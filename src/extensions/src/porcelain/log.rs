@@ -10093,6 +10093,14 @@ enum DecoKind {
 struct Deco {
     kind: DecoKind,
     full: String,
+    /// The refname this entry was added under, where that differs from `full`.
+    ///
+    /// `add_name_decoration` prepends, so display order is the reverse of the
+    /// order entries were added — for a ref, descending refname. A
+    /// `refs/replace/<oid>` ref is added at its own place in that walk while
+    /// displaying the fixed word `replaced`, so it needs the refname kept for
+    /// ordering. `None` everywhere else, where the two coincide.
+    added_as: Option<String>,
 }
 
 /// The ref→commit map plus HEAD state needed to render `%d`/`%D`.
@@ -10363,17 +10371,67 @@ fn userformat_wants(pretty: &Pretty, atoms: &[char]) -> bool {
 /// ref that survives `filter` (peeled through annotated tags to its commit),
 /// then `HEAD`, which git adds last and therefore renders first.
 ///
-/// `refs/replace/*` is skipped: git turns those into a `replaced` decoration on
-/// the object being *replaced*, which is a mechanism this port does not model,
-/// so the ref decorating its own target would be plainly wrong.
+/// git's `replace_refs_enabled()`: the replacement map is on unless
+/// `GIT_NO_REPLACE_OBJECTS` is set (which is what `git --no-replace-objects`
+/// exports) or `core.useReplaceRefs` is false.
+fn replace_refs_enabled(repo: &gix::Repository) -> bool {
+    if std::env::var_os("GIT_NO_REPLACE_OBJECTS").is_some() {
+        return false;
+    }
+    repo.config_snapshot().boolean("core.useReplaceRefs").unwrap_or(true)
+}
+
+/// A `refs/replace/<oid>` ref does not decorate its own target. git reads the
+/// *replaced* object name out of the refname and hangs the literal word
+/// `replaced` on that object instead:
+///
+/// ```c
+/// if (starts_with(ref->name, git_replace_ref_base)) {
+///         struct object_id original_oid;
+///         if (!replace_refs_enabled(the_repository))
+///                 return 0;
+///         if (get_oid_hex(ref->name + strlen(git_replace_ref_base),
+///                         &original_oid)) {
+///                 warning("invalid replace ref %s", ref->name);
+///                 return 0;
+///         }
+///         obj = parse_object(the_repository, &original_oid);
+///         if (obj)
+///                 add_name_decoration(DECORATION_GRAFTED, "replaced", obj);
+///         return 0;
+/// }
+/// ```
+///
+/// (`add_ref_decoration`, log-tree.c:162-175.) It shares `DECORATION_GRAFTED`
+/// with the graft decoration below, and is skipped entirely when replacement is
+/// switched off by `--no-replace-objects`, `GIT_NO_REPLACE_OBJECTS` or
+/// `core.useReplaceRefs=false`.
 pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilter) -> Result<Decorations> {
     let mut map: HashMap<ObjectId, Vec<Deco>> = HashMap::new();
+    let replace_enabled = replace_refs_enabled(repo);
     for r in repo.references()?.all()? {
         let r = r.map_err(|e| anyhow!("{e}"))?;
         let Ok(full) = r.name().as_bstr().to_str().map(str::to_owned) else {
             continue;
         };
-        if !filter.matches(&full) || full.starts_with("refs/replace/") {
+        if let Some(hex) = full.strip_prefix("refs/replace/") {
+            // The `ref_filter_match()` test runs *before* this arm in the C, so a
+            // `--decorate-refs` that excludes the ref excludes the decoration.
+            if !filter.matches(&full) || !replace_enabled {
+                continue;
+            }
+            if let Ok(original) = ObjectId::from_hex(hex.as_bytes()) {
+                if repo.find_object(original).is_ok() {
+                    map.entry(original).or_default().push(Deco {
+                        kind: DecoKind::Grafted,
+                        full: "replaced".to_string(),
+                        added_as: Some(full.clone()),
+                    });
+                }
+            }
+            continue;
+        }
+        if !filter.matches(&full) {
             continue;
         }
         // git's `add_ref_decoration` classifies by the first `ref_namespace[]`
@@ -10393,7 +10451,7 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
         let Ok(id) = r.into_fully_peeled_id() else {
             continue;
         };
-        map.entry(id.detach()).or_default().push(Deco { kind, full });
+        map.entry(id.detach()).or_default().push(Deco { kind, full, added_as: None });
     }
 
     let mut head_branch = None;
@@ -10410,6 +10468,7 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
                 map.entry(id.detach()).or_default().push(Deco {
                     kind: DecoKind::Head,
                     full: "HEAD".to_string(),
+                    added_as: None,
                 });
             }
         }
@@ -10425,6 +10484,7 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
         map.entry(*id).or_default().push(Deco {
             kind: DecoKind::Grafted,
             full: "grafted".to_string(),
+            added_as: None,
         });
     }
 
@@ -10532,8 +10592,16 @@ pub(crate) fn format_decorations(
     // `for_each_commit_graft(add_graft_decoration)` runs *after* the ref walk and
     // after `HEAD` (log-tree.c:221-243), and `add_name_decoration` prepends, so a
     // graft decoration renders ahead of even `HEAD`.
+    // A `replaced` entry is the exception: `add_ref_decoration()` adds it inside
+    // the ref walk (log-tree.c:162-175) rather than after it, so it takes its
+    // place among the refs by the `refs/replace/<oid>` name it came from.
     ordered.sort_by_key(|d| {
-        (d.kind != DecoKind::Grafted, d.kind != DecoKind::Head, std::cmp::Reverse(d.full.clone()))
+        let graft_first = d.kind != DecoKind::Grafted || d.added_as.is_some();
+        (
+            graft_first,
+            d.kind != DecoKind::Head,
+            std::cmp::Reverse(d.added_as.clone().unwrap_or_else(|| d.full.clone())),
+        )
     });
 
     let mut entries: Vec<String> = Vec::new();
@@ -11202,6 +11270,7 @@ pub(crate) fn rev_list_pretty_body(
     commit: &gix::Commit<'_>,
     pretty: &Pretty,
     date_mode: &DateMode,
+    parents: &[ObjectId],
 ) -> Result<Vec<u8>> {
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
@@ -11230,7 +11299,11 @@ pub(crate) fn rev_list_pretty_body(
         repo,
         mark: "",
         revision_mark: ">",
-        parents: &[],
+        // `%P` / `%p` read `commit->parents` (pretty.c's `'P'` and `'p'` arms) —
+        // the commit's own parent list. The caller passes the list it would print
+        // for `--parents`, so a pathspec-simplified walk renders the rewritten
+        // parents exactly as `format_commit_one()` sees them.
+        parents,
         // No `--graph` behind either of these callers.
         graph_width: 0,
         // `rev-list --pretty` has no `--expand-tabs` of its own.

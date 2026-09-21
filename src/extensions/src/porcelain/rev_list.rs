@@ -623,6 +623,15 @@ struct Seed {
     /// `BOTTOM`: an explicitly excluded tip. `--ancestry-path` measures descent
     /// from these.
     bottom: bool,
+    /// This seed has an entry in `revs->cmdline` whose `item` is a commit.
+    ///
+    /// `add_rev_cmdline()` records the object `get_reference()` answered with —
+    /// *before* `handle_commit()` peels it — so an annotated tag leaves an
+    /// `OBJ_TAG` entry behind, and `add_reflogs_to_pending()` records no entry at
+    /// all (it calls `add_pending_object()` alone, revision.c:1836-1858). Only
+    /// `mark_edges_uninteresting()`'s aggressive pass reads the list
+    /// (list-objects.c:323-335), and it skips everything that is not a commit.
+    cmdline_commit: bool,
 }
 
 /// One entry in git's `revs->pending` that never becomes a commit.
@@ -837,6 +846,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `--[no-]object-names`: whether an object line carries the path it was
     // reached through. git prints the separator and the name only when it does.
     let mut object_names = true;
+    // `line_term`/`info_term` both at NUL — `-z` (builtin/rev-list.c:120-121).
+    let mut nul_term = false;
+    // `revs->unpacked`: show only commits no pack holds.
+    let mut unpacked = false;
     let mut show_parents = false;
     let mut show_children = false;
     let mut boundary = false;
@@ -850,6 +863,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut ancestry_path = false;
     // `revs->edge_hint`: print the uninteresting boundary as `-<id>` lines.
     let mut edge_hint = false;
+    // `revs->edge_hint_aggressive`: `--objects-edge-aggressive` also reports
+    // every excluded command-line commit as an edge.
+    let mut edge_aggressive = false;
     // `revs->exclude_promisor_objects`.
     let mut exclude_promisor = false;
     // `arg_print_omitted`.
@@ -1198,9 +1214,40 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // parent of a shown commit — which is how `pack-objects` learns the
             // boundary to delta against. The `-aggressive` spelling widens which
             // trees are marked, not which commits are printed.
-            "--objects-edge" | "--objects-edge-aggressive" => {
+            "--objects-edge" => {
                 objects = true;
                 edge_hint = true;
+            }
+            // `revs->edge_hint_aggressive = 1` on top of `edge_hint`
+            // (revision.c:2526-2530): the aggressive spelling widens both which
+            // trees are marked and which commits are printed — every excluded
+            // command-line commit becomes an edge of its own.
+            "--objects-edge-aggressive" => {
+                objects = true;
+                edge_hint = true;
+                edge_aggressive = true;
+            }
+            // ```c
+            // } else if (!strcmp(arg, "-z")) {
+            //         line_term = '\0';
+            //         info_term = '\0';
+            // }
+            // ```
+            //
+            // (builtin/rev-list.c:752-755, in the pre-scan that runs ahead of
+            // `setup_revisions()`.) Both terminators go to NUL: records are
+            // NUL-separated and every per-record extra is introduced by a NUL
+            // rather than by a space.
+            "-z" => nul_term = true,
+            // `revs->unpacked = 1` (revision.c:2537-2538): `get_revision_1()`
+            // then skips every commit a pack already holds
+            // (`if (revs->unpacked && has_object_pack(...)) continue;`,
+            // revision.c:4182).
+            "--unpacked" => unpacked = true,
+            // `die(_("--unpacked=<packfile> no longer supported"))`
+            // (revision.c:2539-2540).
+            s if s.starts_with("--unpacked=") => {
+                return Ok(fatal("--unpacked=<packfile> no longer supported"));
             }
             "--object-names" => object_names = true,
             "--no-object-names" => object_names = false,
@@ -1246,6 +1293,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--filter-print-omitted" => print_omitted = true,
             "--filter-provided-objects" => filter_provided_objects = true,
             "--ancestry-path" => ancestry_path = true,
+            // ```c
+            // if (skip_prefix(arg, "--progress=", &arg)) {
+            //         show_progress = arg;
+            //         continue;
+            // }
+            // ```
+            //
+            // (builtin/rev-list.c:809-811.) `start_delayed_progress()` only ever
+            // writes to stderr, and `is_foreground_fd()` (progress.c:106-110)
+            // keeps it silent off a terminal, so the option changes nothing that
+            // is captured. The bare `--progress` spelling is not this option: it
+            // falls through to `handle_revision_opt()` and is rejected.
+            s if s.starts_with("--progress=") => {}
             // ```c
             // } else if (skip_prefix(arg, "--ancestry-path=", &optarg)) {
             //         revs->ancestry_path = 1;
@@ -1424,6 +1484,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                         uninteresting: negate,
                         symmetric_left: false,
                         bottom: negate,
+                        cmdline_commit: false,
                     });
                     rev_input_given = true;
                 }
@@ -1614,12 +1675,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // `--not` holds at this argv position.
             "--alternate-refs" => {
                 for id in crate::alternate_refs::tips(&repo) {
-                    if let Some(id) = peel_recording_tags(&repo, id, &mut pending) {
+                    let cmdline_commit = names_a_commit(&repo, id);
+                    if let Some(id) = peel_recording_tags(&repo, id, negate, &mut pending) {
                         seeds.push(Seed {
                             id,
                             uninteresting: negate,
                             symmetric_left: false,
                             bottom: negate,
+                            cmdline_commit,
                         });
                     }
                 }
@@ -2048,6 +2111,33 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error());
     }
 
+    // ```c
+    // if (!line_term) {
+    //         if (revs.graph || revs.verbose_header || show_disk_usage ||
+    //             info.show_timestamp || info.header_prefix || bisect_list ||
+    //             use_bitmap_index || revs.edge_hint || revs.left_right ||
+    //             revs.cherry_mark)
+    //                 die(_("-z option used with unsupported option"));
+    // }
+    // ```
+    //
+    // (builtin/rev-list.c:876-882.) `info.header_prefix` is still NULL here —
+    // it is assigned further down, at line 890 — so the `--pretty` half of that
+    // test is carried by `verbose_header` alone.
+    if nul_term
+        && (graph
+            || verbose_header
+            || disk_usage
+            || show_timestamp
+            || bisect
+            || test_bitmap
+            || edge_hint
+            || left_right
+            || cherry_mark)
+    {
+        return Ok(fatal("-z option used with unsupported option"));
+    }
+
     // `parse_pathspec()` runs inside `setup_revisions()`, so a rejected element
     // is fatal here — before the walk, and on the paths that never build a
     // matcher at all.
@@ -2282,7 +2372,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 "--ancestry-path given but there are no bottom commits",
             ));
         }
-        commits = limit_to_ancestry(&bottoms, &commits, &parents_of);
+        let kept: HashSet<ObjectId> =
+            limit_to_ancestry(&bottoms, &commits, &parents_of).into_iter().collect();
+        // `get_reference(revs, optarg, &oid, ANCESTRY_PATH)` (revision.c:2422)
+        // flags the named commit, and `process_parents()` passes that flag down
+        // (`pass_flags = commit->object.flags & (SYMMETRIC_LEFT | ANCESTRY_PATH)`,
+        // revision.c:1179), so the bottom's own ancestry is flagged too — and
+        // `limit_to_ancestry()` exempts anything carrying it (revision.c:1391).
+        // The argument-less spelling never sets the flag, so its bottoms have no
+        // such exemption.
+        let flagged = match ancestry_bottoms.is_empty() {
+            true => HashSet::new(),
+            false => super::log::ancestor_closure_opt(&repo, &ancestry_bottoms, false)?,
+        };
+        commits.retain(|id| kept.contains(id) || flagged.contains(id));
     }
 
     // The path limit is applied where `try_to_simplify_commit` runs — inside the
@@ -2519,6 +2622,17 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // The six `bisect_*` assignments, rendered once the search is done and
     // written in place of (or, under `--bisect-all`, after) the listing.
     let mut bisect_vars_text: Option<String> = None;
+    // `mark_edges_uninteresting()` (list-objects.c:283-335) runs in
+    // `cmd_rev_list()` (builtin/rev-list.c:938) against `revs->commits` — the list
+    // `prepare_revision_walk()` left behind, after `limit_list()` and
+    // `sort_in_topological_order()`. Everything below this point is
+    // `get_revision()`'s work, applied per commit as the traversal streams them:
+    // `--min-parents`/`--merges`, `--grep`, `--skip` and `--max-count` never
+    // reach the edge list, so the snapshot is taken here.
+    let edge_source: Vec<ObjectId> = match edge_hint {
+        true => commits.clone(),
+        false => Vec::new(),
+    };
     if bisect {
         let found = find_bisection(&commits, &parents_of, first_parent, bisect_all, &treesame);
         commits = found.commits.iter().map(|(id, _)| *id).collect();
@@ -2606,6 +2720,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     // `simplify_commit` drops the TREESAME commits, then `commit_ignore` applies
     // the parent-count bounds and `commit_match` the header predicates.
+    // `if (revs->unpacked && has_object_pack(revs->repo, &commit->object.oid))
+    // continue;` (revision.c:4182), inside `get_revision_1()` — so it filters the
+    // rendered stream, not the walk, exactly like `--no-merges` beside it.
+    // `--unpacked`'s pack lookup, read once: `has_object_pack()` answers for
+    // commits in `get_commit_action()` and for every other object in
+    // `show_object()` (list-objects.c:44-46).
+    let packed_objects: HashSet<ObjectId> = match unpacked {
+        true => pack_objects(&repo, false),
+        false => HashSet::new(),
+    };
+    if unpacked {
+        commits.retain(|id| !packed_objects.contains(id));
+    }
     commits.retain(|id| !treesame.contains(id));
     commits.retain(|id| {
         let n = parents_of.get(id).map_or(0, Vec::len);
@@ -2728,33 +2855,62 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut out: Vec<u8> = Vec::new();
-    // `mark_edges_uninteresting()` (list-objects.c:283-321) runs before
-    // `traverse_commit_list()`, so every `-<id>` precedes the listing itself. The
-    // edges are the *uninteresting* parents of the shown commits — a parent left
-    // unwalked by `--max-count` is not one, which is why `--objects-edge -n 1`
-    // prints no edge at all.
-    if edge_hint && !hidden.is_empty() {
-        let uninteresting = reachable_from(&hidden, &parents_of);
-        let shown: HashSet<ObjectId> = commits.iter().copied().collect();
+    // `mark_edges_uninteresting()` (list-objects.c:283-335) runs before
+    // `traverse_commit_list()`, so every `-<id>` precedes the listing itself.
+    if edge_hint && (!hidden.is_empty() || edge_aggressive) {
+        // `mark_edge_parents_uninteresting()` (list-objects.c:244) tests the
+        // parent's UNINTERESTING flag, which `mark_parents_uninteresting()`
+        // (revision.c:1043-1071) has already painted over the *whole* ancestry of
+        // every `^rev` — not just the excluded tips. `parents_of` only holds the
+        // commits the walk yielded, so the closure is recomputed from the odb;
+        // `--exclude-first-parent-only` is the one case where that painting stops
+        // at each excluded commit's first parent.
+        let uninteresting =
+            super::log::ancestor_closure_opt(&repo, &hidden, exclude_first_parent_only)?;
         let mut edges: Vec<ObjectId> = Vec::new();
+        // `parent->object.flags |= SHOWN` before `show_edge(parent)`, and every
+        // later pass re-checks that flag, so an edge is printed once.
         let mut seen_edge: HashSet<ObjectId> = HashSet::new();
-        for id in &commits {
+        // `limit_list()` drops every UNINTERESTING commit from `revs->commits`
+        // (revision.c:1473-1479), so the first arm of the non-sparse loop is dead
+        // for a limited walk and only the parent arm can fire here.
+        for id in &edge_source {
             for parent in parents_of.get(id).into_iter().flatten() {
-                if !shown.contains(parent)
-                    && uninteresting.contains(parent)
-                    && seen_edge.insert(*parent)
-                {
+                if uninteresting.contains(parent) && seen_edge.insert(*parent) {
                     edges.push(*parent);
+                }
+            }
+        }
+        // ```c
+        // if (revs->edge_hint_aggressive) {
+        //         for (size_t i = 0; i < revs->cmdline.nr; i++) {
+        //                 struct object *obj = revs->cmdline.rev[i].item;
+        //                 struct commit *commit = (struct commit *)obj;
+        //                 if (obj->type != OBJ_COMMIT || !(obj->flags & UNINTERESTING))
+        //                         continue;
+        // ```
+        //
+        // (list-objects.c:323-335.) The aggressive spelling adds every *excluded
+        // command-line operand* to the edge list, whether or not it borders a
+        // commit the walk showed — so `^<deep-rev>` contributes an edge of its
+        // own. The `OBJ_COMMIT` test is on the object as named, which is why an
+        // annotated tag operand contributes nothing.
+        if edge_aggressive {
+            for seed in &seeds {
+                if seed.cmdline_commit
+                    && uninteresting.contains(&seed.id)
+                    && seen_edge.insert(seed.id)
+                {
+                    edges.push(seed.id);
                 }
             }
         }
         for id in &edges {
             out.extend_from_slice(format!("-{id}\n").as_bytes());
         }
-        // `parent->object.flags |= SHOWN` right before `show_edge(parent)`
-        // (list-objects.c), and `create_boundary_commit_list()` skips a commit
-        // that carries `SHOWN` (revision.c) — so `--objects-edge --boundary`
-        // prints the shared commit once, here, rather than twice.
+        // `create_boundary_commit_list()` skips a commit that carries `SHOWN`
+        // (revision.c) — so `--objects-edge --boundary` prints the shared commit
+        // once, here, rather than twice.
         boundary_commits.retain(|id| !edges.contains(id));
     }
     let mut count_left = 0usize;
@@ -2850,17 +3006,46 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // `line_term` — `\n` by default, NUL under `-z` (builtin/rev-list.c:120).
+    let line_term: u8 = match nul_term {
+        true => 0,
+        false => b'\n',
+    };
     // The commits `setup_revisions()` read from the command line: every other
     // commit the walk returns was reached through a parent and carries
     // `NOT_USER_GIVEN` (revision.c:1160, 1207).
     let user_given_commits: HashSet<ObjectId> = seeds.iter().map(|s| s.id).collect();
+    // ```c
+    // printf("%s", oid_to_hex(&obj->oid));
+    // if (arg_show_object_names) {
+    //         if (line_term) {
+    //                 putchar(info_term);
+    //                 for (const char *p = name; *p && *p != '\n'; p++)
+    //                         putchar(*p);
+    //         } else if (*name) {
+    //                 printf("%cpath=%s", info_term, name);
+    //         }
+    // }
+    // putchar(line_term);
+    // ```
+    //
+    // (`show_object`, builtin/rev-list.c:404-416.) `-z` names the field and
+    // leaves it out entirely for an unnamed object, where the newline form
+    // prints a trailing separator with nothing after it.
     let object_line = |id: &ObjectId, name: &[u8], out: &mut Vec<u8>| {
         out.extend_from_slice(id.to_string().as_bytes());
         if object_names {
-            out.push(b' ');
-            out.extend_from_slice(name);
+            if !nul_term {
+                out.push(b' ');
+                let stop = name.iter().position(|b| *b == b'\n').unwrap_or(name.len());
+                out.extend_from_slice(&name[..stop]);
+            } else if !name.is_empty() {
+                out.push(0);
+                out.extend_from_slice(b"path=");
+                out.extend_from_slice(name);
+            }
         }
-        out.push(b'\n');
+        out.push(line_term);
     };
 
     // Shown commits first, then the boundary commits git appends once the walk
@@ -2942,7 +3127,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // `graph_show_commit()` draws `<`, `>`, `=` and `o` in the column
                 // where it would otherwise draw `*`, so the mark is not also
                 // printed in front of the object name.
-                if !graph {
+                // `if (!revs->graph && line_term)` (builtin/rev-list.c:276):
+                // `-z` drops the mark entirely rather than emitting it.
+                if !graph && !nul_term {
                     out.extend_from_slice(revision_mark(
                         *is_boundary,
                         left.contains(id),
@@ -2958,6 +3145,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     out.extend_from_slice(id.attach(&repo).shorten_or_id().to_string().as_bytes());
                 } else {
                     out.extend_from_slice(id.to_string().as_bytes());
+                }
+                // ```c
+                // if (!line_term) {
+                //         if (commit->object.flags & BOUNDARY)
+                //                 printf("%cboundary=yes", info_term);
+                // }
+                // ```
+                //
+                // (builtin/rev-list.c:284-287.) Under `-z` the `-` prefix has no
+                // line to sit in front of, so the fact is reported as a field.
+                if nul_term && *is_boundary {
+                    out.push(0);
+                    out.extend_from_slice(b"boundary=yes");
                 }
             }
             // `--bisect-all`'s decoration list: the refs pointing at the commit,
@@ -2997,12 +3197,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // git separates the object name from a oneline body with a space and
                 // from every other body with the line terminator.
                 Some(Pretty::Oneline) => out.push(b' '),
-                _ if include_header => out.push(b'\n'),
+                _ if include_header => out.push(line_term),
                 _ => {}
             }
             if let Some(p) = &pretty {
                 let object = repo.find_object(*id)?;
-                let body = rev_list_pretty_body(&repo, &object.into_commit(), p, &date_mode)?;
+                let shown_parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
+                let body =
+                    rev_list_pretty_body(&repo, &object.into_commit(), p, &date_mode, shown_parents)?;
                 if !body.is_empty() {
                     out.extend_from_slice(&body);
                     out.push(hdr_term);
@@ -3020,6 +3222,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 return Ok(code);
             }
             for (oid, name) in trav.lines.drain(..) {
+                // `show_object()` (list-objects.c:38-48) returns *before* the
+                // callback, so a packed object is left out of `--disk-usage` and
+                // `--count` as well as out of the listing.
+                if unpacked && packed_objects.contains(&oid) {
+                    continue;
+                }
                 if disk_usage {
                     match object_disk_size(&repo, oid) {
                         Some(n) => disk_total += n,
@@ -3096,6 +3304,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
         }
         for (id, name) in &trav.lines {
+            // `show_object()` (list-objects.c:38-48), as above.
+            if unpacked && packed_objects.contains(id) {
+                continue;
+            }
             if disk_usage {
                 match object_disk_size(&repo, *id) {
                     Some(n) => disk_total += n,
@@ -3191,7 +3403,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let Some(entry) = absent.iter().find(|entry| entry.id == id) else {
             continue;
         };
-        sink.write_all(&print_missing_object(entry, missing == Missing::PrintInfo))?;
+        sink.write_all(&print_missing_object(entry, missing == Missing::PrintInfo, nul_term))?;
     }
     if disk_usage {
         if disk_usage_human {
@@ -3494,12 +3706,14 @@ fn seed_ref_set(
         if repo.find_object(target).is_err() {
             return Err(format!("fatal: bad object {name}\n"));
         }
-        if let Some(id) = peel_recording_tags(repo, target, pending) {
+        let cmdline_commit = names_a_commit(repo, target);
+        if let Some(id) = peel_recording_tags(repo, target, negate, pending) {
             seeds.push(Seed {
                 id,
                 uninteresting: negate,
                 symmetric_left: false,
                 bottom: negate,
+                cmdline_commit,
             });
         }
     }
@@ -3508,12 +3722,14 @@ fn seed_ref_set(
     // exclusion pattern never removes it.
     if sel.head && !sel.excluded("HEAD") && !ref_is_hidden("HEAD", hidden) {
         if let Ok(head) = repo.head_id() {
-            if let Some(id) = peel_recording_tags(repo, head.detach(), pending) {
+            let cmdline_commit = names_a_commit(repo, head.detach());
+            if let Some(id) = peel_recording_tags(repo, head.detach(), negate, pending) {
                 seeds.push(Seed {
                     id,
                     uninteresting: negate,
                     symmetric_left: false,
                     bottom: negate,
+                    cmdline_commit,
                 });
             }
         }
@@ -3574,6 +3790,7 @@ fn seed_revision(
                     uninteresting: not,
                     symmetric_left: false,
                     bottom: not,
+                    cmdline_commit: true,
                 });
             }
             // `if (add_parents_only(…)) { ret = 0; goto out; }` — `^@` claimed the
@@ -3601,7 +3818,7 @@ fn seed_revision(
         crate::setup::verify_non_filename(repo, name).map(|m| format!("fatal: {m}\n"))
     };
     if let Some(rest) = spec.strip_prefix('^') {
-        let Some(id) = resolve(repo, rest, pending) else {
+        let Some((id, cmdline_commit)) = resolve_named(repo, rest, !negate, pending) else {
             // `handle_commit()`'s tree/blob arms again: an excluded non-commit
             // pends nothing and is not an error. Stock `git rev-list --objects
             // ^main^{tree}` exits 0 with no output.
@@ -3619,14 +3836,15 @@ fn seed_revision(
             uninteresting: !negate,
             symmetric_left: false,
             bottom: !negate,
+            cmdline_commit,
         });
         return Ok(());
     }
     if let Some((l, r)) = spec.split_once("...") {
         let left_spec = if l.is_empty() { "HEAD" } else { l };
         let right_spec = if r.is_empty() { "HEAD" } else { r };
-        let left = resolve(repo, left_spec, pending).ok_or_else(|| unknown(spec))?;
-        let right = resolve(repo, right_spec, pending).ok_or_else(|| unknown(spec))?;
+        let (left, left_commit) = resolve_named(repo, left_spec, negate, pending).ok_or_else(|| unknown(spec))?;
+        let (right, right_commit) = resolve_named(repo, right_spec, negate, pending).ok_or_else(|| unknown(spec))?;
         // `handle_dotdot_1()` restores the separator first, so the token is
         // checked as written rather than endpoint by endpoint.
         if let Some(message) = non_filename(spec) {
@@ -3641,6 +3859,7 @@ fn seed_revision(
                 uninteresting: !negate,
                 symmetric_left: false,
                 bottom: !negate,
+                cmdline_commit: true,
             });
         }
         seeds.push(Seed {
@@ -3648,20 +3867,22 @@ fn seed_revision(
             uninteresting: negate,
             symmetric_left: true,
             bottom: negate,
+            cmdline_commit: left_commit,
         });
         seeds.push(Seed {
             id: right,
             uninteresting: negate,
             symmetric_left: false,
             bottom: negate,
+            cmdline_commit: right_commit,
         });
         return Ok(());
     }
     if let Some((l, r)) = spec.split_once("..") {
         let left_spec = if l.is_empty() { "HEAD" } else { l };
         let right_spec = if r.is_empty() { "HEAD" } else { r };
-        let left = resolve(repo, left_spec, pending).ok_or_else(|| unknown(spec))?;
-        let right = resolve(repo, right_spec, pending).ok_or_else(|| unknown(spec))?;
+        let (left, left_commit) = resolve_named(repo, left_spec, !negate, pending).ok_or_else(|| unknown(spec))?;
+        let (right, right_commit) = resolve_named(repo, right_spec, negate, pending).ok_or_else(|| unknown(spec))?;
         // Same restore-then-check as the symmetric form above.
         if let Some(message) = non_filename(spec) {
             return Err(message);
@@ -3671,12 +3892,14 @@ fn seed_revision(
             uninteresting: !negate,
             symmetric_left: false,
             bottom: !negate,
+            cmdline_commit: left_commit,
         });
         seeds.push(Seed {
             id: right,
             uninteresting: negate,
             symmetric_left: false,
             bottom: negate,
+            cmdline_commit: right_commit,
         });
         return Ok(());
     }
@@ -3716,7 +3939,7 @@ fn seed_plain(
     seeds: &mut Vec<Seed>,
     pending: &mut Vec<Pending>,
 ) -> Result<(), String> {
-    let Some(id) = resolve(repo, spec, pending) else {
+    let Some((id, cmdline_commit)) = resolve_named(repo, spec, negate, pending) else {
         // `get_oid_basic()` reads a ref without touching the object it names, so a
         // ref pointing at something the database does not have resolves and then
         // dies in `get_reference()`: `die(_("bad object %s"), name)`
@@ -3753,6 +3976,7 @@ fn seed_plain(
         uninteresting: negate,
         symmetric_left: false,
         bottom: negate,
+        cmdline_commit,
     });
     Ok(())
 }
@@ -3898,7 +4122,8 @@ fn seed_bisect_refs(
                 Err(_) => continue,
             },
         };
-        if let Some(id) = peel_recording_tags(repo, target, pending) {
+        let cmdline_commit = names_a_commit(repo, target);
+        if let Some(id) = peel_recording_tags(repo, target, excluded != negate, pending) {
             // The good refs are handed `*flags ^ (UNINTERESTING | BOTTOM)`.
             let uninteresting = excluded != negate;
             seeds.push(Seed {
@@ -3906,6 +4131,7 @@ fn seed_bisect_refs(
                 uninteresting,
                 symmetric_left: false,
                 bottom: uninteresting,
+                cmdline_commit,
             });
         }
     }
@@ -4411,6 +4637,7 @@ fn human_size(bytes: u64) -> String {
 fn resolve(
     repo: &gix::Repository,
     spec: &str,
+    uninteresting: bool,
     pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
     // `get_oid_basic()` reads a `<ref>@{…}` operand with `repo_dwim_log()` and
@@ -4426,15 +4653,38 @@ fn resolve(
     // tree and blob arms pend under it. Without it a `<rev>:<path>` operand
     // reached its tree arm with an empty path and the walk under that tree was
     // named from the root — `s.txt` where git says `sub/s.txt`.
+    resolve_named(repo, spec, uninteresting, pending).map(|(id, _)| id)
+}
+
+/// [`resolve`], also reporting whether the object the operand *named* — before
+/// `handle_commit()` peeled it — is a commit, which is what `add_rev_cmdline()`
+/// records and what the aggressive edge pass then filters on.
+fn resolve_named(
+    repo: &gix::Repository,
+    spec: &str,
+    uninteresting: bool,
+    pending: &mut Vec<Pending>,
+) -> Option<(ObjectId, bool)> {
     let path = operand_path(repo, spec);
-    if crate::objname::resolves_through_reflog(spec) {
-        return crate::objname::reflog_spec_oid(repo, spec)
-            .and_then(|id| peel_recording_tags_at(repo, id, &path, pending));
-    }
-    // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same
-    // operand as `main@{push}`; gitoxide's parser is case-sensitive.
-    let id = repo.rev_parse_single(crate::objname::canonical_spec(repo, spec).as_ref()).ok()?.detach();
-    peel_recording_tags_at(repo, id, &path, pending)
+    let named = if crate::objname::resolves_through_reflog(spec) {
+        crate::objname::reflog_spec_oid(repo, spec)?
+    } else {
+        // `at_mark()` compares with `strncasecmp`, so `main@{PUSH}` is the same
+        // operand as `main@{push}`; gitoxide's parser is case-sensitive.
+        repo.rev_parse_single(crate::objname::canonical_spec(repo, spec).as_ref()).ok()?.detach()
+    };
+    let cmdline_commit = names_a_commit(repo, named);
+    peel_recording_tags_at(repo, named, &path, uninteresting, pending).map(|id| (id, cmdline_commit))
+}
+
+/// Whether `add_rev_cmdline()` would record this operand as an `OBJ_COMMIT`.
+///
+/// `get_reference()` answers with the object as named — unpeeled — and
+/// `add_rev_cmdline()` stores exactly that (revision.c:1521-1536, 2229-2234), so
+/// an annotated tag leaves an `OBJ_TAG` entry that
+/// `mark_edges_uninteresting()`'s aggressive pass steps over.
+fn names_a_commit(repo: &gix::Repository, id: ObjectId) -> bool {
+    matches!(repo.find_object(id).map(|o| o.kind), Ok(gix::object::Kind::Commit))
 }
 
 /// Peel `id` down to a commit, pushing every tag object passed through onto
@@ -4465,9 +4715,10 @@ fn resolve(
 fn peel_recording_tags(
     repo: &gix::Repository,
     id: ObjectId,
+    uninteresting: bool,
     pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
-    peel_recording_tags_at(repo, id, &[], pending)
+    peel_recording_tags_at(repo, id, &[], uninteresting, pending)
 }
 
 /// [`peel_recording_tags`] for an operand that carries an `oc.path`.
@@ -4481,6 +4732,7 @@ fn peel_recording_tags_at(
     repo: &gix::Repository,
     id: ObjectId,
     path: &[u8],
+    uninteresting: bool,
     pending: &mut Vec<Pending>,
 ) -> Option<ObjectId> {
     let mut id = id;
@@ -4495,7 +4747,7 @@ fn peel_recording_tags_at(
                     id,
                     name: std::mem::take(&mut path),
                     kind,
-                    uninteresting: false,
+                    uninteresting,
                 });
                 return None;
             }
@@ -4506,11 +4758,20 @@ fn peel_recording_tags_at(
                     let decoded = tag.decode().ok()?;
                     (decoded.name.to_vec(), decoded.target())
                 };
+                // `if (revs->tag_objects && !(flags & UNINTERESTING))
+                // add_pending_object(revs, object, tag->tag);` (revision.c:396) —
+                // an excluded tag operand is peeled but never listed, so
+                // `git rev-list --objects ^<tag> <rev>` prints no tag object.
+                // The flag is carried rather than the entry dropped because
+                // `flags` is read off the *object* (revision.c:388), which any
+                // later `^` spelling of the same name has already marked: an
+                // exclusion reaches a pending entry made earlier, which is how
+                // `--objects --all --not --tags` lists no tags at all.
                 pending.push(Pending {
                     id: tag_id,
                     name,
                     kind: gix::object::Kind::Tag,
-                    uninteresting: false,
+                    uninteresting,
                 });
                 // `path = NULL; mode = 0;` — the tagged object is not reached
                 // through the operand's path arm.
@@ -5093,21 +5354,33 @@ struct MissingObject {
 /// newline. An empty `path` prints no `path=` field at all — git's
 /// `entry->path && *entry->path` — which is what a root tree or a tip named on
 /// the command line leaves behind.
-fn print_missing_object(entry: &MissingObject, print_missing_info: bool) -> Vec<u8> {
-    let mut out = format!("?{}", entry.id).into_bytes();
+fn print_missing_object(entry: &MissingObject, print_missing_info: bool, nul_term: bool) -> Vec<u8> {
+    // `if (line_term) printf("?%s", …); else printf("%s%cmissing=yes", …, info_term);`
+    // (builtin/rev-list.c:159-163): `-z` has no room for a `?` prefix, so the
+    // fact becomes a NUL-introduced field, and the path is written raw rather
+    // than through `quote_path()` (lines 173-182).
+    let (info_term, mut out) = match nul_term {
+        true => (0u8, format!("{}\0missing=yes", entry.id).into_bytes()),
+        false => (b' ', format!("?{}", entry.id).into_bytes()),
+    };
     if !print_missing_info {
-        out.push(b'\n');
+        out.push(if nul_term { 0 } else { b'\n' });
         return out;
     }
     if !entry.path.is_empty() {
-        out.extend_from_slice(b" path=");
-        out.extend_from_slice(&quote_path_sp(&entry.path));
+        out.push(info_term);
+        out.extend_from_slice(b"path=");
+        match nul_term {
+            true => out.extend_from_slice(&entry.path),
+            false => out.extend_from_slice(&quote_path_sp(&entry.path)),
+        }
     }
     if let Some(kind) = entry.kind {
-        out.extend_from_slice(b" type=");
+        out.push(info_term);
+        out.extend_from_slice(b"type=");
         out.extend_from_slice(kind.as_bytes());
     }
-    out.push(b'\n');
+    out.push(if nul_term { 0 } else { b'\n' });
     out
 }
 

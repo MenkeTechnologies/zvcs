@@ -1352,11 +1352,13 @@ fn emit_commit_header(
     let commit = repo.find_object(commit_id)?.try_into_commit()?;
     // `diff-tree` has no `--date` option, so its pretty printer always renders the
     // default date mode.
+    let parents: Vec<gix::ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
     let body = super::log::rev_list_pretty_body(
         repo,
         &commit,
         pretty,
         &super::log::DateMode::Default,
+        &parents,
     )?;
     let empty_format = user_format && body.is_empty();
     if !body.is_empty() {

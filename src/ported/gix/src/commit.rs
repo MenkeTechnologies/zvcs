@@ -243,6 +243,8 @@ pub mod describe {
                     fallback_to_oid: self.id_as_fallback,
                     first_parent: self.first_parent,
                     max_candidates: self.max_candidates,
+                    names_total: None,
+                    annotated_names: None,
                 },
             )
             .map_err(Exn::into_inner)?;

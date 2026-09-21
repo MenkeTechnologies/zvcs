@@ -978,12 +978,21 @@ fn is_better_name(
     let old = effective_distance(name.distance, name.generation);
     let new = effective_distance(distance, generation);
 
-    // "When comparing names based on tags, prefer names based on the older tag,
-    // even if it is farther away" (builtin/name-rev.c:110-118) — the distance is
-    // only the tiebreak once the two tagger dates are equal.
+    // ```c
+    // /* If both are tags, we prefer the nearer one. */
+    // if (from_tag && name->from_tag)
+    //         return name_distance > new_distance;
+    // ```
+    //
+    // (builtin/name-rev.c:122-124.) Distance only — the tagger date does not enter
+    // this arm at all. The preference for the older tag is expressed once, in the
+    // tip ordering (`cmp_by_tag_and_age`, `:360-374`), which runs the older tag's
+    // walk first so that it keeps the commit on an exact tie; a *farther* older tag
+    // still loses here. Comparing dates first instead kept `lw11~1` — one
+    // first-parent hop, so a merge-traversal-weighted effective distance of 65536 —
+    // where stock answers `lw13^2`, the second parent of a younger tag at 65535.
     if from_tag && name.from_tag {
-        return name.taggerdate > taggerdate
-            || (name.taggerdate == taggerdate && old > new);
+        return old > new;
     }
     // Favor a tag over a non-tag.
     if name.from_tag != from_tag {

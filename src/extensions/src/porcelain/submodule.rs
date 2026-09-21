@@ -4345,6 +4345,8 @@ fn describe_all_always(repo: &gix::Repository, oid: &ObjectId) -> Result<Option<
         max_candidates: 10,
         fallback_to_oid: true,
         first_parent: false,
+        names_total: None,
+        annotated_names: None,
     };
     for (full, peeled, prio, tag_date) in candidates {
         let replace = match best.get(&peeled) {

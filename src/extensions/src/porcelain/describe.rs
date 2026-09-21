@@ -71,10 +71,11 @@ const LONG_OPTS: &[LongOpt] = &[
 /// `--match`/`--exclude` are ports of `builtin/describe.c:get_name()`: the candidate
 /// `name_by_oid` map is built here from the repo's refs filtered by `wildmatch`
 /// ([`build_names`], which stands in for the platform's own `SelectRef::names()`
-/// whether or not a glob is in play). `--contains`
-/// is a port of `builtin/name-rev.c` (git delegates `describe --contains` to
-/// `name-rev --peel-tag --name-only --no-undefined`). The `<blob>` form ports
-/// `describe_blob()`'s `--objects --in-commit-order --reverse` walk.
+/// whether or not a glob is in play). `--contains` is not implemented here at all:
+/// `cmd_describe()` builds a `name-rev --peel-tag --name-only --no-undefined [...]`
+/// argument vector and calls `cmd_name_rev()` with it (builtin/describe.c:703-752),
+/// and so does [`run_contains`]. The `<blob>` form ports `describe_blob()`'s
+/// `--objects --in-commit-order --reverse` walk.
 ///
 /// Failure paths follow git exactly (see `builtin/describe.c`): option errors
 /// exit 129 with `error:` on stderr, every `fatal:` exits 128, and the four
@@ -611,15 +612,14 @@ fn describe_commit_to_string(
 ///         fprintf(stderr, _("traversed %lu commits\n"), seen_commits);
 ///         if (gave_up_on) {
 ///                 fprintf(stderr,
-///                         _("more than %i tags found; listed %i most recent\n"
-///                         "gave up search at %s\n"),
-///                         max_candidates, max_candidates,
+///                         _("found %i tags; gave up search at %s\n"),
+///                         max_candidates,
 ///                         oid_to_hex(&gave_up_on->object.oid));
 ///         }
 /// }
 /// ```
 ///
-/// (`builtin/describe.c:444-467`, with `prio_names[] = { "head", "lightweight",
+/// (`builtin/describe.c:506-529`, with `prio_names[] = { "head", "lightweight",
 /// "annotated" }` at `:63-65`.) `label_width` is the widest of those three, so the
 /// column is eleven characters wide; the depth column is eight, right aligned.
 ///
@@ -657,10 +657,7 @@ fn narrate(
     }
     eprintln!("traversed {} commits", outcome.commits_seen);
     if let Some(id) = &outcome.gave_up_on {
-        eprintln!(
-            "more than {0} tags found; listed {0} most recent\ngave up search at {id}",
-            opts.max_candidates
-        );
+        eprintln!("found {} tags; gave up search at {id}", opts.max_candidates);
     }
     Ok(())
 }
@@ -739,13 +736,41 @@ fn resolve(
     first_parent: bool,
     reporting: Reporting,
 ) -> Result<Option<Outcome<'static>>> {
-    let name_by_oid = build_names(repo, select, filter)?;
+    let with_prio = build_names_with_prio(repo, select, filter)?;
+    // `n->prio == 2`: the candidates that arm the walk's early stop
+    // (builtin/describe.c:436-437 and `:446`). Under `--tags`/`--all` a lightweight
+    // tag or a branch is a candidate that does *not* arm it.
+    let annotated_names: gix::hashtable::HashSet<ObjectId> = with_prio
+        .iter()
+        .filter(|(_, (_, prio))| *prio == 2)
+        .map(|(id, _)| *id)
+        .collect();
+    let name_by_oid: gix::hashtable::HashMap<ObjectId, Cow<'static, BStr>> =
+        with_prio.into_iter().map(|(id, (name, _))| (id, name)).collect();
+    // git's `names` hashmap holds *every* ref `get_name()` admits, lightweight tags
+    // included ("we still remember lightweight ones, only to give hints in an error
+    // message", builtin/describe.c:219-222) — while `name_by_oid` holds only the
+    // priorities `select` turns into candidates. The walk's
+    // `match_cnt == hashmap_get_size(&names)` stop (builtin/describe.c:418-419) reads
+    // the former, so it gets the wide count: every filtered ref under `--all`, every
+    // filtered tag otherwise.
+    let names_total = build_names(
+        repo,
+        match select {
+            SelectRef::AllRefs => SelectRef::AllRefs,
+            _ => SelectRef::AllTags,
+        },
+        filter,
+    )?
+    .len();
     let cache = repo.commit_graph_if_enabled()?;
     let options = DescribeOptions {
         name_by_oid,
         max_candidates,
         fallback_to_oid: fallback,
         first_parent,
+        names_total: Some(names_total),
+        annotated_names: Some(annotated_names),
     };
     // The reporting graph is `Repository::revision_graph()` with the object
     // lookups wrapped; the graft table has to come along either way, or the walk
@@ -1020,213 +1045,50 @@ fn has_any_name(repo: &gix::Repository, select: SelectRef, filter: &Filter) -> R
 }
 
 // ---------------------------------------------------------------------------
-// `--contains`: a port of `builtin/name-rev.c`.
-//
-// git implements `git describe --contains` by delegating to
-// `name-rev --peel-tag --name-only --no-undefined [--always] [--tags
-// --refs=refs/tags/<pat> --exclude=refs/tags/<pat>]`.  It seeds a table from every
-// (filtered) ref tip, then walks each tip's ancestry backward assigning the tip's
-// name to the commits it contains, keeping the best name per commit.  A commit is
-// then named `<tip>`, `<tip>~<gen>`, `<tip>^<n>`, or `<tip>~<gen>^<n>`.
+// `--contains`: git delegates it to name-rev.
 // ---------------------------------------------------------------------------
 
-const MERGE_TRAVERSAL_WEIGHT: i32 = 65535;
-const CUTOFF_DATE_SLOP: i64 = 86400;
-
-/// A commit's best current name, mirroring name-rev's `struct rev_name`.
-#[derive(Clone)]
-struct RevName {
-    tip_name: String,
-    taggerdate: i64,
-    generation: i32,
-    distance: i32,
-    from_tag: bool,
-}
-
-/// Cached parse of a commit: its committer time and parent ids.
-#[derive(Clone)]
-struct CommitInfo {
-    date: i64,
-    parents: Vec<ObjectId>,
-}
-
-/// A named ref tip feeding the reverse walk, mirroring `struct tip_table_entry`.
-struct Tip {
-    commit: ObjectId,
-    refname: String,
-    taggerdate: i64,
-    from_tag: bool,
-    deref: bool,
-}
-
-fn effective_distance(distance: i32, generation: i32) -> i32 {
-    distance + if generation > 0 { MERGE_TRAVERSAL_WEIGHT } else { 0 }
-}
-
-/// name-rev's `is_better_name()`: prefer tags, then shorter effective distance,
-/// then older tagger date.
-fn is_better_name(cur: &RevName, taggerdate: i64, generation: i32, distance: i32, from_tag: bool) -> bool {
-    let name_distance = effective_distance(cur.distance, cur.generation);
-    let new_distance = effective_distance(distance, generation);
-    if from_tag && cur.from_tag {
-        return name_distance > new_distance;
-    }
-    if cur.from_tag != from_tag {
-        return from_tag;
-    }
-    if name_distance != new_distance {
-        return name_distance > new_distance;
-    }
-    if cur.taggerdate != taggerdate {
-        return cur.taggerdate > taggerdate;
-    }
-    false
-}
-
-/// name-rev's `create_or_update_name()`: install/update the numeric fields when the
-/// candidate beats any existing name; the caller fills `tip_name` afterward. Returns
-/// whether the record was (re)claimed.
-fn create_or_update_name(
-    names: &mut std::collections::HashMap<ObjectId, RevName>,
-    commit: &ObjectId,
-    taggerdate: i64,
-    generation: i32,
-    distance: i32,
-    from_tag: bool,
-) -> bool {
-    if let Some(cur) = names.get(commit) {
-        if !is_better_name(cur, taggerdate, generation, distance, from_tag) {
-            return false;
-        }
-    }
-    names.insert(
-        *commit,
-        RevName { tip_name: String::new(), taggerdate, generation, distance, from_tag },
-    );
-    true
-}
-
-/// name-rev's `get_parent_name()`: the name a merge parent inherits from `name`.
-fn get_parent_name(tip_name: &str, generation: i32, parent_number: usize) -> String {
-    let base = tip_name.strip_suffix("^0").unwrap_or(tip_name);
-    if generation > 0 {
-        format!("{base}~{generation}^{parent_number}")
-    } else {
-        format!("{base}^{parent_number}")
-    }
-}
-
-/// name-rev's `get_rev_name()` for a commit: `tip`, or `tip~<gen>` (with a trailing
-/// `^0` stripped) when the commit is `gen` first-parent hops below the tip.
-fn get_rev_name(names: &std::collections::HashMap<ObjectId, RevName>, commit: &ObjectId) -> Option<String> {
-    let n = names.get(commit)?;
-    if n.tip_name.is_empty() {
-        return None;
-    }
-    if n.generation == 0 {
-        Some(n.tip_name.clone())
-    } else {
-        let base = n.tip_name.strip_suffix("^0").unwrap_or(&n.tip_name);
-        Some(format!("{base}~{}", n.generation))
-    }
-}
-
-/// Parse (and cache) a commit's committer time and parent ids.
-fn commit_info(
-    cache: &mut std::collections::HashMap<ObjectId, CommitInfo>,
-    repo: &gix::Repository,
-    id: ObjectId,
-) -> Result<CommitInfo> {
-    if let Some(info) = cache.get(&id) {
-        return Ok(info.clone());
-    }
-    let commit = repo.find_object(id)?.try_into_commit()?;
-    let date = commit.time()?.seconds;
-    let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
-    let info = CommitInfo { date, parents };
-    cache.insert(id, info.clone());
-    Ok(info)
-}
-
-/// name-rev's `name_rev()`: walk `start`'s ancestry (first-parent-priority DFS via a
-/// LIFO stack) propagating `tip_name` to every commit it beats, honoring the date
-/// cutoff. `deref` marks a name reached by peeling a tag (adds a `^0` handle).
-#[allow(clippy::too_many_arguments)]
-fn name_rev(
-    names: &mut std::collections::HashMap<ObjectId, RevName>,
-    cache: &mut std::collections::HashMap<ObjectId, CommitInfo>,
-    repo: &gix::Repository,
-    start: ObjectId,
-    tip_name: &str,
-    taggerdate: i64,
-    from_tag: bool,
-    deref: bool,
-    cutoff: i64,
-) -> Result<()> {
-    if commit_info(cache, repo, start)?.date < cutoff {
-        return Ok(());
-    }
-    if !create_or_update_name(names, &start, taggerdate, 0, 0, from_tag) {
-        return Ok(());
-    }
-    names.get_mut(&start).expect("just inserted").tip_name =
-        if deref { format!("{tip_name}^0") } else { tip_name.to_string() };
-
-    // The prio_queue is used as a LIFO in git; a Vec stack reproduces it.
-    let mut stack: Vec<ObjectId> = vec![start];
-    while let Some(commit) = stack.pop() {
-        let (cur_tip, cur_gen, cur_dist) = {
-            let n = &names[&commit];
-            (n.tip_name.clone(), n.generation, n.distance)
-        };
-        let parents = commit_info(cache, repo, commit)?.parents;
-        let mut to_queue: Vec<ObjectId> = Vec::new();
-        for (idx, parent) in parents.iter().enumerate() {
-            let parent_number = idx + 1;
-            if commit_info(cache, repo, *parent)?.date < cutoff {
-                continue;
-            }
-            let (generation, distance) = if parent_number > 1 {
-                (0, cur_dist + MERGE_TRAVERSAL_WEIGHT)
-            } else {
-                (cur_gen + 1, cur_dist + 1)
-            };
-            if create_or_update_name(names, parent, taggerdate, generation, distance, from_tag) {
-                let ptip = if parent_number > 1 {
-                    get_parent_name(&cur_tip, cur_gen, parent_number)
-                } else {
-                    cur_tip.clone()
-                };
-                names.get_mut(parent).expect("just inserted").tip_name = ptip;
-                to_queue.push(*parent);
-            }
-        }
-        // Push in reverse so the first parent is popped (and named) first.
-        for parent in to_queue.into_iter().rev() {
-            stack.push(parent);
-        }
-    }
-    Ok(())
-}
-
-/// name-rev's `subpath_matches()`: match `filter` against `path` and each of its
-/// `/`-delimited tails; returns the matched offset (`0` = full-path match).
-fn subpath_matches(path: &BStr, filter: &BStr) -> Option<usize> {
-    let mut offset = 0usize;
-    loop {
-        let sub = &path[offset..];
-        if gix::glob::wildmatch(filter, sub, Mode::empty()) {
-            return Some(offset);
-        }
-        {
-            let pos = sub.find_byte(b'/')?;
-            offset += pos + 1
-        }
-    }
-}
-
-/// The `--contains` path: `git describe --contains` == `name-rev --peel-tag
-/// --name-only --no-undefined [...]` over HEAD or the given commit-ishes.
+/// The `--contains` path.
+///
+/// `cmd_describe()` does not implement `--contains` at all; it builds a name-rev
+/// argument vector and calls `cmd_name_rev()` with it
+/// (builtin/describe.c:703-752):
+///
+/// ```c
+/// strvec_pushl(&args, "name-rev",
+///              "--peel-tag", "--name-only", "--no-undefined", NULL);
+/// if (always)
+///         strvec_push(&args, "--always");
+/// if (!all)
+///         strvec_push(&args, "--tags");
+///
+/// for_each_string_list_item(item, &patterns)
+///         strvec_pushf(&args, "--refs=refs/tags/%s", item->string);
+/// for_each_string_list_item(item, &exclude_patterns)
+///         strvec_pushf(&args, "--exclude=refs/tags/%s", item->string);
+///
+/// if (all) {
+///         … the same two loops again for refs/heads/ and refs/remotes/ …
+/// }
+///
+/// if (argc)
+///         strvec_pushv(&args, argv);
+/// else
+///         strvec_push(&args, "HEAD");
+///
+/// ret = cmd_name_rev(args.nr, argv_copy, prefix, the_repository);
+/// ```
+///
+/// So the port delegates the same way, to [`crate::porcelain::name_rev`]. A second
+/// copy of the name-rev walk used to live here; it disagreed with stock git on
+/// every tie in the tip table, because `name_tips()` orders that table with an
+/// *unstable* `QSORT` (builtin/name-rev.c:460) whose permutation the standalone
+/// port reproduces by calling the platform `qsort` itself, and a re-implementation
+/// cannot reproduce by construction. Three annotated tags created in one second on
+/// one commit are exactly such a tie, and which one stock names depends on the rest
+/// of the tip table: measured against 2.55.0 in two repositories differing only in
+/// the refs around that tie group, stock answered `test2^0` in one and `A2^0` in the
+/// other, while the stable re-implementation answered `A2^0` in both.
 fn run_contains(
     revs: &[&str],
     all: bool,
@@ -1234,240 +1096,41 @@ fn run_contains(
     match_pats: &[BString],
     exclude_pats: &[BString],
 ) -> Result<ExitCode> {
-    // Under `--all`, stock 2.55.0 applies describe's own accept test to the ref set
-    // instead of handing the patterns to name-rev: measured against 2.55.0 on an
-    // octopus fixture, `describe --contains --all --exclude 'oct-*' HEAD^3` answers
-    // `main^3` where the branches are still visible it answers `oct-b`, and
-    // `--match heads/oct-b` matches nothing while `--match oct-b` matches — so the
-    // pattern is tested against the name with `refs/heads/`, `refs/remotes/` or
-    // `refs/tags/` stripped, which is `Filter::accepts()`. git 2.50.1 ignores the
-    // patterns under `--all` entirely and answers `oct-b`.
-    let filter = Filter {
-        all,
-        match_pats: match_pats.to_vec(),
-        exclude_pats: exclude_pats.to_vec(),
-    };
-    let mut repo = crate::setup::discover()?;
-    repo.object_cache_size_if_unset(4 * 1024 * 1024);
+    let mut args: Vec<String> = vec![
+        "--peel-tag".into(),
+        "--name-only".into(),
+        "--no-undefined".into(),
+    ];
+    if always {
+        args.push("--always".into());
+    }
+    if !all {
+        args.push("--tags".into());
+    }
 
-    // git delegates only `refs/tags/`-prefixed patterns to name-rev, and only when
-    // not `--all` (under `--all` name-rev sees every ref and no --refs/--exclude).
-    let ref_filters: Vec<BString> = if all {
-        Vec::new()
+    // `refs/tags/` unconditionally; the other two prefixes only under `--all`, and
+    // in git's order: every `--refs` for a prefix, then every `--exclude` for it.
+    let push_prefix = |prefix: &str, args: &mut Vec<String>| {
+        for p in match_pats {
+            args.push(format!("--refs={prefix}{p}"));
+        }
+        for p in exclude_pats {
+            args.push(format!("--exclude={prefix}{p}"));
+        }
+    };
+    push_prefix("refs/tags/", &mut args);
+    if all {
+        push_prefix("refs/heads/", &mut args);
+        push_prefix("refs/remotes/", &mut args);
+    }
+
+    if revs.is_empty() {
+        args.push("HEAD".into());
     } else {
-        match_pats.iter().map(|p| BString::from(format!("refs/tags/{p}"))).collect()
-    };
-    let exclude_filters: Vec<BString> = if all {
-        Vec::new()
-    } else {
-        exclude_pats.iter().map(|p| BString::from(format!("refs/tags/{p}"))).collect()
-    };
-
-    // Resolve the targets (HEAD by default), peeling to commits like name-rev's
-    // --peel-tag on its input. A rev that won't resolve is warned about and skipped,
-    // exactly as name-rev's revision setup does.
-    let default = ["HEAD"];
-    let inputs: &[&str] = if revs.is_empty() { &default } else { revs };
-    let mut targets: Vec<ObjectId> = Vec::new();
-    let mut cutoff = i64::MAX;
-    let mut cache: std::collections::HashMap<ObjectId, CommitInfo> = std::collections::HashMap::new();
-    for rev in inputs {
-        // name-rev's revision setup fails in three distinct ways, and
-        // `--contains` inherits all of them verbatim. `repo_get_oid` is
-        // `get_oid_basic()`, whose first branch takes a full-length hex name as
-        // the id without consulting the odb, so "resolved" and "present" are not
-        // the same question: a well-formed but absent id gets past the first
-        // check and dies at `parse_object` with a different message.
-        let Some(oid) = crate::objname::resolve(&repo, rev) else {
-            eprintln!("Could not get sha1 for {rev}. Skipping.");
-            continue;
-        };
-        let Ok(object) = repo.find_object(oid) else {
-            eprintln!("Could not get object for {rev}. Skipping.");
-            continue;
-        };
-        // `--contains` passes `--peel-tag`, so anything that does not peel to a
-        // commit is reported separately rather than carried as a target.
-        let Ok(commit) = object.peel_to_commit() else {
-            eprintln!("Could not get commit for {rev}. Skipping.");
-            continue;
-        };
-        let oid = commit.id;
-        let date = commit_info(&mut cache, &repo, oid)?.date;
-        if cutoff > date {
-            cutoff = date;
-        }
-        targets.push(oid);
-    }
-    if targets.is_empty() {
-        return Ok(ExitCode::SUCCESS);
-    }
-    // name-rev's slop: allow for a day of clock skew below the oldest target.
-    if cutoff != i64::MAX {
-        cutoff = cutoff.saturating_sub(CUTOFF_DATE_SLOP);
+        args.extend(revs.iter().map(|r| (*r).to_string()));
     }
 
-    // Collect and rank the ref tips (`name_ref` + `cmp_by_tag_and_age`).
-    let mut tips = collect_tips(
-        &repo,
-        all,
-        &ref_filters,
-        &exclude_filters,
-        &filter,
-        &mut cache,
-    )?;
-    tips.sort_by(|a, b| {
-        // Prefer tags, then older tagger date; git's QSORT is unstable on ties.
-        b.from_tag.cmp(&a.from_tag).then(a.taggerdate.cmp(&b.taggerdate))
-    });
-
-    let mut names: std::collections::HashMap<ObjectId, RevName> = std::collections::HashMap::new();
-    for tip in &tips {
-        name_rev(
-            &mut names,
-            &mut cache,
-            &repo,
-            tip.commit,
-            &tip.refname,
-            tip.taggerdate,
-            tip.from_tag,
-            tip.deref,
-            cutoff,
-        )?;
-    }
-
-    // Emit each target in order (`--name-only`, `--no-undefined`): a name if found,
-    // else the abbreviated hash under `--always`, else name-rev's fatal.
-    for oid in &targets {
-        match get_rev_name(&names, oid) {
-            Some(name) => println!("{name}"),
-            None => {
-                if always {
-                    let short = repo.find_object(*oid)?.try_into_commit()?.short_id()?;
-                    println!("{short}");
-                } else {
-                    return fatal(format!("cannot describe '{oid}'"));
-                }
-            }
-        }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// name-rev's `name_ref()` over every ref: apply the tags-only / ref / exclude
-/// filters, peel tag chains (capturing the innermost tagger date and the `deref`
-/// flag), and record the resulting commit tips.
-fn collect_tips(
-    repo: &gix::Repository,
-    all: bool,
-    ref_filters: &[BString],
-    exclude_filters: &[BString],
-    describe_filter: &Filter,
-    cache: &mut std::collections::HashMap<ObjectId, CommitInfo>,
-) -> Result<Vec<Tip>> {
-    let platform = repo.references()?;
-    // Under `!all`, name-rev is `--tags`: only refs/tags/ (iterating tags() is the
-    // same filter). Under `--all` it sees every ref.
-    let iter = if all { platform.all()? } else { platform.tags()? };
-    let mut tips: Vec<Tip> = Vec::new();
-    for r in iter.filter_map(Result::ok) {
-        let full = r.name().as_bstr().to_owned();
-
-        // Under `--all` the patterns never reach name-rev: describe applies its own
-        // accept test to the ref set (see `run_contains`), and `ref_filters` and
-        // `exclude_filters` are empty.
-        if all && !describe_filter.admits(full.as_bstr()) {
-            continue;
-        }
-        // exclude filters win first.
-        if exclude_filters
-            .iter()
-            .any(|f| subpath_matches(full.as_bstr(), f.as_bstr()).is_some())
-        {
-            continue;
-        }
-        // ref filters: at least one must match if any are present.
-        if !ref_filters.is_empty()
-            && !ref_filters
-                .iter()
-                .any(|f| subpath_matches(full.as_bstr(), f.as_bstr()).is_some())
-        {
-            continue;
-        }
-
-        let Some(target) = r.try_id().map(|id| id.detach()) else {
-            continue;
-        };
-        // Peel a tag chain to the underlying commit, remembering the innermost
-        // tagger date and that we dereferenced.
-        let mut obj = repo.find_object(target)?;
-        let mut deref = false;
-        let mut taggerdate = i64::MAX;
-        while obj.kind == gix::object::Kind::Tag {
-            deref = true;
-            taggerdate = obj
-                .to_tag_ref_iter()
-                .tagger()
-                .ok()
-                .flatten()
-                .map(|s| s.seconds())
-                .unwrap_or(0);
-            let Ok(next) = obj.to_tag_ref_iter().target_id() else { break };
-            obj = repo.find_object(next)?;
-        }
-        if obj.kind != gix::object::Kind::Commit {
-            continue;
-        }
-        let commit = obj.id;
-        let from_tag = full.starts_with(b"refs/tags/");
-        if taggerdate == i64::MAX {
-            taggerdate = commit_info(cache, repo, commit)?.date;
-        }
-        tips.push(Tip {
-            commit,
-            refname: tip_refname(repo, full.as_bstr(), all),
-            taggerdate,
-            from_tag,
-            deref,
-        });
-    }
-    Ok(tips)
-}
-
-/// ```c
-/// static void add_to_tip_table(const struct object_id *oid, const char *refname,
-///                              int shorten_unambiguous, …)
-/// {
-///         char *short_refname = NULL;
-///
-///         if (shorten_unambiguous)
-///                 short_refname = refs_shorten_unambiguous_ref(get_main_ref_store(the_repository),
-///                                                              refname, 0);
-///         else if (skip_prefix(refname, "refs/heads/", &refname))
-///                 ; /* refname already advanced */
-///         else
-///                 skip_prefix(refname, "refs/", &refname);
-/// ```
-///
-/// (`builtin/name-rev.c:311-330`.) `shorten_unambiguous` is
-/// `tags_only && name_only`, which `describe --contains` sets because it passes
-/// both — so the tags-only arm is **not** a plain `refs/tags/` strip. It is the
-/// reverse of `ref_rev_parse_rules`: the shortest suffix that still resolves back
-/// to this ref and no other. In a repository holding `refs/top`, `refs/heads/top`
-/// and `refs/tags/top`, the tag shortens to `tags/top`, because `top` alone would
-/// name `refs/top`. Stripping the prefix unconditionally printed `top~1` where
-/// stock prints `tags/top~1`.
-fn tip_refname(repo: &gix::Repository, full: &BStr, all: bool) -> String {
-    let short: Vec<u8> = if !all {
-        crate::refname::shorten_unambiguous(repo, full, false)
-    } else if let Some(rest) = full.strip_prefix(b"refs/heads/") {
-        rest.to_vec()
-    } else if let Some(rest) = full.strip_prefix(b"refs/") {
-        rest.to_vec()
-    } else {
-        full.to_vec()
-    };
-    short.as_bstr().to_str_lossy().into_owned()
+    crate::porcelain::name_rev(&args)
 }
 
 /// Map a gix-shortened ref name back to git's `--all` spelling: the full name with

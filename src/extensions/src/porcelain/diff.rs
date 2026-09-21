@@ -1931,6 +1931,16 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 abbrev_explicit = true;
                 raw_abbrev = None;
             }
+            // `setup_revisions()`: `revs->diff = 1; revs->diffopt.flags.recursive = 1`
+            // (revision.c:2551-2553). `cmd_diff()` assigns
+            // `rev.diffopt.flags.recursive = 1` unconditionally after parsing
+            // (builtin/diff.c:542) and always renders a diff, so for this verb `-r`
+            // changes nothing at all -- it is accepted because git accepts it.
+            //
+            // `-t` is *not* the same no-op: it adds `tree_in_recursive`, which makes a
+            // tree-to-tree diff list each added or removed directory alongside its
+            // blobs, so it stays unsupported rather than silently dropped.
+            "-r" => {}
             // `--no-abbrev` is `revs->abbrev = 0`: the raw format prints whole ids,
             // while the `index` line falls back to the configured default.
             "--no-abbrev" => {

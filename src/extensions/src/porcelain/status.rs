@@ -964,6 +964,67 @@ fn status_report(
         if let Some(death) = death {
             return death.die();
         }
+
+        // ```c
+        // repo_read_index(the_repository);
+        // refresh_index(the_repository->index,
+        //               REFRESH_QUIET|REFRESH_UNMERGED|progress_flag,
+        //               &s.pathspec, NULL, NULL);
+        // ```
+        //
+        // (builtin/commit.c:1628-1631.) `cmd_status` refreshes the index before it
+        // collects, and `repo_update_index_if_able()` (:1657-1658) writes what that
+        // refresh dirtied. Only the attr-source death of this walk was modelled, so
+        // nothing ever repaired stale stat data: a file whose `lstat` had changed
+        // while its content had not stayed "modified" for every `git diff-files`
+        // after the report, and each later command re-hashed it. `progress_flag`
+        // only picks a progress meter, so the machine formats refresh too.
+        //
+        // `use_optional_locks()` gates the write, not the walk (:1635-1638), but a
+        // refresh whose result cannot be saved is pure cost, so both sit behind it
+        // here. The index is written through the same racy-entry path
+        // [`update_index_if_able`] uses, and under the same verification: another
+        // process may have rewritten the file while this one was reading it.
+        if crate::setup::git_env_bool("GIT_OPTIONAL_LOCKS", true) && repo.index_path().exists() {
+            let ps_index = repo.index_or_empty()?;
+            // A pathspec the engine refuses is the collection's to report; git has
+            // already died on it in `parse_pathspec()` by this point, so there is
+            // nothing to refresh either way.
+            let ps = match pathspecs.is_empty() {
+                true => None,
+                false => match repo.pathspec(
+                    false,
+                    &pathspecs,
+                    false,
+                    &ps_index,
+                    gix::worktree::stack::state::attributes::Source::IdMapping,
+                ) {
+                    Ok(ps) => Some(ps),
+                    Err(_) => return Ok(ExitCode::from(128)),
+                },
+            };
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            let mut index = repo.open_index()?;
+            let flags = super::update_index::RefreshFlags {
+                quiet: true,
+                allow_unmerged: true,
+                ..Default::default()
+            };
+            let outcome = match ps {
+                Some(mut ps) => super::update_index::refresh_index(
+                    &repo,
+                    &mut index,
+                    flags,
+                    None,
+                    Some(&mut |p: &gix::bstr::BStr| ps.is_included(p, Some(false))),
+                )?,
+                None => super::update_index::refresh_index(&repo, &mut index, flags, None, None)?,
+            };
+            if outcome.dirty && verify_index(&repo, &index) {
+                super::write_tree::prepare_offset_table(&repo, &mut index);
+                write_index_if_lockable(&repo, &mut index)?;
+            }
+        }
     }
 
     // The porcelain-v2 machine format is a separate renderer with its own,
@@ -1566,8 +1627,30 @@ fn update_index_if_able(repo: &gix::Repository) -> Result<()> {
         return Ok(());
     }
     super::write_tree::prepare_offset_table(repo, &mut index);
-    crate::index_racy::write(repo, &mut index)?;
-    Ok(())
+    write_index_if_lockable(repo, &mut index)
+}
+
+/// `write_locked_index()` for a caller whose lock is optional.
+///
+/// `fd = repo_hold_locked_index(the_repository, &index_lock, 0)`
+/// (builtin/commit.c:1635-1638) carries no `LOCK_DIE_ON_ERROR`: when the lock
+/// cannot be taken — a git directory this user cannot write to, or another
+/// process holding `index.lock` — `fd` stays -1 and
+/// `repo_update_index_if_able()` is skipped entirely (:1657), so the report
+/// still prints and only the refreshed stat data is lost. That is the whole of
+/// what is optional: a failure past the lock is a real write failure and is
+/// still raised.
+fn write_index_if_lockable(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
+    match crate::index_racy::write(repo, index) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let e = anyhow::Error::new(e);
+            match crate::lock::is_lock_contention(&e) {
+                true => Ok(()),
+                false => Err(e),
+            }
+        }
+    }
 }
 
 /// `has_racy_timestamp()` (read-cache.c:2735-2746) over `is_racy_timestamp()`
@@ -3330,6 +3413,42 @@ fn quote_path(path: impl AsRef<[u8]>, prefix: Option<&[u8]>) -> String {
     crate::quote::quoted_name_string(bytes)
 }
 
+/// The same with git's `QUOTE_PATH_QUOTE_SP`:
+///
+/// ```c
+/// int force_dq = ((flags & QUOTE_PATH_QUOTE_SP) && strchr(rel, ' '));
+/// ...
+/// if (force_dq)
+///         strbuf_addch(out, '"');
+/// quote_c_style_counted(rel, strlen(rel), out, NULL, force_dq ? CQUOTE_NODQ : 0);
+/// if (force_dq)
+///         strbuf_addch(out, '"');
+/// ```
+///
+/// (quote.c:350-371.) A space is not a character `quote_c_style()` escapes, so
+/// this flag is the only thing that puts a path like `a file` inside quotes —
+/// and the three short-format printers are the only callers that pass it
+/// (wt-status.c:2037, :2066, :2071, :2086), which is why `git status -s` and
+/// `--porcelain` quote such a path while `--porcelain=v2` and the long format
+/// leave it bare.
+fn quote_path_sp(path: impl AsRef<[u8]>, prefix: Option<&[u8]>) -> String {
+    let rebased;
+    let bytes = match prefix {
+        Some(p) => {
+            rebased = relative_path(path.as_ref(), p);
+            rebased.as_slice()
+        }
+        None => path.as_ref(),
+    };
+    if !bytes.contains(&b' ') {
+        return crate::quote::quoted_name_string(bytes);
+    }
+    let mut out = vec![b'"'];
+    crate::quote::cq_body(bytes, &mut out);
+    out.push(b'"');
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `core.preloadIndex` (`read-cache.c`'s `preload_index()`): git fans the index
 /// refresh's `lstat()` pass out over threads unless the key is false, in which
 /// case `preload_index()` returns immediately and the refresh runs on one
@@ -5077,17 +5196,27 @@ fn render_short(
             format!("{x}{y}")
         };
         match &e.orig {
-            Some(o) => {
-                out.push_str(&format!("{cols} {} -> {}\n", quote_path(o, prefix), quote_path(path, prefix)))
-            }
-            None => out.push_str(&format!("{cols} {}\n", quote_path(path, prefix))),
+            Some(o) => out.push_str(&format!(
+                "{cols} {} -> {}\n",
+                quote_path_sp(o, prefix),
+                quote_path_sp(path, prefix)
+            )),
+            None => out.push_str(&format!("{cols} {}\n", quote_path_sp(path, prefix))),
         }
     }
     for path in untracked {
-        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "??"), quote_path(path, prefix)));
+        out.push_str(&format!(
+            "{} {}\n",
+            colors.paint(Slot::Untracked, "??"),
+            quote_path_sp(path, prefix)
+        ));
     }
     for path in ignored {
-        out.push_str(&format!("{} {}\n", colors.paint(Slot::Untracked, "!!"), quote_path(path, prefix)));
+        out.push_str(&format!(
+            "{} {}\n",
+            colors.paint(Slot::Untracked, "!!"),
+            quote_path_sp(path, prefix)
+        ));
     }
     out
 }

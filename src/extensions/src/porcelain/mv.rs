@@ -230,9 +230,25 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //    lock. The guard is held across validation, the disk renames, and the
     //    single index write below.
     let _lock = (!dry_run).then(|| crate::lock::RepoLock::acquire(repo.git_dir()));
-    let mut index = match repo.open_index() {
-        Ok(i) => i,
-        Err(e) => return fatal(format!("index file corrupt: {e}")),
+    // ```c
+    // if (repo_read_index(the_repository) < 0)
+    //         die(_("index file corrupt"));
+    // ```
+    //
+    // (builtin/mv.c:251-252.) `repo_read_index()` reaches `do_read_index()` with
+    // `must_exist == 0`, which treats an absent file as an *empty* index and
+    // returns success (read-cache.c) — only a file that exists and fails to parse
+    // is `index file corrupt`. Opening unconditionally made every `git mv` in a
+    // repository that has never staged anything die with `index file corrupt: An
+    // IO error occurred while opening the index`, where git reports the real
+    // problem with the arguments (`bad source`, `not under version control`).
+    let mut index = if repo.index_path().exists() {
+        match repo.open_index() {
+            Ok(i) => i,
+            Err(e) => return fatal(format!("index file corrupt: {e}")),
+        }
+    } else {
+        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
     };
 
     // 5. Validation phase — build a plan per source against the pristine index.
@@ -257,6 +273,10 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     let mut only_match_skip_worktree: Vec<String> = Vec::new();
 
     let mut plans: Vec<Plan> = Vec::new();
+    // git's `src_for_dst` (builtin/mv.c:479): the destination of every file move
+    // already accepted. A directory source or a sparse-skipped entry leaves the
+    // checking loop before the insert, so neither is registered here either.
+    let mut src_for_dst: std::collections::BTreeSet<String> = Default::default();
     for s in sources {
         match plan_source(
             &index,
@@ -269,6 +289,8 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             ignore_sparse,
             ignore_case,
             dry_run,
+            verbose,
+            &src_for_dst,
         ) {
             Ok(Planned::SparseSkip(src)) => only_match_skip_worktree.push(src),
             Ok(Planned::Move(plan)) => {
@@ -285,6 +307,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                         continue;
                     }
                 }
+                if !plan.is_dir && !plan.index_only {
+                    src_for_dst.insert(plan.dst_rel.clone());
+                }
                 plans.push(plan)
             }
             Err(e) => {
@@ -292,6 +317,93 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
                 return fatal(format!("{e:#}"));
+            }
+        }
+    }
+
+    // ```c
+    // strvec_push(&sources, path);
+    // strvec_push(&destinations, prefixed_path);
+    //
+    // modes[argc + j] = MOVE_VIA_PARENT_DIR | (ce_skip_worktree(ce) ? SPARSE : INDEX);
+    // …
+    // argc += last - first;
+    // ```
+    //
+    // (builtin/mv.c:394-410.) A directory source appends every index entry under
+    // it to the *end* of `sources`, so the checking loop reaches them only once
+    // it has walked every path the command line named. Under `--dry-run` that
+    // ordering is visible: `git mv -n d d/n dest` announces `d` and `d/n` first
+    // and their expansions afterwards, where printing each expansion from inside
+    // the directory's own check put `d`'s contents ahead of `d/n`.
+    //
+    // A submodule source never reaches the expansion (`goto act_on_entry` at
+    // `:370`), so its self-remap is not announced.
+    if dry_run {
+        for plan in plans.iter().filter(|p| p.is_dir && p.submodule.is_none()) {
+            for (old, new) in &plan.remaps {
+                println!("Checking rename of '{old}' to '{new}'");
+            }
+        }
+    }
+
+    // ```c
+    // for (i = 0; i < argc; i++) {
+    //         const char *slash_pos;
+    //
+    //         if (modes[i] & MOVE_VIA_PARENT_DIR)
+    //                 continue;
+    //
+    //         strbuf_reset(&pathbuf);
+    //         strbuf_addstr(&pathbuf, sources.v[i]);
+    //
+    //         slash_pos = strrchr(pathbuf.buf, '/');
+    //         while (slash_pos > pathbuf.buf) {
+    //                 struct pathmap_entry needle;
+    //
+    //                 strbuf_setlen(&pathbuf, slash_pos - pathbuf.buf);
+    //                 …
+    //                 if (hashmap_get_entry(&moved_dirs, &needle, ent, NULL))
+    //                         die(_("cannot move both '%s' and its parent directory '%s'"),
+    //                             sources.v[i], pathbuf.buf);
+    //
+    //                 slash_pos = strrchr(pathbuf.buf, '/');
+    //         }
+    // }
+    // ```
+    //
+    // (builtin/mv.c:499-523.) `moved_dirs` holds every directory source that was
+    // expanded into its tracked entries (`hashmap_add()` at `:380`) — a submodule
+    // source returns at `:370` before that, and a directory that failed a check
+    // never gets there at all. Moving a path *and* an ancestor of it in one
+    // command would rename the ancestor first and then chase a source that no
+    // longer exists, so git refuses the pair outright.
+    //
+    // This is a `die()`, not a `bad`: `-k` does not suppress it, and it runs
+    // before the sparse report and before the first `rename()`, so the refusal
+    // costs nothing. Without it `git mv d d/a dest` moved `d` and then failed
+    // with `renaming 'd/a' failed: No such file or directory` — having already
+    // moved the directory.
+    let moved_dirs: std::collections::BTreeSet<&str> = plans
+        .iter()
+        .filter(|p| p.is_dir && p.submodule.is_none())
+        .map(|p| p.src_rel.as_str())
+        .collect();
+    if !moved_dirs.is_empty() {
+        for plan in &plans {
+            let src = plan.src_rel.as_str();
+            let mut cut = src.len();
+            while let Some(at) = src[..cut].rfind('/') {
+                if at == 0 {
+                    break;
+                }
+                cut = at;
+                if moved_dirs.contains(&src[..cut]) {
+                    return fatal(format!(
+                        "cannot move both '{src}' and its parent directory '{}'",
+                        &src[..cut]
+                    ));
+                }
             }
         }
     }
@@ -324,7 +436,12 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             // (`MOVE_VIA_PARENT_DIR`, builtin/mv.c:394-407), so the report names the
             // directory and then each file that moved with it.
             println!("Renaming {} to {}", plan.src_rel, plan.dst_rel);
-            if plan.is_dir {
+            // A submodule source returns at builtin/mv.c:370, before the
+            // expansion that appends the directory's index entries, so it has no
+            // second line — its `remaps` list holds only the gitlink entry, which
+            // *is* the move already announced above. Printing it again gave
+            // `git mv -v mod mod2` two identical `Renaming mod to mod2` lines.
+            if plan.is_dir && plan.submodule.is_none() {
                 for (old, new) in &plan.remaps {
                     println!("Renaming {old} to {new}");
                 }
@@ -439,6 +556,10 @@ fn plan_source(
     ignore_sparse: bool,
     ignore_case: bool,
     show_only: bool,
+    verbose: bool,
+    // git's `src_for_dst`: the destinations of the file moves already accepted
+    // by this run, which is what makes a second source for one target an error.
+    src_for_dst: &std::collections::BTreeSet<String>,
 ) -> Result<Planned> {
     let src_rel = normalize_rel(workdir, prefix, src_arg)?;
     let src_abs = workdir.join(&src_rel);
@@ -578,8 +699,20 @@ fn plan_source(
                 remaps.push((old, new));
             }
         }
+        // ```c
+        // } else if (index_range_of_same_dir(src, length,
+        //                                    &first, &last) < 1) {
+        //         bad = _("source directory is empty");
+        //         goto act_on_entry;
+        // }
+        // ```
+        //
+        // (builtin/mv.c:371-375.) A directory that exists on disk but holds no
+        // index entry never reaches the `not under version control` test at
+        // `:413` — that one only sees non-directories. git names the actual
+        // problem: the directory has nothing tracked under it to move.
         if remaps.is_empty() {
-            crate::git_fatal!("not under version control, source={src_rel}, destination={dst_rel}");
+            crate::git_fatal!("source directory is empty, source={src_rel}, destination={dst_rel}");
         }
         // A directory destination that already exists on disk can't be merged
         // here; git refuses it too (only file destinations honor -f).
@@ -623,6 +756,50 @@ fn plan_source(
         if !force && (clobbers || is_tracked(index, &dst_rel)) {
             crate::git_fatal!("destination exists, source={src_rel}, destination={dst_rel}");
         }
+        // ```c
+        // if (force) {
+        //         /*
+        //          * only files can overwrite each other:
+        //          * check both source and destination
+        //          */
+        //         if (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode)) {
+        //                 if (verbose)
+        //                         warning(_("overwriting '%s'"), dst);
+        //                 bad = NULL;
+        //         } else
+        //                 bad = _("Cannot overwrite");
+        // }
+        // ```
+        //
+        // (builtin/mv.c:424-435.) `-f` only *silences* the refusal; with `-v` git
+        // still says on stderr which file it is about to destroy. The warning is
+        // tied to the destination existing on disk, not to `-f` alone, and to the
+        // same `clobbers` test the refusal uses — a case-only rename on a
+        // case-insensitive filesystem is its own destination and overwrites
+        // nothing.
+        if force && verbose && clobbers {
+            eprintln!("warning: overwriting '{dst_rel}'");
+        }
+        // ```c
+        // if (string_list_has_string(&src_for_dst, dst)) {
+        //         bad = _("multiple sources for the same target");
+        //         goto act_on_entry;
+        // }
+        // ```
+        //
+        // (builtin/mv.c:438-441.) `src_for_dst` collects the destination of every
+        // *file* move this run has already accepted — a directory source and a
+        // sparse-only entry both reach `act_on_entry` before the
+        // `string_list_insert()` at `:479`, so neither registers. Without this
+        // test the second `git mv d/a d/a dest` renamed the file, then tried to
+        // rename it again from a path that no longer existed and died with
+        // `renaming 'd/a' failed: No such file or directory` — after the first
+        // rename had already landed.
+        if src_for_dst.contains(&dst_rel) {
+            crate::git_fatal!(
+                "multiple sources for the same target, source={src_rel}, destination={dst_rel}"
+            );
+        }
         vec![(src_rel.clone(), dst_rel.clone())]
     };
 
@@ -635,16 +812,6 @@ fn plan_source(
     }
 
     let is_dir = meta.is_dir();
-    // `MOVE_VIA_PARENT_DIR` (builtin/mv.c:394-409) appends every index entry under
-    // a directory source to `sources`/`destinations` and grows `argc`, so the
-    // checking loop reaches each of them on a later iteration and prints its own
-    // `Checking rename of …` line — after the directory's. These remaps are that
-    // list, in index order, which is the order git appends them in.
-    if show_only && is_dir {
-        for (old, new) in &remaps {
-            println!("Checking rename of '{old}' to '{new}'");
-        }
-    }
     Ok(Planned::Move(Plan {
         src_abs,
         dst_abs,

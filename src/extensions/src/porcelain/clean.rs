@@ -518,28 +518,68 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
 
     let mut out = String::new();
     let mut failed = false;
+    // `msg_remove` / `msg_would_remove`: one string chosen once, used at every
+    // site that reports a path this pass disposed of.
+    let removing = if dry_run { "Would remove" } else { "Removing" };
+    let cwd_real = std::env::current_dir().ok().and_then(|p| gix::path::realpath(p).ok());
     for (key, rela_path, is_dir) in targets {
         let shown = quote_path(relative_to_prefix(key.as_bstr(), &prefix_parts));
-
-        if dry_run {
-            if !quiet {
-                out.push_str(&format!("Would remove {shown}\n"));
-            }
-            continue;
-        }
 
         let Some(abs) = repo.workdir_path(&rela_path) else {
             continue;
         };
-        let res = if is_dir {
-            std::fs::remove_dir_all(&abs)
-        } else {
-            std::fs::remove_file(&abs)
-        };
+        // ```c
+        // /*
+        //  * we might have removed this as part of earlier
+        //  * recursive directory removal, so lstat() here could
+        //  * fail with ENOENT.
+        //  */
+        // if (lstat(abs_path.buf, &st))
+        //         continue;
+        // ```
+        //
+        // (builtin/clean.c:1062-1068.) A candidate that a previously removed
+        // parent already took with it is dropped silently — no warning, no line.
+        if abs.symlink_metadata().is_err() {
+            continue;
+        }
+        if is_dir {
+            // ```c
+            // if (S_ISDIR(st.st_mode)) {
+            //         if (remove_dirs(&abs_path, prefix, rm_flags, dry_run, quiet, &gone))
+            //                 errors++;
+            //         if (gone && !quiet) {
+            //                 qname = quote_path(item->string, NULL, &buf, 0);
+            //                 printf(dry_run ? _(msg_would_remove) : _(msg_remove), qname);
+            //         }
+            // }
+            // ```
+            //
+            // (builtin/clean.c:1070-1076.) The directory's own line is only
+            // printed when the whole subtree went; a directory that could not be
+            // emptied reports the leaves that *did* go instead, from inside
+            // `remove_dirs()`.
+            let mut gone = true;
+            let ctx = RemoveDirs {
+                prefix_parts: &prefix_parts,
+                keep_nested_git: force < 2,
+                dry_run,
+                quiet,
+                cwd_real: cwd_real.as_deref(),
+            };
+            if ctx.run(&abs, rela_path.as_bstr(), &mut out, &mut gone) {
+                failed = true;
+            }
+            if gone && !quiet {
+                out.push_str(&format!("{removing} {shown}\n"));
+            }
+            continue;
+        }
+        let res = if dry_run { Ok(()) } else { std::fs::remove_file(&abs) };
         match res {
             Ok(()) => {
                 if !quiet {
-                    out.push_str(&format!("Removing {shown}\n"));
+                    out.push_str(&format!("{removing} {shown}\n"));
                 }
             }
             Err(err) => {
@@ -557,6 +597,211 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `remove_dirs()` (builtin/clean.c:163-292) — the recursive directory removal
+/// `cmd_clean()` uses for every directory candidate, in place of a bulk
+/// `remove_dir_all`.
+///
+/// The recursion is not an implementation detail: it is what produces git's
+/// output. `remove_dir_all` gives one result for the whole subtree, so a
+/// directory that could only be partly emptied reported the *directory* as the
+/// thing that failed (`warning: failed to remove top/`) and printed nothing
+/// about the files that did go — where git names the leaf that actually refused
+/// (`warning: failed to remove top/ro/b`) and then lists every path it managed
+/// to remove. It also stops at the first error, leaving behind entries git would
+/// have removed.
+///
+/// Three other behaviours live in the same function and come with the port:
+/// a nested repository found *below* a candidate is announced and keeps its
+/// parent alive (`Skipping repository …`); an unreadable directory still gets an
+/// `rmdir` attempt, since an empty one can be removed without being listed; and
+/// a directory that turns out to be the process's original working directory is
+/// refused rather than removed.
+struct RemoveDirs<'a> {
+    /// The repo-relative current directory, for rendering paths as git does.
+    prefix_parts: &'a [&'a [u8]],
+    /// git's `REMOVE_DIR_KEEP_NESTED_GIT`, set unless `-f` was given twice.
+    keep_nested_git: bool,
+    dry_run: bool,
+    quiet: bool,
+    /// `realpath(startup_info->original_cwd)`, compared against each directory
+    /// before it is removed.
+    cwd_real: Option<&'a std::path::Path>,
+}
+
+impl RemoveDirs<'_> {
+    /// Returns git's `ret` — `true` when something could not be removed — and
+    /// sets `dir_gone` to whether `abs` itself is gone.
+    fn run(
+        &self,
+        abs: &std::path::Path,
+        rela: &BStr,
+        out: &mut String,
+        dir_gone: &mut bool,
+    ) -> bool {
+        let mut ret = false;
+        *dir_gone = true;
+
+        let shown = |p: &BStr| quote_path(relative_to_prefix(p, self.prefix_parts));
+        // stdout is buffered so the `Removing` lines stay in walk order; a
+        // warning has to see everything printed before it, as git's unbuffered
+        // `printf`/`warning_errno` pair does.
+        let warn = |out: &mut String, text: String| {
+            print!("{out}");
+            out.clear();
+            eprint!("{text}");
+        };
+
+        // ```c
+        // if ((force_flag & REMOVE_DIR_KEEP_NESTED_GIT) &&
+        //     is_nonbare_repository_dir(path)) {
+        //         if (!quiet) { … printf(dry_run ? _(msg_would_skip_git_dir) : _(msg_skip_git_dir), quoted.buf); }
+        //         *dir_gone = 0;
+        //         goto out;
+        // }
+        // ```
+        //
+        // (builtin/clean.c:176-186.) `is_nonbare_repository_dir()` (setup.c:405)
+        // looks at `<dir>/.git` alone, which is the same test the top-level
+        // candidate filter makes.
+        if self.keep_nested_git && abs.join(".git").exists() {
+            if !self.quiet {
+                let verb = if self.dry_run { "Would skip" } else { "Skipping" };
+                out.push_str(&format!("{verb} repository {}\n", shown(rela)));
+            }
+            *dir_gone = false;
+            return ret;
+        }
+
+        // ```c
+        // dir = opendir(path->buf);
+        // if (!dir) {
+        //         /* an empty dir could be removed even if it is unreadble */
+        //         res = dry_run ? 0 : rmdir(path->buf);
+        //         …
+        // }
+        // ```
+        //
+        // (builtin/clean.c:188-201.)
+        let entries = match std::fs::read_dir(abs) {
+            Ok(it) => it,
+            Err(_) => {
+                let res = if self.dry_run { Ok(()) } else { std::fs::remove_dir(abs) };
+                if let Err(err) = res {
+                    warn(
+                        out,
+                        format!(
+                            "warning: failed to remove {}: {}\n",
+                            shown(rela),
+                            errno_text(&err)
+                        ),
+                    );
+                    *dir_gone = false;
+                    ret = true;
+                }
+                return ret;
+            }
+        };
+
+        // `dels`: the children that went, reported only if this directory
+        // survives — otherwise the caller prints the directory's own line
+        // instead (builtin/clean.c:281-285).
+        let mut dels: Vec<String> = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let child_abs = entry.path();
+            let mut child_rela = BString::from(rela.to_vec());
+            child_rela.push(b'/');
+            child_rela.extend_from_slice(gix::path::os_str_into_bstr(&entry.file_name()).unwrap_or_default());
+
+            // ```c
+            // if (lstat(path->buf, &st))
+            //         warning_errno(_(msg_warn_lstat_failed), path->buf);
+            // ```
+            //
+            // (builtin/clean.c:211-212.) The message carries its own `\n` and is
+            // given the raw path, not the quoted one, so `warning_errno` adds a
+            // second line holding the reason.
+            let Ok(meta) = child_abs.symlink_metadata() else {
+                warn(out, format!("warning: could not lstat {child_rela}\n: unknown error\n"));
+                *dir_gone = false;
+                ret = true;
+                continue;
+            };
+            if meta.is_dir() {
+                let mut gone = true;
+                if self.run(&child_abs, child_rela.as_bstr(), out, &mut gone) {
+                    ret = true;
+                }
+                if gone {
+                    dels.push(shown(child_rela.as_bstr()));
+                } else {
+                    *dir_gone = false;
+                }
+                continue;
+            }
+            let res = if self.dry_run { Ok(()) } else { std::fs::remove_file(&child_abs) };
+            match res {
+                Ok(()) => dels.push(shown(child_rela.as_bstr())),
+                Err(err) => {
+                    warn(
+                        out,
+                        format!(
+                            "warning: failed to remove {}: {}\n",
+                            shown(child_rela.as_bstr()),
+                            errno_text(&err)
+                        ),
+                    );
+                    *dir_gone = false;
+                    ret = true;
+                }
+            }
+        }
+
+        if *dir_gone {
+            // ```c
+            // if (!strbuf_cmp(&realpath, &real_ocwd)) {
+            //         printf("%s", dry_run ? _(msg_would_skip_cwd) : _(msg_skip_cwd));
+            //         *dir_gone = 0;
+            // } else { res = dry_run ? 0 : rmdir(path->buf); … }
+            // ```
+            //
+            // (builtin/clean.c:247-278.) Both sides are resolved before the
+            // comparison, so a symlinked or `..`-laden cwd still matches.
+            let real = gix::path::realpath(abs).ok();
+            if real.is_some() && real.as_deref() == self.cwd_real {
+                out.push_str(if self.dry_run {
+                    "Would refuse to remove current working directory\n"
+                } else {
+                    "Refusing to remove current working directory\n"
+                });
+                *dir_gone = false;
+            } else {
+                let res = if self.dry_run { Ok(()) } else { std::fs::remove_dir(abs) };
+                if let Err(err) = res {
+                    warn(
+                        out,
+                        format!(
+                            "warning: failed to remove {}: {}\n",
+                            shown(rela),
+                            errno_text(&err)
+                        ),
+                    );
+                    *dir_gone = false;
+                    ret = true;
+                }
+            }
+        }
+
+        if !*dir_gone && !self.quiet {
+            let verb = if self.dry_run { "Would remove" } else { "Removing" };
+            for d in &dels {
+                out.push_str(&format!("{verb} {d}\n"));
+            }
+        }
+        ret
+    }
 }
 
 /// Why a bare `:(attr:…)` pathspec is kept out of the walk and applied to what

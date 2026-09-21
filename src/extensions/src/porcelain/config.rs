@@ -2894,6 +2894,21 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
         [spec, url] => (*spec, *url),
         _ => return usage_error("wrong number of arguments, should be 2"),
     };
+    // ```c
+    // config.section = section = xstrdup_tolower(var);
+    // section_tail = strchr(section, '.');
+    // if (section_tail) {
+    //         *section_tail = '\0';
+    //         config.key = section_tail + 1;
+    //         display_opts.show_keys = 0;
+    // } else {
+    //         config.key = NULL;
+    //         display_opts.show_keys = 1;
+    // }
+    // ```
+    //
+    // (`get_urlmatch()`, builtin/config.c:874-883.) A whole-section query prints the
+    // synthesized `section.key` ahead of each value; a single-key one prints values alone.
     let (section, key) = match spec.split_once('.') {
         Some((s, k)) => (s.to_lowercase(), Some(k.to_lowercase())),
         None => (spec.to_lowercase(), None),
@@ -2905,57 +2920,87 @@ fn get_urlmatch(file: &gix::config::File, positional: &[&str], d: &Display) -> R
         Err(message) => return Ok(fatal(message)),
     };
 
-    // key -> (match, value): the winner for each key seen so far.
-    let mut best: std::collections::BTreeMap<String, (UrlMatch, Vec<u8>)> =
-        std::collections::BTreeMap::new();
+    // `string_list_insert(&collect->vars, key)` keeps one winner per key, and the list is
+    // sorted — which is the order the values come out in.
+    //
+    // The value is `Option`: a name written with no `=` is collected with
+    // `value_is_null = 1` (`urlmatch_collect_fn()`, builtin/config.c:847-852) and reaches
+    // `format_config()` as NULL, so `--bool` reads it as true and a bare listing prints
+    // the key alone. Dropping those entries made `[http] sslVerify` invisible to
+    // `--get-urlmatch http.sslVerify`, which then reported the key as unset.
+    //
+    // The metadata is the winning entry's own `key_value_info` (:842), so `--show-scope`
+    // names the file the value came from rather than the command line.
+    type Winner = (UrlMatch, Option<Vec<u8>>, gix::config::file::Metadata);
+    let mut best: std::collections::BTreeMap<String, Winner> = std::collections::BTreeMap::new();
 
-    for sec in file.sections() {
-        if is_synthetic(sec.meta().source) || sec.header().name() != section.as_str() {
-            continue;
-        }
-        let score = match sec.header().subsection_name() {
-            // A section with no subsection carries no URL to match, so
-            // `urlmatch_config_entry()` never calls `match_urls()` for it and its
-            // `urlmatch_item` stays all-zero: it matches every URL, at the lowest
-            // specificity there is.
-            None => UrlMatch::default(),
-            Some(pattern) => {
-                let text = pattern.to_string();
-                // A subsection that will not normalize is simply not a match —
-                // `url_normalize_1()` returning NULL is `retval = 0` there
-                // (urlmatch.c:707-714), never a diagnostic.
-                match url_normalize(&text, true).ok().and_then(|p| match_urls(&want, &p)) {
-                    Some(score) => score,
-                    None => continue,
+    // The same merged read every other action goes through: `config_with_options()`
+    // (builtin/config.c:888) walks the whole cascade, command-line entries included.
+    for_each_entry(file, d.command_line, |name, value, implicit, meta| {
+        // ```c
+        // if (!skip_prefix(var, collect->section, &key) || *(key++) != '.')
+        //         return 0; /* not interested */
+        // ```
+        let Some(rest) = name.strip_prefix(section.as_str()).filter(|r| r.starts_with('.')) else {
+            return Ok(());
+        };
+        let rest = &rest[1..];
+        // `dot = strrchr(key, '.')`: everything before the LAST dot is the URL pattern
+        // the subsection spelled, and a section with no subsection matches every URL at
+        // the lowest specificity there is (`urlmatch_config_entry()`, urlmatch.c:572-591).
+        let (score, leaf) = match rest.rfind('.') {
+            Some(dot) => {
+                // A pattern that will not normalize is simply not a match
+                // (`retval = 0`, urlmatch.c:584-587), never a diagnostic.
+                match url_normalize(&rest[..dot], true).ok().and_then(|p| match_urls(&want, &p)) {
+                    Some(score) => (score, &rest[dot + 1..]),
+                    None => return Ok(()),
                 }
             }
+            None => (UrlMatch::default(), rest),
         };
-        for name in sec.value_names() {
-            let lname = name.to_lowercase();
-            if key.as_ref().is_some_and(|k| *k != lname) {
-                continue;
-            }
-            let Some(value) = sec.value(&lname) else { continue };
-            let entry = best.entry(lname).or_insert_with(|| (UrlMatch::default(), Vec::new()));
-            if entry.1.is_empty() || score >= entry.0 {
-                *entry = (score, value.to_vec());
+        if key.as_ref().is_some_and(|k| k != leaf) {
+            return Ok(());
+        }
+        // `if (select_fn(&matched, item->util) < 0) return 0;` — a worse match is
+        // discarded, an equal or better one replaces what is there.
+        let value = (!implicit).then(|| value.to_vec());
+        match best.get_mut(leaf) {
+            Some(held) if score < held.0 => {}
+            Some(held) => *held = (score, value, meta.clone()),
+            None => {
+                best.insert(leaf.to_owned(), (score, value, meta.clone()));
             }
         }
-    }
+        Ok(())
+    })?;
 
+    // `ret = !values.nr;`
     if best.is_empty() {
         return Ok(ExitCode::from(1));
     }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let meta = gix::config::file::Metadata::from(Source::Cli);
-    for (name, (_, value)) in &best {
-        // A single-key query prints the value alone; a whole-section query
-        // prints `section.key value`, as git does.
-        match &key {
-            Some(_) => emit_kv(&mut out, d, name, value, &meta, b' ', false)?,
-            None => emit_kv(&mut out, d, &format!("{section}.{name}"), value, &meta, b' ', true)?,
-        }
+    for (leaf, (_, value, meta)) in &best {
+        let shown = format!("{section}.{leaf}");
+        // `format_config()` applies `--type` to the value, and a NULL one under a type is
+        // the type's reading of "set but valueless" — `true` for `--bool`.
+        let typed_value = match value {
+            Some(v) => match typed(d, &shown, v, false, meta) {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => continue,
+                Err(code) => return Ok(code),
+            },
+            None => match d.ty {
+                Some(_) => match typed(d, &shown, b"", true, meta) {
+                    Ok(Some(v)) => Some(v),
+                    Ok(None) => continue,
+                    Err(code) => return Ok(code),
+                },
+                None => None,
+            },
+        };
+        emit_kv_opt(&mut out, d, &shown, typed_value.as_deref(), meta, b' ', key.is_none())?;
     }
     Ok(ExitCode::SUCCESS)
 }

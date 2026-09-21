@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use std::collections::{HashMap, VecDeque};
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 use gix::bstr::{BString, ByteSlice};
@@ -46,6 +46,12 @@ use gix::prelude::ObjectIdExt;
 pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
 
+    // `repo_config(the_repository, git_show_branch_config, NULL)`
+    // (builtin/show-branch.c:718) runs *before* `parse_options()`, so a
+    // `color.showbranch` that `git_config_colorbool()` cannot read is fatal
+    // ahead of any command-line refusal.
+    let color_config = read_color_config(&repo)?;
+
     // `cmd_show_branch`: with no argument at all, `showbranch.default` supplies argv.
     let mut argv: Vec<String> = args.to_vec();
     if argv.is_empty() {
@@ -68,6 +74,10 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
                 eprintln!("{msg}");
             }
             eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
+        }
+        Err(ParseFail::Bare(msg)) => {
+            eprintln!("{msg}");
             return Ok(ExitCode::from(129));
         }
         Err(ParseFail::Ambiguous(tok, first, second)) => {
@@ -104,13 +114,10 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
         opts.all_heads = true;
     }
 
-    let color = color_enabled(&repo, opts.color)?;
+    let color = color_enabled(&repo, opts.color, color_config);
 
     // ---- collect the ref names to show, in git's order ----
     let mut names: Vec<String> = Vec::new();
-    // Reflog mode resolves each `<ref>@{n}` to an object up front; the ordinary
-    // path leaves resolution to the `repo_get_oid(ref_name[i])` loop below.
-    let mut reflog_oids: Vec<ObjectId> = Vec::new();
     let mut reflog_msgs: Vec<String> = Vec::new();
 
     if opts.reflog != 0 {
@@ -119,7 +126,6 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
             &revs,
             &opts,
             &mut names,
-            &mut reflog_oids,
             &mut reflog_msgs,
         ) {
             Ok(()) => {}
@@ -175,11 +181,20 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     let mut rev_ids: Vec<ObjectId> = Vec::with_capacity(names.len());
 
     for (i, name) in names.iter().enumerate() {
-        let resolved = match reflog_oids.get(i) {
-            Some(&id) => Some(id),
-            None => resolve_commit(&repo, name),
-        };
-        let Some(id) = resolved else {
+        // Every name goes back through `repo_get_oid()` here
+        // (builtin/show-branch.c:879), reflog pseudo-refs included: the id
+        // `read_ref_at()` produced reached only `append_ref()`, where it decides
+        // whether the entry peels to a commit and is then dropped.
+        //
+        // The two are not always the same object, and `--reflog HEAD` is where
+        // that shows. `repo_dwim_ref("HEAD")` answers with the name it *resolved
+        // to*, so the log that is read is `refs/heads/<branch>`'s, while the name
+        // recorded is `HEAD@{<i>}` — and `HEAD@{<i>}` re-resolves against **HEAD's
+        // own** reflog, which carries the `checkout:` entries the branch log does
+        // not. Under stock 2.55.0 the captions therefore come from the branch log
+        // while the commits come from the HEAD log; reusing the read id made the
+        // two agree, which is the one thing git does not do here.
+        let Some(id) = resolve_commit(&repo, name) else {
             eprintln!("fatal: '{name}' is not a valid ref.");
             return Ok(ExitCode::from(128));
         };
@@ -438,6 +453,14 @@ enum ParseFail {
     /// A rejection: `usage_with_options()`'s `error:` line (when there is one)
     /// and the block, both on stderr, 129.
     Rejected(Option<String>),
+    /// `PARSE_OPT_ERROR`: the `error:` line alone, on stderr, 129 — **no usage
+    /// block**. `get_value()` and an option callback both report by returning
+    /// `error()`'s -1, and `parse_options()` answers that with a bare
+    /// `exit(129)` (parse-options.c:1198-1201) rather than the
+    /// `usage_with_options()` its `PARSE_OPT_UNKNOWN` neighbour calls. Verified
+    /// against stock 2.55.0: `show-branch --reflog=bogus` writes 41 bytes to
+    /// stderr where `show-branch -Z` writes 1472.
+    Bare(String),
     /// An abbreviation two entries claim, carrying the token as typed and the two
     /// candidate spellings. It is the one refusal whose block goes to **stdout**:
     /// `parse_long_opt()` prints the reason with `error()` and returns
@@ -452,18 +475,124 @@ const BAD_COLOR: &str = "error: option `color' expects \"always\", \"auto\", or 
 /// `DEFAULT_REFLOG`. The leading digit run is read `strtoul`-style, so anything
 /// after it must be the `,<base>` separator.
 fn parse_reflog_param(arg: &str, opts: &mut Opts) -> Result<(), ParseFail> {
-    let end = arg.find(|c: char| !c.is_ascii_digit()).unwrap_or(arg.len());
-    let n: i32 = arg[..end].parse().unwrap_or(0);
+    let (n, end) = strtoul(arg);
     let rest = &arg[end..];
     if let Some(base) = rest.strip_prefix(',') {
         opts.reflog_base = Some(base.to_string());
     } else if !rest.is_empty() {
-        return Err(ParseFail::Rejected(Some(format!("error: unrecognized reflog param '{arg}'"))));
+        return Err(ParseFail::Bare(format!("error: unrecognized reflog param '{arg}'")));
     } else {
         opts.reflog_base = None;
     }
-    opts.reflog = if n == 0 { DEFAULT_REFLOG } else { n };
+    // `if (reflog <= 0) reflog = DEFAULT_REFLOG;` — a *negative* count falls back
+    // just as a zero one does, which is the whole reason `-1` and `-3` are legal
+    // spellings rather than rejections.
+    opts.reflog = if n <= 0 { DEFAULT_REFLOG } else { n };
     Ok(())
+}
+
+/// C's `strtoul(nptr, &endptr, 10)` as show-branch uses it, returning the value
+/// truncated into the `int` it is assigned to plus the byte offset `endptr`
+/// lands on.
+///
+/// Both `<n>` and `<base>` of `--reflog=<n>[,<base>]` go through it
+/// (builtin/show-branch.c:630 and :792), and its grammar is wider than a digit
+/// run in three ways that are all observable:
+///
+///   * leading whitespace is skipped, so `--reflog=' 3'` is 3;
+///   * a `+`/`-` sign is consumed, and a negative value is the *unsigned*
+///     accumulation negated — `-1` becomes `ULONG_MAX`, which lands in `int` as
+///     `-1` and so trips the `<= 0` fallback rather than being refused;
+///   * the result wraps into `int`, so `4294967298` is 2 and not an overflow.
+///
+/// When no digit is converted `endptr` is left at the start of the string
+/// (C99 7.20.1.4p7), which is what lets `--reflog=,3` reach the `,<base>` arm
+/// and `--reflog=-` reach the refusal.
+fn strtoul(s: &str) -> (i32, usize) {
+    let b = s.as_bytes();
+    let mut i = 0;
+    // The "C" locale's `isspace`, which includes the vertical tab Rust's
+    // `is_ascii_whitespace` leaves out.
+    while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')) {
+        i += 1;
+    }
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = i;
+    let mut acc: u64 = 0;
+    let mut overflow = false;
+    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+        acc = match acc
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(b[i] - b'0')))
+        {
+            Some(v) => v,
+            None => {
+                overflow = true;
+                acc
+            }
+        };
+        i += 1;
+    }
+    if i == digits {
+        // No conversion performed: `endptr` is the original string.
+        return (0, 0);
+    }
+    // On overflow `strtoul` answers `ULONG_MAX` and only sets `errno`, which
+    // neither call site reads.
+    let value = match (overflow, negative) {
+        (true, _) => u64::MAX,
+        (false, true) => acc.wrapping_neg(),
+        (false, false) => acc,
+    };
+    (value as i32, i)
+}
+
+/// `do_get_value()`'s two `takes no value` refusals (parse-options.c:138-143),
+/// for a `--<name>=<value>` token:
+///
+/// ```c
+/// if (unset && p->opt)
+///         return error(_("%s takes no value"), optname(opt, flags));
+/// ...
+/// if (!(flags & OPT_SHORT) && p->opt && (opt->flags & PARSE_OPT_NOARG))
+///         return error(_("%s takes no value"), optname(opt, flags));
+/// ```
+///
+/// Both are `PARSE_OPT_ERROR`, so neither prints the usage block. The name is
+/// `optname()`'s (parse-options.c:30-45): the **table's** spelling, with a `no-`
+/// glued on for the unset sense — which is why `--name=x` is reported as
+/// `no-no-name` and `--al=x` as `all`. Without this the tokens fell through to
+/// the `unknown option` arm, which quotes the value too and *does* print usage.
+fn takes_no_value(tok: &str) -> Result<(), ParseFail> {
+    let Some(body) = tok.strip_prefix("--") else {
+        return Ok(());
+    };
+    // `p->opt` is set only when `parse_long_opt()` found an `=`; an empty value
+    // still sets it, so `--all=` is refused like `--all=x`.
+    let Some((name, _)) = body.split_once('=') else {
+        return Ok(());
+    };
+    let super::Resolved::One(opt, unset) = super::resolve_long(LONG_OPTS, name) else {
+        return Ok(());
+    };
+    if !unset && !matches!(opt.arg, super::Arg::None) {
+        return Ok(());
+    }
+    let shown = match unset {
+        true => format!("no-{}", opt.name),
+        false => opt.name.to_string(),
+    };
+    Err(ParseFail::Bare(format!("error: option `{shown}' takes no value")))
 }
 
 /// `parse_options(..., PARSE_OPT_STOP_AT_NON_OPTION)` — option parsing stops at
@@ -500,6 +629,7 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                 return Err(ParseFail::Ambiguous(a.to_string(), first, second))
             }
         };
+        takes_no_value(argv[i].as_str())?;
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "all" => opts.all_heads = true,
@@ -539,7 +669,7 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                 _ if long.starts_with("more=") => {
                     let n = &long["more=".len()..];
                     let v = crate::optint::integer(&crate::optint::long_opt("more"), n)
-                        .map_err(|e| ParseFail::Rejected(Some(format!("error: {e}"))))?;
+                        .map_err(|e| ParseFail::Bare(format!("error: {e}")))?;
                     opts.extra = v as i32;
                 }
                 _ if long.starts_with("color=") => {
@@ -547,7 +677,7 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                         "always" => Some(true),
                         "never" => Some(false),
                         "auto" => None,
-                        _ => return Err(ParseFail::Rejected(Some(BAD_COLOR.to_string()))),
+                        _ => return Err(ParseFail::Bare(BAD_COLOR.to_string())),
                     };
                 }
                 // `error(_("unknown option `%s'"), ctx.argv[0] + 2)`
@@ -1149,38 +1279,58 @@ fn color_reset(on: bool) -> &'static str {
     }
 }
 
-/// `want_color()` — the command line wins, then `color.showbranch`, then
-/// `color.ui`; `auto` (the default) means an interactive stdout on a real term.
-fn color_enabled(repo: &gix::Repository, cli: Option<bool>) -> Result<bool> {
-    if let Some(v) = cli {
-        return Ok(v);
+/// `git_show_branch_config()`'s `color.showbranch` arm (builtin/show-branch.c:588-591),
+/// run at config time and therefore ahead of every command-line diagnostic:
+///
+/// ```c
+/// if (!strcmp(var, "color.showbranch")) {
+///         showbranch_use_color = git_config_colorbool(var, value);
+///         return 0;
+/// }
+/// ```
+///
+/// `git_config_colorbool()` (color.c:383-403) takes `never`/`always`/`auto` as
+/// words and hands everything else to `git_config_bool()`, which `die()`s on a
+/// value that is not a boolean. That death happens whatever the command line
+/// goes on to say, so the read is separated from the decision below.
+fn read_color_config(repo: &gix::Repository) -> Result<Option<String>> {
+    let Some(raw) = repo
+        .config_snapshot()
+        .string("color.showbranch")
+        .map(|v| v.to_string())
+    else {
+        return Ok(None);
+    };
+    let is_word = ["never", "always", "auto"]
+        .iter()
+        .any(|w| raw.eq_ignore_ascii_case(w));
+    if !is_word && crate::optint::maybe_bool(&raw).is_none() {
+        crate::git_fatal!("bad boolean config value '{raw}' for 'color.showbranch'");
     }
-    let snapshot = repo.config_snapshot();
-    for key in ["color.showbranch", "color.ui"] {
-        if let Some(raw) = snapshot.string(key) {
-            let value = raw.to_str_lossy().to_lowercase();
-            return Ok(match value.as_str() {
-                "always" => true,
-                "auto" => auto_color(),
-                "true" | "yes" | "on" | "1" => true,
-                "false" | "no" | "off" | "0" | "" => false,
-                other => crate::git_fatal!("invalid value {other:?} for {key}"),
-            });
-        }
-        // A valueless key (`[color]\n\tui`) is boolean true.
-        if let Some(b) = snapshot.boolean(key) {
-            return Ok(b);
-        }
-    }
-    Ok(auto_color())
+    Ok(Some(raw))
 }
 
-/// `check_auto_color()` — a tty on stdout, and a `TERM` that is not `dumb`.
-fn auto_color() -> bool {
-    if !std::io::stdout().is_terminal() {
-        return false;
+/// `want_color(showbranch_use_color)` — the command line wins, then
+/// `color.showbranch`, then `color.ui`.
+///
+/// The tri-state is [`super::color::want_color_stdout_raw`], which is
+/// `git_config_colorbool()` plus `check_auto_color()`. Spelling it out here
+/// instead got the most common configuration wrong: `git_config_colorbool()`
+/// answers **`GIT_COLOR_AUTO`, not `GIT_COLOR_ALWAYS`**, for an ordinary
+/// boolean-true value ("any normal truth value defaults to 'auto'",
+/// color.c:401-402), so a plain `color.ui = true` — what `git config --global
+/// color.ui true` writes — must still be gated on stdout being a terminal. It
+/// also had no `never` arm at all and turned `color.ui = never` into a fatal.
+fn color_enabled(repo: &gix::Repository, cli: Option<bool>, config: Option<String>) -> bool {
+    if let Some(v) = cli {
+        return v;
     }
-    matches!(std::env::var("TERM"), Ok(t) if t != "dumb")
+    let raw = config.or_else(|| {
+        repo.config_snapshot()
+            .string("color.ui")
+            .map(|v| v.to_string())
+    });
+    super::color::want_color_stdout_raw(repo, raw.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,11 +1603,13 @@ fn reflog_entries(repo: &gix::Repository, full: &str) -> Vec<gix::refs::log::Lin
 /// newest entry no younger than the given date.
 fn reflog_base_index(base: Option<&str>, entries: &[gix::refs::log::Line]) -> i32 {
     let Some(base) = base else { return 0 };
-    let end = base
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(base.len());
+    // `base = strtoul(reflog_base, &ep, 10); if (*ep) { ...approxidate... }`
+    // (builtin/show-branch.c:791-800) — the same wide grammar [`strtoul`] models,
+    // so `2,+1` and `2, 1` are the index 1 and `2,-1` is the index -1 that
+    // `read_ref_at()` then refuses.
+    let (n, end) = strtoul(base);
     if end == base.len() {
-        return base.parse().unwrap_or(0);
+        return n;
     }
     let at = crate::date::approxidate(base);
     entries
@@ -1467,14 +1619,15 @@ fn reflog_base_index(base: Option<&str>, entries: &[gix::refs::log::Line]) -> i3
 }
 
 /// The reflog half of `cmd_show_branch`: turn `<ref>` into a run of
-/// `<ref>@{n}` pseudo-refs with their object ids and `(<date>) <msg>` captions.
+/// `<ref>@{n}` pseudo-ref names with their `(<date>) <msg>` captions. The ids
+/// `read_ref_at()` hands back never leave this function — they only decide
+/// whether `append_ref()` keeps an entry; the caller resolves each name afresh.
 /// `Err` carries the text of git's `die()`.
 fn collect_reflog(
     repo: &gix::Repository,
     revs: &[String],
     opts: &Opts,
     names: &mut Vec<String>,
-    oids: &mut Vec<ObjectId>,
     msgs: &mut Vec<String>,
 ) -> Result<(), String> {
     // With no argument at all git substitutes the ref HEAD resolves to.
@@ -1541,7 +1694,6 @@ fn collect_reflog(
             show_date_relative(entry.signature.time.seconds)
         ));
         names.push(format!("{}@{{{nth}}}", av[0]));
-        oids.push(oid);
     }
     Ok(())
 }

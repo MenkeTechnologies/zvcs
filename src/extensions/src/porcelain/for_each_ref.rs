@@ -246,6 +246,18 @@ pub(super) enum Field {
     Raw(bool),
     /// `%(signature[:<option>])` — a commit's signature verification result.
     Signature(SigOption),
+    /// The atoms `populate_value()`'s specials loop answers with a fixed string
+    /// no ref can change: `%(align)`, `%(end)`, `%(then)` and `%(else)` are
+    /// `xstrdup("")`, `%(if)` is the text after an `if:` prefix on the atom name,
+    /// and `%(rest)` is `ref->rest`, which `for-each-ref` never sets
+    /// (ref-filter.c:2546-2575).
+    ///
+    /// Inside a format those atoms drive the formatting stack instead and are
+    /// [`Item`]s of their own, so this is only ever reached through a sort key:
+    /// `parse_sorting_atom()` (ref-filter.c:3673-3687) runs the same
+    /// `parse_ref_filter_atom()` with no `reject_atom()` pass behind it, so
+    /// `--sort=if` and `--sort=rest` are accepted and compare every ref equal.
+    Constant(Vec<u8>),
 }
 
 /// git's `signature` atom options, in `parse_signature_option`'s order.
@@ -954,7 +966,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     let mut sort_specs: Vec<String> = Vec::new();
     let mut patterns: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
-    let mut points_at: Option<ObjectId> = None;
+    let mut points_at: Vec<ObjectId> = Vec::new();
     let mut start_after: Option<String> = None;
     let mut color_when = ColorWhen::Auto;
     let mut filters = Filters::default();
@@ -1090,17 +1102,20 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             "--no-start-after" => start_after = None,
             "--no-exclude" => excludes.clear(),
             "--no-sort" => sort_specs.clear(),
-            "--no-points-at" => points_at = None,
+            "--no-points-at" => points_at.clear(),
             "--points-at" => {
                 let v = value!(rest, "points-at");
-                // `parse_opt_object_name`: the id is recorded without ever asking
-                // the odb whether that object exists, because `--points-at` only
-                // ever compares it against ref tips. An absent full-length hex id
-                // is therefore a filter that matches nothing at exit 0.
-                points_at = match crate::objname::parse_opt_object_name(&repo, &v) {
-                    Ok(id) => Some(id),
+                // `parse_opt_object_name` (parse-options-cb.c:126-140) *appends*
+                // to an `oid_array`, so repeating `--points-at` widens the filter
+                // instead of replacing it, and `--no-points-at` clears the array.
+                // The id is recorded without ever asking the odb whether that
+                // object exists, because `--points-at` only ever compares it
+                // against ref tips. An absent full-length hex id is therefore a
+                // filter that matches nothing at exit 0.
+                match crate::objname::parse_opt_object_name(&repo, &v) {
+                    Ok(id) => points_at.push(id),
                     Err(e) => return Ok(e.report()),
-                };
+                }
             }
             "--contains" | "--no-contains" => {
                 let v = commit_operand!(rest);
@@ -1333,6 +1348,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                     | Field::WorktreePath
                     | Field::IsBase(_, _)
                     | Field::AheadBehind(_)
+                    | Field::Constant(_)
             )
     });
     let needs_short = atoms().any(|a| matches!(a.field, Field::RefName(NameMod::Short)));
@@ -1423,15 +1439,18 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         // The chain of tag targets, so `--points-at`, the reachability filters
         // and `*`-atoms agree with git. Skipped entirely when nothing needs it,
         // as peeling reads objects.
-        let chain = if points_at.is_some() || needs_peel || filters_active {
+        let chain = if !points_at.is_empty() || needs_peel || filters_active {
             peel_chain(&repo, id)?
         } else {
             Vec::new()
         };
-        if let Some(target) = points_at {
-            if id != target && !chain.contains(&target) {
-                continue;
-            }
+        // `match_points_at()` (ref-filter.c:2840-2866) answers yes for the ref's
+        // own id or any object along its tag chain, against *any* of the ids
+        // collected.
+        if !points_at.is_empty()
+            && !points_at.iter().any(|t| *t == id || chain.contains(t))
+        {
+            continue;
         }
         if filters_active && !passes_filters(&repo, &filters, *chain.last().unwrap_or(&id))? {
             continue;
@@ -1969,7 +1988,17 @@ pub(super) fn parse_format(
                     "then" => items.push(Item::Then),
                     "else" => items.push(Item::Else),
                     _ => {
-                        items.push(Item::Atom(parse_atom(spec, ctx)?));
+                        let atom = parse_atom(spec, ctx)?;
+                        // `reject_atom()` (ref-filter.c:1376-1378) runs *after*
+                        // the atom's own parser and only from here, so
+                        // `%(rest:x)` reports its argument first and a `--sort`
+                        // key of `rest` is never refused at all.
+                        if name.strip_prefix('*').unwrap_or(name) == "rest" {
+                            return Err(fatal_atom(format!(
+                                "this command reject atom %({spec})"
+                            )));
+                        }
+                        items.push(Item::Atom(atom));
                         if name == "color" && !spec.starts_with('*') {
                             need_color_reset = arg != Some("reset");
                         }
@@ -2328,12 +2357,35 @@ pub(super) fn parse_atom(spec: &str, ctx: &AtomCtx<'_>) -> std::result::Result<A
             };
             Field::IsBase(arg.to_string(), tip)
         }
-        // `verify_ref_format`'s `reject_atom`: `for-each-ref` has no "rest of the
-        // line" to report, so the atom parses and is then refused.
+        // `rest_atom_parser` (ref-filter.c:890-897) refuses an argument and
+        // nothing else; the refusal of the atom itself is `reject_atom()`, which
+        // only `verify_ref_format()` runs (ref-filter.c:1401-1402) — see
+        // [`parse_format`]. As a sort key it survives, reading `ref->rest`,
+        // which `for-each-ref` leaves NULL.
         "rest" => {
             no_arg(m, "rest")?;
-            return Err(fatal_atom(format!("this command reject atom %({spec})")));
+            Field::Constant(Vec::new())
         }
+        // The container atoms. A format never reaches them here ([`parse_format`]
+        // turns them into [`Item`]s first), but a sort key parses through this
+        // same function, so their parsers run and their fixed values stand.
+        "align" => {
+            parse_align(m)?;
+            Field::Constant(Vec::new())
+        }
+        "if" => {
+            parse_if(m)?;
+            // `skip_prefix(name, "if:", &s)` (ref-filter.c:2556) reads the atom's
+            // *name*, so the deref `*` defeats the prefix and `%(*if:equals=x)`
+            // is the empty string rather than `equals=x`.
+            let text = match (deref, raw_m) {
+                (false, Some(a)) => a.as_bytes().to_vec(),
+                _ => Vec::new(),
+            };
+            Field::Constant(text)
+        }
+        // No parser in git's atom table, so any `:arg` on them is ignored.
+        "end" | "then" | "else" => Field::Constant(Vec::new()),
         // `head_atom_parser` (ref-filter.c:928-938).
         "HEAD" => {
             no_arg(m, "HEAD")?;
@@ -2948,6 +3000,7 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
     match &atom.field {
         // git's "fill in specials first" pass: these atoms are answered from the
         // ref itself, so a leading `*` has no effect on them.
+        Field::Constant(text) => return Ok(text.clone()),
         Field::Upstream(rr) => return render_upstream(ctx, &info.refname, rr, false),
         Field::Push(rr) => return render_upstream(ctx, &info.refname, rr, true),
         Field::Flag => {
@@ -3116,7 +3169,8 @@ fn render(ctx: &RenderCtx<'_>, atom: &Atom, info: &RefInfo) -> Result<Vec<u8>> {
         | Field::Flag
         | Field::WorktreePath
         | Field::IsBase(..)
-        | Field::AheadBehind(_) => unreachable!("handled above"),
+        | Field::AheadBehind(_)
+        | Field::Constant(_) => unreachable!("handled above"),
     }
 }
 

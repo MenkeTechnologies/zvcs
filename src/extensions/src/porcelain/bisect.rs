@@ -20,8 +20,12 @@
 //!   * `git bisect log`
 //!   * `git bisect reset [<commit>]`
 //!   * `git bisect next` — force a step, including git's `warning: bisecting only
-//!     with a <bad> commit` path and the "need at least one bad|good" error.
+//!     with a <bad> commit` path and the "need at least one bad|good" error. It
+//!     takes no operand, and refuses one before it looks at any state.
+//!   * `git bisect skip [<rev>...]`
 //!   * `git bisect replay <logfile>` — re-drive a session from a saved log.
+//!   * `git bisect run <cmd> [<arg>...]`
+//!   * `git bisect visualize|view [<arg>...]`
 //!   * `git bisect help` — the usage block on stderr, exit 129; `-h` prints the
 //!     same block on stdout, because `parse_options` answers it before
 //!     `usage_with_options` is ever reached.
@@ -73,19 +77,34 @@
 //! order (not the order the same commits are printed in). `bisect replay`
 //! replays `skip` lines the same way.
 //!
+//! `run` drives the command per step through `sh -c`, reading 125 as a skip, 0 as
+//! the good term and anything else as the bad one, with `verify_good()`'s
+//! re-run on the known-good end for a first 126/127 and git's `BISECT_RUN`
+//! redirect around each step.
+//!
+//! `visualize`/`view` is `bisect_visualize()`'s single child: `gitk` when a
+//! windowing environment is set and it is on `$PATH`, `git log` otherwise, and
+//! whatever the caller named in between — `--bisect --` appended, and the
+//! `BISECT_NAMES` tail appended the way git appends it, which is to say never,
+//! because `sq_dequote_to_strvec()` is handed the untrimmed leading space.
+//!
 //! Honest limitations — each bails with a precise message rather than guessing:
 //!   * `skip <a>..<b>`: upstream expands the range with a revision walk in the
 //!     same process as the step that follows, and the `UNINTERESTING` flags it
 //!     leaves behind shrink that step's candidate set — measurably: against git
-//!     2.55.0, `skip c6..c9` and `skip c7 c8 c9` write identical refs and log
-//!     lines and then pick different commits. Reproducing it needs git's object
-//!     flag lifetime rather than its skip algorithm, so the range form is
-//!     refused and the individual revisions are not.
-//!   * `run`: it drives an external command per step and treats exit code 125 as
-//!     a skip; the child-process driver is not ported.
-//!   * `visualize`/`view`: `bisect_next_check(terms, NULL)` is reproduced (a
-//!     silent exit 1 when either side is unmarked); a live session bails, because
-//!     the command shells out to gitk / `git log`.
+//!     2.55.0 on a 15-commit history bisected `c15`/`c1`, `skip c6..c9` answers
+//!     `Bisecting: 3 revisions left … c11` while `skip c9 c8 c7` — the same three
+//!     commits, the same refs, the same log — answers `Bisecting: 6 revisions
+//!     left … c12`. Reproducing it needs `limit_list()`'s `SLOP` walk and git's
+//!     object-flag lifetime across walks rather than its skip algorithm, so the
+//!     range form is refused and the individual revisions are not.
+//!   * `check_ancestors()` is `revs.commits != NULL` after that same
+//!     `limit_list()`, so on a history whose commits share a timestamp its answer
+//!     turns on `prio_queue`'s tie order. This port asks the equivalent question
+//!     — "is every good an ancestor of the bad end" — which agrees with git
+//!     whenever the dates are distinct, and can pick the other refusal
+//!     (`<oid> was both …` instead of `Some '<good>' revs are not ancestors …`,
+//!     both exit 1) when they are not.
 //!   * The worktree update goes through this crate's `checkout`, which refuses to
 //!     switch across a dirty tracked worktree; stock git refuses with a different
 //!     message in the same situation.
@@ -99,6 +118,14 @@ use std::process::ExitCode;
 use gix::bstr::ByteSlice;
 
 use gix::hash::ObjectId;
+
+// git writes its progress (`Bisecting: …`, `[<oid>] <subject>`, `running …`) with
+// `printf()` and its refusals with `error()`/`fprintf(stderr, …)`, so a capture of
+// both streams sees the stdout half held in the stdio buffer until `exit()`. A
+// `bisect run` whose script cannot be executed is the reachable case: the
+// `[<oid>] <subject>` line `verify_good()`'s second `bisect_checkout()` prints
+// comes out *after* the `error: bogus exit code …` that follows it.
+use crate::cstdio::{print, println};
 
 /// The usage block git prints on a usage error, verbatim.
 const USAGE: &str = "\
@@ -119,6 +146,8 @@ usage: git bisect start [--term-(bad|new)=<term-new> --term-(good|old)=<term-old
 ";
 
 pub fn bisect(args: &[String]) -> Result<ExitCode> {
+    // `_IOFBF` on a captured stdout; see the `cstdio` import above.
+    crate::cstdio::defer();
     // Dispatch hands us the subcommand at index 0; tolerate its absence so the
     // module works either way.
     let args: &[String] = match args.first() {
@@ -137,7 +166,7 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         "log" => log_cmd(),
         "reset" => reset_cmd(rest),
         "replay" => replay_cmd(rest),
-        "next" => next_cmd(),
+        "next" => next_cmd(rest),
         // `parse_options` answers `-h` on stdout, `usage_with_options` (which is
         // what the `help` word reaches) on stderr. Both exit 129. `--help-all`
         // renders `USAGE_FULL`, identical here: no entry is `PARSE_OPT_HIDDEN`.
@@ -619,15 +648,220 @@ fn update_bisect_ref(ctx: &Ctx, leaf: &str, id: ObjectId) -> Result<bool> {
     Ok(true)
 }
 
-/// `git bisect visualize|view`: `bisect_next_check(terms, NULL)` first, then the
-/// child process.
-fn visualize_cmd(_args: &[String]) -> Result<ExitCode> {
+/// `git bisect visualize|view` (`bisect_visualize()`, builtin/bisect.c:1148-1183):
+/// `bisect_next_check(terms, NULL)` first, then one child process over the range.
+///
+/// ```c
+/// cmd.no_stdin = 1;
+/// if (!argc) {
+///         if ((getenv("DISPLAY") || getenv("SESSIONNAME") || getenv("MSYSTEM") ||
+///              getenv("SECURITYSESSIONID")) && exists_in_PATH("gitk")) {
+///                 strvec_push(&cmd.args, "gitk");
+///         } else {
+///                 strvec_push(&cmd.args, "log");
+///                 cmd.git_cmd = 1;
+///         }
+/// } else {
+///         if (argv[0][0] == '-') {
+///                 strvec_push(&cmd.args, "log");
+///                 cmd.git_cmd = 1;
+///         } else if (strcmp(argv[0], "tig") && !starts_with(argv[0], "git"))
+///                 cmd.git_cmd = 1;
+///
+///         strvec_pushv(&cmd.args, argv);
+/// }
+///
+/// strvec_pushl(&cmd.args, "--bisect", "--", NULL);
+///
+/// strbuf_read_file(&sb, git_path_bisect_names(), 0);
+/// sq_dequote_to_strvec(sb.buf, &cmd.args);
+/// ```
+///
+/// The three branches differ only in what leads the argument list, and the two
+/// `git_cmd` ones run *this* binary rather than whatever `git` is first on PATH.
+/// A bare `tig` or a word already starting with `git` is spelled out by the user
+/// and left alone, so it is looked up on PATH like `gitk`.
+///
+/// `BISECT_NAMES` is appended *after* the `--` this function pushes, and it keeps
+/// its own leading `'--'` — so a session opened with a pathspec hands the child
+/// two of them, exactly as git does.
+fn visualize_cmd(args: &[String]) -> Result<ExitCode> {
     let ctx = Ctx::open()?;
     let terms = current_terms(&ctx)?;
     if !next_check_silent(&ctx, &terms)? {
         return Ok(ExitCode::from(1));
     }
-    bail!("`bisect visualize` is not supported (it shells out to gitk/git log)")
+
+    let mut argv: Vec<String> = Vec::new();
+    let git_cmd;
+    match args.first() {
+        None => {
+            let windowed = ["DISPLAY", "SESSIONNAME", "MSYSTEM", "SECURITYSESSIONID"]
+                .iter()
+                .any(|k| std::env::var_os(k).is_some());
+            if windowed && exists_in_path("gitk") {
+                argv.push("gitk".to_string());
+                git_cmd = false;
+            } else {
+                argv.push("log".to_string());
+                git_cmd = true;
+            }
+        }
+        Some(first) => {
+            if first.starts_with('-') {
+                argv.push("log".to_string());
+                git_cmd = true;
+            } else {
+                git_cmd = first != "tig" && !first.starts_with("git");
+            }
+            argv.extend(args.iter().cloned());
+        }
+    }
+    argv.push("--bisect".to_string());
+    argv.push("--".to_string());
+    // `strbuf_read_file()` takes the file *as it stands* — leading space, trailing
+    // newline and all — and `sq_dequote_to_strvec()`'s answer is dropped on the
+    // floor. `read_bisect_paths()` (bisect.c) trims each line before dequoting it;
+    // this caller does not, and `sq_quote_argv()` writes a space in front of every
+    // word it quotes, so a non-empty `BISECT_NAMES` always fails at its very first
+    // character and contributes nothing. The pathspec a session was opened with is
+    // therefore not passed to the visualizer — reproduced rather than corrected,
+    // because `git bisect visualize` showing the unfiltered range is what a user
+    // switching between the two implementations sees.
+    if let Ok(names) = std::fs::read(ctx.file("BISECT_NAMES")) {
+        argv.extend(sq_dequote_to_strvec(&names));
+    }
+
+    let res = run_visualizer(&ctx, &argv, git_cmd)?;
+    // `cmd_bisect`'s `return is_bisect_success(res) ? 0 : -res` over `run_command()`'s
+    // answer, which the shell sees modulo 256.
+    Ok(ExitCode::from(((-res) & 0xff) as u8))
+}
+
+/// `sq_dequote_step()` (quote.c:123-167) over one token starting at `i`.
+///
+/// Answers the token and where the scan stopped: `None` for the end of the
+/// string, `Some(j)` for the byte that closed it. A malformed token — one that
+/// does not open with `'`, or that never closes — answers `None` for the token,
+/// which is `sq_dequote_step()` returning `NULL`.
+fn sq_dequote_step(arg: &[u8], mut i: usize) -> (Option<Vec<u8>>, Option<usize>) {
+    if arg.get(i) != Some(&b'\'') {
+        return (None, None);
+    }
+    let mut token: Vec<u8> = Vec::new();
+    loop {
+        i += 1;
+        let Some(&c) = arg.get(i) else {
+            return (None, None);
+        };
+        if c != b'\'' {
+            token.push(c);
+            continue;
+        }
+        // We stepped out of sq.
+        i += 1;
+        match arg.get(i) {
+            None => return (Some(token), None),
+            // `need_bs_quote(c)` is `c == '\'' || c == '!'`: a backslashed
+            // character is only allowed outside the quotes when it needs the
+            // escape *and* the single-quoted part resumes right after it.
+            Some(b'\\')
+                if matches!(arg.get(i + 1), Some(b'\'') | Some(b'!'))
+                    && arg.get(i + 2) == Some(&b'\'') =>
+            {
+                token.push(arg[i + 1]);
+                i += 2;
+            }
+            Some(_) => return (Some(token), Some(i)),
+        }
+    }
+}
+
+/// `sq_dequote_to_strvec()` (quote.c:174-196). The caller here ignores the
+/// success flag, so this answers the tokens that were pushed before the scan
+/// gave up — which is exactly what the `strvec` holds after a `-1`.
+fn sq_dequote_to_strvec(arg: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if arg.is_empty() {
+        return out;
+    }
+    let mut next = Some(0usize);
+    while let Some(start) = next {
+        let (token, mut rest) = sq_dequote_step(arg, start);
+        let Some(token) = token else {
+            return out;
+        };
+        if let Some(j) = rest {
+            if !arg[j].is_ascii_whitespace() {
+                return out;
+            }
+            let mut j = j + 1;
+            while arg.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            rest = Some(j);
+        }
+        out.push(String::from_utf8_lossy(&token).into_owned());
+        next = rest;
+    }
+    out
+}
+
+/// `exists_in_PATH()` (run-command.c): the name resolved against `$PATH`.
+fn exists_in_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        std::fs::metadata(&candidate).is_ok_and(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            m.is_file() && m.permissions().mode() & 0o111 != 0
+        })
+    })
+}
+
+/// `run_command()` for [`visualize_cmd`]'s child: `no_stdin = 1` closes the
+/// child's stdin, and `git_cmd = 1` runs this binary with the arguments in front
+/// of it — the same `git_exe()`/cwd/`GIT_DIR` handover [`show_commit`] performs.
+fn run_visualizer(ctx: &Ctx, argv: &[String], git_cmd: bool) -> Result<i32> {
+    let workdir = crate::hooks::absolutize(ctx.repo.workdir().unwrap_or(&ctx.git_dir));
+    let git_dir = absolutize_git_dir(&workdir, &ctx.git_dir);
+    // `fflush(NULL)` in `start_command()`, before the fork.
+    crate::cstdio::flush();
+    let _ = std::io::stdout().flush();
+    let (program, rest) = if git_cmd {
+        (crate::hosted::git_exe()?, argv)
+    } else {
+        (PathBuf::from(&argv[0]), &argv[1..])
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(rest)
+        .current_dir(&workdir)
+        .stdin(std::process::Stdio::null());
+    if std::env::var_os("GIT_DIR").is_none() {
+        cmd.env("GIT_DIR", git_dir);
+    }
+    Ok(match cmd.status() {
+        Ok(status) => match status.code() {
+            Some(code) => code,
+            None => {
+                let sig = std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0);
+                if sig != libc::SIGINT && sig != libc::SIGQUIT && sig != libc::SIGPIPE {
+                    eprintln!("error: {} died of signal {sig}", argv[0]);
+                }
+                128 + sig
+            }
+        },
+        Err(e) => {
+            eprintln!(
+                "error: cannot run {}: {}",
+                argv[0],
+                crate::external::strerror(&e)
+            );
+            -1
+        }
+    })
 }
 
 /// ```c
@@ -652,9 +886,10 @@ fn visualize_cmd(_args: &[String]) -> Result<ExitCode> {
 /// not be started at all.
 fn do_bisect_run(command: &str) -> Result<i32> {
     println!("running {command}");
-    // The child inherits fd 1, and in `run_cmd` fd 1 is the process's own again
-    // by this point — but a previous iteration left buffered bytes behind, so
-    // flush before handing the descriptor over.
+    // `start_command()`'s `fflush(NULL)` before the fork: the child inherits fd 1,
+    // so everything buffered so far — the `running …` line above included — has to
+    // be on the descriptor before it starts writing.
+    crate::cstdio::before_spawn();
     std::io::stdout().flush()?;
     // `prepare_shell_cmd()` pushes `SHELL_PATH`, `-c` and the command, then
     // `strvec_pushv(out, argv)` appends the caller's argv *after* it — so the
@@ -831,7 +1066,16 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
         if is_first_run && (rc == 126 || rc == 127) {
             let verified = verify_good(&ctx, &terms, &command)?;
             is_first_run = false;
-            if verified < 0 {
+            // ```c
+            // if (rc < 0 || 128 <= rc) {
+            //         error(_("unable to verify %s on '%s' revision"), …);
+            // ```
+            //
+            // (builtin/bisect.c:1267-1269.) A command that dies of a signal on the
+            // known-good revision is as useless a verdict as one that could not be
+            // started, so both end the run rather than being compared against the
+            // first run's 126/127.
+            if verified < 0 || 128 <= verified {
                 eprintln!(
                     "error: unable to verify {command} on '{}' revision",
                     terms.good
@@ -888,9 +1132,17 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
             }
             BISECT_OK => continue,
             other => {
+                // ```c
+                // error(_("bisect run failed: 'git bisect %s'"
+                //         " exited with error code %d"), new_state, res);
+                // ```
+                //
+                // (builtin/bisect.c:1323-1324.) `res` is the `bisect_error` itself,
+                // which is negative — so the number in the message is the negation
+                // of the exit status the command then leaves with.
                 eprintln!(
-                    "error: bisect run failed: 'git bisect--helper --bisect-state \
-                     {new_state}' exited with error code {other}"
+                    "error: bisect run failed: 'git bisect {new_state}' \
+                     exited with error code -{other}"
                 );
                 return Ok(ExitCode::from(other));
             }
@@ -915,6 +1167,10 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
 /// machine.
 fn with_stdout_to<T>(path: &Path, body: impl FnOnce() -> Result<T>) -> Result<T> {
     let file = std::fs::File::create(path)?;
+    // git's `fflush(stdout)` on either side of the `dup2` pair: the buffer is the
+    // process's, the redirect is the descriptor's, so anything still held would
+    // otherwise land in the wrong file.
+    crate::cstdio::flush();
     std::io::stdout().flush()?;
     // SAFETY: `saved` is a fresh descriptor this function owns and closes; the
     // dup2 pair is balanced on every exit path, including the one that carries
@@ -927,6 +1183,7 @@ fn with_stdout_to<T>(path: &Path, body: impl FnOnce() -> Result<T>) -> Result<T>
         libc::dup2(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::STDOUT_FILENO);
     }
     let out = body();
+    crate::cstdio::flush();
     let _ = std::io::stdout().flush();
     unsafe {
         libc::dup2(saved, libc::STDOUT_FILENO);
@@ -1506,25 +1763,19 @@ fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
         }
     }
 
-    // A commit cannot sit on both sides of the search.
-    let bad = ctx.bad(&terms)?;
-    let goods = ctx.goods(&terms)?;
-    for id in &ids {
-        let clashes = match side {
-            Side::Bad => goods.contains(id),
-            Side::Good => bad == Some(*id),
-        };
-        if clashes {
-            println!(
-                "{} was both '{}' and '{}'",
-                id.to_hex(),
-                terms.good,
-                terms.bad
-            );
-            return Ok(BISECT_FAILED);
-        }
-    }
-
+    // A commit that sits on both sides of the search is *not* caught here.
+    // `bisect_state()` writes every marking first (builtin/bisect.c:1004-1016) and
+    // only `bisect_next_all()` notices, once the candidate walk comes back empty,
+    // that there is nothing left to test — `<oid> was both '<good>' and '<bad>'`
+    // (bisect.c:1093-1096). The refs and both `BISECT_LOG` lines are already on
+    // disk by then, so a refusal here would silently drop them.
+    // ```c
+    // if (refs_read_ref(…, "BISECT_EXPECTED_REV", &expected))
+    //         verify_expected = 0; /* Ignore invalid file contents */
+    // ```
+    //
+    // (builtin/bisect.c:1001-1002.)
+    let mut verify_expected = read_ref(&ctx.file("BISECT_EXPECTED_REV"))?;
     for id in &ids {
         let (term, path) = match side {
             Side::Bad => (&terms.bad, ctx.refs_dir().join(&terms.bad)),
@@ -1540,6 +1791,24 @@ fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
             subject(&ctx.repo, *id)?
         ))?;
         ctx.append_log(&format!("git bisect {term} {}\n", id.to_hex()))?;
+        // ```c
+        // if (verify_expected && !oideq(&revs.oid[i], &expected)) {
+        //         unlink_or_warn(git_path_bisect_ancestors_ok());
+        //         refs_delete_ref(…, "BISECT_EXPECTED_REV", …);
+        //         verify_expected = 0;
+        // }
+        // ```
+        //
+        // (builtin/bisect.c:1009-1015.) Marking a commit other than the one the
+        // last step asked for invalidates both cached answers, once — and it is
+        // `BISECT_ANCESTORS_OK` going away that makes the *next*
+        // `check_good_are_ancestors_of_bad()` actually re-run its merge-base
+        // checks instead of trusting the stale flag file.
+        if verify_expected.is_some_and(|expected| expected != *id) {
+            let _ = std::fs::remove_file(ctx.file("BISECT_ANCESTORS_OK"));
+            let _ = std::fs::remove_file(ctx.file("BISECT_EXPECTED_REV"));
+            verify_expected = None;
+        }
     }
 
     // A session opened with `--no-checkout` records its position in BISECT_HEAD.
@@ -1638,7 +1907,18 @@ fn state_exit(res: u8) -> ExitCode {
 /// only reports status until both sides are known), `next` will bisect with just
 /// a bad commit after a warning, and it errors instead of waiting when a side is
 /// missing.
-fn next_cmd() -> Result<ExitCode> {
+fn next_cmd(args: &[String]) -> Result<ExitCode> {
+    // ```c
+    // if (argc)
+    //         return error(_("'%s' requires 0 arguments"), "git bisect next");
+    // ```
+    //
+    // (`cmd_bisect__next`, builtin/bisect.c:1376-1378.) The count is checked before
+    // `get_terms()`, so it answers the same way inside and outside a session.
+    if !args.is_empty() {
+        eprintln!("error: 'git bisect next' requires 0 arguments");
+        return Ok(ExitCode::from(1));
+    }
     let ctx = Ctx::open()?;
     if !ctx.in_progress() {
         eprint!("You need to start by \"git bisect start\"\n\n");
@@ -2446,6 +2726,17 @@ fn candidate_list(
     if first_parent {
         walk = walk.first_parent_only();
     }
+    // `revs.limited = 1` (bisect.c:1078), so `prepare_revision_walk()` ends in
+    // `limit_list()`, whose `prio_queue` is ordered by `compare_commits_by_commit_date`
+    // — `revs.commits` comes out newest first. The order is not cosmetic: it is the
+    // list `find_bisection()` reverses and then scans, and `best_bisection()` keeps the
+    // *first* commit of the largest `min(weight, nr - weight)`, so it decides which of
+    // several equally good candidates is offered. gix defaults to `BreadthFirst`, which
+    // interleaves branches by graph shape rather than by date; on a merge topology that
+    // is a different order and therefore a different pick.
+    walk = walk.sorting(gix::revision::walk::Sorting::ByCommitTime(
+        gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+    ));
     for info in walk.all()? {
         list.push(info?.id);
     }

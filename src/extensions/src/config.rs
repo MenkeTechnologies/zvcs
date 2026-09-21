@@ -1178,6 +1178,31 @@ pub fn multi_values(repo: &gix::Repository, key: &str) -> Vec<String> {
         .collect()
 }
 
+/// [`multi_values`] with `repo_config_get_string_multi()`'s refusal in hand.
+///
+/// The configset reader checks every value it is about to hand back and ends at
+///
+/// ```c
+/// return error(_("missing value for '%s'"), var);
+/// ```
+///
+/// (config.c:3554) as soon as one of them has no value. That is an `error()`, not
+/// a `die()`: the caller sees a non-zero return, treats the key as carrying *no*
+/// values at all, and the command carries on at its usual exit status with the
+/// line already written to stderr. `Err` here is that message, for the caller to
+/// report and then behave as though the key were unset.
+pub fn multi_values_checked(repo: &gix::Repository, key: &str) -> Result<Vec<String>, String> {
+    let wanted = normalize_key(key);
+    let mut out = Vec::new();
+    for v in walk_config(repo).into_iter().filter(|v| normalize_key(&v.key) == wanted) {
+        match v.value {
+            Some(value) => out.push(value),
+            None => return Err(format!("missing value for '{key}'")),
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // repo_config_get_string() / repo_config_get_pathname() and git_die_config()
 // ---------------------------------------------------------------------------

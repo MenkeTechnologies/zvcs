@@ -904,6 +904,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `rev.abbrev_commit = 1` (builtin/log.c:802) overrides `log.abbrevCommit`
     // for `reflog show`; `--no-abbrev-commit` on the command line still wins.
     let mut abbrev_commit = cfg_abbrev_commit || flavor == Flavor::Reflog;
+    // `revs->abbrev_commit_given`, which only `--abbrev-commit` sets
+    // (revision.c:2649-2653); `--no-abbrev-commit` clears the flag without claiming
+    // the option was given.
+    let mut abbrev_commit_given = false;
     // `--show-signature` / `--no-show-signature` (`rev_info.show_signature`), which
     // `show_log()` consults at log-tree.c:851. Off unless asked for; `log.showSignature`
     // is not read here (see the module header).
@@ -966,6 +970,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let builtin_decorate =
         if auto_decoration_style() { DecorateStyle::Short } else { DecorateStyle::Off };
     let mut decorate = cfg_decorate.unwrap_or(builtin_decorate);
+    // `cfg->decoration_given`, set by `decorate_callback()` (builtin/log.c:181) for
+    // every spelling of the option including `--no-decorate`, and read only by the
+    // `--pretty=raw` rule below.
+    let mut decoration_given = false;
     // `--decorate-refs=<pattern>` / `--decorate-refs-exclude=<pattern>` (both
     // repeatable) and `--clear-decorations`, which empties them again and drops
     // git's default "known namespaces" include list.
@@ -1328,6 +1336,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         } else if a == "--decorate" {
             decorate = DecorateStyle::Short;
+            decoration_given = true;
         } else if let Some(m) = a.strip_prefix("--decorate=") {
             match parse_decoration_style(m) {
                 Some(s) => decorate = s,
@@ -1336,8 +1345,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
+            decoration_given = true;
         } else if a == "--no-decorate" {
             decorate = DecorateStyle::Off;
+            decoration_given = true;
         } else if a == "--decorate-refs" || a == "--decorate-refs-exclude" {
             // git's `OPT_STRING_LIST` also takes its value as the next argv token,
             // and its parse-options layer rejects a missing one with exit 129.
@@ -1556,6 +1567,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             show_children = false;
         } else if a == "--abbrev-commit" {
             abbrev_commit = true;
+            abbrev_commit_given = true;
         } else if a == "--no-abbrev-commit" {
             abbrev_commit = false;
         // `--abbrev[=<n>]` / `--no-abbrev`: the length every abbreviated id in the
@@ -2600,6 +2612,34 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             rev_negated.push(negate_revs);
         }
         i += 1;
+    }
+
+    // ```c
+    // if (rev->pretty_given && rev->commit_format == CMIT_FMT_RAW) {
+    //         /*
+    //          * "log --pretty=raw" is special; ignore UI oriented
+    //          * configuration variables such as decoration.
+    //          */
+    //         if (!cfg->decoration_given)
+    //                 cfg->decoration_style = 0;
+    //         if (!rev->abbrev_commit_given)
+    //                 rev->abbrev_commit = 0;
+    // }
+    // ```
+    //
+    // (`cmd_log_init_finish()`, builtin/log.c:348-357.) `--pretty=raw` reproduces
+    // the object as it is stored, so the two keys that would dress it up —
+    // `log.decorate` and `log.abbrevCommit` — are dropped unless the command line
+    // asked for them itself. `pretty_given` is the command line's alone:
+    // `format.pretty` goes through `get_commit_format()`, which does not set it
+    // (builtin/log.c:201-205), so a raw format from config keeps both.
+    if pretty_given && matches!(pretty, Pretty::Raw) {
+        if !decoration_given {
+            decorate = DecorateStyle::Off;
+        }
+        if !abbrev_commit_given {
+            abbrev_commit = false;
+        }
     }
 
     // `setup_revisions()` runs `opt->tweak(revs)` (revision.c:3121-3122) once the
@@ -10170,15 +10210,32 @@ impl DecorationFilter {
         let snap = repo.config_snapshot();
         let mut include: Vec<RefPattern> = include_cli.iter().map(|p| RefPattern::new(p)).collect();
         let exclude: Vec<RefPattern> = exclude_cli.iter().map(|p| RefPattern::new(p)).collect();
-        // `log.excludeDecoration` is multi-valued: git appends every occurrence
-        // across the whole config hierarchy rather than letting the last win.
-        let exclude_config: Vec<RefPattern> = snap
-            .plumbing()
-            .strings("log.excludeDecoration")
-            .into_iter()
-            .flatten()
-            .map(|v| RefPattern::new(&v.to_str_lossy()))
-            .collect();
+        // ```c
+        // if (!repo_config_get_string_multi(the_repository, "log.excludeDecoration",
+        //                                  &config_exclude)) {
+        //         struct string_list_item *item;
+        //         for_each_string_list_item(item, config_exclude)
+        //                 string_list_append(decoration_filter->exclude_ref_config_pattern,
+        //                                    item->string);
+        // }
+        // ```
+        //
+        // (`set_default_decoration_filter()`, builtin/log.c:229-235.) Multi-valued:
+        // every occurrence across the whole hierarchy is appended rather than the
+        // last one winning. A *valueless* occurrence makes the reader return
+        // non-zero after writing `error: missing value for 'log.excludeDecoration'`
+        // (config.c:3554), and the `if` above then skips the whole list — so the key
+        // excludes nothing and the command still exits 0. Reading it as an empty
+        // pattern instead excluded every ref, which is how a stray `[log]
+        // excludeDecoration` silently stripped the decorations it was asked to keep.
+        let exclude_config: Vec<RefPattern> =
+            match crate::config::multi_values_checked(repo, "log.excludeDecoration") {
+                Ok(values) => values.iter().map(|v| RefPattern::new(v)).collect(),
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    Vec::new()
+                }
+            };
 
         // `log.initialDecorationSet=all` relaxes the filter exactly as
         // `--clear-decorations` does. `repo_config_get_string()` (builtin/log.c:242-245)

@@ -11694,10 +11694,22 @@ fn render_entry(
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
         Pretty::Reference => {
-            // `%h (%s, %ad)` with `--date=short` unless `--date=` overrode it.
-            let date_mode = match ctx.date_mode.clone() {
-                DateMode::Default => DateMode::Short,
-                other => other,
+            // ```c
+            // if (!rev->date_mode_explicit && commit_format->default_date_mode_type)
+            //         rev->date_mode.type = commit_format->default_date_mode_type;
+            // ```
+            //
+            // (`get_commit_format()`, pretty.c:216-217, over the `reference` row
+            // `{ "reference", CMIT_FMT_USERFORMAT, 1, 0, 0, DATE_SHORT,
+            // "%C(auto)%h (%s, %ad)" }`, pretty.c:131-132.) The guard is
+            // `date_mode_explicit`, which only `--date=` sets (revision.c) — so
+            // `log.date` does *not* keep the format from imposing `short`, while
+            // `--date=` does. Testing the mode for "still the default" instead read
+            // a configured `log.date` as an override and printed an RFC date where
+            // stock prints `2005-04-07`.
+            let date_mode = match ctx.date_explicit {
+                true => ctx.date_mode.clone(),
+                false => DateMode::Short,
             };
             let author = commit.author()?;
             let t = author.time()?;

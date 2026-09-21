@@ -1886,13 +1886,29 @@ impl PrettyOpts {
                 Some(i) => (&item[..i], Some(item[i + 1..].to_vec())),
                 None => (&item[..], None),
             };
-            // `parse_ret_bool()`: a bare option is true, `=true`/`=false` are the
-            // only spellings of the two states.
+            // ```c
+            // if (!argval) {
+            //         *val = 1;
+            //         return 1;
+            // }
+            //
+            // strval = xstrndup(argval, arglen);
+            // v = git_parse_maybe_bool(strval);
+            // free(strval);
+            //
+            // if (v == -1)
+            //         return 0;
+            // ```
+            //
+            // (`match_placeholder_bool_arg()`, pretty.c:1237-1250.) A bare option is
+            // true, and a value is read by the *whole* boolean grammar — `yes`/`no`,
+            // `on`/`off`, `1`/`0` and the empty string, not just `true`/`false`. The
+            // port accepted only the two words, so `%(trailers:only=yes)` and
+            // `%(trailers:only=no)` were rejected and printed as literal text.
             let flag = |value: &Option<Vec<u8>>| -> Option<bool> {
                 match value.as_deref() {
-                    None | Some(b"true") => Some(true),
-                    Some(b"false") => Some(false),
-                    _ => None,
+                    None => Some(true),
+                    Some(v) => crate::optint::maybe_bool(&String::from_utf8_lossy(v)),
                 }
             };
             match name {

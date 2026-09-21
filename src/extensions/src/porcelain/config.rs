@@ -281,6 +281,19 @@ enum Scope {
     /// (builtin/config.c:820-821) refuses to write one, and `show_editor()`
     /// (:1299-1300) refuses to edit one.
     Blob(String),
+    /// `--file -` (and `GIT_CONFIG=-`): the config text is read from standard input.
+    ///
+    /// ```c
+    /// if (opts->source.file && !strcmp(opts->source.file, "-")) {
+    ///         opts->source.file = NULL;
+    ///         opts->source.use_stdin = 1;
+    ///         opts->source.scope = CONFIG_SCOPE_COMMAND;
+    /// }
+    /// ```
+    ///
+    /// (`location_options_init()`, builtin/config.c:954-958.) Read-only: `check_write()`
+    /// refuses to write it (:817) and `show_editor()` refuses to edit it (:1297).
+    Stdin,
     /// `--worktree`: `$GIT_DIR/config.worktree` when `extensions.worktreeConfig`
     /// is on, and the repository's own `config` when it is not — see
     /// [`worktree_config_file`], which is `location_options_init()`'s arm for it
@@ -304,6 +317,10 @@ struct WriteTarget {
 ///
 /// `anyhow::bail!` would collapse to exit 1, so every usage diagnostic has to
 /// report itself and return the code explicitly.
+/// `CONFIG_ENVIRONMENT` (environment.h:9): the variable that names the single config file
+/// `git config` operates on when no scope flag was given.
+const CONFIG_ENVIRONMENT: &str = "GIT_CONFIG";
+
 fn usage_error(msg: &str) -> Result<ExitCode> {
     eprintln!("error: {msg}");
     Ok(ExitCode::from(129))
@@ -338,6 +355,10 @@ struct Display {
     /// carries `CONFIG_ORIGIN_BLOB` and this name in its `key_value_info`, which
     /// is what `--show-origin` prints instead of a file.
     blob: Option<String>,
+    /// `--file -`: entries carry `CONFIG_ORIGIN_STDIN`, whose
+    /// `config_origin_type_name()` is `standard input` (config.c:3601) and which names no
+    /// file after the colon.
+    stdin: bool,
     /// The merged read, the only one that walks the command line — see [`for_each_entry`].
     command_line: bool,
     /// The directory `git config` is standing in once setup has run, which is
@@ -1421,6 +1442,37 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         _ => {}
     }
 
+    // ```c
+    // if (!opts->source.file)
+    //         opts->source.file = opts->file_to_free =
+    //                 xstrdup_or_null(getenv(CONFIG_ENVIRONMENT));
+    //
+    // if (opts->use_global_config + opts->use_system_config +
+    //     opts->use_local_config + opts->use_worktree_config +
+    //     !!opts->source.file + !!opts->source.blob > 1) {
+    //         error(_("only one config file at a time"));
+    //         exit(129);
+    // }
+    // ```
+    //
+    // (`location_options_init()`, builtin/config.c:932-940.) `GIT_CONFIG` names the one
+    // file `git config` reads and writes when no scope flag was given — it is counted
+    // like `--file`, so it collides with one that was. This port ignored the variable
+    // outright, so `GIT_CONFIG=other git config --list` listed the repository.
+    if let Some(named) = std::env::var_os(CONFIG_ENVIRONMENT) {
+        match &scope {
+            Scope::Default => scope = Scope::File(named.into()),
+            _ => return usage_error("only one config file at a time"),
+        }
+    }
+
+    // `if (opts->source.file && !strcmp(opts->source.file, "-"))` — a `--file` (or
+    // `GIT_CONFIG`) of exactly `-` is standard input, not a file named `-`.
+    if matches!(&scope, Scope::File(path) if path.as_os_str() == "-") {
+        scope = Scope::Stdin;
+        d.stdin = true;
+    }
+
     // `select_type()` has already rejected any name git does not know, so every
     // surviving name is one of the seven [`ValueType`] arms.
     d.ty = ty_name.and_then(ValueType::parse);
@@ -1458,6 +1510,33 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             None
         }
     };
+    // ```c
+    // if (!startup_info->have_repository) {
+    //         if (opts->use_local_config)
+    //                 die(_("--local can only be used inside a git repository"));
+    //         if (opts->source.blob)
+    //                 die(_("--blob can only be used inside a git repository"));
+    //         if (opts->use_worktree_config)
+    //                 die(_("--worktree can only be used inside a git repository"));
+    // }
+    // ```
+    //
+    // (`location_options_init()`, builtin/config.c:941-948.) These are `die()`s, so exit
+    // 128 — and they run before the action, so a *read* through one of those scopes is
+    // refused the same way a write is. This port raised them as ordinary errors from the
+    // read and write paths separately, which exited 1 and let `git config --local x.y`
+    // outside a repository look like "key not found".
+    if repo.is_none() {
+        match &scope {
+            Scope::Local => crate::git_fatal!("--local can only be used inside a git repository"),
+            Scope::Blob(_) => crate::git_fatal!("--blob can only be used inside a git repository"),
+            Scope::Worktree => {
+                crate::git_fatal!("--worktree can only be used inside a git repository")
+            }
+            _ => {}
+        }
+    }
+
     d.prefix = repo.as_ref().and_then(crate::setup::prefix).map(|p| format!("{}/", p.display()));
     d.path_base = match &repo {
         Some(repo) => crate::setup::setup_cwd(repo),
@@ -1665,6 +1744,45 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             };
             &scoped
         }
+        // `git_config_from_stdin()` (config.c:1444-1459) reads the whole of stdin and
+        // parses it through the same `git_parse_source()`, with
+        // `CONFIG_ORIGIN_STDIN`: a parse failure is
+        // `bad config line <n> in standard input` (config.c:1151) and, since
+        // `do_config_from()` leaves `default_error_action` at `CONFIG_ERROR_DIE`, it is
+        // fatal. The entries carry no filename, which is why `--show-origin` prints the
+        // bare `standard input:` column.
+        Scope::Stdin => {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
+            if let Some(line) = crate::config::first_bad_config_line(&bytes) {
+                return Ok(fatal(&format!("bad config line {line} in standard input")));
+            }
+            let mut f = ConfigFile::from_bytes_no_includes(
+                &bytes,
+                gix::config::file::Metadata::from(Source::Cli),
+                Default::default(),
+            )?;
+            if includes {
+                // `opts->options.respect_includes = !opts->source.file` and stdin leaves
+                // `source.file` NULL (builtin/config.c:954-1004), so includes are
+                // followed here by default — unlike a named `--file`.
+                let git_dir = repo.as_ref().map(|r| r.git_dir().to_owned());
+                let branch_name = repo.as_ref().and_then(|r| r.head_name().ok().flatten());
+                let conditional = gix::config::file::includes::conditional::Context {
+                    git_dir: git_dir.as_deref(),
+                    branch_name: branch_name.as_ref().map(|n| n.as_ref()),
+                };
+                f.resolve_includes(gix::config::file::init::Options {
+                    includes: gix::config::file::includes::Options::follow(
+                        Default::default(),
+                        conditional,
+                    ),
+                    ..Default::default()
+                })?;
+            }
+            scoped = f;
+            &scoped
+        }
         // `--file` is git's `CONFIG_SCOPE_COMMAND`, hence `Source::Cli`. Read
         // through `fs::read` so a missing or unreadable path surfaces as a
         // plain `io::Error` whose errno git reports verbatim.
@@ -1807,6 +1925,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::GetColorBool => get_colorbool(file, d.command_line, &positional),
         // `show_editor()` refuses a blob before `check_write()` would have
         // (builtin/config.c:1299-1300), so this is not the write message.
+        // `show_editor()` checks stdin before blobs, and both before `check_write()`
+        // would (builtin/config.c:1295-1300).
+        Mode::Edit if matches!(scope, Scope::Stdin) => {
+            Ok(fatal("editing stdin is not supported"))
+        }
         Mode::Edit if matches!(scope, Scope::Blob(_)) => {
             Ok(fatal("editing blobs is not supported"))
         }
@@ -2224,10 +2347,14 @@ fn write_origin(out: &mut impl Write, d: &Display, meta: &gix::config::file::Met
         return Ok(());
     }
     match &meta.path {
+        // An `include.path` followed out of stdin lands in a real file, and its entries
+        // carry that file's `key_value_info` — only the ones read from stdin itself have
+        // no filename.
         Some(path) => {
             out.write_all(b"file:")?;
             out.write_all(origin_path(d, meta.source, &path.to_string_lossy()).as_bytes())?;
         }
+        None if d.stdin => out.write_all(b"standard input:")?,
         None => out.write_all(origin_word(meta.source).as_bytes())?,
     }
     out.write_all(column_term(d))?;
@@ -3916,6 +4043,7 @@ fn read_scope(sources: &[Source]) -> ConfigFile {
 fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result<WriteTarget> {
     match scope {
         // `check_write()` (builtin/config.c:812-822).
+        Scope::Stdin => crate::git_fatal!("writing to stdin is not supported"),
         Scope::Blob(_) => crate::git_fatal!("writing config blobs is not supported"),
         Scope::Default | Scope::Local => {
             let repo = repo.ok_or_else(|| match scope {

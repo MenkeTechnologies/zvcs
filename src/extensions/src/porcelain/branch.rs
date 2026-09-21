@@ -534,7 +534,7 @@ fn branch_mark(
         "" | "HEAD" => match repo.head_name() {
             Ok(Some(h)) => h.as_bstr().to_string(),
             _ => {
-                return Err(crate::objname::upstream_mark_fatal(repo, name)
+                return Err(crate::objname::upstream_mark_fatal_allowed(repo, name, false)
                     .unwrap_or_else(|| format!("no upstream configured for branch '{name}'")))
             }
         },
@@ -542,7 +542,7 @@ fn branch_mark(
     };
     // `value = get_data(branch, &err); if (!value) die("%s", err.buf);`
     let Some(upstream) = upstream_ref(repo, full.as_str().into()) else {
-        return Err(crate::objname::upstream_mark_fatal(repo, name)
+        return Err(crate::objname::upstream_mark_fatal_allowed(repo, name, false)
             .unwrap_or_else(|| format!("no upstream configured for branch '{name}'")));
     };
     let value = upstream.as_bstr().to_str_lossy().into_owned();

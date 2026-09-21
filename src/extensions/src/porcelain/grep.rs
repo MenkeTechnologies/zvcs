@@ -1091,7 +1091,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // revisions were allowed at that position.
     if !seen_dashdash {
         for (j, item) in rest.iter().enumerate().skip(path_start) {
-            if let Some(code) = verify_filename(item, j == path_start && allow_revs) {
+            if let Some(code) = verify_filename(repo.as_ref(), item, j == path_start && allow_revs) {
                 return Ok(code);
             }
         }
@@ -1899,7 +1899,17 @@ fn collect_trees(
         BTreeMap::new()
     };
     for rev in revs {
-        let object = repo.rev_parse_single(rev.as_str())?.object()?;
+        // The classifier above already resolved this token with
+        // [`crate::objname::resolve`]; looking it up again with gitoxide's own
+        // grammar disagreed with that answer for every operand
+        // `get_oid_basic()` rewrites — `git grep <pat> @@{u}` and
+        // `git grep <pat> @{-2}@{u}` reported `unconsumed input: "@{u}"` where
+        // stock 2.55.0 greps the upstream. `resolve_quiet` because this is the
+        // second look-up of one operand and the warning belongs to the first.
+        let object = match crate::objname::resolve_quiet(repo, rev.as_str()) {
+            Some(id) => repo.find_object(id)?,
+            None => repo.rev_parse_single(rev.as_str())?.object()?,
+        };
         // `grep_object()` dispatches on the object's own type, and a blob is
         // grepped straight away — `grep_oid(opt, &obj->oid, name, 0, path)` —
         // under the name the user spelled and with the pathspec never consulted.
@@ -1908,10 +1918,21 @@ fn collect_trees(
             // `oc.path` from `get_oid_with_context(…, GET_OID_RECORD_PATH, …)`:
             // the path half of the `<rev>:<path>` spelling, which is what the
             // attribute lookups for this blob are keyed on.
-            let rela = rev
-                .split_once(':')
-                .map(|(_, path)| BString::from(path))
-                .unwrap_or_default();
+            // `oc->path` is what `get_oid_with_context_1()` recorded *after*
+            // `resolve_relative_path()` rewrote it (`object-name.c:1838-1845`),
+            // so `main:./f` is keyed on `f` — or on `<prefix>/f` from a
+            // subdirectory — and not on the `./f` the user typed. The raw split
+            // handed gitoxide a path with a `.` component and ended the command
+            // with `Input path "./f" contains relative or absolute components`.
+            let rela = match crate::objpath::split(rev.as_str()) {
+                crate::objpath::Split::Tree { path, .. } => {
+                    match crate::objpath::resolve_relative_path(repo, path) {
+                        Ok(Some(rewritten)) => BString::from(rewritten),
+                        _ => BString::from(path),
+                    }
+                }
+                _ => BString::default(),
+            };
             cands.push((rev.as_bytes().to_vec(), rela, Source::Blob(object.id)));
             continue;
         }
@@ -2158,8 +2179,20 @@ fn source_conflict(opts: &Opts) -> Option<ExitCode> {
 /// a revision was still admissible at this position (the first path, with revs
 /// allowed), the plainer "no such path" form otherwise (subsequent paths, or when
 /// revisions were never in play — including every `--no-index`/`--untracked` path).
-fn verify_filename(arg: &str, diagnose_misspelt_rev: bool) -> Option<ExitCode> {
-    let msg = crate::setup::verify_filename(arg, diagnose_misspelt_rev)?;
+fn verify_filename(
+    repo: Option<&gix::Repository>,
+    arg: &str,
+    diagnose_misspelt_rev: bool,
+) -> Option<ExitCode> {
+    // `die_verify_filename()`'s `maybe_die_on_misspelt_object_name()` step, which
+    // is what makes `git grep <pat> nosuchref:f` say
+    // `fatal: invalid object name 'nosuchref'.` rather than the generic block.
+    // Without a repository (`--no-index`) there is nothing to resolve against and
+    // `diagnose_misspelt_rev` is false anyway.
+    let msg = match repo {
+        Some(repo) => crate::objpath::verify_filename_fatal(repo, arg, diagnose_misspelt_rev)?,
+        None => crate::setup::verify_filename(arg, diagnose_misspelt_rev)?,
+    };
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(128))
 }

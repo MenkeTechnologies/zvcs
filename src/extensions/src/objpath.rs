@@ -217,7 +217,30 @@ pub fn misspelt_object_name(repo: &gix::Repository, name: &str) -> Option<String
             diagnose_invalid_index_path(repo, stage, &path)
         }
         Split::Tree { rev, path } => {
-            let tree = crate::objname::resolve_quiet(repo, rev)?;
+            // ```c
+            // if (!get_oid_1(repo, name, len, &tree_oid, sub_flags)) {
+            //         …
+            // } else {
+            //         if (only_to_die)
+            //                 die(_("invalid object name '%.*s'."), len, name);
+            // }
+            // ```
+            //
+            // (`object-name.c:1854-1877`.) The `else` arm is the whole reason a
+            // `<rev>:<path>` whose *rev* half does not resolve reads differently
+            // from every other unresolvable operand: stock 2.55.0 answers
+            // `git rev-parse nosuchref:f1`, `git show dd:f` (an ambiguous
+            // abbreviation) and `git log main^{blob}:f1` with
+            // `fatal: invalid object name '<rev>'.` and not with the generic
+            // `ambiguous argument …` block. Returning `None` here handed all of
+            // them back to the caller's generic message.
+            //
+            // `len` is the offset of the splitting colon, so the name is the rev
+            // half alone — `main^{blob}` for `main^{blob}:f1`, with its own
+            // `error: … dereferences to tree type` line already printed above it.
+            let Some(tree) = crate::objname::resolve_quiet(repo, rev) else {
+                return Some(format!("invalid object name '{rev}'."));
+            };
             let path = match resolve_relative_path(repo, path) {
                 Ok(Some(rewritten)) => std::borrow::Cow::Owned(rewritten),
                 Ok(None) => std::borrow::Cow::Borrowed(path),
@@ -391,6 +414,50 @@ pub fn verify_filename_diagnosis(repo: &gix::Repository, arg: &str) -> Option<St
         return None;
     }
     misspelt_object_name(repo, arg)
+}
+
+/// `verify_filename()` followed by `die_verify_filename()` (`setup.c:198-226`) as
+/// one call: the text of the `die()` for an operand that is neither a revision
+/// nor a path, or `None` when `verify_filename()` let it through.
+///
+/// ```c
+/// void verify_filename(struct repository *repo, const char *prefix, const char *arg, int diagnose_misspelt_rev)
+/// {
+///         if (*arg == '-')
+///                 die(_("option '%s' must come before non-option arguments"), arg);
+///         if (looks_like_pathspec(arg) || check_filename(repo, prefix, arg))
+///                 return;
+///         die_verify_filename(repo, prefix, arg, diagnose_misspelt_rev);
+/// }
+/// ```
+///
+/// `maybe_die_on_misspelt_object_name()` is a whole second
+/// `get_oid_with_context_1()` over the operand, so it re-raises `peel_onion()`'s
+/// `error()` on the way past — which is why stock 2.55.0 prints
+/// `expected blob type` **twice** for `git diff main^{blob}` and once for
+/// `git cat-file -t main^{blob}`. That line is printed here, where the C prints
+/// it, and the `die()` text is returned for the caller to render.
+///
+/// Every verb that splits revisions from paths needs the whole sequence. Reaching
+/// only for [`crate::setup::verify_filename`] left `git diff nosuchref:f` and
+/// `git grep <pat> nosuchref:f` on the generic `ambiguous argument` block where
+/// stock says `fatal: invalid object name 'nosuchref'.`, and swallowed the second
+/// `error:` line as well.
+pub fn verify_filename_fatal(
+    repo: &gix::Repository,
+    arg: &str,
+    diagnose_misspelt_rev: bool,
+) -> Option<String> {
+    let generic = crate::setup::verify_filename(arg, diagnose_misspelt_rev)?;
+    // `if (!diagnose_misspelt_rev) die(_("%s: no such path in the working tree…"))`
+    // comes first and never reaches the second resolution.
+    if !diagnose_misspelt_rev {
+        return Some(generic);
+    }
+    if let Some(message) = crate::objname::peel_type_error(repo, arg) {
+        eprintln!("error: {message}");
+    }
+    Some(verify_filename_diagnosis(repo, arg).unwrap_or(generic))
 }
 
 /// `prefix_path()`'s `die()`, for an operand whose `./`/`../` path arm climbs out

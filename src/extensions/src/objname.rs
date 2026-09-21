@@ -1046,7 +1046,205 @@ pub fn resolve_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     if resolves_through_reflog(spec) {
         return reflog_spec_oid(repo, spec);
     }
+    // `get_oid_with_context_1()`'s `:/<text>` arm (`object-name.c:1763-1775`).
+    // Unlike `<rev>^{/<text>}`, which searches down from one named commit, this
+    // one seeds the walk with *every* ref plus HEAD and pops in commit-date
+    // order — so with more than one match the two spellings need not agree, and
+    // gitoxide's rev-spec parser does not reproduce either the seed set or the
+    // order.
+    if let Some(text) = oneline_operand(spec) {
+        return oid_oneline(repo, text, all_ref_tips(repo));
+    }
     repo.rev_parse_single(canonical_spec(repo, spec).as_ref()).ok().map(|id| id.detach())
+}
+
+/// The `<text>` of a `:/<text>` operand, or `None` when `spec` is not one.
+///
+/// ```c
+/// if (!only_to_die && namelen > 2 && name[1] == '/') {
+/// ```
+///
+/// `namelen > 2` is why a bare `:/` is *not* a search — it is the index path
+/// `/`, and then the root directory as far as `check_filename()` is concerned.
+pub fn oneline_operand(spec: &str) -> Option<&str> {
+    (spec.len() > 2 && spec.starts_with(":/")).then(|| &spec[2..])
+}
+
+/// `handle_one_ref()` over `refs_for_each_ref()` and then `refs_head_ref()`
+/// (`object-name.c:1165-1183`), in the order the resulting `commit_list` hands
+/// its entries to the priority queue.
+///
+/// ```c
+/// static int handle_one_ref(const struct reference *ref, void *cb_data)
+/// {
+///         struct object *object = parse_object(cb->repo, ref->oid);
+///         if (!object) return 0;
+///         if (object->type == OBJ_TAG) {
+///                 object = deref_tag(cb->repo, object, ref->name, strlen(ref->name));
+///                 if (!object) return 0;
+///         }
+///         if (object->type != OBJ_COMMIT) return 0;
+///         commit_list_insert((struct commit *)object, list);
+///         return 0;
+/// }
+/// ```
+///
+/// `commit_list_insert()` **prepends**, and HEAD is visited last, so the list the
+/// caller then walks front-to-back is HEAD first and the refs in reverse
+/// iteration order after it. That ordering is observable: `prio_queue` breaks a
+/// date tie on insertion counter (`prio-queue.c`'s `compare()` falls back to
+/// `queue->array[i].ctr - queue->array[j].ctr`), so two ref tips sharing a commit
+/// date are answered HEAD-first.
+fn all_ref_tips(repo: &gix::Repository) -> Vec<ObjectId> {
+    let mut refs: Vec<ObjectId> = Vec::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(iter) = platform.all() {
+            for reference in iter.filter_map(std::result::Result::ok) {
+                let Some(id) = reference.try_id() else { continue };
+                if let Some(commit) = peel_to_commit(repo, id.detach()) {
+                    refs.push(commit);
+                }
+            }
+        }
+    }
+    // `commit_list_insert()` prepends each ref as it is visited…
+    refs.reverse();
+    // …and `refs_head_ref()` runs after the whole iteration, so HEAD lands first.
+    let mut tips = Vec::with_capacity(refs.len() + 1);
+    if let Some(head) = repo.head_id().ok().and_then(|id| peel_to_commit(repo, id.detach())) {
+        tips.push(head);
+    }
+    tips.extend(refs);
+    tips
+}
+
+/// `parse_object()` + `deref_tag()` + the `type != OBJ_COMMIT` test, as
+/// `handle_one_ref()` applies them.
+fn peel_to_commit(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    let object = repo.find_object(id).ok()?;
+    let peeled = match object.kind {
+        gix::object::Kind::Tag => object.peel_tags_to_end().ok()?,
+        _ => object,
+    };
+    (peeled.kind == gix::object::Kind::Commit).then_some(peeled.id)
+}
+
+/// `get_oid_oneline()` (`object-name.c:1184-1238`): the most recent commit whose
+/// message body the pattern matches, walking down from `tips`.
+///
+/// ```c
+/// if (prefix[0] == '!') {
+///         prefix++;
+///         if (prefix[0] == '-') { prefix++; negative = 1; }
+///         else if (prefix[0] != '!') return -1;
+/// }
+/// if (regcomp(&regex, prefix, REG_EXTENDED)) return -1;
+/// …
+/// while (copy.nr) {
+///         commit = pop_most_recent_commit(&copy, ONELINE_SEEN);
+///         if (!parse_object(r, &commit->object.oid)) continue;
+///         buf = repo_get_commit_buffer(r, commit, NULL);
+///         p = strstr(buf, "\n\n");
+///         matches = negative ^ (p && !regexec(&regex, p + 2, 0, NULL, 0));
+///         repo_unuse_commit_buffer(r, commit, buf);
+///         if (matches) { oidcpy(oid, &commit->object.oid); found = 1; break; }
+/// }
+/// ```
+///
+/// Three details a re-derivation drops, each separately observable:
+///
+///   * the leading-`!` decode is *three* cases, not two — `!-` negates, `!!`
+///     searches for a literal `!`, and a bare `!` is `return -1`;
+///   * the queue is ordered by **commit date**, not by graph position, so the
+///     answer need not be reachable from HEAD and need not be the first match a
+///     topological walk would find;
+///   * the pattern is matched against everything after the first blank line of
+///     the raw object, so a match in the header (an author's name, a tree id)
+///     does not count.
+fn oid_oneline(
+    repo: &gix::Repository,
+    text: &str,
+    tips: Vec<ObjectId>,
+) -> Option<ObjectId> {
+    let (pattern, negative) = match text.strip_prefix('!') {
+        None => (text, false),
+        Some(rest) if rest.starts_with('-') => (&rest[1..], true),
+        // `else if (prefix[0] != '!') return -1;` — `!!` keeps the second `!` as
+        // part of the pattern.
+        Some(rest) if rest.starts_with('!') => (rest, false),
+        Some(_) => return None,
+    };
+    let regex = crate::revfilter::build_regex(
+        pattern,
+        crate::revfilter::Dialect::Extended,
+        false,
+        crate::revfilter::Origin::CommandLine,
+    )
+    .ok()?;
+
+    /// One `prio_queue` entry. `Ord` is inverted where `BinaryHeap` needs it:
+    /// the heap pops the greatest, and the greatest must be the *newest* commit,
+    /// with a date tie going to the *earlier* insertion.
+    struct Entry {
+        time: i64,
+        ctr: u64,
+        id: ObjectId,
+    }
+    impl PartialEq for Entry {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == std::cmp::Ordering::Equal
+        }
+    }
+    impl Eq for Entry {}
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Entry {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.time.cmp(&other.time).then_with(|| other.ctr.cmp(&self.ctr))
+        }
+    }
+
+    let mut heap: std::collections::BinaryHeap<Entry> = std::collections::BinaryHeap::new();
+    let mut ctr = 0u64;
+    let mut seen: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let mut put = |heap: &mut std::collections::BinaryHeap<Entry>, id: ObjectId, ctr: &mut u64| {
+        let Ok(commit) = repo.find_commit(id) else { return };
+        let time = commit.time().map(|t| t.seconds).unwrap_or(0);
+        heap.push(Entry { time, ctr: *ctr, id });
+        *ctr += 1;
+    };
+
+    // The root loop marks every tip and queues it unconditionally, so a commit
+    // several refs point at is queued several times — harmless, and faithful.
+    for id in tips {
+        seen.insert(id);
+        put(&mut heap, id, &mut ctr);
+    }
+
+    while let Some(entry) = heap.pop() {
+        let Ok(commit) = repo.find_commit(entry.id) else { continue };
+        // `pop_most_recent_commit()`: the parents are queued before the popped
+        // commit is examined.
+        for parent in commit.parent_ids() {
+            let parent = parent.detach();
+            if seen.insert(parent) {
+                put(&mut heap, parent, &mut ctr);
+            }
+        }
+        // `strstr(buf, "\n\n")` over the *raw* object, then `p + 2`.
+        let data = commit.data.as_slice();
+        let matches = match data.windows(2).position(|w| w == b"\n\n") {
+            Some(at) => regex.is_match(&data[at + 2..]),
+            None => false,
+        };
+        if matches != negative {
+            return Some(entry.id);
+        }
+    }
+    None
 }
 
 
@@ -2285,14 +2483,25 @@ pub fn reflog_reach_of(repo: &gix::Repository, name: &str) -> Option<ReflogReach
     // `repo_dwim_ref("HEAD")` resolves the symref and reports its *target*, so a
     // bare `@{99}` is diagnosed as `main`; `repo_dwim_log("HEAD")` finds HEAD's own
     // log and reports `HEAD`. Detached, there is no target and both say `HEAD`.
-    let full = if base.is_empty() {
+    // `repo_dwim_log()` opens with `substitute_branch_name()` (`refs.c:844`), so
+    // the ref half is rewritten before any `ref_rev_parse_rules` spelling is
+    // tried — exactly as [`reflog_read`] already does it. Without the rewrite
+    // `@{u}@{1}` and `<branch>@{push}@{<n>}` found no log, fell through to every
+    // caller's `ambiguous argument`, and lost stock's
+    // `fatal: log for '@{u}' only has 1 entries`.
+    let substituted = match interpret_branch_name(repo, base) {
+        Some(Ok(rewritten)) => Some(rewritten),
+        _ => None,
+    };
+    let looked_up = substituted.as_deref().unwrap_or(base);
+    let full = if looked_up.is_empty() {
         repo.head_ref()
             .ok()
             .flatten()
             .map(|r| r.name().as_bstr().to_string())
             .unwrap_or_else(|| "HEAD".to_string())
     } else {
-        crate::porcelain::reflog::dwim_log(repo, base)?
+        crate::porcelain::reflog::dwim_log(repo, looked_up)?
     };
 
     let (nth, at_time) = {
@@ -2465,13 +2674,34 @@ pub fn reflog_reach_warning(repo: &gix::Repository, spec: &str) -> Option<String
 /// then `push_mark` at each `@` in turn, so the *earlier* `@` decides which of the
 /// two applies and a tie goes to the upstream mark.
 pub fn upstream_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
+    upstream_mark_fatal_allowed(repo, spec, true)
+}
+
+/// [`upstream_mark_fatal`] with `interpret_empty_at()` gated the way
+/// `interpret_branch_name_options.allowed` gates it — see
+/// [`prefix_rewrite_allowed`].
+///
+/// `builtin/branch.c` and `git check-ref-format --branch` are the callers that
+/// need `false`: they pass `INTERPRET_BRANCH_LOCAL`, so `@@{u}` there is the
+/// upstream of a branch named `@` and dies `no such branch: '@'`.
+pub fn upstream_mark_fatal_allowed(
+    repo: &gix::Repository,
+    spec: &str,
+    allow_head: bool,
+) -> Option<String> {
     let base = ambiguity_base(spec);
     if stops_at_missing_count(base) {
         return None;
     }
+    // `reinterpret()`: `@{-<n>}` and a bare `@` are rewritten before either mark
+    // is interpreted, so `@{-2}@{u}` asks about the prior branch's upstream and
+    // `@@{u}` about HEAD's — not about branches literally called `@{-2}` and `@`.
+    if let Some(rewritten) = prefix_rewrite_allowed(repo, base, allow_head) {
+        return upstream_mark_fatal_allowed(repo, &rewritten, allow_head);
+    }
     let at = match (upstream_mark_at(base), push_mark_at(base)) {
-        (Some(u), Some(p)) if p < u => return push_mark_fatal(repo, spec),
-        (None, Some(_)) => return push_mark_fatal(repo, spec),
+        (Some(u), Some(p)) if p < u => return push_mark_fatal_allowed(repo, spec, allow_head),
+        (None, Some(_)) => return push_mark_fatal_allowed(repo, spec, allow_head),
         (Some(u), _) => u,
         (None, None) => return None,
     };
@@ -2582,20 +2812,50 @@ pub fn push_mark_at(base: &str) -> Option<usize> {
 ///     (`add_url_alias()`), so `branch.<n>.pushRemote=nosuchremote` reaches the
 ///     "no local tracking branch" arm rather than "has no remote for pushing".
 pub fn push_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
+    push_mark_fatal_allowed(repo, spec, true)
+}
+
+/// [`push_mark_fatal`] with the same `allowed` gate as
+/// [`upstream_mark_fatal_allowed`].
+pub fn push_mark_fatal_allowed(
+    repo: &gix::Repository,
+    spec: &str,
+    allow_head: bool,
+) -> Option<String> {
     let base = ambiguity_base(spec);
     if stops_at_missing_count(base) {
         return None;
+    }
+    // `reinterpret()`, as in [`upstream_mark_fatal`].
+    if let Some(rewritten) = prefix_rewrite_allowed(repo, base, allow_head) {
+        return push_mark_fatal_allowed(repo, &rewritten, allow_head);
     }
     let at = push_mark_at(base)?;
     let named = &base[..at];
     if named.contains(':') {
         return None;
     }
+    push_dest(repo, named).err()
+}
+
+/// `branch_get_push()`'s *value* — the remote-tracking ref `<branch>@{push}`
+/// names — rather than only the `die()` [`push_mark_fatal`] renders from it.
+///
+/// `interpret_branch_mark()` needs both halves: the error when there is nothing
+/// to name, and the name itself when there is, because that name is what
+/// `substitute_branch_name()` splices into the operand before `repo_dwim_ref()`
+/// and `repo_dwim_log()` look anything up. Answering only the error left
+/// `@{push}@{0}` and `<branch>@{push}@{<n>}` unresolvable here while stock
+/// 2.55.0 reads the push destination's reflog.
+///
+/// `named` is the text before the mark's `@`, i.e. `interpret_branch_mark()`'s
+/// `xmemdupz(name, at)`; empty means `branch_get(NULL)`.
+fn push_dest(repo: &gix::Repository, named: &str) -> Result<String, String> {
     // `branch_get(NULL)` / `branch_get("HEAD")`.
     let name = if named.is_empty() || named == "HEAD" {
         match repo.head_name() {
             Ok(Some(full)) => full.shorten().to_string(),
-            _ => return Some("HEAD does not point to a branch".to_string()),
+            _ => return Err("HEAD does not point to a branch".to_string()),
         }
     } else {
         named.to_string()
@@ -2654,43 +2914,46 @@ pub fn push_mark_fatal(repo: &gix::Repository, spec: &str) -> Option<String> {
         })
     };
 
-    let landed = if !push.is_empty() {
+    // `branch_get_upstream()` as a value, for the two `push.default` arms that
+    // answer with the upstream itself. Its `die()` has already been taken above
+    // each call, so the `None` here is the state that arm cannot be in.
+    let upstream_value = || -> Result<String, String> {
+        crate::porcelain::branch::upstream_ref(repo, refname.as_str().into())
+            .map(|up| up.as_bstr().to_string())
+            .ok_or_else(|| format!("no upstream configured for branch '{name}'"))
+    };
+
+    if !push.is_empty() {
         match apply_refspecs(&push, &refname) {
-            None => {
-                return Some(format!(
-                    "push refspecs for '{remote}' do not include '{name}'"
-                ))
-            }
+            None => Err(format!("push refspecs for '{remote}' do not include '{name}'")),
             Some(dst) => tracking(&dst),
         }
     } else if config.boolean(&format!("remote.{remote}.mirror")).unwrap_or(false) {
         tracking(&refname)
     } else {
         match string("push.default").as_deref().unwrap_or("simple") {
-            "nothing" => {
-                return Some("push has no destination (push.default is 'nothing')".to_string())
-            }
+            "nothing" => Err("push has no destination (push.default is 'nothing')".to_string()),
             "matching" | "current" => tracking(&refname),
-            "upstream" | "tracking" => return upstream_mark_fatal_for(repo, &name),
+            "upstream" | "tracking" => match upstream_mark_fatal_for(repo, &name) {
+                Some(message) => Err(message),
+                None => upstream_value(),
+            },
             // `PUSH_DEFAULT_UNSPECIFIED` and `PUSH_DEFAULT_SIMPLE`.
             _ => {
                 if let Some(message) = upstream_mark_fatal_for(repo, &name) {
-                    return Some(message);
+                    return Err(message);
                 }
-                let up = crate::porcelain::branch::upstream_ref(repo, refname.as_str().into())?;
+                let up = upstream_value()?;
                 match tracking(&refname) {
-                    Err(message) => return Some(message),
-                    Ok(cur) if cur.as_bytes() != up.as_bstr() => {
-                        return Some(
-                            "cannot resolve 'simple' push to a single destination".to_string(),
-                        )
+                    Err(message) => Err(message),
+                    Ok(cur) if cur != up => {
+                        Err("cannot resolve 'simple' push to a single destination".to_string())
                     }
                     Ok(cur) => Ok(cur),
                 }
             }
         }
-    };
-    landed.err()
+    }
 }
 
 /// [`upstream_mark_fatal`] asked about a branch by name rather than about an
@@ -3120,10 +3383,30 @@ pub fn interpret_branch_name(
     repo: &gix::Repository,
     name: &str,
 ) -> Option<Result<String, String>> {
-    if name == "@" {
-        return Some(Ok("HEAD".to_owned()));
+    // `reinterpret()` (`object-name.c:1378-1402`): the two rewrites that consume a
+    // *prefix* re-run the whole interpretation on the spliced name, which is what
+    // lets `@{-<n>}` and a bare `@` carry a mark. Without the recursion
+    // `@{-2}@{u}` and `@@{u}` reached `interpret_branch_mark()` with `@{-2}` and
+    // `@` as the branch name and died with `no such branch:` where stock 2.55.0
+    // resolves them; `@{-<n>}` alone never reached `repo_dwim_ref()` at all, so an
+    // ambiguous prior branch lost its `refname '@{-3}' is ambiguous.` warning.
+    if let Some(rewritten) = prefix_rewrite(repo, name) {
+        return Some(match interpret_branch_name(repo, &rewritten) {
+            Some(result) => result,
+            // `repo_interpret_branch_name()` returned `len == namelen` from the
+            // rewrite itself, so the whole operand was consumed and
+            // `substitute_branch_name()` substitutes.
+            None => Ok(rewritten),
+        });
     }
-    let at = upstream_mark_at(name)?;
+    let at = match (upstream_mark_at(name), push_mark_at(name)) {
+        // The `@` loop tries `upstream_mark` and then `push_mark` at each
+        // position, so the *earlier* `@` decides and a tie goes to the upstream.
+        (Some(u), Some(p)) if p < u => return push_branch_name(repo, name, p),
+        (None, Some(p)) => return push_branch_name(repo, name, p),
+        (Some(u), _) => u,
+        (None, None) => return None,
+    };
     // `if (memchr(name, ':', at)) return -1;`
     if name[..at].contains(':') {
         return Some(Err(format!("unhandled upstream mark in '{name}'")));
@@ -3148,6 +3431,153 @@ pub fn interpret_branch_name(
         .find(|m| rest.len() >= m.len() && rest[..m.len()].eq_ignore_ascii_case(m))
         .map(|m| m.len())?;
     Some(Ok(format!("{}{}", upstream.as_bstr(), &rest[mark_len..])))
+}
+
+/// `interpret_branch_mark()` with `push_mark`/`branch_get_push()`
+/// (`object-name.c:1495-1510`), the sibling of the `@{u}` arm above.
+///
+/// `at` is the offset of the mark's `@`, which the caller has already decided is
+/// the one `repo_interpret_branch_name()`'s scan reaches first.
+fn push_branch_name(
+    repo: &gix::Repository,
+    name: &str,
+    at: usize,
+) -> Option<Result<String, String>> {
+    // `if (memchr(name, ':', at)) return -1;`
+    if name[..at].contains(':') {
+        return None;
+    }
+    match push_dest(repo, &name[..at]) {
+        Ok(dest) => Some(Ok(format!("{dest}{}", &name[at + "@{push}".len()..]))),
+        Err(message) => Some(Err(message)),
+    }
+}
+
+/// The two rewrites in `repo_interpret_branch_name()` that consume a *prefix* of
+/// the operand and then hand the spliced result back to itself through
+/// `reinterpret()` — `interpret_nth_prior_checkout()` and `interpret_empty_at()`.
+///
+/// `None` means neither applies, which is the only case where the `@` scan for
+/// the two branch marks runs on the operand as typed.
+pub fn prefix_rewrite(repo: &gix::Repository, name: &str) -> Option<String> {
+    prefix_rewrite_allowed(repo, name, true)
+}
+
+/// [`prefix_rewrite`] with `interpret_branch_name_options.allowed` applied.
+///
+/// ```c
+/// if (!options->allowed || (options->allowed & INTERPRET_BRANCH_HEAD)) {
+///         len = interpret_empty_at(name, namelen, at - name, buf);
+/// ```
+///
+/// `builtin/branch.c` and `builtin/check-ref-format.c --branch` pass
+/// `INTERPRET_BRANCH_LOCAL`, which does **not** include `INTERPRET_BRANCH_HEAD`,
+/// so a leading bare `@` stays itself for them. That is separately observable:
+/// stock `git check-ref-format --branch @@{u}` is
+/// `fatal: no such branch: '@'` — the mark applied to a branch literally called
+/// `@` — where `git rev-parse @@{u}` answers HEAD's upstream.
+///
+/// `interpret_nth_prior_checkout()` is gated on `INTERPRET_BRANCH_LOCAL`, which
+/// both of those callers do pass, so `@{-<n>}` is not gated here.
+fn prefix_rewrite_allowed(
+    repo: &gix::Repository,
+    name: &str,
+    allow_head: bool,
+) -> Option<String> {
+    if let Some(Some((branch, used))) = nth_prior_checkout(repo, name) {
+        return Some(format!("{branch}{}", &name[used..]));
+    }
+    (allow_head && interpret_empty_at(name)).then(|| format!("HEAD{}", &name[1..]))
+}
+
+/// `interpret_empty_at()` (`object-name.c:1363-1376`): a bare `@` is `HEAD`.
+///
+/// ```c
+/// if (len || name[1] == '{')
+///         return -1;
+/// /* make sure it's a single @, or @@{.*}, not @foo */
+/// next = memchr(name + len + 1, '@', namelen - len - 1);
+/// if (next && next[1] != '{')
+///         return -1;
+/// if (!next)
+///         next = name + namelen;
+/// if (next != name + 1)
+///         return -1;
+/// ```
+///
+/// `len` is the offset of the `@` the scan is at, so only the *first* character
+/// can take this branch, and the tests that follow admit exactly two spellings:
+/// the operand `@` on its own, and `@@{…}` — which is how `@@{u}` reaches the
+/// upstream mark as `HEAD@{u}`.
+fn interpret_empty_at(name: &str) -> bool {
+    let b = name.as_bytes();
+    if b.first() != Some(&b'@') || b.get(1) == Some(&b'{') {
+        return false;
+    }
+    match b.iter().skip(1).position(|&c| c == b'@') {
+        // `next` is the byte after `name`; `next != name + 1` unless the operand
+        // is the single character `@`.
+        None => b.len() == 1,
+        // `next[1] != '{'` rejects `@foo@bar`; `next != name + 1` rejects
+        // anything where the second `@` is not immediately after the first.
+        Some(off) => off == 0 && b.get(2) == Some(&b'{'),
+    }
+}
+
+/// `interpret_nth_prior_checkout()` (`object-name.c:1270-1306`): parse `@{-<n>}`
+/// and read the `n`-th "checkout: moving from <x> to <y>" entry off `HEAD`'s
+/// reflog, newest first.
+///
+/// ```c
+/// if (namelen < 4) return -1;
+/// if (name[0] != '@' || name[1] != '{' || name[2] != '-') return -1;
+/// brace = memchr(name, '}', namelen);
+/// if (!brace) return -1;
+/// nth = strtol(name + 3, &num_end, 10);
+/// if (num_end != brace) return -1;
+/// if (nth <= 0) return -1;
+/// …
+/// if (0 < retval) retval = brace - name + 1; else retval = 0;
+/// ```
+///
+/// `None` is the C's `-1` (not `@{-<n>}` syntax at all), `Some(None)` its `0`
+/// (the syntax is fine but the reflog does not go back that far, which
+/// `substitute_branch_name()` reads as "no substitution"), and
+/// `Some(Some((branch, used)))` its positive `brace - name + 1`.
+pub fn nth_prior_checkout(
+    repo: &gix::Repository,
+    name: &str,
+) -> Option<Option<(String, usize)>> {
+    use gix::bstr::ByteSlice;
+    let b = name.as_bytes();
+    if b.len() < 4 || !b.starts_with(b"@{-") {
+        return None;
+    }
+    let brace = b.iter().position(|&c| c == b'}')?;
+    // `strtol(name + 3, &num_end, 10)` with `num_end != brace` rejected, so the
+    // digits must run exactly up to the brace.
+    let nth: i64 = name.get(3..brace)?.parse().ok()?;
+    if nth <= 0 {
+        return None;
+    }
+    let used = brace + 1;
+
+    let Ok(head) = repo.head() else { return Some(None) };
+    let mut platform = head.log_iter();
+    let Ok(Some(log)) = platform.rev() else { return Some(None) };
+    let mut remaining = nth as usize;
+    for line in log.filter_map(std::result::Result::ok) {
+        // `grab_nth_branch_switch()` (`object-name.c:1246-1267`).
+        let Some(rest) = line.message.strip_prefix(b"checkout: moving from ".as_ref()) else {
+            continue;
+        };
+        let Some(pos) = rest.find(" to ") else { continue };
+        remaining -= 1;
+        if remaining == 0 {
+            return Some(Some((rest[..pos].to_str_lossy().into_owned(), used)));
+        }
+    }
+    Some(None)
 }
 
 /// The offset of the `@` that opens an `@{u}`/`@{upstream}` mark in `base`, as

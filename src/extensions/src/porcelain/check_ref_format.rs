@@ -290,7 +290,7 @@ fn copy_branchname(repo: &gix::Repository, name: &str) -> Result<Vec<u8>, String
     // is the shared port of that ladder — `branch_get_upstream`'s four arms and,
     // for a `@{push}`, the whole of `branch_get_push_1` — and it applies the same
     // left-to-right `@` scan and the same `memchr(name, ':', at)` guard.
-    if let Some(message) = crate::objname::upstream_mark_fatal(repo, name) {
+    if let Some(message) = crate::objname::upstream_mark_fatal_allowed(repo, name, false) {
         return Err(message);
     }
 

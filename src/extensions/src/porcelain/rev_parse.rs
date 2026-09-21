@@ -674,10 +674,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 } else if carries_walk_mark(name) {
                     None
                 } else {
-                    repo
-                        .rev_parse_single(crate::objname::canonical_spec(&repo, name).as_ref())
-                        .ok()
-                        .map(|id| id.detach())
+                    // `repo_get_oid()`'s own tail, not a second spelling of it:
+                    // a bare `rev_parse_single()` here missed
+                    // `get_oid_with_context_1()`'s `:/<text>` arm, so
+                    // `git rev-parse :/<pattern>` answered with gitoxide's pick
+                    // instead of the most recent commit by date.
+                    crate::objname::resolve_quiet(&repo, name)
                 }
             })
             // `show_rev(type, &oid, name)` (`builtin/rev-parse.c:1177`): the mark
@@ -1812,6 +1814,34 @@ Run "git rev-parse --parseopt -h" for more information on the first usage.
 "#;
 
 fn is_worktree_path(repo: &gix::Repository, arg: &str) -> bool {
+    // `check_filename()` (`setup.c:173-198`) strips the short pathspec magic that
+    // still leaves a path behind, and answers three of those spellings without a
+    // stat at all:
+    //
+    // ```c
+    // if (skip_prefix(arg, ":/", &arg)) {
+    //         if (!*arg) /* ":/" is root dir, always exists */
+    //                 return 1;
+    //         prefix = NULL;
+    // } else if (skip_prefix(arg, ":!", &arg) ||
+    //            skip_prefix(arg, ":^", &arg)) {
+    //         if (!*arg) /* excluding everything is silly, but allowed */
+    //                 return 1;
+    // }
+    // ```
+    //
+    // Without it `git rev-parse :/`, `:!` and `:^` echoed the operand and then
+    // died about it, where stock 2.55.0 echoes it and exits 0. `:/<path>` is
+    // root-relative (`prefix = NULL`), which the join below already is.
+    let arg = match arg.strip_prefix(":/") {
+        Some("") => return true,
+        Some(rest) => rest,
+        None => match arg.strip_prefix(":!").or_else(|| arg.strip_prefix(":^")) {
+            Some("") => return true,
+            Some(rest) => rest,
+            None => arg,
+        },
+    };
     if arg.is_empty() {
         return false;
     }
@@ -2207,23 +2237,31 @@ fn endpoint_names(spec: &str) -> (&str, &str) {
 /// `--symbolic-full-name`.
 fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
     let name = name.to_str().ok()?;
-    // `@{-N}`: `interpret_nth_prior_checkout()` rewrites the spec to the branch
-    // that many checkouts ago, and everything after it applies to that name.
-    if let Some((nth, used)) = super::check_ref_format::parse_nth_prior(name.as_bytes()) {
-        let mut branch = super::check_ref_format::nth_branch_switch(repo, nth)?;
-        branch.extend_from_slice(&name.as_bytes()[used..]);
-        return dwim_full_name(repo, BStr::new(&branch));
+    // `repo_interpret_branch_name()`'s two prefix rewrites, through
+    // `reinterpret()`: `@{-<n>}` becomes the branch that many checkouts ago, and
+    // a bare leading `@` becomes `HEAD`, with everything after either of them
+    // applying to the rewritten name. Only the `@{-<n>}` half was here, so
+    // `git rev-parse --abbrev-ref @@{u}` and `--symbolic-full-name @@{u}` printed
+    // nothing at all where stock 2.55.0 names the upstream.
+    if let Some(rewritten) = crate::objname::prefix_rewrite(repo, name) {
+        return dwim_full_name(repo, BStr::new(rewritten.as_bytes()));
     }
     // `@{u}`/`@{upstream}`/`@{push}`: git's `interpret_branch_name()` resolves
     // these through the branch's configured remote and records the ref it landed
     // on, which is what `--symbolic-full-name` reports. Without this the whole
     // spec looks like "not a ref" and prints nothing at all.
     if let Some((base, direction)) = split_tracking_suffix(name) {
-        let branch = if base.is_empty() {
+        // `branch = at ? branch_get(name_str) : branch_get(NULL)`, and
+        // `branch_get()` maps both `NULL` and `"HEAD"` to the checked-out branch
+        // (`remote.c`), so `HEAD@{u}` asks about the same branch `@{u}` does.
+        // Looking `HEAD` up as an ordinary ref instead left
+        // `git rev-parse --symbolic-full-name HEAD@{u}` — and, through the
+        // `@` rewrite above, `@@{u}` — printing nothing where stock names the
+        // upstream.
+        let branch = if base.is_empty() || base == "HEAD" {
             repo.head_name().ok()??
         } else {
-            let full = repo.find_reference(base).ok()?.name().to_owned();
-            full
+            repo.find_reference(base).ok()?.name().to_owned()
         };
         // `branch_get_upstream()` reads `branch.<name>.merge` directly when
         // `branch.<name>.remote` is `.`: the upstream is a *local* ref and there

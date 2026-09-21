@@ -91,9 +91,14 @@
 //!   (cache-tree.c:872-891) cannot be reached through `read-tree`.
 //! * The `-u` untracked-collision check rejects any existing file at a path the read
 //!   adds; git additionally permits it when the file is `.gitignore`d.
-//! * `--sparse-checkout` is accepted but never applies a sparse filter — that
-//!   needs substrate this port does not have, so it behaves as its `--no-`
-//!   counterpart. `--recurse-submodules` (and `submodule.recurse`) *does*
+//! * `--[no-]sparse-checkout` gates the real filter: a `-u` read under
+//!   `core.sparseCheckout` runs `unpack_trees()`'s two `mark_new_skip_worktree()`
+//!   loops (unpack-trees.c:1974-1976, :2035-2043) over the finished index and
+//!   then `apply_sparse_checkout()`'s worktree effects — `CE_WT_REMOVE` for a
+//!   path that left the checkout area, `CE_UPDATE` for one that entered it. What
+//!   is not reproduced is `verify_uptodate_sparse()`/`verify_absent_sparse()`,
+//!   whose failures git downgrades to warnings inside that loop
+//!   (unpack-trees.c:2064-2072). `--recurse-submodules` (and `submodule.recurse`) *does*
 //!   descend: every gitlink a `-u` read wrote is moved to the commit the
 //!   superproject now records, through the same submodule mover
 //!   `git restore --recurse-submodules` uses.
@@ -143,6 +148,20 @@ pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "quiet", neg: true, arg: Arg::None },
 ];
 
+/// The `ce_flags` bits `copy_cache_entry()` carries when a merge re-uses the old
+/// entry outright (unpack-trees.c:2606) — every bit but the stage, of the ones
+/// this port models.
+const STICKY: Flags = Flags::ASSUME_VALID
+    .union(Flags::EXTENDED)
+    .union(Flags::INTENT_TO_ADD)
+    .union(Flags::SKIP_WORKTREE);
+
+/// The narrower set `merged_entry()` migrates when the content moved:
+/// `old->ce_flags & (CE_SKIP_WORKTREE | CE_NEW_SKIP_WORKTREE)` (unpack-trees.c:2614).
+/// `CE_EXTENDED` rides along because `Entry::write_to` only serialises the
+/// extended flag word when it is set.
+const MIGRATED: Flags = Flags::EXTENDED.union(Flags::SKIP_WORKTREE);
+
 /// Parsed command line for a single `read-tree` invocation.
 #[derive(Default)]
 pub(super) struct Opts {
@@ -159,6 +178,11 @@ pub(super) struct Opts {
     aggressive: bool,          // --aggressive
     trivial: bool,             // --trivial
     index_output: Option<PathBuf>, // --index-output=<file>
+    /// `--no-sparse-checkout`: `o->skip_sparse_checkout`
+    /// (builtin/read-tree.c, `OPT_BOOL(0, "no-sparse-checkout", ...)`), which
+    /// `unpack_trees()` tests before it ever reads `info/sparse-checkout`
+    /// (unpack-trees.c:1928-1934).
+    skip_sparse_checkout: bool,
     /// `--[no-]recurse-submodules`; `None` falls back to `submodule.recurse`.
     recurse_submodules: Option<bool>,
     trees: Vec<String>,
@@ -514,8 +538,16 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
                 no_value!();
                 o.aggressive = false;
             }
-            // Sparse checkout is never applied by this port, so both directions no-op.
-            "sparse-checkout" | "no-sparse-checkout" => no_value!(),
+            // One `OPT_BOOL` whose name already carries the `no-`, so
+            // `--sparse-checkout` is that same entry unset.
+            "no-sparse-checkout" => {
+                no_value!();
+                o.skip_sparse_checkout = true;
+            }
+            "sparse-checkout" => {
+                no_value!();
+                o.skip_sparse_checkout = false;
+            }
             // `unpack-trees` tracing has no analogue here.
             "debug-unpack" | "no-debug-unpack" => no_value!(),
             "no-recurse-submodules" => {
@@ -779,10 +811,6 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // `git status` reporting them as deleted. `CE_EXTENDED` rides along because
     // `Entry::write_to` only serialises the extended flag word (which holds skip-worktree and
     // intent-to-add) when it is set.
-    const STICKY: gix::index::entry::Flags = gix::index::entry::Flags::ASSUME_VALID
-        .union(gix::index::entry::Flags::EXTENDED)
-        .union(gix::index::entry::Flags::INTENT_TO_ADD)
-        .union(gix::index::entry::Flags::SKIP_WORKTREE);
     let old_map = stage0_map(&old);
     if o.merge || o.reset {
         let backing = new_index.path_backing().to_owned();
@@ -860,6 +888,34 @@ fn finish(o: Opts) -> Result<ExitCode> {
         }
     }
 
+    // ---- Sparse checkout (unpack-trees.c:2035-2073). ----
+    //
+    // Sparse loop #1 (:1974-1976) marks `CE_NEW_SKIP_WORKTREE` on the *source*
+    // index, and `oneway_merge()`/`twoway_merge()` carry that bit forward by
+    // re-adding the very same `cache_entry`; loop #2 (:2041-2043) then covers the
+    // entries `merged_entry()` freshly created. Between them every entry of the
+    // result is classified, and since both loops consult one pattern list over
+    // one path set, running the walk once over the finished index reaches the
+    // same assignment.
+    // `sparsified` is what `CE_WT_REMOVE` schedules; `outside` is every entry the
+    // patterns leave out, which `CE_UPDATE` must never reach.
+    let mut sparsified: BTreeSet<BString> = BTreeSet::new();
+    let mut desparsified: BTreeSet<BString> = BTreeSet::new();
+    let mut outside: HashSet<BString> = HashSet::new();
+    if let Some(pl) = sparse_patterns(&repo, &o)? {
+        let was = skip_worktree_paths(&new_index);
+        pl.mark_new_skip_worktree(&mut new_index, &|_| true, o.verbose_update)
+            .map_err(|e| crate::fatal::die(e.to_string()))?;
+        outside = skip_worktree_paths(&new_index);
+
+        // `apply_sparse_checkout()` (unpack-trees.c:523-585) turned into the two
+        // worktree effects it schedules: `CE_WT_REMOVE` for a path that left the
+        // checkout area (:576) and `CE_UPDATE` for one that entered it (:582).
+        // A path that was outside and stays outside keeps `CE_UPDATE` off (:553).
+        sparsified.extend(outside.difference(&was).cloned());
+        desparsified.extend(was.difference(&outside).cloned());
+    }
+
     if o.dry_run {
         return Ok(ExitCode::SUCCESS);
     }
@@ -868,6 +924,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
     if o.update {
         // `--reset` also restores tracked files that drifted from the index.
         let mut wanted = changed.clone();
+        wanted.extend(desparsified.iter().cloned());
         if o.reset {
             // `oneway_merge`: for an entry the tree leaves alone, `--reset -u`
             // still writes the file when `lstat()` fails *or* `ie_match_stat()`
@@ -880,6 +937,11 @@ fn finish(o: Opts) -> Result<ExitCode> {
                     .cloned(),
             );
         }
+        // Nothing outside the checkout area is ever written (unpack-trees.c:553).
+        wanted.retain(|p| !outside.contains(p));
+        // `unlink_entry()` also runs for every `CE_WT_REMOVE` the sparse loop set.
+        let mut removed = removed.clone();
+        removed.extend(sparsified.iter().cloned());
         // `check_updates()` (unpack-trees.c:429-506): `get_progress()` over every
         // entry written or removed, then one tick per removal and per write.
         let updating = crate::worktree::UpdatingFiles::start(wanted.len() + removed.len(), o.verbose_update)
@@ -931,6 +993,51 @@ fn finish(o: Opts) -> Result<ExitCode> {
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The pattern list `unpack_trees()` would consult, or `None` when it would not
+/// consult one at all.
+///
+/// ```c
+/// if (!cfg->apply_sparse_checkout || !o->update)
+///         o->skip_sparse_checkout = 1;
+/// if (!o->skip_sparse_checkout) {
+///         memset(&pl, 0, sizeof(pl));
+///         free_pattern_list = 1;
+///         populate_from_existing_patterns(o, &pl);
+/// }
+/// ```
+///
+/// (unpack-trees.c:1928-1934.) `cfg->apply_sparse_checkout` is `core.sparseCheckout`
+/// (environment.c:549-551), and `!o->update` is why a read without `-u` never
+/// touches the skip-worktree bits however sparse the worktree is.
+fn sparse_patterns(
+    repo: &gix::Repository,
+    o: &Opts,
+) -> Result<Option<super::sparse_checkout::UnpackPatterns>> {
+    if o.skip_sparse_checkout || !o.update {
+        return Ok(None);
+    }
+    let cfg = repo.config_snapshot();
+    if cfg.boolean("core.sparseCheckout") != Some(true) {
+        return Ok(None);
+    }
+    // `populate_from_existing_patterns()` reads the file in the dialect the
+    // process was configured with, not whatever the file's writer used (dir.c:3513).
+    let cone = cfg.boolean("core.sparseCheckoutCone").unwrap_or(false);
+    drop(cfg);
+    Ok(Some(super::sparse_checkout::UnpackPatterns::load(repo, cone)?))
+}
+
+/// Every path in `index` currently carrying `CE_SKIP_WORKTREE`.
+fn skip_worktree_paths(index: &gix::index::File) -> HashSet<BString> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.flags.contains(Flags::SKIP_WORKTREE))
+        .map(|e| e.path_in(backing).to_owned())
+        .collect()
 }
 
 /// The index built by reading `tree_ids` in order: the union of their entries, with
@@ -1126,6 +1233,7 @@ fn multi_tree_read(
     // matters under `--reset`.
     let mut index_slots: HashMap<BString, Ce> = HashMap::new();
     let mut old_stats: HashMap<BString, Stat> = HashMap::new();
+    let mut old_flags: HashMap<BString, Flags> = HashMap::new();
     {
         let backing = old.path_backing();
         for e in old.entries() {
@@ -1137,7 +1245,8 @@ fn multi_tree_read(
                 Some(existing) if existing.conflicted => {}
                 _ => {
                     index_slots.insert(path.clone(), slot);
-                    old_stats.insert(path, e.stat);
+                    old_stats.insert(path.clone(), e.stat);
+                    old_flags.insert(path, e.flags);
                 }
             }
         }
@@ -1263,13 +1372,47 @@ fn multi_tree_read(
             Some(stat) if !*update => *stat,
             _ => Stat::default(),
         };
-        let flags = gix::index::entry::Flags::from(stage_enum(u32::from(*stage)));
+        // ```c
+        // if (same(old, merge)) {
+        //         copy_cache_entry(merge, old);
+        //         update = 0;
+        // } else {
+        //         …
+        //         /* Migrate old flags over */
+        //         update |= old->ce_flags & (CE_SKIP_WORKTREE | CE_NEW_SKIP_WORKTREE);
+        // ```
+        //
+        // (`merged_entry()`, unpack-trees.c:2605-2614.) An entry the merge leaves
+        // alone is the old `cache_entry` verbatim, so every `ce_flags` bit but the
+        // stage survives; one whose content moved keeps only the skip-worktree
+        // bit. `twoway_merge`'s "4 and 5" arm re-adds the old entry outright and
+        // lands in the first case. Dropping these turned a sparse index inside
+        // out on any two- or three-tree read.
+        let mut flags = gix::index::entry::Flags::from(stage_enum(u32::from(*stage)));
+        if let Some(had) = old_flags.get(path) {
+            flags |= *had & if *update { MIGRATED } else { STICKY };
+        }
         new_index.dangerously_push_entry(stat, ce.id, flags, ce.mode, path.as_bstr());
         if *update && *stage == 0 {
             wanted.insert(path.clone());
         }
     }
     new_index.sort_entries();
+
+    // Sparse checkout loops #1 and #2 (unpack-trees.c:1974-1976, :2035-2073), as
+    // in the single-tree read: the pattern list decides which of the result's
+    // entries are outside the checkout area, and `apply_sparse_checkout()` turns
+    // each crossing into a worktree write or a worktree removal.
+    let mut removed = removed;
+    if let Some(pl) = sparse_patterns(repo, o)? {
+        let was = skip_worktree_paths(&new_index);
+        pl.mark_new_skip_worktree(&mut new_index, &|_| true, o.verbose_update)
+            .map_err(|e| crate::fatal::die(e.to_string()))?;
+        let outside = skip_worktree_paths(&new_index);
+        removed.extend(outside.difference(&was).cloned());
+        wanted.extend(was.difference(&outside).cloned());
+        wanted.retain(|p| !outside.contains(p));
+    }
 
     if o.update {
         // `check_updates()`'s meter, as in the one- and two-tree read above.

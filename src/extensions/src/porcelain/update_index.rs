@@ -282,6 +282,16 @@ struct Ctx {
     /// (builtin/update-index.c:1206), which `do_write_index()` then writes
     /// literally — the one command that names a version outright.
     index_version: Option<gix::index::Version>,
+    /// `the_repository->index->version` as it stood *before* any
+    /// `--index-version`, which is what `--show-index-version` prints and what
+    /// the `index-version: was %d, set to %d` report names.
+    ///
+    /// `do_read_index()` only assigns `istate->version` from the on-disk header
+    /// (read-cache.c:2245), so an index that was never read — a repository with
+    /// no `$GIT_DIR/index` yet — keeps the zero it was calloc'd with and git
+    /// really does print `0`. The vendored crate has no way to spell "no
+    /// version", so the zero is carried here instead of in the index state.
+    index_disk_version: u8,
 
     allow_add: bool,
     allow_remove: bool,
@@ -345,6 +355,7 @@ impl Ctx {
         drop(cfg);
         Ok(Ctx {
             index_version: None,
+            index_disk_version: version_number(index.version()),
             repo,
             index,
             workdir,
@@ -486,13 +497,17 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
     // other index-mutating subcommand in this port does.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let index = if repo.index_path().exists() {
-        repo.open_index()?
+    let (index, index_disk_version) = if repo.index_path().exists() {
+        let f = repo.open_index()?;
+        let v = version_number(f.version());
+        (f, v)
     } else {
-        gix::index::File::from_state(
+        // Never read, so `istate->version` is still zero (read-cache.c:2245).
+        let f = gix::index::File::from_state(
             gix::index::State::new(repo.object_hash()),
             repo.index_path(),
-        )
+        );
+        (f, 0)
     };
     let stat_opts = repo.stat_options()?;
     let trust_executable_bit = repo
@@ -506,6 +521,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
 
     let mut ctx = Ctx {
         index_version: None,
+        index_disk_version,
         repo,
         index,
         workdir,
@@ -961,7 +977,7 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
     // untracked-cache probe, which returns before the index is ever written.
     if preferred_index_format != 0 {
         if preferred_index_format < 0 {
-            println!("{}", version_number(ctx.index.version()));
+            println!("{}", ctx.index_disk_version);
         } else if !(2..=4).contains(&preferred_index_format) {
             eprintln!("fatal: index-version {preferred_index_format} not in range: 2..4");
             return Ok(Outcome::Die);
@@ -982,9 +998,18 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             // last way an index comes out whole, which is why `update-index --split-index
             // --index-version 4` writes no shared index while `--split-index` alone does.
             let requested = crate::config::index_version(preferred_index_format.into());
-            if ctx.index.version() != requested {
+            // The guard and the report both read the *old* version, and both
+            // see the zero of an index that was never on disk.
+            if i32::from(ctx.index_disk_version) != preferred_index_format {
                 ctx.something_changed = true;
             }
+            report(
+                ctx,
+                format_args!(
+                    "index-version: was {}, set to {preferred_index_format}",
+                    ctx.index_disk_version
+                ),
+            );
             ctx.index_version = Some(requested);
             ctx.dirty = true;
         }
@@ -1124,12 +1149,16 @@ fn option_with_value(
         eprintln!("error: option 'cacheinfo' expects <mode>,<sha1>,<path>");
         return Ok(Err(ParseFail::Usage));
     }
+    // The `||` chain in git's callback advances `ctx->argv` one element at a
+    // time, so the name in the die message is whichever operand was being
+    // consumed when the chain short-circuited — the mode, the object, or the
+    // path — not always the path (update-index.c:834-837).
     let mode = match u32::from_str_radix(args[i + 1].trim(), 8) {
         Ok(m) => m,
         Err(_) => {
             eprintln!(
                 "fatal: git update-index: --cacheinfo cannot add {}",
-                args[i + 3]
+                args[i + 1]
             );
             return Ok(Err(ParseFail::Die));
         }
@@ -1139,7 +1168,7 @@ fn option_with_value(
         Err(_) => {
             eprintln!(
                 "fatal: git update-index: --cacheinfo cannot add {}",
-                args[i + 3]
+                args[i + 2]
             );
             return Ok(Err(ParseFail::Die));
         }
@@ -1156,9 +1185,10 @@ fn parse_new_style_cacheinfo(spec: &str) -> Option<(u32, ObjectId, String)> {
     let (oid_s, path) = rest.split_once(',')?;
     let mode = u32::from_str_radix(mode_s.trim(), 8).ok()?;
     let oid = ObjectId::from_hex(oid_s.as_bytes()).ok()?;
-    if path.is_empty() {
-        return None;
-    }
+    // `*path = p + 1` unconditionally — an empty path is still a well-formed
+    // new-style spec, and it is `add_cacheinfo`'s `verify_path` that rejects it
+    // (update-index.c:810). Treating it as "not new style" would fall through
+    // to the three-argument form and produce a usage error instead.
     Some((mode, oid, path.to_string()))
 }
 
@@ -1651,6 +1681,54 @@ fn process_directory(
         return Ok(remove_one_path(ctx, path));
     }
 
+    // ```c
+    // /* Inexact match: is there perhaps a subdirectory match? */
+    // pos = -pos-1;
+    // while (pos < the_repository->index->cache_nr) {
+    //         const struct cache_entry *ce = the_repository->index->cache[pos++];
+    //
+    //         if (strncmp(ce->name, path, len))
+    //                 break;
+    //         if (ce->name[len] > '/')
+    //                 break;
+    //         if (ce->name[len] < '/')
+    //                 continue;
+    //
+    //         /* Subdirectory match - error out */
+    //         return error("%s: is a directory - add individual files instead", path);
+    // }
+    // ```
+    //
+    // (update-index.c:357-371.) The walk starts at `path`'s insertion point and
+    // runs forward over every entry that still has `path` as a byte prefix; the
+    // first one whose next byte is exactly `/` is a file the index already holds
+    // *inside* this directory. That outranks the gitlink check below, so a
+    // directory with tracked contents is refused even when it is also a
+    // repository.
+    let len = path.len();
+    let backing = ctx.index.path_backing().to_owned();
+    let entries = ctx.index.entries();
+    let start = entries.partition_point(|e| e.path_in(&backing) < path.as_bstr());
+    for e in &entries[start..] {
+        let name = e.path_in(&backing);
+        // `strncmp(ce->name, path, len)`: a name shorter than `path` stops at its
+        // own terminator, so it can never compare equal over `len` bytes.
+        if name.len() < len || name[..len] != path[..] {
+            break;
+        }
+        match name.get(len) {
+            Some(b) if *b > b'/' => break,
+            // `ce->name[len]` is the terminator when the names are the same
+            // length, and `'\0' < '/'`.
+            Some(b) if *b < b'/' => continue,
+            None => continue,
+            Some(_) => {
+                eprintln!("error: {path}: is a directory - add individual files instead");
+                return Ok(Err(Die));
+            }
+        }
+    }
+
     if let Some(head) = gitlink_head(&abs) {
         let stat = Stat::from_fs(meta)?;
         if !add_index_entry(ctx, path.as_bstr(), head, Mode::COMMIT, stat)? {
@@ -1660,7 +1738,9 @@ fn process_directory(
         return Ok(Ok(()));
     }
 
-    eprintln!("error: {path}: is a directory - add individual files instead");
+    // The other wording, for a directory the index knows nothing about and that
+    // is not a repository either (update-index.c:378).
+    eprintln!("error: {path}: is a directory - add files inside instead");
     Ok(Err(Die))
 }
 
@@ -1682,19 +1762,53 @@ fn add_one_path(
     let new_stat = Stat::from_fs(meta)?;
 
     if let Some(idx) = existing {
-        let (flags, old_stat, old_mode) = {
+        let (flags, old_stat, old_mode, old_id) = {
             let e = &ctx.index.entries()[idx];
-            (e.flags, e.stat, e.mode)
+            (e.flags, e.stat, e.mode, e.id)
         };
         // `ie_match_stat` reports "unchanged" for an assume-unchanged entry
         // whatever the worktree says, so the entry (and its bit) survive intact.
         if flags.contains(Flags::ASSUME_VALID) {
             return Ok(Ok(()));
         }
-        if old_stat.matches(&new_stat, ctx.stat_opts)
+        // ```c
+        // if (ce_intent_to_add(ce))
+        //         return DATA_CHANGED | TYPE_CHANGED | MODE_CHANGED;
+        // ```
+        //
+        // (read-cache.c:415-416.) An intent-to-add entry has no content behind
+        // it, so no stat match can make it up to date.
+        if !flags.contains(Flags::INTENT_TO_ADD)
+            && old_stat.matches(&new_stat, ctx.stat_opts)
             && old_mode == ce_mode_from_stat(ctx.mode_rules(), Some(old_mode), meta)
         {
-            return Ok(Ok(())); // already up to date
+            // ```c
+            // if (!changed && is_racy_timestamp(istate, ce)) {
+            //         if (assume_racy_is_modified)
+            //                 changed |= DATA_CHANGED;
+            //         else
+            //                 changed |= ce_modified_check_fs(istate, ce, st);
+            // }
+            // ```
+            //
+            // (`ie_match_stat()`, read-cache.c:436-441.) A stat match on an entry
+            // whose recorded mtime is not older than the index's own is not
+            // believed: `ce_modified_check_fs()` reads the file back. Without this
+            // a rewrite inside the same second as the last index write — which is
+            // exactly what `update-index --again` does in a script — was taken for
+            // an unchanged file and silently dropped.
+            let racy = is_racy_entry(&ctx.index, &old_stat);
+            if !racy {
+                return Ok(Ok(())); // already up to date
+            }
+            die_on_bad_attr_source(ctx, meta)?;
+            let abs = match ctx.repo.workdir_path(path.as_bstr()) {
+                Some(a) => a,
+                None => return Err(crate::fatal::need_work_tree()),
+            };
+            if worktree_blob_id(ctx, path.as_bstr(), &abs, old_mode, meta)? == Some(old_id) {
+                return Ok(Ok(()));
+            }
         }
     }
 

@@ -3652,6 +3652,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--children`: `set_children()` builds this, and where it is built is the
     // whole of its behaviour — see the two sites that fill it below.
     let mut children_map: Option<HashMap<ObjectId, Vec<ObjectId>>> = None;
+    // ```c
+    // static inline int want_ancestry(const struct rev_info *revs)
+    // {
+    //         return (revs->rewrite_parents || revs->children.name);
+    // }
+    // ```
+    //
+    // (revision.c:3914-3917.) `--parents` (revision.c:2459-2461), `--graph`
+    // (revision.c:2749-2752), `--simplify-merges` and `--simplify-by-decoration`
+    // (revision.c:2439-2452) set `rewrite_parents`; `--children` sets
+    // `children.name`. `get_commit_action()` reads it to decide whether a TREESAME
+    // merge is still worth printing.
+    let want_ancestry = graph || show_parents || show_children || simplify_merges_opt;
     if !pathspecs.is_empty() && !follow {
         // `rev_compare_tree()` answers `REV_TREE_DIFFERENT` for a decorated commit
         // before it looks at any tree, so under `--simplify-by-decoration` a tagged
@@ -3804,6 +3817,45 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // (commit->object.flags & PULL_MERGE)) return commit_show;`, which
                 // overrides the TREESAME drop.
                 let pull_merge = show_pulls && treesame_with.first() == Some(&false);
+                // `get_commit_action()` on a TREESAME commit (revision.c:4221-4245):
+                //
+                // ```c
+                // if (commit->object.flags & TREESAME) {
+                //         /* drop merges unless we want parenthood */
+                //         if (!want_ancestry(revs))
+                //                 return commit_ignore;
+                //         if (revs->show_pulls && (commit->object.flags & PULL_MERGE))
+                //                 return commit_show;
+                //         /*
+                //          * If we want ancestry, then need to keep any merges
+                //          * between relevant commits to tie together topology.
+                //          */
+                //         for (n = 0, p = commit->parents; p; p = p->next)
+                //                 if (relevant_commit(p->item))
+                //                         if (++n >= 2)
+                //                                 return commit_show;
+                //         return commit_ignore;
+                // }
+                // ```
+                //
+                // Under `--full-history` the TREESAME arm of
+                // `try_to_simplify_commit()` never prunes the parent list, so a
+                // merge reaches here with every parent it had — and a merge whose
+                // two sides are both relevant is printed even though it changed
+                // nothing over the pathspec. That is what keeps `H` and `E` in
+                // `log --full-history --parents -- file`; without it the merges
+                // that tie the two sides together vanished and the history read as
+                // two disconnected strands. The count is over `commit->parents`,
+                // which `--first-parent` narrows the *comparison* over but leaves
+                // intact.
+                let relevant_ancestors = node
+                    .parents
+                    .iter()
+                    .filter(|p| !uninteresting.contains(*p) || bottoms_set.contains(*p))
+                    .count();
+                let shown = any_change
+                    || !dense
+                    || (want_ancestry && (pull_merge || relevant_ancestors >= 2));
                 if simplify_merges_opt {
                     // The parent list `simplify_one()` rewrites is the *whole*
                     // one: `--first-parent` stops the comparison at parent 1 but
@@ -3818,7 +3870,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         },
                     );
                 }
-                simplified.insert(node.id, (parents.to_vec(), any_change || pull_merge || !dense));
+                simplified.insert(node.id, (parents.to_vec(), shown));
                 continue;
             }
             // `nth_parent` of the parent this commit turned out to be TREESAME to,

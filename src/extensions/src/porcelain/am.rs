@@ -515,6 +515,25 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
+    // ```c
+    // show_usage_with_options_if_asked(argc, argv, usage, options);
+    //
+    // repo_config(the_repository, git_default_config, NULL);
+    // ```
+    // (builtin/am.c:2448-2450). A lone `-h`/`--help-all` is answered before the
+    // config is read at all, so a malformed `am.threeWay` never gets looked at;
+    // and git.c:474-476 demotes the `RUN_SETUP` of that same lone form to a
+    // gentle setup ("demote to GENTLY to allow 'git cmd -h' outside repo"), so
+    // it is answered with no repository either. Both mean the usage block has to
+    // precede `discover()` here, not follow it.
+    if args.len() == 1 {
+        match args[0].as_str() {
+            "-h" => return Ok(super::show_usage(USAGE)),
+            "--help-all" => return Ok(super::show_usage(USAGE_ALL)),
+            _ => {}
+        }
+    }
+
     // `git_config(git_am_config, ...)` runs before `parse_options`, so a
     // malformed `am.*` boolean is a config-time fatal (exit 128) that precedes
     // any CLI usage error (exit 129), and the config values become the option
@@ -1339,6 +1358,50 @@ fn split_mbox_body(body: &[u8], keep_cr: bool, mboxrd: bool) -> Vec<Vec<u8>> {
     msgs
 }
 
+/// `split_one(f, name, 1)` as `split_maildir()` calls it — one message out of one
+/// Maildir file, with `allow_bare` set.
+///
+/// ```c
+/// int is_bare = !is_from_line(buf.buf, buf.len);
+/// ...
+/// do {
+///         if (!keep_cr && buf.len > 1 && buf.buf[buf.len-2] == '\r') { ... }
+///         if (mboxrd && is_gtfrom(&buf)) strbuf_remove(&buf, 0, 1);
+///         if (fwrite(buf.buf, 1, buf.len, output) != buf.len) ...
+/// } while (!strbuf_getwholeline(&buf, mbox, '\n') &&
+///          !(!is_bare && is_from_line(buf.buf, buf.len)));
+/// ```
+///
+/// One thing separates this from [`split_mbox_body`]: the `From ` scan is armed
+/// only when the *first* line already was a postmark, so a bare mail is copied
+/// whole however many `From ` lines its body happens to contain, where an mbox
+/// would be cut at each of them. The `\r\n` rewrite and the mboxrd un-escaping
+/// are the same loop body in both.
+fn split_maildir_body(body: &[u8], keep_cr: bool, mboxrd: bool) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut is_bare = true;
+    for (n, line) in body.split_inclusive(|b| *b == b'\n').enumerate() {
+        let bare = line.strip_suffix(b"\n").unwrap_or(line);
+        if n == 0 {
+            is_bare = !is_from_line(bare);
+        } else if !is_bare && is_from_line(bare) {
+            break;
+        }
+        let mut written: &[u8] = line;
+        let stripped;
+        if !keep_cr && line.len() > 1 && line.ends_with(b"\r\n") {
+            stripped = [&line[..line.len() - 2], b"\n"].concat();
+            written = &stripped;
+        }
+        if mboxrd && is_gtfrom(written) {
+            out.extend_from_slice(&written[1..]);
+        } else {
+            out.extend_from_slice(written);
+        }
+    }
+    out
+}
+
 /// `is_gtfrom()` (builtin/mailsplit.c:53-63): one or more `>` followed by
 /// `From `. Shorter than `">From "` cannot qualify.
 fn is_gtfrom(line: &[u8]) -> bool {
@@ -1387,8 +1450,9 @@ fn split_mail(
 
 /// `git mailsplit`: each path is an mbox file or a Maildir, and no path at all
 /// means stdin. Each file is cut at its `From ` postmarks by
-/// [`split_mbox_body`]; a Maildir contributes one message per file in `new/`
-/// then `cur/`, verbatim.
+/// [`split_mbox_body`]; a Maildir contributes one message per file, in the order
+/// [`mailsplit::populate_maildir_list`] builds and with the single-message
+/// treatment [`split_maildir_body`] gives each.
 fn split_mbox(paths: &[String], keep_cr: bool, mboxrd: bool) -> Result<Split> {
     let mut msgs: Vec<Vec<u8>> = Vec::new();
     if paths.is_empty() {
@@ -1402,17 +1466,59 @@ fn split_mbox(paths: &[String], keep_cr: bool, mboxrd: bool) -> Result<Split> {
         }
         let path = Path::new(p);
         if path.is_dir() {
-            // `populate_maildir_list` reads `new/` then `cur/`, ignoring dotfiles.
-            for sub in ["new", "cur"] {
-                if let Ok(entries) = std::fs::read_dir(path.join(sub)) {
-                    let mut files: Vec<_> = entries
-                        .filter_map(Result::ok)
-                        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-                        .map(|e| e.path())
-                        .collect();
-                    files.sort();
-                    for f in files {
-                        msgs.push(std::fs::read(&f).unwrap_or_default());
+            // `split_maildir()` (builtin/mailsplit.c:172-217) walks the one list
+            // `populate_maildir_list()` built — `cur/` then `new/` merged into a
+            // single `string_list` ordered by `maildir_filename_cmp()`, so
+            // `cur/9` precedes `cur/10` and every `cur/` entry precedes a `new/`
+            // entry that sorts after it — and hands each file to
+            // `split_one(f, name, 1)`.
+            //
+            // ```c
+            // if (ret < 0) {
+            //         error("cannot split patches from %s", arg);
+            //         return 1;
+            // }
+            // ```
+            // (builtin/mailsplit.c:366-369) — every `split_maildir()` failure
+            // adds this second line after its own diagnostic. Only the `stat()`
+            // failure at :356 returns without it, which is the mbox arm below.
+            let failed = |msg: String| {
+                Ok(Split::Failed(vec![
+                    msg,
+                    format!("cannot split patches from {p}"),
+                ]))
+            };
+            let list = match super::mailsplit::populate_maildir_list(p) {
+                Ok(list) => list,
+                Err(msg) => return failed(msg),
+            };
+            for entry in &list {
+                let file = entry.path(path);
+                // ```c
+                // if (strbuf_getwholeline(&buf, f, '\n')) {
+                //         error_errno("cannot read mail %s", file);
+                //         goto out;
+                // }
+                // ```
+                // — an unreadable or empty mail stops the whole split.
+                match std::fs::read(&file) {
+                    Ok(body) if !body.is_empty() => {
+                        msgs.push(split_maildir_body(&body, keep_cr, mboxrd));
+                    }
+                    Ok(_) => {
+                        let e = std::io::Error::from_raw_os_error(0);
+                        return failed(format!(
+                            "cannot read mail {}: {}",
+                            entry.shown(p),
+                            errno_msg(&e)
+                        ));
+                    }
+                    Err(e) => {
+                        return failed(format!(
+                            "cannot open mail {}: {}",
+                            entry.shown(p),
+                            errno_msg(&e)
+                        ))
                     }
                 }
             }

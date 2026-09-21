@@ -479,16 +479,33 @@ fn scan_number(s: &[u8], at: usize) -> (i64, usize) {
 
 /// One Maildir message: the `<sub>/<name>` sort key that `string_list_insert`
 /// orders on, plus the pieces needed to re-open it without a lossy conversion.
-struct MaildirEntry {
+pub(crate) struct MaildirEntry {
     key: Vec<u8>,
     sub: &'static str,
     name: OsString,
 }
 
+impl MaildirEntry {
+    /// `xstrfmt("%s/%s", maildir, list.items[i].string)` — the message's path
+    /// under the Maildir it was listed from.
+    pub(crate) fn path(&self, maildir: &Path) -> std::path::PathBuf {
+        maildir.join(self.sub).join(&self.name)
+    }
+
+    /// The `<sub>/<name>` half of that path, as git prints it in a diagnostic.
+    pub(crate) fn shown(&self, maildir: &str) -> String {
+        format!("{maildir}/{}", String::from_utf8_lossy(&self.key))
+    }
+}
+
 /// `populate_maildir_list()` driving `string_list_insert()`: scan `cur` then
 /// `new`, skip dotfiles, keep the list ordered by [`maildir_filename_cmp`], and
 /// drop any entry that compares equal to one already present.
-fn populate_maildir_list(path: &str) -> Option<Vec<MaildirEntry>> {
+///
+/// `Err` carries the `error_errno()` text without its `error: ` prefix, so a
+/// caller that relays git's own stderr (`git am` spawns `git mailsplit`) can add
+/// the prefix once.
+pub(crate) fn populate_maildir_list(path: &str) -> std::result::Result<Vec<MaildirEntry>, String> {
     let mut list: Vec<MaildirEntry> = Vec::new();
 
     for sub in ["cur", "new"] {
@@ -496,19 +513,13 @@ fn populate_maildir_list(path: &str) -> Option<Vec<MaildirEntry>> {
         let dir = match std::fs::read_dir(&shown) {
             Ok(dir) => dir,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                eprintln!("error: cannot opendir {shown}: {}", errno_text(&e));
-                return None;
-            }
+            Err(e) => return Err(format!("cannot opendir {shown}: {}", errno_text(&e))),
         };
 
         for entry in dir {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(e) => {
-                    eprintln!("error: cannot opendir {shown}: {}", errno_text(&e));
-                    return None;
-                }
+                Err(e) => return Err(format!("cannot opendir {shown}: {}", errno_text(&e))),
             };
             let name = entry.file_name();
             if name.as_encoded_bytes().first() == Some(&b'.') {
@@ -525,7 +536,7 @@ fn populate_maildir_list(path: &str) -> Option<Vec<MaildirEntry>> {
             }
         }
     }
-    Some(list)
+    Ok(list)
 }
 
 /// `split_maildir()` — write one output message per file under `cur` and `new`.
@@ -534,14 +545,18 @@ fn populate_maildir_list(path: &str) -> Option<Vec<MaildirEntry>> {
 /// a Maildir message that happens to open with a `From ` line is truncated at its
 /// second one, exactly as in git.
 fn split_maildir(maildir: &str, dir: &str, nr_prec: i32, skip: i32, opts: &Opts) -> R<Option<i32>> {
-    let Some(list) = populate_maildir_list(maildir) else {
-        return Ok(None);
+    let list = match populate_maildir_list(maildir) {
+        Ok(list) => list,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(None);
+        }
     };
 
     let mut skip = skip;
     for entry in &list {
-        let path = Path::new(maildir).join(entry.sub).join(&entry.name);
-        let shown = format!("{maildir}/{}", String::from_utf8_lossy(&entry.key));
+        let path = entry.path(Path::new(maildir));
+        let shown = entry.shown(maildir);
 
         let file = match File::open(&path) {
             Ok(file) => file,

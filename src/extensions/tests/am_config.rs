@@ -12,9 +12,9 @@
 //! before any session is created).
 //!
 //! `am.keepcr` is deliberately *not* mapped: it only tunes `mailsplit`'s CR
-//! handling, which this port does not implement, so it writes no state file and
-//! must not perturb anything. The final test locks that in — setting it changes
-//! nothing relative to stock git.
+//! handling, which leaves no trace in the session directory, so it writes no
+//! state file and must not perturb anything. The final test locks that in —
+//! setting it changes nothing relative to stock git.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -208,9 +208,10 @@ fn am_messageid_invalid_config_is_fatal() {
 #[test]
 fn am_keepcr_config_is_not_honored() {
     let (repo, home) = fixture("keepcr");
-    // `am.keepcr` only governs mailsplit CR handling, which this port does not
-    // implement: it writes no state file and must leave everything identical to
-    // stock git, whose `threeway`/`messageid` stay at their `f` defaults.
+    // `am.keepcr` only governs mailsplit's CR handling, which leaves no trace in
+    // the session directory: it writes no state file of its own and must leave
+    // everything identical to stock git, whose `threeway`/`messageid` stay at
+    // their `f` defaults.
     git(&repo, &["config", "am.keepcr", "true"]);
     assert_match(&repo, &home, &[], "am.keepcr=true");
     let z = run_am(BIN, &repo, &home, &[]);

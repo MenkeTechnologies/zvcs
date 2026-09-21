@@ -28,8 +28,22 @@
 //! survives), `HEAD`, every entry of every reflog under `logs/`, and any
 //! `<head>...` given on the command line; then a full object closure over
 //! commits (tree + parents), tags (target) and trees (entries, gitlinks skipped).
-//! Missing links are ignored rather than fatal, as git sets
-//! `revs->ignore_missing_links`.
+//!
+//! **Divergence — a severed link is fatal to stock git and is not here.**
+//! `mark_reachable_objects()` sets `revs->ignore_missing_links` only for the
+//! *second* traversal, the `mark_recent` one (reachable.c:344-352); the first
+//! `traverse_commit_list()` (:341) runs with it clear. A reachable object the
+//! repository does not have therefore ends `git prune` with exit 128 and no
+//! object removed — `die("bad tree object %s")` from `process_tree()`
+//! (list-objects.c:187-188), `die("bad object %s")` from `handle_commit()`
+//! (revision.c:400-410), or `error("Could not read %s")` (commit.c:644) followed
+//! by `die("Failed to traverse parents of commit %s")` (revision.c:3933). This
+//! port drops the unresolvable link and prunes what is left, which removes
+//! objects stock git refuses to touch. Reproducing it needs revision.c's
+//! two-phase walk — commits through `prepare_revision_walk()` first, objects
+//! after — since that is what fixes which of the three messages comes out and in
+//! what order; until that exists, `git prune` here is more permissive than git
+//! on a damaged repository.
 //!
 //! `--expire <time>` is `expire` in `builtin/prune.c`, and it does two distinct
 //! things, both ported:

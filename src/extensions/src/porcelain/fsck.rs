@@ -71,7 +71,8 @@ const ERROR_REFS: u8 = 8;
 ///                                       `--verbose` as `cmd_fsck` does.
 ///   * `--verbose` / `-v` / `--no-verbose` — the `Checking ...` trace on stderr;
 ///                                       see divergence 9.
-///   * `--name-objects`               — accepted; see divergence 6.
+///   * `--name-objects`               — decorate each reported id with the path
+///                                       it was reached by; see divergence 6.
 ///   * `--references` / `--no-references` — accepted; see divergence 2.
 ///   * `--full` / `--no-full`         — on by default; `check_full` gates
 ///                                       `verify_pack()`, ported here as a gix pack
@@ -163,37 +164,57 @@ const ERROR_REFS: u8 = 8;
 /// 5. **Gitlink entries are not walked**, matching `gix-fsck` and git: a
 ///    submodule commit that happens to live in this odb is not marked reachable
 ///    by the tree or index entry that names it.
-/// 6. **`--name-objects` is only accepted where it cannot show.** git decorates
-///    an object id with the path it was reached by. Only `missing` lines can
-///    carry such a name — dangling and unreachable objects are by definition not
-///    reached from a head, so git prints their bare id. This port therefore
-///    accepts `--name-objects` and `bail!`s if a `missing` line would be printed
-///    while it is on.
+/// 6. **`--name-objects` is ported** — see [`ObjectNames`]. Names are put where
+///    git puts them: on each snapshotted reference in `process_refs()` order,
+///    on a reflog entry's new id as `<ref>@{<timestamp>}`, on an index entry as
+///    `<index>:<path>`, on a cache-tree node as `:`, and then outwards through
+///    `traverse_reachable()` — a commit's tree as `<name>:`, its first parent as
+///    `<name>^` or `<name>~<n+1>` when the name already carries a generation,
+///    further parents as `<name>^<i>`, a tag's target under the tag's own name,
+///    and a tree's entries as `<name><path>` with a `/` for a subtree. First
+///    write wins, so the order the head sites run in is what decides the name.
+///    Only `fsck_resolve_undo()`'s `:(<stage>):<path>` is missing, because the
+///    index's resolve-undo extension is not a head source here at all.
 /// 7. **`--cache` does not verify the index itself.** git also turns on
 ///    `verify_index_checksum` and `verify_ce_order`; `gix-index` does not expose
 ///    either. The head-node half of the flag — index entries and cache-tree ids
 ///    become heads — is what is implemented.
-/// 8. **No `broken link from`/`to` lines.** When the reachable walk reaches an
-///    id whose object is gone, git can print a two-line `broken link from <type>
-///    <oid>` / `to <type> <oid>` pair in addition to the `missing` line. This
-///    port prints only the `missing` line, so a repository with a severed link
-///    gets the right exit code (2) and a shorter report.
+/// 8. **`broken link from`/`to` is ported; its NULL-object form is not.**
+///    `mark_object()` has two ways of reporting a link it cannot follow
+///    (builtin/fsck.c:135-175). The one this port reproduces is the pair
+///    `broken link from <type> <oid>` / `              to <type> <oid>`, both
+///    type names right-justified in seven columns, printed once per missing
+///    object — the `REACHABLE` guard runs first — when `odb_has_object()` agrees
+///    the object is gone. The other is the `!obj` branch, which fires when
+///    `lookup_tree()`/`lookup_blob()` refuse an id that `obj_hash` already holds
+///    under a different type; that needs git's per-id type cache, which this
+///    port does not model (see divergence 10).
+/// 10. **`obj_hash` remembers a type per id, and this port does not.** git's
+///    `lookup_commit()`/`lookup_tree()`/`lookup_blob()` bind a type to an id the
+///    first time anything names it, and a later `lookup_*()` or
+///    `parse_object()` for a *different* type prints `error: object <oid> is a
+///    <bound>, not a <asked>` and yields NULL. Two shapes reach it: a tree entry
+///    whose mode disagrees with another entry's for the same id, and a tag whose
+///    `type` header disagrees with the object it points at. Both make stock git
+///    report the id `missing` or the link broken; this port reads the object's
+///    real type from the odb instead and reports nothing.
 /// 9. **The `--verbose` trace is approximate in ordering and in one block.**
 ///    `--verbose` changes nothing on stdout and nothing about the exit code —
 ///    every one of its lines is a `Checking ...` line on stderr — so the flag is
 ///    implemented rather than refused. Three caveats about that trace, none of
 ///    which reach stdout:
 ///      * the `Checking <type> <oid>` block comes from `fsck_source()`'s raw
-///        `readdir()` walk of `.git/objects/??`; this port emits it in the odb
-///        iterator's order instead, and emits the `Checking object directory`
-///        header once rather than once per odb source;
+///        `readdir()` walk of `.git/objects/??`; this port emits it in the
+///        reconstructed scan order together with the findings it interleaves
+///        with, falling back to the odb iterator's order when that
+///        reconstruction was not possible, and emits the `Checking object
+///        directory` header once rather than once per odb source;
 ///      * `Checking <oid>` under `Checking connectivity` is emitted in the
 ///        `obj_hash` slot order reconstructed below, with ties broken by id.
 ///        The report itself still refuses to guess when that order is
 ///        ambiguous, so only the trace can be off, and only within one
-///        collision cluster. Its ids are bare: git runs them through
-///        `describe_object()`, which appends a path under `--name-objects`
-///        (divergence 6);
+///        collision cluster. Its ids go through `describe_object()`, so
+///        `--name-objects` decorates them here too;
 ///      * git shells out to `git refs verify --verbose`, whose
 ///        `Checking references consistency` / `Checking <ref>` /
 ///        `Checking packed-refs file <path>` lines follow its own
@@ -322,6 +343,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `snapshot_refs()`: any argument at all replaces the default head set and
     // turns reflogs off, whether or not the argument resolved.
     let mut heads: Vec<ObjectId> = Vec::new();
+    // Heads `fsck_index()` created with `lookup_blob()`; see the reachability
+    // seeding below.
+    let mut index_blobs: HashSet<ObjectId> = HashSet::new();
+    // `--name-objects`' `fsck_walk_options.object_names`.
+    let mut names = ObjectNames { on: opt.name_objects, names: HashMap::new() };
     let mut default_refs = 0usize;
     // Objects `snapshot_ref()`'s `parse_object()` has already parsed. A second
     // parse of one of them is a no-op, which the object scan below has to know:
@@ -413,6 +439,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             &repo,
             &mut state,
             &mut heads,
+            &mut names,
             &mut pre_parsed,
             &promisor,
             &mut errors,
@@ -444,6 +471,34 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // Those reads are the snapshot's heads, in order, only when the snapshot
     // is all this port replays: an `<object>` argument's `repo_get_oid()` may
     // read on its own account, and a read that misses re-prepares the odb.
+    // ```c
+    // odb_prepare_alternates(repo->objects);
+    // for (source = repo->objects->sources; source; source = source->next)
+    //         fsck_source(repo, source);
+    //
+    // if (check_full) {
+    //         …
+    //         repo_for_each_pack(repo, p) {
+    //                 if (verify_pack(repo, p, fsck_obj_buffer, repo, progress, count))
+    //                         errors_found |= ERROR_PACK;
+    //                 …
+    //         }
+    // }
+    // ```
+    //
+    // (`cmd_fsck`, builtin/fsck.c:1072-1101.) `fsck_source()` is a walk of
+    // `.git/objects/??` alone; the packs are `check_full`'s half, and
+    // `fsck_obj_buffer()` — the only thing that sets `HAS_OBJ` on a packed
+    // object — is its callback. So `--no-full` leaves every packed object
+    // uncreated: it draws no `Checking` line, no message-layer finding, no
+    // `root`/`tagged` line, and nothing that goes through `lookup_object()`
+    // rather than `parse_object()` can find it. `--connectivity-only` replaces
+    // the whole block with `odb_for_each_object()`, which is unaffected.
+    if !opt.check_full && !opt.connectivity_only {
+        let loose: HashSet<ObjectId> = loose_only_scan_order(&repo).into_iter().collect();
+        all.retain(|id| loose.contains(id));
+        in_odb.retain(|id| loose.contains(id));
+    }
     let snapshot_reads = (!explicit_heads && !snapshot_missed).then_some(heads.as_slice());
     let pack_lists = PackLists::load(&repo, snapshot_reads);
     let scan_ordered = match loose_scan_order(&repo, opt.check_full, pack_lists.as_ref()) {
@@ -492,6 +547,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // never receive `HAS_OBJ`, and unlike it their type is unknown, so a
     // `missing` line for one carries the type expected at the reference site.
     let mut corrupt: HashSet<ObjectId> = HashSet::new();
+    // Stray files in `.git/objects/??`, which `fsck_cruft()` reports as part of
+    // the same walk. `--connectivity-only` replaces that walk entirely.
+    let cruft_lines: Vec<(usize, String)> = if opt.connectivity_only {
+        Vec::new()
+    } else {
+        loose_cruft(&repo)
+    };
     // `fsck_source()` announces the directory once per odb source before walking
     // it; `--connectivity-only` skips `fsck_source()` altogether.
     if opt.verbose && !opt.connectivity_only {
@@ -551,9 +613,22 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
         };
-        // `fsck_obj()`'s own line, which covers blobs too.
+        // `fsck_obj()`'s own line, which covers blobs too. It is part of the
+        // scan's stderr stream, so it belongs in `msg_lines` alongside the
+        // findings it interleaves with (builtin/fsck.c:413-416 sits between
+        // `parse_object_buffer()` and `fsck_walk()`); the push order within one
+        // object is preserved by the stable sort below. Only where the scan
+        // order could not be reconstructed does it fall back to printing
+        // immediately, since `msg_lines` would then have nothing to order it by.
         if opt.verbose && !opt.connectivity_only {
-            eprintln!("Checking {kind} {id}");
+            match &scan_index {
+                Some(_) => msg_lines.push((
+                    Slot::Scan(id.as_bytes()[0]),
+                    id,
+                    format!("Checking {kind} {id}"),
+                )),
+                None => eprintln!("Checking {kind} {id}"),
+            }
         }
         // A commit's tree and parents, and a tag's tagged object, are created by
         // `parse_commit_buffer()`/`parse_tag_buffer()` — and both return
@@ -671,6 +746,20 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `HAS_OBJ`, as an explicit set. `fsck_loose()` sets it after
+    // `parse_object_buffer()` returns non-NULL (builtin/fsck.c:766-767) and
+    // `fsck_obj_buffer()` does the same for a packed object under `--full`
+    // (:466-467); `mark_object_for_connectivity()` sets it straight from the
+    // odb listing under `--connectivity-only` (:911-918). A read that failed or
+    // a parse that was rejected leaves it clear, which is what separates
+    // `missing` from `unreachable` further down and what
+    // `fsck_handle_reflog_oid()` tests.
+    let has_obj: HashSet<ObjectId> = all
+        .iter()
+        .copied()
+        .filter(|id| !corrupt.contains(id) && !unparseable.contains_key(id))
+        .collect();
+
     // ---- 3a. the blob-content lint ------------------------------------------
     //
     // `fsck_blob()` for every blob a tree named `.gitmodules`/`.gitattributes`,
@@ -759,7 +848,30 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    for (_, _, line) in &msg_lines {
+    // `fsck_cruft()`'s lines come out of the same `readdir()` walk as the scan's
+    // own, so they interleave with them: a cruft entry keyed `k` was met after
+    // `k` loose objects had been handed to `fsck_loose()`, which places it ahead
+    // of the line the `k`-th object would print.
+    if !cruft_lines.is_empty() && !msg_lines.is_empty() && scan_index.is_none() {
+        anyhow::bail!(
+            "refusing to guess the output order: git emits {} `bad sha1 file` line(s) interleaved \
+             with these {} object-content messages in the raw readdir() sequence of one \
+             .git/objects/?? subdirectory",
+            cruft_lines.len(),
+            msg_lines.len()
+        );
+    }
+    let mut cruft = cruft_lines.into_iter().peekable();
+    for (slot, id, line) in &msg_lines {
+        if let (Some(index), Slot::Scan(_)) = (&scan_index, slot) {
+            let at = index.get(id).copied().unwrap_or(usize::MAX);
+            while cruft.peek().is_some_and(|&(k, _)| k <= at) {
+                eprintln!("{}", cruft.next().expect("peeked").1);
+            }
+        }
+        eprintln!("{line}");
+    }
+    for (_, line) in cruft {
         eprintln!("{line}");
     }
     if show_progress && !opt.connectivity_only {
@@ -860,7 +972,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     default_refs += default_refs_snapshot;
     if opt.include_reflogs {
         let logs_root = repo.common_dir().join("logs");
-        errors |= collect_reflog_heads(&repo, &logs_root, &mut state, &mut heads, opt.verbose)?;
+        errors |= collect_reflog_heads(
+            &repo,
+            &logs_root,
+            &mut state,
+            &mut heads,
+            &mut names,
+            &has_obj,
+            &promisor,
+            opt.verbose,
+        )?;
     }
     // Every linked worktree contributes its own HEAD, index, and per-worktree
     // reflogs, exactly as git's `get_default_heads()` iterates all worktrees.
@@ -868,7 +989,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // both of which are membership-based.
     {
         let (wt_count, wt_err) =
-            collect_linked_worktree_heads(&repo, &mut state, &mut heads, &opt, explicit_heads)?;
+            collect_linked_worktree_heads(
+                &repo,
+                &mut state,
+                &mut heads,
+                &mut index_blobs,
+                &mut names,
+                &has_obj,
+                &promisor,
+                &opt,
+                explicit_heads,
+            )?;
         default_refs += wt_count;
         errors |= wt_err;
     }
@@ -881,7 +1012,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
     // ---- 5. index entries as heads -----------------------------------------
     if !explicit_heads || opt.keep_cache_objects {
-        collect_index_heads(&repo, &mut state, &mut heads, opt.verbose);
+        errors |= collect_index_heads(
+            &repo,
+            &mut state,
+            &mut heads,
+            &mut index_blobs,
+            &mut names,
+            None,
+            opt.verbose,
+        );
     }
 
     // ---- 6. reachability ----------------------------------------------------
@@ -890,6 +1029,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // what decides whether an unreadable object is even opened here. A head has
     // no such site.
     let mut queue: Vec<(ObjectId, Option<Kind>)> = Vec::new();
+    // `mark_object()`'s stdout lines, emitted by `traverse_reachable()` — after
+    // every line `fsck_obj()` printed during the scan and before the
+    // connectivity report.
+    let mut broken_links: Vec<String> = Vec::new();
     for id in heads {
         if state.reachable.insert(id) {
             // A head reaches `mark_object()` through `mark_object_reachable()`
@@ -898,6 +1041,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // `pending`, which is why `fsck` on a `--filter=` clone reports the
             // whole history behind the tip as unreachable.
             if promisor.contains(&id) {
+                continue;
+            }
+            // `mark_object()` sets REACHABLE and then returns on `!HAS_OBJ`
+            // without a `broken link` line, because `mark_object_reachable()`
+            // passes no parent (builtin/fsck.c:163-175). The object is still in
+            // `obj_hash`, so `check_reachable_object()` reports it `missing` with
+            // the type its head site gave it — `OBJ_BLOB` for an index entry.
+            if !has_obj.contains(&id) {
+                if index_blobs.contains(&id) && !in_pack(&repo, id) {
+                    state.missing.insert(id, Kind::Blob);
+                }
                 continue;
             }
             queue.push((id, None));
@@ -944,6 +1098,64 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
         };
+        // `traverse_one_object()` is another `fsck_walk()`, so a tree whose
+        // entries will not decode complains a second time — once for the scan's
+        // `fsck_obj()` call and once here (builtin/fsck.c:186-195). Only the
+        // scan's copy is followed by `broken links`; `traverse_reachable()`
+        // folds the `-1` into its own return instead of reporting the object.
+        if let Some((line, _)) = &decoded.walk_error {
+            eprintln!("{line}");
+        }
+        // ```c
+        // name = fsck_get_object_name(options, &tree->object.oid);
+        // …
+        // if (name && obj) fsck_put_object_name(options, &entry.oid, "%s%s/", name, entry.path);
+        // ```
+        //
+        // (`fsck_walk_tree`, fsck.c:364-386, and `fsck_walk_commit`/`fsck_walk_tag`,
+        // :413-478.) A child is named only when its parent has a name, which is
+        // why a name spreads out from the head that carries one and no further.
+        // The names are put *before* `options->walk()` runs, so every child of
+        // one object is named before any of them is descended into.
+        let parent_name = names.get(&id).map(str::to_owned);
+        if let Some(parent) = &parent_name {
+            let mut counter = 0usize;
+            for (index, (child, child_kind)) in decoded.children.iter().enumerate() {
+                match kind {
+                    Kind::Tree => {
+                        let path = decoded
+                            .child_paths
+                            .get(index)
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                            .unwrap_or_default();
+                        let slash = if *child_kind == Kind::Tree { "/" } else { "" };
+                        names.put(*child, || format!("{parent}{path}{slash}"));
+                    }
+                    // `fsck_walk_commit()`: children[0] is the tree, the rest
+                    // are the parents in order.
+                    Kind::Commit if index == 0 => names.put(*child, || format!("{parent}:")),
+                    Kind::Commit => {
+                        let child = *child;
+                        if counter > 0 {
+                            let n = counter + 1;
+                            names.put(child, || format!("{parent}^{n}"));
+                        } else {
+                            let (generation, prefix_len) = parent_name_suffix(parent);
+                            if generation > 0 {
+                                let n = generation + 1;
+                                names.put(child, || format!("{}~{n}", &parent[..prefix_len]));
+                            } else {
+                                names.put(child, || format!("{parent}^"));
+                            }
+                        }
+                        counter += 1;
+                    }
+                    // `fsck_walk_tag()` hands the tagged object the tag's own name.
+                    Kind::Tag => names.put(*child, || parent.clone()),
+                    Kind::Blob => {}
+                }
+            }
+        }
         for (child, child_kind) in decoded.children {
             // `fsck_walk_tree()` resolves every entry through `lookup_tree()` /
             // `lookup_blob()`, and a lookup moves a displaced object back to its
@@ -975,19 +1187,72 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // likewise says nothing about a promisor object that is missing —
             // the remote still has it, which is the whole point of the pack that
             // promised it.
+            // ```c
+            // if (obj->flags & REACHABLE)
+            //         return 0;
+            // obj->flags |= REACHABLE;
+            // ```
+            //
+            // (`mark_object()`, builtin/fsck.c:151-153.) The guard precedes both
+            // the promisor stop and the `HAS_OBJ` test, so however many parents
+            // name one object it is judged — and reported — exactly once.
+            if !state.reachable.insert(child) {
+                continue;
+            }
             if promisor.contains(&child) {
-                state.reachable.insert(child);
                 continue;
             }
             // A corrupt object never got `HAS_OBJ`, so `check_reachable_object()`
             // prints `missing` for it with the type the reference site expected.
-            if corrupt.contains(&child) || !repo.has_object(child) {
-                state.missing.insert(child, child_kind);
+            if !has_obj.contains(&child) {
+                // ```c
+                // if (!(obj->flags & HAS_OBJ)) {
+                //         if (parent && !odb_has_object(options->repo->objects, &obj->oid,
+                //                                       ODB_HAS_OBJECT_RECHECK_PACKED)) {
+                //                 printf_ln(_("broken link from %7s %s\n"
+                //                             "              to %7s %s"), …);
+                //                 errors_found |= ERROR_REACHABLE;
+                //         }
+                //         return 1;
+                // }
+                // ```
+                //
+                // (`mark_object()`, builtin/fsck.c:163-175.) `HAS_OBJ` and
+                // `odb_has_object()` part company for exactly one shape: an
+                // object whose file is there but which the scan could not read
+                // or parse. git then prints `missing` without the pair of
+                // `broken link` lines, which is why the odb is asked again here
+                // rather than the `corrupt` set being taken as the answer.
+                if !repo.has_object(child) {
+                    // `%7s` on both type names — `gix`'s `Kind` writes itself
+                    // through `write_str`, which ignores a width, so the padding
+                    // is applied to the rendered name instead.
+                    broken_links.push(format!(
+                        "broken link from {:>7} {}\n              to {:>7} {}",
+                        kind.to_string(),
+                        names.describe(&id),
+                        child_kind.to_string(),
+                        names.describe(&child)
+                    ));
+                    errors |= ERROR_REACHABLE;
+                }
+                // ```c
+                // if (!(obj->flags & HAS_OBJ)) {
+                //         if (is_promisor_object(repo, &obj->oid)) return;
+                //         if (has_object_pack(repo, &obj->oid))
+                //                 return; /* it is in pack - forget about it */
+                //         printf_ln(_("missing %s %s"), …);
+                // ```
+                //
+                // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
+                // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
+                // there, so the pack is consulted before anything is reported.
+                if !in_pack(&repo, child) {
+                    state.missing.insert(child, child_kind);
+                }
                 continue;
             }
-            if state.reachable.insert(child) {
-                queue.push((child, Some(child_kind)));
-            }
+            queue.push((child, Some(child_kind)));
         }
     }
 
@@ -1046,19 +1311,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             state.missing.insert(id, kind);
         }
     }
-    if opt.name_objects && !state.missing.is_empty() {
-        bail!(
-            "--name-objects is not ported for a repository with missing objects: git decorates a \
-             `missing` line with the path the object was reached by"
-        );
-    }
 
     let mut lines: Vec<(ObjectId, String)> = Vec::new();
     if !state.missing.is_empty() {
         errors |= ERROR_REACHABLE;
     }
     for (&id, &kind) in &state.missing {
-        lines.push((id, format!("missing {kind} {id}")));
+        lines.push((id, format!("missing {kind} {}", names.describe(&id))));
     }
     if opt.show_unreachable || opt.show_dangling || opt.write_lost_and_found {
         for &id in &all {
@@ -1080,14 +1339,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             let Ok(header) = repo.find_header(id) else { continue };
             if opt.show_unreachable {
                 let kind = header.kind();
-                lines.push((id, format!("unreachable {kind} {id}")));
+                lines.push((id, format!("unreachable {kind} {}", names.describe(&id))));
             } else if !state.used.contains(&id) {
                 // `!USED` — the tip of an unreachable set. `dangling` printing and
                 // lost-found writing are independent: `--no-dangling --lost-found`
                 // still writes the files.
                 let kind = header.kind();
                 if opt.show_dangling {
-                    lines.push((id, format!("dangling {kind} {id}")));
+                    lines.push((id, format!("dangling {kind} {}", names.describe(&id))));
                 }
                 if opt.write_lost_and_found {
                     write_lost_found(&repo, id, kind)?;
@@ -1122,12 +1381,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         let mut walked: Vec<ObjectId> = state.known.iter().copied().collect();
         walked.sort_by_key(|id| (order.slot_of(id), *id));
         for id in walked {
-            eprintln!("Checking {id}");
+            eprintln!("Checking {}", names.describe(&id));
         }
     }
 
     let mut out = String::new();
     for (_, line) in &scan_lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for line in &broken_links {
         out.push_str(line);
         out.push('\n');
     }
@@ -1474,6 +1737,10 @@ struct Decoded {
     /// The objects it refers to, paired with the type expected at each site —
     /// which is what git names in a `missing <type> <oid>` line.
     children: Vec<(ObjectId, Kind)>,
+    /// For a tree, the entry name behind each element of [`children`](Self::children),
+    /// which `fsck_walk_tree()` appends to the tree's own name under
+    /// `--name-objects` (fsck.c:375-388). Empty for every other type.
+    child_paths: Vec<Vec<u8>>,
     /// A commit with no parents, which `--root` reports.
     is_root_commit: bool,
     /// `(target kind, target id, tag name)`, which `--tags` reports.
@@ -1523,6 +1790,7 @@ fn parse_object_buffer(
     hexsz: usize,
 ) -> Result<Decoded, ParseFailed> {
     let mut children = Vec::new();
+    let mut child_paths: Vec<Vec<u8>> = Vec::new();
     let mut is_root_commit = false;
     let mut tag = None;
     let mut walk_error = None;
@@ -1547,6 +1815,7 @@ fn parse_object_buffer(
                     _ => continue,
                 };
                 children.push((ObjectId::from_bytes_or_panic(entry.oid), kind));
+                child_paths.push(entry.name.to_vec());
             }
             walk_error = match stop {
                 TreeStop::End => None,
@@ -1554,12 +1823,14 @@ fn parse_object_buffer(
                     // `init_tree_desc_gently()` failed, so not one entry was
                     // walked and `fsck_walk()` reports the whole tree broken.
                     children.clear();
+                    child_paths.clear();
                     Some((format!("error: {msg}"), true))
                 }
                 TreeStop::AtUpdate(msg) => {
                     // `tree_entry_gently()` reports end-of-tree, so the entry
                     // the advance failed on is never handed to the walker.
                     children.pop();
+                    child_paths.pop();
                     Some((format!("error: {msg}"), false))
                 }
             };
@@ -1573,6 +1844,7 @@ fn parse_object_buffer(
     }
     Ok(Decoded {
         children,
+        child_paths,
         is_root_commit,
         tag,
         walk_error,
@@ -1684,6 +1956,7 @@ fn collect_default_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    names: &mut ObjectNames,
     pre_parsed: &mut HashSet<ObjectId>,
     promisor: &HashSet<ObjectId>,
     errors: &mut u8,
@@ -1714,10 +1987,22 @@ fn collect_default_heads(
             return 0;
         }
         state.note(id);
-        if matches!(
-            repo.find_header(id).map(|h| h.kind()),
-            Ok(Kind::Commit) | Ok(Kind::Tag)
-        ) {
+        let kind = repo.find_header(id).map(|h| h.kind()).ok();
+        // ```c
+        // if (obj->type != OBJ_COMMIT && is_branch(ref->name)) {
+        //         error(_("%s: not a commit"), ref->name);
+        //         errors_found |= ERROR_REFS;
+        // }
+        // ```
+        //
+        // (`snapshot_ref()`, builtin/fsck.c:569-572.) `is_branch()` is `HEAD` or
+        // anything under `refs/heads/` (refs.c:1072-1075). The reference still
+        // counts towards `default_refs` and still joins the snapshot.
+        if kind != Some(Kind::Commit) && (name == "HEAD" || name.starts_with("refs/heads/")) {
+            eprintln!("error: {name}: not a commit");
+            *errors |= ERROR_REFS;
+        }
+        if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
             if let Ok(Ok(parsed)) = decode(repo, id) {
                 for (child, _) in &parsed.children {
                     state.note(*child);
@@ -1754,13 +2039,23 @@ fn collect_default_heads(
             },
         };
         count += snapshot_ref(state, heads, pre_parsed, errors, &name, id);
+        // `fsck_handle_ref()` names the head with the reference it came from
+        // (builtin/fsck.c:590-591). It runs over the *snapshot*, i.e. only the
+        // references `snapshot_ref()` kept, and in snapshot order.
+        if heads.last() == Some(&id) {
+            names.put(id, || name.clone());
+        }
     }
 
     // HEAD is a pseudo-ref and is not part of the `refs/` iteration above:
     // `snapshot_refs()` resolves it per worktree after the `for_each_ref` walk.
     if let Ok(head) = repo.head() {
         if let Some(id) = head.id() {
-            count += snapshot_ref(state, heads, pre_parsed, errors, "HEAD", id.detach());
+            let id = id.detach();
+            count += snapshot_ref(state, heads, pre_parsed, errors, "HEAD", id);
+            if heads.last() == Some(&id) {
+                names.put(id, || "HEAD".to_string());
+            }
         }
     }
 
@@ -1775,13 +2070,16 @@ fn collect_reflog_heads(
     logs_root: &Path,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    names: &mut ObjectNames,
+    has_obj: &HashSet<ObjectId>,
+    promisor: &HashSet<ObjectId>,
     verbose: bool,
 ) -> Result<u8> {
     let mut errors = 0u8;
-    let mut names: Vec<String> = Vec::new();
-    collect_log_names(logs_root, "", &mut names)?;
+    let mut log_names: Vec<String> = Vec::new();
+    collect_log_names(logs_root, "", &mut log_names)?;
     let mut buf = Vec::new();
-    for name in names {
+    for name in log_names {
         // A log file whose path is not a well-formed ref name is skipped rather
         // than fatal, matching git's tolerance of stray files there.
         let Ok(Some(iter)) = repo.refs.reflog_iter(name.as_str(), &mut buf) else {
@@ -1798,14 +2096,36 @@ fn collect_reflog_heads(
                     line.new_oid()
                 );
             }
-            for id in [line.previous_oid(), line.new_oid()] {
+            // `fsck_handle_reflog_ent()` passes `0` for the old id's timestamp
+            // and the entry's own for the new one (builtin/fsck.c:511-512), and
+            // `fsck_handle_reflog_oid()` only names when that timestamp is
+            // non-zero (:482-485).
+            let stamp = line.signature.time().map(|t| t.seconds).unwrap_or_default();
+            for (id, timestamp) in [(line.previous_oid(), None), (line.new_oid(), Some(stamp))] {
                 if id.is_null() {
                     continue;
                 }
-                if repo.has_object(id) {
+                // ```c
+                // obj = lookup_object(repo, oid);
+                // if (obj && (obj->flags & HAS_OBJ)) { … mark_object_reachable(obj); }
+                // else if (!is_promisor_object(repo, oid)) {
+                //         error(_("%s: invalid reflog entry %s"), refname, oid_to_hex(oid));
+                //         errors_found |= ERROR_REACHABLE;
+                // }
+                // ```
+                //
+                // (`fsck_handle_reflog_oid()`, builtin/fsck.c:479-493.) This is a
+                // *lookup*, not a read: the test is whether the object-directory
+                // scan created the object and set `HAS_OBJ`, not whether the odb
+                // could produce it. `--no-full` therefore turns every reflog
+                // entry naming a packed object into an error.
+                if has_obj.contains(&id) {
+                    if let Some(timestamp) = timestamp {
+                        names.put(id, || format!("{name}@{{{timestamp}}}"));
+                    }
                     state.note(id);
                     heads.push(id);
-                } else {
+                } else if !promisor.contains(&id) {
                     eprintln!("error: {name}: invalid reflog entry {id}");
                     errors |= ERROR_REACHABLE;
                 }
@@ -1821,22 +2141,44 @@ fn collect_index_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    index_blobs: &mut HashSet<ObjectId>,
+    names: &mut ObjectNames,
+    label: Option<&str>,
     verbose: bool,
-) {
+) -> u8 {
     let Ok(index) = repo.index_or_empty() else {
-        return;
+        return 0;
     };
     for entry in index.entries() {
         if entry.mode.is_submodule() {
             continue;
         }
         state.note(entry.id);
+        // `fsck_index()` reaches an index entry through `lookup_blob()`
+        // (builtin/fsck.c:894-898), so the object it creates carries `OBJ_BLOB`
+        // whether or not the odb has it — which is the type
+        // `check_reachable_object()` names if it turns out to be missing.
+        //
+        // ```c
+        // fsck_put_object_name(&fsck_walk_options, &obj->oid, "%s:%s",
+        //                      is_current_worktree ? "" : index_path,
+        //                      istate->cache[i]->name);
+        // ```
+        //
+        // (builtin/fsck.c:900-903.) The current worktree's index contributes a
+        // bare `:<path>`; a linked worktree's spells its index path first.
+        let prefix = label.unwrap_or("");
+        names.put(entry.id, || {
+            format!("{prefix}:{}", entry.path(&index))
+        });
+        index_blobs.insert(entry.id);
         heads.push(entry.id);
     }
     if let Some(tree) = index.tree() {
-        let path = verbose.then(|| index_path_label(repo));
-        collect_cache_tree(repo, tree, state, heads, path.as_deref());
+        let path = index_path_label(repo);
+        return collect_cache_tree(repo, tree, state, heads, names, &path, verbose);
     }
+    0
 }
 
 /// The index path as `fsck_index()` names it — git runs from the top of the
@@ -1853,31 +2195,68 @@ fn index_path_label(repo: &gix::Repository) -> String {
 /// `fsck_cache_tree()`: an entry with a valid count names a tree that is a head.
 /// An invalid count (git's negative `entry_count`, gix's `None`) is skipped, but
 /// its children are still walked.
+///
+/// ```c
+/// if (0 <= it->entry_count) {
+///         struct object *obj = parse_object(repo, &it->oid);
+///         if (!obj) {
+///                 error(_("%s: invalid sha1 pointer in cache-tree of %s"),
+///                       oid_to_hex(&it->oid), index_path);
+///                 errors_found |= ERROR_REFS;
+///                 return 1;
+///         }
+///         …
+/// }
+/// for (i = 0; i < it->subtree_nr; i++)
+///         err |= fsck_cache_tree(repo, it->down[i]->cache_tree, index_path);
+/// ```
+///
+/// (builtin/fsck.c:821-836.) The `return 1` is taken *before* the subtree loop,
+/// so a node whose id the odb cannot produce takes its children down with it.
 fn collect_cache_tree(
     repo: &gix::Repository,
     tree: &gix::index::extension::Tree,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
-    verbose_index_path: Option<&str>,
-) {
+    names: &mut ObjectNames,
+    index_path: &str,
+    verbose: bool,
+) -> u8 {
     // `fsck_cache_tree()` announces itself once per node, subtrees included, and
     // before the entry-count guard below.
-    if let Some(path) = verbose_index_path {
-        eprintln!("Checking cache tree of {path}");
+    if verbose {
+        eprintln!("Checking cache tree of {index_path}");
     }
-    if tree.num_entries.is_some() && repo.has_object(tree.id) {
+    if tree.num_entries.is_some() {
+        if !repo.has_object(tree.id) {
+            eprintln!(
+                "error: {}: invalid sha1 pointer in cache-tree of {index_path}",
+                tree.id
+            );
+            return ERROR_REFS;
+        }
+        // `fsck_put_object_name(&fsck_walk_options, &it->oid, ":")`
+        // (builtin/fsck.c:830) — every cache-tree node, root or subtree, is
+        // named with a bare colon.
+        names.put(tree.id, || ":".to_string());
         state.note(tree.id);
         heads.push(tree.id);
     }
+    let mut errors = 0u8;
     for child in &tree.children {
-        collect_cache_tree(repo, child, state, heads, verbose_index_path);
+        errors |= collect_cache_tree(repo, child, state, heads, names, index_path, verbose);
     }
+    errors
 }
 
 /// Append every reflog file below `dir` to `out` as a `/`-joined ref name.
 ///
-/// Unsorted and pre-order, which is what git's `dir_iterator_begin(path, 0)`
-/// hands `for_each_reflog()`. Shared with [`super::shortlog`], whose `--reflog`
+/// Pre-order, and sorted by raw byte order within each directory — files and
+/// subdirectories together, as one list. `reflog_iterator_begin()` asks for
+/// `DIR_ITERATOR_SORTED` (refs/files-backend.c:2409), which reads a directory
+/// whole and runs `string_list_sort()` over it (dir-iterator.c:116-132), so the
+/// reflogs of one directory reach `for_each_reflog()` in `strcmp` order rather
+/// than `readdir()` order. Shared with [`super::shortlog`], whose `--reflog`
 /// walks the same directory through the same iterator.
 pub(super) fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
     let read = match std::fs::read_dir(dir) {
@@ -1885,8 +2264,12 @@ pub(super) fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>)
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
+    let mut entries: Vec<std::fs::DirEntry> = Vec::new();
     for entry in read {
-        let entry = entry?;
+        entries.push(entry?);
+    }
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
         let full = format!("{prefix}{name}");
         if entry.file_type()?.is_dir() {
@@ -1997,6 +2380,14 @@ fn has_packs(repo: &gix::Repository) -> bool {
 /// Whether `id` exists as a loose object in any odb source — which decides
 /// whether git found it through `fsck_object_dir()` or through `verify_pack()`,
 /// and so which error bit its messages set.
+/// `has_object_pack()` — the odb holds `id`, and not as a loose file. It is the
+/// guard `check_reachable_object()` puts in front of its `missing` line
+/// (builtin/fsck.c:268-269), which only matters once something in the odb can
+/// lack `HAS_OBJ`: a pack under `--no-full`.
+fn in_pack(repo: &gix::Repository, id: ObjectId) -> bool {
+    repo.has_object(id) && !is_loose(repo, id)
+}
+
 fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
     let hex = id.to_hex().to_string();
     odb_sources(repo)
@@ -2520,6 +2911,10 @@ fn collect_linked_worktree_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
+    index_blobs: &mut HashSet<ObjectId>,
+    names: &mut ObjectNames,
+    has_obj: &HashSet<ObjectId>,
+    promisor: &HashSet<ObjectId>,
     opt: &Options,
     explicit_heads: bool,
 ) -> Result<(usize, u8)> {
@@ -2550,10 +2945,28 @@ fn collect_linked_worktree_heads(
             }
         }
         if opt.include_reflogs {
-            errors |= collect_reflog_heads(&wt, &logs_root, state, heads, opt.verbose)?;
+            errors |= collect_reflog_heads(
+                &wt,
+                &logs_root,
+                state,
+                heads,
+                names,
+                has_obj,
+                promisor,
+                opt.verbose,
+            )?;
         }
         if !explicit_heads || opt.keep_cache_objects {
-            collect_index_heads(&wt, state, heads, opt.verbose);
+            let label = index_path_label(&wt);
+            errors |= collect_index_heads(
+                &wt,
+                state,
+                heads,
+                index_blobs,
+                names,
+                Some(&label),
+                opt.verbose,
+            );
         }
     }
     Ok((count, errors))
@@ -2820,7 +3233,9 @@ fn loose_scan_order(
     let mut out = loose_only_scan_order(repo);
     if has_packs(repo) {
         if !check_full {
-            return None;
+            // `fsck_source()` never reaches a pack, so the loose walk *is* the
+            // whole scan and its order is known exactly (builtin/fsck.c:1072-1076).
+            return Some(out);
         }
         for pack in pack_lists?.packs() {
             out.extend(pack.ids_by_offset());
@@ -3017,6 +3432,61 @@ fn loose_only_scan_order(repo: &gix::Repository) -> Vec<ObjectId> {
                 if seen.insert(id) {
                     out.push(id);
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Every file in a `.git/objects/??` directory that is not a loose object, with
+/// the number of loose objects the same walk had already yielded when it was
+/// met — the key that puts `fsck_cruft()`'s line back where git emits it.
+///
+/// ```c
+/// static int fsck_cruft(const char *basename, const char *path, void *data UNUSED)
+/// {
+///         if (!starts_with(basename, "tmp_obj_"))
+///                 fprintf_ln(stderr, _("bad sha1 file: %s"), path);
+///         return 0;
+/// }
+/// ```
+///
+/// (builtin/fsck.c:776-782.) `for_each_file_in_obj_subdir()` calls the cruft
+/// callback for every `readdir()` entry whose name is not exactly `hexsz - 2`
+/// hex digits (object-file.c:1490-1514), so a subdirectory with a stray file is
+/// the only way to reach it. The line is plain `fprintf_ln()`, not `error()`:
+/// `errors_found` is untouched and `git fsck` still exits 0.
+fn loose_cruft(repo: &gix::Repository) -> Vec<(usize, String)> {
+    let hexsz = repo.object_hash().len_in_hex();
+    let mut objects = 0usize;
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for objdir in odb_sources(repo) {
+        for sub in 0u16..=0xff {
+            let dir = objdir.join(format!("{sub:02x}"));
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let bytes = name.as_bytes();
+                // `hex_to_bytes()` reads through `hexval_table`, which maps
+                // `A`-`F` as well as `a`-`f` (hex-ll.c), so an upper-case name
+                // is an object to git and never reaches the cruft callback.
+                let is_object =
+                    bytes.len() == hexsz - 2 && bytes.iter().all(|b| b.is_ascii_hexdigit());
+                if is_object {
+                    objects += 1;
+                    continue;
+                }
+                // `basename` is the dirent name; git keeps the temporary files
+                // `write_loose_object()` leaves behind out of the report.
+                if bytes.starts_with(b"tmp_obj_") {
+                    continue;
+                }
+                out.push((
+                    objects,
+                    format!("bad sha1 file: {}", loose_label_of(repo, &entry.path())),
+                ));
             }
         }
     }
@@ -4976,7 +5446,10 @@ fn check_tree(data: &[u8], checked: &mut Checked, strict: bool, hexsz: usize) {
         _ => entries.len(),
     };
 
-    let mut previous: Option<Vec<u8>> = None;
+    // `fsck_tree()`'s `o_mode`/`o_name` pair and its `df_dup_candidates` stack
+    // (fsck.c:632-635), which [`verify_ordered`] carries across entries.
+    let mut previous: Option<(u32, Vec<u8>)> = None;
+    let mut df_dup_candidates: Vec<Vec<u8>> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let TreeEntry { mode, raw_mode, name, oid } = *entry;
         has_zero_pad |= raw_mode.first() == Some(&b'0');
@@ -5036,20 +5509,14 @@ fn check_tree(data: &[u8], checked: &mut Checked, strict: bool, hexsz: usize) {
         // `S_IFREG | 0664` falls through to `has_bad_modes` only under `--strict`.
         has_bad_modes |= !GOOD_MODES.contains(&mode) && (strict || mode != 0o100664);
 
-        // `verify_ordered`: names compare with a directory's implicit trailing
-        // slash, so `a` (tree) sorts after `a.`
-        let mut key = name.to_vec();
-        if mode & 0o170000 == 0o040000 {
-            key.push(b'/');
-        }
-        if let Some(prev) = &previous {
-            match key.cmp(prev) {
-                std::cmp::Ordering::Less => not_properly_sorted = true,
-                std::cmp::Ordering::Equal => has_dup_entries = true,
-                std::cmp::Ordering::Greater => {}
+        if let Some((prev_mode, prev_name)) = &previous {
+            match verify_ordered(*prev_mode, prev_name, mode, name, &mut df_dup_candidates) {
+                TreeOrder::Unordered => not_properly_sorted = true,
+                TreeOrder::HasDups => has_dup_entries = true,
+                TreeOrder::Ok => {}
             }
         }
-        previous = Some(key);
+        previous = Some((mode, name.to_vec()));
     }
 
     if has_null_oid {
@@ -5081,6 +5548,160 @@ fn check_tree(data: &[u8], checked: &mut Checked, strict: bool, hexsz: usize) {
     }
     if has_large_name {
         report(out, &LARGE_PATHNAME, "contains excessively large pathname");
+    }
+}
+
+/// `--name-objects`' map from object id to the path it was first reached by.
+///
+/// ```c
+/// pos = kh_put_oid_map(options->object_names, *oid, &hashret);
+/// if (!hashret)
+///         return;
+/// ```
+///
+/// (`fsck_put_object_name`, fsck.c:325-327.) `hashret` is zero when the key was
+/// already present, so the *first* name an object is given is the one it keeps —
+/// which is why the order the head sites run in, and the order
+/// `traverse_reachable()` pops `pending` in, decide what a `missing` line says.
+/// The map is only created under `--name-objects` (`fsck_enable_object_names`,
+/// :295-299), so `put_object_name` is a no-op without the flag and
+/// [`describe_object`] then renders a bare id.
+#[derive(Default)]
+struct ObjectNames {
+    on: bool,
+    names: HashMap<ObjectId, String>,
+}
+
+impl ObjectNames {
+    fn put(&mut self, id: ObjectId, name: impl FnOnce() -> String) {
+        if self.on {
+            self.names.entry(id).or_insert_with(name);
+        }
+    }
+
+    fn get(&self, id: &ObjectId) -> Option<&str> {
+        self.names.get(id).map(String::as_str)
+    }
+
+    /// `fsck.c::fsck_describe_object` (:334-352).
+    fn describe(&self, id: &ObjectId) -> String {
+        match self.get(id) {
+            Some(name) => format!("{id} ({name})"),
+            None => id.to_string(),
+        }
+    }
+}
+
+/// `fsck_walk_commit()`'s parent naming (fsck.c:424-459), which reads a
+/// `^`/`~<n>` suffix off the commit's own name so that a chain of first parents
+/// renders as `<name>~2`, `<name>~3`, … rather than `<name>^^^`.
+///
+/// Returns `(generation, name_prefix_len)` exactly as the C leaves them, `len`
+/// included: the digit loop decrements `len` in place, and the `else` branch
+/// then takes that decremented value.
+fn parent_name_suffix(name: &str) -> (u32, usize) {
+    let b = name.as_bytes();
+    let mut len = b.len();
+    if len > 0 && b[len - 1] == b'^' {
+        return (1, len - 1);
+    }
+    let mut generation: u32 = 0;
+    let mut power: u32 = 1;
+    while len > 0 && b[len - 1].is_ascii_digit() {
+        len -= 1;
+        generation += power * u32::from(b[len] - b'0');
+        power *= 10;
+    }
+    if power > 1 && len > 0 && b[len - 1] == b'~' {
+        (generation, len - 1)
+    } else {
+        (0, len)
+    }
+}
+
+/// `fsck.c`'s three `verify_ordered()` outcomes: `0`, `TREE_UNORDERED` (-1) and
+/// `TREE_HAS_DUPS` (-2) (fsck.c:536-537).
+#[derive(PartialEq, Eq, Debug)]
+enum TreeOrder {
+    Ok,
+    Unordered,
+    HasDups,
+}
+
+/// `fsck.c:539-541`.
+fn is_less_than_slash(c: u8) -> bool {
+    c > 0 && c < b'/'
+}
+
+/// A faithful port of `fsck.c::verify_ordered` (fsck.c:544-614).
+///
+/// Tree entries are ordered in *path* order, so a directory sorts as though its
+/// name carried a trailing `/`. Appending that slash and comparing the two keys
+/// gets the ordering right but misses one class of duplicate: the D/F conflict
+/// that is not between *adjacent* entries. For
+///
+/// ```text
+/// x
+/// x.1
+/// x/
+/// ```
+///
+/// each adjacent pair is correctly ordered, yet `x` and `x/` name the same path.
+/// git records every non-directory whose name is a prefix of the next entry's up
+/// to a byte below `/` on `candidates`, and when it later meets a directory
+/// whose name is one of those prefixes exactly, reports `TREE_HAS_DUPS`.
+fn verify_ordered(
+    mode1: u32,
+    name1: &[u8],
+    mode2: u32,
+    name2: &[u8],
+    candidates: &mut Vec<Vec<u8>>,
+) -> TreeOrder {
+    let len = name1.len().min(name2.len());
+    match name1[..len].cmp(&name2[..len]) {
+        std::cmp::Ordering::Less => return TreeOrder::Ok,
+        std::cmp::Ordering::Greater => return TreeOrder::Unordered,
+        std::cmp::Ordering::Equal => {}
+    }
+
+    // The first `len` bytes agree; order the next one, reading a name's
+    // terminating NUL as `/` when it is a directory.
+    let mut c1 = name1.get(len).copied().unwrap_or(0);
+    let mut c2 = name2.get(len).copied().unwrap_or(0);
+    if c1 == 0 && c2 == 0 {
+        // `git write-tree` used to emit a tree with one blob and one tree under
+        // the same name.
+        return TreeOrder::HasDups;
+    }
+    if c1 == 0 && mode1 & 0o170000 == 0o040000 {
+        c1 = b'/';
+    }
+    if c2 == 0 && mode2 & 0o170000 == 0o040000 {
+        c2 = b'/';
+    }
+
+    if c1 == 0 && is_less_than_slash(c2) {
+        candidates.push(name1.to_vec());
+    } else if c2 == b'/' && is_less_than_slash(c1) {
+        loop {
+            let Some(f_name) = candidates.pop() else { break };
+            let Some(rest) = name2.strip_prefix(f_name.as_slice()) else {
+                continue;
+            };
+            if rest.is_empty() {
+                return TreeOrder::HasDups;
+            }
+            if is_less_than_slash(rest[0]) {
+                candidates.push(f_name);
+                break;
+            }
+        }
+    }
+
+    if c1 < c2 {
+        TreeOrder::Ok
+    } else {
+        TreeOrder::Unordered
     }
 }
 

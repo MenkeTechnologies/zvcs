@@ -1498,26 +1498,26 @@ fn show_advice_pull_non_ff() {
     // suppresses it. `die_ff_impossible()`'s hint, three lines further down the
     // same file, *is* `advise_if_enabled(ADVICE_DIVERGING, …)` — the two are a
     // matched pair, and only one of them can be turned off.
-    for line in [
-        "You have divergent branches and need to specify how to reconcile them.",
-        "You can do so by running one of the following commands sometime before",
-        "your next pull:",
-        "",
-        "  git config pull.rebase false  # merge",
-        "  git config pull.rebase true   # rebase",
-        "  git config pull.ff only       # fast-forward only",
-        "",
-        "You can replace \"git config\" with \"git config --global\" to set a default",
-        "preference for all repositories. You can also pass --rebase, --no-rebase,",
-        "or --ff-only on the command line to override the configured default per",
-        "invocation.",
-    ] {
-        if line.is_empty() {
-            eprintln!("hint:");
-        } else {
-            eprintln!("hint: {line}");
-        }
-    }
+    //
+    // The framing is `vadvise()`'s, not a hand-written `hint: ` prefix: each
+    // line — the prefix included — is wrapped in `color.advice.hint` (default
+    // yellow) whenever `want_color_stderr(advice_use_color)` says so
+    // (advice.c:41-47, :106-118). Printing the lines directly meant
+    // `git -c color.advice=always pull` came out uncolored.
+    crate::advice::print_hint(concat!(
+        "You have divergent branches and need to specify how to reconcile them.\n",
+        "You can do so by running one of the following commands sometime before\n",
+        "your next pull:\n",
+        "\n",
+        "  git config pull.rebase false  # merge\n",
+        "  git config pull.rebase true   # rebase\n",
+        "  git config pull.ff only       # fast-forward only\n",
+        "\n",
+        "You can replace \"git config\" with \"git config --global\" to set a default\n",
+        "preference for all repositories. You can also pass --rebase, --no-rebase,\n",
+        "or --ff-only on the command line to override the configured default per\n",
+        "invocation.\n",
+    ));
 }
 
 /// `config_autostash()`: the CLI flag wins, else `pull.autoStash` — which

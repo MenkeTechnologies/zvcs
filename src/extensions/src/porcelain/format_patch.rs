@@ -287,7 +287,7 @@
 //! without the mail headers and diffstat git has already flushed by then. The
 //! `whitespace_rule()` a colour pass applies comes from `core.whitespace` alone,
 //! with no per-path `whitespace` attribute, which is the same reach `git diff`'s
-//! colour path has here. The cover letter's shortlog does not wrap long subjects at 76 columns.
+//! colour path has here.
 //! `append_signoff()`'s trailer-block scan does not consult `trailer.<token>.key`
 //! config, so only git's own generated prefixes can carry a mixed block over the
 //! 25% threshold. The ERE
@@ -5838,10 +5838,8 @@ fn emit_commit_list(
         return Ok(Ok(()));
     }
     match fmt {
-        "shortlog" => {
-            emit_shortlog(repo, commits, out)?;
-            out.push(b'\n');
-        }
+        // `shortlog_output()` already ends every group with a blank line.
+        "shortlog" => emit_shortlog(repo, commits, out)?,
         // git spells the built-in `modern` layout as a format string, so it
         // wraps at the mail width and numbers each entry within the series.
         "modern" => {
@@ -5856,9 +5854,16 @@ fn emit_commit_list(
                         .to_str()
                         .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
                 );
-                let mut wrapped = String::new();
-                wrap_text(&mut wrapped, &line, 0, 0, MAIL_DEFAULT_WRAP);
-                out.extend_from_slice(wrapped.as_bytes());
+                // `%w(72)` is `strbuf_add_wrapped_text()` (pretty.c), which
+                // measures display columns — so the full port, not this module's
+                // reduced ASCII-only [`wrap_text`].
+                crate::utf8::strbuf_add_wrapped_text(
+                    out,
+                    line.as_bytes(),
+                    0,
+                    0,
+                    MAIL_DEFAULT_WRAP as i32,
+                );
                 out.push(b'\n');
             }
             out.push(b'\n');
@@ -5893,31 +5898,72 @@ fn generate_commit_list(
 }
 
 /// git's shortlog as the cover letter embeds it: one `Name (count):` group per
-/// author, most commits first, each subject indented by two spaces.
+/// author, each subject wrapped into the mail width.
+///
+/// Port of `generate_shortlog_cover_letter()` (builtin/log.c:1349) over
+/// `shortlog_add_commit()`/`shortlog_output()` (builtin/shortlog.c:241, :492).
+/// `shortlog_init()` zeroes `sort_by_number`, so `shortlog_output()` never
+/// re-sorts and the groups come out in the order `string_list_insert()`
+/// (builtin/shortlog.c:63) keeps them in — sorted by the ident string, not by
+/// how many commits an author has. `shortlog_add_commit()` substitutes
+/// `<none>` for a commit whose `%s` is empty (builtin/shortlog.c:260), and the
+/// cover letter sets `wrap_lines`/`wrap`/`in1`/`in2` to 1/72/2/4
+/// (builtin/log.c:1355-1358) so each subject goes through
+/// `strbuf_add_wrapped_text()` (builtin/shortlog.c:488) rather than a flat
+/// two-space indent. Each group is followed by a blank line
+/// (builtin/shortlog.c:520), including the last.
 fn emit_shortlog(repo: &gix::Repository, commits: &[ObjectId], out: &mut Vec<u8>) -> Result<()> {
+    /// `log->in1` / `log->in2` as the cover letter sets them.
+    const SHORTLOG_INDENT1: i32 = 2;
+    const SHORTLOG_INDENT2: i32 = 4;
+
+    // `shortlog_finish_setup()` groups on `%aN` (builtin/shortlog.c:374), and
+    // `%aN` always consults the mailmap (pretty.c:806-807) — independently of
+    // `--use-mailmap`/`log.mailmap`, which is the read `Mailmap::for_pretty`
+    // reproduces.
+    let mailmap = crate::mailmap::Mailmap::for_pretty(repo);
+
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
     for id in commits {
         let commit = repo.find_object(*id)?.try_into_commit()?;
-        let author = commit.author()?.name.to_str()?.to_owned();
+        let author = commit.author()?;
+        let (author, _) = mailmap.mapped(author.name, author.email);
+        let author = author.to_str()?.to_owned();
         let msg = skip_blank_lines(commit.message_raw()?);
         let (title, _) = format_subject(msg);
         let title = title.to_str()?.to_owned();
+        // `oneline_str = oneline.len ? oneline.buf : "<none>"`.
+        let title = if title.is_empty() {
+            "<none>".to_owned()
+        } else {
+            title
+        };
         match groups.iter_mut().find(|(name, _)| *name == author) {
             Some((_, subjects)) => subjects.push(title),
             None => groups.push((author, vec![title])),
         }
     }
-    // Ties keep author order stable by name, as git's string list does.
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    // `string_list_insert()` keeps `log->list` ordered by the ident string.
+    groups.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (i, (name, subjects)) in groups.iter().enumerate() {
-        if i > 0 {
-            out.push(b'\n');
-        }
+    for (name, subjects) in &groups {
         writeln!(out, "{name} ({}):", subjects.len())?;
         for s in subjects {
-            writeln!(out, "  {s}")?;
+            // The full `strbuf_add_wrapped_text()`, not this module's reduced
+            // [`wrap_text`]: a subject is arbitrary UTF-8, and git measures it in
+            // display columns (`utf8_width()`, utf8.c:344-345) — so an accented
+            // Latin letter costs one column for its two bytes and a CJK ideograph
+            // two columns for its three.
+            crate::utf8::strbuf_add_wrapped_text(
+                out,
+                s.as_bytes(),
+                SHORTLOG_INDENT1,
+                SHORTLOG_INDENT2,
+                MAIL_DEFAULT_WRAP as i32,
+            );
+            out.push(b'\n');
         }
+        out.push(b'\n');
     }
     Ok(())
 }
@@ -7411,75 +7457,28 @@ pub(super) fn add_rfc2047(sb: &mut String, line: &str, address: bool) {
     sb.push_str("?=");
 }
 
-/// Port of `strbuf_add_wrapped_text()` (utf8.c) for the ASCII inputs that reach
-/// it — anything non-ASCII takes the RFC2047 path above, and neither the subject
-/// (paragraph joined with spaces) nor a display name can contain a newline, so
-/// the original's embedded-newline branch is unreachable here.
+/// `strbuf_add_wrapped_text()` (utf8.c:277-357) over the `String` buffers the
+/// mail headers are built in.
 ///
 /// A negative `indent1` means that many columns are already consumed.
+///
+/// The wrapping itself is [`crate::utf8::strbuf_add_wrapped_text`] rather than a
+/// second copy here: git measures the line in **display columns**
+/// (`utf8_width()`, utf8.c:344-345), not bytes, and non-ASCII does reach this
+/// path — `--no-encode-email-headers` / `format.encodeEmailHeaders=false` sends
+/// a raw UTF-8 display name or subject straight through it. Every byte the
+/// wrapper copies out is a slice of `text` cut at a character or space boundary,
+/// so the result is still UTF-8.
 pub(super) fn wrap_text(buf: &mut String, text: &str, indent1: i64, indent2: i64, width: i64) {
-    if width <= 0 {
-        buf.push_str(text);
-        return;
-    }
-    let b = text.as_bytes();
-    let mut indent = indent1;
-    let mut w = indent1;
-    let mut bol: usize = 0;
-    let mut space: Option<usize> = None;
-    let mut i: usize = 0;
-
-    if indent < 0 {
-        w = -indent;
-        space = Some(0);
-    }
-
-    loop {
-        let c = b.get(i).copied().unwrap_or(0);
-        if c == 0 || c.is_ascii_whitespace() {
-            if w <= width || space.is_none() {
-                // git checks the empty-tail case against `bol`, before the
-                // remembered space overrides the copy start.
-                if c == 0 && i == bol {
-                    return;
-                }
-                let start = match space {
-                    Some(s) => s,
-                    None => {
-                        if indent > 0 {
-                            buf.push_str(&" ".repeat(indent as usize));
-                        }
-                        bol
-                    }
-                };
-                buf.push_str(&text[start..i]);
-                if c == 0 {
-                    return;
-                }
-                space = Some(i);
-                if c == b'\t' {
-                    w |= 0x07;
-                }
-                w += 1;
-                i += 1;
-            } else {
-                // Break the line at the last remembered space.
-                buf.push('\n');
-                let s = space.expect("the else branch requires a remembered space");
-                // `*space` reads the NUL terminator in git when the remembered
-                // position is the end of the text; that is not whitespace.
-                let at_space = b.get(s).copied().unwrap_or(0).is_ascii_whitespace();
-                i = s + usize::from(at_space);
-                bol = i;
-                space = None;
-                indent = indent2;
-                w = indent2;
-            }
-            continue;
-        }
-        w += 1;
-        i += 1;
-    }
+    let mut bytes = std::mem::take(buf).into_bytes();
+    crate::utf8::strbuf_add_wrapped_text(
+        &mut bytes,
+        text.as_bytes(),
+        indent1 as i32,
+        indent2 as i32,
+        width as i32,
+    );
+    *buf = String::from_utf8(bytes).expect("the wrapper cuts only at character boundaries");
 }
 
 // ---------------------------------------------------------------------------

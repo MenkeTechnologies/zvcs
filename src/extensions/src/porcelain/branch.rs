@@ -690,8 +690,16 @@ struct Opts {
     // Reachability filters (each entry is a raw rev spec, resolved at list time).
     contains: Vec<String>,
     no_contains: Vec<String>,
-    merged: Vec<String>,
-    no_merged: Vec<String>,
+    /// `--merged`/`--no-merged` are the two that resolve during `parse_options()`
+    /// rather than at list time, so they hold commit ids and not specs:
+    /// `parse_opt_merge_filter()` (ref-filter.c:3735-3757) calls `repo_get_oid()`
+    /// once and inserts the commit it found into `rf->reachable_from` /
+    /// `rf->unreachable_from` right there. Keeping the spec and resolving it a
+    /// second time at list time repeats every diagnostic the first resolution
+    /// printed — two `log for 'HEAD' only goes back to ...` warnings for one
+    /// `git branch --merged HEAD@{<old>}` where git prints one.
+    merged: Vec<ObjectId>,
+    no_merged: Vec<ObjectId>,
     points_at: Vec<String>,
     /// `--omit-empty`: drop a formatted line that rendered to nothing, rather
     /// than printing its bare newline (`format.array_opts.omit_empty`).
@@ -1236,12 +1244,16 @@ fn apply_long(
         ("merged" | "no-merged", _) => {
             let spec = val();
             let repo = crate::setup::discover()?;
-            if let Err(e) = crate::objname::parse_opt_merge_filter(&repo, &spec, opt.name) {
-                return Ok(Some(e.report()));
-            }
+            // The commit this resolves to is the value the filter keeps —
+            // `commit_list_insert(merge_commit, &rf->reachable_from)`. Resolving
+            // the spec again at list time would print its warnings twice.
+            let id = match crate::objname::parse_opt_merge_filter(&repo, &spec, opt.name) {
+                Ok(id) => id,
+                Err(e) => return Ok(Some(e.report())),
+            };
             match opt.name {
-                "merged" => o.merged.push(spec),
-                _ => o.no_merged.push(spec),
+                "merged" => o.merged.push(id),
+                _ => o.no_merged.push(id),
             }
         }
         ("abbrev", false) => {
@@ -1871,8 +1883,8 @@ fn emit_columns(colopts: u32, cells: Vec<Vec<u8>>) {
     let _ = std::io::stdout().write_all(&bytes);
 }
 
-/// Resolve every `--contains`/`--no-contains`/`--merged`/`--no-merged`/
-/// `--points-at` operand.
+/// Resolve the `--contains`/`--no-contains`/`--points-at` operands, and carry
+/// the `--merged`/`--no-merged` ids the option callback already resolved.
 ///
 /// git does this from three different `parse_options()` callbacks, and they do
 /// not share a diagnostic: `OPT_CONTAINS` is `parse_opt_commits`, `OPT_MERGED`
@@ -1880,6 +1892,10 @@ fn emit_columns(colopts: u32, cells: Vec<Vec<u8>>) {
 /// (which never peels and never consults the odb, so it accepts an absent id and
 /// simply matches nothing). Routing all five through one resolver is what made
 /// every one of them report `fatal: malformed object name` at 128.
+///
+/// Only two of the three run here. `parse_opt_merge_filter()` stores the commit
+/// it looked up (ref-filter.c:3752-3754), so `--merged` is resolved exactly once,
+/// while `OPT_CONTAINS` keeps the spec in `filter.with_commit` for list time.
 fn resolve_filters(
     repo: &gix::Repository,
     o: &Opts,
@@ -1890,19 +1906,12 @@ fn resolve_filters(
             .map(|s| crate::objname::parse_opt_commits(repo, s))
             .collect()
     };
-    let merges = |specs: &[String],
-                  long_name: &str|
-     -> Result<Vec<ObjectId>, crate::objname::OperandError> {
-        specs
-            .iter()
-            .map(|s| crate::objname::parse_opt_merge_filter(repo, s, long_name))
-            .collect()
-    };
     Ok(Filters {
         contains: commits(&o.contains)?,
         no_contains: commits(&o.no_contains)?,
-        merged: merges(&o.merged, "merged")?,
-        no_merged: merges(&o.no_merged, "no-merged")?,
+        // Already resolved by the option callback, as git's are.
+        merged: o.merged.clone(),
+        no_merged: o.no_merged.clone(),
         points_at: o
             .points_at
             .iter()

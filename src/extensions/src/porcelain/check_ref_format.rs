@@ -63,8 +63,6 @@ use anyhow::Result;
 use std::io::Write;
 use std::process::ExitCode;
 
-use gix::bstr::ByteSlice;
-
 /// Stock git's usage block for this command, byte-for-byte. Stdout on a bare
 /// `-h`, stderr on any argument error; both exit 129.
 const USAGE: &str = "usage: git check-ref-format [--normalize] [<options>] <refname>\n   \
@@ -376,45 +374,17 @@ fn first_mark(name: &str) -> Option<(usize, usize, Mark)> {
     Some((at, len, mark))
 }
 
-/// The syntax half of `refs.c::interpret_nth_prior_checkout`.
+/// The two halves of `interpret_nth_prior_checkout()`, shared with every other
+/// verb that expands `@{-N}` — [`crate::objname::parse_nth_prior`] for the
+/// syntax and [`crate::objname::nth_branch_switch`] for the `HEAD`-reflog walk.
 ///
-/// Recognises a leading `@{-N}` with `N > 0` and returns `(N, bytes consumed)`.
-/// The closing brace is the first `}` in the input and the number must run
-/// exactly up to it, as git's `strtol`/`num_end` comparison requires.
-pub(crate) fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
-    if name.len() < 4 || !name.starts_with(b"@{-") {
-        return None;
-    }
-    let brace = name.iter().position(|&c| c == b'}')?;
-    let nth: i64 = std::str::from_utf8(&name[3..brace]).ok()?.parse().ok()?;
-    if nth <= 0 {
-        return None;
-    }
-    Some((nth as usize, brace + 1))
-}
-
-/// The reflog half: `refs.c::grab_nth_branch_switch` over HEAD's log, newest
-/// entry first, returning the source branch of the `nth` checkout found.
-pub(crate) fn nth_branch_switch(repo: &gix::Repository, nth: usize) -> Option<Vec<u8>> {
-    let head = repo.head().ok()?;
-    let mut platform = head.log_iter();
-    let log = platform.rev().ok()??;
-
-    let mut remaining = nth;
-    for line in log.filter_map(Result::ok) {
-        let Some(from_to) = line.message.strip_prefix(b"checkout: moving from ") else {
-            continue;
-        };
-        let Some(pos) = from_to.find(" to ") else {
-            continue;
-        };
-        remaining -= 1;
-        if remaining == 0 {
-            return Some(from_to[..pos].to_vec());
-        }
-    }
-    None
-}
+/// Re-exported under the names `builtin/checkout.c` and `builtin/reflog.c`'s
+/// ports already call here. `check_branch_ref` passes `INTERPRET_BRANCH_LOCAL`,
+/// which admits `interpret_nth_prior_checkout()` but not `interpret_empty_at()`,
+/// so this file deliberately reaches for these two rather than for
+/// [`crate::objname::prefix_rewrite`], which carries the bare-`@` → `HEAD`
+/// rewrite that `--branch` must not perform.
+pub(crate) use crate::objname::{nth_branch_switch, parse_nth_prior};
 
 /// `builtin/check-ref-format.c::collapse_slashes` — drop leading slashes and
 /// squeeze every run of slashes down to one.

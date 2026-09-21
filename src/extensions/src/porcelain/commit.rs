@@ -2865,7 +2865,7 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
                 _ => line,
             };
             if !nul && line.first() == Some(&b'"') {
-                match unquote_c_style(line) {
+                match crate::quote::unquote_c_style(line) {
                     Some(v) => out.push(String::from_utf8_lossy(&v).into_owned()),
                     None => {
                         return Err(crate::fatal::die(format!(
@@ -2883,66 +2883,6 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
         return Err(crate::fatal::die(msg));
     }
     Ok(out)
-}
-
-/// Port of `unquote_c_style()` (quote.c) for one double-quoted line; `None` is its
-/// `-1`, which `parse_pathspec_file()` turns into `line is badly quoted: <line>`.
-///
-/// Everything up to the first unescaped `"` is the result and whatever follows the
-/// closing quote is ignored, because git passes a NULL `endp` and never looks. The
-/// octal escape is the strict `\NNN` form: exactly three digits, and a leading digit
-/// above `3` is rejected rather than wrapped, since it would overflow a byte.
-///
-/// git walks a NUL-terminated string, so a read past the end lands on `\0`, which
-/// no arm accepts — reading out of range as `0` here reproduces that exactly, and
-/// an embedded NUL byte truncates the same way `strcspn()` does.
-fn unquote_c_style(line: &[u8]) -> Option<Vec<u8>> {
-    let at = |i: usize| line.get(i).copied().unwrap_or(0);
-    if at(0) != b'"' {
-        return None;
-    }
-    let mut i = 1;
-    let mut out = Vec::with_capacity(line.len());
-    loop {
-        // `strcspn(quoted, "\"\\")`: copy through to the next delimiter.
-        while !matches!(at(i), b'"' | b'\\' | 0) {
-            out.push(at(i));
-            i += 1;
-        }
-        let delim = at(i);
-        i += 1;
-        match delim {
-            b'"' => return Some(out),
-            b'\\' => {}
-            _ => return None,
-        }
-        let esc = at(i);
-        i += 1;
-        let byte = match esc {
-            b'a' => 0x07,
-            b'b' => 0x08,
-            b'f' => 0x0c,
-            b'n' => b'\n',
-            b'r' => b'\r',
-            b't' => b'\t',
-            b'v' => 0x0b,
-            b'\\' | b'"' => esc,
-            b'0'..=b'3' => {
-                let mut ac = (esc - b'0') << 6;
-                for shift in [3, 0] {
-                    let d = at(i);
-                    i += 1;
-                    if !d.is_ascii_digit() || d > b'7' {
-                        return None;
-                    }
-                    ac |= (d - b'0') << shift;
-                }
-                ac
-            }
-            _ => return None,
-        };
-        out.push(byte);
-    }
 }
 
 /// The (path → id, mode) view of an index, used to decide which pathspec-matched
@@ -5356,7 +5296,8 @@ fn trailer_config() -> &'static TrailerConfig {
 
 #[cfg(test)]
 mod pathspec_file_tests {
-    use super::{read_pathspec_file, unquote_c_style};
+    use super::read_pathspec_file;
+    use crate::quote::unquote_c_style;
 
     fn unquoted(line: &str) -> Option<String> {
         unquote_c_style(line.as_bytes()).map(|v| String::from_utf8(v).expect("ascii fixtures"))

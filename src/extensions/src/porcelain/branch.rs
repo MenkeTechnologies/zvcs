@@ -449,7 +449,7 @@ pub(crate) fn copy_branchname(
 ) -> std::result::Result<String, String> {
     // `if (!options->allowed || (options->allowed & INTERPRET_BRANCH_LOCAL))`
     if allowed == Interpret::Local {
-        match nth_prior_checkout(repo, name) {
+        match crate::objname::nth_prior_checkout(repo, name) {
             // `len == namelen` — consumed all — or the `reinterpret()` tail,
             // which re-runs the pass over `<resolved><rest>`; the resolved half
             // is a short branch name, so the only mark that can still fire is an
@@ -474,44 +474,6 @@ pub(crate) fn copy_branchname(
         Some(v) => v,
         None => name.to_owned(),
     })
-}
-
-/// `interpret_nth_prior_checkout()` (`object-name.c:1273-1306`): parse `@{-<n>}`
-/// and read the `n`-th "checkout: moving from <x> to <y>" entry off `HEAD`'s
-/// reflog, newest first.
-///
-/// `None` is the C's `-1` (not `@{-<n>}` syntax at all), `Some(None)` its `0`
-/// (syntax fine, the reflog does not go back that far), and
-/// `Some(Some((branch, used)))` its positive `brace - name + 1`.
-fn nth_prior_checkout(repo: &gix::Repository, name: &str) -> Option<Option<(String, usize)>> {
-    let b = name.as_bytes();
-    if b.len() < 4 || !b.starts_with(b"@{-") {
-        return None;
-    }
-    let brace = b.iter().position(|&c| c == b'}')?;
-    // `nth = strtol(name + 3, &num_end, 10); if (num_end != brace) return -1;`
-    let nth: i64 = name[3..brace].parse().ok()?;
-    if nth <= 0 {
-        return None;
-    }
-    let used = brace + 1;
-    let mut remaining = nth as usize;
-
-    let Ok(head) = repo.head() else { return Some(None) };
-    let mut platform = head.log_iter();
-    let Ok(Some(log)) = platform.rev() else { return Some(None) };
-    for line in log.filter_map(std::result::Result::ok) {
-        // `grab_nth_branch_switch()` (object-name.c:1249-1267).
-        let Some(rest) = line.message.strip_prefix(b"checkout: moving from ".as_ref()) else {
-            continue;
-        };
-        let Some(pos) = rest.find(" to ") else { continue };
-        remaining -= 1;
-        if remaining == 0 {
-            return Some(Some((rest[..pos].to_str_lossy().into_owned(), used)));
-        }
-    }
-    Some(None)
 }
 
 /// `interpret_branch_mark()` (`object-name.c:1428-1470`) for `upstream_mark`,

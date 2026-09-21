@@ -388,7 +388,7 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
             // attribute lookup uses, so `"a b.txt"` is filtered as `a b.txt`.
             let decoded;
             let line: &str = if line.as_bytes().first() == Some(&b'"') {
-                match unquote_c_style(line.as_bytes()) {
+                match crate::quote::unquote_c_style(line.as_bytes()) {
                     Some(bytes) => {
                         decoded = String::from_utf8_lossy(&bytes).into_owned();
                         &decoded
@@ -407,64 +407,6 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
     }
 
     Ok(())
-}
-
-/// Port of `unquote_c_style()` (quote.c:386-441) in the `endp == NULL` form
-/// `hash_stdin_paths()` calls it with: decode one double-quoted record, ignoring
-/// whatever follows the closing quote, and answer `None` for git's `-1`.
-///
-/// git walks a NUL-terminated string, so a read past the end lands on `\0`, which
-/// no arm accepts — reading out of range as `0` reproduces that. The octal escape
-/// is the strict `\NNN` form of `case '0' ... case '3'`: exactly three digits, and
-/// a leading digit above `3` is rejected rather than wrapped, because it would
-/// overflow a byte.
-fn unquote_c_style(line: &[u8]) -> Option<Vec<u8>> {
-    let at = |i: usize| line.get(i).copied().unwrap_or(0);
-    if at(0) != b'"' {
-        return None;
-    }
-    let mut i = 1;
-    let mut out = Vec::with_capacity(line.len());
-    loop {
-        // `len = strcspn(quoted, "\"\\")`: copy through to the next delimiter.
-        while !matches!(at(i), b'"' | b'\\' | 0) {
-            out.push(at(i));
-            i += 1;
-        }
-        let delim = at(i);
-        i += 1;
-        match delim {
-            b'"' => return Some(out),
-            b'\\' => {}
-            _ => return None,
-        }
-        let esc = at(i);
-        i += 1;
-        let byte = match esc {
-            b'a' => 0x07,
-            b'b' => 0x08,
-            b'f' => 0x0c,
-            b'n' => b'\n',
-            b'r' => b'\r',
-            b't' => b'\t',
-            b'v' => 0x0b,
-            b'\\' | b'"' => esc,
-            b'0'..=b'3' => {
-                let mut ac = (esc - b'0') << 6;
-                for shift in [3, 0] {
-                    let d = at(i);
-                    i += 1;
-                    if !(b'0'..=b'7').contains(&d) {
-                        return None;
-                    }
-                    ac |= (d - b'0') << shift;
-                }
-                ac
-            }
-            _ => return None,
-        };
-        out.push(byte);
-    }
 }
 
 /// Strip the `(os error N)` tail std appends, leaving git's bare `strerror` text.

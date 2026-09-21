@@ -136,3 +136,89 @@ pub fn quote_two_c_style(prefix: &[u8], path: &[u8]) -> Vec<u8> {
     out
 }
 
+
+/// `unquote_c_style()` (quote.c:386-441) in the `endp == NULL` form every caller
+/// here uses: decode one double-quoted record, ignoring whatever follows the
+/// closing quote, and answer `None` for git's `-1`.
+///
+/// ```c
+/// if (*quoted++ != '"')
+///         return -1;
+/// for (;;) {
+///         len = strcspn(quoted, "\"\\");
+///         strbuf_add(sb, quoted, len);
+///         quoted += len;
+///         switch (*quoted++) {
+///           case '"': if (endp) *endp = quoted; return 0;
+///           case '\\': break;
+///           default: goto error;
+///         }
+///         switch ((ch = *quoted++)) {
+///         case 'a': … case 'v':
+///         case '\\': case '"': break; /* verbatim */
+///         /* octal values with first digit over 4 overflow */
+///         case '0': case '1': case '2': case '3': …
+///         default: goto error;
+///         }
+///         strbuf_addch(sb, ch);
+/// }
+/// ```
+///
+/// git walks a NUL-terminated string, so a read past the end lands on `\0`, which
+/// no arm accepts — reading out of range as `0` reproduces that exactly, and an
+/// embedded NUL byte ends the `strcspn()` run the same way. The octal escape is
+/// the strict `\NNN` form of `case '0' ... case '3'`: exactly three digits, and a
+/// leading digit above `3` is rejected rather than wrapped, because it would
+/// overflow a byte.
+///
+/// One function for every caller, because git has one: `hash_stdin_paths()`
+/// (builtin/hash-object.c:47-55) and `parse_pathspec_file()` (parse-options.c)
+/// both call this exact form and turn its `-1` into their own `die()`.
+pub fn unquote_c_style(line: &[u8]) -> Option<Vec<u8>> {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    if at(0) != b'"' {
+        return None;
+    }
+    let mut i = 1;
+    let mut out = Vec::with_capacity(line.len());
+    loop {
+        // `len = strcspn(quoted, "\"\\")`: copy through to the next delimiter.
+        while !matches!(at(i), b'"' | b'\\' | 0) {
+            out.push(at(i));
+            i += 1;
+        }
+        let delim = at(i);
+        i += 1;
+        match delim {
+            b'"' => return Some(out),
+            b'\\' => {}
+            _ => return None,
+        }
+        let esc = at(i);
+        i += 1;
+        let byte = match esc {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            b'\\' | b'"' => esc,
+            b'0'..=b'3' => {
+                let mut ac = (esc - b'0') << 6;
+                for shift in [3, 0] {
+                    let d = at(i);
+                    i += 1;
+                    if !(b'0'..=b'7').contains(&d) {
+                        return None;
+                    }
+                    ac |= (d - b'0') << shift;
+                }
+                ac
+            }
+            _ => return None,
+        };
+        out.push(byte);
+    }
+}

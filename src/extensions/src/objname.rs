@@ -3549,35 +3549,72 @@ pub fn nth_prior_checkout(
     name: &str,
 ) -> Option<Option<(String, usize)>> {
     use gix::bstr::ByteSlice;
-    let b = name.as_bytes();
-    if b.len() < 4 || !b.starts_with(b"@{-") {
+    let (nth, used) = parse_nth_prior(name.as_bytes())?;
+    Some(nth_branch_switch(repo, nth).map(|b| (b.to_str_lossy().into_owned(), used)))
+}
+
+/// The syntax half of `interpret_nth_prior_checkout()`: a leading `@{-<n>}` with
+/// `n > 0`, answered as `(n, bytes consumed)`.
+///
+/// ```c
+/// if (namelen < 4) return -1;
+/// if (name[0] != '@' || name[1] != '{' || name[2] != '-') return -1;
+/// brace = memchr(name, '}', namelen);
+/// if (!brace) return -1;
+/// nth = strtol(name + 3, &num_end, 10);
+/// if (num_end != brace) return -1;
+/// if (nth <= 0) return -1;
+/// ```
+///
+/// The closing brace is the *first* `}` in the input and the digits must run
+/// exactly up to it, which is what `num_end != brace` says.
+pub fn parse_nth_prior(name: &[u8]) -> Option<(usize, usize)> {
+    if name.len() < 4 || !name.starts_with(b"@{-") {
         return None;
     }
-    let brace = b.iter().position(|&c| c == b'}')?;
-    // `strtol(name + 3, &num_end, 10)` with `num_end != brace` rejected, so the
-    // digits must run exactly up to the brace.
-    let nth: i64 = name.get(3..brace)?.parse().ok()?;
+    let brace = name.iter().position(|&c| c == b'}')?;
+    let nth: i64 = std::str::from_utf8(name.get(3..brace)?).ok()?.parse().ok()?;
     if nth <= 0 {
         return None;
     }
-    let used = brace + 1;
+    Some((nth as usize, brace + 1))
+}
 
-    let Ok(head) = repo.head() else { return Some(None) };
+/// The reflog half: `grab_nth_branch_switch()` (`object-name.c:1246-1267`) run
+/// over `HEAD`'s log newest-entry-first, answering the *source* branch of the
+/// `nth` `checkout: moving from <x> to <y>` entry.
+///
+/// ```c
+/// if (skip_prefix(message, "checkout: moving from ", &match))
+///         target = strstr(match, " to ");
+/// if (!match || !target) return 0;
+/// if (--(cb->remaining) == 0) { len = target - match; … return 1; }
+/// ```
+///
+/// `None` is `refs_for_each_reflog_ent_reverse()` running out — the reflog is
+/// absent, unreadable, or does not go back that far — which
+/// `interpret_nth_prior_checkout()` turns into its `retval = 0`, "syntax Ok, not
+/// enough switches". The name is returned as raw bytes because a branch name is
+/// not required to be UTF-8; callers that render it decide on their own encoding.
+pub fn nth_branch_switch(repo: &gix::Repository, nth: usize) -> Option<Vec<u8>> {
+    use gix::bstr::ByteSlice;
+    let head = repo.head().ok()?;
     let mut platform = head.log_iter();
-    let Ok(Some(log)) = platform.rev() else { return Some(None) };
-    let mut remaining = nth as usize;
+    let log = platform.rev().ok()??;
+    let mut remaining = nth;
     for line in log.filter_map(std::result::Result::ok) {
-        // `grab_nth_branch_switch()` (`object-name.c:1246-1267`).
         let Some(rest) = line.message.strip_prefix(b"checkout: moving from ".as_ref()) else {
             continue;
         };
+        // `strstr(match, " to ")` — the first occurrence, so a branch name
+        // containing " to " splits exactly where git splits it.
         let Some(pos) = rest.find(" to ") else { continue };
         remaining -= 1;
         if remaining == 0 {
-            return Some(Some((rest[..pos].to_str_lossy().into_owned(), used)));
+            return Some(rest[..pos].to_vec());
         }
     }
-    Some(None)
+    None
 }
 
 /// The offset of the `@` that opens an `@{u}`/`@{upstream}` mark in `base`, as

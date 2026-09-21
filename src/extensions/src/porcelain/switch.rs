@@ -1512,35 +1512,14 @@ fn reject_invalid_branch_name(repo: &gix::Repository, branch: &str) -> Option<Ex
 }
 
 /// Resolve `@{-N}` to the branch that was left N checkouts ago, from the HEAD
-/// reflog (mirrors `refs.c::interpret_nth_prior_checkout`).
+/// reflog — `object-name.c::interpret_nth_prior_checkout`, shared with every
+/// other verb that expands the shorthand.
+///
+/// `None` covers both of the C's negative answers here, because `switch` has one
+/// message for them: not `@{-N}` syntax at all, and syntax whose reflog does not
+/// go back that far.
 fn resolve_prev_branch(repo: &gix::Repository, expanded: &str) -> Option<String> {
-    let bytes = expanded.as_bytes();
-    if !bytes.starts_with(b"@{-") {
-        return None;
-    }
-    let brace = bytes.iter().position(|&c| c == b'}')?;
-    let nth: i64 = std::str::from_utf8(&bytes[3..brace]).ok()?.parse().ok()?;
-    if nth <= 0 {
-        return None;
-    }
-    let mut nth = nth as usize;
-
-    let head = repo.head().ok()?;
-    let mut platform = head.log_iter();
-    let log = platform.rev().ok()??;
-    for line in log.filter_map(Result::ok) {
-        let Some(from_to) = line.message.strip_prefix(b"checkout: moving from ") else {
-            continue;
-        };
-        let Some(pos) = from_to.find(" to ") else {
-            continue;
-        };
-        nth -= 1;
-        if nth == 0 {
-            return Some(from_to[..pos].to_str_lossy().into_owned());
-        }
-    }
-    None
+    crate::objname::nth_prior_checkout(repo, expanded)?.map(|(branch, _used)| branch)
 }
 
 /// The tree of the current `HEAD` commit, or `None` on an unborn HEAD.

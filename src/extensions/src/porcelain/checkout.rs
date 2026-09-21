@@ -1836,6 +1836,19 @@ fn detached_checkout(
     let old_label = head_label(repo, &head);
     let cur_tree = head_tree_or_empty(repo)?;
 
+    // `merge_working_tree()`'s first gate (builtin/checkout.c:883-889): detaching is a
+    // switch like every other, so an unmerged index is refused there — ahead of the
+    // two-way unpack, which would otherwise report the same paths as local changes
+    // that would be overwritten. Not conditional on the trees differing: `git checkout
+    // --detach` with no operand detaches onto `HEAD`'s own commit and still has to
+    // refuse. `--discard-changes`/`-f` takes `reset_tree()` instead
+    // (builtin/checkout.c:871-876) and never reaches it.
+    if !force {
+        if let Some(code) = refuse_unmerged_index(repo)? {
+            return Ok(code);
+        }
+    }
+
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut autostashed = false;
@@ -2013,6 +2026,19 @@ fn create_and_switch(
     let existed = repo.try_find_reference(full.as_str())?.is_some();
     if existed && !reset {
         crate::git_fatal!("a branch named '{name}' already exists");
+    }
+
+    // `merge_working_tree()`'s first gate (builtin/checkout.c:883-889), reached only
+    // when `switch_branches()` actually calls it: `git checkout -b <branch>` spelled
+    // with exactly those three argv words sets `only_merge_on_switching_branches`
+    // (builtin/checkout.c:2123-2130), which clears `do_merge` (:1202-1203) and skips
+    // the whole function — so that one spelling creates the branch over an unmerged
+    // index, while `-B`, a start-point operand, or any other flag in the line does
+    // not. That flag is this function's `merge_worktree`.
+    if merge_worktree && !force {
+        if let Some(code) = refuse_unmerged_index(repo)? {
+            return Ok(code);
+        }
     }
 
     let mut autostashed = false;
@@ -2263,6 +2289,20 @@ fn orphan_checkout(
     let start_commit = commit.id;
     let target_tree = commit.tree_id()?.detach();
     let cur_tree = head_tree_or_empty(repo)?;
+    // `merge_working_tree()`'s first gate (builtin/checkout.c:883-889) runs for
+    // `--orphan` like every other switch, and *before* the two-way unpack — so an
+    // unmerged index is refused here rather than being reported as local changes
+    // that would be overwritten. It is not conditional on the trees differing:
+    // `git checkout --orphan <name>` with no start point keeps `HEAD`'s tree and
+    // still has to refuse. `--discard-changes`/`-f` takes `reset_tree()` instead
+    // and never reaches it. The name, collision and start-point checks above are
+    // `validate_new_branchname()`'s and `parse_branchname_arg()`'s, which
+    // `checkout_main()` runs first, so they still win over this.
+    if !force {
+        if let Some(code) = refuse_unmerged_index(repo)? {
+            return Ok(code);
+        }
+    }
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else if target_tree != cur_tree || index_unborn(repo)? {
@@ -2313,7 +2353,8 @@ fn restore_conflict_stage(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let index = repo.open_index()?;
-    let matched = match match_paths(&index, paths) {
+    let norm = normalize_specs(repo, paths)?;
+    let matched = match match_paths(&index, paths, &norm) {
         Ok(m) => m,
         Err(spec) => {
             eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
@@ -2658,6 +2699,82 @@ fn tree_effective_entries(
     out
 }
 
+/// `unmerge_index()` (resolve-undo.c:155-179): put the conflict back.
+///
+/// `checkout_paths()` runs this *before* it matches the pathspec against the
+/// index, so `-m`/`--merge` on a path whose conflict was already resolved
+/// re-creates the stages from the index's resolve-undo (`REUC`) records:
+///
+/// ```c
+/// if (opts->merge)
+///         unmerge_index(the_repository->index, &opts->pathspec, CE_MATCHED);
+/// ```
+///
+/// (builtin/checkout.c:637-638.) `unmerge_index_entry()` (resolve-undo.c:124-153)
+/// leaves a path that is *still* unmerged alone, and otherwise drops the stage-0
+/// entry and adds one entry per recorded stage:
+///
+/// ```c
+/// } else {
+///         /* merged - remove it to replace it with unmerged entries */
+///         remove_index_entry_at(istate, i);
+/// }
+/// for (i = 0; i < 3; i++) {
+///         if (!ru->mode[i])
+///                 continue;
+///         ce = make_cache_entry(istate, ru->mode[i], &ru->oid[i], path, i + 1, 0);
+/// ```
+///
+/// A path resolved *to removal* has no index entry at all, and the loop still
+/// re-adds its stages — which is why the pathspec is matched afterwards and not
+/// before. The record is consumed either way (`item->util = NULL`, resolve-undo.c:177),
+/// so the re-created conflict cannot be re-created twice.
+pub(super) fn unmerge_index(index: &mut gix::index::File, matches: impl Fn(&BStr) -> bool) {
+    let Some(records) = index.resolve_undo().cloned() else {
+        return;
+    };
+    let mut changed = false;
+    for ru in &records {
+        let path = ru.name().to_owned();
+        if !matches(path.as_bstr()) {
+            continue;
+        }
+        index.remove_resolve_undo_path(path.as_bstr());
+        changed = true;
+        // "yes, it is already unmerged" — the entry is left exactly as it is.
+        if index
+            .entries()
+            .iter()
+            .any(|e| e.stage_raw() != 0 && e.path_in(index.path_backing()) == path)
+        {
+            continue;
+        }
+        index.remove_entries(|_, p, e| e.stage_raw() == 0 && p == path);
+        for (i, stage) in ru.stages().iter().enumerate() {
+            let Some(stage) = stage else { continue };
+            let Some(mode) = Mode::from_bits(stage.mode()) else {
+                continue;
+            };
+            // `make_cache_entry(istate, mode, oid, path, i + 1, 0)`: no stat data,
+            // so the file is always written out and always counted.
+            index.dangerously_push_entry(
+                Stat::default(),
+                stage.id(),
+                Flags::from_stage(match i {
+                    0 => gix::index::entry::Stage::Base,
+                    1 => gix::index::entry::Stage::Ours,
+                    _ => gix::index::entry::Stage::Theirs,
+                }),
+                mode,
+                path.as_bstr(),
+            );
+        }
+    }
+    if changed {
+        index.sort_entries();
+    }
+}
+
 /// The conflicted entries among `matched`, as `[stage] -> (id, mode)` with index
 /// 1/2/3 for base/ours/theirs — git's `ce_stage()` walk over the runs of equal
 /// names. A path with a stage-0 entry is not conflicted and never appears here.
@@ -2753,6 +2870,14 @@ fn restore_from_index(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut index = repo.open_index()?;
+    let norm = normalize_specs(repo, paths)?;
+    // `if (opts->merge) unmerge_index(…)` (builtin/checkout.c:637-638) — ahead of the
+    // pathspec match, so a conflict that was already resolved comes back first.
+    if merge.is_some() {
+        unmerge_index(&mut index, |p| {
+            norm.iter().any(|spec| spec_matches(p.as_ref(), spec))
+        });
+    }
     // `mark_ce_for_checkout_*()` (builtin/checkout.c:392, :426) skips a skip-worktree entry
     // before it ever consults the pathspec, so naming one is `did not match any file(s) known to
     // git` — unless `--ignore-skip-worktree-bits` says otherwise.
@@ -2768,7 +2893,7 @@ fn restore_from_index(
                 .collect()
         }
     };
-    let matched = match match_paths_excluding(&index, paths, &sparse) {
+    let matched = match match_paths_excluding(&index, paths, &norm, &sparse) {
         Ok(m) => m,
         Err(spec) => {
             eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
@@ -2826,7 +2951,9 @@ fn restore_from_index(
         0
     };
 
-    let mut subset = repo.open_index()?;
+    // Cloned rather than re-read: `unmerge_index()` above may have put stages back
+    // that are not on disk yet, and those are exactly what gets written out.
+    let mut subset = index.clone();
     keep_only(&mut subset, &matched);
     // An unmerged path is written from the `checkout_merged()` result (git's
     // "phony cache entry": stage 2's mode carrying the merged blob), and one
@@ -2892,10 +3019,34 @@ fn restore_from_index(
     crate::index_racy::write(repo, &mut index)?;
 
     if bare && !quiet {
-        eprintln!(
-            "Updated {count} path{} from the index",
-            if count == 1 { "" } else { "s" }
-        );
+        // `checkout_worktree()`'s tail (builtin/checkout.c:494-511). `checkout_merged()`
+        // counts into `nr_unmerged`, not `nr_checkouts`, and its transient entry
+        // (`make_transient_cache_entry()`) carries no stat data, so every path it
+        // writes is counted. The `Updated …` line is then suppressed when a conflict
+        // was recreated and nothing else was written:
+        //
+        // ```c
+        // if (nr_unmerged)
+        //         fprintf_ln(stderr, Q_("Recreated %d merge conflict",
+        //                               "Recreated %d merge conflicts", nr_unmerged),
+        //                    nr_unmerged);
+        // …
+        // else if (!nr_unmerged || nr_checkouts)
+        //         fprintf_ln(stderr, Q_("Updated %d path from the index", …));
+        // ```
+        let nr_unmerged = merged_blobs.len();
+        if nr_unmerged != 0 {
+            eprintln!(
+                "Recreated {nr_unmerged} merge conflict{}",
+                if nr_unmerged == 1 { "" } else { "s" }
+            );
+        }
+        if nr_unmerged == 0 || count != 0 {
+            eprintln!(
+                "Updated {count} path{} from the index",
+                if count == 1 { "" } else { "s" }
+            );
+        }
     }
     // `checkout_paths()`'s tail: `errs |= post_checkout_hook(head, head, 0)`.
     let head = head_commit_id(repo);
@@ -2978,10 +3129,12 @@ fn restore_from_tree(
         src.remove_entries(|_, path, _| sparse.contains(&path.to_owned()));
     }
 
+    let norm = normalize_specs(repo, paths)?;
+
     // Paths to write from the tree, and (no-overlay only) paths to delete.
     let (matched, to_remove) = if overlay {
         (
-            match match_paths(&src, paths) {
+            match match_paths(&src, paths, &norm) {
                 Ok(m) => m,
                 Err(spec) => {
                     eprintln!(
@@ -2993,7 +3146,7 @@ fn restore_from_tree(
             Vec::new(),
         )
     } else {
-        let (tree_matched, tree_hit) = matches_in(&src, paths);
+        let (tree_matched, tree_hit) = matches_in(&src, &norm);
         let cur = repo.open_index()?;
         // ```c
         // if (!opts->ignore_skip_worktree_bits && ce_skip_worktree(ce))
@@ -3004,7 +3157,7 @@ fn restore_from_tree(
         // of the union is filtered the same way the tree side is: a path the
         // sparse-checkout definition keeps out of the work tree is not a path
         // `--no-overlay` may delete.
-        let (idx_matched, idx_hit) = matches_in_excluding(&cur, paths, &sparse);
+        let (idx_matched, idx_hit) = matches_in_excluding(&cur, &norm, &sparse);
         // A pathspec must match in the tree or the index; else git's "did not match".
         if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si]) {
             // `report_path_error()` (pathspec.c) writes
@@ -3059,11 +3212,24 @@ fn restore_from_tree(
     // differs, and `add_index_entry()` invalidates the cache-tree along that path; an entry the
     // tree already agrees with is left in place and invalidates nothing.
     let mut stale: Vec<BString> = Vec::new();
+    // Resolved once, up front: `dangerously_push_entry()` appends out of order, and
+    // `entry_index_by_path()` is a binary search — so a path looked up *after* the
+    // first append can be reported missing and appended a second time, leaving two
+    // stage-0 entries for it in the index. `add_index_entry()` keeps the index
+    // sorted at every step (read-cache.c), so git never sees an unsorted lookup.
+    // Appending never moves an existing entry, so these positions stay valid.
+    let mut positions: HashMap<BString, usize> = HashMap::new();
+    {
+        let backing = index.path_backing();
+        for (i, e) in index.entries().iter().enumerate() {
+            positions.insert(e.path_in(backing).to_owned(), i);
+        }
+    }
     for path in &matched {
         let Some((id, mode, stat)) = fresh.get(path) else {
             continue;
         };
-        match index.entry_index_by_path(BStr::new(path)) {
+        match positions.get(path).copied().ok_or(()) {
             Ok(idx) => {
                 let e = &mut index.entries_mut()[idx];
                 if e.id != *id || e.mode != *mode {
@@ -4143,8 +4309,54 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
 fn match_paths<'a>(
     index: &gix::index::File,
     specs: &[&'a str],
+    norm: &[(String, bool)],
 ) -> std::result::Result<Vec<BString>, &'a str> {
-    match_paths_excluding(index, specs, &HashSet::new())
+    match_paths_excluding(index, specs, norm, &HashSet::new())
+}
+
+/// The current directory expressed as repo-root-relative path components — git's
+/// `prefix`, which `parse_pathspec()` prepends to every non-magic element
+/// (`prefix_path()`, setup.c). A pathspec is relative to where the command was
+/// run, not to the worktree root, so `git checkout <tree> -- s.txt` inside `sub/`
+/// names `sub/s.txt` and a bare `.` there names only what lies under `sub/`.
+fn repo_prefix(repo: &gix::Repository) -> Vec<String> {
+    let Some(workdir) = repo.workdir() else {
+        return Vec::new();
+    };
+    let wd = workdir.canonicalize().unwrap_or_else(|_| workdir.to_owned());
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
+    };
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    cwd.strip_prefix(&wd)
+        .map(|rel| {
+            rel.components()
+                .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every pathspec normalised against the prefix of the directory the command was
+/// run in, ready for [`spec_matches`]. A spec whose `..` climbs out of the
+/// worktree is git's `fatal: <spec>: '<spec>' is outside repository at '<wd>'`
+/// (`prefix_path_gently()` failing in `parse_pathspec()`), which exits 128.
+fn normalize_specs(repo: &gix::Repository, specs: &[&str]) -> Result<Vec<(String, bool)>> {
+    let prefix = repo_prefix(repo);
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match normalize_spec(&prefix, spec) {
+            Some(n) => out.push(n),
+            None => {
+                let wd = repo
+                    .workdir()
+                    .map(|w| w.canonicalize().unwrap_or_else(|_| w.to_owned()))
+                    .unwrap_or_default();
+                crate::git_fatal!("{spec}: '{spec}' is outside repository at '{}'", wd.display());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// [`match_paths`] with the entries in `exclude` taken out of the index first — the sparse
@@ -4152,9 +4364,10 @@ fn match_paths<'a>(
 fn match_paths_excluding<'a>(
     index: &gix::index::File,
     specs: &[&'a str],
+    norm: &[(String, bool)],
     exclude: &HashSet<BString>,
 ) -> std::result::Result<Vec<BString>, &'a str> {
-    let (matched, hit) = matches_in_excluding(index, specs, exclude);
+    let (matched, hit) = matches_in_excluding(index, norm, exclude);
     match hit.iter().position(|h| !h) {
         Some(si) => Err(specs[si]),
         None => Ok(matched),
@@ -4165,22 +4378,21 @@ fn match_paths_excluding<'a>(
 /// anything" flag. Unlike [`match_paths`] this never fails, so callers that must
 /// consider several indexes (e.g. no-overlay's tree ∪ index) can decide the
 /// "did not match" error against their own union.
-fn matches_in(index: &gix::index::File, specs: &[&str]) -> (Vec<BString>, Vec<bool>) {
-    matches_in_excluding(index, specs, &HashSet::new())
+fn matches_in(index: &gix::index::File, norm: &[(String, bool)]) -> (Vec<BString>, Vec<bool>) {
+    matches_in_excluding(index, norm, &HashSet::new())
 }
 
-/// [`matches_in`] over the entries that are not in `exclude`.
+/// [`matches_in`] over the entries that are not in `exclude`. `norm` is the
+/// pathspec set already put through [`normalize_specs`] — normalised once, not
+/// per entry, because this is O(entries x specs).
 fn matches_in_excluding(
     index: &gix::index::File,
-    specs: &[&str],
+    norm: &[(String, bool)],
     exclude: &HashSet<BString>,
 ) -> (Vec<BString>, Vec<bool>) {
     let mut matched: Vec<BString> = Vec::new();
     let mut seen: HashSet<BString> = HashSet::new();
-    let mut hit = vec![false; specs.len()];
-
-    // Normalised once, not per entry: `matches_in` is O(entries x specs).
-    let norm: Vec<(String, bool)> = specs.iter().map(|s| normalize_spec(s)).collect();
+    let mut hit = vec![false; norm.len()];
 
     let backing = index.path_backing();
     for e in index.entries() {
@@ -4220,17 +4432,22 @@ fn matches_in_excluding(
 /// A leading `/` is left alone. An absolute pathspec is resolved against the
 /// worktree root rather than lexically, which this matcher does not model, and
 /// reducing it here would silently turn `/abs` into a relative `abs`.
-fn normalize_spec(spec: &str) -> (String, bool) {
+///
+/// `prefix` is the repo-root-relative form of the directory the command ran in
+/// (see [`repo_prefix`]), which the spec starts from — so inside `sub/` the spec
+/// `s.txt` names `sub/s.txt` and `..` climbs back to the worktree root. `None`
+/// means the `..`s climbed *past* the root, which is git's "outside repository".
+fn normalize_spec(prefix: &[String], spec: &str) -> Option<(String, bool)> {
     if spec.starts_with('/') {
-        return (spec.to_string(), false);
+        return Some((spec.to_string(), false));
     }
-    let mut comps: Vec<&str> = Vec::new();
-    let mut dir_only = false;
+    let mut comps: Vec<&str> = prefix.iter().map(String::as_str).collect();
+    let mut dir_only = !prefix.is_empty();
     for part in spec.split('/') {
         match part {
             "" | "." => dir_only = true,
             ".." => {
-                comps.pop();
+                comps.pop()?;
                 dir_only = true;
             }
             other => {
@@ -4239,7 +4456,7 @@ fn normalize_spec(spec: &str) -> (String, bool) {
             }
         }
     }
-    (comps.join("/"), dir_only)
+    Some((comps.join("/"), dir_only))
 }
 
 /// Whether `path` is matched by an already-normalised pathspec: an empty spec is

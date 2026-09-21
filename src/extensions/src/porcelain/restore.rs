@@ -611,24 +611,17 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
             return Ok(ExitCode::from(128));
         }
-        let data = if f == "-" {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
-            buf
-        } else {
-            std::fs::read(&f)?
-        };
-        let sep = if pathspec_file_nul { b'\0' } else { b'\n' };
-        for part in data.split(|&c| c == sep) {
-            let mut s = part;
-            if !pathspec_file_nul && s.last() == Some(&b'\r') {
-                s = &s[..s.len() - 1];
-            }
-            if s.is_empty() {
-                continue;
-            }
-            pathspecs.push(String::from_utf8_lossy(s).into_owned());
-        }
+        // The one port of `parse_pathspec_file()` (pathspec.c:687-721), shared with
+        // `checkout`. A private copy here read the file with a bare `std::fs::read`
+        // and split on the separator, which diverged from stock four ways: a missing
+        // file reported the Rust io error at exit 1 instead of `xfopen()`'s
+        // `fatal: could not open '<f>' for reading: …` at 128; a `"`-quoted line was
+        // taken literally instead of going through `unquote_c_style()` (and a broken
+        // one never reached `fatal: line is badly quoted: …`); an embedded NUL in the
+        // newline form was kept rather than ending the record as `strvec_push()`'s C
+        // string does; and a blank line became a skipped record rather than the empty
+        // pathspec that matches everything.
+        pathspecs = super::commit::read_pathspec_file(&f, pathspec_file_nul)?;
     }
 
     // --- Incompatible-flag combinations (git's fatal/exit-128 diagnostics) --
@@ -824,6 +817,21 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // source in the default worktree case.
     let mut cur = repo.open_index()?;
 
+    // ```c
+    // if (opts->merge)
+    //         unmerge_index(the_repository->index, &opts->pathspec, CE_MATCHED);
+    // ```
+    //
+    // (`checkout_paths()`, builtin/checkout.c:637-638.) `--merge`/`--conflict` on a
+    // path whose conflict was already resolved puts the stages back from the index's
+    // resolve-undo records, which is what makes the conflict re-appear. It runs
+    // before the pathspec is matched, so a path resolved *to removal* — gone from
+    // the index entirely — can still be named. `--merge` and `--source` are mutually
+    // exclusive (builtin/checkout.c:590-592), so the source index is unaffected.
+    if merge_active {
+        super::checkout::unmerge_index(&mut cur, |p| path_matches(p, match_all, &spec_set));
+    }
+
     // The source, materialized as an index (a tree is unpacked into one).
     let source_index: gix::index::File = match &source_tree_id {
         Some(tid) => repo.index_from_tree(tid)?,
@@ -1010,8 +1018,23 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             invalidated.extend(unmerged_matched.iter().cloned());
         }
         let mut need_sort = false;
+        // Resolved once, up front. `add_index_entry()` keeps the index sorted at
+        // every step (read-cache.c), but `dangerously_push_entry()` appends: looking
+        // a path up with `entry_index_by_path()`'s binary search *after* an append
+        // can report a present path missing, and appending it a second time leaves
+        // two stage-0 entries for it in the written index. `updates` is built from a
+        // `HashSet` walk, so which path was appended first — and therefore whether
+        // the index came out corrupt — varied from run to run. Appending never moves
+        // an existing entry, so these positions stay valid for the whole loop.
+        let mut positions: HashMap<BString, usize> = HashMap::new();
+        {
+            let b = cur.path_backing();
+            for (i, e) in cur.entries().iter().enumerate() {
+                positions.insert(e.path_in(b).to_owned(), i);
+            }
+        }
         for (path, id, mode, stat) in &updates {
-            match cur.entry_index_by_path(BStr::new(path)) {
+            match positions.get(path).copied().ok_or(()) {
                 Ok(idx) => {
                     let e = &mut cur.entries_mut()[idx];
                     // `update_some()` leaves the old entry in place — and so never

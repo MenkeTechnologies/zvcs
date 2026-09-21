@@ -6234,8 +6234,24 @@ fn parse_int(value: &str) -> Option<i64> {
 /// `verify_filename`). True when the path is present in the working tree, or is
 /// tracked in the index — the latter covers `git log <file>` for a path that was
 /// deleted from the worktree but still has history.
-fn spec_is_path(repo: &gix::Repository, spec: &str) -> bool {
-    if std::path::Path::new(spec).exists() {
+pub(super) fn spec_is_path(repo: &gix::Repository, spec: &str) -> bool {
+    // `verify_filename()`'s own test, which is what decides the fallback in git:
+    //
+    // ```c
+    // if (looks_like_pathspec(arg) || check_filename(prefix, arg))
+    //         return;
+    // die_verify_filename(repo, prefix, arg, diagnose_misspelt_rev);
+    // ```
+    //
+    // (setup.c:289-291.) Two shapes an `exists()` test misses. `looks_like_pathspec()`
+    // (setup.c:232-260) accepts an unescaped glob special and the long-form `:(…)`
+    // magic whatever the working tree holds, so `:(exclude)sub` is a pathspec even
+    // though nothing of that name is on disk. `check_filename()` (setup.c:173-200)
+    // strips the short-form magic `:/`, `:!` and `:^` before it stats, so `:^sub`
+    // stats `sub` — and a bare `:/`, `:!` or `:^` is accepted outright, because
+    // "excluding everything is silly, but allowed". Without this every one of them
+    // fell through to `ambiguous argument`.
+    if crate::setup::looks_like_pathspec(spec) || crate::setup::check_filename(spec) {
         return true;
     }
     let needle = spec.strip_suffix('/').unwrap_or(spec);

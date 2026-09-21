@@ -1811,6 +1811,67 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     &mut seeds,
                     &mut pending,
                 ) {
+                    // `setup_revisions()`'s filename fallback, which `rev-list`
+                    // shares with `log` because both run the same function:
+                    //
+                    // ```c
+                    // if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+                    //         int j;
+                    //         if (seen_dashdash || *arg == '^')
+                    //                 die(_("bad revision '%s'"), arg);
+                    //
+                    //         /* If we didn't have a "--":
+                    //          * (1) all filenames must exist;
+                    //          * (2) all rev-args must not be interpretable
+                    //          *     as a valid filename.
+                    //          * but the latter we have checked in the main loop.
+                    //          */
+                    //         for (j = i; j < argc; j++)
+                    //                 verify_filename(revs->prefix, argv[j], j == i);
+                    //
+                    //         append_prune_data(&prune_data, argv + i);
+                    //         break;
+                    // }
+                    // ```
+                    //
+                    // (revision.c:3080-3097, v2.55.0.) The operand that failed and
+                    // every operand after it become prune data, and the scan stops.
+                    // This file only ever raised the `die()`, so `git rev-list HEAD
+                    // <path>` — the spelling t6001 and t6000 use throughout — was an
+                    // `ambiguous argument` fatal while `git log <path>` worked.
+                    //
+                    // A `^`-prefixed operand and a vector carrying `--` anywhere take
+                    // the short `bad revision` instead; a `--stdin` line is never
+                    // prune data at all, which is the same `cant_be_filename` gate
+                    // `seed_revision()` was handed above.
+                    //
+                    // The fallback belongs to `handle_revision_arg()` *returning*
+                    // non-zero, not to every way the operand can fail: the name that
+                    // resolved and is also a file (`verify_non_filename()`), the
+                    // well-formed hex the database does not have (`get_reference()`'s
+                    // `bad object`) and the merge-base failures all `die()` from
+                    // inside, below this branch. Those carry their own finished
+                    // stderr text, so the one error that means "did not resolve" is
+                    // the one `unresolvable_in()` would have produced for this
+                    // operand.
+                    if e == unresolvable_in(&repo, s, false)
+                        && origin[i] == Origin::Argv
+                        && !seen_dashdash
+                        && !s.starts_with('^')
+                        && super::log::spec_is_path(&repo, s)
+                    {
+                        // `j == i` picks the wording, and it is false for every
+                        // operand after the first: those fail with `no such path in
+                        // the working tree` rather than `ambiguous argument`.
+                        for tail in &argv[i + 1..] {
+                            if let Some(msg) = crate::setup::verify_filename(tail, false) {
+                                eprintln!("fatal: {msg}");
+                                return Ok(ExitCode::from(128));
+                            }
+                        }
+                        pathspecs.extend(argv[i..].iter().map(|p| p.as_bytes().to_vec()));
+                        break 'args;
+                    }
                     return Ok(fatal_text(&e));
                 }
                 note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;

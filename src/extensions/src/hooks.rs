@@ -3,9 +3,12 @@
 //! `pre-rebase`, `pre-merge-commit`, `post-commit`, `post-merge`, …).
 //!
 //! A hook is the executable file `<hooks-dir>/<event>` (`core.hooksPath` or
-//! `<git-dir>/hooks`). It runs in the worktree with `GIT_DIR` set, its stdout
-//! pointed at stderr (as git does), and — for hooks that receive one — a payload
-//! on stdin. A non-zero exit aborts the operation that invoked it.
+//! `<git-dir>/hooks`). It runs at the top of the work tree with `GIT_PREFIX`
+//! naming the directory the command was typed in, its stdout pointed at stderr
+//! (`hook.h:174`; `pre-push` alone keeps them apart, `transport.c:1411`), and —
+//! for hooks that receive one — a payload on stdin. A non-zero exit aborts the
+//! operation that invoked it. `GIT_DIR` is exported only when git itself would
+//! have exported it; see [`git_dir_env`].
 //!
 //! The commit hooks additionally get `GIT_INDEX_FILE` naming the index that
 //! commit is being built from (`commit.c:1994`), which is not always the
@@ -32,9 +35,11 @@ pub(crate) fn find(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf
     let Ok(meta) = std::fs::metadata(&path) else {
         return Ok(None);
     };
-    if meta.is_dir() {
-        return Ok(None);
-    }
+    // `find_hook()` asks `access(path, X_OK)` and nothing else (`hook.c:38`), so a
+    // *directory* named `hooks/<event>` passes the test — 0755 carries the execute
+    // bits — and is handed to `start_command()`, which then fails to exec it. git
+    // reports that failure rather than quietly behaving as though no hook existed,
+    // so this must not filter directories out.
     if meta.permissions().mode() & 0o111 != 0 {
         return Ok(Some(path));
     }
@@ -215,10 +220,14 @@ pub fn run_with_env(
     let Some(path) = find(repo, event)? else {
         return Ok(Outcome { invoked: false, ok: true });
     };
+    // The path git would name in a diagnostic about this hook — the one
+    // `find_hook()` handed `start_command()` as `argv[0]`, not the absolutized
+    // rewrite the spawn below needs.
+    let shown = paths(repo, event)?.1;
 
-    // Hooks run in the worktree (or the git dir for a bare repo) with GIT_DIR set,
-    // and git points their stdout at stderr so hook chatter never pollutes the
-    // command's own stdout.
+    // Hooks run in the worktree (or the git dir for a bare repo), and git points
+    // their stdout at stderr so hook chatter never pollutes the command's own
+    // stdout.
     //
     // Every path handed to the child is absolute first. git can afford relative
     // ones because `setup.c` has already `chdir`'d it to the top of the work tree,
@@ -235,13 +244,29 @@ pub fn run_with_env(
     // ```
     let workdir = absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir()));
     let program = absolutize(&path);
-    let git_dir = absolutize(repo.git_dir());
     let mut cmd = Command::new(&program);
     cmd.args(args)
         .current_dir(&workdir)
-        .env("GIT_DIR", &git_dir)
+        // `setup_git_directory()` ends by exporting the prefix for every child of
+        // this process — the work-tree-relative directory the command was typed
+        // in, with a trailing `/`, and the empty string at the top or in a bare
+        // repository (`setup.c:2069-2076`). Hooks are the visible consumers.
+        .env("GIT_PREFIX", {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(crate::setup::prefix_bytes(repo))
+        })
+        .envs(git_dir_env(repo, &workdir).map(|v| ("GIT_DIR", v)))
         .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
-        .stdout(Stdio::inherit())
+        // `RUN_HOOKS_OPT_INIT` sets `.stdout_to_stderr = 1` (`hook.h:171-176`), so
+        // a hook's own chatter can never land on the command's stdout; `pre-push`
+        // is the single caller that clears it, for backwards compatibility
+        // (`transport.c:1405-1411`).
+        .stdout(if event == "pre-push" {
+            Stdio::inherit()
+        } else {
+            use std::os::fd::AsFd;
+            Stdio::from(std::io::stderr().as_fd().try_clone_to_owned()?)
+        })
         .stderr(Stdio::inherit())
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -252,11 +277,45 @@ pub fn run_with_env(
     // `start_command()`'s `fflush(NULL)` (run-command.c:743) — a hook's output
     // must not overtake the buffered output of the command that ran it.
     crate::cstdio::before_spawn();
-    let mut child = cmd.spawn()?;
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            // The exec fails inside the forked child, whose errno comes back up
+            // the notify pipe as `fatal: cannot exec '<argv[0]>': <strerror>`
+            // (`run-command.c:403-405`, printed through the *die* routine
+            // `child_err_spew()` installs at `run-command.c:384`). `argv[0]` is
+            // the path `find_hook()` returned — git's spelling of it, not the
+            // absolute one zvcs has to hand `Command`. `notify_start_failure()`
+            // ORs 1 into the result (`hook.c:638-647`) and, unlike
+            // `notify_hook_finished()`, never sets `*invoked_hook`.
+            eprintln!("fatal: cannot exec '{shown}': {}", crate::external::strerror(&e));
+            return Ok(Outcome { invoked: false, ok: false });
+        }
+    };
     if let Some(data) = stdin {
         if let Some(mut sink) = child.stdin.take() {
             sink.write_all(data)?;
         }
     }
     Ok(Outcome { invoked: true, ok: child.wait()?.success() })
+}
+
+/// `GIT_DIR` as git leaves it for a hook, or `None` when git exports nothing.
+///
+/// `setup_discovered_git_dir()` calls `set_git_dir()` — the only thing that
+/// `setenv`s `GIT_DIR` (`setup.c:1070-1074`) — only when the discovered directory
+/// is *not* the default `.git` (`setup.c:1240-1241`), so the ordinary case leaves
+/// the variable unset and the hook rediscovers the repository from the work tree
+/// root it was started in. An explicit `--git-dir`/`GIT_DIR` takes
+/// `setup_explicit_git_dir()`, which always exports it, and a bare repository
+/// entered at its own root exports `.` (`setup.c:1284`).
+fn git_dir_env(repo: &gix::Repository, workdir: &Path) -> Option<std::ffi::OsString> {
+    if git_dir_as_git_spells_it(repo) == Path::new(".git") {
+        return None;
+    }
+    let git_dir = absolutize(repo.git_dir());
+    if repo.workdir().is_none() && git_dir == workdir {
+        return Some(".".into());
+    }
+    Some(git_dir.into_os_string())
 }

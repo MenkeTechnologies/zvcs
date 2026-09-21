@@ -2491,10 +2491,20 @@ fn spawn_hook(
 ) -> Option<bool> {
     let path = crate::hooks::find(repo, name).ok().flatten()?;
 
+    let workdir = repo.workdir().unwrap_or_else(|| repo.git_dir());
+    // `enter_repo()` has already `chdir`'d into the repository by the time
+    // receive-pack runs, and `setup_bare_git_dir()` then exports the git
+    // directory as `.` when that is where it is standing (`setup.c:1284`), not as
+    // an absolute path. A hook that hands `$GIT_DIR` to a child of its own after
+    // changing directory therefore sees what it would see under git.
+    let git_dir = match crate::hooks::absolutize(repo.git_dir()) {
+        abs if abs == crate::hooks::absolutize(workdir) => std::path::PathBuf::from("."),
+        abs => abs,
+    };
     let mut cmd = std::process::Command::new(&path);
     cmd.args(args)
-        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
-        .env("GIT_DIR", repo.git_dir())
+        .current_dir(workdir)
+        .env("GIT_DIR", &git_dir)
         .stdin(if stdin.is_some() {
             std::process::Stdio::piped()
         } else {

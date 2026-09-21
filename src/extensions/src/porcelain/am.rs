@@ -2847,16 +2847,19 @@ fn run_applypatch_msg_hook(
         return Ok(true);
     }
     let path = state_dir.join("final-commit");
-    if !crate::hooks::run(repo, "applypatch-msg", &[&path.display().to_string()], None)? {
+    // Both the hook's argument and the diagnostic below are `am_path(state,
+    // "final-commit")` (`builtin/am.c:495`, `:503`) — a `git_path()` string, which
+    // `strbuf_cleanup_path()` has stripped of its leading `./` (`path.c:52-57`).
+    // gitoxide hands back the git directory as `./.git` for a repository
+    // discovered at the current directory, so the raw join carries that prefix.
+    let shown = crate::setup::git_path_display(repo, &path);
+    if !crate::hooks::run(repo, "applypatch-msg", &[&shown], None)? {
         return Ok(false);
     }
     match std::fs::read(&path) {
         Ok(msg) => info.msg = msg,
         Err(_) => {
-            eprintln!(
-                "fatal: '{}' was deleted by the applypatch-msg hook",
-                path.display()
-            );
+            eprintln!("fatal: '{shown}' was deleted by the applypatch-msg hook");
             crate::hosted::exit(128);
         }
     }

@@ -64,6 +64,14 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
                 print!("{}", USAGE_MAIN);
                 return Ok(ExitCode::from(129));
             }
+            // `parse_options_step()` consumes a lone `--` before any table
+            // lookup (parse-options.c: `if (!arg[2]) { ... ctx->argc--;
+            // ctx->argv++; break; }`), so it ends option parsing and is never an
+            // unknown option.
+            "--" => {
+                idx += 1;
+                break;
+            }
             a if a.starts_with('-') => {
                 unknown_option(a);
                 return usage(USAGE_MAIN);
@@ -278,6 +286,9 @@ fn canonical<'a>(
     table: &'static [LongOpt],
     usage_text: &str,
 ) -> std::result::Result<std::borrow::Cow<'a, str>, ExitCode> {
+    if let Some(code) = super::long_takes_no_value(tok, table) {
+        return Err(code);
+    }
     match super::canonical_long(tok, table) {
         super::Long::Name(name) => Ok(name),
         super::Long::Ambiguous(first, second) => {
@@ -944,7 +955,7 @@ fn log_symref_update(
     let Some(new) = resolved_id(repo, name)? else {
         return Ok(());
     };
-    super::symbolic_ref::append_reflog(repo, full.as_ref(), previous, &new, message)
+    super::symbolic_ref::append_reflog(repo, full.as_ref().as_bstr(), previous, &new, message)
 }
 
 /// The object a ref resolves to, or `None` when it does not exist or does not peel.
@@ -1102,7 +1113,7 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         // carried-over history is what the line below appends to.
         move_reflog(repo, &old_text, &dst)?;
         if let Some(id) = logged {
-            super::symbolic_ref::append_reflog(repo, new_name.as_ref(), Some(id), &id, &message)?;
+            super::symbolic_ref::append_reflog(repo, new_name.as_ref().as_bstr(), Some(id), &id, &message)?;
         }
         delete_ref(repo, old_name)?;
     }

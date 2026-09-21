@@ -269,11 +269,22 @@ fn lock_with_mode<T>(
     })
 }
 
+/// git builds the lock path by plain concatenation — `strbuf_addstr(&filename,
+/// LOCK_SUFFIX)` in `lock_file()` (lockfile.c:107) — so this does too.
+///
+/// `Path::with_extension()` is not that. It re-splits the file name at its last
+/// dot, and Rust's split has special cases for names made only of dots: for
+/// `refs/heads/..bad` it reports the stem as `.` and the extension as `bad`, and
+/// setting a new extension then yields `refs/heads/..` — the *parent directory*,
+/// which the caller went on to try to create a lock file at, failing with
+/// `EEXIST` and reporting a ref that was merely oddly named as permanently
+/// locked. `git symbolic-ref refs/heads/..bad refs/heads/main` (which stock
+/// accepts: only the target is format-checked, builtin/symbolic-ref.c:89) was
+/// refused here for that reason.
 fn add_lock_suffix(resource_path: &Path) -> PathBuf {
-    resource_path.with_extension(resource_path.extension().map_or_else(
-        || DOT_LOCK_SUFFIX.chars().skip(1).collect(),
-        |ext| format!("{}{}", ext.to_string_lossy(), DOT_LOCK_SUFFIX),
-    ))
+    let mut buf = resource_path.as_os_str().to_os_string();
+    buf.push(DOT_LOCK_SUFFIX);
+    buf.into()
 }
 
 fn default_permissions() -> Option<std::fs::Permissions> {

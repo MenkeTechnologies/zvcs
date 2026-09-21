@@ -273,7 +273,17 @@ fn set_symref(
         return Ok(ExitCode::from(1));
     }
 
-    let name_full = full_name(name)?;
+    // `cmd_symbolic_ref()` format-checks the *target* and nothing else
+    // (builtin/symbolic-ref.c:89-90); the name it hands to `refs_update_symref()`
+    // only has to clear `refname_is_safe()` above. So stock writes
+    // `refs/heads/bad name`, `refs/heads/bad~1` and the rest happily — exit 0,
+    // `ref: <target>` on disk, a reflog line — even though nothing can read them
+    // back afterwards (`refs_resolve_ref_unsafe()` refuses the name, so its own
+    // `-d` answers `No such ref`). `FullName` cannot spell any of them, so the
+    // write goes straight to the loose ref file, like an unspellable target does.
+    let Ok(name_full) = FullName::try_from(name) else {
+        return set_symref_raw(repo, BStr::new(name), target, message, prefer_symlink);
+    };
     // `check_refname_format(argv[1], REFNAME_ALLOW_ONELEVEL)` (builtin/symbolic-ref.c:120)
     // is git's only constraint on the target, and the `name_partial` check above
     // is its port — so a slash-free lower-case target such as a stray 64-hex
@@ -282,7 +292,7 @@ fn set_symref(
     // case, like `HEAD`), so a target gitoxide cannot spell is written straight
     // into the loose ref file instead of through the transaction.
     let Ok(target_full) = FullName::try_from(target) else {
-        return set_symref_raw(repo, name_full.as_ref(), target, message, prefer_symlink);
+        return set_symref_raw(repo, name_full.as_ref().as_bstr(), target, message, prefer_symlink);
     };
 
     // Capture the pre-edit resolution so the reflog line carries the same
@@ -308,7 +318,7 @@ fn set_symref(
     })?;
 
     if prefer_symlink {
-        write_ref_symlink(repo, name_full.as_ref(), target);
+        write_ref_symlink(repo, name_full.as_ref().as_bstr(), target);
     }
 
     // gitoxide deliberately writes no reflog for symbolic-target updates, so the
@@ -316,7 +326,7 @@ fn set_symref(
     if let Some(new) = new {
         append_reflog(
             repo,
-            name_full.as_ref(),
+            name_full.as_ref().as_bstr(),
             previous,
             &new,
             message.unwrap_or_default(),
@@ -376,7 +386,7 @@ fn log_head_split(
 ) -> Result<()> {
     let head = full_name("HEAD")?;
     let null = repo.object_hash().null();
-    append_reflog(repo, head.as_ref(), previous, &null, message.unwrap_or_default())
+    append_reflog(repo, head.as_ref().as_bstr(), previous, &null, message.unwrap_or_default())
 }
 
 /// `create_symref_locked()` for a target the reference transaction cannot carry.
@@ -395,17 +405,23 @@ fn log_head_split(
 /// path is reached for does not.
 fn set_symref_raw(
     repo: &gix::Repository,
-    name: &FullNameRef,
+    name: &BStr,
     target: &str,
     message: Option<&str>,
     prefer_symlink: bool,
 ) -> Result<ExitCode> {
-    let previous = leaf_object_id(repo, name.as_bstr())?;
-    let via_head = head_refers_to(repo, name)?;
+    let previous = leaf_object_id(repo, name)?;
+    let spelled = FullName::try_from(name).ok();
+    let via_head = match &spelled {
+        Some(full) => head_refers_to(repo, full.as_ref())?,
+        // `HEAD` can only be split onto a name the store can resolve, and a name
+        // gitoxide cannot spell is not one.
+        None => false,
+    };
 
     // `files_ref_path()`: `HEAD` and the other per-worktree names live in the
     // worktree's git dir, `refs/…` in the common one.
-    let base = match name.category() {
+    let base = match spelled.as_ref().and_then(|full| full.as_ref().category()) {
         Some(
             Category::PseudoRef
             | Category::Bisect
@@ -414,7 +430,7 @@ fn set_symref_raw(
         ) => repo.git_dir(),
         _ => repo.common_dir(),
     };
-    let path = base.join(gix::path::from_bstr(name.as_bstr()));
+    let path = base.join(gix::path::from_bstr(name));
     let mut lock = gix::lock::File::acquire_to_update_resource(
         &path,
         gix::lock::acquire::Fail::Immediately,
@@ -477,10 +493,10 @@ hint: Git will then use the textual symref format instead.";
 /// Reading such a reference back is handled in the vendored `gix-ref`
 /// (`store/file/find.rs`'s `symlink_ref_contents`), so a repository written this
 /// way — by this port or by stock git — resolves identically either side.
-fn write_ref_symlink(repo: &gix::Repository, name: &FullNameRef, target: &str) {
+fn write_ref_symlink(repo: &gix::Repository, name: &BStr, target: &str) {
     // `HEAD` lives in the per-worktree git dir, `refs/…` in the common dir; take
     // whichever one the transaction just wrote to.
-    let relative = gix::path::from_byte_slice(name.as_bstr());
+    let relative = gix::path::from_byte_slice(name);
     let candidates = [repo.git_dir().join(relative), repo.common_dir().join(relative)];
     let Some(ref_path) = candidates.into_iter().find(|p| p.symlink_metadata().is_ok()) else {
         eprintln!("{SYMLINK_REFS_DEPRECATION}");
@@ -774,9 +790,13 @@ fn find_exact(repo: &gix::Repository, name: &BStr) -> Result<Option<gix::refs::R
 /// Shared with `remote rename`, which has to write the line itself: git renames the ref in
 /// place and logs `<id> <id> … remote: renamed …`, while gitoxide can only create the ref
 /// anew and would open the line with the null id.
+/// `name` is the literal ref name rather than a [`FullNameRef`] because
+/// `symbolic-ref` logs names gitoxide cannot spell: stock validates only the
+/// *target* (builtin/symbolic-ref.c:89), so `refs/heads/bad name` is a symref it
+/// writes, and logs, like any other.
 pub(super) fn append_reflog(
     repo: &gix::Repository,
-    name: &FullNameRef,
+    name: &BStr,
     previous: Option<ObjectId>,
     new: &ObjectId,
     message: &str,
@@ -793,17 +813,20 @@ pub(super) fn append_reflog(
         WriteReflog::Normal => auto_creates_reflog(name),
     };
 
-    let base = match name.category() {
+    // A name gitoxide cannot spell has no category; every such name got past
+    // `refname_is_safe()`, so it is a `refs/…` name and belongs to the common dir.
+    let spelled = FullName::try_from(name).ok();
+    let base = match spelled.as_ref().and_then(|full| full.as_ref().category()) {
         Some(Category::PseudoRef | Category::Bisect | Category::Rewritten | Category::WorktreePrivate) => {
             repo.git_dir()
         }
         Some(Category::MainPseudoRef | Category::MainRef)
         | Some(Category::LinkedPseudoRef { .. } | Category::LinkedRef { .. }) => {
-            bail!("reflogs for worktree-qualified ref {:?} are not supported", name.as_bstr())
+            bail!("reflogs for worktree-qualified ref {name:?} are not supported")
         }
         _ => repo.common_dir(),
     };
-    let path = base.join("logs").join(gix::path::from_bstr(name.as_bstr()));
+    let path = base.join("logs").join(gix::path::from_bstr(name));
 
     let mut options = std::fs::OpenOptions::new();
     options.append(true).read(false);
@@ -840,8 +863,7 @@ pub(super) fn append_reflog(
 /// note ref hierarchies — `should_autocreate_reflog()`'s `LOG_REFS_NORMAL` arm
 /// (refs.c:1062). `refs/worktree/` is not in it, so a worktree-private ref never
 /// gets a log created for it.
-fn auto_creates_reflog(name: &FullNameRef) -> bool {
-    let name = name.as_bstr();
+fn auto_creates_reflog(name: &BStr) -> bool {
     name == BStr::new("HEAD")
         || name.starts_with(b"refs/heads/")
         || name.starts_with(b"refs/remotes/")

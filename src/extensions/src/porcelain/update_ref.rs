@@ -256,6 +256,20 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // `refs_update_ref()` runs the same transaction the `--stdin` form does, so
+    // the availability check that `files_transaction_prepare()` performs
+    // (refs/files-backend.c:3024-3029) applies here too — and it names the
+    // reference standing in the way. gitoxide reaches the file system instead and
+    // reports whatever `open(2)` said, so `update-ref refs/heads/b/sub <oid>` over
+    // an existing `refs/heads/b` came back as `File exists (os error 17)` and, for
+    // the other direction, as a reflog that `Is a directory`.
+    if let Some(reason) =
+        transaction_conflicts(&repo, std::slice::from_ref(&edit))?.into_iter().flatten().next()
+    {
+        eprintln!("fatal: update_ref failed for ref '{name}': {reason}");
+        return Ok(ExitCode::from(128));
+    }
+
     match repo.edit_reference(edit) {
         Ok(_) => Ok(ExitCode::SUCCESS),
         Err(e) => {
@@ -535,8 +549,23 @@ fn parse_slot(
     if spec.is_empty() {
         return Ok(if empty_is_missing { Val::Missing } else { Val::Zero });
     }
+    resolve_slot(repo, spec).ok_or_else(|| match slot {
+        Slot::New => anyhow!("{spec}: not a valid SHA1"),
+        Slot::Old => anyhow!("{spec}: not a valid old SHA1"),
+    })
+}
+
+/// One `repo_get_oid_with_flags(…, GET_OID_SKIP_AMBIGUITY_CHECK)` over a
+/// non-empty value slot: the value it names, or `None` when it names nothing.
+///
+/// Split out of [`parse_slot`] because the two callers word the failure
+/// differently — the command line says `<spec>: not a valid SHA1`
+/// (builtin/update-ref.c:875, :887) while `--stdin` says `<cmd> <ref>: invalid
+/// <new-oid>: <spec>` (builtin/update-ref.c:233-237) — while resolving
+/// identically.
+fn resolve_slot(repo: &gix::Repository, spec: &str) -> Option<Val> {
     if spec.len() == repo.object_hash().len_in_hex() && spec.bytes().all(|b| b == b'0') {
-        return Ok(Val::Zero);
+        return Some(Val::Zero);
     }
     // git's `get_oid_hex` fast path: a full-length hex string is taken verbatim.
     //
@@ -550,7 +579,7 @@ fn parse_slot(
     // (`gix-odb/src/store_impls/loose/find.rs:34`) rather than reporting.
     if spec.len() == repo.object_hash().len_in_hex() {
         if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
-            return Ok(Val::Oid(id));
+            return Some(Val::Oid(id));
         }
     }
     // One `repo_get_oid_with_flags()` per slot, so one trip through
@@ -582,12 +611,8 @@ fn parse_slot(
         spec.len() <= repo.object_hash().len_in_hex()
             || !spec.bytes().all(|b| b.is_ascii_hexdigit())
             || !id.to_hex().to_string().eq_ignore_ascii_case(spec)
-    })
-    .ok_or_else(|| match slot {
-        Slot::New => anyhow!("{spec}: not a valid SHA1"),
-        Slot::Old => anyhow!("{spec}: not a valid old SHA1"),
     })?;
-    Ok(Val::Oid(id))
+    Some(Val::Oid(id))
 }
 
 /// Restate a gitoxide ref-transaction failure in git's `lock_ref_oid_basic`
@@ -610,7 +635,15 @@ fn lock_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String
         P::MustNotExist { full_name, .. } => {
             format!("cannot lock ref '{full_name}': reference already exists")
         }
-        P::MustExist { full_name, .. } => format!(
+        // Both spellings of "it had to be there and it was not": gitoxide splits
+        // the deletion out, git does not. `lock_raw_ref()` raises one message for
+        // either, from the `mustexist` arms that answer `ENOENT` and `EISDIR`
+        // (refs/files-backend.c:840-844, :873-878), and the caller wraps it
+        // (:2671). So `update-ref -d refs/heads/gone <oid>` is
+        // `error: cannot lock ref 'refs/heads/gone': unable to resolve reference
+        // 'refs/heads/gone'`, not gitoxide's "did not exist or could not be
+        // parsed".
+        P::MustExist { full_name, .. } | P::DeleteReferenceMustExist { full_name } => format!(
             "cannot lock ref '{full_name}': unable to resolve reference '{full_name}'"
         ),
         // A deletion is the only thing `update-ref` does that git locks `packed-refs` for
@@ -621,8 +654,40 @@ fn lock_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String
         P::PackedTransactionAcquire(err) => {
             gix::lock::pid::unable_to_lock_message(&repo.refs.packed_refs_path(), &packed_lock_errno(err))
         }
+        // `lock_raw_ref()` reports a loose ref it could not lock through the same
+        // `unable_to_lock_message()` (refs/files-backend.c:807), wrapped by its
+        // caller in `cannot lock ref '<ref>': ` (:2671). The path it names is the
+        // *absolute* one of the reference file — `absolute_path(path)` in
+        // `unable_to_lock_message()` (lockfile.c:253) — and the `.lock` suffix and
+        // the holder paragraph come from there too, so a stale `refs/heads/x.lock`
+        // reads as git's two-paragraph diagnostic rather than as gitoxide's
+        // attempt count.
+        P::LockAcquire { source, full_name } => {
+            let path = ref_file_path(repo, &full_name.to_string());
+            format!(
+                "cannot lock ref '{full_name}': {}",
+                gix::lock::pid::unable_to_lock_message(&path, &packed_lock_errno(source))
+            )
+        }
         _ => chain(e),
     }
+}
+
+/// `files_ref_path()`: where the loose file for `name` lives — the worktree's git
+/// dir for the per-worktree names, the common dir for everything else.
+fn ref_file_path(repo: &gix::Repository, name: &str) -> std::path::PathBuf {
+    use gix::refs::Category;
+    let spelled = FullName::try_from(name).ok();
+    let base = match spelled.as_ref().and_then(|n| n.as_ref().category()) {
+        Some(
+            Category::PseudoRef
+            | Category::Bisect
+            | Category::Rewritten
+            | Category::WorktreePrivate,
+        ) => repo.git_dir(),
+        _ => repo.common_dir(),
+    };
+    base.join(name)
 }
 
 /// The `errno` behind a lock-acquisition failure, for [`gix::lock::pid::unable_to_lock_message`].
@@ -661,29 +726,6 @@ fn check_new_object(repo: &gix::Repository, name: &str, new: &Val) -> Result<()>
         if !repo.has_object(*id) {
             crate::git_fatal!("trying to write ref '{name}' with nonexistent object {id}");
         }
-    }
-    Ok(())
-}
-
-/// `parse_refname()` (builtin/update-ref.c:53-75, git 2.39.0-rc2; the same
-/// function in 2.55.0, measured): every `--stdin` command validates the name the
-/// moment it reads it, before a single `<new-oid>`/`<old-oid>` is parsed.
-///
-/// ```c
-/// if (check_refname_format(ref.buf, REFNAME_ALLOW_ONELEVEL))
-///         die("invalid ref format: %s", ref.buf);
-/// ```
-///
-/// That ordering is visible: `update ../bad notahash` reports the ref name, not
-/// the unparseable oid. A `symref-*` target is read through the same function, so
-/// both halves of a `symref-create` answer to it.
-///
-/// This is git's own check, not gitoxide's stricter `FullName` one — the two
-/// disagree about one-level names, and [`refname`] below still reports what
-/// `FullName` refused for the names git would have taken.
-fn parse_refname(name: &str) -> Result<()> {
-    if !super::check_ref_format::check_refname_format_onelevel(name.as_bytes()) {
-        crate::git_fatal!("invalid ref format: {name}");
     }
     Ok(())
 }
@@ -777,19 +819,63 @@ struct Batch {
     /// paired with the update's deref flag: `split_symref_update()` moves the
     /// requirement onto the referent, while the diagnostic keeps naming the ref
     /// the command asked for (refs/files-backend.c:2502-2551, v2.55.0).
-    absent: Vec<(String, bool)>,
+    absent: Vec<Absent>,
     /// The reflog lines a `symref-create`/`symref-update` owes, paired with the
     /// index of the edit in `edits` that has to succeed first. gitoxide writes no
     /// reflog for a symbolic-target update at all (its transaction has no oid to
     /// log), so [`SymrefLog`] carries what git's `parse_and_write_reflog()` would
     /// have written and [`apply`] appends it once the edit has landed.
     symref_logs: Vec<(usize, SymrefLog)>,
+    /// Indices in `edits` staged by a `verify`/`symref-verify`.
+    ///
+    /// `ref_transaction_verify()` passes `NULL` for both `new_oid` and
+    /// `new_target` (refs.c), so a `rejected` line for one prints `(null)` in the
+    /// `<new-oid>` column — `new_oid ? oid_to_hex(new_oid) : new_target`
+    /// (builtin/update-ref.c:261). Here a `verify` is spelled as an update to the
+    /// value the reference already has, which would otherwise print that value.
+    verify_edits: std::collections::BTreeSet<usize>,
 }
 
 impl Batch {
     fn is_empty(&self) -> bool {
         self.edits.is_empty() && self.absent.is_empty()
     }
+
+    /// Stage one edit that a `verify` asked for.
+    fn stage_verify(&mut self, edit: RefEdit) {
+        self.verify_edits.insert(self.edits.len());
+        self.edits.push(edit);
+    }
+
+    /// Stage one "must not exist" precondition at the batch's current position.
+    fn require_absent(&mut self, name: &str, deref: bool, new: Option<ObjectId>) {
+        self.absent.push(Absent {
+            name: name.to_string(),
+            deref,
+            new,
+            at: self.edits.len(),
+            guards_edit: new.is_some(),
+        });
+    }
+}
+
+/// One "this reference must not exist" precondition.
+struct Absent {
+    name: String,
+    deref: bool,
+    /// What a `rejected` line prints in the `<new-oid>` column. A `create`
+    /// carries the object it would have written; a `verify` carries no new value
+    /// at all, and git's `new_oid ? oid_to_hex(new_oid) : new_target`
+    /// (builtin/update-ref.c:261) hands `printf` a null pointer, which renders
+    /// `(null)`.
+    new: Option<ObjectId>,
+    /// Where the command sat in the batch: the index its own edit took, or would
+    /// have taken. Rejections are emitted at that position so `--batch-updates`
+    /// reports them in command order, as git's per-update commit does.
+    at: usize,
+    /// Whether the edit at `at` belongs to this precondition and has to be
+    /// dropped with it. A `verify` stages no edit of its own.
+    guards_edit: bool,
 }
 
 /// The reflog lines one `symref-create`/`symref-update` leaves behind.
@@ -902,13 +988,13 @@ fn write_symref_log(repo: &gix::Repository, plan: &SymrefLog) -> Result<()> {
     let new = super::symbolic_ref::leaf_object_id(repo, plan.target.as_bstr())?;
     if let Some(new) = new {
         for (name, old) in &plan.chain {
-            super::symbolic_ref::append_reflog(repo, name.as_ref(), *old, &new, &plan.message)?;
+            super::symbolic_ref::append_reflog(repo, name.as_ref().as_bstr(), *old, &new, &plan.message)?;
         }
     }
     if let Some(old) = plan.head_mirror {
         let zero = ObjectId::null(repo.object_hash());
         let head = refname("HEAD")?;
-        super::symbolic_ref::append_reflog(repo, head.as_ref(), old, &zero, &plan.message)?;
+        super::symbolic_ref::append_reflog(repo, head.as_ref().as_bstr(), old, &zero, &plan.message)?;
     }
     Ok(())
 }
@@ -953,22 +1039,30 @@ fn categorize(cmd: &str) -> Option<Cat> {
 }
 
 /// `builtin/update-ref.c:679-693`'s `command[]`, reduced to what the dispatch
-/// loop reads off it: the prefix, and whether the entry declares arguments.
-const COMMANDS: &[(&str, bool)] = &[
-    ("update", true),
-    ("create", true),
-    ("delete", true),
-    ("verify", true),
-    ("symref-update", true),
-    ("symref-create", true),
-    ("symref-delete", true),
-    ("symref-verify", true),
-    ("option", true),
-    ("start", false),
-    ("prepare", false),
-    ("abort", false),
-    ("commit", false),
+/// loop reads off it: the prefix and the entry's `args` count. The count is both
+/// the "is it followed by SP or by the terminator" test and, under `-z`, the
+/// number of extra whole-lines the loop pulls in for the command
+/// (builtin/update-ref.c:747-749).
+const COMMANDS: &[(&str, usize)] = &[
+    ("update", 3),
+    ("create", 2),
+    ("delete", 2),
+    ("verify", 2),
+    ("symref-update", 4),
+    ("symref-create", 2),
+    ("symref-delete", 2),
+    ("symref-verify", 2),
+    ("option", 1),
+    ("start", 0),
+    ("prepare", 0),
+    ("abort", 0),
+    ("commit", 0),
 ];
+
+/// The `args` count `builtin/update-ref.c:747` counts its extra reads against.
+fn command_args(cmd: &str) -> usize {
+    COMMANDS.iter().find(|(p, _)| *p == cmd).map_or(0, |&(_, args)| args)
+}
 
 /// `builtin/update-ref.c:720-738` — pick the command out of one whole input line.
 ///
@@ -1002,9 +1096,9 @@ const COMMANDS: &[(&str, bool)] = &[
 /// `line` carries its terminator, so the `-z` case where that NUL *is* the
 /// terminator falls out of the same test.
 fn match_command(line: &str, terminator: char) -> Option<&'static str> {
-    COMMANDS.iter().find_map(|&(prefix, takes_args)| {
+    COMMANDS.iter().find_map(|&(prefix, args)| {
         let rest = line.strip_prefix(prefix)?;
-        let want = if takes_args { ' ' } else { terminator };
+        let want = if args != 0 { ' ' } else { terminator };
         rest.starts_with(want).then_some(prefix)
     })
 }
@@ -1131,11 +1225,15 @@ fn availability_conflict(
         if existing.contains(prefix) {
             return Some(format!("'{prefix}' exists; cannot create '{name}'"));
         }
-        if extras.contains(prefix) {
-            return Some(format!(
-                "cannot process '{name}' and '{prefix}' at the same time"
-            ));
-        }
+        // No `extras` test here on purpose. A name the transaction is creating
+        // does not exist yet, so it never stands in the way as a *file*: git
+        // reaches this pair from the other end, checking the shorter name against
+        // the longer one — either at :3024, where `refnames_to_check` holds both
+        // and the shorter comes first, or from `lock_raw_ref()`, when the longer
+        // one's lock already made the directory. Testing it here as well reported
+        // the same collision twice and with the operands the wrong way round:
+        // stock's `cannot process 'refs/heads/z' and 'refs/heads/z/r'` came back
+        // as `cannot process 'refs/heads/z/r' and 'refs/heads/z'`.
         end += 1;
     }
     // The leaf: `refname` itself never conflicts with `refname`, but anything in
@@ -1191,6 +1289,60 @@ fn deref_chain(repo: &gix::Repository, name: &str, deref: bool) -> String {
 /// `refs_verify_refnames_available()` over a whole transaction: the conflict, if
 /// any, that each edit's written name runs into. `None` for an edit git does not
 /// check (see [`written_refname`]).
+/// Whether the name conflict `refs_verify_refname_available()` found is the one
+/// `lock_raw_ref()` runs into while taking the lock, rather than the one
+/// `files_transaction_prepare()` defers.
+///
+/// The two are worded differently: only the first is wrapped in
+/// `cannot lock ref '<ref>': ` by its caller,
+///
+/// ```c
+/// ret = lock_raw_ref(refs, transaction, update_idx, mustexist,
+///                    refnames_to_check, &lock, &referent, err);
+/// if (ret) {
+///         char *reason;
+///
+///         reason = strbuf_detach(err, NULL);
+///         strbuf_addf(err, "cannot lock ref '%s': %s",
+///                     ref_update_original_update_refname(update), reason);
+/// ```
+///
+/// (refs/files-backend.c:2665-2674). `lock_raw_ref()` reaches its own
+/// availability check in exactly two cases: `safe_create_leading_directories()`
+/// answered `SCLD_EXISTS` because a *file* sits where a leading directory has to
+/// go (:743-753), and the reference read back `EISDIR` over a directory that
+/// would not come away empty (:864-884). Both are on-disk states. A conflict that
+/// exists only in `packed-refs`, or only among the transaction's own names, leaves
+/// the lock unobstructed and is reported bare from :3024 instead — which is why
+/// `update-ref refs/heads/b1/sub <oid>` is `cannot lock ref …` while the same
+/// command after `pack-refs --all` is not.
+fn loose_collision(repo: &gix::Repository, name: &str) -> bool {
+    let bases = [repo.git_dir(), repo.common_dir()];
+    // A loose reference file standing where one of `name`'s leading directories
+    // has to go.
+    let mut end = 0;
+    while let Some(slash) = name[end..].find('/') {
+        end += slash;
+        if bases.iter().any(|base| base.join(&name[..end]).is_file()) {
+            return true;
+        }
+        end += 1;
+    }
+    // A directory in the way that `remove_dir_recursively(REMOVE_DIR_EMPTY_ONLY)`
+    // would refuse to take away.
+    bases
+        .iter()
+        .any(|base| std::fs::read_dir(base.join(name)).is_ok_and(|mut dir| dir.next().is_some()))
+}
+
+/// One availability failure, worded as the backend that found it words it.
+fn conflict_error(repo: &gix::Repository, name: &str, reason: &str) -> String {
+    match loose_collision(repo, name) {
+        true => format!("cannot lock ref '{name}': {reason}"),
+        false => reason.to_string(),
+    }
+}
+
 fn transaction_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Result<Vec<Option<String>>> {
     let existing = existing_refnames(repo)?;
     let names: Vec<String> = edits.iter().map(|e| written_refname(repo, e)).collect();
@@ -1200,12 +1352,27 @@ fn transaction_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Result<Ve
     Ok(names
         .iter()
         .zip(edits)
-        .map(|(name, edit)| {
+        .enumerate()
+        .map(|(index, (name, edit))| {
             let creating =
                 matches!(edit.change, Change::Update { .. }) && !existing.contains(name);
             creating
                 .then(|| availability_conflict(&existing, &extras, name))
                 .flatten()
+                .map(|reason| {
+                    // git takes the locks in the order the commands arrived, so a
+                    // name created *under* `name` earlier in the batch has already
+                    // put a directory in the way by the time `name` is locked: that
+                    // conflict comes out of `lock_raw_ref()` and is wrapped, where
+                    // one whose sibling comes later is only caught by the deferred
+                    // check at refs/files-backend.c:3024 and is reported bare.
+                    let under = format!("{name}/");
+                    let blocked = names[..index].iter().any(|other| other.starts_with(&under));
+                    match blocked {
+                        true => format!("cannot lock ref '{name}': {reason}"),
+                        false => conflict_error(repo, name, &reason),
+                    }
+                })
         })
         .collect())
 }
@@ -1215,19 +1382,27 @@ fn transaction_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Result<Ve
 /// the update finally writes — the referent when the named ref is a symref the
 /// update derefs through — while the failure still names the ref the command
 /// asked for (`cannot lock ref '<refname>'`, refs/files-backend.c:2666-2690).
-fn check_absent(repo: &gix::Repository, absent: &[(String, bool)]) -> Result<()> {
-    for (name, deref) in absent {
-        let target = deref_chain(repo, name, *deref);
-        if repo.try_find_reference(target.as_str())?.is_some() {
-            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
+fn check_absent(repo: &gix::Repository, absent: &[Absent]) -> Result<()> {
+    for entry in absent {
+        if absent_violated(repo, entry)? {
+            crate::git_fatal!(
+                "cannot lock ref '{}': reference already exists",
+                entry.name
+            );
         }
     }
     Ok(())
 }
 
+/// Whether one [`Absent`] precondition is broken right now.
+fn absent_violated(repo: &gix::Repository, entry: &Absent) -> Result<bool> {
+    let target = deref_chain(repo, &entry.name, entry.deref);
+    Ok(repo.try_find_reference(target.as_str())?.is_some())
+}
+
 fn validate_prepare(repo: &gix::Repository, batch: &Batch) -> Result<()> {
-    for (name, _) in &batch.absent {
-        refname(name)?;
+    for entry in &batch.absent {
+        refname(&entry.name)?;
     }
     if batch.edits.is_empty() && batch.absent.is_empty() {
         return Ok(());
@@ -1289,7 +1464,7 @@ fn run_stdin(
     // itself.
     let terminator = if nul { '\0' } else { '\n' };
 
-    while let Some((raw, staged)) = next_record(&mut reader, nul)? {
+    while let Some((raw, record)) = next_record(&mut reader, nul)? {
         // `builtin/update-ref.c:715-718`, both checked on the raw line and both
         // ahead of the command table:
         //
@@ -1312,20 +1487,14 @@ fn run_stdin(
         };
         let cat = categorize(cmd).expect("the command table and the classifier list the same names");
 
-        // `parse_cmd_*` reads its arguments off the same line. Splitting it here
-        // rather than up front keeps a malformed *later* line from pre-empting
-        // the output of the commands ahead of it, which is what git's
-        // line-at-a-time loop gives.
-        let fields = match staged {
-            Some(fields) => fields,
-            None => tokenize(raw.strip_suffix(terminator).unwrap_or(&raw))?,
-        };
-        let args = &fields[1..];
-        // Whether `*next` will land on `line_termination` once the arguments are
-        // read, which is what every `parse_cmd_*` asserts before it stages
-        // anything. `-z` records come out of [`next_record`] with their NUL
-        // restored, so only the line form can ever be short one.
-        let terminated = raw.ends_with(terminator);
+        // `cmd->fn(transaction, input.buf + strlen(cmd->prefix) + !!cmd->args,
+        // input.buf + input.len, &opts)` (builtin/update-ref.c:782-783): the
+        // command's parser starts just past the prefix and its separating space,
+        // and reads its arguments off the record itself. Parsing here rather than
+        // up front keeps a malformed *later* line from pre-empting the output of
+        // the commands ahead of it, which is what git's line-at-a-time loop gives.
+        let takes_args = command_args(cmd) != 0;
+        let mut cur = Cursor::new(&record, cmd.len() + usize::from(takes_args), nul);
 
         // State guard, matching git's per-state restrictions. Each violation is a
         // fatal error exiting 128.
@@ -1375,30 +1544,39 @@ fn run_stdin(
                 state = TxnState::Closed;
             }
             "option" => {
-                let [opt] = args else {
-                    return fatal(anyhow!("option takes exactly one argument"));
-                };
-                if opt != "no-deref" {
-                    return fatal(anyhow!("unknown option: {opt}"));
-                }
-                // `parse_cmd_option()` (builtin/update-ref.c:601) accepts the option
-                // only when the terminator follows it:
+                // `parse_cmd_option()` (builtin/update-ref.c:601-610) accepts the
+                // option only when the terminator follows it, and otherwise
+                // reports the raw remainder:
                 //
                 //     if (skip_prefix(next, "no-deref", &rest) && *rest == line_termination)
                 //             update_flags |= REF_NO_DEREF;
                 //     else
                 //             die("option unknown: %s", next);
                 //
-                // so a last line the stream never terminated is an unknown option
-                // rather than a `no-deref` that takes effect.
-                if !terminated {
-                    return fatal(anyhow!("option unknown: {opt}"));
+                // so `option no-deref extra`, `option  no-deref` and a last line
+                // the stream never terminated are all unknown options naming what
+                // followed `option `, not a `no-deref` that takes effect.
+                let accepted = cur
+                    .buf
+                    .get(cur.pos..)
+                    .and_then(|rest| rest.strip_prefix("no-deref"))
+                    .is_some_and(|rest| rest.as_bytes().first().copied().unwrap_or(0) == cur.term);
+                if !accepted {
+                    return fatal(anyhow!("option unknown: {}", cur.rest()));
                 }
                 next_no_deref = true;
                 consumed_option = true;
             }
             "update" | "create" | "delete" | "verify" => {
-                match stage_oid_command(repo, &mut batch, cmd, args, nul, edit_deref, create_reflog, msg) {
+                match stage_oid_command(
+                    repo,
+                    &mut batch,
+                    cmd,
+                    &mut cur,
+                    edit_deref,
+                    create_reflog,
+                    msg,
+                ) {
                     Ok(()) => {}
                     Err(e) => return fatal(e),
                 }
@@ -1408,8 +1586,7 @@ fn run_stdin(
                     repo,
                     &mut batch,
                     cmd,
-                    args,
-                    nul,
+                    &mut cur,
                     edit_deref,
                     create_reflog,
                     msg,
@@ -1419,27 +1596,6 @@ fn run_stdin(
                 }
             }
             _ => unreachable!("categorize accepts exactly this command set"),
-        }
-
-        // Every `parse_cmd_*` that takes arguments closes with
-        //
-        //     if (*next != line_termination)
-        //             die("<cmd> %s: extra input: %s", refname, next);
-        //
-        // (builtin/update-ref.c:325, 382, 421, 452, 488, 518, 546, 581). A final
-        // line the stream never terminated leaves `*next` on the string's own NUL
-        // rather than on the newline, so the batch is refused and the remainder
-        // interpolated is empty: `create refs/heads/g HEAD` without its `\n` is
-        // `fatal: create refs/heads/g: extra input: `. Staging first and refusing
-        // here is the same observable order git has, because the batch only
-        // reaches the ref store at `commit` or at end of input, and because the
-        // value errors `parse_next_oid()` raises come before this check in the C
-        // too. The argless verbs never arrive: the command table demands the
-        // terminator right after their prefix, so [`match_command`] has already
-        // called an unterminated `start` an unknown command.
-        if !terminated && cmd != "option" {
-            let refname = args.first().map(String::as_str).unwrap_or_default();
-            return fatal(anyhow!("{cmd} {refname}: extra input: "));
         }
 
         if !consumed_option {
@@ -1463,20 +1619,20 @@ fn run_stdin(
 /// transaction. With it, each edit is applied on its own so that a rejection
 /// leaves the rest of the batch in place, which is the whole point of the flag.
 fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()> {
-    for (name, _) in &batch.absent {
-        refname(name)?; // reject malformed names the same way an edit would
+    for entry in &batch.absent {
+        refname(&entry.name)?; // reject malformed names the same way an edit would
     }
     if batch.is_empty() {
         return Ok(());
     }
     reftable_transaction_refused(repo)?;
-    check_absent(repo, &batch.absent)?;
     // `refs_verify_refnames_available()` runs over the whole transaction before
     // any reference is written (refs/files-backend.c:3024-3029), which is what
     // names the reference standing in the way; reaching the file system instead
     // reported only that some path already existed.
     let conflicts = transaction_conflicts(repo, &batch.edits)?;
     if !batch_updates {
+        check_absent(repo, &batch.absent)?;
         if let Some(reason) = conflicts.into_iter().flatten().next() {
             crate::git_fatal!("{reason}");
         }
@@ -1489,9 +1645,38 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
         return Ok(());
     }
     let zero = ObjectId::null(repo.object_hash());
+    // A `create` over a reference that is already there is
+    // `REF_TRANSACTION_ERROR_CREATE_EXISTS`, not a generic failure, so
+    // `--batch-updates` drops that one update and keeps the rest
+    // (builtin/update-ref.c:285-289). Dropping the edit it guards is what makes
+    // that true here; the precondition is checked at the position the command
+    // held so the `rejected` lines come out in command order.
+    let mut dropped: std::collections::BTreeSet<usize> = Default::default();
+    let mut rejections: Vec<(usize, String)> = Vec::new();
+    for entry in &batch.absent {
+        if !absent_violated(repo, entry)? {
+            continue;
+        }
+        let new = entry.new.map_or_else(|| "(null)".to_string(), |id| id.to_string());
+        eprintln!("error: cannot lock ref '{}': reference already exists", entry.name);
+        rejections.push((
+            entry.at,
+            format!("rejected {} {new} {zero} reference already exists", entry.name),
+        ));
+        if entry.guards_edit {
+            dropped.insert(entry.at);
+        }
+    }
+    let mut pending = rejections.into_iter().peekable();
     for (index, edit) in batch.edits.into_iter().enumerate() {
+        while pending.peek().is_some_and(|(at, _)| *at == index) {
+            println!("{}", pending.next().expect("peeked").1);
+        }
+        if dropped.contains(&index) {
+            continue;
+        }
         let name = edit.name.to_string();
-        let (new, old) = edit_oids(&edit, &zero);
+        let (new, old) = edit_oids(&edit, &zero, batch.verify_edits.contains(&index));
         // `ref_transaction_maybe_set_rejected()` with
         // `REF_TRANSACTION_ERROR_NAME_CONFLICT` (refs.c:1268-1300, :2847-2854; `ref_transaction_error_msg()` refs.c:3532-3536): under
         // `--batch-updates` the conflicting update is dropped and reported,
@@ -1504,8 +1689,13 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
         }
         if let Err(e) = repo.edit_reference(edit) {
             let msg = lock_error(repo, &e);
+            // A generic failure still dies; only the categorised ones are
+            // reportable (builtin/update-ref.c:285-291).
+            let Some(kind) = rejection_kind(&e) else {
+                crate::git_fatal!("{msg}");
+            };
             eprintln!("error: {msg}");
-            println!("rejected {name} {new} {old} {msg}");
+            println!("rejected {name} {new} {old} {kind}");
             continue;
         }
         // `--batch-updates` runs each update as its own transaction, so a
@@ -1514,13 +1704,40 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
             write_symref_log(repo, plan)?;
         }
     }
+    for (_, line) in pending {
+        println!("{line}");
+    }
     Ok(())
 }
 
+/// `ref_transaction_error_msg()` (refs.c:3532-3552) for the failures gitoxide
+/// reports, which is the last field of a `rejected` line.
+///
+/// `None` is `REF_TRANSACTION_ERROR_GENERIC`: `handle_ref_transaction_error()`
+/// dies on those even under `--batch-updates` (builtin/update-ref.c:285-291).
+fn rejection_kind(e: &gix::reference::edit::Error) -> Option<&'static str> {
+    use gix::refs::file::transaction::prepare::Error as P;
+    let gix::reference::edit::Error::FileTransactionPrepare(p) = e else {
+        return None;
+    };
+    Some(match p {
+        P::ReferenceOutOfDate { .. } => "incorrect old value provided",
+        P::MustNotExist { .. } => "reference already exists",
+        P::MustExist { .. } | P::DeleteReferenceMustExist { .. } => "reference does not exist",
+        _ => return None,
+    })
+}
+
 /// The `<new-oid>`/`<old-oid>` pair a `rejected` line reports for one edit.
-fn edit_oids(edit: &RefEdit, zero: &ObjectId) -> (String, String) {
+fn edit_oids(edit: &RefEdit, zero: &ObjectId, verify: bool) -> (String, String) {
     let (new, expected) = match &edit.change {
-        Change::Update { new, expected, .. } => (target_oid(new, zero), expected),
+        Change::Update { new, expected, .. } => (
+            match verify {
+                true => "(null)".to_string(),
+                false => target_oid(new, zero),
+            },
+            expected,
+        ),
         Change::Delete { expected, .. } => (zero.to_string(), expected),
     };
     let old = match expected {
@@ -1540,53 +1757,68 @@ fn target_oid(target: &Target, zero: &ObjectId) -> String {
     }
 }
 
+/// The check every `parse_cmd_*` that takes arguments closes with
+/// (builtin/update-ref.c:325, :382, :421, :452, :488, :518, :546, :582):
+///
+/// ```c
+/// if (*next != line_termination)
+///         die("<cmd> %s: extra input: %s", refname, next);
+/// ```
+///
+/// A final line the stream never terminated leaves `*next` on the buffer's own
+/// NUL rather than on the newline, so it is refused too, with an empty
+/// remainder: `create refs/heads/g HEAD` without its `\n` is
+/// `fatal: create refs/heads/g: extra input: `.
+fn extra_input(cur: &Cursor<'_>, cmd: &str, refname: &str) -> Result<()> {
+    if !cur.at_terminator() {
+        crate::git_fatal!("{cmd} {refname}: extra input: {}", cur.rest());
+    }
+    Ok(())
+}
+
 /// Stage `update`/`create`/`delete`/`verify`.
 #[allow(clippy::too_many_arguments)]
 fn stage_oid_command(
     repo: &gix::Repository,
     batch: &mut Batch,
     cmd: &str,
-    args: &[String],
-    nul: bool,
+    cur: &mut Cursor<'_>,
     deref: bool,
     create_reflog: bool,
     msg: Option<&str>,
 ) -> Result<()> {
-    // Under -z the slots are always present (possibly empty); otherwise a
-    // trailing slot may be omitted entirely.
-    let slot = |n: usize| -> Option<&str> { args.get(n).map(String::as_str) };
-
-    let name = slot(0).ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
-    parse_refname(name)?;
+    let name = cur
+        .parse_refname()?
+        .ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
+    let name = name.as_str();
 
     match cmd {
         "update" => {
-            if args.len() < 2 || args.len() > 3 {
-                crate::git_fatal!("update: wrong number of arguments");
-            }
-            let new = parse_slot(repo, slot(1), nul, Slot::New)?;
-            let old = parse_slot(repo, slot(2), nul, Slot::Old)?;
-            if matches!(new, Val::Missing) {
-                crate::git_fatal!("update {name}: missing <new-oid>");
-            }
+            let new = cur
+                .parse_next_oid(repo, cmd, name, Slot::New, true)?
+                .ok_or_else(|| anyhow!("update {name}: missing <new-oid>"))?;
+            let old = cur
+                .parse_next_oid(repo, cmd, name, Slot::Old, false)?
+                .unwrap_or(Val::Missing);
+            extra_input(cur, cmd, name)?;
             check_new_object(repo, name, &new)?;
             batch
                 .edits
                 .push(build_edit(name, &new, &old, deref, create_reflog, msg)?);
         }
         "create" => {
-            if args.len() != 2 {
-                crate::git_fatal!("create: wrong number of arguments");
-            }
-            let new = parse_slot(repo, slot(1), nul, Slot::New)?;
+            let new = cur
+                .parse_next_oid(repo, cmd, name, Slot::New, false)?
+                .ok_or_else(|| anyhow!("create {name}: missing <new-oid>"))?;
             let Val::Oid(id) = new else {
                 crate::git_fatal!("create {name}: zero <new-oid>");
             };
+            extra_input(cur, cmd, name)?;
             check_new_object(repo, name, &new)?;
             // git's `create` refuses outright when the ref is already there;
             // gitoxide's `MustNotExist` tolerates an existing ref that already
             // holds the value being written, so the check is made explicit.
-            batch.absent.push((name.to_string(), deref));
+            batch.require_absent(name, deref, Some(id));
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),
@@ -1598,15 +1830,15 @@ fn stage_oid_command(
             });
         }
         "delete" => {
-            if args.len() > 2 {
-                crate::git_fatal!("delete: wrong number of arguments");
-            }
-            let old = parse_slot(repo, slot(1), nul, Slot::Old)?;
+            let old = cur
+                .parse_next_oid(repo, cmd, name, Slot::Old, false)?
+                .unwrap_or(Val::Missing);
             // Unlike the command-line `-d`, the stdin `delete` command rejects an
             // explicit all-zero `<old-oid>` outright rather than deleting.
             if matches!(old, Val::Zero) {
                 crate::git_fatal!("delete {name}: zero <old-oid>");
             }
+            extra_input(cur, cmd, name)?;
             batch.edits.push(RefEdit {
                 change: Change::Delete {
                     expected: expected_for_delete(&old),
@@ -1618,14 +1850,15 @@ fn stage_oid_command(
             });
         }
         "verify" => {
-            if args.len() > 2 {
-                crate::git_fatal!("verify: wrong number of arguments");
-            }
+            let old = cur
+                .parse_next_oid(repo, cmd, name, Slot::Old, false)?
+                .unwrap_or(Val::Missing);
+            extra_input(cur, cmd, name)?;
             // `verify` is an update to the value it already has: gitoxide skips
             // the reflog when old == new, so nothing is logged, as in git.
-            match parse_slot(repo, slot(1), nul, Slot::Old)? {
+            match old {
                 Val::Oid(id) => {
-                    batch.edits.push(RefEdit {
+                    batch.stage_verify(RefEdit {
                         change: Change::Update {
                             log: log_change(create_reflog, msg),
                             expected: PreviousValue::MustExistAndMatch(Target::Object(id)),
@@ -1637,7 +1870,7 @@ fn stage_oid_command(
                     stage_verify_head_mirror(repo, batch, name, create_reflog, msg)?;
                 }
                 // Zero or missing old value: the ref must not exist.
-                Val::Zero | Val::Missing => batch.absent.push((name.to_string(), deref)),
+                Val::Zero | Val::Missing => batch.require_absent(name, deref, None),
             }
         }
         _ => unreachable!("caller filters the command set"),
@@ -1719,27 +1952,29 @@ fn stage_symref_command(
     repo: &gix::Repository,
     batch: &mut Batch,
     cmd: &str,
-    args: &[String],
-    nul: bool,
+    cur: &mut Cursor<'_>,
     deref: bool,
     create_reflog: bool,
     msg: Option<&str>,
 ) -> Result<()> {
-    let slot = |n: usize| -> Option<&str> { args.get(n).map(String::as_str) };
     // The refusal precedes argument parsing in git: the `die` is the first
     // statement of both parsers, so a deref-mode `symref-delete` with no ref at
     // all still reports the mode rather than the missing argument.
     if deref && matches!(cmd, "symref-delete" | "symref-verify") {
         crate::git_fatal!("{cmd}: cannot operate with deref mode");
     }
-    let name = slot(0).ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
-    parse_refname(name)?;
+    let name = cur
+        .parse_refname()?
+        .ok_or_else(|| anyhow!("{cmd}: missing <ref>"))?;
+    let name = name.as_str();
 
     match cmd {
         "symref-create" => {
-            let target = slot(1).ok_or_else(|| anyhow!("symref-create: missing <new-target>"))?;
-            parse_refname(target)?;
-            let (name, target) = (refname(name)?, refname(target)?);
+            let target = cur
+                .parse_next_refname()?
+                .ok_or_else(|| anyhow!("symref-create {name}: missing <new-target>"))?;
+            extra_input(cur, cmd, name)?;
+            let (name, target) = (refname(name)?, refname(&target)?);
             let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
             batch.symref_logs.push((batch.edits.len(), plan));
             batch.edits.push(RefEdit {
@@ -1753,33 +1988,52 @@ fn stage_symref_command(
             });
         }
         "symref-update" => {
-            let target = slot(1).ok_or_else(|| anyhow!("symref-update: missing <new-target>"))?;
-            parse_refname(target)?;
-            // Optional old value: `ref <old-target>` or `oid <old-oid>`.
-            let expected = match slot(2) {
-                None | Some("") => PreviousValue::Any,
-                Some("ref") => {
-                    let old = slot(3)
-                        .ok_or_else(|| anyhow!("symref-update {name}: missing <old-target>"))?;
-                    // The one old value `parse_cmd_symref_update()` does *not* read
-                    // through `parse_refname()`: it checks the name itself and names
-                    // the command and the ref it was updating. Measured against stock
-                    // 2.55.0 — `symref-update <ref> <target> ref ../bad` is
-                    // `fatal: symref-update <ref>: invalid ref: ../bad`, where the
-                    // same `../bad` as a `symref-delete`/`symref-verify` old value is
-                    // `fatal: invalid ref format: ../bad`.
-                    if !super::check_ref_format::check_refname_format_onelevel(old.as_bytes()) {
-                        crate::git_fatal!("symref-update {name}: invalid ref: {old}");
+            let target = cur
+                .parse_next_refname()?
+                .ok_or_else(|| anyhow!("symref-update {name}: missing <new-target>"))?;
+            // Optional old value: `ref <old-target>` or `oid <old-oid>`, read as
+            // two plain arguments (builtin/update-ref.c:361-379) — neither goes
+            // through `parse_next_oid()`, so neither gets its wording.
+            let expected = match cur.parse_next_arg()? {
+                None => PreviousValue::Any,
+                Some(kind) => {
+                    let old = cur
+                        .parse_next_arg()?
+                        .ok_or_else(|| anyhow!("symref-update {name}: expected old value"))?;
+                    match kind.as_str() {
+                        // The one old value `parse_cmd_symref_update()` does *not*
+                        // read through `parse_refname()`: it checks the name itself
+                        // and names the command and the ref it was updating.
+                        // Measured against stock 2.55.0 — `symref-update <ref>
+                        // <target> ref ../bad` is `fatal: symref-update <ref>:
+                        // invalid ref: ../bad`, where the same `../bad` as a
+                        // `symref-delete`/`symref-verify` old value is `fatal:
+                        // invalid ref format: ../bad`.
+                        "ref" => {
+                            if !super::check_ref_format::check_refname_format_onelevel(
+                                old.as_bytes(),
+                            ) {
+                                crate::git_fatal!("symref-update {name}: invalid ref: {old}");
+                            }
+                            PreviousValue::MustExistAndMatch(Target::Symbolic(refname(&old)?))
+                        }
+                        "oid" => match resolve_slot(repo, &old) {
+                            Some(Val::Oid(id)) => {
+                                PreviousValue::MustExistAndMatch(Target::Object(id))
+                            }
+                            Some(_) => PreviousValue::MustNotExist,
+                            None => {
+                                crate::git_fatal!("symref-update {name}: invalid oid: {old}")
+                            }
+                        },
+                        _ => crate::git_fatal!(
+                            "symref-update {name}: invalid arg '{kind}' for old value"
+                        ),
                     }
-                    PreviousValue::MustExistAndMatch(Target::Symbolic(refname(old)?))
                 }
-                Some("oid") => match parse_slot(repo, slot(3), nul, Slot::Old)? {
-                    Val::Oid(id) => PreviousValue::MustExistAndMatch(Target::Object(id)),
-                    Val::Zero | Val::Missing => PreviousValue::MustNotExist,
-                },
-                Some(kind) => crate::git_fatal!("symref-update {name}: invalid old value kind '{kind}'"),
             };
-            let (name, target) = (refname(name)?, refname(target)?);
+            extra_input(cur, cmd, name)?;
+            let (name, target) = (refname(name)?, refname(&target)?);
             let plan = plan_symref_log(repo, &name, &target, deref, msg)?;
             batch.symref_logs.push((batch.edits.len(), plan));
             batch.edits.push(RefEdit {
@@ -1793,12 +2047,11 @@ fn stage_symref_command(
             });
         }
         "symref-delete" => {
-            let expected = match slot(1) {
-                None | Some("") => PreviousValue::Any,
-                Some(old) => {
-                    parse_refname(old)?;
-                    PreviousValue::MustExistAndMatch(Target::Symbolic(refname(old)?))
-                }
+            let old = cur.parse_next_refname()?;
+            extra_input(cur, cmd, name)?;
+            let expected = match old {
+                None => PreviousValue::Any,
+                Some(old) => PreviousValue::MustExistAndMatch(Target::Symbolic(refname(&old)?)),
             };
             batch.edits.push(RefEdit {
                 change: Change::Delete {
@@ -1810,12 +2063,14 @@ fn stage_symref_command(
                 deref: false,
             });
         }
-        "symref-verify" => match slot(1) {
-            None | Some("") => batch.absent.push((name.to_string(), false)),
+        "symref-verify" => {
+            let old = cur.parse_next_refname()?;
+            extra_input(cur, cmd, name)?;
+            match old {
+            None => batch.require_absent(name, false, None),
             Some(old) => {
-                parse_refname(old)?;
-                let target = Target::Symbolic(refname(old)?);
-                batch.edits.push(RefEdit {
+                let target = Target::Symbolic(refname(&old)?);
+                batch.stage_verify(RefEdit {
                     change: Change::Update {
                         log: log_change(create_reflog, msg),
                         expected: PreviousValue::MustExistAndMatch(target.clone()),
@@ -1825,21 +2080,21 @@ fn stage_symref_command(
                     deref: false,
                 });
             }
-        },
+            }
+        }
         _ => unreachable!("caller filters the command set"),
     }
     Ok(())
 }
 
-/// Split NUL-terminated `--stdin -z` input into records.
+/// One dispatched record: the head line as `strbuf_getwholeline(&input, stdin,
+/// line_termination)` produced it, beside the whole buffer the command's parser
+/// walks.
 ///
-/// The first field of each record is `<command> SP <ref>` (or a bare command),
-/// and every following NUL-separated field up to the record's argument count is
-/// a value slot. The per-command field counts come straight from the man page.
-///
-/// Each record is returned with the head as `strbuf_getwholeline(&input, stdin,
-/// '\0')` produced it — its NUL terminator restored — beside the fields, so the
-/// caller's diagnostics can interpolate the same `input.buf` git's do. An
+/// Outside `-z` the two are the same string. Under `-z` the buffer is the head
+/// with the command's remaining value slots appended, terminators and all, which
+/// is what `strbuf_appendwholeline()` builds (builtin/update-ref.c:747-749) and
+/// what makes one cursor able to walk the record. An
 /// unrecognised head is not rejected here: git meets it in the dispatch loop,
 /// after the commands ahead of it have already run, so it is passed through with
 /// no value slots for the loop to refuse.
@@ -1857,6 +2112,195 @@ fn report_ok(command: &str) {
     use std::io::Write as _;
     println!("{command}: ok");
     let _ = std::io::stdout().flush();
+}
+
+/// git's `next` pointer walking one dispatched `--stdin` record.
+///
+/// Port of `parse_arg()`, `parse_refname()`, `parse_next_refname()`,
+/// `parse_next_arg()` and `parse_next_oid()` (builtin/update-ref.c:43-244,
+/// v2.55.0). Each `parse_cmd_*` pulls its arguments off the buffer one at a time
+/// and every diagnostic it raises interpolates *what is left of that buffer*,
+/// terminator included — `update refs/heads/x <oid> <oid> extra` is `fatal:
+/// update refs/heads/x: extra input:  extra`. A pre-split field list cannot say
+/// where the parser stood, so it cannot produce any of those messages; walking
+/// the buffer can.
+///
+/// It also decides what parses at all: `parse_arg()` ends an unquoted argument
+/// at any `isspace()`, while only `' '` is an accepted separator, so
+/// `update refs/heads/x<TAB><oid>` is a well-formed ref followed by `fatal:
+/// update refs/heads/x: expected SP but got: <TAB><oid>` rather than one
+/// tab-bearing ref name.
+struct Cursor<'a> {
+    buf: &'a str,
+    pos: usize,
+    /// git's `line_termination`: `b'\n'`, or `0` under `-z`.
+    term: u8,
+}
+
+impl<'a> Cursor<'a> {
+    /// The buffer as `cmd->fn()` receives it: `input.buf + strlen(prefix) +
+    /// !!cmd->args` (builtin/update-ref.c:782).
+    fn new(buf: &'a str, at: usize, nul: bool) -> Self {
+        Self { buf, pos: at, term: if nul { 0 } else { b'\n' } }
+    }
+
+    /// `*next`. Past the end this is the buffer's own NUL, as in C.
+    fn cur(&self) -> u8 {
+        self.buf.as_bytes().get(self.pos).copied().unwrap_or(0)
+    }
+
+    /// What `%s` prints for `next`: the rest of the buffer up to its first NUL.
+    fn rest(&self) -> &str {
+        c_string(self.buf.get(self.pos..).unwrap_or_default())
+    }
+
+    /// `line_termination == '\0'`.
+    fn nul(&self) -> bool {
+        self.term == 0
+    }
+
+    /// The `if (*next != line_termination)` every `parse_cmd_*` closes with.
+    fn at_terminator(&self) -> bool {
+        self.cur() == self.term
+    }
+
+    /// `builtin/update-ref.c:76-78` / `:139-141`: under `-z` a field runs to the
+    /// next NUL.
+    fn take_field(&mut self) -> String {
+        let start = self.pos;
+        while self.cur() != 0 {
+            self.pos += 1;
+        }
+        self.buf[start..self.pos].to_string()
+    }
+
+    /// `parse_arg()` (builtin/update-ref.c:43-58). Line mode only.
+    fn parse_arg(&mut self) -> Result<String> {
+        if self.cur() == b'"' {
+            let orig = self.rest().to_string();
+            let (arg, used) = unquote_c(&self.buf.as_bytes()[self.pos..])
+                .map_err(|_| anyhow!("badly quoted argument: {orig}"))?;
+            self.pos += used;
+            if self.cur() != 0 && !is_c_space(char::from(self.cur())) {
+                return Err(anyhow!("unexpected character after quoted argument: {orig}"));
+            }
+            return Ok(arg);
+        }
+        let start = self.pos;
+        while self.cur() != 0 && !is_c_space(char::from(self.cur())) {
+            self.pos += 1;
+        }
+        Ok(self.buf[start..self.pos].to_string())
+    }
+
+    /// `parse_refname()` (builtin/update-ref.c:68-90).
+    fn parse_refname(&mut self) -> Result<Option<String>> {
+        let name = if self.nul() { self.take_field() } else { self.parse_arg()? };
+        if name.is_empty() {
+            return Ok(None);
+        }
+        if !super::check_ref_format::check_refname_format_onelevel(name.as_bytes()) {
+            return Err(anyhow!("invalid ref format: {name}"));
+        }
+        Ok(Some(name))
+    }
+
+    /// The delimiter `parse_next_refname()` and `parse_next_arg()` share
+    /// (builtin/update-ref.c:97-109, :121-133). `false` is their `return NULL`.
+    fn skip_delimiter(&mut self) -> Result<bool> {
+        if self.nul() {
+            if self.cur() != 0 {
+                return Ok(false);
+            }
+        } else {
+            if self.cur() == 0 || self.cur() == self.term {
+                return Ok(false);
+            }
+            if self.cur() != b' ' {
+                return Err(anyhow!("expected SP but got: {}", self.rest()));
+            }
+        }
+        self.pos += 1;
+        Ok(true)
+    }
+
+    /// `parse_next_refname()` (builtin/update-ref.c:95-112).
+    fn parse_next_refname(&mut self) -> Result<Option<String>> {
+        if !self.skip_delimiter()? {
+            return Ok(None);
+        }
+        self.parse_refname()
+    }
+
+    /// `parse_next_arg()` (builtin/update-ref.c:117-149).
+    fn parse_next_arg(&mut self) -> Result<Option<String>> {
+        if !self.skip_delimiter()? {
+            return Ok(None);
+        }
+        let arg = if self.nul() { self.take_field() } else { self.parse_arg()? };
+        Ok((!arg.is_empty()).then_some(arg))
+    }
+
+    /// `parse_next_oid()` (builtin/update-ref.c:172-244). `Ok(None)` is its
+    /// `return 1`: the slot was not supplied at all.
+    fn parse_next_oid(
+        &mut self,
+        repo: &gix::Repository,
+        cmd: &str,
+        refname: &str,
+        slot: Slot,
+        allow_empty: bool,
+    ) -> Result<Option<Val>> {
+        let which = match slot {
+            Slot::Old => "<old-oid>",
+            Slot::New => "<new-oid>",
+        };
+        if self.pos == self.buf.len() {
+            return Err(anyhow!(
+                "{cmd} {refname}: unexpected end of input when reading {which}"
+            ));
+        }
+        let arg = if self.nul() {
+            if self.cur() != 0 {
+                return Err(anyhow!("{cmd} {refname}: expected NUL but got: {}", self.rest()));
+            }
+            self.pos += 1;
+            if self.pos == self.buf.len() {
+                return Err(anyhow!(
+                    "{cmd} {refname}: unexpected end of input when reading {which}"
+                ));
+            }
+            let arg = self.take_field();
+            if arg.is_empty() {
+                // builtin/update-ref.c:215-226: only `update`'s `<new-oid>` reads
+                // an empty `-z` field as zero, and it says so; every other slot
+                // reads it as "unspecified".
+                if !allow_empty {
+                    return Ok(None);
+                }
+                eprintln!("warning: {cmd} {refname}: missing {which}, treating as zero");
+                return Ok(Some(Val::Zero));
+            }
+            arg
+        } else {
+            if self.cur() == 0 || self.cur() == self.term {
+                return Ok(None);
+            }
+            if self.cur() != b' ' {
+                return Err(anyhow!("{cmd} {refname}: expected SP but got: {}", self.rest()));
+            }
+            self.pos += 1;
+            let arg = self.parse_arg()?;
+            // builtin/update-ref.c:196-199: without -z an empty value is zeros.
+            if arg.is_empty() {
+                return Ok(Some(Val::Zero));
+            }
+            arg
+        };
+        resolve_slot(repo, &arg)
+            .map(Some)
+            .ok_or_else(|| anyhow!("{cmd} {refname}: invalid {which}: {arg}"))
+    }
 }
 
 /// One `strbuf_getwholeline(&input, stdin, line_termination)`: everything up to
@@ -1881,76 +2325,36 @@ fn read_field(reader: &mut impl std::io::BufRead, terminator: u8) -> Result<Opti
 /// chunk it dispatches on, and for `-z` the NUL-separated value slots that
 /// belong to it, which each `parse_cmd_*` pulls off the same stream with its own
 /// `strbuf_getwholeline()` call.
-fn next_record(
-    reader: &mut impl std::io::BufRead,
-    nul: bool,
-) -> Result<Option<(String, Option<Vec<String>>)>> {
+fn next_record(reader: &mut impl std::io::BufRead, nul: bool) -> Result<Option<(String, String)>> {
     let terminator = if nul { b'\0' } else { b'\n' };
     let Some(head) = read_field(reader, terminator)? else {
         return Ok(None);
     };
     if !nul {
-        return Ok(Some((head, None)));
+        return Ok(Some((head.clone(), head)));
     }
-    let bare = head.strip_suffix('\0').unwrap_or(&head);
-    let (cmd, first) = match bare.split_once(' ') {
-        Some((c, r)) => (c.to_string(), Some(r.to_string())),
-        None => (bare.to_string(), None),
-    };
-    // Number of NUL-separated value slots that follow the head.
-    let extra = match cmd.as_str() {
-        "update" => 2,
-        "create" | "delete" | "verify" => 1,
-        "symref-update" => 3,
-        "symref-create" => 1,
-        "symref-delete" | "symref-verify" => 1,
-        _ => 0,
-    };
-    let mut record = vec![cmd];
-    record.extend(first);
+    // builtin/update-ref.c:747-749, after the command has been recognised:
+    //
+    //     for (j = 1; line_termination == '\0' && j < cmd->args; j++)
+    //             if (strbuf_appendwholeline(&input, stdin, line_termination))
+    //                     break;
+    //
+    // The extra fields are appended to the *same* buffer, NUL terminators and
+    // all, which is what lets one `next` pointer walk the whole record. An
+    // unrecognised head pulls in nothing: the loop below never runs for it, and
+    // the dispatch refuses it on its own.
+    let extra = match_command(&head, '\0').map_or(0, |cmd| command_args(cmd).saturating_sub(1));
+    let mut buf = head.clone();
     for _ in 0..extra {
-        // Trailing optional slots may be absent at end of input.
+        // An early EOF is not an error here; the command reports its own
+        // missing argument.
         let Some(field) = read_field(reader, terminator)? else {
             break;
         };
-        record.push(field.strip_suffix('\0').unwrap_or(&field).to_string());
+        buf.push_str(&field);
     }
-    Ok(Some((head, Some(record))))
+    Ok(Some((head, buf)))
 }
-/// Split one instruction line into fields, honouring C-style quoting.
-fn tokenize(line: &str) -> Result<Vec<String>> {
-    let b = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i <= b.len() {
-        if i == b.len() {
-            // A trailing separator yields one final empty field.
-            out.push(String::new());
-            break;
-        }
-        if b[i] == b'"' {
-            let (s, used) = unquote_c(&b[i..])?;
-            out.push(s);
-            i += used;
-        } else {
-            let start = i;
-            while i < b.len() && b[i] != b' ' {
-                i += 1;
-            }
-            out.push(line[start..i].to_string());
-        }
-        if i < b.len() {
-            if b[i] != b' ' {
-                crate::git_fatal!("unexpected character after quoted field in: {line}");
-            }
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    Ok(out)
-}
-
 /// Undo one C-style quoted string starting at `b[0] == '"'`.
 ///
 /// Returns the decoded value and the number of bytes consumed, closing quote

@@ -53,6 +53,171 @@ pub fn realpath_forgiving(path: &Path) -> PathBuf {
     absolute
 }
 
+/// `MAXSYMLINKS` (`abspath.c:9`): how many nested symlinks `strbuf_realpath()`
+/// follows before it gives up with `ELOOP`.
+const MAXSYMLINKS: usize = 32;
+
+/// Split a path into "is it rooted" plus its components, the way
+/// `get_root_part()` and `get_next_component()` (`abspath.c:20-77`) hand them to
+/// `strbuf_realpath_1()`. Empty and `.` components are dropped by
+/// [`Path::components`] exactly as the C loop skips them; `..` is kept because it
+/// is resolved against what has already been resolved, not lexically.
+fn root_and_components(path: &Path) -> (bool, Vec<std::ffi::OsString>) {
+    use std::path::Component;
+    let mut rooted = false;
+    let mut out = Vec::new();
+    for c in path.components() {
+        match c {
+            Component::RootDir => rooted = true,
+            Component::Prefix(p) => {
+                rooted = true;
+                out.push(p.as_os_str().to_owned());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => out.push(std::ffi::OsString::from("..")),
+            Component::Normal(n) => out.push(n.to_owned()),
+        }
+    }
+    (rooted, out)
+}
+
+/// Port of `strbuf_realpath(&resolved, path, die_on_error=1)`
+/// (`abspath.c:79-202`, reached through `strbuf_realpath_1()` with
+/// `REALPATH_DIE_ON_ERROR` and without `REALPATH_MANY_MISSING`).
+///
+/// The path is walked one component at a time, each intermediate result
+/// `lstat()`ed and symlinks spliced back into the components still to do. Only
+/// the *last* component may be missing:
+///
+/// ```c
+/// if (lstat(resolved->buf, &st)) {
+///         /* error out unless this was the last component */
+///         if (errno != ENOENT ||
+///            (!(flags & REALPATH_MANY_MISSING) && remaining.len)) {
+///                 if (flags & REALPATH_DIE_ON_ERROR)
+///                         die_errno("Invalid path '%s'", resolved->buf);
+/// ```
+///
+/// The `Err` is the text of that `die`, without the `fatal: ` prefix, so the
+/// caller can report it the way its own diagnostics are reported.
+pub fn realpath_or_die(path: &Path) -> Result<PathBuf, String> {
+    use std::collections::VecDeque;
+
+    if path.as_os_str().is_empty() {
+        return Err("The empty string is not a valid path".to_string());
+    }
+    let (rooted, components) = root_and_components(path);
+    let mut resolved = if rooted {
+        PathBuf::from(std::path::MAIN_SEPARATOR_STR)
+    } else {
+        // "relative path; can use CWD as the initial resolved path"
+        std::env::current_dir()
+            .map_err(|e| format!("unable to get current working directory: {}", crate::external::strerror(&e)))?
+    };
+    let mut remaining: VecDeque<std::ffi::OsString> = components.into();
+    let mut num_symlinks = 0usize;
+
+    while let Some(next) = remaining.pop_front() {
+        if next == ".." {
+            resolved.pop();
+            continue;
+        }
+        resolved.push(&next);
+        let meta = match std::fs::symlink_metadata(&resolved) {
+            Ok(meta) => meta,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound || !remaining.is_empty() {
+                    return Err(format!(
+                        "Invalid path '{}': {}",
+                        resolved.display(),
+                        crate::external::strerror(&e)
+                    ));
+                }
+                continue;
+            }
+        };
+        if !meta.file_type().is_symlink() {
+            continue;
+        }
+        num_symlinks += 1;
+        if num_symlinks > MAXSYMLINKS {
+            return Err(format!(
+                "More than {MAXSYMLINKS} nested symlinks on path '{}'",
+                path.display()
+            ));
+        }
+        let target = std::fs::read_link(&resolved).map_err(|e| {
+            format!(
+                "Invalid symlink '{}': {}",
+                resolved.display(),
+                crate::external::strerror(&e)
+            )
+        })?;
+        let (target_rooted, target_components) = root_and_components(&target);
+        if target_rooted {
+            resolved = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+        } else {
+            resolved.pop();
+        }
+        for c in target_components.into_iter().rev() {
+            remaining.push_front(c);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Port of `abspath_part_inside_repo()` (`setup.c:50-106`): the part of the
+/// already-normalised absolute `path` that lies inside `work_tree`, with
+/// symlinks *outside* the work tree dereferenced.
+///
+/// `Ok(Some(rel))` is the work-tree-relative remainder (empty when the path is
+/// the work tree itself), `Ok(None)` is the C's `return -1` — which every caller
+/// turns into `'<path>' is outside repository at '<root>'` — and `Err` is the
+/// `die` [`realpath_or_die`] raises for a path whose leading directories do not
+/// exist, which reaches the user *instead of* the "outside repository" wording.
+///
+/// `work_tree` must already be the resolved, absolute work tree
+/// (`repo_get_work_tree()`), since that is what the C compares each resolved
+/// level against.
+pub fn abspath_part_inside_repo(work_tree: &Path, path: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let wt = gix::path::into_bstr(work_tree).into_owned();
+    let wt: &[u8] = wt.as_ref();
+    let (wtlen, len) = (wt.len(), path.len());
+    // `offset_1st_component()` on a POSIX absolute path is 1, the leading slash.
+    let mut off = usize::from(path.first() == Some(&b'/'));
+
+    // "check if work tree is already the prefix"
+    if wtlen <= len && &path[..wtlen] == wt {
+        if path.get(wtlen) == Some(&b'/') {
+            return Ok(Some(path[wtlen + 1..].to_vec()));
+        }
+        if wt.last() == Some(&b'/') || wtlen == len {
+            return Ok(Some(path[wtlen..].to_vec()));
+        }
+        // "work tree might match beginning of a symlink to work tree"
+        off = wtlen;
+    }
+
+    let at = |bytes: &[u8]| -> PathBuf { gix::path::from_byte_slice(bytes).to_owned() };
+
+    // "check each '/'-terminated level"
+    let mut i = off;
+    while i < len {
+        i += 1;
+        if path.get(i) == Some(&b'/') {
+            if realpath_or_die(&at(&path[..i]))? == work_tree {
+                return Ok(Some(path[i + 1..].to_vec()));
+            }
+        }
+    }
+
+    // "check whole path"
+    if realpath_or_die(&at(path))? == work_tree {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(None)
+}
+
 /// The work tree, symlink-resolved, or `None` when the repository has none.
 fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
     Some(realpath_forgiving(repo.workdir()?))

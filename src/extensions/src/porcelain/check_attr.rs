@@ -392,15 +392,24 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
     let mut out: Vec<u8> = Vec::new();
 
     for path in &given {
-        let Some(rel) = worktree_relative(workdir.as_deref(), prefix.as_bstr(), path.as_bstr())
-        else {
-            // git dies mid-stream, so whatever was already produced is kept.
-            std::io::stdout().write_all(&out)?;
-            eprintln!(
-                "fatal: '{path}' is outside repository at '{}'",
-                workdir.as_deref().unwrap_or(Path::new("")).display()
-            );
-            return Ok(ExitCode::from(128));
+        let rel = match worktree_relative(workdir.as_deref(), prefix.as_bstr(), path.as_bstr()) {
+            Ok(Some(rel)) => rel,
+            Ok(None) => {
+                // git dies mid-stream, so whatever was already produced is kept.
+                std::io::stdout().write_all(&out)?;
+                eprintln!(
+                    "fatal: '{path}' is outside repository at '{}'",
+                    workdir.as_deref().unwrap_or(Path::new("")).display()
+                );
+                return Ok(ExitCode::from(128));
+            }
+            // `strbuf_realpath()`'s own die, raised below `prefix_path()` and so
+            // naming the unresolvable directory rather than the argument.
+            Err(msg) => {
+                std::io::stdout().write_all(&out)?;
+                eprintln!("fatal: {msg}");
+                return Ok(ExitCode::from(128));
+            }
         };
 
         // A trailing slash is git's marker for "this is a directory", which is
@@ -492,32 +501,77 @@ fn emit(out: &mut Vec<u8>, path: &BStr, assignment: gix::attrs::AssignmentRef<'_
 /// git's `prefix_path()`: turn a user-supplied path into the worktree-relative
 /// slash path it is looked up by. Relative paths resolve against `prefix` (the
 /// worktree-relative position of the current directory, `""` or `<dir>/`);
-/// absolute ones must lie inside `workdir`. `None` means the path escapes the
-/// worktree, which git reports as a fatal error.
-fn worktree_relative(workdir: Option<&Path>, prefix: &BStr, file: &BStr) -> Option<BString> {
+/// absolute ones go through `abspath_part_inside_repo()` (`setup.c:50-106`),
+/// which dereferences symlinks that lie outside the work tree so that a path
+/// reached through a symlink *to* the work tree still resolves.
+///
+/// `Ok(None)` is the C's `NULL`, reported as "is outside repository"; `Err`
+/// carries `strbuf_realpath()`'s own die for a path whose leading directories do
+/// not exist.
+fn worktree_relative(
+    workdir: Option<&Path>,
+    prefix: &BStr,
+    file: &BStr,
+) -> std::result::Result<Option<BString>, String> {
     let file = file.as_bytes();
     let trailing_slash = file.len() > 1 && file.ends_with(b"/");
     let mut comps: Vec<&[u8]> = Vec::new();
+    let owned;
 
     if file.starts_with(b"/") {
-        let root = gix::path::into_bstr(workdir?);
-        let root = root.as_bytes();
-        let root = root.strip_suffix(b"/").unwrap_or(root);
-        let rest = file.strip_prefix(root)?;
-        if !(rest.is_empty() || rest.starts_with(b"/")) {
-            return None;
+        let Some(workdir) = workdir else {
+            return Ok(None);
+        };
+        let Some(normalized) = normalize_absolute(file) else {
+            return Ok(None);
+        };
+        let Some(inside) = crate::setup::abspath_part_inside_repo(workdir, &normalized)? else {
+            return Ok(None);
+        };
+        owned = inside;
+        if push_components(&mut comps, &owned).is_none() {
+            return Ok(None);
         }
-        push_components(&mut comps, rest)?;
     } else {
-        push_components(&mut comps, prefix.as_bytes())?;
-        push_components(&mut comps, file)?;
+        if push_components(&mut comps, prefix.as_bytes()).is_none()
+            || push_components(&mut comps, file).is_none()
+        {
+            return Ok(None);
+        }
     }
 
     let mut rel = BString::from(comps.join(&b'/'));
     if trailing_slash && !rel.is_empty() {
         rel.push(b'/');
     }
-    Some(rel)
+    Ok(Some(rel))
+}
+
+/// `normalize_path_copy_len()` on an absolute path: the leading `/` is kept, `.`
+/// and duplicate separators are dropped, and each `..` pops a component — with
+/// `None` for a `..` that walks off the root, which is the C's non-zero return
+/// and so `prefix_path_gently()` yielding `NULL`.
+fn normalize_absolute(path: &[u8]) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = vec![b'/'];
+    for comp in path.split(|&b| b == b'/') {
+        match comp {
+            b"" | b"." => {}
+            b".." => {
+                if out.len() == 1 {
+                    return None;
+                }
+                let cut = out.iter().rposition(|&b| b == b'/')?;
+                out.truncate(cut.max(1));
+            }
+            c => {
+                if out.len() > 1 {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(c);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Append the `/`-separated components of `path` to `comps`, dropping empty and

@@ -89,7 +89,18 @@ where
     /// If source is relative and should be treated as base, set `root` to `Some("")`.
     /// `parse` is a way to parse bytes to pattern.
     pub fn from_bytes(bytes: &[u8], source_file: PathBuf, root: Option<&Path>, parse: T) -> Self {
-        let patterns = parse.bytes_to_patterns(bytes, source_file.as_path());
+        // git's `pl->src` is the *root-relative* spelling of the file, since
+        // `prep_exclude()`/`prepare_attr_stack()` build it by appending
+        // `.gitignore`/`.gitattributes` to the base they descended into
+        // (`dir.c:1769-1772`), and that is the name every diagnostic quotes.
+        // `source_file` here is a path the caller can reopen, which may carry a
+        // `./` or `../` lead-in that git never prints; strip the root off for
+        // reporting while leaving `self.source` usable for I/O.
+        let reported = root
+            .and_then(|root| source_file.strip_prefix(root).ok())
+            .filter(|rel| !rel.as_os_str().is_empty())
+            .unwrap_or_else(|| source_file.strip_prefix(".").unwrap_or(source_file.as_path()));
+        let patterns = parse.bytes_to_patterns(bytes, reported);
         let base = root
             .and_then(|root| source_file.parent().expect("file").strip_prefix(root).ok())
             .and_then(|base| {

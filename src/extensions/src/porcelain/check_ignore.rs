@@ -268,25 +268,45 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
     let mut out: Vec<u8> = Vec::new();
     let mut num_ignored = 0usize;
 
-    for orig in &originals {
-        // `init_pathspec_item()`'s first refusal, before any magic is read.
-        if orig.is_empty() {
-            return Ok(fatal(&crate::pathspec::empty_pathspec()));
-        }
+    // The resolved work tree `abspath_part_inside_repo()` measures an absolute
+    // pathspec against (`repo_get_work_tree()`, which is stored symlink-resolved).
+    let wt_real = gix::path::realpath(&root_abs).unwrap_or_else(|_| root_abs.clone());
+
+    // `check_ignore()` runs once per `parse_pathspec()` call: over every argument
+    // at once, or — under `--stdin` — over a single line at a time
+    // (builtin/check-ignore.c:138-149). That batch is the unit the empty-element
+    // refusal and the parse-time dies are measured against, and each `--stdin`
+    // batch is flushed before the next line is read (`maybe_flush_or_die()`,
+    // builtin/check-ignore.c:148), so a die mid-stream keeps what came before it.
+    let batches: Vec<&[BString]> = if o.stdin {
+        originals.chunks(1).collect()
+    } else {
+        vec![originals.as_slice()]
+    };
+
+    for batch in batches {
+    // `parse_pathspec()` walks the whole argument vector for an empty element
+    // before it parses any of them (pathspec.c:637-643), so an empty string
+    // anywhere in the batch is reported ahead of every other diagnostic.
+    if batch.iter().any(|p| p.is_empty()) {
+        return Ok(flush_then_fatal(&out, &crate::pathspec::empty_pathspec()));
+    }
+
+    // `parse_pathspec()`'s per-item loop (pathspec.c:650-668): the item is
+    // prefixed by `init_pathspec_item()` first — which is where a path that does
+    // not resolve dies — then its magic is checked against the command's mask,
+    // then its leading path is checked for symlinks. Every item is parsed before
+    // any of them is matched, so a die on the last argument suppresses the
+    // output the earlier ones would have produced.
+    let mut items: Vec<(&BStr, bool, BString, BString)> = Vec::with_capacity(batch.len());
+    for orig in batch {
         // `cmd_check_ignore` calls `parse_pathspec()` with a magic mask of
         // `PATHSPEC_ALL_MAGIC & ~PATHSPEC_FROMTOP`, so `:(top)`/`:/` is the one
         // form it accepts and everything else is `unsupported_magic()`.
-        let (fromtop, path) = match split_magic(orig.as_bstr()) {
-            Ok(split) => split,
-            Err(unsupported) => {
-                return Ok(fatal(&format!(
-                    "{orig}: pathspec magic not supported by this command: {unsupported}"
-                )))
-            }
-        };
-        if path.is_empty() {
-            return Ok(fatal(&crate::pathspec::empty_pathspec()));
-        }
+        // The text after the magic may well be empty — only the raw argv element
+        // is refused for that (pathspec.c:639-641). `:(top)` alone leaves
+        // `item->match` empty, matches nothing, and exits 1.
+        let (fromtop, path, unsupported) = split_magic(orig.as_bstr());
 
         // `:(top)` measures the path from the repository root rather than from
         // the current directory. `prefix_pathspec()` does that by not calling
@@ -311,15 +331,52 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         let rel = if fromtop {
             path.clone()
         } else {
-            match to_repo_relative(path.as_bstr(), prefix_b.as_bstr(), root_b.as_bstr()) {
-                Some(rel) => rel,
-                None => {
-                    return Ok(fatal(&format!(
-                        "{orig}: '{path}' is outside repository at '{root_b}'"
-                    )))
+            match to_repo_relative(path.as_bstr(), prefix_b.as_bstr(), &wt_real) {
+                Ok(Some(rel)) => rel,
+                Ok(None) => {
+                    return Ok(flush_then_fatal(
+                        &out,
+                        &format!("{orig}: '{path}' is outside repository at '{root_b}'"),
+                    ))
                 }
+                // `strbuf_realpath()`'s own `die` reaches the user unchanged —
+                // it is raised inside `abspath_part_inside_repo()`, well below
+                // the layer that would have named the pathspec.
+                Err(msg) => return Ok(flush_then_fatal(&out, &msg)),
             }
         };
+
+        // `unsupported_magic()` runs only after the item has been prefixed
+        // (pathspec.c:657-658), so `:(glob)/nosuch/x` reports the path first.
+        if let Some(unsupported) = unsupported {
+            return Ok(flush_then_fatal(
+                &out,
+                &format!("{orig}: pathspec magic not supported by this command: {unsupported}"),
+            ));
+        }
+
+        // `PATHSPEC_SYMLINK_LEADING_PATH` (builtin/check-ignore.c:94):
+        //
+        // ```c
+        // if ((flags & PATHSPEC_SYMLINK_LEADING_PATH) &&
+        //     has_symlink_leading_path(item[i].match, item[i].len)) {
+        //         die(_("pathspec '%s' is beyond a symbolic link"), entry);
+        // }
+        // ```
+        //
+        // `entry` is the argument as written, not the prefixed match.
+        if has_symlink_leading_path(&root_abs, rel.as_bstr()) {
+            return Ok(flush_then_fatal(
+                &out,
+                &format!("pathspec '{orig}' is beyond a symbolic link"),
+            ));
+        }
+
+        items.push((orig.as_bstr(), fromtop, path, rel));
+    }
+
+    for (orig, fromtop, path, rel) in &items {
+        let (orig, fromtop) = (*orig, *fromtop);
 
         // git skips tracked paths entirely unless --no-index: they are not
         // subject to exclude rules, so they neither print nor affect the exit
@@ -351,19 +408,24 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
             if rel.split(|&b| b == b'/').any(|c| c == b"..") {
                 escaping_hit(&repo, &root_abs, rel.as_bstr(), is_dir)?
             } else {
-                let mode = if is_dir {
-                    gix::index::entry::Mode::DIR
-                } else {
-                    gix::index::entry::Mode::FILE
-                };
-                let plat = stack.at_entry(rel.as_bstr(), Some(mode))?;
-                plat.matching_exclude_pattern().map(|m| Hit {
-                    source: m.source.map(Path::to_path_buf),
-                    source_verbatim: false,
-                    line: m.sequence_number,
-                    pattern: render_pattern(m.pattern),
-                    negative: m.pattern.is_negative(),
-                })
+                match leading_dir_hit(&mut stack, rel.as_bstr())? {
+                    Some(hit) => Some(hit),
+                    None => {
+                        let mode = if is_dir {
+                            gix::index::entry::Mode::DIR
+                        } else {
+                            gix::index::entry::Mode::FILE
+                        };
+                        let plat = stack.at_entry(rel.as_bstr(), Some(mode))?;
+                        plat.matching_exclude_pattern().map(|m| Hit {
+                            source: m.source.map(Path::to_path_buf),
+                            source_verbatim: false,
+                            line: m.sequence_number,
+                            pattern: render_pattern(m.pattern),
+                            negative: m.pattern.is_negative(),
+                        })
+                    }
+                }
             }
         };
 
@@ -376,8 +438,17 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
             num_ignored += 1;
         }
         if !o.quiet && (hit.is_some() || o.non_matching) {
-            emit(&mut out, orig.as_bstr(), hit.as_ref(), &o, &workdir, &root_abs);
+            emit(&mut out, orig, hit.as_ref(), &o, &workdir, &root_abs);
         }
+    }
+
+    if o.stdin {
+        // `maybe_flush_or_die(stdout, …)` after every line.
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&out)?;
+        stdout.flush()?;
+        out.clear();
+    }
     }
 
     let mut stdout = std::io::stdout().lock();
@@ -395,6 +466,109 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
+}
+
+/// [`fatal`] for a die raised part-way through the path list: git has already
+/// written — and, under `--stdin`, flushed — the records that came before it, so
+/// they reach standard output even though the command is about to exit 128.
+fn flush_then_fatal(out: &[u8], msg: &str) -> ExitCode {
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(out);
+    let _ = stdout.flush();
+    drop(stdout);
+    fatal(msg)
+}
+
+/// `has_symlink_leading_path()` (`symlinks.c:210-218`): whether any
+/// `/`-terminated leading component of the work-tree-relative `path` is a
+/// symlink.
+///
+/// `lstat_cache_matchlen()` (`symlinks.c:132-161`) walks the components, stops
+/// before the last one (`if (match_len >= len && !(track_flags & FL_FULLPATH))
+/// break;` — `FL_FULLPATH` is not among the flags `has_symlink_leading_path()`
+/// passes), `lstat()`s each prefix, and answers `FL_SYMLINK` only for a symlink:
+/// a directory continues the walk, and anything else — a regular file, or a
+/// component that is not there at all — ends it with a different flag.
+///
+/// The `lstat()`s are relative to the top of the work tree, which is where
+/// `setup_git_directory()` left the process.
+fn has_symlink_leading_path(root_abs: &Path, path: &BStr) -> bool {
+    let bytes = path.as_bytes();
+    let mut start = 0;
+    while let Some(off) = bytes[start..].iter().position(|&b| b == b'/') {
+        let end = start + off;
+        if end == 0 {
+            start = 1;
+            continue;
+        }
+        let head = root_abs.join(gix::path::from_byte_slice(&bytes[..end]));
+        match std::fs::symlink_metadata(&head) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(meta) if meta.is_dir() => {}
+            _ => return false,
+        }
+        start = end + 1;
+    }
+    false
+}
+
+/// `prep_exclude()`'s "abort if the directory is excluded" (`dir.c:1726-1742`),
+/// which decides the whole path before the deeper `.gitignore` files are ever
+/// read:
+///
+/// ```c
+/// /* Abort if the directory is excluded */
+/// if (stk->baselen) {
+///         int dt = DT_DIR;
+///         ...
+///         dir->internal.pattern = last_matching_pattern_from_lists(...);
+///         ...
+///         if (dir->internal.pattern &&
+///             dir->internal.pattern->flags & PATTERN_FLAG_NEGATIVE)
+///                 dir->internal.pattern = NULL;
+///         if (dir->internal.pattern) {
+///                 dir->internal.exclude_stack = stk;
+///                 return;
+///         }
+/// }
+/// ```
+///
+/// and `last_matching_pattern()` then returns that pattern verbatim
+/// (`dir.c:1819-1820`). The descent is shallowest-first and a *negative* match
+/// only clears the pattern, it does not stop it, so the first leading directory
+/// with a positive match wins.
+///
+/// gitoxide's stack decides the entry itself rather than each directory on the
+/// way to it, which differs as soon as a deeper directory is un-excluded: with
+/// `ign/` and `!ign/inner/`, git answers `ign/` for `ign/inner/inner.txt`
+/// because it never descends past `ign`, while the stack reached
+/// `ign/inner/.gitignore` and answered from there.
+fn leading_dir_hit(stack: &mut gix::AttributeStack<'_>, rel: &BStr) -> Result<Option<Hit>> {
+    let bytes = rel.as_bytes();
+    let mut base = 0usize;
+    while let Some(off) = bytes[base..].iter().position(|&b| b == b'/') {
+        let end = base + off;
+        base = end + 1;
+        if end == 0 {
+            continue;
+        }
+        let plat = stack.at_entry(
+            bytes[..end].as_bstr(),
+            Some(gix::index::entry::Mode::DIR),
+        )?;
+        if let Some(m) = plat.matching_exclude_pattern() {
+            if !m.pattern.is_negative() {
+                return Ok(Some(Hit {
+                    source: m.source.map(Path::to_path_buf),
+                    source_verbatim: false,
+                    line: m.sequence_number,
+                    pattern: render_pattern(m.pattern),
+                    negative: false,
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// git's `parse-options` usage block for this command, laid out in the same
@@ -563,9 +737,9 @@ fn unquote_c_style(quoted: &[u8]) -> Option<BString> {
 ///
 /// and `unsupported_magic()` renders each unsupported bit as `'<name>'`, or
 /// `'<name>' (mnemonic: '<c>')` when the table gives it one, joined with `", "`.
-fn split_magic(elt: &BStr) -> Result<(bool, BString), String> {
+fn split_magic(elt: &BStr) -> (bool, BString, Option<String>) {
     let Some(rest) = elt.strip_prefix(b":") else {
-        return Ok((false, BString::from(elt.to_vec())));
+        return (false, BString::from(elt.to_vec()), None);
     };
     let mut fromtop = false;
     let mut bad: Vec<String> = Vec::new();
@@ -574,7 +748,7 @@ fn split_magic(elt: &BStr) -> Result<(bool, BString), String> {
         let Some(end) = long.iter().position(|&b| b == b')') else {
             // `missing ')' at the end of pathspec magic in '%s'` is a different
             // die; leave it to the matcher rather than guessing at it here.
-            return Ok((false, BString::from(elt.to_vec())));
+            return (false, BString::from(elt.to_vec()), None);
         };
         for kw in long[..end].split(|&b| b == b',') {
             match kw {
@@ -601,27 +775,30 @@ fn split_magic(elt: &BStr) -> Result<(bool, BString), String> {
         }
         path = if rest.get(i) == Some(&b':') { &rest[i + 1..] } else { &rest[i..] };
     }
-    if bad.is_empty() {
-        Ok((fromtop, BString::from(path.to_vec())))
-    } else {
-        Err(bad.join(", "))
-    }
+    let unsupported = (!bad.is_empty()).then(|| bad.join(", "));
+    (fromtop, BString::from(path.to_vec()), unsupported)
 }
 
 /// the filesystem, which is what git's pathspec normalisation does too.
-fn to_repo_relative(orig: &BStr, prefix: &BStr, root: &BStr) -> Option<BString> {
+///
+/// `Ok(None)` is `prefix_path_gently()` returning `NULL`, which the caller
+/// reports as "is outside repository"; `Err` carries the `die` that
+/// [`crate::setup::abspath_part_inside_repo`] raises instead for an absolute
+/// path whose leading directories are not there.
+fn to_repo_relative(
+    orig: &BStr,
+    prefix: &BStr,
+    work_tree: &Path,
+) -> std::result::Result<Option<BString>, String> {
     if orig.starts_with(b"/") {
-        // Absolute: normalise both sides and strip the repository root off.
-        let arg = normalize(orig)?;
-        let root = normalize(root)?;
-        if arg == root {
-            return Some(BString::default());
-        }
-        let mut root_prefix = root.to_vec();
-        root_prefix.push(b'/');
-        return arg
-            .strip_prefix(root_prefix.as_slice())
-            .map(BString::from);
+        // `prefix_path_gently()`'s absolute arm (setup.c:125-136): normalise the
+        // argument, then hand it to `abspath_part_inside_repo()`, which knows
+        // how to see through a symlink that points at the work tree.
+        let Some(arg) = normalize_absolute(orig) else {
+            return Ok(None);
+        };
+        return crate::setup::abspath_part_inside_repo(work_tree, &arg)
+            .map(|inside| inside.map(BString::from));
     }
     let joined: Vec<u8> = if prefix.is_empty() {
         orig.to_vec()
@@ -631,7 +808,33 @@ fn to_repo_relative(orig: &BStr, prefix: &BStr, root: &BStr) -> Option<BString> 
         v.extend_from_slice(orig);
         v
     };
-    normalize(&joined)
+    Ok(normalize(&joined))
+}
+
+/// `normalize_path_copy_len()` on an absolute path: the leading `/` is kept, `.`
+/// and duplicate separators are dropped, and each `..` pops a component —
+/// popping past the root is the C's non-zero return, i.e. `None` here.
+fn normalize_absolute(path: &BStr) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = vec![b'/'];
+    for comp in path.split(|&b| b == b'/') {
+        match comp {
+            b"" | b"." => {}
+            b".." => {
+                if out.len() == 1 {
+                    return None;
+                }
+                let cut = out.iter().rposition(|&b| b == b'/')?;
+                out.truncate(cut.max(1));
+            }
+            c => {
+                if out.len() > 1 {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(c);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Fold `.` and empty components away and pop one component per `..`.

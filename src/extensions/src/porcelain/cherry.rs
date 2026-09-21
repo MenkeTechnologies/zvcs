@@ -343,6 +343,30 @@ fn walk(repo: &gix::Repository, tips: &[ObjectId], hidden: &[ObjectId]) -> Resul
 /// parent (against the empty tree for a root commit). `None` for a merge, which
 /// `patch_id_defined()` refuses.
 pub(super) fn commit_patch_id(repo: &gix::Repository, id: ObjectId) -> Result<Option<ObjectId>> {
+    commit_patch_id_within(repo, id, None)
+}
+
+/// [`commit_patch_id`] over the paths a pathspec selects.
+///
+/// `cherry_pick_list()` hands the patch-id machinery the walk's own pathspec
+/// before it hashes anything:
+///
+/// ```c
+/// init_patch_ids(revs->repo, &ids);
+/// ids.diffopts.pathspec = revs->diffopt.pathspec;
+/// ```
+///
+/// (`revision.c:1241-1242`, v2.55.0.) So `git rev-list --cherry-mark A...B --
+/// <path>` asks whether two commits made the same change *to that path*, not
+/// whether they are the same commit — which is what makes a cherry-pick that
+/// also touched something else equivalent under the limited view. Without the
+/// pathspec every such pair came out distinct and `--cherry-pick` dropped
+/// nothing.
+pub(super) fn commit_patch_id_within(
+    repo: &gix::Repository,
+    id: ObjectId,
+    paths: Option<&super::log::PathspecMatcher>,
+) -> Result<Option<ObjectId>> {
     let commit = repo.find_commit(id)?;
     let mut parents = commit.parent_ids();
     let first = parents.next();
@@ -360,6 +384,12 @@ pub(super) fn commit_patch_id(repo: &gix::Repository, id: ObjectId) -> Result<Op
     // what `Options::default()` already is.
     let mut changes =
         repo.diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), gix::diff::Options::default())?;
+    // `diff_get_patch_id()` hashes `diff_queued_diff`, which the pathspec in
+    // `ids.diffopts` has already filtered — so a change outside the limited view
+    // contributes nothing to the id.
+    if let Some(paths) = paths {
+        changes.retain(|c| paths.matches(change_path(c)));
+    }
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
 
     let mut ctx = gix::hash::hasher(repo.object_hash());

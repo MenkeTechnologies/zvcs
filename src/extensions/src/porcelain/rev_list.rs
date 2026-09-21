@@ -2115,7 +2115,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // side up in that table — the same work `git cherry` does, through the same
     // `commit_patch_id()`.
     let patch_same: HashSet<ObjectId> = if cherry_mark || cherry_pick {
-        cherry_pick_list(&repo, &commits, &left)?
+        // `ids.diffopts.pathspec = revs->diffopt.pathspec;` (revision.c:1242): the
+        // ids are of the change *within the limited view*, so this runs ahead of
+        // the pathspec filter below with the same specs in hand.
+        let specs = match pathspecs.is_empty() {
+            true => None,
+            false => Some(super::log::PathspecMatcher::new(&repo, &pathspecs)?),
+        };
+        cherry_pick_list(&repo, &commits, &left, specs.as_ref())?
     } else {
         HashSet::new()
     };
@@ -3115,6 +3122,7 @@ fn cherry_pick_list(
     repo: &gix::Repository,
     commits: &[ObjectId],
     left: &HashSet<ObjectId>,
+    paths: Option<&super::log::PathspecMatcher>,
 ) -> Result<HashSet<ObjectId>> {
     let (mut lefts, mut rights): (Vec<ObjectId>, Vec<ObjectId>) = (Vec::new(), Vec::new());
     for id in commits {
@@ -3135,12 +3143,12 @@ fn cherry_pick_list(
 
     let mut ids: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     for id in table_side {
-        if let Some(pid) = super::cherry::commit_patch_id(repo, *id)? {
+        if let Some(pid) = super::cherry::commit_patch_id_within(repo, *id, paths)? {
             ids.entry(pid).or_default().push(*id);
         }
     }
     for id in probe_side {
-        let Some(pid) = super::cherry::commit_patch_id(repo, *id)? else {
+        let Some(pid) = super::cherry::commit_patch_id_within(repo, *id, paths)? else {
             continue;
         };
         // `patch_id_iter_first()`: one match is enough, and git flags the commit it found as

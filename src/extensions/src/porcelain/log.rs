@@ -3375,15 +3375,28 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     true => (&lefts, &rights),
                     false => (&rights, &lefts),
                 };
+                // `ids.diffopts.pathspec = revs->diffopt.pathspec;`
+                // (revision.c:1242): the ids are of the change *within the
+                // limited view*, so a pathspec in force here narrows what
+                // "the same patch" means.
+                let cherry_paths = match pathspecs.is_empty() {
+                    true => None,
+                    false => Some(PathspecMatcher::new(&repo, &pathspecs)?),
+                };
+                let cherry_paths = cherry_paths.as_ref();
                 let mut ids: HashMap<ObjectId, ObjectId> = HashMap::new();
                 for id in table {
-                    if let Some(pid) = super::cherry::commit_patch_id(&repo, *id)? {
+                    if let Some(pid) =
+                        super::cherry::commit_patch_id_within(&repo, *id, cherry_paths)?
+                    {
                         ids.entry(pid).or_insert(*id);
                     }
                 }
                 let mut same: HashSet<ObjectId> = HashSet::new();
                 for id in probe {
-                    let Some(pid) = super::cherry::commit_patch_id(&repo, *id)? else {
+                    let Some(pid) =
+                        super::cherry::commit_patch_id_within(&repo, *id, cherry_paths)?
+                    else {
                         continue;
                     };
                     // git flags both commits of the pair.

@@ -11,6 +11,7 @@ pub mod alternate_refs;
 pub mod autocorrect;
 pub mod autostart;
 pub mod config;
+pub mod config_store;
 pub mod crawler;
 pub mod cstdio;
 pub mod date;

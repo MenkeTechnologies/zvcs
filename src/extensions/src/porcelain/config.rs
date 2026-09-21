@@ -1821,7 +1821,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             let name = positional.first().copied().unwrap_or_default();
             let value = positional.get(1).copied().unwrap_or_default();
             match normalized(d.ty, name, value) {
-                Ok(value) => replace_all(&write_target()?, name, &value, positional.get(2).copied(), d.fixed_value),
+                Ok(value) => replace_all(
+                    &write_target()?,
+                    name,
+                    &value,
+                    positional.get(2).copied(),
+                    d.fixed_value,
+                    comment.as_deref(),
+                ),
                 Err(code) => Ok(code),
             }
         }
@@ -1835,7 +1842,14 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // the POSIX ERE, or adds a new value when none match.
         Mode::Auto => match normalized(d.ty, positional[0], positional[1]) {
             Ok(value) => {
-                set_with_value_pattern(&write_target()?, positional[0], &value, positional[2])
+                set_with_value_pattern(
+                    &write_target()?,
+                    positional[0],
+                    &value,
+                    positional[2],
+                    d.fixed_value,
+                    comment.as_deref(),
+                )
             }
             Err(code) => Ok(code),
         },
@@ -3494,78 +3508,59 @@ fn rename_section(target: &WriteTarget, positional: &[&str]) -> Result<ExitCode>
         _ => return usage_error("wrong number of arguments, should be 2"),
     };
     // ```c
-    // if (new_name && !section_name_is_valid(new_name)) {
+    // if (new_name && !section_name_is_ok(new_name)) {
     //         ret = error(_("invalid section name: %s"), new_name);
     //         goto out_no_rollback;
     // }
     // ```
     //
-    // (`git_config_copy_or_rename_section_in_file()`, config.c.) It is the first
-    // thing the rename does — before the lock, before the file is read — and it
-    // is an `error()` returning -1, which surfaces as exit 255. Only the *new*
-    // name is checked; `--remove-section` passes a NULL new name and skips it.
+    // (`repo_config_copy_or_rename_section_in_file()`, config.c:3373-3376.) It is the
+    // first thing the rename does — before the lock, before the file is read — and it is
+    // an `error()` returning -1, which surfaces as exit 255. Only the *new* name is
+    // checked; `--remove-section` passes a NULL new name and skips it.
     if !section_name_is_valid(new) {
         eprintln!("error: invalid section name: {new}");
         return Ok(ExitCode::from(255));
     }
-    let (old_name, old_sub) = split_section(old);
-    let (new_name, new_sub) = split_section(new);
-
-    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
-    let mut file = load_or_empty(&target.path, target.source)?;
-
-    // gix exposes no public "rewrite this header", so the rename is a move: read
-    // the old section's entries in order, drop it, and push them into a section
-    // with the new name. Values keep their order and their multivar repeats.
-    let Ok(section) = file.section(&old_name, old_sub.as_deref().map(gix::bstr::BStr::new)) else {
-        eprintln!("fatal: no such section: {old}");
-        return Ok(ExitCode::from(128));
-    };
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut seen: Vec<(String, usize)> = Vec::new();
-    for raw in section.value_names() {
-        let name = raw.to_lowercase();
-        let nth = seen.iter().filter(|(n, _)| *n == name).count();
-        seen.push((name.clone(), nth));
-        if let Some(v) = section.values(&name).into_iter().nth(nth) {
-            entries.push((name, v.to_vec()));
-        }
-    }
-    file.remove_section(&old_name, old_sub.as_deref().map(gix::bstr::BStr::new));
-
-    let mut dest = file.section_mut_or_create_new(
-        &new_name,
-        new_sub.as_deref().map(gix::bstr::BStr::new),
-    )?;
-    for (name, value) in &entries {
-        dest.push(name.as_str(), Some(value.as_slice().into()))?;
-    }
-    persist(&target.path, &file)?;
-    Ok(ExitCode::SUCCESS)
+    rename_or_remove(target, old, Some(new))
 }
 
-/// `git config --remove-section <name>` — drop the section and everything in it.
+/// `git config --remove-section <name>` — drop the section and everything in it. That is
+/// the same C function with a NULL new name (builtin/config.c:1594-1605).
 fn remove_section(target: &WriteTarget, positional: &[&str]) -> Result<ExitCode> {
     let Some(name) = positional.first() else {
         return usage_error("wrong number of arguments, should be 1");
     };
-    let (section, sub) = split_section(name);
+    rename_or_remove(target, name, None)
+}
 
+/// The shared tail of both: run the line-wise port, then apply the builtin's verdict —
+/// `die(_("no such section: %s"), argv[0])` when no header matched, exit 0 otherwise
+/// (builtin/config.c:1582-1605).
+fn rename_or_remove(target: &WriteTarget, old: &str, new: Option<&str>) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
-    let mut file = load_or_empty(&target.path, target.source)?;
-    let mut removed = false;
-    while file
-        .remove_section(&section, sub.as_deref().map(gix::bstr::BStr::new))
-        .is_some()
-    {
-        removed = true;
+    match crate::config_store::copy_or_rename_section_in_file(&target.path, old, new, false) {
+        Ok(0) => {
+            eprintln!("fatal: no such section: {old}");
+            Ok(ExitCode::from(128))
+        }
+        Ok(_) => Ok(ExitCode::SUCCESS),
+        Err(crate::config_store::RenameError::LongLine(line)) => {
+            eprintln!(
+                "error: refusing to work with overly long line in '{}' on line {line}",
+                target.path.display()
+            );
+            Ok(ExitCode::from(255))
+        }
+        Err(crate::config_store::RenameError::Io(err)) => {
+            eprintln!(
+                "error: could not lock config file {}: {}",
+                target.path.display(),
+                errno_text(&err)
+            );
+            Ok(ExitCode::from(255))
+        }
     }
-    if !removed {
-        eprintln!("fatal: no such section: {name}");
-        return Ok(ExitCode::from(128));
-    }
-    persist(&target.path, &file)?;
-    Ok(ExitCode::SUCCESS)
 }
 
 /// `git config --replace-all <name> <value> [<value-pattern>]` — collapse every
@@ -3579,49 +3574,22 @@ fn replace_all(
     value: &str,
     value_pattern: Option<&str>,
     fixed_value: bool,
+    comment: Option<&str>,
 ) -> Result<ExitCode> {
-    let key = parse_key_write(name)?;
-    let section_lc = key.section_name.to_lowercase();
-    let value_lc = key.value_name.to_lowercase();
-    let filter = match value_pattern.map(|p| ValueFilter::parse(p, fixed_value)) {
-        Some(Err(code)) => return Ok(code),
-        Some(Ok(f)) => Some(f),
-        None => None,
-    };
-
-    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
-    let mut file = load_or_empty(&target.path, target.source)?;
-
-    // Drop every value the filter selects, then push the replacement once — the
-    // "collapse to one" half of git's semantics.
-    let keep: Vec<Vec<u8>> = file
-        .raw_values_by(&section_lc, key.subsection_name, &value_lc)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|v| filter.as_ref().is_some_and(|f| !f.matches(v)))
-        .map(|v| v.to_vec())
-        .collect();
-
-    if let Ok(mut section) = file.section_mut(&section_lc, key.subsection_name) {
-        while section.remove(&value_lc).is_some() {}
-        for v in &keep {
-            section.push(value_lc.as_str(), Some(v.as_slice().into()))?;
-        }
-        section.push(value_lc.as_str(), Some(value.into()))?;
-    } else {
-        file.section_mut_or_create_new(&section_lc, key.subsection_name)?
-            .push(value_lc.as_str(), Some(value.into()))?;
-    }
-    persist(&target.path, &file)?;
-    Ok(ExitCode::SUCCESS)
+    let comment = comment.map(prepare_comment).transpose()?;
+    store_set(
+        target,
+        name,
+        Some(value.as_bytes()),
+        value_pattern_of(value_pattern, fixed_value),
+        comment.as_deref(),
+        true,
+    )
 }
 
-/// Split a `--rename-section`/`--remove-section` operand into its section and
-/// optional subsection halves: `remote.origin` is the subsection `origin` of
-/// `remote`, while `core` has none.
-/// Port of config.c's `section_name_is_valid()`: an empty name is bogus, and up
-/// to the first dot every byte must be ASCII alphanumeric or `-`. Past that dot
-/// lies the subsection, where "anything goes, so we can stop checking".
+/// Port of config.c's `section_name_is_ok()` (config.c:3336): an empty name is bogus, and
+/// up to the first dot every byte must be ASCII alphanumeric or `-`. Past that dot lies
+/// the subsection, where "anything goes, so we can stop checking".
 fn section_name_is_valid(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -3631,18 +3599,9 @@ fn section_name_is_valid(name: &str) -> bool {
         .all(|c| c == b'-' || c.is_ascii_alphanumeric())
 }
 
-fn split_section(spec: &str) -> (String, Option<String>) {
-    match spec.split_once('.') {
-        Some((name, sub)) => (name.to_lowercase(), Some(sub.to_string())),
-        None => (spec.to_lowercase(), None),
-    }
-}
-
 enum WriteOp {
     Set,
     Add,
-    Unset,
-    UnsetAll,
 }
 
 /// Read a config file, mirroring git's `fopen_or_warn`: every errno except
@@ -4065,52 +4024,7 @@ fn unset_scoped(
     all: bool,
     fixed_value: bool,
 ) -> Result<ExitCode> {
-    let key = parse_key_write(name)?;
-    let filter = match value_pattern.map(|p| ValueFilter::parse(p, fixed_value)) {
-        Some(Err(code)) => return Ok(code),
-        Some(Ok(f)) => Some(f),
-        None => None,
-    };
-
-    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
-    prepare_parent(target);
-    let path = &target.path;
-    let Some(mut file) = load_for_write(path, target.source)? else {
-        return Ok(ExitCode::from(3));
-    };
-
-    {
-        let Ok(mut section) = file.section_mut(key.section_name, key.subsection_name) else {
-            return Ok(ExitCode::from(5));
-        };
-        let values = section.values(key.value_name);
-        let matched: Vec<usize> = values
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| filter.as_ref().is_none_or(|f| f.matches(v)))
-            .map(|(i, _)| i)
-            .collect();
-        if matched.is_empty() {
-            return Ok(ExitCode::from(5));
-        }
-        if !all && matched.len() > 1 {
-            eprintln!("warning: {name} has multiple values");
-            return Ok(ExitCode::from(5));
-        }
-        // `SectionMut` removes by name, last occurrence first, so the surviving values are
-        // put back in order rather than removed one by one.
-        let keep: Vec<gix::bstr::BString> = values
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !matched.contains(i))
-            .map(|(_, v)| v.clone())
-            .collect();
-        while section.remove(key.value_name).is_some() {}
-        for value in &keep {
-            section.push(key.value_name, value.as_slice())?;
-        }
-    }
-    persist_or_lock_error(path, &file)
+    store_set(target, name, None, value_pattern_of(value_pattern, fixed_value), None, all)
 }
 
 /// ```c
@@ -4141,6 +4055,84 @@ fn prepare_comment(comment: &str) -> Result<String> {
     })
 }
 
+/// Run git's `repo_config_set_multivar_in_file_gently()` (config.c:2999) against the
+/// scoped file and map its `CONFIG_*` return onto the exit code the builtin propagates.
+///
+/// The key is validated first, the way the C function opens with
+/// `git_config_parse_key()`, so a bad key is reported — and exits — before the file is
+/// touched.
+fn store_set(
+    target: &WriteTarget,
+    name: &str,
+    value: Option<&[u8]>,
+    pattern: crate::config_store::ValuePattern<'_>,
+    comment: Option<&str>,
+    multi_replace: bool,
+) -> Result<ExitCode> {
+    parse_key_write(name)?;
+    let Ok(canonical) = crate::config::parse_config_key(name) else {
+        return Ok(ExitCode::from(1));
+    };
+    let Some(baselen) = name.rfind('.') else {
+        return Ok(ExitCode::from(2));
+    };
+
+    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
+    prepare_parent(target);
+    match crate::config_store::set_multivar_in_file(
+        &target.path,
+        name,
+        &canonical,
+        baselen,
+        value,
+        pattern,
+        comment,
+        multi_replace,
+    ) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(crate::config_store::StoreError::NothingSet) => Ok(ExitCode::from(5)),
+        Err(crate::config_store::StoreError::InvalidFile) => {
+            eprintln!("error: invalid config file {}", target.path.display());
+            Ok(ExitCode::from(3))
+        }
+        Err(crate::config_store::StoreError::InvalidPattern(pattern)) => {
+            eprintln!("error: invalid pattern: {pattern}");
+            Ok(ExitCode::from(6))
+        }
+        Err(crate::config_store::StoreError::Io(err)) => {
+            eprintln!(
+                "error: could not lock config file {}: {}",
+                target.path.display(),
+                errno_text(&err)
+            );
+            Ok(ExitCode::from(255))
+        }
+    }
+}
+
+/// Turn the optional `<value-pattern>` operand into the C function's third argument: a
+/// missing one is `NULL` (which makes `matches()` accept every existing value), and
+/// `--fixed-value` swaps `regexec()` for `strcmp()`.
+fn value_pattern_of(pattern: Option<&str>, fixed: bool) -> crate::config_store::ValuePattern<'_> {
+    match (pattern, fixed) {
+        (None, _) => crate::config_store::ValuePattern::Any,
+        (Some(p), true) => crate::config_store::ValuePattern::Fixed(p),
+        (Some(p), false) => crate::config_store::ValuePattern::Regex(p),
+    }
+}
+
+/// `git config <name> <value>` (ACTION_SET) and `--add` (ACTION_ADD).
+///
+/// ```c
+/// ret = repo_config_set_in_file_gently(the_repository, location_opts.source.file,
+///                                      argv[0], comment, value);
+/// if (ret == CONFIG_NOTHING_SET)
+///         error(_("cannot overwrite multiple values with a single value\n"
+///         "       Use a regexp, --add or --replace-all to change %s."), argv[0]);
+/// ```
+///
+/// (builtin/config.c:1510-1517.) `--add` passes `CONFIG_REGEX_NONE` in place of the NULL
+/// value-pattern, so no existing value ever matches and the new one is appended.
 fn write_scoped(
     target: &WriteTarget,
     name: &str,
@@ -4148,106 +4140,19 @@ fn write_scoped(
     op: WriteOp,
     comment: Option<&str>,
 ) -> Result<ExitCode> {
-    let key = parse_key_write(name)?;
-    let section_lc = key.section_name.to_lowercase();
-    let value_lc = key.value_name.to_lowercase();
-
-    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
-
-    prepare_parent(target);
-    let path = &target.path;
-    let Some(mut file) = load_for_write(path, target.source)? else {
-        return Ok(ExitCode::from(3));
-    };
-
     let comment = comment.map(prepare_comment).transpose()?;
-    // `git_config_set_in_file_gently()` is `git_config_set_multivar_in_file_gently(key,
-    // value, NULL, 0)`, and a NULL value-pattern makes `matches()` answer yes for
-    // every existing value of the key. So a key that already carries more than one
-    // value is not collapsed into one:
-    //
-    // ```c
-    // if (store.seen_nr > 1 && !store.multi_replace) {
-    //         error(_("cannot overwrite multiple values with a single value\n"
-    //                 "       Use a regexp, --add or --replace-all to change %s."), key);
-    //         ret = CONFIG_NOTHING_SET;
-    //         goto out_free;
-    // }
-    // ```
-    //
-    // preceded by `store_aux()`'s `warning(_("%s has multiple values"), key)` on
-    // the second match. Nothing is written and the exit code is 5.
-    if matches!(op, WriteOp::Set) {
-        let existing = file
-            .section(&section_lc, key.subsection_name)
-            .map(|section| section.values(&value_lc).len())
-            .unwrap_or(0);
-        if existing > 1 {
-            eprintln!("warning: {name} has multiple values");
-            eprintln!(
-                "error: cannot overwrite multiple values with a single value\n       \
-                 Use a regexp, --add or --replace-all to change {name}."
-            );
-            return Ok(ExitCode::from(5));
-        }
+    let pattern = match op {
+        WriteOp::Add => crate::config_store::ValuePattern::Never,
+        WriteOp::Set => crate::config_store::ValuePattern::Any,
+    };
+    let code = store_set(target, name, Some(value.as_bytes()), pattern, comment.as_deref(), false)?;
+    if matches!(op, WriteOp::Set) && code == ExitCode::from(5) {
+        eprintln!(
+            "error: cannot overwrite multiple values with a single value\n       \
+             Use a regexp, --add or --replace-all to change {name}."
+        );
     }
-    match op {
-        // A comment can only be attached to a line as it is written, so a `set` that would
-        // have rewritten an existing value in place pushes a new one instead — which is
-        // what git does too, since `git_config_set_multivar_in_file()` writes the whole
-        // line (value and comment) whenever a comment is given.
-        WriteOp::Set if comment.is_some() => {
-            let comment = comment.as_deref().expect("checked above");
-            let mut section = file.section_mut_or_create_new(&section_lc, key.subsection_name)?;
-            while section.remove(&value_lc).is_some() {}
-            section.push_with_prepared_comment(&value_lc, value, comment.into())?;
-        }
-        WriteOp::Set => {
-            file.set_raw_value_by(&section_lc, key.subsection_name, &value_lc, value)?;
-        }
-        WriteOp::Add => {
-            let mut section = file.section_mut_or_create_new(&section_lc, key.subsection_name)?;
-            match comment.as_deref() {
-                Some(comment) => {
-                    section.push_with_prepared_comment(&value_lc, value, comment.into())?;
-                }
-                None => {
-                    section.push(&value_lc, value)?;
-                }
-            }
-        }
-        WriteOp::Unset | WriteOp::UnsetAll => {
-            let mut section = match file.section_mut(key.section_name, key.subsection_name) {
-                Ok(s) => s,
-                // Unsetting an absent key is exit 5 in stock git.
-                Err(_) => return Ok(ExitCode::from(5)),
-            };
-            let count = section.values(key.value_name).len();
-            if count == 0 {
-                return Ok(ExitCode::from(5));
-            }
-            // ```c
-            // if (store->seen_nr == 1 && store->multi_replace == 0) {
-            //         warning(_("%s has multiple values"), key);
-            // }
-            // ```
-            //
-            // (`store_aux()`, config.c:2673-2677.) `git config --unset` on a key with more
-            // than one value is not fatal: it warns, changes nothing, and returns
-            // `CONFIG_NOTHING_SET` — exit 5 (config.h:33).
-            if matches!(op, WriteOp::Unset) && count > 1 {
-                eprintln!("warning: {name} has multiple values");
-                return Ok(ExitCode::from(5));
-            }
-            if matches!(op, WriteOp::UnsetAll) {
-                while section.remove(key.value_name).is_some() {}
-            } else {
-                section.remove(key.value_name);
-            }
-        }
-    }
-
-    persist_or_lock_error(path, &file)
+    Ok(code)
 }
 
 /// `git config <name> <value> <value-pattern>` — the value-pattern set form.
@@ -4270,72 +4175,18 @@ fn set_with_value_pattern(
     name: &str,
     value: &str,
     value_pattern: &str,
+    fixed_value: bool,
+    comment: Option<&str>,
 ) -> Result<ExitCode> {
-    let key = parse_key_write(name)?;
-    let section_lc = key.section_name.to_lowercase();
-    let value_lc = key.value_name.to_lowercase();
-
-    // A leading `!` inverts the match; the remainder is the ERE. Compile it the
-    // way git does before touching the file, so a bad pattern is exit 6 whether
-    // or not any value would have matched.
-    let (invert, pat) = match value_pattern.strip_prefix('!') {
-        Some(rest) => (true, rest),
-        None => (false, value_pattern),
-    };
-    let re = match regex::bytes::Regex::new(pat) {
-        Ok(re) => re,
-        Err(_) => {
-            eprintln!("error: invalid pattern: {pat}");
-            return Ok(ExitCode::from(6));
-        }
-    };
-
-    let _lock = crate::lock::RepoLock::acquire(&target.lock_key);
-
-    prepare_parent(target);
-    let path = &target.path;
-    let Some(mut file) = load_for_write(path, target.source)? else {
-        return Ok(ExitCode::from(3));
-    };
-
-    // Existing values of the key in this file, in order of occurrence. An absent
-    // key yields an empty list, which routes to the append branch below.
-    let existing = file
-        .raw_values_by(&section_lc, key.subsection_name, &value_lc)
-        .unwrap_or_default();
-
-    let mut matching: Vec<usize> = Vec::new();
-    for (i, v) in existing.iter().enumerate() {
-        if re.is_match(v.as_ref()) != invert {
-            matching.push(i);
-        }
-    }
-
-    match matching.as_slice() {
-        // No value matches: append a new one (git's add-on-no-match).
-        [] => {
-            file.section_mut_or_create_new(&section_lc, key.subsection_name)?
-                .push(&value_lc, value)?;
-        }
-        // Exactly one match: rewrite that value in place. The index is shared
-        // with `raw_values_by` above — both walk values in occurrence order.
-        [idx] => {
-            file.raw_values_mut_by(&section_lc, key.subsection_name, &value_lc)?
-                .set_string_at(*idx, value)?;
-        }
-        // Multiple matches without `--replace-all`: git warns and exits 5,
-        // leaving the file untouched.
-        _ => {
-            let key_disp = match key.subsection_name {
-                Some(sub) => format!("{section_lc}.{sub}.{value_lc}"),
-                None => format!("{section_lc}.{value_lc}"),
-            };
-            eprintln!("warning: {key_disp} has multiple values");
-            return Ok(ExitCode::from(5));
-        }
-    }
-
-    persist_or_lock_error(path, &file)
+    let comment = comment.map(prepare_comment).transpose()?;
+    store_set(
+        target,
+        name,
+        Some(value.as_bytes()),
+        value_pattern_of(Some(value_pattern), fixed_value),
+        comment.as_deref(),
+        false,
+    )
 }
 
 /// Create the directory holding a scoped target when git would — a first

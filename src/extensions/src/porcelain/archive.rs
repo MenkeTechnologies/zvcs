@@ -95,21 +95,19 @@
 //! stream over ssh or the daemon, which this port does not open; `--exec` names
 //! the program to run for a local one, as it does for git.
 //!
-//! Not covered — every one of these fails loudly rather than emitting an
-//! archive that would silently differ from git's:
-//!   * `export-subst`. `args->convert` makes `object_file_to_archive()` run
-//!     `format_subst()` over the blob, expanding `$Format:<pretty>$` against the
-//!     archived commit; the `--pretty` formatter is not wired into this command,
-//!     so an entry carrying the attribute is rejected rather than archived
-//!     unexpanded. Everything else `.gitattributes` drives *is* honoured — see
-//!     [`Convert`]: `export-ignore` skips entries and whole sub-trees, and
-//!     `convert_to_working_tree()` (`text`/`eol`/`crlf`, `ident`,
-//!     `working-tree-encoding`, `filter=<driver>`) rewrites blob content, with
-//!     attributes read from the archived tree exactly as git's
-//!     `git_attr_set_direction(GIT_ATTR_INDEX)` does, plus
-//!     `$GIT_DIR/info/attributes`, `core.attributesFile`, `core.autocrlf` and
-//!     `core.eol`. `--worktree-attributes` additionally consults the working
-//!     copy.
+//! `.gitattributes` is honoured in full — see [`Convert`]. `export-ignore` skips
+//! entries and whole sub-trees; `export-subst` runs [`format_subst`] over the
+//! converted blob, expanding each `$Format:<pretty>$` against the archived
+//! commit (and expanding nothing when the tree-ish did not peel to one, since
+//! git's `args->commit` is then NULL); and `convert_to_working_tree()`
+//! (`text`/`eol`/`crlf`, `ident`, `working-tree-encoding`, `filter=<driver>`)
+//! rewrites blob content, with attributes read from the archived tree exactly as
+//! git's `git_attr_set_direction(GIT_ATTR_INDEX)` does, plus
+//! `$GIT_DIR/info/attributes`, `core.attributesFile`, `core.autocrlf` and
+//! `core.eol`. `--worktree-attributes` additionally consults the working copy.
+//!
+//! Not covered — this fails loudly rather than emitting an archive that would
+//! silently differ from git's:
 //!   * Two pathspec-magic corners that need substrate this port does not wire
 //!     into `git archive`: an `:(attr:<name>)` spec is matched as if no
 //!     attribute were set, so an `:(attr:…)` spec selects nothing; and `:(top)`
@@ -356,6 +354,10 @@ struct Item {
     path: Vec<u8>,
     kind: EntryKind,
     oid: ObjectId,
+    /// `check_attr_export_subst(check)` for this path — git's `args->convert`,
+    /// which makes `object_file_to_archive()` run `format_subst()` over the
+    /// converted blob (archive.c:93,108-109).
+    subst: bool,
 }
 
 /// `git archive` — write a `tar` archive of `<tree-ish>` to stdout or `-o`.
@@ -659,6 +661,9 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // the entry mtime; anything else that peels to a tree uses the current time.
     // `lookup_commit_reference_gently(..., quiet)` never diagnoses a miss, so a
     // missing object simply leaves both unset.
+    // `args->commit`: only set when the tree-ish peeled to a commit, and only
+    // then does `object_file_to_archive()` run `format_subst()` (archive.c:93).
+    let subst_commit = object.clone().and_then(|obj| obj.peel_to_commit().ok());
     let commit = object
         .clone()
         .and_then(|obj| obj.peel_to_commit().ok())
@@ -817,7 +822,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
 
     // `write_zip_archive()`: the same walk, a different container.
     if format == "zip" {
-        return write_zip(&repo, &tree, items, &opts, &base, commit_id, mtime, level as i32, &mut conv);
+        return write_zip(&repo, &tree, items, &opts, &base, commit_id, mtime, level as i32, &mut conv, subst_commit.as_ref());
     }
     // ```c
     // strbuf_addstr(&cmd, ar->data);
@@ -893,7 +898,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     for item in items {
         let mut path = base.clone().into_bytes();
         path.extend_from_slice(&item.path);
-        let data = entry_data(&repo, &mut conv, &item)?;
+        let data = entry_data(&repo, &mut conv, &item, subst_commit.as_ref())?;
         report(opts.verbose, &path);
         tar.entry(&path, item.kind, &item.oid, &data)?;
     }
@@ -1566,6 +1571,9 @@ struct Convert<'r> {
     attrs: gix::AttributeStack<'r>,
     outcome: gix::attrs::search::Outcome,
     pipeline: gix::filter::Pipeline<'r>,
+    /// Needed by [`Convert::is_binary`] to resolve a `diff=<name>` attribute
+    /// through `diff.<name>.binary`, the way `userdiff_find_by_name()` does.
+    repo: &'r gix::Repository,
 }
 
 /// What `get_archive_attrs()` yields for one path.
@@ -1596,6 +1604,7 @@ impl<'r> Convert<'r> {
             attrs: repo.attributes_only(&index, source)?,
             outcome: gix::attrs::search::Outcome::default(),
             pipeline,
+            repo,
         })
     }
 
@@ -1646,17 +1655,36 @@ impl<'r> Convert<'r> {
     /// driver, and a driver whose `binary` flag is not `-1` decides on its own
     /// without looking at the content: a bare `diff` selects `driver_true`
     /// (`binary = 0`, text) and `-diff` selects `driver_false` (`binary = 1`,
-    /// binary). An unspecified attribute, `!diff`, and `diff=<name>` all land on
-    /// a driver with `binary = -1` — the `default` driver and every builtin one —
-    /// so those fall through to `buffer_is_binary()` on the *converted* content,
-    /// which is the buffer `write_zip_entry()` has in hand.
+    /// binary) (userdiff.c:372-380,539-545).
+    ///
+    /// `diff=<name>` goes to `userdiff_find_by_name()`, which answers with the
+    /// driver `userdiff_config()` built out of the `diff.<name>.*` keys — and
+    /// `diff.<name>.binary` is a *tristate*: `auto` leaves it at -1, anything
+    /// else is `git_config_bool()` (userdiff.c:442-448,478-479). A configured
+    /// `diff.custom.binary = true` therefore forces binary without the content
+    /// being looked at. A name with no such key, an unspecified attribute and
+    /// `!diff` all land on a driver whose `binary` is -1 — the `default` driver
+    /// and every builtin one — so those fall through to `buffer_is_binary()` on
+    /// the *converted* content, which is the buffer `write_zip_entry()` has in
+    /// hand (archive-zip.c's `entry_is_binary()`).
     fn is_binary(&mut self, path: &[u8], data: &[u8]) -> Result<bool> {
-        let [_ignore, _subst, diff] = self.lookup(path)?;
-        Ok(match diff {
-            gix::attrs::StateRef::Set => false,
-            gix::attrs::StateRef::Unset => true,
-            _ => super::diffcore_rename::buffer_is_binary(data),
-        })
+        // The driver name is copied out before the config is consulted: the
+        // `StateRef` borrows the attribute outcome held by `self`.
+        let driver = {
+            let [_ignore, _subst, diff] = self.lookup(path)?;
+            match diff {
+                gix::attrs::StateRef::Set => return Ok(false),
+                gix::attrs::StateRef::Unset => return Ok(true),
+                gix::attrs::StateRef::Value(v) => Some(v.as_bstr().to_string()),
+                gix::attrs::StateRef::Unspecified => None,
+            }
+        };
+        if let Some(name) = driver {
+            if let Some(binary) = driver_is_binary(self.repo, &name) {
+                return Ok(binary);
+            }
+        }
+        Ok(super::diffcore_rename::buffer_is_binary(data))
     }
 
     /// `object_file_to_archive()`'s `convert_to_working_tree()` call. `path` is
@@ -1674,20 +1702,156 @@ impl<'r> Convert<'r> {
     }
 }
 
+/// `userdiff_find_by_name(<name>)->binary`, as a tristate: `Some(true)`/
+/// `Some(false)` when `diff.<name>.binary` is configured to a boolean,
+/// `None` when it is `auto`, is unset, or names a builtin driver — every one of
+/// which leaves `drv->binary` at -1 (userdiff.c:15-27,442-448,467-479).
+fn driver_is_binary(repo: &gix::Repository, name: &str) -> Option<bool> {
+    let snapshot = repo.config_snapshot();
+    let raw = snapshot
+        .plumbing()
+        .string_by("diff", Some(gix::bstr::BStr::new(name.as_bytes())), "binary")?;
+    let bytes: &[u8] = raw.as_ref();
+    if bytes.eq_ignore_ascii_case(b"auto") {
+        return None;
+    }
+    // `parse_tristate()` hands everything but `auto` to `git_config_bool()`,
+    // which treats a valueless key (`[diff "x"] binary`) as true.
+    Some(
+        gix::config::Boolean::try_from(gix::bstr::BStr::new(bytes))
+            .map(|b| b.0)
+            .unwrap_or(true),
+    )
+}
+
 /// Fetch a tree entry's archive payload, converted as git converts it.
 ///
 /// `write_archive_entry()` hands `NULL` content to the writer for a directory or
 /// a gitlink, and `object_file_to_archive()` only runs the conversion when
 /// `S_ISREG(mode)` — so a symlink's target is archived verbatim.
-fn entry_data(repo: &gix::Repository, conv: &mut Convert<'_>, item: &Item) -> Result<Vec<u8>> {
+fn entry_data(
+    repo: &gix::Repository,
+    conv: &mut Convert<'_>,
+    item: &Item,
+    subst_commit: Option<&gix::Commit<'_>>,
+) -> Result<Vec<u8>> {
     match item.kind {
         EntryKind::Tree | EntryKind::Commit => Ok(Vec::new()),
         EntryKind::Link => Ok(repo.find_object(item.oid)?.data.clone()),
         _ => {
             let raw = repo.find_object(item.oid)?.data.clone();
-            conv.content(&item.path, raw)
+            let converted = conv.content(&item.path, raw)?;
+            // ```c
+            // const struct commit *commit = args->convert ? args->commit : NULL;
+            // [...]
+            // convert_to_working_tree(args->repo->index, path, buf.buf, buf.len, &buf, &meta);
+            // if (commit)
+            //         format_subst(commit, buf.buf, buf.len, &buf, args->pretty_ctx);
+            // ```
+            //
+            // (`object_file_to_archive()`, archive.c:93,107-109.) The substitution
+            // runs *after* the worktree conversion, and only when the archived
+            // tree-ish peeled to a commit — archiving a bare tree leaves
+            // `args->commit` NULL, so `$Format:…$` stays literal.
+            match (item.subst, subst_commit) {
+                (true, Some(commit)) => format_subst(repo, commit, &converted),
+                _ => Ok(converted),
+            }
         }
     }
+}
+
+/// `format_subst()` — expand every `$Format:<pretty>$` in `src` against `commit`
+/// (archive.c:52-83).
+///
+/// ```c
+/// for (;;) {
+///         b = memmem(src, len, "$Format:", 8);
+///         if (!b) break;
+///         c = memchr(b + 8, '$', (src + len) - b - 8);
+///         if (!c) break;
+///         strbuf_reset(&fmt);
+///         strbuf_add(&fmt, b + 8, c - b - 8);
+///         strbuf_add(buf, src, b - src);
+///         repo_format_commit_message(the_repository, commit, fmt.buf, buf, ctx);
+///         len -= c + 1 - src;
+///         src  = c + 1;
+/// }
+/// strbuf_add(buf, src, len);
+/// ```
+///
+/// An unterminated `$Format:` leaves the rest of the file verbatim, including the
+/// marker itself, because the loop breaks with `src` still pointing before it.
+fn format_subst(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    src: &[u8],
+) -> Result<Vec<u8>> {
+    const MARK: &[u8] = b"$Format:";
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let mut rest = src;
+    loop {
+        let Some(b) = rest.windows(MARK.len()).position(|w| w == MARK) else {
+            break;
+        };
+        let after = &rest[b + MARK.len()..];
+        let Some(close) = after.iter().position(|&c| c == b'$') else {
+            break;
+        };
+        out.extend_from_slice(&rest[..b]);
+        let fmt = String::from_utf8_lossy(&after[..close]).into_owned();
+        out.extend_from_slice(&archive_format_commit(repo, commit, &fmt)?);
+        rest = &after[close + 1..];
+    }
+    out.extend_from_slice(rest);
+    Ok(out)
+}
+
+/// `repo_format_commit_message()` under the context `write_archive()` builds:
+/// `struct pretty_print_context ctx = {0}` with `ctx.date_mode.type = DATE_NORMAL`
+/// and `ctx.abbrev = DEFAULT_ABBREV` (archive.c:758,768-769).
+///
+/// [`super::log::format_commit`] renders a bare user format under a *zeroed*
+/// context, where `ctx.abbrev == 0` makes `odb_find_abbrev_len()` answer with the
+/// full hex length (odb.c:957-961) — so it spells `%h`, `%t` and `%p` out in full.
+/// Archive's context asks for `DEFAULT_ABBREV` instead, so the three abbreviating
+/// placeholders are resolved here, to the same `repo_find_unique_abbrev()` result
+/// `strbuf_add_unique_abbrev()` would produce (pretty.c:1572-1590), and handed on
+/// as literal hex. `%%h` is an escaped percent followed by a literal `h` and is
+/// left alone, exactly as git's own `%`-scanner treats it.
+fn archive_format_commit(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    fmt: &str,
+) -> Result<Vec<u8>> {
+    let hexsz = repo.object_hash().len_in_hex();
+    let len = crate::abbrev::configured_abbrev(repo, hexsz);
+    let abbrev = |id: gix::hash::ObjectId| crate::abbrev::unique_abbrev(repo, &id, len);
+
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut expanded = String::with_capacity(fmt.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' || i + 1 >= chars.len() {
+            expanded.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        match chars[i + 1] {
+            'h' => expanded.push_str(&abbrev(commit.id)),
+            't' => expanded.push_str(&abbrev(commit.tree_id()?.detach())),
+            'p' => {
+                let parents: Vec<String> = commit.parent_ids().map(|p| abbrev(p.detach())).collect();
+                expanded.push_str(&parents.join(" "));
+            }
+            other => {
+                expanded.push('%');
+                expanded.push(other);
+            }
+        }
+        i += 2;
+    }
+    super::log::format_commit(repo, commit, &expanded)
 }
 
 /// Depth-first walk producing the exact record sequence git writes.
@@ -1740,6 +1904,9 @@ fn collect(
                 path: dir.clone(),
                 kind,
                 oid,
+                // A directory record carries no content, so `object_file_to_archive()`
+                // never runs for it.
+                subst: false,
             });
             let child = repo.find_object(oid)?.peel_to_tree()?;
             collect(repo, child, &dir, search.as_deref_mut(), conv, pending, out)?;
@@ -1781,16 +1948,11 @@ fn collect(
         if export.ignore {
             continue;
         }
-        if export.subst {
-            // `args->convert = check_attr_export_subst(check)` makes
-            // `object_file_to_archive()` run `format_subst()`, expanding
-            // `$Format:<pretty>$` against the archived commit. That needs the
-            // `--pretty` formatter, which this port does not wire into archive;
-            // failing is honest, silently archiving the unexpanded blob is not.
-            let shown = String::from_utf8_lossy(&path).into_owned();
-            bail!("{shown} has export-subst set, but $Format:…$ expansion is not ported");
-        }
-        out.push(Item { path, kind, oid });
+        // `args->convert = check_attr_export_subst(check)` makes
+        // `object_file_to_archive()` run `format_subst()` over the converted
+        // blob (archive.c:93,108-109); the flag is carried per entry because
+        // the attribute is looked up per path.
+        out.push(Item { path, kind, oid, subst: export.subst });
     }
     Ok(())
 }
@@ -1844,6 +2006,7 @@ fn write_zip(
     mtime: i64,
     level: i32,
     conv: &mut Convert<'_>,
+    subst_commit: Option<&gix::Commit<'_>>,
 ) -> Result<ExitCode> {
     let raw: Box<dyn Write> = match &opts.output {
         Some(path) => Box::new(std::io::BufWriter::new(std::fs::File::create(path)?)),
@@ -1863,7 +2026,7 @@ fn write_zip(
     for item in items {
         let mut path = base.as_bytes().to_vec();
         path.extend_from_slice(&item.path);
-        let data = entry_data(repo, conv, &item)?;
+        let data = entry_data(repo, conv, &item, subst_commit)?;
         // `entry_is_binary()` is asked about `path_without_prefix`, and about the
         // converted buffer — which is what `item.path` and `data` already are.
         let binary = conv.is_binary(&item.path, &data)?;

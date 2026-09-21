@@ -51,7 +51,13 @@ impl crate::Repository {
             return self.git_dir().join("index");
         };
         let path = PathBuf::from(from_env);
-        if path.is_absolute() {
+        // `expand_base_dir()` (repository.c:101-109) stores what `getenv_safe()`
+        // returned *verbatim* when it is non-NULL, so the empty value stays the
+        // empty path rather than being resolved against anything. Joining it onto
+        // the work tree instead named the work tree *directory*, and opening that
+        // as an index answered `EINVAL` where git's `open("")` answers `ENOENT`
+        // and `do_read_index()` (read-cache.c) takes the empty-index branch.
+        if path.is_absolute() || path.as_os_str().is_empty() {
             return path;
         }
         self.workdir().unwrap_or_else(|| self.current_dir()).join(path)

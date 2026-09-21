@@ -2,7 +2,31 @@ use std::path::{Path, PathBuf};
 
 use crate::{DOT_LOCK_SUFFIX, File, Marker};
 
+/// The resource a lock path belongs to: the lock path with the `.lock` the
+/// acquire side appended removed again.
+///
+/// git builds the lock path by *concatenation* — `strbuf_addf(&lk->filename,
+/// "%s%s", path, LOCK_SUFFIX)` (lockfile.h) — so undoing it is the matching
+/// textual strip, not a component-wise one. Going through `Path::extension()`
+/// instead had no answer for a resource path whose own file name is empty:
+/// `GIT_INDEX_FILE=` names the empty path (git's `getenv()` is a presence test,
+/// not a non-empty one), its lock is `.lock`, and `Path::new(".lock")` is a
+/// dotfile *stem* with no extension at all — so every verb that took the index
+/// lock panicked in a crate that cannot report an error, where git writes the
+/// empty tree and exits 0.
 fn strip_lock_suffix(lock_path: &Path) -> PathBuf {
+    // A lock path whose whole file name is `.lock` belongs to a resource whose
+    // file name is empty, and `Path::new(".lock")` is a dotfile *stem* with no
+    // extension — so the `extension()` route below has nothing to strip and used
+    // to panic in a crate that cannot report an error. That path is reachable:
+    // `GIT_INDEX_FILE=` names the empty path, because git reads the variable
+    // with `getenv()` (setup.c:1048) and stores it verbatim
+    // (repository.c:101-109), and its lock is the concatenation `"" + ".lock"`.
+    // git writes `.lock` in the current directory there and `git write-tree`
+    // exits 0 with the empty tree.
+    if lock_path.file_name() == Some(std::ffi::OsStr::new(DOT_LOCK_SUFFIX)) {
+        return lock_path.parent().map_or_else(PathBuf::new, Path::to_owned);
+    }
     let ext = lock_path
         .extension()
         .expect("at least our own extension")

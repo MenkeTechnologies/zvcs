@@ -1315,9 +1315,96 @@ pub fn no_lazy_fetch_environment_gate(sub: &str) {
     }
 }
 
+/// `set_git_work_tree()` (setup.c:1904) reached through `$GIT_WORK_TREE`, which
+/// is the one value in the discovery chain that git tests for *presence* rather
+/// than for content:
+///
+/// ```c
+/// /* setup.c:1217 (setup_discovered_git_dir), :1267 (setup_bare_git_dir) */
+/// if (getenv(GIT_WORK_TREE_ENVIRONMENT) || git_work_tree_cfg) {
+///         ...
+///         return setup_explicit_git_dir(repo, gitdir, cwd, repo_fmt, nongit_ok);
+/// }
+///
+/// /* setup.c:1113, :1142-1143 (setup_explicit_git_dir) */
+/// const char *work_tree_env = getenv(GIT_WORK_TREE_ENVIRONMENT);
+/// ...
+/// if (work_tree_env)
+///         set_git_work_tree(repo, work_tree_env);
+/// ```
+///
+/// `getenv()` is non-NULL for `""`, so `GIT_WORK_TREE=` routes discovery through
+/// the *explicit* work tree arm and hands the empty string to
+/// `set_git_work_tree()` → `repo_set_worktree()` (repository.c:252-254), whose
+/// `real_pathdup(path, 1)` dies at abspath.c:89-91:
+///
+/// ```c
+/// if (!*path) {
+///         if (flags & REALPATH_DIE_ON_ERROR)
+///                 die("The empty string is not a valid path");
+/// ```
+///
+/// The port reached the same code through gitoxide's configuration overrides,
+/// which drop an empty value, so `GIT_WORK_TREE=` was silently equivalent to
+/// leaving it unset and every verb went on with the discovered work tree.
+///
+/// Ordering, measured against git 2.55.0 in a repository whose work tree is the
+/// cwd:
+///
+/// | also set | stock 2.55.0 answers with |
+/// |---|---|
+/// | nothing | `fatal: The empty string is not a valid path` |
+/// | `GIT_TEST_ASSUME_DIFFERENT_OWNER=1` (no `safe.directory`) | `fatal: detected dubious ownership …` |
+/// | `GIT_NO_LAZY_FETCH=bogus` | `fatal: The empty string is not a valid path` |
+/// | `GIT_COMMON_DIR=nosuch` | `fatal: not a git repository (or any of the parent directories): .git` |
+///
+/// so this sits between [`dubious_ownership`] and
+/// [`no_lazy_fetch_environment_gate`]: the walk, ownership included, finishes
+/// first, and everything `setup_git_env_internal()` does comes after.
+///
+/// Silent where git is silent: outside a repository the walk fails before
+/// `setup_explicit_git_dir()` is ever reached (measured: `GIT_WORK_TREE= git
+/// config --list` and `git var GIT_EDITOR` both exit 0 in an empty directory),
+/// and `init` raises its own refusal — `GIT_WORK_TREE … not allowed without
+/// specifying GIT_DIR` — from `builtin/init-db.c` before any of this.
+///
+/// [`crate::NO_SETUP_VERBS`] is deliberately *not* the exemption list: it names
+/// the verbs that survive setup coming up empty, which is a different question
+/// from whether setup runs at all. Measured inside a repository with
+/// `GIT_WORK_TREE=` under git 2.55.0, the `NO_SETUP_VERBS` members `config`,
+/// `diff`, `var`, `hash-object`, `apply`, `bugreport`, `clone`, `column`,
+/// `credential`, `diagnose`, `for-each-repo`, `hook`, `index-pack`,
+/// `interpret-trailers`, `ls-remote`, `mailinfo`, `merge-file`, `patch-id`,
+/// `shortlog`, `show-index`, `url-parse`, `verify-pack`, `bundle`, `difftool`
+/// and `mergetool` all exit 128 with this message — they reach
+/// `setup_git_directory_gently()` themselves. The five that stay silent are the
+/// ones below.
+pub fn work_tree_environment_gate(sub: &str) -> Option<ExitCode> {
+    // Measured to exit 0 under `GIT_WORK_TREE=` inside a repository:
+    // `git version`, `git help`, `git stripspace`, `git check-ref-format
+    // refs/heads/x`, `git credential-cache exit`. `init`/`init-db` refuse with
+    // their own message from `builtin/init-db.c` before setup is reached.
+    if matches!(
+        sub,
+        "version" | "help" | "stripspace" | "check-ref-format" | "credential-cache" | "init" | "init-db"
+    ) {
+        return None;
+    }
+    if !std::env::var_os("GIT_WORK_TREE").is_some_and(|v| v.is_empty()) {
+        return None;
+    }
+    // `$GIT_DIR` takes the explicit arm without a walk; without it the walk has
+    // to find something before `setup_explicit_git_dir()` is reached at all.
+    if std::env::var_os("GIT_DIR").is_none() && gix::discover(".").is_err() {
+        return None;
+    }
+    eprintln!("fatal: The empty string is not a valid path");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
 /// Returns the exit code to leave with, or `None` to continue.
-pub fn dubious_ownership(sub: &str) -> Option<ExitCode> {
-    if crate::NO_SETUP_VERBS.contains(&sub) {
+pub fn dubious_ownership(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if !runs_strict_setup(sub, args) {
         return None;
     }
     if std::env::var_os("GIT_DIR").is_some() {
@@ -1376,6 +1463,49 @@ fn discovered_directory(git_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Whether `sub`, *with these arguments*, reaches git's strict repository setup —
+/// the question the gates below ask before they refuse.
+///
+/// [`crate::NO_SETUP_VERBS`] answers it for whole verbs, but one member decides
+/// per invocation. `cmd_hash_object()` (builtin/hash-object.c:99-105) reads its
+/// options first and only then picks a setup:
+///
+/// ```c
+/// argc = parse_options(argc, argv, prefix, hash_object_options,
+///                      hash_object_usage, 0);
+///
+/// if (flags & INDEX_WRITE_OBJECT)
+///         prefix = setup_git_directory(the_repository);
+/// else
+///         prefix = setup_git_directory_gently(the_repository, &nongit);
+/// ```
+///
+/// `INDEX_WRITE_OBJECT` is `-w` and nothing else — the option has no long form
+/// (builtin/hash-object.c:85-86). Measured against git 2.55.0 inside a
+/// repository: `GIT_OBJECT_DIRECTORY=nosuch git hash-object --stdin` prints the
+/// empty blob's id and exits 0, while adding `-w` exits 128 with `not a git
+/// repository (or any of the parent directories): .git`. The same split shows up
+/// under `GIT_COMMON_DIR=nosuch`, `GIT_DIR=nosuch` and a repository that fails
+/// the ownership check: exempting the verb outright let all four refusals past.
+///
+/// `-w` is found through [`crate::parseopt::expand_short`] rather than by looking
+/// for the character, because `-t` takes a value: `-tw` is the *type* `w` and
+/// carries no `-w` at all, while `-wt blob` is both. Everything behind `--` is a
+/// path.
+pub(crate) fn runs_strict_setup(sub: &str, args: &[String]) -> bool {
+    if !crate::NO_SETUP_VERBS.contains(&sub) {
+        return true;
+    }
+    if sub != "hash-object" {
+        return false;
+    }
+    let table = crate::parseopt::Shorts { flags: "w", values: "t", optargs: "", number: false };
+    crate::parseopt::expand_short(args, table)
+        .iter()
+        .take_while(|word| *word != "--")
+        .any(|word| word == "-w")
+}
+
 /// `is_git_directory()`'s object-database probe (setup.c:433-442).
 ///
 /// ```c
@@ -1408,8 +1538,8 @@ fn discovered_directory(git_dir: &Path) -> Option<PathBuf> {
 /// reports the missing repository, not the bad override.
 ///
 /// Returns the exit code to leave with, or `None` to continue.
-pub fn object_directory_gate(sub: &str) -> Option<ExitCode> {
-    if crate::NO_SETUP_VERBS.contains(&sub) {
+pub fn object_directory_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if !runs_strict_setup(sub, args) {
         return None;
     }
     let objdir = std::env::var_os("GIT_OBJECT_DIRECTORY")?;
@@ -1518,8 +1648,8 @@ pub fn core_worktree_chdir_error(repo: &gix::Repository) -> Option<String> {
 /// variable in the same test.
 ///
 /// Returns the exit code to leave with, or `None` to continue.
-pub fn common_dir_gate(sub: &str) -> Option<ExitCode> {
-    if crate::NO_SETUP_VERBS.contains(&sub) {
+pub fn common_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if !runs_strict_setup(sub, args) {
         return None;
     }
     let common = PathBuf::from(std::env::var_os("GIT_COMMON_DIR")?);
@@ -1623,8 +1753,8 @@ pub fn discovery_gitfile_gate() -> Option<ExitCode> {
 /// — a different message, and one that describes a search git did not perform.
 ///
 /// Returns the exit code to leave with, or `None` to continue.
-pub fn explicit_git_dir_gate(sub: &str) -> Option<ExitCode> {
-    if crate::NO_SETUP_VERBS.contains(&sub) {
+pub fn explicit_git_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if !runs_strict_setup(sub, args) {
         return None;
     }
     let env = std::env::var_os("GIT_DIR")?;
@@ -1752,11 +1882,27 @@ fn command_line_config_count() -> Result<u64, String> {
         if std::env::var_os(&value_var).is_none() {
             return Err(format!("missing config value {value_var}"));
         }
-        // `config_parse_pair()`'s own refusal, reported through the same pair of
-        // lines: a key with no section cannot name anything.
-        if !key.contains('.') {
-            return Err(format!("key does not contain a section: {key}"));
+        // `config_parse_pair()` (config.c:620-633), which the environment triple
+        // reaches at config.c:775 exactly as `-c` reaches it at config.c:674:
+        //
+        // ```c
+        // if (!strlen(key))
+        //         return error(_("empty config key"));
+        // if (git_config_parse_key(key, &canonical_name, NULL))
+        //         return -1;
+        // ```
+        //
+        // The empty key has its own line and never reaches the key parser, so it
+        // is not "a key with no section". Everything else is
+        // `git_config_parse_key()` in full — the port of it is
+        // [`crate::config::parse_config_key`], so a trailing dot, a byte outside
+        // `[A-Za-z0-9-]` and a variable name that does not start with a letter
+        // are all reported here the way `-c` reports them, rather than accepted
+        // because the key happened to contain a dot.
+        if key.is_empty() {
+            return Err("empty config key".to_owned());
         }
+        crate::config::parse_config_key(&key)?;
     }
     Ok(count)
 }

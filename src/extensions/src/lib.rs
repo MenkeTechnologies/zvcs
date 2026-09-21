@@ -61,6 +61,7 @@ pub mod refname;
 pub mod refsort;
 pub mod repo_settings;
 pub mod revfilter;
+pub mod revopt;
 pub mod sequencer;
 pub mod setup;
 pub mod shallow_serve;
@@ -824,14 +825,14 @@ fn run_command(argv: &[String]) -> ExitCode {
     // whether a directory is a repository at all, and it runs before any
     // configuration has been read, so it beats even a malformed command-line
     // override.
-    if let Some(code) = setup::object_directory_gate(&sub) {
+    if let Some(code) = setup::object_directory_gate(&sub, &rest) {
         return code;
     }
     // `$GIT_COMMON_DIR` is the other half of that same test: `is_git_directory()`
     // looks for `objects` and `refs` under the *common* directory, so a variable
     // naming a directory that has neither disqualifies every candidate the walk
     // would try.
-    if let Some(code) = setup::common_dir_gate(&sub) {
+    if let Some(code) = setup::common_dir_gate(&sub, &rest) {
         return code;
     }
     // Then the first read of configuration, which `get_allowed_bare_repo()` and
@@ -843,7 +844,7 @@ fn run_command(argv: &[String]) -> ExitCode {
     // `setup_explicit_git_dir()` (setup.c:1176-1190): with `$GIT_DIR` set there is
     // no walk, so a directory that is not a repository is reported by name rather
     // than as a failed search.
-    if let Some(code) = setup::explicit_git_dir_gate(&sub) {
+    if let Some(code) = setup::explicit_git_dir_gate(&sub, &rest) {
         return code;
     }
     // `safe.bareRepository` (setup.c:1676-1678), one line ahead of ownership.
@@ -853,7 +854,14 @@ fn run_command(argv: &[String]) -> ExitCode {
     // `safe.directory` (setup.c:1651-1656): the gate that stops git operating on a
     // repository someone else owns, whose hooks and configuration would otherwise
     // run as us.
-    if let Some(code) = setup::dubious_ownership(&sub) {
+    if let Some(code) = setup::dubious_ownership(&sub, &rest) {
+        return code;
+    }
+    // The walk is over, so `setup_discovered_git_dir()` hands its result to
+    // `setup_explicit_git_dir()` whenever `$GIT_WORK_TREE` is *set* — the empty
+    // string included (setup.c:1217) — and `set_git_work_tree(repo, "")` dies on
+    // the empty path before any of `setup_git_env_internal()` runs.
+    if let Some(code) = setup::work_tree_environment_gate(&sub) {
         return code;
     }
     // The repository survived the walk, so `setup_git_env_internal()` runs and

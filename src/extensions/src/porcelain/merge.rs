@@ -3520,8 +3520,36 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
     // parents `[a, b]`, not `[main, a, b]`).
     let mut mrc: Vec<ObjectId> = vec![ctx.local_id];
     let should_interrupt = AtomicBool::new(false);
+    // `OCTOPUS_FAILURE`: a head `git-merge-one-file` could not resolve does not
+    // end the loop. The script carries the flag to the *next* iteration and
+    // only refuses there, so whether an unresolved head is a conflict to fix or
+    // a merge the octopus should never have attempted depends on nothing but
+    // whether another head follows it.
+    let mut octopus_failure = false;
 
     for (spec, head_id) in &heads {
+        // ```sh
+        // case "$OCTOPUS_FAILURE" in
+        // 1)
+        //         # We allow only last one to have a hand-resolvable
+        //         # conflicts.  Last round failed and we still had
+        //         # a head to merge.
+        //         gettextln "Automated merge did not work."
+        //         gettextln "Should not be doing an octopus."
+        //         exit 2
+        // esac
+        // ```
+        //
+        // (git-merge-octopus.sh:53-62.) `exit 2` is the strategy-failed status,
+        // so `cmd_merge` rewinds to the pristine tree and prints `Merge with
+        // strategy octopus failed.` — it does not record `MERGE_HEAD` or leave
+        // the conflict in the worktree, which is what returning the conflicted
+        // verdict straight from the failing head used to do.
+        if octopus_failure {
+            println!("Automated merge did not work.");
+            println!("Should not be doing an octopus.");
+            return Ok(Attempt::Refused);
+        }
         let tip = if mrc.len() == 1 { mrc[0] } else { ctx.local_id };
         let all_bases = repo.merge_bases_many(tip, &[*head_id])?;
         // ```sh
@@ -3637,11 +3665,14 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
             cur_index = repo.open_index()?;
             if cur_index.entries().iter().any(|e| e.stage_raw() != 0) {
                 // `OCTOPUS_FAILURE=1`, and `next` stays empty because the second
-                // `write-tree` fails too. The octopus stops here, leaving the
-                // conflicted worktree and index; everything downstream —
-                // `MERGE_HEAD` over every head, the `# Conflicts:` hint, rerere,
-                // the notice — is `cmd_merge`'s shared tail, not the strategy's.
-                return Ok(Attempt::Conflicts(unmerged_paths(&cur_index)));
+                // `write-tree` fails too — so `MRT=$next` leaves the shell
+                // variable empty and `MRC="$MRC $SHA1"` still counts the head.
+                // The loop goes round: this is only the conflicted verdict when
+                // no head follows (`exit "$OCTOPUS_FAILURE"` below), and the
+                // refusal at the top of the next iteration otherwise.
+                octopus_failure = true;
+                mrc.push(*head_id);
+                continue;
             }
         }
         // `next=$(git write-tree)`, and `write-tree` is what fills the index's
@@ -3655,6 +3686,14 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
         cur_index.set_tree(Some(cache_tree));
         crate::index_racy::write(repo, &mut cur_index)?;
         mrc.push(*head_id);
+    }
+
+    // `exit "$OCTOPUS_FAILURE"` (git-merge-octopus.sh:125): the last head was
+    // the one that could not be resolved, so this is an ordinary conflicted
+    // merge. Everything downstream — `MERGE_HEAD` over every head, the
+    // `# Conflicts:` hint, rerere, the notice — is `cmd_merge`'s shared tail.
+    if octopus_failure {
+        return Ok(Attempt::Conflicts(unmerged_paths(&cur_index)));
     }
 
     // Nothing merged: every head was already reachable.

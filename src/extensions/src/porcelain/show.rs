@@ -3187,15 +3187,20 @@ fn show_commit_record(
         Vec::new()
     } else if diff_shown {
         let mut warn = super::diffcore_rename::Warnings::default();
-        let mut f = collect_changes(repo, commit, against, &disp.patch, &mut warn)?;
+        // Built before the diff so `--find-copies-harder` can only draw copy sources
+        // from paths the pathspec admits, which is what limiting git's tree walk does.
+        let specs = match pathspecs.is_empty() {
+            true => None,
+            false => Some(super::log::PathspecMatcher::new(repo, pathspecs)?),
+        };
+        let mut f = collect_changes(repo, commit, against, &disp.patch, &mut warn, specs.as_ref())?;
         // Only a pass that reached `too_many_rename_candidates()` writes the
         // `diff_options` fields (see `git log`'s `record_rename_warnings`); an
         // empty report leaves the previous commit's in place.
         if warn.needed_rename_limit != 0 || warn.degraded_cc_to_c {
             disp.rename_warn.borrow_mut().current = warn;
         }
-        if !pathspecs.is_empty() {
-            let specs = super::log::PathspecMatcher::new(repo, pathspecs)?;
+        if let Some(specs) = &specs {
             f.retain(|c| specs.matches(&c.path));
         }
         if pickaxe_path {
@@ -3929,6 +3934,9 @@ fn collect_changes(
     // whole command, so each commit's rename pass overwrites the last — and
     // `diff_result_code()` reports whatever the final one left behind.
     warn: &mut super::diffcore_rename::Warnings,
+    // `-- <pathspec>`: git limits the *tree walk* to it, so the unmodified entries
+    // `--find-copies-harder` adds as copy sources are limited by it too.
+    specs: Option<&super::log::PathspecMatcher>,
 ) -> Result<Vec<FileChange>> {
     let ws = opts.ws;
     let new_tree = commit.tree()?;
@@ -3954,7 +3962,7 @@ fn collect_changes(
             out.push(f);
         }
     }
-    *warn = detect_renames(repo, &mut out, opts)?;
+    *warn = detect_renames(repo, &mut out, opts, old_tree.as_ref(), specs)?;
     Ok(out)
 }
 
@@ -3970,13 +3978,23 @@ fn detect_renames(
     repo: &gix::Repository,
     files: &mut Vec<FileChange>,
     popts: &super::diff::PatchOpts,
+    // The pre-image tree, needed only by `--find-copies-harder`, which takes copy
+    // sources from files the commit did not touch.
+    old_tree: Option<&gix::Tree<'_>>,
+    specs: Option<&super::log::PathspecMatcher>,
 ) -> Result<super::diffcore_rename::Warnings> {
     let cfg = repo.config_snapshot();
-    let detect = popts.renames.unwrap_or_else(|| {
+    let mut detect = popts.renames.unwrap_or_else(|| {
         super::diffcore_rename::config_rename(
             cfg.string("diff.renames").as_deref().map(|v| v.as_bstr()),
         )
     });
+    // `diff_setup_done()` (diff.c:5288): `--find-copies-harder` on its own turns copy
+    // detection on. `-C -C` arrives with `renames` already at `DETECT_COPY` through
+    // its first `-C`, but a lone `--find-copies-harder` sets only the flag.
+    if popts.find_copies_harder {
+        detect = super::diffcore_rename::DETECT_COPY;
+    }
     // `-B` runs on its own: `diffcore_std()` breaks rewrites whether or not rename
     // detection follows, and a break with no rename pass still reports the split.
     let wants_break = popts.break_opt != -1;
@@ -4015,6 +4033,51 @@ fn detect_renames(
         ));
         let idx = q.add_pair(one, two);
         q.pairs[idx].status = f.status;
+    }
+
+    // `--find-copies-harder`: `tree-diff.c:517-532` skips emitting an entry that is
+    // identical on both sides only `if (!opt->flags.find_copies_harder)`, so with the
+    // flag every unchanged path is queued as an unmodified pair and can serve as a
+    // rename source. Append one per pre-image blob the change list does not already
+    // cover; `diffcore_rename()`'s write-back leaves the ones that did not become
+    // copy sources unmatched, and the rebuild below finds no `files` entry for them
+    // and drops them, so they never reach the output on their own.
+    if popts.find_copies_harder && detect == super::diffcore_rename::DETECT_COPY {
+        if let Some(tree) = old_tree {
+            let seen: std::collections::BTreeSet<Vec<u8>> = files
+                .iter()
+                .filter(|f| f.old_mode.is_some())
+                .map(|f| f.path.clone())
+                .collect();
+            let mut recorder = gix::traverse::tree::Recorder::default();
+            tree.traverse().breadthfirst(&mut recorder)?;
+            for entry in recorder.records {
+                if !entry.mode.is_blob_or_symlink() {
+                    continue;
+                }
+                let path = entry.filepath.to_vec();
+                if seen.contains(&path) {
+                    continue;
+                }
+                if specs.is_some_and(|specs| !specs.matches(&path)) {
+                    continue;
+                }
+                let mode = u32::from(entry.mode.value());
+                let one = q.add_spec(super::diffcore_rename::FileSpec::new(
+                    path.clone().into(),
+                    mode,
+                    entry.oid,
+                    true,
+                ));
+                let two = q.add_spec(super::diffcore_rename::FileSpec::new(
+                    path.into(),
+                    mode,
+                    entry.oid,
+                    true,
+                ));
+                q.add_pair(one, two);
+            }
+        }
     }
 
     let mut content = super::diffcore_rename::OdbContent { repo };
@@ -4712,7 +4775,7 @@ fn combined_pickaxe_survivors(
     let mut survivors: Option<Vec<Vec<u8>>> = None;
     for parent in parents {
         let mut warn = super::diffcore_rename::Warnings::default();
-        let mut f = collect_changes(repo, commit, Some(parent.detach()), &disp.patch, &mut warn)?;
+        let mut f = collect_changes(repo, commit, Some(parent.detach()), &disp.patch, &mut warn, specs.as_ref())?;
         if let Some(specs) = &specs {
             f.retain(|c| specs.matches(&c.path));
         }

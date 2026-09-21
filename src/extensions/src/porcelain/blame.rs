@@ -1024,7 +1024,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     let line_funcname = line_funcname.as_ref().and_then(|d| d.funcname.as_ref());
     match resolve_line_specs(&opts.line_specs, &final_image, &rel_path, line_funcname) {
         Ok(ranges) => opts.ranges = ranges,
-        Err(LineSpecError::Usage) => return print_usage(cmd, false),
+        Err(LineSpecError::Usage) => return print_synopsis(cmd),
         Err(LineSpecError::Fatal(msg)) => {
             let mut err = std::io::stderr().lock();
             writeln!(err, "fatal: {msg}")?;
@@ -1218,9 +1218,10 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // blame runs — one, except mid-merge where each `MERGE_HEAD` scapegoat of the synthetic
     // working-tree commit is its own.
     let mut stats = gix::blame::Statistics::default();
-    // `blame_origin::previous`, which the porcelain format reports and which walking forwards is a
-    // *child*, so it cannot be rediscovered from a commit's parents the way [`find_previous`]
-    // does it.
+    // `blame_origin::previous`, which the porcelain formats report. Only the walk knows it: it is
+    // whichever scapegoat origin `pass_blame()` handed entries to first, a *child* under
+    // `--reverse`, and it carries the name the file had there, so no lookup in the object database
+    // reconstructs it.
     let mut previous_origins: PreviousOrigins = std::collections::BTreeMap::new();
     // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
     // which come from the outcome on a miss and from the object on a hit.
@@ -1345,7 +1346,6 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         let info = collect_commit_info(&repo, &lines, &opts, &null_id, &rel_path)?;
         let head_id = if index_only { None } else { head_id };
         return emit_incremental(
-            &repo,
             &entries,
             &info,
             &rel_path,
@@ -1391,7 +1391,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // The synthetic commit only records a `previous` origin when it actually
         // handed lines to one, which never happens when the path is index-only.
         let head_id = if index_only { None } else { head_id };
-        emit_porcelain(&repo, &lines, &info, &rel_path, head_id, &null_id, &opts, &previous_origins)?
+        emit_porcelain(&lines, &info, &rel_path, head_id, &null_id, &opts, &previous_origins)?
     } else {
         emit_human(&repo, &lines, &info, &rel_path, &opts, &colors, &refcounts)?
     };
@@ -2239,7 +2239,6 @@ fn emit_human(
 }
 
 fn emit_porcelain(
-    repo: &gix::Repository,
     lines: &[Line],
     info: &HashMap<ObjectId, CommitInfo>,
     rel_path: &str,
@@ -2267,18 +2266,26 @@ fn emit_porcelain(
         if !previous_cache.contains_key(&key) {
             let previous = if &first.commit_id == null_id {
                 head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
-            } else if opts.reverse {
-                // Walking forwards, `origin->previous` is the first *child* the origin handed
-                // entries to, which no amount of looking at the commit's parents will find.
-                previous_of(previous_origins, first, current_path)
             } else {
-                // `origin->previous` as `pass_blame()` recorded it — the first parent
-                // origin the commit handed entries to. That origin carries the path
-                // the file had *in the parent*, which is the only place a commit that
-                // renamed and modified in one step states its pre-rename name. A cache
-                // hit ran no walk and so has no map; the parent tree answers there.
+                // `origin->previous` as `pass_blame()` recorded it — the first
+                // scapegoat origin the commit handed entries to, a parent going
+                // forwards and a *child* under `--reverse`. That origin carries
+                // the path the file had on the other side, which is the only
+                // place a commit that renamed and modified in one step states its
+                // pre-rename name.
+                //
+                // The walk's record is the whole answer, because that is all
+                // `write_filename_info()` (`builtin/blame.c:233-242`) consults:
+                // it prints the field if and only if `suspect->previous` is set,
+                // and only `pass_blame()` (`blame.c:2474-2487`) sets it. A commit
+                // the walk never passed blame *through* therefore prints no
+                // `previous`, and the boundary of a limited blame is exactly such
+                // a commit: `git blame -p A..B -- f` marks the oldest reachable
+                // commit `boundary` and stops, so git printed `boundary` /
+                // `filename g.txt` with nothing between them while a
+                // first-parent tree lookup named the commit below the bottom.
+                // `--since` and `--first-parent` cut the walk off the same way.
                 previous_of(previous_origins, first, current_path)
-                    .map_or_else(|| find_previous(repo, first.commit_id, path), |p| Ok(Some(p)))?
             };
             previous_cache.insert(key.clone(), previous);
         }
@@ -2475,7 +2482,6 @@ fn clip_to_ranges(
 /// finalizes it, with the commit's detail block emitted only the first time that commit
 /// appears and the path information repeated for every entry.
 fn emit_incremental(
-    repo: &gix::Repository,
     entries: &[IncrementalEntry],
     info: &HashMap<ObjectId, CommitInfo>,
     rel_path: &str,
@@ -2507,7 +2513,21 @@ fn emit_incremental(
             let previous = if &entry.commit_id == null_id {
                 head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
             } else {
-                // Same `blame_origin::previous` the coalesced porcelain reports.
+                // Same `blame_origin::previous` the coalesced porcelain reports,
+                // and *only* that: `write_filename_info()`
+                // (`builtin/blame.c:233-242`) prints the field if and only if the
+                // walk left a `suspect->previous` behind, which `pass_blame()`
+                // (`blame.c:2474-2487`) sets from `first_scapegoat()` — the
+                // parents going forward, the children under `--reverse`. There is
+                // no object-database fallback in git, and inventing one from
+                // `commit^` reported a `previous` git does not: under
+                // `--reverse`, the newest commit in the range has no scapegoat at
+                // all, so `git blame --incremental --reverse A..B -- f` printed
+                // `filename f` with no `previous` line while a first-parent
+                // lookup happily named `A`. `--incremental` is also the one
+                // porcelain the blame cache never serves (the `!opts.incremental`
+                // term in `cache_key` above), so there is no cache-hit case here
+                // that a fallback could have been covering.
                 previous_origins
                     .get(&(entry.commit_id, entry.source_name.clone()))
                     .map(|(commit_id, name)| {
@@ -2516,7 +2536,6 @@ fn emit_incremental(
                             name.clone().unwrap_or_else(|| current_path.to_vec()),
                         )
                     })
-                    .map_or_else(|| find_previous(repo, entry.commit_id, path), |p| Ok(Some(p)))?
             };
             previous_cache.insert(key.clone(), previous);
         }
@@ -2642,33 +2661,6 @@ fn previous_of(
         })
 }
 
-/// The `previous <commit> <path>` field derived from the object database alone:
-/// the first parent of `commit` in which `path` still exists. Used only where the
-/// walk's own record is unavailable — a cache hit — since it cannot name a path
-/// a rename changed.
-fn find_previous(
-    repo: &gix::Repository,
-    commit: ObjectId,
-    path: &[u8],
-) -> Result<Option<(String, Vec<u8>)>> {
-    let commit = repo.find_commit(commit)?;
-    let Some(parent) = commit.parent_ids().next() else {
-        return Ok(None);
-    };
-    let parent_id = parent.detach();
-    let Ok(path_str) = std::str::from_utf8(path) else {
-        return Ok(None);
-    };
-    let tree = repo.find_commit(parent_id)?.tree()?;
-    if tree
-        .lookup_entry_by_path(std::path::Path::new(path_str))?
-        .is_none()
-    {
-        return Ok(None);
-    }
-    Ok(Some((parent_id.to_hex().to_string(), path.to_vec())))
-}
-
 /// `quote_c_style()`: the name verbatim unless some byte needs escaping, in which
 /// case the whole name double-quoted with C escapes. The table and the
 /// `core.quotePath` flag it reads live in [`crate::quote`], shared with every
@@ -2695,6 +2687,21 @@ fn format_tz(offset_seconds: i32) -> String {
 /// no operand wrote 0 to stdout and the same 2097 bytes to stderr.
 fn print_usage(cmd: &str, to_stdout: bool) -> Result<ExitCode> {
     write_usage(cmd, USAGE_BODY, to_stdout)
+}
+
+/// `usage(str_usage)` — the *bare* synopsis, with no option block at all.
+///
+/// `usage()` is not `usage_with_options()`: `usage.c:45-48`'s `usage_builtin()`
+/// is `vreportf(_("usage: "), err, params)` over the single string it was handed
+/// and nothing else, so the only rejection path that reaches it —
+/// `builtin/blame.c:1206-1210`, a `-L` spec `parse_range_arg()` could not parse —
+/// prints one line to stderr and exits 129. Measured against git 2.55.0:
+/// `git blame -L xyz g.txt` wrote 0 bytes to stdout and 62 to stderr, exactly
+/// `usage: git blame [<options>] [<rev-opts>] [<rev>] [--] <file>\n`; the same
+/// command as `annotate` wrote the `git annotate` synopsis. Contrast
+/// [`print_usage`], whose 2097-byte block covers the `parse_options` rejections.
+fn print_synopsis(cmd: &str) -> Result<ExitCode> {
+    write_usage(cmd, "", false)
 }
 
 /// `--help-all`: the same synopsis over [`USAGE_BODY_ALL`], always on stdout —
@@ -5630,7 +5637,8 @@ fn parse_abbrev_cb(arg: &str) -> Result<usize, &'static str> {
 #[derive(Debug)]
 enum LineSpecError {
     /// `parse_range_arg()` returned non-zero, which `cmd_blame` answers with
-    /// `usage(str_usage)` — the stderr usage block and exit 129.
+    /// `usage(str_usage)` — the bare synopsis line on stderr and exit 129, not
+    /// the option block; see [`print_synopsis`].
     Usage,
     /// git dies with this message and exit 128.
     Fatal(String),

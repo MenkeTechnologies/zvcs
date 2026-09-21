@@ -12,7 +12,8 @@
 //! the one-name and the `--stage=all` three-name form, `-z` record separators,
 //! path names made relative to the current directory and C-quoted), the stderr
 //! diagnostics (`git checkout-index: <path> is not in the cache` / `is unmerged`
-//! / `does not exist at stage <n>` / `has skip-worktree enabled`, and
+//! / `does not exist at stage <n>` / `has skip-worktree enabled; use
+//! '--ignore-skip-worktree-bits' to checkout`, and
 //! `<path> already exists, no checkout`), the `die()` messages, and the exit
 //! codes: 0 on success, 1 when any path failed, 128 for a fatal argument error,
 //! 129 for an unknown option (which also prints git's usage block).
@@ -485,7 +486,7 @@ fn checkout_file(ctx: &mut Ctx<'_>, ents: &[Ent], name: &BStr) -> Result<bool> {
         let reason = if !has_same_name {
             "is not in the cache".to_string()
         } else if is_skipped {
-            "has skip-worktree enabled".to_string()
+            "has skip-worktree enabled; use '--ignore-skip-worktree-bits' to checkout".to_string()
         } else if ctx.opts.stage != 0 {
             format!("does not exist at stage {}", ctx.opts.stage)
         } else {

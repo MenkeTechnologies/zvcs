@@ -212,10 +212,23 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
                 Err(m) => return fatal(&m),
             },
             'm' => {
-                // Each -m is its own paragraph, and always ends a line.
+                // Each -m is its own paragraph, and completes a line:
+                //
+                // ```c
+                //      if (buf->len)
+                //              strbuf_addch(buf, '\n');
+                //      strbuf_addstr(buf, arg);
+                //      strbuf_complete_line(buf);
+                // ```
+                //
+                // (`parse_message_arg_callback()`, builtin/commit-tree.c:64-67.)
+                // `strbuf_complete_line()` is a no-op on an *empty* buffer
+                // (strbuf.h: `if (sb->len && sb->buf[sb->len - 1] != '\n')`), so
+                // a lone `-m ""` leaves the message empty rather than turning it
+                // into a bare newline.
                 separate(&mut message);
                 message.extend_from_slice(value.as_bytes());
-                if !message.ends_with(b"\n") {
+                if !message.is_empty() && !message.ends_with(b"\n") {
                     message.push(b'\n');
                 }
                 have_message = true;

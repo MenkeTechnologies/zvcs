@@ -350,6 +350,22 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         opts.show_trees = true;
     }
 
+    // `cmd_ls_tree` splits the two failures the way `object-name.c` does:
+    // `repo_get_oid_with_flags()` only has to *name* an object — a full-length
+    // hex string is decoded and returned without the odb being consulted (see
+    // [`crate::objname::full_hex`]) — and it is `repo_parse_tree_indirect()`
+    // that reports "not a tree object", for a missing object and a non-tree
+    // alike. Resolving through the odb here would mis-report an absent but
+    // well-formed id as an invalid name.
+    let Some(id) = crate::objname::resolve(&repo, spec) else {
+        return Ok(fatal(&format!("Not a valid object name {spec}")));
+    };
+
+    // `parse_pathspec()` runs *after* the tree-ish has been named and *before*
+    // the tree is parsed (builtin/ls-tree.c:410-423, :427-429), so a bad name
+    // outranks a bad pathspec and a bad pathspec outranks `not a tree object`.
+    let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
+
     // Path filters. A `:`-prefixed operand carries pathspec magic: git's
     // ls-tree accepts only `top` (`:/`) and `literal`, rejecting every other
     // magic with a fatal (128) diagnostic. Parse it the way git does, then
@@ -373,13 +389,54 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         } else {
             ((*p).to_string(), false)
         };
+        // `init_pathspec_item()`'s second `die()`, per element and right after the
+        // magic has been taken off:
+        //
+        // ```c
+        //      if (magic & PATHSPEC_FROMTOP) {
+        //              match = xstrdup(copyfrom);
+        //              prefixlen = 0;
+        //      } else {
+        //              match = prefix_path_gently(prefix, prefixlen, &prefixlen, copyfrom);
+        //              if (!match) {
+        //                      …
+        //                      die(_("%s: '%s' is outside repository at '%s'"), elt,
+        //                          copyfrom, absolute_path(hint_path));
+        //              }
+        //      }
+        // ```
+        //
+        // (pathspec.c, quoted in full at
+        // [`crate::pathspec::first_outside_repository_fatal`].) `:(top)` takes the
+        // path verbatim and is never tested, which is why `:(top)/a` is a silent
+        // no-match while a bare `/a` is fatal. This port's own
+        // `normalize_pathspec()` collapses an escaping element into one that
+        // simply matches nothing, so both used to be a silent exit 0.
+        if !from_top {
+            if let Some(msg) = crate::pathspec::first_outside_repository_fatal(
+                &repo,
+                std::slice::from_ref(p),
+                defaults,
+            ) {
+                return Ok(fatal(&msg));
+            }
+        }
         // `top` magic anchors at the root; everything else is resolved against the
         // cwd prefix, then run through `normalize_path_copy()` — which is what makes
         // `git ls-tree HEAD ..` from `sub/deep` list `sub/` and `git ls-tree HEAD .`
         // list the directory it was run in. Without the collapse the element stayed
         // the literal `sub/deep/..`, which matches no entry and printed nothing.
+        // An *absolute* element never gets the prefix: `prefix_path_gently()`
+        // hands it to `abspath_part_inside_repo()`, which returns it spelled
+        // relative to the working tree root (setup.c:56-118). So
+        // `git ls-tree HEAD "$PWD/deep"` from the root lists `deep`, and the same
+        // element from `deep/` still means `deep`, not `deep/deep`. The gate
+        // above has already dealt with an absolute path that is *not* inside.
         let joined = match from_top {
             true => cleaned,
+            false if cleaned.starts_with('/') => {
+                inside_worktree_relative(&repo, &cleaned).unwrap_or(cleaned)
+            }
             false => format!("{cwd_prefix}{cleaned}"),
         };
         // An element that names the directory it started from normalizes to the
@@ -395,16 +452,6 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         opts.paths.push(cwd_prefix.clone().into_bytes());
     }
 
-    // `cmd_ls_tree` splits the two failures the way `object-name.c` does:
-    // `repo_get_oid_with_flags()` only has to *name* an object — a full-length
-    // hex string is decoded and returned without the odb being consulted (see
-    // [`crate::objname::full_hex`]) — and it is `repo_parse_tree_indirect()`
-    // that reports "not a tree object", for a missing object and a non-tree
-    // alike. Resolving through the odb here would mis-report an absent but
-    // well-formed id as an invalid name.
-    let Some(id) = crate::objname::resolve(&repo, spec) else {
-        return Ok(fatal(&format!("Not a valid object name {spec}")));
-    };
     let peeled = repo
         .find_object(id)
         .ok()
@@ -627,7 +674,7 @@ fn walk(
             // when it matches a pathspec directly or is an ancestor of one (so
             // ancestor trees still appear under `-t`, matching git).
             let recurse = should_descend(&name, opts);
-            let interesting = path_selects(&name, opts) || is_ancestor_of_spec(&name, opts);
+            let interesting = path_selects(&name, mode, opts) || is_ancestor_of_spec(&name, opts);
             if interesting && (!recurse || opts.show_trees) {
                 write_entry(repo, out, mode, &oid, &name, opts)?;
             }
@@ -637,7 +684,7 @@ fn walk(
                 base.push(b'/');
                 walk(repo, child, &base, opts, out)?;
             }
-        } else if !(opts.dirs_only && !mode.is_commit()) && path_selects(&name, opts) {
+        } else if !(opts.dirs_only && !mode.is_commit()) && path_selects(&name, mode, opts) {
             // LS_TREE_ONLY (`-d`) drops only OBJ_BLOB entries: object_type()
             // maps a gitlink to OBJ_COMMIT, so a submodule still prints.
             write_entry(repo, out, mode, &oid, &name, opts)?;
@@ -649,14 +696,43 @@ fn walk(
 /// Whether `name` is selected by the path filters (empty filters select all).
 ///
 /// A filter `p` selects `name` when it names the entry exactly or when the entry
-/// lives inside the directory `p`. A trailing '/' on the filter is ignored for
-/// this test (`dir` and `dir/` both select `dir` and everything under it); the
-/// distinction between the two only affects whether the directory line is shown,
-/// which git decides via the recursion rules in `walk`.
-fn path_selects(name: &[u8], opts: &Opts) -> bool {
+/// lives inside the directory `p`.
+///
+/// A filter longer than the entry it is tested against is `match_entry()`'s
+/// "partial pathname" case, and a trailing '/' is what makes `dir/` longer than
+/// `dir`:
+///
+/// ```c
+///     if (matchlen > pathlen) {
+///             if (match[pathlen] != '/')
+///                     return 0;
+///             /*
+///              * Reject non-directories as partial pathnames, except
+///              * when match is a submodule with a trailing slash and
+///              * nothing else (to handle 'submod/' and 'submod'
+///              * uniformly).
+///              */
+///             if (!S_ISDIR(entry->mode) &&
+///                 (!S_ISGITLINK(entry->mode) || matchlen > pathlen + 1))
+///                     return 0;
+///     }
+/// ```
+///
+/// (tree-walk.c:892-904.) So `a/` selects nothing when `a` is a blob, while
+/// `deep/` still selects the tree `deep` — whose own line `walk` then suppresses
+/// because the trailing slash also makes it recurse — and `submod/` selects the
+/// gitlink `submod`, but `submod//` does not.
+fn path_selects(name: &[u8], mode: EntryMode, opts: &Opts) -> bool {
     opts.match_all
         || opts.paths.is_empty()
         || opts.paths.iter().any(|p| {
+            if p.len() > name.len() {
+                // The partial-pathname arm: everything past the entry name must
+                // be exactly one '/', and only a tree or a gitlink may claim it.
+                return p.get(name.len()) == Some(&b'/')
+                    && name == &p[..name.len()]
+                    && (mode.is_tree() || (mode.is_commit() && p.len() == name.len() + 1));
+            }
             let base = trim_trailing_slashes(p);
             name == base || (name.starts_with(base) && name.get(base.len()) == Some(&b'/'))
         })
@@ -951,5 +1027,54 @@ fn object_id_str(repo: &gix::Repository, oid: &ObjectId, opts: &Opts) -> Result<
             .and_then(|c| repo.objects.disambiguate_prefix(c).ok().flatten())
             .map_or_else(|| oid.to_hex_with_len(n).to_string(), |p| p.to_string()),
         Abbrev::Auto => oid.attach(repo).shorten_or_id().to_string(),
+    })
+}
+
+/// `abspath_part_inside_repo()` (setup.c:56-118): an absolute pathspec element
+/// that lies inside the working tree is respelled relative to its root.
+///
+/// ```c
+///     if (!strncmp(path, wt, wtlen)) {
+///             path += wtlen;
+///             ...
+///     }
+/// ```
+///
+/// git compares against `repo_get_work_tree()`, which `setup_work_tree()` filled
+/// from `xgetcwd()` — so it is already symlink-resolved, and the realpath of the
+/// worktree is what has to be stripped here. The element's own `.` and `..`
+/// components are collapsed first (`normalize_path_copy_len()`), and a trailing
+/// `/` survives, because it is what tells `ls-tree` to descend.
+///
+/// Returns `None` when the element is not under the working tree, leaving the
+/// caller's element untouched — the "outside repository" gate has already run.
+fn inside_worktree_relative(repo: &gix::Repository, abs: &str) -> Option<String> {
+    let workdir = repo.workdir()?;
+    let root = gix::path::realpath(workdir).unwrap_or_else(|_| workdir.to_owned());
+    let root = root.to_str()?;
+
+    let trailing = abs.ends_with('/');
+    // Collapse `//`, `.` and `..` the way `normalize_path_copy_len()` does.
+    let mut parts: Vec<&str> = Vec::new();
+    for c in abs.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    let normalized = format!("/{}", parts.join("/"));
+
+    let rest = normalized.strip_prefix(root)?;
+    let rest = match rest {
+        "" => "",
+        r => r.strip_prefix('/')?,
+    };
+    Some(match (rest.is_empty(), trailing) {
+        (true, _) => String::new(),
+        (false, true) => format!("{rest}/"),
+        (false, false) => rest.to_owned(),
     })
 }

@@ -273,6 +273,17 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
     let cone = if add { is_cone(&repo)? } else { update_cone_mode(&repo, cone)? };
     let prefix = worktree_prefix(&repo);
 
+    // `sparse_checkout_set()` runs `update_modes()` (builtin/sparse-checkout.c:875)
+    // *before* it collects the arguments and calls `sanitize_paths()` (:889), so a
+    // definition rejected by the sanity checks still leaves `core.sparseCheckout`,
+    // `core.sparseCheckoutCone`, `index.sparse` and `extensions.worktreeConfig`
+    // recorded. Measured against git 2.55.0: `git sparse-checkout set /folder1`
+    // in a non-sparse repo dies with "specify directories rather than patterns"
+    // yet still turns the worktree config on, so the following `list` answers
+    // "warning: this worktree is not sparse (sparse-checkout file may not exist)"
+    // instead of dying. Writing the config after validation inverts both.
+    enable_config(&repo, cone, sparse_index, record_mode)?;
+
     // builtin/sparse-checkout.c:881-890 — "Cone mode automatically specifies the
     // toplevel directory. For non-cone mode, if nothing is specified, manually
     // select just the top-level directory (much as 'init' would do)."
@@ -304,7 +315,10 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
 
     let sparsity = if cone {
         let mut dirs: BTreeSet<String> = if add {
-            cone_dirs(&read_pattern_file(&repo)?)
+            match read_pattern_file_for_add(&repo) {
+                Ok(lines) => cone_dirs(&lines),
+                Err(code) => return Ok(code),
+            }
         } else {
             BTreeSet::new()
         };
@@ -323,13 +337,19 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
         Sparsity::Cone(cone)
     } else {
         // Non-cone patterns are stored exactly as typed, appended in order.
-        let mut lines: Vec<String> = if add { read_pattern_file(&repo)? } else { Vec::new() };
+        let mut lines: Vec<String> = if add {
+            match read_pattern_file_for_add(&repo) {
+                Ok(lines) => lines,
+                Err(code) => return Ok(code),
+            }
+        } else {
+            Vec::new()
+        };
         lines.extend(inputs.iter().filter(|l| !l.is_empty()).cloned());
         write_pattern_file(&repo, &lines)?;
         Sparsity::Patterns(parse_patterns(&lines))
     };
 
-    enable_config(&repo, cone, sparse_index, record_mode)?;
     apply(&repo, &sparsity)?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1346,6 +1366,33 @@ fn read_pattern_file(repo: &gix::Repository) -> Result<Vec<String>> {
         return Ok(Vec::new());
     };
     Ok(text.lines().map(str::to_owned).collect())
+}
+
+/// The same read, but with `add`'s refusal when the file is not there.
+///
+/// Both of `add`'s arms load the existing definition through
+/// `add_patterns_from_file_to_list()` and die on a non-zero return:
+///
+/// ```c
+///     if (add_patterns_from_file_to_list(sparse_filename, "", 0,
+///                                        &existing, NULL, 0))
+///             die(_("unable to load existing sparse-checkout patterns"));
+/// ```
+///
+/// (`add_patterns_cone_mode()`, builtin/sparse-checkout.c:651-653, and
+/// `add_patterns_literal()`, :679-681.) `add_patterns()` is handed a NULL
+/// `istate`, so a failed `open()` — a missing `info/sparse-checkout` included —
+/// returns -1 straight away (dir.c:1164-1170). An *empty* file is not an error:
+/// it returns 0 at dir.c:1178-1186, which is what the `read_to_string` success
+/// arm above reproduces.
+fn read_pattern_file_for_add(repo: &gix::Repository) -> std::result::Result<Vec<String>, ExitCode> {
+    match std::fs::read_to_string(pattern_path(repo)) {
+        Ok(text) => Ok(text.lines().map(str::to_owned).collect()),
+        Err(_) => {
+            eprintln!("fatal: unable to load existing sparse-checkout patterns");
+            Err(ExitCode::from(128))
+        }
+    }
 }
 
 /// Recover the recursive directory set from a cone pattern file.

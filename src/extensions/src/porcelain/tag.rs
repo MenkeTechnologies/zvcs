@@ -440,8 +440,17 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             // `--column[=<opts>]` / `--no-column`: the list is laid out through the
             // same engine `git column` uses (see `list_tags`). `--no-column` is git's
             // "never", which leaves the default one-name-per-line output.
-            "--column" => super::column::parseopt_column(&mut colopts, None, false)
-                .map_err(|m| anyhow!("{m}"))?,
+            // `column.c:282`'s `error("unsupported option '%s'", arg)` reaches
+            // `parseopt_column_callback()` as -1, which `parse_options_step()` turns
+            // into `PARSE_OPT_ERROR` and `parse_options()` answers with a bare
+            // `exit(129)` (parse-options.c:975-977) — one `error:` line on stderr and
+            // *no* usage block.
+            "--column" => {
+                if let Err(m) = super::column::parseopt_column(&mut colopts, None, false) {
+                    eprintln!("error: {m}");
+                    return Ok(ExitCode::from(129));
+                }
+            }
             "--no-column" => {
                 let _ = super::column::parseopt_column(&mut colopts, None, true);
             }
@@ -489,8 +498,13 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 } else if a == "--cleanup" {
                     cleanup = Some(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--column=") {
-                    super::column::parseopt_column(&mut colopts, Some(rest), false)
-                        .map_err(|m| anyhow!("{m}"))?;
+                    // See the `--column` arm above: a bad style is one `error:` line
+                    // and `exit(129)`, with no usage block.
+                    if let Err(m) = super::column::parseopt_column(&mut colopts, Some(rest), false)
+                    {
+                        eprintln!("error: {m}");
+                        return Ok(ExitCode::from(129));
+                    }
                 } else if let Some(rest) = a.strip_prefix("--color=") {
                     // `parse_opt_color_flag_cb` (parse-options-cb.c:50) runs the
                     // value through `git_config_colorbool(NULL, arg)`, which with a
@@ -902,6 +916,69 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     )
 }
 
+/// `repo_git_path(the_repository, "TAG_EDITMSG")` as git prints it.
+/// `setup_git_directory()` has already moved to the top of the work tree, so an
+/// ordinary repository names its git directory `.git` however deep the command
+/// was run — which is why this cannot simply print `repo.git_dir()`.
+fn tag_editmsg_shown(repo: &gix::Repository) -> String {
+    let git_dir = repo.git_dir();
+    let shown = match repo.workdir() {
+        Some(top) if git_dir == top.join(".git") => std::path::Path::new(".git"),
+        _ => git_dir,
+    };
+    shown.join("TAG_EDITMSG").display().to_string()
+}
+
+/// Port of `refs_verify_refname_available()` (refs.c:2800-2924) for the one
+/// reference `git tag` creates, which is what a `ref_transaction_commit()` runs
+/// before it will take the lock.
+///
+/// Two directions of directory/file conflict are reported with the same text:
+///
+/// ```c
+/// strbuf_addf(err, _("'%s' exists; cannot create '%s'"), dirname.buf, refname);
+/// …
+/// strbuf_addf(err, _("'%s' exists; cannot create '%s'"), iter->ref.name, refname);
+/// ```
+///
+/// (refs.c:2844 for a leading directory of the new name that is itself a
+/// reference, refs.c:2897 for an existing reference *below* the new name). Both
+/// look through packed refs as well as loose ones, and neither is waived by
+/// `--force`: the name is unavailable, not merely taken. The leaf itself is never
+/// a conflict with itself, so the prefix walk stops before the last component.
+///
+/// gitoxide's ref edit does not make this check — it reaches the filesystem and
+/// comes back with a bare `File exists`/`Not a directory`/`Directory not empty`
+/// errno, which names neither reference — so it is made here.
+fn verify_refname_available(repo: &gix::Repository, refname: &str) -> Option<String> {
+    let mut idx = 0usize;
+    while let Some(pos) = refname[idx..].find('/') {
+        let end = idx + pos;
+        let dirname = &refname[..end];
+        if repo
+            .try_find_reference(dirname)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return Some(format!("'{dirname}' exists; cannot create '{refname}'"));
+        }
+        idx = end + 1;
+    }
+    let prefix = format!("{refname}/");
+    let found = repo
+        .references()
+        .ok()?
+        .prefixed(prefix.as_str())
+        .ok()?
+        .flatten()
+        .next()?;
+    Some(format!(
+        "'{}' exists; cannot create '{refname}'",
+        found.name().as_bstr()
+    ))
+}
+
 /// The three lines and the exit code that follow a signature git could not
 /// produce, in order (builtin/tag.c:269-278 and 378-383):
 ///
@@ -937,18 +1014,9 @@ fn sign_failed(repo: &gix::Repository, e: crate::gitsig::SignFailure) -> ExitCod
         }
     }
     eprintln!("error: unable to sign the tag");
-    // `repo_git_path(the_repository, "TAG_EDITMSG")`. `setup_git_directory()` has
-    // already moved to the top of the work tree, so an ordinary repository names
-    // its git directory `.git` however deep the command was run — which is why this
-    // cannot simply print `repo.git_dir()`.
-    let git_dir = repo.git_dir();
-    let shown = match repo.workdir() {
-        Some(top) if git_dir == top.join(".git") => std::path::Path::new(".git"),
-        _ => git_dir,
-    };
     eprintln!(
         "The tag message has been left in {}",
-        shown.join("TAG_EDITMSG").display()
+        tag_editmsg_shown(repo)
     );
     ExitCode::from(128)
 }
@@ -1407,11 +1475,28 @@ fn create_tag(
             } else if let Some(prev) = previous_tag_body(repo, &format!("refs/tags/{name}"))? {
                 prev
             } else {
+                // ```c
+                // strbuf_addch(&buf, '\n');
+                // strbuf_commented_addf(&buf, comment_line_str,
+                //                       _(tag_template), tag, comment_line_str);
+                // ```
+                // with
+                // ```c
+                // static const char tag_template[] =
+                //         N_("\nWrite a message for tag:\n  %s\n"
+                //         "Lines starting with '%s' will be ignored.\n");
+                // ```
+                //
+                // (builtin/tag.c:201-203, 340-344.) The template's own leading `\n`
+                // is inside what gets commented, so the blank line `strbuf_addch()`
+                // wrote is followed by a bare comment character on a line of its own
+                // — `strbuf_commented_addf()` comments empty lines as just the
+                // prefix, with no trailing space.
                 let mut b = vec![b'\n'];
                 let c = super::commit::comment_prefix(&repo.config_snapshot());
                 b.extend_from_slice(
                     format!(
-                        "{c} Write a message for tag:\n{c}   {name}\n\
+                        "{c}\n{c} Write a message for tag:\n{c}   {name}\n\
                          {c} Lines starting with '{c}' will be ignored.\n"
                     )
                     .as_bytes(),
@@ -1423,9 +1508,12 @@ fn create_tag(
                 eprintln!("Please supply the message using either -m or -F option.");
                 return Ok(ExitCode::from(1));
             }
-            let edited = std::fs::read(&path)?;
-            let _ = std::fs::remove_file(&path);
-            edited
+            // git does *not* unlink here: `cmd_tag()` keeps `TAG_EDITMSG` until the
+            // ref transaction has committed (`unlink_or_warn(path)`,
+            // builtin/tag.c:704-707), which is what makes its `The tag message has
+            // been left in %s` on a failed transaction point at a file that is
+            // really still there.
+            std::fs::read(&path)?
         } else {
             raw
         };
@@ -1550,6 +1638,31 @@ fn create_tag(
         ));
     }
 
+    // The other precondition `ref_transaction_commit()` weighs before it takes the
+    // lock: the name has to be available, i.e. free of a directory/file clash with
+    // any reference that already exists. `cmd_tag()` answers a failed transaction
+    // with
+    //
+    // ```c
+    // if (path)
+    //         fprintf(stderr, _("The tag message has been left in %s\n"), path);
+    // die("%s", err.buf);
+    // ```
+    //
+    // (builtin/tag.c:698-703), where `path` is set for every annotated or signed
+    // tag — so the `TAG_EDITMSG` line precedes the death whenever a tag *object*
+    // was built, whether or not anything was ever written to that file. The
+    // backend's own text is `cannot lock ref '<ref>': <reason>`.
+    if let Some(reason) = verify_refname_available(repo, ref_name.as_str()) {
+        if annotate {
+            eprintln!(
+                "The tag message has been left in {}",
+                tag_editmsg_shown(repo)
+            );
+        }
+        return fatal(&format!("cannot lock ref '{ref_name}': {reason}"));
+    }
+
     // git always computes a reflog message describing the *target* object (built
     // before the tag object exists), then writes the ref with `REF_FORCE_CREATE_REFLOG`
     // only under `--create-reflog`. Mirror that: force the reflog via an explicit
@@ -1577,6 +1690,11 @@ fn create_tag(
     } else {
         repo.tag_reference(name, new_id, constraint)?;
     }
+    // `if (path) { unlink_or_warn(path); free(path); }` (builtin/tag.c:704-707):
+    // the editor buffer is discarded only once the reference is in place.
+    if annotate {
+        let _ = std::fs::remove_file(repo.git_dir().join("TAG_EDITMSG"));
+    }
 
     if let Some(old) = prev {
         if old != new_id {
@@ -1594,7 +1712,7 @@ fn create_tag(
 /// 0), which leaves no key in front of it. git's separator set here is `=` plus
 /// `trailer.separators` (default `:`). Returns git's `error:` text for the first
 /// offending argument.
-fn validate_trailer_args(repo: &gix::Repository, trailers: &[String]) -> Option<String> {
+pub(super) fn validate_trailer_args(repo: &gix::Repository, trailers: &[String]) -> Option<String> {
     let configured = repo
         .config_snapshot()
         .string("trailer.separators")

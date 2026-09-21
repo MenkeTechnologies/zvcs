@@ -715,8 +715,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `-C`/`-c` reuse an existing commit's message (and author); `-c` also opens
     // the editor. `-F` reads the message from a file. All are message *sources*
     // like `-m`, resolved once the repo is open.
-    let mut reuse_arg: Option<String> = None;
-    let mut reedit = false;
+    // They are two *separate* `OPT_STRING` slots in git — `use_message` for `-C`
+    // and `edit_message` for `-c` (builtin/commit.c:121-122) — which is why giving
+    // both is a conflict (`die_for_incompatible_opt4(!!use_message, "-C",
+    // !!edit_message, "-c", …)`, builtin/commit.c:1341) and why each `--no-` form
+    // clears only its own slot. They are folded into one only afterwards, by
+    // `if (edit_message) use_message = edit_message;` (builtin/commit.c:1351-1352).
+    let mut use_message_arg: Option<String> = None;
+    let mut edit_message_arg: Option<String> = None;
     let mut file_args: Vec<String> = Vec::new();
     // `-s`/`--signoff` adds a `Signed-off-by:` trailer with the committer ident;
     // `--squash`/`--fixup` build an autosquash-formatted message from a commit.
@@ -833,20 +839,18 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "-m" | "--message" => messages.push(super::take_value(args, &mut i, a)?.to_string()),
             "-F" | "--file" => file_args.push(super::take_value(args, &mut i, a)?.to_string()),
             "-C" | "--reuse-message" => {
-                reuse_arg = Some(super::take_value(args, &mut i, a)?.to_string())
+                use_message_arg = Some(super::take_value(args, &mut i, a)?.to_string())
             }
             "-c" | "--reedit-message" => {
-                reuse_arg = Some(super::take_value(args, &mut i, a)?.to_string());
-                reedit = true;
+                edit_message_arg = Some(super::take_value(args, &mut i, a)?.to_string());
             }
             "--date" => date_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
             s if s.starts_with("--file=") => file_args.push(s["--file=".len()..].to_string()),
             s if s.starts_with("--reuse-message=") => {
-                reuse_arg = Some(s["--reuse-message=".len()..].to_string())
+                use_message_arg = Some(s["--reuse-message=".len()..].to_string())
             }
             s if s.starts_with("--reedit-message=") => {
-                reuse_arg = Some(s["--reedit-message=".len()..].to_string());
-                reedit = true;
+                edit_message_arg = Some(s["--reedit-message=".len()..].to_string());
             }
             s if s.starts_with("--date=") => date_arg = Some(s["--date=".len()..].to_string()),
             "--allow-empty" => allow_empty = true,
@@ -866,10 +870,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             //   `-q` is an `OPT__QUIET` (`OPT_COUNTUP`), whose unset resets to 0.
             "--no-message" => messages.clear(),
             "--no-file" => file_args.clear(),
-            "--no-reuse-message" | "--no-reedit-message" => {
-                reuse_arg = None;
-                reedit = false;
-            }
+            "--no-reuse-message" => use_message_arg = None,
+            "--no-reedit-message" => edit_message_arg = None,
             "--no-date" => date_arg = None,
             "--no-author" => author_arg = None,
             "--no-fixup" => fixup_arg = None,
@@ -1061,9 +1063,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `die_for_incompatible_opt4()` names the first two that are set, in the order it was given
     // them.
     {
-        // `-c` and `-C` share one slot here (`reuse_arg`), told apart by `reedit`.
-        let use_message = reuse_arg.is_some() && !reedit;
-        let edit_message = reuse_arg.is_some() && reedit;
+        let use_message = use_message_arg.is_some();
+        let edit_message = edit_message_arg.is_some();
         let logfile = !file_args.is_empty();
         let have_option_m = !messages.is_empty();
         let first_two = |set: &[(bool, &str)]| -> Option<(String, String)> {
@@ -1092,6 +1093,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // `if (edit_message) use_message = edit_message;` (builtin/commit.c:1351-1352).
+    // At most one of the two survived the conflict check above, so from here on a
+    // single slot plus the `reedit` flag (which is what makes `-c` open the editor)
+    // carries both spellings.
+    let reedit = edit_message_arg.is_some();
+    let reuse_arg: Option<String> = edit_message_arg.or(use_message_arg);
 
     // `-p` implies `--interactive`, and the four ways of choosing what to stage
     // are mutually exclusive (git's `die_for_incompatible_opt4(also, only, all,
@@ -1221,11 +1228,31 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let only_mode =
         (only_flag || !pathspecs.is_empty() || fixup_reword) && !include_flag && !interactive;
 
-    // `-z` promotes an unset (or explicitly long) format to porcelain, and any
-    // format at all implies a dry run — git's `finalize_deferred_config()` plus
-    // the `status_format != STATUS_FORMAT_NONE` rule in cmd_commit.
-    if null_term && matches!(status_format, StatusFormat::None | StatusFormat::Long) {
-        status_format = StatusFormat::Porcelain;
+    // `-z` promotes an unset format to porcelain and refuses an explicitly long
+    // one, and any format at all implies a dry run — git's
+    // `finalize_deferred_config()` plus the `status_format != STATUS_FORMAT_NONE`
+    // rule in cmd_commit:
+    //
+    // ```c
+    // if (s->null_termination) {
+    //         if (status_format == STATUS_FORMAT_NONE ||
+    //             status_format == STATUS_FORMAT_UNSPECIFIED)
+    //                 status_format = STATUS_FORMAT_PORCELAIN;
+    //         else if (status_format == STATUS_FORMAT_LONG)
+    //                 die(_("options '%s' and '%s' cannot be used together"), "--long", "-z");
+    // }
+    // ```
+    //
+    // (builtin/commit.c:1262-1268.) `--short` and `--porcelain` pass through, so
+    // only the long format — which has no NUL-delimited spelling — is fatal.
+    if null_term {
+        match status_format {
+            StatusFormat::Long => {
+                crate::git_fatal!("options '--long' and '-z' cannot be used together")
+            }
+            StatusFormat::None => status_format = StatusFormat::Porcelain,
+            _ => {}
+        }
     }
     if status_format != StatusFormat::None {
         dry_run = true;
@@ -1466,35 +1493,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // (`read_commit_message()`, builtin/commit.c.) An object that is not a commit has
     // already been reported by `object_as_type()`'s `error: object %s is a %s, not a %s`,
     // so the death is the *second* line of two.
+    // `lookup_commit_reference_by_name()` *peels* — so `-C <annotated tag>` reuses
+    // the tagged commit's message and author rather than dying, and only what the
+    // chain ends at has to be a commit.
     let reuse_commit = match &reuse_arg {
-        Some(spec) => {
-            let resolved = repo
-                .rev_parse_single(spec.as_str())
-                .ok()
-                .and_then(|id| repo.find_object(id).ok());
-            // `lookup_commit_reference_by_name()` goes through
-            // `lookup_commit_reference_gently(…, quiet=1)`, which *peels* — so
-            // `-C <annotated tag>` reuses the tagged commit's message and author
-            // rather than dying, and only what the chain ends at has to be a
-            // commit.
-            let resolved = resolved.map(|o| match o.kind {
-                gix::object::Kind::Tag => o.clone().peel_tags_to_end().unwrap_or(o),
-                _ => o,
-            });
-            match resolved {
-                Some(object) if object.kind == gix::object::Kind::Commit => {
-                    Some(object.into_commit())
-                }
-                Some(object) => {
-                    eprintln!(
-                        "error: object {} is a {}, not a commit",
-                        object.id, object.kind
-                    );
-                    crate::git_fatal!("could not lookup commit '{spec}'");
-                }
-                None => crate::git_fatal!("could not lookup commit '{spec}'"),
-            }
-        }
+        Some(spec) => match lookup_commit_reference_by_name(&repo, spec.as_str()) {
+            Some(commit) => Some(commit),
+            None => crate::git_fatal!("could not lookup commit '{spec}'"),
+        },
         None => None,
     };
     // `-C` (unlike `-c`) supplies the message directly, with no editor.
@@ -1527,11 +1533,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // commit — the `squash!` subject is inserted before every other message
         // option contributes, and `squash_fixup_seed` outranks `reuse_commit`
         // when the editor buffer is built.
-        let c = repo.find_commit(
-            repo.rev_parse_single(spec.as_str())
-                .map_err(|e| anyhow::anyhow!("could not lookup commit {spec}: {e}"))?
-                .detach(),
-        )?;
+        // ```c
+        // c = lookup_commit_reference_by_name(squash_message);
+        // if (!c)
+        //         die(_("could not lookup commit '%s'"), squash_message);
+        // ```
+        // (builtin/commit.c:794-796.)
+        let c = match lookup_commit_reference_by_name(&repo, spec.as_str()) {
+            Some(c) => c,
+            None => crate::git_fatal!("could not lookup commit '{spec}'"),
+        };
         let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
         if from_flags {
             // A `-m`/`-F` body follows the `squash!` subject line. A `-C`/`-c`
@@ -1571,11 +1582,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             } else {
                 (raw.as_str(), "fixup")
             };
-        let c = repo.find_commit(
-            repo.rev_parse_single(fixup_spec)
-                .map_err(|e| anyhow::anyhow!("could not lookup commit {fixup_spec}: {e}"))?
-                .detach(),
-        )?;
+        // ```c
+        // commit = lookup_commit_reference_by_name(fixup_commit);
+        // if (!commit)
+        //         die(_("could not lookup commit '%s'"), fixup_commit);
+        // ```
+        // (builtin/commit.c:829-831.)
+        let c = match lookup_commit_reference_by_name(&repo, fixup_spec) {
+            Some(c) => c,
+            None => crate::git_fatal!("could not lookup commit '{fixup_spec}'"),
+        };
         let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
         if fixup_prefix == "fixup" {
             // Default `--fixup`: no editor; a `-m` body follows the subject line.
@@ -2247,7 +2263,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `git interpret-trailers --in-place --no-divider <COMMIT_EDITMSG> <args>`;
     // we call the very same implementation in-process.
     if !trailer_args.is_empty() {
-        apply_trailers(&msg_path, &trailer_args)?;
+        apply_trailers(&repo, &msg_path, &trailer_args)?;
     }
 
     // ```c
@@ -3743,7 +3759,27 @@ fn scissors_line(comment: &str) -> String {
 /// `--trailer <token>[(=|:)<value>]` — git spawns
 /// `git interpret-trailers --in-place --no-divider <COMMIT_EDITMSG> <--trailer v>…`
 /// and we call that exact implementation, with that exact argument order.
-fn apply_trailers(msg_path: &std::path::Path, trailers: &[String]) -> Result<()> {
+fn apply_trailers(
+    repo: &gix::Repository,
+    msg_path: &std::path::Path,
+    trailers: &[String],
+) -> Result<()> {
+    // ```c
+    // if (validate_trailer_args(trailer_args)) {
+    //         ret = -1;
+    //         goto out;
+    // }
+    // ```
+    //
+    // (`amend_file_with_trailers()`, trailer.c.) The arguments are weighed before
+    // the message file is even read, and `cmd_commit()` answers any failure of the
+    // helper with `die(_("unable to pass trailers to --trailers"))`
+    // (builtin/commit.c:1070-1072) — the same pair `git tag` prints, from the same
+    // ported check, so a rejected `--trailer` records no commit at all.
+    if let Some(err) = super::tag::validate_trailer_args(repo, trailers) {
+        eprintln!("error: {err}");
+        crate::git_fatal!("unable to pass trailers to --trailers");
+    }
     let mut args: Vec<String> = vec![
         "--in-place".to_string(),
         "--no-divider".to_string(),
@@ -5077,6 +5113,40 @@ fn expand_tilde(tok: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(tok)
+}
+
+/// Port of `lookup_commit_reference_by_name()` (commit.c:109-126), which is how
+/// `git commit` resolves the argument of `-C`/`-c`, `--squash` and `--fixup`:
+///
+/// ```c
+/// if (repo_get_oid_committish(the_repository, name, &oid))
+///         return NULL;
+/// commit = lookup_commit_reference_gently(the_repository, &oid, quiet);
+/// ```
+///
+/// `quiet` is 0 here, so the chain peels tags and an object that does not end at
+/// a commit is reported by `object_as_type()`'s `error: object %s is a %s, not a
+/// %s` before the caller's own `die(_("could not lookup commit '%s'"), …)`. A name
+/// that does not resolve at all yields `NULL` silently, leaving only the `die()`.
+fn lookup_commit_reference_by_name<'r>(
+    repo: &'r gix::Repository,
+    spec: &str,
+) -> Option<gix::Commit<'r>> {
+    let object = repo
+        .rev_parse_single(spec)
+        .ok()
+        .and_then(|id| repo.find_object(id).ok())?;
+    let object = match object.kind {
+        gix::object::Kind::Tag => object.clone().peel_tags_to_end().unwrap_or(object),
+        _ => object,
+    };
+    match object.kind {
+        gix::object::Kind::Commit => Some(object.into_commit()),
+        kind => {
+            eprintln!("error: object {} is a {}, not a commit", object.id, kind);
+            None
+        }
+    }
 }
 
 /// git's folded `%s` subject: skip leading blank lines, then join the lines of

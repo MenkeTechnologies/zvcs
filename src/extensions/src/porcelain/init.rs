@@ -178,7 +178,13 @@ fn usage_only() -> ExitCode {
 }
 
 pub fn init(args: &[String]) -> Result<ExitCode> {
-    let mut bare = false;
+    // `is_bare_repository_cfg` (environment.c), which starts at -1 for "not
+    // said": `None` here. It is process-global, so `git --bare` sets it to 1
+    // before the subcommand ever runs (git.c:256-258, v2.55.0) and init's own
+    // flag is `OPT_SET_INT(0, "bare", &is_bare_repository_cfg, …, 1)`
+    // (builtin/init-db.c:93) writing that same variable — last one wins,
+    // `--no-bare` writing 0.
+    let mut bare: Option<bool> = None;
     let mut quiet = false;
     let mut initial_branch: Option<String> = None;
     // Every non-option operand, in order. git's `parse_options` collects these
@@ -235,13 +241,13 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         };
         match arg {
             "--" => positional_only = true,
-            "--bare" => bare = true,
+            "--bare" => bare = Some(true),
             // git's parse-options auto-generates a `--no-` form for every OPT_BOOL
             // and OPT_STRING; the negation resets the option to its default (false
             // for booleans, unset for strings), and parsing is last-wins. `--shared`
             // uses a custom callback with no negation, so `--no-shared` is NOT
             // accepted (git reports it as an unknown option) and is left unhandled.
-            "--no-bare" => bare = false,
+            "--no-bare" => bare = Some(false),
             // `parse-options` answers `-h` before anything else, on stdout.
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -337,6 +343,13 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // the usage block and exits 129 (the operand count is judged first), while
     // `git init --separate-git-dir=x --bare a b` dies with the option-conflict
     // message and exits 128 (that check precedes the operand count).
+
+    // What the command line left in `is_bare_repository_cfg`, `git --bare`'s 1
+    // included — so `git --bare init <dir>` is `git init --bare <dir>` and,
+    // like it, rewrites `GIT_DIR` to the operand directory below instead of
+    // initializing into the directory `git --bare` had already exported.
+    let bare_cfg = bare.or_else(|| gix::open::bare_repository_cfg().then_some(true));
+    let bare = bare_cfg == Some(true);
 
     // git refuses to combine these (builtin/init-db.c: "cannot be used together").
     if separate_git_dir.is_some() && bare {
@@ -459,6 +472,23 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // not the cwd, not `.git` and not `*/.git` is taken to be a bare repository
     // ("Otherwise it is often bare. At this point we are just guessing.").
     let bare_layout = bare || guess_repository_type(&git_dir_spec, &cwd);
+
+    // The *second* refusal, once the layout is known:
+    //
+    // ```c
+    // else {
+    //         if (real_git_dir)
+    //                 die(_("--separate-git-dir incompatible with bare repository"));
+    // ```
+    // (builtin/init-db.c:247-250, v2.55.0). The one at :118-119 sees only an
+    // explicit `is_bare_repository_cfg == 1`; a git directory that is bare
+    // because `guess_repository_type()` said so — `GIT_DIR=. git init
+    // --separate-git-dir goop.git` in a directory of its own — reaches this one.
+    // Without it the port went on to move a git directory into a subdirectory of
+    // itself and reported the rename's errno.
+    if bare_layout && separate_git_dir.is_some() {
+        crate::git_fatal!("--separate-git-dir incompatible with bare repository");
+    }
 
     // `init_db`'s `original_git_dir`: `real_pathdup(git_dir, 1)`, the git
     // directory named on its own terms, before any `gitdir:` link is followed.

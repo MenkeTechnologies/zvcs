@@ -34,19 +34,6 @@ use super::{Arg, LongOpt};
 /// follows before giving up.
 const SYMREF_MAXDEPTH: usize = 5;
 
-/// `ref_rev_parse_rules` as `(prefix, suffix)` pairs. A rule matches a refname
-/// when the name carries `prefix`; the suffix is only used when *building* a
-/// candidate name, mirroring `sscanf`, whose `%s` swallows the remainder and
-/// never enforces the trailing literal.
-const REV_PARSE_RULES: [(&str, &str); 6] = [
-    ("", ""),
-    ("refs/", ""),
-    ("refs/tags/", ""),
-    ("refs/heads/", ""),
-    ("refs/remotes/", ""),
-    ("refs/remotes/", "/HEAD"),
-];
-
 /// `cmd_symbolic_ref()`'s `struct option options[]` (builtin/symbolic-ref.c), in
 /// table order, as [`super::resolve_long`] reads it. No entry carries
 /// `PARSE_OPT_NONEG`; `-m <reason>` is short-only and so has no entry.
@@ -227,7 +214,18 @@ fn read_symref(repo: &gix::Repository, name: &str, opts: &Opts) -> Result<ExitCo
     };
 
     let out = if opts.short {
-        shorten_unambiguous(repo, resolved.as_bstr())
+        // `refs_shorten_unambiguous_ref(refs, refname, 0)`
+        // (builtin/symbolic-ref.c:23-26, v2.55.0). The shared port is
+        // `match_parse_rule()`'s (refs.c:1592-1623), which checks the rule's
+        // *suffix* with `strip_suffix()` as well as its prefix -- so
+        // `refs/remotes/origin/HEAD` matches the `refs/remotes/%.*s/HEAD` rule
+        // and shortens to `origin`. The copy that used to live here tested only
+        // the prefix and answered `origin/HEAD`.
+        gix::bstr::BString::from(crate::refname::shorten_unambiguous(
+            repo,
+            resolved.as_bstr(),
+            false,
+        ))
     } else {
         resolved
     };
@@ -768,38 +766,6 @@ fn find_exact(repo: &gix::Repository, name: &BStr) -> Result<Option<gix::refs::R
         Err(err) => return Err(err.into()),
     };
     Ok(found.filter(|reference| reference.name.as_bstr() == BStr::new(name)))
-}
-
-/// Whether a reference with exactly this name exists.
-fn ref_exists(repo: &gix::Repository, name: &str) -> bool {
-    matches!(find_exact(repo, BStr::new(name)), Ok(Some(_)))
-}
-
-/// git's `shorten_unambiguous_ref` (non-strict): find the longest well-known
-/// prefix whose removal leaves a name that no higher-priority rev-parse rule
-/// would resolve to a different, existing ref. Falls back to the full name.
-fn shorten_unambiguous(repo: &gix::Repository, refname: &BStr) -> BString {
-    let Ok(refname) = refname.to_str() else {
-        return refname.to_owned();
-    };
-
-    // Rule 0 is the identity rule and always matches, so it is never a candidate.
-    for i in (1..REV_PARSE_RULES.len()).rev() {
-        let (prefix, _) = REV_PARSE_RULES[i];
-        let Some(short) = refname.strip_prefix(prefix) else {
-            continue;
-        };
-        if short.is_empty() {
-            continue;
-        }
-        let ambiguous = REV_PARSE_RULES[..i]
-            .iter()
-            .any(|(p, s)| ref_exists(repo, &format!("{p}{short}{s}")));
-        if !ambiguous {
-            return short.into();
-        }
-    }
-    refname.into()
 }
 
 /// Append one reflog line for `name`, following git's rules for which refs get a

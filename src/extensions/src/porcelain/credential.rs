@@ -178,15 +178,15 @@ fn run(op: Op) -> Result<ExitCode> {
         Ok(url) => url,
         Err(e) => return Ok(fatal(&format!("credential url cannot be parsed: {e}"))),
     };
-    let (mut cascade, action, prompt) = match &repo {
-        Some(repo) => match repo.config_snapshot().credential_helpers(url) {
-            Ok(parts) => parts,
-            Err(e) => return Ok(fatal(&format!("{e}"))),
-        },
-        None => match standalone_credential_helpers(&cfg, url) {
-            Ok(parts) => parts,
-            Err(e) => return Ok(fatal(&format!("{e}"))),
-        },
+    // `credential_apply_config()` (credential.c:172-207) walks the same
+    // `[credential]` sections whether or not there is a repository — the only
+    // difference is which files the config cascade read. gix's own
+    // `credential_helpers()` applies its subsection test rather than
+    // `urlmatch_config_entry()`'s, so both cases go through
+    // [`standalone_credential_helpers`] and its [`url_pattern_matches`] port.
+    let (mut cascade, action, prompt) = match standalone_credential_helpers(&cfg, url) {
+        Ok(parts) => parts,
+        Err(e) => return Ok(fatal(&format!("{e}"))),
     };
     discount_echoed_helpers(&mut cascade);
 
@@ -364,10 +364,43 @@ fn standalone_credential_helpers(
     ))
 }
 
-/// gix's `credential_helpers` subsection test, reduced to what a `[credential
-/// "<url>"]` header can express: same scheme, host (with `*` wildcards per
-/// label), port, and — for non-root http(s) patterns — the same path.
+/// `url_match_prefix()` (urlmatch.c:570-600): `prefix` matches `path` when it is
+/// an exact match or a prefix ending on a `/` boundary, with both treated as
+/// having an implicit trailing `/`.
+///
+/// So `/foo` matches `/foo` and `/foo/bar` but not `/foobar`, and the root prefix
+/// matches every path.
+fn url_match_prefix(path: &[u8], prefix: &[u8]) -> bool {
+    if prefix.is_empty() || prefix == b"/" {
+        return path.is_empty() || path.starts_with(b"/");
+    }
+    let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
+    if !path.starts_with(prefix) {
+        return false;
+    }
+    path.len() == prefix.len() || path[prefix.len()] == b'/'
+}
+
+/// Whether a `[credential "<pattern>"]` subsection applies to the url being
+/// filled: `urlmatch_config_entry()`'s two arms (urlmatch.c:700-715).
+///
+/// A pattern that `url_normalize()` accepts — one with a scheme — goes through
+/// `match_urls()` (urlmatch.c:602-669): same scheme, host (with `*` wildcards per
+/// label, via `match_host()`), port and user, and a path that
+/// [`url_match_prefix`] accepts. A pattern it rejects falls back to
+/// `match_partial_url()` (credential.c:156-170), which re-reads the pattern with
+/// `allow_partial_url = 1` and then asks `credential_match()` (credential.c:89)
+/// for exact equality of only the fields the partial url actually set — which is
+/// how the schemeless `credential.example.com.username` reaches an `https://`
+/// credential.
+///
+/// `url_normalize()` lowercases the scheme and the host on both sides, so those
+/// two compare case-insensitively while the path does not.
 fn url_pattern_matches(pattern: &gix::bstr::BStr, url: &gix::Url) -> bool {
+    let has_scheme = matches!(pattern.find("://"), Some(n) if n > 0);
+    if !has_scheme {
+        return partial_url_matches(pattern, url);
+    }
     let Ok(pattern) = gix::url::parse(pattern) else {
         return false;
     };
@@ -386,7 +419,7 @@ fn url_pattern_matches(pattern: &gix::bstr::BStr, url: &gix::Url) -> bool {
     if ports.0 != ports.1 {
         return false;
     }
-    if !(is_http && pattern.path_is_root()) && pattern.path != url.path {
+    if !url_match_prefix(&url.path, &pattern.path) {
         return false;
     }
     if pattern.user().is_some() && pattern.user() != url.user() {
@@ -397,12 +430,55 @@ fn url_pattern_matches(pattern: &gix::bstr::BStr, url: &gix::Url) -> bool {
             let (lhs, rhs) = (p.split('.'), h.split('.'));
             lhs.clone().count() == rhs.clone().count()
                 && lhs.zip(rhs).all(|(pat, value)| {
-                    gix::glob::wildmatch(pat.into(), value.into(), gix::glob::wildmatch::Mode::empty())
+                    gix::glob::wildmatch(
+                        pat.to_ascii_lowercase().as_str().into(),
+                        value.to_ascii_lowercase().as_str().into(),
+                        gix::glob::wildmatch::Mode::empty(),
+                    )
                 })
         }
         (None, None) => true,
         _ => false,
     }
+}
+
+/// `match_partial_url()` (credential.c:156-170) for a pattern with no scheme:
+/// read it as a potentially-partial url and require every field it set to equal
+/// the credential's, leaving the fields it did not set unconstrained.
+fn partial_url_matches(pattern: &gix::bstr::BStr, url: &gix::Url) -> bool {
+    // `credential_from_url_1(…, allow_partial_url = 1)`: with no `://` the whole
+    // string starts at the user/host, and the host is set only when non-empty.
+    let bytes: &[u8] = pattern;
+    let at = bytes.find_byte(b'@');
+    let colon = bytes.find_byte(b':');
+    let slash = bytes
+        .iter()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(bytes.len());
+
+    let (want_user, host_off) = match at {
+        None => (None, 0),
+        Some(at) if slash <= at => (None, 0),
+        Some(at) if colon.is_none_or(|colon| at <= colon) => {
+            (Some(url_decode(&bytes[..at])), at + 1)
+        }
+        Some(at) => (
+            Some(url_decode(&bytes[..colon.expect("case (2) took the None arm")])),
+            at + 1,
+        ),
+    };
+    let want_host = (slash > host_off).then(|| url_decode(&bytes[host_off..slash]));
+    let mut want_path = &bytes[slash..];
+    while want_path.first() == Some(&b'/') {
+        want_path = &want_path[1..];
+    }
+    let want_path = (!want_path.is_empty()).then(|| url_decode(want_path));
+
+    // `CHECK(x)`: unset in the pattern is "no constraint", set is exact equality.
+    let have_path = url.path.strip_prefix(b"/".as_ref()).unwrap_or(&url.path);
+    want_host.is_none_or(|want| Some(want.to_string()) == url.host().map(str::to_owned))
+        && want_path.is_none_or(|want| want == have_path)
+        && want_user.is_none_or(|want| Some(want.to_string()) == url.user().map(str::to_owned))
 }
 
 /// Port of `credential_getpass()` (credential.c): ask for whatever the helpers
@@ -601,9 +677,13 @@ fn parse(
             format!("invalid credential key: {}", key.as_bstr())
         })?;
 
-        if value.contains(&0) {
-            return Err(format!("credential value for {key} contains null byte"));
-        }
+        // `credential_read()` hands `value` on as a C string
+        // (credential.c:340-380), so an embedded NUL ends it. git never sees the
+        // tail and never diagnoses it.
+        let value = match value.iter().position(|&b| b == 0) {
+            Some(nul) => &value[..nul],
+            None => value,
+        };
         if protect_protocol && value.contains(&b'\r') {
             return Err(format!(
                 "credential value for {key} contains carriage return\nIf this is intended, set `credential.protectProtocol=false`"
@@ -640,28 +720,126 @@ fn parse(
     Ok(())
 }
 
-/// Expand a `url=` attribute into its constituent fields, exactly as git's
-/// `credential_from_url` does: every component is overwritten, including with
-/// `None` when the url does not carry it.
+/// `url_decode_mem()` (url.c): `%XX` becomes the byte it names and `+` is left
+/// alone (git's `url_decode_internal` only folds `+` to a space for query
+/// strings, which no credential component is). A `%` that is not followed by two
+/// hex digits is copied through unchanged.
+fn url_decode(bytes: &[u8]) -> BString {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).copied(), bytes.get(i + 2).copied()) {
+            (b'%', Some(h), Some(l)) => match (hex(h), hex(l)) {
+                (Some(h), Some(l)) => {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out.into()
+}
+
+/// `check_url_component()` (credential.c:583-595): a newline inside any component
+/// is a protocol smuggling attempt, and the whole url is refused.
+fn check_url_component(
+    url: &BStr,
+    name: &str,
+    value: Option<&BString>,
+) -> std::result::Result<(), String> {
+    if value.is_some_and(|v| v.contains(&b'\n')) {
+        eprintln!("warning: url contains a newline in its {name} component: {url}");
+        return Err(format!("credential url cannot be parsed: {url}"));
+    }
+    Ok(())
+}
+
+/// Port of `credential_from_url_1()` (credential.c:621-693) with
+/// `allow_partial_url = 0`, which is what `credential_from_url()` — the `url=`
+/// attribute's handler at credential.c:377 — passes.
+///
+/// This is a byte scanner, not a URL parser, and the difference is the whole
+/// point: git accepts `https://` (empty host), `ht!tp://x` (a scheme no parser
+/// would recognise) and `HTTPS://EXAMPLE.COM/X` (case preserved verbatim, so the
+/// scheme is *not* recognised as http and the path survives), and it refuses only
+/// a url whose `://` is missing or at offset zero. Each component is
+/// percent-decoded, so `https://ex%41mple.com` is host `exAmple.com`.
+///
+/// `credential_clear(c)` (credential.c:702 → 25) runs first, so a `url=` line
+/// discards every field set before it — including ones the url does not carry.
 fn apply_url(cred: &mut Cred, value: &BStr) -> std::result::Result<(), String> {
-    if !value.contains_str("://") {
+    *cred = Cred::default();
+    let url: &[u8] = value;
+
+    // `proto_end = strstr(url, "://")`, then
+    // `if (!allow_partial_url && (!proto_end || proto_end == url))`.
+    let proto_end = url.find("://");
+    if !matches!(proto_end, Some(n) if n > 0) {
+        eprintln!("warning: url has no scheme: {value}");
         return Err(format!("credential url cannot be parsed: {value}"));
     }
-    let url = gix::url::parse(value)
-        .map_err(|_| format!("credential url cannot be parsed: {value}"))?;
+    let proto_end = proto_end.expect("checked above");
+    let cp = proto_end + 3;
+    let rest = &url[cp..];
 
-    cred.protocol = Some(url.scheme.as_str().into());
-    // git keeps the port verbatim, including when it is the scheme default; a
-    // url with no host at all yields an empty host attribute.
-    cred.host = Some(match (url.host(), url.port) {
-        (Some(h), Some(port)) => format!("{h}:{port}").into(),
-        (Some(h), None) => h.into(),
-        (None, _) => BString::default(),
-    });
-    cred.username = url.user().map(Into::into);
-    cred.password = url.password().map(Into::into);
-    let path = url.path.trim_with(|b| b == '/');
-    cred.path = (!path.is_empty()).then(|| path.into());
+    let at = rest.find_byte(b'@').map(|n| cp + n);
+    let colon = rest.find_byte(b':').map(|n| cp + n);
+    // "A query or fragment marker before the slash ends the host portion."
+    let slash = cp + rest
+        .iter()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .unwrap_or(rest.len());
+
+    let host = match at {
+        // Case (1) `proto://<host>/…`
+        None => cp,
+        Some(at) if slash <= at => cp,
+        // Case (2) `proto://<user>@<host>/…`
+        Some(at) if colon.is_none_or(|colon| at <= colon) => {
+            cred.username = Some(url_decode(&url[cp..at]));
+            at + 1
+        }
+        // Case (3) `proto://<user>:<pass>@<host>/…`
+        Some(at) => {
+            let colon = colon.expect("case (2) took the None arm");
+            cred.username = Some(url_decode(&url[cp..colon]));
+            cred.password = Some(url_decode(&url[colon + 1..at]));
+            at + 1
+        }
+    };
+
+    cred.protocol = Some(url[..proto_end].into());
+    // `if (!allow_partial_url || slash - host > 0)`: with partial urls refused the
+    // host is always set, empty string included (`file:///tmp/x` → `host=`).
+    cred.host = Some(url_decode(&url[host..slash]));
+
+    // "Trim leading and trailing slashes from path."
+    let mut path = &url[slash..];
+    while path.first() == Some(&b'/') {
+        path = &path[1..];
+    }
+    if !path.is_empty() {
+        let mut decoded = url_decode(path);
+        while decoded.len() > 1 && decoded.last() == Some(&b'/') {
+            decoded.pop();
+        }
+        cred.path = Some(decoded);
+    }
+
+    check_url_component(value, "username", cred.username.as_ref())?;
+    check_url_component(value, "password", cred.password.as_ref())?;
+    check_url_component(value, "protocol", cred.protocol.as_ref())?;
+    check_url_component(value, "host", cred.host.as_ref())?;
+    check_url_component(value, "path", cred.path.as_ref())?;
     Ok(())
 }
 

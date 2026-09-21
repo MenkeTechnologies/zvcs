@@ -602,6 +602,14 @@ fn known_keys(cfg: Option<&ConfigFile>) -> Known {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let Some(cfg) = cfg else { return Known(map) };
 
+    // `git_config()` calls back once per `-c`, but this port's snapshot carries
+    // each valued `-c` on two sources. Without the same discount the config walks
+    // take ([`crate::config::CliEcho`]), a single
+    // `-c sendemail.aliasesfile=<f>` lands twice in `@alias_files`, and the
+    // list-valued settings are assigned the whole list — so the file is read and
+    // warned about twice.
+    let mut echo = crate::config::CliEcho::new();
+
     for section in cfg.sections() {
         let name = section.header().name().to_str_lossy().to_ascii_lowercase();
         if name != "sendemail" && name != "sendmail" {
@@ -616,11 +624,18 @@ fn known_keys(cfg: Option<&ConfigFile>) -> Known {
         let body = section.body();
         let value_names: BTreeSet<String> =
             body.value_names().map(|n| n.to_ascii_lowercase()).collect();
+        let source = section.meta().source;
         for value_name in value_names {
-            let entry = map.entry(format!("{prefix}.{value_name}")).or_default();
+            let key = format!("{prefix}.{value_name}");
+            let mut values = Vec::new();
             for v in body.values(&value_name) {
-                entry.push(v.to_str_lossy().into_owned());
+                let v = v.to_str_lossy().into_owned();
+                if echo.is_echo(source, &key, Some(&v)) {
+                    continue;
+                }
+                values.push(v);
             }
+            map.entry(key).or_default().extend(values);
         }
     }
     Known(map)

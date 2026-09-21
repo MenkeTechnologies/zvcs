@@ -617,6 +617,12 @@ fn run_file_diff(repo: &gix::Repository, opts: &Opts) -> Result<ExitCode> {
     let mut launched = 0usize;
     let tmpdir = (total > 0).then(mktemp_dir).transpose()?;
 
+    // `reuse_worktree_file()`'s index, read only on the two `cmd_diff()` arms that
+    // read one (builtin/diff.c:611-640).
+    let index = (total > 0)
+        .then(|| WorktreeIndex::load(repo, &opts.forward))
+        .flatten();
+
     let result = (|| -> Result<ExitCode> {
         for rec in &records {
             // Combined diffs are emitted in the same path order the launches are,
@@ -636,9 +642,24 @@ fn run_file_diff(repo: &gix::Repository, opts: &Opts) -> Result<ExitCode> {
             // `prepare_temp_file` for each side: `/dev/null` for an absent side, a
             // staged blob (or submodule standin) for a recorded object, or the live
             // work-tree file for the unstaged side.
-            let local = materialize_side(repo, tmpdir, &rec.path, &rec.mode_a, &rec.oid_a, "left")?;
-            let remote =
-                materialize_side(repo, tmpdir, &rec.path, &rec.mode_b, &rec.oid_b, "right")?;
+            let local = materialize_side(
+                repo,
+                index.as_ref(),
+                tmpdir,
+                &rec.path,
+                &rec.mode_a,
+                &rec.oid_a,
+                "left",
+            )?;
+            let remote = materialize_side(
+                repo,
+                index.as_ref(),
+                tmpdir,
+                &rec.path,
+                &rec.mode_b,
+                &rec.oid_b,
+                "right",
+            )?;
 
             // `launch_merge_tool`: prompt (unless suppressed), then resolve and
             // eval the tool.
@@ -1253,17 +1274,126 @@ fn parse_raw(buf: &[u8]) -> Result<Vec<RawRecord>> {
     Ok(out)
 }
 
+/// The index `reuse_worktree_file()` consults, loaded once per run.
+///
+/// `builtin/diff.c:611-640` reads the index only on the `builtin_diff_files()`
+/// (`ent.nr == 0`) and `builtin_diff_index()` (`ent.nr == 1`) arms;
+/// `builtin_diff_tree()` and `builtin_diff_combined()` never do, so
+/// `reuse_worktree_file()`'s `if (!istate->cache) return 0` (diff.c:4410) declines
+/// every path there. [`WorktreeIndex::load`] returns `None` for exactly those arms,
+/// which is why `git difftool <a> <b>` hands the tool two temp files where
+/// `git difftool <a>` hands it the live work-tree file.
+struct WorktreeIndex {
+    state: gix::worktree::IndexPersistedOrInMemory,
+    stat: gix::index::entry::stat::Options,
+    workdir: PathBuf,
+}
+
+impl WorktreeIndex {
+    /// `None` when git would not have read the index for this argument list, or
+    /// when it cannot be read at all.
+    fn load(repo: &gix::Repository, forward: &[String]) -> Option<Self> {
+        if ent_count(repo, forward) >= 2 {
+            return None;
+        }
+        Some(WorktreeIndex {
+            state: repo.index_or_load_from_head().ok()?,
+            stat: repo.stat_options().ok()?,
+            workdir: repo.workdir()?.to_path_buf(),
+        })
+    }
+
+    /// Port of `reuse_worktree_file()` (diff.c:4388-4467) for `want_file = 1`,
+    /// which is what `prepare_temp_file()` (diff.c:4716) passes: the pack and
+    /// `would_convert_to_git()` shortcuts at diff.c:4422-4431 are both gated on
+    /// `!want_file` and so never fire for this caller.
+    fn reuse(&self, path: &[u8], oid: &gix::ObjectId) -> bool {
+        let Some(entry) = self.state.entry_by_path(path.as_bstr()) else {
+            return false;
+        };
+        // "This is not the sha1 we are looking for, or unreusable because it is
+        // not a regular file." (diff.c:4447-4451)
+        if entry.id != *oid
+            || !matches!(
+                entry.mode,
+                gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE
+            )
+        {
+            return false;
+        }
+        // `(ce->ce_flags & CE_VALID) || ce_skip_worktree(ce)` (diff.c:4457): with
+        // either bit the work tree is not guaranteed to hold the entry's content.
+        // The same bit answers `path_in_sparse_checkout()` (diff.c:4437) for a
+        // non-sparse index, which is the only index shape this port reads.
+        if entry.flags.intersects(
+            gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE,
+        ) {
+            return false;
+        }
+        // `ce_uptodate(ce) || (!lstat(name, &st) && !ie_match_stat(...))`
+        // (diff.c:4462-4463). `ce_uptodate()` is an in-core marker a fresh
+        // `repo_read_index()` never sets, so the answer is always the stat compare.
+        let full = self.workdir.join(gix::path::from_bstr(path.as_bstr()).as_ref());
+        let Ok(meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+            return false;
+        };
+        let Ok(stat) = gix::index::entry::Stat::from_fs(&meta) else {
+            return false;
+        };
+        entry.stat.matches(&stat, self.stat)
+    }
+}
+
+/// How many tree-ish operands `setup_revisions()` would leave pending, which is
+/// the `ent.nr` that `cmd_diff()` (builtin/diff.c:611-640) dispatches on.
+///
+/// Only the `>= 2` answer is load-bearing here — it is the one that stops the
+/// index from being read — so a spelling this cannot classify counts as two and
+/// leaves the pre-existing "always stage a temp" behaviour in place. `^<rev>` is
+/// still a pending object (`int flags = (obj->flags & UNINTERESTING)` at
+/// builtin/diff.c:573 keeps it and adds it to `ent` all the same), so an exclude
+/// counts as one just like an include.
+fn ent_count(repo: &gix::Repository, forward: &[String]) -> usize {
+    let mut n = 0usize;
+    for a in forward {
+        if a == "--" {
+            break;
+        }
+        // Options never become pending objects; a bare `-` is not one either.
+        if a.starts_with('-') {
+            continue;
+        }
+        // An operand that names no object is a pathspec, which `setup_revisions()`
+        // leaves in `prune_data` rather than `pending`.
+        let Ok(spec) = repo.rev_parse(a.as_str()) else {
+            continue;
+        };
+        n += match spec.detach() {
+            gix::revision::plumbing::Spec::Include(_) | gix::revision::plumbing::Spec::Exclude(_) => 1,
+            _ => 2,
+        };
+        if n >= 2 {
+            return n;
+        }
+    }
+    n
+}
+
 /// `prepare_temp_file` for one side of one path.
 ///
 ///   * mode `000000` (`!DIFF_FILE_VALID`) → `/dev/null`.
 ///   * a gitlink (`160000`) → a temp holding `Subproject commit <hex>\n`; when the
 ///     side is the work tree (null id) the submodule's committed `HEAD` supplies
 ///     the hex.
-///   * a recorded blob id → a temp holding the blob bytes.
-///   * a null id on a non-gitlink side (the unstaged work-tree side) → the live
-///     work-tree file itself, so tool edits land directly in the work tree.
+///   * a null id on a non-gitlink side (the unstaged work-tree side), or a
+///     recorded id that `reuse_worktree_file()` accepts → the live work-tree file
+///     itself, so tool edits land directly in the work tree. git names it
+///     `one->path` (diff.c:4736-4738), the work-tree-relative path, and
+///     `run_file_diff()` has already chdir'd to the work-tree root.
+///   * any other recorded blob id → a temp holding the blob bytes.
 fn materialize_side(
     repo: &gix::Repository,
+    index: Option<&WorktreeIndex>,
     tmpdir: &Path,
     path: &[u8],
     mode: &str,
@@ -1297,16 +1427,20 @@ fn materialize_side(
         return write_temp(tmpdir, side, path, content.as_bytes());
     }
 
-    // The unstaged work-tree side: borrow the live file (git's reuse path).
+    // `!one->oid_valid` (diff.c:4715): the unstaged work-tree side always borrows
+    // the live file. `one->path` is what git names it with.
     if is_null {
-        return repo
-            .workdir_path(gix::bstr::BStr::new(path))
-            .ok_or_else(|| anyhow!("no work tree for path"));
+        return Ok(bytes_path(path).to_owned());
     }
 
-    // A recorded blob: stage its bytes into a temp file.
+    // A recorded blob. `reuse_worktree_file()` (diff.c:4716) borrows the work-tree
+    // file instead of inflating whenever the index says the two hold the same
+    // bytes, which is what makes `git difftool <commit>` open the real file.
     let oid = gix::ObjectId::from_hex(oid_hex.as_bytes())
         .map_err(|e| anyhow!("bad object id {oid_hex:?} in raw diff: {e}"))?;
+    if index.is_some_and(|idx| idx.reuse(path, &oid)) {
+        return Ok(bytes_path(path).to_owned());
+    }
     if let Some(object) = repo.try_find_object(oid)? {
         return write_temp(tmpdir, side, path, &object.data);
     }

@@ -468,6 +468,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // worktree-updating modes (`--hard`, `--merge`, `--keep`) can move a
     // submodule, matching git's `unpack_trees()` submodule updater.
     let mut recurse_submodules: Option<bool> = None;
+    // Whether `--end-of-options` has been seen; see the loop body.
+    let mut saw_eoo = false;
 
     for typed in args {
         let a = typed;
@@ -491,6 +493,31 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             paths.push(a.clone());
             continue;
         }
+        // ```c
+        // } else if (!strcmp(arg + 2, "end-of-options")) {
+        //         if (!(ctx->flags & PARSE_OPT_KEEP_UNKNOWN_OPT)) {
+        //                 ctx->argc--;
+        //                 ctx->argv++;
+        //         }
+        //         break;
+        // }
+        // ```
+        //
+        // (parse-options.c:1116-1122.) `cmd_reset` passes `PARSE_OPT_KEEP_DASHDASH`
+        // and not `PARSE_OPT_KEEP_UNKNOWN_OPT`, so the marker itself is eaten and
+        // option parsing stops. Everything after it belongs to `parse_args()`
+        // (builtin/reset.c:180-215), which is why `git reset --hard
+        // --end-of-options --foo` resolves the branch literally named `--foo`
+        // instead of refusing an unknown option. `--` is still `parse_args()`'s own
+        // separator there.
+        if saw_eoo {
+            if a == "--" {
+                saw_dd = true;
+            } else {
+                positionals.push(typed);
+            }
+            continue;
+        }
         // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
         // ahead of parse_long_opt() and so ahead of the unknown-option refusal
         // below: the name never abbreviates and never takes an `=<value>`. This
@@ -498,6 +525,12 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // same block `-h` prints.
         if a == "--help-all" {
             return Ok(super::show_usage(USAGE));
+        }
+        // Tested with a `strcmp()` ahead of `parse_long_opt()`, so the name never
+        // abbreviates.
+        if a == "--end-of-options" {
+            saw_eoo = true;
+            continue;
         }
         // Respell a unique abbreviation as the name it resolves to, ahead of both
         // the shared value-option handler and the match below, so `--intent-to`

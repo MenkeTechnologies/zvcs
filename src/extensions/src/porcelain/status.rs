@@ -1411,9 +1411,14 @@ fn status_report(
         // is the number of `refs/stash` reflog entries (git's `count_stash_entries`).
         let stash_count = if show_stash { count_stash_entries(&repo) } else { 0 };
         // `format_tracking_info(branch, &sb, s->ahead_behind_flags,
-        // !s->commit_template)` (wt-status.c:1231-1232): the editor's status
-        // block is the one caller that suppresses the divergence hint.
-        let mut tracking_block = tracking_lines(&comparisons, quick, hints, template.is_none());
+        // !s->commit_template)` (wt-status.c:1231-1232). `cmd_commit()` sets
+        // `s->commit_template = 1` for *every* report it prints
+        // (builtin/commit.c:1809), not just the editor block, so `git commit
+        // --dry-run` and the report that stands in for a refusal suppress the
+        // divergence hint too — testing `template.is_none()` here left the
+        // `(use "git pull" …)` line in both of those.
+        let mut tracking_block =
+            tracking_lines(&comparisons, quick, hints, !reference.commit_template());
         // The ahead/behind warning is appended to the same strbuf
         // `format_tracking_info` filled, so it only shows when that produced
         // something, and only for the full counts `--no-ahead-behind` skips.
@@ -3391,34 +3396,36 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
     let Some(branch_ref) = repo.head_ref()? else {
         return Ok(None);
     };
-    let Some(Ok(upstream_name)) = branch_ref.remote_tracking_ref_name(gix::remote::Direction::Fetch)
-    else {
+    // `branch = branch_get(branch_name)` then `stat_tracking_info(branch, …,
+    // &base, …)` (wt-status.c:2124-2130) — the same `branch_get_upstream()` the
+    // long format goes through, not a remote-tracking-ref lookup. The two differ
+    // for `branch.<name>.remote = .`, where the upstream is a branch of this very
+    // repository (`set_merge()`, remote.c) and no fetch refspec maps to it: the
+    // short header showed a bare `## main` for those, with the whole
+    // `...<upstream> [ahead N, behind M]` half missing, while `git status`'s long
+    // format reported the divergence from the same configuration.
+    let full = branch_ref.name().as_bstr().to_owned();
+    let Some(upstream_name) = super::branch::upstream_ref(repo, full.as_bstr()) else {
         return Ok(None);
     };
+    // `refs_shorten_unambiguous_ref(…, base, 0)` (wt-status.c:2138-2139).
     let upstream = upstream_name.shorten().to_str_lossy().into_owned();
-    let upstream_full = upstream_name.as_bstr().to_str_lossy().into_owned();
-
-    let upstream_ref = match repo.try_find_reference(upstream_full.as_str())? {
-        Some(r) => r,
-        None => {
-            return Ok(Some(Tracking {
-                upstream,
-                gone: true,
-                ahead: 0,
-                behind: 0,
-            }));
-        }
-    };
-
-    let upstream_id = upstream_ref.into_fully_peeled_id()?.detach();
-    let local_id = repo.head_id()?.detach();
-
-    Ok(Some(Tracking {
-        upstream,
-        gone: false,
-        ahead: count_commits(repo, local_id, upstream_id)?,
-        behind: count_commits(repo, upstream_id, local_id)?,
-    }))
+    // `sti < 0` with a `base` is the gone upstream; the counts are `num_ours` /
+    // `num_theirs`, which are zero for an identical tip.
+    match super::branch::stat_tracking_info(repo, repo.head_id().ok(), &upstream_name) {
+        Some((ahead, behind)) => Ok(Some(Tracking {
+            upstream,
+            gone: false,
+            ahead,
+            behind,
+        })),
+        None => Ok(Some(Tracking {
+            upstream,
+            gone: true,
+            ahead: 0,
+            behind: 0,
+        })),
+    }
 }
 
 /// One entry of `format_tracking_info()`'s loop (`remote.c:2400-2459`) — the

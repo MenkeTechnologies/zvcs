@@ -726,17 +726,95 @@ pub(crate) fn word_regex_cfg(cfg: &gix::config::File) -> Option<String> {
 /// Compile a word regex the way git's `regcomp(..., REG_EXTENDED | REG_NEWLINE)`
 /// does: on bytes, without Unicode mode, and with `^`/`$` anchoring at embedded
 /// newlines while `.` stops at them.
-pub(crate) fn compile_word_regex(pat: &str) -> Result<regex::bytes::Regex, String> {
+pub(crate) fn compile_word_regex(pat: &str) -> Result<WordRegex, String> {
     // The bracket-expression spellings POSIX gives a literal meaning and the `regex`
     // crate rejects, rewritten as [`crate::userdiff::posix_class_fixups`] rewrites
     // them for a funcname pattern. The built-in `scheme` word regex needs it —
     // `([^][)(}{ \t])+` opens its class with a literal `]` — and so does any
     // `diff.wordRegex` written the same way, which `regcomp()` accepts.
-    regex::bytes::RegexBuilder::new(&crate::userdiff::posix_class_fixups(pat))
+    let fixed = crate::userdiff::posix_class_fixups(pat);
+    let lead = regex::bytes::RegexBuilder::new(&fixed)
         .unicode(false)
         .multi_line(true)
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // The same syntax, built as a lazy DFA that keeps every match state instead of
+    // stopping at the preferred one. `regcomp()` has no size limit to run out of, so
+    // a pattern too large for the DFA falls back to the leftmost-first end rather
+    // than failing the whole diff.
+    let longest = regex_automata::hybrid::dfa::DFA::builder()
+        .configure(
+            regex_automata::hybrid::dfa::DFA::config()
+                .match_kind(regex_automata::MatchKind::All)
+                .starts_for_each_pattern(false),
+        )
+        .syntax(
+            regex_automata::util::syntax::Config::new()
+                .unicode(false)
+                .utf8(false)
+                .multi_line(true),
+        )
+        .build(&fixed)
+        .ok();
+    Ok(WordRegex { lead, longest })
+}
+
+/// A word regex compiled twice: once with the `regex` crate, which finds the
+/// leftmost match start, and once as a lazy DFA that finds the *longest* match at
+/// that start.
+///
+/// git compiles the pattern with `regcomp(…, REG_EXTENDED | REG_NEWLINE)` and calls
+/// `regexec()` (diff.c:2288, `find_word_boundaries()`), so its word splitting is
+/// POSIX leftmost-longest: of the alternatives that match at the earliest position,
+/// the one that matches the most text wins. The `regex` crate is leftmost-*first* —
+/// it takes the alternative written first. The two disagree on every built-in
+/// pattern whose branches can both match at one offset, which is why the C++ driver
+/// (userdiff.c:97-104) splits `0xdead` into `0` + `xdead` under leftmost-first:
+/// `[0-9][0-9.]*…` is written before `0[xXbB][0-9a-fA-F]+…` and matches the bare
+/// `0`. The same ordering turns `<=>` into `<=` followed by `>`.
+///
+/// The second engine is `regex`'s own lazy DFA configured with
+/// [`MatchKind::All`], which (unlike the leftmost-first construction) adds every
+/// match state rather than pruning at the first one, so an anchored forward search
+/// runs on to the last accepting position — the longest match. That is exactly the
+/// use regex-automata documents for `All` (`dense::Config::match_kind`: "`All`
+/// semantics are used for this in order to find the longest possible match").
+#[derive(Clone)]
+pub(crate) struct WordRegex {
+    /// Finds where the next word starts. Leftmost-first and leftmost-longest agree
+    /// on the match *start*; they differ only on how far it runs.
+    lead: regex::bytes::Regex,
+    /// Anchored, `MatchKind::All`: the longest match beginning at a given offset.
+    /// `None` when the lazy DFA could not be built for this pattern, in which case
+    /// [`WordRegex::find`] falls back to `lead`'s own end.
+    longest: Option<regex_automata::hybrid::dfa::DFA>,
+}
+
+impl WordRegex {
+    /// `regexec(&re, buffer + i, 1, &match, 0)`: the first match in `text`, as
+    /// `(start, end)` offsets into it.
+    ///
+    /// git hands `regexec()` a pointer into the middle of the buffer, so the text
+    /// *before* it is invisible to the pattern — `^` matches at offset zero of this
+    /// slice. The caller slices for the same reason, and both engines here are run
+    /// over the slice rather than over the whole line.
+    pub(crate) fn find(&self, text: &[u8]) -> Option<(usize, usize)> {
+        let m = self.lead.find(text)?;
+        let (start, mut end) = (m.start(), m.end());
+        if let Some(dfa) = &self.longest {
+            let mut cache = dfa.create_cache();
+            let input = regex_automata::Input::new(text)
+                .range(start..)
+                .anchored(regex_automata::Anchored::Yes);
+            // A cache that outgrows its budget yields `MatchError::gave_up`; the
+            // leftmost-first end is then the best answer available, which is the
+            // pre-existing behaviour rather than a wrong one.
+            if let Ok(Some(hm)) = dfa.try_search_fwd(&mut cache, &input) {
+                end = end.max(hm.offset());
+            }
+        }
+        Some((start, end))
+    }
 }
 
 /// The `--color-moved` / `--word-diff` state, kept apart from [`PaintOptions`] so
@@ -751,7 +829,7 @@ pub(crate) struct ExtraPaint {
     pub(crate) word_diff: Option<WordDiff>,
     /// `o->word_regex`, already compiled: what `--word-diff-regex`/`--color-words=<re>`
     /// spelled, or `diff.wordRegex` when they did not.
-    pub(crate) word_regex: Option<regex::bytes::Regex>,
+    pub(crate) word_regex: Option<WordRegex>,
     /// Whether [`Self::word_regex`] came from the command line rather than from
     /// `diff.wordRegex`.
     ///
@@ -1237,7 +1315,7 @@ pub(crate) struct FilePaint {
     /// [`ExtraPaint::word_regex`] — `diff.wordRegex` — when the pair has no driver
     /// pattern. Shared behind an `Arc` because a run's pairs almost always name the
     /// same one or two drivers.
-    pub(crate) word_regex: Option<std::sync::Arc<regex::bytes::Regex>>,
+    pub(crate) word_regex: Option<std::sync::Arc<WordRegex>>,
 }
 
 impl FilePaint {
@@ -1711,7 +1789,7 @@ impl WordsPair {
     }
 
     /// `diff_words_show()`.
-    fn show(&mut self, out: &mut Vec<u8>, style: &WordStyle, re: Option<&regex::bytes::Regex>) {
+    fn show(&mut self, out: &mut Vec<u8>, style: &WordStyle, re: Option<&WordRegex>) {
         // Special case: only removal.
         if self.plus.text.is_empty() {
             let minus = std::mem::take(&mut self.minus.text);
@@ -1797,7 +1875,7 @@ fn write_helper(out: &mut Vec<u8>, st: &WordStyleElem, newline: &str, buf: &[u8]
 }
 
 /// `diff_words_fill()`: record the span of every word in `buffer.text`.
-fn diff_words_fill(buffer: &mut WordsBuffer, re: Option<&regex::bytes::Regex>) {
+fn diff_words_fill(buffer: &mut WordsBuffer, re: Option<&WordRegex>) {
     // The fake empty "0th" word at the start of the text.
     buffer.orig.clear();
     buffer.orig.push((0, 0));
@@ -1817,21 +1895,21 @@ fn diff_words_fill(buffer: &mut WordsBuffer, re: Option<&regex::bytes::Regex>) {
 /// `None` once the text is exhausted.
 fn find_word_boundaries(
     text: &[u8],
-    re: Option<&regex::bytes::Regex>,
+    re: Option<&WordRegex>,
     mut begin: usize,
 ) -> Option<(usize, usize)> {
     while let Some(re) = re {
         if begin >= text.len() {
             break;
         }
-        let m = re.find(&text[begin..])?;
+        let (ms, me) = re.find(&text[begin..])?;
         // A match that spans a newline is cut at it, so no word ever straddles a
         // line: the word list xdiff sees is one word per record.
-        let end = match text[begin + m.start()..begin + m.end()].iter().position(|b| *b == b'\n') {
-            Some(p) => begin + m.start() + p,
-            None => begin + m.end(),
+        let end = match text[begin + ms..begin + me].iter().position(|b| *b == b'\n') {
+            Some(p) => begin + ms + p,
+            None => begin + me,
         };
-        begin += m.start();
+        begin += ms;
         if begin == end {
             // An empty match cannot advance; step over one byte and retry.
             begin += 1;
@@ -2833,3 +2911,4 @@ pub(crate) fn whitespace_error_string(ws: u32) -> String {
     }
     err
 }
+

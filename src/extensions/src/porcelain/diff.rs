@@ -546,10 +546,10 @@ impl PairDrivers {
 ///
 /// `die(_("invalid regular expression: %s"))` (diff.c:2358) is the refusal.
 fn driver_word_regex(
-    cache: &mut std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>>,
+    cache: &mut std::collections::HashMap<String, std::sync::Arc<diff_color::WordRegex>>,
     drivers: &PairDrivers,
     want: bool,
-) -> Result<Option<std::sync::Arc<regex::bytes::Regex>>> {
+) -> Result<Option<std::sync::Arc<diff_color::WordRegex>>> {
     if !want {
         return Ok(None);
     }
@@ -584,6 +584,33 @@ impl Delta {
     /// what `show_dirstat()` tests before charging a deletion's whole size as damage.
     fn new_valid(&self) -> bool {
         !matches!(self.new, NewSide::Absent)
+    }
+
+    /// `p->one->oid_valid && p->two->oid_valid && oideq(&p->one->oid, &p->two->oid)`,
+    /// the first thing `show_dirstat()` (diff.c:3390-3399) asks of a pair:
+    ///
+    /// ```c
+    /// if (p->one->oid_valid && p->two->oid_valid &&
+    ///     oideq(&p->one->oid, &p->two->oid)) {
+    ///         damage = 0;
+    ///         goto found_damage;
+    /// }
+    /// ```
+    ///
+    /// It sits *above* the `dirstat_by_file` branch, so a pure rename or a mode-only
+    /// change contributes zero damage to `--dirstat` and `--dirstat-by-file` alike;
+    /// `conclude_dirstat()`'s `if (!changed)` and `gather_dirstat()`'s `if
+    /// (sum_changes)` then keep such a directory out of the report entirely, even at
+    /// a zero cut-off. A worktree-backed side has no valid id, which is why both
+    /// `old_worktree` and `NewSide::Worktree` answer `false` here.
+    fn dirstat_oid_unchanged(&self) -> bool {
+        if self.old_worktree {
+            return false;
+        }
+        let (Some((old, _)), NewSide::Blob(new, _)) = (self.old.as_ref(), &self.new) else {
+            return false;
+        };
+        old == new
     }
 
     /// Whether the pair's two filespecs name different files, which is a weaker
@@ -3773,7 +3800,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 .iter()
                 .zip(analyses.iter())
                 .map(|(d, an)| {
-                    let damage = if dirstat.by_file {
+                    let damage = if !dirstat.by_line && d.dirstat_oid_unchanged() {
+                        // `show_dirstat()` (diff.c:3390-3399) short-circuits an
+                        // oid-identical pair to zero damage *before* consulting
+                        // `dirstat_by_file`, so a pure rename never appears.
+                        0
+                    } else if dirstat.by_file {
                         1
                     } else if dirstat.by_line {
                         // For a binary pair `added`/`deleted` are the two sizes,
@@ -3847,7 +3879,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             let mut files: Vec<diff_color::FilePaint> = Vec::new();
             // `init_diff_words_data()` compiles the pair's driver word regex once
             // per pair; one compilation per distinct pattern is the same answer.
-            let mut word_res: std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>> =
+            let mut word_res: std::collections::HashMap<String, std::sync::Arc<diff_color::WordRegex>> =
                 std::collections::HashMap::new();
             let want_driver_words = extra.wants_driver_word_regex();
             // `--submodule=log`/`=diff` write their lines through
@@ -6193,7 +6225,11 @@ pub(crate) fn commit_dirstat(
                 irreversible_delete: opts.irreversible_delete,
             },
         )?;
-        let damage = if ds.by_file {
+        let damage = if !ds.by_line && delta.dirstat_oid_unchanged() {
+            // `show_dirstat()` (diff.c:3390-3399): an oid-identical pair is charged
+            // zero damage before the `dirstat_by_file` branch is reached.
+            0
+        } else if ds.by_file {
             1
         } else if ds.by_line {
             // For a binary pair `added`/`deleted` are the two sizes, which
@@ -6278,7 +6314,7 @@ fn commit_patch_with(
     let mut plain: Vec<u8> = Vec::new();
     let mut files: Vec<diff_color::FilePaint> = Vec::new();
     // As above: one compiled regex per distinct driver pattern, for the whole commit.
-    let mut word_res: std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>> =
+    let mut word_res: std::collections::HashMap<String, std::sync::Arc<diff_color::WordRegex>> =
         std::collections::HashMap::new();
     let want_driver_words = opts.extra.wants_driver_word_regex();
     for queued in &deltas {
@@ -8794,7 +8830,12 @@ const NUM_PARENT: usize = 2;
 /// each parent, the lines that parent lost — coalesced and numbered exactly as
 /// `combine_diff()` / `make_hunks()` do. Returns the table and the result line
 /// count. Shared by the unmerged-worktree (`--cc`) and multi-revision paths.
-fn build_combined_sline(result: &[u8], parents: &[Vec<u8>], ctx: u32) -> (Vec<SLine>, usize) {
+fn build_combined_sline(
+    result: &[u8],
+    parents: &[Vec<u8>],
+    ctx: u32,
+    dense: bool,
+) -> (Vec<SLine>, usize) {
     // Result lines, terminators stripped; a trailing incomplete line still counts.
     let mut cnt = result.iter().filter(|b| **b == b'\n').count();
     if !result.is_empty() && *result.last().expect("non-empty") != b'\n' {
@@ -8851,7 +8892,7 @@ fn build_combined_sline(result: &[u8], parents: &[Vec<u8>], ctx: u32) -> (Vec<SL
         sline[cnt + 1].p_lno[n] = p_lno;
     }
 
-    make_hunks(&mut sline, cnt, ctx);
+    make_hunks(&mut sline, cnt, ctx, dense);
     (sline, cnt)
 }
 
@@ -9256,6 +9297,53 @@ pub(crate) fn merge_combined_names(
         .collect())
 }
 
+/// The four `show_combined_header()` inputs that are not the path set: git reads
+/// them straight off `diff_options`/`rev_info` (combine-diff.c:931-933, :985).
+///
+/// ```c
+/// int abbrev = opt->flags.full_index ? the_hash_algo->hexsz : DEFAULT_ABBREV;
+/// const char *a_prefix = opt->a_prefix ? opt->a_prefix : "a/";
+/// const char *b_prefix = opt->b_prefix ? opt->b_prefix : "b/";
+/// …
+/// if (rev->combined_all_paths) { … }
+/// ```
+#[derive(Clone)]
+pub(crate) struct CombinedHeaderOpts {
+    /// `opt->flags.full_index`: the `index` line prints every id in full.
+    pub(crate) full_index: bool,
+    /// `opt->a_prefix ? : "a/"` — `--no-prefix` makes it empty.
+    pub(crate) a_prefix: Vec<u8>,
+    /// `opt->b_prefix ? : "b/"`.
+    pub(crate) b_prefix: Vec<u8>,
+    /// `rev->combined_all_paths`: one `--- <prefix><path>` per parent.
+    pub(crate) all_paths: bool,
+}
+
+impl Default for CombinedHeaderOpts {
+    fn default() -> Self {
+        CombinedHeaderOpts {
+            full_index: false,
+            a_prefix: b"a/".to_vec(),
+            b_prefix: b"b/".to_vec(),
+            all_paths: false,
+        }
+    }
+}
+
+impl CombinedHeaderOpts {
+    /// The same four fields as a caller that already parsed the diff options holds
+    /// them. `--no-prefix` leaves the two prefixes empty, which is what git's null
+    /// `a_prefix`/`b_prefix` fall back from.
+    pub(crate) fn from_patch_opts(o: &PatchOpts, all_paths: bool) -> Self {
+        CombinedHeaderOpts {
+            full_index: o.full_index,
+            a_prefix: o.src_prefix.clone(),
+            b_prefix: o.dst_prefix.clone(),
+            all_paths,
+        }
+    }
+}
+
 /// One merge commit's combined patch, as `git log -c`/`--cc` shows it: the commit's
 /// own tree against every parent's, with the header flavour `dense` selects.
 pub(crate) fn merge_combined_patch(
@@ -9265,6 +9353,7 @@ pub(crate) fn merge_combined_patch(
     paths: &[String],
     ctx: u32,
     dense: bool,
+    hdr: &CombinedHeaderOpts,
 ) -> Result<Vec<u8>> {
     merge_combined_patch_painted(
         repo,
@@ -9274,6 +9363,7 @@ pub(crate) fn merge_combined_patch(
         ctx,
         dense,
         &diff_color::DiffColors::disabled(),
+        hdr,
     )
 }
 
@@ -9287,22 +9377,14 @@ pub(crate) fn merge_combined_patch_painted(
     ctx: u32,
     dense: bool,
     colors: &diff_color::DiffColors,
+    hdr: &CombinedHeaderOpts,
 ) -> Result<Vec<u8>> {
     let result_tree = repo.find_commit(commit)?.tree()?;
     let mut parent_trees: Vec<gix::Tree<'_>> = Vec::with_capacity(parents.len());
     for p in parents {
         parent_trees.push(repo.find_commit(*p)?.tree()?);
     }
-    combined_trees_patch_painted(
-        repo,
-        &result_tree,
-        &parent_trees,
-        paths,
-        ctx,
-        dense,
-        colors,
-        false,
-    )
+    combined_trees_patch_painted(repo, &result_tree, &parent_trees, paths, ctx, dense, colors, hdr)
 }
 
 /// The combined diff of `result_tree` against every parent tree, with the header
@@ -9316,6 +9398,7 @@ pub(crate) fn combined_trees_patch_headed(
     paths: &[String],
     ctx: u32,
     dense: bool,
+    hdr: &CombinedHeaderOpts,
 ) -> Result<Vec<u8>> {
     combined_trees_patch_painted(
         repo,
@@ -9325,7 +9408,7 @@ pub(crate) fn combined_trees_patch_headed(
         ctx,
         dense,
         &diff_color::DiffColors::disabled(),
-        false,
+        hdr,
     )
 }
 
@@ -9340,13 +9423,27 @@ pub(crate) fn combined_trees_patch_painted(
     ctx: u32,
     dense: bool,
     colors: &diff_color::DiffColors,
-    // `rev->combined_all_paths`: one `--- a/<path>` per parent instead of one
-    // (combine-diff.c:988-997).
-    combined_all_paths: bool,
+    hdr: &CombinedHeaderOpts,
 ) -> Result<Vec<u8>> {
     let set = combined_path_set(repo, result_tree, parent_trees, paths)?;
-    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-    combined_patch(&set, ctx, dense, abbrev, b"a/", b"b/", b"", colors, combined_all_paths)
+    // `show_combined_header()` (combine-diff.c:933): `opt->flags.full_index` picks
+    // the whole hex, everything else `DEFAULT_ABBREV` — which `core.abbrev` moves.
+    let hexsz = repo.object_hash().len_in_hex();
+    let abbrev = match hdr.full_index {
+        true => hexsz,
+        false => crate::abbrev::configured_abbrev(repo, hexsz),
+    };
+    combined_patch(
+        &set,
+        ctx,
+        dense,
+        abbrev,
+        &hdr.a_prefix,
+        &hdr.b_prefix,
+        b"",
+        colors,
+        hdr.all_paths,
+    )
 }
 
 /// `show_patch_diff()` (combine-diff.c:1015) over an already-built path set: one
@@ -9384,7 +9481,7 @@ fn combined_patch(
             bail!("combined diff of more than two parents is not supported");
         }
         let parent_bytes: Vec<Vec<u8>> = cp.parents.iter().map(|p| p.bytes.clone()).collect();
-        let (sline, cnt) = build_combined_sline(&cp.bytes, &parent_bytes, ctx);
+        let (sline, cnt) = build_combined_sline(&cp.bytes, &parent_bytes, ctx, dense);
         let show_hunks = sline_has_marks(&sline, cnt);
         // `for (i = 0; i < num_parent; i++) if (elem->parent[i].mode != elem->mode)`
         // (combine-diff.c:1123-1128).
@@ -9571,7 +9668,11 @@ fn render_combined(
     };
     let result = std::fs::read(workdir.join(gix::path::from_bstr(delta.path.as_bstr())))?;
     let parents = vec![blob_bytes(repo, ours)?, blob_bytes(repo, theirs)?];
-    let (sline, cnt) = build_combined_sline(&result, &parents, ctx);
+    // An unmerged worktree path is only ever rendered as `diff --cc`
+    // (`run_diff_files()` hands `combine_diff_path`s to `show_combined_diff()` with
+    // the dense flag the caller set, and every caller that reaches here asked for
+    // the dense form), so `make_hunks()` runs with `dense` set.
+    let (sline, cnt) = build_combined_sline(&result, &parents, ctx, true);
 
     // ---- header (`show_combined_header()`) --------------------------------
     push_str(out, "diff --cc ");
@@ -9751,8 +9852,9 @@ fn give_context(sline: &mut [SLine], cnt: usize, context: usize) {
     }
 }
 
-/// `make_hunks()` with `dense` set, which is what `--cc` uses.
-fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32) {
+/// `make_hunks()` (combine-diff.c:607-745). `dense` is `rev->dense_combined_merges`
+/// (combine-diff.c:1204): `--cc` sets it and `-c` does not.
+fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
     let context = context as usize;
     for sl in sline.iter_mut().take(cnt + 1) {
         if interesting(sl) {
@@ -9760,6 +9862,14 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32) {
         } else {
             sl.flag &= !MARK;
         }
+    }
+
+    // `if (!dense) return give_context(sline, cnt, num_parent);` (combine-diff.c:621).
+    // A bare `-c` stops here: every interesting line keeps its mark, so a hunk only
+    // one parent changed still shows.
+    if !dense {
+        give_context(sline, cnt, context);
+        return;
     }
 
     // Drop hunks whose every line differs from the same single set of parents:

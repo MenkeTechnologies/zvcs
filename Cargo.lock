@@ -4333,6 +4333,7 @@ dependencies = [
  "ratatui",
  "reedline",
  "regex",
+ "regex-automata",
  "rkyv",
  "rusqlite",
  "rustls",

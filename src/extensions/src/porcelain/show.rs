@@ -617,26 +617,32 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "-m" => {
                 diff_merges = Some(super::log::DiffMerges::Separate);
                 remerge = false;
+                combined_all_paths = false;
             }
             "-c" => {
                 diff_merges = Some(super::log::DiffMerges::Combined);
                 remerge = false;
+                combined_all_paths = false;
             }
             "--cc" => {
                 diff_merges = Some(super::log::DiffMerges::DenseCombined);
                 remerge = false;
+                combined_all_paths = false;
             }
             "--dd" => {
                 diff_merges = Some(super::log::DiffMerges::FirstParent);
                 remerge = false;
+                combined_all_paths = false;
             }
             "--no-diff-merges" => {
                 diff_merges = Some(super::log::DiffMerges::Off);
                 remerge = false;
+                combined_all_paths = false;
             }
             "--remerge-diff" => {
                 diff_merges = Some(super::log::DiffMerges::Separate);
                 remerge = true;
+                combined_all_paths = false;
             }
             // `diff_tree_combined()` prints one `--- a/<path>` per parent under
             // `--combined-all-paths` (combine-diff.c), which the shared combined
@@ -1039,6 +1045,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         Some(m) => {
                             diff_merges = Some(m);
                             remerge = false;
+                            combined_all_paths = false;
                         }
                         // `func_by_opt()` (diff-merges.c:82-83) does map
                         // `r`/`remerge` onto `set_remerge_diff()`, so calling it
@@ -1046,6 +1053,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         None if matches!(v, "r" | "remerge") => {
                             diff_merges = Some(super::log::DiffMerges::Separate);
                             remerge = true;
+                            combined_all_paths = false;
                         }
                         None => {
                             // `set_diff_merges()`'s `die()` (diff-merges.c:94).
@@ -1154,9 +1162,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     if quiet {
         formats.no_output = true;
     }
-    // `diff_merges_setup_revs()`'s only die (diff-merges.c:184-185) — checked
-    // after the whole line is parsed, so `--combined-all-paths -c` passes it just
-    // as `-c --combined-all-paths` does.
+    // `diff_merges_setup_revs()`'s only die (diff-merges.c:184-185) — checked after
+    // the whole line is parsed. `--combined-all-paths -c` passes it too, but not
+    // with the flag still set: every `--diff-merges` spelling runs `suppress()`
+    // first (diff-merges.c:19), which clears `revs->combined_all_paths`, so only a
+    // `--combined-all-paths` written *after* the last of them survives.
     if !line_prefix.is_empty() && z {
         bail!("unsupported option --line-prefix with -z");
     }
@@ -3621,10 +3631,19 @@ fn show_commit_record(
                         &result_tree,
                         &parent_trees,
                         ps,
-                        3,
+                        // `show_patch_diff()` (combine-diff.c:1030):
+                        // `context = opt->context`, so `-U<n>` reaches the
+                        // combined patch too.
+                        disp.patch.ctx,
                         disp.merges == super::log::DiffMerges::DenseCombined,
                         &disp.patch.colors,
-                        disp.combined_all_paths,
+                        // `show_combined_header()` (combine-diff.c:931-933) takes
+                        // `--full-index` and the two path prefixes off the same
+                        // `diff_options` the two-way patch reads them from.
+                        &super::diff::CombinedHeaderOpts::from_patch_opts(
+                            &disp.patch,
+                            disp.combined_all_paths,
+                        ),
                     )?,
                 };
                 // `printf("%s%c", diff_line_prefix(opt), opt->line_termination)`

@@ -297,6 +297,10 @@ fn parse_diff_merges(v: &str) -> Option<DiffMerges> {
 /// which is why every mode clears the other two knobs rather than ORing into them:
 /// `--cc -m` renders per-parent diffs and `-m --cc` the dense combined patch.
 fn set_diff_merges(opts: &mut Opts, mode: DiffMerges) {
+    // `suppress()` clears `revs->combined_all_paths` too (diff-merges.c:19), so a
+    // `--combined-all-paths` written *before* `-c`/`--cc`/`-m`/`--diff-merges=<v>`
+    // is wiped by it and the run reports one path per row, not one per parent.
+    opts.combined_all_paths = false;
     opts.merges = false;
     opts.remerge = false;
     opts.first_parent_merges = false;
@@ -1064,6 +1068,24 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         opts.filter = ALL_STATUSES;
     }
 
+    // `diff_merges_setup_revs()` (diff-merges.c:184-185), which `setup_revisions()`
+    // calls just ahead of `diff_setup_done()`:
+    //
+    // ```c
+    // if (revs->combined_all_paths && !revs->combine_merges)
+    //         die("--combined-all-paths makes no sense without -c or --cc");
+    // ```
+    //
+    // It outranks every `die()` below — the format exclusivity check, the leftover
+    // argument usage and the operand counts alike — but not a revision that failed
+    // to resolve, which `setup_revisions()` reports while still parsing.
+    if opts.combined_all_paths
+        && !opts.combine
+        && revs.iter().all(|r| repo.rev_parse_single(r.as_str()).is_ok())
+    {
+        eprintln!("fatal: --combined-all-paths makes no sense without -c or --cc");
+        return Ok(ExitCode::from(FATAL));
+    }
     // `diff_setup_done()` (diff.c:5259): `--name-only`, `--name-status`, `--check` and
     // `-s` are mutually exclusive and it dies rather than picking one. `setup_revisions()`
     // resolves each operand as it parses and only calls `diff_setup_done()` afterwards,
@@ -2389,6 +2411,10 @@ fn combined_commit(
     if fmt & OF_PATCH != 0 {
         let paths: Vec<String> =
             opts.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        // `show_combined_header()` (combine-diff.c:931-933, :985) reads
+        // `opt->flags.full_index`, `opt->a_prefix`/`opt->b_prefix` and
+        // `rev->combined_all_paths` alongside the path set; they are the last four
+        // arguments the shared engine takes.
         let patch = super::diff::merge_combined_patch(
             repo,
             commit_id,
@@ -2396,25 +2422,8 @@ fn combined_commit(
             &paths,
             unified_context(&opts.diff_args),
             opts.dense_combined,
+            &combined_header_opts(&opts.diff_args, opts.combined_all_paths),
         )?;
-        // `show_combined_header()` also reads `opt->flags.full_index`,
-        // `opt->a_prefix`/`opt->b_prefix` and `rev->combined_all_paths`; the shared
-        // engine takes none of them, so a run that asks for one would print the wrong
-        // `index`/`---`/`+++` lines. Fail loudly instead — but only once there is a
-        // header to get wrong, since a path set the dense filter emptied prints
-        // nothing either way.
-        if !patch.is_empty() {
-            if let Some(flag) = opts.diff_args.iter().find(|a| {
-                matches!(a.as_str(), "--full-index" | "--no-prefix" | "--default-prefix")
-                    || a.starts_with("--src-prefix=")
-                    || a.starts_with("--dst-prefix=")
-            }) {
-                bail!("{flag} is not applied to the combined patch format");
-            }
-            if opts.combined_all_paths {
-                bail!("--combined-all-paths is not applied to the combined patch format");
-            }
-        }
         if needsep {
             out.extend_from_slice(&opts.line_prefix);
             out.push(term);
@@ -2426,6 +2435,39 @@ fn combined_commit(
         }
     }
     Ok(0)
+}
+
+/// `show_combined_header()`'s own view of the diff options (combine-diff.c:931-933,
+/// :985): `--full-index`, the two path prefixes and `--combined-all-paths`.
+///
+/// The prefixes follow the ordinary rules — `--no-prefix` empties both,
+/// `--default-prefix` puts `a/`/`b/` back, and `--src-prefix=`/`--dst-prefix=`
+/// replace one each — with the last spelling on the line winning, which is how
+/// `diff_opt_parse()` assigns `opt->a_prefix`/`opt->b_prefix`.
+fn combined_header_opts(diff_args: &[String], all_paths: bool) -> super::diff::CombinedHeaderOpts {
+    let mut hdr = super::diff::CombinedHeaderOpts { all_paths, ..Default::default() };
+    for a in diff_args {
+        match a.as_str() {
+            "--full-index" => hdr.full_index = true,
+            "--no-full-index" => hdr.full_index = false,
+            "--no-prefix" => {
+                hdr.a_prefix.clear();
+                hdr.b_prefix.clear();
+            }
+            "--default-prefix" => {
+                hdr.a_prefix = b"a/".to_vec();
+                hdr.b_prefix = b"b/".to_vec();
+            }
+            s if s.starts_with("--src-prefix=") => {
+                hdr.a_prefix = s["--src-prefix=".len()..].as_bytes().to_vec();
+            }
+            s if s.starts_with("--dst-prefix=") => {
+                hdr.b_prefix = s["--dst-prefix=".len()..].as_bytes().to_vec();
+            }
+            _ => {}
+        }
+    }
+    hdr
 }
 
 /// `-U<n>`/`--unified=<n>`, or git's default of 3 when neither was given.

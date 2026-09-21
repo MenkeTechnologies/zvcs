@@ -5389,6 +5389,14 @@ fn emit_combined_diff(
         opts.context,
         dense,
         &opts.colors,
+        // `show_combined_header()` (combine-diff.c:931-933): `--full-index` and the
+        // two path prefixes reach the combined header as well.
+        &super::diff::CombinedHeaderOpts {
+            full_index: opts.full_index,
+            a_prefix: opts.src_prefix.clone().into_bytes(),
+            b_prefix: opts.dst_prefix.clone().into_bytes(),
+            all_paths: false,
+        },
     )?;
     if patch.is_empty() {
         return Ok(());

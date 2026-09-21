@@ -42,13 +42,21 @@
 //!
 //! * **Leftmost-longest vs leftmost-first.** POSIX picks the longest alternative at
 //!   a given start position, the `regex` crate the first one written. Only an
-//!   alternation whose branches can match at the same offset can tell them apart.
+//!   alternation whose branches can match at the same offset can tell them apart —
+//!   which the built-in word regexes routinely do, so
+//!   [`crate::porcelain::diff_color::WordRegex`] recovers POSIX semantics for
+//!   `--word-diff` by pairing the `regex` crate with a lazy DFA built under
+//!   `MatchKind::All`. A *funcname* pattern still matches leftmost-first: git only
+//!   asks it whether a line matched and what its first group was, neither of which
+//!   the tie-break can move for the built-in patterns.
 //! * **Bracket-expression spelling.** POSIX gives three things inside `[...]` a
 //!   literal meaning the `regex` crate rejects or reads as syntax: a leading `]`, a
 //!   bare `\`, and a `[` that does not open a `[:class:]`. [`posix_class_fixups`]
 //!   rewrites exactly those and nothing else, which is what lets the built-in
 //!   `csharp`, `java`, `bibtex` and `css` patterns compile with the meaning
-//!   `regcomp` gives them.
+//!   `regcomp` gives them. Its one exception is `\xHH`: `userdiff.c` writes raw
+//!   bytes into its C string literals where a Rust `&str` can only carry the
+//!   escape, so that escape is passed through rather than made literal.
 //! * **Refusal text.** A pattern the `regex` crate rejects and `regcomp` would have
 //!   taken (or the reverse) changes *whether* the fatal fires, not its wording:
 //!   `Invalid regexp to look for hunk header: <pattern>` is git's own string.
@@ -419,7 +427,9 @@ fn bre_to_ere(bre: &str) -> String {
 /// * `]` immediately after `[` or `[^` is a literal `]`, not an empty class.
 ///   git's built-in `csharp` and `java` patterns rely on it (`[][[:alnum:]@_.]`).
 /// * a `\` inside a bracket expression is a literal backslash, not an escape —
-///   git's `bibtex` pattern relies on it (`[^ \t\"@',\\#}{~%]`).
+///   git's `bibtex` pattern relies on it (`[^ \t\"@',\\#}{~%]`). The single
+///   exception is `\xHH`, which [`BUILTIN`] uses to spell the raw bytes
+///   `userdiff.c` writes directly into its C string literals; see [`is_hex_escape`].
 /// * a `[` inside a bracket expression that does not open a `[:class:]` is a
 ///   literal `[`; the built-in `css` pattern relies on it (`^[:[@.#]?`).
 ///
@@ -466,6 +476,21 @@ pub fn posix_class_fixups(ere: &str) -> String {
                         continue;
                     }
                     if src[i] == '\\' {
+                        // `\xHH` is the one escape kept: `userdiff.c`'s built-in
+                        // word regexes end in `"|[\xc0-\xff][\x80-\xbf]+"`, whose
+                        // C string literal holds the *bytes* 0xC0-0xFF and
+                        // 0x80-0xBF — a UTF-8 lead byte followed by its
+                        // continuation bytes. A Rust `&str` cannot hold a lone
+                        // 0xC0, so [`BUILTIN`] spells that range with the `regex`
+                        // crate's own byte escape; doubling the backslash here
+                        // would turn the class into the literal members `\`, `x`,
+                        // `c`, `0`-`\` and `f`, which match ASCII and would then
+                        // win the longest match over every real branch.
+                        if is_hex_escape(&src, i) {
+                            out.extend(&src[i..i + 4]);
+                            i += 4;
+                            continue;
+                        }
                         out.push_str("\\\\");
                         i += 1;
                         continue;
@@ -485,6 +510,15 @@ pub fn posix_class_fixups(ere: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `src[at..]` opens a `\xHH` byte escape: a backslash, an `x`, and two
+/// hexadecimal digits.
+fn is_hex_escape(src: &[char], at: usize) -> bool {
+    src.get(at) == Some(&'\\')
+        && src.get(at + 1) == Some(&'x')
+        && src.get(at + 2).is_some_and(|c| c.is_ascii_hexdigit())
+        && src.get(at + 3).is_some_and(|c| c.is_ascii_hexdigit())
 }
 
 /// The index of the `:`/`.`/`=` that closes the `[:class:]` opened at `at`, or
@@ -630,8 +664,13 @@ mod tests {
     fn a_driver_word_regex_splits_where_whitespace_would_not() {
         let b = BUILTIN.iter().find(|b| b.name == "python").expect("python driver");
         let re = crate::porcelain::diff_color::compile_word_regex(b.word_regex).expect("compiles");
-        let words: Vec<&[u8]> =
-            re.find_iter(b"alpha_beta+gamma").map(|m| m.as_bytes()).collect();
+        let hay: &[u8] = b"alpha_beta+gamma";
+        let mut words: Vec<&[u8]> = Vec::new();
+        let mut at = 0usize;
+        while let Some((s, e)) = re.find(&hay[at..]) {
+            words.push(&hay[at + s..at + e]);
+            at += e;
+        }
         assert_eq!(words, vec![&b"alpha_beta"[..], &b"+"[..], &b"gamma"[..]]);
     }
 

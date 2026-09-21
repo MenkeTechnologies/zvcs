@@ -5921,9 +5921,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         node.id,
                         &node.parents,
                         combined_paths.as_deref().unwrap_or(&pathspecs),
-                        3,
+                        // `show_patch_diff()` (combine-diff.c:1030) opens with
+                        // `context = opt->context`, so a combined merge honours
+                        // `-U<n>` exactly as a two-way patch does.
+                        patch_opts.ctx,
                         diff_merges == DiffMerges::DenseCombined,
                         &patch_opts.colors,
+                        // `show_combined_header()` (combine-diff.c:931-933).
+                        &super::diff::CombinedHeaderOpts::from_patch_opts(&patch_opts, false),
                     )?,
                 };
                 // A remerge record diffs the re-merged tree against the recorded one,
@@ -5946,7 +5951,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     (None, _) if combined_record && has_pickaxe => &combined_pickaxe_patch,
                     (None, _) if has_pickaxe => &pickaxe_patch,
                     (None, Some(_)) => &separate_patch,
-                    (None, None) => patches.get(&repo, &nodes, ni, 3, &pathspecs)?,
+                    // `context = opt->context` (combine-diff.c:1030): the window
+                    // renders a merge's combined patch, which reads `-U<n>`.
+                    (None, None) => patches.get(&repo, &nodes, ni, patch_opts.ctx, &pathspecs)?,
                 };
                 // `additional_path_headers` (diff.c:3772-3777, 7050-7096): the
                 // conflict notices the re-merge recorded, spliced into the sections
@@ -7222,6 +7229,11 @@ impl PatchWindow {
                                     ctx,
                                     self.merges == DiffMerges::DenseCombined,
                                     &self.patch_opts.colors,
+                                    // `show_combined_header()` (combine-diff.c:931-933).
+                                    &super::diff::CombinedHeaderOpts::from_patch_opts(
+                                        &self.patch_opts,
+                                        false,
+                                    ),
                                 )?,
                             ));
                             continue;

@@ -1511,11 +1511,11 @@ fn side_driver(
 /// `--word-diff`, or a `--word-diff-regex`/`--color-words=<re>` on the command line —
 /// which is also why a driver pattern that would not compile is silent in that state.
 fn pair_word_regex(
-    cache: &mut std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>>,
+    cache: &mut std::collections::HashMap<String, std::sync::Arc<super::diff_color::WordRegex>>,
     one: &Option<std::sync::Arc<crate::userdiff::Driver>>,
     two: &Option<std::sync::Arc<crate::userdiff::Driver>>,
     want: bool,
-) -> Option<std::sync::Arc<regex::bytes::Regex>> {
+) -> Option<std::sync::Arc<super::diff_color::WordRegex>> {
     if !want {
         return None;
     }
@@ -1661,7 +1661,7 @@ fn compare_with_drivers(
     // per-file whitespace state.
     let mut paints: Vec<diff_color::FilePaint> = Vec::new();
     // One compiled regex per distinct driver pattern for the whole run.
-    let mut word_res: std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>> =
+    let mut word_res: std::collections::HashMap<String, std::sync::Arc<super::diff_color::WordRegex>> =
         std::collections::HashMap::new();
     for pi in 0..q.pairs.len() {
         let pair = q.pairs[pi].clone();

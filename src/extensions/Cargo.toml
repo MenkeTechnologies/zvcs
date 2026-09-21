@@ -74,6 +74,18 @@ regex = "1"
 # the same division of labour git makes. Pure Rust, and it shares `regex`'s own
 # `regex-automata`/`regex-syntax` back end, so it adds no new C dependency.
 fancy-regex = "0.18"
+# `regex`'s own lazy-DFA back end, already in the tree as `regex`'s dependency.
+# `regex` matches leftmost-*first*; POSIX `regexec(3)`, which git's word-diff uses,
+# matches leftmost-*longest*. A hybrid DFA built with `MatchKind::All` and searched
+# anchored runs to the longest end, which is how `diff_color::WordRegex` recovers
+# POSIX semantics for `--word-diff` without a second regex syntax.
+regex-automata = { version = "0.4", default-features = false, features = [
+    "std",
+    "syntax",
+    "hybrid",
+    "perf-inline",
+    "unicode",
+] }
 # File-watch autonomy: the daemon reacts to local ref changes (a `git pull`/commit
 # updates `logs/HEAD` / remote-tracking refs) and never polls a remote.
 notify = "6"

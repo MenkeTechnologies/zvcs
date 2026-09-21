@@ -31,9 +31,9 @@
 //! deterministic but can differ from git when two or more previously-unlisted
 //! packs are written in the same run. Everything else — the single-pack case,
 //! the "preserve existing order" case, and every `info/refs` byte — matches.
-//! `core.sharedRepository` permission widening is not applied to the two files;
-//! they are created with the process umask, which is what git produces for the
-//! default (unshared) configuration.
+//! `core.sharedRepository` widening is applied to each replacement before it is
+//! renamed into place, as `update_info_file()` does
+//! (`adjust_shared_perm(r, get_tempfile_path(f))`, server-info.c:81).
 //!
 //! The failure path (`error: unable to update <path>: <reason>`, exit 1, file
 //! left as it was) is reproduced for the case that triggers it in practice — a
@@ -143,9 +143,15 @@ pub fn update_server_info(args: &[String]) -> Result<ExitCode> {
     // status, so a failing `info/refs` still leaves a refreshed pack list.
     let mut errs = false;
 
+    // `get_shared_repository()` as `git_default_core_config()` leaves it: the parsed
+    // `core.sharedRepository`, where `umask`/`0`/absent all mean "not shared" and so
+    // widen nothing. A value this build cannot read is left as not-shared rather than
+    // made fatal here — `git update-server-info` is not where git reports it.
+    let shared = shared_repository(&repo);
+
     let packs_path = objdir.join("info").join("packs");
     let packs = info_packs(&objdir, force);
-    if let Err(reason) = write_info_file(&packs_path, &packs, force) {
+    if let Err(reason) = write_info_file(&packs_path, &packs, force, shared) {
         report(&packs_path, &reason);
         errs = true;
     }
@@ -157,7 +163,7 @@ pub fn update_server_info(args: &[String]) -> Result<ExitCode> {
             errs = true;
         }
         Ok(content) => {
-            if let Err(reason) = write_info_file(&refs_path, &content, force) {
+            if let Err(reason) = write_info_file(&refs_path, &content, force, shared) {
                 report(&refs_path, &reason);
                 errs = true;
             }
@@ -320,7 +326,7 @@ fn info_refs(repo: &gix::Repository) -> Result<String, String> {
 /// `update_info_file()`: leave a file whose contents already match alone unless
 /// `--force` was given, otherwise replace it atomically through a sibling temp
 /// file, creating the `info/` directory if it is missing.
-fn write_info_file(path: &Path, content: &str, force: bool) -> Result<(), String> {
+fn write_info_file(path: &Path, content: &str, force: bool, shared: i32) -> Result<(), String> {
     if !force {
         if let Ok(old) = fs::read_to_string(path) {
             if old == content {
@@ -343,11 +349,38 @@ fn write_info_file(path: &Path, content: &str, force: bool) -> Result<(), String
         let _ = fs::remove_file(&tmp);
         return Err(errno_string(e));
     }
+    // ```c
+    // if (adjust_shared_perm(r, get_tempfile_path(f)) < 0)
+    //         goto out;
+    // if (rename_tempfile(&f, path) < 0)
+    //         goto out;
+    // ```
+    //
+    // (`update_info_file()`, server-info.c:80-84.) The temp file was created at 0666 &
+    // ~umask, and the shared mode widens it from there — so `core.sharedRepository=0660`
+    // under `umask 0277` leaves `info/refs` at 0440, not at the umask's 0400.
+    if shared != 0 {
+        if let Err(e) = super::init::adjust_shared_perm_recursive(&tmp, shared) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+    }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(errno_string(e));
     }
     Ok(())
+}
+
+/// `core.sharedRepository`, read through the full configuration the way
+/// `git_default_core_config()` does, and parsed by `git_config_perm()` (path.c) into the
+/// encoding `calc_shared_perm()` expects: 0 for umask/unshared, a positive mode to OR in,
+/// or the negation of an explicit `0<nnn>` filemode to force.
+fn shared_repository(repo: &gix::Repository) -> i32 {
+    repo.config_snapshot()
+        .string("core.sharedRepository")
+        .and_then(|v| super::init::parse_shared_value(&v.to_string()).ok())
+        .unwrap_or(0)
 }
 
 /// git's `%s_XXXXXX` sibling temp name, made unique by the process id rather

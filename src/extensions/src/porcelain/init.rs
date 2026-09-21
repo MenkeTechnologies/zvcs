@@ -1214,7 +1214,7 @@ fn copy_template_dir(src: &Path, dst: &Path) -> Result<()> {
 /// `0o664`; a `0`/`1`/`2` compatibility number → 0/`0o660`/`0o664`; any other
 /// octal `0xxx` file mode → `-(mode & 0o666)` (stored negated). An octal mode
 /// that would deny the owner read+write is rejected, exactly like git.
-fn parse_shared_value(value: &str) -> Result<i32> {
+pub(crate) fn parse_shared_value(value: &str) -> Result<i32> {
     match value {
         "umask" => return Ok(0),
         "group" => return Ok(0o660),
@@ -1338,7 +1338,7 @@ fn calc_shared_perm(shared: i32, mode: u32) -> u32 {
 /// set-gid bit is forced when any group access is granted. Symlinks are left
 /// untouched (git init creates none, and chmod through them is undesirable).
 #[cfg(unix)]
-fn adjust_shared_perm_recursive(path: &Path, shared: i32) -> Result<()> {
+pub(crate) fn adjust_shared_perm_recursive(path: &Path, shared: i32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     const S_ISGID: u32 = 0o2000;

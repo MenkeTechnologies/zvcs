@@ -1339,19 +1339,6 @@ pub(super) fn read_converted_bytes(
     Ok((converted, mode))
 }
 
-/// `create_ce_mode(st.st_mode)` (cache.h): the index mode `add_to_index()` gives an
-/// entry from the worktree stat alone, before it has read a single byte. `-N` never
-/// reads the file, so this is the only mode it has to compare against.
-pub(super) fn mode_from_metadata(md: &gix::index::fs::Metadata) -> Mode {
-    if md.is_symlink() {
-        Mode::SYMLINK
-    } else if md.is_executable() {
-        Mode::FILE_EXECUTABLE
-    } else {
-        Mode::FILE
-    }
-}
-
 fn read_worktree_bytes(
     abs: &std::path::Path,
     md: &gix::index::fs::Metadata,
@@ -1458,6 +1445,9 @@ struct Staged {
 
 fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let index = open_index(repo)?;
+    // `trust_executable_bit`/`has_symlinks` (environment.c:44-45): with either off,
+    // `add_to_index()` takes a new entry's mode off the index rather than the stat.
+    let mode_rules = super::update_index::ModeRules::from_repo(repo);
     // The content filters every staged blob passes through — the same pipeline
     // `git add` uses, since `cmd_stage()` *is* `cmd_add()`.
     //
@@ -1712,27 +1702,45 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 // already holds with the one just built — under `-N` that is the
                 // empty blob at the mode the worktree stat gives. Only a difference
                 // is reported, and the entry itself is left alone.
-                if current != Some(&(empty, mode_from_metadata(&md))) {
+                if current
+                    != Some(&(
+                        empty,
+                        super::update_index::mode_for_added_path(
+                            mode_rules,
+                            &index,
+                            path.as_bstr(),
+                            &md,
+                        ),
+                    ))
+                {
                     touched.insert(path.clone(), "add");
                 }
                 continue;
             }
             touched.insert(path.clone(), "add");
+            // `add_to_index()`'s mode block runs for `intent_only` too: an
+            // intent-to-add entry keeps the worktree's own mode, so `git stage -N`
+            // over an executable records 100755 and over a symlink 120000 —
+            // except where `core.fileMode`/`core.symlinks` send it to the index
+            // instead (read-cache.c:745-756).
+            let mode =
+                super::update_index::mode_for_added_path(mode_rules, &index, path.as_bstr(), &md);
             staged.push(Staged {
                 path,
                 id: empty,
-                // `create_ce_mode(st_mode)` again: an intent-to-add entry keeps the
-                // worktree's own mode, so `git stage -N` over an executable records
-                // 100755 and over a symlink 120000. Recording 100644 for all three
-                // made `ls-files -s` disagree with stock for both.
-                mode: mode_from_metadata(&md),
+                mode,
                 stat: stat_now,
                 intent: true,
             });
             continue;
         }
 
-        let (raw, mode) = match read_worktree_bytes(&abs, &md) {
+        // The content pipeline is keyed on what the worktree item IS; the mode the
+        // entry records is `ce_mode_from_stat()`'s, which under `core.fileMode=0` or
+        // `core.symlinks=0` comes off the entry already in the index
+        // (read-cache.c:745-756).
+        let mode = super::update_index::mode_for_added_path(mode_rules, &index, path.as_bstr(), &md);
+        let (raw, disk_mode) = match read_worktree_bytes(&abs, &md) {
             Ok(v) => v,
             Err(e) => {
                 if !o.renormalize {
@@ -1753,7 +1761,7 @@ fn add(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // comes from. The two are told apart from a read failure here rather than
         // in a shared helper, because a refused conversion is a fatal while an
         // unreadable file is an `unable to index file` the run can survive.
-        let bytes = if mode == Mode::SYMLINK {
+        let bytes = if disk_mode == Mode::SYMLINK {
             raw
         } else {
             let rela = gix::path::from_bstr(path.as_bstr()).into_owned();

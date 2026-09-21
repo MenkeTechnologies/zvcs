@@ -483,6 +483,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
     };
 
+    // `trust_executable_bit`/`has_symlinks` (environment.c:44-45), which
+    // `add_to_index()` consults before it gives a new entry its mode: with either
+    // one off the mode comes from the entry the index already holds, not from the
+    // worktree stat (read-cache.c:745-756).
+    let mode_rules = super::update_index::ModeRules::from_repo(&repo);
+
     // Repo-relative paths of the current stage-0 entries (tracked set), each with
     // the recorded stat and the object it names. The stat is what
     // `run_diff_files()` compares to decide which tracked paths are handed to
@@ -646,9 +652,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             }
             let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
             let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
-            let (bytes, mode) =
+            // Only the id is taken from this second read. The mode was settled by
+            // `add_to_index()`'s own block before a byte was read
+            // (read-cache.c:745-756), and that answer can differ from what this
+            // stat says: under `core.fileMode=0` or `core.symlinks=0` it comes off
+            // the entry the index already holds. Re-deriving it here put the
+            // filesystem's executable bit back on every path `git add` staged.
+            let (bytes, _disk_mode) =
                 super::stage::read_converted_bytes(repo, filters, s.path.as_ref(), &abs, &md)?;
-            s.mode = mode;
             s.id = repo.write_blob(&bytes)?.detach();
         }
         Ok(())
@@ -916,17 +927,24 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // for every path that reaches `add_to_index()`, before
             // `ADD_CACHE_PRETEND` is consulted — so even `-n` leaves the empty blob.
             indexed_any = true;
+            let mode =
+                super::update_index::mode_for_added_path(mode_rules, &index, path.as_bstr(), &md);
             staged.push(Staged {
                 path,
                 id: repo.object_hash().empty_blob(),
-                mode: super::stage::mode_from_metadata(&md),
+                mode,
                 stat: stat_now,
                 was_tracked: already_tracked,
             });
             continue;
         }
 
-        let (bytes, mode) = if md.is_symlink() {
+        // `add_to_index()` gives the entry its mode before it reads a byte, and with
+        // `core.fileMode=0` or `core.symlinks=0` that mode comes off the entry the
+        // index already holds (read-cache.c:745-756), not off this stat.
+        let mode =
+            super::update_index::mode_for_added_path(mode_rules, &index, path.as_bstr(), &md);
+        let bytes = if md.is_symlink() {
             let target = match std::fs::read_link(&abs) {
                 Ok(t) => t,
                 Err(e) => {
@@ -941,7 +959,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             };
             #[cfg(not(unix))]
             let bytes = target.to_string_lossy().into_owned().into_bytes();
-            (bytes, Mode::SYMLINK)
+            bytes
         } else {
             // A symlink's target never reaches the blob hasher that consults the
             // threshold, so only this branch asks — git 2.55.0 adds a lone
@@ -960,11 +978,6 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
             };
-            let mode = if md.is_executable() {
-                Mode::FILE_EXECUTABLE
-            } else {
-                Mode::FILE
-            };
             // A symlink's target is stored verbatim; a regular file goes through
             // the pipeline, which is also where git's CRLF round-trip warning
             // (and `core.safecrlf`'s refusal) comes from.
@@ -980,7 +993,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             };
-            (bytes, mode)
+            bytes
         };
 
         // `--chmod` is deliberately NOT applied here: git runs `chmod_pathspec()`
@@ -1101,10 +1114,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // nothing; see the walk's copy of this above.
             if intent_to_add {
                 indexed_any = true;
+                let mode = super::update_index::mode_for_added_path(
+                    mode_rules,
+                    &index,
+                    path.as_bstr(),
+                    &md,
+                );
                 staged.push(Staged {
                     path,
                     id: repo.object_hash().empty_blob(),
-                    mode: super::stage::mode_from_metadata(&md),
+                    mode,
                     stat: stat_now,
                     was_tracked: true,
                 });
@@ -1114,7 +1133,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // The walk's own read, verbatim: a symlink's target is stored as it
             // stands, a regular file goes through the `convert_to_git()` pipeline
             // (and so can raise `core.safecrlf`'s refusal).
-            let (bytes, mode) = if md.is_symlink() {
+            let mode = super::update_index::mode_for_added_path(
+                mode_rules,
+                &index,
+                path.as_bstr(),
+                &md,
+            );
+            let bytes = if md.is_symlink() {
                 let target = match std::fs::read_link(&abs) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1129,7 +1154,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 };
                 #[cfg(not(unix))]
                 let bytes = target.to_string_lossy().into_owned().into_bytes();
-                (bytes, Mode::SYMLINK)
+                bytes
             } else {
                 let bytes = match std::fs::read(&abs) {
                     Ok(b) => b,
@@ -1138,7 +1163,6 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                         continue;
                     }
                 };
-                let mode = if md.is_executable() { Mode::FILE_EXECUTABLE } else { Mode::FILE };
                 let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
                 let bytes = match filters.convert(&repo, &rela, &bytes) {
                     Ok(converted) => converted,
@@ -1147,7 +1171,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                         return Ok(ExitCode::from(128));
                     }
                 };
-                (bytes, mode)
+                bytes
             };
             indexed_any = true;
             let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;

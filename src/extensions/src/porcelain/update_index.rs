@@ -303,6 +303,9 @@ struct Ctx {
 
     /// `core.fileMode`; when false the executable bit of worktree files is ignored.
     trust_executable_bit: bool,
+    /// `core.symlinks`; when false a tracked symlink is checked out as an ordinary
+    /// file, so its recorded mode has to survive a restage of that file.
+    has_symlinks: bool,
     /// `core.ignoreStat`; when true every written entry gets the `CE_VALID` bit.
     ignore_stat: bool,
     stat_opts: gix::index::entry::stat::Options,
@@ -325,6 +328,15 @@ struct Ctx {
 struct Die;
 
 impl Ctx {
+    /// The `trust_executable_bit`/`has_symlinks` pair `ce_mode_from_stat()` reads,
+    /// already resolved from config when the context was built.
+    fn mode_rules(&self) -> ModeRules {
+        ModeRules {
+            trust_executable_bit: self.trust_executable_bit,
+            has_symlinks: self.has_symlinks,
+        }
+    }
+
     /// Record that `path`'s index entry changed: the cache-tree nodes along it can
     /// no longer be trusted. (`dirty` — git's `cache_changed` — is set separately by
     /// the callers, which know whether the entry really moved.)
@@ -423,6 +435,10 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         .config_snapshot()
         .boolean("core.fileMode")
         .unwrap_or(true);
+    let has_symlinks = repo
+        .config_snapshot()
+        .boolean("core.symlinks")
+        .unwrap_or(true);
 
     let mut ctx = Ctx {
         index_version: None,
@@ -451,6 +467,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         mark_fsmonitor: None,
         set_executable_bit: None,
         trust_executable_bit,
+        has_symlinks,
         ignore_stat,
         stat_opts,
         filters: None,
@@ -1609,14 +1626,14 @@ fn add_one_path(
             return Ok(Ok(()));
         }
         if old_stat.matches(&new_stat, ctx.stat_opts)
-            && old_mode == ce_mode_from_stat(ctx, Some(old_mode), meta)
+            && old_mode == ce_mode_from_stat(ctx.mode_rules(), Some(old_mode), meta)
         {
             return Ok(Ok(())); // already up to date
         }
     }
 
     let old_mode = existing.map(|idx| ctx.index.entries()[idx].mode);
-    let mode = ce_mode_from_stat(ctx, old_mode, meta);
+    let mode = ce_mode_from_stat(ctx.mode_rules(), old_mode, meta);
 
     let abs = match ctx.repo.workdir_path(path.as_bstr()) {
         Some(a) => a,
@@ -1666,22 +1683,134 @@ fn read_worktree_content(abs: &Path, meta: &gix::index::fs::Metadata) -> Result<
     }
 }
 
-/// git's `ce_mode_from_stat`, honouring `core.fileMode`.
-fn ce_mode_from_stat(ctx: &Ctx, old: Option<Mode>, meta: &gix::index::fs::Metadata) -> Mode {
+/// The two globals `ce_mode_from_stat()` reads: `trust_executable_bit` and
+/// `has_symlinks` (environment.c:44-45, both default 1, both set from
+/// `core.fileMode` / `core.symlinks`).
+#[derive(Clone, Copy)]
+pub(super) struct ModeRules {
+    pub(super) trust_executable_bit: bool,
+    pub(super) has_symlinks: bool,
+}
+
+impl ModeRules {
+    pub(super) fn from_repo(repo: &gix::Repository) -> Self {
+        let cfg = repo.config_snapshot();
+        Self {
+            trust_executable_bit: cfg.boolean("core.fileMode").unwrap_or(true),
+            has_symlinks: cfg.boolean("core.symlinks").unwrap_or(true),
+        }
+    }
+}
+
+/// `create_ce_mode(st.st_mode)` (cache.h) fed from a worktree stat: the index mode
+/// a `stat` alone gives, before any entry already in the index is consulted. The
+/// raw-mode spelling `--cacheinfo` needs is [`create_ce_mode`].
+pub(super) fn ce_mode_from_metadata(meta: &gix::index::fs::Metadata) -> Mode {
     if meta.is_symlink() {
-        return Mode::SYMLINK;
-    }
-    if !ctx.trust_executable_bit {
-        return match old {
-            Some(m) if m == Mode::FILE || m == Mode::FILE_EXECUTABLE => m,
-            _ => Mode::FILE,
-        };
-    }
-    if meta.is_executable() {
+        Mode::SYMLINK
+    } else if meta.is_executable() {
         Mode::FILE_EXECUTABLE
     } else {
         Mode::FILE
     }
+}
+
+/// ```c
+/// static inline unsigned int ce_mode_from_stat(const struct cache_entry *ce,
+///                                              unsigned int mode)
+/// {
+///         extern int trust_executable_bit, has_symlinks;
+///         if (!has_symlinks && S_ISREG(mode) &&
+///             ce && S_ISLNK(ce->ce_mode))
+///                 return ce->ce_mode;
+///         if (!trust_executable_bit && S_ISREG(mode)) {
+///                 if (ce && S_ISREG(ce->ce_mode))
+///                         return ce->ce_mode;
+///                 return create_ce_mode(0666);
+///         }
+///         return create_ce_mode(mode);
+/// }
+/// ```
+///
+/// (read-cache.h:8-21.) Both guards turn on the *worktree* being a regular file:
+/// on a filesystem without symlinks a tracked symlink is checked out as an
+/// ordinary file, so its `120000` has to come back from the entry rather than
+/// from the stat, and with `core.fileMode=0` an executable bit the filesystem
+/// invented must not overwrite the recorded `100644`/`100755`.
+pub(super) fn ce_mode_from_stat(
+    rules: ModeRules,
+    old: Option<Mode>,
+    meta: &gix::index::fs::Metadata,
+) -> Mode {
+    let is_reg = !meta.is_symlink();
+    if !rules.has_symlinks && is_reg && old == Some(Mode::SYMLINK) {
+        return Mode::SYMLINK;
+    }
+    if !rules.trust_executable_bit && is_reg {
+        return match old {
+            Some(m) if m == Mode::FILE || m == Mode::FILE_EXECUTABLE => m,
+            // `create_ce_mode(0666)`: an unexecutable regular file.
+            _ => Mode::FILE,
+        };
+    }
+    ce_mode_from_metadata(meta)
+}
+
+/// ```c
+/// static int index_name_pos_also_unmerged(struct index_state *istate,
+///         const char *path, int namelen)
+/// ```
+///
+/// (read-cache.c:670-689.) Stage 0 if there is one; otherwise the unmerged
+/// entry that sorts first under that name, except that a stage 1 followed by a
+/// stage 2 yields the stage 2 — "order of preference: stage 2, 1, 3". Only the
+/// mode is wanted here, which is all `add_to_index()` reads off the entry.
+pub(super) fn unmerged_aware_mode(index: &gix::index::File, path: &BStr) -> Option<Mode> {
+    if let Some(i) = index.entry_index_by_path_and_stage(path, Stage::Unconflicted) {
+        return Some(index.entries()[i].mode);
+    }
+    let range = index.entry_range(path)?;
+    let entries = index.entries().get(range)?;
+    let first = entries.first()?;
+    if first.stage_raw() == 1 {
+        if let Some(second) = entries.get(1) {
+            if second.stage_raw() == 2 {
+                return Some(second.mode);
+            }
+        }
+    }
+    Some(first.mode)
+}
+
+/// The mode block of `add_to_index()` (read-cache.c:745-756):
+///
+/// ```c
+/// if (trust_executable_bit && has_symlinks) {
+///         ce->ce_mode = create_ce_mode(st_mode);
+/// } else {
+///         /* If there is an existing entry, pick the mode bits and type
+///          * from it, otherwise assume unexecutable regular file.
+///          */
+///         struct cache_entry *ent;
+///         int pos = index_name_pos_also_unmerged(istate, path, namelen);
+///
+///         ent = (0 <= pos) ? istate->cache[pos] : NULL;
+///         ce->ce_mode = ce_mode_from_stat(ent, st_mode);
+/// }
+/// ```
+///
+/// The index is not consulted at all in the common case, so a repository with
+/// both knobs at their defaults pays nothing for the lookup.
+pub(super) fn mode_for_added_path(
+    rules: ModeRules,
+    index: &gix::index::File,
+    path: &BStr,
+    meta: &gix::index::fs::Metadata,
+) -> Mode {
+    if rules.trust_executable_bit && rules.has_symlinks {
+        return ce_mode_from_metadata(meta);
+    }
+    ce_mode_from_stat(rules, unmerged_aware_mode(index, path), meta)
 }
 
 /// git's `add_index_entry_with_check`, reduced to the flags update-index passes.

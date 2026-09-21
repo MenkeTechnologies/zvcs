@@ -1268,12 +1268,15 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         ws_errors = errors;
         // `if (state->whitespace_error && ws_error_action == die_on_ws_error)
         // state->apply = 0;` (apply.c:4942), inside `apply_patch()` and therefore
-        // *before* the check and the write. The summary line itself is printed by
-        // the tail block, which nothing else reaches under this action because
-        // `state->check || state->apply` is then false.
+        // *before* the check and the write. It clears `apply` and nothing else:
+        // `--check` keeps `state->check` set, so `check_patch_list()` (apply.c:4962)
+        // still runs and its refusal still wins. The summary line and the 128 come
+        // from `apply_all_patches()`'s tail (apply.c:5141-5158), which a failed
+        // check never reaches — `apply_patch()` returns -1 and apply.c:5129 jumps
+        // past it, so such a run exits 1 with the patch's own diagnostic and no
+        // whitespace verdict at all.
         if errors > 0 && matches!(o.ws, WsAction::Error) {
-            ws_summary(errors, &o.ws, o.apply, applied_after_fixing_ws, o.quiet());
-            return Ok(ExitCode::from(128));
+            o.apply = false;
         }
     }
 
@@ -1339,7 +1342,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         reports(&patches);
-        return Ok(ExitCode::SUCCESS);
+        return Ok(ws_tail(ws_errors, &o, applied_after_fixing_ws));
     }
 
     // ---- index substrate (only when --index/--cached) -----------------------
@@ -1366,8 +1369,34 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // (apply.c:4945, `(check_index || ita_only) && apply`).
     let update_index = (check_index || o.ita_only) && o.apply;
 
+    // `prepare_symlink_changes()` (apply.c:3975-3987), run once over the whole
+    // patch list before any file is checked: which paths this run turns into a
+    // symlink and which paths stop being one. `path_is_beyond_symlink_1()` reads
+    // both (apply.c:3997-4004).
+    let mut kept_symlinks: HashSet<String> = HashSet::new();
+    let mut removed_symlinks: HashSet<String> = HashSet::new();
+    for p in &patches {
+        if let Some(old) = &p.old_name {
+            if is_symlink_mode(p.old_mode) && (p.is_rename || p.is_delete) {
+                removed_symlinks.insert(old.clone());
+            }
+        }
+        if let Some(new) = &p.new_name {
+            if is_symlink_mode(p.new_mode) {
+                kept_symlinks.insert(new.clone());
+            }
+        }
+    }
+
+    // `trust_executable_bit`, which `check_preimage()` consults when it works out
+    // the mode the pre-image actually has (apply.c:3896).
+    let trust_exec = trust_executable_bit(idx_repo.as_ref());
+
     // ---- check phase: build every result in memory, touching nothing --------
     let mut staged: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    // `previous->new_mode` for a path an earlier patch in this same run created
+    // (apply.c:3862); `staged` alone only records the bytes.
+    let mut staged_modes: HashMap<String, u32> = HashMap::new();
     let mut ops: Vec<Op> = Vec::new();
     let mut failed = false;
     // `patch->conflicted_threeway`: paths whose 3-way merge left markers behind,
@@ -1403,12 +1432,62 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // The pre-image bytes, kept whole: a text patch works on its lines, a binary
         // one on the bytes themselves.
         let mut pre_bytes: Vec<u8> = Vec::new();
+        // `previous_patch()` (apply.c:3505-3520), read once for both the
+        // renamed/deleted refusal and `previous->new_mode`. A rename or a copy
+        // never consults it — "git patches do not depend on the order".
+        // `Some(None)` is `*gone`: the path is in the table but its content is
+        // gone. `Some(Some(mode))` is `previous->new_mode`.
+        let previous_entry: Option<Option<u32>> = if p.is_rename || p.is_copy {
+            None
+        } else {
+            p.old_name.as_deref().and_then(|old| match staged.get(old) {
+                Some(Some(_)) => Some(Some(staged_modes.get(old).copied().unwrap_or(0))),
+                Some(None) => Some(None),
+                None => None,
+            })
+        };
+        // `check_preimage()` (apply.c:3859-3860): `*gone` is set when the path an
+        // earlier patch in this run already deleted is the one this patch wants.
+        if matches!(previous_entry, Some(None)) {
+            let old = p.old_name.as_deref().unwrap_or_default();
+            err(o.quiet(), &format!("error: path {old} has been renamed/deleted"));
+            failed = true;
+            continue;
+        }
+        let previous_mode: Option<u32> = previous_entry.flatten();
+
+        // `check_preimage()`'s `st_mode`: the mode the pre-image actually has
+        // right now, which the patch's own `old_mode` is then measured against.
+        let mut st_mode: Option<u32> = None;
         let mut image: Vec<Vec<u8>> = if p.is_new {
             Vec::new()
         } else {
             let old = p.old_name.as_deref().unwrap_or_default();
             match read_preimage(&staged, idx_view, o.cached, old, p.is_rename) {
                 PreRead::Found(bytes) => {
+                    // apply.c:3862 / :3884-3885 / :3892-3902, in that order: an
+                    // earlier patch's result, then the index entry under
+                    // `--cached`, then the file on disk — normalised through
+                    // `ce_mode_from_stat()`, which is `create_ce_mode()` wherever
+                    // `core.fileMode` is honoured.
+                    let ce_mode = idx_view.and_then(|(_, index)| {
+                        index.entry_by_path(old.as_bytes().as_bstr()).map(|e| e.mode.bits())
+                    });
+                    st_mode = if let Some(m) = previous_mode {
+                        Some(m)
+                    } else if o.cached {
+                        ce_mode
+                    } else {
+                        std::fs::symlink_metadata(old).ok().map(|md| {
+                            use std::os::unix::fs::MetadataExt;
+                            let raw = md.mode();
+                            if trust_exec || raw & S_IFMT != S_IFREG {
+                                create_ce_mode(raw)
+                            } else {
+                                ce_mode.unwrap_or_else(|| p.old_mode.unwrap_or(0))
+                            }
+                        })
+                    };
                     pre_bytes = bytes.clone();
                     split_lines(&bytes).into_iter().map(|l| l.to_vec()).collect()
                 }
@@ -1435,6 +1514,32 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         };
 
+        // The rest of `check_preimage()` (apply.c:3904-3914). The patch's header
+        // modes are defaults, not assertions: an absent `old mode` becomes what is
+        // there, a type change is refused outright, and a permission change is only
+        // reported. `new_mode` picking up `st_mode` is what keeps an executable
+        // file executable across a content-only patch.
+        let mut eff_old_mode = p.old_mode;
+        let mut eff_new_mode = p.new_mode;
+        if let Some(st) = st_mode {
+            let old = p.old_name.as_deref().unwrap_or_default();
+            if eff_old_mode.is_none() {
+                eff_old_mode = Some(st);
+            }
+            let om = eff_old_mode.unwrap_or(0);
+            if (st ^ om) & S_IFMT != 0 {
+                err(o.quiet(), &format!("error: {old}: wrong type"));
+                failed = true;
+                continue;
+            }
+            if st != om {
+                err(o.quiet(), &format!("warning: {old} has type {st:o}, expected {om:o}"));
+            }
+            if eff_new_mode.is_none() && !p.is_delete {
+                eff_new_mode = Some(st);
+            }
+        }
+
         // `check_patch()` (apply.c): `check_preimage()` runs *first*, and only then
         // `check_to_create()` for a path that must not already exist — a creation
         // target, a rename destination or a copy destination. Reporting the
@@ -1459,6 +1564,39 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                     }
                     None => {}
                 }
+                // apply.c:4116-4121: a creation with no `new file mode` line is a
+                // plain 0644 file; a rename or copy with none keeps the source's.
+                if eff_new_mode.is_none() {
+                    eff_new_mode = Some(if p.is_new {
+                        S_IFREG | 0o644
+                    } else {
+                        eff_old_mode.unwrap_or(0)
+                    });
+                }
+            }
+        }
+
+        // apply.c:4124-4140: with both names in hand the two modes must agree on
+        // the *type*. A patch that turns a regular file into a symlink (or the
+        // reverse) in one step is refused here — git only ever emits a type change
+        // as a deletion followed by a creation.
+        if let (Some(new), Some(old)) = (&p.new_name, &p.old_name) {
+            if eff_new_mode.is_none() {
+                eff_new_mode = eff_old_mode;
+            }
+            let om = eff_old_mode.unwrap_or(0);
+            let nm = eff_new_mode.unwrap_or(0);
+            if (om ^ nm) & S_IFMT != 0 {
+                let msg = if old == new {
+                    format!("error: new mode ({nm:o}) of {new} does not match old mode ({om:o})")
+                } else {
+                    format!(
+                        "error: new mode ({nm:o}) of {new} does not match old mode ({om:o}) of {old}"
+                    )
+                };
+                err(o.quiet(), &msg);
+                failed = true;
+                continue;
             }
         }
 
@@ -1474,11 +1612,27 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
 
+        // apply.c:4154-4156. A deletion is left to `load_patch_target()`, which
+        // refuses to read through a symlink of its own accord; a result that would
+        // be *deposited* past one is stopped here, before anything is written.
+        if !p.is_delete {
+            if let Some(new) = &p.new_name {
+                if path_is_beyond_symlink(new, &kept_symlinks, &removed_symlinks, idx_view) {
+                    err(
+                        o.quiet(),
+                        &format!("error: affected file '{new}' is beyond a symbolic link"),
+                    );
+                    failed = true;
+                    continue;
+                }
+            }
+        }
+
         // `apply_data()`: under `--3way` the merge is what applies the patch, and
         // only a pre-image the object store cannot supply — or a patch that will
         // not even apply to that pre-image — falls back to placing hunks.
         let mut merged: Option<ThreeWay> = None;
-        if o.three_way && !p.binary {
+        if o.three_way {
             let repo = idx_repo.as_ref().expect("--3way implies check_index");
             match try_threeway(repo, p, &pre_bytes, &o)? {
                 ThreeWayOutcome::Merged(tw) => {
@@ -1571,25 +1725,10 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
 
         let new = p.new_name.clone().unwrap_or_default();
         let data: Vec<u8> = image.concat();
-        // git defaults a modification's new mode to the pre-image mode; under
-        // `--index`/`--cached` that pre-image mode is the index entry's, so an
-        // executable file stays executable even when the diff carries no mode line.
-        let mode = match p.new_mode {
-            Some(m) => m,
-            None => {
-                let from_index = if p.is_new {
-                    None
-                } else {
-                    idx_view.and_then(|(_, index)| {
-                        let old = p.old_name.as_deref()?;
-                        index
-                            .entry_by_path(old.as_bytes().as_bstr())
-                            .map(|e| e.mode.bits())
-                    })
-                };
-                from_index.unwrap_or(0o100644)
-            }
-        };
+        // `patch->new_mode` as `check_preimage()` and `check_patch()` left it: a
+        // modification with no mode line carries the pre-image's mode, so an
+        // executable file stays executable, and a creation with none is 0644.
+        let mode = eff_new_mode.unwrap_or(S_IFREG | 0o644);
         // A rename removes its source; a copy does not.
         if let Some(old) = &p.old_name {
             if old != &new && !p.is_copy {
@@ -1597,6 +1736,9 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             }
         }
         staged.insert(new.clone(), Some(data.clone()));
+        // `add_to_fn_table()` records the whole patch, so a later `previous_patch()`
+        // reads this result's mode (apply.c:3862).
+        staged_modes.insert(new.clone(), mode);
         if let Some(stages) = merged.and_then(|tw| tw.stages) {
             conflicted.push((new.clone(), mode, stages));
         }
@@ -1635,8 +1777,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
         reports(&patches);
-        ws_summary(ws_errors, &o.ws, o.apply, applied_after_fixing_ws, o.quiet());
-        return Ok(ExitCode::SUCCESS);
+        return Ok(ws_tail(ws_errors, &o, applied_after_fixing_ws));
     }
 
     // ---- write phase: nothing here may fail on a well-formed patch ----------
@@ -2006,8 +2147,20 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
     reports(&patches);
-    ws_summary(ws_errors, &o.ws, o.apply, applied_after_fixing_ws, o.quiet());
-    Ok(ExitCode::SUCCESS)
+    Ok(ws_tail(ws_errors, &o, applied_after_fixing_ws))
+}
+
+/// `apply_all_patches()`'s whitespace tail (apply.c:5141-5171): the summary line,
+/// and the 128 that `--whitespace=error` turns it into. Only a run whose
+/// `apply_patch()` returned zero or one reaches it — apply.c:5129 jumps past it for
+/// anything negative, which is why a patch that failed its check says nothing here.
+fn ws_tail(errors: usize, o: &Opts, applied_after_fixing: usize) -> ExitCode {
+    ws_summary(errors, &o.ws, o.apply, applied_after_fixing, o.quiet());
+    if errors > 0 && matches!(o.ws, WsAction::Error) {
+        ExitCode::from(128)
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// The outcome of `try_threeway()`: either the merge produced the post-image, or
@@ -2084,7 +2237,16 @@ fn try_threeway(
     let pre_id = pre_id.detach();
 
     // "Apply the patch to get the post image" — against that pre-image, not
-    // against what is on disk.
+    // against what is on disk. `apply_fragments()` (apply.c) dispatches to
+    // `apply_binary()` first for a binary patch, so `--3way` rebuilds a binary
+    // post-image here exactly as the direct path would.
+    if p.binary {
+        let post_bytes = match rebuild_binary(p, &pre_bytes, o.reverse) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(ThreeWayOutcome::Fallback(None)),
+        };
+        return finish_threeway(repo, path, pre_id, post_bytes, ours, o);
+    }
     let mut post: Vec<Vec<u8>> = split_lines(&pre_bytes)
         .into_iter()
         .map(<[u8]>::to_vec)
@@ -2111,6 +2273,19 @@ fn try_threeway(
         return Ok(ThreeWayOutcome::Fallback(None));
     }
     let post_bytes: Vec<u8> = post.concat();
+    finish_threeway(repo, path, pre_id, post_bytes, ours, o)
+}
+
+/// The half of `try_threeway()` (apply.c:3753-3800) that runs once the patch's own
+/// post-image is in hand: write the three blobs, merge, and report.
+fn finish_threeway(
+    repo: &gix::Repository,
+    path: String,
+    pre_id: ObjectId,
+    post_bytes: Vec<u8>,
+    ours: &[u8],
+    o: &Opts,
+) -> Result<ThreeWayOutcome> {
     // `odb_write_object()` for theirs and ours (apply.c:3749-3751, :3764-3765):
     // the return value is ignored, so a failed write prints its `error()` and the
     // computed id is used regardless — and read back below, where it dies.
@@ -2146,6 +2321,34 @@ fn try_threeway(
     let base_bytes = read_blob_or_die(repo, pre_id)?;
     let our_bytes = read_blob_or_die(repo, our_id)?;
     let their_bytes = read_blob_or_die(repo, post_id)?;
+
+    // `ll_xdl_merge()` (merge-ll.c:117-129): a NUL in the first 8000 bytes of any
+    // of the three inputs — or an input over `MAX_XDIFF_SIZE` — never reaches xdiff
+    // at all. `ll_binary_merge()` (merge-ll.c:58-101) takes one whole side instead:
+    // "theirs" under `--theirs`, "ours" otherwise, and only the two explicit
+    // one-side variants call the result clean. `--union` is not one of its cases,
+    // so it falls through the `default` arm and conflicts like a plain run.
+    if [&base_bytes, &our_bytes, &their_bytes].iter().any(|b| buffer_is_binary(b)) {
+        let (content, clean) = match o.merge_variant {
+            Some(MergeVariant::Ours) => (our_bytes, true),
+            Some(MergeVariant::Theirs) => (their_bytes, true),
+            _ => {
+                // `three_way_merge()` (apply.c:3656-3658) turns
+                // `LL_MERGE_BINARY_CONFLICT` into this, ahead of try_threeway's own
+                // "with conflicts" line. The two names are literals there.
+                err(
+                    o.quiet(),
+                    &format!("warning: Cannot merge binary files: {path} (ours vs. theirs)"),
+                );
+                (our_bytes, false)
+            }
+        };
+        return Ok(ThreeWayOutcome::Merged(ThreeWay {
+            path,
+            content,
+            stages: (!clean).then_some([Some(pre_id), Some(our_id), Some(post_id)]),
+        }));
+    }
 
     // `ll_merge()` with `LL_MERGE_OPTIONS_INIT`: `XDL_MERGE_ZEALOUS`, the
     // configured conflict style, and git's fixed base/ours/theirs labels.
@@ -2358,6 +2561,105 @@ fn read_preimage(
             Some(bytes) => PreRead::Found(bytes),
             None => PreRead::MissingWorktree,
         },
+    }
+}
+
+/// `buffer_is_binary()` (xdiff-interface.c:197-203): a NUL anywhere in the first
+/// `FIRST_FEW_BYTES` of the buffer. `ll_xdl_merge()` also treats anything over
+/// `MAX_XDIFF_SIZE` (xdiff-interface.h:14) as binary.
+fn buffer_is_binary(buf: &[u8]) -> bool {
+    const FIRST_FEW_BYTES: usize = 8000;
+    const MAX_XDIFF_SIZE: usize = 1024 * 1024 * 1023;
+    buf.len() > MAX_XDIFF_SIZE || buf[..buf.len().min(FIRST_FEW_BYTES)].contains(&0)
+}
+
+/// `S_IFMT`, the file-type bits every mode comparison in `apply.c` masks with.
+const S_IFMT: u32 = 0o170000;
+const S_IFLNK: u32 = 0o120000;
+const S_IFREG: u32 = 0o100000;
+const S_IFGITLINK: u32 = 0o160000;
+
+/// Whether a header mode line named a symlink, for `prepare_symlink_changes()`
+/// (apply.c:3978, :3983), whose `S_ISLNK()` on an absent mode is simply false.
+fn is_symlink_mode(mode: Option<u32>) -> bool {
+    mode.is_some_and(|m| m & S_IFMT == S_IFLNK)
+}
+
+/// `create_ce_mode()` (read-cache.h): the canonical mode git would record for a
+/// path it just `lstat()`ed — symlink, gitlink, or a regular file flattened to
+/// 0755/0644 by its owner-execute bit alone.
+fn create_ce_mode(mode: u32) -> u32 {
+    if mode & S_IFMT == S_IFLNK {
+        return S_IFLNK;
+    }
+    if mode & S_IFMT == 0o040000 || mode & S_IFMT == S_IFGITLINK {
+        return S_IFGITLINK;
+    }
+    S_IFREG | if mode & 0o100 != 0 { 0o755 } else { 0o644 }
+}
+
+/// `trust_executable_bit`, which is `core.fileMode` and defaults to on where the
+/// filesystem carries the bit (environment.c). `check_preimage()` reads it at
+/// apply.c:3896 to decide whether the pre-image's mode comes from the file or
+/// from the index entry that shadows it.
+fn trust_executable_bit(repo: Option<&gix::Repository>) -> bool {
+    fn read(r: Option<&gix::Repository>) -> bool {
+        crate::config::config_get_string(r, "core.fileMode")
+            .as_deref()
+            .map_or(true, crate::userdiff::config_bool)
+    }
+    match repo {
+        Some(r) => read(Some(r)),
+        None => read(crate::setup::discover().ok().as_ref()),
+    }
+}
+
+/// `path_is_beyond_symlink_1()` (apply.c:3989-4021): walk `name`'s leading
+/// directories from the longest prefix down, and answer yes as soon as one of
+/// them is — or this run is about to make it — a symbolic link. A prefix this run
+/// *removes* a symlink from is skipped rather than answered for, "because we may
+/// see a new one created at a higher level".
+fn path_is_beyond_symlink(
+    name: &str,
+    kept: &HashSet<String>,
+    removed: &HashSet<String>,
+    idx: Option<(&gix::Repository, &gix::index::File)>,
+) -> bool {
+    let bytes = name.as_bytes();
+    let mut len = bytes.len();
+    if len == 0 {
+        return false;
+    }
+    loop {
+        // `while (--name->len && name->buf[name->len] != '/') ;`
+        loop {
+            len -= 1;
+            if len == 0 || bytes[len] == b'/' {
+                break;
+            }
+        }
+        if len == 0 {
+            return false;
+        }
+        let prefix = &name[..len];
+        if kept.contains(prefix) {
+            return true;
+        }
+        if removed.contains(prefix) {
+            continue;
+        }
+        let is_link = match idx {
+            // `index_file_exists()` (apply.c:4010-4013).
+            Some((_, index)) => index
+                .entry_by_path(prefix.as_bytes().as_bstr())
+                .is_some_and(|e| e.mode.bits() & S_IFMT == S_IFLNK),
+            // `lstat()` (apply.c:4015-4017).
+            None => std::fs::symlink_metadata(prefix)
+                .is_ok_and(|m| m.file_type().is_symlink()),
+        };
+        if is_link {
+            return true;
+        }
     }
 }
 

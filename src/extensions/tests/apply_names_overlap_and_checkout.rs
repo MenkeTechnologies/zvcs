@@ -286,7 +286,17 @@ fn a_doubled_slash_is_squashed_on_the_name_lines_only() {
     f.write("m.diff", DOUBLE_SLASH_MODE);
     let (code, _, err) = f.run(&["apply", "m.diff"]);
     assert_eq!(code, 128, "{err:?}");
-    assert_eq!(err.trim_end(), "error: invalid path 'sub//g.txt'");
+    // `check_preimage()` (apply.c:3910) has its say before `check_unsafe_path()`
+    // (apply.c:4142) refuses the name: the fixture's `sub/g.txt` is 0755 and the
+    // patch claims 0644, so stock warns and only then rejects. Measured from
+    // stock 2.55.0 on this exact fixture:
+    //   warning: sub//g.txt has type 100755, expected 100644
+    //   error: invalid path 'sub//g.txt'
+    assert_eq!(
+        err.trim_end(),
+        "warning: sub//g.txt has type 100755, expected 100644\n\
+         error: invalid path 'sub//g.txt'"
+    );
 
     // `--stat` reports the squashed name, which is the other half of the same
     // rule: the report reads `patch->new_name`, not the header line.

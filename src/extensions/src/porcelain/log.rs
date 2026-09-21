@@ -1170,6 +1170,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // *before* it resolves anything — so it is in force for the arguments
     // standing in front of the separator too, as `REVARG_CANNOT_BE_FILENAME`.
     let mut seen_dashdash = false;
+    // `setup_revisions()`'s own `seen_end_of_options` (revision.c:3011): once
+    // `--end-of-options` has been read, `if (!seen_end_of_options && *arg == '-')`
+    // (revision.c:3040) stops being true and every remaining token is an operand
+    // whatever it looks like. That is how `git log --end-of-options --source`
+    // walks a branch called `--source` instead of turning on `--source`.
+    let mut seen_end_of_options = false;
+    // `revs->ignore_missing` (revision.c:2714): an operand `get_oid_with_context()`
+    // cannot read is `ret = revs->ignore_missing ? 0 : -1` (revision.c:2223-2226),
+    // so it pends nothing and is not an error. `handle_revision_arg()` still sets
+    // `revs->rev_input_given` for it, which is why `git log --ignore-missing
+    // <zero-oid>` walks nothing rather than falling back to `HEAD`.
+    let mut ignore_missing = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -1180,6 +1192,23 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             seen_dashdash = true;
             pathspecs.extend(args[i + 1..].iter().cloned());
             break;
+        }
+        if seen_end_of_options {
+            if argument_excludes(a, negate_revs) {
+                no_walk = None;
+            }
+            revs.push(a.clone());
+            rev_negated.push(negate_revs);
+            i += 1;
+            continue;
+        }
+        // `if (!strcmp(arg, "--end-of-options")) { seen_end_of_options = 1; continue; }`
+        // (revision.c:3062-3065), read after the pseudo-options and `--stdin` but
+        // ahead of every ordinary revision option.
+        if a == "--end-of-options" {
+            seen_end_of_options = true;
+            i += 1;
+            continue;
         }
         // parse_options_step()'s `internal_help`, which `cmd_log_init` runs
         // before `setup_revisions`: the block on stdout at 129, no `error:` line.
@@ -1606,6 +1635,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             show_root = true;
         } else if a == "--graph" {
             graph = true;
+        // ```c
+        // } else if (!strcmp(arg, "--no-graph")) {
+        //         graph_clear(revs->graph);
+        //         revs->graph = NULL;
+        // }
+        // ```
+        //
+        // (revision.c.) `--graph`'s implied `--topo-order` and parent rewrite are
+        // not set here but in `revision_opts_finish()` (revision.c:2749-2752), which
+        // runs once the whole command line has been read and only looks at whether
+        // `revs->graph` is still there — so `--graph --no-graph` keeps neither, while
+        // an explicit `--topo-order --no-graph` or `--parents --no-graph` keeps its
+        // own. This port reads `graph` at each of those decision points rather than
+        // copying it into another flag, so clearing it is the whole of `--no-graph`.
+        } else if a == "--no-graph" {
+            graph = false;
+        } else if a == "--ignore-missing" {
+            ignore_missing = true;
         // The ref-selecting pseudo-options. Each consumes and clears whatever
         // `--exclude` patterns had accumulated (`clear_ref_exclusions`), and each
         // takes the `UNINTERESTING` flag `--not` is holding, so `--not --all`
@@ -3153,6 +3200,38 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     tip_left.push(*sym_left);
                     tip_names.push(name.clone());
                     tip_sources.push(name.clone());
+                }
+                // ```c
+                // if (get_oid_with_context(revs->repo, arg, get_sha1_flags, &oid, &oc)) {
+                //         ret = revs->ignore_missing ? 0 : -1;
+                //         goto out;
+                // }
+                // ```
+                //
+                // (revision.c:2223-2226.) A `0` here is `handle_revision_arg()`
+                // *succeeding* with nothing pended, so it sets
+                // `revs->rev_input_given` and `setup_revisions()` never reaches its
+                // filename fallback — which is why this arm stands ahead of the one
+                // below, and why `git log --ignore-missing <missing>` walks nothing
+                // instead of defaulting to `HEAD`.
+                Err(_) if ignore_missing => {
+                    rev_input_given = true;
+                }
+                // `verify_filename()` runs on the failed operand as well as on the
+                // tail, and `die_verify_filename()` has its own words for a token
+                // that starts with `-`: `option '%s' must come before non-option
+                // arguments` (setup.c:264-291). Only an operand that got this far
+                // *looking* like an option can reach it, which after
+                // `--end-of-options` is exactly what `--grep merge` is.
+                Err(_)
+                    if !seen_dashdash
+                        && !in_paths
+                        && spec.starts_with('-')
+                        && crate::setup::verify_filename(spec, true).is_some() =>
+                {
+                    let msg = crate::setup::verify_filename(spec, true).unwrap_or_default();
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
                 }
                 Err(_) if spec_is_path(&repo, spec) => {
                     // `setup_revisions()`'s filename fallback checks the whole
@@ -13236,8 +13315,20 @@ fn emit_raw(
             }
             Ok((mode, id.attach(repo).shorten()?.to_string()))
         };
+        // `diff_flush_raw()` (diff.c:6477-6479) renders both ids through
+        // `diff_aligned_abbrev()`, whose dot padding `GIT_PRINT_SHA1_ELLIPSIS=yes`
+        // turns on for this column and for nothing else.
         let (old_mode, old_hex) = side(f.old_side)?;
         let (new_mode, new_hex) = side(f.new_side)?;
+        let pad = |hex: String, s: Option<(u32, ObjectId)>| {
+            let full = s.map_or_else(
+                || repo.object_hash().null().to_hex().to_string(),
+                |(_, id)| id.to_hex().to_string(),
+            );
+            crate::abbrev::aligned_ellipsis(hex, abbrev, &full)
+        };
+        let old_hex = pad(old_hex, f.old_side);
+        let new_hex = pad(new_hex, f.new_side);
         write!(out, ":{old_mode:06o} {new_mode:06o} {old_hex} {new_hex} ")?;
         out.push(f.status);
         if let Some(source) = &f.source {

@@ -948,6 +948,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
     let seen_dashdash = args.iter().any(|a| a == "--");
+    // `setup_revisions()`'s own `seen_end_of_options` (revision.c:3011), the argv
+    // twin of the one `read_revisions_from_stdin()` keeps. Once it is set,
+    // `if (!seen_end_of_options && *arg == '-')` (revision.c:3040) stops being
+    // true and a token that looks like an option is an operand instead.
+    let mut seen_end_of_options = false;
+    // `revs->ignore_missing` (revision.c:2714): an operand `get_oid_with_context()`
+    // cannot read is `ret = revs->ignore_missing ? 0 : -1` (revision.c:2223-2226) —
+    // nothing pends and nothing fails, while `handle_revision_arg()` still counts
+    // it as revision input.
+    let mut ignore_missing = false;
     let mut seeds: Vec<Seed> = Vec::new();
     // `--exclude=<glob>`, held until the next ref-selecting option consumes it.
     let mut ref_excludes: Vec<String> = Vec::new();
@@ -1036,6 +1046,41 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue 'args;
         }
+        // ```c
+        // if (!strcmp(arg, "--end-of-options")) {
+        //         seen_end_of_options = 1;
+        //         continue;
+        // }
+        // ```
+        //
+        // (revision.c:3062-3065.) Read after the pseudo-options and `--stdin`, and
+        // ahead of `handle_revision_opt()` — so it is the *argv* rule here, while
+        // the block above is the same rule inside the stdin reader.
+        if origin[i] == Origin::Argv && !seen_end_of_options && a == "--end-of-options" {
+            seen_end_of_options = true;
+            i += 1;
+            continue 'args;
+        }
+        // Everything `setup_revisions()` no longer treats as an option. Only a
+        // token that looks like one is affected: a plain operand was never going
+        // to reach an option arm anyway. `--` is not one of them — the separator is
+        // found in a scan that runs before the option loop (revision.c:3015-3033),
+        // so it still separates whatever `seen_end_of_options` says.
+        let operand_only = seen_end_of_options && a.starts_with('-') && a != "--";
+        // `handle_revision_opt()` is not reached at all in that state, so the
+        // value-taking long options below stop claiming their argument.
+        let long_opt_value = |argv: &[String], i: usize, name: &str| match operand_only {
+            true => None,
+            false => long_opt_value(argv, i, name),
+        };
+        // A sentinel no option arm can match, which is how the dispatch below is
+        // sent straight to its operand arm. It cannot start with `-`, or the
+        // "unknown flag" arm would claim it.
+        const AFTER_END_OF_OPTIONS: &str = "\u{0}end-of-options";
+        let dispatch: &str = match operand_only {
+            true => AFTER_END_OF_OPTIONS,
+            false => a,
+        };
         // git's `parse_long_opt` takes a value attached (`--grep=x`) or detached
         // (`--grep x`); these are the rev-list options that carry one.
         for (name, sink) in [
@@ -1110,7 +1155,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             i += v.consumed;
             continue 'args;
         }
-        match a {
+        match dispatch {
             "--count" => count_only = true,
             // git toggles this with `revs->reverse ^= 1`, so an even number of
             // `--reverse` flags cancels out and leaves the default order.
@@ -1318,12 +1363,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // --graph --children` dies with `options '--parents' and '--children'
             // cannot be used together`, which is the `rewrite_parents && children`
             // check.
-            "--graph" => {
-                graph = true;
-                if order == Order::Date {
-                    order = Order::Topo;
-                }
-            }
+            "--graph" => graph = true,
+            // ```c
+            // } else if (!strcmp(arg, "--no-graph")) {
+            //         graph_clear(revs->graph);
+            //         revs->graph = NULL;
+            // }
+            // ```
+            //
+            // (revision.c.) The implied `--topo-order` and parent rewrite are set by
+            // `revision_opts_finish()` once the whole command line has been read
+            // (revision.c:2749-2752), so clearing the graph here takes both with it.
+            // That deferral is why the order is applied after this loop rather than
+            // in the `--graph` arm.
+            "--no-graph" => graph = false,
+            "--ignore-missing" => ignore_missing = true,
             // ```c
             // } else if (!strcmp(arg, "--reflog")) {
             //         add_reflogs_to_pending(revs, *flags);
@@ -1790,7 +1844,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             {
                 pathspecs.push(s.as_bytes().to_vec());
             }
-            s => {
+            _ => {
+                // `dispatch` may be the end-of-options sentinel; the operand itself
+                // is always the argument as written.
+                let s = a;
                 // Everything `get_oid_basic()` writes for an operand read off
                 // argv, in git's order and with `handle_dotdot_1()`'s `||`
                 // short-circuit across a range's endpoints. `rev-list` runs the
@@ -1854,6 +1911,41 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     // stderr text, so the one error that means "did not resolve" is
                     // the one `unresolvable_in()` would have produced for this
                     // operand.
+                    // `ret = revs->ignore_missing ? 0 : -1` (revision.c:2224) is
+                    // `handle_revision_arg()` *succeeding* with nothing pended, so
+                    // it stands ahead of the filename fallback and still counts as
+                    // revision input.
+                    if ignore_missing && e == unresolvable_in(&repo, s, false) {
+                        note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;
+                        rev_input_given = true;
+                        i += 1;
+                        continue 'args;
+                    }
+                    // `verify_filename()` is run on the failed operand too, and
+                    // its first branch has its own words:
+                    //
+                    // ```c
+                    // if (looks_like_pathspec(arg) || check_filename(prefix, arg))
+                    //         return;
+                    // die_verify_filename(repo, prefix, arg, diagnose_misspelt_rev);
+                    // ```
+                    //
+                    // …where `die_verify_filename()` answers `option '%s' must come
+                    // before non-option arguments` for a token starting with `-`
+                    // (setup.c:264-291). Only an operand that got here *looking*
+                    // like an option can see it, which after `--end-of-options` is
+                    // exactly what `--grep merge` is.
+                    if e == unresolvable_in(&repo, s, false)
+                        && origin[i] == Origin::Argv
+                        && !seen_dashdash
+                        && !s.starts_with('^')
+                        && s.starts_with('-')
+                    {
+                        if let Some(msg) = crate::setup::verify_filename(s, true) {
+                            eprintln!("fatal: {msg}");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
                     if e == unresolvable_in(&repo, s, false)
                         && origin[i] == Origin::Argv
                         && !seen_dashdash
@@ -1892,6 +1984,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // ```c
+    // if (revs->graph) {
+    //         revs->topo_order = 1;
+    //         revs->rewrite_parents = 1;
+    // }
+    // ```
+    //
+    // (`revision_opts_finish()`, revision.c:2749-2752.) It runs once the whole
+    // command line has been read, so a `--no-graph` written after a `--graph`
+    // cancels both. `topo_order` alone, so a `--date-order` already given keeps its
+    // `sort_order` and stays date-topo; only the default date order is upgraded.
+    if graph && order == Order::Date {
+        order = Order::Topo;
+    }
     // `want_ancestry()` is `revs->rewrite_parents || revs->children.name`, and the
     // die reads the first as `--parents` however it was turned on — which `--graph`
     // does.

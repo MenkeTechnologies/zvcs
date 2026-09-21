@@ -220,13 +220,12 @@ fn reflog_log_date_empty_is_fatal() {
 }
 
 #[test]
-fn reflog_log_date_relative_deferred_no_fabrication() {
+fn reflog_log_date_relative_renders_every_format() {
     let (repo, home) = fixture("relative");
     cfg(&repo, &home, "relative");
 
-    // `relative` needs the current time, which gix-date does not expose. A format
-    // that renders no field date (the default oneline, and `--pretty=short`) is
-    // unaffected, so the command still succeeds.
+    // `relative` renders against the current time. A format that shows no field
+    // date (the default oneline, and `--pretty=short`) is unaffected.
     let out = reflog(&repo, &home, &[]);
     assert_eq!(out.status.code(), Some(0), "relative log.date, no field date, must succeed");
     assert!(stdout(&out).contains("HEAD@{0}: commit: c1"), "oneline still rendered:\n{}", stdout(&out));
@@ -234,14 +233,31 @@ fn reflog_log_date_relative_deferred_no_fabrication() {
     let out = reflog(&repo, &home, &["--pretty=short"]);
     assert_eq!(out.status.code(), Some(0), "short has no field date, must succeed");
 
-    // A format that *would* render a field date fails honestly rather than printing
-    // a wrong default-formatted date — no fabricated output.
+    // A format that renders a field date renders it relative — the elapsed-time
+    // spelling `show_date()` produces for `DATE_RELATIVE` (date.c), not the
+    // default absolute layout. The fixture commit is dated 2006, so a fabricated
+    // or default-formatted date would show that year rather than an age.
+    //
+    // This replaces an assertion that the command *failed* here. That pinned a
+    // real deferral — gix-date exposed no current time — which
+    // `bf0f998dbb reflog: support %D/%d decoration and %ar/%cr/%ai/%at date
+    // atoms` resolved without updating this test. Output is now byte-identical
+    // to git 2.55.0 for this command, so the test asserts the rendering instead
+    // of the limitation.
     let out = reflog(&repo, &home, &["--pretty=medium"]);
-    assert_ne!(out.status.code(), Some(0), "relative log.date on medium must not succeed");
+    assert_eq!(out.status.code(), Some(0), "relative log.date on medium must render");
+    let body = stdout(&out);
+    let date_line = body
+        .lines()
+        .find(|l| l.starts_with("Date:"))
+        .unwrap_or_else(|| panic!("medium must render a Date: line:\n{body}"));
     assert!(
-        !stdout(&out).contains("Date:"),
-        "must not fabricate a Date: line for an unrenderable mode:\n{}",
-        stdout(&out)
+        date_line.ends_with(" ago") || date_line.contains("in the future"),
+        "Date: must be relative, not the absolute default: {date_line:?}"
+    );
+    assert!(
+        !date_line.contains("2006"),
+        "a relative date must not leak the absolute timestamp: {date_line:?}"
     );
 
     // An explicit --date=iso overrides the unrenderable log.date, so it succeeds.

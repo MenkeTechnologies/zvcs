@@ -1358,6 +1358,11 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // Superproject-relative path of a submodule file → its slot in `subrepos`.
     let mut sub_of: BTreeMap<BString, usize> = BTreeMap::new();
 
+    // `pathspec.max_depth` (builtin/grep.c:1316) is set once and read by every
+    // walk — the tree walk included, which is why this is built ahead of the
+    // branch rather than inside the worktree half.
+    let max_depth = MaxDepth::new(&specs, &cwd_prefix, opts.max_depth);
+
     if revs.is_empty() {
         let mut files: Vec<(BString, Option<gix::hash::ObjectId>)> = Vec::new();
         // `cmd_grep`'s first branch is `if (!use_index || untracked)`: both
@@ -1454,7 +1459,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             files.sort_by(|a, b| a.0.cmp(&b.0));
             files.dedup_by(|a, b| a.0 == b.0);
         }
-        apply_max_depth(&mut files, &specs, &cwd_prefix, opts.max_depth);
+        if let Some(md) = max_depth.as_ref() {
+            files.retain(|(path, _)| md.keeps(path));
+        }
 
         for (path, id) in files {
             let name = display_name(path.as_bstr(), prefix, &opts);
@@ -1490,6 +1497,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             &opts,
             &index,
             recurse_submodules,
+            max_depth.as_ref(),
             &mut subrepos,
             &mut cands,
         )?;
@@ -1516,34 +1524,10 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     let renders_lines = !(opts.quiet || opts.files_with || opts.files_without || opts.count);
 
     // `-p`/`--show-function` and `-W`/`--function-context` render the enclosing
-    // function. This port reproduces git's fallback funcname detection (a line
-    // beginning an identifier); a path whose `diff` attribute names a driver with a
-    // funcname regex would use git's built-in userdiff tables instead, which are
-    // not reproduced, so such a matching file is refused rather than approximated.
+    // function, keying off `match_funcname()` (grep.c:1329) — the path's diff
+    // driver funcname pattern when it has one, the built-in identifier test
+    // otherwise.
     if renders_lines && (opts.show_function || opts.funcbody) {
-        // Pre-scan on raw content (no textconv side effects) so the refusal fires
-        // before any output is written, keeping stdout all-or-nothing.
-        for (_, rela, src) in &cands {
-            let Some(content) = load_content(repo.as_ref(), &subrepos, None, false, rela.as_bstr(), src)? else {
-                continue;
-            };
-            if !passes_gate(&content) {
-                continue;
-            }
-            let binary = !opts.text && binary_of(&mut diff_attrs, rela.as_bstr(), &content)?;
-            if binary {
-                continue; // git shapes no function context around a binary hit
-            }
-            if lines(&content).any(|l| ev.matches(l)) {
-                if let Some(da) = diff_attrs.as_mut() {
-                    if da.has_funcname_driver(rela.as_bstr())? {
-                        let flag = if opts.funcbody { "--function-context" } else { "--show-function" };
-                        anyhow::bail!("{}", unsupported(flag));
-                    }
-                }
-            }
-        }
-
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
         let mut any_hit = false;
@@ -1566,19 +1550,31 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             if binary {
                 if lines(&content).any(|l| ev.matches(l)) {
                     any_hit = true;
-                    // git prints the "Binary file … matches" notice for `-p` alone,
-                    // but the context-bearing modes (`-W`, `-A`/`-B`/`-C`) suppress
-                    // it — matching stock `git grep` exactly.
-                    if !opts.funcbody && pre_context == 0 && post_context == 0 {
-                        out.write_all(b"Binary file ")?;
-                        out.write_all(name)?;
-                        out.write_all(b" matches\n")?;
-                        hunk_mark = true;
-                    }
+                    // grep.c:1706 fires ahead of every context renderer, so `-W`
+                    // and `-A`/`-B`/`-C` print the notice too — and leave
+                    // `opt->last_shown` at 0, so no `--` mark is owed either side
+                    // of it.
+                    binary_notice(&mut out, name, &opts)?;
                 }
                 continue;
             }
-            if render_funcctx(&mut out, &content, name, &ev, &opts, pre_context, post_context, hunk_mark)? {
+            // git loads the driver lazily, on the first line `match_funcname()`
+            // is asked about, and keeps it for the rest of the file.
+            let func = match diff_attrs.as_mut() {
+                Some(da) => da.funcname_of(rela.as_bstr())?,
+                None => None,
+            };
+            if render_funcctx(
+                &mut out,
+                &content,
+                name,
+                &ev,
+                &opts,
+                pre_context,
+                post_context,
+                hunk_mark,
+                func.as_deref(),
+            )? {
                 any_hit = true;
                 hunk_mark = true;
             }
@@ -1626,10 +1622,13 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             if binary {
-                // git reports a binary hit through the exit status but prints no
-                // context lines and no "Binary file matches" notice for it.
+                // grep.c:1706 returns before `show_pre_context()`, so a binary hit
+                // prints the notice and no context lines, and leaves
+                // `opt->last_shown` at 0 — `printed_any` must stay put so the next
+                // file's first hunk is still the first one to carry a `--`.
                 if lines(&content).any(|l| ev.matches(l)) {
                     any_hit = true;
+                    binary_notice(&mut out, name, &opts)?;
                 }
                 continue;
             }
@@ -1871,6 +1870,7 @@ fn collect_trees(
     opts: &Opts,
     index: &gix::index::File,
     recurse_submodules: bool,
+    max_depth: Option<&MaxDepth>,
     subrepos: &mut Vec<gix::Repository>,
     cands: &mut Vec<(Vec<u8>, BString, Source)>,
 ) -> Result<()> {
@@ -1944,6 +1944,11 @@ fn collect_trees(
                 continue;
             }
             if !ps.is_included(entry.filepath.as_bstr(), Some(false)) {
+                continue;
+            }
+            // `do_match()` folds `within_depth()` into the same
+            // `tree_entry_interesting()` verdict the pathspec gives.
+            if max_depth.is_some_and(|md| !md.keeps(&entry.filepath)) {
                 continue;
             }
             let mut name = rev_prefix.clone();
@@ -2455,45 +2460,51 @@ fn collect_no_index(
     Ok(())
 }
 
-/// Drop candidates that lie deeper than `--max-depth` allows.
+/// git's `--max-depth`, prepared once per run.
 ///
-/// git counts depth from the end of the pathspec that selected the file — with
-/// no pathspec, from the repo-relative current directory — so `--max-depth=0`
-/// with `-- a` keeps `a/z.txt` but not `a/b/z.txt`. Per `git help grep`, the
-/// option "is ignored if <pathspec> contains active wildcards".
-fn apply_max_depth(
-    files: &mut Vec<(BString, Option<gix::hash::ObjectId>)>,
-    specs: &[BString],
-    cwd_prefix: &[u8],
-    max_depth: i64,
-) {
-    let Ok(max_depth) = usize::try_from(max_depth) else {
-        return;
-    };
-    let has_wildcard = specs.iter().any(|s| {
-        let bytes: &[u8] = s;
-        bytes.iter().any(|&b| matches!(b, b'*' | b'?' | b'[' | b':'))
-    });
-    if has_wildcard {
-        return;
+/// `do_match()` (tree-walk.c:1021) and `do_match_pathspec()` (dir.c) both measure
+/// depth with `within_depth()` from the end of the pathspec that selected the
+/// path — with no pathspec, from the repo-relative current directory — so
+/// `--max-depth=0` with `-- a` keeps `a/z.txt` but not `a/b/z.txt`. Per
+/// `git help grep`, the option "is ignored if <pathspec> contains active
+/// wildcards".
+///
+/// It gates the tree walk and the index/directory walks alike: `cmd_grep` writes
+/// `pathspec.max_depth` once (builtin/grep.c:1316) and every walk reads the same
+/// pathspec.
+struct MaxDepth {
+    /// The repository-root-relative literal each pathspec names, which is what
+    /// `within_depth()` measures from: it skips `ps->items[i].len` bytes of the
+    /// matched name, steps over the `/` that follows when there is one, and
+    /// counts the slashes left in the remainder. A spec of `.` normalises to the
+    /// empty string, so the count runs over the whole path — which is why
+    /// `--max-depth 0` at the top of a repository keeps only the files that have
+    /// no slash at all.
+    bases: Vec<Vec<u8>>,
+    max: usize,
+}
+
+impl MaxDepth {
+    /// `None` when the option is off (`max_depth == -1`) or git ignores it.
+    fn new(specs: &[BString], cwd_prefix: &[u8], max_depth: i64) -> Option<Self> {
+        let max = usize::try_from(max_depth).ok()?;
+        let has_wildcard = specs.iter().any(|s| {
+            let bytes: &[u8] = s;
+            bytes.iter().any(|&b| matches!(b, b'*' | b'?' | b'[' | b':'))
+        });
+        if has_wildcard {
+            return None;
+        }
+        let bases = if specs.is_empty() {
+            vec![strip_trailing_slash(cwd_prefix)]
+        } else {
+            specs.iter().map(|s| spec_base(s.as_bstr(), cwd_prefix)).collect()
+        };
+        Some(MaxDepth { bases, max })
     }
 
-    // The repository-root-relative literal each pathspec names, which is what
-    // git's `do_match_pathspec()` measures the depth from: it skips
-    // `ps->items[i].len` bytes of the matched name, steps over the `/` that
-    // follows when there is one, and counts the slashes left in the remainder
-    // (`within_depth()`, `dir.c`). A spec of `.` normalises to the empty string,
-    // so the count runs over the whole path — which is why `--max-depth 0` at the
-    // top of a repository keeps only the files that have no slash at all.
-    let bases: Vec<Vec<u8>> = if specs.is_empty() {
-        vec![strip_trailing_slash(cwd_prefix)]
-    } else {
-        specs.iter().map(|s| spec_base(s.as_bstr(), cwd_prefix)).collect()
-    };
-
-    files.retain(|(path, _)| {
-        let path: &[u8] = path;
-        bases.iter().any(|base| {
+    fn keeps(&self, path: &[u8]) -> bool {
+        self.bases.iter().any(|base| {
             let rest = if base.is_empty() {
                 path
             } else if path == base.as_slice() {
@@ -2508,9 +2519,9 @@ fn apply_max_depth(
                 // This spec did not match the path; another one may.
                 return false;
             };
-            rest.iter().filter(|&&b| b == b'/').count() <= max_depth
+            rest.iter().filter(|&&b| b == b'/').count() <= self.max
         })
-    });
+    }
 }
 
 /// `bytes` without a trailing `/`, which is how git stores a pathspec literal.
@@ -2817,10 +2828,16 @@ fn build_expr(toks: &[Tok]) -> Result<Expr, String> {
     x.ok_or_else(|| "no pattern given".to_string())
 }
 
-/// git's fallback `match_funcname` (used when the path has no diff driver with a
-/// funcname pattern): a non-empty line whose first byte begins an identifier is a
-/// function-signature line.
-fn is_funcname_line(line: &[u8]) -> bool {
+/// git's `match_funcname` (grep.c:1329). With a driver funcname pattern the line
+/// is handed to `xecfg->find_func` and any non-negative return — a match, even an
+/// empty one — makes it a heading; without one it falls through to the built-in
+/// test, a non-empty line whose first byte begins an identifier.
+fn is_funcname_line(line: &[u8], func: Option<&crate::userdiff::FuncName>) -> bool {
+    if let Some(f) = func {
+        // `char buf[1]` — git passes a one-byte sink because it only wants the
+        // sign of the return value here.
+        return f.find(line, 1).is_some();
+    }
     match line.first() {
         Some(&b) => b.is_ascii_alphabetic() || b == b'_' || b == b'$',
         None => false,
@@ -2832,24 +2849,6 @@ fn is_blank_line(line: &[u8]) -> bool {
     line.iter().all(|b| b.is_ascii_whitespace())
 }
 
-/// The set of git's built-in userdiff drivers that carry a funcname pattern (from
-/// `userdiff.c`). A path whose `diff` attribute names one of these — or a
-/// user-configured driver with a `funcname`/`xfuncname` — would drive git's
-/// funcname detection off those regex tables. [`crate::userdiff::Settings`] resolves
-/// and compiles them for the diff and `-L` paths; `show_funcname_line()` here is not
-/// wired to them, so such a file is refused rather than approximated (see [`grep`]).
-///
-/// This list is narrower than [`crate::userdiff`]'s table: `ini` and `r` also carry
-/// funcname patterns in git 2.55.0 and are absent here, so a path whose `diff`
-/// attribute names one of those two is answered with `def_ff`'s heading instead of
-/// being refused. Nothing in this file reads the table yet, which is why the two are
-/// still listed separately rather than derived from it.
-const BUILTIN_FUNCNAME_DRIVERS: &[&str] = &[
-    "ada", "bash", "bibtex", "cpp", "csharp", "css", "dts", "elixir", "fortran",
-    "fountain", "golang", "html", "java", "kotlin", "markdown", "matlab", "objc",
-    "pascal", "perl", "php", "python", "ruby", "rust", "scheme", "tex",
-];
-
 /// Resolves the `diff` attribute of a path so `--textconv` and the function-context
 /// renderers can find the driver git would use. Built once per run over the same
 /// attribute stack the rest of grep consults.
@@ -2857,6 +2856,11 @@ struct DiffAttrs<'r> {
     repo: &'r gix::Repository,
     stack: gix::AttributeStack<'r>,
     outcome: gix::attrs::search::Outcome,
+    /// Driver name to its compiled funcname pattern, mirroring the
+    /// `userdiff_find_by_name()` lookup git amortises across a run. `None` is a
+    /// driver that carries no funcname, which is the `xecfg = opt->priv = NULL`
+    /// fallback in `match_funcname()` (grep.c:1339).
+    funcnames: std::collections::HashMap<String, Option<std::rc::Rc<crate::userdiff::FuncName>>>,
 }
 
 impl<'r> DiffAttrs<'r> {
@@ -2865,7 +2869,12 @@ impl<'r> DiffAttrs<'r> {
             index,
             gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
         )?;
-        Ok(Self { repo, stack, outcome: gix::attrs::search::Outcome::default() })
+        Ok(Self {
+            repo,
+            stack,
+            outcome: gix::attrs::search::Outcome::default(),
+            funcnames: std::collections::HashMap::new(),
+        })
     }
 
     /// The value of the path's `diff` attribute, i.e. the diff driver name, or
@@ -2933,19 +2942,39 @@ impl<'r> DiffAttrs<'r> {
             .map(|v| v.to_string()))
     }
 
-    /// Whether the path's diff driver carries a funcname pattern this port cannot
-    /// wired to — a built-in funcname driver, or a user driver with a configured
-    /// `funcname`/`xfuncname`.
-    fn has_funcname_driver(&mut self, rela: &BStr) -> Result<bool> {
+    /// The compiled funcname pattern `match_funcname()` (grep.c:1329-1347) would
+    /// use for this path:
+    ///
+    /// ```c
+    ///         if (xecfg && !xecfg->find_func) {
+    ///                 grep_source_load_driver(gs, opt->repo->index);
+    ///                 if (gs->driver->funcname.pattern) {
+    ///                         const struct userdiff_funcname *pe = &gs->driver->funcname;
+    ///                         xdiff_set_find_func(xecfg, pe->pattern, pe->cflags);
+    ///                 } else {
+    ///                         xecfg = opt->priv = NULL;
+    ///                 }
+    ///         }
+    /// ```
+    ///
+    /// `None` — no `diff` attribute, a bare boolean one, or a driver with no
+    /// `funcname`/`xfuncname` — is that `opt->priv = NULL`, which drops the file
+    /// onto the `isalpha(*bol) || '_' || '$'` fallback for the rest of its walk.
+    /// The same built-in table and compiler the diff and `-L` paths use
+    /// ([`crate::userdiff`]) answers the rest.
+    fn funcname_of(&mut self, rela: &BStr) -> Result<Option<std::rc::Rc<crate::userdiff::FuncName>>> {
         let Some(drv) = self.driver_of(rela)? else {
-            return Ok(false);
+            return Ok(None);
         };
-        if BUILTIN_FUNCNAME_DRIVERS.contains(&drv.as_str()) {
-            return Ok(true);
+        if let Some(hit) = self.funcnames.get(&drv) {
+            return Ok(hit.clone());
         }
-        let snap = self.repo.config_snapshot();
-        Ok(snap.string(format!("diff.{drv}.funcname").as_str()).is_some()
-            || snap.string(format!("diff.{drv}.xfuncname").as_str()).is_some())
+        let compiled = crate::userdiff::Settings::for_driver(self.repo, &drv)
+            .compile_funcname()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .map(std::rc::Rc::new);
+        self.funcnames.insert(drv, compiled.clone());
+        Ok(compiled)
     }
 }
 
@@ -3051,11 +3080,13 @@ struct Fc<'a> {
     post: usize,
     /// git's cross-file "a previous file already printed" flag.
     hunk_mark: bool,
+    /// The path's diff-driver funcname pattern, `None` for the built-in fallback.
+    func: Option<&'a crate::userdiff::FuncName>,
 }
 
 impl Fc<'_> {
     fn is_func(&self, idx: usize) -> bool {
-        idx < self.lv.len() && is_funcname_line(self.lv[idx])
+        idx < self.lv.len() && is_funcname_line(self.lv[idx], self.func)
     }
     fn is_empty(&self, idx: usize) -> bool {
         is_blank_line(self.lv[idx])
@@ -3077,10 +3108,12 @@ fn fc_emit<W: Write>(out: &mut W, cx: &Fc, idx: usize, sign: u8, last_shown: &mu
     } else if cx.pre > 0 || cx.post > 0 || cx.opts.funcbody {
         if *last_shown == 0 {
             if cx.hunk_mark {
-                out.write_all(b"--\n")?;
+                write_field(out, b"--", c_sep(), cx.opts.color)?;
+                out.write_all(b"\n")?;
             }
         } else if lno > *last_shown + 1 {
-            out.write_all(b"--\n")?;
+            write_field(out, b"--", c_sep(), cx.opts.color)?;
+            out.write_all(b"\n")?;
         }
     }
     let is_match_line = sign == b':';
@@ -3094,15 +3127,25 @@ fn fc_emit<W: Write>(out: &mut W, cx: &Fc, idx: usize, sign: u8, last_shown: &mu
                 if len == 0 {
                     break;
                 }
+                // `show_line_header()` prints the `--heading` name too, so under
+                // `-o` the heading lands on the first *match* of the file rather
+                // than on its first shown line.
+                if cx.opts.heading && *last_shown == 0 {
+                    write_field(out, cx.name, c_filename(), cx.opts.color)?;
+                    out.write_all(b"\n")?;
+                }
                 write_line_header(out, cx.name, lno, start + 1, sign, cx.opts)?;
                 write_field(out, &line[start..start + len], c_match(), cx.opts.color)?;
                 out.write_all(b"\n")?;
                 at = start + len;
+                // `show_line_header()` is the only writer of `opt->last_shown`
+                // (grep.c:1212), and under `-o` it is reached only from inside the
+                // match loop (grep.c:1290). A context or funcname line therefore
+                // leaves `last_shown` where it was, which is what makes `-W -o`
+                // emit a `--` for each line that shows nothing.
+                *last_shown = lno;
             }
         }
-        // A context/funcname line contributes no matched substring under `-o`, but
-        // still counts as shown so the hunk bookkeeping stays in step.
-        *last_shown = lno;
         return Ok(());
     }
     // The heading name prints once, when nothing has been shown yet.
@@ -3226,6 +3269,7 @@ fn render_funcctx<W: Write>(
     pre: usize,
     post: usize,
     hunk_mark: bool,
+    func: Option<&crate::userdiff::FuncName>,
 ) -> Result<bool> {
     let lv: Vec<&[u8]> = lines(content).collect();
     let n = lv.len();
@@ -3256,7 +3300,7 @@ fn render_funcctx<W: Write>(
         return Ok(false);
     }
 
-    let cx = Fc { ev, opts, name, lv: &lv, col1: &col1, pre, post, hunk_mark };
+    let cx = Fc { ev, opts, name, lv: &lv, col1: &col1, pre, post, hunk_mark, func };
     let mut last_shown: usize = 0; // 1-based line last printed; 0 = none
     let mut last_hit: usize = 0; // 1-based line of the last match printed
     let mut show_function = false; // funcbody: currently inside a body to emit
@@ -3293,7 +3337,12 @@ fn render_funcctx<W: Write>(
                 while p < n && cx.is_empty(p) {
                     p += 1;
                 }
-                if p < n && cx.is_func(p) {
+                // grep.c:1752 — `peek_bol >= gs->buf + gs->size ||
+                // match_funcname(...)`. Running the peek off the end of the
+                // buffer ends the body just as a signature line does, so a file
+                // whose function is followed only by blank lines prints none of
+                // them.
+                if p >= n || cx.is_func(p) {
                     show_function = false;
                 }
             }
@@ -3421,10 +3470,12 @@ fn render_context(
             }
         } else if last_shown == 0 {
             if *printed_any {
-                out.write_all(b"--\n")?;
+                write_field(out, b"--", c_sep(), opts.color)?;
+                out.write_all(b"\n")?;
             }
         } else if lno > last_shown + 1 {
-            out.write_all(b"--\n")?;
+            write_field(out, b"--", c_sep(), opts.color)?;
+            out.write_all(b"\n")?;
         }
 
         let line = lines[idx];
@@ -3600,10 +3651,7 @@ fn search_file(
             continue;
         }
         if binary_notice_pending {
-            open_group(out, name, opts, emitted_any, &mut fired)?;
-            out.write_all(b"Binary file ")?;
-            out.write_all(name)?;
-            out.write_all(b" matches\n")?;
+            binary_notice(out, name, opts)?;
             break;
         }
 
@@ -3758,6 +3806,30 @@ fn write_body(
 /// Print a file's `--break` blank line and `--heading` name line ahead of its
 /// first emitted line. Idempotent per file via `fired`; `emitted_any` spans the
 /// whole run so the separators land between files but not before the first.
+/// git's binary-file notice, `grep_source_1()` at grep.c:1706-1712:
+///
+/// ```c
+///         if (binary_match_only) {
+///                 opt->output(opt, "Binary file ", 12);
+///                 output_color(opt, gs->name, strlen(gs->name),
+///                              opt->colors[GREP_COLOR_FILENAME]);
+///                 opt->output(opt, " matches\n", 9);
+///                 return 1;
+///         }
+/// ```
+///
+/// It is emitted before `show_line()` and `show_line_header()` are ever reached,
+/// so the file contributes no `--heading` heading, no `--break` blank line and no
+/// `--` hunk mark — and, because it returns without touching `opt->last_shown`,
+/// the *next* file still sees `last_shown == 0` and so gets no separator either.
+/// The name is painted with `color.grep.filename` like every other file name.
+fn binary_notice(out: &mut impl Write, name: &[u8], opts: &Opts) -> Result<()> {
+    out.write_all(b"Binary file ")?;
+    write_field(out, name, c_filename(), opts.color)?;
+    out.write_all(b" matches\n")?;
+    Ok(())
+}
+
 fn open_group(
     out: &mut impl Write,
     name: &[u8],

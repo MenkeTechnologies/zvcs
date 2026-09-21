@@ -61,7 +61,7 @@ fn fixture(tag: &str) -> PathBuf {
 /// to N threads` and the whole `Writing objects` meter are gated on `progress >
 /// pack_to_stdout` (builtin/pack-objects.c:1340, 3214): one `--progress` raises
 /// `progress` to 1, which clears that gate only when the pack is NOT going to
-/// stdout. Observed on git 2.50.1 — `pack-objects --progress --stdout` ends at
+/// stdout. Measured on git 2.55.0 — `pack-objects --progress --stdout` ends at
 /// `Compressing objects: 100% (5/5), done.` and goes straight to `Total 9`,
 /// while `pack-objects --progress out/pk` draws both. `--all-progress` is the
 /// other way past the gate, but it also switches the closing line to

@@ -68,8 +68,7 @@
 //! `gix_ref`'s `Change::Update` has no way to say "no new value", so the two
 //! cannot be told apart at the point the mirror is built.
 
-use anyhow::{anyhow, bail, Result};
-use std::io::Read;
+use anyhow::{anyhow, Result};
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
@@ -774,8 +773,11 @@ fn delete_message(msg: Option<&str>) -> gix::bstr::BString {
 #[derive(Default)]
 struct Batch {
     edits: Vec<RefEdit>,
-    /// Refs a `verify` with a zero/absent old value requires to not exist.
-    absent: Vec<String>,
+    /// Refs a `verify` with a zero/absent old value requires to not exist,
+    /// paired with the update's deref flag: `split_symref_update()` moves the
+    /// requirement onto the referent, while the diagnostic keeps naming the ref
+    /// the command asked for (refs/files-backend.c:2502-2551, v2.55.0).
+    absent: Vec<(String, bool)>,
     /// The reflog lines a `symref-create`/`symref-update` owes, paired with the
     /// index of the edit in `edits` that has to succeed first. gitoxide writes no
     /// reflog for a symbolic-target update at all (its transaction has no oid to
@@ -1087,21 +1089,159 @@ fn reftable_cmdline_refusal(
 /// preconditions, then roll everything back. gitoxide's prepared transaction is
 /// perfectly rolled back when dropped, so this catches a doomed batch at
 /// `prepare` time exactly like stock git, without writing anything.
+/// Every reference the store already holds, by full name — the set
+/// `refs_verify_refname_available()` reads through `refs_read_raw_ref()` and its
+/// prefix iterator (refs.c:2828-2906, v2.55.0). Packed and loose alike, because
+/// git checks both stores (refs/files-backend.c:900-912 for the loose lock,
+/// :3024-3026 for the packed one).
+fn existing_refnames(repo: &gix::Repository) -> Result<std::collections::BTreeSet<String>> {
+    let mut names = std::collections::BTreeSet::new();
+    for reference in repo.references()?.all()?.filter_map(Result::ok) {
+        names.insert(reference.name().as_bstr().to_string());
+    }
+    Ok(names)
+}
+
+/// The reference that stops `name` from being created, worded as
+/// `refs_verify_refname_available()` words it (refs.c:2778-2930, v2.55.0).
+///
+/// git walks the prefixes of `name` first — a reference at `refs/foo` is a file
+/// standing where `refs/foo/bar` needs a directory — and then the names *under*
+/// it, which conflict for the same reason in the other direction:
+///
+/// ```c
+/// strbuf_addf(err, _("'%s' exists; cannot create '%s'"), dirname.buf, refname);
+/// …
+/// strbuf_addf(err, _("cannot process '%s' and '%s' at the same time"),
+///             refname, extra_refname);
+/// ```
+///
+/// `extras` are the other refnames of the same transaction
+/// (`&transaction->refnames`, refs/files-backend.c:3024-3026). They do not exist
+/// yet, so a collision with one of them is reported with the second wording.
+fn availability_conflict(
+    existing: &std::collections::BTreeSet<String>,
+    extras: &std::collections::BTreeSet<String>,
+    name: &str,
+) -> Option<String> {
+    let mut end = 0;
+    while let Some(slash) = name[end..].find('/') {
+        end += slash;
+        let prefix = &name[..end];
+        if existing.contains(prefix) {
+            return Some(format!("'{prefix}' exists; cannot create '{name}'"));
+        }
+        if extras.contains(prefix) {
+            return Some(format!(
+                "cannot process '{name}' and '{prefix}' at the same time"
+            ));
+        }
+        end += 1;
+    }
+    // The leaf: `refname` itself never conflicts with `refname`, but anything in
+    // the `refname/` namespace does.
+    let under = format!("{name}/");
+    if let Some(other) = existing.range(under.clone()..).next().filter(|n| n.starts_with(&under)) {
+        return Some(format!("'{other}' exists; cannot create '{name}'"));
+    }
+    extras
+        .range(under.clone()..)
+        .next()
+        .filter(|n| n.starts_with(&under))
+        .map(|other| format!("cannot process '{name}' and '{other}' at the same time"))
+}
+
+/// The refname each edit will actually write, and whether it needs an
+/// availability check at all.
+///
+/// `lock_raw_ref()` adds a name to `refnames_to_check` only "if the ref did not
+/// exist and we are creating it" (refs/files-backend.c:915-932), so an update of
+/// a reference that is already there is not re-checked — it cannot have grown a
+/// conflict since it was created. A deref'd update writes the symref's referent,
+/// not the symref: `split_symref_update()` re-points the update at it and demotes
+/// the original to `REF_LOG_ONLY | REF_NO_DEREF` (refs/files-backend.c:2502-2551),
+/// which is the name that then reaches the check.
+fn written_refname(repo: &gix::Repository, edit: &RefEdit) -> String {
+    deref_chain(repo, &edit.name.as_bstr().to_string(), edit.deref)
+}
+
+/// The reference an update on `name` finally writes: `name` itself under
+/// `REF_NO_DEREF`, otherwise the end of its symref chain.
+///
+/// `split_symref_update()` (refs/files-backend.c:2502-2551, v2.55.0) re-points
+/// the update at the referent and repeats for as long as that is symbolic too;
+/// `SYMREF_MAXDEPTH` (refs.c) bounds the walk at 5.
+fn deref_chain(repo: &gix::Repository, name: &str, deref: bool) -> String {
+    let mut name = name.to_string();
+    if !deref {
+        return name;
+    }
+    for _ in 0..5 {
+        let Ok(Some(reference)) = repo.try_find_reference(name.as_str()) else {
+            break;
+        };
+        match reference.target() {
+            gix::refs::TargetRef::Symbolic(target) => name = target.as_bstr().to_string(),
+            gix::refs::TargetRef::Object(_) => break,
+        }
+    }
+    name
+}
+
+/// `refs_verify_refnames_available()` over a whole transaction: the conflict, if
+/// any, that each edit's written name runs into. `None` for an edit git does not
+/// check (see [`written_refname`]).
+fn transaction_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Result<Vec<Option<String>>> {
+    let existing = existing_refnames(repo)?;
+    let names: Vec<String> = edits.iter().map(|e| written_refname(repo, e)).collect();
+    // `&transaction->refnames` holds every refname in the transaction, deletions
+    // included, and a name is never compared against itself.
+    let extras: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+    Ok(names
+        .iter()
+        .zip(edits)
+        .map(|(name, edit)| {
+            let creating =
+                matches!(edit.change, Change::Update { .. }) && !existing.contains(name);
+            creating
+                .then(|| availability_conflict(&existing, &extras, name))
+                .flatten()
+        })
+        .collect())
+}
+
+/// The `<ref> must not exist` half of a `create`/`verify`: git spells it as an
+/// old value of the null oid, so `lock_ref_for_update()` enforces it on the ref
+/// the update finally writes — the referent when the named ref is a symref the
+/// update derefs through — while the failure still names the ref the command
+/// asked for (`cannot lock ref '<refname>'`, refs/files-backend.c:2666-2690).
+fn check_absent(repo: &gix::Repository, absent: &[(String, bool)]) -> Result<()> {
+    for (name, deref) in absent {
+        let target = deref_chain(repo, name, *deref);
+        if repo.try_find_reference(target.as_str())?.is_some() {
+            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
+        }
+    }
+    Ok(())
+}
+
 fn validate_prepare(repo: &gix::Repository, batch: &Batch) -> Result<()> {
-    for name in &batch.absent {
+    for (name, _) in &batch.absent {
         refname(name)?;
     }
     if batch.edits.is_empty() && batch.absent.is_empty() {
         return Ok(());
     }
     reftable_transaction_refused(repo)?;
-    for name in &batch.absent {
-        if repo.try_find_reference(name.as_str())?.is_some() {
-            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
-        }
-    }
+    check_absent(repo, &batch.absent)?;
     if batch.edits.is_empty() {
         return Ok(());
+    }
+    // `ref_transaction_prepare()` refuses a name conflict before it takes any
+    // lock (refs/files-backend.c:3024-3029), so `prepare` fails here exactly as
+    // `commit` would.
+    if let Some(reason) = transaction_conflicts(repo, &batch.edits)?.into_iter().flatten().next() {
+        crate::git_fatal!("{reason}");
     }
     let prepared = repo
         .refs
@@ -1125,10 +1265,15 @@ fn run_stdin(
     batch_updates: bool,
     msg: Option<&str>,
 ) -> Result<ExitCode> {
-    let mut input = String::new();
-    std::io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|e| anyhow!("failed to read stdin: {e}"))?;
+    // git answers each command before it reads the next one — its loop is
+    // `while (!strbuf_getwholeline(&input, stdin, line_termination))`
+    // (builtin/update-ref.c:1113-1130, v2.55.0) — so a caller can drive
+    // `--stdin` over a pipe, read `start: ok` back, and only then write the next
+    // command. Reading all of stdin up front deadlocked that caller: it was
+    // waiting for the status line this side would not print until EOF, which
+    // was waiting for the command the caller would not send.
+    let stdin = std::io::stdin();
+    let mut reader = std::io::BufReader::new(stdin.lock());
 
     let mut batch = Batch::default();
     // `option no-deref` applies to the next command naming a ref, and only that one.
@@ -1143,13 +1288,8 @@ fn run_stdin(
     // value slots that belong to it, which the line form takes from the chunk
     // itself.
     let terminator = if nul { '\0' } else { '\n' };
-    let records: Vec<(String, Option<Vec<String>>)> = if nul {
-        split_nul_records(&input).into_iter().map(|(raw, f)| (raw, Some(f))).collect()
-    } else {
-        split_line_records(&input).into_iter().map(|raw| (raw, None)).collect()
-    };
 
-    for (raw, staged) in records {
+    while let Some((raw, staged)) = next_record(&mut reader, nul)? {
         // `builtin/update-ref.c:715-718`, both checked on the raw line and both
         // ahead of the command table:
         //
@@ -1183,7 +1323,7 @@ fn run_stdin(
         let args = &fields[1..];
         // Whether `*next` will land on `line_termination` once the arguments are
         // read, which is what every `parse_cmd_*` asserts before it stages
-        // anything. `-z` records come out of [`split_nul_records`] with their NUL
+        // anything. `-z` records come out of [`next_record`] with their NUL
         // restored, so only the line form can ever be short one.
         let terminated = raw.ends_with(terminator);
 
@@ -1210,7 +1350,7 @@ fn run_stdin(
 
         match cmd {
             "start" => {
-                println!("start: ok");
+                report_ok("start");
                 state = TxnState::Started;
             }
             "prepare" => {
@@ -1218,7 +1358,7 @@ fn run_stdin(
                     eprintln!("fatal: prepare: {e:#}");
                     return Ok(ExitCode::from(128));
                 }
-                println!("prepare: ok");
+                report_ok("prepare");
                 state = TxnState::Prepared;
             }
             "commit" => {
@@ -1226,12 +1366,12 @@ fn run_stdin(
                     eprintln!("fatal: commit: {e:#}");
                     return Ok(ExitCode::from(128));
                 }
-                println!("commit: ok");
+                report_ok("commit");
                 state = TxnState::Closed;
             }
             "abort" => {
                 batch = Batch::default();
-                println!("abort: ok");
+                report_ok("abort");
                 state = TxnState::Closed;
             }
             "option" => {
@@ -1323,19 +1463,23 @@ fn run_stdin(
 /// transaction. With it, each edit is applied on its own so that a rejection
 /// leaves the rest of the batch in place, which is the whole point of the flag.
 fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()> {
-    for name in &batch.absent {
+    for (name, _) in &batch.absent {
         refname(name)?; // reject malformed names the same way an edit would
     }
     if batch.is_empty() {
         return Ok(());
     }
     reftable_transaction_refused(repo)?;
-    for name in &batch.absent {
-        if repo.try_find_reference(name.as_str())?.is_some() {
-            crate::git_fatal!("cannot lock ref '{name}': reference already exists");
-        }
-    }
+    check_absent(repo, &batch.absent)?;
+    // `refs_verify_refnames_available()` runs over the whole transaction before
+    // any reference is written (refs/files-backend.c:3024-3029), which is what
+    // names the reference standing in the way; reaching the file system instead
+    // reported only that some path already existed.
+    let conflicts = transaction_conflicts(repo, &batch.edits)?;
     if !batch_updates {
+        if let Some(reason) = conflicts.into_iter().flatten().next() {
+            crate::git_fatal!("{reason}");
+        }
         if let Err(e) = repo.edit_references(batch.edits) {
             crate::git_fatal!("{}", lock_error(repo, &e));
         }
@@ -1348,6 +1492,16 @@ fn apply(repo: &gix::Repository, batch: Batch, batch_updates: bool) -> Result<()
     for (index, edit) in batch.edits.into_iter().enumerate() {
         let name = edit.name.to_string();
         let (new, old) = edit_oids(&edit, &zero);
+        // `ref_transaction_maybe_set_rejected()` with
+        // `REF_TRANSACTION_ERROR_NAME_CONFLICT` (refs.c:1268-1300, :2847-2854; `ref_transaction_error_msg()` refs.c:3532-3536): under
+        // `--batch-updates` the conflicting update is dropped and reported,
+        // `ref_transaction_error_msg()` spelling the reason `refname conflict`,
+        // while the rest of the batch still applies.
+        if let Some(reason) = conflicts.get(index).and_then(Option::as_ref) {
+            eprintln!("error: {reason}");
+            println!("rejected {name} {new} {old} refname conflict");
+            continue;
+        }
         if let Err(e) = repo.edit_reference(edit) {
             let msg = lock_error(repo, &e);
             eprintln!("error: {msg}");
@@ -1432,7 +1586,7 @@ fn stage_oid_command(
             // git's `create` refuses outright when the ref is already there;
             // gitoxide's `MustNotExist` tolerates an existing ref that already
             // holds the value being written, so the check is made explicit.
-            batch.absent.push(name.to_string());
+            batch.absent.push((name.to_string(), deref));
             batch.edits.push(RefEdit {
                 change: Change::Update {
                     log: log_change(create_reflog, msg),
@@ -1483,7 +1637,7 @@ fn stage_oid_command(
                     stage_verify_head_mirror(repo, batch, name, create_reflog, msg)?;
                 }
                 // Zero or missing old value: the ref must not exist.
-                Val::Zero | Val::Missing => batch.absent.push(name.to_string()),
+                Val::Zero | Val::Missing => batch.absent.push((name.to_string(), deref)),
             }
         }
         _ => unreachable!("caller filters the command set"),
@@ -1657,7 +1811,7 @@ fn stage_symref_command(
             });
         }
         "symref-verify" => match slot(1) {
-            None | Some("") => batch.absent.push(name.to_string()),
+            None | Some("") => batch.absent.push((name.to_string(), false)),
             Some(old) => {
                 parse_refname(old)?;
                 let target = Target::Symbolic(refname(old)?);
@@ -1689,63 +1843,80 @@ fn stage_symref_command(
 /// unrecognised head is not rejected here: git meets it in the dispatch loop,
 /// after the commands ahead of it have already run, so it is passed through with
 /// no value slots for the loop to refuse.
-fn split_nul_records(input: &str) -> Vec<(String, Vec<String>)> {
-    let mut fields: Vec<&str> = input.split('\0').collect();
-    // A well-formed stream ends with a trailing NUL, producing one empty tail.
-    if fields.last().is_some_and(|f| f.is_empty()) {
-        fields.pop();
-    }
-
-    let mut records = Vec::new();
-    let mut i = 0;
-    while i < fields.len() {
-        let head = fields[i];
-        i += 1;
-        let (cmd, first) = match head.split_once(' ') {
-            Some((c, r)) => (c.to_string(), Some(r.to_string())),
-            None => (head.to_string(), None),
-        };
-        // Number of NUL-separated value slots that follow the head.
-        let extra = match cmd.as_str() {
-            "update" => 2,
-            "create" | "delete" | "verify" => 1,
-            "symref-update" => 3,
-            "symref-create" => 1,
-            "symref-delete" | "symref-verify" => 1,
-            _ => 0,
-        };
-        let mut record = vec![cmd];
-        if let Some(f) = first {
-            record.push(f);
-        }
-        for _ in 0..extra {
-            match fields.get(i) {
-                Some(v) => {
-                    record.push((*v).to_string());
-                    i += 1;
-                }
-                // Trailing optional slots may be absent at end of input.
-                None => break,
-            }
-        }
-        records.push((format!("{head}\0"), record));
-    }
-    records
-}
-
-/// Split newline-terminated `--stdin` input into the lines
-/// `strbuf_getwholeline(&input, stdin, '\n')` would hand back one at a time.
+/// `report_ok()` (builtin/update-ref.c:595-599, v2.55.0):
 ///
-/// Terminators are kept and empty lines are kept: both are things git's dispatch
-/// loop looks at. `str::lines()` did neither, which turned `\n` on its own into
-/// a skipped record where git says `empty command in input`, dropped the `\r` of
-/// a CRLF line git keeps, and cost every diagnostic the trailing newline git
-/// interpolates. A final line with no terminator is handed back as it arrived,
-/// which is what makes it an unknown command in [`match_command`].
-fn split_line_records(input: &str) -> Vec<String> {
-    input.split_inclusive('\n').map(str::to_string).collect()
+/// ```c
+/// fprintf(stdout, "%s: ok\n", command);
+/// fflush(stdout);
+/// ```
+///
+/// The flush is the whole point: a caller driving `--stdin` over a pipe reads
+/// this line before it writes the next command, so leaving it in the buffer
+/// until exit hangs both ends.
+fn report_ok(command: &str) {
+    use std::io::Write as _;
+    println!("{command}: ok");
+    let _ = std::io::stdout().flush();
 }
 
+/// One `strbuf_getwholeline(&input, stdin, line_termination)`: everything up to
+/// and including the next terminator, or `None` at end of input. A final chunk
+/// the stream never terminated comes back as it arrived, which is what makes it
+/// an unknown command in [`match_command`].
+fn read_field(reader: &mut impl std::io::BufRead, terminator: u8) -> Result<Option<String>> {
+    let mut buf = Vec::new();
+    if reader
+        .read_until(terminator, &mut buf)
+        .map_err(|e| anyhow!("failed to read stdin: {e}"))?
+        == 0
+    {
+        return Ok(None);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| anyhow!("failed to read stdin: {e}"))
+}
+
+/// The next command git's dispatch loop would see: the whole terminator-carrying
+/// chunk it dispatches on, and for `-z` the NUL-separated value slots that
+/// belong to it, which each `parse_cmd_*` pulls off the same stream with its own
+/// `strbuf_getwholeline()` call.
+fn next_record(
+    reader: &mut impl std::io::BufRead,
+    nul: bool,
+) -> Result<Option<(String, Option<Vec<String>>)>> {
+    let terminator = if nul { b'\0' } else { b'\n' };
+    let Some(head) = read_field(reader, terminator)? else {
+        return Ok(None);
+    };
+    if !nul {
+        return Ok(Some((head, None)));
+    }
+    let bare = head.strip_suffix('\0').unwrap_or(&head);
+    let (cmd, first) = match bare.split_once(' ') {
+        Some((c, r)) => (c.to_string(), Some(r.to_string())),
+        None => (bare.to_string(), None),
+    };
+    // Number of NUL-separated value slots that follow the head.
+    let extra = match cmd.as_str() {
+        "update" => 2,
+        "create" | "delete" | "verify" => 1,
+        "symref-update" => 3,
+        "symref-create" => 1,
+        "symref-delete" | "symref-verify" => 1,
+        _ => 0,
+    };
+    let mut record = vec![cmd];
+    record.extend(first);
+    for _ in 0..extra {
+        // Trailing optional slots may be absent at end of input.
+        let Some(field) = read_field(reader, terminator)? else {
+            break;
+        };
+        record.push(field.strip_suffix('\0').unwrap_or(&field).to_string());
+    }
+    Ok(Some((head, Some(record))))
+}
 /// Split one instruction line into fields, honouring C-style quoting.
 fn tokenize(line: &str) -> Result<Vec<String>> {
     let b = line.as_bytes();

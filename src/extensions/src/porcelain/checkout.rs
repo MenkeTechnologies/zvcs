@@ -884,8 +884,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // `--orphan <name> [<start>]`: start an unborn branch off `<start>`'s tree.
     if let Some(name) = orphan {
-        let start = pre.first().copied().unwrap_or("HEAD");
-        return orphan_checkout(&repo, &name, start, quiet, force);
+        return orphan_checkout(&repo, &name, pre.first().copied(), quiet, force);
     }
 
     // `--ours`/`--theirs <path>…`: write one conflict side into the worktree.
@@ -947,26 +946,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // with a rev-spec parse error and make `checkout -B main` unusable in an
         // empty repository.
         if pre.is_empty() && repo.head()?.is_unborn() {
-            let full: gix::refs::FullName = format!("refs/heads/{name}").try_into()?;
-            repo.edit_reference(RefEdit {
-                change: Change::Update {
-                    log: LogChange {
-                        mode: RefLog::AndReference,
-                        force_create_reflog: false,
-                        message: format!("checkout: moving to {name}").into(),
-                    },
-                    expected: PreviousValue::Any,
-                    new: Target::Symbolic(full),
-                },
-                name: "HEAD".try_into()?,
-                deref: false,
-            })?;
-            if !quiet {
-                eprintln!("Switched to a new branch '{name}'");
-            }
-            super::reset::remove_branch_state(&repo, !quiet)?;
-            let head = head_commit_id(&repo);
-            return Ok(run_post_checkout(&repo, head, head, true));
+            return switch_unborn_to_new_branch(&repo, &name, quiet);
         }
         // `-B` resets an existing branch, and `create_branch()` refuses to move
         // one another worktree has checked out (branch.c:400, through
@@ -1970,6 +1950,50 @@ fn create_and_switch(
     Ok(run_post_checkout(repo, old_head, head_commit_id(repo), true))
 }
 
+/// `switch_unborn_to_new_branch()` (builtin/checkout.c:1551-1573, v2.55.0): the
+/// whole of a branch creation that starts from nothing.
+///
+/// ```c
+/// strbuf_addf(&branch_ref, "refs/heads/%s", opts->new_branch);
+/// status = refs_update_symref(get_main_ref_store(the_repository),
+///                             "HEAD", branch_ref.buf, "checkout -b");
+/// if (!opts->quiet)
+///         fprintf(stderr, _("Switched to a new branch '%s'\n"), opts->new_branch);
+/// ```
+///
+/// `checkout_branch()` routes here whenever the new branch has no start-point
+/// commit and `HEAD` is a symref holding the null oid (builtin/checkout.c:1740-1746).
+/// `opts->new_branch` at that point is the slot `-b`, `-B` and `--orphan` were all
+/// folded into (:1960-1961), so every spelling lands on this same transition:
+/// no ref is written (the branch stays unborn), no tree is touched, and no
+/// reflog line appears because `HEAD` still has no value to log a move from.
+fn switch_unborn_to_new_branch(
+    repo: &gix::Repository,
+    name: &str,
+    quiet: bool,
+) -> Result<ExitCode> {
+    let full: gix::refs::FullName = format!("refs/heads/{name}").try_into()?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: format!("checkout: moving to {name}").into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(full),
+        },
+        name: "HEAD".try_into()?,
+        deref: false,
+    })?;
+    if !quiet {
+        eprintln!("Switched to a new branch '{name}'");
+    }
+    super::reset::remove_branch_state(repo, !quiet)?;
+    let head = head_commit_id(repo);
+    Ok(run_post_checkout(repo, head, head, true))
+}
+
 /// `git checkout --orphan <name> [<start>]`: point `HEAD` at an unborn branch
 /// `<name>` whose worktree/index come from `<start>`'s tree. The ref is not
 /// created (git materializes it only at the first commit) and no reflog entry is
@@ -1977,7 +2001,9 @@ fn create_and_switch(
 fn orphan_checkout(
     repo: &gix::Repository,
     name: &str,
-    start: &str,
+    // `None` when the command line carried no start-point operand, which is what
+    // lets an unborn `HEAD` reach `switch_unborn_to_new_branch()` below.
+    start: Option<&str>,
     quiet: bool,
     // `opts->discard_changes`. `merge_working_tree()` routes a forced checkout
     // through `reset_tree()` instead of the two-way merge, so local changes are
@@ -1986,22 +2012,35 @@ fn orphan_checkout(
 ) -> Result<ExitCode> {
     // `old_branch_info.commit` for the post-checkout hook at the tail.
     let old_head = head_commit_id(repo);
+    // With no start-point operand there is nothing for git to resolve:
+    // `parse_branchname_arg()` runs only `if (argc && opts->accept_ref)`
+    // (builtin/checkout.c:1990-2000), so `new_branch_info.commit` stays NULL and
+    // `checkout_branch()` hands an unborn `HEAD` to
+    // `switch_unborn_to_new_branch()` (builtin/checkout.c:1740-1746). A fresh
+    // `git init` can therefore run `git checkout --orphan <name>`; resolving the
+    // implicit `HEAD` here instead reported it as not a commit.
+    let unborn = start.is_none() && repo.head()?.is_unborn();
     // git resolves the start-point before anything else: a bad one aborts here.
     // Resolution is `get_oid_mb()`'s, so a full-length hex name is the id itself
     // and a missing object is `parse_branchname_arg()`'s `unable to read tree`
     // rather than this function's wording.
-    let commit = match crate::objname::resolve(repo, start) {
-        Some(id) => match classify_tree_ish(repo, id)? {
-            TreeIsh::Commit(commit) => commit,
-            TreeIsh::Tree(_) => {
-                crate::git_fatal!("Cannot switch branch to a non-commit '{start}'")
+    let commit = if unborn {
+        None
+    } else {
+        let start = start.unwrap_or("HEAD");
+        match crate::objname::resolve(repo, start) {
+            Some(id) => match classify_tree_ish(repo, id)? {
+                TreeIsh::Commit(commit) => Some(commit),
+                TreeIsh::Tree(_) => {
+                    crate::git_fatal!("Cannot switch branch to a non-commit '{start}'")
+                }
+            },
+            None => {
+                eprintln!(
+                    "fatal: '{start}' is not a commit and a branch '{name}' cannot be created from it"
+                );
+                return Ok(ExitCode::from(128));
             }
-        },
-        None => {
-            eprintln!(
-                "fatal: '{start}' is not a commit and a branch '{name}' cannot be created from it"
-            );
-            return Ok(ExitCode::from(128));
         }
     };
 
@@ -2018,6 +2057,15 @@ fn orphan_checkout(
         eprintln!("fatal: a branch named '{name}' already exists");
         return Ok(ExitCode::from(128));
     }
+
+    // Nothing to check out: the branch is unborn on both sides, so git only
+    // re-points `HEAD` (builtin/checkout.c:1740-1746 → :1551-1573). The name and
+    // collision checks above are `validate_new_branchname()`'s, which
+    // `checkout_main()` runs before `checkout_branch()` either way
+    // (builtin/checkout.c:2066-2074).
+    let Some(commit) = commit else {
+        return switch_unborn_to_new_branch(repo, name, quiet);
+    };
 
     let start_commit = commit.id;
     let target_tree = commit.tree_id()?.detach();

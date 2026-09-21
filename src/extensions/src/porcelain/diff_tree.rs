@@ -384,6 +384,11 @@ struct Opts {
     /// When set, the file pairs are handed to `diff-pairs` with these options instead
     /// of being rendered by this module. See [`needs_pairs`].
     route: Option<Vec<String>>,
+    /// Whether the routed option list carries a `-R`. `diff-tree`'s reverse is
+    /// `flags.reverse_diff`, applied while the queue is built (`diff_addremove()`),
+    /// so the routed renderer has to flip each reversed creation's status letter —
+    /// which `git diff-pairs -R` on its own does not.
+    route_reverse: bool,
     /// Every `diff_opt_parse` option from the command line, in order — the same list
     /// [`route`](Opts::route) is built from, kept unconditionally because
     /// [`combined_commit`] has to reconstruct git's `opt->output_format` bitmask,
@@ -463,6 +468,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         combined_all_paths: false,
         ignore_submodules: false,
         route: None,
+        route_reverse: false,
         diff_args: std::rc::Rc::new(Vec::new()),
         line_prefix: Vec::new(),
         pretty: None,
@@ -1039,6 +1045,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             opts.show_trees = false;
         }
         opts.route = Some(route);
+        // The routed renderer applies `-R` itself, off the option list it was handed;
+        // this walk must not also reverse. It still has to be told that this `-R` is
+        // the queue-time kind, because only that one moves the status letter.
+        opts.route_reverse = opts.reverse;
         opts.reverse = false;
         opts.filter = ALL_STATUSES;
     }
@@ -2783,6 +2793,10 @@ fn render_all(
                 // `repo_diff_setup()`, so `diff.dirstat` reaches it — unlike
                 // `diff-pairs`, whose own order shuts the config out.
                 dirstat_config: true,
+                // `diff-tree`'s `-R` is `options->flags.reverse_diff`, which
+                // `diff_addremove()` applies as the queue is built, so a reversed
+                // creation is a deletion by the time any format reads its status.
+                queue_time_reverse: opts.route_reverse,
             },
         )?;
         return Ok(status.code());

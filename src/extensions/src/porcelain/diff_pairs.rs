@@ -751,6 +751,9 @@ struct Opts {
     ws: Whitespace,            // -w / -b / --ignore-space-at-eol / --ignore-cr-at-eol
     ignore_lines: Vec<Needle>, // -I<re>
     reverse: bool,             // -R
+    /// [`RouteCtx::queue_time_reverse`]: whether `reverse` also moves the status
+    /// letter, which it does for every caller but `diff-pairs` itself.
+    queue_time_reverse: bool,
     filter: Option<Filter>,    // --diff-filter
     pickaxe: Option<Pickaxe>,  // -S / -G / --find-object (finalized after parse)
     relative: Relative,
@@ -983,6 +986,24 @@ pub(crate) struct RouteCtx {
     /// other command reaches `repo_diff_setup()` the ordinary way round, so a
     /// routed `diff-tree` says yes here.
     pub dirstat_config: bool,
+    /// Whether this caller's `-R` is git's `flags.reverse_diff`, applied while the
+    /// queue is *built* rather than while it is emitted.
+    ///
+    /// `diff_addremove()` flips the record itself under that flag —
+    ///
+    /// ```c
+    /// if (options->flags.reverse_diff)
+    ///         addremove = (addremove == '+' ? '-' :
+    ///                      addremove == '-' ? '+' : addremove);
+    /// ```
+    ///
+    /// — so `diff_resolve_rename_copy()` later reads the swapped filespecs and calls
+    /// an addition a deletion. `builtin/diff-pairs.c` has no such stage: it is handed
+    /// finished records and swaps only what it prints, which is why stock `git
+    /// diff-pairs -R --raw` still reports `A` for a record it reversed (measured
+    /// against 2.55.0). A routed `diff-tree` is the first kind, so it says yes here
+    /// and its `--stat --compact-summary` annotates a reversed creation `(gone)`.
+    pub queue_time_reverse: bool,
 }
 
 pub(crate) fn render_raw_stream(
@@ -1007,6 +1028,7 @@ pub(crate) fn render_raw_stream(
         ws: Whitespace::Keep,
         ignore_lines: Vec::new(),
         reverse: false,
+        queue_time_reverse: route.queue_time_reverse,
         filter: None,
         pickaxe: None,
         relative: Relative::No,
@@ -2574,7 +2596,7 @@ fn flush(
     // `-R`: swap each pair's two sides for display (the prefixes were swapped globally).
     if opts.reverse {
         for p in &mut pairs {
-            reverse_pair(p);
+            reverse_pair(p, opts.queue_time_reverse);
         }
     }
 
@@ -2934,13 +2956,29 @@ fn rotate(pairs: &mut Vec<Pair>, anchor: &Anchor) {
     }
 }
 
-/// `-R`: swap the two sides of a pair for rendering. git applies reverse at the emit
-/// layer, so the raw status letter is *not* recomputed — only the modes, ids and paths
-/// move — which is why a reversed deletion still prints its `D` in `--raw`.
-fn reverse_pair(p: &mut Pair) {
+/// `-R`: swap the two sides of a pair for rendering.
+///
+/// `builtin/diff-pairs.c` applies reverse at the emit layer, so the status letter is
+/// *not* recomputed — only the modes, ids and paths move — which is why stock `git
+/// diff-pairs -R --raw` still prints `A` for a record it reversed.
+///
+/// `flip_status` is the other caller: a command whose `-R` is
+/// `options->flags.reverse_diff`, which `diff_addremove()` applies while the queue is
+/// built (`addremove == '+' ? '-' : addremove == '-' ? '+' : addremove`), so
+/// `diff_resolve_rename_copy()` reads the swapped filespecs and a reversed creation
+/// really is a deletion. Only the add/remove letter moves there; a modification, a
+/// type change and a rename each reverse into themselves.
+fn reverse_pair(p: &mut Pair, flip_status: bool) {
     std::mem::swap(&mut p.old_mode, &mut p.new_mode);
     std::mem::swap(&mut p.old_id, &mut p.new_id);
     std::mem::swap(&mut p.old_path, &mut p.new_path);
+    if flip_status {
+        p.status[0] = match p.status[0] {
+            b'A' => b'D',
+            b'D' => b'A',
+            other => other,
+        };
+    }
 }
 
 /// `--relative[=<p>]`: keep only records under `<p>`, with that prefix stripped from

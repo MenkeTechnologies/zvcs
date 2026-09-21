@@ -177,15 +177,10 @@ impl Fatal {
 /// Options that take a value, either attached (`--grep=x`) or as the next argv element
 /// (`--grep x`), together with git's message when the value is missing.
 ///
-/// `-n` is the odd one out: it is spelled as a `parse-options` `error:` but still exits
-/// 128, because `cmd_log_init` turns it into a `die()`.
+/// The count-and-age spellings (`--max-count`, `--skip`, `--since` and the rest)
+/// are absent on purpose: [`crate::revopt`] claims them first, so they are not
+/// restated here.
 const VALUE_OPTS: &[&str] = &[
-    "--max-count",
-    "--skip",
-    "--since",
-    "--after",
-    "--until",
-    "--before",
     "--author",
     "--committer",
     "--grep",
@@ -583,6 +578,9 @@ struct Parsed {
     /// empty-tree diff is suppressed, so — like any TREESAME commit — it is dropped entirely.
     show_root: bool,
     max_count: Option<usize>,
+    /// `handle_revision_opt()`'s count-and-age state, held so the two
+    /// `die_for_incompatible_opt2()` conflicts are raised where git raises them.
+    counts: crate::revopt::Counts,
     revs: Vec<String>,
     pathspecs: Vec<String>,
     /// A collected `--grep` filter, kept so a malformed pattern is rejected in git's
@@ -1155,42 +1153,35 @@ fn consume_option(
             p.show_root = true;
             return Ok(1);
         }
-        "-n" => {
-            let v = next.ok_or_else(|| Fatal {
-                text: "error: -n requires an argument\n".into(),
-                code: 128,
-                to_stdout: false,
-            })?;
-            p.max_count = parse_count(v)?;
-            return Ok(2);
-        }
-        "--max-count" => {
-            let v = next.ok_or_else(|| {
-                Fatal::die("Option '--max-count' requires a value")
-            })?;
-            p.max_count = parse_count(v)?;
-            return Ok(2);
-        }
         _ => {}
     }
-    if let Some(v) = a.strip_prefix("--max-count=") {
-        p.max_count = parse_count(v)?;
-        return Ok(1);
-    }
-    // The `-nN` and `-N` shorthands. Guarded on a single leading dash so that long
-    // options beginning with `n` (`--numstat`, `--name-only`) are not misread.
-    if !a.starts_with("--") {
-        if let Some(v) = a.strip_prefix("-n") {
-            if !v.is_empty() {
-                p.max_count = parse_count(v)?;
-                return Ok(1);
+    // `handle_revision_opt()`'s count-and-age arm (revision.c:2341-2399). The
+    // spellings, the argv arithmetic and the value parsers are
+    // [`crate::revopt`]'s — this classifier only has to agree with git on how
+    // many slots each word eats and which refusal a bad value produces, since
+    // `cmd_whatchanged` *is* `cmd_log` and the walk itself is `git log`'s.
+    match crate::revopt::parse(args, i) {
+        Some(Ok(hit)) => {
+            if let Err(message) = p.counts.apply(hit.what) {
+                return Err(Fatal::die(&message));
             }
+            if let crate::revopt::Count::MaxCount(_) | crate::revopt::Count::MaxCountOldest(_) =
+                hit.what
+            {
+                p.max_count = p.counts.max_count;
+            }
+            return Ok(hit.consumed);
         }
-        let digits = &a[1..];
-        if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
-            p.max_count = parse_count(digits)?;
-            return Ok(1);
+        // `-n` alone is `error()` at 128, not parse-options' 129.
+        Some(Err(message)) if message.starts_with('-') => {
+            return Err(Fatal {
+                text: format!("error: {message}\n"),
+                code: 128,
+                to_stdout: false,
+            })
         }
+        Some(Err(message)) => return Err(Fatal::die(&message)),
+        None => {}
     }
 
     // --- options git recognises and forwards -----------------------------------------

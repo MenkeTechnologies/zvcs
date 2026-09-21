@@ -525,16 +525,6 @@ fn parse_git_int(value: &str) -> Option<i64> {
         .ok()
 }
 
-/// Map a signed `--max-count`/`-n` to the internal limit: git treats any negative
-/// value as "no limit" (its stored max_count stays -1), so those become `None`.
-fn clamp_count(n: i64) -> Option<usize> {
-    if n < 0 {
-        None
-    } else {
-        Some(n as usize)
-    }
-}
-
 /// How commits are ordered before filtering and limiting.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Order {
@@ -936,6 +926,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut min_parents: i64 = 0;
     let mut max_parents: Option<usize> = None;
     let mut max_count: Option<usize> = None;
+    // `handle_revision_opt()`'s count-and-age state; the locals around it are
+    // refreshed from it as each option lands. See [`crate::revopt`].
+    let mut counts = crate::revopt::Counts::default();
     // `--since`/`--until` are git's `max_age`/`min_age`, both committer-date.
     let mut max_age: Option<i64> = None;
     let mut min_age: Option<i64> = None;
@@ -1133,66 +1126,38 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 continue 'args;
             }
         }
-        for name in ["since", "after"] {
-            if let Some(v) = long_opt_value(&argv, i, name) {
-                max_age = Some(approxidate(&v.value));
-                i += v.consumed;
+        // `handle_revision_opt()`'s count-and-age arm (revision.c:2341-2399):
+        // `--max-count`, `--max-count-oldest`, `--skip`, `-<digits>`, `-n`, and
+        // the six date spellings. Each takes its value attached or in the next
+        // argv slot (`parse_long_opt()`, diff.c:5380-5399), and the two
+        // `die_for_incompatible_opt2()` conflicts live with the parse, so every
+        // walking verb answers them identically. See [`crate::revopt`].
+        match crate::revopt::parse(&argv, i) {
+            Some(Ok(hit)) => {
+                if let Err(message) = counts.apply(hit.what) {
+                    return Ok(fatal(&message));
+                }
+                max_count = counts.max_count;
+                skip_count = counts.skip;
+                max_age = counts.max_age;
+                min_age = counts.min_age;
+                max_age_as_filter = counts.max_age_as_filter;
+                if counts.no_walk_cleared {
+                    no_walk = false;
+                }
+                i += hit.consumed;
                 continue 'args;
             }
-        }
-        for name in ["until", "before"] {
-            if let Some(v) = long_opt_value(&argv, i, name) {
-                min_age = Some(approxidate(&v.value));
-                i += v.consumed;
-                continue 'args;
+            // `-n` with nothing after it is `error()` inside
+            // `handle_revision_opt()`, which `setup_revisions()` turns into the
+            // usage block for the verbs that have one; every other refusal here
+            // is a `die()`.
+            Some(Err(message)) if message.starts_with('-') => {
+                eprintln!("error: {message}");
+                return Ok(ExitCode::from(128));
             }
-        }
-        // ```c
-        // } else if ((argcount = parse_long_opt("since-as-filter", argv, &optarg))) {
-        //         revs->max_age_as_filter = approxidate(optarg);
-        //         return argcount;
-        // }
-        // ```
-        //
-        // (revision.c:2282-2285.) `revs->max_age_as_filter` reads the same clock as
-        // `--since` and takes the same `approxidate()` value, but it is applied
-        // where `--until` is — `limit_list()` skips the commit and keeps walking
-        // (revision.c:1446-1448) — instead of marking it UNINTERESTING. So an old
-        // commit drops out of the output without taking its ancestors' *newer*
-        // side of a merge with it, which is the whole point of the flag.
-        if let Some(v) = long_opt_value(&argv, i, "since-as-filter") {
-            max_age_as_filter = Some(approxidate(&v.value));
-            i += v.consumed;
-            continue 'args;
-        }
-        // `--max-age`/`--min-age` set the very same `revs->max_age`/`revs->min_age`
-        // as `--since`/`--until` (revision.c:2379-2393); only the value parser
-        // differs — [`super::log::parse_age`]'s raw epoch instead of
-        // `approxidate()`, so a value that is not a number is fatal rather than
-        // silently "now".
-        for name in ["max-age", "min-age"] {
-            let Some(v) = long_opt_value(&argv, i, name) else {
-                continue;
-            };
-            // `parse_long_opt()` (diff.c:5380-5399) dies when the detached form
-            // runs off the end of argv; [`long_opt_value`] answers with an empty
-            // string there, which is a *different* value git accepts as written.
-            if v.consumed == 2 && argv.get(i + 1).is_none() {
-                return Ok(fatal(&format!("Option '--{name}' requires a value")));
-            }
-            let Ok(age) = super::log::parse_age(&v.value) else {
-                return Ok(fatal(&format!(
-                    "'{}': not a number of seconds since epoch",
-                    v.value
-                )));
-            };
-            if name == "max-age" {
-                max_age = age;
-            } else {
-                min_age = age;
-            }
-            i += v.consumed;
-            continue 'args;
+            Some(Err(message)) => return Ok(fatal(&message)),
+            None => {}
         }
         match dispatch {
             "--count" => count_only = true,
@@ -1627,17 +1592,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     repo.object_hash().len_in_hex(),
                 ));
             }
-            "-n" => {
-                i += 1;
-                let Some(n) = argv.get(i) else {
-                    eprintln!("error: -n requires an argument");
-                    return Ok(ExitCode::from(128));
-                };
-                match parse_git_int(n) {
-                    Some(v) => max_count = clamp_count(v),
-                    None => return Ok(not_an_integer(n)),
-                }
-            }
             "--" => {
                 // Everything after `--` is a pathspec, never a rev or flag.
                 pathspecs.extend(argv[i + 1..].iter().map(|s| s.as_bytes().to_vec()));
@@ -1840,27 +1794,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     return Ok(fatal(&message));
                 }
             }
-            // `--skip=<n>` / `--skip <n>`: `revs->skip_count`. A negative count is
-            // git's "no skip" (its `>= 0` guard), and a non-numeral is
-            // `setup_revisions()`'s `die("'%s': not an integer")` rather than the
-            // usage block.
-            "--skip" => {
-                i += 1;
-                let Some(v) = argv.get(i) else {
-                    return Ok(usage_error());
-                };
-                match parse_git_int(v) {
-                    Some(n) => skip_count = n.max(0) as usize,
-                    None => return Ok(not_an_integer(v)),
-                }
-            }
-            s if s.starts_with("--skip=") => {
-                let v = &s["--skip=".len()..];
-                match parse_git_int(v) {
-                    Some(n) => skip_count = n.max(0) as usize,
-                    None => return Ok(not_an_integer(v)),
-                }
-            }
             // `if (revs.show_notes) die(_("rev-list does not support display of
             // notes"));` (builtin/rev-list.c) — every spelling that turns notes on
             // is fatal, and the ones that turn them off are accepted and inert.
@@ -1871,13 +1804,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 return Ok(fatal("rev-list does not support display of notes"));
             }
             "--no-notes" | "--no-standard-notes" => {}
-            s if s.starts_with("--max-count=") => {
-                let v = &s["--max-count=".len()..];
-                match parse_git_int(v) {
-                    Some(n) => max_count = clamp_count(n),
-                    None => return Ok(not_an_integer(v)),
-                }
-            }
             s if s.starts_with("--min-parents=") => {
                 let v = &s["--min-parents=".len()..];
                 match parse_git_int(v) {
@@ -1892,29 +1818,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     Some(n) => max_parents = if n < 0 { None } else { Some(n as usize) },
                     None => return Ok(not_an_integer(v)),
                 }
-            }
-            s if s.len() > 2
-                && s.starts_with("-n")
-                && s[2..].bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                match parse_git_int(&s[2..]) {
-                    Some(n) => max_count = clamp_count(n),
-                    None => return Ok(not_an_integer(&s[2..])),
-                }
-            }
-            // ```c
-            // } else if (*arg == '-' && isdigit(arg[1])) {
-            //         revs->max_count = atoi(arg + 1);
-            //         revs->no_walk = 0;
-            // ```
-            //
-            // (revision.c:2743-2746.) `atoi()` stops at the first non-digit and
-            // answers 0 rather than failing, so `-1x` is `-0`; only the second
-            // character has to be a digit for the branch to be taken at all.
-            s if s.len() > 1 && s.starts_with('-') && s.as_bytes()[1].is_ascii_digit() => {
-                let digits: String = s[1..].chars().take_while(char::is_ascii_digit).collect();
-                max_count = clamp_count(digits.parse::<i64>().unwrap_or(i64::MAX));
-                no_walk = false;
             }
             // Every remaining flag is one git knows and this does not; a
             // revision never starts with `-`, so anything left is a usage error.
@@ -2810,7 +2713,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if skip_count > 0 {
         commits.drain(..skip_count.min(commits.len()));
     }
-    if let Some(max) = max_count {
+    // `--max-count-oldest` keeps the *last* `max_count` commits of the walk, still
+    // in walk order (`retrieve_oldest_commits()`, revision.c:4596-4657), and
+    // `--skip` cannot accompany it (revision.c:2353-2355). The whole walk has to
+    // run, so no `abort` is short-circuited the way the head-limited form does.
+    if counts.max_count_oldest {
+        if let Some(max) = max_count {
+            let drop = commits.len().saturating_sub(max);
+            commits.drain(..drop);
+        }
+    } else if let Some(max) = max_count {
         // `cmd_rev_list()` stops calling `get_revision()` once the cap is spent, so
         // a walk whose remaining commits were all going to be dropped by the cap
         // never reaches the parent it cannot read: `git rev-list -n 1` over a

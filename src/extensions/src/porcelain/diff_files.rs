@@ -651,6 +651,9 @@ enum Fatal {
     DiffMergesValue(String),
     /// `error: -n requires an argument`, exit 128.
     MissingArgument(&'static str),
+    /// A `die()` raised inside `handle_revision_opt()`'s count-and-age arm,
+    /// already worded; exit 128. See [`crate::revopt`].
+    RevOptDie(String),
     /// `fatal: empty string is not a valid pathspec…`, exit 128.
     EmptyPathspec,
     /// `fatal: No such path '<p>' in the diff` from `--rotate-to`/`--skip-to`, exit 128.
@@ -776,6 +779,9 @@ impl Fatal {
             }
             Fatal::MissingArgument(flag) => {
                 let _ = writeln!(err, "error: {flag} requires an argument");
+            }
+            Fatal::RevOptDie(message) => {
+                let _ = writeln!(err, "fatal: {message}");
             }
             Fatal::EmptyPathspec => {
                 let _ = writeln!(err, "fatal: {}", crate::pathspec::empty_pathspec());
@@ -1030,9 +1036,15 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // not glued on with `=`, which parse-options consumes before anything else —
     // `--` included. This holds the flag still waiting for that value.
     let mut pending_value: Option<String> = None;
+    // Set when the word just read spent the following argv slot on its value;
+    // see the `revopt` arm below.
+    let mut consumed_next = false;
 
-    for a in args {
+    for (idx, a) in args.iter().enumerate() {
         let s = a.as_str();
+        if std::mem::take(&mut consumed_next) {
+            continue;
+        }
         if let Some(flag) = pending_value.take() {
             if flag == "-I" {
                 // `OPT_CALLBACK_F('I', "ignore-matching-lines", …)`: a required value,
@@ -1086,6 +1098,23 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             // both flag-validity (129) and per-value checks, so it is tested first.
             if seen_non_option {
                 return Err(Fatal::OptionAfterArg(s.to_owned()));
+            }
+            // `handle_revision_opt()`'s count-and-age arm, which
+            // `setup_revisions()` reaches for every word this table does not
+            // claim (builtin/diff-files.c:50). `diff-files` compares the index
+            // with the working tree and never walks, so all of these parse and
+            // then change nothing — the value checks and the argv arithmetic are
+            // the only observable part. `-1`/`-2`/`-3` are handled above as
+            // diff-files' own stage selectors, which is why `-01` is the shape
+            // that reaches here.
+            match crate::revopt::parse(args, idx) {
+                Some(Ok(hit)) => {
+                    consumed_next = hit.consumed == 2;
+                    continue;
+                }
+                Some(Err(_)) if s == "-n" => return Err(Fatal::MissingArgument("-n")),
+                Some(Err(message)) => return Err(Fatal::RevOptDie(message)),
+                None => {}
             }
             let fmt_before = opts.fmt;
             match classify(repo, s, &mut opts, &mut quiet)? {

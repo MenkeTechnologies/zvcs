@@ -351,7 +351,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `revs->max_count`: -1 (unlimited) in git; `None` here.
     let mut max_count: Option<usize> = None;
     // `-n <n>`: the count lives in the next argv slot.
-    let mut pending_max_count = false;
+    // `handle_revision_opt()`'s count-and-age state; see [`crate::revopt`].
+    let mut counts = crate::revopt::Counts::default();
+    // Set when the word just read spent the following argv slot on its value.
+    let mut consumed_next = false;
     // `--all`, `--branches`/`--tags`/`--remotes`, `--glob` and the `--exclude`
     // patterns they consume, slotted at the argument index they were written at
     // so their tips land where `setup_revisions()` pends them.
@@ -388,6 +391,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let args = &expanded[..];
 
     for (idx, a) in args.iter().enumerate() {
+        if std::mem::take(&mut consumed_next) {
+            continue;
+        }
         let s = a.as_str();
         // parse_options_step()'s `internal_help`. `git show` is `builtin/log.c`,
         // so the block it prints is `git log`'s — on stdout at 129.
@@ -442,13 +448,32 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             eprintln!("{line}");
             return Ok(ExitCode::from(129));
         }
-        if std::mem::take(&mut pending_max_count) {
-            match s.parse::<usize>() {
-                Ok(n) => max_count = Some(n),
-                Err(_) => crate::git_fatal!("'{s}': not an integer"),
+        // `handle_revision_opt()`'s count-and-age arm (revision.c:2341-2399),
+        // shared with every other walking verb. Each spelling takes its value
+        // attached or in the next argv slot (`parse_long_opt()`,
+        // diff.c:5380-5399); `consumed_next` is how this loop, which has no
+        // index of its own, skips that slot. See [`crate::revopt`].
+        match crate::revopt::parse(args, idx) {
+            Some(Ok(hit)) => {
+                if let Err(message) = counts.apply(hit.what) {
+                    crate::git_fatal!("{message}");
+                }
+                max_count = counts.max_count;
+                if counts.no_walk_cleared {
+                    no_walk = false;
+                }
+                consumed_next = hit.consumed == 2;
+                continue;
             }
-            no_walk = false;
-            continue;
+            // `-n` alone is `error()`, not `die()`; `trailing_option_missing_value`
+            // above already answered the end-of-argv case, so this is the `--`
+            // value slot.
+            Some(Err(message)) if message.starts_with('-') => {
+                eprintln!("error: {message}");
+                return Ok(ExitCode::from(128));
+            }
+            Some(Err(message)) => crate::git_fatal!("{message}"),
+            None => {}
         }
         if std::mem::take(&mut pending_line_range) {
             line_ranges.push(a.clone());
@@ -961,29 +986,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     no_walk = true;
                 } else if s == "--do-walk" {
                     no_walk = false;
-                // `--max-count=<n>` / `-<digit>` / `-n<n>` / `-n <n>`. Each of these
-                // clears `revs->no_walk` alongside setting `revs->max_count`
-                // (revision.c:2345-2346, 2366-2368, 2370-2374, 2376-2378), so
-                // `cmd_show` takes its `if (!rev.no_walk)` branch and runs
-                // `cmd_log_walk` (builtin/log.c:694-699) rather than its pending
-                // loop — `git show -2` is a two-commit walk, not one commit.
-                } else if let Some(v) = s
-                    .strip_prefix("--max-count=")
-                    .or_else(|| s.strip_prefix("-n").filter(|v| !v.is_empty()))
-                    .or_else(|| {
-                        s.strip_prefix('-')
-                            .filter(|v| !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()))
-                    })
-                {
-                    match v.parse::<usize>() {
-                        Ok(n) => max_count = Some(n),
-                        // `parse_count()` (revision.c) dies on a non-number.
-                        Err(_) => crate::git_fatal!("'{v}': not an integer"),
-                    }
-                    no_walk = false;
-                } else if s == "-n" {
-                    // `-n` takes the next argv slot (revision.c:2370-2374).
-                    pending_max_count = true;
                 // `--reverse` reverses what `cmd_log_walk` emits; `cmd_show`'s own
                 // pending loop never consults it, so it does nothing while
                 // `no_walk` stands.
@@ -1597,11 +1599,36 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             .then(|| crate::objname::reflog_spec_oid(&repo, spec))
             .flatten()
             .map(RevSpec::Include);
+        // `get_oid_with_context_1()`'s `:/<text>` arm walks every ref in commit-date
+        // order (`object-name.c:1763-1775`), which gitoxide's grammar answers
+        // differently whenever more than one commit matches — so that spelling is
+        // git's to resolve, not the fallback's.
+        let oneline = crate::objname::oneline_operand(spec).is_some();
         let parsed = match reflog {
             Some(parsed) => parsed,
+            _ if oneline => match crate::objname::resolve_quiet(&repo, spec) {
+                Some(id) => RevSpec::Include(id),
+                None => return Ok(bad_revision(&repo, spec, seen_dashdash)),
+            },
             None => match repo.rev_parse(BStr::new(spec)) {
                 Ok(p) => p.detach(),
-                Err(_) => return Ok(bad_revision(&repo, spec, seen_dashdash)),
+                // `repo_get_oid()`'s rewrites are wider than gitoxide's grammar:
+                // `@@{u}` and `@{-2}@{u}` are `reinterpret()`'s recursion and
+                // gitoxide refuses them outright. Asking [`crate::objname`] for
+                // the name gitoxide could not parse is what keeps `git show`
+                // level with `git log`.
+                // `get_oid_basic()` answers a full-length hex name without
+                // consulting the object database, so `resolve_quiet` says yes to
+                // an id nothing is stored under — which `get_reference()` then
+                // ends as `die("bad object %s")`, the message `bad_revision`
+                // already builds. Taking the fallback only for an object that is
+                // present leaves that path exactly where it was.
+                Err(_) => match crate::objname::resolve_quiet(&repo, spec)
+                    .filter(|id| repo.find_object(*id).is_ok())
+                {
+                    Some(id) => RevSpec::Include(id),
+                    None => return Ok(bad_revision(&repo, spec, seen_dashdash)),
+                },
             },
         };
         // ```c
@@ -2023,8 +2050,39 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // counter runs out, and `--reverse` reverses what survived that limit rather
         // than limiting the reversed stream (revision.c:4683-4692).
         let mut nodes = walked;
-        if let Some(n) = max_count {
-            nodes.truncate(n);
+        // `--since`/`--until`/`--max-age`/`--min-age`/`--since-as-filter` gate on
+        // the committer date. This walk never prunes, so all four cutoffs are
+        // applied to what it produced rather than to what it explores — the
+        // difference `--since-as-filter` exists to draw does not arise here.
+        if counts.max_age.is_some() || counts.min_age.is_some() || counts.max_age_as_filter.is_some()
+        {
+            let mut kept = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                let seconds = repo.find_commit(node.id)?.time()?.seconds;
+                let too_old = counts.max_age.is_some_and(|since| seconds < since)
+                    || counts
+                        .max_age_as_filter
+                        .is_some_and(|since| seconds < since);
+                let too_new = counts.min_age.is_some_and(|until| seconds > until);
+                if !too_old && !too_new {
+                    kept.push(node);
+                }
+            }
+            nodes = kept;
+        }
+        // `--max-count-oldest` keeps the *last* `max_count` commits of the walk,
+        // still in walk order (`retrieve_oldest_commits()`, revision.c:4596-4657),
+        // and `--skip` cannot accompany it (revision.c:2353-2355).
+        if counts.max_count_oldest {
+            if let Some(n) = max_count {
+                let drop = nodes.len().saturating_sub(n);
+                nodes.drain(..drop);
+            }
+        } else {
+            nodes.drain(..counts.skip.min(nodes.len()));
+            if let Some(n) = max_count {
+                nodes.truncate(n);
+            }
         }
         if reverse {
             nodes.reverse();
@@ -2046,6 +2104,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // one-entry walk it was set in, so a commit pended twice — the merge base
         // of `A...B` and the endpoint that names it, say — is walked once.
         let mut seen_pending: Vec<ObjectId> = Vec::new();
+        // `revs->skip_count`, spent inside `get_revision()` — the one-entry walk
+        // `cmd_show` runs per pending commit consults the same counter, so the
+        // skip is spread across the pending list rather than restarting at each
+        // entry. A pended tree or blob never reaches `get_revision()` and so
+        // never spends one.
+        let mut skip_left = counts.skip;
         for (spec, id) in &plain {
             let is_commit = repo.find_object(*id).is_ok_and(|o| o.kind == Kind::Commit);
             if is_commit {
@@ -2058,6 +2122,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
                 reverse_stage = reverse;
+                let seconds = repo.find_commit(*id)?.time()?.seconds;
+                let too_old = counts.max_age.is_some_and(|since| seconds < since)
+                    || counts
+                        .max_age_as_filter
+                        .is_some_and(|since| seconds < since);
+                if too_old || counts.min_age.is_some_and(|until| seconds > until) {
+                    continue;
+                }
+                if skip_left > 0 {
+                    skip_left -= 1;
+                    continue;
+                }
             }
             show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None)?;
         }

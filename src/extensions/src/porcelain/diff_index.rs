@@ -879,6 +879,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         };
     }
 
+    // `handle_revision_opt()`'s count-and-age state; only the three fields
+    // `builtin/diff-index.c:68-70` tests are read.
+    let mut counts = crate::revopt::Counts::default();
     let mut i = 0;
     while i < args.len() {
         let cur = i;
@@ -1506,6 +1509,33 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             s if s.len() > 2 && (s.starts_with("-S") || s.starts_with("-G")) => {
                 pickaxe_arg = Some((s.as_bytes()[1], s.as_bytes()[2..].to_vec()));
             }
+            // `handle_revision_opt()`'s count-and-age arm, which
+            // `setup_revisions()` reaches for every word this table does not
+            // claim (builtin/diff-index.c:46). `diff-index` parses them and then
+            // refuses the run — see the `pending != 1` gate below, which is
+            // git's `rev.max_count != -1 || rev.min_age != -1 || rev.max_age != -1`
+            // (builtin/diff-index.c:68-70). `--skip`, `--no-walk` and
+            // `--first-parent` are not in that test, so they are accepted and inert.
+            s if s.starts_with('-') && crate::revopt::parse(args, cur).is_some() => {
+                match crate::revopt::parse(args, cur) {
+                    Some(Ok(hit)) => {
+                        i = cur + hit.consumed;
+                        if let Err(message) = counts.apply(hit.what) {
+                            eprintln!("fatal: {message}");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
+                    Some(Err(message)) if message.starts_with('-') => {
+                        eprintln!("error: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    Some(Err(message)) => {
+                        eprintln!("fatal: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    None => unreachable!("guarded by the arm's own `is_some()`"),
+                }
+            }
             s => {
                 if render_only_option(s) {
                     // Ignored for the raw/name listings (their bytes are identical with
@@ -1861,7 +1891,19 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         eprintln!("{}", super::diff_optval::PICKAXE_ALL_OBJFIND_CONFLICT);
         return Ok(ExitCode::from(128));
     }
-    if pending != 1 {
+    // ```c
+    // if (rev.pending.nr != 1 ||
+    //     rev.max_count != -1 || rev.min_age != -1 || rev.max_age != -1)
+    //         usage(diff_cache_usage);
+    // ```
+    //
+    // (builtin/diff-index.c:68-70.) A count or an age that survived parsing is
+    // as fatal to this command as a second tree-ish, and reports the same block.
+    if pending != 1
+        || counts.max_count.is_some()
+        || counts.min_age.is_some()
+        || counts.max_age.is_some()
+    {
         eprint!("{}", USAGE);
         return Ok(ExitCode::from(129));
     }

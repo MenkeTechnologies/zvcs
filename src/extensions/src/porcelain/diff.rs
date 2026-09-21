@@ -1696,6 +1696,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // not glued on with `=`; parse-options consumes it before anything else, `--`
     // included. This holds the flag still waiting for that value.
     let mut pending_value: Option<String> = None;
+    // `handle_revision_opt()`'s count-and-age arm. `cmd_diff()` runs
+    // `setup_revisions()` over the whole command line (builtin/diff.c:536), so
+    // every one of those options parses here — and then changes nothing, because
+    // a two-tree diff never walks. Only the value checks are observable. Set when
+    // the word just read spent the following argv slot on its value.
+    let mut consumed_next = false;
 
     // `parse_short_opt()`'s character loop (parse-options.c:426-461) over the
     // diff table, so `-pw` is `-p -w`. A character the table does not claim
@@ -1706,6 +1712,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let args = &expanded[..];
 
     for (arg_idx, a) in args.iter().enumerate() {
+        if std::mem::take(&mut consumed_next) {
+            continue;
+        }
         if let Some(flag) = pending_value.take() {
             // `--` is not a value. `setup_revisions()` cuts the option region at
             // the separator before it parses a single option:
@@ -2474,6 +2483,28 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            // `handle_revision_opt()`'s count-and-age arm, which `setup_revisions()`
+            // reaches for every word `cmd_diff()`'s own scan left behind
+            // (builtin/diff.c:536). It must come ahead of the unknown-option arm
+            // below: none of these names is in [`KNOWN_LONG`], because they are
+            // not diff options at all.
+            s if s.starts_with('-') && crate::revopt::parse(args, arg_idx).is_some() => {
+                match crate::revopt::parse(args, arg_idx) {
+                    // Parsed and dropped: a two-tree diff never walks, so the
+                    // only observable part is the value check.
+                    Some(Ok(hit)) => consumed_next = hit.consumed == 2,
+                    // `-n` alone is `error()`, every other refusal a `die()`.
+                    Some(Err(message)) if message.starts_with('-') => {
+                        eprintln!("error: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    Some(Err(message)) => {
+                        eprintln!("fatal: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    None => unreachable!("guarded by the arm's own `is_some()`"),
+                }
+            }
             // A name git itself does not resolve is its usage error, not a gap here. The
             // report is deferred to after the loop because which of `cmd_diff`'s four
             // dispatch targets receives the leftover — and so whether the `error:` line
@@ -2688,12 +2719,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         );
                         return Ok(ExitCode::from(128));
                     }
-                    if std::fs::symlink_metadata(s).is_err() {
-                        eprintln!(
-                            "fatal: ambiguous argument '{s}': unknown revision or path not in the working tree."
-                        );
-                        eprintln!("Use '--' to separate paths from revisions, like this:");
-                        eprintln!("'git <command> [<revision>...] -- [<file>...]'");
+                    // `verify_filename(revs->prefix, argv[i], 1)` — the whole of
+                    // it, not an `lstat()`: `looks_like_pathspec()` lets a
+                    // wildcard or `:(…)` magic through without a stat, and
+                    // `die_verify_filename()` prefers
+                    // `maybe_die_on_misspelt_object_name()`'s message, which is
+                    // how `git diff nosuchref:f` reads
+                    // `fatal: invalid object name 'nosuchref'.` in stock 2.55.0.
+                    if let Some(message) =
+                        crate::objpath::verify_filename_fatal(&repo, s, true)
+                    {
+                        eprintln!("fatal: {message}");
                         return Ok(ExitCode::from(128));
                     }
                     in_rev_region = false;
@@ -5257,6 +5293,17 @@ fn rev_object<'r>(repo: &'r gix::Repository, spec: &str) -> Result<gix::Object<'
         if let Some(id) = crate::objname::reflog_oid(repo, spec) {
             return Ok(repo.find_object(id)?);
         }
+    }
+    // `repo_get_oid()` and not gitoxide's grammar, for the same reason the reflog
+    // branch above is here: `get_oid_basic()`'s rewrites are not gitoxide's.
+    // A bare `rev_parse_single()` here left `git diff @@{u}`, `git diff @{-2}@{u}`
+    // and `git diff @{push}@{0}` reporting gitoxide's parser error —
+    // `unconsumed input: "@{u}"` — where stock 2.55.0 diffs against the upstream.
+    // [`crate::objname::resolve_quiet`] rather than `resolve`, because the
+    // operand loop has already resolved this name once and `get_oid_basic()`
+    // warns once per resolution.
+    if let Some(id) = crate::objname::resolve_quiet(repo, spec) {
+        return Ok(repo.find_object(id)?);
     }
     Ok(repo.rev_parse_single(spec)?.object()?)
 }

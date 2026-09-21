@@ -877,6 +877,28 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 // `diff_opt_ignore_submodules()` with no value is `all`
                 // (`--ignore-submodules` is `PARSE_OPT_OPTARG`).
                 "--ignore-submodules" => opts.ignore_submodules = true,
+                // `handle_revision_opt()`'s count-and-age arm, which
+                // `setup_revisions()` reaches for every word this table does not
+                // claim (builtin/diff-tree.c:142). `diff-tree` diffs the trees
+                // `setup_revisions()` left pending and never walks, so all of
+                // these parse and then change nothing — but their values are
+                // still checked, and the separate form still eats the next slot,
+                // which is what made `git diff-tree -r HEAD --max-count 1` read
+                // the `1` as a tree-ish here.
+                _ if crate::revopt::parse(args, i).is_some() => {
+                    match crate::revopt::parse(args, i) {
+                        Some(Ok(hit)) => i += hit.consumed - 1,
+                        Some(Err(message)) if message.starts_with('-') => {
+                            eprintln!("error: {message}");
+                            return Ok(ExitCode::from(FATAL));
+                        }
+                        Some(Err(message)) => {
+                            eprintln!("fatal: {message}");
+                            return Ok(ExitCode::from(FATAL));
+                        }
+                        None => unreachable!("guarded by the arm's own `is_some()`"),
+                    }
+                }
                 // Rendered by `diff-pairs` further down; see [`needs_pairs`].
                 _ if needs_pairs(a) => {}
                 _ if is_ignorable(a) => {}

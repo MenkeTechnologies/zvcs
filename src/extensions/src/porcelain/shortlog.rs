@@ -126,6 +126,7 @@ use gix::traverse::commit::simple::CommitTimeOrder;
 
 use super::pretty_pad::{FlushType, PadState, WrapState};
 use crate::revfilter::{compile_patterns, Dialect};
+use super::diff_color;
 
 /// `cmd_shortlog()`'s `struct option options[]` (builtin/shortlog.c), in table
 /// order, as [`super::resolve_long`] reads it.
@@ -258,12 +259,12 @@ enum Order {
 struct Filters {
     min_parents: usize,
     max_parents: Option<usize>,
-    skip: usize,
-    max_count: Option<usize>,
     first_parent: bool,
     exclude_first_parent_only: bool,
-    since: Option<i64>,
-    until: Option<i64>,
+    /// `handle_revision_opt()`'s count-and-age fields, parsed by
+    /// [`crate::revopt`] so shortlog agrees with every other walking verb on the
+    /// spellings, the argv arithmetic and the conflict diagnostics.
+    counts: crate::revopt::Counts,
     grep: Vec<String>,
     author: Vec<String>,
     all_match: bool,
@@ -311,12 +312,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut filters = Filters {
         min_parents: 0,
         max_parents: None,
-        skip: 0,
-        max_count: None,
         first_parent: false,
         exclude_first_parent_only: false,
-        since: None,
-        until: None,
+        counts: crate::revopt::Counts::default(),
         grep: Vec::new(),
         author: Vec::new(),
         all_match: false,
@@ -549,20 +547,23 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
 
-            // Everything else is a revision-walk option. Options that take a
-            // value only exist in their `=<value>` spelling here; the bare form
-            // is not an option git knows.
+            // The count-and-age arm of `handle_revision_opt()`, which
+            // `parse_revision_opt()` reaches for every word shortlog's own table
+            // does not claim (builtin/shortlog.c:444). Every one of these takes
+            // its value attached *or* in the next argv slot, because
+            // `parse_long_opt()` (diff.c:5380-5399) accepts both.
+            match apply_count_opt(argv, i - 1, &mut filters) {
+                Some(Ok(consumed)) => {
+                    i += consumed - 1;
+                    argv_consumed = true;
+                    continue;
+                }
+                Some(Err(code)) => return Ok(code),
+                None => {}
+            }
+
+            // Everything else is a revision-walk option.
             match (name, value) {
-                ("max-count", Some(v)) => match int_arg(v) {
-                    // git's sentinel: a negative count means "unlimited".
-                    Ok(n) => filters.max_count = (n >= 0).then_some(n as usize),
-                    Err(code) => return Ok(code),
-                },
-                ("skip", Some(v)) => match int_arg(v) {
-                    // A negative skip skips nothing.
-                    Ok(n) => filters.skip = n.max(0) as usize,
-                    Err(code) => return Ok(code),
-                },
                 ("min-parents", Some(v)) => match int_arg(v) {
                     // A negative floor admits every commit, exactly like zero.
                     Ok(n) => filters.min_parents = n.max(0) as usize,
@@ -579,8 +580,51 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 ("no-merges", None) => filters.max_parents = Some(1),
                 ("first-parent", None) => filters.first_parent = true,
                 ("exclude-first-parent-only", None) => filters.exclude_first_parent_only = true,
-                ("since" | "after", Some(v)) => filters.since = Some(approxidate(v)),
-                ("until" | "before", Some(v)) => filters.until = Some(approxidate(v)),
+                // `handle_revision_opt()`'s last arm hands whatever it does not
+                // claim to `diff_opt_parse()` (revision.c:2720-2724), which is
+                // how the colour family reaches a command that renders no diff.
+                // Nothing shortlog prints is coloured, so each is accepted and
+                // inert — but the values are still checked, because
+                // `diff_opt_parse` checks them before anything is resolved.
+                ("color" | "no-color", None) => {}
+                ("color", Some(v)) => {
+                    if diff_color::parse_color_when(v).is_none() {
+                        eprintln!(
+                            "error: option `color' expects \"always\", \"auto\", or \"never\""
+                        );
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+                ("color-moved" | "no-color-moved", None) => {}
+                ("color-moved", Some(v)) => {
+                    if diff_color::parse_color_moved(v).is_none() {
+                        eprintln!(
+                            "error: color moved setting must be one of 'no', 'default', \
+                             'blocks', 'zebra', 'dimmed-zebra', 'plain'"
+                        );
+                        eprintln!("error: bad --color-moved argument: {v}");
+                        return Ok(ExitCode::from(129));
+                    }
+                }
+                ("color-words", _) => {}
+                // `revs->children` builds a child map and `--objects`/`--unpacked`
+                // widen the *object* walk; a commit tally reads neither, so all
+                // three are accepted and change nothing.
+                ("children" | "objects" | "unpacked", None) => {}
+                // `revision_opts_finish()`'s companion check in
+                // `setup_revisions()`: a reflog pattern with no reflog walk is
+                // refused before any revision is resolved, and shortlog runs the
+                // same `setup_revisions()` (builtin/shortlog.c:455). The walk
+                // itself is not ported, so only the refusal is answered here —
+                // `--walk-reflogs` still falls through to the deferred bail.
+                ("grep-reflog", _)
+                    if !argv
+                        .iter()
+                        .any(|w| w == "--walk-reflogs" || w == "-g" || w == "--reflog") =>
+                {
+                    eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
+                    return Ok(ExitCode::from(128));
+                }
                 ("author", Some(v)) => filters.author.push(v.to_string()),
                 ("grep", Some(v)) => filters.grep.push(v.to_string()),
                 ("all-match", None) => filters.all_match = true,
@@ -653,16 +697,19 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // `-<number>` is git's `--max-count` shorthand, not a short-option cluster.
+        // `-<digits>` is git's `--max-count` shorthand, not a short-option
+        // cluster. `isdigit(arg[1])` is the whole test (revision.c:2366), so
+        // `-1x` enters the arm and dies in `parse_count`.
         let body = &a[1..];
-        if body.bytes().all(|b| b.is_ascii_digit()) {
-            match int_arg(body) {
-                // `body` is all digits, so the parse is non-negative.
-                Ok(n) => filters.max_count = Some(n as usize),
-                Err(code) => return Ok(code),
+        if body.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            match apply_count_opt(argv, i - 1, &mut filters) {
+                Some(Ok(_)) => {
+                    argv_consumed = true;
+                    continue;
+                }
+                Some(Err(code)) => return Ok(code),
+                None => {}
             }
-            argv_consumed = true;
-            continue;
         }
 
         // Single-letter revision-walk options, which shortlog does not own.
@@ -712,7 +759,19 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     print!("{USAGE}");
                     return Ok(ExitCode::from(129));
                 }
-                _ => return Ok(unknown_option(a, argv_consumed)),
+                // `parse_options_step()` rewrites `ctx->argv[0]` to `-<rest of
+                // the cluster>` before returning PARSE_OPT_UNKNOWN, so what
+                // `parse_revision_opt()` sees for `-n2` is `-2`
+                // (builtin/shortlog.c:430-445). That is how `-n2` is both
+                // `--numbered` and `--max-count=2`.
+                _ => {
+                    let rest = format!("-{}", &body[off..]);
+                    match apply_count_opt(std::slice::from_ref(&rest), 0, &mut filters) {
+                        Some(Ok(_)) => break,
+                        Some(Err(code)) => return Ok(code),
+                        None => return Ok(unknown_option(a, argv_consumed)),
+                    }
+                }
             }
         }
         argv_consumed = true;
@@ -1046,7 +1105,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         } else {
             None
         };
-        if filters.boundary && (filters.skip != 0 || filters.max_count.is_some()) {
+        if filters.boundary && (filters.counts.skip != 0 || filters.counts.max_count.is_some()) {
             bail!("`--boundary` combined with `--skip`/`--max-count` is not ported");
         }
         // The pathspec set, parsed once for the whole walk by the shared engine —
@@ -1123,10 +1182,23 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             kept.extend(boundary_commits(&items).into_iter().map(|id| (id, None)));
         }
 
+        // `--max-count-oldest` keeps the *last* `max_count` commits of the walk,
+        // still in walk order: `retrieve_oldest_commits()` (revision.c:4596-4657)
+        // drains the walk through a two-list window and hands the survivors back
+        // in the order they were produced. `--skip` cannot accompany it
+        // (revision.c:2353-2355), so the two slices never compose.
+        let drop_front = match (filters.counts.max_count_oldest, filters.counts.max_count) {
+            (true, Some(max)) => kept.len().saturating_sub(max),
+            _ => filters.counts.skip,
+        };
         let selected = kept
             .into_iter()
-            .skip(filters.skip)
-            .take(filters.max_count.unwrap_or(usize::MAX));
+            .skip(drop_front)
+            .take(if filters.counts.max_count_oldest {
+                usize::MAX
+            } else {
+                filters.counts.max_count.unwrap_or(usize::MAX)
+            });
 
         let selected: Vec<(ObjectId, Option<Vec<ObjectId>>)> = selected.collect();
         // Reading each commit, applying the mailmap and expanding its record are
@@ -1252,6 +1324,29 @@ fn fatal_rev(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> Exit
 /// `0x10` do not), and a leading `-` is allowed. Failure is
 /// `fatal: '<value>': not an integer`, exit 128. Callers map git's negative
 /// sentinels (`--max-count=-1` → unlimited, `--skip=-1` → skip nothing, …).
+/// Run [`crate::revopt::parse`] over `argv[at]` and fold the result into
+/// `filters`, so shortlog reaches `handle_revision_opt()`'s count-and-age arm
+/// through the same code every other history-walking verb does.
+///
+/// `None` is "not one of those options". The `Err` is git's `die()`, which is
+/// always exit 128 — these run inside `parse_revision_opt()`, below
+/// parse-options' 129.
+fn apply_count_opt(argv: &[String], at: usize, filters: &mut Filters) -> Option<Result<usize, ExitCode>> {
+    let hit = match crate::revopt::parse(argv, at) {
+        None => return None,
+        Some(Err(message)) => {
+            eprintln!("fatal: {message}");
+            return Some(Err(ExitCode::from(128)));
+        }
+        Some(Ok(hit)) => hit,
+    };
+    if let Err(message) = filters.counts.apply(hit.what) {
+        eprintln!("fatal: {message}");
+        return Some(Err(ExitCode::from(128)));
+    }
+    Some(Ok(hit.consumed))
+}
+
 fn int_arg(value: &str) -> Result<i32, ExitCode> {
     value.parse::<i32>().map_err(|_| {
         eprintln!("fatal: '{value}': not an integer");
@@ -1689,14 +1784,22 @@ fn parent_count_matches(parents: usize, filters: &Filters) -> bool {
 
 /// git's `--since`/`--until` gate, applied to the commit timestamp.
 fn time_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> {
-    if filters.since.is_none() && filters.until.is_none() {
+    let c = &filters.counts;
+    if c.max_age.is_none() && c.min_age.is_none() && c.max_age_as_filter.is_none() {
         return Ok(true);
     }
     let seconds = commit.time()?.seconds;
-    if filters.since.is_some_and(|since| seconds < since) {
+    if c.max_age.is_some_and(|since| seconds < since) {
         return Ok(false);
     }
-    if filters.until.is_some_and(|until| seconds > until) {
+    // `revs->max_age_as_filter` is applied by `get_commit_action()` rather than
+    // `limit_list()`, so it hides a commit without hiding its ancestors. This
+    // walk already never prunes on `--since`, so here the two cutoffs differ
+    // only in that both can be in force at once.
+    if c.max_age_as_filter.is_some_and(|since| seconds < since) {
+        return Ok(false);
+    }
+    if c.min_age.is_some_and(|until| seconds > until) {
         return Ok(false);
     }
     Ok(true)

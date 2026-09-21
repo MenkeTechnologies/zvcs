@@ -859,6 +859,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
     let mut max_count: Option<usize> = None;
     let mut skip: usize = 0;
+    // `handle_revision_opt()`'s count-and-age state, shared with every other
+    // walking verb; the locals above are refreshed from it as each option lands.
+    let mut counts = crate::revopt::Counts::default();
     // ```c
     // static void cmd_log_init_defaults(struct rev_info *rev, struct log_config *cfg)
     // {
@@ -1329,27 +1332,40 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             eprintln!("{line}");
             return Ok(ExitCode::from(129));
         }
-        if a == "-n" || a == "--max-count" {
-            i += 1;
-            let v = args
-                .get(i)
-                .ok_or_else(|| anyhow!("option `{a}` requires a value"))?;
-            match parse_max_count(v) {
-                Ok(mc) => max_count = mc,
-                Err(()) => {
-                    eprintln!("fatal: '{v}': not an integer");
+        // `handle_revision_opt()`'s count-and-age arm (revision.c:2341-2399):
+        // `--max-count`, `--max-count-oldest`, `--skip`, `-<digits>`, `-n`, and
+        // the six date spellings, each of which takes its value attached or in
+        // the next argv slot. The spellings, the argv arithmetic and the two
+        // `die_for_incompatible_opt2()` conflicts are [`crate::revopt`]'s, so
+        // every walking verb answers them the same way.
+        match crate::revopt::parse(args, i) {
+            Some(Ok(hit)) => {
+                if let Err(message) = counts.apply(hit.what) {
+                    eprintln!("fatal: {message}");
                     return Ok(ExitCode::from(128));
                 }
+                max_count = counts.max_count;
+                skip = counts.skip;
+                since = counts.max_age;
+                until = counts.min_age;
+                since_as_filter = counts.max_age_as_filter;
+                i += hit.consumed;
+                continue;
             }
-        } else if let Some(v) = a.strip_prefix("--max-count=") {
-            match parse_max_count(v) {
-                Ok(mc) => max_count = mc,
-                Err(()) => {
-                    eprintln!("fatal: '{v}': not an integer");
-                    return Ok(ExitCode::from(128));
+            Some(Err(message)) => {
+                // `-n` with nothing after it is `error()`, not `die()`; every
+                // other refusal here is a `die()`. Both leave status 128 because
+                // `cmd_log_init()` turns the negative return into one.
+                if message.starts_with('-') {
+                    eprintln!("error: {message}");
+                } else {
+                    eprintln!("fatal: {message}");
                 }
+                return Ok(ExitCode::from(128));
             }
-        } else if a == "--decorate" {
+            None => {}
+        }
+        if a == "--decorate" {
             decorate = DecorateStyle::Short;
             decoration_given = true;
         } else if let Some(m) = a.strip_prefix("--decorate=") {
@@ -1459,26 +1475,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // Bare `--format` (no `=value`) is a git usage error, exit 128.
             eprintln!("fatal: unrecognized argument: --format");
             return Ok(ExitCode::from(128));
-        } else if a == "--skip" {
-            i += 1;
-            let v = args
-                .get(i)
-                .ok_or_else(|| anyhow!("option `{a}` requires a value"))?;
-            match parse_skip(v) {
-                Ok(n) => skip = n,
-                Err(()) => {
-                    eprintln!("fatal: '{v}': not an integer");
-                    return Ok(ExitCode::from(128));
-                }
-            }
-        } else if let Some(v) = a.strip_prefix("--skip=") {
-            match parse_skip(v) {
-                Ok(n) => skip = n,
-                Err(()) => {
-                    eprintln!("fatal: '{v}': not an integer");
-                    return Ok(ExitCode::from(128));
-                }
-            }
         } else if let Some(v) = a.strip_prefix("--date=") {
             match parse_date_mode(v) {
                 Some(m) => date_mode = m,
@@ -2095,62 +2091,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     reflog_pats.push(v.clone());
                 }
             }
-        // `--max-age`/`--min-age` set the very same `revs->max_age`/`revs->min_age`
-        // as `--since`/`--until` (revision.c:2379-2393); only the value parser
-        // differs — [`parse_age`]'s raw epoch instead of `approxidate()`. Both
-        // spellings take their value attached or as the next argv element, which is
-        // `parse_long_opt()` (diff.c:5380-5399), and a missing one is its
-        // `die("Option '--%s' requires a value")`.
-        } else if a == "--max-age"
-            || a == "--min-age"
-            || a.starts_with("--max-age=")
-            || a.starts_with("--min-age=")
-        {
-            let name = if a.starts_with("--max-age") { "max-age" } else { "min-age" };
-            let value = match a.split_once('=') {
-                Some((_, v)) => v.to_string(),
-                None => {
-                    i += 1;
-                    match args.get(i) {
-                        Some(v) => v.clone(),
-                        None => {
-                            eprintln!("fatal: Option '--{name}' requires a value");
-                            return Ok(ExitCode::from(128));
-                        }
-                    }
-                }
-            };
-            let Ok(age) = parse_age(&value) else {
-                eprintln!("fatal: '{value}': not a number of seconds since epoch");
-                return Ok(ExitCode::from(128));
-            };
-            if name == "max-age" {
-                since = age;
-            } else {
-                until = age;
-            }
-        // `revs->max_age_as_filter = approxidate(optarg)`: the same cutoff as
-        // `--since`, applied by `get_commit_action()` to each commit as it is about
-        // to be shown instead of by `limit_list()` to the walk — so an older commit
-        // hides itself without hiding its ancestors.
-        } else if let Some(v) = a.strip_prefix("--since-as-filter=") {
-            since_as_filter = Some(approxidate(v));
-        } else if a == "--since-as-filter" {
-            i += 1;
-            since_as_filter = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
-        } else if let Some(v) = a.strip_prefix("--since=").or_else(|| a.strip_prefix("--after=")) {
-            since = Some(approxidate(v));
-        } else if a == "--since" || a == "--after" {
-            i += 1;
-            since = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
-        } else if let Some(v) = a
-            .strip_prefix("--until=")
-            .or_else(|| a.strip_prefix("--before="))
-        {
-            until = Some(approxidate(v));
-        } else if a == "--until" || a == "--before" {
-            i += 1;
-            until = Some(approxidate(&args.get(i).cloned().unwrap_or_default()));
         } else if a == "-S" {
             i += 1;
             let v = args.get(i).cloned().unwrap_or_default();
@@ -2517,26 +2457,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             // `diff_opt_unified()` (diff.c:5961) ends in `enable_patch_output()`.
             patch = true;
-        } else if let Some(body) = a.strip_prefix('-') {
-            if let Some(num) = body.strip_prefix('n') {
-                // `-nN` shorthand (e.g. `-n5`).
-                match parse_max_count(num) {
-                    Ok(mc) => max_count = mc,
-                    Err(()) => {
-                        eprintln!("fatal: '{num}': not an integer");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
-            } else if !body.is_empty() && body.bytes().all(|c| c.is_ascii_digit()) {
-                // `-N` shorthand (e.g. `-5`): show N commits, so N is positive.
-                match parse_max_count(body) {
-                    Ok(mc) => max_count = mc,
-                    Err(()) => {
-                        eprintln!("fatal: '{body}': not an integer");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
-            } else if a == "--show-signature" {
+        } else if a.starts_with('-') {
+            // `-n<n>` and `-<digits>` were claimed by [`crate::revopt`] above.
+            if a == "--show-signature" {
                 show_signature = true;
             } else if a == "--no-show-signature" {
                 show_signature = false;
@@ -3496,7 +3419,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         && order == Order::Default;
     // A suppressed `whatchanged` record does not consume its `--max-count`, so the
     // walk cannot stop at `skip + max_count` commits there.
-    let budget = (unfiltered && max_count.is_some() && flavor != Flavor::WhatChanged)
+    let budget = (unfiltered
+        && max_count.is_some()
+        && !counts.max_count_oldest
+        && flavor != Flavor::WhatChanged)
         .then(|| skip.saturating_add(max_count.unwrap_or(0)));
     // `-g`: `get_revision_1()` calls `next_reflog_entry()` in place of popping the
     // frontier, so the list is the reflog entries themselves rather than anything
@@ -4671,17 +4597,30 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         let drop = skip.min(nodes.len());
         nodes.drain(0..drop);
     }
-    // `cmd_log_walk()` restores a `--max-count` slot spent on a commit that printed
-    // nothing (`if (!log_tree_commit(...)) rev->max_count++`), which only `whatchanged`
-    // can hit — `git log` always shows the header. The cap therefore moves to the
-    // render loop there, counting records actually printed.
-    let print_limit = match flavor {
-        Flavor::WhatChanged => max_count,
-        Flavor::Log | Flavor::Reflog => {
-            if let Some(limit) = max_count {
-                nodes.truncate(limit);
+    // `--max-count-oldest` keeps the *last* `max_count` commits of the walk, still
+    // in walk order: `retrieve_oldest_commits()` (revision.c:4596-4657) drains the
+    // walk with `revs->max_count` set back to -1 and hands the survivors on, so no
+    // cap is in force while they print — which is why `print_limit` stays `None`
+    // here for both flavors. `--skip` cannot accompany it (revision.c:2353-2355).
+    let print_limit = if counts.max_count_oldest {
+        if let Some(limit) = max_count {
+            let drop = nodes.len().saturating_sub(limit);
+            nodes.drain(0..drop);
+        }
+        None
+    } else {
+        // `cmd_log_walk()` restores a `--max-count` slot spent on a commit that printed
+        // nothing (`if (!log_tree_commit(...)) rev->max_count++`), which only `whatchanged`
+        // can hit — `git log` always shows the header. The cap therefore moves to the
+        // render loop there, counting records actually printed.
+        match flavor {
+            Flavor::WhatChanged => max_count,
+            Flavor::Log | Flavor::Reflog => {
+                if let Some(limit) = max_count {
+                    nodes.truncate(limit);
+                }
+                None
             }
-            None
         }
     };
     if reverse {
@@ -6334,73 +6273,6 @@ pub(crate) fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
         Some(n) => Ok(Some(n as usize)),
         None => Err(()),
     }
-}
-
-/// git's `parse_age()` (revision.c:2286-2296), the value parser behind
-/// `--max-age=`/`--min-age=`:
-///
-/// ```c
-/// static timestamp_t parse_age(const char *arg)
-/// {
-///         timestamp_t num;
-///         char *p;
-///
-///         errno = 0;
-///         num = parse_timestamp(arg, &p, 10);
-///         if (errno || *p || p == arg)
-///                 die("'%s': not a number of seconds since epoch", arg);
-///         return num;
-/// }
-/// ```
-///
-/// `parse_timestamp` is `strtoumax`, so the token is read **unsigned**: leading
-/// whitespace is skipped, an optional sign is accepted, and `-` negates by
-/// wrapping. Anything left over, an empty digit run, or an overflow (`ERANGE`) is
-/// the fatal.
-///
-/// `Ok(None)` is the one value that parses and still does nothing:
-/// `repo_init_revisions()` leaves `revs->max_age`/`revs->min_age` at `-1` and
-/// every reader tests against that sentinel, so `--max-age=-1` — which wraps to
-/// exactly `UINTMAX_MAX` — is indistinguishable from the option never having been
-/// given.
-pub(super) fn parse_age(arg: &str) -> Result<Option<i64>, ()> {
-    let b = arg.as_bytes();
-    let mut i = 0;
-    while i < b.len() && b[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    let negative = match b.get(i) {
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        _ => false,
-    };
-    let digits_at = i;
-    let mut num: u64 = 0;
-    while i < b.len() && b[i].is_ascii_digit() {
-        // `strtoumax` sets `ERANGE` rather than wrapping, and `parse_age` dies on it.
-        num = num
-            .checked_mul(10)
-            .and_then(|n| n.checked_add(u64::from(b[i] - b'0')))
-            .ok_or(())?;
-        i += 1;
-    }
-    // `p == arg` (nothing converted) and `*p` (trailing garbage), in that order.
-    if i == digits_at || i != b.len() {
-        return Err(());
-    }
-    let num = if negative { num.wrapping_neg() } else { num };
-    if num == u64::MAX {
-        return Ok(None);
-    }
-    // A bound past `i64::MAX` can only exclude every commit there is, which is what
-    // the saturating conversion leaves it doing.
-    Ok(Some(i64::try_from(num).unwrap_or(i64::MAX)))
 }
 
 /// A non-negative base-10 integer (`--min-parents`, `--max-parents`).

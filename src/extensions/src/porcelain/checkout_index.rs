@@ -523,11 +523,33 @@ fn checkout_entry(ctx: &mut Ctx<'_>, ents: &[Ent], idx: usize) -> Result<bool> {
                 }
                 return Ok(false);
             }
-            // git's `unlink_entry()`: drop what is in the way before rewriting.
+            // ```c
+            // if (S_ISDIR(st.st_mode)) {
+            //         /* If it is a gitlink, leave it alone! */
+            //         if (S_ISGITLINK(ce->ce_mode))
+            //                 return 0;
+            //         …
+            //         remove_subtree(&path);
+            // } else if (unlink(path.buf))
+            //         return error_errno("unable to unlink old '%s'", path.buf);
+            // ```
+            //
+            // (entry.c:557-577.) A directory in the way is emptied *recursively*
+            // — `remove_dir()` alone only ever removes an empty one, so a
+            // `path0/` holding a file survived and the create below failed with
+            // EEXIST where git overwrites. A gitlink entry keeps whatever
+            // directory is there and is reported as done.
             if md.is_dir() {
-                let _ = std::fs::remove_dir(&dest);
-            } else {
-                let _ = std::fs::remove_file(&dest);
+                if ents[idx].mode == Mode::COMMIT {
+                    return Ok(true);
+                }
+                remove_subtree(&dest)?;
+            } else if let Err(e) = std::fs::remove_file(&dest) {
+                eprintln!(
+                    "error: unable to unlink old '{}': {e}",
+                    display_path(ctx, &ents[idx].path)
+                );
+                return Ok(false);
             }
         }
         // Nothing there: `-n` means "refresh only", so skip creating it.
@@ -623,6 +645,7 @@ fn write_entry(ctx: &mut Ctx<'_>, ents: &[Ent], idx: usize, to_tempfile: bool) -
             // Without `--temp` and with real symlink support, the blob content is
             // the link target; otherwise the content lands in a regular file.
             if !to_tempfile && ctx.fs.symlink {
+                create_directories(ctx, &dest)?;
                 if let Err(e) = create_symlink(&dest, &target) {
                     eprintln!(
                         "error: unable to create symlink {}: {e}",
@@ -657,9 +680,7 @@ fn write_entry(ctx: &mut Ctx<'_>, ents: &[Ent], idx: usize, to_tempfile: bool) -
                 );
                 return Ok(false);
             }
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            create_directories(ctx, &dest)?;
             if std::fs::create_dir(&dest).is_err() {
                 eprintln!(
                     "error: cannot create submodule directory {}",
@@ -705,9 +726,7 @@ fn write_regular(
         }
     } else {
         let exec = ents[idx].mode == Mode::FILE_EXECUTABLE;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        create_directories(ctx, dest)?;
         match create_file(dest, exec, data) {
             Ok(()) => Ok(true),
             Err(e) => {
@@ -719,6 +738,97 @@ fn write_regular(
             }
         }
     }
+}
+
+/// ```c
+/// static void remove_subtree(struct strbuf *path)
+/// {
+///         DIR *dir = opendir(path->buf);
+///         …
+///         while ((de = readdir_skip_dot_and_dotdot(dir)) != NULL) {
+///                 …
+///                 if (S_ISDIR(st.st_mode))
+///                         remove_subtree(path);
+///                 else if (unlink(path->buf))
+///                         die_errno("cannot unlink '%s'", path->buf);
+///                 …
+///         }
+///         closedir(dir);
+///         if (rmdir(path->buf))
+///                 die_errno("cannot rmdir '%s'", path->buf);
+/// }
+/// ```
+///
+/// (entry.c:60-84.) Depth-first, symlinks unlinked rather than followed — which
+/// `remove_dir_all()` also guarantees — and every failure is fatal.
+fn remove_subtree(path: &Path) -> Result<()> {
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        crate::git_fatal!("cannot rmdir '{}': {e}", path.display());
+    }
+    Ok(())
+}
+
+/// ```c
+/// if (has_dirs_only_path(buf, len, state->base_dir_len))
+///         continue; /* ok, it is already a directory. */
+///
+/// if (mkdir(buf, 0777)) {
+///         if (errno == EEXIST && state->force &&
+///             !unlink_or_warn(buf) && !mkdir(buf, 0777))
+///                 continue;
+///         die_errno("cannot create directory at '%s'", buf);
+/// }
+/// ```
+///
+/// (`create_directories()`, entry.c:19-58.) Each leading component is made in
+/// turn, and under `--force` one that is *not* a directory — a symlink standing
+/// where a directory belongs, which is how `path3 -> path2` gets in the way —
+/// is unlinked and remade. `has_dirs_only_path()` tests the component with
+/// `lstat()` beyond `base_dir_len`, so a symlink to a directory does not count
+/// as one there; inside the `--prefix` it uses `stat()` and one does.
+/// `create_dir_all()` alone was happy to follow such a symlink and wrote the
+/// entry through it.
+fn create_directories(ctx: &Ctx<'_>, dest: &Path) -> Result<()> {
+    let Some(parent) = dest.parent() else {
+        return Ok(());
+    };
+    // Everything at or above the worktree root is git's business, not ours: it
+    // is `state->base_dir`'s own prefix, which git leaves to `mkdir` too.
+    let Ok(rel) = parent.strip_prefix(&ctx.workdir) else {
+        std::fs::create_dir_all(parent)?;
+        return Ok(());
+    };
+    // `base_dir_len` is a *byte* length, not a component count: `--prefix=tmp-`
+    // is four bytes, so the component `tmp-path1` (nine) lies beyond it and is
+    // tested with `lstat()`. Measuring in components would have put that whole
+    // component inside the prefix and followed the symlink standing there.
+    let base_dir_len = ctx.opts.base_dir.len();
+
+    let mut at = ctx.workdir.clone();
+    let mut so_far = 0usize;
+    for comp in rel.components() {
+        at.push(comp);
+        so_far += comp.as_os_str().len() + usize::from(so_far > 0);
+        let within_prefix = so_far <= base_dir_len;
+        let already_a_dir = match within_prefix {
+            true => std::fs::metadata(&at).map(|m| m.is_dir()).unwrap_or(false),
+            false => std::fs::symlink_metadata(&at).map(|m| m.is_dir()).unwrap_or(false),
+        };
+        if already_a_dir {
+            continue;
+        }
+        match std::fs::create_dir(&at) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && ctx.opts.force => {
+                if std::fs::remove_file(&at).is_ok() && std::fs::create_dir(&at).is_ok() {
+                    continue;
+                }
+                crate::git_fatal!("cannot create directory at '{}': {e}", at.display());
+            }
+            Err(e) => crate::git_fatal!("cannot create directory at '{}': {e}", at.display()),
+        }
+    }
+    Ok(())
 }
 
 /// git's `create_file()`: `O_CREAT|O_EXCL` with 0777 or 0666 so the umask applies.
@@ -744,9 +854,6 @@ fn create_file(path: &Path, _executable: bool, data: &[u8]) -> std::io::Result<(
 
 #[cfg(unix)]
 fn create_symlink(path: &Path, target: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     std::os::unix::fs::symlink(gix::path::from_byte_slice(target), path)
 }
 

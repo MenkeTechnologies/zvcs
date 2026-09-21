@@ -179,12 +179,60 @@ impl ZvcsConfig {
     }
 }
 
-/// The global+system config `git config` reads outside a repository:
-/// git-installation, system, and per-user (`~/.gitconfig`) files, with
-/// `GIT_CONFIG_*` environment overrides layered on top (highest precedence).
-/// Empty (never an error) when no such files exist.
+/// The global+system config `git config` reads outside a repository: system and
+/// per-user (`~/.gitconfig`) files, with `GIT_CONFIG_*` environment overrides
+/// layered on top (highest precedence). Empty (never an error) when no such
+/// files exist.
+///
+/// This is `File::from_globals()` minus its `Source::GitInstallation` scope, and
+/// with the system path derived by [`system_config_path`] rather than by
+/// `Source::System.storage_location()`. Both of those locate their file by
+/// running `git config -lz --show-origin --name-only`
+/// (gix-path/src/env/git/mod.rs:181), and the `git` they run is the one on
+/// `PATH` — which, for a shadow binary named `git`, is this process. The child
+/// then reaches this same function and spawns its own child, without bound.
+///
+/// [`config_file_sequence`] already carries that reasoning for the early gate,
+/// and [`system_config_path`] for the scope itself: `do_git_config_sequence()`
+/// (config.c:1547-1613) has no installation scope at all, so dropping it is not
+/// a compromise but the C behavior. This function is on the same footing — it is
+/// reached by `init`, by `git config` outside a repository, and by
+/// [`config_bool`] — and must obey the same no-subprocess rule.
+///
+/// Regression-tested by `config_file_refusals::the_early_gate_terminates_with_a_git_shim_on_path`,
+/// which puts a `git` shim on `PATH` and requires `git init -q --bare` to
+/// terminate.
 pub fn global_config() -> gix::config::File {
-    let mut file = gix::config::File::from_globals().unwrap_or_default();
+    use gix::config::Source;
+
+    let mut env = |name: &str| std::env::var_os(name);
+    let mut metas: Vec<gix::config::file::Metadata> = Vec::new();
+    let mut push = |path: Option<PathBuf>, source: Source, metas: &mut Vec<_>| {
+        // `from_globals()` keeps a `None` path for a scope whose file is absent,
+        // which `from_paths_metadata` then skips; matching that keeps the scope
+        // list identical in shape to the one this replaces.
+        let path = path.and_then(|p| p.is_file().then_some(p));
+        metas.push(gix::config::file::Metadata {
+            path,
+            source,
+            level: 0,
+            trust: gix::sec::Trust::Full,
+        });
+    };
+    push(system_config_path(&mut env), Source::System, &mut metas);
+    for source in [Source::Git, Source::User] {
+        push(source.storage_location(&mut env), source, &mut metas);
+    }
+
+    let home = gix::path::env::home_dir();
+    let options = gix::config::file::init::Options {
+        includes: gix::config::file::includes::Options::follow_without_conditional(home.as_deref()),
+        ..Default::default()
+    };
+    let mut file = gix::config::File::from_paths_metadata(metas, options)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     if let Ok(env) = gix::config::File::from_environment_overrides() {
         // `append` only errors on a malformed section header it just parsed from
         // the environment; ignore that and keep the good global read rather than

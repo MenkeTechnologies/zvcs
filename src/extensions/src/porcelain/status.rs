@@ -4161,10 +4161,17 @@ fn rebase_information(
             out.push_str(&h(&format!("   {line}\n")));
         }
         if done.len() > SHOWN && hints {
-            out.push_str(&h(&format!(
-                "  (see more in file {})\n",
-                git_dir.join("rebase-merge/done").display()
-            )));
+            // `status_printf_ln(s, color, _("  (see more in file %s)"),
+            // rebase_path_done())` (wt-status.c), whose path comes from
+            // `git_path()`. `setup_git_directory()` has already normalized
+            // `$GIT_DIR` by then, so git prints `.git/rebase-merge/done`; gix
+            // reports a discovered git directory as `./.git`, and that `./`
+            // reached the line.
+            let mut path = git_dir.join("rebase-merge/done").to_string_lossy().into_owned();
+            while let Some(rest) = path.strip_prefix("./") {
+                path = rest.to_string();
+            }
+            out.push_str(&h(&format!("  (see more in file {path})\n")));
         }
     }
     let todo = todo.unwrap_or_default();

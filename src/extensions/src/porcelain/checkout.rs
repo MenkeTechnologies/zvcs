@@ -1218,9 +1218,106 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // Multiple positionals, no `--`: if the first resolves to a tree-ish it is the
     // source and the rest are paths; otherwise all are paths from the index.
     if crate::objname::resolve_quiet(&repo, pre[0]).is_some() {
+        // ```c
+        // if (!has_dash_dash) {	/* case (3).(d) -> (1) */
+        //         /*
+        //          * Do not complain the most common case
+        //          *	git checkout branch
+        //          * even if there happen to be a file called 'branch';
+        //          * it would be extremely annoying.
+        //          */
+        //         if (argc)
+        //                 verify_non_filename(prefix, arg);
+        // }
+        // ```
+        //
+        // (`parse_branchname_arg()`, builtin/checkout.c.) The exemption is for a
+        // *lone* operand; once paths follow it, a leading operand that is also a
+        // file on disk is ambiguous and `verify_non_filename()` (setup.c) dies.
+        // Without it `git checkout world all` silently restored `all` out of the
+        // branch `world` where git refuses, and the refusal is position-aware:
+        // from a subdirectory `world` names no file there, so the same command
+        // goes through.
+        if let Some(code) = verify_non_filename(&repo, pre[0]) {
+            return Ok(code);
+        }
         return restore_from_tree(&repo, pre[0], &pre[1..], overlay, true, quiet, ignore_skipworktree);
     }
     restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree)
+}
+
+/// ```c
+/// void verify_non_filename(const char *prefix, const char *arg)
+/// {
+///         if (!is_inside_work_tree() || is_inside_git_dir())
+///                 return;
+///         if (*arg == '-')
+///                 return; /* flag */
+///         if (!check_filename(prefix, arg))
+///                 return;
+///         die(_("ambiguous argument '%s': both revision and filename\n"
+///               "Use '--' to separate paths from revisions, like this:\n"
+///               "'git <command> [<revision>...] -- [<file>...]'"), arg);
+/// }
+/// ```
+///
+/// (setup.c.) `Some(code)` is that `die()`; `None` means the operand is safe to
+/// read as a revision.
+fn verify_non_filename(repo: &gix::Repository, arg: &str) -> Option<ExitCode> {
+    if repo.workdir().is_none() || arg.starts_with('-') || !check_filename(repo, arg) {
+        return None;
+    }
+    eprintln!(
+        "fatal: ambiguous argument '{arg}': both revision and filename\n\
+         Use '--' to separate paths from revisions, like this:\n\
+         'git <command> [<revision>...] -- [<file>...]'"
+    );
+    Some(ExitCode::from(128))
+}
+
+/// ```c
+/// int check_filename(const char *prefix, const char *arg)
+/// {
+///         …
+///         if (skip_prefix(arg, ":/", &arg)) {
+///                 if (!*arg) /* ":/" is root dir, always exists */
+///                         return 1;
+///                 prefix = NULL;
+///         } else if (skip_prefix(arg, ":!", &arg) ||
+///                    skip_prefix(arg, ":^", &arg)) {
+///                 if (!*arg) /* excluding everything is silly, but allowed */
+///                         return 1;
+///         }
+///
+///         if (prefix)
+///                 arg = to_free = prefix_filename(prefix, arg);
+///
+///         if (!lstat(arg, &st)) { … return 1; /* file exists */ }
+///         if (is_missing_file_error(errno)) { … return 0; }
+///         die_errno(_("failed to stat '%s'"), arg);
+/// }
+/// ```
+///
+/// (setup.c.) `lstat()`, so a dangling symlink still counts as a file. git runs
+/// with the worktree root as its directory and joins `prefix`; here the process
+/// is already in the subdirectory, so a plain relative path needs no join —
+/// except after `:/`, which drops the prefix and means the worktree root.
+fn check_filename(repo: &gix::Repository, arg: &str) -> bool {
+    let (rest, from_root) = match arg.strip_prefix(":/") {
+        Some(rest) => (rest, true),
+        None => match arg.strip_prefix(":!").or_else(|| arg.strip_prefix(":^")) {
+            Some(rest) => (rest, false),
+            None => (arg, false),
+        },
+    };
+    if rest.is_empty() && rest.len() != arg.len() {
+        return true;
+    }
+    let path = match from_root {
+        true => repo.workdir().map(|w| w.join(rest)),
+        false => Some(std::path::PathBuf::from(rest)),
+    };
+    path.is_some_and(|p| std::fs::symlink_metadata(p).is_ok())
 }
 
 /// What an object name means to the checkout family once it has been resolved

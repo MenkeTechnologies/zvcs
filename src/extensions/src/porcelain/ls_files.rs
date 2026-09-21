@@ -880,6 +880,12 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut lines: Vec<Vec<u8>> = Vec::new();
+    // git's `ps_matched`, the per-pathspec-element "this one matched something"
+    // array `report_path_error()` reads for `--error-unmatch`. Only the entries a
+    // `show_*` actually printed set it, so it has to be filled from *both* the
+    // directory walk and the index pass — and from neither when the listing does
+    // not reach them.
+    let mut matched: HashSet<usize> = HashSet::new();
 
     // Phase 1: the directory walk, exactly as git emits it before touching the
     // index — every `? ` line first (`show_other_files`), then every `K ` line
@@ -900,13 +906,31 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                 .iter()
                 .map(|(path, is_dir)| {
                     if opts.directory {
-                        collapse_other_directory(&index, path.as_bstr(), *is_dir)
+                        collapse_other_directory(&index, ps.search(), path.as_bstr(), *is_dir)
                     } else {
                         (path.clone(), *is_dir)
                     }
                 })
                 .collect();
-            candidates.sort();
+            // ```c
+            // static int cmp_dir_entry(const void *p1, const void *p2)
+            // {
+            //         const struct dir_entry *e1 = *(const struct dir_entry **)p1;
+            //         const struct dir_entry *e2 = *(const struct dir_entry **)p2;
+            //
+            //         return name_compare(e1->name, e1->len, e2->name, e2->len);
+            // }
+            // ```
+            //
+            // (dir.c.) The names `QSORT(dir->entries, ...)` orders are the ones
+            // `dir_add_name()` stored, and a directory's was stored *with* its
+            // trailing `/` — `treat_directory()` pushes the slash onto the path
+            // before adding it. So the slash takes part in the comparison, and
+            // `path2-junk` sorts before `path2/` because `-` (0x2D) is below `/`
+            // (0x2F), while the bare names would put `path2` first. Sorting the
+            // slashless form is a different order whenever a sibling's name
+            // begins with a byte between `.` and `/`.
+            candidates.sort_by(|a, b| dir_entry_name(a).cmp(&dir_entry_name(b)));
             candidates.dedup();
 
             // `DIR_HIDE_EMPTY_DIRECTORIES` (`--no-empty-directory`). A collapsed
@@ -969,10 +993,35 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
                 })
                 .collect();
 
+            // ```c
+            // static int dir_path_match(struct index_state *istate, const struct dir_entry *ent,
+            //                           const struct pathspec *pathspec, int prefix, char *seen)
+            // {
+            //         int has_trailing_dir = ent->len && ent->name[ent->len - 1] == '/';
+            //         int len = has_trailing_dir ? ent->len - 1 : ent->len;
+            //         return match_pathspec(istate, pathspec, ent->name, len, prefix, seen, has_trailing_dir);
+            // }
+            // ```
+            //
+            // (builtin/ls-files.c.) `show_dir_entry()` runs this for every line it
+            // prints, and that is the *only* thing that sets `ps_matched` for a
+            // `-o`/`-k` listing: the trailing `/` is dropped and re-offered as the
+            // `is_dir` flag.
+            let mut mark = |ps: &mut gix::Pathspec<'_>, name: &BStr| {
+                let is_dir = name.last() == Some(&b'/');
+                let bare = if is_dir { &name[..name.len() - 1] } else { &name[..] };
+                if let Some(m) = ps.pattern_matching_relative_path(bare.as_bstr(), Some(is_dir)) {
+                    if !m.is_excluded() {
+                        matched.insert(m.sequence_number);
+                    }
+                }
+            };
+
             if opts.others {
                 // `show_other_files` drops anything the index already knows under
                 // that name; `show_killed_files` below deliberately does not.
                 for name in entries.iter().filter(|n| index_name_is_other(&index, n.as_bstr())) {
+                    mark(&mut ps, name.as_bstr());
                     let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
                     lines.push(render(
                         &opts,
@@ -989,6 +1038,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
             if opts.killed {
                 for name in entries.iter().filter(|n| is_killed(&index, n.as_bstr())) {
+                    mark(&mut ps, name.as_bstr());
                     let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
                     lines.push(render(
                         &opts,
@@ -1008,12 +1058,23 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
 
     // Phase 2: one pass over the index; each entry can contribute a cached line,
     // a deleted line, and a modified line, in that order.
-    let mut matched: HashSet<usize> = HashSet::new();
+    // ```c
+    // if (!(show_cached || show_stage || show_deleted || show_modified))
+    //         return;
+    // ```
+    //
+    // (`show_files()`, builtin/ls-files.c:417-418.) A pure `-o`/`-k` listing never
+    // walks the index at all — which is what keeps a pathspec naming a *tracked*
+    // path from satisfying `--error-unmatch` there: `git ls-files -o
+    // --error-unmatch tracked-file` is an error, because only `show_ce()` would
+    // have marked it and `show_ce()` is never reached.
+    let scans_index = opts.cached || opts.stage || opts.deleted || opts.modified;
     // git's `is_submodule_active` gate on the gitlink entries `--recurse-submodules`
     // descends into. Resolved once per repository, as `.gitmodules` cannot change
     // mid-listing.
     let active = active_submodules(&repo, &opts);
-    for entry in index.entries() {
+    let index_entries: &[gix::index::Entry] = if scans_index { index.entries() } else { &[] };
+    for entry in index_entries {
         let path = entry.path(&index);
         // git's `show_ce` swaps an active submodule's own line for the listing of
         // that submodule's index *before* it consults the pathspec, which is what
@@ -1858,6 +1919,150 @@ fn index_has_directory(index: &gix::index::State, dir: &[u8]) -> bool {
         .is_some_and(|e| e.path(index).as_bytes().starts_with(&probe))
 }
 
+/// The name `dir_add_name()` stored for one walked entry: a directory carries
+/// the trailing `/` that `treat_directory()` appended before adding it, and that
+/// slash is part of every comparison `cmp_dir_entry()` makes (dir.c).
+fn dir_entry_name((path, is_dir): &(BString, bool)) -> BString {
+    let mut name = path.clone();
+    if *is_dir {
+        name.push(b'/');
+    }
+    name
+}
+
+/// git's `MATCHED_*` ladder (dir.h:388-391). `do_match_pathspec()` keeps the
+/// *largest* verdict across the pathspec items (`if (retval < how) retval = how`,
+/// dir.c:575-576), so the constants' order is part of the semantics.
+const MATCHED_RECURSIVELY: u8 = 1;
+const MATCHED_RECURSIVELY_LEADING_PATHSPEC: u8 = 2;
+const MATCHED_FNMATCH: u8 = 3;
+const MATCHED_EXACTLY: u8 = 4;
+
+/// `simple_length()` (pathspec.c): the byte count before the first glob-special
+/// character, which `init_pathspec_item()` stores as `item->nowildcard_len`. A
+/// `:(literal)` pathspec has no wildcards at all, so the whole path counts.
+fn nowildcard_len(pat: &gix::pathspec::Pattern) -> usize {
+    if pat.search_mode == gix::pathspec::SearchMode::Literal {
+        return pat.path().len();
+    }
+    pat.path()
+        .iter()
+        .position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
+        .unwrap_or_else(|| pat.path().len())
+}
+
+/// `match_pathspec_item()` (dir.c:387-489) for one item, under the flags
+/// `treat_directory()` passes — `DO_MATCH_LEADING_PATHSPEC` and nothing else
+/// (dir.c:1999-2005), so the `DO_MATCH_DIRECTORY` arm is out of reach. `name` is
+/// the repository-relative directory path *with* its trailing `/`, which is what
+/// `treat_path()` hands down, and `prefix` is 0 for this call.
+///
+/// `git_fnmatch()` runs `wildmatch()` without `WM_PATHNAME` unless the item
+/// carries `:(glob)` magic (dir.c's `git_fnmatch`, pathspec's `PATHSPEC_GLOB`),
+/// so a plain `*` crosses `/`. Its `PATHSPEC_ONESTAR` shortcut — a single `*`
+/// with no wildcard after it, compared as a suffix — reaches the same verdict as
+/// the `wildmatch()` it stands in for, so only the general path is ported.
+fn pathspec_item_how(pat: &gix::pathspec::Pattern, name: &[u8]) -> u8 {
+    // `if (!*match) return MATCHED_RECURSIVELY;` — "the match was just the prefix".
+    if pat.always_matches() || pat.path().is_empty() {
+        return MATCHED_RECURSIVELY;
+    }
+    let m: &[u8] = pat.path();
+    let matchlen = m.len();
+    let namelen = name.len();
+    let icase = pat.signature.contains(gix::pathspec::MagicSignature::ICASE);
+    let eq = |a: &[u8], b: &[u8]| {
+        if icase {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+
+    if matchlen <= namelen && eq(m, &name[..matchlen]) {
+        if matchlen == namelen {
+            return MATCHED_EXACTLY;
+        }
+        if m[matchlen - 1] == b'/' || name[matchlen] == b'/' {
+            return MATCHED_RECURSIVELY;
+        }
+    }
+
+    let nowild = nowildcard_len(pat);
+    if nowild < matchlen {
+        let mode = match pat.search_mode {
+            gix::pathspec::SearchMode::PathAwareGlob => {
+                gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL
+            }
+            _ => gix::glob::wildmatch::Mode::empty(),
+        } | if icase {
+            gix::glob::wildmatch::Mode::IGNORE_CASE
+        } else {
+            gix::glob::wildmatch::Mode::empty()
+        };
+        if gix::glob::wildmatch(m.as_bstr(), name.as_bstr(), mode) {
+            return MATCHED_FNMATCH;
+        }
+    }
+
+    // ```c
+    // /* name is a literal prefix of the pathspec */
+    // int offset = name[namelen-1] == '/' ? 1 : 0;
+    // if ((namelen < matchlen) && (match[namelen-offset] == '/') &&
+    //     !ps_strncmp(item, match, name, namelen))
+    //         return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
+    // ```
+    //
+    // (dir.c:457-464.) This is the verdict that makes `treat_directory()` recurse
+    // rather than collapse: the pathspec names something strictly below `name`.
+    let offset = usize::from(name.last() == Some(&b'/'));
+    if namelen < matchlen && m.get(namelen - offset) == Some(&b'/') && eq(&m[..namelen], name) {
+        return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
+    }
+
+    // `ps_strncmp(item, match, name, item->nowildcard_len - prefix)`: a `strncmp`,
+    // so a `name` shorter than the fixed prefix stops at its NUL and mismatches.
+    if nowild < matchlen {
+        if namelen < nowild || !eq(&m[..nowild], &name[..nowild]) {
+            return 0;
+        }
+        // "Here is where we would perform a wildmatch to check if name can be
+        // matched as a directory (or a prefix) against the pathspec. Since
+        // wildmatch doesn't have this capability at the present we have to punt
+        // and say that it is a match, potentially returning a false positive."
+        return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
+    }
+    0
+}
+
+/// `match_pathspec_with_flags(..., DO_MATCH_LEADING_PATHSPEC)` as
+/// `treat_directory()` calls it (dir.c:1999-2005): the strongest verdict any
+/// positive item reaches, or `MATCHED_RECURSIVELY` when there is no pathspec at
+/// all (`if (!ps->nr) return MATCHED_RECURSIVELY`, dir.c:530-534).
+///
+/// The negative (`:(exclude)`) pass is not repeated here: this verdict is only
+/// consulted to decide *how deep* to collapse a directory that the listing has
+/// already kept, and the exclude pass can only turn a kept path into a dropped
+/// one, which the per-entry filter does on its own.
+fn pathspec_how(search: &gix::pathspec::Search, name: &[u8]) -> u8 {
+    let mut retval = 0u8;
+    let mut any = false;
+    for pat in search.patterns() {
+        if pat.is_excluded() {
+            continue;
+        }
+        any = true;
+        let how = pathspec_item_how(pat, name);
+        if how > retval {
+            retval = how;
+        }
+    }
+    if !any {
+        return MATCHED_RECURSIVELY;
+    }
+    retval
+}
+
 /// git's `treat_directory` under `DIR_SHOW_OTHER_DIRECTORIES` (`--directory`): a
 /// walked path is reported as the outermost of its parent directories the index
 /// knows nothing below. A directory the index does have entries under is recursed
@@ -1865,6 +2070,7 @@ fn index_has_directory(index: &gix::index::State, dir: &[u8]) -> bool {
 /// `a/b/c.txt` is still tracked — even when that tracked file is gone from disk.
 fn collapse_other_directory(
     index: &gix::index::State,
+    search: &gix::pathspec::Search,
     path: &BStr,
     is_dir: bool,
 ) -> (BString, bool) {
@@ -1873,6 +2079,29 @@ fn collapse_other_directory(
     while let Some(off) = bytes[at..].iter().position(|&b| b == b'/') {
         let cut = at + off;
         if index_has_directory(index, &bytes[..cut]) {
+            at = cut + 1;
+            continue;
+        }
+        // ```c
+        // /*
+        //  * If we have a pathspec which could match something _below_ this
+        //  * directory (e.g. when checking 'subdir/' having a pathspec like
+        //  * 'subdir/some/deep/path/file' or 'subdir/widget-*.c'), then we
+        //  * need to recurse.
+        //  */
+        // if (matches_how == MATCHED_RECURSIVELY_LEADING_PATHSPEC)
+        //         return path_recurse;
+        // ```
+        //
+        // (`treat_directory()`, dir.c:2074-2081.) `--directory` collapses a wholly
+        // untracked directory only where the pathspec is satisfied *by the
+        // directory*; where it names something strictly below, the walk keeps
+        // descending — which is why `ls-files -o --directory untracked/deep/`
+        // reports `untracked/deep/` rather than `untracked/`. The name carries its
+        // trailing `/` because that is the form `treat_path()` passes down.
+        let mut dirname = bytes[..cut].to_vec();
+        dirname.push(b'/');
+        if pathspec_how(search, &dirname) == MATCHED_RECURSIVELY_LEADING_PATHSPEC {
             at = cut + 1;
             continue;
         }

@@ -31,7 +31,9 @@
 //!   anything else is `fatal: Bad command: <line>` with exit 128. Trailing
 //!   whitespace is stripped from each line first, so a bare `connect` (no
 //!   service argument) is a bad command, as it is for git.
-//! * the bidirectional transfer loop itself: two threads, a 65536-byte buffer
+//! * the bidirectional transfer loop itself — [`bidirectional_transfer_loop`],
+//!   which `remote-ext` calls too, exactly as both C builtins call the one
+//!   `transport-helper.c` function: two threads, a 65536-byte buffer
 //!   each, stdin → `<outfd>` and `<infd>` → stdout, with EOF on a source
 //!   flushing the buffer and then closing the destination — or, when the two
 //!   descriptors are the same fd, shutting down only its write half, so the peer
@@ -47,11 +49,6 @@
 //!
 //! ### Honest limitations
 //!
-//! * On a read/write failure git prints `error: read(remote input) failed: <s>`
-//!   where `<s>` is `strerror(errno)`; this prints Rust's `io::Error` rendering,
-//!   which appends ` (os error N)` to the same text. Only that stderr diagnostic
-//!   differs — the exit code, the subsequent `error: … thread failed` line, and
-//!   the final `fatal:` line all match.
 //! * The command line is read one byte at a time straight from descriptor 0
 //!   rather than through a buffered reader. git uses `fgets`, whose stdio buffer
 //!   could in principle swallow payload bytes that the transfer loop then never
@@ -144,8 +141,8 @@ fn command_loop(input_fd: RawFd, output_fd: RawFd) -> Result<ExitCode> {
             Err(_) => return Ok(die("Input error")),
         };
 
-        // "Strip end of line characters." — C's isspace(), from the tail.
-        while line.last().is_some_and(|&b| is_c_space(b)) {
+        // "Strip end of line characters." — git's isspace(), from the tail.
+        while line.last().is_some_and(|&b| is_git_space(b)) {
             line.pop();
         }
 
@@ -222,7 +219,7 @@ fn read_command() -> std::io::Result<Option<Vec<u8>>> {
 ///
 /// Neither task closes its source, and the threads are joined in creation order,
 /// both as in the original.
-fn bidirectional_transfer_loop(input: RawFd, output: RawFd) -> bool {
+pub(crate) fn bidirectional_transfer_loop(input: RawFd, output: RawFd) -> bool {
     let same = input == output;
 
     let gtp = std::thread::spawn(move || {
@@ -290,7 +287,7 @@ fn copy_task(t: Transfer) -> bool {
                 Ok(n) => bufuse += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    eprintln!("error: read({}) failed: {e}", t.src_name);
+                    eprintln!("error: read({}) failed: {}", t.src_name, strerror(&e));
                     return false;
                 }
             }
@@ -305,7 +302,7 @@ fn copy_task(t: Transfer) -> bool {
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => {
-                    eprintln!("error: write({}) failed: {e}", t.dest_name);
+                    eprintln!("error: write({}) failed: {}", t.dest_name, strerror(&e));
                     return false;
                 }
             }
@@ -329,13 +326,34 @@ fn copy_task(t: Transfer) -> bool {
     }
 }
 
+/// The bare `strerror()` text, without Rust's ` (os error N)` suffix, so the
+/// diagnostics read exactly like git's `error_errno()` output.
+pub(crate) fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.find(" (os error ") {
+        Some(at) => text[..at].to_string(),
+        None => text,
+    }
+}
+
 /// `die(msg)` — `fatal: <msg>` on stderr, exit 128.
 fn die(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
 }
 
-/// C's `isspace()` in the default locale.
+/// git's `isspace()`, which is **not** the C library's: `sane-ctype.h:40`
+/// redefines it as `sane_istest(x, GIT_SPACE)`, and `ctype.c`'s table marks only
+/// 0x09, 0x0a, 0x0d and 0x20 with `GIT_SPACE` (row `0.. 15` is
+/// `X, X, X, X, X, X, X, X, X, Z, Z, X, X, Z, X, X`). A vertical tab or a form
+/// feed is therefore *not* stripped from a helper command line, which is why
+/// `capabilities\v` is `Bad command` for stock git.
+pub(crate) fn is_git_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// C's `isspace()` in the default locale — what the real `strtoul(3)` skips over,
+/// and so, unlike [`is_git_space`], it does include `\v` and `\f`.
 fn is_c_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
 }

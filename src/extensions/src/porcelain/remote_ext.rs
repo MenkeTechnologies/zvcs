@@ -12,8 +12,10 @@
 //!     exit 129.
 //!   * any argument count other than 3 (`remote-ext`, `<remote>`, `<url>`) → the
 //!     same usage line on **stderr**, exit 129.
-//!   * the command loop: lines are read with git's 4094-byte `fgets` cap and have
-//!     *all* trailing whitespace stripped (`isspace`, `\v` included), then
+//!   * the command loop: lines are read with git's 4094-byte `fgets` cap, are
+//!     truncated at an embedded NUL (the C buffer is a C string) and have
+//!     trailing whitespace stripped with *git's* `isspace` — space, tab, LF and
+//!     CR only, so a trailing `\v` or `\f` is a `Bad command` — then
 //!       - `capabilities` → `*connect\n\n` on stdout, loop again;
 //!       - `connect <service>` → `\n` on stdout, then run the child;
 //!       - anything else → `Bad command` on stderr (no newline), exit 1;
@@ -26,21 +28,27 @@
 //!     child's stdin: a pkt-line holding `<service> SP <repo> NUL`, plus
 //!     `host=<vhost> NUL` when `%V` was given.
 //!   * `GIT_EXT_SERVICE` / `GIT_EXT_SERVICE_NOPREFIX` in the child's environment.
-//!   * the bidirectional copy loop: our stdin → child stdin (closed on EOF) and
-//!     child stdout → our stdout, concurrently, with the child's stderr inherited.
-//!   * exit codes: the child's own status; 128 + signal when it dies of one;
+//!   * the bidirectional copy loop — `bidirectional_transfer_loop(child.out,
+//!     child.in)`, the same `transport-helper.c` function `remote-fd` drives, so
+//!     it lives in [`super::remote_fd`] and is called from here: our stdin →
+//!     child stdin and child stdout → our stdout, concurrently, each half
+//!     closing its destination at EOF. Closing *our stdout* when the child's
+//!     stdout ends is what lets a caller that still holds this helper's stdin
+//!     open see the end of the connection.
+//!   * command resolution: a bare command name is looked up in `$PATH` by
+//!     `prepare_cmd()`'s rules (regular file, owner execute bit) and a miss is
+//!     `error: cannot run <name>: No such file or directory`; a name containing
+//!     `/` goes straight to `execve`, whose failure is
+//!     `fatal: cannot exec '<name>': <strerror>`. Both are followed by
+//!     `fatal: Can't run specified command`.
+//!   * exit codes: the child's own status; 128 + signal when it dies of one
+//!     (silently for `SIGINT`, `SIGQUIT` and `SIGPIPE`);
 //!     128 for `fatal: Bad remote-ext placeholder '%<c>'.`, for
 //!     `fatal: remote-ext command has incomplete placeholder`, and for
 //!     `fatal: Can't run specified command`; 134 when the expansion leaves no
 //!     command at all.
 //!
-//! Three deliberate divergences, none reachable from a real caller:
-//!   * git reads the command loop through stdio, so bytes that arrive in the same
-//!     `read(2)` as the `connect` line are swallowed by the `FILE` buffer and
-//!     never reach the child. This port carries them over to the child instead.
-//!     Emulating the loss would mean emulating one libc's buffer sizing; and
-//!     `transport-helper` waits for the `\n` acknowledgement before sending
-//!     protocol data, so nothing is ever queued behind that line in practice.
+//! Two deliberate divergences, neither reachable from a real caller:
 //!   * an empty expansion aborts git via `BUG()`, i.e. `SIGABRT`, which a shell
 //!     reports as 134. This port exits *normally* with 134 — same `$?`, but
 //!     `WIFEXITED` rather than `WIFSIGNALED`. The `BUG:` text quotes git 2.55.0's
@@ -49,7 +57,10 @@
 //!     stderr) is not implemented.
 
 use anyhow::Result;
+use std::fs::File;
 use std::io::{Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 
 /// The usage string, verbatim from `builtin/remote-ext.c`.
@@ -96,8 +107,9 @@ fn command_loop(child_cmd: &str) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         };
 
-        // "Strip end of line characters": C's `isspace`, so `\v` counts too.
-        while line.last().is_some_and(|b| is_c_space(*b)) {
+        // "Strip end of line characters": git's own `isspace`, which is narrower
+        // than the C library's — see `super::remote_fd::is_git_space`.
+        while line.last().is_some_and(|b| super::remote_fd::is_git_space(*b)) {
             line.pop();
         }
 
@@ -122,30 +134,40 @@ fn command_loop(child_cmd: &str) -> Result<ExitCode> {
 /// One `fgets` worth of stdin: up to and including `\n`, capped at git's 4094
 /// bytes. `None` marks EOF with nothing read.
 ///
-/// Reading a byte at a time is what keeps the *rest* of stdin intact for the
-/// child: `std::io::Stdin` buffers globally, so whatever this over-reads stays in
-/// the same buffer the copy loop drains later.
+/// Descriptor 0 is read directly and unbuffered, exactly as [`super::remote_fd`]
+/// does: whatever this function does not consume must still be visible to the
+/// transfer loop, which reads the same descriptor. Going through
+/// `std::io::Stdin` would slurp up to its 8 KiB buffer and strand those bytes.
+///
+/// The C buffer is a NUL-terminated string that is subsequently compared with
+/// `strcmp`/`skip_prefix`, so a stray NUL ends the command; that truncation is
+/// reproduced here.
 fn read_command_line() -> Result<Option<Vec<u8>>> {
-    let mut stdin = std::io::stdin();
+    let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
 
     while line.len() < MAX_COMMAND_BYTES {
-        if stdin.read(&mut byte)? == 0 {
-            break;
-        }
-        line.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
         }
     }
 
-    Ok(if line.is_empty() { None } else { Some(line) })
-}
-
-/// C's `isspace()` in the C locale.
-fn is_c_space(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    if line.is_empty() {
+        return Ok(None);
+    }
+    if let Some(nul) = line.iter().position(|&b| b == 0) {
+        line.truncate(nul);
+    }
+    Ok(Some(line))
 }
 
 /// Port of `run_child()`: expand the URL, spawn the command, and pump both
@@ -189,7 +211,32 @@ fn run_child(arg: &str, service: &str) -> Result<ExitCode> {
         return Ok(ExitCode::from(134));
     }
 
-    let program = os_str(&argv[0]);
+    // `prepare_cmd()` (run-command.c:435-444): a command name that carries no
+    // directory separator is resolved against `$PATH` *before* the fork, and a
+    // name that is not there is `start_command()`'s own diagnostic
+    // (run-command.c:757-762) — `error: cannot run <name>: No such file or
+    // directory`, whatever the real reason (a non-executable candidate is simply
+    // skipped by `is_executable`, so it reports ENOENT, not EACCES). A name that
+    // does contain a separator is handed to `execve` unresolved instead, and its
+    // failure is reported by `child_err_spew()` (run-command.c:404) — which
+    // installs the *die* message routine, hence `fatal:` rather than `error:`.
+    let resolved = if argv[0].contains(&b'/') {
+        argv[0].clone()
+    } else {
+        match locate_in_path(&argv[0]) {
+            Some(path) => path,
+            None => {
+                eprintln!(
+                    "error: cannot run {}: No such file or directory",
+                    String::from_utf8_lossy(&argv[0])
+                );
+                eprintln!("fatal: Can't run specified command");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    };
+
+    let program = os_str(&resolved);
     let mut command = Command::new(&program);
     for a in &argv[1..] {
         command.arg(os_str(a));
@@ -207,10 +254,13 @@ fn run_child(arg: &str, service: &str) -> Result<ExitCode> {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
+            // `child_err_spew()` → `CHILD_ERR_ERRNO` → `error_errno("cannot exec
+            // '%s'", cmd->args.v[0])` with the die-message routine installed, so
+            // the prefix is `fatal:` and the name is the *unresolved* one.
             eprintln!(
-                "error: cannot run {}: {}",
+                "fatal: cannot exec '{}': {}",
                 String::from_utf8_lossy(&argv[0]),
-                strerror(&e)
+                super::remote_fd::strerror(&e)
             );
             eprintln!("fatal: Can't run specified command");
             return Ok(ExitCode::from(128));
@@ -218,7 +268,7 @@ fn run_child(arg: &str, service: &str) -> Result<ExitCode> {
     };
 
     let mut child_in = child.stdin.take().expect("stdin was piped");
-    let mut child_out = child.stdout.take().expect("stdout was piped");
+    let child_out = child.stdout.take().expect("stdout was piped");
 
     // `%G` turns the connection into an in-line `git://` service request.
     if let Some(repo) = &git_req {
@@ -228,48 +278,61 @@ fn run_child(arg: &str, service: &str) -> Result<ExitCode> {
         }
     }
 
-    // `bidirectional_transfer_loop()`: the git-to-program half runs alongside the
-    // program-to-git half, and the child's stdin is closed once ours hits EOF.
-    let git_to_program = std::thread::spawn(move || -> std::io::Result<()> {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = stdin.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            child_in.write_all(&buf[..n])?;
-            child_in.flush()?;
-        }
-        drop(child_in);
-        Ok(())
-    });
+    // `bidirectional_transfer_loop(child.out, child.in)` — the same
+    // `transport-helper.c` function `remote-fd` drives, with the child's pipes
+    // in place of the inherited descriptors. Handing the descriptors over means
+    // the loop owns closing them: the program-to-git half closes *our* stdout
+    // once the child's stdout reaches EOF, which is how the caller learns the
+    // connection is over while this process is still blocked draining stdin.
+    let child_in_fd = child_in.into_raw_fd();
+    let child_out_fd = child_out.into_raw_fd();
+    let failed = super::remote_fd::bidirectional_transfer_loop(child_out_fd, child_in_fd);
 
-    let program_to_git = {
-        let stdout = std::io::stdout();
-        let mut stdout = stdout.lock();
-        let r = std::io::copy(&mut child_out, &mut stdout).and_then(|_| stdout.flush());
-        r.err()
-    };
-
-    let git_to_program = git_to_program.join().ok().and_then(|r| r.err());
-
-    // git reports each half's failure and keeps going to reap the child.
-    if let Some(e) = &program_to_git {
-        eprintln!("error: write(stdout) failed: {}", strerror(e));
-    }
-    if let Some(e) = &git_to_program {
-        eprintln!("error: write(remote output) failed: {}", strerror(e));
-    }
-
+    // `if (!r) r = finish_command(&child); else finish_command(&child);` — the
+    // child is reaped either way, but a copy failure wins over its status and
+    // `command_loop` reports that as 1.
     let status = child.wait()?;
-
-    // `if (!r) r = finish_command(&child);` — a copy failure wins over the
-    // child's status, and git's loop reports failure as 1.
-    if program_to_git.is_some() || git_to_program.is_some() {
+    if failed {
         return Ok(ExitCode::FAILURE);
     }
     Ok(ExitCode::from(finish_code(&status, &argv[0])))
+}
+
+/// `run-command.c::locate_in_PATH` — the `$PATH` walk `prepare_cmd()` performs
+/// before the fork, including `is_executable()`'s test: `stat(2)` (not `lstat`),
+/// a regular file, and the owner execute bit. An empty `$PATH` entry is the
+/// current directory, per POSIX.
+fn locate_in_path(file: &[u8]) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::env::var_os("PATH")?;
+    let path = path.as_bytes();
+    if path.is_empty() {
+        return None;
+    }
+
+    for entry in path.split(|&b| b == b':') {
+        let mut candidate = Vec::with_capacity(entry.len() + file.len() + 1);
+        if !entry.is_empty() {
+            candidate.extend_from_slice(entry);
+            candidate.push(b'/');
+        }
+        candidate.extend_from_slice(file);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// `run-command.c::is_executable` on a non-Windows build.
+fn is_executable(path: &[u8]) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::metadata(std::path::Path::new(&os_str(path))) {
+        Ok(md) => md.is_file() && md.mode() & 0o100 != 0,
+        Err(_) => false,
+    }
 }
 
 /// Port of `strip_escapes()`: expand one argument of the `ext::` URL.
@@ -380,14 +443,16 @@ fn send_git_request(
 }
 
 /// Port of `wait_or_whine()`'s reporting for `finish_command()`: the child's exit
-/// status, or 128 + signal when it was killed (announced unless it was `SIGINT`
-/// or `SIGQUIT`, which git treats as the user's own doing).
+/// status, or 128 + signal when it was killed. `run-command.c:576` announces the
+/// death unless the signal was `SIGINT`, `SIGQUIT` **or `SIGPIPE`** — the first
+/// two being the user's own doing and the third an ordinary way for a transport
+/// child to end.
 fn finish_code(status: &ExitStatus, argv0: &[u8]) -> u8 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            if signal != libc_sigint() && signal != libc_sigquit() {
+            if signal != SIGINT && signal != SIGQUIT && signal != SIGPIPE {
                 eprintln!(
                     "error: {} died of signal {signal}",
                     String::from_utf8_lossy(argv0)
@@ -401,25 +466,13 @@ fn finish_code(status: &ExitStatus, argv0: &[u8]) -> u8 {
     status.code().unwrap_or(1) as u8
 }
 
+/// The three signals `wait_or_whine()` stays quiet about.
 #[cfg(unix)]
-fn libc_sigint() -> i32 {
-    2
-}
-
+const SIGINT: i32 = 2;
 #[cfg(unix)]
-fn libc_sigquit() -> i32 {
-    3
-}
-
-/// The bare `strerror()` text, without Rust's ` (os error N)` suffix, so the
-/// diagnostics read exactly like git's.
-fn strerror(e: &std::io::Error) -> String {
-    let text = e.to_string();
-    match text.find(" (os error ") {
-        Some(at) => text[..at].to_string(),
-        None => text,
-    }
-}
+const SIGQUIT: i32 = 3;
+#[cfg(unix)]
+const SIGPIPE: i32 = 13;
 
 /// An argument as the OS sees it. The `ext::` URL is arbitrary bytes and must
 /// reach the child unmangled, so bypass `String` on platforms that allow it.

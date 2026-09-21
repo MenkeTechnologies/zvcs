@@ -117,10 +117,12 @@ const PORTED: &str = "ported: -a, -c, -t, -v, -w <ref>, --recover, --stdin";
 
 /// `git http-fetch` — see the module docs for exactly what is and is not ported.
 pub fn http_fetch(args: &[String]) -> Result<ExitCode> {
-    // `args[0]` is the subcommand, mirroring git's `argv[0]`; git's own parser
-    // starts at index 1 and so does this one.
+    // The dispatcher hands over the arguments that FOLLOW the verb, while git's
+    // `argv[0]` is the command itself and its scan starts at index 1. Both the
+    // cursor and the length are therefore one lower here than in the C, which
+    // leaves every `argc - arg` comparison below unchanged.
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut arg = 1;
+    let mut arg = 0;
 
     let mut verbose = false;
     let mut recover = false;

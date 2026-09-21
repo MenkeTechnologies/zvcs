@@ -122,7 +122,7 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
                     i += 1;
                     match args.get(i) {
                         Some(v) => v.clone(),
-                        None => return top_usage("option `ref' requires a value"),
+                        None => return missing_value("--ref"),
                     }
                 }
             });
@@ -247,10 +247,13 @@ pub(crate) fn resolve_notes_ref(repo: &gix::Repository, override_ref: Option<&st
     if let Some(r) = override_ref {
         return expand_notes_ref(r);
     }
-    if let Ok(env) = std::env::var("GIT_NOTES_REF") {
-        if !env.is_empty() {
-            return env;
-        }
+    // `notes.c:1007` takes the environment through `xstrdup_or_null(getenv())`,
+    // which is NULL only when the variable is unset: `GIT_NOTES_REF=` is a set,
+    // empty notes ref, and the `core.notesref` lookup at `notes.c:1009` is then
+    // skipped. The empty name reaches `init_notes_check()` (`builtin/notes.c:427`)
+    // and every subcommand refuses it as outside `refs/notes/`.
+    if let Some(env) = std::env::var_os("GIT_NOTES_REF") {
+        return env.to_string_lossy().into_owned();
     }
     // `repo_config_get_string(repo, "core.notesref", …)` (notes.c:1009), which dies
     // through `git_die_config()` on a valueless key.
@@ -882,8 +885,12 @@ impl Cache {
     }
 }
 
-/// Writing subcommands refuse to touch anything outside `refs/notes/`.
-fn check_writable(notes_ref: &str, sub: &str) -> Result<Option<ExitCode>> {
+/// `builtin/notes.c:init_notes_check()` (`builtin/notes.c:418-435`) — *every*
+/// subcommand that opens a notes tree, reading ones included, dies when the ref
+/// it would open is outside `refs/notes/`. The read-only callers pass
+/// `flags == 0` and so check `t->ref`, the writing ones pass `NOTES_INIT_WRITABLE`
+/// and check `t->update_ref`; both hold the same name here.
+fn check_notes_ref(notes_ref: &str, sub: &str) -> Result<Option<ExitCode>> {
     if !notes_ref.starts_with("refs/notes/") {
         eprintln!("fatal: refusing to {sub} notes in {notes_ref} (outside of refs/notes/)");
         return Ok(Some(ExitCode::from(128)));
@@ -989,21 +996,21 @@ fn parse_msg_opts(
             "--no-separator" => o.separator = None,
             "-m" | "--message" => match detached(args, &mut i) {
                 Some(v) => o.msgs.push(Msg { bytes: v.into_bytes(), strip: true }),
-                None => return Ok(Err(msg_sub_usage(sub, &requires_value(a))?)),
+                None => return Ok(Err(missing_value(a)?)),
             },
             "-F" | "--file" => match detached(args, &mut i) {
                 Some(v) => match read_file(&v) {
                     Ok(b) => o.msgs.push(Msg { bytes: b, strip: true }),
                     Err(m) => return Ok(Err(fatal128(&m))),
                 },
-                None => return Ok(Err(msg_sub_usage(sub, &requires_value(a))?)),
+                None => return Ok(Err(missing_value(a)?)),
             },
             "-C" | "--reuse-message" => match detached(args, &mut i) {
                 Some(v) => match read_note_blob(repo, &v) {
                     Ok(b) => o.msgs.push(Msg { bytes: b, strip: false }),
                     Err(m) => return Ok(Err(fatal128(&m))),
                 },
-                None => return Ok(Err(msg_sub_usage(sub, &requires_value(a))?)),
+                None => return Ok(Err(missing_value(a)?)),
             },
             "-e" | "--edit" => o.use_editor = true,
             "--no-edit" => o.use_editor = false,
@@ -1016,7 +1023,7 @@ fn parse_msg_opts(
                     }
                     Err(m) => return Ok(Err(fatal128(&m))),
                 },
-                None => return Ok(Err(msg_sub_usage(sub, &requires_value(a))?)),
+                None => return Ok(Err(missing_value(a)?)),
             },
             _ if a.starts_with("--reedit-message=") => {
                 match read_note_blob(repo, &a["--reedit-message=".len()..]) {
@@ -1084,6 +1091,19 @@ fn requires_value(flag: &str) -> String {
             format!("switch `{sw}' requires a value")
         }
     }
+}
+
+/// A missing option argument, reported the way `parse_options()` reports it.
+///
+/// `parse-options.c:60` raises it through plain `error()` and returns -1, which
+/// `get_value()` turns into `PARSE_OPT_ERROR` (`parse-options.c:606`); the
+/// `PARSE_OPT_ERROR` arm of `parse_options()` (`parse-options.c:1198-1201`) then
+/// calls `exit(129)` directly. Unlike `PARSE_OPT_UNKNOWN`
+/// (`parse-options.c:1214-1223`) it never reaches `usage_with_options()`, so no
+/// usage block is printed — only the one `error:` line.
+fn missing_value(flag: &str) -> Result<ExitCode> {
+    eprintln!("error: {}", requires_value(flag));
+    Ok(ExitCode::from(129))
 }
 
 /// Print a git `fatal:` line and yield its exit code (128).
@@ -1467,6 +1487,10 @@ fn list(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
     if positional.len() > 1 {
         return sub_usage("too many arguments", LIST_USAGE, &[]);
     }
+    // `builtin/notes.c:457`: the ref check runs before the operand is resolved.
+    if let Some(code) = check_notes_ref(notes_ref, "list")? {
+        return Ok(code);
+    }
     let (notes, _) = load(repo, notes_ref)?;
 
     match positional.first().map(|s| s.as_str()) {
@@ -1521,6 +1545,11 @@ fn show(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
         }
     };
 
+    // `builtin/notes.c:782-785`: `show` resolves its operand first, then opens
+    // the notes tree — so a bad operand outranks a bad notes ref here.
+    if let Some(code) = check_notes_ref(notes_ref, "show")? {
+        return Ok(code);
+    }
     let (notes, _) = load(repo, notes_ref)?;
     match notes.map.get(&object) {
         Some(note) => {
@@ -1552,7 +1581,7 @@ fn add(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitC
             return Ok(ExitCode::from(128));
         }
     };
-    if let Some(code) = check_writable(notes_ref, "add")? {
+    if let Some(code) = check_notes_ref(notes_ref, "add")? {
         return Ok(code);
     }
 
@@ -1629,7 +1658,7 @@ fn append(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
             return Ok(ExitCode::from(128));
         }
     };
-    if let Some(code) = check_writable(notes_ref, "append")? {
+    if let Some(code) = check_notes_ref(notes_ref, "append")? {
         return Ok(code);
     }
 
@@ -1710,7 +1739,7 @@ fn edit(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
             return Ok(ExitCode::from(128));
         }
     };
-    if let Some(code) = check_writable(notes_ref, "edit")? {
+    if let Some(code) = check_notes_ref(notes_ref, "edit")? {
         return Ok(code);
     }
 
@@ -1759,7 +1788,7 @@ fn copy(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
                 i += 1;
                 match args.get(i) {
                     Some(v) => for_rewrite = Some(v.clone()),
-                    None => return sub_usage("option `for-rewrite' requires a value", COPY_USAGE, COPY_OPTS),
+                    None => return missing_value("--for-rewrite"),
                 }
             }
             s if s.starts_with("--for-rewrite=") => {
@@ -1773,6 +1802,11 @@ fn copy(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
         i += 1;
     }
     if stdin || for_rewrite.is_some() {
+        // `builtin/notes.c:599-606`: `--stdin`/`--for-rewrite` take no
+        // positional arguments at all; any leftover is "too many arguments".
+        if !positional.is_empty() {
+            return sub_usage("too many arguments", COPY_USAGE, COPY_OPTS);
+        }
         return copy_stdin(repo, notes_ref, force, for_rewrite.as_deref());
     }
     if positional.is_empty() {
@@ -1796,7 +1830,7 @@ fn copy(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
             return Ok(ExitCode::from(128));
         }
     };
-    if let Some(code) = check_writable(notes_ref, "copy")? {
+    if let Some(code) = check_notes_ref(notes_ref, "copy")? {
         return Ok(code);
     }
 
@@ -2166,7 +2200,7 @@ fn prune(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
             _ => return sub_usage("too many arguments", PRUNE_USAGE, PRUNE_OPTS),
         }
     }
-    if let Some(code) = check_writable(notes_ref, "prune")? {
+    if let Some(code) = check_notes_ref(notes_ref, "prune")? {
         return Ok(code);
     }
 
@@ -2215,7 +2249,7 @@ fn remove(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Ex
             s => specs.push(s.to_string()),
         }
     }
-    if let Some(code) = check_writable(notes_ref, "remove")? {
+    if let Some(code) = check_notes_ref(notes_ref, "remove")? {
         return Ok(code);
     }
     // git processes the given objects, then everything on stdin. The `HEAD`
@@ -2308,6 +2342,17 @@ fn merge_print_usage(out: &mut impl std::io::Write) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `parse-options-cb.c:parse_opt_verbosity_cb()` (`parse-options-cb.c:65-85`),
+/// which `OPT__VERBOSITY` installs for `-v`/`-q`: the counter saturates through
+/// zero rather than cancelling, so `-vq` lands on `-1` and `-qv` on `1`.
+fn bump_verbosity(target: &mut i32, verbose: bool) {
+    if verbose {
+        *target = if *target >= 0 { *target + 1 } else { 1 };
+    } else {
+        *target = if *target <= 0 { *target - 1 } else { -1 };
+    }
+}
+
 /// A merge-specific usage error: `error:` then the merge usage block, exit 129.
 fn merge_usage(msg: &str) -> Result<ExitCode> {
     eprintln!("error: {msg}");
@@ -2326,68 +2371,104 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-v" | "--verbose" => verbosity += 1,
-            "-q" | "--quiet" => verbosity -= 1,
+            "--verbose" => bump_verbosity(&mut verbosity, true),
+            "--no-verbose" | "--no-quiet" => verbosity = 0,
+            "--quiet" => bump_verbosity(&mut verbosity, false),
             "--commit" => do_commit = true,
             "--abort" => do_abort = true,
-            "-s" | "--strategy" => {
+            "--strategy" => {
                 i += 1;
                 match args.get(i) {
                     Some(v) => strategy = Some(v.clone()),
-                    None => return merge_usage(&requires_value(a)),
+                    None => return missing_value(a),
                 }
             }
             s if s.starts_with("--strategy=") => {
                 strategy = Some(s["--strategy=".len()..].to_string())
             }
-            s if s.starts_with("-s") && s.len() > 2 => strategy = Some(s[2..].to_string()),
             // `--help-all` joins `-h`: parse_options_step() tests that name with
             // a `strcmp()` of its own ahead of parse_long_opt() and renders
             // `USAGE_FULL`, identical here because the merge option table has no
             // `PARSE_OPT_HIDDEN` entry. The compare is exact, so `--help-a` and
             // `--help-all=x` stay unknown-option reports.
-            "-h" | "--help-all" => {
+            "--help-all" => {
                 merge_print_usage(&mut std::io::stdout())?;
                 return Ok(ExitCode::from(129));
             }
             s if s.starts_with("--") => {
                 return merge_usage(&format!("unknown option `{}'", &s[2..]))
             }
+            // A short-option cluster, the way `parse_short_opt()` walks it
+            // (`parse-options.c`): each character is its own switch, and the
+            // first one that takes a value swallows the rest of the word — or,
+            // when it is the last character, the next argument.
             s if s.starts_with('-') && s != "-" => {
-                let sw = s[1..].chars().next().unwrap_or(' ');
-                return merge_usage(&format!("unknown switch `{sw}'"));
+                let cluster: Vec<char> = s[1..].chars().collect();
+                let mut c = 0;
+                while c < cluster.len() {
+                    match cluster[c] {
+                        'v' => bump_verbosity(&mut verbosity, true),
+                        'q' => bump_verbosity(&mut verbosity, false),
+                        'h' => {
+                            merge_print_usage(&mut std::io::stdout())?;
+                            return Ok(ExitCode::from(129));
+                        }
+                        's' => {
+                            let rest: String = cluster[c + 1..].iter().collect();
+                            if rest.is_empty() {
+                                i += 1;
+                                match args.get(i) {
+                                    Some(v) => strategy = Some(v.clone()),
+                                    None => return missing_value("-s"),
+                                }
+                            } else {
+                                strategy = Some(rest);
+                            }
+                            break;
+                        }
+                        sw => return merge_usage(&format!("unknown switch `{sw}'")),
+                    }
+                    c += 1;
+                }
             }
             s => positional.push(s.to_string()),
         }
         i += 1;
     }
 
-    // An explicit `-s/--strategy` is validated up front, exactly as git's
-    // callback does. The config-driven default is resolved only once a real
-    // merge is known to be happening: git consults the merge-strategy config
-    // *after* the `--abort`/`--commit` early-outs, so a bad `notes.mergeStrategy`
-    // never aborts an abort.
-    let cli_strat = match strategy.as_deref() {
-        None => None,
-        Some(name) => match parse_strategy(name) {
-            Some(s) => Some(s),
-            None => return merge_usage(&format!("unknown -s/--strategy: {name}")),
-        },
-    };
+    // `builtin/notes.c:919-924`: `-s` implies a merge, as does naming neither
+    // `--commit` nor `--abort`; exactly one of the three modes may be active.
+    let merging = strategy.is_some() || !(do_commit || do_abort);
+    if usize::from(merging) + usize::from(do_commit) + usize::from(do_abort) != 1 {
+        return merge_usage("cannot mix --commit, --abort or -s/--strategy");
+    }
+    // `builtin/notes.c:926-932`: the operand count is checked before the mode
+    // runs, and before `-s` is looked at — `git notes merge -s bogus` is a
+    // missing-operand report, not an unknown-strategy one.
+    if merging && positional.len() != 1 {
+        return merge_usage("must specify a notes ref to merge");
+    } else if !merging && !positional.is_empty() {
+        return merge_usage("too many arguments");
+    }
 
     if do_abort {
-        return merge_abort(repo);
+        return merge_abort(repo, verbosity);
     }
     if do_commit {
         return merge_commit(repo, verbosity);
     }
-    if positional.len() != 1 {
-        return merge_usage("must specify a notes ref to merge");
+    // `builtin/notes.c:948`: the notes tree is opened — and the ref refused if
+    // it is outside `refs/notes/` — before `-s` is parsed at `:950`.
+    if let Some(code) = check_notes_ref(notes_ref, "merge")? {
+        return Ok(code);
     }
     // Without `-s`, `notes.<name>.mergeStrategy` then the general
     // `notes.mergeStrategy` supply the strategy, falling back to git's `manual`.
-    let strat = match cli_strat {
-        Some(s) => s,
+    let strat = match strategy.as_deref() {
+        Some(name) => match parse_strategy(name) {
+            Some(s) => s,
+            None => return merge_usage(&format!("unknown -s/--strategy: {name}")),
+        },
         None => match config_merge_strategy(repo, notes_ref) {
             Ok(s) => s,
             Err(code) => return Ok(code),
@@ -2553,13 +2634,31 @@ fn do_merge(
         (Some(l), Some(r)) => (l, r),
     };
 
-    if l == r {
-        if verbosity >= 0 {
-            println!("Already up to date.");
+    // `notes-merge.c:616-643`. git's verbosity counts from
+    // `NOTES_MERGE_VERBOSITY_DEFAULT` (2), so its `>= 4` is `>= 2` here and its
+    // `>= 3` is `>= 1`.
+    let bases: Vec<ObjectId> =
+        repo.merge_bases_many(l, &[r])?.into_iter().map(|id| id.detach()).collect();
+    let base = bases.first().copied();
+    // `%.7s` of the full hex, which is a plain truncation — not `find_unique_abbrev()`.
+    let short = |id: &ObjectId| id.to_string()[..7].to_string();
+    let base_oid = base.unwrap_or_else(|| ObjectId::null(repo.object_hash()));
+    match bases.len() {
+        0 if verbosity >= 2 => println!("No merge base found; doing history-less merge"),
+        1 if verbosity >= 2 => println!("One merge base found ({})", short(&bases[0])),
+        n if n > 1 && verbosity >= 1 => {
+            println!("Multiple merge bases found. Using the first ({})", short(&bases[0]));
         }
-        return Ok(ExitCode::SUCCESS);
+        _ => {}
     }
-    let base = repo.merge_bases_many(l, &[r])?.into_iter().next().map(|id| id.detach());
+    if verbosity >= 2 {
+        println!(
+            "Merging remote commit {} into local commit {} with merge-base {}",
+            short(&r),
+            short(&l),
+            short(&base_oid)
+        );
+    }
     if base == Some(r) {
         if verbosity >= 0 {
             println!("Already up to date.");
@@ -2597,6 +2696,7 @@ fn do_merge(
 
     let mut merged: BTreeMap<ObjectId, ObjectId> = BTreeMap::new();
     let mut conflicts: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+    let mut worktree_checked = false;
     let blob = |id: Option<ObjectId>| -> Result<Vec<u8>> {
         Ok(match id {
             Some(id) => repo.find_object(id)?.data.clone(),
@@ -2647,6 +2747,16 @@ fn do_merge(
                     if verbosity >= 0 {
                         println!("Auto-merging notes for {obj}");
                     }
+                    // `notes-merge.c:406` calls `check_notes_merge_worktree()`
+                    // between the "Auto-merging" line and the CONFLICT line, and
+                    // only for the first conflict — `o->has_worktree` is set
+                    // afterwards (`notes-merge.c:303`).
+                    if !worktree_checked {
+                        worktree_checked = true;
+                        if let Some(code) = check_merge_worktree(repo)? {
+                            return Ok(code);
+                        }
+                    }
                     if verbosity >= -1 {
                         // `notes-merge.c:merge_one_change_manual()` calls the
                         // conflict `add/add` when the merge base carries no
@@ -2666,6 +2776,17 @@ fn do_merge(
         if let Some(id) = result {
             merged.insert(*obj, id);
         }
+    }
+
+    // `notes-merge.c:545-549`: `t->dirty` is set by every `add_note()`/
+    // `remove_note()` `merge_changes()` applied to the local tree, so it is on
+    // exactly when the merge resolved at least one change into it.
+    if verbosity >= 2 {
+        let dirty = if merged == local_notes.map { "clean" } else { "dirty" };
+        println!(
+            "Merge result: {} unmerged notes and a {dirty} notes tree",
+            conflicts.len()
+        );
     }
 
     let out_notes = Notes {
@@ -2704,25 +2825,56 @@ fn do_merge(
         for (obj, content) in &conflicts {
             std::fs::write(wt.join(obj.to_string()), content)?;
         }
-        // git names the worktree with `git_path(NOTES_MERGE_WORKTREE)`, which is
-        // the git dir exactly as setup resolved it — `.git/…` from the top of a
-        // normal worktree. `git_dir()` here can carry a `./` prefix the path git
-        // never prints, so drop it; an absolute git dir still gets made relative
-        // to the cwd when it is under it.
-        let wt_display = {
-            let shown = wt.display().to_string();
-            match shown.strip_prefix("./") {
-                Some(rest) => rest.to_string(),
-                None => std::env::current_dir()
-                    .ok()
-                    .and_then(|cwd| wt.strip_prefix(&cwd).ok().map(|p| p.display().to_string()))
-                    .unwrap_or(shown),
-            }
-        };
+        // git names the worktree with `git_path(NOTES_MERGE_WORKTREE)`.
+        let wt_display = git_path_shown(repo, "NOTES_MERGE_WORKTREE");
         eprintln!(
             "Automatic notes merge failed. Fix conflicts in {wt_display} and commit the result with 'git notes merge --commit', or abort the merge with 'git notes merge --abort'."
         );
         Ok(ExitCode::from(1))
+    }
+}
+
+/// `notes-merge.c:check_notes_merge_worktree()` (`notes-merge.c:276-310`).
+///
+/// A manual merge that is about to stage its first conflict refuses to start
+/// when `$GIT_DIR/NOTES_MERGE_WORKTREE` already exists and is not empty: the
+/// previous merge has not been concluded. `advice.resolveConflict` picks which
+/// of the two wordings git dies with.
+fn check_merge_worktree(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    let wt = repo.git_dir().join("NOTES_MERGE_WORKTREE");
+    let occupied = match std::fs::read_dir(&wt) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    };
+    if !occupied {
+        std::fs::create_dir_all(&wt)?;
+        return Ok(None);
+    }
+    let shown = git_path_shown(repo, "NOTES_MERGE_*");
+    if crate::advice::Advice::ResolveConflict.enabled_in(repo) {
+        eprintln!(
+            "fatal: You have not concluded your previous notes merge ({shown} exists).\n\
+             Please, use 'git notes merge --commit' or 'git notes merge --abort' to \
+             commit/abort the previous merge before you start a new notes merge."
+        );
+    } else {
+        eprintln!("fatal: You have not concluded your notes merge ({shown} exists).");
+    }
+    Ok(Some(ExitCode::from(128)))
+}
+
+/// `git_path(<name>)` as git prints it: the git dir exactly as setup resolved
+/// it, with the `./` prefix `gix` can carry dropped and an absolute git dir
+/// under the cwd shortened back to a relative path.
+fn git_path_shown(repo: &gix::Repository, name: &str) -> String {
+    let path = repo.git_dir().join(name);
+    let shown = path.display().to_string();
+    match shown.strip_prefix("./") {
+        Some(rest) => rest.to_string(),
+        None => std::env::current_dir()
+            .ok()
+            .and_then(|cwd| path.strip_prefix(&cwd).ok().map(|p| p.display().to_string()))
+            .unwrap_or(shown),
     }
 }
 
@@ -2745,7 +2897,7 @@ fn conflict_content(local_ref: &str, remote_ref: &str, l: &[u8], r: &[u8]) -> Ve
 }
 
 /// `git notes merge --commit` — finalize a manual merge staged on disk.
-fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
+fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
     let partial_raw = match std::fs::read_to_string(git_dir.join("NOTES_MERGE_PARTIAL")) {
         Ok(s) => s,
@@ -2774,11 +2926,21 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
 
     let mut notes = load_from_commit(repo, partial)?;
     let wt = git_dir.join("NOTES_MERGE_WORKTREE");
+    // `notes-merge.c:703-705`: git's own verbosity counts from
+    // `NOTES_MERGE_VERBOSITY_DEFAULT` (2), so its `>= 3` is one `-v` here.
+    let wt_shown = git_path_shown(repo, "NOTES_MERGE_WORKTREE");
+    if verbosity >= 1 {
+        println!("Committing notes in notes merge worktree at {wt_shown}");
+    }
     if let Ok(entries) = std::fs::read_dir(&wt) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Ok(obj) = ObjectId::from_hex(name.as_bytes()) else {
+                // `notes-merge.c:721-726`.
+                if verbosity >= 1 {
+                    println!("Skipping non-SHA1 entry '{wt_shown}/{name}'");
+                }
                 continue;
             };
             let content = std::fs::read(entry.path())?;
@@ -2786,6 +2948,10 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
                 notes.map.remove(&obj);
             } else {
                 let blob = repo.write_blob(&content)?.detach();
+                // `notes-merge.c:737-739`.
+                if verbosity >= 2 {
+                    println!("Added resolved note for object {obj}: {blob}");
+                }
                 notes.map.insert(obj, blob);
             }
         }
@@ -2793,6 +2959,10 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
 
     let tree_id = write_tree(repo, &notes)?;
     let commit = repo.new_commit(full_msg.clone(), tree_id, parents)?.id().detach();
+    // `notes-merge.c:746-748`.
+    if verbosity >= 2 {
+        println!("Finalized notes merge commit: {commit}");
+    }
     let local_tip = repo
         .try_find_reference(local_ref.as_str())?
         .map(|r| r.into_fully_peeled_id())
@@ -2803,7 +2973,7 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
     // Clear the staged merge.
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
-    clear_merge_worktree(&wt);
+    clear_merge_worktree(&wt, &wt_shown, verbosity);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2811,7 +2981,11 @@ fn merge_commit(repo: &gix::Repository, _verbosity: i32) -> Result<ExitCode> {
 /// `$GIT_DIR/NOTES_MERGE_WORKTREE`, which is how both `--commit` and `--abort`
 /// tear the staged merge down: the conflict files go, the directory stays —
 /// git keeps it because it may be the user's current working directory.
-fn clear_merge_worktree(wt: &std::path::Path) {
+fn clear_merge_worktree(wt: &std::path::Path, shown: &str, verbosity: i32) {
+    // `notes-merge.c:765-766`.
+    if verbosity >= 1 {
+        println!("Removing notes merge worktree at {shown}/*");
+    }
     let Ok(entries) = std::fs::read_dir(wt) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -2823,14 +2997,20 @@ fn clear_merge_worktree(wt: &std::path::Path) {
 }
 
 /// `git notes merge --abort` — discard a staged manual merge.
-fn merge_abort(repo: &gix::Repository) -> Result<ExitCode> {
+fn merge_abort(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
     let wt = git_dir.join("NOTES_MERGE_WORKTREE");
+    let shown = git_path_shown(repo, "NOTES_MERGE_WORKTREE");
+    // `notes-merge.c:764-767` announces the removal before attempting it, so
+    // the line is printed even when there is no worktree left to remove.
     if !wt.exists() {
+        if verbosity >= 1 {
+            println!("Removing notes merge worktree at {shown}/*");
+        }
         eprintln!("error: failed to remove 'git notes merge' worktree");
         return Ok(ExitCode::from(1));
     }
-    clear_merge_worktree(&wt);
+    clear_merge_worktree(&wt, &shown, verbosity);
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
     let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
     Ok(ExitCode::SUCCESS)

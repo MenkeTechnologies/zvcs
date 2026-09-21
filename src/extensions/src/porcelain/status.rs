@@ -374,6 +374,9 @@ fn status_report(
         if s == "--help-all" {
             return Ok(super::show_usage(USAGE));
         }
+        if let Some(code) = super::long_takes_no_value(s, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(s, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

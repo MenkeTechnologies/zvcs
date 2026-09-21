@@ -258,6 +258,9 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
             *i += 1;
             Ok(crate::parseopt::value_at(args, *i, crate::parseopt::OptName::Long(name))?.to_string())
         };
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {
@@ -279,6 +282,14 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
                 print!("{USAGE}");
                 std::io::stdout().flush()?;
                 return Ok(ExitCode::from(129));
+            }
+            // `parse_options_step()` consumes a lone `--` before any table
+            // lookup (parse-options.c: `if (!arg[2]) { ... ctx->argc--;
+            // ctx->argv++; break; }`), so it ends option parsing and is never an
+            // unknown option.
+            "--" => {
+                i += 1;
+                break;
             }
             "-z" | "--null" => {
                 null_input = true;

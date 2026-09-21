@@ -142,6 +142,9 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

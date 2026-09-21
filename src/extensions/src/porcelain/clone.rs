@@ -368,6 +368,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // `--recurs` would report itself ambiguous between `--recursive` and the
         // `--recurse-submodules` it aliases.
         let canonical;
+        if let Some(code) = super::long_takes_no_value_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
             super::Long::Name(name) => {
                 canonical = name;

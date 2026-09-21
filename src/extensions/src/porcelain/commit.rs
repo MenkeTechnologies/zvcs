@@ -812,6 +812,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // the shared value-option handler and the match below, so `--allow-empty-m`
         // reaches the same arm as `--allow-empty-message`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(args[at].as_str(), LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(args[at].as_str(), LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

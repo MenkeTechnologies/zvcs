@@ -103,10 +103,25 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
                 no_more_opts = true;
                 continue;
             }
-            match resolve_long(long) {
-                Some((Opt::Missing, value)) => allow_missing = value,
-                Some((Opt::Batch, value)) => is_batch_mode = value,
-                None => return Ok(usage_error(&format!("unknown option `{long}'"))),
+            // `do_get_value()` (parse-options.c:130-143): both entries are
+            // `PARSE_OPT_NOARG`, so an attached `=<value>` is refused by name —
+            // one `error:` line, no usage block.
+            if let Some(code) = super::long_takes_no_value(arg, LONG_OPTS) {
+                return Ok(code);
+            }
+            match super::resolve_long(LONG_OPTS, long) {
+                super::Resolved::One(opt, unset) => match opt.name {
+                    "missing" => allow_missing = !unset,
+                    _ => is_batch_mode = !unset,
+                },
+                // `--no` prefixes both `--no-missing` and `--no-batch`, which is
+                // `register_abbrev()`'s ambiguity and not an unknown option; the
+                // private resolver this replaced answered it with `unknown
+                // option` instead.
+                super::Resolved::Ambiguous(first, second) => {
+                    return Ok(super::ambiguous_option(arg, &first, &second, USAGE))
+                }
+                super::Resolved::Unknown => return Ok(super::unknown_option(arg, USAGE)),
             }
             continue;
         }
@@ -181,37 +196,15 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The two long options, resolved past their `no-` form.
-#[derive(Clone, Copy)]
-enum Opt {
-    Missing,
-    Batch,
-}
 
-/// Match a long option — git's `parse_options` accepts any unambiguous prefix —
-/// to the option it names and the value it sets.
-fn resolve_long(long: &str) -> Option<(Opt, bool)> {
-    const SPELLINGS: [(&str, Opt, bool); 4] = [
-        ("missing", Opt::Missing, true),
-        ("batch", Opt::Batch, true),
-        ("no-missing", Opt::Missing, false),
-        ("no-batch", Opt::Batch, false),
-    ];
-
-    let mut prefix_hit = None;
-    for (spelling, opt, value) in SPELLINGS {
-        if spelling == long {
-            return Some((opt, value));
-        }
-        if spelling.starts_with(long) {
-            if prefix_hit.is_some() {
-                return None; // ambiguous, e.g. `--no`
-            }
-            prefix_hit = Some((opt, value));
-        }
-    }
-    prefix_hit
-}
+/// `mktree`'s own `struct option` table (builtin/mktree.c), in table order as
+/// [`super::resolve_long`] reads it. `-z` is short-only, so it has no entry
+/// here; both long entries are `OPT_BOOL`, which is `PARSE_OPT_NOARG` and
+/// negatable.
+const LONG_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "missing", neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "batch", neg: true, arg: super::Arg::None },
+];
 
 /// Parse one `ls-tree` record into an entry.
 ///

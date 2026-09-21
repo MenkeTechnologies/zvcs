@@ -330,6 +330,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         // `--negotiation-` would report itself ambiguous between the alias and its
         // source.
         let canonical;
+        if let Some(code) = super::long_takes_no_value_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
             super::Long::Name(name) => {
                 canonical = name;

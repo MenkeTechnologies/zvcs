@@ -44,6 +44,15 @@ use gix::prelude::ObjectIdExt;
 ///     `gix_date`'s parser rather than git's `approxidate`, which accepts a
 ///     wider set of fuzzy spellings
 pub fn show_branch(args: &[String]) -> Result<ExitCode> {
+    // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
+    // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
+    // and `parse_options()` then answers the request before the builtin has
+    // looked at a repository. Answering it only after `discover()` made
+    // `git show-branch -h` outside one die `fatal: not a git repository` at 128, where
+    // stock prints the usage block on stdout at 129.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     let repo = crate::setup::discover()?;
 
     // `repo_config(the_repository, git_show_branch_config, NULL)`
@@ -557,42 +566,19 @@ fn strtoul(s: &str) -> (i32, usize) {
     (value as i32, i)
 }
 
-/// `do_get_value()`'s two `takes no value` refusals (parse-options.c:138-143),
-/// for a `--<name>=<value>` token:
+/// `do_get_value()`'s `takes no value` refusals for a `--<name>=<value>` token,
+/// as this parser's own failure rather than as a write to stderr.
 ///
-/// ```c
-/// if (unset && p->opt)
-///         return error(_("%s takes no value"), optname(opt, flags));
-/// ...
-/// if (!(flags & OPT_SHORT) && p->opt && (opt->flags & PARSE_OPT_NOARG))
-///         return error(_("%s takes no value"), optname(opt, flags));
-/// ```
-///
-/// Both are `PARSE_OPT_ERROR`, so neither prints the usage block. The name is
-/// `optname()`'s (parse-options.c:30-45): the **table's** spelling, with a `no-`
-/// glued on for the unset sense — which is why `--name=x` is reported as
-/// `no-no-name` and `--al=x` as `all`. Without this the tokens fell through to
-/// the `unknown option` arm, which quotes the value too and *does* print usage.
+/// The decision and the wording are [`super::long_no_value_name`]'s — the same
+/// rule and the same `optname()` rendering every other verb goes through, which
+/// is why `--name=x` is reported as `no-no-name` and `--al=x` as `all`. This
+/// used to be a private copy of both; keeping one was how the port grew five
+/// spellings of one refusal.
 fn takes_no_value(tok: &str) -> Result<(), ParseFail> {
-    let Some(body) = tok.strip_prefix("--") else {
-        return Ok(());
-    };
-    // `p->opt` is set only when `parse_long_opt()` found an `=`; an empty value
-    // still sets it, so `--all=` is refused like `--all=x`.
-    let Some((name, _)) = body.split_once('=') else {
-        return Ok(());
-    };
-    let super::Resolved::One(opt, unset) = super::resolve_long(LONG_OPTS, name) else {
-        return Ok(());
-    };
-    if !unset && !matches!(opt.arg, super::Arg::None) {
-        return Ok(());
+    match super::long_no_value_name(tok, LONG_OPTS, &[]) {
+        None => Ok(()),
+        Some(name) => Err(ParseFail::Bare(format!("error: {name} takes no value"))),
     }
-    let shown = match unset {
-        true => format!("no-{}", opt.name),
-        false => opt.name.to_string(),
-    };
-    Err(ParseFail::Bare(format!("error: option `{shown}' takes no value")))
 }
 
 /// `parse_options(..., PARSE_OPT_STOP_AT_NON_OPTION)` — option parsing stops at

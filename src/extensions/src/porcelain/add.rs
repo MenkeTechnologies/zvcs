@@ -103,6 +103,9 @@ pub(super) const LONG_OPTS: &[LongOpt] = &[
 ];
 
 pub fn add(args: &[String]) -> Result<ExitCode> {
+    if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
+        return Ok(code);
+    }
     let repo = crate::setup::discover()?;
     if repo.workdir().is_none() {
         crate::git_fatal!("this operation must be run in a work tree");
@@ -193,6 +196,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // the shared value-option handler and the match below, so `--unif 3` and
         // `--intent-to` land where their full spellings land.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

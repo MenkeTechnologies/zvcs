@@ -192,20 +192,19 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
                 None => (body, None),
             };
 
+            // The ambiguity report splits its two halves across the streams:
+            // `error()` on stderr, then `PARSE_OPT_HELP` →
+            // `usage_with_options_internal(..., USAGE_TO_STDOUT)` for the block.
+            // `usage_error` writes both to stderr, which is the `unknown option`
+            // shape.
             let (opt, negated) = match resolve_long(name) {
                 Err(cands) => {
-                    return Err(usage_error(format!(
-                        "ambiguous option: {name} (could be --{} or --{})",
-                        cands[0], cands[1]
-                    )))
+                    return Err(super::ambiguous_option(a, cands[0], cands[1], USAGE))
                 }
                 Ok(Some(opt)) => (opt, false),
                 Ok(None) => match name.strip_prefix("no-").map(resolve_long) {
                     Some(Err(cands)) => {
-                        return Err(usage_error(format!(
-                            "ambiguous option: {name} (could be --{} or --{})",
-                            cands[0], cands[1]
-                        )))
+                        return Err(super::ambiguous_option(a, cands[0], cands[1], USAGE))
                     }
                     Some(Ok(Some(opt))) => (opt, true),
                     _ => return Err(usage_error(format!("unknown option `{body}'"))),
@@ -213,9 +212,17 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
             };
             let (canonical, takes_value) = *opt;
 
-            // A negated option never takes a value, and neither does a flag.
+            // `do_get_value()` (parse-options.c:130-143): a negated option never
+            // takes a value, and neither does a `PARSE_OPT_NOARG` flag. Both are
+            // `PARSE_OPT_ERROR`, so they print the one `error:` line and **no**
+            // usage block — `usage_error` would append one, which is the
+            // `unknown option` shape and not this.
             if inline.is_some() && (negated || !takes_value) {
-                return Err(usage_error(format!("option `{name}' takes no value")));
+                let name = match negated {
+                    true => crate::parseopt::OptName::Unset(canonical),
+                    false => crate::parseopt::OptName::Long(canonical),
+                };
+                return Err(crate::parseopt::takes_no_value(name));
             }
 
             let value = if takes_value && !negated {
@@ -225,10 +232,12 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
                         i += 1;
                         match args.get(i) {
                             Some(v) => Some(v.clone()),
+                            // `get_arg()` (parse-options.c:60) is a
+                            // `PARSE_OPT_ERROR` too: one line, no block.
                             None => {
-                                return Err(usage_error(format!(
-                                    "option `{canonical}' requires a value"
-                                )))
+                                return Err(crate::parseopt::requires_value(
+                                    crate::parseopt::OptName::Long(canonical),
+                                ))
                             }
                         }
                     }

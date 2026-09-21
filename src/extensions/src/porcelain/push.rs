@@ -141,6 +141,9 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         // reaches the same arm as `--force-with-lease`. The aliased form is needed
         // because `builtin_push_options[]` has an `OPT_ALIAS()`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long_aliased(typed, LONG_OPTS, ALIAS_GROUPS) {
             super::Long::Name(name) => {
                 canonical = name;

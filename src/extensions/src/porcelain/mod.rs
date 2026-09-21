@@ -481,6 +481,95 @@ pub(crate) fn ambiguous_option(
 /// — prints its own line and *no* block, so a bad value for a known option looks
 /// nothing like an unknown option.
 ///
+/// `do_get_value()`'s two `takes no value` refusals (parse-options.c:130-143),
+/// for a **long** token that carries an attached `=<value>`:
+///
+/// ```c
+///         const int unset = flags & OPT_UNSET;
+///
+///         if (unset && p->opt)
+///                 return error(_("%s takes no value"), optname(opt, flags));
+///         if (unset && (opt->flags & PARSE_OPT_NONEG))
+///                 return error(_("%s isn't available"), optname(opt, flags));
+///         if (!(flags & OPT_SHORT) && p->opt && (opt->flags & PARSE_OPT_NOARG))
+///                 return error(_("%s takes no value"), optname(opt, flags));
+/// ```
+///
+/// `p->opt` is non-NULL exactly when `parse_long_opt()` found an `=`
+/// (parse-options.c:252-253, `if (*rest == '=') p->opt = rest + 1;`), so this is
+/// the whole of the `=<value>` rule: the `--no-` spelling of *any* option
+/// refuses one whatever the entry does with values, and the plain spelling
+/// refuses one only when the entry is `PARSE_OPT_NOARG` ([`Arg::None`]).
+///
+/// The result is a `PARSE_OPT_ERROR`, which is the shape that prints **one**
+/// `error:` line and **no** usage block, at 129 — the distinction this port
+/// repeatedly got backwards by routing the token into its own "unknown option"
+/// arm, which prints the block. Measured on git 2.55.0 inside a repository:
+///
+/// ```text
+/// $ git add --dry-run=value ; echo $?
+/// error: option `dry-run' takes no value
+/// 129
+/// ```
+///
+/// The name comes from `optname()`, which reads `opt->long_name` — the **table's
+/// own spelling**, not the user's. An entry the table spells `no-verify` is
+/// therefore named `no-verify` when it is reached positively and `no-no-verify`
+/// when it is reached in the unset sense, which is exactly what stock prints:
+///
+/// ```text
+/// $ git commit --no-verify=x   →  error: option `no-verify' takes no value
+/// $ git commit --verify=x      →  error: option `no-no-verify' takes no value
+/// ```
+///
+/// A name no entry claims, or an ambiguous abbreviation, is **not** this
+/// refusal: both are returned as `None` so the caller's own `unknown option` /
+/// `ambiguous option` arm — which does print the block — still answers them, in
+/// the order `parse_long_opt()` decides them.
+pub(crate) fn long_takes_no_value(
+    tok: &str,
+    table: &'static [LongOpt],
+) -> Option<std::process::ExitCode> {
+    long_takes_no_value_aliased(tok, table, &[])
+}
+
+/// [`long_takes_no_value`] for a command whose table has `OPT_ALIAS()` entries,
+/// which change only which abbreviations are ambiguous.
+pub(crate) fn long_takes_no_value_aliased(
+    tok: &str,
+    table: &'static [LongOpt],
+    alias_groups: &[&[&str]],
+) -> Option<std::process::ExitCode> {
+    let name = long_no_value_name(tok, table, alias_groups)?;
+    Some(crate::parseopt::takes_no_value(name))
+}
+
+/// [`long_takes_no_value`] as a decision rather than an action, for the commands
+/// that thread their refusals through their own parse-failure type instead of
+/// writing stderr where the failure is found. Rendering stays
+/// [`crate::parseopt::OptName`]'s, so the two spellings cannot drift.
+pub(crate) fn long_no_value_name(
+    tok: &str,
+    table: &'static [LongOpt],
+    alias_groups: &[&[&str]],
+) -> Option<crate::parseopt::OptName<'static>> {
+    let body = tok.strip_prefix("--")?;
+    // `p->opt` is set only by an attached value; a bare `--<name>` is not this.
+    // A trailing bare `=` still counts — `git add --dry-run=` is refused too.
+    body.split_once('=')?;
+    let (opt, unset) = match resolve_long_aliased(table, alias_groups, body) {
+        Resolved::One(opt, sense) => (opt, sense),
+        Resolved::Ambiguous(..) | Resolved::Unknown => return None,
+    };
+    match unset || opt.arg == Arg::None {
+        true => Some(match unset {
+            true => crate::parseopt::OptName::Unset(opt.name),
+            false => crate::parseopt::OptName::Long(opt.name),
+        }),
+        false => None,
+    }
+}
+
 /// The rendering lives in [`crate::parseopt::unknown_option`], next to the
 /// `PARSE_OPT_ERROR` shapes it must stay distinguishable from.
 pub(crate) fn unknown_option(tok: &str, usage: &str) -> std::process::ExitCode {

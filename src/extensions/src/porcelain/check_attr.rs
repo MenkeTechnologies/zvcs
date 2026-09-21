@@ -131,6 +131,9 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {
@@ -151,9 +154,12 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             "--no-source" => source = None,
             "--source" => {
                 i += 1;
+                // `get_arg()` returns `PARSE_OPT_ERROR` (parse-options.c:59-60):
+                // the `error:` line alone, no usage block.
                 let Some(v) = args.get(i) else {
-                    eprint!("error: option `source' requires a value\n{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(crate::parseopt::requires_value(
+                        crate::parseopt::OptName::Long("source"),
+                    ));
                 };
                 source = Some(v.clone());
             }

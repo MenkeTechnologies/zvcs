@@ -480,6 +480,9 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

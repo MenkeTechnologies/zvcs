@@ -1108,6 +1108,11 @@ pub(crate) fn render_raw_stream(
         // spelling does. Short options and unknown names pass through untouched, so
         // the refusals below still quote what was typed.
         let canonical;
+        // `do_get_value()`'s `=<value>` refusal prints its own line and answers
+        // 129; like the ambiguity above, the number travels as a [`Status`].
+        if super::long_takes_no_value(args[i].as_str(), LONG_OPTS).is_some() {
+            return Ok(Status::from(129));
+        }
         let s = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;
@@ -1681,6 +1686,12 @@ pub(crate) fn render_raw_stream(
                     }
                 }
             }
+            // `parse_options_step()` consumes a lone `--` before any table lookup
+            // (parse-options.c: `if (!arg[2]) { ... ctx->argc--; ctx->argv++;
+            // break; }`), so it ends option parsing rather than being looked up
+            // — where it resolved to nothing and was reported as
+            // ``unknown option `''``.
+            "--" => break,
             // A name `parse_options()` has never heard of is rejected there, before any
             // of this command's own work begins — it is git's error, not a gap here.
             _ if !is_known_option(&s) => return Ok(unknown_option(&s)),

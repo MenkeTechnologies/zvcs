@@ -224,6 +224,15 @@ pub(super) const LONG_OPTS: &[super::LongOpt] = {
 };
 
 pub fn checkout(args: &[String]) -> Result<ExitCode> {
+    // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
+    // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
+    // and `parse_options()` then answers the request before the builtin has
+    // looked at a repository. Answering it only after `discover()` made
+    // `git checkout -h` outside one die `fatal: not a git repository` at 128, where
+    // stock prints the usage block on stdout at 129.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     // git writes `show_local_changes()` / `report_tracking()` to stdout and
     // `Switched to branch '<b>'` to stderr (builtin/checkout.c). Off a terminal
     // stdio holds the stdout half until `exit()`, so a caller capturing both
@@ -328,6 +337,9 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         let a: &str = if patch_opts.awaiting_value() || has_dashdash {
             orig
         } else {
+            if let Some(code) = super::long_takes_no_value(orig, LONG_OPTS) {
+                return Ok(code);
+            }
             resolved = match super::canonical_long(orig, LONG_OPTS) {
                 super::Long::Name(name) => name,
                 super::Long::Ambiguous(first, second) => {

@@ -119,6 +119,9 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         }
         // A bare `-` is a pathname, not an option, exactly as in parse-options.
         if !no_more_flags && a.len() > 1 && a.starts_with('-') {
+            if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+                return Ok(code);
+            }
             let resolved = match super::canonical_long(a, LONG_OPTS) {
                 super::Long::Name(name) => name,
                 super::Long::Ambiguous(first, second) => {

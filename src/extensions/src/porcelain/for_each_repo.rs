@@ -166,6 +166,13 @@ fn parse_options(args: &[String]) -> Parsed {
             // abbreviation lands on the arm its full spelling lands on — and so
             // the `takes no value` diagnostic names `no-config` for `--no-conf=x`
             // the way `optname()` does.
+            // `do_get_value()` (parse-options.c:130-143): the `=<value>` rule,
+            // shared with every other verb rather than spelled out again here.
+            // It runs on the token as typed and before the resolver, since the
+            // name it reports is the table's, not the abbreviation's.
+            if let Some(code) = super::long_takes_no_value(arg, LONG_OPTS) {
+                return Parsed::Exit(code);
+            }
             let canonical;
             let arg = match super::canonical_long(arg, LONG_OPTS) {
                 super::Long::Name(name) => {
@@ -181,13 +188,6 @@ fn parse_options(args: &[String]) -> Parsed {
                 None => (arg, None),
             };
 
-            // `get_value()` returns `PARSE_OPT_ERROR` for both of these, so they
-            // print their line and *no* usage block.
-            let takes_no_value = || {
-                eprintln!("error: option `{}' takes no value", &name[2..]);
-                Parsed::Exit(ExitCode::from(129))
-            };
-
             match name {
                 "--config" => match value {
                     Some(value) => config_key = Some(value.to_string()),
@@ -201,18 +201,9 @@ fn parse_options(args: &[String]) -> Parsed {
                 },
                 // Negated forms are pure booleans in `parse_options`, whatever
                 // the option's own type is.
-                "--no-config" => match value {
-                    Some(_) => return takes_no_value(),
-                    None => config_key = None,
-                },
-                "--keep-going" => match value {
-                    Some(_) => return takes_no_value(),
-                    None => keep_going = true,
-                },
-                "--no-keep-going" => match value {
-                    Some(_) => return takes_no_value(),
-                    None => keep_going = false,
-                },
+                "--no-config" => config_key = None,
+                "--keep-going" => keep_going = true,
+                "--no-keep-going" => keep_going = false,
                 _ => {
                     eprint!("error: unknown option `{}'\n{USAGE}", &arg[2..]);
                     return Parsed::Exit(ExitCode::from(129));

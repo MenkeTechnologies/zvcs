@@ -134,6 +134,14 @@ pub fn hook(args: &[String]) -> Result<ExitCode> {
         // `parse_long_opt()`, finds nothing, and reports `PARSE_OPT_UNKNOWN` —
         // the option (named as typed, `=<value>` and all) or the switch, then
         // the block, both on stderr at 129.
+        // `parse_options_step()` consumes a lone `--` before any table lookup
+        // (parse-options.c: `if (!arg[2]) { ... ctx->argc--; ctx->argv++;
+        // break; }`), so it is not a dashed word here — what is left has no
+        // sub-command in it, which is the refusal above.
+        Some("--") => {
+            eprint!("error: need a subcommand\n{USAGE_RUN}{USAGE_LIST_ALT}\n");
+            Ok(ExitCode::from(129))
+        }
         Some(other) if other.len() > 1 && other.starts_with('-') => Ok(super::unknown_option(
             other,
             &format!("{USAGE_RUN}{USAGE_LIST_ALT}\n"),

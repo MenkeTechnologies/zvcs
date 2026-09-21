@@ -1548,6 +1548,9 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so `--user-i`
         // reaches the same arm as `--user-interfaces`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

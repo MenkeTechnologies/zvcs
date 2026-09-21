@@ -121,6 +121,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             print!("{HELP}");
             return Ok(ExitCode::from(129));
         }
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

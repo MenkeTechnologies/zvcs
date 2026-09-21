@@ -638,6 +638,18 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
 
     let original_args = args;
 
+    // git.c:474-476 demotes `RUN_SETUP` to `RUN_SETUP_GENTLY` for a lone `-h`,
+    // so `parse_options()` answers it before setup and before the deprecation
+    // check below — `git whatchanged -h` prints `git log`'s block outside a
+    // repository too, where this used to die `fatal: not a git repository`.
+    // The block is `log`'s own: git.c:659 registers `whatchanged` as `cmd_log`'s
+    // sibling over `builtin_log_usage`.
+    if let Some(code) =
+        super::show_usage_if_asked_full(args, super::log::USAGE, super::log::USAGE_ALL)
+    {
+        return Ok(code);
+    }
+
     // git runs the deprecation check inside `cmd_whatchanged`, i.e. after repository
     // setup, so a missing repository is still reported first.
     let repo = crate::setup::discover()?;

@@ -380,6 +380,15 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         if s == "--help-all" {
             return Ok(super::show_usage(USAGE));
         }
+        // `do_get_value()` (parse-options.c:130-143): an `=<value>` the entry
+        // cannot take is refused by the *table's* name, with the `error:` line
+        // alone and no usage block — not as an unknown option. This used to be
+        // a private copy that tested `Arg::None` only, so it let
+        // `--no-<value-taking>=x` through where git refuses it, and named the
+        // option by the stem the user typed rather than by `opt->long_name`.
+        if let Some(code) = super::long_takes_no_value(s, LONG_OPTS) {
+            return Ok(code);
+        }
         // Resolve a long option's name the way `parse_long_opt()` does before
         // dispatching on it, so a unique abbreviation (`--stag`) reaches the arm
         // its full spelling reaches and an ambiguous one is refused by name.
@@ -390,27 +399,6 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
         };
         let s = resolved.as_ref();
-        // `do_get_value()` (parse-options.c:138-143): an `=<value>` written on an
-        // option the table declares `PARSE_OPT_NOARG` is refused by *name*, with
-        // the `error:` line alone and no usage block — not as an unknown option.
-        if let Some((head, _)) = s.split_once('=') {
-            let bare = head.trim_start_matches('-');
-            let (stem, negated) = match bare.strip_prefix("no-") {
-                Some(stem) => (stem, true),
-                None => (bare, false),
-            };
-            if LONG_OPTS
-                .iter()
-                .any(|o| o.name == stem && matches!(o.arg, super::Arg::None))
-            {
-                let name = if negated {
-                    crate::parseopt::OptName::Unset(stem)
-                } else {
-                    crate::parseopt::OptName::Long(stem)
-                };
-                return Ok(crate::parseopt::takes_no_value(name));
-            }
-        }
         match s {
             "--" => no_more_flags = true,
             "--cached" => opts.cached = true,

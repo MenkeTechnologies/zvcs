@@ -445,6 +445,9 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so `--worktree-a`
         // reaches the same arm as `--worktree-attributes`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;
@@ -1143,7 +1146,15 @@ fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
                     i += 1;
                     v.clone()
                 }
-                None => return Err(super::missing_option_value(a)),
+                // `optname()` (parse-options.c:30-45) reads `opt->long_name`,
+                // so the abbreviation is reported expanded: stock answers
+                // `git archive --exe` with ``option `exec' requires a value'',
+                // where passing the typed token said ``option `exe'''.
+                None => {
+                    return Err(crate::parseopt::requires_value(
+                        crate::parseopt::OptName::Long(slot),
+                    ))
+                }
             },
         };
         match slot {

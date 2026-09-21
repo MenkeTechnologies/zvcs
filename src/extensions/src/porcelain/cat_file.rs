@@ -345,6 +345,9 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         }
 
         let raw = arg;
+        if let Some(code) = super::long_takes_no_value_aliased(arg, LONG_OPTS, ALIAS_GROUPS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long_aliased(arg, LONG_OPTS, ALIAS_GROUPS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

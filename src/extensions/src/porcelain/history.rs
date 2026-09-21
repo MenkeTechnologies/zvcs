@@ -174,6 +174,14 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
         // table is `OPT_SUBCOMMAND`s only, so `parse_options_step()` sends it to
         // `parse_long_opt()`, finds nothing and reports `PARSE_OPT_UNKNOWN` —
         // the option named as typed, `=<value>` and all, then the block.
+        // `parse_options_step()` consumes a lone `--` before any table lookup
+        // (parse-options.c: `if (!arg[2]) { ... ctx->argc--; ctx->argv++;
+        // break; }`), so it is not a dashed word here — what is left has no
+        // sub-command in it.
+        "--" => {
+            eprint!("error: need a subcommand\n{USAGE}\n");
+            return Ok(ExitCode::from(EXIT_USAGE));
+        }
         other if other.len() > 1 && other.starts_with('-') => {
             return Ok(super::unknown_option(other, &format!("{USAGE}\n")));
         }

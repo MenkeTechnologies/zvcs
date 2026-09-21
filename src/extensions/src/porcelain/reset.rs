@@ -440,6 +440,15 @@ fn ambiguous_argument(arg: &str) -> ExitCode {
 }
 
 pub fn reset(args: &[String]) -> Result<ExitCode> {
+    // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
+    // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
+    // and `parse_options()` then answers the request before the builtin has
+    // looked at a repository. Answering it only after `discover()` made
+    // `git reset -h` outside one die `fatal: not a git repository` at 128, where
+    // stock prints the usage block on stdout at 129.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     // Every `reset` that moves HEAD writes a reflog line, and the reflog writer
     // (`log_ref_write_fd()`, refs/files-backend.c:1940-41) fills a missing
     // committer with `git_committer_info(0)` — flag 0, so `fmt_ident()` runs
@@ -546,6 +555,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // the shared value-option handler and the match below, so `--intent-to`
         // reaches the same arm as `--intent-to-add`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

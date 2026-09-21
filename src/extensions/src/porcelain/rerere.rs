@@ -168,6 +168,9 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
             }
             // Any unambiguous prefix names the option, so `--rerere-au` and
             // `--r` are both `--rerere-autoupdate` and `--n` is its negation.
+            if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+                return Ok(code);
+            }
             let resolved = match super::canonical_long(a, LONG_OPTS) {
                 super::Long::Name(name) => name,
                 super::Long::Ambiguous(first, second) => {

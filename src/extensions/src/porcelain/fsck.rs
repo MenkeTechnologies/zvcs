@@ -1516,8 +1516,15 @@ impl Options {
             if let Some(long) = s.strip_prefix("--") {
                 match resolve_long(long) {
                     LongOutcome::Apply { idx, unset } => self.apply(idx, unset),
+                    // `parse_long_opt()` reports the reason with `error()` on
+                    // stderr and then returns `PARSE_OPT_HELP`, which
+                    // `parse_options_step()` routes to `show_usage:` —
+                    // `usage_with_options_internal(..., USAGE_TO_STDOUT)`. So the
+                    // block lands on **stdout** while its explanation is on
+                    // stderr, at 129. Printing no block at all was the divergence.
                     LongOutcome::Ambiguous(msg) => {
                         eprintln!("{msg}");
+                        print!("{FSCK_USAGE}");
                         return ParseControl::Exit(129);
                     }
                     LongOutcome::TakesNoValue(name) => {

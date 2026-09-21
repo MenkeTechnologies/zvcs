@@ -267,10 +267,13 @@ fn parse_args(
                 i += 1;
                 match args.get(i) {
                     Some(v) => Some(v.clone()),
+                    // `get_arg()`'s refusal is a `PARSE_OPT_ERROR`
+                    // (parse-options.c:60): the line alone, no usage block —
+                    // `ParseError::Usage` would append one.
                     None => {
-                        return Err(ParseError::Usage(format!(
-                            "error: option `{}' requires a value\n",
-                            spec.name
+                        return Err(ParseError::Bare(format!(
+                            "error: {} requires a value\n",
+                            crate::parseopt::OptName::Long(spec.name)
                         )))
                     }
                 }

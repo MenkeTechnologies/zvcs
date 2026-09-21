@@ -1154,6 +1154,9 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // resolves, so an unambiguous prefix lands on exactly the arm its full
         // spelling lands on — including the arms that refuse.
         let orig: &str = a.as_str();
+        if let Some(code) = super::long_takes_no_value(orig, ACTION_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(orig, ACTION_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

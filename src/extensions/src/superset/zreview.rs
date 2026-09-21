@@ -31,26 +31,54 @@ struct Pending {
     stat: String,
 }
 
-fn review_repo(workdir: &Path) -> Option<Pending> {
-    let status = git_out(workdir, "status", &["--short"])?;
+/// What one repository contributes to the review.
+enum Review {
+    /// Nothing to review.
+    Clean,
+    /// The status block and diffstat to show.
+    Pending(Pending),
+    /// The status probe did not run — a git dir that is gone, or one whose
+    /// permissions deny it. Distinct from `Clean` on purpose: both used to be
+    /// `None`, so a repository holding uncommitted work was dropped from the
+    /// screen that exists to show uncommitted work, and the summary counted it
+    /// among the "indexed" without a word.
+    Unreadable,
+}
+
+fn review_repo(workdir: &Path) -> Review {
+    let Some(status) = git_out(workdir, "status", &["--short"]) else {
+        return Review::Unreadable;
+    };
     if status.trim().is_empty() {
-        return None; // clean — nothing to review
+        return Review::Clean;
     }
     // Diffstat of tracked changes (staged + unstaged), for a size-at-a-glance line.
     let stat = git_out(workdir, "diff", &["HEAD", "--stat"]).unwrap_or_default();
-    Some(Pending { status, stat })
+    Review::Pending(Pending { status, stat })
 }
 
 pub fn zreview(args: &[String]) -> Result<ExitCode> {
     let Some(repos) = selected(args)? else { return Ok(ExitCode::SUCCESS) };
-    let pending: Vec<(PathBuf, Option<Pending>)> = {
+    let pending: Vec<(PathBuf, Review)> = {
         let per = parallel_map(&repos, |_gd, wd| review_repo(wd));
         repos.iter().map(|(_, wd)| wd.clone()).zip(per).collect()
     };
     let mut repos_with_change = 0usize;
     let mut total_entries = 0usize;
+    let mut unreadable = 0usize;
     for (wd, p) in &pending {
-        let Some(p) = p else { continue };
+        let p = match p {
+            Review::Clean => continue,
+            Review::Unreadable => {
+                // Shown, not skipped: a repository that cannot be read is the
+                // one thing a review screen must not leave out silently.
+                unreadable += 1;
+                println!("\x1b[1m== {} ==\x1b[0m  (unreadable)", wd.display());
+                println!();
+                continue;
+            }
+            Review::Pending(p) => p,
+        };
         repos_with_change += 1;
         let entries = p.status.lines().filter(|l| !l.trim().is_empty()).count();
         total_entries += entries;
@@ -66,8 +94,9 @@ pub fn zreview(args: &[String]) -> Result<ExitCode> {
         println!();
     }
     eprintln!(
-        "zreview: {repos_with_change} repo(s) with {total_entries} pending change(s) across {} indexed",
-        repos.len()
+        "zreview: {repos_with_change} repo(s) with {total_entries} pending change(s) across {} indexed{}",
+        repos.len(),
+        crate::superset::query::unreadable_note(unreadable)
     );
     Ok(ExitCode::SUCCESS)
 }

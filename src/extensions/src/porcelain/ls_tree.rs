@@ -191,6 +191,9 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(129));
         }
         if !no_more_opts && a.len() > 1 && a.starts_with('-') {
+            if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+                return Ok(code);
+            }
             let resolved = match super::canonical_long(a, LONG_OPTS) {
                 super::Long::Name(name) => name,
                 super::Long::Ambiguous(first, second) => {
@@ -240,8 +243,13 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
                             Some(v) => v.to_string(),
                             None => match it.next() {
                                 Some(v) => v.clone(),
+                                // `get_arg()` returns `PARSE_OPT_ERROR`
+                                // (parse-options.c:59-60), which prints no usage
+                                // block; `error_with_usage` is the other shape.
                                 None => {
-                                    return Ok(error_with_usage("option `format' requires a value"))
+                                    return Ok(crate::parseopt::requires_value(
+                                        crate::parseopt::OptName::Long("format"),
+                                    ))
                                 }
                             },
                         };

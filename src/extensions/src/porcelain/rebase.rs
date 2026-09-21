@@ -537,6 +537,15 @@ fn imply_merge(ty: &mut Backend, option: &str) -> Result<(), String> {
 }
 
 pub fn rebase(args: &[String]) -> Result<ExitCode> {
+    // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
+    // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
+    // and `parse_options()` then answers the request before the builtin has
+    // looked at a repository. Answering it only after `discover()` made
+    // `git rebase -h` outside one die `fatal: not a git repository` at 128, where
+    // stock prints the usage block on stdout at 129.
+    if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
+        return Ok(code);
+    }
     // `die()`: one line on stderr prefixed `fatal: `, exit 128.
     macro_rules! die {
         ($($t:tt)*) => {{
@@ -730,6 +739,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         // exactly as it was: the resolver hands back a full spelling, which that
         // code then splits the same way it always split a full spelling.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

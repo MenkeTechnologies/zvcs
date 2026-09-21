@@ -1045,6 +1045,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         // reaches the same arm as `--creation-factor` — including the arm that defers
         // an option this port has not implemented. Short options pass through untouched.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

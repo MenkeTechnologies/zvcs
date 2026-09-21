@@ -194,8 +194,17 @@ pub fn bundle(args: &[String]) -> Result<ExitCode> {
         "verify" => verify(rest),
         "list-heads" => list_heads(rest),
         "unbundle" => unbundle(rest),
-        s if s.starts_with("--") => Ok(bad_option(&s[2..], TOP_USAGE, false)),
-        s if s.starts_with('-') && s.len() > 1 => Ok(bad_option(&s[1..], TOP_USAGE, true)),
+        // `parse_options_step()` consumes a lone `--` before any table lookup
+        // (parse-options.c: `if (!arg[2]) { ... ctx->argc--; ctx->argv++; break; }`),
+        // so it is never an unknown option. What is left is a command line with
+        // no sub-command word in it, which is `PARSE_OPT_SUBCOMMAND`'s own
+        // refusal — the same one an empty argv gets.
+        "--" => {
+            eprint!("error: need a subcommand\n{TOP_USAGE}");
+            Ok(ExitCode::from(129))
+        }
+        s if s.starts_with("--") => Ok(bad_option(s, TOP_USAGE)),
+        s if s.starts_with('-') && s.len() > 1 => Ok(bad_option(s, TOP_USAGE)),
         s => {
             eprint!("error: unknown subcommand: `{s}'\n{TOP_USAGE}");
             Ok(ExitCode::from(129))
@@ -205,10 +214,15 @@ pub fn bundle(args: &[String]) -> Result<ExitCode> {
 
 /// git's parse-options diagnostic for an unrecognised option, plus the usage
 /// block of the (sub)command that rejected it. Exit 129, both on stderr.
-fn bad_option(name: &str, usage: &str, short: bool) -> ExitCode {
-    let kind = if short { "switch" } else { "option" };
-    eprint!("error: unknown {kind} `{name}'\n{usage}");
-    ExitCode::from(129)
+///
+/// `tok` is the argument **with** its dashes, because which of the two
+/// diagnostics applies — and, for a short one, how much of the token is named —
+/// is [`crate::parseopt::unknown_option`]'s decision and not this module's. The
+/// private copy this replaced named a whole cluster (`git bundle -7q` reported
+/// ``unknown switch `7q'``) where `*ctx->opt` is a single character, and had no
+/// arm at all for the non-ASCII spelling.
+fn bad_option(tok: &str, usage: &str) -> ExitCode {
+    crate::parseopt::unknown_option(tok, usage)
 }
 
 /// git's `fatal: need a <file> argument`, followed by a blank line and usage.
@@ -462,10 +476,10 @@ fn list_heads(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             s if s.starts_with("--") && s.len() > 2 => {
-                return Ok(bad_option(&s[2..], LIST_HEADS_USAGE, false));
+                return Ok(bad_option(s, LIST_HEADS_USAGE));
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                return Ok(bad_option(&s[1..], LIST_HEADS_USAGE, true));
+                return Ok(bad_option(s, LIST_HEADS_USAGE));
             }
             s => file = Some(s),
         }
@@ -523,10 +537,10 @@ fn verify(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             s if s.starts_with("--") && s.len() > 2 => {
-                return Ok(bad_option(&s[2..], VERIFY_USAGE, false));
+                return Ok(bad_option(s, VERIFY_USAGE));
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                return Ok(bad_option(&s[1..], VERIFY_USAGE, true));
+                return Ok(bad_option(s, VERIFY_USAGE));
             }
             s => file = Some(s),
         }
@@ -744,7 +758,7 @@ fn create(args: &[String]) -> Result<ExitCode> {
                     Err(code) => return Ok(code),
                 }
             }
-            _ => return Ok(bad_option(a.trim_start_matches('-'), CREATE_USAGE, !a.starts_with("--"))),
+            _ => return Ok(bad_option(a, CREATE_USAGE)),
         }
         i += 1;
     }
@@ -1720,10 +1734,10 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
             "--progress" => progress = true,
             "--no-progress" => progress = false,
             s if s.starts_with("--") && s.len() > 2 => {
-                return Ok(bad_option(&s[2..], UNBUNDLE_USAGE, false));
+                return Ok(bad_option(s, UNBUNDLE_USAGE));
             }
             s if s.starts_with('-') && s.len() > 1 => {
-                return Ok(bad_option(&s[1..], UNBUNDLE_USAGE, true));
+                return Ok(bad_option(s, UNBUNDLE_USAGE));
             }
             s => file = Some(s),
         }

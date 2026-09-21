@@ -304,8 +304,11 @@ fn parse_options(args: &[String]) -> Result<Parsed> {
                 *i += 1;
                 match args.get(*i) {
                     Some(v) => Some(v.clone()),
+                    // `get_arg()` returns `PARSE_OPT_ERROR`
+                    // (parse-options.c:59-60): the `error:` line alone, no usage
+                    // block — that block belongs to `PARSE_OPT_UNKNOWN`.
                     None => {
-                        eprint!("error: {kind} `{opt}' requires a value\n{USAGE_WITH_OPTIONS}");
+                        eprintln!("error: {kind} `{opt}' requires a value");
                         None
                     }
                 }

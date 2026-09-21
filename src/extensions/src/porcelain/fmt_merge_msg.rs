@@ -203,6 +203,9 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so `--into-n`
         // reaches the same arm as `--into-name`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(args[i].as_str(), LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(args[i].as_str(), LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

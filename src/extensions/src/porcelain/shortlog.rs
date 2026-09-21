@@ -409,6 +409,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // abbreviating — so a name outside [`LONG_OPTS`] must come back untouched,
         // which is exactly what the resolver does.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

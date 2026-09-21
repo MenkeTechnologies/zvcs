@@ -151,6 +151,9 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
         }
         // Any unambiguous prefix of a long option names it, so `--object-f`
         // lands on the same arm `--object-format` does.
+        if let Some(code) = super::long_takes_no_value(raw, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(raw, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

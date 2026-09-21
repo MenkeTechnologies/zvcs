@@ -218,6 +218,15 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
         "verify" => verify(&args[1..]),
         // git's option parser reports an unknown leading dashed argument before
         // it ever looks for a subcommand.
+        // `parse_options_step()` consumes a lone `--` before any table lookup
+        // (parse-options.c: `if (!arg[2]) { ... ctx->argc--; ctx->argv++; break; }`),
+        // so it is never an unknown option. What is left is a command line with
+        // no sub-command word in it, which is `PARSE_OPT_SUBCOMMAND`'s own
+        // refusal — the same one an empty argv gets.
+        "--" => {
+            eprint!("error: need a subcommand\n{USAGE}");
+            Ok(ExitCode::from(129))
+        }
         s if s.starts_with("--") => {
             eprintln!("error: unknown option `{}'", &s[2..]);
             eprint!("{USAGE}");

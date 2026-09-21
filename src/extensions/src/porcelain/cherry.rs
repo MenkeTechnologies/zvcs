@@ -99,11 +99,13 @@ enum Abbrev {
 
 /// `git cherry` — find commits yet to be applied upstream.
 pub fn cherry(args: &[String]) -> Result<ExitCode> {
-    // `run_builtin()` answers a lone `-h` before `setup_git_directory()`, so this
-    // form works outside a repository.
-    if args.len() == 2 && args[1] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+    // git.c:474-476 demotes `RUN_SETUP` to `RUN_SETUP_GENTLY` for a lone `-h`,
+    // so `parse_options()` answers it before `setup_git_directory()` and the
+    // form works outside a repository. The test used to read `args[1]` of a
+    // two-word argv, but `dispatch::run` passes only the tail, so it never
+    // fired and `git cherry -h` outside a repository died at 128.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
     }
 
     let repo = crate::setup::discover()?;
@@ -124,6 +126,9 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

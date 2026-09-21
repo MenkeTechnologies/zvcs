@@ -245,6 +245,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
         // no entry claims come back untouched, so the refusals below still quote
         // what was typed.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(Parse::Failed(code));
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

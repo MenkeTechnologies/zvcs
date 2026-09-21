@@ -121,6 +121,9 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;
@@ -148,10 +151,12 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
                     format = Some(v.as_str());
                     i += 1;
                 }
+                // `get_arg()` returns `PARSE_OPT_ERROR` (parse-options.c:60),
+                // which is the one-line shape: no usage block, 129.
                 None => {
-                    eprintln!("error: option `format' requires a value");
-                    eprint!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(crate::parseopt::requires_value(
+                        crate::parseopt::OptName::Long("format"),
+                    ))
                 }
             },
             "--no-format" => format = None,
@@ -161,16 +166,12 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--format=") => {
                 format = typed.split_once('=').map(|(_, v)| v)
             }
-            _ => {
-                // git's parse-options wording, then the usage block.
-                let (kind, name) = match a.strip_prefix("--") {
-                    Some(long) => ("option", long),
-                    None => ("switch", &a[1..]),
-                };
-                eprintln!("error: unknown {kind} `{name}'");
-                eprint!("{USAGE}");
-                return Ok(ExitCode::from(129));
-            }
+            // git's parse-options wording, then the usage block. Which of the
+            // two it is, and how much of a short token is named, is
+            // [`crate::parseopt::unknown_option`]'s decision: the private copy
+            // here named a whole cluster, so `git verify-tag -7q` reported
+            // ``unknown switch `7q'`` where `*ctx->opt` is one character.
+            _ => return Ok(crate::parseopt::unknown_option(a, USAGE)),
         }
     }
 

@@ -183,6 +183,9 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         if a == "--help-all" {
             return Ok(super::show_usage(USAGE));
         }
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

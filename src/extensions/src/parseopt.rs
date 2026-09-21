@@ -317,9 +317,20 @@ pub enum OptName<'a> {
     Short(char),
     /// `OPT_LONG`: named by `long_name`, without the leading `--`.
     Long(&'a str),
-    /// `OPT_UNSET`: `long_name` with git's own `no-` glued back on. git builds
-    /// this from the table's stem, so a `--no-x` spelling of a `no-x` *entry*
-    /// still reports `no-x` and not `no-no-x`.
+    /// `OPT_UNSET`: `no-` glued onto `long_name` — the table's field, *not* the
+    /// stem `parse_long_opt()` walked past. `optname()` reads `opt->long_name`
+    /// while the `skip_prefix(long_name, "no-", &long_name)` at
+    /// parse-options.c:243 only advanced a local, so a `no-`-named entry keeps
+    /// its own `no-` and gains a second one. Measured on git 2.55.0, where
+    /// `no-verify` is the table's spelling of the entry:
+    ///
+    /// ```text
+    /// $ git commit --no-verify=x   →  error: option `no-verify' takes no value
+    /// $ git commit --verify=x      →  error: option `no-no-verify' takes no value
+    /// ```
+    ///
+    /// so the caller passes the entry's name verbatim and this renders the
+    /// second `no-`.
     Unset(&'a str),
 }
 

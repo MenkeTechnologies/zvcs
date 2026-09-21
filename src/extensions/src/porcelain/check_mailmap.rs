@@ -100,11 +100,13 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
                 Err(Ambiguity::Unknown) => {
                     return Ok(usage_error(&format!("unknown option `{}'", &a[2..])));
                 }
+                // The ambiguity report is the odd one out: the explanation is
+                // `error()` on stderr, but the block reaches
+                // `usage_with_options_internal(..., USAGE_TO_STDOUT)` and lands
+                // on **stdout**. `usage_error` puts both on stderr, which is the
+                // `unknown option` shape and not this one.
                 Err(Ambiguity::Multiple(cands)) => {
-                    return Ok(usage_error(&format!(
-                        "ambiguous option: {name} (could be --{} or --{})",
-                        cands[0], cands[1]
-                    )));
+                    return Ok(super::ambiguous_option(a, cands[0], cands[1], USAGE));
                 }
             };
 

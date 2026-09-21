@@ -115,6 +115,15 @@ pub fn repo(args: &[String]) -> Result<ExitCode> {
         "info" => info(&args[1..]),
         "structure" => structure(&args[1..]),
         // An option in the subcommand slot is reported as an option, not a verb.
+        // `parse_options_step()` consumes a lone `--` before any table lookup
+        // (parse-options.c: `if (!arg[2]) { ... ctx->argc--; ctx->argv++; break; }`),
+        // so it is never an unknown option. What is left is a command line with
+        // no sub-command word in it, which is `PARSE_OPT_SUBCOMMAND`'s own
+        // refusal — the same one an empty argv gets.
+        "--" => {
+            eprint!("error: need a subcommand\n{USAGE_TOP}");
+            Ok(ExitCode::from(129))
+        }
         s if s.starts_with("--") => Ok(top_error(&format!("unknown option `{}'", &s[2..]))),
         s if s.len() > 1 && s.starts_with('-') => {
             // git's parse-options reports only the first offending short switch.

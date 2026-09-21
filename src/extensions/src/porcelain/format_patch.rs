@@ -955,6 +955,15 @@ struct Opts {
 }
 
 pub fn format_patch(args: &[String]) -> Result<ExitCode> {
+    // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
+    // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
+    // and `parse_options()` then answers the request before the builtin has
+    // looked at a repository. Answering it only after `discover()` made
+    // `git format-patch -h` outside one die `fatal: not a git repository` at 128, where
+    // stock prints the usage block on stdout at 129.
+    if let Some(code) = super::show_usage_if_asked(args, USAGE) {
+        return Ok(code);
+    }
     let repo = crate::setup::discover()?;
 
     let mut opts = match parse(&repo, args)? {

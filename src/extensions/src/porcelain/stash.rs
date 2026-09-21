@@ -4276,12 +4276,7 @@ fn parse_push_options(
 /// }
 /// ```
 fn usage_error(flag: &str, usage: &str) -> ExitCode {
-    match flag.strip_prefix("--") {
-        Some(long) => eprintln!("error: unknown option `{long}'"),
-        None => eprintln!("error: unknown switch `{}'", &flag[1..]),
-    }
-    eprint!("{usage}");
-    ExitCode::from(129)
+    crate::parseopt::unknown_option(flag, usage)
 }
 
 /// Parse `save` options: `push`'s table minus the pathspec options, with the

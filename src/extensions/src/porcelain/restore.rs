@@ -439,6 +439,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // the shared value-option handler and the match below, so `--ignore-unm`
         // reaches the same arm as `--ignore-unmerged`.
         let canonical;
+        if let Some(code) = super::long_takes_no_value(&args[i], LONG_OPTS) {
+            return Ok(code);
+        }
         let a = match super::canonical_long(&args[i], LONG_OPTS) {
             super::Long::Name(name) => {
                 canonical = name;

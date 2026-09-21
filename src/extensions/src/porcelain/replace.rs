@@ -240,6 +240,9 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {
@@ -268,11 +271,13 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
                 "format" => {
                     i += 1;
                     let Some(v) = args.get(i) else {
-                        // parse-options' `opterror`: an `error:` line, the usage
-                        // block, exit 129.
-                        eprintln!("error: option `format' requires a value");
-                        eprint!("{USAGE}");
-                        return Ok(ExitCode::from(129));
+                        // `get_arg()` returns `PARSE_OPT_ERROR`
+                        // (parse-options.c:59-60): the `error:` line alone and
+                        // *no* usage block. The block belongs to
+                        // `PARSE_OPT_UNKNOWN`, which a known option is not.
+                        return Ok(crate::parseopt::requires_value(
+                            crate::parseopt::OptName::Long("format"),
+                        ));
                     };
                     format = Some(v.clone());
                 }

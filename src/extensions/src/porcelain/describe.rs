@@ -113,6 +113,9 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
         }
         // Resolve the long name the way `parse_long_opt()` resolves it, so a
         // unique abbreviation reaches the arm its full spelling reaches.
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {

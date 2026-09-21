@@ -199,6 +199,9 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
             print!("{USAGE}");
             return Ok(ExitCode::from(129));
         }
+        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+            return Ok(code);
+        }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {
@@ -256,12 +259,6 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
             // here already behaves exactly as it does under the flag. Accepting
             // it is byte-for-byte parity; there is nothing further to do.
             "--exclude-promisor-objects" | "--no-exclude-promisor-objects" => {}
-            // A switch that takes no argument, given one. parse-options reports
-            // this with the spelling the user typed and no usage block.
-            _ if a.starts_with("--") && a.contains('=') && takes_no_value(a) => {
-                let name = a[2..].split('=').next().unwrap_or_default();
-                return Ok(option_error(&format!("option `{name}' takes no value")));
-            }
             _ if a.starts_with("--") => {
                 return Ok(usage_error(Some(&format!("unknown option `{}'", &a[2..]))));
             }
@@ -592,23 +589,6 @@ fn option_error(msg: &str) -> ExitCode {
 fn malformed_date(value: &str) -> ExitCode {
     eprintln!("fatal: malformed expiration date '{value}'");
     ExitCode::from(128)
-}
-
-/// The long options `prune` declares with no argument. Given `--<name>=<value>`
-/// parse-options rejects them by the spelling that was typed.
-fn takes_no_value(arg: &str) -> bool {
-    matches!(
-        arg[2..].split('=').next().unwrap_or_default(),
-        "dry-run"
-            | "no-dry-run"
-            | "verbose"
-            | "no-verbose"
-            | "progress"
-            | "no-progress"
-            | "no-expire"
-            | "exclude-promisor-objects"
-            | "no-exclude-promisor-objects"
-    )
 }
 
 // git's `parse_expiry_date()` (date.c:957) for `--expire`, shared with every other expiry

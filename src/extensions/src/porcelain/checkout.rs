@@ -50,8 +50,6 @@
 //!
 //! Deviations (honest, conservative — never corrupting):
 //! ```text
-//!   * Pathspecs match literal files and directory prefixes (and `.`); general
-//!     glob magic is left to the shell.
 //!   * `--ours`/`--theirs` write a conflicted path's stage-2/stage-3 blob into
 //!     the worktree (index left conflicted), `--orphan` starts an unborn branch —
 //!     all matching stock git.
@@ -2353,7 +2351,7 @@ fn restore_conflict_stage(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let index = repo.open_index()?;
-    let norm = normalize_specs(repo, paths)?;
+    let norm = Specs::new(repo, paths)?;
     let matched = match match_paths(&index, paths, &norm) {
         Ok(m) => m,
         Err(spec) => {
@@ -2870,12 +2868,12 @@ fn restore_from_index(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut index = repo.open_index()?;
-    let norm = normalize_specs(repo, paths)?;
+    let norm = Specs::new(repo, paths)?;
     // `if (opts->merge) unmerge_index(…)` (builtin/checkout.c:637-638) — ahead of the
     // pathspec match, so a conflict that was already resolved comes back first.
     if merge.is_some() {
         unmerge_index(&mut index, |p| {
-            norm.iter().any(|spec| spec_matches(p.as_ref(), spec))
+            norm.matches(p.as_ref())
         });
     }
     // `mark_ce_for_checkout_*()` (builtin/checkout.c:392, :426) skips a skip-worktree entry
@@ -3129,7 +3127,7 @@ fn restore_from_tree(
         src.remove_entries(|_, path, _| sparse.contains(&path.to_owned()));
     }
 
-    let norm = normalize_specs(repo, paths)?;
+    let norm = Specs::new(repo, paths)?;
 
     // Paths to write from the tree, and (no-overlay only) paths to delete.
     let (matched, to_remove) = if overlay {
@@ -4309,54 +4307,60 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
 fn match_paths<'a>(
     index: &gix::index::File,
     specs: &[&'a str],
-    norm: &[(String, bool)],
+    norm: &Specs,
 ) -> std::result::Result<Vec<BString>, &'a str> {
     match_paths_excluding(index, specs, norm, &HashSet::new())
 }
 
-/// The current directory expressed as repo-root-relative path components — git's
-/// `prefix`, which `parse_pathspec()` prepends to every non-magic element
-/// (`prefix_path()`, setup.c). A pathspec is relative to where the command was
-/// run, not to the worktree root, so `git checkout <tree> -- s.txt` inside `sub/`
-/// names `sub/s.txt` and a bare `.` there names only what lies under `sub/`.
-fn repo_prefix(repo: &gix::Repository) -> Vec<String> {
-    let Some(workdir) = repo.workdir() else {
-        return Vec::new();
-    };
-    let wd = workdir.canonicalize().unwrap_or_else(|_| workdir.to_owned());
-    let Ok(cwd) = std::env::current_dir() else {
-        return Vec::new();
-    };
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
-    cwd.strip_prefix(&wd)
-        .map(|rel| {
-            rel.components()
-                .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+/// The `-- <pathspec>…` list, parsed by `parse_pathspec()`'s gate and then by the
+/// engine the rest of the binary matches with.
+///
+/// `cmd_checkout()` parses its pathspec with `parse_pathspec(&opts->pathspec, 0,
+/// …)` (builtin/checkout.c:2016-2018) — a mask of `0`, so every magic keyword is
+/// accepted — and this verb honoured none of it: the whole element, `:(literal)`
+/// and `:(bogus)` alike, was taken as a literal path and reported as
+/// `error: pathspec '…' did not match any file(s) known to git` at exit 1, where
+/// a malformed one is `fatal:` at 128 and a well-formed one selects files.
+struct Specs {
+    /// Every element as one set, which is the only form in which an exclusion
+    /// means anything: `:(exclude)`/`:!` subtracts from what the positive
+    /// elements select, so "does any single element match" is the wrong
+    /// question to ask of the list.
+    set: super::log::PathspecMatcher,
+    /// One matcher per element, for `report_path_error()`'s per-element "did
+    /// this one match anything" bookkeeping (dir.c:640-673). `None` for an
+    /// exclusion, which `do_match_pathspec()` marks seen as soon as it subtracts
+    /// anything and which is therefore never the element git names.
+    per_element: Vec<Option<super::log::PathspecMatcher>>,
 }
 
-/// Every pathspec normalised against the prefix of the directory the command was
-/// run in, ready for [`spec_matches`]. A spec whose `..` climbs out of the
-/// worktree is git's `fatal: <spec>: '<spec>' is outside repository at '<wd>'`
-/// (`prefix_path_gently()` failing in `parse_pathspec()`), which exits 128.
-fn normalize_specs(repo: &gix::Repository, specs: &[&str]) -> Result<Vec<(String, bool)>> {
-    let prefix = repo_prefix(repo);
-    let mut out = Vec::with_capacity(specs.len());
-    for spec in specs {
-        match normalize_spec(&prefix, spec) {
-            Some(n) => out.push(n),
-            None => {
-                let wd = repo
-                    .workdir()
-                    .map(|w| w.canonicalize().unwrap_or_else(|_| w.to_owned()))
-                    .unwrap_or_default();
-                crate::git_fatal!("{spec}: '{spec}' is outside repository at '{}'", wd.display());
-            }
+impl Specs {
+    /// Parse `specs` for `repo`, raising `parse_pathspec()`'s `die()`s first.
+    ///
+    /// The elements are handed to the engine *raw*: it applies the repository
+    /// prefix itself, so a spec pre-resolved against the prefix would have it
+    /// applied twice and match nothing from a subdirectory.
+    fn new(repo: &gix::Repository, specs: &[&str]) -> Result<Self> {
+        if let Some(msg) = crate::pathspec::parse_pathspec_fatal(repo, specs) {
+            crate::git_fatal!("{msg}");
         }
+        let set = super::log::PathspecMatcher::new(repo, specs)?;
+        let mut per_element = Vec::with_capacity(specs.len());
+        for spec in specs {
+            per_element.push(match super::ls_files::is_exclude_pathspec(spec) {
+                true => None,
+                false => {
+                    Some(super::log::PathspecMatcher::new(repo, std::slice::from_ref(spec))?)
+                }
+            });
+        }
+        Ok(Self { set, per_element })
     }
-    Ok(out)
+
+    /// Whether the set selects this repo-root-relative path.
+    fn matches(&self, path: &[u8]) -> bool {
+        self.set.matches(path)
+    }
 }
 
 /// [`match_paths`] with the entries in `exclude` taken out of the index first — the sparse
@@ -4364,7 +4368,7 @@ fn normalize_specs(repo: &gix::Repository, specs: &[&str]) -> Result<Vec<(String
 fn match_paths_excluding<'a>(
     index: &gix::index::File,
     specs: &[&'a str],
-    norm: &[(String, bool)],
+    norm: &Specs,
     exclude: &HashSet<BString>,
 ) -> std::result::Result<Vec<BString>, &'a str> {
     let (matched, hit) = matches_in_excluding(index, norm, exclude);
@@ -4378,7 +4382,7 @@ fn match_paths_excluding<'a>(
 /// anything" flag. Unlike [`match_paths`] this never fails, so callers that must
 /// consider several indexes (e.g. no-overlay's tree ∪ index) can decide the
 /// "did not match" error against their own union.
-fn matches_in(index: &gix::index::File, norm: &[(String, bool)]) -> (Vec<BString>, Vec<bool>) {
+fn matches_in(index: &gix::index::File, norm: &Specs) -> (Vec<BString>, Vec<bool>) {
     matches_in_excluding(index, norm, &HashSet::new())
 }
 
@@ -4387,12 +4391,14 @@ fn matches_in(index: &gix::index::File, norm: &[(String, bool)]) -> (Vec<BString
 /// per entry, because this is O(entries x specs).
 fn matches_in_excluding(
     index: &gix::index::File,
-    norm: &[(String, bool)],
+    norm: &Specs,
     exclude: &HashSet<BString>,
 ) -> (Vec<BString>, Vec<bool>) {
     let mut matched: Vec<BString> = Vec::new();
     let mut seen: HashSet<BString> = HashSet::new();
-    let mut hit = vec![false; norm.len()];
+    // An exclusion is never the element `report_path_error()` names, so it
+    // starts out satisfied.
+    let mut hit: Vec<bool> = norm.per_element.iter().map(Option::is_none).collect();
 
     let backing = index.path_backing();
     for e in index.entries() {
@@ -4407,70 +4413,23 @@ fn matches_in_excluding(
             continue;
         }
         let bytes: &[u8] = path.as_ref();
-        for (si, spec) in norm.iter().enumerate() {
-            if spec_matches(bytes, spec) {
+        // What is *selected* is the set's answer, so an exclusion subtracts
+        // here; what is *reported* is each element's own answer, so an element
+        // that only ever matched a path another element excluded still counts
+        // as having matched.
+        if norm.matches(bytes) {
+            let owned = path.to_owned();
+            if seen.insert(owned.clone()) {
+                matched.push(owned);
+            }
+        }
+        for (si, spec) in norm.per_element.iter().enumerate() {
+            if !hit[si] && spec.as_ref().is_some_and(|spec| spec.matches(bytes)) {
                 hit[si] = true;
-                let owned = path.to_owned();
-                if seen.insert(owned.clone()) {
-                    matched.push(owned);
-                }
             }
         }
     }
     (matched, hit)
-}
-
-/// A pathspec reduced to what the matcher needs: the components it names, and
-/// whether it ended at a directory boundary.
-///
-/// git normalises a pathspec before matching, so `sub/`, `sub//`, `sub/.` and
-/// `sub/./` all name `sub`, and a `..` pops a component — `top.txt/..` names the
-/// whole tree. What must survive normalisation is whether the spec *ended* on a
-/// slash, a `.` or a `..`, because that makes it a directory spec: `top.txt/`
-/// does not match the file `top.txt`, while a bare `top.txt` does.
-///
-/// A leading `/` is left alone. An absolute pathspec is resolved against the
-/// worktree root rather than lexically, which this matcher does not model, and
-/// reducing it here would silently turn `/abs` into a relative `abs`.
-///
-/// `prefix` is the repo-root-relative form of the directory the command ran in
-/// (see [`repo_prefix`]), which the spec starts from — so inside `sub/` the spec
-/// `s.txt` names `sub/s.txt` and `..` climbs back to the worktree root. `None`
-/// means the `..`s climbed *past* the root, which is git's "outside repository".
-fn normalize_spec(prefix: &[String], spec: &str) -> Option<(String, bool)> {
-    if spec.starts_with('/') {
-        return Some((spec.to_string(), false));
-    }
-    let mut comps: Vec<&str> = prefix.iter().map(String::as_str).collect();
-    let mut dir_only = !prefix.is_empty();
-    for part in spec.split('/') {
-        match part {
-            "" | "." => dir_only = true,
-            ".." => {
-                comps.pop()?;
-                dir_only = true;
-            }
-            other => {
-                comps.push(other);
-                dir_only = false;
-            }
-        }
-    }
-    Some((comps.join("/"), dir_only))
-}
-
-/// Whether `path` is matched by an already-normalised pathspec: an empty spec is
-/// the whole tree, a directory spec matches only what lies under it, and anything
-/// else matches itself or what lies under it.
-fn spec_matches(path: &[u8], (spec, dir_only): &(String, bool)) -> bool {
-    let s = spec.as_bytes();
-    if s.is_empty() {
-        return true;
-    }
-    if !dir_only && path == s {
-        return true;
-    }
-    path.len() > s.len() && path.starts_with(s) && path[s.len()] == b'/'
 }
 
 /// Reduce `index` to only the entries whose path is in `keep`.

@@ -364,7 +364,25 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     // `parse_pathspec()` runs *after* the tree-ish has been named and *before*
     // the tree is parsed (builtin/ls-tree.c:410-423, :427-429), so a bad name
     // outranks a bad pathspec and a bad pathspec outranks `not a tree object`.
-    let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
+    //
+    // ls-tree's mask is `PATHSPEC_ALL_MAGIC & ~(PATHSPEC_FROMTOP |
+    // PATHSPEC_LITERAL)` (builtin/ls-tree.c:420-423): `top` and `literal` are
+    // the two it takes, and both are no-ops here (output is already
+    // root-relative and matching is already literal).
+    //
+    // The whole list goes through the shared gate, which is what puts the three
+    // `die()`s in git's order. This verb used to test its mask *first*, from its
+    // own magic splitter, so `:(attr:)x` named the mask where git says `attr spec
+    // must not be empty`, and the two failures that splitter had no opinion on —
+    // the empty element and a reserved short mnemonic — were accepted outright
+    // at exit 0.
+    const MAGIC_MASK: u32 =
+        crate::pathspec::MAGIC_ALL & !(crate::pathspec::MAGIC_TOP | crate::pathspec::MAGIC_LITERAL);
+    if let Some(msg) =
+        crate::pathspec::parse_pathspec_fatal_masked(&repo, &positionals, MAGIC_MASK)
+    {
+        return Ok(fatal(&msg));
+    }
 
     // Path filters. A `:`-prefixed operand carries pathspec magic: git's
     // ls-tree accepts only `top` (`:/`) and `literal`, rejecting every other
@@ -381,46 +399,18 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     // non-empty prefix, the prefix itself becomes the sole pathspec — this is
     // what limits a bare `git ls-tree` to the current directory's subtree.
     for p in &positionals {
-        let (cleaned, from_top) = if p.starts_with(':') {
-            match parse_pathspec_magic(p) {
-                Ok(parsed) => parsed,
-                Err(code) => return Ok(code),
-            }
-        } else {
-            ((*p).to_string(), false)
+        // `copyfrom` and `magic` from the shared `parse_element_magic()`
+        // (pathspec.c:430-442). The gate above has already raised every `die()`
+        // this can, including `init_pathspec_item()`'s "is outside repository"
+        // — which a rooted element (`:(top)`, `:(prefix:<n>)`) never reaches
+        // (pathspec.c:482-487), so `:(top)/a` is a silent no-match where a bare
+        // `/a` is fatal.
+        let element = match crate::pathspec::parse_element_magic(p.as_bytes().into()) {
+            Ok(element) => element,
+            Err(msg) => return Ok(fatal(&msg)),
         };
-        // `init_pathspec_item()`'s second `die()`, per element and right after the
-        // magic has been taken off:
-        //
-        // ```c
-        //      if (magic & PATHSPEC_FROMTOP) {
-        //              match = xstrdup(copyfrom);
-        //              prefixlen = 0;
-        //      } else {
-        //              match = prefix_path_gently(prefix, prefixlen, &prefixlen, copyfrom);
-        //              if (!match) {
-        //                      …
-        //                      die(_("%s: '%s' is outside repository at '%s'"), elt,
-        //                          copyfrom, absolute_path(hint_path));
-        //              }
-        //      }
-        // ```
-        //
-        // (pathspec.c, quoted in full at
-        // [`crate::pathspec::first_outside_repository_fatal`].) `:(top)` takes the
-        // path verbatim and is never tested, which is why `:(top)/a` is a silent
-        // no-match while a bare `/a` is fatal. This port's own
-        // `normalize_pathspec()` collapses an escaping element into one that
-        // simply matches nothing, so both used to be a silent exit 0.
-        if !from_top {
-            if let Some(msg) = crate::pathspec::first_outside_repository_fatal(
-                &repo,
-                std::slice::from_ref(p),
-                defaults,
-            ) {
-                return Ok(fatal(&msg));
-            }
-        }
+        let cleaned = element.path(p.as_bytes().into()).to_string();
+        let from_top = element.rooted();
         // `top` magic anchors at the root; everything else is resolved against the
         // cwd prefix, then run through `normalize_path_copy()` — which is what makes
         // `git ls-tree HEAD ..` from `sub/deep` list `sub/` and `git ls-tree HEAD .`
@@ -439,12 +429,27 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
             }
             false => format!("{cwd_prefix}{cleaned}"),
         };
+        // A rooted element's path is `xstrdup(copyfrom)` — taken verbatim, with
+        // no `prefix_path_gently()` and so no `normalize_path_copy()` behind it
+        // (pathspec.c:482-487). That is what makes `:(top)./a.txt` match
+        // *nothing* in git while the same path without the magic matches
+        // `a.txt`: the `./` is never folded away. Normalising it here folded it
+        // and listed the file.
+        let normalized = match from_top {
+            true => joined,
+            false => super::add::normalize_pathspec(&joined),
+        };
         // An element that names the directory it started from normalizes to the
         // empty match, which selects the whole tree — `:`, `:/`, `:(top)` and a `.`
         // at the repository root all land here. `normalize_pathspec` spells that
         // empty result `.`, and returns `""` only for an empty input.
-        match super::add::normalize_pathspec(&joined) {
-            n if n.is_empty() || n == "." => opts.match_all = true,
+        //
+        // A rooted element was not normalized, so its `.` is a literal path
+        // component and not that empty result: `:(top).` names an entry called
+        // `.`, which no tree has, where `:(top)` names the whole tree.
+        match normalized {
+            n if n.is_empty() => opts.match_all = true,
+            n if n == "." && !from_top => opts.match_all = true,
             n => opts.paths.push(n.into_bytes()),
         }
     }
@@ -526,123 +531,6 @@ fn parse_abbrev(v: &str) -> Option<Abbrev> {
         n if n < MINIMUM_ABBREV as i64 => Abbrev::Len(MINIMUM_ABBREV),
         n => Abbrev::Len(n as usize),
     })
-}
-
-// Pathspec magic bits, one per entry in `MAGIC_TABLE`.
-const M_TOP: u32 = 1 << 0;
-const M_LITERAL: u32 = 1 << 1;
-const M_GLOB: u32 = 1 << 2;
-const M_ICASE: u32 = 1 << 3;
-const M_EXCLUDE: u32 = 1 << 4;
-const M_ATTR: u32 = 1 << 5;
-
-/// git's `pathspec_magic[]` table: (long name, short mnemonic or `'\0'`, bit).
-/// The order matters — git lists rejected magic back to the user in this order.
-const MAGIC_TABLE: &[(&str, char, u32)] = &[
-    ("top", '/', M_TOP),
-    ("literal", '\0', M_LITERAL),
-    ("glob", '\0', M_GLOB),
-    ("icase", '\0', M_ICASE),
-    ("exclude", '!', M_EXCLUDE),
-    ("attr", '\0', M_ATTR),
-];
-
-/// The magic `git ls-tree` accepts. git parses it with
-/// `PATHSPEC_ALL_MAGIC & ~(PATHSPEC_FROMTOP | PATHSPEC_LITERAL)` as the mask of
-/// *unsupported* magic, so only `top` and `literal` survive; both are no-ops
-/// here (output is already root-relative and matching is already literal).
-const MAGIC_SUPPORTED: u32 = M_TOP | M_LITERAL;
-
-/// Parse the pathspec magic on a `:`-prefixed operand exactly as stock
-/// `git ls-tree` does, returning the magic-stripped path plus whether `top`
-/// magic was present (which anchors the path at the root rather than the cwd),
-/// or a fatal (128) `ExitCode` carrying git's verbatim diagnostic on rejected
-/// magic.
-///
-/// Handles both spellings: long form `:(name,name,...)path` and the short
-/// mnemonic form `:/`, `:!`, `:^`, `::`. Rejections match git byte-for-byte:
-///   * unknown long name  -> `Invalid pathspec magic '<n>' in '<elt>'`
-///   * missing `)`        -> `Missing ')' at the end of pathspec magic in '<elt>'`
-///   * `literal`+`glob`   -> `<elt>: 'literal' and 'glob' are incompatible`
-///   * any other magic    -> `<elt>: pathspec magic not supported by this command: <list>`
-fn parse_pathspec_magic(elt: &str) -> std::result::Result<(String, bool), ExitCode> {
-    let after = &elt[1..]; // strip the leading ':'
-    let mut magic: u32 = 0;
-    let path: String;
-
-    if let Some(body) = after.strip_prefix('(') {
-        // Long form: comma-separated magic names inside parentheses.
-        let Some(close) = body.find(')') else {
-            return Err(fatal(&crate::pathspec::missing_closing_paren(elt.into())));
-        };
-        for field in body[..close].split(',') {
-            if field.is_empty() {
-                continue; // git skips empty elements (e.g. `,,`)
-            }
-            // `attr:<value>` is the attr magic with an argument.
-            let matched = MAGIC_TABLE.iter().find(|(name, _, _)| {
-                *name == field || (*name == "attr" && field.starts_with("attr:"))
-            });
-            match matched {
-                Some((_, _, bit)) => magic |= bit,
-                None => {
-                    return Err(fatal(&crate::pathspec::invalid_magic(field.into(), elt.into())))
-                }
-            }
-        }
-        // git rejects this specific pair while parsing, before the support check.
-        if magic & M_LITERAL != 0 && magic & M_GLOB != 0 {
-            return Err(fatal(&crate::pathspec::incompatible_literal_glob(elt.into())));
-        }
-        path = body[close + 1..].to_string();
-    } else {
-        // Short form: consume mnemonic bytes until a non-mnemonic or a `:`.
-        let bytes = after.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() && bytes[i] != b':' {
-            let ch = bytes[i] as char;
-            // `^` is an accepted short alias for exclude alongside `!`.
-            let bit = if ch == '^' {
-                Some(M_EXCLUDE)
-            } else {
-                MAGIC_TABLE
-                    .iter()
-                    .find(|(_, m, _)| *m != '\0' && *m == ch)
-                    .map(|(_, _, b)| *b)
-            };
-            match bit {
-                Some(b) => {
-                    magic |= b;
-                    i += 1;
-                }
-                None => break,
-            }
-        }
-        if i < bytes.len() && bytes[i] == b':' {
-            i += 1; // a terminating `:` is consumed (so `::path` -> `path`)
-        }
-        path = after[i..].to_string();
-    }
-
-    let unsupported = magic & !MAGIC_SUPPORTED;
-    if unsupported != 0 {
-        let mut parts: Vec<String> = Vec::new();
-        for (name, mnem, bit) in MAGIC_TABLE {
-            if unsupported & bit != 0 {
-                if *mnem != '\0' {
-                    parts.push(format!("'{name}' (mnemonic: '{mnem}')"));
-                } else {
-                    parts.push(format!("'{name}'"));
-                }
-            }
-        }
-        return Err(fatal(&crate::pathspec::magic_not_supported(
-            elt.into(),
-            &parts.join(", "),
-        )));
-    }
-
-    Ok((path, magic & M_TOP != 0))
 }
 
 /// Recursively render `tree` (rooted at `prefix`, e.g. `b"dir/"`) into `out`.

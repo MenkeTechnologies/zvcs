@@ -28,6 +28,10 @@ pub enum Error {
     MultipleAttributeSpecifications,
     #[error("'literal' and 'glob' keywords cannot be used together in the same pathspec")]
     IncompatibleSearchModes,
+    /// `invalid parameter for pathspec magic 'prefix'` (pathspec.c:356): the
+    /// bytes after `prefix:` were not consumed in their entirety by `strtol()`.
+    #[error("invalid parameter for pathspec magic 'prefix'")]
+    InvalidPrefixParameter,
 }
 
 impl Pattern {
@@ -130,7 +134,23 @@ fn parse_long_keywords(input: &[u8], p: &mut Pattern, cursor: &mut usize) -> Res
 
     split_on_non_escaped_char(input, b',', |keyword| {
         let attr_prefix = b"attr:";
+        let prefix_prefix = b"prefix:";
         match keyword {
+            // `if (starts_with(pos, "prefix:")) { *prefix_len = strtol(pos + 7,
+            // &endptr, 10); if ((size_t)(endptr - pos) != len) die(…); continue; }`
+            // (pathspec.c:352-358). It is tested before the keyword table and
+            // raises no magic bit of its own, which is why `prefix:` is absent
+            // from `pathspec_magic[]` — and why this table rejected every
+            // `:(prefix:<n>)` git accepts.
+            _ if keyword.starts_with(prefix_prefix) => {
+                let (value, consumed) = strtol(&keyword[prefix_prefix.len()..]);
+                if consumed != keyword.len() - prefix_prefix.len() {
+                    return Err(Error::InvalidPrefixParameter);
+                }
+                // `pathspec_prefix >= 0` is git's test (pathspec.c:474, :482), so
+                // a negative parameter parses but leaves the element ordinary.
+                p.prefix_magic = usize::try_from(value).ok();
+            }
             b"attr" => {}
             b"top" => p.signature |= MagicSignature::TOP,
             b"icase" => p.signature |= MagicSignature::ICASE,
@@ -158,6 +178,44 @@ fn parse_long_keywords(input: &[u8], p: &mut Pattern, cursor: &mut usize) -> Res
         }
         Ok(())
     })
+}
+
+/// `strtol(nptr, &endptr, 10)` as far as `parse_long_magic()` uses it: the value,
+/// and how many bytes `endptr` advanced past `nptr`.
+///
+/// Leading whitespace and a sign are consumed, and a run with no digits at all
+/// converts nothing — `endptr == nptr`, so `strtol` reports `0` and no progress.
+/// That is what makes `:(prefix:)` legal (nothing follows the colon, so nothing
+/// was left unconsumed) while `:(prefix:0x)` is not. The value saturates rather
+/// than wrapping, as `strtol` clamps to `LONG_MAX`/`LONG_MIN`.
+fn strtol(input: &[u8]) -> (i64, usize) {
+    let mut i = 0;
+    while input.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let negative = match input.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits_at = i;
+    let mut value: i64 = 0;
+    while let Some(&b) = input.get(i).filter(|b| b.is_ascii_digit()) {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(b - b'0'));
+        i += 1;
+    }
+    if i == digits_at {
+        return (0, 0);
+    }
+    (if negative { -value } else { value }, i)
 }
 
 fn split_on_non_escaped_char(

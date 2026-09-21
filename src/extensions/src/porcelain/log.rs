@@ -12898,8 +12898,24 @@ impl PathspecMatcher {
         // inside the constructor below, where `?` would render it in this port's
         // voice at exit 1 — `git log -- ..` is `fatal: ..: '..' is outside
         // repository at '<worktree>'` and exit 128.
-        if let Some(msg) = crate::pathspec::first_outside_repository_fatal(repo, specs, defaults) {
-            return Err(crate::fatal::die(msg));
+        //
+        // A *rooted* element is exempt: `:(top)` and `:(prefix:<n>)` take
+        // `copyfrom` verbatim and never reach `prefix_path_gently()`
+        // (pathspec.c:482-487), so `git log -- ':(top)../x'` is a no-match, not
+        // a fatal. Testing every element alike answered it with a die git never
+        // prints.
+        for spec in specs {
+            let elem = gix::bstr::BStr::new(spec.as_ref());
+            if crate::pathspec::parse_element_magic(elem).is_ok_and(|e| e.rooted()) {
+                continue;
+            }
+            if let Some(msg) = crate::pathspec::first_outside_repository_fatal(
+                repo,
+                std::slice::from_ref(spec),
+                defaults,
+            ) {
+                return Err(crate::fatal::die(msg));
+            }
         }
         // `IdMapping` reads `.gitattributes` from the index, and is only consulted
         // at all when a spec carries `:(attr:…)`.

@@ -674,12 +674,11 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
     // Only `-A` and `-u` imply a pathspec; every other flag alone is a no-op.
     if o.pathspecs.is_empty() && !(o.addremove == Some(true) || o.update) {
         eprintln!("Nothing specified, nothing added.");
-        if crate::advice::enabled("addEmptyPathspec") {
-            eprintln!("hint: Maybe you wanted to say 'git add .'?");
-            eprintln!(
-                "hint: Disable this message with \"git config set advice.addEmptyPathspec false\""
-            );
-        }
+        // `advise_if_enabled(ADVICE_ADD_EMPTY_PATHSPEC, …)` (builtin/add.c:468):
+        // the trailer belongs to `vadvise()`, which prints it only while the slot
+        // is unconfigured — so an explicit `advice.addEmptyPathspec=true` keeps
+        // the hint and drops the trailer.
+        crate::advice::Advice::AddEmptyPathspec.advise("Maybe you wanted to say 'git add .'?");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1030,6 +1029,32 @@ pub(super) fn unmatched_pathspec_check(
                         continue;
                     }
                 }
+                // Same rule, stated generally: `dir.ignored` is filled by
+                // `fill_directory()` from paths the *exclude* machinery
+                // classified, so a path that exists and was simply not matched
+                // belongs in no block at all — git exits 0 saying nothing. The
+                // element that shows it is a rooted one, whose path is verbatim:
+                // `git add ':(top)./a.txt'` names a file that exists, matches no
+                // entry (`./a.txt` is not `a.txt`) and is not ignored, and
+                // listing it under the gitignore banner claimed an exclude rule
+                // that does not exist.
+                let stack = match &mut excludes {
+                    Some(stack) => stack,
+                    none => none.insert(repo.excludes(
+                        index,
+                        None,
+                        gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+                    )?),
+                };
+                let mode = match std::fs::symlink_metadata(
+                    repo.workdir_path(BStr::new(relative.as_bytes())).unwrap_or_default(),
+                ) {
+                    Ok(md) if md.is_dir() => gix::index::entry::Mode::DIR,
+                    _ => gix::index::entry::Mode::FILE,
+                };
+                if !stack.at_entry(BStr::new(relative.as_bytes()), Some(mode))?.is_excluded() {
+                    continue;
+                }
                 ignored.insert(relative);
             }
             SpecMode::Renormalize | SpecMode::Refresh => {}
@@ -1050,12 +1075,12 @@ pub(super) fn unmatched_pathspec_check(
         for p in collapsed_ignored_names(repo, index, &ignored) {
             eprintln!("{p}");
         }
-        if crate::advice::enabled("addIgnoredFile") {
-            eprintln!("hint: Use -f if you really want to add them.");
-            eprintln!(
-                "hint: Disable this message with \"git config set advice.addIgnoredFile false\""
-            );
-        }
+        // `advise_if_enabled(ADVICE_ADD_IGNORED_FILE, …)` (builtin/add.c:351-352):
+        // the preamble and the path list are plain stderr writes, only the
+        // closing line is the hint — and its `Disable this message with …`
+        // trailer is `vadvise()`'s, printed only while the slot is unconfigured.
+        crate::advice::Advice::AddIgnoredFile
+            .advise_in(repo, "Use -f if you really want to add them.");
         return Ok(SpecVerdict::Ignored);
     }
     Ok(SpecVerdict::Ok)

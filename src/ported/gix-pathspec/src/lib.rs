@@ -141,6 +141,17 @@ pub struct Pattern {
     /// match case-insensitively.
     /// Is set by [Pattern::normalize()].
     prefix_len: usize,
+    /// `pathspec_prefix` (pathspec.c:454, :474, :482-484) when the element carried
+    /// `:(prefix:<n>)` and `strtol()` read a non-negative `n`.
+    ///
+    /// git keeps such an element's path verbatim exactly as it does for `:(top)`
+    /// — `match = xstrdup(copyfrom); prefixlen = pathspec_prefix;` — so this is
+    /// the second half of "this element is already rooted", and the `n` it
+    /// carries becomes [`Self::prefix_len`] rather than the count
+    /// [`Pattern::normalize()`] would compute. A negative `n` fails git's
+    /// `pathspec_prefix >= 0` test and so leaves the element ordinary, which is
+    /// why this is an `Option` and not a `usize`.
+    prefix_magic: Option<usize>,
 }
 
 bitflags! {

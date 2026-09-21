@@ -83,6 +83,12 @@ pub fn multiple_attr_specs() -> String {
     "Only one 'attr:' specification is allowed.".to_string()
 }
 
+/// `invalid parameter for pathspec magic 'prefix'` (pathspec.c:356) — the bytes
+/// after `prefix:` that `strtol()` did not consume in full.
+pub fn invalid_prefix_parameter() -> String {
+    "invalid parameter for pathspec magic 'prefix'".to_string()
+}
+
 /// `empty string is not a valid pathspec. please use . instead if you meant to
 /// match all paths` (pathspec.c:640). Checked over the whole argument vector
 /// before any element is parsed, and left untranslated in git.
@@ -118,6 +124,7 @@ pub fn parse_error_message(elem: &BStr, err: &gix::pathspec::parse::Error) -> St
         E::EmptyAttribute => empty_attr_spec(),
         E::MultipleAttributeSpecifications => multiple_attr_specs(),
         E::IncompatibleSearchModes => incompatible_literal_glob(elem),
+        E::InvalidPrefixParameter => invalid_prefix_parameter(),
     }
 }
 
@@ -573,6 +580,17 @@ pub const MAGIC_EXCLUDE: u32 = 1 << 4;
 /// `PATHSPEC_ATTR`, `:(attr:<spec>)`.
 pub const MAGIC_ATTR: u32 = 1 << 5;
 
+/// `PATHSPEC_ALL_MAGIC` (pathspec.h:14-21), the set a verb subtracts from to
+/// spell "everything but these": `ls-tree` passes
+/// `PATHSPEC_ALL_MAGIC & ~(PATHSPEC_FROMTOP | PATHSPEC_LITERAL)`
+/// (builtin/ls-tree.c:420-423).
+///
+/// git's macro also carries `PATHSPEC_MAXDEPTH`, which no element can ask for —
+/// `--max-depth` sets it on the parsed set afterwards — so it is left out here
+/// rather than given a bit that nothing could ever raise.
+pub const MAGIC_ALL: u32 =
+    MAGIC_TOP | MAGIC_LITERAL | MAGIC_GLOB | MAGIC_ICASE | MAGIC_EXCLUDE | MAGIC_ATTR;
+
 /// `pathspec_magic[]` (pathspec.c:101-112), in git's declaration order — which
 /// is the order [`magic_names`] renders in and so is load-bearing, not a detail:
 ///
@@ -687,6 +705,44 @@ fn strcspn_escaped(s: &[u8], stop: &[u8]) -> usize {
     s.len()
 }
 
+/// `strtol(nptr, &endptr, 10)` as far as `parse_long_magic()` uses it
+/// (pathspec.c:354-355): the value, and how many bytes `endptr` advanced.
+///
+/// Leading whitespace and a sign are consumed; a run with no digits converts
+/// nothing, leaving `endptr == nptr` and a value of `0`. The saturation stands
+/// in for `strtol`'s `LONG_MAX`/`LONG_MIN` clamp.
+///
+/// This is the same port as `gix_pathspec`'s, kept here for the same reason
+/// every other piece of `parse_long_magic()` is: this module answers before the
+/// matcher is built and so cannot borrow the matcher's parser.
+fn strtol(input: &[u8]) -> (i64, usize) {
+    let mut i = 0;
+    while input.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    let negative = match input.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits_at = i;
+    let mut value: i64 = 0;
+    while let Some(&b) = input.get(i).filter(|b| b.is_ascii_digit()) {
+        value = value.saturating_mul(10).saturating_add(i64::from(b - b'0'));
+        i += 1;
+    }
+    if i == digits_at {
+        return (0, 0);
+    }
+    (if negative { -value } else { value }, i)
+}
+
 /// `attr_name_valid()` (attr.c:199-216): non-empty, not starting with `-`, and
 /// drawn from `[-A-Za-z0-9_.]`.
 fn attr_name_valid(name: &[u8]) -> bool {
@@ -766,14 +822,33 @@ fn parse_long_magic(elt: &BStr) -> Result<Element, String> {
             continue;
         }
         if kw.starts_with(b"prefix:") {
-            // `invalid parameter for pathspec magic 'prefix'` (pathspec.c:356).
-            // Everything after `prefix:` must parse as a whole `strtol`.
-            let digits = &kw[7..];
-            let body = digits.strip_prefix(b"-").unwrap_or(digits);
-            if body.is_empty() || !body.iter().all(u8::is_ascii_digit) {
-                return Err("invalid parameter for pathspec magic 'prefix'".into());
+            // ```c
+            // if (starts_with(pos, "prefix:")) {
+            //         char *endptr;
+            //         *prefix_len = strtol(pos + 7, &endptr, 10);
+            //         if ((size_t)(endptr - pos) != len)
+            //                 die(_("invalid parameter for pathspec magic 'prefix'"));
+            //         continue;
+            // }
+            // ```
+            //
+            // (pathspec.c:352-358.) The test is on `strtol`'s own `endptr`, so
+            // the three things that die are the three things `strtol` leaves
+            // behind: `:(prefix:0x)` stops at the `x`, `:(prefix:x)` converts
+            // nothing at all, and only a parameter consumed in full survives.
+            // `:(prefix:)` is *accepted* — `endptr == pos + 7 == pos + len`,
+            // nothing was left over — and reading the grammar as "one or more
+            // digits, optionally signed" instead refused it, and refused the
+            // leading whitespace and `+` that `strtol` also takes.
+            let (value, consumed) = strtol(&kw[7..]);
+            if consumed != len - 7 {
+                return Err(invalid_prefix_parameter());
             }
-            prefix_magic = true;
+            // `pathspec_prefix >= 0` (pathspec.c:474, :482): a negative
+            // parameter parses, but leaves the element ordinary — so
+            // `:(prefix:-1)../x` from a subdirectory is still "is outside
+            // repository", where `:(prefix:0)../x` is not.
+            prefix_magic = value >= 0;
             continue;
         }
         if kw.starts_with(b"attr:") {

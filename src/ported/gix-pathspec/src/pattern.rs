@@ -57,6 +57,50 @@ impl Pattern {
             if count > 0 { count as usize } else { Default::default() }
         }
 
+        // ```c
+        // if (pathspec_prefix >= 0) {
+        //         match = xstrdup(copyfrom);
+        //         prefixlen = pathspec_prefix;
+        // } else if (magic & PATHSPEC_FROMTOP) {
+        //         match = xstrdup(copyfrom);
+        //         prefixlen = 0;
+        // } else {
+        //         match = prefix_path_gently(…);
+        // ```
+        //
+        // (pathspec.c:481-490.) A rooted element's path is the one git never
+        // touches: no prefix is joined to it, and — because
+        // `prefix_path_gently()` is what calls `normalize_path_copy_len()`
+        // (setup.c:119-160) — nothing folds its `.`, `..` or repeated `/`
+        // either. Running the normalisation anyway made `:(top)./a.txt` match
+        // `a.txt` where git matches nothing, made `:(top)a.txt/..` select the
+        // whole tree, and turned `:(top)../x` — which git answers with a plain
+        // no-match — into an `OutsideOfWorktree` error that surfaced as exit 128
+        // with an empty stderr.
+        //
+        // This also settles absolute paths: git tests `pathspec_prefix`/
+        // `PATHSPEC_FROMTOP` first, so `:(top)/abs` is the literal `/abs` and
+        // never reaches the "outside of worktree" rejection below.
+        if self.signature.contains(MagicSignature::TOP) || self.prefix_magic.is_some() {
+            // `prefixlen = pathspec_prefix` / `= 0`, then `item->prefix =
+            // prefixlen` (pathspec.c:484, :487, :507). git's sanity check
+            // BUG()s on a prefix past the end of the match (pathspec.c:547-551);
+            // with no `BUG()` to raise, an over-long one is clamped so the
+            // prefix stays a prefix.
+            self.prefix_len = self.prefix_magic.unwrap_or(0).min(self.path.len());
+            return Ok(self);
+        }
+
+        // `normalize_path_copy_len()` folds a trailing `.` away but *keeps the
+        // separator it sat behind* (path.c:1121-1204): `a/.` comes back as `a/`,
+        // which is why `git log -- 'a.txt/.'` matches nothing while
+        // `git log -- 'a.txt'` matches the file. Parsing sets `MUST_BE_DIR` only
+        // for a slash the user wrote last, and the fold below then dropped the
+        // `/.` without a trace, so the two spellings became the same pattern.
+        if self.path.ends_with(b"/.") {
+            self.signature |= MagicSignature::MUST_BE_DIR;
+        }
+
         let mut path = gix_path::from_bstr(self.path.as_bstr());
         let mut num_prefix_components = 0;
         let mut was_absolute = false;
@@ -72,7 +116,7 @@ impl Pattern {
                 }
             };
             path = rela_path.to_owned().into();
-        } else if !prefix.as_os_str().is_empty() && !self.signature.contains(MagicSignature::TOP) {
+        } else if !prefix.as_os_str().is_empty() {
             debug_assert_eq!(
                 prefix
                     .components()

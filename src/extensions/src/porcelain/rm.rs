@@ -675,6 +675,14 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     //     leading directories left empty. Submodule (gitlink) paths are directories
     //     and are removed recursively (their gitdir under .git/modules survives).
     if !opts.cached {
+        // `cmd_rm()`'s own comment (builtin/rm.c:405-412): "If we fail to remove the
+        // first one, we abort the `git rm` (but once we've successfully removed any
+        // file at all, we'll go ahead and commit to it all: by then we've already
+        // committed ourselves and can't fail in the middle)". The `removed` latch is
+        // what makes the second and later failures silent — `git rm -f a b` where `b`
+        // is a directory `unlink()` refuses still removes `a`, still drops both from
+        // the index, and still exits 0.
+        let mut removed = false;
         for t in &selected {
             let Some(abs) = repo.workdir_path(t.path.as_bstr()) else {
                 continue;
@@ -685,9 +693,22 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 std::fs::remove_file(&abs)
             };
             match res {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => crate::git_fatal!("failed to remove {}: {e}", t.path.to_str_lossy()),
+                Ok(()) => removed = true,
+                // `is_missing_file_error()` (dir.c): `ENOENT` and `ENOTDIR` are not
+                // failures at all — `remove_path()` returns 0 and the path counts as
+                // removed, because it is already gone.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::NotFound
+                        || e.raw_os_error() == Some(libc::ENOTDIR) =>
+                {
+                    removed = true;
+                }
+                // `die_errno("git rm: '%s'", path)` (builtin/rm.c:435), reached only
+                // while nothing has been removed yet.
+                Err(e) if !removed => {
+                    crate::git_fatal!("git rm: '{}': {}", t.path.to_str_lossy(), crate::errno_text(&e))
+                }
+                Err(_) => continue,
             }
             // `remove_path()` (dir.c:3520-3540) walks the parents up, `rmdir`ing each
             // until one is not empty — and stopping at `startup_info->original_cwd`, so a

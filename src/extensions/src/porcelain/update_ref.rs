@@ -2411,7 +2411,14 @@ fn unquote_c(b: &[u8]) -> Result<(String, usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_refname;
+    use super::Cursor;
+
+    /// `parse_refname()` as a record's first field: the name followed by the
+    /// line terminator, which is what `cmd->fn()` is handed (see [`Cursor::new`]).
+    fn parse_refname(name: &str) -> anyhow::Result<Option<String>> {
+        let line = format!("{name}\n");
+        Cursor::new(&line, 0, false).parse_refname()
+    }
 
     /// Every `--stdin` command reports a malformed ref name in git's own words, not
     /// gitoxide's. Measured against stock 2.55.0, in a repository with a commit so

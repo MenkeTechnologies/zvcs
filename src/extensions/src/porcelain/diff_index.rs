@@ -3194,8 +3194,8 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
                     ":{:06o} {:06o} {} {} ",
                     d.src_mode,
                     d.dst_mode,
-                    hex(&d.src_id, len),
-                    hex(&d.dst_id, len),
+                    hex(repo, &d.src_id, len),
+                    hex(repo, &d.dst_id, len),
                 )
                 .as_bytes(),
             );
@@ -3220,11 +3220,19 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
     Ok(out)
 }
 
-/// The object id column, full or truncated to `len` hex characters.
-fn hex(id: &ObjectId, len: Option<usize>) -> String {
+/// The object id column, full or truncated to `len` hex characters, then run
+/// through `diff_aligned_abbrev()`'s dot padding (diff.c:6430-6464) — which
+/// `GIT_PRINT_SHA1_ELLIPSIS=yes` turns on and which reaches nothing but this
+/// column.
+fn hex(repo: &gix::Repository, id: &ObjectId, len: Option<usize>) -> String {
     match len {
         None => id.to_hex().to_string(),
-        Some(n) => id.to_hex_with_len(n).to_string(),
+        // `diff_abbrev_oid()` (diff.c:4842-4845) goes through
+        // `repo_find_unique_abbrev()`, so `--abbrev=<n>` is a floor: a prefix another
+        // object in this database shares is widened until it is unique. The dots
+        // `GIT_PRINT_SHA1_ELLIPSIS=yes` appends then shrink by one per extra
+        // character, so the column keeps its width either way.
+        Some(n) => crate::abbrev::aligned_abbrev(repo, id, n),
     }
 }
 

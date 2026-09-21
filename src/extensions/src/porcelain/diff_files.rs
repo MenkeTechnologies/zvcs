@@ -3695,8 +3695,8 @@ fn render_raw(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Vec<u8> 
                         ":{:06o} {:06o} {} {} ",
                         d.src_mode,
                         d.dst_mode,
-                        hex(&d.src_id, len),
-                        hex(&d.dst_id, len),
+                        hex(repo, &d.src_id, len),
+                        hex(repo, &d.dst_id, len),
                     )
                     .as_bytes(),
                 );
@@ -3714,11 +3714,19 @@ fn render_raw(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Vec<u8> 
     out
 }
 
-/// The object id column, full or truncated to `len` hex characters.
-fn hex(id: &ObjectId, len: Option<usize>) -> String {
+/// The object id column, full or truncated to `len` hex characters, then run
+/// through `diff_aligned_abbrev()`'s dot padding (diff.c:6430-6464) — which
+/// `GIT_PRINT_SHA1_ELLIPSIS=yes` turns on and which reaches nothing but this
+/// column.
+fn hex(repo: &gix::Repository, id: &ObjectId, len: Option<usize>) -> String {
     match len {
         None => id.to_hex().to_string(),
-        Some(n) => id.to_hex_with_len(n).to_string(),
+        // `diff_abbrev_oid()` (diff.c:4842-4845) goes through
+        // `repo_find_unique_abbrev()`, so `--abbrev=<n>` is a floor: a prefix another
+        // object in this database shares is widened until it is unique. The dots
+        // `GIT_PRINT_SHA1_ELLIPSIS=yes` appends then shrink by one per extra
+        // character, so the column keeps its width either way.
+        Some(n) => crate::abbrev::aligned_abbrev(repo, id, n),
     }
 }
 
@@ -5335,9 +5343,17 @@ fn render_combined_raw(out: &mut Vec<u8>, repo: &gix::Repository, c: &CombinedPa
 /// to 0, so the default is the full id; `--abbrev=<n>` shortens it.
 fn combined_raw_hex(repo: &gix::Repository, id: &ObjectId, opts: &Opts) -> String {
     let hexsz = repo.object_hash().len_in_hex();
+    let full = id.to_hex().to_string();
+    // `show_raw_diff()` (combine-diff.c:1257-1259) goes through
+    // `diff_aligned_abbrev()`, so an abbreviated combined raw id takes the same
+    // `GIT_PRINT_SHA1_ELLIPSIS` dot padding the two-tree raw record does.
+    let pad = |hex: String, len: usize| crate::abbrev::aligned_ellipsis(hex, len, &full);
     match opts.abbrev {
-        None => id.to_hex().to_string(),
-        Some(Some(n)) => id.to_hex_with_len(n.clamp(4, hexsz)).to_string(),
+        None => full.clone(),
+        Some(Some(n)) => {
+            let n = n.clamp(4, hexsz);
+            pad(id.to_hex_with_len(n).to_string(), n)
+        }
         Some(None) => {
             // Bare `--abbrev` follows core.abbrev / the unique prefix.
             if id.is_null() {
@@ -5347,7 +5363,7 @@ fn combined_raw_hex(repo: &gix::Repository, id: &ObjectId, opts: &Opts) -> Strin
                     .and_then(|v| usize::try_from(v).ok())
                     .unwrap_or(7)
                     .clamp(4, hexsz);
-                "0".repeat(n)
+                pad("0".repeat(n), n)
             } else {
                 let uniq = id.attach(repo).shorten_or_id().hex_len();
                 let floor = repo
@@ -5355,7 +5371,8 @@ fn combined_raw_hex(repo: &gix::Repository, id: &ObjectId, opts: &Opts) -> Strin
                     .integer("core.abbrev")
                     .and_then(|v| usize::try_from(v).ok())
                     .unwrap_or(7);
-                id.to_hex_with_len(uniq.max(floor).clamp(4, hexsz)).to_string()
+                let n = uniq.max(floor).clamp(4, hexsz);
+                pad(id.to_hex_with_len(n).to_string(), floor)
             }
         }
     }

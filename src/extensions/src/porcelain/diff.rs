@@ -7809,7 +7809,9 @@ fn render_raw(
         // width: an id that shares its first `n` hex characters with another object
         // in the database is widened until it does not. The all-zero name is not in
         // the database, so it has nothing to widen against and stays `n` wide.
-        let abbrev = |id: &ObjectId| crate::abbrev::unique_abbrev(repo, id, r.raw_abbrev);
+        // …and then through `diff_aligned_abbrev()`'s own dot padding, which
+        // `GIT_PRINT_SHA1_ELLIPSIS=yes` turns on for the raw format alone.
+        let abbrev = |id: &ObjectId| crate::abbrev::aligned_abbrev(repo, id, r.raw_abbrev);
         let null = abbrev(&r.hash_kind.null());
         // `diff_fill_oid_info()` (diff.c:4014) hashes a filespec that has no id of
         // its own with `index_path()`, leaving the real object name behind in
@@ -8975,12 +8977,23 @@ fn render_combined_raw_at(
             out.push(b' ');
         }
         push_str(out, &mode_octal(cp.kind));
+        // `show_raw_diff()` (combine-diff.c:1257-1259) renders every parent id and
+        // the result id through `diff_aligned_abbrev()`, so the combined raw record
+        // takes `GIT_PRINT_SHA1_ELLIPSIS`'s dot padding exactly as the two-tree one
+        // does.
+        let aligned = |id: &ObjectId| {
+            crate::abbrev::aligned_ellipsis(
+                id.to_hex_with_len(raw_abbrev).to_string(),
+                raw_abbrev,
+                &id.to_string(),
+            )
+        };
         for p in &cp.parents {
             out.push(b' ');
-            push_str(out, &p.id.to_hex_with_len(raw_abbrev).to_string());
+            push_str(out, &aligned(&p.id));
         }
         out.push(b' ');
-        push_str(out, &cp.id.to_hex_with_len(raw_abbrev).to_string());
+        push_str(out, &aligned(&cp.id));
         out.push(b' ');
     }
     if fmt & (F_RAW | F_NAME_STATUS) != 0 {

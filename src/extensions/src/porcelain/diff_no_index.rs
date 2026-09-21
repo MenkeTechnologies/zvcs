@@ -2151,12 +2151,17 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts, from_contents:
     if opts.fmt.name_status || opts.fmt.raw {
         for row in &listed {
             if opts.fmt.raw {
-                let side = |oid: Option<gix::ObjectId>| match oid {
-                    Some(id) => {
-                        let hex = id.to_hex().to_string();
-                        hex[..opts.raw_abbrev.min(hex.len())].to_string()
-                    }
-                    None => "0".repeat(opts.raw_abbrev),
+                // `diff_flush_raw()` (diff.c:6477-6479) renders both ids through
+                // `diff_aligned_abbrev()`, whose dot padding
+                // `GIT_PRINT_SHA1_ELLIPSIS=yes` turns on. A no-index filespec usually
+                // has no id at all, so the padded column is most often all zeros.
+                let side = |oid: Option<gix::ObjectId>| {
+                    let full = oid.unwrap_or_else(|| HASH_KIND.null()).to_hex().to_string();
+                    let hex = match oid {
+                        Some(_) => full[..opts.raw_abbrev.min(full.len())].to_string(),
+                        None => "0".repeat(opts.raw_abbrev),
+                    };
+                    crate::abbrev::aligned_ellipsis(hex, opts.raw_abbrev, &full)
                 };
                 out.extend_from_slice(
                     format!(

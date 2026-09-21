@@ -2313,19 +2313,24 @@ fn combined_commit(
                 }
                 let rmode = sides[0].new.map_or(0, |n| n.mode.value());
                 out.extend_from_slice(format!("{rmode:06o}").as_bytes());
-                // `diff_aligned_abbrev(&oid, opt->abbrev)` — the same width the
-                // two-tree raw format uses, which `--abbrev=<n>` narrows.
-                let zeros = "0".repeat(opts.abbrev);
+                // `diff_aligned_abbrev(&oid, opt->abbrev)` (combine-diff.c:1257-1259)
+                // — the same width the two-tree raw format uses, which `--abbrev=<n>`
+                // narrows, and the same `GIT_PRINT_SHA1_ELLIPSIS` dot padding.
+                let zeros = crate::abbrev::aligned_ellipsis(
+                    "0".repeat(opts.abbrev),
+                    opts.abbrev,
+                    &repo.object_hash().null().to_string(),
+                );
                 for s in sides {
                     let id = s.old.map_or_else(
                         || zeros.clone(),
-                        |o| crate::abbrev::unique_abbrev(repo, &o.id, opts.abbrev),
+                        |o| crate::abbrev::aligned_abbrev(repo, &o.id, opts.abbrev),
                     );
                     out.extend_from_slice(format!(" {id}").as_bytes());
                 }
                 let rid = sides[0].new.map_or_else(
                     || zeros.clone(),
-                    |n| crate::abbrev::unique_abbrev(repo, &n.id, opts.abbrev),
+                    |n| crate::abbrev::aligned_abbrev(repo, &n.id, opts.abbrev),
                 );
                 out.extend_from_slice(format!(" {rid} ").as_bytes());
             }
@@ -2975,20 +2980,25 @@ fn render(repo: &gix::Repository, out: &mut Vec<u8>, c: &Change, opts: &Opts) {
         Format::Raw => {
             // ":<omode> <nmode> <ooid> <noid> <status>" then the separator and path.
             // Absent sides render as an all-zero mode and an all-zero object id.
-            let zeros = "0".repeat(opts.abbrev);
+            let zeros = crate::abbrev::aligned_ellipsis(
+                "0".repeat(opts.abbrev),
+                opts.abbrev,
+                &repo.object_hash().null().to_string(),
+            );
             let (omode, ooid) = match c.old {
                 // `diff_aligned_abbrev()` → `diff_abbrev_oid()` → `repo_find_unique_
-                // abbrev()`: `--abbrev=<n>` is a floor, so a colliding prefix widens.
+                // abbrev()`: `--abbrev=<n>` is a floor, so a colliding prefix widens,
+                // and `GIT_PRINT_SHA1_ELLIPSIS` then pads the column with dots.
                 Some(s) => (
                     s.mode.value(),
-                    crate::abbrev::unique_abbrev(repo, &s.id, opts.abbrev),
+                    crate::abbrev::aligned_abbrev(repo, &s.id, opts.abbrev),
                 ),
                 None => (0, zeros.clone()),
             };
             let (nmode, noid) = match c.new {
                 Some(s) => (
                     s.mode.value(),
-                    crate::abbrev::unique_abbrev(repo, &s.id, opts.abbrev),
+                    crate::abbrev::aligned_abbrev(repo, &s.id, opts.abbrev),
                 ),
                 None => (0, zeros),
             };

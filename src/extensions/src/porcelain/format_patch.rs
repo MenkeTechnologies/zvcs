@@ -8002,11 +8002,22 @@ fn emit_raw(
         // An absent side has no object to disambiguate, so it borrows the other
         // side's width — which is what `diff_abbrev_oid()` on a null oid produces.
         let hex_len = width(&old)?.max(width(&new)?);
+        // `diff_aligned_abbrev()`'s dot padding (diff.c:6430-6464), which
+        // `GIT_PRINT_SHA1_ELLIPSIS=yes` turns on for this column alone. The
+        // requested width is `opt->abbrev`; a name that had to widen past it loses
+        // a dot so the column still lines up.
+        let requested = match abbrev {
+            Abbrev::Auto(n) | Abbrev::Fixed(n) => n,
+        };
+        let hexsz = repo.object_hash().len_in_hex();
         let name = |side: &Option<(ObjectId, &gix::objs::tree::EntryMode)>| -> Result<String> {
-            Ok(match side {
-                Some((id, mode)) => short_oid(repo, *id, abbrev, mode.is_commit())?,
-                None => "0".repeat(hex_len),
-            })
+            let (hex, full) = match side {
+                Some((id, mode)) => {
+                    (short_oid(repo, *id, abbrev, mode.is_commit())?, id.to_hex().to_string())
+                }
+                None => ("0".repeat(hex_len), "0".repeat(hexsz)),
+            };
+            Ok(crate::abbrev::aligned_ellipsis(hex, requested, &full))
         };
         write!(
             out,

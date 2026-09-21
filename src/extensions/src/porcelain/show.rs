@@ -4227,8 +4227,16 @@ fn emit_raw(
     let end = if z { b'\0' } else { b'\n' };
     for f in files {
         write!(out, ":{:06o} {:06o} ", f.old_mode.unwrap_or(0), f.new_mode.unwrap_or(0))?;
-        let old = short_oid(repo, &f.old_id, f.old_mode.is_none() || f.old_is_sub)?;
-        let new = short_oid(repo, &f.new_id, f.new_mode.is_none() || f.new_is_sub)?;
+        // `diff_flush_raw()` (diff.c:6477-6479) runs both ids through
+        // `diff_aligned_abbrev()`, whose dot padding `GIT_PRINT_SHA1_ELLIPSIS=yes`
+        // turns on. The `index` line shares `short_oid()` but not this step.
+        let requested = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex())
+            .max(MINIMUM_ABBREV);
+        let pad = |hex: String, id: &ObjectId| {
+            crate::abbrev::aligned_ellipsis(hex, requested, &id.to_hex().to_string())
+        };
+        let old = pad(short_oid(repo, &f.old_id, f.old_mode.is_none() || f.old_is_sub)?, &f.old_id);
+        let new = pad(short_oid(repo, &f.new_id, f.new_mode.is_none() || f.new_is_sub)?, &f.new_id);
         out.extend_from_slice(old.as_bytes());
         out.push(b' ');
         out.extend_from_slice(new.as_bytes());

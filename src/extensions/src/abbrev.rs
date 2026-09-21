@@ -139,6 +139,83 @@ pub fn unique_abbrev(repo: &gix::Repository, id: &gix::hash::ObjectId, len: usiz
     hex[..widened.min(hexsz)].to_owned()
 }
 
+/// `print_sha1_ellipsis()` (environment.c:205-217): whether the environment asks
+/// the raw diff formats to pad an abbreviated object name with dots.
+///
+/// ```c
+/// const char *v = getenv("GIT_PRINT_SHA1_ELLIPSIS");
+/// cached_result = (v && !strcasecmp(v, "yes"));
+/// ```
+///
+/// git caches the answer for the life of the process, and only `"yes"` — in any
+/// case — turns it on; every other value, the empty string included, leaves it
+/// off. Nothing but [`aligned_ellipsis`] reads it.
+pub fn print_sha1_ellipsis() -> bool {
+    std::env::var("GIT_PRINT_SHA1_ELLIPSIS").is_ok_and(|v| v.eq_ignore_ascii_case("yes"))
+}
+
+/// The dot padding half of `diff_aligned_abbrev()` (diff.c:6421-6467), given an
+/// abbreviation [`unique_abbrev`] has already produced.
+///
+/// ```c
+/// if (!print_sha1_ellipsis())
+///         return abbrev;
+/// abblen = strlen(abbrev);
+/// if (abblen < the_hash_algo->hexsz - 3) {
+///         static char hex[GIT_MAX_HEXSZ + 1];
+///         if (len < abblen && abblen <= len + 2)
+///                 xsnprintf(hex, sizeof(hex), "%s%.*s", abbrev, len+3-abblen, "..");
+///         else
+///                 xsnprintf(hex, sizeof(hex), "%s...", abbrev);
+///         return hex;
+/// }
+/// return oid_to_hex(oid);
+/// ```
+///
+/// The column is meant to line up: a name that had to widen past the requested
+/// `len` because its prefix collided loses one dot per extra character, so the
+/// well-behaved `<len>` + `...` and the widened `<len+1>` + `..` occupy the same
+/// width. An abbreviation within three characters of the full hash gives up and
+/// prints the whole name instead — there is no room left for a marker.
+///
+/// `full_hex` is the object's complete name, which is both the `abblen` bound and
+/// the fallback. git reaches this only from `diff_flush_raw()` (diff.c:6477-6479)
+/// and `show_raw_diff()` (combine-diff.c:1257-1259), so no `index` line and no
+/// `--stat` column is ever padded.
+pub fn aligned_ellipsis(abbrev: String, len: usize, full_hex: &str) -> String {
+    if !print_sha1_ellipsis() {
+        return abbrev;
+    }
+    let hexsz = full_hex.len();
+    let abblen = abbrev.len();
+    if abblen + 3 >= hexsz {
+        return full_hex.to_owned();
+    }
+    // `%.*s` over the two-character `".."`, so the precision is a cap, not a count:
+    // the guarded range gives one or two dots and nothing else can.
+    let dots = match len < abblen && abblen <= len + 2 {
+        true => (len + 3 - abblen).min(2),
+        false => 3,
+    };
+    let mut out = abbrev;
+    for _ in 0..dots {
+        out.push('.');
+    }
+    out
+}
+
+/// [`unique_abbrev`] followed by [`aligned_ellipsis`]: the whole of
+/// `diff_aligned_abbrev()` for a caller that has the repository in hand.
+pub fn aligned_abbrev(repo: &gix::Repository, id: &gix::hash::ObjectId, len: usize) -> String {
+    let full = id.to_string();
+    // "Do we want all 40 hex characters?" (diff.c:6426-6428) — asked before the
+    // abbreviation, so `--abbrev=<hexsz>` never grows a dot.
+    if len == full.len() {
+        return full;
+    }
+    aligned_ellipsis(unique_abbrev(repo, id, len), len, &full)
+}
+
 /// Which object store an abbreviation was computed against, and the state it was
 /// in — the half of an abbreviation's answer that the object id does not carry.
 ///

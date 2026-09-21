@@ -798,6 +798,38 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--stat` width geometry, seeded from `diff.statNameWidth`/`diff.statGraphWidth`
     // (`git_diff_ui_config()`); a later `--stat*` flag overrides the corresponding slot.
     // git loads config before parsing args, so the flag always wins.
+    // ```c
+    // if (!strcmp(var, "grep.patterntype")) {
+    //         opt->pattern_type_option = parse_pattern_type_arg(var, value);
+    //         return 0;
+    // }
+    // ```
+    //
+    // (`grep_config()`, grep.c:73-76, reached from `git_log_config()` through
+    // `grep_config(var, value, ctx, &cfg->grep_config)`.) It seeds the *same*
+    // `pattern_type_option` field `--basic-regexp`/`-E`/`-F`/`-P` assign
+    // (revision.c:2596-2611), so config is simply what that field starts as and any
+    // dialect flag on the command line overwrites it. `default` — and an unset key —
+    // fall back to the legacy `grep.extendedRegexp` boolean, which
+    // `compile_regexp()` resolves to ERE or BRE (grep.c:497-500).
+    //
+    // `git log`, `git show`, `git whatchanged`, `git format-patch` and `git reflog
+    // show` all reach `setup_revisions()` through this module, so reading it here
+    // is what gives every one of them the key.
+    let cfg_grep_dialect = {
+        let snap = repo.config_snapshot();
+        match snap.string("grep.patternType").map(|v| v.to_string()).as_deref() {
+            Some("basic") => Some(crate::revfilter::Dialect::Basic),
+            Some("extended") => Some(crate::revfilter::Dialect::Extended),
+            Some("fixed") => Some(crate::revfilter::Dialect::Fixed),
+            Some("perl") => Some(crate::revfilter::Dialect::Perl),
+            _ => match snap.boolean("grep.extendedRegexp") {
+                Some(true) => Some(crate::revfilter::Dialect::Extended),
+                _ => None,
+            },
+        }
+    };
+
     let mut stat_widths = StatWidths::default();
     {
         let snap = repo.config_snapshot();
@@ -1085,7 +1117,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `commit_match()` prepends under `-g` (revision.c:4105-4109).
     let mut reflog_pats: Vec<String> = Vec::new();
     let mut committer_pats: Vec<String> = Vec::new();
-    let mut grep_dialect = crate::revfilter::Dialect::Basic;
+    let mut grep_dialect = cfg_grep_dialect.unwrap_or(crate::revfilter::Dialect::Basic);
     let mut grep_ignore_case = false;
     let mut grep_all_match = false;
     let mut grep_invert = false;

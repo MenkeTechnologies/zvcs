@@ -1957,16 +1957,39 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let verb = if existed { "Reset to" } else { "Created from" };
     let message = format!("branch: {verb} {start_name}");
 
-    repo.reference(
-        full,
-        target,
-        if o.force {
-            PreviousValue::Any
-        } else {
-            PreviousValue::MustNotExist
+    // ```c
+    // if (reflog)
+    //         flags |= REF_FORCE_CREATE_REFLOG;
+    // …
+    // ref_transaction_update(transaction, ref.buf, &oid,
+    //                        forcing ? NULL : null_oid(the_hash_algo),
+    //                        NULL, NULL, flags, msg, &err)
+    // ```
+    // (branch.c:625-638.) `--create-reflog` writes the log whatever
+    // `core.logAllRefUpdates` says, which is the whole point of the option:
+    // `git -c core.logallrefupdates=false branch --create-reflog d/e/f` still
+    // leaves `logs/refs/heads/d/e/f` behind.
+    let full_name: FullName = full
+        .as_str()
+        .try_into()
+        .map_err(|e| anyhow!("invalid branch name '{name}': {e}"))?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: o.create_reflog,
+                message: message.into(),
+            },
+            expected: if o.force {
+                PreviousValue::Any
+            } else {
+                PreviousValue::MustNotExist
+            },
+            new: Target::Object(target),
         },
-        message,
-    )?;
+        name: full_name,
+        deref: false,
+    })?;
 
     if let Some(up) = upstream {
         install_tracking(repo, name, &up, o.quiet)?;
@@ -2493,8 +2516,7 @@ fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let path = repo.common_dir().join("config");
-    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    let (path, mut file) = local_config(repo)?;
     if let Ok(mut section) = file.section_mut("branch", Some(BStr::new(branch_name.as_bytes()))) {
         while section.remove("remote").is_some() {}
         while section.remove("merge").is_some() {}
@@ -2627,8 +2649,7 @@ fn edit_description(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let cfg_path = repo.common_dir().join("config");
-    let mut file = ConfigFile::from_path_no_includes(cfg_path.clone(), Source::Local)?;
+    let (cfg_path, mut file) = local_config(repo)?;
     let sub = BStr::new(branch_name.as_bytes());
     if stripped.is_empty() {
         if let Ok(mut section) = file.section_mut("branch", Some(sub)) {
@@ -2707,8 +2728,7 @@ pub(super) fn install_tracking(
     quiet: bool,
 ) -> Result<()> {
     let (remote, merge_ref, short) = upstream;
-    let path = repo.common_dir().join("config");
-    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    let (path, mut file) = local_config(repo)?;
     let sub = BStr::new(branch.as_bytes());
     file.set_raw_value_by("branch", Some(sub), "remote", remote.as_str())?;
     file.set_raw_value_by("branch", Some(sub), "merge", merge_ref.as_str())?;
@@ -2879,6 +2899,25 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         }
     };
     // ```c
+    // if (flag & REF_ISSYMREF) {
+    //         if (copy)
+    //                 ret = error("refname %s is a symbolic ref, copying it is not supported", …);
+    //         else
+    //                 ret = error("refname %s is a symbolic ref, renaming it is not supported", …);
+    //         goto out;
+    // }
+    // ```
+    // (refs/files-backend.c:1668-1676.) `files_copy_or_rename_ref()` returns
+    // non-zero, which `copy_or_rename_branch()` turns into
+    // `die(_("branch rename failed"))` (builtin/branch.c:640-644) — so the
+    // symref survives and neither name is touched.
+    if old_ref.target().try_name().is_some() {
+        eprintln!(
+            "error: refname {old_full} is a symbolic ref, renaming it is not supported"
+        );
+        return fatal("branch rename failed");
+    }
+    // ```c
     // if (!force)
     //         die(_("a branch named '%s' already exists"), ref->buf + strlen("refs/heads/"));
     // worktrees = get_worktrees();
@@ -2919,25 +2958,78 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let head_follows = repo.head_name()?.map(|n| n == old_name).unwrap_or(false);
     let message = format!("Branch: renamed {old_full} to {new_full}");
 
-    // Move the reflog first so the update below appends to the carried-over
-    // history rather than starting a fresh log.
+    // `files_copy_or_rename_ref()` (refs/files-backend.c:1682-1751) does this in
+    // a fixed order, and the order is what makes a directory/file rename work:
+    //
+    // ```c
+    // if (!copy && log && rename(sb_oldref.buf, tmp_renamed_log.buf)) …
+    // if (!copy && refs_delete_ref(&refs->base, logmsg, oldrefname, &orig_oid, REF_NO_DEREF)) …
+    // if (!copy && refs_resolve_ref_unsafe(&refs->base, newrefname, …) &&
+    //     refs_delete_ref(&refs->base, NULL, newrefname, NULL, REF_NO_DEREF)) {
+    //         if (errno == EISDIR) { … remove_empty_directories(&path) … }
+    // }
+    // if (log && rename_tmp_log(refs, newrefname)) …
+    // lock = lock_ref_oid_basic(refs, newrefname, &err);
+    // ```
+    //
+    // The old name — ref *and* log — is out of the way before the new one is
+    // written, so `git branch -m m m/m` can turn the file `refs/heads/m` into
+    // the directory it needs, and the empty directory `refs/heads/n` left by
+    // deleting `refs/heads/n/n` is pruned so the file `refs/heads/n` can be
+    // created. Writing the new ref first, as this did, is `File exists` in the
+    // first case and `Is a directory` in the second.
+    let logs = repo.git_dir().join("logs");
+    let tmp_log = logs.join(TMP_RENAMED_LOG);
+    let mut moved_log = false;
     if old_full != new_full {
-        let logs = repo.git_dir().join("logs");
         let from = logs.join(&old_full);
-        let to = logs.join(&new_full);
-        if from.exists() {
+        if from.symlink_metadata().is_ok() {
+            if let Some(parent) = tmp_log.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&from, &tmp_log)?;
+            moved_log = true;
+        }
+        repo.edit_reference(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+                // `refs_delete_ref()` is passed `logmsg`, so when `HEAD` is
+                // symbolic to the branch being renamed this deletion's
+                // `REF_LOG_ONLY` mirror lands in `.git/logs/HEAD` carrying the
+                // message. That mirror is the `<tip> <null>` half of the pair.
+                message: message.clone().into(),
+            },
+            name: old_name,
+            deref: false,
+        })?;
+        // The destination may be a leftover ref or the empty directory tree a
+        // just-deleted `<new>/<something>` left behind.
+        if repo.try_find_reference(new_full.as_str())?.is_some() {
+            repo.edit_reference(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                    message: "".into(),
+                },
+                name: new_name.clone(),
+                deref: false,
+            })?;
+        }
+        remove_empty_directories(&repo.common_dir().join(&new_full));
+        remove_empty_directories(&logs.join(&new_full));
+        if moved_log {
+            let to = logs.join(&new_full);
             if let Some(parent) = to.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::rename(&from, &to)?;
+            std::fs::rename(&tmp_log, &to)?;
         }
     }
 
-    // `files_copy_or_rename_ref()` deletes the old name before writing the new one, so the
-    // `<tip> <null>` half always comes first in `.git/logs/HEAD`. When the two names differ
-    // that half falls out of the deletion below, through `split_head_update()`. Renaming a
-    // branch onto its own name performs no deletion at all, so it is written here — ahead of
-    // the update whose own head-split supplies the `<tip> <tip>` half.
+    // Renaming a branch onto its own name performs no deletion at all, so the
+    // `<tip> <null>` half is written here — ahead of the update whose own
+    // head-split supplies the `<tip> <tip>` half.
     if head_follows && old_full == new_full {
         super::checkout::append_head_log(repo, Some(target), None, &message);
     }
@@ -2964,19 +3056,6 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     if old_full != new_full {
-        repo.edit_reference(RefEdit {
-            change: Change::Delete {
-                expected: PreviousValue::Any,
-                log: RefLog::AndReference,
-                // `files_copy_or_rename_ref()` passes `logmsg` to `refs_delete_ref()`, so when
-                // `HEAD` is symbolic to the branch being renamed the deletion's `REF_LOG_ONLY`
-                // mirror lands in `.git/logs/HEAD` carrying this message. That mirror is the
-                // `<tip> <null>` half of the pair below.
-                message: message.clone().into(),
-            },
-            name: old_name,
-            deref: false,
-        })?;
         // git renames the branch's config section along with the ref.
         move_branch_config(repo, &old, &new, true)?;
         // ```c
@@ -3030,6 +3109,48 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The repository's own `config`, opened for rewriting — with an absent file
+/// read as an empty one.
+///
+/// git's `git_config_set_multivar_in_file_gently()` (`config.c`) holds a lock on
+/// the path and writes through it whether or not anything was there to read, so
+/// a repository whose `.git/config` has been moved aside still takes a
+/// `git branch -m`, a `--set-upstream-to` and an `--edit-description`; this port
+/// refused all three with the `from_path_no_includes()` I/O error.
+fn local_config(repo: &gix::Repository) -> Result<(std::path::PathBuf, ConfigFile)> {
+    let path = repo.common_dir().join("config");
+    let file = match ConfigFile::from_path_no_includes(path.clone(), Source::Local) {
+        Ok(f) => f,
+        Err(gix::config::file::init::from_paths::Error::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            ConfigFile::new(gix::config::file::Metadata::from(Source::Local).at(path.clone()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok((path, file))
+}
+
+/// `TMP_RENAMED_LOG` (refs/files-backend.c): the name a rename parks the old
+/// branch's reflog under while both the old ref and the old log are being taken
+/// out of the way.
+const TMP_RENAMED_LOG: &str = "refs/.tmp-renamed-log";
+
+/// `remove_empty_directories()` (refs/files-backend.c:1184-1192), which is
+/// `remove_dir_recursively(path, REMOVE_DIR_EMPTY_ONLY)`: a file is wanted where
+/// a directory stands, so remove it if it contains nothing but empty
+/// directories. A non-empty tree, or no directory at all, is left alone —
+/// `lock_ref_oid_basic()` then reports the D/F conflict itself.
+fn remove_empty_directories(path: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(path) else { return };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            remove_empty_directories(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(path);
 }
 
 /// `copy_or_rename_branch()` for an orphan `HEAD`: the branch has no ref, so
@@ -3292,8 +3413,7 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 /// spelling of "remove this section". A branch that never had a section of its
 /// own leaves nothing to remove, and that is not an error.
 fn remove_branch_config(repo: &gix::Repository, name: &str) -> Result<()> {
-    let path = repo.common_dir().join("config");
-    let Ok(mut file) = ConfigFile::from_path_no_includes(path.clone(), Source::Local) else {
+    let Ok((path, mut file)) = local_config(repo) else {
         return Ok(());
     };
     let sub = gix::bstr::BString::from(name.as_bytes());
@@ -3320,8 +3440,7 @@ fn move_branch_config(
     new: &str,
     remove_old: bool,
 ) -> Result<()> {
-    let path = repo.common_dir().join("config");
-    let mut file = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
+    let (path, mut file) = local_config(repo)?;
 
     // Gather the old subsection's key/value pairs in order, as owned data so the
     // immutable borrow ends before the mutation below.

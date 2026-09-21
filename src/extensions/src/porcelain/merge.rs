@@ -1529,6 +1529,11 @@ fn try_merge_strategy(
     ctx: &MergeCtx<'_>,
     opts: &Opts,
 ) -> Result<Attempt> {
+    // `repo_refresh_and_write_index(…) < 0 → die(_("Unable to write index."))`
+    // (builtin/merge.c:795-798), ahead of the dispatch: every back-end below
+    // decides what it may overwrite from the index's `stat` data, and the two
+    // that run as separate programs read that data back off the file.
+    refresh_and_write_index(repo)?;
     if pick.kind.is_ort() {
         // `if (remoteheads->next) { error(…); return 2; }` (builtin/merge.c:809-812)
         if ctx.targets.len() > 1 {
@@ -2356,6 +2361,13 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         && bases.len() == 1
         && opts.option_commit()
     {
+        // `refresh_index(the_repository->index, REFRESH_QUIET, NULL, NULL, NULL)`
+        // (builtin/merge.c:1702), which guards both the `repo_index_has_changes()`
+        // check below and `read_tree_trivial()`'s `verify_uptodate()`. git refreshes
+        // `the_repository->index` in place and `read_tree_trivial()` unpacks over
+        // that same in-memory index; this port re-runs `read-tree` as a command
+        // against the file, so the repaired stat data has to reach the file.
+        refresh_and_write_index(&repo)?;
         // "Must first ensure that index matches HEAD before attempting a trivial
         // merge." — `repo_index_has_changes()` (builtin/merge.c:1712-1719). Its
         // refusal is `error:` alone: no `Merge with strategy … failed.` line,
@@ -2546,6 +2558,56 @@ fn exit_status(code: ExitCode) -> u8 {
     (0u8..=255).find(|&n| code == ExitCode::from(n)).unwrap_or(1)
 }
 
+/// `repo_refresh_and_write_index(the_repository, REFRESH_QUIET, SKIP_IF_UNCHANGED,
+/// 0, NULL, NULL, NULL)` (read-cache.c:1460-1479).
+///
+/// ```c
+/// if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET,
+///                                  SKIP_IF_UNCHANGED, 0, NULL, NULL,
+///                                  NULL) < 0)
+///         die(_("Unable to write index."));
+/// ```
+///
+/// `cmd_merge` runs this three times: at the head of `try_merge_strategy()`
+/// (builtin/merge.c:795-798), at the head of `merge_trivial()`
+/// (builtin/merge.c:994-997), and — as the bare in-memory `refresh_index()`,
+/// since nothing there re-reads the file — just before the `allow_trivial`
+/// pre-pass (builtin/merge.c:1702).
+///
+/// It is load-bearing, not hygiene. `threeway_merge()` refuses a path whose
+/// worktree copy is not up to date *before* it records the merge as non-trivial
+/// (`verify_uptodate(index, o)` at unpack-trees.c:2873, `o->internal
+/// .nontrivial_merge = 1` at :2877), and up-to-dateness is decided from `stat`
+/// data alone. So an entry whose mtime moved while its bytes did not — any
+/// editor that rewrites in place, any `touch`, any copy that does not preserve
+/// times — makes the pre-pass die with `error: Entry '<path>' not uptodate.
+/// Cannot merge.` where stock, having just repaired that stat data, reports
+/// `error: Merge requires file-level merging` and carries on. The same stale
+/// stat reaches `git-merge-octopus`/`git-merge-resolve` through the *file*,
+/// which is why the strategy-loop refresh has to be written out and not only
+/// repaired in memory.
+///
+/// `SKIP_IF_UNCHANGED` is the write flag: an index the refresh did not move is
+/// not rewritten. git's non-negative returns are both "carry on" — only a
+/// failed write is `< 0` — so a reported path does not stop the merge.
+fn refresh_and_write_index(repo: &gix::Repository) -> Result<()> {
+    if repo.workdir().is_none() {
+        return Ok(());
+    }
+    let mut index = repo.index_or_load_from_head()?.into_owned();
+    let outcome = super::update_index::refresh_index(
+        repo,
+        &mut index,
+        super::update_index::RefreshFlags { quiet: true, ..Default::default() },
+        None,
+        None,
+    )?;
+    if outcome.dirty {
+        crate::index_racy::write(repo, &mut index)?;
+    }
+    Ok(())
+}
+
 /// `read_tree_trivial()` (builtin/merge.c:743-777): `unpack_trees()` over
 /// `<common> <head> <one>` with `head_idx = 2`, `merge`, `update`,
 /// `verbose_update`, `trivial_merges_only` and `preserve_ignored = 0`, resolving
@@ -2589,6 +2651,9 @@ fn merge_trivial(
     opts: &Opts,
     reflog_spec: &str,
 ) -> Result<ExitCode> {
+    // `repo_refresh_and_write_index(…)` (builtin/merge.c:994-997) before
+    // `write_tree_trivial()` turns the index into the merge commit's tree.
+    refresh_and_write_index(repo)?;
     let index = repo.open_index()?;
     let result_tree = index_tree(repo, &index)?;
     // A bare `printf` with no verbosity check, so `-q` keeps it too.
@@ -3097,9 +3162,16 @@ fn stop_for_conflicts(
     // staged under `--rerere-autoupdate`/`rerere.autoupdate`), an unknown one
     // has its preimage recorded for next time.
     super::rerere::repo_rerere(repo, opts.rerere_autoupdate)?;
-    if !opts.quiet {
-        println!("Automatic merge failed; fix conflicts and then commit the result.");
-    }
+    // ```c
+    // printf(_("Automatic merge failed; "
+    //         "fix conflicts and then commit the result.\n"));
+    // ```
+    //
+    // (builtin/merge.c:1065-1066.) A bare `printf` with no verbosity test, so
+    // `--quiet`/`-q` and `merge.verbosity=0` all keep it: the line that tells the
+    // caller the worktree is now conflicted is the one thing quiet does not take
+    // away (measured against stock 2.55.0, which prints it under both).
+    println!("Automatic merge failed; fix conflicts and then commit the result.");
     // `cmd_merge()`'s tail after `suggest_conflicts()` (builtin/merge.c:1872-1874),
     // printed whether the worktree was dirty (`Created autostash: …` first) or
     // clean. The `MERGE_AUTOSTASH` the merge leaves behind is what `git merge

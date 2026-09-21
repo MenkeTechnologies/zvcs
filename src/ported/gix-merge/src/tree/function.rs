@@ -1030,12 +1030,57 @@ where
                                                 entries,
                                             ))
                                         }
+                                        // A deletion replaced by a directory is a
+                                        // file/directory conflict first and a modify/delete
+                                        // second, and merge-ort gates only the *second* half
+                                        // on the recursion level. The file is moved out of the
+                                        // directory's way at every `call_depth` — git's
+                                        // virtual ancestor for `df` deleted-and-made-a-directory
+                                        // on one side, modified on the other, is
+                                        // `{df/in.txt, df~Temporary merge branch 1, …}`, the
+                                        // branch label being the recursion's own `opt->branch1`
+                                        // /`branch2` (merge-ort.c:5359-5360) — and only the
+                                        // blob left at that moved-aside path follows
+                                        // `index = opt->priv->call_depth ? 0 : side`
+                                        // (merge-ort.c:4368), i.e. the ancestor's version
+                                        // rather than the modified side's.
+                                        //
+                                        // Doing nothing here instead left the ancestor's file
+                                        // sitting at `df` and dropped the directory, so the
+                                        // outer merge saw a file where git had already put a
+                                        // directory and re-raised the whole file/directory
+                                        // conflict one level up.
                                         Some(ResolveWith::Ancestor) => {
-                                            should_fail_on_conflict(Conflict::without_resolution(
-                                                ResolutionFailure::OursModifiedTheirsDeleted,
+                                            let our_tree = pick_our_tree(side, our_tree, their_tree);
+                                            let renamed_path = unique_path_in_tree(
+                                                location.as_bstr(),
+                                                &editor,
+                                                our_tree,
+                                                label_of_side_to_be_moved,
+                                            )?;
+                                            editor.remove(toc(location))?;
+                                            our_tree.remove_existing_leaf(location.as_bstr());
+
+                                            let new_change = Change::Addition {
+                                                location: renamed_path.clone(),
+                                                relation: None,
+                                                entry_mode: *previous_entry_mode,
+                                                id: *previous_id,
+                                            };
+                                            let should_break = should_fail_on_conflict(Conflict::without_resolution(
+                                                ResolutionFailure::OursModifiedTheirsDirectoryThenOursRenamed {
+                                                    renamed_unique_path_to_modified_blob: renamed_path,
+                                                },
                                                 (ours, theirs, side, outer_side),
                                                 entries,
-                                            ))
+                                            ));
+
+                                            // Since we move *our* side, our tree needs to be modified.
+                                            push_deferred(
+                                                (new_change, None),
+                                                pick_our_changes_mut(side, our_changes, their_changes),
+                                            );
+                                            should_break
                                         }
                                     }
                                 } else {
@@ -1140,11 +1185,16 @@ where
                                 let merged_mode =
                                     merge_modes(*our_mode, *their_mode).expect("this case was assured earlier");
 
-                                if matches!(tree_conflicts, None | Some(ResolveWith::Ours)) {
-                                    editor.remove(toc(source_location))?;
-                                    our_tree.remove_existing_leaf(source_location.as_bstr());
-                                    their_tree.remove_existing_leaf(source_location.as_bstr());
-                                }
+                                // `ResolveWith::Ancestor` is in this list because merge-ort
+                                // applies a rename/rename(1to2) the same way at every
+                                // `call_depth`: `process_renames()` writes the content merge
+                                // into *both* destinations and never looks at the recursion
+                                // level except to widen the conflict markers
+                                // (`1 + 2 * opt->priv->call_depth`, merge-ort.c:3011-3046).
+                                // So the source leaves the virtual ancestor's tree here too.
+                                editor.remove(toc(source_location))?;
+                                our_tree.remove_existing_leaf(source_location.as_bstr());
+                                their_tree.remove_existing_leaf(source_location.as_bstr());
 
                                 let their_location = Cow::Borrowed(their_location.as_bstr());
                                 let our_location = Cow::Borrowed(our_location.as_bstr());
@@ -1188,7 +1238,27 @@ where
                                         break 'outer;
                                     }
                                     match tree_conflicts {
-                                        None => {
+                                        // `Ancestor` joins `None` here: a rename/rename(1to2)
+                                        // is not a conflict merge-ort resolves by picking a
+                                        // side, at any `call_depth`. `process_renames()` runs
+                                        // one content merge over (source, ours, theirs) and
+                                        // copies the *same* result into both destinations —
+                                        // `memcpy(&side1->stages[1], &merged, …)` /
+                                        // `memcpy(&side2->stages[2], &merged, …)`
+                                        // (merge-ort.c:3026, 3043) — with no recursion-level
+                                        // branch anywhere in that block.
+                                        //
+                                        // Dropping both destinations instead handed the outer
+                                        // merge a virtual ancestor that still carried the file
+                                        // at its *old* name, so the outer merge re-detected the
+                                        // rename and reported the same `CONFLICT
+                                        // (rename/rename)` git had already settled one level
+                                        // down. Measured against stock 2.55.0 on a criss-cross
+                                        // where `main` renames `ren.txt` to `A.txt` and `side`
+                                        // renames it to `B.txt`: git's virtual ancestor tree is
+                                        // `{A.txt, B.txt, k.txt}` and the merge comes out with
+                                        // neither name and no rename conflict at all.
+                                        None | Some(ResolveWith::Ancestor) => {
                                             let our_addition = Change::Addition {
                                                 location: our_location.into_owned(),
                                                 relation: None,
@@ -1203,7 +1273,6 @@ where
                                             };
                                             (Some(our_addition), Some(their_addition))
                                         }
-                                        Some(ResolveWith::Ancestor) => (None, None),
                                         Some(ResolveWith::Ours) => {
                                             let our_addition = Change::Addition {
                                                 location: match outer_side {

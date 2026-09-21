@@ -642,6 +642,26 @@ fn merge_and_apply(
         for line in &messages {
             println!("{line}");
         }
+        // `merge_display_update_messages()` ends in
+        //
+        // ```c
+        // /* Also include needed rename limit adjustment now */
+        // diff_warn_rename_limit("merge.renamelimit",
+        //                        opti->renames.needed_limit, 0);
+        // ```
+        //
+        // (merge-ort.c:4879-4881), and `diff_warn_rename_limit()` opens with a
+        // bare `fflush(stdout)` *before* it decides whether it has anything to
+        // warn about (diff.c:7038-7049). So every merge-ort merge that displays
+        // its messages flushes stdout right here, whatever the rename limit was.
+        //
+        // That incidental flush is what orders `git merge 2>&1 | …` for stock:
+        // without it the `Auto-merging`/`CONFLICT` block sits in the stdio
+        // buffer until `exit()` and every stderr line — `Recorded preimage for
+        // '<path>'` (rerere.c), `Automatic merge went well; stopped before
+        // committing as requested` (builtin/merge.c:1869) — overtakes it.
+        // [`crate::cstdio`] models that buffer, so it has to model the flush.
+        crate::cstdio::flush();
     }
 
     let mut index = update_worktree_to_tree(repo, old_index, tree_id, should_interrupt)?;

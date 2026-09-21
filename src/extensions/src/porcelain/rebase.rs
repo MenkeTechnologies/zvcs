@@ -583,6 +583,32 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     let mut flags: u32 = NO_QUIET;
     let mut ty = Backend::Unspecified;
     let mut action: Option<ModeOption> = None;
+    // `OPT_CMDMODE`: the six action switches all write `options.action`
+    // (`builtin/rebase.c:1167-1180`), so `parse_options` rejects a *second,
+    // different* one the moment it reaches it -- before the post-parse
+    // `argc != 2` check below turns a lone action switch into a usage block.
+    // Repeating the same switch is accepted: `parse-options.c:401` skips an
+    // entry whose recorded value already equals the new one. The message names
+    // the switch being parsed first and the one already stored second
+    // (`parse-options.c:417-420`), which is why `--continue --abort` and
+    // `--abort --continue` print the pair in opposite orders, and `error()` +
+    // `return -1` emits no usage block; the status is 129.
+    macro_rules! cmdmode {
+        ($new:expr) => {{
+            let new = $new;
+            match action {
+                Some(prev) if prev != new => {
+                    eprintln!(
+                        "error: options '{}' and '{}' cannot be used together",
+                        new.flag(),
+                        prev.flag()
+                    );
+                    return Ok(ExitCode::from(129));
+                }
+                _ => action = Some(new),
+            }
+        }};
+    }
     let mut positional: Vec<String> = Vec::new();
 
     let mut onto_name: Option<String> = None;
@@ -647,7 +673,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // recursive submodule walk aborts on the first one it reaches.
     let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
-    let state_dir = repo.common_dir();
+    // `merge_dir()` / `apply_dir()` are `GIT_PATH_FUNC`s (`builtin/rebase.c:53-54`),
+    // so they resolve against `$GIT_DIR`, and neither `rebase-merge` nor
+    // `rebase-apply` appears in `path.c`'s `common_list` (`path.c:98-124`) that
+    // reroutes a name to the common directory. A linked worktree therefore keeps
+    // its own rebase state, which is also where the replay below writes it:
+    // reading the common directory here missed an in-progress rebase in every
+    // worktree but the main one.
+    let state_dir = repo.git_dir();
     let apply_in_progress = state_dir.join("rebase-apply").is_dir();
     let merge_in_progress = state_dir.join("rebase-merge").is_dir();
     if apply_in_progress {
@@ -889,27 +922,27 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 }
                 "continue" => {
                     noarg!();
-                    action = Some(ModeOption::Continue);
+                    cmdmode!(ModeOption::Continue);
                 }
                 "skip" => {
                     noarg!();
-                    action = Some(ModeOption::Skip);
+                    cmdmode!(ModeOption::Skip);
                 }
                 "abort" => {
                     noarg!();
-                    action = Some(ModeOption::Abort);
+                    cmdmode!(ModeOption::Abort);
                 }
                 "quit" => {
                     noarg!();
-                    action = Some(ModeOption::Quit);
+                    cmdmode!(ModeOption::Quit);
                 }
                 "edit-todo" => {
                     noarg!();
-                    action = Some(ModeOption::EditTodo);
+                    cmdmode!(ModeOption::EditTodo);
                 }
                 "show-current-patch" => {
                     noarg!();
-                    action = Some(ModeOption::ShowCurrentPatch);
+                    cmdmode!(ModeOption::ShowCurrentPatch);
                 }
                 "apply" => {
                     noarg!();
@@ -1238,14 +1271,22 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         } else {
             state_dir.join("rebase-merge")
         };
-        eprintln!(
+        // `builtin/rebase.c:1459-1468`. Two details of that `die()` are easy to
+        // lose. The quoted path is `options.state_dir`, i.e. `merge_dir()` /
+        // `apply_dir()`, which are `GIT_PATH_FUNC`s (`builtin/rebase.c:53-54`):
+        // `setup.c` has already moved to the top of the work tree, so an
+        // ordinary repository prints `.git/rebase-merge` however deep the
+        // command was typed, and only a separate git directory is spelled in
+        // full. And the format string itself ends in `\n` (line 1467) on top of
+        // the one `die()` appends, so the message is followed by a blank line.
+        eprint!(
             "fatal: It seems that there is already a {base} directory, and\n\
              I wonder if you are in the middle of another rebase.  If that is the\n\
              case, please try\n\tgit rebase (--continue | --abort | --skip)\n\
              If that is not the case, please\n\trm -fr \"{}\"\n\
              and run me again.  I am stopping in case you still have something\n\
-             valuable there.",
-            dir.display()
+             valuable there.\n\n",
+            crate::setup::git_path_display(&repo, &dir)
         );
         return Ok(ExitCode::from(128));
     }
@@ -5023,6 +5064,30 @@ enum Step {
     Stop(u8),
 }
 
+/// The failure shape of `pick_commits()`'s `label` / `reset` / `merge` /
+/// `update-ref` arms (sequencer.c:5078-5101): each sets `reschedule = 1`, so the
+/// instruction is put back at the head of the sheet, the
+/// `Could not execute the todo command` advice names the whole line, and the
+/// rebase stops resumable instead of unwinding.
+///
+/// git's `error()` has already printed the reason by the time the flag is set,
+/// which is why this carries no message of its own: the verb prints its
+/// `error:` line and then returns this so the shared tail
+/// (sequencer.c:5105-5117) can run. It is a distinct type so that the port's own
+/// "not ported" refusals, which git has no counterpart for, keep unwinding with
+/// their own wording rather than claiming to have been rescheduled.
+#[derive(Debug)]
+struct Reschedule;
+
+impl std::fmt::Display for Reschedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never reaches a terminal: the dispatch below consumes it.
+        f.write_str("todo command failed and was rescheduled")
+    }
+}
+
+impl std::error::Error for Reschedule {}
+
 impl<'r> Sequencer<'r> {
     fn new(repo: &'r gix::Repository, st: RebaseState) -> Result<Self> {
         let committer = repo
@@ -5192,10 +5257,19 @@ impl<'r> Sequencer<'r> {
                 }
                 todo::Cmd::Exec => self.do_exec(&item)?,
                 todo::Cmd::Noop | todo::Cmd::Drop | todo::Cmd::Comment => Step::Next,
-                todo::Cmd::Label => self.do_label(&item)?,
-                todo::Cmd::Reset => self.do_reset(&item)?,
+                todo::Cmd::Label => match self.do_label(&item) {
+                    Err(e) if e.is::<Reschedule>() => return self.reschedule_stop(&item),
+                    other => other?,
+                },
+                todo::Cmd::Reset => match self.do_reset(&item) {
+                    Err(e) if e.is::<Reschedule>() => return self.reschedule_stop(&item),
+                    other => other?,
+                },
                 todo::Cmd::Merge => {
-                    let step = self.do_merge(&item)?;
+                    let step = match self.do_merge(&item) {
+                        Err(e) if e.is::<Reschedule>() => return self.reschedule_stop(&item),
+                        other => other?,
+                    };
                     // ```c
                     // else if (item->commit)
                     //         record_in_rewritten(&item->commit->object.oid,
@@ -5216,7 +5290,10 @@ impl<'r> Sequencer<'r> {
                 // the record just learns where `HEAD` reached. The refs are
                 // written in one pass at the very end.
                 todo::Cmd::UpdateRef => {
-                    do_update_ref(self.repo, item.arg.to_str_lossy().trim())?;
+                    match do_update_ref(self.repo, item.arg.to_str_lossy().trim()) {
+                        Err(e) if e.is::<Reschedule>() => return self.reschedule_stop(&item),
+                        other => other?,
+                    }
                     Step::Next
                 }
                 todo::Cmd::Invalid => {
@@ -5318,19 +5395,59 @@ impl<'r> Sequencer<'r> {
             return Ok(Step::Next);
         }
         if self.st.reschedule_failed_exec {
-            // Put the instruction back so `--continue` retries it, then say so.
-            // `advise(rescheduled_advice, …)` quotes the *whole* todo line, not
-            // just the command, which is what the user would have to edit.
-            self.reschedule(item)?;
-            let line = todo::List { items: vec![item.clone()] }.to_bytes(self.repo, None, 0);
-            crate::advice::print_hint(&format!(
-                "Could not execute the todo command\n\n    {}\n\n\
-                 It has been rescheduled; To edit the command before continuing, please\n\
-                 edit the todo list first:\n\n    git rebase --edit-todo\n    git rebase --continue",
-                line.as_bstr().trim_end().to_str_lossy(),
-            ));
+            // Put the instruction back so `--continue` retries it, then say so:
+            // the same `reschedule` tail every other verb reaches
+            // (sequencer.c:5105-5117).
+            self.reschedule_item(item)?;
         }
         Ok(Step::Stop(1))
+    }
+
+    /// `pick_commits()`'s shared reschedule tail:
+    ///
+    /// ```c
+    /// if (reschedule) {
+    ///         advise(_(rescheduled_advice),
+    ///                get_item_line_length(todo_list, todo_list->current),
+    ///                get_item_line(todo_list, todo_list->current));
+    ///         if (save_todo(todo_list, opts, reschedule))
+    ///                 return -1;
+    ///         if (item->commit)
+    ///                 write_rebase_head(&item->commit->object.oid);
+    /// }
+    /// ```
+    ///
+    /// (sequencer.c:5105-5117.) `label`, `reset`, `merge` and `update-ref` all
+    /// route their failures here, so the instruction survives in
+    /// `git-rebase-todo` and `git rebase --continue` retries it. Dropping this
+    /// left the sheet empty after the failed instruction, so `--continue`
+    /// concluded the rebase and silently discarded everything that was still
+    /// queued behind it.
+    fn reschedule_stop(&self, item: &todo::Item) -> Result<ExitCode> {
+        self.reschedule_item(item)?;
+        Ok(ExitCode::from(1))
+    }
+
+    /// The body of that tail, shared with `do_exec()`'s
+    /// `opts->reschedule_failed_exec` arm so the two cannot drift apart.
+    fn reschedule_item(&self, item: &todo::Item) -> Result<()> {
+        // `advise()` quotes the *whole* todo line, not just the command, which is
+        // what the user would have to edit.
+        let line = todo::List { items: vec![item.clone()] }.to_bytes(self.repo, None, 0);
+        crate::advice::print_hint(&format!(
+            "Could not execute the todo command\n\n    {}\n\n\
+             It has been rescheduled; To edit the command before continuing, please\n\
+             edit the todo list first:\n\n    git rebase --edit-todo\n    git rebase --continue",
+            line.as_bstr().trim_end().to_str_lossy(),
+        ));
+        self.reschedule(item)?;
+        // `write_rebase_head()` (sequencer.c:1711-1718) — only when the
+        // instruction named a commit, which `label`, `reset`, `update-ref` and
+        // `exec` never do and `merge -C <commit>` always does.
+        if let Some(oid) = item.commit {
+            std::fs::write(self.repo.git_dir().join("REBASE_HEAD"), format!("{oid}\n"))?;
+        }
+        Ok(())
     }
 
     /// Put `item` back at the head of `git-rebase-todo` — git's `reschedule`
@@ -5863,6 +5980,26 @@ impl<'r> Sequencer<'r> {
 
     /// `lookup_label()`: `refs/rewritten/<label>` if it exists, else `<label>`
     /// read as an ordinary revision.
+    ///
+    /// ```c
+    /// strbuf_addf(buf, "refs/rewritten/%.*s", len, label);
+    /// if (!refs_read_ref(…, buf->buf, &oid)) {
+    ///         commit = lookup_commit_object(r, &oid);
+    /// } else {
+    ///         /* fall back to non-rewritten ref or commit */
+    ///         strbuf_splice(buf, 0, strlen("refs/rewritten/"), "", 0);
+    ///         commit = lookup_commit_reference_by_name(buf->buf);
+    /// }
+    ///
+    /// if (!commit)
+    ///         error(_("could not resolve '%s'"), buf->buf);
+    /// ```
+    ///
+    /// (sequencer.c:3991-4002.) The fallback *splices the prefix back off*, so
+    /// the diagnostic names the label as the instruction spelled it, not the
+    /// `refs/rewritten/` ref that was tried first — reporting the full ref sent
+    /// users looking for a ref they never wrote. The failure is a `reschedule`,
+    /// so the message goes out here and the error itself is the marker.
     fn lookup_label(&self, label: &str) -> Result<ObjectId> {
         let full = format!("refs/rewritten/{label}");
         if let Ok(Some(mut r)) = self.repo.try_find_reference(full.as_str()) {
@@ -5873,7 +6010,10 @@ impl<'r> Sequencer<'r> {
         self.repo
             .rev_parse_single(label)
             .map(|id| id.detach())
-            .map_err(|_| anyhow!("could not resolve '{full}'"))
+            .map_err(|_| {
+                eprintln!("error: could not resolve '{label}'");
+                anyhow!(Reschedule)
+            })
     }
 
     /// `do_merge()`: recreate a merge commit whose sides the sheet named by label.
@@ -5911,10 +6051,30 @@ impl<'r> Sequencer<'r> {
             self.term_clear_line();
             crate::git_fatal!("nothing to merge: '{arg}'");
         }
-        let merge_heads: Vec<ObjectId> = heads
-            .iter()
-            .map(|h| self.lookup_label(h))
-            .collect::<Result<Vec<_>>>()?;
+        // ```c
+        // merge_commit = lookup_label(r, p, k, &ref_name);
+        // if (!merge_commit) {
+        //         ret = error(_("unable to parse '%.*s'"), k, p);
+        //         goto leave_merge;
+        // }
+        // ```
+        //
+        // (sequencer.c:4151-4155.) A label `do_merge()` cannot resolve costs two
+        // `error:` lines, not one: `lookup_label()` has already said it could not
+        // resolve the name, and `do_merge()` adds that it could not parse the
+        // merge-head list because of it.
+        let mut merge_heads: Vec<ObjectId> = Vec::with_capacity(heads.len());
+        for h in &heads {
+            match self.lookup_label(h) {
+                Ok(id) => merge_heads.push(id),
+                Err(e) => {
+                    if e.is::<Reschedule>() {
+                        eprintln!("error: unable to parse '{h}'");
+                    }
+                    return Err(e);
+                }
+            }
+        }
         let head = repo.head_id()?.detach();
 
         // `can_fast_forward`: HEAD is still the original merge's first parent and
@@ -5992,6 +6152,23 @@ impl<'r> Sequencer<'r> {
         // need the virtual common ancestor git builds by merging them, which is
         // not reachable from here.
         let bases = repo.merge_bases_many(head, &[merge_head])?;
+        // ```c
+        // if (bases && oideq(&merge_commit->object.oid,
+        //                    &bases->item->object.oid)) {
+        //         ret = 0;
+        //         /* skip merging an ancestor of HEAD */
+        //         goto leave_merge;
+        // }
+        // ```
+        // (sequencer.c:4334-4339). A merge head that is already an ancestor of
+        // `HEAD` contributes nothing, so git writes no `MERGE_HEAD`, builds no
+        // commit and leaves `HEAD` where it is -- while still recording the
+        // original merge in `rewritten`, which is why this returns `Next` rather
+        // than stopping. Without it a `merge` whose side had already been
+        // replayed onto `HEAD` produced a two-parent commit git never writes.
+        if bases.first().map(|b| b.detach()) == Some(merge_head) {
+            return Ok(Step::Next);
+        }
         if bases.len() > 1 {
             self.term_clear_line();
             bail!(

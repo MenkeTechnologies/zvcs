@@ -1205,12 +1205,31 @@ fn pick_one(
         let comment = super::commit::comment_prefix(&repo.config_snapshot());
         message = cleanup_message(&message, mode, &comment);
     }
-    if message.trim().is_empty() && !opts.allow_empty_message {
-        crate::git_fatal!(
-            "the commit message of {pick_short} is empty (use --allow-empty-message)"
-        );
-    }
-    if message.last() != Some(&b'\n') {
+    // git has no refusal here. Its only empty-message check is
+    //
+    // ```c
+    // if ((flags & EDIT_MSG) && message_is_empty(msg, cleanup)) {
+    //         res = 1; /* run 'git commit' to display error message */
+    //         goto out;
+    // }
+    // ```
+    //
+    // (sequencer.c:1631-1634) inside `try_to_commit()`, which `do_commit()`
+    // only calls when `EDIT_MSG` is clear (sequencer.c:1728) -- and the editing
+    // path instead reaches `run_git_commit()`, which passes
+    // `--allow-empty-message` for every *non*-editing commit
+    // (sequencer.c:1177-1178). So a pick that is not being edited commits an
+    // empty message as it stands; only `-e` can refuse one, and then it is the
+    // child `git commit` that says so. Refusing here made `cherry-pick`,
+    // `cherry-pick -x`, `cherry-pick -s` and `revert` all die at 128 on any
+    // commit written with `--allow-empty-message`.
+    //
+    // `strbuf_complete_line()` (sequencer.c:2394) is a no-op on an empty buffer,
+    // and `find_commit_subject()` appends nothing when there is no subject
+    // (sequencer.c:2390-2391), so an empty message stays empty rather than
+    // becoming a bare newline -- which is what puts `-x`'s trailer on the first
+    // line instead of the third.
+    if !message.is_empty() && message.last() != Some(&b'\n') {
         message.push(b'\n');
     }
     if opts.record_origin {
@@ -1229,6 +1248,29 @@ fn pick_one(
             }
             message.extend_from_slice(trailer.as_bytes());
         }
+    }
+    // ```c
+    // if (flags & CLEANUP_MSG)
+    //         cleanup = COMMIT_MSG_CLEANUP_ALL;
+    // else if ((opts->signoff || opts->record_origin) &&
+    //          !opts->explicit_cleanup)
+    //         cleanup = COMMIT_MSG_CLEANUP_SPACE;
+    // else
+    //         cleanup = opts->default_msg_cleanup;
+    //
+    // if (cleanup != COMMIT_MSG_CLEANUP_NONE)
+    //         strbuf_stripspace(msg, …);
+    // ```
+    //
+    // (sequencer.c:1620-1630.) `try_to_commit()` applies this *after* the
+    // trailers are on, so `-s` or `-x` with no explicit `--cleanup` always
+    // whitespace-clean the finished message. That is what collapses the blank
+    // line those trailers insert ahead of themselves when the picked message
+    // was empty, leaving `(cherry picked from commit …)` on the first line
+    // instead of the third.
+    if cleanup.is_none() && (opts.signoff || opts.record_origin) {
+        let comment = super::commit::comment_prefix(&repo.config_snapshot());
+        message = cleanup_message(&message, Cleanup::Whitespace, &comment);
     }
     let subject = gix::objs::commit::MessageRef::from_bytes(message.as_bstr())
         .summary()
@@ -2189,28 +2231,27 @@ fn stop_empty(
     std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
     std::fs::write(git_dir.join("MERGE_MSG"), &message[..])?;
 
-    match repo.head_name()? {
-        Some(name) => println!("On branch {}", name.shorten()),
-        None => println!("HEAD detached at {}", head_id.attach(repo).shorten_or_id()),
-    }
-    // `wt_status_print` follows the header with the upstream relation and a
-    // blank line; a branch with no upstream contributes neither.
-    print!("{}", super::status::tracking_block(repo));
-    println!(
-        "You are currently cherry-picking commit {}.",
-        pick_id.attach(repo).shorten_or_id()
-    );
-    // `wt_status_prepare()`: `s->hints = advice_enabled(ADVICE_STATUS_HINTS)`, so
-    // every parenthesized direction under the in-progress line hangs off that one
-    // flag — `--no-advice` and `advice.statusHints=false` alike take all three
-    // away and leave the state line itself.
-    if crate::advice::Advice::StatusHints.enabled_in(repo) {
-        println!("  (all conflicts fixed: run \"git cherry-pick --continue\")");
-        println!("  (use \"git cherry-pick --skip\" to skip this patch)");
-        println!("  (use \"git cherry-pick --abort\" to cancel the cherry-pick operation)");
-    }
-    println!();
-    println!("nothing to commit, working tree clean");
+    // ```c
+    // s->hints = advice_enabled(ADVICE_STATUS_HINTS);
+    // s->display_comment_prefix = old_display_comment_prefix;
+    // run_status(stdout, index_file, prefix, 0, s);
+    // ```
+    //
+    // (builtin/commit.c:1083-1085.) The block is the whole `git status` report,
+    // written by the same `wt_status_print()` — header, upstream relation,
+    // in-progress state, *and the changed/untracked sections*. Hand-rolling the
+    // header and pinning the tail to `nothing to commit, working tree clean`
+    // assumed the worktree was clean because the merged tree equalled `HEAD`'s,
+    // but that says nothing about untracked files or unstaged edits to files the
+    // pick never touched: both were simply not reported. `CHERRY_PICK_HEAD` is
+    // already on disk above, so the state block resolves the same way git's
+    // `wt_status_get_state()` resolves it — the single-pick wording here, the
+    // sequencer wording once `.git/sequencer` exists.
+    //
+    // `revert.rs` reaches the ported driver for the same reason; this is that
+    // call site, not a second rendering of the same report.
+    let _ = (head_id, pick_id);
+    super::status::status(&[])?;
 
     eprintln!("The previous cherry-pick is now empty, possibly due to conflict resolution.");
     eprintln!("If you wish to commit it anyway, use:");

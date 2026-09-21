@@ -337,7 +337,7 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
-                return Ok(usage_error(Some(&format!("option `{name}' requires a value")), USAGE))
+                return Ok(value_error(&format!("option `{name}' requires a value")))
             }
             Common::NotCommon => {}
         }
@@ -420,10 +420,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
-                return Ok(usage_error(
-                    Some(&format!("option `{name}' requires a value")),
-                    WRITE_USAGE,
-                ))
+                return Ok(value_error(&format!("option `{name}' requires a value")))
             }
             Common::NotCommon => {}
         }
@@ -450,29 +447,20 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             "--base" => match it.next() {
                 Some(_) => base = true,
                 None => {
-                    return Ok(usage_error(
-                        Some("option `base' requires a value"),
-                        WRITE_USAGE,
-                    ))
+                    return Ok(value_error("option `base' requires a value"))
                 }
             },
             _ if a.starts_with("--base=") => base = true,
             "--refs-snapshot" => {
                 if it.next().is_none() {
-                    return Ok(usage_error(
-                        Some("option `refs-snapshot' requires a value"),
-                        WRITE_USAGE,
-                    ));
+                    return Ok(value_error("option `refs-snapshot' requires a value"));
                 }
             }
             _ if a.starts_with("--refs-snapshot=") => {}
             "--preferred-pack" => match it.next() {
                 Some(v) => preferred = Some(v.to_string()),
                 None => {
-                    return Ok(usage_error(
-                        Some("option `preferred-pack' requires a value"),
-                        WRITE_USAGE,
-                    ))
+                    return Ok(value_error("option `preferred-pack' requires a value"))
                 }
             },
             _ if a.starts_with("--preferred-pack=") => {
@@ -1236,10 +1224,7 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
-                return Ok(usage_error(
-                    Some(&format!("option `{name}' requires a value")),
-                    VERIFY_USAGE,
-                ))
+                return Ok(value_error(&format!("option `{name}' requires a value")))
             }
             Common::NotCommon => {}
         }
@@ -1318,10 +1303,7 @@ fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
-                return Ok(usage_error(
-                    Some(&format!("option `{name}' requires a value")),
-                    EXPIRE_USAGE,
-                ))
+                return Ok(value_error(&format!("option `{name}' requires a value")))
             }
             Common::NotCommon => {}
         }
@@ -1441,10 +1423,7 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
-                return Ok(usage_error(
-                    Some(&format!("option `{name}' requires a value")),
-                    COMPACT_USAGE,
-                ))
+                return Ok(value_error(&format!("option `{name}' requires a value")))
             }
             Common::NotCommon => {}
         }
@@ -1465,10 +1444,7 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             "--base" => match it.next() {
                 Some(_) => {}
                 None => {
-                    return Ok(usage_error(
-                        Some("option `base' requires a value"),
-                        COMPACT_USAGE,
-                    ))
+                    return Ok(value_error("option `base' requires a value"))
                 }
             },
             _ if a.starts_with("--base=") => {}
@@ -1572,10 +1548,7 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
-                return Ok(usage_error(
-                    Some(&format!("option `{name}' requires a value")),
-                    REPACK_USAGE,
-                ))
+                return Ok(value_error(&format!("option `{name}' requires a value")))
             }
             Common::NotCommon => {}
         }
@@ -1588,14 +1561,11 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 Some(v) => match classify_magnitude(v) {
                     MagValue::Ok(size) => batch_size = size,
                     other => {
-                        return Ok(usage_error(Some(&magnitude_error(v, other)), REPACK_USAGE))
+                        return Ok(value_error(&magnitude_error(v, other)))
                     }
                 },
                 None => {
-                    return Ok(usage_error(
-                        Some("option `batch-size' requires a value"),
-                        REPACK_USAGE,
-                    ))
+                    return Ok(value_error("option `batch-size' requires a value"))
                 }
             },
             _ if a.starts_with("--batch-size=") => {
@@ -1603,7 +1573,7 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 match classify_magnitude(v) {
                     MagValue::Ok(size) => batch_size = size,
                     other => {
-                        return Ok(usage_error(Some(&magnitude_error(v, other)), REPACK_USAGE))
+                        return Ok(value_error(&magnitude_error(v, other)))
                     }
                 }
             }
@@ -2125,6 +2095,22 @@ fn usage_error(msg: Option<&str>, usage: &str) -> ExitCode {
         Some(m) => eprint!("error: {m}\n{usage}"),
         None => eprint!("{usage}"),
     }
+    ExitCode::from(129)
+}
+
+/// git's parse-options failure shape for a *value* error: the `error: <msg>`
+/// line alone, with no usage block.
+///
+/// `parse_options()` (parse-options.c:1198-1201) exits 129 straight away for
+/// `PARSE_OPT_ERROR` — the code `opterror()` and every value callback return —
+/// and only reaches `usage_with_options()` for `PARSE_OPT_UNKNOWN`
+/// (parse-options.c:1214-1223) and for the `need a subcommand` arm
+/// (parse-options.c:1208-1211). So `option `<name>' requires a value` and the
+/// `OPT_MAGNITUDE` value diagnostics print no usage, while `unknown option`,
+/// `unknown switch`, `need a subcommand` and the command's own
+/// `usage_with_options()` validations all do.
+fn value_error(msg: &str) -> ExitCode {
+    eprintln!("error: {msg}");
     ExitCode::from(129)
 }
 

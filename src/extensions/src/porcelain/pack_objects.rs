@@ -66,11 +66,16 @@
 //! preferred bases, so an entry may be an `OBJ_REF_DELTA` on an object the pack
 //! does not carry because the receiver reached it already. `bundle create` is
 //! the caller that does this, because `write_pack_data()` spawns
-//! `pack-objects --thin` unconditionally. This command's own `--thin` is still
-//! accepted without effect: `--thin` is what makes git ask for edges at all
+//! `pack-objects --thin` unconditionally. This command's own `--thin` reaches
+//! only half of that. `--thin` is what makes git ask for edges at all
 //! (`cmd_pack_objects()` pushes `--objects-edge` under it and plain `--objects`
-//! otherwise), and [`collect_counts`] drops a `^rev` rather than walking to a
-//! boundary, so there is no edge here to hand over.
+//! otherwise, builtin/pack-objects.c:5233-5237), and it turns the *internal rev
+//! list* on in the same breath — which is reproduced, because that is what
+//! decides whether stdin is a list of revisions or a bare object list, and it is
+//! also what `--stdin-packs` and `--cruft` refuse to be combined with (:5312,
+//! :5316). What is not reproduced is the edge itself: [`collect_counts`] drops a
+//! `^rev` rather than walking to a boundary, so there is no edge to hand over
+//! and the pack comes out complete rather than thin.
 //!
 //! The pack's **entry order is the caller's**: [`write_pack`] writes `counts`
 //! in the order it arrives in, and git's own order is its revision walk's. Given
@@ -153,6 +158,13 @@
 //!   * `--include-tag` adds no tags beyond those the object set already names.
 //!   * `--cruft-expiration=<time>` is parsed but does not filter by mtime; every
 //!     cruft object is written with its current mtime.
+//!   * an *exclusion* among the revision arguments on stdin — `^<rev>`, anything
+//!     after `--not`, a `<a>..<b>` range, `<rev>^!`, `<rev>^@` — is validated
+//!     the way `handle_revision_arg()` validates it (so an unresolvable one is
+//!     still `fatal: bad revision '<arg>'`) and then dropped, because
+//!     [`collect_counts`] has no boundary-aware walk to narrow. The resulting
+//!     pack is over-inclusive where git's would stop at the boundary. The same
+//!     gap is why `--shallow <oid>` on stdin registers no shallow boundary.
 //!
 //! # Configuration honoured
 //!
@@ -568,8 +580,30 @@ struct State {
 
 impl State {
     /// The internal-rev-list flag as the `--stdin-packs` check sees it.
+    ///
+    /// `--thin` is part of it: `cmd_pack_objects()` sets `use_internal_rev_list`
+    /// for it at builtin/pack-objects.c:5233-5237, which is *before* the
+    /// `--stdin-packs` check at :5312 and the `--cruft` one at :5316 — so
+    /// `pack-objects --stdin-packs --thin` and `--cruft --thin` both die.
     fn rev_list_at_stdin_packs_check(&self) -> bool {
-        self.internal_rev_list || self.exclude_promisor_best_effort
+        self.internal_rev_list || self.exclude_promisor_best_effort || self.thin
+    }
+
+    /// `use_internal_rev_list` as it stands at builtin/pack-objects.c:5392,
+    /// where it decides what stdin *is*: rev-list arguments for
+    /// `get_object_list()` (:4834-4858), or a bare object list for
+    /// `read_object_list_from_stdin()`.
+    ///
+    /// Everything that reaches `use_internal_rev_list = 1` by then is folded in:
+    /// the options recorded during parsing (`--revs`, `--all`, `--reflog`,
+    /// `--indexed-objects`, `--keep-unreachable`, `--unpack-unreachable`,
+    /// `--pack-loose-unreachable`), `--thin` (:5233), `--unpacked` unless
+    /// `--stdin-packs` took it over (:5253), and the two promisor options
+    /// (:5262-5275).
+    fn internal_rev_list_at_stdin(&self) -> bool {
+        self.rev_list_at_stdin_packs_check()
+            || (self.unpacked && !self.stdin_packs)
+            || (self.exclude_promisor && !self.stdin_packs)
     }
 
     /// The same flag as the later `--cruft` check sees it, by which point
@@ -4592,6 +4626,118 @@ fn read_object_list_from_stdin(stdin: &[u8], hex_len: usize) -> Result<Vec<Objec
     Ok(out)
 }
 
+/// `get_object_list()`'s stdin loop (builtin/pack-objects.c:4834-4858), which is
+/// what the internal rev list reads its *extra* revision arguments from:
+///
+/// ```c
+/// while (fgets(line, sizeof(line), stdin) != NULL) {
+///         int len = strlen(line);
+///         if (len && line[len - 1] == '\n')
+///                 line[--len] = 0;
+///         if (!len)
+///                 break;
+///         if (*line == '-') {
+///                 if (!strcmp(line, "--not")) {
+///                         flags ^= UNINTERESTING;
+///                         write_bitmap_index = 0;
+///                         continue;
+///                 }
+///                 if (starts_with(line, "--shallow ")) {
+///                         struct object_id oid;
+///                         if (get_oid_hex(line + 10, &oid))
+///                                 die("not an object name '%s'", line + 10);
+///                         register_shallow(the_repository, &oid);
+///                         use_bitmap_index = 0;
+///                         continue;
+///                 }
+///                 die(_("not a rev '%s'"), line);
+///         }
+///         if (handle_revision_arg(line, revs, flags, REVARG_CANNOT_BE_FILENAME))
+///                 die(_("bad revision '%s'"), line);
+/// }
+/// ```
+///
+/// Three details the shape of the loop decides, each of them observable:
+///
+/// * only the newline is stripped, so `<oid> <path>` — what `rev-list --objects`
+///   prints — is a whole revision argument and dies as one. That is what makes
+///   `git rev-list --objects --all | git pack-objects --thin --stdout` fail in
+///   stock rather than quietly packing the ids.
+/// * a line that is empty once the newline is gone **ends** the loop, so nothing
+///   after a blank line is read at all.
+/// * `--not` flips the sense of every argument after it for the rest of the
+///   loop, exactly as a `^` prefix does for one.
+///
+/// Exclusions themselves are the port's standing gap: [`collect_counts`] has no
+/// boundary-aware walk, so an excluded argument is validated and then dropped
+/// instead of narrowing the traversal. Validating it is not cosmetic — an
+/// unresolvable `^rev` is `fatal: bad revision '^rev'` in stock.
+fn from_stdin_revs(
+    repo: &gix::Repository,
+    stdin: &[u8],
+    pending: &mut Vec<ObjectId>,
+) -> Result<(), String> {
+    // `get_object_list()` brackets this loop with
+    // `cfg->warn_on_object_refname_ambiguity = 0`, so a full-length hex on
+    // stdin never draws the ambiguity warning the same name on argv would.
+    let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
+    let hex_len = repo.object_hash().len_in_hex();
+    // git's `flags ^= UNINTERESTING`.
+    let mut uninteresting = false;
+    for line in stdin.split(|b| *b == b'\n') {
+        let spec = String::from_utf8_lossy(line);
+        let spec = spec.as_ref();
+        if spec.is_empty() {
+            break;
+        }
+        if spec.starts_with('-') {
+            if spec == "--not" {
+                uninteresting = !uninteresting;
+                continue;
+            }
+            if let Some(rest) = spec.strip_prefix("--shallow ") {
+                // `get_oid_hex()` reads exactly `hexsz` characters and ignores
+                // whatever follows them, so a trailing tail is not an error.
+                let hex = rest.get(..hex_len).filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()));
+                if hex.is_none() {
+                    return Err(format!("not an object name '{rest}'"));
+                }
+                // The shallow boundary itself needs the boundary-aware walk this
+                // port does not have; registering it would change no traversal.
+                continue;
+            }
+            return Err(format!("not a rev '{spec}'"));
+        }
+        let (base, marked) = crate::objname::uninteresting_mark(spec);
+        if !stdin_rev_resolves(repo, base) {
+            return Err(format!("bad revision '{spec}'"));
+        }
+        if uninteresting || marked {
+            continue;
+        }
+        // The ambiguity bracket above only reaches `get_oid_basic()`'s full-hex
+        // branch. The plain-name warning under it carries no such gate, so stock
+        // `printf dup | git pack-objects --revs --stdout` prints it.
+        crate::objname::warn_ambiguous_refname(repo, base);
+        if let Ok(id) = repo.rev_parse_single(base) {
+            pending.push(id.detach());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `handle_revision_arg()` would accept `spec`, which is the only thing
+/// [`from_stdin_revs`] needs from it: a range is accepted when both endpoints
+/// resolve (`handle_dotdot_1()`), and a `^!` / `^@` / `^-<n>` operand when the
+/// name in front of the mark does (`add_parents_only()`), neither of which a
+/// bare `rev_parse_single()` spells.
+fn stdin_rev_resolves(repo: &gix::Repository, spec: &str) -> bool {
+    if let Some(range) = crate::objname::split_range(spec) {
+        return repo.rev_parse_single(range.a).is_ok() && repo.rev_parse_single(range.b).is_ok();
+    }
+    repo.rev_parse_single(crate::objname::parents_only_base(spec)).is_ok()
+}
+
 /// The rev-list half of [`collect_counts`]: tips, their ancestry, and the trees
 /// and blobs hanging off every commit reached.
 fn rev_list_objects(
@@ -4663,31 +4809,25 @@ fn rev_list_objects(
         }
     }
 
-    // stdin is rev-list arguments when git's internal rev list is on, and a
-    // plain object list otherwise.
-    if st.revs {
-        // `get_object_list()` brackets this loop with
-        // `cfg->warn_on_object_refname_ambiguity = 0`, so a full-length hex on
-        // stdin never draws the ambiguity warning the same name on argv would.
-        let _quiet_ambiguity = crate::objname::AmbiguityWarnings::off();
-        for line in stdin.split(|b| *b == b'\n') {
-            let Ok(spec) = std::str::from_utf8(line) else { continue };
-            let spec = spec.trim();
-            // Exclusions would need a boundary-aware walk; the sets this
-            // command is asked for in practice are `--all`-shaped, so a
-            // `^rev` is skipped rather than silently treated as inclusion.
-            if spec.is_empty() || spec.starts_with('^') || spec.starts_with('-') {
-                continue;
-            }
-            // The bracket above only reaches `get_oid_basic()`'s full-hex branch.
-            // The plain-name warning under it carries no such gate, so stock
-            // `printf dup | git pack-objects --revs --stdout` prints it.
-            crate::objname::warn_ambiguous_refname(repo, spec);
-            if let Ok(id) = repo.rev_parse_single(spec) {
-                pending.push(id.detach());
-            }
-        }
-    } else if !st.internal_rev_list {
+    // ```c
+    // if (stdin_packs) {
+    //         read_stdin_packs(stdin_packs, rev_list_unpacked);
+    // } else if (cruft) {
+    //         read_cruft_objects();
+    // } else if (!use_internal_rev_list) {
+    //         read_object_list_from_stdin();
+    // } else {
+    //         [...] get_object_list(&revs, &rp);
+    // }
+    // ```
+    //
+    // (builtin/pack-objects.c:5388-5404.) What stdin *is* turns on
+    // `use_internal_rev_list` alone — not on `--revs`, which is only one of the
+    // options that sets it. `--all` on its own makes stdin a list of revisions
+    // too, and `--thin` does as well (:5233-5234).
+    if st.internal_rev_list_at_stdin() {
+        from_stdin_revs(repo, stdin, &mut pending)?;
+    } else {
         from_stdin = read_object_list_from_stdin(stdin, repo.object_hash().len_in_hex())?;
     }
 

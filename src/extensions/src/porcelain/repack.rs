@@ -186,7 +186,11 @@
 //!     written. Its diagnostics *are* reproduced: a value below 1 MiB warns
 //!     `warning: minimum pack size limit is 1 MiB`, and `pack.packSizeLimit`
 //!     supplies the default (validated ahead of parse-options, so an unreadable
-//!     value is fatal even for `-h`).
+//!     value is fatal even for `-h`). The warning belongs to the `pack-objects`
+//!     child, so it is emitted once per child git would spawn — see
+//!     [`warn_min_pack_size`] — which is twice under `--cruft` and three times
+//!     under `--cruft -d --expire-to=<dir>`. `--max-cruft-size` supplies the
+//!     cruft child's limit on its own (builtin/repack.c:496-497).
 //!   * **`--geometric`** selects the subset of packs that restores a geometric
 //!     size progression, through the ported `init_pack_geometry()` /
 //!     `split_pack_geometry()` (builtin/repack.c:323-445): the new pack holds
@@ -487,6 +491,12 @@ struct State {
     /// `--max-pack-size=<n>` as the magnitude git parsed, which repack forwards
     /// to its `pack-objects` child. Zero is git's "unset".
     max_pack_size: Option<u64>,
+    /// `--max-cruft-size=<n>`, which is `cruft_po_args.max_pack_size`
+    /// (builtin/repack.c:181) and so steers the *cruft* child alone.
+    max_cruft_size: Option<u64>,
+    /// `--expire-to=<dir>`: with `-d` it makes `cmd_repack()` run
+    /// `write_cruft_pack()` a second time (builtin/repack.c:510-544).
+    expire_to: bool,
 }
 
 /// The outcome of parsing: either a fully-formed request, or a diagnostic that
@@ -556,24 +566,53 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    // git's repack does not apply the limit itself: it forwards
-    // `--max-pack-size` (or, absent one, `pack.packSizeLimit`) to the
-    // `pack-objects` child, and the warning below is the child's. It therefore
-    // precedes everything repack prints, including `Nothing new to pack.` — which
-    // is where it lands here too, since this port packs inline instead of
-    // spawning. Like `pack-objects`, this port writes one pack whatever the limit
-    // says, so the warning is its only observable effect.
-    let pack_size_limit = state.max_pack_size.filter(|n| *n > 0).or(pack_size_limit_cfg);
-    if pack_size_limit.is_some_and(|n| n > 0 && n < MIN_PACK_SIZE_LIMIT) {
-        eprintln!("warning: minimum pack size limit is 1 MiB");
-    }
-
-    execute(&state, &midx_cfg)
+    execute(&state, &midx_cfg, pack_size_limit_cfg)
 }
 
 /// git's 1 MiB floor for `pack_size_limit`: any smaller non-zero limit warns and
 /// is then raised to this.
 const MIN_PACK_SIZE_LIMIT: u64 = 1024 * 1024;
+
+/// The 1 MiB floor warning, which belongs to the `pack-objects` *child*:
+///
+/// ```c
+/// if (!pack_to_stdout && !pack_size_limit)
+///         pack_size_limit = pack_size_limit_cfg;
+/// [...]
+/// if (pack_size_limit && pack_size_limit < 1024*1024) {
+///         warning(_("minimum pack size limit is 1 MiB"));
+///         pack_size_limit = 1024*1024;
+/// }
+/// ```
+///
+/// (builtin/pack-objects.c:5291-5298.) repack never runs this check itself; it
+/// forwards `--max-pack-size=<n>` when it has one and otherwise lets the child
+/// read `pack.packSizeLimit`. So the warning is emitted **once per child git
+/// spawns**, not once per `repack` run — a `--cruft` run prints it twice, and a
+/// `--cruft -d --expire-to=<dir>` run three times. This port packs inline, so
+/// each call below stands in for one of those children.
+///
+/// Like `pack-objects`, this port writes one pack whatever the limit says, so
+/// the warning is the limit's only observable effect.
+fn warn_min_pack_size(limit: Option<u64>) {
+    if limit.is_some_and(|n| n > 0 && n < MIN_PACK_SIZE_LIMIT) {
+        eprintln!("warning: minimum pack size limit is 1 MiB");
+    }
+}
+
+/// `po_args.max_pack_size` as the child resolves it: the option when non-zero,
+/// and `pack.packSizeLimit` otherwise.
+fn po_pack_size_limit(st: &State, cfg: Option<u64>) -> Option<u64> {
+    st.max_pack_size.filter(|n| *n > 0).or(cfg)
+}
+
+/// The same for the cruft child, whose `cruft_po_args.max_pack_size` is
+/// `--max-cruft-size` and falls back to `--max-pack-size` when that is unset
+/// (`cmd_repack()`, builtin/repack.c:496-497) before the child's own
+/// `pack.packSizeLimit` fallback.
+fn cruft_pack_size_limit(st: &State, cfg: Option<u64>) -> Option<u64> {
+    st.max_cruft_size.filter(|n| *n > 0).or_else(|| po_pack_size_limit(st, cfg))
+}
 
 /// The three `repack.midx*` keys `repack_config()` reads
 /// (`builtin/repack.c:97-110`), with their defaults from
@@ -638,7 +677,7 @@ impl MidxConfig {
 ///
 /// git reaches the object database only after every check above, so this is also
 /// where "not a git repository" is diagnosed.
-fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
+fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> Result<ExitCode> {
     let Ok(repo) = crate::setup::discover() else {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
@@ -1084,6 +1123,10 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // lost. It runs before the main `pack-objects`, so its pack is the first
     // name in `names`.
     if st.all_into_one && !promisor_held.is_empty() {
+        // `repack_promisor_objects()` starts its child lazily and clears it again
+        // when the store holds no promisor object (repack-promisor.c:104-108), so
+        // this child — and its warning — only exist when one does.
+        warn_min_pack_size(po_pack_size_limit(st, pack_size_limit_cfg));
         let mut ids: Vec<ObjectId> = promisor_held.iter().copied().collect();
         ids.sort();
         let path = write_pack(&repo, st, &ids, &packtmp, write_rev, progress, false)?;
@@ -1093,6 +1136,10 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
         fs::write(suffixed(&packtmp, &format!("-{hash}.promisor")), b"")?;
         new_packs.push((hash, ids.len()));
     }
+
+    // The main `pack-objects` is unconditional in `cmd_repack()` — an empty
+    // object set still spawns it — so its warning does not depend on `to_pack`.
+    warn_min_pack_size(po_pack_size_limit(st, pack_size_limit_cfg));
 
     // Everything filtered out is about to be written elsewhere, so a run whose
     // spec rejects the whole set still has a second pack to produce.
@@ -1147,6 +1194,13 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
     // objects are already delivered — is the main pack plus the promisor one.
     // What is left over is by construction what the traversal did not reach.
     if st.cruft {
+        // `write_cruft_pack()` spawns a `pack-objects` of its own whether or not
+        // anything is left over, so its floor warning is unconditional here too.
+        // With `-d --expire-to=<dir>` `cmd_repack()` runs it a second time
+        // (builtin/repack.c:510-544) and the child warns again; this port writes
+        // no second cruft pack — see the module docs — but the child's
+        // diagnostics are still the run's.
+        warn_min_pack_size(cruft_pack_size_limit(st, pack_size_limit_cfg));
         let mut stamps: HashMap<ObjectId, u32> = HashMap::new();
         for (id, stamp) in cruft_candidates {
             if in_new_pack.contains(&id) || cruft_kept.contains(&id) {
@@ -1242,12 +1296,24 @@ fn execute(st: &State, midx: &MidxConfig) -> Result<ExitCode> {
             write_mtimes(&repo, &path, &suffixed(&packtmp, &format!("-{hash}.mtimes")), &stamps)?;
             new_packs.push((hash, cruft.len()));
         }
+
+        // `if (delete_redundant && expire_to)` (builtin/repack.c:510-544): a
+        // second `write_cruft_pack()`, and so a second child with the same
+        // limit. This port writes no pack there — see the module docs — but the
+        // child's floor warning is still part of the run's output.
+        if st.delete_redundant && st.expire_to {
+            warn_min_pack_size(cruft_pack_size_limit(st, pack_size_limit_cfg));
+        }
     }
 
     // With `--filter` git writes a second pack holding the filtered-out objects.
     // The objects have to travel with it: they are only reachable through this
     // pack once `-d` removes the ones they came from.
     if st.filter {
+        // `write_filtered_pack()` is the fourth `pack-objects` child, driven by
+        // `po_args` (builtin/repack.c:547-558), so it warns on the same limit the
+        // main pack did.
+        warn_min_pack_size(po_pack_size_limit(st, pack_size_limit_cfg));
         // `write_pack_opts` for the filtered pack: `destination` is
         // `--filter-to` when given and `packtmp` otherwise (`cmd_repack()`,
         // `builtin/repack.c:547-557`). Both are pack *prefixes*, which
@@ -2618,6 +2684,15 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
                 .and_then(scaled)
                 .and_then(|n| u64::try_from(n).ok())
         }
+        // `cruft_po_args.max_pack_size`: the cruft child's own limit, which falls
+        // back to `--max-pack-size` when unset (builtin/repack.c:496-497).
+        "max-cruft-size" => {
+            st.max_cruft_size = value
+                .filter(|_| on)
+                .and_then(scaled)
+                .and_then(|n| u64::try_from(n).ok())
+        }
+        "expire-to" => st.expire_to = on && value.is_some(),
         "quiet" => st.quiet = on,
         "keep-unreachable" => st.keep_unreachable = on,
         "write-bitmap-index" => st.write_bitmap = Some(on),

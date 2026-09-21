@@ -3272,30 +3272,33 @@ fn die_user_resolve(repo: &gix::Repository, state_dir: &Path, cli: &Cli) -> Resu
     // and all. This is how `git rebase --apply` gets `git rebase --continue`
     // wording out of a failed `git am`.
     if let Some(msg) = &cli.resolvemsg {
-        if crate::advice::enabled("mergeConflict") {
-            for line in msg.split('\n') {
-                eprintln!("hint: {line}");
-            }
-            eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
-        }
+        crate::advice::Advice::MergeConflict.advise_in(repo, msg);
         return Ok(ExitCode::from(128));
     }
-    if crate::advice::enabled("mergeConflict") {
-        let interactive = cli.interactive;
-        let cmdline = if interactive { "git am -i" } else { "git am" };
-        eprintln!("hint: When you have resolved this problem, run \"{cmdline} --continue\".");
-        eprintln!("hint: If you prefer to skip this patch, run \"{cmdline} --skip\" instead.");
-        let patch_empty = is_empty_or_missing(&state_dir.join("patch"));
-        if crate::advice::enabled("amWorkDir") && patch_empty && index_has_no_changes(repo)? {
-            eprintln!(
-                "hint: To record the empty patch as an empty commit, run \"{cmdline} --allow-empty\"."
-            );
-        }
-        eprintln!(
-            "hint: To restore the original branch and stop patching, run \"{cmdline} --abort\"."
-        );
-        eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
+    // `die_user_resolve()` builds one `strbuf` and hands it to a single
+    // `advise_if_enabled(ADVICE_MERGE_CONFLICT, "%s", sb.buf)` (builtin/am.c:1179),
+    // so the `Disable this message with …` trailer is decided once, for the whole
+    // block, and only while `advice.mergeConflict` is unconfigured. The
+    // `--allow-empty` line inside is the one part gated on `advice.amWorkDir`
+    // (builtin/am.c:1172-1175).
+    let cmdline = if cli.interactive { "git am -i" } else { "git am" };
+    let mut sb = String::new();
+    sb.push_str(&format!(
+        "When you have resolved this problem, run \"{cmdline} --continue\".\n"
+    ));
+    sb.push_str(&format!(
+        "If you prefer to skip this patch, run \"{cmdline} --skip\" instead.\n"
+    ));
+    let patch_empty = is_empty_or_missing(&state_dir.join("patch"));
+    if crate::advice::enabled("amWorkDir") && patch_empty && index_has_no_changes(repo)? {
+        sb.push_str(&format!(
+            "To record the empty patch as an empty commit, run \"{cmdline} --allow-empty\".\n"
+        ));
     }
+    sb.push_str(&format!(
+        "To restore the original branch and stop patching, run \"{cmdline} --abort\"."
+    ));
+    crate::advice::Advice::MergeConflict.advise_in(repo, &sb);
     Ok(ExitCode::from(128))
 }
 

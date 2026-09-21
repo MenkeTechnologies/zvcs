@@ -41,11 +41,12 @@ use std::process::ExitCode;
 ///     a configured `reftable` format is rejected rather than silently laid down
 ///     as `files`.
 ///
-/// One inherited divergence, on stderr and belonging to `init` rather than to this
-/// synonym: stock git prints the `advice.defaultBranchName` hint block when
-/// `init.defaultBranch` is unset; this port prints no hint. The refusals themselves are
-/// git's — `-h` and an unknown option print the usage block and exit 129, an unknown
-/// hash or ref format is `fatal:` and exit 128.
+/// The `advice.defaultBranchName` hint block belongs to `init` rather than to this
+/// synonym and is printed here too, from the same code: `repo_default_branch_name()`
+/// (refs.c:709-711) advises whenever it falls back to the compiled-in `master`,
+/// which `-q`, an explicit `-b` and a configured `init.defaultBranch` each avoid.
+/// The refusals themselves are git's — `-h` and an unknown option print the usage
+/// block and exit 129, an unknown hash or ref format is `fatal:` and exit 128.
 ///
 /// Unlike [`super::fsck_objects::fsck_objects`], no leading-subcommand strip is
 /// performed: `dispatch::run` takes the subcommand as a separate

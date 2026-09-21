@@ -123,6 +123,18 @@ pub enum Advice {
     /// `checkout` detached `HEAD` without being asked to (`opts->force_detach` unset), so it
     /// explains what a detached `HEAD` is (builtin/checkout.c, `ADVICE_DETACHED_HEAD`).
     DetachedHead,
+    /// `git add` / `git stage` was run with nothing to add — `cmd_add()`'s
+    /// `Nothing specified, nothing added.` (builtin/add.c:466-471).
+    AddEmptyPathspec,
+    /// `add_files()`'s report that a pathspec named paths an ignore rule covers
+    /// (builtin/add.c:346-357).
+    AddIgnoredFile,
+    /// `ensure_full_index()` had to expand a sparse index back to a full one
+    /// (sparse-index.c, `ADVICE_SPARSE_INDEX_EXPANDED`).
+    SparseIndexExpanded,
+    /// `repo_default_branch_name()` fell back to the built-in initial branch name
+    /// because `init.defaultBranch` is unset (refs.c:709-711).
+    DefaultBranchName,
 }
 
 impl Advice {
@@ -168,6 +180,10 @@ impl Advice {
             Advice::FetchShowForcedUpdates => "advice.fetchShowForcedUpdates",
             Advice::WorktreeAddOrphan => "advice.worktreeAddOrphan",
             Advice::DetachedHead => "advice.detachedHead",
+            Advice::AddEmptyPathspec => "advice.addEmptyPathspec",
+            Advice::AddIgnoredFile => "advice.addIgnoredFile",
+            Advice::SparseIndexExpanded => "advice.sparseIndexExpanded",
+            Advice::DefaultBranchName => "advice.defaultBranchName",
         }
     }
 

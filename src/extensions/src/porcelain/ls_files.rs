@@ -1434,18 +1434,10 @@ fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> 
     }
     index.sort_entries();
 
-    if repo
-        .config_snapshot()
-        .boolean("advice.sparseIndexExpanded")
-        .unwrap_or(true)
-    {
-        for line in SPARSE_EXPANDED_ADVICE.lines() {
-            eprintln!("hint: {line}");
-        }
-        eprintln!(
-            "hint: Disable this message with \"git config set advice.sparseIndexExpanded false\""
-        );
-    }
+    // `advise_if_enabled(ADVICE_SPARSE_INDEX_EXPANDED, …)` (sparse-index.c): the
+    // shared gate, which also honors `GIT_ADVICE` and prints the `Disable this
+    // message with …` trailer only while the slot is unconfigured.
+    crate::advice::Advice::SparseIndexExpanded.advise_in(repo, SPARSE_EXPANDED_ADVICE);
     Ok(true)
 }
 

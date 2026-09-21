@@ -269,7 +269,14 @@ Tag listing options
 /// The set of resolved listing filters.
 #[derive(Default)]
 struct Filters {
-    points_at: Option<ObjectId>,
+    /// `--points-at` is `OPT_CALLBACK_F(0, "points-at", &filter.points_at, …,
+    /// parse_opt_object_name)` (builtin/tag.c:568-570), and
+    /// `parse_opt_object_name()` (parse-options-cb.c:126-140) *appends* to an
+    /// `oid_array`; `match_points_at()` (ref-filter.c:2840-2862) then accepts a
+    /// ref matching any entry. So repeated `--points-at` are OR-ed, and
+    /// `--no-points-at` (`oid_array_clear`) drops all of them. Keeping a single
+    /// slot made the last one win.
+    points_at: Vec<ObjectId>,
     contains: Option<ObjectId>,
     no_contains: Option<ObjectId>,
     merged: Option<ObjectId>,
@@ -290,7 +297,7 @@ impl Filters {
     }
 
     fn any(&self) -> bool {
-        self.points_at.is_some()
+        !self.points_at.is_empty()
             || self.contains.is_some()
             || self.no_contains.is_some()
             || self.merged.is_some()
@@ -356,7 +363,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut operands_only = false;
 
     // Raw (unresolved) filter operands, resolved once the repository is open.
-    let mut points_at: Option<String> = None;
+    let mut points_at: Vec<String> = Vec::new();
     let mut contains: Option<String> = None;
     let mut no_contains: Option<String> = None;
     let mut merged: Option<String> = None;
@@ -445,7 +452,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--no-cleanup" => cleanup = None,
             // git's `points-at` is a `parse_opt_object_name` callback whose unset
             // branch clears the oid array, dropping the filter entirely.
-            "--no-points-at" => points_at = None,
+            "--no-points-at" => points_at.clear(),
             // git's `OPT_STRING_LIST` unset (`string_list_clear`) empties every
             // sort key gathered so far, CLI and `tag.sort` config alike.
             "--no-sort" => {
@@ -460,7 +467,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "-u" | "--local-user" => keyid = Some(super::take_value(args, &mut i, a)?.to_string()),
             "-e" | "--edit" => edit_flag = true,
             "-n" => lines = Some(1),
-            "--points-at" => points_at = Some(optarg(args, &mut i)),
+            "--points-at" => points_at.push(optarg(args, &mut i)),
             "--contains" => contains = Some(optarg(args, &mut i)),
             "--no-contains" => no_contains = Some(optarg(args, &mut i)),
             "--merged" => merged = Some(optarg(args, &mut i)),
@@ -484,7 +491,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(rest) = a.strip_prefix("--color=") {
                     color_when = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--points-at=") {
-                    points_at = Some(rest.to_string());
+                    points_at.push(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--contains=") {
                     contains = Some(rest.to_string());
                 } else if let Some(rest) = a.strip_prefix("--with=") {
@@ -683,7 +690,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             || no_contains.is_some()
             || merged.is_some()
             || no_merged.is_some()
-            || points_at.is_some())
+            || !points_at.is_empty())
     {
         cmdmode = CmdMode::List;
     }
@@ -760,9 +767,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // are `parse_opt_commits`, and `--merged`/`--no-merged` are
     // `parse_opt_merge_filter`, whose unresolvable-name case is a `die()`.
     let mut filters = Filters::default();
-    if let Some(spec) = &points_at {
+    for spec in &points_at {
         match crate::objname::parse_opt_object_name(&repo, spec) {
-            Ok(id) => filters.points_at = Some(id),
+            Ok(id) => filters.points_at.push(id),
             Err(e) => return Ok(e.report()),
         }
     }
@@ -815,7 +822,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         Some("--contains")
     } else if no_contains.is_some() {
         Some("--no-contains")
-    } else if points_at.is_some() {
+    } else if !points_at.is_empty() {
         Some("--points-at")
     } else if merged.is_some() {
         Some("--merged")
@@ -1107,8 +1114,15 @@ fn list_tags(
             }
             names.push((BString::from(r.name().as_bstr().to_vec()), short));
         }
-        // git's implicit key: ascending full refname.
-        names.sort_by(|a, b| a.0.cmp(&b.0));
+        // git's implicit key: ascending full refname — through
+        // `ref_sorting_set_sort_flags_all(sorting, REF_SORTING_ICASE, icase)`
+        // (builtin/tag.c:594), which makes `-i` a *sort* flag as well as a match
+        // flag. This shortcut compared case-sensitively, so `git tag -l -i` came
+        // back in the same order as `git tag -l`.
+        names.sort_by(|a, b| match ignore_case {
+            true => a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()),
+            false => a.0.cmp(&b.0),
+        });
         return write_lines(names.into_iter().map(|(_, short)| short.into()).collect(), colopts);
     }
 
@@ -1147,7 +1161,7 @@ fn list_tags(
         kinds: super::ref_filter::kind::TAGS,
         patterns: patterns.iter().map(|p| p.to_string()).collect(),
         ignore_case,
-        points_at: filters.points_at.into_iter().collect(),
+        points_at: filters.points_at.clone(),
         filters: filters.shared(),
         omit_empty,
         color_on,
@@ -1286,8 +1300,27 @@ fn create_tag(
         return fatal(&format!("Failed to resolve '{spec}' as a valid ref."));
     };
 
+    // ```c
+    // int check_tag_ref(struct strbuf *sb, const char *name)
+    // {
+    //         if (name[0] == '-' || !strcmp(name, "HEAD"))
+    //                 return -1;
+    //
+    //         strbuf_reset(sb);
+    //         strbuf_addf(sb, "refs/tags/%s", name);
+    //
+    //         return check_refname_format(sb->buf, 0);
+    // }
+    // ```
+    //
+    // (refs.c:784-793.) The two names ruled out before the format check are not
+    // things `check_refname_format()` would reject: `refs/tags/HEAD` is a
+    // perfectly well-formed ref name, and git refuses it here because a tag by
+    // that name shadows `HEAD` for every rule in `ref_rev_parse_rules[]`. A
+    // leading `-` is refused for the same reason `git branch` refuses it — the
+    // name is indistinguishable from an option everywhere it is echoed back.
     let ref_name = format!("refs/tags/{name}");
-    if FullName::try_from(ref_name.as_str()).is_err() {
+    if name.starts_with('-') || name == "HEAD" || FullName::try_from(ref_name.as_str()).is_err() {
         return fatal(&format!("'{name}' is not a valid tag name."));
     }
 

@@ -174,8 +174,28 @@ impl<'a> Prereleases<'a> {
             };
             let snapshot = repo.config_snapshot();
             let config = snapshot.plumbing();
-            let newl = config.strings("versionsort.suffix");
-            let oldl = config.strings("versionsort.prereleasesuffix");
+            // ```c
+            // int new = repo_config_get_string_multi(the_repository, newk, &newl);
+            // int old = repo_config_get_string_multi(the_repository, oldk, &oldl);
+            //
+            // if (!new && !old)
+            //         warning("ignoring %s because %s is set", oldk, newk);
+            // if (!new)
+            //         prereleases = newl;
+            // else if (!old)
+            //         prereleases = oldl;
+            // ```
+            //
+            // (versioncmp.c:165-181.) `repo_config_get_string_multi()` fails on a
+            // *valueless* occurrence — `git_configset_get_value_multi()` ends in
+            // `config_error_nonbool()`, which prints `error: missing value for
+            // '<key>'` and returns -1 rather than dying — so a bare
+            // `[versionsort] suffix` leaves the key unset for this purpose, and
+            // the deprecation warning (which only fires when *both* reads
+            // succeeded) does not fire either. Reading the values alone reported
+            // both keys as set and printed the warning instead of the two errors.
+            let newl = string_multi(config, "versionsort", "suffix");
+            let oldl = string_multi(config, "versionsort", "prereleasesuffix");
             match (newl, oldl) {
                 (Some(new), Some(_)) => {
                     eprintln!(
@@ -190,6 +210,44 @@ impl<'a> Prereleases<'a> {
             }
         })
     }
+}
+
+/// `repo_config_get_string_multi()` (config.c) for a `<section>.<name>` key with
+/// no subsection: every value in configuration order, or `None` when the key is
+/// unset *or* any of its occurrences is valueless.
+///
+/// The valueless case is `config_error_nonbool()` (config.c:1300-1306): it
+/// prints `error: missing value for '<section>.<name>'` on stderr and returns
+/// -1, so the caller sees the key as absent and the command carries on.
+fn string_multi(
+    config: &gix::config::File,
+    section: &str,
+    name: &str,
+) -> Option<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut any = false;
+    let mut missing = false;
+    for s in config.sections() {
+        if !s.header().name().eq_ignore_ascii_case(section.as_bytes()) || s.header().subsection_name().is_some()
+        {
+            continue;
+        }
+        for v in s.values_implicit(name) {
+            any = true;
+            match v {
+                Some(v) => out.push(v.to_vec()),
+                None => missing = true,
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    if missing {
+        eprintln!("error: missing value for '{section}.{name}'");
+        return None;
+    }
+    Some(out)
 }
 
 /// A partial match of a configured prerelease suffix within a version string.

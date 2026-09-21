@@ -1772,6 +1772,139 @@ fn setup_with_upstream(repo: &gix::Repository) -> std::result::Result<Vec<String
     }
 }
 
+/// `cmd_merge`'s unborn-`HEAD` arm (builtin/merge.c:1532-1562):
+///
+/// ```c
+/// if (!head_commit) {
+///         /*
+///          * If the merged head is a valid one there is no reason
+///          * to forbid "git merge" into a branch yet to be born.
+///          * We do the same for "git pull".
+///          */
+///         struct object_id *remote_head_oid;
+///         if (squash)
+///                 die(_("Squash commit into empty head not supported yet"));
+///         if (fast_forward == FF_NO)
+///                 die(_("Non-fast-forward commit does not make sense into "
+///                     "an empty head"));
+///         remoteheads = collect_parents(head_commit, &head_subsumed,
+///                                       argc, argv, NULL);
+///         if (!remoteheads)
+///                 die(_("%s - not something we can merge"), argv[0]);
+///         if (remoteheads->next)
+///                 die(_("Can merge only exactly one commit into empty head"));
+///
+///         if (verify_signatures)
+///                 verify_merge_signature(remoteheads->item, verbosity,
+///                                        check_trust_level);
+///
+///         remote_head_oid = &remoteheads->item->object.oid;
+///         read_empty(remote_head_oid);
+///         refs_update_ref(get_main_ref_store(the_repository),
+///                         "initial pull", "HEAD", remote_head_oid, NULL,
+///                         0, UPDATE_REFS_DIE_ON_ERR);
+///         goto done;
+/// }
+/// ```
+///
+/// No merge commit, no message, no diffstat and no `Fast-forward` line: the
+/// whole operation is `read_empty()` — `git read-tree -m -u <empty> <oid>`
+/// (builtin/merge.c:378-389) — plus one `HEAD` move logged as `initial pull`.
+/// That reflog wording is not cosmetic: `git pull` into a fresh clone is this
+/// path, and `t7600-merge.sh`'s `merge from unborn branch` reads it back.
+fn merge_into_unborn(repo: &gix::Repository, refs: &[String], opts: &Opts) -> Result<ExitCode> {
+    if opts.squash {
+        crate::git_fatal!("Squash commit into empty head not supported yet");
+    }
+    if opts.ff == Ff::Never {
+        crate::git_fatal!("Non-fast-forward commit does not make sense into an empty head");
+    }
+
+    // `collect_parents(NULL, …)`: every operand resolved through
+    // `get_merge_parent()`, then `reduce_parents()`. With no `head_commit` in
+    // the list the reduction is just "keep the independent ones", so
+    // `git merge <tip> <ancestor-of-tip>` is a single-head merge here too.
+    let mut targets: Vec<ObjectId> = Vec::with_capacity(refs.len());
+    for spec in refs {
+        crate::objname::warn_ambiguous_refname(repo, spec.as_str());
+        let resolved = repo
+            .rev_parse_single(spec.as_str())
+            .ok()
+            .and_then(|o| o.object().ok())
+            .and_then(|o| o.peel_to_commit().ok());
+        let Some(commit) = resolved else {
+            // `help_unknown_ref()`, the same refusal the born-`HEAD` path gives.
+            eprintln!("merge: {spec} - not something we can merge");
+            return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+        };
+        targets.push(commit.id);
+    }
+    let reaches = |a: ObjectId, b: ObjectId| -> Result<bool> {
+        Ok(repo.merge_bases_many(a, &[b])?.iter().any(|base| base.detach() == b))
+    };
+    let mut keep = Vec::with_capacity(targets.len());
+    for (i, &target) in targets.iter().enumerate() {
+        let duplicate = targets[..i].contains(&target);
+        let subsumed = !duplicate
+            && targets
+                .iter()
+                .enumerate()
+                .filter(|(j, &other)| *j != i && other != target)
+                .try_fold(false, |acc, (_, &other)| {
+                    Ok::<_, anyhow::Error>(acc || reaches(other, target)?)
+                })?;
+        keep.push(!duplicate && !subsumed);
+    }
+    let targets = mask(targets, &keep);
+    let Some(&target) = targets.first() else {
+        crate::git_fatal!("{} - not something we can merge", refs[0]);
+    };
+    if targets.len() > 1 {
+        crate::git_fatal!("Can merge only exactly one commit into empty head");
+    }
+
+    if opts.verify_signatures.unwrap_or_else(|| {
+        repo.config_snapshot().boolean("merge.verifySignatures") == Some(true)
+    }) {
+        let check_trust = repo.config_snapshot().string("gpg.minTrustLevel").is_none();
+        if let Some(code) = verify_merge_signature(repo, target, opts.quiet, check_trust)? {
+            return Ok(code);
+        }
+    }
+
+    // `read_empty()`: `git read-tree -m -u <empty tree> <oid>`. A two-way unpack
+    // from nothing, so anything untracked standing where the commit wants a file
+    // stops it — and `read_empty()` turns that non-zero child into `die()`.
+    let target_tree = repo.find_object(target)?.peel_to_tree()?.id;
+    let empty_tree = gix::ObjectId::empty_tree(repo.object_hash());
+    let old_index = repo.index_or_empty()?.clone();
+    let clobber = crate::merge_guard::verify_two_way(repo, empty_tree, target_tree, &old_index)?;
+    if !clobber.is_empty() {
+        clobber.report("merge");
+        crate::git_fatal!("read-tree failed");
+    }
+    let should_interrupt = AtomicBool::new(false);
+    update_worktree(repo, &old_index, Some(empty_tree), target_tree, &should_interrupt)?;
+
+    // `refs_update_ref(…, "initial pull", "HEAD", oid, NULL, 0, DIE_ON_ERR)` —
+    // a `NULL` old value, so there is nothing to match: the unborn branch `HEAD`
+    // names is created by the deref.
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "initial pull".into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(target),
+        },
+        name: "HEAD".try_into().map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
+        deref: true,
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let mut repo = crate::setup::discover()?;
     // Moving `HEAD` writes a reflog, and a fast-forward has already touched the
@@ -1843,11 +1976,12 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         refs
     };
 
-    // Current HEAD state. An unborn branch has no commit to fast-forward from;
-    // a real merge into it would be a checkout, which is out of scope.
+    // Current HEAD state. `if (!head_commit)` (builtin/merge.c:1532) is not a
+    // refusal in git: a branch yet to be born takes the single named commit
+    // wholesale, which is what `git pull` into a fresh clone relies on.
     let head = repo.head()?;
     if head.is_unborn() {
-        crate::git_fatal!("cannot merge into an unborn branch");
+        return merge_into_unborn(&repo, refs, opts);
     }
     let local_id = head
         .id()
@@ -2086,6 +2220,32 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
                 eprintln!("fatal: refusing to merge unrelated histories");
                 return Ok(ExitCode::from(128));
             }
+        }
+
+        // ```c
+        // } else {
+        //         /*
+        //          * An octopus.  If we can reach all the remote we are up
+        //          * to date.
+        //          */
+        //         int up_to_date = 1;
+        //         …
+        // }
+        //
+        // if (fast_forward == FF_ONLY)
+        //         die_ff_impossible();
+        // ```
+        //
+        // (builtin/merge.c:1732-1757.) The `FF_ONLY` refusal is shared by both
+        // head counts — it sits *below* the `if (!remoteheads_is_single)` fork,
+        // not inside the single-head arm — so `git merge --ff-only a b` and
+        // `merge.ff=only` with two operands die here rather than octopusing.
+        // Nothing but a merge commit can join three histories, so an octopus
+        // that got this far is by construction not a fast-forward.
+        if opts.ff == Ff::Only {
+            crate::advice::ff_impossible(&repo);
+            eprintln!("fatal: Not possible to fast-forward, aborting.");
+            return Ok(ExitCode::from(128));
         }
 
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
@@ -3566,15 +3726,124 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
     })
 }
 
-/// The default octopus commit subject: `Merge branches 'a', 'b' and 'c'`.
-fn octopus_message(refs: &[&str]) -> String {
-    let quoted: Vec<String> = refs.iter().map(|r| format!("'{r}'")).collect();
-    let joined = match quoted.split_last() {
-        Some((last, [])) => last.clone(),
-        Some((last, init)) => format!("{} and {}", init.join(", "), last),
+/// `print_joined()` (fmt-merge-msg.c:209-224): one name keeps the singular
+/// label, several take the plural and are joined `a, b and c`.
+///
+/// ```c
+/// if (list->nr == 1) {
+///         strbuf_addf(out, "%s%s", singular, list->items[0].string);
+/// } else {
+///         strbuf_addstr(out, plural);
+///         for (i = 0; i < list->nr - 1; i++)
+///                 strbuf_addf(out, "%s%s", i > 0 ? ", " : "",
+///                             list->items[i].string);
+///         strbuf_addf(out, " and %s", list->items[list->nr - 1].string);
+/// }
+/// ```
+fn print_joined(singular: &str, plural: &str, list: &[String]) -> String {
+    match list.split_last() {
         None => String::new(),
+        Some((only, [])) => format!("{singular}{only}"),
+        Some((last, init)) => format!("{plural}{} and {last}", init.join(", ")),
+    }
+}
+
+/// The octopus commit subject, a port of `fmt_merge_msg_title()`
+/// (fmt-merge-msg.c:452-503) over the heads named on the command line:
+///
+/// ```c
+/// strbuf_addstr(out, "Merge ");
+/// for (i = 0; i < srcs.nr; i++) {
+///         struct src_data *src_data = srcs.items[i].util;
+///         const char *subsep = "";
+///
+///         strbuf_addstr(out, sep);
+///         sep = "; ";
+///
+///         if (src_data->head_status == 1) {
+///                 strbuf_addstr(out, srcs.items[i].string);
+///                 continue;
+///         }
+///         if (src_data->branch.nr)   { … "branch ",   "branches "   … }
+///         if (src_data->r_branch.nr) { … "remote-tracking branch "  … }
+///         if (src_data->tag.nr)      { … "tag ",      "tags "       … }
+///         if (src_data->generic.nr)  { … "commit ",   "commits "    … }
+///         if (strcmp(".", srcs.items[i].string))
+///                 strbuf_addf(out, " of %s", srcs.items[i].string);
+/// }
+/// if (!dest_suppressed(current_branch))
+///         strbuf_addf(out, " into %s", current_branch);
+/// ```
+///
+/// Two groupings decide the wording, and the old hard-coded
+/// `Merge branches 'a' and 'b'` had neither.
+///
+/// * Within a source, heads are bucketed by the category `handle_line()` reads
+///   back off each `merge_name()` line (fmt-merge-msg.c:176-194), which is what
+///   turns a pair of tags into `Merge tags 'c2' and 'c3'` and a mixture into
+///   `Merge branch 'a', tag 'b'`.
+/// * `handle_line()` keys the source on the text after ` of `
+///   (fmt-merge-msg.c:158-166). `merge_name()` writes ` of .` for a name that
+///   resolved to a ref (builtin/merge.c:566-580, :609-623) and nothing at all
+///   for a raw commit (builtin/merge.c:634-635) — so every ref shares the `.`
+///   source while each raw commit becomes a source of its own, printed verbatim
+///   under `head_status == 1` and separated by `; `.
+fn octopus_message(
+    repo: &gix::Repository,
+    refs: &[&str],
+    branch: Option<&FullName>,
+    into_name: Option<&str>,
+) -> String {
+    // `srcs` in first-seen order. `None` is `merge_name()`'s `.` — the one
+    // source every ref-shaped operand lands in; `Some(line)` is a raw commit's
+    // own source, whose whole line is the title fragment.
+    let mut order: Vec<Option<String>> = Vec::new();
+    let (mut branches, mut r_branches, mut tags) = (Vec::new(), Vec::new(), Vec::new());
+    for spec in refs {
+        let described = describe_spec(repo, spec).described;
+        // `handle_line()`'s prefix tests, in its order. A name keeps its quotes:
+        // the list holds `line + strlen("branch ")`, not a bare name.
+        let key = if let Some(rest) = described.strip_prefix("branch ") {
+            branches.push(rest.to_string());
+            None
+        } else if let Some(rest) = described.strip_prefix("tag ") {
+            tags.push(rest.to_string());
+            None
+        } else if let Some(rest) = described.strip_prefix("remote-tracking branch ") {
+            r_branches.push(rest.to_string());
+            None
+        } else {
+            Some(described)
+        };
+        if !order.contains(&key) {
+            order.push(key);
+        }
+    }
+
+    let dot_group = || {
+        let parts = [
+            print_joined("branch ", "branches ", &branches),
+            print_joined("remote-tracking branch ", "remote-tracking branches ", &r_branches),
+            print_joined("tag ", "tags ", &tags),
+        ];
+        parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(", ")
     };
-    format!("Merge branches {joined}\n")
+    let groups: Vec<String> =
+        order.into_iter().map(|key| key.unwrap_or_else(dot_group)).collect();
+    let mut out = format!("Merge {}", groups.join("; "));
+
+    // `if (!dest_suppressed(current_branch)) strbuf_addf(out, " into %s", …)`
+    // — the same tail the single-head title carries (`merge_message`).
+    let current = match (into_name, branch) {
+        (Some(n), _) => n.to_string(),
+        (None, Some(b)) => b.shorten().to_str_lossy().into_owned(),
+        (None, None) => "HEAD".to_string(),
+    };
+    if !dest_suppressed(repo, &current) {
+        out.push_str(&format!(" into {current}"));
+    }
+    out.push('\n');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3915,7 +4184,7 @@ fn compose_message(
         (None, _, 1) => merge_message(repo, &refs[0], branch, opts.into_name.as_deref())?,
         (None, _, _) => {
             let specs: Vec<&str> = refs.iter().map(String::as_str).collect();
-            octopus_message(&specs)
+            octopus_message(repo, &specs, branch, opts.into_name.as_deref())
         }
     };
     if opts.log_len != 0 {

@@ -135,15 +135,26 @@ impl State {
         let (offset_to_extensions, offsets) = entries(&mut write, self, offset_to_entries, entries_per_block, version)?;
         let (extension_toc, out) = self.write_extensions(write, offset_to_extensions, extensions, &offsets)?;
 
-        // `if (!strip_extensions && offset && record_eoie())` (read-cache.c:2998):
-        // `offset` is where the extensions begin and is never zero, so an index
-        // with no entries at all still gets the extension — what gates it is
-        // whether any *other* extension was written, since `EOIE` exists to say
-        // where those start.
+        // ```c
+        // offset = hashfile_total(f);
+        // ...
+        // if (offset && record_eoie()) {
+        //         CALLOC_ARRAY(eoie_c, 1);
+        //         the_hash_algo->init_fn(eoie_c);
+        // }
+        // ```
+        //
+        // (read-cache.c:2951-2960, with the write itself at :3060-3070 gated on `eoie_c`
+        // alone.) `offset` is the file position one past the last entry, so it is at least
+        // the twelve-byte header and can never be zero: the condition is `record_eoie()`
+        // and nothing else. In particular it does *not* ask whether any other extension
+        // was written — stock git 2.55.0 under `index.recordEndOfIndexEntries=true`
+        // appends an `EOIE` whose hash is the SHA-1 of the empty string to an index that
+        // carries no other extension at all, measured with
+        // `update-index --add a` in a repository with no cache-tree.
         if extensions
             .should_write(extension::end_of_index_entry::SIGNATURE)
             .is_some()
-            && !extension_toc.is_empty()
         {
             extension::end_of_index_entry::write_to(out, self.object_hash, offset_to_extensions, extension_toc)?;
         }
@@ -300,6 +311,29 @@ fn entries<T: std::io::Write>(
                     from_beginning_of_file: block_offset,
                     num_entries: block_entries,
                 });
+                // ```c
+                // /*
+                //  * If we have a V4 index, set the first byte to an invalid
+                //  * character to ensure there is nothing common with the previous
+                //  * entry
+                //  */
+                // if (previous_name)
+                //         previous_name->buf[0] = 0;
+                // ```
+                //
+                // (read-cache.c:2926-2927.) A block is decoded by a thread that starts at the
+                // block's offset with an empty `previous_name`, so the first entry of a block
+                // has to encode its name against nothing. git arranges that by poisoning the
+                // *first byte* of the buffer and leaving its length alone, which is not the
+                // same as clearing it: `ce_write_entry()` then finds `common == 0` — no path
+                // byte is NUL — and still writes `to_remove = previous_name->len`, so the
+                // strip count is the whole previous name rather than zero. Clearing the buffer
+                // would write a strip count of zero and produce a different, unreadable file.
+                if let Some(previous) = previous_name.as_mut() {
+                    if let Some(first) = previous.first_mut() {
+                        *first = 0;
+                    }
+                }
                 block_entries = 0;
                 block_offset = out.count;
             }

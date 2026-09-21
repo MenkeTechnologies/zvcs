@@ -309,6 +309,7 @@ impl State {
                 object_hash,
                 timestamp,
                 version,
+                version_unset: false,
                 entries,
                 path_backing,
                 is_sparse,

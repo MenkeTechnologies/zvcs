@@ -30,8 +30,20 @@ pub mod from_tree {
         pub fn new(object_hash: gix_hash::Kind) -> Self {
             State {
                 object_hash,
-                timestamp: filetime::FileTime::now(),
+                // `do_read_index()` zeroes `istate->timestamp` before it opens the file and
+                // only fills it in from `st.st_mtime` once the read succeeded
+                // (read-cache.c:2214-2215 and :2299-2300), so a state that was never read
+                // off disk — a missing `.git/index`, an `unpack_trees()` result — has no
+                // timestamp at all. `is_racy_stat()` opens on `istate->timestamp.sec &&`
+                // (read-cache.c:358) and `is_index_unborn()` is `!cache_nr &&
+                // !timestamp.sec` (:2417), so the zero is load-bearing, not a placeholder:
+                // dated *now*, every entry whose file was touched this second looks racily
+                // clean, which smudges sizes that git leaves alone and makes
+                // `prepare_to_write_split_index()` emit a stand-in for every entry it just
+                // wrote into the shared half.
+                timestamp: filetime::FileTime::zero(),
                 version: Version::V2,
+                version_unset: true,
                 entries: vec![],
                 path_backing: vec![],
                 is_sparse: false,
@@ -100,8 +112,20 @@ pub mod from_tree {
 
             Ok(State {
                 object_hash: tree.kind(),
-                timestamp: filetime::FileTime::now(),
+                // `do_read_index()` zeroes `istate->timestamp` before it opens the file and
+                // only fills it in from `st.st_mtime` once the read succeeded
+                // (read-cache.c:2214-2215 and :2299-2300), so a state that was never read
+                // off disk — a missing `.git/index`, an `unpack_trees()` result — has no
+                // timestamp at all. `is_racy_stat()` opens on `istate->timestamp.sec &&`
+                // (read-cache.c:358) and `is_index_unborn()` is `!cache_nr &&
+                // !timestamp.sec` (:2417), so the zero is load-bearing, not a placeholder:
+                // dated *now*, every entry whose file was touched this second looks racily
+                // clean, which smudges sizes that git leaves alone and makes
+                // `prepare_to_write_split_index()` emit a stand-in for every entry it just
+                // wrote into the shared half.
+                timestamp: filetime::FileTime::zero(),
                 version: Version::V2,
+                version_unset: true,
                 entries,
                 path_backing,
                 is_sparse: false,

@@ -148,6 +148,23 @@ pub struct State {
     /// same timestamp as this as potentially changed, checking more thoroughly if a change actually happened.
     timestamp: FileTime,
     version: Version,
+    /// git's `istate->version == 0`: this state was built from scratch and has never
+    /// named a version of its own.
+    ///
+    /// `do_write_index()` opens with
+    ///
+    /// ```c
+    /// if (!istate->version)
+    ///         istate->version = get_index_format_default(the_repository);
+    /// ```
+    ///
+    /// (read-cache.c:2865-2866), so a state that came off disk writes back in the version
+    /// it was read in and only a from-scratch one consults `index.version` /
+    /// `GIT_INDEX_VERSION`. `Version` has no zero, so the distinction is carried here;
+    /// [`version()`](State::version()) keeps answering the placeholder the rest of the
+    /// crate needs, and [`version_is_unset()`](State::version_is_unset()) is what a writer
+    /// with access to a repository's configuration tests before imposing a version.
+    version_unset: bool,
     entries: Vec<Entry>,
     /// A memory area keeping all index paths, in full length, independently of the index version.
     ///

@@ -181,12 +181,38 @@ pub fn write_with(
 /// says otherwise. Every writer in this port goes through here for the same reason they
 /// all go through the smudge — git has one such function, and a writer that skipped it
 /// would dissolve a repository's split index the first time it touched it.
+/// `do_write_index()`'s first act, before a single byte is written:
+///
+/// ```c
+/// if (!istate->version)
+///         istate->version = get_index_format_default(the_repository);
+/// ```
+///
+/// (read-cache.c:2865-2866.) A state read off disk carries the version its file was
+/// written in and keeps it — `git -c index.version=4 add b` on a version 2 index leaves
+/// it at 2 — while a state built from scratch, which is what every command gets when
+/// `.git/index` does not exist yet, has none and so is the only case that consults
+/// `index.version` / `GIT_INDEX_VERSION`.
+///
+/// `gix`'s [`Version`](gix::index::Version) has no zero to stand for "unset", so the
+/// distinction rides along on
+/// [`State::version_is_unset()`](gix::index::State::version_is_unset()); a caller that
+/// already resolved the version itself (`update-index --index-version <n>`,
+/// `read-tree`'s fresh-state options) has filled in `options.version` and is left alone.
+fn resolve_index_version(repo: &gix::Repository, index: &gix::index::File, options: &mut gix::index::write::Options) {
+    if options.version.is_none() && index.version_is_unset() {
+        options.version = Some(crate::config::index_format_default(repo));
+    }
+}
+
 pub fn write_split(
     repo: &gix::Repository,
     index: &mut gix::index::File,
     options: gix::index::write::Options,
     request: gix::index::file::split::Request,
 ) -> Result<(), gix::index::file::write::Error> {
+    let mut options = options;
+    resolve_index_version(repo, index, &mut options);
     // Before the smudge, because that is where `do_write_locked_index()` puts it:
     // `convert_to_sparse()` runs at read-cache.c:3129 and `do_write_index()` — which
     // holds the smudge loop at :2903 — only at :3138.
@@ -209,6 +235,8 @@ pub fn write_locked(
     options: gix::index::write::Options,
     request: gix::index::file::split::Request,
 ) -> Result<(), gix::index::file::write::Error> {
+    let mut options = options;
+    resolve_index_version(repo, index, &mut options);
     convert_to_sparse(repo, index);
     write_locked_inner(repo, index, options, request)
 }

@@ -20,6 +20,27 @@ impl State {
         self.version
     }
 
+    /// Whether this state was built from scratch and so has no version of its own —
+    /// git's `!istate->version` at the head of `do_write_index()` (read-cache.c:2865).
+    ///
+    /// [`version()`](State::version()) answers a placeholder in that case; a caller that can
+    /// read `index.version` / `GIT_INDEX_VERSION` resolves it with
+    /// [`set_version()`](State::set_version()) or by passing
+    /// [`write::Options::version`](crate::write::Options::version).
+    pub fn version_is_unset(&self) -> bool {
+        self.version_unset
+    }
+
+    /// Name the version this state stores itself in, as `do_write_index()` does when it
+    /// finds `istate->version` unset (read-cache.c:2865-2866).
+    ///
+    /// The assignment sticks, exactly as git's does: a state told its version once no
+    /// longer reports [`version_is_unset()`](State::version_is_unset()).
+    pub fn set_version(&mut self, version: Version) {
+        self.version = version;
+        self.version_unset = false;
+    }
+
     /// Returns time at which the state was created, indicating its freshness compared to other files on disk.
     pub fn timestamp(&self) -> FileTime {
         self.timestamp

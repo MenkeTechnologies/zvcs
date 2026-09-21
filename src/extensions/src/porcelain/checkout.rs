@@ -903,9 +903,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // path *after* the separator (or before it, without one) is a path restore.
         // `parse_branchname_arg()` takes the leading operand as the start-point
         // only when it resolves; whatever is left is `opts->pathspec`.
+        // `parse_branchname_arg()`'s own resolution, which is `get_oid_mb()`'s:
+        // an operand holding `...` is a start-point too (the merge base), not a
+        // pathspec.
         let start_resolved = pre
             .first()
-            .map(|p| crate::objname::resolve_quiet(&repo, p).is_some())
+            .map(|p| super::branch::get_oid_mb_quiet(&repo, p).is_some())
             .unwrap_or(false);
         let remaining: &[&str] = if has_dashdash {
             &post
@@ -938,6 +941,47 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             );
             return Ok(ExitCode::from(128));
         }
+        // ```c
+        // if (opts->new_branch) {
+        //         struct strbuf buf = STRBUF_INIT;
+        //
+        //         if (opts->new_branch_force)
+        //                 opts->branch_exists = validate_branchname(opts->new_branch, &buf);
+        //         else
+        //                 opts->branch_exists =
+        //                         validate_new_branchname(opts->new_branch, &buf, 0);
+        //         strbuf_release(&buf);
+        // }
+        // ```
+        //
+        // (builtin/checkout.c:2065-2074.) Both halves go through
+        // `check_branch_ref()`, whose first act is `copy_branchname()`
+        // (refs.c:762-765) — so `-b @{-1}` names the branch that mark resolves
+        // to, not a ref literally called `@{-1}`, and `create_branch()` creates
+        // that same rewritten name (branch.c:373-383). The refusals disagree
+        // about which spelling they name: `validate_branchname()` names the
+        // operand as typed, while `validate_new_branchname()`'s "already exists"
+        // names `ref->buf + strlen("refs/heads/")` (branch.c:478-479), the
+        // rewritten one — which the collision check downstream reports.
+        let name = {
+            let rewritten =
+                match super::branch::copy_branchname(&repo, &name, super::branch::Interpret::Local)
+                {
+                    Ok(n) => n,
+                    // `interpret_branch_mark()`'s `die(err.buf)` for a mark on a
+                    // branch with no upstream.
+                    Err(message) => {
+                        eprintln!("fatal: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                };
+            if !super::branch::valid_branch_name(&rewritten) {
+                eprintln!("fatal: '{name}' is not a valid branch name");
+                crate::advice::Advice::RefSyntax.advise_in(&repo, "See 'git help check-ref-format'");
+                return Ok(ExitCode::from(128));
+            }
+            rewritten
+        };
         let start = pre.first().copied().unwrap_or("HEAD");
         // On an UNBORN HEAD (a fresh `git init`, or a clone of an empty repo)
         // there is no commit for the default start-point to resolve to, and git
@@ -1035,7 +1079,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // Reaching only the first two left `git checkout 'HEAD@{99}'` reporting
         // `pathspec … did not match any file(s)` where stock dies with
         // `log for 'HEAD' only has 3 entries`.
-        let resolved = crate::objname::resolve(&repo, spec);
+        // `repo_get_oid_mb()` (object-name.c:1308-1353), not a plain
+        // `repo_get_oid()`: an operand holding `...` is the *merge base* of its
+        // two sides, which is what makes `git checkout branch1...` land on the
+        // fork point of `branch1` and `HEAD`. Shared with `git branch`'s
+        // start-point, git's other caller of the same function.
+        let resolved = super::branch::get_oid_mb(&repo, spec);
         // And then a *second* time: `setup_branch_path()` resolves the operand
         // again whenever it is not itself a ref name
         //
@@ -1467,11 +1516,21 @@ pub(crate) fn head_commit_id(repo: &gix::Repository) -> Option<ObjectId> {
 /// `restore --source` all take the *branch* for a name that is both. `None` when
 /// the repository has no such branch, which is also every spec that is not a
 /// plain name (`HEAD~1`, `v1^{tree}`, a raw id): `refs/heads/<that>` cannot exist.
+///
+/// A branch may itself be a symbolic ref — `git symbolic-ref refs/heads/a-branch
+/// refs/remotes/origin/HEAD` is legal, and t2018-checkout-branch.sh builds one —
+/// so the target is followed rather than read straight off the reference.
+/// `resolve_ref_unsafe()` (refs.c) chases up to `SYMREF_MAXDEPTH` links and
+/// hands back the object at the end; taking the reference's own target instead
+/// panicked on the symbolic one ("BUG: tries to obtain object id from symbolic
+/// target"). Tags are still not peeled: `get_oid_mb()`'s answer is an object id,
+/// not a commit.
 pub(crate) fn branch_ref_id(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     repo.try_find_reference(format!("refs/heads/{spec}").as_str())
         .ok()
         .flatten()
-        .map(|r| r.id().detach())
+        .and_then(|mut r| r.follow_to_object().ok())
+        .map(|id| id.detach())
 }
 
 pub(crate) fn switch_to_branch_opts(
@@ -1767,7 +1826,9 @@ fn create_and_switch(
     // resolves to without the odb ever being asked — is `unable to read tree`, and
     // a tree is the family's non-commit refusal. Only a name that resolves to
     // nothing at all reaches `create_branch()`'s own wording.
-    let Some(start_oid) = crate::objname::resolve(repo, start) else {
+    // `repo_get_oid_mb(r, start_name, &oid)` (`dwim_branch_start()`,
+    // branch.c:545): a start-point spelled `<a>...<b>` is their merge base.
+    let Some(start_oid) = super::branch::get_oid_mb(repo, start) else {
         crate::git_fatal!(
             "'{start}' is not a commit and a branch '{name}' cannot be created from it"
         );
@@ -2028,7 +2089,7 @@ fn orphan_checkout(
         None
     } else {
         let start = start.unwrap_or("HEAD");
-        match crate::objname::resolve(repo, start) {
+        match super::branch::get_oid_mb(repo, start) {
             Some(id) => match classify_tree_ish(repo, id)? {
                 TreeIsh::Commit(commit) => Some(commit),
                 TreeIsh::Tree(_) => {

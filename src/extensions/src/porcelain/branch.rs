@@ -2158,10 +2158,29 @@ fn dwim_branch_start(repo: &gix::Repository, start_name: &str, track: Track) -> 
 /// Either side may be empty and then means `HEAD`, and more than one merge base
 /// is a failure, not a choice — which is why `git branch mb main...` is the
 /// fork point of `main` and `HEAD` and `git branch x a...b` on a criss-cross
-/// merge is refused. `git branch` is git's only caller.
-fn get_oid_mb(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+/// merge is refused. `git branch`'s `-b`-equivalent start-point is one caller;
+/// `parse_branchname_arg()` (builtin/checkout.c:1476) and `dwim_branch_start()`
+/// (branch.c:539-594) are the others, which is why `git checkout -b <new>
+/// <a>...<b>` starts the branch at that same fork point.
+pub(super) fn get_oid_mb(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    get_oid_mb_inner(repo, name, false)
+}
+
+/// [`get_oid_mb`] without `get_oid_basic()`'s diagnostics, for the callers that
+/// are only asking *whether* an operand resolves — `parse_branchname_arg()`'s
+/// look at `argv[0]` before it decides the operand is a start-point rather than
+/// a pathspec. The `...` arm is quiet either way: `repo_get_oid_committish()`
+/// answers both of its sides.
+pub(super) fn get_oid_mb_quiet(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    get_oid_mb_inner(repo, name, true)
+}
+
+fn get_oid_mb_inner(repo: &gix::Repository, name: &str, quiet: bool) -> Option<ObjectId> {
     let Some(dots) = name.find("...") else {
-        return crate::objname::resolve(repo, name);
+        return match quiet {
+            true => crate::objname::resolve_quiet(repo, name),
+            false => crate::objname::resolve(repo, name),
+        };
     };
     let left = match &name[..dots] {
         "" => "HEAD",

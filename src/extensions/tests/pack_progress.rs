@@ -56,6 +56,17 @@ fn fixture(tag: &str) -> PathBuf {
 
 /// `pack-objects` reading its object list on stdin, with the meter forced on so
 /// the assertions do not need a terminal.
+///
+/// The pack goes to a file, not `--stdout`, because `Delta compression using up
+/// to N threads` and the whole `Writing objects` meter are gated on `progress >
+/// pack_to_stdout` (builtin/pack-objects.c:1340, 3214): one `--progress` raises
+/// `progress` to 1, which clears that gate only when the pack is NOT going to
+/// stdout. Observed on git 2.50.1 — `pack-objects --progress --stdout` ends at
+/// `Compressing objects: 100% (5/5), done.` and goes straight to `Total 9`,
+/// while `pack-objects --progress out/pk` draws both. `--all-progress` is the
+/// other way past the gate, but it also switches the closing line to
+/// `Writing objects: 100% (9/9), 605 bytes | 605.00 KiB/s, done.`, so it is not
+/// the phase framing this case is pinning.
 fn pack_objects_with_progress(repo: &Path) -> Output {
     let list = git(repo, &["rev-list", "--all", "--objects"]);
     let ids: String = list
@@ -64,7 +75,7 @@ fn pack_objects_with_progress(repo: &Path) -> Output {
         .map(|id| format!("{id}\n"))
         .collect();
 
-    let mut child = cmd(repo, &["pack-objects", "--progress", "--stdout"])
+    let mut child = cmd(repo, &["pack-objects", "--progress", "pk"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

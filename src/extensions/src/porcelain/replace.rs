@@ -32,8 +32,7 @@
 //!     `import_object()` hashes the result back in as the same type — through
 //!     `git mktree` for a pretty-printed tree. An unchanged object is git's
 //!     `new object is the same as the old one` error (255). As in git, the
-//!     scratch file is left behind, so a second `--edit` in the same repository
-//!     fails on the `O_EXCL` create.
+//!     scratch file is left behind and the next `--edit` truncates it.
 //!
 //! Not covered, and refused rather than approximated:
 //!   * `index_fd()`'s `INDEX_FORMAT_CHECK`, the object-format validation git
@@ -44,7 +43,6 @@
 //!     instead of silently dropping the mergetag.
 //!   * `core.graftFile` — git 2.55 does not honour it either (only
 //!     `$GIT_GRAFT_FILE` and the default path), so neither does this.
-//!   * `GIT_REPLACE_REF_BASE` — the namespace is always `refs/replace/`.
 //!
 //! The replacements themselves *are* in effect: every command that reads an object
 //! goes through the odb's replacement map, which is built from `refs/replace/*` at
@@ -93,8 +91,22 @@ use super::{Arg, LongOpt};
 // and how `-f` writes a replace ref for an object that is not present yet.
 use crate::objname;
 
-/// The namespace every replace ref lives in.
-const REPLACE_BASE: &str = "refs/replace/";
+/// The namespace every replace ref lives in — `ref_namespace[NAMESPACE_REPLACE].ref`.
+///
+/// ```c
+/// replace_ref_base = getenv(GIT_REPLACE_REF_BASE_ENVIRONMENT);
+/// git_replace_ref_base = xstrdup(replace_ref_base ? replace_ref_base
+///                                                 : "refs/replace/");
+/// update_ref_namespace(NAMESPACE_REPLACE, git_replace_ref_base);
+/// ```
+///
+/// (setup.c:1057-1060.) The value is taken verbatim, trailing slash included or
+/// not — `GIT_REPLACE_REF_BASE=refs/alt` really does write `refs/alt<oid>` —
+/// and it is the same namespace the object database reads its replacement map
+/// from, so writer and reader stay in step.
+fn replace_base() -> String {
+    std::env::var("GIT_REPLACE_REF_BASE").unwrap_or_else(|_| "refs/replace/".to_string())
+}
 
 /// `cmd_replace()`'s `struct option options[]` (builtin/replace.c), in table
 /// order, as [`super::resolve_long`] reads it. The five mode selectors are
@@ -427,16 +439,17 @@ fn edit_and_replace(object_ref: &str, force: bool, raw: bool) -> Result<ExitCode
     };
 
     // `check_ref_valid()`: the ref must be writable *before* the editor runs.
-    let name = format!("{REPLACE_BASE}{old}");
+    let name = format!("{}{old}", replace_base());
     if read_replace_ref(&repo, &name)?.is_some() && !force {
         return err(&format!("replace ref '{name}' already exists"));
     }
 
-    // git never removes `REPLACE_EDITOBJ`, and creates it `O_EXCL`, so a second
-    // `--edit` in the same repository dies on the leftover. Verified against
-    // stock 2.55.0.
+    // git never removes `REPLACE_EDITOBJ`; it re-opens it `O_TRUNC` each time,
+    // so the leftover from an earlier `--edit` is simply overwritten.
     let tmpfile = repo.git_dir().join("REPLACE_EDITOBJ");
-    export_object(&tmpfile, old, kind, raw)?;
+    if export_object(&tmpfile, old, kind, raw).is_none() {
+        return Ok(ExitCode::from(255));
+    }
 
     let new = if launch_editor(&repo, &tmpfile) {
         import_object(&repo, &tmpfile, kind, raw)
@@ -476,27 +489,41 @@ fn os_msg(e: &std::io::Error) -> String {
 /// `export_object()`: `git --no-replace-objects cat-file (-p|<type>) <oid>` into
 /// a freshly created `filename`, run as our own binary (git's `cmd.git_cmd = 1`).
 /// `--no-replace-objects` is exactly `GIT_NO_REPLACE_OBJECTS=1` in the child.
-fn export_object(filename: &std::path::Path, oid: ObjectId, kind: Kind, raw: bool) -> Result<()> {
-    // `xopen(filename, O_CREAT | O_EXCL | O_WRONLY, 0666)`.
-    let file = std::fs::File::options()
-        .write(true)
-        .create_new(true)
-        .open(filename)
-        .map_err(|e| anyhow!("unable to create '{}': {}", filename.display(), os_msg(&e)))?;
+fn export_object(filename: &std::path::Path, oid: ObjectId, kind: Kind, raw: bool) -> Option<()> {
+    // ```c
+    // fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    // if (fd < 0)
+    //         return error_errno(_("unable to open %s for writing"), filename);
+    // ```
+    //
+    // (builtin/replace.c:239-241.) `O_TRUNC`, not `O_EXCL`: git never removes
+    // the scratch file, so every `--edit` after the first one overwrites the
+    // leftover rather than failing on it.
+    let file = match std::fs::File::options().write(true).create(true).truncate(true).open(filename) {
+        Ok(f) => f,
+        Err(e) => {
+            error_line(&format!(
+                "unable to open {} for writing: {}",
+                filename.display(),
+                os_msg(&e)
+            ));
+            return None;
+        }
+    };
     let selector = if raw { kind.to_string() } else { "-p".to_string() };
-    let status = std::process::Command::new(crate::hosted::git_exe()?)
+    let status = std::process::Command::new(crate::hosted::git_exe().ok()?)
         .args(["cat-file", &selector, &oid.to_string()])
         .env("GIT_NO_REPLACE_OBJECTS", "1")
         .stdin(std::process::Stdio::null())
         .stdout(file)
         .status();
     match status {
-        Ok(s) if s.success() => Ok(()),
+        Ok(s) if s.success() => Some(()),
+        // `if (run_command(&cmd)) return error(_("cat-file reported failure"));`
+        // (builtin/replace.c:253-254).
         _ => {
-            error_line(&format!(
-                "cannot run 'git cat-file' to export object '{oid}'"
-            ));
-            Err(anyhow!("cat-file failed"))
+            error_line("cat-file reported failure");
+            None
         }
     }
 }
@@ -512,15 +539,21 @@ fn import_object(
 ) -> Option<ObjectId> {
     if !raw && kind == Kind::Tree {
         let listing = std::fs::File::open(filename).ok()?;
+        // `cmd.in = fd; cmd.out = -1;` (builtin/replace.c:278-279) — only stdout
+        // is a pipe, so mktree's own diagnostics reach the terminal.
         let out = std::process::Command::new(crate::hosted::git_exe().ok()?)
             .arg("mktree")
             .stdin(listing)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
             .ok()
             .or_else(|| {
                 error_line("unable to spawn mktree");
                 None
-            })?;
+            })?
+            .wait_with_output()
+            .ok()?;
         if !out.status.success() {
             error_line("mktree reported failure");
             return None;
@@ -663,7 +696,7 @@ fn replace_object_oid(
         return Ok(false);
     }
 
-    let name = format!("{REPLACE_BASE}{object}");
+    let name = format!("{}{object}", replace_base());
     let prev = read_replace_ref(repo, &name)?;
     if prev.is_some() && !force {
         error_line(&format!("replace ref '{name}' already exists"));
@@ -734,7 +767,7 @@ fn delete_replace_refs(names: &[String]) -> Result<ExitCode> {
             continue;
         };
         let full_hex = oid.to_string();
-        let name = format!("{REPLACE_BASE}{full_hex}");
+        let name = format!("{}{full_hex}", replace_base());
         let Some(current) = read_replace_ref(&repo, &name)? else {
             eprintln!("error: replace ref '{full_hex}' not found");
             had_error = true;
@@ -790,7 +823,7 @@ fn list_replace_refs(pattern: Option<&str>, format: Option<&str>) -> Result<Exit
     for reference in repo.references()?.all()? {
         let reference = reference.map_err(|e| anyhow!("{e}"))?;
         let full = reference.name().as_bstr().to_string();
-        let Some(short) = full.strip_prefix(REPLACE_BASE) else {
+        let Some(short) = full.strip_prefix(replace_base().as_str()) else {
             continue;
         };
         let Some(id) = reference.target().try_id().map(|id| id.to_owned()) else {

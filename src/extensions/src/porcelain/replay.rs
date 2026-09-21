@@ -23,7 +23,11 @@
 //!   atomic reference transaction and prints nothing.
 //! * Revision ranges in the forms `<rev>`, `^<rev>`, `<a>..<b>` and `<a>...<b>`
 //!   (the symmetric difference's merge bases go in as the excluded side, ahead of
-//!   both endpoints, exactly as `handle_dotdot_1()` queues them), plus the ref-set
+//!   both endpoints, exactly as `handle_dotdot_1()` queues them), the parent
+//!   marks `<rev>^@`, `<rev>^!` and `<rev>^-<n>` (`handle_revision_arg_1()`'s
+//!   `add_parents_only()` block, with the operand still recorded under its
+//!   untrimmed name so `get_ref_information()` cannot dwim it to a reference),
+//!   plus the ref-set
 //!   pseudo-options `--all`, `--branches`/`--heads`, `--tags` and `--remotes` and
 //!   the `--not` toggle, walked
 //!   `--topo-order` (reversed for pick mode, newest-first for revert mode) via
@@ -530,6 +534,63 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             // `setup_revisions()` does.
             _ => {}
         }
+        // `handle_revision_arg_1()`'s parent-mark block (revision.c:2178-2207),
+        // which git reaches only once `handle_dotdot()` has declined the operand
+        // — hence the range guard. `^@` queues the parents at the operand's own
+        // flags and claims the operand (`ret = 0; goto out;`); `^!` and `^-<n>`
+        // queue them at `flags ^ (UNINTERESTING | BOTTOM)` and then put the
+        // trimmed name back into `arg`, which is what makes `<a>^!` the range
+        // `<a>^..<a>`. A mark `add_parents_only()` declines is left on the
+        // operand, which then fails to resolve exactly as in git.
+        let original = expr;
+        let mut trimmed_mark = false;
+        let mut expr = expr;
+        if crate::objname::split_range(expr).is_none() {
+            match crate::objname::parents_only(expr) {
+                crate::objname::ParentsOnly::Absent => {}
+                // `strtol_i()` refused the `^-<n>`: `ret = -1` without ever
+                // resolving the operand, which `setup_revisions()` reports as a
+                // bad revision.
+                crate::objname::ParentsOnly::BadParent => {
+                    eprint!("{}", super::log::bad_revision_message_in(&repo, expr));
+                    return Ok(ExitCode::from(128));
+                }
+                crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
+                    let mut queued: Vec<RevArg> = Vec::new();
+                    let parent_not = if replaces { not } else { !not };
+                    let outcome = crate::objname::add_parents_only(
+                        &repo,
+                        base,
+                        parent_not,
+                        nth,
+                        &mut |name: &str, oid, negative| {
+                            queued.push(RevArg { name: name.to_string(), negative, oid });
+                        },
+                    );
+                    // `get_reference()` sits inside `add_parents_only()`'s
+                    // peeling loop and `die(_("bad object %s"), name)`s there
+                    // when the name decoded to an object the database does not
+                    // have — which a full-length hex always does.
+                    if matches!(outcome, crate::objname::Parents::BadObject) {
+                        return fatal(&format!(
+                            "bad object {}",
+                            crate::objname::uninteresting_mark(base).0
+                        ));
+                    }
+                    if matches!(outcome, crate::objname::Parents::Queued) {
+                        revs.extend(queued);
+                        if replaces {
+                            continue;
+                        }
+                        // `arg = arg_minus_excl`: the leading `^` is still on it,
+                        // and the `local_flags` strip below is what consumes it.
+                        expr = base;
+                        trimmed_mark = true;
+                    }
+                }
+            }
+        }
+
         // `handle_dotdot_1()` (revision.c) computes `flags_exclude = flags ^
         // (UNINTERESTING | BOTTOM)`, so a range written after `--not` has its two
         // ends swapped along with everything else.
@@ -567,7 +628,21 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             arg(expr, not).map(|a| vec![a])
         };
         match resolved {
-            Ok(args) => revs.extend(args),
+            Ok(mut args) => {
+                // `add_rev_cmdline(revs, object, arg_, REV_CMD_REV, …)`
+                // (revision.c:2234) records the operand under `arg_`, the
+                // *untouched* argument — so `<a>^!` names its own entry
+                // `<a>^!`, which `get_ref_information()` cannot dwim to a
+                // reference, while the parent entries `add_parents_only()`
+                // queued are named `<a>` and can. That asymmetry is what keeps
+                // `git replay --onto <x> <a>^!` from updating `<a>`.
+                if trimmed_mark {
+                    for a in &mut args {
+                        a.name = original.to_string();
+                    }
+                }
+                revs.extend(args);
+            }
             Err(_) => {
                 eprint!("{}", super::log::bad_revision_message_in(&repo, expr));
                 return Ok(ExitCode::from(128));

@@ -338,22 +338,26 @@ fn cmd_gc(repo: &gix::Repository) -> Result<ExitCode> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let mut cutoff_noresolve = now - 15 * 86400;
     let mut cutoff_resolve = now - 60 * 86400;
-    // `git_config_get_expiry_in_days()` also accepts an approxidate string, but
-    // its caller ignores the parse failure, so an unparsable value leaves the
-    // default cutoff in place — which is exactly what falling through does.
     let cfg = repo.config_snapshot();
-    if let Some(days) = cfg.string("gc.rerereResolved").and_then(|v| parse_days(v.as_bstr())) {
-        cutoff_resolve = now - days * 86400;
+    if let Some(cutoff) = config_expiry(&cfg, "gc.rerereResolved", now) {
+        cutoff_resolve = cutoff;
     }
-    if let Some(days) = cfg.string("gc.rerereUnresolved").and_then(|v| parse_days(v.as_bstr())) {
-        cutoff_noresolve = now - days * 86400;
+    if let Some(cutoff) = config_expiry(&cfg, "gc.rerereUnresolved", now) {
+        cutoff_noresolve = cutoff;
     }
 
     let rr_cache = rr_cache_dir(repo);
     let dir = std::fs::read_dir(&rr_cache).context("unable to open rr-cache directory")?;
 
+    let hexsz = repo.object_hash().len_in_hex();
     let mut to_remove: Vec<PathBuf> = Vec::new();
     for ent in dir.flatten() {
+        // `is_rr_cache_dirname()` (rerere.c:1222-1227): `parse_oid_hex()` has to
+        // consume the whole basename, so anything that is not a full object name
+        // is left alone — "or should we remove e->d_name?", says the comment.
+        if !is_rr_cache_dirname(&ent.file_name(), hexsz) {
+            continue;
+        }
         let id_dir = ent.path();
         let mut status = scan_rerere_dir(&id_dir);
 
@@ -1414,9 +1418,42 @@ fn os_err_message(e: &std::io::Error) -> String {
     }
 }
 
-/// The integer-days form of a `gc.rerere*` expiry value.
-fn parse_days(value: &gix::bstr::BStr) -> Option<i64> {
-    value.to_str().ok()?.trim().parse().ok()
+/// `is_rr_cache_dirname()` (rerere.c:1222): does the basename read as a whole
+/// object name? `parse_oid_hex()` accepts either case of hex digit and has to
+/// land exactly on the NUL, so the name is `hexsz` hex digits and nothing else.
+fn is_rr_cache_dirname(name: &std::ffi::OsStr, hexsz: usize) -> bool {
+    let bytes = name.as_encoded_bytes();
+    bytes.len() == hexsz && bytes.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// `repo_config_get_expiry_in_days()` (config.c:2482): the cutoff timestamp a
+/// `gc.rerere*` value names.
+///
+/// ```c
+/// if (git_parse_int(expiry_string, &days)) {
+///         const intmax_t scale = 86400;
+///         *expiry = now - days * scale;
+///         return 0;
+/// }
+/// if (!parse_expiry_date(expiry_string, &when)) {
+///         *expiry = when;
+///         return 0;
+/// }
+/// return -1; /* thing exists but cannot be parsed */
+/// ```
+///
+/// So a plain `git_parse_int()` integer (units and all) counts days back from
+/// `now`, anything else goes through `parse_expiry_date()` — which takes over
+/// `never`/`false` as "expire nothing" and `all`/`now` as "expire everything" —
+/// and a value that parses as neither leaves the caller's default in place,
+/// because `rerere_gc()` (rerere.c:1243-1246) ignores the `-1` return.
+fn config_expiry(cfg: &gix::config::Snapshot<'_>, key: &str, now: i64) -> Option<i64> {
+    let value = cfg.string(key)?;
+    let value = value.to_str().ok()?;
+    if let Ok(days) = crate::optint::config_int(value) {
+        return Some(now.saturating_sub(days.saturating_mul(86400)));
+    }
+    crate::date::parse_expiry_date(value)
 }
 
 /// Seconds since the epoch of a file's mtime, or `None` if it does not exist.

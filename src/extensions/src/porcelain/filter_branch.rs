@@ -1036,17 +1036,26 @@ fn rewrite(
         match state_commit {
             Some(id) => {
                 eprintln!("Populating map from {} ({id})", opts.state_branch);
-                let blob = repo
-                    .rev_parse_single(format!("{id}:filter.map").as_str())
-                    .ok()
-                    .and_then(|b| b.object().ok());
-                let Some(blob) = blob else {
+                // ```sh
+                // git show "$state_commit:filter.map" >"$tempdir"/filter-map ||
+                //         die "Unable to load state from $state_branch:filter.map"
+                // ```
+                //
+                // (script line 299.) Only stdout is redirected, so `git show`'s
+                // own `fatal: path 'filter.map' does not exist in '<commit>'`
+                // is part of the output when the branch carries no map.
+                let shown = ctx
+                    .git(&["show", &format!("{id}:filter.map")])
+                    .stdout(Stdio::piped())
+                    .spawn()?
+                    .wait_with_output()?;
+                if !shown.status.success() {
                     return die(&format!(
                         "Unable to load state from {}:filter.map",
                         opts.state_branch
                     ));
-                };
-                for line in ByteSlice::lines(&blob.data[..]) {
+                }
+                for line in ByteSlice::lines(&shown.stdout[..]) {
                     let line = line.to_str_lossy();
                     let Some(colon) = line.rfind(':') else {
                         return die(&format!(

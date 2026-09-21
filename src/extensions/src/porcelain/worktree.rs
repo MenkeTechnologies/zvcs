@@ -2895,6 +2895,39 @@ fn state_branch(path: &Path) -> Option<String> {
     Some(text.strip_prefix("refs/heads/").unwrap_or(&text).to_owned())
 }
 
+/// `copy_or_rename_branch()`'s own worktree scan (builtin/branch.c:599-608),
+/// which is narrower than [`branch_checked_out`]: it asks only whether some
+/// worktree's `HEAD` *symref* names `refname`, with no rebase or bisect state
+/// consulted, and stops at the first hit.
+///
+/// ```c
+/// for (int i = 0; worktrees[i]; i++) {
+///         struct worktree *wt = worktrees[i];
+///
+///         if (wt->head_ref && !strcmp(oldref.buf, wt->head_ref)) {
+///                 oldref_usage |= IS_HEAD;
+///                 if (is_null_oid(&wt->head_oid))
+///                         oldref_usage |= IS_ORPHAN;
+///                 break;
+///         }
+/// }
+/// ```
+///
+/// `Some(true)` is `IS_HEAD | IS_ORPHAN` — the branch is checked out but has no
+/// commit yet, so `git branch -m` re-points `HEAD` without renaming any ref.
+/// Unlike `branch_checked_out()` this does *not* skip a bare worktree, because
+/// git's loop does not: a bare worktree simply has no `head_ref` to match.
+pub(super) fn head_ref_usage(repo: &gix::Repository, refname: &str) -> Result<Option<bool>> {
+    for wt in collect(repo, u64::MAX)? {
+        if let HeadInfo::Branch { oid, name } = &wt.head {
+            if name.as_bstr() == refname {
+                return Ok(Some(oid.is_null()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// `die_if_checked_out(branch, ignore_current_worktree = 1)` (branch.c:394): the
 /// *other* worktree whose `HEAD` is on `branch`, if any.
 ///

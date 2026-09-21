@@ -387,6 +387,184 @@ fn ref_syntax_hints(repo: &gix::Repository) {
     crate::advice::Advice::RefSyntax.advise_in(repo, "See 'git help check-ref-format'");
 }
 
+/// Which namespace `copy_branchname()` will let an `@{…}` rewrite land in —
+/// git's `enum interpret_branch_kind`, reduced to the two values
+/// `builtin/branch.c` ever passes (`INTERPRET_BRANCH_LOCAL` for every branch
+/// operand, `INTERPRET_BRANCH_REMOTE` for the operands of `-r -d`).
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Interpret {
+    Local,
+    Remote,
+}
+
+/// `copy_branchname()` (`refs.c:747-760`): run a branch-name operand through
+/// `repo_interpret_branch_name()` before it is spliced under `refs/heads/`.
+///
+/// ```c
+/// void copy_branchname(struct strbuf *sb, const char *name,
+///                      enum interpret_branch_kind allowed)
+/// {
+///         int len = strlen(name);
+///         struct interpret_branch_name_options options = { .allowed = allowed };
+///         int used = repo_interpret_branch_name(the_repository, name, len, sb, &options);
+///
+///         if (used < 0)
+///                 used = 0;
+///         strbuf_add(sb, name + used, len - used);
+/// }
+/// ```
+///
+/// Every branch-name operand of `git branch` goes through it — the deletes
+/// (`builtin/branch.c:262`), `--edit-description` (:901), `--set-upstream-to`
+/// (:944), `--unset-upstream` (:974), and both names of `-m`/`-c` by way of
+/// `check_branch_ref()` (`refs.c:762-765`) — which is why `git branch -D @{-1}`
+/// and `git branch -f @{upstream} <commit>` name the branch those marks resolve
+/// to rather than a ref literally called `@{-1}`.
+///
+/// `repo_interpret_branch_name()` (`object-name.c:1472-1522`) tries, in order:
+///
+///   * `interpret_nth_prior_checkout()` — only when `allowed` admits a local
+///     branch — which reads `@{-<n>}` off `HEAD`'s reflog;
+///   * `interpret_empty_at()` — only under `INTERPRET_BRANCH_HEAD`, which
+///     `builtin/branch.c` never passes, so a branch literally named `@` stays
+///     itself here;
+///   * `interpret_branch_mark()` with `upstream_mark`, which rewrites
+///     `<branch>@{u}` / `<branch>@{upstream}` to that branch's upstream.
+///
+/// A rewrite that lands outside `allowed` is dropped by
+/// `branch_interpret_allowed()` (`object-name.c:1412-1426`) and the operand is
+/// left exactly as typed, which is how `git branch -r -D @{-1}` refuses to
+/// delete a *local* branch and `git branch -D @{upstream}` refuses to delete a
+/// remote-tracking one.
+///
+/// `Err` is `interpret_branch_mark()`'s `die(err.buf)` for a mark on a branch
+/// with no upstream; `nonfatal_dangling_mark` is off for every caller here.
+///
+/// Not ported: `push_mark` (`@{push}`), whose `push.default` machinery
+/// [`crate::objname`] keeps as a separate concern.
+pub(crate) fn copy_branchname(
+    repo: &gix::Repository,
+    name: &str,
+    allowed: Interpret,
+) -> std::result::Result<String, String> {
+    // `if (!options->allowed || (options->allowed & INTERPRET_BRANCH_LOCAL))`
+    if allowed == Interpret::Local {
+        match nth_prior_checkout(repo, name) {
+            // `len == namelen` — consumed all — or the `reinterpret()` tail,
+            // which re-runs the pass over `<resolved><rest>`; the resolved half
+            // is a short branch name, so the only mark that can still fire is an
+            // upstream one, and that is exactly what the fall-through below does.
+            Some(Some((resolved, used))) => {
+                let rejoined = format!("{resolved}{}", &name[used..]);
+                if used == name.len() {
+                    return Ok(rejoined);
+                }
+                return Ok(match branch_mark(repo, &rejoined, allowed)? {
+                    Some(v) => v,
+                    None => rejoined,
+                });
+            }
+            // `return len; /* syntax Ok, not enough switches */` — `used` is 0,
+            // so `copy_branchname()` copies the operand through untouched.
+            Some(None) => return Ok(name.to_owned()),
+            None => {}
+        }
+    }
+    Ok(match branch_mark(repo, name, allowed)? {
+        Some(v) => v,
+        None => name.to_owned(),
+    })
+}
+
+/// `interpret_nth_prior_checkout()` (`object-name.c:1273-1306`): parse `@{-<n>}`
+/// and read the `n`-th "checkout: moving from <x> to <y>" entry off `HEAD`'s
+/// reflog, newest first.
+///
+/// `None` is the C's `-1` (not `@{-<n>}` syntax at all), `Some(None)` its `0`
+/// (syntax fine, the reflog does not go back that far), and
+/// `Some(Some((branch, used)))` its positive `brace - name + 1`.
+fn nth_prior_checkout(repo: &gix::Repository, name: &str) -> Option<Option<(String, usize)>> {
+    let b = name.as_bytes();
+    if b.len() < 4 || !b.starts_with(b"@{-") {
+        return None;
+    }
+    let brace = b.iter().position(|&c| c == b'}')?;
+    // `nth = strtol(name + 3, &num_end, 10); if (num_end != brace) return -1;`
+    let nth: i64 = name[3..brace].parse().ok()?;
+    if nth <= 0 {
+        return None;
+    }
+    let used = brace + 1;
+    let mut remaining = nth as usize;
+
+    let Ok(head) = repo.head() else { return Some(None) };
+    let mut platform = head.log_iter();
+    let Ok(Some(log)) = platform.rev() else { return Some(None) };
+    for line in log.filter_map(std::result::Result::ok) {
+        // `grab_nth_branch_switch()` (object-name.c:1249-1267).
+        let Some(rest) = line.message.strip_prefix(b"checkout: moving from ".as_ref()) else {
+            continue;
+        };
+        let Some(pos) = rest.find(" to ") else { continue };
+        remaining -= 1;
+        if remaining == 0 {
+            return Some(Some((rest[..pos].to_str_lossy().into_owned(), used)));
+        }
+    }
+    Some(None)
+}
+
+/// `interpret_branch_mark()` (`object-name.c:1428-1470`) for `upstream_mark`,
+/// with `branch_interpret_allowed()` and `set_shortened_ref()` applied as the C
+/// applies them. `Ok(None)` is the C's `-1`: no mark here, or one whose value
+/// the caller's `allowed` does not admit.
+fn branch_mark(
+    repo: &gix::Repository,
+    name: &str,
+    allowed: Interpret,
+) -> std::result::Result<Option<String>, String> {
+    let Some(at) = crate::objname::upstream_mark_at(name) else { return Ok(None) };
+    // `if (memchr(name, ':', at)) return -1;`
+    if name[..at].contains(':') {
+        return Ok(None);
+    }
+    // `branch = branch_get(at ? name_str : NULL)`: an empty left-hand side is
+    // the current branch.
+    let full = match &name[..at] {
+        "" | "HEAD" => match repo.head_name() {
+            Ok(Some(h)) => h.as_bstr().to_string(),
+            _ => {
+                return Err(crate::objname::upstream_mark_fatal(repo, name)
+                    .unwrap_or_else(|| format!("no upstream configured for branch '{name}'")))
+            }
+        },
+        b => format!("refs/heads/{b}"),
+    };
+    // `value = get_data(branch, &err); if (!value) die("%s", err.buf);`
+    let Some(upstream) = upstream_ref(repo, full.as_str().into()) else {
+        return Err(crate::objname::upstream_mark_fatal(repo, name)
+            .unwrap_or_else(|| format!("no upstream configured for branch '{name}'")));
+    };
+    let value = upstream.as_bstr().to_str_lossy().into_owned();
+    // `if (!branch_interpret_allowed(value, options->allowed)) return -1;`
+    let ok = match allowed {
+        Interpret::Local => value.starts_with("refs/heads/"),
+        Interpret::Remote => value.starts_with("refs/remotes/"),
+    };
+    if !ok {
+        return Ok(None);
+    }
+    // `set_shortened_ref(r, buf, value); return len + at;` — the mark's own
+    // length is consumed, and anything past it is carried over by the caller.
+    let mark_len = ["@{upstream}", "@{u}"]
+        .iter()
+        .find(|m| name.len() - at >= m.len() && name[at..at + m.len()].eq_ignore_ascii_case(m))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let short = crate::refname::shorten_unambiguous_str(repo, &value, false);
+    Ok(Some(format!("{short}{}", &name[at + mark_len..])))
+}
+
 /// Which ref namespace a listing covers. `-a`/`-r` are a single mode selector in
 /// git's option table, so the last one on the command line wins.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -819,6 +997,35 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     if let Some((key, spec, meta)) = super::color::first_invalid_slot(&repo, "color.branch", &COLOR_SLOTS)
     {
         return Ok(super::color::invalid_color_fatal(&key, &spec, &meta));
+    }
+
+    // Every branch-name *operand* is rewritten by `copy_branchname()` before it
+    // is used — the deletes (builtin/branch.c:262), `--edit-description` (:901),
+    // `--set-upstream-to` (:944), `--unset-upstream` (:974), both names of
+    // `-m`/`-c` through `check_branch_ref()`, and a creation's `<branch-name>`
+    // through `validate_branchname()` (branch.c:375). A `--list` pattern is not
+    // an operand and is left alone, and neither is a creation's `<start-point>`,
+    // which `dwim_branch_start()` resolves as an object name instead.
+    if !o.names.is_empty() && !listing && !o.show_current {
+        let allowed = match o.delete && o.mode == ListMode::Remotes {
+            true => Interpret::Remote,
+            false => Interpret::Local,
+        };
+        // A creation reads only `argv[0]` through `check_branch_ref()`; its
+        // `<start-point>` is `dwim_branch_start()`'s, not `copy_branchname()`'s.
+        let creating = !(o.delete
+            || o.rename
+            || o.copy
+            || o.edit_description
+            || o.set_upstream_to.is_some()
+            || o.unset_upstream);
+        let count = if creating { 1 } else { o.names.len() };
+        for name in o.names.iter_mut().take(count) {
+            match copy_branchname(&repo, name, allowed) {
+                Ok(rewritten) => *name = rewritten,
+                Err(msg) => return fatal(msg),
+            }
+        }
     }
 
     if o.rename {
@@ -1701,60 +1908,15 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         None => current_short.clone().unwrap_or_else(|| "HEAD".to_string()),
     };
 
-    // Resolve the target commit and, when the start-point is itself a ref, its
-    // full name — used to decide tracking.
-    let (target, start_ref): (ObjectId, Option<BString>) = match start {
-        Some(s) => {
-            // git's `dwim_branch_start()` (`branch.c`) draws the line here:
-            // `repo_get_oid_mb()` failing is `not a valid object name`, but a name
-            // that *did* resolve and then fails `lookup_commit_reference()` is
-            // `not a valid branch point` — which is what an absent full-length hex
-            // name reaches, since `get_oid_basic()` decodes it without asking the
-            // odb whether the object exists.
-            let Some(id) = crate::objname::resolve(repo, s) else {
-                return fatal(format!("not a valid object name: '{s}'"));
-            };
-            // `dwim_branch_start()` then DWIMs the same name, and more than one
-            // match is fatal — checked before `lookup_commit_reference()`:
-            //
-            // ```c
-            // switch (repo_dwim_ref(r, start_name, strlen(start_name), &oid, &real_ref, 0)) {
-            // …
-            // default:
-            //         die(_("ambiguous object name: '%s'"), start_name);
-            // }
-            // ```
-            if super::rev_parse::dwim_ref_matches(repo, s).len() > 1 {
-                return fatal(format!("ambiguous object name: '{s}'"));
-            }
-            let found = crate::objname::lookup_commit_reference(repo, id);
-            let crate::objname::CommitRef::Commit(commit) = found else {
-                // `object_as_type()` has already complained about a present
-                // object of the wrong type; git prints that line before dying.
-                if let Some(note) = found.type_error() {
-                    eprintln!("error: {note}");
-                }
-                return fatal(format!("not a valid branch point: '{s}'"));
-            };
-            let start_ref = repo
-                .find_reference(s)
-                .ok()
-                .map(|r| r.name().as_bstr().to_owned());
-            (commit, start_ref)
-        }
-        None => {
-            let head = repo.head()?;
-            if head.is_unborn() {
-                return fatal("not a valid object name: 'HEAD'");
-            }
-            let id = head
-                .id()
-                .ok_or_else(|| anyhow!("HEAD does not point to a commit"))?
-                .detach();
-            let start_ref = repo.head_name()?.map(|n| n.as_bstr().to_owned());
-            (id, start_ref)
-        }
-    };
+    // `create_branch()` resolves the start-point through `dwim_branch_start()`
+    // whether or not one was typed: with `argc == 1` git passes `head`, the
+    // current branch's short name (builtin/branch.c:998), and the same DWIM runs
+    // over it.
+    let (target, start_ref): (ObjectId, Option<BString>) =
+        match dwim_branch_start(repo, &start_name, o.track)? {
+            Start::Resolved(id, real_ref) => (id, real_ref),
+            Start::Stop(code) => return Ok(code),
+        };
 
     // Decide tracking before touching the ref: git dies (without creating the
     // branch) if `--track` was explicit but the start-point is not a branch.
@@ -1811,6 +1973,198 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `upstream_advice` trailer (`branch.c:510-518`), printed behind
+/// `upstream_missing` while `advice.setUpstreamFailure` is unconfigured.
+const UPSTREAM_ADVICE: &str = "\nIf you are planning on basing your work on an upstream\n\
+     branch that already exists at the remote, you may need to\n\
+     run \"git fetch\" to retrieve it.\n\
+     \n\
+     If you are planning to push out a new local branch that\n\
+     will track its remote counterpart, you may want to use\n\
+     \"git push -u\" to set the upstream config as you push.";
+
+/// What [`dwim_branch_start`] found, or the exit code it already reported.
+enum Start {
+    /// The start-point's commit, and git's `real_ref`: the full name of the
+    /// branch it named, when that is a branch tracking can be set up against.
+    Resolved(ObjectId, Option<BString>),
+    /// git `die()`d; the caller returns this code without touching any ref.
+    Stop(ExitCode),
+}
+
+/// `dwim_branch_start()` (branch.c:539-594): resolve a start-point to a commit
+/// and, separately, decide whether it also names a *branch* — which is what
+/// `setup_tracking()` is later handed as `orig_ref`.
+///
+/// ```c
+/// real_ref = NULL;
+/// if (repo_get_oid_mb(r, start_name, &oid)) {
+///         if (explicit_tracking) {
+///                 int code = die_message(_(upstream_missing), start_name);
+///                 advise_if_enabled(ADVICE_SET_UPSTREAM_FAILURE, _(upstream_advice));
+///                 exit(code);
+///         }
+///         die(_("not a valid object name: '%s'"), start_name);
+/// }
+///
+/// switch (repo_dwim_ref(r, start_name, strlen(start_name), &oid, &real_ref, 0)) {
+/// case 0:
+///         /* Not branching from any existing branch */
+///         if (explicit_tracking)
+///                 die(_(upstream_not_branch), start_name);
+///         break;
+/// case 1:
+///         /* Unique completion -- good, only if it is a real branch */
+///         if (!starts_with(real_ref, "refs/heads/") &&
+///             validate_remote_tracking_branch(real_ref)) {
+///                 if (explicit_tracking)
+///                         die(_(upstream_not_branch), start_name);
+///                 else
+///                         FREE_AND_NULL(real_ref);
+///         }
+///         break;
+/// default:
+///         die(_("ambiguous object name: '%s'"), start_name);
+///         break;
+/// }
+///
+/// if (!(commit = lookup_commit_reference(r, &oid)))
+///         die(_("not a valid branch point: '%s'"), start_name);
+/// ```
+///
+/// Three distinctions the port used to lose:
+///
+///   * `repo_get_oid_mb()` failing is `not a valid object name`, while a name
+///     that resolved and then failed `lookup_commit_reference()` is
+///     `not a valid branch point` — which is where an absent full-length hex
+///     name lands, since `get_oid_basic()` decodes it without asking the odb.
+///   * A ref that is neither under `refs/heads/` nor the destination of some
+///     remote's fetch refspec is not a branch: with `--track` that is fatal,
+///     and without it the ref is simply dropped so no tracking is recorded.
+///     That is the whole of `git branch mytag12 localtags/mytag12` writing no
+///     `branch.mytag12.remote`.
+///   * `explicit_tracking` is `--track`/`--set-upstream-to` only
+///     (`BRANCH_TRACK_EXPLICIT`, `BRANCH_TRACK_OVERRIDE`);
+///     `--track=inherit` is not in it.
+fn dwim_branch_start(repo: &gix::Repository, start_name: &str, track: Track) -> Result<Start> {
+    let explicit_tracking = matches!(track, Track::Direct | Track::Override);
+
+    let Some(id) = get_oid_mb(repo, start_name) else {
+        if explicit_tracking {
+            let code = fatal(format!(
+                "the requested upstream branch '{start_name}' does not exist"
+            ))?;
+            crate::advice::Advice::SetUpstreamFailure.advise_in(repo, UPSTREAM_ADVICE);
+            return Ok(Start::Stop(code));
+        }
+        return Ok(Start::Stop(fatal(format!(
+            "not a valid object name: '{start_name}'"
+        ))?));
+    };
+
+    let not_a_branch = || {
+        fatal(format!(
+            "cannot set up tracking information; starting point '{start_name}' is not a branch"
+        ))
+    };
+    let matched = super::rev_parse::dwim_ref_matches(repo, start_name);
+    let mut real_ref: Option<BString> = match matched.len() {
+        0 => {
+            if explicit_tracking {
+                return Ok(Start::Stop(not_a_branch()?));
+            }
+            None
+        }
+        1 => Some(BString::from(matched[0].as_str())),
+        _ => {
+            return Ok(Start::Stop(fatal(format!(
+                "ambiguous object name: '{start_name}'"
+            ))?))
+        }
+    };
+    if let Some(r) = &real_ref {
+        // `validate_remote_tracking_branch()` (branch.c:501-504) is
+        // `!for_each_remote(check_tracking_branch, ref)`: true — "not a valid
+        // remote-tracking branch" — exactly when no remote's fetch refspec has
+        // this ref as its destination.
+        let is_branch = r.to_str_lossy().starts_with("refs/heads/")
+            || !remotes_fetching_into(repo, r.as_bstr()).is_empty();
+        if !is_branch {
+            if explicit_tracking {
+                return Ok(Start::Stop(not_a_branch()?));
+            }
+            real_ref = None;
+        }
+    }
+
+    let found = crate::objname::lookup_commit_reference(repo, id);
+    let crate::objname::CommitRef::Commit(commit) = found else {
+        // `object_as_type()` has already complained about a present object of
+        // the wrong type; git prints that line before dying.
+        if let Some(note) = found.type_error() {
+            eprintln!("error: {note}");
+        }
+        return Ok(Start::Stop(fatal(format!(
+            "not a valid branch point: '{start_name}'"
+        ))?));
+    };
+    Ok(Start::Resolved(commit, real_ref))
+}
+
+/// `repo_get_oid_mb()` (`object-name.c:1308-1353`): ordinary object-name
+/// resolution, except that a name containing `...` is the *merge base* of its
+/// two sides.
+///
+/// ```c
+/// dots = strstr(name, "...");
+/// if (!dots)
+///         return repo_get_oid(r, name, oid);
+/// if (dots == name)
+///         st = repo_get_oid(r, "HEAD", &oid_tmp);
+/// else { … repo_get_oid_committish(r, <left>, &oid_tmp) … }
+/// …
+/// if (repo_get_oid_committish(r, dots[3] ? (dots + 3) : "HEAD", &oid_tmp))
+///         return -1;
+/// …
+/// if (!mbs || mbs->next)
+///         st = -1;
+/// ```
+///
+/// Either side may be empty and then means `HEAD`, and more than one merge base
+/// is a failure, not a choice — which is why `git branch mb main...` is the
+/// fork point of `main` and `HEAD` and `git branch x a...b` on a criss-cross
+/// merge is refused. `git branch` is git's only caller.
+fn get_oid_mb(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    let Some(dots) = name.find("...") else {
+        return crate::objname::resolve(repo, name);
+    };
+    let left = match &name[..dots] {
+        "" => "HEAD",
+        s => s,
+    };
+    let right = match &name[dots + 3..] {
+        "" => "HEAD",
+        s => s,
+    };
+    let one = commit_of(repo, left)?;
+    let two = commit_of(repo, right)?;
+    let bases = repo.merge_bases_many(one, &[two]).ok()?;
+    match bases.len() {
+        1 => Some(bases[0].detach()),
+        _ => None,
+    }
+}
+
+/// `repo_get_oid_committish()` followed by `lookup_commit_reference_gently()`:
+/// the commit a `...` endpoint names, or `None`.
+fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    let id = crate::objname::resolve_quiet(repo, spec)?;
+    match crate::objname::lookup_commit_reference(repo, id) {
+        crate::objname::CommitRef::Commit(c) => Some(c),
+        _ => None,
+    }
 }
 
 /// `setup_tracking()`'s `for_each_remote(find_tracked_branch)` pass (branch.c):
@@ -1998,7 +2352,21 @@ fn inherited_upstream(
 /// `-u`/`--set-upstream-to`: point a branch's upstream at `<upstream>`. Operates
 /// on the given branch, or the current one when no positional is present.
 fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result<ExitCode> {
-    let branch_name = match o.names.first() {
+    // ```c
+    // if (!argc)
+    //         branch = branch_get(NULL);
+    // else if (argc == 1) { … }
+    // else
+    //         die(_("too many arguments to set new upstream"));
+    // ```
+    // (builtin/branch.c:941-947.) The count is judged before the branch is
+    // looked up, so `--set-upstream-to <up> a b c` is this one line and not a
+    // complaint about `a`.
+    if o.names.len() > 1 {
+        return fatal("too many arguments to set new upstream");
+    }
+    let named = o.names.first().cloned();
+    let branch_name = match &named {
         Some(n) => n.clone(),
         None => match repo.head_name()? {
             Some(h) => h.shorten().to_string(),
@@ -2010,97 +2378,99 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
         },
     };
 
+    // ```c
+    // if (!refs_ref_exists(get_main_ref_store(the_repository), branch->refname)) {
+    //         if (!argc || branch_checked_out(branch->refname))
+    //                 die(_("no commit on branch '%s' yet"), branch->name);
+    //         die(_("branch '%s' does not exist"), branch->name);
+    // }
+    // ```
+    // (builtin/branch.c:957-961.) A branch some worktree's `HEAD` sits on but
+    // that has no ref yet is an unborn branch, not a missing one.
     let full = format!("refs/heads/{branch_name}");
     if repo.try_find_reference(full.as_str())?.is_none() {
+        if named.is_none() || super::worktree::branch_checked_out(repo, &full)?.is_some() {
+            return fatal(format!("no commit on branch '{branch_name}' yet"));
+        }
         return fatal(format!("branch '{branch_name}' does not exist"));
     }
 
-    // `create_branch()` resolves the start-point as an *object name* first —
-    // `if (repo_get_oid_mb(r, start_name, &oid))` — and only then DWIMs it as a
-    // ref. The object-name pass is what emits `warning: refname '<x>' is
-    // ambiguous.`, so skipping it left the fatal below unannounced.
-    let _ = crate::objname::resolve(repo, upstream_spec);
-    let up = match resolve_upstream(repo, upstream_spec)? {
-        Some(u) => u,
-        None => {
-            let code = fatal(format!(
-                "the requested upstream branch '{upstream_spec}' does not exist"
-            ))?;
-            // `advise_if_enabled(ADVICE_SET_UPSTREAM_FAILURE, upstream_advice)`
-            // in `branch.c`: the trailer is git's, not ours, so it appears only
-            // while the slot is unconfigured.
-            crate::advice::Advice::SetUpstreamFailure.advise_in(
-                repo,
-                "\nIf you are planning on basing your work on an upstream\n\
-                 branch that already exists at the remote, you may need to\n\
-                 run \"git fetch\" to retrieve it.\n\
-                 \n\
-                 If you are planning to push out a new local branch that\n\
-                 will track its remote counterpart, you may want to use\n\
-                 \"git push -u\" to set the upstream config as you push.",
-            );
-            return Ok(code);
-        }
+    // `dwim_and_setup_tracking(r, branch->name, new_upstream,
+    // BRANCH_TRACK_OVERRIDE, quiet)` (builtin/branch.c:963-965), which is
+    // `dwim_branch_start()` followed by `setup_tracking()` — the very same pair
+    // a creation runs, with `explicit_tracking` on. So a spec that resolves to
+    // nothing is `upstream_missing` with its advice, one that resolves but is
+    // not a branch is `upstream_not_branch`, and one six DWIM rules read two
+    // ways is `ambiguous object name` rather than being silently attributed to
+    // whichever rule happens to win.
+    let real_ref = match dwim_branch_start(repo, upstream_spec, Track::Override)? {
+        Start::Resolved(_, real_ref) => real_ref,
+        Start::Stop(code) => return Ok(code),
     };
-    // `--set-upstream-to` is `create_branch(…, BRANCH_TRACK_OVERRIDE)`, so it runs
-    // the very same `dwim_ref()` switch the start-point above does, in the same
-    // order: `repo_get_oid_mb()` first — a name that resolves to nothing is the
-    // `upstream_missing` die handled just above — and then
-    //
-    // ```c
-    // switch (dwim_ref(start_name, strlen(start_name), &oid, &real_ref, 0)) {
-    // …
-    // default:
-    //         die(_("ambiguous object name: '%s'"), start_name);
-    // }
-    // ```
-    //
-    // (`create_branch()`, branch.c.) A name that six DWIM rules resolve two ways
-    // is refused rather than silently attributed to whichever rule wins: with
-    // both `refs/heads/rem/ambi` and `refs/remotes/rem/ambi` present,
-    // `branch --set-upstream-to=rem/ambi main` is fatal in git and used to write
-    // `branch.main.remote=.` here, recording the *local* branch as the upstream
-    // of a name whose remote-tracking reading is the likelier one.
-    if super::rev_parse::dwim_ref_matches(repo, upstream_spec).len() > 1 {
-        return fatal(format!("ambiguous object name: '{upstream_spec}'"));
-    }
+    // `if (real_ref && track) setup_tracking(...)` — `dwim_branch_start()` has
+    // already refused every case where `real_ref` could be absent under
+    // `BRANCH_TRACK_OVERRIDE`.
+    let Some(real_ref) = real_ref else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let Some(up) = upstream_of_ref(real_ref.as_bstr()) else {
+        return Ok(ExitCode::SUCCESS);
+    };
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // `install_branch_config_multiple_remotes()` (branch.c:105-116): a branch
+    // asked to track itself is a warning and nothing else.
+    //
+    // ```c
+    // if (!origin)
+    //         for_each_string_list_item(item, remotes)
+    //                 if (skip_prefix(item->string, "refs/heads/", &shortname)
+    //                     && !strcmp(local, shortname)) {
+    //                         warning(_("not setting branch '%s' as its own upstream"), local);
+    //                         return 0;
+    //                 }
+    // ```
+    if up.0 == "." && up.1.strip_prefix("refs/heads/") == Some(branch_name.as_str()) {
+        eprintln!("warning: not setting branch '{branch_name}' as its own upstream");
+        return Ok(ExitCode::SUCCESS);
+    }
     install_tracking(repo, &branch_name, &up, o.quiet)?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// Resolve an upstream spec to `(remote, merge_ref, short)`. A remote-tracking
-/// ref maps to its remote and the remote-side branch; a local branch maps to the
-/// `.` remote. `None` when the spec does not name a ref.
-fn resolve_upstream(
-    repo: &gix::Repository,
-    spec: &str,
-) -> Result<Option<(String, String, String)>> {
-    let full: BString = match repo.find_reference(spec) {
-        Ok(r) => r.name().as_bstr().to_owned(),
-        Err(_) => return Ok(None),
-    };
-    let s = full.to_str_lossy();
+/// `setup_tracking()`'s record for one resolved `orig_ref`: the `(remote,
+/// merge, short)` triple `install_branch_config()` writes. A remote-tracking
+/// ref maps to its remote and the remote-side branch name; anything else is the
+/// `.` remote with the ref name recorded verbatim.
+fn upstream_of_ref(real_ref: &BStr) -> Option<(String, String, String)> {
+    let s = real_ref.to_str_lossy();
     if let Some(rest) = s.strip_prefix("refs/remotes/") {
         if let Some((remote, branch)) = rest.split_once('/') {
-            return Ok(Some((
+            return Some((
                 remote.to_string(),
                 format!("refs/heads/{branch}"),
                 format!("{remote}/{branch}"),
-            )));
+            ));
         }
     }
-    if let Some(b) = s.strip_prefix("refs/heads/") {
-        return Ok(Some((".".to_string(), s.to_string(), b.to_string())));
-    }
-    // Any other ref (e.g. a tag): git records it against the `.` remote.
-    Ok(Some((".".to_string(), s.to_string(), spec.to_string())))
+    let short = s.strip_prefix("refs/heads/").unwrap_or(&s).to_string();
+    Some((".".to_string(), s.into_owned(), short))
 }
 
 /// `--unset-upstream`: drop `branch.<name>.remote` and `branch.<name>.merge` for
 /// the given branch (or the current one). Refuses a branch with no upstream.
 fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
+    // ```c
+    // if (!argc)
+    //         branch = branch_get(NULL);
+    // else if (argc == 1) { … }
+    // else
+    //         die(_("too many arguments to unset upstream"));
+    // ```
+    // (builtin/branch.c:971-977), judged before any branch is looked up.
+    if o.names.len() > 1 {
+        return fatal("too many arguments to unset upstream");
+    }
     let branch_name = match o.names.first() {
         Some(n) => n.clone(),
         None => match repo.head_name()? {
@@ -2183,11 +2553,18 @@ fn edit_description(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     let full = format!("refs/heads/{branch_name}");
     if repo.try_find_reference(full.as_str())?.is_none() {
-        // An unborn branch is named by HEAD but has no ref yet, which is why the
-        // wording depends on whether the name came from argv or from HEAD.
-        match named {
-            Some(_) => eprintln!("error: no branch named '{branch_name}'"),
-            None => eprintln!("error: no commit on branch '{branch_name}' yet"),
+        // ```c
+        // error((!argc || branch_checked_out(branch_ref.buf))
+        //       ? _("no commit on branch '%s' yet")
+        //       : _("no branch named '%s'"),
+        //       branch_name);
+        // ```
+        // (builtin/branch.c:909-912.) An unborn branch has no ref yet but some
+        // worktree's `HEAD` is on it — named explicitly or not, that is "no
+        // commit yet", not "no such branch".
+        match named.is_some() && super::worktree::branch_checked_out(repo, &full)?.is_none() {
+            true => eprintln!("error: no branch named '{branch_name}'"),
+            false => eprintln!("error: no commit on branch '{branch_name}' yet"),
         }
         return Ok(ExitCode::from(1));
     }
@@ -2465,9 +2842,41 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // ```c
+    // for (int i = 0; worktrees[i]; i++) {
+    //         struct worktree *wt = worktrees[i];
+    //         if (wt->head_ref && !strcmp(oldref.buf, wt->head_ref)) {
+    //                 oldref_usage |= IS_HEAD;
+    //                 if (is_null_oid(&wt->head_oid))
+    //                         oldref_usage |= IS_ORPHAN;
+    //                 break;
+    //         }
+    // }
+    //
+    // if ((copy || !(oldref_usage & IS_HEAD)) &&
+    //     !refs_ref_exists(get_main_ref_store(the_repository), oldref.buf)) {
+    //         if (oldref_usage & IS_HEAD)
+    //                 die(_("no commit on branch '%s' yet"), oldname);
+    //         else
+    //                 die(_("no branch named '%s'"), oldname);
+    // }
+    // ```
+    //
+    // (builtin/branch.c:599-615.) A *rename* of a branch some worktree's `HEAD`
+    // is on skips the existence check, which is the only reason an orphan
+    // branch can be renamed at all: there is no ref to move, so git moves the
+    // config and re-points every `HEAD` that named it — `!(oldref_usage &
+    // IS_ORPHAN)` guards `refs_rename_ref()` at :640. `IS_HEAD` is *any*
+    // worktree's `HEAD`, not just this one's.
+    let head_usage = super::worktree::head_ref_usage(repo, &old_full)?;
     let mut old_ref = match repo.try_find_reference(old_full.as_str())? {
         Some(r) => r,
-        None => return fatal(format!("no branch named '{old}'")),
+        None => {
+            if head_usage.is_none() {
+                return fatal(format!("no branch named '{old}'"));
+            }
+            return rename_orphan_branch(repo, &old, &new, &old_full, &new_full);
+        }
     };
     // ```c
     // if (!force)
@@ -2623,6 +3032,63 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `copy_or_rename_branch()` for an orphan `HEAD`: the branch has no ref, so
+/// there is nothing to rename.
+///
+/// git reaches this with `oldref_usage == IS_HEAD | IS_ORPHAN`, which turns off
+/// the `refs_rename_ref()` call (builtin/branch.c:640) while leaving the config
+/// move (:663-672) and `replace_each_worktree_head_symref()` (:655-658) to run
+/// as they always do. So `git checkout --orphan foo && git branch -m foo bar`
+/// leaves `HEAD` symbolic to `refs/heads/bar` with still no commit on it, and
+/// `branch.foo.*` becomes `branch.bar.*`.
+///
+/// `validate_new_branchname()` has already accepted the destination: with no
+/// old ref, a same-name rename is the only way the two can collide and git does
+/// not treat that specially here either.
+fn rename_orphan_branch(
+    repo: &gix::Repository,
+    old: &str,
+    new: &str,
+    old_full: &str,
+    new_full: &str,
+) -> Result<ExitCode> {
+    if old_full == new_full {
+        return Ok(ExitCode::SUCCESS);
+    }
+    move_branch_config(repo, old, new, true)?;
+    let new_name: FullName = new_full
+        .try_into()
+        .map_err(|e| anyhow!("invalid branch name '{new}': {e}"))?;
+    let message = format!("Branch: renamed {old_full} to {new_full}");
+    // `replace_each_worktree_head_symref()` covers the linked worktrees; the
+    // current one's `HEAD` is written here, with no reflog entry because the
+    // branch has no object to log a transition between.
+    let target = repo.head_name()?.map(|n| n.as_bstr() == old_full.as_bytes()).unwrap_or(false);
+    if target {
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: message.clone().into(),
+                },
+                expected: PreviousValue::Any,
+                new: Target::Symbolic(new_name.clone()),
+            },
+            name: "HEAD".try_into().map_err(|e| anyhow!("invalid ref name 'HEAD': {e}"))?,
+            deref: false,
+        })?;
+    }
+    repoint_linked_worktree_heads(
+        repo,
+        old_full,
+        &new_name,
+        ObjectId::null(repo.object_hash()),
+        &message,
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Port of `replace_each_worktree_head_symref()` (`worktree.c`): repoint every
 /// *linked* worktree whose `HEAD` is symbolic to `old_full` at `new_name`,
 /// writing the rename's own message into that worktree's `logs/HEAD`. The
@@ -2709,9 +3175,17 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
+    // `(copy || !(oldref_usage & IS_HEAD))`: for a *copy* the existence check
+    // always runs, and a branch some worktree's `HEAD` is on but that has no
+    // ref yet is "no commit on branch '%s' yet" (builtin/branch.c:610-615).
     let mut old_ref = match repo.try_find_reference(old_full.as_str())? {
         Some(r) => r,
-        None => return fatal(format!("no branch named '{old}'")),
+        None => {
+            return match super::worktree::head_ref_usage(repo, &old_full)? {
+                Some(_) => fatal(format!("no commit on branch '{old}' yet")),
+                None => fatal(format!("no branch named '{old}'")),
+            }
+        }
     };
     // ```c
     // if (!force)
@@ -2988,9 +3462,14 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // RESOLVE_REF_ALLOW_BAD_NAME, &oid, &flags)`: the ref's *recorded* value, with no
         // dereference and no object read. A branch pointing at an object that is not in the
         // repository is still deletable, which is most of the reason `-D` exists.
-        let reference = match repo.try_find_reference(full.as_str())? {
-            Some(r) => r,
-            None => {
+        // `RESOLVE_REF_ALLOW_BAD_NAME` also means a name git would never *write*
+        // still gets a lookup rather than a syntax complaint, so an operand an
+        // `@{…}` rewrite declined to touch — `git branch -D @{upstream}` when
+        // the upstream is a remote-tracking ref — is reported as the ordinary
+        // "not found" at exit 1, not as a ref-name error.
+        let reference = match repo.try_find_reference(full.as_str()) {
+            Ok(Some(r)) => r,
+            Ok(None) | Err(_) => {
                 error_exit(format!("{kind_word} '{name}' not found"))?;
                 status = ExitCode::from(1);
                 continue;

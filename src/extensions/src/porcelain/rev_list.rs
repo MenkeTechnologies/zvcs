@@ -983,7 +983,30 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut grep_pats: Vec<String> = Vec::new();
     let mut author_pats: Vec<String> = Vec::new();
     let mut committer_pats: Vec<String> = Vec::new();
-    let mut dialect = Dialect::Basic;
+    // ```c
+    // if (!strcmp(var, "grep.patterntype")) {
+    //         opt->pattern_type_option = parse_pattern_type_arg(var, value);
+    //         return 0;
+    // }
+    // ```
+    //
+    // (`grep_config()`, grep.c:73-76.) It seeds the same `pattern_type_option` the
+    // dialect flags assign, so config is what the field starts as and `-E`/`-F`/`-P`
+    // below overwrite it. `default` and an unset key fall back to the legacy
+    // `grep.extendedRegexp` boolean (grep.c:497-500).
+    let mut dialect = {
+        let snap = repo.config_snapshot();
+        match snap.string("grep.patternType").map(|v| v.to_string()).as_deref() {
+            Some("basic") => Dialect::Basic,
+            Some("extended") => Dialect::Extended,
+            Some("fixed") => Dialect::Fixed,
+            Some("perl") => Dialect::Perl,
+            _ => match snap.boolean("grep.extendedRegexp") {
+                Some(true) => Dialect::Extended,
+                _ => Dialect::Basic,
+            },
+        }
+    };
     let mut ignore_case = false;
     let mut all_match = false;
     let mut invert_grep = false;

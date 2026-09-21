@@ -75,12 +75,28 @@ static CLI_OVERRIDES: std::sync::OnceLock<Vec<gix::bstr::BString>> = std::sync::
 /// reach the configuration through *both* channels. See [`double_delivered`].
 static DOUBLE_DELIVERED: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
 
+/// The same overrides as `(key, value)` pairs, kept apart from the rendered
+/// `key=value` strings above because the two are not interchangeable: a key may itself
+/// contain an `=`, and re-deriving the pair by splitting the rendered string at its first
+/// `=` then moves those bytes into the value. `--config-env` splits its spec at the LAST
+/// `=` (`git_config_push_env()`, config.c:492) and a new-style `GIT_CONFIG_PARAMETERS`
+/// entry does not split its quoted key at all (`parse_config_env_list()`, config.c:697),
+/// so both can hand over a key like `section.subsection=with=equals.key`.
+static CLI_OVERRIDE_PAIRS: std::sync::OnceLock<Vec<(String, Option<String>)>> =
+    std::sync::OnceLock::new();
+
 /// Record the `-c` overrides for [`discover`]. Called once from the entry point;
 /// later calls are ignored, which is what makes the value stable for the whole
 /// process.
 pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
     let rendered: Vec<gix::bstr::BString> = overrides
         .iter()
+        // `gix`'s override parser splits each entry at its first `=`
+        // (`config::overrides::append()`), so an override whose KEY contains one cannot
+        // be spelled here at all — it would arrive as a shorter key with the rest of it
+        // moved into the value. Those reach the configuration through the
+        // `GIT_CONFIG_KEY_<n>` triple instead, which keeps the two apart.
+        .filter(|o| !o.key.contains('='))
         .map(|o| match &o.value {
             // `-c key=value`.
             Some(v) => format!("{}={}", o.key, v).into(),
@@ -93,6 +109,8 @@ pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
         })
         .collect();
     let _ = CLI_OVERRIDES.set(rendered);
+    let _ = CLI_OVERRIDE_PAIRS
+        .set(overrides.iter().map(|o| (o.key.clone(), o.value.clone())).collect());
     let valued: Vec<(String, String)> = overrides
         .iter()
         .filter_map(|o| o.value.as_ref().map(|v| (o.key.clone(), v.clone())))
@@ -108,20 +126,11 @@ pub fn set_cli_overrides(overrides: &[crate::ConfigOverride]) {
 /// Spelled from what the user typed, not from the snapshot: gitoxide parses a
 /// `Source::Cli` override with its config-file parser, which drops unquoted
 /// trailing blanks and anything after `;` or `#`, while git keeps the value
-/// byte for byte. `git_config_parse_parameter()` splits on the first `=`, so a
-/// key never contains one.
+/// byte for byte. The pair is the one that was recorded, not one re-derived from the
+/// rendered `key=value` string — see [`CLI_OVERRIDE_PAIRS`] for why splitting that back
+/// apart moves an `=` out of the key and into the value.
 pub fn command_line_overrides() -> Vec<(String, Option<String>)> {
-    use gix::bstr::ByteSlice as _;
-
-    CLI_OVERRIDES.get().map_or_else(Vec::new, |overrides| {
-        overrides
-            .iter()
-            .map(|o| match o.split_once_str("=") {
-                Some((k, v)) => (k.to_str_lossy().into_owned(), Some(v.to_str_lossy().into_owned())),
-                None => (o.to_str_lossy().into_owned(), None),
-            })
-            .collect()
-    })
+    CLI_OVERRIDE_PAIRS.get().cloned().unwrap_or_default()
 }
 
 /// The `-c key=value` overrides this process hands to `gix` **twice**.

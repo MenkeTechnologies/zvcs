@@ -550,6 +550,12 @@ pub(crate) fn validate_config_overrides(
 /// on every turn of `run_argv`'s loop whatever the command turns out to be, so
 /// there is no verb to exempt there.
 pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Option<ExitCode> {
+    // A `GIT_CONFIG_PARAMETERS` that did not parse is the same `die()`; its `error:` line
+    // was already printed where the list was read.
+    if BOGUS_CONFIG_PARAMETERS.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("fatal: unable to parse command-line config");
+        return Some(ExitCode::from(fatal::EXIT_FATAL));
+    }
     let reason = overrides
         .iter()
         .find_map(|o| config::check_config_key(&o.key).err())?;
@@ -1371,15 +1377,7 @@ pub(crate) fn system_path(path: &str) -> String {
 /// configuration reaches `gix`, not to this function.
 fn push_config_override(overrides: &mut Vec<ConfigOverride>, over: ConfigOverride) {
     match over.value.as_deref() {
-        Some(value) => {
-            let count: usize = std::env::var("GIT_CONFIG_COUNT")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-            std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), &over.key);
-            std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), value);
-            std::env::set_var("GIT_CONFIG_COUNT", (count + 1).to_string());
-        }
+        Some(value) => push_config_triple(&over.key, value),
         // A valueless key is deliberately kept OUT of the triple. Writing an
         // empty `GIT_CONFIG_VALUE_N` for it is not a neutral encoding: it sets
         // the key to the empty string, which reads as *false* and prints as
@@ -1390,6 +1388,19 @@ fn push_config_override(overrides: &mut Vec<ConfigOverride>, over: ConfigOverrid
     }
     export_config_parameter(&over);
     overrides.push(over);
+}
+
+/// Append one `(key, value)` to the `GIT_CONFIG_COUNT` / `_KEY_<n>` / `_VALUE_<n>`
+/// sequence, the channel that carries the key and the value in separate variables and so
+/// is the only one that can hold a key containing an `=`.
+fn push_config_triple(key: &str, value: &str) {
+    let count: usize = std::env::var("GIT_CONFIG_COUNT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    std::env::set_var(format!("GIT_CONFIG_KEY_{count}"), key);
+    std::env::set_var(format!("GIT_CONFIG_VALUE_{count}"), value);
+    std::env::set_var("GIT_CONFIG_COUNT", (count + 1).to_string());
 }
 
 /// Append one override to `GIT_CONFIG_PARAMETERS`, the channel git itself
@@ -1473,6 +1484,26 @@ fn sq_quote(s: &str) -> String {
 /// A malformed list is git's `error: bogus format in GIT_CONFIG_PARAMETERS`.
 /// Everything parsed before the malformed entry is kept, as in the C, which
 /// pushes each parameter as it reads it.
+/// Set once a `GIT_CONFIG_PARAMETERS` entry does not parse, so the deferred
+/// command-line-config check turns it into the `die()` git raises.
+///
+/// ```c
+/// if (!opts->ignore_cmdline && git_config_from_parameters(fn, data) < 0)
+///         die(_("unable to parse command-line config"));
+/// ```
+///
+/// (`config_with_options()`, config.c:1601-1602.) `parse_config_env_list()`'s
+/// `error()` returns -1 all the way up, so a malformed list is fatal the first time
+/// configuration is read — not, as this port had it, a line on stderr followed by the
+/// command carrying on with whatever parsed before it.
+static BOGUS_CONFIG_PARAMETERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn bogus_config_parameters() {
+    eprintln!("error: bogus format in GIT_CONFIG_PARAMETERS");
+    BOGUS_CONFIG_PARAMETERS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn inherit_config_parameters(overrides: &mut Vec<ConfigOverride>) {
     let Ok(raw) = std::env::var("GIT_CONFIG_PARAMETERS") else { return };
     let mut rest = raw.as_str();
@@ -1482,37 +1513,79 @@ fn inherit_config_parameters(overrides: &mut Vec<ConfigOverride>) {
             return;
         }
         let Some((key, after)) = sq_dequote_step(rest) else {
-            eprintln!("error: bogus format in GIT_CONFIG_PARAMETERS");
+            bogus_config_parameters();
             return;
         };
-        // `'key'` or `'key'=` — git's boolean true, which it holds as a NULL
-        // value. It is encoded here exactly as `push_config_override` encodes a
-        // bare `-c name`, and inherits that encoding's one known gap: the
-        // environment channel cannot say "no value", so this reads back as
-        // false rather than true. Consistent with the `-c` path rather than
-        // adding a second behaviour; see `push_config_override`.
-        let (key, value, next) = match after.strip_prefix('=') {
+        // ```c
+        // if (!cur || isspace(*cur)) {
+        //         /* old-style 'key=value' */
+        //         if (git_config_parse_parameter(key, fn, data) < 0) return -1;
+        // } else if (*cur == '=') {
+        //         /* new-style 'key'='value' */
+        //         …
+        // } else {
+        //         return error(_("bogus format in %s"), CONFIG_DATA_ENVIRONMENT);
+        // }
+        // ```
+        //
+        // (`parse_config_env_list()`, config.c:679-725.) Which form this is decides
+        // whether the key may contain an `=`: only the old style splits the quoted run at
+        // its first `=` (`git_config_push_parameter()`, config.c:466-501), so
+        // `'key.with=equals.newbool'=` is one whole key with no value, while
+        // `'key.with=equals.oldbool'` is `key.with` set to `equals.oldbool`.
+        let (key, value, next) = match after.chars().next() {
             None => (key, None, after),
-            Some(tail) if tail.is_empty() || tail.starts_with(char::is_whitespace) => {
-                (key, None, tail)
+            Some(c) if c.is_whitespace() => (key, None, after),
+            Some('=') => {
+                let tail = &after[1..];
+                match tail.chars().next() {
+                    // `'key'='value'`: a quoted value, which must be followed by
+                    // whitespace or the end of the list.
+                    Some('\'') => {
+                        let Some((value, next)) = sq_dequote_step(tail) else {
+                            bogus_config_parameters();
+                            return;
+                        };
+                        if !next.is_empty() && !next.starts_with(char::is_whitespace) {
+                            bogus_config_parameters();
+                            return;
+                        }
+                        (key, Some(value), next)
+                    }
+                    // `'key'=` — the implicit bool, git's NULL value.
+                    None => (key, None, tail),
+                    Some(c) if c.is_whitespace() => (key, None, tail),
+                    Some(_) => {
+                        bogus_config_parameters();
+                        return;
+                    }
+                }
             }
-            Some(tail) => {
-                let Some((value, next)) = sq_dequote_step(tail) else {
-                    eprintln!("error: bogus format in GIT_CONFIG_PARAMETERS");
-                    return;
-                };
-                (key, Some(value), next)
+            // A closing quote followed by anything else is not a form git knows.
+            Some(_) => {
+                bogus_config_parameters();
+                return;
             }
         };
-        // The older spelling puts the whole pair inside one quoted run.
+        // The old-style spelling puts the whole pair inside one quoted run.
         let (key, value) = match value {
-            None => match key.split_once('=') {
+            None if !after.starts_with('=') => match key.split_once('=') {
                 Some((k, v)) => (k.to_string(), Some(v.to_string())),
                 None => (key, None),
             },
-            some => (key, some),
+            _ => (key, value),
         };
-        push_config_override(overrides, ConfigOverride { key, value });
+        // Already in the environment: this process inherited it, so re-exporting it to
+        // `GIT_CONFIG_PARAMETERS` would hand every child a second copy. A key carrying an
+        // `=` is the one shape `gix`'s CLI-override channel cannot spell (it splits each
+        // entry at the first `=`), so that one is handed over through the triple, which
+        // keeps key and value apart.
+        if key.contains('=') {
+            if let Some(value) = value.as_deref() {
+                push_config_triple(&key, value);
+            }
+        }
+        overrides.push(ConfigOverride { key, value });
         rest = next;
     }
 }

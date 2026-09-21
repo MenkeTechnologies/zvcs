@@ -2252,6 +2252,20 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         println!("First, rewinding head to replay your work on top of it...");
     }
 
+    // `reset_head()` runs before `ORIG_HEAD` is written and before `HEAD` moves,
+    // so a checkout it refuses leaves the repository exactly as it was — which
+    // is why `git rebase --quit` afterwards still says `no rebase in progress`.
+    // See [`detach_blocked`]; the apply backend's wording is its own.
+    if detach_blocked(&repo, &old_index, onto_oid)? {
+        match apply_backend {
+            // `ret = error(_("Could not detach HEAD")); goto cleanup_autostash;`
+            true => eprintln!("error: Could not detach HEAD"),
+            false => eprintln!("error: could not detach HEAD"),
+        }
+        finish_early(&repo, autostash_oid)?;
+        return Ok(ExitCode::from(1));
+    }
+
     // git writes ORIG_HEAD only once it commits to actually rebasing. It is a
     // pseudo-ref, so no reflog is created for it (gix applies git's own
     // `should_autocreate_reflog` rule).
@@ -4544,6 +4558,14 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
     // `onto_name`, not the id), even when `skip_unnecessary_picks()` has advanced the
     // base past it — the entry describes the rebase, not the commit it landed on.
     let onto_label = start.onto_spec.to_string();
+    // `checkout_onto()`'s `reset_head()` gate (sequencer.c:4879-4883): the
+    // sequencer state it has already written is torn down and the autostash put
+    // back, then `error(_("could not detach HEAD"))`. See [`detach_blocked`].
+    if detach_blocked(repo, start.old_index, base)? {
+        eprintln!("error: could not detach HEAD");
+        finish_early(repo, start.autostash)?;
+        return Ok(ExitCode::from(1));
+    }
     write_orig_head(repo, start.state.orig_head)?;
     set_head(
         repo,
@@ -4668,6 +4690,12 @@ fn finish_early(repo: &gix::Repository, autostash: Option<ObjectId>) -> Result<(
 /// state directory stays so `--edit-todo` can fix it, and `HEAD` is detached at
 /// `<onto>` so the two agree.
 fn checkout_onto(repo: &gix::Repository, start: &SequencerStart<'_>) -> Result<()> {
+    // The same `reset_head()` gate the ordinary start goes through: a refused
+    // checkout leaves `ORIG_HEAD` and `HEAD` alone (sequencer.c:4879-4883).
+    if detach_blocked(repo, start.old_index, start.state.onto)? {
+        eprintln!("error: could not detach HEAD");
+        return Ok(());
+    }
     write_orig_head(repo, start.state.orig_head)?;
     set_head(
         repo,
@@ -7019,6 +7047,49 @@ fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()>
     })?;
     super::checkout::record_head_move(repo, from, to, message);
     Ok(())
+}
+
+/// `reset_head()`'s `unpack_trees()` gate, which every rebase start goes
+/// through before it moves anything: a `twoway_merge` from `HEAD`'s tree to
+/// `<onto>`'s with `.update = 1` and `setup_unpack_trees_porcelain(…,
+/// "checkout")` (reset.c:56-146), so `verify_absent()` refuses to write over an
+/// untracked file and `verify_uptodate()` refuses to lose a local change.
+///
+/// ```c
+/// if (reset_head(r, &ropts)) {
+///         apply_autostash(rebase_path_autostash());
+///         sequencer_remove_state(opts);
+///         return error(_("could not detach HEAD"));
+/// }
+/// ```
+///
+/// (sequencer.c:4879-4883 — `checkout_onto()`, the merge backend's start.
+/// builtin/rebase.c:1883-1886 is the apply backend's, whose message is
+/// `Could not detach HEAD`.) Without the gate the rebase detached, checked
+/// `<onto>` out over whatever was in the way, and reported success — an
+/// untracked file destroyed with no way back.
+///
+/// The left-hand tree is the one the *current* `HEAD` names — `repo_get_oid(r,
+/// "HEAD", &head_oid)` at reset.c:118, fed to `fill_tree_descriptor()` at
+/// reset.c:150 — and not the branch being rebased. `git rebase <upstream>
+/// <branch>` does not check `<branch>` out unless it can fast-forward
+/// (builtin/rebase.c:1804-1810), so on the replay path the worktree the detach
+/// must not clobber is still the one it started in.
+///
+/// Reports git's refusal and answers whether the detach is blocked.
+fn detach_blocked(repo: &gix::Repository, old: &gix::index::File, to: ObjectId) -> Result<bool> {
+    // `else if (!oid || !reset_hard) { error(_("could not determine HEAD
+    // revision")); }` — an unborn `HEAD` never reaches a rebase start, so there
+    // is nothing to compare and nothing to refuse.
+    let Ok(head) = repo.head_id() else { return Ok(false) };
+    let from_tree = repo.find_object(head.detach())?.peel_to_tree()?.id;
+    let to_tree = repo.find_object(to)?.peel_to_tree()?.id;
+    let clobber = crate::merge_guard::verify_two_way(repo, from_tree, to_tree, old)?;
+    if clobber.is_empty() {
+        return Ok(false);
+    }
+    clobber.report("checkout");
+    Ok(true)
 }
 
 /// Move a clean worktree and its index from the state captured in `old` to the

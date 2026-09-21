@@ -271,7 +271,10 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
     let mut batch: Option<BatchKind> = None;
     let mut batch_dup = false;
     let mut batch_format: Option<String> = None;
-    let mut buffer = false;
+    // git's `batch.buffer_output`, a tristate: -1 until `--buffer`/`--no-buffer`
+    // is seen (archive of the option table in `cmd_cat_file()`), and *any* of the
+    // two — the negation included — makes the flag a batch-mode-only option.
+    let mut buffer: Option<bool> = None;
     let mut unordered = false;
     let mut nul_in = false;
     let mut nul_out = false;
@@ -372,8 +375,8 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 // known types, which gix cannot decode at all — so there is no
                 // additional behavior to port for the representable domain.
                 "allow-unknown-type" | "no-allow-unknown-type" => {}
-                "buffer" => buffer = true,
-                "no-buffer" => buffer = false,
+                "buffer" => buffer = Some(true),
+                "no-buffer" => buffer = Some(false),
                 "unordered" => unordered = true,
                 "no-unordered" => unordered = false,
                 "follow-symlinks" => follow_symlinks = true,
@@ -488,20 +491,39 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return die_usage(&format!("'{}' is incompatible with batch mode", m.flag()));
     }
 
-    if all_objects && batch.is_none() {
-        return die_usage("'--batch-all-objects' requires a batch mode");
-    }
-
     if path.is_some() && transform.is_none() {
         return die_usage("'--path=<path|tree-ish>' needs '--filters' or '--textconv'");
     }
 
-    // `--follow-symlinks` only shapes a batch stream (it changes how each
-    // `<rev>:<path>` request is resolved). git's `usage_msg_optf` rejects it
-    // outside batch mode; the check sits right after `--path`, mirroring the
-    // order of git's batch-mode-compatibility guards in `cmd_cat_file`.
-    if follow_symlinks && batch.is_none() {
-        return die_usage("'--follow-symlinks' requires a batch mode");
+    // ```c
+    // if (batch.enabled)
+    //         ;
+    // else if (batch.follow_symlinks)
+    //         usage_msg_optf(_("'%s' requires a batch mode"), ..., "--follow-symlinks");
+    // else if (batch.buffer_output >= 0)
+    //         usage_msg_optf(_("'%s' requires a batch mode"), ..., "--buffer");
+    // else if (batch.all_objects)
+    //         usage_msg_optf(_("'%s' requires a batch mode"), ..., "--batch-all-objects");
+    // else if (input_nul_terminated)
+    //         usage_msg_optf(_("'%s' requires a batch mode"), ..., "-z");
+    // else if (nul_terminated)
+    //         usage_msg_optf(_("'%s' requires a batch mode"), ..., "-Z");
+    // ```
+    //
+    // (`cmd_cat_file()`, builtin/cat-file.c:1185-1201.) One chain, in this order,
+    // and it runs *before* the `<object> required with '-e'` arity checks — so
+    // `git cat-file -e --buffer` is diagnosed as the misplaced `--buffer`, not as
+    // a missing operand.
+    if batch.is_none() {
+        if follow_symlinks {
+            return die_usage("'--follow-symlinks' requires a batch mode");
+        }
+        if buffer.is_some() {
+            return die_usage("'--buffer' requires a batch mode");
+        }
+        if all_objects {
+            return die_usage("'--batch-all-objects' requires a batch mode");
+        }
     }
 
     if filter.is_some() && batch.is_none() {
@@ -510,9 +532,8 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
-    // `-z`/`-Z` only shape a batch stream; outside batch mode git rejects them
-    // with `usage_msg_optf`, naming the exact flag that was supplied. This check
-    // follows the `--path`/`--filter` diagnostics, matching git's option order.
+    // The `-z`/`-Z` tail of the chain above, kept after the objects-filter
+    // diagnostic because git runs that one earlier still (builtin/cat-file.c:1160-1167).
     if let Some(flag) = nul_flag {
         if batch.is_none() {
             return die_usage(&format!("'{flag}' requires a batch mode"));
@@ -534,7 +555,10 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             kind,
             batch_format.as_deref(),
             all_objects,
-            buffer,
+            // `if (batch.buffer_output < 0) batch.buffer_output = batch.all_objects;`
+            // (builtin/cat-file.c:1210-1211): `--batch-all-objects` buffers by
+            // default, every other batch does not.
+            buffer.unwrap_or(all_objects),
             unordered,
             nul_in,
             nul_out,
@@ -1080,6 +1104,7 @@ enum Token {
     ObjectSize,
     ObjectSizeDisk,
     DeltaBase,
+    ObjectMode,
     Rest,
 }
 
@@ -1152,6 +1177,7 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
                 has_delta_base = true;
                 Token::DeltaBase
             }
+            b"objectmode" => Token::ObjectMode,
             _ => {
                 // git dies `bad cat-file format: %(<atom>)`.
                 let a = String::from_utf8_lossy(atom);
@@ -1174,6 +1200,7 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
 ///
 /// `disk` is only consulted when the format carries `%(objectsize:disk)`; the
 /// caller passes 0 otherwise rather than paying for the lookup.
+#[allow(clippy::too_many_arguments)]
 fn render_info(
     fmt: &Format,
     oid: &gix::hash::ObjectId,
@@ -1181,6 +1208,7 @@ fn render_info(
     size: u64,
     disk: u64,
     delta_base: &gix::hash::ObjectId,
+    mode: Option<u32>,
     rest: &[u8],
     out: &mut Vec<u8>,
 ) {
@@ -1192,6 +1220,22 @@ fn render_info(
             Token::ObjectSize => out.extend_from_slice(size.to_string().as_bytes()),
             Token::ObjectSizeDisk => out.extend_from_slice(disk.to_string().as_bytes()),
             Token::DeltaBase => out.extend_from_slice(delta_base.to_hex().to_string().as_bytes()),
+            // ```c
+            // } else if (is_atom("objectmode", atom, len)) {
+            //         if (!data->mark_query && !(S_IFINVALID == data->mode))
+            //                 strbuf_addf(sb, "%06o", data->mode);
+            // ```
+            //
+            // (builtin/cat-file.c:360-363.) `expand_data` starts at
+            // `S_IFINVALID` and only a `<rev>:<path>` / `:<path>` operand
+            // replaces it (`data->mode = ctx.mode`, builtin/cat-file.c:629), so
+            // a plain object id — and every `--batch-all-objects` record —
+            // expands the atom to nothing at all, not to `000000`.
+            Token::ObjectMode => {
+                if let Some(mode) = mode {
+                    out.extend_from_slice(format!("{mode:06o}").as_bytes());
+                }
+            }
             Token::Rest => out.extend_from_slice(rest),
         }
     }
@@ -1548,6 +1592,10 @@ fn run_batch(
                 oid,
                 header.kind(),
                 header.size(),
+                // `batch_object_cb()` only sets `data->oid`, so `data->mode`
+                // stays at `EXPAND_DATA_INIT`'s `S_IFINVALID`
+                // (builtin/cat-file.c:643-650).
+                None,
                 b"",
                 want_contents,
                 output_delim,
@@ -1845,7 +1893,15 @@ fn process_request(
     // `fatal: log for 'HEAD' only has 3 entries` rather than reporting one
     // `missing` line — and `get_oid_1()`'s narrower grammar, which has no case for
     // `HEAD^!` and reports it `missing` where gitoxide resolved it.
-    let oid = std::str::from_utf8(name).ok().and_then(|s| crate::objname::resolve(repo, s));
+    // `get_oid_with_context_1()` resolves a path operand through the index or the
+    // tree, neither of which reads the named object — so this lookup answers for
+    // a gitlink whose commit lives in another repository, where the revspec
+    // parser (which insists the object be readable) does not.
+    let name_str = std::str::from_utf8(name).ok();
+    let path_entry = name_str.and_then(|s| operand_path_entry(repo, s));
+    let oid = name_str
+        .and_then(|s| crate::objname::resolve(repo, s))
+        .or_else(|| path_entry.map(|(id, _)| id));
 
     let Some(oid) = oid else {
         // `get_oid_with_context()`'s `SHORT_NAME_AMBIGUOUS` is reported apart from
@@ -1858,9 +1914,32 @@ fn process_request(
         return Ok(EmitOutcome::Ok);
     };
 
+    // `data->mode = ctx.mode` (builtin/cat-file.c:629): the entry mode the
+    // operand's path arm resolved through, which `%(objectmode)` renders.
+    let mode = path_entry.map(|(_, m)| m);
+
     let Ok(header) = repo.find_header(oid) else {
-        out.write_all(name)?;
-        out.write_all(b" missing")?;
+        // ```c
+        // if (ret < 0) {
+        //         if (data->mode == S_IFGITLINK)
+        //                 report_object_status(opt, NULL, &data->oid, "submodule");
+        //         else
+        //                 report_object_status(opt, obj_name, &data->oid, "missing");
+        //         return;
+        // }
+        // ```
+        //
+        // (`batch_object_write()`, builtin/cat-file.c:505-511.) The submodule line
+        // is keyed by the *gitlink's own object id* — `obj_name` is passed NULL,
+        // so `report_object_status()` spells the oid rather than echoing the
+        // operand (builtin/cat-file.c:471).
+        if mode == Some(S_IFGITLINK) {
+            out.write_all(oid.to_hex().to_string().as_bytes())?;
+            out.write_all(b" submodule")?;
+        } else {
+            out.write_all(name)?;
+            out.write_all(b" missing")?;
+        }
         out.write_all(&[delim])?;
         return Ok(EmitOutcome::Ok);
     };
@@ -1883,6 +1962,7 @@ fn process_request(
         oid,
         header.kind(),
         header.size(),
+        mode,
         rest,
         want_contents,
         delim,
@@ -1891,14 +1971,72 @@ fn process_request(
     )
 }
 
+/// git's `oc->mode` after `get_oid_with_context_1()` resolved `spec`
+/// (object-name.c:1743,1811,1852): the entry mode a path operand was found at,
+/// and `None` — git's `S_IFINVALID` — for an operand with no path arm.
+///
+/// `:<stage>:<path>` reads the mode off the index entry (`oc->mode =
+/// ce->ce_mode`, object-name.c:1811); `<rev>:<path>` reads it off the tree entry
+/// `get_tree_entry()` filled in (object-name.c:1852). `:/<text>` is the oneline
+/// search, not a path, and leaves the mode alone.
+fn operand_mode(repo: &gix::Repository, spec: &str) -> Option<u32> {
+    operand_path_entry(repo, spec).map(|(_, mode)| mode)
+}
+
+/// The `(oid, mode)` pair `get_oid_with_context_1()` fills in for a path
+/// operand, looked up the way git does: through the index for `:<stage>:<path>`
+/// and through the tree for `<rev>:<path>`.
+///
+/// Neither lookup reads the named object — `get_tree_entry()` only walks tree
+/// bytes — so a gitlink resolves here even though its commit is in another
+/// repository. That is what lets `batch_object_write()` tell a submodule apart
+/// from a missing object: the odb read fails for both, and only the mode says
+/// which (`if (data->mode == S_IFGITLINK)`, builtin/cat-file.c:506-509).
+fn operand_path_entry(repo: &gix::Repository, spec: &str) -> Option<(gix::hash::ObjectId, u32)> {
+    // git rewrites `./`/`../` path arms before the lookup, so the same rewrite
+    // has to happen here or a relative operand finds no entry.
+    let spec = crate::objpath::canonical_paths(repo, spec).ok()?;
+    match crate::objpath::split(&spec) {
+        crate::objpath::Split::Rev | crate::objpath::Split::Oneline => None,
+        crate::objpath::Split::Index { stage, path } => {
+            let index = repo.index_or_empty().ok()?;
+            index
+                .entries()
+                .iter()
+                .find(|e| e.stage_raw() == u32::from(stage) && e.path(&index) == path.as_bytes())
+                .map(|e| (e.id, e.mode.bits()))
+        }
+        crate::objpath::Split::Tree { rev, path } => {
+            let tree = repo
+                .rev_parse_single(rev)
+                .ok()?
+                .object()
+                .ok()?
+                .peel_to_kind(Kind::Tree)
+                .ok()?
+                .into_tree();
+            let entry = tree.lookup_entry_by_path(path).ok()??;
+            Some((entry.object_id(), u32::from(entry.mode().value())))
+        }
+    }
+}
+
+/// `S_IFGITLINK` (object.h:112): the mode a gitlink tree entry carries, and the
+/// only thing that distinguishes a submodule from a missing object once the odb
+/// read has failed.
+const S_IFGITLINK: u32 = 0o160000;
+
 // ---- `--follow-symlinks` ---------------------------------------------------
 
 /// The outcome of resolving one `<rev>:<path>` request with symlink following,
 /// mirroring git's `get_oid_result` plus the `ctx.mode == 0` symlink-escape case
 /// that `batch_one_object` splits out.
 enum FollowResult {
-    /// An in-tree object was reached (`FOUND`, `mode != 0`).
-    Found(gix::hash::ObjectId),
+    /// An in-tree object was reached (`FOUND`, `mode != 0`). The second field is
+    /// `oc->mode` as `get_tree_entry_follow_symlinks()` left it: `None` where the
+    /// walk never called `find_tree_entry()` and the caller's `S_IFINVALID` stands
+    /// (tree-walk.c:696-700,745-748).
+    Found(gix::hash::ObjectId, Option<u32>),
     /// A symlink pointed outside the tree — an absolute target or `..` past the
     /// root (`FOUND`, `mode == 0`); the payload is the escaped path.
     Symlink(Vec<u8>),
@@ -1959,7 +2097,7 @@ fn emit_follow(
             out.write_all(b"\n")?;
             Ok(EmitOutcome::Ok)
         }
-        FollowResult::Found(oid) => {
+        FollowResult::Found(oid, mode) => {
             let Ok(header) = repo.find_header(oid) else {
                 out.write_all(name)?;
                 out.write_all(b" missing\n")?;
@@ -1982,6 +2120,7 @@ fn emit_follow(
                 oid,
                 header.kind(),
                 header.size(),
+                mode,
                 rest,
                 want_contents,
                 delim,
@@ -2020,7 +2159,9 @@ fn resolve_follow_symlinks(repo: &gix::Repository, name: &[u8]) -> FollowResult 
             .ok()
             .and_then(|s| repo.rev_parse_single(s).ok())
         {
-            Some(id) => FollowResult::Found(id.detach()),
+            // No path arm, so `get_oid_with_context_1()` never reaches the
+            // tree walk and `oc->mode` keeps its `S_IFINVALID`.
+            Some(id) => FollowResult::Found(id.detach(), None),
             None => FollowResult::Missing,
         };
     };
@@ -2060,6 +2201,9 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
     // git's `retval`, which only ever moves from `MISSING_OBJECT` to
     // `DANGLING_SYMLINK` and stays there for the rest of the walk.
     let mut followed = false;
+    // git's `*mode`, which the caller initialised to `S_IFINVALID` and only
+    // `find_tree_entry()` ever writes.
+    let mut mode: Option<u32> = None;
     let miss = |followed: bool| {
         if followed {
             FollowResult::Dangling
@@ -2091,7 +2235,9 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
             let empty = bytes.is_empty();
             parents.push((root, bytes));
             if namebuf.is_empty() {
-                return FollowResult::Found(root);
+                // `oidcpy(result, &root); retval = FOUND;` with `*mode` untouched
+                // (tree-walk.c:696-700).
+                return FollowResult::Found(root, mode);
             }
             if empty {
                 return miss(followed);
@@ -2126,19 +2272,23 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
 
         if namebuf.is_empty() {
             // Reached via a symlink to `dir/..`: the current tree is the answer.
-            return FollowResult::Found(parents.last().unwrap().0);
+            // `*mode` keeps whatever the last `find_tree_entry()` wrote
+            // (tree-walk.c:745-748).
+            return FollowResult::Found(parents.last().unwrap().0, mode);
         }
 
-        let Some((entry_oid, kind)) = find_entry(&parents.last().unwrap().1, component, hash_kind)
+        let Some((entry_oid, kind, entry_mode)) =
+            find_entry(&parents.last().unwrap().1, component, hash_kind)
         else {
             return miss(followed);
         };
         current_tree_oid = entry_oid;
+        mode = Some(entry_mode);
 
         match kind {
             EntryKind::Tree => {
                 if first_slash.is_none() {
-                    return FollowResult::Found(current_tree_oid);
+                    return FollowResult::Found(current_tree_oid, mode);
                 }
                 // Descend: drop `component/` and read the sub-tree next iteration.
                 namebuf.drain(..first_slash.unwrap() + 1);
@@ -2176,7 +2326,7 @@ fn follow_tree(repo: &gix::Repository, tree_id: gix::hash::ObjectId, path: Vec<u
             // Regular file (or, defensively, a gitlink): a terminal entry.
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Commit => {
                 if first_slash.is_none() {
-                    return FollowResult::Found(current_tree_oid);
+                    return FollowResult::Found(current_tree_oid, mode);
                 }
                 return FollowResult::NotDir;
             }
@@ -2191,12 +2341,12 @@ fn find_entry(
     tree_bytes: &[u8],
     component: &[u8],
     hash_kind: gix::hash::Kind,
-) -> Option<(gix::hash::ObjectId, EntryKind)> {
+) -> Option<(gix::hash::ObjectId, EntryKind, u32)> {
     for entry in TreeRefIter::from_bytes(tree_bytes, hash_kind) {
         let entry = entry.ok()?;
         let filename: &[u8] = entry.filename.as_ref();
         if filename == component {
-            return Some((entry.oid.to_owned(), entry.mode.kind()));
+            return Some((entry.oid.to_owned(), entry.mode.kind(), u32::from(entry.mode.value())));
         }
     }
     None
@@ -2212,6 +2362,9 @@ fn emit_object(
     oid: gix::hash::ObjectId,
     kind: Kind,
     size: u64,
+    // git's `data->mode`: the tree (or index) entry mode when the operand named
+    // a path, `None` for the `S_IFINVALID` every other operand leaves behind.
+    mode: Option<u32>,
     rest: &[u8],
     want_contents: bool,
     delim: u8,
@@ -2237,7 +2390,7 @@ fn emit_object(
     } else {
         gix::ObjectId::null(repo.object_hash())
     };
-    render_info(fmt, &oid, kind, size, disk, &delta_base, rest, &mut info);
+    render_info(fmt, &oid, kind, size, disk, &delta_base, mode, rest, &mut info);
     out.write_all(&info)?;
     out.write_all(&[delim])?;
 

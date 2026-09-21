@@ -4,7 +4,7 @@ use bstr::{BStr, ByteSlice};
 
 use crate::{
     Pipeline, driver, eol, ident,
-    pipeline::{WriteObject, util::Configuration},
+    pipeline::{EolConversion, WriteObject, util::Configuration},
     worktree,
 };
 
@@ -25,6 +25,8 @@ pub mod configuration {
 
 ///
 pub mod to_git {
+    use bstr::BString;
+
     /// A function that fills `buf` `fn(&mut buf)` with the data stored in the index of the file that should be converted.
     pub type IndexObjectFn<'a> = dyn FnMut(&mut Vec<u8>) -> Result<Option<()>, gix_object::find::Error> + 'a;
 
@@ -42,6 +44,14 @@ pub mod to_git {
         Configuration(#[from] super::configuration::Error),
         #[error("Copy of driver process output to memory failed")]
         ReadProcessOutputToBuffer(#[from] std::io::Error),
+        /// Port of `die(_("%s: clean filter '%s' failed"))` — convert.c:1441. `apply_filter()`
+        /// answers 0 for every way a clean filter can fail to deliver content — the driver has no
+        /// `clean` command at all (convert.c:1021), the long-running process does not advertise the
+        /// `clean` capability (convert.c:832), it answered `error`/`abort` (convert.c:927-933), or
+        /// the single-file program exited non-zero (convert.c:697) — and a `required` driver turns
+        /// every one of them into this one message.
+        #[error("{rela_path}: clean filter '{driver}' failed")]
+        RequiredCleanFilterFailed { rela_path: BString, driver: BString },
         #[error("Could not allocate buffer")]
         OutOfMemory(#[from] std::collections::TryReserveError),
     }
@@ -49,10 +59,16 @@ pub mod to_git {
 
 ///
 pub mod to_worktree {
+    use bstr::BString;
+
     /// The error returned by [Pipeline::convert_to_worktree()][super::Pipeline::convert_to_worktree()].
     #[derive(Debug, thiserror::Error)]
     #[expect(missing_docs)]
     pub enum Error {
+        /// Port of `die(_("%s: smudge filter %s failed"))` — convert.c:1518. git quotes the driver
+        /// name in the clean message and leaves it bare here; that asymmetry is git's own text.
+        #[error("{rela_path}: smudge filter {driver} failed")]
+        RequiredSmudgeFilterFailed { rela_path: BString, driver: BString },
         #[error(transparent)]
         Ident(#[from] crate::ident::apply::Error),
         #[error(transparent)]
@@ -98,8 +114,13 @@ impl Pipeline {
         )?;
 
         let mut in_src_buffer = false;
+        // `if (!(conv_flags & CONV_EOL_KEEP_CRLF))` — convert.c:1455. With the flag set the
+        // end-of-line half of the conversion is skipped whole, so nothing here may estimate that
+        // it would run either.
+        let convert_eol = self.options.eol_conversion == EolConversion::Apply;
         // this is just an approximation, but it's as good as it gets without reading the actual input.
-        let would_convert_eol = eol::convert_to_git(
+        let would_convert_eol = convert_eol
+            && eol::convert_to_git(
             b"\r\n",
             digest,
             &mut self.bufs.dest,
@@ -111,21 +132,53 @@ impl Pipeline {
         )?;
 
         if let Some(driver) = driver {
-            if let Some(mut read) = self.processes.apply(
-                driver,
-                &mut src,
-                driver::Operation::Clean,
-                self.context.with_path(bstr_rela_path.as_ref()),
-            )? {
-                if !apply_ident_filter && encoding.is_none() && !would_convert_eol {
-                    // Note that this is not typically a benefit in terms of saving memory as most filters
-                    // aren't expected to make the output file larger. It's more about who is waiting for the filter's
-                    // output to arrive, which won't be us now. For `git-lfs` it definitely won't matter though.
-                    return Ok(ToGitOutcome::Process(read));
+            // `convert_to_git()` hands `apply_filter()` a buffer it still owns, so a filter that
+            // answers 0 — it failed, or it never ran — leaves `dst` untouched and the original
+            // content is what the rest of the conversion sees (convert.c:1436-1445). Buffering
+            // `src` up front keeps that fallback available once `apply()` has consumed the reader,
+            // and it is what lets a `required` driver's failure be named with its path below.
+            self.bufs.clear();
+            src.read_to_end(&mut self.bufs.src)?;
+            in_src_buffer = true;
+
+            let filtered = {
+                let mut original = self.bufs.src.as_slice();
+                match self.processes.apply(
+                    driver,
+                    &mut original,
+                    driver::Operation::Clean,
+                    self.context.with_path(bstr_rela_path.as_ref()),
+                ) {
+                    Ok(Some(mut read)) => {
+                        if !driver.required && !apply_ident_filter && encoding.is_none() && !would_convert_eol {
+                            // Note that this is not typically a benefit in terms of saving memory as most filters
+                            // aren't expected to make the output file larger. It's more about who is waiting for the filter's
+                            // output to arrive, which won't be us now. For `git-lfs` it definitely won't matter though.
+                            // A `required` driver cannot take this exit: its failure has to be seen here to be
+                            // reported as git reports it, and only reading the output to its end reveals one.
+                            return Ok(ToGitOutcome::Process(read));
+                        }
+                        let mut filtered = Vec::new();
+                        read.read_to_end(&mut filtered).ok().map(|_| filtered)
+                    }
+                    // Every one of these is `apply_filter()` answering 0: no `clean` command, a
+                    // process without the `clean` capability, or a driver that failed. Whatever
+                    // explains it is already on stderr, printed where git prints it.
+                    Ok(None) | Err(_) => None,
                 }
-                self.bufs.clear();
-                read.read_to_end(&mut self.bufs.src)?;
-                in_src_buffer = true;
+            };
+            match filtered {
+                Some(filtered) => self.bufs.src = filtered,
+                // `if (!ret && ca.drv && ca.drv->required)` — convert.c:1441. Without `required`
+                // the buffered original stands in for the filter's output, which is exactly what
+                // git's untouched `dst` leaves behind.
+                None if driver.required => {
+                    return Err(to_git::Error::RequiredCleanFilterFailed {
+                        rela_path: bstr_rela_path.into_owned(),
+                        driver: driver.name.clone(),
+                    });
+                }
+                None => {}
             }
         }
         if !in_src_buffer && (apply_ident_filter || encoding.is_some() || would_convert_eol) {
@@ -164,16 +217,18 @@ impl Pipeline {
             }
         }
 
-        if eol::convert_to_git(
-            &self.bufs.src,
-            digest,
-            &mut self.bufs.dest,
-            &mut |buf| index_object(buf),
-            eol::convert_to_git::Options {
-                round_trip_check: self.options.crlf_roundtrip_check.to_eol_roundtrip_check(rela_path),
-                config: self.options.eol_config,
-            },
-        )? {
+        if convert_eol
+            && eol::convert_to_git(
+                &self.bufs.src,
+                digest,
+                &mut self.bufs.dest,
+                &mut |buf| index_object(buf),
+                eol::convert_to_git::Options {
+                    round_trip_check: self.options.crlf_roundtrip_check.to_eol_roundtrip_check(rela_path),
+                    config: self.options.eol_config,
+                },
+            )?
+        {
             self.bufs.swap();
         }
 
@@ -235,14 +290,43 @@ impl Pipeline {
 
         if let Some(driver) = driver {
             let (mut src, _dest) = bufs.src_and_dest();
-            if let Some(maybe_delayed) = self.processes.apply_delayed(
+            match self.processes.apply_delayed(
                 driver,
                 &mut src,
                 driver::Operation::Smudge,
                 can_delay,
                 self.context.with_path(rela_path),
-            )? {
-                return Ok(ToWorktreeOutcome::Process(maybe_delayed));
+            ) {
+                Ok(Some(driver::apply::MaybeDelayed::Immediate(mut read))) if driver.required => {
+                    // `apply_single_file_filter()` collects the whole result before it can tell
+                    // whether the filter succeeded (convert.c:728-742), so a `required` smudge
+                    // driver's failure has to be seen here rather than handed to the caller as a
+                    // stream that fails halfway through — git names the path and the driver
+                    // (convert.c:1517-1518) and nothing else does.
+                    let mut filtered = Vec::new();
+                    if read.read_to_end(&mut filtered).is_err() {
+                        return Err(to_worktree::Error::RequiredSmudgeFilterFailed {
+                            rela_path: rela_path.to_owned(),
+                            driver: driver.name.clone(),
+                        });
+                    }
+                    drop(read);
+                    let (_src, dest) = bufs.src_and_dest();
+                    *dest = filtered;
+                    bufs.swap();
+                    return Ok(ToWorktreeOutcome::Buffer(bufs.src));
+                }
+                Ok(Some(maybe_delayed)) => return Ok(ToWorktreeOutcome::Process(maybe_delayed)),
+                // `apply_filter()` answering 0 — see the `clean` side. The content already in
+                // `bufs` is the fallback, and `required` turns the failure into git's message
+                // (`if (!ret_filter && ca->drv && ca->drv->required)`, convert.c:1517-1518).
+                Ok(None) | Err(_) if driver.required => {
+                    return Err(to_worktree::Error::RequiredSmudgeFilterFailed {
+                        rela_path: rela_path.to_owned(),
+                        driver: driver.name.clone(),
+                    });
+                }
+                Ok(None) | Err(_) => {}
             }
         }
 

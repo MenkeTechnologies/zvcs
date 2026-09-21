@@ -135,6 +135,9 @@ impl<'repo> Pipeline<'repo> {
             // this off through [`gix_filter::Pipeline::options_mut()`], the same way it turns off
             // the `core.safecrlf` round-trip check.
             write_object: gix_filter::pipeline::WriteObject::Yes,
+            // `CONV_EOL_KEEP_CRLF` is `git apply`'s alone (`read_old_data()`, apply.c:2404), and it
+            // turns this off through [`gix_filter::Pipeline::options_mut()`].
+            eol_conversion: gix_filter::pipeline::EolConversion::Apply,
             object_hash: repo.object_hash(),
         })
     }

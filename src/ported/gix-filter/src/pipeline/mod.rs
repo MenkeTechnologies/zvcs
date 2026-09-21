@@ -50,9 +50,26 @@ pub enum WriteObject {
     No,
 }
 
+/// Whether the end-of-line half of a conversion to git runs at all.
+///
+/// Port of `CONV_EOL_KEEP_CRLF` — `convert.h:16`, tested at `convert.c:1455`. Only `git apply`
+/// sets it, for a patch whose pre-image lines already end `\r\n` (`read_old_data()`,
+/// `apply.c:2404-2405`): the file on disk is CRLF and the patch was made against a CRLF file, so
+/// normalizing it would make every context line miss.
+#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum EolConversion {
+    /// Run `crlf_to_git()` as the attributes and configuration ask — every caller but `git apply`.
+    #[default]
+    Apply,
+    /// Leave line endings as they stand; `clean`, `working-tree-encoding` and `ident` still run.
+    KeepCrlf,
+}
+
 /// Additional configuration for the filter pipeline.
 #[derive(Default, Clone)]
 pub struct Options {
+    /// Whether to convert line endings on the way into git at all; see [`EolConversion`].
+    pub eol_conversion: EolConversion,
     /// Available (external) driver programs to invoke if attributes for path configure them.
     pub drivers: Vec<Driver>,
     /// Global options to configure end-of-line conversions, to worktree or to git.

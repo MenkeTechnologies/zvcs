@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::Read, sync::Arc};
 
-use bstr::{BStr, BString};
+use bstr::{BStr, BString, ByteSlice};
 
 use crate::{
     Driver, driver,
@@ -119,10 +119,11 @@ impl State {
                 // Solution: Read all data into a buffer, then spawn a thread to write it to stdin
                 // while we can immediately read from stdout.
                 //
-                // TODO(perf): This keeps the entire input in memory until the writer is done. For
-                // required drivers, output remains streamed; for non-required drivers, the input is
-                // retained as a fallback while the entire output is buffered, making peak storage
-                // approximately input plus output (the `Arc` clone does not copy the input). Git's
+                // TODO(perf): This keeps the entire input in memory until the writer is done. The
+                // input is retained as a fallback while the entire output is buffered, making peak
+                // storage approximately input plus output (the `Arc` clone does not copy the input).
+                // git pays the same price — `apply_single_file_filter()` collects the whole result
+                // into a `strbuf` before it can tell whether the filter succeeded. Git's
                 // `apply_single_file_filter()` can instead have its async worker copy directly from
                 // an input file descriptor while the main thread reads output
                 // (`convert.c::filter_buffer_or_fd()`), avoiding an input-sized allocation in that
@@ -132,14 +133,23 @@ impl State {
 
                 let stdin = child.stdin.take().expect("configured");
                 let input_data: Arc<[u8]> = input_data.into();
-                let fallback = (!driver.required).then(|| Arc::clone(&input_data));
+                let fallback = Arc::clone(&input_data);
                 let write_thread = WriterThread::write_all_in_background(input_data, stdin)?;
 
                 Ok(Some(MaybeDelayed::Immediate(Box::new(ReadFilterOutput {
                     inner: child.stdout.take(),
                     child: Some((child, command)),
                     write_thread: Some(write_thread),
-                    fallback,
+                    fallback: Some(fallback),
+                    // `error()` in `filter_buffer_or_fd()`/`apply_single_file_filter()` names the
+                    // command as configured, before `%f` substitution (convert.c:694, 729-735, where
+                    // `params->cmd` is `drv->clean`/`drv->smudge` itself).
+                    cmd: match operation {
+                        Operation::Clean => driver.clean.clone(),
+                        Operation::Smudge => driver.smudge.clone(),
+                    }
+                    .unwrap_or_default(),
+                    required: driver.required,
                     buffered: None,
                 }))))
             }
@@ -200,6 +210,13 @@ impl State {
                         }
                         "error" => {}
                         _strange => {
+                            // `handle_filter_error()` reports only this branch — a broken protocol —
+                            // on stderr; `error` and `abort` are the filter's own, documented answers
+                            // and stay silent (convert.c:776-793).
+                            eprintln!(
+                                "error: external filter '{}' failed",
+                                driver.process.as_ref().map_or("".into(), |cmd| cmd.as_bstr())
+                            );
                             let client = self.running.remove(&key.0).expect("we definitely have it");
                             client.into_child().kill().ok();
                         }
@@ -284,9 +301,13 @@ struct ReadFilterOutput {
     child: Option<(std::process::Child, std::process::Command)>,
     /// The thread writing to stdin, if any. Must be joined when reading is done.
     write_thread: Option<WriterThread>,
-    /// Original input to return if a non-required driver fails.
+    /// Original input to return if a non-required driver fails. Taken once the run is finished.
     fallback: Option<Arc<[u8]>>,
-    /// Fully buffered output of a non-required driver, or its original input after failure.
+    /// The driver command as configured, for the `error()` messages git prints (convert.c:694, 735).
+    cmd: BString,
+    /// Whether a failure is fatal to the caller rather than a silent fallback to `fallback`.
+    required: bool,
+    /// Fully buffered output of the driver, or its original input after failure.
     buffered: Option<std::io::Cursor<BufferedOutput>>,
 }
 
@@ -305,9 +326,15 @@ impl AsRef<[u8]> for BufferedOutput {
 }
 
 impl ReadFilterOutput {
-    /// Buffer all output to verify that the non-required driver succeeded before exposing it,
-    /// falling back to the original input if reading, writing, or the process itself fails.
-    fn buffer_non_required_driver(&mut self, fallback: Arc<[u8]>) -> &mut std::io::Cursor<BufferedOutput> {
+    /// Buffer all output to verify that the driver succeeded before exposing it, exactly as
+    /// `apply_single_file_filter()` collects the whole result with `strbuf_read()` and only then
+    /// decides whether to hand it to the caller (convert.c:728-742).
+    ///
+    /// On failure the original input takes the place of the output, which is what git's caller sees:
+    /// a filter that returns 0 leaves `dst` untouched and `convert_to_git()` keeps using `src`
+    /// (convert.c:1440). A `required` driver has no such fallback — the failure is returned so the
+    /// caller can `die()` with the path and driver name (convert.c:1441).
+    fn buffer_driver_output(&mut self, fallback: Arc<[u8]>) -> std::io::Result<&mut std::io::Cursor<BufferedOutput>> {
         let mut output = Vec::new();
         let read_result = self.inner.take().expect("configured").read_to_end(&mut output);
         let write_result = self.write_thread.take().map_or(Ok(()), |mut thread| thread.join());
@@ -320,8 +347,8 @@ impl ReadFilterOutput {
             Ok(()) => true,
             Err(err) => err.kind() == std::io::ErrorKind::BrokenPipe,
         };
-        let succeeded =
-            read_result.is_ok() && write_succeeded && status.as_ref().is_ok_and(std::process::ExitStatus::success);
+        let exited_well = status.as_ref().is_ok_and(std::process::ExitStatus::success);
+        let succeeded = read_result.is_ok() && write_succeeded && exited_well;
 
         if !succeeded {
             gix_trace::debug!(
@@ -329,15 +356,39 @@ impl ReadFilterOutput {
                 ?read_result,
                 ?write_result,
                 ?status,
-                "Non-required filter driver failed; using original input"
+                "Filter driver failed; using original input"
             );
+            let cmd = &self.cmd;
+            // The order and the wording are git's: the async half reports the child first
+            // (convert.c:687, 694), the parent half second (convert.c:729-735).
+            if !write_succeeded {
+                eprintln!("error: cannot feed the input to external filter '{cmd}'");
+            }
+            if let Ok(status) = &status {
+                if !status.success() {
+                    eprintln!(
+                        "error: external filter '{cmd}' failed {}",
+                        status.code().unwrap_or(-1)
+                    );
+                }
+            }
+            if read_result.is_err() {
+                eprintln!("error: read from external filter '{cmd}' failed");
+            }
+            eprintln!("error: external filter '{cmd}' failed");
         }
         self.buffered = Some(std::io::Cursor::new(if succeeded {
             BufferedOutput::Filtered(output)
         } else {
             BufferedOutput::Original(fallback)
         }));
-        self.buffered.as_mut().expect("just initialized")
+        if !succeeded && self.required {
+            return Err(std::io::Error::other(format!(
+                "external filter '{}' failed",
+                self.cmd
+            )));
+        }
+        Ok(self.buffered.as_mut().expect("just initialized"))
     }
 }
 
@@ -355,47 +406,7 @@ impl std::io::Read for ReadFilterOutput {
         if let Some(buffered) = self.buffered.as_mut() {
             return buffered.read(buf);
         }
-        if let Some(fallback) = self.fallback.take() {
-            return self.buffer_non_required_driver(fallback).read(buf);
-        }
-
-        match self.inner.as_mut() {
-            Some(inner) => {
-                let num_read = match inner.read(buf) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        // On read error, ensure we join the writer thread before propagating the error.
-                        // This is expected to finish with failure as well as it should fail to write
-                        // to the process which now fails to produce output (that we try to read).
-                        if let Some(mut write_thread) = self.write_thread.take() {
-                            // Try to join but prioritize the original read error
-                            if let Err(_thread_err) = write_thread.join() {
-                                gix_trace::debug!(thread_err = %_thread_err, read_err = %e, "write to stdin error during failed read");
-                            }
-                        }
-                        return Err(e);
-                    }
-                };
-
-                if num_read == 0 {
-                    self.inner.take();
-
-                    // Join the writer thread first to ensure all data has been written
-                    // and that resources are freed now.
-                    let write_result = self.write_thread.take().map_or(Ok(()), |mut thread| thread.join());
-
-                    if let Some((mut child, cmd)) = self.child.take() {
-                        let status = child.wait()?;
-                        if !status.success() {
-                            return Err(std::io::Error::other(format!("Driver process {cmd:?} failed")));
-                        }
-                    }
-
-                    write_result?;
-                }
-                Ok(num_read)
-            }
-            None => Ok(0),
-        }
+        let fallback = self.fallback.take().expect("set when the child was spawned");
+        self.buffer_driver_output(fallback)?.read(buf)
     }
 }

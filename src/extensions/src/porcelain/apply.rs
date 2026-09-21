@@ -1392,6 +1392,27 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // the mode the pre-image actually has (apply.c:3896).
     let trust_exec = trust_executable_bit(idx_repo.as_ref());
 
+    // `read_old_data()` (apply.c:2401-2427) runs every pre-image it reads off disk through
+    // `convert_to_git()`, so a `clean` driver, a `working-tree-encoding`, `ident` and the
+    // `text`/`core.autocrlf` normalization all see the file the way the patch does. Without it a
+    // patch made against the normalized content misses every context line of a CRLF working copy.
+    //
+    // Discovery is best effort for the same reason the smudge side's is: `git apply` runs outside a
+    // repository, where there are no attributes and no configuration to convert by, and a command
+    // that worked there must not start failing.
+    let preimage_repo_owned = if idx_repo.is_none() {
+        crate::setup::discover().ok()
+    } else {
+        None
+    };
+    let preimage_repo = idx_repo
+        .as_ref()
+        .or(preimage_repo_owned.as_ref())
+        .filter(|repo| repo.workdir().is_some());
+    // One pipeline per `conv_flags` value `read_old_data()` can pass — `CONV_EOL_RENORMALIZE` and
+    // `CONV_EOL_KEEP_CRLF` (apply.c:2404-2405) — built when a patch first needs it.
+    let mut preimage_filters: [Option<super::convert_to_git::WorktreeFilter>; 2] = [None, None];
+
     // ---- check phase: build every result in memory, touching nothing --------
     let mut staged: HashMap<String, Option<Vec<u8>>> = HashMap::new();
     // `previous->new_mode` for a path an earlier patch in this same run created
@@ -1463,7 +1484,32 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             Vec::new()
         } else {
             let old = p.old_name.as_deref().unwrap_or_default();
-            match read_preimage(&staged, idx_view, o.cached, old, p.is_rename) {
+            // `patch->crlf_in_old` (apply.c:1720): set while parsing, so it is settled for the
+            // whole patch before the first hunk is matched.
+            let keep_crlf = patch_ws_rule(p, 0) & super::diff_color::WS_CR_AT_EOL != 0;
+            let slot = &mut preimage_filters[usize::from(keep_crlf)];
+            let mut convert = |path: &str, bytes: Vec<u8>| -> Vec<u8> {
+                let Some(repo) = preimage_repo else { return bytes };
+                // `case S_IFLNK` returns the link target unconverted (apply.c:2407-2410).
+                if std::fs::symlink_metadata(path).is_ok_and(|md| md.file_type().is_symlink()) {
+                    return bytes;
+                }
+                let filter = match &mut *slot {
+                    Some(filter) => filter,
+                    none => {
+                        match super::convert_to_git::WorktreeFilter::for_apply_preimage(repo, keep_crlf)
+                        {
+                            Ok(filter) => none.insert(filter),
+                            // `convert_to_git()` cannot fail the command from here: `read_old_data()`
+                            // ignores its answer entirely (apply.c:2422-2423).
+                            Err(_) => return bytes,
+                        }
+                    }
+                };
+                let rela = std::path::Path::new(path);
+                filter.convert(repo, rela, &bytes).unwrap_or(bytes)
+            };
+            match read_preimage(&staged, idx_view, o.cached, old, &mut convert, p.is_rename) {
                 PreRead::Found(bytes) => {
                     // apply.c:3862 / :3884-3885 / :3892-3902, in that order: an
                     // earlier patch's result, then the index entry under
@@ -2499,6 +2545,10 @@ fn read_preimage(
     idx: Option<(&gix::Repository, &gix::index::File)>,
     cached: bool,
     old: &str,
+    // `read_old_data()`'s `convert_to_git()` (apply.c:2422), applied to the bytes it just read
+    // off disk. Only that branch converts: `--cached`/`--index` take their pre-image from the
+    // index, where the content is already in git's representation.
+    convert: &mut dyn FnMut(&str, Vec<u8>) -> Vec<u8>,
     // `previous_patch()` (apply.c:3505) returns NULL outright for a rename or copy —
     // "git patches do not depend on the order" — so those read their pre-image from
     // the worktree or the index as it stands, never from an earlier patch's result.
@@ -2558,7 +2608,10 @@ fn read_preimage(
             PreRead::Found(bytes)
         }
         None => match read_current(staged, old) {
-            Some(bytes) => PreRead::Found(bytes),
+            // An image an earlier patch in this run left behind is already converted, so only
+            // a genuine read from the working tree goes through `read_old_data()`.
+            Some(bytes) if staged.contains_key(old) => PreRead::Found(bytes),
+            Some(bytes) => PreRead::Found(convert(old, bytes)),
             None => PreRead::MissingWorktree,
         },
     }

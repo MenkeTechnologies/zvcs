@@ -60,6 +60,28 @@ impl WorktreeFilter {
         })
     }
 
+    /// The pipeline `git apply` reads a worktree pre-image through — `read_old_data()`,
+    /// apply.c:2401-2427.
+    ///
+    /// It passes `istate = NULL` deliberately ("git apply" without "--index/--cached" should never
+    /// look at the index), which is what `renormalize` models here: no index version of the file is
+    /// offered, so `crlf_to_git()`'s `has_crlf_in_index()` guard cannot fire. `keep_crlf` is
+    /// `patch->crlf_in_old` (apply.c:2404): when the patch's own context and removed lines already
+    /// end `\r\n`, the end-of-line conversion is skipped whole, because normalizing a CRLF file
+    /// the patch was made against would make every one of those lines miss.
+    ///
+    /// The round-trip check is off: the flags `read_old_data()` passes carry neither
+    /// `CONV_EOL_RNDTRP_WARN` nor `CONV_EOL_RNDTRP_DIE`, and nothing here is written to the object
+    /// database.
+    pub(super) fn for_apply_preimage(repo: &gix::Repository, keep_crlf: bool) -> Result<Self> {
+        let mut filter = Self::new(repo, false, true)?;
+        if keep_crlf {
+            filter.pipeline.options_mut().eol_conversion =
+                gix::filter::plumbing::pipeline::EolConversion::KeepCrlf;
+        }
+        Ok(filter)
+    }
+
     /// Convert the worktree bytes of `rela_path` to their stored form.
     ///
     /// Under `--renormalize` the `text=auto` guard is switched off: git normally

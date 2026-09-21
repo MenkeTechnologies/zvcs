@@ -334,8 +334,21 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         &index,
         gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
     )?;
+    // The only conversion *to* git this command performs is the racy-entry content compare in
+    // [`worktree_blob_id`], which is `ce_compare_data()` -> `index_fd(..., flags = 0)`
+    // (read-cache.c:210-221). `get_conv_flags(0)` answers a plain 0 (object-file.c:33-41): neither
+    // `global_conv_flags_eol` nor `CONV_WRITE_OBJECT`, because nothing here is being stored. So the
+    // `core.safecrlf` round-trip check must not run — `git checkout-index` never warns that a
+    // working-copy file's line endings would change — and a `working-tree-encoding` that cannot be
+    // decoded is reported rather than fatal.
+    let mut pipeline = gix::filter::Pipeline::new(&repo, cache.detach())?;
+    {
+        let options = pipeline.options_mut();
+        options.crlf_roundtrip_check = gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
+        options.write_object = gix::filter::plumbing::pipeline::WriteObject::No;
+    }
     let mut ctx = Ctx {
-        pipeline: gix::filter::Pipeline::new(&repo, cache.detach())?,
+        pipeline,
         filter_index: crate::index_open::or_empty(&repo)?,
         repo: &repo,
         workdir,
@@ -665,11 +678,21 @@ fn write_entry(ctx: &mut Ctx<'_>, ents: &[Ent], idx: usize, to_tempfile: bool) -
         Mode::FILE | Mode::FILE_EXECUTABLE => {
             let blob = ctx.repo.find_object(ent.id)?.data.clone();
             let rela = ent.path.clone();
-            let mut converted = ctx.pipeline.convert_to_worktree(
+            // `convert_to_working_tree()` reports a failed `required` smudge driver with
+            // `die()` (convert.c:1517-1518), which is `fatal:` and exit 128 — not a per-entry
+            // `error:` that lets the walk carry on, and not this command's own exit 1. git leaves
+            // the entries it already wrote behind, so nothing is undone here either.
+            let mut converted = match ctx.pipeline.convert_to_worktree(
                 &blob,
                 rela.as_bstr(),
                 gix::filter::plumbing::driver::apply::Delay::Forbid,
-            )?;
+            ) {
+                Ok(converted) => converted,
+                Err(err) => {
+                    eprintln!("fatal: {err}");
+                    std::process::exit(128);
+                }
+            };
             let mut data = Vec::new();
             std::io::copy(&mut converted, &mut data)?;
             drop(converted);

@@ -173,7 +173,18 @@ pub(crate) mod function {
         }
 
         let encoding = crate::worktree::encoding::for_label(src_encoding).map_err(|_| unavailable())?;
-        encode_to_git(src, encoding, buf, round_trip)?;
+        // git's decoder is `iconv`, which answers NULL for anything it cannot turn into UTF-8, and
+        // `encode_to_git()` reports every one of those the same way — `failed to encode '%s' from
+        // %s to %s` (convert.c:416-429). `encoding_rs` splits that single answer in two, and it
+        // accepts byte pairs `iconv` rejects (SHIFT-JIS 0x8790, 0xfa54, 0xfa5b, 0xeeef among them),
+        // catching them one step later in the round-trip check instead. git's own note at
+        // convert.c:445-447 records that its round-trip `die()` has no reachable case precisely
+        // because "iconv errors are already caught above", so the message for all of these is the
+        // `failed to encode` one, whichever half of the port noticed.
+        encode_to_git(src, encoding, buf, round_trip).map_err(|err| match err {
+            Error::Malformed { .. } | Error::Overflow { .. } | Error::RoundTrip { .. } => unavailable(),
+            other => other,
+        })?;
         Ok(true)
     }
 

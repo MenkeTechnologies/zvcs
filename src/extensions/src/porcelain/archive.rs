@@ -727,6 +727,16 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // `parsed` keeps the individual patterns so the "did not match" check can
     // test each one independently, the way git's `path_exists()` does.
     let root = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_path_buf();
+    // Every refusal `parse_pathspec()` can raise, in git's order and git's words
+    // (pathspec.c:637-668). Reporting gitoxide's own `Display` instead put
+    // `fatal: Found "bogus" in signature, which is not a valid keyword` where git
+    // says `fatal: Invalid pathspec magic 'bogus' in ':(bogus)x'`, and turned the
+    // three-operand "is outside repository" die into a bare
+    // `The path '..' leaves the repository`.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &opts.paths) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
     let parsed: Vec<gix::pathspec::Pattern> = if opts.paths.is_empty() {
         Vec::new()
     } else {
@@ -735,8 +745,14 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         for spec in &opts.paths {
             match gix::pathspec::parse(spec.as_bytes(), defaults) {
                 Ok(p) => patterns.push(p),
+                // Unreachable behind the gate above, which already died on
+                // everything both parsers refuse; translated rather than shown raw
+                // so it cannot become a second wording if they ever diverge.
                 Err(e) => {
-                    eprintln!("fatal: {e}");
+                    eprintln!(
+                        "fatal: {}",
+                        crate::pathspec::parse_error_message(spec.as_str().into(), &e)
+                    );
                     return Ok(ExitCode::from(128));
                 }
             }

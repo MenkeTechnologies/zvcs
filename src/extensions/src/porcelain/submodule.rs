@@ -35,13 +35,9 @@ fn usage_exit() -> Result<ExitCode> {
 
 /// git rejects an empty pathspec while parsing one, before any listing happens.
 fn reject_empty_pathspec(patterns: &[BString]) -> Option<ExitCode> {
-    if patterns.iter().any(|p| p.is_empty()) {
-        eprintln!(
-            "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
-        );
-        return Some(ExitCode::from(128));
-    }
-    None
+    let msg = crate::pathspec::empty_element_fatal(patterns)?;
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(128))
 }
 
 /// The subcommand names stock git recognizes after the global flags. Anything

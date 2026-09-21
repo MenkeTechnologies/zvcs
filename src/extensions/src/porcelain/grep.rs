@@ -1292,8 +1292,24 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     if let Some(msg) = crate::pathspec::global_magic_fatal() {
         return Err(crate::fatal::die(msg));
     }
-    if let Some(msg) = crate::pathspec::first_magic_fatal(&specs, pathspec_defaults) {
-        return Err(crate::fatal::die(msg));
+    match repo.as_ref() {
+        // Inside a repository `init_pathspec_item()`'s second `die()` applies too:
+        // an element that resolves above the work tree is
+        // `<elt>: '<copyfrom>' is outside repository at '<worktree>'`
+        // (pathspec.c:500-501), not gitoxide's "Could not obtain the repository
+        // prefix …" at exit 1.
+        Some(repo) => {
+            if let Some(msg) = crate::pathspec::parse_pathspec_fatal(repo, &specs) {
+                return Err(crate::fatal::die(msg));
+            }
+        }
+        // `--no-index` outside a repository: there is nothing to be outside of, so
+        // only the parse itself can refuse.
+        None => {
+            if let Some(msg) = crate::pathspec::first_magic_fatal(&specs, pathspec_defaults) {
+                return Err(crate::fatal::die(msg));
+            }
+        }
     }
 
     // The repo-root-relative prefix of the current directory. It scopes a bare

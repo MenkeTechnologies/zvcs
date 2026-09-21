@@ -6220,23 +6220,18 @@ fn pad(buf: &mut Vec<u8>, n: usize) {
 /// Turn a CWD-relative user path into a repo-root-relative path, so blame works
 /// from any subdirectory of the worktree (git resolves pathspecs the same way).
 fn repo_relative_path(repo: &gix::Repository, user_path: &str) -> Result<String> {
-    let joined = match repo.workdir() {
-        Some(workdir) => {
-            let cwd = std::env::current_dir()?;
-            let workdir_abs = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
-            let cwd_abs = cwd.canonicalize().unwrap_or(cwd);
-            match cwd_abs.strip_prefix(&workdir_abs) {
-                Ok(prefix) => prefix.join(user_path),
-                Err(_) => PathBuf::from(user_path),
-            }
-        }
-        None => PathBuf::from(user_path),
-    };
-
-    let s = joined
-        .to_str()
-        .ok_or_else(|| anyhow!("path is not valid UTF-8: {user_path}"))?;
-    Ok(s.strip_prefix("./").unwrap_or(s).to_string())
+    // `add_prefix()` is `prefix_path(repo, prefix, strlen(prefix), path)`
+    // (builtin/blame.c:709-712) — `prefix_path()`, not `parse_pathspec()`, so no
+    // magic is read and the die has two operands rather than three. This used to
+    // join the prefix by hand and stop there: `.` and `..` inside the path were
+    // never folded (`sub/../a.txt` was "no such path" where git blames `a.txt`),
+    // and an element that climbed out of the work tree reached the object lookup
+    // and became `no such path '..' in HEAD` instead of
+    // `'..' is outside repository at '<worktree>'`.
+    match crate::pathspec::prefix_path(repo, user_path.into()) {
+        Ok(path) => Ok(path.to_string()),
+        Err(msg) => Err(crate::fatal::die(msg).into()),
+    }
 }
 
 #[cfg(test)]

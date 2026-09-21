@@ -604,8 +604,8 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if o.pathspecs.iter().any(String::is_empty) {
-        eprintln!("fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths");
+    if let Some(msg) = crate::pathspec::empty_element_fatal(&o.pathspecs) {
+        eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(FATAL));
     }
     if o.pathspec_file_nul && !o.pathspec_from_file {
@@ -649,8 +649,8 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
         }
         // The file's own pathspecs get the same empty-string validation git runs
         // over command-line pathspecs — an empty line is an empty pathspec.
-        if o.pathspecs.iter().any(String::is_empty) {
-            eprintln!("fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths");
+        if let Some(msg) = crate::pathspec::empty_element_fatal(&o.pathspecs) {
+            eprintln!("fatal: {msg}");
             return Ok(ExitCode::from(FATAL));
         }
     }

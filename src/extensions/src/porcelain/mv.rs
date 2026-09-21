@@ -24,11 +24,11 @@
 //! exists only as sparse index entries (`empty_dir_has_sparse_contents()`);
 //! such a source is still reported as `bad source`.
 
-use anyhow::{anyhow, bail, Result};
-use std::path::{Component, Path, PathBuf};
+use anyhow::{anyhow, Result};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString};
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::index::entry::{Flags, Mode, Stage, Stat};
 
@@ -627,9 +627,14 @@ fn plan_source(
     // `skip-worktree` explains it: the path is outside the sparse-checkout
     // definition, so without `--sparse` it is collected for the advice block, and
     // with it the move happens in the index alone.
-    let meta = match std::fs::symlink_metadata(&src_abs) {
-        Ok(meta) => meta,
-        Err(_) => {
+    // git `lstat()`s `src` as it stands, and `prefix_path()` normalises both `''`
+    // and `.` to the empty string — `lstat("")` is ENOENT, so those land in the
+    // not-on-disk arm and come back as `bad source`. Joining the empty name to
+    // the worktree root instead pointed the stat at the root directory, which
+    // exists, so both reported `source directory is empty` from the branch below.
+    let meta = match (src_rel.is_empty(), std::fs::symlink_metadata(&src_abs)) {
+        (false, Ok(meta)) => meta,
+        _ => {
             if !skip_worktree_entry(index, &src_rel) {
                 return Err(anyhow!("bad source, source={src_rel}, destination={dst_rel}"));
             }
@@ -1055,52 +1060,53 @@ fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)]) {
     }
 }
 
-/// Turn an operand into a clean, repo-relative, slash-separated path.
+/// `prefix_path()` (setup.c:149-160) — what `builtin/mv.c` runs every operand
+/// through before it looks at the index.
 ///
-/// Relative operands are resolved against the worktree `prefix` (the repo-
-/// relative CWD). Absolute operands are resolved against the worktree root
-/// `workdir` and stripped back to repo-relative — stock git accepts an absolute
-/// path that lands inside the worktree (verified: `git mv /abs/inside/a b`
-/// exits 0). `.`/`..` are folded lexically. Any path that escapes the worktree
-/// is a fatal "outside repository", matching git's exit 128.
+/// Relative operands are joined to the worktree `prefix` (the repo-relative
+/// CWD); absolute ones are cut down to the part inside the worktree
+/// (`abspath_part_inside_repo()`, setup.c:50-106). `.` and `..` are folded by
+/// `normalize_path_copy_len()` and a `..` that climbs past the top is the
+/// `'%s' is outside repository at '%s'` die.
+///
+/// Two things were private here and wrong in the same way three times over: the
+/// die named `workdir` as gix hands it back, which at the top of a worktree is
+/// the relative `.` rather than git's absolute, symlink-resolved path; and an
+/// operand that normalised to nothing (`''`, `.`) was refused with an invented
+/// `invalid path: <arg>` where git returns the empty string and lets `mv`'s own
+/// `bad source, source=, destination=<dst>` report it (builtin/mv.c:306-345).
 fn normalize_rel(workdir: &Path, prefix: &Path, arg: &str) -> Result<String> {
-    let arg_path = Path::new(arg);
-    let joined = if arg_path.is_absolute() {
-        // Resolve symlinks on the longest existing ancestor (macOS /tmp ->
-        // /private/tmp), keep any not-yet-created tail, then strip the worktree
-        // root. Anything not under it is outside the repository.
-        let canon_wd = workdir
-            .canonicalize()
-            .unwrap_or_else(|_| workdir.to_path_buf());
-        let real = canonicalize_lenient(arg_path);
-        match real.strip_prefix(&canon_wd) {
-            Ok(rel) if !rel.as_os_str().is_empty() => rel.to_path_buf(),
-            _ => crate::git_fatal!("'{arg}' is outside repository at '{}'", canon_wd.display()),
-        }
+    let prefix = prefix.to_string_lossy().replace('\\', "/");
+    let joined = if Path::new(arg).is_absolute() {
+        BString::from(arg)
+    } else if prefix.is_empty() {
+        BString::from(arg)
     } else {
-        prefix.join(arg)
+        let mut joined = BString::from(prefix.trim_end_matches('/').as_bytes().to_vec());
+        joined.push(b'/');
+        joined.extend_from_slice(arg.as_bytes());
+        joined
     };
-    let mut parts: Vec<String> = Vec::new();
-    for comp in joined.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if parts.pop().is_none() {
-                    crate::git_fatal!("'{arg}' is outside repository at '{}'", workdir.display());
-                }
-            }
-            Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
-            Component::RootDir | Component::Prefix(_) => {
-                // Absolute inputs are stripped to worktree-relative above, so a
-                // residual root component here means the path escaped.
-                crate::git_fatal!("'{arg}' is outside repository at '{}'", workdir.display())
-            }
-        }
+    // `absolute_path(repo_get_work_tree())`: the worktree as `setup_git_directory()`
+    // left it, which is `xgetcwd()`'s already-symlink-resolved spelling.
+    let real_wd = workdir.canonicalize().unwrap_or_else(|_| workdir.to_path_buf());
+    let outside =
+        || crate::fatal::die(format!("'{arg}' is outside repository at '{}'", real_wd.display()));
+    let normalized = match crate::pathspec::normalize_path(joined.as_bstr()) {
+        Some(normalized) => normalized,
+        None => crate::git_fatal!("'{arg}' is outside repository at '{}'", real_wd.display()),
+    };
+    if !Path::new(arg).is_absolute() {
+        return Ok(normalized.to_string());
     }
-    if parts.is_empty() {
-        crate::git_fatal!("invalid path: {arg}");
+    // An absolute operand is measured against the worktree's realpath, so a
+    // worktree reached through a symlink (macOS `/tmp` -> `/private/tmp`) is not
+    // called an outside one.
+    let real = canonicalize_lenient(Path::new(&normalized.to_string()));
+    match real.strip_prefix(&real_wd) {
+        Ok(rel) => Ok(rel.to_string_lossy().replace('\\', "/")),
+        Err(_) => Err(outside().into()),
     }
-    Ok(parts.join("/"))
 }
 
 /// Canonicalize the longest existing prefix of `p`, re-appending the trailing

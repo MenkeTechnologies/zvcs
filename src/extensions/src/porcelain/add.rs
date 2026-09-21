@@ -416,11 +416,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
 
     // git rejects an empty-string pathspec outright — inside `parse_pathspec()`,
     // so it fires before `--pathspec-from-file` is even opened.
-    if pathspecs.iter().any(String::is_empty) {
-        return usage_fatal(
-            "empty string is not a valid pathspec. please use . instead if you meant to match all paths"
-                .into(),
-        );
+    if let Some(msg) = crate::pathspec::empty_element_fatal(&pathspecs) {
+        return usage_fatal(msg);
     }
 
     // `--pathspec-from-file`: read pathspecs from a file (or stdin for `-`).
@@ -433,16 +430,23 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         pathspecs = super::commit::read_pathspec_file(&src, file_nul)?;
         // The file's own elements go through the same `parse_pathspec()` the argv
         // ones did, so an empty line is the same fatal.
-        if pathspecs.iter().any(String::is_empty) {
-            return usage_fatal(
-                "empty string is not a valid pathspec. please use . instead if you meant to match all paths"
-                    .into(),
-            );
+        if let Some(msg) = crate::pathspec::empty_element_fatal(&pathspecs) {
+            return usage_fatal(msg);
         }
     } else if file_nul {
         return usage_fatal(
             "the option '--pathspec-file-nul' requires '--pathspec-from-file'".into(),
         );
+    }
+
+    // `parse_pathspec()` reads every element's magic before `cmd_add()` does any
+    // work (pathspec.c:650-668), and each way that read can fail is a `die()` —
+    // so `git add -n ':(bogus)x'` is `fatal:` and exit 128, not whatever the
+    // matcher says when it is eventually built. `cmd_add()` passes no
+    // `magic_mask` (builtin/add.c:453-456), so every keyword is in scope here and
+    // only the parse itself can refuse.
+    if let Some(msg) = crate::pathspec::magic_mask_fatal(&pathspecs, 0) {
+        return usage_fatal(msg);
     }
 
     if pathspecs.is_empty() && !(all || update_only) {
@@ -2103,36 +2107,12 @@ pub(crate) fn record_stage_event(repo: &gix::Repository, count: usize) {
 /// "already prefixed" for the same reason `top` does: `prefix_pathspec()` takes
 /// the element verbatim in both cases (pathspec.c:452-457).
 fn split_pathspec_magic(spec: &str) -> (usize, bool) {
-    let b = spec.as_bytes();
-    if b.first() != Some(&b':') {
-        return (0, false);
-    }
-    if b.get(1) == Some(&b'(') {
-        // A missing `)` is git's "Missing ')' at the end of pathspec magic", which
-        // the matcher below reports; treat the element as all-magic so this pass
-        // leaves it exactly as typed.
-        let Some(close) = spec[2..].find(')').map(|i| i + 2) else {
-            return (spec.len(), true);
-        };
-        let rooted =
-            spec[2..close].split(',').any(|m| m == "top" || m.starts_with("prefix:"));
-        (close + 1, rooted)
-    } else {
-        let mut i = 1;
-        let mut rooted = false;
-        while i < b.len() && b[i] != b':' {
-            match b[i] {
-                b'/' => rooted = true,
-                b'!' | b'^' => {}
-                // Not a mnemonic: the path starts here.
-                _ => break,
-            }
-            i += 1;
-        }
-        if i < b.len() && b[i] == b':' {
-            i += 1;
-        }
-        (i, rooted)
+    match crate::pathspec::parse_element_magic(spec.into()) {
+        Ok(element) => (element.path_start, element.rooted()),
+        // Unreachable from `add()`, which runs `magic_mask_fatal()` over the whole
+        // list first; kept so this stays total, and matching git in the only sense
+        // available — an element nobody could parse has no path to prefix.
+        Err(_) => (spec.len(), true),
     }
 }
 
@@ -2260,7 +2240,7 @@ pub(super) fn resolve_pathspecs(
                 }
                 checked.push((original[i].clone(), relative));
             }
-            Err(copyfrom) => {
+            Err(_) => {
                 // `absolute_path(hint_path)`: the worktree gix hands back can be
                 // relative to the cwd ("..") and git always names an absolute one.
                 let root = repo
@@ -2270,7 +2250,16 @@ pub(super) fn resolve_pathspecs(
                     .unwrap_or_else(|_| repo.git_dir().to_path_buf())
                     .display()
                     .to_string();
-                crate::git_fatal!("{spec}: '{copyfrom}' is outside repository at '{root}'");
+                // Both operands come off the element *as typed* (pathspec.c:500):
+                // `elt` whole, `copyfrom` with only the magic taken off. `spec`
+                // here has already been through `normalize_pathspec()`, which
+                // turns `..` into `../` — so reporting it named a path the user
+                // never wrote, in both halves of the message.
+                let elt = &original[i];
+                let copyfrom = crate::pathspec::parse_element_magic(elt.as_str().into())
+                    .map(|element| element.path(elt.as_str().into()).to_string())
+                    .unwrap_or_else(|_| elt.clone());
+                crate::git_fatal!("{elt}: '{copyfrom}' is outside repository at '{root}'");
             }
         }
     }

@@ -778,11 +778,7 @@ impl Fatal {
                 let _ = writeln!(err, "error: {flag} requires an argument");
             }
             Fatal::EmptyPathspec => {
-                let _ = writeln!(
-                    err,
-                    "fatal: empty string is not a valid pathspec. \
-                     please use . instead if you meant to match all paths"
-                );
+                let _ = writeln!(err, "fatal: {}", crate::pathspec::empty_pathspec());
             }
             Fatal::NoSuchPath(p) => {
                 let _ = writeln!(err, "fatal: No such path '{p}' in the diff");

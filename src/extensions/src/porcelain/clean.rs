@@ -317,11 +317,6 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         .filter(|c| !c.is_empty())
         .collect();
 
-    let workdir_real = repo
-        .workdir()
-        .map(gix::path::realpath)
-        .transpose()?
-        .unwrap_or_default();
     // git validates every pathspec left-to-right: for each element it first
     // parses the magic prefix (`:(…)`), then checks it does not escape the
     // worktree. A magic-parse failure is `fatal:` / exit 128 — not the exit 1
@@ -330,28 +325,22 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     let pathspec_defaults = repo.pathspec_defaults_inherit_ignore_case(true)?;
     // Whether every element is a bare `:(attr:…)` — attribute requirements and
     // no path pattern at all. See [`attr_pathspec_matches`] for what that buys.
+    // Both of `init_pathspec_item()`'s `die()`s, in git's order and with git's two
+    // operands. The escape check used to be a private one that returned early for
+    // *any* element starting with `:` (so `:(icase)../x` walked straight out of
+    // the work tree) and named the whole element in both halves of the message,
+    // where git names `elt` and then `copyfrom` — the element with its magic taken
+    // off (pathspec.c:500-501).
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
     let mut attr_only_pathspec = !pathspecs.is_empty();
     for spec in &pathspecs {
-        match gix::pathspec::parse(spec.as_bytes(), pathspec_defaults) {
-            Ok(pattern) => {
-                attr_only_pathspec &= !pattern.attributes.is_empty()
-                    && pattern.path().is_empty()
-                    && !pattern.is_excluded();
-            }
-            Err(err) => {
-                eprintln!(
-                    "fatal: {}",
-                    crate::pathspec::parse_error_message(spec.as_str().into(), &err)
-                );
-                return Ok(ExitCode::from(128));
-            }
-        }
-        if pathspec_leaves_worktree(spec, prefix_parts.len(), &workdir_real) {
-            eprintln!(
-                "fatal: {spec}: '{spec}' is outside repository at '{}'",
-                workdir_real.display()
-            );
-            return Ok(ExitCode::from(128));
+        if let Ok(pattern) = gix::pathspec::parse(spec.as_bytes(), pathspec_defaults) {
+            attr_only_pathspec &= !pattern.attributes.is_empty()
+                && pattern.path().is_empty()
+                && !pattern.is_excluded();
         }
     }
 
@@ -1086,47 +1075,6 @@ impl gix::dir::walk::Delegate for Collect {
         self.0.push(entry.to_owned());
         std::ops::ControlFlow::Continue(())
     }
-}
-
-/// Whether a pathspec resolves outside the worktree, which git rejects with
-/// `'<spec>' is outside repository at '<worktree>'`.
-///
-/// Relative specs are resolved against the repository prefix by counting
-/// components, so `..` from the top level escapes while `./src/../src` does not.
-/// Absolute specs must live under the worktree. Specs carrying magic (`:/…`,
-/// `:(top)…`) are resolved by the pathspec parser instead and are not checked.
-fn pathspec_leaves_worktree(spec: &str, prefix_depth: usize, workdir_real: &std::path::Path) -> bool {
-    if spec.starts_with(':') {
-        return false;
-    }
-    if spec.starts_with('/') {
-        let mut normalized = std::path::PathBuf::new();
-        for comp in std::path::Path::new(spec).components() {
-            match comp {
-                std::path::Component::ParentDir => {
-                    normalized.pop();
-                }
-                std::path::Component::CurDir => {}
-                other => normalized.push(other),
-            }
-        }
-        return !normalized.starts_with(workdir_real);
-    }
-
-    let mut depth = prefix_depth as i64;
-    for comp in spec.split('/') {
-        match comp {
-            "" | "." => {}
-            ".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return true;
-                }
-            }
-            _ => depth += 1,
-        }
-    }
-    false
 }
 
 /// Render a repository-relative path as git does for display: relative to the

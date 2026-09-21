@@ -1239,6 +1239,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
         return Ok(code);
     }
+    // `prepare_index()` opens with `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL,
+    // prefix, argv)` (builtin/commit.c:367-369), so every element is read before the
+    // index is touched and a malformed one is `fatal:` at 128. Reaching the matcher
+    // first reported gitoxide's own wording at exit 1.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
     // Serialize tree build + commit + HEAD update through the repo coordinator so
     // concurrent zvcs writers queue instead of racing. Held across the whole op —
     // except that `-p`/`--interactive` must run the selector *outside* the lane,
@@ -2855,11 +2863,8 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
             }
         }
     }
-    if out.iter().any(String::is_empty) {
-        return Err(crate::fatal::die(
-            "empty string is not a valid pathspec. \
-             please use . instead if you meant to match all paths",
-        ));
+    if let Some(msg) = crate::pathspec::empty_element_fatal(&out) {
+        return Err(crate::fatal::die(msg));
     }
     Ok(out)
 }

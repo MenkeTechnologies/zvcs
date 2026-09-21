@@ -309,7 +309,23 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
         // The text after the magic may well be empty — only the raw argv element
         // is refused for that (pathspec.c:639-641). `:(top)` alone leaves
         // `item->match` empty, matches nothing, and exits 1.
-        let (fromtop, path, unsupported) = split_magic(orig.as_bstr());
+        // `init_pathspec_item()` parses the magic first (pathspec.c:464-467), and
+        // every way that parse can fail is a `die()` that lands here — before the
+        // path is prefixed and before the mask is consulted. A private reading of
+        // the element that only looked for keywords it did not support answered
+        // `:(bogus)x` with `unsupported_magic()`'s text where git answers
+        // `Invalid pathspec magic`, and let `:(glob` and `:%x` through entirely.
+        let element = match crate::pathspec::parse_element_magic(orig.as_bstr()) {
+            Ok(element) => element,
+            Err(msg) => return Ok(flush_then_fatal(&out, &msg)),
+        };
+        // `:(prefix:<n>)` skips `prefix_path_gently()` for the same reason
+        // `:(top)` does (pathspec.c:482-487), and carries no `PATHSPEC_*` bit, so
+        // the mask below never sees it.
+        let fromtop = element.rooted();
+        let path = BString::from(element.path(orig.as_bstr()).to_vec());
+        // `PATHSPEC_ALL_MAGIC & ~PATHSPEC_FROMTOP` (builtin/check-ignore.c:93).
+        let unsupported = element.magic & !crate::pathspec::MAGIC_TOP;
 
         // `:(top)` measures the path from the repository root rather than from
         // the current directory. `prefix_pathspec()` does that by not calling
@@ -351,10 +367,10 @@ pub fn check_ignore(args: &[String]) -> Result<ExitCode> {
 
         // `unsupported_magic()` runs only after the item has been prefixed
         // (pathspec.c:657-658), so `:(glob)/nosuch/x` reports the path first.
-        if let Some(unsupported) = unsupported {
+        if unsupported != 0 {
             return Ok(flush_then_fatal(
                 &out,
-                &format!("{orig}: pathspec magic not supported by this command: {unsupported}"),
+                &crate::pathspec::unsupported_magic(orig.as_bstr(), unsupported),
             ));
         }
 
@@ -718,70 +734,6 @@ fn unquote_c_style(quoted: &[u8]) -> Option<BString> {
 /// escapes the repository root (git's "is outside repository" fatal).
 ///
 /// Both branches normalise lexically — `.` and `..` are folded without touching
-
-/// Split a pathspec element into "was `top` magic given" and the path after the
-/// magic, or the `unsupported_magic()` rendering of the magic this command does
-/// not take.
-///
-/// ```c
-/// static struct pathspec_magic {
-///         unsigned bit;
-///         char mnemonic; /* this cannot be ':'! */
-///         const char *name;
-/// } pathspec_magic[] = {
-///         { PATHSPEC_FROMTOP,  '/', "top" },
-///         { PATHSPEC_LITERAL,   0,  "literal" },
-///         { PATHSPEC_GLOB,     '\0', "glob" },
-///         { PATHSPEC_ICASE,    '\0', "icase" },
-///         { PATHSPEC_EXCLUDE,  '!', "exclude" },
-///         { PATHSPEC_ATTR,     '\0', "attr" },
-/// };
-/// ```
-///
-/// and `unsupported_magic()` renders each unsupported bit as `'<name>'`, or
-/// `'<name>' (mnemonic: '<c>')` when the table gives it one, joined with `", "`.
-fn split_magic(elt: &BStr) -> (bool, BString, Option<String>) {
-    let Some(rest) = elt.strip_prefix(b":") else {
-        return (false, BString::from(elt.to_vec()), None);
-    };
-    let mut fromtop = false;
-    let mut bad: Vec<String> = Vec::new();
-    let path: &[u8];
-    if let Some(long) = rest.strip_prefix(b"(") {
-        let Some(end) = long.iter().position(|&b| b == b')') else {
-            // `missing ')' at the end of pathspec magic in '%s'` is a different
-            // die; leave it to the matcher rather than guessing at it here.
-            return (false, BString::from(elt.to_vec()), None);
-        };
-        for kw in long[..end].split(|&b| b == b',') {
-            match kw {
-                b"top" => fromtop = true,
-                b"" => {}
-                other => bad.push(match other {
-                    b"exclude" => "'exclude' (mnemonic: '!')".to_string(),
-                    b"literal" => "'literal'".to_string(),
-                    other => format!("'{}'", String::from_utf8_lossy(other)),
-                }),
-            }
-        }
-        path = &long[end + 1..];
-    } else {
-        // Short form: a run of mnemonics, optionally closed by another `:`.
-        let mut i = 0;
-        while i < rest.len() && rest[i] != b':' {
-            match rest[i] {
-                b'/' => fromtop = true,
-                b'!' | b'^' => bad.push("'exclude' (mnemonic: '!')".to_string()),
-                _ => break,
-            }
-            i += 1;
-        }
-        path = if rest.get(i) == Some(&b':') { &rest[i + 1..] } else { &rest[i..] };
-    }
-    let unsupported = (!bad.is_empty()).then(|| bad.join(", "));
-    (fromtop, BString::from(path.to_vec()), unsupported)
-}
-
 /// the filesystem, which is what git's pathspec normalisation does too.
 ///
 /// `Ok(None)` is `prefix_path_gently()` returning `NULL`, which the caller

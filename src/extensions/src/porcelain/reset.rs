@@ -743,6 +743,15 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `parse_args()` ends in `parse_pathspec(pathspec, 0, PATHSPEC_PREFER_FULL | …,
+    // prefix, argv)` (builtin/reset.c:295-298), and `cmd_reset()` calls it before
+    // every one of the checks below — so `git reset --hard -- ':(bogus)x'` reports
+    // the magic, not `Cannot do hard reset with paths.`, and does it at 128.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &paths) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+
     let with_paths = !paths.is_empty();
     if with_paths {
         if let Some(m @ (ResetMode::Soft | ResetMode::Hard | ResetMode::Merge | ResetMode::Keep)) =

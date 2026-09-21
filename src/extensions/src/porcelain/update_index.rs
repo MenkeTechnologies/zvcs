@@ -2563,6 +2563,16 @@ fn do_reupdate(ctx: &mut Ctx, specs: &[String]) -> Result<Step> {
     if ctx.workdir.is_none() {
         return Err(crate::fatal::need_work_tree());
     }
+    // `do_reupdate()` opens with `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_CWD,
+    // prefix, paths)` (builtin/update-index.c:677-679) — the one code path in this
+    // command that reads magic at all; every other argument is a plain path run
+    // through `prefix_path()`. Nothing rejected these elements before, so
+    // `update-index --again -- ':(glob'` walked the index and exited 0 where git
+    // is `fatal:` and 128.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&ctx.repo, specs) {
+        eprintln!("fatal: {msg}");
+        return Ok(Err(Die));
+    }
     // `PATHSPEC_PREFER_CWD`: a bare spec is relative to the current directory.
     let specs: Vec<String> = specs.iter().map(|s| format!("{}{s}", ctx.prefix)).collect();
 

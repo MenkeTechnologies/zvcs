@@ -938,6 +938,18 @@ fn status_report(
         return Ok(ExitCode::from(128));
     }
 
+    // `cmd_status()` runs `parse_pathspec()` (builtin/commit.c:1622-1624) before
+    // it reads the index, with a `magic_mask` of 0 — so every keyword is in scope
+    // and only a malformed element or one that resolves outside the repository is
+    // refused. Without this gate the refusal was swallowed twice over: the
+    // matcher's `Err` is discarded at both construction sites below (`Err(_) =>
+    // None`), and the collection that was supposed to report it exits 128 with an
+    // empty stderr, so `git status -- ':(bogus)x'` failed silently.
+    if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+
     // `cmd_status()` refreshes the index before collecting anything
     // (builtin/commit.c:1629-1632), limited to the pathspec and with
     // `REFRESH_UNMERGED`, so conflicted paths are not named. Its content compare

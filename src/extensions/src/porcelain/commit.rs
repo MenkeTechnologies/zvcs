@@ -2364,6 +2364,46 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
+
+    // ```c
+    // if (!no_verify &&
+    //     run_commit_hook(use_editor, index_file, NULL, "commit-msg",
+    //                     git_path_commit_editmsg(), NULL))
+    //         return 0;
+    // ```
+    //
+    // (builtin/commit.c:1130-1134.) It is the last thing `prepare_to_commit()`
+    // does, so the hook reads `COMMIT_EDITMSG` exactly as the editor left it —
+    // comments, status block and verbose patch included — and whatever it writes
+    // back is what `cmd_commit` then reads and cleans (:1902-1905). Handing it a
+    // pre-cleaned buffer instead hid the template from every hook and left the
+    // cleaned message on disk in place of the edited one, which is what
+    // `COMMIT_EDITMSG` is supposed to keep. The cleanup below is git's, in
+    // memory, and never written back.
+    //
+    // Same `run_commit_hook()` as `prepare-commit-msg` above, so it gets the same
+    // `GIT_INDEX_FILE` (commit.c:1744) and the same `GIT_EDITOR=:` when no editor
+    // is in play (commit.c:1747-1748).
+    if verify {
+        let arg = msg_path.to_string_lossy().into_owned();
+        let mut env: Vec<(&str, &std::path::Path)> =
+            vec![("GIT_INDEX_FILE", index_file.as_path())];
+        let colon = std::path::Path::new(":");
+        if !use_editor {
+            env.push(("GIT_EDITOR", colon));
+        }
+        let outcome = HookIndexLock::around(&repo, normal_lock, "commit-msg", &index_file, || {
+            crate::hooks::run_with_env(&repo, "commit-msg", &[&arg], None, &env)
+        })?;
+        if !outcome.ok {
+            return Ok(ExitCode::from(1));
+        }
+    }
+
+    // `strbuf_read_file(&sb, git_path_commit_editmsg(), 0)` then
+    // `cleanup_message(&sb, cleanup_mode, verbose)` (builtin/commit.c:1902-1906):
+    // the buffer the hook left, cleaned for the object being written and for the
+    // two refusals below it.
     message =
         cleanup_message(&std::fs::read_to_string(&msg_path)?, &comment, cleanup, verbose > 0);
 
@@ -2410,32 +2450,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         message.push('\n');
     }
 
-    // `commit-msg` gets the message file and may rewrite it (e.g. add a trailer);
-    // a non-zero exit aborts. Re-read afterward to pick up any edits.
-    //
-    // It is a `run_commit_hook()` call like the two above it — `run_commit_hook(
-    // use_editor, index_file, NULL, "commit-msg", git_path(commit_editmsg), NULL)`
-    // (builtin/commit.c:1101-1102) — so it gets the same `GIT_INDEX_FILE` they do
-    // (`commit.c:1744`). Running it through the plain `run()` left the variable
-    // unset, and a `commit-msg` hook that shells out to git then read whatever
-    // index the ambient environment named rather than the one being committed.
-    if verify {
-        std::fs::write(&msg_path, &message)?;
-        let arg = msg_path.to_string_lossy().into_owned();
-        let outcome = HookIndexLock::around(&repo, normal_lock, "commit-msg", &index_file, || {
-            crate::hooks::run_with_env(
-                &repo,
-                "commit-msg",
-                &[&arg],
-                None,
-                &[("GIT_INDEX_FILE", index_file.as_path())],
-            )
-        })?;
-        if !outcome.ok {
-            return Ok(ExitCode::from(1));
-        }
-        message = std::fs::read_to_string(&msg_path)?;
-    }
     // ```c
     // if (memchr(msg, '\0', msg_len))
     //         return error(_("a NUL byte in commit log message not allowed."));
@@ -4101,17 +4115,27 @@ fn skip_worktree_paths(index: &gix::index::File) -> HashSet<BString> {
         .collect()
 }
 
-/// HEAD's tree id, refusing an unborn branch the way a pathspec-limited commit
-/// must (it has no base tree to build upon).
-fn head_tree(repo: &gix::Repository) -> Result<ObjectId> {
-    let head_commit = repo
-        .head()?
-        .try_peel_to_id()?
-        .ok_or_else(|| {
-            anyhow::anyhow!("cannot do a pathspec-limited commit on an unborn branch (no HEAD)")
-        })?
-        .detach();
-    Ok(repo.find_commit(head_commit)?.tree_id()?.detach())
+/// HEAD's tree id, or `None` on an unborn branch — a pathspec-limited commit is
+/// still allowed there, it just has no base to build upon:
+///
+/// ```c
+/// static void create_base_index(const struct commit *current_head)
+/// {
+///         if (!current_head) {
+///                 discard_index(the_repository->index);
+///                 return;
+///         }
+/// ```
+/// (builtin/commit.c:311-318, v2.55.0), and the matching
+/// `list_paths(&partial, !current_head ? NULL : "HEAD", &pathspec)`
+/// (builtin/commit.c:527) which skips the `overlay_tree_on_index()` so the
+/// pathspecs are matched against the real index alone. So `git commit -m msg
+/// <path>` makes the *initial* commit out of exactly the matched paths.
+fn head_tree(repo: &gix::Repository) -> Result<Option<ObjectId>> {
+    let Some(head_commit) = repo.head()?.try_peel_to_id()? else {
+        return Ok(None);
+    };
+    Ok(Some(repo.find_commit(head_commit.detach())?.tree_id()?.detach()))
 }
 
 /// git's "false index" for a partial commit: HEAD's tree with only the matched
@@ -4126,10 +4150,21 @@ fn only_mode_stage(
     repo: &gix::Repository,
     pathspecs: &[String],
 ) -> Result<(gix::index::File, StagedSet)> {
-    let head_tree_id = head_tree(repo)?;
     let real = crate::index_open::or_empty(repo)?;
-    let mut temp = repo.index_from_tree(&head_tree_id)?;
-    carry_unchanged_entries(&mut temp, &real);
+    let mut temp = match head_tree(repo)? {
+        Some(head_tree_id) => {
+            let mut temp = repo.index_from_tree(&head_tree_id)?;
+            carry_unchanged_entries(&mut temp, &real);
+            temp
+        }
+        // `create_base_index(NULL)`'s `discard_index()` (builtin/commit.c:317-320):
+        // an unborn HEAD leaves the false index empty, so the initial commit
+        // carries only the paths `add_remove_files()` puts back.
+        None => gix::index::File::from_state(
+            gix::index::State::new(repo.object_hash()),
+            repo.index_path(),
+        ),
+    };
     // `if (!pattern->nr) return 0;` — `list_paths()` leaves the false index as
     // HEAD's tree when there is no pathspec at all, which is the whole of what
     // `--fixup=reword:` (git's `only` with no paths) commits. An empty pathspec

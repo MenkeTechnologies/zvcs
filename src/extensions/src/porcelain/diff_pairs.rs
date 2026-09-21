@@ -4855,8 +4855,11 @@ fn text_analysis(
     // The change script, in `xdchange_t` shape, with the `ignore` bit that
     // `xdl_mark_ignorable_lines` (`--ignore-blank-lines`) and `xdl_mark_ignorable_regex`
     // (`-I<re>`) set on a change whose every pre- and post-image record is ignorable.
-    // Both markers assign (rather than or into) `xch->ignore`, and the regex pass runs
-    // second, so `-I` has the final say whenever it is present.
+    // The blank-line pass runs first and the regex pass opens with
+    // `if (xch->ignore) continue;` — "Do not override --ignore-blank-lines"
+    // (xdiff/xdiffi.c:1070-1074) — so the two verdicts are an or, not a
+    // last-writer-wins: a blank-line change stays ignored even when `-I` is in force
+    // and its own patterns do not match.
     let changes: Vec<Change> = diff
         .hunks()
         .map(|h| {
@@ -4866,13 +4869,9 @@ fn text_analysis(
                 before[i1..i1 + chg1].iter().all(|l| pred(l))
                     && after[i2..i2 + chg2].iter().all(|l| pred(l))
             };
-            let ignore = if !opts.ignore_lines.is_empty() {
-                all(&|l| matches_any(&opts.ignore_lines, l))
-            } else if opts.ignore_blank_lines {
-                all(&|l| is_blank_rec(l, opts.ws))
-            } else {
-                false
-            };
+            let ignore = (opts.ignore_blank_lines && all(&|l| is_blank_rec(l, opts.ws)))
+                || (!opts.ignore_lines.is_empty()
+                    && all(&|l| matches_any(&opts.ignore_lines, l)));
             Change { i1, chg1, i2, chg2, ignore }
         })
         .collect();

@@ -7135,9 +7135,10 @@ fn text_hunks(
     // The change script in `xdchange_t` shape, carrying the `ignore` bit
     // `xdl_mark_ignorable_lines()` (`--ignore-blank-lines`) and
     // `xdl_mark_ignorable_regex()` (`-I<re>`) set on a change whose every pre- and
-    // post-image record is ignorable. Both markers *assign* rather than or into
-    // `xch->ignore` and the regex pass runs second, so `-I` has the final say
-    // whenever it is present. The same rule [`super::diff_pairs`] applies.
+    // post-image record is ignorable. The blank-line pass runs first and the regex
+    // pass opens with `if (xch->ignore) continue;` — "Do not override
+    // --ignore-blank-lines" (xdiff/xdiffi.c:1070-1074) — so the two verdicts are an
+    // or, not a last-writer-wins. The same rule [`super::diff_pairs`] applies.
     let changes: Vec<super::diff_pairs::Change> = diff
         .hunks()
         .map(|h| {
@@ -7147,13 +7148,9 @@ fn text_hunks(
                 before[i1..i1 + chg1].iter().all(|l| pred(l))
                     && after[i2..i2 + chg2].iter().all(|l| pred(l))
             };
-            let ignored = if !ignore.lines.is_empty() {
-                all(&|l| ignore.lines.iter().any(|p| p.is_match(l)))
-            } else if ignore.blank_lines {
-                all(&|l| is_blank_record(l, ws))
-            } else {
-                false
-            };
+            let ignored = (ignore.blank_lines && all(&|l| is_blank_record(l, ws)))
+                || (!ignore.lines.is_empty()
+                    && all(&|l| ignore.lines.iter().any(|p| p.is_match(l))));
             super::diff_pairs::Change { i1, chg1, i2, chg2, ignore: ignored }
         })
         .collect();

@@ -919,15 +919,17 @@ const GIT_MAX_HEXSZ: i64 = 64;
 /// `DEFAULT_ABBREV`, which is `default_abbrev` (object-name.h:137) as
 /// `git_default_core_config()` sets it (environment.c:349-363):
 ///
-///     if (!strcasecmp(value, "auto"))
-///             default_abbrev = -1;
-///     else if (!git_parse_maybe_bool_text(value))
-///             default_abbrev = GIT_MAX_HEXSZ;
-///     else {
-///             int abbrev = git_config_int(var, value, ctx->kvi);
-///             ...
-///             default_abbrev = abbrev;
-///     }
+/// ```text
+/// if (!strcasecmp(value, "auto"))
+///         default_abbrev = -1;
+/// else if (!git_parse_maybe_bool_text(value))
+///         default_abbrev = GIT_MAX_HEXSZ;
+/// else {
+///         int abbrev = git_config_int(var, value, ctx->kvi);
+///         ...
+///         default_abbrev = abbrev;
+/// }
+/// ```
 ///
 /// The raw value, not a width resolved against this repository: `-1` for
 /// `auto` (and for no key at all), `64` for a false-y word even under SHA-1,

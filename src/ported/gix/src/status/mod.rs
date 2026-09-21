@@ -29,6 +29,19 @@ pub enum Submodule {
         /// Thus, submodules that are clean will still impose the complete set of computation, as configured.
         check_dirty: bool,
     },
+    /// Git's own resolution order for a submodule's ignore level, which is *not*
+    /// [`Submodule::AsConfigured`]'s: `set_diffopt_flags_from_submodule_config()`
+    /// (submodule.c:180-199) consults `submodule.<name>.ignore` (config first, then
+    /// `.gitmodules`) and lets it override whatever `diff.ignoreSubmodules` had
+    /// already put in the diff flags. Only when the submodule names no level of its
+    /// own does `fallback` — which the caller has already folded
+    /// `diff.ignoreSubmodules` and any command-level default into — apply.
+    PerSubmoduleOr {
+        /// Used for a submodule that carries no `ignore` setting of its own.
+        fallback: crate::submodule::config::Ignore,
+        /// See [`Submodule::AsConfigured::check_dirty`].
+        check_dirty: bool,
+    },
     /// Instead of the configuration, use the given ['ignore' value](crate::submodule::config::Ignore).
     /// This makes it possible to fine-tune the amount of work invested in this status, while allowing
     /// to turn off all submodule status information.

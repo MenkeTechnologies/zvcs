@@ -323,9 +323,17 @@ fn status_report(
     // *after* the command line is parsed. `None` leaves each submodule's own
     // configured ignore level in force (gix's `AsConfigured` default).
     let mut ignore_submodules_arg: Option<String> = None;
-    // `None` keeps git's configured default (`status.renames`/`diff.renames`),
-    // i.e. `s->detect_rename == -1`; `Some` is what a command-line flag pinned.
-    let mut renames: Option<RenameOpts> = None;
+    // `cmd_status()`'s two command-line rename variables, kept apart exactly as
+    // the C keeps them because they are *not* resolved in command-line order:
+    // `--no-renames` is an `OPT_BOOL` into `no_renames` (C's `-1` sentinel is
+    // `None`) and `-M`/`--find-renames` only ever stores its raw argument in
+    // `rename_score_arg` (builtin/commit.c:1542-1543, 1596-1598). Both are read
+    // once after parsing, at builtin/commit.c:1646-1653, where `--find-renames`
+    // is applied last and so wins over a `--no-renames` that followed it.
+    let mut no_renames: Option<bool> = None;
+    // C's `(const char *)-1` sentinel is the outer `None`; a bare `-M` with no
+    // attached value is `Some(None)` (the callback's `arg == NULL`).
+    let mut rename_score_arg: Option<Option<String>> = None;
     // `git status [--] <pathspec>...` limits the report to matching paths.
     let mut pathspecs: Vec<BString> = Vec::new();
     let mut operands_only = false;
@@ -459,10 +467,9 @@ fn status_report(
             // Everything after `--` is a pathspec; the pathspec arm below rejects
             // any that follow, and a trailing `--` on its own is a no-op.
             "--" => operands_only = true,
-            "--no-renames" => renames = Some(RenameOpts::disabled()),
-            "--renames" | "-M" | "--find-renames" => {
-                renames = Some(RenameOpts::renames());
-            }
+            "--no-renames" => no_renames = Some(true),
+            "--renames" => no_renames = Some(false),
+            "-M" | "--find-renames" => rename_score_arg = Some(None),
             // `--column[=<opts>]` / `--no-column`: lay the long-format untracked and
             // ignored file listings out in columns (git's `OPT_COLUMN`).
             //
@@ -511,14 +518,7 @@ fn status_report(
                 let raw = s
                     .strip_prefix("--find-renames=")
                     .unwrap_or_else(|| s.trim_start_matches("-M"));
-                match parse_similarity(raw) {
-                    Some(opts) => renames = Some(opts),
-                    None => {
-                        eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
-                        eprint!("{USAGE}");
-                        return Ok(ExitCode::from(129));
-                    }
-                }
+                rename_score_arg = Some(Some(raw.to_string()));
             }
             _ if s.starts_with("--") => {
                 eprintln!("error: unknown option `{}'", &s[2..]);
@@ -561,14 +561,7 @@ fn status_report(
                             break;
                         }
                         'M' => {
-                            match parse_similarity(rest) {
-                                Some(opts) => renames = Some(opts),
-                                None => {
-                                    eprintln!("error: unknown option `{}'", &s[1..]);
-                                    eprint!("{USAGE}");
-                                    return Ok(ExitCode::from(129));
-                                }
-                            }
+                            rename_score_arg = Some(Some(rest.to_string()));
                             break;
                         }
                         other => {
@@ -699,6 +692,11 @@ fn status_report(
     // `status.submoduleSummary`, git's `s->submodule_summary`.
     let submodule_summary_limit: Option<i64>;
 
+    // `rev.diffopt.detect_rename`/`rename_score`/`rename_limit` for both halves of
+    // the report, settled inside the config block below from `status.renames` /
+    // `diff.renames` and then the two command-line variables.
+    let renames: RenameOpts;
+
     // With no format/branch flag on the command line, `status.short` selects the
     // colored short display and `status.branch` adds the `## <branch>` header.
     // A flag (including `--long` / `--no-branch`) always wins over the config.
@@ -738,21 +736,50 @@ fn status_report(
                 return Ok(ExitCode::from(128));
             }
         };
-        if renames.is_none() {
-            // `s->detect_rename` is still `-1`: `diff_setup()` fills it from
-            // `diff.renames`, which is why `-c diff.renames=copies` reaches
-            // `status` at all.
-            let detect = configured_detect.unwrap_or_else(|| configured_diff_renames(&snap));
-            renames = Some(RenameOpts {
-                detect,
-                ..RenameOpts::disabled()
-            });
+        // `s->detect_rename` when the config has had its say and before any flag:
+        // `status.renames`, else — it being still `-1` — what `diff_setup()` puts
+        // there from `diff.renames`, which is why `-c diff.renames=copies` reaches
+        // `status` at all.
+        let mut opts = RenameOpts {
+            detect: configured_detect.unwrap_or_else(|| configured_diff_renames(&snap)),
+            ..RenameOpts::disabled()
+        };
+        // builtin/commit.c:1646-1653, verbatim in order:
+        //
+        //   if (no_renames != -1)
+        //           s.detect_rename = !no_renames;
+        //   if ((intptr_t)rename_score_arg != -1) {
+        //           if (s.detect_rename < DIFF_DETECT_RENAME)
+        //                   s.detect_rename = DIFF_DETECT_RENAME;
+        //           if (rename_score_arg)
+        //                   s.rename_score = parse_rename_score(&rename_score_arg);
+        //   }
+        //
+        // Two consequences the command-line order does not predict: `-M` never
+        // *lowers* detection, so it leaves `status.renames=copies` alone rather
+        // than demoting it to plain renames; and because the `-M` clause runs
+        // after the `--no-renames` one, `--find-renames=90 --no-renames` still
+        // detects renames.
+        if let Some(off) = no_renames {
+            opts.detect = if off { 0 } else { diffcore_rename::DETECT_RENAME };
+        }
+        if let Some(score_arg) = rename_score_arg.as_ref() {
+            if opts.detect < diffcore_rename::DETECT_RENAME {
+                opts.detect = diffcore_rename::DETECT_RENAME;
+            }
+            if let Some(raw) = score_arg {
+                // `parse_rename_score()` consumes the leading `[0-9.]*%?` run and
+                // hands back where it stopped; `cmd_status()` never looks at that
+                // remainder, so `--find-renames=bogus` is a score of 0 and not an
+                // error. (`git diff`'s own `-M` callback is the one that rejects
+                // a leftover; `status` has no such check.)
+                opts.score = diffcore_rename::parse_rename_score(raw).0;
+            }
         }
         // The limit is not a flag on `status`, so config alone decides it — and it
         // applies whichever way detection was turned on.
-        if let Some(opts) = renames.as_mut() {
-            opts.limit = configured_rename_limit(&snap);
-        }
+        opts.limit = configured_rename_limit(&snap);
+        renames = opts;
         // `status.showStash` is git's default for `--show-stash`; a command-line
         // flag (`Some`) always wins.
         if show_stash.is_none() {
@@ -803,9 +830,6 @@ fn status_report(
         .filter(|_| !matches!(ignore_submodules, Some(gix::submodule::config::Ignore::All)));
     }
 
-    // `rev.diffopt.detect_rename` for both halves of the report, settled: the
-    // command line, else `status.renames`, else `diff.renames`.
-    let renames = renames.unwrap_or_else(RenameOpts::renames);
     let orderfile = configured_orderfile(&repo)?;
 
     // git's `s->prefix`. Two renderers drop it regardless of the config:
@@ -1111,15 +1135,7 @@ fn status_report(
     // collected pairs below — gix's tracker scores similarity differently and has
     // no worktree-side equivalent at all, so it stays off on both halves.
     platform = platform.tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
-    // `--ignore-submodules=<when>` fixes the index↔worktree submodule check at the
-    // requested ignore level (git's `handle_ignore_submodules_arg`); absent the
-    // flag, gix keeps each submodule's own configured level.
-    if let Some(ignore) = ignore_submodules {
-        platform = platform.index_worktree_submodules(gix::status::Submodule::Given {
-            ignore,
-            check_dirty: true,
-        });
-    }
+    platform = platform.index_worktree_submodules(submodule_mode(&repo, ignore_submodules, untracked));
 
     // `wt_status_collect_untracked` brackets the worktree walk with `getnanotime()`
     // and keeps the elapsed time in `s->untracked_in_ms` — but only when
@@ -2160,21 +2176,6 @@ fn parse_git_int(value: &str) -> Option<i64> {
     Some(val * factor)
 }
 
-/// Parse the `<n>` of `-M<n>` / `--find-renames=<n>` through git's own
-/// `parse_rename_score()` (diff.c:5679), the same reader `git diff -M<n>` uses:
-/// `50`, `50%` and `.5` all mean half, and a trailing remainder the parser could
-/// not consume is what makes git reject the option.
-fn parse_similarity(raw: &str) -> Option<RenameOpts> {
-    let (score, rest) = diffcore_rename::parse_rename_score(raw);
-    if !rest.is_empty() {
-        return None;
-    }
-    Some(RenameOpts {
-        score,
-        ..RenameOpts::renames()
-    })
-}
-
 /// `--ignored=matching` (`SHOW_MATCHING_IGNORED`) names the entity an ignore rule
 /// matched, and for anything inside an ignored *directory* that entity is the
 /// directory: stock answers `!! build/` for
@@ -2460,6 +2461,69 @@ impl SubmoduleState {
     }
 }
 
+/// `wt_status_collect_changes_worktree()`'s submodule setup (wt-status.c:646-655),
+/// as one `gix::status::Submodule`:
+///
+/// ```c
+/// rev.diffopt.flags.dirty_submodules = 1;
+/// if (!s->show_untracked_files)
+///         rev.diffopt.flags.ignore_untracked_in_submodules = 1;
+/// if (s->ignore_submodule_arg) {
+///         rev.diffopt.flags.override_submodule_config = 1;
+///         handle_ignore_submodules_arg(&rev.diffopt, s->ignore_submodule_arg);
+/// } else if (!rev.diffopt.flags.ignore_submodule_set &&
+///                 s->show_untracked_files != SHOW_NO_UNTRACKED_FILES)
+///         handle_ignore_submodules_arg(&rev.diffopt, "none");
+/// ```
+///
+/// Three things the shape of that C decides, none of which survive a naive reading:
+///
+/// * `--ignore-submodules=<when>` sets `override_submodule_config`, so it is the
+///   only setting that `submodule.<name>.ignore` cannot take back — and because
+///   `handle_ignore_submodules_arg()` (submodule.c:429-441) *clears* all three
+///   ignore bits before setting its own, an explicit `--ignore-submodules=none`
+///   also undoes the `ignore_untracked_in_submodules` that `-uno` had just set.
+/// * `-uno` only adds `ignore_untracked_in_submodules`; it never clears the bits
+///   `diff.ignoreSubmodules` left, which is why it upgrades an unset/`none`
+///   `diff.ignoreSubmodules` to `untracked` and leaves `dirty`/`all` alone.
+/// * `submodule.<name>.ignore` is applied last of all, per path, from
+///   `set_diffopt_flags_from_submodule_config()`, hence [`gix::status::Submodule::PerSubmoduleOr`]
+///   rather than `AsConfigured` (which reads `diff.ignoreSubmodules` first).
+///
+/// `check_dirty` stays `false` throughout: it makes gix stop collecting a
+/// submodule's changes at the first one, and `is_submodule_modified()`
+/// (submodule.c:1880) classifies *every* line of the submodule's status to build
+/// `d->dirty_submodule`. Stopping early loses whichever of
+/// `DIRTY_SUBMODULE_MODIFIED` / `DIRTY_SUBMODULE_UNTRACKED` came second, which is
+/// what made `status --ignore-submodules=none` print `(modified content)` where
+/// stock prints `(modified content, untracked content)`.
+fn submodule_mode(
+    repo: &gix::Repository,
+    ignore_submodules: Option<gix::submodule::config::Ignore>,
+    untracked: Untracked,
+) -> gix::status::Submodule {
+    use gix::submodule::config::Ignore;
+    if let Some(ignore) = ignore_submodules {
+        return gix::status::Submodule::Given { ignore, check_dirty: false };
+    }
+    // `diff.ignoreSubmodules`, read by `git_diff_basic_config()` into the default
+    // diff options long before `wt_status_collect()` runs.
+    let configured = repo
+        .config_snapshot()
+        .string("diff.ignoreSubmodules")
+        .and_then(|v| Ignore::try_from(v.as_ref()).ok());
+    let fallback = match configured {
+        Some(Ignore::All) => Ignore::All,
+        Some(Ignore::Dirty) => Ignore::Dirty,
+        Some(Ignore::Untracked) => Ignore::Untracked,
+        // Unset or `none`: `-uno`'s lone `ignore_untracked_in_submodules` bit is
+        // then the whole of the flag word.
+        _ if untracked == Untracked::No => Ignore::Untracked,
+        _ => Ignore::None,
+    };
+    gix::status::Submodule::PerSubmoduleOr { fallback, check_dirty: false }
+}
+
 /// `short_submodule_status()` (wt-status.c:449), applied by
 /// `wt_status_collect_changed_cb()` (wt-status.c:488) *only* when the format is
 /// `STATUS_FORMAT_SHORT` — so `git status --short` prints `m`/`?` for a submodule
@@ -2738,12 +2802,7 @@ fn porcelain_v2_output(
     // Rename detection runs as git's own `diffcore_rename()` pass below, over
     // both halves of the report; gix's tracker stays off.
     platform = platform.tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled);
-    if let Some(ignore) = ignore_submodules {
-        platform = platform.index_worktree_submodules(gix::status::Submodule::Given {
-            ignore,
-            check_dirty: true,
-        });
-    }
+    platform = platform.index_worktree_submodules(submodule_mode(repo, ignore_submodules, untracked));
 
     let patterns: Vec<BString> = pathspecs.to_vec();
     for item in platform.into_iter(patterns)? {

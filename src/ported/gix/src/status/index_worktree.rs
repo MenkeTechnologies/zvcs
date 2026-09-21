@@ -329,6 +329,11 @@ pub mod submodule_status {
                         (ignore, check_dirty)
                     }
                 }
+                Submodule::PerSubmoduleOr { fallback, check_dirty } => {
+                    // submodule.c:190-196: `submodule.<name>.ignore` wins over the
+                    // diff-level default the caller folded into `fallback`.
+                    (sm.ignore()?.unwrap_or(fallback), check_dirty)
+                }
                 Submodule::Given { ignore, check_dirty } => (ignore, check_dirty),
             };
             let status = sm.status(ignore, check_dirty)?;

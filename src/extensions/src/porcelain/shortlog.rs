@@ -4,8 +4,11 @@
 //! `revision.c` that shortlog leans on (its option loop hands every option it
 //! does not own to `handle_revision_opt`), plus the two output helpers:
 //! `strbuf_add_wrapped_text()` / `strbuf_add_indented_text()` from `utf8.c`
-//! (the `-w` line wrapper) and `split_ident_line()` from `ident.c` (the stdin
-//! path's `Name <email>` splitter). The commit walk, the mailmap and the ref
+//! (the `-w` line wrapper, shared with every other caller through
+//! [`crate::utf8`], so a subject is measured in `git_wcwidth()` columns and
+//! non-UTF-8 bytes take git's `assume_utf8` retry) and `split_ident_line()` from
+//! `ident.c` (the `Name <email>` splitter the stdin path and
+//! `--group=trailer:<tok>` both run their idents through). The commit walk, the mailmap and the ref
 //! iteration come from the vendored gitoxide crates.
 //!
 //! Covered, byte-for-byte against stock git 2.55:
@@ -17,6 +20,9 @@
 //!     repeated to build git's group bitfield (a commit filed under each field,
 //!     deduped per commit as git does), `--no-group`, and the `unknown group
 //!     type` / `with stdin is not supported` (single and multiple) failures.
+//!     A trailer value shaped like an ident is mailmapped and reduced to the
+//!     bare name unless `-e` asked for the address (`parse_ident()`), which is
+//!     also what lets its key collide with the author group's and be deduped.
 //!   * `--format=<fmt>` — builtin format names are ignored (git only consults
 //!     `--format` when it is a *user* format), user formats are expanded. The
 //!     supported placeholders are `%H %h %T %t %P %p %s %B %n %x## %%`, the
@@ -32,6 +38,9 @@
 //!     a CJK subject costs two per glyph. `%C…` is not among the placeholders
 //!     above, so `format_and_pad_commit()`'s colour chain can never open here.
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
+//!   * `--abbrev[=<n>]` / `--no-abbrev` — `revs->abbrev`, which `%h`, `%t` and
+//!     `%p` render through. The value is clamped to `[MINIMUM_ABBREV, hexsz]`
+//!     with no error for a malformed number, and `--no-abbrev` is the whole name.
 //!   * revision selection: `<rev>`, `^<rev>`, `<a>..<b>`, `<a>...<b>`,
 //!     `<rev>^@` / `<rev>^!` / `<rev>^-[<n>]`, `--not`,
 //!     `--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`,
@@ -174,6 +183,21 @@ struct Opts {
     /// The raw `--date=<fmt>` value, threaded to `%cd`/`%ad` expansion. `None`
     /// leaves those placeholders on git's default (ctime-like) format.
     date_format: Option<String>,
+    /// `revs->abbrev` from `--abbrev[=<n>]` / `--no-abbrev`, which `cmd_shortlog()`
+    /// copies into `ctx.abbrev` (builtin/shortlog.c:461) for `%h`/`%t`/`%p`.
+    /// `None` is git's `DEFAULT_ABBREV` sentinel — the `core.abbrev` default.
+    abbrev: Option<usize>,
+}
+
+/// `--abbrev[=<n>]` / `--no-abbrev` as the command line gave it, held until the
+/// repository's hash width is known. git's `DEFAULT_ABBREV` sentinel — the
+/// `core.abbrev` default — is the absence of this value.
+enum AbbrevArg {
+    /// `--no-abbrev`: `revs->abbrev = 0` (revision.c:2639-2640), which every id
+    /// placeholder renders as the whole name.
+    Full,
+    /// `--abbrev=<n>`, unclamped (revision.c:2643-2648 clamps against `hexsz`).
+    Len(String),
 }
 
 /// git's `log->groups` bitfield, reduced to the single group this port accepts.
@@ -281,6 +305,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         groups: Vec::new(),
         user_format: None,
         date_format: None,
+        abbrev: None,
     };
 
     let mut filters = Filters {
@@ -330,6 +355,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // only after the parse loop and the revision-resolution loop have had their
     // chance to emit git's exact exit code. Holds the first such flag as written.
     let mut unsupported: Option<String> = None;
+    let mut abbrev_arg: Option<AbbrevArg> = None;
 
     // Once git has consumed any option other than a ref-selecting pseudo-option,
     // the argv slot its error reporter reads has moved on, and a later unknown
@@ -610,6 +636,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         return Ok(ExitCode::from(128));
                     }
                 },
+                // `handle_revision_opt()` (revision.c:2639-2648). `--abbrev`
+                // restores git's `DEFAULT_ABBREV` sentinel, `--no-abbrev` zeroes
+                // `revs->abbrev` (which every id placeholder reads as "the whole
+                // name"), and `--abbrev=<n>` is clamped to
+                // `[MINIMUM_ABBREV, hexsz]` with no error for a bad number.
+                ("abbrev", None) => abbrev_arg = None,
+                ("no-abbrev", None) => abbrev_arg = Some(AbbrevArg::Full),
+                ("abbrev", Some(v)) => abbrev_arg = Some(AbbrevArg::Len(v.to_string())),
                 _ => return Ok(unknown_option(a, argv_consumed)),
             }
             argv_consumed = true;
@@ -726,6 +760,18 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     filters.commit_filter.invert_grep = filters.invert_grep;
 
     let repo = crate::setup::discover().ok();
+    // `revision.c` clamps `--abbrev=<n>` against the repository's hash width, so
+    // the value can only be resolved once the repository is open. Outside one,
+    // `cmd_shortlog()` pins SHA-1 (builtin/shortlog.c:421-422).
+    opts.abbrev = abbrev_arg.map(|arg| {
+        let hexsz = repo
+            .as_ref()
+            .map_or(40, |repo| repo.object_hash().len_in_hex());
+        match arg {
+            AbbrevArg::Full => hexsz,
+            AbbrevArg::Len(v) => crate::abbrev::parse_abbrev_arg(&v, hexsz),
+        }
+    });
     // Outside a repository shortlog reads stdin and never reaches `commit_match()`.
     filters.commit_filter.output_encoding = repo.as_ref().map_or_else(
         || "UTF-8".to_string(),
@@ -1744,7 +1790,7 @@ fn one_record(
     } else {
         let text = match &opts.user_format {
             Some(fmt) => {
-                expand_format(repo, &commit, parents, mailmap, fmt, opts.date_format.as_deref())?
+                expand_format(repo, &commit, parents, mailmap, fmt, Render::from(opts))?
             }
             None => commit.message()?.summary().into_owned(),
         };
@@ -1781,7 +1827,7 @@ fn group_keys(
                 &mut keys,
             ),
             GroupBy::Format(fmt) => push(
-                expand_format(repo, commit, parents, mailmap, fmt, opts.date_format.as_deref())?,
+                expand_format(repo, commit, parents, mailmap, fmt, Render::from(opts))?,
                 &mut keys,
             ),
             GroupBy::Trailer(token) => {
@@ -1791,7 +1837,25 @@ fn group_keys(
                         .trailers()
                         .filter(|t| t.token.eq_ignore_ascii_case(token.as_bytes()))
                     {
-                        push(BString::from(trailer.value.to_vec()), &mut keys);
+                        // `insert_records_from_trailers()` runs the value
+                        // through `parse_ident()` first (builtin/shortlog.c:200):
+                        // a value shaped like `Name <mail>` is mailmapped and
+                        // reduced to the bare name unless `-e` asked for the
+                        // address. A value that does not split is grouped raw.
+                        let value = trailer.value.as_ref();
+                        let key = match split_ident_line(value) {
+                            Some((name, email)) => format_ident(
+                                gix::actor::SignatureRef {
+                                    name,
+                                    email,
+                                    time: "",
+                                },
+                                mailmap,
+                                opts.email,
+                            ),
+                            None => BString::from(value.to_vec()),
+                        };
+                        push(key, &mut keys);
                     }
                 }
             }
@@ -1816,15 +1880,44 @@ fn group_keys(
 /// `format_and_pad_commit()`'s `%C…` chain is absent because [`expand_one`]
 /// refuses `%C` outright, so a colour atom can never open a chain here.
 ///
-/// `date_format` is the `--date=<fmt>` value that `%ad`/`%cd` honour
+/// `render` carries the `--date=<fmt>` and `--abbrev` knobs
 /// (`None` = git's default ctime-like format).
+/// The `pretty_print_context` fields shortlog fills in before formatting:
+/// `ctx.date_mode` from `--date=<fmt>` and `ctx.abbrev` from `revs->abbrev`
+/// (builtin/shortlog.c:461-463).
+#[derive(Clone, Copy)]
+struct Render<'a> {
+    date_format: Option<&'a str>,
+    /// `None` is git's `DEFAULT_ABBREV`: let `core.abbrev` decide.
+    abbrev: Option<usize>,
+}
+
+impl<'a> Render<'a> {
+    fn from(opts: &'a Opts) -> Self {
+        Self {
+            date_format: opts.date_format.as_deref(),
+            abbrev: opts.abbrev,
+        }
+    }
+
+    /// `repo_find_unique_abbrev()` at this run's width: the configured default
+    /// when `--abbrev` was never given, and otherwise the requested floor,
+    /// widened until the prefix is unique.
+    fn short_id(&self, repo: &gix::Repository, id: &ObjectId) -> String {
+        match self.abbrev {
+            Some(len) => crate::abbrev::unique_abbrev(repo, id, len),
+            None => id.attach(repo).shorten_or_id().to_string(),
+        }
+    }
+}
+
 fn expand_format(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parents: Option<&[ObjectId]>,
     mailmap: &crate::mailmap::Mailmap,
     fmt: &str,
-    date_format: Option<&str>,
+    render: Render<'_>,
 ) -> Result<BString> {
     let mut out: Vec<u8> = Vec::new();
     let bytes = fmt.as_bytes();
@@ -1849,7 +1942,7 @@ fn expand_format(
         // nothing, which is how git rescans from that character.
         let mut at = i + 1;
         if pad.flush == FlushType::None {
-            if !expand_one(&mut out, repo, commit, parents, mailmap, bytes, &mut at, date_format, &mut pad, &mut wrap)? {
+            if !expand_one(&mut out, repo, commit, parents, mailmap, bytes, &mut at, render, &mut pad, &mut wrap)? {
                 out.push(b'%');
             }
             i = at;
@@ -1861,7 +1954,7 @@ fn expand_format(
         let padding = pad.padding;
         let mut local: Vec<u8> = Vec::new();
         let consumed =
-            expand_one(&mut local, repo, commit, parents, mailmap, bytes, &mut at, date_format, &mut pad, &mut wrap)?;
+            expand_one(&mut local, repo, commit, parents, mailmap, bytes, &mut at, render, &mut pad, &mut wrap)?;
         pad.apply(&mut out, local, padding, 0);
         if !consumed {
             out.push(b'%');
@@ -1900,7 +1993,7 @@ fn expand_one(
     mailmap: &crate::mailmap::Mailmap,
     bytes: &[u8],
     at: &mut usize,
-    date_format: Option<&str>,
+    render: Render<'_>,
     pad: &mut PadState,
     wrap: &mut WrapState,
 ) -> Result<bool> {
@@ -1961,13 +2054,11 @@ fn expand_one(
         match next {
             b'n' => out.push(b'\n'),
             b'H' => out.extend_from_slice(commit.id.to_string().as_bytes()),
-            b'h' => {
-                let prefix = commit.id.attach(repo).shorten_or_id();
-                out.extend_from_slice(prefix.to_string().as_bytes());
-            }
+            b'h' => out.extend_from_slice(render.short_id(repo, &commit.id).as_bytes()),
             b'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
             b't' => {
-                out.extend_from_slice(commit.tree_id()?.shorten_or_id().to_string().as_bytes());
+                let tree = commit.tree_id()?.detach();
+                out.extend_from_slice(render.short_id(repo, &tree).as_bytes());
             }
             // `%P`/`%p` read `commit->parents`, which history simplification has
             // already rewritten in place by the time a record is formatted.
@@ -1984,8 +2075,7 @@ fn expand_one(
                     if n > 0 {
                         out.push(b' ');
                     }
-                    let short = parent.attach(repo).shorten_or_id();
-                    out.extend_from_slice(short.to_string().as_bytes());
+                    out.extend_from_slice(render.short_id(repo, &parent).as_bytes());
                 }
             }
             b's' => {
@@ -2046,7 +2136,7 @@ fn expand_one(
                     // timezone offset, matching git.
                     b't' | b'i' | b'I' | b'D' | b'd' | b's' => {
                         let time = raw.time().map_err(|e| anyhow!("{e}"))?;
-                        out.extend_from_slice(sig_date(time, which, date_format)?.as_bytes());
+                        out.extend_from_slice(sig_date(time, which, render.date_format)?.as_bytes());
                     }
                     // `%ar`/`%cr`: relative date, rendered by the shared
                     // `show_date_relative` port against git's "now" reference.
@@ -2308,7 +2398,13 @@ fn render(groups: &BTreeMap<BString, Group>, opts: &Opts, out: &mut Vec<u8>) {
         };
         for msg in ordered {
             if opts.wrap_lines {
-                add_wrapped_text(out, msg, opts.in1, opts.in2, opts.wrap);
+                crate::utf8::strbuf_add_wrapped_text(
+                    out,
+                    msg,
+                    opts.in1 as i32,
+                    opts.in2 as i32,
+                    opts.wrap as i32,
+                );
             } else {
                 out.extend_from_slice(b"      ");
                 out.extend_from_slice(msg);
@@ -2614,92 +2710,6 @@ fn tree_object(repo: &gix::Repository, id: ObjectId) -> Option<gix::Tree<'_>> {
         return None;
     }
     Some(object.into_tree())
-}
-
-/// Byte length of the UTF-8 sequence introduced by `b`; 1 for a stray byte.
-fn utf8_seq_len(b: u8) -> usize {
-    match b {
-        0x00..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        0xf0..=0xf7 => 4,
-        _ => 1,
-    }
-}
-
-/// Port of `strbuf_add_indented_text()` (`utf8.c`), git's `-w0` path.
-fn add_indented_text(out: &mut Vec<u8>, text: &[u8], indent1: usize, indent2: usize) {
-    let mut indent = indent1;
-    let mut pos = 0;
-    while pos < text.len() {
-        let eol = match text[pos..].iter().position(|&b| b == b'\n') {
-            Some(n) => pos + n + 1,
-            None => text.len(),
-        };
-        out.resize(out.len() + indent, b' ');
-        out.extend_from_slice(&text[pos..eol]);
-        pos = eol;
-        indent = indent2;
-    }
-}
-
-/// Port of `strbuf_add_wrapped_text()` (`utf8.c`).
-///
-/// Structure follows the C loop exactly, including its habit of emitting the
-/// run of whitespace that precedes a word together with that word — which is
-/// why a wrapped line can keep a trailing space and why runs of spaces survive
-/// wrapping. Two branches of the original are absent because the caller cannot
-/// reach them: shortlog always passes a single line (no `\n` handling), and
-/// subjects carry no ANSI escapes (no `display_mode_esc_sequence_len` skip).
-/// Column width is counted per code point rather than via `wcwidth()`.
-fn add_wrapped_text(out: &mut Vec<u8>, text: &[u8], indent1: usize, indent2: usize, width: usize) {
-    if width == 0 {
-        add_indented_text(out, text, indent1, indent2);
-        return;
-    }
-
-    let mut bol = 0usize;
-    let mut indent = indent1;
-    let mut w = indent1;
-    let mut space: Option<usize> = None;
-    let mut i = 0usize;
-
-    loop {
-        let c = text.get(i).copied();
-        let Some(byte) = c.filter(|&b| !is_space(b)) else {
-            // Whitespace, or the end of the text (C's NUL terminator).
-            if w <= width || space.is_none() {
-                let mut start = bol;
-                if c.is_none() && i == start {
-                    return;
-                }
-                match space {
-                    Some(s) => start = s,
-                    None => out.resize(out.len() + indent, b' '),
-                }
-                out.extend_from_slice(&text[start..i]);
-                let Some(c) = c else { return };
-                space = Some(i);
-                if c == b'\t' {
-                    w |= 0x07;
-                }
-                w += 1;
-                i += 1;
-            } else {
-                out.push(b'\n');
-                let s = space.expect("the `||` above guarantees a break point here");
-                i = s + usize::from(text.get(s).is_some_and(|&b| is_space(b)));
-                bol = i;
-                space = None;
-                indent = indent2;
-                w = indent2;
-            }
-            continue;
-        };
-
-        w += 1;
-        i += utf8_seq_len(byte).min(text.len() - i);
-    }
 }
 
 #[cfg(test)]

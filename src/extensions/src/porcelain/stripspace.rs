@@ -27,12 +27,14 @@
 //! * `--` ends option parsing; a bare `-` is a positional. `-h` anywhere prints
 //!   git's usage block on stdout and exits 129; any positional argument prints
 //!   the same block on stderr and exits 129.
-//! * Option errors in git's own shapes: `` error: unknown option `x' `` and
-//!   `` error: unknown switch `x' `` followed by the usage block (129);
-//!   `` error: option `strip-comments' takes no value `` (129); and the
-//!   cmdmode conflict `error: options '-c' and '-s' cannot be used together`
-//!   with no usage block (129), which names each option with the spelling it was
-//!   given. Repeating the same mode is not an error.
+//! * Option errors in git's own shapes, which differ in whether the usage block
+//!   follows: `` error: unknown option `x' `` and `` error: unknown switch `x' ``
+//!   print it (`PARSE_OPT_UNKNOWN`, parse-options.c:1214-1223), while
+//!   `` error: option `strip-comments' takes no value `` and the cmdmode conflict
+//!   `error: options '-c' and '-s' cannot be used together` do not
+//!   (`PARSE_OPT_ERROR`, parse-options.c:1200-1201). All exit 129, and the
+//!   conflict names each option with the spelling it was given. Repeating the
+//!   same mode is not an error.
 //! * Unambiguous long-option abbreviations (`--strip`, `--comment`), as
 //!   `parse_options` accepts them; the error text still names the full option.
 //!   An ambiguous name (`--=x`, whose option name is empty and so prefixes both)
@@ -130,7 +132,13 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
                 }
             };
             if value.is_some() {
-                return Ok(usage_error(&format!("option `{full_name}' takes no value")));
+                // `do_get_value()` returns `error()` — i.e. `PARSE_OPT_ERROR` —
+                // for a NOARG option given a value (parse-options.c:142-143),
+                // and `parse_options()` turns that straight into `exit(129)`
+                // with no usage block (parse-options.c:1200-1201). Only
+                // `PARSE_OPT_UNKNOWN` prints the usage (parse-options.c:1223).
+                eprintln!("error: option `{full_name}' takes no value");
+                return Ok(ExitCode::from(129));
             }
             let given = format!("--{full_name}");
             if let Err(code) = set_mode(&mut mode, &mut mode_spelling, opt_mode, &given) {

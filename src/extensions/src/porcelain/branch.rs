@@ -578,18 +578,68 @@ enum ListMode {
 /// order (the last one wins).
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Track {
-    /// Neither `--track` nor `--no-track` given: auto-track per `branch.autoSetupMerge`.
+    /// Neither `--track` nor `--no-track` given yet. Not one of git's values:
+    /// git seeds `track` from `cfg->branch_track` before `parse_options()` runs,
+    /// and this port cannot read the configuration until the repository is
+    /// open, so the CLI pass leaves this and [`branch`] replaces it with
+    /// [`config_branch_track`]'s answer. It never survives into a decision.
     Unset,
-    /// `--no-track`: never set up tracking.
-    No,
-    /// `-t` / `--track` / `--track=direct`: track the start-point's remote directly.
-    Direct,
-    /// `--track=inherit`: copy the start-point branch's own upstream configuration.
-    Inherit,
-    /// The hidden `--set-upstream`: `OPT_SET_INT_F(0, "set-upstream", &track,
-    /// N_("do not use"), BRANCH_TRACK_OVERRIDE, PARSE_OPT_HIDDEN)`. Accepted by
-    /// the parser, then refused by name in the creation path.
+    /// `BRANCH_TRACK_NEVER` — `--no-track`, or `branch.autoSetupMerge=false`.
+    Never,
+    /// `BRANCH_TRACK_REMOTE` — the default, and `branch.autoSetupMerge=true`:
+    /// track when the start-point is a remote-tracking ref.
+    Remote,
+    /// `BRANCH_TRACK_ALWAYS` — `branch.autoSetupMerge=always`: track a local
+    /// start-point too.
+    Always,
+    /// `BRANCH_TRACK_EXPLICIT` — `-t` / `--track` / `--track=direct`.
+    Explicit,
+    /// `BRANCH_TRACK_OVERRIDE` — the hidden `--set-upstream`:
+    /// `OPT_SET_INT_F(0, "set-upstream", &track, N_("do not use"),
+    /// BRANCH_TRACK_OVERRIDE, PARSE_OPT_HIDDEN)`. Accepted by the parser, then
+    /// refused by name in the creation path; `--set-upstream-to` reaches
+    /// `dwim_and_setup_tracking()` with it.
     Override,
+    /// `BRANCH_TRACK_INHERIT` — `--track=inherit` or
+    /// `branch.autoSetupMerge=inherit`: copy the start branch's own upstream.
+    Inherit,
+    /// `BRANCH_TRACK_SIMPLE` — `branch.autoSetupMerge=simple`: track only when
+    /// the remote-side branch name matches the new branch's.
+    Simple,
+}
+
+/// `git_default_branch_config()`'s `branch.autosetupmerge` arm
+/// (environment.c:582-595), which seeds `cfg->branch_track`:
+///
+/// ```c
+/// if (!strcmp(var, "branch.autosetupmerge")) {
+///         if (value && !strcmp(value, "always")) { cfg->branch_track = BRANCH_TRACK_ALWAYS; return 0; }
+///         else if (value && !strcmp(value, "inherit")) { cfg->branch_track = BRANCH_TRACK_INHERIT; return 0; }
+///         else if (value && !strcmp(value, "simple")) { cfg->branch_track = BRANCH_TRACK_SIMPLE; return 0; }
+///         cfg->branch_track = git_config_bool(var, value);
+///         return 0;
+/// }
+/// ```
+///
+/// `git_config_bool()` yields 1 (`BRANCH_TRACK_REMOTE`) or 0
+/// (`BRANCH_TRACK_NEVER`), and an unset key leaves the `BRANCH_TRACK_REMOTE`
+/// the repository's configuration starts at. A `--track` on the command line
+/// *replaces* this, which is why `--track=direct` beats
+/// `branch.autoSetupMerge=inherit` rather than being read through it.
+fn config_branch_track(repo: &gix::Repository) -> Track {
+    let snap = repo.config_snapshot();
+    let raw = snap.string("branch.autoSetupMerge");
+    let Some(raw) = raw else { return Track::Remote };
+    let text = raw.to_str_lossy().into_owned();
+    match text.as_str() {
+        "always" => Track::Always,
+        "inherit" => Track::Inherit,
+        "simple" => Track::Simple,
+        _ => match snap.boolean("branch.autoSetupMerge") {
+            Some(false) => Track::Never,
+            _ => Track::Remote,
+        },
+    }
 }
 
 /// `--color[=<when>]` tri-state, matching `git branch`'s default of `auto`.
@@ -832,7 +882,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
                             o.copy = true;
                             o.force = true;
                         }
-                        't' => o.track = Track::Direct,
+                        't' => o.track = Track::Explicit,
                         'f' => o.force = true,
                         // parse_options_step(): `if (internal_help && *ctx->opt
                         // == 'h')` is tested inside the short-option loop, so a
@@ -990,6 +1040,15 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
 
+    // `track = cfg->branch_track;` (builtin/branch.c:799) seeds `track` from
+    // `branch.autoSetupMerge` *before* `parse_options()` runs, so `--track` and
+    // `--no-track` overwrite it rather than being read alongside it. This port
+    // cannot read the configuration until the repository is open, so the
+    // command-line pass leaves [`Track::Unset`] behind and the seed lands here.
+    if o.track == Track::Unset {
+        o.track = config_branch_track(&repo);
+    }
+
     // `git_branch_config()` runs `color_parse()` on every `color.branch.<slot>`
     // it recognizes while configuration is being read, so an unparseable spec is
     // fatal for *every* `git branch` invocation — deletes and renames included,
@@ -1130,7 +1189,7 @@ fn apply_long(
         ("quiet", n) => o.quiet = !n,
         ("track", false) => {
             o.track = match value.as_deref() {
-                None | Some("direct") => Track::Direct,
+                None | Some("direct") => Track::Explicit,
                 Some("inherit") => Track::Inherit,
                 Some(_) => {
                     return value_error("option `--track' expects \"direct\" or \"inherit\"")
@@ -1138,12 +1197,12 @@ fn apply_long(
                 }
             }
         }
-        ("track", true) => o.track = Track::No,
+        ("track", true) => o.track = Track::Never,
         // The hidden `--set-upstream` only selects BRANCH_TRACK_OVERRIDE here;
         // the creation path is where git refuses it by name. `OPT_SET_INT`
         // unset writes 0, which is the same "never track" `--no-track` picks.
         ("set-upstream", false) => o.track = Track::Override,
-        ("set-upstream", true) => o.track = Track::No,
+        ("set-upstream", true) => o.track = Track::Never,
         ("set-upstream-to", false) => o.set_upstream_to = value,
         ("set-upstream-to", true) => o.set_upstream_to = None,
         ("unset-upstream", n) => o.unset_upstream = !n,
@@ -1918,23 +1977,15 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             Start::Stop(code) => return Ok(code),
         };
 
-    // Decide tracking before touching the ref: git dies (without creating the
-    // branch) if `--track` was explicit but the start-point is not a branch.
-    let start_ref_bstr = start_ref.as_ref().map(|b| b.as_bstr());
-    if let Some(code) = ambiguous_tracking(repo, start_ref_bstr, o.track)? {
-        return Ok(code);
-    }
-    let upstream = tracking_upstream(repo, start_ref_bstr, o.track, name);
-    if matches!(o.track, Track::Direct | Track::Inherit) && upstream.is_none() {
-        return fatal(format!(
-            "cannot set up tracking information; starting point '{start_name}' is not a branch"
-        ));
-    }
-
     // Serialize the ref read-modify-write through the repo coordinator.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let existed = repo.try_find_reference(full.as_str())?.is_some();
+    // `validate_new_branchname()`'s `refs_ref_exists()` (branch.c:474, refs.c),
+    // which is `refs_resolve_ref_unsafe(refs, refname, RESOLVE_REF_READING, …)`:
+    // the chain is *followed*, so a branch that is a symref onto a name with no
+    // object behind it does not exist for this question. `try_find_reference()`
+    // answers about the file alone and reported such a branch as present.
+    let existed = crate::refname::ref_exists(repo, full.as_bytes());
     if existed && !o.force {
         return fatal(format!("a branch named '{name}' already exists"));
     }
@@ -1991,8 +2042,19 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         deref: false,
     })?;
 
-    if let Some(up) = upstream {
-        install_tracking(repo, name, &up, o.quiet)?;
+    // ```c
+    // if (real_ref && track)
+    //         setup_tracking(ref.buf + 11, real_ref, track, quiet);
+    // ```
+    // (branch.c:644-645), *after* the ref transaction — which is why
+    // `git branch all1 main` with two remotes claiming `refs/heads/main`
+    // creates `all1` and only then fails with `not tracking: ambiguous
+    // information`. The refusal for an explicit `--track` on a start-point that
+    // is not a branch happened earlier, inside `dwim_branch_start()`.
+    if let (Some(real_ref), true) = (&start_ref, o.track != Track::Never) {
+        if let Some(code) = setup_tracking(repo, name, real_ref.as_bstr(), o.track, o.quiet)? {
+            return Ok(code);
+        }
     }
 
     Ok(ExitCode::SUCCESS)
@@ -2072,7 +2134,7 @@ enum Start {
 ///     (`BRANCH_TRACK_EXPLICIT`, `BRANCH_TRACK_OVERRIDE`);
 ///     `--track=inherit` is not in it.
 fn dwim_branch_start(repo: &gix::Repository, start_name: &str, track: Track) -> Result<Start> {
-    let explicit_tracking = matches!(track, Track::Direct | Track::Override);
+    let explicit_tracking = matches!(track, Track::Explicit | Track::Override);
 
     let Some(id) = get_oid_mb(repo, start_name) else {
         if explicit_tracking {
@@ -2113,7 +2175,7 @@ fn dwim_branch_start(repo: &gix::Repository, start_name: &str, track: Track) -> 
         // remote-tracking branch" — exactly when no remote's fetch refspec has
         // this ref as its destination.
         let is_branch = r.to_str_lossy().starts_with("refs/heads/")
-            || !remotes_fetching_into(repo, r.as_bstr()).is_empty();
+            || !find_tracked_branch(repo, r.as_bstr()).is_empty();
         if !is_branch {
             if explicit_tracking {
                 return Ok(Start::Stop(not_a_branch()?));
@@ -2209,186 +2271,364 @@ fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     }
 }
 
-/// `setup_tracking()`'s `for_each_remote(find_tracked_branch)` pass (branch.c):
-/// before deciding an upstream, git asks which remotes' *fetch* refspecs map
-/// onto the start-point ref. Two or more is a configuration error it refuses to
-/// guess through — it dies naming the remotes, without creating the branch, and
-/// the list of them is the `advice.ambiguousFetchRefspec` hint.
+/// `setup_tracking()` (branch.c:252-351): decide and record the upstream of a
+/// newly created branch — or of the branch `--set-upstream-to` names.
 ///
-/// Returns `Some(128)` when the caller must stop. The scan is skipped exactly
-/// where git skips it: with `--no-track`, for a start-point that is not a ref,
-/// for `--track=inherit` (which reads the start branch's own upstream instead of
-/// consulting remotes), and when `branch.autoSetupMerge=false` left git's
-/// `track` at `BRANCH_TRACK_NEVER` — but an explicit `--track` overrides that
-/// last one, and even `branch.autoSetupMerge=simple` reaches the check before it
-/// gets to compare names.
-fn ambiguous_tracking(
+/// ```c
+/// tracking.spec.dst = (char *)orig_ref;
+/// tracking.srcs = &tracking_srcs;
+/// if (track != BRANCH_TRACK_INHERIT)
+///         for_each_remote(find_tracked_branch, &ftb_cb);
+/// else if (inherit_tracking(&tracking, orig_ref))
+///         goto cleanup;
+///
+/// if (!tracking.matches)
+///         switch (track) {
+///         case BRANCH_TRACK_ALWAYS:
+///         case BRANCH_TRACK_EXPLICIT:
+///         case BRANCH_TRACK_OVERRIDE:
+///         case BRANCH_TRACK_INHERIT:
+///                 break;
+///         default:
+///                 goto cleanup;
+///         }
+///
+/// if (tracking.matches > 1) { … die("not tracking: ambiguous information for ref '%s'") … }
+///
+/// if (track == BRANCH_TRACK_SIMPLE) {
+///         const char *tracked_branch;
+///         if (!skip_prefix(tracking.srcs->items[0].string, "refs/heads/", &tracked_branch) ||
+///             strcmp(tracked_branch, new_ref))
+///                 goto cleanup;
+/// }
+///
+/// if (tracking.srcs->nr < 1)
+///         string_list_append(tracking.srcs, orig_ref);
+/// if (install_branch_config_multiple_remotes(config_flags, new_ref,
+///                         tracking.remote, tracking.srcs) < 0)
+///         exit(1);
+/// ```
+///
+/// What the port used to do instead was read the *shape of `orig_ref`*: a
+/// `refs/remotes/<remote>/<rest>` name was split on the first slash and taken to
+/// name a remote and a branch. Three things fall out of doing it git's way:
+///
+///   * The recorded `merge` is the refspec's **source**, not the tail of the
+///     remote-tracking name. With `remote.<r>.fetch = refs/tags/*:refs/remotes/<r>/*`
+///     the source is `refs/tags/<x>`, which is why `branch.autoSetupMerge=simple`
+///     declines it — its `skip_prefix(…, "refs/heads/", …)` fails — while the
+///     shape-reading version compared `<x>` with the new branch's name and
+///     tracked it.
+///   * `BRANCH_TRACK_INHERIT` is reached through `track`, never through
+///     `branch.autoSetupMerge` being read a second time here, so an explicit
+///     `--track=direct` overrides `branch.autoSetupMerge=inherit` instead of
+///     being overridden by it.
+///   * The ambiguity die happens *here*, after `create_branch()` has already
+///     written the ref (branch.c:632-645) — `git branch all1 main` with two
+///     remotes claiming `refs/heads/main` creates `all1` and then fails.
+///
+/// Returns `Some(code)` when git exits; the caller returns it.
+fn setup_tracking(
     repo: &gix::Repository,
-    start_ref: Option<&BStr>,
+    new_ref: &str,
+    orig_ref: &BStr,
     track: Track,
+    quiet: bool,
 ) -> Result<Option<ExitCode>> {
-    if track == Track::No {
+    if track == Track::Never {
+        // `if (!track) BUG("asked to set up tracking, but tracking is disallowed")`
+        // — the callers guard this, and so do ours.
         return Ok(None);
     }
-    let Some(orig_ref) = start_ref else { return Ok(None) };
-    let snap = repo.config_snapshot();
-    let mode = snap
-        .string("branch.autoSetupMerge")
-        .map(|v| v.to_str_lossy().to_ascii_lowercase());
-    let mode = mode.as_deref();
-    let explicit = matches!(track, Track::Direct | Track::Inherit);
-    if track == Track::Inherit || mode == Some("inherit") {
-        return Ok(None);
+    let mut srcs: Vec<String>;
+    let mut remote: Option<String>;
+    let mut matches = 0usize;
+    let mut ambiguous_remotes: Vec<String> = Vec::new();
+
+    if track != Track::Inherit {
+        let found = find_tracked_branch(repo, orig_ref);
+        matches = found.len();
+        match matches {
+            1 => {
+                srcs = vec![found[0].1.clone()];
+                remote = Some(found[0].0.clone());
+            }
+            0 => {
+                srcs = Vec::new();
+                remote = None;
+            }
+            _ => {
+                srcs = Vec::new();
+                remote = None;
+                ambiguous_remotes = found.into_iter().map(|(r, _)| r).collect();
+            }
+        }
+    } else {
+        let Some((r, s)) = inherit_tracking(repo, orig_ref) else {
+            return Ok(None);
+        };
+        remote = Some(r);
+        srcs = s;
     }
-    if !explicit && matches!(mode, Some("false" | "no" | "off" | "0")) {
+
+    if matches == 0
+        && !matches!(
+            track,
+            Track::Always | Track::Explicit | Track::Override | Track::Inherit
+        )
+    {
         return Ok(None);
     }
 
-    let matches = remotes_fetching_into(repo, orig_ref);
-    if matches.len() < 2 {
-        return Ok(None);
+    if matches > 1 {
+        eprintln!("fatal: not tracking: ambiguous information for ref '{orig_ref}'");
+        let listed: String = ambiguous_remotes.iter().map(|n| format!("  {n}\n")).collect();
+        crate::advice::Advice::AmbiguousFetchRefspec.advise_plain_in(
+            repo,
+            &format!(
+                "There are multiple remotes whose fetch refspecs map to the remote\n\
+                 tracking ref '{orig_ref}':\n\
+                 {listed}\n\
+                 This is typically a configuration error.\n\
+                 \n\
+                 To support setting up tracking branches, ensure that\n\
+                 different remotes' fetch refspecs map into different\n\
+                 tracking namespaces."
+            ),
+        );
+        return Ok(Some(ExitCode::from(128)));
     }
-    eprintln!("fatal: not tracking: ambiguous information for ref '{orig_ref}'");
-    let mut listed = String::new();
-    for name in &matches {
-        listed.push_str(&format!("  {name}\n"));
+
+    if track == Track::Simple {
+        let tracked_branch = srcs.first().and_then(|s| s.strip_prefix("refs/heads/"));
+        if tracked_branch != Some(new_ref) {
+            return Ok(None);
+        }
     }
-    crate::advice::Advice::AmbiguousFetchRefspec.advise_plain_in(
+
+    if srcs.is_empty() {
+        srcs.push(orig_ref.to_str_lossy().into_owned());
+    }
+    // `install_branch_config_multiple_remotes()`'s `origin ? origin : "."`.
+    let origin = remote.take();
+    Ok(install_branch_config_multiple_remotes(
         repo,
-        &format!(
-            "There are multiple remotes whose fetch refspecs map to the remote\n\
-             tracking ref '{orig_ref}':\n\
-             {listed}\n\
-             This is typically a configuration error.\n\
-             \n\
-             To support setting up tracking branches, ensure that\n\
-             different remotes' fetch refspecs map into different\n\
-             tracking namespaces."
-        ),
-    );
-    Ok(Some(ExitCode::from(128)))
+        new_ref,
+        origin.as_deref(),
+        &srcs,
+        quiet,
+    )?)
 }
 
-/// `find_tracked_branch()` reduced to what the ambiguity check needs: the names
-/// of the remotes with a fetch refspec whose destination covers `name`. Mirrors
-/// `refspec_find_match()`'s dst-side lookup — refspecs with no destination and
-/// negative (`^`) ones are skipped, and a destination containing `*` matches by
-/// prefix and suffix (`match_name_with_pattern`).
-fn remotes_fetching_into(repo: &gix::Repository, name: &BStr) -> Vec<String> {
+/// `find_tracked_branch()` (branch.c:35-59) run over every remote: the
+/// `(remote name, refspec source)` pairs whose fetch refspec has `name` as its
+/// *destination*.
+///
+/// ```c
+/// if (!remote_find_tracking(remote, &tracking->spec)) {
+///         switch (++tracking->matches) {
+///         case 1:
+///                 string_list_append_nodup(tracking->srcs, tracking->spec.src);
+///                 tracking->remote = remote->name;
+///                 break;
+///         case 2:
+///                 string_list_append(&ftb->ambiguous_remotes, tracking->remote);
+///                 /* fall through */
+///         default:
+///                 string_list_append(&ftb->ambiguous_remotes, remote->name);
+///                 …
+///         }
+/// }
+/// ```
+///
+/// `remote_find_tracking()` with `query.dst` set is `refspec_find_match()`'s
+/// dst-side lookup, which fills `query.src` by substituting the matched `*`
+/// back into the refspec's source. Negative (`^`) refspecs and ones with no
+/// destination are skipped (`match_name_with_pattern`, remote.c).
+fn find_tracked_branch(repo: &gix::Repository, name: &BStr) -> Vec<(String, String)> {
     let needle: &[u8] = name.as_ref();
-    let mut hits = Vec::new();
+    let mut hits: Vec<(String, String)> = Vec::new();
     for remote_name in repo.remote_names() {
         let Ok(remote) = repo.find_remote(&*remote_name) else { continue };
-        let covered = remote.refspecs(gix::remote::Direction::Fetch).iter().any(|spec| {
+        let mut src = None;
+        for spec in remote.refspecs(gix::remote::Direction::Fetch) {
             let gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::AndUpdate {
+                src: spec_src,
                 dst,
                 ..
             }) = spec.to_ref().instruction()
             else {
-                return false;
+                continue;
             };
             let dst: &[u8] = dst.as_ref();
+            let spec_src: &[u8] = spec_src.as_ref();
             match dst.iter().position(|&b| b == b'*') {
                 Some(star) => {
                     let (prefix, suffix) = (&dst[..star], &dst[star + 1..]);
-                    needle.len() >= prefix.len() + suffix.len()
-                        && needle.starts_with(prefix)
-                        && needle.ends_with(suffix)
+                    if needle.len() < prefix.len() + suffix.len()
+                        || !needle.starts_with(prefix)
+                        || !needle.ends_with(suffix)
+                    {
+                        continue;
+                    }
+                    // `match_name_with_pattern()`'s substitution into the other
+                    // side: the matched middle replaces the source's own `*`.
+                    let middle = &needle[prefix.len()..needle.len() - suffix.len()];
+                    let filled = match spec_src.iter().position(|&b| b == b'*') {
+                        Some(s) => {
+                            let mut v = spec_src[..s].to_vec();
+                            v.extend_from_slice(middle);
+                            v.extend_from_slice(&spec_src[s + 1..]);
+                            v
+                        }
+                        None => spec_src.to_vec(),
+                    };
+                    src = Some(String::from_utf8_lossy(&filled).into_owned());
                 }
-                None => dst == needle,
+                None => {
+                    if dst != needle {
+                        continue;
+                    }
+                    src = Some(String::from_utf8_lossy(spec_src).into_owned());
+                }
             }
-        });
-        if covered {
-            hits.push(remote_name.to_str_lossy().into_owned());
+            break;
+        }
+        if let Some(src) = src {
+            hits.push((remote_name.to_str_lossy().into_owned(), src));
         }
     }
     hits
 }
 
-/// The upstream a branch should track: `(remote, merge_ref, short)`. Auto-set
-/// when the start-point is a remote-tracking branch (git's default
-/// `branch.autoSetupMerge=true`); a local branch is tracked only with an explicit
-/// `--track`. `--no-track` disables it. `--track=inherit` copies the start
-/// branch's own upstream. Mirrors `git switch`'s tracking logic.
-fn tracking_upstream(
-    repo: &gix::Repository,
-    start_ref: Option<&BStr>,
-    track: Track,
-    new_branch: &str,
-) -> Option<(String, String, String)> {
-    if track == Track::No {
-        return None;
-    }
-    let full = start_ref?;
-    let s = full.to_str_lossy();
-    let explicit = matches!(track, Track::Direct | Track::Inherit);
-
+/// `inherit_tracking()` (branch.c:217-243): the start branch's own
+/// `branch.<b>.remote` and every `branch.<b>.merge`, or `None` with the warning
+/// git prints for each missing half.
+///
+/// ```c
+/// branch = branch_get(bare_ref);
+/// if (!branch->remote_name) {
+///         warning(_("asked to inherit tracking from '%s', but no remote is set"), bare_ref);
+///         return -1;
+/// }
+/// if (branch->merge_nr < 1 || !branch->merge || !branch->merge[0] || !branch->merge[0]->src) {
+///         warning(_("asked to inherit tracking from '%s', but no merge configuration is set"), bare_ref);
+///         return -1;
+/// }
+/// ```
+fn inherit_tracking(repo: &gix::Repository, orig_ref: &BStr) -> Option<(String, Vec<String>)> {
+    let full = orig_ref.to_str_lossy();
+    let bare_ref = full.strip_prefix("refs/heads/").unwrap_or(&full);
     let snap = repo.config_snapshot();
-    let mode = snap
-        .string("branch.autoSetupMerge")
-        .map(|v| v.to_str_lossy().to_ascii_lowercase());
-    let mode = mode.as_deref();
-    let off = matches!(mode, Some("false" | "no" | "off" | "0"));
-
-    // `--track=inherit` (or `branch.autoSetupMerge=inherit`) copies the start
-    // branch's own upstream rather than pointing at the start branch itself.
-    if track == Track::Inherit || mode == Some("inherit") {
-        if let Some(b) = s.strip_prefix("refs/heads/") {
-            return inherited_upstream(&snap, b);
-        }
-    }
-
-    if let Some(rest) = s.strip_prefix("refs/remotes/") {
-        let (remote, branch) = rest.split_once('/')?;
-        let auto = if off {
-            false
-        } else if mode == Some("simple") {
-            branch == new_branch
-        } else {
-            true
-        };
-        if explicit || auto {
-            return Some((
-                remote.to_string(),
-                format!("refs/heads/{branch}"),
-                format!("{remote}/{branch}"),
-            ));
-        }
+    let Some(remote) = snap.string(&format!("branch.{bare_ref}.remote")) else {
+        eprintln!("warning: asked to inherit tracking from '{bare_ref}', but no remote is set");
+        return None;
+    };
+    let merges: Vec<String> = snap
+        .plumbing()
+        .strings_by("branch", Some(BStr::new(bare_ref.as_bytes())), "merge")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|v| v.to_str_lossy().into_owned())
+        .collect();
+    if merges.is_empty() || merges[0].is_empty() {
+        eprintln!(
+            "warning: asked to inherit tracking from '{bare_ref}', but no merge configuration is set"
+        );
         return None;
     }
-
-    if let Some(branch) = s.strip_prefix("refs/heads/") {
-        if explicit || mode == Some("always") {
-            return Some((
-                ".".to_string(),
-                format!("refs/heads/{branch}"),
-                branch.to_string(),
-            ));
-        }
-    }
-    None
+    Some((remote.to_str_lossy().into_owned(), merges))
 }
 
-/// The upstream inherited from a local start branch's own `branch.<b>.remote`/
-/// `branch.<b>.merge`, if it has one.
-fn inherited_upstream(
-    snap: &gix::config::Snapshot<'_>,
-    branch: &str,
-) -> Option<(String, String, String)> {
-    let remote = snap
-        .string(&format!("branch.{branch}.remote"))?
-        .to_str_lossy()
-        .into_owned();
-    let merge = snap
-        .string(&format!("branch.{branch}.merge"))?
-        .to_str_lossy()
-        .into_owned();
-    let short = match merge.strip_prefix("refs/heads/") {
-        Some(b) if remote == "." => b.to_string(),
-        Some(b) => format!("{remote}/{b}"),
-        None => merge.clone(),
-    };
-    Some((remote, merge, short))
+/// `install_branch_config_multiple_remotes()` (branch.c:91-190): write
+/// `branch.<local>.remote`, every `branch.<local>.merge`, and
+/// `branch.<local>.rebase` when `branch.autoSetupRebase` says so — then print
+/// the `set up to track` notice unless the caller asked for quiet.
+///
+/// Two refusals of its own, both ahead of any write:
+///
+/// ```c
+/// if (rebasing && remotes->nr > 1)
+///         die(_("cannot inherit upstream tracking configuration of multiple refs when rebasing is requested"));
+///
+/// if (!origin)
+///         for_each_string_list_item(item, remotes)
+///                 if (skip_prefix(item->string, "refs/heads/", &shortname) && !strcmp(local, shortname)) {
+///                         warning(_("not setting branch '%s' as its own upstream"), local);
+///                         return 0;
+///                 }
+/// ```
+fn install_branch_config_multiple_remotes(
+    repo: &gix::Repository,
+    local: &str,
+    origin: Option<&str>,
+    remotes: &[String],
+    quiet: bool,
+) -> Result<Option<ExitCode>> {
+    let remote = origin.unwrap_or(".");
+    let rebasing = autosetup_rebase(repo, remote);
+    if rebasing && remotes.len() > 1 {
+        return Ok(Some(fatal(
+            "cannot inherit upstream tracking configuration of multiple refs when rebasing is requested",
+        )?));
+    }
+    if origin.is_none() {
+        for item in remotes {
+            if item.strip_prefix("refs/heads/") == Some(local) {
+                eprintln!("warning: not setting branch '{local}' as its own upstream");
+                return Ok(None);
+            }
+        }
+    }
+
+    let (path, mut file) = local_config(repo)?;
+    {
+        let sub = BStr::new(local.as_bytes());
+        let mut section = file.section_mut_or_create_new("branch", Some(sub))?;
+        while section.remove("remote").is_some() {}
+        section.push("remote", remote)?;
+        while section.remove("merge").is_some() {}
+        for item in remotes {
+            section.push("merge", item.as_str())?;
+        }
+        if rebasing {
+            while section.remove("rebase").is_some() {}
+            section.push("rebase", "true")?;
+        }
+    }
+    write_config(&path, &file)?;
+
+    if !quiet {
+        // ```c
+        // if (remotes->nr == 1)
+        //         printf_ln(rebasing ? _("branch '%s' set up to track '%s' by rebasing.")
+        //                            : _("branch '%s' set up to track '%s'."), local, …);
+        // else {
+        //         printf_ln(_("branch '%s' set up to track:"), local);
+        //         for_each_string_list_item(item, &friendly_ref_names)
+        //                 printf_ln("  %s", item->string);
+        // }
+        // ```
+        let friendly: Vec<String> = remotes
+            .iter()
+            .map(|item| {
+                let short = item.strip_prefix("refs/heads/").unwrap_or(item);
+                match origin {
+                    Some(o) => format!("{o}/{short}"),
+                    None => short.to_string(),
+                }
+            })
+            .collect();
+        if friendly.len() == 1 {
+            println!("{}", tracking_line(local, &friendly[0], rebasing));
+        } else {
+            println!("branch '{local}' set up to track:");
+            for name in &friendly {
+                println!("  {name}");
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `-u`/`--set-upstream-to`: point a branch's upstream at `<upstream>`. Operates
@@ -2449,55 +2689,22 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
         Start::Resolved(_, real_ref) => real_ref,
         Start::Stop(code) => return Ok(code),
     };
-    // `if (real_ref && track) setup_tracking(...)` — `dwim_branch_start()` has
-    // already refused every case where `real_ref` could be absent under
-    // `BRANCH_TRACK_OVERRIDE`.
+    // `setup_tracking(new_ref, real_orig_ref, track, quiet)` — the second half of
+    // `dwim_and_setup_tracking()`. `dwim_branch_start()` has already refused
+    // every case where `real_ref` could be absent under `BRANCH_TRACK_OVERRIDE`.
     let Some(real_ref) = real_ref else {
-        return Ok(ExitCode::SUCCESS);
-    };
-    let Some(up) = upstream_of_ref(real_ref.as_bstr()) else {
         return Ok(ExitCode::SUCCESS);
     };
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    // `install_branch_config_multiple_remotes()` (branch.c:105-116): a branch
-    // asked to track itself is a warning and nothing else.
-    //
-    // ```c
-    // if (!origin)
-    //         for_each_string_list_item(item, remotes)
-    //                 if (skip_prefix(item->string, "refs/heads/", &shortname)
-    //                     && !strcmp(local, shortname)) {
-    //                         warning(_("not setting branch '%s' as its own upstream"), local);
-    //                         return 0;
-    //                 }
-    // ```
-    if up.0 == "." && up.1.strip_prefix("refs/heads/") == Some(branch_name.as_str()) {
-        eprintln!("warning: not setting branch '{branch_name}' as its own upstream");
-        return Ok(ExitCode::SUCCESS);
+    if let Some(code) =
+        setup_tracking(repo, &branch_name, real_ref.as_bstr(), Track::Override, o.quiet)?
+    {
+        return Ok(code);
     }
-    install_tracking(repo, &branch_name, &up, o.quiet)?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// `setup_tracking()`'s record for one resolved `orig_ref`: the `(remote,
-/// merge, short)` triple `install_branch_config()` writes. A remote-tracking
-/// ref maps to its remote and the remote-side branch name; anything else is the
-/// `.` remote with the ref name recorded verbatim.
-fn upstream_of_ref(real_ref: &BStr) -> Option<(String, String, String)> {
-    let s = real_ref.to_str_lossy();
-    if let Some(rest) = s.strip_prefix("refs/remotes/") {
-        if let Some((remote, branch)) = rest.split_once('/') {
-            return Some((
-                remote.to_string(),
-                format!("refs/heads/{branch}"),
-                format!("{remote}/{branch}"),
-            ));
-        }
-    }
-    let short = s.strip_prefix("refs/heads/").unwrap_or(&s).to_string();
-    Some((".".to_string(), s.into_owned(), short))
-}
 
 /// `--unset-upstream`: drop `branch.<name>.remote` and `branch.<name>.merge` for
 /// the given branch (or the current one). Refuses a branch with no upstream.
@@ -2716,23 +2923,27 @@ pub(crate) fn worktree_tracking(
     quiet: bool,
 ) -> Result<Option<ExitCode>> {
     let track = match track {
-        Some(true) => Track::Direct,
-        Some(false) => Track::No,
-        None => Track::Unset,
+        Some(true) => Track::Explicit,
+        Some(false) => Track::Never,
+        None => config_branch_track(repo),
     };
-    if let Some(code) = ambiguous_tracking(repo, start_ref, track)? {
-        return Ok(Some(code));
-    }
-    let upstream = tracking_upstream(repo, start_ref, track, new_branch);
-    if track == Track::Direct && upstream.is_none() {
+    // `dwim_branch_start()`'s `case 0` / `case 1` refusal under explicit
+    // tracking: the start-point resolved, but not to a branch.
+    if track == Track::Explicit
+        && !start_ref.is_some_and(|r| {
+            r.to_str_lossy().starts_with("refs/heads/")
+                || !find_tracked_branch(repo, r).is_empty()
+        })
+    {
         return Ok(Some(fatal(format!(
             "cannot set up tracking information; starting point '{start_name}' is not a branch"
         ))?));
     }
-    if let Some(up) = upstream {
-        install_tracking(repo, new_branch, &up, quiet)?;
+    let Some(start_ref) = start_ref else { return Ok(None) };
+    if track == Track::Never {
+        return Ok(None);
     }
-    Ok(None)
+    Ok(setup_tracking(repo, new_branch, start_ref, track, quiet)?)
 }
 
 /// `install_branch_config()` (branch.c): record `branch.<name>.remote`,
@@ -2952,7 +3163,12 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // no longer names. Renaming a branch onto its own name skips the whole check,
     // which is why it is guarded by `old_full != new_full` exactly as git guards
     // it with `strcmp(oldname, newname)`.
-    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() {
+    // `validate_new_branchname()` asks `refs_ref_exists()`, which follows the
+    // symref chain (RESOLVE_REF_READING) — a dangling one is not an existing
+    // branch, which is why `git branch -m m broken_symref` is not a refusal.
+    // The destination is still *deleted* below, because
+    // `files_copy_or_rename_ref()` looks it up with RESOLVE_REF_NO_RECURSE.
+    if old_full != new_full && crate::refname::ref_exists(repo, new_full.as_bytes()) {
         if !o.force {
             return fatal(format!("a branch named '{new}' already exists"));
         }
@@ -3001,6 +3217,22 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let tmp_log = logs.join(TMP_RENAMED_LOG);
     let mut moved_log = false;
     if old_full != new_full {
+        // ```c
+        // if (!refs_rename_ref_available(&refs->base, oldrefname, newrefname)) {
+        //         ret = 1;
+        //         goto out;
+        // }
+        // ```
+        // (refs/files-backend.c:1677-1680, ahead of every move below.) A D/F
+        // conflict with some *other* ref is refused before the old name is
+        // touched, so a failed rename leaves both names exactly as they were.
+        // Without it the old ref was already deleted by the time the new name
+        // failed to lock, and `git branch -m o/o o` next to `o/p` destroyed
+        // `o/o`.
+        if let Some(blocker) = df_conflict(repo, &new_full, &old_full) {
+            eprintln!("error: '{blocker}' exists; cannot create '{new_full}'");
+            return fatal("branch rename failed");
+        }
         let from = logs.join(&old_full);
         if from.symlink_metadata().is_ok() {
             if let Some(parent) = tmp_log.parent() {
@@ -3150,6 +3382,44 @@ fn local_config(repo: &gix::Repository) -> Result<(std::path::PathBuf, ConfigFil
         Err(e) => return Err(e.into()),
     };
     Ok((path, file))
+}
+
+/// `refs_verify_refname_available()` (refs.c) reduced to the question
+/// `refs_rename_ref_available()` (refs/files-backend.c:1616-1633) asks: is some
+/// *other* reference in the way of creating `refname`?
+///
+/// Two shapes conflict, and git reports both with the same words —
+/// `'%s' exists; cannot create '%s'`:
+///
+///   * a reference at one of `refname`'s parent paths, which would have to
+///     become a directory (`refs/heads/r` against `refs/heads/r/q`);
+///   * a reference *below* `refname`, which already made it a directory
+///     (`refs/heads/o/p` against `refs/heads/o`).
+///
+/// `skip` is `refs_rename_ref_available()`'s one-entry skip list: the name being
+/// renamed away is about to stop existing, so it never blocks its own
+/// destination.
+fn df_conflict(repo: &gix::Repository, refname: &str, skip: &str) -> Option<String> {
+    let mut dir = refname;
+    while let Some(cut) = dir.rfind('/') {
+        dir = &dir[..cut];
+        if dir == skip {
+            continue;
+        }
+        if crate::refname::ref_exists(repo, dir.as_bytes()) {
+            return Some(dir.to_string());
+        }
+    }
+    let prefix = format!("{refname}/");
+    let mut platform = repo.references().ok()?;
+    for r in platform.prefixed(prefix.as_str()).ok()? {
+        let Ok(r) = r else { continue };
+        let name = r.name().as_bstr().to_str_lossy().into_owned();
+        if name != skip {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// `TMP_RENAMED_LOG` (refs/files-backend.c): the name a rename parks the old
@@ -3343,7 +3613,12 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // no longer names. Renaming a branch onto its own name skips the whole check,
     // which is why it is guarded by `old_full != new_full` exactly as git guards
     // it with `strcmp(oldname, newname)`.
-    if old_full != new_full && repo.try_find_reference(new_full.as_str())?.is_some() {
+    // `validate_new_branchname()` asks `refs_ref_exists()`, which follows the
+    // symref chain (RESOLVE_REF_READING) — a dangling one is not an existing
+    // branch, which is why `git branch -m m broken_symref` is not a refusal.
+    // The destination is still *deleted* below, because
+    // `files_copy_or_rename_ref()` looks it up with RESOLVE_REF_NO_RECURSE.
+    if old_full != new_full && crate::refname::ref_exists(repo, new_full.as_bytes()) {
         if !o.force {
             return fatal(format!("a branch named '{new}' already exists"));
         }

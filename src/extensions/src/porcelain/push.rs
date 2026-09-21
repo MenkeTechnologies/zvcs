@@ -193,18 +193,15 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--force-with-lease" => f.lease = parse_lease(inline)?,
             "--no-force-with-lease" => f.lease = Lease::None,
             // Accepted, but inert here or already matched by the engine's behavior.
-            "-v" | "--verbose" => f.verbose = true,
+            "-v" | "--verbose" => f.verbosity = bump_verbosity(f.verbosity, true),
             // `--quiet` drives `transport->verbose` negative, which is what
             // `set_upstreams()` tests before printing its notice (transport.c:120).
-            "-q" | "--quiet" => f.quiet = true,
+            "-q" | "--quiet" => f.verbosity = bump_verbosity(f.verbosity, false),
             // `OPT__VERBOSITY()` points `-v` and `-q` at the one `verbosity` int,
             // and both negations are `*(int *)opt->value = 0`
             // (parse-options-cb.c `parse_opt_verbosity_cb`), so either one
             // clears whatever the other had set.
-            "--no-verbose" | "--no-quiet" => {
-                f.verbose = false;
-                f.quiet = false;
-            }
+            "--no-verbose" | "--no-quiet" => f.verbosity = 0,
             // `transport_set_verbosity(transport, verbosity, progress)`: the flag
             // forces the meter on, `--no-progress` off, and with neither it
             // follows `isatty(2)` (transport.c). `send_pack()` passes it to
@@ -305,8 +302,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                         'n' => f.dry_run = true,
                         'd' => f.delete = true,
                         'u' => f.set_upstream = true,
-                        'v' => f.verbose = true,
-                        'q' => f.quiet = true,
+                        'v' => f.verbosity = bump_verbosity(f.verbosity, true),
+                        'q' => f.verbosity = bump_verbosity(f.verbosity, false),
                         // `-4`/`-6` are `OPT_SET_INT` over the transport's address
                         // family, which this port does not select on; accepted
                         // and inert, exactly as in the single-token arm above.
@@ -337,6 +334,11 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
         i += 1;
     }
+    // `push_with_options()` tests `verbosity > 0` and `transport_set_verbosity()`
+    // turns `verbosity < 0` into `transport->verbose < 0`; nothing reads the
+    // magnitude beyond that.
+    f.verbose = f.verbosity > 0;
+    f.quiet = f.verbosity < 0;
 
     // Conflicts git rejects before contacting the remote.
     if f.tags && f.all {
@@ -602,6 +604,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         }
         kept
     };
+
+    // ```c
+    // if (verbosity > 0)
+    //         fprintf(stderr, _("Pushing to %s\n"), anon_url);
+    // ```
+    //
+    // (`push_with_options()`, builtin/push.c:386-387.) It sits between
+    // `setup_default_push_refspecs()` — which `do_push()` runs first, so
+    // `push.default=nothing` still dies without announcing a destination — and
+    // `transport_push()`, so it precedes `check_push_refs()`, the `pre-push`
+    // hook and every refusal the transport raises.
+    if f.verbose {
+        eprintln!("Pushing to {transport_url}");
+    }
 
     // Build the concrete updates, plus the (local-branch, remote-ref) pairs that
     // `--set-upstream` records after a successful push.
@@ -907,18 +923,36 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // A dry run performs no local writes, but `set_upstreams()` still runs for
     // it: `pretend` makes it report what it *would* configure, while the
     // tracking-ref update is skipped outright.
-    let code = if f.porcelain {
-        report_porcelain(&outcome)
+    let (code, trailer) = if f.porcelain {
+        report_porcelain(&outcome, f.quiet)?
     } else {
-        report(&outcome, f.verbose)
+        report(&outcome, f.verbose, f.quiet)?
     };
     if f.set_upstream {
         record_upstreams(&repo, &remote_name, &outcome, &upstreams, f.dry_run, f.quiet);
     }
     if !f.dry_run {
-        update_tracking_refs(&repo, &remote, &outcome);
+        update_tracking_refs(&repo, &remote, &outcome, f.verbose);
     }
-    code
+    // ```c
+    // if (porcelain && !push_ret)
+    //         puts("Done");
+    // else if (!quiet && !ret && !transport_refs_pushed(remote_refs))
+    //         fprintf(stderr, "Everything up-to-date\n");
+    // ```
+    //
+    // (`transport_push()`, transport.c:1560-1564.) Both closing lines come after
+    // `set_upstreams()` and the tracking-ref writes, so `git push -v` that moved
+    // nothing prints `updating local tracking ref …` *above* `Everything
+    // up-to-date`.
+    if trailer {
+        if f.porcelain {
+            println!("Done");
+        } else {
+            eprintln!("Everything up-to-date");
+        }
+    }
+    Ok(code)
 }
 
 /// The push flag state.
@@ -936,9 +970,35 @@ struct Flags {
     all: bool,
     tags: bool,
     mirror: bool,
+    /// `OPT__VERBOSITY()`'s single counter, which `-v` and `-q` share:
+    ///
+    /// ```c
+    /// if (unset)
+    ///         *target = 0;
+    /// else if (opt->short_name == 'v') {
+    ///         if (*target >= 0)
+    ///                 (*target)++;
+    ///         else
+    ///                 *target = 1;
+    /// } else {
+    ///         if (*target <= 0)
+    ///                 (*target)--;
+    ///         else
+    ///                 *target = -1;
+    /// }
+    /// ```
+    ///
+    /// (`parse_opt_verbosity_cb()`, parse-options-cb.c:72-85.) Each flag *resets*
+    /// across the sign boundary rather than cancelling one step of the other, so
+    /// `-q -v` is verbose, `-v -q` is quiet, and `-q -q -v` is verbose again.
+    /// [`Flags::verbose`] and [`Flags::quiet`] are read off it after parsing, as
+    /// `push_with_options()` reads `verbosity > 0` and `transport->verbose < 0`.
+    verbosity: i32,
     verbose: bool,
-    /// `-q`/`--quiet`. Only consulted where git consults `transport->verbose < 0`:
-    /// the `set up to track` notice `--set-upstream` prints.
+    /// `transport->verbose < 0`, which gates three things: the whole `To <url>`
+    /// status block unless a ref that reached the transport failed
+    /// (transport.c:1545), the `Everything up-to-date` summary (:1562), and the
+    /// `set up to track` notice `--set-upstream` prints (:120).
     quiet: bool,
     prune: bool,
     atomic: bool,
@@ -2119,6 +2179,7 @@ fn update_tracking_refs(
     repo: &gix::Repository,
     remote: &gix::Remote<'_>,
     outcome: &push_proto::Outcome,
+    verbose: bool,
 ) {
     let mut edits: Vec<RefEdit> = Vec::new();
     for s in &outcome.statuses {
@@ -2135,6 +2196,19 @@ fn update_tracking_refs(
         let Ok(name) = gix::refs::FullName::try_from(tracking.as_str()) else {
             continue;
         };
+        // ```c
+        // if (!remote_find_tracking(remote, &rs)) {
+        //         if (verbose)
+        //                 fprintf(stderr, "updating local tracking ref '%s'\n", rs.dst);
+        // ```
+        //
+        // (`update_one_tracking_ref()`, transport.c:584-586.) The notice is tied
+        // to the refspec lookup succeeding, not to the ref moving, so an
+        // up-to-date ref announces itself too. Untranslated in git — it is not
+        // wrapped in `_()`.
+        if verbose {
+            eprintln!("updating local tracking ref '{tracking}'");
+        }
         let change = if s.new.is_null() {
             Change::Delete {
                 expected: PreviousValue::Any,
@@ -2186,7 +2260,11 @@ fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
 
 /// Print the human `To <url>` status block (git prints it on stderr) and return
 /// the exit code: failure if the unpack failed or any ref was rejected.
-fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
+fn report(
+    outcome: &push_proto::Outcome,
+    verbose: bool,
+    quiet: bool,
+) -> Result<(ExitCode, bool)> {
     // git's two independent switches over this block: `color.transport` for the
     // per-ref summary field and `color.push` for the trailing error line. Both are
     // `auto` against stderr and neither consults `color.ui`.
@@ -2215,24 +2293,60 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
         .any(|s| !s.up_to_date && s.result.is_ok());
     let nothing_moved =
         !did_update && !any_failed && outcome.statuses.iter().all(|s| s.result.is_ok());
+
+    // ```c
+    // if (!quiet || err)
+    //         transport_print_push_status(transport->url, remote_refs,
+    //                         verbose | porcelain, porcelain,
+    //                         reject_reasons);
+    // ```
+    //
+    // (`transport_push()`, transport.c:1545-1548.) `-q` hides the whole `To
+    // <url>` block, but only while the push went through: `err` is
+    // `push_had_errors()`, which is set by any ref status that is neither OK,
+    // UPTODATE nor NONE, and a quiet push that had a ref rejected still lists
+    // what was rejected. Matcher rejections are not part of `err` — they never
+    // reached the transport — and their `error:` lines above are printed
+    // regardless, as git's `match_push_refs()` does.
+    let wire_err = outcome.unpack.is_err()
+        || outcome
+            .statuses
+            .iter()
+            .any(|s| !s.pre_transport && s.result.is_err());
+    let status_block = !quiet || wire_err;
+
     // Under `-v` git still prints the `To <url>` block listing each unchanged
     // ref, and only THEN the summary line; the default output is the summary
     // alone.
+    //
+    // ```c
+    // else if (!quiet && !ret && !transport_refs_pushed(remote_refs))
+    //         fprintf(stderr, "Everything up-to-date\n");
+    // ```
+    //
+    // (transport.c:1562-1564.) The summary line is gated on `!quiet` of its own,
+    // so a quiet push that moved nothing says nothing at all.
     if nothing_moved && !verbose {
-        eprintln!("Everything up-to-date");
-        return Ok(ExitCode::SUCCESS);
+        return Ok((ExitCode::SUCCESS, !quiet));
     }
 
     // Nothing but matcher rejections: git never opened a transport report, so the
     // `To <url>` block is not printed at all.
     let wire_rows = outcome.statuses.iter().any(|s| !s.pre_transport);
-    if wire_rows {
+    if wire_rows && status_block {
         eprintln!("To {}", outcome.url);
     }
     // Every rejected ref with its reason, which `advise_rejections` folds into
     // the single advice block git prints under the status list.
     let mut rejected: Vec<(&str, &str)> = Vec::new();
-    for s in outcome.statuses.iter().filter(|s| !s.pre_transport) {
+    // With the block suppressed there is nothing to list: `status_block` is false
+    // only when no ref that reached the transport failed, so every row this loop
+    // would have printed is an `Ok` one and skipping them changes no state.
+    let listed = match status_block {
+        true => outcome.statuses.as_slice(),
+        false => &[][..],
+    };
+    for s in listed.iter().filter(|s| !s.pre_transport) {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `print_ref_status` (transport.c:620): the left side is the LOCAL ref
         // (`ref->peer_ref`) and the right side is `report->ref_name` when the
@@ -2332,10 +2446,6 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
             }
         }
     }
-    if nothing_moved {
-        eprintln!("Everything up-to-date");
-    }
-
     if any_failed {
         // `color.push` / `color.push.error`. git closes the span *after* the
         // newline, so the reset lands at the start of the following line.
@@ -2346,9 +2456,9 @@ fn report(outcome: &push_proto::Outcome, verbose: bool) -> Result<ExitCode> {
             eprint!("{}{line}\n\x1b[m", colors.error);
         }
         advise_rejections(&rejected);
-        return Ok(ExitCode::from(1));
+        return Ok((ExitCode::from(1), false));
     }
-    Ok(ExitCode::SUCCESS)
+    Ok((ExitCode::SUCCESS, nothing_moved && !quiet))
 }
 
 /// The advice tail `do_push` (builtin/push.c) prints after the rejection block.
@@ -2445,11 +2555,27 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
 
 /// `--porcelain`: machine-readable output — `<flag>\t<ref>\t<summary>` per ref,
 /// framed by `To <url>` and a trailing `Done`, on stdout.
-fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
+fn report_porcelain(outcome: &push_proto::Outcome, quiet: bool) -> Result<(ExitCode, bool)> {
     let mut any_failed = outcome.unpack.is_err();
     let mut rejected: Vec<(&str, &str)> = Vec::new();
-    println!("To {}", outcome.url);
-    for s in &outcome.statuses {
+    // `if (!quiet || err)` (transport.c:1545) gates the status block whatever the
+    // format is, so `push --porcelain -q` that went through prints its trailing
+    // `Done` and nothing else. `err` is `push_had_errors()`: any ref that reached
+    // the transport and came back neither OK nor up to date.
+    let wire_err = outcome.unpack.is_err()
+        || outcome
+            .statuses
+            .iter()
+            .any(|s| !s.pre_transport && s.result.is_err());
+    let status_block = !quiet || wire_err;
+    let listed = match status_block {
+        true => outcome.statuses.as_slice(),
+        false => &[][..],
+    };
+    if status_block {
+        println!("To {}", outcome.url);
+    }
+    for s in listed {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `fprintf(stdout, "%c\t%s:%s\t", flag, from->name, to_name)` — the local
         // ref and the ref the server says it updated, both unshortened.
@@ -2483,16 +2609,20 @@ fn report_porcelain(outcome: &push_proto::Outcome) -> Result<ExitCode> {
             }
         }
     }
-    println!("Done");
     if any_failed {
         // `push_with_options()` reports the failure whatever the output format is: the
         // machine-readable block is on stdout, and this stays on stderr next to the advice
         // (builtin/push.c).
+        //
+        // `puts("Done")` sits at transport.c:1561, *after* the tracking refs are
+        // written, so the caller emits it once those are done — which is what
+        // orders it behind `updating local tracking ref` under `--porcelain -v`.
+        println!("Done");
         eprintln!("error: failed to push some refs to '{}'", outcome.url);
         advise_rejections(&rejected);
-        return Ok(ExitCode::from(1));
+        return Ok((ExitCode::from(1), false));
     }
-    Ok(ExitCode::SUCCESS)
+    Ok((ExitCode::SUCCESS, true))
 }
 
 /// Shorten a full ref name for display (`refs/heads/main` → `main`).
@@ -2885,5 +3015,18 @@ mod tests {
         }];
         append_followed_tags(&repo, &mut requests).expect("append");
         assert_eq!(requests.len(), 1, "no tips to be reachable from, so no tags");
+    }
+}
+
+/// One step of `OPT__VERBOSITY()`'s shared counter, ported from
+/// `parse_opt_verbosity_cb()` (parse-options-cb.c:75-85). `more` is `-v`
+/// (`opt->short_name == 'v'`), its absence `-q`. Crossing zero *resets* to ±1
+/// instead of stepping, which is what makes `-v -q` quiet rather than neutral.
+fn bump_verbosity(current: i32, more: bool) -> i32 {
+    match more {
+        true if current >= 0 => current + 1,
+        true => 1,
+        false if current <= 0 => current - 1,
+        false => -1,
     }
 }

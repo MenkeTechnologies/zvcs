@@ -1456,6 +1456,21 @@ struct Die(String);
 
 impl From<std::io::Error> for Die {
     fn from(e: std::io::Error) -> Self {
+        // A client that stopped reading is not a protocol error. Stock
+        // `git upload-pack` leaves `SIGPIPE` at its default disposition and is
+        // killed by the signal the moment it writes into the closed pipe, so it
+        // says nothing at all; the Rust runtime sets `SIGPIPE` to `SIG_IGN`
+        // before `main`, which turns the same event into `EPIPE` here and used to
+        // reach the caller as `fatal: Broken pipe (os error 32)`.
+        //
+        // It is the *server* side of an ordinary `git fetch --dry-run`: the
+        // client takes the advertisement, decides it wants no pack and hangs up,
+        // and the stray line landed on the user's terminal ahead of the fetch's
+        // own summary. [`crate::sigpipe::exit_broken_pipe`] stages git's death
+        // instead — signal 13, nothing on stderr.
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            crate::sigpipe::exit_broken_pipe();
+        }
         Die(e.to_string())
     }
 }

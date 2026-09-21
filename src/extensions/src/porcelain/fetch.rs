@@ -99,12 +99,18 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// alone and warned about, exactly as git's `update_shallow()` decides; `--update-shallow`
 /// takes the roots the fetched refs actually need and adds them to the boundary instead.
 ///
-/// Known divergence, stated rather than hidden: under `--dry-run` git reports an
-/// auto-followed tag *twice* — nothing is written, so its `backfill_tags()`
-/// round proposes the same tag the first round already listed. Reproducing that
-/// would mean running a second transport round for the sole purpose of printing a
-/// duplicate line, so this prints the tag once. A real (non-dry-run) fetch is
-/// byte-identical.
+/// Automatic tag following is two-pass, and both passes are visible in the
+/// output: `get_ref_map()` proposes the tags whose objects the refspecs are
+/// already bringing in, and `backfill_tags()` re-examines the rest once the pack
+/// has landed, appending whatever it recovers behind every other row. Under
+/// `--dry-run` nothing is written, so the second pass re-proposes the first
+/// pass's tags as well and git prints those rows twice. See [`backfilled_tags`].
+///
+/// Known gap in that area: git's `--dry-run` still downloads the pack and skips
+/// only the ref writes, so its second pass can still tell a backfilled tag from
+/// one whose object nobody sent. The vendored fetch downloads nothing at all
+/// under a dry run, so a tag pointing outside the fetched history is still
+/// listed there; a real fetch drops it.
 ///
 /// `-4`/`--ipv4` and `-6`/`--ipv6` are git's `transport_family`: they restrict address
 /// resolution for `git://` and `http(s)://` and become `ssh`'s `-4`/`-6`, and are forwarded
@@ -1321,6 +1327,100 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The remote tag refs automatic tag following would leave for git's *second*
+/// pass — the `backfill_tags()` round `do_fetch()` runs once the pack is in.
+///
+/// `find_non_local_tags()` is called twice with different object databases under
+/// it, and the split is observable in both the summary and `FETCH_HEAD`. The
+/// first call happens inside `get_ref_map()` (builtin/fetch.c:589-591), before
+/// anything is fetched, and drops every tag whose object is neither already
+/// local nor among the oids the refspecs are about to bring in:
+///
+/// ```c
+/// if (ends_with(ref->name, "^{}")) {
+///         if (item &&
+///             !odb_has_object(the_repository->objects, &ref->old_oid, 0) &&
+///             !oidset_contains(&fetch_oids, &ref->old_oid) &&
+///             !odb_has_object(the_repository->objects, &item->oid, 0) &&
+///             !oidset_contains(&fetch_oids, &item->oid))
+///                 clear_item(item);
+///         item = NULL;
+///         continue;
+/// }
+///
+/// if (item &&
+///     !odb_has_object(the_repository->objects, &item->oid, 0) &&
+///     !oidset_contains(&fetch_oids, &item->oid))
+///         clear_item(item);
+/// ```
+///
+/// (builtin/fetch.c:365-385.) A peeled advertisement line rescues its tag when
+/// *either* the tag object or the commit it points at is in reach; a tag with no
+/// peel line — a lightweight one — is judged on its own object alone.
+/// `fetch_oids` is `create_fetch_oidset()` over the ref map built so far
+/// (:250-257, :341), which is the refspec matches and nothing else.
+///
+/// The survivors are fetched with the branches. The rest are re-examined by the
+/// second call (:2040) against the database as it stands *after* that fetch, so
+/// a tag pointing at an ancestor of a fetched tip comes back — appended to the
+/// very end of the list, behind even the opportunistic tracking-ref updates —
+/// and a tag pointing at an object nobody sent is gone for good.
+///
+/// So the names returned here are the ones whose row belongs at the end, and the
+/// classification has to be made *before* the fetch: afterwards every reachable
+/// object is local and the two passes are indistinguishable.
+fn backfilled_tags(repo: &gix::Repository, map: &gix::remote::fetch::RefMap) -> TagPasses {
+    use gix::objs::Exists;
+    use gix::protocol::fetch::refmap::Source;
+
+    let mut passes = TagPasses::default();
+    let Some(tag_spec) = Tags::Included.to_refspec() else {
+        return passes;
+    };
+    let is_implicit_tag = |m: &gix::protocol::fetch::refmap::Mapping| {
+        m.spec_index
+            .get(&map.refspecs, &map.extra_refspecs)
+            .is_some_and(|spec| spec.to_ref() == tag_spec)
+    };
+
+    let fetch_oids: std::collections::HashSet<gix::ObjectId> = map
+        .mappings
+        .iter()
+        .filter(|m| !is_implicit_tag(m))
+        .filter_map(|m| m.remote.as_id().map(ToOwned::to_owned))
+        .collect();
+    let in_reach = |id: Option<&gix::hash::oid>| {
+        id.is_some_and(|id| fetch_oids.contains(id) || repo.objects.exists(id))
+    };
+
+    for m in map.mappings.iter().filter(|m| is_implicit_tag(m)) {
+        // `r.unpack()` yields `(name, target, peeled)`; `peeled` is `Some` only
+        // for an advertisement line that carried a `^{}` companion, which is
+        // exactly git's "the peeled ref always follows the matching base ref".
+        let peeled = match &m.remote {
+            Source::Ref(r) => r.unpack().2,
+            Source::ObjectId(_) => None,
+        };
+        let Some(name) = m.remote.as_name() else { continue };
+        match in_reach(m.remote.as_id()) || in_reach(peeled) {
+            true => passes.first.insert(name.to_owned()),
+            false => passes.deferred.insert(name.to_owned()),
+        };
+    }
+    passes
+}
+
+/// How automatic tag following split the remote's tags across git's two
+/// `find_non_local_tags()` calls — see [`backfilled_tags`].
+#[derive(Default)]
+struct TagPasses {
+    /// Proposed by the first call and fetched with the branches.
+    first: std::collections::HashSet<gix::bstr::BString>,
+    /// Dropped by the first call; the `backfill_tags()` round decides their fate
+    /// and reports whatever it keeps after everything else.
+    deferred: std::collections::HashSet<gix::bstr::BString>,
+}
+
 /// The source of the first refspec that had to match a remote ref and did not, as
 /// `get_fetch_map()` reports it.
 ///
@@ -2013,6 +2113,13 @@ struct Line {
     /// walks the ref map once per value in enum order and both writes `FETCH_HEAD` and
     /// collects the summary rows inside that loop, so the key orders the summary too.
     status: u8,
+    /// Set for a row automatic tag following only recovered on git's second pass.
+    /// `backfill_tags()` calls `store_updated_refs()` a *second* time
+    /// (builtin/fetch.c:2050), and that call runs its own status-major double
+    /// loop and appends to the same display array, so every backfilled row lands
+    /// behind every first-pass row — including the `FETCH_HEAD_IGNORE` ones the
+    /// status key would otherwise sort last. It is the outer sort key.
+    backfill: bool,
     /// Value the ref held before the fetch, for `--porcelain`'s second column.
     old: gix::ObjectId,
     /// Value it holds afterwards, for `--porcelain`'s third column.
@@ -2853,18 +2960,48 @@ fn fetch_one(
         prune_prefixes.dedup();
     }
 
-    // `-P` fetches all tags via an implicit refspec so pruning has the full
-    // remote tag set to diff against, without persisting the spec to config.
     let mut extra_refspecs = Vec::new();
-    if prune_tags == Some(true) {
-        extra_refspecs.push(
-            gix::refspec::parse(
-                "refs/tags/*:refs/tags/*".into(),
-                gix::refspec::parse::Operation::Fetch,
-            )?
-            .to_owned(),
-        );
+    // Two things put the whole tag namespace into the ref map without it being
+    // automatic tag following, and both need the refspec supplied here.
+    //
+    // `-P` needs it so the prune has the remote's full tag set to diff against.
+    // The spec is a refspec, not tag *following*: every tag it maps goes through
+    // `update_local_ref()` like any other ref, so a tag the remote moved is
+    // `! [rejected] … (would clobber existing tag)` under `-P` alone, not silence.
+    //
+    // ```c
+    // if (!is_null_oid(&ref->old_oid) &&
+    //     starts_with(ref->name, "refs/tags/")) {
+    //         if (force || ref->force) {
+    //                 [...] _("[tag update]") [...]
+    //         } else {
+    //                 [...] _("would clobber existing tag")
+    // ```
+    //
+    // (`update_local_ref()`, builtin/fetch.c:980-1001.) `force` there is the
+    // command-line flag, read *before* the refspec's own `+`. `--tags` fetches
+    // through `TAG_REFSPEC`, which carries no `+` (:582-588), so with the refspec
+    // alone deciding, `git fetch --tags --force` left the tag where it was and
+    // reported a rejection at exit 1. The forced spelling is supplied here
+    // instead; it fetches the same namespace as `Tags::All::to_refspec()`
+    // (gix-protocol/src/fetch/types.rs:308).
+    //
+    // In both cases the tag mode comes off the remote, so the vendored fetch
+    // cannot mistake this spec for the auto-follow one and silence what it maps.
+    // Nothing is lost by that: auto-following proposes no tag this spec has not
+    // already claimed.
+    let supply_tag_refspec =
+        prune_tags == Some(true) || (opts.force && matches!(remote.fetch_tags(), Tags::All));
+    if supply_tag_refspec {
+        let spec = match opts.force {
+            true => "+refs/tags/*:refs/tags/*",
+            false => "refs/tags/*:refs/tags/*",
+        };
+        extra_refspecs
+            .push(gix::refspec::parse(spec.into(), gix::refspec::parse::Operation::Fetch)?.to_owned());
+        remote = remote.with_fetch_tags(Tags::None);
     }
+
     // git's second matching stage. With command-line refspecs the configured refspecs no longer select refs;
     // they map the refs that were selected onto their tracking refs, so `git fetch origin main` still moves
     // `refs/remotes/origin/main`. `--refmap` replaces them for that purpose only.
@@ -3004,6 +3141,12 @@ fn fetch_one(
         Err(verdict) => return Ok(verdict),
     };
 
+    // Whether automatic tag following is in play, read before `connect` consumes
+    // the remote. `Tags::All` (`--tags`) puts the *same* `refs/tags/*:refs/tags/*`
+    // spec in `extra_refspecs`, so the spec alone cannot tell the two apart and
+    // only `Included` is git's `find_non_local_tags()`.
+    let follows_tags = matches!(remote.fetch_tags(), Tags::Included);
+
     // `git_connect()` on a local path that is not a repository: `enter_repo()`
     // fails in the spawned `upload-pack` and the fetch dies with git's block at
     // 128. The vendored transport refuses the same path before spawning, in its
@@ -3135,6 +3278,14 @@ fn fetch_one(
         eprintln!("fatal: couldn't find remote ref {missing}");
         return Ok(Verdict::Fatal);
     }
+
+    // Which auto-followed tags git would have left for its *second* pass. This
+    // has to be decided here, against the object database as it stands before a
+    // single object arrives — see [`backfilled_tags`].
+    let tag_passes = match follows_tags {
+        true => backfilled_tags(repo, prepared.ref_map()),
+        false => TagPasses::default(),
+    };
 
     // `fetch_pack_config()` (`fetch-pack.c:1995`) reads `fetch.fsck.<msg-id>`,
     // `fetch.fsck.skipList`, `fetch.fsckObjects` and `transfer.fsckObjects` from
@@ -3487,11 +3638,45 @@ fn fetch_one(
     // command rather than a per-ref rejection.
     let mut checked_out: Option<(String, std::path::PathBuf)> = None;
 
-    for (update, mapping, spec, edit) in update_refs.iter_mapping_updates(
-        &ref_map.mappings,
-        &ref_map.refspecs,
-        &ref_map.extra_refspecs,
-    ) {
+    // Tags that automatic tag following only recovered on git's second pass are
+    // appended to the very end of the list, behind the opportunistic entries —
+    // `backfill_tags()` runs after `fetch_and_consume_refs()` has already
+    // reported everything else (builtin/fetch.c:2027-2053). A stable partition
+    // reproduces that without disturbing any other order.
+    let rows: Vec<_> = update_refs
+        .iter_mapping_updates(&ref_map.mappings, &ref_map.refspecs, &ref_map.extra_refspecs)
+        .collect();
+    let named = |m: &gix::protocol::fetch::refmap::Mapping,
+                 set: &std::collections::HashSet<gix::bstr::BString>| {
+        m.remote.as_name().is_some_and(|n| set.contains(gix::bstr::BStr::new(n)))
+    };
+    let (first_pass, mut second_pass): (Vec<_>, Vec<_>) =
+        rows.into_iter().partition(|(_, m, _, _)| !named(m, &tag_passes.deferred));
+    // ```c
+    // if (dry_run)
+    //         return 0;
+    // ```
+    //
+    // (`s_update_ref()`, builtin/fetch.c:651-652.) Under `--dry-run` nothing is
+    // queued in the transaction, so the `add_already_queued_tags()` filter the
+    // second `find_non_local_tags()` call relies on (:350-353) has nothing to
+    // filter and re-proposes every tag the first pass already listed. git really
+    // does print those rows twice.
+    if opts.dry_run {
+        let again: Vec<_> =
+            first_pass.iter().filter(|(_, m, _, _)| named(m, &tag_passes.first)).copied().collect();
+        second_pass.extend(again);
+    }
+    // Both calls build their list with `string_list_insert()` (:395), which keeps
+    // it sorted by refname, so the backfilled rows are ordered among themselves
+    // regardless of the order the remote advertised them in.
+    second_pass.sort_by_key(|(_, m, _, _)| m.remote.as_name().map(ToOwned::to_owned));
+
+    for (update, mapping, spec, edit, backfill) in first_pass
+        .into_iter()
+        .map(|r| (r.0, r.1, r.2, r.3, false))
+        .chain(second_pass.into_iter().map(|r| (r.0, r.1, r.2, r.3, true)))
+    {
         let remote_full = mapping
             .remote
             .as_name()
@@ -3592,6 +3777,7 @@ fn fetch_one(
                         from,
                         to: "FETCH_HEAD".to_string(),
                         reason: "",
+                        backfill,
                         old: null,
                         new: id,
                         full: "FETCH_HEAD".to_string(),
@@ -3623,6 +3809,17 @@ fn fetch_one(
             && !matches!(opts.tags, Some(Tags::All))
             && update.mode == Mode::NoChangeNeeded
         {
+            continue;
+        }
+
+        // An auto-followed tag whose object the remote never sent. Both of git's
+        // `find_non_local_tags()` passes clear such a tag — the first because
+        // nothing in `fetch_oids` covers it, the second because the pack did not
+        // bring it either — so it never enters the ref map and contributes
+        // neither a summary row *nor* a `FETCH_HEAD` line. The row is dropped
+        // here, ahead of the `FETCH_HEAD` push below, rather than at the summary
+        // match further down.
+        if update.mode == Mode::ImplicitTagNotSentByRemote {
             continue;
         }
 
@@ -3658,6 +3855,8 @@ fn fetch_one(
         };
 
         let (flag, summary, reason): (char, String, &'static str) = match &update.mode {
+            // Already skipped above, before the `FETCH_HEAD` row.
+            Mode::ImplicitTagNotSentByRemote => continue,
             Mode::New => {
                 // `store_updated_refs()` (`builtin/fetch.c`) reads the *remote*
                 // name, not the local one it is being written to:
@@ -3683,6 +3882,25 @@ fn fetch_one(
                 };
                 ('*', s.to_string(), "")
             }
+            // ```c
+            // if (!is_null_oid(&ref->old_oid) &&
+            //     starts_with(ref->name, "refs/tags/")) {
+            //         if (force || ref->force) {
+            //                 r = s_update_ref("updating tag", ref, transaction, 0);
+            //                 info = ref_update_display_info_append(display_array, 't', '!',
+            //                                                       _("[tag update]"), ...
+            // ```
+            //
+            // (`update_local_ref()`, builtin/fetch.c:980-997.) A tag that already
+            // exists locally is reported as `t [tag update]` whatever the new
+            // value's relation to the old one is — the branch sits above the
+            // fast-forward test, so neither a range nor `(forced update)` is ever
+            // printed for one. The name tested is the *local* ref's.
+            Mode::FastForward | Mode::Forced
+                if is_tag && old_id.is_some_and(|old| !old.is_null()) =>
+            {
+                ('t', "[tag update]".to_string(), "")
+            }
             Mode::FastForward => (' ', range(".."), ""),
             // `--no-show-forced-updates` / `fetch.showForcedUpdates=false` skips
             // the forced-update check outright, so git reports the ref as an
@@ -3695,7 +3913,6 @@ fn fetch_one(
                 }
                 ('=', "[up to date]".to_string(), "")
             }
-            Mode::ImplicitTagNotSentByRemote => continue,
             // ```c
             // if (check_refname_format(rm->peer_ref->name, 0)) {
             //         error(_("* Ignoring funny ref '%s' locally"), rm->peer_ref->name);
@@ -3846,6 +4063,7 @@ fn fetch_one(
             new: porcelain_new,
             full: local_full.as_bstr().to_string(),
             status,
+            backfill,
             widens: true,
         });
     }
@@ -3942,6 +4160,7 @@ fn fetch_one(
                 // Prune rows are not ref-map entries at all: `prune_refs()` reports them
                 // before the walk, and they are prepended to the summary below.
                 status: 0,
+                backfill: false,
             });
         }
     }
@@ -4072,7 +4291,7 @@ fn fetch_one(
     // the order the remote advertised them, then the opportunistic tracking-ref updates.
     // A stable sort on the key reproduces it, because the walk above already visits the
     // mappings in ref-map order.
-    update_lines.sort_by_key(|l| l.status);
+    update_lines.sort_by_key(|l| (l.backfill, l.status));
 
     // Pruned refs are reported first, mirroring git's prune-before-fetch order.
     let mut lines = prune_lines;

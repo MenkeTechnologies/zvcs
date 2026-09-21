@@ -1424,7 +1424,26 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     if plan.is_some() || fetch_tags.is_some() {
         let plan = plan.clone();
-        let url_for_remote = url.clone();
+        // ```c
+        // path = get_repo_path(repo_name, &is_bundle);
+        // if (path) {
+        //         FREE_AND_NULL(path);
+        //         repo = repo_to_free = absolute_pathdup(repo_name);
+        // }
+        // ```
+        //
+        // (`cmd_clone()`, builtin/clone.c:1054-1057.) A local source is recorded
+        // absolute, so `remote.<name>.url` keeps working from any directory.
+        // `prepare_clone*()` absolutizes its own copy of the url the same way
+        // (`PrepareFetch::new_inner`, gix/src/clone/mod.rs:141) — but the remote
+        // built below is built from *this* copy, and without the same treatment a
+        // `git clone --bare ./peer` wrote `./peer` into the new repository's
+        // config and its first `git fetch` from anywhere else failed.
+        let url_for_remote = {
+            let mut url = url.clone();
+            url.absolutize(Path::new(""));
+            url
+        };
         let explicit_origin = origin.clone();
         let single_outcome = single_outcome.clone();
         let probe_connect = gix::remote::connect::Options {

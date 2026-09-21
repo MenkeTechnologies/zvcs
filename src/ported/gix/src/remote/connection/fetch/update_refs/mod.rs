@@ -93,12 +93,17 @@ pub(crate) fn update(
              spec_index,
          }| {
             spec_index.get(refspecs, extra_refspecs).map(|spec| {
-                (
-                    remote,
-                    local,
-                    spec,
-                    implicit_tag_refspec.is_some_and(|tag_spec| spec.to_ref() == tag_spec),
-                )
+                // Automatic tag following is the *implicit* spec `fetch_tags`
+                // contributed, and nothing else. Matching on the spelling alone
+                // also caught a `refs/tags/*:refs/tags/*` the user wrote on the
+                // command line, which git puts through `update_local_ref()` like
+                // any other refspec — so `git fetch <remote> refs/tags/*:refs/tags/*`
+                // over a tag the remote moved silently did nothing where git
+                // reports `! [rejected] … (would clobber existing tag)` and exits 1.
+                // A command-line refspec is always `ExplicitInRemote`.
+                let is_implicit_tag = matches!(spec_index, fetch::refmap::SpecIndex::Implicit(_))
+                    && implicit_tag_refspec.is_some_and(|tag_spec| spec.to_ref() == tag_spec);
+                (remote, local, spec, is_implicit_tag)
             })
         },
     ) {

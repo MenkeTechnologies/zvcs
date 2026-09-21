@@ -1377,6 +1377,63 @@ pub fn common_dir_gate(sub: &str) -> Option<ExitCode> {
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
+/// The `die_on_error` half of `setup_git_directory_gently_1()`'s walk
+/// (setup.c:1600-1634, v2.55.0): a `.git` the walk finds but cannot follow ends
+/// the command where it stands, naming what is wrong with it.
+///
+/// ```c
+/// gitdirenv = read_gitfile_gently(dir->buf, &error_code);
+/// if (!gitdirenv) {
+///         switch (error_code) {
+///         case READ_GITFILE_ERR_MISSING:      /* no .git here, move on */ break;
+///         case READ_GITFILE_ERR_IS_A_DIR:     … break;
+///         case READ_GITFILE_ERR_STAT_FAILED:  die(_("error reading '%s'"), dir->buf);
+///         case READ_GITFILE_ERR_NOT_A_FILE:   die(_("not a regular file: '%s'"), dir->buf);
+///         default:                            read_gitfile_error_die(error_code, dir->buf, NULL);
+///         }
+/// }
+/// ```
+///
+/// `setup_git_directory()` passes `die_on_error = 1` (setup.c:1951), so this is
+/// what every command that sets up a repository the ordinary way reports for a
+/// `.git` file with no `gitdir:` line, or one naming a directory that is not a
+/// repository. gitoxide's discovery has no such diagnostic — it walks past the
+/// broken file and ends on "not a git repository (or any of the parent
+/// directories)", which describes neither problem.
+///
+/// `$GIT_DIR` skips discovery outright, which is [`explicit_git_dir_gate`]'s
+/// branch, so it is not this one's. Returns the exit code to leave with, or
+/// `None` when discovery should carry on.
+pub fn discovery_gitfile_gate() -> Option<ExitCode> {
+    use crate::porcelain::rev_parse::{gitfile_error_message, is_git_directory, read_gitfile_gently};
+    if std::env::var_os("GIT_DIR").is_some() {
+        return None;
+    }
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let candidate = dir.join(".git");
+        match read_gitfile_gently(&candidate) {
+            // A gitfile that read fine: discovery is over and it succeeded.
+            Ok(Some(_)) => return None,
+            // `READ_GITFILE_ERR_MISSING` / `_IS_A_DIR` / `_NOT_A_FILE` — the
+            // ordinary "no gitfile here" answers, which the walk steps past.
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("fatal: {}", gitfile_error_message(&candidate, err));
+                return Some(ExitCode::from(crate::fatal::EXIT_FATAL));
+            }
+        }
+        // `case READ_GITFILE_ERR_IS_A_DIR: if (is_git_directory(dir->buf))`, and
+        // the `setup_bare_git_dir()` arm below the loop for the directory itself.
+        if is_git_directory(&candidate) || is_git_directory(&dir) {
+            return None;
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// `setup_explicit_git_dir()`'s two refusals (setup.c:1176-1190):
 ///
 /// ```c

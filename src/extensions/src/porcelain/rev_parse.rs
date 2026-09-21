@@ -254,6 +254,35 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // the first argument slot and never entered from anywhere else in the scan:
     // `git rev-parse HEAD --sq-quote` echoes the flag instead. Neither opens a
     // repository.
+    // ```c
+    // /* No options; just report on whether we're in a git repo or not. */
+    // if (argc == 1) {
+    //         setup_git_directory(the_repository);
+    //         repo_config(the_repository, git_default_config, NULL);
+    //         return 0;
+    // }
+    // ```
+    //
+    // (builtin/rev-parse.c:740-745.) The report *is* the exit status: bare
+    // `git rev-parse` prints nothing and answers 0 inside a repository, and
+    // whatever `setup_git_directory()` dies with outside one. This port used to
+    // answer 0 either way, which made the no-operand form useless as the
+    // repository test it exists to be.
+    if args.is_empty() {
+        if let Some(code) = crate::setup::discovery_gitfile_gate() {
+            return Ok(code);
+        }
+        let Ok(repo) = crate::setup::discover() else {
+            eprintln!("fatal: {}", crate::fatal::no_repository_walked());
+            return Ok(ExitCode::from(128));
+        };
+        if let Some(message) = crate::setup::core_worktree_chdir_error(&repo) {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     match args.first().map(String::as_str) {
         Some("--parseopt") => return parseopt(&args[1..]),
         Some("--sq-quote") => {
@@ -509,7 +538,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             emit(&mut out, arg.as_bytes())?;
-            if !is_worktree_path(&repo, arg) {
+            if !crate::setup::looks_like_pathspec(arg) && !is_worktree_path(&repo, arg) {
                 out.flush()?;
                 eprintln!(
                     "fatal: {arg}: no such path in the working tree.\n\
@@ -729,6 +758,27 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // `repo_get_oid_committish()` on each side, never the range
                 // grammar, so `HEAD@{1}..HEAD` is two ordinary resolutions and
                 // gitoxide must not be asked about either of them.
+                // `try_difference()` has a guard of its own for the one token
+                // that holds a `..` and is still not a range:
+                //
+                // ```c
+                // if (start == head_by_default && end == head_by_default &&
+                //     !symmetric) {
+                //         /*
+                //          * Just ".."?  That is not a range but the
+                //          * pathspec for the parent directory.
+                //          */
+                //         free(to_free);
+                //         return 0;
+                // }
+                // ```
+                //
+                // (builtin/rev-parse.c:292-300.) Both endpoints defaulting means
+                // both were empty, so the token is exactly `..`; `...` is
+                // symmetric and stays `HEAD...HEAD`, and `HEAD..HEAD` names its
+                // endpoints rather than defaulting to them. Unlike
+                // `revision.c`'s version of the guard this one does not care
+                // whether a `--` was seen.
                 let parsed = if arg.is_empty()
                     || reflog_operand_anywhere(arg)
                     || carries_walk_mark(arg)
@@ -760,9 +810,17 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // a revspec built out of a full-length hex naming an object that is
                 // not present fails to parse at all. git reaches the same specs
                 // through `get_oid()`, which takes full hex at face value.
-                let parsed = parsed
-                    .or_else(|| reflog_range(&repo, arg))
-                    .or_else(|| full_hex_spec(&repo, arg));
+                let parsed = if arg == ".." {
+                    // The guard quoted above: a bare `..` is the parent
+                    // directory's pathspec, not `HEAD..HEAD`, so neither
+                    // gitoxide's grammar nor either fallback may make a range of
+                    // it.
+                    None
+                } else {
+                    parsed
+                        .or_else(|| reflog_range(&repo, arg))
+                        .or_else(|| full_hex_spec(&repo, arg))
+                };
                 match parsed {
                     Some(Parsed::Range(range)) => {
                         emit_range(&mut out, &repo, &o, range, arg)?;
@@ -820,7 +878,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
                 emit(&mut out, arg.as_bytes())?;
-                if !is_worktree_path(&repo, arg) {
+                // `verify_filename()` is
+                // `if (looks_like_pathspec(arg) || check_filename(prefix, arg)) return;`
+                // (setup.c:289-290): a wildcard, or long-form `:(…)` magic, says
+                // the user is naming pathspecs that need not be in the file
+                // system, so the operand passes without a stat. Only
+                // `check_filename()` was ported here, which made
+                // `git rev-parse '*.c'` echo the pathspec and then die about it.
+                if !crate::setup::looks_like_pathspec(arg) && !is_worktree_path(&repo, arg) {
                     out.flush()?;
                     // `verify_filename(prefix, arg, 1)` → `die_verify_filename()`:
                     // the operand gets one more resolution, with

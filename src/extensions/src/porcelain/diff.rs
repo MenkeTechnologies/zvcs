@@ -1921,8 +1921,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 fmt |= F_PATCH;
                 fmt &= !F_NO_OUTPUT;
             }
+            // `revs->abbrev = DEFAULT_ABBREV` (revision.c:2641-2642), which is the
+            // `default_abbrev` global — `core.abbrev`, or the object-count-derived
+            // auto width when that is unset (object-name.h:137). Not a literal 7:
+            // that is only `FALLBACK_DEFAULT_ABBREV`, for a caller with no object
+            // database to size against.
             "--abbrev" => {
-                abbrev = 7;
+                abbrev = crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex());
                 abbrev_explicit = true;
                 raw_abbrev = None;
             }

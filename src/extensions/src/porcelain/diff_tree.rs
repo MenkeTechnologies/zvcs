@@ -33,7 +33,9 @@
 //!   second commit's tree; zero/multiple bases or a non-commit operand reproduce git's
 //!   fatal messages (exit 128)
 //! * `-z`, `--abbrev=<n>` (parsed with git's `strtoul`: leading base-10 digits
-//!   only, no error on garbage, clamped to 4..=hash length)
+//!   only, no error on garbage, clamped to 4..=hash length) and bare `--abbrev`
+//!   (`revs->abbrev = DEFAULT_ABBREV`, revision.c:2641-2642 — `core.abbrev`, else the
+//!   width derived from the repository's approximate object count)
 //! * `--no-commit-id`, `--always`
 //! * `--diff-filter=<letters>`, `--exit-code`, `--quiet`
 //! * literal `<path>` filters (exact entry, directory prefix, or a tree that a filter
@@ -144,8 +146,6 @@
 //!
 //! Not implemented, and bailed on whenever they would matter:
 //!
-//! * bare `--abbrev` (no `=<n>`), whose width is git's *auto* abbreviation derived from
-//!   the repository's approximate object count; the vendored crates expose no equivalent.
 //! * `-v`, `--pretty`/`--format` — these need commit-message formatting, which belongs
 //!   to the `log`/`show` machinery, not the tree diff.
 //! * `--anchored=<text>` — git runs an anchored patience diff (`xpp->anchors`); the
@@ -735,6 +735,15 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 "--no-abbrev" => {
                     opts.abbrev = hash.len_in_hex();
                     opts.abbrev_explicit = None;
+                }
+                // `revs->abbrev = DEFAULT_ABBREV` (revision.c:2641-2642): the
+                // `default_abbrev` global, which is `core.abbrev` when it is set and
+                // otherwise the width `repo_find_unique_abbrev()` derives from the
+                // repository's approximate object count.
+                "--abbrev" => {
+                    opts.abbrev = crate::abbrev::configured_abbrev(&repo, hash.len_in_hex())
+                        .max(MINIMUM_ABBREV);
+                    opts.abbrev_explicit = Some(opts.abbrev);
                 }
                 // `--line-prefix=<s>` prefixes every emitted line, the commit-id line
                 // included; the diff body is prefixed by whoever renders it.
@@ -1890,8 +1899,6 @@ fn is_known_unsupported(a: &str) -> bool {
         "--compact-summary",
         "--check",
         "--unified",
-        // object-name width we cannot derive
-        "--abbrev",
         // rename, copy and rewrite detection
         "-B",
         "-C",

@@ -59,12 +59,13 @@
 //!      `fatal: pack version <n> unsupported` → exit 128
 //!
 //! Only once every one of those has passed is an unported flag rejected, so
-//! `--check-self-contained-and-connected does-not-exist.pack` reports the
-//! missing pack exactly as git does instead of complaining about the flag.
+//! `--pack_header=2,1 does-not-exist.pack` reports the missing pack exactly as
+//! git does instead of complaining about the flag.
 //!
-//! Everything past option parsing is a `die()` in git, so nothing here exits 1:
-//! a failure the checks above did not name still becomes a `fatal:` line and
-//! exit 128. `--stdin` without a `<pack-file>` also leaves the same
+//! Everything past option parsing is a `die()` in git, so the only exit 1 is
+//! `--check-self-contained-and-connected`'s deliberate one (see
+//! [`self_contained_exit`]); a failure the checks above did not name still
+//! becomes a `fatal:` line and exit 128. `--stdin` without a `<pack-file>` also leaves the same
 //! `objects/pack/tmp_pack_XXXXXX` behind that git's `open_pack_file(NULL)` does
 //! — created before the header is parsed, renamed into place on success, and
 //! deliberately not cleaned up when the command dies.
@@ -87,19 +88,23 @@
 //! print. A self-contained stream (the common case) is copied through
 //! byte-for-byte, so its hash matches git exactly.
 //!
-//! `--strict` and `--fsck-objects` are covered: see [`fsck_pack`]. Both run
-//! `fsck_object()` over every object the pack holds, `--strict` adds
-//! `fsck_walk()`/`check_objects()`'s link and type checks, and both finish with
-//! `fsck_finish()`'s `.gitmodules`/`.gitattributes` lint. The checks reuse the
-//! `fsck_object()` port in [`super::fsck`] and run before the index is renamed
-//! into place, so a pack that fails them leaves no artifact behind.
+//! `--strict`, `--fsck-objects` and `--check-self-contained-and-connected` are
+//! covered: see [`fsck_pack`]. git splits them across two flags
+//! (builtin/index-pack.c:1935-1944) — `do_fsck_object` runs `fsck_object()` over
+//! every object the pack holds and `fsck_finish()`'s
+//! `.gitmodules`/`.gitattributes` lint at the end, while `strict` runs
+//! `parse_object_buffer()`'s gate plus `fsck_walk()`/`check_objects()`'s link and
+//! type checks. `--strict` raises both, `--fsck-objects` only the first and
+//! `--check-self-contained-and-connected` only the second, answering exit 1 when
+//! `check_objects()` had to read a linked object out of the object database
+//! instead of the pack. The checks reuse the `fsck_object()` port in
+//! [`super::fsck`] and run before the index is renamed into place, so a pack that
+//! fails them leaves no artifact behind.
 //!
 //! Not covered, each rejected with a precise message rather than a plausible
 //! wrong answer: the `<msg-id>=<severity>` list form of `--strict=` /
 //! `--fsck-objects=` (its grammar is validated, but the severities it asks for
 //! are not applied — the checks run at git's defaults),
-//! `--check-self-contained-and-connected` (git's connectivity pass over the
-//! whole reachable set, which exceeds the vendored `gix-fsck` primitive),
 //! `--pack_header`, `--index-version` other than a plain `2`,
 //! `--verify` combined with `--stdin`, and a `<pack-file>` on disk (or a self-contained pack read
 //! from stdin without `--fix-thin`) holding REF_DELTA entries — which stock git
@@ -192,6 +197,22 @@ impl Opts {
             pack_header: false,
             pack: None,
         }
+    }
+
+    /// git's `strict` (builtin/index-pack.c:137), which gates `fsck_walk()` and
+    /// `check_objects()`. `--strict` raises it, and so does
+    /// `--check-self-contained-and-connected` — on its own, without
+    /// `do_fsck_object` (builtin/index-pack.c:1935-1941).
+    fn strict(&self) -> bool {
+        self.strict || self.self_contained
+    }
+
+    /// git's `do_fsck_object` (builtin/index-pack.c:138), which gates
+    /// `fsck_object()` in `sha1_object()` and `fsck_finish()` at the end.
+    /// `--strict` and `--fsck-objects` raise it;
+    /// `--check-self-contained-and-connected` does not.
+    fn do_fsck_object(&self) -> bool {
+        self.strict || self.fsck_objects
     }
 
     /// The hash algorithm every object id in this pack is spelled in, resolved
@@ -538,7 +559,11 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     }
     drop(file);
 
-    let hash = write_index_for_pack(opts, pack_path, index_path)?;
+    // `unsigned foreign_nr = 1; /* zero is a "good" value, assume bad */`
+    // (builtin/index-pack.c:1897). It is only ever recomputed under `strict`,
+    // which is exactly when `--check-self-contained-and-connected` reads it.
+    let mut foreign_nr = 1u32;
+    let hash = write_index_for_pack(opts, pack_path, index_path, &mut foreign_nr)?;
 
     if want_rev_index(opts) {
         write_rev_index(index_path, &hash, opts.object_hash())?;
@@ -574,7 +599,27 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     }
 
     println!("{hash}");
-    Ok(ExitCode::SUCCESS)
+    Ok(self_contained_exit(opts, foreign_nr))
+}
+
+/// ```c
+/// /*
+///  * Let the caller know this pack is not self contained
+///  */
+/// if (check_self_contained_and_connected && foreign_nr)
+///         return 1;
+///
+/// return 0;
+/// ```
+///
+/// (builtin/index-pack.c:2145-2151.) The last thing `cmd_index_pack()` does, so
+/// the `pack\t<hash>` / `keep\t<hash>` / bare hash line has already been printed
+/// by the time the status turns non-zero.
+fn self_contained_exit(opts: &Opts, foreign_nr: u32) -> ExitCode {
+    if opts.self_contained && foreign_nr != 0 {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
 
 /// `write_special_file(suffix, ...)` (builtin/index-pack.c:1452-1482): the
@@ -605,7 +650,12 @@ fn write_special_file(pack_path: &Path, suffix: &str, msg: Option<&str>) -> Opti
 /// is built in a sibling temporary and renamed into place, so a failure never
 /// leaves a half-written index behind — the same `git_mkstemp`/`rename` dance
 /// git performs.
-fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<ObjectId> {
+fn write_index_for_pack(
+    opts: &Opts,
+    pack_path: &Path,
+    index_path: &Path,
+    foreign_nr: &mut u32,
+) -> Result<ObjectId> {
     let hash = opts.object_hash();
     let file = io::BufReader::new(fs::File::open(pack_path)?);
     let mut entries = pack::data::input::BytesToEntriesIter::new_from_header(
@@ -649,8 +699,15 @@ fn write_index_for_pack(opts: &Opts, pack_path: &Path, index_path: &Path) -> Res
     // The fsck passes run against the finished index while it is still the
     // temporary, so a failure leaves the repository exactly as git leaves it:
     // the checks git runs before `write_idx_file()` have already failed by then.
-    if opts.strict || opts.fsck_objects {
-        if let Err(e) = fsck_pack(pack_path, &tmp, opts.strict, hash) {
+    if opts.strict() || opts.do_fsck_object() {
+        if let Err(e) = fsck_pack(
+            pack_path,
+            &tmp,
+            opts.strict(),
+            opts.do_fsck_object(),
+            hash,
+            foreign_nr,
+        ) {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
@@ -704,10 +761,18 @@ fn verify_existing(opts: &Opts, index_path: &Path) -> Result<ExitCode> {
     }
     // `do_fsck_object` is independent of `--verify`: the object checks still run
     // over everything the pack holds.
-    if opts.strict || opts.fsck_objects {
-        fsck_pack(&pack_path, index_path, opts.strict, hash)?;
+    let mut foreign_nr = 1u32;
+    if opts.strict() || opts.do_fsck_object() {
+        fsck_pack(
+            &pack_path,
+            index_path,
+            opts.strict(),
+            opts.do_fsck_object(),
+            hash,
+            &mut foreign_nr,
+        )?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(self_contained_exit(opts, foreign_nr))
 }
 
 /// `read_idx_option()` (builtin/index-pack.c:1742-1767): open the pack a `.idx`
@@ -805,6 +870,9 @@ fn index_from_stdin(
     target_index: Option<&Path>,
 ) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
+    // `unsigned foreign_nr = 1; /* zero is a "good" value, assume bad */`
+    // (builtin/index-pack.c:1897).
+    let mut foreign_nr = 1u32;
 
     // git opens a named output pack with O_CREAT|O_EXCL before reading stdin, so
     // a path that already exists is fatal with xopen's create-mode wording.
@@ -887,7 +955,15 @@ fn index_from_stdin(
     // here through the same index writer the named-pack path uses.
     let (hash, data_path, index_path, gix_keep) = if object_count == 0 {
         let (hash, data_path, index_path) =
-            index_empty_from_stdin(opts, input, target_pack, target_index, temp_pack.as_deref(), &write_dir)?;
+            index_empty_from_stdin(
+                opts,
+                input,
+                target_pack,
+                target_index,
+                temp_pack.as_deref(),
+                &write_dir,
+                &mut foreign_nr,
+            )?;
         (hash, data_path, index_path, None)
     } else {
         // With `--fix-thin` the object database resolves REF_DELTA bases missing
@@ -915,8 +991,15 @@ fn index_from_stdin(
         // Before the pack is moved anywhere, so a failing check leaves nothing
         // in `objects/pack` — the state git leaves, since its own checks run
         // ahead of `write_idx_file()`.
-        if opts.strict || opts.fsck_objects {
-            if let Err(e) = fsck_pack(gix_data, gix_index, opts.strict, opts.object_hash()) {
+        if opts.strict() || opts.do_fsck_object() {
+            if let Err(e) = fsck_pack(
+                gix_data,
+                gix_index,
+                opts.strict(),
+                opts.do_fsck_object(),
+                opts.object_hash(),
+                &mut foreign_nr,
+            ) {
                 for path in [gix_data, gix_index].into_iter().chain(outcome.keep_path.as_ref()) {
                     let _ = fs::remove_file(path);
                 }
@@ -980,7 +1063,7 @@ fn index_from_stdin(
         }
         None => println!("pack\t{hash}"),
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(self_contained_exit(opts, foreign_nr))
 }
 
 /// Stream a pack whose header declares zero objects from `input` and index it.
@@ -997,6 +1080,7 @@ fn index_empty_from_stdin(
     target_index: Option<&Path>,
     temp_pack: Option<&Path>,
     write_dir: &Path,
+    foreign_nr: &mut u32,
 ) -> Result<(ObjectId, PathBuf, PathBuf)> {
     let staged = match (target_pack, temp_pack) {
         (Some(p), _) => p.to_path_buf(),
@@ -1010,7 +1094,7 @@ fn index_empty_from_stdin(
     // The pack's own checksum names it, so the index is written beside the
     // staged pack first and both are moved once the checksum is known.
     let staged_index = with_suffix(&staged, ".idx");
-    let hash = write_index_for_pack(opts, &staged, &staged_index)?;
+    let hash = write_index_for_pack(opts, &staged, &staged_index, foreign_nr)?;
 
     let data_path = match target_pack {
         Some(p) => p.to_path_buf(),
@@ -1059,7 +1143,14 @@ fn index_empty_from_stdin(
 /// rename. Here all three run against a finished index that has not been moved
 /// into place, so a failure still leaves no artifact behind — the caller removes
 /// the temporary it passed.
-fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> Result<()> {
+fn fsck_pack(
+    pack_path: &Path,
+    index_path: &Path,
+    strict: bool,
+    do_fsck_object: bool,
+    hash: Kind,
+    foreign_nr: &mut u32,
+) -> Result<()> {
     use super::fsck::{check_blob, check_object, Severity};
     use gix::object::Kind as ObjKind;
 
@@ -1143,51 +1234,84 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
             }
             let as_modules = modules_found.contains(&id);
             let as_attrs = attrs_found.contains(&id);
-            if as_modules || as_attrs {
+            if do_fsck_object && (as_modules || as_attrs) {
                 done_early.insert(id);
                 for finding in check_blob(Some(&data), as_modules, as_attrs) {
                     report_blob_finding(&finding, &id, &mut object_error);
+                }
+                // `if (do_fsck_object && fsck_object(...)) die(_("fsck error in
+                // packed object"));` (builtin/index-pack.c:936-938) fires per
+                // object, so the first object that fails is the last one reported.
+                if object_error {
+                    crate::git_fatal!("fsck error in packed object");
                 }
             }
             continue;
         }
 
-        let checked = check_object(kind, &data, true, hash.len_in_hex());
-        // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
-        // `error()` themselves, with no msg-id and so no severity to consult.
-        for line in &checked.raw {
-            eprintln!("error: {line}");
-            object_error = true;
+        // `parse_object_buffer()` runs *before* `fsck_object()` (builtin/index-pack.c:950-957)
+        // and its failure is a `die()`, so a commit or tag the parser rejects never
+        // reaches the content checks at all.
+        if !parse_object_buffer(kind, &data, &id, hash.len_in_hex()) {
+            crate::git_fatal!("invalid {kind}");
         }
-        for finding in &checked.findings {
-            match strict_severity(finding.msg) {
-                Severity::Ignore => {}
-                Severity::Info | Severity::Warn => {
-                    eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
-                }
-                Severity::Error | Severity::Fatal => {
-                    eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
-                    object_error = true;
+
+        // `fsck_object()` — and with it the `.gitmodules`/`.gitattributes` queue it
+        // fills — is `do_fsck_object` only; `--check-self-contained-and-connected`
+        // raises `strict` alone (builtin/index-pack.c:1939-1941) and so runs the
+        // link pass below over content it never lints.
+        if do_fsck_object {
+            let checked = check_object(kind, &data, true, hash.len_in_hex());
+            // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
+            // `error()` themselves, with no msg-id and so no severity to consult;
+            // the text arrives carrying its own `error: ` prefix.
+            for line in &checked.raw {
+                eprintln!("{line}");
+                object_error = true;
+            }
+            for finding in &checked.findings {
+                match strict_severity(finding.msg) {
+                    Severity::Ignore => {}
+                    Severity::Info | Severity::Warn => {
+                        eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+                    }
+                    Severity::Error | Severity::Fatal => {
+                        eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                        object_error = true;
+                    }
                 }
             }
+            for blob in &checked.gitmodules {
+                queued.push((*blob, true, false));
+                modules_found.insert(*blob);
+            }
+            for blob in &checked.gitattributes {
+                queued.push((*blob, false, true));
+                attrs_found.insert(*blob);
+            }
+            // `if (do_fsck_object && fsck_object(obj, buf, size, &fsck_options))
+            // die(_("fsck error in packed object"));`
+            // (builtin/index-pack.c:955-957) — before `fsck_walk()` below, and
+            // before any later object is looked at.
+            if object_error {
+                crate::git_fatal!("fsck error in packed object");
+            }
         }
-        for blob in &checked.gitmodules {
-            queued.push((*blob, true, false));
-            modules_found.insert(*blob);
-        }
-        for blob in &checked.gitattributes {
-            queued.push((*blob, false, true));
-            attrs_found.insert(*blob);
-        }
-        if strict {
-            collect_links(kind, &data, &mut links, hash);
+        // ```c
+        // if (strict && fsck_walk(obj, NULL, &fsck_options))
+        //         die(_("Not all child objects of %s are reachable"), oid_to_hex(&obj->oid));
+        // ```
+        //
+        // (builtin/index-pack.c:958-959.)
+        if strict && !collect_links(kind, &data, &id, &mut links, hash) {
+            crate::git_fatal!("Not all child objects of {id} are reachable");
         }
     }
     // `parse_pack_objects()`'s delayed sweep (`builtin/index-pack.c:1308`): the
     // streamed blobs, now that every tree in the pack has named what it names.
     // Still part of the per-object pass, so a finding here is
     // `fsck error in packed object`.
-    for id in &delayed {
+    for id in delayed.iter().filter(|_| do_fsck_object) {
         let as_modules = modules_found.contains(id);
         let as_attrs = attrs_found.contains(id);
         if !as_modules && !as_attrs {
@@ -1197,20 +1321,37 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
         for finding in check_blob(None, as_modules, as_attrs) {
             report_blob_finding(&finding, id, &mut object_error);
         }
+        if object_error {
+            crate::git_fatal!("fsck error in packed object");
+        }
     }
 
     if object_error {
         crate::git_fatal!("fsck error in packed object");
     }
 
-    // `check_objects()`: a linked object already in this pack carries
-    // `FLAG_CHECKED` and is skipped; anything else has to be in the object
-    // database with the type the link gave it.
+    // `check_objects()` (builtin/index-pack.c:278-295): a linked object already in
+    // this pack carries `FLAG_CHECKED` and is skipped; anything else has to be in
+    // the object database with the type the link gave it, and each one it had to
+    // read from there counts towards `foreign_nr` — the count
+    // `--check-self-contained-and-connected` turns into exit status 1
+    // (builtin/index-pack.c:2148-2149).
+    if strict {
+        // `foreign_nr = check_objects();` (builtin/index-pack.c:2090) *assigns*,
+        // discarding the pessimistic 1 the caller started from.
+        *foreign_nr = 0;
+    }
     if strict && !links.is_empty() {
         let repo = crate::setup::discover()?;
         use gix::odb::HeaderExt;
+        let mut counted: std::collections::HashSet<ObjectId> = Default::default();
         for (id, expected) in &links {
             if in_pack.contains(id) {
+                continue;
+            }
+            // `check_object()` counts an object once: the first visit sets
+            // `FLAG_CHECKED`, and every later link to it returns 0.
+            if !counted.insert(*id) {
                 continue;
             }
             let Ok(header) = repo.objects.header(id) else {
@@ -1222,6 +1363,7 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
                     header.kind()
                 );
             }
+            *foreign_nr += 1;
         }
     }
 
@@ -1294,6 +1436,153 @@ fn fsck_pack(pack_path: &Path, index_path: &Path, strict: bool, hash: Kind) -> R
 /// `fsck_msg_severity()` for `index-pack`: its options always carry `strict = 1`
 /// and nothing configures a row, so an unconfigured warning becomes an error and
 /// every other default is left alone.
+/// `parse_object_buffer()` as `sha1_object()` calls it under `strict` or
+/// `do_fsck_object` (builtin/index-pack.c:950-954):
+///
+/// ```c
+/// obj = parse_object_buffer(the_repository, oid, type, size, buf, &eaten);
+/// if (!obj)
+///         die(_("invalid %s"), type_name(type));
+/// ```
+///
+/// `false` is its `NULL`. The parsers for the two types that can fail print their
+/// own `error:` lines first; a tree is only recorded here and decoded lazily, so
+/// `parse_tree_buffer()` cannot fail, and a blob has no parser at all.
+fn parse_object_buffer(
+    kind: gix::object::Kind,
+    data: &[u8],
+    id: &ObjectId,
+    hexsz: usize,
+) -> bool {
+    use gix::object::Kind as ObjKind;
+    match kind {
+        ObjKind::Commit => parse_commit_buffer(data, id, hexsz),
+        ObjKind::Tag => parse_tag_buffer(data, id, hexsz),
+        ObjKind::Tree | ObjKind::Blob => true,
+    }
+}
+
+/// `parse_commit_buffer()` (commit.c) as far as it can fail on a buffer alone.
+///
+/// ```c
+/// const int tree_entry_len = the_hash_algo->hexsz + 5;
+/// const int parent_entry_len = the_hash_algo->hexsz + 7;
+/// tail += size;
+/// if (tail <= bufptr + tree_entry_len + 1 || memcmp(bufptr, "tree ", 5) ||
+///                 bufptr[tree_entry_len] != '\n')
+///         return error("bogus commit object %s", oid_to_hex(&item->object.oid));
+/// if (get_oid_hex(bufptr + 5, &parent) < 0)
+///         return error("bad tree pointer in commit %s", …);
+/// …
+/// while (bufptr + parent_entry_len < tail && !memcmp(bufptr, "parent ", 7)) {
+///         if (tail <= bufptr + parent_entry_len + 1 ||
+///             get_oid_hex(bufptr + 7, &parent) ||
+///             bufptr[parent_entry_len] != '\n')
+///                 return error("bad parents in commit %s", …);
+///         bufptr += parent_entry_len + 1;
+///         …
+/// }
+/// ```
+///
+/// `lookup_tree()`/`lookup_commit()` allocate rather than look up, so the three
+/// `bad … pointer` deaths behind them cannot fire; the grafts branch needs a
+/// graft file this path never has.
+fn parse_commit_buffer(data: &[u8], id: &ObjectId, hexsz: usize) -> bool {
+    let tree_entry_len = hexsz + 5;
+    let parent_entry_len = hexsz + 7;
+    if data.len() <= tree_entry_len + 1
+        || !data.starts_with(b"tree ")
+        || data[tree_entry_len] != b'\n'
+    {
+        eprintln!("error: bogus commit object {id}");
+        return false;
+    }
+    if !data[5..5 + hexsz].iter().all(u8::is_ascii_hexdigit) {
+        eprintln!("error: bad tree pointer in commit {id}");
+        return false;
+    }
+    let mut at = tree_entry_len + 1;
+    while at + parent_entry_len < data.len() && data[at..].starts_with(b"parent ") {
+        if data.len() <= at + parent_entry_len + 1
+            || !data[at + 7..at + 7 + hexsz].iter().all(u8::is_ascii_hexdigit)
+            || data[at + parent_entry_len] != b'\n'
+        {
+            eprintln!("error: bad parents in commit {id}");
+            return false;
+        }
+        at += parent_entry_len + 1;
+    }
+    true
+}
+
+/// `parse_tag_buffer()` (tag.c). Every structural failure is a silent `-1`; only
+/// an unrecognised `type` value prints, and `lookup_*()` allocating means the
+/// `bad tag pointer` death below it is unreachable.
+///
+/// ```c
+/// if (size < r->hash_algo->hexsz + 24)
+///         return -1;
+/// if (memcmp("object ", bufptr, 7) ||
+///     parse_oid_hex_algop(bufptr + 7, &oid, &bufptr, r->hash_algo) ||
+///     *bufptr++ != '\n')
+///         return -1;
+/// if (!starts_with(bufptr, "type "))
+///         return -1;
+/// bufptr += 5;
+/// nl = memchr(bufptr, '\n', tail - bufptr);
+/// if (!nl || sizeof(type) <= (nl - bufptr))
+///         return -1;
+/// …
+/// else
+///         return error("unknown tag type '%s' in %s", type, …);
+/// …
+/// if (bufptr + 4 < tail && starts_with(bufptr, "tag "))
+///         ;               /* good */
+/// else
+///         return -1;
+/// bufptr += 4;
+/// nl = memchr(bufptr, '\n', tail - bufptr);
+/// if (!nl)
+///         return -1;
+/// ```
+///
+/// `char type[20]`, so a `type` value of 20 bytes or more is rejected before it
+/// is ever compared.
+fn parse_tag_buffer(data: &[u8], id: &ObjectId, hexsz: usize) -> bool {
+    if data.len() < hexsz + 24 || !data.starts_with(b"object ") {
+        return false;
+    }
+    let mut at = 7;
+    if !data[at..at + hexsz].iter().all(u8::is_ascii_hexdigit) || data[at + hexsz] != b'\n' {
+        return false;
+    }
+    at += hexsz + 1;
+    if !data[at..].starts_with(b"type ") {
+        return false;
+    }
+    at += 5;
+    let Some(nl) = data[at..].iter().position(|&b| b == b'\n') else {
+        return false;
+    };
+    if nl >= 20 {
+        return false;
+    }
+    let type_name = &data[at..at + nl];
+    if !matches!(type_name, b"blob" | b"tree" | b"commit" | b"tag") {
+        eprintln!(
+            "error: unknown tag type '{}' in {id}",
+            String::from_utf8_lossy(type_name)
+        );
+        return false;
+    }
+    at += nl + 1;
+    if !(at + 4 < data.len() && data[at..].starts_with(b"tag ")) {
+        return false;
+    }
+    at += 4;
+    data[at..].contains(&b'\n')
+}
+
 fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
     use super::fsck::Severity;
     match msg.default {
@@ -1302,39 +1591,103 @@ fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
     }
 }
 
-/// `fsck_walk_{commit,tree,tag}`: the objects `obj` links to, each with the type
-/// the link gives it. A gitlink is skipped — it names a commit in another
-/// repository, which `fsck_walk_tree()` never follows.
+/// `fsck_walk_{commit,tree,tag}` (fsck.c): the objects `obj` links to, each with
+/// the type the link gives it. `false` is the walk's `-1`, which
+/// `sha1_object()` turns into `die(_("Not all child objects of %s are
+/// reachable"), …)` (builtin/index-pack.c:958-959).
+///
+/// The walk runs over the object `parse_object_buffer()` already accepted, not
+/// over a fresh parse — a commit's `tree` and `parent` lines are exactly the ones
+/// [`parse_commit_buffer`] read, so a commit with no `author` line still links to
+/// its tree. A gitlink is skipped: it names a commit in another repository, which
+/// `fsck_walk_tree()` never follows.
 fn collect_links(
     kind: gix::object::Kind,
     data: &[u8],
+    id: &ObjectId,
     out: &mut Vec<(ObjectId, gix::object::Kind)>,
     hash: Kind,
-) {
+) -> bool {
     use gix::object::Kind as ObjKind;
+    let hexsz = hash.len_in_hex();
     match kind {
         ObjKind::Commit => {
-            let Ok(commit) = gix::objs::CommitRef::from_bytes(data, hash) else { return };
-            out.push((commit.tree(), ObjKind::Tree));
-            out.extend(commit.parents().map(|id| (id, ObjKind::Commit)));
+            // The shape [`parse_commit_buffer`] validated: `tree <hex>\n` then a
+            // run of `parent <hex>\n`.
+            let Ok(tree) = ObjectId::from_hex(&data[5..5 + hexsz]) else { return true };
+            out.push((tree, ObjKind::Tree));
+            let parent_entry_len = hexsz + 7;
+            let mut at = hexsz + 6;
+            while at + parent_entry_len < data.len() && data[at..].starts_with(b"parent ") {
+                let Ok(parent) = ObjectId::from_hex(&data[at + 7..at + 7 + hexsz]) else {
+                    return true;
+                };
+                out.push((parent, ObjKind::Commit));
+                at += parent_entry_len + 1;
+            }
+            true
         }
         ObjKind::Tree => {
-            let Ok(tree) = gix::objs::TreeRef::from_bytes(data, hash) else { return };
-            for entry in tree.entries {
-                match entry.mode.kind() {
-                    gix::objs::tree::EntryKind::Commit => {}
-                    gix::objs::tree::EntryKind::Tree => {
-                        out.push((entry.oid.to_owned(), ObjKind::Tree));
+            // ```c
+            // if (init_tree_desc_gently(&desc, &tree->object.oid, tree->buffer, tree->size, 0))
+            //         return -1;
+            // while (tree_entry_gently(&desc, &entry)) { … }
+            // ```
+            //
+            // `init_tree_desc_gently()` and `update_tree_entry_gently()` print
+            // their own diagnostic; only the first of the two ends the walk in
+            // failure, because the second just reports end-of-tree.
+            let (entries, stop) = super::fsck::tree_entries(data, hexsz);
+            let usable = match stop {
+                super::fsck::TreeStop::AtInit(msg) => {
+                    eprintln!("error: {msg}");
+                    return false;
+                }
+                super::fsck::TreeStop::AtUpdate(msg) => {
+                    eprintln!("error: {msg}");
+                    entries.len() - 1
+                }
+                super::fsck::TreeStop::End => entries.len(),
+            };
+            for entry in &entries[..usable] {
+                let oid = ObjectId::from_bytes_or_panic(entry.oid);
+                match entry.mode & 0o170000 {
+                    // `S_ISGITLINK()` is tested first and is a `continue`.
+                    _ if entry.mode == 0o160000 => {}
+                    0o040000 => out.push((oid, ObjKind::Tree)),
+                    0o100000 | 0o120000 => out.push((oid, ObjKind::Blob)),
+                    // `error("in tree %s: entry %s has bad mode %.6o", …)`
+                    // returns -1, which ends the walk in failure.
+                    _ => {
+                        eprintln!(
+                            "error: in tree {id}: entry {} has bad mode {:06o}",
+                            String::from_utf8_lossy(entry.name),
+                            entry.mode
+                        );
+                        return false;
                     }
-                    _ => out.push((entry.oid.to_owned(), ObjKind::Blob)),
                 }
             }
+            true
         }
         ObjKind::Tag => {
-            let Ok(tag) = gix::objs::TagRef::from_bytes(data, hash) else { return };
-            out.push((tag.target(), tag.target_kind));
+            // `options->walk(tag->tagged, OBJ_ANY, …)`: the tagged object carries
+            // the type the `type ` line named, which [`parse_tag_buffer`] already
+            // accepted.
+            let Some(nl) = data[hexsz + 8..].iter().position(|&b| b == b'\n') else {
+                return true;
+            };
+            let target_kind = match &data[hexsz + 13..hexsz + 8 + nl] {
+                b"blob" => ObjKind::Blob,
+                b"tree" => ObjKind::Tree,
+                b"commit" => ObjKind::Commit,
+                _ => ObjKind::Tag,
+            };
+            let Ok(target) = ObjectId::from_hex(&data[7..7 + hexsz]) else { return true };
+            out.push((target, target_kind));
+            true
         }
-        ObjKind::Blob => {}
+        ObjKind::Blob => true,
     }
 }
 
@@ -1350,9 +1703,6 @@ fn reject_unported(opts: &Opts) -> Result<()> {
             "unsupported fsck severity list {list:?} \
              (the checks run at git's defaults; per-message severities are not honoured)"
         );
-    }
-    if opts.self_contained {
-        bail!("unsupported flag \"--check-self-contained-and-connected\" (no connectivity pass is run here)");
     }
     if opts.pack_header {
         bail!("unsupported flag \"--pack_header\" (internal fetch fast-path is not ported)");

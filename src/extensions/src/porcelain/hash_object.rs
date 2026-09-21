@@ -372,6 +372,32 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
         // `README.md\0src/lib.rs\0` hashes `README.md` alone and exits 0.
         let text = String::from_utf8_lossy(&buf).into_owned();
         for line in text.lines() {
+            // `hash_stdin_paths()` (builtin/hash-object.c:47-55): a record that
+            // opens with a double quote is a C-quoted path and is decoded before
+            // anything is opened; `unquote_c_style()` failing is a `die()`.
+            //
+            //     if (buf.buf[0] == '"') {
+            //             strbuf_reset(&unquoted);
+            //             if (unquote_c_style(&unquoted, buf.buf, NULL))
+            //                     die("line is badly quoted");
+            //             strbuf_swap(&buf, &unquoted);
+            //     }
+            //     hash_object(buf.buf, type, no_filters ? NULL : buf.buf, flags);
+            //
+            // The swap means the *decoded* name is also the virtual path the
+            // attribute lookup uses, so `"a b.txt"` is filtered as `a b.txt`.
+            let decoded;
+            let line: &str = if line.as_bytes().first() == Some(&b'"') {
+                match unquote_c_style(line.as_bytes()) {
+                    Some(bytes) => {
+                        decoded = String::from_utf8_lossy(&bytes).into_owned();
+                        &decoded
+                    }
+                    None => return Err(Fatal::new("line is badly quoted")),
+                }
+            } else {
+                line
+            };
             let name = match line.find('\0') {
                 Some(at) => &line[..at],
                 None => line,
@@ -381,6 +407,64 @@ fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
     }
 
     Ok(())
+}
+
+/// Port of `unquote_c_style()` (quote.c:386-441) in the `endp == NULL` form
+/// `hash_stdin_paths()` calls it with: decode one double-quoted record, ignoring
+/// whatever follows the closing quote, and answer `None` for git's `-1`.
+///
+/// git walks a NUL-terminated string, so a read past the end lands on `\0`, which
+/// no arm accepts — reading out of range as `0` reproduces that. The octal escape
+/// is the strict `\NNN` form of `case '0' ... case '3'`: exactly three digits, and
+/// a leading digit above `3` is rejected rather than wrapped, because it would
+/// overflow a byte.
+fn unquote_c_style(line: &[u8]) -> Option<Vec<u8>> {
+    let at = |i: usize| line.get(i).copied().unwrap_or(0);
+    if at(0) != b'"' {
+        return None;
+    }
+    let mut i = 1;
+    let mut out = Vec::with_capacity(line.len());
+    loop {
+        // `len = strcspn(quoted, "\"\\")`: copy through to the next delimiter.
+        while !matches!(at(i), b'"' | b'\\' | 0) {
+            out.push(at(i));
+            i += 1;
+        }
+        let delim = at(i);
+        i += 1;
+        match delim {
+            b'"' => return Some(out),
+            b'\\' => {}
+            _ => return None,
+        }
+        let esc = at(i);
+        i += 1;
+        let byte = match esc {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
+            b'\\' | b'"' => esc,
+            b'0'..=b'3' => {
+                let mut ac = (esc - b'0') << 6;
+                for shift in [3, 0] {
+                    let d = at(i);
+                    i += 1;
+                    if !(b'0'..=b'7').contains(&d) {
+                        return None;
+                    }
+                    ac |= (d - b'0') << shift;
+                }
+                ac
+            }
+            _ => return None,
+        };
+        out.push(byte);
+    }
 }
 
 /// Strip the `(os error N)` tail std appends, leaving git's bare `strerror` text.
@@ -455,8 +539,43 @@ fn emit<'repo>(
     let data = converted.as_deref().unwrap_or(data);
 
     if !opts.literally && kind != Kind::Blob {
-        if let Err(e) = ObjectRef::from_bytes(data, kind, hash_kind) {
-            eprintln!("error: object fails check: {e}");
+        // `index_mem()` (object-file.c:1007-1016):
+        //
+        //     if (flags & INDEX_FORMAT_CHECK) {
+        //             struct fsck_options opts;
+        //             fsck_options_init(&opts, the_repository, FSCK_OPTIONS_DEFAULT);
+        //             opts.strict = 1;
+        //             opts.error_func = hash_format_check_report;
+        //             if (fsck_buffer(null_oid(...), type, buf, size, &opts))
+        //                     die(_("refusing to create malformed object"));
+        //             fsck_finish(&opts);
+        //     }
+        //
+        // so this is `fsck_buffer()`, not a parse. `hash_format_check_report()`
+        // (object-file.c:974-982) prints `error: object fails fsck: %s` — where
+        // `%s` is `fsck_vreport()`'s `<camelCasedId>: <text>` — and returns 1
+        // *whatever* the severity, so the first non-`FSCK_IGNORE` finding both
+        // prints and kills the run. A blob is `fsck_blob()`, which against the
+        // null oid queues nothing and reports nothing, so it is skipped here.
+        //
+        // `fsck_finish()` then lints the `.gitmodules`/`.gitattributes` blobs a
+        // tree named — but nothing was queued for the null oid, so it is a no-op.
+        let checked = super::fsck::check_object(kind, data, true, hash_kind.len_in_hex());
+        // `init_tree_desc_gently()`/`update_tree_entry_gently()` call `error()`
+        // themselves, ahead of the `report()` that follows; the text already
+        // carries its `error: ` prefix.
+        for line in &checked.raw {
+            eprintln!("{line}");
+        }
+        if let Some(finding) = checked
+            .findings
+            .iter()
+            .find(|f| !matches!(f.msg.default, super::fsck::Severity::Ignore))
+        {
+            eprintln!("error: object fails fsck: {}: {}", finding.msg.id, finding.text);
+            return Err(Fatal::new("refusing to create malformed object"));
+        }
+        if !checked.raw.is_empty() {
             return Err(Fatal::new("refusing to create malformed object"));
         }
     }

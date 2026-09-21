@@ -3632,8 +3632,9 @@ macro_rules! msg {
 macro_rules! msg_mktag {
     ($konst:ident, $id:literal, $fsck:literal, $receive:literal, $fetch:literal, $sev:ident) => {
         #[doc = concat!("`", $id, "`, whose severity comes from `", $fsck, "`. Only ")]
-        #[doc = "`git mktag` reports it: it is the one entry point that fscks a raw tag"]
-        #[doc = concat!("buffer without `parse_tag_buffer()` rejecting it first. `", $receive)]
+        #[doc = "`git mktag` and `git hash-object -t tag` report it: they are the two entry"]
+        #[doc = "points that fsck a raw tag buffer without `parse_tag_buffer()` rejecting it"]
+        #[doc = concat!("first. `", $receive)]
         #[doc = concat!("` and `", $fetch, "` are read and validated, as git does, but the")]
         #[doc = "check cannot fire on a transfer."]
         pub const $konst: Msg = Msg {
@@ -3719,24 +3720,20 @@ msg!(BAD_TIMEZONE, "badTimezone", "fsck.badTimezone", "receive.fsck.badTimezone"
 msg!(NUL_IN_COMMIT, "nulInCommit", "fsck.nulInCommit", "receive.fsck.nulInCommit", "fetch.fsck.nulInCommit", Warn);
 msg!(UNTERMINATED_HEADER, "unterminatedHeader", "fsck.unterminatedHeader", "receive.fsck.unterminatedHeader", "fetch.fsck.unterminatedHeader", Fatal);
 msg!(NUL_IN_HEADER, "nulInHeader", "fsck.nulInHeader", "receive.fsck.nulInHeader", "fetch.fsck.nulInHeader", Fatal);
-// `fsck_commit()`'s two `tree` header ids (`fsck.c:970` and `fsck.c:972`). Both
-// sit behind a `parse_commit_buffer()` that has already rejected the same
-// buffer, on every path that could reach them, so neither is reportable — see
-// the `msg_config_only!` rows below for the evidence.
-msg_config_only!(MISSING_TREE, "missingTree", "fsck.missingTree", "receive.fsck.missingTree", "fetch.fsck.missingTree", Error,
-    "`fsck_commit()` reports it at `fsck.c:970` for a commit whose first header \
-     is not `tree `, but every entry point parses the commit first and gives up: \
-     `builtin/fsck.c:754` calls `parse_object_buffer()` and prints `object could \
-     not be parsed`, and `builtin/index-pack.c:950` does the same and dies \
-     `invalid commit`. Confirmed against git 2.55.0: a commit object with no \
-     `tree` line yields `error: bogus commit object <oid>` from `git fsck`, from \
-     `git index-pack --strict` and from `git unpack-objects --strict` — never \
-     `missingTree`. No command hands a raw *commit* buffer to `fsck_buffer()` \
-     the way `git mktag` does for tags.");
-msg_config_only!(BAD_TREE_SHA1, "badTreeSha1", "fsck.badTreeSha1", "receive.fsck.badTreeSha1", "fetch.fsck.badTreeSha1", Error,
-    "`fsck_commit()` reports it at `fsck.c:972` for a `tree` line whose hex is \
-     not a well-formed object id. Unreachable for the same reason as \
-     `missingTree`: `parse_commit_buffer()` rejects the buffer first everywhere.");
+// `fsck_commit()`'s two `tree` header ids (`fsck.c:970` and `fsck.c:972`).
+//
+// Every *walking* entry point parses the commit before it fscks it and gives up
+// first — `builtin/fsck.c:754` calls `parse_object_buffer()` and prints `object
+// could not be parsed`, `builtin/index-pack.c:950` does the same and dies
+// `invalid commit` — so neither id can be reached from `git fsck`, `git
+// index-pack --strict` or `git unpack-objects --strict`, which all answer `error:
+// bogus commit object <oid>` instead.
+//
+// `index_mem()` (`object-file.c:1013`) is the exception: `git hash-object -t
+// commit` hands `fsck_buffer()` a raw, unparsed buffer, exactly the way `git
+// mktag` does for tags, and both ids report there.
+msg!(MISSING_TREE, "missingTree", "fsck.missingTree", "receive.fsck.missingTree", "fetch.fsck.missingTree", Error);
+msg!(BAD_TREE_SHA1, "badTreeSha1", "fsck.badTreeSha1", "receive.fsck.badTreeSha1", "fetch.fsck.badTreeSha1", Error);
 
 // --- tree checks (`fsck_tree`) ---------------------------------------------
 msg!(NULL_SHA1, "nullSha1", "fsck.nullSha1", "receive.fsck.nullSha1", "fetch.fsck.nullSha1", Warn);
@@ -5147,11 +5144,13 @@ fn verify_headers(data: &[u8], out: &mut Vec<Finding>) -> bool {
     true
 }
 
-/// `fsck.c::fsck_commit`, entered only for a commit `parse_commit_buffer()`
-/// already accepted — so the `tree` line is known well formed and the two ids
-/// git would report for it (`missingTree`, `badTreeSha1`) cannot arise; an
-/// unexpected `tree` line stops the check rather than claiming an id this port
-/// does not report.
+/// `fsck.c::fsck_commit`.
+///
+/// Every walking caller parses the commit before fscking it, so from `git fsck`,
+/// `git index-pack --strict` and `git unpack-objects --strict` the `tree` line is
+/// known well formed by the time this runs. `index_mem()` (`object-file.c:1013`)
+/// is the exception — `git hash-object -t commit` fscks a raw buffer — so the two
+/// `tree` ids are reported here rather than skipped.
 ///
 /// A malformed `parent` line *can* survive that parse, because
 /// `parse_commit_buffer()` only enters its own parent loop while
@@ -5162,9 +5161,23 @@ fn check_commit(data: &[u8], out: &mut Vec<Finding>, hexsz: usize) {
     if verify_headers(data, out) {
         return;
     }
-    let Some(mut p) = strip(data, b"tree ") else { return };
-    let Some(rest) = skip_line(p) else { return };
-    p = rest;
+    // `if (buffer >= buffer_end || !skip_prefix(buffer, "tree ", &buffer))`
+    // (fsck.c:969-970).
+    let Some(after_tree) = strip(data, b"tree ") else {
+        report(out, &MISSING_TREE, "invalid format - expected 'tree' line");
+        return;
+    };
+    // `if (parse_oid_hex_algop(buffer, &tree_oid, &p, …) || *p != '\n')`
+    // (fsck.c:971-975), then `buffer = p + 1`. `report()` answering non-zero
+    // returns; every severity this port can resolve for `badTreeSha1` does.
+    let well_formed = after_tree.len() > hexsz
+        && after_tree[..hexsz].iter().all(u8::is_ascii_hexdigit)
+        && after_tree[hexsz] == b'\n';
+    if !well_formed {
+        report(out, &BAD_TREE_SHA1, "invalid 'tree' line format - bad sha1");
+        return;
+    }
+    let mut p = &after_tree[hexsz + 1..];
     while let Some(after) = strip(p, b"parent ") {
         // `parse_oid_hex_algop(buffer, &parent_oid, &p) || *p != '\n'`.
         let well_formed = after.len() > hexsz
@@ -5310,15 +5323,15 @@ fn rawsz(hexsz: usize) -> usize {
 
 /// One decoded tree entry — `struct name_entry` plus the raw mode field, which
 /// `zeroPaddedFilemode` needs.
-struct TreeEntry<'a> {
+pub(crate) struct TreeEntry<'a> {
     /// The mode as `parse_mode()` returns it, truncated to git's `uint16_t`.
-    mode: u32,
+    pub(crate) mode: u32,
     /// The mode exactly as it was spelled in the buffer.
-    raw_mode: &'a [u8],
+    pub(crate) raw_mode: &'a [u8],
     /// The entry name, up to but not including its NUL.
-    name: &'a [u8],
+    pub(crate) name: &'a [u8],
     /// The entry's raw object id.
-    oid: &'a [u8],
+    pub(crate) oid: &'a [u8],
 }
 
 /// `tree-walk.c::decode_tree_entry`, returning the message
@@ -5374,7 +5387,7 @@ fn tree_entry_span(entry: &TreeEntry<'_>, hexsz: usize) -> usize {
 }
 
 /// Where a tree walk stopped.
-enum TreeStop {
+pub(crate) enum TreeStop {
     /// The whole buffer decoded.
     End,
     /// `init_tree_desc_gently()` rejected the very first entry, which is what
@@ -5387,7 +5400,7 @@ enum TreeStop {
 
 /// `init_tree_desc_gently()` followed by `update_tree_entry_gently()` until the
 /// buffer runs out or an entry fails to decode.
-fn tree_entries(data: &[u8], hexsz: usize) -> (Vec<TreeEntry<'_>>, TreeStop) {
+pub(crate) fn tree_entries(data: &[u8], hexsz: usize) -> (Vec<TreeEntry<'_>>, TreeStop) {
     let mut out = Vec::new();
     if data.is_empty() {
         return (out, TreeStop::End);
@@ -6315,20 +6328,71 @@ fn url_normalize(url: &str) -> Option<String> {
 }
 
 
-/// `fsck.c::fsck_tag`, entered only for a tag gix already parsed — so the
-/// `object`/`type`/`tag` lines are present and the ids git reports for their
-/// absence cannot arise. The `tag` name is still validated, because gix accepts
-/// names `check_refname_format()` rejects.
+/// `fsck.c::fsck_tag_standalone` (fsck.c:1021-1131), the header walk in full.
+///
+/// Every walking caller parses the tag first and gives up on a malformed one, so
+/// from `git fsck`, `git index-pack --strict` and `git unpack-objects --strict`
+/// the `object`/`type`/`tag` lines are known present by the time this runs.
+/// `git mktag` and `index_mem()` — `git hash-object -t tag` — are the two entry
+/// points that hand over a raw buffer, so the ids git reports for a missing or
+/// malformed header are reported here rather than skipped.
+///
+/// The `tag` name is validated whichever way the buffer arrived, because gix
+/// accepts names `check_refname_format()` rejects.
 fn check_tag(data: &[u8], out: &mut Vec<Finding>) {
     if verify_headers(data, out) {
         return;
     }
-    let Some(p) = strip(data, b"object ") else { return };
-    let Some(p) = skip_line(p) else { return };
-    let Some(p) = strip(p, b"type ") else { return };
-    let Some(p) = skip_line(p) else { return };
-    let Some(p) = strip(p, b"tag ") else { return };
-    let Some(eol) = p.iter().position(|&b| b == b'\n') else { return };
+    // `if (buffer >= buffer_end || !skip_prefix(buffer, "object ", &buffer))`
+    // (fsck.c:1041-1044).
+    let Some(after_object) = strip(data, b"object ") else {
+        report(out, &MISSING_OBJECT, "invalid format - expected 'object' line");
+        return;
+    };
+    // `if (parse_oid_hex_algop(buffer, tagged_oid, &p, …) || *p != '\n')`
+    // (fsck.c:1045-1049). The width is the repository's, which `fsck_tag` reads
+    // off `options->repo->hash_algo`; `check_tag` is only ever handed a buffer
+    // whose ids are `HEXSZ_MAX` or `HEXSZ_SHA1` wide, so the first hex run that
+    // ends in a newline decides it.
+    let Some(nl) = after_object.iter().position(|&b| b == b'\n') else {
+        report(out, &BAD_OBJECT_SHA1, "invalid 'object' line format - bad sha1");
+        return;
+    };
+    if !matches!(nl, 40 | 64) || !after_object[..nl].iter().all(u8::is_ascii_hexdigit) {
+        report(out, &BAD_OBJECT_SHA1, "invalid 'object' line format - bad sha1");
+        return;
+    }
+    let p = &after_object[nl + 1..];
+    // `if (buffer >= buffer_end || !skip_prefix(buffer, "type ", &buffer))`
+    // (fsck.c:1052-1055).
+    let Some(after_type) = strip(p, b"type ") else {
+        report(out, &MISSING_TYPE_ENTRY, "invalid format - expected 'type' line");
+        return;
+    };
+    // `eol = memchr(...); if (!eol) report(MISSING_TYPE, "invalid format -
+    // unexpected end after 'type' line")` (fsck.c:1056-1060) — git's wording says
+    // `'type'` for both this and `missingTag` below.
+    let Some(eol) = after_type.iter().position(|&b| b == b'\n') else {
+        report(out, &MISSING_TYPE, "invalid format - unexpected end after 'type' line");
+        return;
+    };
+    // `*tagged_type = type_from_string_gently(buffer, eol - buffer, 1);`
+    // (fsck.c:1061-1065).
+    if !matches!(&after_type[..eol], b"blob" | b"tree" | b"commit" | b"tag") {
+        report(out, &BAD_TYPE, "invalid 'type' value");
+        return;
+    }
+    let p = &after_type[eol + 1..];
+    // `if (buffer >= buffer_end || !skip_prefix(buffer, "tag ", &buffer))`
+    // (fsck.c:1068-1071).
+    let Some(p) = strip(p, b"tag ") else {
+        report(out, &MISSING_TAG_ENTRY, "invalid format - expected 'tag' line");
+        return;
+    };
+    let Some(eol) = p.iter().position(|&b| b == b'\n') else {
+        report(out, &MISSING_TAG, "invalid format - unexpected end after 'type' line");
+        return;
+    };
     let name = &p[..eol];
     if !refname_ok(name) {
         report(out, &BAD_TAG_NAME, format!("invalid 'tag' name: {}", String::from_utf8_lossy(name)));

@@ -375,9 +375,17 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
+    // `fill()` (builtin/unpack-objects.c:78-84) is the only place the reader can
+    // run out, and it dies `early EOF` when it does. `gix-pack` collapses that
+    // into the same `IncompletePack` it reports for a zlib stream that simply
+    // ended short of its declared size — two conditions git words very
+    // differently — so the staged bytes are read through a wrapper that records
+    // whether the decoder ever asked past the end.
+    let saw_eof = std::cell::Cell::new(false);
     let mut write_pack = |mode| {
+        saw_eof.set(false);
         gix::odb::pack::Bundle::write_to_directory(
-            &mut raw.as_slice(),
+            &mut EofWatch { inner: &raw, at: 0, saw_eof: &saw_eof },
             // A dry run still decodes and verifies every entry; it just discards
             // the index and pack instead of keeping them around to read back.
             scratch.as_ref().map(|s| s.path.as_path()),
@@ -396,7 +404,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let outcome = match write_pack(options.iteration_mode) {
         Ok(outcome) => outcome,
         Err(e) => {
-            let message = pack_fatal(&e);
+            let message = pack_fatal_at_eof(&e, saw_eof.get());
             match write_pack(gix::odb::pack::data::input::Mode::Restore) {
                 Ok(outcome) => {
                     deferred_fatal = Some(message);
@@ -416,6 +424,25 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     // 128 a non-recovering run would have produced.
     let has_errors = recover
         && declared_objects.is_some_and(|declared| outcome.index.num_objects < declared);
+
+    // `-r` only covers `get_data()`'s `inflate returned %d` branch
+    // (builtin/unpack-objects.c:139-142); the `fill(1)` right below it (`:144`)
+    // and the trailer's own `fill(the_hash_algo->rawsz)` (`:684`) die `early
+    // EOF` whatever `recover` asked for. `Mode::Restore` salvages silently and
+    // reports nothing — it does not even look at the trailer it was given — so
+    // the same bytes are re-read under `Verify` to tell a short pack, which
+    // still has to die, from damage `-r` is entitled to swallow.
+    if recover && deferred_fatal.is_none() {
+        if let Err(e) = write_pack(gix::odb::pack::data::input::Mode::Verify) {
+            let message = pack_fatal_at_eof(&e, saw_eof.get());
+            // The two deaths `recover` never covers, both driven by `fill()`
+            // rather than by `get_data()`'s inflate loop: running out of input
+            // (`:144`) and the trailer comparison (`:684-686`).
+            if matches!(message.as_str(), "early EOF" | "final sha1 did not match") {
+                deferred_fatal = Some(message);
+            }
+        }
+    }
 
     // The salvaged run still dies — git's does, once every object it decoded is out of
     // the buffer and into the odb. Every exit below goes through this.
@@ -513,6 +540,32 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         };
         collect_links(&parsed, &mut referenced);
         deferred.push(idx);
+    }
+
+    // ```c
+    // for (i = 0; i < nr_objects; i++) {
+    //         unpack_one(i);
+    //         display_progress(progress, i + 1);
+    // }
+    // …
+    // /* Write the last and final delta */
+    // …
+    // if (!hasheq(fill(the_hash_algo->rawsz), oid.hash, …))
+    //         die("final sha1 did not match");
+    // ```
+    //
+    // (`unpack_all()` then `cmd_unpack_objects()`, builtin/unpack-objects.c:602-686.)
+    // A pack cut off mid-object dies inside that loop, so `write_rest()` — and
+    // with it the link check below — never runs and the held-back objects stay
+    // unwritten. A pack whose *trailer* alone is short still completes the loop,
+    // so `write_rest()` writes everything and only then does the trailer check
+    // kill the run. The declared object count tells the two apart.
+    let declared_in_pack = (raw.len() >= 12)
+        .then(|| u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]));
+    let loop_completed =
+        declared_in_pack.is_none_or(|declared| bundle.index.num_objects() >= declared);
+    if deferred_fatal.is_some() && !loop_completed {
+        return Ok(finish(done(has_errors)));
     }
 
     // A link resolves if the pack carries it or the odb already had it — the
@@ -693,12 +746,22 @@ fn parse_magnitude(s: &str) -> u64 {
 /// `io::Error` at all, which is how a truncated pack kept reporting
 /// "An IO operation failed while streaming an entry".
 fn pack_fatal(err: &(dyn std::error::Error + 'static)) -> String {
-    classify_pack_error(err).unwrap_or_else(|| err.to_string())
+    pack_fatal_at_eof(err, false)
+}
+
+/// [`pack_fatal`] for a failure whose reader position is known: `saw_eof` says the
+/// decoder asked for bytes past the end of the input, which is git's `fill()`
+/// running out and so `early EOF`.
+fn pack_fatal_at_eof(err: &(dyn std::error::Error + 'static), saw_eof: bool) -> String {
+    classify_pack_error(err, saw_eof).unwrap_or_else(|| err.to_string())
 }
 
 /// One node of the descent [`pack_fatal`] documents: recognise the wrapper,
 /// step into the error it holds, and stop at the first thing git has a word for.
-fn classify_pack_error(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+fn classify_pack_error(
+    err: &(dyn std::error::Error + 'static),
+    saw_eof: bool,
+) -> Option<String> {
     use gix::hash::io::Error as HashIoError;
     use gix::odb::pack::bundle::write::Error as BundleError;
     use gix::odb::pack::data::header::decode::Error as HeaderError;
@@ -712,38 +775,48 @@ fn classify_pack_error(err: &(dyn std::error::Error + 'static)) -> Option<String
         return match e {
             HeaderError::Corrupt(_) => Some("bad pack file".to_string()),
             HeaderError::UnsupportedVersion(v) => Some(format!("unknown pack file version {v}")),
-            HeaderError::Io { source, .. } => classify_pack_error(source),
+            HeaderError::Io { source, .. } => classify_pack_error(source, saw_eof),
         };
     }
     if let Some(e) = err.downcast_ref::<HashIoError>() {
         return match e {
-            HashIoError::Io(e) => classify_pack_error(e),
+            HashIoError::Io(e) => classify_pack_error(e, saw_eof),
             HashIoError::Hasher(_) => None,
         };
     }
     if let Some(e) = err.downcast_ref::<InputError>() {
         return match e {
-            InputError::Io(e) => classify_pack_error(e),
-            InputError::PackParse(e) => classify_pack_error(e),
+            InputError::Io(e) => classify_pack_error(e, saw_eof),
+            InputError::PackParse(e) => classify_pack_error(e, saw_eof),
             // `if (!hasheq(fill(the_hash_algo->rawsz), oid.hash, …)) die("final sha1 did
             // not match");` (builtin/unpack-objects.c:684-686) — the trailer check, which
             // git makes after every object is already in the odb.
             InputError::Verify(_) => Some("final sha1 did not match".to_string()),
+            // `gix-pack` reports this when `io::copy` over the entry's inflate
+            // reader stopped short of the declared size
+            // (gix-pack/src/data/input/bytes_to_entries.rs:121-126). git reaches
+            // that state two ways and words them differently: a truncated pack
+            // runs `get_data()` back into `fill(1)`
+            // (builtin/unpack-objects.c:144), which dies `early EOF`
+            // (`:78-84`), while a zlib stream that simply ended short falls to
+            // `error("inflate returned %d")` (`:136-137`). Only the first asks
+            // for bytes past the end of the input, which `saw_eof` records.
+            InputError::IncompletePack { .. } if saw_eof => Some("early EOF".to_string()),
             _ => None,
         };
     }
     if let Some(e) = err.downcast_ref::<IndexError>() {
         return match e {
-            IndexError::Io(e) => classify_pack_error(e),
-            IndexError::PackEntryDecode(e) => classify_pack_error(e),
+            IndexError::Io(e) => classify_pack_error(e, saw_eof),
+            IndexError::PackEntryDecode(e) => classify_pack_error(e, saw_eof),
             _ => None,
         };
     }
     if let Some(e) = err.downcast_ref::<BundleError>() {
         return match e {
-            BundleError::Io(e) => classify_pack_error(e),
-            BundleError::PackIter(e) => classify_pack_error(e),
-            BundleError::IndexWrite(e) => classify_pack_error(e),
+            BundleError::Io(e) => classify_pack_error(e, saw_eof),
+            BundleError::PackIter(e) => classify_pack_error(e, saw_eof),
+            BundleError::IndexWrite(e) => classify_pack_error(e, saw_eof),
             BundleError::Persist(_) => None,
         };
     }
@@ -830,6 +903,44 @@ impl<R: Read> Read for Limited<R> {
         let n = self.inner.read(buf)?;
         self.consumed += n as u64;
         Ok(n)
+    }
+}
+
+/// A `BufRead` over the staged pack bytes that notices when the decoder reads
+/// past the end.
+///
+/// `gix-pack` answers both a truncated entry and a zlib stream that ended short
+/// of its declared size with `input::Error::IncompletePack`, but git tells them
+/// apart: the first hits `fill(1)` (builtin/unpack-objects.c:144) and dies
+/// `early EOF`, the second falls out of `get_data()`'s loop into
+/// `error("inflate returned %d")`. Only the first asks for bytes that are not
+/// there, so `saw_eof` is what distinguishes them.
+struct EofWatch<'a> {
+    inner: &'a [u8],
+    at: usize,
+    saw_eof: &'a std::cell::Cell<bool>,
+}
+
+impl Read for EofWatch<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+impl BufRead for EofWatch<'_> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.at >= self.inner.len() {
+            self.saw_eof.set(true);
+        }
+        Ok(&self.inner[self.at..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.at = (self.at + amt).min(self.inner.len());
     }
 }
 

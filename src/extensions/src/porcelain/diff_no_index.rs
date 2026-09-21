@@ -1403,14 +1403,32 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             None => diff_color::WS_DEFAULT_RULE,
         },
     };
-    let (out, changed, paints, check_failed) =
-        match compare(&pair[0], &pair[1], reverse, &opts, &rename_opts, ws_rule, stdin_data) {
-            Ok(result) => result,
-            Err(message) => {
-                eprintln!("error: {message}");
-                return Ok(ExitCode::from(1));
-            }
-        };
+    // `diff_filespec_load_driver()` (diff.c:2308-2320) runs over `o->repo->index`,
+    // which `git diff --no-index` still has whenever the comparison was started from
+    // inside a repository — `cmd_diff()` sets the repository up before it notices the
+    // operands are outside it. So the gitattributes stack applies to the two operand
+    // names exactly as it would for a tracked path, and only a comparison started
+    // outside any repository has no driver to find.
+    let mut drivers = match &repo {
+        Some(repo) => Some(crate::userdiff::Lookup::new(repo)?),
+        None => None,
+    };
+    let (out, changed, paints, check_failed) = match compare_with_drivers(
+        &pair[0],
+        &pair[1],
+        reverse,
+        &opts,
+        &rename_opts,
+        ws_rule,
+        stdin_data,
+        drivers.as_mut(),
+    ) {
+        Ok(result) => result,
+        Err(message) => {
+            eprintln!("error: {message}");
+            return Ok(ExitCode::from(1));
+        }
+    };
     // `diffcore_pickaxe()`'s objfind arm keeps a pair only when a side is
     // `DIFF_FILE_VALID` with an oid in the set (diffcore-pickaxe.c). A no-index
     // filespec never has a valid oid, so `--find-object` drops every pair.
@@ -1453,6 +1471,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
 
 /// The comparison itself: `queue_diff()`, then `diffcore_std()`'s passes, then
 /// `diff_flush()`. Returns the uncoloured output and git's `has_changes`.
+#[cfg(test)]
 fn compare(
     lhs: &str,
     rhs: &str,
@@ -1461,6 +1480,78 @@ fn compare(
     rename_opts: &super::diffcore_rename::Options,
     ws_rule: u32,
     stdin_data: Option<Vec<u8>>,
+) -> std::result::Result<(Vec<u8>, bool, Vec<diff_color::FilePaint>, bool), String> {
+    compare_with_drivers(lhs, rhs, reverse, opts, rename_opts, ws_rule, stdin_data, None)
+}
+
+/// `diff_filespec_load_driver()` (diff.c:2308-2320): the userdiff driver a side's own
+/// path selects, or `None` where git falls back to `userdiff_find_by_name("default")`
+/// — a driver that carries neither a funcname pattern nor a word regex, so the two
+/// are indistinguishable here.
+///
+/// The mode test is git's: only `S_ISREG(one->mode)` consults the attribute stack, so
+/// the absent side of a creation or a deletion, and a symlink, get no driver.
+fn side_driver(
+    drivers: Option<&mut crate::userdiff::Lookup<'_>>,
+    side: &Side,
+) -> std::result::Result<Option<std::sync::Arc<crate::userdiff::Driver>>, String> {
+    let Some(lookup) = drivers else { return Ok(None) };
+    if side.mode & 0o170000 != 0o100000 {
+        return Ok(None);
+    }
+    lookup.for_path(side.name.as_bstr())
+}
+
+/// `init_diff_words_data()` (diff.c:2346-2359): the pair's word regex is the old
+/// side's driver pattern, else the new side's, compiled with
+/// `REG_EXTENDED | REG_NEWLINE`. Memoised per pattern because one run over a
+/// directory of one language would otherwise compile the same text once per file.
+///
+/// `None` whenever git never reaches `userdiff_word_regex()` at all — no
+/// `--word-diff`, or a `--word-diff-regex`/`--color-words=<re>` on the command line —
+/// which is also why a driver pattern that would not compile is silent in that state.
+fn pair_word_regex(
+    cache: &mut std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>>,
+    one: &Option<std::sync::Arc<crate::userdiff::Driver>>,
+    two: &Option<std::sync::Arc<crate::userdiff::Driver>>,
+    want: bool,
+) -> Option<std::sync::Arc<regex::bytes::Regex>> {
+    if !want {
+        return None;
+    }
+    let pat = one
+        .as_ref()
+        .and_then(|d| d.settings.word_regex.as_deref())
+        .or_else(|| two.as_ref().and_then(|d| d.settings.word_regex.as_deref()))?;
+    if let Some(hit) = cache.get(pat) {
+        return Some(hit.clone());
+    }
+    let re = match diff_color::compile_word_regex(pat) {
+        Ok(re) => std::sync::Arc::new(re),
+        // `die("invalid regular expression: %s", o->word_regex)` (diff.c:2358). It is
+        // a `die()`, not the `error()` this command's other refusals take, so it
+        // leaves through stderr and exit 128 rather than the caller's `error:` path.
+        Err(_) => {
+            let message = format!("invalid regular expression: {pat}");
+            crate::trace2::error(&message);
+            eprintln!("fatal: {message}");
+            std::process::exit(crate::fatal::EXIT_FATAL as i32);
+        }
+    };
+    cache.insert(pat.to_string(), re.clone());
+    Some(re)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_with_drivers(
+    lhs: &str,
+    rhs: &str,
+    reverse: bool,
+    opts: &Opts,
+    rename_opts: &super::diffcore_rename::Options,
+    ws_rule: u32,
+    stdin_data: Option<Vec<u8>>,
+    mut drivers: Option<&mut crate::userdiff::Lookup<'_>>,
 ) -> std::result::Result<(Vec<u8>, bool, Vec<diff_color::FilePaint>, bool), String> {
     let mut pairs = queue(lhs, rhs)?;
     // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
@@ -1569,11 +1660,32 @@ fn compare(
     // what `colorize_patch_ex()` indexes to reproduce `emit_line_ws_markup()`'s
     // per-file whitespace state.
     let mut paints: Vec<diff_color::FilePaint> = Vec::new();
+    // One compiled regex per distinct driver pattern for the whole run.
+    let mut word_res: std::collections::HashMap<String, std::sync::Arc<regex::bytes::Regex>> =
+        std::collections::HashMap::new();
     for pi in 0..q.pairs.len() {
         let pair = q.pairs[pi].clone();
         let a = side_of(&q.specs[pair.one], &content);
         let b = side_of(&q.specs[pair.two], &content);
         let (a, b) = (&a, &b);
+        // `builtin_diff()` asks `one` first and falls back to `two` for both the
+        // funcname pattern (diff.c:4036-4038) and the word regex (diff.c:2347-2348),
+        // so the two sides are resolved separately — they differ for a rename or a
+        // copy, which `--no-index` detects across its two directory operands.
+        let drv_one = side_driver(drivers.as_deref_mut(), a)?;
+        let drv_two = match a.name == b.name {
+            true => drv_one.clone(),
+            false => side_driver(drivers.as_deref_mut(), b)?,
+        };
+        let geom = super::diff_pairs::EmitGeometry {
+            ctx: opts.ctx as usize,
+            inter_hunk_ctx: opts.inter_hunk_ctx,
+            func_context: opts.func_context,
+            funcname: drv_one
+                .as_ref()
+                .and_then(|d| d.funcname.as_ref())
+                .or_else(|| drv_two.as_ref().and_then(|d| d.funcname.as_ref())),
+        };
         let old_data = content.bytes(&a.name).filter(|_| a.file.is_some()).unwrap_or_default();
         let new_data = content.bytes(&b.name).filter(|_| b.file.is_some()).unwrap_or_default();
         // A pair that reaches this point and still has identical content is a
@@ -1590,7 +1702,7 @@ fn compare(
         super::diff::no_index_body(
             &old_data,
             &new_data,
-            &opts.ctx_geometry(),
+            &geom,
             opts.ws,
             binary,
             opts.algorithm,
@@ -1680,10 +1792,14 @@ fn compare(
             paints.push(diff_color::FilePaint {
                 ws_rule,
                 blank_at_eof: diff_color::check_blank_at_eof(&old_data, &new_data),
-                // This command does not resolve a path's userdiff driver, so no driver word
-                // regex is available; `diff.wordRegex` still reaches the emitter through
-                // [`diff_color::ExtraPaint`].
-                word_regex: None,
+                // The pair's own driver pattern; `diff.wordRegex` still reaches the
+                // emitter through [`diff_color::ExtraPaint`] when there is none.
+                word_regex: pair_word_regex(
+                    &mut word_res,
+                    &drv_one,
+                    &drv_two,
+                    opts.extra.wants_driver_word_regex(),
+                ),
             });
             emit_header(&mut patch, a, b, &old_data, &new_data, &opts, same_content, binary, &pair);
             // `builtin_diff()` (diff.c:3596): with `-D`, a pair whose post-image label
@@ -1884,20 +2000,6 @@ fn non_patch_format(opts: &Opts) -> bool {
 /// `options->line_termination`: a newline, or a NUL under `-z`.
 fn terminator(opts: &Opts) -> u8 {
     if opts.z { 0 } else { b'\n' }
-}
-
-impl Opts {
-    /// `--no-index` reads no gitattributes at all (`diff_no_index()` never opens a
-    /// repository), so no userdiff driver can apply and the built-in `def_ff` is the
-    /// only heading heuristic there is.
-    fn ctx_geometry(&self) -> super::diff_pairs::EmitGeometry<'static> {
-        super::diff_pairs::EmitGeometry {
-            ctx: self.ctx as usize,
-            inter_hunk_ctx: self.inter_hunk_ctx,
-            func_context: self.func_context,
-            funcname: None,
-        }
-    }
 }
 
 /// `name_a += (*name_a == '/')` (diff.c:1899-1900, and again at diff.c:3899-3900

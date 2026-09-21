@@ -222,7 +222,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "--default",
     "--prefix",
     "--bisect",
-    "--end-of-options",
     "--all-objects",
 ];
 
@@ -351,6 +350,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // Set by an explicit `--`: git's `as_is = 2`. Every later token is a pathspec
     // echoed verbatim with no existence check and no flag interpretation.
     let mut dashdash = false;
+    // git's `seen_end_of_options` (`builtin/rev-parse.c:720`): once
+    // `--end-of-options` has been read, `if (!seen_end_of_options && *arg == '-')`
+    // (:795) stops standing between a leading `-` and the revision parser, so
+    // `git rev-parse --verify --end-of-options -tricky` names the branch
+    // `-tricky` instead of reading it as options.
+    let mut seen_end_of_options = false;
     // `ref_excludes` in `builtin/rev-parse.c`: `--exclude=<pattern>` accumulates
     // here and the next ref walk both applies and clears it.
     let mut ref_excludes: Vec<String> = Vec::new();
@@ -406,11 +411,32 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
+        // ```c
+        // if (!strcmp(arg, "--end-of-options")) {
+        //         seen_end_of_options = 1;
+        //         if (filter & (DO_FLAGS | DO_REVS))
+        //                 show_file(arg, 0);
+        //         continue;
+        // }
+        // ```
+        //
+        // (`builtin/rev-parse.c:1147-1152`) — echoed under the same rule as `--`,
+        // so it appears in the plain listing and is swallowed by `--verify`.
+        // Unlike `--` it ends only the *options*: what follows is still read as
+        // revisions and paths.
+        if !as_is && !seen_end_of_options && arg == "--end-of-options" {
+            if o.filter & (DO_FLAGS | DO_REVS) != 0 && o.shows_files() {
+                emit(&mut out, arg.as_bytes())?;
+            }
+            seen_end_of_options = true;
+            continue;
+        }
+
         // The options that print at their position and need more than the option
         // table: the two pre-setup ones (reached here when they were not part of the
         // leading run), the two that consume `argv[++i]`, and the ones that read the
         // repository or the clock.
-        if !as_is && arg.starts_with('-') && arg.len() > 1 {
+        if !as_is && !seen_end_of_options && arg.starts_with('-') && arg.len() > 1 {
             match positional_option(&mut out, &repo, &paths, &mut o, arg, args.get(i))? {
                 Positional::NotMine => {}
                 Positional::Consumed => continue,
@@ -425,7 +451,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             }
         }
 
-        if !as_is && arg.len() > 1 && arg.starts_with('-') {
+        if !as_is && !seen_end_of_options && arg.len() > 1 && arg.starts_with('-') {
             match option(&mut o, arg)? {
                 Opt::Consumed => {}
                 Opt::Query(q) => {

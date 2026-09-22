@@ -274,6 +274,13 @@ pub struct RefStatus {
     /// `ng <ref> <reason>` line rather than being decided here, which is the
     /// difference between git's `[remote rejected]` and `[rejected]` summaries.
     pub remote_rejected: bool,
+    /// `REF_STATUS_EXPECTING_REPORT`: the command was sent and the server's
+    /// status report came back without a verdict for it, which happens when the
+    /// report stops early (a duplicate destination refspec makes `receive-pack`
+    /// abort after the first `ng`). git keeps this apart from every other
+    /// refusal: `print_ref_status('!', "[remote failure]", …, "remote failed to
+    /// report status")` (transport.c:793-798), not `[rejected]`.
+    pub missing_report: bool,
 }
 
 /// The outcome of a push: the resolved destination URL and every ref's verdict.
@@ -605,15 +612,36 @@ pub fn send_pack(
     if use_sideband {
         cap_buf.push_str(" side-band-64k");
     }
-    if object_format_supported {
-        cap_buf.push_str(&format!(" object-format={}", repo.object_hash()));
+    // ```c
+    // if (quiet_supported && (args->quiet || !args->progress))
+    //         strbuf_addstr(&cap_buf, " quiet");
+    // ```
+    //
+    // (send-pack.c:623-624.) `quiet` tells `receive-pack` not to run its own
+    // progress meter over the pack it indexes, and the sender asks for it
+    // whenever it is not itself showing progress. `args->quiet` is the caller's
+    // `-q`: `transport.c:918` sets it from `transport->verbose < 0`, while
+    // `cmd_send_pack` leaves its `quiet` at the `unsigned quiet = 0;` of
+    // builtin/send-pack.c:173 — no option in that table ever assigns it, so for
+    // `git send-pack` the condition is exactly `!args->progress`. The shared
+    // [`SendOptions`] carries no `quiet` of its own, so the one combination this
+    // cannot yet tell apart is `git push -q --progress`, where git suppresses the
+    // meter on both ends and this asks only for the local one.
+    if caps.contains("quiet") && !opts.progress {
+        cap_buf.push_str(" quiet");
     }
     // `--atomic` and `-o` are refused rather than downgraded: git errors when the
     // receiving end lacks the capability, because pushing non-atomically (or
     // dropping the options) would silently do something other than what was asked.
     if opts.atomic {
         if !caps.contains("atomic") {
-            crate::git_fatal!("the receiving end does not support --atomic push");
+            // `die(_("the receiving end does not support --atomic push"))`
+            // (send-pack.c:608), reached with the connection still half-open —
+            // the same shape as the two refusals below, so the peer reads EOF
+            // where it expected the command list and the transport reports the
+            // hang-up as the second `fatal:`.
+            eprintln!("fatal: the receiving end does not support --atomic push");
+            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
         }
         cap_buf.push_str(" atomic");
     }
@@ -626,6 +654,13 @@ pub fn send_pack(
             return Err(crate::fatal::die("the remote end hung up unexpectedly"));
         }
         cap_buf.push_str(" push-options");
+    }
+    // `object-format` comes *after* `atomic` and `push-options` in the request,
+    // not before them (send-pack.c:617-630 builds `cap_buf` in that order). The
+    // capability list is order-insensitive to a conforming server, but it is what
+    // a recorded pkt-line stream is compared against.
+    if object_format_supported {
+        cap_buf.push_str(&format!(" object-format={}", repo.object_hash()));
     }
     // `push-cert=<nonce>`: the server hands out a nonce that the certificate has
     // to quote back, which is what stops a captured certificate from being
@@ -671,6 +706,27 @@ pub fn send_pack(
         cap_buf.push_str(" push-cert");
     }
     cap_buf.push_str(&format!(" agent={}", agent()));
+    // ```c
+    // repo_config_get_bool(r, "transfer.advertisesid", &advertise_sid);
+    // ...
+    // if (!server_supports("session-id"))
+    //         advertise_sid = 0;
+    // ...
+    // if (advertise_sid)
+    //         strbuf_addf(&cap_buf, " session-id=%s", trace2_session_id());
+    // ```
+    //
+    // (send-pack.c:562, :579-580, :633-634.) Opt-in on both ends: the config says
+    // this process is willing to name itself, and the server has to have
+    // advertised that it understands the capability. The id is the same trace2
+    // SID `upload-pack` advertises under the same setting.
+    let advertise_sid = repo
+        .config_snapshot()
+        .boolean("transfer.advertiseSID")
+        .unwrap_or(false);
+    if advertise_sid && caps.contains("session-id") {
+        cap_buf.push_str(&format!(" session-id={}", crate::trace2::session_id()));
+    }
 
     // Resolve each requested update against the advertisement, running git's
     // pre-flight fast-forward / delete checks. Rejected updates are reported but
@@ -796,6 +852,7 @@ pub fn send_pack(
             up_to_date: false,
             pre_transport: false,
             remote_rejected: false,
+            missing_report: false,
         };
 
         if deletion && !allow_deleting_refs {
@@ -837,6 +894,7 @@ pub fn send_pack(
                 up_to_date: true,
                 pre_transport: false,
                 remote_rejected: false,
+                missing_report: false,
             });
             continue;
         }
@@ -975,6 +1033,7 @@ pub fn send_pack(
                     up_to_date: false,
                     pre_transport: false,
                     remote_rejected: false,
+                    missing_report: false,
                 });
             }
             return Ok(Outcome {
@@ -1002,6 +1061,7 @@ pub fn send_pack(
             up_to_date: false,
             pre_transport: false,
             remote_rejected: false,
+            missing_report: false,
         });
         }
         return Ok(Outcome {
@@ -1048,6 +1108,7 @@ pub fn send_pack(
             up_to_date: false,
             pre_transport: false,
             remote_rejected: false,
+            missing_report: false,
         });
                 continue;
             }
@@ -1278,10 +1339,20 @@ pub fn send_pack(
     // reported through `option refname` produces one status per report, exactly as
     // `print_one_push_report` prints one line per `ref_push_report`.
     for w in &wire {
+        // A command that was sent and never answered keeps git's
+        // `REF_STATUS_EXPECTING_REPORT`, which is neither an `ng` refusal nor a
+        // local one: `print_ref_status('!', "[remote failure]", …, "remote failed
+        // to report status")` (transport.c:793-798). Reporting it as
+        // `[remote rejected]` claimed the server had said something about the ref
+        // when the truth is that the report ended before reaching it.
+        let mut missing_report = false;
         let (result, reports) = match remote_status.remove(&w.name) {
             Some(v) => (v.result, v.reports),
             None if status_report.is_none() => (Ok(()), Vec::new()),
-            None => (Err("remote end did not report status".into()), Vec::new()),
+            None => {
+                missing_report = true;
+                (Err("remote failed to report status".into()), Vec::new())
+            }
         };
         if reports.is_empty() {
             statuses.push(RefStatus {
@@ -1294,7 +1365,8 @@ pub fn send_pack(
                 forced: w.forced,
                 up_to_date: false,
                 pre_transport: false,
-                remote_rejected: true,
+                remote_rejected: !missing_report,
+                missing_report,
             });
             continue;
         }
@@ -1310,6 +1382,7 @@ pub fn send_pack(
                 up_to_date: false,
                 pre_transport: false,
                 remote_rejected: true,
+                missing_report: false,
             });
         }
     }
@@ -1790,6 +1863,171 @@ fn refname_match(pattern: &str, full_name: &str) -> bool {
     ]
     .iter()
     .any(|candidate| candidate == full_name)
+}
+
+/// git's `struct push_cas_option` — the parsed state of `--force-with-lease`.
+///
+/// git holds an array of entries plus the catch-all flag; every caller so far
+/// passes the option at most once, so the array is collapsed to its single
+/// entry. The distinction the two variants keep is the one `apply_cas()`
+/// actually branches on.
+///
+/// The option not having been given at all (`is_empty_cas()`) is the caller's
+/// own `Option<Cas>`: git skips `apply_push_cas()` entirely in that case.
+pub(super) enum Cas {
+    /// `--force-with-lease` with no value: `cas->use_tracking_for_rest = 1`,
+    /// which leases *every* ref against its remote-tracking ref.
+    TrackingForRest,
+    /// `--force-with-lease=<refname>[:<expect>]`: one entry.
+    Entry { refname: String, expect: CasExpect },
+}
+
+/// What one `--force-with-lease` entry expects the remote ref to hold —
+/// `parse_push_cas_option()`'s three arms (remote.c:2650-2658).
+pub(super) enum CasExpect {
+    /// `<refname>` with no colon: `entry->use_tracking = 1`, so the expected
+    /// value is read from the remote-tracking ref at push time.
+    Tracking,
+    /// `<refname>:` with nothing after the colon:
+    /// `oidclr(&entry->expect, …)` — the lease is that the ref does not exist.
+    Absent,
+    /// `<refname>:<expect>`, resolved by `repo_get_oid()`.
+    Value(ObjectId),
+}
+
+/// `parse_push_cas_option()` (remote.c:2632-2660):
+///
+/// ```c
+/// if (!arg) {
+///         /* just "--<option>" */
+///         cas->use_tracking_for_rest = 1;
+///         return 0;
+/// }
+/// colon = strchrnul(arg, ':');
+/// entry = add_cas_entry(cas, arg, colon - arg);
+/// if (!*colon)
+///         entry->use_tracking = 1;
+/// else if (!colon[1])
+///         oidclr(&entry->expect, the_repository->hash_algo);
+/// else if (repo_get_oid(the_repository, colon + 1, &entry->expect))
+///         return error(_("cannot parse expected object name '%s'"), colon + 1);
+/// ```
+///
+/// `repo_get_oid()` is deliberately *not* an existence check for a full-length
+/// object name: `get_oid_basic()` accepts any `hexsz`-digit hex as written. The
+/// value leased is the remote's tip, and a checkout that has never fetched it
+/// cannot resolve it — measured against git 2.55.0, a 40-digit hex naming no
+/// object is accepted while a 39-digit one is rejected.
+pub(super) fn parse_cas(repo: &gix::Repository, arg: Option<&str>) -> Result<Cas> {
+    let Some(arg) = arg else {
+        return Ok(Cas::TrackingForRest);
+    };
+    let (refname, expect) = match arg.split_once(':') {
+        None => (arg, CasExpect::Tracking),
+        Some((r, "")) => (r, CasExpect::Absent),
+        Some((r, e)) => (r, CasExpect::Value(resolve_expect(repo, e)?)),
+    };
+    Ok(Cas::Entry { refname: refname.to_owned(), expect })
+}
+
+/// `repo_get_oid()` as `parse_push_cas_option()` uses it: a full-length hex
+/// object name as written, or any revision this repository can resolve.
+fn resolve_expect(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
+    if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
+        return Ok(id);
+    }
+    repo.rev_parse_single(spec)
+        .map(|id| id.detach())
+        .map_err(|_| anyhow::anyhow!("cannot parse expected object name '{spec}'"))
+}
+
+/// `apply_cas()` (remote.c:2818-2852) for one ref: the expected old value the
+/// lease imposes, and the remote-tracking ref `--force-if-includes` would then
+/// have to prove this checkout has seen.
+///
+/// ```c
+/// for (i = 0; i < cas->nr; i++) {
+///         struct push_cas *entry = &cas->entry[i];
+///         if (!refname_match(entry->refname, ref->name))
+///                 continue;
+///         ref->expect_old_sha1 = 1;
+///         if (!entry->use_tracking)
+///                 oidcpy(&ref->old_oid_expect, &entry->expect);
+///         else if (remote_tracking(remote, ref->name, &ref->old_oid_expect, &ref->tracking_ref))
+///                 oidclr(&ref->old_oid_expect, the_repository->hash_algo);
+///         else
+///                 ref->check_reachable = cas->use_force_if_includes;
+///         return;
+/// }
+/// if (!cas->use_tracking_for_rest)
+///         return;
+/// ```
+///
+/// A tracking ref that cannot be read leaves the expected value at the null oid,
+/// i.e. the lease becomes "the remote must not have this ref at all" — and, per
+/// the `else` above, leaves `check_reachable` off.
+///
+/// `remote` is optional because `cmd_send_pack` only resolves one for
+/// `--remote=<name>` and passes NULL otherwise (send-pack.c:158, :314). git
+/// dereferences it unconditionally in `remote_tracking()` (`remote->fetch`,
+/// remote.c:2684) and segfaults; "no tracking ref" is the behaviour that read
+/// would have produced for a remote with no fetch refspec.
+pub(super) fn apply_cas(
+    repo: &gix::Repository,
+    remote: Option<&gix::Remote<'_>>,
+    cas: &Cas,
+    ref_name: &str,
+    force_if_includes: bool,
+) -> (Option<ObjectId>, Option<String>) {
+    let use_tracking = match cas {
+        Cas::Entry { refname, expect } => {
+            if !refname_match(refname, ref_name) {
+                return (None, None);
+            }
+            match expect {
+                CasExpect::Value(id) => return (Some(*id), None),
+                CasExpect::Absent => return (Some(ObjectId::null(repo.object_hash())), None),
+                CasExpect::Tracking => true,
+            }
+        }
+        Cas::TrackingForRest => true,
+    };
+    debug_assert!(use_tracking);
+
+    let tracking = remote.and_then(|remote| tracking_ref_for(remote, ref_name));
+    let tip = tracking
+        .as_deref()
+        .and_then(|name| repo.find_reference(name).ok())
+        .and_then(|r| r.try_id().map(|id| id.detach()));
+    match (tracking, tip) {
+        (Some(name), Some(tip)) => (Some(tip), force_if_includes.then_some(name)),
+        _ => (Some(ObjectId::null(repo.object_hash())), None),
+    }
+}
+
+/// `remote_tracking()` (remote.c:2679-2694) reduced to naming the ref:
+/// `apply_refspecs(&remote->fetch, refname)`, the local ref a fetch from this
+/// remote would write `refname` to.
+fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
+    for spec in remote.refspecs(Direction::Fetch) {
+        let spec = spec.to_ref();
+        let (Some(src), Some(dst)) = (spec.source(), spec.destination()) else {
+            continue;
+        };
+        let (Ok(src), Ok(dst)) = (std::str::from_utf8(src), std::str::from_utf8(dst)) else {
+            continue;
+        };
+        match (src.strip_suffix('*'), dst.strip_suffix('*')) {
+            (Some(src_pre), Some(dst_pre)) => {
+                if let Some(rest) = pushed.strip_prefix(src_pre) {
+                    return Some(format!("{dst_pre}{rest}"));
+                }
+            }
+            _ if src == pushed => return Some(dst.to_owned()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `count_refspec_match()` (remote.c:1084-1136) reduced to what a deletion needs:

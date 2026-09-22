@@ -329,7 +329,46 @@ fn push(st: &State) -> Result<ExitCode> {
         };
     }
 
-    let requests = build_requests(&repo, st)?;
+    // `if (match_push_refs(...)) { ret = -1; goto cleanup; }` (send-pack.c:309-312):
+    // every refspec whose source names nothing is an `error()` of its own and the
+    // whole push is abandoned, even when other refspecs were fine. `cmd_send_pack`
+    // returns -1 for it, which `run_builtin()` masks to 255.
+    let (mut requests, missing) = build_requests(&repo, st)?;
+    if !missing.is_empty() {
+        for src in &missing {
+            eprintln!("error: src refspec {src} does not match any");
+        }
+        return Ok(ExitCode::from(255));
+    }
+
+    // ```c
+    // if (!is_empty_cas(&cas))
+    //         apply_push_cas(&cas, remote, remote_refs);
+    // if (!is_empty_cas(&cas) && force_if_includes)
+    //         cas.use_force_if_includes = 1;
+    // ```
+    //
+    // (send-pack.c:313-317.) The lease turns into each ref's expected old value
+    // before `send_pack()` sees the list; the wire layer then compares it against
+    // the advertisement and reports `(stale info)` without sending anything.
+    // `remote` is only ever non-NULL for `--remote=<name>` (send-pack.c:158-265),
+    // and it is the only source of the tracking refs the valueless forms lease
+    // against.
+    //
+    // `State::lease` is `Option<Option<String>>` because the option and its value
+    // are separately optional: the outer `None` is "never given" (`is_empty_cas()`
+    // — nothing to apply), the inner `None` is a bare `--force-with-lease`.
+    if let Some(arg) = &st.lease {
+        let cas = push_proto::parse_cas(&repo, arg.as_deref())?;
+        let named = st.remote_name.is_some().then_some(&remote);
+        for req in &mut requests {
+            let (expected, check_reachable) =
+                push_proto::apply_cas(&repo, named, &cas, &req.name, st.force_if_includes);
+            req.expected = expected;
+            req.check_reachable = check_reachable;
+        }
+    }
+
     let opts = push_proto::SendOptions {
         atomic: st.atomic,
         push_options: st.push_options.clone(),
@@ -483,8 +522,11 @@ pub(crate) fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
 /// remote-tracking refs. Neither implies force: `--mirror` is `MATCH_REFS_MIRROR`,
 /// a *matching* flag, and the update's `force` still comes from the refspec's
 /// own `+` or from `args.force_update` (`--force`).
-fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
+fn build_requests(repo: &gix::Repository, st: &State) -> Result<(Vec<Request>, Vec<String>)> {
     let mut requests = Vec::new();
+    // Sources that resolved to nothing, in argv order. `match_explicit()` reports
+    // every one of them (remote.c:1179) rather than stopping at the first.
+    let mut missing = Vec::new();
 
     if st.send_all || st.send_mirror {
         for r in repo.references()?.all()? {
@@ -509,7 +551,7 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
                 });
             }
         }
-        return Ok(requests);
+        return Ok((requests, missing));
     }
 
     let null = ObjectId::null(repo.object_hash());
@@ -539,9 +581,10 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
             continue;
         }
 
-        let src_ref = repo
-            .find_reference(src)
-            .with_context(|| format!("src refspec {src} does not match any"))?;
+        let Ok(src_ref) = repo.find_reference(src) else {
+            missing.push(src.to_owned());
+            continue;
+        };
         let new = src_ref.clone().into_fully_peeled_id()?.detach();
         requests.push(Request {
             name: full_ref_name(repo, dst),
@@ -554,7 +597,7 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<Vec<Request>> {
                 explicit_delete: false,
         });
     }
-    Ok(requests)
+    Ok((requests, missing))
 }
 
 /// The destination side of a refspec as a full ref name. A `<dst>` that is
@@ -617,9 +660,14 @@ fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verb
                 // rejected]", …)` (transport.c) — a refusal the server sent back as an
                 // `ng` line is not the same summary as one this side decided.
                 Err(reason) => {
-                    let summary = match s.remote_rejected {
-                        true => "[remote rejected]",
-                        false => "[rejected]",
+                    // `case REF_STATUS_EXPECTING_REPORT: print_ref_status('!',
+                    // "[remote failure]", …)` (transport.c:793-798) is its own
+                    // summary: the command was sent, and the report ended before
+                    // answering it.
+                    let summary = match (s.missing_report, s.remote_rejected) {
+                        (true, _) => "[remote failure]",
+                        (false, true) => "[remote rejected]",
+                        (false, false) => "[rejected]",
                     };
                     emit('!', summary.into(), from, to, Some(reason))
                 }
@@ -731,6 +779,10 @@ fn print_helper_status(outcome: &push_proto::Outcome) {
         match &s.result {
             Ok(()) if s.up_to_date => println!("ok {name} up to date"),
             Ok(()) => println!("ok {name}"),
+            // `case REF_STATUS_EXPECTING_REPORT: res = "error"; msg = "expecting
+            // report";` (builtin/send-pack.c:89-92) — the helper spelling has
+            // nothing in common with the human one.
+            Err(_) if s.missing_report => println!("error {name} expecting report"),
             // `REF_STATUS_REJECT_NONFASTFORWARD`'s helper spelling.
             Err(reason) if reason == "non-fast-forward" => println!("error {name} non-fast forward"),
             Err(reason) => println!("error {name} {reason}"),
@@ -974,7 +1026,18 @@ fn parse_int(v: &str) -> Option<i32> {
 /// Whether `spec` names an object in the current repository, i.e. whether git's
 /// `repo_get_oid` would have succeeded. Failing to open a repository at all
 /// counts as "unresolvable", matching git's own outcome there.
+///
+/// A *full-length* object name is accepted as written, whether or not the object
+/// is present: `get_oid_basic()` takes the `hexsz`-digit case through
+/// `get_oid_hex()` and returns it without a lookup. This is load-bearing for
+/// `--force-with-lease=<ref>:<expect>`, whose `<expect>` is the remote's tip —
+/// the value a lease exists to detect having changed is exactly the one a stale
+/// checkout cannot resolve. Measured against git 2.55.0: a 40-digit hex naming
+/// no object is accepted, a 39-digit one is rejected.
 fn resolve_rev(spec: &str) -> bool {
+    if ObjectId::from_hex(spec.as_bytes()).is_ok() {
+        return true;
+    }
     let Ok(repo) = crate::setup::discover() else {
         return false;
     };

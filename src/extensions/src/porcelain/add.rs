@@ -452,12 +452,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     if pathspecs.is_empty() && !(all || update_only) {
         // git: message + advice on stderr, exit 0. stdout stays empty.
         eprintln!("Nothing specified, nothing added.");
-        if crate::advice::enabled("addEmptyPathspec") {
-            eprintln!("hint: Maybe you wanted to say 'git add .'?");
-            eprintln!(
-                "hint: Disable this message with \"git config set advice.addEmptyPathspec false\""
-            );
-        }
+        // `advise_if_enabled(ADVICE_ADD_EMPTY_PATHSPEC, …)` (builtin/add.c:468):
+        // the shared gate, so the `Disable this message with …` trailer appears
+        // only while the slot is unconfigured, exactly as `vadvise()` decides.
+        crate::advice::Advice::AddEmptyPathspec.advise("Maybe you wanted to say 'git add .'?");
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -2541,14 +2539,12 @@ pub(super) fn finish_code(f: Finish<'_>) -> ExitCode {
         for path in sparse_skipped {
             eprintln!("{path}");
         }
-        if crate::advice::enabled("updateSparsePath") {
-            eprintln!("hint: If you intend to update such entries, try one of the following:");
-            eprintln!("hint: * Use the --sparse option.");
-            eprintln!("hint: * Disable or modify the sparsity rules.");
-            eprintln!(
-                "hint: Disable this message with \"git config set advice.updateSparsePath false\""
-            );
-        }
+        // `advise_if_enabled(ADVICE_UPDATE_SPARSE_PATH, …)` (advice.c:268-271).
+        crate::advice::Advice::UpdateSparsePath.advise(
+            "If you intend to update such entries, try one of the following:\n\
+             * Use the --sparse option.\n\
+             * Disable or modify the sparsity rules.",
+        );
     }
     for line in chmod_errors {
         eprintln!("{line}");

@@ -2102,27 +2102,39 @@ fn write_zip(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `zip_time`/`zip_date`: the DOS pair `archive-zip.c` derives from the entry
-/// mtime in *local* time, which `git archive` leaves as UTC because it sets
-/// `TZ`-independent fields from `gmtime`.
+/// `zip_time`/`zip_date`: the DOS pair `dos_time()` (archive-zip.c:613-628)
+/// derives from the entry mtime.
+///
+/// ```c
+/// time = (time_t)*timestamp;
+/// localtime_r(&time, &tm);
+/// *timestamp = time;
+///
+/// *dos_date = tm.tm_mday + (tm.tm_mon + 1) * 32 +
+///             (tm.tm_year + 1900 - 1980) * 512;
+/// *dos_time = tm.tm_sec / 2 + tm.tm_min * 32 + tm.tm_hour * 2048;
+/// ```
+///
+/// The broken-down time is the process's *local* one, not UTC: a zip written
+/// in `TZ=America/New_York` from a commit at `2005-04-07T22:13:13 +0200`
+/// carries `16:13:12`, and the same commit archived under `TZ=UTC` carries
+/// `20:13:12`. Only the DOS pair moves — the `UT` extra field next to it keeps
+/// the raw epoch seconds, which is why an unzip that prefers `UT` shows the
+/// same instant either way and the header bytes still differ.
 fn dos_time(mtime: i64) -> (u16, u16) {
-    // Days/seconds since the epoch, in UTC.
-    let days = mtime.div_euclid(86400);
-    let secs = mtime.rem_euclid(86400);
-    // Civil-from-days (Howard Hinnant's algorithm), which is what `gmtime` does.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    let date = (((y - 1980) as u16) << 9) | ((m as u16) << 5) | d as u16;
-    let time = ((hour as u16) << 11) | ((min as u16) << 5) | (sec as u16 / 2);
+    let t = mtime as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` fills the `tm` this frame owns and reads `t`;
+    // both are live for the call. NULL is the out-of-range answer, which is
+    // the `date_overflows()` arm git dies on and no zip this port writes can
+    // reach from a commit date.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return (0, 0);
+    }
+    let date = ((tm.tm_year + 1900 - 1980) as u16) << 9
+        | ((tm.tm_mon + 1) as u16) << 5
+        | tm.tm_mday as u16;
+    let time = (tm.tm_hour as u16) << 11 | (tm.tm_min as u16) << 5 | (tm.tm_sec as u16 / 2);
     (time, date)
 }
 

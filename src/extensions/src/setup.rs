@@ -2112,20 +2112,38 @@ pub(crate) fn unquote_c_style_step(bytes: &[u8], at: usize) -> Option<(Vec<u8>, 
                     b't' => b'\t',
                     b'v' => 0x0b,
                     b'"' | b'\\' => c,
-                    b'0'..=b'7' => {
-                        // Up to three octal digits, as `git_parse_c_escape` reads
-                        // them; the value wraps into a byte.
-                        let mut value = u32::from(c - b'0');
-                        for _ in 0..2 {
-                            match bytes.get(i + 1) {
-                                Some(&d @ b'0'..=b'7') => {
-                                    value = value * 8 + u32::from(d - b'0');
-                                    i += 1;
-                                }
-                                _ => break,
+                    // ```c
+                    // /* octal values with first digit over 4 overflow */
+                    // case '0': case '1': case '2': case '3':
+                    //         ac = ((ch - '0') << 6);
+                    //         if ((ch = *quoted++) < '0' || '7' < ch)
+                    //                 goto error;
+                    //         ac |= ((ch - '0') << 3);
+                    //         if ((ch = *quoted++) < '0' || '7' < ch)
+                    //                 goto error;
+                    //         ac |= (ch - '0');
+                    //         ch = ac;
+                    //         break;
+                    // ```
+                    //
+                    // (quote.c:422-432.) Exactly three digits, and only `0`-`3`
+                    // may lead: `\4` and above would overflow the byte, so git
+                    // sends them to `error` rather than wrapping. Accepting
+                    // one or two digits, or a leading `4`-`7`, made
+                    // `git archive '--add-virtual-file="\401":x'` write a file
+                    // named `\001` where stock 2.55.0 answers
+                    // `fatal: unclosed quote: '"\401":x'`.
+                    b'0'..=b'3' => {
+                        let mut ac = (c - b'0') << 6;
+                        for shift in [3, 0] {
+                            let &d = bytes.get(i + 1)?;
+                            if !(b'0'..=b'7').contains(&d) {
+                                return None;
                             }
+                            ac |= (d - b'0') << shift;
+                            i += 1;
                         }
-                        u8::try_from(value & 0xff).ok()?
+                        ac
                     }
                     _ => return None,
                 });

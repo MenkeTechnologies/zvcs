@@ -99,7 +99,9 @@
 //! allocator and pack-window counters that have no equivalent here — is never
 //! printed, and no crash report is dumped on a fatal error, because the
 //! `fast_import_crash_<pid>` file could never match anyway and lives inside
-//! `.git` where nothing observes it.
+//! `.git` where nothing observes it. The `warning:` lines
+//! `parse_one_option()` prints are *not* part of that: they are ordinary
+//! stderr a caller reads, and they are reproduced.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -813,6 +815,44 @@ fn ulong_arg(flag: &str, value: &str) -> Result<u64> {
     Ok(u64::from_str_radix(digits, radix).unwrap_or(u64::MAX))
 }
 
+/// `strtoumax(data, NULL, 10)` as `parse_data()` calls it: leading blanks,
+/// then as many decimal digits as there are, and no error for the rest.
+fn strtoumax10(spec: &[u8]) -> usize {
+    let mut i = 0;
+    while matches!(spec.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let mut v: usize = 0;
+    while let Some(d) = spec.get(i).filter(|b| b.is_ascii_digit()) {
+        v = v.saturating_mul(10).saturating_add(usize::from(d - b'0'));
+        i += 1;
+    }
+    v
+}
+
+/// The two legacy-unit warnings in `parse_one_option()`'s `max-pack-size=`
+/// arm (builtin/fast-import.c:3755-3766):
+///
+/// ```c
+/// if (v < 8192) {
+///         warning(_("max-pack-size is now in bytes, assuming --max-pack-size=%lum"), v);
+///         v *= 1024 * 1024;
+/// } else if (v < 1024 * 1024) {
+///         warning(_("minimum max-pack-size is 1 MiB"));
+///         v = 1024 * 1024;
+/// }
+/// ```
+///
+/// The clamped value steers only which pack an object lands in, which this
+/// port does not reproduce, but the warnings are stderr a caller sees.
+fn warn_max_pack_size(v: u64) {
+    if v < 8192 {
+        eprintln!("warning: max-pack-size is now in bytes, assuming --max-pack-size={v}m");
+    } else if v < 1024 * 1024 {
+        eprintln!("warning: minimum max-pack-size is 1 MiB");
+    }
+}
+
 /// git's `parse_ulong_with_suffix`, used for the two byte-size options. A value
 /// it cannot read is not a distinct error: git falls through and reports the
 /// whole argument as an unknown option.
@@ -831,6 +871,21 @@ fn byte_size(value: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
+
+thread_local! {
+    /// `static struct strbuf command_buf` (builtin/fast-import.c:253): the line
+    /// most recently read off the stream. Nearly every `die()` in the parser
+    /// quotes it back rather than the fragment it was handed, so the port keeps
+    /// the same one-line memory instead of threading the line through each
+    /// call.
+    static COMMAND_BUF: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The current [`COMMAND_BUF`], for the diagnostics that quote it.
+fn command_buf() -> String {
+    COMMAND_BUF.with(|b| String::from_utf8_lossy(&b.borrow()).into_owned())
+}
 
 /// The command stream on stdin, with git's one-line pushback and its
 /// "consume a trailing LF if there is one" primitive.
@@ -860,6 +915,10 @@ impl Input {
         if buf.last() == Some(&b'\n') {
             buf.pop();
         }
+        // git reads every line into the one global `command_buf`, and a push-back
+        // leaves it alone (`unread_command_buf` only suppresses the next read),
+        // so this mirror is updated here and not in `unread`.
+        COMMAND_BUF.with(|b| *b.borrow_mut() = buf.clone());
         Ok(Some(buf))
     }
 
@@ -880,11 +939,31 @@ impl Input {
     }
 
     /// Exactly `n` bytes of raw data.
+    ///
+    /// ```c
+    /// while (n < length) {
+    ///         size_t s = strbuf_fread(sb, length - n, stdin);
+    ///         if (!s && feof(stdin))
+    ///                 die(_("EOF in data (%lu bytes remaining)"),
+    ///                         (unsigned long)(length - n));
+    ///         n += s;
+    /// }
+    /// ```
+    ///
+    /// (`parse_data()`, builtin/fast-import.c:1950-1957.) The count git reports
+    /// is what is *still* missing when the stream ends, not the whole request:
+    /// `data 5` over a four-byte tail is `EOF in data (1 bytes remaining)`.
     fn exact(&mut self, n: usize) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; n];
-        self.stdin
-            .read_exact(&mut buf)
-            .map_err(|_| anyhow!("EOF in data ({n} bytes remaining)"))?;
+        let mut got = 0usize;
+        while got < n {
+            match self.stdin.read(&mut buf[got..]) {
+                Ok(0) => crate::git_fatal!("EOF in data ({} bytes remaining)", n - got),
+                Ok(k) => got += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(buf)
     }
 
@@ -917,12 +996,11 @@ impl Input {
             }
             out
         } else {
-            let text = std::str::from_utf8(spec).unwrap_or("");
-            let n: usize = text
-                .trim()
-                .parse()
-                .map_err(|_| anyhow!("invalid count in data command: {text}"))?;
-            self.exact(n)?
+            // `uintmax_t len = strtoumax(data, NULL, 10);` — git never checks
+            // for a conversion, so a `data` line whose argument is not a number
+            // at all is a zero-length payload rather than an error, and a
+            // trailing suffix is ignored.
+            self.exact(strtoumax10(spec))?
         };
         self.skip_optional_lf()?;
         Ok(out)
@@ -1020,8 +1098,9 @@ impl Importer {
                         .ok_or_else(|| anyhow!("unknown option {a}"))?;
                 }
                 _ if starts(a, "--max-pack-size=") => {
-                    byte_size(&a["--max-pack-size=".len()..])
+                    let v = byte_size(&a["--max-pack-size=".len()..])
                         .ok_or_else(|| anyhow!("unknown option {a}"))?;
+                    warn_max_pack_size(v);
                 }
                 _ if starts(a, "--date-format=") => {
                     self.opts.date_format = date_format(&a["--date-format=".len()..])?;
@@ -1165,6 +1244,12 @@ impl Importer {
                 input.skip_optional_lf()?;
             } else if let Some(v) = after(cmd, b"get-mark ") {
                 self.seen_data_command = true;
+                // `if (*p != ':') die(_("not a mark: %s"), p);` — `parse_get_mark()`,
+                // builtin/fast-import.c:3386-3387, the one caller that says so
+                // before `parse_mark_ref()` asserts on the colon.
+                if v.first() != Some(&b':') {
+                    crate::git_fatal!("not a mark: {}", String::from_utf8_lossy(v));
+                }
                 let id = self.mark_ref(v)?;
                 self.respond(format!("{id}\n").as_bytes())?;
             } else if let Some(v) = after(cmd, b"cat-blob ") {
@@ -1193,14 +1278,14 @@ impl Importer {
         let mut mark = None;
         let mut line = input.command()?;
         if let Some(v) = field(&line, b"mark :") {
-            mark = Some(parse_mark(&v)?);
+            mark = parse_mark_decl(&v);
             line = input.command()?;
         }
         if field(&line, b"original-oid ").is_some() {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"data ") else {
-            crate::git_fatal!("expected 'data n' command");
+            crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
         };
         let payload = input.data(&spec)?;
         let id = self.pack.store(&self.repo, Kind::Blob, &payload)?.0;
@@ -1220,7 +1305,7 @@ impl Importer {
 
         let mut line = input.command()?;
         if let Some(v) = field(&line, b"mark :") {
-            mark = Some(parse_mark(&v)?);
+            mark = parse_mark_decl(&v);
             line = input.command()?;
         }
         if field(&line, b"original-oid ").is_some() {
@@ -1231,7 +1316,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(v) = field(&line, b"committer ") else {
-            crate::git_fatal!("expected committer command");
+            crate::git_fatal!("expected committer but didn't get one");
         };
         let committer = self.ident(&v)?;
         line = input.command()?;
@@ -1249,7 +1334,7 @@ impl Importer {
             };
             line = input.command()?;
             let Some(spec) = field(&line, b"data ") else {
-                crate::git_fatal!("expected 'data n' command");
+                crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
             };
             signatures.push((header, input.data(&spec)?));
             line = input.command()?;
@@ -1281,7 +1366,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"data ") else {
-            crate::git_fatal!("expected 'data n' command");
+            crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
         };
         let message = input.data(&spec)?;
 
@@ -1302,9 +1387,8 @@ impl Importer {
             if cmd.is_empty() {
                 break;
             }
-            if let Some(v) = after(&cmd, b"M ") {
-                let v = v.to_vec();
-                self.file_modify(input, idx, &v)?;
+            if after(&cmd, b"M ").is_some() {
+                self.file_modify(input, idx, &cmd)?;
             } else if let Some(v) = after(&cmd, b"D ") {
                 let path = unquote(v)?;
                 dir_remove(&mut self.branches[idx].tree, &path);
@@ -1388,13 +1472,19 @@ impl Importer {
         let mut mark = None;
         let mut line = input.command()?;
         if let Some(v) = field(&line, b"mark :") {
-            mark = Some(parse_mark(&v)?);
+            mark = parse_mark_decl(&v);
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"from ") else {
-            crate::git_fatal!("expected from command");
+            crate::git_fatal!("expected 'from' command, got '{}'", command_buf());
         };
-        let object = self.commitish(&spec)?;
+        // `parse_new_tag()` reads the mark's own type out of the mark table and
+        // tags whatever it finds (builtin/fast-import.c:3220-3225), so a tag of
+        // a blob or of another tag is legal where a `<commit-ish>` is not.
+        let object = match spec.strip_prefix(b":") {
+            Some(v) => self.mark_ref(v)?,
+            None => self.commitish(&spec)?,
+        };
         line = input.command()?;
 
         if field(&line, b"original-oid ").is_some() {
@@ -1406,7 +1496,7 @@ impl Importer {
             line = input.command()?;
         }
         let Some(spec) = field(&line, b"data ") else {
-            crate::git_fatal!("expected 'data n' command");
+            crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
         };
         let mut message = input.data(&spec)?;
 
@@ -1478,20 +1568,57 @@ impl Importer {
         Ok(())
     }
 
-    /// `alias LF mark 'to' SP <commit-ish> LF LF?`.
+    /// `alias LF mark 'to' SP <commit-ish> LF`.
+    ///
+    /// ```c
+    /// static void parse_alias(void)
+    /// {
+    ///         struct object_entry *e;
+    ///         struct branch b;
+    ///
+    ///         skip_optional_lf();
+    ///         read_next_command();
+    ///
+    ///         /* mark ... */
+    ///         parse_mark();
+    ///         if (!next_mark)
+    ///                 die(_("expected 'mark' command, got %s"), command_buf.buf);
+    ///
+    ///         /* to ... */
+    ///         memset(&b, 0, sizeof(b));
+    ///         if (!parse_objectish_with_prefix(&b, "to "))
+    ///                 die(_("expected 'to' command, got %s"), command_buf.buf);
+    /// ```
+    ///
+    /// (builtin/fast-import.c:3623-3642.) The optional LF is eaten *before* the
+    /// block, not after it, and `parse_objectish()` ends with its own
+    /// `read_next_command()` whose result nothing here puts back — so the line
+    /// after `to <objectish>` is consumed and discarded. In a stream that
+    /// separates its blocks with a blank line that line is the blank; in one
+    /// that does not, the next command is swallowed, which is why stock 2.55.0
+    /// answers `fatal: unsupported command: from :9` for an `alias` block
+    /// followed immediately by `reset`/`from`.
     fn parse_alias(&mut self, input: &mut Input) -> Result<()> {
+        input.skip_optional_lf()?;
         let line = input.command()?;
         let Some(v) = field(&line, b"mark :") else {
-            crate::git_fatal!("expected mark command");
+            // `command_buf` is what git quotes, and at EOF it still holds the
+            // previous line rather than an empty one.
+            crate::git_fatal!("expected 'mark' command, got {}", command_buf());
         };
-        let mark = parse_mark(&v)?;
+        // `if (!next_mark) die(_("expected 'mark' command, got %s"), …)`: a
+        // `mark :` whose argument is not a positive number is no mark at all,
+        // and `alias` is one of the callers that insists on one.
+        let Some(mark) = parse_mark_decl(&v) else {
+            crate::git_fatal!("expected 'mark' command, got {}", command_buf());
+        };
         let line = input.command()?;
         let Some(spec) = field(&line, b"to ") else {
-            crate::git_fatal!("expected to command");
+            crate::git_fatal!("expected 'to' command, got {}", command_buf());
         };
         let id = self.commitish(&spec)?;
         self.marks.insert(mark, id);
-        input.skip_optional_lf()?;
+        input.command()?;
         Ok(())
     }
 
@@ -1540,8 +1667,16 @@ impl Importer {
         }
         match opt {
             "quiet" | "stats" => Ok(()),
-            _ if starts(opt, "max-pack-size=")
-                || starts(opt, "big-file-threshold=")
+            _ if starts(opt, "max-pack-size=") => {
+                // `parse_one_option()` runs the same arm for the `option git`
+                // spelling as for the command line, so the legacy-unit warnings
+                // belong to both.
+                if let Some(v) = byte_size(&opt["max-pack-size=".len()..]) {
+                    warn_max_pack_size(v);
+                }
+                Ok(())
+            }
+            _ if starts(opt, "big-file-threshold=")
                 || starts(opt, "depth=")
                 || starts(opt, "active-branches=") =>
             {
@@ -1554,27 +1689,81 @@ impl Importer {
     // -- file changes -------------------------------------------------------
 
     /// `M SP <mode> SP <dataref> SP <path>`, with the dataref possibly `inline`.
-    fn file_modify(&mut self, input: &mut Input, idx: usize, rest: &[u8]) -> Result<()> {
-        let (mode_word, rest) = split_space(rest)
-            .ok_or_else(|| anyhow!("Corrupt mode: M {}", String::from_utf8_lossy(rest)))?;
-        let mode = canonical_mode(mode_word)
-            .ok_or_else(|| anyhow!("Corrupt mode: M {}", String::from_utf8_lossy(mode_word)))?;
+    ///
+    /// Port of `file_change_m()` (builtin/fast-import.c:2370-2469) including its
+    /// order: mode, dataref, path, the empty-directory shortcut, then the
+    /// gitlink and `inline` refusals, then the type check. Every diagnostic in
+    /// that function names `command_buf.buf` — the whole `M …` line as typed —
+    /// so `line` is carried in rather than the remainder being reassembled.
+    fn file_modify(&mut self, input: &mut Input, idx: usize, line: &[u8]) -> Result<()> {
+        let shown = String::from_utf8_lossy(line).into_owned();
+        let rest = &line[b"M ".len()..];
+        // ```c
+        // p = parse_mode(p, &mode);
+        // if (!p)
+        //         die(_("corrupt mode: %s"), command_buf.buf);
+        // ```
+        //
+        // …and the `switch (mode)` below it, whose `default:` is the same die,
+        // so an octal that parses but is not one git tracks reads identically.
+        let (mode_word, rest) =
+            split_space(rest).ok_or_else(|| anyhow!("corrupt mode: {shown}"))?;
+        let mode = canonical_mode(mode_word).ok_or_else(|| anyhow!("corrupt mode: {shown}"))?;
 
-        let (oid, path) = if let Some(after_inline) = after(rest, b"inline ") {
-            let path = unquote(after_inline)?;
-            let line = input.command()?;
-            let Some(spec) = field(&line, b"data ") else {
-                crate::git_fatal!("expected 'data n' command");
+        let hexsz = self.repo.object_hash().len_in_hex();
+        let mut inline_data = false;
+        let (oid, path) = if rest.first() == Some(&b':') {
+            let (oid, rest) = self.mark_ref_space(rest)?;
+            (oid, unquote(rest)?)
+        } else if let Some(after_inline) = after(rest, b"inline ") {
+            inline_data = true;
+            (ObjectId::null(self.repo.object_hash()), unquote(after_inline)?)
+        } else {
+            // `parse_mapped_oid_hex()` consumes exactly `hexsz` characters and
+            // leaves `p` on whatever follows; the space is checked separately,
+            // which is why a 41-character id is `missing space after SHA1` and
+            // not `invalid dataref`.
+            if rest.len() < hexsz {
+                crate::git_fatal!("invalid dataref: {shown}");
+            }
+            let Ok(oid) = ObjectId::from_hex(&rest[..hexsz]) else {
+                crate::git_fatal!("invalid dataref: {shown}");
+            };
+            let tail = &rest[hexsz..];
+            if tail.first() != Some(&b' ') {
+                crate::git_fatal!("missing space after SHA1: {shown}");
+            }
+            (oid, unquote(&tail[1..])?)
+        };
+
+        // `if (S_ISDIR(mode) && is_empty_tree_oid(&oid) && *path.buf)`: git does
+        // not track empty directories below the root, and the shortcut returns
+        // before any of the checks below.
+        if mode == 0o40000
+            && !inline_data
+            && oid == ObjectId::empty_tree(self.repo.object_hash())
+            && !path.is_empty()
+        {
+            dir_remove(&mut self.branches[idx].tree, &path);
+            return Ok(());
+        }
+
+        if mode == 0o160000 && inline_data {
+            crate::git_fatal!("Git links cannot be specified 'inline': {shown}");
+        }
+        if mode == 0o40000 && inline_data {
+            crate::git_fatal!("directories cannot be specified 'inline': {shown}");
+        }
+
+        let oid = if inline_data {
+            let dline = input.command()?;
+            let Some(spec) = field(&dline, b"data ") else {
+                crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
             };
             let payload = input.data(&spec)?;
-            if mode == 0o160000 {
-                crate::git_fatal!("Git links cannot be specified 'inline'");
-            }
-            (self.pack.store(&self.repo, Kind::Blob, &payload)?.0, path)
+            self.pack.store(&self.repo, Kind::Blob, &payload)?.0
         } else {
-            let (dataref, rest) = split_space(rest)
-                .ok_or_else(|| anyhow!("Missing space after SHA1: M {}", String::from_utf8_lossy(rest)))?;
-            (self.dataref(dataref)?, unquote(rest)?)
+            oid
         };
 
         // A gitlink is the only thing `--rewrite-submodules-from/-to` would touch,
@@ -1597,23 +1786,33 @@ impl Importer {
             0o160000 => Kind::Commit,
             _ => Kind::Blob,
         };
-        match self.repo.try_find_header(oid)? {
-            None if mode == 0o160000 => {}
-            None => crate::git_fatal!("{oid} not found"),
-            Some(header) if header.kind() != want => crate::git_fatal!(
-                "Not a {want} (actually a {}): {}",
-                header.kind(),
-                String::from_utf8_lossy(&path)
-            ),
-            Some(_) => {}
+        // ```c
+        // if (type < 0)
+        //         die(_("%s not found: %s"),
+        //             S_ISDIR(mode) ?  _("tree") : _("blob"),
+        //             command_buf.buf);
+        // if (type != expected)
+        //         die(_("not a %s (actually a %s): %s"),
+        //                 type_name(expected), type_name(type),
+        //                 command_buf.buf);
+        // ```
+        //
+        // (builtin/fast-import.c:2446-2459.) The object just written for an
+        // `inline` payload is a blob by construction and git never re-reads it,
+        // so the check is skipped there as it is in the C.
+        if !inline_data {
+            match self.repo.try_find_header(oid)? {
+                None if mode == 0o160000 => {}
+                None => crate::git_fatal!("{want} not found: {shown}"),
+                Some(header) if header.kind() != want => crate::git_fatal!(
+                    "not a {want} (actually a {}): {shown}",
+                    header.kind()
+                ),
+                Some(_) => {}
+            }
         }
 
         if mode == 0o40000 {
-            // git does not track empty directories below the root.
-            if oid == ObjectId::empty_tree(self.repo.object_hash()) && !path.is_empty() {
-                dir_remove(&mut self.branches[idx].tree, &path);
-                return Ok(());
-            }
             let sub = load_dir(&self.repo, oid)?;
             if path.is_empty() {
                 self.branches[idx].tree = sub;
@@ -1652,14 +1851,13 @@ impl Importer {
             let target = after_inline.to_vec();
             let line = input.command()?;
             let Some(spec) = field(&line, b"data ") else {
-                crate::git_fatal!("expected 'data n' command");
+                crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
             };
             let payload = input.data(&spec)?;
             (self.pack.store(&self.repo, Kind::Blob, &payload)?.0, target)
         } else {
-            let (dataref, target) =
-                split_space(rest).ok_or_else(|| anyhow!("Missing space after SHA1"))?;
-            (self.dataref(dataref)?, target.to_vec())
+            let (oid, target) = self.dataref_space(rest, "SHA1")?;
+            (oid, target.to_vec())
         };
         let commit = self.commitish(&target)?;
         let hex = commit.to_string().into_bytes();
@@ -1694,12 +1892,33 @@ impl Importer {
     // -- queries ------------------------------------------------------------
 
     /// `cat-blob <dataref>` → `<oid> SP blob SP <size> LF <contents> LF`.
+    /// ```c
+    /// if (type <= 0) {
+    ///         strbuf_reset(&line);
+    ///         strbuf_addf(&line, "%s missing\n", oid_to_hex(oid));
+    ///         cat_blob_write(line.buf, line.len);
+    ///         [...]
+    ///         return;
+    /// }
+    /// if (!buf)
+    ///         die(_("can't read object %s"), oid_to_hex(oid));
+    /// if (type != OBJ_BLOB)
+    ///         die(_("object %s is a %s but a blob was expected."),
+    ///             oid_to_hex(oid), type_name(type));
+    /// ```
+    ///
+    /// (`cat_blob()`, builtin/fast-import.c:3332-3363.) An object that is not
+    /// there is answered on the cat-blob channel the way `cat-file --batch`
+    /// answers it, not as a fatal error.
     fn cat_blob(&mut self, spec: &[u8]) -> Result<()> {
         let oid = self.dataref(spec)?;
-        let object = self.repo.find_object(oid)?;
-        if object.kind != Kind::Blob {
-            crate::git_fatal!("Object {oid} is a {}, not a blob", object.kind);
+        let Some(header) = self.repo.try_find_header(oid)? else {
+            return self.respond(format!("{oid} missing\n").as_bytes());
+        };
+        if header.kind() != Kind::Blob {
+            crate::git_fatal!("object {oid} is a {} but a blob was expected.", header.kind());
         }
+        let object = self.repo.find_object(oid)?;
         let mut out = format!("{oid} blob {}\n", object.data.len()).into_bytes();
         out.extend_from_slice(&object.data);
         out.push(b'\n');
@@ -1714,9 +1933,10 @@ impl Importer {
             let idx = branch.ok_or_else(|| anyhow!("Not in a commit: ls"))?;
             (self.branches[idx].tree.clone(), unquote(rest)?)
         } else {
-            let (dataref, rest) =
-                split_space(rest).ok_or_else(|| anyhow!("Missing space after tree-ish"))?;
-            let oid = self.dataref(dataref)?;
+            // `parse_ls()` takes the tree-ish through `parse_mark_ref_space()`
+            // for a mark (builtin/fast-import.c:3518), so a mark with trailing
+            // junk is `missing space after mark`, not `garbage after mark`.
+            let (oid, rest) = self.dataref_space(rest, "tree-ish")?;
             let tree = self.repo.find_object(oid)?.peel_to_tree()?.id;
             (load_dir(&self.repo, tree)?, unquote(rest)?)
         };
@@ -1849,7 +2069,24 @@ impl Importer {
     /// As [`Importer::commitish`], but the all-zero id is a legal answer.
     fn commitish_allow_null(&self, spec: &[u8]) -> Result<ObjectId> {
         if let Some(v) = spec.strip_prefix(b":") {
-            return self.mark_ref(v);
+            // ```c
+            // uintmax_t idnum = parse_mark_ref_eol(objectish);
+            // struct object_entry *oe = find_mark(marks, idnum);
+            // if (oe->type != OBJ_COMMIT)
+            //         die(_("mark :%" PRIuMAX " not a commit"), idnum);
+            // ```
+            //
+            // (`parse_objectish()`, builtin/fast-import.c:2662-2666, with the
+            // same three lines in `parse_merge()` at 2727-2730 and in
+            // `note_change_n()` at 2562-2566.) `parse_new_tag()` is the one
+            // caller that takes a mark of any type, so it resolves the mark
+            // itself rather than coming through here.
+            let mark = parse_mark_ref_eol(v)?;
+            let id = self.find_mark(mark)?;
+            if self.repo.try_find_header(id)?.map(|h| h.kind()) != Some(Kind::Commit) {
+                crate::git_fatal!("mark :{mark} not a commit");
+            }
+            return Ok(id);
         }
         let text = utf8(spec, "commit-ish")?;
         if let Some(&idx) = self.by_name.get(&text) {
@@ -1865,7 +2102,7 @@ impl Importer {
         Ok(self
             .repo
             .rev_parse_single(text.as_str())
-            .map_err(|_| anyhow!("Invalid ref name or SHA1 expression: {text}"))?
+            .map_err(|_| anyhow!("invalid ref name or SHA1 expression: {text}"))?
             .detach())
     }
 
@@ -1874,14 +2111,44 @@ impl Importer {
         if let Some(v) = spec.strip_prefix(b":") {
             return self.mark_ref(v);
         }
-        ObjectId::from_hex(spec)
-            .map_err(|_| anyhow!("Invalid dataref: {}", String::from_utf8_lossy(spec)))
+        ObjectId::from_hex(spec).map_err(|_| anyhow!("invalid dataref: {}", command_buf()))
     }
 
-    /// Look up `:<idnum>` (the leading colon already stripped).
+    /// A dataref that is followed by a space: a mark through
+    /// `parse_mark_ref_space()`, or a full hex id with the space checked after
+    /// it (`file_change_m()`/`note_change_n()`/`parse_ls()`).
+    fn dataref_space<'a>(&self, spec: &'a [u8], field: &str) -> Result<(ObjectId, &'a [u8])> {
+        if spec.first() == Some(&b':') {
+            return self.mark_ref_space(spec);
+        }
+        let hexsz = self.repo.object_hash().len_in_hex();
+        if spec.len() < hexsz {
+            crate::git_fatal!("invalid dataref: {}", command_buf());
+        }
+        let Ok(oid) = ObjectId::from_hex(&spec[..hexsz]) else {
+            crate::git_fatal!("invalid dataref: {}", command_buf());
+        };
+        let Some(rest) = spec[hexsz..].strip_prefix(b" ") else {
+            crate::git_fatal!("missing space after {field}: {}", command_buf());
+        };
+        Ok((oid, rest))
+    }
+
+    /// `find_mark(marks, parse_mark_ref_eol(p))`: a mark reference that runs to
+    /// the end of the line.
     fn mark_ref(&self, spec: &[u8]) -> Result<ObjectId> {
-        let spec = spec.strip_prefix(b":").unwrap_or(spec);
-        let mark = parse_mark(spec)?;
+        self.find_mark(parse_mark_ref_eol(spec)?)
+    }
+
+    /// `find_mark(marks, parse_mark_ref_space(&p))`: a mark reference followed
+    /// by a space, with the rest of the line handed back.
+    fn mark_ref_space<'a>(&self, spec: &'a [u8]) -> Result<(ObjectId, &'a [u8])> {
+        let (mark, rest) = parse_mark_ref_space(spec)?;
+        Ok((self.find_mark(mark)?, rest))
+    }
+
+    /// `find_mark()`: the object a declared mark stands for.
+    fn find_mark(&self, mark: u64) -> Result<ObjectId> {
         self.marks
             .get(&mark)
             .copied()
@@ -2694,15 +2961,57 @@ fn unquote_prefix(input: &[u8]) -> Result<(Vec<u8>, usize)> {
     crate::git_fatal!("Invalid quoting: {}", String::from_utf8_lossy(input))
 }
 
-/// `:<idnum>` where the number is a positive decimal integer.
-fn parse_mark(spec: &[u8]) -> Result<u64> {
-    let text = std::str::from_utf8(spec)
-        .map_err(|_| anyhow!("invalid mark: {}", String::from_utf8_lossy(spec)))?;
-    let text = text.trim_end();
-    text.parse::<u64>()
-        .ok()
-        .filter(|m| *m > 0)
-        .ok_or_else(|| anyhow!("invalid mark: {text}"))
+/// `parse_mark()` (builtin/fast-import.c:1901-1910): the `mark :<idnum>`
+/// declaration, whose argument goes through a bare `strtoumax(v, NULL, 10)`.
+/// There is no failure mode — a `mark :` line whose argument is not a number
+/// leaves `next_mark` at 0, which every caller reads as "no mark was given" —
+/// so `mark :x` is accepted and declares nothing.
+fn parse_mark_decl(spec: &[u8]) -> Option<u64> {
+    let mark = strtoumax10(spec) as u64;
+    (mark != 0).then_some(mark)
+}
+
+/// `parse_mark_ref()` (builtin/fast-import.c:2274-2285): the digits after the
+/// `:` of a mark *reference*, and whatever follows them.
+///
+/// ```c
+/// assert(*p == ':');
+/// p++;
+/// mark = strtoumax(p, endptr, 10);
+/// if (*endptr == p)
+///         die(_("no value after ':' in mark: %s"), command_buf.buf);
+/// ```
+fn parse_mark_ref(spec: &[u8]) -> Result<(u64, &[u8])> {
+    let spec = spec.strip_prefix(b":").unwrap_or(spec);
+    let n = spec.iter().take_while(|b| b.is_ascii_digit()).count();
+    if n == 0 {
+        crate::git_fatal!("no value after ':' in mark: {}", command_buf());
+    }
+    let mut mark: u64 = 0;
+    for b in &spec[..n] {
+        mark = mark.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+    }
+    Ok((mark, &spec[n..]))
+}
+
+/// `parse_mark_ref_eol()` (builtin/fast-import.c:2290-2299): a mark reference
+/// that has to be the whole of the rest of the line.
+fn parse_mark_ref_eol(spec: &[u8]) -> Result<u64> {
+    let (mark, rest) = parse_mark_ref(spec)?;
+    if !rest.is_empty() {
+        crate::git_fatal!("garbage after mark: {}", command_buf());
+    }
+    Ok(mark)
+}
+
+/// `parse_mark_ref_space()` (builtin/fast-import.c:2305-2316): a mark reference
+/// followed by a space, and the rest of the line after it.
+fn parse_mark_ref_space(spec: &[u8]) -> Result<(u64, &[u8])> {
+    let (mark, rest) = parse_mark_ref(spec)?;
+    let Some(rest) = rest.strip_prefix(b" ") else {
+        crate::git_fatal!("missing space after mark: {}", command_buf());
+    };
+    Ok((mark, rest))
 }
 
 /// git's `validate_raw_date` (builtin/fast-import.c:1966-1999): `<seconds> SP

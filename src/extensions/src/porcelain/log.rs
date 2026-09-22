@@ -4398,7 +4398,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // under entries from either side of the cutoff.
             let seconds = match &node.reflog {
                 Some(rl) => rl.time.seconds,
-                None => commit.time()?.seconds,
+                None => commit_date(&commit),
             };
             if since.is_some_and(|s| seconds < s)
                 || since_as_filter.is_some_and(|s| seconds < s)
@@ -8196,7 +8196,7 @@ fn read_node(repo: &gix::Repository, id: ObjectId) -> Result<Node> {
         patch_same: false,
         id,
         parents: commit.parent_ids().map(|p| p.detach()).collect(),
-        time: commit.time()?.seconds,
+        time: commit_date(&commit),
         seq: 0,
         boundary: false,
         follow_path: None,
@@ -8808,7 +8808,7 @@ pub(super) fn write_identity_headers_for(
     encode: bool,
     mailmap: Option<&Mailmap>,
 ) -> Result<()> {
-    let date = who.time()?.format(gix::date::time::format::GIT_RFC2822)?;
+    let date = show_ident_date(who.time, DateMode::Rfc, now_secs());
     let (name, mail) = mapped_ident(who.name, who.email, mailmap);
     let name = name.to_str().map_err(|_| {
         anyhow!("identity name is not valid UTF-8; RFC2047 encoding needs a known charset")
@@ -9708,7 +9708,11 @@ fn expand_one(
                 'a' => commit.author()?,
                 _ => commit.committer()?,
             };
-            expand_person(out, &who, chars.get(*i).copied(), date_mode, ctx)?;
+            if !expand_person(out, &who, chars.get(*i).copied(), date_mode, ctx)? {
+                // `return 0; /* unknown placeholder */` (pretty.c:866): the
+                // letter was not consumed, so the driver prints `%a<x>` as typed.
+                return Ok(false);
+            }
             *i += 1;
         }
         // The reflog placeholders. `format_reflog_person()` and the selector both
@@ -11013,19 +11017,6 @@ fn format_relative(then: i64, now: i64) -> String {
     crate::date::show_date_relative(then, now)
 }
 
-/// Write a signature's timestamp in `mode`, the shared body of `%ad`/`%cd` and
-/// their fixed-format `%ai`/`%aI` cousins.
-fn expand_date(
-    out: &mut Vec<u8>,
-    sig: &gix::actor::SignatureRef<'_>,
-    mode: DateMode,
-    now: i64,
-) -> Result<()> {
-    let t = sig.time()?;
-    out.extend_from_slice(fmt_time(t.seconds, t.offset, mode, now).as_bytes());
-    Ok(())
-}
-
 /// Format a timestamp, routing the clock-relative `relative` mode (which needs
 /// `now`) to [`format_relative`] and everything else to [`format_date`].
 pub(crate) fn fmt_time(seconds: i64, offset: i32, mode: DateMode, now: i64) -> String {
@@ -11048,7 +11039,7 @@ fn expand_person(
     part: Option<char>,
     date_mode: DateMode,
     ctx: &RenderCtx<'_>,
-) -> Result<()> {
+) -> Result<bool> {
     let local_part = |mail: &[u8]| -> Vec<u8> {
         match mail.iter().position(|b| *b == b'@') {
             Some(at) => mail[..at].to_vec(),
@@ -11065,22 +11056,37 @@ fn expand_person(
             who,
             Some(Mailmap::for_pretty(ctx.repo)),
         ))),
-        Some('d') => expand_date(out, who, date_mode, ctx.now)?,
-        Some('D') => expand_date(out, who, DateMode::Rfc, ctx.now)?,
-        Some('i') => expand_date(out, who, DateMode::Iso, ctx.now)?,
-        Some('I') => expand_date(out, who, DateMode::IsoStrict, ctx.now)?,
-        Some('r') => expand_date(out, who, DateMode::Relative, ctx.now)?,
-        Some('s') => expand_date(out, who, DateMode::Short, ctx.now)?,
-        Some('h') => expand_date(
-            out,
-            who,
-            DateMode::Show(crate::showdate::DateMode::new(crate::showdate::DateType::Human)),
-            ctx.now,
-        )?,
-        Some('t') => write!(out, "{}", who.time()?.seconds)?,
+        // Every remaining letter is a date, and all of them are behind
+        // `if (!s.date_begin) goto skip;` (pretty.c:824). What `skip:` does then
+        // depends on the letter: it returns `placeholder_len` for `t d D r i`,
+        // which consumes the placeholder and prints nothing, but falls through to
+        // `return 0` for `I h s`, which leaves `%aI`/`%ah`/`%as` on the line
+        // *verbatim*. An ident with no readable date is the only way to reach
+        // either arm, and the two are visibly different (pretty.c:862-866).
+        Some(part @ ('d' | 'D' | 'i' | 'I' | 'r' | 's' | 'h' | 't')) => {
+            if !ident_has_date(who.time) {
+                return Ok(matches!(part, 't' | 'd' | 'D' | 'r' | 'i'));
+            }
+            let mode = match part {
+                'd' => date_mode,
+                'D' => DateMode::Rfc,
+                'i' => DateMode::Iso,
+                'I' => DateMode::IsoStrict,
+                'r' => DateMode::Relative,
+                's' => DateMode::Short,
+                _ => DateMode::Show(crate::showdate::DateMode::new(
+                    crate::showdate::DateType::Human,
+                )),
+            };
+            if part == 't' {
+                out.extend_from_slice(ident_date_raw(who.time).as_bytes());
+            } else {
+                out.extend_from_slice(show_ident_date(who.time, mode, ctx.now).as_bytes());
+            }
+        }
         _ => unreachable!("check_format rejected this already"),
     }
-    Ok(())
+    Ok(true)
 }
 
 /// git's `%b`: the message body — everything after the blank line that ends the
@@ -11253,14 +11259,15 @@ pub(crate) fn rev_list_pretty_body(
         Pretty::User(fmt) => expand_format(&mut out, commit, fmt, &ctx)?,
         Pretty::Reference => {
             let author = commit.author()?;
-            let t = author.time()?;
             out.extend_from_slice(abbrev.borrow_mut().get(commit.id()).as_bytes());
             out.extend_from_slice(b" (");
             out.extend_from_slice(&subject(commit.message_raw()?));
             out.extend_from_slice(b", ");
-            out.extend_from_slice(
-                fmt_time(t.seconds, t.offset, DateMode::Short, ctx.now).as_bytes(),
-            );
+            if ident_has_date(author.time) {
+                out.extend_from_slice(
+                    show_ident_date(author.time, DateMode::Short, ctx.now).as_bytes(),
+                );
+            }
             out.push(b')');
         }
         Pretty::Raw => {
@@ -11295,19 +11302,17 @@ pub(crate) fn rev_list_pretty_body(
             match pretty {
                 Pretty::Fuller => {
                     let committer = commit.committer()?;
-                    let at = author.time()?;
-                    let ct = committer.time()?;
                     write_person(&mut out, b"Author:     ", &author, None);
                     writeln!(
                         out,
                         "AuthorDate: {}",
-                        fmt_time(at.seconds, at.offset, ctx.date_mode.clone(), ctx.now)
+                        show_ident_date(author.time, ctx.date_mode.clone(), ctx.now)
                     )?;
                     write_person(&mut out, b"Commit:     ", &committer, None);
                     writeln!(
                         out,
                         "CommitDate: {}",
-                        fmt_time(ct.seconds, ct.offset, ctx.date_mode.clone(), ctx.now)
+                        show_ident_date(committer.time, ctx.date_mode.clone(), ctx.now)
                     )?;
                 }
                 Pretty::Full => {
@@ -11318,11 +11323,10 @@ pub(crate) fn rev_list_pretty_body(
                 _ => {
                     write_person(&mut out, b"Author: ", &author, None);
                     if matches!(pretty, Pretty::Medium) {
-                        let t = author.time()?;
                         writeln!(
                             out,
                             "Date:   {}",
-                            fmt_time(t.seconds, t.offset, ctx.date_mode, ctx.now)
+                            show_ident_date(author.time, ctx.date_mode, ctx.now)
                         )?;
                     }
                 }
@@ -11708,12 +11712,13 @@ fn render_entry(
                 false => DateMode::Short,
             };
             let author = commit.author()?;
-            let t = author.time()?;
             out.extend_from_slice(ctx.abbrev.borrow_mut().get(commit.id()).as_bytes());
             out.extend_from_slice(b" (");
             out.extend_from_slice(&subject(commit.message_raw()?));
             out.extend_from_slice(b", ");
-            out.extend_from_slice(fmt_time(t.seconds, t.offset, date_mode, ctx.now).as_bytes());
+            if ident_has_date(author.time) {
+                out.extend_from_slice(show_ident_date(author.time, date_mode, ctx.now).as_bytes());
+            }
             out.push(b')');
         }
         // ```c
@@ -11840,19 +11845,17 @@ fn render_entry(
             match pretty {
                 Pretty::Fuller => {
                     let committer = commit.committer()?;
-                    let at = author.time()?;
-                    let ct = committer.time()?;
                     write_person(out, b"Author:     ", &author, ctx.mailmap);
                     writeln!(
                         out,
                         "AuthorDate: {}",
-                        fmt_time(at.seconds, at.offset, ctx.date_mode.clone(), ctx.now)
+                        show_ident_date(author.time, ctx.date_mode.clone(), ctx.now)
                     )?;
                     write_person(out, b"Commit:     ", &committer, ctx.mailmap);
                     writeln!(
                         out,
                         "CommitDate: {}",
-                        fmt_time(ct.seconds, ct.offset, ctx.date_mode.clone(), ctx.now)
+                        show_ident_date(committer.time, ctx.date_mode.clone(), ctx.now)
                     )?;
                 }
                 Pretty::Full => {
@@ -11864,11 +11867,10 @@ fn render_entry(
                     // medium / short
                     write_person(out, b"Author: ", &author, ctx.mailmap);
                     if matches!(pretty, Pretty::Medium) {
-                        let time = author.time()?;
                         writeln!(
                             out,
                             "Date:   {}",
-                            fmt_time(time.seconds, time.offset, ctx.date_mode.clone(), ctx.now)
+                            show_ident_date(author.time, ctx.date_mode.clone(), ctx.now)
                         )?;
                     }
                 }
@@ -12002,23 +12004,20 @@ pub(crate) fn write_person(
 pub(crate) use crate::mailmap::Mailmap;
 
 
-/// Write a raw-format identity line: `<role> <name> <<email>> <seconds> +ZZZZ`.
+/// Write a raw-format identity line: `<role> <name> <<email>> <date field>`.
+///
+/// `CMIT_FMT_RAW` reproduces the object's own header (`pp_header()`), so the
+/// date field goes back out exactly as recorded — a timestamp no integer type
+/// can hold, or a zone `gix` cannot round-trip, still round-trips here.
 fn write_raw_ident(out: &mut Vec<u8>, role: &[u8], sig: &gix::actor::SignatureRef<'_>) -> Result<()> {
-    let t = sig.time()?;
-    let (sign, off) = if t.offset < 0 { ('-', -t.offset) } else { ('+', t.offset) };
     out.extend_from_slice(role);
     out.push(b' ');
     out.extend_from_slice(sig.name);
     out.extend_from_slice(b" <");
     out.extend_from_slice(sig.email);
-    out.push(b'>');
-    writeln!(
-        out,
-        " {} {sign}{:02}{:02}",
-        t.seconds,
-        off / 3600,
-        (off % 3600) / 60
-    )?;
+    out.extend_from_slice(b"> ");
+    out.extend_from_slice(sig.time.as_bytes());
+    out.push(b'\n');
     Ok(())
 }
 
@@ -14725,11 +14724,6 @@ pub(crate) fn parse_date_mode(spec: &str) -> Option<DateMode> {
     })
 }
 
-const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
 /// `show_date(…, DATE_MODE(RFC2822))`, which is the one date mode git hardcodes
 /// outside the `--date=` machinery: `refs.c`'s
 /// `warning(_("log for '%.*s' only goes back to %s"), …)` renders its timestamp
@@ -14742,109 +14736,213 @@ pub(crate) fn show_date_rfc2822(seconds: i64, offset: i32) -> String {
 }
 
 /// Format a timestamp in the requested [`DateMode`], matching git byte-for-byte.
+///
+/// The offset arrives in *seconds* — what `gix` normalises an object header's
+/// `[-+]HHMM` field into — so it is converted back to git's own `tz` integer on
+/// the way in. Callers that still hold the recorded field go straight to
+/// [`format_date_tz`], which keeps a zone `gix` cannot round-trip (`+9999`)
+/// exactly as git prints it.
 fn format_date(seconds: i64, offset: i32, mode: DateMode) -> String {
-    match mode {
-        // `show_date()` itself, for the modes whose rendering needs libc.
-        DateMode::Show(ref m) => {
-            // git's `tz` is the `[-+]HHMM` integer off the object header; this file carries the
-            // offset in seconds, so it is converted back on the way in.
-            let tz = (offset / 3600) * 100 + (offset % 3600) / 60;
-            crate::showdate::show_date(seconds, tz, m, now_secs())
-        }
-        DateMode::Default => format_git_date(seconds, offset),
+    let tz = (offset / 3600) * 100 + (offset % 3600) / 60;
+    format_date_tz(seconds, tz, mode)
+}
+
+/// `show_date()` (date.c:288-370) with git's own `tz`: the `[-+]HHMM` *integer*
+/// read off the object header — `+0530` is `530`, `-0030` is `-30` — not an
+/// offset in seconds.
+///
+/// Every mode goes through [`crate::showdate::show_date`], which is the port of
+/// that function. A second hand-rolled calendar lived here and disagreed with it
+/// wherever `gmtime_r()` refuses the timestamp: date.c:330-333 falls back to the
+/// epoch with a zero zone,
+///
+/// ```c
+/// if (!tm) {
+///         tm = time_to_tm(0, 0, &tmbuf);
+///         tz = 0;
+/// }
+/// ```
+///
+/// while the arithmetic here happily extrapolated, printing
+/// `31688740476-10-22` where git prints `1970-01-01` (t4212's "absurdly
+/// far-in-future date").
+fn format_date_tz(seconds: i64, tz: i32, mode: DateMode) -> String {
+    use crate::showdate::{DateMode as ShowMode, DateType};
+    let show = match mode {
+        DateMode::Show(m) => m,
+        DateMode::Default => ShowMode::new(DateType::Normal),
+        DateMode::Short => ShowMode::new(DateType::Short),
+        DateMode::Iso => ShowMode::new(DateType::Iso8601),
+        DateMode::IsoStrict => ShowMode::new(DateType::Iso8601Strict),
+        DateMode::Rfc => ShowMode::new(DateType::Rfc2822),
+        DateMode::Unix => ShowMode::new(DateType::Unix),
+        DateMode::Raw => ShowMode::new(DateType::Raw),
         // Relative dates need the current time; callers route them through
         // `fmt_time`, but keep this arm self-contained rather than unreachable.
-        DateMode::Relative => format_relative(seconds, now_secs()),
-        DateMode::Unix => format!("{seconds}"),
-        DateMode::Raw => {
-            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-            format!("{seconds} {sign}{:02}{:02}", off / 3600, (off % 3600) / 60)
+        DateMode::Relative => ShowMode::new(DateType::Relative),
+    };
+    crate::showdate::show_date(seconds, tz, &show, now_secs())
+}
+
+/// `parse_commit_date()` (commit.c:128-186): the clock a revision walk sorts and
+/// range-limits by, read off the *committer* line.
+///
+/// Every failure arm in the C is `return 0` — a missing header, a line with no
+/// `>`, a date that is whitespace or a non-numeric token. None of them abort the
+/// parse, which is why `git rev-list --until=1980-01-01` lists a commit whose
+/// committer date is a lone vertical tab instead of erroring out.
+fn commit_date(commit: &gix::Commit<'_>) -> i64 {
+    commit.time().map_or(0, |t| t.seconds)
+}
+
+/// The `isspace()` C reads bytes with. Rust's `u8::is_ascii_whitespace` leaves
+/// out the vertical tab, and t4212 pins that difference on purpose: a committer
+/// date of a single `\013` is whitespace to `split_ident_line()`, so the date is
+/// dropped rather than parsed as a timestamp.
+fn c_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// `split_ident_line()`'s date and timezone spans (ident.c:328-342), scanned
+/// over the text `gix` hands back as `SignatureRef::time` — everything after the
+/// closing `>` of the email.
+///
+/// ```c
+/// for (cp = cp + 1; cp < line + len && isspace(*cp); cp++)
+///         ;
+/// if (line + len <= cp)
+///         goto person_only;
+/// split->date_begin = cp;
+/// span = strspn(cp, "0123456789");
+/// if (!span)
+///         goto person_only;
+/// ```
+///
+/// The date is `strspn(…, "0123456789")` — *digits only*. A leading `-` ends
+/// that scan at zero length, so a negative timestamp is not a small number to
+/// git: it is no date at all, and every date placeholder on that commit renders
+/// empty. `None` here is the C's `person_only` label.
+fn ident_date_spans(raw: &str) -> Option<(&str, &str)> {
+    let b = raw.as_bytes();
+    let digits = |from: usize| {
+        let mut i = from;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
         }
-        DateMode::Short | DateMode::Iso | DateMode::IsoStrict | DateMode::Rfc => {
-            let local = seconds + offset as i64;
-            let days = local.div_euclid(86_400);
-            let secs = local.rem_euclid(86_400);
-            let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-            let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
-            let (year, month, day) = civil_from_days(days);
-            let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-            let (oh, om) = (off / 3600, (off % 3600) / 60);
-            match mode {
-                DateMode::Short => format!("{year}-{month:02}-{day:02}"),
-                DateMode::Iso => format!(
-                    "{year}-{month:02}-{day:02} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}"
-                ),
-                // git renders a zero UTC offset as `Z` in iso-strict (RFC 3339),
-                // not `+00:00` (verified against git 2.55).
-                DateMode::IsoStrict => {
-                    let tz = if offset == 0 {
-                        "Z".to_string()
-                    } else {
-                        format!("{sign}{oh:02}:{om:02}")
-                    };
-                    format!("{year}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{tz}")
+        i
+    };
+    let space = |from: usize| {
+        let mut i = from;
+        while i < b.len() && c_isspace(b[i]) {
+            i += 1;
+        }
+        i
+    };
+
+    let date_begin = space(0);
+    let date_end = digits(date_begin);
+    if date_end == date_begin {
+        return None;
+    }
+    let tz_begin = space(date_end);
+    if tz_begin >= b.len() || (b[tz_begin] != b'+' && b[tz_begin] != b'-') {
+        return None;
+    }
+    let tz_end = digits(tz_begin + 1);
+    if tz_end == tz_begin + 1 {
+        return None;
+    }
+    Some((&raw[date_begin..date_end], &raw[tz_begin..tz_end]))
+}
+
+/// `parse_timestamp` is `strtoumax` (compat/posix.h:266), which *saturates* at
+/// `UINTMAX_MAX` rather than failing — which is how a 2^64+1 timestamp becomes
+/// `TIME_MAX` and then trips [`date_overflows`].
+fn parse_timestamp(digits: &str) -> u64 {
+    digits.parse::<u64>().unwrap_or(u64::MAX)
+}
+
+/// `date_overflows()` (date.c:1431-1446) on git's `timestamp_t`, which is
+/// `uintmax_t`:
+///
+/// ```c
+/// if ((uintmax_t)t >= TIME_MAX)
+///         return 1;
+/// sys = t;
+/// return t != sys || (t < 1) != (sys < 1);
+/// ```
+///
+/// With a 64-bit signed `time_t` both halves reduce to "does not fit in a
+/// non-negative `i64`".
+fn date_overflows(date: u64) -> bool {
+    date >= u64::MAX || i64::try_from(date).is_err()
+}
+
+/// `show_ident_date()` (pretty.c:442-459): render the date recorded in one
+/// ident line, reading the timestamp and the zone out of the raw field rather
+/// than a decoded one.
+///
+/// ```c
+/// if (ident->date_begin && ident->date_end)
+///         date = parse_timestamp(ident->date_begin, NULL, 10);
+/// if (date_overflows(date))
+///         date = 0;
+/// else {
+///         if (ident->tz_begin && ident->tz_end)
+///                 tz = strtol(ident->tz_begin, NULL, 10);
+///         if (tz >= INT_MAX || tz <= INT_MIN)
+///                 tz = 0;
+/// }
+/// return show_date(date, tz, mode);
+/// ```
+///
+/// Note that the zone is only read when the timestamp did *not* overflow, so an
+/// out-of-range date prints as the epoch in `+0000` even when the ident carried
+/// a real zone. This never fails: a commit git can show is one this can render.
+pub(crate) fn show_ident_date(raw: &str, mode: DateMode, now: i64) -> String {
+    let mut date: u64 = 0;
+    let mut tz: i32 = 0;
+    if let Some((d, t)) = ident_date_spans(raw) {
+        date = parse_timestamp(d);
+        if !date_overflows(date) {
+            tz = t.parse::<i64>().map_or(0, |v| {
+                if v >= i64::from(i32::MAX) || v <= i64::from(i32::MIN) {
+                    0
+                } else {
+                    v as i32
                 }
-                DateMode::Rfc => format!(
-                    "{}, {day} {} {year} {hour:02}:{min:02}:{sec:02} {sign}{oh:02}{om:02}",
-                    WEEKDAYS[weekday],
-                    MONTHS[(month - 1) as usize],
-                ),
-                _ => unreachable!(),
-            }
+            });
         }
+    }
+    if date_overflows(date) {
+        date = 0;
+    }
+    let seconds = date as i64;
+    match mode {
+        DateMode::Relative => format_relative(seconds, now),
+        other => format_date_tz(seconds, tz, other),
     }
 }
 
-/// Format a commit time exactly like stock `git log`'s default (`DATE_NORMAL`)
-/// mode: `Www Mmm <day> HH:MM:SS YYYY +ZZZZ`, in the commit's own timezone
-/// offset. The day is **unpadded** — git's `show_date` builds this with a bare
-/// `%d` (printf integer), so a single-digit day gets one space, not two
-/// (verified against git 2.55: `Mon Jan 2 ...`, not `Mon Jan  2 ...`).
-fn format_git_date(seconds: i64, offset: i32) -> String {
-    // Shift into the commit's local wall-clock time, then split into whole days
-    // (since the Unix epoch) and the seconds within the day. `div_euclid` /
-    // `rem_euclid` keep the split correct for pre-1970 (negative) timestamps.
-    let local = seconds + offset as i64;
-    let days = local.div_euclid(86_400);
-    let secs = local.rem_euclid(86_400);
-    let (hour, min, sec) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-
-    // 1970-01-01 (day 0) was a Thursday, index 4 with Sunday = 0.
-    let weekday = ((days.rem_euclid(7)) + 4).rem_euclid(7) as usize;
-    let (year, month, day) = civil_from_days(days);
-
-    let (sign, off) = if offset < 0 { ('-', -offset) } else { ('+', offset) };
-    let (off_h, off_m) = (off / 3600, (off % 3600) / 60);
-
-    format!(
-        "{} {} {} {:02}:{:02}:{:02} {} {}{:02}{:02}",
-        WEEKDAYS[weekday],
-        MONTHS[(month - 1) as usize],
-        day,
-        hour,
-        min,
-        sec,
-        year,
-        sign,
-        off_h,
-        off_m,
-    )
+/// The raw digit span `%at`/`%ct` print (pretty.c:827-829):
+///
+/// ```c
+/// if (part == 't') {	/* date, UNIX timestamp */
+///         strbuf_add(sb, s.date_begin, s.date_end - s.date_begin);
+///         return placeholder_len;
+/// }
+/// ```
+///
+/// Verbatim, not re-rendered — a timestamp too large for any integer type still
+/// prints back exactly as recorded — and empty when the ident carries no date.
+pub(crate) fn ident_date_raw(raw: &str) -> &str {
+    ident_date_spans(raw).map_or("", |(d, _)| d)
 }
 
-/// Convert a day count since the Unix epoch into a civil `(year, month, day)`,
-/// month and day 1-based. Howard Hinnant's `civil_from_days` algorithm, which is
-/// exact for the whole representable range and needs no calendar tables.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = z - era * 146_097; // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-    (if month <= 2 { year + 1 } else { year }, month as u32, day)
+/// Whether an ident line carries a date at all; `%ad` and friends render empty
+/// when it does not (pretty.c:824, `if (!s.date_begin) goto skip`).
+pub(crate) fn ident_has_date(raw: &str) -> bool {
+    ident_date_spans(raw).is_some()
 }
 
 /// Strip trailing whitespace (git trims a subject line this way).

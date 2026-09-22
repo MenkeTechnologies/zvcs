@@ -48,8 +48,21 @@ pub(crate) mod function {
         Ok(IdentityRef { name, email })
     }
 
+    /// The bytes an ident's date field may hold, which has to be at least every
+    /// byte `split_ident_line()` (ident.c:324-341) is willing to walk over: the
+    /// digits and sign it reads, plus whatever its `isspace()` skips between
+    /// them. C's `isspace()` is six bytes — space, `\t`, `\n`, `\v`, `\f`, `\r` —
+    /// and the vertical tab is not an academic entry: git's own
+    /// `t4212-log-corrupt.sh` writes a committer date of a lone `\v` on purpose,
+    /// because `strtoumax()` treats it as whitespace while git's `isspace()`
+    /// wrapper does not. Leaving it out here does not make that date invalid, it
+    /// makes the whole commit object undecodable, so `git log` fails where git
+    /// prints an empty date.
+    ///
+    /// `\n` stays out: it ends the ident line, and consuming it would run the
+    /// date field into the next header.
     fn is_time_byte(b: u8) -> bool {
-        matches!(b, b'+' | b'-' | b'0'..=b'9' | b' ' | b'\t')
+        matches!(b, b'+' | b'-' | b'0'..=b'9' | b' ' | b'\t' | 0x0b | 0x0c | b'\r')
     }
 }
 pub use function::identity;

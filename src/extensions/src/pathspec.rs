@@ -176,11 +176,12 @@ pub fn first_magic_fatal<S: AsRef<[u8]>>(
 /// Returns the `fatal:` body, in git's order, or `None`. Callers print
 /// `fatal: {msg}` and exit 128.
 pub fn global_magic_fatal() -> Option<String> {
-    let env_bool = |name: &str| -> bool {
-        std::env::var_os(name).is_some_and(|v| {
-            gix::config::Boolean::try_from(v).map(|b| b.0).unwrap_or(false)
-        })
-    };
+    // `git_env_bool()` (parse.c:197-208), not gitoxide's boolean: git's grammar
+    // has the base-0 integer fallback `git_parse_maybe_bool()` provides, so
+    // `0x10` and `1k` are true, and a value that is neither a word nor an
+    // integer is `fatal: bad boolean environment value '<v>' for '<k>'` rather
+    // than a silent false.
+    let env_bool = |name: &str| crate::setup::git_env_bool(name, false);
     let literal = env_bool("GIT_LITERAL_PATHSPECS");
     let glob = env_bool("GIT_GLOB_PATHSPECS");
     let noglob = env_bool("GIT_NOGLOB_PATHSPECS");

@@ -192,6 +192,22 @@ pub fn config_int64(value: &str) -> Result<i64, NumError> {
     parse_config_signed(value, i64::MAX)
 }
 
+/// `git_parse_ulong()` (parse.c:119): [`parse_unsigned`] bounded by
+/// `maximum_unsigned_value_of_type(long)`, the width `git_config_ulong()` reads
+/// every byte-sized config value with (`core.bigFileThreshold`,
+/// `pack.packSizeLimit`, `gc.maxCruftSize`, …).
+///
+/// `long` is 64 bits on every platform this ports to, so the bound is
+/// [`u64::MAX`]. A leading `-` is `EINVAL` — `git_parse_unsigned()` refuses it
+/// before `strtoumax` can negate and wrap it (parse.c:61-65).
+pub fn config_ulong(value: &str) -> Result<u64, NumError> {
+    match parse_unsigned(value, u64::MAX) {
+        Ok(v) => Ok(v),
+        Err(ParseFail::Range) => Err(NumError::OutOfRange),
+        Err(ParseFail::Invalid) => Err(NumError::InvalidUnit),
+    }
+}
+
 fn parse_config_signed(value: &str, max: i64) -> Result<i64, NumError> {
     match parse_signed(value, max) {
         Ok(v) => Ok(v),

@@ -516,15 +516,17 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         // fatal: a value that is not an integer, and a negative one.
         if let Some(raw) = snap.string("grep.threads") {
             let raw = raw.to_string();
-            match parse_config_int(&raw) {
-                Some(n) if n < 0 => {
+            // `git_config_int()` (config.c:1226), not a decimal parse: the value
+            // is base-0 with a `k`/`m`/`g` unit and is bounded by a C `int`.
+            match crate::optint::config_int(&raw) {
+                Ok(n) if n < 0 => {
                     eprintln!(
                         "fatal: invalid number of threads specified ({n}) for grep.threads"
                     );
                     return Ok(ExitCode::from(128));
                 }
-                Some(n) => num_threads = n,
-                None => return Ok(bad_numeric_config(&raw, "grep.threads")),
+                Ok(n) => num_threads = n,
+                Err(e) => return Ok(bad_numeric_config(&raw, "grep.threads", e)),
             }
         }
     }
@@ -1807,35 +1809,18 @@ fn errno_text(e: &std::io::Error) -> String {
     }
 }
 
-/// git's `git_config_int` on a `grep.threads` value: a decimal integer with an
-/// optional `k`/`m`/`g`/`t` scale suffix. `None` means it will not parse at all.
-fn parse_config_int(raw: &str) -> Option<i64> {
-    let (digits, scale): (&str, i64) = match raw.as_bytes().last() {
-        Some(b'k' | b'K') => (&raw[..raw.len() - 1], 1024),
-        Some(b'm' | b'M') => (&raw[..raw.len() - 1], 1024 * 1024),
-        Some(b'g' | b'G') => (&raw[..raw.len() - 1], 1024 * 1024 * 1024),
-        Some(b't' | b'T') => (&raw[..raw.len() - 1], 1024_i64.pow(4)),
-        _ => (raw, 1),
-    };
-    digits.trim().parse::<i64>().ok()?.checked_mul(scale)
-}
-
-/// git's `config_error_nonbool` shape for a numeric config value that will not
-/// parse: `fatal: bad numeric config value '<raw>' for '<key>': <reason>`, exit
-/// 128. git says `out of range` when a well-formed number overflows and
-/// `invalid unit` otherwise.
-fn bad_numeric_config(raw: &str, key: &str) -> ExitCode {
-    let digits = match raw.as_bytes().last() {
-        Some(c) if matches!(c.to_ascii_lowercase(), b'k' | b'm' | b'g' | b't') => {
-            &raw[..raw.len() - 1]
-        }
-        _ => raw,
-    };
-    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
-    let reason = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-        "out of range"
-    } else {
-        "invalid unit"
+/// `die_bad_number()` (config.c:1188) for a `-c`/environment value, which
+/// carries no filename and so takes the short form: `fatal: bad numeric config
+/// value '<raw>' for '<key>': <reason>`, exit 128.
+///
+/// `reason` is whichever of `out of range` / `invalid unit` the shared
+/// [`crate::optint::config_int`] reader reported; deciding it here from the
+/// shape of the text used to disagree with the parser (`grep.threads=5g` was
+/// read as a value instead of the overflow git reports).
+fn bad_numeric_config(raw: &str, key: &str, reason: crate::optint::NumError) -> ExitCode {
+    let reason = match reason {
+        crate::optint::NumError::OutOfRange => "out of range",
+        crate::optint::NumError::InvalidUnit => "invalid unit",
     };
     eprintln!("fatal: bad numeric config value '{raw}' for '{key}': {reason}");
     ExitCode::from(128)

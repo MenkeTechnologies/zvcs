@@ -367,6 +367,47 @@ struct Display {
     /// otherwise (a bare repository, the git directory itself, or no repository).
     /// See [`crate::setup::setup_cwd`].
     path_base: Option<std::path::PathBuf>,
+    /// The bytes of a `--file -` or `--blob` source, kept because a callback
+    /// failure has to name the physical line the value sits on and neither
+    /// source has a path to re-read. A file scope leaves this `None` and
+    /// [`config_line_in`] reads the file instead.
+    source_text: Option<Vec<u8>>,
+}
+
+/// The `key_value_info` origin behind one value, which is what
+/// `die_bad_number()` (config.c:1204-1224) names after the key and what
+/// `git_parse_source()` (config.c:1140-1163) names when a callback aborts the
+/// parse.
+///
+/// The distinction the port used to miss is that only `CONFIG_ORIGIN_CMDLINE`
+/// has a NULL `filename`: `kvi_from_param()` (config.c:642-647) nulls it, while
+/// `git_config_from_stdin()` passes `""` (config.c:1404-1409) and a blob read
+/// passes the spec, both of which are non-NULL and so reach the origin switch.
+#[derive(Clone, Copy)]
+enum Origin<'a> {
+    /// `-c`, `GIT_CONFIG_KEY_<n>`, a `--default`, or a value typed as an
+    /// argument to `git config` itself.
+    CommandLine,
+    /// `CONFIG_ORIGIN_FILE`.
+    File(&'a std::path::Path),
+    /// `CONFIG_ORIGIN_STDIN` — `git config --file -`.
+    Stdin,
+    /// `CONFIG_ORIGIN_BLOB` — `git config --blob=<rev>`, named by the spec.
+    Blob(&'a str),
+}
+
+impl Origin<'_> {
+    /// The clause `die_bad_number()` puts between the key and the reason.
+    /// Empty for the command line, whose NULL filename takes the short form
+    /// (config.c:1201-1202).
+    fn bad_number_clause(self) -> String {
+        match self {
+            Origin::CommandLine => String::new(),
+            Origin::File(p) => format!(" in file {}", display_origin_path(p)),
+            Origin::Stdin => " in standard input".to_owned(),
+            Origin::Blob(spec) => format!(" in blob {spec}"),
+        }
+    }
 }
 
 /// `--type=<t>` and its legacy spellings (`--bool`, `--int`, `--bool-or-int`,
@@ -504,7 +545,7 @@ impl ValueType {
             ValueType::Path => expand_config_path(&text, base).map(String::into_bytes),
             // `git_config_expiry_date()` (config.c) — `parse_expiry_date()` with an
             // `error()` in front of the failure, and the epoch seconds printed raw.
-            ValueType::ExpiryDate => match crate::date::parse_expiry_date(&text) {
+            ValueType::ExpiryDate => match expiry_timestamp(&text) {
                 Some(t) => Ok(t.to_string().into_bytes()),
                 None => Err(TypeError::Callback(format!(
                     "error: '{text}' for '{key}' is not a valid timestamp"
@@ -519,6 +560,30 @@ impl ValueType {
             },
         }
     }
+}
+
+/// `parse_expiry_date()` (date.c:957) in `timestamp_t`, which is **unsigned**.
+///
+/// ```c
+/// if (!strcmp(date, "never") || !strcmp(date, "false"))
+///         *timestamp = 0;
+/// else if (!strcmp(date, "all") || !strcmp(date, "now"))
+///         *timestamp = TIME_MAX;
+/// else
+///         *timestamp = approxidate_careful(date, &errors);
+/// ```
+///
+/// `TIME_MAX` is `maximum_unsigned_value_of_type(timestamp_t)`, and
+/// `format_config_expiry_date()` prints it with `PRItime` — so
+/// `git config --type=expiry-date` answers `18446744073709551615` for `now` and
+/// `all`. The port's shared reader is `i64`-shaped and saturates at `i64::MAX`
+/// instead, which printed `9223372036854775807`; the two sentinel spellings are
+/// therefore answered here, before the reader is consulted.
+fn expiry_timestamp(text: &str) -> Option<u64> {
+    if text == "all" || text == "now" {
+        return Some(u64::MAX);
+    }
+    crate::date::parse_expiry_date(text).map(|t| t as u64)
 }
 
 /// The width the reader bounds its value by, which is the one thing git's two
@@ -1772,7 +1837,11 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 .into());
             };
             scoped = match blob_config(repo, spec) {
-                Ok(file) => file,
+                Ok((file, bytes)) => {
+                    // `bad config line <n> in blob <spec>` names no file either.
+                    d.source_text = Some(bytes);
+                    file
+                }
                 // The three `error()`s are already on stderr; what happens next is
                 // the caller's, and only `--list` makes it fatal.
                 Err(()) => {
@@ -1800,6 +1869,8 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 gix::config::file::Metadata::from(Source::Cli),
                 Default::default(),
             )?;
+            // `bad config line <n> in standard input` has no file to re-read.
+            d.source_text = Some(bytes);
             if includes {
                 // `opts->options.respect_includes = !opts->source.file` and stdin leaves
                 // `source.file` NULL (builtin/config.c:954-1004), so includes are
@@ -2307,7 +2378,14 @@ fn emit_default(out: &mut impl std::io::Write, d: &Display, name: &str) -> Resul
         // "default was a missing optional value": the item is dropped, so
         // `ret = !values.nr` is 1 and nothing is printed.
         Err(TypeError::MissingOptional) => Ok(ExitCode::from(1)),
-        Err(err) => Ok(report_type_error(err, name, default.as_bytes(), None)),
+        Err(err) => Ok(report_type_error(
+            err,
+            name,
+            default.as_bytes(),
+            Origin::CommandLine,
+            None,
+            false,
+        )),
     }
 }
 
@@ -2507,7 +2585,38 @@ fn typed(
         Ok(v) => Ok(Some(v)),
         // `collect_config()` releases the item and moves on (builtin/config.c:529-533).
         Err(TypeError::MissingOptional) => Ok(None),
-        Err(err) => Err(report_type_error(err, key, value, meta.path.as_deref())),
+        Err(err) => {
+            let origin = d.origin_of(meta);
+            Err(report_type_error(err, key, value, origin, d.source_bytes(origin).as_deref(), d.null))
+        }
+    }
+}
+
+impl Display {
+    /// The `key_value_info` origin one entry carries.
+    ///
+    /// An entry with a path behind it is `CONFIG_ORIGIN_FILE` whatever the scope
+    /// is — an `include.path` followed out of stdin or a blob lands in a real
+    /// file and its entries are blamed on that file, which is the same rule
+    /// [`write_origin`] already follows for `--show-origin`.
+    fn origin_of<'a>(&'a self, meta: &'a gix::config::file::Metadata) -> Origin<'a> {
+        match meta.path.as_deref() {
+            Some(path) => Origin::File(path),
+            None => match (&self.blob, self.stdin) {
+                (Some(spec), _) => Origin::Blob(spec),
+                (None, true) => Origin::Stdin,
+                (None, false) => Origin::CommandLine,
+            },
+        }
+    }
+
+    /// The bytes [`config_line_in`] should search for an entry from this origin.
+    fn source_bytes(&self, origin: Origin<'_>) -> Option<Vec<u8>> {
+        match origin {
+            Origin::File(path) => std::fs::read(path).ok(),
+            Origin::Stdin | Origin::Blob(_) => self.source_text.clone(),
+            Origin::CommandLine => None,
+        }
     }
 }
 
@@ -2518,21 +2627,21 @@ fn report_type_error(
     err: TypeError,
     key: &str,
     value: &[u8],
-    origin: Option<&std::path::Path>,
+    origin: Origin<'_>,
+    source: Option<&[u8]>,
+    null_term: bool,
 ) -> ExitCode {
     let shown = String::from_utf8_lossy(value);
     match err {
         TypeError::BadNumber { out_of_range } => {
             let reason = if out_of_range { "out of range" } else { "invalid unit" };
-            // `die_bad_number()` splits on whether the value has a file behind it:
-            // one that does not gets the short form (config.c:1201-1202).
-            match origin {
-                Some(path) => eprintln!(
-                    "fatal: bad numeric config value '{shown}' for '{key}' in file {}: {reason}",
-                    display_origin_path(path)
-                ),
-                None => eprintln!("fatal: bad numeric config value '{shown}' for '{key}': {reason}"),
-            }
+            // `die_bad_number()` (config.c:1188) names the origin the value came
+            // from; only a NULL filename — the command line — takes the short
+            // form (config.c:1201-1202).
+            eprintln!(
+                "fatal: bad numeric config value '{shown}' for '{key}'{}: {reason}",
+                origin.bad_number_clause()
+            );
         }
         TypeError::BadBool => eprintln!("fatal: bad boolean config value '{shown}' for '{key}'"),
         TypeError::ExpandUser => eprintln!("fatal: failed to expand user dir in: '{shown}'"),
@@ -2544,13 +2653,33 @@ fn report_type_error(
         // `git_config_from_parameters`).
         TypeError::Callback(message) => {
             eprintln!("{message}");
+            let line = || source.and_then(|b| config_line_in(b, key, value)).unwrap_or(0);
             match origin {
-                Some(path) => eprintln!(
+                Origin::File(path) => eprintln!(
                     "fatal: bad config line {} in file {}",
-                    config_line_of(path, key, value).unwrap_or(0),
+                    line(),
                     display_origin_path(path)
                 ),
-                None => eprintln!("fatal: unable to parse command-line config"),
+                Origin::Stdin => eprintln!("fatal: bad config line {} in standard input", line()),
+                // A blob is read by `git_config_from_mem()`, whose
+                // `default_error_action` is `CONFIG_ERROR_ERROR` and not
+                // `CONFIG_ERROR_DIE` (config.c:1448) — so the second line is an
+                // `error()` and the parse merely returns -1. `collect_config()`
+                // had already grown `values` by one before `format_config()`
+                // failed, and `format_config()` appends `opts->term` even on the
+                // failing path (builtin/config.c:`terminator:`), so `get_value()`
+                // computes `ret = !values.nr` as 0 and writes that bare
+                // terminator out.
+                Origin::Blob(spec) => {
+                    eprintln!("error: bad config line {} in blob {spec}", line());
+                    use std::io::Write as _;
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    let _ = out.write_all(if null_term { b"\0" } else { b"\n" });
+                    let _ = out.flush();
+                    return ExitCode::from(0);
+                }
+                Origin::CommandLine => eprintln!("fatal: unable to parse command-line config"),
             }
         }
     }
@@ -2600,7 +2729,7 @@ fn normalize_value(ty: Option<ValueType>, key: &str, value: &str) -> Option<Stri
                 // A value handed to `git config` on the command line has no file
                 // behind it, so `die_bad_number()` takes its short form.
                 TypeError::BadNumber { .. } | TypeError::BadBool | TypeError::ExpandUser => {
-                    report_type_error(err, key, value.as_bytes(), None);
+                    report_type_error(err, key, value.as_bytes(), Origin::CommandLine, None, false);
                 }
                 TypeError::Callback(message) => {
                     eprintln!("{message}");
@@ -2625,17 +2754,16 @@ fn display_origin_path(path: &std::path::Path) -> String {
 /// The physical line an entry sits on, which is what `cf->linenr` holds when a
 /// callback aborts the parse and git reports `bad config line <n> in file <f>`.
 ///
-/// The file is re-read and walked as a token stream because `gix_config` keeps a
+/// The source text is walked as a token stream because `gix_config` keeps a
 /// parsed section/value model with no source positions in it. Every `Newline`
 /// event advances the counter, so a value continued over several lines is blamed
 /// on the line it *ends* on — the line git's reader had just consumed when it
 /// handed the value to the callback.
-fn config_line_of(path: &std::path::Path, key: &str, value: &[u8]) -> Option<usize> {
+fn config_line_in(bytes: &[u8], key: &str, value: &[u8]) -> Option<usize> {
     use gix::bstr::ByteSlice;
     use gix::config::parse::EventRef;
 
-    let bytes = std::fs::read(path).ok()?;
-    let events = gix::config::parse::Events::from_bytes(&bytes, None).ok()?;
+    let events = gix::config::parse::Events::from_bytes(bytes, None).ok()?;
     let mut line = 1usize;
     // The git-normalized `section[.subsection].` prefix the current header sets.
     let mut prefix: Option<String> = None;
@@ -3562,11 +3690,21 @@ fn get_color(file: &gix::config::File, command_line: bool, slot: &str, def_color
     })?;
     if let Some((value, origin)) = failure {
         let text = String::from_utf8_lossy(&value).into_owned();
+        let origin = match origin.as_deref() {
+            Some(path) => Origin::File(path),
+            None => Origin::CommandLine,
+        };
         return Ok(report_type_error(
             TypeError::Callback(format!("error: invalid color value: {text}")),
             slot,
             &value,
-            origin.as_deref(),
+            origin,
+            match origin {
+                Origin::File(path) => std::fs::read(path).ok(),
+                _ => None,
+            }
+            .as_deref(),
+            false,
         ));
     }
 
@@ -3894,7 +4032,10 @@ fn read_config_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 /// Each of the three failures is an `error()` returning -1, never a `die()`, so
 /// the caller decides what a failed read means; `Err(())` says the message is
 /// already on stderr.
-fn blob_config(repo: &gix::Repository, spec: &str) -> std::result::Result<ConfigFile, ()> {
+fn blob_config(
+    repo: &gix::Repository,
+    spec: &str,
+) -> std::result::Result<(ConfigFile, Vec<u8>), ()> {
     let Ok(id) = repo.rev_parse_single(spec) else {
         eprintln!("error: unable to resolve config blob '{spec}'");
         return Err(());
@@ -3914,12 +4055,13 @@ fn blob_config(repo: &gix::Repository, spec: &str) -> std::result::Result<Config
         eprintln!("error: bad config line {line} in blob {spec}");
         return Err(());
     }
-    ConfigFile::from_bytes_no_includes(
+    let file = ConfigFile::from_bytes_no_includes(
         &object.data,
         gix::config::file::Metadata::from(Source::Cli),
         Default::default(),
     )
-    .map_err(|_| ())
+    .map_err(|_| ())?;
+    Ok((file, object.data.clone()))
 }
 
 /// The file `--worktree` names:

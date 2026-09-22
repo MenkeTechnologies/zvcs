@@ -272,14 +272,7 @@ pub fn config_bool(key: &str) -> Option<bool> {
 /// `pack.packsizelimit` diagnostics — `1k`/`0x400`/`010`/`0k` parse, `-1`/`1.5`/
 /// `1x`/``/`5 ` are invalid units, and a 24-digit value is out of range.
 pub fn parse_config_ulong(raw: &str) -> Result<u64, &'static str> {
-    // git guards `*value == '-'` because `strtoumax` would otherwise negate and
-    // wrap a negative into a huge unsigned. Trimming first folds ` -1` in with
-    // `-1`, matching git's rejection of both.
-    let (negative, magnitude) = split_sign(raw);
-    if negative {
-        return Err(INVALID_UNIT);
-    }
-    parse_magnitude(magnitude)
+    crate::optint::config_ulong(raw).map_err(reason_text)
 }
 
 /// git's `git_parse_int`, the parser behind `git_config_int` and hence behind the
@@ -287,11 +280,24 @@ pub fn parse_config_ulong(raw: &str) -> Result<u64, &'static str> {
 /// [`parse_config_ulong`] except that `strtoimax` accepts a leading `-`, so a
 /// negative value is a *number* rather than an invalid unit — which is why
 /// `core.maxTreeDepth=-1` rejects every tree instead of dying.
+///
+/// The bound is a C `int`, not an `int64_t`: `git_parse_int()` passes
+/// `maximum_signed_value_of_type(int)` down to `git_parse_signed()`
+/// (parse.c:92-99), so `gc.auto=3000000000` and `diff.renameLimit=5g` are
+/// `out of range` and not values. `git config --type=int` is the one reader
+/// that is *not* this — it is `git_config_int64()` (builtin/config.c:270-283)
+/// and reaches [`crate::optint::config_int64`] instead.
 pub fn parse_config_int(raw: &str) -> Result<i64, &'static str> {
-    let (negative, magnitude) = split_sign(raw);
-    let value = parse_magnitude(magnitude)?;
-    let signed = i64::try_from(value).map_err(|_| OUT_OF_RANGE)?;
-    Ok(if negative { -signed } else { signed })
+    crate::optint::config_int(raw).map_err(reason_text)
+}
+
+/// The word `die_bad_number()` prints for an `errno` (config.c:1190-1191):
+/// `ERANGE` is `out of range`, everything else `invalid unit`.
+fn reason_text(e: crate::optint::NumError) -> &'static str {
+    match e {
+        crate::optint::NumError::OutOfRange => OUT_OF_RANGE,
+        crate::optint::NumError::InvalidUnit => INVALID_UNIT,
+    }
 }
 
 /// config.c's `iskeychar()`: the bytes a section or variable name may contain.
@@ -366,48 +372,6 @@ pub fn check_config_key(key: &str) -> Result<(), String> {
 const INVALID_UNIT: &str = "invalid unit";
 /// The reason string git's `die_bad_number` prints for a value that overflows.
 const OUT_OF_RANGE: &str = "out of range";
-
-/// Strip leading ASCII whitespace and an optional sign, as `strtoimax` does.
-fn split_sign(raw: &str) -> (bool, &str) {
-    let rest = raw.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
-    match rest.strip_prefix('-') {
-        Some(r) => (true, r),
-        None => (false, rest.strip_prefix('+').unwrap_or(rest)),
-    }
-}
-
-/// `strtoumax` with base 0 followed by `get_unit_factor`: the unsigned magnitude
-/// shared by git's int and ulong config parsers.
-fn parse_magnitude(rest: &str) -> Result<u64, &'static str> {
-    let (radix, digits) = if let Some(r) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
-        (16u32, r)
-    } else if rest.len() > 1 && rest.starts_with('0') {
-        // Base 0 reads a leading zero as octal, and the zero is part of the
-        // number: `0k` is 0 with a `k` suffix, not an empty number, so the `0` is
-        // kept rather than stripped.
-        (8, rest)
-    } else {
-        (10, rest)
-    };
-
-    let split = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
-    let (number, tail) = digits.split_at(split);
-    if number.is_empty() {
-        return Err(INVALID_UNIT);
-    }
-    let value = u64::from_str_radix(number, radix).map_err(|_| OUT_OF_RANGE)?;
-
-    // `get_unit_factor`: an empty tail scales by one, one k/m/g byte scales and
-    // must end the string, anything else is not a unit.
-    let factor: u64 = match tail.as_bytes() {
-        [] => 1,
-        [b'k' | b'K'] => 1024,
-        [b'm' | b'M'] => 1024 * 1024,
-        [b'g' | b'G'] => 1024 * 1024 * 1024,
-        _ => return Err(INVALID_UNIT),
-    };
-    value.checked_mul(factor).ok_or(OUT_OF_RANGE)
-}
 
 /// The last value configured for the dotted `<section>.<key>` anywhere in the
 /// merged config, paired with git's origin clause for the diagnostic it prints

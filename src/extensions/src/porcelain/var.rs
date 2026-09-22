@@ -70,7 +70,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use gix::bstr::BString;
-use gix::config::{Boolean, File as ConfigFile, Source};
+use gix::config::{File as ConfigFile, Source};
 
 /// Stock git's `var` usage line, byte-for-byte. Printed on `-h` (stdout) and on
 /// any argument error (stderr); both exit 129.
@@ -544,12 +544,17 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-/// git's `git_env_bool` for the `*_NOSYSTEM` switches, using gitoxide's own
-/// boolean parser so `0`/`false`/`no`/`off`/empty read as false.
+/// `git_env_bool()` (parse.c:197-208) for the `*_NOSYSTEM` switches, which is
+/// what both call sites stand in for: `attr.c:893` reads `GIT_ATTR_NOSYSTEM`
+/// through it and `config.c:1541` reads `GIT_CONFIG_NOSYSTEM`.
+///
+/// gitoxide's own boolean parser was the wrong grammar in both directions: it
+/// has no base-0 integer fallback, so `GIT_ATTR_NOSYSTEM=0x10` read as false
+/// where git reads sixteen and suppresses the system file, and it coerces a
+/// value that is not a boolean to false where git dies with
+/// `bad boolean environment value`.
 fn env_bool(name: &str) -> bool {
-    std::env::var_os(name)
-        .and_then(|v| Boolean::try_from(v).ok())
-        .is_some_and(|b| b.0)
+    crate::setup::git_env_bool(name, false)
 }
 
 /// A single configuration value as a `String`, or `None` if the key is unset.

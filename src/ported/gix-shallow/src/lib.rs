@@ -50,11 +50,53 @@ pub fn read(shallow_file: &std::path::Path) -> Result<Option<nonempty::NonEmpty<
 
     let mut commits = buf
         .lines()
-        .map(gix_hash::ObjectId::from_hex)
+        .map(|line| gix_hash::ObjectId::from_hex(hex_prefix(line)))
         .collect::<Result<Vec<_>, _>>()?;
 
     commits.sort();
     Ok(nonempty::NonEmpty::from_vec(commits))
+}
+
+/// The leading run of hex digits in one `shallow` line.
+///
+/// `is_repository_shallow()` (`shallow.c:87-92`) reads each line with
+/// `fgets` — so the buffer still carries its newline — and decodes it with
+/// `get_oid_hex()`:
+///
+/// ```c
+/// while (fgets(buf, sizeof(buf), fp)) {
+///         struct object_id oid;
+///         if (get_oid_hex(buf, &oid))
+///                 die("bad shallow line: %s", buf);
+///         register_shallow(r, &oid);
+/// }
+/// ```
+///
+/// `get_oid_hex()` consumes exactly `the_hash_algo->hexsz` characters and never
+/// looks at what follows, which is what lets a line keep its newline — and any
+/// other trailing bytes. Measured against git 2.55.0, a boundary written with a
+/// trailing space still grafts:
+///
+/// ```text
+/// $ printf '%s \n' "$boundary" > .git/shallow
+/// $ git log --oneline
+/// 4a3fb3cba9 c5
+/// 46d54d6a68 c4
+/// ```
+///
+/// Decoding the whole line instead rejects it, and the repository silently stops
+/// being shallow — which then fails on the first parent it does not have.
+///
+/// Trimming at the first non-hex byte reproduces that for every suffix git's
+/// leniency actually covers. It differs only for a suffix that is *itself* hex
+/// and carries the line past the hash length, which no writer of this file
+/// produces.
+fn hex_prefix(line: &[u8]) -> &[u8] {
+    let end = line
+        .iter()
+        .position(|b| !b.is_ascii_hexdigit())
+        .unwrap_or(line.len());
+    &line[..end]
 }
 
 ///

@@ -49,8 +49,20 @@ fn alternate_with_content(
     Ok((at, to))
 }
 
+/// A cycle is not an error to git: `source_by_path` holds the primary store and
+/// every alternate linked so far, so the entry that closes the loop is simply
+/// not linked a second time (`odb_is_source_usable()`, `odb.c:75-93`).
+///
+/// Measured against git 2.55.0, with `a` and `b` naming each other:
+///
+/// ```text
+/// $ git -C cyc1.git count-objects -v | tail -1
+/// alternate: /…/cyc2.git/objects
+/// ```
+///
+/// One line, no error, and the resolution of `cyc1` is not among them.
 #[test]
-fn circular_alternates_are_detected_with_relative_paths() -> crate::Result {
+fn circular_alternates_resolve_to_each_other_once() -> crate::Result {
     let tmp = gix_testtools::tempfile::TempDir::new()?;
     let tmp = tmp.path().join("sub-dir");
     std::fs::create_dir(&tmp)?;
@@ -67,21 +79,28 @@ fn circular_alternates_are_detected_with_relative_paths() -> crate::Result {
         None,
     )?;
 
-    match alternate::resolve(from, &std::env::current_dir()?) {
-        Err(alternate::Error::Cycle(chain)) => {
-            assert_eq!(
-                chain
-                    .into_iter()
-                    .map(|p| p.file_name().expect("non-root").to_str().expect("utf8").to_owned())
-                    .collect::<Vec<_>>(),
-                vec!["a", "b"]
-            );
-        }
-        res => unreachable!("should be a specific kind of error: {:?}", res),
-    }
+    let alternates = alternate::resolve(from.clone(), &std::env::current_dir()?)?;
+    assert_eq!(
+        alternates,
+        vec![std::fs::canonicalize(tmp.join("b"))?],
+        "the loop closes on the borrower, which is already linked, so `b` is the whole answer"
+    );
+    assert!(
+        !alternates.contains(&std::fs::canonicalize(from)?),
+        "the primary object directory is never one of its own alternates"
+    );
     Ok(())
 }
 
+/// Every entry is normalized (`strbuf_realpath`), which is why
+/// `git count-objects -v` prints an absolute, symlink-free path whatever the
+/// file said. Measured against git 2.55.0 for an alternate written through a
+/// symlink:
+///
+/// ```text
+/// $ git -C b.git count-objects -v | tail -1
+/// alternate: /…/real.git/objects
+/// ```
 #[test]
 fn single_link_with_comment_before_path_and_ansi_c_escape() -> crate::Result {
     let tmp = gix_testtools::tempfile::TempDir::new()?;
@@ -89,8 +108,62 @@ fn single_link_with_comment_before_path_and_ansi_c_escape() -> crate::Result {
 
     let (from, to) = alternate_with(tmp.path().join("a"), non_alternate, Some("# comment\n"))?;
     let alternates = alternate::resolve(from, &std::env::current_dir()?)?;
-    assert_eq!(alternates.len(), 1);
-    assert_eq!(alternates[0], to);
+    assert_eq!(alternates, vec![std::fs::canonicalize(to)?]);
+    Ok(())
+}
+
+/// `odb_is_source_usable()` (`odb.c:68-73`) drops an entry that is not a
+/// directory. Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -C r.git count-objects -v | tail -1
+/// error: unable to normalize alternate object path: /…/nope/objects
+/// size-garbage: 0
+/// ```
+///
+/// — the entry is dropped, so no `alternate:` line follows.
+#[test]
+fn a_missing_alternate_is_dropped() -> crate::Result {
+    let tmp = gix_testtools::tempfile::TempDir::new()?;
+    let from = tmp.path().join("a");
+    fs::create_dir_all(from.join("info"))?;
+    fs::write(
+        from.join("info").join("alternates"),
+        tmp.path().join("nope").join("objects").to_str().expect("utf8"),
+    )?;
+    assert!(alternate::resolve(from, &std::env::current_dir()?)?.is_empty());
+    Ok(())
+}
+
+/// `if (sources.nr && depth + 1 > 5)` (`odb.c:194`) drops the level below, so a
+/// chain reached from the primary store contributes at most six directories.
+/// Measured against git 2.55.0 on a seven-long chain `a0 -> a1 -> … -> a7`:
+///
+/// ```text
+/// $ git -C a0 cat-file -t <oid in a7>
+/// error: /…/a6/objects: ignoring alternate object stores, nesting too deep
+/// fatal: git cat-file: could not get object info
+/// ```
+#[test]
+fn nesting_stops_after_five_levels() -> crate::Result {
+    let tmp = gix_testtools::tempfile::TempDir::new()?;
+    let link = |n: usize| tmp.path().join(format!("a{n}"));
+    for n in 0..=7 {
+        fs::create_dir_all(link(n).join("info"))?;
+    }
+    for n in 0..7 {
+        fs::write(
+            link(n).join("info").join("alternates"),
+            link(n + 1).to_str().expect("utf8"),
+        )?;
+    }
+
+    let alternates = alternate::resolve(link(0), &std::env::current_dir()?)?;
+    let expected: Vec<_> = (1..=6).map(|n| std::fs::canonicalize(link(n))).collect::<Result<_, _>>()?;
+    assert_eq!(
+        alternates, expected,
+        "a1 through a6 are linked in pre-order; a6's own alternate is the level that is dropped"
+    );
     Ok(())
 }
 

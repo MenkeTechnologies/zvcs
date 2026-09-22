@@ -2025,18 +2025,6 @@ fn parse_alternates(list: &str) -> Vec<PathBuf> {
     parse_alternates_sep(list.as_bytes(), b':', None)
 }
 
-/// `parse_alternates(buf.buf, '\n', source->path, out)` — the *file* form, as
-/// `odb_source_files_read_alternates()` (`odb/source-files.c:192-209`) calls it
-/// for an `objects/info/alternates`.
-///
-/// Two things change from the environment form: entries are separated by newlines
-/// rather than `PATH_SEP`, and a relative entry is resolved against
-/// `relative_base` — the *object directory that listed it* — rather than against
-/// the current directory.
-pub(crate) fn alternates_from_file(content: &[u8], relative_base: &Path) -> Vec<PathBuf> {
-    parse_alternates_sep(content, b'\n', Some(relative_base))
-}
-
 /// The body both forms share. `sep` is git's `sep` argument and `relative_base`
 /// its `relative_base`; `None` is the `NULL` that leaves a relative entry to be
 /// resolved against the current directory by `strbuf_realpath` itself.

@@ -142,6 +142,24 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
+    // `odb_prepare_alternates()` reports every entry it had to drop, and it runs
+    // before the counts are gathered, so the lines come out ahead of the report:
+    //
+    // ```text
+    // $ git -C r.git count-objects -v
+    // error: unable to normalize alternate object path: /…/nope/objects
+    // count: 0
+    // ```
+    //
+    // This command exists to say what the object database holds, alternates
+    // included, so it asks for the diagnostics the resolution itself keeps quiet
+    // about (`alternate::diagnose()`); commands that only happen to read an
+    // object do not.
+    // `false`: `setup::report_missing_alternates()` has already spoken for
+    // `$GIT_ALTERNATE_OBJECT_DIRECTORIES`, and git prints each line once.
+    for line in gix::odb::alternate::diagnose(objdir.clone(), &std::env::current_dir()?, false) {
+        eprintln!("error: {line}");
+    }
     // git prints garbage paths relative to the top-level it chdir'd into.
     let display_root = repo.workdir().map(Path::to_path_buf);
 

@@ -207,12 +207,9 @@ fn read_alternate_refs(mut cmd: Command, out: &mut Vec<ObjectId>) {
     }
 }
 
-/// `MAX_ALTERNATE_DEPTH` in spirit — `odb_add_alternate_recursively()` refuses to
-/// descend past `depth + 1 > 5` (`odb.c:194`).
-const MAX_DEPTH: usize = 5;
-
 /// The alternate object directories of `repo`, in `odb->sources` order —
-/// `odb_add_alternate_recursively()` (`odb.c:169-205`).
+/// `odb_prepare_alternates()` (`odb.c:487-502`) and the
+/// `odb_add_alternate_recursively()` it drives (`odb.c:169-205`):
 ///
 /// ```c
 /// /* add the alternate entry */
@@ -233,55 +230,20 @@ const MAX_DEPTH: usize = 5;
 /// Each entry is appended *before* its own alternates are read, so the list is a
 /// depth-first pre-order walk in file order. That order is the order the tips
 /// below come out in, and with equal commit dates it is the order `rev-list`
-/// prints them in — which is why this is not taken from gitoxide's
-/// `alternate_db_paths()`, whose stack-based traversal answers the same set in a
-/// different sequence.
+/// prints them in.
 ///
-/// `seen` is `odb->source_by_path` (`odb.c:79-93`), which both prevents the
-/// "common mistake of listing the same thing twice" and terminates a cycle. The
-/// primary object directory is seeded into it there too, so an alternate that
-/// points back at the borrower is skipped rather than recursed into.
+/// This is the object database's own list rather than a second traversal beside
+/// it: `alternate::resolve()` (`gix-odb/src/alternate/mod.rs`) is the port of
+/// that C, so `$GIT_ALTERNATE_OBJECT_DIRECTORIES`, the five-level nesting limit,
+/// the drop of a missing or repeated entry and the tolerance of a cycle are all
+/// decided once, for every command that reads an object, instead of being
+/// re-decided here for this one flag.
 ///
-/// The two `error()` calls of `odb_is_source_usable()` and the nesting-depth one
-/// are not raised here. They belong to *object database preparation*, which this
-/// port does through gitoxide for every command that reads an object; emitting
-/// them from this call site alone would make `rev-list --alternate-refs` louder
-/// about a broken `objects/info/alternates` than `rev-list --all` in the same
-/// repository. The entry is skipped either way, which is what the C does after
-/// it prints.
+/// The primary object directory is not among them — git walks
+/// `odb->sources->next` (`odb.c:479`) — which is what `alternate_db_paths()`
+/// skips as well.
 fn alternate_object_dirs(repo: &gix::Repository) -> Vec<PathBuf> {
-    let primary = repo.objects.store_ref().path().to_path_buf();
-    let mut seen: Vec<PathBuf> = vec![std::fs::canonicalize(&primary).unwrap_or(primary.clone())];
-    let mut out = Vec::new();
-    add_alternates_recursively(&primary, 0, &mut seen, &mut out);
-    out
-}
-
-fn add_alternates_recursively(
-    object_dir: &Path,
-    depth: usize,
-    seen: &mut Vec<PathBuf>,
-    out: &mut Vec<PathBuf>,
-) {
-    let Ok(content) = std::fs::read(object_dir.join("info").join("alternates")) else {
-        return;
-    };
-    let sources = crate::setup::alternates_from_file(&content, object_dir);
-    // `if (sources.nr && depth + 1 > 5)` — the whole level is dropped, not
-    // trimmed, once the nesting is too deep.
-    if sources.is_empty() || depth + 1 > MAX_DEPTH {
-        return;
-    }
-    for source in sources {
-        // `odb_is_source_usable()`: a path that is not a directory, is the
-        // primary store, or has already been linked contributes nothing.
-        if !source.is_dir() || seen.contains(&source) {
-            continue;
-        }
-        seen.push(source.clone());
-        out.push(source.clone());
-        add_alternates_recursively(&source, depth + 1, seen, out);
-    }
+    repo.objects.store_ref().alternate_db_paths().unwrap_or_default()
 }
 
 /// `odb_for_each_alternate_ref()` (`odb.c:463-470`): the object ids every

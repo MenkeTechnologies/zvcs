@@ -821,6 +821,18 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     if !opts.gpg_sign_given && repo.config_snapshot().boolean("commit.gpgSign") == Some(true) {
         opts.gpg_sign = Some("");
     }
+    // `pull.twohead` is the sequencer's `default_strategy` (sequencer.c:308-320):
+    // the first value only, cut at its first space. `run_sequencer()` adopts it
+    // when no `--strategy` was given (builtin/revert.c:222-225), so
+    // `-c pull.twohead=bogus cherry-pick X` runs `git merge-bogus` and fails.
+    let default_strategy = repo
+        .config_snapshot()
+        .strings("pull.twohead")
+        .and_then(|values| values.into_iter().next())
+        .map(|v| v.to_string());
+    if opts.strategy.is_none() {
+        opts.strategy = default_strategy.as_deref().map(|v| v.split(' ').next().unwrap_or(v));
+    }
     // The whole sequence (tree build, commit, HEAD move, worktree update) is one
     // logical write; hold the coordinator lock across all of it, like `merge`.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

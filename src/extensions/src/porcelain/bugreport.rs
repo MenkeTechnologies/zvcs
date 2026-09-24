@@ -34,8 +34,9 @@
 //!     info`, `libc info`) is C-preprocessor state baked into the stock git
 //!     binary at compile time. This binary is Rust on gitoxide and has no such
 //!     state, so it reports what is true of *itself* — the crate version, the
-//!     target architecture, `size_of::<usize>()`, and git's own "no compiler
-//!     information available" / "no libc information available" fallbacks.
+//!     target architecture, `size_of::<usize>()`, git's own "no compiler
+//!     information available" fallback, and `glibc: <version>` on
+//!     `*-linux-gnu` targets (git's "no libc information available" elsewhere).
 //!     Copying stock git's values here would put false claims in a bug report.
 //!   * The `hint: Waiting for your editor to close the file...` line and the
 //!     line-erase that follows it are not emitted. Both fire only when stderr is
@@ -460,16 +461,33 @@ fn system_info(out: &mut String) {
     out.push_str("uname: ");
     out.push_str(&uname_info());
 
-    // git's fallbacks when no compiler/libc macros are defined, which is the
-    // situation a Rust binary is permanently in.
+    // `get_compiler_info()` (compat/compiler.h:10-26): no `__clang__`,
+    // `__GNUC__` or `_MSC_VER` describes a Rust binary, so git's fallback is
+    // the true line.
     out.push_str("compiler info: no compiler information available\n");
-    out.push_str("libc info: no libc information available\n");
+    out.push_str("libc info: ");
+    out.push_str(&libc_info());
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "<unset>".to_string());
     out.push_str(&format!("$SHELL (typically, interactive shell): {shell}\n"));
 }
 
-/// `get_uname_info(buf, 1)` — `sysname release version machine`, which is
+/// `get_libc_info()` (compat/compiler.h:28-38). git's `__GLIBC__` test is true
+/// of any build against glibc headers; a `*-linux-gnu` Rust target links the
+/// same glibc, so `gnu_get_libc_version()` reports the library actually loaded.
+/// Every other target takes git's fallback line.
+fn libc_info() -> String {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: glibc returns a pointer to a static NUL-terminated string.
+        let version = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
+        return format!("glibc: {}\n", version.to_string_lossy());
+    }
+    #[allow(unreachable_code)]
+    "no libc information available\n".to_string()
+}
+
+/// `get_uname_info(buf, 1)` —`sysname release version machine`, which is
 /// exactly what `uname -srvm` prints.
 ///
 /// git calls `uname(2)` directly and reports `strerror`/`errno` on failure;

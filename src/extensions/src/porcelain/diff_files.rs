@@ -1883,10 +1883,10 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("-O") {
-        if v.is_empty() {
-            return Err(Fatal::MissingArgument("-O"));
-        }
-        opts.order_file = Some(v.to_owned());
+        // `OPT_FILENAME` (diff.c:6291) stores `fix_filename()`, which answers NULL
+        // for an empty name (parse-options.c:64-70): `-O ''` clears the order file
+        // rather than naming one.
+        opts.order_file = (!v.is_empty()).then(|| v.to_owned());
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--output=") {

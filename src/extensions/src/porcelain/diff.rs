@@ -1760,7 +1760,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             } else if flag == "-O" {
-                order_file = Some(a.clone());
+                // `fix_filename()` answers NULL for an empty name
+                // (parse-options.c:64-70), so `-O ''` also drops a
+                // `diff.orderFile` seeded above.
+                order_file = (!a.is_empty()).then(|| a.clone());
             } else if flag == "-l" {
                 match parse_rename_limit(a) {
                     Ok(n) => ro.rename_limit = n,

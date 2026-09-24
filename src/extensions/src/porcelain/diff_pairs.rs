@@ -1532,7 +1532,8 @@ pub(crate) fn render_raw_stream(
             _ if s.starts_with("--output=") => output_file = Some(s["--output=".len()..].to_string()),
             // `-O<file>`: `diffcore_order` reorders the queue by the first glob in the
             // file that matches the destination path or any of its directory prefixes.
-            "-O" => opts.orderfile = Some(want_value!(s.len())),
+            // `fix_filename()` turns an empty name into NULL (parse-options.c:64-70).
+            "-O" => opts.orderfile = Some(want_value!(s.len())).filter(|f| !f.is_empty()),
             _ if s.starts_with("-O") => opts.orderfile = Some(s[2..].to_string()),
             // `-D`: `diff_opt_irreversible_delete` — a deletion emits only its header.
             "-D" | "--irreversible-delete" => opts.irreversible_delete = true,

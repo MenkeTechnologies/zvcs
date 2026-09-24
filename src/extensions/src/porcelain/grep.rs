@@ -804,15 +804,6 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // `-NUM` is git's shortcut for `-C NUM`: it sets both context sides.
-        if a.len() > 1 && a[1..].bytes().all(|b| b.is_ascii_digit()) {
-            let n = a[1..].parse::<usize>().unwrap_or(usize::MAX);
-            pre_context = n;
-            post_context = n;
-            i += 1;
-            continue;
-        }
-
         // Short flags, possibly grouped (`-in`). A flag that takes a value
         // consumes the rest of the group as that value, or the next argument
         // when the group ends with it.
@@ -929,6 +920,20 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                         Err(code) => return Ok(code),
                     }
                     c = group.len();
+                    continue;
+                }
+                // `OPT_NUMBER_CALLBACK(…, context_callback)`, git's `-NUM` shortcut
+                // for `-C NUM` (builtin/grep.c:1134). No short option is a digit, so
+                // `parse_short_opt()` hands the whole digit run at this position to
+                // it and parsing resumes behind the run (parse-options.c:444-458):
+                // `-c1` is `-c` then `-1`, `-2n` is `-2` then `-n`.
+                d if d.is_ascii_digit() => {
+                    let len = group[c..].iter().take_while(|g| g.is_ascii_digit()).count();
+                    let run: String = group[c..c + len].iter().collect();
+                    let n = run.parse::<usize>().unwrap_or(usize::MAX);
+                    pre_context = n;
+                    post_context = n;
+                    c += len;
                     continue;
                 }
                 other if !SHORT_OPTS.contains(other) => return Ok(unknown_short(other)),

@@ -2147,20 +2147,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         let want_hunks = opts.patch || opts.format == Format::Check;
         let need_analyses = want_hunks || opts.numstat || opts.diffstat || opts.shortstat;
         let analyses: Vec<IdxAnalysis> = if need_analyses {
-            // `diff_filespec_load_driver()`: the `diff=<driver>` attribute plus that
-            // driver's `diff.<name>.binary`, resolved once for the whole batch because
+            // `diff_filespec_load_driver()`: the `diff` attribute — `-diff` is
+            // `driver_false`, `diff` is `driver_true`, a value names a driver whose
+            // `diff.<name>.binary` decides — resolved once for the whole batch because
             // the attribute stack is what makes the lookup expensive.
             let mut tc = super::cat_file::Textconv::new(&repo).ok();
             let driver_binary: Vec<Option<bool>> = deltas
                 .iter()
-                .map(|d| {
-                    let name = tc.as_mut()?.driver_name(d.path.as_ref()).ok().flatten()?;
-                    let raw = super::cat_file::diff_driver_config(&repo, &name, "binary")?;
-                    // `git_config_bool()` on the driver's `binary` key.
-                    gix::config::Boolean::try_from(gix::bstr::BStr::new(raw.as_bytes()))
-                        .ok()
-                        .map(|b| b.0)
-                })
+                .map(|d| tc.as_mut()?.binary_attr(d.path.as_ref()).ok().flatten())
                 .collect();
             // `userdiff_find_by_path()` for both filespecs of every pair: the funcname
             // pattern `xdiff_set_find_func()` installs, and — under `--textconv` — the
@@ -3446,8 +3440,8 @@ fn analyze_index_delta(
     workdir: Option<&Path>,
     d: &Delta,
     opts: &Opts,
-    // `one->driver->binary`: `Some` only when the path's `diff=<driver>` attribute names
-    // a driver that configures `diff.<name>.binary`.
+    // `one->driver->binary`: [`super::cat_file::diff_attr_binary`]'s answer — `Some`
+    // for `-diff`, `diff`, or a named driver that configures `diff.<name>.binary`.
     driver_binary: Option<bool>,
     // `xecfg.find_func`: the compiled `funcname`/`xfuncname` pattern of the driver
     // [`resolve_drivers`] picked for this pair, or `None` for xdiff's `def_ff`.
@@ -3482,8 +3476,8 @@ fn analyze_index_delta(
     let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path)?.unwrap_or_default();
     let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path)?.unwrap_or_default();
 
-    // `diff_filespec_is_binary()` per side (diff.c:3396): the path's `diff=<driver>`
-    // attribute is consulted first — when that driver sets `diff.<name>.binary`,
+    // `diff_filespec_is_binary()` per side (diff.c:3712): the path's `diff` attribute is
+    // consulted first — when it is `-diff`/`diff` or its driver sets `diff.<name>.binary`,
     // `one->driver->binary != -1` and the verdict is taken from it verbatim; only an
     // unset (`-1`) driver setting falls through to the NUL sniff. A side that does not
     // exist is never binary, which is why `builtin_diff()` can render an addition of a

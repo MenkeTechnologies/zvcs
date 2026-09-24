@@ -12,7 +12,7 @@ use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
 use gix::revision::plumbing::Spec as RevSpec;
 
-use super::filespec::{content_of, count_changed_lines_ws, is_binary};
+use super::filespec::{content_of, count_changed_lines_ws, filespec_is_binary, is_binary};
 use super::diff_color;
 use super::diffstat::{self, StatWidths};
 use super::line_log;
@@ -4058,7 +4058,38 @@ fn collect_changes(
         }
     }
     *warn = detect_renames(repo, &mut out, opts, old_tree.as_ref(), specs)?;
+    apply_diff_drivers(&mut super::cat_file::Textconv::new(repo)?, &mut out, ws)?;
     Ok(out)
+}
+
+/// `builtin_diffstat()`'s binary test (diff.c:4213-4223) is
+/// `diff_filespec_is_binary()` on each side, and that asks the side's diff
+/// driver before it sniffs the bytes (diff.c:3712-3734): `-diff` makes a path
+/// binary whatever it holds, and `diff` or a driver's `binary` setting can make
+/// it text. [`fill_counts`] only sniffs, so every path an attribute speaks for
+/// is recounted with the drivers' verdict. A rename asks the old side under its
+/// old name.
+fn apply_diff_drivers(
+    drivers: &mut super::cat_file::Textconv<'_>,
+    files: &mut [FileChange],
+    ws: super::diff::Whitespace,
+) -> Result<()> {
+    for f in files {
+        let old_path = f.source.as_deref().unwrap_or(&f.path);
+        let old_driver = drivers.binary_attr(old_path.as_bstr())?;
+        let new_driver = drivers.binary_attr(f.path.as_bstr())?;
+        if old_driver.is_none() && new_driver.is_none() {
+            continue;
+        }
+        f.is_binary = (!f.old_is_sub && filespec_is_binary(old_driver, &f.old_content))
+            || (!f.new_is_sub && filespec_is_binary(new_driver, &f.new_content));
+        (f.added, f.deleted) = if f.is_binary || f.mode_only {
+            (0, 0)
+        } else {
+            count_changed_lines_ws(&f.old_content, &f.new_content, ws)?
+        };
+    }
+    Ok(())
 }
 
 /// `diffcore_rename()`: pair each deletion with an addition that carries the same (or

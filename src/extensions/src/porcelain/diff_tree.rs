@@ -171,6 +171,8 @@ use gix::diff::blob::{sources, Algorithm, Diff, InternedInput};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryMode;
 
+use super::filespec::filespec_is_binary;
+
 /// Stock git's `diff-tree` usage block, byte-for-byte (1755 bytes), including the
 /// trailing blank line. Printed on `-h` (stdout) and when no `<tree-ish>` is given
 /// (stderr); both exit 129.
@@ -2880,11 +2882,14 @@ fn render_all(
     }
     match opts.format {
         Format::NumStat => {
+            let mut drivers = super::cat_file::Textconv::new(repo)?;
             for c in changes {
-                render_numstat(repo, out, c, opts)?;
+                render_numstat(repo, &mut drivers, out, c, opts)?;
             }
         }
-        Format::ShortStat => render_shortstat(repo, out, changes)?,
+        Format::ShortStat => {
+            render_shortstat(repo, &mut super::cat_file::Textconv::new(repo)?, out, changes)?
+        }
         Format::Summary => {
             for c in changes {
                 render_summary(out, c);
@@ -2937,23 +2942,23 @@ fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Vec<u8>> {
     }
 }
 
-/// git's `buffer_is_binary`: a NUL byte within the first `FIRST_FEW_BYTES` (8000)
-/// marks the blob binary, which is what makes numstat print `-` for both counts.
-fn is_binary(data: &[u8]) -> bool {
-    const FIRST_FEW_BYTES: usize = 8000;
-    let n = data.len().min(FIRST_FEW_BYTES);
-    data[..n].contains(&0)
-}
-
 /// Added/removed line counts for one change, or `None` when either side is binary.
+/// That is `builtin_diffstat()`'s `diff_filespec_is_binary()` test on each side
+/// (diff.c:4213-4214), which asks the path's diff driver before it sniffs the
+/// bytes, so a `-diff` path is binary whatever it holds.
 ///
 /// Uses git's default diff algorithm (Myers, non-minimal) over whole lines with the
 /// trailing newline kept in each token, so a line that only gains or loses its final
 /// newline counts as one removal plus one addition exactly as git reports.
-fn numstat_counts(repo: &gix::Repository, c: &Change) -> Result<Option<(u32, u32)>> {
+fn numstat_counts(
+    repo: &gix::Repository,
+    drivers: &mut super::cat_file::Textconv<'_>,
+    c: &Change,
+) -> Result<Option<(u32, u32)>> {
     let old = side_bytes(repo, c.old)?;
     let new = side_bytes(repo, c.new)?;
-    if is_binary(&old) || is_binary(&new) {
+    let driver = drivers.binary_attr(c.path.as_bstr())?;
+    if filespec_is_binary(driver, &old) || filespec_is_binary(driver, &new) {
         return Ok(None);
     }
     let input = InternedInput::new(sources::byte_lines(&old), sources::byte_lines(&new));
@@ -2966,11 +2971,12 @@ fn numstat_counts(repo: &gix::Repository, c: &Change) -> Result<Option<(u32, u32
 /// NUL and leaves the path unquoted, otherwise the path is C-quoted like git's.
 fn render_numstat(
     repo: &gix::Repository,
+    drivers: &mut super::cat_file::Textconv<'_>,
     out: &mut Vec<u8>,
     c: &Change,
     opts: &Opts,
 ) -> Result<()> {
-    match numstat_counts(repo, c)? {
+    match numstat_counts(repo, drivers, c)? {
         Some((add, del)) => {
             out.extend_from_slice(format!("{add}\t{del}\t").as_bytes());
         }
@@ -2983,14 +2989,19 @@ fn render_numstat(
 
 /// The single `--shortstat` line, aggregated over every changed blob. Binary blobs
 /// count toward the file total but contribute no line counts.
-fn render_shortstat(repo: &gix::Repository, out: &mut Vec<u8>, changes: &[Change]) -> Result<()> {
+fn render_shortstat(
+    repo: &gix::Repository,
+    drivers: &mut super::cat_file::Textconv<'_>,
+    out: &mut Vec<u8>,
+    changes: &[Change],
+) -> Result<()> {
     if changes.is_empty() {
         return Ok(());
     }
     let mut insertions: u64 = 0;
     let mut deletions: u64 = 0;
     for c in changes {
-        if let Some((add, del)) = numstat_counts(repo, c)? {
+        if let Some((add, del)) = numstat_counts(repo, drivers, c)? {
             insertions += add as u64;
             deletions += del as u64;
         }

@@ -265,8 +265,13 @@ impl Pipeline {
             driver
                 .is_binary
                 .map(|is_binary| is_binary && driver.binary_to_text_command.is_none())
+        } else if attr.assignment.state.is_unset() {
+            // `-diff` is git's `driver_false`, whose `.binary` is 1 (userdiff.c:377-380).
+            Some(true)
         } else {
-            attr.assignment.state.is_unset().then_some(true)
+            // A set `diff` is `driver_true`, whose `.binary` is 0 (userdiff.c:372-375):
+            // the content is text whatever its bytes look like.
+            attr.assignment.state.is_set().then_some(false)
         };
         match self.roots.by_kind(kind) {
             Some(root) => {

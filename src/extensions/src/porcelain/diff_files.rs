@@ -605,6 +605,11 @@ struct Analysis {
     added: u32,
     deleted: u32,
     binary: bool,
+    /// `diff_filespec_size()` of each side of a binary pair, in the delta's
+    /// orientation: `builtin_diffstat()`'s `Bin <old> -> <new> bytes`
+    /// (diff.c:4220-4221). The blob pipeline keeps only the size of content it
+    /// classifies as binary, so the buffers below cannot answer it.
+    binary_sizes: (u64, u64),
     /// `None` when the two sides compare equal (e.g. a pure mode change).
     hunks: Option<Vec<u8>>,
     /// Both buffers are in the delta's orientation, so `-R` has already swapped
@@ -623,6 +628,7 @@ impl Analysis {
             added: 0,
             deleted: 0,
             binary: false,
+            binary_sizes: (0, 0),
             hunks: None,
             old_data: Vec::new(),
             new_data: Vec::new(),
@@ -3447,6 +3453,13 @@ fn analyze(
 
     match prep.operation {
         Operation::SourceOrDestinationIsBinary => {
+            let size = |d: &gix::diff::blob::platform::resource::Data<'_>| match d {
+                gix::diff::blob::platform::resource::Data::Buffer { buf, .. } => buf.len() as u64,
+                gix::diff::blob::platform::resource::Data::Binary { size } => *size,
+                gix::diff::blob::platform::resource::Data::Missing => 0,
+            };
+            let (blob_size, wt_size) = (size(&prep.old.data), size(&prep.new.data));
+            let binary_sizes = if swapped { (wt_size, blob_size) } else { (blob_size, wt_size) };
             // The blob pipeline hands back only the *size* of content it classified as
             // binary, so `prep.*.data` is empty here. `--binary` needs the real bytes,
             // and so does a `textconv` converter, whose stdout is what `builtin_diff()`
@@ -3498,6 +3511,7 @@ fn analyze(
                 added: 0,
                 deleted: 0,
                 binary: true,
+                binary_sizes,
                 hunks,
                 old_data,
                 new_data,
@@ -3510,6 +3524,7 @@ fn analyze(
             added: 0,
             deleted: 0,
             binary: false,
+            binary_sizes: (0, 0),
             hunks: None,
             old_data,
             new_data,
@@ -3542,6 +3557,7 @@ fn analyze(
                 added,
                 deleted,
                 binary: false,
+                binary_sizes: (0, 0),
                 hunks,
                 old_data,
                 new_data,
@@ -3665,6 +3681,7 @@ fn analyze_images(
         added,
         deleted,
         binary: false,
+        binary_sizes: (0, 0),
         hunks,
         old_data,
         new_data,
@@ -3858,7 +3875,7 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec
         }
         let (added, deleted) = if an.binary {
             // Binary counts are byte sizes, not lines.
-            (an.new_data.len() as u32, an.old_data.len() as u32)
+            (an.binary_sizes.1 as u32, an.binary_sizes.0 as u32)
         } else {
             (an.added, an.deleted)
         };

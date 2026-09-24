@@ -28,6 +28,14 @@ pub(crate) fn is_binary(data: &[u8]) -> bool {
     data.iter().take(8000).any(|&b| b == 0)
 }
 
+/// `diff_filespec_is_binary()` (diff.c:3712-3734): the path's diff driver decides
+/// when it has an opinion — `driver` is [`super::cat_file::diff_attr_binary`]'s
+/// answer — and only its `-1` falls through to [`is_binary`] on the bytes. A side
+/// with no data is not binary unless its driver says so.
+pub(crate) fn filespec_is_binary(driver: Option<bool>, data: &[u8]) -> bool {
+    driver.unwrap_or_else(|| is_binary(data))
+}
+
 /// Total added and removed lines, for `--stat`. Uses the same hunk machinery as
 /// the patch so the two can never disagree about what changed.
 pub(crate) fn count_changed_lines(old: &[u8], new: &[u8]) -> Result<(usize, usize)> {

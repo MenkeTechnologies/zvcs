@@ -9,7 +9,7 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 
-use super::filespec::{content_of, count_changed_lines_ws, is_binary};
+use super::filespec::{content_of, count_changed_lines_ws, filespec_is_binary, is_binary};
 use super::diff_color;
 // `--color=<when>` (and `--color`/`--no-color`): whether `%C`/`%d` emit ANSI.
 // One tri-state for the whole port, so the value grammar cannot drift.
@@ -4963,6 +4963,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // (builtin/log.c:443, diff.c:7546-7548). Each commit's rename pass overwrites
     // them, so what is reported is the last diffed commit's.
     let mut rename_warn = super::diffcore_rename::Warnings::default();
+    // `userdiff_find_by_path()`'s attribute stack for the count formats' binary
+    // test, built on first use: most walks never ask for counts.
+    let mut diff_drivers: Option<super::cat_file::Textconv<'_>> = None;
     let mut blocks: Vec<Option<GraphBlock>> = Vec::new();
     // BLOCK-buffered, not line-buffered: Rust's stdout is a LineWriter, so writing
     // one terminated record per commit meant one write(2) per commit — 6375
@@ -5421,6 +5424,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     pre,
                     Some(&mut rename_warn),
                 )?;
+                if count_formats {
+                    let drivers = match diff_drivers.as_mut() {
+                        Some(d) => d,
+                        None => diff_drivers.insert(super::cat_file::Textconv::new(&repo)?),
+                    };
+                    apply_diff_drivers(&repo, drivers, &mut files, patch_opts.ws)?;
+                }
                 if let Some(m) = followed.as_mut() {
                     files.retain(|f| m.matches(&f.path));
                 }
@@ -12386,6 +12396,46 @@ fn collect_changes(
         }
     }
     Ok(out)
+}
+
+/// `builtin_diffstat()`'s binary test (diff.c:4213-4223) is
+/// `diff_filespec_is_binary()` on each side, and that asks the side's diff
+/// driver first (diff.c:3712-3734): `-diff` makes a path binary whatever its
+/// bytes, and `diff` or a driver's `binary` setting can make it text. The change
+/// list — cached, as a pure function of two trees — only sniffed the bytes, so
+/// every path an attribute speaks for is recounted here with the drivers'
+/// verdict. A rename asks the old side under its old name.
+fn apply_diff_drivers(
+    repo: &gix::Repository,
+    drivers: &mut super::cat_file::Textconv<'_>,
+    files: &mut [FileChange],
+    ws: super::diff::Whitespace,
+) -> Result<()> {
+    let side_content = |side: Option<(u32, ObjectId)>| -> Result<Vec<u8>> {
+        match side {
+            Some((mode, id)) => content_of(repo, id, mode & 0o170000 == 0o160000),
+            None => Ok(Vec::new()),
+        }
+    };
+    for f in files {
+        let old_path = f.source.as_deref().unwrap_or(&f.path);
+        let old_driver = drivers.binary_attr(old_path.as_bstr())?;
+        let new_driver = drivers.binary_attr(f.path.as_bstr())?;
+        if old_driver.is_none() && new_driver.is_none() {
+            continue;
+        }
+        let old_content = side_content(f.old_side)?;
+        let new_content = side_content(f.new_side)?;
+        f.is_binary = filespec_is_binary(old_driver, &old_content)
+            || filespec_is_binary(new_driver, &new_content);
+        let may_differ = f.old_side.map(|(_, id)| id) != f.new_side.map(|(_, id)| id);
+        (f.added, f.deleted) = if f.is_binary || !may_differ {
+            (0, 0)
+        } else {
+            count_changed_lines_ws(&old_content, &new_content, ws)?
+        };
+    }
+    Ok(())
 }
 
 /// `diffcore_rename()`: pair each deletion with an addition carrying the same (or

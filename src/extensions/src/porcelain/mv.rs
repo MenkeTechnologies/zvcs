@@ -201,32 +201,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     };
 
     // 3. Split operands: everything but the last is a source; the last is the
-    //    destination. Decide file-mode vs into-directory-mode the way git does:
-    //    a trailing slash or an existing directory means "into directory".
+    //    destination.
     let dest_arg = *positional.last().expect("checked len >= 2");
     let sources = &positional[..positional.len() - 1];
-
-    let dest_rel = match normalize_rel(&workdir, &prefix, dest_arg) {
-        Ok(r) => r,
-        Err(e) => return fatal(e),
-    };
-    let dest_abs = workdir.join(&dest_rel);
-    let trailing_slash = dest_arg.ends_with('/');
-    let dest_is_dir = dest_abs.is_dir();
-
-    if trailing_slash && !dest_is_dir {
-        let first = match normalize_rel(&workdir, &prefix, sources[0]) {
-            Ok(r) => r,
-            Err(e) => return fatal(e),
-        };
-        return fatal(format!(
-            "destination directory does not exist, source={first}, destination={dest_arg}"
-        ));
-    }
-    let dir_mode = dest_is_dir;
-    if sources.len() > 1 && !dir_mode {
-        return fatal(format!("destination '{dest_arg}' is not a directory"));
-    }
 
     // 4. Serialize the whole index read-modify-write through the repo
     //    coordinator for real moves; a dry run mutates nothing and needs no
@@ -252,6 +229,75 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         }
     } else {
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
+    };
+
+    // ```c
+    // internal_prefix_pathspec(&sources, prefix, argv, argc, 0);
+    // …
+    // flags = KEEP_TRAILING_SLASH;
+    // if (argc == 1 && is_directory(argv[0]) && !is_directory(argv[1]))
+    //         flags = 0;
+    // internal_prefix_pathspec(&dest_paths, prefix, argv + argc, 1, flags);
+    // dst_w_slash = add_slash(dest_paths.v[0]);
+    // …
+    // if (dest_paths.v[0][0] == '\0')
+    //         /* special case: "." was normalized to "" */
+    //         internal_prefix_pathspec(&destinations, dest_paths.v[0], argv, argc, DUP_BASENAME);
+    // else if (!lstat(dest_paths.v[0], &st) && S_ISDIR(st.st_mode)) {
+    //         internal_prefix_pathspec(&destinations, dst_w_slash, argv, argc, DUP_BASENAME);
+    // } else if (…SKIP_WORKTREE_DIR…) {
+    // } else if (argc != 1) {
+    //         die(_("destination '%s' is not a directory"), dest_paths.v[0]);
+    // } else {
+    //         strvec_pushv(&destinations, dest_paths.v);
+    // ```
+    //
+    // (builtin/mv.c:254-281.) A source loses its trailing slashes; the
+    // destination keeps its own so that `git mv file no-such-dir/` can be
+    // refused per source (`:442`), except for `git mv dir no-such-dir/`, which
+    // is a plain rename. An existing directory (`lstat()`, so a symlink to one
+    // is a file) receives each source's basename under `add_slash()`, which is
+    // what keeps `git mv a dir/` from recording `dir//a`. `is_directory()`
+    // `stat()`s the raw operands from the top of the worktree, where
+    // `setup_git_directory()` left the process.
+    let src_rels: Vec<String> = match sources
+        .iter()
+        .map(|s| normalize_rel(&workdir, &prefix, trim_dir_seps(s)))
+        .collect()
+    {
+        Ok(v) => v,
+        Err(e) => return fatal(e),
+    };
+    let keep_trailing_slash = !(sources.len() == 1
+        && workdir.join(sources[0]).is_dir()
+        && !workdir.join(dest_arg).is_dir());
+    let dest_rel = match normalize_rel(
+        &workdir,
+        &prefix,
+        if keep_trailing_slash { dest_arg } else { trim_dir_seps(dest_arg) },
+    ) {
+        Ok(r) => r,
+        Err(e) => return fatal(e),
+    };
+    let dst_w_slash = add_slash(&dest_rel);
+    let into_dir = |under: &str| -> Result<Vec<String>> {
+        sources
+            .iter()
+            .map(|s| normalize_rel(&workdir, Path::new(under), dup_basename(s)))
+            .collect()
+    };
+    let dst_rels = if dest_rel.is_empty() {
+        into_dir(&dest_rel)
+    } else if std::fs::symlink_metadata(workdir.join(&dest_rel)).is_ok_and(|m| m.is_dir()) {
+        into_dir(&dst_w_slash)
+    } else if sources.len() != 1 {
+        return fatal(format!("destination '{dest_rel}' is not a directory"));
+    } else {
+        Ok(vec![dest_rel.clone()])
+    };
+    let dst_rels = match dst_rels {
+        Ok(v) => v,
+        Err(e) => return fatal(e),
     };
 
     // 5. Validation phase — build a plan per source against the pristine index.
@@ -280,14 +326,12 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     // already accepted. A directory source or a sparse-skipped entry leaves the
     // checking loop before the insert, so neither is registered here either.
     let mut src_for_dst: std::collections::BTreeSet<String> = Default::default();
-    for s in sources {
+    for (src_rel, dst_rel) in src_rels.into_iter().zip(dst_rels) {
         match plan_source(
             &index,
             &workdir,
-            &prefix,
-            s,
-            dir_mode,
-            &dest_rel,
+            src_rel,
+            dst_rel,
             force,
             ignore_sparse,
             ignore_case,
@@ -551,10 +595,8 @@ enum Planned {
 fn plan_source(
     index: &gix::index::File,
     workdir: &Path,
-    prefix: &Path,
-    src_arg: &str,
-    dir_mode: bool,
-    dest_rel: &str,
+    src_rel: String,
+    dst_rel: String,
     force: bool,
     ignore_sparse: bool,
     ignore_case: bool,
@@ -564,16 +606,7 @@ fn plan_source(
     // by this run, which is what makes a second source for one target an error.
     src_for_dst: &std::collections::BTreeSet<String>,
 ) -> Result<Planned> {
-    let src_rel = normalize_rel(workdir, prefix, src_arg)?;
     let src_abs = workdir.join(&src_rel);
-
-    // When moving into a directory the destination basename is the source's.
-    let dst_rel = if dir_mode {
-        let base = src_rel.rsplit('/').next().unwrap_or(&src_rel);
-        format!("{dest_rel}/{base}")
-    } else {
-        dest_rel.to_owned()
-    };
     let dst_abs = workdir.join(&dst_rel);
 
     // ```c
@@ -703,7 +736,7 @@ fn plan_source(
             let p = e.path_in(backing);
             if p.starts_with(sub_prefix.as_bytes()) {
                 let old = String::from_utf8_lossy(p).into_owned();
-                let new = format!("{dst_rel}{}", &old[src_rel.len()..]);
+                let new = format!("{}{}", add_slash(&dst_rel), &old[src_rel.len() + 1..]);
                 remaps.push((old, new));
             }
         }
@@ -807,6 +840,21 @@ fn plan_source(
             crate::git_fatal!(
                 "multiple sources for the same target, source={src_rel}, destination={dst_rel}"
             );
+        }
+        // ```c
+        // if (is_dir_sep(dst[strlen(dst) - 1])) {
+        //         bad = _("destination directory does not exist");
+        //         goto act_on_entry;
+        // }
+        // ```
+        //
+        // (builtin/mv.c:442-445.) Only a destination that `KEEP_TRAILING_SLASH`
+        // preserved and that is not an existing directory gets here; like any
+        // `bad`, `-k` skips the source.
+        if dst_rel.ends_with('/') {
+            return Err(anyhow!(
+                "destination directory does not exist, source={src_rel}, destination={dst_rel}"
+            ));
         }
         vec![(src_rel.clone(), dst_rel.clone())]
     };
@@ -1106,6 +1154,31 @@ fn normalize_rel(workdir: &Path, prefix: &Path, arg: &str) -> Result<String> {
     match real.strip_prefix(&real_wd) {
         Ok(rel) => Ok(rel.to_string_lossy().replace('\\', "/")),
         Err(_) => Err(outside().into()),
+    }
+}
+
+/// `internal_prefix_pathspec()`'s trim when `KEEP_TRAILING_SLASH` is not set
+/// (builtin/mv.c:68-70): every trailing directory separator goes.
+fn trim_dir_seps(arg: &str) -> &str {
+    arg.trim_end_matches('/')
+}
+
+/// `DUP_BASENAME` (builtin/mv.c:72-73): POSIX `basename()` of the operand with
+/// its trailing separators trimmed, which is `.` when nothing is left.
+fn dup_basename(arg: &str) -> &str {
+    match trim_dir_seps(arg) {
+        "" => ".",
+        trimmed => trimmed.rsplit('/').next().unwrap_or(trimmed),
+    }
+}
+
+/// `add_slash()` (builtin/mv.c:82-93): `path` with one `/` appended, unless it
+/// is empty or already ends in one.
+fn add_slash(path: &str) -> String {
+    match path {
+        "" => String::new(),
+        p if p.ends_with('/') => p.to_owned(),
+        p => format!("{p}/"),
     }
 }
 

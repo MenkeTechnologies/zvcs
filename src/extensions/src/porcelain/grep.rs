@@ -79,10 +79,11 @@
 //! `--cached` or a `<tree>` argument alongside it is the fatal git makes of it,
 //! and a non-zero pager exit becomes this command's exit status.
 //!
-//! `grep.threads`/`--threads` are read for their diagnostics only: a worker-thread
-//! count cannot change the output of a search that emits in path order, but git's
-//! `invalid number of threads specified` fatal and its `ignoring --threads`
-//! warning under `-O` are observable, so both are reproduced.
+//! `grep.threads`/`--threads` decide one thing about the output besides their
+//! diagnostics (`invalid number of threads specified`, `ignoring --threads` under
+//! `-O`): whether git ran threaded. A threaded run gives every file a leading
+//! hunk mark and drops the first line of the whole output instead, which is only
+//! the same thing when that first line *was* a mark — see [`SkipFirstLine`].
 //!
 //! `grep` is not a `NEED_WORK_TREE` command and does not need a repository at
 //! all: `--no-index` walks the current directory, and `grep.fallbackToNoIndex`
@@ -1148,6 +1149,13 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: invalid number of threads specified ({num_threads})");
         return Ok(ExitCode::from(128));
     }
+    // `else if (num_threads == 0) num_threads = HAVE_THREADS ? online_cpus() : 1;`
+    // (builtin/grep.c:1341-1342), after `-O` has forced it to 1.
+    let threaded = pager.is_none()
+        && match num_threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()) > 1,
+            n => n > 1,
+        };
 
     // The pager is fed worktree paths to open, so there is nothing for it to show
     // for index-only or tree contents.
@@ -1544,17 +1552,26 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     // found nothing, where git's output is empty and its exit code is 1 too.
     let renders_lines = !(opts.quiet || opts.files_with || opts.files_without || opts.count);
 
+    // A threaded git renders each file into its own buffer with `show_hunk_mark`
+    // already set — `if (opt->output != std_output) opt->show_hunk_mark = 1;`
+    // (grep.c:1598-1599) — so every file's first shown line carries its `--` or
+    // `--break` blank line, and `work_done()` drops the first line of the whole
+    // output instead (builtin/grep.c:1347-1350,163-171). The renderers below get
+    // that by starting their cross-file "something was printed" flag set and
+    // writing through [`SkipFirstLine`].
+    let skip_first_line = threaded && renders_lines && (pre_context > 0 || post_context > 0 || opts.brk || opts.funcbody);
+
     // `-p`/`--show-function` and `-W`/`--function-context` render the enclosing
     // function, keying off `match_funcname()` (grep.c:1329) — the path's diff
     // driver funcname pattern when it has one, the built-in identifier test
     // otherwise.
     if renders_lines && (opts.show_function || opts.funcbody) {
         let stdout = std::io::stdout();
-        let mut out = std::io::BufWriter::new(stdout.lock());
+        let mut out = SkipFirstLine::new(std::io::BufWriter::new(stdout.lock()), skip_first_line);
         let mut any_hit = false;
         // git's cross-file "a previous file already printed" flag, which gates the
         // `--`/`--break` separators between files.
-        let mut hunk_mark = false;
+        let mut hunk_mark = skip_first_line;
         for (name, rela, src) in &cands {
             let Some(content) =
                 load_content(repo.as_ref(), &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
@@ -1609,7 +1626,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     }
 
     let stdout = std::io::stdout();
-    let mut term = std::io::BufWriter::new(stdout.lock());
+    let mut term = SkipFirstLine::new(std::io::BufWriter::new(stdout.lock()), skip_first_line);
     // git's `-O` swaps its output function for `append_path`, so under a pager the
     // same search writes into this buffer and the pager's argument vector is built
     // from it afterwards. The two context-bearing branches below are unreachable
@@ -1628,7 +1645,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     if renders_lines && (pre_context > 0 || post_context > 0) {
         // `printed_any` spans all files: git's `--` separator precedes every hunk
         // except the first one printed across the whole run, files included.
-        let mut printed_any = false;
+        let mut printed_any = skip_first_line;
         for (name, rela, src) in &cands {
             let Some(content) =
                 load_content(repo.as_ref(), &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
@@ -1676,7 +1693,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
 
     // `emitted_any` spans all files for `--break`/`--heading`: the blank line and
     // heading precede every file's first emitted line except the first overall.
-    let mut emitted_any = false;
+    let mut emitted_any = skip_first_line;
     for (name, rela, src) in &cands {
         let Some(content) =
             load_content(repo.as_ref(), &subrepos, diff_attrs.as_mut(), textconv_active, rela.as_bstr(), src)?
@@ -3868,6 +3885,40 @@ fn write_body(
 /// `--` hunk mark — and, because it returns without touching `opt->last_shown`,
 /// the *next* file still sees `last_shown == 0` and so gets no separator either.
 /// The name is painted with `color.grep.filename` like every other file name.
+/// `work_done()`'s `skip_first_line` (builtin/grep.c:163-171): "Skip the leading
+/// hunk mark of the first file" — by dropping everything up to and including the
+/// first newline written, whatever that line is. When the first thing a threaded
+/// run prints is a `Binary file … matches` notice, which carries no mark, it is
+/// the notice that goes; measured against git 2.55.0, `git grep -W nested --
+/// <a -diff path>` prints nothing and exits 0.
+struct SkipFirstLine<W> {
+    inner: W,
+    skipping: bool,
+}
+
+impl<W: Write> SkipFirstLine<W> {
+    fn new(inner: W, skipping: bool) -> Self {
+        Self { inner, skipping }
+    }
+}
+
+impl<W: Write> Write for SkipFirstLine<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.skipping {
+            return self.inner.write(buf);
+        }
+        if let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+            self.skipping = false;
+            self.inner.write_all(&buf[nl + 1..])?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn binary_notice(out: &mut impl Write, name: &[u8], opts: &Opts) -> Result<()> {
     out.write_all(b"Binary file ")?;
     write_field(out, name, c_filename(), opts.color)?;

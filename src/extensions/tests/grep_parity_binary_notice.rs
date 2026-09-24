@@ -14,8 +14,8 @@
 //! (`output_color(..., opt->colors[GREP_COLOR_FILENAME])` on the same line).
 //!
 //! Measured against git 2.55.0 with `--threads 1`; the threaded default drops
-//! the very first output line (`skip_first_line`, builtin/grep.c:1350), which is
-//! a thread-scheduling artifact and not what the single-threaded spec says.
+//! the very first output line (`skip_first_line`, builtin/grep.c:1350), which
+//! `grep_parity_threaded_skip_first_line.rs` covers.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

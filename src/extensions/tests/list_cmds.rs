@@ -10,10 +10,11 @@
 //!     the user can tab to. Every category git 2.55.0 knows is compared.
 //!   * **Binary groups** (`builtins`, `main`, `others`) are facts about the
 //!     running binary, and this binary serves a superset of git's verbs, so
-//!     they are asserted structurally: every stock builtin present, the `z*`
-//!     verbs present, the exec-path and `$PATH` scans really performed. A
-//!     hermetic `$HOME`/`$PATH` is used so the scans see only what the fixture
-//!     puts there.
+//!     they are asserted structurally: `builtins` is git's `commands[]` table
+//!     exactly, the `z*` verbs and scripted commands are in `main`, and the
+//!     exec-path and `$PATH` scans are really performed. A hermetic
+//!     `$HOME`/`$PATH` is used so the scans see only what the fixture puts
+//!     there.
 //!   * **Failure shapes** are stock's, down to which part of the spec the
 //!     message quotes: a bad top-level token is reported with the whole
 //!     remainder of the spec, a bad `list-<category>` with the bare category.
@@ -183,27 +184,34 @@ fn nohelpers_filters_only_what_precedes_it() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
-/// `builtins` answers from the dispatch tables, so it must carry every verb
-/// stock serves *and* the superset verbs this binary adds — the completion
-/// script offers exactly what this prints.
+/// `builtins` is git's `commands[]` table — the set `t0012-help.sh:254` holds to
+/// "`-h` exits 129 with a usage". The scripted commands and the `z*` verbs this
+/// binary also serves in-process do not keep that contract, so they must be in
+/// `main` and not here: `archimport -h` exits 1 and `zstatus -h` exits 0.
 #[test]
-fn builtins_covers_stock_and_the_superset_verbs() {
+fn builtins_is_the_commands_table_and_the_rest_is_main() {
     let repo = fixture("builtins");
-    let ours = set_of(&run(&repo, &["--list-cmds=builtins"]));
-
+    let out = run(&repo, &["--list-cmds=builtins"]);
     if stock_available() {
-        let stock = set_of(&run_stock(&repo, &["--list-cmds=builtins"]));
-        let missing: Vec<&String> = stock.difference(&ours).collect();
-        assert!(missing.is_empty(), "stock builtins missing from this port's listing: {missing:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&run_stock(&repo, &["--list-cmds=builtins"]).stdout),
+            "builtins differs from git 2.55.0's commands[] table"
+        );
     }
-
-    for verb in ["zstatus", "zrepos", "zdaemon"] {
-        assert!(ours.contains(verb), "superset verb {verb} is dispatched but not listed");
+    let builtins = set_of(&out);
+    let main = set_of(&run(&repo, &["--list-cmds=main"]));
+    for verb in ["commit", "submodule--helper", "format-rev", "rev-parse"] {
+        assert!(builtins.contains(verb), "commands[] entry {verb} is not listed");
     }
+    for verb in ["archimport", "submodule", "web--browse", "zstatus", "zrepos"] {
+        assert!(!builtins.contains(verb), "{verb} is not in commands[] but was listed as a builtin");
+        assert!(main.contains(verb), "{verb} is dispatched but missing from `main`");
+    }
+    assert!(builtins.is_subset(&main), "`main` lost a builtin");
 
-    // Sorted and de-duplicated, like git's `commands[]` walk over an
-    // alphabetical table.
-    let listed = lines(&run(&repo, &["--list-cmds=builtins"]));
+    // `list_builtins()` walks an alphabetical table.
+    let listed = lines(&out);
     let mut sorted = listed.clone();
     sorted.sort();
     sorted.dedup();

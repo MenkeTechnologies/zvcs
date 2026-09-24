@@ -18,19 +18,20 @@
 //! completion that fails, and a name missing from it is a command the user
 //! cannot tab to.
 //!
-//! This port therefore derives the same three groups from
-//! [`crate::dispatch::PORCELAIN_VERBS`] / [`crate::dispatch::SUPERSET_VERBS`] —
-//! the tables `dispatch::run` actually matches on — plus the same exec-path and
-//! `$PATH` scans (`help::load_command_list`). A literal copy of git's list would
-//! be wrong in both directions the moment either table moved: it would advertise
-//! stock verbs this binary does not serve and hide every `z*` verb it does.
+//! This port therefore derives the same three groups from the tables
+//! `dispatch::run` actually matches on — `builtins` is git's `commands[]` set
+//! filtered through them, `main` adds every other verb they serve — plus the
+//! same exec-path and `$PATH` scans (`help::load_command_list`). A literal copy
+//! of git's `main` would be wrong in both directions the moment either table
+//! moved: it would advertise stock verbs this binary does not serve and hide
+//! every `z*` verb it does.
 //!
 //! The same derivation is why `others` answers differently here than stock does
 //! on this machine. Stock lists every `git-z*` dashed link `git zdashed`
 //! installed as an *external* command, because they are not builtins of its
-//! binary; they are builtins of this one, so they appear under `builtins` and
-//! `main` instead and `exclude_cmds()` keeps them out of `others`. Neither
-//! listing loses a name — `main,others` covers the same set both ways.
+//! binary; this one dispatches them, so they appear under `main` instead and
+//! `exclude_cmds()` keeps them out of `others`. Neither listing loses a name —
+//! `main,others` covers the same set both ways.
 //!
 //! The documentation-driven groups are the opposite case and are handled the
 //! opposite way. `list-<category>` answers from `command-list.txt`
@@ -44,7 +45,7 @@
 //!
 //! | token | source | git |
 //! |---|---|---|
-//! | `builtins` | dispatch tables | `list_builtins(&list, 0, 0)` |
+//! | `builtins` | [`crate::gitcomp`] tables + [`NO_PARSEOPT`] ∩ dispatch tables | `list_builtins(&list, 0, 0)` |
 //! | `main` | dispatch tables + exec-path scan | `list_all_main_cmds()` |
 //! | `others` | `$PATH` scan | `list_all_other_cmds()` |
 //! | `nohelpers` | filter: drop names containing `--` | `exclude_helpers_from_list()` |
@@ -86,6 +87,45 @@ const DEPRECATED: &[&str] = &["pack-redundant", "whatchanged"];
 fn parseopt_verbs() -> impl Iterator<Item = &'static str> {
     crate::gitcomp::builtins().iter().map(|b| b.name)
 }
+
+/// The `commands[]` entries git 2.55.0 flags `NO_PARSEOPT` (git.c:529-685): the
+/// builtins that parse their own argv and so have no `struct option` table.
+///
+/// `commands[]` is split by that one flag, which is how [`builtins`] is
+/// assembled without a second copy of the whole table: the flagged half is
+/// this list, the other half is exactly the `--list-cmds=parseopt` set
+/// ([`parseopt_verbs`]), and together they are `list_builtins(&list, 0, 0)`.
+const NO_PARSEOPT: &[&str] = &[
+    "check-ref-format",
+    "credential",
+    "diff",
+    "diff-files",
+    "diff-index",
+    "diff-pairs",
+    "diff-tree",
+    "fast-import",
+    "fetch-pack",
+    "get-tar-commit-id",
+    "index-pack",
+    "mailsplit",
+    "merge-index",
+    "merge-ours",
+    "merge-recursive",
+    "merge-recursive-ours",
+    "merge-recursive-theirs",
+    "merge-subtree",
+    "pack-redundant",
+    "patch-id",
+    "remote-ext",
+    "remote-fd",
+    "rev-list",
+    "rev-parse",
+    "unpack-file",
+    "unpack-objects",
+    "upload-archive",
+    "upload-archive--writer",
+    "var",
+];
 
 /// The `command-list.txt` attribute groups that have no heading in `git help -a`
 /// and so cannot be read back out of the tables this port prints.
@@ -160,38 +200,44 @@ const COMMON_CATEGORY_SECTIONS: &[(&str, &str)] = &[
     ("remote", "collaborate (see also: git help workflows)"),
 ];
 
-/// Every verb [`crate::dispatch::run`] serves, sorted — this port's
-/// `list_builtins(&list, 0, 0)`.
+/// `list_builtins(&list, 0, 0)` (git.c:702-715): the names in git's
+/// `commands[]` table, in its alphabetical order.
 ///
-/// git's `commands[]` holds only the C builtins; the scripted commands
-/// (`git-archimport`, `git-cvsimport`, `git-submodule`, …) are separate
-/// executables in its exec-path and reach the listing through the `main` scan
-/// instead. This binary serves all of them in-process, so they are builtins
-/// *here* and belong in this group — as do the `z*` verbs, which no other git
-/// has. Both differences are additive: every stock builtin is still listed.
+/// That table is a contract, not just an inventory. git's own suite reads this
+/// group as "the commands `run_builtin()` drives": `t0012-help.sh:254` requires
+/// every name listed to answer `-h` with exit 129 and a usage on stdout, and
+/// `t0450-txt-doc-vs-help.sh:11` diffs each one's `-h` synopsis against its
+/// manual. The scripted commands (`archimport` exits 1 on `-h`, `web--browse`
+/// 0, `credential-netrc` 2) and the `z*` verbs (`zstatus -h` exits 0) do not
+/// keep it, so although this binary serves them in-process they are not
+/// builtins in git's sense; they reach `main` instead, as stock's scripts do
+/// from its exec-path. Filtered through the dispatch table so a name this port
+/// stops serving leaves the listing with it.
 fn builtins() -> Vec<String> {
-    let mut out: Vec<String> = dispatch::PORCELAIN_VERBS
-        .iter()
-        .chain(dispatch::SUPERSET_VERBS.iter())
-        .map(|v| (*v).to_string())
+    let mut out: Vec<String> = parseopt_verbs()
+        .chain(NO_PARSEOPT.iter().copied())
+        .filter(|v| dispatch::is_verb(v))
+        .map(str::to_string)
         .collect();
     out.sort();
     out.dedup();
     out
 }
 
-/// `list_all_main_cmds()`: the builtins plus the `git-*` files in the exec-path,
-/// sorted and de-duplicated (`load_command_list()`'s `main_cmds`).
+/// `list_all_main_cmds()`: `load_command_list()`'s `main_cmds`, the builtins
+/// plus the `git-*` files in the exec-path, sorted and de-duplicated.
 ///
-/// The union with [`builtins`] is what keeps this consistent with that group
-/// *before* `git zshadow` has been run. Once the shadow is installed the
-/// exec-path scan finds a `git-z*` link for every superset verb and would list
-/// them anyway; without it, a completion built from `main,others` — which is how
-/// `git-completion.bash:1261` builds its command set — would offer the git verbs
-/// and silently omit every `z*` verb this binary dispatches.
+/// What stock finds in its exec-path — the scripted commands — this binary
+/// serves in-process, so they come from the dispatch table (already in
+/// [`help::load_command_list`]'s answer) rather than from files. The superset
+/// verbs are added for the same reason: once `git zdashed` has run the
+/// exec-path scan finds a `git-z*` link for each, but without it a completion
+/// built from `main,others` — `git-completion.bash:1261` — would silently omit
+/// every `z*` verb this binary dispatches.
 fn main_cmds() -> Vec<String> {
     let mut out: std::collections::BTreeSet<String> = help::load_command_list().0;
     out.extend(builtins());
+    out.extend(dispatch::SUPERSET_VERBS.iter().map(|v| (*v).to_string()));
     out.into_iter().collect()
 }
 

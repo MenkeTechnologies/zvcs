@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
+use gix::bstr::ByteSlice;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
@@ -1515,25 +1516,35 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     return Ok(fatal("--stdin given twice?"));
                 }
                 read_stdin = true;
-                let mut text = String::new();
-                std::io::stdin().read_to_string(&mut text)?;
+                // Bytes, not text: the lines are whatever `strbuf_getline()`
+                // hands back, and a stray non-UTF-8 byte is a bad revision, not
+                // a read error.
+                let mut text = Vec::new();
+                std::io::stdin().read_to_end(&mut text)?;
                 let mut lines: Vec<String> = Vec::new();
                 let mut kinds: Vec<Origin> = Vec::new();
                 let mut seen_end_of_options = false;
-                let mut rest = text.lines();
-                for line in rest.by_ref() {
-                    // `strbuf_getline()` strips a trailing CR of its own.
-                    let line = line.strip_suffix('\r').unwrap_or(line);
+                // `strbuf_getline()` strips the LF and then one CR of its own.
+                let mut rest = text.lines_with_terminator().map(|l| {
+                    let l = l.strip_suffix(b"\n").unwrap_or(l);
+                    l.strip_suffix(b"\r").unwrap_or(l)
+                });
+                while let Some(raw) = rest.next() {
                     // `if (!sb.len) break;` — an empty line ends the *whole* read,
                     // pathspecs included, rather than being skipped.
-                    if line.is_empty() {
+                    if raw.is_empty() {
                         break;
                     }
+                    // Past that length check the line is only ever read as the C
+                    // string `sb.buf`, so it ends at its first NUL: a line that
+                    // starts with one is `die("bad revision '%s'", "")`.
+                    let c_str = raw.split(|&b| b == 0).next().unwrap_or_default();
+                    let line: &str = &String::from_utf8_lossy(c_str);
                     if line == "--" {
                         // `seen_dashdash = 1; break;` then
                         // `read_pathspec_from_stdin()`: every remaining line is a
                         // pathspec, empty ones included.
-                        pathspecs.extend(rest.map(|p| p.as_bytes().to_vec()));
+                        pathspecs.extend(rest.map(|p| p.split(|&b| b == 0).next().unwrap_or_default().to_vec()));
                         break;
                     }
                     if !seen_end_of_options && line == "--end-of-options" {

@@ -120,7 +120,25 @@ pub fn merge_one_file(args: &[String]) -> Result<ExitCode> {
         eprintln!("Cannot chdir to $cdup, the toplevel of the working tree");
         return Ok(ExitCode::from(1));
     };
-    std::env::set_current_dir(&workdir)?;
+    if std::env::set_current_dir(&workdir).is_err() {
+        eprintln!("Cannot chdir to $cdup, the toplevel of the working tree");
+        return Ok(ExitCode::from(1));
+    }
+
+    // require_work_tree (git-sh-setup.sh:186-191) asks a fresh `git rev-parse
+    // --is-inside-work-tree` from the new cwd. A relative `GIT_WORK_TREE` (as
+    // `--work-tree=src` exports it, git.c:handle_options) is re-resolved against
+    // that cwd, so it can name a directory that does not exist and the check
+    // fails even though cd_to_toplevel succeeded. `die` is `die_with_status 1`
+    // and `$program_name` is `$0`, the script's path under the exec-path.
+    let inside = crate::setup::discover().is_ok_and(|r| crate::setup::is_inside_work_tree(&r));
+    if !inside {
+        eprintln!(
+            "fatal: {}/git-merge-one-file cannot be used without a working tree.",
+            crate::exec_path()
+        );
+        return Ok(ExitCode::from(1));
+    }
 
     if args.len() != 7 {
         // `echo`, not `echo >&2`: git really does put this on stdout.

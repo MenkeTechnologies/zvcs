@@ -67,6 +67,19 @@ fn die_no_such_path(arg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// `--max-depth`'s value through `OPTION_INTEGER` (`precision = sizeof(int)`),
+/// or the refusal: `error: option `max-depth' expects …` and exit 129, with no
+/// usage block.
+fn max_depth_value(v: &str) -> std::result::Result<i32, ExitCode> {
+    match crate::optint::integer(&crate::optint::long_opt("max-depth"), v) {
+        Ok(n) => Ok(n as i32),
+        Err(e) => {
+            eprintln!("error: {}", e.message());
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
 /// Parsed command line, mirroring `struct last_modified` plus the diff options
 /// `last_modified_init()` sets on `rev.diffopt`.
 struct Opts {
@@ -129,18 +142,22 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
             "-t" | "--show-trees" => show_trees = true,
             "--no-show-trees" => show_trees = false,
             "-z" => nul = true,
+            // `OPT_INTEGER_F` into a C `int` (builtin/last-modified.c:535):
+            // `OPTION_INTEGER`'s diagnostics (parse-options.c:260-288), which
+            // `parse_options` turns into a bare `error:` line and exit 129.
             "--max-depth" => {
                 i += 1;
                 let v = super::value_at(args, i, a)?;
-                max_depth = v
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid --max-depth value: {v}"))?;
+                match max_depth_value(v) {
+                    Ok(n) => max_depth = n,
+                    Err(code) => return Ok(code),
+                }
             }
             _ if a.starts_with("--max-depth=") => {
-                let v = &a["--max-depth=".len()..];
-                max_depth = v
-                    .parse()
-                    .map_err(|_| anyhow::anyhow!("invalid --max-depth value: {v}"))?;
+                match max_depth_value(&a["--max-depth=".len()..]) {
+                    Ok(n) => max_depth = n,
+                    Err(code) => return Ok(code),
+                }
             }
             _ if a.len() > 1 && a.starts_with('-') => {
                 if unknown.is_none() {

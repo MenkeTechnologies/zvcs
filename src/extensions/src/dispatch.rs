@@ -385,7 +385,6 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "last-modified",
     "log",
     "ls-files",
-    "ls-tree",
     "merge",
     "merge-base",
     // `repo_config(repo, git_default_config, NULL)` then `prepare_repo_settings()`
@@ -515,6 +514,10 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     // refuses to make.
     "init-db",
     "interpret-trailers",
+    // `repo_config(the_repository, git_default_config, NULL)` ahead of
+    // `parse_options()` (builtin/ls-tree.c:381); the settings block is read
+    // lazily, after the tree-ish is named, by `porcelain::ls_tree` itself.
+    "ls-tree",
     "mailinfo",
     // `cmd_merge_recursive`'s `init_merge_options()`; see
     // `crate::cmd_config::validate_merge_recursive`.

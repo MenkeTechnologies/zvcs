@@ -188,6 +188,29 @@ fn settings_gate_spares_the_verbs_git_spares() {
     assert!(out.status.success());
 }
 
+/// `ls-tree` reads the settings block only once the tree-ish has been named
+/// (builtin/ls-tree.c:381-410): a usage error and a name that matches nothing
+/// both answer first, and a name that resolves dies on the setting.
+#[test]
+fn ls_tree_reads_the_settings_block_after_naming_the_tree() {
+    let (repo, home) = fixture("lstree");
+    let limit = ["-c", "core.packedGitLimit=bogus", "ls-tree"];
+    let with = |rest: &[&str]| run(&repo, &home, &[&limit[..], rest].concat());
+
+    let out = with(&["--format=%(path)", "--name-only", "HEAD"]);
+    assert_eq!(code(&out), 129);
+    assert!(stderr(&out).starts_with("fatal: --format can't be combined with other format-altering options\n"));
+
+    let out = with(&["nosuch"]);
+    assert_eq!((stderr(&out).as_str(), code(&out)), ("fatal: Not a valid object name nosuch\n", FATAL));
+
+    let out = with(&["HEAD", ""]);
+    assert_eq!(
+        (stderr(&out).as_str(), code(&out)),
+        ("fatal: bad numeric config value 'bogus' for 'core.packedgitlimit': invalid unit\n", FATAL)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // feature.manyFiles / feature.experimental
 // ---------------------------------------------------------------------------

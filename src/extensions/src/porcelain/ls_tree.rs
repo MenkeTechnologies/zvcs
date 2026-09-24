@@ -360,6 +360,17 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
     let Some(id) = crate::objname::resolve(&repo, spec) else {
         return Ok(fatal(&format!("Not a valid object name {spec}")));
     };
+    // The settings block (`prepare_repo_settings()`) is not read up front: it
+    // is built the first time the name lookup consults it — a full-length hex
+    // name asks `repo_settings_get_warn_ambiguous_refs()`, anything that walks
+    // to an object opens the odb. Measured on 2.55.0 with
+    // `-c core.packedGitLimit=bogus`: every usage error, `--format` with a
+    // cmdmode included, still wins, and so does `Not a valid object name` for
+    // a ref name that matches nothing; a name that resolves dies on the setting
+    // ahead of the pathspec checks below.
+    if let Err(msg) = crate::repo_settings::RepoSettings::load(&repo) {
+        return Ok(fatal(&msg));
+    }
 
     // `parse_pathspec()` runs *after* the tree-ish has been named and *before*
     // the tree is parsed (builtin/ls-tree.c:410-423, :427-429), so a bad name

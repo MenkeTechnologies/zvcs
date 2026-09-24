@@ -388,6 +388,10 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "ls-tree",
     "merge",
     "merge-base",
+    // `repo_config(repo, git_default_config, NULL)` then `prepare_repo_settings()`
+    // (builtin/merge-ours.c:27-28) — config first; see
+    // [`CONFIG_BEFORE_SETTINGS_VERBS`].
+    "merge-ours",
     // The script verbs below are here because of their first git call rather
     // than their own code: sourcing `git-sh-setup` without `NONGIT_OK` runs
     // `git_dir_init`, whose `GIT_DIR=$(git rev-parse --git-dir) || exit`
@@ -473,6 +477,16 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
 /// valueless `[core]` / `abbrev` in a system config file made `git prune-packed`
 /// die at 128 where git prunes and exits 0 — the port refusing work git performs.
 const SETTINGS_ONLY_VERBS: &[&str] = &["mktree", "prune", "prune-packed"];
+
+/// The entries of [`REPO_SETTINGS_VERBS`] whose builtin runs `git_config()` *before*
+/// `prepare_repo_settings()`, so a value the config callback refuses is reported
+/// ahead of one only the settings block reads. Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c index.version=bogus -c core.createObject=bogus merge-ours
+/// fatal: invalid mode for object creation: bogus
+/// ```
+const CONFIG_BEFORE_SETTINGS_VERBS: &[&str] = &["merge-ours"];
 
 const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "branch",
@@ -701,6 +715,8 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "last-modified",
     "ls-files",
     "merge",
+    // `show_usage_if_asked()` is `cmd_merge_ours`'s first statement.
+    "merge-ours",
     // `git-sh-setup` answers a first-position `-h` before `git_dir_init` runs
     // the `rev-parse` that reads the configuration.
     "merge-octopus",
@@ -1417,11 +1433,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             // `status` reports `core.packedgitlimit`. The settings block is read by
             // targeted `repo_config_get_*` lookups that skip the default callback,
             // and `read_index()` asks for it before the command gets as far as
-            // calling `git_config()`.
-            if in_repo_settings {
-                if let Err(msg) = crate::repo_settings::RepoSettings::load(&repo) {
-                    return Err(crate::fatal::die(msg));
-                }
+            // calling `git_config()`. A verb that calls `git_config()` itself
+            // before `prepare_repo_settings()` takes the opposite order — see
+            // [`CONFIG_BEFORE_SETTINGS_VERBS`].
+            let settings_first = !CONFIG_BEFORE_SETTINGS_VERBS.contains(&sub);
+            let load_settings =
+                || crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die);
+            if in_repo_settings && settings_first {
+                load_settings()?;
             }
             if in_default_config {
                 // `porcelain::diff` reads `diff.submodule` for itself and prints
@@ -1503,6 +1522,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                         return Err(rejection.into_error());
                     }
                 }
+            }
+            if in_repo_settings && !settings_first {
+                load_settings()?;
             }
             // `check_updates()` reads the parallel-checkout pair after the config
             // has been parsed, so it reports last of the three.

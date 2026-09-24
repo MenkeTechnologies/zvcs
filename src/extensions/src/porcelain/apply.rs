@@ -4433,7 +4433,10 @@ fn build_fake_ancestor(patches: &[Patch], path: &str, quiet: bool) -> Result<boo
         );
     }
     result.sort_entries();
-    result.write(gix::index::write::Options::default())?;
+    // `INDEX_STATE_INIT` leaves the version at zero, so `do_write_index()` picks it
+    // (`get_index_format_default()`), and `record_eoie()` governs `EOIE` as for any
+    // other index write (read-cache.c:2957).
+    result.write(crate::config::index_write_options_fresh(&repo))?;
     Ok(true)
 }
 

@@ -1021,6 +1021,26 @@ pub fn read_todo(repo: &gix::Repository, git_dir: &Path) -> Result<Vec<TodoItem>
     Ok(items)
 }
 
+/// The tail of `read_populate_todo()` (sequencer.c:3031-3047) for a
+/// cherry-pick/revert sequence: the `error()` it returns when the list is empty
+/// or holds an instruction the resuming command does not own, or `None`.
+///
+/// `sequencer_continue()` runs this before `continue_single_pick()`, so
+/// `git revert --continue` over a stopped cherry-pick sequence refuses here
+/// rather than reporting the stopped pick's unmerged paths.
+pub fn todo_refusal(todo: &[TodoItem], action: Action) -> Option<&'static str> {
+    if todo.is_empty() {
+        return Some("no commits parsed.");
+    }
+    if todo.iter().any(|item| item.action != action) {
+        return Some(match action {
+            Action::Pick => "cannot cherry-pick during a revert.",
+            Action::Revert => "cannot revert during a cherry-pick.",
+        });
+    }
+    None
+}
+
 /// `update_abort_safety_file()`: record the `HEAD` `--abort` will later verify
 /// against, or an empty file when there is no `HEAD` to read.
 ///

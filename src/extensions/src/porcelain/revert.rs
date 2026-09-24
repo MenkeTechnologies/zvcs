@@ -829,6 +829,11 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
     }
 
     let todo = crate::sequencer::read_todo(repo, git_dir)?;
+    if let Some(msg) = crate::sequencer::todo_refusal(&todo, crate::sequencer::Action::Revert) {
+        eprintln!("error: {msg}");
+        eprintln!("fatal: revert failed");
+        return Ok(ExitCode::from(128));
+    }
     if git_dir.join("REVERT_HEAD").exists() || git_dir.join("CHERRY_PICK_HEAD").exists() {
         if let Err(code) = continue_single_pick(repo, git_dir)? {
             return Ok(code);

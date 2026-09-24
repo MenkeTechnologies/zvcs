@@ -1882,6 +1882,10 @@ fn sequencer_continue(repo: &gix::Repository) -> Result<ExitCode> {
     }
 
     let todo = crate::sequencer::read_todo(repo, &git_dir)?;
+    if let Some(msg) = crate::sequencer::todo_refusal(&todo, crate::sequencer::Action::Pick) {
+        eprintln!("error: {msg}");
+        return Ok(sequencer_failed_tail());
+    }
     if git_dir.join("CHERRY_PICK_HEAD").exists() || git_dir.join("REVERT_HEAD").exists() {
         if let Err(code) = continue_single_pick(repo, &git_dir)? {
             return Ok(code);

@@ -482,6 +482,9 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "count-objects",
     "credential",
     "difftool",
+    // `repo_config(repo, fmt_merge_msg_config, …)` ahead of `parse_options()`
+    // (builtin/fmt-merge-msg.c:56); see `crate::cmd_config::validate_fmt_merge_msg`.
+    "fmt-merge-msg",
     "for-each-ref",
     "hash-object",
     "hook",
@@ -596,6 +599,9 @@ enum ConfigCallback {
     /// `git_branch_config` (builtin/branch.c:84) — its own keys, then
     /// `git_color_config`, then the default.
     Branch,
+    /// `fmt_merge_msg_config` (fmt-merge-msg.c:26) — its own `merge.*` keys,
+    /// then the default.
+    FmtMergeMsg,
 }
 
 /// Which callback `sub` installs.
@@ -657,6 +663,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         }
         "merge" => ConfigCallback::Merge,
         "branch" => ConfigCallback::Branch,
+        "fmt-merge-msg" => ConfigCallback::FmtMergeMsg,
         "add" | "stage" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
         _ => ConfigCallback::Default,
     }
@@ -1482,6 +1489,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     }
                     ConfigCallback::Merge => crate::cmd_config::validate_merge(&repo),
                     ConfigCallback::Branch => crate::cmd_config::validate_branch(&repo),
+                    ConfigCallback::FmtMergeMsg => {
+                        crate::cmd_config::validate_fmt_merge_msg(&repo)
+                    }
                 };
                 if let Err(rejection) = outcome {
                     return Err(rejection.into_error());

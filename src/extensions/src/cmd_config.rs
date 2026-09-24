@@ -876,6 +876,26 @@ fn git_merge_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Reje
     crate::diff_config::git_diff_ui_config(v, out)
 }
 
+/// `repo_config(repo, fmt_merge_msg_config, &merge_log_config)` —
+/// `cmd_fmt_merge_msg` (builtin/fmt-merge-msg.c:56), ahead of `parse_options()`,
+/// so even `-h` and a stray argument are refused by a bad value. Measured
+/// against git 2.55.0:
+///
+/// ```text
+/// $ git -c merge.log=bogus fmt-merge-msg -h
+/// fatal: bad numeric config value 'bogus' for 'merge.log': invalid unit
+/// $ git -c merge.log=-1 fmt-merge-msg
+/// error: merge.log: negative length -1
+/// fatal: unable to parse 'merge.log' from command-line config
+/// ```
+pub fn validate_fmt_merge_msg(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        fmt_merge_msg_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
 /// `fmt_merge_msg_config()` (fmt-merge-msg.c:26-52).
 ///
 /// ```c

@@ -2074,19 +2074,7 @@ fn add_index_entry(
     // `REUC` record stock leaves behind an octopus merge was never written.
     // Every entry this function adds is a stage-0 one (`want_flags` carries no
     // stage bits), so that is the stage the two scans are restricted to.
-    let conflicting: Vec<BString> = {
-        let backing = ctx.index.path_backing();
-        let mut dir_prefix = owned.to_vec();
-        dir_prefix.push(b'/');
-        ctx.index
-            .entries()
-            .iter()
-            .filter(|e| e.stage() == Stage::Unconflicted)
-            .map(|e| e.path_in(backing))
-            .filter(|p| p.starts_with(&dir_prefix) || is_ancestor_entry(p, owned.as_bstr()))
-            .map(|p| p.to_owned())
-            .collect()
-    };
+    let conflicting = file_directory_conflicts(&ctx.index, owned.as_bstr(), Stage::Unconflicted);
     if !conflicting.is_empty() {
         if !ctx.allow_replace {
             eprintln!("error: '{path}' appears as both a file and as a directory");
@@ -2107,6 +2095,30 @@ fn add_index_entry(
     ctx.dirty = true;
     ctx.invalidate(path);
     Ok(true)
+}
+
+/// `check_file_directory_conflict()` (read-cache.c:1211) for an entry `path` at
+/// `stage`: the entries of that stage lying below `path` (`has_file_name()`,
+/// read-cache.c:1055) and those naming one of its leading directories
+/// (`has_dir_name()`, read-cache.c:1111). `add_index_entry()` with
+/// `ADD_CACHE_OK_TO_REPLACE` removes every one of them; without it any one is
+/// the "appears as both a file and as a directory" refusal.
+pub(crate) fn file_directory_conflicts(
+    index: &gix::index::File,
+    path: &BStr,
+    stage: Stage,
+) -> Vec<BString> {
+    let backing = index.path_backing();
+    let mut dir_prefix = path.to_vec();
+    dir_prefix.push(b'/');
+    index
+        .entries()
+        .iter()
+        .filter(|e| e.stage() == stage)
+        .map(|e| e.path_in(backing))
+        .filter(|p| p.starts_with(&dir_prefix) || is_ancestor_entry(p, path))
+        .map(|p| p.to_owned())
+        .collect()
 }
 
 /// Whether the tracked file `candidate` is a strict directory prefix of `path`

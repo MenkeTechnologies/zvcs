@@ -1102,8 +1102,20 @@ fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)]) {
     index.remove_entries(|_, path, _| doomed.iter().any(|d| *d == AsRef::<[u8]>::as_ref(path)));
 
     // Re-append each entry at its new path with the original blob and mode.
+    // `rename_index_entry_at()` adds it with `ADD_CACHE_OK_TO_REPLACE`
+    // (read-cache.c:182-185), so an entry in its way as a file or directory is
+    // dropped first: `git mv README.md lnk/` through a tracked symlink `lnk` to a
+    // directory removes the `lnk` entry. Renames apply one at a time, so an
+    // earlier one's result can be in the way of a later one.
     for (stat, id, flags, mode, new) in pushes {
         let new_bytes = BString::from(new);
+        let in_way =
+            super::update_index::file_directory_conflicts(index, new_bytes.as_bstr(), Stage::Unconflicted);
+        if !in_way.is_empty() {
+            index.remove_entries(|_, path, e| {
+                e.stage() == Stage::Unconflicted && in_way.iter().any(|c| c.as_bstr() == path)
+            });
+        }
         index.dangerously_push_entry(stat, id, flags, mode, BStr::new(&new_bytes));
     }
 }

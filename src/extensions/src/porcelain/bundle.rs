@@ -112,8 +112,11 @@
 //!     operand ends option parsing: `git bundle create <file> -q` reports
 //!     `error: unrecognized argument: -q` and writes nothing, exactly as stock
 //!     does — except for the exit code, because git 2.55.0 prints that line and
-//!     then aborts (a shell sees 134). This returns the 255 an `error()` return
-//!     normally becomes rather than reproducing a `SIGABRT`.
+//!     then aborts (a shell sees 134): the `goto out` at bundle.c:515 reaches
+//!     `object_array_clear(&revs_copy.pending)` (:600) before `revs_copy` is
+//!     initialised (:551). This returns the 1 the path means —
+//!     `ret = !!create_bundle(...)` (builtin/bundle.c:104) over `error()`'s -1 —
+//!     rather than reproducing undefined behaviour.
 //!
 //! One deliberate gap, so this doc claims no more than the code does: a header
 //! that parses as neither a capability nor a ref line is surfaced as a plain
@@ -1251,15 +1254,16 @@ fn resolve_revisions(
         // ended option parsing, which is why `git bundle create <file> -q` is an
         // error while `git bundle create -q <file>` is not.
         //
-        // (git 2.55.0 aborts on this path — one `error:` line, then SIGABRT, so a
-        // shell sees 134. This returns the 255 an `error()` return normally
-        // becomes, and writes no bundle, which is the part that matters.)
+        // (git 2.55.0 aborts on this path — one `error:` line, then SIGABRT from
+        // freeing the uninitialised `revs_copy` at bundle.c:600, so a shell sees
+        // 134. This returns the 1 `!!create_bundle()` makes of the -1
+        // (builtin/bundle.c:104), and writes no bundle.)
         if matches!(a, "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied")
             || a == "--version"
             || a.starts_with("--version=")
         {
             eprintln!("error: unrecognized argument: {a}");
-            return Ok(Err(ExitCode::from(255)));
+            return Ok(Err(ExitCode::from(1)));
         }
         // `handle_revision_arg_1()`'s very first test, ahead of everything
         // below:

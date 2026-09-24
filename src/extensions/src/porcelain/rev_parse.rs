@@ -60,8 +60,8 @@
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--sq`, `--not`, `--bisect`, `--default <rev>`, `--prefix <dir>`,
-//! `--end-of-options`, `--all-objects` and `--exclude-hidden=`. Options git does
+//! `--not`, `--bisect`, `--default <rev>`, `--prefix <dir>`,
+//! `--all-objects` and `--exclude-hidden=`. Options git does
 //! *not* recognize are echoed — through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
 //! `--no-flags` narrow — which is what git itself does with them.
@@ -131,6 +131,9 @@ struct Opts {
     /// (`builtin/rev-parse.c:721`). It is plain scan state, so it governs only the
     /// path-printing options that come *after* it on the command line.
     format: Format,
+    /// `output_sq` (`builtin/rev-parse.c:55`), set by `--sq`: every value
+    /// `show()` prints is shell-quoted onto one line instead of one per line.
+    sq: bool,
 }
 
 /// `#define DO_REVS 1` … `#define DO_NONFLAGS 8` (`builtin/rev-parse.c:38-41`).
@@ -207,6 +210,7 @@ impl Default for Opts {
             abbrev_ref_strict: None,
             filter: DO_REVS | DO_NOREV | DO_FLAGS | DO_NONFLAGS,
             format: Format::Default,
+            sq: false,
         }
     }
 }
@@ -217,7 +221,6 @@ impl Default for Opts {
 const UNIMPLEMENTED_EXACT: &[&str] = &[
     "-h",
     "--help",
-    "--sq",
     "--not",
     "--default",
     "--prefix",
@@ -417,7 +420,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // are being echoed) and move on. No existence check, no flag parsing.
         if dashdash {
             if o.shows_files() {
-                emit(&mut out, arg.as_bytes())?;
+                show(&mut out, &o, arg.as_bytes())?;
             }
             continue;
         }
@@ -434,7 +437,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // `--revs-only` swallow the separator while `--no-flags` keeps it.
         if !as_is && arg == "--" {
             if o.filter & (DO_FLAGS | DO_REVS) != 0 && o.shows_files() {
-                emit(&mut out, arg.as_bytes())?;
+                show(&mut out, &o, arg.as_bytes())?;
             }
             dashdash = true;
             continue;
@@ -455,7 +458,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // revisions and paths.
         if !as_is && !seen_end_of_options && arg == "--end-of-options" {
             if o.filter & (DO_FLAGS | DO_REVS) != 0 && o.shows_files() {
-                emit(&mut out, arg.as_bytes())?;
+                show(&mut out, &o, arg.as_bytes())?;
             }
             seen_end_of_options = true;
             continue;
@@ -519,7 +522,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 }
                 Opt::Unknown => {
                     if o.shows_flag(arg) {
-                        emit(&mut out, arg.as_bytes())?;
+                        show(&mut out, &o, arg.as_bytes())?;
                     }
                 }
                 Opt::Fatal => {
@@ -537,7 +540,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             if !o.shows_files() {
                 continue;
             }
-            emit(&mut out, arg.as_bytes())?;
+            show(&mut out, &o, arg.as_bytes())?;
             if !crate::setup::looks_like_pathspec(arg) && !is_worktree_path(&repo, arg) {
                 out.flush()?;
                 eprintln!(
@@ -879,7 +882,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 if !o.shows_files() {
                     continue;
                 }
-                emit(&mut out, arg.as_bytes())?;
+                show(&mut out, &o, arg.as_bytes())?;
                 // `verify_filename()` is
                 // `if (looks_like_pathspec(arg) || check_filename(prefix, arg)) return;`
                 // (setup.c:289-290): a wildcard, or long-form `:(…)` magic, says
@@ -1442,6 +1445,8 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "--flags" => o.filter &= !DO_NONFLAGS,
         "--no-flags" => o.filter &= !DO_FLAGS,
         "-q" | "--quiet" => o.quiet = true,
+        // `builtin/rev-parse.c:901-904`.
+        "--sq" => o.sq = true,
         "--short" => {
             // `--short` implies `--verify` in stock git; that is where the
             // otherwise surprising `fatal: Needed a single revision` comes from
@@ -2121,15 +2126,13 @@ fn show_rev(
         Some(render_id(repo, o, id)?)
     };
 
+    // `show_with_type()` (`builtin/rev-parse.c:135-140`) puts the `^` out ahead
+    // of `show()`, so under `--sq` it lands outside the quotes: `^'<id>' `.
     if let Some(p) = payload {
         if reversed {
-            let mut buf = Vec::with_capacity(p.len() + 1);
-            buf.push(b'^');
-            buf.extend_from_slice(&p);
-            emit(out, &buf)?;
-        } else {
-            emit(out, &p)?;
+            out.write_all(b"^")?;
         }
+        show(out, o, &p)?;
     }
     Ok(())
 }
@@ -2171,11 +2174,10 @@ fn truncate_hex(id: &ObjectId, len: usize) -> Vec<u8> {
     hex
 }
 
-/// Emit `^<id>` for the excluded side of a range.
-fn emit_exclude(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+/// Emit `^<id>` for the excluded side of a range (`show_with_type(REVERSED, …)`).
+fn emit_exclude(out: &mut impl Write, o: &Opts, bytes: &[u8]) -> std::io::Result<()> {
     out.write_all(b"^")?;
-    out.write_all(bytes)?;
-    out.write_all(b"\n")
+    show(out, o, bytes)
 }
 
 /// Expand a range revspec at its position, matching stock git's line order.
@@ -2208,7 +2210,7 @@ fn emit_range(
                 .merge_bases_many(theirs, &[ours])
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             for base in bases {
-                emit_exclude(out, &render_id(repo, o, &base.detach())?)?;
+                emit_exclude(out, o, &render_id(repo, o, &base.detach())?)?;
             }
         }
     }
@@ -2369,6 +2371,25 @@ fn ref_target(repo: &gix::Repository, reference: &gix::Reference<'_>) -> Option<
         }
     }
     None
+}
+
+/// `show()` (`builtin/rev-parse.c:117-133`), the printer for revisions, echoed
+/// flags and paths. Under `--sq` the value is single-quoted with each `'` spelled
+/// `'\''`, followed by a space and no newline — the whole run is one shell line
+/// that never gets a terminating newline. The query options (`--git-dir`,
+/// `--show-toplevel`, …) `puts()` directly and go through [`emit`] instead.
+fn show(out: &mut impl Write, o: &Opts, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    if !o.sq {
+        return emit(out, bytes);
+    }
+    out.write_all(b"'")?;
+    for &ch in bytes.as_ref() {
+        if ch == b'\'' {
+            out.write_all(b"'\\'")?;
+        }
+        out.write_all(&[ch])?;
+    }
+    out.write_all(b"' ")
 }
 
 /// Ref names and paths are bytes, not necessarily UTF-8, so output goes out raw.
@@ -2610,7 +2631,7 @@ fn show_datestring(out: &mut impl Write, o: &Opts, flag: &str, datestr: &str) ->
         return Ok(());
     }
     let when = crate::date::approxidate(datestr);
-    emit(out, format!("{flag}{when}").as_bytes())?;
+    show(out, o, format!("{flag}{when}").as_bytes())?;
     Ok(())
 }
 

@@ -1371,7 +1371,6 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 /// object is local and the two passes are indistinguishable.
 fn backfilled_tags(repo: &gix::Repository, map: &gix::remote::fetch::RefMap) -> TagPasses {
     use gix::objs::Exists;
-    use gix::protocol::fetch::refmap::Source;
 
     let mut passes = TagPasses::default();
     let Some(tag_spec) = Tags::Included.to_refspec() else {
@@ -1393,16 +1392,34 @@ fn backfilled_tags(repo: &gix::Repository, map: &gix::remote::fetch::RefMap) -> 
         id.is_some_and(|id| fetch_oids.contains(id) || repo.objects.exists(id))
     };
 
-    for m in map.mappings.iter().filter(|m| is_implicit_tag(m)) {
+    // The walk is over the advertisement, as git's is (`for (ref = refs; …)`,
+    // :353), not over the tag-following mappings: a tag the ref map lost to
+    // `ref_remove_duplicates()` — a command-line refspec that already maps it
+    // onto itself — was still proposed, and `--dry-run` proposes it again.
+    for r in &map.remote_refs {
         // `r.unpack()` yields `(name, target, peeled)`; `peeled` is `Some` only
         // for an advertisement line that carried a `^{}` companion, which is
         // exactly git's "the peeled ref always follows the matching base ref".
-        let peeled = match &m.remote {
-            Source::Ref(r) => r.unpack().2,
-            Source::ObjectId(_) => None,
-        };
-        let Some(name) = m.remote.as_name() else { continue };
-        match in_reach(m.remote.as_id()) || in_reach(peeled) {
+        let (name, target, peeled) = r.unpack();
+        if !name.starts_with(b"refs/tags/") {
+            continue;
+        }
+        // ```c
+        // /* skip duplicates and refs that we already have */
+        // if (refname_hash_exists(&remote_refs, ref->name) ||
+        //     refname_hash_exists(&existing_refs, ref->name))
+        //         continue;
+        // ```
+        //
+        // (builtin/fetch.c:388-391.) A tag this repository already has is
+        // proposed by neither pass, whatever its value.
+        if passes.first.contains(name)
+            || passes.deferred.contains(name)
+            || repo.try_find_reference(name).ok().flatten().is_some()
+        {
+            continue;
+        }
+        match in_reach(target) || in_reach(peeled) {
             true => passes.first.insert(name.to_owned()),
             false => passes.deferred.insert(name.to_owned()),
         };
@@ -3662,9 +3679,20 @@ fn fetch_one(
     // second `find_non_local_tags()` call relies on (:350-353) has nothing to
     // filter and re-proposes every tag the first pass already listed. git really
     // does print those rows twice.
+    //
+    // What it re-proposes is a tag-following entry, `refs/tags/<t>` onto itself
+    // (:405-409). A command-line refspec's row for the same remote tag under
+    // another name — `refs/tags/*:refs/tags/dryt/*` — is not repeated; one that
+    // maps the tag onto itself is the row `ref_remove_duplicates()` kept in the
+    // tag-following entry's place, so it is.
     if opts.dry_run {
-        let again: Vec<_> =
-            first_pass.iter().filter(|(_, m, _, _)| named(m, &tag_passes.first)).copied().collect();
+        let again: Vec<_> = first_pass
+            .iter()
+            .filter(|(_, m, _, _)| {
+                named(m, &tag_passes.first) && m.local.as_ref().map(|l| l.as_bstr()) == m.remote.as_name()
+            })
+            .copied()
+            .collect();
         second_pass.extend(again);
     }
     // Both calls build their list with `string_list_insert()` (:395), which keeps
@@ -3688,8 +3716,10 @@ fn fetch_one(
         // because their row would duplicate the one the command-line refspec already contributed.
         let opportunistic = ref_map.is_opportunistic(mapping);
         // git marks every entry a *command-line* refspec produced `FETCH_HEAD_MERGE`. Refs that only
-        // automatic tag following pulled in are added afterwards and keep the default `not-for-merge`.
-        let from_command_line = explicit_refspecs
+        // automatic tag following pulled in are added afterwards and keep the default `not-for-merge`
+        // — which includes a `--dry-run` second-pass row that re-renders a command-line mapping.
+        let from_command_line = !backfill
+            && explicit_refspecs
             && matches!(
                 mapping.spec_index,
                 gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)

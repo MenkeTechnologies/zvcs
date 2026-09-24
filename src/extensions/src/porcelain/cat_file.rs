@@ -998,6 +998,49 @@ impl<'repo> Textconv<'repo> {
     }
 }
 
+impl Textconv<'_> {
+    /// [`diff_attr_binary`] over this lookup's attribute stack.
+    pub(crate) fn binary_attr(&mut self, path: &BStr) -> Result<Option<bool>> {
+        diff_attr_binary(self.repo, &mut self.stack, &mut self.outcome, path)
+    }
+}
+
+/// Whether the path's diff driver settles the binary question, following
+/// `userdiff_find_by_path()` (`userdiff.c`) as `diff_filespec_is_binary()` and
+/// `grep_source_is_binary()` consult it: a set `diff` attribute selects
+/// `driver_true` (`binary = 0`), an unset one (`-diff`) selects `driver_false`
+/// (`binary = 1`), and a value names a driver whose `diff.<name>.binary` setting
+/// decides. `None` is git's `binary = -1`, the "no opinion" that falls through to
+/// `buffer_is_binary()` on the contents.
+pub(crate) fn diff_attr_binary(
+    repo: &gix::Repository,
+    stack: &mut gix::AttributeStack<'_>,
+    outcome: &mut gix::attrs::search::Outcome,
+    path: &BStr,
+) -> Result<Option<bool>> {
+    let mode = Some(gix::index::entry::Mode::FILE);
+    let _ = stack.at_entry(path, mode)?;
+    outcome.initialize_with_selection(stack.attributes_collection(), ["diff"]);
+    let platform = stack.at_entry(path, mode)?;
+    platform.matching_attributes(outcome);
+    let mut named: Option<String> = None;
+    for m in outcome.iter_selected() {
+        match m.assignment.state {
+            gix::attrs::StateRef::Set => return Ok(Some(false)),
+            gix::attrs::StateRef::Unset => return Ok(Some(true)),
+            gix::attrs::StateRef::Value(v) => {
+                named = Some(String::from_utf8_lossy(v.as_bstr().as_bytes()).into_owned());
+                break;
+            }
+            gix::attrs::StateRef::Unspecified => {}
+        }
+    }
+    let Some(drv) = named else {
+        return Ok(None);
+    };
+    Ok(repo.config_snapshot().boolean(format!("diff.{drv}.binary").as_str()))
+}
+
 /// `diff.<name>.<key>` from the merged configuration, last definition winning.
 /// Subsection names are compared byte for byte, as git compares them.
 pub(crate) fn diff_driver_config(

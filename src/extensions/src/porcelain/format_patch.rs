@@ -1404,8 +1404,9 @@ fn emit_diff_of_diff(
             &RenameOpts::from_opts(opts),
             &mut dissimilarity,
         )?;
+        let drivers = std::cell::RefCell::new(super::cat_file::Textconv::new(repo)?);
         for change in &changes {
-            emit_change(repo, &mut body, change, abbrev, opts, &dissimilarity)?;
+            emit_change(repo, &drivers, &mut body, change, abbrev, opts, &dissimilarity)?;
         }
         write_indented(out, &body, indent);
     }
@@ -6301,6 +6302,7 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
 
     let mut result = vec![0u8; kind.len_in_bytes()];
     let mut ctx = gix::hash::hasher(kind);
+    let mut attrs = super::cat_file::Textconv::new(repo)?;
     for change in &changes {
         let path = change_path(change);
         let one = remove_space(path);
@@ -6334,7 +6336,10 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
             Some((id, is_sub)) => content_of(repo, id, is_sub)?,
             None => Vec::new(),
         };
-        if is_binary(&old_content) || is_binary(&new_content) {
+        // `diff_filespec_is_binary()` on each side: the path's diff driver first
+        // (`-diff` is binary whatever the bytes), the NUL sniff only without one.
+        let attr_binary = attrs.binary_attr(path.as_bstr())?;
+        if attr_binary.unwrap_or_else(|| is_binary(&old_content) || is_binary(&new_content)) {
             // A binary pair contributes its two object names instead of a diff.
             let hex = |o: Option<(ObjectId, bool)>| {
                 o.map_or_else(|| ObjectId::null(kind), |(id, _)| id)
@@ -6745,14 +6750,11 @@ fn render_changes(
         true => super::diff::external_diff_program(repo)?,
         false => None,
     };
-    // One gitattributes stack for the whole commit, shared by the driver lookup and
-    // by `prepare_temp_file()`'s worktree-form materialisation, as git's single
-    // `userdiff_find_by_path()` static is.
-    let ext_drivers = match opts.allow_external {
-        true => Some(std::cell::RefCell::new(super::cat_file::Textconv::new(repo)?)),
-        false => None,
-    };
-    let ext = ext_drivers.as_ref().map(|d| super::diff::ext_context(d, ext_env.clone()));
+    // One gitattributes stack for the whole commit, shared by the binary test, the
+    // driver lookup and `prepare_temp_file()`'s worktree-form materialisation, as
+    // git's single `userdiff_find_by_path()` static is.
+    let drivers = std::cell::RefCell::new(super::cat_file::Textconv::new(repo)?);
+    let ext = opts.allow_external.then(|| super::diff::ext_context(&drivers, ext_env.clone()));
     // Carry `o->diff_path_counter` in from the commits already rendered, and hand it
     // back below, so one `format-patch` run numbers its driver invocations the way
     // one `diff_options` does.
@@ -6767,7 +6769,7 @@ fn render_changes(
     };
     for change in changes {
         let mut one: Vec<u8> = Vec::new();
-        let (stat, paint) = emit_change(repo, &mut one, change, abbrev, opts, dissimilarity)?;
+        let (stat, paint) = emit_change(repo, &drivers, &mut one, change, abbrev, opts, dissimilarity)?;
         if from_contents && stat.added == 0 && stat.deleted == 0 && is_plain_edit(change) {
             continue;
         }
@@ -8167,6 +8169,7 @@ fn similarity_percent(diff: Option<&gix::diff::blob::DiffLineStats>) -> u32 {
 /// Render one file-level change as a `diff --git` block, returning its stat row.
 fn emit_change(
     repo: &gix::Repository,
+    attrs: &std::cell::RefCell<super::cat_file::Textconv<'_>>,
     out: &mut Vec<u8>,
     change: &ChangeDetached,
     abbrev: Abbrev,
@@ -8189,6 +8192,13 @@ fn emit_change(
     // full: the payload can only be applied against the exact pre-image, so the `index`
     // line has to identify it unambiguously.
     let hexsz = repo.object_hash().len_in_hex();
+    //
+    // `-a` leaves the diffstat alone — `builtin_diffstat()` asks
+    // `diff_filespec_is_binary()` with no `flags.text` guard (diff.c:4213-4215) — but
+    // it both keeps `flags.binary` off (builtin/log.c:2243-2244) and lets
+    // `builtin_diff()` past its `!o->flags.text` test (diff.c:3964), so the body and
+    // the `index` line treat the pair as text.
+    let body_binary = |binary: Option<(u64, u64)>| binary.is_some() && !opts.text;
     let index_abbrev = |binary: bool| match binary && !opts.no_binary {
         true => Abbrev::Fixed(hexsz),
         false => abbrev,
@@ -8209,11 +8219,11 @@ fn emit_change(
             writeln!(out, "new file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            binary = pair_is_binary(is_sub, &content, opts).then(|| (0, content.len() as u64));
-            let short = short_oid(repo, *id, index_abbrev(binary.is_some()), is_sub)?;
+            binary = pair_is_binary(attrs, path, is_sub, &content)?.then(|| (0, content.len() as u64));
+            let short = short_oid(repo, *id, index_abbrev(body_binary(binary)), is_sub)?;
             writeln!(out, "index {}..{}", "0".repeat(short.len()), short)?;
             counts = emit_body(
-                repo, out, None, Some(path), &[], &content, opts, binary.is_some(), &mut blank_at_eof,
+                repo, out, None, Some(path), &[], &content, opts, body_binary(binary), &mut blank_at_eof,
             )?;
         }
         ChangeDetached::Deletion {
@@ -8227,8 +8237,8 @@ fn emit_change(
             writeln!(out, "deleted file mode {:o}", entry_mode.value())?;
             let is_sub = entry_mode.is_commit();
             let content = content_of(repo, *id, is_sub)?;
-            binary = pair_is_binary(is_sub, &content, opts).then(|| (content.len() as u64, 0));
-            let short = short_oid(repo, *id, index_abbrev(binary.is_some()), is_sub)?;
+            binary = pair_is_binary(attrs, path, is_sub, &content)?.then(|| (content.len() as u64, 0));
+            let short = short_oid(repo, *id, index_abbrev(body_binary(binary)), is_sub)?;
             writeln!(out, "index {}..{}", short, "0".repeat(short.len()))?;
             // `-D`/`--irreversible-delete`: `builtin_diff()` stops as soon as it
             // sees `/dev/null` on the post-image side, so a deletion carries no
@@ -8237,7 +8247,7 @@ fn emit_change(
             let mut sink = Vec::new();
             let body = if opts.irreversible_delete { &mut sink } else { &mut *out };
             counts = emit_body(
-                repo, body, Some(path), None, &content, &[], opts, binary.is_some(), &mut blank_at_eof,
+                repo, body, Some(path), None, &content, &[], opts, body_binary(binary), &mut blank_at_eof,
             )?;
         }
         ChangeDetached::Modification {
@@ -8268,12 +8278,12 @@ fn emit_change(
                 let new_is_sub = entry_mode.is_commit();
                 let old_content = content_of(repo, *previous_id, old_is_sub)?;
                 let new_content = content_of(repo, *id, new_is_sub)?;
-                binary = (pair_is_binary(old_is_sub, &old_content, opts)
-                    || pair_is_binary(new_is_sub, &new_content, opts))
+                binary = (pair_is_binary(attrs, path, old_is_sub, &old_content)?
+                    || pair_is_binary(attrs, path, new_is_sub, &new_content)?)
                 .then(|| (old_content.len() as u64, new_content.len() as u64));
                 let old_short =
-                    short_oid(repo, *previous_id, index_abbrev(binary.is_some()), old_is_sub)?;
-                let new_short = short_oid(repo, *id, index_abbrev(binary.is_some()), new_is_sub)?;
+                    short_oid(repo, *previous_id, index_abbrev(body_binary(binary)), old_is_sub)?;
+                let new_short = short_oid(repo, *id, index_abbrev(body_binary(binary)), new_is_sub)?;
                 // The mode suffix is dropped when `old mode`/`new mode` said it.
                 if mode_changed {
                     writeln!(out, "index {old_short}..{new_short}")?;
@@ -8288,7 +8298,7 @@ fn emit_change(
                     &old_content,
                     &new_content,
                     opts,
-                    binary.is_some(),
+                    body_binary(binary),
                     &mut blank_at_eof,
                 )?;
             }
@@ -8326,12 +8336,12 @@ fn emit_change(
                 let new_is_sub = entry_mode.is_commit();
                 let old_content = content_of(repo, *source_id, old_is_sub)?;
                 let new_content = content_of(repo, *id, new_is_sub)?;
-                binary = (pair_is_binary(old_is_sub, &old_content, opts)
-                    || pair_is_binary(new_is_sub, &new_content, opts))
+                binary = (pair_is_binary(attrs, from, old_is_sub, &old_content)?
+                    || pair_is_binary(attrs, to, new_is_sub, &new_content)?)
                 .then(|| (old_content.len() as u64, new_content.len() as u64));
                 let old_short =
-                    short_oid(repo, *source_id, index_abbrev(binary.is_some()), old_is_sub)?;
-                let new_short = short_oid(repo, *id, index_abbrev(binary.is_some()), new_is_sub)?;
+                    short_oid(repo, *source_id, index_abbrev(body_binary(binary)), old_is_sub)?;
+                let new_short = short_oid(repo, *id, index_abbrev(body_binary(binary)), new_is_sub)?;
                 if old_mode != new_mode {
                     writeln!(out, "index {old_short}..{new_short}")?;
                 } else {
@@ -8345,7 +8355,7 @@ fn emit_change(
                     &old_content,
                     &new_content,
                     opts,
-                    binary.is_some(),
+                    body_binary(binary),
                     &mut blank_at_eof,
                 )?;
             }
@@ -8438,11 +8448,23 @@ fn emit_rename_header(out: &mut Vec<u8>, from: &[u8], to: &[u8], opts: &Opts) {
     out.push(b'\n');
 }
 
-/// `diff_filespec_is_binary()`: a NUL in the first 8000 bytes makes a blob binary, unless
-/// `-a`/`--text` asked for it to be treated as text. A gitlink is never binary — its
-/// "content" is the synthesized `Subproject commit …` line.
-fn pair_is_binary(is_submodule: bool, content: &[u8], opts: &Opts) -> bool {
-    !opts.text && !is_submodule && is_binary(content)
+/// `diff_filespec_is_binary()` (diff.c:3712-3733): the path's diff driver decides first —
+/// `-diff` is binary whatever the bytes — and only a driver with no opinion falls back to
+/// a NUL in the first 8000 bytes. A gitlink is never binary — its "content" is the
+/// synthesized `Subproject commit …` line.
+fn pair_is_binary(
+    attrs: &std::cell::RefCell<super::cat_file::Textconv<'_>>,
+    path: &[u8],
+    is_submodule: bool,
+    content: &[u8],
+) -> Result<bool> {
+    if is_submodule {
+        return Ok(false);
+    }
+    Ok(match attrs.borrow_mut().binary_attr(path.as_bstr())? {
+        Some(decided) => decided,
+        None => is_binary(content),
+    })
 }
 
 /// `diff --git a/<path> b/<path>` line, with git's `quote_two()` C-quoting.

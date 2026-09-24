@@ -2958,39 +2958,11 @@ impl<'r> DiffAttrs<'r> {
         Ok(None)
     }
 
-    /// Whether the path's diff driver settles the binary question, following
-    /// `userdiff_find_by_path()` (`userdiff.c`) as `grep_source_is_binary()`
-    /// consults it: a set `diff` attribute selects `driver_true` (`binary = 0`),
-    /// an unset one (`-diff`) selects `driver_false` (`binary = 1`), and a value
-    /// names a driver whose `diff.<name>.binary` setting decides. `None` is
-    /// git's `binary = -1`, the "no opinion" that falls through to
-    /// `buffer_is_binary()` on the contents.
+    /// Whether the path's diff driver settles the binary question, as
+    /// `grep_source_is_binary()` consults it — see
+    /// [`super::cat_file::diff_attr_binary`].
     fn binary_attr(&mut self, rela: &BStr) -> Result<Option<bool>> {
-        let mode = Some(gix::index::entry::Mode::FILE);
-        let _ = self.stack.at_entry(rela, mode)?;
-        self.outcome
-            .initialize_with_selection(self.stack.attributes_collection(), ["diff"]);
-        let platform = self.stack.at_entry(rela, mode)?;
-        platform.matching_attributes(&mut self.outcome);
-        let mut named: Option<String> = None;
-        for m in self.outcome.iter_selected() {
-            match m.assignment.state {
-                gix::attrs::StateRef::Set => return Ok(Some(false)),
-                gix::attrs::StateRef::Unset => return Ok(Some(true)),
-                gix::attrs::StateRef::Value(v) => {
-                    named = Some(String::from_utf8_lossy(v.as_bstr().as_bytes()).into_owned());
-                    break;
-                }
-                gix::attrs::StateRef::Unspecified => {}
-            }
-        }
-        let Some(drv) = named else {
-            return Ok(None);
-        };
-        Ok(self
-            .repo
-            .config_snapshot()
-            .boolean(format!("diff.{drv}.binary").as_str()))
+        super::cat_file::diff_attr_binary(self.repo, &mut self.stack, &mut self.outcome, rela)
     }
 
     /// The `diff.<driver>.textconv` command configured for the path, if any.

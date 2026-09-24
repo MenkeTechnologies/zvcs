@@ -225,6 +225,16 @@ fn write_options(repo: &gix::Repository, o: &Opts) -> gix::index::write::Options
     }
 }
 
+/// `o->internal.result.version = o->src_index->version` (unpack-trees.c:1940): the
+/// result of a merge-like read is written in the version of the index it replaces,
+/// so `GIT_INDEX_VERSION` / `index.version` only decide when that index was never on
+/// disk (a version of zero, which `do_write_index()` resolves at read-cache.c:2865).
+fn carry_version(result: &mut gix::index::File, src: &gix::index::File) {
+    if !src.version_is_unset() {
+        result.set_version(src.version());
+    }
+}
+
 /// git's own `read-tree` usage block, byte for byte (`git read-tree -h`).
 ///
 /// Reproduced verbatim because `parse-options` prints it on every usage error, and
@@ -798,6 +808,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // — the un-split git's own NEEDSWORK comment right above that line describes.
     if o.merge_like() {
         new_index.inherit_split_index(&old);
+        carry_version(&mut new_index, &old);
     }
 
     // `-m`/`--reset` carry the stat cache of entries the tree leaves untouched, so a
@@ -1026,7 +1037,7 @@ fn sparse_patterns(
     // process was configured with, not whatever the file's writer used (dir.c:3513).
     let cone = cfg.boolean("core.sparseCheckoutCone").unwrap_or(false);
     drop(cfg);
-    Ok(Some(super::sparse_checkout::UnpackPatterns::load(repo, cone)?))
+    Ok(super::sparse_checkout::UnpackPatterns::load(repo, cone))
 }
 
 /// Every path in `index` currently carrying `CE_SKIP_WORKTREE`.
@@ -1363,6 +1374,7 @@ fn multi_tree_read(
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path());
     // `o->internal.result.split_index = o->src_index->split_index` (unpack-trees.c:1950).
     new_index.inherit_split_index(old);
+    carry_version(&mut new_index, old);
     let mut wanted: BTreeSet<BString> = BTreeSet::new();
     for (path, ce, stage, update) in &result {
         // "Take the stat information from stage0": an entry carried through

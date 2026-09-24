@@ -1385,6 +1385,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--cc` on the command line: `revs->dense_combined_merges`, checked against the
     // output format once the whole scan is done — see the option's own arm.
     let mut cc = false;
+    // `revs->combine_merges` and `revs->combined_all_paths` as `diff_merges_parse_opts()`
+    // leaves them (diff-merges.c:117-148): every mode setter starts from `suppress()`,
+    // which clears both, so `--combined-all-paths --cc` drops the flag again while
+    // `--cc --combined-all-paths` keeps it.
+    let mut combine_merges = false;
+    let mut combined_all_paths = false;
     // `o->pickaxe` and the `DIFF_PICKAXE_KIND_*` bit, as typed: the kind letter and
     // the raw pattern. Compiled after the scan, since `--pickaxe-regex` may follow
     // the `-S` it promotes and `diff_setup_done()`'s conflicts outrank a bad regex.
@@ -1838,6 +1844,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     eprintln!("fatal: invalid value for '--diff-merges': '{a}'");
                     return Ok(ExitCode::from(128));
                 }
+                (combine_merges, combined_all_paths) = (diff_merges_combines(a), false);
             } else if let Some(Err(msg)) =
                 move_word.parse_flag(&format!("{flag}={a}"), &mut color_when)
             {
@@ -2219,13 +2226,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `builtin/diff.c` never walks commits, so none of them can reach output
             // here — but the value is still rejected the same way, because
             // `set_diff_merges()` dies before `cmd_diff()` gets going.
-            "--no-diff-merges" => {}
+            "--no-diff-merges" => (combine_merges, combined_all_paths) = (false, false),
             s if s.starts_with("--diff-merges=") => {
                 let val = &s["--diff-merges=".len()..];
                 if !is_diff_merges_value(val) {
                     eprintln!("fatal: invalid value for '--diff-merges': '{val}'");
                     return Ok(ExitCode::from(128));
                 }
+                (combine_merges, combined_all_paths) = (diff_merges_combines(val), false);
             }
             // `--ws-error-highlight=<kind>` (`diff_opt_ws_error_highlight()`).
             s if s.starts_with("--ws-error-highlight=") => {
@@ -2547,7 +2555,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `--cc --raw` prints `::`-prefixed combined records and `--cc --stat`
             // prints nothing at all. Neither is ported; [`cc`]'s check below refuses
             // those rather than answering them with the uncombined records.
-            "--cc" => cc = true,
+            "--cc" => {
+                cc = true;
+                (combine_merges, combined_all_paths) = (true, false);
+            }
+            // `revs->combined_all_paths = 1` and nothing else; whether it makes
+            // sense is asked once the scan is over.
+            "--combined-all-paths" => combined_all_paths = true,
             // `--pickaxe-all` is `DIFF_OPT_PICKAXE_ALL`, and on its own it changes
             // nothing: `diffcore_pickaxe()` reads it only once a pickaxe kind is
             // set, so `git diff --pickaxe-all` is a plain diff (measured against
@@ -2772,6 +2786,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // pathspec is looked at.
     if let Some(flag) = pending_value {
         return Ok(missing_value_refusal(&flag));
+    }
+    // `diff_merges_setup_revs()` (diff-merges.c:184-185), which `setup_revisions()`
+    // runs just ahead of `diff_setup_done()` (revision.c:3170-3174): past every
+    // positional, ahead of the pickaxe conflicts and of `cmd_diff()`'s unknown-option
+    // usage.
+    if combined_all_paths && !combine_merges {
+        eprintln!("fatal: --combined-all-paths makes no sense without -c or --cc");
+        return Ok(ExitCode::from(128));
     }
     // `diff_setup_done()`'s two pickaxe `die()`s, in git's order. They close
     // `setup_revisions()`, so they run once the whole option scan and every
@@ -5352,6 +5374,7 @@ const KNOWN_LONG: &[&str] = &[
     "--color-moved",
     "--color-moved-ws",
     "--color-words",
+    "--combined-all-paths",
     "--compact-summary",
     "--count",
     "--cumulative",
@@ -5510,6 +5533,14 @@ fn set_indicator(
         _ => indicators.2 = c,
     }
     Ok(())
+}
+
+/// Whether a valid `--diff-merges` value selects `set_combined()` or
+/// `set_dense_combined()` (diff-merges.c:76-79), i.e. leaves `revs->combine_merges`
+/// raised. `m`/`on` run `set_to_default`, which only `log.diffMerges` can point
+/// anywhere but `set_separate()`, and `git diff` never reads that key.
+fn diff_merges_combines(v: &str) -> bool {
+    matches!(v, "c" | "combined" | "cc" | "dense-combined")
 }
 
 /// `func_by_opt()` (diff-merges.c:68-86): the `--diff-merges=<v>` values git maps to

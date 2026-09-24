@@ -1134,6 +1134,12 @@ fn revert_one(
     } else {
         "(empty tree)".to_string()
     };
+    // `do_recursive_merge()` calls `init_ui_merge_options()` (sequencer.c)
+    // before merging, and its `merge_recursive_config()` dies on an unreadable
+    // `merge.renameLimit` & co.
+    if super::merge::merge_recursive_config_check(repo).is_some() {
+        return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
+    }
     let mut merge = repo.merge_trees(
         base_tree,
         ours_tree,

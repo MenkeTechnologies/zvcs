@@ -2009,31 +2009,65 @@ pub fn first_bad_config_line(bytes: &[u8]) -> Option<usize> {
 /// message, and gitoxide's parser renders it as an empty value rather than as an
 /// absent one — so an empty value is passed over here rather than reported as the
 /// wrong half of the pair.
-pub fn extension_value_refusal(naming: GitDirNaming) -> Option<(String, String)> {
+///
+/// The two boolean v0 extensions are the exception to the pair:
+/// `handle_extension_v0()` reads them with `git_config_bool()`, which `die()`s
+/// on a value it cannot parse, so there is no `error:` line and the `fatal:` line
+/// is `bad boolean config value '<value>' for 'extensions.<key>'`.
+pub fn extension_value_refusal(naming: GitDirNaming) -> Option<(Option<String>, String)> {
     for candidate in config_file_sequence(ConfigScopes::Repository, naming) {
         let Ok(bytes) = std::fs::read(&candidate.path) else {
             continue;
         };
-        // Both refusals come from the one `check_repo_format()` pass over the
+        // Every refusal comes from the one `check_repo_format()` pass over the
         // file, so whichever key sits first is the one reported.
-        let extension = first_invalid_extension_value(&bytes).map(|(key, value, line)| {
-            (format!("invalid value for '{key}': '{value}'"), line)
+        let extension = first_invalid_extension_value(&bytes);
+        let worktree = first_valueless_core_worktree(&bytes).map(|line| {
+            let refusal = ExtensionRefusal::Invalid {
+                key: "core.worktree",
+                value: None,
+            };
+            (refusal, line)
         });
-        let worktree = first_valueless_core_worktree(&bytes)
-            .map(|line| ("missing value for 'core.worktree'".to_string(), line));
-        let Some((diagnostic, line)) = [extension, worktree]
+        let Some((refusal, line)) = [extension, worktree]
             .into_iter()
             .flatten()
             .min_by_key(|(_, line)| *line)
         else {
             continue;
         };
-        return Some((
-            diagnostic,
-            format!("bad config line {line} in file {}", candidate.shown),
-        ));
+        let bad_line = || format!("bad config line {line} in file {}", candidate.shown);
+        return Some(match refusal {
+            ExtensionRefusal::Invalid {
+                key,
+                value: Some(value),
+            } => (Some(format!("invalid value for '{key}': '{value}'")), bad_line()),
+            ExtensionRefusal::Invalid { key, value: None } => {
+                (Some(format!("missing value for '{key}'")), bad_line())
+            }
+            // `git_config_bool()` dies itself (config.c), so the reader never
+            // gets to add its `bad config line`.
+            ExtensionRefusal::BadBool { key, value } => {
+                (None, format!("bad boolean config value '{value}' for '{key}'"))
+            }
+        });
     }
     None
+}
+
+/// Why `check_repo_format()` stopped on an `extensions.<key>` (or
+/// `core.worktree`) line.
+enum ExtensionRefusal {
+    /// `handle_extension()`'s `error(_("invalid value for '%s': '%s'"))`, or
+    /// `config_error_nonbool()`'s `missing value for '%s'` when `value` is `None`
+    /// — both `return -1`, so the reader's `bad config line` follows.
+    Invalid {
+        key: &'static str,
+        value: Option<String>,
+    },
+    /// `handle_extension_v0()`'s `git_config_bool()` on `preciousobjects` /
+    /// `worktreeconfig` (setup.c:622, 630) — a direct `die()`.
+    BadBool { key: &'static str, value: String },
 }
 
 /// The 1-based line of the first valueless `core.worktree` in `bytes`.
@@ -2079,16 +2113,15 @@ fn first_valueless_core_worktree(bytes: &[u8]) -> Option<usize> {
 }
 
 /// The first `extensions.<key> = <value>` in `bytes` whose value git refuses, as
-/// `(git's spelling of the key, the value, the 1-based line)`.
-fn first_invalid_extension_value(bytes: &[u8]) -> Option<(&'static str, String, usize)> {
-    use gix::bstr::ByteSlice as _;
+/// `(the refusal, the 1-based line)`.
+fn first_invalid_extension_value(bytes: &[u8]) -> Option<(ExtensionRefusal, usize)> {
     use gix::bstr::ByteSlice as _;
     use gix::config::parse::EventRef;
 
     let events = gix::config::parse::Events::from_bytes(bytes, None).ok()?;
     let mut line = 1usize;
     let mut in_extensions = false;
-    let mut pending: Option<(&'static str, &'static [&'static str])> = None;
+    let mut pending: Option<(&'static str, ExtensionValue)> = None;
     for event in events.iter() {
         match event {
             EventRef::Newline(nl) => {
@@ -2114,7 +2147,7 @@ fn first_invalid_extension_value(bytes: &[u8]) -> Option<(&'static str, String, 
                 };
             }
             EventRef::Value(raw) => {
-                let Some((key, allowed)) = pending.take() else {
+                let Some((key, check)) = pending.take() else {
                     continue;
                 };
                 let value = gix::config::value::normalize(raw);
@@ -2122,8 +2155,15 @@ fn first_invalid_extension_value(bytes: &[u8]) -> Option<(&'static str, String, 
                     continue;
                 }
                 let text = value.to_str_lossy().into_owned();
-                if !allowed.iter().any(|name| *name == text) {
-                    return Some((key, text, line));
+                match check {
+                    ExtensionValue::Table(allowed) if !allowed.contains(&text.as_str()) => {
+                        let value = Some(text);
+                        return Some((ExtensionRefusal::Invalid { key, value }, line));
+                    }
+                    ExtensionValue::Bool if crate::optint::maybe_bool(&text).is_none() => {
+                        return Some((ExtensionRefusal::BadBool { key, value: text }, line));
+                    }
+                    _ => {}
                 }
             }
             _ => {}
@@ -2140,15 +2180,28 @@ fn first_invalid_extension_value(bytes: &[u8]) -> Option<(&'static str, String, 
 /// `hash_algo_by_name()` (hash.c) and `ref_storage_format_by_name()` (refs.c)
 /// both compare with `strcmp`, so the value is case-*sensitive* even though the
 /// key is not.
-fn validated_extension(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+///
+/// `handle_extension_v0()` adds the two it reads with `git_config_bool()`
+/// (setup.c:622, 630), whose value must be one `git_parse_maybe_bool()` accepts.
+fn validated_extension(name: &str) -> Option<(&'static str, ExtensionValue)> {
     const HASHES: &[&str] = &["sha1", "sha256"];
     const REF_STORAGES: &[&str] = &["files", "reftable"];
     Some(match name.to_ascii_lowercase().as_str() {
-        "objectformat" => ("extensions.objectformat", HASHES),
-        "compatobjectformat" => ("extensions.compatobjectformat", HASHES),
-        "refstorage" => ("extensions.refstorage", REF_STORAGES),
+        "objectformat" => ("extensions.objectformat", ExtensionValue::Table(HASHES)),
+        "compatobjectformat" => ("extensions.compatobjectformat", ExtensionValue::Table(HASHES)),
+        "refstorage" => ("extensions.refstorage", ExtensionValue::Table(REF_STORAGES)),
+        "preciousobjects" => ("extensions.preciousobjects", ExtensionValue::Bool),
+        "worktreeconfig" => ("extensions.worktreeconfig", ExtensionValue::Bool),
         _ => return None,
     })
+}
+
+/// How [`validated_extension`]'s keys have their value checked.
+enum ExtensionValue {
+    /// One of the names a lookup table holds.
+    Table(&'static [&'static str]),
+    /// Anything `git_parse_maybe_bool()` accepts.
+    Bool,
 }
 
 

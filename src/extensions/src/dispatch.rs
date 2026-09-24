@@ -1226,7 +1226,9 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
             _ => crate::config::GitDirNaming::AsDiscovered,
         };
         if let Some((diagnostic, fatal)) = crate::config::extension_value_refusal(naming) {
-            eprintln!("error: {diagnostic}");
+            if let Some(diagnostic) = diagnostic {
+                eprintln!("error: {diagnostic}");
+            }
             return Some(fatal);
         }
     }

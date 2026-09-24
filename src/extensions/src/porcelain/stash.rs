@@ -3613,7 +3613,10 @@ fn write_target_index(
     // single object. An index that for any reason does not match gets the nodes
     // it can prove and nothing more.
     match cache_tree {
-        CacheTree::LikeUnpackTrees => super::write_tree::rebuild_cache_tree(repo, &mut new_index),
+        CacheTree::LikeUnpackTrees => {
+            super::write_tree::carry_untracked_cache(old_index, &mut new_index);
+            super::write_tree::rebuild_cache_tree(repo, &mut new_index);
+        }
         CacheTree::LikeMixedReset { touched } => {
             super::write_tree::carry_cache_tree_invalidating_changes(repo, old_index, &mut new_index);
             // The paths a child command staged and then unstaged again: the entry is back to
@@ -3640,6 +3643,12 @@ fn write_target_index(
         CacheTree::LikeUnstagedOverMerge { merged } => {
             super::write_tree::carry_cache_tree_invalidating_changes(repo, merged, &mut new_index);
         }
+    }
+    // The reset arms stand on indexes built from a tree, which have no untracked cache of their
+    // own to hand on; the one the stash started from is the one the child `reset` would have
+    // read, and the write invalidates the names it gained or lost.
+    if new_index.untracked().is_none() {
+        new_index.inherit_untracked_cache(old_index);
     }
     // The `write_locked_index()` that ends `reset_tree()` is the one
     // `do_write_index()` every other index writer goes through

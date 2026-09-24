@@ -982,6 +982,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         if mode == ResetMode::Keep {
             let current = repo.open_index()?;
             let mut index = reset_index_to_tree(&repo, &current, target_tree, false)?;
+            // And it is `unpack_trees()`, so the untracked cache moves onto the result with
+            // every path whose entry changed invalidated.
+            super::write_tree::carry_untracked_cache(&current, &mut index);
             // That second pass is `reset_index()`, not `read_from_tree()`, so it ends in
             // `prime_cache_tree(the_repository, index, tree)` (builtin/reset.c:120-127): the
             // index it writes carries a cache-tree built from the target tree itself.
@@ -1748,6 +1751,7 @@ fn reset_worktree_hard(
 
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
+    super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
     Ok(())
@@ -2063,6 +2067,7 @@ fn reset_two_tree(
 
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
+    super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
     Ok(true)

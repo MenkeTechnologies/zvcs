@@ -446,9 +446,12 @@ pub(crate) fn carry_cache_tree_invalidating_changes(
     old: &gix::index::File,
     new: &mut gix::index::File,
 ) {
-    use gix::bstr::BString;
-    use std::collections::HashMap;
-
+    // The untracked cache moves along too. `read_from_tree()` stages entry by entry, so it
+    // hears only about the names that came and went — which the write reconciles by itself
+    // (`State::invalidate_untracked_for_changed_entries()`) once the cache is on `new`.
+    if new.untracked().is_none() {
+        new.inherit_untracked_cache(old);
+    }
     let Some(tree) = old.tree().cloned() else {
         // No cache-tree to carry: git would have had one to invalidate into, this index
         // simply has nothing, and the next reader rebuilds. Never repair here — that would
@@ -456,29 +459,71 @@ pub(crate) fn carry_cache_tree_invalidating_changes(
         prepare_offset_table(repo, new);
         return;
     };
-    let key = |index: &gix::index::File| -> HashMap<BString, (gix::ObjectId, u32, u32)> {
-        let backing = index.path_backing();
-        index
-            .entries()
-            .iter()
-            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode.bits(), e.stage_raw())))
-            .collect()
-    };
-    let before = key(old);
-    let after = key(new);
-
+    let (before, after) = (entry_states(old), entry_states(new));
     new.set_tree(Some(tree));
-    for (path, state) in &after {
-        if before.get(path) != Some(state) {
-            new.invalidate_path_in_tree(path.as_ref());
-        }
-    }
-    for path in before.keys() {
-        if !after.contains_key(path) {
-            new.invalidate_path_in_tree(path.as_ref());
-        }
+    for path in changed_paths(&before, &after) {
+        new.invalidate_path_in_tree(path.as_ref());
     }
     prepare_offset_table(repo, new);
+}
+
+/// Every entry of an index as `path -> (id, mode, stage)`: what [`changed_paths`] compares.
+pub(crate) type EntryStates = std::collections::HashMap<gix::bstr::BString, (gix::ObjectId, u32, u32)>;
+
+/// `index`'s [`EntryStates`].
+pub(crate) fn entry_states(index: &gix::index::File) -> EntryStates {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode.bits(), e.stage_raw())))
+        .collect()
+}
+
+/// The paths whose entry differs between `before` and `after` in blob id, mode or stage, or that
+/// exist on only one side — the paths `unpack_trees()` hands `invalidate_ce_path()`
+/// (unpack-trees.c:2296-2303) from `merged_entry()`, `deleted_entry()` and a conflicted
+/// `keep_entry()`, and the set `oneway_diff()` would have staged.
+pub(crate) fn changed_paths<'a>(before: &'a EntryStates, after: &'a EntryStates) -> Vec<&'a gix::bstr::BString> {
+    let moved = after
+        .iter()
+        .filter(|(path, state)| before.get(*path) != Some(*state))
+        .map(|(path, _)| path);
+    let gone = before.keys().filter(|path| !after.contains_key(*path));
+    moved.chain(gone).collect()
+}
+
+/// `unpack_trees()`'s untracked-cache half: every path [`changed_paths`] names goes through
+/// `untracked_cache_invalidate_path()` (unpack-trees.c:2302) and the source index's cache then
+/// moves onto the result with `move_index_extensions()` (read-cache.c:3497-3503, called at
+/// unpack-trees.c:2077).
+///
+/// Unlike `read_from_tree()`'s entry-by-entry staging this invalidates a path whose *content*
+/// moved while its name stayed: the directory of every file a checkout rewrote loses its cached
+/// listing, as stock's does. `old` is the source index as it was read, before the caller began
+/// turning it into `new`; a `new` that already carries a cache keeps it.
+pub(crate) fn carry_untracked_cache(old: &gix::index::File, new: &mut gix::index::File) {
+    if new.untracked().is_none() {
+        new.inherit_untracked_cache(old);
+    }
+    invalidate_untracked_changes(untracked_entry_states(old).as_ref(), new);
+}
+
+/// The source index's [`entry_states`] for [`invalidate_untracked_changes`], or `None` when it
+/// carries no untracked cache and there is nothing to invalidate.
+pub(crate) fn untracked_entry_states(index: &gix::index::File) -> Option<EntryStates> {
+    index.untracked().is_some().then(|| entry_states(index))
+}
+
+/// The invalidation half of [`carry_untracked_cache`], for a verb that turns the source index
+/// into its result in place and so snapshots it ([`untracked_entry_states`]) before it starts.
+pub(crate) fn invalidate_untracked_changes(before: Option<&EntryStates>, index: &mut gix::index::File) {
+    let Some(before) = before.filter(|_| index.untracked().is_some()) else {
+        return;
+    };
+    for path in changed_paths(before, &entry_states(index)) {
+        index.invalidate_untracked_path(path.as_ref());
+    }
 }
 
 pub(crate) fn rebuild_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) {
@@ -514,6 +559,7 @@ pub(crate) fn carry_and_repair_cache_tree(
     old: &gix::index::File,
     new: &mut gix::index::File,
 ) {
+    carry_untracked_cache(old, new);
     carry_cache_tree_invalidating_changes(repo, old, new);
     repair_cache_tree(repo, new);
     prepare_offset_table(repo, new);

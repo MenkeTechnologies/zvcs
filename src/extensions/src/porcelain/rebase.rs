@@ -3936,6 +3936,7 @@ fn restore_worktree_to_tree(
 
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
+    super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
     Ok(())
@@ -7408,6 +7409,7 @@ fn update_clean_worktree(
     // Drop any stale cache-tree extension before persisting.
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
 

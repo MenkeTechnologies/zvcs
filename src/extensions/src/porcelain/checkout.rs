@@ -3774,6 +3774,7 @@ pub(super) fn update_worktree_to_tree(
     checkout_subset(repo, &mut subset, &result_attrs, &should_interrupt, &updating)?;
     updating.stop();
 
+    let untracked_before = super::write_tree::untracked_entry_states(&old);
     // The index moves with the worktree, one path at a time: the touched entries
     // are replaced by the new tree's, the rest stay exactly as they were.
     let mut index = old;
@@ -3803,6 +3804,7 @@ pub(super) fn update_worktree_to_tree(
     index.sort_entries();
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::invalidate_untracked_changes(untracked_before.as_ref(), &mut index);
     super::write_tree::rebuild_cache_tree(repo, &mut index);
     crate::index_racy::write(repo, &mut index)?;
     Ok(())
@@ -3937,6 +3939,7 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
     }
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
+    super::write_tree::carry_untracked_cache(&old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
     // The in-progress merge, cherry-pick or revert this abandons is dropped by

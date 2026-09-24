@@ -36,12 +36,14 @@ impl Extensions {
             } => match signature {
                 extension::tree::SIGNATURE => tree_cache,
                 extension::end_of_index_entry::SIGNATURE => end_of_index_entry,
-                // `strip_extensions` is the only gate git puts on `link` and `REUC`
-                // (read-cache.c:2197 and :2222) — neither has a knob of its own, and
-                // both describe state that exists nowhere else in the file. `Given`
-                // is this crate's "not stripped", so both are always written when
-                // the state carries them; only [`Extensions::None`] drops them.
-                extension::link::SIGNATURE | extension::resolve_undo::SIGNATURE => &true,
+                // `strip_extensions` is the only gate git puts on `link`, `REUC` and
+                // `UNTR` (read-cache.c:2197, :2222 and :3022) — none has a knob of its
+                // own, and each describes state that exists nowhere else in the file.
+                // `Given` is this crate's "not stripped", so all three are always
+                // written when the state carries them; only [`Extensions::None`] drops them.
+                extension::link::SIGNATURE
+                | extension::resolve_undo::SIGNATURE
+                | extension::untracked_cache::SIGNATURE => &true,
                 _ => &false,
             }
             .then(|| signature),
@@ -219,6 +221,22 @@ impl State {
                     .and_then(|signature| {
                         self.resolve_undo()
                             .map(|paths| extension::resolve_undo::write_to(paths, write).map(|()| signature))
+                    })
+            },
+            // `if (write_extensions & WRITE_UNTRACKED_CACHE_EXTENSION && istate->untracked)`
+            // (read-cache.c:3022-3033): after `REUC`, and on the pointer alone — a cache with no
+            // root is still written, as the header and a zero directory count.
+            &|write| {
+                extensions
+                    .should_write(extension::untracked_cache::SIGNATURE)
+                    .and_then(|signature| {
+                        self.untracked().map(|untracked| {
+                            let mut body = Vec::new();
+                            untracked.write_to(&mut body, self.object_hash);
+                            write.write_all(&signature)?;
+                            write.write_all(&(body.len() as u32).to_be_bytes())?;
+                            write.write_all(&body).map(|()| signature)
+                        })
                     })
             },
             &|write| {

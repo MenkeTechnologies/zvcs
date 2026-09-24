@@ -789,6 +789,51 @@ impl State {
     pub fn untracked(&self) -> Option<&extension::UntrackedCache> {
         self.untracked.as_ref()
     }
+    /// Install `untracked` as this state's untracked cache, git's assignment to
+    /// `istate->untracked`, taking the current entries as the ones it describes.
+    pub fn set_untracked(&mut self, untracked: Option<extension::UntrackedCache>) {
+        self.untracked_index_names = untracked
+            .is_some()
+            .then(|| extension::untracked_cache::IndexNames::of(self));
+        self.untracked = untracked;
+    }
+    /// Adopt `src`'s untracked cache — the half of `move_index_extensions()`
+    /// (read-cache.c:3497-3503) that `unpack_trees()` runs on its result (unpack-trees.c:2077) —
+    /// together with the entries it was last reconciled against, so that the names this state
+    /// gained or lost relative to `src`'s are still invalidated when it is written.
+    pub fn inherit_untracked_cache(&mut self, src: &State) {
+        self.untracked = src.untracked.clone();
+        self.untracked_index_names = src.untracked_index_names.clone();
+    }
+    /// `untracked_cache_invalidate_path(istate, path, 1)` (dir.c:4015-4024), for the callers
+    /// that invalidate a path whose *name* stays in the index — `unpack_trees()`'s
+    /// `invalidate_ce_path()` (unpack-trees.c:2296-2303) on a merged entry whose content moved.
+    /// Names added or removed need no call: see
+    /// [`invalidate_untracked_for_changed_entries()`](Self::invalidate_untracked_for_changed_entries()).
+    pub fn invalidate_untracked_path(&mut self, path: &BStr) {
+        if let Some(untracked) = self.untracked.as_mut() {
+            untracked.invalidate_path(path);
+        }
+    }
+    /// Run `untracked_cache_add_to_index()` / `untracked_cache_remove_from_index()`
+    /// (dir.c:4046-4056) for every `(path, stage)` the entries gained or lost since the untracked
+    /// cache was read or last reconciled, then take the current entries as reconciled.
+    ///
+    /// Called by every writer in this crate before it serialises, which is where the two sets
+    /// can first be compared; see `IndexNames` in `extension::untracked_cache` for why git's
+    /// per-mutation calls are recovered here rather than at each mutation.
+    pub fn invalidate_untracked_for_changed_entries(&mut self) {
+        if self.untracked.is_none() {
+            return;
+        }
+        let now = extension::untracked_cache::IndexNames::of(self);
+        if let (Some(untracked), Some(before)) = (self.untracked.as_mut(), self.untracked_index_names.as_ref()) {
+            for path in before.changed_paths(&now) {
+                untracked.invalidate_path(path);
+            }
+        }
+        self.untracked_index_names = Some(now);
+    }
     /// Obtain the fsmonitor extension.
     pub fn fs_monitor(&self) -> Option<&extension::FsMonitor> {
         self.fs_monitor.as_ref()

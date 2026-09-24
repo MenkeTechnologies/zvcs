@@ -96,8 +96,11 @@
 //! not write the extension. Each is invisible to `git status` / `git ls-files`,
 //! so behaviour observable through git itself is unaffected, but the index bytes
 //! differ from stock git's:
-//!   * `--untracked-cache`, `--fsmonitor`: the `UNTR` and `FSMN` extensions are
-//!     not writable through the vendored crates.
+//!   * `--untracked-cache` / `--no-untracked-cache` / `--force-untracked-cache`: an
+//!     `UNTR` extension already in the index is carried through every write and
+//!     invalidated where git invalidates it, but these options neither add one nor
+//!     take one away yet.
+//!   * `--fsmonitor`: the `FSMN` extension is not writable through the vendored crates.
 //!
 //! Content filters run where git runs them. `index_mem()` (read-cache.c:2295)
 //! hands every blob it is about to hash to `convert_to_git()`, so a worktree file

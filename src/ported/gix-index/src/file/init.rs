@@ -132,6 +132,9 @@ impl File {
         if let Some(mut link) = file.link.take() {
             link.dissolve_into(&mut file, git_dir, object_hash, skip_hash, options)?;
         }
+        // The untracked cache describes the whole index, shared half included, so the
+        // entries it is reconciled against are taken only once the split index is dissolved.
+        file.state.invalidate_untracked_for_changed_entries();
 
         Ok(file)
     }

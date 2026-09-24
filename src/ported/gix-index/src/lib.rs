@@ -200,6 +200,9 @@ pub struct State {
     split_index: Option<SplitIndex>,
     resolve_undo: Option<extension::resolve_undo::Paths>,
     untracked: Option<extension::UntrackedCache>,
+    /// The `(path, stage)` pairs the entries held when `untracked` was last brought up to
+    /// date with them — see [`State::invalidate_untracked_for_changed_entries()`].
+    untracked_index_names: Option<extension::untracked_cache::IndexNames>,
     fs_monitor: Option<extension::FsMonitor>,
 }
 

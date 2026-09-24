@@ -28,7 +28,7 @@ pub(crate) use flags::at_rest;
 
 ///
 pub mod stat;
-mod write;
+pub(crate) mod write;
 
 use bitflags::bitflags;
 

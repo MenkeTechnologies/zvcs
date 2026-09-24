@@ -991,6 +991,12 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)` instead, which
     // validates a node only when the tree it would serialise is already in the odb
     // and writes nothing.
+    //
+    // The untracked cache rides along with the split index: only an index git read has one
+    // to move onto the result.
+    if o.merge_like() {
+        super::write_tree::carry_untracked_cache(&old, &mut new_index);
+    }
     match (tree_ids.len(), o.prefix.as_ref()) {
         (1, None) => {
             new_index.prime_cache_tree(&repo.objects, &tree_ids[0])?;
@@ -1453,6 +1459,7 @@ fn multi_tree_read(
     // so all this index gets is `unpack_trees()`'s repair pass: nodes whose tree the
     // repository already has keep an id, everything else — including every node above
     // an unmerged path — comes out invalid.
+    super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write_with(repo, &mut new_index, write_options(repo, o))?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());

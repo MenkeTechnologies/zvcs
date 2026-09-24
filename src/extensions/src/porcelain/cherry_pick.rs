@@ -2595,6 +2595,7 @@ fn update_clean_worktree(
 
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
+    super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
     Ok(new_index)

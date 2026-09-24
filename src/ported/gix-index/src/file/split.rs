@@ -113,15 +113,18 @@ impl File {
         max_percent_split_change: Option<u32>,
         options: write::Options,
     ) -> Result<Option<gix_hash::ObjectId>, Error> {
+        // Against the full entry list, before `prepare_to_write_split_index()` narrows it to
+        // the split half below.
+        self.state.invalidate_untracked_for_changed_entries();
         if request == Request::Whole {
             // `~WRITE_SPLIT_INDEX_EXTENSION`: the shared half stays on disk — git never
             // unlinks it here — but nothing points at it any more.
             self.state.remove_split_index();
-            self.write(options)?;
+            self.write_reconciled(options)?;
             return Ok(None);
         }
         if self.state.split_index().is_none() && request != Request::NewShared {
-            self.write(options)?;
+            self.write_reconciled(options)?;
             return Ok(None);
         }
 
@@ -158,7 +161,7 @@ impl File {
         };
 
         let saved = prepare_to_write_split_index(self);
-        let result = self.write(options);
+        let result = self.write_reconciled(options);
         finish_writing_split_index(self, saved);
         result?;
         Ok(shared_id)

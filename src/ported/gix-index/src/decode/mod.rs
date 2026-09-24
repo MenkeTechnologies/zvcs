@@ -323,6 +323,7 @@ impl State {
                 link,
                 resolve_undo,
                 untracked,
+                untracked_index_names: None,
                 fs_monitor,
             },
             checksum,

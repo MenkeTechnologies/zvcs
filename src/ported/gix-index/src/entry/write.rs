@@ -17,7 +17,7 @@ use crate::{Entry, State, entry};
 ///         return sizeof(varint) - pos;
 /// }
 /// ```
-fn encode_varint(mut value: u64) -> Vec<u8> {
+pub(crate) fn encode_varint(mut value: u64) -> Vec<u8> {
     let mut varint = [0u8; 16];
     let mut pos = varint.len() - 1;
     varint[pos] = (value & 127) as u8;

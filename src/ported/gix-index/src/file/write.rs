@@ -79,6 +79,14 @@ impl File {
     ///
     /// [issue #2421]: https://github.com/GitoxideLabs/gitoxide/issues/2421
     pub fn write(&mut self, options: write::Options) -> Result<(), Error> {
+        self.state.invalidate_untracked_for_changed_entries();
+        self.write_reconciled(options)
+    }
+
+    /// [`write()`](File::write()) for a caller that has already reconciled the untracked cache
+    /// with the full entry list — [`write_locked()`](File::write_locked()), whose split half is
+    /// written from a narrowed one.
+    pub(crate) fn write_reconciled(&mut self, options: write::Options) -> Result<(), Error> {
         let _span = gix_features::trace::detail!("gix_index::File::write()", path = ?self.path);
         let mut lock = std::io::BufWriter::with_capacity(
             64 * 1024,

@@ -484,7 +484,11 @@ struct Opts {
     allow_unrelated: bool,
     no_verify: bool,
     quiet: bool,
-    cleanup: Cleanup,
+    /// `cleanup_arg`: `commit.cleanup`, then `--cleanup`, unvalidated until
+    /// `get_cleanup_mode()` runs (builtin/merge.c:1498) — after `--abort`,
+    /// `--quit`, `--continue` and the unfinished-operation refusals have had
+    /// their say. `--no-cleanup` resets it to `None`.
+    cleanup_arg: Option<String>,
     /// `use_strategies` (builtin/merge.c:82): *every* `-s`, in the order given.
     /// git tries them one after another, rewinding between attempts, and keeps
     /// the one that scored best — so the list has to survive parsing whole.
@@ -541,7 +545,7 @@ impl Default for Opts {
             allow_unrelated: false,
             no_verify: false,
             quiet: false,
-            cleanup: Cleanup::Default,
+            cleanup_arg: None,
             strategies: Vec::new(),
             strategy_options: Vec::new(),
             into_name: None,
@@ -556,6 +560,12 @@ impl Default for Opts {
 }
 
 impl Opts {
+    /// The mode `cleanup_arg` names. [`do_merge`] has already died on a value
+    /// [`parse_cleanup`] refuses, so the fallback is never taken.
+    fn cleanup(&self) -> Cleanup {
+        self.cleanup_arg.as_deref().and_then(parse_cleanup).unwrap_or(Cleanup::Default)
+    }
+
     /// `append_strategy(get_strategy(name))` (builtin/merge.c:232-243): every
     /// `-s` is appended, duplicates included — `-s ort -s ort` really does run
     /// `ort` twice, with a rewind in between.
@@ -724,13 +734,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         }
         // `commit.cleanup` feeds the same `cleanup_arg` `--cleanup` sets.
         if let Some(v) = snap.string("commit.cleanup") {
-            match parse_cleanup(&v.to_string()) {
-                Some(mode) => opts.cleanup = mode,
-                None => {
-                    eprintln!("fatal: Invalid cleanup mode {v}");
-                    return Ok(ExitCode::from(128));
-                }
-            }
+            opts.cleanup_arg = Some(v.to_string());
         }
     }
 
@@ -982,26 +986,15 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // `fatal: Invalid cleanup mode ` at 128 instead of
             // ``error: option `cleanup' requires a value`` at 129.
             "--cleanup" => {
-                let mode = super::take_value(args, &mut i, a)?;
-                match parse_cleanup(mode) {
-                    Some(mode) => opts.cleanup = mode,
-                    None => {
-                        eprintln!("fatal: Invalid cleanup mode {mode}");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
+                opts.cleanup_arg = Some(super::take_value(args, &mut i, a)?.to_string());
             }
-            _ if a.starts_with("--cleanup=") => match parse_cleanup(&a["--cleanup=".len()..]) {
-                Some(mode) => opts.cleanup = mode,
-                None => {
-                    eprintln!("fatal: Invalid cleanup mode {}", &a["--cleanup=".len()..]);
-                    return Ok(ExitCode::from(128));
-                }
-            },
+            _ if a.starts_with("--cleanup=") => {
+                opts.cleanup_arg = Some(a["--cleanup=".len()..].to_string());
+            }
             // `--no-cleanup`: git's OPT_CLEANUP is an OPT_STRING, so the negation
             // sets `cleanup_arg` to NULL and `get_cleanup_mode(NULL, 0)` returns
             // the default (`whitespace` without an editor) — our `Cleanup::Default`.
-            "--no-cleanup" => opts.cleanup = Cleanup::Default,
+            "--no-cleanup" => opts.cleanup_arg = None,
             "-s" | "--strategy" => {
                 let name = super::take_value(args, &mut i, a)?.to_string();
                 match resolve_strategy(&name) {
@@ -1955,6 +1948,14 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         if crate::advice::Advice::ResolveConflict.enabled_in(&repo) {
             eprintln!("Please, commit your changes before you merge.");
         }
+        return Ok(ExitCode::from(128));
+    }
+
+    // `cleanup_mode = get_cleanup_mode(cleanup_arg, 0 < option_edit)`
+    // (builtin/merge.c:1498) is where an unknown mode dies, so `--abort`,
+    // `--quit` and `--continue` never see it.
+    if let Some(arg) = opts.cleanup_arg.as_deref().filter(|a| parse_cleanup(a).is_none()) {
+        eprintln!("fatal: Invalid cleanup mode {arg}");
         return Ok(ExitCode::from(128));
     }
 
@@ -3115,7 +3116,7 @@ fn stop_for_conflicts(
     // `#` line stock leaves between the cut line and `# Conflicts:`, so the two
     // modes differ by the scissors block and nothing else.
     let comment = comment_char(repo);
-    if opts.cleanup == Cleanup::Scissors {
+    if opts.cleanup() == Cleanup::Scissors {
         merge_msg.push(b'\n');
         merge_msg.extend_from_slice(comment.as_bytes());
         merge_msg
@@ -3325,7 +3326,7 @@ fn finalize_clean(
         append_signoff(repo, &mut msg)?;
     }
     if edit {
-        append_editor_comment(&mut msg, opts.cleanup, &comment);
+        append_editor_comment(&mut msg, opts.cleanup(), &comment);
     }
 
     let git_dir = repo.git_dir();
@@ -3371,7 +3372,7 @@ fn finalize_clean(
     // `--cleanup`/`commit.cleanup`, an edited message is stripped of its comment
     // lines (`COMMIT_MSG_CLEANUP_ALL`) while an unedited one only loses
     // whitespace (`COMMIT_MSG_CLEANUP_SPACE`).
-    let cleanup = match (opts.cleanup, edit) {
+    let cleanup = match (opts.cleanup(), edit) {
         (Cleanup::Default, true) => Cleanup::Strip,
         (mode, _) => mode,
     };

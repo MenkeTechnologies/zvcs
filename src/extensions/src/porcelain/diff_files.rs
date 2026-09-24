@@ -1435,7 +1435,6 @@ const PICKAXE_KIND_OBJFIND: u8 = 4;
 const ACCEPTED_NOOP_VALUED: &[&str] = &[
     "--anchored=",
     "--submodule=",
-    "-l",
     "--break-rewrites=",
     "--find-renames=",
 ];
@@ -1458,7 +1457,11 @@ const GLUED_WHEN_SEPARATED: &[&str] = &["--diff-algorithm", "--find-object"];
 /// pattern. Treating it instead as an *empty* pattern left the real pattern behind
 /// to be read as a pathspec or a revision, which is why `git diff-files -S dd` died
 /// with `fatal: ambiguous argument 'dd'` where stock filtered on `dd`.
-const SHORT_GLUED_WHEN_SEPARATED: &[&str] = &["-S", "-G"];
+///
+/// `-l` (`OPT_INTEGER`, diff.c:6188) and `-O` (`OPT_FILENAME`, diff.c:6291) are the
+/// same shape. Since the short-clump expansion splits `-l1` into `-l` `1`, this
+/// is also what keeps the glued spelling from losing its value to the operand scan.
+const SHORT_GLUED_WHEN_SEPARATED: &[&str] = &["-S", "-G", "-l", "-O"];
 
 /// Real git flags whose effect on the output we do not produce. `--find-object`,
 /// `-O` and `--output=` were formerly here and are now implemented.
@@ -1907,6 +1910,14 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
     if let Some(v) = s.strip_prefix("-B") {
         crate::diffopt::check_break_rewrites(v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        return Ok(Flag::Handled);
+    }
+    // `-l<n>`: `OPT_INTEGER('l', NULL, &options->rename_limit, …)` (diff.c:6188).
+    // diff-files never pairs a deletion with an addition, so the limit is inert,
+    // but parse-options still rejects a value that is not an integer.
+    if let Some(v) = s.strip_prefix("-l") {
+        crate::optint::integer(&crate::optint::short_opt('l'), v)
+            .map_err(|e| Fatal::OptionError(format!("error: {e}")))?;
         return Ok(Flag::Handled);
     }
     // `--inter-hunk-context=<n>` is an `OPT_MAGNITUDE` (`xecfg.interhunkctxlen`): two

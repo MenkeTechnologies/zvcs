@@ -1,4 +1,5 @@
-//! `git diff-files` stage selection, measured against stock git 2.55.0.
+//! `git diff-files` stage selection and the short value options the clump
+//! expansion splits, measured against stock git 2.55.0.
 //!
 //! * `-0`/`-1`/`-3` were claimed by the shared count parser and ignored, so every
 //!   conflict compared against stage #2. In stock they *are* `revs->max_count`,
@@ -6,6 +7,8 @@
 //!   so `-01`, `-n 3` and `--max-count=1` select a stage too, a count above 3 or
 //!   any age is the usage text (builtin/diff-files.c:73-76), and `--base`/`--ours`/
 //!   `--theirs` override a count from either side of it (diff-files.c:51-62).
+//! * `-l1` was split into `-l` `1`, and the `1` was then read as a revision:
+//!   `fatal: ambiguous argument '1'`. `-Ofile` lost its file the same way.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -150,3 +153,25 @@ fn a_count_above_three_or_an_age_is_the_usage_text() {
     }
 }
 
+#[test]
+fn short_value_options_keep_a_glued_or_separate_value() {
+    let fx = Fixture::new("values");
+    let plain = fx.ok(&["diff-files"]);
+    assert_eq!(fx.ok(&["diff-files", "-l1"]), plain);
+    assert_eq!(fx.ok(&["diff-files", "-l", "1"]), plain);
+    assert_eq!(fx.ok(&["diff-files", "-l1k"]), plain);
+    assert_eq!(
+        fx.code(&["-lx"]),
+        (129, "error: switch `l' expects an integer value with an optional k/m/g suffix\n".into())
+    );
+    assert_eq!(fx.code(&["-l"]), (129, "error: switch `l' requires a value\n".into()));
+
+    fx.write("order", "z.txt\n*\n");
+    let names: Vec<String> = fx
+        .ok(&["diff-files", "--name-only", "-Oorder"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(names, ["z.txt", "a.txt", "c.txt", "c.txt"]);
+    assert_eq!(fx.code(&["-O"]), (129, "error: switch `O' requires a value\n".into()));
+}

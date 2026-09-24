@@ -29,7 +29,10 @@
 //!   * Exit codes and streams: usage to stdout for `-h` and to stderr when no
 //!     action is given (both 129), `error:` diagnostics to stderr (129), `fatal:`
 //!     to stderr (128), and 0 for every path that reaches a socket — including a
-//!     connect failure on `exit`, which stock git swallows silently.
+//!     connect failure on `exit` or `get` that means "no daemon" (`ENOENT`,
+//!     `ECONNREFUSED`); any other connect error is fatal, as
+//!     `connection_fatally_broken()` decides.
+//!   * Socket paths longer than `sun_path`, through [`crate::unix_socket`].
 //!
 //! Not covered:
 //!   * The daemon itself. `git-credential-cache--daemon` is its own command; this
@@ -47,7 +50,6 @@
 use anyhow::Result;
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -246,10 +248,16 @@ fn do_cache(
         }
     }
 
+    let connect_failed = |e: &std::io::Error| {
+        fatal(&format!("unable to connect to cache daemon: {}", errno(e)))
+    };
     match send_request(socket, &request) {
         Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(Some(msg)) => fatal(&msg),
-        Err(None) => {
+        Err(Failure::Die(msg)) => fatal(&msg),
+        Err(Failure::Connect(e)) => {
+            if connection_fatally_broken(&e) {
+                return connect_failed(&e);
+            }
             if !spawn {
                 return Ok(ExitCode::SUCCESS);
             }
@@ -258,23 +266,35 @@ fn do_cache(
             }
             match send_request(socket, &request) {
                 Ok(()) => Ok(ExitCode::SUCCESS),
-                Err(Some(msg)) => fatal(&msg),
-                Err(None) => fatal("unable to connect to cache daemon: Connection refused"),
+                Err(Failure::Die(msg)) => fatal(&msg),
+                Err(Failure::Connect(e)) => connect_failed(&e),
             }
         }
     }
 }
 
+/// `connection_fatally_broken()` (builtin/credential-cache.c:36-39): no socket
+/// file, or nothing listening on it, just means there is no daemon yet. Any
+/// other connect error is `die_errno("unable to connect to cache daemon")`.
+fn connection_fatally_broken(e: &std::io::Error) -> bool {
+    !matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ECONNREFUSED))
+}
+
+/// How [`send_request`] failed.
+enum Failure {
+    /// git's `-1` return: `unix_stream_connect()` failed with this `errno`.
+    Connect(std::io::Error),
+    /// A `die_errno` after connecting.
+    Die(String),
+}
+
 /// `send_request()`: write the request, half-close, copy the answer to stdout.
-///
-/// `Err(None)` is git's `-1` return — the socket was not connectable, which is
-/// not an error by itself; `Err(Some(msg))` is a `die_errno` after connecting.
-fn send_request(socket: &Path, request: &[u8]) -> Result<(), Option<String>> {
-    let mut stream = UnixStream::connect(socket).map_err(|_| None)?;
+fn send_request(socket: &Path, request: &[u8]) -> Result<(), Failure> {
+    let mut stream = crate::unix_socket::connect(socket).map_err(Failure::Connect)?;
 
     stream
         .write_all(request)
-        .map_err(|e| Some(format!("unable to write to cache daemon: {}", errno(&e))))?;
+        .map_err(|e| Failure::Die(format!("unable to write to cache daemon: {}", errno(&e))))?;
     // `shutdown(fd, SHUT_WR)` — unchecked in git, and a failure here surfaces on
     // the read side anyway.
     let _ = stream.shutdown(Shutdown::Write);
@@ -286,18 +306,18 @@ fn send_request(socket: &Path, request: &[u8]) -> Result<(), Option<String>> {
             Ok(0) => break,
             Ok(n) => stdout
                 .write_all(&buf[..n])
-                .map_err(|e| Some(format!("write error: {}", errno(&e))))?,
+                .map_err(|e| Failure::Die(format!("write error: {}", errno(&e))))?,
             // git treats a reset exactly like a clean EOF here.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                return Err(Some(format!("read error from cache daemon: {}", errno(&e))))
+                return Err(Failure::Die(format!("read error from cache daemon: {}", errno(&e))))
             }
         }
     }
     stdout
         .flush()
-        .map_err(|e| Some(format!("write error: {}", errno(&e))))
+        .map_err(|e| Failure::Die(format!("write error: {}", errno(&e))))
 }
 
 /// `spawn_daemon()`: start the daemon detached (git never waits for it) and

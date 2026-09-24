@@ -471,28 +471,10 @@ impl Cache {
 /// Port of `serve_cache()`: bind, announce readiness, detach the standard
 /// streams, then run the accept/expire loop until nothing is cached.
 fn serve_cache(socket_path: &str, debug: bool) -> Result<ExitCode> {
-    // `unix_stream_listen()` unlinks first so a stale socket from a killed
-    // daemon does not make the bind fail.
-    let _ = fs::remove_file(socket_path);
-
-    let listener = match UnixListener::bind(socket_path) {
+    // `unix_stream_listen()`: unlink a stale socket, and fit an over-long path
+    // into `sun_path` the way `unix_sockaddr_init()` does.
+    let listener = match crate::unix_socket::listen(Path::new(socket_path)) {
         Ok(l) => l,
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
-            // The path did not fit in `sun_path`. Upstream chdirs to the
-            // directory and binds the basename; `init_socket_directory` has
-            // already put us there, so binding the basename is that same move.
-            let base = basename(socket_path);
-            match UnixListener::bind(base) {
-                Ok(l) => l,
-                Err(_) => {
-                    eprintln!(
-                        "fatal: unable to bind to '{socket_path}': {}",
-                        strerror(&e)
-                    );
-                    return Ok(ExitCode::from(128));
-                }
-            }
-        }
         Err(e) => {
             eprintln!("fatal: unable to bind to '{socket_path}': {}", strerror(&e));
             return Ok(ExitCode::from(128));
@@ -954,15 +936,6 @@ fn hex2chr(pair: &[u8]) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-/// The last path component, for the over-long-`sun_path` bind fallback.
-fn basename(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-    match trimmed.rfind('/') {
-        Some(i) => &trimmed[i + 1..],
-        None => trimmed,
-    }
-}
 
 /// The bare `strerror` text, without Rust's ` (os error N)` suffix, so the
 /// `fatal:` lines read exactly as git's `die_errno` ones do.

@@ -73,7 +73,8 @@
 //!     and stage #3 through `show_combined_diff()`, so the patch is a `diff --cc`
 //!     (or `diff --combined` under a bare `-c`) and, when a raw/name format is also
 //!     on, the record is the `::`-prefixed combined form.
-//!   * `-0`/`-1`/`-2`/`-3`, `--base`/`--ours`/`--theirs` (unmerged stage selection).
+//!   * `-0`/`-1`/`-2`/`-3` (any spelling of `--max-count`), `--base`/`--ours`/`--theirs`
+//!     (unmerged stage selection).
 //!   * `--color[=always|auto|never]`/`--no-color` and `--ws-error-highlight=<kind>`:
 //!     the patch and the stat graph are painted from the `color.diff.*` slots, with
 //!     git's `ws.c` whitespace-error markup driven by `core.whitespace`.
@@ -641,8 +642,6 @@ enum Fatal {
     /// the working tree" — exit 128. Which of the three it is depends on the
     /// argument's position, so the choice is made in [`crate::setup`].
     VerifyFilename(String),
-    /// `fatal: '<rest>': not an integer` from `-n<rest>`, exit 128.
-    NotAnInteger(String),
     /// `fatal: '<v>': not a non-negative integer`, exit 128 — `strtol_i`'s failure
     /// inside `--expand-tabs=<n>` (revision.c:2581-2582).
     NotNonNegInteger(String),
@@ -767,9 +766,6 @@ impl Fatal {
             }
             Fatal::VerifyFilename(msg) => {
                 let _ = writeln!(err, "fatal: {msg}");
-            }
-            Fatal::NotAnInteger(v) => {
-                let _ = writeln!(err, "fatal: '{v}': not an integer");
             }
             Fatal::NotNonNegInteger(v) => {
                 let _ = writeln!(err, "fatal: '{v}': not a non-negative integer");
@@ -1039,6 +1035,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // Set when the word just read spent the following argv slot on its value;
     // see the `revopt` arm below.
     let mut consumed_next = false;
+    // `revs->max_count` / `max_age` / `min_age` as `handle_revision_opt()` leaves
+    // them. diff-files never walks, but `run_diff_files()` reads `max_count` as
+    // the unmerged stage to compare (diff-lib.c:112-126), and `cmd_diff_files()`
+    // refuses an age or a count above 3 (builtin/diff-files.c:73-76).
+    let mut counts = crate::revopt::Counts::default();
 
     for (idx, a) in args.iter().enumerate() {
         let s = a.as_str();
@@ -1101,15 +1102,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             }
             // `handle_revision_opt()`'s count-and-age arm, which
             // `setup_revisions()` reaches for every word this table does not
-            // claim (builtin/diff-files.c:50). `diff-files` compares the index
-            // with the working tree and never walks, so all of these parse and
-            // then change nothing — the value checks and the argv arithmetic are
-            // the only observable part. `-1`/`-2`/`-3` are handled above as
-            // diff-files' own stage selectors, which is why `-01` is the shape
-            // that reaches here.
+            // claim (builtin/diff-files.c:50). The walk-only fields change
+            // nothing here, but `max_count` is the unmerged-stage selector, so
+            // `-0`..`-3`, `-01`, `-n 3` and `--max-count=3` all pick the stage.
             match crate::revopt::parse(args, idx) {
                 Some(Ok(hit)) => {
                     consumed_next = hit.consumed == 2;
+                    counts.apply(hit.what).map_err(Fatal::RevOptDie)?;
                     continue;
                 }
                 Some(Err(_)) if s == "-n" => return Err(Fatal::MissingArgument("-n")),
@@ -1261,6 +1260,26 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // the same text, refuses a non-empty `revs->pending`.
     if unknown.is_some() || pending_objects {
         return Err(Fatal::Usage);
+    }
+    // The leftover loop's `--base`/`--ours`/`--theirs` have already overwritten
+    // `rev.max_count` by the time it is checked, so a count only stands when none
+    // of them was given:
+    //
+    // ```c
+    // if (rev.pending.nr ||
+    //     rev.min_age != -1 || rev.max_age != -1 ||
+    //     3 < rev.max_count)
+    //         usage(diff_files_usage);
+    // ```
+    //
+    // (builtin/diff-files.c:73-76.) A negative count is git's `-1`, "no stage
+    // asked for", which `run_diff_files()` turns into stage 2 (diff-lib.c:125).
+    if counts.max_age.is_some() || counts.min_age.is_some() {
+        return Err(Fatal::Usage);
+    }
+    if let (false, Some(n)) = (opts.explicit_stage, counts.max_count) {
+        opts.unmerged_stage = u8::try_from(n).ok().filter(|&n| n <= 3).ok_or(Fatal::Usage)?;
+        opts.explicit_stage = true;
     }
     if quiet {
         // `--quiet` wins over every other format and turns on the exit status.
@@ -1590,19 +1609,19 @@ fn classify(
             opts.merges_need_diff = true;
         }
         "--full-index" => opts.full_index = true,
-        "-0" => {
-            opts.unmerged_stage = 0;
-            opts.explicit_stage = true;
-        }
-        "-1" | "--base" => {
+        // `cmd_diff_files()`'s own leftover-argv loop (builtin/diff-files.c:51-62),
+        // which runs after `setup_revisions()` and so overrides any `-<n>` count
+        // regardless of order. The digit spellings are `revs->max_count` and are
+        // folded in by [`parse`].
+        "--base" => {
             opts.unmerged_stage = 1;
             opts.explicit_stage = true;
         }
-        "-2" | "--ours" => {
+        "--ours" => {
             opts.unmerged_stage = 2;
             opts.explicit_stage = true;
         }
-        "-3" | "--theirs" => {
+        "--theirs" => {
             opts.unmerged_stage = 3;
             opts.explicit_stage = true;
         }
@@ -1889,17 +1908,6 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         crate::diffopt::check_break_rewrites(v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
         return Ok(Flag::Handled);
-    }
-    // `-n<count>` is `--max-count`; diff-files rejects any revision limiting,
-    // but only after the value itself parses.
-    if let Some(v) = s.strip_prefix("-n") {
-        return if v.is_empty() {
-            Err(Fatal::MissingArgument("-n"))
-        } else if v.parse::<i32>().is_ok() {
-            Err(Fatal::Usage)
-        } else {
-            Err(Fatal::NotAnInteger(v.to_owned()))
-        };
     }
     // `--inter-hunk-context=<n>` is an `OPT_MAGNITUDE` (`xecfg.interhunkctxlen`): two
     // change groups closer than `2 * ctxlen + interhunk` records land in one hunk. git

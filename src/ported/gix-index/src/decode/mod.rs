@@ -324,6 +324,7 @@ impl State {
                 resolve_undo,
                 untracked,
                 untracked_index_names: None,
+                untracked_changed: false,
                 fs_monitor,
             },
             checksum,

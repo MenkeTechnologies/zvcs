@@ -23,10 +23,7 @@ pub fn or_empty(repo: &gix::Repository) -> Result<gix::index::File, gix::worktre
         Err(gix::worktree::open_index::Error::IndexFile(gix::index::file::init::Error::Io(err)))
             if err.kind() == std::io::ErrorKind::NotFound =>
         {
-            Ok(gix::index::File::from_state(
-                gix::index::State::new(repo.object_hash()),
-                repo.index_path(),
-            ))
+            Ok(repo.missing_index())
         }
         Err(err) => Err(err),
     }

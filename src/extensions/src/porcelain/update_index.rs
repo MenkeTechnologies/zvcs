@@ -39,6 +39,11 @@
 //! `<path>: needs update` lines and the exit-1 with them, while still reporting
 //! `<path>: needs merge` for conflicted paths. `--test-untracked-cache` runs the
 //! real filesystem probe and, like git, returns before the index is written.
+//! `--untracked-cache` / `--force-untracked-cache` add an empty `UNTR` extension
+//! for this worktree (or keep the one built here) and `--no-untracked-cache` drops
+//! it, each with git's warning when `core.untrackedCache` says otherwise; the
+//! setting itself is applied to the index on the read, so a plain `update-index`
+//! under `core.untrackedCache=true` writes the extension too.
 //!
 //! `core.ignoreStat=true` is honoured: like stock git it sets the
 //! assume-unchanged (`CE_VALID`) bit on every entry this command writes, so the
@@ -96,10 +101,6 @@
 //! not write the extension. Each is invisible to `git status` / `git ls-files`,
 //! so behaviour observable through git itself is unaffected, but the index bytes
 //! differ from stock git's:
-//!   * `--untracked-cache` / `--no-untracked-cache` / `--force-untracked-cache`: an
-//!     `UNTR` extension already in the index is carried through every write and
-//!     invalidated where git invalidates it, but these options neither add one nor
-//!     take one away yet.
 //!   * `--fsmonitor`: the `FSMN` extension is not writable through the vendored crates.
 //!
 //! Content filters run where git runs them. `index_mem()` (read-cache.c:2295)
@@ -512,10 +513,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         (f, v)
     } else {
         // Never read, so `istate->version` is still zero (read-cache.c:2245).
-        let f = gix::index::File::from_state(
-            gix::index::State::new(repo.object_hash()),
-            repo.index_path(),
-        );
+        let f = repo.missing_index();
         (f, 0)
     };
     let stat_opts = repo.stat_options()?;
@@ -569,7 +567,10 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
         Outcome::Help => Ok(super::show_usage(USAGE)),
         Outcome::Exit(code) => Ok(ExitCode::from(code)),
         Outcome::Done => {
-            if ctx.dirty || ctx.force_write {
+            // `UNTRACKED_CHANGED` is part of `cache_changed`: making or dropping the
+            // untracked cache, here or in `tweak_untracked_cache()` on the read, is a
+            // reason to write on its own.
+            if ctx.dirty || ctx.force_write || ctx.index.untracked_changed() {
                 // `do_write_index()` refuses to serialise an entry whose object id
                 // is null, so the write fails and `cmd_update_index` dies. Without
                 // this, `--cacheinfo <mode>,<null oid>,<path>` writes an index
@@ -1024,22 +1025,40 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
         }
     }
 
-    // `report()`: `printf` under `--verbose`, silence otherwise. The extensions
-    // themselves are not writable through the vendored crates (see the module
-    // documentation), but the line git prints about them is, and its absence is
-    // a stdout difference on every verbose invocation.
+    // `report()`: `printf` under `--verbose`, silence otherwise. The `FSMN`
+    // extension is not writable through the vendored crates (see the module
+    // documentation), but the line git prints about it is, and its absence is a
+    // stdout difference on every verbose invocation.
+    let verbose = ctx.verbose;
     let report = |line: &str| {
-        if ctx.verbose {
+        if verbose {
             println!("{line}");
         }
     };
+    // builtin/update-index.c:1244-1270. The warnings compare the flag with
+    // `core.untrackedCache` as `prepare_repo_settings()` resolved it, and then do
+    // what the flag said regardless.
     match untracked_cache {
         UntrackedCache::Unspecified => {}
-        UntrackedCache::Disable => report("Untracked cache disabled"),
+        UntrackedCache::Disable => {
+            if ctx.repo.core_untracked_cache() == Some(true) {
+                eprintln!(
+                    "warning: core.untrackedCache is set to true; remove or change it, if you really want to disable the untracked cache"
+                );
+            }
+            ctx.index.remove_untracked_cache();
+            report("Untracked cache disabled");
+        }
         UntrackedCache::Test => {
             return Ok(Outcome::Exit(u8::from(!test_untracked_cache_supported())))
         }
         UntrackedCache::Enable | UntrackedCache::Force => {
+            if ctx.repo.core_untracked_cache() == Some(false) {
+                eprintln!(
+                    "warning: core.untrackedCache is set to false; remove or change it, if you really want to enable the untracked cache"
+                );
+            }
+            ctx.repo.add_untracked_cache(&mut ctx.index);
             // `repo_get_work_tree()` is an absolute path — `setup_work_tree()`
             // chdir's there and takes `getcwd()`, so symlinks are already
             // resolved — and NULL in a bare repository, which git's `printf`

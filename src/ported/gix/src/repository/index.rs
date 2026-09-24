@@ -67,6 +67,8 @@ impl crate::Repository {
                 alloc_limit_bytes: self.config.alloc_limit_bytes,
             },
         )?;
+        let mut index = index;
+        self.tweak_untracked_cache(&mut index);
 
         Ok(index)
     }
@@ -123,10 +125,7 @@ impl crate::Repository {
     /// ```
     pub fn index_or_empty(&self) -> Result<worktree::Index, worktree::open_index::Error> {
         Ok(self.try_index()?.unwrap_or_else(|| {
-            worktree::Index::new(gix_fs::FileSnapshot::new(gix_index::File::from_state(
-                gix_index::State::new(self.object_hash()),
-                self.index_path(),
-            )))
+            worktree::Index::new(gix_fs::FileSnapshot::new(self.missing_index()))
         }))
     }
 
@@ -213,10 +212,7 @@ impl crate::Repository {
                     let head_tree_id = id.object()?.peel_to_commit()?.tree_id()?;
                     IndexPersistedOrInMemory::InMemory(self.index_from_tree(&head_tree_id)?)
                 }
-                None => IndexPersistedOrInMemory::InMemory(gix_index::File::from_state(
-                    gix_index::State::new(self.object_hash()),
-                    self.index_path(),
-                )),
+                None => IndexPersistedOrInMemory::InMemory(self.missing_index()),
             },
         })
     }
@@ -234,6 +230,66 @@ impl crate::Repository {
             })?,
             self.index_path(),
         ))
+    }
+
+    /// The index git's `do_read_index()` produces when `.git/index` does not exist: empty,
+    /// and — because `read_index_from()` runs `post_read_index_from()` whatever the read found
+    /// (read-cache.c:2365-2371) — already tweaked by `core.untrackedCache`.
+    pub fn missing_index(&self) -> gix_index::File {
+        let mut index = gix_index::File::from_state(gix_index::State::new(self.object_hash()), self.index_path());
+        self.tweak_untracked_cache(&mut index);
+        index
+    }
+
+    /// `r->settings.core_untracked_cache` (repo-settings.c:59-63 and :107-118): `Some(true)` for
+    /// `UNTRACKED_CACHE_WRITE`, `Some(false)` for `UNTRACKED_CACHE_REMOVE` and `None` for
+    /// `UNTRACKED_CACHE_KEEP`.
+    ///
+    /// `feature.manyFiles` defaults it to write; an explicit `core.untrackedCache` that parses as
+    /// a boolean overrides that, and anything else — `keep`, or a value that is no boolean at
+    /// all — leaves the default standing.
+    pub fn core_untracked_cache(&self) -> Option<bool> {
+        let config = self.config_snapshot();
+        let many_files = config.boolean("feature.manyFiles").unwrap_or(false);
+        config
+            .boolean("core.untrackedCache")
+            .or_else(|| many_files.then_some(true))
+    }
+
+    /// `get_ident_string()` for this repository: the location its untracked cache must name.
+    ///
+    /// `repo_get_work_tree()` is the real path of the worktree, which is what makes a cache built
+    /// through `/tmp` valid when read through `/private/tmp`.
+    pub fn untracked_cache_ident(&self) -> crate::bstr::BString {
+        let worktree = self
+            .workdir()
+            .map(|dir| gix_path::realpath(dir).unwrap_or_else(|_| dir.to_owned()));
+        gix_index::extension::untracked_cache::ident(worktree.as_deref())
+    }
+
+    /// `new_untracked_cache_flags()` (dir.c:2919-2939): `status.showUntrackedFiles=all` builds the
+    /// cache for a walk that lists every file, anything else for `normal`'s directory summaries.
+    pub fn new_untracked_cache_flags(&self) -> u32 {
+        use gix_index::extension::untracked_cache::{DIR_HIDE_EMPTY_DIRECTORIES, DIR_SHOW_OTHER_DIRECTORIES};
+        match self.config_snapshot().string("status.showuntrackedfiles") {
+            Some(value) if value.as_slice() == b"all" => 0,
+            _ => DIR_SHOW_OTHER_DIRECTORIES | DIR_HIDE_EMPTY_DIRECTORIES,
+        }
+    }
+
+    /// `add_untracked_cache()` (dir.c:2952-2962) for this repository's location.
+    pub fn add_untracked_cache(&self, index: &mut gix_index::State) {
+        index.add_untracked_cache(self.untracked_cache_ident().as_ref(), || self.new_untracked_cache_flags());
+    }
+
+    /// `tweak_untracked_cache()` (read-cache.c:1908-1930), which `post_read_index_from()` runs on
+    /// every index git reads.
+    fn tweak_untracked_cache(&self, index: &mut gix_index::State) {
+        match self.core_untracked_cache() {
+            Some(false) => index.remove_untracked_cache(),
+            Some(true) => self.add_untracked_cache(index),
+            None => {}
+        }
     }
 }
 

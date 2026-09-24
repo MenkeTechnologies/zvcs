@@ -49,6 +49,11 @@
 //! * `pack.usePathWalk` → the default for `pack-objects --path-walk`, which
 //!   decides whether the two `warning: cannot use <option> with --path-walk`
 //!   diagnostics fire; see [`RepoSettings::pack_use_path_walk`].
+//! * `feature.manyFiles` → the default for `core.untrackedCache`, which
+//!   `gix::Repository::core_untracked_cache()` resolves the same way and every
+//!   index read applies (`tweak_untracked_cache()`), and the default for
+//!   `index.version = 4`, which [`crate::config::index_format_default`] reads for
+//!   the writes where git chooses a version at all.
 //!
 //! Read, validated, and diagnosed exactly as git does, but with no further
 //! effect because the machinery they tune does not exist in this port:
@@ -65,11 +70,6 @@
 //! * `pack.useSparse`, `pack.readReverseIndex` and
 //!   `pack.useBitmapBoundaryTraversal` — see their fields below for what each
 //!   would have steered.
-//! * `feature.manyFiles`' `core.untrackedCache = write`, because the index
-//!   writer never emits the `UNTR` extension. Its `index.version = 4` *is*
-//!   honored — [`crate::config::index_format_default`] reads the cascade and
-//!   `gix-index`'s writer emits version 4's prefix-compressed entries — for the
-//!   writes where git chooses a version at all.
 
 use crate::config::config_ulong;
 

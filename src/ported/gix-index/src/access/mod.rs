@@ -797,6 +797,32 @@ impl State {
             .then(|| extension::untracked_cache::IndexNames::of(self));
         self.untracked = untracked;
     }
+    /// `add_untracked_cache()` (dir.c:2952-2962): give this state a cache for the location
+    /// `ident` names ([`extension::untracked_cache::ident()`]), keeping the one it has when that
+    /// was built there. `dir_flags` is `new_untracked_cache_flags()`, asked only when a cache is
+    /// made.
+    pub fn add_untracked_cache(&mut self, ident: &BStr, dir_flags: impl FnOnce() -> u32) {
+        if self.untracked.as_ref().is_some_and(|uc| uc.ident_matches(ident)) {
+            return;
+        }
+        // `new_untracked_cache()` marks `UNTRACKED_CHANGED`; replacing a foreign cache and
+        // making the first one are the same call.
+        let cache = extension::UntrackedCache::new(ident.to_owned(), dir_flags());
+        self.set_untracked(Some(cache));
+        self.untracked_changed = true;
+    }
+    /// `remove_untracked_cache()` (dir.c:2964-2971).
+    pub fn remove_untracked_cache(&mut self) {
+        if self.untracked.take().is_some() {
+            self.untracked_index_names = None;
+            self.untracked_changed = true;
+        }
+    }
+    /// git's `cache_changed & UNTRACKED_CHANGED`: whether the cache was created, replaced or
+    /// removed since this state was read, which on its own is a reason to write the index.
+    pub fn untracked_changed(&self) -> bool {
+        self.untracked_changed
+    }
     /// Adopt `src`'s untracked cache — the half of `move_index_extensions()`
     /// (read-cache.c:3497-3503) that `unpack_trees()` runs on its result (unpack-trees.c:2077) —
     /// together with the entries it was last reconciled against, so that the names this state

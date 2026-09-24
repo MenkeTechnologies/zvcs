@@ -116,9 +116,60 @@ impl Directory {
 pub const SIGNATURE: Signature = *b"UNTR";
 
 /// `DIR_SHOW_OTHER_DIRECTORIES` (dir.h:228), the one `dir_flags` bit invalidation consults.
-const DIR_SHOW_OTHER_DIRECTORIES: u32 = 1 << 1;
+pub const DIR_SHOW_OTHER_DIRECTORIES: u32 = 1 << 1;
+/// `DIR_HIDE_EMPTY_DIRECTORIES` (dir.h:231).
+pub const DIR_HIDE_EMPTY_DIRECTORIES: u32 = 1 << 2;
+
+/// `get_ident_string()` (dir.c:2882-2894) as `set_untracked_ident()` stores it (dir.c:2908-2917):
+/// `Location <worktree>, system <sysname>` followed by a NUL, "for backward compatibility" with
+/// the NUL-separated list the field used to hold.
+///
+/// `worktree` is `repo_get_work_tree()`, which is already absolute and free of symlinks; a
+/// repository without one prints it as glibc and Darwin libc both print a `NULL` `%s`.
+pub fn ident(worktree: Option<&std::path::Path>) -> BString {
+    let mut ident: BString = match worktree {
+        Some(worktree) => format!("Location {}, system {}", worktree.display(), sysname()),
+        None => format!("Location (null), system {}", sysname()),
+    }
+    .into();
+    ident.push(0);
+    ident
+}
+
+/// `uts.sysname` from `uname(2)`.
+#[cfg(unix)]
+fn sysname() -> String {
+    rustix::system::uname().sysname().to_string_lossy().into_owned()
+}
+
+/// `compat/mingw.c`'s `uname()` fills in `Windows`.
+#[cfg(not(unix))]
+fn sysname() -> String {
+    "Windows".into()
+}
 
 impl UntrackedCache {
+    /// `new_untracked_cache()` (dir.c:2941-2950): a cache with no directories yet, for the
+    /// location `ident` names (see [`ident()`]), built with `dir_flags`.
+    pub fn new(ident: BString, dir_flags: u32) -> Self {
+        UntrackedCache {
+            identifier: ident,
+            info_exclude: None,
+            excludes_file: None,
+            exclude_filename_per_dir: ".gitignore".into(),
+            dir_flags,
+            directories: Vec::new(),
+        }
+    }
+
+    /// `ident_in_untracked()` (dir.c:2896-2906): whether this cache was built at the location
+    /// `ident` names. Only the first of the NUL-separated strings older gits stored is compared,
+    /// as git's `strcmp()` does.
+    pub fn ident_matches(&self, ident: &bstr::BStr) -> bool {
+        let first = |s: &[u8]| s.split(|b| *b == 0).next().unwrap_or_default().to_vec();
+        first(&self.identifier) == first(ident)
+    }
+
     /// `untracked_cache_invalidate_path(istate, path, 1)` (dir.c:4015-4024), which is also
     /// `untracked_cache_add_to_index()` and `untracked_cache_remove_from_index()`
     /// (dir.c:4046-4056): the index gained or lost `path`, so the directory holding it can no

@@ -132,19 +132,37 @@ impl Fixture {
         std::fs::read(self.work.join(".git/index")).unwrap()
     }
 
-    /// Run `args` with `bin` on a fresh fixture and report the cache it left behind and what
-    /// stock's `status` then says about the repository.
-    fn outcome(&self, bin: &str, args: &[&str]) -> (Option<String>, String, String) {
+    /// Run `args` with `bin` on a fresh fixture, after stock has run each of `pre`, and report
+    /// the cache it left behind, its stderr, and what stock's `status` then says about the
+    /// repository.
+    fn outcome(&self, bin: &str, pre: &[&[&str]], args: &[&str]) -> Outcome {
         self.reset();
+        for step in pre {
+            self.stock(step);
+        }
         let out = self.run(bin, args);
         assert!(out.status.success(), "`{bin} {args:?}` failed: {out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
         let cache = untracked_cache(&self.index());
         // `-uall` first: it walks with different `dir_flags`, which stock answers by building a
         // new cache — so the default listing, which *uses* the cache, has to be read before.
         let normal = self.stock(&["status", "--porcelain"]);
         let all = self.stock(&["status", "--porcelain", "--untracked-files=all"]);
-        (cache, normal, all)
+        Outcome {
+            cache,
+            stderr,
+            normal,
+            all,
+        }
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct Outcome {
+    cache: Option<String>,
+    stderr: String,
+    normal: String,
+    all: String,
 }
 
 /// The `UNTR` body rendered without its stat data: `dir_flags`, the exclude-file hashes, the
@@ -174,9 +192,11 @@ fn untracked_cache(index: &[u8]) -> Option<String> {
         s
     };
     let ident_len = varint(&mut pos) as usize;
-    // The ident, then the two 36-byte `stat_data` records of the exclude files.
+    // Both runs of a scenario use one path, so the ident is comparable.
+    let mut out = format!("ident={:?}", String::from_utf8_lossy(&body[pos..pos + ident_len]));
+    // The two 36-byte `stat_data` records of the exclude files.
     pos += ident_len + 72;
-    let mut out = format!("flags={:08x}", u32::from_be_bytes(body[pos..pos + 4].try_into().unwrap()));
+    out += &format!(" flags={:08x}", u32::from_be_bytes(body[pos..pos + 4].try_into().unwrap()));
     pos += 4;
     for _ in 0..2 {
         out += &format!(" {}", hex(&body[pos..pos + 20]));
@@ -208,18 +228,29 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn assert_like_stock(tag: &str, args: &[&str]) {
+/// Run `args` on the fixture with stock and with this binary, after stock has run `pre`, and
+/// require the same cache, the same stderr and the same stock `status` listings. Returns stock's
+/// outcome so a scenario can also assert what that outcome is.
+fn assert_like_stock_after(tag: &str, pre: &[&[&str]], args: &[&str]) -> Option<Outcome> {
     let Some(stock) = stock_git() else {
         eprintln!("no stock git available; skipping");
-        return;
+        return None;
     };
     let f = Fixture::new(tag, &stock);
-    let theirs = f.outcome(&stock, args);
-    let ours = f.outcome(BIN, args);
-    assert!(theirs.0.is_some(), "stock dropped its own cache on `{args:?}`");
-    assert_eq!(ours.0, theirs.0, "untracked cache after `{args:?}`");
-    assert_eq!(ours.1, theirs.1, "stock `status` after `{args:?}`");
-    assert_eq!(ours.2, theirs.2, "stock `status -uall` after `{args:?}`");
+    let theirs = f.outcome(&stock, pre, args);
+    let ours = f.outcome(BIN, pre, args);
+    assert_eq!(ours.cache, theirs.cache, "untracked cache after `{args:?}`");
+    assert_eq!(ours.stderr, theirs.stderr, "stderr of `{args:?}`");
+    assert_eq!(ours.normal, theirs.normal, "stock `status` after `{args:?}`");
+    assert_eq!(ours.all, theirs.all, "stock `status -uall` after `{args:?}`");
+    Some(theirs)
+}
+
+/// [`assert_like_stock_after`] on the populated cache itself, which stock must keep.
+fn assert_like_stock(tag: &str, args: &[&str]) {
+    if let Some(theirs) = assert_like_stock_after(tag, &[], args) {
+        assert!(theirs.cache.is_some(), "stock dropped its own cache on `{args:?}`");
+    }
 }
 
 /// The stock-built cache comes back byte for byte when nothing about the entries changed.
@@ -282,4 +313,70 @@ fn a_hard_reset_invalidates_every_entry_it_rewrote() {
 #[test]
 fn a_branch_switch_invalidates_every_entry_it_rewrote() {
     assert_like_stock("checkout", &["checkout", "-q", "side"]);
+}
+
+// ---- making and dropping the cache ------------------------------------------------------
+//
+// `tweak_untracked_cache()` (read-cache.c:1908-1930) runs on every index git reads:
+// `core.untrackedCache=false` drops the cache, `true` adds one unless the index already holds
+// one built at this location (`add_untracked_cache()`, dir.c:2952-2962), and `keep`, unset or
+// a non-boolean leaves it alone. A fresh cache names its location in the ident, has no
+// directories yet, and takes `dir_flags` from `status.showUntrackedFiles` (dir.c:2919-2950).
+// `update-index --[no-]untracked-cache` does the same by hand and warns when the configuration
+// disagrees (builtin/update-index.c:1244-1270).
+
+/// The fixture's config says `true`; the flag wins, with git's warning.
+#[test]
+fn update_index_no_untracked_cache_drops_it_and_warns_against_the_config() {
+    if let Some(theirs) = assert_like_stock_after("uc-disable", &[], &["update-index", "--no-untracked-cache"]) {
+        assert_eq!(theirs.cache, None);
+        assert!(theirs.stderr.contains("core.untrackedCache is set to true"), "{:?}", theirs.stderr);
+    }
+}
+
+/// With the cache dropped by hand and the configuration unset, `--untracked-cache` makes an
+/// empty one with `status.showUntrackedFiles=all`'s flags.
+#[test]
+fn update_index_untracked_cache_makes_an_empty_cache() {
+    let pre: &[&[&str]] = &[
+        &["config", "--unset", "core.untrackedCache"],
+        &["update-index", "--no-untracked-cache"],
+        &["config", "status.showUntrackedFiles", "all"],
+    ];
+    if let Some(theirs) = assert_like_stock_after("uc-enable", pre, &["update-index", "--untracked-cache"]) {
+        assert!(theirs.cache.as_deref().is_some_and(|c| c.contains("flags=00000000")), "{theirs:?}");
+    }
+}
+
+/// `core.untrackedCache=false` on the command line drops the cache on the read, so any write
+/// leaves it out.
+#[test]
+fn a_command_under_untracked_cache_false_drops_the_cache() {
+    if let Some(theirs) = assert_like_stock_after("uc-false", &[], &["-c", "core.untrackedCache=false", "add", "untr"]) {
+        assert_eq!(theirs.cache, None);
+    }
+}
+
+/// `core.untrackedCache=true` on an index with no cache: the read makes one, and the write
+/// carries it — `commit` included, whose `SKIP_IF_UNCHANGED` write counts `UNTRACKED_CHANGED`.
+#[test]
+fn a_command_under_untracked_cache_true_makes_one() {
+    let pre: &[&[&str]] = &[&["-c", "core.untrackedCache=keep", "update-index", "--no-untracked-cache"]];
+    for (tag, args) in [
+        ("uc-true-add", &["add", "untr"][..]),
+        ("uc-true-commit", &["commit", "-q", "--allow-empty", "-m", "empty"][..]),
+    ] {
+        if let Some(theirs) = assert_like_stock_after(tag, pre, args) {
+            assert!(theirs.cache.as_deref().is_some_and(|c| c.contains("blocks=0")), "{theirs:?}");
+        }
+    }
+}
+
+/// `keep` and a value that is no boolean both leave the populated cache exactly as it is.
+#[test]
+fn keep_and_a_bogus_value_leave_the_cache_alone() {
+    for value in ["keep", "bogus"] {
+        let config = format!("core.untrackedCache={value}");
+        assert_like_stock(&format!("uc-{value}"), &["-c", &config, "add", "untr"]);
+    }
 }

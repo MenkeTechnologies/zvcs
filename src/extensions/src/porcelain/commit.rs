@@ -1715,6 +1715,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // cache-tree past the hook, on the way to the commit it never made.
     if !all && !include_flag && !only_mode {
         super::write_tree::update_cache_tree_if_stale(&repo, &mut index)?;
+        // `SKIP_IF_UNCHANGED` skips only an index whose `cache_changed` is zero, and the
+        // `UNTRACKED_CHANGED` bit `tweak_untracked_cache()` sets on the read counts: a
+        // cache `core.untrackedCache` just created or dropped is written here.
+        if index.untracked_changed() {
+            crate::index_racy::write(&repo, &mut index)?;
+        }
     }
 
     // --- `prepare_index()`'s return value: the index this commit is built from ---

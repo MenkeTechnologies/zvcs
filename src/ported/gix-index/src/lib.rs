@@ -203,6 +203,8 @@ pub struct State {
     /// The `(path, stage)` pairs the entries held when `untracked` was last brought up to
     /// date with them — see [`State::invalidate_untracked_for_changed_entries()`].
     untracked_index_names: Option<extension::untracked_cache::IndexNames>,
+    /// git's `UNTRACKED_CHANGED` bit of `cache_changed`; see [`State::untracked_changed()`].
+    untracked_changed: bool,
     fs_monitor: Option<extension::FsMonitor>,
 }
 

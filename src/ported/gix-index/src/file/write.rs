@@ -99,6 +99,9 @@ impl File {
         };
         self.state.version = version;
         self.checksum = Some(digest);
+        // The file on disk now carries the created or dropped cache, so the change is no
+        // longer a reason for a caller to write again.
+        self.state.untracked_changed = false;
         Ok(())
     }
 }

@@ -64,8 +64,9 @@ struct Opts {
 ///
 /// See the module docs for the supported flags and the fidelity notes.
 pub fn credential_netrc(args: &[String]) -> Result<ExitCode> {
-    // `args[0]` is the subcommand name itself, as dispatch hands it over.
-    let (opts, rest) = parse_args(args.get(1..).unwrap_or(&[]))?;
+    // `dispatch::run` hands over the arguments *after* the verb, so `args` is
+    // exactly the script's `@ARGV`.
+    let (opts, rest) = parse_args(args)?;
 
     if opts.help {
         print!("{}", help_text());

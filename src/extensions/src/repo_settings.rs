@@ -224,6 +224,13 @@ impl RepoSettings {
         // `pack.usePathWalk` unset lands on 0 even under `feature.experimental`.
         let pack_use_sparse = config_bool_strict(repo, "pack.usesparse")?.unwrap_or(true);
         let pack_use_path_walk = config_bool_strict(repo, "pack.usepathwalk")?.unwrap_or(false);
+        // repo-settings.c:79-80. Neither value is consumed yet (gix picks its
+        // own multi-pack-index and sparse-index handling), but `repo_cfg_bool`
+        // dies on a value it cannot parse: `index.sparse = all` stops every
+        // command that prepares the settings — `rebase -i` included — with
+        // `bad boolean config value 'all' for 'index.sparse'`.
+        config_bool_strict(repo, "core.multipackindex")?;
+        config_bool_strict(repo, "index.sparse")?;
 
         // repo-settings.c:79 — `repo_cfg_bool(r, "index.skiphash", …, r->settings.index_skip_hash)`,
         // i.e. the cascaded value is this key's *default*, not its competitor.
@@ -286,6 +293,8 @@ impl RepoSettings {
         if let Some(v) = config_bool_strict(repo, "pack.usebitmapboundarytraversal")? {
             pack_use_bitmap_boundary_traversal = v;
         }
+        // repo-settings.c:86, validated for the same reason as the two above.
+        config_bool_strict(repo, "core.usereplacerefs")?;
 
         // repo-settings.c:142-143 (2.55.0) — `repo_config_get_ulong(r,
         // "core.deltabasecachelimit", &ulongval)`, read ahead of the window size.

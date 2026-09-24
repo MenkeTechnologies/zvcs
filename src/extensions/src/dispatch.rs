@@ -1386,7 +1386,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         && !SUPERSET_VERBS.contains(&sub)
         && !rev_parse_before_setup
     {
-        crate::config::check_bare_and_worktree();
+        crate::config::check_bare_and_worktree()?;
     }
 
     let help_only = args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all");

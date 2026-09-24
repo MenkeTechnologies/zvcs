@@ -2975,17 +2975,24 @@ pub fn worktree_config_is_bogus() -> bool {
 /// `git_config_from_file()`, so neither `-c core.bare=false` nor an `[include]`
 /// changes the answer. A format `verify_repository_format()` refuses returns
 /// before any of this, as does a config that names no version.
-pub fn check_bare_and_worktree() {
+///
+/// The arm after it is the one that can die (setup.c:1156-1170): with the
+/// repository not bare, a *relative* `core.worktree` is installed by `chdir()`ing
+/// to the git directory and then to the value, and a value naming no directory —
+/// the empty string included, which `chdir("")` refuses with `ENOENT` — is
+/// `die_errno(_("cannot chdir to '%s'"), git_work_tree_cfg)` for every verb that
+/// runs setup, before the builtin says a word. The error is that `die()`.
+pub fn check_bare_and_worktree() -> anyhow::Result<()> {
     if std::env::var_os("GIT_WORK_TREE").is_some() {
-        return;
+        return Ok(());
     }
     let Some(dirs) = repository_directories() else {
-        return;
+        return Ok(());
     };
     let common_config = dirs.common_dir.join("config");
     let format = read_repository_format(&common_config);
     if format.version < 0 || verify_repository_format(&format).is_some() {
-        return;
+        return Ok(());
     }
     // `get_common_dir()`: `$GIT_COMMON_DIR`, or a `commondir` file in `$GIT_DIR`.
     let mut has_common = std::env::var_os("GIT_COMMON_DIR").is_some()
@@ -3000,11 +3007,28 @@ pub fn check_bare_and_worktree() {
     // `git --bare` starts `is_bare_repository_cfg` at 1 (git.c:258); a
     // `core.bare` in the files replaces it.
     let is_bare = is_bare.or(gix::open::bare_repository_cfg().then_some(true));
-    if has_common || is_bare != Some(true) || work_tree.is_none() {
-        return;
+    let Some(work_tree) = work_tree.filter(|_| !has_common) else {
+        return Ok(());
+    };
+    if is_bare == Some(true) {
+        eprintln!("warning: core.bare and core.worktree do not make sense");
+        WORKTREE_CONFIG_IS_BOGUS.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(());
     }
-    eprintln!("warning: core.bare and core.worktree do not make sense");
-    WORKTREE_CONFIG_IS_BOGUS.store(true, std::sync::atomic::Ordering::Relaxed);
+    if std::path::Path::new(&work_tree).is_absolute() {
+        return Ok(());
+    }
+    let chdir = if work_tree.is_empty() {
+        Err(std::io::Error::from_raw_os_error(libc::ENOENT))
+    } else {
+        std::fs::read_dir(dirs.git_dir.join(&work_tree)).map(drop)
+    };
+    chdir.map_err(|err| {
+        crate::fatal::die(format!(
+            "cannot chdir to '{work_tree}': {}",
+            crate::external::strerror(&err)
+        ))
+    })
 }
 
 /// `read_worktree_config()` over one file: the last `core.bare` and the last

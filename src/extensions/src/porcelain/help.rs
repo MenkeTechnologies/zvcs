@@ -1746,7 +1746,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             // `setup_git_directory_gently()` runs here and nowhere earlier in
             // `cmd_help()` (builtin/help.c:743), so `-a`, `-g`, `--config` and a
             // bare `help` never meet a repository's setup warnings.
-            crate::config::check_bare_and_worktree();
+            crate::config::check_bare_and_worktree()?;
             let config = match help_config() {
                 Ok(c) => c,
                 Err(code) => return Ok(code),

@@ -229,3 +229,25 @@ fn two_tree_merge_carries_skip_worktree_without_any_patterns() {
     assert_eq!(f.tags(), "H init.t\nH sub/added\nH sub/addedtoo\nS subsub/added\n");
     assert_eq!(f.stdout(&["status", "--porcelain"]), "");
 }
+
+/// No `info/sparse-checkout` at all is not an empty pattern list: the failed
+/// `open()` makes `get_sparse_checkout_patterns()` return -1, and
+/// `populate_from_existing_patterns()` (unpack-trees.c:1829-1836) answers that with
+/// `o->skip_sparse_checkout = 1`. Nothing is sparsified, and the bits an earlier
+/// sparse read left behind are carried rather than recomputed.
+#[test]
+fn missing_pattern_file_skips_the_filter() {
+    let f = Fixture::new("nofile");
+    f.git(&["config", "core.sparsecheckout", "true"]);
+
+    f.git(&["read-tree", "-m", "-u", "HEAD"]);
+    assert_eq!(f.tags(), ALL_IN);
+    assert!(f.exists("init.t"));
+
+    f.enable_sparse("sub/\n");
+    f.git(&["read-tree", "-m", "-u", "HEAD"]);
+    std::fs::remove_file(f.work.join(".git/info/sparse-checkout")).unwrap();
+    f.git(&["read-tree", "-m", "-u", "HEAD"]);
+    assert_eq!(f.tags(), ONLY_SUB);
+    assert!(!f.exists("init.t"), "a skipped filter must not write the file back");
+}

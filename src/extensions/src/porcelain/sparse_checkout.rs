@@ -863,8 +863,14 @@ pub(crate) struct UnpackPatterns {
 impl UnpackPatterns {
     /// The pattern file as `unpack_trees()` reads it, with `cone` the in-process
     /// `core_sparse_checkout_cone` rather than whatever the file's writer set since.
-    pub(crate) fn load(repo: &gix::Repository, cone: bool) -> Result<Self> {
-        let lines = read_pattern_file(repo)?;
+    ///
+    /// `None` is `populate_from_existing_patterns()` (unpack-trees.c:1829-1836) finding
+    /// no file to open: `add_patterns_from_file_to_list()` is handed a NULL `istate`, so
+    /// a failed `open()` returns -1 (dir.c:1164-1170) and `o->skip_sparse_checkout` is
+    /// set — the skip-worktree bits are left alone rather than every path excluded.
+    pub(crate) fn load(repo: &gix::Repository, cone: bool) -> Option<Self> {
+        let text = std::fs::read_to_string(pattern_path(repo)).ok()?;
+        let lines: Vec<String> = text.lines().map(str::to_owned).collect();
         let mut full_cone = false;
         for l in &lines {
             match l.trim_end_matches('\r') {
@@ -873,7 +879,7 @@ impl UnpackPatterns {
                 _ => {}
             }
         }
-        Ok(UnpackPatterns {
+        Some(UnpackPatterns {
             sparsity: if cone {
                 Sparsity::Cone(Cone::new(cone_dirs(&lines)))
             } else {

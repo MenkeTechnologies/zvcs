@@ -1801,7 +1801,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     sparse_init_failed = true;
                     return Ok(());
                 }
-                Some(super::sparse_checkout::UnpackPatterns::load(checkout.repo(), cone)?)
+                super::sparse_checkout::UnpackPatterns::load(checkout.repo(), cone)
             } else {
                 None
             };

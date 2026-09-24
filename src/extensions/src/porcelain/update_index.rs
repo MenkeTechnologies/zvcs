@@ -92,13 +92,10 @@
 //! so a conflict resolved through this port stays recoverable by stock git's
 //! `git checkout --merge`.
 //!
-//! Accepted but not represented on disk, because the vendored `gix_index` writes
-//! neither the extension nor a pinned header version. Each is invisible to
-//! `git status` / `git ls-files`, so behaviour observable through git itself is
-//! unaffected, but the index bytes differ from stock git's:
-//!   * `--index-version <n>`: the range check and the resulting index write are
-//!     performed, but `gix_index` derives V2/V3 from the entry flags and cannot
-//!     emit V4 or be pinned.
+//! Accepted but not represented on disk, because the vendored `gix_index` does
+//! not write the extension. Each is invisible to `git status` / `git ls-files`,
+//! so behaviour observable through git itself is unaffected, but the index bytes
+//! differ from stock git's:
 //!   * `--untracked-cache`, `--fsmonitor`: the `UNTR` and `FSMN` extensions are
 //!     not writable through the vendored crates.
 //!

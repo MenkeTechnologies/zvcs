@@ -12,8 +12,8 @@
 //!     `store` and `erase` — stdin relayed verbatim to EOF. The write side is
 //!     shut down, then every byte the daemon answers with is written to stdout
 //!     unchanged (`capability[]=…`/`username=`/`password=` lines and all).
-//!   * All four actions: `exit` (no stdin relay, never spawns a daemon), and
-//!     `get`/`store`/`erase` (relay + spawn-on-demand). Any other action is
+//!   * All four actions: `exit` (no stdin relay, never spawns a daemon),
+//!     `get`/`erase` (relay, never spawn) and `store` (relay + spawn-on-demand). Any other action is
 //!     silently ignored with exit 0, exactly as `cmd_main` does.
 //!   * `--timeout <n>` (default 900) and `--socket <path>`, in the stuck
 //!     (`--timeout=30`), separate (`--timeout 30`), negated (`--no-timeout`,
@@ -184,7 +184,11 @@ pub fn credential_cache(args: &[String]) -> Result<ExitCode> {
         // `exit` neither relays stdin nor starts a daemon: with nothing listening
         // there is nothing to shut down, and git returns 0 without a word.
         "exit" => do_cache(&socket_path, action, timeout, false, false),
-        "get" | "store" | "erase" => do_cache(&socket_path, action, timeout, true, true),
+        // Only `store` carries `FLAG_SPAWN` (builtin/credential-cache.c:177-180):
+        // a `get` or `erase` with no daemon listening has nothing to read or
+        // forget, so git answers 0 without starting one.
+        "get" | "erase" => do_cache(&socket_path, action, timeout, false, true),
+        "store" => do_cache(&socket_path, action, timeout, true, true),
         // "ignore unknown operation"
         _ => Ok(ExitCode::SUCCESS),
     }
@@ -225,7 +229,7 @@ fn default_socket_path() -> Option<PathBuf> {
     home.map(|h| Path::new(&h).join(".cache/git/credential/socket"))
 }
 
-/// `do_cache()`: build the request, try it, and — for the relaying actions —
+/// `do_cache()`: build the request, try it, and — for `store` —
 /// start a daemon and try once more if nothing was listening.
 fn do_cache(
     socket: &Path,

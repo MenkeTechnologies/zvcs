@@ -251,14 +251,17 @@ fn info(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `print_fields()` (builtin/repo.c:130-153): an unknown key is `ret =
+    // error(...); continue;`, so the keys after it are still printed and the -1
+    // only surfaces as the exit code, 255.
     let repo = crate::setup::discover()?;
+    let mut code = ExitCode::SUCCESS;
     for key in wanted {
         let Some(value) = value_of(&repo, key) else {
-            // Values already written stay on stdout; git returns -1 here, which
-            // the process exits with as 255.
             out.flush()?;
             eprintln!("error: key '{key}' not found");
-            return Ok(ExitCode::from(255));
+            code = ExitCode::from(255);
+            continue;
         };
         match format {
             Format::Nul => write!(out, "{key}\n{value}\0")?,
@@ -266,7 +269,7 @@ fn info(args: &[String]) -> Result<ExitCode> {
         }
     }
     out.flush()?;
-    Ok(ExitCode::SUCCESS)
+    Ok(code)
 }
 
 /// Resolve one documented info key, or `None` if git wouldn't recognise it.

@@ -692,3 +692,58 @@ fn a_trailing_dot_component_is_a_directory_spec_everywhere() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "dir/b.txt\n");
     let _ = std::fs::remove_dir_all(&repo);
 }
+
+/// `get_global_magic()` is OR-ed into every element (pathspec.c:469), so the
+/// `--glob-pathspecs`/`--icase-pathspecs`/`--noglob-pathspecs` bits are measured
+/// against a verb's mask like magic that was written out. `ls-tree` and
+/// `check-ignore` refuse them; `:(literal)` suppresses the global `glob` and
+/// `:(glob)` the global `literal`, exactly as the element's own magic would.
+#[test]
+fn global_pathspec_magic_is_measured_against_the_mask() {
+    let repo = fixture("global");
+    let with = |var: &str, args: &[&str]| {
+        Command::new(BIN)
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &repo)
+            .env("ZVCS_HOME", &repo)
+            .env_remove("GIT_LITERAL_PATHSPECS")
+            .env_remove("GIT_GLOB_PATHSPECS")
+            .env_remove("GIT_ICASE_PATHSPECS")
+            .env_remove("GIT_NOGLOB_PATHSPECS")
+            .env(var, "1")
+            .output()
+            .unwrap()
+    };
+    for (var, args, stderr) in [
+        (
+            "GIT_GLOB_PATHSPECS",
+            &["ls-tree", "HEAD", "a.txt"][..],
+            "fatal: a.txt: pathspec magic not supported by this command: 'glob'\n",
+        ),
+        (
+            "GIT_ICASE_PATHSPECS",
+            &["ls-tree", "HEAD", ":(glob)a.txt"][..],
+            "fatal: :(glob)a.txt: pathspec magic not supported by this command: 'glob', 'icase'\n",
+        ),
+        (
+            "GIT_NOGLOB_PATHSPECS",
+            &["check-ignore", "x"][..],
+            "fatal: x: pathspec magic not supported by this command: 'literal'\n",
+        ),
+        (
+            "GIT_NOGLOB_PATHSPECS",
+            &["ls-tree", "HEAD", ":(glob)a.txt"][..],
+            "fatal: :(glob)a.txt: pathspec magic not supported by this command: 'glob'\n",
+        ),
+    ] {
+        let out = with(var, args);
+        assert_eq!((err_of(&out).as_str(), out.status.code()), (stderr, Some(128)), "{var} {args:?}");
+    }
+    // `:(literal)` keeps the global `glob` off, and `ls-tree` accepts `literal`.
+    let out = with("GIT_GLOB_PATHSPECS", &["ls-tree", "--name-only", "HEAD", ":(literal)a.txt"]);
+    assert_eq!((err_of(&out).as_str(), out.status.code()), ("", Some(0)));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a.txt\n");
+    let _ = std::fs::remove_dir_all(&repo);
+}

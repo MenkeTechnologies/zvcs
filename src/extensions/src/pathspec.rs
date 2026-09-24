@@ -910,20 +910,52 @@ pub fn parse_element_magic(elt: &BStr) -> Result<Element, String> {
     }) {
         return Ok(Element { magic: MAGIC_LITERAL, path_start: 0, prefix_magic: false });
     }
-    let element = if elt.first() != Some(&b':') {
+    let mut element = if elt.first() != Some(&b':') {
         Element { magic: 0, path_start: 0, prefix_magic: false }
     } else if elt.get(1) == Some(&b'(') {
         parse_long_magic(elt)?
     } else {
         parse_short_magic(elt)?
     };
-    // `get_global_magic()` folds `--glob-pathspecs`/`--icase-pathspecs` in here
-    // too, but those bits are always *supported* wherever they can be set, so
-    // they never change a mask verdict and are left out deliberately.
+    // `magic |= get_global_magic(element_magic);` (pathspec.c:469). The global
+    // bits are ordinary magic from here on, so a verb whose mask leaves out
+    // `glob` or `icase` refuses every element under `--glob-pathspecs` /
+    // `--icase-pathspecs`: `GIT_GLOB_PATHSPECS=1 git ls-tree HEAD a` is
+    // `a: pathspec magic not supported by this command: 'glob'`.
+    element.magic |= global_magic(element.magic);
     if element.magic & MAGIC_LITERAL != 0 && element.magic & MAGIC_GLOB != 0 {
         return Err(incompatible_literal_glob(elt));
     }
     Ok(element)
+}
+
+/// `get_global_magic()` (pathspec.c:297-324) for an element that was parsed for
+/// magic, i.e. with `GIT_LITERAL_PATHSPECS` off. Its two `die()`s are raised
+/// ahead of any element by [`global_magic_fatal`], so only the bits are left:
+///
+/// ```c
+/// /* --glob-pathspec is overridden by :(literal) */
+/// if (get_glob_global() && !(element_magic & PATHSPEC_LITERAL))
+///         global_magic |= PATHSPEC_GLOB;
+/// if (get_icase_global())
+///         global_magic |= PATHSPEC_ICASE;
+/// /* --noglob-pathspec adds :(literal) _unless_ :(glob) is specified */
+/// if (get_noglob_global() && !(element_magic & PATHSPEC_GLOB))
+///         global_magic |= PATHSPEC_LITERAL;
+/// ```
+fn global_magic(element_magic: u32) -> u32 {
+    let env_bool = |name: &str| crate::setup::git_env_bool(name, false);
+    let mut global = 0;
+    if element_magic & MAGIC_LITERAL == 0 && env_bool("GIT_GLOB_PATHSPECS") {
+        global |= MAGIC_GLOB;
+    }
+    if env_bool("GIT_ICASE_PATHSPECS") {
+        global |= MAGIC_ICASE;
+    }
+    if element_magic & MAGIC_GLOB == 0 && env_bool("GIT_NOGLOB_PATHSPECS") {
+        global |= MAGIC_LITERAL;
+    }
+    global
 }
 
 /// `parse_pathspec()`'s argv scan for an empty element (pathspec.c:637-643).

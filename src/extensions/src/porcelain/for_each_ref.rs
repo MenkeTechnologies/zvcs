@@ -524,6 +524,11 @@ pub(super) struct RefInfo {
     /// there, so every line formatted before this ref is already on stdout and
     /// a `--count` that stops short of the ref never raises it at all.
     pub(super) missing: bool,
+    /// A `*`-atom needs the object this tag peels to and the peel failed: the
+    /// `die("bad tag")` `populate_value()` reaches once `get_object()` has
+    /// filled the tag's own atoms (ref-filter.c:2634-2642). Like [`Self::missing`]
+    /// it is raised when the ref is first sorted or formatted.
+    pub(super) bad_tag: bool,
 }
 
 /// Everything `parse_atom` needs beyond the atom text itself.
@@ -1507,11 +1512,6 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         }
         // The chain of tag targets, so `*`-atoms agree with git. Skipped
         // entirely when nothing needs it, as peeling reads objects.
-        let chain = if needs_peel {
-            peel_chain(&repo, id)?
-        } else {
-            Vec::new()
-        };
         if filters_active && !passes_filters(&repo, &filters, id)? {
             continue;
         }
@@ -1532,9 +1532,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
                 reads_object,
             ),
         };
-        let peeled = match (needs_peel, obj.kind, chain.last()) {
-            (true, Kind::Tag, Some(&last)) => Some(load(&repo, last, needs_data)?),
-            _ => None,
+        let (peeled, bad_tag) = match needs_peel {
+            true => peel_for_deref(&repo, &obj, needs_data),
+            false => (None, false),
         };
         let short = if needs_short {
             short_name(&repo, &refname, &all_names)
@@ -1565,6 +1565,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             packed,
             is_base: Vec::new(),
             missing,
+            bad_tag,
         });
     }
 
@@ -2885,6 +2886,37 @@ pub(super) fn load(repo: &gix::Repository, id: ObjectId, with_data: bool) -> Res
     })
 }
 
+/// The object the `*`-atoms read for a ref at `obj`, and whether peeling failed.
+///
+/// ```c
+/// if (!is_null_oid(&ref->peeled_oid)) {
+///         oidcpy(&oi_deref.oid, &ref->peeled_oid);
+/// } else if (!peel_object(the_repository, &oi.oid, &oi_deref.oid,
+///                         PEEL_OBJECT_VERIFY_TAGGED_OBJECT_TYPE)) {
+///         /* We managed to peel the object ourselves. */
+/// } else {
+///         die("bad tag");
+/// }
+/// ```
+///
+/// (ref-filter.c:2634-2642.) Only a tag is peeled. `PEEL_OBJECT_VERIFY_TAGGED_OBJECT_TYPE`
+/// reads the type of every target on the chain (object.c:235-239), so a tag whose
+/// target is missing is `PEEL_INVALID` — `true` here, for [`RefInfo::bad_tag`] to
+/// raise when the ref is sorted or formatted.
+pub(super) fn peel_for_deref(repo: &gix::Repository, obj: &ObjInfo, needs_data: bool) -> (Option<ObjInfo>, bool) {
+    if obj.kind != Kind::Tag {
+        return (None, false);
+    }
+    let peeled = peel_chain(repo, obj.id)
+        .ok()
+        .and_then(|chain| chain.last().copied())
+        .and_then(|last| load(repo, last, needs_data).ok());
+    match peeled {
+        Some(peeled) => (Some(peeled), false),
+        None => (None, true),
+    }
+}
+
 /// The chain of objects reached by dereferencing tags, starting *after* `id`.
 ///
 /// Empty when `id` is not a tag; otherwise each element is one dereference
@@ -4082,6 +4114,11 @@ pub(super) fn populate_value_errors(used: &[&Atom], info: &RefInfo) -> Result<()
     }
     let objects = [(false, Some(&info.obj)), (true, info.peeled.as_ref())];
     for (deref, obj) in objects {
+        // The tag's own values are grabbed before it is peeled, so its date
+        // formats fail ahead of the peel.
+        if deref && info.bad_tag {
+            crate::git_fatal!("bad tag");
+        }
         let Some(obj) = obj else { continue };
         let order: &[Who] = match obj.kind {
             Kind::Commit => &[Who::Author, Who::Committer, Who::Creator],

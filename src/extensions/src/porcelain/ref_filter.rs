@@ -35,7 +35,7 @@ use gix::objs::Kind;
 
 use super::for_each_ref::{
     self, filter_commit, filter_is_base, format_ref, is_packed, load, parse_atom, parse_format, passes_filters,
-    peel_chain, populate_for_sort, short_name, sort_refs, Atom, AtomCtx, AtomError, ErrKind, Field, Filters, Item,
+    peel_chain, peel_for_deref, populate_for_sort, short_name, sort_refs, Atom, AtomCtx, AtomError, ErrKind, Field, Filters, Item,
     NameMod, QuoteStyle, RefInfo, RenderCtx, SortKey,
 };
 use crate::refsort::Prereleases;
@@ -119,8 +119,6 @@ pub(super) struct Candidate {
     id: ObjectId,
     symref: Vec<u8>,
     packed: bool,
-    /// The tag-peel chain, computed only when a filter or a `*`-atom needed it.
-    chain: Vec<ObjectId>,
 }
 
 /// Where the format string comes from.
@@ -259,7 +257,7 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
     sorts.reverse();
 
     // Phase 1: `filter_refs()`. Nothing here reads an object body.
-    let (candidates, pending_die) = filter_refs(spec, &sorts)?;
+    let (candidates, pending_die) = filter_refs(spec)?;
     // `print_ref_list()` runs `filter_refs()` to completion before it builds or
     // verifies the format (builtin/branch.c:464-477), so a `die()` in the walk
     // comes first there.
@@ -435,11 +433,9 @@ fn atoms<'a>(items: &'a [Item], sorts: &'a [SortKey]) -> impl Iterator<Item = &'
 /// The second value is a `die()` `apply_ref_filter()` raised (`match_points_at()`'s
 /// `malformed object at '%s'`): the walk stopped at that ref, and the candidates are
 /// the refs it kept before it.
-fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<(Vec<Candidate>, Option<String>)> {
+fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option<String>)> {
     let repo = spec.repo;
     let filters_active = spec.filters.active();
-    // A `*`-prefixed sort key peels too, so the chain is worth keeping from here.
-    let sort_derefs = sorts.iter().any(|s| s.atom.deref);
 
     let mut names: Vec<Vec<u8>> = Vec::new();
     for r in repo.references()?.all()? {
@@ -518,11 +514,6 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<(Vec<Candidate>
             continue;
         }
 
-        let chain = if sort_derefs {
-            peel_chain(repo, id)?
-        } else {
-            Vec::new()
-        };
         if filters_active && !passes_filters(repo, &spec.filters, id)? {
             continue;
         }
@@ -534,7 +525,6 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<(Vec<Candidate>
             id,
             symref,
             packed,
-            chain,
         });
     }
     Ok((out, None))
@@ -614,14 +604,9 @@ fn populate(
                 needs_object,
             ),
         };
-        let chain = if needs_peel && c.chain.is_empty() && obj.kind == Kind::Tag {
-            peel_chain(repo, c.id)?
-        } else {
-            c.chain
-        };
-        let peeled = match (needs_peel, obj.kind, chain.last()) {
-            (true, Kind::Tag, Some(&last)) => Some(load(repo, last, needs_data)?),
-            _ => None,
+        let (peeled, bad_tag) = match needs_peel {
+            true => peel_for_deref(repo, &obj, needs_data),
+            false => (None, false),
         };
         let short = if needs_short {
             short_name(repo, &c.refname, &all_names)
@@ -649,6 +634,7 @@ fn populate(
             packed: c.packed,
             is_base: Vec::new(),
             missing,
+            bad_tag,
         });
     }
     Ok(refs)
@@ -727,6 +713,7 @@ pub(super) fn pretty_print_ref(
         packed: false,
         is_base: Vec::new(),
         missing: false,
+        bad_tag: false,
     };
     let ctx = RenderCtx {
         repo,

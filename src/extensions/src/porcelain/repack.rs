@@ -974,7 +974,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     }
     let mut filtered_out: Vec<ObjectId> = existing
         .iter()
-        .filter(|f| droppable(st, f.path()))
+        .filter(|f| is_existing_local(&pack_dir, f.path()) && droppable(st, f.path()))
         .flat_map(|f| f.iter().map(|e| e.oid))
         .filter(|id| !in_new_pack.contains(id))
         .collect();
@@ -989,7 +989,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         (true, true, _) => existing
             .iter()
             .map(|f| f.path().to_path_buf())
-            .filter(|p| droppable(st, p))
+            .filter(|p| is_existing_local(&pack_dir, p) && droppable(st, p))
             .collect(),
         // ```c
         // for (i = 0; i < geometry->split; i++) {
@@ -2244,6 +2244,25 @@ impl Geometry {
             .filter(|p| p.parent() == Some(pack_dir))
             .collect()
     }
+}
+
+/// `p->pack_local`: whether a pack [`super::prune::pack_indices`] listed lives in
+/// this repository's own `objects/pack` rather than in an alternate's.
+///
+/// ```c
+/// repo_for_each_pack(existing->repo, p) {
+///         [...]
+///         if (!p->pack_local)
+///                 continue;
+/// ```
+///
+/// (`existing_packs_collect()`, repack.c:133-141.) A borrowed pack never enters
+/// `non_kept_packs`, so `-a -d` never marks it for deletion and
+/// `write_filtered_pack()` never feeds it to `--stdin-packs`. `repack -a` still
+/// *copies* its objects — `pack-objects` runs without `--local` — which is the
+/// half `clone --dissociate` relies on before it unlinks `objects/info/alternates`.
+fn is_existing_local(pack_dir: &Path, index_path: &Path) -> bool {
+    index_path.parent() == Some(pack_dir)
 }
 
 fn droppable(st: &State, index_path: &Path) -> bool {

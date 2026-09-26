@@ -88,9 +88,13 @@ fn paths(repo: &gix::Repository, event: &str) -> Result<(PathBuf, String)> {
     // `repo_config_get_pathname()`, which dies through `git_die_config()` on a
     // valueless key and on a `~user` it cannot expand.
     let cwd = crate::setup::setup_cwd(repo).unwrap_or_default();
+    let setup = crate::setup::after_setup(repo);
     let (dir, shown_dir) = match crate::config::config_get_pathname(Some(repo), "core.hookspath", &cwd) {
         Some(p) => {
-            let on_disk = match repo.workdir() {
+            // A relative value names a directory relative to wherever setup left
+            // git standing.
+            let base = setup.as_ref().map(|s| s.cwd.as_path()).or(repo.workdir());
+            let on_disk = match base {
                 Some(top) if p.is_relative() => top.join(&p),
                 _ => p.clone(),
             };
@@ -99,8 +103,14 @@ fn paths(repo: &gix::Repository, event: &str) -> Result<(PathBuf, String)> {
         None => {
             // `hooks` is a common path (`path.c:101`), so a linked worktree shares
             // the main repository's hooks directory.
+            // `git_path("hooks/<event>")` is `repo->gitdir` as setup left it,
+            // spelled verbatim — `../.git`, `<abs>/sub/../.git` and all.
             let git_dir = repo.common_dir();
-            (git_dir.join("hooks"), git_dir_as_git_spells_it(repo).join("hooks"))
+            let shown = match &setup {
+                Some(s) => s.git_dir.join("hooks"),
+                None => git_dir_as_git_spells_it(repo).join("hooks"),
+            };
+            (git_dir.join("hooks"), shown)
         }
     };
     let shown = shown_dir.join(event).display().to_string();
@@ -242,7 +252,15 @@ pub fn run_with_env(
     // $ cd deep && git commit -m m
     // zvcs: commit: No such file or directory (os error 2)
     // ```
-    let workdir = absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+    let setup = crate::setup::after_setup(repo);
+    let workdir = match &setup {
+        // `run_hooks_opt()` leaves `cp->dir` NULL for these hooks (hook.c:609), so
+        // the hook starts wherever setup left git standing — the top of the work
+        // tree, or the directory the command was typed in when that lies outside
+        // it and no `setup_work_tree()` moved git.
+        Some(s) => s.cwd.clone(),
+        None => absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir())),
+    };
     // What the exec is handed is also what the hook sees as its own name — the
     // kernel passes a `#!` script the pathname given to `execve()`, so `$0` is
     // `.git/hooks/pre-commit` under git and a hook's `dirname "$0"` is relative
@@ -250,22 +268,26 @@ pub fn run_with_env(
     // relative and names this same file from the child's directory (`Command`
     // resolves a relative program containing `/` after the child's `chdir`).
     //
-    // That spelling is only trusted for a *discovered* repository, where
-    // `setup_discovered_git_dir()` leaves `.git` relative to the top it moved
-    // to. An explicit `GIT_DIR` or `GIT_WORK_TREE` (`--git-dir`/`--work-tree`
-    // arrive as those variables) goes through `setup_explicit_git_dir()`, whose
-    // git directory is made absolute whenever setup changes directory — measured
-    // on 2.55.0, `cd sub && git --work-tree=.. commit` runs
-    // `<abs>/.git/hooks/pre-commit` — and [`git_dir_as_git_spells_it`] does not
-    // model that, so those runs keep the absolute path, as does a spelling
-    // without a `/` that `execvp()` would look up on `PATH`.
-    let discovered = std::env::var_os("GIT_DIR").is_none()
-        && std::env::var_os("GIT_WORK_TREE").is_none();
+    // With [`crate::setup::after_setup`]'s model of the spelling — an explicit
+    // `GIT_DIR`/`GIT_WORK_TREE` included — an absolute spelling is exec'd
+    // verbatim too, since git's may be unnormalized (`<abs>/sub/../.git/...`).
+    // Without the model, only a discovered repository's relative spelling is
+    // trusted. A spelling without a `/` that `execvp()` would look up on `PATH`
+    // keeps the absolute path either way.
+    let modelled = setup.is_some();
+    let discovered = modelled
+        || (std::env::var_os("GIT_DIR").is_none() && std::env::var_os("GIT_WORK_TREE").is_none());
     let program = match Path::new(&shown) {
+        abs if modelled
+            && abs.is_absolute()
+            && crate::setup::realpath(abs) == crate::setup::realpath(&path) =>
+        {
+            abs.to_path_buf()
+        }
         rel if discovered
             && rel.is_relative()
             && shown.contains('/')
-            && lexical_normalize(&workdir.join(rel)) == absolutize(&path) =>
+            && crate::setup::realpath(&workdir.join(rel)) == crate::setup::realpath(&path) =>
         {
             rel.to_path_buf()
         }
@@ -282,7 +304,14 @@ pub fn run_with_env(
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(crate::setup::prefix_bytes(repo))
         })
-        .envs(git_dir_env(repo, &workdir).map(|v| ("GIT_DIR", v)))
+        .envs(match &setup {
+            Some(s) => s.export_git_dir.then(|| s.git_dir.clone().into_os_string()),
+            None => git_dir_env(repo, &workdir),
+        }
+        .map(|v| ("GIT_DIR", v)))
+        // `setup_work_tree()` rewrites a set `GIT_WORK_TREE` to `.` once it has
+        // moved there (setup.c:511-512).
+        .envs(setup.as_ref().and_then(|s| s.work_tree_env.clone()).map(|v| ("GIT_WORK_TREE", v)))
         .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
         // `RUN_HOOKS_OPT_INIT` sets `.stdout_to_stderr = 1` (`hook.h:171-176`), so
         // a hook's own chatter can never land on the command's stdout; `pre-push`

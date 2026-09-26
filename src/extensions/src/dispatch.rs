@@ -289,6 +289,7 @@ pub(crate) fn setup_work_tree() -> anyhow::Result<()> {
             return Err(crate::fatal::need_work_tree());
         }
     }
+    crate::setup::note_setup_work_tree();
     Ok(())
 }
 

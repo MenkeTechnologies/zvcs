@@ -560,6 +560,173 @@ pub(crate) fn setup_cwd(repo: &gix::Repository) -> Option<PathBuf> {
     })
 }
 
+/// Whether `run_builtin()` has put this command through `setup_work_tree()`
+/// (git.c:499-500) — set by the dispatcher for a `NEED_WORK_TREE` verb.
+static WORK_TREE_SET_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that `setup_work_tree()` has run for this command, so
+/// [`after_setup`] moves to the work tree the way git's `chdir_notify()` does.
+pub(crate) fn note_setup_work_tree() {
+    WORK_TREE_SET_UP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process state git's setup leaves behind for its children — hooks, the
+/// editor — which zvcs does not reproduce in its own process because it never
+/// `chdir`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AfterSetup {
+    /// The directory git is standing in: where a child starts.
+    pub cwd: PathBuf,
+    /// `repo->gitdir`, spelled as git holds it — relative to [`Self::cwd`] or
+    /// absolute, and never normalized. `git_path()` builds on this spelling, so
+    /// it is what a hook sees as its `$0` and as `COMMIT_EDITMSG`.
+    pub git_dir: PathBuf,
+    /// Whether `set_git_dir_1()` has `setenv`'d `GIT_DIR` to [`Self::git_dir`]
+    /// (setup.c:1070-1074).
+    pub export_git_dir: bool,
+    /// `GIT_WORK_TREE` as it stands in git's environment, when it is set at all.
+    pub work_tree_env: Option<std::ffi::OsString>,
+}
+
+/// Model of what `setup_git_directory()` — and `setup_work_tree()` for a
+/// `NEED_WORK_TREE` command — leaves in `repo->gitdir`, the cwd and the
+/// environment of a non-bare repository.
+///
+/// * `setup_discovered_git_dir()` (setup.c:1207-1250): with neither
+///   `GIT_WORK_TREE` nor `core.worktree`, the default `.git` stays `.git` and is
+///   not exported, and git stands at the top of the work tree. With either one,
+///   the discovered directory is made absolute with `real_pathdup()` when the
+///   walk left the directory the command started in (`offset != cwd->len`), and
+///   `setup_explicit_git_dir()` takes over.
+/// * `setup_explicit_git_dir()` (setup.c:1107-1205): `$GIT_DIR` is kept as given
+///   when the cwd *is* the work tree or lies outside it, and is `realpath`'d when
+///   setup has to `chdir()` up to the work tree from below (setup.c:1191-1198).
+///   Either way `set_git_dir()` exports it.
+/// * `setup_work_tree()` (setup.c:496-513): `chdir_notify()` to the work tree,
+///   which re-parents a relative `repo->gitdir` through
+///   `reparent_relative_path()` (chdir-notify.c:100-115) — `<old-cwd>/<gitdir>`
+///   with the new cwd stripped as a leading path, or left whole when it is not
+///   one — and a set `GIT_WORK_TREE` becomes `.`.
+///
+/// `None` for what this model does not cover — a bare repository, a git
+/// directory reached through a gitfile, a linked worktree — whose callers keep
+/// their own reckoning.
+pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
+    let work_tree = work_tree(repo)?;
+    let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
+    let is_gitfile = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file());
+    let explicit = std::env::var_os("GIT_DIR");
+    let work_tree_env = std::env::var_os("GIT_WORK_TREE");
+    let has_core_worktree = repo.config_snapshot().string("core.worktree").is_some();
+
+    let (git_dir, export) = match explicit {
+        Some(ref given) => {
+            if is_gitfile(Path::new(given)) {
+                return None;
+            }
+            explicit_git_dir(PathBuf::from(given), &cwd, &work_tree)
+        }
+        None => {
+            // Only a default `.git` directory: a gitfile (submodule, linked
+            // worktree) hands setup the path it names instead.
+            let found = crate::hooks::absolutize(repo.git_dir());
+            let top = found.parent()?.to_owned();
+            if found.file_name()? != ".git" || repo.common_dir() != repo.git_dir() {
+                return None;
+            }
+            let top = realpath(&top);
+            if work_tree_env.is_some() || has_core_worktree {
+                // `if (offset != cwd->len && !is_absolute_path(gitdir))
+                //         gitdir = to_free = real_pathdup(gitdir, 1);`
+                let git_dir = match cwd == top {
+                    true => PathBuf::from(".git"),
+                    false => realpath(&found),
+                };
+                explicit_git_dir(git_dir, &cwd, &work_tree)
+            } else {
+                // `set_git_work_tree(repo, ".")` at the top the walk reached, and
+                // `.git` is not passed to `set_git_dir()` at all.
+                if top != work_tree {
+                    return None;
+                }
+                (PathBuf::from(".git"), false)
+            }
+        }
+    };
+    let setup_cwd = match cwd.starts_with(&work_tree) {
+        true => work_tree.clone(),
+        false => cwd,
+    };
+    let mut state = AfterSetup {
+        cwd: setup_cwd,
+        git_dir,
+        export_git_dir: export,
+        work_tree_env,
+    };
+    if WORK_TREE_SET_UP.load(std::sync::atomic::Ordering::Relaxed) {
+        if state.cwd != work_tree {
+            if state.git_dir.is_relative() {
+                let full = format!("{}/{}", state.cwd.display(), state.git_dir.display());
+                state.git_dir = PathBuf::from(remove_leading_path(&full, &work_tree.to_string_lossy()));
+            }
+            state.cwd = work_tree;
+        }
+        if state.work_tree_env.is_some() {
+            state.work_tree_env = Some(".".into());
+        }
+    }
+    Some(state)
+}
+
+/// `setup_explicit_git_dir()`'s choice of spelling for `gitdirenv` once the work
+/// tree is known (setup.c:1184-1204): verbatim at the work tree or outside it,
+/// `realpath`'d from below it. `set_git_dir()` always exports it.
+fn explicit_git_dir(given: PathBuf, cwd: &Path, work_tree: &Path) -> (PathBuf, bool) {
+    if cwd != work_tree && cwd.starts_with(work_tree) {
+        return (realpath(&cwd.join(&given)), true);
+    }
+    (given, true)
+}
+
+/// `remove_leading_path()` (path.c:1046-1087): `input` with `prefix` stripped as
+/// a whole-component leading path (runs of `/` compare equal), `.` when nothing
+/// is left, and `input` unchanged when `prefix` does not lead it.
+fn remove_leading_path(input: &str, prefix: &str) -> String {
+    let (inp, pre) = (input.as_bytes(), prefix.as_bytes());
+    if pre.is_empty() {
+        return input.to_owned();
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < pre.len() {
+        if pre[i] == b'/' {
+            if inp.get(j) != Some(&b'/') {
+                return input.to_owned();
+            }
+            while pre.get(i) == Some(&b'/') {
+                i += 1;
+            }
+            while inp.get(j) == Some(&b'/') {
+                j += 1;
+            }
+            continue;
+        } else if inp.get(j) != Some(&pre[i]) {
+            return input.to_owned();
+        }
+        i += 1;
+        j += 1;
+    }
+    if j < inp.len() && pre[i - 1] != b'/' && inp[j] != b'/' {
+        return input.to_owned();
+    }
+    while inp.get(j) == Some(&b'/') {
+        j += 1;
+    }
+    match j < inp.len() {
+        true => input[j..].to_owned(),
+        false => ".".to_owned(),
+    }
+}
+
 /// git's `is_inside_git_dir()` (setup.c:472-478): whether the cwd is the git
 /// directory or below it.
 /// `git_path()`'s rendering of a path inside the git directory.

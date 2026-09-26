@@ -157,6 +157,14 @@
 //!     `--ita-visible-in-index` and `--max-depth=<n>`: there is no tree walk, no
 //!     submodule and no index here — the two filespecs are the `is_stdin`
 //!     buffers `get_filespec()` builds (range-diff.c:477-489).
+//!   * `-M` / `--find-renames`, `-C` / `--find-copies`, `--find-copies-harder`,
+//!     `--no-renames`, `--[no-]rename-empty` and `-l<n>`: the one pair is a
+//!     modification, and `diffcore_rename()` pairs deletions with creations.
+//!     Their scores and limit are still validated at parse time.
+//!   * `-D` / `--irreversible-delete`, `-R`, `-a` / `--text`, `--no-ext-diff`
+//!     and `--rotate-to` / `--skip-to`: `-R` swaps sides only in
+//!     `diff_change()` / `diff_addremove()`, which `diff_queue()` bypasses, a
+//!     patch text holds no NUL for the binary test, and rotation is non-strict.
 //! * The output formats `diff_flush()` writes for the one filepair
 //!   `patch_diff()` queues, rendered by [`flush_pair`] in `diff_flush()`'s own
 //!   order: `--raw`, `--name-only`, `--name-status` and `--check` first, then
@@ -270,8 +278,9 @@
 //! * A `-G` pattern, or an `-S` one under `--pickaxe-regex`, that does not
 //!   compile: upstream dies from inside `patch_diff()` with libc's `regerror()`
 //!   text, which this port does not reproduce.
-//! * The rename and copy detection flags, `--word-diff`, `--color-moved`, `-R`,
-//!   `--diff-filter`, `--rotate-to` / `--skip-to`, `--ext-diff` and `-O`.
+//! * `-B` / `--break-rewrites` (a large enough outer change becomes a complete
+//!   rewrite), `--word-diff`, `--color-moved`, `--diff-filter`, `--ext-diff`
+//!   and `-O`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -1256,6 +1265,85 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // (`LONG_TAKES_VALUE`), which has to be consumed so it is not
             // classified as a revision.
             "--src-prefix" | "--dst-prefix" | "--line-prefix" | "--max-depth" => {
+                if inline.is_none() {
+                    i += 1;
+                }
+            }
+            // More options the one filepair `get_filespec()` builds cannot show —
+            // a *modified* pair named `a` → `b`, both valid, both mode 0100644
+            // (range-diff.c:477-489) — each verified byte-identical to the
+            // flagless run against git 2.55.0 under patch, `--raw`,
+            // `--name-status`, `--stat` and `--numstat`, colored or not:
+            //
+            // * `-M`/`--find-renames`, `-C`/`--find-copies`,
+            //   `--find-copies-harder`, `--no-renames`, `--[no-]rename-empty`
+            //   and `-l<n>` (diff.c:6167-6190): `diffcore_rename()` pairs
+            //   deletions with creations, and the queue holds neither.
+            // * `-D`/`--irreversible-delete` (diff.c:6171): read only for a
+            //   deleted pair.
+            // * `-R` (diff.c:6254): `flags.reverse_diff` swaps sides in
+            //   `diff_change()`/`diff_addremove()` (diff.c:7625, 7667), which
+            //   `patch_diff()` bypasses by calling `diff_queue()`, and swaps the
+            //   `a/`/`b/` prefixes (diff.c:1891, 3862) the suppressed headers
+            //   would carry.
+            // * `-a`/`--text` (diff.c:6252): the binary test (diff.c:3964) never
+            //   fires on a patch text, whose size is its `strlen()`
+            //   (range-diff.c:483), so it has no NUL to find.
+            // * `--no-ext-diff` (diff.c:6260): `allow_external` is already off.
+            // * `--rotate-to`/`--skip-to` (diff.c:6293-6298): range-diff leaves
+            //   `rotate_to_strict` clear, so `diffcore_rotate()` either finds the
+            //   one pair first or returns (diffcore-rotate.c:20-32).
+            //
+            // The score of `-M`/`-C` and the `-l` limit are still validated as
+            // parse-options does, before any revision is resolved.
+            _ if name.starts_with("-M")
+                || name.starts_with("-C")
+                || name == "--find-renames"
+                || name == "--find-copies" =>
+            {
+                let long = match name.starts_with("-M") || name == "--find-renames" {
+                    true => "find-renames",
+                    false => "find-copies",
+                };
+                let score = match name.strip_prefix("--") {
+                    Some(_) => inline,
+                    None => Some(&name[2..]).filter(|v| !v.is_empty()),
+                };
+                if let Some(v) = score {
+                    if let Err(msg) = crate::diffopt::check_rename_score(long, v) {
+                        return Ok(option_error(&msg));
+                    }
+                }
+            }
+            _ if name.starts_with("-l") => {
+                let value = match &name[2..] {
+                    "" => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => return Ok(option_error("switch `l' requires a value")),
+                        }
+                    }
+                    v => v.to_string(),
+                };
+                match git_parse_signed(&value, i32::MIN as i64, i32::MAX as i64) {
+                    Ok(_) => {}
+                    Err(MagnitudeError::Range) => {
+                        return Ok(option_error(&format!(
+                            "value {value} for switch `l' not in range [-2147483648,2147483647]"
+                        )))
+                    }
+                    Err(MagnitudeError::Invalid) => {
+                        return Ok(option_error(
+                            "switch `l' expects an integer value with an optional k/m/g suffix",
+                        ))
+                    }
+                }
+            }
+            "--find-copies-harder" | "--no-find-copies-harder" | "--no-renames"
+            | "--rename-empty" | "--no-rename-empty" | "-D" | "--irreversible-delete"
+            | "-R" | "-a" | "--text" | "--no-text" | "--no-ext-diff" => {}
+            "--rotate-to" | "--skip-to" => {
                 if inline.is_none() {
                     i += 1;
                 }

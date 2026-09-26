@@ -495,14 +495,22 @@ pub(crate) fn load_display(repo: &gix::Repository, opt: &DisplayOpt) -> Result<V
                     add_by_glob(repo, &mut refs, name)?;
                 }
             }
+            // `repo_config(the_repository, notes_display_config, …)`: the
+            // callback runs once per configured value, in configuration order,
+            // so one `-c notes.displayRef=<ref>` is one value (and one warning),
+            // and a valueless spelling is `config_error_nonbool()`, which
+            // `configset_iter()` turns into `git_die_config_linenr()` for that
+            // occurrence (notes.c:987-999, config.c:1654-1673).
             Err(_) => {
-                for v in repo
-                    .config_snapshot()
-                    .plumbing()
-                    .values::<gix::bstr::BString>("notes.displayRef")
-                    .unwrap_or_default()
-                {
-                    add_by_glob(repo, &mut refs, v.to_str()?)?;
+                for v in crate::config::walk_config(repo) {
+                    if v.key != "notes.displayref" {
+                        continue;
+                    }
+                    let Some(value) = v.value.as_deref() else {
+                        eprintln!("error: missing value for '{}'", v.key);
+                        crate::git_fatal!("{}", v.origin.die_linenr(&v.key));
+                    };
+                    add_by_glob(repo, &mut refs, value)?;
                 }
             }
         }

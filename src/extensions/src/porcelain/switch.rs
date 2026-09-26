@@ -877,6 +877,9 @@ fn switch_create(
             let Some(id) = super::branch::get_oid_mb(repo, s) else {
                 return fatal(format!("invalid reference: {s}"));
             };
+            // `setup_new_branch_info_and_source_tree()`: a second resolution, and a
+            // `refs/heads/<s>` that exists wins over whatever `id` named.
+            let id = super::checkout::setup_new_branch_info_rev(repo, s, id);
             let commit = match super::checkout::classify_tree_ish(repo, id)? {
                 TreeIsh::Commit(commit) => Some(commit.id),
                 TreeIsh::Tree(_) => {
@@ -1106,27 +1109,13 @@ fn switch_detach(
                 return fatal(format!("invalid reference: {s}"));
             };
             // `setup_new_branch_info_and_source_tree()` (`builtin/checkout.c:1311`)
-            // resolves the operand a second time through `setup_branch_path()`:
-            //
-            // ```c
-            // if (!repo_dwim_ref(the_repository, branch->name, strlen(branch->name),
-            //                    &branch->oid, &branch->refname, 0))
-            //         repo_get_oid_committish(the_repository, branch->name, &branch->oid);
-            // ```
-            //
-            // (`builtin/checkout.c:804-806`.) `<ref>@{<n>}` is never a ref name, so
-            // the fallback always fires for it and stock 2.55.0 prints
-            // `warning: log for 'HEAD' only goes back to …` twice for
-            // `git switch --detach 'HEAD@{<old date>}'`, where a plain branch name
-            // stops at `repo_dwim_ref()` and warns once.
-            if super::rev_parse::dwim_ref_matches(repo, s).is_empty() {
-                crate::objname::resolve(repo, s);
-            }
-            // That second resolution is also where `refs/heads/<name>` overrides
-            // the revision parser outright — see
-            // [`super::checkout::branch_ref_id`] — so `switch --detach <name>`
-            // detaches at the *branch* for a name that is also a tag.
-            let id = super::checkout::branch_ref_id(repo, s).unwrap_or(id);
+            // resolves the operand a second time through `setup_branch_path()` —
+            // so stock 2.55.0 prints `warning: log for 'HEAD' only goes back to …`
+            // twice for `git switch --detach 'HEAD@{<old date>}'` — and lets an
+            // existing `refs/heads/<name>` override the revision parser, so
+            // `switch --detach <name>` detaches at the *branch* for a name that is
+            // also a tag. See [`super::checkout::setup_new_branch_info_rev`].
+            let id = super::checkout::setup_new_branch_info_rev(repo, s, id);
             match super::checkout::classify_tree_ish(repo, id)? {
                 TreeIsh::Commit(commit) => commit.id,
                 TreeIsh::Tree(_) => {
@@ -1230,6 +1219,7 @@ fn switch_orphan(
         let Some(id) = super::branch::get_oid_mb(repo, p) else {
             return fatal(format!("invalid reference: {p}"));
         };
+        let id = super::checkout::setup_new_branch_info_rev(repo, p, id);
         // `parse_branchname_arg()` still has to read the object it resolved, and
         // fails first when it cannot: `--orphan <absent-full-hex>` is git's
         // `unable to read tree`, while `--orphan <tree>` reaches the refusal below.

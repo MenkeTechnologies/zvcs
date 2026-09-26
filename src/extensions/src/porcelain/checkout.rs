@@ -1123,27 +1123,13 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // fork point of `branch1` and `HEAD`. Shared with `git branch`'s
         // start-point, git's other caller of the same function.
         let resolved = super::branch::get_oid_mb(&repo, spec);
-        // And then a *second* time: `setup_branch_path()` resolves the operand
-        // again whenever it is not itself a ref name
-        //
-        // ```c
-        // if (!repo_dwim_ref(the_repository, branch->name, strlen(branch->name),
-        //                    &branch->oid, &branch->refname, 0))
-        //         repo_get_oid_committish(the_repository, branch->name, &branch->oid);
-        // ```
-        //
-        // (`builtin/checkout.c:804-806`, reached from
-        // `setup_new_branch_info_and_source_tree()` at `builtin/checkout.c:1311`).
-        // `<ref>@{<n>}` is never a ref name, so the fallback always fires for it
-        // and stock prints the warning twice — while an ambiguous plain name
-        // resolves at `repo_dwim_ref()` and so prints its own warning only once.
+        // And then `setup_new_branch_info_and_source_tree()`: a second resolution
+        // and the `refs/heads/<name>` override — see [`setup_new_branch_info_rev`].
         // It is reached only when the first resolution answered:
         // `parse_branchname_arg()` returns at `builtin/checkout.c:1518` otherwise,
         // which is why `git checkout 'HEAD^{blob}'` prints `error: …` once and not
         // twice.
-        if resolved.is_some() && super::rev_parse::dwim_ref_matches(&repo, spec).is_empty() {
-            crate::objname::resolve(&repo, spec);
-        }
+        let rev = resolved.map(|rev| setup_new_branch_info_rev(&repo, spec, rev));
         // A revspec like `HEAD~3` is not a valid ref *name* (`~` is rejected by
         // ref validation), so treat a lookup error as "not a branch" and let the
         // `rev_parse_single` path below resolve and detach-checkout it.
@@ -1194,11 +1180,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // that resolution's result being used, not a second visit to
         // `get_oid_basic()` — warning again made `git checkout --detach <ambiguous>`
         // print two `refname … is ambiguous` lines where git prints one.
-        // The same `refs/heads/<name>` override, for the detaching half of the
-        // command: `setup_new_branch_info_and_source_tree()` runs before
-        // `checkout_branch()` sees `--detach`, so `git checkout --detach <name>`
-        // detaches at the branch too.
-        if let Some(id) = branch_ref_id(&repo, spec).or(resolved) {
+        // `rev` carries the `refs/heads/<name>` override, for the detaching half
+        // of the command too: `setup_new_branch_info_and_source_tree()` runs
+        // before `checkout_branch()` sees `--detach`, so `git checkout --detach
+        // <name>` detaches at the branch.
+        if let Some(id) = rev {
             let commit = match classify_tree_ish(&repo, id)? {
                 TreeIsh::Commit(commit) => commit,
                 // A tree is a legitimate `source_tree`, so `parse_branchname_arg()`
@@ -1665,6 +1651,40 @@ pub(crate) fn head_commit_id(repo: &gix::Repository) -> Option<ObjectId> {
 /// panicked on the symbolic one ("BUG: tries to obtain object id from symbolic
 /// target"). Tags are still not peeled: `get_oid_mb()`'s answer is an object id,
 /// not a commit.
+/// `setup_new_branch_info_and_source_tree()` (builtin/checkout.c:1299-1320) for an
+/// operand `parse_branchname_arg()` has already resolved to `rev` through
+/// `repo_get_oid_mb()` (builtin/checkout.c:1476) — shared by the plain switch, the
+/// detach, `checkout -b <new> <start>` and `switch -c <new> <start>`.
+///
+/// Two things happen to it there. `setup_branch_path()` resolves the operand a
+/// *second* time whenever it is not itself a ref name
+///
+/// ```c
+/// if (!repo_dwim_ref(the_repository, branch->name, strlen(branch->name),
+///                    &branch->oid, &branch->refname, 0))
+///         repo_get_oid_committish(the_repository, branch->name, &branch->oid);
+/// ```
+///
+/// (builtin/checkout.c:804-806), so `<ref>@{<n>}` or `amb^0` warns twice about an
+/// ambiguous `<ref>` — while an ambiguous plain name resolves at `repo_dwim_ref()`
+/// and warns only once. And an existing `refs/heads/<arg>` then replaces `rev`
+///
+/// ```c
+/// if (!check_refname_format(new_branch_info->path, 0) &&
+///     !refs_read_ref(get_main_ref_store(the_repository), new_branch_info->path, &branch_rev))
+///         oidcpy(rev, &branch_rev);
+/// ```
+///
+/// (builtin/checkout.c:1313-1315), so a name that is both a tag and a branch
+/// moves the worktree to the *branch*, whatever `get_oid_basic()`'s ref order
+/// picked.
+pub(crate) fn setup_new_branch_info_rev(repo: &gix::Repository, spec: &str, rev: ObjectId) -> ObjectId {
+    if super::rev_parse::dwim_ref_matches(repo, spec).is_empty() {
+        crate::objname::resolve(repo, spec);
+    }
+    branch_ref_id(repo, spec).unwrap_or(rev)
+}
+
 pub(crate) fn branch_ref_id(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
     repo.try_find_reference(format!("refs/heads/{spec}").as_str())
         .ok()
@@ -1969,6 +1989,7 @@ fn create_and_switch(
             "'{start}' is not a commit and a branch '{name}' cannot be created from it"
         );
     };
+    let start_oid = setup_new_branch_info_rev(repo, start, start_oid);
     let commit = match classify_tree_ish(repo, start_oid)? {
         TreeIsh::Commit(commit) => commit,
         TreeIsh::Tree(_) => crate::git_fatal!("Cannot switch branch to a non-commit '{start}'"),
@@ -2224,7 +2245,7 @@ fn orphan_checkout(
     } else {
         let start = start.unwrap_or("HEAD");
         match super::branch::get_oid_mb(repo, start) {
-            Some(id) => match classify_tree_ish(repo, id)? {
+            Some(id) => match classify_tree_ish(repo, setup_new_branch_info_rev(repo, start, id))? {
                 TreeIsh::Commit(commit) => Some(commit),
                 TreeIsh::Tree(_) => {
                     crate::git_fatal!("Cannot switch branch to a non-commit '{start}'")

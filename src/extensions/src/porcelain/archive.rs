@@ -136,102 +136,159 @@ const SIZE_MAX: u64 = 0o77777777777;
 
 const ZEROS: [u8; RECORD] = [0; RECORD];
 
-/// The formats stock `git archive --list` reports before configuration is read: `tar` and
-/// git's two pre-seeded tar filters, then `zip` — the registration order of
-/// `init_tar_archiver()` and `init_zip_archiver()` (archive.c), which is the order `--list`
-/// prints. A `tar.<name>.command` adds its own name to the list between the two groups; see
-/// [`configured_formats`].
+/// The built-in formats: `tar`, git's two pre-seeded tar filters, then `zip`.
+/// `FORMATS[..3]` are the tar family, which is what decides whether a
+/// compression level is a filter's to accept.
 const FORMATS: &[&str] = &["tar", "tgz", "tar.gz", "zip"];
 
+/// The command `init_tar_archiver()` pre-seeds `tgz` and `tar.gz` with; a filter
+/// still carrying it is the in-process gzip rather than a command to spawn.
+const INTERNAL_GZIP: &str = "git archive gzip";
+
+/// One entry of `archive-tar.c`'s `tar_filters[]`.
+struct TarFilter {
+    name: String,
+    /// `ar->filter_command`: a filter that never had one is not registered.
+    command: Option<String>,
+    /// `ARCHIVER_REMOTE`.
+    remote: bool,
+}
+
+/// What `init_tar_archiver()` (archive-tar.c:529-545) leaves behind: the
+/// `tar.umask` in force and the tar filters, in creation order.
+///
 /// ```c
-/// ar = find_tar_filter(name, namelen);
-/// if (!ar) {
-///         CALLOC_ARRAY(ar, 1);
-///         ar->name = xmemdupz(name, namelen);
-///         ar->write_archive = write_tar_filter_archive;
-///         ar->flags = ARCHIVER_WANT_COMPRESSION_LEVELS |
-///                     ARCHIVER_HIGH_COMPRESSION_LEVELS;
-///         ALLOC_GROW(tar_filters, nr_tar_filters + 1, alloc_tar_filters);
-///         tar_filters[nr_tar_filters++] = ar;
-/// }
+/// register_archiver(&tar_archiver);
+/// tar_filter_config("tar.tgz.command", internal_gzip_command, NULL);
+/// tar_filter_config("tar.tgz.remote", "true", NULL);
+/// tar_filter_config("tar.tar.gz.command", internal_gzip_command, NULL);
+/// tar_filter_config("tar.tar.gz.remote", "true", NULL);
+/// repo_config(the_repository, git_tar_config, NULL);
+/// for (i = 0; i < nr_tar_filters; i++)
+///         if (tar_filters[i]->filter_command)
+///                 register_archiver(tar_filters[i]);
 /// ```
 ///
-/// A filter is *not* born remotely available — `ARCHIVER_REMOTE` is granted only
-/// by a `tar.<name>.remote`, which [`remote_allowed`] reads.
-///
-/// (`git_tar_config()`, archive-tar.c.) Every `tar.<name>.command` is an archive format of
-/// its own: the tar goes to the command's standard input and whatever it writes is the
-/// archive. `tgz` and `tar.gz` are registered the same way with `git archive gzip` as their
-/// command, so configuring one of *those* replaces the internal gzip.
-fn configured_formats(repo: Option<&gix::Repository>) -> Vec<String> {
-    let mut out: Vec<String> = FORMATS[..3].iter().map(|f| (*f).to_string()).collect();
-    if let Some(repo) = repo {
-        let snapshot = repo.config_snapshot();
-        for section in snapshot.plumbing().sections() {
-            let header = section.header();
-            if !header.name().to_string().eq_ignore_ascii_case("tar") {
+/// `cmd_archive()` runs it straight after its own `-o`/`--remote`/`--exec`
+/// pass (builtin/archive.c:97-100), and `cmd_upload_archive_writer()` before
+/// `write_archive()` (builtin/upload-archive.c:37), so a configuration the
+/// callbacks refuse is fatal ahead of `--list`, `-h`, `-o` and `--remote`.
+struct TarConfig {
+    umask: u32,
+    filters: Vec<TarFilter>,
+}
+
+impl TarConfig {
+    fn load(repo: Option<&gix::Repository>) -> Result<TarConfig> {
+        let seeded = |name: &str| TarFilter {
+            name: name.to_string(),
+            command: Some(INTERNAL_GZIP.to_string()),
+            remote: true,
+        };
+        // `static int tar_umask = 002;`
+        let mut cfg = TarConfig { umask: 0o002, filters: vec![seeded("tgz"), seeded("tar.gz")] };
+        for v in crate::config::walk_config_gently(repo) {
+            if v.key == "tar.umask" {
+                // `git_tar_config()` (archive-tar.c:415-429).
+                cfg.umask = match v.value.as_deref() {
+                    // `tar_umask = umask(0); umask(tar_umask);` — there is no
+                    // read-only POSIX umask getter, so git sets it to zero and
+                    // restores it in one breath, and so does this.
+                    Some("user") => process_umask() & 0o7777,
+                    // `git_config_int()`: `strtoimax()` base 0 with a `k`/`m`/`g`
+                    // suffix, and a valueless key is `''`'s invalid unit. The
+                    // result lands in git's `unsigned int`, so `-1` wraps to all
+                    // ones and every archived mode comes out as 0; truncating to
+                    // `u32` is that assignment.
+                    raw => {
+                        let raw = raw.unwrap_or("");
+                        match crate::config::parse_config_int(raw) {
+                            Ok(n) => n as u32,
+                            Err(reason) => crate::git_fatal!(
+                                "bad numeric config value '{raw}' for '{}'{}: {reason}",
+                                v.key,
+                                v.origin.bad_number_clause()
+                            ),
+                        }
+                    }
+                };
                 continue;
             }
-            // `tar.<name>.command` reaches the config callback as one flat key, so a
-            // dotted format name lands in the subsection (`tar "tar.gz"`) or in the value
-            // name (`tar.command` under a `tar.gz` subsection is not a thing) — either way
-            // the name is whatever sits between `tar.` and `.command`.
-            let Some(sub) = header.subsection_name() else {
-                continue;
-            };
-            let name = sub.to_string();
-            if section.body().values("command").is_empty() || out.contains(&name) {
-                continue;
-            }
-            out.push(name);
+            cfg.filter_config(&v)?;
         }
+        Ok(cfg)
     }
-    out.push("zip".to_string());
-    out
-}
 
-/// Whether `format` carries `ARCHIVER_REMOTE` — the flag that decides what
-/// `git upload-archive` will serve, and so what a `git archive --remote` client
-/// can ask for.
-///
-/// `tar` and `zip` are static archivers declared with the flag
-/// (`archive-tar.c:526`, `archive-zip.c`). Everything else is a tar filter, and
-/// `tar_filter_config()` grants the flag only through `tar.<name>.remote`:
-///
-/// ```c
-/// ar->flags = ARCHIVER_WANT_COMPRESSION_LEVELS | ARCHIVER_HIGH_COMPRESSION_LEVELS;
-/// [...]
-/// if (!strcmp(type, "remote")) {
-///         if (git_config_bool(var, value))  ar->flags |=  ARCHIVER_REMOTE;
-///         else                              ar->flags &= ~ARCHIVER_REMOTE;
-/// }
-/// ```
-///
-/// `init_tar_archiver()` pre-seeds `tar.tgz.remote=true` and
-/// `tar.tar.gz.remote=true` *before* reading the repository's configuration, so
-/// those two default to remotely available and a user `tar.tgz.remote=false`
-/// takes it back — while a filter the user invents is not remotely available
-/// unless they say so.
-fn remote_allowed(repo: Option<&gix::Repository>, format: &str) -> bool {
-    if format == "tar" || format == "zip" {
-        return true;
+    /// `tar_filter_config()` (archive-tar.c:375-413): `tar.<name>.<type>` finds
+    /// or creates the filter `<name>` — whatever `<type>` is — and then sets
+    /// its command or its remote flag. `parse_config_key()` splits at the
+    /// *last* dot, so a dotted name such as `tar.gz` is the subsection whole.
+    fn filter_config(&mut self, v: &crate::config::ConfigValue) -> Result<()> {
+        let Some(rest) = v.key.strip_prefix("tar.") else {
+            return Ok(());
+        };
+        let Some((name, kind)) = rest.rsplit_once('.') else {
+            return Ok(());
+        };
+        let idx = match self.filters.iter().position(|f| f.name == name) {
+            Some(idx) => idx,
+            None => {
+                self.filters.push(TarFilter { name: name.to_string(), command: None, remote: false });
+                self.filters.len() - 1
+            }
+        };
+        match kind {
+            "command" => {
+                let Some(value) = v.value.as_deref() else {
+                    eprintln!("error: missing value for '{}'", v.key);
+                    crate::git_fatal!("{}", v.origin.die_linenr(&v.key));
+                };
+                self.filters[idx].command = Some(value.to_string());
+            }
+            // `git_config_bool()`: NULL is true, and a value
+            // `git_parse_maybe_bool()` refuses dies.
+            "remote" => {
+                self.filters[idx].remote = match v.value.as_deref() {
+                    None => true,
+                    Some(raw) => match crate::optint::maybe_bool(raw) {
+                        Some(b) => b,
+                        None => crate::git_fatal!("bad boolean config value '{raw}' for '{}'", v.key),
+                    },
+                };
+            }
+            _ => {}
+        }
+        Ok(())
     }
-    let configured = repo.and_then(|repo| {
-        repo.config_snapshot()
-            .plumbing()
-            .boolean_by("tar", Some(gix::bstr::BStr::new(format)), "remote")
-            .ok()
-            .flatten()
-    });
-    configured.unwrap_or(matches!(format, "tgz" | "tar.gz"))
-}
 
-/// The command a `tar.<format>.command` configures for this format, if any.
-fn tar_filter_command(repo: &gix::Repository, format: &str) -> Option<String> {
-    repo.config_snapshot()
-        .plumbing()
-        .string_by("tar", Some(format.into()), "command")
-        .map(|v| v.to_string())
+    /// The registered archivers in `archivers[]` order — which is the order
+    /// `--list` prints: `tar`, every filter that has a command, then `zip`.
+    fn formats(&self) -> Vec<String> {
+        let mut out = vec!["tar".to_string()];
+        out.extend(self.filters.iter().filter(|f| f.command.is_some()).map(|f| f.name.clone()));
+        out.push("zip".to_string());
+        out
+    }
+
+    /// Whether `format` carries `ARCHIVER_REMOTE` — what `git upload-archive`
+    /// will serve. `tar` and `zip` are declared with it (archive-tar.c:526,
+    /// archive-zip.c); a filter has it only through `tar.<name>.remote`, which
+    /// the two pre-seeded ones start out with.
+    fn remote_allowed(&self, format: &str) -> bool {
+        format == "tar"
+            || format == "zip"
+            || self.filters.iter().any(|f| f.name == format && f.command.is_some() && f.remote)
+    }
+
+    /// The command a registered filter spawns, or `None` for `tar`, `zip`, and
+    /// a filter still carrying the in-process gzip.
+    fn spawn_command(&self, format: &str) -> Option<String> {
+        self.filters
+            .iter()
+            .find(|f| f.name == format)
+            .and_then(|f| f.command.clone())
+            .filter(|cmd| cmd != INTERNAL_GZIP)
+    }
 }
 
 /// The formats carrying git's `ARCHIVER_WANT_COMPRESSION_LEVELS`. A `-<digits>`
@@ -384,6 +441,9 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         Ok(outer) => outer,
         Err(code) => return Ok(code),
     };
+    // `init_archivers()` → `init_tar_archiver()`: the tar configuration is
+    // walked here, after the outer option pass and before `-o` is created.
+    let tar = TarConfig::load(crate::setup::discover().ok().as_ref())?;
     // ```c
     // if (output)
     //         create_output_file(output);
@@ -574,12 +634,11 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             eprintln!("fatal: extra command line parameter '{extra}'");
             return Ok(ExitCode::from(128));
         }
-        let repo = crate::setup::discover().ok();
         let mut out = String::new();
-        for f in configured_formats(repo.as_ref()) {
+        for f in tar.formats() {
             // `if (!is_remote || archivers[i]->flags & ARCHIVER_REMOTE)`
             // (`parse_archive_args`, archive.c).
-            if is_remote && !remote_allowed(repo.as_ref(), &f) {
+            if is_remote && !tar.remote_allowed(&f) {
                 continue;
             }
             out.push_str(&f);
@@ -610,13 +669,12 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // The registry is config-driven, so a `tar.<name>.command` makes `<name>` a format git
     // knows — which is why this is checked against the configured list and not the built-in
     // one.
-    let known_repo = crate::setup::discover().ok();
-    let known = configured_formats(known_repo.as_ref());
+    let known = tar.formats();
     // `if (!*ar || (is_remote && !((*ar)->flags & ARCHIVER_REMOTE)))
     //         die(_("Unknown archive format '%s'"), format);` — a format the
     // remote side is not allowed to serve is reported as unknown, not as denied.
     if !known.iter().any(|f| f == &format)
-        || (is_remote && !remote_allowed(known_repo.as_ref(), &format))
+        || (is_remote && !tar.remote_allowed(&format))
     {
         eprintln!("fatal: Unknown archive format '{format}'");
         return Ok(ExitCode::from(128));
@@ -641,17 +699,11 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
-    // git lets `tar.<fmt>.command` replace an archiver with an external filter.
-    // The internal gzip is what this port reproduces; anything else would have
-    // to be spawned, which it does not do. `tar.tgz.command` and
-    // `tar.tar.gz.command` are pre-seeded with the internal name, so only a
-    // value that differs from it is a problem.
-    // `tgz`/`tar.gz` are pre-seeded with `git archive gzip`; a configuration that repeats
-    // that value asks for the gzip this port produces in-process, and anything else is a
-    // filter to spawn.
-    const INTERNAL_GZIP: &str = "git archive gzip";
-    let filter = tar_filter_command(&repo, &format).filter(|cmd| cmd != INTERNAL_GZIP);
-    let umask = tar_umask(&repo)?;
+    // A `tar.<format>.command` replaces the archiver with a filter to spawn;
+    // `tgz`/`tar.gz` still carrying the pre-seeded `git archive gzip` are the
+    // in-process gzip.
+    let filter = tar.spawn_command(&format);
+    let umask = tar.umask;
 
     // `parse_treeish_arg()` (archive.c) resolves with `repo_get_oid()`, which
     // only has to *name* an object — a full-length hex string is decoded
@@ -1557,33 +1609,6 @@ fn format_from_filename(name: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|f| name.len() > f.len() + 1 && name.ends_with(&format!(".{f}")))
-}
-
-/// `tar.umask`, parsed the way `git_config_int` does (a leading `0` means octal).
-fn tar_umask(repo: &gix::Repository) -> Result<u32> {
-    let Some(raw) = repo.config_snapshot().string("tar.umask") else {
-        return Ok(0o002);
-    };
-    let text = raw.to_str()?.trim().to_string();
-    if text == "user" {
-        // git's `git_tar_config`: `tar_umask = umask(0); umask(tar_umask);`.
-        // There is no read-only POSIX umask getter, so git reads it by setting
-        // it to zero and restoring it in one breath; this does the same. The
-        // result is at most 0o777, so masking guards against any garbage the C
-        // ABI leaves in the high bits of the narrower `mode_t` on some targets.
-        return Ok(process_umask() & 0o7777);
-    }
-    // Everything else is `git_config_int()`, whose grammar is `strtoimax()` base
-    // 0 plus a `k`/`m`/`g` scale suffix: `1k` is 1024, `-1` is negative, and an
-    // empty value is `die()`'s "invalid unit" rather than a zero. The result is
-    // stored in git's `static unsigned int tar_umask`, so a negative value wraps
-    // — `-1` becomes all-ones, `~tar_umask` becomes zero, and every archived mode
-    // comes out as 0. Truncating to `u32` here reproduces that assignment.
-    match crate::config::config_int(repo, "tar.umask") {
-        Ok(Some(v)) => Ok(v as u32),
-        Ok(None) => Ok(0o002),
-        Err(msg) => Err(crate::fatal::Fatal(msg).into()),
-    }
 }
 
 /// The process umask, read the way git reads it for `tar.umask=user`: set it to

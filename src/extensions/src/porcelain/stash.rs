@@ -2549,22 +2549,15 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
 /// `git stash list` — newest first, `stash@{N}: <reflog message>`.
 fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
-    // `git stash list` is `git log --format="%gd: %gs" -g <log-opts> refs/stash`,
-    // so delegate to the reflog machinery on `refs/stash` rather than duplicate its
-    // format engine (`%H`, `%gd`, `%gs`, dates, `--pretty`, …). Only the default
-    // format differs: stash uses `%gd: %gs`, injected when the caller gives none.
-    // With no stash ref, git prints nothing (exit 0) — reflog would instead fatal
-    // on an unknown ref, so short-circuit that here.
+    // `list_stash()` (builtin/stash.c) is `git log --format="%gd: %gs" -g
+    // --first-parent <log-opts> refs/stash --`, so it runs through `log` itself —
+    // its user-format expander, date modes and diff options included. With no
+    // stash ref, `list_stash()` returns 0 before running anything.
     if repo.try_find_reference("refs/stash")?.is_none() {
         return Ok(ExitCode::SUCCESS);
     }
-    let has_format = args
-        .iter()
-        .any(|a| a.starts_with("--format") || a.starts_with("--pretty"));
-    let mut rf: Vec<String> = Vec::new();
-    if !has_format {
-        rf.push("--format=%gd: %gs".into());
-    }
+    // The default format goes first, so a user `--format`/`--pretty` overrides it.
+    let mut rf: Vec<String> = vec!["--format=%gd: %gs".into(), "-g".into()];
     // `list_stash()` runs `log -g --first-parent`, and the `--first-parent` is
     // what gives a diff option anything to render: every stash entry is a merge
     // commit, which is otherwise skipped. Without it `stash list --name-only`
@@ -2606,8 +2599,8 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // `fatal: unrecognized argument: --zzbogus` and then exits **1**, not 128.
     // The forwarded parser's message is git's; the forwarded parser's exit code
     // is not.
-    let status = super::reflog_show_as_log_status(&rf)?;
-    Ok(ExitCode::from(u8::from(status != 0)))
+    let status = super::log::log(&rf)?;
+    Ok(ExitCode::from(u8::from(status != ExitCode::SUCCESS)))
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.

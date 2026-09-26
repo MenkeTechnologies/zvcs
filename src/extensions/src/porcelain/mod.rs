@@ -924,7 +924,7 @@ pub use range_diff::range_diff;
 pub use read_tree::read_tree;
 pub use rebase::rebase;
 pub use receive_pack::receive_pack;
-pub use reflog::{reflog, reflog_show_as_log, reflog_show_as_log_status};
+pub use reflog::reflog;
 pub use refs::refs;
 pub use remote::remote;
 pub use remote_ext::remote_ext;

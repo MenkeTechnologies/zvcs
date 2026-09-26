@@ -439,6 +439,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--" => end_of_options = true,
             "--bare" => bare = true,
             "--no-bare" => bare = false,
+            // `OPT_HIDDEN_BOOL(0, "naked", &option_bare, ...)` (builtin/clone.c:931):
+            // a second, hidden name for `--bare`, negatable like it.
+            "--naked" => bare = true,
+            "--no-naked" => bare = false,
             // `--mirror` implies `--bare` (git-clone(1)); the implication is applied
             // after parsing so a later `--no-mirror` can still take it back.
             "--mirror" => mirror = true,
@@ -485,6 +489,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--server-option" => server_options.push(take_value!().into()),
             "--no-server-option" => server_options.clear(),
             "-j" | "--jobs" => jobs = Some(take_value!()),
+            // `OPT_INTEGER` unset stores 0 (parse-options.c:260-267),
+            // which is not `max_jobs == -1`, so `--jobs=0` is forwarded.
+            "--no-jobs" => jobs = Some("0".to_string()),
             other if other.starts_with("-j") && other.len() > 2 => {
                 jobs = Some(other[2..].to_string())
             }
@@ -503,6 +510,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-ref-format" => ref_format = None,
             "--reference" => required_references.push(take_value!()),
             "--reference-if-able" => optional_references.push(take_value!()),
+            // `OPT_STRING_LIST`'s unset arm is `string_list_clear(v, 0)`
+            // (parse-options-cb.c:199-206): `--no-reference` empties the list the
+            // earlier `--reference`s built, it takes no value.
+            "--no-reference" => required_references.clear(),
+            "--no-reference-if-able" => optional_references.clear(),
             "-s" | "--shared" => shared = true,
             "--no-shared" => shared = false,
             "--dissociate" => dissociate = true,
@@ -534,6 +546,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-also-filter-submodules" => also_filter_submodules = Some(false),
             "--bundle-uri" => bundle_uri = Some(take_value!()),
             "--no-bundle-uri" => bundle_uri = None,
+            // `OPT_STRING` unset is NULL and `OPT_STRING_LIST` unset clears the
+            // list, so each of these takes back every earlier spelling of its
+            // option: the shallow requests, and the `-c` pairs.
+            "--no-depth" => depth = None,
+            "--no-shallow-since" => shallow_since = None,
+            "--no-shallow-exclude" => shallow_exclude.clear(),
+            "--no-config" => config_pairs.clear(),
             "--depth" => {
                 let v = take_value!();
                 // `die(_("depth %s is not a positive number"), option_depth)`

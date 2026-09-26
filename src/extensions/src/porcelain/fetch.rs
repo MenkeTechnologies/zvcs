@@ -3296,6 +3296,37 @@ fn fetch_one(
         return Ok(Verdict::Fatal);
     }
 
+    // ```c
+    // ref_map = get_ref_map(transport->remote, remote_refs, rs, tags, &autotags);
+    // if (!update_head_ok)
+    //         check_not_current_branch(ref_map);
+    // ```
+    //
+    // (builtin/fetch.c:1970-1973, with the check at :1495-1505.) Every mapping
+    // whose destination is under `refs/heads/` is looked up in
+    // `branch_checked_out()`, and the first one a worktree holds ends the command
+    // before a single object is requested. The test is on the *name*: a branch
+    // `HEAD` points at but that has no commit yet is checked out all the same, and
+    // so is one whose value the fetch would leave unchanged. gitoxide's own guard
+    // only fires for a ref that exists and would move, which let `git fetch <url>
+    // main:main` in a fresh `git init` write the branch and populate the object
+    // store.
+    if !opts.update_head_ok {
+        for mapping in &prepared.ref_map().mappings {
+            let Some(local) = mapping.local.as_ref().map(|l| l.to_string()) else { continue };
+            if !local.starts_with("refs/heads/") {
+                continue;
+            }
+            if let Some(path) = super::worktree::branch_checked_out(repo, &local)? {
+                eprintln!(
+                    "fatal: refusing to fetch into branch '{local}' checked out at '{}'",
+                    path.display()
+                );
+                return Ok(Verdict::Fatal);
+            }
+        }
+    }
+
     // Which auto-followed tags git would have left for its *second* pass. This
     // has to be decided here, against the object database as it stands before a
     // single object arrives — see [`backfilled_tags`].

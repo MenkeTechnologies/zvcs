@@ -355,18 +355,42 @@ impl Mark {
         //
         // git matches the name *with* its trailing slash (`treat_one_path()` appends it,
         // dir.c:2493), so `ud/*` and `*/` match `ud/` where the bare `ud` does not.
+        //
+        // For deletion that match is the whole decision. `git clean` walks with
+        // `DIR_SHOW_OTHER_DIRECTORIES` (builtin/clean.c:964), so an untracked directory
+        // that is not merely a leading path of the pathspec is `path_untracked`
+        // (dir.c:2079, and :2212-2213 when nothing below it matched at all) and is
+        // added as a whole; `treat_path()` tests the pathspec against files only
+        // (dir.c:2501-2507), never against a directory's contents on its behalf.
+        // `correct_untracked_entries()` (builtin/clean.c:887-917) then keeps that
+        // directory unless it holds an ignored path, dropping whatever was listed
+        // inside it. So `clean -nd '*/'` says `ud/` though no file under it matches
+        // `*/`, and `clean -nd ud ':!ud/f'` says `ud/` — the exclusion names a file
+        // inside, not the directory — where requiring every held entry to match
+        // listed the survivors one by one or nothing at all.
+        let mut deletion_whole_dir: Option<PathspecMatch> = None;
         if dir_info.status == Status::Untracked
             && ctx.pathspec.patterns().len() != 0
-            && dir_info.pathspec_match.is_none()
+            && (dir_info.pathspec_match.is_none() || opts.for_deletion.is_some())
         {
             let mut with_slash = BString::from(dir_rela_path);
             with_slash.push(b'/');
-            let matches_itself = ctx
+            let matched = ctx
                 .pathspec
                 .pattern_matching_relative_path(with_slash.as_bstr(), Some(true), ctx.pathspec_attributes)
-                .is_some();
-            if !matches_itself {
-                return None;
+                .map(PathspecMatch::from);
+            match matched {
+                None => return None,
+                // An excluded directory is `path_none` (dir.c:1998-2005): nothing under
+                // it is a candidate, and it is no reason for its parent not to be
+                // taken whole — `clean -nd ':!ud/sub'` says `ud/`.
+                Some(PathspecMatch::Excluded) if opts.for_deletion.is_some() => {
+                    out.seen_entries += (state.on_hold.len() - self.start_index) as u32;
+                    state.on_hold.truncate(self.start_index);
+                    return Some(std::ops::ControlFlow::Continue(()));
+                }
+                Some(m) if opts.for_deletion.is_some() => deletion_whole_dir = Some(m),
+                Some(_) => {}
             }
         }
         let (mut expendable, mut precious, mut untracked, mut entries, mut matching_entries) = (0, 0, 0, 0, 0);
@@ -374,11 +398,21 @@ impl Mark {
             .iter()
             .map(|e| (e.disk_kind, e.status, e.pathspec_match))
         {
+            // A file the pathspec does not match is `path_none` to git before its
+            // ignore status is even asked (dir.c:2501-2509): it is neither a
+            // candidate nor an ignored path that could keep the directory from
+            // being taken whole. `clean -nd '*' ':!*.o'` says `ui/` though `ui/b.o`
+            // is ignored.
+            if deletion_whole_dir.is_some() && pathspec_match.is_none_or(|m| m == PathspecMatch::Excluded) {
+                continue;
+            }
             entries += 1;
             if kind == Some(entry::Kind::Repository) {
                 return None;
             }
-            if pathspec_match.is_some_and(|m| matches!(m, PathspecMatch::Verbatim | PathspecMatch::Excluded)) {
+            if deletion_whole_dir.is_none()
+                && pathspec_match.is_some_and(|m| matches!(m, PathspecMatch::Verbatim | PathspecMatch::Excluded))
+            {
                 return None;
             }
             matching_entries += usize::from(pathspec_match.is_some_and(|m| !m.should_ignore()));
@@ -393,12 +427,12 @@ impl Mark {
             }
         }
 
-        if matching_entries != 0 && matching_entries != entries {
+        if deletion_whole_dir.is_none() && matching_entries != 0 && matching_entries != entries {
             return None;
         }
 
         let dir_status = if opts.emit_untracked == CollapseDirectory
-            && untracked != 0
+            && (untracked != 0 || (deletion_whole_dir.is_some() && entries == 0))
             && untracked + expendable + precious == entries
             && (opts.for_deletion.is_none()
                 || (precious == 0 && expendable == 0)
@@ -426,10 +460,12 @@ impl Mark {
         }
 
         // Pathspecs affect the collapse of the next level, hence find the highest-value one.
-        let dir_pathspec_match = state.on_hold[self.start_index..]
+        // A directory deletion takes as a whole carries its own match: its contents may
+        // have matched nothing.
+        let dir_pathspec_match = deletion_whole_dir.or_else(|| state.on_hold[self.start_index..]
             .iter()
             .filter_map(|e| e.pathspec_match)
-            .max()
+            .max())
             .or_else(|| {
                 // Only take directory matches as value if they are above the 'guessed' ones.
                 // Otherwise we end up with seemingly matched entries in the parent directory which

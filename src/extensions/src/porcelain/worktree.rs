@@ -152,17 +152,21 @@ pub fn worktree(args: &[String]) -> Result<ExitCode> {
         return usage(Some(&format!("error: unknown switch `{c}'")), MAIN_USAGE);
     }
 
+    // Each subcommand runs `parse_options()` over its own table, so a clump such as
+    // `add -qd`, `prune -nv` or `move -ff` is split by `parse_short_opt()` one character
+    // at a time, and `-b<name>` takes the rest of its word as the value (the short
+    // options of builtin/worktree.c:252-253, :805-818, :1089-1092, :1250, :1383).
+    use crate::parseopt::{expand_short, Shorts};
+    let rest = &args[1..];
     match sub {
-        "list" => list(&args[1..]),
-        "lock" => lock(&args[1..]),
-        "unlock" => unlock(&args[1..]),
-        "prune" => prune(&args[1..]),
-        "repair" => repair(&args[1..]),
-        "add" => add(&args[1..]),
-        "move" => move_worktree(&args[1..]),
-        "remove" => {
-            remove(&args[1..])
-        }
+        "list" => list(&expand_short(rest, Shorts::flags("vz"))),
+        "lock" => lock(rest),
+        "unlock" => unlock(rest),
+        "prune" => prune(&expand_short(rest, Shorts::flags("nv"))),
+        "repair" => repair(rest),
+        "add" => add(&expand_short(rest, Shorts { flags: "fdq", values: "bB", optargs: "", number: false })),
+        "move" => move_worktree(&expand_short(rest, Shorts::flags("f"))),
+        "remove" => remove(&expand_short(rest, Shorts::flags("f"))),
         other => usage(
             Some(&format!("error: unknown subcommand: `{other}'")),
             MAIN_USAGE,
@@ -2163,7 +2167,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
                 }
                 i += 1;
             }
-            "--detach" => detach = true,
+            "-d" | "--detach" => detach = true,
             "-f" | "--force" => force_count += 1,
             "--no-force" => force_count = 0,
             "--checkout" => checkout = true,

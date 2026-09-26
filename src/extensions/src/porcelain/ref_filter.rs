@@ -259,7 +259,13 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
     sorts.reverse();
 
     // Phase 1: `filter_refs()`. Nothing here reads an object body.
-    let candidates = filter_refs(spec, &sorts)?;
+    let (candidates, pending_die) = filter_refs(spec, &sorts)?;
+    // `print_ref_list()` runs `filter_refs()` to completion before it builds or
+    // verifies the format (builtin/branch.c:464-477), so a `die()` in the walk
+    // comes first there.
+    if let (Some(msg), false) = (&pending_die, spec.can_iterate) {
+        return Ok(Listing::Exit(for_each_ref::fatal(msg)));
+    }
 
     // Phase 2: the format, which `build_format()` may size from what survived.
     let format = match &spec.format {
@@ -275,6 +281,46 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
         Ok(v) => v,
         Err(e) => return Ok(Listing::Exit(report(e)?)),
     };
+
+    // `used_atom[]`: the sort keys were parsed in `cmd_branch()` / `cmd_tag()`
+    // before the format was verified, in command-line order (`sorts` is
+    // reversed above).
+    let used: Vec<&Atom> = sorts
+        .iter()
+        .rev()
+        .map(|s| &s.atom)
+        .chain(items.iter().filter_map(|it| match it {
+            Item::Atom(a) => Some(a),
+            _ => None,
+        }))
+        .collect();
+
+    // `can_do_iterative_format()` (ref-filter.c:3385-3417): a single plain
+    // `refname` key (or none), no `ahead-behind`/`is-base` atom and no
+    // `--merged`/`--no-merged`. Anything else sorts the whole array, filling
+    // every ref before any output — see [`populate_for_sort`].
+    let iterative = spec.can_iterate
+        && match sorts.as_slice() {
+            [] => true,
+            [only] => {
+                matches!(only.atom.field, Field::RefName(_))
+                    && !only.descending
+                    && !only.versioned
+                    && !spec.ignore_case
+            }
+            _ => false,
+        }
+        && spec.filters.merged.is_empty()
+        && spec.filters.no_merged.is_empty()
+        && !used.iter().any(|a| matches!(a.field, Field::AheadBehind(_) | Field::IsBase(..)));
+
+    // `list_tags()` verifies the format before `filter_and_format_refs()`
+    // (builtin/tag.c:72-75). A sorted listing runs `filter_refs()` whole before
+    // any output, so its `die()` leaves stdout empty; an iterative one has
+    // written every ref the walk passed first — see the end of this function.
+    if let (Some(msg), false) = (&pending_die, iterative) {
+        return Ok(Listing::Exit(for_each_ref::fatal(msg)));
+    }
 
     // Phase 3: load what the atoms actually ask for, and render.
     let mut refs = populate(repo, candidates, &items, &sorts)?;
@@ -312,37 +358,6 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
         filter_is_base(repo, &mut refs, &is_base_atoms);
     }
 
-    // `used_atom[]`: the sort keys were parsed in `cmd_branch()` / `cmd_tag()`
-    // before the format was verified, in command-line order (`sorts` is
-    // reversed above).
-    let used: Vec<&Atom> = sorts
-        .iter()
-        .rev()
-        .map(|s| &s.atom)
-        .chain(items.iter().filter_map(|it| match it {
-            Item::Atom(a) => Some(a),
-            _ => None,
-        }))
-        .collect();
-
-    // `can_do_iterative_format()` (ref-filter.c:3385-3417): a single plain
-    // `refname` key (or none), no `ahead-behind`/`is-base` atom and no
-    // `--merged`/`--no-merged`. Anything else sorts the whole array, filling
-    // every ref before any output — see [`populate_for_sort`].
-    let iterative = spec.can_iterate
-        && match sorts.as_slice() {
-            [] => true,
-            [only] => {
-                matches!(only.atom.field, Field::RefName(_))
-                    && !only.descending
-                    && !only.versioned
-                    && !spec.ignore_case
-            }
-            _ => false,
-        }
-        && spec.filters.merged.is_empty()
-        && spec.filters.no_merged.is_empty()
-        && !used.iter().any(|a| matches!(a.field, Field::AheadBehind(_) | Field::IsBase(..)));
     if !iterative && !sorts.is_empty() {
         populate_for_sort(&used, &refs)?;
     }
@@ -387,6 +402,14 @@ pub(super) fn filter_and_format(spec: &ListSpec<'_>) -> Result<Listing> {
         }
         lines.push(line);
     }
+    // The walk stopped at the ref `filter_and_format_one()` died on; the refs
+    // before it are already written.
+    if let Some(msg) = pending_die {
+        return Ok(match lines.is_empty() {
+            true => Listing::Exit(for_each_ref::fatal(&msg)),
+            false => Listing::Partial(lines, crate::fatal::die(msg)),
+        });
+    }
     Ok(Listing::Lines(lines))
 }
 
@@ -408,7 +431,11 @@ fn atoms<'a>(items: &'a [Item], sorts: &'a [SortKey]) -> impl Iterator<Item = &'
 }
 
 /// `filter_refs()`: walk the ref store and keep the refs this verb asked for.
-fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>> {
+///
+/// The second value is a `die()` `apply_ref_filter()` raised (`match_points_at()`'s
+/// `malformed object at '%s'`): the walk stopped at that ref, and the candidates are
+/// the refs it kept before it.
+fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<(Vec<Candidate>, Option<String>)> {
     let repo = spec.repo;
     let filters_active = spec.filters.active();
     // A `*`-prefixed sort key peels too, so the chain is worth keeping from here.
@@ -472,6 +499,16 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
             (symref, id, is_packed(repo, name_str))
         };
 
+        // `match_points_at()` comes first in `apply_ref_filter()` (ref-filter.c:2979-2980), and
+        // its `die()` ends the walk here.
+        if !spec.points_at.is_empty() {
+            match for_each_ref::match_points_at(repo, &spec.points_at, id) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return Ok((out, Some(for_each_ref::malformed_object(&refname)))),
+            }
+        }
+
         // `apply_ref_filter()`'s gentle commit lookup (ref-filter.c:2987-2991): the reachability
         // filters and `-v` all need the commit, and a ref whose object is missing — or whose tag
         // chain ends at one, or at something other than a commit — is dropped here rather than
@@ -481,17 +518,11 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
             continue;
         }
 
-        let chain = if !spec.points_at.is_empty() || sort_derefs {
+        let chain = if sort_derefs {
             peel_chain(repo, id)?
         } else {
             Vec::new()
         };
-        // `match_points_at()` accepts the ref's own id or any object it peels to.
-        if !spec.points_at.is_empty()
-            && !spec.points_at.iter().any(|t| *t == id || chain.contains(t))
-        {
-            continue;
-        }
         if filters_active && !passes_filters(repo, &spec.filters, id)? {
             continue;
         }
@@ -506,7 +537,7 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
             chain,
         });
     }
-    Ok(out)
+    Ok((out, None))
 }
 
 /// Read each surviving ref's object as far as the run's atoms require, producing

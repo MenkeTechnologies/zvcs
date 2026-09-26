@@ -1424,8 +1424,35 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // The `:short` disambiguation rules test candidate names against every ref.
     let all_names: HashSet<Vec<u8>> = names.iter().cloned().collect();
 
+    // `used_atom[]`: `verify_ref_format()` runs before `ref_sorting_options()`
+    // (builtin/for-each-ref.c:71-77), so the format's atoms come first, then the
+    // sort keys in command-line order — `sorts` was reversed above.
+    let used: Vec<&Atom> = items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Atom(a) => Some(a),
+            _ => None,
+        })
+        .chain(sorts.iter().rev().map(|s| &s.atom))
+        .collect();
+
+    // `can_do_iterative_format()` (ref-filter.c:3385-3417). The default
+    // `refname` key is always there (builtin/for-each-ref.c:60), so any
+    // `--sort` makes a second node; `--ignore-case` flags the one node.
+    // Iteratively, each ref is filled and written before the next is looked
+    // at. Otherwise `ref_array_sort()` fills every ref before the first line
+    // is written — see [`populate_for_sort`].
+    let iterative = sort_specs.is_empty()
+        && !ignore_case
+        && filters.merged.is_empty()
+        && filters.no_merged.is_empty()
+        && !used.iter().any(|a| matches!(a.field, Field::AheadBehind(_) | Field::IsBase(..)));
+
     let filters_active = filters.active();
     let mut refs: Vec<RefInfo> = Vec::new();
+    // A `die()` `apply_ref_filter()` raised mid-walk in an iterative listing:
+    // the refs before it are formatted and written first, as git does.
+    let mut pending_die: Option<String> = None;
     for refname in names {
         // `--start-after` seeks inside the `refs/` iteration, so a marker that
         // does not name a ref under `refs/` has no effect at all.
@@ -1465,21 +1492,27 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             continue;
         };
 
-        // The chain of tag targets, so `--points-at` and `*`-atoms agree with
-        // git. Skipped entirely when nothing needs it, as peeling reads objects.
-        let chain = if !points_at.is_empty() || needs_peel {
+        if !points_at.is_empty() {
+            match match_points_at(&repo, &points_at, id) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => {
+                    let msg = malformed_object(&refname);
+                    if !iterative {
+                        return Ok(fatal(&msg));
+                    }
+                    pending_die = Some(msg);
+                    break;
+                }
+            }
+        }
+        // The chain of tag targets, so `*`-atoms agree with git. Skipped
+        // entirely when nothing needs it, as peeling reads objects.
+        let chain = if needs_peel {
             peel_chain(&repo, id)?
         } else {
             Vec::new()
         };
-        // `match_points_at()` (ref-filter.c:2840-2866) answers yes for the ref's
-        // own id or any object along its tag chain, against *any* of the ids
-        // collected.
-        if !points_at.is_empty()
-            && !points_at.iter().any(|t| *t == id || chain.contains(t))
-        {
-            continue;
-        }
         if filters_active && !passes_filters(&repo, &filters, id)? {
             continue;
         }
@@ -1601,35 +1634,17 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         worktrees: std::cell::OnceCell::new(),
     };
 
-    // `used_atom[]`: `verify_ref_format()` runs before `ref_sorting_options()`
-    // (builtin/for-each-ref.c:71-77), so the format's atoms come first, then the
-    // sort keys in command-line order — `sorts` was reversed above.
-    let used: Vec<&Atom> = items
-        .iter()
-        .filter_map(|it| match it {
-            Item::Atom(a) => Some(a),
-            _ => None,
-        })
-        .chain(sorts.iter().rev().map(|s| &s.atom))
-        .collect();
-
-    // `can_do_iterative_format()` (ref-filter.c:3385-3417). The default
-    // `refname` key is always there (builtin/for-each-ref.c:60), so any
-    // `--sort` makes a second node; `--ignore-case` flags the one node.
-    // Iteratively, each ref is filled and written before the next is looked
-    // at. Otherwise `ref_array_sort()` fills every ref before the first line
-    // is written — see [`populate_for_sort`].
-    let iterative = sort_specs.is_empty()
-        && !ignore_case
-        && filters.merged.is_empty()
-        && filters.no_merged.is_empty()
-        && !used.iter().any(|a| matches!(a.field, Field::AheadBehind(_) | Field::IsBase(..)));
     if !iterative {
         populate_for_sort(&used, &refs)?;
     }
 
     let mut refs = sort_refs(&ctx, refs, &sorts, ignore_case, &prereleases)?;
     if let Some(n) = count {
+        // `filter_and_format_one()` stops the walk once `--count` refs are
+        // written (ref-filter.c:3088-3090), so a die further along is never met.
+        if refs.len() >= n {
+            pending_die = None;
+        }
         refs.truncate(n);
     }
 
@@ -1658,7 +1673,69 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     }
 
     std::io::stdout().write_all(&out)?;
+    if let Some(msg) = pending_die {
+        return Ok(fatal(&msg));
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `match_points_at()` (ref-filter.c:2840-2866): whether the ref at `id`, or an
+/// object down its tag chain, is one of `points_at`. `None` is the
+/// `die(_("malformed object at '%s'"), refname)` it ends in when an object it
+/// has to parse cannot be:
+///
+/// ```c
+/// if (oid_array_lookup(points_at, oid) >= 0)
+///         return 1;
+/// obj = parse_object_with_flags(the_repository, oid,
+///                               PARSE_OBJECT_SKIP_HASH_CHECK);
+/// while (obj && obj->type == OBJ_TAG) {
+///         struct tag *tag = (struct tag *)obj;
+///         if (parse_tag(the_repository, tag) < 0) {
+///                 obj = NULL;
+///                 break;
+///         }
+///         if (oid_array_lookup(points_at, get_tagged_oid(tag)) >= 0)
+///                 return 1;
+///         obj = tag->tagged;
+/// }
+/// if (!obj)
+///         die(_("malformed object at '%s'"), refname);
+/// return 0;
+/// ```
+///
+/// The ref's own id matches before anything is read, so a ref at a missing
+/// object is kept when that object is what was asked for. `tag->tagged` is
+/// only looked up, typed by the tag's `type` header, so the walk reads the
+/// next object only when that header says `tag`; a tag whose target commit is
+/// missing answers no without dying.
+pub(super) fn match_points_at(repo: &gix::Repository, points_at: &[ObjectId], id: ObjectId) -> Option<bool> {
+    if points_at.contains(&id) {
+        return Some(true);
+    }
+    let mut obj = repo.find_object(id).ok()?;
+    while obj.kind == Kind::Tag {
+        let tag = TagRef::from_bytes(&obj.data, repo.object_hash()).ok()?;
+        let target = tag.target();
+        if points_at.contains(&target) {
+            return Some(true);
+        }
+        if tag.target_kind != Kind::Tag {
+            return Some(false);
+        }
+        // `parse_tag()` on the next tag reads it; an object of any other
+        // type there is `Object %s not a tag` and fails the parse.
+        obj = repo.find_object(target).ok()?;
+        if obj.kind != Kind::Tag {
+            return None;
+        }
+    }
+    Some(false)
+}
+
+/// The message of `match_points_at()`'s `die()` (ref-filter.c:2863-2864).
+pub(super) fn malformed_object(refname: &[u8]) -> String {
+    format!("malformed object at '{}'", String::from_utf8_lossy(refname))
 }
 
 /// Repository-wide state the renderers share, built at most once per run.

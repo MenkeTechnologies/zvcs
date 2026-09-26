@@ -39,7 +39,9 @@ use gix::refs::FullName;
 ///
 /// `remove` and `move` reproduce `remove_worktree()`/`move_worktree()`: the argument
 /// is resolved through the same lookup `lock` uses, the main worktree is refused, and a
-/// locked one needs `-f -f` (`move`: `-f`). `remove` additionally runs
+/// locked one needs `-f -f` for either. `add` and `move` also put their destination
+/// through `check_candidate_path()`: a missing but registered path needs `-f` (`-f -f`
+/// when locked), which deletes the stale registration first. `remove` additionally runs
 /// `check_clean_worktree()`'s question — does `status` have anything to say, tracked or
 /// untracked? — and refuses without `--force`; it then deletes the checkout before the
 /// administrative directory, so an interrupted removal leaves a prunable entry rather
@@ -1401,8 +1403,8 @@ fn prune_worktree(wt_dir: &Path, id: &str, reason: &str, show_only: bool, verbos
 
 /// Port of `delete_git_dir()`: recursively remove the administrative directory,
 /// falling back to `unlink` for a stray non-directory entry (git's `ENOTDIR`
-/// branch).
-fn delete_git_dir(wt_dir: &Path, id: &str) {
+/// branch). `false` when the removal failed, which git has already reported.
+fn delete_git_dir(wt_dir: &Path, id: &str) -> bool {
     let path = wt_dir.join(id);
     let res = if path.is_dir() {
         std::fs::remove_dir_all(&path)
@@ -1415,7 +1417,77 @@ fn delete_git_dir(wt_dir: &Path, id: &str) {
             path_to_string(&path),
             errno_str(&e)
         );
+        return false;
     }
+    true
+}
+
+/// Port of `check_candidate_path()` (builtin/worktree.c:317-342), the viability test
+/// `add` and `move` put their destination through. `shown` is the spelling git's
+/// messages name — `add`'s `<path>`, `move`'s computed destination.
+///
+/// A non-empty directory (or anything else) at the path is refused whatever
+/// `--force` says. A path that is empty or absent but still *registered* — a
+/// worktree whose checkout was deleted without `prune` — is refused too, unless
+/// `-f` (or `-f -f` for a locked one) was given, in which case its stale
+/// administrative directory is deleted so the new registration can take its place:
+///
+/// ```c
+/// locked = !!worktree_lock_reason(wt);
+/// if ((!locked && force) || (locked && force > 1)) {
+///         if (delete_git_dir(wt->id))
+///             die(_("unusable worktree destination '%s'"), path);
+///         return;
+/// }
+/// ```
+///
+/// `find_worktree_by_path()` (worktree.c:279-296) compares `real_pathdup(p, 0)` of
+/// both sides, which tolerates a missing last component.
+fn check_candidate_path(
+    common: &Path,
+    worktrees: &[Wt],
+    path: &Path,
+    shown: &str,
+    force: usize,
+    cmd: &str,
+) -> Option<ExitCode> {
+    let occupied = match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        // A plain file at the path is just as occupied as a full directory.
+        Err(_) => path.exists(),
+    };
+    if occupied {
+        eprintln!("fatal: '{shown}' already exists");
+        return Some(ExitCode::from(128));
+    }
+
+    let want = crate::setup::realpath_or_die(path).ok()?;
+    let wt = worktrees.iter().find(|wt| {
+        crate::setup::realpath_or_die(&wt.path).is_ok_and(|have| have == want)
+    })?;
+    // The main worktree is never missing, so the non-empty test above caught it.
+    let id = wt.id.as_deref()?;
+    let locked = wt.locked.is_some();
+    if (!locked && force > 0) || (locked && force > 1) {
+        if !delete_git_dir(&common.join("worktrees"), id) {
+            eprintln!("fatal: unusable worktree destination '{shown}'");
+            return Some(ExitCode::from(128));
+        }
+        return None;
+    }
+    if locked {
+        eprintln!(
+            "fatal: '{shown}' is a missing but locked worktree;\n\
+             use '{cmd} -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
+        );
+    } else {
+        eprintln!(
+            "fatal: '{shown}' is a missing but already registered worktree;\n\
+             use '{cmd} -f' to override, or 'prune' or 'remove' to clear"
+        );
+    }
+    Some(ExitCode::from(128))
 }
 
 /// git's `strbuf_add_absolute_path(get_git_common_dir())` with a trailing `/.`
@@ -2051,7 +2123,9 @@ fn add(args: &[String]) -> Result<ExitCode> {
     let mut saw_new_branch = false;
     let mut saw_new_branch_force = false;
     let mut detach = false;
-    let mut force = false;
+    // `OPT__FORCE(&opts.force, …)`: a count, since `check_candidate_path()` wants `-f -f` for a
+    // missing but locked destination.
+    let mut force_count = 0usize;
     let mut checkout = true;
     let mut quiet = false;
     let mut lock_it = false;
@@ -2090,7 +2164,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
                 i += 1;
             }
             "--detach" => detach = true,
-            "-f" | "--force" => force = true,
+            "-f" | "--force" => force_count += 1,
+            "--no-force" => force_count = 0,
             "--checkout" => checkout = true,
             "--no-checkout" => checkout = false,
             "-q" | "--quiet" => quiet = true,
@@ -2145,6 +2220,8 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
         i += 1;
     }
+
+    let force = force_count > 0;
 
     // `if (!!opts.detach + !!new_branch + !!new_branch_force > 1)` (worktree.c:836),
     // the very first check `add()` makes — ahead of every `--orphan` combination,
@@ -2460,20 +2537,6 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `die_if_checked_out()`: a branch may be checked out in one worktree only.
-    if let Start::Branch(name, _) = &start {
-        if !force {
-            if let Some(other) = checked_out_in(&repo, name)? {
-                eprintln!(
-                    "fatal: '{}' is already used by worktree at '{}'",
-                    name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/"),
-                    path_to_string(&other)
-                );
-                return Ok(ExitCode::from(128));
-            }
-        }
-    }
-
     // `validate_new_branchname()` runs before a single directory is made, so a
     // `-b` naming an existing branch leaves nothing behind. git reports it through
     // a failed child process, which is why the status is 255 rather than `die()`'s
@@ -2531,25 +2594,25 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `add_worktree()`: the destination must be absent, or an empty directory.
-    let occupied = match std::fs::read_dir(&path) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        // A plain file at the path is just as occupied as a full directory.
-        Err(_) => path.exists(),
-    };
-    // `check_candidate_path()`'s first line is not gated by `--force`:
-    //
-    // ```c
-    // if (file_exists(path) && !is_empty_dir(path))
-    //         die(_("'%s' already exists"), path);
-    // ```
-    //
-    // `--force` only overrides the *registered worktree* checks below it, so
-    // `git worktree add -f <non-empty-dir>` dies in stock 2.55.0 too.
-    if occupied {
-        eprintln!("fatal: '{path_arg}' already exists");
-        return Ok(ExitCode::from(128));
+    // `add_worktree()` (worktree.c:478-488): `check_candidate_path()` first — whose opening
+    // `file_exists() && !is_empty_dir()` refusal no `--force` overrides — then, for a
+    // `<commit-ish>` that is a branch, `die_if_checked_out()`. An occupied destination is
+    // therefore reported ahead of a branch that is checked out elsewhere.
+    let worktrees = collect(&repo, u64::MAX)?;
+    if let Some(code) = check_candidate_path(&common, &worktrees, &path, path_arg, force_count, "add") {
+        return Ok(code);
+    }
+    if let Start::Branch(name, _) = &start {
+        if !force {
+            if let Some(other) = checked_out_in(&repo, name)? {
+                eprintln!(
+                    "fatal: '{}' is already used by worktree at '{}'",
+                    name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/"),
+                    path_to_string(&other)
+                );
+                return Ok(ExitCode::from(128));
+            }
+        }
     }
 
     // `add_worktree()`:490 — the fourth and last lookup, after
@@ -3507,7 +3570,9 @@ fn remove(args: &[String]) -> Result<ExitCode> {
 /// rewritten: `worktrees/<id>/gitdir` (which names the checkout's `.git` file) and
 /// the checkout's own `.git` file (which names the administrative directory).
 fn move_worktree(args: &[String]) -> Result<ExitCode> {
-    let mut force = false;
+    // `OPT__FORCE(&force, …)` counts: one `-f` overrides a missing registered destination,
+    // a locked worktree (or a missing *locked* destination) needs two.
+    let mut force = 0usize;
     let mut positionals: Vec<&str> = Vec::new();
     for a in args {
         match a.as_str() {
@@ -3516,8 +3581,8 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
                 print!("{MOVE_USAGE}");
                 return Ok(ExitCode::from(129));
             }
-            "-f" | "--force" => force = true,
-            "--no-force" => force = false,
+            "-f" | "--force" => force += 1,
+            "--no-force" => force = 0,
             s if s.starts_with('-') && s != "-" => return Ok(super::unknown_option(s, MOVE_USAGE)),
             s => positionals.push(s),
         }
@@ -3549,17 +3614,16 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     }
     // `check_candidate_path()` (builtin/worktree.c:317), which runs *before* the lock check and
     // names the destination it computed: `worktree move wt .` refuses `'./wt' already exists`,
-    // not the `.` the caller typed. An empty directory there is not in the way.
-    let occupied = match std::fs::read_dir(&dest) {
-        Ok(mut entries) => entries.next().is_some(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => dest.exists(),
-    };
-    if occupied {
-        return die(&format!("'{}' already exists", path_to_string(&dest)));
+    // not the `.` the caller typed. An empty directory there is not in the way, and a missing but
+    // registered one is cleared by `-f` (`-f -f` when locked).
+    if let Some(code) =
+        check_candidate_path(repo.common_dir(), &worktrees, &dest, &path_to_string(&dest), force, "move")
+    {
+        return Ok(code);
     }
 
-    if !force {
+    // `if (force < 2) reason = worktree_lock_reason(wt);` (worktree.c:1291-1292).
+    if force < 2 {
         if let Some(reason) = &wt.locked {
             return die(&if reason.is_empty() {
                 "cannot move a locked working tree;\nuse 'move -f -f' to override or unlock first"

@@ -10,6 +10,15 @@
 //! ref was warned about twice; and the valueless form was taken as an empty
 //! ref name and warned about instead of dying.
 //!
+//! `init_copy_notes_for_rewrite()` reads `notes.rewrite.<cmd>`,
+//! `notes.rewriteMode` and `notes.rewriteRef` through the same kind of walk
+//! (`notes_rewrite_config()`, notes-utils.c:103-132): the enable flag is
+//! `git_config_bool()`, which dies on a non-boolean; every mode value is
+//! checked, so a bad one is reported even when a later one replaces it; and
+//! a valueless mode or ref dies. zvcs read last values off the snapshot,
+//! defaulting a bad flag to true, skipping superseded modes and treating a
+//! valueless ref as the empty name.
+//!
 //! Expectations measured from stock git 2.55.0 under the same environment.
 
 use std::path::PathBuf;
@@ -135,4 +144,82 @@ fn a_valueless_display_ref_dies_naming_its_origin() {
     // Notes that are never loaded never run the callback.
     let (out, err, code) = f.run(&["log", "-1", "--format=%s"]);
     assert_eq!((out.as_str(), err.as_str(), code), ("base\n", "", 0));
+}
+
+/// `git -c <config>... commit --amend`: its stderr and exit code, then the
+/// resulting subject and the number of notes in `refs/notes/commits`.
+fn amend(f: &Fixture, config: &[&str]) -> (String, i32, String, usize) {
+    let mut args: Vec<&str> = Vec::new();
+    for c in config {
+        args.extend(["-c", c]);
+    }
+    args.extend(["commit", "-q", "--amend", "-m", "amended"]);
+    let (_, err, code) = f.run(&args);
+    let subject = f.run(&["log", "-1", "--format=%s"]).0;
+    let notes = f.run(&["notes", "list"]).0.lines().count();
+    (err, code, subject, notes)
+}
+
+#[test]
+fn a_superseded_bad_rewrite_mode_is_still_reported() {
+    let f = Fixture::new("rewrite-mode");
+    let (err, code, subject, _) = amend(
+        &f,
+        &[
+            "notes.rewriteRef=refs/notes/commits",
+            "notes.rewriteMode=bogus",
+            "notes.rewriteMode=overwrite",
+        ],
+    );
+    assert_eq!(
+        (err.as_str(), code, subject.as_str()),
+        ("error: Bad notes.rewriteMode value: 'bogus'\n", 0, "amended\n")
+    );
+    // The later valid mode wins: the note was carried to the amended commit.
+    assert_eq!(f.run(&["notes", "show"]).0, "yo\n");
+}
+
+#[test]
+fn a_command_line_rewrite_ref_is_warned_about_once() {
+    let f = Fixture::new("rewrite-once");
+    let (err, code, _, _) = amend(&f, &["notes.rewriteRef=refs/notes/x"]);
+    assert_eq!((err.as_str(), code), ("warning: notes ref refs/notes/x is invalid\n", 0));
+}
+
+#[test]
+fn a_valueless_rewrite_ref_dies_after_the_amend() {
+    let f = Fixture::new("rewrite-nonbool");
+    let (err, code, subject, notes) = amend(&f, &["notes.rewriteRef"]);
+    assert_eq!(
+        (err.as_str(), code, subject.as_str(), notes),
+        (
+            "error: missing value for 'notes.rewriteref'\n\
+             fatal: unable to parse 'notes.rewriteref' from command-line config\n",
+            128,
+            "amended\n",
+            1
+        )
+    );
+    // Only the old commit's note remains: nothing was copied.
+    assert_eq!(f.run(&["notes", "show"]).2, 1);
+}
+
+#[test]
+fn a_non_boolean_rewrite_flag_dies() {
+    let f = Fixture::new("rewrite-bool");
+    let (err, code, subject, _) = amend(
+        &f,
+        &["notes.rewriteRef=refs/notes/commits", "notes.rewrite.amend=bogus"],
+    );
+    assert_eq!(
+        (err.as_str(), code, subject.as_str()),
+        ("fatal: bad boolean config value 'bogus' for 'notes.rewrite.amend'\n", 128, "amended\n")
+    );
+    assert_eq!(f.run(&["notes", "show"]).2, 1);
+    // An integer is a boolean to `git_parse_maybe_bool()`: 0x0 disables the copy.
+    let f = Fixture::new("rewrite-bool-int");
+    let (err, code, _, _) =
+        amend(&f, &["notes.rewriteRef=refs/notes/commits", "notes.rewrite.amend=0x0"]);
+    assert_eq!((err.as_str(), code), ("", 0));
+    assert_eq!(f.run(&["notes", "show"]).2, 1);
 }

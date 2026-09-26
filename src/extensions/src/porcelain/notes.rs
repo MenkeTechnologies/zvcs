@@ -2013,7 +2013,6 @@ impl RewriteCfg {
     /// when `notes.rewrite.<cmd>` is false or nothing selects a ref, and the
     /// caller then copies nothing at all.
     pub(crate) fn init(repo: &gix::Repository, cmd: &str) -> Result<Option<RewriteCfg>> {
-        let snap = repo.config_snapshot();
         let mut combine = Combine::Concatenate;
         // A value git cannot parse does not fall back to `concatenate`: it
         // leaves the copy without a combine function of its own, so `add_note()`
@@ -2045,26 +2044,48 @@ impl RewriteCfg {
             Err(_) => false,
         };
 
-        let enabled = snap.boolean(&format!("notes.rewrite.{cmd}")).unwrap_or(true);
-        if !mode_from_env {
-            if let Some(v) = snap.string("notes.rewriteMode") {
-                let v = v.to_str_lossy().into_owned();
-                match parse_combine(&v) {
+        // `repo_config(the_repository, notes_rewrite_config, c)`
+        // (notes-utils.c:103-132): the callback runs once per configured value,
+        // in configuration order, so every value of each key is validated — a
+        // bad `notes.rewriteMode` is reported even when a later one replaces
+        // it — and a valueless mode or ref is `config_error_nonbool()`, which
+        // `configset_iter()` turns into `git_die_config_linenr()` for that
+        // occurrence (config.c:1654-1673). The mode's own refusal returns 1,
+        // which the walk ignores.
+        let enable_key = format!("notes.rewrite.{cmd}");
+        let mut enabled = true;
+        for v in crate::config::walk_config(repo) {
+            if v.key == enable_key {
+                // `git_config_bool()`: NULL is true, anything
+                // `git_parse_maybe_bool()` refuses dies.
+                enabled = match v.value.as_deref() {
+                    None => true,
+                    Some(raw) => match crate::optint::maybe_bool(raw) {
+                        Some(b) => b,
+                        None => crate::git_fatal!("bad boolean config value '{raw}' for '{}'", v.key),
+                    },
+                };
+            } else if !mode_from_env && v.key == "notes.rewritemode" {
+                let Some(raw) = v.value.as_deref() else {
+                    eprintln!("error: missing value for '{}'", v.key);
+                    crate::git_fatal!("{}", v.origin.die_linenr(&v.key));
+                };
+                match parse_combine(raw) {
                     Some(c) => combine = c,
                     None => {
-                        eprintln!("error: Bad notes.rewriteMode value: '{v}'");
+                        eprintln!("error: Bad notes.rewriteMode value: '{raw}'");
                         combine = Combine::Ignore;
                     }
                 }
-            }
-        }
-        if !refs_from_env {
-            for v in snap.strings("notes.rewriteRef").unwrap_or_default() {
-                let v = v.to_str_lossy().into_owned();
-                if v.starts_with("refs/notes/") {
-                    add_by_glob(repo, &mut refs, &v)?;
+            } else if !refs_from_env && v.key == "notes.rewriteref" {
+                let Some(raw) = v.value.as_deref() else {
+                    eprintln!("error: missing value for '{}'", v.key);
+                    crate::git_fatal!("{}", v.origin.die_linenr(&v.key));
+                };
+                if raw.starts_with("refs/notes/") {
+                    add_by_glob(repo, &mut refs, raw)?;
                 } else {
-                    eprintln!("warning: Refusing to rewrite notes in {v} (outside of refs/notes/)");
+                    eprintln!("warning: Refusing to rewrite notes in {raw} (outside of refs/notes/)");
                 }
             }
         }

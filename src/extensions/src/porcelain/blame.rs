@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
@@ -579,24 +578,41 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         Err(code) => return Ok(code),
     };
 
-    // `blame.ignoreRevsFile` is an `OPT_STRING_LIST` fed from the config callback, so
-    // every occurrence in file order contributes and an empty value clears what came
-    // before it. git resolves each through `git_config_pathname`, which expands `~`.
-    let ignore_revs_file_default: Vec<String> = repo
-        .config_snapshot()
-        .plumbing()
-        .strings("blame.ignoreRevsFile")
-        .unwrap_or_default()
-        .iter()
-        .map(|v| v.to_str_lossy().into_owned())
-        .fold(Vec::new(), |mut acc, value| {
-            if value.is_empty() {
-                acc.clear();
-            } else {
-                acc.push(expand_tilde(&value));
-            }
-            acc
-        });
+    // `git_blame_config()` (builtin/blame.c:738-749): each `blame.ignoreRevsFile`
+    // value goes through `git_config_pathname()` — a valueless one is
+    // `config_error_nonbool()`, `~` is expanded, and an `:(optional)` path that
+    // is missing (from the work-tree top git has moved to) is dropped — and is
+    // then `string_list_insert()`ed: kept sorted by `strcmp()`, duplicates
+    // dropped. An empty value is an entry like any other, sorting first; it is
+    // `build_ignorelist()` that treats `""` as "clear what came before".
+    let setup_cwd = crate::setup::setup_cwd(&repo).unwrap_or_default();
+    let mut ignore_revs_file_default: Vec<String> = Vec::new();
+    for v in crate::config::walk_config(&repo) {
+        if v.key != "blame.ignorerevsfile" {
+            continue;
+        }
+        let Some(raw) = v.value.as_deref() else {
+            eprintln!("error: missing value for '{}'", v.key);
+            crate::git_fatal!("{}", v.origin.die_linenr(&v.key));
+        };
+        let (optional, value) = match raw.strip_prefix(":(optional)") {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        let Some(path) = crate::setup::interpolate_path(value) else {
+            crate::git_fatal!("failed to expand user dir in: '{value}'");
+        };
+        if optional
+            && std::fs::metadata(setup_cwd.join(&path))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue;
+        }
+        let path = path.to_string_lossy().into_owned();
+        if let Err(at) = ignore_revs_file_default.binary_search(&path) {
+            ignore_revs_file_default.insert(at, path);
+        }
+    }
     let mark_unblamable_lines =
         repo.config_snapshot().boolean("blame.markUnblamableLines") == Some(true);
     let mark_ignored_lines = repo.config_snapshot().boolean("blame.markIgnoredLines") == Some(true);
@@ -2739,22 +2755,6 @@ enum Targets {
     Resolved,
 }
 
-/// Expand a leading `~` / `~/` to `$HOME`, which is what `git_config_pathname` does
-/// for `blame.ignoreRevsFile`.
-fn expand_tilde(value: &str) -> String {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return value.to_string();
-    };
-    let expanded = if value == "~" {
-        home
-    } else if let Some(rest) = value.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        return value.to_string();
-    };
-    expanded.to_string_lossy().into_owned()
-}
-
 /// `strerror(errno)` as `die_errno()` renders it: Rust spells an OS error
 /// `<strerror> (os error <n>)` and git spells only the first half.
 fn errno_text(e: &std::io::Error) -> String {
@@ -2787,8 +2787,10 @@ fn peel_ignored_oid(repo: &gix::Repository, oid: ObjectId) -> Option<ObjectId> {
         .map(|c| c.id().detach())
 }
 
-/// git's `build_ignorelist`: the revision files first (in the order config and
-/// command line contributed them), then the `--ignore-rev` arguments.
+/// git's `build_ignorelist` (builtin/blame.c:908-930): the revision files first
+/// (the sorted config entries, then the command line's in order), then the
+/// `--ignore-rev` arguments. An empty file name clears the set built so far, and
+/// a relative name is opened from the work-tree top git has moved to.
 ///
 /// A file that cannot be opened, and a line in one that is not a full object name,
 /// are fatal; a well-formed object name that is not a commit is skipped silently. An
@@ -2799,8 +2801,13 @@ fn build_ignorelist(
 ) -> Result<HashSet<ObjectId>, ExitCode> {
     let mut set: HashSet<ObjectId> = HashSet::new();
 
+    let setup_cwd = crate::setup::setup_cwd(repo).unwrap_or_default();
     for path in &opts.ignore_revs_file {
-        let Ok(data) = std::fs::read(path) else {
+        if path.is_empty() {
+            set.clear();
+            continue;
+        }
+        let Ok(data) = std::fs::read(setup_cwd.join(path)) else {
             eprintln!("fatal: could not open object name list: {path}");
             return Err(ExitCode::from(128));
         };
@@ -4802,7 +4809,8 @@ struct ConfigDefaults {
     show_root: bool,
     /// `blame.blankBoundary`.
     blank_boundary: bool,
-    /// `blame.ignoreRevsFile`, in file order; an empty value clears the list.
+    /// `blame.ignoreRevsFile`, sorted and de-duplicated as `string_list_insert()`
+    /// keeps it; an empty entry clears the set when the list is applied.
     ignore_revs_file: Vec<String>,
     /// `blame.markUnblamableLines`.
     mark_unblamable_lines: bool,

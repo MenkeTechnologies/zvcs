@@ -231,16 +231,17 @@ impl BlameColors {
         };
 
         // `blame.coloring` ORs into `coloring_mode`; `none` clears both bits. The
-        // config callback sees every occurrence in file order, so all values are
-        // folded in rather than just the last one.
+        // config callback sees every configured value once, in order
+        // (builtin/blame.c:770-785), so all values are folded in and each bad
+        // one warns once — `config::walk_config()` counts a `-c` override once,
+        // where the snapshot holds it twice.
         let (mut config_lines, mut config_age) = (false, false);
-        for value in snapshot
-            .plumbing()
-            .strings("blame.coloring")
-            .unwrap_or_default()
-            .iter()
-            .map(|v| v.to_str_lossy().into_owned())
-        {
+        for v in crate::config::walk_config(repo) {
+            if v.key != "blame.coloring" {
+                continue;
+            }
+            // A valueless key has already died in the config validation.
+            let Some(value) = v.value else { continue };
             match value.as_str() {
                 "repeatedLines" => config_lines = true,
                 "highlightRecent" => config_age = true,

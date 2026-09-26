@@ -56,8 +56,9 @@
 //!     `:(literal)`, `:(icase)`, `:(top)`, `:(exclude)` / `:!`, and the `*` /
 //!     `?` / `[…]` wildcards — matched the way git's `match_pathspec()` matches,
 //!     with only a *positive* spec that matches nothing raising the failure.
-//!   * Being run from a subdirectory, which narrows the tree to that
-//!     subdirectory exactly as git does.
+//!   * Being run from a subdirectory: the whole tree is walked (and its
+//!     attributes read) under the cwd-prefixed pathspec, a spec reaching files
+//!     above the cwd is refused, and each path is written relative to the cwd.
 //!   * `tar.umask` (numeric, and `tar.umask=user`, which git reads from the
 //!     process umask by `umask(0)`-then-restore — reproduced here).
 //!   * `--add-file <path>` and `--add-virtual-file <path:content>`: the extra
@@ -108,12 +109,10 @@
 //!
 //! Not covered — this fails loudly rather than emitting an archive that would
 //! silently differ from git's:
-//!   * Two pathspec-magic corners that need substrate this port does not wire
+//!   * One pathspec-magic corner that needs substrate this port does not wire
 //!     into `git archive`: an `:(attr:<name>)` spec is matched as if no
-//!     attribute were set, so an `:(attr:…)` spec selects nothing; and `:(top)`
-//!     given from a *subdirectory* re-roots at the repository top in git, but
-//!     here the tree is already narrowed to the subdirectory, so a `:(top)` spec
-//!     is matched against the narrowed tree. Every other magic works.
+//!     attribute were set, so an `:(attr:…)` spec selects nothing. Every other
+//!     magic works.
 
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -686,44 +685,39 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         None => default_mtime,
     };
     // git names the *resolved* id here, not the spelling from argv.
-    let Some(mut tree) = object.and_then(|obj| obj.peel_to_tree().ok()) else {
+    let Some(tree) = object.and_then(|obj| obj.peel_to_tree().ok()) else {
         eprintln!("fatal: not a tree object: {id}");
         return Ok(ExitCode::from(128));
     };
 
     // git does not diagnose an unsupported container, nor an out-of-range gzip
-    // level, until *archive-writing* time — after the subdirectory narrowing,
-    // the attribute scan and the whole path-filter walk have each had their turn
-    // to fail with git's own exit code. Both checks are therefore deferred to
+    // level, until *archive-writing* time — after the attribute scan and the
+    // whole path-filter walk have each had their turn to fail with git's own
+    // exit code. Both checks are therefore deferred to
     // just before the first byte is written (see below); here we only compute the
     // format flags the writer needs.
     // A configured `tar.<format>.command` *replaces* the archiver, so a `tar.tar.gz.command`
     // means the tar goes to that command rather than through the internal gzip.
     let gzipped = matches!(format.as_str(), "tgz" | "tar.gz") && filter.is_none();
     let level = opts.level.unwrap_or(6);
-    // Run from a subdirectory, git narrows the tree to that subdirectory and
-    // makes every archived path relative to it.
-    if let Some(prefix) = repo.prefix()?.map(std::path::Path::to_path_buf) {
-        for part in prefix.components() {
-            let name = part.as_os_str().as_encoded_bytes().to_vec();
-            let Some(sub) = subtree(&repo, &tree, &name)? else {
-                eprintln!("fatal: current working directory is untracked");
-                return Ok(ExitCode::from(128));
-            };
-            tree = sub;
-        }
-    }
+    // Run from a subdirectory, git does not narrow the tree: the whole tree is
+    // walked (and its attributes read) under a pathspec parsed with
+    // `PATHSPEC_PREFER_CWD` against `args->prefix` (archive.c:473-474), so no
+    // argument means "everything below the cwd", and each written path is made
+    // relative to the cwd afterwards (archive.c:183-201).
+    let cwd_prefix = repo.prefix()?.map(std::path::Path::to_path_buf);
+    let cwd_prefix_bytes = crate::setup::prefix_bytes(&repo);
 
     let mut conv = Convert::new(&repo, &tree, opts.worktree_attributes)?;
 
     // Parse the trailing pathspecs into a `gix-pathspec` search so the whole
     // magic grammar is matched exactly as git's `match_pathspec()` does. git
     // parses these with `parse_pathspec(..., 0, PATHSPEC_PREFER_CWD, prefix,
-    // argv)` (no magic disallowed) and sets `recursive = 1`. The tree was
-    // already narrowed to the CWD subdirectory above, so the specs are matched
-    // against subdirectory-relative paths — the PREFER_CWD prefixing and the
-    // narrowing cancel out for every spec that is not `:(top)`. An empty spec
-    // list means "match everything", represented as `None` (no search built).
+    // argv)` (no magic disallowed) and sets `recursive = 1`. The specs are
+    // normalised against the cwd prefix and matched against full tree paths;
+    // with no spec, `PATHSPEC_PREFER_CWD` stands the prefix itself in, which
+    // `Search::from_specs` does for an empty list and a non-empty prefix. No
+    // spec at the top level means "match everything", represented as `None`.
     // `parsed` keeps the individual patterns so the "did not match" check can
     // test each one independently, the way git's `path_exists()` does.
     let root = repo.workdir().unwrap_or_else(|| repo.git_dir()).to_path_buf();
@@ -759,10 +753,10 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         }
         patterns
     };
-    let mut search = if parsed.is_empty() {
+    let mut search = if parsed.is_empty() && cwd_prefix.is_none() {
         None
     } else {
-        match Search::from_specs(parsed.clone(), None, &root) {
+        match Search::from_specs(parsed.clone(), cwd_prefix.as_deref(), &root) {
             Ok(s) => Some(s),
             Err(e) => {
                 eprintln!("fatal: {e}");
@@ -788,7 +782,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         if pat.is_excluded() {
             continue;
         }
-        let mut one = match Search::from_specs([pat.clone()], None, &root) {
+        let mut one = match Search::from_specs([pat.clone()], cwd_prefix.as_deref(), &root) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("fatal: {e}");
@@ -796,10 +790,29 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             }
         };
         // ```c
-        // const char *paths[] = { path, NULL };
-        // [...]
-        // parse_pathspec(&ctx.pathspec, 0, 0, "", paths);
+        // parse_pathspec(&ctx.pathspec, 0, PATHSPEC_PREFER_CWD,
+        //                args->prefix, paths);
         // ctx.pathspec.recursive = 1;
+        // if (args->prefix && read_tree(args->repo, args->tree, &ctx.pathspec,
+        //                               reject_outside, args))
+        //         die(_("pathspec '%s' matches files outside the "
+        //               "current directory"), path);
+        // ```
+        //
+        // (`path_exists()`, archive.c:434-452.) From a subdirectory, a spec
+        // that reaches any file whose path relative to the cwd starts with
+        // `../` is refused before its existence is tested — `../x` and `:/x`
+        // name real files but still die here.
+        if !cwd_prefix_bytes.is_empty()
+            && matches_outside(&repo, tree.clone(), b"", &mut one, &cwd_prefix_bytes)?
+        {
+            eprintln!(
+                "fatal: pathspec '{}' matches files outside the current directory",
+                opts.paths[idx]
+            );
+            return Ok(ExitCode::from(128));
+        }
+        // ```c
         // ret = read_tree(args->repo, args->tree, &ctx.pathspec, reject_entry, &ctx);
         // ```
         //
@@ -827,6 +840,27 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     }
+
+    // `write_archive_entry()` (archive.c:183-201): from a subdirectory, each
+    // entry is renamed to `relative_path(path_without_prefix, args->prefix)`,
+    // and the cwd itself (`./`) and anything above it (`../…`) are skipped —
+    // after `export-ignore`/`export-subst` were looked up on the full path.
+    // The renamed path is the one `object_file_to_archive()` converts under.
+    let items: Vec<Item> = if cwd_prefix_bytes.is_empty() {
+        items
+    } else {
+        items
+            .into_iter()
+            .filter_map(|mut item| {
+                let rel = item.path.strip_prefix(cwd_prefix_bytes.as_slice())?;
+                if rel.is_empty() {
+                    return None;
+                }
+                item.path = rel.to_vec();
+                Some(item)
+            })
+            .collect()
+    };
 
     // Now that every git diagnostic with an exit code of its own has fired, the
     // two archive-writing-time failures can be emitted in git's own order. git
@@ -1583,20 +1617,6 @@ fn process_umask() -> u32 {
     }
 }
 
-/// The sub-tree named `name` directly below `tree`, if it is a tree.
-fn subtree<'r>(
-    repo: &'r gix::Repository,
-    tree: &gix::Tree<'r>,
-    name: &[u8],
-) -> Result<Option<gix::Tree<'r>>> {
-    for entry in tree.decode()?.entries.iter() {
-        if entry.filename == name && entry.mode.is_tree() {
-            return Ok(Some(repo.find_object(entry.oid.to_owned())?.peel_to_tree()?));
-        }
-    }
-    Ok(None)
-}
-
 /// The two ways `.gitattributes` reaches `git archive`, bundled so the walk and
 /// the two container writers share one lookup state.
 ///
@@ -2001,6 +2021,52 @@ fn collect(
         out.push(Item { path, kind, oid, subst: export.subst });
     }
     Ok(())
+}
+
+/// `read_tree(..., reject_outside, args)` (archive.c:414-432): whether `search`
+/// reaches any non-directory entry that lies outside the cwd `prefix` — one
+/// whose `relative_path()` against it would start with `../`. Attributes play
+/// no part: this is the plain tree walk, not the archive walk.
+fn matches_outside(
+    repo: &gix::Repository,
+    tree: gix::Tree<'_>,
+    base: &[u8],
+    search: &mut Search,
+    prefix: &[u8],
+) -> Result<bool> {
+    let entries: Vec<(EntryKind, Vec<u8>, ObjectId)> = tree
+        .decode()?
+        .entries
+        .iter()
+        .map(|e| (e.mode.kind(), e.filename.to_vec(), e.oid.to_owned()))
+        .collect();
+    for (kind, filename, oid) in entries {
+        let mut path = base.to_vec();
+        path.extend_from_slice(&filename);
+        if kind == EntryKind::Tree {
+            if !search.can_match_relative_path(path.as_bstr(), Some(true)) {
+                continue;
+            }
+            path.push(b'/');
+            let child = repo.find_object(oid)?.peel_to_tree()?;
+            if matches_outside(repo, child, &path, search, prefix)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        let mut no_attrs = |_: &gix::bstr::BStr,
+                            _: gix::pathspec::attributes::glob::pattern::Case,
+                            _: bool,
+                            _: &mut gix::pathspec::attributes::search::Outcome|
+         -> bool { false };
+        let selected = search
+            .pattern_matching_relative_path(path.as_bstr(), Some(false), &mut no_attrs)
+            .is_some_and(|m| !m.is_excluded());
+        if selected && !path.starts_with(prefix) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Write out the queued directories that are ancestors of `path`, dropping the

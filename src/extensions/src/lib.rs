@@ -558,12 +558,53 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
         eprintln!("fatal: unable to parse command-line config");
         return Some(ExitCode::from(fatal::EXIT_FATAL));
     }
-    let reason = overrides
-        .iter()
-        .find_map(|o| config::check_config_key(&o.key).err())?;
+    // `git_config_from_parameters()` (config.c:731-790) hands each entry to the
+    // reader in turn, so the first one that fails either check is the one named.
+    let reason = overrides.iter().find_map(|o| {
+        config::check_config_key(&o.key)
+            .err()
+            .or_else(|| command_line_include_refusal(o))
+    })?;
     eprintln!("error: {reason}");
     eprintln!("fatal: unable to parse command-line config");
     Some(ExitCode::from(fatal::EXIT_FATAL))
+}
+
+/// `handle_path_include()`'s refusal of a command-line `include.path`, or `None`
+/// when the reader would follow (or quietly skip) it.
+///
+/// Every value the configuration sequence reads goes through
+/// `git_config_include()` (config.c:416-448), which hands an `include.path` to
+/// `handle_path_include()` (config.c:142-191). A command-line value has no file
+/// behind it (`kvi->origin_type` is `CONFIG_ORIGIN_CMDLINE`), so:
+///
+/// ```c
+/// if (!path)
+///         return config_error_nonbool("include.path");
+/// expanded = interpolate_path(path, 0);
+/// if (!expanded)
+///         return error(_("could not expand include path '%s'"), path);
+/// if (!is_absolute_path(path)) {
+///         if (!kvi || kvi->origin_type != CONFIG_ORIGIN_FILE) {
+///                 ret = error(_("relative config includes must come from files"));
+/// ```
+///
+/// and the negative return makes `do_git_config_sequence()` die with `unable to
+/// parse command-line config` (config.c:1600-1602). The empty value is relative.
+/// An absolute path that does not exist is skipped silently
+/// (`access_or_die()`), as it is here. `includeIf.<cond>.path` is left to the
+/// reader: whether it is followed depends on the condition.
+fn command_line_include_refusal(o: &ConfigOverride) -> Option<String> {
+    if config::normalize_key(&o.key) != "include.path" {
+        return None;
+    }
+    let Some(value) = o.value.as_deref() else {
+        return Some("missing value for 'include.path'".to_string());
+    };
+    let Some(path) = setup::interpolate_path(value) else {
+        return Some(format!("could not expand include path '{value}'"));
+    };
+    (!path.is_absolute()).then(|| "relative config includes must come from files".to_string())
 }
 
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.

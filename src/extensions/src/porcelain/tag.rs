@@ -1951,8 +1951,10 @@ fn fatal(msg: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(128))
 }
 
-/// Abbreviated hex for `id`, honoring the repo's shortening rules.
+/// `repo_find_unique_abbrev(the_repository, oid, DEFAULT_ABBREV)` — the id in the
+/// `Deleted tag` and `Updated tag` lines and the `--create-reflog` message
+/// (builtin/tag.c:134, 400, 712). An id the object database does not hold keeps the
+/// starting length rather than being printed whole.
 fn short_hex(repo: &gix::Repository, id: ObjectId) -> String {
-    use gix::prelude::ObjectIdExt;
-    id.attach(repo).shorten_or_id().to_string()
+    crate::abbrev::default_unique_abbrev(repo, &id)
 }

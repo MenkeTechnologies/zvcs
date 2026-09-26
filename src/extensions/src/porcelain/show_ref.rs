@@ -674,12 +674,10 @@ fn emit(
 fn hex(repo: &gix::Repository, id: ObjectId, abbrev: Abbrev) -> String {
     match abbrev {
         Abbrev::Full => id.to_hex().to_string(),
-        Abbrev::Auto => id.attach(repo).shorten_or_id().to_string(),
-        Abbrev::Len(n) if n >= id.kind().len_in_hex() => id.to_hex().to_string(),
-        Abbrev::Len(n) => gix::odb::store::prefix::disambiguate::Candidate::new(id, n)
-            .ok()
-            .and_then(|c| repo.objects.disambiguate_prefix(c).ok().flatten())
-            .map_or_else(|| id.to_hex_with_len(n).to_string(), |p| p.to_string()),
+        // `repo_find_unique_abbrev(the_repository, ref->oid, opts->abbrev)`
+        // (builtin/show-ref.c:47, 57), where bare `--abbrev` is `DEFAULT_ABBREV`.
+        Abbrev::Auto => crate::abbrev::default_unique_abbrev(repo, &id),
+        Abbrev::Len(n) => crate::abbrev::unique_abbrev(repo, &id, n),
     }
 }
 

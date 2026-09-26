@@ -204,6 +204,17 @@ pub fn aligned_ellipsis(abbrev: String, len: usize, full_hex: &str) -> String {
     out
 }
 
+/// `repo_find_unique_abbrev(r, oid, DEFAULT_ABBREV)`: [`unique_abbrev`] starting
+/// at the configured `core.abbrev` length. `DEFAULT_ABBREV` is `default_abbrev`,
+/// which is `core.abbrev` or -1 for `auto` (environment.c:349-363), and a negative
+/// length is the automatic one (object-name.c:586-600).
+///
+/// This is what gitoxide's `shorten_or_id()` is not: an id the object database
+/// does not hold keeps the starting length instead of coming back whole.
+pub fn default_unique_abbrev(repo: &gix::Repository, id: &gix::hash::ObjectId) -> String {
+    unique_abbrev(repo, id, configured_abbrev(repo, id.kind().len_in_hex()))
+}
+
 /// [`unique_abbrev`] followed by [`aligned_ellipsis`]: the whole of
 /// `diff_aligned_abbrev()` for a caller that has the repository in hand.
 pub fn aligned_abbrev(repo: &gix::Repository, id: &gix::hash::ObjectId, len: usize) -> String {

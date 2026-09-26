@@ -105,11 +105,10 @@
 //! `--include-root-refs` asked for.
 //!
 //! One known divergence: the `:short` renderings (`%(objectname:short)`,
-//! `%(tree:short)`, `%(parent:short)`) take their length from gitoxide's
-//! abbreviation logic, which honours `core.abbrev` but, when it is unset,
-//! auto-scales off the packed-object count alone where git also counts loose
-//! objects, and which does not extend a `:short=<n>` prefix to keep it unique
-//! the way git's `find_unique_abbrev` does. The full forms match byte-for-byte.
+//! `%(tree:short)`, `%(parent:short)`) honour `core.abbrev` but, when it is
+//! unset, auto-scale off the packed-object count alone where git also counts
+//! loose objects ([`crate::abbrev::auto_abbrev`]). The widening to a unique
+//! prefix is git's `find_unique_abbrev`, and the full forms match byte-for-byte.
 
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashSet;
@@ -3531,17 +3530,26 @@ fn ahead_behind(repo: &gix::Repository, tip: ObjectId, base: ObjectId) -> Result
     Ok((count(tip, base), count(base, tip)))
 }
 
-/// Render an object id per an `%(objectname)`-style length modifier.
+/// Render an object id per an `%(objectname)`-style length modifier:
+/// `do_grab_oid()` (ref-filter.c:1422-1437).
 ///
-/// The `:short` / `:short=<n>` renderings take their length from gitoxide's
-/// abbreviation logic, which does not extend a prefix to guarantee uniqueness
-/// the way git's `find_unique_abbrev` does — the divergence the module header
-/// notes for `%(objectname:short)` applies to `%(tree)` / `%(parent)` too.
+/// ```c
+/// case O_LENGTH:
+///         return repo_find_unique_abbrev(the_repository, oid,
+///                                        atom->u.oid.length);
+/// case O_SHORT:
+///         return repo_find_unique_abbrev(the_repository, oid,
+///                                        DEFAULT_ABBREV);
+/// ```
+///
+/// Both widen past the starting length while another object shares the prefix,
+/// and neither widens an id the object database does not hold — a ref at a
+/// missing object prints the starting length, not the whole name.
 fn format_oid(repo: &gix::Repository, id: ObjectId, len: &NameLen) -> Vec<u8> {
     match len {
         NameLen::Full => id.to_hex().to_string().into_bytes(),
-        NameLen::Auto => id.attach(repo).shorten_or_id().to_string().into_bytes(),
-        NameLen::Fixed(n) => id.to_hex_with_len(*n).to_string().into_bytes(),
+        NameLen::Auto => crate::abbrev::default_unique_abbrev(repo, &id).into_bytes(),
+        NameLen::Fixed(n) => crate::abbrev::unique_abbrev(repo, &id, *n).into_bytes(),
     }
 }
 

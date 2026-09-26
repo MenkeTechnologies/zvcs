@@ -2789,12 +2789,35 @@ fn parse_mail_rebase(
     state_dir: &Path,
     mail: &Path,
 ) -> Result<Option<CommitInfo>> {
+    // `am_path(state, msgnum(state))`, rendered the way `git_path()` renders a
+    // file under `$GIT_DIR`: `.git/rebase-apply/0001` from anywhere in the tree.
+    let shown = crate::setup::git_path_display(repo, mail);
     let Some(oid) = get_mail_commit_oid(repo, mail) else {
-        eprintln!("fatal: could not parse {}", mail.display());
+        eprintln!("fatal: could not parse {shown}");
         return Ok(None);
     };
-    let info = get_commit_info(repo, oid)?;
-    write_commit_patch(ctx, state_dir, oid)?;
+    // `commit = lookup_commit_or_die(&commit_oid, mail);` (commit.c:81-91):
+    // `lookup_commit_reference()` peels a tag to its commit, so the postmark may
+    // name an annotated tag — warned about, then replayed. A missing object, or
+    // one that peels to something else (after `object_as_type()`'s own
+    // `error:`), dies naming the mail file. The commit's info and diff are read
+    // from the peeled commit; `original-commit` and `REBASE_HEAD` keep the
+    // postmark's own id (builtin/am.c:1478-1482).
+    let commit = match crate::objname::lookup_commit_reference(repo, oid) {
+        crate::objname::CommitRef::Commit(commit) => commit,
+        refused => {
+            if let Some(error) = refused.type_error() {
+                eprintln!("error: {error}");
+            }
+            eprintln!("fatal: could not parse {shown}");
+            return Ok(None);
+        }
+    };
+    if commit != oid {
+        eprintln!("warning: {shown} {oid} is not a commit!");
+    }
+    let info = get_commit_info(repo, commit)?;
+    write_commit_patch(ctx, state_dir, commit)?;
     write_text(state_dir, "original-commit", &oid.to_hex().to_string())?;
     // `refs_update_ref(…, "am", "REBASE_HEAD", …, REF_NO_DEREF, DIE_ON_ERR)`:
     // the commit being replayed, which `git status` and the conflict advice name.

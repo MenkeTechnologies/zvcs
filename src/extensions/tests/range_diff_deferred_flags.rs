@@ -662,8 +662,8 @@ fn pickaxe_combinations_keep_gits_message_and_ordering() {
         assert_eq!(err, expected, "{argv:?}");
     }
 
-    // The same kind twice is one bit, so it is no conflict — it reaches the
-    // honesty guard instead, because `-S` itself is not implemented.
+    // The same kind twice is one bit, so it is no conflict: the run filters
+    // and prints its page like stock git 2.55.0 does.
     for args in [
         vec!["-S", "x", "-S", "y"],
         vec!["-G", "x", "-G", "y"],
@@ -673,8 +673,8 @@ fn pickaxe_combinations_keep_gits_message_and_ordering() {
         argv.extend(args.iter().copied());
         argv.extend_from_slice(&["v1..main", "v1..feature"]);
         let (_, err, code) = run(&repo, &home, &argv);
-        assert_eq!(code, 128, "{argv:?}");
-        assert!(err.starts_with("fatal: unsupported flag"), "{argv:?}: {err}");
+        assert_eq!(code, 0, "{argv:?}");
+        assert_eq!(err, "", "{argv:?}");
     }
 
     // `diff_opt_find_object()` resolves its value before it sets the bit

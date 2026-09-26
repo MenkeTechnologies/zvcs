@@ -115,6 +115,13 @@
 //! * `--anchored=<text>` (diff.c:5544-5555): patience with anchor lines, matched
 //!   against the outer records — patch lines — and dropped by a later
 //!   `--patience` (diff.c:5838-5857).
+//! * The pickaxe filters `-S` (literal, or a regex count under
+//!   `--pickaxe-regex`), `-G` and `--find-object`, through the same
+//!   `pickaxe_match()` test `git diff` runs: `diffcore_pickaxe()` can drop the
+//!   one filepair, and `diff_flush()` then writes nothing in any format. The
+//!   two filespecs carry the null id, so `--find-object` keeps the pair only
+//!   when it names that id. All five pickaxe options contribute their
+//!   `pickaxe_opts` bit, for the three refusals listed above.
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
@@ -260,12 +267,9 @@
 //!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
 //!   widths give it — `builtin/range-diff.c` never calls
 //!   `init_diffstat_widths()`.
-//! * The pickaxe *filters* `-S`, `-G` and `--find-object`: `diffcore_pickaxe()`
-//!   can drop the diff-of-diffs' single filepair, which empties the body. Their
-//!   modifiers `--pickaxe-all` and `--pickaxe-regex` are accepted instead, since
-//!   `diffcore_std()` never reaches the pickaxe unless one of those three set a
-//!   kind bit (diff.c:7517). All five contribute their `pickaxe_opts` bit, for
-//!   the three refusals listed above.
+//! * A `-G` pattern, or an `-S` one under `--pickaxe-regex`, that does not
+//!   compile: upstream dies from inside `patch_diff()` with libc's `regerror()`
+//!   text, which this port does not reproduce.
 //! * The rename and copy detection flags, `--word-diff`, `--color-moved`, `-R`,
 //!   `--diff-filter`, `--rotate-to` / `--skip-to`, `--ext-diff` and `-O`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
@@ -965,6 +969,9 @@ struct Opts {
     /// `o->ws_error_highlight`: `--ws-error-highlight=<kind>`, else
     /// `diff.wsErrorHighlight`, else `WSEH_NEW`.
     ws_error_highlight: u32,
+    /// `-S` / `-G` / `--find-object`: the `diffcore_pickaxe()` filter that runs in
+    /// `diffcore_std()` ahead of `diff_flush()` and can drop the filepair.
+    pickaxe: Option<super::diff_pickaxe::Kind>,
 }
 
 impl Opts {
@@ -1005,6 +1012,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         dual: true,
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
+        pickaxe: None,
     };
     // `--ws-error-highlight=<kind>`, held until the config default can be read.
     let mut ws_error_highlight: Option<u32> = None;
@@ -1033,6 +1041,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // `diffopt.flags.follow_renames`, the other two things `diff_setup_done()`
     // refuses before any revision is resolved.
     let mut pickaxe_mask: u32 = 0;
+    // `options->pickaxe` — the last `-S`/`-G` value — and the `--find-object`
+    // ids, which [`pickaxe_keeps`] tests the filepair against.
+    let mut pickaxe_arg: Option<Vec<u8>> = None;
+    let mut find_object_ids: Vec<ObjectId> = Vec::new();
     let mut follow = false;
     // `--find-object` resolves its value against the repository while
     // parse-options runs (diff.c:5531), so discovery has to happen here rather
@@ -1316,23 +1328,26 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // `--pickaxe-all` and `--pickaxe-regex` are modifiers, not filters:
             // `diffcore_std()` only reaches `diffcore_pickaxe()` when a *kind*
             // bit is set (`options->pickaxe_opts & DIFF_PICKAXE_KINDS_MASK`,
-            // diff.c:7517), and every option that sets one is deferred below —
-            // so on their own they cannot change a byte, and are accepted.
+            // diff.c:7517), so on their own they cannot change a byte.
             "--pickaxe-all" => pickaxe_mask |= PICKAXE_ALL,
             "--pickaxe-regex" => pickaxe_mask |= PICKAXE_REGEX,
-            // `-S`, `-G` and `--find-object` do filter, and a filtered-out
-            // filepair means no diff-of-diffs body at all, so they are deferred.
-            // Both carry their value either attached (`-Sfoo`) or as the next
-            // argv element (`-S foo`), and the bit is set for each spelling.
+            // `-S`, `-G` and `--find-object` filter the one filepair
+            // `patch_diff()` queues (see [`pickaxe_keeps`]). `-S` and `-G` both
+            // store `options->pickaxe`, so the last value wins, carried either
+            // attached (`-Sfoo`) or as the next argv element (`-S foo`); the bit is
+            // set for each spelling.
             _ if name.starts_with("-S") || name.starts_with("-G") => {
                 pickaxe_mask |= match name.as_bytes()[1] {
                     b'S' => PICKAXE_KIND_S,
                     _ => PICKAXE_KIND_G,
                 };
-                opts.defer(unsupported_flag(a));
-                if name.len() == 2 {
-                    i += 1;
-                }
+                pickaxe_arg = match name.len() {
+                    2 => {
+                        i += 1;
+                        args.get(i).map(|v| v.as_bytes().to_vec())
+                    }
+                    _ => Some(name.as_bytes()[2..].to_vec()),
+                };
             }
             // `diff_opt_find_object()` resolves its value before it sets the
             // bit, and an unresolvable one is the 129 `error:` it reports
@@ -1354,13 +1369,12 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 // consulting the object database (see [`crate::objname`]) — so
                 // `--find-object <absent-full-hex>` is a perfectly good filter
                 // that simply matches nothing, and the run continues.
-                let found =
-                    objname::resolve(repo.as_ref().expect("discovered just above"), &value).is_some();
-                if !found {
+                let Some(id) = objname::resolve(repo.as_ref().expect("discovered just above"), &value)
+                else {
                     return Ok(option_error(&format!("unable to resolve '{value}'")));
-                }
+                };
                 pickaxe_mask |= PICKAXE_KIND_OBJFIND;
-                opts.defer(unsupported_flag(a));
+                find_object_ids.push(id);
             }
             // The xdiff algorithm of the diff-of-diffs. `set_diff_algorithm()`
             // clears the previous choice before setting the new one
@@ -1739,6 +1753,37 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     }
+    // `diffcore_pickaxe()` (diffcore-pickaxe.c:233-280): `-G` is always a regex and
+    // `-S` a literal unless `--pickaxe-regex`, while `--find-object` wins over both
+    // because `pickaxe_match()` tests `o->objfind` first (diffcore-pickaxe.c:140).
+    // A pattern that does not compile is `die("invalid regex: …")` from inside
+    // `patch_diff()`, with libc's `regerror()` text, which this port cannot
+    // reproduce — that one case stays deferred.
+    opts.pickaxe = if !find_object_ids.is_empty() {
+        Some(super::diff_pickaxe::Kind::ObjFind(find_object_ids))
+    } else if let Some(pat) = pickaxe_arg {
+        let grep = pickaxe_mask & PICKAXE_KIND_G != 0;
+        if !grep && pickaxe_mask & PICKAXE_REGEX == 0 {
+            Some(super::diff_pickaxe::Kind::Occurrences(super::diff_pickaxe::Needle::Literal(pat)))
+        } else {
+            match super::diff_pickaxe::compile_regex(&pat) {
+                Ok(re) => {
+                    let needle = super::diff_pickaxe::Needle::Regex(re);
+                    Some(match grep {
+                        true => super::diff_pickaxe::Kind::Grep(needle),
+                        false => super::diff_pickaxe::Kind::Occurrences(needle),
+                    })
+                }
+                Err(_) => {
+                    let flag = if grep { "-G" } else { "-S" };
+                    opts.defer(unsupported_flag(&format!("{flag}{}", String::from_utf8_lossy(&pat))));
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
     // `--follow` last (diff.c:5364-5365), and unconditionally: range-diff routes
     // every `-- <path>` to `log_arg`, so `diffopt.pathspec` is always empty and
     // `diff_check_follow_pathspec()` always takes its `ps->nr != 1` die.
@@ -1984,6 +2029,7 @@ pub(super) fn show_range_diff(
         dual: true,
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
+        pickaxe: None,
     };
     let ends1 = match endpoints(repo, range1) {
         Ok(e) => walkable(repo, e),
@@ -4083,6 +4129,14 @@ fn flush_pair(
     abbrev_len: usize,
     opts: &Opts,
 ) -> Result<()> {
+    // `diffcore_std()` runs the pickaxe before `diff_flush()` (diff.c:7517-7518),
+    // and `diff_flush()` returns at once on the empty queue it can leave
+    // (diff.c:7197), so a dropped pair writes nothing in any format.
+    if let Some(kind) = &opts.pickaxe {
+        if !pickaxe_keeps(kind, a, b) {
+            return Ok(());
+        }
+    }
     let fmt = opts.output_format;
     let unmodified = a == b;
     let mut separator = false;
@@ -4174,6 +4228,22 @@ fn flush_pair(
         }
     }
     Ok(())
+}
+
+/// `pickaxe_match()` (diffcore-pickaxe.c:130-177) for range-diff's one filepair,
+/// through the same [`super::diff_pickaxe::Kind`] test `git diff` uses.
+///
+/// Both filespecs are valid, carry the null id with `oid_valid` clear, and are
+/// named `a` and `b` (range-diff.c:477-489), so `--find-object` keeps the pair
+/// only when it names the null id, and `diff_unmodified_pair()` never
+/// short-circuits — the paths differ. `-G` gives up on a binary side, since the
+/// `section_headers` driver has no textconv.
+fn pickaxe_keeps(kind: &super::diff_pickaxe::Kind, a: &[u8], b: &[u8]) -> bool {
+    match kind {
+        super::diff_pickaxe::Kind::ObjFind(ids) => ids.iter().any(|id| id.is_null()),
+        super::diff_pickaxe::Kind::Grep(_) if is_binary(a) || is_binary(b) => false,
+        _ => kind.content_hit(Some(a), Some(b)),
+    }
 }
 
 /// The added/deleted counts `diffstat_consume()` accumulates for the outer diff:

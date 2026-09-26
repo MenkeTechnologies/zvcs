@@ -1766,19 +1766,46 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // `prepare_index()` returns `get_index_file()` instead (builtin/commit.c:493).
         None => crate::hooks::absolutize(&repo.index_path()),
     };
+    // The same file as git names it in the hooks' `GIT_INDEX_FILE`
+    // (`run_commit_hook()`, commit.c:1994): a lock by the absolute name
+    // `lock_file()` gave it — `absolute_path()` of `<index>.lock` or of
+    // `git_path("next-index-<pid>")` + `.lock` (builtin/commit.c:541-554) — and
+    // the plain index as `repo_get_index_file()` spells it, `.git/index`.
+    let hook_index: std::path::PathBuf = match &partial {
+        Some(p) => crate::setup::absolute_path_spelled(
+            &repo,
+            &crate::setup::git_path_spelled(&repo, &p.path.file_name().unwrap_or_default().to_string_lossy()),
+        ),
+        None if normal_lock => {
+            let mut lock = crate::setup::index_file_spelled(&repo).into_os_string();
+            lock.push(".lock");
+            crate::setup::absolute_path_spelled(&repo, std::path::Path::new(&lock))
+        }
+        None => crate::setup::index_file_spelled(&repo),
+    };
 
+    // git decides *once* whether an editor is used: a `-m`/`-F`/`-C` message
+    // source turns it off, then an explicit `-e`/`--no-edit` overrides that. The
+    // answer picks the default cleanup mode and what every commit hook is told
+    // through `GIT_EDITOR`, so it is computed before the first of them.
+    let no_edit = edit_flag == Some(false);
+    let use_editor = match edit_flag {
+        Some(v) => v,
+        None => !from_flags,
+    };
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
     if verify {
+        // `run_commit_hook(use_editor, index_file, &invoked_hook, "pre-commit",
+        // NULL)` (builtin/commit.c:780-781) — `GIT_EDITOR=:` when no editor will be
+        // launched, as for every commit hook (commit.c:2006-2007).
+        let mut env: Vec<(&str, &std::path::Path)> = vec![("GIT_INDEX_FILE", hook_index.as_path())];
+        if !use_editor {
+            env.push(("GIT_EDITOR", std::path::Path::new(":")));
+        }
         let hook = HookIndexLock::around(&repo, normal_lock, "pre-commit", &index_file, || {
-            crate::hooks::run_with_env(
-                &repo,
-                "pre-commit",
-                &[],
-                None,
-                &[("GIT_INDEX_FILE", index_file.as_path())],
-            )
+            crate::hooks::run_with_env(&repo, "pre-commit", &[], None, &env)
         })?;
         if !hook.ok {
             return Ok(ExitCode::from(1));
@@ -1969,14 +1996,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- message: `prepare_to_commit()` -----------------------------------
-    // git decides *once* whether an editor is used: a `-m`/`-F`/`-C` message
-    // source turns it off, then an explicit `-e`/`--no-edit` overrides that. The
-    // answer also picks the default cleanup mode, so it is computed first.
-    let no_edit = edit_flag == Some(false);
-    let use_editor = match edit_flag {
-        Some(v) => v,
-        None => !from_flags,
-    };
+    // `use_editor` and `no_edit` are settled above, before `pre-commit` runs.
     let snap = repo.config_snapshot();
     let cleanup = resolve_cleanup(cleanup_arg.as_deref(), &snap, use_editor)?;
     // `auto` is resolved to `#` at config time and only becomes something else
@@ -2341,7 +2361,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
         let borrowed: Vec<&str> = hook_args.iter().map(String::as_str).collect();
         let mut env: Vec<(&str, &std::path::Path)> =
-            vec![("GIT_INDEX_FILE", index_file.as_path())];
+            vec![("GIT_INDEX_FILE", hook_index.as_path())];
         let colon = std::path::Path::new(":");
         if !use_editor {
             env.push(("GIT_EDITOR", colon));
@@ -2397,7 +2417,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if verify {
         let arg = msg_arg.clone();
         let mut env: Vec<(&str, &std::path::Path)> =
-            vec![("GIT_INDEX_FILE", index_file.as_path())];
+            vec![("GIT_INDEX_FILE", hook_index.as_path())];
         let colon = std::path::Path::new(":");
         if !use_editor {
             env.push(("GIT_EDITOR", colon));
@@ -2706,8 +2726,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // running them the other way round changes what both see.
     //
     // `post-commit` is a notification hook: it runs after the commit regardless of
-    // `--no-verify`, and its exit status is ignored.
-    let _ = crate::hooks::run(&repo, "post-commit", &[], None);
+    // `--no-verify`, and its exit status is ignored. It is still a
+    // `run_commit_hook()`, so it gets `GIT_INDEX_FILE` — the real index by its
+    // `repo_get_index_file()` name — and `GIT_EDITOR=:` when no editor was used
+    // (commit.c:2001-2007).
+    let post_index = crate::setup::index_file_spelled(&repo);
+    let mut post_env: Vec<(&str, &std::path::Path)> = vec![("GIT_INDEX_FILE", post_index.as_path())];
+    if !use_editor {
+        post_env.push(("GIT_EDITOR", std::path::Path::new(":")));
+    }
+    let _ = crate::hooks::run_with_env(&repo, "post-commit", &[], None, &post_env);
 
     // `commit_post_rewrite()` (builtin/commit.c), which `--no-post-rewrite`
     // suppresses whole: first the notes an `amend` carries onto the replacement

@@ -689,6 +689,42 @@ pub(crate) fn git_path_spelled(repo: &gix::Repository, name: &str) -> PathBuf {
     }
 }
 
+/// `repo_get_index_file()` as a child of git sees it: `$GIT_INDEX_FILE` verbatim
+/// when set, otherwise `<gitdir>/index` on the spelled git directory
+/// (`expand_base_dir()` in `repo_set_gitdir()`, repository.c:101-109, :186-189).
+pub(crate) fn index_file_spelled(repo: &gix::Repository) -> PathBuf {
+    match std::env::var_os("GIT_INDEX_FILE") {
+        Some(env) => PathBuf::from(env),
+        None => git_path_spelled(repo, "index"),
+    }
+}
+
+/// `strbuf_add_absolute_path()` (abspath.c:293-316) evaluated where setup left
+/// git standing: a relative `path` is appended, unnormalized, to the cwd — to
+/// `$PWD` instead when that names the same directory by another spelling.
+/// Lock files are named this way (`lock_file()` → `create_tempfile()`), so it is
+/// how a hook sees `index.lock` and `next-index-<pid>.lock`.
+pub(crate) fn absolute_path_spelled(repo: &gix::Repository, path: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    if path.is_absolute() {
+        return path.to_owned();
+    }
+    let Some(cwd) = after_setup(repo).map(|s| s.cwd) else {
+        return crate::hooks::absolutize(path);
+    };
+    let same_file = |a: &Path, b: &Path| match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    let base = match std::env::var_os("PWD").map(PathBuf::from) {
+        Some(pwd) if pwd != cwd && same_file(&pwd, &cwd) => pwd,
+        _ => cwd,
+    };
+    let base = base.to_string_lossy().into_owned();
+    let sep = if base.ends_with('/') { "" } else { "/" };
+    PathBuf::from(format!("{base}{sep}{}", path.display()))
+}
+
 /// `setup_explicit_git_dir()`'s choice of spelling for `gitdirenv` once the work
 /// tree is known (setup.c:1184-1204): verbatim at the work tree or outside it,
 /// `realpath`'d from below it. `set_git_dir()` always exports it.

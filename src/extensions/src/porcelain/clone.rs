@@ -333,9 +333,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // has run every check that precedes the transport — see the refusal beside the
     // destination tests.
     let mut revision_requested: Option<String> = None;
-    // `--reference <repo>` / `--reference-if-able <repo>`: the bool records
-    // whether a missing repository is a warning (`if-able`) or fatal.
-    let mut references: Vec<(String, bool)> = Vec::new();
+    // `--reference <repo>` / `--reference-if-able <repo>`: git's two
+    // `OPT_STRING_LIST`s, `option_required_reference` and
+    // `option_optional_reference` (builtin/clone.c:76-77, :956-959). They are
+    // kept apart because `setup_reference()` walks the whole required list before
+    // the optional one, whatever order the options were typed in.
+    let mut required_references: Vec<String> = Vec::new();
+    let mut optional_references: Vec<String> = Vec::new();
     let mut shared = false;
     let mut dissociate = false;
     let mut sparse = false;
@@ -497,8 +501,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-separate-git-dir" => separate_git_dir = None,
             "--ref-format" => ref_format = Some(take_value!()),
             "--no-ref-format" => ref_format = None,
-            "--reference" => references.push((take_value!(), false)),
-            "--reference-if-able" => references.push((take_value!(), true)),
+            "--reference" => required_references.push(take_value!()),
+            "--reference-if-able" => optional_references.push(take_value!()),
             "-s" | "--shared" => shared = true,
             "--no-shared" => shared = false,
             "--dissociate" => dissociate = true,
@@ -1189,8 +1193,32 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // is where git writes them. `--dissociate` records them too — it borrows for the
     // duration of the clone and only afterwards repacks and drops the file
     // (`dissociate_from_references()`, builtin/clone.c:845-861).
+    //
+    // The order is git's: `setup_reference()` (builtin/clone.c:182-190, called at
+    // :1314-1315) adds every `--reference` and then every `--reference-if-able`,
+    // and the `-s` line comes last, from `clone_local()` (:380-402), which runs
+    // after it. Each goes through `odb_add_to_alternates_file()`, so a store
+    // already listed is not written twice — see [`write_alternates`].
     {
         let mut alternates: Vec<PathBuf> = Vec::new();
+        let references = required_references
+            .iter()
+            .map(|path| (path, false))
+            .chain(optional_references.iter().map(|path| (path, true)));
+        for (path, if_able) in references {
+            match compute_alternate_path(path) {
+                Ok(objects) => alternates.push(objects),
+                // `--reference-if-able` downgrades only what
+                // `compute_alternate_path()` wrote into its `err` buffer. The
+                // gitfile refusal is a `die()` from inside `read_gitfile()`, which
+                // has no error slot to write into and no caller to consult, so it
+                // ends both spellings alike — see [`gitfile_target`].
+                Err(e) if if_able && e.downcast_ref::<crate::fatal::Fatal>().is_none() => {
+                    eprintln!("info: Could not add alternate for '{path}': {e}");
+                }
+                Err(e) => crate::git_fatal!("{e}"),
+            }
+        }
         // git only shares "when the repository to clone is on the local machine",
         // so a URL that names no openable local repository leaves `-s` a no-op.
         //
@@ -1206,20 +1234,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         if shared && is_local {
             if let Some(objects) = local_path_of(&url).and_then(|p| objects_dir_of(&p).ok()) {
                 alternates.push(objects);
-            }
-        }
-        for (path, if_able) in &references {
-            match compute_alternate_path(path) {
-                Ok(objects) => alternates.push(objects),
-                // `--reference-if-able` downgrades only what
-                // `compute_alternate_path()` wrote into its `err` buffer. The
-                // gitfile refusal is a `die()` from inside `read_gitfile()`, which
-                // has no error slot to write into and no caller to consult, so it
-                // ends both spellings alike — see [`gitfile_target`].
-                Err(e) if *if_able && e.downcast_ref::<crate::fatal::Fatal>().is_none() => {
-                    eprintln!("info: Could not add alternate for '{path}': {e}");
-                }
-                Err(e) => crate::git_fatal!("{e}"),
             }
         }
         if !alternates.is_empty() {
@@ -3647,15 +3661,32 @@ fn gitfile_target(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 /// Write `objects/info/alternates` with one absolute object-directory path per
-/// line, the format git's `add_to_alternates_file` produces.
+/// line, the way a run of `odb_add_to_alternates_file()` calls leaves it.
+///
+/// ```c
+/// while (strbuf_getline(&line, in) != EOF) {
+///         if (!strcmp(alternate, line.buf)) {
+///                 found = 1;
+///                 break;
+///         }
+///         fprintf_or_die(out, "%s\n", line.buf);
+/// }
+/// ```
+///
+/// (`odb_source_files_write_alternate()`, odb/source-files.c:227-249.) A store
+/// the file already names is not appended again, so `--reference r --reference
+/// r/.git` or `-s --reference <src>` record it once.
 fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
     let info = git_dir.join("objects").join("info");
     std::fs::create_dir_all(&info)?;
-    let mut body = String::new();
+    let mut lines: Vec<String> = Vec::new();
     for path in alternates {
-        body.push_str(&path.to_string_lossy());
-        body.push('\n');
+        let line = path.to_string_lossy().into_owned();
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
     }
+    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
     std::fs::write(info.join("alternates"), body)?;
     Ok(())
 }

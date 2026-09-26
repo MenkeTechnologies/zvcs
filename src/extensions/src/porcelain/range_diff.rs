@@ -112,6 +112,9 @@
 //!   `-I<regex>` set on an all-blank or all-matching change. A pair those flags
 //!   reduce to no `+`/`-` record has no stat row either, as `builtin_diffstat()`
 //!   drops it (diff.c:4256-4273).
+//! * `--anchored=<text>` (diff.c:5544-5555): patience with anchor lines, matched
+//!   against the outer records — patch lines — and dropped by a later
+//!   `--patience` (diff.c:5838-5857).
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
@@ -263,8 +266,6 @@
 //!   `diffcore_std()` never reaches the pickaxe unless one of those three set a
 //!   kind bit (diff.c:7517). All five contribute their `pickaxe_opts` bit, for
 //!   the three refusals listed above.
-//! * `--anchored=<text>`, which is patience diff plus anchor lines; gitoxide's
-//!   `Algorithm::Patience` takes no anchors.
 //! * The rename and copy detection flags, `--word-diff`, `--color-moved`, `-R`,
 //!   `--diff-filter`, `--rotate-to` / `--skip-to`, `--ext-diff` and `-O`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
@@ -1038,6 +1039,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // than after the loop; the handle is reused below.
     let mut repo: Option<gix::Repository> = None;
 
+    // `diffopt.anchors`, the `--anchored=<text>` list of the outer diff.
+    let mut anchors: Vec<String> = Vec::new();
+
     // The first `--diff-merges` style the inner `git log` would reject, held
     // back until that log runs so the ordering matches upstream.
     let mut bad_diff_merges: Option<String> = None;
@@ -1366,7 +1370,24 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // `parse_algorithm_value()` is case-insensitive (diff.c:220-236) and
             // `crate::diffopt::check` has already rejected an unknown name.
             "--minimal" => opts.algorithm = Algorithm::MyersMinimal,
-            "--patience" => opts.algorithm = Algorithm::Patience,
+            // `diff_opt_patience()` drops every anchor given so far — "Both --patience
+            // and --anchored use PATIENCE_DIFF internally" (diff.c:5838-5857) — where
+            // `--diff-algorithm=patience` leaves them.
+            "--patience" => {
+                opts.algorithm = Algorithm::Patience;
+                anchors.clear();
+            }
+            // `diff_opt_anchored()` (diff.c:5544-5555): patience, plus one more
+            // anchor. The list reaches [`diff_pairs::compute_compacted`] through
+            // [`diff_pairs::set_anchor_texts`] once the command line is read.
+            "--anchored" => {
+                let value = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                opts.algorithm = Algorithm::Patience;
+                anchors.push(value);
+            }
             "--histogram" => opts.algorithm = Algorithm::Histogram,
             "--diff-algorithm" => {
                 let value = match required_value(args, &mut i, name, inline) {
@@ -1646,6 +1667,11 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         }
         i += 1;
     }
+
+    // Only the outer diff has anchors: `diffsize()` builds its own zeroed
+    // `xpparam_t` (range-diff.c:307) and the inner patches come from a separate
+    // `git log`, and neither of those reaches [`diff_pairs::compute_compacted`].
+    diff_pairs::set_anchor_texts(anchors);
 
     // `cmd_log_init_finish()`: with no `--notes`/`--no-notes` of its own, a run
     // whose pretty format is a built-in one — and the inner `git log` uses

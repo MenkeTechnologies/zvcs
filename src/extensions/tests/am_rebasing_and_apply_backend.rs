@@ -365,7 +365,7 @@ fn no_verify_suppresses_only_the_two_verifying_hooks() {
     let mbox = mailbox(&fx);
     fx.ok(&["checkout", "-q", "main"]);
     for h in ["applypatch-msg", "pre-applypatch", "post-applypatch"] {
-        fx.hook(h, &format!("echo {h} >> \"$GIT_DIR/../ran.log\"\nexit 0"));
+        fx.hook(h, &format!("echo {h} >> ran.log\nexit 0"));
     }
 
     let out = am_stdin(&fx, &[], &mbox);
@@ -381,7 +381,7 @@ fn no_verify_suppresses_only_the_two_verifying_hooks() {
     let mbox2 = mailbox(&fx2);
     fx2.ok(&["checkout", "-q", "main"]);
     for h in ["applypatch-msg", "pre-applypatch", "post-applypatch"] {
-        fx2.hook(h, &format!("echo {h} >> \"$GIT_DIR/../ran.log\"\nexit 0"));
+        fx2.hook(h, &format!("echo {h} >> ran.log\nexit 0"));
     }
     let out = am_stdin(&fx2, &["--no-verify"], &mbox2);
     assert!(out.status.success(), "am --no-verify: {out:?}");

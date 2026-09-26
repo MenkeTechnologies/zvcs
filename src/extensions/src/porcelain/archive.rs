@@ -804,7 +804,9 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         // `../` is refused before its existence is tested — `../x` and `:/x`
         // name real files but still die here.
         if !cwd_prefix_bytes.is_empty()
-            && matches_outside(&repo, tree.clone(), b"", &mut one, &cwd_prefix_bytes)?
+            && tree_walk_hits(&repo, tree.clone(), b"", &mut one, false, &mut |path| {
+                !path.starts_with(&cwd_prefix_bytes)
+            })?
         {
             eprintln!(
                 "fatal: pathspec '{}' matches files outside the current directory",
@@ -816,23 +818,13 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         // ret = read_tree(args->repo, args->tree, &ctx.pathspec, reject_entry, &ctx);
         // ```
         //
-        // (`path_exists()`, archive.c.) The tree is re-read with *only* this one spec, so
-        // whether it matched is decided before any other spec has a say: `git archive HEAD
-        // src :!src/lib.rs` archives nothing and still accepts `src`, which matched the
-        // directory. Testing against the already-filtered entry list called that a miss.
-        let mut probe_pending: Vec<Item> = Vec::new();
-        let mut probe: Vec<Item> = Vec::new();
-        collect(
-            &repo,
-            tree.clone(),
-            b"",
-            Some(&mut one),
-            &mut conv,
-            &mut probe_pending,
-            &mut probe,
-        )?;
-        let hit = !probe.is_empty();
-        if !hit {
+        // (`path_exists()`, archive.c:397-412,450.) The tree is re-read with *only* this
+        // one spec, so whether it matched is decided before any other spec has a say: `git
+        // archive HEAD src :!src/lib.rs` archives nothing and still accepts `src`, which
+        // matched the directory. And it is the plain tree walk, not the archive walk:
+        // `export-ignore` plays no part, so a spec naming only ignored paths exists and
+        // yields an empty archive rather than a miss.
+        if !tree_walk_hits(&repo, tree.clone(), b"", &mut one, true, &mut |_| true)? {
             eprintln!(
                 "fatal: pathspec '{}' did not match any files",
                 opts.paths[idx]
@@ -2023,16 +2015,21 @@ fn collect(
     Ok(())
 }
 
-/// `read_tree(..., reject_outside, args)` (archive.c:414-432): whether `search`
-/// reaches any non-directory entry that lies outside the cwd `prefix` — one
-/// whose `relative_path()` against it would start with `../`. Attributes play
-/// no part: this is the plain tree walk, not the archive walk.
-fn matches_outside(
+/// The plain `read_tree()` walk `path_exists()` runs twice (archive.c:397-452):
+/// every entry `search` finds interesting, attributes playing no part.
+///
+/// `hit` decides a non-directory entry; returning `true` stops the walk, the
+/// callbacks' non-zero return. With `dir_hits`, a directory the spec matches
+/// as a whole is a hit too — `reject_entry()`'s `match_pathspec(..., is_dir=1)`
+/// — and otherwise directories are only recursed into, as `reject_outside()`
+/// does.
+fn tree_walk_hits(
     repo: &gix::Repository,
     tree: gix::Tree<'_>,
     base: &[u8],
     search: &mut Search,
-    prefix: &[u8],
+    dir_hits: bool,
+    hit: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<bool> {
     let entries: Vec<(EntryKind, Vec<u8>, ObjectId)> = tree
         .decode()?
@@ -2040,29 +2037,33 @@ fn matches_outside(
         .iter()
         .map(|e| (e.mode.kind(), e.filename.to_vec(), e.oid.to_owned()))
         .collect();
+    let mut no_attrs = |_: &gix::bstr::BStr,
+                        _: gix::pathspec::attributes::glob::pattern::Case,
+                        _: bool,
+                        _: &mut gix::pathspec::attributes::search::Outcome|
+     -> bool { false };
     for (kind, filename, oid) in entries {
         let mut path = base.to_vec();
         path.extend_from_slice(&filename);
-        if kind == EntryKind::Tree {
-            if !search.can_match_relative_path(path.as_bstr(), Some(true)) {
-                continue;
-            }
-            path.push(b'/');
-            let child = repo.find_object(oid)?.peel_to_tree()?;
-            if matches_outside(repo, child, &path, search, prefix)? {
+        let is_dir = kind == EntryKind::Tree;
+        if is_dir && !search.can_match_relative_path(path.as_bstr(), Some(true)) {
+            continue;
+        }
+        let matched = search
+            .pattern_matching_relative_path(path.as_bstr(), Some(is_dir), &mut no_attrs)
+            .is_some_and(|m| !m.is_excluded());
+        if !is_dir {
+            if matched && hit(&path) {
                 return Ok(true);
             }
             continue;
         }
-        let mut no_attrs = |_: &gix::bstr::BStr,
-                            _: gix::pathspec::attributes::glob::pattern::Case,
-                            _: bool,
-                            _: &mut gix::pathspec::attributes::search::Outcome|
-         -> bool { false };
-        let selected = search
-            .pattern_matching_relative_path(path.as_bstr(), Some(false), &mut no_attrs)
-            .is_some_and(|m| !m.is_excluded());
-        if selected && !path.starts_with(prefix) {
+        if dir_hits && matched {
+            return Ok(true);
+        }
+        path.push(b'/');
+        let child = repo.find_object(oid)?.peel_to_tree()?;
+        if tree_walk_hits(repo, child, &path, search, dir_hits, hit)? {
             return Ok(true);
         }
     }

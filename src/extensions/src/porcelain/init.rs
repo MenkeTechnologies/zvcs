@@ -618,8 +618,8 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         None
     } else if bare_layout {
         Some(
-            match gix::ThreadSafeRepository::init(&git_dir, gix::create::Kind::Bare, create_opts) {
-                Ok(r) => r.to_thread_local(),
+            match create_repository(&git_dir, gix::create::Kind::Bare, create_opts) {
+                Ok(r) => r,
                 Err(gix::init::Error::Init(gix::create::Error::DirectoryNotEmpty { .. })) => {
                     init_bare_into_nonempty(&git_dir, create_opts)?
                 }
@@ -629,13 +629,8 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     } else {
         let worktree = git_dir.parent().unwrap_or(&cwd).to_path_buf();
         Some(
-            gix::ThreadSafeRepository::init(
-                &worktree,
-                gix::create::Kind::WithWorktree,
-                create_opts,
-            )
-            .map(|r| r.to_thread_local())
-            .map_err(|e| anyhow::anyhow!("{e}"))?,
+            create_repository(&worktree, gix::create::Kind::WithWorktree, create_opts)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
         )
     };
 
@@ -681,10 +676,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             // `repo_default_branch_name()` (refs.c:696-700): the
             // `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` override first, then
             // `repo_config_get_string()`, which dies through `git_die_config()` on a
-            // valueless key.
+            // valueless key. An empty value is a value, not the unset fallback:
+            // `refs/heads/` then fails the format check below.
             None => crate::refname::default_branch_name_override().unwrap_or_else(|| {
                 crate::config::config_get_string(Some(&repo), "init.defaultbranch")
-                    .filter(|v| !v.trim().is_empty())
                     .unwrap_or_else(|| {
                         // `repo_default_branch_name()` (refs.c:703-712): only the
                         // compiled-in fallback carries the hint — an explicit
@@ -748,9 +743,14 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                 for dir in ["objects/pack", "objects/info", "objects"] {
                     let _ = std::fs::remove_dir(src_git_dir.join(dir));
                 }
-                return Ok(fatal(&format!(
-                    "invalid initial branch name: '{branch_name}'"
-                )));
+                // A `-b` name fails `create_reference_database()`'s own check
+                // (setup.c); one `repo_default_branch_name()` supplied — the
+                // test override or `init.defaultBranch` — dies inside that
+                // function first, under the key's display name (refs.c:714-716).
+                return Ok(fatal(&match initial_branch {
+                    Some(_) => format!("invalid initial branch name: '{branch_name}'"),
+                    None => format!("invalid branch name: init.defaultBranch = {branch_name}"),
+                }));
             }
         };
         {
@@ -1006,6 +1006,32 @@ pub(super) fn enable_submodule_path_config(git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Lay down a repository skeleton and open it, without `gix`'s own
+/// `init.defaultBranch` step.
+///
+/// `gix::ThreadSafeRepository::init` is `create::into()` + open + a HEAD
+/// repoint to `init.defaultBranch`, and it refuses a value its own branch-name
+/// validator rejects before the caller can say anything. git reads that key
+/// in `repo_default_branch_name()` (refs.c:691-720) from
+/// `create_reference_database()`, once the skeleton exists, and judges it by
+/// `check_refname_format("refs/heads/<name>", 0)` alone — so `HEAD` is a
+/// valid default branch there, and a broken one is git's
+/// `invalid branch name: init.defaultBranch = <name>` rather than gix's
+/// error. The caller resolves and repoints HEAD itself, so this stops after
+/// the open, exactly where `init_opts` would have started on the branch.
+fn create_repository(
+    directory: &Path,
+    kind: gix::create::Kind,
+    create_opts: gix::create::Options,
+) -> std::result::Result<gix::Repository, gix::init::Error> {
+    use gix::sec::trust::DefaultForLevel as _;
+
+    let path = gix::create::into(directory, kind, create_opts)?;
+    let (git_dir, _) = path.into_repository_and_work_tree_directories();
+    let open = gix::open::Options::default_for_level(gix::sec::Trust::Full).open_path_as_is(true);
+    Ok(gix::open_opts(git_dir, open)?)
+}
+
 /// Build a bare repository inside a non-empty `target`. gix hard-refuses this
 /// (`create::into` checks emptiness unconditionally for bare), while stock git
 /// permits it. Lay the layout down in an empty scratch subdirectory, then move
@@ -1017,7 +1043,7 @@ fn init_bare_into_nonempty(
     std::fs::create_dir_all(target)?;
     let scratch = target.join(format!(".git-init-scratch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
-    gix::ThreadSafeRepository::init(&scratch, gix::create::Kind::Bare, create_opts)
+    create_repository(&scratch, gix::create::Kind::Bare, create_opts)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     for entry in std::fs::read_dir(&scratch)? {
         let entry = entry?;

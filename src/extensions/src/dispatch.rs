@@ -619,6 +619,13 @@ enum ConfigCallback {
     /// `fmt_merge_msg_config` (fmt-merge-msg.c:26) — its own `merge.*` keys,
     /// then the default.
     FmtMergeMsg,
+    /// A callback the verb walks itself, in parse order, with
+    /// `git_default_config()` as its tail — so the gate must not run the default
+    /// walk first and report a `core.*` value ahead of one of the verb's own keys
+    /// that precedes it. The verb also needs the walk outside a repository, where
+    /// this gate does not run: `patch-id` (`git_patch_id_config`,
+    /// builtin/patch-id.c:204).
+    Verb,
 }
 
 /// Which callback `sub` installs.
@@ -682,6 +689,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "branch" => ConfigCallback::Branch,
         "fmt-merge-msg" => ConfigCallback::FmtMergeMsg,
         "add" | "stage" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
+        "patch-id" => ConfigCallback::Verb,
         _ => ConfigCallback::Default,
     }
 }
@@ -1516,6 +1524,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::FmtMergeMsg => {
                         crate::cmd_config::validate_fmt_merge_msg(&repo)
                     }
+                    ConfigCallback::Verb => Ok(()),
                 };
                 if let Err(rejection) = outcome {
                     return Err(rejection.into_error());

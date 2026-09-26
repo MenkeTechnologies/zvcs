@@ -1355,6 +1355,14 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
     with_lines(ordered_occurrences(repo))
 }
 
+/// [`walk_config`] for a `RUN_SETUP_GENTLY` verb: the repository's merged read
+/// when there is one, otherwise the system/global cascade plus the command line
+/// that `repo_config(the_repository, fn, data)` walks before setup has found a
+/// git directory (config.c:1547-1613).
+pub fn walk_config_gently(repo: Option<&gix::Repository>) -> Vec<ConfigValue> {
+    with_lines(occurrences_for(repo))
+}
+
 /// Attach each occurrence's [`ValueOrigin`], re-reading every file once for the
 /// line numbers.
 fn with_lines(occurrences: Vec<Occurrence>) -> Vec<ConfigValue> {

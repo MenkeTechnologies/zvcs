@@ -857,7 +857,7 @@ fn sparse_config(v: &ConfigValue, key: &str, out: &mut DefaultConfig) -> Result<
 /// answers **1** for it before it looks at any text (parse.c:168-169) — a
 /// different answer from the empty string's 0. Everything else goes through the
 /// word grammar and then the integer grammar, so `0x10` is true and `1k` is true.
-fn bool_value(v: &ConfigValue, key: &str) -> Result<bool, Rejection> {
+pub(crate) fn bool_value(v: &ConfigValue, key: &str) -> Result<bool, Rejection> {
     let Some(raw) = v.value.as_deref() else {
         return Ok(true);
     };
@@ -903,12 +903,12 @@ fn bad_number(v: &ConfigValue, key: &str, raw: &str, reason: &str) -> Rejection 
 
 /// `config_error_nonbool()` (config.c:3552-3555) followed by the
 /// `git_die_config_linenr()` the negative return earns.
-fn nonbool(v: &ConfigValue) -> Rejection {
+pub(crate) fn nonbool(v: &ConfigValue) -> Rejection {
     reported(v, vec![format!("missing value for '{}'", v.key)])
 }
 
 /// Any `return error(...)` arm: the `error:` lines, then the origin-named fatal.
-fn reported(v: &ConfigValue, errors: Vec<String>) -> Rejection {
+pub(crate) fn reported(v: &ConfigValue, errors: Vec<String>) -> Rejection {
     Rejection::Reported {
         errors,
         fatal: v.origin.die_linenr(&v.key),

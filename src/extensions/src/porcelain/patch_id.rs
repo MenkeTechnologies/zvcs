@@ -6,7 +6,7 @@
 //! reproduced operation for operation, so stdout matches stock git byte for byte.
 //! No repository object access is involved — patch-id is a pure filter over the
 //! diff text — so the only gitoxide substrate used is `gix::hash` for the digest
-//! and `gix::config` for the `patchid.*` defaults.
+//! and [`crate::config::walk_config_gently`] for the `patchid.*` defaults.
 //!
 //! Output is `<patch-id> <commit-id>\n` per patch, and only for patches whose
 //! accumulated length is non-zero, exactly as `flush_current_id()` decides.
@@ -15,9 +15,10 @@
 //!
 //! * `git patch-id` — the default: unstable hash, whitespace stripped
 //! * `--stable`, `--unstable`, `--verbatim` (`--verbatim` implies `--stable`)
-//! * the `patchid.stable` and `patchid.verbatim` configuration defaults, read
-//!   from the repository snapshot or, outside a repository, from the global
-//!   files plus `GIT_CONFIG_*` overrides
+//! * the `patchid.stable` and `patchid.verbatim` configuration defaults, read by
+//!   a port of `git_patch_id_config()` walking every value in parse order — from
+//!   the repository or, outside one, the global files plus the command line —
+//!   ahead of option parsing, with `git_default_config()` as its tail
 //! * `git log` / `format-patch` prefixes (`commit <oid>`, `From <oid>`), the bare
 //!   object-name headers of `diff-tree --stdin`, binary diffs (`GIT binary patch`
 //!   and `Binary files ... differ`), and `\ No newline at end of file` lines
@@ -49,14 +50,14 @@
 //! ### Not covered
 //!
 //! * `--help` — upstream renders the man page; this bails rather than fake it
-//! * a malformed `patchid.stable` / `patchid.verbatim` value is treated as false
-//!   here, where git makes it fatal
 
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use gix::config::File as ConfigFile;
+use crate::default_config::{
+    bool_value, git_default_config, DefaultConfig, ObjectCreationMode, Rejection,
+};
 use gix::hash::{Hasher, Kind, ObjectId};
 
 /// git's own usage block for `patch-id`, reproduced verbatim.
@@ -74,6 +75,11 @@ const MAX_HEXSZ: usize = 64;
 
 /// `git patch-id` — compute the patch ID of each patch read from stdin.
 pub fn patch_id(args: &[String]) -> Result<ExitCode> {
+    // `repo_config(the_repository, git_patch_id_config, &config)` runs ahead of
+    // `parse_options()` (builtin/patch-id.c:238-244), so a refused value wins
+    // over `-h` and over a usage error.
+    let (mut cfg_stable, cfg_verbatim, kind) = load_defaults().map_err(|r| r.into_error())?;
+
     // Upstream models the three flags as one `OPT_CMDMODE` slot with the values
     // 1 = --unstable, 2 = --stable, 3 = --verbatim; 0 means "not given".
     let mut opts = 0u8;
@@ -146,7 +152,6 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
         set_by = name;
     }
 
-    let (mut cfg_stable, cfg_verbatim, kind) = load_defaults();
     // `patchid.verbatim` implies `patchid.stable`, as `--verbatim` implies `--stable`.
     if cfg_verbatim {
         cfg_stable = true;
@@ -222,39 +227,44 @@ fn resolve_long(rest: &str) -> Long {
     }
 }
 
-/// The `patchid.stable` / `patchid.verbatim` defaults and the hash to use.
+/// `git_patch_id_config()` (builtin/patch-id.c:204-219) over every configured
+/// value in parse order, and the hash to use.
 ///
-/// Inside a repository the merged snapshot answers, and the digest follows the
-/// repository's object hash — the same coupling upstream inherits from
-/// `the_hash_algo`. Outside one, git still reads the global configuration, and
-/// falls back to SHA-1 (`GIT_HASH_DEFAULT`).
-fn load_defaults() -> (bool, bool, Kind) {
-    match crate::setup::discover() {
-        Ok(repo) => {
-            let snapshot = repo.config_snapshot();
-            let stable = snapshot.boolean("patchid.stable").unwrap_or(false);
-            let verbatim = snapshot.boolean("patchid.verbatim").unwrap_or(false);
-            (stable, verbatim, repo.object_hash())
-        }
-        Err(_) => {
-            let cfg = global_config();
-            let read = |key: &str| -> bool {
-                cfg.as_ref()
-                    .ok()
-                    .and_then(|c| c.boolean(key).ok().flatten())
-                    .unwrap_or(false)
-            };
-            (read("patchid.stable"), read("patchid.verbatim"), Kind::Sha1)
+/// ```c
+/// if (!strcmp(var, "patchid.stable")) {
+///         opts->stable = git_config_bool(var, value);
+///         return 0;
+/// }
+/// if (!strcmp(var, "patchid.verbatim")) {
+///         opts->verbatim = git_config_bool(var, value);
+///         return 0;
+/// }
+/// return git_default_config(var, value, ctx, cb);
+/// ```
+///
+/// Every occurrence is handed to the callback, so the first value it cannot
+/// read is fatal even when a later one would have overridden it, and a
+/// `core.*` refusal is reported in its place in the walk, not before or after
+/// the two `patchid.*` keys. Outside a repository `the_repository`'s configset
+/// is the global cascade plus the command line, and the digest falls back to
+/// SHA-1 (`GIT_HASH_DEFAULT`); inside one it follows the repository's object
+/// hash — the coupling upstream inherits from `the_hash_algo`.
+fn load_defaults() -> std::result::Result<(bool, bool, Kind), Rejection> {
+    let repo = crate::setup::discover().ok();
+    let mut resolved = DefaultConfig {
+        object_creation_mode: ObjectCreationMode::Renames,
+        sparse_expect_files_outside_of_patterns: false,
+    };
+    let (mut stable, mut verbatim) = (false, false);
+    for v in crate::config::walk_config_gently(repo.as_ref()) {
+        match v.key.as_str() {
+            "patchid.stable" => stable = bool_value(&v, "patchid.stable")?,
+            "patchid.verbatim" => verbatim = bool_value(&v, "patchid.verbatim")?,
+            _ => git_default_config(&v, &mut resolved)?,
         }
     }
-}
-
-/// The configuration git reads when there is no repository: the global files
-/// plus the `GIT_CONFIG_*` environment overrides.
-fn global_config() -> Result<ConfigFile> {
-    let mut file = ConfigFile::from_globals()?;
-    file.append(ConfigFile::from_environment_overrides()?)?;
-    Ok(file)
+    let kind = repo.as_ref().map_or(Kind::Sha1, gix::Repository::object_hash);
+    Ok((stable, verbatim, kind))
 }
 
 /// Port of `generate_id_list()`: one patch per iteration, printing the previous

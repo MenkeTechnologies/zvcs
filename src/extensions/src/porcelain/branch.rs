@@ -2212,8 +2212,9 @@ pub(super) fn get_oid_mb(repo: &gix::Repository, name: &str) -> Option<ObjectId>
 /// [`get_oid_mb`] without `get_oid_basic()`'s diagnostics, for the callers that
 /// are only asking *whether* an operand resolves — `parse_branchname_arg()`'s
 /// look at `argv[0]` before it decides the operand is a start-point rather than
-/// a pathspec. The `...` arm is quiet either way: `repo_get_oid_committish()`
-/// answers both of its sides.
+/// a pathspec. Loud, the `...` arm warns like any other resolution:
+/// `repo_get_oid_committish()` on each side goes through `get_oid_basic()`, so
+/// `git branch b amb...main` says `refname 'amb' is ambiguous`.
 pub(super) fn get_oid_mb_quiet(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
     get_oid_mb_inner(repo, name, true)
 }
@@ -2233,8 +2234,8 @@ fn get_oid_mb_inner(repo: &gix::Repository, name: &str, quiet: bool) -> Option<O
         "" => "HEAD",
         s => s,
     };
-    let one = commit_of(repo, left)?;
-    let two = commit_of(repo, right)?;
+    let one = commit_of(repo, left, quiet)?;
+    let two = commit_of(repo, right, quiet)?;
     let bases = repo.merge_bases_many(one, &[two]).ok()?;
     match bases.len() {
         1 => Some(bases[0].detach()),
@@ -2244,11 +2245,21 @@ fn get_oid_mb_inner(repo: &gix::Repository, name: &str, quiet: bool) -> Option<O
 
 /// `repo_get_oid_committish()` followed by `lookup_commit_reference_gently()`:
 /// the commit a `...` endpoint names, or `None`.
-fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = crate::objname::resolve_quiet(repo, spec)?;
+fn commit_of(repo: &gix::Repository, spec: &str, quiet: bool) -> Option<ObjectId> {
+    let id = match quiet {
+        true => crate::objname::resolve_quiet(repo, spec)?,
+        false => crate::objname::resolve(repo, spec)?,
+    };
+    // `lookup_commit_reference_gently(r, &oid_tmp, 0)` (object-name.c:1331, :1337) is
+    // not quiet: an endpoint naming a tree says so before the resolution fails.
     match crate::objname::lookup_commit_reference(repo, id) {
         crate::objname::CommitRef::Commit(c) => Some(c),
-        _ => None,
+        other => {
+            if let Some(note) = other.type_error().filter(|_| !quiet) {
+                eprintln!("error: {note}");
+            }
+            None
+        }
     }
 }
 

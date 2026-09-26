@@ -29,10 +29,12 @@
 //!    file headers (`suppress_diff_headers`) and the hunk header reduced to `@@`
 //!    plus a section name (`suppress_hunk_header_line_count`). The section name
 //!    comes from upstream's `section_headers` userdiff driver — the two patterns
-//!    `^ ## (.*) ##$` and `^.?@@ (.*)$` — ported by hand together with
-//!    `ff_regexp()`'s 80-byte cap and trailing-whitespace trim, the backwards
-//!    search bounded by the previous hunk, and `xdl_emit_diff()`'s quirk that a
-//!    hunk with no match repeats the previous hunk's section name.
+//!    `^ ## (.*) ##$` and `^.?@@ (.*)$` — compiled as a [`crate::userdiff::FuncName`],
+//!    whose `ff_regexp()` applies the 80-byte cap and trailing-whitespace trim. The
+//!    hunks themselves come from [`super::diff_pairs::emit_hunks`], the
+//!    `xdl_emit_diff()` port `git diff` uses, so the backwards search bounded by the
+//!    previous hunk and the quirk that a hunk with no match repeats the previous
+//!    hunk's section name are the shared ones.
 //!
 //! ### Covered (stdout byte-identical to stock git, exit code included)
 //!
@@ -98,6 +100,12 @@
 //!   which drops the marker column entirely). None of them reaches
 //!   [`diffsize`], whose `xpparam_t` upstream leaves zeroed, so the *matching*
 //!   is unchanged by all of them.
+//! * The whitespace bits of the outer diff's `xpp.flags`: `-w` /
+//!   `--ignore-all-space`, `-b` / `--ignore-space-change`, `--ignore-space-at-eol`
+//!   and `--ignore-cr-at-eol` (diff.c:6196-6207). Records compare under the
+//!   strongest bit given, as `xdl_recmatch()` tests them (xdiff/xutils.c:173-222),
+//!   context lines print from the post-image, and the stat group counts under
+//!   the same flags. Like the algorithm, they never reach [`diffsize`].
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
@@ -255,8 +263,7 @@
 //!   the merging has no counterpart here.
 //! * `--anchored=<text>`, which is patience diff plus anchor lines; gitoxide's
 //!   `Algorithm::Patience` takes no anchors.
-//! * The whitespace-comparison flags (`-w`, `-b`, `--ignore-space-at-eol`,
-//!   `--ignore-cr-at-eol`, `--ignore-blank-lines`, `-I<regex>`), the rename and
+//! * `--ignore-blank-lines` and `-I<regex>`, the rename and
 //!   copy detection flags, `--word-diff`, `--color-moved`, `-R`,
 //!   `--function-context`, `--diff-filter`, `--rotate-to` / `--skip-to`,
 //!   `--ext-diff` and `-O`.
@@ -322,7 +329,7 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::prelude::ObjectIdExt;
 
-use super::{diff_color, diff_files, diffstat, Arg, LongOpt};
+use super::{diff, diff_color, diff_files, diff_pairs, diffstat, Arg, LongOpt};
 use crate::objname;
 
 /// `RANGE_DIFF_CREATION_FACTOR_DEFAULT`.
@@ -901,6 +908,11 @@ struct Opts {
     /// `XDF_INDENT_HEURISTIC`, on by default and cleared by
     /// `--no-indent-heuristic` (diff.c:6214-6216).
     indent_heuristic: bool,
+    /// The `XDF_*` whitespace bits of `diffopt.xdl_opts` — `-w`, `-b`,
+    /// `--ignore-space-at-eol`, `--ignore-cr-at-eol` (diff.c:6196-6207) — that the
+    /// outer diff compares records under. Like the algorithm, they never reach
+    /// [`diffsize`].
+    ws: diff::Whitespace,
     /// `diffopt.context`: `-U<n>` / `--unified=<n>` (diff.c:5945-5960),
     /// three lines by default.
     context: u32,
@@ -964,6 +976,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         max_memory: MAX_MEMORY_DEFAULT,
         algorithm: Algorithm::Myers,
         indent_heuristic: true,
+        ws: diff::Whitespace::Keep,
         context: 3,
         indicators: [b'+', b'-', b' '],
         output: None,
@@ -1353,6 +1366,15 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
             // `XDF_INDENT_HEURISTIC` is an `OPT_BIT` (diff.c:6214), on by
             // default, so only `--no-indent-heuristic` changes anything.
+            // The whitespace bits of `xpp.flags` for the outer diff, `OPT_BIT_F`s with
+            // no negation (diff.c:6196-6207); [`diff::Whitespace::with`] keeps the
+            // strongest, which is the one `xdl_recmatch()` honours.
+            "-w" | "--ignore-all-space" => opts.ws = opts.ws.with(diff::Whitespace::IgnoreAll),
+            "-b" | "--ignore-space-change" => {
+                opts.ws = opts.ws.with(diff::Whitespace::IgnoreChange)
+            }
+            "--ignore-space-at-eol" => opts.ws = opts.ws.with(diff::Whitespace::IgnoreAtEol),
+            "--ignore-cr-at-eol" => opts.ws = opts.ws.with(diff::Whitespace::IgnoreCrAtEol),
             "--indent-heuristic" => opts.indent_heuristic = true,
             "--no-indent-heuristic" => opts.indent_heuristic = false,
             // `-U<n>` / `--unified[=<n>]`, the context size of the
@@ -1874,6 +1896,7 @@ pub(super) fn show_range_diff(
         max_memory: MAX_MEMORY_DEFAULT,
         algorithm: Algorithm::Myers,
         indent_heuristic: true,
+        ws: diff::Whitespace::Keep,
         context: 3,
         indicators: [b'+', b'-', b' '],
         output: None,
@@ -4072,28 +4095,66 @@ fn flush_pair(
 }
 
 /// The added/deleted counts `diffstat_consume()` accumulates for the outer diff:
-/// every `+` and `-` record xdiff emits, which is every line inside a change
-/// region. The context width does not enter into it, so the same diff
-/// [`patch_diff`] renders answers both.
+/// every `+` and `-` record xdiff emits. `builtin_diffstat()` runs `xdi_diff_outf()`
+/// with the same `xpp.flags` the patch does and `o->context` as its context
+/// (diff.c:4241-4250), so the whitespace flags reach the counts too.
 fn outer_diff_counts(a: &[u8], b: &[u8], opts: &Opts) -> (u64, u64) {
-    let input = InternedInput::new(a, b);
-    let diff = match opts.indent_heuristic {
-        true => diff_with_slider_heuristics(opts.algorithm, &input),
-        false => {
-            let mut d = Diff::compute(opts.algorithm, &input);
-            d.postprocess_no_heuristic(&input);
-            d
-        }
+    let (before, after) = (diff::byte_lines(a), diff::byte_lines(b));
+    let changes = outer_changes(&before, &after, opts);
+    let geom = diff_pairs::EmitGeometry {
+        ctx: opts.context as usize,
+        inter_hunk_ctx: 0,
+        func_context: false,
+        funcname: Some(section_headers()),
     };
-    let mut added = 0u64;
-    let mut deleted = 0u64;
-    for h in diff.hunks() {
-        deleted += h.before.len() as u64;
-        added += h.after.len() as u64;
-    }
-    (added, deleted)
+    let (added, deleted) = diff_pairs::emit_hunks(&before, &after, &changes, &geom, &mut NoSink);
+    (added as u64, deleted as u64)
 }
 
+/// A sink that discards what [`diff_pairs::emit_hunks`] hands it, for the counts.
+struct NoSink;
+
+impl diff_pairs::EmitSink for NoSink {
+    fn hunk(&mut self, _: usize, _: usize, _: usize, _: usize, _: &[u8]) {}
+    fn record(&mut self, _: u8, _: &[u8]) {}
+}
+
+/// `xdl_diff()`'s change script for the outer diff, over the records of the two
+/// patch texts. The records are compared under `xpp.flags` — the `-w`/`-b`/
+/// `--ignore-space-at-eol`/`--ignore-cr-at-eol` bits `add_diff_options()` sets on
+/// `diffopt` (diff.c:6196-6207) — by interning each one's whitespace-normalized
+/// form, while [`diff_pairs::compute_compacted`] slides the groups over the
+/// original bytes, as `xdl_change_compact()` does. The same path `git diff` takes.
+fn outer_changes(before: &[&[u8]], after: &[&[u8]], opts: &Opts) -> Vec<diff_pairs::Change> {
+    let mut input: InternedInput<Vec<u8>> = InternedInput::default();
+    input.update_before(before.iter().map(|l| diff::normalize_line(l, opts.ws)));
+    input.update_after(after.iter().map(|l| diff::normalize_line(l, opts.ws)));
+    let diff = diff_pairs::compute_compacted(opts.algorithm, &input, before, after, opts.indent_heuristic);
+    diff.hunks()
+        .map(|h| diff_pairs::Change {
+            i1: h.before.start as usize,
+            chg1: h.before.len(),
+            i2: h.after.start as usize,
+            chg2: h.after.len(),
+            ignore: false,
+        })
+        .collect()
+}
+
+/// `section_headers` (range-diff.c:470-475): the userdiff driver `get_filespec()`
+/// hangs on both sides of the outer diff, whose funcname patterns name each outer
+/// hunk after the nearest ` ## <section> ##` or inner `@@` line above it.
+fn section_headers() -> &'static crate::userdiff::FuncName {
+    static DRIVER: std::sync::OnceLock<crate::userdiff::FuncName> = std::sync::OnceLock::new();
+    DRIVER.get_or_init(|| {
+        crate::userdiff::FuncName::compile(&crate::userdiff::FuncPattern {
+            pattern: "^ ## (.*) ##$\n^.?@@ (.*)$".to_string(),
+            extended: true,
+            icase: false,
+        })
+        .expect("the built-in section_headers patterns compile")
+    })
+}
 /// `builtin_checkdiff()` (diff.c:3808) driving `checkdiff_consume()`
 /// (diff.c:3196) over the outer diff.
 ///
@@ -4167,17 +4228,13 @@ fn check_pair(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) {
     }
 }
 
+/// `patch_diff()` (range-diff.c:491-498) as far as `builtin_diff()`'s patch goes:
+/// the outer change script through [`diff_pairs::emit_hunks`] — the `xdl_emit_diff`
+/// port `git diff` uses — into [`OuterHunks`], which paints each record the way
+/// `fn_out_consume()` does.
 fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> {
-    let input = InternedInput::new(a, b);
-    let diff = match opts.indent_heuristic {
-        true => diff_with_slider_heuristics(opts.algorithm, &input),
-        false => {
-            let mut d = Diff::compute(opts.algorithm, &input);
-            d.postprocess_no_heuristic(&input);
-            d
-        }
-    };
-    let before: Vec<&[u8]> = input.before.iter().map(|&t| input.interner[t]).collect();
+    let (before, after) = (diff::byte_lines(a), diff::byte_lines(b));
+    let changes = outer_changes(&before, &after, opts);
 
     // `builtin_diff()`'s pre-pass (diff.c:1920-1927): the two patch texts are this
     // filepair's pre- and post-images, and the check is skipped outright — leaving
@@ -4187,12 +4244,9 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
         false => (0, 0),
     };
 
-    let writer = OuterHunks {
+    let mut sink = OuterHunks {
         out,
-        before,
         indicators: opts.indicators,
-        func_line: Vec::new(),
-        funclineprev: -1,
         colors: &opts.colors,
         dual: opts.dual,
         ws_rule: opts.ws_rule,
@@ -4201,30 +4255,23 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
         lno_pre: 0,
         lno_post: 0,
     };
-    UnifiedDiff::new(
-        &diff,
-        &input,
-        writer,
-        ContextSize::symmetrical(opts.context),
-    )
-    .consume()?;
+    let geom = diff_pairs::EmitGeometry {
+        ctx: opts.context as usize,
+        inter_hunk_ctx: 0,
+        func_context: false,
+        funcname: Some(section_headers()),
+    };
+    diff_pairs::emit_hunks(&before, &after, &changes, &geom, &mut sink);
     Ok(())
 }
 
-/// Writes the outer hunks, carrying `func_line` and `funclineprev` across hunks
-/// the way `xdl_emit_diff()` does, and colouring each line the way
-/// `fn_out_consume()` → `emit_diff_symbol()` does.
+/// Writes the outer hunks, colouring each line the way `fn_out_consume()` →
+/// `emit_diff_symbol()` does.
 struct OuterHunks<'a> {
     out: &'a mut Vec<u8>,
-    before: Vec<&'a [u8]>,
     /// `o->output_indicators`, indexed by [`IND_NEW`] / [`IND_OLD`] /
     /// [`IND_CONTEXT`].
     indicators: [u8; 3],
-    /// Deliberately *not* reset per hunk: `get_func_line()` only overwrites its
-    /// buffer on a match, so a hunk with no match repeats the previous name.
-    func_line: Vec<u8>,
-    /// The `s1 - 1` of the previous hunk, the exclusive limit of the search.
-    funclineprev: i64,
     /// `diff_get_color_opt()`'s table, all empty strings with colour off.
     colors: &'a diff_color::DiffColors,
     /// `o->flags.dual_color_diffed_diffs`.
@@ -4256,143 +4303,65 @@ impl OuterHunks<'_> {
     }
 }
 
-impl ConsumeHunk for OuterHunks<'_> {
-    type Out = ();
-
-    fn consume_hunk(
-        &mut self,
-        header: HunkHeader,
-        lines: &[(DiffLineKind, &[u8])],
-    ) -> std::io::Result<()> {
-        let s1 = header.before_hunk_start as i64 - 1;
-        if let Some(f) = get_func_line(&self.before, s1 - 1, self.funclineprev) {
-            self.func_line = f;
-        }
-        self.funclineprev = s1 - 1;
-
+impl diff_pairs::EmitSink for OuterHunks<'_> {
+    fn hunk(&mut self, s1: usize, len1: usize, s2: usize, len2: usize, func: &[u8]) {
         // `find_lno()` reads the two numbers back out of the header xdiff just
-        // wrote, and `xdl_emit_hunk_hdr()` writes `s - 1` for an empty side — so a
-        // zero-length side starts one lower than the struct's 1-based field.
-        let start = |begin: u32, len: u32| match len {
-            0 => begin.saturating_sub(1) as usize,
-            _ => begin as usize,
-        };
-        self.lno_pre = start(header.before_hunk_start, header.before_hunk_len);
-        self.lno_post = start(header.after_hunk_start, header.after_hunk_len);
+        // wrote, and `xdl_emit_hunk_hdr()` writes `s - 1` for an empty side — the
+        // 0-based start — and the 1-based start otherwise.
+        let start = |s: usize, len: usize| if len == 0 { s } else { s + 1 };
+        self.lno_pre = start(s1, len1);
+        self.lno_post = start(s2, len2);
 
         // `diff_line_prefix()` first, then the header the `fraginfo` palette
-        // paints. Lent out and handed straight back so the buffer keeps carrying
-        // the last matched section name across hunks.
+        // paints, its line counts dropped by `suppress_hunk_header_line_count`.
         self.out.extend_from_slice(INDENT);
-        let func_line = std::mem::take(&mut self.func_line);
-        diff_color::emit_hunk_header_suppressed(self.out, self.colors, self.dual, &func_line);
-        self.func_line = func_line;
+        diff_color::emit_hunk_header_suppressed(self.out, self.colors, self.dual, func);
+    }
 
+    fn record(&mut self, marker: u8, content: &[u8]) {
+        // `fn_out_consume()`'s three cases, each stepping the line counters
+        // before it emits (diff.c:2499-2512).
+        let (ck, ind, side) = match marker {
+            b'+' => {
+                self.lno_post += 1;
+                (diff_color::ContentKind::Plus, IND_NEW, diff_color::WSEH_NEW)
+            }
+            b'-' => {
+                self.lno_pre += 1;
+                (diff_color::ContentKind::Minus, IND_OLD, diff_color::WSEH_OLD)
+            }
+            _ => {
+                self.lno_pre += 1;
+                self.lno_post += 1;
+                (diff_color::ContentKind::Context, IND_CONTEXT, diff_color::WSEH_CONTEXT)
+            }
+        };
         // `emit_line_0()` writes the prefix, then the sign, then the record — with
         // the line terminator held back past the closing reset (diff.c:801-807). A
         // NUL sign (the empty `--output-indicator-*` value) writes no column at
-        // all: `if (first) fputc(first, file)` (diff.c:786-787).
-        for &(kind, content) in lines {
-            // `fn_out_consume()`'s three cases, each stepping the line counters
-            // before it emits (diff.c:2499-2512).
-            let (ck, ind, side) = match kind {
-                DiffLineKind::Context => {
-                    self.lno_pre += 1;
-                    self.lno_post += 1;
-                    (diff_color::ContentKind::Context, IND_CONTEXT, diff_color::WSEH_CONTEXT)
-                }
-                DiffLineKind::Add => {
-                    self.lno_post += 1;
-                    (diff_color::ContentKind::Plus, IND_NEW, diff_color::WSEH_NEW)
-                }
-                DiffLineKind::Remove => {
-                    self.lno_pre += 1;
-                    (diff_color::ContentKind::Minus, IND_OLD, diff_color::WSEH_OLD)
-                }
-            };
-            // The record as xdiff hands it over. A patch text always ends its
-            // lines, so only a truncated final record can lack the terminator.
-            let terminated: Vec<u8>;
-            let line: &[u8] = if content.ends_with(b"\n") {
-                content
-            } else {
-                terminated = [content, b"\n"].concat();
-                &terminated
-            };
-            let blank_at_eof =
-                ck == diff_color::ContentKind::Plus && self.new_blank_line_at_eof(line);
-            self.out.extend_from_slice(INDENT);
-            diff_color::emit_content_symbol(
-                self.out,
-                self.colors,
-                self.dual,
-                ck,
-                0,
-                self.indicators[ind],
-                line,
-                self.ws_rule,
-                self.ws_error_highlight & side != 0,
-                blank_at_eof,
-            );
-        }
-        Ok(())
-    }
-
-    fn finish(self) {}
-}
-
-/// `get_func_line()`: scan `records` from `start` towards `limit` (exclusive)
-/// for the first line the section-header driver matches.
-fn get_func_line(records: &[&[u8]], start: i64, limit: i64) -> Option<Vec<u8>> {
-    let step: i64 = if start > limit { -1 } else { 1 };
-    let mut l = start;
-    while l != limit && 0 <= l && (l as usize) < records.len() {
-        if let Some(f) = section_name(records[l as usize]) {
-            return Some(f);
-        }
-        l += step;
-    }
-    None
-}
-
-/// Upstream's `section_headers` userdiff driver run through `ff_regexp()`: try
-/// `^ ## (.*) ##$` then `^.?@@ (.*)$` against the record with its line
-/// terminator excluded, take capture group 1, cap it at 80 bytes, then trim
-/// trailing whitespace.
-fn section_name(record: &[u8]) -> Option<Vec<u8>> {
-    let mut len = record.len();
-    if len > 0 && record[len - 1] == b'\n' {
-        if len > 1 && record[len - 2] == b'\r' {
-            len -= 2;
+        // all: `if (first) fputc(first, file)` (diff.c:786-787). A patch text
+        // always ends its lines, so only a truncated final record can lack the
+        // terminator.
+        let terminated: Vec<u8>;
+        let line: &[u8] = if content.ends_with(b"\n") {
+            content
         } else {
-            len -= 1;
-        }
+            terminated = [content, b"\n"].concat();
+            &terminated
+        };
+        let blank_at_eof = ck == diff_color::ContentKind::Plus && self.new_blank_line_at_eof(line);
+        self.out.extend_from_slice(INDENT);
+        diff_color::emit_content_symbol(
+            self.out,
+            self.colors,
+            self.dual,
+            ck,
+            0,
+            self.indicators[ind],
+            line,
+            self.ws_rule,
+            self.ws_error_highlight & side != 0,
+            blank_at_eof,
+        );
     }
-    let line = &record[..len];
-
-    let group = match_section(line).or_else(|| match_hunk(line))?;
-    let mut n = group.len().min(FUNC_BUF_SIZE);
-    while n > 0 && group[n - 1].is_ascii_whitespace() {
-        n -= 1;
-    }
-    Some(group[..n].to_vec())
-}
-
-/// `^ ## (.*) ##$`. `.*` is greedy and `$` anchors, so the group runs from just
-/// after the opening ` ## ` to just before the final ` ##`.
-fn match_section(line: &[u8]) -> Option<&[u8]> {
-    (line.len() >= 7 && line.starts_with(b" ## ") && line.ends_with(b" ##"))
-        .then(|| &line[4..line.len() - 3])
-}
-
-/// `^.?@@ (.*)$`. The optional leading character is greedy, so a one-character
-/// diff marker is consumed in preference to matching `@@ ` at offset zero.
-fn match_hunk(line: &[u8]) -> Option<&[u8]> {
-    if line.len() >= 4 && line[1..].starts_with(b"@@ ") {
-        return Some(&line[4..]);
-    }
-    if line.starts_with(b"@@ ") {
-        return Some(&line[3..]);
-    }
-    None
 }

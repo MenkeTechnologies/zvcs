@@ -425,6 +425,30 @@ pub(crate) enum Whitespace {
     IgnoreCrAtEol,
 }
 
+impl Whitespace {
+    /// Add one more `XDF_*` whitespace bit to the set already given. The four are
+    /// independent `OPT_BIT`s on `xdl_opts` (diff.c:6196-6207), but
+    /// `xdl_recmatch()` and `xdl_hash_record()` test them as an `if`/`else if`
+    /// chain — `IGNORE_WHITESPACE`, then `IGNORE_WHITESPACE_CHANGE`, then
+    /// `IGNORE_WHITESPACE_AT_EOL`, then `IGNORE_CR_AT_EOL` (xdiff/xutils.c:
+    /// 173-222) — so the strongest bit present decides, whatever the order the
+    /// options were spelled in.
+    pub(crate) fn with(self, flag: Whitespace) -> Whitespace {
+        let rank = |w: Whitespace| match w {
+            Whitespace::Keep => 0,
+            Whitespace::IgnoreCrAtEol => 1,
+            Whitespace::IgnoreAtEol => 2,
+            Whitespace::IgnoreChange => 3,
+            Whitespace::IgnoreAll => 4,
+        };
+        if rank(flag) > rank(self) {
+            flag
+        } else {
+            self
+        }
+    }
+}
+
 /// The "new" side of a change.
 enum NewSide {
     /// The path no longer exists (a deletion).

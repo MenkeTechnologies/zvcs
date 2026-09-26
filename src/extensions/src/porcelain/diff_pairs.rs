@@ -5077,36 +5077,83 @@ pub(crate) struct EmitGeometry<'a> {
     pub(crate) funcname: Option<&'a crate::userdiff::FuncName>,
 }
 
+/// Where [`emit_hunks`] delivers what `xdl_emit_diff()` hands its `xdemitcb_t`: one
+/// call per hunk header, then one per record. The unified-text writer behind
+/// [`emit_unified`] is one implementation; `range-diff`'s dual-colour diff-of-diffs
+/// renderer is another, which is what lets both share one hunk geometry.
+pub(crate) trait EmitSink {
+    /// `xdl_emit_hunk_hdr()`: the 0-based start and the length of each side's
+    /// range, and the enclosing-function name `XDL_EMIT_FUNCNAMES` found (empty for
+    /// none).
+    fn hunk(&mut self, s1: usize, len1: usize, s2: usize, len2: usize, func: &[u8]);
+    /// `xdl_emit_record()`: one record behind its `' '`, `'-'` or `'+'` marker,
+    /// with its line terminator when it has one.
+    fn record(&mut self, marker: u8, content: &[u8]);
+}
+
+/// The unified-diff text writer: `@@ -a,b +c,d @@ <func>` headers, and records
+/// followed by `\ No newline at end of file` when they lack a terminator.
+struct TextSink {
+    buf: Vec<u8>,
+}
+
+impl EmitSink for TextSink {
+    fn hunk(&mut self, s1: usize, len1: usize, s2: usize, len2: usize, func: &[u8]) {
+        self.buf.extend_from_slice(b"@@ -");
+        self.buf.extend_from_slice(fmt_range(s1 as u32 + 1, len1 as u32).as_bytes());
+        self.buf.extend_from_slice(b" +");
+        self.buf.extend_from_slice(fmt_range(s2 as u32 + 1, len2 as u32).as_bytes());
+        self.buf.extend_from_slice(b" @@");
+        if !func.is_empty() {
+            self.buf.push(b' ');
+            self.buf.extend_from_slice(func);
+        }
+        self.buf.push(b'\n');
+    }
+
+    fn record(&mut self, marker: u8, content: &[u8]) {
+        self.buf.push(marker);
+        self.buf.extend_from_slice(content);
+        if content.last() != Some(&b'\n') {
+            self.buf.push(b'\n');
+            self.buf.extend_from_slice(b"\\ No newline at end of file\n");
+        }
+    }
+}
+
 /// `xdl_emit_diff`: turn the change script into unified-diff text and count the emitted
 /// `+`/`-` records, which is what `diffstat_consume` counts too.
-///
-/// Reproduces xdiff's hunk geometry: `--unified=<n>` context, `--inter-hunk-context=<n>`
-/// merging (via [`get_hunk`]), `XDL_EMIT_FUNCNAMES` hunk-header function names and, under
-/// `-W`, `XDL_EMIT_FUNCCONTEXT`'s expansion of both hunk ends to enclosing-function
-/// boundaries.
 pub(crate) fn emit_unified(
     before: &[&[u8]],
     after: &[&[u8]],
     changes: &[Change],
     geom: &EmitGeometry<'_>,
 ) -> (u32, u32, Vec<u8>) {
+    let mut sink = TextSink { buf: Vec::new() };
+    let (add, del) = emit_hunks(before, after, changes, geom, &mut sink);
+    (add, del, sink.buf)
+}
+
+/// `xdl_emit_diff`: walk the change script into hunks, handing each header and record
+/// to `sink`, and count the emitted `+`/`-` records.
+///
+/// Reproduces xdiff's hunk geometry: `--unified=<n>` context, `--inter-hunk-context=<n>`
+/// merging (via [`get_hunk`]), `XDL_EMIT_FUNCNAMES` hunk-header function names and, under
+/// `-W`, `XDL_EMIT_FUNCCONTEXT`'s expansion of both hunk ends to enclosing-function
+/// boundaries.
+pub(crate) fn emit_hunks(
+    before: &[&[u8]],
+    after: &[&[u8]],
+    changes: &[Change],
+    geom: &EmitGeometry<'_>,
+    sink: &mut impl EmitSink,
+) -> (u32, u32) {
     let (nrec1, nrec2) = (before.len(), after.len());
     let ctxlen = geom.ctx;
-    let mut buf: Vec<u8> = Vec::new();
     let (mut add, mut del) = (0u32, 0u32);
     let mut funclineprev: isize = -1;
     let mut func_name: Vec<u8> = Vec::new();
     let mut cursor = 0usize;
-
-    // Append one record, tagging a final line that lacks its terminator.
-    let emit = |buf: &mut Vec<u8>, marker: u8, content: &[u8]| {
-        buf.push(marker);
-        buf.extend_from_slice(content);
-        if content.last() != Some(&b'\n') {
-            buf.push(b'\n');
-            buf.extend_from_slice(b"\\ No newline at end of file\n");
-        }
-    };
 
     while cursor < changes.len() {
         // `xchp` is the queue position *before* `xdl_get_hunk` skips ignorable changes;
@@ -5192,12 +5239,6 @@ pub(crate) fn emit_unified(
             break (e1, e2);
         };
 
-        // Hunk header, with `XDL_EMIT_FUNCNAMES`' enclosing-function name.
-        buf.extend_from_slice(b"@@ -");
-        buf.extend_from_slice(fmt_range(s1 as u32 + 1, (e1 - s1) as u32).as_bytes());
-        buf.extend_from_slice(b" +");
-        buf.extend_from_slice(fmt_range(s2 as u32 + 1, (e2 - s2) as u32).as_bytes());
-        buf.extend_from_slice(b" @@");
         // `func_line` lives across hunks in `xdl_emit_diff`: a failed search leaves the
         // previously found name in place, because the search only spans back to the last
         // hunk's origin and finding nothing means the enclosing function is unchanged.
@@ -5208,44 +5249,41 @@ pub(crate) fn emit_unified(
                 .unwrap_or_default()
                 .to_vec();
         }
-        if !func_name.is_empty() {
-            buf.push(b' ');
-            buf.extend_from_slice(&func_name);
-        }
-        buf.push(b'\n');
+        // Hunk header, with `XDL_EMIT_FUNCNAMES`' enclosing-function name.
+        sink.hunk(s1, e1 - s1, s2, e2 - s2, &func_name);
 
         // Pre-context comes from the post-image, like `xdl_emit_diff`.
         let mut c2 = s2;
         while c2 < changes[first].i2 {
-            emit(&mut buf, b' ', after[c2]);
+            sink.record(b' ', after[c2]);
             c2 += 1;
         }
         let mut c1 = changes[first].i1;
         for ch in &changes[first..=last] {
             while c1 < ch.i1 && c2 < ch.i2 {
-                emit(&mut buf, b' ', after[c2]);
+                sink.record(b' ', after[c2]);
                 c1 += 1;
                 c2 += 1;
             }
             for l in ch.i1..ch.i1 + ch.chg1 {
-                emit(&mut buf, b'-', before[l]);
+                sink.record(b'-', before[l]);
                 del += 1;
             }
             for l in ch.i2..ch.i2 + ch.chg2 {
-                emit(&mut buf, b'+', after[l]);
+                sink.record(b'+', after[l]);
                 add += 1;
             }
             c1 = ch.i1 + ch.chg1;
             c2 = ch.i2 + ch.chg2;
         }
         while c2 < e2 {
-            emit(&mut buf, b' ', after[c2]);
+            sink.record(b' ', after[c2]);
             c2 += 1;
         }
 
         cursor = last + 1;
     }
-    (add, del, buf)
+    (add, del)
 }
 
 /// Split `data` into lines the way `imara_diff::sources::byte_lines` does: the

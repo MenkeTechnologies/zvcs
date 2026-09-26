@@ -3058,20 +3058,72 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
     // `extensions.worktreeConfig` and an unknown `extensions.*` are untouched by
     // that unset and are still written, which is what makes this a two-key rule
     // rather than a rule about the section.
+    //
+    // Where the pairs land is `write_config()`'s doing too (builtin/clone.c:764-791):
+    // it runs straight after `init_db()` (:1189, :1241), so the `-c` sections follow
+    // the `[core]` block `init_db()` wrote and come *before* everything the clone sets
+    // afterwards. `remote.<name>.url`, its `fetch` refspec and the `branch.<name>`
+    // keys are then `git_config_set()` calls, which append a new key to the end of
+    // an existing section of the same name — so `-c remote.origin.x=y` leaves `x`
+    // ahead of `url` inside one `[remote "origin"]`. gitoxide has already written
+    // those sections by now, so the file is rebuilt in git's order: the sections
+    // ahead of the first `[remote]`, then the pairs, then every later key appended
+    // the way `git_config_set()` would.
+    let sections: Vec<_> = file.sections().collect();
+    let split = sections
+        .iter()
+        .position(|s| s.header().name() == "remote")
+        .unwrap_or(sections.len());
+    let mut out = gix::config::File::new(gix::config::file::Metadata::from(gix::config::Source::Local));
+    let append = |out: &mut gix::config::File,
+                      section: &str,
+                      subsection: Option<&str>,
+                      name: &str,
+                      value: &gix::bstr::BStr|
+     -> Result<()> {
+        out.section_mut_or_create_new(section, subsection.map(Into::into))
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .push(name, Some(value))?;
+        Ok(())
+    };
+    let replay = |out: &mut gix::config::File, sections: &[gix::config::file::SectionRef<'_>]| -> Result<()> {
+        for s in sections {
+            let header = s.header();
+            let section = header.name().to_string();
+            let subsection = header.subsection_name().map(|n| n.to_string());
+            let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for name in s.value_names() {
+                let nth = seen.entry(name.to_ascii_lowercase()).or_insert(0);
+                if let Some(value) = s.values(&name).get(*nth) {
+                    append(out, &section, subsection.as_deref(), &name, value.as_ref())?;
+                }
+                *nth += 1;
+            }
+        }
+        Ok(())
+    };
+    replay(&mut out, &sections[..split])?;
     for (key, value) in fixups.config_pairs {
         if key.eq_ignore_ascii_case("extensions.objectformat")
             || key.eq_ignore_ascii_case("extensions.refstorage")
         {
             continue;
         }
+        // `write_one_config()` hands the key to `git_config_set_multivar_gently()`,
+        // which canonicalizes it with `git_config_parse_key()`: the section and the
+        // variable name are lowercased, a subsection keeps its case.
         let (section, subsection, name) = split_config_key(key)?;
-        let mut sec = file
-            .section_mut_or_create_new(&section, subsection.as_deref().map(Into::into))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        sec.push(name.as_str(), Some(value.as_str().into()))?;
+        append(
+            &mut out,
+            &section.to_ascii_lowercase(),
+            subsection.as_deref(),
+            &name.to_ascii_lowercase(),
+            value.as_str().into(),
+        )?;
     }
+    replay(&mut out, &sections[split..])?;
 
-    std::fs::write(&path, file.to_bstring())?;
+    std::fs::write(&path, out.to_bstring())?;
     Ok(())
 }
 

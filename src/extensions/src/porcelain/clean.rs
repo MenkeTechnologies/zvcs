@@ -269,13 +269,23 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
+    // `git_clean_config()` reads `clean.requireforce` with `git_config_bool()`
+    // (builtin/clean.c:132-133), which dies on a value it cannot parse while the
+    // configuration is being read — before the refusal below, and even under `-n`,
+    // `-i` or `-f` where the value would not matter.
+    let require_force = match crate::repo_settings::config_bool_strict(&repo, "clean.requireforce") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+    };
+
     // git checks the force refusal before anything else it could diagnose, so
     // `git clean ../outside-repo` reports the refusal rather than the pathspec.
-    if !interactive
-        && !dry_run
-        && force == 0
-        && repo.config_snapshot().boolean("clean.requireForce") != Some(false)
-    {
+    // `require_force` starts at -1 (unset) and only `0` lifts the refusal
+    // (builtin/clean.c:30, :956).
+    if !interactive && !dry_run && force == 0 && require_force != Some(false) {
         eprintln!("fatal: clean.requireForce is true and -f not given: refusing to clean");
         return Ok(ExitCode::from(128));
     }

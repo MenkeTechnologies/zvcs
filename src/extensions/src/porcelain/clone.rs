@@ -582,11 +582,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `--recursive` / `--recurse-submodules[=<pathspec>]`: after the clone,
             // initialize and update submodules recursively. A pathspec-limited
             // recurse is honored as a full recursive update.
+            //
+            // `recurse_submodules_cb()` (builtin/clone.c:83-95) appends the
+            // pathspec, or the option's `defval` of `"."` when none is given, so
+            // `--recursive --recursive=a` records both `.` and `a`.
             "--recursive" | "--recurse-submodules" => {
                 recurse_submodules = true;
-                if let Some(pathspec) = inline_val.clone() {
-                    submodule_pathspecs.push(pathspec);
-                }
+                submodule_pathspecs.push(inline_val.clone().unwrap_or_else(|| ".".to_string()));
             }
             "--no-recursive" | "--no-recurse-submodules" => {
                 recurse_submodules = false;
@@ -960,6 +962,70 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             eprintln!("Cloning into bare repository '{dir}'...");
         } else {
             eprintln!("Cloning into '{dir}'...");
+        }
+    }
+
+    // ```c
+    // if (option_recurse_submodules.nr > 0) {
+    //         [...]
+    //         string_list_sort_u(&option_recurse_submodules, 0);
+    //         for_each_string_list_item(item, &option_recurse_submodules) {
+    //                 strbuf_addf(&sb, "submodule.active=%s", item->string);
+    //                 string_list_append(&option_config, sb.buf);
+    //         [...]
+    //         if (!repo_config_get_bool(the_repository, "submodule.stickyRecursiveClone", &val) &&
+    //             val)
+    //                 string_list_append(&option_config, "submodule.recurse=true");
+    //
+    //         if (option_required_reference.nr &&
+    //             option_optional_reference.nr)
+    //                 die(_("clone --recursive is not compatible with "
+    //                       "both --reference and --reference-if-able"));
+    //         else if (option_required_reference.nr) {
+    //                 [... "submodule.alternateLocation=superproject" ...]
+    //                 [... "submodule.alternateErrorStrategy=die" ...]
+    //         } else if (option_optional_reference.nr) {
+    //                 [... "submodule.alternateLocation=superproject" ...]
+    //                 [... "submodule.alternateErrorStrategy=info" ...]
+    //         }
+    // ```
+    //
+    // (builtin/clone.c:1141-1180, straight after the banner.) Everything lands on
+    // `option_config`, behind the caller's own `-c` pairs, so `write_config()`
+    // writes it in that order and the fetch sees it like any other `-c`. The
+    // `stickyRecursiveClone` read is the ambient configuration: the new
+    // repository's own file holds nothing but what `init_db()` wrote yet.
+    if !submodule_pathspecs.is_empty() {
+        let mut active = submodule_pathspecs.clone();
+        active.sort();
+        active.dedup();
+        for pathspec in active {
+            config_pairs.push(("submodule.active".to_string(), pathspec));
+        }
+        let sticky = "submodule.stickyRecursiveClone";
+        match crate::config::global_config().boolean(sticky) {
+            Ok(Some(true)) => config_pairs.push(("submodule.recurse".to_string(), "true".to_string())),
+            Err(_) => {
+                let value = crate::config::global_config()
+                    .string(sticky)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                // `git_config_bool()` names the key the way the caller spelled it.
+                crate::git_fatal!("bad boolean config value '{value}' for '{sticky}'");
+            }
+            _ => {}
+        }
+        let strategy = match (required_references.is_empty(), optional_references.is_empty()) {
+            (false, false) => crate::git_fatal!(
+                "clone --recursive is not compatible with both --reference and --reference-if-able"
+            ),
+            (false, true) => Some("die"),
+            (true, false) => Some("info"),
+            (true, true) => None,
+        };
+        if let Some(strategy) = strategy {
+            config_pairs.push(("submodule.alternateLocation".to_string(), "superproject".to_string()));
+            config_pairs.push(("submodule.alternateErrorStrategy".to_string(), strategy.to_string()));
         }
     }
 
@@ -2181,20 +2247,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             drop_fetch: bare && !mirror,
             drop_tag_opt: forced_all_tags,
             drop_branch_sections: bare,
-            // "The resulting clone has submodule.active set to the provided
-            // pathspec, or '.' (meaning all submodules) if no pathspec is
-            // provided" (git-clone(1)). git records it whenever the option is
-            // given, even for `--bare` / `-n`, where the update itself is skipped.
             // `partial_clone_register()`: a partial clone records the remote it may go back to for
             // the objects it skipped, and bumps the repository format so older git refuses it.
             promisor_filter: filter.as_ref().map(|f| f.as_str().to_owned()),
-            submodule_active: recurse_submodules.then(|| {
-                if submodule_pathspecs.is_empty() {
-                    vec![".".to_string()]
-                } else {
-                    submodule_pathspecs.clone()
-                }
-            }),
             fetch_bundle_uri: persist_bundle_uri.clone(),
             fetch_bundle_creation_token: persist_creation_token.clone(),
             // The remote a bundle clone records is the bundle, not the scratch
@@ -2706,8 +2761,6 @@ struct ConfigFixups<'a> {
     /// `partial_clone_register()` does — `remote.<name>.promisor = true`,
     /// `remote.<name>.partialclonefilter = <spec>` and `core.repositoryformatversion = 1`.
     promisor_filter: Option<String>,
-    /// `submodule.active` values recorded by `--recurse-submodules[=<pathspec>]`.
-    submodule_active: Option<Vec<String>>,
     /// `fetch.bundleURI`, recorded by `--bundle-uri` when the list it fetched
     /// advertised a `bundle.heuristic` so later fetches can revisit it.
     fetch_bundle_uri: Option<String>,
@@ -2906,7 +2959,6 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
         && !fixups.drop_fetch
         && !fixups.drop_tag_opt
         && !fixups.drop_branch_sections
-        && fixups.submodule_active.is_none()
         && fixups.promisor_filter.is_none()
         && fixups.fetch_bundle_uri.is_none()
         && fixups.fetch_bundle_creation_token.is_none()
@@ -2964,15 +3016,6 @@ fn finalize_config(git_dir: &Path, fixups: &ConfigFixups<'_>) -> Result<()> {
             .collect();
         for sub in subsections {
             while file.remove_section("branch", Some(sub.as_str().into())).is_some() {}
-        }
-    }
-
-    if let Some(pathspecs) = &fixups.submodule_active {
-        let mut section = file
-            .section_mut_or_create_new("submodule", None)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for pathspec in pathspecs {
-            section.push("active", Some(pathspec.as_str().into()))?;
         }
     }
 

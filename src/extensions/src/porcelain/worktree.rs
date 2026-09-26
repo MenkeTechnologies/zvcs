@@ -95,7 +95,8 @@ use gix::refs::FullName;
 /// `move` and `remove` are ported, `check_clean_worktree()` included: both refuse a
 /// linked worktree whose `git status --porcelain` is not empty unless `--force` is
 /// given, and `move` rewrites the linking files on both sides
-/// (`update_worktree_location()`).
+/// (`update_worktree_location()`), relative or absolute as `--[no-]relative-paths`
+/// (default `worktree.useRelativePaths`) says at the time of the move.
 ///
 /// A single documented deviation: `repair <nonexistent-path>` dies (exit 128) as
 /// git does, but git's `strbuf_realpath()` names the deepest resolvable path
@@ -3577,6 +3578,8 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     // `OPT__FORCE(&force, …)` counts: one `-f` overrides a missing registered destination,
     // a locked worktree (or a missing *locked* destination) needs two.
     let mut force = 0usize;
+    // `OPT_BOOL(0, "relative-paths", &use_relative_paths, …)` (worktree.c:1253).
+    let mut relative: Option<bool> = None;
     let mut positionals: Vec<&str> = Vec::new();
     for a in args {
         match a.as_str() {
@@ -3587,6 +3590,8 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
             }
             "-f" | "--force" => force += 1,
             "--no-force" => force = 0,
+            "--relative-paths" => relative = Some(true),
+            "--no-relative-paths" => relative = Some(false),
             s if s.starts_with('-') && s != "-" => return Ok(super::unknown_option(s, MOVE_USAGE)),
             s => positionals.push(s),
         }
@@ -3666,18 +3671,19 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
         ));
     }
 
-    // `update_worktree_location()`: both halves of the link are rewritten, absolute,
-    // exactly as `worktree add` wrote them.
-    let admin = repo.common_dir().join("worktrees").join(&id);
-    let dest_abs = gix::path::realpath(&dest).unwrap_or(dest.clone());
-    let mut gitdir_line = path_bytes(&dest_abs.join(".git"));
-    gitdir_line.push(b'\n');
-    std::fs::write(admin.join("gitdir"), gitdir_line)?;
-    let admin_abs = gix::path::realpath(&admin).unwrap_or_else(|_| admin.clone());
-    let mut dot_git = b"gitdir: ".to_vec();
-    dot_git.extend_from_slice(&path_bytes(&admin_abs));
-    dot_git.push(b'\n');
-    std::fs::write(dest_abs.join(".git"), dot_git)?;
+    // `update_worktree_location(wt, dst.buf, use_relative_paths)` (worktree.c:432-457):
+    // both halves of the link go through `write_worktree_linking_files()`, so they come out
+    // relative when `--relative-paths` (or `worktree.useRelativePaths`, which
+    // `git_worktree_config()` reads into the same variable at builtin/worktree.c:141-142)
+    // asks for it, and absolute otherwise — whatever form `add` first wrote.
+    let relative = relative.unwrap_or_else(|| {
+        repo.config_snapshot().boolean("worktree.useRelativePaths").unwrap_or(false)
+    });
+    let gitdir = gix::path::realpath(repo.common_dir().join("worktrees").join(&id).join("gitdir"))?;
+    let dest_abs = gix::path::realpath(&dest)?;
+    if wt.path != dest_abs {
+        write_worktree_linking_files(repo.common_dir(), &dest_abs.join(".git"), &gitdir, relative);
+    }
     Ok(ExitCode::SUCCESS)
 }
 

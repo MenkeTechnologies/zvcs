@@ -3246,7 +3246,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     eprintln!("fatal: {msg}");
                     return Ok(ExitCode::from(128));
                 }
-                Err(_) if spec_is_path(&repo, spec) => {
+                // `if (seen_dashdash || *arg == '^') die("bad revision '%s'", arg);`
+                // (revision.c:3081-3082) stands ahead of the fallback: once a `--`
+                // is on the line, an operand in front of it is a revision or an
+                // error, never the start of the pathspec, even when a file of that
+                // name exists.
+                Err(_) if !seen_dashdash && spec_is_path(&repo, spec) => {
                     // `setup_revisions()`'s filename fallback checks the whole
                     // tail before it prunes with any of it:
                     //

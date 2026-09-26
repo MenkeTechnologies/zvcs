@@ -341,6 +341,34 @@ impl Mark {
         if dir_info.index_kind == Some(entry::Kind::Directory) {
             return None;
         }
+        // `treat_directory()` (dir.c:2074-2081): an untracked directory the pathspec
+        // only reaches as a *leading* path — `*f` or `:(glob)**/f` against `dir/`,
+        // `MATCHED_RECURSIVELY_LEADING_PATHSPEC` — is recursed into and its matching
+        // entries are listed one by one; only a directory the pathspec matches itself
+        // (`u*`, `ud`, `:(glob)ud/*`) is reported as a whole. So `git clean -n '*f'`
+        // says `ud/f`, never `ud/`. An excluded directory skips the pathspec test
+        // (dir.c:1997), hence the restriction to untracked ones.
+        //
+        // gix reports git's `MATCHED_RECURSIVELY` (`ud` against `ud/sub/`) as
+        // `Prefix`; a merely *leading* match is no match at all, which is what `None`
+        // stands for here.
+        //
+        // git matches the name *with* its trailing slash (`treat_one_path()` appends it,
+        // dir.c:2493), so `ud/*` and `*/` match `ud/` where the bare `ud` does not.
+        if dir_info.status == Status::Untracked
+            && ctx.pathspec.patterns().len() != 0
+            && dir_info.pathspec_match.is_none()
+        {
+            let mut with_slash = BString::from(dir_rela_path);
+            with_slash.push(b'/');
+            let matches_itself = ctx
+                .pathspec
+                .pattern_matching_relative_path(with_slash.as_bstr(), Some(true), ctx.pathspec_attributes)
+                .is_some();
+            if !matches_itself {
+                return None;
+            }
+        }
         let (mut expendable, mut precious, mut untracked, mut entries, mut matching_entries) = (0, 0, 0, 0, 0);
         for (kind, status, pathspec_match) in state.on_hold[self.start_index..]
             .iter()

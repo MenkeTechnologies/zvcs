@@ -16,7 +16,7 @@ use super::diff_color;
 use super::diff_color::ColorWhen;
 use super::diffstat::{self, StatWidths};
 use super::line_log;
-use super::pretty_pad::{FlushType, PadState, WrapState};
+use super::pretty_pad::{FlushType, FormatMagic, PadState, WrapState};
 
 /// `usage_with_options()` over `builtin/log.c`'s `builtin_log_usage` and option
 /// table. `git show` and `git whatchanged` are the same builtin and print it too.
@@ -9407,6 +9407,9 @@ fn expand_format(
     fmt: &str,
     ctx: &RenderCtx<'_>,
 ) -> Result<()> {
+    // Where this commit's message starts: `%-` strips line feeds back to here
+    // and no further.
+    let start = out.len();
     // `%C(auto)` latches auto-coloring on for the placeholders that follow it —
     // notably `%d`/`%D`, which stay uncolored until it appears (matching git).
     let mut auto = false;
@@ -9444,54 +9447,78 @@ fn expand_format(
             continue;
         }
         i += 1;
-        if pad.flush == FlushType::None {
-            if !expand_one(out, commit, &chars, &mut i, p, ctx, &mut auto, &mut gsig, &mut pad, &mut wrap)? {
-                // `format_commit_item()` answered 0: git prints the `%` and
-                // rescans from the placeholder character itself.
-                out.push(b'%');
-                i -= 1;
-            }
-            continue;
-        }
-        // `format_and_pad_commit()`: the placeholder renders into a buffer of its
-        // own so its *display* width can be measured, and a `%C…` color keeps
-        // pulling the following placeholder into the same field — the escape adds
-        // bytes but no columns, so the field measures the text.
-        let padding = pad.padding;
-        let mut local: Vec<u8> = Vec::new();
+        // `format_commit_item()` (pretty.c:1906-1965): a `-`, `+` or ` ` ahead of
+        // the placeholder is magic applied to whatever the placeholder expands to.
+        // `%+w(…)` could only ever reflow text already written, so git refuses the
+        // pair (`return 0`) and the driver prints it literally.
+        let magic = FormatMagic::of(p);
         let mut p = p;
-        // Whether the chain has already swallowed a `%`. `format_and_pad_commit()`
-        // counts it in `total_consumed`, so a *later* placeholder that expands to
-        // nothing still leaves the driver with a non-zero count — and the driver
-        // only prints a bare `%` when the count is zero.
-        let mut chained = false;
-        let consumed = loop {
-            let modifier = p == 'C';
-            let consumed =
-                expand_one(&mut local, commit, &chars, &mut i, p, ctx, &mut auto, &mut gsig, &mut pad, &mut wrap)?;
-            if !modifier || !consumed {
-                break consumed;
-            }
-            if chars.get(i) != Some(&'%') {
-                break consumed;
-            }
-            i += 1;
+        if magic != FormatMagic::None {
             match chars.get(i) {
+                Some('w') => {
+                    out.push(b'%');
+                    i -= 1;
+                    continue;
+                }
                 Some(&next) => {
-                    chained = true;
                     p = next;
                     i += 1;
                 }
-                None => break consumed,
+                // `format_commit_one()` meets the NUL and consumes nothing; the
+                // item still answers `consumed + 1`, the magic character alone.
+                None => continue,
             }
+        }
+        let orig_len = out.len();
+        let (consumed, chained) = if pad.flush == FlushType::None {
+            let consumed =
+                expand_one(out, commit, &chars, &mut i, p, ctx, &mut auto, &mut gsig, &mut pad, &mut wrap)?;
+            (consumed, false)
+        } else {
+            // `format_and_pad_commit()`: the placeholder renders into a buffer of its
+            // own so its *display* width can be measured, and a `%C…` color keeps
+            // pulling the following placeholder into the same field — the escape adds
+            // bytes but no columns, so the field measures the text.
+            let padding = pad.padding;
+            let mut local: Vec<u8> = Vec::new();
+            // Whether the chain has already swallowed a `%`. `format_and_pad_commit()`
+            // counts it in `total_consumed`, so a *later* placeholder that expands to
+            // nothing still leaves the driver with a non-zero count — and the driver
+            // only prints a bare `%` when the count is zero.
+            let mut chained = false;
+            let consumed = loop {
+                let modifier = p == 'C';
+                let consumed =
+                    expand_one(&mut local, commit, &chars, &mut i, p, ctx, &mut auto, &mut gsig, &mut pad, &mut wrap)?;
+                if !modifier || !consumed {
+                    break consumed;
+                }
+                if chars.get(i) != Some(&'%') {
+                    break consumed;
+                }
+                i += 1;
+                match chars.get(i) {
+                    Some(&next) => {
+                        chained = true;
+                        p = next;
+                        i += 1;
+                    }
+                    None => break consumed,
+                }
+            };
+            pad.apply(out, local, padding, ctx.graph_width);
+            (consumed, chained)
         };
-        pad.apply(out, local, padding, ctx.graph_width);
         if !consumed {
+            // The scan resumes at the placeholder character itself. The driver
+            // prints the `%` only when the item's count is zero, and a magic
+            // item's count never is: it answers `consumed + 1`.
             i -= 1;
-            if !chained {
+            if !chained && magic == FormatMagic::None {
                 out.push(b'%');
             }
         }
+        magic.apply(out, orig_len, start);
     }
     // `repo_format_commit_message()` closes with a rewrap to width 0, which wraps
     // whatever a trailing `%w()` was still governing.

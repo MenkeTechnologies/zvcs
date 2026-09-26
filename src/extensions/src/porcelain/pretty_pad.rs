@@ -821,3 +821,60 @@ mod tests {
         assert_eq!(wrap.parse_and_apply(&mut sb, &"wx".chars().collect::<Vec<_>>(), 0), None);
     }
 }
+
+/// The magic `format_commit_item()` (pretty.c:1906-1965) reads off a `-`, `+` or
+/// ` ` between the `%` and the placeholder, applied to whatever the placeholder
+/// then expands to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FormatMagic {
+    None,
+    /// `%-x`: an empty expansion also removes the line feeds just before it.
+    DelLfBeforeEmpty,
+    /// `%+x`: a non-empty expansion gets a line feed inserted in front of it.
+    AddLfBeforeNonEmpty,
+    /// `% x`: a non-empty expansion gets a space inserted in front of it.
+    AddSpBeforeNonEmpty,
+}
+
+impl FormatMagic {
+    /// The `switch (placeholder[0])` that picks the magic.
+    pub(crate) fn of(c: char) -> Self {
+        match c {
+            '-' => FormatMagic::DelLfBeforeEmpty,
+            '+' => FormatMagic::AddLfBeforeNonEmpty,
+            ' ' => FormatMagic::AddSpBeforeNonEmpty,
+            _ => FormatMagic::None,
+        }
+    }
+
+    /// The tail of `format_commit_item()`: `orig_len` is where the placeholder's
+    /// expansion starts in `out`, and `start` where this commit's message does —
+    /// git's `sb` holds only the message, so `%-` never reaches past it.
+    ///
+    /// ```c
+    /// if ((orig_len == sb->len) && magic == DEL_LF_BEFORE_EMPTY) {
+    ///         while (sb->len && sb->buf[sb->len - 1] == '\n')
+    ///                 strbuf_setlen(sb, sb->len - 1);
+    /// } else if (orig_len != sb->len) {
+    ///         if (magic == ADD_LF_BEFORE_NON_EMPTY)
+    ///                 strbuf_insertstr(sb, orig_len, "\n");
+    ///         else if (magic == ADD_SP_BEFORE_NON_EMPTY)
+    ///                 strbuf_insertstr(sb, orig_len, " ");
+    /// }
+    /// ```
+    pub(crate) fn apply(self, out: &mut Vec<u8>, orig_len: usize, start: usize) {
+        if orig_len == out.len() {
+            if self == FormatMagic::DelLfBeforeEmpty {
+                while out.len() > start && out.last() == Some(&b'\n') {
+                    out.pop();
+                }
+            }
+            return;
+        }
+        match self {
+            FormatMagic::AddLfBeforeNonEmpty => out.insert(orig_len, b'\n'),
+            FormatMagic::AddSpBeforeNonEmpty => out.insert(orig_len, b' '),
+            FormatMagic::None | FormatMagic::DelLfBeforeEmpty => {}
+        }
+    }
+}

@@ -25,18 +25,9 @@
 //!     also what lets its key collide with the author group's and be deduped.
 //!   * `--format=<fmt>` — builtin format names are ignored (git only consults
 //!     `--format` when it is a *user* format), user formats are expanded. The
-//!     supported placeholders are `%H %h %T %t %P %p %s %B %n %x## %%`, the
-//!     author/committer name/email/local-part `%a{n,e,N,E,l,L}`/`%c{n,e,N,E,l,L}`,
-//!     and the date forms `%a{t,i,I,D,d,s}`/`%c{t,i,I,D,d,s}` (`%ad`/`%cd` honour
-//!     `--date`; `%as`/`%cs` is always the short date). A `%a`/`%c` at end of
-//!     string, and any unrecognised `%a`/`%c` sub-form, are copied through
-//!     verbatim exactly as git does (its `format_person_part` returns 0).
-//!     The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` — with
-//!     their `%<|(<N>)` column-target and `,trunc`/`,ltrunc`/`,mtrunc` forms —
-//!     and the `%w(<width>,<indent1>,<indent2>)` wrap atom go through the shared
-//!     [`super::pretty_pad`] port, so a field is measured in display columns and
-//!     a CJK subject costs two per glyph. `%C…` is not among the placeholders
-//!     above, so `format_and_pad_commit()`'s colour chain can never open here.
+//!     format, and each `--group=format:` key, goes through `pretty.c`'s one
+//!     expander, shared with `log` and `rev-list`, so every placeholder, the
+//!     column and wrap atoms and the `%+`/`%-`/`% ` magic behave as they do there.
 //!   * `--date=<fmt>` — validated the way `parse_date_format()` validates it.
 //!   * `--abbrev[=<n>]` / `--no-abbrev` — `revs->abbrev`, which `%h`, `%t` and
 //!     `%p` render through. The value is clamped to `[MINIMUM_ABBREV, hexsz]`
@@ -120,11 +111,9 @@ use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
-use gix::prelude::ObjectIdExt;
 use gix::revision::walk::Sorting;
 use gix::traverse::commit::simple::CommitTimeOrder;
 
-use super::pretty_pad::{FlushType, PadState, WrapState};
 use crate::revfilter::{compile_patterns, Dialect};
 use super::diff_color;
 
@@ -821,7 +810,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     filters.commit_filter.all_match = filters.all_match;
     filters.commit_filter.invert_grep = filters.invert_grep;
 
-    let repo = crate::setup::discover().ok();
+    let mut repo = crate::setup::discover().ok();
     // `revision.c` clamps `--abbrev=<n>` against the repository's hash width, so
     // the value can only be resolved once the repository is open. Outside one,
     // `cmd_shortlog()` pins SHA-1 (builtin/shortlog.c:421-422).
@@ -834,6 +823,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             AbbrevArg::Len(v) => crate::abbrev::parse_abbrev_arg(&v, hexsz),
         }
     });
+    // `revs->abbrev` is the length every id placeholder asks
+    // `repo_find_unique_abbrev()` for. Pushing it into the repository's config as
+    // `core.abbrev` is how `git log` hands the same knob to the shared expander.
+    if let (Some(repo), Some(n)) = (repo.as_mut(), opts.abbrev) {
+        let mut config = repo.config_snapshot_mut();
+        config.append_config(Some(format!("core.abbrev={n}")), gix::config::Source::Cli)?;
+        config.commit()?;
+    }
     // Outside a repository shortlog reads stdin and never reaches `commit_match()`.
     filters.commit_filter.output_encoding = repo.as_ref().map_or_else(
         || "UTF-8".to_string(),
@@ -1355,8 +1352,8 @@ fn int_arg(value: &str) -> Result<i32, ExitCode> {
 }
 
 /// git's `parse_date_format()`, reduced to the accept/reject decision. This
-/// only validates the `--date=<fmt>` spelling; the subset of formats that
-/// `%ad`/`%cd` can actually render byte-for-byte is mapped in `git_date_format`.
+/// only validates the `--date=<fmt>` spelling; [`expand_format`] renders the
+/// mode through the shared `show_date()` port.
 fn is_known_date_format(fmt: &str) -> bool {
     let fmt = fmt.strip_prefix("auto:").unwrap_or(fmt);
     if fmt.starts_with("format:") || fmt.starts_with("format-local:") {
@@ -1896,7 +1893,7 @@ fn one_record(
     } else {
         let text = match &opts.user_format {
             Some(fmt) => {
-                expand_format(repo, &commit, parents, mailmap, fmt, Render::from(opts))?
+                expand_format(repo, &commit, parents, fmt, opts)?
             }
             None => commit.message()?.summary().into_owned(),
         };
@@ -1933,7 +1930,7 @@ fn group_keys(
                 &mut keys,
             ),
             GroupBy::Format(fmt) => push(
-                expand_format(repo, commit, parents, mailmap, fmt, Render::from(opts))?,
+                expand_format(repo, commit, parents, fmt, opts)?,
                 &mut keys,
             ),
             GroupBy::Trailer(token) => {
@@ -1970,107 +1967,29 @@ fn group_keys(
     Ok(keys)
 }
 
-/// git's `repo_format_commit_message()` driver loop (pretty.c:2014), which is
-/// what `shortlog_add_commit()` reaches for both `--format=<fmt>` and each
-/// `--group=format:<fmt>` — so the column and wrap atoms work here exactly as
-/// they do under `git log`.
-///
-/// Literal text is copied, `%%` is expanded by `strbuf_expand_step()` before
-/// `format_commit_item()` is reached (so it is neither padded nor spends a
-/// pending field), and every other `%` placeholder goes through [`expand_one`] —
-/// directly, or into a measured buffer when a `%<`/`%>` atom left a field
-/// pending. A placeholder that consumes nothing still pads: git prints the `%`
-/// and rescans from the placeholder character *after* `format_and_pad_commit()`
-/// has laid out an empty field.
-///
-/// `format_and_pad_commit()`'s `%C…` chain is absent because [`expand_one`]
-/// refuses `%C` outright, so a colour atom can never open a chain here.
-///
-/// `render` carries the `--date=<fmt>` and `--abbrev` knobs
-/// (`None` = git's default ctime-like format).
-/// The `pretty_print_context` fields shortlog fills in before formatting:
-/// `ctx.date_mode` from `--date=<fmt>` and `ctx.abbrev` from `revs->abbrev`
-/// (builtin/shortlog.c:461-463).
-#[derive(Clone, Copy)]
-struct Render<'a> {
-    date_format: Option<&'a str>,
-    /// `None` is git's `DEFAULT_ABBREV`: let `core.abbrev` decide.
-    abbrev: Option<usize>,
-}
-
-impl<'a> Render<'a> {
-    fn from(opts: &'a Opts) -> Self {
-        Self {
-            date_format: opts.date_format.as_deref(),
-            abbrev: opts.abbrev,
-        }
-    }
-
-    /// `repo_find_unique_abbrev()` at this run's width: the configured default
-    /// when `--abbrev` was never given, and otherwise the requested floor,
-    /// widened until the prefix is unique.
-    fn short_id(&self, repo: &gix::Repository, id: &ObjectId) -> String {
-        match self.abbrev {
-            Some(len) => crate::abbrev::unique_abbrev(repo, id, len),
-            None => id.attach(repo).shorten_or_id().to_string(),
-        }
-    }
-}
-
+/// `repo_format_commit_message()` over the `pretty_print_context` that
+/// `shortlog_add_commit()` builds (builtin/shortlog.c:243-251): a user format
+/// with `ctx.abbrev` from `revs->abbrev`, `ctx.date_mode` from `--date=<fmt>` and
+/// nothing else set. It is what both `--format=<fmt>` and each
+/// `--group=format:<fmt>` expand through (:231, :257), so it is `pretty.c`'s one
+/// expander — the same one `git log` and `git rev-list` use — rather than a
+/// placeholder table of its own. `revs->abbrev` reaches it as the `core.abbrev`
+/// the repository was opened with (see [`shortlog`]).
 fn expand_format(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
     parents: Option<&[ObjectId]>,
-    mailmap: &crate::mailmap::Mailmap,
     fmt: &str,
-    render: Render<'_>,
+    opts: &Opts,
 ) -> Result<BString> {
-    let mut out: Vec<u8> = Vec::new();
-    let bytes = fmt.as_bytes();
-    // The deferred state `struct format_commit_context` carries: a column field a
-    // `%<`/`%>` atom is holding open, and the `%w()` wrap parameters.
-    let mut pad = PadState::default();
-    let mut wrap = WrapState::default();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'%' {
-            out.push(bytes[i]);
-            i += 1;
-            continue;
-        }
-        if bytes.get(i + 1) == Some(&b'%') {
-            out.push(b'%');
-            i += 2;
-            continue;
-        }
-        // The cursor sits on the placeholder character. `expand_one` advances it
-        // past whatever it consumes and leaves it untouched when it consumes
-        // nothing, which is how git rescans from that character.
-        let mut at = i + 1;
-        if pad.flush == FlushType::None {
-            if !expand_one(&mut out, repo, commit, parents, mailmap, bytes, &mut at, render, &mut pad, &mut wrap)? {
-                out.push(b'%');
-            }
-            i = at;
-            continue;
-        }
-        // `format_and_pad_commit()`: the placeholder renders into a buffer of its
-        // own so its *display* width can be measured. `padding` is read before it
-        // expands, so a nested `%<(…)` retargets the next field, not this one.
-        let padding = pad.padding;
-        let mut local: Vec<u8> = Vec::new();
-        let consumed =
-            expand_one(&mut local, repo, commit, parents, mailmap, bytes, &mut at, render, &mut pad, &mut wrap)?;
-        pad.apply(&mut out, local, padding, 0);
-        if !consumed {
-            out.push(b'%');
-        }
-        i = at;
-    }
-    // `repo_format_commit_message()` closes with a rewrap to width 0, which wraps
-    // whatever a trailing `%w()` was still governing.
-    wrap.rewrap_message_tail(&mut out, 0, 0, 0);
-    Ok(out.into())
+    let date_mode = match opts.date_format.as_deref() {
+        None => super::log::DateMode::Default,
+        Some(spec) => super::log::parse_date_mode(spec)
+            .ok_or_else(|| anyhow!("unknown date format {spec}"))?,
+    };
+    let pretty = super::log::Pretty::User(fmt.to_string());
+    let parents = ancestry(commit, parents);
+    Ok(super::log::rev_list_pretty_body(repo, commit, &pretty, &date_mode, &parents)?.into())
 }
 
 /// The parent list `%p`/`%P` print: the simplified one when a path limit produced
@@ -2080,249 +1999,6 @@ fn ancestry(commit: &gix::Commit<'_>, parents: Option<&[ObjectId]>) -> Vec<Objec
         Some(list) => list.to_vec(),
         None => commit.parent_ids().map(|id| id.detach()).collect(),
     }
-}
-
-/// `format_commit_one()`: expand the single placeholder at `bytes[*at]`,
-/// advancing `*at` past whatever it consumes.
-///
-/// `Ok(false)` is git's "consumed 0 bytes" — the placeholder is not one git
-/// expands, nothing was written, and `*at` is left on the placeholder character
-/// so the caller can print the `%` and rescan. A placeholder git *does* expand
-/// but this port does not render identically bails instead, rather than emitting
-/// something divergent.
-#[allow(clippy::too_many_arguments)]
-fn expand_one(
-    out: &mut Vec<u8>,
-    repo: &gix::Repository,
-    commit: &gix::Commit<'_>,
-    parents: Option<&[ObjectId]>,
-    mailmap: &crate::mailmap::Mailmap,
-    bytes: &[u8],
-    at: &mut usize,
-    render: Render<'_>,
-    pad: &mut PadState,
-    wrap: &mut WrapState,
-) -> Result<bool> {
-    let start = *at;
-    // Every early return that means "git consumed nothing" rewinds to here.
-    let unconsumed = |at: &mut usize| {
-        *at = start;
-        Ok(false)
-    };
-    let Some(&next) = bytes.get(start) else {
-        // A trailing `%`: `format_commit_one()` switches on the NUL and returns 0,
-        // so git prints the `%` — after padding an empty field, when one is open.
-        return unconsumed(at);
-    };
-
-    // `%(...)`: the groups git recognises do real work this port does not
-    // implement. Anything else is unknown to git too — it consumes nothing, so
-    // the `%` prints and `(foo)` is rescanned as literal text.
-    if next == b'(' {
-        let Some(end) = bytes[start + 1..].iter().position(|&b| b == b')') else {
-            return unconsumed(at);
-        };
-        let inner = String::from_utf8_lossy(&bytes[start + 1..start + 1 + end]).into_owned();
-        for known in ["trailers", "describe", "decorate", "wrap", "ahead-behind"] {
-            if inner == known || inner.starts_with(&format!("{known}:")) {
-                bail!("`--format` placeholder `%({inner})` is not ported");
-            }
-        }
-        return unconsumed(at);
-    }
-
-    // The column atoms `%<(<N>)`, `%>(<N>)`, `%><(<N>)`, `%>>(<N>)` and their
-    // `|`/`trunc`/`ltrunc`/`mtrunc` forms: they expand to nothing and leave the
-    // field pending for the next placeholder.
-    if next == b'<' || next == b'>' {
-        return Ok(match pad.parse(bytes, start) {
-            Some(consumed) => {
-                *at = start + consumed;
-                true
-            }
-            None => false,
-        });
-    }
-    // `%w(<width>,<indent1>,<indent2>)`: everything emitted after it is re-wrapped
-    // to that width when the parameters next change.
-    if next == b'w' {
-        return Ok(match wrap.parse_and_apply(out, bytes, start) {
-            Some(consumed) => {
-                *at = start + consumed;
-                true
-            }
-            None => false,
-        });
-    }
-
-    let mut i = start + 1;
-    {
-        match next {
-            b'n' => out.push(b'\n'),
-            b'H' => out.extend_from_slice(commit.id.to_string().as_bytes()),
-            b'h' => out.extend_from_slice(render.short_id(repo, &commit.id).as_bytes()),
-            b'T' => out.extend_from_slice(commit.tree_id()?.to_string().as_bytes()),
-            b't' => {
-                let tree = commit.tree_id()?.detach();
-                out.extend_from_slice(render.short_id(repo, &tree).as_bytes());
-            }
-            // `%P`/`%p` read `commit->parents`, which history simplification has
-            // already rewritten in place by the time a record is formatted.
-            b'P' => {
-                for (n, parent) in ancestry(commit, parents).into_iter().enumerate() {
-                    if n > 0 {
-                        out.push(b' ');
-                    }
-                    out.extend_from_slice(parent.to_string().as_bytes());
-                }
-            }
-            b'p' => {
-                for (n, parent) in ancestry(commit, parents).into_iter().enumerate() {
-                    if n > 0 {
-                        out.push(b' ');
-                    }
-                    out.extend_from_slice(render.short_id(repo, &parent).as_bytes());
-                }
-            }
-            b's' => {
-                let message = commit.message()?;
-                out.extend_from_slice(message.summary().as_bytes());
-            }
-            // `%B`: the raw body — the commit message exactly as stored, from
-            // the first byte after the header separator. git's
-            // `msg + message_off + 1`; gix's `message_raw()` returns the same
-            // slice (the bytes after the header block).
-            b'B' => out.extend_from_slice(commit.message_raw()?),
-            b'x' => match bytes.get(i..i + 2) {
-                // git's `%x##` needs exactly two hex digits (its `isxdigit`
-                // test, which — unlike `from_str_radix` — rejects a `+`/`-` sign).
-                Some(h) if h[0].is_ascii_hexdigit() && h[1].is_ascii_hexdigit() => {
-                    let hi = (h[0] as char).to_digit(16).unwrap();
-                    let lo = (h[1] as char).to_digit(16).unwrap();
-                    out.push((hi * 16 + lo) as u8);
-                    i += 2;
-                }
-                // Otherwise `format_commit_one()` consumes nothing: the `%` prints
-                // and `x` plus the trailing bytes are rescanned as literals.
-                _ => return unconsumed(at),
-            },
-            b'a' | b'c' => {
-                let raw = if next == b'a' {
-                    commit.author()?
-                } else {
-                    commit.committer()?
-                };
-                let sig = raw.trim();
-                let Some(&which) = bytes.get(i) else {
-                    // `%a`/`%c` at end of string: git's `format_person_part`
-                    // sees a NUL sub-form and returns 0 (unknown), so the driver
-                    // prints the `%` and rescans from the `a`, giving `end%a` →
-                    // `end%a` — and, inside a pending field, an empty field first.
-                    return unconsumed(at);
-                };
-                i += 1;
-                // `format_person_part()` (pretty.c:806-807): `mailmap_name()`.
-                let (mut mapped_name, mut mapped_email): (&[u8], &[u8]) = (sig.name, sig.email);
-                mailmap.map_user(&mut mapped_email, &mut mapped_name);
-                match which {
-                    b'n' => out.extend_from_slice(sig.name),
-                    b'e' => out.extend_from_slice(sig.email),
-                    b'N' => out.extend_from_slice(mapped_name),
-                    b'E' => out.extend_from_slice(mapped_email),
-                    // `%al`/`%aL`: the local-part of the email (up to the first
-                    // `@`). git's `format_person_part` runs the mailmap for `L`
-                    // (part `N`/`E`/`L`) before taking the local-part, so `L`
-                    // reads the resolved address and `l` the commit's own.
-                    b'l' => out.extend_from_slice(local_part(sig.email)),
-                    b'L' => out.extend_from_slice(local_part(mapped_email.as_bstr())),
-                    // Date sub-forms. `%at`/`%ct` epoch, `%ai`/`%ci` ISO,
-                    // `%aI`/`%cI` strict ISO, `%aD`/`%cD` RFC2822, `%as`/`%cs`
-                    // short (always, independent of `--date`), `%ad`/`%cd` the
-                    // `--date`-controlled format. All read the ident's own
-                    // timezone offset, matching git.
-                    b't' | b'i' | b'I' | b'D' | b'd' | b's' => {
-                        let time = raw.time().map_err(|e| anyhow!("{e}"))?;
-                        out.extend_from_slice(sig_date(time, which, render.date_format)?.as_bytes());
-                    }
-                    // `%ar`/`%cr`: relative date, rendered by the shared
-                    // `show_date_relative` port against git's "now" reference.
-                    b'r' => {
-                        let time = raw.time().map_err(|e| anyhow!("{e}"))?;
-                        out.extend_from_slice(
-                            crate::date::show_date_relative(
-                                time.seconds,
-                                crate::date::now_seconds(),
-                            )
-                            .as_bytes(),
-                        );
-                    }
-                    // `%ah`/`%ch`: human dates need git's separate rounding;
-                    // left as an honest floor rather than a divergent render.
-                    b'h' => bail!(
-                        "`--format` placeholder `%{}{}` is not ported",
-                        next as char,
-                        which as char
-                    ),
-                    // Any other sub-form is unknown to git, whose
-                    // `format_person_part` returns 0: the driver prints the `%`
-                    // and rescans, so both letters come back as literals
-                    // (`%aZ` → `%aZ`). Match it.
-                    _ => return unconsumed(at),
-                }
-            }
-            other => bail!("`--format` placeholder `%{}` is not ported", other as char),
-        }
-    }
-    *at = i;
-    Ok(true)
-}
-
-/// Format an ident timestamp for the `%ad`/`%cd` placeholder family. `which` is
-/// the character after `%a`/`%c`, already restricted by the caller to a date
-/// sub-form. The offset carried by `time` is the ident's own, matching git.
-fn sig_date(time: gix::date::Time, which: u8, date_format: Option<&str>) -> Result<String> {
-    use gix::date::time::format as dfmt;
-    let fmt: gix::date::time::Format = match which {
-        b't' => return Ok(time.seconds.to_string()),
-        b'i' => dfmt::ISO8601.into(),
-        b'I' => dfmt::ISO8601_STRICT.into(),
-        b'D' => dfmt::GIT_RFC2822.into(),
-        // `%as`/`%cs` is always the short date, independent of `--date`
-        // (git's `show_ident_date(&s, DATE_MODE(SHORT))`).
-        b's' => dfmt::SHORT.into(),
-        // `%ad`/`%cd` honour `--date`. `relative` is rendered by the shared
-        // port; the other unmapped selectors (human/local/format:) still bail.
-        _ => {
-            if date_format == Some("relative") {
-                return Ok(crate::date::show_date_relative(
-                    time.seconds,
-                    crate::date::now_seconds(),
-                ));
-            }
-            match git_date_format(date_format) {
-                Some(f) => f,
-                None => bail!("`--format` %ad/%cd with --date={date_format:?} is not ported"),
-            }
-        }
-    };
-    time.format(fmt).map_err(|e| anyhow!("{e}"))
-}
-
-/// Map git's `--date=<fmt>` selector to the gitoxide date format that renders it
-/// identically. `None` means git's default (ctime-like) format; an unmappable
-/// selector (relative, human, `*-local`, `format:…`, `auto:…`) returns `None`.
-fn git_date_format(spec: Option<&str>) -> Option<gix::date::time::Format> {
-    use gix::date::time::format as dfmt;
-    Some(match spec {
-        None | Some("default") => dfmt::DEFAULT.into(),
-        Some("iso" | "iso8601") => dfmt::ISO8601.into(),
-        Some("iso-strict" | "iso8601-strict") => dfmt::ISO8601_STRICT.into(),
-        Some("short") => dfmt::SHORT.into(),
-        Some("rfc" | "rfc2822") => dfmt::GIT_RFC2822.into(),
-        Some("unix") => dfmt::UNIX,
-        Some("raw") => dfmt::RAW,
-        _ => return None,
-    })
 }
 
 /// Port of `parse_uint()` from `builtin/shortlog.c`: read a decimal run, require
@@ -2373,16 +2049,6 @@ fn parse_wrap_args(opts: &mut Opts, arg: Option<&str>) -> bool {
         return false;
     }
     true
-}
-
-/// git's `%al`/`%aL` local-part: the email up to the first `@`, or the whole
-/// address when it carries none (`format_person_part`, pretty.c).
-fn local_part(email: &BStr) -> &[u8] {
-    let bytes = email.as_bytes();
-    match bytes.iter().position(|&b| b == b'@') {
-        Some(at) => &bytes[..at],
-        None => bytes,
-    }
 }
 
 /// The group key: the mailmap-resolved name, plus ` <email>` under `-e`.
@@ -2816,27 +2482,4 @@ fn tree_object(repo: &gix::Repository, id: ObjectId) -> Option<gix::Tree<'_>> {
         return None;
     }
     Some(object.into_tree())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// git's `%al`/`%aL` take the email up to the *first* `@`; an address with
-    /// none is emitted whole. The primary case is verified against
-    /// `git log -1 --format='%al'` (→ `local` for `local@example.com`); the
-    /// first-`@` rule is pinned to pretty.c's `memchr(mail, '@', maillen)`.
-    #[test]
-    fn local_part_matches_git() {
-        fn lp(s: &[u8]) -> &[u8] {
-            local_part(s.as_bstr())
-        }
-        assert_eq!(lp(b"local@example.com"), &b"local"[..]);
-        // No `@`: the whole string is the local-part (git's memchr misses).
-        assert_eq!(lp(b"nobody"), &b"nobody"[..]);
-        // Two `@`: git stops at the first (memchr), keeping the rest verbatim.
-        assert_eq!(lp(b"a@b@c"), &b"a"[..]);
-        // Empty email → empty local-part.
-        assert_eq!(lp(b""), &b""[..]);
-    }
 }

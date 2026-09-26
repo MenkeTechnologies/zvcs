@@ -1006,7 +1006,13 @@ fn switch_create(
     })?;
 
     if let Some((cur_tree, target_tree)) = trees {
-        let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: branch });
+        // The `-m` labels come from `new_branch_info->name`, which for `-c`/`-C` is the
+        // start-point as `parse_branchname_arg()` left it, not the branch being created:
+        // `apply_autostash_ref(…, new_branch_info->name, "local", …)` and the
+        // `autostash while switching to '%s'` message (builtin/checkout.c:1218-1242).
+        // `trees` is only `Some` when a start-point was given.
+        let label = start_reflog.or(start).unwrap_or("HEAD");
+        let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: label });
         match move_worktree(
             repo,
             cur_tree,

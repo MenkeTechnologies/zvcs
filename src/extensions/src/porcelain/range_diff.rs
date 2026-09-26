@@ -106,6 +106,12 @@
 //!   strongest bit given, as `xdl_recmatch()` tests them (xdiff/xutils.c:173-222),
 //!   context lines print from the post-image, and the stat group counts under
 //!   the same flags. Like the algorithm, they never reach [`diffsize`].
+//! * The outer hunk geometry `xdl_emit_diff()` owns: `-W` / `--function-context`
+//!   (grown to the lines the `section_headers` driver matches),
+//!   `--inter-hunk-context=<n>`, and the `ignore` bit `--ignore-blank-lines` and
+//!   `-I<regex>` set on an all-blank or all-matching change. A pair those flags
+//!   reduce to no `+`/`-` record has no stat row either, as `builtin_diffstat()`
+//!   drops it (diff.c:4256-4273).
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
@@ -232,9 +238,8 @@
 //!   `diff_opt_find_object()` resolves against the repository before it records
 //!   anything (diff.c:5531). A malformed value for any of them is the 129
 //!   `error:` upstream reports at parse time, not a deferred `unsupported
-//!   flag`. An `--inter-hunk-context` or `--find-object` value upstream accepts
-//!   is deferred like the rest, because honouring it would change the rendered
-//!   patch text.
+//!   flag`. A `--find-object` value upstream accepts is deferred like the rest,
+//!   because honouring it would change the rendered patch text.
 //!
 //! An option this port does not recognise at all is deferred too, rather than
 //! rejected: upstream accepts the whole `git diff` option list here, and
@@ -258,15 +263,10 @@
 //!   `diffcore_std()` never reaches the pickaxe unless one of those three set a
 //!   kind bit (diff.c:7517). All five contribute their `pickaxe_opts` bit, for
 //!   the three refusals listed above.
-//! * `--inter-hunk-context=<n>`, which merges hunks closer than `<n>` context
-//!   lines: gitoxide's `UnifiedDiff` exposes only a symmetrical context size, so
-//!   the merging has no counterpart here.
 //! * `--anchored=<text>`, which is patience diff plus anchor lines; gitoxide's
 //!   `Algorithm::Patience` takes no anchors.
-//! * `--ignore-blank-lines` and `-I<regex>`, the rename and
-//!   copy detection flags, `--word-diff`, `--color-moved`, `-R`,
-//!   `--function-context`, `--diff-filter`, `--rotate-to` / `--skip-to`,
-//!   `--ext-diff` and `-O`.
+//! * The rename and copy detection flags, `--word-diff`, `--color-moved`, `-R`,
+//!   `--diff-filter`, `--rotate-to` / `--skip-to`, `--ext-diff` and `-O`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -913,6 +913,20 @@ struct Opts {
     /// outer diff compares records under. Like the algorithm, they never reach
     /// [`diffsize`].
     ws: diff::Whitespace,
+    /// `-W` / `--function-context`: `flags.funccontext` (diff.c:6054), which
+    /// `builtin_diff()` turns into `XDL_EMIT_FUNCCONTEXT` (diff.c:4061-4062) — each
+    /// outer hunk grows to the enclosing ` ## <section> ##` or inner `@@` line
+    /// the `section_headers` driver finds.
+    func_context: bool,
+    /// `--inter-hunk-context=<n>`: `xecfg.interhunkctxlen`, the gap two outer
+    /// changes may span and still share one hunk.
+    inter_hunk_ctx: usize,
+    /// `--ignore-blank-lines` (`XDF_IGNORE_BLANK_LINES`, diff.c:6208-6210) and
+    /// `-I<regex>` (`xpp.ignore_regex`, diff.c:5859-5877): an outer change whose
+    /// every record is blank, or matches one of the patterns, gets no hunk of its
+    /// own.
+    ignore_blank_lines: bool,
+    ignore_lines: Vec<super::diff_pickaxe::Needle>,
     /// `diffopt.context`: `-U<n>` / `--unified=<n>` (diff.c:5945-5960),
     /// three lines by default.
     context: u32,
@@ -977,6 +991,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         algorithm: Algorithm::Myers,
         indent_heuristic: true,
         ws: diff::Whitespace::Keep,
+        func_context: false,
+        inter_hunk_ctx: 0,
+        ignore_blank_lines: false,
+        ignore_lines: Vec::new(),
         context: 3,
         indicators: [b'+', b'-', b' '],
         output: None,
@@ -1375,6 +1393,32 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
             "--ignore-space-at-eol" => opts.ws = opts.ws.with(diff::Whitespace::IgnoreAtEol),
             "--ignore-cr-at-eol" => opts.ws = opts.ws.with(diff::Whitespace::IgnoreCrAtEol),
+            // `OPT_BOOL('W', "function-context")` (diff.c:6054), negatable.
+            "-W" | "--function-context" => opts.func_context = true,
+            "--no-function-context" => opts.func_context = false,
+            "--ignore-blank-lines" => opts.ignore_blank_lines = true,
+            // `diff_opt_ignore_regex()` (diff.c:5859-5877) compiles each pattern as it
+            // is met, so a bad one is the 129 `error:` at parse time. The value is
+            // glued on or the next argv element.
+            _ if name == "--ignore-matching-lines" || name.starts_with("-I") => {
+                let value = match name.strip_prefix("-I") {
+                    Some(v) if !v.is_empty() => v.to_string(),
+                    // parse-options names a short option a `switch`.
+                    Some(_) if i + 1 >= args.len() => {
+                        return Ok(option_error("switch `I' requires a value"))
+                    }
+                    _ => match required_value(args, &mut i, name, inline) {
+                        Ok(v) => v,
+                        Err(code) => return Ok(code),
+                    },
+                };
+                match super::diff_pickaxe::compile_regex(value.as_bytes()) {
+                    Ok(re) => opts.ignore_lines.push(super::diff_pickaxe::Needle::Regex(re)),
+                    Err(_) => {
+                        return Ok(option_error(&format!("invalid regex given to -I: '{value}'")))
+                    }
+                }
+            }
             "--indent-heuristic" => opts.indent_heuristic = true,
             "--no-indent-heuristic" => opts.indent_heuristic = false,
             // `-U<n>` / `--unified[=<n>]`, the context size of the
@@ -1480,8 +1524,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 // `interhunkcontext` has 4-byte precision, so the bound is
                 // `UINTMAX_MAX >> (64 - 32)` = `u32::MAX`.
                 match git_parse_unsigned(&arg, u32::MAX as u64) {
-                    // Accepted by upstream but not rendered by this port.
-                    Ok(_) => opts.defer(unsupported_flag(a)),
+                    Ok(n) => opts.inter_hunk_ctx = n as usize,
                     Err(MagnitudeError::Range) => {
                         return Ok(option_error(&format!(
                             "value {arg} for option `inter-hunk-context' not in range \
@@ -1897,6 +1940,10 @@ pub(super) fn show_range_diff(
         algorithm: Algorithm::Myers,
         indent_heuristic: true,
         ws: diff::Whitespace::Keep,
+        func_context: false,
+        inter_hunk_ctx: 0,
+        ignore_blank_lines: false,
+        ignore_lines: Vec::new(),
         context: 3,
         indicators: [b'+', b'-', b' '],
         output: None,
@@ -4046,8 +4093,17 @@ fn flush_pair(
     // separator (diff.c:6549-6566).
     let dirstat_by_line = fmt & FMT_DIRSTAT != 0 && opts.dirstat_by_line;
     if fmt & FMT_STAT_GROUP != 0 || dirstat_by_line {
-        if !unmodified {
-            let (added, deleted) = outer_diff_counts(a, b, opts);
+        // `builtin_diffstat()` drops a modified pair whose xdiff emitted no `+`/`-`
+        // record at all — "Even if may_differ, this might be the case due to
+        // ignoring whitespace changes, etc." (diff.c:4256-4273) — which leaves
+        // `data->nr == 0`, and every stat renderer then returns without a byte. An
+        // identical pair and one that `-w` or `--ignore-blank-lines` reduced to
+        // nothing both end there.
+        let (added, deleted) = match unmodified {
+            true => (0, 0),
+            false => outer_diff_counts(a, b, opts),
+        };
+        if added + deleted != 0 {
             let files = [diffstat::StatFile::text(RENAME_NAME.to_vec(), added, deleted)];
             if fmt & FMT_NUMSTAT != 0 {
                 // `show_numstat()` (diff.c:2892): a renamed row prints
@@ -4103,7 +4159,7 @@ fn outer_diff_counts(a: &[u8], b: &[u8], opts: &Opts) -> (u64, u64) {
     let changes = outer_changes(&before, &after, opts);
     let geom = diff_pairs::EmitGeometry {
         ctx: opts.context as usize,
-        inter_hunk_ctx: 0,
+        inter_hunk_ctx: opts.inter_hunk_ctx,
         func_context: false,
         funcname: Some(section_headers()),
     };
@@ -4124,19 +4180,29 @@ impl diff_pairs::EmitSink for NoSink {
 /// `--ignore-space-at-eol`/`--ignore-cr-at-eol` bits `add_diff_options()` sets on
 /// `diffopt` (diff.c:6196-6207) — by interning each one's whitespace-normalized
 /// form, while [`diff_pairs::compute_compacted`] slides the groups over the
-/// original bytes, as `xdl_change_compact()` does. The same path `git diff` takes.
+/// original bytes, as `xdl_change_compact()` does. A change whose every record is
+/// blank under `--ignore-blank-lines` (`xdl_mark_ignorable_lines()`), or matches an
+/// `-I` pattern (`xdl_mark_ignorable_regex()`, which skips a change the first pass
+/// already marked, xdiff/xdiffi.c:1070-1074), carries the `ignore` bit
+/// `xdl_get_hunk()` weighs. The same path `git diff` takes.
 fn outer_changes(before: &[&[u8]], after: &[&[u8]], opts: &Opts) -> Vec<diff_pairs::Change> {
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
     input.update_before(before.iter().map(|l| diff::normalize_line(l, opts.ws)));
     input.update_after(after.iter().map(|l| diff::normalize_line(l, opts.ws)));
     let diff = diff_pairs::compute_compacted(opts.algorithm, &input, before, after, opts.indent_heuristic);
     diff.hunks()
-        .map(|h| diff_pairs::Change {
-            i1: h.before.start as usize,
-            chg1: h.before.len(),
-            i2: h.after.start as usize,
-            chg2: h.after.len(),
-            ignore: false,
+        .map(|h| {
+            let (i1, chg1) = (h.before.start as usize, h.before.len());
+            let (i2, chg2) = (h.after.start as usize, h.after.len());
+            let all = |pred: &dyn Fn(&[u8]) -> bool| {
+                before[i1..i1 + chg1].iter().all(|l| pred(l))
+                    && after[i2..i2 + chg2].iter().all(|l| pred(l))
+            };
+            let ignore = (opts.ignore_blank_lines
+                && all(&|l| diff::is_blank_record(l, opts.ws)))
+                || (!opts.ignore_lines.is_empty()
+                    && all(&|l| opts.ignore_lines.iter().any(|p| p.is_match(l))));
+            diff_pairs::Change { i1, chg1, i2, chg2, ignore }
         })
         .collect()
 }
@@ -4155,6 +4221,7 @@ fn section_headers() -> &'static crate::userdiff::FuncName {
         .expect("the built-in section_headers patterns compile")
     })
 }
+
 /// `builtin_checkdiff()` (diff.c:3808) driving `checkdiff_consume()`
 /// (diff.c:3196) over the outer diff.
 ///
@@ -4257,8 +4324,8 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
     };
     let geom = diff_pairs::EmitGeometry {
         ctx: opts.context as usize,
-        inter_hunk_ctx: 0,
-        func_context: false,
+        inter_hunk_ctx: opts.inter_hunk_ctx,
+        func_context: opts.func_context,
         funcname: Some(section_headers()),
     };
     diff_pairs::emit_hunks(&before, &after, &changes, &geom, &mut sink);

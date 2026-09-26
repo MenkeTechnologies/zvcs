@@ -7360,7 +7360,7 @@ fn text_hunks(
 /// `xdl_blankline()`: with no whitespace option in force a record is blank only when
 /// it is empty or a bare terminator; once any `XDF_WHITESPACE_FLAGS` bit is set, any
 /// record made entirely of whitespace counts.
-fn is_blank_record(line: &[u8], ws: Whitespace) -> bool {
+pub(crate) fn is_blank_record(line: &[u8], ws: Whitespace) -> bool {
     if ws == Whitespace::Keep {
         return line.len() <= 1;
     }

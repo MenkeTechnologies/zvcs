@@ -2239,7 +2239,16 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let branch_arg = commit_ish.unwrap_or("HEAD");
+    // `dwim_branch()` (builtin/worktree.c:765-778) hands back the basename itself when
+    // `refs/heads/<basename>` exists, and `add()` makes it `branch` (worktree.c:890-892): every
+    // later `lookup_commit_reference_by_name(branch)` asks about that name, not `HEAD`.
+    let dwim_existing = commit_ish.is_none()
+        && new_branch.is_none()
+        && !detach
+        && !orphan
+        && super::branch::valid_branch_name(&dwim_name)
+        && repo.try_find_reference(format!("refs/heads/{dwim_name}").as_str()).ok().flatten().is_some();
+    let branch_arg = if dwim_existing { dwim_name.as_str() } else { commit_ish.unwrap_or("HEAD") };
     if commit_ish.is_some() && !detach {
         crate::objname::warn_ambiguous_refname(&repo, branch_arg);
     }
@@ -2976,6 +2985,19 @@ fn resolve_start(
         }
         // No commit-ish: `-b $(basename <path>)` off HEAD, or a detached HEAD.
         None => {
+            // `dwim_branch()` (builtin/worktree.c:765-778): when `refs/heads/<basename>`
+            // already exists, that branch *is* the `<commit-ish>` — `return branchname`
+            // leaves `new_branch` NULL, so `add()` checks the existing branch out
+            // ("checking out '<name>'") instead of asking `git branch` to create it.
+            if !detach {
+                if let Some(existing) = FullName::try_from(format!("refs/heads/{dwim_name}"))
+                    .ok()
+                    .and_then(|full| repo.try_find_reference(full.as_bstr()).ok().flatten())
+                {
+                    let oid = peel(existing.name().as_bstr().to_str_lossy().as_ref())?;
+                    return Ok(Start::Branch(existing.name().to_owned(), oid));
+                }
+            }
             // `dwim_branch()`'s remote guess, when `worktree.guessRemote` found
             // exactly one remote-tracking branch of that name: the *start point*
             // becomes that ref, so the new branch begins at the remote's tip and

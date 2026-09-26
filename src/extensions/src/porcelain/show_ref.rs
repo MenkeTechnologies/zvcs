@@ -585,10 +585,45 @@ fn resolve_exact<'repo>(
     Some((id, reference))
 }
 
-/// The id this ref peels to once annotated tags are unwrapped, or `None` when
-/// there is nothing to unwrap (git only prints a `^{}` line for tag objects).
+/// `reference_get_peeled_oid()` (refs.c:2486-2496): the `^` line packed-refs
+/// recorded for the ref, taken as given, or else `peel_object()`. `None` is
+/// its non-zero return, for which `show_one()` prints no `^{}` line
+/// (builtin/show-ref.c:56-59).
 fn peeled(reference: &mut gix::Reference<'_>) -> Option<ObjectId> {
-    reference.peel_to_id().ok().map(|id| id.detach())
+    if let Some(recorded) = reference.inner.peeled {
+        return Some(recorded);
+    }
+    let id = reference.follow_to_object().ok()?.detach();
+    peel_object(reference.repo, id)
+}
+
+/// `peel_object()` (object.c:211-250) without `PEEL_OBJECT_VERIFY_TAGGED_OBJECT_TYPE`.
+///
+/// A ref that is not a tag is `PEEL_NON_TAG`, and an object that cannot be read
+/// on the way is `PEEL_INVALID` — both `None`. Each tag in the chain is parsed,
+/// but its target is only *looked up* under the type the tag's `type` header
+/// names, so the walk stops at the first target that header says is not a tag
+/// without opening it: a tag whose target commit is missing still peels, to
+/// that commit's id.
+fn peel_object(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    if repo.find_header(id).ok()?.kind() != gix::object::Kind::Tag {
+        return None;
+    }
+    let mut current = id;
+    loop {
+        let object = repo.find_object(current).ok()?;
+        if object.kind != gix::object::Kind::Tag {
+            // `parse_object()` on an id already typed as a tag that turns out
+            // to be something else fails the type check and returns NULL.
+            return None;
+        }
+        let tag = gix::objs::TagRef::from_bytes(&object.data, repo.object_hash()).ok()?;
+        let target = tag.target();
+        if tag.target_kind != gix::object::Kind::Tag {
+            return Some(target);
+        }
+        current = target;
+    }
 }
 
 /// Whether a ref is inside the `--branches` / `--tags` selection.

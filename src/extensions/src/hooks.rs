@@ -243,7 +243,34 @@ pub fn run_with_env(
     // zvcs: commit: No such file or directory (os error 2)
     // ```
     let workdir = absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir()));
-    let program = absolutize(&path);
+    // What the exec is handed is also what the hook sees as its own name — the
+    // kernel passes a `#!` script the pathname given to `execve()`, so `$0` is
+    // `.git/hooks/pre-commit` under git and a hook's `dirname "$0"` is relative
+    // to the work tree root it runs in. So git's spelling is exec'd when it is
+    // relative and names this same file from the child's directory (`Command`
+    // resolves a relative program containing `/` after the child's `chdir`).
+    //
+    // That spelling is only trusted for a *discovered* repository, where
+    // `setup_discovered_git_dir()` leaves `.git` relative to the top it moved
+    // to. An explicit `GIT_DIR` or `GIT_WORK_TREE` (`--git-dir`/`--work-tree`
+    // arrive as those variables) goes through `setup_explicit_git_dir()`, whose
+    // git directory is made absolute whenever setup changes directory — measured
+    // on 2.55.0, `cd sub && git --work-tree=.. commit` runs
+    // `<abs>/.git/hooks/pre-commit` — and [`git_dir_as_git_spells_it`] does not
+    // model that, so those runs keep the absolute path, as does a spelling
+    // without a `/` that `execvp()` would look up on `PATH`.
+    let discovered = std::env::var_os("GIT_DIR").is_none()
+        && std::env::var_os("GIT_WORK_TREE").is_none();
+    let program = match Path::new(&shown) {
+        rel if discovered
+            && rel.is_relative()
+            && shown.contains('/')
+            && lexical_normalize(&workdir.join(rel)) == absolutize(&path) =>
+        {
+            rel.to_path_buf()
+        }
+        _ => absolutize(&path),
+    };
     let mut cmd = Command::new(&program);
     cmd.args(args)
         .current_dir(&workdir)

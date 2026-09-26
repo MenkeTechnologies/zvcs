@@ -65,10 +65,9 @@ use anyhow::{anyhow, Result};
 // Every `print!`/`println!` below goes through git's stdout buffer; see
 // `crate::cstdio` and the `defer()` call in `switch()`.
 use crate::cstdio::{print, println};
-use std::io::Write as _;
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, BString, ByteSlice};
+use gix::bstr::{BStr, ByteSlice};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
@@ -382,7 +381,10 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
                     'q' => p.quiet = true,
                     'd' => p.detach = true,
                     'f' => p.force = true,
-                    't' => p.track = Some(true),
+                    't' => {
+                        p.track_inherit = false;
+                        p.track = Some(true);
+                    }
                     'c' | 'C' => {
                         let rest = &shorts[next_off..];
                         let value = if rest.is_empty() {
@@ -580,6 +582,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         }
         return switch_detach(&repo, &p.positionals, discard, p.quiet, merge_style, guess);
     }
+    let track = resolve_track(&repo, p.track, p.track_inherit);
     if let Some(name) = p.force_create {
         // `-C` resets the branch, and `create_branch()` refuses to move one that
         // another worktree has checked out (branch.c:400, through
@@ -589,8 +592,8 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         {
             return Ok(code);
         }
-        return switch_create(&repo, name, true, &p.positionals, None, p.quiet, discard, p.track,
-            p.track_inherit, merge_style);
+        return switch_create(&repo, name, true, &p.positionals, None, p.quiet, discard, track,
+            merge_style);
     }
     if let Some(name) = p.create.map(str::to_string).or(create_from_track) {
         return switch_create(
@@ -601,8 +604,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
             None,
             p.quiet,
             discard,
-            p.track,
-            p.track_inherit,
+            track,
             merge_style,
         );
     }
@@ -740,7 +742,8 @@ fn switch_existing(
                     let sp = [remote_short.as_str()];
                     let full_remote = format!("refs/remotes/{remote_short}");
                     return switch_create(
-                        repo, branch, false, &sp, Some(&full_remote), quiet, force, None, false,
+                        repo, branch, false, &sp, Some(&full_remote), quiet, force,
+                        resolve_track(repo, None, false),
                         merge_style,
                     );
                 }
@@ -836,9 +839,8 @@ fn switch_create(
     start_reflog: Option<&str>,
     quiet: bool,
     force: bool,
-    track: Option<bool>,
-    // `--track=inherit`: take the start-point branch's upstream, not the start-point itself.
-    track_inherit: bool,
+    // `opts->track`, already resolved against `branch.autoSetupMerge`; see [`resolve_track`].
+    track: super::branch::Track,
     merge_style: Option<&str>,
 ) -> Result<ExitCode> {
     // `old_branch_info.commit`, for the post-checkout hook at the tail.
@@ -881,31 +883,14 @@ fn switch_create(
                     return fatal(format!("Cannot switch branch to a non-commit '{s}'"))
                 }
             };
-            // `create_branch()` hands the start-point to `dwim_branch_start()`
-            // (branch.c:539-594), which resolves it a *second* time and then
-            // DWIMs it — so the name warns twice and more than one matching ref
-            // is fatal before the branch exists:
-            //
-            // ```c
-            // if (repo_get_oid_mb(r, start_name, &oid)) { … }
-            // switch (repo_dwim_ref(r, start_name, strlen(start_name), &oid, &real_ref, 0)) {
-            // …
-            // default:
-            //         die(_("ambiguous object name: '%s'"), start_name);
-            // }
-            // ```
-            crate::objname::warn_ambiguous_refname(repo, s);
-            if super::rev_parse::dwim_ref_matches(repo, s).len() > 1 {
-                return fatal(format!("ambiguous object name: '{s}'"));
-            }
+            // The second resolution — `create_branch()`'s `dwim_branch_start()`,
+            // with its second ambiguity warning and its `ambiguous object name`
+            // die — happens after the worktree has moved; see below.
             commit
         }
         None => current_commit,
     };
     let from_desc = describe_head(repo)?;
-
-    // Determine the upstream ref this branch should track, if any.
-    let upstream = tracking_upstream(repo, start, track, track_inherit, branch);
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -915,12 +900,11 @@ fn switch_create(
     }
 
     // Unborn HEAD with no start-point: point HEAD at the new branch; the ref
-    // materialises with the first commit.
+    // materialises with the first commit. `switch_unborn_to_new_branch()`
+    // (builtin/checkout.c:1551-1567) only repoints `HEAD`: no `create_branch()`,
+    // so no tracking is set up whatever `--track` says.
     let Some(start_commit) = start_commit else {
         attach_head(repo, &full_name, &from_desc, branch)?;
-        if let Some(up) = &upstream {
-            install_tracking(repo, branch, up, quiet)?;
-        }
         if !quiet {
             eprintln!("Switched to a new branch '{branch}'");
         }
@@ -969,6 +953,50 @@ fn switch_create(
         None
     };
 
+    if let Some((cur_tree, target_tree)) = trees {
+        // The `-m` labels come from `new_branch_info->name`, which for `-c`/`-C` is the
+        // start-point as `parse_branchname_arg()` left it, not the branch being created:
+        // `apply_autostash_ref(…, new_branch_info->name, "local", …)` and the
+        // `autostash while switching to '%s'` message (builtin/checkout.c:1218-1242).
+        // `trees` is only `Some` when a start-point was given.
+        let label = start_reflog.or(start).unwrap_or("HEAD");
+        let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: label });
+        match move_worktree(
+            repo,
+            cur_tree,
+            target_tree,
+            force,
+            quiet,
+            &start_commit.to_string(),
+            merge,
+        )? {
+            Err(code) => return Ok(code),
+            Ok(stashed) => autostashed = stashed,
+        }
+    }
+
+    // `orphaned_commit_warning()` runs between `merge_working_tree()` and
+    // `update_refs_for_switch()` (builtin/checkout.c:1251-1252), so it is out
+    // before `create_branch()` can die.
+    if !quiet && old_detached {
+        if let Some(id) = current_commit.filter(|id| *id != start_commit) {
+            let (abbrev, summary) = describe(repo, id)?;
+            eprintln!("Previous HEAD position was {abbrev} {summary}");
+        }
+    }
+
+    // `update_refs_for_switch()` → `create_branch()` (branch.c:596-650), which
+    // resolves the start-point a second time through `dwim_branch_start()` — the
+    // second ambiguity warning, `ambiguous object name`, and under `--track` the
+    // `starting point '<x>' is not a branch` refusal all land here, after the
+    // worktree has moved and before the branch exists. `new_branch_info->name` is
+    // `HEAD` when no start-point was given (builtin/checkout.c:1195-1197).
+    let start_name = start_reflog.or(start).unwrap_or("HEAD");
+    let real_ref = match super::branch::dwim_branch_start(repo, start_name, track)? {
+        super::branch::Start::Resolved(_, real_ref) => real_ref,
+        super::branch::Start::Stop(code) => return Ok(code),
+    };
+
     // Create fresh, or force-move an existing branch for -C.
     repo.edit_reference(RefEdit {
         change: Change::Update {
@@ -1005,34 +1033,16 @@ fn switch_create(
         deref: false,
     })?;
 
-    if let Some((cur_tree, target_tree)) = trees {
-        // The `-m` labels come from `new_branch_info->name`, which for `-c`/`-C` is the
-        // start-point as `parse_branchname_arg()` left it, not the branch being created:
-        // `apply_autostash_ref(…, new_branch_info->name, "local", …)` and the
-        // `autostash while switching to '%s'` message (builtin/checkout.c:1218-1242).
-        // `trees` is only `Some` when a start-point was given.
-        let label = start_reflog.or(start).unwrap_or("HEAD");
-        let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: label });
-        match move_worktree(
-            repo,
-            cur_tree,
-            target_tree,
-            force,
-            quiet,
-            &start_commit.to_string(),
-            merge,
-        )? {
-            Err(code) => return Ok(code),
-            Ok(stashed) => autostashed = stashed,
+    // `if (real_ref && track) setup_tracking(ref.buf + 11, real_ref, track, quiet);`
+    // (branch.c:645-646). Its `install_branch_config()` notice follows
+    // `merge_working_tree()`'s listing on stdout; a refusal inside it exits with
+    // the branch created and `HEAD` not yet moved.
+    if let Some(real_ref) = real_ref.filter(|_| track != super::branch::Track::Never) {
+        if let Some(code) =
+            super::branch::setup_tracking(repo, branch, real_ref.as_bstr(), track, quiet)?
+        {
+            return Ok(code);
         }
-    }
-
-    // `install_branch_config()` runs inside `update_refs_for_switch()`, *after*
-    // `merge_working_tree()` has printed its listing (builtin/checkout.c:1215-1272). Announcing
-    // the upstream before the worktree moved put `branch '<b>' set up to track '<u>'.` above the
-    // `M <path>` lines on the same stream.
-    if let Some(up) = &upstream {
-        install_tracking(repo, branch, up, quiet)?;
     }
 
     attach_head(repo, &full_name, &from_desc, branch)?;
@@ -1040,18 +1050,10 @@ fn switch_create(
     if !quiet {
         if existed && already_on {
             eprintln!("Reset branch '{branch}'");
+        } else if existed {
+            eprintln!("Switched to and reset branch '{branch}'");
         } else {
-            if old_detached {
-                if let Some(id) = current_commit.filter(|id| *id != start_commit) {
-                    let (abbrev, summary) = describe(repo, id)?;
-                    eprintln!("Previous HEAD position was {abbrev} {summary}");
-                }
-            }
-            if existed {
-                eprintln!("Switched to and reset branch '{branch}'");
-            } else {
-                eprintln!("Switched to a new branch '{branch}'");
-            }
+            eprintln!("Switched to a new branch '{branch}'");
         }
     }
     super::reset::remove_branch_state(repo, !quiet)?;
@@ -1328,129 +1330,19 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
     }
 }
 
-/// The upstream a newly created branch should track: `(remote, merge_ref,
-/// short)`. Auto-set when the start-point is a remote-tracking branch (git's
-/// default `branch.autoSetupMerge=true`); a local branch is tracked only with an
-/// explicit `--track`. `--no-track` disables it entirely.
-fn tracking_upstream(
-    repo: &gix::Repository,
-    start: Option<&str>,
-    track: Option<bool>,
-    track_inherit: bool,
-    new_branch: &str,
-) -> Option<(String, String, String)> {
-    if track == Some(false) {
-        return None;
+/// `opts->track` as `checkout_main()` hands it to `create_branch()`: the
+/// command-line value `parse_opt_tracking_mode()` stored (parse-options-cb.c:305-318
+/// — `--no-track` is `NEVER`, bare `--track`/`direct` is `EXPLICIT`, `inherit` is
+/// `INHERIT`), or `cfg->branch_track` from `branch.autoSetupMerge` when neither was
+/// given (builtin/checkout.c:1702-1703).
+fn resolve_track(repo: &gix::Repository, track: Option<bool>, inherit: bool) -> super::branch::Track {
+    use super::branch::Track;
+    match track {
+        Some(false) => Track::Never,
+        Some(true) if inherit => Track::Inherit,
+        Some(true) => Track::Explicit,
+        None => super::branch::config_branch_track(repo),
     }
-    // Resolve the start-point (or current HEAD branch) to a full ref name.
-    let full: BString = match start {
-        Some(s) => repo.find_reference(s).ok()?.name().as_bstr().to_owned(),
-        None => repo.head_name().ok()??.as_bstr().to_owned(),
-    };
-    let s = full.to_str_lossy();
-    let explicit = track == Some(true); // `--track` given
-
-    // branch.autoSetupMerge decides when tracking is auto-installed (no --track).
-    // git's default is "true". `--track` overrides it and always tracks.
-    let snap = repo.config_snapshot();
-    let mode = snap
-        .string("branch.autoSetupMerge")
-        .map(|v| v.to_str_lossy().to_ascii_lowercase());
-    let mode = mode.as_deref();
-    let off = matches!(mode, Some("false" | "no" | "off" | "0"));
-
-    if let Some(rest) = s.strip_prefix("refs/remotes/") {
-        // Remote-tracking start-point.
-        let (remote, branch) = rest.split_once('/')?;
-        let auto = if off {
-            false
-        } else if mode == Some("simple") {
-            // "simple": only when the local and remote branch names match.
-            branch == new_branch
-        } else {
-            true // "true"/"always"/"inherit"/unset auto-track a remote start
-        };
-        if explicit || auto {
-            return Some((
-                remote.to_string(),
-                format!("refs/heads/{branch}"),
-                format!("{remote}/{branch}"),
-            ));
-        }
-        return None;
-    }
-
-    if let Some(branch) = s.strip_prefix("refs/heads/") {
-        // Local branch start-point.
-        if track_inherit || mode == Some("inherit") {
-            // `inherit_tracking()` (branch.c:217): the new branch takes the start branch's own
-            // `remote`/`merge` pair, so a branch started from a local branch that tracks
-            // `origin/main` tracks `origin/main` too — not the local branch itself.
-            let remote = snap.string(&format!("branch.{branch}.remote"))?.to_str_lossy().into_owned();
-            let merge = snap.string(&format!("branch.{branch}.merge"))?.to_str_lossy().into_owned();
-            let short = match merge.strip_prefix("refs/heads/") {
-                Some(b) if remote == "." => b.to_string(),
-                Some(b) => format!("{remote}/{b}"),
-                None => merge.clone(),
-            };
-            return Some((remote, merge, short));
-        }
-        if explicit || mode == Some("always") {
-            // Track the local branch itself (the "." remote).
-            return Some((
-                ".".to_string(),
-                format!("refs/heads/{branch}"),
-                branch.to_string(),
-            ));
-        }
-    }
-    None
-}
-
-/// Write `branch.<name>.remote` / `branch.<name>.merge` into the repository-local
-/// config and print git's `set up to track` notice on stdout. Called while the
-/// repo lock is already held.
-fn install_tracking(
-    repo: &gix::Repository,
-    branch: &str,
-    upstream: &(String, String, String),
-    quiet: bool,
-) -> Result<()> {
-    let (remote, merge_ref, short) = upstream;
-    let path = repo.common_dir().join("config");
-    let mut file =
-        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)?;
-    let sub = BStr::new(branch.as_bytes());
-    file.set_raw_value_by("branch", Some(sub), "remote", remote.as_str())?;
-    file.set_raw_value_by("branch", Some(sub), "merge", merge_ref.as_str())?;
-
-    // branch.autoSetupRebase also records `branch.<name>.rebase=true`, gated on
-    // whether the upstream is local (`remote == "."`) or remote-tracking. git's
-    // default is "never".
-    let want_rebase = super::branch::autosetup_rebase(repo, remote);
-    if want_rebase {
-        file.set_raw_value_by("branch", Some(sub), "rebase", "true")?;
-    }
-
-    let bytes = file.to_bstring();
-    let tmp = path.with_extension("zvcs-tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-
-    // `install_branch_config_multiple_remotes()` (branch.c:168-171) picks the wording from the
-    // same `rebasing` that wrote `branch.<name>.rebase` — and prints at all only under
-    // `BRANCH_CONFIG_VERBOSE` (branch.c:144), which `setup_tracking()` clears for a quiet run:
-    // `int config_flags = quiet ? 0 : BRANCH_CONFIG_VERBOSE;` (branch.c:257). Printing it
-    // unconditionally put the notice on stdout under `git switch -q -c <new> <remote>/<b>`,
-    // where stock says nothing at all.
-    if !quiet {
-        println!("{}", super::branch::tracking_line(branch, short, want_rebase));
-    }
-    Ok(())
 }
 
 // --- Ref / worktree helpers ------------------------------------------------

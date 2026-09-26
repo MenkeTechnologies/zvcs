@@ -539,7 +539,7 @@ enum ListMode {
 /// `-t`/`--track[=(direct|inherit)]` / `--no-track` selector, in git's option
 /// order (the last one wins).
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Track {
+pub(super) enum Track {
     /// Neither `--track` nor `--no-track` given yet. Not one of git's values:
     /// git seeds `track` from `cfg->branch_track` before `parse_options()` runs,
     /// and this port cannot read the configuration until the repository is
@@ -588,7 +588,7 @@ enum Track {
 /// the repository's configuration starts at. A `--track` on the command line
 /// *replaces* this, which is why `--track=direct` beats
 /// `branch.autoSetupMerge=inherit` rather than being read through it.
-fn config_branch_track(repo: &gix::Repository) -> Track {
+pub(super) fn config_branch_track(repo: &gix::Repository) -> Track {
     let snap = repo.config_snapshot();
     let raw = snap.string("branch.autoSetupMerge");
     let Some(raw) = raw else { return Track::Remote };
@@ -2052,7 +2052,7 @@ const UPSTREAM_ADVICE: &str = "\nIf you are planning on basing your work on an u
      \"git push -u\" to set the upstream config as you push.";
 
 /// What [`dwim_branch_start`] found, or the exit code it already reported.
-enum Start {
+pub(super) enum Start {
     /// The start-point's commit, and git's `real_ref`: the full name of the
     /// branch it named, when that is a branch tracking can be set up against.
     Resolved(ObjectId, Option<BString>),
@@ -2114,7 +2114,7 @@ enum Start {
 ///   * `explicit_tracking` is `--track`/`--set-upstream-to` only
 ///     (`BRANCH_TRACK_EXPLICIT`, `BRANCH_TRACK_OVERRIDE`);
 ///     `--track=inherit` is not in it.
-fn dwim_branch_start(repo: &gix::Repository, start_name: &str, track: Track) -> Result<Start> {
+pub(super) fn dwim_branch_start(repo: &gix::Repository, start_name: &str, track: Track) -> Result<Start> {
     let explicit_tracking = matches!(track, Track::Explicit | Track::Override);
 
     let Some(id) = get_oid_mb(repo, start_name) else {
@@ -2309,7 +2309,7 @@ fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 ///     remotes claiming `refs/heads/main` creates `all1` and then fails.
 ///
 /// Returns `Some(code)` when git exits; the caller returns it.
-fn setup_tracking(
+pub(super) fn setup_tracking(
     repo: &gix::Repository,
     new_ref: &str,
     orig_ref: &BStr,

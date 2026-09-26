@@ -1127,21 +1127,12 @@ pub fn prepare_commit_msg(
     // `write_message(…, append_eol = 0)`: the message is written verbatim.
     std::fs::write(&path, message)?;
 
-    // git has already `chdir`'d to the top of the worktree, so the path it hands
-    // the hook is the `.git/COMMIT_EDITMSG` its `git_path_commit_editmsg()`
-    // spells relative to the git dir it discovered. Hooks run with that same
-    // working directory here, so the relative form is passed whenever the git
-    // directory really is inside the worktree, and the absolute one otherwise
-    // (a linked worktree, a `--git-dir` elsewhere) where a relative path would
-    // name nothing.
-    let workdir = repo.workdir().map(crate::hooks::absolutize);
-    let spelled = match workdir
-        .as_ref()
-        .and_then(|w| crate::hooks::absolutize(repo.git_dir()).strip_prefix(w).ok().map(Path::to_path_buf))
-    {
-        Some(rel) => rel.join("COMMIT_EDITMSG").to_string_lossy().into_owned(),
-        None => crate::hooks::absolutize(&path).to_string_lossy().into_owned(),
-    };
+    // The path git hands the hook is `git_path_commit_editmsg()`, built on
+    // `repo->gitdir` as setup left it — `.git/COMMIT_EDITMSG` from any
+    // subdirectory, `../.git/COMMIT_EDITMSG` for `GIT_DIR=../.git` typed in one.
+    let spelled = crate::setup::git_path_spelled(repo, "COMMIT_EDITMSG")
+        .to_string_lossy()
+        .into_owned();
     let index = crate::hooks::absolutize(&repo.index_path());
     let args: Vec<&str> = if amend {
         vec![spelled.as_str(), "commit", "HEAD"]

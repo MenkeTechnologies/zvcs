@@ -678,6 +678,17 @@ pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
     Some(state)
 }
 
+/// `git_path(name)` (path.c:387-431) as a child of git sees it: `name` under
+/// [`AfterSetup::git_dir`], so relative to [`AfterSetup::cwd`] or absolute.
+/// Outside the model — a gitfile, a linked worktree — git's `repo->gitdir` is the
+/// absolute path the gitfile named, which the absolute git directory stands in for.
+pub(crate) fn git_path_spelled(repo: &gix::Repository, name: &str) -> PathBuf {
+    match after_setup(repo) {
+        Some(s) => s.git_dir.join(name),
+        None => crate::hooks::absolutize(repo.git_dir()).join(name),
+    }
+}
+
 /// `setup_explicit_git_dir()`'s choice of spelling for `gitdirenv` once the work
 /// tree is known (setup.c:1184-1204): verbatim at the work tree or outside it,
 /// `realpath`'d from below it. `set_git_dir()` always exports it.

@@ -2184,11 +2184,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     // The commented help + status block, and the `-v` diff below the cut line, go
     // into the editor buffer only — git gates both on `use_editor && include_status`.
-    // `git_path_commit_editmsg()`, which is absolute: `setup_git_directory()`
-    // makes `$GIT_DIR` absolute during startup, so every consumer of the path —
-    // the editor, `prepare-commit-msg`, `commit-msg` — is handed one that does
-    // not depend on their working directory. gix reports a discovered git
-    // directory relative to the cwd, so rebase it here rather than at each use.
+    // `git_path_commit_editmsg()`. zvcs never `chdir`s, so the file it writes is
+    // reached through the absolute git directory; what the hooks are handed is
+    // `msg_arg` below, git's own spelling.
     let msg_path: std::path::PathBuf = {
         let dir = repo.git_dir();
         let absolute = match dir.is_absolute() {
@@ -2199,6 +2197,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // drops the `.` on git's side, and `Components` does the same here.
         absolute.components().collect::<std::path::PathBuf>().join("COMMIT_EDITMSG")
     };
+    // The `COMMIT_EDITMSG` argument `run_commit_hook()` hands `prepare-commit-msg`
+    // and `commit-msg` (builtin/commit.c:1116-1117, :1133-1134) is
+    // `git_path_commit_editmsg()` built on `repo->gitdir` as setup left it:
+    // `.git/COMMIT_EDITMSG` from any subdirectory, `../.git/COMMIT_EDITMSG` for
+    // `GIT_DIR=../.git` typed there.
+    let msg_arg = crate::setup::git_path_spelled(&repo, "COMMIT_EDITMSG")
+        .to_string_lossy()
+        .into_owned();
     if use_editor && include_status {
         if !buf.is_empty() && !buf.ends_with('\n') {
             buf.push('\n');
@@ -2326,7 +2332,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             arg2 = Some(String::new());
         }
 
-        let mut hook_args: Vec<String> = vec![msg_path.to_string_lossy().into_owned()];
+        let mut hook_args: Vec<String> = vec![msg_arg.clone()];
         if let Some(a) = arg1 {
             hook_args.push(a.to_string());
             if let Some(b) = arg2 {
@@ -2389,7 +2395,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `GIT_INDEX_FILE` (commit.c:1744) and the same `GIT_EDITOR=:` when no editor
     // is in play (commit.c:1747-1748).
     if verify {
-        let arg = msg_path.to_string_lossy().into_owned();
+        let arg = msg_arg.clone();
         let mut env: Vec<(&str, &std::path::Path)> =
             vec![("GIT_INDEX_FILE", index_file.as_path())];
         let colon = std::path::Path::new(":");

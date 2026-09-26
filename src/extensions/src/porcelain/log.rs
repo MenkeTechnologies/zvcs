@@ -1100,7 +1100,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `try_to_simplify_commit()` does in place, so a merge that is TREESAME to
     // one parent is still shown but the sides it did not take are not walked.
     let mut dense = true;
-    let decorations_for_simplify: Option<Decorations>;
     let mut min_parents: Option<usize> = None;
     let mut max_parents: Option<usize> = None;
     /// `revs->left_right` / `cherry_mark` / `cherry_pick` / `left_only` / `right_only`: the
@@ -3774,7 +3773,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `children.name`. `get_commit_action()` reads it to decide whether a TREESAME
     // merge is still worth printing.
     let want_ancestry = graph || show_parents || show_children || simplify_merges_opt;
-    if !pathspecs.is_empty() && !follow {
+    // `--simplify-by-decoration` sets `revs->prune` (revision.c:2445-2452), so
+    // `try_to_simplify_commit()` runs with no pathspec at all, and
+    // `rev_compare_tree()` then answers before looking at a tree:
+    //
+    // ```c
+    // if (get_name_decoration(&commit->object))
+    //         return REV_TREE_DIFFERENT;
+    // if (!revs->prune_data.nr)
+    //         return REV_TREE_SAME;
+    // ```
+    //
+    // (revision.c:789-805.) The rest — the TREESAME bookkeeping and
+    // `--simplify-merges`' parent reduction — is the same pass a pathspec gets.
+    if (!pathspecs.is_empty() || simplify_by_decoration) && !follow {
+        // `if (!revs->prune_data.nr) return REV_TREE_SAME;` for every parent
+        // comparison. A root is compared by `rev_same_tree_as_empty()`, which
+        // never consults decorations or this shortcut.
+        let undecorated_same = pathspecs.is_empty();
         // `rev_compare_tree()` answers `REV_TREE_DIFFERENT` for a decorated commit
         // before it looks at any tree, so under `--simplify-by-decoration` a tagged
         // commit is "changed" against every parent. The map is needed here, ahead
@@ -3836,9 +3852,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // ahead of the `--sparse` early return (revision.c:979-997), so a
                 // root is still marked TREESAME under `--sparse`; what `--sparse`
                 // removes is the `revs->prune && revs->dense` gate that would have
-                // dropped it (revision.c:4221).
-                let changed =
-                    decorated(&node.id) || changes_match(&repo, &commit, None, &mut matcher)?;
+                // dropped it (revision.c:4221). `rev_same_tree_as_empty()` diffs the
+                // trees alone: unlike `rev_compare_tree()` it never asks whether the
+                // commit is decorated, so under `--simplify-by-decoration` a tagged
+                // root that adds nothing the pathspec selects is TREESAME all the
+                // same.
+                let changed = changes_match(&repo, &commit, None, &mut matcher)?;
                 if simplify_merges_opt {
                     merge_simp.insert(
                         node.id,
@@ -3904,7 +3923,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 for p in parents {
                     let relevant = !uninteresting.contains(p) || bottoms_set.contains(p);
                     let changed = decorated(&node.id)
-                        || changes_match(&repo, &commit, Some(*p), &mut matcher)?;
+                        || (!undecorated_same && changes_match(&repo, &commit, Some(*p), &mut matcher)?);
                     if remove_empty && changed && pathspec_view_is_empty(&repo, *p, &mut matcher)? {
                         forced_roots.insert(*p);
                     }
@@ -3987,7 +4006,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // `--show-pulls` — whether the merge is still shown.
             let mut treesame: Option<(usize, ObjectId)> = None;
             for (nth, p) in parents.iter().enumerate() {
-                if !decorated(&node.id) && !changes_match(&repo, &commit, Some(*p), &mut matcher)? {
+                if !decorated(&node.id) && (undecorated_same || !changes_match(&repo, &commit, Some(*p), &mut matcher)?) {
                     treesame = Some((nth, *p));
                     break;
                 }
@@ -4823,72 +4842,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     } else {
         super::color::DecorateColors::disabled()
     };
-    // `--simplify-by-decoration`: the same simplification the pathspec path runs,
-    // with a different question asked of each commit. `simplify_commit()` keeps a
-    // commit that carries a decoration, and — since simplification may not drop
-    // the shape of the history — a root or a merge; everything else is walked
-    // past. The parent lists are rewritten so `--graph`/`--parents` draw the
-    // simplified history rather than the real one.
-    // `if (!revs->prune_data.nr) return REV_TREE_SAME;`: without a pathspec every
-    // undecorated commit compares equal, which is this whole-history shortcut. With
-    // one, the comparison above already answered per commit and this must not run
-    // a second, coarser pass over its result.
-    if simplify_by_decoration && pathspecs.is_empty() {
-        let decos = match &decorations {
-            Some(d) => d,
-            None => {
-                let filter = DecorationFilter::build(
-                    &repo,
-                    &decorate_refs,
-                    &decorate_refs_exclude,
-                    default_decoration_filter,
-                );
-                decorations_for_simplify = Some(build_decorations(&repo, &filter)?);
-                decorations_for_simplify.as_ref().expect("just built")
-            }
-        };
-        let mut simplified: HashMap<ObjectId, (Vec<ObjectId>, bool)> =
-            HashMap::with_capacity(nodes.len());
-        for node in &nodes {
-            let shown =
-                decos.decorates(&node.id) || node.parents.is_empty() || node.parents.len() > 1;
-            let parents = if shown {
-                node.parents.clone()
-            } else {
-                node.parents[..node.parents.len().min(1)].to_vec()
-            };
-            simplified.insert(node.id, (parents, shown));
-        }
-        let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(nodes.len());
-        let mut stack: Vec<ObjectId> = tips.clone();
-        while let Some(id) = stack.pop() {
-            if !reachable.insert(id) {
-                continue;
-            }
-            if let Some((parents, _)) = simplified.get(&id) {
-                stack.extend(parents.iter().copied());
-            }
-        }
-        nodes.retain(|n| {
-            reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
-        });
-        // `rewrite_parents()` runs whenever a simplification did: the ancestry the
-        // output shows — the `Merge:` header, `--parents`, the graph — is the
-        // simplified one, not the commit's real parent list.
-        for node in &mut nodes {
-            let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
-            for p in &node.parents {
-                if let Some(id) = simplify_rewrite_one(*p, &simplified) {
-                    if !rewritten.contains(&id) {
-                        rewritten.push(id);
-                    }
-                }
-            }
-            prune_redundant_parents(&repo, &mut rewritten);
-            node.parents = rewritten;
-        }
-    }
-
     // `--boundary`: the commits the shown history hangs off, appended after the
     // walk with a `-` mark. git emits them from `revs->boundary_commits` once the
     // main walk is done, so they come last regardless of their dates and skip the

@@ -874,7 +874,7 @@ fn switch_create(
     // commit the branch is actually created at.
     let start_commit: Option<ObjectId> = match start {
         Some(s) => {
-            let Some(id) = crate::objname::resolve(repo, s) else {
+            let Some(id) = super::branch::get_oid_mb(repo, s) else {
                 return fatal(format!("invalid reference: {s}"));
             };
             let commit = match super::checkout::classify_tree_ish(repo, id)? {
@@ -1089,7 +1089,7 @@ fn switch_detach(
         // name resolves without the odb, so `git switch --detach <absent-sha>` is
         // git's `unable to read tree`, not `invalid reference`.
         Some(s) => {
-            let Some(id) = crate::objname::resolve(repo, s) else {
+            let Some(id) = super::branch::get_oid_mb(repo, s) else {
                 // `--detach` does not turn the `--guess` DWIM off: `dwim_ok` is
                 // `!patch_mode && dwim_new_local_branch && track == UNSPECIFIED &&
                 // !new_branch` (builtin/checkout.c) with no mention of `force_detach`, so
@@ -1227,7 +1227,7 @@ fn switch_orphan(
     // `--orphan` takes no start-point; a resolvable extra arg is a start-point
     // error, an unresolvable one is a bad reference (git's evaluation order).
     if let Some(p) = positionals.first().copied() {
-        let Some(id) = crate::objname::resolve(repo, p) else {
+        let Some(id) = super::branch::get_oid_mb(repo, p) else {
             return fatal(format!("invalid reference: {p}"));
         };
         // `parse_branchname_arg()` still has to read the object it resolved, and
@@ -1367,7 +1367,7 @@ fn branch_expected(repo: &gix::Repository, branch: &str) -> Result<ExitCode> {
             ExitCode::from(128)
         }
         None => {
-            let Some(id) = crate::objname::resolve(repo, branch) else {
+            let Some(id) = super::branch::get_oid_mb(repo, branch) else {
                 return fatal(format!("invalid reference: {branch}"));
             };
             // `parse_branchname_arg()` reads the object before `switch` gets to

@@ -1335,7 +1335,7 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
 /// — `--no-track` is `NEVER`, bare `--track`/`direct` is `EXPLICIT`, `inherit` is
 /// `INHERIT`), or `cfg->branch_track` from `branch.autoSetupMerge` when neither was
 /// given (builtin/checkout.c:1702-1703).
-fn resolve_track(repo: &gix::Repository, track: Option<bool>, inherit: bool) -> super::branch::Track {
+pub(super) fn resolve_track(repo: &gix::Repository, track: Option<bool>, inherit: bool) -> super::branch::Track {
     use super::branch::Track;
     match track {
         Some(false) => Track::Never,

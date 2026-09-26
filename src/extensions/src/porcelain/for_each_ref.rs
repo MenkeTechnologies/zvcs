@@ -1465,10 +1465,9 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             continue;
         };
 
-        // The chain of tag targets, so `--points-at`, the reachability filters
-        // and `*`-atoms agree with git. Skipped entirely when nothing needs it,
-        // as peeling reads objects.
-        let chain = if !points_at.is_empty() || needs_peel || filters_active {
+        // The chain of tag targets, so `--points-at` and `*`-atoms agree with
+        // git. Skipped entirely when nothing needs it, as peeling reads objects.
+        let chain = if !points_at.is_empty() || needs_peel {
             peel_chain(&repo, id)?
         } else {
             Vec::new()
@@ -1481,7 +1480,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         {
             continue;
         }
-        if filters_active && !passes_filters(&repo, &filters, *chain.last().unwrap_or(&id))? {
+        if filters_active && !passes_filters(&repo, &filters, id)? {
             continue;
         }
 
@@ -1894,14 +1893,27 @@ fn parse_count(v: &str) -> Option<i64> {
     crate::optint::integer(&crate::optint::long_opt("count"), v).ok()
 }
 
-/// Whether `tip` survives the reachability filters.
+/// `lookup_commit_reference_gently(the_repository, ref->oid, 1)`, the one object
+/// lookup `apply_ref_filter()` makes for the reachability filters
+/// (ref-filter.c:2987-2991): `deref_tag()` parses down the tag chain
+/// (tag.c:76-95), and the ref is dropped — quietly — when any object on the way
+/// cannot be read or the end of the chain is not a commit. A ref at a missing
+/// object, or at a tag whose target is missing, is simply not listed.
+pub(super) fn filter_commit(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    let chain = peel_chain(repo, id).ok()?;
+    let tip = *chain.last().unwrap_or(&id);
+    (repo.find_header(tip).ok()?.kind() == Kind::Commit).then_some(tip)
+}
+
+/// Whether the ref at `id` survives the reachability filters.
 ///
 /// A ref that does not peel to a commit is dropped by every one of them, as git
-/// does when `lookup_commit_reference_gently` comes back empty.
-pub(super) fn passes_filters(repo: &gix::Repository, filters: &Filters, tip: ObjectId) -> Result<bool> {
-    if repo.find_header(tip)?.kind() != Kind::Commit {
+/// does when `lookup_commit_reference_gently` comes back empty — see
+/// [`filter_commit`].
+pub(super) fn passes_filters(repo: &gix::Repository, filters: &Filters, id: ObjectId) -> Result<bool> {
+    let Some(tip) = filter_commit(repo, id) else {
         return Ok(false);
-    }
+    };
     // `--contains=<c>`: the ref must be a descendant of `<c>`.
     if !filters.contains.is_empty() {
         let mut any = false;

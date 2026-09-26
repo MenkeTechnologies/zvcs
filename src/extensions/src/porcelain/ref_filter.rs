@@ -34,7 +34,7 @@ use gix::hash::ObjectId;
 use gix::objs::Kind;
 
 use super::for_each_ref::{
-    self, filter_is_base, format_ref, is_packed, load, parse_atom, parse_format, passes_filters,
+    self, filter_commit, filter_is_base, format_ref, is_packed, load, parse_atom, parse_format, passes_filters,
     peel_chain, populate_for_sort, short_name, sort_refs, Atom, AtomCtx, AtomError, ErrKind, Field, Filters, Item,
     NameMod, QuoteStyle, RefInfo, RenderCtx, SortKey,
 };
@@ -473,14 +473,15 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
         };
 
         // `apply_ref_filter()`'s gentle commit lookup (ref-filter.c:2987-2991): the reachability
-        // filters and `-v` all need the commit, and a ref whose object is missing is dropped here
-        // rather than reported. Nothing else in the walk opens an object, so a listing that asks
-        // for none still names a branch pointing at a missing object — which is what stock does.
-        if (filters_active || spec.verbose) && repo.find_header(id).is_err() {
+        // filters and `-v` all need the commit, and a ref whose object is missing — or whose tag
+        // chain ends at one, or at something other than a commit — is dropped here rather than
+        // reported. Nothing else in the walk opens an object, so a listing that asks for none
+        // still names a branch pointing at a missing object — which is what stock does.
+        if (filters_active || spec.verbose) && filter_commit(repo, id).is_none() {
             continue;
         }
 
-        let chain = if !spec.points_at.is_empty() || filters_active || sort_derefs {
+        let chain = if !spec.points_at.is_empty() || sort_derefs {
             peel_chain(repo, id)?
         } else {
             Vec::new()
@@ -491,7 +492,7 @@ fn filter_refs(spec: &ListSpec<'_>, sorts: &[SortKey]) -> Result<Vec<Candidate>>
         {
             continue;
         }
-        if filters_active && !passes_filters(repo, &spec.filters, *chain.last().unwrap_or(&id))? {
+        if filters_active && !passes_filters(repo, &spec.filters, id)? {
             continue;
         }
 

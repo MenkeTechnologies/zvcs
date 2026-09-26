@@ -5,7 +5,7 @@
 //! relative `GIT_WORK_TREE` against the directory the command was typed in and
 //! makes the git directory absolute when it changes directory (setup.c), and
 //! `run_apply()` initialises its `apply_state` with no prefix
-//! (builtin/am.c:1500), so `cd sub && git --work-tree=.. am` patches the whole
+//! (builtin/am.c:1501), so `cd sub && git --work-tree=.. am` patches the whole
 //! tree and commits it.
 //!
 //! zvcs runs `apply`, `write-tree` and `commit-tree` as children from the work

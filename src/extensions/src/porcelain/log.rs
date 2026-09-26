@@ -9113,7 +9113,7 @@ pub(crate) fn format_commit(
         want_color: false,
         colors: &colors,
         now: now_secs(),
-        decorations: None,
+        decorations: lazy_decorations(repo, pretty_uses_decoration(&Pretty::User(fmt.to_string()))),
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,
@@ -10455,6 +10455,25 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
     Ok(Decorations { map, head_branch })
 }
 
+/// The ref map a pretty-print context with no `rev_info` decorates from.
+///
+/// `format_decorations()` reaches `get_name_decoration()` (log-tree.c:94-98),
+/// which calls `load_ref_decorations(NULL, DECORATE_SHORT_REFS)` the first time
+/// any caller asks. A command that never set up decorations of its own —
+/// `rev-list --format`, `shortlog --format`, `rebase -i`'s instruction format —
+/// therefore loads every ref, unfiltered (`add_ref_decoration()` skips
+/// `ref_filter_match()` for a NULL filter, :153-154), exactly once per process.
+/// `wanted` gates the load the way git's laziness does: a format that never
+/// asks for a decoration never reads the refs.
+fn lazy_decorations(repo: &gix::Repository, wanted: bool) -> Option<&'static Decorations> {
+    static LOADED: std::sync::OnceLock<Option<Decorations>> = std::sync::OnceLock::new();
+    if !wanted {
+        return None;
+    }
+    let unfiltered = DecorationFilter { include: Vec::new(), exclude: Vec::new(), exclude_config: Vec::new() };
+    LOADED.get_or_init(|| build_decorations(repo, &unfiltered).ok()).as_ref()
+}
+
 /// Expand `%d` (`wrap` true: ` (…)`) or `%D` (`wrap` false: bare) for `commit`.
 /// Colored only when `auto` (set by a preceding `%C(auto)`) and color is enabled,
 /// matching git, whose decorations stay plain until `%C(auto)` appears.
@@ -11254,7 +11273,7 @@ pub(crate) fn rev_list_pretty_body(
         want_color: false,
         colors: &colors,
         now: now_secs(),
-        decorations: None,
+        decorations: lazy_decorations(repo, pretty_uses_decoration(pretty)),
         decorate: DecorateStyle::Off,
         source: None,
         mailmap: None,

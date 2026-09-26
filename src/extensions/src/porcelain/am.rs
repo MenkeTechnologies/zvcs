@@ -1877,17 +1877,33 @@ struct Ctx {
     /// three-way fallback's scratch index needs: a child that inherits it
     /// resolves it against its *own* cwd, which is not always the worktree root.
     sdir_abs: PathBuf,
+    /// `GIT_DIR` / `GIT_WORK_TREE` re-exported absolute for a child that starts
+    /// in the worktree root. The user's own values are relative to the directory
+    /// the command was typed in; git itself has already moved to the top of the
+    /// work tree and made them absolute before any child runs
+    /// (`setup_explicit_git_dir()`, setup.c), so `cd sub && git --work-tree=.. am`
+    /// hands its `apply`/`write-tree` children the right tree. Inherited as-is,
+    /// `..` resolved one level above the repository: `apply` patched the files
+    /// but `write-tree` committed the old tree, and `GIT_DIR=../.git` was
+    /// `not a git repository`.
+    env: Vec<(&'static str, PathBuf)>,
 }
 
 impl Ctx {
     fn new(repo: &gix::Repository, state_dir: &Path) -> Result<Ctx> {
         let exe = crate::hosted::git_exe()
             .map_err(|e| anyhow::anyhow!("cannot locate the running executable: {e}"))?;
-        let (cwd, sdir) = match repo.workdir() {
-            Some(w) if state_dir.starts_with(w) => (
-                Some(w.to_path_buf()),
-                state_dir.strip_prefix(w).unwrap_or(state_dir).to_path_buf(),
-            ),
+        // The two are compared absolute: `--work-tree=..` typed in a subdirectory
+        // leaves gitoxide with a relative work tree beside an absolute git dir,
+        // and a textual prefix test then ran the children from the user's cwd.
+        let (cwd, sdir) = match repo.workdir().map(crate::hooks::absolutize) {
+            Some(w) if crate::hooks::absolutize(state_dir).starts_with(&w) => {
+                let sdir = crate::hooks::absolutize(state_dir)
+                    .strip_prefix(&w)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|_| state_dir.to_path_buf());
+                (Some(w), sdir)
+            }
             _ => (None, state_dir.to_path_buf()),
         };
         let sdir_abs = if state_dir.is_absolute() {
@@ -1897,11 +1913,21 @@ impl Ctx {
                 .map(|d| d.join(state_dir))
                 .unwrap_or_else(|_| state_dir.to_path_buf())
         };
+        let mut env = Vec::new();
+        if cwd.is_some() {
+            if std::env::var_os("GIT_DIR").is_some() {
+                env.push(("GIT_DIR", crate::hooks::absolutize(repo.git_dir())));
+            }
+            if let (Some(_), Some(w)) = (std::env::var_os("GIT_WORK_TREE"), repo.workdir()) {
+                env.push(("GIT_WORK_TREE", crate::hooks::absolutize(w)));
+            }
+        }
         Ok(Ctx {
             exe,
             cwd,
             sdir,
             sdir_abs,
+            env,
         })
     }
 
@@ -1912,6 +1938,7 @@ impl Ctx {
         if let Some(w) = &self.cwd {
             c.current_dir(w);
         }
+        c.envs(self.env.iter().map(|(k, v)| (*k, v)));
         c
     }
 

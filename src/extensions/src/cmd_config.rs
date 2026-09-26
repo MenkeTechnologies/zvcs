@@ -61,8 +61,14 @@ fn defaults() -> DefaultConfig {
 /// `repo_config(the_repository, grep_cmd_config, &opt)` — `git grep`
 /// (builtin/grep.c:1182).
 pub fn validate_grep(repo: &gix::Repository) -> Result<(), Rejection> {
+    validate_grep_values(walk_config(repo))
+}
+
+/// [`validate_grep`] over an already-walked configuration; see
+/// [`crate::default_config::validate_values`].
+pub fn validate_grep_values(values: Vec<ConfigValue>) -> Result<(), Rejection> {
     let mut out = defaults();
-    for v in walk_config(repo) {
+    for v in values {
         grep_cmd_config(&v, &mut out)?;
     }
     Ok(())

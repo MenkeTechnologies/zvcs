@@ -488,6 +488,61 @@ const SETTINGS_ONLY_VERBS: &[&str] = &["mktree", "prune", "prune-packed"];
 /// ```
 const CONFIG_BEFORE_SETTINGS_VERBS: &[&str] = &["merge-ours"];
 
+/// Whether `sub` reads its configuration even when no repository was found.
+///
+/// A `RUN_SETUP` builtin never gets that far — `setup_git_directory()` dies with
+/// "not a git repository" first (git.c:478-481). The builtins below are the
+/// `RUN_SETUP_GENTLY` or setup-free entries of git.c's `commands[]` table whose
+/// `cmd_*` calls `repo_config(the_repository, <callback>, …)` whatever setup
+/// found, and `repo_config()` with `the_repository` walks the system and global
+/// files and the command line even with no git directory (config.c:2334-2342,
+/// 1570-1602):
+///
+/// | verb | read | callback |
+/// |---|---|---|
+/// | `apply` | `init_apply_state()` → `git_apply_config()` (apply.c:50-55, :129) | `git_xmerge_config` → default |
+/// | `archive` | `write_archive()` (archive.c:764) | `git_default_config` |
+/// | `clone` | builtin/clone.c:1012, before `parse_options()` | `git_clone_config` → default |
+/// | `credential` | builtin/credential.c:20, first statement | `git_default_config` |
+/// | `diff` | builtin/diff.c:489, after the gentle setup | `git_diff_ui_config` |
+/// | `grep` | builtin/grep.c:1182, before `parse_options()` | `grep_cmd_config` |
+/// | `hash-object` | builtin/hash-object.c:115 | `git_default_config` |
+/// | `hook` | `run` only, builtin/hook.c:171 | `git_default_config` |
+/// | `index-pack` | builtin/index-pack.c:1918 | `git_index_pack_config` → default |
+/// | `interpret-trailers` | builtin/interpret-trailers.c:169 | `git_default_config` |
+/// | `shortlog` | builtin/shortlog.c:424 | `git_default_config` |
+/// | `var` | `<variable>` only, builtin/var.c:234 | `git_default_config` |
+/// | `verify-pack` | builtin/verify-pack.c:85 | `git_default_config` |
+///
+/// Three modes are carved out because the C never reaches the read in them:
+/// `hash-object -w` runs the dying `setup_git_directory()` first
+/// (builtin/hash-object.c:102-103); `archive --remote` hands off to
+/// `run_remote_archiver()` and never calls `write_archive()`
+/// (builtin/archive.c:105-106); and `var -l` / a wrong argument count take the
+/// `show_config` path or `usage()` (builtin/var.c:226-232).
+///
+/// Left out: `difftool` and `merge-file` pass their `repo` argument, which
+/// `run_builtin()` sets to `NULL` outside a repository (git.c:506), and
+/// `repo_config(NULL, …)` is `read_very_early_config()` — no command line
+/// (config.c:2336-2338, 1705-1716). `mailinfo` and `patch-id` read their own
+/// callbacks in the verb. `init`/`init-db` read in two passes around creating
+/// the directory (setup.c:2859, :2565), which a gate ahead of the verb cannot
+/// reproduce. Measured against git 2.55.0 outside any repository with
+/// `-c core.abbrev=bogus`: every entry answers `fatal: bad numeric config value
+/// 'bogus' for 'core.abbrev': invalid unit` at 128.
+fn runs_config_without_repository(sub: &str, args: &[String]) -> bool {
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    match sub {
+        "apply" | "clone" | "credential" | "diff" | "grep" | "index-pack"
+        | "interpret-trailers" | "shortlog" | "verify-pack" => true,
+        "archive" => !args.iter().any(|a| a == "--remote" || a.starts_with("--remote=")),
+        "hash-object" => !has("-w"),
+        "hook" => args.first().map(String::as_str) == Some("run"),
+        "var" => args.len() == 1 && args[0] != "-l",
+        _ => false,
+    }
+}
+
 const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "branch",
     "check-mailmap",
@@ -1548,6 +1603,21 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                 if let Err(msg) = crate::worktree::parallel_checkout_configs(&repo) {
                     return Err(crate::fatal::die(msg));
                 }
+            }
+        } else if in_default_config && runs_config_without_repository(sub, args) {
+            // No repository: a `RUN_SETUP_GENTLY` or setup-free builtin still
+            // runs `repo_config(the_repository, <callback>, …)`, which with no
+            // git directory walks the system and global files and the command
+            // line (config.c:1570-1602) — so a refused value dies here exactly
+            // as it does inside a repository.
+            let values = crate::config::walk_config_gently(None);
+            let outcome = match config_callback(sub, args) {
+                ConfigCallback::DiffUi => crate::diff_config::validate_ui_values(values),
+                ConfigCallback::Grep => crate::cmd_config::validate_grep_values(values),
+                _ => crate::default_config::validate_values(values).map(|_| ()),
+            };
+            if let Err(rejection) = outcome {
+                return Err(rejection.into_error());
             }
         }
     }

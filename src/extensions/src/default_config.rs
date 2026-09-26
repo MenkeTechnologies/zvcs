@@ -186,11 +186,19 @@ impl Rejection {
 /// `Ok` carries the values the last winning occurrence of each resolved key left
 /// behind; `Err` is the first refusal, which is where git stops.
 pub fn validate(repo: &gix::Repository) -> Result<DefaultConfig, Rejection> {
+    validate_values(walk_config(repo))
+}
+
+/// [`validate`] over an already-walked configuration — the repository's, or
+/// [`crate::config::walk_config_gently`]'s read with no repository, which is
+/// what `repo_config(the_repository, git_default_config, NULL)` walks in a
+/// `RUN_SETUP_GENTLY` builtin run outside one.
+pub fn validate_values(values: Vec<ConfigValue>) -> Result<DefaultConfig, Rejection> {
     let mut resolved = DefaultConfig {
         object_creation_mode: ObjectCreationMode::Renames,
         sparse_expect_files_outside_of_patterns: false,
     };
-    for value in walk_config(repo) {
+    for value in values {
         git_default_config(&value, &mut resolved)?;
     }
     Ok(resolved)

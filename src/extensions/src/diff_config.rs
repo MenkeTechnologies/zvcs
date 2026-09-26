@@ -82,8 +82,14 @@ fn defaults() -> DefaultConfig {
 /// `show`, `format-patch`, `whatchanged` and `range-diff` install, and the one
 /// `git_status_config` falls through to.
 pub fn validate_ui(repo: &gix::Repository) -> Result<(), Rejection> {
+    validate_ui_values(walk_config(repo))
+}
+
+/// [`validate_ui`] over an already-walked configuration; see
+/// [`crate::default_config::validate_values`].
+pub fn validate_ui_values(values: Vec<ConfigValue>) -> Result<(), Rejection> {
     let mut out = defaults();
-    for v in walk_config(repo) {
+    for v in values {
         git_diff_ui_config(&v, &mut out)?;
     }
     Ok(())

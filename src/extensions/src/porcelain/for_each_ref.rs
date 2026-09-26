@@ -514,6 +514,17 @@ pub(super) struct RefInfo {
     ///
     /// `for-each-ref` never sets it; it is `None` for every ordinary ref.
     pub(super) head_desc: Option<Vec<u8>>,
+    /// The ref's object could not be read and an atom of the run needs it.
+    ///
+    /// `apply_ref_filter()` does not open the object — "sort may only need
+    /// refname to do its job and the resulting list may yet to be pruned by
+    /// maxcount logic" (ref-filter.c:3002-3006) — so the absence surfaces only
+    /// when `populate_value()` reaches `get_object()` and its `missing object
+    /// %s for %s` (ref-filter.c:2359-2361): at the first sort comparison, or
+    /// when this ref's line is formatted. [`populate_value_errors`] raises it
+    /// there, so every line formatted before this ref is already on stdout and
+    /// a `--count` that stops short of the ref never raises it at all.
+    pub(super) missing: bool,
 }
 
 /// Everything `parse_atom` needs beyond the atom text itself.
@@ -1474,19 +1485,20 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        let obj = match load(&repo, id, needs_data) {
-            Ok(obj) => obj,
-            Err(_) if !reads_object => ObjInfo {
-                id,
-                // Never read: with no atom asking, nothing consults the type or
-                // the size. git leaves the same fields untouched.
-                kind: Kind::Commit,
-                size: 0,
-                data: None,
-            },
-            Err(_) => crate::git_fatal!(
-                "missing object {id} for {}",
-                String::from_utf8_lossy(&refname)
+        // A missing object is not an error yet: see [`RefInfo::missing`].
+        let (obj, missing) = match load(&repo, id, needs_data) {
+            Ok(obj) => (obj, false),
+            Err(_) => (
+                ObjInfo {
+                    id,
+                    // Never read: with no atom asking, nothing consults the type
+                    // or the size, and with one asking the ref dies before it
+                    // is rendered. git leaves the same fields untouched.
+                    kind: Kind::Commit,
+                    size: 0,
+                    data: None,
+                },
+                reads_object,
             ),
         };
         let peeled = match (needs_peel, obj.kind, chain.last()) {
@@ -1521,6 +1533,7 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             peeled,
             packed,
             is_base: Vec::new(),
+            missing,
         });
     }
 
@@ -3955,6 +3968,15 @@ fn date_format(spec: &str) -> Result<crate::showdate::DateMode> {
 /// [`populate_for_sort`] is the caller for a sorted listing.
 pub(super) fn populate_value_errors(used: &[&Atom], info: &RefInfo) -> Result<()> {
     if used.iter().any(|a| a.deref && matches!(a.field, Field::Push(_))) {
+        crate::git_fatal!(
+            "missing object {} for {}",
+            info.obj.id,
+            String::from_utf8_lossy(&info.refname)
+        );
+    }
+    // `get_object()`'s `missing object %s for %s` (ref-filter.c:2359-2361),
+    // raised before `grab_values()` can reach a date format.
+    if info.missing {
         crate::git_fatal!(
             "missing object {} for {}",
             info.obj.id,

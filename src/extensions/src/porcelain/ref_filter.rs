@@ -566,17 +566,21 @@ fn populate(
 
     let mut refs = Vec::with_capacity(candidates.len());
     for c in candidates {
-        let obj = match load(repo, c.id, needs_data) {
-            Ok(obj) => obj,
-            // Nothing in this run will look at it, so the ref is listed by name — the state a
-            // branch pointing at a missing object is in.
-            Err(_) if !needs_object => super::for_each_ref::ObjInfo {
-                id: c.id,
-                kind: Kind::Commit,
-                size: 0,
-                data: None,
-            },
-            Err(err) => return Err(err),
+        // When nothing in this run looks at the object, the ref is listed by name — the state a
+        // branch pointing at a missing object is in. When something does, the ref dies with
+        // `missing object %s for %s` only once it is sorted or formatted (see `RefInfo::missing`),
+        // after every line formatted before it.
+        let (obj, missing) = match load(repo, c.id, needs_data) {
+            Ok(obj) => (obj, false),
+            Err(_) => (
+                super::for_each_ref::ObjInfo {
+                    id: c.id,
+                    kind: Kind::Commit,
+                    size: 0,
+                    data: None,
+                },
+                needs_object,
+            ),
         };
         let chain = if needs_peel && c.chain.is_empty() && obj.kind == Kind::Tag {
             peel_chain(repo, c.id)?
@@ -612,6 +616,7 @@ fn populate(
             peeled,
             packed: c.packed,
             is_base: Vec::new(),
+            missing,
         });
     }
     Ok(refs)
@@ -689,6 +694,7 @@ pub(super) fn pretty_print_ref(
         peeled,
         packed: false,
         is_base: Vec::new(),
+        missing: false,
     };
     let ctx = RenderCtx {
         repo,

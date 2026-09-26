@@ -624,7 +624,8 @@ enum ConfigCallback {
     /// walk first and report a `core.*` value ahead of one of the verb's own keys
     /// that precedes it. The verb also needs the walk outside a repository, where
     /// this gate does not run: `patch-id` (`git_patch_id_config`,
-    /// builtin/patch-id.c:204).
+    /// builtin/patch-id.c:204) and `mailinfo` (`git_mailinfo_config`,
+    /// mailinfo.c:1252).
     Verb,
 }
 
@@ -689,7 +690,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "branch" => ConfigCallback::Branch,
         "fmt-merge-msg" => ConfigCallback::FmtMergeMsg,
         "add" | "stage" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
-        "patch-id" => ConfigCallback::Verb,
+        "patch-id" | "mailinfo" => ConfigCallback::Verb,
         _ => ConfigCallback::Default,
     }
 }

@@ -13,8 +13,10 @@
 //! patch, subject cleanup, the `From:` address/name split, and every flag:
 //! `-k`, `-b`, `-m`/`--message-id`, `-u`, `-n`, `--encoding=<enc>`,
 //! `--scissors`/`--no-scissors`, `--quoted-cr=<action>` and the hidden
-//! `--inbody-headers`. Configuration is read for `mailinfo.scissors`,
-//! `mailinfo.quotedcr` and `i18n.commitEncoding`. Usage, `error:` and
+//! `--inbody-headers`. Configuration is read by a port of `git_mailinfo_config()`
+//! (`mailinfo.scissors`, `mailinfo.quotedcr`, and `git_default_config()` for
+//! everything outside `mailinfo.`) walking every value in parse order ahead of
+//! option parsing, plus `i18n.commitEncoding` for `-u`. Usage, `error:` and
 //! `warning:` text and the 0/1/129 exit codes match.
 //!
 //! Charset re-coding (`reencode_string_len()`, which git routes through
@@ -46,14 +48,15 @@
 //! iconv ones in a few rows (Shift_JIS's NEC extensions, for one). A byte sequence
 //! only WHATWG accepts decodes here and is refused by stock on macOS.
 //!
-//! Not covered: a malformed `mailinfo.quotedcr` bails instead of reproducing git's
-//! config-callback death path.
-//!
 //! One structural difference with no observable effect on a successful run: the
 //! `<msg>` and `<patch>` files are created and truncated up front, as git does,
 //! but filled once parsing finishes rather than incrementally.
 
 use anyhow::{bail, Result};
+
+use crate::default_config::{
+    bool_value, git_default_config, nonbool, reported, DefaultConfig, ObjectCreationMode, Rejection,
+};
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
@@ -493,18 +496,64 @@ impl Mailinfo {
             input_error: 0,
         };
 
-        let config = config()?;
-        if let Some(v) = config.boolean("mailinfo.scissors").transpose() {
-            mi.use_scissors = v?;
-        }
-        if let Some(v) = config.string("mailinfo.quotedcr") {
-            let value = String::from_utf8_lossy(&v).into_owned();
-            match parse_quoted_cr_action(&value) {
-                Some(action) => mi.quoted_cr = action,
-                None => crate::git_fatal!("bad action '{value}' for 'mailinfo.quotedcr'"),
-            }
+        let repo = crate::setup::discover().ok();
+        let mut resolved = DefaultConfig {
+            object_creation_mode: ObjectCreationMode::Renames,
+            sparse_expect_files_outside_of_patterns: false,
+        };
+        for v in crate::config::walk_config_gently(repo.as_ref()) {
+            mi.mailinfo_config(&v, &mut resolved).map_err(|r| r.into_error())?;
         }
         Ok(mi)
+    }
+
+    /// `git_mailinfo_config()` (mailinfo.c:1252-1272), handed one configured
+    /// value. `setup_mailinfo()` runs it over every value in parse order, so the
+    /// first refusal is fatal even when a later value would override it.
+    ///
+    /// ```c
+    /// if (!starts_with(var, "mailinfo."))
+    ///         return git_default_config(var, value, ctx, NULL);
+    /// if (!strcmp(var, "mailinfo.scissors")) {
+    ///         mi->use_scissors = git_config_bool(var, value);
+    ///         return 0;
+    /// }
+    /// if (!strcmp(var, "mailinfo.quotedcr")) {
+    ///         if (!value)
+    ///                 return config_error_nonbool(var);
+    ///         if (mailinfo_parse_quoted_cr_action(value, &mi->quoted_cr) != 0)
+    ///                 return error(_("bad action '%s' for '%s'"), value, var);
+    ///         return 0;
+    /// }
+    /// /* perhaps others here */
+    /// return 0;
+    /// ```
+    fn mailinfo_config(
+        &mut self,
+        v: &crate::config::ConfigValue,
+        resolved: &mut DefaultConfig,
+    ) -> std::result::Result<(), Rejection> {
+        let key = v.key.as_str();
+        if !key.starts_with("mailinfo.") {
+            return git_default_config(v, resolved);
+        }
+        match key {
+            "mailinfo.scissors" => self.use_scissors = bool_value(v, key)?,
+            "mailinfo.quotedcr" => {
+                let Some(value) = v.value.as_deref() else {
+                    return Err(nonbool(v));
+                };
+                match parse_quoted_cr_action(value) {
+                    Some(action) => self.quoted_cr = action,
+                    None => {
+                        let error = format!("bad action '{value}' for '{key}'");
+                        return Err(reported(v, vec![error]));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// `mailinfo()` plus `cmd_mailinfo()`'s `!!` on the return value.

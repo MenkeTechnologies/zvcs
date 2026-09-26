@@ -3183,7 +3183,7 @@ fn stop_for_conflicts(
     return Ok(ExitCode::from(1));
 }
 
-fn guard_checkout(
+pub(super) fn guard_checkout(
     repo: &gix::Repository,
     head_tree: ObjectId,
     new_tree: ObjectId,
@@ -5492,7 +5492,7 @@ fn early_part_of_branch(repo: &gix::Repository, spec: &str) -> Option<(String, b
 ///   wholesale. A path carrying a conflicted stage in `old` is always treated as
 ///   changed there, since its worktree file holds conflict markers rather than
 ///   any indexed blob.
-fn update_worktree(
+pub(super) fn update_worktree(
     repo: &gix::Repository,
     old: &gix::index::File,
     old_tree: Option<ObjectId>,

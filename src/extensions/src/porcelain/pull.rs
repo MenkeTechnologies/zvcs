@@ -958,10 +958,21 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `if (repo_get_oid(the_repository, "HEAD", &orig_head)) oidclr(&orig_head, ...);`
+    // (builtin/pull.c:1068-1069): `HEAD` as it stands before the fetch, null when
+    // the branch is unborn. The tests below are against this value, not against
+    // `HEAD` after the fetch — the `--update-head-ok` fetch may have moved it.
+    let orig_head: Option<gix::ObjectId> = repo.head_id().ok().map(gix::Id::detach);
+
     // ---- phase 1: fetch --------------------------------------------------
     // Delegate to the ported fetch, which acquires the repo lock itself, prints
     // the git-style `From …` per-ref summary, and honors the forwarded knobs.
-    let mut fetch_args: Vec<String> = Vec::new();
+    //
+    // `strvec_pushl(&cmd.args, "fetch", "--update-head-ok", NULL)` (`run_fetch()`,
+    // builtin/pull.c:392): the fetch a pull runs may always write the branch `HEAD`
+    // names — that is how a pull into an unborn branch gets its first commit — so
+    // `check_not_current_branch()` (builtin/fetch.c:1972-1973) is skipped for it.
+    let mut fetch_args: Vec<String> = vec!["--update-head-ok".into()];
     if f_all {
         fetch_args.push("--all".into());
     }
@@ -1110,6 +1121,45 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // ```c
+    // if (!is_null_oid(&orig_head) && !is_null_oid(&curr_head) &&
+    //                 !oideq(&orig_head, &curr_head)) {
+    //         warning(_("fetch updated the current branch head.\n"
+    //                 "fast-forwarding your working tree from\n"
+    //                 "commit %s."), oid_to_hex(&orig_head));
+    //         if (checkout_fast_forward(the_repository, &orig_head, &curr_head, 0))
+    //                 die(_("Cannot fast-forward your working tree.\n" [...]
+    // ```
+    //
+    // (builtin/pull.c:1093-1118.) A `pull <url> <branch>:<branch>` fetches straight
+    // into the branch `HEAD` names, which leaves the index and the worktree on the
+    // old commit; they are carried over to the new one before anything is merged.
+    let curr_head: Option<gix::ObjectId> = repo.head_id().ok().map(gix::Id::detach);
+    if let (Some(orig), Some(curr)) = (orig_head, curr_head) {
+        if orig != curr {
+            eprintln!(
+                "warning: fetch updated the current branch head.\n\
+                 fast-forwarding your working tree from\n\
+                 commit {orig}."
+            );
+            let orig_tree = repo.find_object(orig)?.peel_to_tree()?.id;
+            let curr_tree = repo.find_object(curr)?.peel_to_tree()?.id;
+            let index = (*repo.index_or_empty()?).clone();
+            let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+            if super::merge::guard_checkout(&repo, orig_tree, curr_tree, &index, None)?.is_some() {
+                crate::git_fatal!(
+                    "Cannot fast-forward your working tree.\n\
+                     After making sure that you saved anything precious from\n\
+                     $ git diff {orig}\n\
+                     output, run\n\
+                     $ git reset --hard\n\
+                     to recover."
+                );
+            }
+            super::merge::update_worktree(&repo, &index, Some(orig_tree), curr_tree, &should_interrupt)?;
+        }
+    }
+
     // `get_merge_heads()` opens `FETCH_HEAD` with `xfopen()` (builtin/pull.c:393)
     // before `die_no_merge_candidates()` is ever considered, so a fetch that wrote
     // no file dies here. `--append` is how that happens: without it the fetch
@@ -1181,12 +1231,12 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // the fetched head as the initial state — `pull_into_void()` fast-forwards the
     // empty tree to it and points `HEAD` there with an `initial pull` reflog entry.
     // This is the `git init && git remote add && git pull origin main` flow.
-    if repo.head()?.is_unborn() {
+    if orig_head.is_none() {
         if merge_heads.len() > 1 {
             eprintln!("fatal: Cannot merge multiple branches into empty head.");
             return Ok(ExitCode::from(128));
         }
-        return pull_into_void(&repo, merge_heads[0].0, verify_signatures.is_some(), f_quiet);
+        return pull_into_void(&repo, merge_heads[0].0, curr_head, verify_signatures.is_some(), f_quiet);
     }
 
     let head_id = repo.head_id()?.detach();
@@ -1643,6 +1693,7 @@ fn no_merge_candidates(repo: &gix::Repository, branch: Option<&str>, rebasing: b
 fn pull_into_void(
     repo: &gix::Repository,
     merge_head: gix::ObjectId,
+    curr_head: Option<gix::ObjectId>,
     verify_signatures: bool,
     quiet: bool,
 ) -> Result<ExitCode> {
@@ -1667,7 +1718,11 @@ fn pull_into_void(
 
     let empty_tree = gix::ObjectId::empty_tree(repo.object_hash());
     let target_tree = repo.find_object(merge_head)?.peel_to_tree()?.id;
-    let index = repo.index_or_load_from_head_or_empty()?.into_owned();
+    // `checkout_fast_forward()` reads the index file itself (`repo_read_index()`),
+    // so a missing one is empty. Falling back to `HEAD`'s tree would be wrong once
+    // a `<branch>:<branch>` fetch has given the unborn branch a commit: the index
+    // would already list what the worktree does not have, and nothing got written.
+    let index = (*repo.index_or_empty()?).clone();
     let should_interrupt = std::sync::atomic::AtomicBool::new(false);
     let labels = gix::merge::blob::builtin_driver::text::Labels {
         ancestor: Some(BStr::new(b"empty tree")),
@@ -1705,8 +1760,13 @@ fn pull_into_void(
                 force_create_reflog: false,
                 message: "initial pull".into(),
             },
-            // The branch does not exist yet, which is what makes this the unborn case.
-            expected: PreviousValue::MustNotExist,
+            // `refs_update_ref(..., "HEAD", merge_head, curr_head, ...)`
+            // (builtin/pull.c:490): the old value is `HEAD` as the fetch left it —
+            // still unborn, or the commit a `<branch>:<branch>` fetch wrote there.
+            expected: match curr_head {
+                Some(id) => PreviousValue::MustExistAndMatch(gix::refs::Target::Object(id)),
+                None => PreviousValue::MustNotExist,
+            },
             new: gix::refs::Target::Object(merge_head),
         },
         name: "HEAD".try_into().map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,

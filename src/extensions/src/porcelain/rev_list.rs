@@ -1680,7 +1680,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     std::mem::take(&mut ref_excludes),
                     negate,
                 );
-                if let Err(e) = seed_ref_set(&repo, &sel, negate, &hidden_refs, &mut seeds, &mut pending) {
+                if let Err(e) = seed_ref_set(
+                    &repo,
+                    &sel,
+                    negate,
+                    &hidden_refs,
+                    &mut seeds,
+                    &mut pending,
+                    walk_reflogs.then_some(&mut reflog_names),
+                ) {
                     return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
@@ -1715,7 +1723,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     std::mem::take(&mut ref_excludes),
                     negate,
                 );
-                if let Err(e) = seed_ref_set(&repo, &sel, negate, &hidden_refs, &mut seeds, &mut pending) {
+                if let Err(e) = seed_ref_set(
+                    &repo,
+                    &sel,
+                    negate,
+                    &hidden_refs,
+                    &mut seeds,
+                    &mut pending,
+                    walk_reflogs.then_some(&mut reflog_names),
+                ) {
                     return Ok(fatal_text(&e));
                 }
                 rev_input_given = true;
@@ -1968,7 +1984,23 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
                 note_parsed(&repo, s, &seeds[seeds_before..], &mut parsed_commits)?;
                 rev_input_given = true;
-                reflog_names.push(s.to_string());
+                // `add_pending_object_with_path()` (revision.c:305-318): once `-g`
+                // has been read, a commit operand is handed to
+                // `add_reflog_for_walk()` instead of the pending list, and that
+                // `die("cannot walk reflogs for %s", name)`s on an UNINTERESTING
+                // one (reflog-walk.c:165-166). An operand read *before* `-g` was
+                // pended as an ordinary commit and has no reflog walked for it.
+                if walk_reflogs {
+                    if let Some(name) = super::log::reflog_excluded_tip(
+                        &repo,
+                        &[s.to_string()],
+                        &[negate],
+                        seen_dashdash,
+                    ) {
+                        return Ok(fatal(&format!("cannot walk reflogs for {name}")));
+                    }
+                    reflog_names.push(s.to_string());
+                }
             }
         }
         // `add_pending_object_with_path()` clears `revs->no_walk` the moment an
@@ -2001,6 +2033,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `want_ancestry()` is `revs->rewrite_parents || revs->children.name`, and the
     // die reads the first as `--parents` however it was turned on — which `--graph`
     // does.
+    // `if (revs->reflog_info && revs->limited) die(...)` (revision.c:3180-3181),
+    // ahead of the `--parents`/`--children` check. A reflog walk hands its entries
+    // out in reflog order, and every option that makes `setup_revisions()` set
+    // `revs->limited` asks for a limited, re-sorted list first — `--graph` among
+    // them, through the `topo_order` it has just implied.
+    if walk_reflogs
+        && (order != Order::Date
+            || show_children
+            || simplify_merges_opt
+            || simplify_by_decoration
+            || ancestry_path
+            || left_only
+            || right_only
+            || cherry_mark
+            || cherry_pick)
+    {
+        return Ok(fatal("cannot combine --walk-reflogs with history-limiting options"));
+    }
     if (show_parents || graph) && show_children {
         return Ok(fatal(
             "options '--parents' and '--children' cannot be used together",
@@ -2010,6 +2060,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal(
             "options '--graph' and '--reverse' cannot be used together",
         ));
+    }
+    // The third leg of `die_for_incompatible_opt3(graph, reverse, reflog_info)`
+    // (revision.c:3190-3192); `--graph` with `-g` has already died above.
+    if reverse && walk_reflogs {
+        return Ok(fatal("options '--reverse' and '--walk-reflogs' cannot be used together"));
     }
     if graph && no_walk {
         return Ok(fatal(
@@ -2195,11 +2250,25 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // the order `git log -g` reports them, and every filter below then applies to
     // that list exactly as it would to an ancestry walk.
     if walk_reflogs {
-        if reflog_names.is_empty() {
-            reflog_names.push("HEAD".to_owned());
-        }
-        let nodes = super::log::reflog_walk(&repo, &reflog_names)?;
+        // `rev-list` passes no `revs->def` (builtin/rev-list.c), so nothing
+        // stands in for an empty reflog list: `--tags` over tags that keep no
+        // reflog, `--stdin` with no input, or `main -g` (pended before `-g`, so
+        // no reflog of it is walked) all walk nothing. A command line naming
+        // nothing at all is the usage error raised above.
+        let nodes = if reflog_names.is_empty() {
+            Vec::new()
+        } else {
+            super::log::reflog_walk(&repo, &reflog_names)?
+        };
         commits = nodes.iter().map(|n| n.id).collect();
+        // A commit pended UNINTERESTING *before* `-g` was read is not refused;
+        // it makes the walk limited (revision.c:431-435), `limit_list()` paints
+        // everything it reaches, and `get_commit_action()` ignores those as the
+        // reflog entries come out.
+        if !hidden.is_empty() {
+            let excluded = super::log::ancestor_closure(&repo, &hidden)?;
+            commits.retain(|id| !excluded.contains(id));
+        }
         parents_of = nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
         abort = None;
     }
@@ -3606,6 +3675,7 @@ fn seed_ref_set(
     hidden: &[String],
     seeds: &mut Vec<Seed>,
     pending: &mut Vec<Pending>,
+    mut reflog: Option<&mut Vec<String>>,
 ) -> Result<(), String> {
     let refs = repo.references().map_err(|e| e.to_string())?;
     let iter = refs.all().map_err(|e| e.to_string())?;
@@ -3635,6 +3705,7 @@ fn seed_ref_set(
             return Err(format!("fatal: bad object {name}\n"));
         }
         let cmdline_commit = names_a_commit(repo, target);
+        reflog_for_walk(reflog.as_deref_mut(), name, cmdline_commit, negate)?;
         if let Some(id) = peel_recording_tags(repo, target, negate, pending) {
             seeds.push(Seed {
                 id,
@@ -3651,6 +3722,7 @@ fn seed_ref_set(
     if sel.head && !sel.excluded("HEAD") && !ref_is_hidden("HEAD", hidden) {
         if let Ok(head) = repo.head_id() {
             let cmdline_commit = names_a_commit(repo, head.detach());
+            reflog_for_walk(reflog.as_deref_mut(), "HEAD", cmdline_commit, negate)?;
             if let Some(id) = peel_recording_tags(repo, head.detach(), negate, pending) {
                 seeds.push(Seed {
                     id,
@@ -3662,6 +3734,29 @@ fn seed_ref_set(
             }
         }
     }
+    Ok(())
+}
+
+/// `add_pending_object_with_path()` under `-g` (revision.c:305-318): a selected
+/// ref whose tip is a commit names a reflog to walk rather than a commit to pend,
+/// and `add_reflog_for_walk()` refuses an UNINTERESTING one — the `--not --all`
+/// case — with `cannot walk reflogs for <name>` (reflog-walk.c:165-166). The name
+/// is the one `handle_one_ref()` was given. An annotated tag is not a commit, so
+/// it is pended as usual and walks no reflog.
+fn reflog_for_walk(
+    reflog: Option<&mut Vec<String>>,
+    name: &str,
+    is_commit: bool,
+    negate: bool,
+) -> Result<(), String> {
+    let Some(names) = reflog else { return Ok(()) };
+    if !is_commit {
+        return Ok(());
+    }
+    if negate {
+        return Err(format!("fatal: cannot walk reflogs for {name}\n"));
+    }
+    names.push(name.to_string());
     Ok(())
 }
 

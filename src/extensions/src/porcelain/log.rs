@@ -7528,7 +7528,7 @@ pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Ve
 /// git expands `a..b` into `b ^a` and `a...b` into `a b ^<merge-base>`, so either
 /// range pends an UNINTERESTING tip; `--not` swaps which side that is. `None` when
 /// every argument is a plain positive revision.
-fn reflog_excluded_tip(
+pub(super) fn reflog_excluded_tip(
     repo: &gix::Repository,
     revs: &[String],
     negated: &[bool],

@@ -80,7 +80,10 @@ const USAGE: &str = "usage: git push [<options>] [<repository> [<refspec>...]]\n
 /// silently; inert or already-matched flags (`--thin`, `-4/-6`, …) are accepted.
 /// `--no-verify`/`--verify` drive the `pre-push` hook alone — git's
 /// `TRANSPORT_PUSH_NO_HOOK` — and `--dry-run` does not suppress it: a hook that
-/// refuses fails a dry run exactly as it fails a real push. `--receive-pack=<path>` / `--exec=<path>` (else
+/// refuses fails a dry run exactly as it fails a real push. The hook runs where
+/// `transport_push()` runs it — after the ref advertisement has been matched, and
+/// fed the refs that will actually be pushed with the values the remote
+/// advertised ([`super::push_proto::PrePush`]). `--receive-pack=<path>` / `--exec=<path>` (else
 /// `remote.<name>.receivepack`) reaches the transport, which runs it in place of
 /// `git-receive-pack` on the other end.
 ///
@@ -792,102 +795,6 @@ git push <groupname>\n"
     // deletions the advertisement still calls for. Only `setup_default_push_refspecs()`
     // refuses to invent a refspec, and it does so with its own messages.
 
-    // `pre-push` runs before contacting the remote, receiving `<remote> <url>` as
-    // arguments and one `<local-ref> <local-sha> <remote-ref> <remote-sha>` line
-    // per update on stdin. A non-zero exit aborts the push (git behavior).
-    //
-    // Gated on `--no-verify` alone (`TRANSPORT_PUSH_NO_HOOK` in `transport_push()`),
-    // never on `--dry-run`: git runs the hook for a dry run too, so a hook that
-    // refuses makes `push --dry-run` fail exactly as a real push would.
-    if !f.no_verify {
-        let url = remote
-            .url(Direction::Push)
-            .or_else(|| remote.url(Direction::Fetch))
-            .map(|u| u.to_bstring().to_string())
-            .unwrap_or_default();
-        let null = ObjectId::null(repo.object_hash());
-        let mut payload = String::new();
-        for req in &requests {
-            let remote_sha = tracking_oid(&repo, &remote, &req.name).unwrap_or(null);
-            // ```c
-            // strbuf_addf(&buf, "%s %s %s %s\n",
-            //             r->peer_ref->name, oid_to_hex(&r->new_oid),
-            //             r->name, oid_to_hex(&r->old_oid));
-            // ```
-            //
-            // (`run_pre_push_hook()`, transport.c:1409-1412.) The first field is
-            // `peer_ref->name` — the *local* ref — and the third is `ref->name`,
-            // the remote one. They differ whenever the refspec renames, and
-            // `git push origin main:refs/heads/other` is exactly that case: the
-            // hook must read `refs/heads/main … refs/heads/other …`, not the
-            // destination twice. A deletion has no peer ref and git writes
-            // `(delete)` in its place.
-            let local = req.src.as_deref().unwrap_or("(delete)");
-            payload.push_str(&format!(
-                "{local} {} {} {remote_sha}\n",
-                req.new, req.name
-            ));
-        }
-        if !crate::hooks::run(&repo, "pre-push", &[&remote_name, &url], Some(payload.as_bytes()))? {
-            // `transport_push()` returns -1, and `push_with_options()` closes with
-            // the same summary line every other push failure ends on:
-            // `error(_("failed to push some refs to '%s'"), transport->url)`.
-            eprintln!("error: failed to push some refs to '{url}'");
-            return Ok(ExitCode::from(1));
-        }
-    }
-
-    // `--recurse-submodules` handling, ported from git's `transport_push`
-    // (transport.c): it runs after the pre-push hook and before the object upload.
-    // `no` is a plain push; the other modes first look for submodules whose pushed
-    // commit is not yet on their remote.
-    if f.recurse != Recurse::Off {
-        let needs = unpushed_submodules(&repo, &requests)?;
-        if !needs.is_empty() {
-            match f.recurse {
-                // git's `die_with_unpushed_submodules` (transport.c) — abort, no writes.
-                Recurse::Check => {
-                    eprintln!("The following submodule paths contain changes that can");
-                    eprintln!("not be found on any remote:");
-                    for p in &needs {
-                        eprintln!("  {p}");
-                    }
-                    eprintln!();
-                    eprintln!("Please try");
-                    eprintln!();
-                    eprintln!("\tgit push --recurse-submodules=on-demand");
-                    eprintln!();
-                    eprintln!("or cd to the path and use");
-                    eprintln!();
-                    eprintln!("\tgit push");
-                    eprintln!();
-                    eprintln!("to push them to a remote.");
-                    eprintln!();
-                    crate::git_fatal!("Aborting.");
-                }
-                // git's `push_unpushed_submodules` recursively runs `git push` inside
-                // each submodule (submodule.c). That transport recursion is not wired
-                // here; silently skipping it would upload a superproject commit whose
-                // submodule commits are absent from their remotes (data-losing), so
-                // abort and tell the user to push the submodules first.
-                Recurse::OnDemand | Recurse::Only => {
-                    let mode = if f.recurse == Recurse::Only { "only" } else { "on-demand" };
-                    let list = needs.join(", ");
-                    bail!(
-                        "--recurse-submodules={mode}: the submodule(s) [{list}] have commits not on their remote and must be pushed first (cd <path> && git push); recursive submodule push is not supported"
-                    );
-                }
-                Recurse::Off => unreachable!("guarded by the outer `!= Recurse::Off`"),
-            }
-        }
-        if f.recurse == Recurse::Only {
-            // git never pushes the superproject under `only` (transport.c skips
-            // `push_refs`); with no submodule to push, that leaves nothing to do.
-            eprintln!("Everything up-to-date");
-            return Ok(ExitCode::SUCCESS);
-        }
-    }
-
     // Every ref this repository still has, for the `--mirror`/`--prune` deletion
     // decision: an advertised ref absent from this set has no local counterpart.
     let local_refs: std::collections::HashSet<String> = repo
@@ -979,7 +886,106 @@ git push <groupname>\n"
             std::io::stderr().is_terminal()
         }) && !f.quiet,
     };
-    let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
+    // `transport_push()`'s steps between the match and `push_refs()`
+    // (transport.c:1479-1531), which `push_proto::send_pack` calls back into once
+    // every ref has its status: the `pre-push` hook, then the submodule checks.
+    //
+    // The hook receives `<remote> <url>` as arguments and one
+    // `<local-ref> <local-sha> <remote-ref> <remote-sha>` line per ref that will
+    // be pushed ([`push_proto::PrePushRef`]); a non-zero exit aborts the push.
+    // Gated on `--no-verify` alone (`TRANSPORT_PUSH_NO_HOOK`), never on
+    // `--dry-run`: git runs the hook for a dry run too, so a hook that refuses
+    // makes `push --dry-run` fail exactly as a real push would.
+    let mut between_match_and_push = |lines: &[push_proto::PrePushRef]| -> Result<Option<ExitCode>> {
+        if !f.no_verify {
+            // ```c
+            // strbuf_addf(&data->buf, "%s %s %s %s\n",
+            //             r->peer_ref->name, oid_to_hex(&r->new_oid),
+            //             r->name, oid_to_hex(&r->old_oid));
+            // ```
+            //
+            // (`pre_push_hook_feed_stdin()`, transport.c:1364-1366.) The first
+            // field is the *local* ref (`(delete)` for a deletion), the third the
+            // remote one, and the last the value the remote advertised.
+            let payload: String = lines
+                .iter()
+                .map(|l| format!("{} {} {} {}\n", l.local, l.new, l.remote, l.old))
+                .collect();
+            if !crate::hooks::run(&repo, "pre-push", &[&remote_name, &transport_url], Some(payload.as_bytes()))? {
+                // `transport_push()` returns -1, and `push_with_options()` closes
+                // with the same summary line every other push failure ends on:
+                // `error(_("failed to push some refs to '%s'"), transport->url)`.
+                eprintln!("error: failed to push some refs to '{transport_url}'");
+                return Ok(Some(ExitCode::from(1)));
+            }
+        }
+
+
+        // `--recurse-submodules` handling, ported from git's `transport_push`
+        // (transport.c): it runs after the pre-push hook and before the object upload.
+        // `no` is a plain push; the other modes first look for submodules whose pushed
+        // commit is not yet on their remote.
+        if f.recurse != Recurse::Off {
+            let needs = unpushed_submodules(&repo, &requests)?;
+            if !needs.is_empty() {
+                match f.recurse {
+                    // git's `die_with_unpushed_submodules` (transport.c) — abort, no writes.
+                    Recurse::Check => {
+                        eprintln!("The following submodule paths contain changes that can");
+                        eprintln!("not be found on any remote:");
+                        for p in &needs {
+                            eprintln!("  {p}");
+                        }
+                        eprintln!();
+                        eprintln!("Please try");
+                        eprintln!();
+                        eprintln!("\tgit push --recurse-submodules=on-demand");
+                        eprintln!();
+                        eprintln!("or cd to the path and use");
+                        eprintln!();
+                        eprintln!("\tgit push");
+                        eprintln!();
+                        eprintln!("to push them to a remote.");
+                        eprintln!();
+                        crate::git_fatal!("Aborting.");
+                    }
+                    // git's `push_unpushed_submodules` recursively runs `git push` inside
+                    // each submodule (submodule.c). That transport recursion is not wired
+                    // here; silently skipping it would upload a superproject commit whose
+                    // submodule commits are absent from their remotes (data-losing), so
+                    // abort and tell the user to push the submodules first.
+                    Recurse::OnDemand | Recurse::Only => {
+                        let mode = if f.recurse == Recurse::Only { "only" } else { "on-demand" };
+                        let list = needs.join(", ");
+                        bail!(
+                            "--recurse-submodules={mode}: the submodule(s) [{list}] have commits not on their remote and must be pushed first (cd <path> && git push); recursive submodule push is not supported"
+                        );
+                    }
+                    Recurse::Off => unreachable!("guarded by the outer `!= Recurse::Off`"),
+                }
+            }
+            if f.recurse == Recurse::Only {
+                // git never pushes the superproject under `only` (transport.c skips
+                // `push_refs`); with no submodule to push, that leaves nothing to do.
+                eprintln!("Everything up-to-date");
+                return Ok(Some(ExitCode::SUCCESS));
+            }
+        }
+
+        Ok(None)
+    };
+
+    let outcome = push_proto::send_pack(
+        &repo,
+        &remote,
+        &requests,
+        f.dry_run,
+        &send_opts,
+        Some(&mut between_match_and_push),
+    )?;
+    if let Some(code) = outcome.aborted {
+        return Ok(code);
+    }
     // `git_transport_push()` ORs in `finish_connect()` (transport.c:957), and the receive-pack
     // that `send_pack()` left without a command list died, so `push_with_options()` reports
     // the failure (builtin/push.c:393-394). With no refs there is no status block, no

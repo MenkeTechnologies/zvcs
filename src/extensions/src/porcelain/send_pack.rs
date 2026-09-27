@@ -405,7 +405,7 @@ fn push(st: &State) -> Result<ExitCode> {
     // Everything `send_pack()` can fail on is a `die()` in git — a refused
     // capability, a broken connection, an unreadable advertisement — so the
     // status is 128 rather than the dispatcher's 1.
-    let outcome = match push_proto::send_pack(&repo, &remote, &requests, st.dry_run, &opts) {
+    let outcome = match push_proto::send_pack(&repo, &remote, &requests, st.dry_run, &opts, None) {
         Ok(outcome) => outcome,
         Err(err) => {
             eprintln!("fatal: {err}");

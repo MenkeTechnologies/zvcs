@@ -211,6 +211,67 @@ fn remote_refs_position(advertised: &[String], created: &[String], name: &str) -
         .unwrap_or(usize::MAX)
 }
 
+/// A command `send_pack()` will write: the ref, its local source, the value the
+/// remote advertised and the one it is asked to take.
+struct Wire {
+    name: String,
+    src: Option<String>,
+    old: ObjectId,
+    new: ObjectId,
+    forced: bool,
+}
+
+/// The `pre-push` hook's stdin: every ref of `remote_refs` that has a peer, in
+/// that order, except the ones that will not be pushed —
+///
+/// ```c
+/// switch (r->status) {
+/// case REF_STATUS_REJECT_NONFASTFORWARD:
+/// case REF_STATUS_REJECT_REMOTE_UPDATED:
+/// case REF_STATUS_REJECT_STALE:
+/// case REF_STATUS_UPTODATE:
+///         return 0; /* skip refs which won't be pushed */
+/// ```
+///
+/// (`pre_push_hook_feed_stdin()`, transport.c:1349-1360.) The other refusals
+/// (`already exists`, `fetch first`, `needs force`) are listed. `old` is the
+/// advertised value, which is what the remote really holds.
+fn pre_push_lines(
+    statuses: &[RefStatus],
+    wire: &[Wire],
+    advertised: &[String],
+    created: &[String],
+) -> Vec<PrePushRef> {
+    let local = |src: Option<&str>, new: ObjectId| match src {
+        Some(src) if !new.is_null() => src.to_owned(),
+        _ => "(delete)".to_owned(),
+    };
+    let mut lines: Vec<PrePushRef> = statuses
+        .iter()
+        .filter(|s| !s.up_to_date && !s.pre_transport)
+        .filter(|s| {
+            !matches!(
+                s.result.as_ref().err().map(String::as_str),
+                Some("non-fast-forward" | "stale info" | "remote ref updated since checkout")
+            )
+        })
+        .map(|s| PrePushRef {
+            local: local(s.src.as_deref(), s.new),
+            new: s.new,
+            remote: s.name.clone(),
+            old: s.old,
+        })
+        .chain(wire.iter().map(|w| PrePushRef {
+            local: local(w.src.as_deref(), w.new),
+            new: w.new,
+            remote: w.name.clone(),
+            old: w.old,
+        }))
+        .collect();
+    lines.sort_by_cached_key(|l| remote_refs_position(advertised, created, &l.remote));
+    lines
+}
+
 /// Wire-level options that change the request itself rather than the ref list.
 #[derive(Default)]
 pub struct SendOptions {
@@ -355,7 +416,28 @@ pub struct Outcome {
     /// and dies `the remote end hung up unexpectedly`, which is how `finish_connect()` fails
     /// the push.
     pub no_refs: bool,
+    /// The `pre-push` hook refused (or the caller's hook step otherwise ended the
+    /// push) with this exit status. Nothing was sent and there is no status to
+    /// print; the caller has already said what went wrong.
+    pub aborted: Option<std::process::ExitCode>,
 }
+
+/// One line of the `pre-push` hook's stdin, `<local ref> <local oid> <remote
+/// ref> <remote oid>` (`pre_push_hook_feed_stdin()`, transport.c:1340-1375).
+pub struct PrePushRef {
+    /// `peer_ref->name`: the local ref, or `(delete)` for a deletion.
+    pub local: String,
+    /// `new_oid`, null for a deletion.
+    pub new: ObjectId,
+    /// `ref->name`, the remote ref.
+    pub remote: String,
+    /// `old_oid`: what the remote advertised, null for a ref it does not have.
+    pub old: ObjectId,
+}
+
+/// The caller's `pre-push` step: handed the hook's lines, it answers `None` to
+/// go on or `Some(status)` to stop.
+pub type PrePush<'a> = &'a mut dyn FnMut(&[PrePushRef]) -> Result<Option<std::process::ExitCode>>;
 
 
 /// The certificate's signed payload — split out from the signing so the exact
@@ -463,6 +545,7 @@ pub fn send_pack(
     requests: &[Request],
     dry_run: bool,
     opts: &SendOptions,
+    pre_push: Option<PrePush<'_>>,
 ) -> Result<Outcome> {
     let null = ObjectId::null(repo.object_hash());
     let url = remote
@@ -544,32 +627,6 @@ pub fn send_pack(
         }
     }
 
-    // `send_pack()` reads its own two keys here, right after the `if
-    // (!remote_refs)` early return and before the capability selection below
-    // (send-pack.c:542-560). Both go through `repo_config_get_bool`, so an
-    // unreadable value dies — and it dies *late*, after the transport is open:
-    // git 2.55.0 reports it for an already-up-to-date push and for `--dry-run`,
-    // and does not report it when the remote could not be reached at all.
-    //
-    //   * `push.negotiate` runs `git fetch --negotiate-only` against the same
-    //     URL first, so the pack can leave out what the rounds proved common.
-    //     This port's pack is built from the advertised tips alone, which is
-    //     what git falls back to when the key is false — its documented "rely
-    //     solely on the server's ref advertisement" behaviour.
-    //   * `push.useBitmaps` becomes `args->disable_bitmaps`, i.e.
-    //     `--no-use-bitmap-index` on the `pack-objects` child. `gix-pack` has no
-    //     bitmap reader, so the count is already the un-accelerated one.
-    //
-    // Both are therefore validated and reported exactly as git does while the
-    // acceleration each names stays unimplemented; see the module docs.
-    if !requests.is_empty() {
-        for key in ["push.negotiate", "push.usebitmaps"] {
-            if let Err(message) = crate::repo_settings::config_bool_strict(repo, key) {
-                crate::git_fatal!("{message}");
-            }
-        }
-    }
-
     // git's capability selection (send-pack.c, "Does the other end support…"):
     // prefer report-status-v2, fall back to report-status; request side-band-64k
     // whenever it is offered; advertise the hash algorithm and agent.
@@ -633,147 +690,10 @@ pub fn send_pack(
     if !server_supports_hash {
         crate::git_fatal!("the receiving end does not support this repository's hash algorithm");
     }
-    // `if (server_supports("side-band-64k")) use_sideband = 1;` (send-pack.c:573).
-    // git asks for it unconditionally, and it is what carries every `remote:` line
-    // back — including everything the server's hooks wrote — and what keeps the
-    // conversation open until the server's own closing flush.
-    let use_sideband = caps.contains("side-band-64k");
-
-    let mut cap_buf = String::new();
-    match status_report {
-        Some(2) => cap_buf.push_str(" report-status-v2"),
-        Some(1) => cap_buf.push_str(" report-status"),
-        _ => {}
-    }
-    if use_sideband {
-        cap_buf.push_str(" side-band-64k");
-    }
-    // ```c
-    // if (quiet_supported && (args->quiet || !args->progress))
-    //         strbuf_addstr(&cap_buf, " quiet");
-    // ```
-    //
-    // (send-pack.c:623-624.) `quiet` tells `receive-pack` not to run its own
-    // progress meter over the pack it indexes, and the sender asks for it
-    // whenever it is not itself showing progress. `args->quiet` is the caller's
-    // `-q`: `transport.c:918` sets it from `transport->verbose < 0`, while
-    // `cmd_send_pack` leaves its `quiet` at the `unsigned quiet = 0;` of
-    // builtin/send-pack.c:173 — no option in that table ever assigns it, so for
-    // `git send-pack` the condition is exactly `!args->progress`. The shared
-    // [`SendOptions`] carries no `quiet` of its own, so the one combination this
-    // cannot yet tell apart is `git push -q --progress`, where git suppresses the
-    // meter on both ends and this asks only for the local one.
-    if caps.contains("quiet") && !opts.progress {
-        cap_buf.push_str(" quiet");
-    }
-    // `--atomic` and `-o` are refused rather than downgraded: git errors when the
-    // receiving end lacks the capability, because pushing non-atomically (or
-    // dropping the options) would silently do something other than what was asked.
-    if opts.atomic {
-        if !caps.contains("atomic") {
-            // `die(_("the receiving end does not support --atomic push"))`
-            // (send-pack.c:608), reached with the connection still half-open —
-            // the same shape as the two refusals below, so the peer reads EOF
-            // where it expected the command list and the transport reports the
-            // hang-up as the second `fatal:`.
-            eprintln!("fatal: the receiving end does not support --atomic push");
-            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
-        }
-        cap_buf.push_str(" atomic");
-    }
-    if !opts.push_options.is_empty() {
-        if !caps.contains("push-options") {
-            // `send_pack()` dies with the first line; the connection is then torn
-            // down half-open and `transport_push()` reports that as the hang-up.
-            // Two `fatal:` lines, in this order, exit 128.
-            eprintln!("fatal: the receiving end does not support push options");
-            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
-        }
-        cap_buf.push_str(" push-options");
-    }
-    // `object-format` comes *after* `atomic` and `push-options` in the request,
-    // not before them (send-pack.c:617-630 builds `cap_buf` in that order). The
-    // capability list is order-insensitive to a conforming server, but it is what
-    // a recorded pkt-line stream is compared against.
-    if object_format_supported {
-        cap_buf.push_str(&format!(" object-format={}", repo.object_hash()));
-    }
-    // `push-cert=<nonce>`: the server hands out a nonce that the certificate has
-    // to quote back, which is what stops a captured certificate from being
-    // replayed against a different push.
-    let nonce = caps
-        .capability("push-cert")
-        .and_then(|c| c.value())
-        .map(|v| v.to_string())
-        .filter(|v| !v.is_empty());
-    let sign_cert = match opts.signed {
-        Signed::Never => false,
-        Signed::IfAsked => {
-            // `send_pack()` (send-pack.c): the two non-`never` modes differ only
-            // in how loudly they give up on a server that advertised no nonce.
-            //
-            // ```c
-            // else if (args->push_cert == SEND_PACK_PUSH_CERT_IF_ASKED)
-            //         warning(_("not sending a push certificate since the"
-            //                   " receiving end does not support --signed push"));
-            // ```
-            if nonce.is_none() {
-                eprintln!(
-                    "warning: not sending a push certificate since the receiving end does not support --signed push"
-                );
-            }
-            nonce.is_some()
-        }
-        Signed::Always => {
-            if nonce.is_none() {
-                // `die(_("the receiving end does not support --signed push"))`
-                // (send-pack.c:543). `send_pack()` dies with the connection
-                // still half-open, so the `receive-pack` on the other end reads
-                // EOF where it expected the command list and the transport
-                // reports that as the hang-up — the same two-`fatal:` shape the
-                // push-options refusal above produces, exit 128.
-                eprintln!("fatal: the receiving end does not support --signed push");
-                return Err(crate::fatal::die("the remote end hung up unexpectedly"));
-            }
-            true
-        }
-    };
-    if sign_cert {
-        cap_buf.push_str(" push-cert");
-    }
-    cap_buf.push_str(&format!(" agent={}", agent()));
-    // ```c
-    // repo_config_get_bool(r, "transfer.advertisesid", &advertise_sid);
-    // ...
-    // if (!server_supports("session-id"))
-    //         advertise_sid = 0;
-    // ...
-    // if (advertise_sid)
-    //         strbuf_addf(&cap_buf, " session-id=%s", trace2_session_id());
-    // ```
-    //
-    // (send-pack.c:562, :579-580, :633-634.) Opt-in on both ends: the config says
-    // this process is willing to name itself, and the server has to have
-    // advertised that it understands the capability. The id is the same trace2
-    // SID `upload-pack` advertises under the same setting.
-    let advertise_sid = repo
-        .config_snapshot()
-        .boolean("transfer.advertiseSID")
-        .unwrap_or(false);
-    if advertise_sid && caps.contains("session-id") {
-        cap_buf.push_str(&format!(" session-id={}", crate::trace2::session_id()));
-    }
 
     // Resolve each requested update against the advertisement, running git's
     // pre-flight fast-forward / delete checks. Rejected updates are reported but
     // never put on the wire (send-pack.c `check_to_send_update`).
-    struct Wire {
-        name: String,
-        src: Option<String>,
-        old: ObjectId,
-        new: ObjectId,
-        forced: bool,
-    }
     let mut wire: Vec<Wire> = Vec::new();
     // Every matched ref's new value, whether or not the update survived the
     // pre-flight checks above. `send_pack()` filters the *command list* with
@@ -1086,6 +1006,24 @@ pub fn send_pack(
     remote_refs_order(&mut statuses, &advertised_order, &created);
     wire.sort_by_cached_key(|w| remote_refs_position(&advertised_order, &created, &w.name));
 
+    // `transport_push()` runs the `pre-push` hook here: after
+    // `set_ref_status_for_push()` has decided every ref and before `push_refs()`
+    // — so ahead of `send_pack()`'s own refusals below (transport.c:1475-1481).
+    // A hook that fails ends the push with nothing sent.
+    if let Some(hook) = pre_push {
+        let lines = pre_push_lines(&statuses, &wire, &advertised_order, &created);
+        if let Some(code) = hook(&lines)? {
+            return Ok(Outcome {
+                url,
+                statuses: Vec::new(),
+                advertised: advertised_order,
+                unpack: Ok(()),
+                no_refs: false,
+                aborted: Some(code),
+            });
+        }
+    }
+
     // ```c
     // if (!remote_refs) {
     //         fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
@@ -1110,7 +1048,165 @@ pub fn send_pack(
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: true,
+            aborted: None,
         });
+    }
+
+    // `send_pack()` reads its own two keys here, right after the `if
+    // (!remote_refs)` early return and before the capability selection below
+    // (send-pack.c:542-560). Both go through `repo_config_get_bool`, so an
+    // unreadable value dies — and it dies *late*, after the transport is open:
+    // git 2.55.0 reports it for an already-up-to-date push and for `--dry-run`,
+    // and does not report it when the remote could not be reached at all.
+    //
+    //   * `push.negotiate` runs `git fetch --negotiate-only` against the same
+    //     URL first, so the pack can leave out what the rounds proved common.
+    //     This port's pack is built from the advertised tips alone, which is
+    //     what git falls back to when the key is false — its documented "rely
+    //     solely on the server's ref advertisement" behaviour.
+    //   * `push.useBitmaps` becomes `args->disable_bitmaps`, i.e.
+    //     `--no-use-bitmap-index` on the `pack-objects` child. `gix-pack` has no
+    //     bitmap reader, so the count is already the un-accelerated one.
+    //
+    // Both are therefore validated and reported exactly as git does while the
+    // acceleration each names stays unimplemented; see the module docs.
+    if !requests.is_empty() {
+        for key in ["push.negotiate", "push.usebitmaps"] {
+            if let Err(message) = crate::repo_settings::config_bool_strict(repo, key) {
+                crate::git_fatal!("{message}");
+            }
+        }
+    }
+
+    // `if (server_supports("side-band-64k")) use_sideband = 1;` (send-pack.c:573).
+    // git asks for it unconditionally, and it is what carries every `remote:` line
+    // back — including everything the server's hooks wrote — and what keeps the
+    // conversation open until the server's own closing flush.
+    let use_sideband = caps.contains("side-band-64k");
+
+    let mut cap_buf = String::new();
+    match status_report {
+        Some(2) => cap_buf.push_str(" report-status-v2"),
+        Some(1) => cap_buf.push_str(" report-status"),
+        _ => {}
+    }
+    if use_sideband {
+        cap_buf.push_str(" side-band-64k");
+    }
+    // ```c
+    // if (quiet_supported && (args->quiet || !args->progress))
+    //         strbuf_addstr(&cap_buf, " quiet");
+    // ```
+    //
+    // (send-pack.c:623-624.) `quiet` tells `receive-pack` not to run its own
+    // progress meter over the pack it indexes, and the sender asks for it
+    // whenever it is not itself showing progress. `args->quiet` is the caller's
+    // `-q`: `transport.c:918` sets it from `transport->verbose < 0`, while
+    // `cmd_send_pack` leaves its `quiet` at the `unsigned quiet = 0;` of
+    // builtin/send-pack.c:173 — no option in that table ever assigns it, so for
+    // `git send-pack` the condition is exactly `!args->progress`. The shared
+    // [`SendOptions`] carries no `quiet` of its own, so the one combination this
+    // cannot yet tell apart is `git push -q --progress`, where git suppresses the
+    // meter on both ends and this asks only for the local one.
+    if caps.contains("quiet") && !opts.progress {
+        cap_buf.push_str(" quiet");
+    }
+    // `--atomic` and `-o` are refused rather than downgraded: git errors when the
+    // receiving end lacks the capability, because pushing non-atomically (or
+    // dropping the options) would silently do something other than what was asked.
+    if opts.atomic {
+        if !caps.contains("atomic") {
+            // `die(_("the receiving end does not support --atomic push"))`
+            // (send-pack.c:608), reached with the connection still half-open —
+            // the same shape as the two refusals below, so the peer reads EOF
+            // where it expected the command list and the transport reports the
+            // hang-up as the second `fatal:`.
+            eprintln!("fatal: the receiving end does not support --atomic push");
+            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
+        }
+        cap_buf.push_str(" atomic");
+    }
+    if !opts.push_options.is_empty() {
+        if !caps.contains("push-options") {
+            // `send_pack()` dies with the first line; the connection is then torn
+            // down half-open and `transport_push()` reports that as the hang-up.
+            // Two `fatal:` lines, in this order, exit 128.
+            eprintln!("fatal: the receiving end does not support push options");
+            return Err(crate::fatal::die("the remote end hung up unexpectedly"));
+        }
+        cap_buf.push_str(" push-options");
+    }
+    // `object-format` comes *after* `atomic` and `push-options` in the request,
+    // not before them (send-pack.c:617-630 builds `cap_buf` in that order). The
+    // capability list is order-insensitive to a conforming server, but it is what
+    // a recorded pkt-line stream is compared against.
+    if object_format_supported {
+        cap_buf.push_str(&format!(" object-format={}", repo.object_hash()));
+    }
+    // `push-cert=<nonce>`: the server hands out a nonce that the certificate has
+    // to quote back, which is what stops a captured certificate from being
+    // replayed against a different push.
+    let nonce = caps
+        .capability("push-cert")
+        .and_then(|c| c.value())
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty());
+    let sign_cert = match opts.signed {
+        Signed::Never => false,
+        Signed::IfAsked => {
+            // `send_pack()` (send-pack.c): the two non-`never` modes differ only
+            // in how loudly they give up on a server that advertised no nonce.
+            //
+            // ```c
+            // else if (args->push_cert == SEND_PACK_PUSH_CERT_IF_ASKED)
+            //         warning(_("not sending a push certificate since the"
+            //                   " receiving end does not support --signed push"));
+            // ```
+            if nonce.is_none() {
+                eprintln!(
+                    "warning: not sending a push certificate since the receiving end does not support --signed push"
+                );
+            }
+            nonce.is_some()
+        }
+        Signed::Always => {
+            if nonce.is_none() {
+                // `die(_("the receiving end does not support --signed push"))`
+                // (send-pack.c:543). `send_pack()` dies with the connection
+                // still half-open, so the `receive-pack` on the other end reads
+                // EOF where it expected the command list and the transport
+                // reports that as the hang-up — the same two-`fatal:` shape the
+                // push-options refusal above produces, exit 128.
+                eprintln!("fatal: the receiving end does not support --signed push");
+                return Err(crate::fatal::die("the remote end hung up unexpectedly"));
+            }
+            true
+        }
+    };
+    if sign_cert {
+        cap_buf.push_str(" push-cert");
+    }
+    cap_buf.push_str(&format!(" agent={}", agent()));
+    // ```c
+    // repo_config_get_bool(r, "transfer.advertisesid", &advertise_sid);
+    // ...
+    // if (!server_supports("session-id"))
+    //         advertise_sid = 0;
+    // ...
+    // if (advertise_sid)
+    //         strbuf_addf(&cap_buf, " session-id=%s", trace2_session_id());
+    // ```
+    //
+    // (send-pack.c:562, :579-580, :633-634.) Opt-in on both ends: the config says
+    // this process is willing to name itself, and the server has to have
+    // advertised that it understands the capability. The id is the same trace2
+    // SID `upload-pack` advertises under the same setting.
+    let advertise_sid = repo
+        .config_snapshot()
+        .boolean("transfer.advertiseSID")
+        .unwrap_or(false);
+    if advertise_sid && caps.contains("session-id") {
+        cap_buf.push_str(&format!(" session-id={}", crate::trace2::session_id()));
     }
 
     // ```c
@@ -1176,6 +1272,7 @@ pub fn send_pack(
                 advertised: advertised_order,
                 unpack: Ok(()),
                 no_refs: false,
+                aborted: None,
             });
         }
     }
@@ -1206,6 +1303,7 @@ pub fn send_pack(
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: false,
+            aborted: None,
         });
     }
 
@@ -1218,6 +1316,7 @@ pub fn send_pack(
             advertised: advertised_order,
             unpack: Ok(()),
             no_refs: false,
+            aborted: None,
         });
     }
 
@@ -1481,6 +1580,7 @@ pub fn send_pack(
         advertised: advertised_order,
         unpack,
         no_refs: false,
+        aborted: None,
     })
 }
 

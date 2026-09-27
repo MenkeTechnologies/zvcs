@@ -2580,9 +2580,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `cmd_rev_list()` loads them with a *NULL* filter, not `git log`'s
     // `set_default_decoration_filter()` one — so a ref outside the decorated
     // namespaces (`refs/top`) shows here even though `git log --decorate` hides
-    // it. Hence `use_default = false` rather than log's `true`.
+    // it, and `log.excludeDecoration` excludes nothing.
     let bisect_decorations = if bisect_all {
-        let filter = super::log::DecorationFilter::build(&repo, &[], &[], false);
+        let filter = super::log::DecorationFilter::unfiltered();
         Some(super::log::build_decorations(&repo, &filter)?)
     } else {
         None
@@ -2604,8 +2604,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // is kept, and so are a root and a merge, because simplification may not change
     // the shape of the history; everything else is walked past, and what is then
     // unreachable from the tips drops out with it.
+    //
+    // "Decorated" is `get_name_decoration()`'s answer (revision.c:789-794), which
+    // loads every ref with no filter (log-tree.c:94-98): a commit named only by
+    // `refs/bisect/*`, `refs/notes/*` or a ref outside `git log`'s default
+    // namespaces is kept too.
     if simplify_by_decoration {
-        let filter = super::log::DecorationFilter::build(&repo, &[], &[], true);
+        let filter = super::log::DecorationFilter::unfiltered();
         let decos = super::log::build_decorations(&repo, &filter)?;
         let kept: HashSet<ObjectId> = commits
             .iter()

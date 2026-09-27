@@ -10123,6 +10123,21 @@ const DEFAULT_DECORATION_NAMESPACES: [&str; 6] = [
 ];
 
 impl DecorationFilter {
+    /// No filter at all: `load_ref_decorations(NULL, …)`, which is what
+    /// `get_name_decoration()` asks for (log-tree.c:94-98) whenever no command set
+    /// up a filter first. `add_ref_decoration()` then skips `ref_filter_match()`
+    /// entirely (log-tree.c:159-160), so every ref decorates — `refs/bisect/*`,
+    /// `refs/notes/*` and refs outside any namespace included — and
+    /// `log.excludeDecoration`, which only `set_default_decoration_filter()` reads,
+    /// plays no part. `rev-list` never builds a filter.
+    pub(crate) fn unfiltered() -> DecorationFilter {
+        DecorationFilter {
+            include: Vec::new(),
+            exclude: Vec::new(),
+            exclude_config: Vec::new(),
+        }
+    }
+
     /// git's `builtin/log.c:set_default_decoration_filter` followed by the
     /// normalization `load_ref_decorations` performs on all three lists.
     ///

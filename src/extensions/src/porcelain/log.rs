@@ -3413,12 +3413,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `if (revs->reflog_info && revs->limited) die(...)` — a reflog walk hands its
     // entries out in reflog order, so anything that makes git build a *limited*
     // (topologically ordered) revision list first has nothing to hand it. The
-    // limiting options this module models are the three sort orders, `--graph`,
-    // `--children` and `--simplify-merges`; `--reverse` has its own message and
-    // comes next. Both are refused ahead of the `--parents`/`--children` check
+    // limiting options are the three sort orders, `--graph`, `--children`,
+    // `--simplify-merges`/`--simplify-by-decoration`, `--ancestry-path`,
+    // `--left-only`/`--right-only`/`--cherry` and `--cherry-mark`/`--cherry-pick`
+    // (each sets `revs->limited` where it is parsed, revision.c:2405-2517);
+    // `--reverse` has its own message and comes next. Both are refused ahead of the `--parents`/`--children` check
     // below, which is where `setup_revisions()` puts them.
     if walk_reflogs {
-        if order != Order::Default || graph || show_children || simplify_merges_opt {
+        if order != Order::Default
+            || graph
+            || show_children
+            || simplify_merges_opt
+            || simplify_by_decoration
+            || ancestry_path
+            || left_only
+            || right_only
+            || cherry_mark
+            || cherry_pick
+        {
             eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
             return Ok(ExitCode::from(128));
         }

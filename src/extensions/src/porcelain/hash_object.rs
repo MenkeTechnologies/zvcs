@@ -275,8 +275,10 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
                         i += 1;
                         match args.get(i) {
                             Some(v) => opts.type_name = v.clone(),
+                            // `get_arg()`'s `PARSE_OPT_ERROR` (parse-options.c:60): the
+                            // one line, no usage block — as for the long options above.
                             None => {
-                                return Err(usage_error("switch `t' requires a value"));
+                                return Err(crate::parseopt::requires_value(crate::parseopt::OptName::Short('t')));
                             }
                         }
                     } else {

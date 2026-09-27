@@ -1560,7 +1560,14 @@ fn try_merge_strategy(
     match pick.kind {
         Strategy::Ours => ours_attempt(repo, ctx),
         Strategy::Resolve => resolve_attempt(repo, ctx, opts),
-        Strategy::Octopus => octopus_attempt(repo, ctx, opts),
+        Strategy::Octopus => {
+            // `try_merge_command()` (merge.c:22-42, from builtin/merge.c:847)
+            // runs `git-merge-octopus` through `run_command()`: a shell script, whose
+            // `echo`s reach the fd as they happen rather than sitting in this
+            // process's buffer until `cmd_merge`'s own stderr lines are out.
+            let _child = crate::cstdio::run_command();
+            octopus_attempt(repo, ctx, opts)
+        }
         Strategy::Ort | Strategy::Subtree => unreachable!("handled by the merge-ort branch above"),
     }
 }

@@ -122,6 +122,9 @@
 //!   two filespecs carry the null id, so `--find-object` keeps the pair only
 //!   when it names that id. All five pickaxe options contribute their
 //!   `pickaxe_opts` bit, for the three refusals listed above.
+//! * `--diff-filter=<letters>` (diff.c:5470-5500), applied last in
+//!   `diffcore_std()` (diff.c:7526) to the one pair, a plain `M`; an unknown
+//!   letter is the 129 parse-time error.
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
@@ -280,8 +283,7 @@
 //!   compile: upstream dies from inside `patch_diff()` with libc's `regerror()`
 //!   text, which this port does not reproduce.
 //! * `-B` / `--break-rewrites` (a large enough outer change becomes a complete
-//!   rewrite), `--word-diff`, `--color-moved`, `--diff-filter`, `--ext-diff`
-//!   and `-O`.
+//!   rewrite), `--word-diff`, `--color-moved`, `--ext-diff` and `-O`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -986,6 +988,10 @@ struct Opts {
     /// tab between `--raw`/`--name-status` fields and every line end of `--raw`,
     /// `--name-only`, `--name-status` and `--numstat` into NUL.
     nul_terminated: bool,
+    /// `--diff-filter=<letters>`, accumulated across occurrences as
+    /// `diff_opt_diff_filter()` does (diff.c:5470-5500) and applied last in
+    /// `diffcore_std()` by `diffcore_apply_filter()`.
+    diff_filter: super::diff_filter::Filter,
 }
 
 impl Opts {
@@ -1028,6 +1034,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
         nul_terminated: false,
+        diff_filter: super::diff_filter::Filter::default(),
     };
     // `--ws-error-highlight=<kind>`, held until the config default can be read.
     let mut ws_error_highlight: Option<u32> = None;
@@ -1347,6 +1354,17 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             "-z" => opts.nul_terminated = true,
+            "--diff-filter" => {
+                let value = match required_value(args, &mut i, name, inline) {
+                    Ok(v) => v,
+                    Err(code) => return Ok(code),
+                };
+                if let Err(bad) = opts.diff_filter.accumulate(&value) {
+                    return Ok(option_error(&format!(
+                        "unknown change class '{bad}' in --diff-filter={value}"
+                    )));
+                }
+            }
             "--find-copies-harder" | "--no-find-copies-harder" | "--no-renames"
             | "--rename-empty" | "--no-rename-empty" | "-D" | "--irreversible-delete"
             | "-R" | "-a" | "--text" | "--no-text" | "--no-ext-diff" => {}
@@ -2126,6 +2144,7 @@ pub(super) fn show_range_diff(
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
         nul_terminated: false,
+        diff_filter: super::diff_filter::Filter::default(),
     };
     let ends1 = match endpoints(repo, range1) {
         Ok(e) => walkable(repo, e),
@@ -4232,6 +4251,11 @@ fn flush_pair(
         if !pickaxe_keeps(kind, a, b) {
             return Ok(());
         }
+    }
+    // `diffcore_apply_filter()` closes `diffcore_std()` (diff.c:7526): the pair is
+    // a plain modification — `M`, with no `-B` score.
+    if !super::diff_filter::apply(opts.diff_filter, &[(b'M', None)])[0] {
+        return Ok(());
     }
     let fmt = opts.output_format;
     let unmodified = a == b;

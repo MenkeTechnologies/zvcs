@@ -590,66 +590,79 @@ pub(crate) struct AfterSetup {
 
 /// Model of what `setup_git_directory()` — and `setup_work_tree()` for a
 /// `NEED_WORK_TREE` command — leaves in `repo->gitdir`, the cwd and the
-/// environment of a non-bare repository.
+/// environment.
 ///
 /// * `setup_discovered_git_dir()` (setup.c:1207-1250): with neither
 ///   `GIT_WORK_TREE` nor `core.worktree`, the default `.git` stays `.git` and is
-///   not exported, and git stands at the top of the work tree. With either one,
-///   the discovered directory is made absolute with `real_pathdup()` when the
-///   walk left the directory the command started in (`offset != cwd->len`), and
+///   not exported, and git stands at the top of the work tree. A `.git` *file*
+///   hands setup the path `read_gitfile_gently()` resolved (setup.c:956-1035,
+///   :1599-1600) — absolute and symlink-free — and `strcmp(gitdir, ".git")`
+///   exports it. With `GIT_WORK_TREE` or `core.worktree`, a relative discovered
+///   directory is made absolute with `real_pathdup()` when the walk left the
+///   directory the command started in (`offset != cwd->len`), and
 ///   `setup_explicit_git_dir()` takes over.
-/// * `setup_explicit_git_dir()` (setup.c:1107-1205): `$GIT_DIR` is kept as given
-///   when the cwd *is* the work tree or lies outside it, and is `realpath`'d when
-///   setup has to `chdir()` up to the work tree from below (setup.c:1191-1198).
-///   Either way `set_git_dir()` exports it.
+/// * `setup_explicit_git_dir()` (setup.c:1107-1205): a `$GIT_DIR` naming a
+///   gitfile is replaced by what it points to (setup.c:1121-1125). It is kept as
+///   given when the cwd *is* the work tree or lies outside it, and is
+///   `realpath`'d when setup has to `chdir()` up to the work tree from below
+///   (setup.c:1191-1198). Either way `set_git_dir()` exports it. Without a work
+///   tree (`core.bare`, setup.c:1143-1154) it is exported as given and the cwd is
+///   left alone.
+/// * `setup_bare_git_dir()` (setup.c:1252-1281), and a discovered `.git` under
+///   `core.bare` (setup.c:1231-1237): the cwd is left alone and the directory is
+///   exported — `.` or `.git` when found where the command started, the path the
+///   walk reached (made real for `.git`) when found above it.
 /// * `setup_work_tree()` (setup.c:496-513): `chdir_notify()` to the work tree,
 ///   which re-parents a relative `repo->gitdir` through
 ///   `reparent_relative_path()` (chdir-notify.c:100-115) — `<old-cwd>/<gitdir>`
 ///   with the new cwd stripped as a leading path, or left whole when it is not
 ///   one — and a set `GIT_WORK_TREE` becomes `.`.
-///
-/// `None` for what this model does not cover — a bare repository, a git
-/// directory reached through a gitfile, a linked worktree — whose callers keep
-/// their own reckoning.
 pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
-    let work_tree = work_tree(repo)?;
     let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
-    let is_gitfile = |p: &Path| std::fs::metadata(p).is_ok_and(|m| m.is_file());
     let explicit = std::env::var_os("GIT_DIR");
     let work_tree_env = std::env::var_os("GIT_WORK_TREE");
     let has_core_worktree = repo.config_snapshot().string("core.worktree").is_some();
+    let gitfile = |p: &Path| crate::porcelain::rev_parse::read_gitfile_gently(p).ok().flatten();
 
+    let Some(work_tree) = work_tree(repo) else {
+        return bare_setup(repo, cwd, explicit.map(PathBuf::from), gitfile);
+    };
     let (git_dir, export) = match explicit {
-        Some(ref given) => {
-            if is_gitfile(Path::new(given)) {
-                return None;
-            }
-            explicit_git_dir(PathBuf::from(given), &cwd, &work_tree)
+        Some(given) => {
+            let given = PathBuf::from(given);
+            explicit_git_dir(gitfile(&given).unwrap_or(given), &cwd, &work_tree)
         }
         None => {
-            // Only a default `.git` directory: a gitfile (submodule, linked
-            // worktree) hands setup the path it names instead.
-            let found = crate::hooks::absolutize(repo.git_dir());
-            let top = found.parent()?.to_owned();
-            if found.file_name()? != ".git" || repo.common_dir() != repo.git_dir() {
-                return None;
-            }
-            let top = realpath(&top);
-            if work_tree_env.is_some() || has_core_worktree {
-                // `if (offset != cwd->len && !is_absolute_path(gitdir))
-                //         gitdir = to_free = real_pathdup(gitdir, 1);`
-                let git_dir = match cwd == top {
-                    true => PathBuf::from(".git"),
-                    false => realpath(&found),
-                };
-                explicit_git_dir(git_dir, &cwd, &work_tree)
-            } else {
-                // `set_git_work_tree(repo, ".")` at the top the walk reached, and
-                // `.git` is not passed to `set_git_dir()` at all.
-                if top != work_tree {
-                    return None;
+            // The walk stops at the first directory holding a `.git` entry.
+            let dot_git = cwd.ancestors().map(|d| d.join(".git")).find(|p| p.exists())?;
+            let top = dot_git.parent()?.to_owned();
+            match gitfile(&dot_git) {
+                Some(target) if work_tree_env.is_some() || has_core_worktree => {
+                    explicit_git_dir(target, &cwd, &work_tree)
                 }
-                (PathBuf::from(".git"), false)
+                Some(target) => {
+                    if top != work_tree {
+                        return None;
+                    }
+                    (target, true)
+                }
+                None if work_tree_env.is_some() || has_core_worktree => {
+                    // `if (offset != cwd->len && !is_absolute_path(gitdir))
+                    //         gitdir = to_free = real_pathdup(gitdir, 1);`
+                    let git_dir = match cwd == top {
+                        true => PathBuf::from(".git"),
+                        false => realpath(&dot_git),
+                    };
+                    explicit_git_dir(git_dir, &cwd, &work_tree)
+                }
+                None => {
+                    // `set_git_work_tree(repo, ".")` at the top the walk reached,
+                    // and `.git` is not passed to `set_git_dir()` at all.
+                    if top != work_tree {
+                        return None;
+                    }
+                    (PathBuf::from(".git"), false)
+                }
             }
         }
     };
@@ -678,6 +691,48 @@ pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
     Some(state)
 }
 
+/// [`after_setup`] for a repository without a work tree: git stays where the
+/// command was typed and exports the directory it settled on.
+fn bare_setup(
+    repo: &gix::Repository,
+    cwd: PathBuf,
+    explicit: Option<PathBuf>,
+    gitfile: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<AfterSetup> {
+    let git_dir = match explicit {
+        // `set_git_dir(repo, gitdirenv, 0)` (setup.c:1152, :1172).
+        Some(given) => gitfile(&given).unwrap_or(given),
+        None => {
+            let target = realpath(repo.git_dir());
+            let found = cwd.ancestors().find_map(|d| {
+                let dot_git = d.join(".git");
+                if let Some(to) = gitfile(&dot_git) {
+                    return Some(to);
+                }
+                if dot_git.is_dir() && realpath(&dot_git) == target {
+                    // `set_git_dir(repo, ".git", offset != cwd->len)`.
+                    return Some(match d == cwd {
+                        true => PathBuf::from(".git"),
+                        false => realpath(&dot_git),
+                    });
+                }
+                // `setup_bare_git_dir()`: `.` here, the walked prefix above.
+                (d == target).then(|| match d == cwd {
+                    true => PathBuf::from("."),
+                    false => d.to_owned(),
+                })
+            })?;
+            found
+        }
+    };
+    Some(AfterSetup {
+        cwd,
+        git_dir,
+        export_git_dir: true,
+        work_tree_env: None,
+    })
+}
+
 /// Give `cmd` what every child git starts with `cp->dir` left NULL inherits from
 /// setup: `GIT_PREFIX`, exported by `setup_git_directory()` for all children
 /// (setup.c:2069-2076), and — under the [`after_setup`] model — git's cwd, its
@@ -704,8 +759,8 @@ pub(crate) fn export_to_child(
 
 /// `git_path(name)` (path.c:387-431) as a child of git sees it: `name` under
 /// [`AfterSetup::git_dir`], so relative to [`AfterSetup::cwd`] or absolute.
-/// Outside the model — a gitfile, a linked worktree — git's `repo->gitdir` is the
-/// absolute path the gitfile named, which the absolute git directory stands in for.
+/// Outside the model — a work tree the walk did not reach, which setup has no
+/// spelling for here — the absolute git directory stands in.
 pub(crate) fn git_path_spelled(repo: &gix::Repository, name: &str) -> PathBuf {
     match after_setup(repo) {
         Some(s) => s.git_dir.join(name),

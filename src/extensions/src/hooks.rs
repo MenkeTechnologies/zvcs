@@ -106,9 +106,12 @@ fn paths(repo: &gix::Repository, event: &str) -> Result<(PathBuf, String)> {
             // `git_path("hooks/<event>")` is `repo->gitdir` as setup left it,
             // spelled verbatim — `../.git`, `<abs>/sub/../.git` and all.
             let git_dir = repo.common_dir();
+            // A linked worktree's common directory is `get_common_dir()`'s real
+            // path (setup.c:323-352), not a spelling of `repo->gitdir`.
+            let linked = repo.common_dir() != repo.git_dir();
             let shown = match &setup {
-                Some(s) => s.git_dir.join("hooks"),
-                None => git_dir_as_git_spells_it(repo).join("hooks"),
+                Some(s) if !linked => s.git_dir.join("hooks"),
+                _ => git_dir_as_git_spells_it(repo).join("hooks"),
             };
             (git_dir.join("hooks"), shown)
         }

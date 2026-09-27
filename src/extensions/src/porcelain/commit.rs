@@ -1150,16 +1150,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
         pathspecs = read_pathspec_file(src, pathspec_file_nul)?;
     }
-    // `builtin/commit.c:parse_and_validate_options`:
-    //     if (argc == 0 && (also || (only && !amend && !allow_empty)))
-    //             die(_("No paths with --include/--only does not make sense."));
-    // `--only` with no paths is how a caller says "commit exactly what is staged
-    // and nothing the worktree has since changed", which is meaningful the moment
-    // there is something to commit without a pathspec — an amend, or an explicitly
-    // allowed empty commit. `--include` has no such reading and always needs paths.
-    //
-    // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
-    // how the JetBrains client rewords a commit message.
     // ```c
     // } else if (skip_prefix(fixup_message, "reword:", &fixup_commit)) {
     //         fixup_prefix = "amend";
@@ -1171,14 +1161,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // (builtin/commit.c's `--fixup` parsing.) `reword:` is `amend:` with two
     // extra flags, and git sets them while parsing options — so they are in force
     // for every check below, including the "No paths with --include/--only" one
-    // this sits in front of. The message itself is shaped further down, where the
+    // further down. The message itself is shaped further down, where the
     // `amend` prefix it shares is handled.
     let fixup_reword = fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("reword:"));
     if fixup_reword {
         allow_empty = true;
-    }
-    if pathspecs.is_empty() && (include_flag || (only_flag && !amend && !allow_empty)) {
-        crate::git_fatal!("No paths with --include/--only does not make sense.");
     }
     // `parse_and_validate_options()` rejects a malformed `-u<mode>` and
     // `--cleanup=<mode>` before the index is read, so the answer does not depend
@@ -1348,6 +1335,43 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         && !whence.is_rebase()
     {
         crate::git_fatal!("--reset-author can be used only with -C, -c or --amend.");
+    }
+
+    // `check_fixup_reword_options()` (builtin/commit.c:1295-1307), called while
+    // `--fixup=reword:` is parsed (:1399-1401): a reword records no content, so
+    // an operation in progress, a pathspec on the command line (`argv[0]`, the
+    // first one — `--pathspec-from-file` is only read later, in
+    // `prepare_index()`) and every staging mode are refused.
+    if fixup_reword {
+        match whence {
+            Whence::Merge => crate::git_fatal!("You are in the middle of a merge -- cannot reword."),
+            Whence::CherryPick => {
+                crate::git_fatal!("You are in the middle of a cherry-pick -- cannot reword.")
+            }
+            _ => {}
+        }
+        if let Some(path) = pathspecs.first().filter(|_| pathspec_from_file.is_none()) {
+            crate::git_fatal!("reword option of '--fixup' and path '{path}' cannot be used together");
+        }
+        if interactive || all || include_flag || only_flag {
+            crate::git_fatal!(
+                "reword option of '--fixup' and '--patch/--interactive/--all/--include/--only' cannot be used together"
+            );
+        }
+    }
+    // `prepare_index()` (builtin/commit.c:387-390), after every option check:
+    //     if (!pathspec.nr && (also || (only && !allow_empty &&
+    //         (!amend || (fixup_message && strcmp(fixup_prefix, "amend"))))))
+    //             die(_("No paths with --include/--only does not make sense."));
+    // `--only` with no paths is how a caller says "commit exactly what is staged
+    // and nothing the worktree has since changed", which is meaningful the moment
+    // there is something to commit without a pathspec — an amend, or an explicitly
+    // allowed empty commit. `--include` has no such reading and always needs paths.
+    //
+    // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
+    // how the JetBrains client rewords a commit message.
+    if pathspecs.is_empty() && (include_flag || (only_flag && !amend && !allow_empty)) {
+        crate::git_fatal!("No paths with --include/--only does not make sense.");
     }
 
     // `prepare_index()`: a pathspec-limited commit builds a tree that ignores the

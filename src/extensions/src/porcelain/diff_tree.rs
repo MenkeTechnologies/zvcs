@@ -1186,7 +1186,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
                 Some(new) => {
                     let changes = collect(&repo, Some(old), Some(new), &opts)?;
                     differed = !changes.is_empty();
-                    render_all(&repo, &mut out, &changes, &opts)?
+                    render_all(&repo, &mut out, &changes, &opts, None)?
                 }
             },
         }
@@ -1288,7 +1288,7 @@ fn diff_tree_stdin(
                 };
                 let changes = collect(repo, Some(ta), Some(tb), opts)?;
                 *differed |= !changes.is_empty();
-                let code = render_all(repo, out, &changes, opts)?;
+                let code = render_all(repo, out, &changes, opts, None)?;
                 if code != 0 {
                     return Ok(code);
                 }
@@ -1355,10 +1355,25 @@ fn emit_commit_diff(
     for before in befores {
         let changes = collect(repo, before, Some(new_tree), opts)?;
         *differed |= !changes.is_empty();
-        if opts.always || (!opts.no_commit_id && !changes.is_empty()) {
+        // `log_tree_diff_flush()` prints the header only once `diffcore_std()` has
+        // left the queue non-empty (log-tree.c:929-940). A routed run's diffcore —
+        // pickaxe, `--diff-filter`, `--find-object` — lives in `diff-pairs`, so the
+        // header travels with the pairs and is written there; `--always`
+        // (`log_tree_diff()`'s `opt->always` arm) prints it regardless.
+        let mut header = Vec::new();
+        let mut routed_header = None;
+        if opts.always {
             emit_commit_header(repo, out, commit_id, opts)?;
+        } else if !opts.no_commit_id && !changes.is_empty() {
+            match opts.route {
+                Some(_) => {
+                    emit_commit_header(repo, &mut header, commit_id, opts)?;
+                    routed_header = Some(header.as_slice());
+                }
+                None => emit_commit_header(repo, out, commit_id, opts)?,
+            }
         }
-        let code = render_all(repo, out, &changes, opts)?;
+        let code = render_all(repo, out, &changes, opts, routed_header)?;
         if code != 0 {
             return Ok(code);
         }
@@ -2374,7 +2389,7 @@ fn combined_commit(
         // `diff-pairs` answers `--exit-code` with 1, but git runs this pass on a
         // *copy* of `diffopt` (`combine-diff.c:1570`) and reads the exit status from
         // the original, so the stat can only report a fatal here.
-        let code = render_all(repo, out, &changes, &stat_opts)?;
+        let code = render_all(repo, out, &changes, &stat_opts, None)?;
         if code > 1 {
             return Ok(code);
         }
@@ -2602,7 +2617,7 @@ fn merge_base_diff(
     let new_tree = tree_of(repo, commits[1])?;
     let changes = collect(repo, Some(base_tree), Some(new_tree), opts)?;
     *differed = !changes.is_empty();
-    render_all(repo, out, &changes, opts)
+    render_all(repo, out, &changes, opts, None)
 }
 
 /// The tree a commit points at.
@@ -2872,6 +2887,7 @@ fn render_all(
     out: &mut Vec<u8>,
     changes: &[Change],
     opts: &Opts,
+    log_header: Option<&[u8]>,
 ) -> Result<u8> {
     // A routed run hands the walk output straight to `diff-pairs`, which owns every
     // patch, diffstat, dirstat, whitespace and rename format.
@@ -2895,6 +2911,7 @@ fn render_all(
                 // creation is a deletion by the time any format reads its status.
                 queue_time_reverse: opts.route_reverse,
                 pickaxe_icase: opts.pickaxe_icase,
+                log_header,
             },
         )?;
         return Ok(status.code());

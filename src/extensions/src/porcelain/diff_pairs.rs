@@ -810,6 +810,9 @@ struct Opts {
     /// `--ext-diff` / `--no-ext-diff` (`o->flags.allow_external`). Off by default:
     /// `diff_setup()` only turns external drivers on for the porcelain commands.
     allow_external: bool,
+    /// The caller's `show_log()` output, written ahead of the diff only when the
+    /// queue survives `diffcore_std()` — see [`RouteCtx::log_header`].
+    log_header: Option<Vec<u8>>,
     /// The inverse of `builtin/diff-pairs.c`s `skip_resolving_statuses`. That flag is
     /// specific to reading pairs off stdin, where the status letters are given; every
     /// other caller of `diffcore_std()` — `diff-tree` routed through here included —
@@ -938,7 +941,21 @@ pub fn diff_pairs(args: &[String]) -> Result<std::process::ExitCode> {
 /// What an *in-process* caller knows that a shell caller cannot express, because
 /// stock `git diff-pairs` has no spelling for either.
 #[derive(Default, Clone, Copy)]
-pub(crate) struct RouteCtx {
+pub(crate) struct RouteCtx<'a> {
+    /// A per-commit header (`show_log()`) that `log_tree_diff_flush()` prints only
+    /// once `diffcore_std()` has left the queue non-empty (log-tree.c:929-940):
+    ///
+    /// ```c
+    /// diffcore_std(&opt->diffopt);
+    /// if (diff_queue_is_empty(&opt->diffopt)) {
+    ///         …
+    ///         return 0;
+    /// }
+    /// ```
+    ///
+    /// A routed `diff-tree` hands its header here instead of printing it, so a
+    /// pickaxe or `--diff-filter` that drops every pair drops the header too.
+    pub log_header: Option<&'a [u8]>,
     /// `o->abbrev` as the calling command resolved it (`fill_metainfo()`, diff.c:4915:
     /// `int abbrev = o->abbrev ? o->abbrev : DEFAULT_ABBREV`). Stock `git diff-pairs
     /// --abbrev=<n>` leaves its `index` lines at `core.abbrev` (measured against
@@ -989,7 +1006,7 @@ pub(crate) fn render_raw_stream(
     args: &[String],
     pairs: Option<Vec<u8>>,
     sink: Option<&mut Vec<u8>>,
-    route: RouteCtx,
+    route: RouteCtx<'_>,
 ) -> Result<Status> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first().map(String::as_str) {
@@ -1040,6 +1057,7 @@ pub(crate) fn render_raw_stream(
         ignore_submodules_set: false,
         submodule_format: SubmoduleFormat::Short,
         allow_external: false,
+        log_header: route.log_header.map(<[u8]>::to_vec),
         resolve_statuses: false,
     };
     // Whether a `--ws-error-highlight` flag was seen, so the config default does not
@@ -2601,6 +2619,9 @@ fn flush(
 
     if pairs.is_empty() {
         return Ok(Ok(()));
+    }
+    if let Some(header) = &opts.log_header {
+        out.write_all(header)?;
     }
     // `diff_flush()` with `DIFF_FORMAT_NO_OUTPUT` renders nothing — but its tail
     // (diff.c:7265) still walks the queue with `diff_flush_patch_quietly()` when the

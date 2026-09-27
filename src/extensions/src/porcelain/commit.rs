@@ -469,7 +469,12 @@ fn read_state_oid(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
 /// The `U<TAB><path>` lines are `refresh_index()`'s `REFRESH_IN_PORCELAIN`
 /// report and go to **stdout**, one per conflicted path; the diagnosis and the
 /// `advice.resolveConflict` hint go to stderr, and the exit status is 128.
+///
+/// The `U` lines sit in stdio's buffer until the `die()`'s `exit()`, so off a
+/// terminal they come out after the stderr lines; the buffer is armed here and
+/// flushed when the command returns.
 pub(super) fn die_resolve_conflict(index: &gix::index::File) -> ExitCode {
+    crate::cstdio::defer();
     let backing = index.path_backing();
     let mut last: Option<&gix::bstr::BStr> = None;
     for entry in index.entries() {
@@ -482,10 +487,9 @@ pub(super) fn die_resolve_conflict(index: &gix::index::File) -> ExitCode {
         if last == Some(path) {
             continue;
         }
-        println!("U\t{path}");
+        crate::cstdio::println!("U\t{path}");
         last = Some(path);
     }
-    let _ = std::io::Write::flush(&mut std::io::stdout());
     eprintln!("error: Committing is not possible because you have unmerged files.");
     crate::advice::Advice::ResolveConflict.advise_plain(
         "Fix them up in the work tree, and then use 'git add/rm <file>'\n\

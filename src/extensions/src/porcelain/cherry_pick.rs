@@ -2115,6 +2115,8 @@ fn continue_single_pick(
     // literally that command's — the `U<TAB><path>` report on stdout included.
     let mut index = repo.open_index()?;
     if index.entries().iter().any(|e| e.stage_raw() != 0) {
+        // A `git commit` child: its `U` lines flush at its own exit.
+        let _child = crate::cstdio::run_command();
         return Ok(Err(super::commit::die_resolve_conflict(&index)));
     }
     // The tree comes out of the cache-tree, and the index is written back with the

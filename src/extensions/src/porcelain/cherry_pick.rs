@@ -1111,9 +1111,11 @@ fn pick_one(
         // demand is that the index be merged — `cache_tree_update()` names every
         // conflicted entry on its way out.
         if let Some(unmerged) = unmerged_entries(&state.index) {
-            for (path, id) in unmerged {
-                eprintln!("{path}: unmerged ({id})");
-            }
+            // `verify_cache()` (cache-tree.c:171-184) caps the list at ten
+            // lines and a bare `...`; the shared reporter carries that cap.
+            super::write_tree::report_tree_build_failure(
+                &gix::index::extension::tree::update::Error::Unmerged(unmerged),
+            );
             eprintln!("error: your index file is unmerged.");
             return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
         }

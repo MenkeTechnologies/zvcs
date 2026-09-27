@@ -1049,7 +1049,17 @@ fn revert_one(
     let index_state = read_index_state(repo, head_tree)?;
     if o.no_commit {
         if index_state.unmerged {
+            // `write_index_as_tree()` (sequencer.c:2293) fails in
+            // `cache_tree_update()` → `verify_cache()` (cache-tree.c:165-186),
+            // which names every conflicted stage (ten at most, then `...`)
+            // before `do_pick_commit` adds its error and `run_sequencer` its
+            // `die(_("%s failed"))` (builtin/revert.c:276).
+            let mut index = repo.open_index()?;
+            if let Err(err) = super::write_tree::refresh_cache_tree(repo, &mut index, false)? {
+                super::write_tree::report_tree_build_failure(&err);
+            }
             eprintln!("error: your index file is unmerged.");
+            eprintln!("fatal: revert failed");
             return Ok(Step::Failed(ExitCode::from(128)));
         }
     } else if index_state.unmerged {

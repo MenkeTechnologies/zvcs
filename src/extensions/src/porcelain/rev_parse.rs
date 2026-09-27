@@ -60,7 +60,7 @@
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--bisect`, `--default <rev>`, `--prefix <dir>`,
+//! `--bisect`, `--prefix <dir>`,
 //! `--all-objects` and `--exclude-hidden=`. Options git does
 //! *not* recognize are echoed — through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
@@ -139,6 +139,10 @@ struct Opts {
     /// differs from it (:135-140), so under an odd number of `--not`s a plain
     /// revision gains the caret and a `^rev` exclude loses it.
     not: bool,
+    /// git's `static const char *def` (`builtin/rev-parse.c:43`), set by
+    /// `--default <rev>`. Every `show_rev()` that gets past the `DO_REVS` filter
+    /// clears it (:146-148); [`show_default`] prints what is left.
+    def: std::cell::RefCell<Option<String>>,
 }
 
 /// `#define DO_REVS 1` … `#define DO_NONFLAGS 8` (`builtin/rev-parse.c:38-41`).
@@ -217,6 +221,7 @@ impl Default for Opts {
             format: Format::Default,
             sq: false,
             not: false,
+            def: std::cell::RefCell::new(None),
         }
     }
 }
@@ -227,17 +232,16 @@ impl Default for Opts {
 const UNIMPLEMENTED_EXACT: &[&str] = &[
     "-h",
     "--help",
-    "--default",
     "--prefix",
     "--bisect",
     "--all-objects",
 ];
 
-/// `--default` and `--prefix` are matched with `strcmp()` and take `argv[++i]`
-/// (`builtin/rev-parse.c:832-845`), so a `--default=<rev>` / `--prefix=<dir>`
-/// spelling is not those options at all: it falls through to `show_flag()` and
-/// is echoed like any other unknown flag. Only the separate-argument forms are
-/// listed in [`UNIMPLEMENTED_EXACT`].
+/// `--prefix` is matched with `strcmp()` and takes `argv[++i]`
+/// (`builtin/rev-parse.c:838-845`), so a `--prefix=<dir>` spelling is not that
+/// option at all: it falls through to `show_flag()` and is echoed like any other
+/// unknown flag. Only the separate-argument form is listed in
+/// [`UNIMPLEMENTED_EXACT`].
 const UNIMPLEMENTED_PREFIX: &[&str] = &["--exclude-hidden="];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
@@ -424,9 +428,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // After an explicit `--`, everything is a pathspec: echo it (when paths
         // are being echoed) and move on. No existence check, no flag parsing.
         if dashdash {
-            if o.shows_files() {
-                show(&mut out, &o, arg.as_bytes())?;
-            }
+            show_file(&mut out, &repo, &o, arg)?;
             continue;
         }
 
@@ -441,8 +443,8 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // under `DO_NONFLAGS | DO_NOREV` — so `--verify`/`--short` and
         // `--revs-only` swallow the separator while `--no-flags` keeps it.
         if !as_is && arg == "--" {
-            if o.filter & (DO_FLAGS | DO_REVS) != 0 && o.shows_files() {
-                show(&mut out, &o, arg.as_bytes())?;
+            if o.filter & (DO_FLAGS | DO_REVS) != 0 {
+                show_file(&mut out, &repo, &o, arg)?;
             }
             dashdash = true;
             continue;
@@ -462,8 +464,8 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // Unlike `--` it ends only the *options*: what follows is still read as
         // revisions and paths.
         if !as_is && !seen_end_of_options && arg == "--end-of-options" {
-            if o.filter & (DO_FLAGS | DO_REVS) != 0 && o.shows_files() {
-                show(&mut out, &o, arg.as_bytes())?;
+            if o.filter & (DO_FLAGS | DO_REVS) != 0 {
+                show_file(&mut out, &repo, &o, arg)?;
             }
             seen_end_of_options = true;
             continue;
@@ -542,10 +544,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         //         verify_filename(prefix, arg, 0);` (`builtin/rev-parse.c:751-753`):
         // a path that is not printed is not checked either.
         if as_is {
-            if !o.shows_files() {
+            if !show_file(&mut out, &repo, &o, arg)? {
                 continue;
             }
-            show(&mut out, &o, arg.as_bytes())?;
             // `verify_filename(prefix, arg, 0)` opens with
             // `if (*arg == '-') die(_("option '%s' must come before non-option arguments"), arg);`
             // (setup.c:287-288): past the first path an option spelling is
@@ -891,10 +892,9 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // (`builtin/rev-parse.c:1185-1187`): under `--revs-only` or
                 // `--no-flags`' sibling filters the operand is neither echoed nor
                 // required to exist.
-                if !o.shows_files() {
+                if !show_file(&mut out, &repo, &o, arg)? {
                     continue;
                 }
-                show(&mut out, &o, arg.as_bytes())?;
                 // `verify_filename(prefix, arg, 1)` refuses a leading `-` before
                 // anything else (setup.c:287-288). An operand only reaches here
                 // with one when `--end-of-options` stopped it being read as an
@@ -939,11 +939,17 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             Some((id, name, reversed)) if revs == 1 => {
                 show_rev(&mut out, &repo, &o, &id, Some(name.as_bstr()), None, reversed)?;
             }
+            // `else if (revs_count == 0 && show_default()) return 0;`
+            // (`builtin/rev-parse.c:1192-1195`).
+            _ if revs == 0 && show_default(&mut out, &repo, &o)? => {}
             _ => {
                 out.flush()?;
                 return Ok(die_single(o.quiet));
             }
         }
+    } else {
+        // `show_default();` (`builtin/rev-parse.c:1197-1198`).
+        show_default(&mut out, &repo, &o)?;
     }
 
     out.flush()?;
@@ -2091,6 +2097,9 @@ fn show_rev(
     if o.filter & DO_REVS == 0 {
         return Ok(());
     }
+    // `def = NULL;` (`builtin/rev-parse.c:148`): a revision was shown, so
+    // `--default` has nothing left to stand in for.
+    o.def.replace(None);
     // Build the rendered text without the newline first. `None` means "print
     // nothing" — and for a `^rev` exclude the `^` is suppressed along with it,
     // which is why `rev-parse --abbrev-ref ^HEAD~1` prints an empty result
@@ -2172,6 +2181,34 @@ fn show_rev(
         show(out, o, &p)?;
     }
     Ok(())
+}
+
+/// `show_default()` (`builtin/rev-parse.c:205-218`): print the `--default`
+/// revision if one is still pending, and say whether it printed. The pending
+/// name is dropped either way, and a name that does not resolve is silently not
+/// shown.
+fn show_default(out: &mut impl Write, repo: &gix::Repository, o: &Opts) -> Result<bool> {
+    let Some(name) = o.def.take() else {
+        return Ok(false);
+    };
+    let Some(id) = crate::objname::resolve(repo, &name) else {
+        return Ok(false);
+    };
+    show_rev(out, repo, o, &id, Some(name.as_bytes().as_bstr()), None, false)?;
+    Ok(true)
+}
+
+/// `show_file()` (`builtin/rev-parse.c:253-266`): a path, `--` or
+/// `--end-of-options` is about to be echoed, so the pending `--default` goes out
+/// first — even when the filter then keeps the token itself off stdout. Returns
+/// whether the token was printed.
+fn show_file(out: &mut impl Write, repo: &gix::Repository, o: &Opts, arg: &str) -> Result<bool> {
+    show_default(out, repo, o)?;
+    if !o.shows_files() {
+        return Ok(false);
+    }
+    show(out, o, arg.as_bytes())?;
+    Ok(true)
 }
 
 /// Render an object id to the hex bytes that current option state calls for:
@@ -2546,6 +2583,25 @@ fn positional_option(
         };
         let path = git_path(repo, paths, name);
         print_path(out, paths, &path, o.format, DefaultType::RelativeIfShared)?;
+        return Ok(Positional::ConsumedValue);
+    }
+    // ```c
+    // if (!strcmp(arg, "--default")) {
+    //         def = argv[++i];
+    //         if (!def)
+    //                 die(_("--default requires an argument"));
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:832-837`.) Only recorded here; [`show_default`]
+    // prints it later, if no revision has been shown by then.
+    if arg == "--default" {
+        let Some(rev) = next else {
+            out.flush()?;
+            eprintln!("fatal: --default requires an argument");
+            return Ok(Positional::Fatal);
+        };
+        o.def.replace(Some(rev.clone()));
         return Ok(Positional::ConsumedValue);
     }
     // ```c

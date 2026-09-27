@@ -394,9 +394,9 @@ impl Mark {
             }
         }
         let (mut expendable, mut precious, mut untracked, mut entries, mut matching_entries) = (0, 0, 0, 0, 0);
-        for (kind, status, pathspec_match) in state.on_hold[self.start_index..]
+        for (status, pathspec_match) in state.on_hold[self.start_index..]
             .iter()
-            .map(|e| (e.disk_kind, e.status, e.pathspec_match))
+            .map(|e| (e.status, e.pathspec_match))
         {
             // A file the pathspec does not match is `path_none` to git before its
             // ignore status is even asked (dir.c:2501-2509): it is neither a
@@ -407,9 +407,12 @@ impl Mark {
                 continue;
             }
             entries += 1;
-            if kind == Some(entry::Kind::Repository) {
-                return None;
-            }
+            // A nested repository does not keep its parent from being reported whole.
+            // `treat_directory()` makes it `path_none` under `DIR_SKIP_NESTED_GIT` and a
+            // plain untracked entry otherwise (dir.c:2034-2038); either way the parent
+            // is an untracked directory like any other — `?? ud/` in `status`, and for
+            // `clean` the candidate whose `remove_dirs()` spares the repository inside:
+            // `Would skip repository ud/nest` (builtin/clean.c:176-186).
             if deletion_whole_dir.is_none()
                 && pathspec_match.is_some_and(|m| matches!(m, PathspecMatch::Verbatim | PathspecMatch::Excluded))
             {

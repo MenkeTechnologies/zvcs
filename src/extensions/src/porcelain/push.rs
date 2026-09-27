@@ -1954,7 +1954,7 @@ fn local_head_names(repo: &gix::Repository) -> Vec<String> {
 ///
 /// A symbolic branch is skipped: `try_id()` is `None` for it, and there is no
 /// branch to push under that name anyway.
-fn local_branch_tips(repo: &gix::Repository) -> Vec<(String, ObjectId)> {
+pub(super) fn local_branch_tips(repo: &gix::Repository) -> Vec<(String, ObjectId)> {
     let Ok(platform) = repo.references() else { return Vec::new() };
     let Ok(iter) = platform.local_branches() else { return Vec::new() };
     iter.filter_map(Result::ok)
@@ -2916,7 +2916,7 @@ fn reachable(repo: &gix::Repository, commit: ObjectId, tip: ObjectId) -> bool {
 ///
 /// Only refs are matched, never revisions: `refs/heads/*` cannot select a commit,
 /// which is why this is separate from [`parse_refspec`]'s `rev_parse_single`.
-fn expand_pattern_refspec(
+pub(super) fn expand_pattern_refspec(
     repo: &gix::Repository,
     spec: &str,
     force: bool,

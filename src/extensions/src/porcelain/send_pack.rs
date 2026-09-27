@@ -47,9 +47,6 @@
 //!     narrates its pack, not what the receiver is asked to do. The pack this
 //!     sends is never thin and reports no progress, which is a valid choice for
 //!     either flag's value, so neither changes the bytes on the wire.
-//!   * **Refspec forms beyond `[+]<src>[:<dst>]`.** `match_push_refs()`'s
-//!     pattern expansion (`refs/heads/*:refs/heads/*`) is not implemented here;
-//!     `git push` is the porcelain that has it.
 //!   * **`--force-with-lease=<ref>:<expect>`** resolves `<expect>` through
 //!     gitoxide's `rev_parse_single` rather than git's `repo_get_oid`; the two
 //!     accept the same everyday spellings but are not proven byte-identical on
@@ -333,7 +330,8 @@ fn push(st: &State) -> Result<ExitCode> {
     // every refspec whose source names nothing is an `error()` of its own and the
     // whole push is abandoned, even when other refspecs were fine. `cmd_send_pack`
     // returns -1 for it, which `run_builtin()` masks to 255.
-    let (mut requests, missing) = build_requests(&repo, st)?;
+    let mut matching = None;
+    let (mut requests, missing) = build_requests(&repo, st, &mut matching)?;
     if !missing.is_empty() {
         for src in &missing {
             eprintln!("error: src refspec {src} does not match any");
@@ -379,9 +377,9 @@ fn push(st: &State) -> Result<ExitCode> {
         local_refs: requests.iter().map(|r| r.name.clone()).collect(),
         signed: st.signed,
         receive_pack: st.receive_pack.clone(),
-        // `send-pack` has no matching refspec: `--all`/`--mirror` are its
-        // wholesale modes and every other invocation names its refs.
-        matching: None,
+        // A `:` among the refspecs; `--all`/`--mirror` are wholesale modes of
+        // their own and never reach it.
+        matching,
         progress: st.progress.unwrap_or_else(|| {
             use std::io::IsTerminal;
             std::io::stderr().is_terminal()
@@ -519,7 +517,8 @@ pub(crate) fn local_dest_that_is_not_a_repository<'a>(
 
 /// `match_push_refs()` reduced to what `send-pack` can ask of it: `--all` and
 /// `--mirror` take local refs wholesale, and otherwise each `<ref>` argument is
-/// one `[+]<src>[:<dst>]` refspec.
+/// one `[+]<src>[:<dst>]` refspec, a pattern refspec, or the matching refspec `:`
+/// (handed back through `matching` for the wire layer to expand).
 ///
 /// `get_local_heads()` (remote.c) is `for_each_ref`, so the candidate set is
 /// every ref — but `get_ref_match()` narrows it back down for the *matching*
@@ -537,7 +536,11 @@ pub(crate) fn local_dest_that_is_not_a_repository<'a>(
 /// remote-tracking refs. Neither implies force: `--mirror` is `MATCH_REFS_MIRROR`,
 /// a *matching* flag, and the update's `force` still comes from the refspec's
 /// own `+` or from `args.force_update` (`--force`).
-fn build_requests(repo: &gix::Repository, st: &State) -> Result<(Vec<Request>, Vec<String>)> {
+fn build_requests(
+    repo: &gix::Repository,
+    st: &State,
+    matching: &mut Option<push_proto::Matching>,
+) -> Result<(Vec<Request>, Vec<String>)> {
     let mut requests = Vec::new();
     // Sources that resolved to nothing, in argv order. `match_explicit()` reports
     // every one of them (remote.c:1179) rather than stopping at the first.
@@ -575,6 +578,22 @@ fn build_requests(repo: &gix::Repository, st: &State) -> Result<(Vec<Request>, V
             Some(rest) => (true, rest),
             None => (false, spec.as_str()),
         };
+        // `:` is not an empty source and destination but the *matching* refspec
+        // (refspec.c:73-76): every local branch the remote already carries,
+        // expanded against the advertisement one layer down.
+        if body == ":" {
+            *matching = Some(push_proto::Matching {
+                force: forced || st.force,
+                branches: super::push::local_branch_tips(repo),
+            });
+            continue;
+        }
+        // A pattern refspec expands over the local refs as `match_push_refs()`'s
+        // glob half does — the expansion `git push` uses.
+        if body.contains('*') {
+            requests.extend(super::push::expand_pattern_refspec(repo, spec, st.force)?);
+            continue;
+        }
         let (src, dst) = match body.split_once(':') {
             Some((s, d)) => (s, d),
             None => (body, body),

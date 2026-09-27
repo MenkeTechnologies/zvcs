@@ -494,7 +494,7 @@ fn git_push_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejec
 /// ```
 pub fn validate_receive_pack(repo: &gix::Repository) -> Result<(), Rejection> {
     let mut out = defaults();
-    for v in walk_config(repo) {
+    for v in crate::config::walk_config_after_enter_repo(repo) {
         receive_pack_config(&v, &mut out)?;
     }
     Ok(())

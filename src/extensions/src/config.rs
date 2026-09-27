@@ -1355,6 +1355,26 @@ pub fn walk_config(repo: &gix::Repository) -> Vec<ConfigValue> {
     with_lines(ordered_occurrences(repo))
 }
 
+/// [`walk_config`] for a server program that `enter_repo()` has set up
+/// (`receive-pack`, `upload-pack`). `enter_repo()` chdirs into the git
+/// directory and calls `set_git_dir(".")` (path.c:760-834), so the repository's
+/// own config file is `./config`, which `strbuf_cleanup_path()` prints as
+/// `config` — `… for 'receive.unpacklimit' in file config: invalid unit`. Files
+/// outside the git directory (global, system, `include.path` targets elsewhere)
+/// keep the names they had.
+pub fn walk_config_after_enter_repo(repo: &gix::Repository) -> Vec<ConfigValue> {
+    let git_dir = repo.common_dir();
+    let mut values = walk_config(repo);
+    for v in &mut values {
+        if let ValueOrigin::File { path, .. } = &mut v.origin {
+            if let Ok(inside) = std::path::Path::new(path.as_str()).strip_prefix(git_dir) {
+                *path = inside.to_string_lossy().into_owned();
+            }
+        }
+    }
+    values
+}
+
 /// [`walk_config`] for a `RUN_SETUP_GENTLY` verb: the repository's merged read
 /// when there is one, otherwise the system/global cascade plus the command line
 /// that `repo_config(the_repository, fn, data)` walks before setup has found a

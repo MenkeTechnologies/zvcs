@@ -11349,6 +11349,7 @@ pub(crate) fn rev_list_pretty_body(
     pretty: &Pretty,
     date_mode: &DateMode,
     parents: &[ObjectId],
+    expand_tabs: Option<usize>,
 ) -> Result<Vec<u8>> {
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
@@ -11384,8 +11385,11 @@ pub(crate) fn rev_list_pretty_body(
         parents,
         // No `--graph` behind either of these callers.
         graph_width: 0,
-        // `rev-list --pretty` has no `--expand-tabs` of its own.
-        expand_tabs: None,
+        // `ctx.expand_tabs_in_log`: `rev-list`'s `show_commit()` builds its
+        // context by hand and leaves it at 0 (builtin/rev-list.c:310-320), so its
+        // indented formats keep their tabs; the `show_log()` callers pass `None`
+        // for each format's own default.
+        expand_tabs,
         // `rev-list` has no reflog walk, so every `%g…` expands to nothing.
         reflog: None,
         date_explicit: false,

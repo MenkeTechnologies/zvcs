@@ -942,6 +942,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut nul_term = false;
     // `revs->unpacked`: show only commits no pack holds.
     let mut unpacked = false;
+    // `revs->no_kept_objects` with `KEPT_PACK_ON_DISK` in `keep_pack_cache_flags`
+    // (revision.c:2541-2550): commits in a pack with a `.keep` file are ignored.
+    // `KEPT_PACK_IN_CORE` names packs `pack-objects` marks in memory; from the
+    // command line there are none.
+    let mut no_kept_on_disk = false;
     let mut show_parents = false;
     let mut show_children = false;
     let mut boundary = false;
@@ -1321,6 +1326,36 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--unpacked=") => {
                 return Ok(fatal("--unpacked=<packfile> no longer supported"));
             }
+            "--no-kept-objects" => no_kept_on_disk = true,
+            s if s.starts_with("--no-kept-objects=") => {
+                if &s["--no-kept-objects=".len()..] == "on-disk" {
+                    no_kept_on_disk = true;
+                }
+            }
+            // Options `handle_revision_opt()` takes that change nothing `rev-list`
+            // prints: they are read by `log_tree_commit()`/`show_log()` or by the
+            // diff machinery, and `cmd_rev_list()` reaches neither — its own
+            // `show_commit()` formats through `pretty_print_commit()` with a
+            // context whose `expand_tabs_in_log` is left at 0 (builtin/rev-list.c:
+            // 310-320). `--always`, `--root` and `--no-commit-id` shape diff output;
+            // `--log-size`, `--show-linear-break` and `--show-signature` are
+            // `show_log()`'s (revision.c:2575-2600, 2661-2700).
+            "--always" | "--root" | "--no-commit-id" | "--log-size" | "--show-signature"
+            | "--no-show-signature" | "--expand-tabs" | "--no-expand-tabs"
+            | "--show-linear-break" => {}
+            s if s.starts_with("--show-linear-break=") => {}
+            // `if (strtol_i(arg, 10, &val) < 0 || val < 0)
+            //         die("'%s': not a non-negative integer", arg);`
+            // (revision.c:2579-2583).
+            s if s.starts_with("--expand-tabs=") => {
+                let v = &s["--expand-tabs=".len()..];
+                if crate::revopt::strtol_i(v).is_none_or(|n| n < 0) {
+                    return Ok(fatal(&format!("'{v}': not a non-negative integer")));
+                }
+            }
+            // `revs->date_mode.type = DATE_RELATIVE` (revision.c:2661-2663), which
+            // is `--date=relative`.
+            "--relative-date" => date_mode = super::log::DateMode::Relative,
             "--object-names" => object_names = true,
             "--no-object-names" => object_names = false,
             "--in-commit-order" => in_commit_order = true,
@@ -2980,11 +3015,24 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // commits in `get_commit_action()` and for every other object in
     // `show_object()` (list-objects.c:44-46).
     let packed_objects: HashSet<ObjectId> = match unpacked {
-        true => pack_objects(&repo, false),
+        true => pack_objects(&repo, None),
         false => HashSet::new(),
     };
     if unpacked {
         commits.retain(|id| !packed_objects.contains(id));
+    }
+    // ```c
+    // if (revs->no_kept_objects) {
+    //         if (has_object_kept_pack(revs->repo, &commit->object.oid,
+    //                                  revs->keep_pack_cache_flags))
+    //                 return commit_ignore;
+    // }
+    // ```
+    //
+    // (revision.c:4183-4187.) Commits only: `show_object()` does not ask.
+    if no_kept_on_disk {
+        let kept = pack_objects(&repo, Some("keep"));
+        commits.retain(|id| !kept.contains(id));
     }
     commits.retain(|id| !treesame.contains(id));
     commits.retain(|id| {
@@ -3475,7 +3523,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 let object = repo.find_object(*id)?;
                 let shown_parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
                 let body =
-                    rev_list_pretty_body(&repo, &object.into_commit(), p, &date_mode, shown_parents)?;
+                    rev_list_pretty_body(&repo, &object.into_commit(), p, &date_mode, shown_parents, Some(0))?;
                 if !body.is_empty() {
                     out.extend_from_slice(&body);
                     out.push(hdr_term);
@@ -5874,17 +5922,18 @@ pub(super) fn has_promisor_remote(repo: &gix::Repository) -> bool {
 /// Every object this repository's packs hold — git's `has_object_pack()` asked in
 /// bulk, which is what `--unpacked` filters on.
 pub(super) fn packed_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
-    pack_objects(repo, false)
+    pack_objects(repo, None)
 }
 
 /// The objects held by every pack with a `.promisor` file beside it — git's
 /// `FOR_EACH_OBJECT_PROMISOR_ONLY` enumeration.
 pub(super) fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
-    pack_objects(repo, true)
+    pack_objects(repo, Some("promisor"))
 }
 
-/// The ids in this repository's packs, optionally only the promisor ones.
-fn pack_objects(repo: &gix::Repository, promisor_only: bool) -> HashSet<ObjectId> {
+/// The ids in this repository's packs — only those of packs with a `<sidecar>`
+/// file beside the `.idx` (`.promisor`, `.keep`) when one is named.
+fn pack_objects(repo: &gix::Repository, sidecar: Option<&str>) -> HashSet<ObjectId> {
     let mut set = HashSet::new();
     let store = repo.objects.store_ref();
     for dir in std::iter::once(store.path().to_path_buf())
@@ -5894,7 +5943,7 @@ fn pack_objects(repo: &gix::Repository, promisor_only: bool) -> HashSet<ObjectId
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("idx")
-                || (promisor_only && !path.with_extension("promisor").exists())
+                || sidecar.is_some_and(|ext| !path.with_extension(ext).exists())
             {
                 continue;
             }

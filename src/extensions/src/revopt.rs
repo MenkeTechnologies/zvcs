@@ -41,7 +41,7 @@
 /// be consumed, at least one digit must be converted, and the result must survive
 /// the round trip through `int` — which is why `3000000000` is rejected on every
 /// platform git builds on even though it fits a `long`.
-fn strtol_i(s: &str) -> Option<i32> {
+pub fn strtol_i(s: &str) -> Option<i32> {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() && matches!(b[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {

@@ -1104,6 +1104,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut graph_max_lanes: i64 = 0;
     // `revs->show_merge` (`--merge`, revision.c:2434-2435).
     let mut show_merge = false;
+    // `revs->track_linear` (`--show-linear-break`, revision.c:2591-2598).
+    let mut track_linear = false;
     // `revs->show_notes`, `revs->show_notes_given` and
     // `revs->show_notes_by_default` (revision.c:2584-2616).
     let mut show_notes = false;
@@ -1388,9 +1390,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // `--log-size`, `--show-linear-break` and `--show-signature` are
             // `show_log()`'s (revision.c:2575-2600, 2661-2700).
             "--always" | "--root" | "--no-commit-id" | "--log-size" | "--show-signature"
-            | "--no-show-signature" | "--expand-tabs" | "--no-expand-tabs"
-            | "--show-linear-break" => {}
-            s if s.starts_with("--show-linear-break=") => {}
+            | "--no-show-signature" | "--expand-tabs" | "--no-expand-tabs" => {}
+            // `revs->track_linear` still meets `--graph` in `revision_opts_finish()`.
+            "--show-linear-break" => track_linear = true,
+            s if s.starts_with("--show-linear-break=") => track_linear = true,
             // `if (strtol_i(arg, 10, &val) < 0 || val < 0)
             //         die("'%s': not a non-negative integer", arg);`
             // (revision.c:2579-2583).
@@ -2306,6 +2309,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // command line has been read, so a `--no-graph` written after a `--graph`
     // cancels both. `topo_order` alone, so a `--date-order` already given keeps its
     // `sort_order` and stays date-topo; only the default date order is upgraded.
+    // `revision_opts_finish()` (revision.c:2744-2747).
+    if graph && track_linear {
+        return Ok(fatal("options '--show-linear-break' and '--graph' cannot be used together"));
+    }
     if graph && order == Order::Date {
         order = Order::Topo;
     }

@@ -1068,6 +1068,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut no_kept_on_disk = false;
     // `revs->maximal_only` (revision.c:2400-2401).
     let mut maximal_only = false;
+    // `revs->break_bar` with `track_linear` (`--show-linear-break[=<barrier>]`,
+    // revision.c:2591-2598).
+    let mut break_bar: Option<String> = None;
     // `--full-history` (git's `revs->simplify_history = 0`): follow every parent
     // of a merge even when the merge is TREESAME to one of them, so a change that
     // arrived on a side branch keeps both the merge and that side in the history.
@@ -1634,6 +1637,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             order = Order::Topo;
         } else if a == "--boundary" {
             boundary = true;
+        } else if a == "--show-linear-break" {
+            break_bar = Some("                    ..........".to_string());
+        } else if let Some(bar) = a.strip_prefix("--show-linear-break=") {
+            break_bar = Some(bar.to_string());
         } else if a == "--maximal-only" {
             maximal_only = true;
         } else if a == "--no-boundary" {
@@ -3424,6 +3431,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // with `SYMMETRIC_LEFT`, the other head, their merge bases excluded, and the
     // conflicted paths — as root-relative literal paths — in place of the
     // pathspec that selected them.
+    // `revision_opts_finish()` (revision.c:2744-2747), run once the arguments —
+    // revisions included — have been read.
+    if graph && break_bar.is_some() {
+        eprintln!("fatal: options '--show-linear-break' and '--graph' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
     if show_merge {
         let user: Vec<Vec<u8>> = pathspecs.iter().map(|p| p.as_bytes().to_vec()).collect();
         let merge = match prepare_show_merge(&repo, &user)? {
@@ -4894,11 +4907,25 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         interesting = nodes.iter().map(|n| n.id).collect();
     }
 
+    // `track_linear()` (revision.c:4333-4352), which `get_revision_1()` runs on
+    // every commit `simplify_commit()` lets through — `--skip`ped ones included,
+    // which is why this is decided before the skip: a commit is linear when it
+    // is a parent of the one handed out before it, and the first one always is.
+    // The flags ride along with `nodes` through the skip, the cap and `--reverse`.
+    let mut linear: Vec<bool> = Vec::new();
+    if break_bar.is_some() {
+        let mut previous: Option<&[ObjectId]> = None;
+        for node in &nodes {
+            linear.push(previous.is_none_or(|parents| parents.contains(&node.id)));
+            previous = Some(&node.parents);
+        }
+    }
     // `--skip` drops the first N of the selected commits, then `--max-count` caps
     // what remains — git's order in `get_revision`.
     if skip > 0 {
         let drop = skip.min(nodes.len());
         nodes.drain(0..drop);
+        linear.drain(0..drop.min(linear.len()));
     }
     // `--max-count-oldest` keeps the *last* `max_count` commits of the walk, still
     // in walk order: `retrieve_oldest_commits()` (revision.c:4596-4657) drains the
@@ -4909,6 +4936,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if let Some(limit) = max_count {
             let drop = nodes.len().saturating_sub(limit);
             nodes.drain(0..drop);
+            linear.drain(0..drop.min(linear.len()));
         }
         None
     } else {
@@ -4921,6 +4949,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             Flavor::Log | Flavor::Reflog => {
                 if let Some(limit) = max_count {
                     nodes.truncate(limit);
+                    linear.truncate(limit);
                 }
                 None
             }
@@ -4928,6 +4957,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     };
     if reverse {
         nodes.reverse();
+        linear.reverse();
     }
 
     // `revs->diffopt.output_format` as the command line itself left it — every bit
@@ -5359,10 +5389,29 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // reported, and only when *none* of them showed anything does the
     // `always_show_header` fallback print a single parentless header.
     let mut merge_shown_any = false;
+    // `log_tree_commit()` prints `"\n%s\n"` with the break bar ahead of a commit
+    // that is not linear — or, in `--reverse`'s output stage, behind it
+    // (log-tree.c:1188-1197) — straight to the file, outside any line prefix.
+    let write_break = |stdout: &mut std::io::BufWriter<std::io::StdoutLock<'_>>, bar: &str| -> Result<()> {
+        write!(stdout, "\n{bar}\n")?;
+        Ok(())
+    };
     for (ri, (ni, diff_parent, from)) in records.iter().copied().enumerate() {
         let node = &nodes[ni];
         if print_limit.is_some_and(|n| printed >= n) {
             break;
+        }
+        if let Some(bar) = break_bar.as_deref() {
+            let first_record = ri == 0 || records[ri - 1].0 != ni;
+            if first_record {
+                let broken_before = match reverse {
+                    false => linear.get(ni) == Some(&false),
+                    true => ni > 0 && linear.get(ni - 1) == Some(&false),
+                };
+                if broken_before {
+                    write_break(&mut stdout, bar)?;
+                }
+            }
         }
         // `do_remerge_diff()` (log-tree.c:1134-1142): a two-parent merge is re-merged
         // and its result tree takes the place of the parent this record diffs
@@ -6350,6 +6399,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
     }
 
+    if let (Some(bar), true) = (break_bar.as_deref(), reverse) {
+        if !graph && !records.is_empty() && linear.get(nodes.len() - 1) == Some(&false) {
+            write_break(&mut stdout, bar)?;
+        }
+    }
     // Persist whatever abbreviations this run had to compute, off the critical
     // path — the next `log` in any clone holding these objects reads them back.
     abbrev_cache.into_inner().flush();

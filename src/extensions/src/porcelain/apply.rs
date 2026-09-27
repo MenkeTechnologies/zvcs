@@ -2167,9 +2167,10 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
             idx_repo.as_ref().expect("repo present when update_index"),
             index,
         );
-        index.write(crate::config::index_write_options(
-            idx_repo.as_ref().expect("repo present when update_index"),
-        ))?;
+        // `write_locked_index()` (apply.c:5174) is `do_write_index()` like every other
+        // writer, racy-clean smudge included (read-cache.c:2902-2903).
+        let repo = idx_repo.as_ref().expect("repo present when update_index");
+        crate::index_racy::write_with(repo, index, crate::config::index_write_options(repo))?;
     }
 
     // `write_out_results()`: the conflicted paths are named once every write is

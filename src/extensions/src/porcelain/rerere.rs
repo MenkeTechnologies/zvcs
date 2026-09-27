@@ -838,11 +838,11 @@ fn update_paths(repo: &gix::Repository, update: &[BString]) -> Result<()> {
 
     index.sort_entries();
     index.remove_tree();
-    // Staging a previous resolution rewrites the real index, so it carries the
-    // repository's index-write options (read-cache.c:2830-2831).
-    index
-        .write(crate::config::index_write_options(repo))
-        .context("unable to write new index file")?;
+    // Staging a previous resolution rewrites the real index through
+    // `write_locked_index()` (rerere.c:723), so it carries the repository's
+    // index-write options (read-cache.c:2830-2831) and the racy-clean smudge
+    // (:2902-2903).
+    crate::index_racy::write(repo, &mut index).context("unable to write new index file")?;
     Ok(())
 }
 

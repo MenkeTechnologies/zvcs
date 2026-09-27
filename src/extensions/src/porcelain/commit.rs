@@ -2389,7 +2389,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // (builtin/commit.c:1124-1127.) The editor's own `error:` line is already on
     // stderr; this is the hint that follows it, and the status is 1 — not 128.
     if use_editor {
-        if launch_editor(&snap, &msg_path).is_err() {
+        if launch_editor(&repo, &msg_path).is_err() {
             eprintln!("Please supply the message using either -m or -F option.");
             return Ok(ExitCode::from(1));
         }
@@ -4966,7 +4966,8 @@ fn is_terminal_dumb() -> bool {
 /// Open `path` in the configured editor and wait, git-style: the editor string
 /// runs through the shell so `core.editor = "code -w"` and other argument-bearing
 /// commands work, and stdio is inherited so the interactive editor owns the tty.
-pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::Path) -> Result<()> {
+pub(super) fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
+    let snap = &repo.config_snapshot();
     // Every failure below is `error()` in `launch_specified_editor()`, not
     // `die()`: the message goes to stderr with an `error: ` prefix and the
     // *caller* decides the exit status (`builtin/commit.c:1124-1127` prints
@@ -4999,7 +5000,14 @@ pub(super) fn launch_editor(snap: &gix::config::Snapshot<'_>, path: &std::path::
     // `start_command()` reports its own `cannot run <cmd>: <strerror>` before
     // `launch_specified_editor` adds `unable to start editor '<editor>'`
     // (editor.c:95-98), so a failed spawn produces two `error:` lines.
-    let spawned = crate::external::prepare_shell_cmd_str(&editor, [path]).status();
+    //
+    // The file is handed over as `strbuf_realpath(&realpath, path, 1)`
+    // (editor.c:88-90), and the child starts where setup left git, with the
+    // environment setup exported (`run_command()` with `p.dir` unset).
+    let realpath = crate::setup::realpath(path);
+    let mut cmd = crate::external::prepare_shell_cmd_str(&editor, [&realpath]);
+    crate::setup::export_to_child(repo, crate::setup::after_setup(repo).as_ref(), &mut cmd);
+    let spawned = cmd.status();
     let status = match spawned {
         Ok(s) => s,
         Err(e) => {

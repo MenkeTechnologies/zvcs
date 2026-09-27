@@ -2853,7 +2853,7 @@ fn edit_description(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // file from then on and the state probe sees it.
     let path = repo.git_dir().join("EDIT_DESCRIPTION");
     std::fs::write(&path, &buf)?;
-    if super::commit::launch_editor(&snap, &path).is_err() {
+    if super::commit::launch_editor(repo, &path).is_err() {
         // `if (launch_editor(...)) return -1;`, and `cmd_branch` turns that into 1.
         return Ok(ExitCode::from(1));
     }

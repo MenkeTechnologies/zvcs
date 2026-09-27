@@ -678,6 +678,30 @@ pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
     Some(state)
 }
 
+/// Give `cmd` what every child git starts with `cp->dir` left NULL inherits from
+/// setup: `GIT_PREFIX`, exported by `setup_git_directory()` for all children
+/// (setup.c:2069-2076), and — under the [`after_setup`] model — git's cwd, its
+/// exported `GIT_DIR` and its `GIT_WORK_TREE`. Outside the model only
+/// `GIT_PREFIX` is set and the caller keeps its own reckoning of the rest.
+pub(crate) fn export_to_child(
+    repo: &gix::Repository,
+    setup: Option<&AfterSetup>,
+    cmd: &mut std::process::Command,
+) {
+    use std::os::unix::ffi::OsStringExt;
+    cmd.env("GIT_PREFIX", std::ffi::OsString::from_vec(prefix_bytes(repo)));
+    let Some(s) = setup else {
+        return;
+    };
+    cmd.current_dir(&s.cwd);
+    if s.export_git_dir {
+        cmd.env("GIT_DIR", &s.git_dir);
+    }
+    if let Some(work_tree) = &s.work_tree_env {
+        cmd.env("GIT_WORK_TREE", work_tree);
+    }
+}
+
 /// `git_path(name)` (path.c:387-431) as a child of git sees it: `name` under
 /// [`AfterSetup::git_dir`], so relative to [`AfterSetup::cwd`] or absolute.
 /// Outside the model — a gitfile, a linked worktree — git's `repo->gitdir` is the

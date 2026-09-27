@@ -294,25 +294,15 @@ pub fn run_with_env(
         _ => absolutize(&path),
     };
     let mut cmd = Command::new(&program);
-    cmd.args(args)
-        .current_dir(&workdir)
-        // `setup_git_directory()` ends by exporting the prefix for every child of
-        // this process — the work-tree-relative directory the command was typed
-        // in, with a trailing `/`, and the empty string at the top or in a bare
-        // repository (`setup.c:2069-2076`). Hooks are the visible consumers.
-        .env("GIT_PREFIX", {
-            use std::os::unix::ffi::OsStringExt;
-            std::ffi::OsString::from_vec(crate::setup::prefix_bytes(repo))
-        })
-        .envs(match &setup {
-            Some(s) => s.export_git_dir.then(|| s.git_dir.clone().into_os_string()),
-            None => git_dir_env(repo, &workdir),
-        }
-        .map(|v| ("GIT_DIR", v)))
-        // `setup_work_tree()` rewrites a set `GIT_WORK_TREE` to `.` once it has
-        // moved there (setup.c:511-512).
-        .envs(setup.as_ref().and_then(|s| s.work_tree_env.clone()).map(|v| ("GIT_WORK_TREE", v)))
-        .envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
+    cmd.args(args).current_dir(&workdir);
+    // `GIT_PREFIX` — the work-tree-relative directory the command was typed in,
+    // with a trailing `/` — plus, under the setup model, the `GIT_DIR` and
+    // `GIT_WORK_TREE` setup left in git's environment.
+    crate::setup::export_to_child(repo, setup.as_ref(), &mut cmd);
+    if setup.is_none() {
+        cmd.envs(git_dir_env(repo, &workdir).map(|v| ("GIT_DIR", v)));
+    }
+    cmd.envs(env.iter().map(|(k, v)| (*k, v.as_os_str())))
         // `RUN_HOOKS_OPT_INIT` sets `.stdout_to_stderr = 1` (`hook.h:171-176`), so
         // a hook's own chatter can never land on the command's stdout; `pre-push`
         // is the single caller that clears it, for backwards compatibility

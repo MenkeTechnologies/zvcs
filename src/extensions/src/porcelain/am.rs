@@ -2292,7 +2292,7 @@ fn do_interactive(
             Some(b'e' | b'E') => {
                 let path = state_dir.join("final-commit");
                 let _ = out.flush();
-                let _ = super::commit::launch_editor(&repo.config_snapshot(), &path);
+                let _ = super::commit::launch_editor(&repo, &path);
                 // `launch_specified_editor()` reads the file back whatever the
                 // editor did, so a message the editor left alone reloads
                 // unchanged and a rewritten one replaces `state->msg`.

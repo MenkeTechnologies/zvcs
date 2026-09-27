@@ -475,6 +475,109 @@ fn git_push_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejec
 }
 
 // ---------------------------------------------------------------------------
+// receive-pack
+// ---------------------------------------------------------------------------
+
+/// `repo_config(the_repository, receive_pack_config, NULL)` — `git receive-pack`
+/// (builtin/receive-pack.c:2652), after `enter_repo()` and before the
+/// advertisement, so a refused value ends the session before a byte is sent and
+/// the pushing side reports that it could not read from the remote.
+///
+/// Measured against git 2.55.0, pushing into a bare repository:
+///
+/// ```text
+/// $ git --git-dir=up.git config receive.denyCurrentBranch bogus; git push o main
+/// fatal: bad boolean config value 'bogus' for 'receive.denycurrentbranch'
+/// fatal: Could not read from remote repository.
+/// $ git --git-dir=up.git config receive.unpackLimit bogus; git push o main
+/// fatal: bad numeric config value 'bogus' for 'receive.unpacklimit' in file config: invalid unit
+/// ```
+pub fn validate_receive_pack(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        receive_pack_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+/// `receive_pack_config()` (builtin/receive-pack.c:145-278), refusals only; the
+/// values themselves are read by `porcelain::receive_pack`.
+///
+/// `parse_hide_refs_config()` (refs.c) comes first and refuses a valueless
+/// `transfer.hiderefs`/`receive.hiderefs`; `parse_deny_action()`
+/// (builtin/receive-pack.c:128-143) takes the four words and otherwise
+/// `git_config_bool()`.
+fn receive_pack_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    match key {
+        "transfer.hiderefs" | "receive.hiderefs" => {
+            string_value(v)?;
+            return Ok(());
+        }
+        "receive.denydeletes"
+        | "receive.denynonfastforwards"
+        | "receive.fsckobjects"
+        | "transfer.fsckobjects"
+        | "repack.usedeltabaseoffset"
+        | "receive.updateserverinfo"
+        | "receive.autogc"
+        | "receive.shallowupdate"
+        | "receive.advertiseatomic"
+        | "receive.advertisepushoptions"
+        | "transfer.advertisesid" => {
+            bool_value(v, key)?;
+            return Ok(());
+        }
+        "receive.unpacklimit" | "transfer.unpacklimit" | "receive.keepalive" => {
+            int_value(v, key)?;
+            return Ok(());
+        }
+        "receive.certnonceslop" => {
+            ulong_value(v, key)?;
+            return Ok(());
+        }
+        // `git_config_int64()`.
+        "receive.maxinputsize" => {
+            let raw = v.value.as_deref().unwrap_or("");
+            if let Err(e) = crate::optint::config_int64(raw) {
+                let reason = match e {
+                    crate::optint::NumError::OutOfRange => "out of range",
+                    crate::optint::NumError::InvalidUnit => "invalid unit",
+                };
+                return Err(Rejection::Die(format!(
+                    "bad numeric config value '{raw}' for '{key}'{}: {reason}",
+                    v.origin.bad_number_clause()
+                )));
+            }
+            return Ok(());
+        }
+        "receive.denycurrentbranch" | "receive.denydeletecurrent" => {
+            let word = v.value.as_deref().is_some_and(|raw| {
+                ["ignore", "warn", "refuse", "updateinstead"]
+                    .iter()
+                    .any(|w| raw.eq_ignore_ascii_case(w))
+            });
+            if !word {
+                bool_value(v, key)?;
+            }
+            return Ok(());
+        }
+        // `git_config_pathname()` and `git_config_string()`.
+        "receive.fsck.skiplist" | "receive.certnonceseed" | "receive.procreceiverefs" => {
+            string_value(v)?;
+            return Ok(());
+        }
+        _ => {
+            if key.starts_with("receive.fsck.") {
+                string_value(v)?;
+                return Ok(());
+            }
+        }
+    }
+    git_default_config(v, out)
+}
+
+// ---------------------------------------------------------------------------
 // remote.c read_config() / handle_config()
 // ---------------------------------------------------------------------------
 

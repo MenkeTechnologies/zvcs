@@ -308,6 +308,16 @@ pub fn receive_pack(args: &[String]) -> Result<ExitCode> {
     // `receive.fsck.<msg-id>` value kills the session before a byte is written.
     // `<git-dir>` is passed as spelled: it is `service_dir`, one half of the
     // push-certificate nonce's HMAC key.
+    // The callback's refusals — a bad boolean, number or valueless string among
+    // its keys, or anything `git_default_config()` refuses — come first, in
+    // configuration order.
+    if let Err(rejection) = crate::cmd_config::validate_receive_pack(&repo) {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        return Ok(ExitCode::from(128));
+    }
     let config = match Config::read(&repo, &opts.dir) {
         Ok(config) => config,
         // `is_valid_msg_type()` reaches `parse_msg_type()`'s `die()`

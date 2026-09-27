@@ -1417,6 +1417,18 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // The global scopes were already checked before any argument was looked at
     // (see `run_command` in `lib.rs`); this is only the two files that need a
     // repository to name.
+    //
+    // `hash-object` has no setup flag in `commands[]` (git.c:588): `run_builtin()`
+    // neither sets up the repository nor reads the pager config, and
+    // `cmd_hash_object()` runs `parse_options()` before its own setup and
+    // `repo_config()` (builtin/hash-object.c:99-115). An option it refuses is
+    // therefore 129 ahead of every configuration diagnostic. `--help` first is
+    // still `handle_builtin()`'s rewrite below.
+    if sub == "hash-object" && args.first().is_none_or(|a| a != "--help") {
+        if let Some(code) = porcelain::hash_object_options_refused(args) {
+            return Ok(code);
+        }
+    }
     if let Some(code) = config_file_gate(sub, args) {
         return Ok(code);
     }

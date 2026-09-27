@@ -116,7 +116,7 @@ pub fn hash_object(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    let opts = match parse(args) {
+    let opts = match parse(args).and_then(|opts| check_combinations(&opts).map(|()| opts)) {
         Ok(opts) => opts,
         Err(code) => return Ok(code),
     };
@@ -290,6 +290,25 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
         i += 1;
     }
 
+    Ok(opts)
+}
+
+/// `parse_options()` alone (builtin/hash-object.c:99-100), which `cmd_hash_object()`
+/// runs before `setup_git_directory_gently()` and `repo_config()` (:102-115): a
+/// usage error here is the 129 no configuration value can pre-empt. The
+/// dispatcher runs it ahead of its config gates and returns the code when the
+/// parse refuses; the diagnostic has already been printed.
+pub fn options_refused(args: &[String]) -> Option<ExitCode> {
+    let args = match args.first() {
+        Some(a) if a == "hash-object" => &args[1..],
+        _ => args,
+    };
+    parse(args).err()
+}
+
+/// The option combinations `cmd_hash_object()` refuses (builtin/hash-object.c:117-135)
+/// — after `repo_config()`, so a bad configuration value is reported first.
+fn check_combinations(opts: &Opts) -> std::result::Result<(), ExitCode> {
     // Argument conflicts git reports as usage errors, in git's own order.
     if opts.stdin_paths {
         if opts.stdin > 0 {
@@ -309,8 +328,7 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
             return Err(usage_error("Can't use --path with --no-filters"));
         }
     }
-
-    Ok(opts)
+    Ok(())
 }
 
 /// Hash everything the options ask for, in git's order.

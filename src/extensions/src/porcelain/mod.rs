@@ -866,6 +866,7 @@ pub use gc::gc;
 pub use get_tar_commit_id::get_tar_commit_id;
 pub use grep::grep;
 pub use hash_object::hash_object;
+pub use hash_object::options_refused as hash_object_options_refused;
 pub use help::help;
 pub use history::history;
 pub use hook::hook;

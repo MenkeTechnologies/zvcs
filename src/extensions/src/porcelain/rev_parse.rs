@@ -1800,7 +1800,10 @@ fn superproject_working_tree(repo: &gix::Repository) -> Option<std::path::PathBu
     if !is_inside_work_tree(repo) {
         return None;
     }
-    let cwd = std::env::current_dir().ok()?;
+    // `char *cwd = xgetcwd();` — git's cwd, which setup has already moved to the
+    // top of the work tree ([`crate::setup::setup_cwd`]), so a subdirectory of a
+    // submodule measures from the submodule's top like its top level does.
+    let cwd = crate::setup::setup_cwd(repo)?;
     let one_up = std::fs::canonicalize(cwd.join("..")).ok()?;
     // `relative_path(cwd, one_up)`: the path of this directory below its parent.
     let subpath = relative_path(

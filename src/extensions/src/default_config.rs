@@ -82,21 +82,39 @@
 //! later failed acquisition reads that companion to say whether the holder is
 //! still running. See [`gix::lock::pid`].
 //!
-//! # The three keys deliberately left out
+//! # The fsync keys
 //!
-//! `core.fsync`, `core.fsyncMethod` and `core.fsyncObjectFiles` belong to
-//! `git_default_core_config` (environment.c:475-501) but are **not** validated
-//! here. This port already reads all three — with git's exact
-//! `ignoring unknown core.fsync component`, `ignoring unknown core.fsyncMethod
-//! value` and `core.fsyncObjectFiles is deprecated` diagnostics — in
-//! [`crate::config::FsyncPolicy`], at the point an index or object file is about
-//! to be written rather than at parse time. Validating them here as well would
-//! print each warning twice for any verb that reaches both. The cost of leaving
-//! them is that a command which never writes anything does not report them at
-//! all, where git does; the cost of moving them would be a duplicated warning on
-//! every write, which is worse. This is a known, measured gap, not an oversight.
+//! `core.fsync`, `core.fsyncMethod` and `core.fsyncObjectFiles`
+//! (environment.c:475-501) speak here, while the configuration is parsed:
+//! `ignoring unknown core.fsync component` / `invalid value for variable` for
+//! every occurrence of `core.fsync` (through
+//! [`crate::config::parse_fsync_components`]), `ignoring unknown core.fsyncMethod
+//! value` for every occurrence of that, and `core.fsyncObjectFiles is deprecated`
+//! once per process — C's `if (fsync_object_files < 0)` — before its boolean is
+//! read. [`crate::config::FsyncPolicy::load`] resolves the same keys at the write
+//! site and stays quiet once this walk has run ([`walked`]), so a verb that
+//! reaches both says each thing once.
 
 use crate::config::{ConfigValue, walk_config};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether `git_default_config()` has been run over a value in this process.
+static WALKED: AtomicBool = AtomicBool::new(false);
+
+/// C's `fsync_object_files >= 0`: set by the first `core.fsyncObjectFiles` read.
+static FSYNC_OBJECT_FILES_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process has walked its configuration through
+/// `git_default_config()` — and so already printed the fsync diagnostics.
+pub(crate) fn walked() -> bool {
+    WALKED.load(Ordering::Relaxed)
+}
+
+/// `if (fsync_object_files < 0) warning(...)` (environment.c:496-498): true for
+/// the first `core.fsyncObjectFiles` this process reads, false ever after.
+pub(crate) fn first_fsync_object_files() -> bool {
+    !FSYNC_OBJECT_FILES_SEEN.swap(true, Ordering::Relaxed)
+}
 
 /// `enum object_creation_mode` (`environment.h`): how a finished loose object is
 /// moved from its temporary file to its final name.
@@ -215,6 +233,7 @@ pub fn validate_values(values: Vec<ConfigValue>) -> Result<DefaultConfig, Reject
 /// otherwise a `diff.*` refusal and a `core.*` refusal in the same config would
 /// report in the wrong order. See [`crate::diff_config`].
 pub(crate) fn git_default_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    WALKED.store(true, Ordering::Relaxed);
     let key = v.key.as_str();
     if let Some(rest) = key.strip_prefix("core.") {
         return core_config(v, rest, out);
@@ -468,9 +487,29 @@ fn core_config(v: &ConfigValue, name: &str, out: &mut DefaultConfig) -> Result<(
             gix::lock::pid::set_enabled(bool_value(v, key)?);
         }
 
-        // environment.c:475-501: read by `crate::config::FsyncPolicy` at the write
-        // site instead — see the module header for why they are not here.
-        "fsync" | "fsyncmethod" | "fsyncobjectfiles" => {}
+        // environment.c:475-480: `config_error_nonbool` for the valueless
+        // spelling, then `parse_fsync_components()` and its warnings.
+        "fsync" => {
+            let raw = string_value(v)?;
+            crate::config::parse_fsync_components(&raw, true);
+        }
+
+        // environment.c:482-494. An unknown method is a warning, not a refusal.
+        "fsyncmethod" => {
+            let raw = string_value(v)?;
+            if !matches!(raw.as_str(), "fsync" | "writeout-only" | "batch") {
+                eprintln!("warning: ignoring unknown core.fsyncMethod value '{raw}'");
+            }
+        }
+
+        // environment.c:496-500: the deprecation warning once per process, then
+        // `git_config_bool()`, which dies on a value it cannot read.
+        "fsyncobjectfiles" => {
+            if first_fsync_object_files() {
+                eprintln!("warning: core.fsyncObjectFiles is deprecated; use core.fsync instead");
+            }
+            bool_value(v, key)?;
+        }
 
         // Everything else falls through to `platform_core_config()`, which is a
         // no-op on every platform but Windows (`git-compat-util.h` defines it as

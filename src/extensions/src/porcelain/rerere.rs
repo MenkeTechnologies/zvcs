@@ -1244,6 +1244,12 @@ fn is_rerere_enabled(repo: &gix::Repository) -> Result<bool> {
             crate::git_fatal!("bad boolean config value '{raw}' for 'rerere.enabled'");
         }
     }
+    // The rest of `git_rerere_config()` (rerere.c:875-880), which `setup_rerere()`
+    // runs before it asks whether rerere is enabled at all:
+    // `repo_config(the_repository, git_default_config, NULL)`. A second walk of
+    // the default callback, so its parse-time warnings (`core.fsync` and friends)
+    // come out once more, as they do in stock after `commit` or `merge`.
+    crate::default_config::validate(repo).map_err(crate::default_config::Rejection::into_error)?;
     let configured = repo.config_snapshot().boolean("rerere.enabled");
     if configured == Some(false) {
         return Ok(false);

@@ -867,11 +867,14 @@ impl FsyncPolicy {
     pub fn load(repo: &gix::Repository) -> Result<Self, String> {
         let mut policy = Self::default();
         let snap = repo.config_snapshot();
+        // A verb whose configuration went through `git_default_config()` has
+        // printed these diagnostics at parse time already, where git prints them.
+        let warn = !crate::default_config::walked();
 
         // `core.fsync` is parsed afresh from the platform default by every
         // occurrence (environment.c:475-480), so only the last one matters.
         if let Some((raw, _)) = last_value_with_origin(repo, "core.fsync") {
-            policy.components = parse_fsync_components(&raw, true);
+            policy.components = parse_fsync_components(&raw, warn);
         }
 
         // Deprecated, but still read: git warns whenever it is set at all, and
@@ -880,7 +883,9 @@ impl FsyncPolicy {
         // object when it is on and otherwise asks the component set, so `false`
         // takes nothing away.
         if let Some((raw, origin)) = last_value_with_origin(repo, "core.fsyncObjectFiles") {
-            eprintln!("warning: core.fsyncObjectFiles is deprecated; use core.fsync instead");
+            if warn && crate::default_config::first_fsync_object_files() {
+                eprintln!("warning: core.fsyncObjectFiles is deprecated; use core.fsync instead");
+            }
             match snap.boolean("core.fsyncObjectFiles") {
                 Some(true) => policy.components |= FsyncComponent::LooseObject.bit(),
                 Some(false) => {}
@@ -897,7 +902,8 @@ impl FsyncPolicy {
                 "fsync" => policy.method = FsyncMethod::Fsync,
                 "writeout-only" => policy.method = FsyncMethod::WriteoutOnly,
                 "batch" => policy.method = FsyncMethod::Batch,
-                other => eprintln!("warning: ignoring unknown core.fsyncMethod value '{other}'"),
+                other if warn => eprintln!("warning: ignoring unknown core.fsyncMethod value '{other}'"),
+                _ => {}
             }
         }
 

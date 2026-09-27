@@ -478,7 +478,7 @@ fn octopus_bases(
 /// git's `reduce_heads`: de-duplicate `commits` (keeping first occurrence, so
 /// input order is preserved) and drop every commit that is reachable from
 /// another one in the list.
-fn reduce_heads(
+pub(super) fn reduce_heads(
     repo: &Repository,
     commits: &[ObjectId],
 ) -> Result<std::result::Result<Vec<ObjectId>, ObjectId>> {

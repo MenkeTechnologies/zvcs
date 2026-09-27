@@ -945,6 +945,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut show_parents = false;
     let mut show_children = false;
     let mut boundary = false;
+    // `revs->maximal_only` (revision.c:2400-2401): show only the commits no other
+    // walked commit reaches.
+    let mut maximal_only = false;
     let mut left_right = false;
     let mut cherry_mark = false;
     /// `revs->cherry_pick`: drop the commits whose change is already on the other side.
@@ -1324,6 +1327,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--parents" => show_parents = true,
             "--children" => show_children = true,
             "--boundary" => boundary = true,
+            "--maximal-only" => maximal_only = true,
             "--left-right" => left_right = true,
             s @ ("--cherry-mark" | "--cherry-pick" | "--left-only" | "--right-only" | "--cherry")
                 if side_option_conflict(s, left_only, right_only, cherry_mark, cherry_pick)
@@ -2163,6 +2167,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if reverse && walk_reflogs {
         return Ok(fatal("options '--reverse' and '--walk-reflogs' cannot be used together"));
     }
+    // `die_for_incompatible_opt2(!!revs->boundary, "--boundary",
+    // !!revs->maximal_only, "--maximal-only")` (revision.c:3194-3195).
+    if boundary && maximal_only {
+        return Ok(fatal("options '--boundary' and '--maximal-only' cannot be used together"));
+    }
     if graph && no_walk {
         return Ok(fatal(
             "options '--no-walk' and '--graph' cannot be used together",
@@ -2439,6 +2448,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             commits.retain(|id| !pruned.contains(id));
         }
     }
+    // Every commit `process_parents()` handles from here on sets `CHILD_VISITED` on
+    // the parents it goes on to (revision.c:1150-1153, 1205) — whatever
+    // `get_commit_action()` later decides about the commit itself. `--until`,
+    // `--left-only`, `--ancestry-path` and the rest drop commits at that later
+    // point, so the list as it stands here is what was processed.
+    let mut maximal_processed: Vec<ObjectId> = match maximal_only {
+        true => commits.clone(),
+        false => Vec::new(),
+    };
     if let Some(bound) = min_age {
         commits.retain(|id| commit_date(&repo, *id) <= bound);
     }
@@ -2729,6 +2747,115 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             let reachable = reachable_from(&tips, &parents_of);
             commits.retain(|id| reachable.contains(id));
         }
+    }
+
+    // `--maximal-only`. `get_commit_action()` ignores a commit carrying
+    // `CHILD_VISITED` (revision.c:4180), which `process_parents()` sets on each
+    // parent of a commit it processes — after `try_to_simplify_commit()` has
+    // pruned that commit's parent list, and only the first parent under
+    // `--first-parent` (revision.c:1150-1205). Under `--no-walk` it returns before
+    // that loop, so nothing is marked.
+    //
+    // `prepare_maximal_independent()` (builtin/rev-list.c:636-685) short-cuts the
+    // plain case: with no exclusion and none of its listed modifiers, the pending
+    // commits are replaced by `reduce_heads()` of them and the walk is turned off.
+    // Under `--no-walk` that is the only way a tip reachable from another drops out.
+    let fast_maximal = maximal_only
+        && !seeds.iter().any(|s| s.uninteresting)
+            && order == Order::Date
+            && !first_parent
+            && !reverse
+            && max_count.is_none()
+            && skip_count == 0
+            && min_age.is_none()
+            && max_age.is_none()
+            && min_parents <= 0
+            && max_parents.is_none()
+            && pathspecs.is_empty()
+            && !count_only
+            && !left_right
+            && !objects
+            && filter.is_none()
+            && !walk_reflogs
+            && author_pats.is_empty()
+            && committer_pats.is_empty()
+            && grep_pats.is_empty()
+            && !verbose_header
+            && !show_parents
+            && !edge_hint
+            && !unpacked
+            // `revs->limited` without an exclusion.
+            && !ancestry_path
+            && !cherry_mark
+            && !cherry_pick
+            && !left_only
+            && !right_only
+            && !show_children
+            && !simplify_merges_opt
+            && !simplify_by_decoration
+            && !bisect;
+    let maximal = if !maximal_only {
+        None
+    } else if fast_maximal {
+        // The pending commits, in the date order `prepare_revision_walk()` sorted
+        // them into (a stable sort) — which is also the order the walk pops the
+        // tips in, so keeping them in `commits` keeps git's order.
+        let mut heads: Vec<ObjectId> = Vec::new();
+        for seed in seeds.iter().filter(|s| !s.uninteresting) {
+            if !heads.contains(&seed.id) {
+                heads.push(seed.id);
+            }
+        }
+        if !unsorted_input {
+            heads.sort_by_key(|id| std::cmp::Reverse(commit_date(&repo, *id)));
+        }
+        match super::merge_base::reduce_heads(&repo, &heads)? {
+            Ok(heads) => Some(heads),
+            Err(id) => return Err(anyhow!("could not read commit {id}")),
+        }
+    } else if no_walk {
+        None
+    } else {
+        if prune {
+            // A commit the simplified parents no longer reach was never processed.
+            let reachable = reachable_from(&tips, &parents_of);
+            maximal_processed.retain(|id| reachable.contains(id));
+        }
+        // A limited walk (`limit_list()`) processes everything before the first
+        // commit is handed out, so every mark is in place when any commit is
+        // judged. A streaming walk judges each commit as it pops, right after its
+        // own parents were marked — a commit popped before any of its children
+        // (a tip that another tip reaches, but that sorts ahead of it by date)
+        // is still shown.
+        let limited = seeds.iter().any(|s| s.uninteresting)
+            || order != Order::Date
+            || ancestry_path
+            || cherry_mark
+            || cherry_pick
+            || left_only
+            || right_only
+            || show_children
+            || simplify_merges_opt
+            || simplify_by_decoration
+            || bisect;
+        let mut visited: HashSet<ObjectId> = HashSet::new();
+        let mut shown: HashSet<ObjectId> = HashSet::new();
+        for id in &maximal_processed {
+            if !limited && !visited.contains(id) {
+                shown.insert(*id);
+            }
+            let parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
+            let followed = if first_parent { parents.len().min(1) } else { parents.len() };
+            visited.extend(parents[..followed].iter().copied());
+        }
+        Some(match limited {
+            true => commits.iter().copied().filter(|id| !visited.contains(id)).collect::<Vec<_>>(),
+            false => commits.iter().copied().filter(|id| shown.contains(id)).collect::<Vec<_>>(),
+        })
+    };
+    if let Some(keep) = maximal {
+        let keep: HashSet<ObjectId> = keep.into_iter().collect();
+        commits.retain(|id| keep.contains(id));
     }
 
     // 2. Reorder, 3. filter by parent count, 4. limit, 5. reverse — in that

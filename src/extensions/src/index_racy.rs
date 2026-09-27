@@ -281,6 +281,37 @@ pub fn write_split(
     options: gix::index::write::Options,
     request: gix::index::file::split::Request,
 ) -> Result<(), gix::index::file::write::Error> {
+    write_split_holding(repo, index, None, options, request)
+}
+
+/// [`write`] through `held`, the lock on the index's own path — [`hold_locked_index`] —
+/// that the caller took before it read the index, as git's `write_locked_index()` writes
+/// through the `lock_file` its caller got from `repo_hold_locked_index()`
+/// (read-cache.c:3309). The lock is committed by the write, and rolled back when it is
+/// dropped unwritten.
+pub fn write_holding(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    held: gix::lock::File,
+) -> Result<(), gix::index::file::write::Error> {
+    let options = crate::config::index_write_options(repo);
+    write_split_holding(repo, index, Some(held), options, gix::index::file::split::Request::Keep)
+}
+
+/// `repo_hold_locked_index(repo, &lock, 0)` (lockfile.h, over `hold_lock_file_for_update()`):
+/// take `<index>.lock` now, without dying — `None` when another process holds it or the
+/// directory cannot be written, which is git's `fd < 0`.
+pub fn hold_locked_index(repo: &gix::Repository) -> Option<gix::lock::File> {
+    gix::lock::File::acquire_to_update_resource(repo.index_path(), gix::lock::acquire::Fail::Immediately, None).ok()
+}
+
+fn write_split_holding(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    held: Option<gix::lock::File>,
+    options: gix::index::write::Options,
+    request: gix::index::file::split::Request,
+) -> Result<(), gix::index::file::write::Error> {
     let mut options = options;
     resolve_index_version(repo, index, &mut options);
     // Before the smudge, because that is where `do_write_locked_index()` puts it:
@@ -294,7 +325,7 @@ pub fn write_split(
     if index.path() != repo.index_path() {
         return index.write(options);
     }
-    write_locked_inner(repo, index, options, request)
+    write_locked_inner(repo, index, held, options, request)
 }
 
 /// git's `write_locked_index()` proper for `update-index`, whose caller has already resolved the
@@ -316,7 +347,7 @@ pub fn write_locked(
     resolve_index_version(repo, index, &mut options);
     convert_to_sparse(repo, index);
     smudge_racily_clean(repo, index);
-    write_locked_inner(repo, index, options, request)
+    write_locked_inner(repo, index, None, options, request)
 }
 
 /// The serialisation half of [`write_locked`], so the two entry points above can each run
@@ -324,13 +355,14 @@ pub fn write_locked(
 fn write_locked_inner(
     repo: &gix::Repository,
     index: &mut gix::index::File,
+    held: Option<gix::lock::File>,
     options: gix::index::write::Options,
     request: gix::index::file::split::Request,
 ) -> Result<(), gix::index::file::write::Error> {
     let request = tweak_split_index(repo, request);
     let git_dir = repo.git_dir().to_owned();
     let max_percent = crate::config::split_index_max_percent_change(repo);
-    match index.write_locked(&git_dir, request, max_percent, options) {
+    match index.write_locked_holding(held, &git_dir, request, max_percent, options) {
         Ok(_) => Ok(()),
         Err(gix::index::file::split::Error::Write(err)) => Err(err),
         Err(err) => Err(gix::index::file::write::Error::Io(std::io::Error::other(err).into())),

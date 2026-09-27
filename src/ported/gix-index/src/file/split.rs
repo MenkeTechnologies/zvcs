@@ -113,6 +113,22 @@ impl File {
         max_percent_split_change: Option<u32>,
         options: write::Options,
     ) -> Result<Option<gix_hash::ObjectId>, Error> {
+        self.write_locked_holding(None, git_dir, request, max_percent_split_change, options)
+    }
+
+    /// [`write_locked()`](File::write_locked()) through `held`, the lock on this index's
+    /// own path that the caller has been holding since before it read the index — git's
+    /// `write_locked_index(istate, lock, …)` with a `lock` from `repo_hold_locked_index()`.
+    /// `None` acquires the lock at write time, as [`write_locked()`](File::write_locked())
+    /// does. The shared half of a split index has a lock of its own either way.
+    pub fn write_locked_holding(
+        &mut self,
+        held: Option<gix_lock::File>,
+        git_dir: &Path,
+        request: Request,
+        max_percent_split_change: Option<u32>,
+        options: write::Options,
+    ) -> Result<Option<gix_hash::ObjectId>, Error> {
         // Against the full entry list, before `prepare_to_write_split_index()` narrows it to
         // the split half below.
         self.state.invalidate_untracked_for_changed_entries();
@@ -120,11 +136,11 @@ impl File {
             // `~WRITE_SPLIT_INDEX_EXTENSION`: the shared half stays on disk — git never
             // unlinks it here — but nothing points at it any more.
             self.state.remove_split_index();
-            self.write_reconciled(options)?;
+            self.write_reconciled_holding(held, options)?;
             return Ok(None);
         }
         if self.state.split_index().is_none() && request != Request::NewShared {
-            self.write_reconciled(options)?;
+            self.write_reconciled_holding(held, options)?;
             return Ok(None);
         }
 
@@ -161,7 +177,7 @@ impl File {
         };
 
         let saved = prepare_to_write_split_index(self);
-        let result = self.write_reconciled(options);
+        let result = self.write_reconciled_holding(held, options);
         finish_writing_split_index(self, saved);
         result?;
         Ok(shared_id)

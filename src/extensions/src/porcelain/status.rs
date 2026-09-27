@@ -1070,11 +1070,33 @@ fn status_report(
         }
     }
 
+    // ```c
+    // if (use_optional_locks())
+    //         fd = repo_hold_locked_index(the_repository, &index_lock, 0);
+    // else
+    //         fd = -1;
+    // ```
+    //
+    // (builtin/commit.c:1634-1637.) `<index>.lock` is taken after the refresh and
+    // held through `wt_status_collect()` until `repo_update_index_if_able()` commits
+    // or rolls it back. It is visible: an index file inside the work tree
+    // (`GIT_INDEX_FILE=subidx`) has its `subidx.lock` listed as untracked. A lock
+    // someone else holds is `fd < 0`, which skips the write and nothing more.
+    let index_lock = match reference == Reference::Status
+        && template.is_none()
+        && crate::setup::git_env_bool("GIT_OPTIONAL_LOCKS", true)
+    {
+        true => crate::index_racy::hold_locked_index(&repo),
+        false => None,
+    };
+
     // The porcelain-v2 machine format is a separate renderer with its own,
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
     // of the v1/long collection below, so the two cannot regress each other.
+    // `cmd_status` is one body for every format, so v2 settles the held lock
+    // through the same `repo_update_index_if_able()`.
     if porcelain_v2 {
-        return porcelain_v2_output(
+        let code = porcelain_v2_output(
             &repo,
             reference_tree.unwrap_or_else(|| repo.object_hash().empty_tree()),
             untracked,
@@ -1091,7 +1113,11 @@ fn status_report(
             path_prefix,
             unborn,
             orderfile.as_deref(),
-        );
+        )?;
+        if let Some(lock) = index_lock {
+            update_index_if_able(&repo, lock)?;
+        }
+        return Ok(code);
     }
 
     // Collect the four change classes from the unified status iterator.
@@ -1429,8 +1455,8 @@ fn status_report(
     // between `wt_status_collect()` and the first line of the report. Only
     // `cmd_status` runs it — `cmd_commit`'s `run_status()` calls do not, and neither
     // does the block that goes into `COMMIT_EDITMSG`.
-    if reference == Reference::Status && template.is_none() {
-        update_index_if_able(&repo)?;
+    if let Some(lock) = index_lock {
+        update_index_if_able(&repo, lock)?;
     }
 
     // git orders each section (and each short-format block) by path.
@@ -1633,12 +1659,10 @@ fn status_report(
 /// above is unaffected — `has_racy_timestamp()` and the split-index half of
 /// `cache_changed` are both computed from the index as read — but an index this
 /// leaves behind can still hold stat data git would have refreshed.
-fn update_index_if_able(repo: &gix::Repository) -> Result<()> {
-    // `use_optional_locks()` (environment.c): `git_env_bool("GIT_OPTIONAL_LOCKS", 1)`.
-    // Off means `fd = -1` (builtin/commit.c:1637) and the whole call is skipped.
-    if !crate::setup::git_env_bool("GIT_OPTIONAL_LOCKS", true) {
-        return Ok(());
-    }
+///
+/// `lock` is the `<index>.lock` `cmd_status` has held since before the collection
+/// (`fd >= 0`); every early return drops it, which is `rollback_lock_file()`.
+fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File) -> Result<()> {
     if !repo.index_path().exists() {
         return Ok(());
     }
@@ -1662,7 +1686,8 @@ fn update_index_if_able(repo: &gix::Repository) -> Result<()> {
         return Ok(());
     }
     super::write_tree::prepare_offset_table(repo, &mut index);
-    write_index_if_lockable(repo, &mut index)
+    crate::index_racy::write_holding(repo, &mut index, lock)?;
+    Ok(())
 }
 
 /// `write_locked_index()` for a caller whose lock is optional.

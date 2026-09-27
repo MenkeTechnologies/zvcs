@@ -87,11 +87,28 @@ impl File {
     /// with the full entry list — [`write_locked()`](File::write_locked()), whose split half is
     /// written from a narrowed one.
     pub(crate) fn write_reconciled(&mut self, options: write::Options) -> Result<(), Error> {
+        self.write_reconciled_holding(None, options)
+    }
+
+    /// [`write_reconciled()`](File::write_reconciled()) into `held`, a lock on this index's
+    /// path that the caller took earlier, or into a lock acquired here when there is none.
+    ///
+    /// git's `write_locked_index()` writes through a `struct lock_file` its caller has been
+    /// holding since before it read the index (`repo_hold_locked_index()`), so the lock
+    /// file exists for the whole command — `cmd_status` holds it across the untracked scan
+    /// (builtin/commit.c:1634-1658). Acquiring it again here would fail against our own
+    /// lock, which is why the held one is handed in instead.
+    pub(crate) fn write_reconciled_holding(
+        &mut self,
+        held: Option<gix_lock::File>,
+        options: write::Options,
+    ) -> Result<(), Error> {
         let _span = gix_features::trace::detail!("gix_index::File::write()", path = ?self.path);
-        let mut lock = std::io::BufWriter::with_capacity(
-            64 * 1024,
-            gix_lock::File::acquire_to_update_resource(&self.path, gix_lock::acquire::Fail::Immediately, None)?,
-        );
+        let lock = match held {
+            Some(lock) => lock,
+            None => gix_lock::File::acquire_to_update_resource(&self.path, gix_lock::acquire::Fail::Immediately, None)?,
+        };
+        let mut lock = std::io::BufWriter::with_capacity(64 * 1024, lock);
         let (version, digest) = self.write_to(&mut lock, options)?;
         match lock.into_inner() {
             Ok(lock) => lock.commit()?,

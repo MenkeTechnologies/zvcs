@@ -26,10 +26,14 @@
 //! daemon, lost a write in nine of ten trials.
 //!
 //! The lane file is deliberately NOT `index.lock`: gitoxide acquires that one
-//! with `Fail::Immediately`, so holding it ourselves makes our own writer fail
-//! ("could not be obtained immediately after 1 attempt(s)"). A separate
-//! zvcs-owned file gives zvcs-vs-zvcs exclusion without touching the writer, and
-//! foreign writers are covered separately by [`wait_for_foreign_index_lock`].
+//! with `Fail::Immediately`, so a writer that did not know it was holding it
+//! would fail against itself ("could not be obtained immediately after 1
+//! attempt(s)"). A separate zvcs-owned file gives zvcs-vs-zvcs exclusion without
+//! touching every writer, and foreign writers are covered separately by
+//! [`wait_for_foreign_index_lock`]. The one command that holds `index.lock`
+//! itself the way git does — `status`, across its collection — takes it with
+//! [`crate::index_racy::hold_locked_index`] and writes through it with
+//! [`crate::index_racy::write_holding`].
 //!
 //! Exclusion is the kernel's `flock`, not the file's existence, so a killed
 //! holder wedges nothing: the lock dies with the process even on `SIGKILL`, and

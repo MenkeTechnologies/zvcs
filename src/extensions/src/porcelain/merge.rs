@@ -2488,7 +2488,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         return Ok(code);
     }
     update_worktree(&repo, &old_index, Some(head_tree), target_tree, &should_interrupt)?;
-    advance(&repo, local_id, target_id, format!("{}: Fast-forward", reflog_action(&reflog_spec)))?;
+    advance(&repo, local_id, target_id, format!("{}: Fast-forward", reflog_action(&reflog_spec)), opts.quiet)?;
     if !opts.quiet {
         println!("Fast-forward");
         print!("{}", diffstat(&repo, head_tree, target_tree, opts.stat)?);
@@ -3446,6 +3446,7 @@ fn finalize_clean(
         local_id,
         new_id,
         format!("{}: {finish_msg}", reflog_action(&spec_label)),
+        opts.quiet,
     )?;
     if !opts.quiet {
         println!("{finish_msg}");
@@ -3829,6 +3830,7 @@ fn octopus_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
             ctx.local_id,
             mrc[0],
             format!("{}: Fast-forward", reflog_action(&ctx.refs.join(" "))),
+            opts.quiet,
         )?;
         if !opts.quiet {
             println!("Fast-forward");
@@ -5172,8 +5174,17 @@ fn strerror(e: &std::io::Error) -> String {
     }
 }
 
-/// Move `name` from `old` to `new`, writing `reflog` as the reflog message.
-fn advance(repo: &gix::Repository, old: ObjectId, new: ObjectId, reflog: String) -> Result<()> {
+/// Move `name` from `old` to `new`, writing `reflog` as the reflog message, then
+/// run the automatic maintenance `finish()` runs right behind that update:
+///
+/// ```c
+/// refs_update_ref(…, reflog_message.buf, "HEAD", new_head, head, 0, UPDATE_REFS_DIE_ON_ERR);
+/// /* We ignore errors in 'gc --auto', since the user should see them. */
+/// run_auto_maintenance(the_repository, verbosity < 0);
+/// ```
+///
+/// (builtin/merge.c:500-509.)
+fn advance(repo: &gix::Repository, old: ObjectId, new: ObjectId, reflog: String, quiet: bool) -> Result<()> {
     // git's `finish()` calls `update_ref(msg, "HEAD", …)`, and updating a symref
     // writes the entry to `.git/logs/HEAD` *and*, through the deref, to the
     // branch's own log. Editing the branch directly writes only the branch log
@@ -5195,7 +5206,7 @@ fn advance(repo: &gix::Repository, old: ObjectId, new: ObjectId, reflog: String)
             .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
         deref: true,
     })?;
-    Ok(())
+    super::maintenance::run_auto_maintenance(repo, quiet)
 }
 
 /// `finish_up_to_date()`: the notice a merge with nothing to do prints, which

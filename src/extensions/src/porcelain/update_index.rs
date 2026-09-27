@@ -1251,21 +1251,23 @@ fn read_stdin_paths(ctx: &mut Ctx, nul_term_line: bool) -> Result<Step> {
     std::io::stdin().read_to_end(&mut buf)?;
     let sep = if nul_term_line { b'\0' } else { b'\n' };
 
-    for line in buf.split(|&b| b == sep) {
-        if line.is_empty() {
-            continue;
-        }
+    // `getline_fn = nul_term_line ? strbuf_getline_nul : strbuf_getline_lf;`
+    // (builtin/update-index.c:1181-1204). Only the EOF ends the loop, so the
+    // piece after a final separator is no record, but an empty line in the
+    // middle is one: `prefix_path()` makes it the empty path, which
+    // `update_one()` reports as `Ignoring path `. And `_lf` strips the `\n`
+    // alone — a CRLF line names a path that ends in `\r`.
+    let mut records: Vec<&[u8]> = buf.split(|&b| b == sep).collect();
+    if records.last().is_some_and(|last| last.is_empty()) {
+        records.pop();
+    }
+    for line in records {
         // The same C-string truncation `checkout-index`'s reader makes: a NUL
         // inside a newline-terminated record ends the path there, because
         // `prefix_path()` takes `buf.buf`.
         let line = match nul_term_line {
             true => line,
             false => &line[..line.iter().position(|&b| b == 0).unwrap_or(line.len())],
-        };
-        let line = if !nul_term_line && line.last() == Some(&b'\r') {
-            &line[..line.len() - 1]
-        } else {
-            line
         };
         let owned;
         let raw: &[u8] = if !nul_term_line && line.first() == Some(&b'"') {
@@ -1612,7 +1614,8 @@ fn update_one(ctx: &mut Ctx, path: &BString) -> Result<Step> {
             Ok(Ok(()))
         }
         Err(Die) => {
-            eprintln!("fatal: Unable to process path {path}");
+            // `die()`, so `vfreportf()` turns control bytes into `?` (usage.c:12-38).
+            eprintln!("{}", crate::gitsig::report("fatal: ", &format!("Unable to process path {path}")));
             Ok(Err(Die))
         }
     }
@@ -1664,7 +1667,8 @@ fn process_path(
 /// git's `remove_one_path`.
 fn remove_one_path(ctx: &mut Ctx, path: &BString) -> Step {
     if !ctx.allow_remove {
-        eprintln!("error: {path}: does not exist and --remove not passed");
+        // `error()`, so `vfreportf()` turns control bytes into `?` (usage.c:12-38).
+        eprintln!("{}", crate::gitsig::report("error: ", &format!("{path}: does not exist and --remove not passed")));
         return Err(Die);
     }
     remove_path_entries(ctx, path.as_bstr());

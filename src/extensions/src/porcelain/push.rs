@@ -2694,10 +2694,16 @@ fn report_porcelain(outcome: &push_proto::Outcome, quiet: bool) -> Result<(ExitC
             Ok(()) if s.up_to_date => println!("=\t{refpair}\t[up to date]"),
             Ok(()) if s.new.is_null() => println!("-\t:{dst}\t[deleted]"),
             Ok(()) if s.old.is_null() => {
+                // `print_ok_ref_status()` names the namespace in porcelain form too:
+                // anything outside `refs/tags/` and `refs/heads/` — the
+                // remote-tracking refs `--mirror` pushes, notes — is a
+                // `[new reference]` (transport.c:694-699).
                 let kind = if dst.starts_with("refs/tags/") {
                     "[new tag]"
-                } else {
+                } else if dst.starts_with("refs/heads/") {
                     "[new branch]"
+                } else {
+                    "[new reference]"
                 };
                 println!("*\t{refpair}\t{kind}");
             }

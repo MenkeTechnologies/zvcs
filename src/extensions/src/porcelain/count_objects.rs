@@ -15,9 +15,10 @@
 //!
 //! Not covered exactly: the `warning:` lines that accompany garbage are written
 //! to stderr with paths made relative to the worktree root rather than to git's
-//! internal post-`chdir` object directory, and they are grouped loose-first then
-//! pack-second instead of interleaving with the loose scan. Every number printed
-//! on stdout — including `garbage` and `size-garbage` — still matches. A repo
+//! internal post-`chdir` object directory. They come in git's order: the pack
+//! directory's at the first loose object `has_object_pack()` is asked about,
+//! the rest as the loose scan meets them. Every number printed on stdout —
+//! including `garbage` and `size-garbage` — still matches. A repo
 //! whose multi-pack-index references packs whose `.idx` files have been removed
 //! would under-count `in-pack`/`packs`, as this port enumerates `objects/pack/*.idx`
 //! the way `prepare_packed_git_one()` does rather than reading the midx. Running
@@ -173,6 +174,15 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
     let mut loose_size: u64 = 0;
     let mut loose_ids: Vec<ObjectId> = Vec::new();
     let name_len = hash.len_in_hex() - 2;
+    // Only `-v` looks at packs. `count_loose()` asks `has_object_pack()` of the
+    // first loose object it counts, and that call is what prepares the packs —
+    // so the pack directory's garbage is reported at that point in the loose
+    // scan, and only after the whole scan when there is no loose object at all.
+    let alternates = match verbose {
+        true => repo.objects.store_ref().alternate_db_paths()?,
+        false => Vec::new(),
+    };
+    let mut prepared: Option<(Vec<OpenPack>, Vec<OpenPack>)> = None;
 
     for fanout in 0u16..256 {
         let prefix = format!("{fanout:02x}");
@@ -194,6 +204,9 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
                     loose_size += on_disk_bytes(&md);
                     loose += 1;
                     if verbose {
+                        if prepared.is_none() {
+                            prepared = Some(prepare_packed_git(&objdir, &alternates, hash, &mut garbage));
+                        }
                         if let Ok(id) = ObjectId::from_hex(format!("{prefix}{name}").as_bytes()) {
                             loose_ids.push(id);
                         }
@@ -222,19 +235,18 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
     let mut size_pack: u64 = 0;
     let mut indices: Vec<pack::index::File> = Vec::new();
 
-    for idx in scan_pack_dir(&objdir, hash, &mut garbage) {
+    let (local_packs, alternate_packs) = match prepared {
+        Some(p) => p,
+        None => prepare_packed_git(&objdir, &alternates, hash, &mut garbage),
+    };
+    for idx in local_packs {
         packs += 1;
         in_pack += u64::from(idx.file.num_objects());
         size_pack += idx.pack_size + idx.index_size;
         indices.push(idx.file);
     }
 
-    let alternates = repo.objects.store_ref().alternate_db_paths()?;
-    for alt in &alternates {
-        for idx in scan_pack_dir(alt, hash, &mut garbage) {
-            indices.push(idx.file);
-        }
-    }
+    indices.extend(alternate_packs.into_iter().map(|idx| idx.file));
 
     let prune_packable = loose_ids
         .iter()
@@ -282,6 +294,22 @@ struct OpenPack {
     file: pack::index::File,
     index_size: u64,
     pack_size: u64,
+}
+
+/// `prepare_packed_git()`: every source's pack directory, the repository's own
+/// first and then each alternate's, reporting garbage as it goes.
+fn prepare_packed_git(
+    objdir: &Path,
+    alternates: &[PathBuf],
+    hash: gix::hash::Kind,
+    garbage: &mut Garbage,
+) -> (Vec<OpenPack>, Vec<OpenPack>) {
+    let local = scan_pack_dir(objdir, hash, garbage);
+    let mut others = Vec::new();
+    for alt in alternates {
+        others.extend(scan_pack_dir(alt, hash, garbage));
+    }
+    (local, others)
 }
 
 /// Scan an `objects/pack` directory the way `prepare_packed_git_one()` does:

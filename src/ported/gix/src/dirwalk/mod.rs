@@ -84,6 +84,7 @@ pub struct Options {
     emit_ignored: Option<EmissionMode>,
     recurse_ignored_directories: bool,
     for_deletion: Option<ForDeletionMode>,
+    current_dir_may_collapse: bool,
     emit_tracked: bool,
     emit_untracked: EmissionMode,
     emit_empty_directories: bool,

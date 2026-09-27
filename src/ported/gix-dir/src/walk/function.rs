@@ -104,7 +104,11 @@ pub fn walk(
         return Ok((out, root.to_owned()));
     }
 
-    let mut state = readdir::State::new(worktree_root, ctx.current_dir, options.for_deletion.is_some());
+    let mut state = readdir::State::new(
+        worktree_root,
+        ctx.current_dir,
+        options.for_deletion.is_some() && !options.current_dir_may_collapse,
+    );
     let may_collapse = root != worktree_root && state.may_collapse(&current);
     let (action, _) = readdir::recursive(
         may_collapse,

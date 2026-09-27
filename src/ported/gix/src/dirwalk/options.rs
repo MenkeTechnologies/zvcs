@@ -13,6 +13,7 @@ impl Options {
             emit_ignored: None,
             recurse_ignored_directories: false,
             for_deletion: None,
+            current_dir_may_collapse: false,
             emit_tracked: false,
             emit_untracked: Default::default(),
             emit_empty_directories: false,
@@ -34,6 +35,7 @@ impl From<Options> for gix_dir::walk::Options<'static> {
             emit_ignored: v.emit_ignored,
             recurse_ignored_directories: v.recurse_ignored_directories,
             for_deletion: v.for_deletion,
+            current_dir_may_collapse: v.current_dir_may_collapse,
             emit_tracked: v.emit_tracked,
             emit_untracked: v.emit_untracked,
             emit_empty_directories: v.emit_empty_directories,
@@ -86,6 +88,13 @@ impl Options {
     /// If `None`, ignored entries will not be emitted at all.
     pub fn emit_ignored(mut self, value: Option<EmissionMode>) -> Self {
         self.emit_ignored = value;
+        self
+    }
+    /// If `true`, default `false`, let a deletion walk collapse the directory the process
+    /// runs in, as git's `fill_directory()` does; see
+    /// `gix_dir::walk::Options::current_dir_may_collapse`.
+    pub fn current_dir_may_collapse(mut self, toggle: bool) -> Self {
+        self.current_dir_may_collapse = toggle;
         self
     }
     /// If `true`, default `false`, look inside a directory that is itself ignored so

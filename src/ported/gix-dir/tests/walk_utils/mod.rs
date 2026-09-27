@@ -32,6 +32,7 @@ pub fn options_emit_all() -> walk::Options<'static> {
         emit_pruned: true,
         emit_ignored: Some(walk::EmissionMode::Matching),
         recurse_ignored_directories: false,
+        current_dir_may_collapse: false,
         emit_tracked: true,
         emit_untracked: walk::EmissionMode::Matching,
         emit_empty_directories: true,

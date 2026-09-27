@@ -3133,7 +3133,7 @@ fn print_path(
 /// `prefix` returns `in` unchanged, and paths that do not share a root are also
 /// returned unchanged. Otherwise the shared directory components are dropped and one
 /// `../` is emitted per component of `prefix` that is left over.
-fn relative_path(input: &[u8], prefix: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn relative_path(input: &[u8], prefix: Option<&[u8]>) -> Vec<u8> {
     let is_sep = |b: u8| b == b'/';
     let in_len = input.len();
     let prefix = prefix.unwrap_or(b"");

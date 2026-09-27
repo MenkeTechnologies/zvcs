@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -245,10 +245,10 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
 /// trailing `/`) and then rendered relative to the current working directory,
 /// C-quoted exactly as git's `quote_path` does.
 ///
-/// Faithfully unsupported — this `bail!`s rather than emit wrong results:
-/// running from inside a directory that is itself a deletion candidate, where
-/// git prints an unsorted, readdir-ordered `./`-prefixed listing after `Refusing
-/// to remove current working directory`.
+/// Run from inside a directory that is itself a deletion candidate, the walk
+/// lists that directory like any other and `remove_dirs()` refuses it: `Refusing
+/// to remove current working directory`, then its contents in readdir order,
+/// rendered relative to the prefix (`./f`, `../deep/z`) — see [`RemoveDirs`].
 pub fn clean(args: &[String]) -> Result<ExitCode> {
     let p = match parse(args) {
         Ok(p) => p,
@@ -326,6 +326,11 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         .split(|b| *b == b'/')
         .filter(|c| !c.is_empty())
         .collect();
+    // git's own `prefix` spelling: empty at the top, else ending in `/`.
+    let mut prefix_slash = prefix.clone();
+    if !prefix_slash.is_empty() && prefix_slash.last() != Some(&b'/') {
+        prefix_slash.push(b'/');
+    }
 
     // git validates every pathspec left-to-right: for each element it first
     // parses the magic prefix (`:(…)`), then checks it does not escape the
@@ -360,27 +365,6 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     }
 
     let index = repo.index_or_load_from_head_or_empty()?;
-
-    // A directory only exists in the worktree because it holds tracked files or
-    // because it is untracked/ignored; if nothing tracked lives under the prefix
-    // the current directory is itself a deletion candidate, which git reports in
-    // a shape we do not reproduce.
-    if !prefix_parts.is_empty() {
-        let mut under_prefix = prefix.clone();
-        if under_prefix.last() != Some(&b'/') {
-            under_prefix.push(b'/');
-        }
-        let backing = index.path_backing();
-        let any_tracked = index
-            .entries()
-            .iter()
-            .any(|e| e.path_in(backing).starts_with_str(&under_prefix));
-        if !any_tracked {
-            bail!(
-                "cleaning from inside a directory that is itself a deletion candidate is not supported"
-            );
-        }
-    }
 
     // Emission modes, chosen to mirror git's `dir.c` flags for each combination:
     //   * `-X` keeps untracked entries un-collapsed so an untracked directory
@@ -419,7 +403,10 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
             (ignored_too || ignored_only)
                 .then_some(gix::dir::walk::EmissionMode::CollapseDirectory),
         )
-        .emit_empty_directories(remove_directories);
+        .emit_empty_directories(remove_directories)
+        // `fill_directory()` has no notion of the working directory; the refusal to
+        // remove it is `remove_dirs()`'s (builtin/clean.c:252-265).
+        .current_dir_may_collapse(true);
     options = options.for_deletion(
         remove_directories
             .then_some(gix::dir::walk::ForDeletionMode::IgnoredDirectoriesCanHideNestedRepositories),
@@ -456,12 +443,6 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
             gix::dir::entry::Status::Ignored(_) if !(ignored_too || ignored_only) => continue,
             _ => {}
         }
-        if entry.property == Some(gix::dir::entry::Property::EmptyDirectoryAndCWD) {
-            bail!(
-                "cleaning from inside a directory that is itself a deletion candidate is not supported"
-            );
-        }
-
         // `is_nonbare_repository_dir()` (setup.c:405) is the only repository test
         // git's directory walk makes, and it looks at `<dir>/.git` alone:
         //
@@ -522,7 +503,14 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
     let removing = if dry_run { "Would remove" } else { "Removing" };
     let cwd_real = std::env::current_dir().ok().and_then(|p| gix::path::realpath(p).ok());
     for (key, rela_path, is_dir) in targets {
-        let shown = quote_path(relative_to_prefix(key.as_bstr(), &prefix_parts));
+        // `rel = relative_path(ent->name, prefix, &buf)` (builtin/clean.c:1043) is what
+        // `del_list` holds and what is printed, with no further prefix
+        // (`quote_path(item->string, NULL, …)`). `abs_path` is `prefix` + `rel`
+        // (builtin/clean.c:1053-1056), which `remove_dirs()` extends and renders
+        // relative to `prefix` again — hence `./f` for a file of the very directory
+        // the command runs in, which `rel` names `./`.
+        let rel = BString::from(super::rev_parse::relative_path(&key, Some(&prefix_slash)));
+        let shown = quote_path(&rel);
 
         let Some(abs) = repo.workdir_path(&rela_path) else {
             continue;
@@ -560,13 +548,15 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
             // `remove_dirs()`.
             let mut gone = true;
             let ctx = RemoveDirs {
-                prefix_parts: &prefix_parts,
+                prefix: prefix_slash.as_bstr(),
                 keep_nested_git: force < 2,
                 dry_run,
                 quiet,
                 cwd_real: cwd_real.as_deref(),
             };
-            if ctx.run(&abs, rela_path.as_bstr(), &mut out, &mut gone) {
+            let mut abs_path = prefix_slash.clone();
+            abs_path.extend_from_slice(&rel);
+            if ctx.run(&abs, abs_path.as_bstr(), &mut out, &mut gone) {
                 failed = true;
             }
             if gone && !quiet {
@@ -618,8 +608,9 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
 /// a directory that turns out to be the process's original working directory is
 /// refused rather than removed.
 struct RemoveDirs<'a> {
-    /// The repo-relative current directory, for rendering paths as git does.
-    prefix_parts: &'a [&'a [u8]],
+    /// git's `prefix`: the repo-relative current directory with its trailing `/`,
+    /// empty at the top. Every path is rendered `quote_path(path, prefix)`.
+    prefix: &'a BStr,
     /// git's `REMOVE_DIR_KEEP_NESTED_GIT`, set unless `-f` was given twice.
     keep_nested_git: bool,
     dry_run: bool,
@@ -631,18 +622,20 @@ struct RemoveDirs<'a> {
 
 impl RemoveDirs<'_> {
     /// Returns git's `ret` — `true` when something could not be removed — and
-    /// sets `dir_gone` to whether `abs` itself is gone.
+    /// sets `dir_gone` to whether `abs` itself is gone. `path` is git's `path`
+    /// buffer: `prefix` + the candidate as `relative_path()` rendered it, extended
+    /// one entry at a time — only ever printed, never opened.
     fn run(
         &self,
         abs: &std::path::Path,
-        rela: &BStr,
+        path: &BStr,
         out: &mut String,
         dir_gone: &mut bool,
     ) -> bool {
         let mut ret = false;
         *dir_gone = true;
 
-        let shown = |p: &BStr| quote_path(relative_to_prefix(p, self.prefix_parts));
+        let shown = |p: &BStr| quote_path(super::rev_parse::relative_path(p, Some(self.prefix)));
         // stdout is buffered so the `Removing` lines stay in walk order; a
         // warning has to see everything printed before it, as git's unbuffered
         // `printf`/`warning_errno` pair does.
@@ -667,7 +660,7 @@ impl RemoveDirs<'_> {
         if self.keep_nested_git && abs.join(".git").exists() {
             if !self.quiet {
                 let verb = if self.dry_run { "Would skip" } else { "Skipping" };
-                out.push_str(&format!("{verb} repository {}\n", shown(rela)));
+                out.push_str(&format!("{verb} repository {}\n", shown(path)));
             }
             *dir_gone = false;
             return ret;
@@ -692,7 +685,7 @@ impl RemoveDirs<'_> {
                         out,
                         format!(
                             "warning: failed to remove {}: {}\n",
-                            shown(rela),
+                            shown(path),
                             errno_text(&err)
                         ),
                     );
@@ -710,8 +703,11 @@ impl RemoveDirs<'_> {
         for entry in entries {
             let Ok(entry) = entry else { continue };
             let child_abs = entry.path();
-            let mut child_rela = BString::from(rela.to_vec());
-            child_rela.push(b'/');
+            // `strbuf_complete(path, '/')`, then the entry's name (builtin/clean.c:203-210).
+            let mut child_rela = BString::from(path.to_vec());
+            if child_rela.last() != Some(&b'/') {
+                child_rela.push(b'/');
+            }
             child_rela.extend_from_slice(gix::path::os_str_into_bstr(&entry.file_name()).unwrap_or_default());
 
             // ```c
@@ -783,7 +779,7 @@ impl RemoveDirs<'_> {
                         out,
                         format!(
                             "warning: failed to remove {}: {}\n",
-                            shown(rela),
+                            shown(path),
                             errno_text(&err)
                         ),
                     );

@@ -173,6 +173,15 @@ pub struct Options<'a> {
     /// If `None`, precious files are treated like expendable files, which is usually what you want when displaying them
     /// for addition to the repository, and the collapse of folders can be more generous in relation to ignored files.
     pub for_deletion: Option<ForDeletionMode>,
+    /// If `true`, the directory the process runs in may be collapsed like any other
+    /// when [`for_deletion`](Self::for_deletion) is set. By default a deletion walk
+    /// never folds it, so it cannot be deleted as a whole.
+    ///
+    /// git's `fill_directory()` knows nothing of the working directory: `git clean`
+    /// run inside an untracked directory lists that directory, and it is
+    /// `remove_dirs()` that refuses it (builtin/clean.c:252-265) —
+    /// `Would refuse to remove current working directory`, then its contents.
+    pub current_dir_may_collapse: bool,
     /// If `true`, we will not only find non-bare repositories in untracked directories, but also bare ones.
     ///
     /// Note that this is very costly, but without it, bare repositories will appear like untracked directories when collapsed,

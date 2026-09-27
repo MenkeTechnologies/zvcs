@@ -656,6 +656,7 @@ mod format_patch;
 mod format_rev;
 mod fsck;
 mod fsck_objects;
+mod pack_check;
 #[allow(non_snake_case)] // maps to git's `fsmonitor--daemon` subcommand
 mod fsmonitor__daemon;
 mod gc;

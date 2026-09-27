@@ -5,7 +5,6 @@ use std::io::IsTerminal;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 use gix::hash::ObjectId;
 use gix::objs::Kind;
@@ -75,14 +74,16 @@ const ERROR_REFS: u8 = 8;
 ///                                       it was reached by; see divergence 6.
 ///   * `--references` / `--no-references` — accepted; see divergence 2.
 ///   * `--full` / `--no-full`         — on by default; `check_full` gates
-///                                       `verify_pack()`, ported here as a gix pack
-///                                       integrity check over every pack in the main
-///                                       object directory and each alternate (the
-///                                       `.idx`/`.pack` checksums and every object's
-///                                       SHA-1 and CRC-32), setting `ERROR_PACK` on
-///                                       failure. The fsck message layer git also
-///                                       re-runs over packed objects is not part of
-///                                       it; see divergence 1.
+///                                       `verify_pack()` over every pack in the main
+///                                       object directory and each alternate, ported
+///                                       in `pack_check.rs` with git's `error:` lines
+///                                       (index and pack checksums, per-object CRC,
+///                                       `unpack_entry()`'s delta-chain failures,
+///                                       `cannot unpack`), setting `ERROR_PACK`; an
+///                                       object it cannot produce never gains
+///                                       `HAS_OBJ`. A pack whose trailer disagrees
+///                                       with its `.idx` is not refused at open the
+///                                       way `open_packed_git()` refuses it.
 ///   * `--strict` / `--no-strict`     — promotes every message-layer warning
 ///                                       that no `fsck.<msg-id>` configured to
 ///                                       an error, leaving info-severity ids
@@ -559,6 +560,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     if opt.verbose && !opt.connectivity_only {
         eprintln!("Checking object directory");
     }
+    // `--full`'s `verify_pack()` pass, run ahead of the scan so the objects it
+    // could not produce are treated as absent; its lines are printed at 3b.
+    let pack_check = match opt.check_full && !opt.connectivity_only {
+        true => verify_packs(&repo),
+        false => super::pack_check::PackCheck::default(),
+    };
     for &id in &all {
         // `--connectivity-only` replaces `fsck_source()` with
         // `mark_object_for_connectivity()`, which creates the object straight
@@ -570,6 +577,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // only if it is a non-blob something reaches.
         if opt.connectivity_only {
             state.note(id);
+            continue;
+        }
+        // A packed object `verify_pack()` could not produce never reaches
+        // `fsck_obj_buffer()`: its lines are the pack's, and it stays without
+        // `HAS_OBJ`.
+        if pack_check.unverified.contains(&id)
+            && !pack_check.verified.contains(&id)
+            && loose_object_path(&repo, id).is_none()
+        {
+            corrupt.insert(id);
             continue;
         }
         // `fsck_loose()` reads the object out of the odb first of all. Every
@@ -889,8 +906,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `verify_pack()` across `get_all_packs()` (the main object directory plus
     // every alternate), OR-ing `ERROR_PACK` into `errors_found` on failure.
     // `--connectivity-only` skips the whole object-content phase, this included.
-    if opt.check_full && !opt.connectivity_only {
-        errors |= verify_packs(&repo);
+    for line in &pack_check.lines {
+        eprintln!("{line}");
+    }
+    if pack_check.failed {
+        errors |= ERROR_PACK;
     }
 
     // ---- 3c. `process_refs()`: the snapshot, handled ------------------------
@@ -1049,7 +1069,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // `obj_hash`, so `check_reachable_object()` reports it `missing` with
             // the type its head site gave it — `OBJ_BLOB` for an index entry.
             if !has_obj.contains(&id) {
-                if index_blobs.contains(&id) && !in_pack(&repo, id) {
+                if index_blobs.contains(&id) && !in_pack(&repo, id, &pack_check.bad) {
                     state.missing.insert(id, Kind::Blob);
                 }
                 continue;
@@ -1247,7 +1267,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
                 // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
                 // there, so the pack is consulted before anything is reported.
-                if !in_pack(&repo, child) {
+                if !in_pack(&repo, child, &pack_check.bad) {
                     state.missing.insert(child, child_kind);
                 }
                 continue;
@@ -2289,23 +2309,24 @@ pub(super) fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>)
 }
 
 /// `--full`: git's `verify_pack()` over every pack `get_all_packs()` yields — the
-/// main object directory first, then each alternate — returning `ERROR_PACK` if
-/// any pack fails.
+/// main object directory first, then each alternate — see
+/// [`super::pack_check`] for the port. The result is gathered before the object
+/// scan, because the objects a pack could not produce never gain `HAS_OBJ` and
+/// the scan must treat them as absent, and printed where git prints it, after
+/// the loose objects' lines.
 ///
-/// git re-inflates each packed object and re-runs the fsck message layer through
-/// `fsck_obj_buffer`; that half is the missing message layer (divergence 1). What
-/// gix exposes, and what this checks, is `verify_pack`'s integrity core: the
-/// `.idx` and `.pack` file checksums plus every object's SHA-1 and CRC-32 as
-/// stored in the index. The `Mode::HashCrc32` choice and the `verify_integrity`
-/// call mirror `porcelain::index_pack`'s `--verify`, git's own `verify_pack` peer.
-fn verify_packs(repo: &gix::Repository) -> u8 {
+/// One ordering difference remains: git interleaves each pack's `verify_pack()`
+/// lines with the message-layer findings its `fsck_obj_buffer()` callback
+/// prints for the same pack's good objects, while this port prints those
+/// findings with the scan and the pack's lines here.
+fn verify_packs(repo: &gix::Repository) -> super::pack_check::PackCheck {
     let hash = repo.object_hash();
     let mut objdirs: Vec<PathBuf> = vec![repo.objects.store_ref().path().to_path_buf()];
     if let Ok(alts) = repo.objects.store_ref().alternate_db_paths() {
         objdirs.extend(alts);
     }
 
-    let mut errors = 0u8;
+    let mut check = super::pack_check::PackCheck::default();
     for objdir in objdirs {
         let dir = objdir.join("pack");
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -2334,40 +2355,23 @@ fn verify_packs(repo: &gix::Repository) -> u8 {
             }
             let opened = pack::index::File::at(&index_path, hash)
                 .ok()
-                .zip(pack::data::File::at(&data_path, hash).ok());
-            let Some((index, data)) = opened else {
+                .zip(std::fs::read(&index_path).ok())
+                .zip(std::fs::read(&data_path).ok());
+            let Some(((index, idx_bytes), pack_bytes)) = opened else {
                 // The `.pack` exists but a file will not open/parse — a pack
                 // failure in its own right, as `verify_pack()` treats an
                 // unopenable pack.
-                eprintln!("error: unable to open pack '{}'", data_path.display());
-                errors |= ERROR_PACK;
+                check.lines.push(format!("error: unable to open pack '{}'", data_path.display()));
+                check.failed = true;
                 continue;
             };
-            let options = pack::index::verify::integrity::Options {
-                // git checks each object's hash and CRC32 against the index plus
-                // the two file checksums; it never re-encodes, so the stricter
-                // modes would reject packs git accepts.
-                verify_mode: pack::index::verify::Mode::HashCrc32,
-                thread_limit: None,
-                ..Default::default()
-            };
-            if let Err(e) = index.verify_integrity(
-                Some(pack::index::verify::PackContext {
-                    data: &data,
-                    options,
-                }),
-                &mut gix::progress::Discard,
-                &AtomicBool::new(false),
-            ) {
-                // `verify_pack()` "gives error messages itself"; report the real
-                // failure rather than inventing git's per-corruption text.
-                eprintln!("error: {e}");
-                errors |= ERROR_PACK;
-            }
+            let pack_name = loose_label_of(repo, &data_path);
+            super::pack_check::verify_pack(repo, &index, &idx_bytes, &pack_bytes, &pack_name, &mut check);
         }
     }
-    errors
+    check
 }
+
 
 /// Whether the odb has any pack, which changes git's `--progress` output.
 fn has_packs(repo: &gix::Repository) -> bool {
@@ -2391,8 +2395,9 @@ fn has_packs(repo: &gix::Repository) -> bool {
 /// guard `check_reachable_object()` puts in front of its `missing` line
 /// (builtin/fsck.c:268-269), which only matters once something in the odb can
 /// lack `HAS_OBJ`: a pack under `--no-full`.
-fn in_pack(repo: &gix::Repository, id: ObjectId) -> bool {
-    repo.has_object(id) && !is_loose(repo, id)
+/// `bad` is `mark_bad_packed_object()`'s set, which `find_pack_entry()` skips.
+fn in_pack(repo: &gix::Repository, id: ObjectId, bad: &HashSet<ObjectId>) -> bool {
+    repo.has_object(id) && !is_loose(repo, id) && !bad.contains(&id)
 }
 
 fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
@@ -2501,7 +2506,7 @@ fn zerr_to_string(e: &gix::zlib::DecompressError) -> &'static str {
 }
 
 /// `git-zlib.c::git_inflate`'s diagnostic for a status below `Z_OK`.
-fn inflate_error_line(z: &gix::zlib::Decompress, e: &gix::zlib::DecompressError) -> String {
+pub(super) fn inflate_error_line(z: &gix::zlib::Decompress, e: &gix::zlib::DecompressError) -> String {
     format!(
         "error: inflate: {} ({})",
         zerr_to_string(e),

@@ -593,11 +593,20 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
 /// and the negative return makes `do_git_config_sequence()` die with `unable to
 /// parse command-line config` (config.c:1600-1602). The empty value is relative.
 /// An absolute path that does not exist is skipped silently
-/// (`access_or_die()`), as it is here. `includeIf.<cond>.path` is left to the
-/// reader: whether it is followed depends on the condition.
+/// (`access_or_die()`), as it is here.
+///
+/// `includeIf.<cond>.path` reaches the same `handle_path_include()` when
+/// `include_condition_is_true()` holds (config.c:432-445), so a true condition
+/// with a relative path is the same refusal; a false one is never followed.
 fn command_line_include_refusal(o: &ConfigOverride) -> Option<String> {
-    if config::normalize_key(&o.key) != "include.path" {
-        return None;
+    let key = config::normalize_key(&o.key);
+    if key != "include.path" {
+        // `parse_config_key(var, "includeif", &cond, &cond_len, &key)` with a
+        // subsection, and a name of exactly `path`.
+        let cond = key.strip_prefix("includeif.")?.strip_suffix(".path")?;
+        if !config::command_line_include_condition(cond) {
+            return None;
+        }
     }
     let Some(value) = o.value.as_deref() else {
         return Some("missing value for 'include.path'".to_string());

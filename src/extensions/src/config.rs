@@ -2660,6 +2660,69 @@ impl RepositoryDirs {
     }
 }
 
+/// `include_condition_is_true()` (config.c:396-414) for an `includeIf.<cond>.path`
+/// read from the command line, which `do_git_config_sequence()` evaluates against
+/// the repository setup found (`opts->git_dir`, `data->repo`). Located without
+/// opening the repository: opening reads this very configuration.
+///
+/// * `gitdir:` / `gitdir/i:` — `include_by_gitdir()` (:238-295): the pattern is
+///   `~`-expanded, made `**/`-relative unless absolute, `**`-completed when it
+///   names a directory, and wildmatched with `WM_PATHNAME` against the realpath
+///   of the git directory, then against its plain absolute path. A `./` pattern
+///   is `prepare_include_condition_pattern()`'s own error (:199-236) and is not
+///   modelled here.
+/// * `onbranch:` — `include_by_branch()` (:297-320): the short name of the branch
+///   `HEAD` points at, same pattern completion, `WM_PATHNAME`.
+/// * `hasconfig:remote.*.url:` — `include_by_remote_url()` (:385-394) has to
+///   read the remote URLs first, and `populate_remote_urls()` reads the whole
+///   sequence with `unconditional_remote_url` set, which treats this very
+///   condition as true. So for a relative path the answer is always yes.
+///
+/// Anything else is an unknown condition, which is false.
+pub(crate) fn command_line_include_condition(cond: &str) -> bool {
+    let complete = |mut pattern: String| {
+        // `add_trailing_starstar_for_dir()`.
+        if pattern.ends_with('/') {
+            pattern.push_str("**");
+        }
+        pattern
+    };
+    let matches = |pattern: &str, text: &std::path::Path, icase: bool| {
+        let mut mode = gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL;
+        if icase {
+            mode |= gix::glob::wildmatch::Mode::IGNORE_CASE;
+        }
+        gix::glob::wildmatch(pattern.into(), text.to_string_lossy().as_ref().into(), mode)
+    };
+    let gitdir = |pattern: &str, icase: bool| {
+        let Some(dirs) = repository_directories() else { return false };
+        let expanded = crate::setup::interpolate_path(pattern)
+            .map_or_else(|| pattern.to_owned(), |p| p.to_string_lossy().into_owned());
+        if expanded.starts_with("./") {
+            return false;
+        }
+        let pattern = match std::path::Path::new(&expanded).is_absolute() {
+            true => complete(expanded),
+            false => complete(format!("**/{expanded}")),
+        };
+        let absolute = std::path::absolute(&dirs.git_dir).unwrap_or_else(|_| dirs.git_dir.clone());
+        matches(&pattern, &crate::setup::realpath(&dirs.git_dir), icase) || matches(&pattern, &absolute, icase)
+    };
+    if let Some(pattern) = cond.strip_prefix("gitdir:") {
+        return gitdir(pattern, false);
+    }
+    if let Some(pattern) = cond.strip_prefix("gitdir/i:") {
+        return gitdir(pattern, true);
+    }
+    if let Some(pattern) = cond.strip_prefix("onbranch:") {
+        let Some(dirs) = repository_directories() else { return false };
+        let head = std::fs::read_to_string(dirs.git_dir.join("HEAD")).unwrap_or_default();
+        let Some(short) = head.trim_end().strip_prefix("ref: refs/heads/") else { return false };
+        return matches(&complete(pattern.to_owned()), std::path::Path::new(short), false);
+    }
+    cond.starts_with("hasconfig:remote.*.url:")
+}
+
 /// Locate the repository without opening it — opening is what fails when the
 /// config will not parse, so the location has to come from the discovery walk
 /// alone.

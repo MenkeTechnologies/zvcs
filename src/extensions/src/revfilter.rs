@@ -37,10 +37,6 @@ pub enum Origin {
     /// `p->origin = "header"` — `--author`/`--committer`, which
     /// `compile_grep_patterns()` appends as header patterns.
     Header,
-    /// The pickaxe, which is not a `grep_pat` at all: `diffcore_pickaxe()` calls
-    /// `regcomp()` itself and dies `invalid regex: <regerror>` with no origin and
-    /// no quoted pattern (diffcore-pickaxe.c).
-    Pickaxe,
 }
 
 impl Origin {
@@ -49,7 +45,6 @@ impl Origin {
         match self {
             Origin::CommandLine => format!("command line, '{pattern}': {text}"),
             Origin::Header => format!("header, '{pattern}': {text}"),
-            Origin::Pickaxe => format!("invalid regex: {text}"),
         }
     }
 }

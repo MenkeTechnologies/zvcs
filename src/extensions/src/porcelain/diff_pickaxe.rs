@@ -75,10 +75,18 @@ impl Needle {
 /// stable one — every caller compiles with `REG_EXTENDED` — and the engine's own
 /// message for anything else.
 pub(crate) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
+    compile_regex_icase(pat, false)
+}
+
+/// [`compile_regex`] with `REG_ICASE` when `icase` — the flag `diffcore_pickaxe()` adds
+/// for `DIFF_PICKAXE_IGNORE_CASE` (diffcore-pickaxe.c:244-245). Without Unicode mode the
+/// fold is ASCII-only, as `REG_ICASE` is in git's C locale.
+pub(crate) fn compile_regex_icase(pat: &[u8], icase: bool) -> std::result::Result<Regex, String> {
     let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
     regex::bytes::RegexBuilder::new(s)
         .unicode(false)
         .multi_line(true)
+        .case_insensitive(icase)
         .build()
         .map_err(|e| match super::line_log::ere_syntax_error(s) {
             Some(text) => text.to_owned(),

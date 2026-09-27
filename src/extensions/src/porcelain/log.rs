@@ -4245,14 +4245,26 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         eprintln!("fatal: the option '--grep-reflog' requires '--walk-reflogs'");
         return Ok(ExitCode::from(128));
     }
-    // Pickaxe `-G<regex>` compiles once, in the same dialect as --grep.
+    // Pickaxe `-G<regex>` (and `-S` under `--pickaxe-regex`, below) is not a
+    // `grep_pat`: `diffcore_pickaxe()` compiles it itself with
+    // `REG_EXTENDED | REG_NEWLINE`, plus `REG_ICASE` when `-i` /
+    // `--regexp-ignore-case` set `DIFF_PICKAXE_IGNORE_CASE` (diffcore-pickaxe.c:242-246,
+    // revision.c:2690-2692). `-E`/`-F`/`-P`/`--basic-regexp` only choose the dialect of
+    // `--grep`/`--author`/`--committer`, so they never reach it.
+    //
+    // A pattern that does not compile is `regcomp_or_die()`'s `die()`, raised from
+    // `diffcore_std()` — i.e. when the walk diffs its first commit, not while the
+    // options are parsed — so a walk that diffs nothing exits 0. The failure is kept
+    // here and raised at that point below.
+    let mut pickaxe_regex_error: Option<String> = None;
     let pickaxe_g_re = match &pickaxe_g {
-        Some(p) => Some(crate::revfilter::build_regex(
-            p,
-            grep_dialect,
-            grep_ignore_case,
-            crate::revfilter::Origin::Pickaxe,
-        )?),
+        Some(p) => match super::diff_pickaxe::compile_regex_icase(p.as_bytes(), grep_ignore_case) {
+            Ok(re) => Some(re),
+            Err(msg) => {
+                pickaxe_regex_error = Some(msg);
+                None
+            }
+        },
         None => None,
     };
     // `diff_setup_done()` (diff.c:5262-5273) rejects two pickaxe combinations outright,
@@ -4312,23 +4324,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         (_, Some(needle)) => {
             let kind = match pickaxe_regex {
                 true => match super::diff_pairs::compile_regex(needle.as_bytes()) {
-                    Ok(re) => super::diff_pairs::PickaxeKind::Occurrences(
+                    Ok(re) => Some(super::diff_pairs::PickaxeKind::Occurrences(
                         super::diff_pairs::Needle::Regex(re),
-                    ),
+                    )),
                     Err(msg) => {
-                        eprintln!("fatal: invalid regex: {msg}");
-                        return Ok(ExitCode::from(128));
+                        pickaxe_regex_error = Some(msg);
+                        None
                     }
                 },
-                false => super::diff_pairs::PickaxeKind::Occurrences(
+                false => Some(super::diff_pairs::PickaxeKind::Occurrences(
                     super::diff_pairs::Needle::Literal(needle.as_bytes().to_vec()),
-                ),
+                )),
             };
-            Some(super::diff_pairs::Pickaxe { kind, all: pickaxe_all })
+            kind.map(|kind| super::diff_pairs::Pickaxe { kind, all: pickaxe_all })
         }
         _ => None,
     };
-    let has_pickaxe = pickaxe.is_some() || pickaxe_g_re.is_some();
+    let has_pickaxe =
+        pickaxe.is_some() || pickaxe_g_re.is_some() || pickaxe_regex_error.is_some();
 
     // `--graph`: the commits `get_commit_action()` would show, which is what
     // `graph_is_interesting()` asks about each parent. Taken before `-S`/`-G`,
@@ -4582,6 +4595,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     }
                 }
             };
+            // `regcomp_or_die()` for a pattern that did not compile: the first
+            // commit `log_tree_diff()` hands to `diffcore_std()` dies, before
+            // anything about it is printed.
+            if let Some(msg) = &pickaxe_regex_error {
+                if !candidates.is_empty() || !merge_jobs.is_empty() {
+                    eprintln!("fatal: invalid regex: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
             let hits = scan(candidates)?;
             // The pairs that survived, not the commits: a merge can print for one
             // parent and stay silent for another, and the record loop needs to know

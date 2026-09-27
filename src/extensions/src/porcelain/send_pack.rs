@@ -703,7 +703,7 @@ fn print_push_status(repo: &gix::Repository, outcome: &push_proto::Outcome, verb
                         (false, true) => "[remote rejected]",
                         (false, false) => "[rejected]",
                     };
-                    emit('!', summary.into(), from, to, Some(reason))
+                    emit('!', summary.into(), s.rejected_from(), to, Some(reason))
                 }
                 Ok(()) if up_to_date => emit('=', "[up to date]".into(), from, to, None),
                 Ok(()) if s.new.is_null() => emit('-', "[deleted]".into(), None, to, None),

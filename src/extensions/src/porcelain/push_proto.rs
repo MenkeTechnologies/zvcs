@@ -198,14 +198,17 @@ fn match_name_with_pattern(key: &str, name: &str, value: &str) -> Option<String>
 /// is stable, which keeps a proc-receive hook's several reports for one ref in
 /// the order they came.
 fn remote_refs_order(statuses: &mut [RefStatus], advertised: &[String], created: &[String]) {
-    let key = |name: &str| {
-        advertised
-            .iter()
-            .position(|a| a == name)
-            .or_else(|| created.iter().position(|c| c == name).map(|i| advertised.len() + i))
-            .unwrap_or(usize::MAX)
-    };
-    statuses.sort_by_cached_key(|s| key(&s.name));
+    statuses.sort_by_cached_key(|s| remote_refs_position(advertised, created, &s.name));
+}
+
+/// Where `name` sits in `remote_refs`: its place in the advertisement, else
+/// after it in match order ([`remote_refs_order`]).
+fn remote_refs_position(advertised: &[String], created: &[String], name: &str) -> usize {
+    advertised
+        .iter()
+        .position(|a| a == name)
+        .or_else(|| created.iter().position(|c| c == name).map(|i| advertised.len() + i))
+        .unwrap_or(usize::MAX)
 }
 
 /// Wire-level options that change the request itself rather than the ref list.
@@ -304,6 +307,24 @@ pub struct RefStatus {
 }
 
 impl RefStatus {
+    /// The `from` side `print_one_push_report()` hands `print_ref_status()` for
+    /// a refused ref (transport.c:742-803): the local ref (`ref->peer_ref`),
+    /// which for a deletion is the placeholder `alloc_delete_ref()` names
+    /// `(delete)` — except where git passes `NULL`: `REF_STATUS_REJECT_NODELETE`,
+    /// and a deletion the server refused or never answered
+    /// (`ref->deletion ? NULL : ref->peer_ref`). `None` prints the remote ref
+    /// alone.
+    pub fn rejected_from(&self) -> Option<&str> {
+        if !self.new.is_null() {
+            return Some(self.src.as_deref().unwrap_or(&self.name));
+        }
+        let nodelete = matches!(&self.result, Err(r) if r == "remote does not support deleting refs");
+        match self.remote_rejected || self.missing_report || nodelete {
+            true => None,
+            false => Some("(delete)"),
+        }
+    }
+
     /// Which of `transport_print_push_status()`'s three walks over `remote_refs`
     /// prints this ref (transport.c:864-897): `0` for `REF_STATUS_UPTODATE`
     /// (only under `-v` or `--porcelain`), `1` for `REF_STATUS_OK`, `2` for
@@ -1002,6 +1023,69 @@ pub fn send_pack(
         });
     }
 
+    // `--mirror` / `--prune`: an advertised ref with no local counterpart is
+    // deleted. This has to happen here rather than in the porcelain because only
+    // the handshake knows what the remote actually has. `delete-refs` is required
+    // for the same reason git requires it — without it the deletion cannot be
+    // expressed on the wire at all.
+    if let Some(scope) = &opts.delete_scope {
+        // `if (ref->peer_ref) continue;` (remote.c:1639-1641): a ref some refspec
+        // already matched is never a deletion candidate, whatever its verdict.
+        let requested: HashSet<&str> = wire
+            .iter()
+            .map(|w| w.name.as_str())
+            .chain(statuses.iter().map(|s| s.name.as_str()))
+            .collect();
+        let doomed: Vec<(&String, &ObjectId)> = advertised
+            .iter()
+            .filter(|(name, _)| !requested.contains(name.as_str()))
+            .filter(|(name, _)| match scope {
+                // `--mirror` reaches `get_ref_match()` through the matching
+                // refspec with `send_mirror` set, which answers with the
+                // advertised name for every ref, `refs/heads/` or not.
+                DeleteScope::All => !opts.local_refs.contains(name.as_str()),
+                DeleteScope::Prune(specs) => specs
+                    .iter()
+                    .find_map(|spec| spec.source_of(name))
+                    .is_some_and(|src| !opts.local_refs.contains(src.as_str())),
+            })
+            .collect();
+        for (name, old) in doomed {
+            if !allow_deleting_refs {
+                statuses.push(RefStatus {
+                    name: name.clone(),
+                    src: None,
+                    report_name: None,
+                    old: *old,
+                    new: null,
+                    result: Err("remote does not support deleting refs".to_owned()),
+                    forced: false,
+            up_to_date: false,
+            pre_transport: false,
+            remote_rejected: false,
+            missing_report: false,
+        });
+                continue;
+            }
+            // Only the wire entry: the per-ref status is produced from the
+            // server report alongside every other command, so pushing one here
+            // too would report the deletion twice.
+            wire.push(Wire {
+                name: name.clone(),
+                src: None,
+                old: *old,
+                new: null,
+                forced: true,
+            });
+        }
+    }
+
+    // From here on everything walks `remote_refs` — the atomic check's "first
+    // rejected ref", the command list, the pack's tips and every report — so
+    // the verdicts and the commands are put in that order now.
+    remote_refs_order(&mut statuses, &advertised_order, &created);
+    wire.sort_by_cached_key(|w| remote_refs_position(&advertised_order, &created, &w.name));
+
     // ```c
     // if (!remote_refs) {
     //         fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
@@ -1123,59 +1207,6 @@ pub fn send_pack(
             unpack: Ok(()),
             no_refs: false,
         });
-    }
-
-    // `--mirror` / `--prune`: an advertised ref with no local counterpart is
-    // deleted. This has to happen here rather than in the porcelain because only
-    // the handshake knows what the remote actually has. `delete-refs` is required
-    // for the same reason git requires it — without it the deletion cannot be
-    // expressed on the wire at all.
-    if let Some(scope) = &opts.delete_scope {
-        let requested: HashSet<&str> = wire.iter().map(|w| w.name.as_str()).collect();
-        let mut doomed: Vec<(&String, &ObjectId)> = advertised
-            .iter()
-            .filter(|(name, _)| !requested.contains(name.as_str()))
-            .filter(|(name, _)| match scope {
-                // `--mirror` reaches `get_ref_match()` through the matching
-                // refspec with `send_mirror` set, which answers with the
-                // advertised name for every ref, `refs/heads/` or not.
-                DeleteScope::All => !opts.local_refs.contains(name.as_str()),
-                DeleteScope::Prune(specs) => specs
-                    .iter()
-                    .find_map(|spec| spec.source_of(name))
-                    .is_some_and(|src| !opts.local_refs.contains(src.as_str())),
-            })
-            .collect();
-        // Deterministic order so the status block reads the same run to run.
-        doomed.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, old) in doomed {
-            if !allow_deleting_refs {
-                statuses.push(RefStatus {
-                    name: name.clone(),
-                    src: None,
-                    report_name: None,
-                    old: *old,
-                    new: null,
-                    result: Err("remote does not support deleting refs".to_owned()),
-                    forced: false,
-            up_to_date: false,
-            pre_transport: false,
-            remote_rejected: false,
-            missing_report: false,
-        });
-                continue;
-            }
-            // Only the wire entry: the per-ref status is produced from the
-            // server report alongside every other command, so pushing one here
-            // too would report the deletion twice.
-            wire.push(Wire {
-                name: name.clone(),
-                src: None,
-                old: *old,
-                new: null,
-                forced: true,
-            });
-        }
     }
 
     // Nothing survived the checks: no request to send. Report what we have.

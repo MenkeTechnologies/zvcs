@@ -2542,12 +2542,11 @@ fn report(
                 // only when `from` is non-NULL, and a deletion has no local side
                 // worth naming — `git push --delete . main` refused by
                 // `receive.denyCurrentBranch` reads `main`, never `main -> main`.
-                // The locally decided rejections above keep `peer_ref` whatever
-                // the update is, which is why this is scoped to the remote's.
-                let shown = if s.remote_rejected && s.new.is_null() {
-                    short_ref(dst).to_string()
-                } else {
-                    src_dst.clone()
+                // A deletion refused on this side keeps its `peer_ref`, the
+                // `(delete)` placeholder ([`push_proto::RefStatus::rejected_from`]).
+                let shown = match s.rejected_from() {
+                    Some(from) => format!("{} -> {}", short_ref(from), short_ref(dst)),
+                    None => short_ref(dst).to_string(),
                 };
                 let summary = super::color::PushColors::paint(&colors.rejected, label);
                 eprintln!(" {summary} {shown} ({reason})");
@@ -2715,6 +2714,12 @@ fn report_porcelain(outcome: &push_proto::Outcome, quiet: bool) -> Result<(ExitC
                 any_failed = true;
                 rejected.push((s.name.as_str(), reason.as_str()));
                 let label = if s.remote_rejected { "[remote rejected]" } else { "[rejected]" };
+                // `print_ref_status()` in porcelain form: `<from>:<to>`, or `:<to>`
+                // when `from` is `NULL` (transport.c:632-636).
+                let refpair = match s.rejected_from() {
+                    Some(from) => format!("{from}:{dst}"),
+                    None => format!(":{dst}"),
+                };
                 println!("!\t{refpair}\t{label} ({reason})");
             }
         }

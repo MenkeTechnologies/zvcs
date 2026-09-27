@@ -200,9 +200,14 @@ fn checkout_tree(
             opts,
         )?;
     }
+    // `git worktree add` populates the new worktree with `git reset --hard`
+    // (builtin/worktree.c:405), whose index starts from nothing and is
+    // written by `write_locked_index()`: `index.version` / `GIT_INDEX_VERSION`
+    // pick the format of a fresh state (read-cache.c:2865-2866), and the write
+    // goes through `index.lock`. The shared writer does both.
     index.remove_tree();
-    let mut f = std::fs::File::create(index_path)?;
-    index.write_to(&mut f, gix::index::write::Options::default())?;
+    index.set_path(index_path);
+    crate::index_racy::write(repo, &mut index)?;
     Ok(())
 }
 

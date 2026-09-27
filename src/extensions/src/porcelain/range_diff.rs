@@ -125,6 +125,14 @@
 //! * `--diff-filter=<letters>` (diff.c:5470-5500), applied last in
 //!   `diffcore_std()` (diff.c:7526) to the one pair, a plain `M`; an unknown
 //!   letter is the 129 parse-time error.
+//! * The two `die()`s `diffcore_std()` can raise from inside `patch_diff()`
+//!   (diff.c:7517-7520), so on the first matched pair whose body is rendered and
+//!   with every pair header before it already written: a `-G` / `--pickaxe-regex
+//!   -S` needle that does not compile (`regcomp_or_die()`,
+//!   diffcore-pickaxe.c:219-228, worded through [`super::diff_pickaxe::compile_regex`]),
+//!   then an `-O<orderfile>` that cannot be read (`prepare_order()`), which is only
+//!   opened while the pickaxe left the pair queued (diffcore-order.c:118-119). A
+//!   readable order file cannot reorder a one-pair queue, so it changes nothing.
 //! * `--abbrev` / `--no-abbrev` / `--abbrev=<n>`: the abbreviation length of the
 //!   ids in every pair header, ported from `find_unique_abbrev()` and
 //!   `parse_opt_abbrev_cb()` (bare `--abbrev` is 7, `--no-abbrev` / `--abbrev=0`
@@ -279,11 +287,8 @@
 //!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
 //!   widths give it — `builtin/range-diff.c` never calls
 //!   `init_diffstat_widths()`.
-//! * A `-G` pattern, or an `-S` one under `--pickaxe-regex`, that does not
-//!   compile: upstream dies from inside `patch_diff()` with libc's `regerror()`
-//!   text, which this port does not reproduce.
 //! * `-B` / `--break-rewrites` (a large enough outer change becomes a complete
-//!   rewrite), `--word-diff`, `--color-moved`, `--ext-diff` and `-O`.
+//!   rewrite), `--word-diff`, `--color-moved` and `--ext-diff`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -984,6 +989,14 @@ struct Opts {
     /// `-S` / `-G` / `--find-object`: the `diffcore_pickaxe()` filter that runs in
     /// `diffcore_std()` ahead of `diff_flush()` and can drop the filepair.
     pickaxe: Option<super::diff_pickaxe::Kind>,
+    /// A `-G` / `--pickaxe-regex -S` needle that did not compile: `regcomp_or_die()`
+    /// (diffcore-pickaxe.c:219-228) fires from the first `patch_diff()` call, i.e.
+    /// after the first matched pair's header is out.
+    pickaxe_fatal: Option<String>,
+    /// `-O<orderfile>` (`OPT_FILENAME`, last one wins). `diffcore_order()` cannot
+    /// reorder a one-pair queue, so the file matters only in that
+    /// `prepare_order()` must be able to read it, from the first `patch_diff()`.
+    orderfile: Option<String>,
     /// `-z`: `line_termination = 0` (diff.c `OPT_SET_INT('z')`), which turns the
     /// tab between `--raw`/`--name-status` fields and every line end of `--raw`,
     /// `--name-only`, `--name-status` and `--numstat` into NUL.
@@ -1033,6 +1046,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
+        pickaxe_fatal: None,
+        orderfile: None,
         nul_terminated: false,
         diff_filter: super::diff_filter::Filter::default(),
     };
@@ -1449,6 +1464,18 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // store `options->pickaxe`, so the last value wins, carried either
             // attached (`-Sfoo`) or as the next argv element (`-S foo`); the bit is
             // set for each spelling.
+            // `OPT_FILENAME('O', …, &options->orderfile)`: attached or the next
+            // argv element, the last one winning. Read only when `patch_diff()`
+            // first runs, like `prepare_order()`.
+            _ if name.starts_with("-O") => {
+                opts.orderfile = match name.len() {
+                    2 => {
+                        i += 1;
+                        args.get(i).cloned()
+                    }
+                    _ => Some(name[2..].to_string()),
+                };
+            }
             _ if name.starts_with("-S") || name.starts_with("-G") => {
                 pickaxe_mask |= match name.as_bytes()[1] {
                     b'S' => PICKAXE_KIND_S,
@@ -1887,9 +1914,8 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                         false => super::diff_pickaxe::Kind::Occurrences(needle),
                     })
                 }
-                Err(_) => {
-                    let flag = if grep { "-G" } else { "-S" };
-                    opts.defer(unsupported_flag(&format!("{flag}{}", String::from_utf8_lossy(&pat))));
+                Err(msg) => {
+                    opts.pickaxe_fatal = Some(format!("invalid regex: {msg}"));
                     None
                 }
             }
@@ -2057,7 +2083,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     }
 
     let mut rendered: Vec<u8> = Vec::new();
-    output(&mut rendered, &mut a, &b, &opts)?;
+    // A `die()` inside `patch_diff()` leaves every pair header before it
+    // written, so what was rendered goes out ahead of the error.
+    let result = output(&mut rendered, &mut a, &b, &opts);
 
     // Everything upstream writes — the pair headers included — goes to
     // `diffopt.file`, which `--output=<file>` has replaced.
@@ -2073,7 +2101,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             out.flush()?;
         }
     }
-    Ok(ExitCode::SUCCESS)
+    result.map(|()| ExitCode::SUCCESS)
 }
 
 /// `RANGE_DIFF_CREATION_FACTOR_DEFAULT`'s sibling
@@ -2143,6 +2171,8 @@ pub(super) fn show_range_diff(
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
+        pickaxe_fatal: None,
+        orderfile: None,
         nul_terminated: false,
         diff_filter: super::diff_filter::Filter::default(),
     };
@@ -4096,6 +4126,23 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
             let ai = b[j].matching as usize;
             pair_header(out, patch_no_width, &mut dashes, Some(&a[ai]), Some(&b[j]), &opts.colors)?;
             if opts.output_format & FMT_NO_OUTPUT == 0 {
+                // `patch_diff()` → `diffcore_std()`: `diffcore_pickaxe()`'s
+                // `regcomp_or_die()`, then `diffcore_order()`'s `prepare_order()`
+                // (diff.c:7515-7521), each a `die()` with this header already out.
+                if let Some(msg) = &opts.pickaxe_fatal {
+                    return Err(crate::fatal::die(msg.clone()));
+                }
+                // `diffcore_order()` returns before `prepare_order()` when the
+                // pickaxe emptied the queue (diffcore-order.c:118-119).
+                if let Some(path) = &opts.orderfile {
+                    let queued = opts
+                        .pickaxe
+                        .as_ref()
+                        .is_none_or(|k| pickaxe_keeps(k, &a[ai].text, &b[j].text));
+                    if queued {
+                        super::diff_files::read_order_file(path)?;
+                    }
+                }
                 // `dashes` is `find_unique_abbrev()`'s width, which is also the
                 // width `--raw`'s null-id columns print to.
                 let abbrev_len = dashes.as_deref().map_or(0, str::len);

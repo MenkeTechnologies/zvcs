@@ -2793,6 +2793,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         parents_of.extend(rewritten);
     }
 
+    // `graph_is_interesting()` (graph.c:457) asks `get_commit_action()`, which
+    // judges a commit by the filters alone; `--skip`/`--max-count` stop the walk
+    // rather than reject a commit. So the set of commits the graph may draw a
+    // lane towards is the list as it stands here, before the counts cut it —
+    // which is why `rev-list --graph -1 <merge>` still draws the merge's `|\`.
+    let graph_shown: HashSet<ObjectId> = match graph {
+        true => commits.iter().copied().collect(),
+        false => HashSet::new(),
+    };
     // `revs->skip_count` is spent inside `get_revision()` before the `max_count`
     // check, so `--skip=2 --max-count=1` answers the third commit rather than none.
     if skip_count > 0 {
@@ -3243,8 +3252,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // The nodes the graph state machine walks, in emission order.
         // `rev-list` has no `--color` option, so `revs->diffopt.use_color` is never
         // turned on and the graph is drawn plain.
-        let shown: HashSet<ObjectId> =
-            emitted.iter().filter(|(_, b)| !*b).map(|(id, _)| *id).collect();
+        let shown = graph_shown;
         // `--boundary`: every parent of a commit the walk *returned* carries
         // CHILD_SHOWN, which `graph_is_interesting()` accepts on its own; the
         // boundary commits themselves are handed out below the marking loop and

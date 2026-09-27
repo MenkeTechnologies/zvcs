@@ -600,12 +600,25 @@ fn update_clean_worktree(
 
     // Fill in the target index stats: checked-out (changed) entries get their
     // fresh stat; unchanged entries reuse the previous stat.
+    //
+    // The result inherits the source index's timestamp and version as
+    // `unpack_trees()` does (unpack-trees.c:1938-1940): a reused stat is only as
+    // trustworthy as the index it came from, and without that timestamp the
+    // racy-clean smudge at write time could not tell which reused entries are
+    // racy; an index read off disk keeps the format it was written in. A freshly
+    // checked-out entry is marked up to date the way `fill_stat_cache_info()`
+    // does (read-cache.c:201), so the smudge trusts it instead of hashing it.
+    new_index.set_timestamp(old.timestamp());
+    if !old.version_is_unset() {
+        new_index.set_version(old.version());
+    }
     {
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
             if let Some(stat) = subset_stats.get(&path) {
                 e.stat = *stat;
+                e.flags.insert(gix::index::entry::Flags::UPTODATE);
             } else if let Some((oid, mode, stat)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
                     e.stat = *stat;
@@ -616,7 +629,7 @@ fn update_clean_worktree(
 
     // Drop any stale cache-tree extension before persisting.
     new_index.remove_tree();
-    new_index.write(Default::default())?;
+    crate::index_racy::write(repo, &mut new_index)?;
 
     Ok(())
 }

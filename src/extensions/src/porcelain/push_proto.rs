@@ -365,7 +365,7 @@ fn build_push_cert(
     // `datestamp()` (date.c): the current time and this machine's UTC offset, in
     // the same `<seconds> <+hhmm>` shape an ident carries.
     let cert = push_cert_payload(
-        &format!("{key_id} {}", datestamp()),
+        &format!("{key_id} {}", crate::date::datestamp()),
         url,
         nonce,
         commands,
@@ -394,33 +394,6 @@ fn sign_failure(e: crate::gitsig::SignFailure) -> anyhow::Error {
             crate::fatal::die("failed to sign the push certificate")
         }
     }
-}
-
-/// git's `datestamp()` (date.c): `<seconds-since-epoch> <+hhmm>` for right now,
-/// with this machine's local UTC offset — the second half of the certificate's
-/// `pusher` line.
-fn datestamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default();
-    let offset_minutes = local_utc_offset_seconds(now) / 60;
-    let sign = if offset_minutes < 0 { '-' } else { '+' };
-    let abs = offset_minutes.abs();
-    format!("{now} {sign}{:02}{:02}", abs / 60, abs % 60)
-}
-
-/// `local_time_tzoffset()` (date.c): this machine's offset from UTC at `time`,
-/// in seconds, as `localtime_r` reports it.
-fn local_utc_offset_seconds(time: i64) -> i64 {
-    let t = time as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `localtime_r` reads `t` and writes `tm`, both live locals of the
-    // right types, and is reentrant.
-    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
-        return 0;
-    }
-    tm.tm_gmtoff as i64
 }
 
 /// Push `requests` to `remote` over receive-pack, returning each ref's verdict.

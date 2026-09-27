@@ -62,6 +62,45 @@ pub fn parse_expiry_date(value: &str) -> Option<i64> {
     gix::date::parse::parse_expiry_date(value, now_seconds())
 }
 
+/// git's `date_string()` (date.c:835-844): `<seconds> <±hhmm>`, the form every
+/// stored ident date takes. `offset_minutes` is signed minutes east of UTC.
+pub fn date_string(seconds: i64, offset_minutes: i64) -> String {
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let abs = offset_minutes.abs();
+    format!("{seconds} {sign}{:02}{:02}", abs / 60, abs % 60)
+}
+
+/// git's `parse_date()` (date.c:979-987): [`parse_date_basic()`] rendered through
+/// [`date_string()`]. `None` is git's `-1` return.
+pub fn parse_date(value: &str) -> Option<String> {
+    let time = parse_date_basic(value)?;
+    Some(date_string(time.seconds, i64::from(time.offset) / 60))
+}
+
+/// git's `datestamp()` (date.c:1057-1069): [`date_string()`] for the wall clock
+/// now, at this machine's local UTC offset. Unlike [`now_seconds()`] it does not
+/// honour `GIT_TEST_DATE_NOW`; git's reads `time(NULL)`.
+pub fn datestamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    date_string(now, local_utc_offset_seconds(now) / 60)
+}
+
+/// `tm_to_time_t(localtime_r(&now, &tm)) - now` in [`datestamp()`]: this
+/// machine's offset from UTC at `time`, in seconds, as `localtime_r` reports it.
+fn local_utc_offset_seconds(time: i64) -> i64 {
+    let t = time as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `localtime_r` reads `t` and writes `tm`, both live locals of the
+    // right types, and is reentrant.
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
 /// git's `Q_(...)` pluralization: `"1 second ago"` vs `"N seconds ago"`.
 fn ago(n: i64, unit: &str) -> String {
     if n == 1 {

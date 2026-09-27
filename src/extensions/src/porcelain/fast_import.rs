@@ -59,11 +59,6 @@
 //! implements the flagless check that rejects every lowercase one-level name.
 //!
 //! Not covered, each rejected with a precise message rather than guessed at:
-//!   * `--date-format=rfc2822` / `now` — accepted on the command line, as git
-//!     accepts them, and refused at the first identity line that would have to
-//!     be parsed in them. Only `raw` and `raw-permissive` are ported, so a
-//!     stream in another date format fails instead of storing a timestamp that
-//!     might not be git's.
 //!   * `--rewrite-submodules-from/-to=<name>:<file>` — the marks file is read
 //!     where git reads it, so a missing or corrupt one fails identically, but a
 //!     stream that actually carries a gitlink to rewrite is refused.
@@ -535,25 +530,10 @@ enum DateFormat {
     Raw,
     /// The same syntax with the offset sanity check relaxed.
     RawPermissive,
-    /// Accepted so the command line parses as git's does, then refused at the
-    /// first identity line: parsing RFC 2822 dates means reimplementing git's
-    /// date parser, and a near-miss silently stores the wrong timestamp.
+    /// Any date `parse_date()` reads, stored as `<seconds> <±hhmm>`.
     Rfc2822,
-    /// Likewise accepted and then refused. `now` ignores the stream's timestamp
-    /// and takes the wall clock, which no reproducible import can rely on.
+    /// The literal `now`, replaced by `datestamp()`.
     Now,
-}
-
-impl DateFormat {
-    /// The spelling this format has on the command line, for error text.
-    fn name(self) -> &'static str {
-        match self {
-            DateFormat::Raw => "raw",
-            DateFormat::RawPermissive => "raw-permissive",
-            DateFormat::Rfc2822 => "rfc2822",
-            DateFormat::Now => "now",
-        }
-    }
 }
 
 /// `--signed-commits=`/`--signed-tags=`: what to do with a signature in the stream.
@@ -767,9 +747,7 @@ fn starts(s: &str, prefix: &str) -> bool {
 
 /// Map a `--date-format=`/`feature date-format=` value onto a format.
 ///
-/// Every name git knows parses here; the two this port cannot evaluate are
-/// refused at the identity line that would need them, not on the command line,
-/// because that is where git's own failure would be observable.
+/// `option_date_format()` (builtin/fast-import.c:3670): the four `whenspec` names.
 fn date_format(name: &str) -> Result<DateFormat> {
     match name {
         "raw" => Ok(DateFormat::Raw),
@@ -2211,14 +2189,43 @@ impl Importer {
                     String::from_utf8_lossy(raw)
                 )
             })?;
+        // `name_len = ltgt - buf; strbuf_add(&ident, buf, name_len);`: everything
+        // through the space after `>`, which the two converting formats follow
+        // with the date they compute.
+        let name_part = &raw[..raw.len() - date.len()];
         let strict = match self.opts.date_format {
             DateFormat::Raw => true,
             DateFormat::RawPermissive => false,
-            other => bail!(
-                "unsupported flag \"--date-format={}\" — porting it would mean reimplementing \
-                 git's date parser, and a near-miss would silently store the wrong timestamp",
-                other.name()
-            ),
+            // ```c
+            // case WHENSPEC_RFC2822:
+            //         if (parse_date(ltgt, &ident) < 0)
+            //                 die(_("invalid rfc2822 date \"%s\" in ident: %s"), ltgt, buf);
+            // ```
+            DateFormat::Rfc2822 => {
+                let text = String::from_utf8_lossy(date);
+                let Some(stamp) = crate::date::parse_date(&text) else {
+                    crate::git_fatal!(
+                        "invalid rfc2822 date \"{text}\" in ident: {}",
+                        String::from_utf8_lossy(raw)
+                    );
+                };
+                return Ok([name_part, stamp.as_bytes()].concat());
+            }
+            // ```c
+            // case WHENSPEC_NOW:
+            //         if (strcmp("now", ltgt))
+            //                 die(_("date in ident must be 'now': %s"), buf);
+            //         datestamp(&ident);
+            // ```
+            DateFormat::Now => {
+                if date != b"now" {
+                    crate::git_fatal!(
+                        "date in ident must be 'now': {}",
+                        String::from_utf8_lossy(raw)
+                    );
+                }
+                return Ok([name_part, crate::date::datestamp().as_bytes()].concat());
+            }
         };
         if !valid_raw_date(date, strict) {
             crate::git_fatal!(

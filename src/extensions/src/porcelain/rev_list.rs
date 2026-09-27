@@ -1069,6 +1069,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut graph_max_lanes: i64 = 0;
     // `revs->show_merge` (`--merge`, revision.c:2434-2435).
     let mut show_merge = false;
+    // `revs->show_notes`, `revs->show_notes_given` and
+    // `revs->show_notes_by_default` (revision.c:2584-2616).
+    let mut show_notes = false;
+    let mut show_notes_given = false;
+    let mut show_notes_by_default = false;
     // `revs->def` from `--default <rev>` (revision.c:2429-2433); `rev-list`
     // passes none of its own.
     let mut default_rev: Option<String> = None;
@@ -1985,16 +1990,26 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     return Ok(fatal(&message));
                 }
             }
-            // `if (revs.show_notes) die(_("rev-list does not support display of
-            // notes"));` (builtin/rev-list.c) — every spelling that turns notes on
-            // is fatal, and the ones that turn them off are accepted and inert.
-            "--notes" | "--show-notes" | "--standard-notes" => {
-                return Ok(fatal("rev-list does not support display of notes"));
+            // The notes switches as `handle_revision_opt()` keeps them
+            // (revision.c:2584-2616): `revs->show_notes` is what
+            // `cmd_rev_list()` refuses, once the whole command line is read, so a
+            // later `--no-notes` takes an earlier `--notes` back.
+            "--notes" | "--show-notes" => {
+                show_notes = true;
+                show_notes_given = true;
             }
             s if s.starts_with("--notes=") || s.starts_with("--show-notes=") => {
-                return Ok(fatal("rev-list does not support display of notes"));
+                show_notes = true;
+                show_notes_given = true;
             }
-            "--no-notes" | "--no-standard-notes" => {}
+            "--no-notes" => {
+                show_notes = false;
+                show_notes_given = true;
+            }
+            // `use_default_notes` only chooses *which* notes; it turns none on.
+            "--standard-notes" => show_notes_given = true,
+            "--no-standard-notes" => {}
+            "--show-notes-by-default" => show_notes_by_default = true,
             s if s.starts_with("--min-parents=") => {
                 let v = &s["--min-parents=".len()..];
                 match parse_git_int(v) {
@@ -2441,6 +2456,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // usage error.
     if tips.is_empty() && !objects && !read_stdin && !rev_input_given && pending.is_empty() {
         return Ok(usage_error());
+    }
+    // `if (!revs->show_notes_given && revs->show_notes_by_default)` turns them on
+    // at the end of `setup_revisions()` (revision.c:3217-3220); then
+    // `if (revs.show_notes) die(...)` (builtin/rev-list.c:905-906).
+    if show_notes || (!show_notes_given && show_notes_by_default) {
+        return Ok(fatal("rev-list does not support display of notes"));
     }
     // ```c
     // if (revs.count &&

@@ -7060,7 +7060,9 @@ fn entry_block_from(
     // A `tformat:` record is terminated by a newline. git still terminates a
     // record whose expansion happened to be empty (so `%d` prints one line per
     // commit); only the genuinely empty user format emits no terminator.
-    if p.terminator && !p.empty_user_format {
+    // The `-g` oneline record already ended itself: see [`render_entry`].
+    let reflog_oneline = node.reflog.is_some() && matches!(p.pretty, Pretty::Oneline);
+    if p.terminator && !p.empty_user_format && !reflog_oneline {
         block.push(p.rec_term);
     }
     Ok(block)
@@ -11809,11 +11811,15 @@ fn render_entry(
             write_signature_block(out, commit, ctx)?;
             // `show_log()`: under `-g` the oneline record is the reflog selector and
             // the entry's own message, and it `return`s there — the commit's subject
-            // and its notes are never reached.
+            // and its notes are never reached, and neither is the record
+            // terminator. `show_reflog_message()` prints `"%s: %s"` with the
+            // message as the reflog stored it, newline included (reflog-walk.c:
+            // 324-326), so the line ends in `\n` even under `-z`.
             if let Some(rl) = ctx.reflog {
                 write_reflog_selector(out, rl, ctx, false);
                 out.extend_from_slice(b": ");
                 out.extend_from_slice(&rl.message);
+                out.push(b'\n');
                 return Ok(());
             }
             out.extend_from_slice(&subject(commit.message_raw()?));

@@ -238,8 +238,28 @@ fn lookup(name: &str) -> Option<String> {
 /// binds the user's remaining arguments to `"$@"` with `$0` set to the body —
 /// or, for a body that is a bare program name, execs it directly. Returns the
 /// child's exit code, or a failure code if it could not be spawned.
+///
+/// ```c
+/// /* Aliases expect GIT_PREFIX, GIT_DIR etc to be set */
+/// setup_git_directory_gently(the_repository, &nongit_ok);
+/// ```
+///
+/// (git.c:handle_alias.) The child starts where setup left git — the top of the
+/// work tree — with `GIT_PREFIX` naming the way back down, and whatever
+/// `GIT_DIR`/`GIT_WORK_TREE` setup exported; [`crate::setup::export_to_child`]
+/// carries that model. Outside a repository setup still exports an empty
+/// `GIT_PREFIX` (setup.c:2069-2076).
 fn run_shell_alias(body: &str, user_args: &[String]) -> ExitCode {
     let mut cmd = crate::external::prepare_shell_cmd_str(body, user_args);
+    match crate::setup::discover() {
+        Ok(repo) => {
+            let setup = crate::setup::after_setup(&repo);
+            crate::setup::export_to_child(&repo, setup.as_ref(), &mut cmd);
+        }
+        Err(_) => {
+            cmd.env("GIT_PREFIX", "");
+        }
+    }
     match cmd.status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(e) => {

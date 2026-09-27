@@ -1454,6 +1454,15 @@ fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
 
     let mut snapshot: Vec<(Source, Occurrence)> = Vec::new();
     for sec in config.sections() {
+        // gitoxide's environment layer (`GIT_NO_REPLACE_OBJECTS` →
+        // `core.useReplaceRefs`, `GIT_NAMESPACE`, `GIT_SSL_NO_VERIFY`, …) has no
+        // place in `do_git_config_sequence()` (config.c:1570-1602): git reads
+        // those variables with `getenv()` and never hands them to a config
+        // callback. Walking them made `GIT_NO_REPLACE_OBJECTS=bogus log` die on
+        // `core.usereplacerefs`, which git 2.55.0 runs cleanly.
+        if sec.meta().source == Source::EnvOverride {
+            continue;
+        }
         let header = sec.header();
         let section = header.name().to_string().to_ascii_lowercase();
         let subsection = header

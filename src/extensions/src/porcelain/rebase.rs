@@ -4706,7 +4706,7 @@ fn edit_todo_list(
 
     // Without an explicit `-i`, `run_specific_rebase()` sets the sequence editor
     // to `:` — the sheet comes back exactly as written.
-    if interactive && !todo::launch_sequence_editor(repo, &todo_path)? {
+    if interactive && crate::editor::launch_sequence_editor(Some(repo), &todo_path, &[]).is_err() {
         return Ok(EditOutcome::EditorFailed);
     }
 

@@ -1223,7 +1223,7 @@ fn prepare_note_data(
     ));
 
     std::fs::write(&edit_path, &file)?;
-    let edited = launch_editor(repo, &edit_path);
+    let edited = crate::editor::launch_editor_read(Some(repo), &edit_path, &[]).ok();
     // `free_note_data()` unlinks the scratch file whatever happened.
     let _ = std::fs::remove_file(&edit_path);
 
@@ -1250,35 +1250,6 @@ fn show_stat(object: &ObjectId) -> Result<Vec<u8>> {
         bail!("failed to finish 'show' for object '{object}'");
     }
     Ok(out.stdout)
-}
-
-/// `launch_editor()`: open `path` in git's editor and hand back what it left
-/// there. `None` is git's `-1` return, after the `error:` line it prints itself.
-///
-/// `:` is git's documented no-op editor — it is never run and the file is never
-/// read back, so the message stays empty.
-fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Option<Vec<u8>> {
-    let Some(editor) = super::bugreport::git_editor(Some(repo)) else {
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        return None;
-    };
-    if editor == ":" {
-        return Some(Vec::new());
-    }
-    match super::bugreport::editor_command(&editor, path).status() {
-        Ok(s) if s.success() => {}
-        Ok(_) | Err(_) => {
-            eprintln!("error: there was a problem with the editor '{editor}'");
-            return None;
-        }
-    }
-    match std::fs::read(path) {
-        Ok(buf) => Some(buf),
-        Err(e) => {
-            eprintln!("error: could not read file '{}': {}", path.display(), os_msg(&e));
-            None
-        }
-    }
 }
 
 /// `builtin/notes.c:append_separator()` — the separator always ends a line, so

@@ -774,7 +774,7 @@ fn fill_commit_message(
 
     let path = repo.git_dir().join("COMMIT_EDITMSG");
     std::fs::write(&path, &buf)?;
-    if super::commit::launch_editor(repo, &path).is_err() {
+    if crate::editor::launch_editor(Some(repo), &path, &[]).is_err() {
         eprintln!("Aborting commit as launching the editor failed.");
         return Ok(Err("failed writing reworded commit".into()));
     }

@@ -1504,7 +1504,7 @@ fn create_tag(
                 b
             };
             std::fs::write(&path, &seed)?;
-            if super::commit::launch_editor(&repo, &path).is_err() {
+            if crate::editor::launch_editor(Some(&repo), &path, &[]).is_err() {
                 eprintln!("Please supply the message using either -m or -F option.");
                 return Ok(ExitCode::from(1));
             }

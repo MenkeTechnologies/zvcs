@@ -2419,7 +2419,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // (builtin/commit.c:1124-1127.) The editor's own `error:` line is already on
     // stderr; this is the hint that follows it, and the status is 1 — not 128.
     if use_editor {
-        if launch_editor(&repo, &msg_path).is_err() {
+        if crate::editor::launch_editor(Some(&repo), &msg_path, &[]).is_err() {
             eprintln!("Please supply the message using either -m or -F option.");
             return Ok(ExitCode::from(1));
         }
@@ -4950,122 +4950,6 @@ fn adjust_comment_line_char(body: &str) -> Result<String> {
              in the current commit message",
         )),
     }
-}
-
-/// `git_editor()` (editor.c:27-46), which is finickier than it looks:
-///
-/// ```c
-/// const char *editor = getenv("GIT_EDITOR");
-/// int terminal_is_dumb = is_terminal_dumb();
-///
-/// if (!editor && editor_program)      editor = editor_program;
-/// if (!editor && !terminal_is_dumb)   editor = getenv("VISUAL");
-/// if (!editor)                        editor = getenv("EDITOR");
-/// if (!editor && terminal_is_dumb)    return NULL;
-/// if (!editor)                        editor = DEFAULT_EDITOR;
-/// ```
-///
-/// Three details this used to get wrong. `getenv` returns non-NULL for an *empty*
-/// variable, so `GIT_EDITOR=` selects the empty editor and fails at the exec —
-/// it does not fall through to `core.editor`. `$VISUAL` is skipped on a dumb
-/// terminal but `$EDITOR` is not. And the only thing that makes git give up is a
-/// dumb `TERM`: whether stdin is a terminal never enters into it, so a redirected
-/// stdin still gets `vi`.
-///
-/// `None` is git's NULL, which `launch_specified_editor()` reports as
-/// "Terminal is dumb, but EDITOR unset".
-fn resolve_editor(snap: &gix::config::Snapshot<'_>) -> Option<String> {
-    let dumb = is_terminal_dumb();
-    if let Some(e) = std::env::var("GIT_EDITOR").ok() {
-        return Some(e);
-    }
-    if let Some(e) = snap.string("core.editor") {
-        return Some(e.to_string());
-    }
-    if !dumb {
-        if let Ok(e) = std::env::var("VISUAL") {
-            return Some(e);
-        }
-    }
-    if let Ok(e) = std::env::var("EDITOR") {
-        return Some(e);
-    }
-    if dumb {
-        return None;
-    }
-    Some("vi".to_string())
-}
-
-/// `is_terminal_dumb()` (editor.c:21-25): an unset `TERM` counts as dumb.
-fn is_terminal_dumb() -> bool {
-    std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true)
-}
-
-/// Open `path` in the configured editor and wait, git-style: the editor string
-/// runs through the shell so `core.editor = "code -w"` and other argument-bearing
-/// commands work, and stdio is inherited so the interactive editor owns the tty.
-pub(super) fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
-    let snap = &repo.config_snapshot();
-    // Every failure below is `error()` in `launch_specified_editor()`, not
-    // `die()`: the message goes to stderr with an `error: ` prefix and the
-    // *caller* decides the exit status (`builtin/commit.c:1124-1127` prints
-    // "Please supply the message…" and exits 1). Wearing `fatal:`/128 here would
-    // both misreport the code and claim git's voice for a line git never says.
-    let Some(editor) = resolve_editor(snap) else {
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
-    };
-    // `if (strcmp(editor, ":"))` (editor.c:66): git's documented no-op editor is
-    // recognised before any child is built, so nothing is spawned and not even
-    // the "Waiting for your editor" hint is printed.
-    if editor == ":" {
-        return Ok(());
-    }
-    // `launch_specified_editor` (editor.c): when stderr is a terminal and
-    // `advice.waitingForEditor` is on, git says why it is blocked before handing
-    // the tty over. A dumb terminal cannot erase the line afterwards, so it gets
-    // a newline instead of the erase sequence. The hint is never printed when
-    // stderr is redirected, which is why scripted runs see none of this.
-    let waiting = std::io::IsTerminal::is_terminal(&std::io::stderr())
-        && crate::advice::Advice::WaitingForEditor.enabled();
-    let dumb = is_terminal_dumb();
-    if waiting {
-        use std::io::Write;
-        let tail = if dumb { "\n" } else { " " };
-        eprint!("hint: Waiting for your editor to close the file...{tail}");
-        let _ = std::io::stderr().flush();
-    }
-    // `start_command()` reports its own `cannot run <cmd>: <strerror>` before
-    // `launch_specified_editor` adds `unable to start editor '<editor>'`
-    // (editor.c:95-98), so a failed spawn produces two `error:` lines.
-    //
-    // The file is handed over as `strbuf_realpath(&realpath, path, 1)`
-    // (editor.c:88-90), and the child starts where setup left git, with the
-    // environment setup exported (`run_command()` with `p.dir` unset).
-    let realpath = crate::setup::realpath(path);
-    let mut cmd = crate::external::prepare_shell_cmd_str(&editor, [&realpath]);
-    crate::setup::export_to_child(repo, crate::setup::after_setup(repo).as_ref(), &mut cmd);
-    let spawned = cmd.status();
-    let status = match spawned {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: cannot run {editor}: {}", crate::external::strerror(&e));
-            eprintln!("error: unable to start editor '{editor}'");
-            return Err(anyhow::Error::new(crate::fatal::Silent(1)));
-        }
-    };
-    // `term_clear_line()`: wipe the "Waiting for your editor" line so the
-    // command's real output starts on a clean line.
-    if waiting && !dumb {
-        use std::io::Write;
-        eprint!("\r\x1b[K");
-        let _ = std::io::stderr().flush();
-    }
-    if !status.success() {
-        eprintln!("error: there was a problem with the editor '{editor}'");
-        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
-    }
-    Ok(())
 }
 
 /// git's `commit_msg_cleanup_mode` (builtin/commit.c), resolved by

@@ -3356,7 +3356,7 @@ fn finalize_clean(
         return Ok(ExitCode::from(1));
     }
 
-    if edit && !launch_editor(repo, &msg_path)? {
+    if edit && crate::editor::launch_editor(Some(repo), &msg_path, &[]).is_err() {
         eprintln!("Not committing merge; use 'git commit' to complete the merge.");
         return Ok(ExitCode::from(1));
     }
@@ -4584,62 +4584,6 @@ fn edit_wanted(opts: &Opts) -> std::result::Result<bool, ExitCode> {
         };
     }
     Ok(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
-}
-
-/// git's `git_editor()`: `GIT_EDITOR`, then `core.editor`, then `$VISUAL`
-/// (skipped on a dumb terminal), then `$EDITOR`, then `vi` — and nothing at all
-/// when the terminal is dumb and none of them is set.
-fn resolve_editor(repo: &gix::Repository, dumb: bool) -> Option<String> {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    if let Some(e) = env("GIT_EDITOR") {
-        return Some(e);
-    }
-    if let Some(e) = repo.config_snapshot().string("core.editor") {
-        return Some(e.to_string());
-    }
-    if !dumb {
-        if let Some(e) = env("VISUAL") {
-            return Some(e);
-        }
-    }
-    if let Some(e) = env("EDITOR") {
-        return Some(e);
-    }
-    if dumb {
-        return None;
-    }
-    Some("vi".to_string())
-}
-
-/// Open `path` in the configured editor and wait, git's `launch_editor()`. The
-/// command runs through the shell so `core.editor = "code -w"` works, and stdio
-/// is inherited so an interactive editor owns the terminal. `:` is git's
-/// documented no-op editor. Returns whether the edit succeeded; the diagnostics
-/// on failure are git's own.
-fn launch_editor(repo: &gix::Repository, path: &Path) -> Result<bool> {
-    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
-    let Some(editor) = resolve_editor(repo, dumb) else {
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        return Ok(false);
-    };
-    if editor == ":" {
-        return Ok(true);
-    }
-    // `start_command()`'s `fflush(NULL)` (run-command.c:743): the editor takes
-    // over the terminal, so nothing may still be sitting in the buffer.
-    crate::cstdio::before_spawn();
-    let status = crate::external::prepare_shell_cmd_str(&editor, [path]).status();
-    match status {
-        Ok(status) if status.success() => Ok(true),
-        Ok(_) => {
-            eprintln!("error: there was a problem with the editor '{editor}'");
-            Ok(false)
-        }
-        Err(e) => {
-            eprintln!("error: unable to start editor '{editor}': {e}");
-            Ok(false)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

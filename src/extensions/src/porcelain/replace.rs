@@ -582,31 +582,18 @@ fn import_object(
 
 /// `launch_editor(tmpfile, NULL, NULL)`: open the file and wait, without reading
 /// it back — `import_object()` re-reads it from disk. `false` is git's -1.
+///
+/// `cmd_replace`'s `read_replace_refs = 0` is a process-global in git, so the
+/// editor it launches inherits nothing from it. Here it is an environment
+/// variable, which a child *would* inherit — so the one this command set for
+/// itself is taken back out. A `GIT_NO_REPLACE_OBJECTS` the caller set (or
+/// `git --no-replace-objects`) is left in place, because stock passes that on.
 fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> bool {
-    let Some(editor) = super::bugreport::git_editor(Some(repo)) else {
-        error_line("Terminal is dumb, but EDITOR unset");
-        return false;
+    let unset: &[(&str, Option<&std::ffi::OsStr>)] = match INHERITED_NO_REPLACE.load(std::sync::atomic::Ordering::Relaxed) {
+        true => &[],
+        false => &[("GIT_NO_REPLACE_OBJECTS", None)],
     };
-    // `:` is git's documented no-op editor; it is never actually run.
-    if editor == ":" {
-        return true;
-    }
-    // `cmd_replace`'s `read_replace_refs = 0` is a process-global in git, so the
-    // editor it launches inherits nothing from it. Here it is an environment
-    // variable, which a child *would* inherit — so the one this command set for
-    // itself is taken back out. A `GIT_NO_REPLACE_OBJECTS` the caller set (or
-    // `git --no-replace-objects`) is left in place, because stock passes that on.
-    let mut command = super::bugreport::editor_command(&editor, path);
-    if !INHERITED_NO_REPLACE.load(std::sync::atomic::Ordering::Relaxed) {
-        command.env_remove("GIT_NO_REPLACE_OBJECTS");
-    }
-    match command.status() {
-        Ok(s) if s.success() => true,
-        Ok(_) | Err(_) => {
-            error_line(&format!("there was a problem with the editor '{editor}'"));
-            false
-        }
-    }
+    crate::editor::launch_editor(Some(repo), path, unset).is_ok()
 }
 
 /// What one `create_graft` call did — git's version returns 0 or -1 and never

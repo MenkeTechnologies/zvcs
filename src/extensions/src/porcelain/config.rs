@@ -3568,23 +3568,11 @@ fn match_urls(url: &UrlInfo, pattern: &UrlInfo) -> Option<UrlMatch> {
     Some(UrlMatch { hostmatch_len: pattern.host_len, pathmatch_len, user_matched })
 }
 
-/// `git config -e|--edit` — open the target config in the user's editor.
-///
-/// Editor precedence is git's `GIT_EDITOR` → `core.editor` → `VISUAL` →
-/// `EDITOR` → `vi`, and the command is run through the shell exactly as git
-/// does, so a configured editor with arguments (`code --wait`) works.
+/// `show_editor()` (builtin/config.c:1291-1320): open the target config in the
+/// user's editor. `launch_editor(config_file, NULL, NULL)` is called for its
+/// side effect only — an editor that fails has said so with `error:`, and the
+/// command still returns 0.
 fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
-    let editor = std::env::var("GIT_EDITOR")
-        .ok()
-        .or_else(|| {
-            crate::setup::discover()
-                .ok()
-                .and_then(|r| r.config_snapshot().string("core.editor").map(|v| v.to_string()))
-        })
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| "vi".to_string());
-
     if target.create_parent {
         if let Some(parent) = target.path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -3595,16 +3583,9 @@ fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
         std::fs::File::create(&target.path)?;
     }
 
-    // `if (strcmp(editor, ":"))` (editor.c:66): the no-op editor spawns nothing.
-    if editor == ":" {
-        return Ok(ExitCode::SUCCESS);
-    }
-    let status =
-        crate::external::prepare_shell_cmd_str(&editor, [&target.path]).status()?;
-    Ok(match status.code() {
-        Some(0) | None => ExitCode::SUCCESS,
-        Some(code) => ExitCode::from(code as u8),
-    })
+    let repo = crate::setup::discover().ok();
+    let _ = crate::editor::launch_editor(repo.as_ref(), &target.path, &[]);
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `kvi_from_param()` (`config.c`): the origin a value typed on the command line

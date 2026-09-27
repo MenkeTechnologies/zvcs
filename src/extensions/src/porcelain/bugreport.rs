@@ -257,7 +257,10 @@ pub fn bugreport(args: &[String]) -> Result<ExitCode> {
         .unwrap_or(&report_path);
     eprintln!("Created new report at '{shown}'.");
 
-    Ok(match launch_editor(repo.as_ref(), Path::new(&report_path)) {
+    // `Setup::enter()` has moved this process to the top already, so the
+    // `GIT_PREFIX` setup exported (setup.c:2069-2076) is the prefix it recorded.
+    let env = [("GIT_PREFIX", Some(std::ffi::OsStr::new(start.prefix())))];
+    Ok(match crate::editor::launch_editor(repo.as_ref(), Path::new(&report_path), &env).is_ok() {
         true => ExitCode::SUCCESS,
         false => ExitCode::from(1),
     })
@@ -532,73 +535,6 @@ fn populated_hooks(out: &mut String, repo: Option<&gix::Repository>) -> Result<(
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-}
-
-/// `launch_editor()` — returns whether it succeeded, which is what git turns
-/// into its 0/1 exit status.
-fn launch_editor(repo: Option<&gix::Repository>, path: &Path) -> bool {
-    let Some(editor) = git_editor(repo) else {
-        eprintln!("error: Terminal is dumb, but EDITOR unset");
-        return false;
-    };
-    if editor == ":" {
-        return true;
-    }
-
-    // git hands the editor the real path, so a relative report path still opens
-    // correctly after the editor changes directory.
-    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
-    let status = editor_command(&editor, &real).status();
-    match status {
-        Err(_) => {
-            eprintln!("error: unable to start editor '{editor}'");
-            false
-        }
-        Ok(s) if !s.success() => {
-            eprintln!("error: there was a problem with the editor '{editor}'");
-            false
-        }
-        Ok(_) => true,
-    }
-}
-
-/// `git_editor()`: `GIT_EDITOR`, then `core.editor`, then `VISUAL` (skipped on a
-/// dumb terminal), then `EDITOR`, then git's built-in `vi` default. A dumb
-/// terminal with none of them set yields `None`.
-///
-/// `core.editor` is only consulted when a repository was found — without one
-/// there is no configuration stack to read it from here.
-pub(crate) fn git_editor(repo: Option<&gix::Repository>) -> Option<String> {
-    let dumb = match std::env::var("TERM") {
-        Ok(t) => t == "dumb",
-        Err(_) => true,
-    };
-
-    let mut editor = std::env::var("GIT_EDITOR").ok();
-    if editor.is_none() {
-        editor = repo
-            .and_then(|r| r.config_snapshot().trusted_program("core.editor"))
-            .map(|p| p.to_string_lossy().into_owned());
-    }
-    if editor.is_none() && !dumb {
-        editor = std::env::var("VISUAL").ok();
-    }
-    if editor.is_none() {
-        editor = std::env::var("EDITOR").ok();
-    }
-    if editor.is_none() && dumb {
-        return None;
-    }
-    Some(editor.unwrap_or_else(|| "vi".to_string()))
-}
-
-/// `launch_specified_editor()`'s child: `strvec_pushl(&p.args, editor, path)`
-/// with `p.use_shell = 1`, so an editor string containing anything the shell
-/// would interpret runs as `<SHELL_PATH> -c '<editor> "$@"' <editor> <path>` and
-/// a bare program name is executed directly.
-pub(crate) fn editor_command(editor: &str, path: &Path) -> Command {
-    crate::external::prepare_shell_cmd_str(editor, [path])
 }
 
 /// `safe_create_leading_directories()` (path.c:832), reduced to the two outcomes

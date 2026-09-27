@@ -1527,42 +1527,6 @@ pub(crate) fn append_help(
     ));
 }
 
-/// `launch_sequence_editor()`: `GIT_SEQUENCE_EDITOR`, then `sequence.editor`,
-/// then the ordinary `git_editor()` chain. Run through the shell so a
-/// configured editor may carry arguments.
-pub(crate) fn launch_sequence_editor(
-    repo: &gix::Repository,
-    path: &std::path::Path,
-) -> Result<bool> {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let snap = repo.config_snapshot();
-    let editor = env("GIT_SEQUENCE_EDITOR")
-        .or_else(|| snap.string("sequence.editor").map(|v| v.to_string()))
-        .or_else(|| env("GIT_EDITOR"))
-        .or_else(|| snap.string("core.editor").map(|v| v.to_string()))
-        .or_else(|| env("VISUAL"))
-        .or_else(|| env("EDITOR"))
-        .unwrap_or_else(|| "vi".to_string());
-    // `if (strcmp(editor, ":"))` (editor.c:66): git's documented no-op editor is
-    // recognised before any child is built, leaving the todo list untouched.
-    if editor == ":" {
-        return Ok(true);
-    }
-    let status = crate::external::prepare_shell_cmd_str(&editor, [path])
-        .status()
-        .map_err(|e| anyhow!("cannot run editor '{editor}': {e}"))?;
-    if !status.success() {
-        // `launch_specified_editor()` (editor.c) reports this itself with
-        // `error()`, and `edit_todo_list()` then returns `-2` — the caller's
-        // signal to tear the rebase down silently. Returning it as an `anyhow`
-        // error instead rendered it as `zvcs: rebase: …` and left the state
-        // directory behind, so the *next* `git rebase` refused at 128.
-        eprintln!("error: there was a problem with the editor '{editor}'");
-        return Ok(false);
-    }
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

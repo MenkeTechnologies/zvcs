@@ -1735,7 +1735,7 @@ fn edit_patch(repo: &gix::Repository, pathspecs: &[String]) -> Result<ExitCode> 
         crate::git_fatal!("could not write patch");
     }
 
-    if super::commit::launch_editor(&repo, &file).is_err() {
+    if crate::editor::launch_editor(Some(&repo), &file, &[]).is_err() {
         crate::git_fatal!("editing patch failed");
     }
 

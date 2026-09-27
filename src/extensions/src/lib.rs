@@ -23,6 +23,7 @@ pub mod log_config;
 pub mod status_config;
 pub mod diffopt;
 pub mod dispatch;
+pub mod editor;
 pub mod external;
 pub mod fatal;
 pub mod gitcomp;

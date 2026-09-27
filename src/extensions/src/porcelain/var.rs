@@ -187,12 +187,11 @@ fn resolve(name: &str, cfg: &ConfigFile) -> Result<Option<Vec<BString>>> {
     match name {
         "GIT_AUTHOR_IDENT" => single(Some(ident(cfg, "AUTHOR")?)),
         "GIT_COMMITTER_IDENT" => single(Some(ident(cfg, "COMMITTER")?)),
-        "GIT_EDITOR" => single(editor(cfg)),
-        "GIT_SEQUENCE_EDITOR" => single(
-            env("GIT_SEQUENCE_EDITOR")
-                .or_else(|| cfg_str(cfg, "sequence.editor"))
-                .or_else(|| editor(cfg)),
-        ),
+        "GIT_EDITOR" => single(crate::editor::select_editor(cfg_str(cfg, "core.editor"))),
+        "GIT_SEQUENCE_EDITOR" => single(crate::editor::select_sequence_editor(
+            cfg_str(cfg, "sequence.editor"),
+            cfg_str(cfg, "core.editor"),
+        )),
         "GIT_PAGER" => single(Some(pager(cfg))),
         "GIT_DEFAULT_BRANCH" => {
             // `git_default_branch_name()` (`refs.c`) composes `refs/heads/<name>`
@@ -263,29 +262,6 @@ fn ident(cfg: &ConfigFile, role: &str) -> Result<String> {
     };
 
     Ok(format!("{name} <{email}> {time}"))
-}
-
-/// `GIT_EDITOR` — git's `git_editor()` chain.
-///
-/// `$GIT_EDITOR`, then `core.editor`, then `$VISUAL` (skipped on a dumb
-/// terminal), then `$EDITOR`, then the compiled-in default `vi` — except on a
-/// dumb terminal, where an unset editor stays unset so the caller exits 1.
-fn editor(cfg: &ConfigFile) -> Option<String> {
-    let dumb = match std::env::var("TERM") {
-        Ok(term) => term == "dumb",
-        Err(_) => true,
-    };
-
-    let found = env("GIT_EDITOR")
-        .or_else(|| cfg_str(cfg, "core.editor"))
-        .or_else(|| if dumb { None } else { env("VISUAL") })
-        .or_else(|| env("EDITOR"));
-
-    match found {
-        Some(e) => Some(e),
-        None if dumb => None,
-        None => Some("vi".into()),
-    }
 }
 
 /// `GIT_PAGER` — git's `git_pager(1)` chain, with `builtin/var.c`'s `cat` fallback.

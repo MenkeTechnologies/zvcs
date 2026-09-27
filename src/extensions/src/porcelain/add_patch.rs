@@ -1526,10 +1526,9 @@ impl State<'_> {
             &comment,
         );
 
-        let path = self.repo.git_dir().join("addp-hunk-edit.diff");
-        std::fs::write(&path, &buf)?;
-        launch_editor(self.repo, &path)?;
-        let edited = std::fs::read(&path)?;
+        // `if (strbuf_edit_interactively(...) < 0) return -1;` — the errors are
+        // already on stderr, and `edit_hunk_loop()` offers another go.
+        let edited = crate::editor::edit_interactively(self.repo, &buf, "addp-hunk-edit.diff")?;
 
         // Strip the commented lines.
         hunk.start = self.plain.len();
@@ -1627,6 +1626,8 @@ impl State<'_> {
                         return true;
                     }
                 }
+                // Already reported by `strbuf_edit_interactively()`.
+                Err(e) if e.is::<crate::editor::EditorFailed>() => {}
                 Err(e) => {
                     eprintln!("error: {e}");
                 }
@@ -1702,37 +1703,6 @@ fn add_commented_lines(out: &mut Vec<u8>, text: &str, prefix: &str) {
         i = next;
     }
     complete_line(out);
-}
-
-/// git's `git_editor()` chain, run through the shell so `core.editor = "code -w"`
-/// works.
-fn launch_editor(repo: &gix::Repository, path: &std::path::Path) -> Result<()> {
-    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true);
-    let snap = repo.config_snapshot();
-    let editor = std::env::var("GIT_EDITOR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| snap.string("core.editor").map(|v| v.to_string()))
-        .or_else(|| {
-            if dumb {
-                None
-            } else {
-                std::env::var("VISUAL").ok().filter(|v| !v.is_empty())
-            }
-        })
-        .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.is_empty()))
-        .or_else(|| if dumb { None } else { Some("vi".to_string()) });
-    let Some(editor) = editor else {
-        crate::git_fatal!("terminal is dumb, but EDITOR unset");
-    };
-    if editor == ":" {
-        return Ok(());
-    }
-    let status = crate::external::prepare_shell_cmd_str(&editor, [path]).status()?;
-    if !status.success() {
-        crate::git_fatal!("There was a problem with the editor '{editor}'.");
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

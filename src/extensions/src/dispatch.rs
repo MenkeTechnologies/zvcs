@@ -306,7 +306,7 @@ pub(crate) fn setup_work_tree() -> anyhow::Result<()> {
 /// Measured against git 2.55.0 in a repository with `core.bare = true` and
 /// `core.worktree = ..`: each of these, run bare, prints no warning, while every
 /// other builtin prints it before its own output.
-const SETUP_FREE_VERBS: &[&str] = &[
+pub(crate) const SETUP_FREE_VERBS: &[&str] = &[
     "check-ref-format",
     "clone",
     "credential-cache",

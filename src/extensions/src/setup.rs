@@ -431,7 +431,7 @@ fn ref_store_first_use() {
 }
 
 fn discover_with_overrides() -> Result<gix::Repository, gix::discover::Error> {
-    if IGNORED_DUBIOUS_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed) {
+    if IGNORED_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
             path: PathBuf::from("."),
         }));
@@ -1747,14 +1747,21 @@ pub fn work_tree_environment_gate(sub: &str) -> Option<ExitCode> {
 /// that runs setup gently: `setup_git_directory_gently()` then carries on with
 /// `*nongit_ok = 1` (setup.c:1979-1993), so the command runs as though there were
 /// no repository at all. [`discover`] honours it.
-static IGNORED_DUBIOUS_REPOSITORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static IGNORED_REPOSITORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Treat the repository discovery would find as absent for the rest of the
+/// process: `*nongit_ok = 1` after setup refused it (ownership, or
+/// `safe.bareRepository`) for a command that sets up gently.
+pub(crate) fn ignore_repository() {
+    IGNORED_REPOSITORY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Returns the exit code to leave with, or `None` to continue.
 ///
 /// A command that sets up strictly dies with git's message. One that sets up
 /// gently gets `GIT_DIR_INVALID_OWNERSHIP`'s other arm, `*nongit_ok = 1`: no
 /// message, and the repository is not used — its configuration is not read and
-/// the command runs outside it ([`IGNORED_DUBIOUS_REPOSITORY`]).
+/// the command runs outside it ([`IGNORED_REPOSITORY`]).
 pub fn dubious_ownership(sub: &str, args: &[String]) -> Option<ExitCode> {
     if std::env::var_os("GIT_DIR").is_some() {
         return None;
@@ -1776,7 +1783,7 @@ pub fn dubious_ownership(sub: &str, args: &[String]) -> Option<ExitCode> {
         // one (`porcelain::ls_remote`), where stock lists the refs. Ignoring the
         // repository would turn a listing stock prints into that refusal.
         if sub != "ls-remote" {
-            IGNORED_DUBIOUS_REPOSITORY.store(true, std::sync::atomic::Ordering::Relaxed);
+            ignore_repository();
         }
         return None;
     }

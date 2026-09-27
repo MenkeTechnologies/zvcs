@@ -1098,33 +1098,61 @@ pub(crate) const NO_SETUP_VERBS: &[&str] = &[
 /// * `is_implicit_bare_repo()` exempts the three paths that are bare only as an
 ///   implementation detail: a `.git` directory, and `$GIT_DIR` of a secondary
 ///   worktree or of a submodule.
-/// * Only commands that need a repository die; the ones git runs with
-///   `RUN_SETUP_GENTLY` (or no setup at all) carry on ([`NO_SETUP_VERBS`]).
+/// * Only commands that need a repository die. The ones git runs with
+///   `RUN_SETUP_GENTLY` ([`NO_SETUP_VERBS`]) meet the other arm of
+///   `GIT_DIR_DISALLOWED_BARE`, `*nongit_ok = 1` (setup.c:1994-2001), and carry
+///   on as though there were no repository ([`setup::ignore_repository`]).
 ///
 /// Returns the exit code to leave with, or `None` to continue.
 fn disallowed_bare_repository(sub: &str) -> Option<ExitCode> {
-    if NO_SETUP_VERBS.contains(&sub) {
-        return None;
-    }
-    // `get_allowed_bare_repo()` defaults to `all`, so the walk below is skipped
-    // outright unless the user asked for `explicit`.
-    let allowed = config::global_config()
-        .string("safe.bareRepository")
-        .map(|v| v.to_string());
-    if allowed.as_deref() != Some("explicit") {
-        return None;
-    }
     // `setup_git_directory_gently_1` returns `GIT_DIR_EXPLICIT` before ever
     // reaching the bare check when `$GIT_DIR` names the repository.
     if std::env::var_os("GIT_DIR").is_some() {
         return None;
     }
-    let repo = crate::setup::discover().ok()?;
-    if repo.workdir().is_some() {
+    // A command that never runs setup never walks, so it never asks.
+    if dispatch::SETUP_FREE_VERBS.contains(&sub) {
         return None;
     }
+    let gentle = NO_SETUP_VERBS.contains(&sub);
+    // `git_protected_config()`: system, global and command line, never the
+    // repository's own file. Nothing to decide when the key is not set at all.
+    let protected: Vec<config::ConfigValue> = config::walk_config_gently(None)
+        .into_iter()
+        .filter(|v| v.key == "safe.barerepository")
+        .collect();
+    if protected.is_empty() {
+        return None;
+    }
+    let repo = crate::setup::discover().ok()?;
     let git_dir = std::fs::canonicalize(repo.path()).unwrap_or_else(|_| repo.path().to_owned());
-    if is_implicit_bare_repo(&git_dir) {
+    // `if (is_git_directory(dir->buf))` (setup.c:1673): the walk stands in a git
+    // directory — a bare repository, or the inside of a `.git`.
+    let in_git_dir = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| std::fs::canonicalize(cwd).ok())
+        .is_some_and(|cwd| cwd.starts_with(&git_dir));
+    if repo.workdir().is_some() && !in_git_dir {
+        return None;
+    }
+    // `get_allowed_bare_repo()`: every protected value in order.
+    let mut explicit = false;
+    for v in &protected {
+        match v.value.as_deref() {
+            Some("explicit") => explicit = true,
+            Some("all") => explicit = false,
+            _ => {}
+        }
+    }
+    if !explicit || is_implicit_bare_repo(&git_dir) {
+        return None;
+    }
+    if gentle {
+        // `ls-remote` stays on the repository for the reason
+        // `setup::dubious_ownership` gives.
+        if sub != "ls-remote" {
+            crate::setup::ignore_repository();
+        }
         return None;
     }
     eprintln!(

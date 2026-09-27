@@ -1103,6 +1103,12 @@ pub(crate) const NO_SETUP_VERBS: &[&str] = &[
 ///   `GIT_DIR_DISALLOWED_BARE`, `*nongit_ok = 1` (setup.c:1994-2001), and carry
 ///   on as though there were no repository ([`setup::ignore_repository`]).
 ///
+/// `allowed_bare_repo_cb()` (setup.c:1458-1476) accepts `explicit` and `all` and
+/// returns -1 for anything else, which `git_protected_config()` turns into
+/// `git_die_config_linenr()`. It is only consulted once the walk has found a git
+/// directory itself, so a bad value refuses exactly the invocations that reach
+/// that point.
+///
 /// Returns the exit code to leave with, or `None` to continue.
 fn disallowed_bare_repository(sub: &str) -> Option<ExitCode> {
     // `setup_git_directory_gently_1` returns `GIT_DIR_EXPLICIT` before ever
@@ -1135,13 +1141,17 @@ fn disallowed_bare_repository(sub: &str) -> Option<ExitCode> {
     if repo.workdir().is_some() && !in_git_dir {
         return None;
     }
-    // `get_allowed_bare_repo()`: every protected value in order.
+    // `get_allowed_bare_repo()`: every protected value in order, the first one the
+    // callback refuses dying where it stands.
     let mut explicit = false;
     for v in &protected {
         match v.value.as_deref() {
             Some("explicit") => explicit = true,
             Some("all") => explicit = false,
-            _ => {}
+            _ => {
+                eprintln!("fatal: {}", v.origin.die_linenr(&v.key));
+                return Some(ExitCode::from(128));
+            }
         }
     }
     if !explicit || is_implicit_bare_repo(&git_dir) {

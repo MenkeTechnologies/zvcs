@@ -491,6 +491,17 @@ fn is_known_option(arg: &str) -> bool {
     }
 }
 
+/// Whether `parse_options()` would answer `arg` with `unknown option` / `unknown
+/// switch` against the `add_diff_options()` table: a long name no entry claims, even
+/// as an abbreviation, or a short letter the table does not carry. An ambiguous
+/// abbreviation is not unknown — parse-options reports it differently.
+pub(crate) fn is_unknown_diff_option(arg: &str) -> bool {
+    match arg.strip_prefix("--") {
+        Some(body) => matches!(super::resolve_long(LONG_OPTS, body), super::Resolved::Unknown),
+        None => arg.as_bytes().get(1).is_some_and(|c| !KNOWN_SHORT.contains(c)),
+    }
+}
+
 /// git's unknown-option convention: the complaint, then the usage block, exit 129.
 ///
 /// A long option is quoted in full including any `=<value>`; a short one by its letter

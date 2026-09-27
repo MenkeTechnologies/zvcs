@@ -30,8 +30,10 @@
 //!
 //! The option table is `add_diff_options(no_index_options, &revs->diffopt)`
 //! (diff-no-index.c:372) — the *whole* `diff_opts` table, not a subset — so this is
-//! a hand-written implementation of a table `git diff` shares, and a name missing
-//! here is a gap rather than a name git rejects. The exceptions are collected in
+//! a hand-written implementation of a table `git diff` shares. A name that table
+//! does not carry is `unknown option` / `unknown switch` + usage, exit 129, judged
+//! against the same table `diff-pairs` parses with; a name it carries that is
+//! missing here is a gap rather than a name git rejects. The exceptions are collected in
 //! [`NOT_IN_NO_INDEX`]: `--cached`/`--staged`/`--merge-base` belong to `cmd_diff()`
 //! and `--expand-tabs`/`--no-expand-tabs` to `builtin/log.c`, so all five are
 //! `unknown option` here. Algorithm selection is on it:
@@ -1124,6 +1126,16 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             s if NOT_IN_NO_INDEX.contains(&s) => {
                 eprintln!("error: unknown option `{}'", s.trim_start_matches('-'));
                 return usage();
+            }
+            // The table is `no_index_options` (`--no-index` alone) followed by
+            // `add_diff_options()` (diff-no-index.c:365-372), so a name neither
+            // claims is `unknown option` / `unknown switch` + usage, exit 129
+            // (parse-options.c:1214-1223) — `-i` and the grep dialect flags among
+            // them, as those belong to `setup_revisions()` (revision.c:2686-2696).
+            // A name the table does carry but this port does not is a gap.
+            s if super::diff_pairs::is_unknown_diff_option(s) => {
+                let usage = format!("{USAGE_LINE}{}", super::diff_pairs::DIFF_OPTIONS);
+                return Ok(crate::parseopt::unknown_option(s, &usage));
             }
             s => anyhow::bail!("unsupported option {s:?}"),
         }

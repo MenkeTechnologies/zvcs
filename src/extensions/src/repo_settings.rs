@@ -277,13 +277,37 @@ impl RepoSettings {
             index_version = Some(v);
         }
 
-        // repo-settings.c:107-130: `core.untrackedcache` and
+        // repo-settings.c:103-105 — `repo_cfg_int(r, "core.maxtreedepth", …,
+        // DEFAULT_MAX_ALLOWED_TREE_DEPTH)`, which dies through `git_config_int()`
+        // like `index.version` just above it. The depth guard it feeds
+        // (`tree-walk.c`) has no counterpart in gix's tree traversal, so only the
+        // refusal is observable: `-c core.maxTreeDepth=bogus log -1` is
+        // `bad numeric config value 'bogus' for 'core.maxtreedepth': invalid unit`,
+        // and it is reported ahead of `core.packedgitlimit`.
+        crate::config::config_int(repo, "core.maxtreedepth")?;
+
+        // repo-settings.c:107-138: `core.untrackedcache` and
         // `fetch.negotiationalgorithm` through `repo_config_get_string_tmp()`,
-        // whose only refusal is `git_die_config()` for a valueless key; any
-        // spelling is otherwise accepted here (`fetch` validates the algorithm
-        // itself).
+        // whose own refusal is `git_die_config()` for a valueless key. The
+        // algorithm is then matched case-insensitively against the four names
+        // git knows, and anything else is
+        //
+        // ```c
+        // die("unknown fetch negotiation algorithm '%s'", strval);
+        // ```
+        //
+        // — here, for every command that prepares the settings, not only
+        // `fetch`: `-c fetch.negotiationAlgorithm=bogus rev-parse --git-dir`
+        // dies in git 2.55.0.
         crate::config::config_get_string(Some(repo), "core.untrackedcache");
-        crate::config::config_get_string(Some(repo), "fetch.negotiationalgorithm");
+        if let Some(algorithm) =
+            crate::config::config_get_string(Some(repo), "fetch.negotiationalgorithm")
+        {
+            let known = ["skipping", "noop", "consecutive", "default"];
+            if !known.iter().any(|k| k.eq_ignore_ascii_case(&algorithm)) {
+                return Err(format!("unknown fetch negotiation algorithm '{algorithm}'"));
+            }
+        }
 
         // repo-settings.c:82-85. `pack.readReverseIndex` takes a literal default
         // of 1; `pack.useBitmapBoundaryTraversal` takes the cascaded value, so

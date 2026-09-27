@@ -1546,7 +1546,7 @@ pub(super) fn credentials_in_url(repo: &gix::Repository, url: Option<&gix::url::
 /// `remote.<name>.<key>` for each name (`handle_config()`, remote.c:431-505). A section
 /// header with no key under it creates no remote, and neither does a name that begins
 /// with `/`, which `handle_config()` only warns about.
-fn remotes_in_config_order(repo: &gix::Repository) -> Vec<String> {
+pub(crate) fn remotes_in_config_order(repo: &gix::Repository) -> Vec<String> {
     let snapshot = repo.config_snapshot();
     let mut names: Vec<String> = Vec::new();
     for section in snapshot.plumbing().sections() {

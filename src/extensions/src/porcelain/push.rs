@@ -2017,11 +2017,9 @@ fn default_push_refspec(
 
     // `same_remote = !strcmp(remote->name, remote_for_branch(branch, NULL))`: whether this
     // push is going to the branch's own remote.
-    let branch_remote = snap
-        .string(&format!("branch.{branch}.remote"))
-        .map(|v| v.to_string())
-        .or_else(|| snap.string("remote.pushDefault").map(|v| v.to_string()))
-        .unwrap_or_else(|| "origin".to_string());
+    // `remote_for_branch()` is the *fetch* side's answer: `remote.pushDefault` and
+    // `branch.<name>.pushRemote` play no part in it.
+    let branch_remote = remote_for_branch(repo, Some(&branch));
     let same_remote = remote.name().map(|n| n.as_bstr().to_string()).as_deref()
         == Some(branch_remote.as_str());
 
@@ -2696,9 +2694,9 @@ fn short_ref(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-/// The remote `git push` targets with no `<remote>` argument, in git's order:
-/// the current branch's `pushRemote`, then `remote.pushDefault`, then the
-/// branch's `remote`, then `origin`.
+/// The remote `git push` targets with no `<remote>` argument —
+/// `remotes_pushremote_for_branch()` (remote.c:692-706): the current branch's
+/// `pushRemote`, then `remote.pushDefault`, then [`remote_for_branch`].
 fn default_push_remote(repo: &gix::Repository) -> String {
     let snap = repo.config_snapshot();
     let branch = repo
@@ -2714,12 +2712,26 @@ fn default_push_remote(repo: &gix::Repository) -> String {
     if let Some(r) = snap.string("remote.pushDefault") {
         return r.to_string();
     }
-    if let Some(b) = &branch {
-        if let Some(r) = snap.string(&format!("branch.{b}.remote")) {
-            return r.to_string();
-        }
+    remote_for_branch(repo, branch.as_deref())
+}
+
+/// `remotes_remote_for_branch()` (remote.c:666-680): `branch.<name>.remote` when
+/// it is set, otherwise the sole configured remote when there is exactly one,
+/// otherwise `origin`.
+fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>) -> String {
+    let configured = branch.and_then(|b| {
+        repo.config_snapshot()
+            .string(&format!("branch.{b}.remote"))
+            .map(|v| v.to_string())
+    });
+    if let Some(name) = configured {
+        return name;
     }
-    "origin".to_string()
+    let mut names = super::fetch::remotes_in_config_order(repo);
+    match names.len() {
+        1 => names.remove(0),
+        _ => "origin".to_string(),
+    }
 }
 
 /// The submodule paths whose commit referenced by the pushed superproject tips is

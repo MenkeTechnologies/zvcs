@@ -73,6 +73,14 @@ pub struct Options {
     /// This is git's `transport_family`: it narrows address resolution for `git://` and `http(s)://`
     /// and becomes `ssh`'s `-4`/`-6`. `file://` opens no socket and ignores it.
     pub address_family: Option<gix_transport::AddressFamily>,
+    /// git's current directory after setup, when it is not this process's: a relative local
+    /// repository path is resolved from it and a local service program is started in it.
+    ///
+    /// git `chdir()`s to the top of the work tree while setting up a command started below it
+    /// (setup.c:960-971, 1014-1015), so by the time `git_connect()` runs, a remote URL such as
+    /// `../up.git` names a directory next to the work tree, not next to the directory the command
+    /// was typed in. `None` is this process's current directory.
+    pub current_dir: Option<std::path::PathBuf>,
 }
 
 /// Establishing connections to remote hosts (without performing a git-handshake).
@@ -124,7 +132,7 @@ impl<'repo> Remote<'repo> {
         direction: crate::remote::Direction,
         options: Options,
     ) -> Result<Connection<'_, 'static, 'repo, Box<dyn Transport + Send>>, Error> {
-        let (url, version) = self.sanitized_url_and_version(direction)?;
+        let (url, version) = self.sanitized_url_and_version_in(direction, options.current_dir.as_deref())?;
         #[cfg(feature = "blocking-network-client")]
         let scheme_is_ssh = url.scheme == gix_url::Scheme::Ssh;
         let transport = connect::connect(
@@ -140,6 +148,7 @@ impl<'repo> Remote<'repo> {
                 upload_pack: options.upload_pack,
                 receive_pack: options.receive_pack,
                 address_family: options.address_family,
+                current_dir: options.current_dir,
             },
         )
         .await?;
@@ -153,13 +162,27 @@ impl<'repo> Remote<'repo> {
         &self,
         direction: crate::remote::Direction,
     ) -> Result<(gix_url::Url, gix_protocol::transport::Protocol), Error> {
-        fn sanitize(mut url: gix_url::Url) -> Result<gix_url::Url, Error> {
+        self.sanitized_url_and_version_in(direction, None)
+    }
+
+    /// [`sanitized_url_and_version()`](Self::sanitized_url_and_version()) with a relative local path
+    /// read from `current_dir` instead of this process's current directory.
+    pub fn sanitized_url_and_version_in(
+        &self,
+        direction: crate::remote::Direction,
+        current_dir: Option<&std::path::Path>,
+    ) -> Result<(gix_url::Url, gix_protocol::transport::Protocol), Error> {
+        let sanitize = |mut url: gix_url::Url| -> Result<gix_url::Url, Error> {
             if url.scheme == gix_url::Scheme::File {
                 let mut dir = gix_path::to_native_path_on_windows(Cow::Borrowed(url.path.as_ref()));
-                let kind = gix_discover::is_git(dir.as_ref())
+                let cwd = match current_dir {
+                    Some(dir) => dir.to_owned(),
+                    None => gix_fs::current_dir(false)?,
+                };
+                let kind = gix_discover::is_git(&cwd.join(dir.as_ref()))
                     .or_else(|_| {
                         dir.to_mut().push(gix_discover::DOT_GIT_DIR);
-                        gix_discover::is_git(dir.as_ref())
+                        gix_discover::is_git(&cwd.join(dir.as_ref()))
                     })
                     .map_err(|err| Error::FileUrl {
                         source: err.into(),
@@ -170,7 +193,7 @@ impl<'repo> Remote<'repo> {
                     kind,
                     // precomposed unicode doesn't matter here as long as the produced path is accessible,
                     // which is a given either way.
-                    &gix_fs::current_dir(false)?,
+                    &cwd,
                 )
                 .ok_or_else(|| Error::InvalidRemoteRepositoryPath {
                     directory: dir.into_owned(),
@@ -179,7 +202,7 @@ impl<'repo> Remote<'repo> {
                 url.path = gix_path::into_bstr(git_dir).into_owned();
             }
             Ok(url)
-        }
+        };
 
         let mut version = crate::config::tree::Protocol::VERSION
             .try_into_protocol_version(self.repo.config.resolved.integer(Protocol::VERSION))

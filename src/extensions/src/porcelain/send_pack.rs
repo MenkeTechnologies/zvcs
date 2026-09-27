@@ -394,7 +394,7 @@ fn push(st: &State) -> Result<ExitCode> {
     // `die_initial_contact()` (connect.c). Both lines, and the 128, are
     // reproduced here because the vendored transport reports a single Rust-level
     // metadata error instead.
-    if let Some(bad) = local_dest_that_is_not_a_repository(dest) {
+    if let Some(bad) = local_dest_that_is_not_a_repository(dest, crate::setup::setup_cwd(&repo).as_deref()) {
         eprintln!("fatal: '{bad}' does not appear to be a git repository");
         eprintln!(
             "fatal: Could not read from remote repository.\n\n\
@@ -484,7 +484,14 @@ fn read_pkt_line(r: &mut impl std::io::Read) -> Result<Pkt> {
 /// not a repository — the case `git-receive-pack` would have refused on the far
 /// end. `None` for anything reachable, and for any destination that is not a
 /// local path, whose failures belong to the transport that owns them.
-pub(crate) fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
+///
+/// The service is started in git's current directory, `cwd` — the top of the work
+/// tree once setup has moved there — so a relative `dest` is looked for from it.
+/// `None` is this process's current directory.
+pub(crate) fn local_dest_that_is_not_a_repository<'a>(
+    dest: &'a str,
+    cwd: Option<&std::path::Path>,
+) -> Option<&'a str> {
     let url = gix::url::parse(dest.into()).ok()?;
     if url.scheme != gix::url::Scheme::File {
         return None;
@@ -498,7 +505,10 @@ pub(crate) fn local_dest_that_is_not_a_repository(dest: &str) -> Option<&str> {
         format!("{dest}.git/.git"),
     ]
     .iter()
-    .any(|c| gix::open(c).is_ok());
+    .any(|c| match cwd {
+        Some(cwd) => gix::open(cwd.join(c)).is_ok(),
+        None => gix::open(c).is_ok(),
+    });
     (!found).then_some(dest)
 }
 

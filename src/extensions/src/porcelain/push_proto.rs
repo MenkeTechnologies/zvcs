@@ -451,6 +451,8 @@ pub fn send_pack(
                 opts.receive_pack.as_deref().map(Into::into),
                 "receive-pack",
             ),
+            // git has moved to the top of the work tree by now; a relative URL is read from there.
+            current_dir: crate::setup::setup_cwd(repo),
             ..Default::default()
         },
     )?;

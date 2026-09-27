@@ -721,7 +721,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // hand (transport.c:1335-1339). The configured URL is tested as well as a
     // bare path: `remote.origin.url = ./peer` read from a directory where
     // `./peer` does not exist is the same refusal.
-    if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&transport_url) {
+    if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(
+        &transport_url,
+        crate::setup::setup_cwd(&repo).as_deref(),
+    ) {
         return Ok(crate::transport_err::not_a_repository_fatal(bad));
     }
 

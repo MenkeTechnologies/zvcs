@@ -31,16 +31,18 @@ pub(crate) mod function {
                         scheme: url.scheme,
                     });
                 }
-                Box::new(
-                    crate::client::blocking_io::file::connect_with_program(
-                        url.path,
-                        options.version,
-                        options.trace,
-                        options.upload_pack,
-                        options.receive_pack,
-                    )
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+                let mut transport = crate::client::blocking_io::file::connect_with_program(
+                    url.path,
+                    options.version,
+                    options.trace,
+                    options.upload_pack,
+                    options.receive_pack,
                 )
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                if let Some(dir) = options.current_dir {
+                    transport.set_current_dir(dir);
+                }
+                Box::new(transport)
             }
             gix_url::Scheme::Ssh => Box::new({
                 let mut ssh = options.ssh;

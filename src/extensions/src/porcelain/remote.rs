@@ -1863,7 +1863,7 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
         // a repository on disk therefore ends where every other unreachable
         // transport does.
         if !no_query && repo.find_remote(*name).is_err() {
-            if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(name) {
+            if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(name, crate::setup::setup_cwd(repo).as_deref()) {
                 eprintln!("fatal: '{bad}' does not appear to be a git repository");
                 eprintln!(
                     "fatal: Could not read from remote repository.\n\n\
@@ -2508,6 +2508,8 @@ fn query_ref_map(repo: &gix::Repository, name: &str) -> Result<gix::remote::fetc
                 upload_pack,
                 "upload-pack",
             ),
+            // git has moved to the top of the work tree by now; a relative URL is read from there.
+            current_dir: crate::setup::setup_cwd(repo),
             ..Default::default()
         },
     )?;

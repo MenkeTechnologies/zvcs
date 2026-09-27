@@ -1508,6 +1508,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             address_family,
             // `git clone` never connects for push.
             receive_pack: None,
+            // clone records a local source absolute, so there is nothing relative to resolve.
+            current_dir: None,
         });
     }
     if !server_options.is_empty() {
@@ -1550,6 +1552,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             address_family,
             // `git clone` never connects for push.
             receive_pack: None,
+            current_dir: None,
         };
         let probe_server_options = server_options.clone();
         prepare = prepare.configure_remote(move |r| {

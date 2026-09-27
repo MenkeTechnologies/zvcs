@@ -60,6 +60,12 @@ pub struct SpawnProcessOnDemand {
     ssh_disallow_shell: bool,
     /// git's `--ipv4`/`--ipv6`, passed on to `ssh` as `-4`/`-6`.
     ssh_address_family: Option<crate::AddressFamily>,
+    /// The directory the service program is started in, when it is not this process's.
+    ///
+    /// git has `chdir()`ed to the top of the work tree during setup before it connects, so a
+    /// local service it starts inherits that directory, and a relative repository path is
+    /// read from there (`start_command(conn)` with `conn->dir` unset, connect.c:1479-1491).
+    current_dir: Option<std::path::PathBuf>,
     connection: Option<Connection<Box<dyn std::io::Read + Send>, process::ChildStdin>>,
     child: Option<process::Child>,
     trace: bool,
@@ -88,6 +94,7 @@ impl SpawnProcessOnDemand {
             ssh_disallow_shell,
             ssh_address_family,
             child: None,
+            current_dir: None,
             connection: None,
             desired_version: version,
             trace,
@@ -116,10 +123,16 @@ impl SpawnProcessOnDemand {
             ssh_disallow_shell: false,
             ssh_address_family: None,
             child: None,
+            current_dir: None,
             connection: None,
             desired_version: version,
             trace,
         }
+    }
+
+    /// Start the service program in `dir` rather than in this process's current directory.
+    pub fn set_current_dir(&mut self, dir: std::path::PathBuf) {
+        self.current_dir = Some(dir);
     }
 
     /// The caller's override for the program that runs `service`, if any.
@@ -364,11 +377,15 @@ impl client::blocking_io::Transport for SpawnProcessOnDemand {
     ) -> Result<SetServiceResponse<'_>, client::Error> {
         let (cmd, ssh_kind, cmd_name) = self.prepare_command(service)?;
         let envs = std::mem::take(&mut self.envs);
+        let current_dir = self.current_dir.clone();
         let into_std_command = |mut cmd: gix_command::Prepare| {
             cmd.stdin = Stdio::piped();
             cmd.stdout = Stdio::piped();
 
             let mut cmd = std::process::Command::from(cmd);
+            if let Some(dir) = &current_dir {
+                cmd.current_dir(dir);
+            }
             for env_to_remove in ENV_VARS_TO_REMOVE {
                 cmd.env_remove(env_to_remove);
             }

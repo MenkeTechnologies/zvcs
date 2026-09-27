@@ -2808,7 +2808,7 @@ fn fetch_one(
     if let Some(spec) = name_or_url {
         let spec = spec.to_string();
         if repo.try_find_remote(spec.as_str()).is_none() {
-            if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&spec) {
+            if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&spec, crate::setup::setup_cwd(repo).as_deref()) {
                 fetch_head.truncate_now()?;
                 eprintln!("fatal: '{bad}' does not appear to be a git repository");
                 eprintln!(
@@ -3156,6 +3156,8 @@ fn fetch_one(
         address_family: opts.address_family,
         // `git fetch` never connects for push.
         receive_pack: None,
+        // git has moved to the top of the work tree by now; a relative URL is read from there.
+        current_dir: crate::setup::setup_cwd(repo),
     };
     let server_options = server_options_for(repo, remote_name.as_deref(), &opts.server_options);
 

@@ -63,6 +63,10 @@ pub(crate) mod connect {
         /// `http(s)://` pins the resolver — the three places git's `transport_family` reaches.
         /// `file://` has no socket and ignores it, as git does.
         pub address_family: Option<crate::AddressFamily>,
+        /// The directory a local service program is started in and a relative local path is read
+        /// from: git's current directory after setup, which is the top of the work tree when the
+        /// command was started below it. `None` is this process's current directory.
+        pub current_dir: Option<std::path::PathBuf>,
     }
 
     /// The error used in `connect()`.

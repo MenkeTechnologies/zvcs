@@ -279,6 +279,8 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             super::fetch::upload_pack_program(&repo, remote_name.as_deref(), opts.upload_pack.as_deref()),
             "upload-pack",
         ),
+        // git has moved to the top of the work tree by now; a relative URL is read from there.
+        current_dir: crate::setup::setup_cwd(&repo),
         // `git ls-remote` has no `--ipv4`/`--ipv6`, and never connects for push.
         ..Default::default()
     };

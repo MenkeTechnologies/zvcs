@@ -384,7 +384,24 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // `origin`, never a refspec named `origin`.
     let remote_name: String = match positionals.first().cloned().or_else(|| f.repo.clone()) {
         Some(r) => r,
-        None => default_push_remote(&repo),
+        None => match default_push_remote(&repo) {
+            Some(name) => name,
+            None => {
+                // builtin/push.c:761-777: `pushremote_get(NULL)` came back NULL.
+                eprintln!(
+                    "fatal: No configured push destination.\n\
+                     Either specify the URL from the command-line or configure a remote repository using\n\n    \
+git remote add <name> <url>\n\n\
+                     and then push using the remote name\n\n    \
+git push <name>\n\n\
+                     To push to multiple remotes at once, configure a remote group using\n\n    \
+git config remotes.<groupname> \"<remote1> <remote2>\"\n\n\
+                     and then push using the group name\n\n    \
+git push <groupname>\n"
+                );
+                return Ok(ExitCode::from(128));
+            }
+        },
     };
     let typed: Vec<String> = positionals.into_iter().skip(1).collect();
 
@@ -2718,7 +2735,12 @@ fn short_ref(name: &str) -> &str {
 /// The remote `git push` targets with no `<remote>` argument —
 /// `remotes_pushremote_for_branch()` (remote.c:692-706): the current branch's
 /// `pushRemote`, then `remote.pushDefault`, then [`remote_for_branch`].
-fn default_push_remote(repo: &gix::Repository) -> String {
+///
+/// `None` is `pushremote_get(NULL)` returning NULL (remote.c:792-818): a name none
+/// of those keys spelled out — the sole remote, or `origin` — is not taken as a
+/// URL alias, so without a `remote.<name>.url` it is no remote at all
+/// (`valid_remote()`, remote.c:44-47).
+fn default_push_remote(repo: &gix::Repository) -> Option<String> {
     let snap = repo.config_snapshot();
     let branch = repo
         .head()
@@ -2727,13 +2749,20 @@ fn default_push_remote(repo: &gix::Repository) -> String {
 
     if let Some(b) = &branch {
         if let Some(r) = snap.string(&format!("branch.{b}.pushRemote")) {
-            return r.to_string();
+            return Some(r.to_string());
         }
     }
     if let Some(r) = snap.string("remote.pushDefault") {
-        return r.to_string();
+        return Some(r.to_string());
     }
-    remote_for_branch(repo, branch.as_deref())
+    if let Some(b) = &branch {
+        if let Some(r) = snap.string(&format!("branch.{b}.remote")) {
+            return Some(r.to_string());
+        }
+    }
+    let name = remote_for_branch(repo, branch.as_deref());
+    let urls = crate::config::multi_values(repo, &format!("remote.{name}.url"));
+    (!urls.is_empty()).then_some(name)
 }
 
 /// `remotes_remote_for_branch()` (remote.c:666-680): `branch.<name>.remote` when

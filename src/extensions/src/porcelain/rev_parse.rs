@@ -60,7 +60,7 @@
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--not`, `--bisect`, `--default <rev>`, `--prefix <dir>`,
+//! `--bisect`, `--default <rev>`, `--prefix <dir>`,
 //! `--all-objects` and `--exclude-hidden=`. Options git does
 //! *not* recognize are echoed — through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
@@ -134,6 +134,11 @@ struct Opts {
     /// `output_sq` (`builtin/rev-parse.c:55`), set by `--sq`: every value
     /// `show()` prints is shell-quoted onto one line instead of one per line.
     sq: bool,
+    /// git's `show_type` (`builtin/rev-parse.c:47`), flipped by every `--not`
+    /// (:905-908). `show_with_type()` prints the `^` when a revision's own type
+    /// differs from it (:135-140), so under an odd number of `--not`s a plain
+    /// revision gains the caret and a `^rev` exclude loses it.
+    not: bool,
 }
 
 /// `#define DO_REVS 1` … `#define DO_NONFLAGS 8` (`builtin/rev-parse.c:38-41`).
@@ -211,6 +216,7 @@ impl Default for Opts {
             filter: DO_REVS | DO_NOREV | DO_FLAGS | DO_NONFLAGS,
             format: Format::Default,
             sq: false,
+            not: false,
         }
     }
 }
@@ -221,7 +227,6 @@ impl Default for Opts {
 const UNIMPLEMENTED_EXACT: &[&str] = &[
     "-h",
     "--help",
-    "--not",
     "--default",
     "--prefix",
     "--bisect",
@@ -1462,6 +1467,8 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "-q" | "--quiet" => o.quiet = true,
         // `builtin/rev-parse.c:901-904`.
         "--sq" => o.sq = true,
+        // `show_type ^= REVERSED;` (`builtin/rev-parse.c:905-908`).
+        "--not" => o.not = !o.not,
         "--short" => {
             // `--short` implies `--verify` in stock git; that is where the
             // otherwise surprising `fatal: Needed a single revision` comes from
@@ -2157,8 +2164,9 @@ fn show_rev(
 
     // `show_with_type()` (`builtin/rev-parse.c:135-140`) puts the `^` out ahead
     // of `show()`, so under `--sq` it lands outside the quotes: `^'<id>' `.
+    // The test is `type != show_type`, which `--not` turns around.
     if let Some(p) = payload {
-        if reversed {
+        if reversed != o.not {
             out.write_all(b"^")?;
         }
         show(out, o, &p)?;
@@ -2203,12 +2211,6 @@ fn truncate_hex(id: &ObjectId, len: usize) -> Vec<u8> {
     hex
 }
 
-/// Emit `^<id>` for the excluded side of a range (`show_with_type(REVERSED, …)`).
-fn emit_exclude(out: &mut impl Write, o: &Opts, bytes: &[u8]) -> std::io::Result<()> {
-    out.write_all(b"^")?;
-    show(out, o, bytes)
-}
-
 /// Expand a range revspec at its position, matching stock git's line order.
 ///
 /// `a..b` prints `b` then `^a`; `a...b` prints `b`, `a`, then `^<merge-base>` for
@@ -2239,7 +2241,10 @@ fn emit_range(
                 .merge_bases_many(theirs, &[ours])
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             for base in bases {
-                emit_exclude(out, o, &render_id(repo, o, &base.detach())?)?;
+                // `show_rev(REVERSED, &commit->object.oid, NULL)`
+                // (`builtin/rev-parse.c:316-319`): nameless, and subject to
+                // `--not` and the `DO_REVS` filter like any other revision.
+                show_rev(out, repo, o, &base.detach(), None, None, true)?;
             }
         }
     }

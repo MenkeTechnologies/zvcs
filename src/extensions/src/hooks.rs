@@ -214,6 +214,22 @@ pub fn run(
     Ok(run_with_env(repo, event, args, stdin, &[])?.ok)
 }
 
+/// `run_commit_hook()` (commit.c:1994-2016): `GIT_INDEX_FILE=<index_file>` and,
+/// when no editor will be launched, `GIT_EDITOR=:`.
+pub fn run_commit_hook(
+    repo: &gix::Repository,
+    editor_is_used: bool,
+    index_file: &Path,
+    event: &str,
+    args: &[&str],
+) -> Result<Outcome> {
+    let mut env: Vec<(&str, &Path)> = vec![("GIT_INDEX_FILE", index_file)];
+    if !editor_is_used {
+        env.push(("GIT_EDITOR", Path::new(":")));
+    }
+    run_with_env(repo, event, args, None, &env)
+}
+
 /// [`run`], plus the environment git exports to the hook and the `invoked_hook`
 /// flag git needs back from it.
 ///

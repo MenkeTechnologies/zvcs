@@ -3323,19 +3323,28 @@ fn finalize_clean(
         return Ok(ExitCode::SUCCESS);
     }
 
+    let edit = match edit_wanted(opts) {
+        Ok(edit) => edit,
+        Err(code) => return Ok(code),
+    };
+    // Every hook on the commit path goes through `run_commit_hook()`
+    // (commit.c:1994-2016) with `repo_get_index_file()` and `0 < option_edit`
+    // (builtin/merge.c:926-977): `GIT_INDEX_FILE` as setup spells it, and
+    // `GIT_EDITOR=:` when no editor will run.
+    let index_file = crate::setup::index_file_spelled(repo);
+    let commit_hook = |event: &str, args: &[&str]| -> Result<bool> {
+        Ok(crate::hooks::run_commit_hook(repo, edit, &index_file, event, args)?.ok)
+    };
+
     // `pre-merge-commit` runs before the commit; a non-zero exit vetoes it. The
     // hook's own output (inherited on stderr) is the whole diagnostic, as in git.
-    if !opts.no_verify && !crate::hooks::run(repo, "pre-merge-commit", &[], None)? {
+    if !opts.no_verify && !commit_hook("pre-merge-commit", &[])? {
         return Ok(ExitCode::from(1));
     }
 
     // git's `prepare_to_commit()` from here: build the buffer, persist the merge
     // state, run the editor and the `commit-msg` hook over that file, then clean
     // the message up and refuse an empty one.
-    let edit = match edit_wanted(opts) {
-        Ok(edit) => edit,
-        Err(code) => return Ok(code),
-    };
     let comment = comment_char(repo);
     let mut msg = message;
     if opts.signoff {
@@ -3367,8 +3376,9 @@ fn finalize_clean(
     // Omitting the hook meant a repository whose `prepare-commit-msg` appends a
     // trailer committed a *different message*, and so a different commit id,
     // than stock.
-    let msg_arg = msg_path.to_string_lossy().into_owned();
-    if !crate::hooks::run(repo, "prepare-commit-msg", &[&msg_arg, "merge"], None)? {
+    // `git_path_merge_msg()`, spelled on the git directory setup left.
+    let msg_arg = crate::setup::git_path_spelled(repo, "MERGE_MSG").to_string_lossy().into_owned();
+    if !commit_hook("prepare-commit-msg", &[&msg_arg, "merge"])? {
         return Ok(ExitCode::from(1));
     }
 
@@ -3378,8 +3388,7 @@ fn finalize_clean(
     }
     // `commit-msg` gets the same file and may rewrite it.
     if !opts.no_verify {
-        let arg = msg_path.to_string_lossy().into_owned();
-        if !crate::hooks::run(repo, "commit-msg", &[&arg], None)? {
+        if !commit_hook("commit-msg", &[&msg_arg])? {
             return Ok(ExitCode::from(1));
         }
     }

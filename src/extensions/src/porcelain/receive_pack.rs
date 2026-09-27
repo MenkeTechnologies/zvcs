@@ -2485,6 +2485,17 @@ fn hook_env(repo: &gix::Repository, push_options: &[String], cert: Option<&PushC
     HookEnv { set }
 }
 
+/// Where a receive-side hook starts, and the `GIT_DIR` it is handed.
+///
+/// `enter_repo()` settles on the git directory — `<path>/.git` for a
+/// repository with a work tree, the path itself for a bare one, the target of
+/// a gitfile — `chdir()`s into it and calls `set_git_dir(".", 0)` (setup.c:
+/// 1868-1893), and `run_hook_ve()` leaves `dir` unset, so every hook runs in the
+/// git directory with `GIT_DIR=.`, bare or not.
+fn enter_repo_dir(repo: &gix::Repository) -> (std::path::PathBuf, std::path::PathBuf) {
+    (crate::hooks::absolutize(repo.git_dir()), std::path::PathBuf::from("."))
+}
+
 /// Spawn `<hooks-dir>/<name>` with git's receive-side wiring: `GIT_DIR` set, the
 /// hook's stdout folded into its stderr (`run_hooks_opt`'s default) and the pair
 /// relayed to the pusher on band 2.
@@ -2501,19 +2512,10 @@ fn spawn_hook(
 ) -> Option<bool> {
     let path = crate::hooks::find(repo, name).ok().flatten()?;
 
-    let workdir = repo.workdir().unwrap_or_else(|| repo.git_dir());
-    // `enter_repo()` has already `chdir`'d into the repository by the time
-    // receive-pack runs, and `setup_bare_git_dir()` then exports the git
-    // directory as `.` when that is where it is standing (`setup.c:1284`), not as
-    // an absolute path. A hook that hands `$GIT_DIR` to a child of its own after
-    // changing directory therefore sees what it would see under git.
-    let git_dir = match crate::hooks::absolutize(repo.git_dir()) {
-        abs if abs == crate::hooks::absolutize(workdir) => std::path::PathBuf::from("."),
-        abs => abs,
-    };
+    let (hook_dir, git_dir) = enter_repo_dir(repo);
     let mut cmd = std::process::Command::new(&path);
     cmd.args(args)
-        .current_dir(workdir)
+        .current_dir(&hook_dir)
         .env("GIT_DIR", &git_dir)
         .stdin(if stdin.is_some() {
             std::process::Stdio::piped()
@@ -2814,8 +2816,8 @@ fn run_proc_receive_hook(
     };
 
     let mut child = match std::process::Command::new(&path)
-        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
-        .env("GIT_DIR", repo.git_dir())
+        .current_dir(enter_repo_dir(repo).0)
+        .env("GIT_DIR", enter_repo_dir(repo).1)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

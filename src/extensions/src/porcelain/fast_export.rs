@@ -369,8 +369,9 @@ struct Opts {
     rename: diffcore_rename::Options,
 }
 
-/// The tagger git invents for a tag object that has none, when asked to.
-const FAKE_TAGGER: &str = "tagger <unknown> <unknown> 0 +0000";
+/// The tagger git invents for a tag object that has none, when asked to
+/// (builtin/fast-export.c:921-923).
+const FAKE_TAGGER: &str = "tagger Unspecified Tagger <unspecified-tagger> 0 +0000";
 
 /// git's `null_oid()` as printed in a `reset` for an excluded commit.
 const NULL_OID: &str = "0000000000000000000000000000000000000000";

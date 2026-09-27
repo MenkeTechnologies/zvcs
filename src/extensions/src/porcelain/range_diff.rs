@@ -174,6 +174,9 @@
 //!     `--no-renames`, `--[no-]rename-empty` and `-l<n>`: the one pair is a
 //!     modification, and `diffcore_rename()` pairs deletions with creations.
 //!     Their scores and limit are still validated at parse time.
+//!   * `-B` / `--break-rewrites[=<n>[/<m>]]`: `diffcore_break()` only splits a pair
+//!     whose two paths match (diffcore-break.c:188-191), and these are `a`
+//!     and `b`. Its `<n>/<m>` is still validated at parse time.
 //!   * `-D` / `--irreversible-delete`, `-R`, `-a` / `--text`, `--no-ext-diff`
 //!     and `--rotate-to` / `--skip-to`: `-R` swaps sides only in
 //!     `diff_change()` / `diff_addremove()`, which `diff_queue()` bypasses, a
@@ -289,8 +292,7 @@
 //!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
 //!   widths give it — `builtin/range-diff.c` never calls
 //!   `init_diffstat_widths()`.
-//! * `-B` / `--break-rewrites` (a large enough outer change becomes a complete
-//!   rewrite), `--word-diff`, `--color-moved` and `--ext-diff`.
+//! * `--word-diff`, `--color-moved` and `--ext-diff`.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -1323,9 +1325,24 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // * `--rotate-to`/`--skip-to` (diff.c:6293-6298): range-diff leaves
             //   `rotate_to_strict` clear, so `diffcore_rotate()` either finds the
             //   one pair first or returns (diffcore-rotate.c:20-32).
+            // * `-B`/`--break-rewrites` (diff.c:6159): `diffcore_break()` only
+            //   splits a pair whose two paths are equal (diffcore-break.c:188-191),
+            //   and this pair's are `a` and `b`, so nothing is ever broken and
+            //   `diffcore_merge_broken()` has nothing to merge.
             //
-            // The score of `-M`/`-C` and the `-l` limit are still validated as
-            // parse-options does, before any revision is resolved.
+            // The score of `-M`/`-C`/`-B` and the `-l` limit are still validated
+            // as parse-options does, before any revision is resolved.
+            _ if name.starts_with("-B") || name == "--break-rewrites" => {
+                let score = match name.strip_prefix("--") {
+                    Some(_) => inline,
+                    None => Some(&name[2..]).filter(|v| !v.is_empty()),
+                };
+                if let Some(v) = score {
+                    if super::diffcore_rename::parse_break_opt(v).is_err() {
+                        return Ok(option_error("break-rewrites expects <n>/<m> form"));
+                    }
+                }
+            }
             _ if name.starts_with("-M")
                 || name.starts_with("-C")
                 || name == "--find-renames"

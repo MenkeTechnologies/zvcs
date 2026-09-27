@@ -68,6 +68,9 @@
 //!     `--simplify-merges` also implies `--topo-order` and turns on parent
 //!     rewriting, so `%p`/`%P` print the simplified ancestry and a TREESAME merge
 //!     between two relevant commits stays in the output.
+//!     `--simplify-by-decoration` is the same passes with `rev_compare_tree()`
+//!     asking whether a commit is decorated (revision.c:789-805), which with
+//!     no pathspec is the whole question.
 //!
 //! Not covered — each `bail!`s rather than emitting output that would diverge:
 //! `--bisect`, `--alternate-refs`, `--exclude-hidden`,
@@ -330,6 +333,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut dense = true;
     let mut full_history = false;
     let mut simplify_merges = false;
+    // `revs->simplify_by_decoration`, which also sets `revs->prune` with no
+    // pathspec at all (revision.c:2445-2452).
+    let mut simplify_by_decoration = false;
     // Raw pathspecs collected after a `--` separator, in command-line order.
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
 
@@ -639,6 +645,13 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 // `--date-order`/`--author-date-order` means, so an order named
                 // anywhere on the line still wins.
                 ("simplify-merges", None) => {
+                    simplify_merges = true;
+                    full_history = true;
+                }
+                // `--simplify-merges` with `rev_compare_tree()` asking about
+                // decorations instead of paths (revision.c:789-805, 2445-2452).
+                ("simplify-by-decoration", None) => {
+                    simplify_by_decoration = true;
                     simplify_merges = true;
                     full_history = true;
                 }
@@ -1107,7 +1120,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         }
         // The pathspec set, parsed once for the whole walk by the shared engine —
         // magic (`:(exclude)`, `:(glob)`, `:(icase)`, …) included.
-        let mut specs = if pathspecs.is_empty() {
+        let mut specs = if pathspecs.is_empty() && !simplify_by_decoration {
             None
         } else {
             Some(super::log::PathspecMatcher::new(repo, &pathspecs)?)
@@ -1144,7 +1157,24 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // `simplify_merges()` over the whole limited list. Only afterwards does
         // `get_commit_action()` decide commit by commit.
         let simplification =
-            simplify_walk(repo, &items, &tips, specs.as_mut(), dense, full_history, simplify_merges, &filters)?;
+        {
+            // `get_name_decoration()` loads every ref with no filter
+            // (log-tree.c:94-98).
+            let decorations = match simplify_by_decoration {
+                true => Some(super::log::build_decorations(
+                    repo,
+                    &super::log::DecorationFilter::unfiltered(),
+                )?),
+                false => None,
+            };
+            let mut diff = specs.as_mut().map(|specs| PathDiff {
+                repo,
+                specs,
+                decorations: decorations.as_ref(),
+                pathspec: !pathspecs.is_empty(),
+            });
+            simplify_walk(repo, &items, &tips, diff.as_mut(), dense, full_history, simplify_merges, &filters)?
+        };
 
         // `None` for the ancestry means "the commit's own parents", which is what
         // every walk without a path limit shows.
@@ -2298,10 +2328,25 @@ fn is_space(b: u8) -> bool {
 struct PathDiff<'a> {
     repo: &'a gix::Repository,
     specs: &'a mut super::log::PathspecMatcher,
+    /// The decorations `--simplify-by-decoration` asks about, if it was given.
+    decorations: Option<&'a super::log::Decorations>,
+    /// `revs->prune_data.nr != 0`.
+    pathspec: bool,
 }
 
 impl super::simplify::TreeDiff for PathDiff<'_> {
     fn differs(&mut self, commit: ObjectId, parent: Option<ObjectId>) -> Result<bool> {
+        // `rev_compare_tree()` (revision.c:789-805): a decorated commit differs from
+        // every parent and an undecorated one, with no pathspec, from none. A root
+        // goes through `rev_same_tree_as_empty()` instead, which never asks.
+        if let (Some(decorations), Some(_)) = (self.decorations, parent) {
+            if decorations.decorates(&commit) {
+                return Ok(true);
+            }
+            if !self.pathspec {
+                return Ok(false);
+            }
+        }
         let Some(tree) = commit_tree(self.repo, commit) else {
             return Ok(false);
         };
@@ -2323,7 +2368,8 @@ struct Simplified {
 /// git's history simplification over a finished walk: the commits
 /// `get_commit_action()` still shows, each with its two parent lists.
 ///
-/// `None` when no pathspec is in play. That is `revs->prune == 0`, and every one
+/// `None` when neither a pathspec nor `--simplify-by-decoration` is in play, so
+/// `diff` is `None` too. That is `revs->prune == 0`, and every one
 /// of the three passes is then a no-op — which is why `--simplify-merges` on its
 /// own changes nothing but the walk order.
 ///
@@ -2335,13 +2381,13 @@ fn simplify_walk(
     repo: &gix::Repository,
     items: &[WalkItem],
     tips: &[ObjectId],
-    specs: Option<&mut super::log::PathspecMatcher>,
+    diff: Option<&mut PathDiff<'_>>,
     dense: bool,
     full_history: bool,
     simplify_merges: bool,
     filters: &Filters,
 ) -> Result<Option<HashMap<ObjectId, Simplified>>> {
-    let Some(specs) = specs else {
+    let Some(diff) = diff else {
         return Ok(None);
     };
     let first_parent = filters.first_parent;
@@ -2353,13 +2399,12 @@ fn simplify_walk(
         simplify_history: !full_history,
         first_parent,
     };
-    let mut diff = PathDiff { repo, specs };
     let mut info: HashMap<ObjectId, super::simplify::Classified> =
         HashMap::with_capacity(items.len());
     for item in items {
         info.insert(
             item.id,
-            super::simplify::classify(item.id, &item.parents, &walked, mode, &mut diff)?,
+            super::simplify::classify(item.id, &item.parents, &walked, mode, &mut *diff)?,
         );
     }
 

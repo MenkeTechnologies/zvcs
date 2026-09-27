@@ -431,6 +431,11 @@ fn ref_store_first_use() {
 }
 
 fn discover_with_overrides() -> Result<gix::Repository, gix::discover::Error> {
+    if IGNORED_DUBIOUS_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
+            path: PathBuf::from("."),
+        }));
+    }
     let overrides = CLI_OVERRIDES.get();
     if overrides.is_none_or(Vec::is_empty) {
         return gix::discover(".");
@@ -1738,14 +1743,23 @@ pub fn work_tree_environment_gate(sub: &str) -> Option<ExitCode> {
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
+/// Set when setup found a repository whose ownership it refuses for a command
+/// that runs setup gently: `setup_git_directory_gently()` then carries on with
+/// `*nongit_ok = 1` (setup.c:1979-1993), so the command runs as though there were
+/// no repository at all. [`discover`] honours it.
+static IGNORED_DUBIOUS_REPOSITORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Returns the exit code to leave with, or `None` to continue.
+///
+/// A command that sets up strictly dies with git's message. One that sets up
+/// gently gets `GIT_DIR_INVALID_OWNERSHIP`'s other arm, `*nongit_ok = 1`: no
+/// message, and the repository is not used — its configuration is not read and
+/// the command runs outside it ([`IGNORED_DUBIOUS_REPOSITORY`]).
 pub fn dubious_ownership(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if !runs_strict_setup(sub, args) {
-        return None;
-    }
     if std::env::var_os("GIT_DIR").is_some() {
         return None;
     }
+    let strict = runs_strict_setup(sub, args);
     let repo = gix::discover(".").ok()?;
     let git_dir = realpath(repo.git_dir());
     let work_tree = discovered_directory(&git_dir);
@@ -1754,6 +1768,16 @@ pub fn dubious_ownership(sub: &str, args: &[String]) -> Option<ExitCode> {
     // read, so the file's own ownership is checked alongside what it points at.
     let gitfile = work_tree.as_ref().map(|top| top.join(".git")).filter(|p| p.is_file());
     if ensure_valid_ownership(gitfile.as_deref(), work_tree.as_deref(), &git_dir) {
+        return None;
+    }
+    if !strict {
+        // `ls-remote` is the one gentle verb left on the repository: this port
+        // needs a `gix::Repository` to build any transport and refuses outside
+        // one (`porcelain::ls_remote`), where stock lists the refs. Ignoring the
+        // repository would turn a listing stock prints into that refusal.
+        if sub != "ls-remote" {
+            IGNORED_DUBIOUS_REPOSITORY.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         return None;
     }
     let path = work_tree.unwrap_or(git_dir);

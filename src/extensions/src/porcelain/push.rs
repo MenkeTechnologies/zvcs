@@ -628,7 +628,7 @@ git push <groupname>\n"
         let configured = configured_push_refspecs(&repo, remote_name.as_str());
         match configured.is_empty() {
             false => configured,
-            true => match default_push_refspec(&repo, &remote, remote_name.as_str(), &mut f)? {
+            true => match default_push_refspec(&repo, remote_name.as_str(), &mut f)? {
                 Ok(specs) => specs,
                 Err(code) => return Ok(code),
             },
@@ -1978,7 +1978,6 @@ fn configured_push_refspecs(repo: &gix::Repository, name: &str) -> Vec<String> {
 /// is only there once the handshake has run.
 fn default_push_refspec(
     repo: &gix::Repository,
-    remote: &gix::Remote<'_>,
     remote_name: &str,
     f: &mut Flags,
 ) -> Result<std::result::Result<Vec<String>, ExitCode>> {
@@ -2019,12 +2018,13 @@ fn default_push_refspec(
     let refname = format!("refs/heads/{branch}");
 
     // `same_remote = !strcmp(remote->name, remote_for_branch(branch, NULL))`: whether this
-    // push is going to the branch's own remote.
+    // push is going to the branch's own remote. `remote->name` is the name as given even
+    // when no remote is configured under it (`make_remote()`, remote.c:807), so
+    // `git push origin` without a remote `origin` is still the branch's own remote.
     // `remote_for_branch()` is the *fetch* side's answer: `remote.pushDefault` and
     // `branch.<name>.pushRemote` play no part in it.
-    let branch_remote = remote_for_branch(repo, Some(&branch));
-    let same_remote = remote.name().map(|n| n.as_bstr().to_string()).as_deref()
-        == Some(branch_remote.as_str());
+    let branch_remote = remote_for_branch(repo, Some(&branch), Some(remote_name));
+    let same_remote = remote_name == branch_remote;
 
     // `get_upstream_ref()` (builtin/push.c:196-227). Only `push.autoSetupRemote`'s
     // `TRANSPORT_PUSH_AUTO_UPSTREAM` lets a branch without `branch.<name>.merge` through,
@@ -2760,7 +2760,7 @@ fn default_push_remote(repo: &gix::Repository) -> Option<String> {
             return Some(r.to_string());
         }
     }
-    let name = remote_for_branch(repo, branch.as_deref());
+    let name = remote_for_branch(repo, branch.as_deref(), None);
     let urls = crate::config::multi_values(repo, &format!("remote.{name}.url"));
     (!urls.is_empty()).then_some(name)
 }
@@ -2768,7 +2768,11 @@ fn default_push_remote(repo: &gix::Repository) -> Option<String> {
 /// `remotes_remote_for_branch()` (remote.c:666-680): `branch.<name>.remote` when
 /// it is set, otherwise the sole configured remote when there is exactly one,
 /// otherwise `origin`.
-fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>) -> String {
+///
+/// `made` is a remote `pushremote_get()` already created under a name no
+/// configuration spells (`make_remote()`, remote.c:807): it joins
+/// `remote_state->remotes`, so it counts toward "exactly one".
+fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>, made: Option<&str>) -> String {
     let configured = branch.and_then(|b| {
         repo.config_snapshot()
             .string(&format!("branch.{b}.remote"))
@@ -2778,6 +2782,9 @@ fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>) -> String {
         return name;
     }
     let mut names = super::fetch::remotes_in_config_order(repo);
+    if let Some(made) = made.filter(|m| !names.iter().any(|n| n == m)) {
+        names.push(made.to_string());
+    }
     match names.len() {
         1 => names.remove(0),
         _ => "origin".to_string(),

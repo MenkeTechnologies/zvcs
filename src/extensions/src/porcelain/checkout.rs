@@ -3306,27 +3306,50 @@ pub(super) enum Gate {
 ///
 /// `--discard-changes`/`-f` takes `reset_tree()` instead and never reaches this, which is why a
 /// forced switch out of a conflicted state works.
+///
+/// ```c
+/// refresh_index(the_repository->index, REFRESH_QUIET, NULL, NULL, NULL);
+///
+/// if (unmerged_index(the_repository->index)) {
+///         rollback_lock_file(&lock_file);
+///         error(_("you need to resolve your current index first"));
+///         return 1;
+/// }
+/// ```
+///
+/// The refresh is what lets a switch see through stat-only changes: an entry whose file was
+/// touched (or copied, or restored by a tool that does not keep mtimes) but whose content still
+/// matches is repaired here, so `show_local_changes()`'s `diff-index` afterwards does not list it
+/// as `M`. The repaired stat data reaches disk with the index the switch writes; on the refusal
+/// git rolls the lock back, so nothing is written then either.
 pub(super) fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
-    let index = repo.index_or_load_from_head_or_empty()?;
-    let backing = index.path_backing();
-    let mut unmerged: Vec<BString> = Vec::new();
-    for entry in index.entries() {
-        if entry.stage() == gix::index::entry::Stage::Unconflicted {
-            continue;
-        }
-        let path = entry.path_in(backing).to_owned();
-        if unmerged.last() != Some(&path) {
-            unmerged.push(path);
-        }
+    let mut index = repo.index_or_load_from_head_or_empty()?.into_owned();
+    let refreshed = if repo.workdir().is_some() {
+        super::update_index::refresh_index(
+            repo,
+            &mut index,
+            super::update_index::RefreshFlags { quiet: true, ..Default::default() },
+            None,
+            None,
+        )?
+        .dirty
+    } else {
+        false
+    };
+    let unmerged = index
+        .entries()
+        .iter()
+        .any(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted);
+    if unmerged {
+        // `refresh_index()` has already printed `<path>: needs merge` for each
+        // conflicted path; `REFRESH_QUIET` does not silence that line.
+        eprintln!("error: you need to resolve your current index first");
+        return Ok(Some(ExitCode::from(1)));
     }
-    if unmerged.is_empty() {
-        return Ok(None);
+    if refreshed {
+        crate::index_racy::write(repo, &mut index)?;
     }
-    for path in &unmerged {
-        println!("{path}: needs merge");
-    }
-    eprintln!("error: you need to resolve your current index first");
-    Ok(Some(ExitCode::from(1)))
+    Ok(None)
 }
 
 pub(super) fn switch_gate(

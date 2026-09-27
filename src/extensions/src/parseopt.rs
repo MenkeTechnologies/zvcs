@@ -1061,3 +1061,25 @@ mod tests {
         assert_eq!(i, 1);
     }
 }
+
+/// `die_for_incompatible_opt4()` (parse-options.c:1528-1560) — and its
+/// `die_for_incompatible_opt3()` wrapper — as a message: the names of the
+/// options that are set, in argument order, joined the way the three
+/// translated templates join them. `None` when fewer than two are set.
+///
+/// ```c
+/// case 4: die(_("options '%s', '%s', '%s', and '%s' cannot be used together"), …);
+/// case 3: die(_("options '%s', '%s', and '%s' cannot be used together"), …);
+/// case 2: die(_("options '%s' and '%s' cannot be used together"), …);
+/// ```
+pub fn incompatible_options(opts: &[(bool, &str)]) -> Option<String> {
+    let set: Vec<&str> = opts.iter().filter(|(on, _)| *on).map(|(_, name)| *name).collect();
+    match set.as_slice() {
+        [a, b] => Some(format!("options '{a}' and '{b}' cannot be used together")),
+        [a, b, c] => Some(format!("options '{a}', '{b}', and '{c}' cannot be used together")),
+        [a, b, c, d] => {
+            Some(format!("options '{a}', '{b}', '{c}', and '{d}' cannot be used together"))
+        }
+        _ => None,
+    }
+}

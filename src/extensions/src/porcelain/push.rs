@@ -340,12 +340,33 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     f.verbose = f.verbosity > 0;
     f.quiet = f.verbosity < 0;
 
-    // Conflicts git rejects before contacting the remote.
-    if f.tags && f.all {
-        crate::git_fatal!("--all can't be combined with --tags");
+    // `RUN_SETUP`: the repository is found before `cmd_push()` looks at an option.
+    let repo = crate::setup::discover()?;
+
+    // ```c
+    // die_for_incompatible_opt4(deleterefs, "--delete",
+    //                           tags, "--tags",
+    //                           flags & TRANSPORT_PUSH_ALL, "--all/--branches",
+    //                           flags & TRANSPORT_PUSH_MIRROR, "--mirror");
+    // if (deleterefs && argc < 2)
+    //         die(_("--delete doesn't make sense without any refs"));
+    // ```
+    //
+    // (`cmd_push()`, builtin/push.c:728-733.) Only the command-line `--mirror` is
+    // in play here; `remote.<name>.mirror` is added per remote later. `argc`
+    // counts the positionals, so a `--repo` never stands in for a ref.
+    if let Some(msg) = crate::parseopt::incompatible_options(&[
+        (f.delete, "--delete"),
+        (f.tags, "--tags"),
+        (f.all, "--all/--branches"),
+        (f.mirror, "--mirror"),
+    ]) {
+        crate::git_fatal!("{msg}");
+    }
+    if f.delete && positionals.len() < 2 {
+        crate::git_fatal!("--delete doesn't make sense without any refs");
     }
 
-    let repo = crate::setup::discover()?;
     // `add_remote_or_group()` / `pushremote_get()` (builtin/push.c:747-777) are the
     // first remote lookups, and the first lookup runs remote.c's `read_config()`.
     crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;

@@ -764,18 +764,40 @@ impl FsyncComponent {
     }
 }
 
-/// `objects` — `loose-object,pack`.
+/// `FSYNC_COMPONENT_OBJECT_MAP` (write-or-die.h:24): no writer here produces
+/// one, but `all` names it, so it keeps its bit.
+const FSYNC_OBJECT_MAP: u8 = 1 << 6;
+/// `FSYNC_COMPONENTS_OBJECTS` (write-or-die.h:27-28).
 const FSYNC_OBJECTS: u8 = FsyncComponent::LooseObject.bit() | FsyncComponent::Pack.bit();
-/// `derived-metadata` — `pack-metadata,commit-graph`.
+/// `FSYNC_COMPONENTS_DERIVED_METADATA` (write-or-die.h:30-31).
 const FSYNC_DERIVED_METADATA: u8 = FsyncComponent::PackMetadata.bit() | FsyncComponent::CommitGraph.bit();
-/// `committed` — currently equivalent to `objects`.
-const FSYNC_COMMITTED: u8 = FSYNC_OBJECTS;
-/// `added` — `committed,index`.
+/// `FSYNC_COMPONENTS_COMMITTED` (write-or-die.h:37-38): the objects and the refs
+/// that name them.
+const FSYNC_COMMITTED: u8 = FSYNC_OBJECTS | FsyncComponent::Reference.bit();
+/// `FSYNC_COMPONENTS_ADDED` (write-or-die.h:40-41).
 const FSYNC_ADDED: u8 = FSYNC_COMMITTED | FsyncComponent::Index.bit();
-/// `all` — every individual component.
-const FSYNC_ALL: u8 = FSYNC_OBJECTS | FSYNC_DERIVED_METADATA | FsyncComponent::Index.bit() | FsyncComponent::Reference.bit();
-/// The platform default, documented as `committed,-loose-object`.
-const FSYNC_DEFAULT: u8 = FSYNC_COMMITTED & !FsyncComponent::LooseObject.bit();
+/// `FSYNC_COMPONENTS_ALL` (write-or-die.h:43-49).
+const FSYNC_ALL: u8 = FSYNC_OBJECTS | FSYNC_DERIVED_METADATA | FsyncComponent::Index.bit()
+    | FsyncComponent::Reference.bit() | FSYNC_OBJECT_MAP;
+/// `FSYNC_COMPONENTS_PLATFORM_DEFAULT`, which is `FSYNC_COMPONENTS_DEFAULT` off
+/// Windows (write-or-die.h:33-35, :51-52): objects and derived metadata, less the
+/// loose objects.
+const FSYNC_DEFAULT: u8 = (FSYNC_OBJECTS | FSYNC_DERIVED_METADATA) & !FsyncComponent::LooseObject.bit();
+
+/// `fsync_component_names[]` (environment.c:220-235), in its order.
+const FSYNC_COMPONENT_NAMES: &[(&str, u8)] = &[
+    ("loose-object", FsyncComponent::LooseObject.bit()),
+    ("pack", FsyncComponent::Pack.bit()),
+    ("pack-metadata", FsyncComponent::PackMetadata.bit()),
+    ("commit-graph", FsyncComponent::CommitGraph.bit()),
+    ("index", FsyncComponent::Index.bit()),
+    ("objects", FSYNC_OBJECTS),
+    ("reference", FsyncComponent::Reference.bit()),
+    ("derived-metadata", FSYNC_DERIVED_METADATA),
+    ("committed", FSYNC_COMMITTED),
+    ("added", FSYNC_ADDED),
+    ("all", FSYNC_ALL),
+];
 
 /// How `core.fsyncMethod` says a hardened file should be flushed.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -846,26 +868,28 @@ impl FsyncPolicy {
         let mut policy = Self::default();
         let snap = repo.config_snapshot();
 
+        // `core.fsync` is parsed afresh from the platform default by every
+        // occurrence (environment.c:475-480), so only the last one matters.
+        if let Some((raw, _)) = last_value_with_origin(repo, "core.fsync") {
+            policy.components = parse_fsync_components(&raw, true);
+        }
+
         // Deprecated, but still read: git warns whenever it is set at all, and
-        // then dies if the value is not a boolean.
+        // then dies if the value is not a boolean. It is a separate switch, not a
+        // component: `close_loose_object()` (object-file.c:578-595) fsyncs a loose
+        // object when it is on and otherwise asks the component set, so `false`
+        // takes nothing away.
         if let Some((raw, origin)) = last_value_with_origin(repo, "core.fsyncObjectFiles") {
             eprintln!("warning: core.fsyncObjectFiles is deprecated; use core.fsync instead");
             match snap.boolean("core.fsyncObjectFiles") {
                 Some(true) => policy.components |= FsyncComponent::LooseObject.bit(),
-                Some(false) => policy.components &= !FsyncComponent::LooseObject.bit(),
+                Some(false) => {}
                 None => {
                     return Err(format!(
                         "bad boolean config value '{raw}' for 'core.fsyncobjectfiles'{origin}"
                     ))
                 }
             }
-        }
-
-        // `core.fsync` layers onto the platform default rather than replacing it:
-        // the set starts at the default, `-<name>` removes, a bare `<name>` adds,
-        // and `none` resets to empty. An empty value is the platform default.
-        if let Some((raw, _)) = last_value_with_origin(repo, "core.fsync") {
-            policy.components = parse_fsync_components(&raw, policy.components);
         }
 
         if let Some((raw, _)) = last_value_with_origin(repo, "core.fsyncMethod") {
@@ -915,43 +939,65 @@ impl FsyncPolicy {
     }
 }
 
-/// git's `git_parse_fsync_components`: a comma/whitespace separated component
-/// list layered onto `start`. `none` clears the set outright, `-<name>` removes a
-/// component, a bare `<name>` adds one, and an unknown name warns and is skipped.
-fn parse_fsync_components(raw: &str, start: u8) -> u8 {
-    let mut bits = start;
-    for token in raw.split([',', ' ', '\t', '\n', '\r']).filter(|t| !t.is_empty()) {
-        if token == "none" {
-            return 0;
-        }
-        let (negated, name) = match token.strip_prefix('-') {
-            Some(rest) => (true, rest),
-            None => (false, token),
-        };
-        let mask = match name {
-            "loose-object" => FsyncComponent::LooseObject.bit(),
-            "pack" => FsyncComponent::Pack.bit(),
-            "pack-metadata" => FsyncComponent::PackMetadata.bit(),
-            "commit-graph" => FsyncComponent::CommitGraph.bit(),
-            "index" => FsyncComponent::Index.bit(),
-            "reference" => FsyncComponent::Reference.bit(),
-            "objects" => FSYNC_OBJECTS,
-            "derived-metadata" => FSYNC_DERIVED_METADATA,
-            "committed" => FSYNC_COMMITTED,
-            "added" => FSYNC_ADDED,
-            "all" => FSYNC_ALL,
-            other => {
-                eprintln!("warning: ignoring unknown core.fsync component '{other}'");
-                continue;
-            }
-        };
-        if negated {
-            bits &= !mask;
+/// `parse_fsync_components()` (environment.c:237-290), warnings included when
+/// `warn` is set.
+///
+/// ```c
+/// string = string + strspn(string, ", \t\n\r");
+/// ep = strchrnul(string, ',');
+/// len = ep - string;
+/// if (!strcmp(string, "none")) { current = FSYNC_COMPONENT_NONE; goto next_name; }
+/// if (*string == '-') { negated = 1; string++; len--;
+///         if (!len) warning(_("invalid value for variable %s"), var); }
+/// if (!len) break;
+/// for (…) if (!strncmp(n->name, string, len)) { found = 1; … }
+/// if (!found) warning(_("ignoring unknown core.fsync component '%s'"), component);
+/// …
+/// return (current & ~negative) | positive;
+/// ```
+///
+/// Only a comma ends a name — `bogus index` is one unknown name — and a name is
+/// matched as a prefix of every table entry, so `ind` is `index` and `pack` is
+/// both `pack` and `pack-metadata`. `none` is recognised only as the *whole rest*
+/// of the value, and clears the platform default, never what a positive name
+/// added: `objects,none` keeps `objects`, and `none,objects` warns about `none`.
+/// A negation only ever subtracts from the platform default for the same reason.
+pub(crate) fn parse_fsync_components(raw: &str, warn: bool) -> u8 {
+    let mut current = FSYNC_DEFAULT;
+    let (mut positive, mut negative) = (0u8, 0u8);
+    let mut rest = raw;
+    loop {
+        rest = rest.trim_start_matches([',', ' ', '\t', '\n', '\r']);
+        let end = rest.find(',').unwrap_or(rest.len());
+        let (mut name, next) = rest.split_at(end);
+        if rest == "none" {
+            current = 0;
         } else {
-            bits |= mask;
+            let negated = name.starts_with('-');
+            if negated {
+                name = &name[1..];
+                if name.is_empty() && warn {
+                    eprintln!("warning: invalid value for variable core.fsync");
+                }
+            }
+            if name.is_empty() {
+                break;
+            }
+            let mut found = false;
+            for &(_, bits) in FSYNC_COMPONENT_NAMES.iter().filter(|(full, _)| full.starts_with(name)) {
+                found = true;
+                match negated {
+                    true => negative |= bits,
+                    false => positive |= bits,
+                }
+            }
+            if !found && warn {
+                eprintln!("warning: ignoring unknown core.fsync component '{name}'");
+            }
         }
+        rest = next;
     }
-    bits
+    (current & !negative) | positive
 }
 
 /// A durable flush: `fcntl(F_FULLFSYNC)` on macOS, where plain `fsync()` only
@@ -1021,26 +1067,38 @@ mod stock_config_tests {
         assert_eq!(parse_config_int(&"9".repeat(24)), Err("out of range"));
     }
 
-    /// `core.fsync` layers onto the platform default: `-<name>` removes,
-    /// `<name>` adds, an aggregate expands, and `none` clears everything.
+    /// `parse_fsync_components()` (environment.c:237-290) and the component sets
+    /// of write-or-die.h:18-52. The warnings this parse prints are measured
+    /// against stock git 2.55.0 in `tests/config_parity_fsync_components.rs`; the
+    /// bits themselves are only visible as durability, so they are pinned to the
+    /// C here.
     #[test]
-    fn fsync_components_layer_onto_the_platform_default() {
-        let index = FsyncComponent::Index.bit();
-        let loose = FsyncComponent::LooseObject.bit();
+    fn fsync_components_follow_parse_fsync_components() {
+        let bit = |c: FsyncComponent| c.bit();
+        let (loose, pack, index) = (bit(FsyncComponent::LooseObject), bit(FsyncComponent::Pack), bit(FsyncComponent::Index));
+        let reference = bit(FsyncComponent::Reference);
 
-        // The documented platform default is `committed,-loose-object`, which
-        // leaves `pack` alone — the index is NOT hardened unless asked for.
-        assert_eq!(FSYNC_DEFAULT, FsyncComponent::Pack.bit());
+        // `(objects | derived-metadata) & ~loose-object`: pack, pack metadata and
+        // the commit graph — not the index, not the refs.
+        assert_eq!(FSYNC_DEFAULT, pack | bit(FsyncComponent::PackMetadata) | bit(FsyncComponent::CommitGraph));
+        assert_eq!(FSYNC_COMMITTED, loose | pack | reference);
 
-        assert_eq!(parse_fsync_components("index", FSYNC_DEFAULT), FSYNC_DEFAULT | index);
-        assert_eq!(parse_fsync_components("-pack", FSYNC_DEFAULT), 0);
-        assert_eq!(parse_fsync_components("none", FSYNC_ALL), 0);
-        assert_eq!(parse_fsync_components("all", 0), FSYNC_ALL);
-        assert_eq!(parse_fsync_components("added", 0), FSYNC_COMMITTED | index);
-        // `all,-loose-object` is `all` minus one bit, order-sensitively.
-        assert_eq!(parse_fsync_components("all,-loose-object", 0), FSYNC_ALL & !loose);
-        // An unknown component is skipped, not fatal, and the rest still applies.
-        assert_eq!(parse_fsync_components("bogus,index", 0), index);
+        assert_eq!(parse_fsync_components("", false), FSYNC_DEFAULT);
+        assert_eq!(parse_fsync_components("index", false), FSYNC_DEFAULT | index);
+        // A prefix names every entry it starts: `pack` is `pack` and `pack-metadata`.
+        assert_eq!(parse_fsync_components("-pack", false), bit(FsyncComponent::CommitGraph));
+        assert_eq!(parse_fsync_components("ind", false), FSYNC_DEFAULT | index);
+        // `none` clears the default only when it is the whole rest of the value,
+        // and never what a positive name added.
+        assert_eq!(parse_fsync_components("none", false), 0);
+        assert_eq!(parse_fsync_components("objects,none", false), FSYNC_OBJECTS);
+        assert_eq!(parse_fsync_components("none,index", false), FSYNC_DEFAULT | index);
+        // Positives win over negatives whatever the order.
+        assert_eq!(parse_fsync_components("all,-loose-object", false), FSYNC_ALL);
+        assert_eq!(parse_fsync_components("-loose-object,all", false), FSYNC_ALL);
+        // Only a comma separates names.
+        assert_eq!(parse_fsync_components("bogus index", false), FSYNC_DEFAULT);
+        assert_eq!(parse_fsync_components(" ,bogus,index", false), FSYNC_DEFAULT | index);
     }
 }
 

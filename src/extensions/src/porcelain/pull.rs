@@ -1496,6 +1496,16 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     if allow_unrelated {
         merge_args.push("--allow-unrelated-histories".into());
     }
+    // `run_merge()` is `run_command()` of a `git merge` child (builtin/pull.c:
+    // 521-570), and that child starts with `repo_config(the_repository,
+    // git_merge_config, …)` (builtin/merge.c:1400) like any other `git merge`.
+    // The in-process merge below skips the dispatcher that runs that callback, so
+    // it is run here: a `merge.autoStash` or `commit.gpgSign` the child would
+    // refuse ends the pull after the fetch, at the child's 128, which `cmd_pull()`
+    // returns as its own status.
+    if let Err(rejection) = crate::cmd_config::validate_merge(&repo) {
+        return Err(rejection.into_error());
+    }
     // `run_merge()` forwards the autostash choice and lets `git merge` do the
     // stashing, which is why a dirty tree is fine on the merge path.
     match autostash {

@@ -223,14 +223,6 @@ fn work_tree(repo: &gix::Repository) -> Option<PathBuf> {
     Some(realpath_forgiving(repo.workdir()?))
 }
 
-/// git's `startup_info->prefix`: the path from the top of the work tree down to
-/// the current directory, or `None` at the top itself, outside the work tree, or
-/// where there is no work tree at all. git leaves the field NULL in all of those
-/// cases, and `prefix_path()` treats NULL and `""` alike.
-///
-/// `setup_git_directory()` chdirs to the top of the work tree and hands the
-/// command this string, so anything a command prints relative to *its* cwd has
-/// to be spelled relative to the top level instead.
 /// The command-line configuration overrides this process was started with, in
 /// the `key=value` / bare-`key` spelling `gix::open::Options::cli_overrides`
 /// takes. Captured once, after `handle_options` has parsed the command line.
@@ -506,6 +498,16 @@ pub fn declares_reftable(repo: &gix::Repository) -> bool {
     ref_storage_format(repo) == "reftable"
 }
 
+/// The path from the top of the work tree down to the current directory, or
+/// `None` at the top itself, outside the work tree, or where there is no work
+/// tree at all: what `setup_git_directory()` computes for `startup_info->prefix`
+/// before a command gets the chance to replace it. git leaves the field NULL in
+/// all of those cases, and `prefix_path()` treats NULL and `""` alike.
+///
+/// `setup_git_directory()` chdirs to the top of the work tree and hands the
+/// command this string, so anything a command prints relative to *its* cwd has
+/// to be spelled relative to the top level instead. Readers that must honour a
+/// replaced prefix go through [`startup_prefix`].
 pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
     let top = work_tree(repo)?;
     let cwd = std::env::current_dir().ok().and_then(|c| std::fs::canonicalize(c).ok())?;
@@ -513,14 +515,55 @@ pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
     (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
 }
 
-/// [`prefix`] in the byte form the pathspec and archive code wants: the
+/// A prefix a command installed in place of the computed one: `git rev-parse
+/// --prefix <dir>` does
+///
+/// ```c
+/// prefix = argv[++i];
+/// if (!prefix)
+///         die(_("--prefix requires an argument"));
+/// startup_info->prefix = prefix;
+/// output_prefix = 1;
+/// ```
+///
+/// (`builtin/rev-parse.c:838-845`). The string is kept exactly as given — not
+/// slash-terminated, not normalized — because `prefix_filename()` and
+/// `prefix_path()` concatenate it byte for byte (`--prefix sub f` names `subf`).
+static STARTUP_PREFIX_OVERRIDE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Replace `startup_info->prefix` for the rest of the process, as
+/// `rev-parse --prefix` does. Every reader of [`startup_prefix`] — path echo,
+/// `check_filename()`, `:./<path>` resolution, `GIT_PREFIX` — sees the new value.
+pub fn set_startup_prefix(prefix: &str) {
+    *STARTUP_PREFIX_OVERRIDE.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefix.to_owned());
+}
+
+/// git's `startup_info->prefix` as a string: the [`set_startup_prefix`]
+/// replacement when one was installed, else [`prefix`] slash-terminated. `None`
+/// is git's NULL; an installed `""` stays `Some("")`, which `print_path()` and
+/// `--git-dir` tell apart from NULL (`builtin/rev-parse.c:667`, :1047).
+pub fn startup_prefix(repo: &gix::Repository) -> Option<String> {
+    if let Some(given) = STARTUP_PREFIX_OVERRIDE.read().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+        return Some(given.clone());
+    }
+    prefix(repo).map(|rel| format!("{}/", rel.to_string_lossy()))
+}
+
+/// `prefix_filename()` (`abspath.c:267-284`): `arg` behind `pfx`, unless there is
+/// no prefix or `arg` is absolute. A plain concatenation — the prefix is expected
+/// to be slash-terminated, and one that is not runs straight into the name.
+pub fn prefix_filename(pfx: Option<&str>, arg: &str) -> String {
+    match pfx {
+        Some(pfx) if !pfx.is_empty() && !Path::new(arg).is_absolute() => format!("{pfx}{arg}"),
+        _ => arg.to_owned(),
+    }
+}
+
+/// [`startup_prefix`] in the byte form the pathspec and archive code wants: the
 /// repo-relative path of the current directory with a trailing `/`, empty at the
 /// top of the work tree and in a bare repository.
 pub fn prefix_bytes(repo: &gix::Repository) -> Vec<u8> {
-    match prefix(repo).as_deref().map(Path::to_string_lossy) {
-        Some(rel) if !rel.is_empty() => format!("{rel}/").into_bytes(),
-        _ => Vec::new(),
-    }
+    startup_prefix(repo).unwrap_or_default().into_bytes()
 }
 
 /// `is_inside_dir()`: whether the current directory is `dir` or below it.

@@ -58,8 +58,10 @@
 //! `--exclude` is tested against the trimmed name. `handle_ref_opt()` clears the
 //! exclusion list once the walk that consumed it is done.
 //!
-//! Rejected with an explicit refusal rather than silently ignored — the list is
-//! [`UNIMPLEMENTED_EXACT`]: `--prefix <dir>`. Options `cmd_rev_parse()` does *not* recognize —
+//! `--prefix <dir>` replaces `startup_info->prefix` through
+//! [`crate::setup::set_startup_prefix`], so every later path echo, existence check,
+//! `:./<path>` lookup and prefix-relative query reads the new value. Options
+//! `cmd_rev_parse()` does *not* recognize —
 //! `--help`, `--all-objects` and a `-h` past the first argument among them —
 //! are echoed through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
@@ -142,6 +144,10 @@ struct Opts {
     /// `--default <rev>`. Every `show_rev()` that gets past the `DO_REVS` filter
     /// clears it (:146-148); [`show_default`] prints what is left.
     def: std::cell::RefCell<Option<String>>,
+    /// `output_prefix` (`builtin/rev-parse.c:715`), set by `--prefix <dir>`
+    /// (:838-845): from then on `show_file()` echoes a path as
+    /// `prefix_filename(startup_info->prefix, arg)` instead of verbatim.
+    output_prefix: bool,
 }
 
 /// `#define DO_REVS 1` … `#define DO_NONFLAGS 8` (`builtin/rev-parse.c:38-41`).
@@ -221,19 +227,10 @@ impl Default for Opts {
             sq: false,
             not: false,
             def: std::cell::RefCell::new(None),
+            output_prefix: false,
         }
     }
 }
-
-/// Options stock git recognizes that this port does not implement. Echoing them
-/// the way unknown options are echoed would silently produce a wrong answer, so
-/// they are rejected instead.
-///
-/// `--prefix` is matched with `strcmp()` and takes `argv[++i]`
-/// (`builtin/rev-parse.c:838-845`), so a `--prefix=<dir>` spelling is not that
-/// option at all: it falls through to `show_flag()` and is echoed like any other
-/// unknown flag. Only the separate-argument form is listed.
-const UNIMPLEMENTED_EXACT: &[&str] = &["--prefix"];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, builtin_rev_parse_usage)`
@@ -380,7 +377,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     }
 
     // Everything `print_path()` needs out of a setup this port does not perform.
-    let paths = PathCtx::new(&repo);
+    let mut paths = PathCtx::new(&repo);
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -436,7 +433,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // After an explicit `--`, everything is a pathspec: echo it (when paths
         // are being echoed) and move on. No existence check, no flag parsing.
         if dashdash {
-            show_file(&mut out, &repo, &o, arg)?;
+            show_file(&mut out, &repo, &o, arg, o.output_prefix)?;
             continue;
         }
 
@@ -452,7 +449,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // `--revs-only` swallow the separator while `--no-flags` keeps it.
         if !as_is && arg == "--" {
             if o.filter & (DO_FLAGS | DO_REVS) != 0 {
-                show_file(&mut out, &repo, &o, arg)?;
+                show_file(&mut out, &repo, &o, arg, false)?;
             }
             dashdash = true;
             continue;
@@ -473,7 +470,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // revisions and paths.
         if !as_is && !seen_end_of_options && arg == "--end-of-options" {
             if o.filter & (DO_FLAGS | DO_REVS) != 0 {
-                show_file(&mut out, &repo, &o, arg)?;
+                show_file(&mut out, &repo, &o, arg, false)?;
             }
             seen_end_of_options = true;
             continue;
@@ -484,7 +481,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         // leading run), the two that consume `argv[++i]`, and the ones that read the
         // repository or the clock.
         if !as_is && !seen_end_of_options && arg.starts_with('-') && arg.len() > 1 {
-            match positional_option(&mut out, &repo, &paths, &mut o, arg, args.get(i))? {
+            match positional_option(&mut out, &repo, &mut paths, &mut o, arg, args.get(i))? {
                 Positional::NotMine => {}
                 Positional::Consumed => continue,
                 Positional::ConsumedValue => {
@@ -590,7 +587,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         //         verify_filename(prefix, arg, 0);` (`builtin/rev-parse.c:751-753`):
         // a path that is not printed is not checked either.
         if as_is {
-            if !show_file(&mut out, &repo, &o, arg)? {
+            if !show_file(&mut out, &repo, &o, arg, o.output_prefix)? {
                 continue;
             }
             // `verify_filename(prefix, arg, 0)` opens with
@@ -938,7 +935,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 // (`builtin/rev-parse.c:1185-1187`): under `--revs-only` or
                 // `--no-flags`' sibling filters the operand is neither echoed nor
                 // required to exist.
-                if !show_file(&mut out, &repo, &o, arg)? {
+                if !show_file(&mut out, &repo, &o, arg, o.output_prefix)? {
                     continue;
                 }
                 // `verify_filename(prefix, arg, 1)` refuses a leading `-` before
@@ -1499,10 +1496,6 @@ enum Query {
 }
 
 fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
-    if UNIMPLEMENTED_EXACT.contains(&arg) {
-        anyhow::bail!("{arg} is not ported yet");
-    }
-
     match arg {
         "--verify" => {
             o.verify = true;
@@ -1682,11 +1675,9 @@ fn query(
                 return Ok(Some(ExitCode::from(128)));
             }
         },
-        Query::ShowPrefix => match prefix(repo) {
-            // git's prefix is slash-terminated; without one it still prints the empty line.
-            Some(pfx) => emit(out, format!("{}/", pfx.display()).as_bytes())?,
-            None => emit(out, b"")?,
-        },
+        // `if (prefix) puts(prefix); else putchar('\n');` (`builtin/rev-parse.c:1011-1016`):
+        // the local `prefix`, which `--prefix <dir>` replaces verbatim.
+        Query::ShowPrefix => emit(out, paths.prefix.as_deref().unwrap_or("").as_bytes())?,
         Query::ShowCdup => {
             // Outside the work tree git prints the work tree itself rather than a `../` climb —
             // and where there is no work tree at all it prints *nothing*, not even the newline
@@ -1708,9 +1699,10 @@ fn query(
                     emit(out, top.as_os_str().as_encoded_bytes())?;
                 }
             } else {
-                let up: String = prefix(repo).map_or_else(String::new, |pfx| {
-                    pfx.components().map(|_| "../").collect()
-                });
+                // One `../` per `/` in the local `prefix` (`builtin/rev-parse.c:1026-1032`),
+                // so a `--prefix` given without its trailing slash climbs one short.
+                let slashes = paths.prefix.as_deref().map_or(0, |pfx| pfx.matches('/').count());
+                let up = "../".repeat(slashes);
                 emit(out, up.as_bytes())?;
             }
         }
@@ -1882,7 +1874,7 @@ fn absolute(path: &std::path::Path) -> std::path::PathBuf {
 
 // `is_inside_git_dir()` and `is_inside_work_tree()` are shared with the other commands that ask
 // setup the same questions — see [`crate::setup`].
-use crate::setup::{is_inside_git_dir, is_inside_work_tree, prefix};
+use crate::setup::{is_inside_git_dir, is_inside_work_tree};
 
 /// `builtin_rev_parse_usage` — the bare synopsis `show_usage_if_asked()`
 /// and `usage()` both print. rev-parse has no parse-options table of its own.
@@ -1926,21 +1918,30 @@ fn is_worktree_path(repo: &gix::Repository, arg: &str) -> bool {
     //
     // Without it `git rev-parse :/`, `:!` and `:^` echoed the operand and then
     // died about it, where stock 2.55.0 echoes it and exits 0. `:/<path>` is
-    // root-relative (`prefix = NULL`), which the join below already is.
-    let arg = match arg.strip_prefix(":/") {
+    // root-relative (`prefix = NULL`); every other spelling is
+    //
+    // ```c
+    // if (prefix)
+    //         to_free = prefix_filename(prefix, arg);
+    // ```
+    //
+    // and the `lstat()` runs from the top of the work tree, where setup left git.
+    let prefix = crate::setup::startup_prefix(repo);
+    let (arg, prefix) = match arg.strip_prefix(":/") {
         Some("") => return true,
-        Some(rest) => rest,
+        Some(rest) => (rest, None),
         None => match arg.strip_prefix(":!").or_else(|| arg.strip_prefix(":^")) {
             Some("") => return true,
-            Some(rest) => rest,
-            None => arg,
+            Some(rest) => (rest, prefix),
+            None => (arg, prefix),
         },
     };
-    if arg.is_empty() {
+    let path = crate::setup::prefix_filename(prefix.as_deref(), arg);
+    if path.is_empty() {
         return false;
     }
     repo.workdir()
-        .map(|wd| wd.join(arg))
+        .map(|wd| wd.join(path))
         .is_some_and(|p| p.symlink_metadata().is_ok())
 }
 
@@ -2386,12 +2387,27 @@ fn show_default(out: &mut impl Write, repo: &gix::Repository, o: &Opts) -> Resul
 /// `--end-of-options` is about to be echoed, so the pending `--default` goes out
 /// first — even when the filter then keeps the token itself off stdout. Returns
 /// whether the token was printed.
-fn show_file(out: &mut impl Write, repo: &gix::Repository, o: &Opts, arg: &str) -> Result<bool> {
+///
+/// With `output_prefix`, set once `--prefix <dir>` has been seen, the token is
+/// printed as `prefix_filename(startup_info->prefix, arg)`. `--` and
+/// `--end-of-options` pass `0` (`builtin/rev-parse.c:790`, :1150) and stay bare.
+fn show_file(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    o: &Opts,
+    arg: &str,
+    output_prefix: bool,
+) -> Result<bool> {
     show_default(out, repo, o)?;
     if !o.shows_files() {
         return Ok(false);
     }
-    show(out, o, arg.as_bytes())?;
+    if output_prefix {
+        let pfx = crate::setup::startup_prefix(repo);
+        show(out, o, crate::setup::prefix_filename(pfx.as_deref(), arg).as_bytes())?;
+    } else {
+        show(out, o, arg.as_bytes())?;
+    }
     Ok(true)
 }
 
@@ -2676,7 +2692,7 @@ enum Positional {
 fn positional_option(
     out: &mut impl Write,
     repo: &gix::Repository,
-    paths: &PathCtx,
+    paths: &mut PathCtx,
     o: &mut Opts,
     arg: &str,
     next: Option<&String>,
@@ -2767,6 +2783,32 @@ fn positional_option(
         };
         let path = git_path(repo, paths, name);
         print_path(out, paths, &path, o.format, DefaultType::RelativeIfShared)?;
+        return Ok(Positional::ConsumedValue);
+    }
+    // ```c
+    // if (!strcmp(arg, "--prefix")) {
+    //         prefix = argv[++i];
+    //         if (!prefix)
+    //                 die(_("--prefix requires an argument"));
+    //         startup_info->prefix = prefix;
+    //         output_prefix = 1;
+    //         continue;
+    // }
+    // ```
+    // (`builtin/rev-parse.c:838-845`.) Both the local `prefix` — which
+    // `print_path()`, `--show-prefix` and `--show-cdup` read — and the global
+    // one — which `show_file()`, `check_filename()` and `resolve_relative_path()`
+    // read — are replaced. `--prefix=<dir>` is not this option (a whole-string
+    // compare) and is echoed as an unknown flag.
+    if arg == "--prefix" {
+        let Some(given) = next else {
+            out.flush()?;
+            eprintln!("fatal: --prefix requires an argument");
+            return Ok(Positional::Fatal);
+        };
+        crate::setup::set_startup_prefix(given);
+        paths.prefix = Some(given.clone());
+        o.output_prefix = true;
         return Ok(Positional::ConsumedValue);
     }
     // ```c
@@ -3537,11 +3579,11 @@ fn git_path(repo: &gix::Repository, ctx: &PathCtx, name: &str) -> std::path::Pat
 /// `GIT_WORK_TREE` pointing elsewhere `git rev-parse --git-dir` answers `.git`
 /// rather than the absolute path, because the cwd is then *outside* the work tree
 /// and `set_git_dir()` is called with `make_realpath = 0`.
-fn gitdir_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
+fn gitdir_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
     match std::env::var_os("GIT_DIR") {
         // With `$GIT_DIR` set the field and the variable agree (see below).
         Some(_) => repo_get_git_dir(repo),
-        None => discovered_gitdir_string(repo, &setup_cwd(), false),
+        None => discovered_gitdir_string(repo, &setup_cwd(), Some(ctx.prefix.is_some())),
     }
 }
 
@@ -3585,7 +3627,7 @@ pub(crate) fn repo_get_git_dir(repo: &gix::Repository) -> std::path::PathBuf {
             let stored = read_gitfile(&env).unwrap_or(env);
             explicit_gitdir_string(repo, stored, &cwd)
         }
-        None => discovered_gitdir_string(repo, &cwd, true),
+        None => discovered_gitdir_string(repo, &cwd, None),
     }
 }
 
@@ -3672,11 +3714,18 @@ fn explicit_work_tree(
 /// The work-tree arm comes first in the C: with `$GIT_WORK_TREE` or
 /// `core.worktree` set, discovery hands the string it found to
 /// `setup_explicit_git_dir()` and that function's rules apply instead.
+///
+/// `git_dir_query` is `None` for the `repo->gitdir` field and `Some(has_prefix)`
+/// for `--git-dir`, whose un-exported arm is
+/// `if (!prefix) print_path(".git", …)` else `<cwd>/.git`
+/// (`builtin/rev-parse.c:1043-1069`) — decided by the local `prefix`, which
+/// `--prefix <dir>` can set at the top of the work tree.
 fn discovered_gitdir_string(
     repo: &gix::Repository,
     cwd: &std::path::Path,
-    repo_field: bool,
+    git_dir_query: Option<bool>,
 ) -> std::path::PathBuf {
+    let repo_field = git_dir_query.is_none();
     let git_dir = absolute(repo.git_dir());
     let dot_git = git_dir.file_name() == Some(std::ffi::OsStr::new(".git"));
     let root = git_dir.parent().map(std::path::Path::to_path_buf);
@@ -3698,8 +3747,11 @@ fn discovered_gitdir_string(
             // *is* `.git`), so `repo->gitdir` keeps that relative spelling however
             // far the walk climbed. `--git-dir` reports the climb instead, through
             // its own `<cwd>/.git` fallback — see [`repo_gitdir_string`].
-            let stored: std::path::PathBuf = if climbed && !(repo_field && !has_work_tree_override)
-            {
+            let absolute = match git_dir_query {
+                Some(has_prefix) if !has_work_tree_override => has_prefix,
+                _ => climbed && !(repo_field && !has_work_tree_override),
+            };
+            let stored: std::path::PathBuf = if absolute {
                 root.join(".git")
             } else {
                 ".git".into()

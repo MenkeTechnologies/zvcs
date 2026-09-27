@@ -35,9 +35,10 @@ fn exists_at_root(repo: &gix::Repository, path: &str) -> bool {
     }
 }
 
-/// [`crate::setup::prefix`], slash-terminated the way `prefix_path()` wants it.
+/// `startup_info->prefix` ([`crate::setup::startup_prefix`]), the string
+/// `prefix_path()` and `prefix_filename()` concatenate onto a relative path.
 fn prefix(repo: &gix::Repository) -> Option<String> {
-    Some(format!("{}/", crate::setup::prefix(repo)?.to_str()?))
+    crate::setup::startup_prefix(repo)
 }
 
 /// `normalize_path_copy()` (`path.c`): collapse `.` and `..` textually, without

@@ -371,11 +371,7 @@ impl Setup {
     /// `prefix_filename()`: an absolute name is used as-is, a relative one is
     /// taken to be relative to the directory the command started in.
     pub(crate) fn prefix_filename(&self, name: &str) -> String {
-        if name.starts_with('/') {
-            name.to_string()
-        } else {
-            format!("{}{name}", self.prefix)
-        }
+        crate::setup::prefix_filename(Some(&self.prefix), name)
     }
 }
 

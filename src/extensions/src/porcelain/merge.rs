@@ -4318,7 +4318,14 @@ fn compose_message(
     // `strbuf_addch(&merge_msg, '\n')` in `write_merge_state()` — and nowhere
     // else. Measured against stock 2.55.0 through a `prepare-commit-msg` hook
     // that appends to the file, which is the only way to see the byte at all.
-    if opts.message.is_none() && msg.ends_with('\n') {
+    //
+    // The strip is `prepare_merge_message()`'s `strbuf_setlen(merge_msg,
+    // merge_msg->len - 1)` (builtin/merge.c:1226-1227), and it runs whenever
+    // `collect_parents()` builds an `autogen` list, i.e. `!have_message ||
+    // shortlog_len` (builtin/merge.c:1293, :1318-1319). So `-m`/`-F` under
+    // `--log` loses the shortlog's trailing newline as well, while `-F` text
+    // ending in a newline keeps it when there is no shortlog.
+    if opts.message.is_none() || opts.log_len != 0 {
         msg.pop();
     }
     Ok(msg)

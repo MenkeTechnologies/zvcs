@@ -767,6 +767,9 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // delegate finds nothing left to do; it still runs, because it also sweeps
     // the stale temporary files that repacking does not touch.
     if prune == Prune::Now {
+        // git forks `prune` (builtin/gc.c), so its buffered stdout is its own
+        // and is flushed by its exit before gc goes on.
+        let _child = crate::cstdio::run_command();
         super::prune::prune(&["prune".to_string()])?;
     }
 

@@ -134,6 +134,7 @@ use gix::objs::Kind;
 use gix::odb::pack;
 
 use super::{Arg, LongOpt};
+use crate::cstdio::{print, println};
 
 /// `cmd_prune()`'s `struct option options[]` (builtin/prune.c), in table order,
 /// as [`super::resolve_long`] reads it. No entry carries `PARSE_OPT_NONEG`.
@@ -164,6 +165,10 @@ const USAGE: &str = "usage: git prune [-n] [-v] [--progress] [--expire <time>] [
 /// See the module documentation for the ported surface and the exact reasons the
 /// remaining flags bail.
 pub fn prune(args: &[String]) -> Result<ExitCode> {
+    // The object and `rm -f` listings are `printf()`s into stdio's stdout
+    // buffer while `bad sha1 file:` and `error:` go straight to stderr
+    // (builtin/prune.c:103, :117), so captured together the stderr lines lead.
+    crate::cstdio::defer();
     // Dispatch includes the verb at index 0. `prune`'s positionals are revisions,
     // and `git prune prune` would name a ref called `prune`, so dropping a
     // leading verb is only safe as the very first argument — which is exactly

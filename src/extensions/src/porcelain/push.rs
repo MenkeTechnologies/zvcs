@@ -524,30 +524,12 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                 });
         }
 
-        // `push.autoSetupRemote` — on a bare default push whose current branch has
-        // no configured upstream, act as if `--set-upstream`. Ported from git's
-        // `setup_default_push_refspecs` (builtin/push.c): the SET_UPSTREAM flag is
-        // added when `(flags & AUTO_UPSTREAM) && branch->merge_nr == 0`, and only
-        // for `push.default` simple/upstream/current — `matching` and `nothing`
-        // return/die before that point. Unlike a plain flag it is not undone by
-        // `--no-set-upstream` (git applies it at push time, after option parsing).
-        let bare_default = specs.is_empty() && !f.all && !f.tags && !f.delete;
-        if bare_default && snap.boolean("push.autoSetupRemote") == Some(true) {
-            let push_default = snap
-                .string("push.default")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "simple".to_string());
-            let default_applies = !matches!(push_default.as_str(), "matching" | "nothing");
-            let has_upstream = repo
-                .head()
-                .ok()
-                .and_then(|h| h.referent_name().map(|n| n.shorten().to_string()))
-                .map(|b| snap.string(&format!("branch.{b}.merge")).is_some())
-                .unwrap_or(false);
-            if default_applies && !has_upstream {
-                f.set_upstream = true;
-            }
-        }
+        // `push.autoSetupRemote` arms `TRANSPORT_PUSH_AUTO_UPSTREAM` (builtin/push.c:501-504).
+        // It is not `--set-upstream`: `setup_default_push_refspecs()` turns it into
+        // `TRANSPORT_PUSH_SET_UPSTREAM` only for a default push whose branch has no
+        // upstream (builtin/push.c:283-284), and until then it only relaxes
+        // `get_upstream_ref()`. See [`default_push_refspec`].
+        f.auto_upstream = snap.boolean("push.autoSetupRemote") == Some(true);
     }
 
     // ```c
@@ -629,7 +611,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         let configured = configured_push_refspecs(&repo, remote_name.as_str());
         match configured.is_empty() {
             false => configured,
-            true => match default_push_refspec(&repo, &remote, remote_name.as_str(), &f)? {
+            true => match default_push_refspec(&repo, &remote, remote_name.as_str(), &mut f)? {
                 Ok(specs) => specs,
                 Err(code) => return Ok(code),
             },
@@ -1067,6 +1049,10 @@ struct Flags {
     push_options: Vec<String>,
     follow_tags: bool,
     set_upstream: bool,
+    /// `TRANSPORT_PUSH_AUTO_UPSTREAM`, from `push.autoSetupRemote`. A plain `-u`
+    /// does not set it, so a bare `git push -u` on a branch without an upstream
+    /// still dies in `get_upstream_ref()`.
+    auto_upstream: bool,
     porcelain: bool,
     repo: Option<String>,
     lease: Lease,
@@ -1977,7 +1963,7 @@ fn default_push_refspec(
     repo: &gix::Repository,
     remote: &gix::Remote<'_>,
     remote_name: &str,
-    f: &Flags,
+    f: &mut Flags,
 ) -> Result<std::result::Result<Vec<String>, ExitCode>> {
     let snap = repo.config_snapshot();
     let push_default = snap
@@ -2023,29 +2009,39 @@ fn default_push_refspec(
     let same_remote = remote.name().map(|n| n.as_bstr().to_string()).as_deref()
         == Some(branch_remote.as_str());
 
-    // `get_upstream_ref()` (builtin/push.c:196-227), which dies when the branch has no
-    // `branch.<name>.merge` — unless `push.autoSetupRemote` armed the auto-upstream flag,
-    // in which case the branch pushes to its own name and the upstream is set afterwards.
-    let upstream = |f: &Flags| -> std::result::Result<String, ExitCode> {
-        let merge = snap.string(&format!("branch.{branch}.merge")).map(|v| v.to_string());
-        match merge {
-            Some(merge) => Ok(merge),
-            None if f.set_upstream => Ok(refname.clone()),
-            None => {
-                let advice = match f.set_upstream {
-                    true => String::new(),
-                    false => "\nTo have this happen automatically for branches without a tracking\n\
-                              upstream, see 'push.autoSetupRemote' in 'git help config'.\n"
-                        .to_string(),
-                };
-                eprintln!(
-                    "fatal: The current branch {branch} has no upstream branch.\n\
-                     To push the current branch and set the remote as upstream, use\n\n    \
-git push --set-upstream {remote_name} {branch}\n{advice}"
-                );
-                Err(ExitCode::from(128))
-            }
+    // `get_upstream_ref()` (builtin/push.c:196-227). Only `push.autoSetupRemote`'s
+    // `TRANSPORT_PUSH_AUTO_UPSTREAM` lets a branch without `branch.<name>.merge` through,
+    // pushing to its own name; `-u` alone does not, so `git push -u` on such a branch
+    // dies here like a plain `git push`. A merge value without `branch.<name>.remote`
+    // is no upstream either, and more than one is refused.
+    // `multi_values`, not the snapshot's plain reader: see `configured_push_refspecs`.
+    let merges = crate::config::multi_values(repo, &format!("branch.{branch}.merge"));
+    let has_remote = snap.string(format!("branch.{branch}.remote").as_str()).is_some();
+    let auto_upstream = f.auto_upstream;
+    let upstream = || -> std::result::Result<String, ExitCode> {
+        if merges.is_empty() && auto_upstream {
+            return Ok(refname.clone());
         }
+        if merges.is_empty() || !has_remote {
+            let advice = match auto_upstream {
+                true => "",
+                false => "\nTo have this happen automatically for branches without a tracking\n\
+                          upstream, see 'push.autoSetupRemote' in 'git help config'.\n",
+            };
+            eprintln!(
+                "fatal: The current branch {branch} has no upstream branch.\n\
+                 To push the current branch and set the remote as upstream, use\n\n    \
+git push --set-upstream {remote_name} {branch}\n{advice}"
+            );
+            return Err(ExitCode::from(128));
+        }
+        if merges.len() != 1 {
+            eprintln!(
+                "fatal: The current branch {branch} has multiple upstream branches, refusing to push."
+            );
+            return Err(ExitCode::from(128));
+        }
+        Ok(merges[0].clone())
     };
 
     let dst = match push_default.as_str() {
@@ -2059,7 +2055,7 @@ git push --set-upstream {remote_name} {branch}\n{advice}"
                 );
                 return Ok(Err(ExitCode::from(128)));
             }
-            match upstream(f) {
+            match upstream() {
                 Ok(dst) => dst,
                 Err(code) => return Ok(Err(code)),
             }
@@ -2068,7 +2064,7 @@ git push --set-upstream {remote_name} {branch}\n{advice}"
         // upstream only has to *agree* with that name when this is the branch's own remote.
         _ => {
             if same_remote {
-                match upstream(f) {
+                match upstream() {
                     Ok(dst) if dst != refname => {
                         return Ok(Err(die_push_simple(&branch, remote_name, &dst)));
                     }
@@ -2079,6 +2075,12 @@ git push --set-upstream {remote_name} {branch}\n{advice}"
             refname.clone()
         }
     };
+
+    // builtin/push.c:279-284: a default push under `push.autoSetupRemote` whose branch has
+    // no upstream records one once it lands, with `simple`, `upstream` and `current` alike.
+    if auto_upstream && merges.is_empty() {
+        f.set_upstream = true;
+    }
 
     Ok(Ok(vec![format!("{refname}:{dst}")]))
 }

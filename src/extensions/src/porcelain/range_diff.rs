@@ -175,7 +175,8 @@
 //!   it. The filepair is fixed at paths `a`/`b`, mode `0100644`, both valid with
 //!   the null id (range-diff.c:477-489), which is what makes `--raw`'s two id
 //!   columns a run of zeroes, `--name-only` print `b` and `--name-status` print
-//!   `M	a`.
+//!   `M	a`. `-z` turns their tab and line ends, the renamed `--numstat` row
+//!   and the separator before the patch into NUL (diff.c:1436-1440, 6471-6501).
 //! * Rename and copy detection inside the patches. The inner `git log` runs with
 //!   no `-M` of its own (range-diff.c:44-59), so it detects with whatever
 //!   `diff.renames` says — on, at the default 50% similarity, unless the config
@@ -981,6 +982,10 @@ struct Opts {
     /// `-S` / `-G` / `--find-object`: the `diffcore_pickaxe()` filter that runs in
     /// `diffcore_std()` ahead of `diff_flush()` and can drop the filepair.
     pickaxe: Option<super::diff_pickaxe::Kind>,
+    /// `-z`: `line_termination = 0` (diff.c `OPT_SET_INT('z')`), which turns the
+    /// tab between `--raw`/`--name-status` fields and every line end of `--raw`,
+    /// `--name-only`, `--name-status` and `--numstat` into NUL.
+    nul_terminated: bool,
 }
 
 impl Opts {
@@ -1022,6 +1027,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
+        nul_terminated: false,
     };
     // `--ws-error-highlight=<kind>`, held until the config default can be read.
     let mut ws_error_highlight: Option<u32> = None;
@@ -1340,6 +1346,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            "-z" => opts.nul_terminated = true,
             "--find-copies-harder" | "--no-find-copies-harder" | "--no-renames"
             | "--rename-empty" | "--no-rename-empty" | "-D" | "--irreversible-delete"
             | "-R" | "-a" | "--text" | "--no-text" | "--no-ext-diff" => {}
@@ -2118,6 +2125,7 @@ pub(super) fn show_range_diff(
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
+        nul_terminated: false,
     };
     let ends1 = match endpoints(repo, range1) {
         Ok(e) => walkable(repo, e),
@@ -4246,12 +4254,21 @@ fn flush_pair(
                     format!(":100644 100644 {zeroes} {zeroes} ").as_bytes(),
                 );
             }
-            out.extend_from_slice(b"M\ta\n");
+            // `diff_flush_raw()` (diff.c:6471-6501): `inter_name_termination` is
+            // a tab, or NUL under `-z`, and the name ends with
+            // `line_termination`.
+            out.extend_from_slice(match opts.nul_terminated {
+                true => b"M\0a\0",
+                false => b"M\ta\n",
+            });
         } else {
             // `DIFF_FORMAT_NAME` writes `p->two->path`, the only place the `b`
             // side's name is ever printed.
             out.extend_from_slice(INDENT);
-            out.extend_from_slice(b"b\n");
+            out.extend_from_slice(match opts.nul_terminated {
+                true => b"b\0",
+                false => b"b\n",
+            });
         }
         separator = true;
     }
@@ -4276,7 +4293,12 @@ fn flush_pair(
             if fmt & FMT_NUMSTAT != 0 {
                 // `show_numstat()` (diff.c:2892): a renamed row prints
                 // `print_name` rather than the quoted `name`.
-                indented(out, format!("{added}\t{deleted}\ta => b\n").as_bytes());
+                // Under `-z` the renamed row is `\0<from>\0<to>\0` instead.
+                let names: &[u8] = match opts.nul_terminated {
+                    true => b"\0a\0b\0",
+                    false => b"a => b\n",
+                };
+                indented(out, &[format!("{added}\t{deleted}\t").as_bytes(), names].concat());
             }
             if fmt & FMT_DIFFSTAT != 0 {
                 let mut rendered = Vec::new();
@@ -4307,9 +4329,10 @@ fn flush_pair(
 
     if fmt & FMT_PATCH != 0 {
         if separator {
-            // `DIFF_SYMBOL_SEPARATOR`: the line prefix and nothing else.
+            // `DIFF_SYMBOL_SEPARATOR`: the line prefix, then `line_termination`
+            // (diff.c:1436-1440) — a NUL under `-z`.
             out.extend_from_slice(INDENT);
-            out.push(b'\n');
+            out.push(if opts.nul_terminated { 0 } else { b'\n' });
         }
         if !unmodified {
             patch_diff(out, a, b, opts)?;

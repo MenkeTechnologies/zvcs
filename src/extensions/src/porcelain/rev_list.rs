@@ -564,6 +564,49 @@ pub(super) enum Origin {
     StdinEnd(bool),
 }
 
+/// The `die()`s `handle_revision_opt()` raises while parsing the side-selecting
+/// options, against what the options already read have set (revision.c:2486-2517):
+///
+/// ```c
+/// } else if (!strcmp(arg, "--left-only")) {
+///         if (revs->right_only)
+///                 die(_("options '%s' and '%s' cannot be used together"),
+///                     "--left-only", "--right-only/--cherry");
+/// } else if (!strcmp(arg, "--right-only")) {
+///         if (revs->left_only)
+///                 die(…, "--right-only", "--left-only");
+/// } else if (!strcmp(arg, "--cherry")) {
+///         if (revs->left_only)
+///                 die(…, "--cherry", "--left-only");
+/// } else if (!strcmp(arg, "--cherry-mark")) {
+///         if (revs->cherry_pick)
+///                 die(…, "--cherry-mark", "--cherry-pick");
+/// } else if (!strcmp(arg, "--cherry-pick")) {
+///         if (revs->cherry_mark)
+///                 die(…, "--cherry-pick", "--cherry-mark");
+/// ```
+///
+/// The message is the `die()` text without its `fatal: ` prefix. `--cherry` sets
+/// `right_only` and `cherry_mark`, so it conflicts with a later `--left-only` or
+/// `--cherry-pick` through those. Shared by `rev-list` and `log`.
+pub(super) fn side_option_conflict(
+    arg: &str,
+    left_only: bool,
+    right_only: bool,
+    cherry_mark: bool,
+    cherry_pick: bool,
+) -> Option<String> {
+    let (first, second) = match arg {
+        "--left-only" if right_only => ("--left-only", "--right-only/--cherry"),
+        "--right-only" if left_only => ("--right-only", "--left-only"),
+        "--cherry" if left_only => ("--cherry", "--left-only"),
+        "--cherry-mark" if cherry_pick => ("--cherry-mark", "--cherry-pick"),
+        "--cherry-pick" if cherry_mark => ("--cherry-pick", "--cherry-mark"),
+        _ => return None,
+    };
+    Some(format!("options '{first}' and '{second}' cannot be used together"))
+}
+
 /// `read_revisions_from_stdin()` (`revision.c:2937-2983`), up to the point where
 /// each line is handed on: the revision lines in order — each with whether it came
 /// after the block's own `--end-of-options`, past which nothing is an option — and
@@ -1268,6 +1311,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--children" => show_children = true,
             "--boundary" => boundary = true,
             "--left-right" => left_right = true,
+            s @ ("--cherry-mark" | "--cherry-pick" | "--left-only" | "--right-only" | "--cherry")
+                if side_option_conflict(s, left_only, right_only, cherry_mark, cherry_pick)
+                    .is_some() =>
+            {
+                let message = side_option_conflict(s, left_only, right_only, cherry_mark, cherry_pick);
+                return Ok(fatal(&message.expect("guarded")));
+            }
             "--cherry-mark" => cherry_mark = true,
             "--cherry-pick" => cherry_pick = true,
             "--left-only" => left_only = true,

@@ -2590,6 +2590,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 exclude_first_parent_only = true;
             } else if a == "--left-right" {
                 left_right = true;
+            } else if let Some(message) = super::rev_list::side_option_conflict(
+                a,
+                left_only,
+                right_only,
+                cherry_mark,
+                cherry_pick,
+            ) {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
             } else if a == "--cherry-mark" {
                 cherry_mark = true;
             } else if a == "--cherry-pick" {

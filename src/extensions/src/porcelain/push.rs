@@ -1014,7 +1014,7 @@ git push <groupname>\n"
     // A dry run performs no local writes, but `set_upstreams()` still runs for
     // it: `pretend` makes it report what it *would* configure, while the
     // tracking-ref update is skipped outright.
-    let (code, trailer) = if f.porcelain {
+    let (code, trailer, failure) = if f.porcelain {
         report_porcelain(&outcome, f.quiet)?
     } else {
         report(&outcome, f.verbose, f.quiet)?
@@ -1042,6 +1042,13 @@ git push <groupname>\n"
         } else {
             eprintln!("Everything up-to-date");
         }
+    }
+    // `push_with_options()` speaks once `transport_push()` has returned — after the
+    // status block, the upstreams, the tracking refs and `Done` — with the failure
+    // line and then the one advice paragraph the rejections call for
+    // (builtin/push.c:392-409).
+    if let Some(failure) = failure {
+        failure.report(&outcome.url);
     }
     Ok(code)
 }
@@ -2382,11 +2389,11 @@ fn tracking_ref_for(remote: &gix::Remote<'_>, pushed: &str) -> Option<String> {
 
 /// Print the human `To <url>` status block (git prints it on stderr) and return
 /// the exit code: failure if the unpack failed or any ref was rejected.
-fn report(
-    outcome: &push_proto::Outcome,
+fn report<'a>(
+    outcome: &'a push_proto::Outcome,
     verbose: bool,
     quiet: bool,
-) -> Result<(ExitCode, bool)> {
+) -> Result<(ExitCode, bool, Option<PushFailure<'a>>)> {
     // git's two independent switches over this block: `color.transport` for the
     // per-ref summary field and `color.push` for the trailing error line. Both are
     // `auto` against stderr and neither consults `color.ui`.
@@ -2449,7 +2456,7 @@ fn report(
     // (transport.c:1562-1564.) The summary line is gated on `!quiet` of its own,
     // so a quiet push that moved nothing says nothing at all.
     if nothing_moved && !verbose {
-        return Ok((ExitCode::SUCCESS, !quiet));
+        return Ok((ExitCode::SUCCESS, !quiet, None));
     }
 
     // Nothing but matcher rejections: git never opened a transport report, so the
@@ -2571,18 +2578,32 @@ fn report(
         }
     }
     if any_failed {
+        let failure = PushFailure { rejected, color: colors.error.clone() };
+        return Ok((ExitCode::from(1), false, Some(failure)));
+    }
+    Ok((ExitCode::SUCCESS, nothing_moved && !quiet, None))
+}
+
+/// A push that failed, as `push_with_options()` reports it once `transport_push()`
+/// is done: the refs that were rejected, with their reasons, for the advice, and
+/// the `color.push.error` span for the summary line (empty for none).
+struct PushFailure<'a> {
+    rejected: Vec<(&'a str, &'a str)>,
+    color: String,
+}
+
+impl PushFailure<'_> {
+    fn report(&self, url: &str) {
         // `color.push` / `color.push.error`. git closes the span *after* the
         // newline, so the reset lands at the start of the following line.
-        let line = format!("error: failed to push some refs to '{}'", outcome.url);
-        if colors.error.is_empty() {
+        let line = format!("error: failed to push some refs to '{url}'");
+        if self.color.is_empty() {
             eprintln!("{line}");
         } else {
-            eprint!("{}{line}\n\x1b[m", colors.error);
+            eprint!("{}{line}\n\x1b[m", self.color);
         }
-        advise_rejections(&rejected);
-        return Ok((ExitCode::from(1), false));
+        advise_rejections(&self.rejected);
     }
-    Ok((ExitCode::SUCCESS, nothing_moved && !quiet))
 }
 
 /// The advice tail `do_push` (builtin/push.c) prints after the rejection block.
@@ -2679,7 +2700,10 @@ fn advise_rejections(rejected: &[(&str, &str)]) {
 
 /// `--porcelain`: machine-readable output — `<flag>\t<ref>\t<summary>` per ref,
 /// framed by `To <url>` and a trailing `Done`, on stdout.
-fn report_porcelain(outcome: &push_proto::Outcome, quiet: bool) -> Result<(ExitCode, bool)> {
+fn report_porcelain<'a>(
+    outcome: &'a push_proto::Outcome,
+    quiet: bool,
+) -> Result<(ExitCode, bool, Option<PushFailure<'a>>)> {
     let mut any_failed = outcome.unpack.is_err();
     let mut rejected: Vec<(&str, &str)> = Vec::new();
     // `if (!quiet || err)` (transport.c:1545) gates the status block whatever the
@@ -2749,18 +2773,13 @@ fn report_porcelain(outcome: &push_proto::Outcome, quiet: bool) -> Result<(ExitC
     }
     if any_failed {
         // `push_with_options()` reports the failure whatever the output format is: the
-        // machine-readable block is on stdout, and this stays on stderr next to the advice
-        // (builtin/push.c).
-        //
-        // `puts("Done")` sits at transport.c:1561, *after* the tracking refs are
-        // written, so the caller emits it once those are done — which is what
-        // orders it behind `updating local tracking ref` under `--porcelain -v`.
-        println!("Done");
-        eprintln!("error: failed to push some refs to '{}'", outcome.url);
-        advise_rejections(&rejected);
-        return Ok((ExitCode::from(1), false));
+        // machine-readable block is on stdout, and the failure line stays on stderr
+        // next to the advice (builtin/push.c:392-409). `Done` still follows the
+        // tracking refs (transport.c:1560-1561).
+        let failure = PushFailure { rejected, color: String::new() };
+        return Ok((ExitCode::from(1), true, Some(failure)));
     }
-    Ok((ExitCode::SUCCESS, true))
+    Ok((ExitCode::SUCCESS, true, None))
 }
 
 /// Shorten a full ref name for display (`refs/heads/main` → `main`).

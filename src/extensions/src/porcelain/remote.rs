@@ -587,6 +587,108 @@ fn fetch_refspec_dsts(repo: &gix::Repository, name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every ref name `refs_for_each_ref()` would visit, sorted, including one whose
+/// file cannot be parsed (see [`tracking_refs`] for why that one is recovered
+/// from the iterator's error).
+fn all_ref_names(repo: &gix::Repository) -> Result<Vec<FullName>> {
+    let mut out = Vec::new();
+    for reference in repo.refs.iter()?.all()? {
+        match reference {
+            Ok(reference) => out.push(reference.name),
+            Err(gix::refs::file::iter::loose_then_packed::Error::ReferenceCreation { relative_path, .. }) => {
+                if let Ok(broken) = FullName::try_from(gix::path::into_bstr(relative_path).as_ref()) {
+                    out.push(broken);
+                }
+            }
+            Err(e) => anyhow::bail!("{e}"),
+        }
+    }
+    out.sort_by(|a, b| a.as_bstr().cmp(b.as_bstr()));
+    Ok(out)
+}
+
+/// `match_refname_with_pattern()` (refspec.c:298-324): whether `refname` matches
+/// the single-`*` `pattern`, and with a `replacement` the name that `*` expands
+/// to there.
+fn match_refname_with_pattern(pattern: &[u8], refname: &[u8], replacement: Option<&[u8]>) -> Option<Vec<u8>> {
+    let kstar = pattern.find_byte(b'*')?;
+    let (head, tail) = (&pattern[..kstar], &pattern[kstar + 1..]);
+    if !(refname.starts_with(head) && refname.len() >= head.len() + tail.len() && refname.ends_with(tail)) {
+        return None;
+    }
+    let middle = &refname[head.len()..refname.len() - tail.len()];
+    Some(match replacement.and_then(|r| r.find_byte(b'*').map(|v| (r, v))) {
+        Some((r, vstar)) => [&r[..vstar], middle, &r[vstar + 1..]].concat(),
+        None => Vec::new(),
+    })
+}
+
+/// `remote_find_tracking(remote, &query)` with `query.dst = dst` — true where git
+/// returns 0: `refspec_find_match()` (refspec.c:434-466) over the remote's fetch
+/// refspecs, after `refspec_find_negative_match()` (refspec.c:346-400) has had its
+/// say. A `^` refspec is matched against the *source* the destination maps back
+/// to, which is why the reversal expands every positive refspec first.
+fn remote_find_tracking(repo: &gix::Repository, remote: &str, dst: &BStr) -> bool {
+    use gix::refspec::instruction::Fetch;
+    use gix::refspec::Instruction;
+    let Ok(remote) = repo.find_remote(remote) else {
+        return false;
+    };
+    let needle: &[u8] = dst.as_ref();
+    let is_pattern = |s: &[u8]| s.contains(&b'*');
+    let specs: Vec<Instruction<'_>> = remote
+        .refspecs(gix::remote::Direction::Fetch)
+        .iter()
+        .map(|s| s.to_ref().instruction())
+        .collect();
+
+    // The first loop of `refspec_find_negative_match()`: every positive refspec,
+    // read backwards. Note the non-pattern arm compares the needle with the
+    // *source*, as the C does.
+    let mut reversed: Vec<Vec<u8>> = Vec::new();
+    for spec in &specs {
+        let (src, key): (&[u8], &[u8]) = match spec {
+            Instruction::Fetch(Fetch::Only { src }) => (src.as_ref(), src.as_ref()),
+            Instruction::Fetch(Fetch::AndUpdate { src, dst, .. }) => (src.as_ref(), dst.as_ref()),
+            _ => continue,
+        };
+        if is_pattern(key) {
+            if let Some(expanded) = match_refname_with_pattern(key, needle, Some(src)) {
+                reversed.push(expanded);
+            }
+        } else if needle == src {
+            reversed.push(src.to_vec());
+        }
+    }
+    // `refname_matches_negative_refspec_item()` (refspec.c:335-344).
+    let negative = |name: &[u8]| {
+        specs.iter().any(|spec| match spec {
+            Instruction::Fetch(Fetch::Exclude { src }) => {
+                let src: &[u8] = src.as_ref();
+                match is_pattern(src) {
+                    true => match_refname_with_pattern(src, name, None).is_some(),
+                    false => src == name,
+                }
+            }
+            _ => false,
+        })
+    };
+    if reversed.iter().any(|name| negative(name)) {
+        return false;
+    }
+
+    specs.iter().any(|spec| {
+        let Instruction::Fetch(Fetch::AndUpdate { dst, .. }) = spec else {
+            return false;
+        };
+        let dst: &[u8] = dst.as_ref();
+        match is_pattern(dst) {
+            true => match_refname_with_pattern(dst, needle, None).is_some(),
+            false => dst == needle,
+        }
+    })
+}
+
 /// Raw multi-values of `remote.<name>.<key>` across all config scopes.
 fn effective_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String> {
     let cfg = repo.config_snapshot();
@@ -1197,8 +1299,45 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    for (ref_name, _) in tracking_refs(repo, name)? {
+    // `refs_for_each_ref(…, add_branch_for_removal, …)` (builtin/remote.c:1066-1067,
+    // 573-608): a ref is removed when this remote's fetch refspecs have it as a
+    // destination, no other remote's do, and it lives under `refs/remotes/`; a
+    // `refs/heads/` one that qualifies otherwise is only named in the note below.
+    let others: Vec<String> = repo
+        .remote_names()
+        .iter()
+        .map(|n| n.to_str_lossy().into_owned())
+        .filter(|n| n != name)
+        .collect();
+    let mut skipped: Vec<String> = Vec::new();
+    for ref_name in all_ref_names(repo)? {
+        let full = ref_name.as_bstr();
+        if !remote_find_tracking(repo, name, full) {
+            continue;
+        }
+        // `/* don't delete a branch if another remote also uses it */`
+        if others.iter().any(|other| remote_find_tracking(repo, other, full)) {
+            continue;
+        }
+        if !full.starts_with(b"refs/remotes/") {
+            if full.starts_with(b"refs/heads/") {
+                skipped.push(abbrev_branch(full));
+            }
+            continue;
+        }
         delete_ref(repo, ref_name)?;
+    }
+    if !skipped.is_empty() {
+        eprintln!(
+            "{}",
+            match skipped.len() {
+                1 => "Note: A branch outside the refs/remotes/ hierarchy was not removed;\nto delete it, use:",
+                _ => "Note: Some branches outside the refs/remotes/ hierarchy were not removed;\nto delete them, use:",
+            }
+        );
+        for branch in &skipped {
+            eprintln!("  git branch -d {branch}");
+        }
     }
 
     let (path, mut file) = open_local(repo)?;

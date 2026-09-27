@@ -2444,6 +2444,9 @@ fn refresh(
         if eflags.contains(Flags::SKIP_WORKTREE)
             || (!flags.really && eflags.contains(Flags::ASSUME_VALID))
         {
+            // "the user promised us that the change to the work tree does not matter":
+            // `ce_mark_uptodate(ce)` (read-cache.c:1364-1371), so the write trusts it too.
+            ctx.index.entries_mut()[i].flags.insert(Flags::UPTODATE);
             i += 1;
             continue;
         }
@@ -2510,6 +2513,10 @@ fn refresh(
             }
         }
         if changed == 0 {
+            // `ce_mark_uptodate(ce)` (read-cache.c:1406-1420): the entry was checked —
+            // racily clean ones by content — so `do_write_index()` need not smudge it.
+            // Gitlinks returned above and are never marked.
+            ctx.index.entries_mut()[i].flags.insert(Flags::UPTODATE);
             i += 1;
             continue;
         }
@@ -2532,6 +2539,11 @@ fn refresh(
 
         if up_to_date {
             ctx.index.entries_mut()[i].stat = new_stat;
+            // `fill_stat_cache_info()` (read-cache.c:193-204) marks a regular file
+            // up to date along with the fresh stat data.
+            if meta.is_file() {
+                ctx.index.entries_mut()[i].flags.insert(Flags::UPTODATE);
+            }
             ctx.dirty = true;
         } else if !flags.quiet {
             let kind = if eflags.contains(Flags::INTENT_TO_ADD) {

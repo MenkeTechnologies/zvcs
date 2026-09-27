@@ -297,8 +297,15 @@ pub fn write_split(
     write_locked_inner(repo, index, options, request)
 }
 
-/// git's `write_locked_index()` proper, without the smudge its `do_write_index()` does —
-/// for the one caller, `update-index`, that already resolved every entry it touched.
+/// git's `write_locked_index()` proper for `update-index`, whose caller has already resolved the
+/// index version and the split-index request itself.
+///
+/// The racy-clean smudge still runs: it lives in `do_write_index()` (read-cache.c:2902-2903), under
+/// every caller. Skipping it here was how `update-index --refresh` lost a change —
+/// `has_racy_timestamp()` makes the refresh rewrite the index (builtin/update-index.c:740-750), the
+/// entry it had just reported as modified was written back with its old size, and once that write
+/// landed in a later second the entry no longer looked racy, so `diff-files` called it clean. The
+/// entries the refresh *did* verify carry `UPTODATE` and are not hashed again.
 pub fn write_locked(
     repo: &gix::Repository,
     index: &mut gix::index::File,
@@ -308,6 +315,7 @@ pub fn write_locked(
     let mut options = options;
     resolve_index_version(repo, index, &mut options);
     convert_to_sparse(repo, index);
+    smudge_racily_clean(repo, index);
     write_locked_inner(repo, index, options, request)
 }
 

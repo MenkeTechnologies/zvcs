@@ -321,7 +321,10 @@ impl ThreadSafeRepository {
         let mut filter_config_section = filter_config_section.unwrap_or(config::section::is_trusted);
         let mut config = config::Cache::from_stage_one(
             repo_config,
-            common_dir_ref,
+            // `opts.git_dir = repo_get_git_dir(repo)` (config.c:1685): an `includeIf "gitdir:…"`
+            // is matched against the git directory itself — a linked worktree's own
+            // `worktrees/<name>` — never against the common directory.
+            &git_dir,
             head.as_ref().and_then(|head| head.target.try_name()),
             filter_config_section,
             git_install_dir.as_deref(),

@@ -4323,7 +4323,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
         (_, Some(needle)) => {
             let kind = match pickaxe_regex {
-                true => match super::diff_pairs::compile_regex(needle.as_bytes()) {
+                true => match super::diff_pickaxe::compile_regex_icase(needle.as_bytes(), grep_ignore_case) {
                     Ok(re) => Some(super::diff_pairs::PickaxeKind::Occurrences(
                         super::diff_pairs::Needle::Regex(re),
                     )),
@@ -4332,6 +4332,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         None
                     }
                 },
+                // `-i` is `DIFF_PICKAXE_IGNORE_CASE` for `-S` too.
+                false if grep_ignore_case => Some(super::diff_pairs::PickaxeKind::Occurrences(
+                    super::diff_pairs::Needle::Regex(super::diff_pickaxe::literal_icase(needle.as_bytes())),
+                )),
                 false => Some(super::diff_pairs::PickaxeKind::Occurrences(
                     super::diff_pairs::Needle::Literal(needle.as_bytes().to_vec()),
                 )),

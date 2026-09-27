@@ -94,6 +94,27 @@ pub(crate) fn compile_regex_icase(pat: &[u8], icase: bool) -> std::result::Resul
         })
 }
 
+/// A plain `-S<needle>` under `DIFF_PICKAXE_IGNORE_CASE` (`-i` /
+/// `--regexp-ignore-case`, revision.c:2690-2692). `diffcore_pickaxe()` counts an
+/// ASCII needle with a kwset over `tolower_trans_tbl`, and quotes any other needle
+/// into a basic regex compiled `REG_NEWLINE | REG_ICASE` (diffcore-pickaxe.c:257-272).
+/// Both are a case-insensitive literal count in git's C locale, i.e. ASCII-only
+/// folding, which is what this byte-escaped, non-Unicode pattern matches.
+pub(crate) fn literal_icase(needle: &[u8]) -> Regex {
+    let mut pat = String::with_capacity(needle.len() * 4);
+    for &b in needle {
+        match b {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => pat.push(b as char),
+            _ => pat.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    regex::bytes::RegexBuilder::new(&pat)
+        .unicode(false)
+        .case_insensitive(true)
+        .build()
+        .expect("an escaped literal always compiles")
+}
+
 /// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset
 /// does — `diffcore_count_changes()`'s `contains()` walks forward past each whole
 /// match rather than by one byte, so `aa` occurs once in `aaa`, not twice.

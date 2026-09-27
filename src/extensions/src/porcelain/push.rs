@@ -405,71 +405,6 @@ git push <groupname>\n"
     };
     let typed: Vec<String> = positionals.into_iter().skip(1).collect();
 
-    // `parse_refspec()` (refspec.c) rejects a push refspec whose destination is
-    // present but empty:
-    //
-    // ```c
-    // if (!item->dst)
-    //         ;                       /* no colon at all: dst is the src */
-    // else if (!*item->dst)
-    //         return 0;               /* "src:" — invalid */
-    // ```
-    //
-    // and `refspec_item_init_or_die()` turns that into
-    // `die("invalid refspec '%s'", refspec)`. The one spelling that survives is
-    // `:` (or `+:`) on its own, which the function special-cases above that block
-    // as the *matching* refspec.
-    //
-    // The rest of the push branch of `parse_refspec()` applies too: a refspec
-    // with no destination must have a source that is itself a valid ref name,
-    // so `git push origin ./.remote.git` dies here rather than failing to match.
-    // `--delete <ref>` reaches the same parser as `:<ref>` (`set_refspecs()`,
-    // builtin/push.c:118-121), after its own plain-name refusal.
-    //
-    // Those checks run inside `set_refspecs()` (builtin/push.c:104-138), one
-    // argument at a time, together with its two other refusals:
-    //
-    // ```c
-    // if (!strcmp("tag", ref)) {
-    //         if (nr <= ++i)
-    //                 die(_("tag shorthand without <tag>"));
-    //         ref = refs[i];
-    //         if (deleterefs)
-    //                 refspec_appendf(&rs, ":refs/tags/%s", ref);
-    //         else
-    //                 refspec_appendf(&rs, "refs/tags/%s", ref);
-    // } else if (deleterefs) {
-    //         if (strchr(ref, ':') || !*ref)
-    //                 die(_("--delete only accepts plain target ref names"));
-    //         refspec_appendf(&rs, ":%s", ref);
-    // }
-    // ```
-    //
-    // `tag <name>` becomes `refs/tags/<name>`; under `--delete` the colon is added
-    // later, by the deletion requests, as for every other `--delete` argument.
-    let mut specs: Vec<String> = Vec::with_capacity(typed.len());
-    let mut args = typed.into_iter();
-    while let Some(arg) = args.next() {
-        let spec = match arg.as_str() {
-            "tag" => match args.next() {
-                Some(name) => format!("refs/tags/{name}"),
-                None => crate::git_fatal!("tag shorthand without <tag>"),
-            },
-            _ if f.delete && (arg.contains(':') || arg.is_empty()) => {
-                crate::git_fatal!("--delete only accepts plain target ref names")
-            }
-            _ => arg,
-        };
-        let as_parsed = match f.delete {
-            true => format!(":{spec}"),
-            false => spec.clone(),
-        };
-        if !push_refspec_is_valid(&as_parsed, repo.object_hash().len_in_hex()) {
-            crate::git_fatal!("invalid refspec '{as_parsed}'");
-        }
-        specs.push(spec);
-    }
-
     // Honor the `push.*` config defaults for flags not given explicitly. An
     // explicit command-line flag always wins: git reads config in `git_push_config`
     // before `parse_options`, so the flag's assignment lands after the config's.
@@ -549,39 +484,110 @@ git push <groupname>\n"
         f.auto_upstream = snap.boolean("push.autoSetupRemote") == Some(true);
     }
 
-    // ```c
-    // if (remote->mirror)
-    //         flags |= (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE);
-    // ```
-    //
-    // (`do_push()`, builtin/push.c:425-426.) `remote.<name>.mirror` is `--mirror`
-    // written into the configuration, and it arms the force bit alongside it — a
-    // mirror that could not rewind would not be a mirror. Reading it here, after
-    // the remote name is known and before the refspec defaults are chosen, is
-    // where git reads it: the mirror flag is what keeps `setup_default_push_refspecs()`
-    // from running at all.
-    //
-    // `specs.is_empty()` is this port's limit, not git's. The `--mirror can't be
-    // combined with refspecs` refusal is `cmd_push`'s and tests the *option*, which
-    // is parsed before `do_push()` reads the configuration — so git accepts
-    // `remote.<name>.mirror` beside a refspec and mirrors the deletions alongside
-    // it. This port raises that refusal from the request builder, where the two
-    // spellings are no longer distinguishable, so the configured flag is applied
-    // only where it cannot reach it.
-    if specs.is_empty()
-        && repo
-            .config_snapshot()
-            .boolean(&format!("remote.{remote_name}.mirror"))
-            == Some(true)
-    {
-        f.mirror = true;
-        f.force = true;
-    }
-
     // git validates the push-option list once, after the command line and
     // `push.pushOption` have been reconciled, so a configured value is checked too.
     if f.push_options.iter().any(|o| o.contains('\n')) {
         crate::git_fatal!("push options must not have new line characters");
+    }
+
+    // ```c
+    // if (r->mirror)
+    //         inner_flags |= (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE);
+    //
+    // if (inner_flags & TRANSPORT_PUSH_ALL) {
+    //         if (argc >= 2)
+    //                 die(_("--all can't be combined with refspecs"));
+    // }
+    // if (inner_flags & TRANSPORT_PUSH_MIRROR) {
+    //         if (argc >= 2)
+    //                 die(_("--mirror can't be combined with refspecs"));
+    // }
+    // ```
+    //
+    // (`cmd_push()`, builtin/push.c:805-820.) `remote.<name>.mirror` is `--mirror`
+    // written into the configuration, and it arms the force bit alongside it — a
+    // mirror that could not rewind would not be a mirror. Both refusals test the
+    // positional count, not the refspec list, so they come before `set_refspecs()`
+    // gets to parse (and refuse) a single refspec, and they cover the configured
+    // mirror as well as the option.
+    if repo
+        .config_snapshot()
+        .boolean(&format!("remote.{remote_name}.mirror"))
+        == Some(true)
+    {
+        f.mirror = true;
+        f.force = true;
+    }
+    if f.all && !typed.is_empty() {
+        crate::git_fatal!("--all can't be combined with refspecs");
+    }
+    if f.mirror && !typed.is_empty() {
+        crate::git_fatal!("--mirror can't be combined with refspecs");
+    }
+
+    // `parse_refspec()` (refspec.c) rejects a push refspec whose destination is
+    // present but empty:
+    //
+    // ```c
+    // if (!item->dst)
+    //         ;                       /* no colon at all: dst is the src */
+    // else if (!*item->dst)
+    //         return 0;               /* "src:" — invalid */
+    // ```
+    //
+    // and `refspec_item_init_or_die()` turns that into
+    // `die("invalid refspec '%s'", refspec)`. The one spelling that survives is
+    // `:` (or `+:`) on its own, which the function special-cases above that block
+    // as the *matching* refspec.
+    //
+    // The rest of the push branch of `parse_refspec()` applies too: a refspec
+    // with no destination must have a source that is itself a valid ref name,
+    // so `git push origin ./.remote.git` dies here rather than failing to match.
+    // `--delete <ref>` reaches the same parser as `:<ref>` (`set_refspecs()`,
+    // builtin/push.c:118-121), after its own plain-name refusal.
+    //
+    // Those checks run inside `set_refspecs()` (builtin/push.c:104-138), one
+    // argument at a time, together with its two other refusals:
+    //
+    // ```c
+    // if (!strcmp("tag", ref)) {
+    //         if (nr <= ++i)
+    //                 die(_("tag shorthand without <tag>"));
+    //         ref = refs[i];
+    //         if (deleterefs)
+    //                 refspec_appendf(&rs, ":refs/tags/%s", ref);
+    //         else
+    //                 refspec_appendf(&rs, "refs/tags/%s", ref);
+    // } else if (deleterefs) {
+    //         if (strchr(ref, ':') || !*ref)
+    //                 die(_("--delete only accepts plain target ref names"));
+    //         refspec_appendf(&rs, ":%s", ref);
+    // }
+    // ```
+    //
+    // `tag <name>` becomes `refs/tags/<name>`; under `--delete` the colon is added
+    // later, by the deletion requests, as for every other `--delete` argument.
+    let mut specs: Vec<String> = Vec::with_capacity(typed.len());
+    let mut args = typed.into_iter();
+    while let Some(arg) = args.next() {
+        let spec = match arg.as_str() {
+            "tag" => match args.next() {
+                Some(name) => format!("refs/tags/{name}"),
+                None => crate::git_fatal!("tag shorthand without <tag>"),
+            },
+            _ if f.delete && (arg.contains(':') || arg.is_empty()) => {
+                crate::git_fatal!("--delete only accepts plain target ref names")
+            }
+            _ => arg,
+        };
+        let as_parsed = match f.delete {
+            true => format!(":{spec}"),
+            false => spec.clone(),
+        };
+        if !push_refspec_is_valid(&as_parsed, repo.object_hash().len_in_hex()) {
+            crate::git_fatal!("invalid refspec '{as_parsed}'");
+        }
+        specs.push(spec);
     }
 
     // Not a configured remote, so the name is a URL or a path. Whether that path
@@ -1287,9 +1293,6 @@ fn build_requests(
     // refs this repository no longer has) is synthesized in the wire layer, which
     // is the only place the advertisement exists.
     if f.mirror {
-        if !specs.is_empty() {
-            crate::git_fatal!("--mirror can't be combined with refspecs");
-        }
         for r in repo.references()?.all()? {
             let mut r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();
@@ -1325,9 +1328,6 @@ fn build_requests(
     }
 
     if f.all {
-        if !specs.is_empty() {
-            crate::git_fatal!("--all can't be combined with refspecs");
-        }
         for r in repo.references()?.local_branches()? {
             let r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();

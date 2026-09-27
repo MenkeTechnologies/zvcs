@@ -395,6 +395,10 @@ struct Opts {
     /// so the routed renderer has to flip each reversed creation's status letter —
     /// which `git diff-pairs -R` on its own does not.
     route_reverse: bool,
+    /// `-i` / `--regexp-ignore-case`: `DIFF_PICKAXE_IGNORE_CASE`, set by `setup_revisions()`
+    /// (revision.c:2690-2692) rather than by the diff option table, so it travels to the
+    /// routed renderer in its [`RouteCtx`](super::diff_pairs::RouteCtx), not its argv.
+    pickaxe_icase: bool,
     /// Every `diff_opt_parse` option from the command line, in order — the same list
     /// [`route`](Opts::route) is built from, kept unconditionally because
     /// [`combined_commit`] has to reconstruct git's `opt->output_format` bitmask,
@@ -475,6 +479,7 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
         ignore_submodules: false,
         route: None,
         route_reverse: false,
+        pickaxe_icase: false,
         diff_args: std::rc::Rc::new(Vec::new()),
         line_prefix: Vec::new(),
         pretty: None,
@@ -622,6 +627,10 @@ pub fn diff_tree(args: &[String]) -> Result<ExitCode> {
             }
             match a {
                 "-r" => opts.recurse = true,
+                "-i" | "--regexp-ignore-case" => opts.pickaxe_icase = true,
+                // The grep dialect flags beside it (revision.c:2686-2696) only choose
+                // `grep_filter.pattern_type_option`, which a diff never reads.
+                "-E" | "--extended-regexp" | "-F" | "--fixed-strings" | "-P" | "--perl-regexp" | "--basic-regexp" => {}
                 "-t" => {
                     opts.recurse = true; // -t implies -r
                     opts.show_trees = true;
@@ -1706,6 +1715,15 @@ fn is_diff_tree_option(a: &str) -> bool {
         "--merge-base",
         "--stdin",
         "-v",
+        "-i",
+        "--regexp-ignore-case",
+        "-E",
+        "--extended-regexp",
+        "-F",
+        "--fixed-strings",
+        "-P",
+        "--perl-regexp",
+        "--basic-regexp",
         "--pretty",
         "--format",
         "-h",
@@ -2876,6 +2894,7 @@ fn render_all(
                 // `diff_addremove()` applies as the queue is built, so a reversed
                 // creation is a deletion by the time any format reads its status.
                 queue_time_reverse: opts.route_reverse,
+                pickaxe_icase: opts.pickaxe_icase,
             },
         )?;
         return Ok(status.code());

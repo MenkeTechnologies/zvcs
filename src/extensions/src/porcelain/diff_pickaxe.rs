@@ -41,14 +41,14 @@ use regex::bytes::Regex;
 /// `regex::bytes::Regex` shares the compiled program behind an `Arc`, so a per-worker
 /// copy costs a refcount rather than a recompile.
 #[derive(Clone)]
-pub(super) enum Needle {
+pub(crate) enum Needle {
     Literal(Vec<u8>),
     Regex(Regex),
 }
 
 impl Needle {
     /// Whether `hay` contains a match — used by `-G` on each changed line and by `-I`.
-    pub(super) fn is_match(&self, hay: &[u8]) -> bool {
+    pub(crate) fn is_match(&self, hay: &[u8]) -> bool {
         match self {
             Needle::Literal(n) => contains(hay, n),
             Needle::Regex(re) => re.is_match(hay),
@@ -56,7 +56,7 @@ impl Needle {
     }
 
     /// Non-overlapping match count — used by `-S` to compare the two sides.
-    pub(super) fn count(&self, hay: &[u8]) -> usize {
+    pub(crate) fn count(&self, hay: &[u8]) -> usize {
         match self {
             Needle::Literal(n) => count_occurrences(hay, n),
             Needle::Regex(re) => re.find_iter(hay).count(),
@@ -113,6 +113,22 @@ pub(crate) fn literal_icase(needle: &[u8]) -> Regex {
         .case_insensitive(true)
         .build()
         .expect("an escaped literal always compiles")
+}
+
+/// The needle `diffcore_pickaxe()` (diffcore-pickaxe.c:241-272) builds from `o->pickaxe`:
+/// a `REG_EXTENDED | REG_NEWLINE` regex for `-G` and for `-S --pickaxe-regex`
+/// (`regex`), a literal kwset count for a plain `-S`, and `REG_ICASE` / a
+/// `tolower_trans_tbl` kwset on top of either under `DIFF_PICKAXE_IGNORE_CASE` —
+/// the `-i` / `--regexp-ignore-case` revision option (revision.c:2690-2692).
+///
+/// `Err` is the text of `regcomp_or_die()`'s `die("invalid regex: %s")`. Every diff
+/// verb compiles its needle here, so `-i` means the same thing in all of them.
+pub(crate) fn compile_needle(pat: Vec<u8>, regex: bool, icase: bool) -> std::result::Result<Needle, String> {
+    match (regex, icase) {
+        (true, _) => compile_regex_icase(&pat, icase).map(Needle::Regex),
+        (false, true) => Ok(Needle::Regex(literal_icase(&pat))),
+        (false, false) => Ok(Needle::Literal(pat)),
+    }
 }
 
 /// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset

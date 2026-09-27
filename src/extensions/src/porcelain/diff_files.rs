@@ -437,6 +437,9 @@ struct Opts {
     pickaxe_all: bool,
     /// `--pickaxe-regex`: makes `-S` a regex search rather than a literal count.
     pickaxe_regex: bool,
+    /// `-i` / `--regexp-ignore-case`: `DIFF_PICKAXE_IGNORE_CASE`, set by
+    /// `setup_revisions()` rather than the diff option table (revision.c:2690-2692).
+    pickaxe_icase: bool,
     /// The `DIFF_PICKAXE_KIND_*` bits `diff_setup_done()` tests, accumulated
     /// across the whole command line. Distinct from [`Opts::pickaxe_pending`],
     /// which keeps only the last `-S`/`-G`: the bits are sticky, which is how
@@ -972,6 +975,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         output_file: None,
         pickaxe_all: false,
         pickaxe_regex: false,
+        pickaxe_icase: false,
         pickaxe_kinds: 0,
         stat: StatWidths::plumbing(),
         compact_summary: false,
@@ -1320,14 +1324,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
     // validation, so a bad pattern is `fatal: invalid regex` (128) only once every
     // earlier argument has passed.
     if let Some((kind, raw)) = opts.pickaxe_pending.take() {
-        let needle = if kind == b'S' && !opts.pickaxe_regex {
-            diff_pickaxe::Needle::Literal(raw)
-        } else {
-            match diff_pickaxe::compile_regex(&raw) {
-                Ok(re) => diff_pickaxe::Needle::Regex(re),
-                Err(msg) => return Err(Fatal::InvalidRegexPickaxe(msg)),
-            }
-        };
+        let needle = diff_pickaxe::compile_needle(raw, kind == b'G' || opts.pickaxe_regex, opts.pickaxe_icase)
+            .map_err(Fatal::InvalidRegexPickaxe)?;
         opts.pickaxe = Some(Pickaxe {
             kind: if kind == b'S' {
                 PickaxeKind::Occurrences(needle)
@@ -1580,6 +1578,10 @@ fn classify(
         "--no-color" => opts.color_when = Some(diff_color::ColorWhen::Never),
         "--pickaxe-all" => opts.pickaxe_all = true,
         "--pickaxe-regex" => opts.pickaxe_regex = true,
+        "-i" | "--regexp-ignore-case" => opts.pickaxe_icase = true,
+        // The grep dialect flags beside it (revision.c:2686-2696) only choose
+        // `grep_filter.pattern_type_option`, which a diff never reads.
+        "-E" | "--extended-regexp" | "-F" | "--fixed-strings" | "-P" | "--perl-regexp" | "--basic-regexp" => {}
         "-w" | "--ignore-all-space" => opts.ws = Whitespace::IgnoreAll,
         "-b" | "--ignore-space-change" => opts.ws = Whitespace::IgnoreChange,
         "--ignore-space-at-eol" => opts.ws = Whitespace::IgnoreAtEol,

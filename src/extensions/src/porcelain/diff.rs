@@ -2859,25 +2859,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // A pattern that will not compile is git's `fatal: invalid regex: …` at 128.
     let mut pickaxe = None;
     if let Some((kind, pat)) = pickaxe_arg {
-        if kind == b'S' && !pickaxe_regex {
-            pickaxe = Some(super::diff_pickaxe::Kind::Occurrences(match pickaxe_icase {
-                true => super::diff_pickaxe::Needle::Regex(super::diff_pickaxe::literal_icase(&pat)),
-                false => super::diff_pickaxe::Needle::Literal(pat),
-            }));
-        } else {
-            match super::diff_pickaxe::compile_regex_icase(&pat, pickaxe_icase) {
-                Ok(re) => {
-                    let needle = super::diff_pickaxe::Needle::Regex(re);
-                    pickaxe = Some(if kind == b'S' {
-                        super::diff_pickaxe::Kind::Occurrences(needle)
-                    } else {
-                        super::diff_pickaxe::Kind::Grep(needle)
-                    });
-                }
-                Err(msg) => {
-                    eprintln!("fatal: invalid regex: {msg}");
-                    return Ok(ExitCode::from(128));
-                }
+        match super::diff_pickaxe::compile_needle(pat, kind == b'G' || pickaxe_regex, pickaxe_icase) {
+            Ok(needle) if kind == b'S' => pickaxe = Some(super::diff_pickaxe::Kind::Occurrences(needle)),
+            Ok(needle) => pickaxe = Some(super::diff_pickaxe::Kind::Grep(needle)),
+            Err(msg) => {
+                eprintln!("fatal: invalid regex: {msg}");
+                return Ok(ExitCode::from(128));
             }
         }
     }

@@ -281,6 +281,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // second promotes `-S`'s literal to a regular expression.
     let mut pickaxe_all = false;
     let mut pickaxe_regex = false;
+    // `-i` / `--regexp-ignore-case`: `DIFF_PICKAXE_IGNORE_CASE`, which `setup_revisions()`
+    // sets alongside the grep filter's own ignore-case (revision.c:2690-2692).
+    let mut pickaxe_icase = false;
     // `--line-prefix=<s>` (`diff_line_prefix()`): the string `emit_line_0()` writes
     // in front of every emitted line, header included.
     let mut line_prefix: Vec<u8> = Vec::new();
@@ -628,6 +631,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "--first-parent" => first_parent = true,
             "--pickaxe-all" => pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
+            "-i" | "--regexp-ignore-case" => pickaxe_icase = true,
+            // The grep dialect flags beside it (revision.c:2686-2696) only choose
+            // `grep_filter.pattern_type_option`, which a diff never reads.
+            "-E" | "--extended-regexp" | "-F" | "--fixed-strings" | "-P" | "--perl-regexp" | "--basic-regexp" => {}
             // `diff_merges_parse_opts()` (diff-merges.c:119-151): each spelling
             // selects one of `func_by_opt()`'s modes and raises
             // `revs->explicit_diff_merges`, so the last one on the line wins and
@@ -1891,21 +1898,22 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `REG_EXTENDED | REG_NEWLINE` (diffcore-pickaxe.c:242-246) — not in `--grep`'s
     // dialect — and a failure is only raised once a commit is diffed.
     let mut bad_regex: Option<String> = None;
-    let mut compile = |needle: &str| match super::diff_pickaxe::compile_regex(needle.as_bytes()) {
-        Ok(re) => Some(re),
-        Err(msg) => {
+    let s = pickaxe_s
+        .as_deref()
+        .map(|n| super::diff_pickaxe::compile_needle(n.as_bytes().to_vec(), pickaxe_regex, pickaxe_icase))
+        .transpose()
+        .unwrap_or_else(|msg| {
             bad_regex.get_or_insert(msg);
             None
-        }
-    };
-    let s = match (&pickaxe_s, pickaxe_regex) {
-        (None, _) => None,
-        (Some(needle), false) => {
-            Some(super::diff_pickaxe::Needle::Literal(needle.as_bytes().to_vec()))
-        }
-        (Some(needle), true) => compile(needle).map(super::diff_pickaxe::Needle::Regex),
-    };
-    let g = pickaxe_g.as_deref().and_then(&mut compile);
+        });
+    let g = pickaxe_g
+        .as_deref()
+        .map(|p| super::diff_pickaxe::compile_regex_icase(p.as_bytes(), pickaxe_icase))
+        .transpose()
+        .unwrap_or_else(|msg| {
+            bad_regex.get_or_insert(msg);
+            None
+        });
     let pickaxe = Pickaxe { s, g, all: pickaxe_all, bad_regex };
 
     let mut out: Vec<u8> = Vec::new();

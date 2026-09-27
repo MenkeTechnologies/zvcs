@@ -211,7 +211,6 @@ use gix::diff::blob::{InternedInput, ResourceKind};
 use gix::hash::ObjectId;
 use gix::objs::tree::EntryKind;
 use gix::prelude::ObjectIdExt;
-use regex::bytes::Regex;
 
 use super::{diff_color, Arg, LongOpt};
 use super::diff_files;
@@ -523,31 +522,9 @@ enum Anchor {
     Skip(BString),
 }
 
-/// A search pattern: a literal substring (git's kwset path for a plain `-S`) or a
-/// compiled regular expression (git's `-G` and `-S --pickaxe-regex`, which call
-/// `regcomp` with `REG_EXTENDED | REG_NEWLINE`).
-pub(crate) enum Needle {
-    Literal(Vec<u8>),
-    Regex(Regex),
-}
-
-impl Needle {
-    /// Whether `hay` contains a match — used by `-G` on each changed line.
-    pub(crate) fn is_match(&self, hay: &[u8]) -> bool {
-        match self {
-            Needle::Literal(n) => diff_pickaxe::count_occurrences(hay, n) > 0,
-            Needle::Regex(re) => re.is_match(hay),
-        }
-    }
-
-    /// Non-overlapping match count — used by `-S` to compare the two sides.
-    pub(crate) fn count(&self, hay: &[u8]) -> usize {
-        match self {
-            Needle::Literal(n) => diff_pickaxe::count_occurrences(hay, n),
-            Needle::Regex(re) => re.find_iter(hay).count(),
-        }
-    }
-}
+/// The one pickaxe/`-I` pattern type, [`diff_pickaxe::Needle`], under the name this
+/// module's callers already use.
+pub(crate) use super::diff_pickaxe::Needle;
 
 /// The one `-G`/`-I`/`-S --pickaxe-regex` compiler, [`diff_pickaxe::compile_regex`],
 /// re-exported under the name this module's callers already use.
@@ -990,6 +967,11 @@ pub(crate) struct RouteCtx {
     /// against 2.55.0). A routed `diff-tree` is the first kind, so it says yes here
     /// and its `--stat --compact-summary` annotates a reversed creation `(gone)`.
     pub queue_time_reverse: bool,
+    /// `DIFF_PICKAXE_IGNORE_CASE`. It is not one of `add_diff_options()`'s: the caller's
+    /// `setup_revisions()` sets it from `-i` / `--regexp-ignore-case`
+    /// (revision.c:2690-2692), which is why `git diff-pairs -i` is an unknown switch
+    /// while a routed `diff-tree -i -S<s>` folds case.
+    pub pickaxe_icase: bool,
 }
 
 pub(crate) fn render_raw_stream(
@@ -1847,6 +1829,7 @@ pub(crate) fn render_raw_stream(
         find_object_args,
         pickaxe_all,
         pickaxe_regex,
+        route.pickaxe_icase,
     ) {
         Ok(p) => p,
         Err(msg) => {
@@ -2209,6 +2192,7 @@ fn finalize_pickaxe(
     find_object_args: Vec<String>,
     all: bool,
     regex: bool,
+    icase: bool,
 ) -> std::result::Result<Option<Pickaxe>, String> {
     if !find_object_args.is_empty() {
         let mut ids = Vec::new();
@@ -2226,20 +2210,11 @@ fn finalize_pickaxe(
     let Some((which, pat)) = pending else {
         return Ok(None);
     };
+    let needle = diff_pickaxe::compile_needle(pat, which == b'G' || regex, icase)
+        .map_err(|e| format!("fatal: invalid regex: {e}"))?;
     let kind = match which {
-        b'G' => {
-            let re = compile_regex(&pat).map_err(|e| format!("fatal: invalid regex: {e}"))?;
-            PickaxeKind::Grep(Needle::Regex(re))
-        }
-        _ => {
-            let needle = if regex {
-                let re = compile_regex(&pat).map_err(|e| format!("fatal: invalid regex: {e}"))?;
-                Needle::Regex(re)
-            } else {
-                Needle::Literal(pat)
-            };
-            PickaxeKind::Occurrences(needle)
-        }
+        b'G' => PickaxeKind::Grep(needle),
+        _ => PickaxeKind::Occurrences(needle),
     };
     Ok(Some(Pickaxe { kind, all }))
 }

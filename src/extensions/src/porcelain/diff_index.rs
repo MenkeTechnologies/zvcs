@@ -793,6 +793,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     // its argv position, as git's inline `regcomp` does.
     let mut ignore_arg: Option<(usize, Vec<u8>)> = None;
     let mut pickaxe_regex = false;
+    // `-i` / `--regexp-ignore-case`: a revision option, not a diff one — `setup_revisions()`
+    // sets `DIFF_PICKAXE_IGNORE_CASE` from it (revision.c:2690-2692).
+    let mut pickaxe_icase = false;
     // Positionals given before a `--` separator, paired with their argv index. git's
     // `setup_revisions` resolves each against the object database; the first that
     // resolves is the tree-ish and the rest are extra revisions or pathspecs (see the
@@ -1091,6 +1094,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "--no-renames" => opts.rename.detect_rename = 0,
             "--pickaxe-all" => opts.pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
+            "-i" | "--regexp-ignore-case" => pickaxe_icase = true,
+            // The grep dialect flags beside it (revision.c:2686-2696) only choose
+            // `grep_filter.pattern_type_option`, which a diff never reads.
+            "-E" | "--extended-regexp" | "-F" | "--fixed-strings" | "-P" | "--perl-regexp" | "--basic-regexp" => {}
             // `diff_opt_dirstat()`: `--cumulative` and `--dirstat-by-file` are spelled
             // as parameter lists, and every spelling also turns the format on.
             "--dirstat" | "-X" => dirstat!(""),
@@ -1682,21 +1689,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // always a regex. A regex that fails to compile is git's
         // `fatal: invalid regex: …` (exit 128), deferred to after the tree-ish just as
         // git compiles it inside `diffcore_pickaxe`.
-        if kind == b'S' && !pickaxe_regex {
-            opts.pickaxe = Some(diff_pickaxe::Kind::Occurrences(diff_pickaxe::Needle::Literal(pat)));
-        } else {
-            match diff_pickaxe::compile_regex(&pat) {
-                Ok(re) => {
-                    let needle = diff_pickaxe::Needle::Regex(re);
-                    opts.pickaxe = Some(if kind == b'S' {
-                        diff_pickaxe::Kind::Occurrences(needle)
-                    } else {
-                        diff_pickaxe::Kind::Grep(needle)
-                    });
-                }
-                Err(msg) => {
-                    bad_regex.get_or_insert_with(|| format!("fatal: invalid regex: {msg}\n").into_bytes());
-                }
+        match diff_pickaxe::compile_needle(pat, kind == b'G' || pickaxe_regex, pickaxe_icase) {
+            Ok(needle) if kind == b'S' => opts.pickaxe = Some(diff_pickaxe::Kind::Occurrences(needle)),
+            Ok(needle) => opts.pickaxe = Some(diff_pickaxe::Kind::Grep(needle)),
+            Err(msg) => {
+                bad_regex.get_or_insert_with(|| format!("fatal: invalid regex: {msg}\n").into_bytes());
             }
         }
     }

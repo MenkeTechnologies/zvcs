@@ -1781,15 +1781,30 @@ pub fn dubious_ownership(sub: &str, args: &[String]) -> Option<ExitCode> {
         return None;
     }
     let path = work_tree.unwrap_or(git_dir);
-    let shown = path.display().to_string();
-    eprintln!(
-        "fatal: detected dubious ownership in repository at '{shown}'\n\
+    eprintln!("fatal: {}", dubious_ownership_message(&path.display().to_string()));
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
+/// The text of git's ownership refusal for `path`, without the `fatal: `.
+fn dubious_ownership_message(path: &str) -> String {
+    format!(
+        "detected dubious ownership in repository at '{path}'\n\
          To add an exception for this directory, call:\n\
          \n\
          \tgit config --global --add safe.directory {}",
-        sq_quote_pretty(&shown)
-    );
-    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+        sq_quote_pretty(path)
+    )
+}
+
+/// `die_upon_dubious_ownership()` (setup.c:1437-1456): the refusal to `die()`
+/// with, or `None` when `ensure_valid_ownership()` accepts the repository. The
+/// message names `gitfile` when there is one and `gitdir` otherwise, as given.
+pub(crate) fn die_upon_dubious_ownership(gitfile: Option<&Path>, worktree: Option<&Path>, gitdir: &Path) -> Option<String> {
+    if ensure_valid_ownership(gitfile, worktree, gitdir) {
+        return None;
+    }
+    let path = gitfile.unwrap_or(gitdir);
+    Some(dubious_ownership_message(&path.display().to_string()))
 }
 
 /// The directory `setup_git_directory_gently_1()` was standing in when it found

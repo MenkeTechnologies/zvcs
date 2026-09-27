@@ -3659,6 +3659,18 @@ fn local_path_of(url: &gix::Url) -> Option<PathBuf> {
 /// `fatal: bad object HEAD`, and `git submodule add ./sub other` failed in the
 /// checkout that followed. `get_common_dir` is the second half — a source that is
 /// itself a linked worktree keeps its objects in the common directory.
+/// `src_repo` itself — the repository directory `get_repo_path()` resolved
+/// the source to, absolute, which is what `copy_or_link_directory()` checks the
+/// ownership of and names in its refusal.
+fn local_source_repo(source: &Path) -> PathBuf {
+    let dir = match gix::open(source) {
+        Ok(repo) => repo.git_dir().to_owned(),
+        Err(_) if source.join(".git").is_dir() => source.join(".git"),
+        Err(_) => source.to_owned(),
+    };
+    std::fs::canonicalize(&dir).unwrap_or(dir)
+}
+
 fn local_source_objects(source: &Path) -> PathBuf {
     match gix::open(source) {
         Ok(repo) => repo.common_dir().join("objects"),
@@ -4112,6 +4124,20 @@ fn adopt_local_objects(source: &Path, git_dir: &Path, hardlinks: bool) -> Result
     let src_objects = local_source_objects(source);
     if !src_objects.is_dir() {
         return Ok(());
+    }
+    // ```c
+    // /*
+    //  * Refuse copying directories by default which aren't owned by us. …
+    //  */
+    // die_upon_dubious_ownership(NULL, NULL, src_repo);
+    // ```
+    //
+    // (builtin/clone.c:253-265, `copy_or_link_directory()`.) Copying or
+    // hardlinking another user's object store is refused before anything is
+    // made, unless `safe.directory` names it.
+    let src_repo = local_source_repo(source);
+    if let Some(message) = crate::setup::die_upon_dubious_ownership(None, None, &src_repo) {
+        crate::git_fatal!("{message}");
     }
     let dst_objects = git_dir.join("objects");
 

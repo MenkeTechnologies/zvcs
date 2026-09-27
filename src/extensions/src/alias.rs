@@ -182,8 +182,8 @@ fn loop_detected(cmd_list: &[String], repeated: usize) -> String {
 }
 
 /// Port of `alias_lookup`/`config_alias_cb` (alias.c): find the alias body for
-/// `name` in the repository's resolved config (all scopes), or `None` when unset
-/// or outside a repository.
+/// `name` in the resolved config (all scopes, the repository's when there is
+/// one), or `None` when unset.
 ///
 /// git accepts two spellings and this scans for both, last match winning as its
 /// config callback does:
@@ -198,11 +198,21 @@ fn loop_detected(cmd_list: &[String], repeated: usize) -> String {
 /// key inside a subsection falls back to the first form, which is what keeps
 /// `alias.foo.bar` working after the parser has split it.
 fn lookup(name: &str) -> Option<String> {
+    // `alias_lookup()` reads the configuration through `read_early_config()`
+    // (alias.c), which discovers a repository gently and reads the system, global
+    // and command-line scopes whether or not one is found — so an alias from
+    // `~/.gitconfig` works outside every repository.
+    match crate::setup::discover() {
+        Ok(repo) => lookup_in(repo.config_snapshot().plumbing(), name),
+        Err(_) => lookup_in(&crate::config::global_config(), name),
+    }
+}
+
+/// [`lookup`] over one merged configuration.
+fn lookup_in(config: &gix::config::File, name: &str) -> Option<String> {
     use gix::bstr::ByteSlice;
 
-    let repo = crate::setup::discover().ok()?;
-    let snapshot = repo.config_snapshot();
-    let sections = snapshot.plumbing().sections_by_name("alias")?;
+    let sections = config.sections_by_name("alias")?;
 
     let mut found: Option<String> = None;
     for section in sections {

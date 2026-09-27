@@ -417,6 +417,16 @@ fn push(st: &State) -> Result<ExitCode> {
     if outcome.no_refs {
         return Ok(ExitCode::from(128));
     }
+    // `if (match_push_refs(...)) { ret = -1; goto cleanup; }` (send-pack.c:309-312),
+    // after the `error()`s the match raised; `run_builtin()` masks the -1 to 255.
+    if outcome.match_failed {
+        for s in &outcome.statuses {
+            if let Err(reason) = &s.result {
+                eprintln!("error: {reason}");
+            }
+        }
+        return Ok(ExitCode::from(255));
+    }
 
     if st.helper_status {
         print_helper_status(&outcome);

@@ -420,6 +420,11 @@ pub struct Outcome {
     /// push) with this exit status. Nothing was sent and there is no status to
     /// print; the caller has already said what went wrong.
     pub aborted: Option<std::process::ExitCode>,
+    /// `match_push_refs()` failed (`transport_push()`, transport.c:1466-1467): a
+    /// refspec could not be matched against the advertisement, so neither the
+    /// hook nor the upload ran. [`statuses`][Self::statuses] holds only the
+    /// `error()`s the match raised, in the order it raised them.
+    pub match_failed: bool,
 }
 
 /// One line of the `pre-push` hook's stdin, `<local ref> <local oid> <remote
@@ -1006,6 +1011,27 @@ pub fn send_pack(
     remote_refs_order(&mut statuses, &advertised_order, &created);
     wire.sort_by_cached_key(|w| remote_refs_position(&advertised_order, &created, &w.name));
 
+    // ```c
+    // if (match_push_refs(local_refs, &remote_refs, rs, match_flags))
+    //         goto done;
+    // ```
+    //
+    // (`transport_push()`, transport.c:1466-1467.) A refspec the match refused —
+    // a deletion of a ref the remote does not have — fails the whole push before
+    // the hook, the upload or any status block; the other refspecs are not sent.
+    if statuses.iter().any(|s| s.pre_transport) {
+        statuses.retain(|s| s.pre_transport);
+        return Ok(Outcome {
+            url,
+            statuses,
+            advertised: advertised_order,
+            unpack: Ok(()),
+            no_refs: false,
+            aborted: None,
+            match_failed: true,
+        });
+    }
+
     // `transport_push()` runs the `pre-push` hook here: after
     // `set_ref_status_for_push()` has decided every ref and before `push_refs()`
     // — so ahead of `send_pack()`'s own refusals below (transport.c:1475-1481).
@@ -1020,6 +1046,7 @@ pub fn send_pack(
                 unpack: Ok(()),
                 no_refs: false,
                 aborted: Some(code),
+                match_failed: false,
             });
         }
     }
@@ -1049,6 +1076,7 @@ pub fn send_pack(
             unpack: Ok(()),
             no_refs: true,
             aborted: None,
+            match_failed: false,
         });
     }
 
@@ -1273,6 +1301,7 @@ pub fn send_pack(
                 unpack: Ok(()),
                 no_refs: false,
                 aborted: None,
+                match_failed: false,
             });
         }
     }
@@ -1304,6 +1333,7 @@ pub fn send_pack(
             unpack: Ok(()),
             no_refs: false,
             aborted: None,
+            match_failed: false,
         });
     }
 
@@ -1317,6 +1347,7 @@ pub fn send_pack(
             unpack: Ok(()),
             no_refs: false,
             aborted: None,
+            match_failed: false,
         });
     }
 
@@ -1581,6 +1612,7 @@ pub fn send_pack(
         unpack,
         no_refs: false,
         aborted: None,
+        match_failed: false,
     })
 }
 

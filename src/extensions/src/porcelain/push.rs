@@ -986,6 +986,17 @@ git push <groupname>\n"
     if let Some(code) = outcome.aborted {
         return Ok(code);
     }
+    // `match_push_refs()` failed: its `error()`s, then `push_with_options()`'s
+    // summary (builtin/push.c:393-394). No status block, no `Done`.
+    if outcome.match_failed {
+        for s in &outcome.statuses {
+            if let Err(reason) = &s.result {
+                eprintln!("error: {reason}");
+            }
+        }
+        eprintln!("error: failed to push some refs to '{transport_url}'");
+        return Ok(ExitCode::from(1));
+    }
     // `git_transport_push()` ORs in `finish_connect()` (transport.c:957), and the receive-pack
     // that `send_pack()` left without a command list died, so `push_with_options()` reports
     // the failure (builtin/push.c:393-394). With no refs there is no status block, no

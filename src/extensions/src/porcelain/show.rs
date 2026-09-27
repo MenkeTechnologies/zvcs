@@ -2586,10 +2586,18 @@ fn show_one(
     line_log_pairs: Option<&[(line_log::Pair, Vec<line_log::Range>)]>,
 ) -> Result<()> {
     let mut obj = repo.find_object(id)?;
+    // `cmd_show()` writes a blob, a tree and a tag's own lines straight to stdout
+    // (`stream_blob_to_fd()`, `fprintf()`, `show_tag_object()`'s `fwrite()`,
+    // builtin/log.c:614-639, 708-743), so `--line-prefix` — which only
+    // `diff_line_prefix()` and `show_log()` apply — never reaches them. Only a
+    // commit's record is prefixed.
+    let exempt = |start: usize, out: &Vec<u8>| disp.no_prefix.borrow_mut().push((start, out.len()));
     loop {
+        let start = out.len();
         match obj.kind {
             Kind::Blob => {
                 out.extend_from_slice(&obj.data);
+                exempt(start, out);
                 break;
             }
             Kind::Tree => {
@@ -2602,6 +2610,7 @@ fn show_one(
                     out.push(b'\n');
                 }
                 show_tree(out, &obj, spec)?;
+                exempt(start, out);
                 *shown_one = true;
                 break;
             }
@@ -2623,6 +2632,7 @@ fn show_one(
             }
             Kind::Tag => {
                 let target = show_tag(out, &obj, pretty, disp, shown_one)?;
+                exempt(start, out);
                 obj = repo.find_object(target)?;
             }
         }

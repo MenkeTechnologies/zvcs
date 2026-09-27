@@ -1441,6 +1441,7 @@ fn emit_commit_header(
         &super::log::DateMode::Default,
         &parents,
         None,
+        ">",
     )?;
     let empty_format = user_format && body.is_empty();
     if !body.is_empty() {

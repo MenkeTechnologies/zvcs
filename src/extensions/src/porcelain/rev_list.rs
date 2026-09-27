@@ -3582,9 +3582,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             }
             if let Some(p) = &pretty {
                 let object = repo.find_object(*id)?;
+                // `%m` is `get_revision_mark(NULL, commit)` (revision.c:4716-4734):
+                // the `!revs` arm names the side whatever `--left-right` says.
+                // The `!revs` arm is the `left_right` one.
+                let mark = std::str::from_utf8(revision_mark(
+                    *is_boundary,
+                    left.contains(id),
+                    patch_same.contains(id),
+                    true,
+                    false,
+                ))
+                .expect("an ASCII mark");
                 let shown_parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
-                let body =
-                    rev_list_pretty_body(&repo, &object.into_commit(), p, &date_mode, shown_parents, Some(0))?;
+                let body = rev_list_pretty_body(
+                    &repo,
+                    &object.into_commit(),
+                    p,
+                    &date_mode,
+                    shown_parents,
+                    Some(0),
+                    mark,
+                )?;
                 if !body.is_empty() {
                     out.extend_from_slice(&body);
                     out.push(hdr_term);

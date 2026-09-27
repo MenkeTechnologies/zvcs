@@ -3577,7 +3577,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // an `A...B` is everything reachable from the endpoints pended with `SYMMETRIC_LEFT`; git
     // paints the flag down the ancestry, and the merge-base exclusion has already removed the
     // commits both sides share, so membership is unambiguous.
-    if left_right || cherry_mark || cherry_pick || left_only || right_only {
+    //
+    // The flag is there whether or not anything asked to see it: `%m` reads it
+    // through `get_revision_mark(NULL, commit)`, whose `!revs` arm reports the side
+    // without `--left-right` (revision.c:4716-4734).
+    let any_left = tip_left.iter().any(|left| *left);
+    if any_left || left_right || cherry_mark || cherry_pick || left_only || right_only {
         let left_tips: Vec<ObjectId> = tips
             .iter()
             .zip(tip_left.iter())
@@ -11470,6 +11475,7 @@ pub(crate) fn rev_list_pretty_body(
     date_mode: &DateMode,
     parents: &[ObjectId],
     expand_tabs: Option<usize>,
+    revision_mark: &'static str,
 ) -> Result<Vec<u8>> {
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
@@ -11497,7 +11503,9 @@ pub(crate) fn rev_list_pretty_body(
         notes_shown: false,
         repo,
         mark: "",
-        revision_mark: ">",
+        // `%m`: `get_revision_mark(NULL, commit)`, which the caller answers from
+        // the commit's flags.
+        revision_mark,
         // `%P` / `%p` read `commit->parents` (pretty.c's `'P'` and `'p'` arms) —
         // the commit's own parent list. The caller passes the list it would print
         // for `--parents`, so a pathspec-simplified walk renders the rewritten

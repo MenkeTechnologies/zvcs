@@ -3186,9 +3186,13 @@ fn index_differs_from_reference(
     };
     let flatten = |idx: &gix::index::File| -> Vec<(BString, Option<EntryMode>, ObjectId)> {
         let backing = idx.path_backing();
+        // An intent-to-add entry is invisible to the index side of the
+        // comparison: `wt_status_collect_changes_index()` runs its diff-index
+        // with `ita_invisible_in_index = 1` (wt-status.c:677).
         idx.entries()
             .iter()
             .filter(|e| e.stage() == Stage::Unconflicted)
+            .filter(|e| !e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD))
             .map(|e| (e.path_in(backing).to_owned(), e.mode.to_tree_entry_mode(), e.id))
             .collect()
     };

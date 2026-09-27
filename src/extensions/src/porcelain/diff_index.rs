@@ -236,7 +236,9 @@
 //!   cases) can match differently, and an *invalid* pattern's fatal carries a different
 //!   message tail: `-I` reproduces git's `error: invalid regex given to -I: '<pat>'`
 //!   (exit 129) byte for byte, but `-G`/`-S` keep git's `fatal: invalid regex: ` prefix
-//!   and exit 128 while the tail is the `regex` crate's message rather than `regerror`'s.
+//!   and exit 128, and the tail is macOS `regerror()`'s wording for the unbalanced
+//!   bracket/parenthesis/brace and trailing-backslash errors
+//!   ([`super::diff_pickaxe::compile_regex`]) and the `regex` crate's message otherwise.
 //! * A locally modified but committed-clean submodule is reported as unchanged; git also
 //!   inspects the submodule worktree and would report it.
 //! * With a bare `--abbrev` and no `core.abbrev` set, the length comes from gitoxide's
@@ -846,8 +848,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     let mut find_object_args: Vec<(usize, String)> = Vec::new();
     // A `-G`/`-S --pickaxe-regex` pattern that failed to compile. git compiles these in
     // `diffcore_pickaxe`, after the tree-ish is resolved, and dies with
-    // `fatal: invalid regex: <msg>` (exit 128); the message tail comes from the platform
-    // regex engine, so only the prefix and exit code are reproduced byte for byte here.
+    // `fatal: invalid regex: <msg>` (exit 128); the message tail is whatever
+    // [`diff_pickaxe::compile_regex`] reproduces of the platform `regerror()` text.
     let mut bad_regex: Option<Vec<u8>> = None;
     // The first option whose *value* git rejects during its single left-to-right parse,
     // as `(argv index, exit code, exact stderr bytes)`. git validates such values inline

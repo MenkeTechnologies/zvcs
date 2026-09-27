@@ -549,23 +549,9 @@ impl Needle {
     }
 }
 
-/// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
-/// bytes, without Unicode mode so the byte semantics carry git's C locale, and with
-/// multi-line mode standing in for `REG_NEWLINE`.
-pub(crate) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
-    let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
-    regex::bytes::RegexBuilder::new(s)
-        .unicode(false)
-        .multi_line(true)
-        .build()
-        // `diffcore_pickaxe()` dies with the platform `regerror()` text, which
-        // [`super::line_log::ere_syntax_error`] reproduces for the syntax errors
-        // that have a stable wording — the pickaxe compiles with `REG_EXTENDED`.
-        .map_err(|e| match super::line_log::ere_syntax_error(s) {
-            Some(text) => text.to_owned(),
-            None => e.to_string(),
-        })
-}
+/// The one `-G`/`-I`/`-S --pickaxe-regex` compiler, [`diff_pickaxe::compile_regex`],
+/// re-exported under the name this module's callers already use.
+pub(crate) use super::diff_pickaxe::compile_regex;
 
 fn matches_any(pats: &[Needle], line: &[u8]) -> bool {
     pats.iter().any(|p| p.is_match(line))

@@ -67,15 +67,23 @@ impl Needle {
 /// Compile a `-G`/`-I`/`-S --pickaxe-regex` pattern the way git's `regcomp` does: on
 /// bytes, without Unicode mode so `.` and the character classes carry git's C-locale
 /// byte semantics, and with multi-line mode standing in for `REG_NEWLINE` since
-/// matching is done a line at a time. `Err` carries the engine's message for the
-/// (best-effort) fatal.
-pub(super) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
+/// matching is done a line at a time.
+///
+/// `Err` carries the text `regcomp_or_die()` (diffcore-pickaxe.c:219-228) hands to
+/// `die("invalid regex: %s")`: the platform `regerror()` wording, which
+/// [`super::line_log::ere_syntax_error`] reproduces for the syntax errors that have a
+/// stable one — every caller compiles with `REG_EXTENDED` — and the engine's own
+/// message for anything else.
+pub(crate) fn compile_regex(pat: &[u8]) -> std::result::Result<Regex, String> {
     let s = std::str::from_utf8(pat).map_err(|_| "invalid byte sequence in pattern".to_owned())?;
     regex::bytes::RegexBuilder::new(s)
         .unicode(false)
         .multi_line(true)
         .build()
-        .map_err(|e| e.to_string())
+        .map_err(|e| match super::line_log::ere_syntax_error(s) {
+            Some(text) => text.to_owned(),
+            None => e.to_string(),
+        })
 }
 
 /// Occurrences of `needle` in `haystack`, counted without overlap, as git's kwset

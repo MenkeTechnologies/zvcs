@@ -702,7 +702,7 @@ enum Fatal {
     PickaxeAllObjfind,
     /// `fatal: invalid regex: <msg>`, exit 128. git compiles the `-G`/`-S --pickaxe-regex`
     /// pattern in `diffcore_pickaxe` setup, after argument validation; the message tail
-    /// is the `regex` crate's rather than the platform `regerror`'s.
+    /// is what [`diff_pickaxe::compile_regex`] reproduces of the platform `regerror()`.
     InvalidRegexPickaxe(String),
     /// `error: invalid regex given to -I: '<pat>'`, exit 129. `diff_opt_ignore_regex`
     /// compiles inline, so this fires at the flag's own argv position.

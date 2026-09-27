@@ -41,7 +41,8 @@ use gix::refs::FullName;
 /// is resolved through the same lookup `lock` uses, the main worktree is refused, and a
 /// locked one needs `-f -f` for either. `add` and `move` also put their destination
 /// through `check_candidate_path()`: a missing but registered path needs `-f` (`-f -f`
-/// when locked), which deletes the stale registration first. `remove` additionally runs
+/// when locked), which deletes the stale registration first. Both refuse a worktree
+/// holding a submodule (`validate_no_submodules()`; `remove --force` skips it). `remove` additionally runs
 /// `check_clean_worktree()`'s question — does `status` have anything to say, tracked or
 /// untracked? — and refuses without `--force`; it then deletes the checkout before the
 /// administrative directory, so an interrupted removal leaves a prunable entry rather
@@ -3537,6 +3538,11 @@ fn remove(args: &[String]) -> Result<ExitCode> {
     // (`WT_VALIDATE_WORKTREE_MISSING_OK`) skips straight to the bookkeeping.
     if wt.path.exists() {
         if force == 0 {
+            // `check_clean_worktree()` starts with `validate_no_submodules()`
+            // (builtin/worktree.c:1336): "all submodules are \"dirty\"".
+            if let Some(code) = validate_no_submodules(&repo, wt) {
+                return Ok(code);
+            }
             if let Some(dirty) = worktree_is_dirty(&wt.path)? {
                 if dirty {
                     return die(&format!(
@@ -3567,6 +3573,36 @@ fn remove(args: &[String]) -> Result<ExitCode> {
     // any worktree existed. `rmdir` fails harmlessly while other worktrees remain.
     let _ = std::fs::remove_dir(&worktrees_dir);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Port of `validate_no_submodules()` (builtin/worktree.c:1203-1242): `move`, and `remove`
+/// through `check_clean_worktree()`, refuse a worktree that holds a submodule. It does if its
+/// administrative directory has a `modules/` (a submodule's absorbed git directory), or if
+/// its index names a gitlink whose checkout is populated — `is_submodule_populated_gently()`
+/// (submodule.c:295-305), i.e. `<wt>/<path>/.git` resolves through
+/// `resolve_gitdir_gently()` as a git directory or a valid gitfile. `Some` is the refusal.
+fn validate_no_submodules(repo: &gix::Repository, wt: &Wt) -> Option<ExitCode> {
+    let admin = repo.common_dir().join("worktrees").join(wt.id.as_deref()?);
+    let found = admin.join("modules").is_dir()
+        || gix::index::File::at(
+            admin.join("index"),
+            repo.object_hash(),
+            false,
+            gix::index::decode::Options::default(),
+        )
+        .is_ok_and(|index| {
+            index.entries().iter().any(|e| {
+                if e.mode != gix::index::entry::Mode::COMMIT {
+                    return false;
+                }
+                let dotgit = wt.path.join(gix::path::from_bstr(e.path(&index))).join(".git");
+                is_git_dir(&dotgit) || read_gitfile(&dotgit).is_ok()
+            })
+        });
+    found.then(|| {
+        eprintln!("fatal: working trees containing submodules cannot be moved or removed");
+        ExitCode::from(128)
+    })
 }
 
 /// `git worktree move <worktree> <new-path>` — port of `move_worktree()`.
@@ -3628,6 +3664,9 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
     if let Some(code) =
         check_candidate_path(repo.common_dir(), &worktrees, &dest, &path_to_string(&dest), force, "move")
     {
+        return Ok(code);
+    }
+    if let Some(code) = validate_no_submodules(&repo, wt) {
         return Ok(code);
     }
 

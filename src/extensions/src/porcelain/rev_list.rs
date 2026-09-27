@@ -2278,6 +2278,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             super::log::reflog_walk(&repo, &reflog_names)?
         };
         commits = nodes.iter().map(|n| n.id).collect();
+        // `get_revision_1()` takes each commit from `next_reflog_entry()` and only
+        // runs `try_to_simplify_commit()` on it (revision.c:4385-4420), never
+        // following a parent: every entry is walked. The reachability passes below
+        // that re-derive "what the simplified parents still reach" start from
+        // `tips`, so every entry is one — a merge's side parent outside the reflog
+        // must not cut the walk short.
+        tips = commits.clone();
+        dedup_in_place(&mut tips);
         // A commit pended UNINTERESTING *before* `-g` was read is not refused;
         // it makes the walk limited (revision.c:431-435), `limit_list()` paints
         // everything it reaches, and `get_commit_action()` ignores those as the

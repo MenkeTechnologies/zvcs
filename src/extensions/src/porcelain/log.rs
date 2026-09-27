@@ -4038,8 +4038,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
         // Whatever the simplified parent lists no longer reach was never walked
         // by git in the first place, so it cannot appear in the output.
+        //
+        // A reflog walk is the exception: `get_revision_1()` takes each commit
+        // from `next_reflog_entry()` and only runs `try_to_simplify_commit()` on
+        // it (revision.c:4385-4420), never following a parent. Every entry is
+        // walked, so reachability over the simplified parents — which a merge's
+        // side parents outside the reflog would cut short — does not apply.
         let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(nodes.len());
-        let mut stack: Vec<ObjectId> = tips.clone();
+        let mut stack: Vec<ObjectId> = match walk_reflogs {
+            true => nodes.iter().map(|n| n.id).collect(),
+            false => tips.clone(),
+        };
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) {
                 continue;

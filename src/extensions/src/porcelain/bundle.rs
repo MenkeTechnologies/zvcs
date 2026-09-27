@@ -18,7 +18,8 @@
 //!     `The bundle records a complete history.` /
 //!     `The bundle uses this hash algorithm: …` / `The bundle uses this filter: …`
 //!     report on stdout and the
-//!     `<file> is okay` line on stderr, including all three failure paths
+//!     `<file> is okay` line on stderr — the report held in the stdio
+//!     buffer, so captured together the `is okay` line comes first, including all three failure paths
 //!     (`could not open`, `does not look like a v2 or v3 bundle file`,
 //!     `Repository lacks these prerequisite commits:`) and the
 //!     not-connected-to-history diagnostic
@@ -552,6 +553,11 @@ fn verify(args: &[String]) -> Result<ExitCode> {
     let Some(file) = file else {
         return Ok(need_file(VERIFY_USAGE));
     };
+    // `verify_bundle()` prints its verbose block with `printf_ln()` into stdio's
+    // stdout buffer (bundle.c:265-286) and `cmd_bundle_verify()` then writes
+    // `<file> is okay` with `fprintf(stderr, …)` (builtin/bundle.c:161), so off
+    // a terminal the listing reaches the fd at `exit()`, after that line.
+    crate::cstdio::defer();
     let header = match read_header(file) {
         Ok(h) => h,
         Err(e) => return report(file, e),
@@ -615,7 +621,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
                 format!("The bundle uses this filter: {filter}\n").as_bytes(),
             );
         }
-        io::stdout().write_all(&out)?;
+        crate::cstdio::write_bytes_io(&out)?;
     }
 
     if !ok {

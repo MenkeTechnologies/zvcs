@@ -553,7 +553,7 @@ enum Order {
 /// `int flags = 0` — so an argv `--not` written before `--stdin` does not reach
 /// the stdin lines, and a `--not` among them does not reach the argv that follows.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Origin {
+pub(super) enum Origin {
     Argv,
     /// A `--stdin` line read before any `--end-of-options`.
     Stdin,
@@ -564,6 +564,52 @@ enum Origin {
     StdinEnd(bool),
 }
 
+/// `read_revisions_from_stdin()` (`revision.c:2937-2983`), up to the point where
+/// each line is handed on: the revision lines in order — each with whether it came
+/// after the block's own `--end-of-options`, past which nothing is an option — and
+/// the pathspecs a `--` line turns the rest of the input into.
+///
+/// `rev-list` and `log` splice the lines into their argument scan at the `--stdin`
+/// position, because git reads them from inside `setup_revisions()`'s loop.
+pub(super) fn read_revisions_from_stdin() -> Result<(Vec<(String, bool)>, Vec<Vec<u8>>)> {
+    // Bytes, not text: the lines are whatever `strbuf_getline()` hands back, and a
+    // stray non-UTF-8 byte is a bad revision, not a read error.
+    let mut text = Vec::new();
+    std::io::stdin().read_to_end(&mut text)?;
+    let mut lines: Vec<(String, bool)> = Vec::new();
+    let mut pathspecs: Vec<Vec<u8>> = Vec::new();
+    let mut seen_end_of_options = false;
+    // `strbuf_getline()` strips the LF and then one CR of its own.
+    let mut rest = text.lines_with_terminator().map(|l| {
+        let l = l.strip_suffix(b"\n").unwrap_or(l);
+        l.strip_suffix(b"\r").unwrap_or(l)
+    });
+    while let Some(raw) = rest.next() {
+        // `if (!sb.len) break;` — an empty line ends the *whole* read, pathspecs
+        // included, rather than being skipped.
+        if raw.is_empty() {
+            break;
+        }
+        // Past that length check the line is only ever read as the C string
+        // `sb.buf`, so it ends at its first NUL: a line that starts with one is
+        // `die("bad revision '%s'", "")`.
+        let c_str = raw.split(|&b| b == 0).next().unwrap_or_default();
+        let line = String::from_utf8_lossy(c_str).into_owned();
+        if line == "--" {
+            // `seen_dashdash = 1; break;` then `read_pathspec_from_stdin()`: every
+            // remaining line is a pathspec, empty ones included.
+            pathspecs.extend(rest.map(|p| p.split(|&b| b == 0).next().unwrap_or_default().to_vec()));
+            break;
+        }
+        if !seen_end_of_options && line == "--end-of-options" {
+            seen_end_of_options = true;
+            continue;
+        }
+        lines.push((line, seen_end_of_options));
+    }
+    Ok((lines, pathspecs))
+}
+
 /// Whether `handle_revision_pseudo_opt()` (`revision.c:2778-2935`) claims `arg`.
 ///
 /// The list is that function's own `strcmp`/`skip_prefix`/`parse_long_opt` chain.
@@ -571,7 +617,7 @@ enum Origin {
 /// these or `fatal: invalid option '<line>' in --stdin mode`. The detached forms
 /// (`--glob <pat>`) cannot occur, because the reader hands the option a one-element
 /// `argv` with no following element to take a value from.
-fn is_revision_pseudo_opt(arg: &str) -> bool {
+pub(super) fn is_revision_pseudo_opt(arg: &str) -> bool {
     const EXACT: &[&str] = &[
         "--all",
         "--branches",
@@ -1533,46 +1579,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     return Ok(fatal("--stdin given twice?"));
                 }
                 read_stdin = true;
-                // Bytes, not text: the lines are whatever `strbuf_getline()`
-                // hands back, and a stray non-UTF-8 byte is a bad revision, not
-                // a read error.
-                let mut text = Vec::new();
-                std::io::stdin().read_to_end(&mut text)?;
-                let mut lines: Vec<String> = Vec::new();
-                let mut kinds: Vec<Origin> = Vec::new();
-                let mut seen_end_of_options = false;
-                // `strbuf_getline()` strips the LF and then one CR of its own.
-                let mut rest = text.lines_with_terminator().map(|l| {
-                    let l = l.strip_suffix(b"\n").unwrap_or(l);
-                    l.strip_suffix(b"\r").unwrap_or(l)
-                });
-                while let Some(raw) = rest.next() {
-                    // `if (!sb.len) break;` — an empty line ends the *whole* read,
-                    // pathspecs included, rather than being skipped.
-                    if raw.is_empty() {
-                        break;
-                    }
-                    // Past that length check the line is only ever read as the C
-                    // string `sb.buf`, so it ends at its first NUL: a line that
-                    // starts with one is `die("bad revision '%s'", "")`.
-                    let c_str = raw.split(|&b| b == 0).next().unwrap_or_default();
-                    let line: &str = &String::from_utf8_lossy(c_str);
-                    if line == "--" {
-                        // `seen_dashdash = 1; break;` then
-                        // `read_pathspec_from_stdin()`: every remaining line is a
-                        // pathspec, empty ones included.
-                        pathspecs.extend(rest.map(|p| p.split(|&b| b == 0).next().unwrap_or_default().to_vec()));
-                        break;
-                    }
-                    if !seen_end_of_options && line == "--end-of-options" {
-                        seen_end_of_options = true;
-                        continue;
-                    }
-                    lines.push(line.to_string());
-                    kinds.push(if seen_end_of_options {
-                        Origin::StdinAfterEndOfOptions
-                    } else {
-                        Origin::Stdin
+                let (read, paths) = read_revisions_from_stdin()?;
+                pathspecs.extend(paths);
+                let mut lines: Vec<String> = Vec::with_capacity(read.len() + 1);
+                let mut kinds: Vec<Origin> = Vec::with_capacity(read.len() + 1);
+                for (line, after_end_of_options) in read {
+                    lines.push(line);
+                    kinds.push(match after_end_of_options {
+                        true => Origin::StdinAfterEndOfOptions,
+                        false => Origin::Stdin,
                     });
                 }
                 // `read_revisions_from_stdin()`'s `int flags = 0;` is its own, so

@@ -1132,6 +1132,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // Parallel to `revs`: whether a `--not` was in force when it was read, which
     // reverses the sense the `^` prefix would otherwise give it.
     let mut rev_negated: Vec<bool> = Vec::new();
+    // Parallel to `revs`: whether the revision was a `--stdin` line, which
+    // `read_revisions_from_stdin()` hands to `handle_revision_arg()` with
+    // `REVARG_CANNOT_BE_FILENAME` — never a pathspec, and `bad revision` when it
+    // does not resolve.
+    let mut rev_from_stdin: Vec<bool> = Vec::new();
     let mut pathspecs: Vec<String> = Vec::new();
     // History filtering (`--grep`/`--author`/`--committer` + dialect flags),
     // matched through the shared `revfilter` so log and shortlog agree.
@@ -1240,9 +1245,52 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // <zero-oid>` walks nothing rather than falling back to `HEAD`.
     let mut ignore_missing = false;
 
+    // `--stdin` splices its lines in where it stood; `origin` tells them apart
+    // from argv. See [`super::rev_list::Origin`].
+    let mut args: Vec<String> = args.to_vec();
+    let mut origin: Vec<super::rev_list::Origin> = vec![super::rev_list::Origin::Argv; args.len()];
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
+        // ```c
+        // if (!seen_end_of_options && sb.buf[0] == '-') {
+        //         ...
+        //         if (handle_revision_pseudo_opt(revs, argv, &flags) > 0)
+        //                 continue;
+        //         die(_("invalid option '%s' in --stdin mode"), sb.buf);
+        // }
+        // if (handle_revision_arg(sb.buf, revs, flags, REVARG_CANNOT_BE_FILENAME))
+        //         die("bad revision '%s'", sb.buf);
+        // ```
+        //
+        // (revision.c:2960-2976.) A pseudo-option line goes through the arms
+        // below like its argv spelling; any other line is a revision.
+        match origin[i] {
+            super::rev_list::Origin::Argv => {}
+            super::rev_list::Origin::StdinEnd(saved) => {
+                negate_revs = saved;
+                i += 1;
+                continue;
+            }
+            kind => {
+                let is_option =
+                    kind == super::rev_list::Origin::Stdin && a.starts_with('-');
+                if is_option && !super::rev_list::is_revision_pseudo_opt(a) {
+                    eprintln!("fatal: invalid option '{a}' in --stdin mode");
+                    return Ok(ExitCode::from(128));
+                }
+                if !is_option {
+                    if argument_excludes(a, negate_revs) {
+                        no_walk = None;
+                    }
+                    revs.push(a.clone());
+                    rev_negated.push(negate_revs);
+                    rev_from_stdin.push(true);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
         if a == "--" {
             // Everything after `--` is a pathspec, even tokens that look like
             // flags — git stops option parsing at the separator.
@@ -1256,6 +1304,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             revs.push(a.clone());
             rev_negated.push(negate_revs);
+            rev_from_stdin.push(false);
             i += 1;
             continue;
         }
@@ -1337,7 +1386,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // the next argv slot. The spellings, the argv arithmetic and the two
         // `die_for_incompatible_opt2()` conflicts are [`crate::revopt`]'s, so
         // every walking verb answers them the same way.
-        match crate::revopt::parse(args, i) {
+        match crate::revopt::parse(&args, i) {
             Some(Ok(hit)) => {
                 if let Err(message) = counts.apply(hit.what) {
                     eprintln!("fatal: {message}");
@@ -1829,7 +1878,32 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             eprintln!("fatal: unrecognized argument: {a}");
             return Ok(ExitCode::from(128));
         } else if a == "--stdin" {
+            // `if (revs->read_from_stdin++) die("--stdin given twice?");` then
+            // `read_revisions_from_stdin()`, right here in the scan (revision.c:
+            // 3047-3057): the lines are spliced in at this position. The reader
+            // keeps its own `int flags = 0`, so the block starts with `--not`
+            // cleared and the argv scan gets its state back at the sentinel.
+            if read_stdin {
+                eprintln!("fatal: --stdin given twice?");
+                return Ok(ExitCode::from(128));
+            }
             read_stdin = true;
+            let (read, paths) = super::rev_list::read_revisions_from_stdin()?;
+            pathspecs.extend(paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()));
+            let mut lines: Vec<String> = Vec::with_capacity(read.len() + 1);
+            let mut kinds: Vec<super::rev_list::Origin> = Vec::with_capacity(read.len() + 1);
+            for (line, after_end_of_options) in read {
+                lines.push(line);
+                kinds.push(match after_end_of_options {
+                    true => super::rev_list::Origin::StdinAfterEndOfOptions,
+                    false => super::rev_list::Origin::Stdin,
+                });
+            }
+            lines.push(String::new());
+            kinds.push(super::rev_list::Origin::StdinEnd(negate_revs));
+            negate_revs = false;
+            args.splice(i + 1..i + 1, lines);
+            origin.splice(i + 1..i + 1, kinds);
         } else if a == "--not" {
             negate_revs = !negate_revs;
         } else if a == "--no-walk" {
@@ -2550,6 +2624,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
             revs.push(a.clone());
             rev_negated.push(negate_revs);
+            rev_from_stdin.push(false);
         }
         i += 1;
     }
@@ -2696,39 +2771,6 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // the ref-naming pseudo-options can be slotted back in at the position they were
     // written at: `setup_revisions()` appends to one `pending` list as it reads the
     // command line, and a tie in commit date is broken by that order.
-    // `read_revisions_from_stdin()`: every line is another revision argument, until
-    // a bare `--` turns the rest into pathspecs. They are appended after the ones
-    // the command line named, which is where git puts them.
-    // `read_revisions_from_stdin()` brackets its loop with
-    // `cfg->warn_on_object_refname_ambiguity = 0`, so a name that arrives on stdin
-    // never gets the ambiguity warning the same name on argv gets. The lines are
-    // appended to `revs` and resolved further down rather than here, so the
-    // boundary is remembered instead of the switch being held.
-    let argv_revs = revs.len();
-    if read_stdin {
-        use std::io::Read as _;
-        let mut text = String::new();
-        std::io::stdin().read_to_string(&mut text)?;
-        let mut in_paths = false;
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            if in_paths {
-                pathspecs.push(line.to_string());
-            } else if line == "--" {
-                in_paths = true;
-            } else {
-                // The same `handle_revision_arg()` reads these, so an exclusion
-                // arriving on stdin cancels `--no-walk` like one on the command line.
-                if argument_excludes(line, negate_revs) {
-                    no_walk = None;
-                }
-                revs.push(line.to_string());
-                rev_negated.push(negate_revs);
-            }
-        }
-    }
     // The fourth field is git's `SYMMETRIC_LEFT`: the left endpoint of an `A...B` carries it,
     // every other pended tip does not. It is what `--left-right` prints and what
     // `cherry_pick_list()` splits the difference on.
@@ -2746,7 +2788,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // leave nothing behind: a pending tree or blob is dropped by
     // `handle_commit()` but the flag was already set, so `revs->def` stays out.
     let mut rev_input_given = false;
-    let mut resolve_neg = |spec: &str, token: &str, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
+    let mut resolve_neg = |spec: &str, token: &str, gated: bool, neg_ids: &mut Vec<ObjectId>| -> Option<ExitCode> {
         match resolve_rev(&repo, crate::objname::canonical_spec(&repo, spec).as_ref()) {
             Ok(id) => {
                 // `get_reference()`'s `die(_("bad object %s"), name)`
@@ -2769,7 +2811,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // been seen anywhere on the line the operand can no longer be a
                 // pathspec, so the three-line `ambiguous argument` advice is not
                 // printed.
-                eprint!("{}", bad_revision_message_in_gated(&repo, token, seen_dashdash));
+                eprint!("{}", bad_revision_message_in_gated(&repo, token, gated));
                 Some(ExitCode::from(128))
             }
         }
@@ -2777,13 +2819,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     for (at, (spec, negated)) in revs.iter().zip(rev_negated.iter().copied()).enumerate() {
         // The lines `--stdin` supplied are exempt from the ambiguity half, which
         // is what `read_revisions_from_stdin()` clears the switch for.
-        warn_operand(&repo, spec, at < argv_revs);
+        warn_operand(&repo, spec, !rev_from_stdin[at]);
+        // `REVARG_CANNOT_BE_FILENAME`: a `--stdin` line is never a pathspec, so it
+        // takes the diagnostics `seen_dashdash` gates.
+        let gated = seen_dashdash || rev_from_stdin[at];
         // `handle_revision_arg_1()`'s guard ahead of `handle_dotdot()`: a bare
         // `..` is the pathspec for the parent directory, not `HEAD..HEAD`. It
         // falls through to the plain branch, fails to resolve, and is taken as a
         // path — which the pathspec layer then rejects for leaving the
         // repository. See [`crate::objname::is_parent_directory_pathspec`].
-        if crate::objname::is_parent_directory_pathspec(spec, seen_dashdash) {
+        if crate::objname::is_parent_directory_pathspec(spec, gated) {
             pos_specs.push((at, spec.to_string(), spec.to_string(), false));
         } else if let Some((a, b)) = spec.split_once("...") {
             let a = if a.is_empty() { "HEAD" } else { a };
@@ -2815,7 +2860,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             parsed.extend(navigation_path(&repo, b));
             // `A..B` is `^A B`; under `--not` each endpoint takes the other side.
             let (kept, excluded) = if negated { (a, b) } else { (b, a) };
-            if let Some(code) = resolve_neg(excluded, spec, &mut neg_ids) {
+            if let Some(code) = resolve_neg(excluded, spec, gated, &mut neg_ids) {
                 return Ok(code);
             }
             pos_specs.push((at, kept.to_string(), kept.to_string(), false));
@@ -2836,7 +2881,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // `strtol_i()` refused the `<n>`, so `add_parents_only()` is never
                 // reached: `ret = -1` and the operand is diagnosed as written.
                 crate::objname::ParentsOnly::BadParent => {
-                    eprint!("{}", bad_revision_message_in_gated(&repo, spec, seen_dashdash));
+                    eprint!("{}", bad_revision_message_in_gated(&repo, spec, gated));
                     return Ok(ExitCode::from(128));
                 }
                 crate::objname::ParentsOnly::Mark { base, nth, replaces } => {
@@ -2864,7 +2909,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         crate::objname::Parents::None => {
                             eprint!(
                                 "{}",
-                                bad_revision_message_in_gated(&repo, spec, seen_dashdash)
+                                bad_revision_message_in_gated(&repo, spec, gated)
                             );
                             return Ok(ExitCode::from(128));
                         }
@@ -2896,7 +2941,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             let bare = spec.strip_prefix('^').unwrap_or(spec);
             parsed.extend(navigation_path(&repo, bare));
             if spec.starts_with('^') != negated {
-                if let Some(code) = resolve_neg(bare, spec, &mut neg_ids) {
+                if let Some(code) = resolve_neg(bare, spec, gated, &mut neg_ids) {
                     return Ok(code);
                 }
                 // `handle_revision_arg_1()` runs `verify_non_filename()` between
@@ -2904,7 +2949,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // on the operand with its leading `^` already stripped — so
                 // `git log ^dual` and `git log --not dual` are as ambiguous as
                 // `git log dual` when a file named `dual` is sitting there.
-                if let Some(code) = non_filename_fatal(&repo, bare, seen_dashdash) {
+                if let Some(code) = non_filename_fatal(&repo, bare, gated) {
                     return Ok(code);
                 }
                 // `revs->rev_input_given` is set by `handle_revision_arg()` as
@@ -3114,6 +3159,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut in_paths = false;
     let mut specs = pos_specs.iter().peekable();
     for at in 0..=revs.len() {
+        // `REVARG_CANNOT_BE_FILENAME` for a `--stdin` line (see the scan above).
+        let gated = seen_dashdash || rev_from_stdin.get(at).copied().unwrap_or(false);
         // One `verify_non_filename()` per operand, not per endpoint: a range is
         // split into two specs here and git checks the token once.
         let mut token_checked = false;
@@ -3206,7 +3253,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         token_checked = true;
                         let token = revs.get(at).map(String::as_str).unwrap_or(spec.as_str());
                         if let Some(code) =
-                            non_filename_fatal(&repo, non_filename_name(token), seen_dashdash)
+                            non_filename_fatal(&repo, non_filename_name(token), gated)
                         {
                             return Ok(code);
                         }
@@ -3252,7 +3299,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // *looking* like an option can reach it, which after
                 // `--end-of-options` is exactly what `--grep merge` is.
                 Err(_)
-                    if !seen_dashdash
+                    if !gated
                         && !in_paths
                         && spec.starts_with('-')
                         && crate::setup::verify_filename(spec, true).is_some() =>
@@ -3266,7 +3313,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // is on the line, an operand in front of it is a revision or an
                 // error, never the start of the pathspec, even when a file of that
                 // name exists.
-                Err(_) if !seen_dashdash && spec_is_path(&repo, spec) => {
+                Err(_) if !gated && spec_is_path(&repo, spec) => {
                     // `setup_revisions()`'s filename fallback checks the whole
                     // tail before it prunes with any of it:
                     //
@@ -3304,7 +3351,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // `setup_revisions()` names the argument as written, so a range
                     // whose endpoint failed is reported whole.
                     let token = revs.get(at).map(String::as_str).unwrap_or(spec.as_str());
-                    eprint!("{}", bad_revision_message_in_gated(&repo, token, seen_dashdash));
+                    eprint!("{}", bad_revision_message_in_gated(&repo, token, gated));
                     return Ok(ExitCode::from(128));
                 }
             }

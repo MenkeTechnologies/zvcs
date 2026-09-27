@@ -974,6 +974,14 @@ git push <groupname>\n"
         }) && !f.quiet,
     };
     let outcome = push_proto::send_pack(&repo, &remote, &requests, f.dry_run, &send_opts)?;
+    // `git_transport_push()` ORs in `finish_connect()` (transport.c:957), and the receive-pack
+    // that `send_pack()` left without a command list died, so `push_with_options()` reports
+    // the failure (builtin/push.c:393-394). With no refs there is no status block, no
+    // upstream and no tracking ref.
+    if outcome.no_refs {
+        eprintln!("error: failed to push some refs to '{transport_url}'");
+        return Ok(ExitCode::from(1));
+    }
 
     // `transport_push` finishes in this order: print the status block, then
     // `set_upstreams()`, then the tracking refs (transport.c:1545-1558). The

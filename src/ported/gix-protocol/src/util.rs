@@ -61,6 +61,13 @@ mod with_transport {
             }
         }
 
+        /// Close without the end-of-interaction flush-packet, as git's `send_pack()` does when it
+        /// has no refs to update at all (send-pack.c:542-547): the peer then reads EOF where it
+        /// expected a command list.
+        pub fn skip_end_of_interaction(&mut self) {
+            self.flush_packet_sent = true;
+        }
+
         /// Useful to explicitly invalidate the connection by sending a flush-packet.
         /// This will happen exactly once, and it is not considered an error to call it multiple times.
         ///

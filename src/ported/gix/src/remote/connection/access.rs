@@ -147,6 +147,12 @@ where
         &mut self.transport.inner
     }
 
+    /// Drop the connection without the flush-packet that otherwise ends the interaction; see
+    /// [`SendFlushOnDrop::skip_end_of_interaction()`](gix_protocol::SendFlushOnDrop::skip_end_of_interaction()).
+    pub fn skip_end_of_interaction(&mut self) {
+        self.transport.skip_end_of_interaction();
+    }
+
     pub(crate) fn into_detached(self) -> ConnectionDetached<'auth, T> {
         ConnectionDetached {
             remote: self.remote.detached(),

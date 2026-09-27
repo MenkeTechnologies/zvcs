@@ -294,6 +294,12 @@ pub struct Outcome {
     pub advertised: Vec<String>,
     /// `unpack ok`, or the server's failure reason.
     pub unpack: Result<(), String>,
+    /// `send_pack()`'s `if (!remote_refs)` return (send-pack.c:542-547): the remote advertised
+    /// nothing and no refspec named anything, so no command list was written and the
+    /// connection was closed without its flush. The receive-pack on the other end reads EOF
+    /// and dies `the remote end hung up unexpectedly`, which is how `finish_connect()` fails
+    /// the push.
+    pub no_refs: bool,
 }
 
 
@@ -983,6 +989,32 @@ pub fn send_pack(
     }
 
     // ```c
+    // if (!remote_refs) {
+    //         fprintf(stderr, "No refs in common and none specified; doing nothing.\n"
+    //                 "Perhaps you should specify a branch.\n");
+    //         ret = 0;
+    //         goto out;
+    // }
+    // ```
+    //
+    // (`send_pack()`, send-pack.c:542-547.) `remote_refs` is the advertisement with every
+    // ref `match_push_refs()` created appended, so it is empty only when the remote has no
+    // refs and nothing was matched — a matching push or `--tags` into an empty repository.
+    // Nothing is written, not even the flush that ends an empty command list.
+    if advertised_order.is_empty() && statuses.is_empty() && wire.is_empty() {
+        eprintln!("No refs in common and none specified; doing nothing.");
+        eprintln!("Perhaps you should specify a branch.");
+        connection.skip_end_of_interaction();
+        return Ok(Outcome {
+            url,
+            statuses,
+            advertised: advertised_order,
+            unpack: Ok(()),
+            no_refs: true,
+        });
+    }
+
+    // ```c
     // static void atomic_push_failure(struct send_pack_args *args,
     //                                 struct ref *remote_refs,
     //                                 struct ref *failing_ref)
@@ -1043,6 +1075,7 @@ pub fn send_pack(
                 statuses,
                 advertised: advertised_order,
                 unpack: Ok(()),
+                no_refs: false,
             });
         }
     }
@@ -1071,6 +1104,7 @@ pub fn send_pack(
             statuses,
             advertised: advertised_order,
             unpack: Ok(()),
+            no_refs: false,
         });
     }
 
@@ -1134,6 +1168,7 @@ pub fn send_pack(
             statuses,
             advertised: advertised_order,
             unpack: Ok(()),
+            no_refs: false,
         });
     }
 
@@ -1233,7 +1268,8 @@ pub fn send_pack(
     // POST the request: command list + flush + pack, written verbatim (the pack is
     // not pkt-line framed). `into_parts` hands back the raw writer and the response
     // reader; the writer must be dropped before the response is read.
-    let (mut writer, mut reader) = transport
+    let (mut writer, mut reader) = connection
+        .transport_mut()
         .request(WriteMode::Binary, MessageKind::Flush, false)?
         .into_parts();
     writer.write_all(&req_buf)?;
@@ -1394,6 +1430,7 @@ pub fn send_pack(
         statuses,
         advertised: advertised_order,
         unpack,
+        no_refs: false,
     })
 }
 

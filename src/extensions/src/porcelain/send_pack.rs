@@ -414,6 +414,11 @@ fn push(st: &State) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // `ret |= finish_connect(conn)` (builtin/send-pack.c:330): the receive-pack that read EOF
+    // where its command list belonged exited 128, and with no refs there is no status to print.
+    if outcome.no_refs {
+        return Ok(ExitCode::from(128));
+    }
 
     if st.helper_status {
         print_helper_status(&outcome);

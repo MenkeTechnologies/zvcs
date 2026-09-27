@@ -177,6 +177,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use super::{Arg, LongOpt};
+// stdout goes through git's stdio buffer, armed on entry to `am`: off a
+// terminal `Applying: <subject>` and `Patch failed at …` reach the fd at
+// `exit()` or at the next `start_command()`'s `fflush(NULL)`, after whatever
+// went to stderr in between (see `crate::cstdio`).
+use crate::cstdio::println;
 
 /// `cmd_am()`'s `struct option options[]` (builtin/am.c), in table order, as
 /// [`super::resolve_long`] reads it.
@@ -533,6 +538,7 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
             _ => {}
         }
     }
+    crate::cstdio::defer();
 
     // `git_config(git_am_config, ...)` runs before `parse_options`, so a
     // malformed `am.*` boolean is a config-time fatal (exit 128) that precedes
@@ -1811,7 +1817,6 @@ fn preflight(repo: &gix::Repository, state_dir: &Path) -> Result<Option<ExitCode
         return Ok(Some(death.die()?));
     }
     {
-        let mut out = std::io::stdout().lock();
         let mut reported: BTreeSet<BString> = BTreeSet::new();
         for e in state.entries() {
             if e.stage_raw() == 0 {
@@ -1819,7 +1824,7 @@ fn preflight(repo: &gix::Repository, state_dir: &Path) -> Result<Option<ExitCode
             }
             let path = e.path(state);
             if reported.insert(path.to_owned()) {
-                writeln!(out, "{path}: needs merge")?;
+                println!("{path}: needs merge");
             }
         }
     }
@@ -2269,6 +2274,9 @@ fn do_interactive(
     use std::io::{BufRead, Write};
 
     loop {
+        // The prompt is written unbuffered below; what `am` buffered so far goes
+        // out first.
+        crate::cstdio::flush();
         let mut out = std::io::stdout();
         out.write_all(b"Commit Body is:\n--------------------------\n")?;
         out.write_all(&info.msg)?;
@@ -2313,6 +2321,7 @@ fn do_interactive(
 fn page_file(repo: &gix::Repository, path: &Path) -> Result<()> {
     use std::io::Write;
 
+    crate::cstdio::before_spawn();
     let _ = std::io::stdout().flush();
     let mut pager = crate::pager::resolve_pager(Some(&repo.config_snapshot()));
     if pager.is_empty() || pager == "cat" {
@@ -2604,6 +2613,9 @@ fn fall_back_threeway(
         None => repo.object_hash().empty_tree(),
     };
 
+    // `build_fake_ancestor()` is a `run_command()` child (builtin/am.c:1562-1576),
+    // so `start_command()`'s `fflush(NULL)` puts `Applying: …` out here.
+    crate::cstdio::before_spawn();
     let mut fake = ctx.cmd("apply");
     fake.arg(format!("--build-fake-ancestor={}", index_path.display()));
     for opt in &ld.apply_opts {
@@ -2632,6 +2644,9 @@ fn fall_back_threeway(
         // `run_diff_index(DIFF_INDEX_CACHED)` filtered to A/M against `HEAD`:
         // the paths that needed reconstructing, so the user knows where to look
         // for a mismerge.
+        // git runs this diff in process, into the same buffer; the child writes
+        // straight to the fd, so what is buffered goes first.
+        crate::cstdio::before_spawn();
         let _ = ctx
             .cmd("diff-index")
             .arg("--cached")
@@ -3543,11 +3558,11 @@ fn first_line(msg: &[u8]) -> &[u8] {
 /// `Applying: caf\xe9 change` byte for byte. Rendering it through
 /// `String::from_utf8_lossy` instead would print U+FFFD and lose the byte.
 fn say_subject(prefix: &str, subject: &[u8]) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(prefix.as_bytes());
-    let _ = out.write_all(subject);
-    let _ = out.write_all(b"\n");
+    let mut line = Vec::with_capacity(prefix.len() + subject.len() + 1);
+    line.extend_from_slice(prefix.as_bytes());
+    line.extend_from_slice(subject);
+    line.push(b'\n');
+    crate::cstdio::write_bytes(&line);
 }
 
 /// `is_empty_or_missing_file`: true when the file is absent or zero-length.
@@ -3680,6 +3695,7 @@ fn show_patch(repo: &gix::Repository, state_dir: &Path, sub: Sub) -> Result<Exit
     // not the regenerated patch, and it ignores the raw/diff distinction.
     if let Some(oid) = read_orig_commit(state_dir) {
         let ctx = Ctx::new(repo, state_dir)?;
+        crate::cstdio::before_spawn();
         let ok = ctx
             .cmd("show")
             .arg(oid.to_hex().to_string())

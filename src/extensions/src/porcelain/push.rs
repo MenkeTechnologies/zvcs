@@ -386,7 +386,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         Some(r) => r,
         None => default_push_remote(&repo),
     };
-    let specs: Vec<String> = positionals.into_iter().skip(1).collect();
+    let typed: Vec<String> = positionals.into_iter().skip(1).collect();
 
     // `parse_refspec()` (refspec.c) rejects a push refspec whose destination is
     // present but empty:
@@ -408,15 +408,49 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // so `git push origin ./.remote.git` dies here rather than failing to match.
     // `--delete <ref>` reaches the same parser as `:<ref>` (`set_refspecs()`,
     // builtin/push.c:118-121), after its own plain-name refusal.
-    for spec in &specs {
+    //
+    // Those checks run inside `set_refspecs()` (builtin/push.c:104-138), one
+    // argument at a time, together with its two other refusals:
+    //
+    // ```c
+    // if (!strcmp("tag", ref)) {
+    //         if (nr <= ++i)
+    //                 die(_("tag shorthand without <tag>"));
+    //         ref = refs[i];
+    //         if (deleterefs)
+    //                 refspec_appendf(&rs, ":refs/tags/%s", ref);
+    //         else
+    //                 refspec_appendf(&rs, "refs/tags/%s", ref);
+    // } else if (deleterefs) {
+    //         if (strchr(ref, ':') || !*ref)
+    //                 die(_("--delete only accepts plain target ref names"));
+    //         refspec_appendf(&rs, ":%s", ref);
+    // }
+    // ```
+    //
+    // `tag <name>` becomes `refs/tags/<name>`; under `--delete` the colon is added
+    // later, by the deletion requests, as for every other `--delete` argument.
+    let mut specs: Vec<String> = Vec::with_capacity(typed.len());
+    let mut args = typed.into_iter();
+    while let Some(arg) = args.next() {
+        let spec = match arg.as_str() {
+            "tag" => match args.next() {
+                Some(name) => format!("refs/tags/{name}"),
+                None => crate::git_fatal!("tag shorthand without <tag>"),
+            },
+            _ if f.delete && (arg.contains(':') || arg.is_empty()) => {
+                crate::git_fatal!("--delete only accepts plain target ref names")
+            }
+            _ => arg,
+        };
         let as_parsed = match f.delete {
-            true if spec.contains(':') || spec.is_empty() => continue,
             true => format!(":{spec}"),
             false => spec.clone(),
         };
         if !push_refspec_is_valid(&as_parsed, repo.object_hash().len_in_hex()) {
             crate::git_fatal!("invalid refspec '{as_parsed}'");
         }
+        specs.push(spec);
     }
 
     // Honor the `push.*` config defaults for flags not given explicitly. An

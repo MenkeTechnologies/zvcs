@@ -1046,9 +1046,13 @@ fn quote_c_style(bytes: &[u8]) -> String {
     crate::quote::quoted_name_string(bytes)
 }
 
-/// Read the `--stdin` path list. Without `-z` a trailing CR is stripped with the
-/// LF and a leading `"` marks a C-quoted record; `None` reports one that git
-/// would reject as badly quoted.
+/// Read the `--stdin` path list the way `getline_fn = nul_term_line ?
+/// strbuf_getline_nul : strbuf_getline_lf` does (builtin/checkout-index.c:319-331):
+/// only the separator is stripped — a CRLF line names a path ending in `\r` —
+/// and only EOF ends the loop, so an empty record in the middle is the empty
+/// path (`git checkout-index:  is not in the cache`) while the piece after a
+/// final separator is no record. Without `-z` a leading `"` marks a C-quoted
+/// record; `None` reports one that git would reject as badly quoted.
 fn read_stdin_paths(nul_term: bool) -> Result<Option<Vec<BString>>> {
     use std::io::Read;
     let mut raw = Vec::new();
@@ -1056,12 +1060,11 @@ fn read_stdin_paths(nul_term: bool) -> Result<Option<Vec<BString>>> {
 
     let sep = if nul_term { b'\0' } else { b'\n' };
     let mut out = Vec::new();
-    for record in raw.split(|&b| b == sep) {
-        // A trailing separator yields one empty tail record, which git's
-        // line reader never returns.
-        if record.is_empty() {
-            continue;
-        }
+    let mut records: Vec<&[u8]> = raw.split(|&b| b == sep).collect();
+    if records.last().is_some_and(|last| last.is_empty()) {
+        records.pop();
+    }
+    for record in records {
         if nul_term {
             out.push(BString::from(record));
             continue;
@@ -1076,7 +1079,6 @@ fn read_stdin_paths(nul_term: bool) -> Result<Option<Vec<BString>>> {
         // the record instead looks up a path no index can hold and reports
         // `is not in the cache`.
         let record = &record[..record.iter().position(|&b| b == 0).unwrap_or(record.len())];
-        let record = record.strip_suffix(b"\r").unwrap_or(record);
         if record.first() == Some(&b'"') {
             match unquote_c_style(record) {
                 Some(decoded) => out.push(decoded),

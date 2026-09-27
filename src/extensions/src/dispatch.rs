@@ -672,6 +672,10 @@ enum ConfigCallback {
     /// `git_branch_config` (builtin/branch.c:84) — its own keys, then
     /// `git_color_config`, then the default.
     Branch,
+    /// `git_tag_config` (builtin/tag.c:210) — `tag.gpgsign`, `tag.sort`,
+    /// `tag.forcesignannotated`, `column.*`, then `git_color_config` and the
+    /// default.
+    Tag,
     /// `fmt_merge_msg_config` (fmt-merge-msg.c:26) — its own `merge.*` keys,
     /// then the default.
     FmtMergeMsg,
@@ -745,7 +749,8 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "merge" => ConfigCallback::Merge,
         "branch" => ConfigCallback::Branch,
         "fmt-merge-msg" => ConfigCallback::FmtMergeMsg,
-        "add" | "stage" | "clean" | "tag" | "show-branch" => ConfigCallback::Color,
+        "tag" => ConfigCallback::Tag,
+        "add" | "stage" | "clean" | "show-branch" => ConfigCallback::Color,
         "patch-id" | "mailinfo" => ConfigCallback::Verb,
         _ => ConfigCallback::Default,
     }
@@ -1578,6 +1583,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     }
                     ConfigCallback::Merge => crate::cmd_config::validate_merge(&repo),
                     ConfigCallback::Branch => crate::cmd_config::validate_branch(&repo),
+                    ConfigCallback::Tag => crate::cmd_config::validate_tag(&repo),
                     ConfigCallback::FmtMergeMsg => {
                         crate::cmd_config::validate_fmt_merge_msg(&repo)
                     }

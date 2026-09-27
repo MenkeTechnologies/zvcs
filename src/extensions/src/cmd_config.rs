@@ -236,6 +236,78 @@ fn git_branch_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rej
     git_default_config(v, out)
 }
 
+/// `repo_config(the_repository, git_tag_config, &sorting_options)` — `git tag`
+/// (builtin/tag.c:549), ahead of `parse_options()`, so a refused value stops a
+/// listing, a `-d` and a `-h` alike.
+///
+/// Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c tag.gpgSign=bogus tag -d nosuch
+/// fatal: bad boolean config value 'bogus' for 'tag.gpgsign'
+/// $ git -c tag.gpgSign=bogus -c color.ui=bogus tag
+/// fatal: bad boolean config value 'bogus' for 'tag.gpgsign'
+/// ```
+pub fn validate_tag(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_tag_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+/// `git_tag_config()` (builtin/tag.c:210-237).
+///
+/// ```c
+/// if (!strcmp(var, "tag.gpgsign")) {
+///         config_sign_tag = git_config_bool(var, value);
+///         return 0;
+/// }
+/// if (!strcmp(var, "tag.sort")) {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         string_list_append(cb, value);
+///         return 0;
+/// }
+/// if (!strcmp(var, "tag.forcesignannotated")) {
+///         force_sign_annotate = git_config_bool(var, value);
+///         return 0;
+/// }
+/// if (starts_with(var, "column."))
+///         return git_column_config(var, value, "tag", &colopts);
+/// if (git_color_config(var, value, cb) < 0)
+///         return -1;
+/// return git_default_config(var, value, ctx, cb);
+/// ```
+fn git_tag_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    if key == "tag.gpgsign" || key == "tag.forcesignannotated" {
+        bool_value(v, key)?;
+        return Ok(());
+    }
+    if key == "tag.sort" {
+        string_value(v)?;
+        return Ok(());
+    }
+    // `git_column_config()` (column.c:328-343): `column.ui` and the key named
+    // after the command; every other `column.*` is ignored.
+    if key.starts_with("column.") {
+        if key == "column.ui" || key == "column.tag" {
+            let raw = string_value(v)?;
+            if let Err(message) = crate::porcelain::column::validate_config_value(&raw) {
+                let name = key.trim_start_matches("column.");
+                return Err(reported(
+                    v,
+                    vec![message, format!("invalid column.{name} mode {raw}")],
+                ));
+            }
+        }
+        return Ok(());
+    }
+    git_color_config(v)?;
+    git_default_config(v, out)
+}
+
 // ---------------------------------------------------------------------------
 // checkout / switch / restore
 // ---------------------------------------------------------------------------

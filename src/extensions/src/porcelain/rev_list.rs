@@ -1304,10 +1304,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            // `--simplify-by-decoration`: `simplify_commit()` keeps a decorated commit,
-            // and — since simplification may not change the shape of the history — a
-            // root or a merge; everything else is walked past.
-            "--simplify-by-decoration" => simplify_by_decoration = true,
+            // ```c
+            // } else if (!strcmp(arg, "--simplify-by-decoration")) {
+            //         revs->simplify_merges = 1;
+            //         revs->topo_order = 1;
+            //         revs->rewrite_parents = 1;
+            //         revs->simplify_history = 0;
+            //         revs->simplify_by_decoration = 1;
+            //         revs->limited = 1;
+            //         revs->prune = 1;
+            // ```
+            //
+            // (revision.c:2445-2452.) It is `--simplify-merges` with a different
+            // `rev_compare_tree()` question, so it takes that pass whole.
+            "--simplify-by-decoration" => {
+                simplify_by_decoration = true;
+                simplify_merges_opt = true;
+                full_history = true;
+                if order == Order::Date {
+                    order = Order::Topo;
+                }
+            }
             "--show-pulls" => show_pulls = true,
             "-g" | "--walk-reflogs" => walk_reflogs = true,
             "--exclude-first-parent-only" => exclude_first_parent_only = true,
@@ -2030,9 +2047,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if graph && order == Order::Date {
         order = Order::Topo;
     }
-    // `want_ancestry()` is `revs->rewrite_parents || revs->children.name`, and the
-    // die reads the first as `--parents` however it was turned on — which `--graph`
-    // does.
     // `if (revs->reflog_info && revs->limited) die(...)` (revision.c:3180-3181),
     // ahead of the `--parents`/`--children` check. A reflog walk hands its entries
     // out in reflog order, and every option that makes `setup_revisions()` set
@@ -2051,7 +2065,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     {
         return Ok(fatal("cannot combine --walk-reflogs with history-limiting options"));
     }
-    if (show_parents || graph) && show_children {
+    // `want_ancestry()` is `revs->rewrite_parents || revs->children.name`, and the
+    // die reads the first as `--parents` however it was turned on — which `--graph`,
+    // `--simplify-merges` and `--simplify-by-decoration` do (revision.c:2439-2452).
+    if (show_parents || graph || simplify_merges_opt) && show_children {
         return Ok(fatal(
             "options '--parents' and '--children' cannot be used together",
         ));
@@ -2381,7 +2398,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // applies it — in `simplify_commit()`, after `get_commit_action()` has read the
     // parent list `simplify_one()` left behind.
     let mut simplified_display: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    if !pathspecs.is_empty() {
+    // `revs->prune`: a pathspec, or `--simplify-by-decoration`, which sets it with
+    // no pathspec at all (revision.c:2452).
+    let prune = !pathspecs.is_empty() || simplify_by_decoration;
+    // `get_name_decoration()`, which `rev_compare_tree()` consults under
+    // `--simplify-by-decoration` (revision.c:789-805). It loads every ref with no
+    // filter (log-tree.c:94-98), so a commit named only by `refs/bisect/*`,
+    // `refs/notes/*` or a ref outside `git log`'s namespaces counts too.
+    let simplify_decorations = match simplify_by_decoration {
+        true => Some(super::log::build_decorations(
+            &repo,
+            &super::log::DecorationFilter::unfiltered(),
+        )?),
+        false => None,
+    };
+    if prune {
         let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
         // `--remove-empty` runs ahead of the TREESAME classification below because
         // what it does is cut a parent's ancestry off the walk: the commits it
@@ -2423,7 +2454,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 simplify_history: false,
                 first_parent,
             };
-            let mut diff = PathDiff { repo: &repo, specs: &mut specs };
+            let mut diff = PathDiff {
+                repo: &repo,
+                specs: &mut specs,
+                decorations: simplify_decorations.as_ref(),
+                pathspec: !pathspecs.is_empty(),
+            };
             let mut info: HashMap<ObjectId, super::simplify::Classified> =
                 HashMap::with_capacity(commits.len());
             for id in &commits {
@@ -2668,44 +2704,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `--simplify-by-decoration`: the same simplification the pathspec path runs,
-    // asking a different question of each commit. A commit that carries a decoration
-    // is kept, and so are a root and a merge, because simplification may not change
-    // the shape of the history; everything else is walked past, and what is then
-    // unreachable from the tips drops out with it.
-    //
-    // "Decorated" is `get_name_decoration()`'s answer (revision.c:789-794), which
-    // loads every ref with no filter (log-tree.c:94-98): a commit named only by
-    // `refs/bisect/*`, `refs/notes/*` or a ref outside `git log`'s default
-    // namespaces is kept too.
-    if simplify_by_decoration {
-        let filter = super::log::DecorationFilter::unfiltered();
-        let decos = super::log::build_decorations(&repo, &filter)?;
-        let kept: HashSet<ObjectId> = commits
-            .iter()
-            .copied()
-            .filter(|id| {
-                let parents = parents_of.get(id).map_or(0, Vec::len);
-                decos.decorates(id) || parents == 0 || parents > 1
-            })
-            .collect();
-        let mut reachable: HashSet<ObjectId> = HashSet::with_capacity(commits.len());
-        let mut stack: Vec<ObjectId> = tips.clone();
-        while let Some(id) = stack.pop() {
-            if !reachable.insert(id) {
-                continue;
-            }
-            let parents = parents_of.get(&id).map_or(&[][..], Vec::as_slice);
-            if kept.contains(&id) {
-                stack.extend(parents.iter().copied());
-            } else {
-                // A simplified-away commit is walked past along its first parent only.
-                stack.extend(parents.first().copied());
-            }
-        }
-        commits.retain(|id| kept.contains(id) && reachable.contains(id));
-    }
-
     // `simplify_commit` drops the TREESAME commits, then `commit_ignore` applies
     // the parent-count bounds and `commit_match` the header predicates.
     // `if (revs->unpacked && has_object_pack(revs->repo, &commit->object.oid))
@@ -2772,7 +2770,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `revs->prune && revs->dense && want_ancestry(revs)` (revision.c:4317-4318),
     // so `--sparse --parents` prints the ancestry the commits really have — as
     // the in-place prune left it, not as `rewrite_parents()` would.
-    if !pathspecs.is_empty() && show_parents && dense {
+    if prune && show_parents && dense {
         // `--simplify-merges` already ran the same `rewrite_parents()` over the
         // list `simplify_one()` produced; rerunning it over the survivors would
         // rewrite a rewrite.
@@ -5130,10 +5128,25 @@ fn commit_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
 struct PathDiff<'a> {
     repo: &'a gix::Repository,
     specs: &'a mut super::log::PathspecMatcher,
+    /// The decorations `--simplify-by-decoration` asks about, if it was given.
+    decorations: Option<&'a super::log::Decorations>,
+    /// `revs->prune_data.nr != 0`.
+    pathspec: bool,
 }
 
 impl super::simplify::TreeDiff for PathDiff<'_> {
     fn differs(&mut self, commit: ObjectId, parent: Option<ObjectId>) -> Result<bool> {
+        // `rev_compare_tree()` (revision.c:789-805): a decorated commit differs from
+        // every parent and an undecorated one, with no pathspec, from none. A root
+        // goes through `rev_same_tree_as_empty()` instead, which never asks.
+        if let (Some(decorations), Some(_)) = (self.decorations, parent) {
+            if decorations.decorates(&commit) {
+                return Ok(true);
+            }
+            if !self.pathspec {
+                return Ok(false);
+            }
+        }
         let Some(tree) = commit_tree(self.repo, commit) else {
             return Ok(false);
         };

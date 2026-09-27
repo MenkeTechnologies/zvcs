@@ -1887,31 +1887,26 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
              use '--pickaxe-regex' with '-S'\n",
         ));
     }
-    let pickaxe = Pickaxe {
-        s: match (&pickaxe_s, pickaxe_regex) {
-            (None, _) => None,
-            (Some(needle), false) => {
-                Some(super::diff_pickaxe::Needle::Literal(needle.as_bytes().to_vec()))
-            }
-            (Some(needle), true) => match super::diff_pickaxe::compile_regex(needle.as_bytes()) {
-                Ok(re) => Some(super::diff_pickaxe::Needle::Regex(re)),
-                Err(msg) => {
-                    eprintln!("fatal: invalid regex: {msg}");
-                    return Ok(ExitCode::from(128));
-                }
-            },
-        },
-        g: match &pickaxe_g {
-            Some(p) => Some(crate::revfilter::build_regex(
-                p,
-                crate::revfilter::Dialect::Basic,
-                false,
-                crate::revfilter::Origin::CommandLine,
-            )?),
-            None => None,
-        },
-        all: pickaxe_all,
+    // `diffcore_pickaxe()` compiles `-G`, and `-S` under `--pickaxe-regex`, with
+    // `REG_EXTENDED | REG_NEWLINE` (diffcore-pickaxe.c:242-246) — not in `--grep`'s
+    // dialect — and a failure is only raised once a commit is diffed.
+    let mut bad_regex: Option<String> = None;
+    let mut compile = |needle: &str| match super::diff_pickaxe::compile_regex(needle.as_bytes()) {
+        Ok(re) => Some(re),
+        Err(msg) => {
+            bad_regex.get_or_insert(msg);
+            None
+        }
     };
+    let s = match (&pickaxe_s, pickaxe_regex) {
+        (None, _) => None,
+        (Some(needle), false) => {
+            Some(super::diff_pickaxe::Needle::Literal(needle.as_bytes().to_vec()))
+        }
+        (Some(needle), true) => compile(needle).map(super::diff_pickaxe::Needle::Regex),
+    };
+    let g = pickaxe_g.as_deref().and_then(&mut compile);
+    let pickaxe = Pickaxe { s, g, all: pickaxe_all, bad_regex };
 
     let mut out: Vec<u8> = Vec::new();
     // git marks each commit it prints as SHOWN, so a commit named twice (or reached
@@ -2135,7 +2130,15 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
             }
-            show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None)?;
+            if let Err(e) = show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None) {
+                // git writes each object as `cmd_show()` reaches it, so a `die()`
+                // partway through the list — `regcomp_or_die()` on the first commit
+                // diffed, say — leaves the objects before it already printed.
+                let done = apply_line_prefix_except(out, &line_prefix, &no_prefix.borrow());
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(&done).and_then(|()| stdout.flush());
+                return Err(e);
+            }
         }
     }
 
@@ -2542,11 +2545,23 @@ struct Pickaxe {
     /// so the commit shows every file it touched. When nothing matched the queue is
     /// emptied either way.
     all: bool,
+    /// A `-G` / `--pickaxe-regex -S` needle that did not compile. git compiles it in
+    /// `diffcore_pickaxe()`, so `regcomp_or_die()` (diffcore-pickaxe.c:219-228) fires
+    /// only when a commit is diffed — never for a blob, tree or tag shown alone.
+    bad_regex: Option<String>,
 }
 
 impl Pickaxe {
     fn active(&self) -> bool {
-        self.s.is_some() || self.g.is_some()
+        self.s.is_some() || self.g.is_some() || self.bad_regex.is_some()
+    }
+
+    /// `regcomp_or_die()` at the first `diffcore_pickaxe()` call.
+    fn check(&self) -> Result<()> {
+        match &self.bad_regex {
+            Some(msg) => Err(crate::fatal::die(format!("invalid regex: {msg}"))),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3290,6 +3305,7 @@ fn show_commit_record(
             f.retain(|c| specs.matches(&c.path));
         }
         if pickaxe_path {
+            pickaxe.check()?;
             // Test each file's own change text, exactly as `git log` tests a
             // commit's patch. `--pickaxe-all` then decides what survives: git keeps
             // the whole queue when anything matched and empties it when nothing did
@@ -4898,6 +4914,7 @@ fn combined_pickaxe_survivors(
         true => None,
         false => Some(super::log::PathspecMatcher::new(repo, pathspecs)?),
     };
+    pickaxe.check()?;
     let mut survivors: Option<Vec<Vec<u8>>> = None;
     for parent in parents {
         let mut warn = super::diffcore_rename::Warnings::default();

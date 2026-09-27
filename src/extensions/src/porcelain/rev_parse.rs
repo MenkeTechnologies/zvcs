@@ -59,8 +59,7 @@
 //! exclusion list once the walk that consumed it is done.
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
-//! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`]: `--prefix <dir>` and
-//! `--exclude-hidden=`. Options `cmd_rev_parse()` does *not* recognize —
+//! [`UNIMPLEMENTED_EXACT`]: `--prefix <dir>`. Options `cmd_rev_parse()` does *not* recognize —
 //! `--help`, `--all-objects` and a `-h` past the first argument among them —
 //! are echoed through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
@@ -229,14 +228,12 @@ impl Default for Opts {
 /// Options stock git recognizes that this port does not implement. Echoing them
 /// the way unknown options are echoed would silently produce a wrong answer, so
 /// they are rejected instead.
-const UNIMPLEMENTED_EXACT: &[&str] = &["--prefix"];
-
+///
 /// `--prefix` is matched with `strcmp()` and takes `argv[++i]`
 /// (`builtin/rev-parse.c:838-845`), so a `--prefix=<dir>` spelling is not that
 /// option at all: it falls through to `show_flag()` and is echoed like any other
-/// unknown flag. Only the separate-argument form is listed in
-/// [`UNIMPLEMENTED_EXACT`].
-const UNIMPLEMENTED_PREFIX: &[&str] = &["--exclude-hidden="];
+/// unknown flag. Only the separate-argument form is listed.
+const UNIMPLEMENTED_EXACT: &[&str] = &["--prefix"];
 
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, builtin_rev_parse_usage)`
@@ -407,6 +404,10 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // `ref_excludes` in `builtin/rev-parse.c`: `--exclude=<pattern>` accumulates
     // here and the next ref walk both applies and clears it.
     let mut ref_excludes: Vec<String> = Vec::new();
+    // `ref_excludes.hidden_refs` (`revision.h`), filled by `--exclude-hidden=`;
+    // `Some` is `hidden_refs_configured`. Cleared with the `--exclude` list by
+    // the next ref walk.
+    let mut hidden_refs: Option<Vec<String>> = None;
     // git's `has_dashdash`, decided by a scan of the whole argument vector before
     // the loop starts (`builtin/rev-parse.c:717-722`):
     //
@@ -507,7 +508,34 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     }
                 }
                 Opt::Exclude(pattern) => ref_excludes.push(pattern),
+                Opt::ExcludeHidden(section) => {
+                    match exclude_hidden_refs(&mut out, &repo, &section, hidden_refs.is_some())? {
+                        Ok(patterns) => hidden_refs = Some(patterns),
+                        Err(code) => return Ok(code),
+                    }
+                }
                 Opt::Refs(kind, pattern) => {
+                    // ```c
+                    // if (ref_excludes.hidden_refs_configured)
+                    //         return error(_("options '%s' and '%s' cannot be used together"),
+                    //                      "--exclude-hidden", "--branches");
+                    // ```
+                    // (`builtin/rev-parse.c:958-979`), likewise for `--tags` and
+                    // `--remotes`: a `return error()` out of `cmd_rev_parse()`,
+                    // which `git` turns into exit 255.
+                    use crate::porcelain::log::RefSelector;
+                    let option = match kind {
+                        RefSelector::Branches => Some("--branches"),
+                        RefSelector::Tags => Some("--tags"),
+                        RefSelector::Remotes => Some("--remotes"),
+                        RefSelector::All | RefSelector::Glob => None,
+                    };
+                    if let (Some(option), Some(_)) = (option, &hidden_refs) {
+                        out.flush()?;
+                        eprintln!("error: options '--exclude-hidden' and '{option}' cannot be used together");
+                        return Ok(ExitCode::from(255));
+                    }
+                    let hidden = hidden_refs.take();
                     // `handle_ref_opt()` ends in `clear_ref_exclusions()`, and so
                     // does the `--all` branch: the exclusion list lives only until
                     // the next ref walk. `git rev-parse --exclude=side --branches
@@ -531,11 +559,16 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // Handing the full name straight through would have skipped that
                     // resolution and printed a ref stock git refuses to name.
                     for (echo, _full, id) in collect_refs(&repo, &selection)? {
+                        // `ref_excluded()`'s second half (`revision.c:1551-1565`),
+                        // on the name the walk handed `show_reference()`.
+                        if ref_hidden(hidden.as_deref(), echo.to_str().unwrap_or_default()) {
+                            continue;
+                        }
                         show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), None, false)?;
                     }
                 }
                 Opt::Bisect => {
-                    if let Some(code) = show_bisect_refs(&mut out, &repo, &paths, &o, &ref_excludes)? {
+                    if let Some(code) = show_bisect_refs(&mut out, &repo, &paths, &o, &ref_excludes, hidden_refs.as_deref())? {
                         out.flush()?;
                         return Ok(code);
                     }
@@ -1424,6 +1457,8 @@ enum Opt {
     Exclude(String),
     /// `--bisect`: the `refs/bisect/<bad>*` refs, then `^refs/bisect/<good>*`.
     Bisect,
+    /// `--exclude-hidden=<section>`: the hidden-refs half of `ref_excludes`.
+    ExcludeHidden(String),
     /// Not an option stock git knows; git echoes these.
     Unknown,
     /// git `die()`d on the option's value: the message is already on stderr and the
@@ -1464,7 +1499,7 @@ enum Query {
 }
 
 fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
-    if UNIMPLEMENTED_EXACT.contains(&arg) || UNIMPLEMENTED_PREFIX.iter().any(|p| arg.starts_with(p)) {
+    if UNIMPLEMENTED_EXACT.contains(&arg) {
         anyhow::bail!("{arg} is not ported yet");
     }
 
@@ -1516,6 +1551,9 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         }
         _ if arg.starts_with("--exclude=") => {
             return Ok(Opt::Exclude(arg["--exclude=".len()..].to_string()))
+        }
+        _ if arg.starts_with("--exclude-hidden=") => {
+            return Ok(Opt::ExcludeHidden(arg["--exclude-hidden=".len()..].to_string()))
         }
         _ => {
             // `--show-object-format=<mode>`: git names three, and rejects anything
@@ -2215,6 +2253,7 @@ fn show_bisect_refs(
     paths: &PathCtx,
     o: &Opts,
     excludes: &[String],
+    hidden: Option<&[String]>,
 ) -> Result<Option<ExitCode>> {
     let (bad, good) = match read_bisect_terms(repo) {
         Ok(terms) => terms,
@@ -2242,7 +2281,8 @@ fn show_bisect_refs(
     for (full, id) in refs.iter().filter(|(full, _)| full.starts_with(&format!("refs/bisect/{bad}"))) {
         let excluded = excludes
             .iter()
-            .any(|p| crate::porcelain::log::wildmatch(p.as_bytes(), full.as_bytes()));
+            .any(|p| crate::porcelain::log::wildmatch(p.as_bytes(), full.as_bytes()))
+            || ref_hidden(hidden, full);
         if !excluded {
             show_rev(out, repo, o, id, Some(full.as_bytes().as_bstr()), None, false)?;
         }
@@ -2251,6 +2291,67 @@ fn show_bisect_refs(
         show_rev(out, repo, o, id, Some(full.as_bytes().as_bstr()), None, true)?;
     }
     Ok(None)
+}
+
+/// `exclude_hidden_refs()` (`revision.c:1600-1616`) for `--exclude-hidden=<section>`:
+/// the section is checked, a second use is refused, and then every configured
+/// value is handed to `hide_refs_config()` in callback order. `Ok(Err(code))`
+/// is a `die()` whose message is already on stderr.
+///
+/// `parse_hide_refs_config()` (`refs.c:1688-1708`) keeps `transfer.hideRefs`
+/// and `<section>.hideRefs` — no subsection — in the order the configuration
+/// lists them, with trailing slashes dropped; a valueless one is
+/// `config_error_nonbool()`, which `configset_iter()` turns into a `die()`
+/// naming where that entry came from. The callback runs for every key, so a
+/// repository's own config alone makes `hidden_refs_configured` true.
+fn exclude_hidden_refs(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    section: &str,
+    configured: bool,
+) -> Result<std::result::Result<Vec<String>, ExitCode>> {
+    let die = |out: &mut dyn Write, message: String| -> Result<std::result::Result<Vec<String>, ExitCode>> {
+        out.flush()?;
+        eprintln!("fatal: {message}");
+        Ok(Err(ExitCode::from(128)))
+    };
+    if !matches!(section, "fetch" | "receive" | "uploadpack") {
+        return die(out, format!("unsupported section for hidden refs: {section}"));
+    }
+    if configured {
+        return die(out, "--exclude-hidden= passed more than once".into());
+    }
+    let own_key = format!("{section}.hiderefs");
+    let mut patterns = Vec::new();
+    for entry in crate::config::walk_config(repo) {
+        if entry.key != "transfer.hiderefs" && entry.key != own_key {
+            continue;
+        }
+        let Some(value) = entry.value else {
+            out.flush()?;
+            eprintln!("error: missing value for '{}'", entry.key);
+            eprintln!("fatal: {}", entry.origin.die_linenr(&entry.key));
+            return Ok(Err(ExitCode::from(128)));
+        };
+        patterns.push(value.trim_end_matches('/').to_string());
+    }
+    Ok(Ok(patterns))
+}
+
+/// The `ref_is_hidden(strip_namespace(path), path, &exclusions->hidden_refs)` test
+/// of `ref_excluded()` (`revision.c:1551-1565`). `strip_namespace()` is `NULL`
+/// for a ref outside ``, and the name itself when none is set.
+fn ref_hidden(hidden: Option<&[String]>, path: &str) -> bool {
+    let Some(patterns) = hidden else {
+        return false;
+    };
+    let stripped = match crate::namespace::from_env() {
+        None => Some(path),
+        Some(raw) => gix::refs::namespace::expand(raw.as_str())
+            .ok()
+            .and_then(|ns| path.strip_prefix(ns.as_bstr().to_str().ok()?)),
+    };
+    super::receive_pack::ref_is_hidden_qualified(patterns, stripped, path)
 }
 
 /// `read_bisect_terms()` (`bisect.c:1005-1031`): the first two lines of

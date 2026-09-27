@@ -212,6 +212,9 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         Ok(repo) => repo,
         Err(_) => bail!("ls-remote outside a repository is not supported (no repository found)"),
     };
+    // `remote_get(dest)` (builtin/ls-remote.c) is the first lookup, which runs
+    // remote.c's `read_config()`.
+    crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
 
     let name_or_url = repository.map(BStr::new);
     let remote = match repo.find_fetch_remote(name_or_url) {

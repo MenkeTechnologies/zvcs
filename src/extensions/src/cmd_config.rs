@@ -475,6 +475,147 @@ fn git_push_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejec
 }
 
 // ---------------------------------------------------------------------------
+// remote.c read_config() / handle_config()
+// ---------------------------------------------------------------------------
+
+/// `repo->remote_state->initialized` (remote.c:634-636).
+static REMOTE_STATE_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Clear [`REMOTE_STATE_INITIALIZED`] where git would start a child process with a
+/// fresh `remote_state` and this port calls the child's code in-process instead —
+/// `pull`'s `run_fetch()` — so the child reads (and reports on) the remote
+/// configuration again, as the real one does.
+pub fn forget_remote_config_read() {
+    REMOTE_STATE_INITIALIZED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `read_config()` (remote.c:630-650): the one pass over the configuration that
+/// fills `repo->remote_state`, run lazily by the first `remote_get()`,
+/// `pushremote_get()`, `for_each_remote()` or `branch_get()` — so it lands after
+/// the command's own config callback and option parsing, at the point the
+/// command first asks for a remote. `remote_state->initialized` makes it run at
+/// most once per process; so does this.
+///
+/// Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c remote.o.prune=bogus push o main
+/// fatal: bad boolean config value 'bogus' for 'remote.o.prune'
+/// $ git -c remote.o.pushurl push o main
+/// error: missing value for 'remote.o.pushurl'
+/// fatal: unable to parse 'remote.o.pushurl' from command-line config
+/// $ git -c branch..remote=x push o main
+/// fatal: unable to parse 'branch..remote' from command-line config
+/// ```
+///
+/// Only refusals and the diagnostics nothing else in this port prints are
+/// reproduced; the values themselves are read where they are used. Two arms are
+/// left out on purpose: `remote.<name>.tagopt` and
+/// `remote.<name>.followRemoteHEAD` dereference a `NULL` value (stock 2.55.0
+/// segfaults on the valueless spelling), and the latter's
+/// `unrecognized followRemoteHEAD value` warning is already printed by
+/// `porcelain::fetch` where it reads the key. The refspec parse behind
+/// `remote.<name>.fetch`/`push` (`refspec_append()`) is not repeated here.
+pub fn read_remote_config(repo: &gix::Repository) -> Result<(), Rejection> {
+    if REMOTE_STATE_INITIALIZED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+    let mut receivepack: Vec<String> = Vec::new();
+    let mut uploadpack: Vec<String> = Vec::new();
+    for v in walk_config(repo) {
+        remote_handle_config(&v, &mut receivepack, &mut uploadpack)?;
+    }
+    Ok(())
+}
+
+/// `handle_config()` (remote.c:431-609).
+///
+/// `parse_config_key()` splits `<section>.<name>.<subkey>` with the name running
+/// from the first dot to the last, so a subsection may itself contain dots; a
+/// two-part key has no name at all.
+fn remote_handle_config(
+    v: &ConfigValue,
+    receivepack: &mut Vec<String>,
+    uploadpack: &mut Vec<String>,
+) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    let Some((section, rest)) = key.split_once('.') else {
+        return Ok(());
+    };
+    let (name, subkey) = match rest.rfind('.') {
+        Some(i) => (Some(&rest[..i]), &rest[i + 1..]),
+        None => (None, rest),
+    };
+    match section {
+        // remote.c:442-462.
+        "branch" => {
+            let Some(name) = name else { return Ok(()) };
+            // "There is a subsection, but it is empty." — `return -1` with no
+            // `error()` of its own, so only `git_die_config_linenr()` speaks.
+            if name.is_empty() {
+                return Err(reported(v, Vec::new()));
+            }
+            if matches!(subkey, "remote" | "pushremote" | "merge") {
+                string_value(v)?;
+            }
+            Ok(())
+        }
+        // remote.c:463-480. The block has no `return` of its own, but the
+        // `parse_config_key(key, "remote", …)` that follows fails for it.
+        "url" => {
+            if name.is_some() && matches!(subkey, "insteadof" | "pushinsteadof") {
+                string_value(v)?;
+            }
+            Ok(())
+        }
+        "remote" => {
+            let Some(name) = name else {
+                // remote.c:486-490.
+                if subkey == "pushdefault" {
+                    string_value(v)?;
+                }
+                return Ok(());
+            };
+            // remote.c:495-499. `name` is printed from its start to the end of
+            // the key, subkey included.
+            if name.starts_with('/') {
+                eprintln!("warning: config remote shorthand cannot begin with '/': {rest}");
+                return Ok(());
+            }
+            match subkey {
+                // remote.c:505-514.
+                "mirror" | "skipdefaultupdate" | "skipfetchall" | "prune" | "prunetags" => {
+                    bool_value(v, key)?;
+                }
+                // remote.c:515-532, 555-574.
+                "url" | "pushurl" | "push" | "fetch" | "proxy" | "proxyauthmethod" | "vcs"
+                | "serveroption" | "negotiationrestrict" | "negotiationinclude" => {
+                    string_value(v)?;
+                }
+                // remote.c:533-548: the first one wins, every later one is an
+                // `error()` that does not stop the command.
+                "receivepack" | "uploadpack" => {
+                    string_value(v)?;
+                    let seen = match subkey {
+                        "receivepack" => &mut *receivepack,
+                        _ => &mut *uploadpack,
+                    };
+                    if seen.iter().any(|n| n == name) {
+                        eprintln!("error: more than one {subkey} given, using the first");
+                    } else {
+                        seen.push(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // checkout / switch / restore
 // ---------------------------------------------------------------------------
 

@@ -935,7 +935,13 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // flag wins, else branch.<name>.rebase / pull.rebase.
     let (rebase_mode, rebase_unspecified) = match rebase_cli {
         Some(m) => (m, false),
-        None => config_rebase(&repo, branch_short.as_deref())?,
+        None => {
+            // `config_get_rebase()` opens with `branch_get("HEAD")` (builtin/pull.c:200),
+            // the pull's first touch of the remote state, so remote.c's
+            // `read_config()` runs here — in the pull itself, ahead of the fetch child.
+            crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
+            config_rebase(&repo, branch_short.as_deref())?
+        }
     };
     let mut rebasing = rebase_mode != RebaseMode::Disabled;
 
@@ -1085,6 +1091,15 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // once. The dispatcher runs that pass for a `git fetch` it is handed; the in-process call
     // below bypasses the dispatcher, so the pass is run here, and its refusal travels the same
     // road as any other `die()` inside the fetch.
+    // `get_rebase_fork_point()` (builtin/pull.c:1082) looks the upstream up through
+    // `remote_get()` before the fetch child starts, so a `--rebase` given on the
+    // command line still has the pull read the remote configuration itself.
+    if rebasing {
+        crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
+    }
+    // The child is a new process with its own `remote_state`, so it reads the remote
+    // configuration again, diagnostics and all.
+    crate::cmd_config::forget_remote_config_read();
     let fetch_result = crate::cmd_config::validate_fetch(&repo)
         .map_err(|rejection| rejection.into_error())
         .and_then(|()| super::fetch(&fetch_args));

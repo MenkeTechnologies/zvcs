@@ -346,6 +346,9 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
+    // `add_remote_or_group()` / `pushremote_get()` (builtin/push.c:747-777) are the
+    // first remote lookups, and the first lookup runs remote.c's `read_config()`.
+    crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
 
     // ```c
     // if (argc > 0) {

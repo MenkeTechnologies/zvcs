@@ -929,6 +929,12 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // `remote_get(NULL)` with no usable default leaves behind. `--all` skips every remote
     // `skipFetchAll` marks (`get_one_remote_for_fetch()`, :2179-2185); a named remote or
     // group is fetched whatever that flag says.
+    //
+    // Every branch but the `--all`-with-arguments refusal reaches `remote_get()` or
+    // `for_each_remote()`, whose first call is remote.c's `read_config()`.
+    if !(all && !positionals.is_empty()) {
+        crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
+    }
     let mut list: Vec<String> = Vec::new();
     let one: Option<Option<String>> = if all {
         match positionals.len() {

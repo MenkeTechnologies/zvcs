@@ -90,7 +90,12 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
     };
 
     match rest.first().map(String::as_str) {
-        None => list(&repo, verbose),
+        None => {
+            // `show_all()` walks `for_each_remote()`, which runs remote.c's
+            // `read_config()` first.
+            crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
+            list(&repo, verbose)
+        }
         Some("add") => add(&repo, &rest[1..]),
         Some("rename") => rename(&repo, &rest[1..]),
         Some("remove") | Some("rm") => remove(&repo, &rest[1..]),

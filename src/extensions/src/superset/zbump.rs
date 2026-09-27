@@ -184,8 +184,11 @@ pub fn zbump_run(args: &[String]) -> Result<BumpOutcome> {
     if staged {
         // Persist the on-disk index (gitlink staged) so `git status` shows the
         // submodule clean; any of the user's OTHER staged changes stay staged.
+        // Through the shared writer, so an unrelated entry that is racily modified
+        // is smudged (`do_write_index()`, read-cache.c:2902-2903) before the new,
+        // later index timestamp would make its stale stat read as clean.
         index.remove_tree();
-        index.write(gix::index::write::Options::default())?;
+        crate::index_racy::write(&repo, &mut index)?;
 
         let plural = if bumped == 1 { "" } else { "s" };
         let message = format!("zvcs: autobump {bumped} submodule pointer{plural}");

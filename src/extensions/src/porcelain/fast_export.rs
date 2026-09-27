@@ -922,13 +922,17 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                 continue;
             };
             let target = target.detach();
-            let Ok(commit) = repo.find_object(target)?.peel_to_commit() else {
-                continue; // a ref to a blob or tree is not exportable, as in git
+            // `handle_one_ref()` pends the object whatever its type; a ref to a
+            // blob or a tree (or a tag of one) is sorted out by
+            // `get_tags_and_duplicates()` and the walk, not here.
+            let Some(object) = peeled(&repo, target) else {
+                continue;
             };
             cmdline.push(Pending {
                 dwim: Some((name.clone(), target)),
                 pending_name: name,
-                commit: commit.id,
+                commit: object,
+                kind: kind_of(&repo, object),
                 negated,
             });
         }
@@ -945,6 +949,8 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // updated eventually, whether through a commit or manually at the end".
     let mut commit_refs: Vec<(BString, ObjectId)> = Vec::new();
     let mut tag_refs: Vec<(BString, ObjectId)> = Vec::new();
+    // The blobs `get_tags_and_duplicates()` exports before the walk starts.
+    let mut early_blobs: Vec<ObjectId> = Vec::new();
 
     // `revs->pending`, in the order `setup_revisions` filled it. The order is
     // load-bearing twice over, so it is kept rather than sorted: `--source` hands
@@ -956,20 +962,26 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     let mut hidden: Vec<ObjectId> = Vec::new();
 
     for p in &cmdline {
+        let is_commit = p.kind == gix::object::Kind::Commit;
         if p.negated {
-            hidden.push(p.commit);
+            if is_commit {
+                hidden.push(p.commit);
+            }
             // `get_tags_and_duplicates` skips a cmdline entry whose *flags* are
             // UNINTERESTING (fast-export.c:1065-1066), so a negative ref labels
             // nothing, contributes no tag block and gets no trailing `reset`.
             continue;
         }
-        tips.push(p.commit);
+        if is_commit {
+            tips.push(p.commit);
+        }
         // `repo_dwim_ref(e->name)` failing is the other `continue` there: a raw
         // object id, or a `^main` whose recorded name still has the caret.
         let Some((name, target)) = &p.dwim else {
             continue;
         };
-        if repo.find_object(*target)?.kind == gix::object::Kind::Tag {
+        let target_kind = repo.find_object(*target)?.kind;
+        if target_kind == gix::object::Kind::Tag {
             // `get_commit()` (fast-export.c:1040-1045): every tag of a nested
             // chain is filed under the one ref name, outermost first, so the
             // backwards walk below writes the innermost tag first.
@@ -982,7 +994,32 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                 tag_refs.push((name.clone(), tag));
                 tag = object.try_into_tag()?.target_id()?.detach();
             }
-        } else {
+        } else if target_kind != gix::object::Kind::Commit {
+            // `get_commit()` answers NULL for anything but a commit or a tag
+            // (fast-export.c:1050-1051).
+            eprintln!(
+                "warning: {}: unexpected object of type {target_kind}, skipping.",
+                p.pending_name
+            );
+            continue;
+        }
+        match p.kind {
+            gix::object::Kind::Commit => {}
+            // `case OBJ_BLOB: export_blob(&commit->object.oid); continue;`
+            // (fast-export.c:1090-1093): the blob a tag chain ends in is written
+            // right away, ahead of every commit.
+            gix::object::Kind::Blob => {
+                early_blobs.push(p.commit);
+                continue;
+            }
+            // `default: /* OBJ_TAG (nested tags) is already handled */`
+            // (fast-export.c:1094-1098).
+            other => {
+                eprintln!("warning: tag points to object of unexpected type {other}, skipping.");
+                continue;
+            }
+        }
+        if target_kind != gix::object::Kind::Tag {
             commit_refs.push((name.clone(), p.commit));
         }
         sources.entry(p.commit).or_insert_with(|| name.clone());
@@ -994,7 +1031,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
     // the only reason `fast-export <oid>` prints `commit <oid>` rather than an
     // empty refname, and why `--not ^main` prints `commit main` and not
     // `commit refs/heads/main`.
-    for p in &cmdline {
+    for p in cmdline.iter().filter(|p| p.kind == gix::object::Kind::Commit) {
         sources
             .entry(p.commit)
             .or_insert_with(|| p.pending_name.clone());
@@ -1275,6 +1312,13 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         st.out.extend_from_slice(b"feature done\n");
     }
 
+    for id in early_blobs {
+        // `export_blob()` returns at once under `--no-data` (fast-export.c:305-306).
+        if !opts.no_data {
+            emit_blob(&repo, id, &opts, &mut st)?;
+        }
+    }
+
     for info in &order_list {
         let override_parents = emit_parents.get(&info.id).map(Vec::as_slice);
         if let Some(f) = emit_commit(&repo, info, &opts, &sources, &mut st, filtering.then_some(&specs), override_parents)?
@@ -1497,8 +1541,14 @@ struct Pending {
     /// `fast-export --not ^main` prints `commit main` and `fast-export <oid>`
     /// prints `commit <oid>`.
     pending_name: BString,
-    /// The commit the argument peels to.
+    /// The object the argument peels to through any tags. Usually a commit; a
+    /// tag of a blob or a tree, or a blob or tree named directly, leaves that
+    /// object here instead, and [`Pending::kind`] says which.
     commit: ObjectId,
+    /// The type of [`Pending::commit`]. The walk takes only commits:
+    /// `handle_commit()` (revision.c) drops a blob or a tree when
+    /// `revs->blob_objects` / `tree_objects` are off, as they are here.
+    kind: gix::object::Kind,
     /// `e->flags & UNINTERESTING`.
     negated: bool,
 }
@@ -1565,6 +1615,7 @@ fn add_rev_token(
                     dwim: dwim_ref(repo, base).map(|(full, _)| (full, parent)),
                     pending_name: BString::from(name),
                     commit: parent,
+                    kind: gix::object::Kind::Commit,
                     negated: uninteresting,
                 }));
             };
@@ -1589,7 +1640,7 @@ fn add_rev_token(
         // leading `^`, and 2229/2234 file the object under `flags ^ local_flags`.
         // Under `--not` the two cancel and `^X` is *positive*: this is the XOR,
         // not an OR, and it is what `fast-export --not ^main base` relies on.
-        let id = commit_of(repo, rest).ok_or(None)?;
+        let id = peeled_of(repo, rest).ok_or(None)?;
         sel.args
             .push(CmdArg::Rev(pending(repo, cmdline, rest, id, !negated)));
         return Ok(());
@@ -1602,8 +1653,32 @@ fn add_rev_token(
         // resolutions below, which stop at the first absent object and would
         // leave the right endpoint unwarned.
         warn_range_once(repo, tok);
-        let (lc, rc) =
-            (commit_of_quiet(repo, l).ok_or(None)?, commit_of_quiet(repo, r).ok_or(None)?);
+        let named = (
+            crate::objname::resolve_quiet(repo, l).ok_or(None)?,
+            crate::objname::resolve_quiet(repo, r).ok_or(None)?,
+        );
+        let (lc, rc) = (peeled(repo, named.0).ok_or(None)?, peeled(repo, named.1).ok_or(None)?);
+        // ```c
+        // a = lookup_commit_reference(revs->repo, &a_obj->oid);
+        // b = lookup_commit_reference(revs->repo, &b_obj->oid);
+        // if (!a || !b)
+        //         return dotdot_missing(full_name, revs, symmetric);
+        // ```
+        //
+        // (revision.c:2092-2095.) Both lookups run, and each that peels to
+        // something else reports the id as named with the peeled type
+        // (commit.c:61-66) before `dotdot_missing()` dies naming the token.
+        let mut missing = false;
+        for (id, peeled_id) in [(named.0, lc), (named.1, rc)] {
+            let kind = kind_of(repo, peeled_id);
+            if kind != gix::object::Kind::Commit {
+                eprintln!("error: object {id} is a {kind}, not a commit");
+                missing = true;
+            }
+        }
+        if missing {
+            return Err(Some(format!("fatal: Invalid symmetric difference expression {tok}\n")));
+        }
         // `handle_dotdot_1` (revision.c:2087-2107): the merge bases go in under
         // `flags_exclude` (`flags ^ (UNINTERESTING | BOTTOM)`) and both endpoints
         // under `flags`, in that order — so plain `A...B` is
@@ -1626,15 +1701,15 @@ fn add_rev_token(
         // `b_flags = flags; a_flags = flags_exclude` (revision.c:2083-2086).
         let (l, r) = (default_head(l), default_head(r));
         warn_range_once(repo, tok);
-        let lc = commit_of_quiet(repo, l).ok_or(None)?;
-        let rc = commit_of_quiet(repo, r).ok_or(None)?;
+        let lc = peeled_of_quiet(repo, l).ok_or(None)?;
+        let rc = peeled_of_quiet(repo, r).ok_or(None)?;
         sel.args
             .push(CmdArg::Rev(pending(repo, l, l, lc, !negated)));
         sel.args
             .push(CmdArg::Rev(pending(repo, r, r, rc, negated)));
         return Ok(());
     }
-    let id = commit_of(repo, tok).ok_or(None)?;
+    let id = peeled_of(repo, tok).ok_or(None)?;
     sel.args
         .push(CmdArg::Rev(pending(repo, cmdline, tok, id, negated)));
     Ok(())
@@ -1656,7 +1731,7 @@ fn add_rev_token(
 /// ```
 ///
 /// — so *both* endpoints are resolved, and both warn, before either object is
-/// looked up. [`commit_of`] cannot reproduce that on its own: it fails on the
+/// looked up. [`peeled_of`] cannot reproduce that on its own: it fails on the
 /// left endpoint the moment that endpoint's object is missing, which for a
 /// full-length hex is exactly the case that warns, and the right endpoint then
 /// never resolves and never warns.
@@ -1665,7 +1740,7 @@ fn add_rev_token(
 /// the right one.
 ///
 /// The endpoint resolutions that follow must therefore be quiet — see
-/// [`commit_of_quiet`]. `AmbiguityWarnings` cannot do that job: its switch is
+/// [`peeled_of_quiet`]. `AmbiguityWarnings` cannot do that job: its switch is
 /// `warn_on_object_refname_ambiguity`, which git reads only in
 /// `get_oid_basic()`'s full-hex branch, so it leaves the plain-name warning on
 /// and the count doubles for `fast-export dup..main`.
@@ -1685,6 +1760,7 @@ fn pending(
         dwim: dwim_ref(repo, cmdline_name),
         pending_name: BString::from(pending_name),
         commit,
+        kind: kind_of(repo, commit),
         negated,
     }
 }
@@ -2255,16 +2331,26 @@ fn rewrite_one(mut id: ObjectId, simpl: &HashMap<ObjectId, Simpl>) -> Option<Obj
 /// full-length hex is decoded without asking the object database, so an id whose
 /// object is missing gets past this and fails at the `parse_object()` below,
 /// which is what `get_reference()`'s `bad object` diagnostic reports on.
-fn commit_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = crate::objname::resolve(repo, spec)?;
-    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
+fn peeled_of(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    peeled(repo, crate::objname::resolve(repo, spec)?)
 }
 
-/// [`commit_of`] for a range endpoint, which [`warn_range_once`] has already
+/// [`peeled_of`] for a range endpoint, which [`warn_range_once`] has already
 /// warned about as part of the token — git resolves each endpoint once.
-fn commit_of_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
-    let id = crate::objname::resolve_quiet(repo, spec)?;
-    Some(repo.find_object(id).ok()?.peel_to_commit().ok()?.id)
+fn peeled_of_quiet(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    peeled(repo, crate::objname::resolve_quiet(repo, spec)?)
+}
+
+/// `id` peeled through any tags. `handle_revision_arg()` pends whatever object
+/// a name resolves to, so a blob or a tree (or a tag of one) is accepted here;
+/// the walk and `get_tags_and_duplicates()` are what drop it later.
+fn peeled(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    Some(repo.find_object(id).ok()?.peel_tags_to_end().ok()?.id)
+}
+
+/// The type of an object already found to exist.
+fn kind_of(repo: &gix::Repository, id: ObjectId) -> gix::object::Kind {
+    repo.find_header(id).map_or(gix::object::Kind::Commit, |h| h.kind())
 }
 
 /// git's `repo_dwim_ref`: the fully-resolved ref name a spec names, if any.

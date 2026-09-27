@@ -794,11 +794,8 @@ struct Config {
     unpack_limit: u64,
     /// `receive.updateServerInfo`.
     update_server_info: bool,
-    /// `transfer.hideRefs` then `receive.hideRefs`, in that order — git reads
-    /// both into one list and lets the last match win, so a `!`-negation in
-    /// `receive.hideRefs` overrides a `transfer.hideRefs` pattern but not the
-    /// other way around, which is where this ordering can differ from git's
-    /// (git keeps whatever order the config files produced).
+    /// `transfer.hideRefs` and `receive.hideRefs` in configuration order, trailing
+    /// slashes dropped — one list in which the last match wins.
     hide_refs: Vec<String>,
     /// `receive.advertiseAtomic`, which gates both the advertised `atomic`
     /// capability and whether a client asking for it is honoured.
@@ -847,7 +844,7 @@ impl Config {
             Some(v) => DenyAction::parse(&v.to_string()),
             None => DenyAction::Unconfigured,
         };
-        let hide_refs = hide_ref_patterns(&config, "receive.hideRefs");
+        let hide_refs = hide_ref_patterns(repo, "receive");
         let cert_nonce_seed = config.string("receive.certNonceSeed").map(|v| v.to_string());
         Ok(Self {
             deny_deletes: config.boolean("receive.denyDeletes").unwrap_or(false),
@@ -994,24 +991,50 @@ impl Config {
     }
 }
 
-/// `refs.c::parse_hide_refs_config` for one protocol: the shared
-/// `transfer.hideRefs` patterns followed by the protocol's own
-/// (`receive.hideRefs`, `uploadpack.hideRefs`), which is the order that decides
-/// which `!`-negation wins. git keeps whatever order the config files produced,
-/// so a `transfer.hideRefs` negation of a `receive.hideRefs` pattern is where
-/// this can differ.
-pub fn hide_ref_patterns(config: &gix::config::Snapshot<'_>, protocol_key: &str) -> Vec<String> {
+/// `parse_hide_refs_config()` (refs.c:1688-1708) run over one `repo_config()`
+/// walk for `section` (`receive`, `uploadpack`, `fetch`):
+///
+/// ```c
+/// if (!strcmp("transfer.hiderefs", var) ||
+///     (!parse_config_key(var, section, NULL, NULL, &key) &&
+///      !strcmp(key, "hiderefs"))) {
+///         if (!value)
+///                 return config_error_nonbool(var);
+///         ref = (char *)strvec_push(hide_refs, value);
+///         len = strlen(ref);
+///         while (len && ref[len - 1] == '/')
+///                 ref[--len] = '\0';
+/// }
+/// ```
+///
+/// Both keys land in one list in the order the configuration lists them —
+/// which is what decides the winner when a `!`-negation from one key overlaps
+/// a pattern from the other — and each value loses its trailing slashes, so
+/// `refs/heads/` hides every branch rather than nothing. `Err` is the valueless
+/// entry the callback refuses; the caller owns the `die()` that follows.
+pub fn hide_ref_patterns_checked(
+    repo: &gix::Repository,
+    section: &str,
+) -> std::result::Result<Vec<String>, crate::config::ConfigValue> {
+    let own_key = format!("{section}.hiderefs");
     let mut patterns = Vec::new();
-    for key in ["transfer.hideRefs", protocol_key] {
-        patterns.extend(
-            config
-                .raw_values(key)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|v| v.to_string()),
-        );
+    for entry in crate::config::walk_config(repo) {
+        if entry.key != "transfer.hiderefs" && entry.key != own_key {
+            continue;
+        }
+        let Some(value) = entry.value.as_deref() else {
+            return Err(entry);
+        };
+        patterns.push(value.trim_end_matches('/').to_string());
     }
-    patterns
+    Ok(patterns)
+}
+
+/// [`hide_ref_patterns_checked`] for a command whose own configuration pass
+/// (`cmd_config::validate_receive_pack` for receive-pack) is where a valueless
+/// entry dies; here it only yields no patterns.
+pub fn hide_ref_patterns(repo: &gix::Repository, section: &str) -> Vec<String> {
+    hide_ref_patterns_checked(repo, section).unwrap_or_default()
 }
 
 /// `refs.c::ref_is_hidden`: the last pattern that matches wins, a leading `!`

@@ -2321,21 +2321,15 @@ fn exclude_hidden_refs(
     if configured {
         return die(out, "--exclude-hidden= passed more than once".into());
     }
-    let own_key = format!("{section}.hiderefs");
-    let mut patterns = Vec::new();
-    for entry in crate::config::walk_config(repo) {
-        if entry.key != "transfer.hiderefs" && entry.key != own_key {
-            continue;
-        }
-        let Some(value) = entry.value else {
+    match super::receive_pack::hide_ref_patterns_checked(repo, section) {
+        Ok(patterns) => Ok(Ok(patterns)),
+        Err(entry) => {
             out.flush()?;
             eprintln!("error: missing value for '{}'", entry.key);
             eprintln!("fatal: {}", entry.origin.die_linenr(&entry.key));
-            return Ok(Err(ExitCode::from(128)));
-        };
-        patterns.push(value.trim_end_matches('/').to_string());
+            Ok(Err(ExitCode::from(128)))
+        }
     }
-    Ok(Ok(patterns))
 }
 
 /// The `ref_is_hidden(strip_namespace(path), path, &exclusions->hidden_refs)` test

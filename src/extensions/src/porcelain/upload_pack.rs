@@ -833,8 +833,7 @@ fn advertisement(repo: &gix::Repository, policy: WantPolicy, no_done: bool) -> R
     // `upload-pack` filters its ref list through `ref_is_hidden()` exactly as
     // `receive-pack` does, off `uploadpack.hideRefs` plus the shared
     // `transfer.hideRefs`.
-    let config = repo.config_snapshot();
-    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+    let hidden = super::receive_pack::hide_ref_patterns(repo, "uploadpack");
     let head_target = repo
         .head_ref()
         .ok()
@@ -1154,8 +1153,7 @@ impl WantPolicy {
     /// set: every ref tip, minus the ones hidden from the advertisement when
     /// [`hides_hidden_refs`][Self::hides_hidden_refs] says so.
     fn our_refs(self, repo: &gix::Repository) -> Result<Vec<ObjectId>> {
-        let config = repo.config_snapshot();
-        let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+        let hidden = super::receive_pack::hide_ref_patterns(repo, "uploadpack");
         let skip_hidden = self.hides_hidden_refs();
         let mut out = Vec::new();
         for reference in repo.references()?.all()? {
@@ -1960,8 +1958,7 @@ fn ls_refs_command(
         prefixes.clear();
     }
 
-    let config = repo.config_snapshot();
-    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+    let hidden = super::receive_pack::hide_ref_patterns(repo, "uploadpack");
     let matches = |name: &str| {
         !super::receive_pack::ref_is_hidden(&hidden, name)
             && (prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p)))
@@ -2118,8 +2115,7 @@ fn process_fetch_args(
     writer: &mut PktWriter<std::io::Stdout>,
 ) -> Result<FetchArgs, Die> {
     let mut args = FetchArgs::default();
-    let config = repo.config_snapshot();
-    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+    let hidden = super::receive_pack::hide_ref_patterns(repo, "uploadpack");
 
     loop {
         let line = match reader.read()? {
@@ -2417,8 +2413,7 @@ fn send_pack_section(
 fn add_included_tags(repo: &gix::Repository, objects: &mut Vec<ObjectId>) {
     use std::collections::HashSet;
     let present: HashSet<ObjectId> = objects.iter().copied().collect();
-    let config = repo.config_snapshot();
-    let hidden = super::receive_pack::hide_ref_patterns(&config, "uploadpack.hideRefs");
+    let hidden = super::receive_pack::hide_ref_patterns(repo, "uploadpack");
     let Ok(refs) = repo.references() else { return };
     let Ok(tags) = refs.prefixed("refs/tags/") else { return };
     for reference in tags {

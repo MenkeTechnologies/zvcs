@@ -7,9 +7,14 @@
 //! first one, and `-p`/`--interactive`/`-a`/`-i`/`-o` die together — all before
 //! `prepare_index()`'s "No paths with --include/--only" (:387-390).
 //!
+//! An `amend:`/`reword:` fixup with `-m` dies with `fixup_message` already cut
+//! at its colon (:1392-1393), so the message reads `'--fixup:reword'`
+//! (:851-853).
+//!
 //! zvcs had no `check_fixup_reword_options()`: `--fixup=reword:X -a` committed
 //! the work tree's changes under an `amend!` commit, and a path or a merge in
-//! progress was accepted the same way.
+//! progress was accepted the same way. Its `-m` refusal named
+//! `'--fixup=amend:<commit>'` for both suboptions.
 //!
 //! Expectations measured from stock git 2.55.0 under the same environment.
 
@@ -117,4 +122,17 @@ fn a_reword_is_refused_in_the_middle_of_a_merge() {
         f.git(&["commit", "--fixup=reword:HEAD", "--no-edit"]),
         ("fatal: You are in the middle of a merge -- cannot reword.\n".into(), 128)
     );
+}
+
+#[test]
+fn m_with_amend_or_reword_names_the_suboption_as_typed() {
+    let f = Fixture::new("dash-m");
+    for sub in ["amend", "reword"] {
+        let spec = format!("--fixup={sub}:HEAD~1");
+        assert_eq!(
+            f.git(&["commit", &spec, "-m", "x"]),
+            (format!("fatal: options '-m' and '--fixup:{sub}' cannot be used together\n"), 128),
+            "{sub}"
+        );
+    }
 }

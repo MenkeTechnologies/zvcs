@@ -1629,8 +1629,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // `--fixup=amend:` — incompatible with `-m`, allows an empty change,
             // and carries the original message (its body only when the original
             // is itself an `amend!` commit, mirroring `prepare_amend_commit()`).
+            //
+            // `die(_("options '%s' and '%s:%s' cannot be used together"), "-m",
+            // "--fixup", fixup_message)` (builtin/commit.c:851-853), where
+            // `fixup_message` has been cut at the colon (:1392-1393), so it names
+            // the suboption as typed: `--fixup:amend` or `--fixup:reword`.
             if from_flags {
-                crate::git_fatal!("options '-m' and '--fixup=amend:<commit>' cannot be used together");
+                let sub = &raw[..alpha];
+                crate::git_fatal!("options '-m' and '--fixup:{sub}' cannot be used together");
             }
             allow_empty = true;
             let orig = c.message_raw()?.to_str_lossy().into_owned();

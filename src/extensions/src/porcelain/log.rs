@@ -2977,13 +2977,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // order, which is what breaks a commit-date tie between two of them.
     // `get_reference()`'s `die()` cannot unwind out of the closure below, so the offending name is
     // carried out and reported by the caller.
+    //
+    // Under `-g`, `add_pending_object_with_path()` hands each commit a ref-set option
+    // pends to `add_reflog_for_walk()` (revision.c:305-318), which refuses an
+    // UNINTERESTING one — `-g --not --all` — by the name `handle_one_ref()` gave it:
+    // `die("cannot walk reflogs for %s", name)` (reflog-walk.c:165-166).
+    let refuse_reflog_walk = |negated: bool, name: &str| {
+        (walk_reflogs && negated).then(|| format!("cannot walk reflogs for {name}"))
+    };
     let mut push_ref_tips = |at: usize,
                              tips: &mut Vec<ObjectId>,
                              tip_left: &mut Vec<bool>,
                              tip_names: &mut Vec<String>,
                              tip_sources: &mut Vec<String>,
                              neg_ids: &mut Vec<ObjectId>,
-                             bad_object: &mut Option<String>| {
+                             fatal: &mut Option<String>| {
         for sel in ref_selections.iter().filter(|s| s.at == at) {
             // `handle_one_ref()` names each pending object by the name the
             // iterator handed it: trimmed for `--branches`/`--tags`/`--remotes`,
@@ -3030,12 +3038,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // reports `dangling`. Skipping such a ref instead logged the healthy history and
                 // reported success, hiding a corrupt repository.
                 let Ok(object) = repo.find_object(oid) else {
-                    *bad_object = Some(name.to_string());
+                    *fatal = Some(format!("bad object {name}"));
                     return;
                 };
                 // A tag pointing at a tree or blob is not a history tip.
                 if object.kind != gix::objs::Kind::Commit {
                     continue;
+                }
+                if let Some(msg) = refuse_reflog_walk(sel.negated, name) {
+                    *fatal = Some(msg);
+                    return;
                 }
                 pend(oid, name, tips, tip_left, tip_names, tip_sources, neg_ids);
             }
@@ -3045,6 +3057,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             if sel.head && !sel.excluded("HEAD") {
                 if let Some(id) = repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten())
                 {
+                    if let Some(msg) = refuse_reflog_walk(sel.negated, "HEAD") {
+                        *fatal = Some(msg);
+                        return;
+                    }
                     pend(id.detach(), "HEAD", tips, tip_left, tip_names, tip_sources, neg_ids);
                 }
             }
@@ -3101,7 +3117,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // One `verify_non_filename()` per operand, not per endpoint: a range is
         // split into two specs here and git checks the token once.
         let mut token_checked = false;
-        let mut bad_object: Option<String> = None;
+        let mut fatal_msg: Option<String> = None;
         push_ref_tips(
             at,
             &mut tips,
@@ -3109,10 +3125,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             &mut tip_names,
             &mut tip_sources,
             &mut neg_ids,
-            &mut bad_object,
+            &mut fatal_msg,
         );
-        if let Some(name) = bad_object.take() {
-            eprintln!("fatal: bad object {name}");
+        if let Some(msg) = fatal_msg.take() {
+            eprintln!("fatal: {msg}");
             return Ok(ExitCode::from(128));
         }
         // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries, so a

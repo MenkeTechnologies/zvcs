@@ -412,10 +412,7 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
     match protocol_version_from_env() {
         2 => {
             if advertise_only {
-                let mut out = std::io::stdout().lock();
-                out.write_all(&v2_advertisement(&repo)?)?;
-                out.flush()?;
-                Ok(ExitCode::SUCCESS)
+                write_v2_advertisement(&repo)
             } else {
                 serve_v2(&repo, stateless_rpc)
             }
@@ -468,6 +465,11 @@ fn protocol_version_of(value: &str) -> u8 {
 /// by this binary. `advertise_only` (smart-HTTP info/refs) writes the advertisement
 /// and stops. Shallow/deepen and object filters are not negotiated (ignored).
 fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> Result<ExitCode> {
+    // `upload_pack()` reads its configuration before a byte of the advertisement
+    // (upload-pack.c:1408); v1's `version 1` line is already out by then.
+    if let Err(rejection) = crate::cmd_config::validate_upload_pack(repo) {
+        return Ok(die_on_rejection(rejection));
+    }
     // Every failure inside `upload-pack` is a `die()` in git: a truncated
     // request stream, a bad pkt-line length, a filter the policy bans. All of
     // them print `fatal: <reason>` and exit 128, so the error must not escape to
@@ -1711,9 +1713,36 @@ impl V2Config {
     }
 }
 
+/// `die()` on a refused `upload_pack_config()` value: any `error:` lines, then
+/// the `fatal:` line, exit 128.
+fn die_on_rejection(rejection: crate::default_config::Rejection) -> ExitCode {
+    let fatal = rejection.into_fatal();
+    if !fatal.is_empty() {
+        eprintln!("fatal: {fatal}");
+    }
+    ExitCode::from(128)
+}
+
+/// Write [`v2_advertisement`] to stdout. A refused configuration value still
+/// lets the capabilities ahead of `fetch` out, as git's per-line writes do.
+fn write_v2_advertisement(repo: &gix::Repository) -> Result<ExitCode> {
+    let (adv, refused) = v2_advertisement(repo)?;
+    let mut out = std::io::stdout().lock();
+    out.write_all(&adv)?;
+    out.flush()?;
+    Ok(refused.map_or(ExitCode::SUCCESS, die_on_rejection))
+}
+
 /// `protocol_v2_advertise_capabilities()` (serve.c:186-216): `version 2`, then
 /// one pkt-line per advertised capability in table order, then a flush.
-fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
+///
+/// `fetch`'s advertise callback is `upload_pack_advertise()`, which runs
+/// `get_upload_pack_config()` (upload-pack.c:1835-1841); a value it refuses
+/// dies after `version 2`, `agent` and `ls-refs` have been written. That is the
+/// `Some` half of the return, with the buffer cut where git stopped.
+fn v2_advertisement(
+    repo: &gix::Repository,
+) -> Result<(Vec<u8>, Option<crate::default_config::Rejection>)> {
     let cfg = V2Config::from_repo(repo);
     let mut out = Vec::new();
     pkt_line(&mut out, b"version 2\n");
@@ -1721,6 +1750,9 @@ fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
     match cfg.unborn {
         Unborn::Advertise => pkt_line(&mut out, b"ls-refs=unborn\n"),
         _ => pkt_line(&mut out, b"ls-refs\n"),
+    }
+    if let Err(rejection) = crate::cmd_config::validate_upload_pack(repo) {
+        return Ok((out, Some(rejection)));
     }
     pkt_line(&mut out, format!("fetch={}\n", cfg.fetch_values()).as_bytes());
     pkt_line(&mut out, b"server-option\n");
@@ -1742,7 +1774,7 @@ fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
         pkt_line(&mut out, format!("promisor-remote={info}\n").as_bytes());
     }
     flush_pkt(&mut out);
-    Ok(out)
+    Ok((out, None))
 }
 
 /// `protocol_v2_serve_loop()` (serve.c:356-372): advertise unless this is a
@@ -1750,10 +1782,10 @@ fn v2_advertisement(repo: &gix::Repository) -> Result<Vec<u8>> {
 /// client closes the connection.
 fn serve_v2(repo: &gix::Repository, stateless_rpc: bool) -> Result<ExitCode> {
     if !stateless_rpc {
-        let adv = v2_advertisement(repo)?;
-        let mut out = std::io::stdout().lock();
-        out.write_all(&adv)?;
-        out.flush()?;
+        let code = write_v2_advertisement(repo)?;
+        if code != ExitCode::SUCCESS {
+            return Ok(code);
+        }
     }
     let cfg = V2Config::from_repo(repo);
     let mut reader = PktReader::new(std::io::stdin());
@@ -1930,6 +1962,20 @@ fn ls_refs_command(
     /// longer be the comprehensive list it is meant to be, so it is dropped.
     const TOO_MANY_PREFIXES: usize = 65536;
 
+    // `repo_config(the_repository, ls_refs_config, &data)` comes before the
+    // argument loop (ls-refs.c:171). Its only callback is
+    // `parse_hide_refs_config()`, so a valueless hideRefs is the one refusal.
+    let hidden = match super::receive_pack::hide_ref_patterns_checked(
+        crate::config::walk_config_after_enter_repo(repo),
+        "uploadpack",
+    ) {
+        Ok(hidden) => hidden,
+        Err(entry) => {
+            eprintln!("error: missing value for '{}'", entry.key);
+            return Err(Die(entry.origin.die_linenr(&entry.key)));
+        }
+    };
+
     let mut peel = false;
     let mut symrefs = false;
     let mut unborn = false;
@@ -1958,7 +2004,6 @@ fn ls_refs_command(
         prefixes.clear();
     }
 
-    let hidden = super::receive_pack::hide_ref_patterns(repo, "uploadpack");
     let matches = |name: &str| {
         !super::receive_pack::ref_is_hidden(&hidden, name)
             && (prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p)))
@@ -2094,6 +2139,11 @@ fn fetch_command(
     reader: &mut PktReader<std::io::Stdin>,
     writer: &mut PktWriter<std::io::Stdout>,
 ) -> Result<(), Die> {
+    // `upload_pack_v2()` reads the configuration before the arguments
+    // (upload-pack.c:1779).
+    if let Err(rejection) = crate::cmd_config::validate_upload_pack(repo) {
+        return Err(Die(rejection.into_fatal()));
+    }
     let args = process_fetch_args(repo, cfg, reader, writer)?;
 
     if args.wants.is_empty() && !args.wait_for_done {

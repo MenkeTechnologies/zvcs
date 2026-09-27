@@ -1010,15 +1010,18 @@ impl Config {
 /// Both keys land in one list in the order the configuration lists them —
 /// which is what decides the winner when a `!`-negation from one key overlaps
 /// a pattern from the other — and each value loses its trailing slashes, so
-/// `refs/heads/` hides every branch rather than nothing. `Err` is the valueless
-/// entry the callback refuses; the caller owns the `die()` that follows.
+/// `refs/heads/` hides every branch rather than nothing. `walk` is the caller's
+/// `repo_config()` pass — a server program's names files the way `enter_repo()`
+/// left them ([`crate::config::walk_config_after_enter_repo`]). `Err` is the
+/// valueless entry the callback refuses; the caller owns the `die()` that
+/// follows.
 pub fn hide_ref_patterns_checked(
-    repo: &gix::Repository,
+    walk: Vec<crate::config::ConfigValue>,
     section: &str,
 ) -> std::result::Result<Vec<String>, crate::config::ConfigValue> {
     let own_key = format!("{section}.hiderefs");
     let mut patterns = Vec::new();
-    for entry in crate::config::walk_config(repo) {
+    for entry in walk {
         if entry.key != "transfer.hiderefs" && entry.key != own_key {
             continue;
         }
@@ -1031,10 +1034,10 @@ pub fn hide_ref_patterns_checked(
 }
 
 /// [`hide_ref_patterns_checked`] for a command whose own configuration pass
-/// (`cmd_config::validate_receive_pack` for receive-pack) is where a valueless
-/// entry dies; here it only yields no patterns.
+/// (`cmd_config::validate_receive_pack`, `cmd_config::validate_upload_pack`) is
+/// where a valueless entry dies; here it only yields no patterns.
 pub fn hide_ref_patterns(repo: &gix::Repository, section: &str) -> Vec<String> {
-    hide_ref_patterns_checked(repo, section).unwrap_or_default()
+    hide_ref_patterns_checked(crate::config::walk_config(repo), section).unwrap_or_default()
 }
 
 /// `refs.c::ref_is_hidden`: the last pattern that matches wins, a leading `!`

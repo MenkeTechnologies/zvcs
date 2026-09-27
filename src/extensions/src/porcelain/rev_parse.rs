@@ -2322,7 +2322,7 @@ fn exclude_hidden_refs(
     if configured {
         return die(out, "--exclude-hidden= passed more than once".into());
     }
-    match super::receive_pack::hide_ref_patterns_checked(repo, section) {
+    match super::receive_pack::hide_ref_patterns_checked(crate::config::walk_config(repo), section) {
         Ok(patterns) => Ok(Ok(patterns)),
         Err(entry) => {
             out.flush()?;

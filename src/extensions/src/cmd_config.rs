@@ -2,8 +2,10 @@
 //! for commands outside the diff/status/log family: `grep_cmd_config`
 //! (builtin/grep.c:297-327) and the `grep_config` it wraps (grep.c:59-111),
 //! `git_blame_config` (builtin/blame.c:714-805), `git_fetch_config`
-//! (builtin/fetch.c:115-177), `git_push_config` (builtin/push.c:477-540) and
-//! `repack_config` (builtin/repack.c:55-113).
+//! (builtin/fetch.c:115-177), `git_push_config` (builtin/push.c:477-540),
+//! `repack_config` (builtin/repack.c:55-113), `receive_pack_config`
+//! (builtin/receive-pack.c:145-278) and `upload_pack_config`
+//! (upload-pack.c:1334-1379), the last of which has no `git_default_config` link.
 //!
 //! Each is the same shape as [`crate::diff_config`]: a chain that ends in
 //! `git_default_config`, walked once per configured value in parse order. Which
@@ -575,6 +577,81 @@ fn receive_pack_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), R
         }
     }
     git_default_config(v, out)
+}
+
+// ---------------------------------------------------------------------------
+// upload-pack
+// ---------------------------------------------------------------------------
+
+/// `get_upload_pack_config()` → `repo_config(r, upload_pack_config, data)`
+/// (upload-pack.c:1392-1399), after `enter_repo()`. `upload_pack()` runs it
+/// before the v0/v1 advertisement (upload-pack.c:1408), `upload_pack_v2()` at
+/// the start of a v2 `fetch` (:1779), and `upload_pack_advertise()` while the
+/// v2 capability list is being written (:1841) — so a v2 advertisement stops
+/// after `ls-refs`, right where `fetch` would have been.
+///
+/// Unlike receive-pack's callback this one does not fall through to
+/// `git_default_config()`; `core.precomposeunicode` is the one core key it
+/// reads itself. Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -C r config uploadpack.keepAlive bogus; git upload-pack --advertise-refs r
+/// fatal: bad numeric config value 'bogus' for 'uploadpack.keepalive' in file config: invalid unit
+/// ```
+pub fn validate_upload_pack(repo: &gix::Repository) -> Result<(), Rejection> {
+    for v in crate::config::walk_config_after_enter_repo(repo) {
+        upload_pack_config(&v)?;
+    }
+    Ok(())
+}
+
+/// `upload_pack_config()` (upload-pack.c:1334-1379), refusals only: the
+/// `if`/`else if` chain, then `parse_object_filter_config()` (:1297-1332), then
+/// `parse_hide_refs_config()` (refs.c:1688-1708) — each key reaches at most one
+/// of them.
+fn upload_pack_config(v: &ConfigValue) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    match key {
+        "uploadpack.allowtipsha1inwant"
+        | "uploadpack.allowreachablesha1inwant"
+        | "uploadpack.allowanysha1inwant"
+        | "uploadpack.allowfilter"
+        | "uploadpack.allowrefinwant"
+        | "uploadpack.allowsidebandall"
+        | "core.precomposeunicode"
+        | "transfer.advertisesid" => {
+            bool_value(v, key)?;
+            return Ok(());
+        }
+        "uploadpack.keepalive" => {
+            int_value(v, key)?;
+            return Ok(());
+        }
+        "transfer.hiderefs" | "uploadpack.hiderefs" => {
+            string_value(v)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+    // `parse_config_key(var, "uploadpackfilter", &sub, &sub_len, &key)`: the
+    // subsection runs from the first dot to the last.
+    if let Some(rest) = key.strip_prefix("uploadpackfilter.") {
+        match rest.rsplit_once('.') {
+            None if rest == "allow" => {
+                bool_value(v, key)?;
+            }
+            None => {}
+            Some((_, "allow")) => {
+                bool_value(v, key)?;
+            }
+            Some(("tree", "maxdepth")) => {
+                string_value(v)?;
+                ulong_value(v, key)?;
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -541,6 +541,13 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             show(&mut out, &o, arg.as_bytes())?;
+            // `verify_filename(prefix, arg, 0)` opens with
+            // `if (*arg == '-') die(_("option '%s' must come before non-option arguments"), arg);`
+            // (setup.c:287-288): past the first path an option spelling is
+            // refused as misplaced, never looked up as a file.
+            if let Some(code) = die_on_option_in_path_position(&mut out, arg)? {
+                return Ok(code);
+            }
             if !crate::setup::looks_like_pathspec(arg) && !is_worktree_path(&repo, arg) {
                 out.flush()?;
                 eprintln!(
@@ -883,6 +890,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
                 show(&mut out, &o, arg.as_bytes())?;
+                // `verify_filename(prefix, arg, 1)` refuses a leading `-` before
+                // anything else (setup.c:287-288). An operand only reaches here
+                // with one when `--end-of-options` stopped it being read as an
+                // option, so `git rev-parse --end-of-options --verify HEAD` echoes
+                // both tokens and then dies naming `--verify`.
+                if let Some(code) = die_on_option_in_path_position(&mut out, arg)? {
+                    return Ok(code);
+                }
                 // `verify_filename()` is
                 // `if (looks_like_pathspec(arg) || check_filename(prefix, arg)) return;`
                 // (setup.c:289-290): a wildcard, or long-form `:(…)` magic, says
@@ -1817,6 +1832,20 @@ const USAGE: &str = r#"usage: git rev-parse --parseopt [<options>] -- [<args>...
 
 Run "git rev-parse --parseopt -h" for more information on the first usage.
 "#;
+
+/// The first check of `verify_filename()` (setup.c:280-288): a path-position
+/// token that starts with `-` is an option given after the non-options, and is
+/// `die()`d with that message whatever the file system holds. The caller has
+/// already echoed the token, as `show_file()` does before `verify_filename()`
+/// in `cmd_rev_parse()` (builtin/rev-parse.c:751-753, :1185-1188).
+fn die_on_option_in_path_position(out: &mut impl Write, arg: &str) -> Result<Option<ExitCode>> {
+    if !arg.starts_with('-') {
+        return Ok(None);
+    }
+    out.flush()?;
+    eprintln!("fatal: option '{arg}' must come before non-option arguments");
+    Ok(Some(ExitCode::from(128)))
+}
 
 fn is_worktree_path(repo: &gix::Repository, arg: &str) -> bool {
     // `check_filename()` (`setup.c:173-198`) strips the short pathspec magic that

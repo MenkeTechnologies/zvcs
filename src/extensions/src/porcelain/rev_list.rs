@@ -1065,6 +1065,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `revs->graph`: `--graph` is a `revision.c` option, so `rev-list` draws the
     // same ASCII graph in front of its object names that `log` does.
     let mut graph = false;
+    // `revs->graph_max_lanes` (`--graph-lane-limit=<n>`, revision.c:2627-2628).
+    let mut graph_max_lanes: i64 = 0;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -1593,6 +1595,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // That deferral is why the order is applied after this loop rather than
             // in the `--graph` arm.
             "--no-graph" => graph = false,
+            // Only the stuck form exists (`skip_prefix()`), so a bare
+            // `--graph-lane-limit` stays unknown.
+            s if s.starts_with("--graph-lane-limit=") => {
+                match crate::revopt::parse_count(&s["--graph-lane-limit=".len()..]) {
+                    Ok(n) => graph_max_lanes = i64::from(n),
+                    Err(message) => return Ok(fatal(&message)),
+                }
+            }
             "--ignore-missing" => ignore_missing = true,
             // ```c
             // } else if (!strcmp(arg, "--reflog")) {
@@ -2211,6 +2221,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal(
             "options '--no-walk' and '--graph' cannot be used together",
         ));
+    }
+    // `if (revs->graph_max_lanes > 0 && !revs->graph) die(…)` (revision.c:3200-3201).
+    if graph_max_lanes > 0 && !graph {
+        return Ok(fatal("the option '--graph-lane-limit' requires '--graph'"));
     }
     // The graph draws one block per commit record. `--objects` interleaves object
     // names between those blocks unprefixed, and `--count`/`--quiet`/`--disk-usage`
@@ -3611,6 +3625,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             first_parent,
             left_right,
             &interest,
+            graph_max_lanes,
         )?;
         out.extend_from_slice(&drawn);
     }

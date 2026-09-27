@@ -154,20 +154,10 @@ const GIT_LOG_LONG_OPTS: &[&str] = &[
     "git-completion-helper-all",
     "glob",
     "graph",
-    // `graph-lane-limit` is absent here, and this list cannot express it
-    // correctly either way. git 2.55.0 parses it only through
-    // `skip_prefix(arg, "--graph-lane-limit=", …)`, so the two spellings answer
-    // differently:
-    //
-    //     git log --graph-lane-limit          fatal: unrecognized argument: …
-    //     git log --graph-lane-limit=5        fatal: the option '--graph-lane-limit' requires '--graph'
-    //     git log --graph --graph-lane-limit=3   works
-    //
-    // Membership is keyed on the name with `=value` cut off, so listing it makes
-    // both spellings say "not implemented" and omitting it makes both say
-    // "unrecognized argument". Omitted is the better half — it matches stock on
-    // the bare form — but the `=` form still diverges, and closing that needs a
-    // value-only entry kind this table does not have.
+    // `graph-lane-limit` is absent here on purpose. git 2.55.0 parses it only
+    // through `skip_prefix(arg, "--graph-lane-limit=", …)`, so the bare spelling
+    // is `fatal: unrecognized argument: …` — which omission gives — while the
+    // `=<n>` form is read by the option loop itself before this table is asked.
     //
     // It is also new since 2.50.1, which rejects it, and absent from 2.39
     // entirely; it appears in neither `-h` nor `--help-all`.
@@ -612,8 +602,7 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
 ///
 /// Deviations, surfaced rather than faked:
 ///   * `--graph` is a port of `graph.c` covering every parent count, octopus merges
-///     included, minus `graph_needs_truncation()` — the lane cap only reachable
-///     through `--graph-lane-limit=<n>`, which this port rejects as unsupported.
+///     included, and `--graph-lane-limit=<n>`'s `graph_needs_truncation()` lane cap.
 ///   * `--abbrev[=<n>]`/`--no-abbrev` set the width of every abbreviated id, applied as a
 ///     `core.abbrev` override. `--no-abbrev` is git's zero: the raw columns and `%h` print
 ///     the whole id while the patch `index` line stays at the configured default.
@@ -979,6 +968,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // from (`\t<source>` after the hash), for the built-in header formats.
     let mut source_mode = false;
     let mut graph = false;
+    // `revs->graph_max_lanes` (`--graph-lane-limit=<n>`, revision.c:2627-2628).
+    let mut graph_max_lanes: i64 = 0;
     // git's built-in default is `auto` (short refs when interactive, none when
     // piped); `log.decorate` overrides it, and the `--decorate` flags override
     // that in turn.
@@ -1752,6 +1743,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // an explicit `--topo-order --no-graph` or `--parents --no-graph` keeps its
         // own. This port reads `graph` at each of those decision points rather than
         // copying it into another flag, so clearing it is the whole of `--no-graph`.
+        } else if let Some(v) = a.strip_prefix("--graph-lane-limit=") {
+            // `skip_prefix(arg, "--graph-lane-limit=", &optarg)`: only the stuck
+            // form exists, so a bare `--graph-lane-limit` stays unrecognized.
+            match crate::revopt::parse_count(v) {
+                Ok(n) => graph_max_lanes = i64::from(n),
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "--no-graph" {
             graph = false;
         } else if a == "--ignore-missing" {
@@ -3466,6 +3467,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         eprintln!("fatal: options '--no-walk' and '--graph' cannot be used together");
         return Ok(ExitCode::from(128));
     }
+    // `if (revs->graph_max_lanes > 0 && !revs->graph) die(…)` (revision.c:3200-3201).
+    if graph_max_lanes > 0 && !graph {
+        eprintln!("fatal: the option '--graph-lane-limit' requires '--graph'");
+        return Ok(ExitCode::from(128));
+    }
 
     // Walk in git's default commit-date order, then re-sort if a topological
     // order was asked for. `--graph` implies `--topo-order` unless `--date-order`
@@ -5006,7 +5012,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // the graph is drawn here, so the widths are measured up front — the same
     // state machine, run for its column bookkeeping alone.
     if graph {
-        measure_graph_widths(&mut nodes, first_parent, &interest);
+        measure_graph_widths(&mut nodes, first_parent, &interest, graph_max_lanes);
     }
 
     // `--children`: the map `set_children()` built while the walk was still being
@@ -6220,6 +6226,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             first_parent,
             left_right,
             &interest,
+            graph_max_lanes,
         )?;
         let out = super::diff::apply_line_prefix(out, &line_prefix);
         let rc = match stdout.write_all(&out) {
@@ -13874,8 +13881,13 @@ pub(super) fn graph_colors(repo: &gix::Repository) -> Vec<String> {
 /// machine over the node list therefore yields the same widths `show_log()` reads
 /// one commit at a time, and costs a pass over the columns rather than a second
 /// render. The colors are irrelevant to the width, so the cheapest palette is used.
-fn measure_graph_widths(nodes: &mut [Node], first_parent: bool, interest: &GraphInterest) {
-    let mut graph = Graph::new(vec![String::new()], false);
+fn measure_graph_widths(
+    nodes: &mut [Node],
+    first_parent: bool,
+    interest: &GraphInterest,
+    max_lanes: i64,
+) {
+    let mut graph = Graph::new(vec![String::new()], false, max_lanes);
     for node in nodes.iter_mut() {
         let drawn_parents = interest.drawn_parents(node, first_parent);
         // The glyph does not change the row's width, so the cheapest one will do.
@@ -13960,8 +13972,9 @@ pub(super) fn render_graph(
     first_parent: bool,
     left_right: bool,
     interest: &GraphInterest,
+    max_lanes: i64,
 ) -> Result<Vec<u8>> {
-    let mut graph = Graph::new(colors, want_color);
+    let mut graph = Graph::new(colors, want_color, max_lanes);
     let mut out: Vec<u8> = Vec::new();
     // `opt->shown_one` together with `opt->missing_newline`: whether a record has
     // printed yet, and whether the last one's *message* ended in a newline
@@ -14174,11 +14187,11 @@ impl GraphLine {
 ///
 /// The port follows `graph.c` function for function: [`Graph::update`] is
 /// `graph_update()`, [`Graph::update_columns`] is `graph_update_columns()`, and
-/// each `*_line` method is the matching `graph_output_*_line()`. The one piece
-/// left out is `graph_needs_truncation()`, which only fires under
-/// `--graph-lane-limit=<n>`; this port's `log` rejects that option outright, so
-/// `revs->graph_max_lanes` is always 0 and every truncation branch is dead.
+/// each `*_line` method is the matching `graph_output_*_line()`, truncation
+/// under `--graph-lane-limit=<n>` included.
 struct Graph {
+    /// `revs->graph_max_lanes`: `--graph-lane-limit=<n>`, 0 (or less) for none.
+    max_lanes: i64,
     /// Columns as of the previous commit.
     columns: Vec<GraphColumn>,
     /// Columns as of the current commit.
@@ -14231,11 +14244,12 @@ struct Graph {
 const GRAPH_COLUMN_CAPACITY: usize = 30;
 
 impl Graph {
-    fn new(colors: Vec<String>, want_color: bool) -> Self {
+    fn new(colors: Vec<String>, want_color: bool, max_lanes: i64) -> Self {
         // git starts one short of the wrap point, because the first column opened
         // always increments first — which lands the first branch line on index 0.
         let default_column_color = colors.len().saturating_sub(2);
         Graph {
+            max_lanes,
             boundary: false,
             commit_char: b'*',
             columns: Vec::new(),
@@ -14259,6 +14273,20 @@ impl Graph {
             colors,
             default_column_color,
             want_color,
+        }
+    }
+
+    /// `graph_needs_truncation()` (graph.c:320-327): whether `lane` lies past
+    /// `--graph-lane-limit`. A value of 0 or less is no limit; a lane of -1 (git's
+    /// "not found" from `graph_find_new_column_by_commit()`) never is.
+    fn needs_truncation(&self, lane: isize) -> bool {
+        self.max_lanes > 0 && lane as i64 >= self.max_lanes
+    }
+
+    /// Append `s` — git's `graph_line_addstr()`.
+    fn addstr(line: &mut GraphLine, s: &[u8]) {
+        for ch in s {
+            line.addch(*ch);
         }
     }
 
@@ -14488,6 +14516,15 @@ impl Graph {
             }
         }
 
+        // "If graph_max_lanes is set, cap the width": `| ` per lane plus the `~ `
+        // truncation mark (graph.c:708-718).
+        if self.max_lanes > 0 {
+            let max_width = (self.max_lanes * 2 + 2) as usize;
+            if self.width > max_width {
+                self.width = max_width;
+            }
+        }
+
         while self.mapping_size > 1 && self.mapping[self.mapping_size - 1] < 0 {
             self.mapping_size -= 1;
         }
@@ -14519,7 +14556,11 @@ impl Graph {
             return self.next_line();
         }
         let mut line = GraphLine::new();
-        for col in &self.columns {
+        for (i, col) in self.columns.iter().enumerate() {
+            if self.needs_truncation(i as isize) {
+                Self::addstr(&mut line, b"~ ");
+                break;
+            }
             self.write_column(&mut line, col, b'|');
             if col.id == self.commit && self.num_parents > 2 {
                 for _ in 0..(self.num_parents - 2) * 2 {
@@ -14538,7 +14579,11 @@ impl Graph {
 
     /// `graph_output_padding_line()`: every branch line carries straight down.
     fn padding_line(&mut self, line: &mut GraphLine) {
-        for col in &self.new_columns {
+        for (i, col) in self.new_columns.iter().enumerate() {
+            if self.needs_truncation(i as isize) {
+                Self::addstr(line, b"~ ");
+                break;
+            }
             self.write_column(line, col, b'|');
             line.addch(b' ');
         }
@@ -14570,6 +14615,9 @@ impl Graph {
                 for _ in 0..self.expansion_row {
                     line.addch(b' ');
                 }
+            } else if seen_this && self.needs_truncation(i as isize) {
+                Self::addstr(line, b"~ ");
+                break;
             } else if seen_this && self.expansion_row == 0 {
                 // First expansion row: a branch line that the previous commit's
                 // post-merge row drew as `\` keeps going as `\` here.
@@ -14610,6 +14658,11 @@ impl Graph {
                 continue;
             };
             self.write_column(line, &col, b'-');
+            // The commit is at `commit_index`; each dash pair is one lane further.
+            if self.needs_truncation((self.commit_index + 1 + i as usize) as isize) {
+                Self::addstr(line, b"~ ");
+                break;
+            }
             self.write_column(line, &col, if i == dashed_parents - 1 { b'.' } else { b'-' });
         }
     }
@@ -14634,9 +14687,16 @@ impl Graph {
                 // hollow `o`, and every other commit as the character
                 // `get_revision_mark()` answers for it.
                 line.addch(if self.boundary { b'o' } else { self.commit_char });
+                if self.needs_truncation(i as isize) {
+                    line.addch(b' ');
+                    break;
+                }
                 if self.num_parents > 2 {
                     self.draw_octopus_merge(line);
                 }
+            } else if self.needs_truncation(i as isize) {
+                Self::addstr(line, b"~ ");
+                break;
             } else if seen_this && self.edges_added > 1 {
                 self.write_column(line, &self.columns[i], b'\\');
             } else if seen_this && self.edges_added == 1 {
@@ -14662,8 +14722,24 @@ impl Graph {
             line.addch(b' ');
         }
 
+        // A merge over the limit still needs its post-merge row when the first
+        // parent's lane is visible; with that lane truncated too, the row would only
+        // be padding (graph.c:1117-1151).
         if self.num_parents > 1 {
-            self.update_state(GraphState::PostMerge);
+            let first_lane = self
+                .parents
+                .first()
+                .and_then(|p| self.find_new_column_by_commit(*p))
+                .map_or(-1, |lane| lane as isize);
+            if !self.needs_truncation(self.commit_index as isize)
+                || !self.needs_truncation(first_lane)
+            {
+                self.update_state(GraphState::PostMerge);
+            } else if self.mapping_correct() {
+                self.update_state(GraphState::Padding);
+            } else {
+                self.update_state(GraphState::Collapsing);
+            }
         } else if self.mapping_correct() {
             self.update_state(GraphState::Padding);
         } else {
@@ -14698,6 +14774,7 @@ impl Graph {
                 // parent just took. `merge_layout` picks where in `merge_chars` the
                 // run starts, so a left-skewed merge opens with `/`.
                 let mut idx = self.merge_layout.clamp(0, 2) as usize;
+                let mut truncated = false;
                 for (j, parent) in self.parents.clone().into_iter().enumerate() {
                     let ch = MERGE_CHARS[idx];
                     match self.find_new_column_by_commit(parent) {
@@ -14707,24 +14784,50 @@ impl Graph {
                         }
                         None => line.addch(ch),
                     }
+                    // `j` counts parents, two to a lane, so it is halved to compare
+                    // with `i`; past the last lane there is nothing to truncate.
+                    if self.needs_truncation((j / 2 + i) as isize) && j / 2 + i <= num_columns {
+                        if (j + i * 2) % 2 != 0 {
+                            line.addch(b' ');
+                        }
+                        Self::addstr(line, b"~ ");
+                        truncated = true;
+                        break;
+                    }
                     if idx == 2 {
-                        if self.edges_added > 0 || j < self.num_parents - 1 {
+                        // A truncated next lane would double the padding.
+                        if self.needs_truncation(((j + 1) / 2 + i) as isize)
+                            && j < self.num_parents - 1
+                        {
+                            Self::addstr(line, b"~ ");
+                            truncated = true;
+                            break;
+                        } else if self.edges_added > 0 || j < self.num_parents - 1 {
                             line.addch(b' ');
                         }
                     } else {
                         idx += 1;
                     }
                 }
+                if truncated {
+                    break;
+                }
                 if self.edges_added == 0 {
                     line.addch(b' ');
                 }
+            } else if self.needs_truncation(i as isize) {
+                Self::addstr(line, b"~ ");
+                break;
             } else if seen_this {
                 if self.edges_added > 0 {
                     self.write_column(line, &self.columns[i], b'\\');
                 } else {
                     self.write_column(line, &self.columns[i], b'|');
                 }
-                line.addch(b' ');
+                // Between two lanes with the next one truncated: no padding.
+                if !self.needs_truncation(i as isize + 1) {
+                    line.addch(b' ');
+                }
             } else {
                 self.write_column(line, &self.columns[i], b'|');
                 // The gap left of a left-skewed merge is filled with the first
@@ -14810,17 +14913,28 @@ impl Graph {
         }
 
         let mut used_horizontal = false;
+        // Past the lane limit the row ends in `~ `, but the mapping keeps being
+        // updated so the next row still knows where every line is heading.
+        let mut truncated = false;
         for i in 0..self.mapping_size {
+            if !truncated && self.needs_truncation((i / 2) as isize) {
+                Self::addstr(line, b"~ ");
+                truncated = true;
+            }
             let target = self.mapping[i];
             // A collapsing edge is drawn in the color of the lane it is heading for,
             // which is the new column the mapping points at.
             let col = usize::try_from(target).ok().and_then(|t| self.new_columns.get(t)).copied();
             let Some(col) = col else {
-                line.addch(b' ');
+                if !truncated {
+                    line.addch(b' ');
+                }
                 continue;
             };
             if (target as usize) * 2 == i {
-                self.write_column(line, &col, b'|');
+                if !truncated {
+                    self.write_column(line, &col, b'|');
+                }
             } else if target == horizontal_edge_target && i as i32 != horizontal_edge - 1 {
                 // Only the first segment of a horizontal run continues onto the
                 // next row.
@@ -14828,12 +14942,16 @@ impl Graph {
                     self.mapping[i] = -1;
                 }
                 used_horizontal = true;
-                self.write_column(line, &col, b'_');
+                if !truncated {
+                    self.write_column(line, &col, b'_');
+                }
             } else {
                 if used_horizontal && (i as i32) < horizontal_edge {
                     self.mapping[i] = -1;
                 }
-                self.write_column(line, &col, b'/');
+                if !truncated {
+                    self.write_column(line, &col, b'/');
+                }
             }
         }
 

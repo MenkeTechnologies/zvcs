@@ -466,17 +466,16 @@ enum StatMode {
 /// take one struct rather than a growing parameter list.
 struct Opts {
     ff: Ff,
-    /// Whether `--no-ff` was passed explicitly (needed for the `--squash`
-    /// incompatibility check, which git keys off the literal flag).
-    no_ff_given: bool,
+    /// The option `--squash` clashes with, settled before `-s` can force
+    /// `fast_forward = FF_NO`: `do_merge` reports it only after the
+    /// unmerged-index and unfinished-state refusals, as git does.
+    squash_clash: Option<&'static str>,
     stat: StatMode,
     /// `-m`/`--message` or `-F`/`--file` contents (the latter read eagerly).
     message: Option<String>,
     squash: bool,
     /// `--commit`/`--no-commit` as given; `None` leaves the default (`!squash`).
     commit: Option<bool>,
-    /// `--commit` was given explicitly (for the `--squash` incompatibility check).
-    commit_given: bool,
     signoff: bool,
     /// `--verify-signatures` / `--no-verify-signatures`; `None` defers to
     /// `merge.verifySignatures`.
@@ -534,12 +533,11 @@ impl Default for Opts {
     fn default() -> Self {
         Opts {
             ff: Ff::Allow,
-            no_ff_given: false,
+            squash_clash: None,
             stat: StatMode::Diffstat,
             message: None,
             squash: false,
             commit: None,
-            commit_given: false,
             signoff: false,
             verify_signatures: None,
             allow_unrelated: false,
@@ -791,10 +789,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             "--quit" => op = Op::Quit,
             "--continue" => op = Op::Continue,
             "--ff" => opts.ff = Ff::Allow,
-            "--no-ff" => {
-                opts.ff = Ff::Never;
-                opts.no_ff_given = true;
-            }
+            "--no-ff" => opts.ff = Ff::Never,
             "--ff-only" => opts.ff = Ff::Only,
             "--stat" | "--summary" => opts.stat = StatMode::Diffstat,
             "--no-stat" | "--no-summary" | "-n" => opts.stat = StatMode::None,
@@ -804,10 +799,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             "--no-compact-summary" => opts.stat = StatMode::None,
             "--squash" => opts.squash = true,
             "--no-squash" => opts.squash = false,
-            "--commit" => {
-                opts.commit = Some(true);
-                opts.commit_given = true;
-            }
+            "--commit" => opts.commit = Some(true),
             "--no-commit" => opts.commit = Some(false),
             "--signoff" => opts.signoff = true,
             "--no-signoff" => opts.signoff = false,
@@ -1171,16 +1163,26 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         Op::Quit => quit(),
         Op::Continue => continue_merge(),
         Op::Merge => {
-            // git's `builtin/merge.c` incompatibility checks, keyed off the literal
-            // flags. `--squash` cannot fast-forward, so it clashes with `--no-ff`,
-            // and it never commits, so it clashes with `--commit`.
-            if opts.squash && opts.commit_given {
-                eprintln!("fatal: options '--squash' and '--commit.' cannot be used together");
-                return Ok(ExitCode::from(128));
-            }
-            if opts.squash && opts.no_ff_given {
-                eprintln!("fatal: options '--squash' and '--no-ff.' cannot be used together");
-                return Ok(ExitCode::from(128));
+            // ```c
+            // if (squash) {
+            //         if (fast_forward == FF_NO)
+            //                 die(... "--squash", "--no-ff.");
+            //         if (option_commit > 0)
+            //                 die(... "--squash", "--commit.");
+            // ```
+            //
+            // (builtin/merge.c:1503-1507; the stray periods are git's.)
+            // `fast_forward` is the value `merge.ff`, `branch.<n>.mergeoptions`
+            // and the command line left — last one wins, so `--no-ff --ff`
+            // passes and `merge.ff=false` alone dies — and `option_commit` the
+            // last of `--commit`/`--no-commit`. It is read before the `-s` loop
+            // below forces `FF_NO`, which is why `--squash -s subtree` passes.
+            if opts.squash {
+                if opts.ff == Ff::Never {
+                    opts.squash_clash = Some("--no-ff.");
+                } else if opts.commit == Some(true) {
+                    opts.squash_clash = Some("--commit.");
+                }
             }
             // `for (i = 0; i < use_strategies_nr; i++) if (… & NO_FAST_FORWARD)
             // fast_forward = FF_NO;` (builtin/merge.c:1608-1610). `subtree` and
@@ -1956,6 +1958,13 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // `--quit` and `--continue` never see it.
     if let Some(arg) = opts.cleanup_arg.as_deref().filter(|a| parse_cleanup(a).is_none()) {
         eprintln!("fatal: Invalid cleanup mode {arg}");
+        return Ok(ExitCode::from(128));
+    }
+
+    // builtin/merge.c:1503-1507, right after the cleanup mode: an unmerged
+    // index or an unfinished merge/cherry-pick outranks the clash.
+    if let Some(clash) = opts.squash_clash {
+        eprintln!("fatal: options '--squash' and '{clash}' cannot be used together");
         return Ok(ExitCode::from(128));
     }
 

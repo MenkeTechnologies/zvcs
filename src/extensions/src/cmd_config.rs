@@ -2,7 +2,8 @@
 //! for commands outside the diff/status/log family: `grep_cmd_config`
 //! (builtin/grep.c:297-327) and the `grep_config` it wraps (grep.c:59-111),
 //! `git_blame_config` (builtin/blame.c:714-805), `git_fetch_config`
-//! (builtin/fetch.c:115-177) and `repack_config` (builtin/repack.c:55-113).
+//! (builtin/fetch.c:115-177), `git_push_config` (builtin/push.c:477-540) and
+//! `repack_config` (builtin/repack.c:55-113).
 //!
 //! Each is the same shape as [`crate::diff_config`]: a chain that ends in
 //! `git_default_config`, walked once per configured value in parse order. Which
@@ -349,6 +350,126 @@ fn git_pull_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejec
     if key == "rebase.autostash" || key == "pull.autostash" || key == "submodule.recurse" {
         bool_value(v, key)?;
         return Ok(());
+    }
+    git_default_config(v, out)
+}
+
+// ---------------------------------------------------------------------------
+// push
+// ---------------------------------------------------------------------------
+
+/// `repo_config(the_repository, git_push_config, &flags)` — `git push`
+/// (builtin/push.c:721), ahead of `parse_options()`, so a refused value stops
+/// the push before a remote is even looked up.
+///
+/// Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c push.followTags=bogus push o main
+/// fatal: bad boolean config value 'bogus' for 'push.followtags'
+/// $ git -c push.gpgSign=bogus push o main
+/// error: invalid value for 'push.gpgsign'
+/// fatal: unable to parse 'push.gpgsign' from command-line config
+/// $ git -c push.recurseSubmodules push o main
+/// fatal: bad push.recursesubmodules argument: (null)
+/// ```
+pub fn validate_push(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_push_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+/// `git_push_config()` (builtin/push.c:477-540).
+///
+/// ```c
+/// if (!strcmp(k, "push.followtags")) { git_config_bool … return 0; }
+/// else if (!strcmp(k, "push.autosetupremote")) { git_config_bool … return 0; }
+/// else if (!strcmp(k, "push.gpgsign")) {
+///         switch (git_parse_maybe_bool(v)) {
+///         case 0: … case 1: …
+///         default:
+///                 if (!strcasecmp(v, "if-asked")) …
+///                 else
+///                         return error(_("invalid value for '%s'"), k);
+///         }
+/// } else if (!strcmp(k, "push.recursesubmodules")) {
+///         recurse_submodules = parse_push_recurse_submodules_arg(k, v);
+/// } else if (!strcmp(k, "submodule.recurse")) { git_config_bool … }
+/// else if (!strcmp(k, "push.pushoption")) {
+///         return parse_transport_option(k, v, &push_options_config);
+/// } else if (!strcmp(k, "color.push")) { git_config_colorbool … return 0; }
+/// else if (skip_prefix(k, "color.push.", &slot_name)) {
+///         int slot = parse_push_color_slot(slot_name);
+///         if (slot < 0) return 0;
+///         if (!v) return config_error_nonbool(k);
+///         return color_parse(v, push_colors[slot]);
+/// } else if (!strcmp(k, "push.useforceifincludes")) { git_config_bool … return 0; }
+///
+/// return git_default_config(k, v, ctx, NULL);
+/// ```
+///
+/// The `push.gpgsign`, `push.recursesubmodules` and `submodule.recurse` arms
+/// have no `return`, so a valid value falls through to `git_default_config`.
+fn git_push_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    match key {
+        "push.followtags" | "push.autosetupremote" | "push.useforceifincludes" => {
+            bool_value(v, key)?;
+            return Ok(());
+        }
+        "push.gpgsign" => {
+            // `git_parse_maybe_bool(NULL)` is 1, so only a valued spelling can
+            // reach the `if-asked` comparison.
+            if let Some(raw) = v.value.as_deref() {
+                if crate::optint::maybe_bool(raw).is_none() && !raw.eq_ignore_ascii_case("if-asked")
+                {
+                    return Err(reported(v, vec![format!("invalid value for '{key}'")]));
+                }
+            }
+        }
+        // `parse_push_recurse()` (submodule-config.c:498-526) with
+        // `die_on_error`: a true value has no push meaning, and the valueless
+        // spelling is true — printed through glibc/libc's `%s` of `NULL`.
+        "push.recursesubmodules" => {
+            let shown = v.value.as_deref().unwrap_or("(null)");
+            let valid = match v.value.as_deref() {
+                None => false,
+                Some(raw) => match crate::optint::maybe_bool(raw) {
+                    Some(on) => !on,
+                    None => matches!(raw, "on-demand" | "check" | "only"),
+                },
+            };
+            if !valid {
+                return Err(Rejection::Die(format!("bad {key} argument: {shown}")));
+            }
+        }
+        "submodule.recurse" => {
+            bool_value(v, key)?;
+        }
+        // `parse_transport_option()` (transport.c:1144-1154).
+        "push.pushoption" => {
+            string_value(v)?;
+            return Ok(());
+        }
+        "color.push" => {
+            colorbool(v, key)?;
+            return Ok(());
+        }
+        _ => {
+            if let Some(slot) = key.strip_prefix("color.push.") {
+                // `parse_push_color_slot()` (builtin/push.c:42-49).
+                if !slot.eq_ignore_ascii_case("reset") && !slot.eq_ignore_ascii_case("error") {
+                    return Ok(());
+                }
+                let raw = string_value(v)?;
+                if crate::porcelain::color::parse_color_spec(&raw).is_none() {
+                    return Err(reported(v, vec![format!("invalid color value: {raw}")]));
+                }
+                return Ok(());
+            }
+        }
     }
     git_default_config(v, out)
 }

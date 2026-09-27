@@ -684,6 +684,9 @@ enum ConfigCallback {
     /// `git_pull_config` (builtin/pull.c:226) — `rebase.autostash`,
     /// `pull.autostash`, `submodule.recurse`, then the default.
     Pull,
+    /// `git_push_config` (builtin/push.c:477) — the `push.*` keys,
+    /// `submodule.recurse`, `color.push[.<slot>]`, then the default.
+    Push,
     /// `fmt_merge_msg_config` (fmt-merge-msg.c:26) — its own `merge.*` keys,
     /// then the default.
     FmtMergeMsg,
@@ -759,6 +762,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "fmt-merge-msg" => ConfigCallback::FmtMergeMsg,
         "tag" => ConfigCallback::Tag,
         "pull" => ConfigCallback::Pull,
+        "push" => ConfigCallback::Push,
         "add" | "stage" | "clean" | "show-branch" => ConfigCallback::Color,
         "patch-id" | "mailinfo" => ConfigCallback::Verb,
         _ => ConfigCallback::Default,
@@ -1594,6 +1598,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::Branch => crate::cmd_config::validate_branch(&repo),
                     ConfigCallback::Tag => crate::cmd_config::validate_tag(&repo),
                     ConfigCallback::Pull => crate::cmd_config::validate_pull(&repo),
+                    ConfigCallback::Push => crate::cmd_config::validate_push(&repo),
                     ConfigCallback::FmtMergeMsg => {
                         crate::cmd_config::validate_fmt_merge_msg(&repo)
                     }

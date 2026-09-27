@@ -398,9 +398,11 @@ impl Ancestry<'_> {
         out
     }
 
-    /// `rewrite_one_1()`: walk back through TREESAME commits to the first one the
-    /// output will show. `None` is `rewrite_one_noparents` — the chain ran into a
-    /// TREESAME root, which git drops from the parent list entirely.
+    /// `rewrite_one_1()` (revision.c:4035-4054): walk back through TREESAME
+    /// commits to the first one the output will show, or to a TREESAME merge with
+    /// no single relevant parent to collapse onto. `None` is
+    /// `rewrite_one_noparents` — the chain ran into a TREESAME root, which git
+    /// drops from the parent list entirely.
     fn rewrite_one(&self, parent: ObjectId) -> Option<ObjectId> {
         let mut p = parent;
         // Each step moves strictly further back in a finite DAG, so the walk ends;
@@ -417,8 +419,14 @@ impl Ancestry<'_> {
             if grandparents.is_empty() {
                 return None;
             }
-            let next = one_relevant_parent(grandparents, self.walked, self.first_parent)?;
-            p = next;
+            // `if (!(p = one_relevant_parent(revs, p->parents))) return
+            // rewrite_one_ok;` (revision.c:4050-4051): a TREESAME merge with
+            // several relevant parents is where the walk stops, and it stays in
+            // the list as it is — only a parentless one is dropped.
+            match one_relevant_parent(grandparents, self.walked, self.first_parent) {
+                Some(next) => p = next,
+                None => return Some(p),
+            }
         }
         Some(p)
     }

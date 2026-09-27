@@ -619,6 +619,41 @@ pub(super) fn side_option_conflict(
     Some(format!("options '{first}' and '{second}' cannot be used together"))
 }
 
+/// `--maximal-only`: which of `processed` — the commits `process_parents()`
+/// handled, in the order it handled them — `get_commit_action()` does not ignore
+/// for carrying `CHILD_VISITED` (revision.c:4180). Each processed commit marks
+/// the parents it goes on to (after `try_to_simplify_commit()`, which is what
+/// `parents` answers; the first only under `--first-parent`, revision.c:
+/// 1150-1205).
+///
+/// A limited walk (`limit_list()`) processes everything before the first commit
+/// is handed out, so every mark is in place when any commit is judged. A
+/// streaming walk judges each commit as it pops, right after its own parents
+/// were marked — a commit popped before any of its children (a tip another tip
+/// reaches but that sorts ahead of it) is still shown. Shared by `rev-list` and
+/// `log`.
+pub(super) fn maximal_passes(
+    processed: &[ObjectId],
+    parents: impl Fn(&ObjectId) -> Vec<ObjectId>,
+    first_parent: bool,
+    limited: bool,
+) -> HashSet<ObjectId> {
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    let mut shown: HashSet<ObjectId> = HashSet::new();
+    for id in processed {
+        if !limited && !visited.contains(id) {
+            shown.insert(*id);
+        }
+        let parents = parents(id);
+        let followed = if first_parent { parents.len().min(1) } else { parents.len() };
+        visited.extend(parents[..followed].iter().copied());
+    }
+    match limited {
+        true => processed.iter().copied().filter(|id| !visited.contains(id)).collect(),
+        false => shown,
+    }
+}
+
 /// `read_revisions_from_stdin()` (`revision.c:2937-2983`), up to the point where
 /// each line is handed on: the revision lines in order — each with whether it came
 /// after the block's own `--end-of-options`, past which nothing is an option — and
@@ -2975,12 +3010,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             let reachable = reachable_from(&tips, &parents_of);
             maximal_processed.retain(|id| reachable.contains(id));
         }
-        // A limited walk (`limit_list()`) processes everything before the first
-        // commit is handed out, so every mark is in place when any commit is
-        // judged. A streaming walk judges each commit as it pops, right after its
-        // own parents were marked — a commit popped before any of its children
-        // (a tip that another tip reaches, but that sorts ahead of it by date)
-        // is still shown.
         let limited = seeds.iter().any(|s| s.uninteresting)
             || order != Order::Date
             || ancestry_path
@@ -2992,20 +3021,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             || simplify_merges_opt
             || simplify_by_decoration
             || bisect;
-        let mut visited: HashSet<ObjectId> = HashSet::new();
-        let mut shown: HashSet<ObjectId> = HashSet::new();
-        for id in &maximal_processed {
-            if !limited && !visited.contains(id) {
-                shown.insert(*id);
-            }
-            let parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
-            let followed = if first_parent { parents.len().min(1) } else { parents.len() };
-            visited.extend(parents[..followed].iter().copied());
-        }
-        Some(match limited {
-            true => commits.iter().copied().filter(|id| !visited.contains(id)).collect::<Vec<_>>(),
-            false => commits.iter().copied().filter(|id| shown.contains(id)).collect::<Vec<_>>(),
-        })
+        let passes = maximal_passes(
+            &maximal_processed,
+            |id| parents_of.get(id).cloned().unwrap_or_default(),
+            first_parent,
+            limited,
+        );
+        Some(commits.iter().copied().filter(|id| passes.contains(id)).collect::<Vec<_>>())
     };
     if let Some(keep) = maximal {
         let keep: HashSet<ObjectId> = keep.into_iter().collect();

@@ -10,6 +10,8 @@
 //!   `--parents`, `--first-parent`, ...) means the pending commits are replaced
 //!   by `reduce_heads()` of them, whatever their dates.
 //! - `--boundary` is refused (revision.c:3194-3195).
+//! - `log` runs the same filter; it never takes the short cut, since it always
+//!   sets `verbose_header`.
 //!
 //! Expectations measured from stock git 2.55.0 under the same environment.
 
@@ -108,6 +110,28 @@ fn only_commits_no_other_walked_commit_reaches() {
 fn boundary_is_refused() {
     let f = Fixture::new("boundary");
     let out = f.run(&["rev-list", "--maximal-only", "--boundary", "main"]);
+    assert_eq!(
+        out,
+        (
+            String::new(),
+            "fatal: options '--boundary' and '--maximal-only' cannot be used together\n".to_string(),
+            128
+        )
+    );
+}
+
+/// `git log` always sets `verbose_header`, so the `reduce_heads()` short cut is
+/// never taken: the streaming walk shows B because it pops before M marks it.
+#[test]
+fn log_takes_the_walk_not_the_short_cut() {
+    let f = Fixture::new("log");
+    let out = f.run(&["log", "--format=%s", "--maximal-only", "main~1", "main"]);
+    assert_eq!(out, ("B\nM\n".to_string(), String::new(), 0));
+    let out = f.run(&["log", "--format=%s", "--maximal-only", "--all"]);
+    assert_eq!(out, ("M\n".to_string(), String::new(), 0));
+    let out = f.run(&["log", "--format=%s", "--maximal-only", "--first-parent", "main", "side"]);
+    assert_eq!(out, ("M\nS\n".to_string(), String::new(), 0));
+    let out = f.run(&["log", "--maximal-only", "--boundary", "main"]);
     assert_eq!(
         out,
         (

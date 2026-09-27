@@ -1066,6 +1066,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `revs->no_kept_objects` with `KEPT_PACK_ON_DISK` (revision.c:2541-2550):
     // commits held in a `.keep` pack are ignored the same way.
     let mut no_kept_on_disk = false;
+    // `revs->maximal_only` (revision.c:2400-2401).
+    let mut maximal_only = false;
     // `--full-history` (git's `revs->simplify_history = 0`): follow every parent
     // of a merge even when the merge is TREESAME to one of them, so a change that
     // arrived on a side branch keeps both the merge and that side in the history.
@@ -1632,6 +1634,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             order = Order::Topo;
         } else if a == "--boundary" {
             boundary = true;
+        } else if a == "--maximal-only" {
+            maximal_only = true;
         } else if a == "--no-boundary" {
             boundary = false;
         } else if a == "--children" {
@@ -3551,6 +3555,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         eprintln!("fatal: options '--graph' and '--reverse' cannot be used together");
         return Ok(ExitCode::from(128));
     }
+    // `die_for_incompatible_opt2(!!revs->boundary, "--boundary",
+    // !!revs->maximal_only, "--maximal-only")` (revision.c:3194-3195).
+    if boundary && maximal_only {
+        eprintln!("fatal: options '--boundary' and '--maximal-only' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    // What `--maximal-only` marks is each processed commit's parents *after*
+    // `try_to_simplify_commit()` pruned them; the path-limited walk below keeps
+    // that pruning to itself, so the combination is refused rather than answered
+    // from the unpruned parents.
+    if maximal_only && (!pathspecs.is_empty() || simplify_by_decoration) {
+        bail!("--maximal-only with a pathspec or --simplify-by-decoration is not ported");
+    }
     // `revision.c:3197`: the graph lays its columns out by following each commit's
     // parents into the walk, and `--no-walk` yields the named commits alone — so
     // there is no history for it to draw.
@@ -3585,6 +3602,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // one, no topological re-sort needs the whole set, and `--reverse` does not
     // need the tail. Anything else walks the full history as before.
     let unfiltered = pathspecs.is_empty()
+        && !maximal_only
         && !line_level
         && !only_merges
         && !no_merges
@@ -3622,6 +3640,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         (reflog_walk(&repo, &tip_names)?, None)
     } else {
         walk_reporting(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
+    };
+    // `--maximal-only`: every commit the walk handed to `process_parents()`, in
+    // that order, with the parents it went on to — captured before any later
+    // filter drops a commit, since the marks are made either way. `--no-walk`
+    // returns from `process_parents()` before the marking loop.
+    let maximal_processed: Vec<(ObjectId, Vec<ObjectId>)> = match maximal_only && no_walk.is_none() {
+        true => nodes.iter().map(|n| (n.id, n.parents.clone())).collect(),
+        false => Vec::new(),
     };
     // `cherry_pick_list()` (revision.c) and the flags that read what it marks. The left side of
     // an `A...B` is everything reachable from the endpoints pended with `SYMMETRIC_LEFT`; git
@@ -3842,6 +3868,33 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     if no_kept_on_disk {
         let kept = super::rev_list::kept_pack_objects(&repo);
         nodes.retain(|n| !kept.contains(&n.id));
+    }
+    // `if (revs->maximal_only && (commit->object.flags & CHILD_VISITED))
+    // return commit_ignore;` (revision.c:4180). `git log` always sets
+    // `verbose_header`, so `prepare_maximal_independent()`'s short cut never
+    // applies to it. See [`super::rev_list::maximal_passes`].
+    if maximal_only && no_walk.is_none() {
+        let limited = !neg_ids.is_empty()
+            || order != Order::Default
+            || graph
+            || ancestry_path
+            || cherry_mark
+            || cherry_pick
+            || left_only
+            || right_only
+            || show_children
+            || simplify_merges_opt
+            || show_merge
+            || line_level;
+        let order_ids: Vec<ObjectId> = maximal_processed.iter().map(|(id, _)| *id).collect();
+        let parents: HashMap<ObjectId, Vec<ObjectId>> = maximal_processed.into_iter().collect();
+        let passes = super::rev_list::maximal_passes(
+            &order_ids,
+            |id| parents.get(id).cloned().unwrap_or_default(),
+            first_parent,
+            limited,
+        );
+        nodes.retain(|n| passes.contains(&n.id));
     }
 
     // `--ancestry-path`: `limit_list()` keeps only the commits that descend from a

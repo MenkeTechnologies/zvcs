@@ -1720,6 +1720,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
 /// empty file behind (measured against git 2.55.0).
 fn edit_patch(repo: &gix::Repository, pathspecs: &[String]) -> Result<ExitCode> {
     let file = repo.git_dir().join("ADD_EDIT.patch");
+    // `repo_git_path(repo, "ADD_EDIT.patch")` as git spells it in its messages
+    // and hands it to its children: relative to where setup left git.
+    let shown = crate::setup::git_path_spelled(repo, "ADD_EDIT.patch");
     let exe = crate::hosted::git_exe()?;
 
     let mut diff = std::process::Command::new(&exe);
@@ -1743,7 +1746,7 @@ fn edit_patch(repo: &gix::Repository, pathspecs: &[String]) -> Result<ExitCode> 
         Ok(m) => m,
         Err(err) => crate::git_fatal!(
             "could not stat '{}': {}",
-            super::worktree::path_to_string(&file),
+            super::worktree::path_to_string(&shown),
             crate::external::strerror(&err)
         ),
     };
@@ -1751,12 +1754,14 @@ fn edit_patch(repo: &gix::Repository, pathspecs: &[String]) -> Result<ExitCode> 
         crate::git_fatal!("empty patch. aborted");
     }
 
-    let applied = std::process::Command::new(&exe)
-        .args(["apply", "--recount", "--cached"])
-        .arg(&file)
-        .status()?;
+    // `child.git_cmd = 1` with `p.dir` unset: the apply runs where setup left
+    // git, on the path as `repo_git_path()` spelled it.
+    let mut apply = std::process::Command::new(&exe);
+    apply.args(["apply", "--recount", "--cached"]).arg(&shown);
+    crate::setup::export_to_child(repo, crate::setup::after_setup(repo).as_ref(), &mut apply);
+    let applied = apply.status()?;
     if !applied.success() {
-        crate::git_fatal!("could not apply '{}'", super::worktree::path_to_string(&file));
+        crate::git_fatal!("could not apply '{}'", super::worktree::path_to_string(&shown));
     }
     let _ = std::fs::remove_file(&file);
     Ok(ExitCode::SUCCESS)

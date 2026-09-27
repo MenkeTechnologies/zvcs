@@ -1678,8 +1678,16 @@ fn run_batch(
         if n == 0 {
             break;
         }
+        // `strbuf_getdelim_strip_crlf()` (strbuf.c:735-745), which both batch
+        // loops read with (builtin/cat-file.c:764, :1009): the terminator goes,
+        // and when it was a `\n` so does one `\r` in front of it. A line that
+        // ends at EOF without its `\n`, and every `-z`/`-Z` NUL-terminated one,
+        // keeps its `\r`.
         if line.last() == Some(&input_delim) {
             line.pop();
+            if input_delim == b'\n' && line.last() == Some(&b'\r') {
+                line.pop();
+            }
         }
 
         match kind {

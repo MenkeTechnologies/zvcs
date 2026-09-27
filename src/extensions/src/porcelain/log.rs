@@ -970,6 +970,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut graph = false;
     // `revs->graph_max_lanes` (`--graph-lane-limit=<n>`, revision.c:2627-2628).
     let mut graph_max_lanes: i64 = 0;
+    // `revs->show_merge` (`--merge`, revision.c:2434-2435).
+    let mut show_merge = false;
     // git's built-in default is `auto` (short refs when interactive, none when
     // piped); `log.decorate` overrides it, and the `--decorate` flags override
     // that in turn.
@@ -1743,6 +1745,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // an explicit `--topo-order --no-graph` or `--parents --no-graph` keeps its
         // own. This port reads `graph` at each of those decision points rather than
         // copying it into another flag, so clearing it is the whole of `--no-graph`.
+        } else if a == "--merge" {
+            show_merge = true;
         } else if let Some(v) = a.strip_prefix("--graph-lane-limit=") {
             // `skip_prefix(arg, "--graph-lane-limit=", &optarg)`: only the stuck
             // form exists, so a bare `--graph-lane-limit` stays unrecognized.
@@ -3379,6 +3383,42 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // prints nothing. `--alternate-refs` and `--reflog` are the exceptions: both
     // fill their callback data by hand rather than through `init_all_refs_cb()`,
     // so with no alternates (or no reflogs) the walk falls back to `HEAD`.
+    // `if (revs->show_merge) prepare_show_merge(revs);` (revision.c:3123-3124),
+    // once every argument is in and ahead of the `revs->def` fallback: `HEAD`
+    // with `SYMMETRIC_LEFT`, the other head, their merge bases excluded, and the
+    // conflicted paths — as root-relative literal paths — in place of the
+    // pathspec that selected them.
+    if show_merge {
+        let user: Vec<Vec<u8>> = pathspecs.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let merge = match prepare_show_merge(&repo, &user)? {
+            Ok(merge) => merge,
+            Err(message) => {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+        };
+        // Under `-g` each pended commit names a reflog, and an excluded one is
+        // refused by its name — the hex `add_pending_commit_list()` gives a base.
+        if walk_reflogs {
+            if let Some(base) = merge.bases.first() {
+                eprintln!("fatal: cannot walk reflogs for {base}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+        for (id, name, left) in [(merge.head, "HEAD", true), (merge.other, merge.other_name, false)] {
+            tips.push(id);
+            tip_left.push(left);
+            tip_names.push(name.to_string());
+            tip_sources.push(name.to_string());
+        }
+        neg_ids.extend(merge.bases);
+        pathspecs = merge
+            .paths
+            .iter()
+            .map(|p| format!(":(top,literal){}", String::from_utf8_lossy(p)))
+            .collect();
+        rev_input_given = true;
+    }
     let positive_from_args = rev_input_given
         || !tips.is_empty()
         || !neg_ids.is_empty()
@@ -3434,6 +3474,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             || graph
             || show_children
             || simplify_merges_opt
+            || show_merge
             || simplify_by_decoration
             || ancestry_path
             || left_only
@@ -7627,6 +7668,78 @@ pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Ve
         nodes.push(node);
     }
     Ok(nodes)
+}
+
+/// What `prepare_show_merge()` (revision.c:1994-2039) adds to a walk for
+/// `--merge`: `HEAD` (pended with `SYMMETRIC_LEFT`), the other side of the
+/// operation in progress, their merge bases as `UNINTERESTING | BOTTOM`, and a
+/// pathspec of the conflicted index paths that the user's pathspec selects.
+pub(super) struct ShowMerge {
+    pub(super) head: ObjectId,
+    pub(super) other: ObjectId,
+    /// `lookup_other_head()`'s answer, which is the name the tip is pended under.
+    pub(super) other_name: &'static str,
+    pub(super) bases: Vec<ObjectId>,
+    /// Each unmerged path once, in index order. Empty means no path limiting at
+    /// all — `parse_pathspec()` of an empty list — not "match nothing".
+    pub(super) paths: Vec<Vec<u8>>,
+}
+
+/// `prepare_show_merge()` and `lookup_other_head()` (revision.c:1975-2039).
+/// `Err` is a `die()` text without its `fatal: ` prefix.
+pub(super) fn prepare_show_merge(
+    repo: &gix::Repository,
+    user_pathspecs: &[Vec<u8>],
+) -> Result<std::result::Result<ShowMerge, String>> {
+    let Ok(head) = repo.head_id().map(|id| id.detach()) else {
+        return Ok(Err("--merge without HEAD?".to_string()));
+    };
+    // `refs_read_ref_full(…, RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE, …)`:
+    // the pseudoref file itself, whose first line is the id (`MERGE_HEAD` of an
+    // octopus holds one per line). A `ref: ` line reads back as the null id.
+    let mut found: Option<(&'static str, ObjectId)> = None;
+    for name in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"] {
+        let Ok(text) = std::fs::read(repo.git_dir().join(name)) else { continue };
+        let first = text.split(|&b| b == b'\n').next().unwrap_or_default();
+        if first.starts_with(b"ref:") {
+            return Ok(Err(format!("{name} exists but is a symbolic ref")));
+        }
+        let hex_len = repo.object_hash().len_in_hex();
+        if let Some(id) = first.get(..hex_len).and_then(|hex| ObjectId::from_hex(hex).ok()) {
+            found = Some((name, id));
+            break;
+        }
+    }
+    let Some((other_name, other)) = found else {
+        return Ok(Err("--merge requires one of the pseudorefs MERGE_HEAD, CHERRY_PICK_HEAD, \
+                       REVERT_HEAD or REBASE_HEAD"
+            .to_string()));
+    };
+    let bases: Vec<ObjectId> = match repo.merge_bases_many(head, &[other]) {
+        Ok(bases) => bases.into_iter().map(|b| b.detach()).collect(),
+        Err(_) => Vec::new(),
+    };
+    // `ce_path_match(istate, ce, &revs->prune_data, NULL)` per unmerged path, the
+    // stages of one path counted once.
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let matcher = match user_pathspecs.is_empty() {
+        true => None,
+        false => Some(PathspecMatcher::new(repo, user_pathspecs)?),
+    };
+    let mut paths: Vec<Vec<u8>> = Vec::new();
+    for entry in index.entries() {
+        if entry.stage() == gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let path = entry.path(&index).to_vec();
+        if paths.last() == Some(&path) {
+            continue;
+        }
+        if matcher.as_ref().is_none_or(|m| m.matches(&path)) {
+            paths.push(path);
+        }
+    }
+    Ok(Ok(ShowMerge { head, other, other_name, bases, paths }))
 }
 
 /// The excluded revision a `--walk-reflogs` run would have to start from, spelled

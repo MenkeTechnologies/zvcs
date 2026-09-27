@@ -1067,6 +1067,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut graph = false;
     // `revs->graph_max_lanes` (`--graph-lane-limit=<n>`, revision.c:2627-2628).
     let mut graph_max_lanes: i64 = 0;
+    // `revs->show_merge` (`--merge`, revision.c:2434-2435).
+    let mut show_merge = false;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -1595,6 +1597,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // That deferral is why the order is applied after this loop rather than
             // in the `--graph` arm.
             "--no-graph" => graph = false,
+            "--merge" => show_merge = true,
             // Only the stuck form exists (`skip_prefix()`), so a bare
             // `--graph-lane-limit` stays unknown.
             s if s.starts_with("--graph-lane-limit=") => {
@@ -2162,6 +2165,49 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `if (revs->show_merge) prepare_show_merge(revs);` (revision.c:3123-3124),
+    // once every argument is in: `HEAD` with `SYMMETRIC_LEFT`, the other head,
+    // their merge bases as `UNINTERESTING | BOTTOM`, and the conflicted paths in
+    // place of the pathspec that selected them. See
+    // [`super::log::prepare_show_merge`].
+    if show_merge {
+        let merge = match super::log::prepare_show_merge(&repo, &pathspecs)? {
+            Ok(merge) => merge,
+            Err(message) => return Ok(fatal(&message)),
+        };
+        if walk_reflogs {
+            if let Some(base) = merge.bases.first() {
+                return Ok(fatal(&format!("cannot walk reflogs for {base}")));
+            }
+        }
+        for (id, left) in [(merge.head, true), (merge.other, false)] {
+            seeds.push(Seed {
+                id,
+                uninteresting: false,
+                symmetric_left: left,
+                bottom: false,
+                // `add_pending_object()` alone: no `revs->cmdline` entry.
+                cmdline_commit: false,
+            });
+        }
+        for base in merge.bases {
+            seeds.push(Seed {
+                id: base,
+                uninteresting: true,
+                symmetric_left: false,
+                bottom: true,
+                // `add_rev_cmdline_list(revs, bases, REV_CMD_MERGE_BASE, …)`.
+                cmdline_commit: true,
+            });
+        }
+        pathspecs = merge
+            .paths
+            .iter()
+            .map(|p| [b":(top,literal)".as_slice(), p.as_slice()].concat())
+            .collect();
+        rev_input_given = true;
+    }
+
     // ```c
     // if (revs->graph) {
     //         revs->topo_order = 1;
@@ -2183,6 +2229,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // them, through the `topo_order` it has just implied.
     if walk_reflogs
         && (order != Order::Date
+            || show_merge
             || show_children
             || simplify_merges_opt
             || simplify_by_decoration

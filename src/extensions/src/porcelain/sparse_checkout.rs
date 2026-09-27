@@ -1696,6 +1696,25 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
         return Ok(());
     }
 
+    // A sparse index written by stock git stores each wholly-excluded directory as one
+    // `040000` entry. `update_sparsity()` expands it before marking anything
+    // (unpack-trees.c:2157-2158, `expand_index(o->src_index, pl)`), and this port only
+    // ever writes a full index (see `index_racy::convert_to_sparse`), so every such
+    // entry is expanded here. Without it the directory entry was checked out as if it
+    // were a file, and a write left `040000` entries behind with no `sdir` extension.
+    //
+    // git's advice follows `expand_index()`: a cone pattern list expands in place and
+    // says nothing, a non-cone one is `pl = NULL`, and so is `--no-sparse-index`
+    // (`update_modes()`'s `ensure_full_index()`, builtin/sparse-checkout.c:432-441) —
+    // both announce `advice.sparseIndexExpanded` (sparse-index.c:363-366). `disable`
+    // clears `give_advice_on_expansion` first (builtin/sparse-checkout.c:1071).
+    let advise = match sparsity {
+        Sparsity::Full => false,
+        Sparsity::Patterns(_) => true,
+        Sparsity::Cone(_) => !config_bool(repo, "index", "sparse")?.unwrap_or(false),
+    };
+    super::ls_files::expand_sparse_index(repo, &mut index, advise)?;
+
     let snapshot: Vec<Snapshot> = {
         let backing = index.path_backing();
         index

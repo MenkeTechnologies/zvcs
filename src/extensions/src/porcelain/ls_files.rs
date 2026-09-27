@@ -714,7 +714,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // directory entry is replaced by the blobs of the tree it stands for, each
     // marked skip-worktree, before any index-derived line is produced.
     if !opts.sparse && (opts.shows_index_entries() || opts.deleted || opts.modified) {
-        expand_sparse_index(&repo, &mut index)?;
+        expand_sparse_index(&repo, &mut index, true)?;
     }
 
     // `--with-tree <tree-ish>` overlays the named tree onto the index so that
@@ -1393,8 +1393,14 @@ sparse-checkout reapply' may assist in this cleanup.";
 /// what git's `add_path_to_index` callback produces.
 ///
 /// Returns `true` when at least one entry was expanded, which is also the
-/// condition under which git emits its `advice.sparseIndexExpanded` hint.
-fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> Result<bool> {
+/// condition under which git emits its `advice.sparseIndexExpanded` hint —
+/// unless the caller cleared `give_advice_on_expansion` (sparse-index.c:29), which
+/// is what `advise == false` stands for.
+pub(crate) fn expand_sparse_index(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    advise: bool,
+) -> Result<bool> {
     let sparse: Vec<(BString, gix::ObjectId)> = {
         let state: &gix::index::State = index;
         state
@@ -1409,6 +1415,9 @@ fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> 
     }
 
     index.remove_entries(|_, _, e| e.mode == gix::index::entry::Mode::DIR);
+    // `istate->sparse_index = INDEX_EXPANDED` (sparse-index.c): what is written back is a
+    // full index, without the `sdir` extension that would tell a reader otherwise.
+    index.set_expanded();
     for (dir, tree_id) in &sparse {
         let Some(tree) = repo
             .find_object(*tree_id)
@@ -1437,7 +1446,9 @@ fn expand_sparse_index(repo: &gix::Repository, index: &mut gix::index::File) -> 
     // `advise_if_enabled(ADVICE_SPARSE_INDEX_EXPANDED, …)` (sparse-index.c): the
     // shared gate, which also honors `GIT_ADVICE` and prints the `Disable this
     // message with …` trailer only while the slot is unconfigured.
-    crate::advice::Advice::SparseIndexExpanded.advise_in(repo, SPARSE_EXPANDED_ADVICE);
+    if advise {
+        crate::advice::Advice::SparseIndexExpanded.advise_in(repo, SPARSE_EXPANDED_ADVICE);
+    }
     Ok(true)
 }
 

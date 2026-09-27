@@ -285,7 +285,8 @@ fn write_locked_inner(
 /// directory into one sparse directory entry — is left out, and with it the `sdir`
 /// extension and `istate->sparse_index = INDEX_COLLAPSED`. A collapsed index is only
 /// legible to a reader that expands it again (`ensure_full_index()`, sparse-index.c:462),
-/// which this port does not do, so writing one would leave every other command in this
+/// which here only `ls-files` and `sparse-checkout` do (`ls_files::expand_sparse_index`) — a
+/// collapsed index stock git wrote is expanded by them and written back full — so writing one would leave every other command in this
 /// binary reading an index it misunderstands. The index written here therefore stays full
 /// where git's would be collapsed; stock git expands its own the next time a command reads
 /// it, and both sides arrive at the same full index carrying the same cache-tree.

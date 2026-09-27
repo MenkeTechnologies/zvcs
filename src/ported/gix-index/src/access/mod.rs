@@ -467,6 +467,13 @@ impl State {
         self.is_sparse
     }
 
+    /// Record that every sparse-directory entry has been expanded away — git's
+    /// `istate->sparse_index = INDEX_EXPANDED` after `ensure_full_index()` — so the
+    /// `sdir` extension is no longer written for this index.
+    pub fn set_expanded(&mut self) {
+        self.is_sparse = false;
+    }
+
     /// Return the range of entries that exactly match the given `path`, in all available stages, or `None` if no entry with such
     /// path exists.
     ///

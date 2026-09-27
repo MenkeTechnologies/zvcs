@@ -9,7 +9,7 @@
 //!     `pack.writeReverseIndex=false`, drops a `<pack>.keep` under `--keep`, and
 //!     prints the pack hash plus `\n`.
 //!   * `--promisor[=<msg>]` — `write_special_file("promisor", …)`
-//!     (builtin/index-pack.c:1452-1482, called from `final()` at :1523-1526):
+//!     (builtin/index-pack.c:1558-1589, called from `final()` at :1629-1631):
 //!     a `<pack>.promisor` holding `<msg>\n`, or empty for the bare flag. Unlike
 //!     `.keep` it never changes the word `--stdin` prints. `git bundle unbundle`
 //!     is the caller that needs it: a filtered bundle installs its pack as a
@@ -71,7 +71,8 @@
 //! deliberately not cleaned up when the command dies.
 //!
 //! File modes match git: `.pack`/`.idx`/`.rev` are left `0444`, a `.keep` is
-//! `0600` and holds `<msg>\n` (empty for a bare `--keep`). The `.rev` payload
+//! `0600` and holds `<msg>\n` (empty for a bare `--keep`); one that already
+//! exists is left as it is (`O_EXCL`), and `--stdin` then prints `pack`. The `.rev` payload
 //! is written here directly against `gitformat-pack(5)` — RIDX magic, version
 //! 1, the hash function id (1 for SHA-1, 2 for SHA-256), one 4-byte index
 //! position per object sorted by pack offset, the pack checksum, then a digest
@@ -131,7 +132,7 @@
 use anyhow::{bail, Result};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -579,7 +580,7 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     // so `--keep` leaves a `.keep` beside the pack that was indexed; only the `report` word it
     // sets is `--stdin`-only, because the non-stdin arm prints the bare hash.
     if let Some(msg) = &opts.keep {
-        if let Some(code) = write_special_file(pack_path, "keep", msg.as_deref()) {
+        if let Err(code) = write_special_file(pack_path, "keep", msg.as_deref()) {
             return Ok(code);
         }
     }
@@ -593,7 +594,7 @@ fn index_pack_file(opts: &Opts, pack_path: &Path, index_path: &Path) -> Result<E
     // `NULL` for the `report` slot is why a `.promisor` never changes the word
     // `--stdin` prints, where a `.keep` does.
     if let Some(msg) = &opts.promisor {
-        if let Some(code) = write_special_file(pack_path, "promisor", Some(msg)) {
+        if let Err(code) = write_special_file(pack_path, "promisor", Some(msg)) {
             return Ok(code);
         }
     }
@@ -622,26 +623,59 @@ fn self_contained_exit(opts: &Opts, foreign_nr: u32) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `write_special_file(suffix, ...)` (builtin/index-pack.c:1452-1482): the
+/// `write_special_file(suffix, ...)` (builtin/index-pack.c:1558-1589): the
 /// `<pack>.<suffix>` beside `pack_path`, named by `derive_filename(pack_name,
-/// "pack", suffix)` and opened `O_CREAT|O_EXCL, 0600`.
+/// "pack", suffix)` and opened through `safe_create_file_with_leading_directories()`
+/// (path.c:912-924), i.e. `O_RDWR|O_CREAT|O_EXCL, 0600`.
 ///
 /// An empty message writes an empty file — git only appends the trailing newline
-/// when `msg_len > 0`. `Some` is the exit code to die with, which is git's death
-/// when the pack it was asked to index is not named `*.pack`.
-fn write_special_file(pack_path: &Path, suffix: &str, msg: Option<&str>) -> Option<ExitCode> {
+/// when `msg_len > 0`. A file that already exists (`EEXIST`) is left untouched
+/// and not reported, so a repeated `--keep=<msg>` keeps the first message and
+/// `--stdin` prints `pack`, not `keep`. `Ok(true)` is git's `*report = suffix`;
+/// `Err` is the exit code to die with.
+fn write_special_file(pack_path: &Path, suffix: &str, msg: Option<&str>) -> Result<bool, ExitCode> {
     let name = pack_path.to_string_lossy();
     let Some(stem) = name.strip_suffix(".pack").filter(|s| !s.is_empty()) else {
-        return Some(fatal(format!(
+        return Err(fatal(format!(
             "packfile name '{name}' does not end with '.pack'"
         )));
     };
     let path = PathBuf::from(format!("{stem}.{suffix}"));
-    let body = msg.filter(|m| !m.is_empty()).map(|m| format!("{m}\n"));
-    if fs::write(&path, body.unwrap_or_default()).is_ok() {
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+    };
+    // The "slow path": create the leading directories, then try once more.
+    let opened = match open() {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            open()
+        }
+        other => other,
+    };
+    let mut file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => {
+            return Err(fatal(format!(
+                "cannot write {suffix} file '{}': {}",
+                path.display(),
+                strerror(&e)
+            )))
+        }
+    };
+    if let Some(m) = msg.filter(|m| !m.is_empty()) {
+        if let Err(e) = file.write_all(format!("{m}\n").as_bytes()) {
+            return Err(fatal(format!("write error: {}", strerror(&e))));
+        }
     }
-    None
+    Ok(true)
 }
 
 /// Index the pack at `pack_path` into `index_path`, returning the pack checksum.
@@ -1046,23 +1080,24 @@ fn index_from_stdin(
     set_read_only(&index_path)?;
     set_read_only(&data_path)?;
 
+    // `const char *report = "pack";` (builtin/index-pack.c:1613); the `.keep`
+    // goes first and turns the word into `keep` only when it created the file,
+    // then the `.promisor`, which never touches `report` (1626-1631).
+    let mut report = "pack";
+    if let Some(msg) = &opts.keep {
+        match write_special_file(&data_path, "keep", msg.as_deref()) {
+            Ok(true) => report = "keep",
+            Ok(false) => {}
+            Err(code) => return Ok(code),
+        }
+    }
     if let Some(msg) = &opts.promisor {
-        if let Some(code) = write_special_file(&data_path, "promisor", Some(msg)) {
+        if let Err(code) = write_special_file(&data_path, "promisor", Some(msg)) {
             return Ok(code);
         }
     }
 
-    match &opts.keep {
-        Some(msg) => {
-            if let Some(code) = write_special_file(&data_path, "keep", msg.as_deref()) {
-                return Ok(code);
-            }
-            // `*report = suffix` in `write_special_file()`: the word `final()` prints changes
-            // only because a `.keep` was created.
-            println!("keep\t{hash}");
-        }
-        None => println!("pack\t{hash}"),
-    }
+    println!("{report}\t{hash}");
     Ok(self_contained_exit(opts, foreign_nr))
 }
 

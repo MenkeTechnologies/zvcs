@@ -188,6 +188,26 @@ fn match_name_with_pattern(key: &str, name: &str, value: &str) -> Option<String>
     Some(format!("{vprefix}{middle}{vsuffix}"))
 }
 
+/// Put `statuses` in `remote_refs` order: the advertisement as the remote sent
+/// it, then the refs `match_push_refs()` appended with `make_linked_ref()`
+/// because the remote did not have them, in the order they were matched
+/// (`created`). Every consumer walks that list — `transport_print_push_status()`'s
+/// three passes (transport.c:850-899), `print_helper_status()`, the tracking-ref
+/// updates and `set_upstreams()` — so a status list in request order printed an
+/// `nf zz main` push as `nf, zz, main` where git prints `main, zz, nf`. The sort
+/// is stable, which keeps a proc-receive hook's several reports for one ref in
+/// the order they came.
+fn remote_refs_order(statuses: &mut [RefStatus], advertised: &[String], created: &[String]) {
+    let key = |name: &str| {
+        advertised
+            .iter()
+            .position(|a| a == name)
+            .or_else(|| created.iter().position(|c| c == name).map(|i| advertised.len() + i))
+            .unwrap_or(usize::MAX)
+    };
+    statuses.sort_by_cached_key(|s| key(&s.name));
+}
+
 /// Wire-level options that change the request itself rather than the ref list.
 #[derive(Default)]
 pub struct SendOptions {
@@ -281,6 +301,20 @@ pub struct RefStatus {
     /// refusal: `print_ref_status('!', "[remote failure]", …, "remote failed to
     /// report status")` (transport.c:793-798), not `[rejected]`.
     pub missing_report: bool,
+}
+
+impl RefStatus {
+    /// Which of `transport_print_push_status()`'s three walks over `remote_refs`
+    /// prints this ref (transport.c:864-897): `0` for `REF_STATUS_UPTODATE`
+    /// (only under `-v` or `--porcelain`), `1` for `REF_STATUS_OK`, `2` for
+    /// everything else.
+    pub fn print_pass(&self) -> u8 {
+        match (&self.result, self.up_to_date) {
+            (Ok(()), true) => 0,
+            (Ok(()), false) => 1,
+            (Err(_), _) => 2,
+        }
+    }
 }
 
 /// The outcome of a push: the resolved destination URL and every ref's verdict.
@@ -742,6 +776,10 @@ pub fn send_pack(
     // command list alone left the peer three objects short of stock's.
     let mut pack_tips: Vec<ObjectId> = Vec::new();
     let mut statuses: Vec<RefStatus> = Vec::new();
+    // The refs `match_push_refs()` appends to `remote_refs` because the remote
+    // does not advertise them, in the order they were matched — the tail of the
+    // list every report walks. See [`remote_refs_order`].
+    let mut created: Vec<String> = Vec::new();
     // ```c
     // if (!ref->peer_ref)
     //         continue;
@@ -805,6 +843,9 @@ pub fn send_pack(
             check_reachable: req.check_reachable.clone(),
             explicit_delete: req.explicit_delete,
         };
+        if !advertised.contains_key(&req.name) && !created.contains(&req.name) {
+            created.push(req.name.clone());
+        }
 
         // The remote's current value of the ref. `--force-with-lease` never
         // changes it: git keeps the lease in `ref->old_oid_expect` and sends
@@ -978,6 +1019,7 @@ pub fn send_pack(
         eprintln!("No refs in common and none specified; doing nothing.");
         eprintln!("Perhaps you should specify a branch.");
         connection.skip_end_of_interaction();
+        remote_refs_order(&mut statuses, &advertised_order, &created);
         return Ok(Outcome {
             url,
             statuses,
@@ -1043,6 +1085,7 @@ pub fn send_pack(
                     missing_report: false,
                 });
             }
+            remote_refs_order(&mut statuses, &advertised_order, &created);
             return Ok(Outcome {
                 url,
                 statuses,
@@ -1072,6 +1115,7 @@ pub fn send_pack(
             missing_report: false,
         });
         }
+        remote_refs_order(&mut statuses, &advertised_order, &created);
         return Ok(Outcome {
             url,
             statuses,
@@ -1136,6 +1180,7 @@ pub fn send_pack(
 
     // Nothing survived the checks: no request to send. Report what we have.
     if wire.is_empty() {
+        remote_refs_order(&mut statuses, &advertised_order, &created);
         return Ok(Outcome {
             url,
             statuses,
@@ -1398,6 +1443,7 @@ pub fn send_pack(
         }
     }
 
+    remote_refs_order(&mut statuses, &advertised_order, &created);
     Ok(Outcome {
         url,
         statuses,

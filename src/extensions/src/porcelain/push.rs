@@ -2451,7 +2451,10 @@ fn report(
         true => outcome.statuses.as_slice(),
         false => &[][..],
     };
-    for s in listed.iter().filter(|s| !s.pre_transport) {
+    // `transport_print_push_status()` walks `remote_refs` three times — up to
+    // date, then moved, then everything else (transport.c:864-897).
+    let in_passes = (0..3).flat_map(|pass| listed.iter().filter(move |s| s.print_pass() == pass));
+    for s in in_passes.filter(|s| !s.pre_transport) {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `print_ref_status` (transport.c:620): the left side is the LOCAL ref
         // (`ref->peer_ref`) and the right side is `report->ref_name` when the
@@ -2680,7 +2683,9 @@ fn report_porcelain(outcome: &push_proto::Outcome, quiet: bool) -> Result<(ExitC
     if status_block {
         println!("To {}", outcome.url);
     }
-    for s in listed {
+    // The same three walks over `remote_refs` as the human block
+    // (transport.c:864-897); `--porcelain` passes `verbose`, so the first runs.
+    for s in (0..3).flat_map(|pass| listed.iter().filter(move |s| s.print_pass() == pass)) {
         let short = |oid: &ObjectId| oid.to_hex_with_len(7).to_string();
         // `fprintf(stdout, "%c\t%s:%s\t", flag, from->name, to_name)` — the local
         // ref and the ref the server says it updated, both unshortened.

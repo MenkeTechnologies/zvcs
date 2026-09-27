@@ -104,31 +104,37 @@ impl packed::Transaction {
                 ..
             } = edit.inner.change
             {
+                // `peel_object(…, PEEL_OBJECT_VERIFY_TAGGED_OBJECT_TYPE)` (object.c:211-250),
+                // whose failure `ref_transaction_update()` answers by leaving
+                // `REF_HAVE_PEELED` unset (refs.c:1442-1446) — the ref is written without
+                // a `^` line, never refused. A tag whose target is missing, whose target
+                // is not the type the tag declares, or which does not parse is
+                // `PEEL_INVALID`. Only the ref's own object being absent stays an error.
                 let mut next_id = new;
+                let mut declared: Option<gix_object::Kind> = None;
                 edit.peeled = loop {
-                    let data = objects.try_find(&next_id, &mut buf)?;
-                    match data {
-                        Some(gix_object::Data {
-                            kind: gix_object::Kind::Tag,
-                            data,
-                            object_hash: hash_kind,
-                        }) => {
-                            next_id = gix_object::TagRefIter::from_bytes(data, hash_kind)
-                                .target_id()
-                                .map_err(|_| {
-                                    prepare::Error::Resolve(
-                                        format!("Couldn't get target object id from tag {next_id}").into(),
-                                    )
-                                })?;
-                        }
-                        Some(_) => {
-                            break if next_id == new { None } else { Some(next_id) };
-                        }
-                        None => {
+                    let Some(data) = objects.try_find(&next_id, &mut buf)? else {
+                        if next_id == new {
                             return Err(prepare::Error::Resolve(
                                 format!("Couldn't find object with id {next_id}").into(),
                             ));
                         }
+                        break None;
+                    };
+                    if declared.is_some_and(|kind| kind != data.kind) {
+                        break None;
+                    }
+                    if data.kind != gix_object::Kind::Tag {
+                        break if next_id == new { None } else { Some(next_id) };
+                    }
+                    use gix_object::tag::ref_iter::Token;
+                    let mut tokens = gix_object::TagRefIter::from_bytes(data.data, data.object_hash);
+                    match (tokens.next(), tokens.next()) {
+                        (Some(Ok(Token::Target { id })), Some(Ok(Token::TargetKind(kind)))) => {
+                            next_id = id;
+                            declared = Some(kind);
+                        }
+                        _ => break None,
                     }
                 };
             }

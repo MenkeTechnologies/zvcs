@@ -2751,6 +2751,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if repo.index_path().exists() {
         super::rerere::repo_rerere(&repo, None)?;
     }
+    // `run_auto_maintenance(the_repository, quiet)` (builtin/commit.c:1965), right
+    // behind the rerere and ahead of the `post-commit` hook.
+    super::maintenance::run_auto_maintenance(&repo, quiet)?;
 
     // ```c
     // run_commit_hook(use_editor, repo_get_index_file(the_repository),

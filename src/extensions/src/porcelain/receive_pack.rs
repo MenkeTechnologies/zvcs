@@ -2887,17 +2887,21 @@ fn run_proc_receive_hook(
     flush_pkt(&mut greeting);
 
     let mut errmsg = String::new();
-    let mut version: Option<i32> = None;
+    let mut version = 0;
     let mut hook_push_options = false;
-    let handshake = to_hook.write_all(&greeting).and_then(|()| to_hook.flush());
-    if handshake.is_ok() {
+    // `code` in git: the greeting write, then the read loop, which only a flush
+    // ends cleanly — `PACKET_READ_EOF` (the hook exited, or stopped mid-packet)
+    // is `code = -1` (receive-pack.c:1205-1235). A hook that answers with a bare
+    // flush is a version-0 hook and is accepted.
+    let mut negotiated = to_hook.write_all(&greeting).and_then(|()| to_hook.flush()).is_ok();
+    if negotiated {
         loop {
             match read_pkt_line(&mut from_hook) {
                 Ok(Some(line)) => {
                     let nul = line.iter().position(|&b| b == 0).unwrap_or(line.len());
                     let head = String::from_utf8_lossy(&line[..nul]).trim_end().to_string();
                     if let Some(v) = head.strip_prefix("version=") {
-                        version = Some(v.trim().parse().unwrap_or(0));
+                        version = v.trim().parse().unwrap_or(0);
                         if nul < line.len() {
                             let features = String::from_utf8_lossy(&line[nul + 1..]);
                             hook_push_options =
@@ -2907,18 +2911,16 @@ fn run_proc_receive_hook(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    version = None;
+                    negotiated = false;
                     break;
                 }
             }
         }
     }
     match version {
-        // A hook that says nothing is a version-0 hook, which git accepts.
-        None if handshake.is_ok() => {}
-        None => errmsg.push_str("fail to negotiate version with proc-receive hook"),
-        Some(0) | Some(1) => {}
-        Some(v) => errmsg.push_str(&format!("proc-receive version '{v}' is not supported")),
+        _ if !negotiated => errmsg.push_str("fail to negotiate version with proc-receive hook"),
+        0 | 1 => {}
+        v =>errmsg.push_str(&format!("proc-receive version '{v}' is not supported")),
     }
 
     let mut failed = !errmsg.is_empty();

@@ -181,6 +181,13 @@
 //!     and `--rotate-to` / `--skip-to`: `-R` swaps sides only in
 //!     `diff_change()` / `diff_addremove()`, which `diff_queue()` bypasses, a
 //!     patch text holds no NUL for the binary test, and rotation is non-strict.
+//! * `--word-diff[=plain|color]`, `--color-words[=<re>]`, `--word-diff-regex`,
+//!   `--[no-]color-moved[=<mode>]` and `--[no-]color-moved-ws`, over the
+//!   `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` defaults
+//!   `git_diff_ui_config()` supplies. The outer patch then goes through the
+//!   symbol pass `git diff` uses ([`diff_color::colorize_patch_ex`]) with
+//!   range-diff's `suppress_hunk_header_line_count` and
+//!   `dual_color_diffed_diffs` set, and the indent in front of every line.
 //! * The output formats `diff_flush()` writes for the one filepair
 //!   `patch_diff()` queues, rendered by [`flush_pair`] in `diff_flush()`'s own
 //!   order: `--raw`, `--name-only`, `--name-status` and `--check` first, then
@@ -292,7 +299,9 @@
 //!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
 //!   widths give it — `builtin/range-diff.c` never calls
 //!   `init_diffstat_widths()`.
-//! * `--word-diff`, `--color-moved` and `--ext-diff`.
+//! * `--word-diff=porcelain`, whose indent `fn_out_diff_words_write_helper()`
+//!   places itself (diff.c:2009-2053) — the symbol pass indents every line —
+//!   and `--ext-diff`, which would run a configured driver on the pair.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -983,6 +992,13 @@ struct Opts {
     /// every sequence the dual arms select is the empty string and
     /// `GIT_COLOR_REVERSE` is gated on `want_color()` (diff.c:776).
     dual: bool,
+    /// `o->word_diff` / `o->word_regex` / `o->color_moved` /
+    /// `o->color_moved_ws_handling`: the flags over `git_diff_ui_config()`'s
+    /// `diff.colorMoved`, `diff.colorMovedWS` and `diff.wordRegex`, which
+    /// `builtin/range-diff.c` reads before it parses its options. `Err` is the
+    /// `regcomp_or_die()` a word diff raises once it first compiles its regex, in
+    /// `init_diff_words_data()` from the first rendered patch (diff.c:2346-2355).
+    extra: std::result::Result<diff_color::ExtraPaint, String>,
     /// `whitespace_rule()` for the diff-of-diffs' two synthetic blobs, which comes
     /// entirely from `core.whitespace`: the filespecs are named `a` and `b`
     /// (range-diff.c:495), and this port reads no `whitespace` gitattribute.
@@ -1047,6 +1063,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         deferred: None,
         colors: diff_color::DiffColors::disabled(),
         dual: true,
+        extra: Ok(diff_color::ExtraPaint::default()),
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
@@ -1063,6 +1080,10 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // --no-color` still comes out colored.
     let mut simple_color: i8 = -1;
     let mut color_when: Option<diff_color::ColorWhen> = None;
+    // `--word-diff[=<mode>]`, `--word-diff-regex`, `--color-words[=<re>]`,
+    // `--[no-]color-moved[=<mode>]` and `--[no-]color-moved-ws`, from the
+    // `add_diff_options()` table range-diff's parser carries.
+    let mut move_word = diff_color::MoveWordOpts::default();
     // `args` excludes the `range-diff` verb: `dispatch::run` takes the
     // subcommand separately, so option parsing starts at index 0. Positionals
     // are collected in order into `pos`, and the `--` end-of-options marker is
@@ -1784,6 +1805,28 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // A name `parse_options()` has never heard of loses immediately — it never
             // reaches the revision arguments, so unlike an unimplemented option there is
             // nothing to defer it behind.
+            "--word-diff" | "--word-diff-regex" | "--color-words" | "--color-moved"
+            | "--no-color-moved" | "--color-moved-ws" | "--no-color-moved-ws" => {
+                let flag = match (inline, diff_color::needs_separate_value(name)) {
+                    (Some(v), _) => format!("{name}={v}"),
+                    (None, true) => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => format!("{name}={v}"),
+                            None => return Ok(option_error(&diff_color::missing_value(name))),
+                        }
+                    }
+                    (None, false) => name.to_string(),
+                };
+                match move_word.parse_flag(&flag, &mut color_when) {
+                    Some(Ok(())) => {}
+                    Some(Err(msg)) => {
+                        eprintln!("{msg}");
+                        return Ok(ExitCode::from(129));
+                    }
+                    None => opts.defer(unsupported_flag(a)),
+                }
+            }
             _ if !is_known_option(name) => return Ok(unknown_option(a)),
             _ => {
                 // `--summary` and the `--dirstat` family (short of
@@ -1965,6 +2008,16 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // dual unless `--no-dual-color` was spelled out, which is why the *default*
     // colored range-diff is the dual one.
     opts.dual = simple_color < 1;
+    opts.extra = move_word
+        .resolve(&repo)
+        .map_err(|msg| msg.trim_start_matches("fatal: ").to_string());
+    // `--word-diff=porcelain` puts `output_prefix`'s indent only where
+    // `fn_out_diff_words_write_helper()` and `diff_words_show()` write it
+    // (diff.c:2009-2053, 2237-2275) — its `~` lines and a word that opens a line
+    // go out bare — and the symbol pass indents every line it writes.
+    if matches!(&opts.extra, Ok(e) if e.word_diff == Some(diff_color::WordDiff::Porcelain)) {
+        opts.defer(unsupported_flag("--word-diff=porcelain"));
+    }
     // `whitespace_rule()` and `o->ws_error_highlight`, both read only by
     // `emit_line_ws_markup()` and so both invisible until color is on.
     opts.ws_rule = diff_color::whitespace_rule_cfg(&repo);
@@ -2193,6 +2246,7 @@ pub(super) fn show_range_diff(
         // selects the same (empty) sequences the simple arms would, so the bytes are
         // the same either way.
         dual: true,
+        extra: Ok(diff_color::ExtraPaint::default()),
         ws_rule: diff_color::WS_DEFAULT_RULE,
         ws_error_highlight: diff_color::WSEH_NEW,
         pickaxe: None,
@@ -4676,6 +4730,39 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
         false => (0, 0),
     };
 
+    let geom = diff_pairs::EmitGeometry {
+        ctx: opts.context as usize,
+        inter_hunk_ctx: opts.inter_hunk_ctx,
+        func_context: opts.func_context,
+        funcname: Some(section_headers()),
+    };
+
+    // A word diff, or move detection with color on, needs the whole patch before
+    // anything is written: `diff_flush_patch_all_file_pairs()` collects every
+    // symbol, marks the moved blocks, and only then emits (diff.c:7102-7130). The
+    // outer patch is assembled plain and handed to the same symbol pass `git diff`
+    // uses, with range-diff's two flags set on it and `output_prefix`'s indent put
+    // in front of every line it writes.
+    let extra = match &opts.extra {
+        Ok(extra) => extra,
+        Err(msg) => return Err(crate::fatal::die(msg.clone())),
+    };
+    if extra.repaints(opts.colors.enabled()) {
+        let mut plain = PlainHunks { buf: Vec::new(), indicators: opts.indicators };
+        diff_pairs::emit_hunks(&before, &after, &changes, &geom, &mut plain);
+        let paint = diff_color::PaintOptions {
+            ws_error_highlight: opts.ws_error_highlight,
+            indicators: (opts.indicators[IND_NEW], opts.indicators[IND_OLD], opts.indicators[IND_CONTEXT]),
+            suppress_hunk_header_line_count: true,
+            dual_color_diffed_diffs: opts.dual,
+            ..Default::default()
+        };
+        let file = diff_color::FilePaint { blank_at_eof, ..diff_color::FilePaint::new(opts.ws_rule) };
+        let painted = diff_color::colorize_patch_ex(&plain.buf, &opts.colors, &paint, &[], file, extra);
+        diff_pairs::append_prefixed(out, INDENT, &painted);
+        return Ok(());
+    }
+
     let mut sink = OuterHunks {
         out,
         indicators: opts.indicators,
@@ -4687,14 +4774,37 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
         lno_pre: 0,
         lno_post: 0,
     };
-    let geom = diff_pairs::EmitGeometry {
-        ctx: opts.context as usize,
-        inter_hunk_ctx: opts.inter_hunk_ctx,
-        func_context: opts.func_context,
-        funcname: Some(section_headers()),
-    };
     diff_pairs::emit_hunks(&before, &after, &changes, &geom, &mut sink);
     Ok(())
+}
+
+/// The outer patch as xdiff's callback would hand it to `fn_out_consume()`: the
+/// `@@ -a,b +c,d @@ <section>` header `xdl_emit_hunk_hdr()` writes, and each record
+/// behind its `o->output_indicators[]` sign.
+struct PlainHunks {
+    buf: Vec<u8>,
+    /// Indexed by [`IND_NEW`] / [`IND_OLD`] / [`IND_CONTEXT`].
+    indicators: [u8; 3],
+}
+
+impl diff_pairs::EmitSink for PlainHunks {
+    fn hunk(&mut self, s1: usize, len1: usize, s2: usize, len2: usize, func: &[u8]) {
+        diff_pairs::write_hunk_header(&mut self.buf, s1, len1, s2, len2, func);
+    }
+
+    fn record(&mut self, marker: u8, content: &[u8]) {
+        let ind = match marker {
+            b'+' => IND_NEW,
+            b'-' => IND_OLD,
+            _ => IND_CONTEXT,
+        };
+        self.buf.push(self.indicators[ind]);
+        self.buf.extend_from_slice(content);
+        // A patch text always ends its lines; see [`OuterHunks::record`].
+        if !content.ends_with(b"\n") {
+            self.buf.push(b'\n');
+        }
+    }
 }
 
 /// Writes the outer hunks, colouring each line the way `fn_out_consume()` →

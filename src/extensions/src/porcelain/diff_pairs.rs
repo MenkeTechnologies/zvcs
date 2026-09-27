@@ -2121,7 +2121,7 @@ pub(crate) fn io_reason(e: &std::io::Error) -> String {
 /// `diff_line_prefix()`: `--line-prefix=<s>` is written once at the start of every record
 /// git emits. `body` holds records terminated by newlines (the stat block, the summary and
 /// the patch), so the prefix goes at the start and after every terminator but the last.
-fn append_prefixed(out: &mut Vec<u8>, lp: &[u8], body: &[u8]) {
+pub(crate) fn append_prefixed(out: &mut Vec<u8>, lp: &[u8], body: &[u8]) {
     if lp.is_empty() {
         out.extend_from_slice(body);
         return;
@@ -2838,6 +2838,7 @@ fn flush(
             // `diff.suppressBlankEmpty` is not read by this module, so the sign of an
             // empty context line is always kept, as git's default does.
             suppress_blank_empty: false,
+            ..Default::default()
         };
         let mut sink = PatchSink {
             out: Vec::new(),
@@ -5090,18 +5091,24 @@ struct TextSink {
     buf: Vec<u8>,
 }
 
+/// `xdl_emit_hunk_hdr()`: `@@ -a,b +c,d @@`, then one space and the function name
+/// when there is one.
+pub(crate) fn write_hunk_header(buf: &mut Vec<u8>, s1: usize, len1: usize, s2: usize, len2: usize, func: &[u8]) {
+    buf.extend_from_slice(b"@@ -");
+    buf.extend_from_slice(fmt_range(s1 as u32 + 1, len1 as u32).as_bytes());
+    buf.extend_from_slice(b" +");
+    buf.extend_from_slice(fmt_range(s2 as u32 + 1, len2 as u32).as_bytes());
+    buf.extend_from_slice(b" @@");
+    if !func.is_empty() {
+        buf.push(b' ');
+        buf.extend_from_slice(func);
+    }
+    buf.push(b'\n');
+}
+
 impl EmitSink for TextSink {
     fn hunk(&mut self, s1: usize, len1: usize, s2: usize, len2: usize, func: &[u8]) {
-        self.buf.extend_from_slice(b"@@ -");
-        self.buf.extend_from_slice(fmt_range(s1 as u32 + 1, len1 as u32).as_bytes());
-        self.buf.extend_from_slice(b" +");
-        self.buf.extend_from_slice(fmt_range(s2 as u32 + 1, len2 as u32).as_bytes());
-        self.buf.extend_from_slice(b" @@");
-        if !func.is_empty() {
-            self.buf.push(b' ');
-            self.buf.extend_from_slice(func);
-        }
-        self.buf.push(b'\n');
+        write_hunk_header(&mut self.buf, s1, len1, s2, len2, func);
     }
 
     fn record(&mut self, marker: u8, content: &[u8]) {

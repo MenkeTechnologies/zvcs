@@ -853,6 +853,12 @@ impl ExtraPaint {
         self.word_diff.unwrap_or(WordDiff::None)
     }
 
+    /// Whether a patch has to go through the symbol pass at all: a word diff always
+    /// rewrites it, and move detection only runs with color on (diff.c:7108).
+    pub(crate) fn repaints(&self, color: bool) -> bool {
+        self.rewrites_uncolored() || (color && self.moved() != ColorMoved::No)
+    }
+
     /// Whether the assembled patch has to be re-emitted even with color off.
     pub(crate) fn rewrites_uncolored(&self) -> bool {
         self.words() != WordDiff::None
@@ -1341,6 +1347,15 @@ pub(crate) struct PaintOptions {
     /// `emit_line_ws_markup()` applies it before any color is chosen, which is why
     /// it has to be known here rather than patched into the finished bytes.
     pub(crate) suppress_blank_empty: bool,
+    /// `o->flags.suppress_hunk_header_line_count`: a hunk header is written as a
+    /// bare `@@` and its section name (diff.c:1764-1765). `range-diff`'s `output()`
+    /// is the only setter (range-diff.c:526).
+    pub(crate) suppress_hunk_header_line_count: bool,
+    /// `o->flags.dual_color_diffed_diffs`: the diff-of-diffs palette, which colors
+    /// the outer sign and the inner content separately (diff.c:1445-1541) and
+    /// reverses the hunk header (diff.c:1761-1762). Set by `range-diff` alone
+    /// (range-diff.c:524-525).
+    pub(crate) dual_color_diffed_diffs: bool,
 }
 
 impl Default for PaintOptions {
@@ -1351,6 +1366,8 @@ impl Default for PaintOptions {
             ws_error_highlight: WSEH_NEW,
             indicators: (b'+', b'-', b' '),
             suppress_blank_empty: false,
+            suppress_hunk_header_line_count: false,
+            dual_color_diffed_diffs: false,
         }
     }
 }
@@ -1483,7 +1500,7 @@ pub(crate) fn colorize_patch_ex(
             dim_moved_lines(&mut syms);
         }
     }
-    emit_syms(&syms, colors)
+    emit_syms(&syms, colors, opts)
 }
 
 /// `fn_out_consume()`: split the assembled patch into the symbol list, taking the
@@ -1657,7 +1674,7 @@ fn build_syms(
 
 /// Write the symbol list out, choosing each line's color the way
 /// `emit_diff_symbol_from_struct()` does.
-fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
+fn emit_syms(syms: &[Sym], colors: &DiffColors, opts: &PaintOptions) -> Vec<u8> {
     let on = colors.enabled();
     let reset = colors.reset();
     let meta = colors.get(DiffSlot::Meta);
@@ -1669,6 +1686,14 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
     for s in syms {
         match s.kind {
             Kind::Meta => emit_header_line(&mut out, &s.line, meta, reset),
+            Kind::Frag if opts.suppress_hunk_header_line_count => {
+                emit_hunk_header_suppressed(
+                    &mut out,
+                    colors,
+                    opts.dual_color_diffed_diffs,
+                    frag_func_name(&s.line),
+                )
+            }
             Kind::Frag => emit_hunk_header(&mut out, on, &s.line, frag, context, func, reset),
             Kind::Plus | Kind::Minus | Kind::Context => {
                 let ck = match s.kind {
@@ -1676,14 +1701,10 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors) -> Vec<u8> {
                     Kind::Minus => ContentKind::Minus,
                     _ => ContentKind::Context,
                 };
-                // `dual` is false for every command that reaches this re-emitter:
-                // `o->flags.dual_color_diffed_diffs` is set in exactly one place,
-                // range-diff's `output()` (range-diff.c:524-525), and range-diff
-                // paints its diff-of-diffs line by line rather than through here.
                 emit_content_symbol(
                     &mut out,
                     colors,
-                    false,
+                    opts.dual_color_diffed_diffs,
                     ck,
                     s.flags,
                     s.sign,
@@ -2540,6 +2561,19 @@ fn emit_hunk_header(
     // `DIFF_SYMBOL_CONTEXT_FRAGINFO` is emitted with empty set and reset: the
     // buffer already carries its own sequences.
     emit_line_0(out, on, Some(""), None, false, "", 0, &msg);
+}
+
+/// The section name of an xdiff hunk header `@@ -a,b +c,d @@ <func>`: what follows
+/// the closing `@@` and the one space xdiff writes before it, without the line end.
+fn frag_func_name(line: &[u8]) -> &[u8] {
+    let Some(at) = line.windows(2).skip(2).position(|w| w == b"@@").map(|i| i + 4) else {
+        return b"";
+    };
+    let mut body = line.get(at..).unwrap_or_default();
+    while let [rest @ .., b'\n' | b'\r'] = body {
+        body = rest;
+    }
+    body.strip_prefix(b" ").unwrap_or(body)
 }
 
 /// `emit_hunk_header()` under `o->flags.suppress_hunk_header_line_count`

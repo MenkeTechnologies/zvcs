@@ -2352,6 +2352,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             // `diff.suppressBlankEmpty` is not read by this module, so the sign of
             // an empty context line is always kept, as git's default does.
             suppress_blank_empty: false,
+            ..Default::default()
         };
         let mut plain = combined_patch.clone();
         // Every `diff --cc` section ahead of the first ordinary pair consumes a slot,

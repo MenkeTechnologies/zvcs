@@ -1069,6 +1069,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut graph_max_lanes: i64 = 0;
     // `revs->show_merge` (`--merge`, revision.c:2434-2435).
     let mut show_merge = false;
+    // `revs->def` from `--default <rev>` (revision.c:2429-2433); `rev-list`
+    // passes none of its own.
+    let mut default_rev: Option<String> = None;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -1598,6 +1601,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // in the `--graph` arm.
             "--no-graph" => graph = false,
             "--merge" => show_merge = true,
+            // `if (argc <= 1) return error("bad --default argument");`, which
+            // `setup_revisions()` turns into exit 128.
+            "--default" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(v) => default_rev = Some(v.clone()),
+                    None => {
+                        eprintln!("error: bad --default argument");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+            }
             // Only the stuck form exists (`skip_prefix()`), so a bare
             // `--graph-lane-limit` stays unknown.
             s if s.starts_with("--graph-lane-limit=") => {
@@ -2206,6 +2221,28 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             .map(|p| [b":(top,literal)".as_slice(), p.as_slice()].concat())
             .collect();
         rev_input_given = true;
+    }
+
+    // `if (revs->def && !revs->pending.nr && !revs->rev_input_given)` right after
+    // `prepare_show_merge()` (revision.c:3125-3133): the default is pended like an
+    // operand, under its own name. See [`super::log::resolve_default`].
+    if let Some(def) = default_rev.as_deref() {
+        if seeds.is_empty() && pending.is_empty() && !rev_input_given {
+            if let Err(message) = super::log::resolve_default(&repo, def) {
+                return Ok(fatal(&message));
+            }
+            let pending_before = pending.len();
+            if let Err(e) = seed_revision(&repo, def, false, true, &mut seeds, &mut pending) {
+                return Ok(fatal_text(&e));
+            }
+            // `add_pending_object_with_mode()` passes no path, unlike an operand's
+            // `oc.path`, so a tree or blob default is listed with an empty name.
+            for entry in &mut pending[pending_before..] {
+                if entry.kind != gix::object::Kind::Tag {
+                    entry.name.clear();
+                }
+            }
+        }
     }
 
     // ```c

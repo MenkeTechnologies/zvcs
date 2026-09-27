@@ -972,6 +972,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut graph_max_lanes: i64 = 0;
     // `revs->show_merge` (`--merge`, revision.c:2434-2435).
     let mut show_merge = false;
+    // `revs->def` from `--default <rev>` (revision.c:2429-2433), standing in for
+    // `HEAD` when nothing was named.
+    let mut default_rev: Option<String> = None;
     // git's built-in default is `auto` (short refs when interactive, none when
     // piped); `log.decorate` overrides it, and the `--decorate` flags override
     // that in turn.
@@ -1745,6 +1748,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // an explicit `--topo-order --no-graph` or `--parents --no-graph` keeps its
         // own. This port reads `graph` at each of those decision points rather than
         // copying it into another flag, so clearing it is the whole of `--no-graph`.
+        } else if a == "--default" {
+            // `if (argc <= 1) return error("bad --default argument");` — the
+            // negative return is fatal to `setup_revisions()`'s caller.
+            i += 1;
+            match args.get(i) {
+                Some(v) => default_rev = Some(v.clone()),
+                None => {
+                    eprintln!("error: bad --default argument");
+                    return Ok(ExitCode::from(128));
+                }
+            }
         } else if a == "--merge" {
             show_merge = true;
         } else if let Some(v) = a.strip_prefix("--graph-lane-limit=") {
@@ -3424,7 +3438,25 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         || !neg_ids.is_empty()
         || !ref_selections.is_empty()
         || !bisect_selections.is_empty();
-    if !positive_from_args {
+    if !positive_from_args && default_rev.as_deref().is_some_and(|def| def != "HEAD") {
+        // `get_oid_with_context(revs->def)`, `diagnose_missing_default()` when it
+        // fails, then `get_reference()` and `add_pending_object_with_mode()` under
+        // the default's own name (revision.c:3125-3133).
+        let def = default_rev.clone().expect("checked above");
+        let id = match resolve_default(&repo, &def) {
+            Ok(id) => id,
+            Err(message) => {
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+        };
+        if let Some(commit) = crate::objname::walk_pending(&repo, id) {
+            tips.push(commit);
+            tip_left.push(false);
+            tip_names.push(def.clone());
+            tip_sources.push(def);
+        }
+    } else if !positive_from_args {
         // `if (get_oid_with_context(revs->repo, revs->def, 0, &oid, &oc))
         //         diagnose_missing_default(revs->def);` (revision.c:3125-3130): the
         // default goes through `get_oid_basic()` like any operand, which is where
@@ -7673,6 +7705,34 @@ pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Ve
         nodes.push(node);
     }
     Ok(nodes)
+}
+
+/// `revs->def` when nothing was named: `get_oid_with_context(revs->def, …)`,
+/// and `diagnose_missing_default()` (revision.c:2985-2998) when that fails — a
+/// symbolic ref to a branch with no commits yet names the branch, anything else
+/// is "broken". `Err` is the `die()` text without its `fatal: ` prefix.
+pub(super) fn resolve_default(repo: &gix::Repository, def: &str) -> std::result::Result<ObjectId, String> {
+    if let Some(id) = crate::objname::resolve(repo, def) {
+        return Ok(id);
+    }
+    // `refs_resolve_ref_unsafe(…, def, 0, NULL, &flags)`: the name exactly as
+    // given, no DWIM — so a bare branch name is not found at all.
+    let unborn = repo
+        .try_find_reference(def)
+        .ok()
+        .flatten()
+        .filter(|r| r.name().as_bstr() == def)
+        .and_then(|r| match r.target() {
+            gix::refs::TargetRef::Symbolic(target) => Some(target.as_bstr().to_string()),
+            gix::refs::TargetRef::Object(_) => None,
+        });
+    match unborn {
+        Some(target) => {
+            let branch = target.strip_prefix("refs/heads/").unwrap_or(&target);
+            Err(format!("your current branch '{branch}' does not have any commits yet"))
+        }
+        None => Err("your current branch appears to be broken".to_string()),
+    }
 }
 
 /// What `prepare_show_merge()` (revision.c:1994-2039) adds to a walk for

@@ -485,8 +485,13 @@ const SETTINGS_ONLY_VERBS: &[&str] = &["mktree", "prune", "prune-packed"];
 /// ```text
 /// $ git -c index.version=bogus -c core.createObject=bogus merge-ours
 /// fatal: invalid mode for object creation: bogus
+/// $ git -c core.packedGitLimit=bogus -c core.abbrev=bogus pull . side
+/// fatal: bad numeric config value 'bogus' for 'core.abbrev': invalid unit
 /// ```
-const CONFIG_BEFORE_SETTINGS_VERBS: &[&str] = &["merge-ours"];
+///
+/// `cmd_pull()` runs `repo_config(the_repository, git_pull_config, NULL)`
+/// (builtin/pull.c:1018) before anything that prepares the settings.
+const CONFIG_BEFORE_SETTINGS_VERBS: &[&str] = &["merge-ours", "pull"];
 
 /// Whether `sub` reads its configuration even when no repository was found.
 ///
@@ -676,6 +681,9 @@ enum ConfigCallback {
     /// `tag.forcesignannotated`, `column.*`, then `git_color_config` and the
     /// default.
     Tag,
+    /// `git_pull_config` (builtin/pull.c:226) — `rebase.autostash`,
+    /// `pull.autostash`, `submodule.recurse`, then the default.
+    Pull,
     /// `fmt_merge_msg_config` (fmt-merge-msg.c:26) — its own `merge.*` keys,
     /// then the default.
     FmtMergeMsg,
@@ -750,6 +758,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "branch" => ConfigCallback::Branch,
         "fmt-merge-msg" => ConfigCallback::FmtMergeMsg,
         "tag" => ConfigCallback::Tag,
+        "pull" => ConfigCallback::Pull,
         "add" | "stage" | "clean" | "show-branch" => ConfigCallback::Color,
         "patch-id" | "mailinfo" => ConfigCallback::Verb,
         _ => ConfigCallback::Default,
@@ -1584,6 +1593,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::Merge => crate::cmd_config::validate_merge(&repo),
                     ConfigCallback::Branch => crate::cmd_config::validate_branch(&repo),
                     ConfigCallback::Tag => crate::cmd_config::validate_tag(&repo),
+                    ConfigCallback::Pull => crate::cmd_config::validate_pull(&repo),
                     ConfigCallback::FmtMergeMsg => {
                         crate::cmd_config::validate_fmt_merge_msg(&repo)
                     }

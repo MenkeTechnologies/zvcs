@@ -308,6 +308,51 @@ fn git_tag_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Reject
     git_default_config(v, out)
 }
 
+/// `repo_config(the_repository, git_pull_config, NULL)` — `git pull`
+/// (builtin/pull.c:1018), ahead of `parse_options()` and so ahead of the fetch.
+///
+/// Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c rebase.autoStash=bogus pull . side
+/// fatal: bad boolean config value 'bogus' for 'rebase.autostash'
+/// $ git -c pull.autostash=bogus pull -h
+/// fatal: bad boolean config value 'bogus' for 'pull.autostash'
+/// ```
+pub fn validate_pull(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_pull_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+/// `git_pull_config()` (builtin/pull.c:226-252).
+///
+/// ```c
+/// if (!strcmp(var, "rebase.autostash")) {
+///         config_rebase_autostash = git_config_bool(var, value);
+///         return 0;
+/// } else if (!strcmp(var, "pull.autostash")) {
+///         config_pull_autostash = git_config_bool(var, value);
+///         return 0;
+/// } else if (!strcmp(var, "submodule.recurse")) {
+///         recurse_submodules = git_config_bool(var, value) ? … : …;
+///         return 0;
+/// } else if (!strcmp(var, "gpg.mintrustlevel")) {
+///         check_trust_level = 0;
+/// }
+/// return git_default_config(var, value, ctx, cb);
+/// ```
+fn git_pull_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    if key == "rebase.autostash" || key == "pull.autostash" || key == "submodule.recurse" {
+        bool_value(v, key)?;
+        return Ok(());
+    }
+    git_default_config(v, out)
+}
+
 // ---------------------------------------------------------------------------
 // checkout / switch / restore
 // ---------------------------------------------------------------------------

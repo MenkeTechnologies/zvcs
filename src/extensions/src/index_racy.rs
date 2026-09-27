@@ -89,14 +89,60 @@ pub fn modified_check_fs(
     }
 }
 
+/// `ce_match_stat_basic()` (read-cache.c:311-352): does a plain `lstat` comparison
+/// already tell the entry apart from the file? Only the yes/no answer is needed here —
+/// `ce_smudge_racily_clean_entry()` returns early on any bit.
+///
+/// The stat half is `match_stat_data()` (statinfo.c:64-104), which honours `core.trustctime`
+/// and `core.checkStat` through `opts`: with the default `core.trustctime=true`, a rewrite
+/// that moved `ctime` into a later second is a stat difference, so git leaves the entry
+/// alone and every later reader reports it by stat. Comparing only size and mtime smudged
+/// those entries too.
+fn match_stat_basic_differs(
+    entry: &gix::index::Entry,
+    meta: &gix::index::fs::Metadata,
+    current: &gix::index::entry::Stat,
+    opts: gix::index::entry::stat::Options,
+    trust_executable_bit: bool,
+    has_symlinks: bool,
+    empty_blob: &gix::ObjectId,
+) -> bool {
+    use gix::index::entry::Mode;
+    // `if (ce->ce_flags & CE_REMOVE) return MODE_CHANGED | DATA_CHANGED | TYPE_CHANGED;`
+    if entry.flags.contains(gix::index::entry::Flags::REMOVE) {
+        return true;
+    }
+    let type_or_mode = if entry.mode == Mode::SYMLINK {
+        // `if (!S_ISLNK(st->st_mode) && (has_symlinks || !S_ISREG(st->st_mode)))`
+        !meta.is_symlink() && (has_symlinks || !meta.is_file())
+    } else {
+        // `S_IFREG`: a type change, or — only the owner x bit counts — a mode change.
+        !meta.is_file()
+            || (trust_executable_bit && (entry.mode == Mode::FILE_EXECUTABLE) != meta.is_executable())
+    };
+    type_or_mode
+        || !entry.stat.matches(current, opts)
+        // "Racily smudged entry?": an already-zeroed size on a non-empty blob.
+        || (entry.stat.size == 0 && entry.id != *empty_blob)
+}
+
 /// Smudge every racily-clean entry of `index`, as `do_write_index()` does before serialising.
+///
+/// ```c
+/// if (!ce_uptodate(ce) && is_racy_timestamp(istate, ce))
+///         ce_smudge_racily_clean_entry(istate, ce);
+/// ```
+///
+/// (read-cache.c:2902-2903.) An entry a command has just verified against the worktree carries
+/// [`UPTODATE`](gix::index::entry::Flags::UPTODATE) (`ce_mark_uptodate()`), and git trusts that
+/// instead of hashing it a second time.
 ///
 /// A no-op for an index with no timestamp (never read from disk), for a bare repository, and for
 /// entries whose `mtime` is older than the index's own — the overwhelming majority.
 pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File) {
-    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+    if repo.workdir().is_none() {
         return;
-    };
+    }
     let timestamp = index.timestamp();
     if timestamp.unix_seconds() == 0 {
         return;
@@ -112,11 +158,26 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
         isec <= stat.mtime.secs
     };
 
+    // `match_stat_data()` reads `core.trustctime` / `core.checkStat`; `ce_match_stat_basic()`
+    // reads `trust_executable_bit` (`core.fileMode`) and `has_symlinks` (`core.symlinks`).
+    let stat_opts = repo.stat_options().unwrap_or_default();
+    let snapshot = repo.config_snapshot();
+    let trust_executable_bit = snapshot.boolean("core.fileMode").unwrap_or(true);
+    let has_symlinks = snapshot.boolean("core.symlinks").unwrap_or(true);
     let object_hash = index.object_hash();
+    let empty_blob = object_hash.empty_blob();
+
     let mut smudge: Vec<usize> = Vec::new();
     {
         let backing = index.path_backing();
         for (idx, entry) in index.entries().iter().enumerate() {
+            // `if (ce->ce_flags & CE_REMOVE) continue;` and `!ce_uptodate(ce)`.
+            if entry
+                .flags
+                .intersects(gix::index::entry::Flags::REMOVE | gix::index::entry::Flags::UPTODATE)
+            {
+                continue;
+            }
             // Gitlinks always consult the nested repository, so git never calls the smudge for
             // them (`is_racy_timestamp()` returns 0 for `S_ISGITLINK`).
             if entry.mode == gix::index::entry::Mode::COMMIT || !racy(&entry.stat) {
@@ -124,6 +185,7 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
             }
             let path = entry.path_in(backing);
             let Some(full) = repo.workdir_path(path) else { continue };
+            // `if (lstat(ce->name, &st) < 0) return;`
             let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
             let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
                 continue;
@@ -131,9 +193,17 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
             let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
                 continue;
             };
-            // `ce_match_stat_basic()`: a stat that already differs will be reported anyway, so
-            // there is nothing to smudge.
-            if current.size != entry.stat.size || current.mtime.secs != entry.stat.mtime.secs {
+            // `if (ce_match_stat_basic(ce, &st)) return;`: a stat that already differs will be
+            // reported anyway, so there is nothing to smudge.
+            if match_stat_basic_differs(
+                entry,
+                &fs_meta,
+                &current,
+                stat_opts,
+                trust_executable_bit,
+                has_symlinks,
+                &empty_blob,
+            ) {
                 continue;
             }
             // `ce_modified_check_fs()`: the stat agrees, so the content has to answer.

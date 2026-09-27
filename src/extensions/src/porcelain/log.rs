@@ -1063,6 +1063,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `revs->unpacked`: `get_commit_action()` ignores a commit that any pack
     // holds, so a fully packed repository logs nothing under it.
     let mut unpacked = false;
+    // `revs->no_kept_objects` with `KEPT_PACK_ON_DISK` (revision.c:2541-2550):
+    // commits held in a `.keep` pack are ignored the same way.
+    let mut no_kept_on_disk = false;
     // `--full-history` (git's `revs->simplify_history = 0`): follow every parent
     // of a merge even when the merge is TREESAME to one of them, so a change that
     // arrived on a side branch keeps both the merge and that side in the history.
@@ -1567,6 +1570,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             remove_empty = true;
         } else if a == "--unpacked" {
             unpacked = true;
+        } else if a == "--no-kept-objects" {
+            no_kept_on_disk = true;
+        } else if let Some(v) = a.strip_prefix("--no-kept-objects=") {
+            // `in-core` names packs only `pack-objects` marks in memory.
+            if v == "on-disk" {
+                no_kept_on_disk = true;
+            }
+        // `--in-commit-order` orders the object listing, which `log` never
+        // prints (builtin/rev-list.c reads `revs->in_commit_order`).
+        } else if a == "--in-commit-order" {
+        // `revs->date_mode.type = DATE_RELATIVE; revs->date_mode_explicit = 1;`
+        // (revision.c:2661-2663).
+        } else if a == "--relative-date" {
+            date_mode = DateMode::Relative;
+            date_explicit = true;
         // `revs->count` and the object-listing switches are `rev-list`'s output
         // modes. `setup_revisions()` accepts them for every command that walks —
         // `builtin/log.c` simply never reads them, so a `git log --count` is the
@@ -3818,6 +3836,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     if unpacked {
         let packed = super::rev_list::packed_objects(&repo);
         nodes.retain(|n| !packed.contains(&n.id));
+    }
+    // `if (revs->no_kept_objects && has_object_kept_pack(…)) return commit_ignore;`
+    // (revision.c:4183-4187), right behind the `--unpacked` test.
+    if no_kept_on_disk {
+        let kept = super::rev_list::kept_pack_objects(&repo);
+        nodes.retain(|n| !kept.contains(&n.id));
     }
 
     // `--ancestry-path`: `limit_list()` keeps only the commits that descend from a

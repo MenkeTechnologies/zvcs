@@ -3150,7 +3150,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     //
     // (revision.c:4183-4187.) Commits only: `show_object()` does not ask.
     if no_kept_on_disk {
-        let kept = pack_objects(&repo, Some("keep"));
+        let kept = kept_pack_objects(&repo);
         commits.retain(|id| !kept.contains(id));
     }
     commits.retain(|id| !treesame.contains(id));
@@ -6067,6 +6067,12 @@ pub(super) fn packed_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
 /// `FOR_EACH_OBJECT_PROMISOR_ONLY` enumeration.
 pub(super) fn promisor_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
     pack_objects(repo, Some("promisor"))
+}
+
+/// The objects held by every pack with a `.keep` file beside it — what
+/// `has_object_kept_pack(…, KEPT_PACK_ON_DISK)` answers for.
+pub(super) fn kept_pack_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
+    pack_objects(repo, Some("keep"))
 }
 
 /// The ids in this repository's packs — only those of packs with a `<sidecar>`

@@ -676,6 +676,9 @@ fn switch_existing(
             .as_ref()
             .map(|n| n.as_bstr())
     {
+        if let Some(code) = unmerged_gate(repo, force)? {
+            return Ok(code);
+        }
         // `merge_working_tree()` runs here too, and with `--discard-changes`/`-f` that is
         // `reset_tree()` — the worktree and index are rewritten from the target tree even when
         // the branch does not move, which is how `git switch -f <current>` throws local changes
@@ -783,6 +786,9 @@ fn switch_existing(
     // Entered unconditionally: `switch <branch>` always names an operand, so
     // git's `do_merge` stays 1 and `merge_working_tree()` — listing and all —
     // runs even when the two branches point at the same tree.
+    if let Some(code) = unmerged_gate(repo, force)? {
+        return Ok(code);
+    }
     let target_tree = repo.find_object(target)?.peel_to_commit()?.tree_id()?.detach();
     let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
     let merge = merge_style.map(|style| super::checkout::MergeOpt { style, name: branch });
@@ -942,6 +948,9 @@ fn switch_create(
         let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
         // Refuse before the branch is created, so a blocked switch leaves no ref
         // behind — git's `merge_working_tree()` runs before `update_refs_for_switch()`.
+        if let Some(code) = unmerged_gate(repo, force)? {
+            return Ok(code);
+        }
         // `-m` is exempt: it has an answer for the paths the two-way merge
         // rejects, so the refusal it would raise here is not the final one.
         if let Some(code) = if force || merge_style.is_some() {
@@ -1150,6 +1159,9 @@ fn switch_detach(
     // whatever the trees turn out to be.
     let mut autostashed = false;
     if !positionals.is_empty() {
+        if let Some(code) = unmerged_gate(repo, force)? {
+            return Ok(code);
+        }
         let from_tree = cur_tree.unwrap_or_else(|| repo.empty_tree().id().detach());
         // The `ours` label and the autostash message name the target as typed —
         // `git switch -m --detach HEAD~1` writes `HEAD~1`, not the id.
@@ -1244,6 +1256,9 @@ fn switch_orphan(
         return fatal(format!("a branch named '{branch}' already exists"));
     }
 
+    if let Some(code) = unmerged_gate(repo, force)? {
+        return Ok(code);
+    }
     let old = repo.index_or_load_from_head()?.into_owned();
     if !old.entries().is_empty() {
         // `orphan_from_empty_tree`: the target tree is the empty one, so the same
@@ -1473,6 +1488,20 @@ fn move_worktree(
         super::checkout::show_local_changes(listing_rev, quiet)?;
     }
     Ok(Ok(autostashed))
+}
+
+/// `merge_working_tree()`'s opening gate, which `switch` shares with `checkout`
+/// (builtin/checkout.c:883-889): the quiet index refresh, then the refusal of an
+/// unmerged index with `error: you need to resolve your current index first`.
+/// `--discard-changes`/`-f` takes `reset_tree()` instead (builtin/checkout.c:871-876)
+/// and never reaches it. Every switch that runs `merge_working_tree()` runs this
+/// first — before the two-way pass could answer with its own "would be
+/// overwritten" refusal, and before any branch is created.
+fn unmerged_gate(repo: &gix::Repository, discard: bool) -> Result<Option<ExitCode>> {
+    if discard {
+        return Ok(None);
+    }
+    super::checkout::refuse_unmerged_index(repo)
 }
 
 /// The second, headed listing an autostashed switch prints once `HEAD` has moved

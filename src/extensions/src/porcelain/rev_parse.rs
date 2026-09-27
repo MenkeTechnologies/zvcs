@@ -60,7 +60,7 @@
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
 //! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--bisect`, `--prefix <dir>`,
+//! `--prefix <dir>`,
 //! `--all-objects` and `--exclude-hidden=`. Options git does
 //! *not* recognize are echoed — through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
@@ -233,7 +233,6 @@ const UNIMPLEMENTED_EXACT: &[&str] = &[
     "-h",
     "--help",
     "--prefix",
-    "--bisect",
     "--all-objects",
 ];
 
@@ -525,6 +524,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     // resolution and printed a ref stock git refuses to name.
                     for (echo, _full, id) in collect_refs(&repo, &selection)? {
                         show_rev(&mut out, &repo, &o, &id, Some(echo.as_bstr()), None, false)?;
+                    }
+                }
+                Opt::Bisect => {
+                    if let Some(code) = show_bisect_refs(&mut out, &repo, &paths, &o, &ref_excludes)? {
+                        out.flush()?;
+                        return Ok(code);
                     }
                 }
                 Opt::Unknown => {
@@ -1409,6 +1414,8 @@ enum Opt {
     Refs(crate::porcelain::log::RefSelector, Option<String>),
     /// `--exclude=<pattern>`: accumulated until the next ref walk consumes it.
     Exclude(String),
+    /// `--bisect`: the `refs/bisect/<bad>*` refs, then `^refs/bisect/<good>*`.
+    Bisect,
     /// Not an option stock git knows; git echoes these.
     Unknown,
     /// git `die()`d on the option's value: the message is already on stderr and the
@@ -1473,6 +1480,7 @@ fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
         "-q" | "--quiet" => o.quiet = true,
         // `builtin/rev-parse.c:901-904`.
         "--sq" => o.sq = true,
+        "--bisect" => return Ok(Opt::Bisect),
         // `show_type ^= REVERSED;` (`builtin/rev-parse.c:905-908`).
         "--not" => o.not = !o.not,
         "--short" => {
@@ -2181,6 +2189,86 @@ fn show_rev(
         show(out, o, &p)?;
     }
     Ok(())
+}
+
+/// The `--bisect` arm of `cmd_rev_parse()` (`builtin/rev-parse.c:936-956`):
+///
+/// ```c
+/// read_bisect_terms(&term_bad, &term_good);
+/// opts.prefix = xstrfmt("refs/bisect/%s", term_bad);
+/// refs_for_each_ref_ext(…, show_reference, NULL, &opts);
+/// opts.prefix = xstrfmt("refs/bisect/%s", term_good);
+/// refs_for_each_ref_ext(…, anti_reference, NULL, &opts);
+/// ```
+///
+/// Both walks are plain string-prefix matches on the full, untrimmed refname,
+/// so `refs/bisect/bad` also takes `refs/bisect/badly` and an empty term takes
+/// every ref under `refs/bisect/`. `show_reference()` honours the pending
+/// `--exclude` patterns and `anti_reference()` does not (:198-232); neither
+/// clears them. The ref's own object is shown, never peeled.
+///
+/// Returns the exit code when `read_bisect_terms()` died.
+fn show_bisect_refs(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    paths: &PathCtx,
+    o: &Opts,
+    excludes: &[String],
+) -> Result<Option<ExitCode>> {
+    let (bad, good) = match read_bisect_terms(repo) {
+        Ok(terms) => terms,
+        Err(err) => {
+            out.flush()?;
+            eprintln!(
+                "fatal: could not read file '{}': {}",
+                git_path(repo, paths, "BISECT_TERMS").display(),
+                crate::external::strerror(&err)
+            );
+            return Ok(Some(ExitCode::from(128)));
+        }
+    };
+    let mut refs = Vec::new();
+    for reference in repo.references()?.all()? {
+        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let Ok(full) = reference.name().as_bstr().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if let Some(id) = ref_target(repo, &reference) {
+            refs.push((full, id));
+        }
+    }
+    refs.sort();
+    for (full, id) in refs.iter().filter(|(full, _)| full.starts_with(&format!("refs/bisect/{bad}"))) {
+        let excluded = excludes
+            .iter()
+            .any(|p| crate::porcelain::log::wildmatch(p.as_bytes(), full.as_bytes()));
+        if !excluded {
+            show_rev(out, repo, o, id, Some(full.as_bytes().as_bstr()), None, false)?;
+        }
+    }
+    for (full, id) in refs.iter().filter(|(full, _)| full.starts_with(&format!("refs/bisect/{good}"))) {
+        show_rev(out, repo, o, id, Some(full.as_bytes().as_bstr()), None, true)?;
+    }
+    Ok(None)
+}
+
+/// `read_bisect_terms()` (`bisect.c:1005-1031`): the first two lines of
+/// `BISECT_TERMS`, each read with `strbuf_getline_lf()` — so a missing line is
+/// the empty string, not the default — or `bad`/`good` when the file does not
+/// exist. Any other failure to read it is the caller's `die_errno()`.
+fn read_bisect_terms(repo: &gix::Repository) -> std::io::Result<(String, String)> {
+    let text = match std::fs::read(repo.path().join("BISECT_TERMS")) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(("bad".into(), "good".into()));
+        }
+        Err(err) => return Err(err),
+    };
+    let mut lines = text.split(|&b| b == b'\n');
+    let mut next = || String::from_utf8_lossy(lines.next().unwrap_or_default()).into_owned();
+    let bad = next();
+    let good = next();
+    Ok((bad, good))
 }
 
 /// `show_default()` (`builtin/rev-parse.c:205-218`): print the `--default`

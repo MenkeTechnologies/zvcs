@@ -59,10 +59,10 @@
 //! exclusion list once the walk that consumed it is done.
 //!
 //! Rejected with an explicit refusal rather than silently ignored — the list is
-//! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`], and it includes
-//! `--prefix <dir>`,
-//! `--all-objects` and `--exclude-hidden=`. Options git does
-//! *not* recognize are echoed — through `show_flag()`'s `DO_FLAGS` /
+//! [`UNIMPLEMENTED_EXACT`] and [`UNIMPLEMENTED_PREFIX`]: `--prefix <dir>` and
+//! `--exclude-hidden=`. Options `cmd_rev_parse()` does *not* recognize —
+//! `--help`, `--all-objects` and a `-h` past the first argument among them —
+//! are echoed through `show_flag()`'s `DO_FLAGS` /
 //! `DO_REVS`-or-`DO_NOREV` gate, which `--revs-only`, `--no-revs`, `--flags` and
 //! `--no-flags` narrow — which is what git itself does with them.
 
@@ -229,12 +229,7 @@ impl Default for Opts {
 /// Options stock git recognizes that this port does not implement. Echoing them
 /// the way unknown options are echoed would silently produce a wrong answer, so
 /// they are rejected instead.
-const UNIMPLEMENTED_EXACT: &[&str] = &[
-    "-h",
-    "--help",
-    "--prefix",
-    "--all-objects",
-];
+const UNIMPLEMENTED_EXACT: &[&str] = &["--prefix"];
 
 /// `--prefix` is matched with `strcmp()` and takes `argv[++i]`
 /// (`builtin/rev-parse.c:838-845`), so a `--prefix=<dir>` spelling is not that
@@ -302,6 +297,19 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
             buf.push(b'\n');
             std::io::stdout().write_all(&buf)?;
             return Ok(ExitCode::SUCCESS);
+        }
+        // ```c
+        // if (argc > 1 && !strcmp("-h", argv[1]))
+        //         usage(builtin_rev_parse_usage);
+        // ```
+        //
+        // (`builtin/rev-parse.c:731-732`.) A leading `-h` with more behind it is
+        // the usage block on stderr at 129, before any repository is opened. Only
+        // `argv[1]` is tested: a `-h` anywhere later is no option of
+        // `cmd_rev_parse()` and is echoed through `show_flag()` like any other.
+        Some("-h") => {
+            eprint!("{USAGE}");
+            return Ok(ExitCode::from(129));
         }
         _ => {}
     }
@@ -1456,13 +1464,6 @@ enum Query {
 }
 
 fn option(o: &mut Opts, arg: &str) -> Result<Opt> {
-    // A `-h` that was not the sole argument (the lone-`-h` case is answered at
-    // the entry point) is `usage(builtin_rev_parse_usage)`: the same block, but
-    // on stderr and with no `error:` line, exit 129.
-    if arg == "-h" {
-        eprint!("{USAGE}");
-        return Err(crate::fatal::Silent(129).into());
-    }
     if UNIMPLEMENTED_EXACT.contains(&arg) || UNIMPLEMENTED_PREFIX.iter().any(|p| arg.starts_with(p)) {
         anyhow::bail!("{arg} is not ported yet");
     }

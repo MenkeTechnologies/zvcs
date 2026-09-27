@@ -2582,6 +2582,19 @@ struct V2Rec {
 /// A directory is `S_IFGITLINK` when it is a repository (`create_ce_mode()`,
 /// object.h:140) and `0` when it is not, since `check_removed()` then calls the entry
 /// removed.
+/// Whether `path` is a gitlink in the index with a directory in the work tree —
+/// the case `ce_mode_from_stat()` answers `S_IFGITLINK` for without looking
+/// inside the directory (read-cache.h `ce_mode_from_stat()`).
+fn ita_gitlink_over_dir(repo: &gix::Repository, index: &gix::index::File, path: &gix::bstr::BStr) -> bool {
+    let is_gitlink = index
+        .entry_by_path(path)
+        .is_some_and(|e| e.mode == gix::index::entry::Mode::COMMIT);
+    is_gitlink
+        && repo
+            .workdir()
+            .is_some_and(|wd| wd.join(gix::path::from_bstr(path)).is_dir())
+}
+
 fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
     let Some(wd) = repo.workdir() else {
         return 0;
@@ -3108,6 +3121,10 @@ fn porcelain_v2_output(
         r.m_w = match r.y {
             b'D' => 0,
             b'.' => r.m_i, // worktree matches the index
+            // `newmode = ce_mode_from_stat(ce, st.st_mode)` for an intent-to-add
+            // entry (diff-lib.c:265): a gitlink entry over a directory stays
+            // `160000` whether or not that repository has a commit.
+            b'A' if r.ita && ita_gitlink_over_dir(repo, &index, path.as_bstr()) => 0o160000,
             _ => worktree_mode(repo, path.as_bstr()),
         };
     }

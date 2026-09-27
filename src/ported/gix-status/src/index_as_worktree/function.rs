@@ -425,6 +425,13 @@ impl<'index> State<'_, 'index> {
         // If a file turned into a directory it was removed.
         // The only exception here are submodules which are part of the index despite being directories.
         if metadata.is_dir() {
+            // git's `run_diff_files()` tests `ce_intent_to_add()` right after
+            // `check_removed()` and before `match_stat_with_submodule()`
+            // (diff-lib.c:252-269), so an intent-to-add gitlink over a directory
+            // is an addition, not a submodule to inspect.
+            if entry.mode.is_submodule() && entry.flags.contains(gix_index::entry::Flags::INTENT_TO_ADD) {
+                return Ok(Some(EntryStatus::IntentToAdd));
+            }
             if entry.mode.is_submodule() {
                 let status = submodule
                     .status(entry, rela_path)

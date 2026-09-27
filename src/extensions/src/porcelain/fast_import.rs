@@ -2146,24 +2146,34 @@ impl Importer {
     /// bracket is therefore rejected with a named diagnostic instead of quietly
     /// producing an ident whose email is whatever came last.
     fn ident(&self, raw: &[u8]) -> Result<Vec<u8>> {
-        // `if (*buf == '<') --buf;` guarantees the space delimiter even when the
-        // name is empty; the port cannot step behind the slice, so it treats an
-        // ident that opens with `<` as having its (absent) name end right there.
-        let leading_lt = raw.first() == Some(&b'<');
-        let lt = match leading_lt {
-            true => 0,
-            false => raw
-                .iter()
-                .position(|&b| b == b'<' || b == b'>')
-                .filter(|&i| raw[i] == b'<')
-                .ok_or_else(|| {
-                    anyhow!(
-                        "missing < in ident string: {}",
-                        String::from_utf8_lossy(raw)
-                    )
-                })?,
+        // ```c
+        // /* ensure there is a space delimiter even if there is no name */
+        // if (*buf == '<')
+        //         --buf;
+        // ```
+        //
+        // `buf` points just past the `committer `/`author `/`tagger ` keyword, so
+        // stepping back lands on that keyword's space. From here on `buf` *is*
+        // the ident: the stored object reads `committer  <email> …` with two
+        // spaces, and every diagnostic below quotes the ident from that space.
+        let stepped_back;
+        let raw: &[u8] = if raw.first() == Some(&b'<') {
+            stepped_back = [b" ", raw].concat();
+            &stepped_back
+        } else {
+            raw
         };
-        if !leading_lt && lt != 0 && raw[lt - 1] != b' ' {
+        let lt = raw
+            .iter()
+            .position(|&b| b == b'<' || b == b'>')
+            .filter(|&i| raw[i] == b'<')
+            .ok_or_else(|| {
+                anyhow!(
+                    "missing < in ident string: {}",
+                    String::from_utf8_lossy(raw)
+                )
+            })?;
+        if lt != 0 && raw[lt - 1] != b' ' {
             bail!(
                 "missing space before < in ident string: {}",
                 String::from_utf8_lossy(raw)

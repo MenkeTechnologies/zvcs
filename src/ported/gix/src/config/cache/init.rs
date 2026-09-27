@@ -125,7 +125,7 @@ impl Cache {
                 globals.append(gix_config::File::from_env(options)?.unwrap_or_default())?;
             }
             if !cli_config_overrides.is_empty() {
-                config::overrides::append(&mut globals, cli_config_overrides, gix_config::Source::Cli, |_| None)
+                config::overrides::append_resolving_includes(&mut globals, cli_config_overrides, gix_config::Source::Cli, options)
                     .map_err(|err| Error::ConfigOverrides {
                         err,
                         source: gix_config::Source::Cli,

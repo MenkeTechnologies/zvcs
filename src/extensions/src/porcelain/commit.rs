@@ -2416,10 +2416,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // }
     // ```
     //
-    // (builtin/commit.c:1124-1127.) The editor's own `error:` line is already on
+    // (builtin/commit.c:1119-1127.) The editor's own `error:` line is already on
     // stderr; this is the hint that follows it, and the status is 1 — not 128.
+    // The editor is handed `GIT_INDEX_FILE=<index_file>` exactly as the hooks
+    // are, with the lock that names in place while it runs.
     if use_editor {
-        if crate::editor::launch_editor(Some(&repo), &msg_path, &[]).is_err() {
+        let env = [("GIT_INDEX_FILE", Some(hook_index.as_os_str()))];
+        let edited = HookIndexLock::hold(&repo, normal_lock, &index_file, || {
+            Ok(crate::editor::launch_editor(Some(&repo), &msg_path, &env))
+        })?;
+        if edited.is_err() {
             eprintln!("Please supply the message using either -m or -F option.");
             return Ok(ExitCode::from(1));
         }
@@ -3466,8 +3472,23 @@ impl HookIndexLock {
         if !armed || crate::hooks::find(repo, event)?.is_none() {
             return hook();
         }
+        Self::hold(repo, true, index_file, hook)
+    }
+
+    /// Run `child` with the lock in place when `armed`, whatever the child is —
+    /// also the editor, which git runs while it holds `index.lock`
+    /// (builtin/commit.c:1119-1127).
+    fn hold<T>(
+        repo: &gix::Repository,
+        armed: bool,
+        index_file: &std::path::Path,
+        child: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !armed {
+            return child();
+        }
         let guard = Self::take(repo, index_file)?;
-        let out = hook();
+        let out = child();
         // The replay runs even when the hook refused: git rolls the lock back at
         // that point, and this port's rollback is [`StagedIndex`], which puts the
         // whole index back regardless of what was replayed into it.

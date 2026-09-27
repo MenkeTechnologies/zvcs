@@ -151,9 +151,6 @@
 //!   no re-encoding substrate is vendored.
 //! * `--tag-of-filtered-object=rewrite` on a filtered tag — needs rev-list
 //!   parent rewriting.
-//! * a nested tag (a tag whose object is another tag) — git flattens the chain to
-//!   the innermost tag's content under the outer tag's name, a convoluted shape
-//!   not reproduced here.
 //! * `--ancestry-path` together with a pathspec — the option also clears
 //!   `revs->simplify_history`, and the path limit here implements git's default
 //!   simplification rather than the full-history one that leaves a TREESAME merge
@@ -973,7 +970,18 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
             continue;
         };
         if repo.find_object(*target)?.kind == gix::object::Kind::Tag {
-            tag_refs.push((name.clone(), *target));
+            // `get_commit()` (fast-export.c:1040-1045): every tag of a nested
+            // chain is filed under the one ref name, outermost first, so the
+            // backwards walk below writes the innermost tag first.
+            let mut tag = *target;
+            loop {
+                let object = repo.find_object(tag)?;
+                if object.kind != gix::object::Kind::Tag {
+                    break;
+                }
+                tag_refs.push((name.clone(), tag));
+                tag = object.try_into_tag()?.target_id()?.detach();
+            }
         } else {
             commit_refs.push((name.clone(), p.commit));
         }
@@ -2859,6 +2867,8 @@ fn emit_tag(
     opts: &Opts,
     st: &mut State,
 ) -> Result<Option<Fatal>> {
+    use gix::object::Kind;
+
     // `handle_tag` has no "already exported" guard of any kind: unlike
     // `export_blob` and `handle_commit`, it never consults `get_object_mark` on
     // the tag itself. A tag reached twice is written twice, and under
@@ -2869,33 +2879,49 @@ fn emit_tag(
     // `--import-marks` in the first place.
     let data = repo.find_object(tag_id)?.data.clone();
     let (headers, mut message) = split_object(&data);
+    let tagged_of = |headers: &[u8], id: ObjectId| -> Result<ObjectId> {
+        let hex = header_value(headers, b"object")
+            .ok_or_else(|| anyhow!("tag {id} has no object header"))?;
+        ObjectId::from_hex(hex).map_err(|e| anyhow!("tag {id}: {e}"))
+    };
+    let tagged = tagged_of(headers, tag_id)?;
+    let tagged_kind = repo.find_header(tagged)?.kind();
+
+    // ```c
+    // tagged = tag->tagged;
+    // while (tagged->type == OBJ_TAG) {
+    //         tagged = ((struct tag *)tagged)->tagged;
+    // }
+    // if (tagged->type == OBJ_TREE) {
+    //         warning(_("omitting tag %s,\nsince tags of trees (or tags "
+    //                   "of tags of trees, etc.) are not supported."), …);
+    //         return;
+    // }
+    // ```
+    //
+    // (fast-export.c:899-908.) A tag of a tag is followed to whatever the chain
+    // ends in; only a tree at the end drops the tag.
+    let (mut innermost, mut innermost_kind) = (tagged, tagged_kind);
+    while innermost_kind == Kind::Tag {
+        let inner = repo.find_object(innermost)?.data.clone();
+        innermost = tagged_of(split_object(&inner).0, innermost)?;
+        innermost_kind = repo.find_header(innermost)?.kind();
+    }
+    if innermost_kind == Kind::Tree {
+        eprintln!(
+            "warning: omitting tag {tag_id},\n\
+             since tags of trees (or tags of tags of trees, etc.) are not supported."
+        );
+        return Ok(None);
+    }
+
     // git anonymizes the message straight off the object, before the signature
     // block is looked at, so the anonymization table is keyed on the message as
     // stored — not on whatever `--signed-tags=strip` leaves of it.
     let original_message = message;
-    let target = header_value(headers, b"object")
-        .ok_or_else(|| anyhow!("tag {tag_id} has no object header"))?;
-    let target = ObjectId::from_hex(target).map_err(|e| anyhow!("tag {tag_id}: {e}"))?;
-    if header_value(headers, b"type") == Some(&b"tag"[..]) {
-        bail!("nested tags are not supported (tag {tag_id} tags another tag)");
-    }
-    let commit_id = repo.find_object(target)?.peel_to_commit()?.id;
 
-    let Some(mark) = st.marks.get(&commit_id).copied() else {
-        return match opts.filtered_tag {
-            FilteredTagMode::Drop => Ok(None),
-            FilteredTagMode::Abort => Ok(Some(Fatal(format!(
-                "tag {tag_id} tags unexported object; \
-                 use --tag-of-filtered-object=<mode> to handle it"
-            )))),
-            FilteredTagMode::Rewrite => bail!(
-                "--tag-of-filtered-object=rewrite is not supported \
-                 (tag {tag_id} tags an unexported object)"
-            ),
-        };
-    };
-
-    // git looks for the signature block and applies --signed-tags to it.
+    // git looks for the signature block and applies --signed-tags to it
+    // (fast-export.c:945-974), before the filtered-object check below.
     if let Some(pos) = find_sub(message, b"\n-----BEGIN PGP SIGNATURE-----\n") {
         match opts.signed_tags {
             SignedMode::Abort => {
@@ -2913,7 +2939,51 @@ fn emit_tag(
         }
     }
 
+    // `tagged_mark = get_object_mark(tagged)` (fast-export.c:977-978): the mark
+    // of the object this tag names directly — a commit, a blob, or, for a
+    // nested tag, the inner tag, which only has one under `--mark-tags`.
+    let tagged_mark = match st.marks.get(&tagged).copied() {
+        Some(mark) => Some(mark),
+        None => match opts.filtered_tag {
+            FilteredTagMode::Abort => {
+                return Ok(Some(Fatal(format!(
+                    "tag {tag_id} tags unexported object; \
+                     use --tag-of-filtered-object=<mode> to handle it"
+                ))));
+            }
+            FilteredTagMode::Drop => return Ok(None),
+            FilteredTagMode::Rewrite if tagged_kind == Kind::Tag && !opts.mark_tags => {
+                return Ok(Some(Fatal(
+                    "cannot export nested tags unless --mark-tags is specified.".to_string(),
+                )));
+            }
+            FilteredTagMode::Rewrite if tagged_kind == Kind::Commit => bail!(
+                "--tag-of-filtered-object=rewrite is not supported \
+                 (tag {tag_id} tags an unexported object)"
+            ),
+            // `tagged->type is either OBJ_BLOB or OBJ_TAG`: the mark is looked up
+            // again and is still absent, so the tag names the object by id.
+            FilteredTagMode::Rewrite => None,
+        },
+    };
+
     let printed_name = st.anon_refname(opts, full_name);
+    // ```c
+    // if (tagged->type == OBJ_TAG) {
+    //         printf("reset %s\nfrom %s\n\n",
+    //                name, oid_to_hex(null_oid(the_hash_algo)));
+    // }
+    // ```
+    //
+    // (fast-export.c:1008-1011.) The inner tag was just written under this same
+    // name, so the ref is cleared before the outer tag is written over it.
+    if tagged_kind == Kind::Tag {
+        st.out.extend_from_slice(b"reset ");
+        st.out.extend_from_slice(&printed_name);
+        st.out.extend_from_slice(
+            format!("\nfrom {}\n\n", ObjectId::null(repo.object_hash())).as_bytes(),
+        );
+    }
     let full: &[u8] = &printed_name;
     let short = full.strip_prefix(&b"refs/tags/"[..]).unwrap_or(full).to_vec();
     st.out.extend_from_slice(b"tag ");
@@ -2924,8 +2994,10 @@ fn emit_tag(
         st.out
             .extend_from_slice(format!("mark :{tmark}\n").as_bytes());
     }
-    st.out
-        .extend_from_slice(format!("from :{mark}\n").as_bytes());
+    match tagged_mark {
+        Some(mark) => st.out.extend_from_slice(format!("from :{mark}\n").as_bytes()),
+        None => st.out.extend_from_slice(format!("from {tagged}\n").as_bytes()),
+    }
     if opts.show_original_ids {
         st.out
             .extend_from_slice(format!("original-oid {tag_id}\n").as_bytes());

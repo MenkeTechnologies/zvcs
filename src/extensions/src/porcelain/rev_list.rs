@@ -71,6 +71,18 @@ fn fatal(message: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// Whether `open_bitmap()` (pack-bitmap.c) would find a reachability bitmap to
+/// load: a multi-pack bitmap or a pack bitmap in `objects/pack`. Only presence
+/// is asked — see the `--use-bitmap-index` gate in [`rev_list`].
+fn has_reachability_bitmap(repo: &gix::Repository) -> bool {
+    let pack_dir = repo.objects.store_ref().path().join("pack");
+    std::fs::read_dir(pack_dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".bitmap"))
+    })
+}
+
 /// `test_bitmap_walk()` (pack-bitmap.c:2791-2860, git 2.55.0).
 ///
 /// ```c
@@ -981,6 +993,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // above — but terminal rather than a mode: it runs `test_bitmap_walk()` and
     // jumps to the exit (`builtin/rev-list.c:805-808`), so nothing is listed.
     let mut test_bitmap = false;
+    // `use_bitmap_index` (builtin/rev-list.c:801-804).
+    let mut use_bitmap_index = false;
     let mut quiet = false;
     let mut disk_usage = false;
     let mut disk_usage_human = false;
@@ -1445,6 +1459,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 bisect_vars = true;
             }
             "--test-bitmap" => test_bitmap = true,
+            "--use-bitmap-index" => use_bitmap_index = true,
             // `revs->dense` (revision.c:2462-2465). `--dense` restores the
             // `repo_init_revisions()` default, so it is only ever an undo of an
             // earlier `--sparse`. Neither says anything without a pathspec: the
@@ -2182,6 +2197,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             || show_timestamp
             || bisect
             || test_bitmap
+            || use_bitmap_index
             || edge_hint
             || left_right
             || cherry_mark)
@@ -2211,6 +2227,40 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // (`builtin/rev-list.c:805-808`, git 2.55.0.)
     if test_bitmap {
         return test_bitmap_walk(&repo, &seeds, &pending);
+    }
+
+    // ```c
+    // if (use_bitmap_index) {
+    //         if (!try_bitmap_count(&revs, filter_provided_objects))
+    //                 goto cleanup;
+    //         if (!try_bitmap_disk_usage(&revs, filter_provided_objects))
+    //                 goto cleanup;
+    //         if (!try_bitmap_traversal(&revs, filter_provided_objects))
+    //                 goto cleanup;
+    // }
+    // ```
+    //
+    // (builtin/rev-list.c:923-930.) Each `try_` declines (-1) on its own terms —
+    // count needs `--count` without a marked count and without `--max-count`
+    // over objects, disk usage needs `--disk-usage`, the traversal needs no
+    // `--max-count` and no `--left-right` (builtin/rev-list.c:537-635) — and
+    // otherwise asks `prepare_bitmap_walk()`, which answers NULL under a
+    // pathspec (`revs->prune`) or when no reachability bitmap loads
+    // (pack-bitmap.c:2123-2133). A NULL answer is the ordinary walk below, so the
+    // option changes nothing in a repository without a bitmap. What a bitmap
+    // walk prints instead — `traverse_bitmap_commit_list()`'s order and
+    // `count_bitmap_commit_list()`'s totals — is not ported, so that case is
+    // refused rather than answered with the ordinary walk's output.
+    if use_bitmap_index && pathspecs.is_empty() {
+        let count_path =
+            count_only && !left_right && !cherry_mark && !(max_count.is_some() && objects);
+        let traversal_path = max_count.is_none() && !left_right;
+        if (count_path || disk_usage || traversal_path) && has_reachability_bitmap(&repo) {
+            anyhow::bail!(
+                "--use-bitmap-index over a repository with a reachability bitmap is not ported: \
+                 the bitmap walk's output order and counts are not reproduced"
+            );
+        }
     }
 
     // `revs->abbrev` is the minimum width every abbreviation in the run is asked

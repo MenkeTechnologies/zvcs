@@ -355,20 +355,25 @@ fn describe_blob(
     filter: &Filter,
 ) -> Result<Option<ExitCode>> {
     let head = repo.head_commit()?;
-    // `--objects --in-commit-order --reverse HEAD`: the *default* walk, reversed. Taking
-    // the walk oldest-first instead is not the same order when commits share a timestamp,
-    // and it named a different commit for a blob every one of them carries.
+    // `--objects --in-commit-order --reverse HEAD`: the *default* walk — commit-date
+    // order, newest first — reversed. Taking the walk oldest-first instead is not the
+    // same order when commits share a timestamp, and it named a different commit for a
+    // blob every one of them carries. gitoxide's own default is breadth-first, which is
+    // not git's order at all once two branches meet.
     let mut order: Vec<ObjectId> = Vec::new();
-    for info in repo.rev_walk(Some(head.id)).all()? {
+    let walk = repo
+        .rev_walk(Some(head.id))
+        .sorting(gix::revision::walk::Sorting::ByCommitTime(Default::default()));
+    for info in walk.all()? {
         order.push(info?.id);
     }
     for oid in order.into_iter().rev() {
         let commit = repo.find_object(oid)?.try_into_commit()?;
-        let entries = commit.tree()?.traverse().breadthfirst.files()?;
-        if let Some(entry) = entries.into_iter().find(|e| e.oid == blob) {
+        let mut path = BString::default();
+        if find_blob_path(repo, commit.tree_id()?.detach(), blob, &mut path)? {
             return match describe_commit_to_string(repo, &commit, opts, filter)? {
                 Ok(s) => {
-                    println!("{s}:{}", entry.filepath.to_str_lossy());
+                    println!("{s}:{}", path.to_str_lossy());
                     Ok(None)
                 }
                 Err(code) => Ok(Some(code)),
@@ -376,6 +381,43 @@ fn describe_blob(
         }
     }
     Ok(Some(fatal(format!("blob '{blob}' not reachable from HEAD"))?))
+}
+
+/// The path `process_object()` first reports `blob` under inside `tree`.
+///
+/// `traverse_commit_list()` hands each commit's objects to `process_object()` through
+/// `process_tree()` (list-objects.c), which reads the entries in stored order and
+/// recurses into a subtree the moment it meets one — depth-first. So a blob at both
+/// `a/x` and `a0` is `a/x`: the `a` tree sorts before `a0` and is entered first. A
+/// breadth-first scan answered with the top-level path instead. On a hit, `path` holds
+/// the answer; on a miss it is left as it was given.
+fn find_blob_path(
+    repo: &gix::Repository,
+    tree: ObjectId,
+    blob: ObjectId,
+    path: &mut BString,
+) -> Result<bool> {
+    let tree = repo.find_tree(tree)?;
+    for entry in tree.iter() {
+        let entry = entry?;
+        let len = path.len();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(entry.filename());
+        let found = match entry.mode().kind() {
+            gix::object::tree::EntryKind::Tree => {
+                find_blob_path(repo, entry.object_id(), blob, path)?
+            }
+            gix::object::tree::EntryKind::Commit => false,
+            _ => entry.object_id() == blob,
+        };
+        if found {
+            return Ok(true);
+        }
+        path.truncate(len);
+    }
+    Ok(false)
 }
 
 /// Everything the per-commit walk needs, resolved once for the whole invocation.

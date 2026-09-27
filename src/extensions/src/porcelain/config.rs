@@ -3048,10 +3048,15 @@ pub(crate) fn for_each_entry(
                 .iter()
                 .map(|(_, value, implicit, _)| (!implicit).then(|| String::from_utf8_lossy(value).into_owned()))
                 .collect();
-            let view: Vec<(Source, &str, Option<&str>)> = entries
+            let view: Vec<crate::config::SpliceEntry<'_>> = entries
                 .iter()
                 .zip(&values)
-                .map(|((key, _, _, meta), value)| (meta.source, key.as_str(), value.as_deref()))
+                .map(|((key, _, _, meta), value)| crate::config::SpliceEntry {
+                    source: meta.source,
+                    key: key.as_str(),
+                    value: value.as_deref(),
+                    level: meta.level,
+                })
                 .collect();
             crate::config::command_line_splice(&view)
         }
@@ -3067,11 +3072,15 @@ pub(crate) fn for_each_entry(
     // `kvi_from_param()` (config.c:642-647): no file, no line, scope command.
     let cli = param_metadata();
     let replay = |emit: &mut dyn FnMut(&str, &[u8], bool, &gix::config::file::Metadata) -> Result<()>| -> Result<()> {
-        for (key, value) in &splice.overrides {
+        for ((key, value), included) in splice.overrides.iter().zip(&splice.included) {
             let key = crate::config::normalize_key(key);
             match value {
                 Some(value) => emit(&key, value.as_bytes(), false, &cli)?,
                 None => emit(&key, b"", true, &cli)?,
+            }
+            for &j in included {
+                let (key, value, implicit, meta) = &entries[j];
+                emit(key, value, *implicit, meta)?;
             }
         }
         Ok(())

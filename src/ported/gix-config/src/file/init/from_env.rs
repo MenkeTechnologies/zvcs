@@ -63,8 +63,13 @@ impl File {
                 key_val: key.to_string(),
             })?;
 
+            // One section per entry, in `GIT_CONFIG_KEY_<n>` order: git hands the
+            // triple to the callback one entry at a time (`git_config_from_parameters()`,
+            // config.c:731-790), and an include is read where its line is. Folding a
+            // key into an earlier section of the same name reordered the walk and put
+            // an included file behind every later entry of the including section.
             config
-                .section_mut_or_create_new_inner(key.section_name, key.subsection_name)?
+                .new_section(key.section_name, key.subsection_name.map(ToOwned::to_owned))?
                 .push(
                     key.value_name,
                     Some(

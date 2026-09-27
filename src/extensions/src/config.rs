@@ -1422,6 +1422,7 @@ fn with_lines(occurrences: Vec<Occurrence>) -> Vec<ConfigValue> {
 /// line it sits on. The targeted last-value readers need the order and the
 /// value but not the line, and skipping [`FileLines`] keeps them from re-reading
 /// every config file per lookup.
+#[derive(Clone)]
 struct Occurrence {
     /// Normalised as [`ConfigValue::key`] is.
     key: String,
@@ -1472,7 +1473,7 @@ fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
     use gix::config::Source;
     use std::collections::HashMap;
 
-    let mut snapshot: Vec<(Source, Occurrence)> = Vec::new();
+    let mut snapshot: Vec<(Source, u8, Occurrence)> = Vec::new();
     for sec in config.sections() {
         // gitoxide's environment layer (`GIT_NO_REPLACE_OBJECTS` →
         // `core.useReplaceRefs`, `GIT_NAMESPACE`, `GIT_SSL_NO_VERIFY`, …) has no
@@ -1514,6 +1515,7 @@ fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
             };
             snapshot.push((
                 meta.source,
+                meta.level,
                 Occurrence {
                     key,
                     value,
@@ -1526,24 +1528,36 @@ fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
         }
     }
 
-    let view: Vec<(Source, &str, Option<&str>)> = snapshot
+    let view: Vec<SpliceEntry<'_>> = snapshot
         .iter()
-        .map(|(source, o)| (*source, o.key.as_str(), o.value.as_deref()))
+        .map(|(source, level, o)| SpliceEntry {
+            source: *source,
+            key: o.key.as_str(),
+            value: o.value.as_deref(),
+            level: *level,
+        })
         .collect();
     let Some(splice) = command_line_splice(&view) else {
-        return snapshot.into_iter().map(|(_, o)| o).collect();
+        return snapshot.into_iter().map(|(_, _, o)| o).collect();
+    };
+    let replay = |out: &mut Vec<Occurrence>| {
+        for (argv, included) in splice.overrides.iter().zip(&splice.included) {
+            out.push(occurrence_from_argv(argv.clone()));
+            out.extend(included.iter().map(|&j| snapshot[j].2.clone()));
+        }
     };
     let mut out = Vec::with_capacity(snapshot.len());
-    let mut command_line = Some(splice.overrides);
-    for (i, (_, o)) in snapshot.into_iter().enumerate() {
+    for (i, (_, _, o)) in snapshot.iter().enumerate() {
         if i == splice.at {
-            out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
+            replay(&mut out);
         }
         if !splice.drop[i] {
-            out.push(o);
+            out.push(o.clone());
         }
     }
-    out.extend(command_line.take().into_iter().flatten().map(occurrence_from_argv));
+    if splice.at == snapshot.len() {
+        replay(&mut out);
+    }
     out
 }
 
@@ -1551,25 +1565,67 @@ fn ordered_occurrences_in(config: &gix::config::File) -> Vec<Occurrence> {
 /// command line back into git's one: which entries to skip, and the argv-order
 /// `-c` list to walk in their place, starting at index `at`.
 pub(crate) struct CommandLineSplice {
-    /// `drop[i]` is set for the environment copy of a valued `-c` and for the
-    /// `Source::Cli` entries the overrides produced.
+    /// `drop[i]` is set for the environment copy of a valued `-c`, for the
+    /// `Source::Cli` entries the overrides produced, and for everything either
+    /// copy of an `include.path` / `includeIf.<cond>.path` override pulled in.
     pub(crate) drop: Vec<bool>,
     /// [`crate::setup::command_line_overrides`], spelled as typed.
     pub(crate) overrides: Vec<(String, Option<String>)>,
+    /// `included[k]`: the snapshot indices of what `overrides[k]` included, to be
+    /// walked right behind it. Empty for anything but an include line whose
+    /// condition held.
+    pub(crate) included: Vec<Vec<usize>>,
     /// The index the overrides are walked ahead of; `drop.len()` for the end.
     pub(crate) at: usize,
 }
 
+/// One entry of a merged walk as [`command_line_splice`] reads it.
+pub(crate) struct SpliceEntry<'a> {
+    pub(crate) source: gix::config::Source,
+    /// Normalized, as [`normalize_key`] spells it.
+    pub(crate) key: &'a str,
+    pub(crate) value: Option<&'a str>,
+    /// The include depth of the entry's section: 0 for a top-level one, one more
+    /// for each `include` that led to it (`Metadata::level`).
+    pub(crate) level: u8,
+}
+
+/// Whether a normalized key is an include directive, `include.path` or
+/// `includeif.<condition>.path` (config.c:git_config_include()).
+fn is_include_key(key: &str) -> bool {
+    key == "include.path" || (key.starts_with("includeif.") && key.ends_with(".path"))
+}
+
+/// The entries an include line at `at` pulled in: gitoxide inserts the included
+/// file's sections right behind the including one, one level deeper
+/// (`insert_includes_recursively()`), so they are the run of deeper entries that
+/// follows it.
+fn included_after(entries: &[SpliceEntry<'_>], at: usize) -> std::ops::Range<usize> {
+    let level = entries[at].level;
+    let end = entries[at + 1..]
+        .iter()
+        .position(|e| e.level <= level || e.source != entries[at].source)
+        .map_or(entries.len(), |n| at + 1 + n);
+    at + 1..end
+}
+
 /// Plan the splice [`ordered_occurrences`] describes over a merged walk given
-/// as `(source, normalized key, value)` in snapshot order. `None` when this
-/// command line carries no `-c`, so the walk stands as it is.
+/// in snapshot order. `None` when this command line carries no `-c`, so the
+/// walk stands as it is.
+///
+/// git includes a file where its include line is read (`handle_path_include()`,
+/// config.c:198-243, runs from `git_config_include()` inside the callback), so
+/// `-c include.path=<file>` contributes the file's entries right behind the
+/// `-c` itself. Both of this port's deliveries resolved the include, each at
+/// its own copy; both sets are dropped, and the command-line set is walked
+/// again behind its override.
 ///
 /// Only a *merged* read may be spliced: `git -c a.b=1 config --file x --list`
 /// reads `x` alone (`config_with_options()`, config.c:1634-1645: only
 /// `do_git_config_sequence()` calls `git_config_from_parameters()`, config.c:1601), so a scoped
 /// file whose own entries happen to be `Source::Cli` must not lose one to an
 /// override of the same key.
-pub(crate) fn command_line_splice(entries: &[(gix::config::Source, &str, Option<&str>)]) -> Option<CommandLineSplice> {
+pub(crate) fn command_line_splice(entries: &[SpliceEntry<'_>]) -> Option<CommandLineSplice> {
     use gix::config::Source;
     use std::collections::HashMap;
 
@@ -1580,37 +1636,73 @@ pub(crate) fn command_line_splice(entries: &[(gix::config::Source, &str, Option<
 
     let mut drop = vec![false; entries.len()];
     // The environment copy of each valued `-c`, matched on the exact bytes the
-    // triple carries and taken from the end.
+    // triple carries and taken from the end. Only top-level entries are copies:
+    // a value an included file set is the file's, whatever it says.
     let mut env_copies: HashMap<(String, String), usize> = HashMap::new();
     for (key, value) in crate::setup::double_delivered() {
         *env_copies.entry((normalize_key(key), value.clone())).or_default() += 1;
     }
-    for (i, (source, key, value)) in entries.iter().enumerate().rev() {
-        if *source != Source::Env {
+    for (i, e) in entries.iter().enumerate().rev() {
+        if e.source != Source::Env || e.level != 0 {
             continue;
         }
-        let Some(value) = value else { continue };
-        if let Some(n) = env_copies.get_mut(&((*key).to_owned(), (*value).to_owned())) {
+        let Some(value) = e.value else { continue };
+        if let Some(n) = env_copies.get_mut(&(e.key.to_owned(), value.to_owned())) {
             if *n > 0 {
                 *n -= 1;
                 drop[i] = true;
             }
         }
     }
-    // The `Source::Cli` sections the overrides produced, one occurrence per
-    // override of that key.
-    let mut cli_copies: HashMap<String, usize> = HashMap::new();
-    for (key, _) in &overrides {
-        *cli_copies.entry(normalize_key(key)).or_default() += 1;
+    // The `Source::Cli` sections the overrides produced, in argv order: the n-th
+    // top-level `Source::Cli` entry of a key is the n-th override of that key.
+    let mut pending: HashMap<String, std::collections::VecDeque<usize>> = HashMap::new();
+    for (k, (key, _)) in overrides.iter().enumerate() {
+        pending.entry(normalize_key(key)).or_default().push_back(k);
     }
-    for (i, (source, key, _)) in entries.iter().enumerate() {
-        if *source != Source::Cli {
+    let mut included: Vec<Option<Vec<usize>>> = vec![None; overrides.len()];
+    for (i, e) in entries.iter().enumerate() {
+        if e.source != Source::Cli || e.level != 0 {
             continue;
         }
-        if let Some(n) = cli_copies.get_mut(*key) {
-            if *n > 0 {
-                *n -= 1;
-                drop[i] = true;
+        if let Some(k) = pending.get_mut(e.key).and_then(std::collections::VecDeque::pop_front) {
+            drop[i] = true;
+            if is_include_key(e.key) {
+                included[k] = Some(included_after(entries, i).collect());
+            }
+        }
+    }
+    // gitoxide resolves includes in the environment layer, not in the
+    // `Source::Cli` one it applies afterwards, so what an override included is
+    // read off its environment copy: the dropped copies of one `(key, value)`
+    // belong to that pair's overrides in argv order. A valueless override has no
+    // environment copy and includes nothing.
+    let mut env_includes: HashMap<(String, String), std::collections::VecDeque<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if drop[i] && e.source == Source::Env && is_include_key(e.key) {
+            if let Some(value) = e.value {
+                env_includes.entry((e.key.to_owned(), value.to_owned())).or_default().push_back(i);
+            }
+        }
+    }
+    let included: Vec<Vec<usize>> = overrides
+        .iter()
+        .zip(included)
+        .map(|((key, value), from_cli)| {
+            let key = normalize_key(key);
+            let from_env = value
+                .as_deref()
+                .and_then(|v| env_includes.get_mut(&(key.clone(), v.to_owned())))
+                .and_then(std::collections::VecDeque::pop_front)
+                .map(|i| included_after(entries, i).collect());
+            from_env.or(from_cli).unwrap_or_default()
+        })
+        .collect();
+    // Whatever a dropped include line pulled in goes with it.
+    for i in 0..entries.len() {
+        if drop[i] && is_include_key(entries[i].key) {
+            for j in included_after(entries, i) {
+                drop[j] = true;
             }
         }
     }
@@ -1620,9 +1712,9 @@ pub(crate) fn command_line_splice(entries: &[(gix::config::Source, &str, Option<
     // `Source::Cli`/`Api`/`EnvOverride` section.
     let at = entries
         .iter()
-        .position(|(s, _, _)| matches!(s, Source::Cli | Source::Api | Source::EnvOverride))
+        .position(|e| matches!(e.source, Source::Cli | Source::Api | Source::EnvOverride))
         .unwrap_or(entries.len());
-    Some(CommandLineSplice { drop, overrides, at })
+    Some(CommandLineSplice { drop, overrides, included, at })
 }
 
 /// A `-c key[=value]` as the callback receives it.

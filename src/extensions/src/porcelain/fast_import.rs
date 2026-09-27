@@ -682,7 +682,11 @@ pub fn fast_import(args: &[String]) -> Result<ExitCode> {
 fn run(args: &[String]) -> Result<ExitCode> {
     // git runs `setup_git_directory()` before it looks at argv, so even a usage
     // error outside a repository comes out as "not a git repository".
-    let repo = crate::setup::discover()?;
+    let mut repo = crate::setup::discover()?;
+    // `update_branch()` and `dump_tags()` write their reflogs with
+    // `git_committer_info(0)`, the non-strict identity: with no `user.*` it is
+    // synthesized from the account and host rather than refused.
+    crate::ensure_reflog_identity(&mut repo);
     // Serialize object and ref writes through the repo coordinator, as the other
     // writing porcelain does, so concurrent zvcs writers queue instead of racing.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

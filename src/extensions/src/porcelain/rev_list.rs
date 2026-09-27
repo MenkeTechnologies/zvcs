@@ -2250,6 +2250,18 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if tips.is_empty() && !objects && !read_stdin && !rev_input_given && pending.is_empty() {
         return Ok(usage_error());
     }
+    // ```c
+    // if (revs.count &&
+    //     (revs.tag_objects || revs.tree_objects || revs.blob_objects) &&
+    //     (revs.left_right || revs.cherry_mark))
+    //         die(_("marked counting and '%s' cannot be used together"), "--objects");
+    // ```
+    //
+    // (builtin/rev-list.c:907-910.) A marked count splits commits into `<`/`>`/`=`
+    // columns, and objects belong to none of them.
+    if count_only && objects && (left_right || cherry_mark) {
+        return Ok(fatal("marked counting and '--objects' cannot be used together"));
+    }
     dedup_in_place(&mut tips);
 
     // 1. Full commit list in date order — the input every later stage refines.

@@ -2151,6 +2151,9 @@ fn continue_single_pick(
             true => super::commit::Whence::RebasePick,
             false => super::commit::Whence::CherryPick,
         };
+        // A `git commit` child (sequencer.c:5240-5256): its buffered report
+        // flushes at its exit, after its advice on stderr.
+        let _child = crate::cstdio::run_command();
         return Ok(Err(super::commit::refuse_nothing_to_commit(None, false, whence)?));
     }
 
@@ -2272,19 +2275,12 @@ fn stop_empty(
     // `wt_status_get_state()` resolves it — the single-pick wording here, the
     // sequencer wording once `.git/sequencer` exists.
     //
-    // `revert.rs` reaches the ported driver for the same reason; this is that
-    // call site, not a second rendering of the same report.
+    // The report and the advice both come from the `git commit` child that
+    // `run_git_commit()` spawns (sequencer.c:1128-1180), so its stdout is its
+    // own stdio buffer, flushed at its exit — after the advice on stderr.
     let _ = (head_id, pick_id);
-    super::status::status(&[])?;
-
-    eprintln!("The previous cherry-pick is now empty, possibly due to conflict resolution.");
-    eprintln!("If you wish to commit it anyway, use:");
-    eprintln!();
-    eprintln!("    git commit --allow-empty");
-    eprintln!();
-    eprintln!("Otherwise, please use 'git cherry-pick --skip'");
-
-    Ok(ExitCode::from(1))
+    let _child = crate::cstdio::run_command();
+    super::commit::refuse_nothing_to_commit(None, false, super::commit::Whence::CherryPick)
 }
 
 /// git's `strbuf_stripspace` plus the per-mode extras: trailing whitespace goes,

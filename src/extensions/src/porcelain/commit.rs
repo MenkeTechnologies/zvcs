@@ -3112,6 +3112,10 @@ pub(super) fn refuse_nothing_to_commit(
     amend: bool,
     whence: Whence,
 ) -> Result<ExitCode> {
+    // `run_status(stdout, ...)` writes into stdio's buffer and the advice goes
+    // to unbuffered stderr, so off a terminal stock prints the advice first and
+    // the report at `exit()`. Arm the same buffering before the report.
+    crate::cstdio::defer();
     report_nothing_to_commit(
         untracked,
         match amend {

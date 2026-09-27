@@ -8,6 +8,10 @@ use gix::hash::ObjectId;
 use super::color::{Slot, StatusColors};
 use super::diffcore_rename;
 use super::{Arg, LongOpt};
+// The report goes through git's stdout buffer: a caller that arms it (a
+// `git commit` child refusing an empty pick) gets stock's ordering against
+// its stderr advice; an unarmed `git status` writes straight through.
+use crate::cstdio::print;
 
 /// `cmd_status()`'s `struct option builtin_status_options[]`
 /// (builtin/commit.c:1568-1599), in table order, as [`super::resolve_long`]
@@ -5124,10 +5128,8 @@ fn flush_rendered(out: &mut String, comment_prefix: Option<&str>, sink: LongSink
         Some(cs) => comment_prefix_body(&text, cs),
         None => text,
     };
-    use std::io::Write as _;
-    let mut stdout = std::io::stdout().lock();
-    let _ = stdout.write_all(text.as_bytes());
-    let _ = stdout.flush();
+    crate::cstdio::write_bytes(text.as_bytes());
+    crate::cstdio::before_spawn();
 }
 
 /// The leading SGR sequence git's `color()` would emit for `slot`, recovered from

@@ -2066,7 +2066,7 @@ git push --set-upstream {remote_name} {branch}\n{advice}"
             if same_remote {
                 match upstream() {
                     Ok(dst) if dst != refname => {
-                        return Ok(Err(die_push_simple(&branch, remote_name, &dst)));
+                        return Ok(Err(die_push_simple(repo, &branch, remote_name, &dst)));
                     }
                     Ok(_) => {}
                     Err(code) => return Ok(Err(code)),
@@ -2085,16 +2085,35 @@ git push --set-upstream {remote_name} {branch}\n{advice}"
     Ok(Ok(vec![format!("{refname}:{dst}")]))
 }
 
-/// `die_push_simple()` (builtin/push.c): the upstream of the current branch is a
+/// `die_push_simple()` (builtin/push.c:135-181): the upstream of the current branch is a
 /// differently-named branch, so `simple` refuses rather than guess which one was meant.
-fn die_push_simple(branch: &str, remote_name: &str, upstream: &str) -> ExitCode {
+///
+/// Two advice paragraphs close the message: the `push.default` one unless that key is
+/// set at all (`PUSH_DEFAULT_UNSPECIFIED`, :152-155), and the `branch.autoSetupMerge`
+/// one unless it is `simple` (`cfg->branch_track != BRANCH_TRACK_SIMPLE`, :156-161).
+fn die_push_simple(
+    repo: &gix::Repository,
+    branch: &str,
+    remote_name: &str,
+    upstream: &str,
+) -> ExitCode {
     let short = upstream.strip_prefix("refs/heads/").unwrap_or(upstream);
+    let pushdefault_maybe = match repo.config_snapshot().string("push.default") {
+        None => "\nTo choose either option permanently, see push.default in 'git help config'.\n",
+        Some(_) => "",
+    };
+    let automergesimple_maybe = match super::branch::config_branch_track(repo) {
+        super::branch::Track::Simple => "",
+        _ => "\nTo avoid automatically configuring an upstream branch when its name\n\
+              won't match the local branch, see option 'simple' of branch.autoSetupMerge\n\
+              in 'git help config'.\n",
+    };
     eprintln!(
         "fatal: The upstream branch of your current branch does not match\n\
          the name of your current branch.  To push to the upstream branch\n\
          on the remote, use\n\n    git push {remote_name} HEAD:{short}\n\n\
          To push to the branch of the same name on the remote, use\n\n    \
-git push {remote_name} HEAD\n"
+git push {remote_name} HEAD\n{pushdefault_maybe}{automergesimple_maybe}"
     );
     ExitCode::from(128)
 }

@@ -3849,7 +3849,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     //
     // (revision.c:789-805.) The rest — the TREESAME bookkeeping and
     // `--simplify-merges`' parent reduction — is the same pass a pathspec gets.
-    if (!pathspecs.is_empty() || simplify_by_decoration) && !follow {
+    //
+    // `--no-walk` never gets there: `prepare_revision_walk()` returns before
+    // `limit_list()` (`if (revs->no_walk) return 0;`), and `get_revision_1()`'s
+    // `REV_WALK_NO_WALK` arm runs no `try_to_simplify_commit()` (revision.c:4418-
+    // 4434). No commit is ever marked TREESAME, so every named one is shown.
+    if (!pathspecs.is_empty() || simplify_by_decoration) && !follow && no_walk.is_none() {
         // `if (!revs->prune_data.nr) return REV_TREE_SAME;` for every parent
         // comparison. A root is compared by `rev_same_tree_as_empty()`, which
         // never consults decorations or this shortcut.

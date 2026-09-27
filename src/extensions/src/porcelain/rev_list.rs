@@ -2423,7 +2423,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut simplified_display: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     // `revs->prune`: a pathspec, or `--simplify-by-decoration`, which sets it with
     // no pathspec at all (revision.c:2452).
-    let prune = !pathspecs.is_empty() || simplify_by_decoration;
+    //
+    // Under `--no-walk` nothing is pruned: `prepare_revision_walk()` returns before
+    // `limit_list()` (`if (revs->no_walk) return 0;`) and `get_revision_1()`'s
+    // `REV_WALK_NO_WALK` arm runs no `try_to_simplify_commit()` (revision.c:4418-
+    // 4434), so no commit is marked TREESAME and every named one is shown.
+    let prune = (!pathspecs.is_empty() || simplify_by_decoration) && !no_walk;
     // `get_name_decoration()`, which `rev_compare_tree()` consults under
     // `--simplify-by-decoration` (revision.c:789-805). It loads every ref with no
     // filter (log-tree.c:94-98), so a commit named only by `refs/bisect/*`,

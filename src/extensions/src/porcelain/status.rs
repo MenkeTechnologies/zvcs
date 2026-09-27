@@ -1994,9 +1994,16 @@ pub(crate) fn diffcore_order_read(
     queued: bool,
 ) -> Result<()> {
     if let (Some(path), true) = (orderfile, queued) {
-        super::diff_files::read_order_file_at(path, &orderfile_open_path(repo, path))?;
+        read_orderfile(repo, path)?;
     }
     Ok(())
+}
+
+/// `prepare_order()` (diffcore-order.c:14-60) for a `RUN_SETUP` command: the
+/// patterns of the order file [`configured_orderfile`] named, opened from the top
+/// of the work tree, or git's `failed to read orderfile` fatal.
+pub(crate) fn read_orderfile(repo: &gix::Repository, path: &str) -> Result<Vec<Vec<u8>>> {
+    super::diff_files::read_order_file_at(path, &orderfile_open_path(repo, path))
 }
 
 /// Resolve `status.showUntrackedFiles`, which stands in for an absent

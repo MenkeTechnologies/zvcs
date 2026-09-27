@@ -12,6 +12,8 @@
 //!    the 4-space-indented, right-trimmed message, and one ` ## <path> ##`
 //!    section per changed file whose hunk headers are rewritten to
 //!    `@@ <path>: <function>` — so hunk line numbers never enter the comparison.
+//!    That log reads `diff.orderFile`, so the sections follow the order file, and
+//!    one it cannot read is its `fatal:` plus `could not parse log`, exit 255.
 //!    Because upstream feeds the `diff --git` header block through
 //!    `parse_git_diff_header()`, the `index`/`--- `/`+++ `/`new file mode` lines
 //!    are consumed rather than kept: abbreviated blob ids are irrelevant to the
@@ -2035,9 +2037,15 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // Loaded once per range because upstream runs one log per range: a ref that
     // does not resolve warns once for each of them.
     let notes1 = super::notes::load_display(&repo, &opts.notes)?;
-    let mut a = read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes1)?;
+    let mut a = match read_patches(&repo, ends1, &mailmap, matcher.as_ref(), &opts.abbrev, &notes1, &range1)? {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
     let notes2 = super::notes::load_display(&repo, &opts.notes)?;
-    let mut b = read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes2)?;
+    let mut b = match read_patches(&repo, ends2, &mailmap, matcher.as_ref(), &opts.abbrev, &notes2, &range2)? {
+        Ok(p) => p,
+        Err(code) => return Ok(code),
+    };
 
     find_exact_matches(&mut a, &mut b);
     if let Err(msg) = get_correspondences(&mut a, &mut b, opts.creation_factor, opts.max_memory) {
@@ -2187,8 +2195,14 @@ pub(super) fn show_range_diff(
 
     let mailmap = crate::mailmap::Mailmap::read(Some(&repo));
     let notes = super::notes::load_display(repo, &opts.notes)?;
-    let mut a = read_patches(repo, ends1, &mailmap, None, &opts.abbrev, &notes)?;
-    let mut b = read_patches(repo, ends2, &mailmap, None, &opts.abbrev, &notes)?;
+    let mut a = match read_patches(repo, ends1, &mailmap, None, &opts.abbrev, &notes, range1)? {
+        Ok(p) => p,
+        Err(code) => return Ok(Err(code)),
+    };
+    let mut b = match read_patches(repo, ends2, &mailmap, None, &opts.abbrev, &notes, range2)? {
+        Ok(p) => p,
+        Err(code) => return Ok(Err(code)),
+    };
 
     find_exact_matches(&mut a, &mut b);
     if let Err(msg) = get_correspondences(&mut a, &mut b, opts.creation_factor, opts.max_memory) {
@@ -2974,7 +2988,29 @@ fn read_patches(
     matcher: Option<&PathMatcher>,
     abbrev: &Abbrev,
     notes: &[super::notes::Tree],
-) -> Result<Vec<Patch>> {
+    range: &str,
+) -> Result<std::result::Result<Vec<Patch>, ExitCode>> {
+    // The inner `git log` reads `diff.orderFile` through `git_diff_ui_config()`
+    // (diff.c:442-445) and its `diffcore_std()` runs `diffcore_order()` on every
+    // commit's queue (diff.c:7519-7520), so the sections come out in the order
+    // file's order. A file that cannot be read kills that log at the first
+    // non-empty queue (`prepare_order()`, diffcore-order.c:24-26), which
+    // `range-diff` reports as `could not parse log` (range-diff.c:77-81).
+    let report = |e: anyhow::Error| match e.downcast::<crate::fatal::Fatal>() {
+        Ok(fatal) => {
+            eprintln!("fatal: {fatal}");
+            Ok(Err(log_parse_failed(range)))
+        }
+        Err(e) => Err(e),
+    };
+    let orderfile = match super::status::configured_orderfile(repo) {
+        Ok(o) => o,
+        Err(e) => return report(e),
+    };
+    let mut order = OrderFile {
+        path: orderfile.as_deref(),
+        patterns: None,
+    };
     let ids = ordered_commits(repo, tips, hidden)?;
     let mut out = Vec::with_capacity(ids.len());
     // With a pathspec, a commit that touches no matching path is dropped
@@ -2983,12 +3019,24 @@ fn read_patches(
     // index as patches are kept, not from the pre-filter walk position.
     let mut index = 0usize;
     for id in ids {
-        if let Some(patch) = build_patch(repo, id, index, mailmap, matcher, abbrev, notes)? {
-            out.push(patch);
-            index += 1;
+        match build_patch(repo, id, index, mailmap, matcher, abbrev, notes, &mut order) {
+            Ok(Some(patch)) => {
+                out.push(patch);
+                index += 1;
+            }
+            Ok(None) => {}
+            Err(e) => return report(e),
         }
     }
-    Ok(out)
+    Ok(Ok(out))
+}
+
+/// `diff.orderFile` for the inner log: the configured name, and its patterns once
+/// `prepare_order()` has read them — it reads the file once per process, at the
+/// first non-empty queue.
+struct OrderFile<'a> {
+    path: Option<&'a str>,
+    patterns: Option<Vec<Vec<u8>>>,
 }
 
 /// `--no-merges --reverse --date-order`: the commits of the range, oldest first,
@@ -3084,6 +3132,7 @@ fn build_patch(
     matcher: Option<&PathMatcher>,
     abbrev: &Abbrev,
     notes: &[super::notes::Tree],
+    order: &mut OrderFile<'_>,
 ) -> Result<Option<Patch>> {
     let commit = repo.find_object(id)?.try_into_commit()?;
 
@@ -3161,7 +3210,17 @@ fn build_patch(
         }
     }
 
-    let sections = detect_renames(repo, &changes)?;
+    let mut sections = detect_renames(repo, &changes)?;
+
+    // `diffcore_order()` (diffcore-order.c:112-127): a stable sort on the first
+    // pattern matching `pair->two->path`, skipped for an empty queue.
+    if let (Some(path), false) = (order.path, sections.is_empty()) {
+        if order.patterns.is_none() {
+            order.patterns = Some(super::status::read_orderfile(repo, path)?);
+        }
+        let patterns = order.patterns.as_deref().unwrap_or_default();
+        sections.sort_by_cached_key(|s| super::diff_files::match_order(patterns, s.path_two()));
+    }
 
     let mut diff_offset = 0usize;
     let mut diffsize = 0i64;
@@ -3203,6 +3262,17 @@ enum Section<'a> {
         /// so a copy keeps the bare destination path.
         is_rename: bool,
     },
+}
+
+impl Section<'_> {
+    /// `pair->two->path`, which `diff_tree_oid()` fills for both sides of an
+    /// addition or deletion, so it is the one path every section has.
+    fn path_two(&self) -> &[u8] {
+        match self {
+            Section::Plain(change) => change_path(change),
+            Section::Paired { new_path, .. } => new_path,
+        }
+    }
 }
 
 /// The `diffcore_std()` rename pass over one commit's tree diff.

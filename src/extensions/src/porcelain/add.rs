@@ -740,9 +740,18 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         }
         // `read_directory()` sorts `dir->entries` before `add_files()` walks them, so
         // the new paths are reported in path order rather than in the order the
-        // directory walk happened to reach them.
-        let mut fresh: Vec<&BString> =
-            staged.iter().filter(|s| !s.was_tracked).map(|s| &s.path).collect();
+        // directory walk happened to reach them. An embedded repository is a
+        // directory entry, named with the trailing `/` `treat_directory()` gives it,
+        // and `add_to_index()` reports that name verbatim (read-cache.c:805-806) —
+        // so it also sorts as `<name>/`.
+        let mut fresh: Vec<String> = staged
+            .iter()
+            .filter(|s| !s.was_tracked)
+            .map(|s| match s.mode == Mode::COMMIT {
+                true => format!("{}/", s.path),
+                false => s.path.to_string(),
+            })
+            .collect();
         fresh.sort();
         for path in fresh {
             lines.push(format!("add '{path}'"));
@@ -862,6 +871,24 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
                 let Some(abs) = repo.workdir_path(&path) else { continue };
+                // `-N` takes `add_to_index()`'s `intent_only` arm, which never calls
+                // `index_path()` (read-cache.c:775-781): the embedded repository's
+                // HEAD is not resolved, so an unborn one is no failure, and the
+                // gitlink carries the empty blob `set_object_name_for_intent_to_add_entry()`
+                // gives every intent-to-add entry. `check_embedded_repo()` still
+                // warns first (builtin/add.c:336-340).
+                if intent_to_add {
+                    warn_embedded_repo(&path, warn_embedded, &repo, &mut embedded_advised);
+                    indexed_any = true;
+                    staged.push(Staged {
+                        path,
+                        id: repo.object_hash().empty_blob(),
+                        mode: Mode::COMMIT,
+                        stat: Default::default(),
+                        was_tracked: false,
+                    });
+                    continue;
+                }
                 // `add_file_to_index` resolves the embedded repository's HEAD into
                 // the gitlink; an unborn HEAD has nothing to record and is the
                 // `does not have a commit checked out` failure.

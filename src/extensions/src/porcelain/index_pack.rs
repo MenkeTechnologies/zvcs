@@ -853,42 +853,70 @@ pub(super) fn open_idx_and_pack(
     }
 }
 
-/// `load_idx()`'s size arithmetic (packfile.c:232-251), which reports before
-/// `open_pack_index()` fails.
+/// `check_packed_git_idx()` and `load_idx()` (packfile.c:160-262): the checks
+/// that print an `error:` line before `open_pack_index()` fails. The first
+/// that trips is the one reported, in git's order:
 ///
 /// ```c
-/// size_t min_size = st_add(8 + 4*256 + hashsz + hashsz, st_mult(nr, hashsz + 4 + 4));
-/// size_t max_size = min_size;
-/// if (nr)
-///         max_size = st_add(max_size, st_mult(nr - 1, 8));
-/// if (idx_size < min_size || idx_size > max_size)
-///         return error("wrong index v2 file size in %s", path);
+/// if (idx_size < 4 * 256 + hashsz + hashsz)
+///         return error("index file %s is too small", path);
+/// if (hdr->idx_signature == htonl(PACK_IDX_SIGNATURE)) {
+///         version = ntohl(hdr->idx_version);
+///         if (version < 2 || version > 2)
+///                 return error("index file %s is version %"PRIu32
+///                              " and is not supported by this binary"
+///                              " (try upgrading GIT to a newer version)", …);
+/// } else
+///         version = 1;
+/// …                       return error("non-monotonic index %s", path);
+/// …                       return error("wrong index v1 file size in %s", path);
+/// …                       return error("wrong index v2 file size in %s", path);
 /// ```
 ///
 /// The bounds depend on the *hash* the reader was told to use, which is why
-/// `--object-format=sha256` over a sha1 index reports this and then refuses to
-/// open it. Only the v2 case is reported: gitoxide writes and reads no v1 index,
-/// so a file this port could produce is never measured against the v1 rule.
+/// `--object-format=sha256` over a sha1 index reports a wrong size and then
+/// refuses to open it. Nothing is printed for a file that passes every check.
 fn report_bad_idx_size(index_path: &Path, hash: Kind) {
     let Ok(data) = fs::read(index_path) else { return };
-    // The v2 header is `\377tOc` plus a version word; anything else is a v1 index.
-    if data.len() < 8 + 4 * 256 || &data[..4] != b"\xfftOc" {
+    let path = index_path.display();
+    let hashsz = hash.len_in_bytes();
+    if data.len() < 4 * 256 + hashsz + hashsz {
+        eprintln!("error: index file {path} is too small");
         return;
     }
-    let fanout_at = 8 + 4 * 255;
-    let nr = u32::from_be_bytes([
-        data[fanout_at],
-        data[fanout_at + 1],
-        data[fanout_at + 2],
-        data[fanout_at + 3],
-    ]) as usize;
-    let hashsz = hash.len_in_bytes();
+    let word = |at: usize| u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    let version = if &data[..4] == b"\xfftOc" { word(4) } else { 1 };
+    if version != 1 && version != 2 {
+        eprintln!(
+            "error: index file {path} is version {version} and is not supported by this binary \
+             (try upgrading GIT to a newer version)"
+        );
+        return;
+    }
+    let fanout = if version > 1 { 8 } else { 0 };
+    let mut nr = 0u32;
+    for i in 0..256 {
+        let n = word(fanout + 4 * i);
+        if n < nr {
+            eprintln!("error: non-monotonic index {path}");
+            return;
+        }
+        nr = n;
+    }
+    let nr = nr as usize;
+    if version == 1 {
+        if data.len() != 4 * 256 + hashsz + hashsz + nr * (hashsz + 4) {
+            eprintln!("error: wrong index v1 file size in {path}");
+        }
+        return;
+    }
     let min_size = 8 + 4 * 256 + hashsz + hashsz + nr * (hashsz + 4 + 4);
     let max_size = min_size + nr.saturating_sub(1) * 8;
     if data.len() < min_size || data.len() > max_size {
-        eprintln!("error: wrong index v2 file size in {}", index_path.display());
+        eprintln!("error: wrong index v2 file size in {path}");
     }
 }
+
 
 /// Stream a pack from stdin, then report it git's way.
 ///

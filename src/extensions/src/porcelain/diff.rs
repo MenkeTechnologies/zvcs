@@ -1421,6 +1421,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut pickaxe_arg: Option<(u8, Vec<u8>)> = None;
     // `DIFF_PICKAXE_REGEX`.
     let mut pickaxe_regex = false;
+    // `DIFF_PICKAXE_IGNORE_CASE`, from `-i` / `--regexp-ignore-case`.
+    let mut pickaxe_icase = false;
     // `XDF_INDENT_HEURISTIC`, on unless `diff.indentHeuristic` or
     // `--no-indent-heuristic` turns it off (`git_diff_basic_config()` sets
     // `diff_indent_heuristic`, whose default is 1).
@@ -2598,6 +2600,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // scan — so the pattern is only compiled below.
             "--pickaxe-regex" => pickaxe_regex = true,
             "--no-pickaxe-regex" => pickaxe_regex = false,
+            // `handle_revision_opt()` (revision.c:2686-2696): `-i` also sets
+            // `DIFF_PICKAXE_IGNORE_CASE`, which `diffcore_pickaxe()` reads. The four
+            // dialect flags only choose `grep_filter.pattern_type_option`, which a
+            // diff never consults — `-G` is always `REG_EXTENDED` — so they are
+            // accepted and change nothing.
+            "-i" | "--regexp-ignore-case" => pickaxe_icase = true,
+            "-E" | "--extended-regexp" | "-F" | "--fixed-strings" | "-P" | "--perl-regexp"
+            | "--basic-regexp" => {}
             // `OPT_PICKAXE_S`/`OPT_PICKAXE_G` (diff.c:6270-6275). The pattern is
             // kept raw and the kind recorded: `--pickaxe-regex` may still be ahead,
             // and `diff_setup_done()`'s two `HAS_MULTI_BITS` `die()`s run after the
@@ -2850,11 +2860,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut pickaxe = None;
     if let Some((kind, pat)) = pickaxe_arg {
         if kind == b'S' && !pickaxe_regex {
-            pickaxe = Some(super::diff_pickaxe::Kind::Occurrences(
-                super::diff_pickaxe::Needle::Literal(pat),
-            ));
+            pickaxe = Some(super::diff_pickaxe::Kind::Occurrences(match pickaxe_icase {
+                true => super::diff_pickaxe::Needle::Regex(super::diff_pickaxe::literal_icase(&pat)),
+                false => super::diff_pickaxe::Needle::Literal(pat),
+            }));
         } else {
-            match super::diff_pickaxe::compile_regex(&pat) {
+            match super::diff_pickaxe::compile_regex_icase(&pat, pickaxe_icase) {
                 Ok(re) => {
                     let needle = super::diff_pickaxe::Needle::Regex(re);
                     pickaxe = Some(if kind == b'S' {
@@ -5386,6 +5397,7 @@ const KNOWN_LONG: &[&str] = &[
     "--all",
     "--anchored",
     "--base",
+    "--basic-regexp",
     "--binary",
     "--bisect",
     "--branches",
@@ -5412,11 +5424,13 @@ const KNOWN_LONG: &[&str] = &[
     "--dst-prefix",
     "--exclude-hidden",
     "--exit-code",
+    "--extended-regexp",
     "--ext-diff",
     "--find-copies",
     "--find-copies-harder",
     "--find-object",
     "--find-renames",
+    "--fixed-strings",
     "--follow",
     "--full-index",
     "--function-context",
@@ -5482,10 +5496,12 @@ const KNOWN_LONG: &[&str] = &[
     "--patch-with-raw",
     "--patch-with-stat",
     "--patience",
+    "--perl-regexp",
     "--pickaxe-all",
     "--pickaxe-regex",
     "--quiet",
     "--raw",
+    "--regexp-ignore-case",
     "--relative",
     "--remerge-diff",
     "--remotes",

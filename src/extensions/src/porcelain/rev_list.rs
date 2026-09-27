@@ -3250,9 +3250,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             graph_blocks.push((!text.is_empty()).then(|| super::log::GraphBlock::message_only(text)));
         }
         if objects && in_commit_order && !is_boundary {
-            if let Err(code) = collect_commit_objects(&mut trav, *id) {
-                return Ok(code);
-            }
+            // The objects shown ahead of a missing one stand: see
+            // [`print_before_die`].
+            let failed = collect_commit_objects(&mut trav, *id).err();
             for (oid, name) in trav.lines.drain(..) {
                 // `show_object()` (list-objects.c:38-48) returns *before* the
                 // callback, so a packed object is left out of `--disk-usage` and
@@ -3270,6 +3270,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 if !quiet && !count_only {
                     object_line(&oid, &name, &mut out);
                 }
+            }
+            if let Some(code) = failed {
+                print_before_die(&out, count_only || quiet || disk_usage)?;
+                return Ok(code);
             }
         }
     }
@@ -3329,9 +3333,11 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // the object listing at all. `--in-commit-order` is the exception: it emits a
     // commit's objects inside the loop, alongside the commit, and those stand.
     if objects && !in_commit_order && abort.is_none() {
+        let mut failed: Option<ExitCode> = None;
         for id in &commits {
             if let Err(code) = collect_commit_objects(&mut trav, *id) {
-                return Ok(code);
+                failed = Some(code);
+                break;
             }
         }
         for (id, name) in &trav.lines {
@@ -3351,6 +3357,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             if !quiet && !count_only {
                 object_line(id, name, &mut out);
             }
+        }
+        if let Some(code) = failed {
+            print_before_die(&out, count_only || quiet || disk_usage)?;
+            return Ok(code);
         }
     }
 
@@ -5032,10 +5042,9 @@ fn process_blob(
 /// then offer it again as `LOFS_END_TREE`. `base` is the path of the tree being
 /// walked into, `/`-terminated when non-empty, and is restored on return.
 ///
-/// A tree the repository lacks is `die("bad tree object")` territory unless
-/// `--missing` asked otherwise; under the default action this port keeps the
-/// `missing object` fatal [`note_missing`] raises. Otherwise the filter still
-/// decides whether the tree is shown, and showing it reports it missing.
+/// A tree the repository lacks is `die("bad tree object %s")` unless `--missing`
+/// asked otherwise. Otherwise the filter still decides whether the tree is shown,
+/// and showing it reports it missing through [`note_missing`].
 fn process_tree(
     trav: &mut Traversal<'_>,
     id: ObjectId,
@@ -5057,11 +5066,21 @@ fn process_tree(
     let failed_parse = entries.is_none();
     let baselen = base.len();
     base.extend_from_slice(name);
+    // ```c
+    // if (failed_parse) {
+    //         ...
+    //         if (!revs->do_not_die_on_missing_objects)
+    //                 die("bad tree object %s", oid_to_hex(&obj->oid));
+    // }
+    // ```
+    //
+    // (list-objects.c:173-187.) `cmd_rev_list()` sets
+    // `do_not_die_on_missing_objects` for every `--missing=` action but `error`,
+    // so only the default dies here — in `process_tree()`'s own words, not
+    // `finish_object__ma()`'s. A promisor tree `--exclude-promisor-objects`
+    // pre-filters never gets this far: it is already in `seen`.
     if failed_parse && trav.missing == Missing::Error {
-        // `base` is this tree's own path — empty for the root tree.
-        if let Some(code) = note_missing(trav.repo, id, base, gix::object::Kind::Tree, &mut trav.absent, trav.missing) {
-            return Err(code);
-        }
+        return Err(fatal(&format!("bad tree object {id}")));
     }
 
     let r = list_objects_filter::filter_object(
@@ -5473,6 +5492,24 @@ fn quote_path_sp(path: &[u8]) -> Vec<u8> {
     out
 }
 
+/// What stands on stdout when `finish_object__ma()` dies part-way through the
+/// object listing.
+///
+/// `traverse_commit_list()` prints as it goes — every commit, then (or, under
+/// `--in-commit-order`, alongside each commit) its trees and blobs — so the
+/// listing up to the missing object has already been written when the `die()`
+/// fires. A summary (`--count`, `--disk-usage`, `--quiet`) is printed only once
+/// the walk ends, so it never is.
+fn print_before_die(out: &[u8], summary: bool) -> Result<()> {
+    if summary {
+        return Ok(());
+    }
+    let mut sink = std::io::stdout().lock();
+    sink.write_all(out)?;
+    sink.flush()?;
+    Ok(())
+}
+
 /// git's `finish_object__ma`: record or reject an object the repository lacks.
 /// `Some(code)` means the walk must stop with that exit code.
 fn note_missing(
@@ -5484,7 +5521,7 @@ fn note_missing(
     missing: Missing,
 ) -> Option<ExitCode> {
     match missing {
-        Missing::Error => Some(fatal(&format!("missing object '{id}'"))),
+        Missing::Error => Some(fatal(&format!("missing {kind} object '{id}'"))),
         Missing::AllowAny => None,
         // ```c
         // case MA_PRINT:
@@ -5518,7 +5555,7 @@ fn note_missing(
         // (`finish_object__ma()`, builtin/rev-list.c:215-220.)
         Missing::AllowPromisor => match promisor_objects(repo).contains(&id) {
             true => None,
-            false => Some(fatal(&format!("unexpected missing object '{id}'"))),
+            false => Some(fatal(&format!("unexpected missing {kind} object '{id}'"))),
         },
     }
 }

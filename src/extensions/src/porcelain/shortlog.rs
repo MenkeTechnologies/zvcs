@@ -665,6 +665,32 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 // `--remove-empty` (`revs->remove_empty_trees`) is not ported; it
                 // only bites a merge whose parent introduces every matching path.
                 ("remove-empty", None) => {}
+                // `handle_revision_opt()`'s display switches (revision.c:2575-2668).
+                // Each only sets a `rev_info` field that `show_log()` and
+                // `log_tree_diff()` read, and `cmd_shortlog()` takes nothing from
+                // `rev` but the format kind, the abbreviation, the output file and
+                // the date mode (builtin/shortlog.c:460-463), so all are accepted
+                // and change nothing. `--expand-tabs=<n>` still dies on a value
+                // `strtol_i()` refuses (revision.c:2579-2583).
+                (
+                    "log-size" | "abbrev-commit" | "no-abbrev-commit" | "show-signature"
+                    | "no-show-signature" | "expand-tabs" | "no-expand-tabs" | "show-notes"
+                    | "notes" | "no-notes" | "standard-notes" | "no-standard-notes"
+                    | "show-notes-by-default" | "show-linear-break" | "encode-email-headers"
+                    | "no-encode-email-headers" | "root" | "no-commit-id" | "always"
+                    | "full-diff",
+                    None,
+                ) => {}
+                ("show-linear-break" | "show-notes" | "notes", Some(_)) => {}
+                ("expand-tabs", Some(v)) => {
+                    if !crate::revopt::strtol_i(v).is_some_and(|n| n >= 0) {
+                        eprintln!("fatal: '{v}': not a non-negative integer");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+                // `revs->date_mode.type = DATE_RELATIVE` (revision.c:2660-2662),
+                // the date mode `%ad`/`%cd` read.
+                ("relative-date", None) => opts.date_format = Some("relative".to_string()),
                 ("date", Some(fmt)) => {
                     if !is_known_date_format(fmt) {
                         eprintln!("fatal: unknown date format {fmt}");

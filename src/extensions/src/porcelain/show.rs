@@ -2851,9 +2851,12 @@ fn show_tag(
             super::log::write_identity_headers_for(
                 &mut sb,
                 &tagger,
-                disp.email.encode_headers,
-                // `show_tagger()`'s `pp_user_info(…, get_log_output_encoding())`
-                // (builtin/log.c:577), over the tag's own bytes.
+                // `show_tagger()` builds a zeroed `pretty_print_context` of its own
+                // (builtin/log.c:570-577), so `encode_email_headers` is 0 and the
+                // name is never Q-encoded, whatever `format.encodeEmailHeaders` or
+                // `--encode-email-headers` say; the label it would carry is
+                // `get_log_output_encoding()`.
+                false,
                 disp.email.output_encoding,
                 None,
             )?;

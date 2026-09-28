@@ -1265,6 +1265,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--no-commit-id` (`revs->no_commit_id`) and `--always`
     // (`revs->always_show_header = 1`), revision.c:2635-2638.
     let mut no_commit_id = false;
+    // `--full-diff` (`revs->diff = 1; revs->full_diff = 1`, revision.c): the
+    // pathspec limits the walk but is not copied into `diffopt.pathspec`
+    // (`if (!revs->full_diff) copy_pathspec(...)` in `setup_revisions()`), so
+    // each commit's diff shows every path it touched.
+    let mut full_diff = false;
+    // `save_parents()`: under `--full-diff`, `simplify_commit()` keeps each
+    // commit's parent list as `try_to_simplify_commit()` left it, before
+    // `rewrite_parents()` replaces it (revision.c:4325-4326), and
+    // `log_tree_diff()` diffs against that saved list (`get_saved_parents()`).
+    let mut saved_parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     let mut always_opt = false;
 
     // `--stdin` splices its lines in where it stood; `origin` tells them apart
@@ -1487,6 +1497,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             use_mailmap = false;
         } else if a == "--log-size" {
             log_size = true;
+        } else if a == "--full-diff" {
+            full_diff = true;
         } else if a == "--no-commit-id" {
             no_commit_id = true;
         } else if a == "--always" {
@@ -4066,7 +4078,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     if follow {
         // `cmd_log_init_finish()`: `--follow` rewrites the pathspec as the walk
         // goes back, so it can only track one path.
-        if pathspecs.len() != 1 {
+        // `diff_setup_done()` counts `diffopt.pathspec` (diff.c:5224-5225), which
+        // `--full-diff` leaves empty.
+        if pathspecs.len() != 1 || full_diff {
             eprintln!("fatal: --follow requires exactly one pathspec");
             return Ok(ExitCode::from(128));
         }
@@ -4198,6 +4212,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     continue;
                 }
                 if show_parents {
+                    if full_diff {
+                        // "We want to keep only the first set of parents"
+                        // (`save_parents()`, revision.c): a reflog names a
+                        // commit again after its list was rewritten.
+                        let parents = sim.parents(node.id).to_vec();
+                        saved_parents.entry(node.id).or_insert(parents);
+                    }
                     sim.rewrite(node.id, &mut diff)?;
                 }
             }
@@ -4578,6 +4599,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // so `--sparse --parents` prints the ancestry the commits really have.
         if (graph || show_parents) && !simplify_merges_opt && dense {
             for node in &mut nodes {
+                if full_diff {
+                    saved_parents.entry(node.id).or_insert_with(|| node.parents.clone());
+                }
                 let mut rewritten: Vec<ObjectId> = Vec::with_capacity(node.parents.len());
                 for p in &node.parents {
                     if let Some(id) = simplify_rewrite_one(*p, &simplified) {
@@ -4615,6 +4639,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         children_map = Some(map);
     }
 
+    // `revs->diffopt.pathspec`: the walk's pathspec, copied only without
+    // `--full-diff` (revision.c:3166-3167). Every diff, stat, name list and
+    // pickaxe below is limited by this one.
+    let diff_pathspecs: Vec<String> = match full_diff {
+        true => Vec::new(),
+        false => pathspecs.clone(),
+    };
     // `--merges`/`--no-merges` are git's aliases for `--min-parents=2` /
     // `--max-parents=1`; parent-count limiting happens before commit limiting.
     if only_merges && !reflog_prune {
@@ -5017,11 +5048,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // counts the needle in each side's whole blob and keeps the file when
                     // the two counts differ, and `objfind` only compares ids, so the scan
                     // reads blobs (or nothing at all) and never diffs them.
-                    (Some(px), None) => pickaxe_by_count(&repo, candidates, &px.kind, &pathspecs, &patch_opts),
+                    (Some(px), None) => pickaxe_by_count(&repo, candidates, &px.kind, &diff_pathspecs, &patch_opts),
                     _ => {
                         let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                             candidates.iter().map(|n| (n.id, n.parents.first().copied())).collect();
-                        let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &pathspecs, false)?;
+                        let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &diff_pathspecs, false)?;
                         Ok(candidates
                             .into_iter()
                             .zip(patches)
@@ -5503,10 +5534,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     });
     // The pathspec set the name/stat formats are limited to, parsed once rather
     // than per commit. `--follow` replaces it per commit (see below).
-    let mut path_limit = if pathspecs.is_empty() {
+    let mut path_limit = if diff_pathspecs.is_empty() {
         None
     } else {
-        Some(PathspecMatcher::new(&repo, &pathspecs)?)
+        Some(PathspecMatcher::new(&repo, &diff_pathspecs)?)
     };
     // `-z` replaces the record terminator (and the separator between records) with NUL,
     // which is what `line_termination` feeds in git.
@@ -5548,7 +5579,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         bail!("`-m` with `--graph` is not ported: git lays out one graph row per
                per-parent record");
     }
-    let records: Vec<(usize, Option<ObjectId>, Option<ObjectId>)> = nodes
+    // The parents each commit's diff is taken against: the walked ones, or the
+    // `--full-diff` saved ones where the display list was rewritten.
+    let diff_nodes: std::borrow::Cow<'_, [Node]> = match saved_parents.is_empty() {
+        true => std::borrow::Cow::Borrowed(&nodes),
+        false => std::borrow::Cow::Owned(
+            nodes
+                .iter()
+                .map(|n| {
+                    let mut n = n.clone();
+                    if let Some(parents) = saved_parents.get(&n.id) {
+                        n.parents = parents.clone();
+                    }
+                    n
+                })
+                .collect(),
+        ),
+    };
+    let records: Vec<(usize, Option<ObjectId>, Option<ObjectId>)> = diff_nodes
         .iter()
         .enumerate()
         .flat_map(|(ni, n)| {
@@ -5586,7 +5634,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         Ok(())
     };
     for (ri, (ni, diff_parent, from)) in records.iter().copied().enumerate() {
-        let node = &nodes[ni];
+        // The diff side of the record; the header renders from `nodes[ni]`.
+        let node = &diff_nodes[ni];
         if print_limit.is_some_and(|n| printed >= n) {
             break;
         }
@@ -5618,10 +5667,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         let (diff_parent, remerge_headers): (Option<ObjectId>, Vec<(Vec<u8>, Vec<String>)>) =
             match &remerge_here {
                 Some(super::show::Remerge::Diff { tree, headers }) => {
-                    let kept = match pathspecs.is_empty() {
+                    let kept = match diff_pathspecs.is_empty() {
                         true => headers.clone(),
                         false => {
-                            let specs = PathspecMatcher::new(&repo, &pathspecs)?;
+                            let specs = PathspecMatcher::new(&repo, &diff_pathspecs)?;
                             headers.iter().filter(|(p, _)| specs.matches(p)).cloned().collect()
                         }
                     };
@@ -5689,7 +5738,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // A per-parent `-m` record is rendered on its own: the batched window has
             // one slot per commit and no room for the ` (from <oid>)` insert.
             Some(parent) => {
-                entry_block_from(&repo, node, &entries.params, &abbrev_cache, Some(parent))?
+                entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, Some(parent))?
             }
         };
         // Where `show_log()` stops and `log_tree_diff_flush()` takes over. Under
@@ -5979,9 +6028,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     );
                     let mut set: HashSet<Vec<u8>> = files.iter().map(|f| f.path.clone()).collect();
                     for parent in node.parents.iter().skip(1) {
-                        let mut limit = match pathspecs.is_empty() {
+                        let mut limit = match diff_pathspecs.is_empty() {
                             true => None,
-                            false => Some(PathspecMatcher::new(&repo, &pathspecs)?),
+                            false => Some(PathspecMatcher::new(&repo, &diff_pathspecs)?),
                         };
                         let mut other = collect_changes(
                             &repo,
@@ -6113,7 +6162,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             node.id,
                             diff_parent,
                             &patch_opts,
-                            &pathspecs,
+                            &diff_pathspecs,
                         )?;
                     }
                 } else if combined_merge {
@@ -6156,7 +6205,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             &repo,
                             node.id,
                             &node.parents,
-                            combined_paths.as_deref().unwrap_or(&pathspecs),
+                            combined_paths.as_deref().unwrap_or(&diff_pathspecs),
                             crate::abbrev::configured_abbrev(&repo, repo.object_hash().len_in_hex())
                                 .max(MINIMUM_ABBREV),
                             z,
@@ -6169,7 +6218,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             &repo,
                             node.id,
                             &node.parents,
-                            combined_paths.as_deref().unwrap_or(&pathspecs),
+                            combined_paths.as_deref().unwrap_or(&diff_pathspecs),
                         )? {
                             if name_status {
                                 diff.extend_from_slice(letters.as_bytes());
@@ -6305,7 +6354,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         &repo,
                         &[(node.id, Some(parent))],
                         &patch_opts,
-                        &pathspecs,
+                        &diff_pathspecs,
                         false,
                     )?
                     .pop()
@@ -6346,7 +6395,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         &repo,
                         node.id,
                         &node.parents,
-                        combined_paths.as_deref().unwrap_or(&pathspecs),
+                        combined_paths.as_deref().unwrap_or(&diff_pathspecs),
                         // `show_patch_diff()` (combine-diff.c:1030) opens with
                         // `context = opt->context`, so a combined merge honours
                         // `-U<n>` exactly as a two-way patch does.
@@ -6365,7 +6414,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         &repo,
                         &[(node.id, diff_parent)],
                         &patch_opts,
-                        &pathspecs,
+                        &diff_pathspecs,
                         false,
                     )?
                     .pop()
@@ -6379,7 +6428,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     (None, Some(_)) => &separate_patch,
                     // `context = opt->context` (combine-diff.c:1030): the window
                     // renders a merge's combined patch, which reads `-U<n>`.
-                    (None, None) => patches.get(&repo, &nodes, ni, patch_opts.ctx, &pathspecs)?,
+                    (None, None) => patches.get(&repo, &diff_nodes, ni, patch_opts.ctx, &diff_pathspecs)?,
                 };
                 // `additional_path_headers` (diff.c:3772-3777, 7050-7096): the
                 // conflict notices the re-merge recorded, spliced into the sections
@@ -6543,7 +6592,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if !last_of_merge || shown_before {
                     continue;
                 }
-                block = entry_block_from(&repo, node, &entries.params, &abbrev_cache, None)?;
+                block = entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, None)?;
                 msg_len = block.len();
             }
         }

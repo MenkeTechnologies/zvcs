@@ -248,3 +248,16 @@ pub fn initial_contact_fatal() -> ExitCode {
 pub fn is_local(url: &str) -> bool {
     gix::url::parse(url.into()).is_ok_and(|u| u.scheme == gix::url::Scheme::File)
 }
+
+/// git's `die()` for an advertisement the other end cut short, or `None` when
+/// `err` is something else: `die_initial_contact(0)` for a stream that closed
+/// before its first packet line (connect.c:151-153) and `expected flush after
+/// capabilities` for a v2 capability list without its flush
+/// (connect.c:134-140). Exit 128.
+pub fn hang_up_fatal(err: &anyhow::Error) -> Option<ExitCode> {
+    let hang_up = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<gix::protocol::transport::client::HangUp>())?;
+    eprintln!("fatal: {hang_up}");
+    Some(ExitCode::from(128))
+}

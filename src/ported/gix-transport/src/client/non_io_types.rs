@@ -141,6 +141,11 @@ mod error {
         MissingHandshake,
         #[error("An IO error occurred when talking to the server")]
         Io(#[from] std::io::Error),
+        /// The other end closed the stream in the middle of its advertisement.
+        /// `{0}` rather than `transparent` so that [`HangUp`] stays reachable
+        /// through `source()` from any `transparent` wrapper above this error.
+        #[error("{0}")]
+        HungUp(#[source] HangUp),
         #[error("Capabilities could not be parsed")]
         Capabilities {
             #[from]
@@ -171,6 +176,20 @@ mod error {
         AmbiguousPath { path: BString },
     }
 
+    /// Where in the advertisement the other end hung up, spelled as git dies.
+    #[derive(thiserror::Error, Debug)]
+    pub enum HangUp {
+        /// `die_initial_contact(0)` (connect.c:61-72): not a single packet line
+        /// arrived, which `discover_version()` sees as `PACKET_READ_EOF`
+        /// (connect.c:151-153).
+        #[error("Could not read from remote repository.\n\nPlease make sure you have the correct access rights\nand the repository exists.")]
+        InitialContact,
+        /// `process_capabilities_v2()` (connect.c:134-140): the v2 capability
+        /// advertisement ended before its flush packet.
+        #[error("expected flush after capabilities")]
+        CapabilitiesFlush,
+    }
+
     impl crate::IsSpuriousError for Error {
         fn is_spurious(&self) -> bool {
             match self {
@@ -182,4 +201,4 @@ mod error {
     }
 }
 
-pub use error::Error;
+pub use error::{Error, HangUp};

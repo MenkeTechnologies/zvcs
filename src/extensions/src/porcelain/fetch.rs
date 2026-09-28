@@ -3270,6 +3270,10 @@ fn fetch_one(
             if crate::transport_err::ssh_fatal(&url, &err).is_some() {
                 return Ok(Verdict::Fatal);
             }
+            // The advertisement itself was cut short.
+            if crate::transport_err::hang_up_fatal(&err).is_some() {
+                return Ok(Verdict::Fatal);
+            }
             // A server that refused the request with an `ERR` line said why; git
             // prints that message and dies.
             if crate::transport_err::remote_error_fatal(&err).is_some() {

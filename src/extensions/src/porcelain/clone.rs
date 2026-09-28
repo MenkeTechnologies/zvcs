@@ -1979,6 +1979,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         if let Some(code) = crate::transport_err::ssh_fatal(url_str, e) {
             return Ok(code);
         }
+        if let Some(code) = crate::transport_err::hang_up_fatal(e) {
+            return Ok(code);
+        }
     }
     result?;
     // `git_sparse_checkout_init()` failed ahead of `checkout()`: `error()`, then

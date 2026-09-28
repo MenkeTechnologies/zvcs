@@ -207,7 +207,7 @@ pub mod blocking_recv {
 
             Ok(match rd.peek_line() {
                 Some(line) => {
-                    let line = line??.as_text().ok_or(client::Error::ExpectedLine("text"))?;
+                    let line = client::initial_contact(line)??.as_text().ok_or(client::Error::ExpectedLine("text"))?;
                     let version = Capabilities::extract_protocol(line)?;
                     match version {
                         Protocol::V0 => unreachable!("already handled in `None` case"),
@@ -225,7 +225,7 @@ pub mod blocking_recv {
                                 let mut rd = rd.as_read();
                                 let mut buf = Vec::new();
                                 while let Some(line) = rd.read_data_line() {
-                                    let line = line??;
+                                    let line = client::capabilities_v2_line(line)??;
                                     match line.as_bstr() {
                                         Some(line) => {
                                             buf.push_str(line);
@@ -294,7 +294,7 @@ pub mod async_recv {
 
             Ok(match rd.peek_line().await {
                 Some(line) => {
-                    let line = line??.as_text().ok_or(client::Error::ExpectedLine("text"))?;
+                    let line = client::initial_contact(line)??.as_text().ok_or(client::Error::ExpectedLine("text"))?;
                     let version = Capabilities::extract_protocol(line)?;
                     match version {
                         Protocol::V0 => unreachable!("already handled in `None` case"),
@@ -312,7 +312,7 @@ pub mod async_recv {
                                 let mut rd = rd.as_read();
                                 let mut buf = Vec::new();
                                 while let Some(line) = rd.read_data_line().await {
-                                    let line = line??;
+                                    let line = client::capabilities_v2_line(line)??;
                                     match line.as_bstr() {
                                         Some(line) => {
                                             buf.push_str(line);

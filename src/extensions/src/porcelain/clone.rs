@@ -1866,7 +1866,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             note_filter_support(&outcome.handshake);
             if revision.is_some() {
                 if let Ok(repo) = gix::open(&git_dir) {
-                    report_revision_head(&repo, &outcome.ref_map, false);
+                    report_revision_head(&repo, &outcome.ref_map);
                 }
             }
             // `checkout()` is still called for a bare or `--no-checkout` clone; it returns
@@ -1907,7 +1907,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
             if revision.is_some() {
-                report_revision_head(checkout.repo(), &outcome.ref_map, true);
+                report_revision_head(checkout.repo(), &outcome.ref_map);
             }
             // `--sparse` is set up before anything is checked out:
             //
@@ -2432,7 +2432,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `warning: refs/tags/v0.2.0 <tag-object> is not a commit!`, naming the ref
     // and the unpeeled id — and the clone then carries on and detaches anyway.
     if branch.is_some() {
-        detach_head_from_non_branch(&git_dir, bare || no_checkout, quiet)?;
+        detach_head_from_non_branch(&git_dir)?;
     }
 
     // Every ref this clone wrote has now been written, so the two ref stores can
@@ -2500,19 +2500,29 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     //                   "unable to checkout"));
     //         return 0;
     // }
+    // if (!strcmp(head, "HEAD")) {
+    //         if (advice_enabled(ADVICE_DETACHED_HEAD))
+    //                 detach_advice(oid_to_hex(&oid));
     // ```
     //
-    // (`checkout()`, builtin/clone.c:655-661.) `update_head()` points HEAD at whatever the
+    // (`checkout()`, builtin/clone.c:655-664.) `update_head()` points HEAD at whatever the
     // remote's own HEAD named even when that branch was not among the refs fetched, so the
     // first thing the checkout does is find HEAD unresolvable and give up — without failing
     // the clone. An empty clone never gets here: it set `option_no_checkout` above.
+    //
+    // A detached `HEAD` — a remote `HEAD` that names no branch, `--branch <tag>`,
+    // `--revision` — gets the advice block instead, which `-q` does not silence.
     if !bare && !no_checkout && !cloned_empty {
-        let unborn = gix::open(&git_dir)
-            .ok()
-            .map(|repo| repo.head().map(|head| head.id().is_none()).unwrap_or(true))
-            .unwrap_or(false);
-        if unborn {
-            eprintln!("warning: remote HEAD refers to nonexistent ref, unable to checkout");
+        if let Ok(repo) = gix::open(&git_dir) {
+            match repo.head() {
+                Ok(head) if head.id().is_some() => {
+                    if head.is_detached() && crate::advice::Advice::DetachedHead.enabled_in(&repo) {
+                        let id = head.id().expect("checked above");
+                        super::checkout::print_detached_head_advice(&id.to_string());
+                    }
+                }
+                _ => eprintln!("warning: remote HEAD refers to nonexistent ref, unable to checkout"),
+            }
         }
     }
 
@@ -4066,16 +4076,14 @@ fn first_unreachable_component(path: &Path) -> Option<PathBuf> {
 /// is the state `--branch <tag>` leaves behind — every other clone already has
 /// the branch link git wants.
 ///
-/// Three things move together, and a port that does only the first leaves a
+/// Two things move together, and a port that does only the first leaves a
 /// repository `fsck` rejects:
 ///
 /// * `HEAD` itself, rewritten from `ref: refs/tags/<name>` to the object id.
 /// * The `clone: from <url>` reflog entry, whose new-value field gitoxide filled
 ///   with the ref's own target — the *tag object* for an annotated tag, where git
 ///   records the peeled commit.
-/// * The `advice.detachedHead` block, which the checkout prints on the way out
-///   and which a bare or `--no-checkout` clone has no worktree to print for.
-fn detach_head_from_non_branch(git_dir: &Path, bare_or_no_checkout: bool, quiet: bool) -> Result<()> {
+fn detach_head_from_non_branch(git_dir: &Path) -> Result<()> {
     let head_path = git_dir.join("HEAD");
     let Ok(text) = std::fs::read_to_string(&head_path) else { return Ok(()) };
     let Some(target) = text.trim_end().strip_prefix("ref: ") else { return Ok(()) };
@@ -4112,26 +4120,17 @@ fn detach_head_from_non_branch(git_dir: &Path, bare_or_no_checkout: bool, quiet:
         std::fs::write(&log, fixed)?;
     }
 
-    if !bare_or_no_checkout && !quiet && repo.config_snapshot().boolean("advice.detachedHead") != Some(false) {
-        super::checkout::print_detached_head_advice(&peeled.to_string());
-    }
     Ok(())
 }
 
-/// What a `clone --revision` prints about the `HEAD` gitoxide detached at the revision.
-///
-/// * `lookup_commit_or_die()` (commit.c:81-91), called from `update_head()` (builtin/clone.c:587),
-///   warns `<name> <oid> is not a commit!` when the ref named a tag it had to peel.
-/// * `checkout()` (builtin/clone.c:652-664) then gives the `advice.detachedHead` block, which
-///   `-q` does not silence, unless there is no checkout to make.
-fn report_revision_head(repo: &gix::Repository, ref_map: &gix::remote::fetch::RefMap, checkout: bool) {
+/// The warning `lookup_commit_or_die()` (commit.c:81-91) gives from `update_head()`
+/// (builtin/clone.c:587) when the `clone --revision` ref named a tag it had to peel:
+/// `<name> <oid> is not a commit!`.
+fn report_revision_head(repo: &gix::Repository, ref_map: &gix::remote::fetch::RefMap) {
     let Some((name, advertised)) = gix::clone::fetch::revision_mapping(ref_map) else { return };
     let Ok(head) = repo.head_id() else { return };
     if head.detach() != advertised {
         eprintln!("warning: {name} {advertised} is not a commit!");
-    }
-    if checkout && repo.config_snapshot().boolean("advice.detachedHead") != Some(false) {
-        super::checkout::print_detached_head_advice(&head.to_string());
     }
 }
 

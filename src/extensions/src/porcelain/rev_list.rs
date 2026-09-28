@@ -1041,6 +1041,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut quiet = false;
     let mut disk_usage = false;
     let mut disk_usage_human = false;
+    // What `cmd_rev_list()`'s loop over the arguments `setup_revisions()` left
+    // behind stops on first (builtin/rev-list.c:768-866): `Some(text)` for the
+    // `--disk-usage=<bad>` `die()`, `None` for `usage(rev_list_usage)` — an
+    // option nothing claimed, or `--disk-usage<junk>`. That loop runs only once
+    // `setup_revisions()` has resolved every revision (reading the graft file on
+    // the first commit it parses) and passed its own checks, so it is raised
+    // there, not where the word was read.
+    let mut leftover_failure: Option<Option<String>> = None;
     let mut include_header = true;
     let mut verbose_header = false;
     // `--timestamp`: prefix each object name with the commit date.
@@ -1956,12 +1964,14 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     "" => {}
                     "=human" => disk_usage_human = true,
                     v if v.starts_with('=') => {
-                        return Ok(fatal(&format!(
+                        leftover_failure.get_or_insert(Some(format!(
                             "invalid value for '--disk-usage=<format>': '{}', the only allowed format is 'human'",
                             &v[1..]
-                        )))
+                        )));
                     }
-                    _ => return Ok(usage_error()),
+                    _ => {
+                        leftover_failure.get_or_insert(None);
+                    }
                 }
                 disk_usage = true;
                 quiet = true;
@@ -2061,8 +2071,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
             }
             // Every remaining flag is one git knows and this does not; a
-            // revision never starts with `-`, so anything left is a usage error.
-            s if s.starts_with('-') => return Ok(usage_error()),
+            // revision never starts with `-`, so anything left is a usage error —
+            // raised by `cmd_rev_list()`'s own loop, once `setup_revisions()` has
+            // finished. See `leftover_failure`.
+            s if s.starts_with('-') => {
+                leftover_failure.get_or_insert(None);
+            }
             // `handle_revision_arg_1()`'s guard ahead of `handle_dotdot()`: a
             // bare `..` is the pathspec for the parent directory, never
             // `HEAD..HEAD`. `setup_revisions()` then sends it to
@@ -2386,6 +2400,23 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // (builtin/rev-list.c:876-882.) `info.header_prefix` is still NULL here —
     // it is assigned further down, at line 890 — so the `--pretty` half of that
     // test is carried by `verbose_header` alone.
+    if let Some(failure) = leftover_failure {
+        // `parse_pathspec()` is `setup_revisions()`'s too.
+        if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+        // `get_reference()` parses every commit it pends (revision.c:389-400),
+        // and parsing the first one reads `info/grafts` (commit.c:287-314) —
+        // so the deprecation advice is already out when the usage follows.
+        if !seeds.is_empty() || !pending.is_empty() {
+            repo.commit_grafts();
+        }
+        return Ok(match failure {
+            Some(text) => fatal(&text),
+            None => usage_error(),
+        });
+    }
     if nul_term
         && (graph
             || verbose_header

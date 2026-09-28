@@ -260,26 +260,21 @@ pub(crate) enum HeaderError {
     Open,
     /// `error: '<file>' does not look like a v2 or v3 bundle file`
     NotBundle,
-    /// A header that starts correctly but does not parse. git has its own
-    /// `unrecognized header:` text for this; it is not reproduced here, so the
-    /// reason is surfaced as a plain error instead of a wrong-looking match.
-    Malformed(String),
-    /// `error: unknown capability '<cap>'` — `parse_capability()` (bundle.c) on a
-    /// `@`-line it does not know. It is an `error()`, so the command reports it
-    /// and exits 1 rather than dying at 128.
-    UnknownCapability(String),
+    /// Any other `error()` `read_bundle_header_fd()` or `parse_capability()`
+    /// reports — `unrecognized header: …`, `unknown capability '<cap>'`,
+    /// `unrecognized bundle hash algorithm: <name>` — after which the command
+    /// exits 1.
+    Error(String),
 }
 
-/// Report a [`HeaderError`] the way git does and yield its exit code, except
-/// for [`HeaderError::Malformed`] which becomes an ordinary error.
+/// Report a [`HeaderError`] the way git does and yield its exit code.
 pub(crate) fn report(path: &str, err: HeaderError) -> Result<ExitCode> {
     match err {
         HeaderError::Open => eprintln!("error: could not open '{path}'"),
         HeaderError::NotBundle => {
             eprintln!("error: '{path}' does not look like a v2 or v3 bundle file");
         }
-        HeaderError::Malformed(why) => crate::git_fatal!("malformed bundle header in {path:?}: {why}"),
-        HeaderError::UnknownCapability(cap) => eprintln!("error: unknown capability '{cap}'"),
+        HeaderError::Error(message) => eprintln!("error: {message}"),
     }
     Ok(ExitCode::from(1))
 }
@@ -323,7 +318,9 @@ impl BundleSource {
     }
 }
 
-/// Read one `\n`-terminated line, keeping the terminator. `Ok(None)` at EOF.
+/// Read one `\n`-terminated line, keeping the terminator. `Ok(None)` at EOF —
+/// including EOF partway through a line, which `strbuf_getwholeline_fd()`
+/// (strbuf.c) reports as `EOF` too, dropping the unterminated tail.
 ///
 /// One byte per `read`, as `strbuf_getwholeline_fd` does, so the stream stops on
 /// the terminator and not a byte later.
@@ -332,7 +329,7 @@ fn read_line(input: &mut dyn Read) -> Result<Option<Vec<u8>>, HeaderError> {
     let mut byte = [0u8; 1];
     loop {
         match input.read(&mut byte) {
-            Ok(0) => return Ok(if line.is_empty() { None } else { Some(line) }),
+            Ok(0) => return Ok(None),
             Ok(_) => {
                 line.push(byte[0]);
                 if byte[0] == b'\n' {
@@ -362,6 +359,14 @@ pub(crate) fn open_bundle(path: &str) -> Result<(Header, BundleSource), HeaderEr
     Ok((header, input))
 }
 
+/// git's `read_bundle_header_fd()` (bundle.c:77-151).
+///
+/// The signature line must be one of the two `bundle_sigs`; after it, every
+/// line up to the first empty one — or up to EOF, which ends the header just as
+/// quietly — is a v3 `@capability`, a `-<oid>[ <subject>]` prerequisite or an
+/// `<oid> <refname>` tip. A line that is none of those is `unrecognized header:
+/// <line> (<len>)`, quoted after `strbuf_rtrim()` and without its `-`, which
+/// the message puts back.
 fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
     let magic = read_line(input)?.ok_or(HeaderError::NotBundle)?;
     let version = match magic.as_slice() {
@@ -370,6 +375,8 @@ fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
         _ => return Err(HeaderError::NotBundle),
     };
 
+    // "The default hash format for bundles is SHA1, unless told otherwise by
+    // an "object-format=" capability".
     let mut header = Header {
         hash: "sha1".into(),
         prereqs: Vec::new(),
@@ -378,85 +385,77 @@ fn read_header_from(input: &mut BundleSource) -> Result<Header, HeaderError> {
     };
     let mut hexsz = 40usize;
 
-    let mut pending: Option<Vec<u8>>;
-    // Capabilities (v3 only) come first, each on its own `@key[=value]` line.
-    loop {
-        let Some(line) = read_line(input)? else {
-            return Err(HeaderError::Malformed("truncated before the pack".into()));
-        };
-        if !line.starts_with(b"@") {
-            pending = Some(line);
+    while let Some(line) = read_line(input)? {
+        if line.first().is_none_or(|&b| b == b'\n') {
             break;
         }
-        if version < 3 {
-            return Err(HeaderError::Malformed(
-                "capability line in a v2 bundle".into(),
-            ));
-        }
-        let cap = String::from_utf8_lossy(&line[1..]).trim_end().to_string();
-        match cap.strip_prefix("object-format=") {
-            Some("sha1") => {}
-            Some("sha256") => {
-                header.hash = "sha256".into();
-                hexsz = 64;
-            }
-            Some(other) => {
-                return Err(HeaderError::Malformed(format!(
-                    "unknown object format {other:?}"
-                )))
-            }
-            // `@filter=<spec>`: a v3 bundle written with `--filter`, recording
-            // which objects were deliberately left out.
-            //
-            // ```c
-            // if (skip_prefix(capability, "filter=", &arg)) {
-            //         parse_list_objects_filter(&header->filter, arg);
-            //         return 0;
-            // }
-            // ```
-            //
-            // (`parse_capability()`, bundle.c.) The spec is recorded verbatim
-            // rather than re-parsed: `verify` echoes it and nothing else reads it,
-            // and a spec git would have rejected here cannot come out of this
-            // port's own `bundle create`.
-            None if cap.starts_with("filter=") => {
-                header.filter = Some(cap["filter=".len()..].to_string());
-            }
-            None => return Err(HeaderError::UnknownCapability(cap)),
-        }
-    }
+        // `strbuf_rtrim()`
+        let end = line.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(0, |i| i + 1);
+        let line = &line[..end];
 
-    // Ref lines, terminated by an empty line.
-    loop {
-        let line = match pending.take() {
-            Some(line) => line,
-            None => read_line(input)?
-                .ok_or_else(|| HeaderError::Malformed("truncated before the pack".into()))?,
-        };
-        let line = line.strip_suffix(b"\n").unwrap_or(&line);
-        if line.is_empty() {
-            break;
+        if version == 3 && line.first() == Some(&b'@') {
+            // `parse_capability()` (bundle.c:47-62).
+            let cap = String::from_utf8_lossy(&line[1..]).into_owned();
+            if let Some(name) = cap.strip_prefix("object-format=") {
+                match name {
+                    "sha1" => hexsz = 40,
+                    "sha256" => hexsz = 64,
+                    _ => {
+                        return Err(HeaderError::Error(format!(
+                            "unrecognized bundle hash algorithm: {name}"
+                        )))
+                    }
+                }
+                header.hash = name.to_string();
+            } else if let Some(spec) = cap.strip_prefix("filter=") {
+                // Recorded verbatim: `verify` echoes it and nothing else reads it.
+                header.filter = Some(spec.to_string());
+            } else {
+                return Err(HeaderError::Error(format!("unknown capability '{cap}'")));
+            }
+            continue;
         }
+
         let (is_prereq, body) = match line.strip_prefix(b"-") {
             Some(rest) => (true, rest),
             None => (false, line),
         };
-        if body.len() < hexsz {
-            return Err(HeaderError::Malformed("short object id".into()));
+        // ```c
+        // if (parse_oid_hex_algop(buf.buf, &oid, &p, header->hash_algo) ||
+        //     (*p && !isspace(*p)) ||
+        //     (!is_prereq && !*p)) {
+        // ```
+        let oid = body
+            .get(..hexsz)
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| ObjectId::from_hex(hex).ok());
+        let rest = body.get(hexsz..).unwrap_or_default();
+        let unrecognized = match oid {
+            None => true,
+            Some(_) => {
+                rest.first().is_some_and(|b| !b.is_ascii_whitespace()) || (!is_prereq && rest.is_empty())
+            }
+        };
+        if unrecognized {
+            return Err(HeaderError::Error(format!(
+                "unrecognized header: {}{} ({})",
+                if is_prereq { "-" } else { "" },
+                String::from_utf8_lossy(body),
+                body.len()
+            )));
         }
-        let oid = ObjectId::from_hex(&body[..hexsz])
-            .map_err(|e| HeaderError::Malformed(format!("bad object id: {e}")))?;
+        let oid = oid.expect("checked above");
         if is_prereq {
             header.prereqs.push(oid);
         } else {
-            // Exactly one space separates the id from the ref name.
-            let name = body[hexsz..].strip_prefix(b" ").unwrap_or(&body[hexsz..]);
-            header.refs.push((oid, name.to_vec()));
+            // `p + 1`: the ref name follows the one whitespace byte.
+            header.refs.push((oid, rest[1..].to_vec()));
         }
     }
 
     Ok(header)
 }
+
 
 // ------------------------------------------------------------ list-heads ----
 

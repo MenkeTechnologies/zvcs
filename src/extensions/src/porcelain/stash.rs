@@ -3260,6 +3260,17 @@ fn sync_worktree(
         .ok_or_else(|| anyhow!("bare repository has no worktree to update"))?
         .to_owned();
 
+    // Affected paths absent from the target tree are deletions, made first: the
+    // `reset --hard` this stands for unlinks every `CE_WT_REMOVE` entry before it
+    // checks out a single `CE_UPDATE` one (`check_updates()`, unpack-trees.c:455-469).
+    for path in affected {
+        if !target_map.contains_key(path) {
+            if let Some(full) = repo.workdir_path(path.as_bstr()) {
+                let _ = std::fs::remove_file(full);
+            }
+        }
+    }
+
     // Restrict a fresh target-tree index to just the affected, present paths.
     let mut subset = repo.index_from_tree(&tree_id)?;
     subset.remove_entries(|_, path, _| !affected.contains(&path.to_owned()));
@@ -3285,15 +3296,6 @@ fn sync_worktree(
         let backing = subset.path_backing();
         for e in subset.entries() {
             fresh.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
-        }
-    }
-
-    // Affected paths absent from the target tree are deletions.
-    for path in affected {
-        if !target_map.contains_key(path) {
-            if let Some(full) = repo.workdir_path(path.as_bstr()) {
-                let _ = std::fs::remove_file(full);
-            }
         }
     }
 

@@ -957,8 +957,8 @@ fn finish(o: Opts) -> Result<ExitCode> {
         // entry written or removed, then one tick per removal and per write.
         let updating = crate::worktree::UpdatingFiles::start(wanted.len() + removed.len(), o.verbose_update)
             .map_err(|e| crate::fatal::die(e.to_string()))?;
-        checkout_subset(&repo, &mut new_index, &wanted, &updating)?;
-        move_submodules(&repo, &new_index, &o)?;
+        // `check_updates()` unlinks every `CE_WT_REMOVE` entry before it checks
+        // out a single `CE_UPDATE` one (unpack-trees.c:455-469).
         for path in &removed {
             updating.tick();
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
@@ -971,6 +971,8 @@ fn finish(o: Opts) -> Result<ExitCode> {
                 }
             }
         }
+        checkout_subset(&repo, &mut new_index, &wanted, &updating)?;
+        move_submodules(&repo, &new_index, &o)?;
         updating.stop();
     }
 
@@ -1436,7 +1438,7 @@ fn multi_tree_read(
         // `check_updates()`'s meter, as in the one- and two-tree read above.
         let updating = crate::worktree::UpdatingFiles::start(wanted.len() + removed.len(), o.verbose_update)
             .map_err(|e| crate::fatal::die(e.to_string()))?;
-        checkout_subset(repo, &mut new_index, &wanted, &updating)?;
+        // `check_updates()` unlinks before it checks out (unpack-trees.c:455-469).
         for path in &removed {
             updating.tick();
             if let Some(full) = repo.workdir_path(path.as_bstr()) {
@@ -1449,6 +1451,7 @@ fn multi_tree_read(
                 }
             }
         }
+        checkout_subset(repo, &mut new_index, &wanted, &updating)?;
         updating.stop();
     }
 

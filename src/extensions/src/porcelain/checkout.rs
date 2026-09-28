@@ -3108,10 +3108,16 @@ fn restore_from_tree(
     // *before* it writes anything (builtin/checkout.c:400-412), so the attributes a
     // matched path sees are the tree's and every other path's are the index's — which is
     // exactly "the subset first, the index for what it lacks".
-    checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
+    //
+    // `checkout_worktree()` (builtin/checkout.c:465-491) walks the index in order and
+    // hands every matched entry to `checkout_entry()`, which unlinks one the no-overlay
+    // mode marked `CE_WT_REMOVE` rather than writing it (entry.c). Writes and removals
+    // therefore interleave by path, and on a case-insensitive file system the order is
+    // what `restore -SW .` after `mv a A` leaves behind: `A` sorts first, goes, and `a`
+    // is then written.
+    let fresh = checkout_interleaved(repo, &mut subset, &to_remove, &index, &should_interrupt)?;
 
     // Fold the tree's blobs (with fresh checkout stats) into the real index.
-    let fresh = stats_by_path(&subset);
     let mut pushed = false;
     // `add_index_entry()` replaces *every* stage of the path it writes (`ADD_CACHE_OK_TO_REPLACE`,
     // builtin/checkout.c:231), so `git checkout HEAD -- <conflicted>` resolves the conflict: the
@@ -3191,19 +3197,9 @@ fn restore_from_tree(
         }
     }
 
-    // No-overlay: delete pathspec-matched paths that the tree does not carry.
+    // No-overlay: the pathspec-matched paths the tree does not carry, whose files
+    // [`checkout_interleaved`] removed, leave the index too.
     if !to_remove.is_empty() {
-        for path in &to_remove {
-            if let Some(full) = repo.workdir_path(BStr::new(path)) {
-                let _ = std::fs::remove_file(&full);
-                // `unlink_entry()`'s `schedule_dir_for_removal()`, which
-                // `remove_scheduled_dirs()` then acts on: the directory whose last file
-                // just went goes with it.
-                if let Some(workdir) = repo.workdir() {
-                    crate::worktree::prune_empty_dirs(workdir, &full);
-                }
-            }
-        }
         let rmset: HashSet<BString> = to_remove.into_iter().collect();
         stale.extend(rmset.iter().cloned());
         index.remove_entries(|_, path, _| rmset.contains(&path.to_owned()));
@@ -3955,6 +3951,59 @@ fn checkout_subset(
         opts,
     )?;
     Ok(())
+}
+
+/// `checkout_worktree()`'s loop over the matched entries (builtin/checkout.c:465-491):
+/// every entry of `subset` is written and every path of `remove` unlinked, in index
+/// (path) order, the writes between two removals going out as one batch. Returns the
+/// written entries' fresh stats, as [`stats_by_path`] would over `subset`.
+///
+/// A removal is `unlink_entry()`, whose `schedule_dir_for_removal()` lets
+/// `remove_scheduled_dirs()` take a directory the removal emptied.
+pub(super) fn checkout_interleaved(
+    repo: &gix::Repository,
+    subset: &mut gix::index::File,
+    remove: &[BString],
+    attr_source: &gix::index::State,
+    should_interrupt: &AtomicBool,
+) -> Result<HashMap<BString, (ObjectId, Mode, Stat)>> {
+    let off = crate::worktree::UpdatingFiles::off();
+    if remove.is_empty() {
+        checkout_subset(repo, subset, attr_source, should_interrupt, &off)?;
+        return Ok(stats_by_path(subset));
+    }
+    let writes: Vec<BString> = {
+        let backing = subset.path_backing();
+        subset.entries().iter().map(|e| e.path_in(backing).to_owned()).collect()
+    };
+    let mut removals: Vec<&BString> = remove.iter().collect();
+    removals.sort();
+    let mut fresh = HashMap::with_capacity(writes.len());
+    let mut write_batch = |batch: &[BString], fresh: &mut HashMap<_, _>| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let keep: HashSet<&BString> = batch.iter().collect();
+        let mut part = subset.clone();
+        part.remove_entries(|_, path, _| !keep.contains(&path.to_owned()));
+        checkout_subset(repo, &mut part, attr_source, should_interrupt, &off)?;
+        fresh.extend(stats_by_path(&part));
+        Ok(())
+    };
+    let mut next_write = 0;
+    for path in removals {
+        let end = next_write + writes[next_write..].partition_point(|w| w < path);
+        write_batch(&writes[next_write..end], &mut fresh)?;
+        next_write = end;
+        if let Some(full) = repo.workdir_path(BStr::new(path)) {
+            let _ = std::fs::remove_file(&full);
+            if let Some(workdir) = repo.workdir() {
+                crate::worktree::prune_empty_dirs(workdir, &full);
+            }
+        }
+    }
+    write_batch(&writes[next_write..], &mut fresh)?;
+    Ok(fresh)
 }
 
 /// Set `HEAD` to point symbolically at `branch` (attached), logging the move.

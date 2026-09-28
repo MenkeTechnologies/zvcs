@@ -1,0 +1,141 @@
+//! Undoing `git mv a A`, where the order of removals and writes decides what is
+//! left on a case-insensitive file system.
+//!
+//! `check_updates()` (unpack-trees.c:455-469) unlinks every `CE_WT_REMOVE` entry
+//! before it checks a single `CE_UPDATE` one out, and `oneway_merge()` settles
+//! which kept entries need writing before either happens. `reset --hard`,
+//! `reset --merge`, `read-tree -u --reset` and `stash` wrote `a` first and then
+//! removed `A` — the same file there — leaving ` D a`. `checkout_worktree()`
+//! (builtin/checkout.c:465-491) instead walks the index in path order, unlinking or
+//! writing each matched entry as it comes, so `restore -SW .` after `mv a A` removes
+//! `A` and writes `a`, while after `mv A a` it writes `A` and then removes `a`,
+//! which takes the file just written.
+//!
+//! The first group holds on any file system; the rest only where `A` and `a` name
+//! one file, and are asserted only there.
+//!
+//! Expectations measured from stock git 2.55.0 under the same environment, on a
+//! case-insensitive APFS volume.
+
+use std::path::PathBuf;
+use std::process::Command;
+
+const BIN: &str = env!("CARGO_BIN_EXE_git");
+
+struct Fixture {
+    root: PathBuf,
+    work: PathBuf,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+impl Fixture {
+    /// `name` and `b`, committed.
+    fn new(tag: &str, name: &str) -> Self {
+        let root = std::env::temp_dir().join(format!("zvcs-case-only-rename-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let f = Fixture { root, work };
+        f.run(&["init", "-q", "."]);
+        std::fs::write(f.work.join(name), "a\n").unwrap();
+        std::fs::write(f.work.join("b"), "b\n").unwrap();
+        f.run(&["add", "."]);
+        f.run(&["-c", "maintenance.auto=false", "commit", "-q", "-m", "base"]);
+        f
+    }
+
+    fn run(&self, args: &[&str]) -> (String, String, i32) {
+        let out = Command::new(BIN)
+            .args(args)
+            .current_dir(&self.work)
+            .env("HOME", &self.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "A U Thor")
+            .env("GIT_AUTHOR_EMAIL", "author@example.com")
+            .env("GIT_COMMITTER_NAME", "C O Mitter")
+            .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            out.status.code().expect("no signal"),
+        )
+    }
+
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&self.work)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != ".git")
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn status(&self) -> String {
+        self.run(&["status", "--short"]).0
+    }
+
+    fn case_insensitive(&self) -> bool {
+        self.work.join("B").exists()
+    }
+}
+
+#[test]
+fn every_reset_brings_the_lowercase_name_back() {
+    for (tag, undo) in [
+        ("hard", &["reset", "-q", "--hard"][..]),
+        ("merge", &["reset", "-q", "--merge", "HEAD"][..]),
+        ("readtree", &["read-tree", "-u", "--reset", "HEAD"][..]),
+        ("stash", &["stash", "-q"][..]),
+        ("restore", &["restore", "-SW", "."][..]),
+        ("checkoutf", &["checkout", "-q", "-f", "HEAD"][..]),
+    ] {
+        let f = Fixture::new(tag, "a");
+        assert_eq!(f.run(&["mv", "a", "A"]).2, 0, "{tag}");
+        assert_eq!(f.run(undo).2, 0, "{tag}");
+        assert_eq!(f.files(), ["a", "b"], "{tag}");
+        assert_eq!(f.status(), "", "{tag}");
+    }
+}
+
+#[test]
+fn restore_follows_index_order_when_the_names_collide() {
+    let f = Fixture::new("upper", "A");
+    if !f.case_insensitive() {
+        return;
+    }
+    f.run(&["mv", "A", "a"]);
+    assert_eq!(f.run(&["restore", "-SW", "."]).2, 0);
+    // `A` is written, then the removal of `a` takes the same file.
+    assert_eq!(f.files(), ["b"]);
+    assert_eq!(f.status(), " D A\n");
+}
+
+#[test]
+fn a_kept_entry_is_settled_before_the_removals() {
+    let f = Fixture::new("both", "a");
+    if !f.case_insensitive() {
+        return;
+    }
+    f.run(&["mv", "a", "A"]);
+    // Overlay mode: `a` comes back into the index beside `A`.
+    f.run(&["checkout", "HEAD", "--", "."]);
+    assert_eq!(f.run(&["ls-files"]).0, "A\na\nb\n");
+    assert_eq!(f.run(&["reset", "-q", "--hard"]).2, 0);
+    // `a` was up to date when `oneway_merge()` looked, so it is not written after
+    // the removal of `A` took its file.
+    assert_eq!(f.files(), ["b"]);
+    assert_eq!(f.status(), " D a\n");
+}

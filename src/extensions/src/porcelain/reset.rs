@@ -1708,20 +1708,33 @@ fn reset_worktree_hard(
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
     opts.destination_is_initially_empty = false;
     opts.overwrite_existing = true;
-    let odb = repo.objects.clone().into_arc()?;
-    let discard_files = gix::progress::Discard;
-    let discard_bytes = gix::progress::Discard;
-    crate::worktree::checkout_subset(
-        &mut new_index,
-        workdir.as_path(),
-        odb,
-        &discard_files,
-        &discard_bytes,
-        should_interrupt,
-        opts,
-    )?;
+    // `oneway_merge()` settles `CE_UPDATE` during the unpack — `lstat()` plus
+    // `ie_match_stat()` for an entry the reset keeps — before anything is removed.
+    // An entry already up to date then is not written, even when a removal below
+    // takes its file (`A` going on a case-insensitive file system takes `a`).
+    // Only a kept entry (`same(old, a)`) is decided then; one the reset changes is
+    // `merged_entry()`'s `CE_UPDATE`, which `checkout_entry()` weighs when it gets there.
+    let kept: HashSet<(BString, ObjectId, u32)> = {
+        let backing = old.path_backing();
+        old.entries().iter().map(|e| (e.path_in(backing).to_owned(), e.id, e.mode.bits())).collect()
+    };
+    let settled: HashSet<BString> = {
+        let backing = new_index.path_backing();
+        let fresh = crate::worktree::up_to_date_paths(&new_index, &workdir, opts.stat_options);
+        new_index
+            .entries()
+            .iter()
+            .map(|e| (e.path_in(backing).to_owned(), e.id, e.mode.bits()))
+            .filter(|key| fresh.contains(&key.0) && kept.contains(key))
+            .map(|(path, _, _)| path)
+            .collect()
+    };
 
-    // Remove files tracked before the reset but absent from the target tree.
+    // Remove files tracked before the reset but absent from the target tree —
+    // first, as `check_updates()` (unpack-trees.c:455-469) unlinks every
+    // `CE_WT_REMOVE` entry before it checks a single `CE_UPDATE` one out. On a
+    // case-insensitive file system the order is what undoes `mv a A`: removing
+    // `A` after writing `a` removes the file just written.
     let new_paths: HashSet<BString> = {
         let backing = new_index.path_backing();
         new_index
@@ -1747,10 +1760,41 @@ fn reset_worktree_hard(
         }
     }
 
+    // The settled entries ride through the checkout as `SKIP_WORKTREE`, which the
+    // writer passes over while still reading their attributes, and get their flag
+    // back afterwards.
+    let hidden: Vec<usize> = {
+        let backing = new_index.path_backing().to_owned();
+        new_index
+            .entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.flags.contains(Flags::SKIP_WORKTREE) && settled.contains(e.path_in(&backing)))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    for &i in &hidden {
+        new_index.entries_mut()[i].flags.insert(Flags::SKIP_WORKTREE);
+    }
+    let odb = repo.objects.clone().into_arc()?;
+    let discard_files = gix::progress::Discard;
+    let discard_bytes = gix::progress::Discard;
+    let written = crate::worktree::checkout_subset(
+        &mut new_index,
+        workdir.as_path(),
+        odb,
+        &discard_files,
+        &discard_bytes,
+        should_interrupt,
+        opts,
+    );
+    for &i in &hidden {
+        new_index.entries_mut()[i].flags.remove(Flags::SKIP_WORKTREE);
+    }
+    written?;
+
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
-
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
-
     super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;
@@ -2005,6 +2049,19 @@ fn reset_two_tree(
     // does not have (measured: stock 0 records, this port 3).
     new_index.remove_resolve_undo();
 
+    // `check_updates()` unlinks every `CE_WT_REMOVE` entry before it checks out a
+    // single `CE_UPDATE` one (unpack-trees.c:455-469).
+    for (p, mode) in &deletes {
+        unlink_entry(
+            repo,
+            &workdir,
+            BStr::new(p),
+            *mode,
+            recurse_submodules,
+            &active_submodules,
+        );
+    }
+
     // Write the changed files to the worktree by checking out a filtered copy that
     // holds only the updated entries — kept files (with their local changes) are
     // never touched.
@@ -2050,17 +2107,6 @@ fn reset_two_tree(
                 e.stat = *stat;
             }
         }
-    }
-
-    for (p, mode) in &deletes {
-        unlink_entry(
-            repo,
-            &workdir,
-            BStr::new(p),
-            *mode,
-            recurse_submodules,
-            &active_submodules,
-        );
     }
 
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`

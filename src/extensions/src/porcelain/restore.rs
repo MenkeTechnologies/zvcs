@@ -1095,58 +1095,20 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             subset.sort_entries();
         }
 
-        // `git_attr_set_direction(GIT_ATTR_CHECKOUT)` — the index first, the worktree
-        // file only when the index has none (attr.c:784-787). `Source::IdMapping` alone
-        // is `GIT_ATTR_INDEX`, the direction `check-attr` sets, not a checkout's.
-        let mut opts = repo.checkout_options(
-            gix::worktree::stack::state::attributes::Source::IdMappingThenWorktree,
-        )?;
-        opts.destination_is_initially_empty = false;
-        opts.overwrite_existing = true;
-        let odb = repo.objects.clone().into_arc()?;
-        let discard_files = gix::progress::Discard;
-        let discard_bytes = gix::progress::Discard;
-        // `checkout_entry()` reads attributes from `state.istate =
-        // the_repository->index` (builtin/checkout.c:412) — the whole index, not the
-        // pathspec-matched subset being written. `cur` supplies the `.gitattributes`
-        // files the subset dropped; see
-        // [`crate::worktree::checkout_subset_with_attributes`].
-        crate::worktree::checkout_subset_with_attributes(
-            &mut subset,
-            &cur,
-            workdir.as_path(),
-            odb,
-            &discard_files,
-            &discard_bytes,
-            &should_interrupt,
-            opts,
-        )?;
-
-        // Capture the fresh filesystem stats produced by the checkout.
-        {
-            let b = subset.path_backing();
-            for e in subset.entries() {
-                fresh_stats.insert(e.path_in(b).to_owned(), e.stat);
-            }
-        }
-
         // No-overlay: delete worktree files present before but absent in source.
         // `--overlay` suppresses these; conflict-resolution deletes (a side that
         // removed the file) are applied regardless of overlay.
+        let mut remove: Vec<BString> = resolved_remove.iter().cloned().collect();
         if !overlay {
-            for path in &removals {
-                if let Some(full) = repo.workdir_path(BStr::new(path)) {
-                    let _ = std::fs::remove_file(&full);
-                    crate::worktree::prune_empty_dirs(workdir.as_path(), &full);
-                }
-            }
+            remove.extend(removals.iter().cloned());
         }
-        for path in &resolved_remove {
-            if let Some(full) = repo.workdir_path(BStr::new(path)) {
-                let _ = std::fs::remove_file(&full);
-                crate::worktree::prune_empty_dirs(workdir.as_path(), &full);
-            }
-        }
+        // `checkout_worktree()`'s one pass over the index, writes and removals in
+        // path order, attributes read from the whole index (`state.istate =
+        // the_repository->index`, builtin/checkout.c:412) — `cur` supplies the
+        // `.gitattributes` files the subset dropped.
+        let written =
+            super::checkout::checkout_interleaved(&repo, &mut subset, &remove, &cur, &should_interrupt)?;
+        fresh_stats.extend(written.into_iter().map(|(path, (_, _, stat))| (path, stat)));
 
         // --- Recurse into matched submodules --------------------------------
         // git-restore(1): when the restore location includes the working tree

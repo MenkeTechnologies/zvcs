@@ -460,3 +460,25 @@ pub fn original_cwd() -> Option<&'static std::path::Path> {
         .get_or_init(|| std::env::current_dir().ok().map(|dir| gix::path::realpath(&dir).unwrap_or(dir)))
         .as_deref()
 }
+
+/// The paths of `index` whose work-tree file already holds exactly what the entry
+/// names — the entries [`checkout_subset`] would skip, asked *now*.
+///
+/// `unpack_trees()` settles `CE_UPDATE` while it merges, before `check_updates()`
+/// unlinks anything (unpack-trees.c:455-469). A caller that removes files ahead of the
+/// checkout takes this answer first, so a removal that happens to take an up-to-date
+/// entry's file with it — `A` and `a` on a case-insensitive file system — does not turn
+/// that entry into a write git never makes.
+pub fn up_to_date_paths(
+    index: &gix::index::State,
+    dir: &std::path::Path,
+    stat_options: gix::index::entry::stat::Options,
+) -> std::collections::HashSet<gix::bstr::BString> {
+    let backing = index.path_backing();
+    index
+        .entries()
+        .iter()
+        .filter(|entry| is_up_to_date(entry, backing, dir, stat_options))
+        .map(|entry| entry.path_in(backing).to_owned())
+        .collect()
+}

@@ -1136,7 +1136,7 @@ fn switch_detach(
             let mut head = repo.head()?;
             match head.try_peel_to_id()? {
                 Some(id) => id.detach(),
-                None => return fatal("you are on a branch yet to be born"),
+                None => return fatal("You are on a branch yet to be born"),
             }
         }
     };

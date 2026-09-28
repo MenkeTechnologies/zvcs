@@ -714,8 +714,10 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             0 => false,
             1 => {
                 let spec = pre[0];
-                let is_ref = matches!(spec, "HEAD" | "@")
-                    || repo
+                // `HEAD` and `@` are revisions only while `HEAD` resolves: on an
+                // unborn branch `repo_get_oid_mb()` fails for them as for any name,
+                // and they are pathspecs (builtin/checkout.c:1476-1518).
+                let is_ref = repo
                         .try_find_reference(format!("refs/heads/{spec}").as_str())
                         .ok()
                         .flatten()
@@ -1080,6 +1082,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // No `--`, no -b/-B.
     if pre.is_empty() {
+        // `switch_branches()` (builtin/checkout.c:1195-1199): with no operand the
+        // branch is "HEAD" at the current commit, and there is none to take.
+        if head_commit_id(&repo).is_none() {
+            crate::git_fatal!("You are on a branch yet to be born");
+        }
         // `git checkout --detach` with no revision detaches at the CURRENT HEAD:
         // git resolves the missing argument to HEAD rather than erroring
         // (builtin/checkout.c, `opts->force_detach && !argc`). The worktree is
@@ -1164,7 +1171,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         // `refs/heads/HEAD` to resolve, `new_branch_info->path` stays NULL while
         // its name is "HEAD", and `update_refs_for_switch()`'s first arm leaves
         // every ref alone. Only the worktree reconciliation runs.
-        if !detach && matches!(spec, "HEAD" | "@") && !is_branch {
+        if !detach && matches!(spec, "HEAD" | "@") && !is_branch && rev.is_some() {
             let code = checkout_head_in_place(&repo, quiet, force)?;
             maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
             return Ok(code);
@@ -1239,6 +1246,12 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                 }
                 Dwim::None => {}
             }
+        }
+        // `if (has_dash_dash) die(_("invalid reference: %s"), arg);`
+        // (builtin/checkout.c:1512-1513): with `--` after it the operand can only
+        // have been a revision.
+        if has_dashdash {
+            crate::git_fatal!("invalid reference: {spec}");
         }
         // Not a ref/rev — treat as a path restore from the index (bare form).
         return restore_from_index(&repo, &pre, true, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree);
@@ -2782,7 +2795,7 @@ fn restore_from_index(
 ) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let mut index = repo.open_index()?;
+    let mut index = crate::index_open::or_empty(repo)?;
     let norm = Specs::new(repo, paths)?;
     // `if (opts->merge) unmerge_index(…)` (builtin/checkout.c:637-638) — ahead of the
     // pathspec match, so a conflict that was already resolved comes back first.

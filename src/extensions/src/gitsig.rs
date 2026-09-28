@@ -1732,3 +1732,37 @@ mod tests {
         assert_eq!(known.pretty_status().code(), 'G');
     }
 }
+
+/// `add_header_signature()` (commit.c:1160-1190): splice `sig` into the object
+/// `buf` as a `gpgsig` header (`gpgsig-sha256` in a SHA-256 repository), at the
+/// end of the header block, each line of the signature after the first carried
+/// as a continuation line opening with a space.
+pub fn add_header_signature(buf: &mut Vec<u8>, sig: &[u8], kind: gix::hash::Kind) {
+    let header: &[u8] = match kind {
+        gix::hash::Kind::Sha1 => b"gpgsig",
+        _ => b"gpgsig-sha256",
+    };
+    // "find the end of the header"
+    let mut inspos = match buf.windows(2).position(|w| w == b"\n\n") {
+        Some(eoh) => eoh + 1,
+        None => buf.len(),
+    };
+    // The signature is a C string: it ends at its first NUL.
+    let sig = &sig[..sig.iter().position(|&b| b == 0).unwrap_or(sig.len())];
+    let mut copypos = 0;
+    while copypos < sig.len() {
+        let len = match sig[copypos..].iter().position(|&b| b == b'\n') {
+            Some(nl) => nl + 1,
+            None => sig.len() - copypos,
+        };
+        if copypos == 0 {
+            buf.splice(inspos..inspos, header.iter().copied());
+            inspos += header.len();
+        }
+        buf.insert(inspos, b' ');
+        inspos += 1;
+        buf.splice(inspos..inspos, sig[copypos..copypos + len].iter().copied());
+        inspos += len;
+        copypos += len;
+    }
+}

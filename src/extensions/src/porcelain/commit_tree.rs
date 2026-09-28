@@ -3,7 +3,8 @@
 //! Covered: `<tree>`, `-p <parent>` (repeatable, with git's duplicate-parent
 //! dedup), `-m <message>` and `-F <file>` (both repeatable and freely
 //! interleaved, joined in git's own order), reading the message from stdin when
-//! neither is given, `--no-gpg-sign`, and `--`. Attached short-option values
+//! neither is given, `-S[<key-id>]`/`--gpg-sign[=<key-id>]`/`--no-gpg-sign`, and
+//! `--`. Attached short-option values
 //! (`-mfoo`, `-Fmsg.txt`, `-p<oid>`) are accepted exactly as git's
 //! `parse_options` accepts them. Stdout is the new commit id followed by a
 //! newline, and the object bytes are byte-identical to git's, so the id matches.
@@ -21,10 +22,14 @@
 //! rewritten by it too — which is what `git am` on an `ISO-8859-1` mail depends
 //! on, since `mailinfo` leaves that header's bytes alone.
 //!
-//! Not covered: `-S`/`--gpg-sign` (commit signing needs a gpg driver that the
-//! vendored crates do not provide), and git's gecos-derived identity fallback
-//! when nothing is configured — both fail with a precise message rather than
-//! writing a commit that would differ from git's.
+//! `-S` signs the finished buffer through [`crate::gitsig::Signer`] — the
+//! `gpg.format` program table `git commit -S` uses — and splices the result in
+//! with [`crate::gitsig::add_header_signature`], after the UTF-8 check as
+//! `commit_tree_extended()` orders them.
+//!
+//! Not covered: git's gecos-derived identity fallback when nothing is
+//! configured, which fails with a precise message rather than writing a commit
+//! that would differ from git's.
 //!
 //! One resolution caveat: revision parsing goes through gitoxide's
 //! `rev_parse_single`, which may peel an annotated tag where git's
@@ -116,7 +121,11 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
     let mut parents: Vec<ObjectId> = Vec::new();
     // Non-options, kept unresolved: `parse_options` only gathers them.
     let mut trees: Vec<&str> = Vec::new();
-    let mut sign = false;
+    // `sign_commit`: `OPTION_STRING` with `PARSE_OPT_OPTARG` and a `""` default
+    // (builtin/commit-tree.c:115-124), so `-S`/`--gpg-sign` sign with the
+    // default key, `-S<key-id>`/`--gpg-sign=<key-id>` name one, and
+    // `--no-gpg-sign` puts it back to NULL.
+    let mut sign: Option<String> = None;
     let mut no_more_opts = false;
 
     let mut i = 0;
@@ -158,9 +167,9 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         if let Some(long) = a.strip_prefix("--") {
             match long {
                 "" => no_more_opts = true,
-                "gpg-sign" => sign = true,
-                "no-gpg-sign" => sign = false,
-                _ if long.starts_with("gpg-sign=") => sign = true,
+                "gpg-sign" => sign = Some(String::new()),
+                "no-gpg-sign" => sign = None,
+                _ if long.starts_with("gpg-sign=") => sign = Some(long["gpg-sign=".len()..].to_owned()),
                 _ => {
                     eprintln!("error: unknown option `{long}'");
                     eprint!("{USAGE}");
@@ -176,7 +185,7 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         let attached = &a[1 + flag.len_utf8()..];
         match flag {
             'S' => {
-                sign = true;
+                sign = Some(attached.to_owned());
                 i += 1;
                 continue;
             }
@@ -260,9 +269,6 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    if sign {
-        bail!("`-S`/`--gpg-sign` is not supported (no signing driver in the vendored crates)");
-    }
     if trees.len() != 1 {
         return fatal("must give exactly one tree");
     }
@@ -331,6 +337,25 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
              You may want to amend it after fixing the message, or set the config\n\
              variable i18n.commitEncoding to the encoding your project uses."
         );
+    }
+    // `sign_buffer(&buffer, &sig, sign_commit, SIGN_BUFFER_USE_DEFAULT_KEY)` on the
+    // checked buffer, then `add_header_signature()` (commit.c:1623-1628,
+    // 1680-1690). A failure is `commit_tree()`'s `-1`, which `cmd_commit_tree()`
+    // turns into exit 1 after the backend's own `error()`; a `die()` inside the
+    // backend exits 128 on the spot.
+    if let Some(key) = &sign {
+        let signer = super::commit::sequencer_signer(&repo, Some(key.as_str()))
+            .expect("a key always resolves a signer");
+        let sig = match signer.sign(&buffer) {
+            Ok(sig) => sig,
+            Err(crate::gitsig::SignFailure::Silent) => return Ok(ExitCode::from(128)),
+            Err(crate::gitsig::SignFailure::Fatal(m)) => return fatal(&m),
+            Err(crate::gitsig::SignFailure::Error(m)) => {
+                eprintln!("{}", crate::gitsig::report("error: ", &m));
+                return Ok(ExitCode::FAILURE);
+            }
+        };
+        crate::gitsig::add_header_signature(&mut buffer, &sig, repo.object_hash());
     }
     let id = repo
         .objects

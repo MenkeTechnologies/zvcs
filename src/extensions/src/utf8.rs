@@ -1,7 +1,7 @@
 //! git's `utf8.c` display-width and wrapping primitives.
 //!
 //! Ported function for function from git 2.55.0: [`display_mode_esc_sequence_len`],
-//! `pick_one_utf8_char`, [`utf8_width`], [`utf8_strnwidth`], [`strbuf_utf8_replace`],
+//! `pick_one_utf8_char`, [`mbs_chrlen`], [`utf8_width`], [`utf8_strnwidth`], [`strbuf_utf8_replace`],
 //! `strbuf_add_indented_text` and [`strbuf_add_wrapped_text`]. The column widths come
 //! from git's own interval tables (see [`crate::unicode_width`]), because
 //! `--pretty=format:%<(<N>)` measures padding in these columns and any drift from
@@ -127,6 +127,26 @@ fn pick_one_utf8_char(s: &[u8], pos: &mut usize) -> Option<u32> {
 /// `*pos` past it. `None` for invalid UTF-8 (C's `*start = NULL`).
 pub(crate) fn utf8_width(s: &[u8], pos: &mut usize) -> Option<i32> {
     pick_one_utf8_char(s, pos).map(git_wcwidth)
+}
+
+/// `mbs_chrlen()` (utf8.c:668-699): the byte length of the first character of
+/// `text` in `encoding`. Under a UTF-8 name that is one decoded character, or a
+/// single byte where the bytes are not valid UTF-8; every other encoding is
+/// "treated as one-byte" (git's own TODO), which is also what an empty name —
+/// `--encoding=none` — gets, since `is_encoding_utf8("")` is false. An empty
+/// `text` answers 0.
+pub(crate) fn mbs_chrlen(text: &[u8], encoding: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    if crate::porcelain::mailinfo::is_utf8_name(encoding) {
+        let mut pos = 0usize;
+        return match pick_one_utf8_char(text, &mut pos) {
+            Some(_) => pos,
+            None => 1,
+        };
+    }
+    1
 }
 
 /// `utf8_strnwidth()`: the columns `s` occupies, skipping ANSI SGR sequences when

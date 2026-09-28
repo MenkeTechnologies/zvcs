@@ -2720,14 +2720,14 @@ fn show_tag(
     match (tag.tagger()?, pretty) {
         (_, Pretty::Oneline) | (None, _) => {}
         (Some(tagger), Pretty::Email | Pretty::MboxRd) => {
-            let mut sb = String::new();
+            let mut sb: Vec<u8> = Vec::new();
             super::log::write_identity_headers_for(
                 &mut sb,
                 &tagger,
                 disp.email.encode_headers,
                 None,
             )?;
-            out.extend_from_slice(sb.as_bytes());
+            out.extend_from_slice(&sb);
         }
         (Some(tagger), _) => {
             out.extend_from_slice(b"Tagger: ");

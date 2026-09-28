@@ -9207,20 +9207,14 @@ pub(super) fn email_config(repo: &gix::Repository) -> (String, bool) {
 /// `pp_user_info()` runs `map_user()` over the identity first when the context
 /// carries a mailmap (pretty.c:539-540).
 pub(super) fn write_identity_headers_for(
-    sb: &mut String,
+    sb: &mut Vec<u8>,
     who: &gix::actor::SignatureRef<'_>,
     encode: bool,
     mailmap: Option<&Mailmap>,
 ) -> Result<()> {
     let date = show_ident_date(who.time, DateMode::Rfc, now_secs());
     let (name, mail) = mapped_ident(who.name, who.email, mailmap);
-    let name = name.to_str().map_err(|_| {
-        anyhow!("identity name is not valid UTF-8; RFC2047 encoding needs a known charset")
-    })?;
-    let mail = mail.to_str().map_err(|_| {
-        anyhow!("identity email is not valid UTF-8; RFC2047 encoding needs a known charset")
-    })?;
-    super::format_patch::write_identity_headers(sb, name, mail, &date, encode);
+    super::format_patch::write_identity_headers(sb, &name, &mail, &date, encode, "UTF-8");
     Ok(())
 }
 
@@ -9234,7 +9228,7 @@ pub(super) fn email_body(
     let raw = commit.message_raw()?;
     let author = commit.author()?;
 
-    let mut sb = String::new();
+    let mut sb: Vec<u8> = Vec::new();
     // `pp_header()` → `pp_user_info(pp, "Author", …)`, whose mail branch writes
     // `From:` and then the RFC2822 `Date:` (pretty.c:516-595). `add_merge_info()`
     // returns early for a mail format, so a merge has no `Merge:` line here.
@@ -9242,17 +9236,13 @@ pub(super) fn email_body(
 
     let msg = super::format_patch::skip_blank_lines(raw);
     let (title, rest) = super::format_patch::format_subject(msg);
-    let title = title
-        .to_str()
-        .map_err(|_| anyhow!("commit subject is not valid UTF-8"))?
-        .to_owned();
     if style.subject_prefix.is_empty() {
-        sb.push_str("Subject: ");
+        sb.extend_from_slice(b"Subject: ");
     } else {
-        sb.push_str(&format!("Subject: [{}] ", style.subject_prefix));
+        sb.extend_from_slice(format!("Subject: [{}] ", style.subject_prefix).as_bytes());
     }
     if style.encode_headers && super::format_patch::needs_rfc2047_encoding(&title) {
-        super::format_patch::add_rfc2047(&mut sb, &title, false);
+        super::format_patch::add_rfc2047(&mut sb, &title, "UTF-8", false);
     } else {
         let consumed = -super::format_patch::last_line_length(&sb);
         super::format_patch::wrap_text(
@@ -9263,7 +9253,7 @@ pub(super) fn email_body(
             super::format_patch::HEADER_MAX_LENGTH,
         );
     }
-    sb.push('\n');
+    sb.push(b'\n');
 
     // `pretty_print_commit()`'s `need_8bit_cte` scan (pretty.c:2175-2192) looks
     // only at the *body*: the author line may be non-ASCII while the log is not.
@@ -9274,14 +9264,14 @@ pub(super) fn email_body(
         after_headers.iter().any(|&b| b >= 0x80)
     };
     if body_is_8bit {
-        sb.push_str("MIME-Version: 1.0\n");
-        sb.push_str("Content-Type: text/plain; charset=UTF-8\n");
-        sb.push_str("Content-Transfer-Encoding: 8bit\n");
+        sb.extend_from_slice(b"MIME-Version: 1.0\n");
+        sb.extend_from_slice(b"Content-Type: text/plain; charset=UTF-8\n");
+        sb.extend_from_slice(b"Content-Transfer-Encoding: 8bit\n");
     }
     // `if (cmit_fmt_is_mail(pp->fmt)) strbuf_addch(sb, '\n');` (pretty.c:2003-2005).
-    sb.push('\n');
+    sb.push(b'\n');
 
-    out.extend_from_slice(sb.as_bytes());
+    out.extend_from_slice(&sb);
     let beginning_of_body = out.len();
     let mut body: Vec<u8> = Vec::new();
     super::format_patch::pp_remainder(rest, &mut body);

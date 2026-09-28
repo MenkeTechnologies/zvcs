@@ -580,11 +580,27 @@ fn add_by_glob(repo: &gix::Repository, refs: &mut Vec<String>, name: &str) -> Re
 /// `--pretty=oneline` subject, which is exactly git's own spacing.
 ///
 /// `raw` is `%N`'s expansion: the note text alone, no header and no indent.
+///
+/// This is [`format_display_encoded`] with no output encoding, i.e. the note
+/// bytes exactly as stored.
 pub(crate) fn format_display(
     repo: &gix::Repository,
     trees: &[Tree],
     object: ObjectId,
     raw: bool,
+) -> Result<Vec<u8>> {
+    format_display_encoded(repo, trees, object, raw, "")
+}
+
+/// [`format_display`] with `format_note()`'s `output_encoding` (notes.c:1305-1312):
+/// a note is stored as UTF-8, so under any other non-empty encoding its text is
+/// re-coded from UTF-8 first — and left as stored when that conversion fails.
+pub(crate) fn format_display_encoded(
+    repo: &gix::Repository,
+    trees: &[Tree],
+    object: ObjectId,
+    raw: bool,
+    output_encoding: &str,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for t in trees {
@@ -597,7 +613,11 @@ pub(crate) fn format_display(
         if blob.kind != gix::object::Kind::Blob {
             continue;
         }
-        let mut msg = blob.data.as_slice();
+        let reencoded = (!output_encoding.is_empty()
+            && !super::mailinfo::is_utf8_name(output_encoding))
+        .then(|| super::mailinfo::reencode(&blob.data, "utf-8", output_encoding))
+        .flatten();
+        let mut msg = reencoded.as_deref().unwrap_or(blob.data.as_slice());
         // "we will end the annotation by a newline anyway"
         if msg.last() == Some(&b'\n') {
             msg = &msg[..msg.len() - 1];

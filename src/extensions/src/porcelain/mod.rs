@@ -685,7 +685,7 @@ pub(crate) mod log;
 mod ls_files;
 mod ls_remote;
 mod ls_tree;
-mod mailinfo;
+pub(crate) mod mailinfo;
 mod mailsplit;
 mod maintenance;
 mod merge;

@@ -5183,21 +5183,34 @@ fn message_body(msg: &str) -> String {
 /// re-appends a trailer that appears earlier in the block, while `format-patch`
 /// passes the flag and leaves the block alone.
 pub(crate) fn append_signoff(msg: &mut String, ident: &str, ignore_footer: usize, dedup: bool) {
+    let mut bytes = std::mem::take(msg).into_bytes();
+    append_signoff_bytes(&mut bytes, ident.as_bytes(), ignore_footer, dedup);
+    // Only ASCII separators and the UTF-8 `ident` were spliced in, at line
+    // boundaries of an already valid string.
+    *msg = String::from_utf8(bytes).expect("a UTF-8 sign-off into a UTF-8 message stays UTF-8");
+}
+
+/// [`append_signoff`] over a byte buffer, which is what `format-patch` hands it:
+/// its message is in `get_log_output_encoding()`, not necessarily UTF-8, and
+/// git's `strbuf` never cares.
+pub(crate) fn append_signoff_bytes(msg: &mut Vec<u8>, ident: &[u8], ignore_footer: usize, dedup: bool) {
     // `ensure_configured()`: the trailer scan below reads the comment prefix,
     // `trailer.separators` and every configured `trailer.<token>.key`.
     let cfg = trailer_config();
-    let sob = format!("Signed-off-by: {ident}\n");
+    let mut sob = b"Signed-off-by: ".to_vec();
+    sob.extend_from_slice(ident);
+    sob.push(b'\n');
     // strbuf_complete_line: only when there is no trailing footer to preserve.
-    if ignore_footer == 0 && !msg.is_empty() && !msg.ends_with('\n') {
-        msg.push('\n');
+    if ignore_footer == 0 && !msg.is_empty() && msg.last() != Some(&b'\n') {
+        msg.push(b'\n');
     }
     let cut = msg.len() - ignore_footer;
-    let sob_bytes = sob.as_bytes();
+    let sob_bytes = sob.as_slice();
     // If the whole (footer-stripped) buffer equals the sob, treat it as present.
-    let has_footer: u8 = if cut == sob_bytes.len() && &msg.as_bytes()[..cut] == sob_bytes {
+    let has_footer: u8 = if cut == sob_bytes.len() && &msg[..cut] == sob_bytes {
         3
     } else {
-        has_conforming_footer(&msg.as_bytes()[..cut], sob_bytes, cfg)
+        has_conforming_footer(&msg[..cut], sob_bytes, cfg)
     };
     if has_footer == 0 {
         // Leave a blank line between a message body and the sob.
@@ -5208,19 +5221,19 @@ pub(crate) fn append_signoff(msg: &mut String, ident: &str, ignore_footer: usize
             Some("\n\n")
         } else if cut == 1 {
             Some("\n")
-        } else if msg.as_bytes()[cut - 2] != b'\n' {
+        } else if msg[cut - 2] != b'\n' {
             Some("\n")
         } else {
             None
         };
         if let Some(a) = append {
             let pos = msg.len() - ignore_footer;
-            msg.insert_str(pos, a);
+            msg.splice(pos..pos, a.bytes());
         }
     }
     if has_footer != 3 && (!dedup || has_footer != 2) {
         let pos = msg.len() - ignore_footer;
-        msg.insert_str(pos, &sob);
+        msg.splice(pos..pos, sob.iter().copied());
     }
 }
 

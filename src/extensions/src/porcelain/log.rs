@@ -3698,6 +3698,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // ending; which of git's three messages it becomes is decided below, once the
     // effective order is known, and it is raised at the point in this function
     // where git's own `die()` would have fired.
+    // `walk->last_commit_reflog`: the entry `next_reflog_entry()` handed out last
+    // (reflog-walk.c:378-381). It is left alone once the reflogs run dry, so
+    // it is what `show_log()` reports for the `--boundary` commits printed
+    // after the walk. Until `--max-count` cuts the walk short, that is the
+    // final entry, whether or not it was shown.
+    let mut reflog_last_popped: Option<ReflogEntry> = None;
     let (mut nodes, abort) = if walk_reflogs {
         let names: Vec<String> = tip_names
             .iter()
@@ -3706,6 +3712,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             .map(|(_, n)| n.clone())
             .collect();
         let mut nodes = reflog_walk(&repo, &names)?;
+        reflog_last_popped = nodes.last().and_then(|n| n.reflog.clone());
         // A commit excluded before `-g` was read makes the walk limited
         // (revision.c:431-435): `limit_list()` paints its ancestry
         // UNINTERESTING, and `get_commit_action()` ignores those entries.
@@ -5064,6 +5071,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             Flavor::WhatChanged => max_count,
             Flavor::Log | Flavor::Reflog => {
                 if let Some(limit) = max_count {
+                    // `get_revision()` stops asking for entries once the cap is
+                    // spent, so the last one popped is the last one shown.
+                    if nodes.len() > limit && limit > 0 {
+                        reflog_last_popped = nodes[limit - 1].reflog.clone();
+                    }
                     nodes.truncate(limit);
                     linear.truncate(limit);
                 }
@@ -5290,6 +5302,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         for id in edge_ids {
             let mut n = reader.read(&repo, id)?;
             n.boundary = true;
+            n.reflog = reflog_last_popped.clone();
             nodes.push(n);
         }
     }

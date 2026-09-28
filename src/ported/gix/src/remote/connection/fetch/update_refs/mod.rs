@@ -9,7 +9,6 @@ use gix_ref::{
 
 use crate::{
     Repository,
-    ext::ObjectIdExt,
     remote::{
         fetch,
         fetch::{
@@ -199,34 +198,20 @@ pub(crate) fn update(
                                     // governs the rejection and the reflog message, not just the summary.
                                     let is_fast_forward = match dry_run {
                                         fetch::DryRun::No if !show_forced_updates => true,
-                                        fetch::DryRun::No => {
-                                            let ancestors = repo
-                                                .find_object(local_id)?
-                                                .try_into_commit()
-                                                .map_err(|_| ())
-                                                .and_then(|c| c.committer().map(|a| a.seconds()).map_err(|_| ()))
-                                                .and_then(|local_commit_time| {
-                                                    remote_id
-                                                        .to_owned()
-                                                        .ancestors(&repo.objects)
-                                                        .sorting(
-                                                            gix_traverse::commit::simple::Sorting::ByCommitTimeCutoff {
-                                                                order: Default::default(),
-                                                                seconds: local_commit_time,
-                                                            },
-                                                        )
-                                                        .map_err(|_| ())
-                                                });
-                                            match ancestors {
-                                                Ok(mut ancestors) => {
-                                                    ancestors.any(|cid| cid.is_ok_and(|c| c.id == local_id))
-                                                }
-                                                Err(_) => {
-                                                    force = true;
-                                                    false
-                                                }
+                                        // `fast_forward = repo_in_merge_bases(the_repository, current, updated)`
+                                        // (builtin/fetch.c:1049-1050): an exact reachability test. A walk cut
+                                        // off at the local commit's date answered "not an ancestor" whenever
+                                        // a descendant carried an older committer date, turning a clock-skewed
+                                        // fast-forward into a forced update (or a rejection).
+                                        fetch::DryRun::No => match repo.find_object(local_id)?.try_into_commit() {
+                                            Ok(_) => repo
+                                                .merge_base(remote_id.to_owned(), local_id.to_owned())
+                                                .is_ok_and(|base| base.detach() == local_id),
+                                            Err(_) => {
+                                                force = true;
+                                                false
                                             }
-                                        }
+                                        },
                                         fetch::DryRun::Yes => true,
                                     };
                                     if is_fast_forward {

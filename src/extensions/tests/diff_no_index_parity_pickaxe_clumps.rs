@@ -148,3 +148,14 @@ fn pickaxe_refusals() {
     );
     assert_eq!(f.first_err_line(&["-S"]), ("error: switch `S' requires a value".to_owned(), 129));
 }
+
+/// `diff_opt_find_object()` refuses before it resolves anything when there is no
+/// repository (diff.c:5529-5530); zvcs reported the name as unresolvable.
+#[test]
+fn find_object_outside_a_repository() {
+    let f = Fixture::new("objfind");
+    assert_eq!(
+        f.first_err_line(&["--find-object=HEAD", "p", "q"]),
+        ("error: --find-object requires a git repository".to_owned(), 129)
+    );
+}

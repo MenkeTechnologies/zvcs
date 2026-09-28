@@ -605,14 +605,15 @@ const NOT_IN_NO_INDEX: &[&str] = &[
     "--no-expand-tabs",
 ];
 
-/// `diff_opt_find_object()` (diff.c:4968-4986): the object is resolved during the
-/// option scan, and a name that does not resolve — which is every name when no
-/// repository was found — is `error: unable to resolve '<arg>'`, exit 129.
+/// `diff_opt_find_object()` (diff.c:5522-5542): the object is resolved during the
+/// option scan. Outside a repository that is refused before the name is looked
+/// at (`!startup_info->have_repository`), and inside one a name that does not
+/// resolve is `error: unable to resolve '<arg>'`; both exit 129.
 fn resolve_find_object(arg: &str) -> std::result::Result<(), ExitCode> {
     match crate::setup::discover() {
         Ok(repo) => crate::objname::find_object(&repo, arg).map(|_| ()).map_err(|e| e.report()),
         Err(_) => {
-            eprintln!("error: unable to resolve '{arg}'");
+            eprintln!("error: --find-object requires a git repository");
             Err(ExitCode::from(129))
         }
     }

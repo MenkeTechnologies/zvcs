@@ -116,7 +116,6 @@
 use anyhow::Result;
 use std::process::ExitCode;
 
-use gix::remote::Direction;
 
 use super::{Arg, LongOpt};
 
@@ -1204,47 +1203,6 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         );
     }
 
-    // Resolve which remote-tracking ref the fetched upstream lands at.
-    // `<repository>` may just as well be a URL, and then there is no `remote.<name>` section and
-    // nothing under `refs/remotes/` for the fetch to have updated. git never depends on one:
-    // `cmd_pull()` collects its merge heads from `FETCH_HEAD`, which the fetch has just written for
-    // exactly the refs that were asked for. Only a configured remote gets the tracking-ref
-    // treatment, because that is the one whose name a tracking ref can be built from.
-    //
-    // This sits *below* the fetch because `cmd_pull()` puts it there: `run_fetch()` runs first and
-    // only `get_merge_heads()` afterwards decides there is nothing to merge. Resolving the upstream
-    // first would answer for the fetch — a `git pull` with no upstream would report the missing
-    // tracking information instead of fetching, and an option only the fetch knows how to reject
-    // (`--no-ipv4`) would never reach it.
-    let named_remote = positionals
-        .first()
-        .is_some_and(|name| repo.remote_names().iter().any(|known| known == name));
-    let target_ref = if positionals.len() >= 2 && named_remote {
-        // Explicit `<remote> <branch>`: after a default-refspec fetch the branch
-        // lands at refs/remotes/<remote>/<branch>.
-        format!("refs/remotes/{}/{}", positionals[0], positionals[1])
-    } else if positionals.len() >= 2 {
-        "FETCH_HEAD".to_string()
-    } else {
-        // No explicit branch: derive the tracking ref from the current branch's
-        // upstream configuration (branch.<name>.remote / .merge).
-        let head = match head_name.as_ref() {
-            Some(head) => head,
-            None => return Ok(no_merge_candidates(&repo, None, rebasing)),
-        };
-        match repo.branch_remote_tracking_ref_name(head.as_ref(), Direction::Fetch) {
-            Some(Ok(name)) => name.as_bstr().to_string(),
-            Some(Err(err)) => return Err(err.into()),
-            None => {
-                return Ok(no_merge_candidates(
-                    &repo,
-                    Some(head.shorten().to_string()).as_deref(),
-                    rebasing,
-                ))
-            }
-        }
-    };
-
     // `get_merge_heads()`: everything the fetch marked for-merge in `FETCH_HEAD`,
     // which is what `cmd_pull()` integrates — not a remote-tracking ref. A
     // `<remote> <ref>` pair that lands nowhere under `refs/remotes/` (a tag, a
@@ -1252,8 +1210,54 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // several heads.
     let merge_heads = super::merge::fetch_head_for_merge(&repo)?;
     if merge_heads.is_empty() {
-        // `die_no_merge_candidates()`: nothing came back that could be merged.
-        crate::git_fatal!("couldn't find remote ref {target_ref}");
+        // `die_no_merge_candidates()` (builtin/pull.c:315-366): the fetch
+        // succeeded but marked nothing for merge.
+        let short = head_name.as_ref().map(|h| h.shorten().to_string());
+        let branch_remote = short.as_ref().and_then(|b| {
+            crate::config::config_get_string(Some(&repo), &format!("branch.{b}.remote"))
+        });
+        let merges = short.as_ref().map_or_else(Vec::new, |b| {
+            crate::config::multi_values(&repo, &format!("branch.{b}.merge"))
+        });
+        if positionals.len() >= 2 {
+            eprintln!(
+                "{}",
+                if rebasing {
+                    "There is no candidate for rebasing against among the refs that you just fetched."
+                } else {
+                    "There are no candidates for merging among the refs that you just fetched."
+                }
+            );
+            eprintln!(
+                "Generally this means that you provided a wildcard refspec which had no\n\
+                 matches on the remote end."
+            );
+        } else if let (Some(repo_arg), Some(_)) = (positionals.first(), short.as_ref()) {
+            if branch_remote.as_deref() != Some(*repo_arg) {
+                eprintln!(
+                    "You asked to pull from the remote '{repo_arg}', but did not specify\n\
+                     a branch. Because this is not the default configured remote\n\
+                     for your current branch, you must specify a branch on the command line."
+                );
+            } else if merges.is_empty() || branch_remote.is_none() {
+                return Ok(no_merge_candidates(&repo, short.as_deref(), rebasing));
+            } else {
+                eprintln!(
+                    "Your configuration specifies to merge with the ref '{}'\n\
+                     from the remote, but no such ref was fetched.",
+                    merges[0]
+                );
+            }
+        } else if short.is_none() || merges.is_empty() || branch_remote.is_none() {
+            return Ok(no_merge_candidates(&repo, short.as_deref(), rebasing));
+        } else {
+            eprintln!(
+                "Your configuration specifies to merge with the ref '{}'\n\
+                 from the remote, but no such ref was fetched.",
+                merges[0]
+            );
+        }
+        return Ok(ExitCode::FAILURE);
     }
 
     // ---- phase 2: integrate ----------------------------------------------

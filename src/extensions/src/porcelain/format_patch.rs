@@ -6382,9 +6382,18 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
     let mut ctx = gix::hash::hasher(kind);
     let mut attrs = super::cat_file::Textconv::new(repo)?;
     for change in &changes {
-        let path = change_path(change);
-        let one = remove_space(path);
-        let two = one.clone();
+        // `p->one->path` and `p->two->path`, which differ for a rename or a copy:
+        // `diffcore_std()` ran rename detection over this queue as over any other,
+        // and `diff_unmodified_pair()` keeps such a pair even when the content
+        // is identical, since its two paths differ (diff.c:6520-6523).
+        let (one_path, two_path) = match change {
+            ChangeDetached::Rewrite { source_location, location, .. } => {
+                (source_location.as_slice(), location.as_slice())
+            }
+            _ => (change_path(change), change_path(change)),
+        };
+        let one = remove_space(one_path);
+        let two = remove_space(two_path);
         let (old_id, new_id, old_mode, new_mode) = pair_info(change);
 
         ctx.update(b"diff--git");
@@ -6414,10 +6423,12 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
             Some((id, is_sub)) => content_of(repo, id, is_sub)?,
             None => Vec::new(),
         };
-        // `diff_filespec_is_binary()` on each side: the path's diff driver first
-        // (`-diff` is binary whatever the bytes), the NUL sniff only without one.
-        let attr_binary = attrs.binary_attr(path.as_bstr())?;
-        if attr_binary.unwrap_or_else(|| is_binary(&old_content) || is_binary(&new_content)) {
+        // `diff_filespec_is_binary()` on each side, each through its own path's
+        // diff driver first (`-diff` is binary whatever the bytes), the NUL sniff
+        // only without one.
+        let one_binary = attrs.binary_attr(one_path.as_bstr())?.unwrap_or_else(|| is_binary(&old_content));
+        let two_binary = attrs.binary_attr(two_path.as_bstr())?.unwrap_or_else(|| is_binary(&new_content));
+        if one_binary || two_binary {
             // A binary pair contributes its two object names instead of a diff.
             let hex = |o: Option<(ObjectId, bool)>| {
                 o.map_or_else(|| ObjectId::null(kind), |(id, _)| id)
@@ -6556,8 +6567,19 @@ fn pair_info(
             previous_entry_mode.value().into(),
             entry_mode.value().into(),
         ),
-        // Never produced: rewrite tracking is off via Options::default().
-        ChangeDetached::Rewrite { .. } => (None, None, 0, 0),
+        // A rename or copy [`detect_renames`] paired up: both sides are valid.
+        ChangeDetached::Rewrite {
+            source_entry_mode,
+            source_id,
+            entry_mode,
+            id,
+            ..
+        } => (
+            Some((*source_id, source_entry_mode.is_commit())),
+            Some((*id, entry_mode.is_commit())),
+            source_entry_mode.value().into(),
+            entry_mode.value().into(),
+        ),
     }
 }
 

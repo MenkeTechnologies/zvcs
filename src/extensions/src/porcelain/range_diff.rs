@@ -177,10 +177,17 @@
 //!   * `-B` / `--break-rewrites[=<n>[/<m>]]`: `diffcore_break()` only splits a pair
 //!     whose two paths match (diffcore-break.c:188-191), and these are `a`
 //!     and `b`. Its `<n>/<m>` is still validated at parse time.
-//!   * `-D` / `--irreversible-delete`, `-R`, `-a` / `--text`, `--no-ext-diff`
+//!   * `-D` / `--irreversible-delete`, `-R`, `-a` / `--text`
 //!     and `--rotate-to` / `--skip-to`: `-R` swaps sides only in
 //!     `diff_change()` / `diff_addremove()`, which `diff_queue()` bypasses, a
 //!     patch text holds no NUL for the binary test, and rotation is non-strict.
+//! * `--[no-]ext-diff` (`flags.allow_external`): with it up, `run_diff_cmd()`
+//!   hands the pair to `diff.external` / `GIT_EXTERNAL_DIFF`, or to path `a`'s
+//!   `diff.<driver>.command`, through [`diff_pairs::run_external_diff`] — the
+//!   driver's stdout, unindented, replaces the patch body of every matched pair,
+//!   `=` pairs included, while the stat formats are still computed here. Neither
+//!   side has an object id, so the program reads the worktree's `a` and `b`
+//!   when they exist and `/dev/null` otherwise (diff.c:4698-4750).
 //! * `--word-diff[=plain|color]`, `--color-words[=<re>]`, `--word-diff-regex`,
 //!   `--[no-]color-moved[=<mode>]` and `--[no-]color-moved-ws`, over the
 //!   `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` defaults
@@ -300,8 +307,7 @@
 //!   widths give it — `builtin/range-diff.c` never calls
 //!   `init_diffstat_widths()`.
 //! * `--word-diff=porcelain`, whose indent `fn_out_diff_words_write_helper()`
-//!   places itself (diff.c:2009-2053) — the symbol pass indents every line —
-//!   and `--ext-diff`, which would run a configured driver on the pair.
+//!   places itself (diff.c:2009-2053) — the symbol pass indents every line.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -1025,6 +1031,10 @@ struct Opts {
     /// `diff_opt_diff_filter()` does (diff.c:5470-5500) and applied last in
     /// `diffcore_std()` by `diffcore_apply_filter()`.
     diff_filter: super::diff_filter::Filter,
+    /// `--[no-]ext-diff`: `flags.allow_external` (diff.c:6260), last one wins.
+    /// With it up, `run_diff_cmd()` hands the `a`/`b` filepair to the program
+    /// `external_diff()` or path `a`'s `diff.<driver>.command` names.
+    allow_external: bool,
 }
 
 impl Opts {
@@ -1071,6 +1081,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         orderfile: None,
         nul_terminated: false,
         diff_filter: super::diff_filter::Filter::default(),
+        allow_external: false,
     };
     // `--ws-error-highlight=<kind>`, held until the config default can be read.
     let mut ws_error_highlight: Option<u32> = None;
@@ -1342,7 +1353,6 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // * `-a`/`--text` (diff.c:6252): the binary test (diff.c:3964) never
             //   fires on a patch text, whose size is its `strlen()`
             //   (range-diff.c:483), so it has no NUL to find.
-            // * `--no-ext-diff` (diff.c:6260): `allow_external` is already off.
             // * `--rotate-to`/`--skip-to` (diff.c:6293-6298): range-diff leaves
             //   `rotate_to_strict` clear, so `diffcore_rotate()` either finds the
             //   one pair first or returns (diffcore-rotate.c:20-32).
@@ -1422,7 +1432,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             }
             "--find-copies-harder" | "--no-find-copies-harder" | "--no-renames"
             | "--rename-empty" | "--no-rename-empty" | "-D" | "--irreversible-delete"
-            | "-R" | "-a" | "--text" | "--no-text" | "--no-ext-diff" => {}
+            | "-R" | "-a" | "--text" | "--no-text" => {}
+            "--ext-diff" => opts.allow_external = true,
+            "--no-ext-diff" => opts.allow_external = false,
             "--rotate-to" | "--skip-to" => {
                 if inline.is_none() {
                     i += 1;
@@ -2160,10 +2172,29 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `run_diff()` nulls the program unless `--ext-diff` raised `allow_external`
+    // (diff.c:5040-5041); `git_diff_ui_config()` is what range-diff reads its
+    // configuration through (builtin/range-diff.c:53), so `diff.external` counts.
+    // `attr_path` is always `a`, so the driver lookup is the same for every pair.
+    let drivers = std::cell::RefCell::new(super::cat_file::Textconv::new(&repo)?);
+    let ext_ctx = match opts.allow_external {
+        true => Some(super::diff::ext_context(&drivers, super::diff::external_diff_program(&repo)?)),
+        false => None,
+    };
+    let ext_pgm = match &ext_ctx {
+        Some(ctx) => diff_pairs::external_for_path(&repo, &drivers, "a".into(), ctx.env.as_ref())
+            .map_err(crate::fatal::die)?,
+        None => None,
+    };
+    let ext = match (&ext_ctx, &ext_pgm) {
+        (Some(ctx), Some(pgm)) => Some(ExtDiff { repo: &repo, ctx, pgm }),
+        _ => None,
+    };
+
     let mut rendered: Vec<u8> = Vec::new();
     // A `die()` inside `patch_diff()` leaves every pair header before it
     // written, so what was rendered goes out ahead of the error.
-    let result = output(&mut rendered, &mut a, &b, &opts);
+    let result = output(&mut rendered, &mut a, &b, &opts, ext.as_ref());
 
     // Everything upstream writes — the pair headers included — goes to
     // `diffopt.file`, which `--output=<file>` has replaced.
@@ -2254,6 +2285,7 @@ pub(super) fn show_range_diff(
         orderfile: None,
         nul_terminated: false,
         diff_filter: super::diff_filter::Filter::default(),
+        allow_external: false,
     };
     let ends1 = match endpoints(repo, range1) {
         Ok(e) => walkable(repo, e),
@@ -2279,7 +2311,7 @@ pub(super) fn show_range_diff(
     if let Err(msg) = get_correspondences(&mut a, &mut b, opts.creation_factor, opts.max_memory) {
         crate::git_fatal!("{msg}");
     }
-    output(out, &mut a, &b, &opts)?;
+    output(out, &mut a, &b, &opts, None)?;
     Ok(Ok(()))
 }
 
@@ -4232,7 +4264,21 @@ fn compute_assignment(
 
 /// Walk both ranges in the order of the right-hand side, placing each left-hand
 /// commit that has no counterpart once all of its predecessors have been shown.
-fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Result<()> {
+/// The external program `--ext-diff` resolved for the run, with the state its
+/// invocations share (`o->diff_path_counter` above all).
+struct ExtDiff<'a, 'd, 'repo> {
+    repo: &'a gix::Repository,
+    ctx: &'a diff_pairs::ExtCtx<'d, 'repo>,
+    pgm: &'a diff_pairs::ExternalDiff,
+}
+
+fn output(
+    out: &mut Vec<u8>,
+    a: &mut [Patch],
+    b: &[Patch],
+    opts: &Opts,
+    ext: Option<&ExtDiff<'_, '_, '_>>,
+) -> Result<()> {
     let patch_no_width = decimal_width(1 + a.len().max(b.len()) as u64);
     let mut dashes: Option<String> = None;
     let mut i = 0usize;
@@ -4287,7 +4333,7 @@ fn output(out: &mut Vec<u8>, a: &mut [Patch], b: &[Patch], opts: &Opts) -> Resul
                 // `dashes` is `find_unique_abbrev()`'s width, which is also the
                 // width `--raw`'s null-id columns print to.
                 let abbrev_len = dashes.as_deref().map_or(0, str::len);
-                flush_pair(out, &a[ai].text, &b[j].text, abbrev_len, opts)?;
+                flush_pair(out, &a[ai].text, &b[j].text, abbrev_len, opts, ext)?;
             }
             a[ai].shown = true;
             j += 1;
@@ -4431,6 +4477,7 @@ fn flush_pair(
     b: &[u8],
     abbrev_len: usize,
     opts: &Opts,
+    ext: Option<&ExtDiff<'_, '_, '_>>,
 ) -> Result<()> {
     // `diffcore_std()` runs the pickaxe before `diff_flush()` (diff.c:7517-7518),
     // and `diff_flush()` returns at once on the empty queue it can leave
@@ -4546,7 +4593,40 @@ fn flush_pair(
             out.extend_from_slice(INDENT);
             out.push(if opts.nul_terminated { 0 } else { b'\n' });
         }
-        if !unmodified {
+        // `run_diff_cmd()` (diff.c:4969-4972) hands the pair to the program and
+        // returns before `builtin_diff()`. `diff_flush_patch()`'s
+        // `diff_unmodified_pair()` test compares the two *paths*, `a` and `b`, so
+        // an `=` pair reaches the program too. Neither side has an object id
+        // (`get_filespec()`, range-diff.c:477-489), so `prepare_temp_file()` hands
+        // over the worktree's `a` and `b` when they exist and `/dev/null`
+        // otherwise, and both ids being the null id leaves `fill_metainfo()` no
+        // `index` line to pass. The program's stdout is not indented: git gives
+        // the child its own output descriptor.
+        if let Some(ext) = ext {
+            let pair = diff_pairs::ExtPair {
+                old_path: "a".into(),
+                new_path: "b".into(),
+                old_id: ext.repo.object_hash().null(),
+                new_id: ext.repo.object_hash().null(),
+                old_mode: 0o100644,
+                new_mode: 0o100644,
+                old_oid_valid: false,
+                new_oid_valid: false,
+                kind: b'M',
+                score: 0,
+            };
+            let naming = diff_pairs::IndexNaming {
+                base_abbrev: abbrev_len,
+                full_index: false,
+                abbrev_explicit: None,
+            };
+            let run = diff_pairs::run_external_diff(ext.pgm, ext.repo, ext.ctx, &pair, &naming, 1, true)
+                .map_err(crate::fatal::die)?;
+            out.extend_from_slice(&run.stdout);
+            if let Some(msg) = run.died {
+                return Err(crate::fatal::die(msg));
+            }
+        } else if !unmodified {
             patch_diff(out, a, b, opts)?;
         }
     }

@@ -3495,7 +3495,9 @@ struct TempSide {
 /// object of its own (`!one->oid_valid`, i.e. a worktree file) or
 /// `reuse_worktree_file()` confirms the checked-out file already holds exactly that
 /// object — then the driver is handed the worktree path itself, with the pair's own
-/// mode rather than the index entry's. Gitlinks never take that branch.
+/// mode rather than the index entry's, unless `lstat()` finds no file there (the
+/// `/dev/null` triple again) or a symlink (a temporary file holding its target).
+/// Gitlinks never take that branch.
 #[allow(clippy::too_many_arguments)]
 fn prepare_temp_file(
     repo: &gix::Repository,
@@ -3509,15 +3511,55 @@ fn prepare_temp_file(
 ) -> std::result::Result<TempSide, String> {
     use std::os::unix::ffi::OsStrExt;
 
+    // `not_a_valid_file:` — "A '-' entry produces this for file-2, and a '+'
+    // entry produces this for file-1."
+    let not_a_valid_file = || TempSide {
+        dir: None,
+        name: std::ffi::OsString::from("/dev/null"),
+        hex: ".".to_string(),
+        mode: ".".to_string(),
+    };
     if !valid {
-        return Ok(TempSide {
-            dir: None,
-            name: std::ffi::OsString::from("/dev/null"),
-            hex: ".".to_string(),
-            mode: ".".to_string(),
-        });
+        return Ok(not_a_valid_file());
     }
     if !is_gitlink_mode(mode) && (!oid_valid || ctx.reuse_worktree_file(repo, path, id)) {
+        // `lstat(one->path)`: a side that names no file after all — range-diff's
+        // synthetic `a`/`b` pair, whose worktree need not hold either — is the
+        // `/dev/null` triple, and a symlink is handed over as a temporary file
+        // holding its target, named by the null id and `S_IFLNK` unless the side
+        // has an object of its own (diff.c:4714-4733).
+        let fs_path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+        let meta = match std::fs::symlink_metadata(fs_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(not_a_valid_file()),
+            Err(e) => return Err(format!("stat({}): {}", path, io_reason(&e))),
+        };
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(fs_path)
+                .map_err(|e| format!("readlink({}): {}", path, io_reason(&e)))?;
+            let (hex, link_mode) = match oid_valid {
+                true => (id.to_hex().to_string(), mode),
+                false => (id.kind().null().to_hex().to_string(), 0o120000),
+            };
+            let dir = super::cat_file::temp_blob_dir().map_err(|e| e.to_string())?;
+            let file = match drivers.borrow_mut().prep_temp_blob(
+                &dir,
+                path.as_bstr(),
+                target.as_os_str().as_bytes(),
+            ) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(format!("unable to write temp-file: {e}"));
+                }
+            };
+            return Ok(TempSide {
+                dir: Some(dir),
+                name: file.into_os_string(),
+                hex,
+                mode: format!("{link_mode:06o}"),
+            });
+        }
         return Ok(TempSide {
             dir: None,
             name: std::ffi::OsStr::from_bytes(path).to_os_string(),

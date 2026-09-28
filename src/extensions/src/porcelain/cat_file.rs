@@ -1065,26 +1065,18 @@ pub(crate) fn diff_driver_config(
     winner
 }
 
-/// `mks_tempfile_ts()`'s directory: a fresh `git-blob-XXXXXX` under `TMPDIR`, so
-/// the blob can keep its own basename inside it.
+/// `mks_tempfile_dt("git-blob-XXXXXX", base)`'s directory (tempfile.c:205-230),
+/// which `prep_temp_blob()` (diff.c:4680) creates so the blob can keep its own
+/// basename inside it. The parent is `$TMPDIR` exactly as the environment spells
+/// it — joined with a literal `/`, so a `TMPDIR` ending in a slash yields the
+/// `…//git-blob-…` a driver sees from stock git — and `/tmp` when it is unset.
+/// A failure is `die_errno("unable to create temp-file")`.
 pub(crate) fn temp_blob_dir() -> Result<std::path::PathBuf> {
-    let base = std::env::temp_dir();
-    for attempt in 0..64u32 {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        let dir = base.join(format!(
-            "git-blob-{:06x}",
-            (std::process::id() ^ stamp ^ attempt) & 0xff_ffff
-        ));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    crate::git_fatal!("could not create a temporary directory in {}", base.display())
+    let mut template = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
+    template.push("/git-blob-XXXXXX");
+    crate::tmp_objdir::git_mkdtemp(&template).map_err(|e| {
+        crate::fatal::die(format!("unable to create temp-file: {}", super::diff_pairs::io_reason(&e)))
+    })
 }
 
 /// `git cat-file --textconv (<rev>:<path> | --path=<path> <rev>)`: emit the object

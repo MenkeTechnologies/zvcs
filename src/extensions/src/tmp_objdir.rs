@@ -196,40 +196,49 @@ fn write_alternates(root: &Path, alternate: &Path) -> Result<()> {
 /// (tmp-objdir.c:149-153), so a repository this port crashed in is cleanable by
 /// stock git.
 fn mkdtemp(objects: &Path, prefix: &str) -> Result<PathBuf> {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let template = objects.join(format!("tmp_objdir-{prefix}-XXXXXX"));
+    git_mkdtemp(template.as_os_str()).with_context(|| {
+        format!("creating temporary object directory under {}", objects.display())
+    })
+}
+
+/// `mkdtemp(3)` as git calls it (`git_mkdstemps_mode()`, wrapper.c:434-495): the
+/// trailing `XXXXXX` of `template` becomes six characters of
+/// `[a-zA-Z0-9]`, retried on `EEXIST` up to `TMP_MAX` times, and the directory is
+/// created mode 0700. Any other error ends the search at once.
+pub(crate) fn git_mkdtemp(template: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::DirBuilderExt;
+    const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const TMP_MAX: u32 = 16384;
+    let pattern = template.as_bytes();
+    let stem = pattern.strip_suffix(b"XXXXXX").ok_or_else(|| {
+        std::io::Error::from_raw_os_error(22) // EINVAL
+    })?;
     let mut seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-        ^ (u64::from(std::process::id()) << 32);
-    let mut last = None;
-    // `mkdtemp` itself retries a bounded number of times before reporting EEXIST.
-    for _ in 0..256 {
-        let mut suffix = String::with_capacity(6);
+        ^ (u64::from(std::process::id()) << 32)
+        | 1;
+    for _ in 0..TMP_MAX {
+        let mut name = stem.to_vec();
+        // xorshift64 stands in for `csprng_bytes()`: a name generator, not a
+        // security primitive, and `O_EXCL`-style creation is what makes it safe.
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mut v = seed;
         for _ in 0..6 {
-            // xorshift64: a name generator, not a security primitive — the same role
-            // `mkdtemp`'s own counter plays.
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            suffix.push(ALPHABET[(seed % ALPHABET.len() as u64) as usize] as char);
+            name.push(LETTERS[(v % LETTERS.len() as u64) as usize]);
+            v /= LETTERS.len() as u64;
         }
-        let candidate = objects.join(format!("tmp_objdir-{prefix}-{suffix}"));
-        match std::fs::create_dir(&candidate) {
-            Ok(()) => return Ok(candidate),
+        let path = PathBuf::from(std::ffi::OsString::from_vec(name));
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                last = Some((candidate, e));
-                break;
-            }
+            Err(e) => return Err(e),
         }
     }
-    match last {
-        Some((path, e)) => Err(anyhow::Error::new(e)
-            .context(format!("creating temporary object directory {}", path.display()))),
-        None => anyhow::bail!(
-            "unable to create temporary object directory under {}",
-            objects.display()
-        ),
-    }
+    Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
 }

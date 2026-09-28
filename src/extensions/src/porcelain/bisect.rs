@@ -89,15 +89,19 @@
 //! because `sq_dequote_to_strvec()` is handed the untrimmed leading space.
 //!
 //! Honest limitations — each bails with a precise message rather than guessing:
-//!   * `skip <a>..<b>`: upstream expands the range with a revision walk in the
-//!     same process as the step that follows, and the `UNINTERESTING` flags it
-//!     leaves behind shrink that step's candidate set — measurably: against git
-//!     2.55.0 on a 15-commit history bisected `c15`/`c1`, `skip c6..c9` answers
-//!     `Bisecting: 3 revisions left … c11` while `skip c9 c8 c7` — the same three
-//!     commits, the same refs, the same log — answers `Bisecting: 6 revisions
-//!     left … c12`. Reproducing it needs `limit_list()`'s `SLOP` walk and git's
-//!     object-flag lifetime across walks rather than its skip algorithm, so the
-//!     range form is refused and the individual revisions are not.
+//!   * `skip <a>..<b>` is expanded with a revision walk in the same process as
+//!     the step that follows, and the `UNINTERESTING` flags it leaves behind
+//!     shrink that step's candidate set: on a 15-commit history sharing one
+//!     timestamp, bisected `c15`/`c1`, `skip c6..c9` answers `Bisecting: 4
+//!     revisions left … c10` where `skip c7 c8 c9` answers `6 revisions left …
+//!     c4`. [`ObjectFlags`] ports the flags' lifetime — `limit_list()`, the
+//!     parse state, `reset_revision_walk()` and `check_ancestors()`'s cleanup —
+//!     and both walks of that step run on it. Two cases are refused before
+//!     anything is written, because a merge-base computation runs in between and
+//!     the commits `paint_down_to_common()` parses decide how far a later mark
+//!     spreads: `<a>...<b>`, and a step where some good is not an ancestor of the
+//!     bad end and every merge base is already good. A pathspec with a merge in
+//!     the walk is refused too (`try_to_simplify_commit()` rewrites its parents).
 //!   * `check_ancestors()` is `revs.commits != NULL` after that same
 //!     `limit_list()`, so on a history whose commits share a timestamp its answer
 //!     turns on `prio_queue`'s tie order. This port asks the equivalent question
@@ -523,41 +527,51 @@ fn skip_cmd(args: &[String]) -> Result<ExitCode> {
 /// can drive it the way `bisect_run()` drives `bisect_state("skip")`.
 fn bisect_skip(args: &[String]) -> Result<u8> {
     let ctx = Ctx::open()?;
+
+    // The range form is expanded first, as the C's loop does before
+    // `bisect_state()` is ever called — so a range that does not resolve dies here
+    // even outside a session.
+    let mut flags: Option<ObjectFlags> = None;
+    let mut specs: Vec<String> = Vec::new();
+    for arg in args {
+        let Some(dotdot) = arg.find("..") else {
+            specs.push(arg.clone());
+            continue;
+        };
+        // `setup_revisions(2, argv + i - 1, &revs, NULL)`: `handle_dotdot()`
+        // (revision.c:2119-2145), an empty side being `HEAD`.
+        if arg[dotdot + 2..].starts_with('.') {
+            bail!(
+                "`bisect skip <a>...<b>` is not supported: the symmetric difference computes the \
+                 merge bases in the same process, and the commits that computation parses decide \
+                 how far the walk's leftover flags spread; skip the revisions individually instead"
+            );
+        }
+        let side = |s: &str| if s.is_empty() { "HEAD".to_string() } else { s.to_string() };
+        let (a_name, b_name) = (side(&arg[..dotdot]), side(&arg[dotdot + 2..]));
+        let model = flags.get_or_insert_with(ObjectFlags::default);
+        let (a, b) = (range_end(&ctx.repo, model, &a_name)?, range_end(&ctx.repo, model, &b_name)?);
+        let (Some(a), Some(b)) = (a, b) else {
+            // Not a range, so `verify_filename()` decides whether it is a path.
+            match crate::setup::verify_filename(arg, true) {
+                Some(msg) => {
+                    eprintln!("fatal: {msg}");
+                    return Ok(128);
+                }
+                None => bail!("`bisect skip {arg}`: a path in place of a range is not supported"),
+            }
+        };
+        for commit in model.expand_range(&ctx.repo, a, b)? {
+            specs.push(commit.to_hex().to_string());
+        }
+    }
+
     // `bisect_state()`'s first act, and the reason an unstarted session fails
     // here rather than at the revision parsing below.
     if !autostart(&ctx) {
         return Ok(BISECT_FAILED);
     }
     let terms = current_terms(&ctx)?;
-
-    let mut specs: Vec<String> = Vec::new();
-    for arg in args {
-        // The range form is refused rather than approximated. `bisect_skip()`
-        // expands it with a `setup_revisions()`/`get_revision()` walk *in the
-        // same process* as the bisection that follows, and the object flags that
-        // walk leaves behind (`UNINTERESTING` on the excluded endpoint and as
-        // much of its ancestry as `still_interesting()`'s slop reached) are not
-        // cleared before `bisect_next_all()` runs — so the commits it then
-        // considers are fewer than the marked state alone implies.
-        //
-        // Measured against git 2.55.0 on a 15-commit history bisected `c15`/`c1`:
-        // `git bisect skip c6..c9` reports `Bisecting: 4 revisions left … c10`
-        // while `git bisect skip c7 c8 c9` — the same three commits, the same
-        // refs, the same log — reports `Bisecting: 6 revisions left … c4`. The
-        // outcome is therefore not a function of the skip set, and reproducing
-        // it needs git's in-process flag lifetime rather than its skip
-        // algorithm, which is ported in full below.
-        if arg.contains("..") {
-            bail!(
-                "`bisect skip <a>..<b>` is not supported: upstream expands the range with a \
-                 revision walk whose leftover `UNINTERESTING` flags then shrink the candidate \
-                 set of the bisection step, so the same skip set reached through a range and \
-                 through explicit revisions picks different commits; skip the revisions \
-                 individually instead"
-            );
-        }
-        specs.push(arg.clone());
-    }
     let no_checkout = ctx.file("BISECT_HEAD").exists();
     if specs.is_empty() {
         // `get_oid("BISECT_HEAD")`, falling back to `HEAD` when that ref is
@@ -576,9 +590,19 @@ fn bisect_skip(args: &[String]) -> Result<u8> {
                 return Ok(BISECT_FAILED);
             }
         }
+        // `lookup_commit_reference()` parses what it resolves, and the navigation
+        // on the way there parses more.
+        if let Some(model) = flags.as_mut() {
+            range_end(&ctx.repo, model, spec)?;
+            model.parse(&ctx.repo, *ids.last().expect("just pushed"))?;
+        }
     }
 
     let mut verify_expected = read_ref(&ctx.file("BISECT_EXPECTED_REV"))?;
+    if let Some(model) = flags.as_ref() {
+        let loses_ancestors_ok = verify_expected.is_some_and(|expected| ids.iter().any(|id| *id != expected));
+        refuse_unmodelled_step(&ctx, &terms, model.clone(), loses_ancestors_ok)?;
+    }
     for id in &ids {
         // `bisect_skip()` resolves each operand and hands `oid_to_hex(&oid)` to
         // `bisect_write()`, so the ref and the log line name the hex — unlike `replay`,
@@ -595,7 +619,119 @@ fn bisect_skip(args: &[String]) -> Result<u8> {
         }
     }
 
-    auto_next(&ctx, &terms, no_checkout)
+    if let Ok(mut slot) = LEFTOVER_FLAGS.lock() {
+        *slot = flags;
+    }
+    let res = auto_next(&ctx, &terms, no_checkout);
+    if let Ok(mut slot) = LEFTOVER_FLAGS.lock() {
+        *slot = None;
+    }
+    res
+}
+
+/// One side of `<a>..<b>` as `get_oid_with_context()` resolves it, recording the
+/// commits the resolution parses: `get_nth_ancestor()` parses every commit it
+/// steps through and `get_parent()` the one it starts from (object-name.c), and
+/// either parse can later carry an `UNINTERESTING` mark further. `None` is a name
+/// that does not resolve.
+fn range_end(repo: &gix::Repository, model: &mut ObjectFlags, spec: &str) -> Result<Option<ObjectId>> {
+    let Some(resolved) = get_oid(repo, spec) else {
+        return Ok(None);
+    };
+    let split = spec.find(['~', '^']).unwrap_or(spec.len());
+    let (base, mut suffix) = spec.split_at(split);
+    if base.starts_with(':') {
+        bail!("`bisect skip {spec}`: the commits this revision syntax parses are not modelled");
+    }
+    let Some(mut current) = get_oid(repo, base) else {
+        return Ok(Some(resolved));
+    };
+    // `lookup_commit_reference()`: the tags on the way, then the commit.
+    let commit_reference = |model: &mut ObjectFlags, id: ObjectId| -> Result<ObjectId> {
+        model.parse(repo, id)?;
+        let commit = peel_to_commit(repo, id);
+        model.parse(repo, commit)?;
+        Ok(commit)
+    };
+    while let Some(op) = suffix.chars().next() {
+        suffix = &suffix[1..];
+        if op == '^' && suffix.starts_with('{') {
+            let Some(end) = suffix.find('}') else { break };
+            if suffix[1..end].starts_with('/') {
+                bail!("`bisect skip {spec}`: the commits this revision syntax parses are not modelled");
+            }
+            suffix = &suffix[end + 1..];
+            current = commit_reference(model, current)?;
+            continue;
+        }
+        let digits: String = suffix.chars().take_while(char::is_ascii_digit).collect();
+        suffix = &suffix[digits.len()..];
+        let n: usize = if digits.is_empty() { 1 } else { digits.parse().unwrap_or(usize::MAX) };
+        let mut commit = commit_reference(model, current)?;
+        match op {
+            // `get_nth_ancestor()`.
+            '~' => {
+                for _ in 0..n {
+                    model.parse(repo, commit)?;
+                    let Some(first) = model.parents(commit).first().copied() else { break };
+                    commit = first;
+                }
+            }
+            // `get_parent()`: `^0` is the commit itself.
+            _ => {
+                if n > 0 {
+                    let Some(parent) = model.parents(commit).get(n - 1).copied() else { break };
+                    commit = parent;
+                }
+            }
+        }
+        current = commit;
+    }
+    Ok(Some(resolved))
+}
+
+/// Refuse, before anything is written, a `skip <a>..<b>` whose step the flag model
+/// cannot follow faithfully.
+///
+/// * When `check_ancestors()` finds a good that is not an ancestor, the merge bases
+///   are computed in the same process, and `paint_down_to_common()` parses commits
+///   whose parsed state then decides how far a later `UNINTERESTING` mark spreads.
+///   Only when every merge base is already good does the step go on to the walk.
+/// * With a pathspec, `try_to_simplify_commit()` rewrites a merge's parents during
+///   the bisection walk itself.
+fn refuse_unmodelled_step(ctx: &Ctx, terms: &Terms, mut model: ObjectFlags, loses_ancestors_ok: bool) -> Result<()> {
+    let Some(bad) = ctx.bad(terms)? else { return Ok(()) };
+    let goods = ctx.goods(terms)?;
+    if goods.is_empty() {
+        return Ok(());
+    }
+    let ancestors_ok = ctx.file("BISECT_ANCESTORS_OK").exists() && !loses_ancestors_ok;
+    if !ancestors_ok && model.check_ancestors(&ctx.repo, bad, &goods)? {
+        let peeled: Vec<ObjectId> = goods.iter().map(|g| peel_to_commit(&ctx.repo, *g)).collect();
+        let bases = ctx.repo.merge_bases_many(peel_to_commit(&ctx.repo, bad), &peeled)?;
+        if bases.iter().all(|mb| goods.contains(&mb.detach())) {
+            bail!(
+                "`bisect skip <a>..<b>` is not supported here: a good commit is not an ancestor \
+                 of the bad one, and the merge-base computation that follows parses commits \
+                 whose parsed state decides how far the range walk's leftover flags spread; \
+                 skip the revisions individually instead"
+            );
+        }
+        return Ok(());
+    }
+    if !bisect_paths(ctx)?.is_empty() {
+        let mut tips = vec![(bad, 0)];
+        tips.extend(goods.iter().map(|&g| (g, F_UNINTERESTING | F_BOTTOM)));
+        let walked = model.limit_list(&ctx.repo, &tips, ctx.first_parent_only())?;
+        if walked.iter().any(|c| model.parents(*c).len() > 1) {
+            bail!(
+                "`bisect skip <a>..<b>` is not supported here: with a pathspec the bisection \
+                 walk rewrites merge parents while the range walk's leftover flags are in \
+                 place, which is not modelled; skip the revisions individually instead"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `bisect_write("skip", …)`: the `refs/bisect/skip-<oid>` ref plus the two
@@ -2364,15 +2500,31 @@ fn take_step(
     // `check_ancestors()` is the only walk that runs before the bisection's own,
     // and whether it ran decides what the bisection sees — see
     // [`bad_ref_leaks_uninteresting`].
+    //
+    // A `bisect skip <a>..<b>` in this same invocation left flags behind; with
+    // them both walks run on the process's object flags, as in the C.
+    let mut leftover = LEFTOVER_FLAGS.lock().ok().and_then(|mut slot| slot.take());
     let mut ancestors_walked = false;
-    if let Some(code) =
-        check_good_are_ancestors_of_bad(ctx, bad, &goods, terms, no_checkout, &mut ancestors_walked)?
-    {
+    if let Some(code) = check_good_are_ancestors_of_bad(
+        ctx,
+        bad,
+        &goods,
+        terms,
+        no_checkout,
+        &mut ancestors_walked,
+        leftover.as_mut(),
+    )? {
         return Ok(code);
     }
 
     let first_parent = ctx.first_parent_only();
-    let candidates = candidate_list(ctx, bad, &goods, first_parent)?;
+    let candidates = match leftover.as_mut() {
+        Some(flags) => {
+            let list = flags.bisection_list(&ctx.repo, bad, &goods, first_parent)?;
+            candidates_from(ctx, list, first_parent)?
+        }
+        None => candidate_list(ctx, bad, &goods, first_parent)?,
+    };
     // git's `all`: with a pathspec this counts only the commits that touched it.
     let n = candidates.all;
     // `if (skipped_revs.nr) bisect_flags |= FIND_BISECTION_ALL` (bisect.c:1038):
@@ -2548,12 +2700,17 @@ fn check_good_are_ancestors_of_bad(
     terms: &Terms,
     no_checkout: bool,
     walked: &mut bool,
+    leftover: Option<&mut ObjectFlags>,
 ) -> Result<Option<u8>> {
     if ctx.file("BISECT_ANCESTORS_OK").exists() || goods.is_empty() {
         return Ok(None);
     }
     *walked = true;
-    if check_ancestors(ctx, bad, goods)? {
+    let not_ancestors = match leftover {
+        Some(flags) => flags.check_ancestors(&ctx.repo, bad, goods)?,
+        None => check_ancestors(ctx, bad, goods)?,
+    };
+    if not_ancestors {
         if let Some(code) = check_merge_bases(ctx, bad, goods, terms, no_checkout)? {
             return Ok(Some(code));
         }
@@ -2743,7 +2900,11 @@ fn candidate_list(
     // An empty list is not an error: `bisect_next_all()` runs `find_bisection()` over it,
     // gets nothing back and reports `<oid> was both '<good>' and '<bad>'`
     // (bisect.c:1085-1099). That is the case `git bisect start <c> <c>` lands in.
+    candidates_from(ctx, list, first_parent)
+}
 
+/// The `TREESAME` half of [`candidate_list`], over a `revs.commits` already walked.
+fn candidates_from(ctx: &Ctx, list: Vec<ObjectId>, first_parent: bool) -> Result<Candidates> {
     let paths = bisect_paths(ctx)?;
     let mut treesame = vec![false; list.len()];
     let mut pruned: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -2776,6 +2937,285 @@ fn candidate_list(
     }
     let all = treesame.iter().filter(|same| !**same).count();
     Ok(Candidates { list, treesame, pruned, all })
+}
+
+// ---------------------------------------------------------------------------
+// Object flags that outlive a revision walk
+// ---------------------------------------------------------------------------
+//
+// `bisect_skip()` (builtin/bisect.c:1111-1146) expands `<a>..<b>` with a whole
+// revision walk and then calls `bisect_state()` — and through it
+// `bisect_next_all()` — in the same process. The flags a walk leaves on
+// `struct object` are process state: `reset_revision_walk()` (revision.c:3678-3682)
+// clears only `SEEN | ADDED | SHOWN` and the topo bits, so the `UNINTERESTING`
+// that `<a>` and as much of its ancestry as `limit_list()` reached picked up is
+// still there when `check_ancestors()` and the bisection walk run. Which commits
+// carry it, and which of them the `clear_commit_marks_many()` at bisect.c:903
+// reaches, turns on `limit_list()`'s date-ordered queue, its `SLOP` and on which
+// commits happen to have been parsed — so it is ported here as the C has it
+// rather than derived from reachability.
+
+/// `revision.h`'s bits, the ones these walks set.
+const F_SEEN: u32 = 1 << 0;
+const F_UNINTERESTING: u32 = 1 << 1;
+const F_SHOWN: u32 = 1 << 3;
+const F_ADDED: u32 = 1 << 7;
+const F_BOTTOM: u32 = 1 << 10;
+const F_NOT_USER_GIVEN: u32 = 1 << 25;
+const F_CHILD_VISITED: u32 = 1 << 28;
+/// `ALL_REV_FLAGS`, as far as these walks can set it.
+const F_ALL_REV: u32 =
+    F_SEEN | F_UNINTERESTING | F_SHOWN | F_ADDED | F_BOTTOM | F_NOT_USER_GIVEN | F_CHILD_VISITED;
+/// `limit_list()`'s `SLOP` (revision.c).
+const SLOP: i32 = 5;
+
+/// The process's parsed objects: each object's flags, and for a parsed commit its
+/// parents and committer date (`commit->parents`, `commit->date`).
+#[derive(Clone, Default)]
+struct ObjectFlags {
+    flags: HashMap<ObjectId, u32>,
+    commits: HashMap<ObjectId, (Vec<ObjectId>, i64)>,
+    /// Tag objects parsed so far, with the object each one names.
+    tags: HashMap<ObjectId, ObjectId>,
+}
+
+/// The flags a `bisect skip <a>..<b>` walk left behind, for the bisection step the
+/// same invocation takes.
+static LEFTOVER_FLAGS: std::sync::Mutex<Option<ObjectFlags>> = std::sync::Mutex::new(None);
+
+impl ObjectFlags {
+    fn get(&self, id: ObjectId) -> u32 {
+        self.flags.get(&id).copied().unwrap_or(0)
+    }
+
+    fn set(&mut self, id: ObjectId, bits: u32) {
+        *self.flags.entry(id).or_insert(0) |= bits;
+    }
+
+    /// `parse_object()` / `repo_parse_commit()`: a commit learns its parents and
+    /// date, a tag the object it names. Parsing twice is a no-op.
+    fn parse(&mut self, repo: &gix::Repository, id: ObjectId) -> Result<()> {
+        if self.commits.contains_key(&id) || self.tags.contains_key(&id) {
+            return Ok(());
+        }
+        let object = repo.find_object(id)?;
+        match object.kind {
+            gix::object::Kind::Commit => {
+                let commit = object.into_commit();
+                let parents = commit.parent_ids().map(|p| p.detach()).collect();
+                let date = commit.committer()?.seconds();
+                self.commits.insert(id, (parents, date));
+            }
+            gix::object::Kind::Tag => {
+                let target = object.into_tag().target_id()?.detach();
+                self.tags.insert(id, target);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn parents(&self, id: ObjectId) -> Vec<ObjectId> {
+        self.commits.get(&id).map(|(p, _)| p.clone()).unwrap_or_default()
+    }
+
+    fn date(&self, id: ObjectId) -> i64 {
+        self.commits.get(&id).map_or(0, |(_, d)| *d)
+    }
+
+    /// `mark_parents_uninteresting()` (revision.c:253-293): the parents, and on
+    /// through every parsed ancestor not already `UNINTERESTING`.
+    fn mark_parents_uninteresting(&mut self, id: ObjectId) {
+        let mut pending: Vec<ObjectId> = self.parents(id);
+        pending.reverse();
+        while let Some(commit) = pending.pop() {
+            if self.get(commit) & F_UNINTERESTING != 0 {
+                continue;
+            }
+            self.set(commit, F_UNINTERESTING);
+            let mut parents = self.parents(commit);
+            parents.reverse();
+            pending.extend(parents);
+        }
+    }
+
+    /// `setup_revisions()` + `prepare_revision_walk()` + `limit_list()` for tips
+    /// given as `(object, flags)` in command-line order: `revs.commits` as
+    /// `limit_list()` leaves it, before anything filters it by flag.
+    fn limit_list(
+        &mut self,
+        repo: &gix::Repository,
+        tips: &[(ObjectId, u32)],
+        first_parent: bool,
+    ) -> Result<Vec<ObjectId>> {
+        // `get_reference()`: parse the named object and give it the argument's flags.
+        for &(id, bits) in tips {
+            self.parse(repo, id)?;
+            self.set(id, bits);
+        }
+        // `prepare_revision_walk()` hands each pending entry to `handle_commit()`
+        // (revision.c:381-437), which peels a tag and copies *its* flags onto what
+        // it names, and marks an uninteresting tip's parents.
+        let mut list: Vec<ObjectId> = Vec::new();
+        for &(tip, _) in tips {
+            let flags = self.get(tip);
+            let mut object = tip;
+            while let Some(&target) = self.tags.get(&object) {
+                self.parse(repo, target)?;
+                self.set(target, flags);
+                object = target;
+            }
+            if !self.commits.contains_key(&object) {
+                continue;
+            }
+            if flags & F_UNINTERESTING != 0 {
+                self.mark_parents_uninteresting(object);
+            }
+            if self.get(object) & F_SEEN == 0 {
+                self.set(object, F_SEEN);
+                list.push(object);
+            }
+        }
+        // `commit_list_sort_by_date()`, a stable merge sort, newest first.
+        list.sort_by_key(|id| std::cmp::Reverse(self.date(*id)));
+
+        // `limit_list()` (revision.c:1438-1504) over a `prio_queue` ordered by
+        // `compare_commits_by_commit_date`, ties in insertion order.
+        let mut queue: std::collections::BinaryHeap<(i64, std::cmp::Reverse<u64>, ObjectId)> =
+            std::collections::BinaryHeap::new();
+        let mut ctr = 0u64;
+        let mut put = |queue: &mut std::collections::BinaryHeap<_>, date: i64, id: ObjectId| {
+            queue.push((date, std::cmp::Reverse(ctr), id));
+            ctr += 1;
+        };
+        for id in list {
+            put(&mut queue, self.date(id), id);
+        }
+        let mut slop = SLOP;
+        let mut date = i64::MAX;
+        let mut newlist = Vec::new();
+        while let Some((_, _, commit)) = queue.pop() {
+            // `process_parents()` (revision.c:1118-1216).
+            if self.get(commit) & F_ADDED == 0 {
+                self.set(commit, F_ADDED);
+                let uninteresting = self.get(commit) & F_UNINTERESTING != 0;
+                for parent in self.parents(commit) {
+                    self.set(parent, if uninteresting { F_UNINTERESTING | F_CHILD_VISITED } else { F_CHILD_VISITED });
+                    self.parse(repo, parent)?;
+                    if uninteresting && !self.parents(parent).is_empty() {
+                        self.mark_parents_uninteresting(parent);
+                    }
+                    if self.get(parent) & F_SEEN == 0 {
+                        self.set(parent, F_SEEN | F_NOT_USER_GIVEN);
+                        put(&mut queue, self.date(parent), parent);
+                    }
+                    if first_parent && !uninteresting {
+                        break;
+                    }
+                }
+            }
+            if self.get(commit) & F_UNINTERESTING != 0 {
+                self.mark_parents_uninteresting(commit);
+                // `still_interesting()` (revision.c:1298-1319).
+                slop = match queue.peek() {
+                    None => 0,
+                    Some(&(next, _, _)) if date <= next => SLOP,
+                    Some(_) if queue.iter().any(|(_, _, id)| self.get(*id) & F_UNINTERESTING == 0) => SLOP,
+                    Some(_) => slop - 1,
+                };
+                if slop > 0 {
+                    continue;
+                }
+                break;
+            }
+            date = self.date(commit);
+            newlist.push(commit);
+        }
+        Ok(newlist)
+    }
+
+    /// `reset_revision_walk()` (revision.c:3678-3682).
+    fn reset_revision_walk(&mut self) {
+        for bits in self.flags.values_mut() {
+            *bits &= !(F_SEEN | F_ADDED | F_SHOWN);
+        }
+    }
+
+    /// `clear_commit_marks_many()` (commit.c): from each commit down its parsed
+    /// ancestry for as long as the commits it meets still carry one of the flags.
+    fn clear_commit_marks_many(&mut self, commits: &[ObjectId], mark: u32) {
+        let mut list: Vec<ObjectId> = Vec::new();
+        let clear_one = |this: &mut Self, list: &mut Vec<ObjectId>, mut commit: ObjectId| loop {
+            if this.get(commit) & mark == 0 {
+                return;
+            }
+            *this.flags.entry(commit).or_insert(0) &= !mark;
+            let parents = this.parents(commit);
+            let Some((first, rest)) = parents.split_first() else { return };
+            for p in rest {
+                if this.get(*p) & mark != 0 {
+                    list.push(*p);
+                }
+            }
+            commit = *first;
+        };
+        for &commit in commits {
+            clear_one(self, &mut list, commit);
+        }
+        while let Some(commit) = list.pop() {
+            clear_one(self, &mut list, commit);
+        }
+    }
+
+    /// `bisect_skip()`'s expansion of one `<a>..<b>`: `setup_revisions()` over the
+    /// pair, every commit `get_revision()` returns, then `reset_revision_walk()`.
+    fn expand_range(&mut self, repo: &gix::Repository, a: ObjectId, b: ObjectId) -> Result<Vec<ObjectId>> {
+        // `handle_dotdot_1()` (revision.c:2050-2116): `a` excluded, `b` included,
+        // in that order.
+        let newlist = self.limit_list(repo, &[(a, F_UNINTERESTING | F_BOTTOM), (b, 0)], false)?;
+        // `get_revision()`: `get_commit_action()` drops what ended up uninteresting.
+        let mut out = Vec::new();
+        for commit in newlist {
+            if self.get(commit) & (F_UNINTERESTING | F_SHOWN) == 0 {
+                self.set(commit, F_SHOWN);
+                out.push(commit);
+            }
+        }
+        self.reset_revision_walk();
+        Ok(out)
+    }
+
+    /// `check_ancestors()` (bisect.c:890-908): `^<bad> <good>…`, whether anything
+    /// came out, and the cleanup that follows it.
+    fn check_ancestors(&mut self, repo: &gix::Repository, bad: ObjectId, goods: &[ObjectId]) -> Result<bool> {
+        // `get_bad_and_good_commits()`: `lookup_commit_reference()` of each ref.
+        let mut rev = Vec::with_capacity(goods.len() + 1);
+        for &id in std::iter::once(&bad).chain(goods) {
+            let commit = peel_to_commit(repo, id);
+            self.parse(repo, commit)?;
+            rev.push(commit);
+        }
+        let mut tips = vec![(bad, F_UNINTERESTING | F_BOTTOM)];
+        tips.extend(goods.iter().map(|&g| (g, 0)));
+        let res = !self.limit_list(repo, &tips, false)?.is_empty();
+        self.clear_commit_marks_many(&rev, F_ALL_REV);
+        Ok(res)
+    }
+
+    /// `bisect_next_all()`'s own walk, `<bad> ^<good>…` (bisect.c:1075-1082), and
+    /// the `UNINTERESTING` filter `find_bisection()` opens with.
+    fn bisection_list(
+        &mut self,
+        repo: &gix::Repository,
+        bad: ObjectId,
+        goods: &[ObjectId],
+        first_parent: bool,
+    ) -> Result<Vec<ObjectId>> {
+        let mut tips = vec![(bad, 0)];
+        tips.extend(goods.iter().map(|&g| (g, F_UNINTERESTING | F_BOTTOM)));
+        let newlist = self.limit_list(repo, &tips, first_parent)?;
+        Ok(newlist.into_iter().filter(|c| self.get(*c) & F_UNINTERESTING == 0).collect())
+    }
 }
 
 /// `read_bisect_paths()` (bisect.c:492-507): the pathspec `bisect start` sq-quoted into

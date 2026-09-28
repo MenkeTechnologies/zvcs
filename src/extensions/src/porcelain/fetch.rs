@@ -4115,10 +4115,20 @@ fn fetch_one(
         // `--porcelain`'s two id columns: a ref that did not exist before shows
         // the null id on the left, and one that stayed put repeats its own id on
         // both sides (git prints `<old-object-id> <new-object-id>` either way).
+        // A refused update wrote nothing, so its left column is the value the
+        // local ref still holds — `ref->old_oid`, not the remote's.
         let (porcelain_old, porcelain_new) = match &update.mode {
             Mode::New => (null, remote_id.unwrap_or(null)),
             _ => (
-                old_id.or(remote_id).unwrap_or(null),
+                old_id
+                    .or_else(|| {
+                        repo.try_find_reference(local_full.as_ref())
+                            .ok()
+                            .flatten()
+                            .and_then(|r| r.target().try_id().map(ToOwned::to_owned))
+                    })
+                    .or(remote_id)
+                    .unwrap_or(null),
                 new_id.or(remote_id).unwrap_or(null),
             ),
         };

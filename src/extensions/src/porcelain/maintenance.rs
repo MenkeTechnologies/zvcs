@@ -71,6 +71,9 @@
 //! `run` is a task driver, and this port runs the tasks that have a home in the
 //! tree â see [`run_tasks`] for the task set, the ordering, and the two tasks
 //! that are deliberately no-ops.
+//! Like git it holds `<objdir>/maintenance.lock` for the run, runs every task's
+//! foreground half, daemonizes under `--detach`, and runs the background halves
+//! in the daemon.
 //!
 //! `run`'s quiet flag starts at `!isatty(2)`, not at `false`: `maintenance_run()`
 //! opens with `opts.quiet = !isatty(2);` and `--quiet`/`--no-quiet` only move it
@@ -357,11 +360,12 @@ const REPO_KEY: &str = "maintenance.repo";
 ///     the run detaches. `GIT_TEST_MAINT_AUTO_DETACH=0` turns that default off,
 ///     which is what makes the behaviour testable at all.
 ///
-/// git builds `maintenance run --auto --[no-]quiet --[no-]detach` and lets the
-/// child daemonize itself; here the detached form is a child process with its
-/// standard streams on `/dev/null` â the state `daemonize()` leaves them in â
-/// that the caller does not wait for. Either way the caller never sees the
-/// child's output, and its own exit code is unaffected.
+/// git builds `maintenance run --auto --[no-]quiet --[no-]detach` and waits for
+/// it with `run_command()`, standard streams inherited (run-command.c:1987-1993):
+/// the child reads its configuration and runs its foreground tasks where the
+/// caller can see them — a deprecated-key warning, a `pack-refs` failure — and
+/// only then, under `--detach`, daemonizes and returns control. The caller's own
+/// exit code is unaffected either way.
 pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
     let config = repo.config_snapshot();
     let enabled = match config.boolean("maintenance.auto") {
@@ -391,16 +395,8 @@ pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
         .arg(if quiet { "--quiet" } else { "--no-quiet" })
         .arg(if detach { "--detach" } else { "--no-detach" })
         .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()));
-    if detach {
-        child
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        // Not waited for: the child is the daemonized half of git's run.
-        let _ = child.spawn();
-    } else {
-        let _ = child.status();
-    }
+    crate::cstdio::before_spawn();
+    let _ = child.status();
     Ok(())
 }
 
@@ -486,6 +482,7 @@ fn option_name(arg: &str) -> Option<String> {
 /// `git maintenance run` â validate arguments, then run the selected tasks.
 fn run_sub(args: &[String]) -> Result<ExitCode> {
     let mut auto = false;
+    let mut detach: Option<bool> = None;
     // `maintenance_run()` opens with `opts.quiet = !isatty(2);`, so a run whose
     // stderr is not a terminal is quiet before a single option is read. That is
     // what keeps `git maintenance run --task=loose-objects | cat` silent while
@@ -521,9 +518,9 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             // `--no-progress`/`--progress` to `multi-pack-index`.
             "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
-            // `--detach` only changes *when* the same work happens, and this
-            // port runs synchronously.
-            "--detach" | "--no-detach" => {}
+            // `OPT_BOOL(0, "detach", &opts.detach, …)` over `.detach = -1`.
+            "--detach" => detach = Some(true),
+            "--no-detach" => detach = Some(false),
             // git's `--schedule` callback rejects the negated form outright, at
             // the position it appears â before any later option is parsed.
             "--no-schedule" => {
@@ -614,7 +611,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
         None
     };
 
-    run_tasks(&repo, &selected, scheduled, strategy, auto, quiet)
+    run_tasks(&repo, &selected, scheduled, strategy, RunOpts { auto, quiet, detach })
 }
 
 /// Run the selected maintenance tasks in git's order and report the way git's
@@ -628,146 +625,222 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
 /// `maintenance.<task>.enabled` and â for a `--schedule` run â
 /// `maintenance.<task>.schedule`, in [`CONFIG_ORDER`].
 ///
-/// # What the tasks do
+/// # Phases
 ///
-///   * **`pack-refs`** â [`super::pack_refs::pack_refs`] with `--all --prune`,
-///     which is git's own argument list and a real port.
-///   * **`reflog-expire`** â [`super::gc::expire_reflogs`], the same
-///     `reflog expire --all` port `git gc` runs, including the per-pattern
-///     `gc.<pattern>.reflogExpire*` policy and the reachability arm.
-///   * **`geometric-repack`** and **`gc`** â the ported [`super::repack::repack`]
-///     and [`super::gc::gc`], invoked with the exact argument lists git's
-///     `run-command` uses (read off `GIT_TRACE2_PERF=1`, which prints each
-///     child's argv). `repack` writes a valid pack, `.idx` and `.rev`, drops the
-///     packs it supersedes and prunes the loose objects it folded in.
-///
-///     **The pack's bytes differ from git's by design.** `gix-pack` has no delta
-///     compression â its only output mode is `Mode::PackCopyAndBaseObjects`,
-///     "Copy base objects and deltas from packs, while non-packed objects will
-///     be treated as base objects (i.e. without trying to delta compress them)"
-///     (`gix-pack/src/data/output/entry/iter_from_counts.rs:362`) â so every
-///     object is stored undeltified and the pack is larger than git's, sharing
-///     none of its bytes and, since the name embeds the checksum, none of its
-///     name either. What it *is* is a well-formed pack holding the correct
-///     object set. Delta selection is an optimization, not part of the pack's
-///     meaning, so its absence changes the file's size, not its correctness.
-///   * **`rerere-gc`** â [`super::rerere::rerere`], guarded on `rr-cache`
-///     existing so a repository that never recorded a resolution does not enter
-///     the delegate's `read_dir` error path, which git has no equivalent of.
-///
-///   * **`worktree-prune`** â [`super::gc::prune_worktrees`], the same
-///     `worktree prune --expire <gc.worktreePruneExpire>` port `git gc` runs,
-///     with git's `locked` and expiry semantics.
-///
-///   * **`commit-graph`** â [`super::commit_graph::commit_graph`] with
-///     `write --split --reachable`, git's own argument list
-///     (`run_write_commit_graph()`, gc.c).
-///
-///   * **`loose-objects`** â [`prune_packed_task`] then [`pack_loose`], which is
-///     `prune_packed(opts) || pack_loose(opts)` verbatim.
-///
-///   * **`incremental-repack`** â [`incremental_repack`], the
-///     `multi-pack-index write` / `expire` / `repack --batch-size=<n>` sequence.
-///
-///   * **`prefetch`**: [`prefetch`], one `git fetch <remote> --prefetch ...` per
-///     configured remote, which is what `fetch_remote()` spawns.
+/// Every selected task's foreground half runs first, then — under `--detach` —
+/// the process daemonizes, and the background halves run in the daemon; see
+/// [`run_task`] for what each half does.
 fn run_tasks(
     repo: &gix::Repository,
     selected: &[String],
     scheduled: Option<Schedule>,
     strategy: Option<Strategy>,
-    auto: bool,
-    quiet: bool,
+    opts: RunOpts,
 ) -> Result<ExitCode> {
     let order = plan(repo, selected, scheduled, strategy);
 
-    // git reports a failing task on stderr and keeps going, then exits 1 â
+    // `maintenance_run_tasks()` (builtin/gc.c:1785-1828) holds
+    // `<objdir>/maintenance.lock` for the whole run. Another maintenance holding
+    // it is not an error; under `--auto` it is likely a recursive process stack,
+    // so not even a warning.
+    let objdir = repo.objects.store_ref().path().to_path_buf();
+    let lock_path = objdir.join("maintenance.lock");
+    let Ok(_lock) = MaintenanceLock::take(lock_path) else {
+        if !opts.auto && !opts.quiet {
+            let shown = super::prune_packed::display_objdir(repo, &objdir).join("maintenance");
+            eprintln!("warning: lock file '{}' exists, skipping maintenance", shown.display());
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    // git reports a failing task on stderr and keeps going, then exits 1 â
     // `error: task 'incremental-repack' failed` on a repository with no packs,
     // observed on git 2.55.0.
     let mut failed = false;
-    for task in order {
-        // git's `maybe_run_task()`: under `--auto` a task runs only when its own
-        // `auto_condition` says the repository needs it, and a task git's table
-        // leaves without one (`prefetch`) never runs at all.
-        if auto && !auto_condition(repo, task) {
-            continue;
+    let mut run_phase = |phase: Phase| {
+        for &task in &order {
+            // `maybe_run_task()` (builtin/gc.c:1758-1783): a task with nothing
+            // to do in this phase is skipped before its condition is asked, and
+            // under `--auto` a task runs only when its own `auto_condition` says
+            // the repository needs it — asked again in each phase it has work in.
+            if !has_phase(task, phase) {
+                continue;
+            }
+            if opts.auto && !auto_condition(repo, task) {
+                continue;
+            }
+            if !run_task(repo, task, phase, opts) {
+                eprintln!("error: task '{task}' failed");
+                failed = true;
+            }
         }
-        let ok = match task {
-            // `maintenance_task_pack_refs()` forwards `--auto`, so the packing
-            // itself re-applies the same threshold the condition just checked.
-            //
-            // A child, as `maintenance_task_pack_refs()` runs it
-            // (`run_command(&cmd)`, builtin/gc.c): a value `pack-refs` dies on at
-            // ref-store setup or at `packed_refs_lock()` — `core.logAllRefUpdates`,
-            // `core.packedRefsTimeout` — ends that process with 128, which the
-            // task reports as `error: task 'pack-refs' failed` at exit 1. Run in
-            // this process, the same `die()` ended maintenance itself with 128.
-            "pack-refs" => {
-                let mut args = vec!["pack-refs", "--all", "--prune"];
-                if auto {
-                    args.push("--auto");
-                }
-                spawn_git(repo, &args)
-            }
-            "reflog-expire" => super::gc::expire_reflogs(repo).is_ok(),
-            // `maintenance_task_geometric_repack()`: `git repack -d -l
-            // --geometric=<splitFactor> --quiet --write-midx`. The task does not
-            // exist in the vendored v2.39 tree, so the argument list is the one
-            // git 2.55.0 spawns, read off `GIT_TRACE=1`: `run_command: git repack
-            // -d -l --geometric=2 --quiet --write-midx`, and `--geometric=3` with
-            // `maintenance.geometric-repack.splitFactor=3`. There is no `--cruft`
-            // in it — a cruft repack is the `gc` task, and asking for one here
-            // both wrote a `.mtimes` git does not and dropped the packs the
-            // geometric split was supposed to leave alone.
-            "geometric-repack" => {
-                let factor = repo
-                    .config_snapshot()
-                    .integer("maintenance.geometric-repack.splitFactor")
-                    .unwrap_or(2)
-                    .max(0);
-                let geometric = format!("--geometric={factor}");
-                delegate(super::repack::repack(&strings(&[
-                    "repack",
-                    "-d",
-                    "-l",
-                    &geometric,
-                    "--quiet",
-                    "--write-midx",
-                ])))
-            }
-            "gc" => delegate(super::gc::gc(&strings(&["gc"]))),
-            "rerere-gc" => {
-                !repo.git_dir().join("rr-cache").is_dir()
-                    // Unlike `repack` and `gc` above, `rerere()` takes the verb's
-                    // arguments only; a leading "rerere" reads as an unknown
-                    // subcommand and prints the usage block.
-                    || delegate(super::rerere::rerere(&strings(&["gc"])))
-            }
-            "worktree-prune" => super::gc::prune_worktrees(repo).is_ok(),
-            // `run_write_commit_graph()`: git spawns `git commit-graph write
-            // --split --reachable` and reports the task as failed when it fails.
-            "commit-graph" => {
-                spawn_git(repo, &["commit-graph", "write", "--split", "--reachable"])
-            }
-            // `maintenance_task_loose_objects()` is exactly
-            // `prune_packed(opts) || pack_loose(opts)`: the `||` short-circuits,
-            // so a failing `prune-packed` skips the packing and fails the task.
-            "loose-objects" => prune_packed_task(repo, quiet) && pack_loose(repo, quiet),
-            "incremental-repack" => incremental_repack(repo, quiet),
-            "prefetch" => prefetch(repo, quiet),
-            _ => true,
-        };
-        if !ok {
-            eprintln!("error: task '{task}' failed");
-            failed = true;
-        }
+    };
+    run_phase(Phase::Foreground);
+    // "Failure to daemonize is ok, we'll continue in foreground."
+    if opts.detach == Some(true) {
+        let _ = crate::setup::daemonize();
     }
+    run_phase(Phase::Background);
 
     Ok(if failed {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// `maintenance run`'s options as `maintenance_run_tasks()` reads them.
+#[derive(Clone, Copy)]
+struct RunOpts {
+    auto: bool,
+    quiet: bool,
+    /// `opts.detach`: `None` is git's `-1`, "not asked either way".
+    detach: Option<bool>,
+}
+
+/// `enum task_phase` (builtin/gc.c:1753-1756): the work done before
+/// `daemonize()` and the work done after it.
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    Foreground,
+    Background,
+}
+
+/// Whether the `tasks[]` table (builtin/gc.c:1700-1751) gives `task` a function
+/// for `phase`: `pack-refs` and `reflog-expire` are foreground only, `gc` has
+/// both halves, and every other task runs in the background.
+fn has_phase(task: &str, phase: Phase) -> bool {
+    match task {
+        "pack-refs" | "reflog-expire" => phase == Phase::Foreground,
+        "gc" => true,
+        _ => phase == Phase::Background,
+    }
+}
+
+/// `<objdir>/maintenance.lock`, taken with `O_CREAT | O_EXCL` and removed when
+/// dropped — which a daemonizing parent's `exit(0)` never does, leaving it to the
+/// child that carries on with the run.
+struct MaintenanceLock(PathBuf);
+
+impl MaintenanceLock {
+    fn take(path: PathBuf) -> std::io::Result<Self> {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        Ok(MaintenanceLock(path))
+    }
+}
+
+impl Drop for MaintenanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// One task's function for one phase, answering whether it succeeded.
+///
+/// # What the tasks do
+///
+///   * **`pack-refs`** — the `git pack-refs --all --prune [--auto]` child
+///     `maintenance_task_pack_refs()` runs.
+///   * **`reflog-expire`** — [`super::gc::expire_reflogs`], the same
+///     `reflog expire --all` port `git gc` runs, including the per-pattern
+///     `gc.<pattern>.reflogExpire*` policy and the reachability arm.
+///   * **`gc`** — in the foreground `gc_foreground_tasks()` (builtin/gc.c:834-842):
+///     `pack-refs` unless `gc.packRefs` is false, then `reflog expire --all`
+///     unless both reflog expiries are `never`. In the background
+///     `maintenance_task_gc_background()` (builtin/gc.c:1253-1272): a
+///     `git gc [--auto] --[no-]quiet --no-detach --skip-foreground-tasks` child.
+///   * **`geometric-repack`** — the ported [`super::repack::repack`] with the
+///     argument list git 2.55.0 spawns. The pack's bytes differ from git's:
+///     `gix-pack` stores every object undeltified
+///     (`Mode::PackCopyAndBaseObjects`), so the pack is a well-formed one with the
+///     correct object set, larger than git's.
+///   * **`rerere-gc`** — [`super::rerere::rerere`], guarded on `rr-cache`
+///     existing so a repository that never recorded a resolution does not enter
+///     the delegate's `read_dir` error path, which git has no equivalent of.
+///   * **`worktree-prune`** — [`super::gc::prune_worktrees`], the same
+///     `worktree prune --expire <gc.worktreePruneExpire>` port `git gc` runs.
+///   * **`commit-graph`** — the `git commit-graph write --split --reachable`
+///     child `run_write_commit_graph()` runs.
+///   * **`loose-objects`** — [`prune_packed_task`] then [`pack_loose`], which is
+///     `prune_packed(opts) || pack_loose(opts)` verbatim.
+///   * **`incremental-repack`** — [`incremental_repack`], the
+///     `multi-pack-index write` / `expire` / `repack --batch-size=<n>` sequence.
+///   * **`prefetch`** — [`prefetch`], one `git fetch <remote> --prefetch ...` per
+///     configured remote, which is what `fetch_remote()` spawns.
+fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> bool {
+    let pack_refs = || {
+        let mut args = vec!["pack-refs", "--all", "--prune"];
+        if opts.auto {
+            args.push("--auto");
+        }
+        spawn_git(repo, &args)
+    };
+    match (task, phase) {
+        // A child, as `maintenance_task_pack_refs()` runs it (`run_command(&cmd)`,
+        // builtin/gc.c): a value `pack-refs` dies on at ref-store setup or at
+        // `packed_refs_lock()` — `core.logAllRefUpdates`, `core.packedRefsTimeout` —
+        // ends that process with 128, which the task reports as
+        // `error: task 'pack-refs' failed` at exit 1.
+        ("pack-refs", _) => pack_refs(),
+        ("reflog-expire", _) => super::gc::expire_reflogs(repo).is_ok(),
+        ("gc", Phase::Foreground) => {
+            // `cfg->pack_refs` is `-1` for `notbare`, which is true here: only
+            // `cmd_gc()` resolves it against the repository.
+            if super::gc::pack_refs_setting(repo).unwrap_or(true) && !pack_refs() {
+                eprintln!("error: failed to run pack-refs");
+                return false;
+            }
+            if super::gc::reflog_expire_enabled(repo) && !spawn_git(repo, &["reflog", "expire", "--all"]) {
+                eprintln!("error: failed to run reflog");
+                return false;
+            }
+            true
+        }
+        ("gc", Phase::Background) => {
+            let mut args = vec!["gc"];
+            if opts.auto {
+                args.push("--auto");
+            }
+            args.push(if opts.quiet { "--quiet" } else { "--no-quiet" });
+            args.extend(["--no-detach", "--skip-foreground-tasks"]);
+            spawn_git(repo, &args)
+        }
+        // `maintenance_task_geometric_repack()`: `git repack -d -l
+        // --geometric=<splitFactor> --quiet --write-midx`, read off `GIT_TRACE=1`
+        // under git 2.55.0. There is no `--cruft` in it — a cruft repack is the
+        // `gc` task.
+        ("geometric-repack", _) => {
+            let factor = repo
+                .config_snapshot()
+                .integer("maintenance.geometric-repack.splitFactor")
+                .unwrap_or(2)
+                .max(0);
+            let geometric = format!("--geometric={factor}");
+            delegate(super::repack::repack(&strings(&[
+                "repack",
+                "-d",
+                "-l",
+                &geometric,
+                "--quiet",
+                "--write-midx",
+            ])))
+        }
+        ("rerere-gc", _) => {
+            !repo.git_dir().join("rr-cache").is_dir()
+                // Unlike `repack` above, `rerere()` takes the verb's arguments
+                // only; a leading "rerere" reads as an unknown subcommand.
+                || delegate(super::rerere::rerere(&strings(&["gc"])))
+        }
+        ("worktree-prune", _) => super::gc::prune_worktrees(repo).is_ok(),
+        ("commit-graph", _) => spawn_git(repo, &["commit-graph", "write", "--split", "--reachable"]),
+        // `maintenance_task_loose_objects()` is exactly
+        // `prune_packed(opts) || pack_loose(opts)`: the `||` short-circuits, so a
+        // failing `prune-packed` skips the packing and fails the task.
+        ("loose-objects", _) => prune_packed_task(repo, opts.quiet) && pack_loose(repo, opts.quiet),
+        ("incremental-repack", _) => incremental_repack(repo, opts.quiet),
+        ("prefetch", _) => prefetch(repo, opts.quiet),
+        _ => true,
+    }
 }
 
 /// Which tasks run, in the order they run.

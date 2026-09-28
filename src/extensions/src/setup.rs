@@ -2796,3 +2796,58 @@ pub fn enter_repo_gitfile_gate(candidates: &[PathBuf]) -> Option<ExitCode> {
     }
     None
 }
+
+/// `daemonize()` (setup.c:2186-2222): fork, let the parent `exit(0)`, and carry on
+/// in the child as the leader of a new session with `/dev/null` on all three
+/// standard streams (`sanitize_stdfds()`, setup.c:2177-2184).
+///
+/// Returns in the child only. `Err` is git's "failure to daemonize is ok, we'll
+/// continue in foreground" case — a failed `fork()` is `die_errno()` there — and
+/// it is also the answer inside a host process ([`crate::hosted`]), where a fork
+/// would duplicate the host rather than a `git` invocation.
+///
+/// The stdio buffer is flushed first, as `fork()` in the C is always preceded by
+/// `fflush(NULL)`, so nothing the parent printed is written twice. The parent's
+/// `exit(0)` runs git's `atexit` work, which here is the Trace2 closing records.
+pub(crate) fn daemonize() -> std::io::Result<()> {
+    if crate::hosted::is_hosted() {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    crate::cstdio::flush();
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // Safety: `fork()` has no preconditions; the child continues only on this
+    // thread, which is the only one running at the maintenance call site.
+    match unsafe { libc::fork() } {
+        -1 => {
+            let err = std::io::Error::last_os_error();
+            eprintln!("fatal: fork failed: {}", crate::external::strerror(&err));
+            crate::hosted::exit(128);
+        }
+        0 => {}
+        _ => {
+            crate::trace2::exit(0);
+            std::process::exit(0);
+        }
+    }
+    // Safety: plain syscalls on descriptors this process owns.
+    unsafe {
+        if libc::setsid() == -1 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("fatal: setsid failed: {}", crate::external::strerror(&err));
+            std::process::exit(128);
+        }
+        libc::close(0);
+        libc::close(1);
+        libc::close(2);
+        let mut fd = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
+        while (0..2).contains(&fd) {
+            fd = libc::dup(fd);
+        }
+        if fd > 2 {
+            libc::close(fd);
+        }
+    }
+    Ok(())
+}

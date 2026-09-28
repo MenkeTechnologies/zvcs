@@ -3528,7 +3528,11 @@ fn prepare_temp_file(
         // `/dev/null` triple, and a symlink is handed over as a temporary file
         // holding its target, named by the null id and `S_IFLNK` unless the side
         // has an object of its own (diff.c:4714-4733).
-        let fs_path = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+        // `one->path` is relative to the top of the worktree, which is where
+        // `setup_git_directory()` left git's working directory.
+        let rel = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
+        let joined = repo.workdir().map(|w| w.join(rel));
+        let fs_path = joined.as_deref().unwrap_or(rel);
         let meta = match std::fs::symlink_metadata(fs_path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(not_a_valid_file()),
@@ -3737,6 +3741,12 @@ pub(crate) fn run_external_diff(
         }
     }
     let mut cmd = crate::external::prepare_shell_cmd_str(&pgm.cmd, &argv);
+    // The child inherits git's working directory, which `setup_git_directory()`
+    // moved to the top of the worktree: the worktree paths in `argv` are relative
+    // to it, and so is anything the program itself opens.
+    if let Some(workdir) = repo.workdir() {
+        cmd.current_dir(workdir);
+    }
     ctx.counter.set(ctx.counter.get() + 1);
     cmd.env("GIT_DIFF_PATH_COUNTER", ctx.counter.get().to_string());
     cmd.env("GIT_DIFF_PATH_TOTAL", total.to_string());

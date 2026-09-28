@@ -1255,6 +1255,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `revs->rev_input_given` for it, which is why `git log --ignore-missing
     // <zero-oid>` walks nothing rather than falling back to `HEAD`.
     let mut ignore_missing = false;
+    // The first argument neither `parse_options()` nor `setup_revisions()`
+    // claimed. `cmd_log_init_finish()` dies on it only after the whole command
+    // line has been through `setup_revisions()` (builtin/log.c:316-320).
+    let mut unrecognized: Option<String> = None;
 
     // `--stdin` splices its lines in where it stood; `origin` tells them apart
     // from argv. See [`super::rev_list::Origin`].
@@ -1538,9 +1542,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             terminator = false;
             pretty_given = true;
         } else if a == "--format" {
-            // Bare `--format` (no `=value`) is a git usage error, exit 128.
-            eprintln!("fatal: unrecognized argument: --format");
-            return Ok(ExitCode::from(128));
+            // Bare `--format` (no `=value`) is left unclaimed, exit 128.
+            unrecognized.get_or_insert_with(|| a.clone());
         } else if let Some(v) = a.strip_prefix("--date=") {
             match parse_date_mode(v) {
                 Some(m) => date_mode = m,
@@ -1861,8 +1864,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 eprintln!(
                     "error: options '--exclude-hidden' and '{name}' cannot be used together"
                 );
-                eprintln!("fatal: unrecognized argument: {a}");
-                return Ok(ExitCode::from(128));
+                unrecognized.get_or_insert_with(|| a.clone());
+                i += 1;
+                continue;
             }
             // `--glob` is a `parse_long_opt()` option, so its value may stand as
             // the next argv element; the fixed spellings never take one.
@@ -1937,8 +1941,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `setup_revisions()` leaves them unconsumed and `cmd_log_walk()` dies on the
         // first one, so this is git's own refusal rather than an unported feature.
         } else if a == "--timestamp" || a == "--no-stat" {
-            eprintln!("fatal: unrecognized argument: {a}");
-            return Ok(ExitCode::from(128));
+            unrecognized.get_or_insert_with(|| a.clone());
         } else if a == "--stdin" {
             // `if (revs->read_from_stdin++) die("--stdin given twice?");` then
             // `read_revisions_from_stdin()`, right here in the scan (revision.c:
@@ -2689,8 +2692,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // fall through to the gap message below, which is the truthful
                 // answer for them — borrowing git's wording there would claim git
                 // rejects an option it accepts.
-                eprintln!("fatal: unrecognized argument: {a}");
-                return Ok(ExitCode::from(128));
+                unrecognized.get_or_insert_with(|| a.clone());
             } else {
                 bail!("unsupported flag {a:?}");
             }
@@ -3647,6 +3649,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `if (revs->graph_max_lanes > 0 && !revs->graph) die(…)` (revision.c:3200-3201).
     if graph_max_lanes > 0 && !graph {
         eprintln!("fatal: the option '--graph-lane-limit' requires '--graph'");
+        return Ok(ExitCode::from(128));
+    }
+    // `if (argc > 1) die(_("unrecognized argument: %s"), argv[1]);`
+    // (builtin/log.c:319-320), the first thing `cmd_log_init_finish()` does once
+    // `setup_revisions()` returns. By then every revision has been resolved —
+    // an unresolvable one was reported instead — and parsing the first commit
+    // read `info/grafts` and printed its deprecation advice (commit.c:287-314).
+    if let Some(a) = unrecognized {
+        if !tips.is_empty() || !neg_ids.is_empty() {
+            repo.commit_grafts();
+        }
+        eprintln!("fatal: unrecognized argument: {a}");
         return Ok(ExitCode::from(128));
     }
 

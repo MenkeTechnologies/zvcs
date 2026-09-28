@@ -1259,6 +1259,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // claimed. `cmd_log_init_finish()` dies on it only after the whole command
     // line has been through `setup_revisions()` (builtin/log.c:316-320).
     let mut unrecognized: Option<String> = None;
+    // `--log-size` (`revs->show_log_size`, revision.c:2668-2669).
+    let mut log_size = false;
 
     // `--stdin` splices its lines in where it stood; `origin` tells them apart
     // from argv. See [`super::rev_list::Origin`].
@@ -1478,6 +1480,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             use_mailmap = true;
         } else if a == "--no-use-mailmap" || a == "--no-mailmap" {
             use_mailmap = false;
+        } else if a == "--log-size" {
+            log_size = true;
         } else if a == "--oneline" {
             pretty = Pretty::Oneline;
             terminator = true;
@@ -5466,6 +5470,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         notes_shown: notes_opt.show,
         expand_tabs,
         date_explicit,
+        log_size,
         // `show_log()`'s `ctx.rev = opt; ctx.print_email_subject = 1;`
         // (log-tree.c:700-701), which is what puts `[<prefix>] ` on the
         // `Subject:` line and turns the RFC2047 encoding on.
@@ -7177,6 +7182,8 @@ struct EntryParams<'a> {
     expand_tabs: Option<usize>,
     /// `revs->date_mode_explicit`: see [`RenderCtx::date_explicit`].
     date_explicit: bool,
+    /// `--log-size`: see [`RenderCtx::log_size`].
+    log_size: bool,
     /// See [`RenderCtx::email`].
     email: EmailStyle<'a>,
     /// `get_log_output_encoding()` (`environment.c:189-193`): the charset commit
@@ -7415,6 +7422,7 @@ fn entry_block_from(
         expand_tabs: p.expand_tabs,
         reflog: node.reflog.as_ref(),
         date_explicit: p.date_explicit,
+        log_size: p.log_size,
         email: p.email,
     };
     let mut block: Vec<u8> = Vec::new();
@@ -9665,6 +9673,7 @@ pub(crate) fn format_commit(
         // Neither caller is a reflog walk, so every `%g…` expands to nothing.
         reflog: None,
         date_explicit: false,
+        log_size: false,
         // Only a user format reaches this caller, and no `%` placeholder reads it.
         email: EmailStyle::REV_LIST,
     };
@@ -11852,6 +11861,7 @@ pub(crate) fn rev_list_pretty_body(
         // `rev-list` has no reflog walk, so every `%g…` expands to nothing.
         reflog: None,
         date_explicit: false,
+        log_size: false,
         email: EmailStyle::REV_LIST,
     };
     let mut out = Vec::new();
@@ -11998,6 +12008,8 @@ pub(crate) struct ShowEntry<'a> {
     pub(crate) reflog: Option<&'a ReflogEntry>,
     /// `revs->date_mode_explicit`, which the reflog selector consults.
     pub(crate) date_explicit: bool,
+    /// `--log-size`: see [`RenderCtx::log_size`].
+    pub(crate) log_size: bool,
 }
 
 /// A reusable [`render_entry`] driver for the commands that render one record at
@@ -12086,6 +12098,7 @@ impl<'r> EntryRenderer<'r> {
             expand_tabs: opts.expand_tabs,
             reflog: opts.reflog,
             date_explicit: opts.date_explicit,
+            log_size: opts.log_size,
             email: opts.email,
         };
         // `pretty_print_commit()` fills a `struct strbuf msgbuf` of its own, which
@@ -12186,6 +12199,10 @@ struct RenderCtx<'a> {
     /// never by `log.date`. It is `get_reflog_selector()`'s `force_date`: the
     /// selector prints `HEAD@{<date>}` instead of `HEAD@{<n>}`.
     date_explicit: bool,
+    /// `revs->show_log_size` (`--log-size`): `show_log()` prints `log size <n>`
+    /// ahead of the pretty-printed message, `<n>` being that message's length in
+    /// bytes (log-tree.c:900-903).
+    log_size: bool,
     /// The two `pretty_print_context` fields [`Pretty::Email`] reads.
     email: EmailStyle<'a>,
 }
@@ -12280,6 +12297,11 @@ fn render_entry(
         commit.id().to_string()
     };
 
+    // Where `pretty_print_commit()`'s `msgbuf` begins: everything before it —
+    // the `commit` line, the `Reflog:` header, the signature report — is written
+    // by `show_log()` itself (log-tree.c:805-852), and `--log-size` counts only
+    // what follows.
+    let mut msg_start = out.len();
     match pretty {
         Pretty::Oneline => {
             write_commit_name(out, b"", &id, ctx);
@@ -12297,6 +12319,7 @@ fn render_entry(
             }
             out.push(b' ');
             write_signature_block(out, commit, ctx)?;
+            msg_start = out.len();
             // `show_log()`: under `-g` the oneline record is the reflog selector and
             // the entry's own message, and it `return`s there — the commit's subject
             // and its notes are never reached, and neither is the record
@@ -12359,6 +12382,7 @@ fn render_entry(
         Pretty::Email | Pretty::MboxRd => {
             writeln!(out, "From {} Mon Sep 17 00:00:00 2001", commit.id())?;
             write_signature_block(out, commit, ctx)?;
+            msg_start = out.len();
             email_body(out, commit, pretty, ctx.email, ctx.mailmap)?;
             // ```c
             // if ((ctx.fmt != CMIT_FMT_USERFORMAT) &&
@@ -12380,6 +12404,7 @@ fn render_entry(
         }
         Pretty::User(fmt) => {
             write_signature_block(out, commit, ctx)?;
+            msg_start = out.len();
             expand_format(out, commit, fmt, ctx)?;
         }
         Pretty::Raw => {
@@ -12404,6 +12429,7 @@ fn render_entry(
             out.push(b'\n');
             write_reflog_header(out, ctx);
             write_signature_block(out, commit, ctx)?;
+            msg_start = out.len();
             writeln!(out, "tree {}", commit.tree_id()?)?;
             for pid in commit.parent_ids() {
                 writeln!(out, "parent {pid}")?;
@@ -12448,6 +12474,7 @@ fn render_entry(
             out.push(b'\n');
             write_reflog_header(out, ctx);
             write_signature_block(out, commit, ctx)?;
+            msg_start = out.len();
 
             // A merge commit lists its abbreviated parents right after `commit`.
             // The list is the *effective* one: history simplification rewrites
@@ -12507,6 +12534,10 @@ fn render_entry(
             }
             out.extend_from_slice(&notes_block(commit, ctx)?);
         }
+    }
+    if ctx.log_size {
+        let size = format!("log size {}\n", out.len() - msg_start);
+        out.splice(msg_start..msg_start, size.into_bytes());
     }
     Ok(())
 }

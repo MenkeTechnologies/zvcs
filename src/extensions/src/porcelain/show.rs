@@ -379,6 +379,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // (revision.c:305-318), so `cmd_show`'s pending loop never sees it; only a
     // cleared `no_walk` sends the reflog to `cmd_log_walk()`.
     let mut reflog_from: Option<(usize, usize)> = None;
+    // `--log-size` (`revs->show_log_size`, revision.c:2668-2669).
+    let mut log_size = false;
     // `--topo-order` / `--date-order`, applied to the walk a cleared `no_walk`
     // hands to `cmd_log_walk`.
     let mut order = super::log::Order::Default;
@@ -1000,6 +1002,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     no_walk = true;
                 } else if s == "--do-walk" {
                     no_walk = false;
+                } else if s == "--log-size" {
+                    log_size = true;
                 } else if s == "-g" || s == "--walk-reflogs" {
                     reflog_from.get_or_insert((specs.len(), ref_selections.len()));
                 // `--reverse` reverses what `cmd_log_walk` emits; `cmd_show`'s own
@@ -2035,6 +2039,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         reflog: std::cell::RefCell::new(None),
         reflog_walk: reflog_from.is_some(),
         date_explicit,
+        log_size,
         show_signature,
         notes: &notes_trees,
         notes_shown: notes_opt.show,
@@ -2518,6 +2523,8 @@ struct DisplayOpts<'a> {
     reflog_walk: bool,
     /// `revs->date_mode_explicit`: `--date=` was given, which the `-g` selector reads.
     date_explicit: bool,
+    /// `--log-size` (`revs->show_log_size`).
+    log_size: bool,
     /// `--show-signature` / `--no-show-signature` (`rev_info.show_signature`).
     show_signature: bool,
     /// `log.abbrevCommit` / `--abbrev-commit`: abbreviate the `commit <id>` line.
@@ -3605,6 +3612,7 @@ fn show_commit_record(
             from,
             reflog: reflog.as_ref(),
             date_explicit: disp.date_explicit,
+            log_size: disp.log_size,
         },
     )?;
     // `repo_format_commit_message()`'s tail: the *rendered record* is converted out

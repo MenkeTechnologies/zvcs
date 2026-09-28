@@ -2790,7 +2790,7 @@ struct Patch {
     /// that the pre-image is the one the payload was made against.
     index_old: Option<String>,
     index_new: Option<String>,
-    score: u32, // `similarity index N%`, for the summary's rename line
+    score: u32, // `similarity`/`dissimilarity index N%`: the summary's rename, copy and rewrite `(N%)`
     /// `patch->is_toplevel_relative`: set by `parse_git_header()` (apply.c:1457) for
     /// a `diff --git` patch, whose names are already relative to the worktree root.
     /// A traditional `---`/`+++` diff leaves it clear (apply.c:1596) and its names
@@ -3674,11 +3674,19 @@ fn parse_one(
         } else if let Some(rest) = l.strip_prefix("copy to ") {
             p.is_copy = true;
             p.new_name = rename_path(rest, strip)?;
-        } else if let Some(rest) = l.strip_prefix("similarity index ") {
-            // Drives the `(N%)` in the summary's rename line.
-            p.score = rest.trim().trim_end_matches('%').parse().unwrap_or(0);
-        } else if l.starts_with("dissimilarity index ") {
-            // Rename/copy scoring; irrelevant to application.
+        } else if let Some(rest) = l
+            .strip_prefix("similarity index ")
+            .or_else(|| l.strip_prefix("dissimilarity index "))
+        {
+            // `gitdiff_similarity()` / `gitdiff_dissimilarity()` (apply.c:1087-1105):
+            // `strtoul()` of the line, kept only when it is at most 100. It is the
+            // `(N%)` of the summary's rename/copy line, and of its `rewrite` line.
+            let rest = rest.trim_start();
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            let val: u64 = rest[..digits].parse().unwrap_or(if digits == 0 { 0 } else { u64::MAX });
+            if val <= 100 {
+                p.score = val as u32;
+            }
         } else if let Some(rest) = l.strip_prefix("index ") {
             // `index <old>..<new> <mode>` carries the mode when it did not change;
             // git creates the result with it, so an executable file stays one.
@@ -4813,9 +4821,23 @@ fn stat_summary_line(files: usize, ins: usize, del: usize) -> String {
 fn render_summary(patches: &[Patch]) -> String {
     let mut out = String::new();
     for p in patches {
-        if p.is_rename || p.is_copy {
-            out.push_str(&rename_line(p));
-        } else if p.is_new {
+        // `summary_patch_list()` (apply.c:4382-4405): creation and deletion first,
+        // then a rename or copy line, then a `-B` rewrite's line — each of those two
+        // followed by `show_mode_change(p, 0)`, which names no path — and otherwise
+        // a bare mode change, which does.
+        let mode_change = |show_name: bool| -> String {
+            match (p.old_mode, p.new_mode) {
+                (Some(om), Some(nm)) if om != 0 && nm != 0 && om != nm => match show_name {
+                    true => format!(
+                        " mode change {om:06o} => {nm:06o} {}\n",
+                        p.new_name.as_deref().unwrap_or("")
+                    ),
+                    false => format!(" mode change {om:06o} => {nm:06o}\n"),
+                },
+                _ => String::new(),
+            }
+        };
+        if p.is_new {
             out.push_str(&format!(
                 " create mode {:06o} {}\n",
                 p.new_mode.unwrap_or(0),
@@ -4827,15 +4849,18 @@ fn render_summary(patches: &[Patch]) -> String {
                 p.old_mode.unwrap_or(0),
                 p.old_name.as_deref().unwrap_or("")
             ));
-        } else if let (Some(om), Some(nm)) = (p.old_mode, p.new_mode) {
-            if om != nm {
-                out.push_str(&format!(
-                    " mode change {:06o} => {:06o} {}\n",
-                    om,
-                    nm,
-                    p.new_name.as_deref().unwrap_or("")
-                ));
-            }
+        } else if p.is_rename || p.is_copy {
+            out.push_str(&rename_line(p));
+            out.push_str(&mode_change(false));
+        } else if p.score != 0 {
+            out.push_str(&format!(
+                " rewrite {} ({}%)\n",
+                p.new_name.as_deref().unwrap_or(""),
+                p.score
+            ));
+            out.push_str(&mode_change(false));
+        } else {
+            out.push_str(&mode_change(true));
         }
     }
     out

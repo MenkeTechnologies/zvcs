@@ -1262,6 +1262,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--log-size` (`revs->show_log_size`, revision.c:2668-2669).
     let mut log_size = false;
     let mut show_notes_by_default = false;
+    // `--no-commit-id` (`revs->no_commit_id`) and `--always`
+    // (`revs->always_show_header = 1`), revision.c:2635-2638.
+    let mut no_commit_id = false;
+    let mut always_opt = false;
 
     // `--stdin` splices its lines in where it stood; `origin` tells them apart
     // from argv. See [`super::rev_list::Origin`].
@@ -1483,6 +1487,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             use_mailmap = false;
         } else if a == "--log-size" {
             log_size = true;
+        } else if a == "--no-commit-id" {
+            no_commit_id = true;
+        } else if a == "--always" {
+            always_opt = true;
         } else if a == "--oneline" {
             pretty = Pretty::Oneline;
             terminator = true;
@@ -5523,6 +5531,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // own `set_separate()` would otherwise ask for.
     let separate_merges =
         !remerge && diff_merges == DiffMerges::Separate && (all_need_diff || merges_need_diff);
+    // `rev->always_show_header`: `cmd_log()` sets it, `cmd_whatchanged()` leaves
+    // it to `--always`, and `cmd_log_init_finish()` clears it for a pickaxe,
+    // `--diff-filter` or `--follow` whatever was asked (builtin/log.c:333-335).
+    let always_show_header = (flavor != Flavor::WhatChanged || always_opt)
+        && !has_pickaxe
+        && patch_opts.diff_filter.is_none()
+        && !follow;
+    // `--no-commit-id` moves the header behind the diff (see the record assembly
+    // below). The layouts that print a header of their own inside the diff
+    // machinery are not ported under it.
+    if no_commit_id && (graph || line_level || separate_merges) {
+        bail!("`--no-commit-id` with `--graph`, `-L` or `-m` is not ported");
+    }
     if separate_merges && graph && nodes.iter().any(|n| n.parents.len() > 1) {
         bail!("`-m` with `--graph` is not ported: git lays out one graph row per
                per-parent record");
@@ -5635,6 +5656,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // from `!record_has_diff`, which is also what an `-s` record looks like:
         // there the queue was never asked about, so the flush still ran.
         let mut record_queue_empty = false;
+        // `--no-commit-id`: the record's diff output, printed ahead of the header.
+        let mut diff_before_header: Vec<u8> = Vec::new();
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
@@ -6431,7 +6454,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // (log-tree.c:941.) With no output format at all — `--exit-code` on its
             // own builds the queue without asking for one — there is nothing to
             // separate the message from, so no blank line is written either.
-            if (!diff.is_empty() || queue_nonempty || combined_here)
+            if no_commit_id {
+                // `log_tree_diff_flush()` skips `show_log()` under
+                // `revs->no_commit_id` (log-tree.c:939), and `diff_tree_combined()`
+                // likewise (`show_log_first`, combine-diff.c:1512): the diff comes
+                // out alone, with no separator of its own. The header follows it —
+                // see the record assembly below.
+                if !probe_queue && (want_names || emit_patch || check) {
+                    diff_before_header = std::mem::take(&mut diff);
+                }
+            } else if (!diff.is_empty() || queue_nonempty || combined_here)
                 && !probe_queue
                 && (want_names || emit_patch || check)
             {
@@ -6464,7 +6496,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
                 block.extend_from_slice(&diff);
             }
-            record_has_diff = !diff.is_empty() || queue_nonempty || combined_here;
+            record_has_diff =
+                !diff.is_empty() || !diff_before_header.is_empty() || queue_nonempty || combined_here;
             record_queue_empty = !record_has_diff;
         }
         // The octopus arm's own output: `show_log(opt)` has already written the
@@ -6522,7 +6555,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `git log` itself the moment a pickaxe, `--diff-filter` or `--follow` is in
         // play, because each of those *is* a queue filter: a commit that survives the
         // walk but loses every pair must print nothing rather than a bare header.
-        if flavor == Flavor::WhatChanged || patch_opts.diff_filter.is_some() {
+        if !always_show_header && (flavor == Flavor::WhatChanged || patch_opts.diff_filter.is_some()) {
             if !record_has_diff {
                 // Under `--graph` the commit was still walked and graphed, so it
                 // keeps its slot and prints no row (see [`render_graph`]).
@@ -6545,11 +6578,26 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // first with a blank line; a `tformat:` record was already terminated
         // above, so no separator is inserted.
         let mut piece: Vec<u8> = Vec::new();
-        if !terminator && !first {
-            piece.push(rec_term);
+        if no_commit_id {
+            // `log_tree_diff()` never cleared `opt->loginfo`, so it reported
+            // nothing shown and `log_tree_commit()` prints the header afterwards —
+            // only while `always_show_header` holds (log-tree.c:1189-1194). The
+            // separator is `show_log()`'s, owed only once a header has been shown.
+            piece = diff_before_header;
+            if always_show_header {
+                if !terminator && !first {
+                    piece.push(rec_term);
+                }
+                piece.extend_from_slice(&block);
+                first = false;
+            }
+        } else {
+            if !terminator && !first {
+                piece.push(rec_term);
+            }
+            piece.extend_from_slice(&block);
+            first = false;
         }
-        piece.extend_from_slice(&block);
-        first = false;
         // `--line-prefix`: `emit_line_0()` writes `diff_line_prefix(o)` in front of
         // every emitted line, and for a history verb that includes the header
         // `show_log()` wrote. Applied per record because the records stream; a

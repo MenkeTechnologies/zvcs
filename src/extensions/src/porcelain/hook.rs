@@ -231,8 +231,8 @@ fn list(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = crate::setup::discover()?;
-    let cfg = match parse_config(&repo)? {
+    let repo = gentle_repo();
+    let cfg = match with_config(repo.as_ref(), parse_config)? {
         Ok(cfg) => cfg,
         Err(code) => return Ok(code),
     };
@@ -257,7 +257,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
         out.push(term);
     }
 
-    if hookdir_hook(&repo, &event)?.is_some() {
+    if hookdir_hook(repo.as_ref(), &event)?.is_some() {
         found = true;
         out.push_str("hook from hookdir");
         out.push(term);
@@ -360,13 +360,13 @@ fn run(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    let repo = crate::setup::discover()?;
-    let cfg = match parse_config(&repo)? {
+    let repo = gentle_repo();
+    let cfg = match with_config(repo.as_ref(), parse_config)? {
         Ok(cfg) => cfg,
         Err(code) => return Ok(code),
     };
     let event_disabled = event_disabled(&cfg, &event);
-    let hookdir = hookdir_hook(&repo, &event)?;
+    let hookdir = hookdir_hook(repo.as_ref(), &event)?;
 
     // "Found" ignores the enabled flags: git only reports a missing hook when
     // nothing is configured for the event and no hookdir script exists.
@@ -401,7 +401,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
 
     // Parallelism is only rejected when it would actually engage, so a repo that
     // merely sets `hook.jobs` still runs its serial hooks normally.
-    let jobs = effective_jobs(&repo, &event, jobs_flag)?;
+    let jobs = with_config(repo.as_ref(), |file| effective_jobs(file, &event, jobs_flag))?;
     let all_parallel = registered
         .iter()
         .filter_map(|r| cfg.hooks.get(&r.name))
@@ -428,7 +428,12 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // invoked, so the child's cwd has to be moved there explicitly — otherwise
     // `git hook run pre-commit` from `sub/` writes the hook's output into `sub/`
     // while git writes it into the work tree root.
-    let workdir = crate::hooks::absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+    // Outside a repository `setup_git_directory_gently()` never moved, so the
+    // hook runs where the command was typed.
+    let workdir = match &repo {
+        Some(repo) => crate::hooks::absolutize(repo.workdir().unwrap_or_else(|| repo.git_dir())),
+        None => std::env::current_dir()?,
+    };
     let mut rc: i32 = 0;
     for (idx, cmd) in commands.iter().enumerate() {
         // `pick_next_hook` (hook.c:611-622) runs the two kinds differently: a
@@ -510,9 +515,7 @@ fn reject_unknown_event(event: &str, allow_unknown: bool) -> Option<ExitCode> {
 ///
 /// Returns `Err(code)` (never an `anyhow` error) for git's own fatal config
 /// diagnostics, which print their message and exit 128.
-fn parse_config(repo: &gix::Repository) -> Result<std::result::Result<Config, ExitCode>> {
-    let snapshot = repo.config_snapshot();
-    let file = snapshot.plumbing();
+fn parse_config(file: &gix::config::File) -> Result<std::result::Result<Config, ExitCode>> {
 
     let mut regs: Vec<Registration> = Vec::new();
     let mut hooks: BTreeMap<String, HookCfg> = BTreeMap::new();
@@ -643,8 +646,7 @@ fn parse_jobs(value: &str) -> Result<i64> {
 
 /// The job count actually in effect: the flag, else `hook.<event>.jobs`, else
 /// `hook.jobs`, else 1. `-1` resolves to the available parallelism.
-fn effective_jobs(repo: &gix::Repository, event: &str, flag: Option<i64>) -> Result<i64> {
-    let snapshot = repo.config_snapshot();
+fn effective_jobs(snapshot: &gix::config::File, event: &str, flag: Option<i64>) -> Result<i64> {
     let n = match flag {
         Some(n) => n,
         None => {
@@ -670,8 +672,13 @@ fn effective_jobs(repo: &gix::Repository, event: &str, flag: Option<i64>) -> Res
 /// Locate the traditional `<hooks-dir>/<event>` script — git's `find_hook()`,
 /// shared with every other hook site in zvcs so the lookup rules and the
 /// `advice.ignoredHook` hint cannot drift between them.
-fn hookdir_hook(repo: &gix::Repository, event: &str) -> Result<Option<PathBuf>> {
-    crate::hooks::find(repo, event)
+///
+/// `find_hook()` (hook.c:32-33) answers NULL when there is no repository.
+fn hookdir_hook(repo: Option<&gix::Repository>, event: &str) -> Result<Option<PathBuf>> {
+    match repo {
+        Some(repo) => crate::hooks::find(repo, event),
+        None => Ok(None),
+    }
 }
 
 /// Build the child process for one `HOOK_CONFIGURED` hook command — git's
@@ -780,4 +787,24 @@ fn errno_str(e: &std::io::Error) -> String {
 fn stderr_dup() -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::AsFd;
     Ok(std::io::stderr().as_fd().try_clone_to_owned()?)
+}
+
+/// `hook` is `RUN_SETUP_GENTLY` (git.c:591): outside a repository it still
+/// runs, with no hooks directory and only the system, global and
+/// command-line configuration — `get_hook_config_cache()` (hook.c:453-477)
+/// builds a throwaway map for a repository without a gitdir.
+fn gentle_repo() -> Option<gix::Repository> {
+    crate::setup::discover().ok()
+}
+
+/// Hand `f` the configuration `repo_config()` walks: the repository's merged
+/// snapshot, or the repository-less cascade.
+fn with_config<T>(
+    repo: Option<&gix::Repository>,
+    f: impl FnOnce(&gix::config::File) -> T,
+) -> T {
+    match repo {
+        Some(repo) => f(repo.config_snapshot().plumbing()),
+        None => f(&crate::config::global_config()),
+    }
 }

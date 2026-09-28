@@ -256,6 +256,11 @@ struct State {
     objects: Option<Meter>,
     deltas: Option<Meter>,
     local_base_objects: usize,
+    /// `progress_title`, for an `index-pack -v` run on its own; the fetch
+    /// path's child never gets one.
+    title: Option<&'static str>,
+    /// [`FIRST_READ_BEFORE_METER`] unless the caller knows better.
+    first_read_override: Option<u64>,
 }
 
 impl Meters {
@@ -270,8 +275,32 @@ impl Meters {
                 objects: None,
                 deltas: None,
                 local_base_objects: 0,
+                title: None,
+                first_read_override: None,
             })),
         }
+    }
+
+    /// The meters of an `index-pack -v` run directly rather than by `get_pack()`:
+    /// `title` is `progress_title ? progress_title : from_stdin ? "Receiving
+    /// objects" : "Indexing objects"` (builtin/index-pack.c:1258-1263), and
+    /// `first_read` how many bytes its first `fill()` took before
+    /// `start_progress()` — every byte for a pack that is not read from stdin,
+    /// which reports no throughput at all.
+    pub(crate) fn index_pack(title: &'static str, first_read: u64) -> Self {
+        let meters = Meters::new(Plan {
+            progress: true,
+            quiet: false,
+            keep_pack: true,
+            unpack_limit: 0,
+            index_pack_required: true,
+        });
+        {
+            let mut state = meters.state();
+            state.title = Some(title);
+            state.first_read_override = Some(first_read);
+        }
+        meters
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -367,7 +396,11 @@ impl prodash::Progress for Meters {
                     Meter::counted("Unpacking objects", nr_objects, plan.unpack_objects_verbose())
                 } else {
                     // `from_stdin ? _("Receiving objects") : ...` (builtin/index-pack.c:1258-1263).
-                    Meter::counted("Receiving objects", nr_objects, plan.index_pack_verbose())
+                    Meter::counted(
+                        state.title.unwrap_or("Receiving objects"),
+                        nr_objects,
+                        plan.index_pack_verbose(),
+                    )
                 };
                 // With the header passed on, every read the child makes follows
                 // `start_progress()`; `unpack-objects` likewise reports each
@@ -377,8 +410,8 @@ impl prodash::Progress for Meters {
                     state.first_read = 0;
                     meter.throughput(state.bytes);
                 } else {
-                    state.first_read = FIRST_READ_BEFORE_METER;
-                    if state.bytes > FIRST_READ_BEFORE_METER {
+                    state.first_read = state.first_read_override.unwrap_or(FIRST_READ_BEFORE_METER);
+                    if state.bytes > state.first_read {
                         meter.throughput(state.bytes);
                     }
                 }

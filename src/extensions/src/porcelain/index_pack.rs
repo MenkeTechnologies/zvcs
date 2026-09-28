@@ -37,8 +37,8 @@
 //! `-o <file>`, `--threads=<n>`, `--progress-title <t>` and `--index-version=<v>`
 //! spellings are accepted (`-o<file>`, `--threads <n>`, `--progress-title=<t>`
 //! and `--index-version <v>` are usage errors), `--verbose` and `--` are *not*
-//! recognised at all, and a repeated `-o` or a second `<pack-file>` is a usage
-//! error. Anything unrecognised prints the usage block on stderr and exits 129.
+//! recognised at all, and a repeated `-o` or `--progress-title` or a second
+//! `<pack-file>` is a usage error. Anything unrecognised prints the usage block on stderr and exits 129.
 //!
 //! The post-parse checks run in git's order, which is load-bearing: a command
 //! naming both an unported flag and a bad path must fail the way git does, on
@@ -123,11 +123,11 @@
 //! Only a *well-formed* value reaches the later rejection of the severity list
 //! itself.
 //!
-//! Two narrower gaps are documented rather than papered over: `-v` and
-//! `--progress-title` are accepted but no progress is drawn on stderr (stdout
-//! is unaffected, so the compared bytes still match); and a `--verify` that
-//! finds real corruption reports the `gix` error rather than git's diagnostic
-//! text.
+//! `-v` draws git's `Receiving objects` (`--stdin`) or `Indexing objects`
+//! meter, or the `--progress-title` one, then `Resolving deltas`, through the
+//! same meters the fetch path uses. One narrower gap is documented rather than
+//! papered over: a `--verify` that finds real corruption reports the `gix`
+//! error rather than git's diagnostic text.
 
 use anyhow::{bail, Result};
 use std::fs;
@@ -175,9 +175,47 @@ struct Opts {
     object_format: Option<String>, // --object-format=<algo>
     pack_header: bool,            // --pack_header=<v>,<n> (internal fetch path)
     pack: Option<PathBuf>,        // the positional <pack-file>
+    verbose: bool,                // -v
+    progress_title: Option<String>, // --progress-title <title>
 }
 
 impl Opts {
+    /// The meters `-v` draws (builtin/index-pack.c:1258-1263, :1340-1343), or
+    /// none. `progress_title` names the first one; otherwise it is `Receiving
+    /// objects` for `--stdin` and `Indexing objects` for a named pack.
+    ///
+    /// Only `--stdin` reports throughput, and only for the bytes read after the
+    /// meter starts: the header's `fill()` has already taken one buffer, which
+    /// from a regular file is the whole `DEFAULT_IO_BUFFER_SIZE` (128 KiB) and
+    /// from a pipe what the pipe held (64 KiB).
+    fn meters(&self) -> Box<dyn prodash::DynNestedProgress> {
+        if !self.verbose {
+            return Box::new(gix::progress::Discard);
+        }
+        let title: &'static str = match &self.progress_title {
+            // One title per process, for the life of the process.
+            Some(title) => Box::leak(title.clone().into_boxed_str()),
+            None if self.stdin => "Receiving objects",
+            None => "Indexing objects",
+        };
+        let first_read = match self.stdin {
+            false => u64::MAX,
+            true => {
+                use std::os::fd::AsRawFd;
+                let fd = io::stdin().as_raw_fd();
+                let file = std::mem::ManuallyDrop::new(unsafe {
+                    <fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+                });
+                match file.metadata().map(|m| m.is_file()) {
+                    Ok(true) => 128 * 1024,
+                    _ => 64 * 1024,
+                }
+            }
+        };
+        Box::new(super::fetch_progress::Meters::index_pack(title, first_read))
+    }
+
+
     fn new() -> Self {
         Opts {
             stdin: false,
@@ -197,6 +235,8 @@ impl Opts {
             object_format: None,
             pack_header: false,
             pack: None,
+            verbose: false,
+            progress_title: None,
         }
     }
 
@@ -269,7 +309,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
         }
 
         match a {
-            "-v" => {} // progress is not drawn; stdout is unaffected
+            "-v" => opts.verbose = true,
             "--stdin" => opts.stdin = true,
             "--fix-thin" => opts.fix_thin = true,
             "--verify" => opts.verify = true,
@@ -292,11 +332,12 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
                 opts.index_out = Some(PathBuf::from(v));
             }
             "--progress-title" => {
-                // Consumed for parity; no progress is drawn.
+                // `if (progress_title || (i+1) >= argc) usage(index_pack_usage);`
                 i += 1;
-                if args.get(i).is_none() {
+                let (None, Some(title)) = (&opts.progress_title, args.get(i)) else {
                     return Ok(usage_error());
-                }
+                };
+                opts.progress_title = Some(title.clone());
             }
             _ if a.starts_with("--keep=") => {
                 opts.keep = Some(Some(a["--keep=".len()..].to_string()));
@@ -702,6 +743,7 @@ fn write_index_for_pack(
 
     let tmp = with_suffix(index_path, ".tmp");
     let mut out = io::BufWriter::new(fs::File::create(&tmp)?);
+    let mut progress = opts.meters();
     let written = pack::index::write_data_iter_to_stream(
         pack::index::Version::default(),
         || {
@@ -710,13 +752,15 @@ fn write_index_for_pack(
         },
         &mut entries,
         opts.threads,
-        &mut gix::progress::Discard,
+        &mut *progress,
         &mut out,
         &AtomicBool::new(false),
         hash,
         None,
         pack_version,
     );
+    // The closing `done` lines are drawn as the meters go.
+    drop(progress);
     // git indexes into a `git_mkstemp_mode()` file that is only ever renamed into place, so a
     // pack it cannot read leaves nothing behind; the temporary here has to go the same way.
     let outcome = match written {
@@ -1032,10 +1076,11 @@ fn index_from_stdin(
         // from the pack, completing a thin pack in place; without it the pack is
         // copied through byte-for-byte and a thin base is a fatal `NotFound`.
         let resolver = opts.fix_thin.then(|| repo.objects.clone());
+        let mut progress = opts.meters();
         let outcome = pack::Bundle::write_to_directory(
             input,
             Some(&write_dir),
-            &mut gix::progress::Discard,
+            &mut *progress,
             &AtomicBool::new(false),
             resolver,
             pack::bundle::write::Options {
@@ -1043,7 +1088,9 @@ fn index_from_stdin(
                 object_hash: opts.object_hash(),
                 ..Default::default()
             },
-        )?;
+        );
+        drop(progress);
+        let outcome = outcome?;
 
         let hash = outcome.index.data_hash;
         let (Some(gix_data), Some(gix_index)) = (&outcome.data_path, &outcome.index_path) else {

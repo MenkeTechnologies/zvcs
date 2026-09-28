@@ -566,7 +566,7 @@ fn is_executable(path: &Path) -> bool {
 /// file creation and dies there with git's `unable to create '<path>': Not a
 /// directory` rather than complaining about the directories. `create_dir_all`
 /// cannot express that: it reports the same `NotADirectory` as any other error.
-fn safe_create_leading_directories(path: &str) -> bool {
+pub(crate) fn safe_create_leading_directories(path: &str) -> bool {
     let bytes = path.as_bytes();
     // `offset_1st_component()`: the leading separator of an absolute path is not
     // a component that can be created.

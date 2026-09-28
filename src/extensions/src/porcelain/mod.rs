@@ -589,7 +589,7 @@ mod binary_patch;
 mod bisect;
 mod blame;
 pub(crate) mod branch;
-mod bugreport;
+pub(crate) mod bugreport;
 mod bundle;
 pub(crate) mod cat_file;
 mod check_attr;

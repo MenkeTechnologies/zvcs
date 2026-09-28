@@ -611,6 +611,12 @@ struct Opts {
     // Output shape.
     to_stdout: bool,
     outdir: Option<String>,
+    /// `output_directory` as `set_outdir()` (builtin/log.c:1510-1527) leaves it
+    /// once the invocation prefix is known: an absolute directory as given, a
+    /// relative one behind the prefix, the prefix alone without one, and `./` at
+    /// the top with none. It is what a failed `fopen()` names, where the file
+    /// name printed on stdout drops the leading `outdir_offset` bytes.
+    outdir_reported: String,
     /// Whether `-o`/`--output-directory` was given on the command line, as
     /// opposed to [`Opts::outdir`] having been seeded from
     /// `format.outputDirectory`.
@@ -1090,6 +1096,23 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             return Ok(fatal(&format!("{name} does not make sense")));
         }
     }
+    // The output directory is made before the walk looks at a single commit
+    // (builtin/log.c:2272-2284), so an empty series still leaves it behind.
+    let prefix = crate::setup::startup_prefix(&repo).filter(|p| !p.is_empty());
+    opts.outdir_reported = match (&opts.outdir, prefix) {
+        (Some(dir), _) if std::path::Path::new(dir).is_absolute() => dir.clone(),
+        (Some(dir), Some(p)) => format!("{p}{dir}"),
+        (Some(dir), None) => dir.clone(),
+        (None, Some(p)) => p,
+        (None, None) => "./".to_string(),
+    };
+    if !opts.to_stdout && opts.output.is_none() {
+        if let Some(dir) = &opts.outdir {
+            if let Err(code) = create_outdir(dir, &opts.outdir_reported) {
+                return Ok(code);
+            }
+        }
+    }
     // `if (ignore_if_in_upstream && has_commit_patch_id(commit, &ids)) continue;`
     // (builtin/log.c:2348-2349), over the commits the walk handed back.
     // The walk's boundary — the cover letter's diffstat base and the inferred
@@ -1217,7 +1240,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         if let Err(code) =
             render_cover_letter(&repo, &commits, &walked, &pending, printed_total, &opts, &th, &mut msg)?
         {
-            emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
+            emit_message(&mut buffered, &msg, cover_filename(&opts), &opts, true)?;
             stdout.write_all(&buffered)?;
             stdout.flush()?;
             return Ok(code);
@@ -1228,7 +1251,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         if let Err(code) =
             emit_diff_of_diff(&repo, &opts, range_diff_ranges.as_ref(), creation_factor, &commits, 0, &mut msg)?
         {
-            emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
+            emit_message(&mut buffered, &msg, cover_filename(&opts), &opts, true)?;
             stdout.write_all(&buffered)?;
             stdout.flush()?;
             return Ok(code);
@@ -1238,7 +1261,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             bases_pending = false;
         }
         write_signature(&mut msg, &opts);
-        emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
+        emit_message(&mut buffered, &msg, cover_filename(&opts), &opts, true)?;
     }
 
     for (idx, id) in commits.iter().enumerate() {
@@ -1278,7 +1301,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             if let Err(code) =
                 emit_diff_of_diff(&repo, &opts, range_diff_ranges.as_ref(), creation_factor, &commits, 2, &mut msg)?
             {
-                emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts)?;
+                emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts, false)?;
                 stdout.write_all(&buffered)?;
                 stdout.flush()?;
                 return Ok(code);
@@ -1309,7 +1332,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             }
             buffered.push(b'\n');
         }
-        emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts)?;
+        emit_message(&mut buffered, &msg, patch_filename(&commit, nr, &opts)?, &opts, false)?;
     }
 
     match stdout.write_all(&buffered).and_then(|()| stdout.flush()) {
@@ -1486,7 +1509,34 @@ fn write_indented(out: &mut Vec<u8>, body: &[u8], indent: usize) {
 
 /// Append one rendered message to the mbox stream, or write it to its file and
 /// note the name for stdout.
-fn emit_message(buffered: &mut Vec<u8>, msg: &[u8], name: String, opts: &Opts) -> Result<()> {
+/// `safe_create_leading_directories_const()` and then `mkdir()` on the output
+/// directory (builtin/log.c:2272-2284): a prefix that is a file is not the
+/// leading directories' failure but the `mkdir()`'s, and an existing directory is
+/// fine. `dir` is the directory as seen from here, `reported` as git names it
+/// from the top of the worktree ([`Opts::outdir_reported`]).
+fn create_outdir(dir: &str, reported: &str) -> std::result::Result<(), ExitCode> {
+    if !super::bugreport::safe_create_leading_directories(dir) {
+        return Err(fatal(&format!("could not create leading directories of '{reported}'")));
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(fatal(&format!(
+            "could not create directory '{reported}': {}",
+            super::diff_pairs::io_reason(&e)
+        ))),
+    }
+}
+
+/// `cover` is `make_cover_letter()`'s file, whose failed `open_next_file()` is
+/// `failed to create cover-letter file` rather than the patches' message.
+fn emit_message(
+    buffered: &mut Vec<u8>,
+    msg: &[u8],
+    name: String,
+    opts: &Opts,
+    cover: bool,
+) -> Result<()> {
     // `--output=<file>`: every message of the series is appended to the one file the
     // option opened, and nothing is announced on stdout.
     if let Some(path) = &opts.output {
@@ -1498,21 +1548,41 @@ fn emit_message(buffered: &mut Vec<u8>, msg: &[u8], name: String, opts: &Opts) -
         buffered.extend_from_slice(msg);
         return Ok(());
     }
+    // `strbuf_complete(&filename, '/')`: a directory already ending in a slash
+    // gets no second one.
+    let join = |dir: &str| match dir.ends_with('/') {
+        true => format!("{dir}{name}"),
+        false => format!("{dir}/{name}"),
+    };
     let path = match &opts.outdir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)?;
-            format!("{dir}/{name}")
-        }
+        Some(dir) => join(dir),
         None => name.clone(),
     };
     if !opts.quiet {
         let shown = match &opts.outdir {
             Some(_) => path.clone(),
-            None => name,
+            None => name.clone(),
         };
         writeln!(buffered, "{shown}")?;
     }
-    std::fs::write(&path, msg)?;
+    // `open_next_file()` (builtin/log.c:1140-1168) names the file on stdout and
+    // only then opens it; a failed `fopen()` is `error_errno()` there and a `die()`
+    // in its caller (builtin/log.c:1414-1415, 2518-2519) — the name already out.
+    if let Err(e) = std::fs::write(&path, msg) {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(buffered)?;
+        stdout.flush()?;
+        buffered.clear();
+        eprintln!(
+            "error: cannot open patch file {}: {}",
+            join(&opts.outdir_reported),
+            super::diff_pairs::io_reason(&e)
+        );
+        return Err(crate::fatal::die(match cover {
+            true => "failed to create cover-letter file",
+            false => "failed to create output files",
+        }));
+    }
     Ok(())
 }
 
@@ -1867,6 +1937,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     let mut o = Opts {
         to_stdout: false,
         outdir: cfg_str("format.outputDirectory"),
+        outdir_reported: String::new(),
         outdir_cli: false,
         numbered: snap.boolean("format.numbered"),
         start_number: 1,

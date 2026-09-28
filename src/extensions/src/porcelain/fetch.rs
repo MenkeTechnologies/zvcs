@@ -3592,6 +3592,28 @@ fn fetch_one(
     };
 
     // ```c
+    // if (server_supports("filter")) {
+    //         server_supports_filtering = 1;
+    //         print_verbose(args, _("Server supports %s"), "filter");
+    // } else if (args->filter_options.choice) {
+    //         warning("filtering not recognized by server, ignoring");
+    // }
+    // ```
+    //
+    // (fetch-pack.c:1173-1178, and the v2 spelling at 305-313.) It belongs to the
+    // request, so a fetch that had nothing to ask for says nothing — the same test
+    // `clone` makes.
+    if fetch_filter.is_some()
+        && matches!(outcome.status, Status::Change { .. })
+        && !gix::protocol::fetch::filter::is_supported(
+            outcome.handshake.server_protocol_version,
+            &outcome.handshake.capabilities,
+        )
+    {
+        eprintln!("warning: filtering not recognized by server, ignoring");
+    }
+
+    // ```c
     // if (rm && check_connected(iterate_ref_map, &rm, &opt)) {
     //         rc = error(_("%s did not send all necessary objects"), display_state->url);
     //         goto abort;

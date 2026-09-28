@@ -12,14 +12,16 @@ struct Replace {
     with: OwnShared<BString>,
 }
 
+/// The `url.<base>.insteadOf` and `url.<base>.pushInsteadOf` rewrites of a configuration.
 #[derive(Default, Debug, Clone)]
-pub(crate) struct Rewrite {
+pub struct Rewrite {
     url_rewrite: Vec<Replace>,
     push_url_rewrite: Vec<Replace>,
 }
 
 /// Init
 impl Rewrite {
+    /// Collect the rewrites of every `url` section of `config` that `filter` admits.
     pub fn from_config(config: &gix_config::File, mut filter: fn(&gix_config::file::Metadata) -> bool) -> Rewrite {
         config
             .sections_by_name_and_filter("url", &mut filter)
@@ -63,6 +65,7 @@ impl Rewrite {
         }
     }
 
+    /// The rewritten form of `url`, or `None` if no rule applies.
     pub fn longest(&self, url: &gix_url::Url, direction: Direction) -> Option<BString> {
         if self.replacements_for(direction).is_empty() {
             None

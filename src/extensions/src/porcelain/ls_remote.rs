@@ -36,12 +36,13 @@
 //! * `version:` in front of a *date* key falls back to the plain numeric
 //!   compare instead of git's versioncmp over the formatted date string.
 //!
-//! Running outside a repository also bails: gitoxide resolves transport,
-//! credential and `insteadOf` configuration through a `Repository`, and there
-//! is no repository-less remote in the vendored crates.
+//! Outside a repository the operand is the URL, rewritten by the system, global
+//! and command-line `url.<base>.insteadOf`, and the transport is opened on it
+//! directly (see [`outside_repository`]); a date `--sort` key dies there for
+//! want of object data, as in git.
 
 use crate::refsort::{self, Prereleases};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::cmp::Ordering;
 use std::process::ExitCode;
 
@@ -206,11 +207,10 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         None => (None, &[]),
     };
 
-    // gitoxide resolves URL rewriting, transport and credential configuration
-    // through a Repository; there is no repository-less remote to fall back on.
+    // `ls-remote` is `RUN_SETUP_GENTLY`: outside a repository it still lists.
     let repo = match crate::setup::discover() {
         Ok(repo) => repo,
-        Err(_) => bail!("ls-remote outside a repository is not supported (no repository found)"),
+        Err(_) => return Ok(outside_repository(repository, patterns, &opts)),
     };
     // `remote_get(dest)` (builtin/ls-remote.c) is the first lookup, which runs
     // remote.c's `read_config()`.
@@ -350,11 +350,19 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    Ok(list(&ref_map.remote_refs, patterns, &opts, Some(&repo)))
+}
+
+/// The listing itself, from the advertised refs on: filter, sort, print.
+///
+/// `repo` is `None` outside a repository, where a date key has no object data
+/// to read and `ref_sorting_options()` dies on it — after the refs are in.
+fn list(refs: &[Ref], patterns: &[&str], opts: &Opts, repo: Option<&gix::Repository>) -> ExitCode {
     let mut rows: Vec<Row> = Vec::new();
-    for r in &ref_map.remote_refs {
+    for r in refs {
         push_rows(r, &mut rows);
     }
-    rows.retain(|row| check_ref(row, &opts) && tail_match(patterns, &row.name));
+    rows.retain(|row| check_ref(row, opts) && tail_match(patterns, &row.name));
     rows.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
 
     // git only reorders when `--sort` was given; otherwise the advertisement
@@ -364,15 +372,39 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             Ok(keys) => keys,
             Err(msg) => {
                 eprintln!("fatal: {msg}");
-                return Ok(ExitCode::from(128));
+                return ExitCode::from(128);
             }
         };
-        if let Err(msg) = resolve_dates(&repo, &keys, &mut rows) {
-            eprintln!("fatal: {msg}");
-            return Ok(ExitCode::from(128));
-        }
-        // git seeds `versioncmp`'s prerelease list from config once, lazily.
-        let prereleases = Prereleases::new(&repo);
+        let prereleases = match repo {
+            Some(repo) => {
+                if let Err(msg) = resolve_dates(repo, &keys, &mut rows) {
+                    eprintln!("fatal: {msg}");
+                    return ExitCode::from(128);
+                }
+                // git seeds `versioncmp`'s prerelease list from config once, lazily.
+                Prereleases::new(repo)
+            }
+            None => {
+                // `parse_ref_filter_atom()`: "not a git repository, but the field
+                // '%.*s' requires access to object data" for the first such key
+                // on the command line.
+                if let Some(field) = opts.sort.iter().find_map(|spec| {
+                    let field = spec.trim_start_matches('-');
+                    let field = field
+                        .strip_prefix("version:")
+                        .or_else(|| field.strip_prefix("v:"))
+                        .unwrap_or(field);
+                    matches!(field, "creatordate" | "committerdate" | "authordate" | "taggerdate")
+                        .then_some(field)
+                }) {
+                    eprintln!(
+                        "fatal: not a git repository, but the field '{field}' requires access to object data"
+                    );
+                    return ExitCode::from(128);
+                }
+                Prereleases::none()
+            }
+        };
         rows.sort_by(|a, b| compare_rows(&keys, a, b, &prereleases));
     }
 
@@ -387,11 +419,11 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     }
     print!("{out}");
 
-    Ok(if rows.is_empty() && opts.exit_code {
+    if rows.is_empty() && opts.exit_code {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
-    })
+    }
 }
 
 /// Walk the command line the way `parse_options` does.
@@ -924,4 +956,100 @@ mod tests {
         // A bare `-` is an operand, not a switch, and stops parsing too.
         assert_eq!(parse(&["-", "--tags"]).unwrap().1, vec!["-", "--tags"]);
     }
+}
+
+/// `cmd_ls_remote()` without a repository: `remote_get(dest)` has only the
+/// system, global and command-line configuration to read, so the operand is
+/// the URL (after `url.<base>.insteadOf`), and the transport is built from it
+/// directly — `transport_get()` needs no repository either.
+fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) -> ExitCode {
+    // `remote_get(NULL)` finds no default remote to list.
+    let Some(dest) = repository else {
+        eprintln!("fatal: No remote configured to list refs from.");
+        return ExitCode::from(128);
+    };
+    let config = crate::config::global_config();
+    let mut raw = gix::bstr::BString::from(dest);
+    gix::remote::url::Rewrite::from_config(&config, |_| true)
+        .rewrite_url_in_place(&mut raw, gix::remote::Direction::Fetch);
+    if opts.get_url {
+        println!("{raw}");
+        return ExitCode::SUCCESS;
+    }
+    let url = match gix::url::parse(raw.as_ref()) {
+        Ok(url) => url,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            return ExitCode::from(128);
+        }
+    };
+    if let Some(code) = crate::setup::check_url_allowed(&url) {
+        return code;
+    }
+    let version = match crate::config::config_get_string(None, "protocol.version").as_deref() {
+        None | Some("2") => gix::protocol::transport::Protocol::V2,
+        Some("1") => gix::protocol::transport::Protocol::V1,
+        Some("0") => gix::protocol::transport::Protocol::V0,
+        Some(v) => {
+            eprintln!("fatal: unknown value for config 'protocol.version': {v}");
+            return ExitCode::from(128);
+        }
+    };
+    let upload_pack = super::fetch::local_service_program(
+        Some(&url),
+        opts.upload_pack.as_deref().map(Into::into),
+        "upload-pack",
+    );
+    let refs = match advertised_refs(url.clone(), version, upload_pack, &opts.server_options) {
+        Ok(refs) => refs,
+        Err(err) => {
+            if let Some(code) = crate::transport_err::ssh_fatal(&url.to_bstring().to_string(), &err)
+                .or_else(|| crate::transport_err::hang_up_fatal(&err))
+            {
+                return code;
+            }
+            eprintln!("fatal: {err}");
+            return ExitCode::from(128);
+        }
+    };
+    list(&refs, patterns, opts, None)
+}
+
+/// Connect, shake hands and list: the advertisement a v0/v1 server sends
+/// unasked, or the answer to a v2 `ls-refs`.
+fn advertised_refs(
+    url: gix::Url,
+    version: gix::protocol::transport::Protocol,
+    upload_pack: Option<gix::bstr::BString>,
+    server_options: &[gix::bstr::BString],
+) -> anyhow::Result<Vec<Ref>> {
+    use gix::protocol::transport::client::blocking_io::connect;
+    let mut transport = connect::connect(
+        url,
+        connect::Options {
+            version,
+            upload_pack,
+            ..Default::default()
+        },
+    )?;
+    let mut handshake = gix::protocol::handshake(
+        &mut transport,
+        gix::protocol::transport::Service::UploadPack,
+        gix::credentials::builtin,
+        Vec::new(),
+        &mut gix::progress::Discard,
+    )?;
+    let refs = match handshake.refs.take() {
+        Some(refs) => refs,
+        None => gix::protocol::LsRefsCommand::new(
+            None,
+            &handshake.capabilities,
+            ("agent", Some(gix::protocol::agent(gix::env::agent()))),
+            server_options,
+            None,
+        )
+        .invoke_blocking(&mut transport, &mut gix::progress::Discard, false)?,
+    };
+    gix::protocol::indicate_end_of_interaction(&mut transport, false)?;
+    Ok(refs)
 }

@@ -1319,7 +1319,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             &notes_trees,
             &mut msg,
         ) {
-            emit_message(&mut buffered, &[], patch_filename(&commit, nr, &opts)?, &opts)?;
+            emit_message(&mut buffered, &[], patch_filename(&commit, nr, &opts)?, &opts, false)?;
             stdout.write_all(&buffered)?;
             stdout.flush()?;
             return Err(e);

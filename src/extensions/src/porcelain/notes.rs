@@ -9,6 +9,8 @@ use gix::objs::tree::{EntryKind, EntryMode};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::Target;
 
+use crate::cstdio::println;
+
 /// `git notes` — add or inspect object notes.
 ///
 /// Notes live in their own commit history (`refs/notes/commits` by default),
@@ -2382,6 +2384,10 @@ fn merge_usage(msg: &str) -> Result<ExitCode> {
 
 /// `builtin/notes.c:merge()` — the notes-merge driver.
 fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<ExitCode> {
+    // `notes-merge.c` reports each change with `printf()` and `builtin/notes.c` the
+    // conflict summary with `fprintf(stderr, …)` (builtin/notes.c:1004), so off a
+    // terminal the summary comes out first and the per-note lines at `exit()`.
+    crate::cstdio::defer();
     let mut verbosity: i32 = 0;
     let mut strategy: Option<String> = None;
     let mut do_commit = false;

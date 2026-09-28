@@ -2290,7 +2290,12 @@ fn try_threeway(
     if p.binary {
         let post_bytes = match rebuild_binary(p, &pre_bytes, o.reverse) {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(ThreeWayOutcome::Fallback(None)),
+            // `apply_binary()` reports with `error()` before `try_threeway()`
+            // returns -1, so the direct attempt that follows repeats the line.
+            Err(msg) => {
+                err(o.quiet(), &format!("error: {msg}"));
+                return Ok(ThreeWayOutcome::Fallback(None));
+            }
         };
         return finish_threeway(repo, path, pre_id, post_bytes, ours, o);
     }

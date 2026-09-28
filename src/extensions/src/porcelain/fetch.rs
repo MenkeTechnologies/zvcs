@@ -3738,6 +3738,7 @@ fn fetch_one(
     // it sorted by refname, so the backfilled rows are ordered among themselves
     // regardless of the order the remote advertised them in.
     second_pass.sort_by_key(|(_, m, _, _)| m.remote.as_name().map(ToOwned::to_owned));
+    let backfill_rows = second_pass.len();
 
     for (update, mapping, spec, edit, backfill) in first_pass
         .into_iter()
@@ -3889,6 +3890,30 @@ fn fetch_one(
         // here, ahead of the `FETCH_HEAD` push below, rather than at the summary
         // match further down.
         if update.mode == Mode::ImplicitTagNotSentByRemote {
+            continue;
+        }
+
+        // ```c
+        // if (fetch_and_consume_refs(display_state, transport, transaction, ref_map, ...)) {
+        //         retcode = 1;
+        //         goto cleanup;
+        // }
+        // ```
+        //
+        // (`do_fetch()`, builtin/fetch.c.) A refused update fails the first pass, and
+        // `backfill_tags()` is never reached: its tags are neither written, listed nor
+        // recorded in `FETCH_HEAD`. The vendored update has already applied them
+        // together with everything else, so the write is taken back here.
+        if backfill && rejected {
+            if let (false, Some(RefEdit { change: Change::Update { expected, .. }, name, .. })) =
+                (opts.dry_run, edit)
+            {
+                let old = match expected {
+                    PreviousValue::MustExistAndMatch(Target::Object(id)) => Some(*id),
+                    _ => None,
+                };
+                undo_ref_write(repo, name.as_ref(), old)?;
+            }
             continue;
         }
 
@@ -4261,12 +4286,19 @@ fn fetch_one(
     // place is ahead of everything `do_fetch()` does after `fetch_and_consume_refs()`: the
     // `--set-upstream` warnings and the summary rendered at `cleanup:`. The timing half is
     // not ported; this build does not time the forced-update check.
+    //
+    // `backfill_tags()` runs `store_updated_refs()` a second time, so the note is
+    // printed once more whenever that pass had tags to store — which it only
+    // reaches when the first pass refused nothing.
     if !opts.show_forced_updates && crate::advice::Advice::FetchShowForcedUpdates.enabled_in(repo) {
-        eprintln!(
-            "warning: fetch normally indicates which branches had a forced update,\n\
-             but that check has been disabled; to re-enable, use '--show-forced-updates'\n\
-             flag or run 'git config fetch.showForcedUpdates true'"
-        );
+        let passes = if backfill_rows > 0 && !rejected { 2 } else { 1 };
+        for _ in 0..passes {
+            eprintln!(
+                "warning: fetch normally indicates which branches had a forced update,\n\
+                 but that check has been disabled; to re-enable, use '--show-forced-updates'\n\
+                 flag or run 'git config fetch.showForcedUpdates true'"
+            );
+        }
     }
 
     fetch_head.write(if atomic_abort { &[] } else { &fetch_head_rows })?;

@@ -27,6 +27,10 @@
 //! commits these callers see, since a `^<rev>`-excluded commit never enters the
 //! walk. Every entry point therefore takes the walked set and reads relevance off
 //! membership in it.
+//!
+//! A reflog walk (`-g`) is the exception: it has no walked set, so the three
+//! passes collapse into the per-entry state machine [`ReflogWalk`], which runs
+//! `try_to_simplify_commit()` and `rewrite_parents()` as each entry streams out.
 
 use anyhow::Result;
 use gix::hash::ObjectId;
@@ -80,6 +84,19 @@ pub(super) fn classify(
     mode: Mode,
     diff: &mut dyn TreeDiff,
 ) -> Result<Classified> {
+    classify_with(id, parents, &|p| walked.contains(p), mode, diff)
+}
+
+/// [`classify`] with `relevant_commit()` as a predicate rather than membership in
+/// a walked list — for a walk that has no such list, like the reflog walk, where
+/// every commit short of an UNINTERESTING one is relevant.
+pub(super) fn classify_with(
+    id: ObjectId,
+    parents: &[ObjectId],
+    relevant: &dyn Fn(&ObjectId) -> bool,
+    mode: Mode,
+    diff: &mut dyn TreeDiff,
+) -> Result<Classified> {
     if parents.is_empty() {
         // "Pretend as if we are comparing ourselves to the (non-existent) first
         // parent of this commit object": a root is TREESAME when its tree carries
@@ -103,7 +120,7 @@ pub(super) fn classify(
     let mut treesame_with: Vec<bool> = Vec::new();
 
     for (nth, parent) in parents.iter().enumerate() {
-        if walked.contains(parent) {
+        if relevant(parent) {
             relevant_parents += 1;
         }
         if nth == 1 {
@@ -121,7 +138,7 @@ pub(super) fn classify(
         }
         if !diff.differs(id, Some(*parent))? {
             // REV_TREE_SAME.
-            if !mode.simplify_history || !walked.contains(parent) {
+            if !mode.simplify_history || !relevant(parent) {
                 // "Even if a merge with an uninteresting side branch brought the
                 // entire change we are interested in, we do not want to lose the
                 // other branches of this merge, so we just keep going."
@@ -138,7 +155,7 @@ pub(super) fn classify(
                 treesame: true,
             });
         }
-        if walked.contains(parent) {
+        if relevant(parent) {
             relevant_change = true;
         } else {
             irrelevant_change = true;
@@ -350,6 +367,15 @@ pub(super) fn one_relevant_parent(
     walked: &HashSet<ObjectId>,
     first_parent: bool,
 ) -> Option<ObjectId> {
+    one_relevant_parent_with(parents, &|p| walked.contains(p), first_parent)
+}
+
+/// [`one_relevant_parent`] with `relevant_commit()` as a predicate.
+fn one_relevant_parent_with(
+    parents: &[ObjectId],
+    is_relevant: &dyn Fn(&ObjectId) -> bool,
+    first_parent: bool,
+) -> Option<ObjectId> {
     if parents.is_empty() {
         return None;
     }
@@ -358,7 +384,7 @@ pub(super) fn one_relevant_parent(
     }
     let mut relevant = None;
     for p in parents {
-        if walked.contains(p) {
+        if is_relevant(p) {
             if relevant.is_some() {
                 return None;
             }
@@ -456,4 +482,219 @@ pub(super) fn shows(
         return false;
     }
     parents.iter().filter(|p| walked.contains(*p)).count() >= 2
+}
+
+/// The commit state a reflog walk (`-g`) carries from one entry to the next.
+///
+/// A reflog walk has no limited list to classify up front: `get_revision_1()`
+/// takes each entry from `next_reflog_entry()`, clears its `ADDED`, `SEEN` and
+/// `SHOWN` flags and runs `try_to_simplify_commit()` on it (revision.c:4386-4420).
+/// When the entry is shown and ancestry is wanted, `rewrite_parents()` walks
+/// back through the *real* history behind it — `rewrite_one_1()` calls
+/// `process_parents()`, and so `try_to_simplify_commit()`, on each commit it
+/// passes, whether or not the reflog names it (revision.c:4035-4054). A commit
+/// is relevant unless it is UNINTERESTING without being a BOTTOM
+/// (revision.c:524-527). What those calls do is
+/// written onto the commit objects and outlives the entry: the `TREESAME` flag,
+/// the parent list `try_to_simplify_commit()` prunes and `rewrite_parents()`
+/// rewrites in place, and — in `rev-list` — the list `finish_commit()` frees
+/// after printing (builtin/rev-list.c:228-234). A commit the reflog names twice
+/// meets the second time whatever the first left behind.
+///
+/// Whether a commit has been *parsed* matters as much. `try_to_simplify_commit()`
+/// returns at once for a commit with no tree loaded (`repo_get_commit_tree()`
+/// answers NULL until `parse_commit()` has run, revision.c:976-977), and an
+/// unparsed commit's parent list is empty. Only the reflog entries themselves,
+/// the parents `try_to_simplify_commit()` compares against, and the parents
+/// `process_parents()` walks to are ever parsed — so the second parent of a
+/// merge under `--first-parent`, which neither reaches, stays unsimplified and
+/// `rewrite_parents()` keeps it as it is.
+pub(super) struct ReflogWalk<'a> {
+    repo: &'a gix::Repository,
+    mode: Mode,
+    /// `revs->limited`: `rewrite_one_1()` runs `process_parents()` only when it
+    /// is off, so under it a commit outside the reflog is never simplified.
+    limited: bool,
+    /// Everything `limit_list()` painted UNINTERESTING.
+    uninteresting: &'a HashSet<ObjectId>,
+    /// The `^<rev>` tips, which carry BOTTOM as well and so stay relevant.
+    bottoms: &'a HashSet<ObjectId>,
+    /// `commit->parents`, once parsed.
+    parents: HashMap<ObjectId, Vec<ObjectId>>,
+    /// The `TREESAME` flag. `try_to_simplify_commit()` only ever sets it.
+    treesame: HashSet<ObjectId>,
+    /// The `ADDED` flag `process_parents()` checks and sets.
+    added: HashSet<ObjectId>,
+    /// `commit->object.parsed`.
+    parsed: HashSet<ObjectId>,
+}
+
+impl<'a> ReflogWalk<'a> {
+    pub(super) fn new(
+        repo: &'a gix::Repository,
+        mode: Mode,
+        limited: bool,
+        uninteresting: &'a HashSet<ObjectId>,
+        bottoms: &'a HashSet<ObjectId>,
+    ) -> Self {
+        ReflogWalk {
+            repo,
+            mode,
+            limited,
+            uninteresting,
+            bottoms,
+            parents: HashMap::new(),
+            treesame: HashSet::new(),
+            added: HashSet::new(),
+            parsed: HashSet::new(),
+        }
+    }
+
+    /// `commit->parents` as the walk has left it, parsing the commit if needed.
+    pub(super) fn parents(&mut self, id: ObjectId) -> &[ObjectId] {
+        let repo = self.repo;
+        self.parents
+            .entry(id)
+            .or_insert_with(|| super::rev_list::commit_parents(repo, id))
+    }
+
+    /// One entry out of `next_reflog_entry()`: `flags &= ~(ADDED | SEEN |
+    /// SHOWN)`, then `try_to_simplify_commit()`.
+    /// The entry was parsed when `next_reflog_commit()` looked it up.
+    pub(super) fn pop(&mut self, id: ObjectId, diff: &mut dyn TreeDiff) -> Result<()> {
+        self.parsed.insert(id);
+        self.added.remove(&id);
+        self.simplify(id, diff)
+    }
+
+    /// `try_to_simplify_commit()`: prunes the parent list in place and sets the
+    /// flag; it never clears one set by an earlier pass.
+    fn simplify(&mut self, id: ObjectId, diff: &mut dyn TreeDiff) -> Result<()> {
+        if !self.parsed.contains(&id) {
+            return Ok(());
+        }
+        let parents = self.parents(id).to_vec();
+        let (uninteresting, bottoms) = (self.uninteresting, self.bottoms);
+        // Each parent is parsed just before it is compared (revision.c:1032-1036).
+        let mut compared = ParentsCompared { inner: diff, parents: Vec::new() };
+        let classified = classify_with(
+            id,
+            &parents,
+            &|p| relevant_commit(uninteresting, bottoms, p),
+            self.mode,
+            &mut compared,
+        )?;
+        self.parsed.extend(compared.parents);
+        if classified.treesame {
+            self.treesame.insert(id);
+        }
+        self.parents.insert(id, classified.parents);
+        Ok(())
+    }
+
+    /// `process_parents()` with no queue: once per `ADDED`, and an UNINTERESTING
+    /// commit is never simplified (revision.c:1124-1174).
+    fn process_parents(&mut self, id: ObjectId, diff: &mut dyn TreeDiff) -> Result<()> {
+        if !self.added.insert(id) || !self.parsed.contains(&id) {
+            return Ok(());
+        }
+        if self.uninteresting.contains(&id) {
+            // Every parent is parsed on the way to marking it
+            // (revision.c:1147-1166).
+            let parents = self.parents(id).to_vec();
+            self.parsed.extend(parents);
+            return Ok(());
+        }
+        self.simplify(id, diff)?;
+        // The loop parses each parent it goes on to, stopping after the first
+        // under `--first-parent` (revision.c:1181-1213).
+        let take = if self.mode.first_parent { 1 } else { usize::MAX };
+        let parents: Vec<ObjectId> = self.parents(id).iter().take(take).copied().collect();
+        self.parsed.extend(parents);
+        Ok(())
+    }
+
+    /// `get_commit_action()`'s `revs->prune && revs->dense` arm
+    /// (revision.c:4221-4245): whether the TREESAME test lets the entry through.
+    pub(super) fn shows(&mut self, id: ObjectId, want_ancestry: bool) -> bool {
+        if !self.treesame.contains(&id) {
+            return true;
+        }
+        if !want_ancestry {
+            return false;
+        }
+        let (uninteresting, bottoms) = (self.uninteresting, self.bottoms);
+        self.parents(id).iter().filter(|p| relevant_commit(uninteresting, bottoms, p)).count() >= 2
+    }
+
+    /// `rewrite_parents()` (revision.c:4072-4092), in place.
+    pub(super) fn rewrite(&mut self, id: ObjectId, diff: &mut dyn TreeDiff) -> Result<()> {
+        let mut out: Vec<ObjectId> = Vec::new();
+        for parent in self.parents(id).to_vec() {
+            if let Some(p) = self.rewrite_one(parent, diff)? {
+                out.push(p);
+            }
+        }
+        // `remove_duplicate_parents()`.
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        out.retain(|p| seen.insert(*p));
+        self.parents.insert(id, out);
+        Ok(())
+    }
+
+    /// `rewrite_one_1()` (revision.c:4035-4054). `None` is
+    /// `rewrite_one_noparents`.
+    fn rewrite_one(&mut self, mut p: ObjectId, diff: &mut dyn TreeDiff) -> Result<Option<ObjectId>> {
+        loop {
+            if !self.limited {
+                self.process_parents(p, diff)?;
+            }
+            if self.uninteresting.contains(&p) || !self.treesame.contains(&p) {
+                return Ok(Some(p));
+            }
+            let first_parent = self.mode.first_parent;
+            let (uninteresting, bottoms) = (self.uninteresting, self.bottoms);
+            let grandparents = self.parents(p);
+            if grandparents.is_empty() {
+                return Ok(None);
+            }
+            let relevant = |c: &ObjectId| relevant_commit(uninteresting, bottoms, c);
+            match one_relevant_parent_with(grandparents, &relevant, first_parent) {
+                Some(next) => p = next,
+                None => return Ok(Some(p)),
+            }
+        }
+    }
+
+    /// `finish_commit()`'s `commit_list_free(commit->parents); commit->parents =
+    /// NULL;` — `rev-list` drops a printed commit's parents for good.
+    pub(super) fn free_parents(&mut self, id: ObjectId) {
+        self.parents.insert(id, Vec::new());
+    }
+}
+
+/// `relevant_commit()` (revision.c:524-527): `(flags & (UNINTERESTING | BOTTOM))
+/// != UNINTERESTING`.
+fn relevant_commit(
+    uninteresting: &HashSet<ObjectId>,
+    bottoms: &HashSet<ObjectId>,
+    id: &ObjectId,
+) -> bool {
+    !uninteresting.contains(id) || bottoms.contains(id)
+}
+
+/// A [`TreeDiff`] that notes every parent it is asked about — the parents
+/// `try_to_simplify_commit()` parses.
+struct ParentsCompared<'d> {
+    inner: &'d mut dyn TreeDiff,
+    parents: Vec<ObjectId>,
+}
+
+impl TreeDiff for ParentsCompared<'_> {
+    fn differs(&mut self, commit: ObjectId, parent: Option<ObjectId>) -> Result<bool> {
+        if let Some(p) = parent {
+            self.parents.push(p);
+        }
+        self.inner.differs(commit, parent)
+    }
 }

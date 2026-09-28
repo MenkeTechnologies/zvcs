@@ -2595,6 +2595,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         commits.retain(|id| !excluded.contains(id));
     }
 
+    // What `limit_list()` painted UNINTERESTING under `-g`: the ancestry of a
+    // commit pended before `-g` was read.
+    let mut reflog_uninteresting: HashSet<ObjectId> = HashSet::new();
     // The reflog walk replaces the list wholesale: each entry is one "commit" in
     // the order `git log -g` reports them, and every filter below then applies to
     // that list exactly as it would to an ancestry walk.
@@ -2623,8 +2626,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // everything it reaches, and `get_commit_action()` ignores those as the
         // reflog entries come out.
         if !hidden.is_empty() {
-            let excluded = super::log::ancestor_closure(&repo, &hidden)?;
-            commits.retain(|id| !excluded.contains(id));
+            reflog_uninteresting = super::log::ancestor_closure(&repo, &hidden)?;
+            commits.retain(|id| !reflog_uninteresting.contains(id));
         }
         parents_of = nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
         abort = None;
@@ -2766,7 +2769,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         )?),
         false => None,
     };
-    if prune {
+    // Under `-g` the entries are simplified one at a time as they stream out —
+    // see the reflog pass below.
+    if prune && !walk_reflogs {
         let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
         // `--remove-empty` runs ahead of the TREESAME classification below because
         // what it does is cut a parent's ancestry off the walk: the commits it
@@ -3193,11 +3198,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let kept = kept_pack_objects(&repo);
         commits.retain(|id| !kept.contains(id));
     }
-    commits.retain(|id| !treesame.contains(id));
-    commits.retain(|id| {
-        let n = parents_of.get(id).map_or(0, Vec::len);
-        n as i64 >= min_parents && max_parents.is_none_or(|max| n <= max)
-    });
+    let parent_count_ok =
+        |n: usize| n as i64 >= min_parents && max_parents.is_none_or(|max| n <= max);
+    if !walk_reflogs {
+        commits.retain(|id| !treesame.contains(id));
+        commits.retain(|id| parent_count_ok(parents_of.get(id).map_or(0, Vec::len)));
+    }
 
     // `--grep`/`--author`/`--committer`: git's `commit_match`, applied as each
     // commit is about to be shown rather than during the walk.
@@ -3227,7 +3233,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         invert_grep,
         output_encoding: crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref()),
     };
-    if !cfilter.is_empty() {
+    if !cfilter.is_empty() && !walk_reflogs {
         let mut kept = Vec::with_capacity(commits.len());
         for id in &commits {
             let object = repo.find_object(*id)?;
@@ -3238,13 +3244,102 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         commits = kept;
     }
 
+    // `-g`: each entry's parent list, as `show_commit()` will print it. A reflog
+    // can name one commit several times, and what the walk did to it the first
+    // time is still on the object the next — so the list belongs to the entry,
+    // not to the commit id, and the filters that read it run entry by entry, in
+    // `get_revision_1()`'s order: `try_to_simplify_commit()`, then
+    // `get_commit_action()`'s parent counts, `commit_match()` and TREESAME test,
+    // then `rewrite_parents()`, then `get_revision()`'s `--skip` and
+    // `--max-count`. `finish_commit()` frees a printed commit's parents
+    // (builtin/rev-list.c:228-234), so the next entry for it has none.
+    let mut entry_parents: Option<Vec<Vec<ObjectId>>> = None;
+    if walk_reflogs {
+        let mode = super::simplify::Mode {
+            dense,
+            simplify_history: !full_history,
+            first_parent,
+        };
+        // `revs->limited`: an UNINTERESTING commit pended before `-g`
+        // (revision.c:431-435), or `--bisect` (builtin/rev-list.c:916-917).
+        let limited = !hidden.is_empty() || bisect;
+        let bottoms: HashSet<ObjectId> =
+            seeds.iter().filter(|s| s.uninteresting && s.bottom).map(|s| s.id).collect();
+        let mut sim = super::simplify::ReflogWalk::new(
+            &repo,
+            mode,
+            limited,
+            &reflog_uninteresting,
+            &bottoms,
+        );
+        let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
+        let mut diff = PathDiff {
+            repo: &repo,
+            specs: &mut specs,
+            decorations: simplify_decorations.as_ref(),
+            pathspec: !pathspecs.is_empty(),
+        };
+        let want_ancestry = show_parents || show_children;
+        let mut skip = skip_count;
+        let mut kept: Vec<ObjectId> = Vec::new();
+        let mut kept_parents: Vec<Vec<ObjectId>> = Vec::new();
+        for id in std::mem::take(&mut commits) {
+            if !counts.max_count_oldest && max_count.is_some_and(|max| kept.len() >= max) {
+                break;
+            }
+            if prune {
+                sim.pop(id, &mut diff)?;
+            }
+            if !parent_count_ok(sim.parents(id).len()) {
+                continue;
+            }
+            if !cfilter.is_empty() && !cfilter.matches(&repo.find_object(id)?.into_commit())? {
+                continue;
+            }
+            if prune && dense {
+                if !sim.shows(id, want_ancestry) {
+                    continue;
+                }
+                if want_ancestry {
+                    sim.rewrite(id, &mut diff)?;
+                }
+            }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            kept.push(id);
+            kept_parents.push(sim.parents(id).to_vec());
+            // `--max-count-oldest` prints only once the walk is over, so nothing
+            // is freed while it runs; its repeats are blanked below instead.
+            if !counts.max_count_oldest {
+                sim.free_parents(id);
+            }
+        }
+        if counts.max_count_oldest {
+            if let Some(max) = max_count {
+                let drop = kept.len().saturating_sub(max);
+                kept.drain(..drop);
+                kept_parents.drain(..drop);
+            }
+            let mut printed: HashSet<ObjectId> = HashSet::new();
+            for (id, parents) in kept.iter().zip(kept_parents.iter_mut()) {
+                if !printed.insert(*id) {
+                    parents.clear();
+                }
+            }
+        }
+        commits = kept;
+        entry_parents = Some(kept_parents);
+    }
+
     // `simplify_commit` rewrites the parent list of every shown commit when
     // `--parents` asked for ancestry, so a parent the path limit simplified away
     // is reported as the nearest ancestor that survived. The call sits under
     // `revs->prune && revs->dense && want_ancestry(revs)` (revision.c:4317-4318),
     // so `--sparse --parents` prints the ancestry the commits really have — as
     // the in-place prune left it, not as `rewrite_parents()` would.
-    if prune && show_parents && dense {
+    if prune && show_parents && dense && !walk_reflogs {
         // `--simplify-merges` already ran the same `rewrite_parents()` over the
         // list `simplify_one()` produced; rerunning it over the survivors would
         // rewrite a rewrite.
@@ -3276,14 +3371,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     };
     // `revs->skip_count` is spent inside `get_revision()` before the `max_count`
     // check, so `--skip=2 --max-count=1` answers the third commit rather than none.
-    if skip_count > 0 {
+    if skip_count > 0 && !walk_reflogs {
         commits.drain(..skip_count.min(commits.len()));
     }
     // `--max-count-oldest` keeps the *last* `max_count` commits of the walk, still
     // in walk order (`retrieve_oldest_commits()`, revision.c:4596-4657), and
     // `--skip` cannot accompany it (revision.c:2353-2355). The whole walk has to
     // run, so no `abort` is short-circuited the way the head-limited form does.
-    if counts.max_count_oldest {
+    if walk_reflogs {
+        // Spent entry by entry in the reflog pass above.
+    } else if counts.max_count_oldest {
         if let Some(max) = max_count {
             let drop = commits.len().saturating_sub(max);
             commits.drain(..drop);
@@ -3535,8 +3632,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         .map(|id| (*id, false))
         .chain(boundary_commits.iter().map(|id| (*id, true)))
         .collect();
+    // The parent list each record prints: the entry's own under `-g`, the
+    // commit's otherwise. Boundary records always read the commit's.
+    let mut emitted_parents: Vec<Option<Vec<ObjectId>>> = match entry_parents {
+        Some(lists) => lists.into_iter().map(Some).collect(),
+        None => Vec::new(),
+    };
+    emitted_parents.resize(emitted.len(), None);
     if reverse {
         emitted.reverse();
+        emitted_parents.reverse();
         // The `--objects` walk below reads the commit list itself, in the same
         // order the records came out.
         commits.reverse();
@@ -3548,8 +3653,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // with these.
     let mut graph_blocks: Vec<Option<super::log::GraphBlock>> = Vec::new();
 
-    for (id, is_boundary) in &emitted {
+    for ((id, is_boundary), own_parents) in emitted.iter().zip(&emitted_parents) {
         let record_start = out.len();
+        let record_parents: &[ObjectId] = match own_parents {
+            Some(parents) => parents,
+            None => parents_of.get(id).map_or(&[][..], Vec::as_slice),
+        };
         // `do_traverse()` (list-objects.c:377) offers every commit to the
         // filter as `LOFS_COMMIT` and calls `show_commit()` — which does the
         // counting, the disk usage and the printing — only on `LOFR_DO_SHOW`.
@@ -3639,7 +3748,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 }
             }
             if show_parents {
-                for parent in parents_of.get(id).into_iter().flatten() {
+                for parent in record_parents {
                     out.push(b' ');
                     out.extend_from_slice(parent.to_string().as_bytes());
                 }
@@ -3701,7 +3810,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     false,
                 ))
                 .expect("an ASCII mark");
-                let shown_parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
+                let shown_parents = record_parents;
                 let body = rev_list_pretty_body(
                     &repo,
                     &object.into_commit(),
@@ -5647,13 +5756,13 @@ fn commit_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
 
 /// `rev_compare_tree()` for the shared simplification passes, over rev-list's own
 /// tree comparison so there is one pathspec engine in play and not two.
-struct PathDiff<'a> {
-    repo: &'a gix::Repository,
-    specs: &'a mut super::log::PathspecMatcher,
+pub(super) struct PathDiff<'a> {
+    pub(super) repo: &'a gix::Repository,
+    pub(super) specs: &'a mut super::log::PathspecMatcher,
     /// The decorations `--simplify-by-decoration` asks about, if it was given.
-    decorations: Option<&'a super::log::Decorations>,
+    pub(super) decorations: Option<&'a super::log::Decorations>,
     /// `revs->prune_data.nr != 0`.
-    pathspec: bool,
+    pub(super) pathspec: bool,
 }
 
 impl super::simplify::TreeDiff for PathDiff<'_> {

@@ -111,8 +111,7 @@ impl crate::Repository {
     /// push URLs are reported as errors. Use [`try_find_remote_without_url_rewrite()`](Self::try_find_remote_without_url_rewrite)
     /// with [`Remote::rewrite_urls()`] to defer rewriting and handle such errors after constructing the remote.
     ///
-    /// Note that ref-specs are de-duplicated right away which may change their order. This doesn't affect matching in any way
-    /// as negations/excludes are applied after includes.
+    /// Note that ref-specs are de-duplicated right away, keeping the first of identical ones in configuration order.
     ///
     /// We will only include information if we deem it [trustworthy][crate::open::Options::filter_config_section()].
     pub fn try_find_remote<'a>(&self, name_or_url: impl Into<&'a BStr>) -> Option<Result<Remote<'_>, find::Error>> {
@@ -194,10 +193,18 @@ impl crate::Repository {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()
-                .map(|mut specs| {
-                    specs.sort();
-                    specs.dedup();
-                    specs
+                // Configuration order is kept: `get_ref_map()` walks `remote->fetch` item by item
+                // (builtin/fetch.c:554-562), so the ref map, `FETCH_HEAD` and the summary follow it,
+                // and the first refspec decides the merge candidate. A repeated refspec adds
+                // nothing — `ref_remove_duplicates()` keeps the first of identical entries.
+                .map(|specs| {
+                    let mut kept: Vec<gix_refspec::RefSpec> = Vec::with_capacity(specs.len());
+                    for spec in specs {
+                        if !kept.contains(&spec) {
+                            kept.push(spec);
+                        }
+                    }
+                    kept
                 })
         }
 

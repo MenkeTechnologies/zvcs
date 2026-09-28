@@ -264,9 +264,10 @@ where
         self
     }
 
-    /// If dry run is enabled, no change to the repository will be made.
+    /// If dry run is enabled, refs will not be updated.
     ///
-    /// This works by not actually fetching the pack after negotiating it, nor will refs be updated.
+    /// The pack is still received and written, as `git fetch --dry-run` does, so that the fast-forward and
+    /// object-exists checks see the same objects a real fetch would.
     pub fn with_dry_run(mut self, enabled: bool) -> Self {
         self.inner.dry_run = if enabled { DryRun::Yes } else { DryRun::No };
         self

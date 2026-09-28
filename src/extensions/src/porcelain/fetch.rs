@@ -105,12 +105,8 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 /// has landed, appending whatever it recovers behind every other row. Under
 /// `--dry-run` nothing is written, so the second pass re-proposes the first
 /// pass's tags as well and git prints those rows twice. See [`backfilled_tags`].
-///
-/// Known gap in that area: git's `--dry-run` still downloads the pack and skips
-/// only the ref writes, so its second pass can still tell a backfilled tag from
-/// one whose object nobody sent. The vendored fetch downloads nothing at all
-/// under a dry run, so a tag pointing outside the fetched history is still
-/// listed there; a real fetch drops it.
+/// `--dry-run` still downloads the pack and skips only the ref writes, so the
+/// second pass can still tell a backfilled tag from one whose object nobody sent.
 ///
 /// `-4`/`--ipv4` and `-6`/`--ipv6` are git's `transport_family`: they restrict address
 /// resolution for `git://` and `http(s)://` and become `ssh`'s `-4`/`-6`, and are forwarded

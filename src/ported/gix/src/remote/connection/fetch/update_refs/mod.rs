@@ -46,8 +46,8 @@ impl From<Mode> for Update {
 /// Update all refs as derived from `refmap.mappings` and produce an `Outcome` informing about all applied changes in detail, with each
 /// [`update`][Update] corresponding to the [`fetch::Mapping`] of at the same index.
 /// If `dry_run` is true, ref transactions won't actually be applied, but are assumed to work without error so the underlying
-/// `repo` is not actually changed. Also it won't perform an 'object exists' check as these are likely not to exist as the pack
-/// wasn't fetched either.
+/// `repo` is not actually changed. The pack was received all the same, so the 'object exists' and fast-forward checks run
+/// as they would for a real fetch.
 /// `action` is the prefix used for reflog entries, and is typically "fetch".
 ///
 /// It can be used to produce typical information that one is used to from `git fetch`.
@@ -108,7 +108,8 @@ pub(crate) fn update(
     ) {
         // `None` only if unborn.
         let remote_id = remote.as_id();
-        if matches!(dry_run, fetch::DryRun::No) && !remote_id.is_none_or(|id| repo.objects.exists(id)) {
+        // A dry run received the pack as well, so the objects it brought are there to be checked.
+        if !remote_id.is_none_or(|id| repo.objects.exists(id)) {
             if let Some(remote_id) = remote_id.filter(|id| !repo.objects.exists(id)) {
                 let update = if is_implicit_tag {
                     Mode::ImplicitTagNotSentByRemote.into()
@@ -196,14 +197,17 @@ pub(crate) fn update(
                                     // `fetch.showForcedUpdates=false` skips the ancestry walk and takes
                                     // every update as a fast-forward (builtin/fetch.c:1047-1056), which
                                     // governs the rejection and the reflog message, not just the summary.
-                                    let is_fast_forward = match dry_run {
-                                        fetch::DryRun::No if !show_forced_updates => true,
-                                        // `fast_forward = repo_in_merge_bases(the_repository, current, updated)`
-                                        // (builtin/fetch.c:1049-1050): an exact reachability test. A walk cut
-                                        // off at the local commit's date answered "not an ancestor" whenever
-                                        // a descendant carried an older committer date, turning a clock-skewed
-                                        // fast-forward into a forced update (or a rejection).
-                                        fetch::DryRun::No => match repo.find_object(local_id)?.try_into_commit() {
+                                    //
+                                    // `fast_forward = repo_in_merge_bases(the_repository, current, updated)`
+                                    // (builtin/fetch.c:1049-1050): an exact reachability test. A walk cut
+                                    // off at the local commit's date answered "not an ancestor" whenever
+                                    // a descendant carried an older committer date, turning a clock-skewed
+                                    // fast-forward into a forced update (or a rejection). A dry run asks
+                                    // too: `--dry-run` still receives the pack, so both commits are here.
+                                    let is_fast_forward = if !show_forced_updates {
+                                        true
+                                    } else {
+                                        match repo.find_object(local_id)?.try_into_commit() {
                                             Ok(_) => repo
                                                 .merge_base(remote_id.to_owned(), local_id.to_owned())
                                                 .is_ok_and(|base| base.detach() == local_id),
@@ -211,16 +215,10 @@ pub(crate) fn update(
                                                 force = true;
                                                 false
                                             }
-                                        },
-                                        fetch::DryRun::Yes => true,
+                                        }
                                     };
                                     if is_fast_forward {
-                                        (
-                                            Mode::FastForward,
-                                            matches!(dry_run, fetch::DryRun::Yes)
-                                                .then(|| "fast-forward (guessed in dry-run)")
-                                                .unwrap_or("fast-forward"),
-                                        )
+                                        (Mode::FastForward, "fast-forward")
                                     } else if force {
                                         (Mode::Forced, "forced-update")
                                     } else {

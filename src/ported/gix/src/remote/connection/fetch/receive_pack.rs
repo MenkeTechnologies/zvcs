@@ -189,25 +189,21 @@ where
         let res = gix_protocol::fetch(
             &mut negotiate,
             |reader, progress, should_interrupt| -> Result<bool, gix_pack::bundle::write::Error> {
-                let mut may_read_to_end = false;
-                write_pack_bundle = if matches!(self.dry_run, fetch::DryRun::No) {
-                    let res = gix_pack::Bundle::write_to_directory(
-                        reader,
-                        Some(&repo.objects.store_ref().path().join("pack")),
-                        progress,
-                        should_interrupt,
-                        Some(Box::new({
-                            let repo = repo.clone();
-                            repo.objects
-                        })),
-                        write_pack_options,
-                    )?;
-                    may_read_to_end = true;
-                    Some(res)
-                } else {
-                    None
-                };
-                Ok(may_read_to_end)
+                // `--dry-run` receives the pack too: git's dry run stops short of the
+                // ref updates and `FETCH_HEAD`, not of the transfer, which is why its
+                // forced-update test has both commits to compare.
+                write_pack_bundle = Some(gix_pack::Bundle::write_to_directory(
+                    reader,
+                    Some(&repo.objects.store_ref().path().join("pack")),
+                    progress,
+                    should_interrupt,
+                    Some(Box::new({
+                        let repo = repo.clone();
+                        repo.objects
+                    })),
+                    write_pack_options,
+                )?);
+                Ok(true)
             },
             progress,
             should_interrupt,
@@ -407,7 +403,11 @@ where
         )?;
 
         if let Some(bundle) = write_pack_bundle.as_mut() {
-            if !update_refs.edits.is_empty() || bundle.index.num_objects == 0 {
+            // A dry run applied none of its edits, but git unlocks the pack all the same.
+            if !update_refs.edits.is_empty()
+                || bundle.index.num_objects == 0
+                || matches!(self.dry_run, fetch::DryRun::Yes)
+            {
                 if let Some(path) = bundle.keep_path.take() {
                     std::fs::remove_file(&path).map_err(|err| Error::RemovePackKeepFile { path, source: err })?;
                 }

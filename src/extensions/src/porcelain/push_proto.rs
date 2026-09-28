@@ -115,6 +115,11 @@ pub struct Request {
 pub enum DeleteScope {
     /// `--mirror`: every advertised ref the local repository no longer has.
     All,
+    /// `--mirror` under `remote.<name>.push` refspecs: every advertised ref no
+    /// refspec matched. `set_ref_status_for_push()` (remote.c:1693-1698) leaves
+    /// such a ref's `new_oid` null once `send_mirror` is set, which makes it a
+    /// deletion whether or not the local repository still has it.
+    Unmatched,
     /// `--prune`: the push refspecs, so each advertised ref can be mapped BACK
     /// through them to the local ref it would have come from.
     ///
@@ -969,6 +974,7 @@ pub fn send_pack(
                 // refspec with `send_mirror` set, which answers with the
                 // advertised name for every ref, `refs/heads/` or not.
                 DeleteScope::All => !opts.local_refs.contains(name.as_str()),
+                DeleteScope::Unmatched => true,
                 DeleteScope::Prune(specs) => specs
                     .iter()
                     .find_map(|spec| spec.source_of(name))

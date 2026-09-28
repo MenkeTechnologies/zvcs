@@ -642,10 +642,15 @@ git push <groupname>\n"
     // `remote.<name>.push` decides what is pushed, and only when that is unset does
     // `push.default` get a say. `--tags` has already put `refs/tags/*` in the list by this
     // point (builtin/push.c:825-826), which is why it takes neither.
-    let specs: Vec<String> = if specs.is_empty() && !f.all && !f.mirror && !f.tags && !f.delete {
+    //
+    // `--mirror` skips only the `push.default` fallback, not the configured
+    // refspecs: a mirror remote with `remote.<name>.push` pushes what those
+    // refspecs name, forced, and deletes every advertised ref they leave unmatched.
+    let specs: Vec<String> = if specs.is_empty() && !f.all && !f.tags && !f.delete {
         let configured = configured_push_refspecs(&repo, remote_name.as_str());
         match configured.is_empty() {
             false => configured,
+            true if f.mirror => specs,
             true => match default_push_refspec(&repo, remote_name.as_str(), &mut f)? {
                 Ok(specs) => specs,
                 Err(code) => return Ok(code),
@@ -812,7 +817,9 @@ git push <groupname>\n"
         .filter_map(|r| r.ok())
         .filter_map(|r| r.name().as_bstr().to_str().ok().map(str::to_owned))
         .collect();
-    let delete_scope = if f.mirror {
+    let delete_scope = if f.mirror && !specs.is_empty() {
+        Some(push_proto::DeleteScope::Unmatched)
+    } else if f.mirror {
         Some(push_proto::DeleteScope::All)
     } else if f.prune {
         // git prunes only within the namespaces the push's refspecs actually
@@ -1325,7 +1332,7 @@ fn build_requests(
     // refs, notes — each forced, each to its own name. The deletion half (remote
     // refs this repository no longer has) is synthesized in the wire layer, which
     // is the only place the advertisement exists.
-    if f.mirror {
+    if f.mirror && specs.is_empty() {
         for r in repo.references()?.all()? {
             let mut r = r.map_err(|e| anyhow!("{e}"))?;
             let name = r.name().as_bstr().to_str().map_err(|e| anyhow!("{e}"))?.to_string();

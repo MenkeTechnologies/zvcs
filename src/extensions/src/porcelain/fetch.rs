@@ -3007,7 +3007,44 @@ fn fetch_one(
         prune_prefixes.dedup();
     }
 
-    let mut extra_refspecs = Vec::new();
+    // ```c
+    // if (has_merge &&
+    //     !strcmp(branch->remote_name, remote->name))
+    //         add_merge_config(&ref_map, remote_refs, branch, &tail);
+    // ```
+    //
+    // (`get_ref_map()`, builtin/fetch.c:570-572.) Each `branch.<name>.merge` no configured
+    // refspec mapped is fetched anyway, into `FETCH_HEAD` alone and as the merge candidate,
+    // through a refspec that is its source and nothing else — `get_fetch_map(remote_refs,
+    // &refspec, tail, 1)` with `missing_ok`, so a value naming nothing is no error
+    // (:232-246). Whether a configured refspec already mapped it is only known once the
+    // advertisement is in, so every value is asked for here, ahead of any tag refspec as
+    // git's `tail` puts them, and the rows loop drops the ones an earlier entry claimed.
+    // `merge_spec_values[i]` is the index into `branch.<name>.merge` of extra refspec `i`.
+    let (merge_spec_values, merge_srcs): (Vec<usize>, Vec<gix::refspec::RefSpec>) = match upstream {
+        Some((_, merges)) if !explicit_refspecs && branch_upstream_is_this_remote => merges
+            .iter()
+            .enumerate()
+            .filter_map(|(i, src)| {
+                gix::refspec::parse(src.as_str().into(), gix::refspec::parse::Operation::Fetch)
+                    .ok()
+                    .map(|spec| (i, spec.to_owned()))
+            })
+            .unzip(),
+        _ => (Vec::new(), Vec::new()),
+    };
+    // `*autotags` is set only by a configured refspec with a destination (`dst && dst[0]`,
+    // builtin/fetch.c:556-558): a remote whose refspecs have none, or that has none at all and
+    // fetches only the merge values, follows no tags.
+    if !explicit_refspecs
+        && opts.tags.is_none()
+        && !configured_refspecs
+            .iter()
+            .any(|s| s.to_ref().destination().is_some_and(|dst| !dst.is_empty()))
+    {
+        remote = remote.with_fetch_tags(Tags::None);
+    }
+    let mut extra_refspecs = merge_srcs;
     // Two things put the whole tag namespace into the ref map without it being
     // automatic tag following, and both need the refspec supplied here.
     //
@@ -3862,9 +3899,21 @@ fn fetch_one(
                 .refspecs
                 .first()
                 .is_some_and(|s| !s.to_ref().source().is_some_and(|src| src.contains(&b'*')));
+        // A row one of the `branch.<name>.merge` refspecs produced. git adds it only when no
+        // earlier entry named that value (`if (rm) continue;`, builtin/fetch.c:229-230), so a
+        // value a configured refspec already mapped leaves no row of its own.
+        let merge_extra = match mapping.spec_index {
+            gix::protocol::fetch::refmap::SpecIndex::Implicit(i) => merge_spec_values.get(i).copied(),
+            gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_) => None,
+        };
+        if let Some(value) = merge_extra {
+            if std::mem::replace(&mut merge_marked[value], true) {
+                continue;
+            }
+        }
         let status: u8 = if opportunistic {
             2
-        } else if from_command_line {
+        } else if merge_extra.is_some() || from_command_line {
             0
         } else if first_exact_refspec_row {
             first_row_marked = true;

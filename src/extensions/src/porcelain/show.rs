@@ -280,6 +280,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut pickaxe_s: Option<String> = None;
     let mut pickaxe_g: Option<String> = None;
     let mut pending_pickaxe: Option<char> = None;
+    // `-O<file>` (`OPT_FILENAME('O', …, &options->orderfile)`), over the
+    // `diff.orderFile` default; `pending_order` is the separate value form.
+    let mut order_cli: Option<String> = None;
+    let mut pending_order = false;
     // `--pickaxe-all` (`o->pickaxe_opts & DIFF_PICKAXE_ALL`) and `--pickaxe-regex`
     // (`DIFF_PICKAXE_REGEX`), the two knobs `diffcore_pickaxe()` reads beside the
     // needle itself: the first keeps the whole queue when any pair matched, the
@@ -457,6 +461,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
+        if std::mem::take(&mut pending_order) {
+            order_cli = Some(a.clone());
+            continue;
+        }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
         // `cmd_show` runs the same `cmd_log_init_finish` as `git log`, so a diff
         // option's value is validated here whether or not this command renders it.
@@ -552,6 +560,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         match s {
             "-S" => pending_pickaxe = Some('S'),
             "-G" => pending_pickaxe = Some('G'),
+            "-O" => pending_order = true,
+            s if s.starts_with("-O") => order_cli = Some(s[2..].to_string()),
             "-L" => pending_line_range = true,
             "--" => after_dashdash = true,
             "-p" | "-u" | "--patch" => formats.patch = true,
@@ -2046,6 +2056,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let diff_status = std::cell::Cell::new((false, false));
     let remerge_odb: std::cell::OnceCell<crate::tmp_objdir::TmpObjdir> = std::cell::OnceCell::new();
     let no_prefix: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
+    // `prepare_order()` (diffcore-order.c:14-60): read up front so every diff
+    // can sort by it; a failure waits for the first non-empty queue.
+    let mut order_failure: Option<anyhow::Error> = None;
+    let order_read = match &order_cli {
+        Some(path) => Some(super::diff_files::read_order_file(path)),
+        None => super::status::configured_orderfile(&repo)?
+            .map(|path| super::status::read_orderfile(&repo, &path)),
+    };
+    match order_read {
+        Some(Ok(patterns)) => patch_opts.order = Some(std::sync::Arc::new(patterns)),
+        Some(Err(e)) => order_failure = Some(e),
+        None => {}
+    }
     let disp = DisplayOpts {
         reflog: std::cell::RefCell::new(None),
         reflog_walk: reflog_from.is_some(),
@@ -2069,6 +2092,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         relative: patch_opts.relative.clone().unwrap_or_default(),
         dirstat,
         patch: patch_opts.clone(),
+        order_failure: std::cell::RefCell::new(order_failure),
         decorate,
         decorations: decorations.as_ref(),
         mailmap: use_mailmap.then(|| mailmap.as_ref()).flatten(),
@@ -2537,6 +2561,9 @@ struct DisplayOpts<'a> {
     date_explicit: bool,
     /// `--log-size` (`revs->show_log_size`).
     log_size: bool,
+    /// An order file `prepare_order()` could not read, raised by the first commit
+    /// whose diff queue is non-empty (diffcore-order.c:24-26).
+    order_failure: std::cell::RefCell<Option<anyhow::Error>>,
     /// `--show-signature` / `--no-show-signature` (`rev_info.show_signature`).
     show_signature: bool,
     /// `log.abbrevCommit` / `--abbrev-commit`: abbreviate the `commit <id>` line.
@@ -2933,6 +2960,54 @@ fn show_commit<'a>(
     line_log_pairs: Option<&[(line_log::Pair, Vec<line_log::Range>)]>,
 ) -> Result<()> {
     let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+    // `cmd_show` always sets `rev.diff`, so `diffcore_std()` runs on every
+    // commit — `-s` included — and `diffcore_order()` reads the order file at the
+    // first non-empty queue, before `show_log()` (diff.c:7519-7520). A merge's
+    // queue is the one its `--diff-merges` mode builds: the paths that differ
+    // from every parent under `-c`/`--cc` (`diff_tree_combined()` orders them
+    // only when there are any), each parent's under `-m`, the first parent's
+    // under `first-parent`, none when off.
+    if disp.order_failure.borrow().is_some() && (disp.show_root || !parents.is_empty()) {
+        let specs = match pathspecs.is_empty() {
+            true => None,
+            false => Some(super::log::PathspecMatcher::new(repo, pathspecs)?),
+        };
+        let mut warn = super::diffcore_rename::Warnings::default();
+        let mut paths_against = |parent: Option<ObjectId>| -> Result<Vec<Vec<u8>>> {
+            let queue = collect_changes(repo, commit, parent, &disp.patch, &mut warn, specs.as_ref())?;
+            Ok(queue.into_iter().map(|f| f.path).collect())
+        };
+        use super::log::DiffMerges;
+        let queued = match (parents.len() > 1, disp.merges) {
+            (false, _) | (true, DiffMerges::FirstParent) => {
+                !paths_against(parents.first().copied())?.is_empty()
+            }
+            (true, DiffMerges::Off) => false,
+            (true, DiffMerges::Separate) => {
+                let mut any = false;
+                for p in &parents {
+                    any |= !paths_against(Some(*p))?.is_empty();
+                }
+                any
+            }
+            (true, DiffMerges::Combined | DiffMerges::DenseCombined) => {
+                let mut common: Option<Vec<Vec<u8>>> = None;
+                for p in &parents {
+                    let paths = paths_against(Some(*p))?;
+                    common = Some(match common {
+                        None => paths,
+                        Some(c) => c.into_iter().filter(|x| paths.contains(x)).collect(),
+                    });
+                }
+                common.is_some_and(|c| !c.is_empty())
+            }
+        };
+        if queued && !disp.remerge {
+            if let Some(e) = disp.order_failure.borrow_mut().take() {
+                return Err(e);
+            }
+        }
+    }
     if parents.len() > 1 && line_log_pairs.is_none() {
         // `do_remerge_diff()` (log-tree.c:1134-1142), which is tested ahead of both
         // `combine_merges` and `separate_merges` and so wins over whatever mode
@@ -4232,6 +4307,10 @@ fn collect_changes(
     }
     *warn = detect_renames(repo, &mut out, opts, old_tree.as_ref(), specs)?;
     apply_diff_drivers(&mut super::cat_file::Textconv::new(repo)?, &mut out, ws)?;
+    // `diffcore_order()` (diff.c:7519-7520); see [`super::diff_files::order_queue`].
+    if let Some(order) = &opts.order {
+        super::diff_files::order_queue(order, &mut out, |f| f.path.as_slice());
+    }
     Ok(out)
 }
 

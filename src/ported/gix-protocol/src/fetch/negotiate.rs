@@ -321,6 +321,7 @@ pub fn make_refmapping_ignore_predicate<'a>(
     fetch_tags: Tags,
     ref_map: &'a RefMap,
     objects: &'a impl gix_object::Exists,
+    refs: &'a gix_ref::file::Store,
 ) -> impl Fn(&refmap::Mapping) -> bool + 'a {
     // With included tags, we have to keep mappings of tags to handle them later when updating refs, but we don't want to
     // explicitly `want` them as the server will determine by itself which tags are pointing to a commit it wants to send.
@@ -348,6 +349,15 @@ pub fn make_refmapping_ignore_predicate<'a>(
     move |mapping| {
         if !is_implicit_tag(mapping) {
             return false;
+        }
+        // "skip duplicates and refs that we already have" (builtin/fetch.c:389-392): a tag
+        // this repository already has under the same name is never proposed.
+        if mapping
+            .remote
+            .as_name()
+            .is_some_and(|name| refs.try_find(name).ok().flatten().is_some())
+        {
+            return true;
         }
         let followed = match &mapping.remote {
             refmap::Source::Ref(crate::handshake::Ref::Peeled { tag, object, .. }) => {

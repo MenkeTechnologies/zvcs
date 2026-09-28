@@ -1071,7 +1071,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             if *arg == "tag" {
                 let name = rest
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("you need to specify a tag name"))?;
+                    .ok_or_else(|| crate::fatal::die("you need to specify a tag name"))?;
                 positional_specs.push(format!("refs/tags/{name}:refs/tags/{name}"));
             } else {
                 positional_specs.push((*arg).to_string());

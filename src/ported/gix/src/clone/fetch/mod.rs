@@ -54,6 +54,10 @@ pub enum Error {
         wanted: gix_ref::PartialName,
         candidates: Vec<BString>,
     },
+    #[error("Remote revision {revision} not found in upstream {remote_name}")]
+    RevisionMissing { revision: BString, remote_name: BString },
+    #[error("could not parse {name}")]
+    RevisionNotACommit { name: BString },
     #[error(transparent)]
     CommitterOrFallback(#[from] crate::config::commit_signature::Error),
     #[error(transparent)]
@@ -134,7 +138,10 @@ impl PrepareFetch {
 
         // For shallow clones without custom configuration, we'll use a single-branch refspec
         // to match git's behavior (matching git's single-branch behavior for shallow clones).
+        // `--revision` names the one ref it wants itself and never guesses a branch:
+        // `option_single_branch = 0` in `cmd_clone()` (builtin/clone.c:1407).
         let use_single_branch_for_shallow = self.shallow != remote::fetch::Shallow::NoChange
+            && self.revision.is_none()
             && remote.fetch_specs.is_empty()
             && self.fetch_options.extra_refspecs.is_empty();
 
@@ -224,7 +231,7 @@ impl PrepareFetch {
 
         // Set up refspec based on whether we're doing a single-branch shallow clone,
         // which requires a single ref to match Git unless it's overridden.
-        if remote.fetch_specs.is_empty() {
+        if remote.fetch_specs.is_empty() && self.revision.is_none() {
             if let Some(target_ref) = &target_ref {
                 // Single-branch refspec for shallow clones
                 let destination = match target_ref.category_and_short_name() {
@@ -257,6 +264,25 @@ impl PrepareFetch {
             clone_fetch_tags = remote::fetch::Tags::All.into();
         }
 
+        // ```c
+        // if (!option_rev)
+        //         refspec_appendf(&remote->fetch, "+%s*:%s*", src_ref_prefix, branch_top.buf);
+        // [...]
+        // if (option_rev) {
+        //         [...]
+        //         refspec_append(&remote->fetch, option_rev);
+        // }
+        // [...]
+        // if (!option_rev)
+        //         write_refspec_config(src_ref_prefix, our_head_points_at,
+        //                              remote_head_points_at, &branch_top);
+        // ```
+        //
+        // (builtin/clone.c:1319-1321, 1405-1412, 1590-1592.) The revision is the only refspec
+        // the fetch uses and none reaches the configuration.
+        if self.revision.is_some() {
+            remote.fetch_specs.clear();
+        }
         // The remote section just written to `.git/config`, kept around so we can
         // mirror it into the repository's in-memory config once we know which
         // repo handle survives.
@@ -264,12 +290,20 @@ impl PrepareFetch {
             &mut remote,
             remote_name.clone(),
         )?);
+        if let Some(spec) = &self.revision {
+            remote.fetch_specs = vec![spec.clone()];
+        }
         #[cfg(feature = "sha256")]
         let mut config = config;
 
         // Now we are free to apply remote configuration we don't want to be written to disk.
         if let Some(fetch_tags) = clone_fetch_tags {
             remote = remote.with_fetch_tags(fetch_tags);
+        }
+        // `option_tags = 0` for `--revision` (builtin/clone.c:1406): no tag is followed, but the
+        // `tagOpt` it would have written was decided before (clone.c:1308-1312).
+        if self.revision.is_some() {
+            remote = remote.with_fetch_tags(remote::fetch::Tags::None);
         }
 
         // Add HEAD after the remote was written to config, we need it to know what to check out later, and assure
@@ -293,7 +327,8 @@ impl PrepareFetch {
             let connection = connection.into_detached();
             let mut fetch_opts = {
                 let mut opts = self.fetch_options.clone();
-                if !opts.extra_refspecs.contains(&head_refspec) {
+                // `opts.wants_head = 0` for `--revision` (builtin/clone.c:1408).
+                if self.revision.is_none() && !opts.extra_refspecs.contains(&head_refspec) {
                     opts.extra_refspecs.push(head_refspec.clone());
                 }
                 if let Some(ref_name) = &self.ref_name {
@@ -344,6 +379,23 @@ impl PrepareFetch {
         // Assure problems with custom branch names fail early, not after getting the pack or during negotiation.
         if let Some(ref_name) = &self.ref_name {
             util::find_custom_refname(pending_pack.ref_map(), ref_name)?;
+        }
+        // ```c
+        // } else if (option_rev) {
+        //         our_head_points_at = mapped_refs;
+        //         if (!our_head_points_at)
+        //                 die(_("Remote revision %s not found in upstream %s"),
+        //                     option_rev, remote_name);
+        // ```
+        //
+        // (builtin/clone.c:1547-1551.) Decided from the advertisement, before any pack arrives.
+        if let Some(spec) = &self.revision {
+            if revision_mapping(pending_pack.ref_map()).is_none() {
+                return Err(Error::RevisionMissing {
+                    revision: spec.to_ref().to_bstring(),
+                    remote_name: remote_name.clone(),
+                });
+            }
         }
         // On an object-format mismatch: adopt the remote's format before receiving the pack.
         // Only reachable with sha256, otherwise `gix_hash::Kind` has a single variant, so
@@ -412,13 +464,18 @@ impl PrepareFetch {
         if let Some(config) = config {
             util::append_config_to_repo_config(&mut repo, config)?;
         }
-        util::update_head(
-            &mut repo,
-            &outcome.ref_map,
-            reflog_message.as_ref(),
-            remote_name.as_ref(),
-            self.ref_name.as_ref(),
-        )?;
+        if self.revision.is_some() {
+            let (name, id) = revision_mapping(&outcome.ref_map).expect("checked before the pack was received");
+            util::detach_head(&mut repo, name, id, reflog_message.as_ref())?;
+        } else {
+            util::update_head(
+                &mut repo,
+                &outcome.ref_map,
+                reflog_message.as_ref(),
+                remote_name.as_ref(),
+                self.ref_name.as_ref(),
+            )?;
+        }
 
         drop(self.repo.take().expect("still present"));
         Ok((repo, outcome))
@@ -445,6 +502,24 @@ impl PrepareFetch {
             fetch_outcome,
         ))
     }
+}
+
+/// The ref a `clone --revision` refspec matched in `ref_map`: its name as git names it in
+/// `lookup_commit_or_die()` (the full ref name, or the hex id the refspec spelled out) and the
+/// object it advertised, before any peeling.
+///
+/// The revision is the only fetch refspec such a clone has, so its mapping is the one produced
+/// by refspec 0 (`wanted_peer_refs()` → `get_fetch_map()`, builtin/clone.c:465-466).
+pub fn revision_mapping(ref_map: &crate::remote::fetch::RefMap) -> Option<(BString, gix_hash::ObjectId)> {
+    ref_map
+        .mappings
+        .iter()
+        .find(|m| m.spec_index == crate::remote::fetch::refmap::SpecIndex::ExplicitInRemote(0))
+        .and_then(|m| {
+            let id = m.remote.as_id()?.to_owned();
+            let name = m.remote.as_name().map_or_else(|| id.to_string().into(), ToOwned::to_owned);
+            Some((name, id))
+        })
 }
 
 mod util;

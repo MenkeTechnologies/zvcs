@@ -105,11 +105,16 @@ fn write_to_local_config(config: &gix_config::File, mode: WriteMode) -> std::io:
         .truncate(overwrite)
         .append(matches!(mode, WriteMode::Append))
         .open(config.meta().path.as_deref().expect("local config with path set"))?;
-    // The separator only makes sense when appending to what is already there. Writing it in
-    // overwrite mode put a blank first line into every cloned repository's config, which
-    // `git clone` never produces.
+    // The separator only makes sense when appending to a file whose last line is unterminated.
+    // Writing it in overwrite mode put a blank first line into every cloned repository's config,
+    // and after a terminated last line it left a blank line before the new section: git's
+    // `repo_config_set()` appends a section right below the previous one.
     if !overwrite {
-        local_config.write_all(config.detect_newline_style())?;
+        let path = config.meta().path.as_deref().expect("local config with path set");
+        let terminated = std::fs::read(path).map_or(true, |bytes| bytes.is_empty() || bytes.ends_with(b"\n"));
+        if !terminated {
+            local_config.write_all(config.detect_newline_style())?;
+        }
     }
     config.write_to_filter(&mut local_config, |s| s.meta().source == gix_config::Source::Local)
 }
@@ -259,6 +264,49 @@ pub fn update_head(
             })?;
         }
     }
+    Ok(())
+}
+
+/// Detach `HEAD` at the commit the `clone --revision` ref `name` advertised as `id`.
+///
+/// ```c
+/// } else if (our) {
+///         struct commit *c = lookup_commit_or_die(&our->old_oid,
+///                                                 our->name);
+///
+///         /* --branch specifies a non-branch (i.e. tags), detach HEAD */
+///         refs_update_ref(get_main_ref_store(the_repository), msg,
+///                         "HEAD", &c->object.oid, NULL, REF_NO_DEREF,
+///                         UPDATE_REFS_DIE_ON_ERR);
+/// ```
+///
+/// (`update_head()`, builtin/clone.c:586-593, reached for `--revision` through `opts->detach`.)
+/// `lookup_commit_or_die()` peels a tag to its commit; the "is not a commit!" warning it prints
+/// for that is left to the caller, which compares `id` with the new `HEAD`.
+pub fn detach_head(repo: &mut Repository, name: BString, id: gix_hash::ObjectId, reflog_message: &BStr) -> Result<(), Error> {
+    use gix_ref::{
+        Target,
+        transaction::{PreviousValue, RefEdit},
+    };
+    let commit = repo
+        .find_object(id)
+        .ok()
+        .and_then(|object| object.peel_to_commit().ok())
+        .ok_or(Error::RevisionNotACommit { name })?
+        .id;
+    repo.edit_reference(RefEdit {
+        change: gix_ref::transaction::Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: reflog_message.to_owned(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(commit),
+        },
+        name: "HEAD".try_into().expect("valid"),
+        deref: false,
+    })?;
     Ok(())
 }
 

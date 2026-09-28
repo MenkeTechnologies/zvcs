@@ -45,6 +45,16 @@ impl PrepareFetch {
         self
     }
 
+    /// Clone the single revision `spec` names and detach `HEAD` at it, git's `clone --revision`.
+    ///
+    /// `spec` is used as the only fetch refspec, without a destination, so no ref is written,
+    /// no refspec is saved to the remote's configuration and the remote's `HEAD` is not asked
+    /// for (`builtin/clone.c:1405-1412`, `1590-1592`).
+    pub fn with_revision(mut self, spec: Option<gix_refspec::RefSpec>) -> Self {
+        self.revision = spec;
+        self
+    }
+
     /// Apply the given configuration `values` right before readying the actual fetch from the remote.
     /// The configuration is marked with [source API](gix_config::Source::Api), and will not be written back, it's
     /// retained only in memory.

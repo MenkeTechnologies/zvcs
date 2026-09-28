@@ -53,6 +53,9 @@ pub struct PrepareFetch {
     /// The object filter of a partial clone (git's `--filter`), if any.
     #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
     filter: Option<gix_protocol::fetch::filter::Filter>,
+    /// The single revision to fetch and detach `HEAD` at (git's `clone --revision`), if any.
+    #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
+    revision: Option<gix_refspec::RefSpec>,
 }
 
 /// The error returned by [`PrepareFetch::new()`].
@@ -158,6 +161,7 @@ impl PrepareFetch {
             ref_name: None,
             remove_worktree_on_drop,
             filter: None,
+            revision: None,
         })
     }
 }

@@ -531,9 +531,8 @@ fn an_absent_value_is_refused_before_the_command_can_misread_it() {
 }
 
 /// `--revision` is an `OPT_STRING` in `builtin_clone_options[]`, so
-/// parse-options fetches its value before `cmd_clone()` runs at all. Cloning at
-/// a bare revision is not ported — but that is a *different* refusal, and it
-/// must not pre-empt the one parse-options owns.
+/// parse-options fetches its value before `cmd_clone()` runs at all: a missing
+/// value is refused before any clone is attempted.
 #[test]
 fn a_value_is_fetched_before_a_port_gap_is_reported() {
     let f = Fixture::new("cloneRev");

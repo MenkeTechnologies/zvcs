@@ -329,10 +329,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     let mut template: Option<String> = None;
     let mut separate_git_dir: Option<String> = None;
     let mut ref_format: Option<String> = None;
-    // `--revision=<rev>`: parsed like git's `OPT_STRING`, refused once `cmd_clone()`
-    // has run every check that precedes the transport — see the refusal beside the
-    // destination tests.
-    let mut revision_requested: Option<String> = None;
+    // `--revision=<rev>`: the one ref or object id to clone, with `HEAD` detached at it.
+    let mut revision: Option<String> = None;
     // `--reference <repo>` / `--reference-if-able <repo>`: git's two
     // `OPT_STRING_LIST`s, `option_required_reference` and
     // `option_optional_reference` (builtin/clone.c:76-77, :956-959). They are
@@ -521,14 +519,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-dissociate" => dissociate = false,
             "--sparse" => sparse = true,
             "--no-sparse" => sparse = false,
-            // `--revision` is an `OPT_STRING` in `builtin_clone_options[]`, so
-            // parse-options fetches its value before `cmd_clone()` ever runs: a
-            // missing one is ``option `revision' requires a value`` at 129 and
-            // never reaches the command. Cloning at a bare revision is not
-            // ported, and *that* refusal is this port's own — which is why the
-            // value is taken first and the gap reported second.
-            "--revision" => revision_requested = Some(take_value!()),
-            "--no-revision" => revision_requested = None,
+            // `--revision=<rev>`: clone only what `<rev>` needs and detach `HEAD` there
+            // (`OPT_STRING(0, "revision", ...)`, builtin/clone.c:966-967).
+            "--revision" => revision = Some(take_value!()),
+            "--no-revision" => revision = None,
             // `--filter=<spec>`: ask the remote to withhold the objects `<spec>` selects against.
             // git parses the spec in `cmd_clone`'s option table, so an invalid one never reaches the
             // network; `Filter::from_str` reproduces both the grammar and the messages.
@@ -915,19 +909,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     }
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
-    // This port's own two gaps, refused only once every check git makes before
-    // creating anything has passed: stock 2.55.0 answers `clone --ref-format=reftable
-    // nope` with `repository 'nope' does not exist`, and `clone --revision=HEAD .
-    // .git` with the non-empty destination refusal above, so neither may pre-empt
-    // them.
+    // This port's own gap, refused only once every check git makes before creating
+    // anything has passed: stock 2.55.0 answers `clone --ref-format=reftable nope` with
+    // `repository 'nope' does not exist`, so it may not pre-empt that.
     if ref_format.as_deref() == Some("reftable") {
         bail!("the reftable ref storage format is not supported: no vendored reftable backend");
-    }
-    if revision_requested.is_some() {
-        bail!(
-            "unsupported option \"--revision\" (cloning at a bare revision needs the \
-             unborn-HEAD handshake, which is not ported)"
-        );
     }
     let created_destination = !dst.exists();
     std::fs::create_dir_all(dst)?;
@@ -1212,6 +1198,42 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // ```c
+    // die_for_incompatible_opt2(!!option_rev, "--revision",
+    //                           !!option_branch, "--branch");
+    // die_for_incompatible_opt2(!!option_rev, "--revision",
+    //                           option_mirror, "--mirror");
+    // [...]
+    // if (option_rev) {
+    //         option_tags = 0;
+    //         option_single_branch = 0;
+    //         opts.wants_head = 0;
+    //         opts.detach = 1;
+    //
+    //         refspec_append(&remote->fetch, option_rev);
+    // }
+    // ```
+    //
+    // (builtin/clone.c:1364-1367, 1405-1412.) Both refusals and the refspec parse come after
+    // the banner, so the half-made clone is taken down with them. `option_tags = 0` lands
+    // after `remote.<name>.tagOpt` was written (clone.c:1308-1312), so it only stops this
+    // fetch following tags, which the gitoxide side applies.
+    let revision_spec = match revision.as_deref() {
+        None => None,
+        Some(rev) => {
+            if branch.is_some() {
+                crate::git_fatal!("options '--revision' and '--branch' cannot be used together");
+            }
+            if mirror {
+                crate::git_fatal!("options '--revision' and '--mirror' cannot be used together");
+            }
+            match gix::refspec::parse(rev.into(), gix::refspec::parse::Operation::Fetch) {
+                Ok(spec) => Some(spec.to_owned()),
+                Err(_) => crate::git_fatal!("invalid refspec '{rev}'"),
+            }
+        }
+    };
+
     // `transport_get()` hands a bundle a vtable whose `get_refs_list` is the
     // bundle's own header and whose `fetch_refs` is `unbundle()` — the pack is
     // *installed*, not negotiated (transport.c:151-216, v2.55.0). gitoxide has no
@@ -1393,6 +1415,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .map_err(|_| anyhow::anyhow!("--branch expects a valid branch name, got {name:?}"))?;
     }
     prepare = prepare.with_shallow(shallow);
+    prepare = prepare.with_revision(revision_spec);
     // "ignored in local clones" is literal: git never puts the filter on the wire
     // for a local source, because there is no wire — `clone_local()` copies the
     // object store whole. Sending it anyway reaches a server that does not
@@ -1434,7 +1457,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // of `Tags::All`, so every plan that is not a single-branch clone has to ask
     // for it back explicitly. `Tags::All` is written to `remote.<name>.tagOpt`,
     // which git does not do, so those cases strip the key again afterwards.
-    let plan = if mirror {
+    let plan = if revision.is_some() {
+        // `--revision` fetches its own refspec and writes none (builtin/clone.c:1319, 1590).
+        None
+    } else if mirror {
         Some(Refspecs::Mirror)
     } else if single_branch == Some(true) {
         Some(Refspecs::Single {
@@ -1838,6 +1864,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             say_done();
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
+            if revision.is_some() {
+                if let Ok(repo) = gix::open(&git_dir) {
+                    report_revision_head(&repo, &outcome.ref_map, false);
+                }
+            }
             // `checkout()` is still called for a bare or `--no-checkout` clone; it returns
             // before touching the worktree, but `junk_mode` has already moved on.
             junk.leave();
@@ -1875,6 +1906,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             say_done();
             note_remote_head(&outcome.ref_map);
             note_filter_support(&outcome.handshake);
+            if revision.is_some() {
+                report_revision_head(checkout.repo(), &outcome.ref_map, true);
+            }
             // `--sparse` is set up before anything is checked out:
             //
             // ```c
@@ -2016,9 +2050,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // leaving it with nothing but the header. gitoxide runs no transaction when there is
     // nothing to write, so the empty file is written here. A remote that advertised no
     // ref at all never reaches `write_remote_refs()` (`if (refs)`, builtin/clone.c:554),
-    // so it gets no file.
+    // so it gets no file. A `--revision` clone stores no ref either — its refspec has no
+    // destination — but its remote did advertise the revision.
+    let packed = git_dir.join("packed-refs");
+    if revision.is_some() && !packed.exists() {
+        std::fs::write(&packed, "# pack-refs with: peeled fully-peeled sorted \n")?;
+    }
     if cloned_empty {
-        let packed = git_dir.join("packed-refs");
         // A single-branch fetch whose refspec came out empty sent ls-refs no `refs/heads/`
         // prefix, so what the remote had under it is known only from the probe.
         let probe_advertised_refs = single_outcome
@@ -3239,6 +3277,10 @@ fn short_pack(err: gix::clone::fetch::Error, branch: Option<&str>, remote_name: 
         )) if io.kind() == std::io::ErrorKind::UnexpectedEof => {
             crate::fatal::die("the remote end hung up unexpectedly")
         }
+        // `die(_("Remote revision %s not found in upstream %s"), ...)` and
+        // `die(_("could not parse %s"), ref_name)` (builtin/clone.c:1550, commit.c:85).
+        e @ (gix::clone::fetch::Error::RevisionMissing { .. }
+        | gix::clone::fetch::Error::RevisionNotACommit { .. }) => crate::fatal::die(e.to_string()),
         gix::clone::fetch::Error::RefNameMissing { ref wanted } => {
             let wanted = branch.map_or_else(|| wanted.as_ref().as_bstr().to_string(), ToOwned::to_owned);
             crate::fatal::die(format!("Remote branch {wanted} not found in upstream {remote_name}"))
@@ -4074,6 +4116,23 @@ fn detach_head_from_non_branch(git_dir: &Path, bare_or_no_checkout: bool, quiet:
         super::checkout::print_detached_head_advice(&peeled.to_string());
     }
     Ok(())
+}
+
+/// What a `clone --revision` prints about the `HEAD` gitoxide detached at the revision.
+///
+/// * `lookup_commit_or_die()` (commit.c:81-91), called from `update_head()` (builtin/clone.c:587),
+///   warns `<name> <oid> is not a commit!` when the ref named a tag it had to peel.
+/// * `checkout()` (builtin/clone.c:652-664) then gives the `advice.detachedHead` block, which
+///   `-q` does not silence, unless there is no checkout to make.
+fn report_revision_head(repo: &gix::Repository, ref_map: &gix::remote::fetch::RefMap, checkout: bool) {
+    let Some((name, advertised)) = gix::clone::fetch::revision_mapping(ref_map) else { return };
+    let Ok(head) = repo.head_id() else { return };
+    if head.detach() != advertised {
+        eprintln!("warning: {name} {advertised} is not a commit!");
+    }
+    if checkout && repo.config_snapshot().boolean("advice.detachedHead") != Some(false) {
+        super::checkout::print_detached_head_advice(&head.to_string());
+    }
 }
 
 /// Remove whatever the local fetch wrote into `objects/pack`.

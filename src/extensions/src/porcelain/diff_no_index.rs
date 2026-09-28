@@ -50,7 +50,9 @@
 //! `-Sfoo` is `-S foo`), through [`crate::parseopt::expand_short`]. `-S`/`-G`
 //! with `--pickaxe-regex`/`--pickaxe-all` run `diffcore_pickaxe()` between rename
 //! detection and rotation, through [`super::diff_pickaxe`]; the needle is matched
-//! against the files' own bytes, as no-index has no textconv pass here.
+//! against each side's textconv output when `--textconv` (the default) finds a
+//! driver for it, and the patch is taken between those outputs too; see
+//! [`textconv_side`].
 //!
 //! `diff_setup_done()`'s two output-format rules apply here as well:
 //! `--name-only`/`--name-status` clear every other format bit (so `--name-only -p`
@@ -505,6 +507,10 @@ struct Opts {
     raw_abbrev: usize,
     full_index: bool,
     text: bool,
+    /// `o->flags.allow_textconv`: `cmd_diff()` raises it before it branches to the
+    /// no-index path (builtin/diff.c:512), and `--[no-]textconv` moves it
+    /// (`diff_opt_textconv()`, diff.c:5930).
+    textconv: bool,
     colors: diff_color::DiffColors,
     /// `options->xdl_opts`' algorithm bits, which `add_diff_options()` exposes to
     /// this parser as fully as to `git diff`'s own.
@@ -651,6 +657,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut no_abbrev = false;
     let mut full_index = false;
     let mut text = false;
+    let mut textconv = true;
     let mut color_when: Option<diff_color::ColorWhen> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut after_dashdash = false;
@@ -1070,6 +1077,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "--no-function-context" => func_context = false,
             "--full-index" => full_index = true,
             "--text" | "-a" => text = true,
+            "--textconv" => textconv = true,
+            "--no-textconv" => textconv = false,
             // `diff_opt_binary()` calls `enable_patch_output()` first, so the flag
             // turns the patch on as well as widening the `index` line.
             "--binary" => {
@@ -1447,6 +1456,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         raw_abbrev,
         full_index,
         text,
+        textconv,
         colors,
         algorithm,
         inter_hunk_ctx,
@@ -1624,6 +1634,32 @@ fn side_driver(
     lookup.for_path(side.name.as_bstr())
 }
 
+/// `get_textconv()` + `fill_textconv()` (diff.c:3762, 7793) for one side: the
+/// converted text when `--textconv` is on and the side exists with a driver that
+/// names a `textconv` program, else `None` for "use the bytes on disk".
+///
+/// A program that cannot run or exits non-zero is `die("unable to read files to
+/// diff")` (diff.c:7824).
+fn textconv_side(
+    drivers: Option<&mut crate::userdiff::Lookup<'_>>,
+    driver: &Option<std::sync::Arc<crate::userdiff::Driver>>,
+    side: &Side,
+    raw: &[u8],
+) -> Option<Vec<u8>> {
+    let program = driver.as_ref()?.settings.textconv.as_deref()?;
+    let lookup = drivers?;
+    if side.file.is_none() {
+        return None;
+    }
+    match lookup.run_program(program, side.name.as_bstr(), raw) {
+        Ok(Some(text)) => Some(text),
+        _ => {
+            eprintln!("fatal: unable to read files to diff");
+            std::process::exit(crate::fatal::EXIT_FATAL as i32);
+        }
+    }
+}
+
 /// `init_diff_words_data()` (diff.c:2346-2359): the pair's word regex is the old
 /// side's driver pattern, else the new side's, compiled with
 /// `REG_EXTENDED | REG_NEWLINE`. Memoised per pattern because one run over a
@@ -1729,28 +1765,48 @@ fn compare_with_drivers(
     // and rotation. `pickaxe_match()` skips a pair with neither side valid, and a
     // `-G` over a binary side without `--text`; a side that does not exist reads
     // as no buffer at all.
+    //
+    // With `allow_textconv` the needle is looked for in each side's textconv
+    // output, and a side that has one is never judged binary
+    // (diffcore-pickaxe.c:148-166).
     if let Some(kind) = &opts.pickaxe {
-        let hits: Vec<bool> = q
-            .pairs
-            .iter()
-            .map(|p| {
-                let a = side_of(&q.specs[p.one], &content);
-                let b = side_of(&q.specs[p.two], &content);
-                if a.file.is_none() && b.file.is_none() {
-                    return false;
+        let mut hits: Vec<bool> = Vec::with_capacity(q.pairs.len());
+        for p in &q.pairs {
+            let a = side_of(&q.specs[p.one], &content);
+            let b = side_of(&q.specs[p.two], &content);
+            if a.file.is_none() && b.file.is_none() {
+                hits.push(false);
+                continue;
+            }
+            let mut side_text = |s: &Side| -> Option<(Vec<u8>, bool)> {
+                s.file.as_ref()?;
+                let raw = content.bytes(&s.name).unwrap_or_default();
+                if !opts.textconv {
+                    return Some((raw, false));
                 }
-                let one = a.file.as_ref().map(|_| content.bytes(&a.name).unwrap_or_default());
-                let two = b.file.as_ref().map(|_| content.bytes(&b.name).unwrap_or_default());
-                let binary = |s: &Option<Vec<u8>>| s.as_deref().is_some_and(super::diff::looks_binary);
-                if matches!(kind, super::diff_pickaxe::Kind::Grep(_))
-                    && !opts.text
-                    && (binary(&one) || binary(&two))
-                {
-                    return false;
-                }
-                kind.content_hit(one.as_deref(), two.as_deref())
-            })
-            .collect();
+                let drv = side_driver(drivers.as_deref_mut(), s).ok().flatten();
+                Some(match textconv_side(drivers.as_deref_mut(), &drv, s, &raw) {
+                    Some(text) => (text, true),
+                    None => (raw, false),
+                })
+            };
+            let one = side_text(&a);
+            let two = side_text(&b);
+            let binary = |s: &Option<(Vec<u8>, bool)>| {
+                s.as_ref().is_some_and(|(data, conv)| !conv && super::diff::looks_binary(data))
+            };
+            if matches!(kind, super::diff_pickaxe::Kind::Grep(_))
+                && !opts.text
+                && (binary(&one) || binary(&two))
+            {
+                hits.push(false);
+                continue;
+            }
+            hits.push(kind.content_hit(
+                one.as_ref().map(|(d, _)| d.as_slice()),
+                two.as_ref().map(|(d, _)| d.as_slice()),
+            ));
+        }
         match opts.pickaxe_all {
             // "Showing the whole changeset if needle exists".
             true => {
@@ -1859,17 +1915,46 @@ fn compare_with_drivers(
         // formats still report as `Bin <old> -> <new> bytes`.
         let stat_binary =
             super::diff::looks_binary(&old_data) || super::diff::looks_binary(&new_data);
-        let binary = !opts.text && stat_binary;
+        // `builtin_diff()` (diff.c:3890-3893, 3964-3966): the patch is taken
+        // between the sides' textconv output, and a side that has one is never
+        // binary there. The header's `index` line and the stat formats keep the
+        // bytes on disk.
+        let (conv_one, conv_two) = match opts.textconv && opts.fmt.patch {
+            true => (
+                textconv_side(drivers.as_deref_mut(), &drv_one, a, &old_data),
+                textconv_side(drivers.as_deref_mut(), &drv_two, b, &new_data),
+            ),
+            false => (None, None),
+        };
+        let binary = !opts.text
+            && ((conv_one.is_none() && super::diff::looks_binary(&old_data))
+                || (conv_two.is_none() && super::diff::looks_binary(&new_data)));
         let (added, deleted, body) =
         super::diff::no_index_body(
-            &old_data,
-            &new_data,
+            conv_one.as_deref().unwrap_or(&old_data),
+            conv_two.as_deref().unwrap_or(&new_data),
             &geom,
             opts.ws,
             binary,
             opts.algorithm,
             opts.ignore_blank_lines,
         );
+        // `builtin_diffstat()` counts the bytes on disk, never the textconv output.
+        let (added, deleted) = match conv_one.is_some() || conv_two.is_some() {
+            false => (added, deleted),
+            true => {
+                let (added, deleted, _) = super::diff::no_index_body(
+                    &old_data,
+                    &new_data,
+                    &geom,
+                    opts.ws,
+                    !opts.text && stat_binary,
+                    opts.algorithm,
+                    opts.ignore_blank_lines,
+                );
+                (added, deleted)
+            }
+        };
         // `hash_filespec()` (diffcore-rename.c) is what leaves an object id on a
         // filespec `queue_diff()` created with the null one, and it runs only
         // inside rename detection. `--raw` therefore prints real ids exactly when
@@ -1909,7 +1994,7 @@ fn compare_with_drivers(
                 match (a.file.is_some(), b.file.is_some()) {
                     (true, true) => {
                         let (copied, added) = super::diff_files::count_changes_sides(
-                            &old_data, !binary, &new_data, !binary,
+                            &old_data, !stat_binary || opts.text, &new_data, !stat_binary || opts.text,
                         );
                         (old_data.len() as u64).saturating_sub(copied) + added
                     }
@@ -2542,6 +2627,7 @@ mod tests {
             raw_abbrev,
             full_index: false,
             text: false,
+            textconv: false,
             // git's default: `static long diff_algorithm` (diff.c) is zero, i.e.
             // Myers, and `--no-index` reaches it through the same `diff_opts`
             // table as every other verb.

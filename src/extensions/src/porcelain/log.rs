@@ -11993,6 +11993,11 @@ pub(crate) struct ShowEntry<'a> {
     /// and before the decorations (log-tree.c:824-826). Only the per-parent
     /// records of `--diff-merges=separate`/`-m` carry one.
     pub(crate) from: Option<ObjectId>,
+    /// `-g`: the reflog entry this record stands for, which the header's
+    /// `Reflog:` lines, the oneline selector and every `%g…` read.
+    pub(crate) reflog: Option<&'a ReflogEntry>,
+    /// `revs->date_mode_explicit`, which the reflog selector consults.
+    pub(crate) date_explicit: bool,
 }
 
 /// A reusable [`render_entry`] driver for the commands that render one record at
@@ -12079,9 +12084,8 @@ impl<'r> EntryRenderer<'r> {
             parents: &parents,
             graph_width: 0,
             expand_tabs: opts.expand_tabs,
-            // No `-g` walk, so every `%g…` expands to nothing.
-            reflog: None,
-            date_explicit: false,
+            reflog: opts.reflog,
+            date_explicit: opts.date_explicit,
             email: opts.email,
         };
         // `pretty_print_commit()` fills a `struct strbuf msgbuf` of its own, which

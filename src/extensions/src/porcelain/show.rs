@@ -195,7 +195,11 @@ const DEFAULT_ABBREV: usize = 7;
 /// object each ref *names*, with no peeling (revision.c:1625-1637), so a ref on an
 /// annotated tag reaches `cmd_show`'s `case OBJ_TAG:` and prints its `tag <name>`
 /// block; only the walk, which peels in `prepare_revision_walk()`, sees through it.
-/// Every flag not listed above is rejected explicitly.
+/// `-g`/`--walk-reflogs` hands each commit named after it to the reflog walk
+/// instead of the pending list, so it prints only once a count or an exclusion
+/// has cleared `no_walk`, and then each entry carries its reflog selector
+/// ([`super::log::reflog_walk`]); a ref-selecting option after `-g` is not
+/// ported. Every flag not listed above is rejected explicitly.
 pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut specs: Vec<&str> = Vec::new();
     // `--stdin`: further revisions, one per line, read after the command line is
@@ -369,6 +373,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--reverse`: reverses `cmd_log_walk`'s output. Inert while `no_walk` holds,
     // because `cmd_show` prints its pending list without consulting it.
     let mut reverse = false;
+    // `-g`/`--walk-reflogs` (`init_reflog_walk()`): the revision slot it stood at,
+    // and how many ref-set options had been read by then. A commit operand read
+    // after it is handed to `add_reflog_for_walk()` instead of the pending list
+    // (revision.c:305-318), so `cmd_show`'s pending loop never sees it; only a
+    // cleared `no_walk` sends the reflog to `cmd_log_walk()`.
+    let mut reflog_from: Option<(usize, usize)> = None;
     // `--topo-order` / `--date-order`, applied to the walk a cleared `no_walk`
     // hands to `cmd_log_walk`.
     let mut order = super::log::Order::Default;
@@ -990,6 +1000,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     no_walk = true;
                 } else if s == "--do-walk" {
                     no_walk = false;
+                } else if s == "-g" || s == "--walk-reflogs" {
+                    reflog_from.get_or_insert((specs.len(), ref_selections.len()));
                 // `--reverse` reverses what `cmd_log_walk` emits; `cmd_show`'s own
                 // pending loop never consults it, so it does nothing while
                 // `no_walk` stands.
@@ -1343,6 +1355,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `git log`; the CLI flags parsed above win where present. git reads these in
     // `git_log_config` and validates `log.date` there — an invalid value is fatal
     // even when `--date` later overrides it, so it is checked unconditionally.
+    // `revs->date_mode_explicit`, which the `-g` selector consults.
+    let date_explicit = cli_date.is_some();
+    if reflog_from.is_some_and(|(_, refs)| ref_selections.len() > refs) {
+        bail!("unsupported option -g with a ref-selecting option after it");
+    }
     let (abbrev_commit, date_mode, show_root, decorate, use_mailmap) = {
         let snap = repo.config_snapshot();
         let cfg_abbrev = snap.boolean("log.abbrevCommit").unwrap_or(false);
@@ -1435,6 +1452,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut walk_tips: Vec<ObjectId> = Vec::new();
     let mut walk_hidden: Vec<ObjectId> = Vec::new();
     let mut plain: Vec<(String, ObjectId)> = Vec::new();
+    // The names `add_reflog_for_walk()` was handed, in argument order.
+    let mut reflog_names: Vec<String> = Vec::new();
     // Commits the command line already caused to be parsed, which is as far as
     // `mark_parents_uninteresting()` reaches while `no_walk` stands.
     let mut parsed_commits: std::collections::HashSet<ObjectId> =
@@ -1525,6 +1544,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             eprint!("{message}");
             return Ok(ExitCode::from(128));
         }
+
         // `handle_revision_arg_1()`'s parent-mark block (revision.c:2178-2207),
         // decoded before the revision parser rather than after it. It has to be:
         // these marks are `handle_revision_arg_1()`'s own grammar, `get_oid_1()`
@@ -1654,6 +1674,19 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         ) {
             return Ok(code);
         }
+        // `add_reflog_for_walk()` refuses an UNINTERESTING commit the moment it is
+        // pended (reflog-walk.c:165-166), once the operand has resolved.
+        let after_reflog_walk = reflog_from.is_some_and(|(g, _)| at >= g);
+        if after_reflog_walk {
+            if let Some(name) = super::log::reflog_excluded_tip(
+                &repo,
+                &[spec.to_string()],
+                &[negated],
+                seen_dashdash,
+            ) {
+                return Ok(fatal(&format!("cannot walk reflogs for {name}\n")));
+            }
+        }
         match parsed {
             // `--not <rev>` and `^<rev>` are the same thing twice: `handle_revision_arg_1`
             // flips `UNINTERESTING` once for the `^` and `setup_revisions` flips it once
@@ -1661,6 +1694,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             RevSpec::Include(id) if negated => {
                 plain.push(((*spec).to_string(), id));
                 walk_hidden.push(id);
+            }
+            // `if (revs->reflog_info && obj->type == OBJ_COMMIT)`: the commit
+            // walks its reflog and is not pended; a tag, tree or blob still is.
+            RevSpec::Include(id)
+                if after_reflog_walk && repo.find_object(id).is_ok_and(|o| o.kind == Kind::Commit) =>
+            {
+                reflog_names.push((*spec).to_string());
             }
             RevSpec::Include(id) => {
                 plain.push(((*spec).to_string(), id));
@@ -1766,6 +1806,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // the pending list positive, and nothing about them is UNINTERESTING, so
             // `no_walk` survives and `git show HEAD^@` prints the parents themselves
             // rather than walking their history. `--not` is what makes them exclusions.
+            RevSpec::IncludeOnlyParents(_) if after_reflog_walk => {
+                bail!("unsupported option -g with {spec}");
+            }
             RevSpec::IncludeOnlyParents(id) => {
                 // Same rule as `^!`: the name is `arg_minus_at`, the argument with
                 // its `^@` cut off (revision.c:2178-2184).
@@ -1805,6 +1848,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // loop — see through an annotated tag to the commit it names, on the positive and the negative
     // side alike, which is why `git show v1 ^v1` prints nothing rather than the tag's own header.
     let needs_walk = !no_walk;
+    // `if (revs->reflog_info && revs->limited) die(...)` and the `--reverse` leg of
+    // `die_for_incompatible_opt3()` (revision.c:3180-3192). `-L` sets
+    // `topo_order`, which is what limits it.
+    if reflog_from.is_some() {
+        if order != super::log::Order::Default || line_level {
+            return Ok(fatal("cannot combine --walk-reflogs with history-limiting options\n"));
+        }
+        if reverse {
+            return Ok(fatal("options '--reverse' and '--walk-reflogs' cannot be used together\n"));
+        }
+    }
     if needs_walk {
         for id in walk_tips.iter_mut().chain(walk_hidden.iter_mut()) {
             if let Some(peeled) = repo
@@ -1838,7 +1892,35 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // tips and parents entered it. Sharing `git log`'s walk is what keeps
     // `git show <range>` from ordering a merge's two lanes differently from
     // `git log <range>` — gitoxide's default `Sorting::BreadthFirst` did.
-    let walked = if needs_walk && !line_level {
+    let walked = if needs_walk && reflog_from.is_some() {
+        // `get_revision_1()` takes nothing but reflog entries (revision.c:4386-4388);
+        // a commit excluded before `-g` hides what it reaches.
+        let hidden = super::log::ancestor_closure(&repo, &walk_hidden)?;
+        let mut nodes = super::log::reflog_walk(&repo, &reflog_names)?;
+        nodes.retain(|n| !hidden.contains(&n.id));
+        // A pathspec makes `get_commit_action()` drop the TREESAME entries.
+        if !pathspecs.is_empty() {
+            let mode = super::simplify::Mode { dense: true, simplify_history: true, first_parent };
+            let bottoms: std::collections::HashSet<ObjectId> = walk_hidden.iter().copied().collect();
+            let mut sim = super::simplify::ReflogWalk::new(&repo, mode, !walk_hidden.is_empty(), &hidden, &bottoms);
+            let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
+            let mut diff = super::rev_list::PathDiff {
+                repo: &repo,
+                specs: &mut specs,
+                decorations: None,
+                pathspec: true,
+            };
+            let mut kept = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                sim.pop(node.id, &mut diff)?;
+                if sim.shows(node.id, false) {
+                    kept.push(node);
+                }
+            }
+            nodes = kept;
+        }
+        nodes
+    } else if needs_walk && !line_level {
         let hidden = if walk_hidden.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -1950,6 +2032,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let remerge_odb: std::cell::OnceCell<crate::tmp_objdir::TmpObjdir> = std::cell::OnceCell::new();
     let no_prefix: std::cell::RefCell<Vec<(usize, usize)>> = std::cell::RefCell::new(Vec::new());
     let disp = DisplayOpts {
+        reflog: std::cell::RefCell::new(None),
+        reflog_walk: reflog_from.is_some(),
+        date_explicit,
         show_signature,
         notes: &notes_trees,
         notes_shown: notes_opt.show,
@@ -2089,6 +2174,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
         for node in &nodes {
             let id = node.id;
+            // A reflog entry is shown whatever came before it: `get_revision_1()`
+            // clears `SHOWN` on each commit `next_reflog_entry()` hands out
+            // (revision.c:4404-4405), and `show_log()` prints its selector.
+            if node.reflog.is_some() {
+                shown.clear();
+            }
+            *disp.reflog.borrow_mut() = node.reflog.clone();
             show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(node.source.as_str()), &mut shown_one, None)?;
         }
     } else {
@@ -2112,6 +2204,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         let mut skip_left = counts.skip;
         for (spec, id) in &plain {
             let is_commit = repo.find_object(*id).is_ok_and(|o| o.kind == Kind::Commit);
+            // Under `-g` the one-entry walk `cmd_show` runs for a pending commit
+            // hands out reflog entries only, and there are none: it prints
+            // nothing and spends no `--skip`.
+            if is_commit && reflog_from.is_some() {
+                continue;
+            }
             if is_commit {
                 if seen_pending.contains(id) {
                     continue;
@@ -2413,6 +2511,13 @@ struct RenameWarnState {
 }
 
 struct DisplayOpts<'a> {
+    /// The reflog entry the record being rendered stands for under `-g`, which
+    /// `show_log()` prints the selector and message of.
+    reflog: std::cell::RefCell<Option<super::log::ReflogEntry>>,
+    /// `revs->reflog_info` is set: a commit renders only as a reflog entry.
+    reflog_walk: bool,
+    /// `revs->date_mode_explicit`: `--date=` was given, which the `-g` selector reads.
+    date_explicit: bool,
     /// `--show-signature` / `--no-show-signature` (`rev_info.show_signature`).
     show_signature: bool,
     /// `log.abbrevCommit` / `--abbrev-commit`: abbreviate the `commit <id>` line.
@@ -2620,6 +2725,12 @@ fn show_one(
                 break;
             }
             Kind::Commit => {
+                // Under `-g` a pending commit goes through `cmd_log_walk()`, and
+                // that walk hands out reflog entries only (revision.c:4386-4388):
+                // the commit a tag names prints nothing.
+                if disp.reflog_walk && disp.reflog.borrow().is_none() {
+                    break;
+                }
                 // git prints a given commit at most once (the SHOWN flag).
                 if shown.contains(&obj.id) {
                     break;
@@ -3474,6 +3585,7 @@ fn show_commit_record(
         &recoded
     };
     let record_start = out.len();
+    let reflog = disp.reflog.borrow().clone();
     disp.renderer.render(
         out,
         commit,
@@ -3491,6 +3603,8 @@ fn show_commit_record(
             source: source.map(str::as_bytes),
             show_signature: disp.show_signature,
             from,
+            reflog: reflog.as_ref(),
+            date_explicit: disp.date_explicit,
         },
     )?;
     // `repo_format_commit_message()`'s tail: the *rendered record* is converted out
@@ -3510,7 +3624,9 @@ fn show_commit_record(
     // The closing half of `show_log()`: a terminator format ends each record with
     // `opt->diffopt.line_termination`, except the genuinely empty user format,
     // which emits nothing at all (log-tree.c:915-919).
-    if disp.terminator && !header_empty {
+    // The `-g` oneline record has already ended itself: see
+    // [`super::log::render_entry`].
+    if disp.terminator && !header_empty && !(reflog.is_some() && matches!(pretty, Pretty::Oneline)) {
         out.push(rec_term);
     }
 

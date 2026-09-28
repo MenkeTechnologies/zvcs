@@ -250,11 +250,6 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // git prints the header only when `<repository>` was left off the command line.
-    if repository.is_none() && !opts.quiet {
-        eprintln!("From {url}");
-    }
-
     // `transfer.credentialsInUrl` is consulted before the connection is opened,
     // sharing the fetch port's implementation so both commands report the same
     // sentence for the same URL.
@@ -350,6 +345,12 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // git prints the header only when `<repository>` was left off the command
+    // line, and only once `transport_get_remote_refs()` has answered
+    // (builtin/ls-remote.c:149-156): an unreachable remote gets none.
+    if repository.is_none() && !opts.quiet {
+        eprintln!("From {url}");
+    }
     Ok(list(&ref_map.remote_refs, patterns, &opts, Some(&repo)))
 }
 

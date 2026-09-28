@@ -504,7 +504,7 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
             &mut *self.graph,
             self.ref_map,
             self.shallow,
-            negotiate::make_refmapping_ignore_predicate(self.tags, self.ref_map),
+            negotiate::make_refmapping_ignore_predicate(self.tags, self.ref_map, self.objects),
             &self.restrictions,
         )
     }
@@ -516,7 +516,7 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
             self.ref_map,
             remote_ref_target_known,
             self.shallow,
-            negotiate::make_refmapping_ignore_predicate(self.tags, self.ref_map),
+            negotiate::make_refmapping_ignore_predicate(self.tags, self.ref_map, self.objects),
         )
     }
 

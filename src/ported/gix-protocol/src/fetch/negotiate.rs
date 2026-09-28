@@ -311,14 +311,24 @@ where
 ///
 /// We want to ignore mappings during negotiation if they would be handled implicitly by the server, which is the case
 /// when tags would be sent implicitly due to `Tags::Included`.
-pub fn make_refmapping_ignore_predicate(fetch_tags: Tags, ref_map: &RefMap) -> impl Fn(&refmap::Mapping) -> bool + '_ {
+///
+/// An implicit tag is only ignored when git's `find_non_local_tags()` (builtin/fetch.c:355-406) would not have
+/// put it in the ref map: that keeps a tag whose object, or the object it peels to, is already in `objects` or
+/// is the target of another mapping being fetched. Such a tag is then wanted like any other ref, which is how an
+/// annotated tag created upstream on a commit this repository already has reaches it — `include-tag` alone
+/// never sends it, since the commit is not in the pack.
+pub fn make_refmapping_ignore_predicate<'a>(
+    fetch_tags: Tags,
+    ref_map: &'a RefMap,
+    objects: &'a impl gix_object::Exists,
+) -> impl Fn(&refmap::Mapping) -> bool + 'a {
     // With included tags, we have to keep mappings of tags to handle them later when updating refs, but we don't want to
     // explicitly `want` them as the server will determine by itself which tags are pointing to a commit it wants to send.
     // If we would not exclude implicit tag mappings like this, we would get too much of the graph.
     let tag_refspec_to_ignore = matches!(fetch_tags, Tags::Included)
         .then(|| fetch_tags.to_refspec())
         .flatten();
-    move |mapping| {
+    let is_implicit_tag = move |mapping: &refmap::Mapping| {
         tag_refspec_to_ignore.is_some_and(|tag_spec| {
             mapping
                 .spec_index
@@ -326,6 +336,26 @@ pub fn make_refmapping_ignore_predicate(fetch_tags: Tags, ref_map: &RefMap) -> i
                 .and_then(|idx| ref_map.extra_refspecs.get(idx))
                 .is_some_and(|spec| spec.to_ref() == tag_spec)
         })
+    };
+    // `create_fetch_oidset()`: what the rest of the ref map is fetching.
+    let fetch_oids: std::collections::HashSet<gix_hash::ObjectId> = ref_map
+        .mappings
+        .iter()
+        .filter(|m| !is_implicit_tag(m))
+        .filter_map(|m| m.remote.as_id().map(ToOwned::to_owned))
+        .collect();
+    let reachable = move |id: &gix_hash::oid| objects.exists(id) || fetch_oids.contains(id);
+    move |mapping| {
+        if !is_implicit_tag(mapping) {
+            return false;
+        }
+        let followed = match &mapping.remote {
+            refmap::Source::Ref(crate::handshake::Ref::Peeled { tag, object, .. }) => {
+                reachable(tag) || reachable(object)
+            }
+            other => other.as_id().is_some_and(&reachable),
+        };
+        !followed
     }
 }
 

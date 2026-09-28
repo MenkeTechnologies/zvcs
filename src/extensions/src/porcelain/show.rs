@@ -208,6 +208,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // Owns the lines so `specs` can borrow them alongside the argument slices.
     let stdin_text: String;
     let mut pathspecs: Vec<Vec<u8>> = Vec::new();
+    // `--full-diff` (`revs->full_diff`, revision.c:2654-2656): the pathspec still
+    // limits the walk, but `setup_revisions()` no longer copies it into
+    // `revs->diffopt.pathspec` (revision.c:3165-3167), so each record's diff
+    // covers the whole tree.
+    let mut full_diff = false;
     let mut formats = Formats::default();
     // `-z` (`diffopt.line_termination = 0`): NUL-terminated records with raw paths.
     let mut z = false;
@@ -1098,6 +1103,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                             )));
                         }
                     }
+                } else if s == "--full-diff" {
+                    full_diff = true;
                 } else if s == "--compact-summary" {
                     compact_summary = true;
                     formats.stat = true;
@@ -1243,7 +1250,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     if line_level {
         // git's allowed set is PATCH / NO_OUTPUT / RAW / NAME / NAME_STATUS /
         // SUMMARY; `DIFF_FORMAT_CHECKDIFF` and the count formats are not in it.
-        if formats.stat || formats.check {
+        // `revs->full_diff` is in the same test (revision.c:3206-3212).
+        if formats.stat || formats.check || full_diff {
             return Ok(fatal("-L does not yet support the requested diff format\n"));
         }
         if !pathspecs.is_empty() {
@@ -2069,6 +2077,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         Some(Err(e)) => order_failure = Some(e),
         None => {}
     }
+    // `revs->diffopt.pathspec`: the command-line pathspec unless `--full-diff`
+    // kept it to the walk (revision.c:3165-3167).
+    let diff_pathspecs: Vec<Vec<u8>> = match full_diff {
+        true => Vec::new(),
+        false => pathspecs.clone(),
+    };
     let disp = DisplayOpts {
         reflog: std::cell::RefCell::new(None),
         reflog_walk: reflog_from.is_some(),
@@ -2152,7 +2166,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     continue;
                 };
                 let pairs = line_log::queue_pairs(&range);
-                show_one(&repo, &mut out, &node.id.to_string(), node.id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, None, &mut shown_one, Some(&pairs))?;
+                show_one(&repo, &mut out, &node.id.to_string(), node.id, &pretty, selection, &diff_pathspecs, &disp, &pickaxe, &mut shown, None, &mut shown_one, Some(&pairs))?;
             }
         } else {
             // `no_walk` never parses the pending commit's parents, so their tree ids
@@ -2170,7 +2184,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 }
             }
             let spec = walk_tip_sources.first().map(String::as_str).unwrap_or("HEAD");
-            show_one(&repo, &mut out, spec, start, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec), &mut shown_one, Some(&pairs))?;
+            show_one(&repo, &mut out, spec, start, &pretty, selection, &diff_pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec), &mut shown_one, Some(&pairs))?;
         }
     } else if needs_walk {
         // `--reverse` is applied to what the walk produced, which is where
@@ -2225,7 +2239,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 shown.clear();
             }
             *disp.reflog.borrow_mut() = node.reflog.clone();
-            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(node.source.as_str()), &mut shown_one, None)?;
+            show_one(&repo, &mut out, &id.to_string(), id, &pretty, selection, &diff_pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(node.source.as_str()), &mut shown_one, None)?;
         }
     } else {
         // `cmd_show` reuses one `rev_info` across its pending loop, and the first
@@ -2277,7 +2291,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
             }
-            if let Err(e) = show_one(&repo, &mut out, spec, *id, &pretty, selection, &pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None) {
+            if let Err(e) = show_one(&repo, &mut out, spec, *id, &pretty, selection, &diff_pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None) {
                 // git writes each object as `cmd_show()` reaches it, so a `die()`
                 // partway through the list — `regcomp_or_die()` on the first commit
                 // diffed, say — leaves the objects before it already printed.

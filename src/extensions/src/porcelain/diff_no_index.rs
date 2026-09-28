@@ -46,6 +46,12 @@
 //! `builtin_diff_no_index()` never raises `rotate_to_strict`, silent rather than
 //! fatal when the target names no pair.
 //!
+//! Short options clump as `parse_short_opt()` reads them (`-bw` is `-b -w`, and
+//! `-Sfoo` is `-S foo`), through [`crate::parseopt::expand_short`]. `-S`/`-G`
+//! with `--pickaxe-regex`/`--pickaxe-all` run `diffcore_pickaxe()` between rename
+//! detection and rotation, through [`super::diff_pickaxe`]; the needle is matched
+//! against the files' own bytes, as no-index has no textconv pass here.
+//!
 //! `diff_setup_done()`'s two output-format rules apply here as well:
 //! `--name-only`/`--name-status` clear every other format bit (so `--name-only -p`
 //! prints names and no patch), `-s` *assigns* `DIFF_FORMAT_NO_OUTPUT` where it
@@ -540,12 +546,36 @@ struct Opts {
     ignore_blank_lines: bool,
     /// `--diff-filter=<v>`: `diffcore_apply_filter()`'s letter set.
     filter: super::diff_filter::Filter,
+    /// `-S`/`-G`: the `diffcore_pickaxe()` pass, which keeps the pairs whose two
+    /// sides differ in the needle's occurrence count (`-S`) or whose changed lines
+    /// match it (`-G`).
+    pickaxe: Option<super::diff_pickaxe::Kind>,
+    /// `--pickaxe-all`: one hit keeps the whole queue, none empties it.
+    pickaxe_all: bool,
     /// `o->ws_error_highlight` and `o->output_indicators[]`, for the re-emission
     /// pass that paints the assembled patch.
     paint: diff_color::PaintOptions,
     /// `o->word_diff` / `o->word_regex` / `o->color_moved`, likewise.
     extra: diff_color::ExtraPaint,
 }
+
+/// `add_diff_options()`'s short options by how `parse_short_opt()` consumes them
+/// (diff.c:6011-6292): the flags, the five whose value is required (`-S`, `-G`,
+/// `-I`, `-O`, `-l`) and so swallow the rest of a clump, and the five
+/// `PARSE_OPT_OPTARG` ones (`-U`, `-X`, `-B`, `-M`, `-C`) whose value is only ever
+/// the rest of the word.
+const DIFF_SHORTS: crate::parseopt::Shorts<'static> = crate::parseopt::Shorts {
+    flags: "pswubWzDaR",
+    values: "SGIOl",
+    optargs: "UXBMC",
+    number: false,
+};
+
+/// `DIFF_PICKAXE_KIND_S` / `_G` / `_OBJFIND` (diff.h), the bits
+/// `diff_setup_done()`'s conflict checks count.
+const PICKAXE_KIND_S: u8 = 1;
+const PICKAXE_KIND_G: u8 = 2;
+const PICKAXE_KIND_OBJFIND: u8 = 4;
 
 /// git's `diff_no_index_usage[]`, over the block every `add_diff_options()`
 /// caller shares. `usage_with_options()` writes both to stderr and exits 129.
@@ -676,10 +706,34 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut pending: Option<String> = None;
     // `--find-object=<object>`: `options->objfind`, see [`resolve_find_object`].
     let mut find_object = false;
+    // `options->pickaxe` / `pickaxe_opts`: the last `-S`/`-G` needle and which
+    // kind it was, the kind bits `diff_setup_done()` checks for conflicts (with
+    // `--find-object` among them), `--pickaxe-regex` and `--pickaxe-all`.
+    let mut pickaxe_needle: Option<(u8, Vec<u8>)> = None;
+    let mut pickaxe_kinds: u8 = 0;
+    let mut pickaxe_regex = false;
+    let mut pickaxe_all = false;
 
-    for a in args {
+    // `parse_short_opt()` consumes a clump such as `-bw` one character at a time,
+    // so a clump is split into the words it would have been read as and those go
+    // back on the front of the line.
+    let mut words: std::collections::VecDeque<String> = args.iter().cloned().collect();
+    while let Some(word) = words.pop_front() {
+        let a = &word;
         if let Some(flag) = pending.take() {
             match flag.as_str() {
+                // `diff_opt_pickaxe_string()` / `diff_opt_pickaxe_regex()`
+                // (diff.c:5879-5902): the needle is recorded, the kind bit is or'ed
+                // in, and an empty needle is the callback's `error()`.
+                "-S" | "-G" => {
+                    let kind = flag.as_bytes()[1];
+                    pickaxe_kinds |= if kind == b'S' { PICKAXE_KIND_S } else { PICKAXE_KIND_G };
+                    if a.is_empty() {
+                        eprintln!("error: -{} requires a non-empty argument", kind as char);
+                        return Ok(ExitCode::from(129));
+                    }
+                    pickaxe_needle = Some((kind, a.as_bytes().to_vec()));
+                }
                 "--skip-to" | "--rotate-to" => {
                     skip_or_rotate = Some((flag == "--skip-to", a.as_str().into()));
                 }
@@ -689,7 +743,10 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                 },
                 "--line-prefix" => line_prefix = a.as_bytes().to_vec(),
                 "--find-object" => match resolve_find_object(a) {
-                    Ok(()) => find_object = true,
+                    Ok(()) => {
+                        find_object = true;
+                        pickaxe_kinds |= PICKAXE_KIND_OBJFIND;
+                    }
                     Err(code) => return Ok(code),
                 },
                 "--diff-filter" => {
@@ -746,6 +803,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                 | "--find-object"
                 | "--diff-filter"
                 | "--ws-error-highlight"
+                | "-S"
+                | "-G"
         ) || diff_color::needs_separate_value(a)
             || super::diff::is_stat_width_flag(a)
         {
@@ -778,6 +837,15 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         if after_dashdash || !a.starts_with('-') || a == "-" {
             operands.push(a.clone());
             continue;
+        }
+        if !a.starts_with("--") && a.len() > 2 {
+            let split = crate::parseopt::expand_short(std::slice::from_ref(a), DIFF_SHORTS);
+            if split.len() > 1 {
+                for w in split.into_iter().rev() {
+                    words.push_front(w);
+                }
+                continue;
+            }
         }
         // `--color-words[=<re>]`, `--word-diff[=<mode>]`, `--word-diff-regex=<re>`
         // and the `--color-moved` family are all on the shared `add_diff_options()`
@@ -1117,10 +1185,15 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             }
             s if s.starts_with("--find-object=") => {
                 match resolve_find_object(&s["--find-object=".len()..]) {
-                    Ok(()) => find_object = true,
+                    Ok(()) => {
+                        find_object = true;
+                        pickaxe_kinds |= PICKAXE_KIND_OBJFIND;
+                    }
                     Err(code) => return Ok(code),
                 }
             }
+            "--pickaxe-all" => pickaxe_all = true,
+            "--pickaxe-regex" => pickaxe_regex = true,
             // `parse_options()` rejects these outright: they belong to
             // `cmd_diff()`, not to the no-index parser, and never reach it.
             s if NOT_IN_NO_INDEX.contains(&s) => {
@@ -1327,6 +1400,41 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(128));
     }
+    // The three pickaxe checks that follow it in `diff_setup_done()`
+    // (diff.c:5263-5273), each a `HAS_MULTI_BITS()` over a mask of `pickaxe_opts`.
+    let multi = |bits: u8| bits.count_ones() > 1;
+    if multi(pickaxe_kinds) {
+        eprintln!("fatal: options '-G', '-S', and '--find-object' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+    if multi(pickaxe_kinds & PICKAXE_KIND_G | u8::from(pickaxe_regex) << 7) {
+        eprintln!(
+            "fatal: options '-G' and '--pickaxe-regex' cannot be used together, use '--pickaxe-regex' with '-S'"
+        );
+        return Ok(ExitCode::from(128));
+    }
+    if multi(pickaxe_kinds & PICKAXE_KIND_OBJFIND | u8::from(pickaxe_all) << 7) {
+        eprintln!(
+            "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'"
+        );
+        return Ok(ExitCode::from(128));
+    }
+    // `diffcore_pickaxe()` compiles the needle as the queue reaches it
+    // (diffcore-pickaxe.c:242-276): `-G` and `--pickaxe-regex -S` through
+    // `regcomp_or_die()`, a plain `-S` as a literal.
+    let pickaxe = match pickaxe_needle {
+        Some((kind, pat)) => {
+            match super::diff_pickaxe::compile_needle(pat, kind == b'G' || pickaxe_regex, false) {
+                Ok(needle) if kind == b'G' => Some(super::diff_pickaxe::Kind::Grep(needle)),
+                Ok(needle) => Some(super::diff_pickaxe::Kind::Occurrences(needle)),
+                Err(e) => {
+                    eprintln!("fatal: invalid regex: {e}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        }
+        None => None,
+    };
     let opts = Opts {
         fmt: fmt.resolved(),
         ctx,
@@ -1354,6 +1462,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         dirstat,
         ignore_blank_lines,
         filter,
+        pickaxe,
+        pickaxe_all,
         paint: diff_color::PaintOptions { ws_error_highlight, ..Default::default() },
         extra: match &repo {
             Some(repo) => match move_word.resolve(repo) {
@@ -1614,6 +1724,46 @@ fn compare_with_drivers(
     }
     super::diffcore_rename::run(&mut q, rename_opts, &mut content).emit("diff.renameLimit");
     super::diffcore_rename::resolve_rename_copy(&mut q);
+
+    // `diffcore_pickaxe()` (diffcore-pickaxe.c:184-218), between rename detection
+    // and rotation. `pickaxe_match()` skips a pair with neither side valid, and a
+    // `-G` over a binary side without `--text`; a side that does not exist reads
+    // as no buffer at all.
+    if let Some(kind) = &opts.pickaxe {
+        let hits: Vec<bool> = q
+            .pairs
+            .iter()
+            .map(|p| {
+                let a = side_of(&q.specs[p.one], &content);
+                let b = side_of(&q.specs[p.two], &content);
+                if a.file.is_none() && b.file.is_none() {
+                    return false;
+                }
+                let one = a.file.as_ref().map(|_| content.bytes(&a.name).unwrap_or_default());
+                let two = b.file.as_ref().map(|_| content.bytes(&b.name).unwrap_or_default());
+                let binary = |s: &Option<Vec<u8>>| s.as_deref().is_some_and(super::diff::looks_binary);
+                if matches!(kind, super::diff_pickaxe::Kind::Grep(_))
+                    && !opts.text
+                    && (binary(&one) || binary(&two))
+                {
+                    return false;
+                }
+                kind.content_hit(one.as_deref(), two.as_deref())
+            })
+            .collect();
+        match opts.pickaxe_all {
+            // "Showing the whole changeset if needle exists".
+            true => {
+                if !hits.iter().any(|&h| h) {
+                    q.pairs.clear();
+                }
+            }
+            false => {
+                let mut it = hits.into_iter();
+                q.pairs.retain(|_| it.next().unwrap_or(false));
+            }
+        }
+    }
 
     // `diffcore_rotate()` (diff.c:6763): re-anchor the queue on the pair whose
     // *post-image* name is the target — `p->two->path`, which for a no-index
@@ -2413,6 +2563,8 @@ mod tests {
             dirstat: super::super::diff_files::DirStat::default(),
             ignore_blank_lines: false,
             filter: super::super::diff_filter::Filter::default(),
+            pickaxe: None,
+            pickaxe_all: false,
             paint: diff_color::PaintOptions::default(),
             extra: diff_color::ExtraPaint::default(),
         }

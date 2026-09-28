@@ -2733,8 +2733,8 @@ impl RepositoryDirs {
 ///   `~`-expanded, made `**/`-relative unless absolute, `**`-completed when it
 ///   names a directory, and wildmatched with `WM_PATHNAME` against the realpath
 ///   of the git directory, then against its plain absolute path. A `./` pattern
-///   is `prepare_include_condition_pattern()`'s own error (:199-236) and is not
-///   modelled here.
+///   is `prepare_include_condition_pattern()`'s own error (:214-219), the `Err`:
+///   a command-line value has no file for it to be relative to.
 /// * `onbranch:` — `include_by_branch()` (:297-320): the short name of the branch
 ///   `HEAD` points at, same pattern completion, `WM_PATHNAME`.
 /// * `hasconfig:remote.*.url:` — `include_by_remote_url()` (:385-394) has to
@@ -2743,7 +2743,7 @@ impl RepositoryDirs {
 ///   condition as true. So for a relative path the answer is always yes.
 ///
 /// Anything else is an unknown condition, which is false.
-pub(crate) fn command_line_include_condition(cond: &str) -> bool {
+pub(crate) fn command_line_include_condition(cond: &str) -> Result<bool, String> {
     let complete = |mut pattern: String| {
         // `add_trailing_starstar_for_dir()`.
         if pattern.ends_with('/') {
@@ -2759,18 +2759,18 @@ pub(crate) fn command_line_include_condition(cond: &str) -> bool {
         gix::glob::wildmatch(pattern.into(), text.to_string_lossy().as_ref().into(), mode)
     };
     let gitdir = |pattern: &str, icase: bool| {
-        let Some(dirs) = repository_directories() else { return false };
+        let Some(dirs) = repository_directories() else { return Ok(false) };
         let expanded = crate::setup::interpolate_path(pattern)
             .map_or_else(|| pattern.to_owned(), |p| p.to_string_lossy().into_owned());
         if expanded.starts_with("./") {
-            return false;
+            return Err("relative config include conditionals must come from files".to_owned());
         }
         let pattern = match std::path::Path::new(&expanded).is_absolute() {
             true => complete(expanded),
             false => complete(format!("**/{expanded}")),
         };
         let absolute = std::path::absolute(&dirs.git_dir).unwrap_or_else(|_| dirs.git_dir.clone());
-        matches(&pattern, &crate::setup::realpath(&dirs.git_dir), icase) || matches(&pattern, &absolute, icase)
+        Ok(matches(&pattern, &crate::setup::realpath(&dirs.git_dir), icase) || matches(&pattern, &absolute, icase))
     };
     if let Some(pattern) = cond.strip_prefix("gitdir:") {
         return gitdir(pattern, false);
@@ -2779,12 +2779,12 @@ pub(crate) fn command_line_include_condition(cond: &str) -> bool {
         return gitdir(pattern, true);
     }
     if let Some(pattern) = cond.strip_prefix("onbranch:") {
-        let Some(dirs) = repository_directories() else { return false };
+        let Some(dirs) = repository_directories() else { return Ok(false) };
         let head = std::fs::read_to_string(dirs.git_dir.join("HEAD")).unwrap_or_default();
-        let Some(short) = head.trim_end().strip_prefix("ref: refs/heads/") else { return false };
-        return matches(&complete(pattern.to_owned()), std::path::Path::new(short), false);
+        let Some(short) = head.trim_end().strip_prefix("ref: refs/heads/") else { return Ok(false) };
+        return Ok(matches(&complete(pattern.to_owned()), std::path::Path::new(short), false));
     }
-    cond.starts_with("hasconfig:remote.*.url:")
+    Ok(cond.starts_with("hasconfig:remote.*.url:"))
 }
 
 /// Locate the repository without opening it — opening is what fails when the

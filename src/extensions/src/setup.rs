@@ -2213,41 +2213,61 @@ fn access_x_ok(path: &Path) -> bool {
 /// an unknown verb on its way to `help_unknown_cmd` — reports it and exits 128.
 ///
 /// Returns the exit code to leave with, or `None` to continue.
-pub fn command_line_config_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+pub fn command_line_config_gate(
+    sub: &str,
+    args: &[String],
+    overrides: &[crate::ConfigOverride],
+) -> Option<ExitCode> {
     // Verified against git 2.55.0: `version`, a bare `help` and `stripspace` exit 0
-    // under a bogus count; everything else measured reports it and exits 128.
+    // under a bogus count and under a malformed `-c` alike; everything else
+    // measured reports it and exits 128.
     let reads_no_config = sub == "version" || sub == "stripspace" || (sub == "help" && args.is_empty());
-    match command_line_config_count() {
-        Err(reason) => {
-            if reads_no_config {
-                return None;
-            }
-            eprintln!("error: {reason}");
-            eprintln!("fatal: unable to parse command-line config");
-            Some(ExitCode::from(crate::fatal::EXIT_FATAL))
-        }
-        // `strtoul("")` is `0` with `endp` at the terminator, so an empty
-        // `GIT_CONFIG_COUNT` is zero overrides and not an error. gitoxide's parser
-        // is stricter and rejects the empty string outright, so the value is
-        // rewritten to the `0` it means before anything reads configuration.
-        Ok(0) => {
-            if std::env::var_os("GIT_CONFIG_COUNT").is_some_and(|v| v != "0") {
-                // Safety: this runs on the main thread, before the verb is
-                // dispatched — the same point at which `push_config_override()`
-                // publishes `-c` overrides through these variables.
-                std::env::set_var("GIT_CONFIG_COUNT", "0");
-            }
-            None
-        }
-        Ok(_) => None,
+    if reads_no_config {
+        return None;
+    }
+    if let Some(code) = crate::report_bad_config_overrides(overrides) {
+        return Some(code);
+    }
+    // `strtoul("")` is `0` with `endp` at the terminator, so an empty
+    // `GIT_CONFIG_COUNT` is zero overrides and not an error. gitoxide's parser
+    // is stricter and rejects the empty string outright, so the value is
+    // rewritten to the `0` it means before anything reads configuration.
+    let count = std::env::var("GIT_CONFIG_COUNT").ok();
+    if count.as_deref().is_some_and(|v| v != "0" && strtoul_10(v) == Some(0)) {
+        // Safety: this runs on the main thread, before the verb is
+        // dispatched — the same point at which `push_config_override()`
+        // publishes `-c` overrides through these variables.
+        std::env::set_var("GIT_CONFIG_COUNT", "0");
+    }
+    None
+}
+
+/// The `GIT_CONFIG_COUNT` this process inherited, captured by
+/// [`capture_inherited_config_count`] before `handle_options` appends this
+/// process's own `-c` to the same triple for its children.
+static INHERITED_CONFIG_COUNT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Record the inherited `GIT_CONFIG_COUNT`. The port publishes every valued `-c`
+/// through that triple as it parses it, so after `handle_options` the variable
+/// no longer says how many entries the *parent* declared — and the C reads the
+/// inherited entries first and the `-c` ones (through `GIT_CONFIG_PARAMETERS`)
+/// second, which decides whose error is reported when both are wrong.
+pub(crate) fn capture_inherited_config_count() {
+    if let Ok(mut slot) = INHERITED_CONFIG_COUNT.write() {
+        *slot = std::env::var("GIT_CONFIG_COUNT").ok();
     }
 }
 
-/// The number of `-c`-equivalent overrides the environment declares, or the
-/// `error()` line [`command_line_config_gate`] reports.
-fn command_line_config_count() -> Result<u64, String> {
-    let Ok(raw) = std::env::var("GIT_CONFIG_COUNT") else {
-        return Ok(0);
+/// The `GIT_CONFIG_COUNT` half of `git_config_from_parameters()`
+/// (config.c:740-779): each inherited entry in order, its key checked by
+/// `config_parse_pair()` and the pair handed to `each` — the config callback,
+/// which is where `git_config_include()` refuses a relative include. The first
+/// failure is the `error()` line the caller reports.
+pub(crate) fn for_each_inherited_config_entry(
+    mut each: impl FnMut(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(raw) = INHERITED_CONFIG_COUNT.read().ok().and_then(|slot| slot.clone()) else {
+        return Ok(());
     };
     let Some(count) = strtoul_10(&raw) else {
         return Err("bogus count in GIT_CONFIG_COUNT".to_owned());
@@ -2261,9 +2281,9 @@ fn command_line_config_count() -> Result<u64, String> {
             return Err(format!("missing config key {key_var}"));
         };
         let value_var = format!("GIT_CONFIG_VALUE_{i}");
-        if std::env::var_os(&value_var).is_none() {
+        let Ok(value) = std::env::var(&value_var) else {
             return Err(format!("missing config value {value_var}"));
-        }
+        };
         // `config_parse_pair()` (config.c:620-633), which the environment triple
         // reaches at config.c:775 exactly as `-c` reaches it at config.c:674:
         //
@@ -2285,8 +2305,9 @@ fn command_line_config_count() -> Result<u64, String> {
             return Err("empty config key".to_owned());
         }
         crate::config::parse_config_key(&key)?;
+        each(&key, &value)?;
     }
-    Ok(count)
+    Ok(())
 }
 
 /// `strtoul(value, &endp, 10)` followed by git's `if (*endp)` test. `None` is

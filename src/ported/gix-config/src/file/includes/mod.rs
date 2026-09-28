@@ -266,6 +266,14 @@ fn gitdir_matches(
         if !err_on_missing_config_path && target_config_path.is_none() {
             return Ok(false);
         }
+        // git's `prepare_include_condition_pattern()` (config.c:214-219) answers a
+        // `./` pattern with no file behind it with `error()`, whose `-1` the `&&`
+        // chain in `git_config_include()` (config.c:436-438) reads as true: the
+        // `path` is then followed. The `error:` line itself is printed where the
+        // command-line configuration is validated, before any of it is loaded.
+        if target_config_path.is_none() {
+            return Ok(true);
+        }
         let parent_dir = target_config_path
             .ok_or(Error::MissingConfigPath)?
             .parent()

@@ -531,16 +531,18 @@ fn push_config_env(overrides: &mut Vec<ConfigOverride>, spec: &str) -> Option<Ex
 ///
 /// git has no such point — `git_config_from_parameters()` is called by whatever
 /// reads config first, so a command that never reads any (`git -c foo version`,
-/// `git -c foo --exec-path`) never notices a bad key. This port has no single
-/// place where config is read either, so the check runs once, here, after the
-/// `version`/`help` rewrite that `cmd_main` does; `version` and a bare `help`
-/// are the two verbs it exempts, both confirmed silent under stock 2.55.0.
+/// `git -c foo --exec-path`) never notices a bad key. For a builtin that first
+/// read is repository setup, which comes after the `$GIT_OBJECT_DIRECTORY`
+/// discovery refusal (measured against git 2.55.0: `GIT_OBJECT_DIRECTORY=<missing>
+/// git -c bad=1 status` is `not a git repository`), so a builtin is left to
+/// [`setup::command_line_config_gate`], which runs at that point. Anything else
+/// is on its way to `alias_lookup()`, which reads the configuration first.
 pub(crate) fn validate_config_overrides(
     overrides: &[ConfigOverride],
     sub: &str,
     rest: &[String],
 ) -> Option<ExitCode> {
-    if sub == "version" || (sub == "help" && rest.is_empty()) {
+    if dispatch::is_verb(sub) || sub == "version" || (sub == "help" && rest.is_empty()) {
         return None;
     }
     report_bad_config_overrides(overrides)
@@ -559,25 +561,32 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
         eprintln!("fatal: unable to parse command-line config");
         return Some(ExitCode::from(fatal::EXIT_FATAL));
     }
-    // `git_config_from_parameters()` (config.c:731-790) hands each entry to the
-    // reader in turn, so the first one that fails either check is the one named.
-    let reason = overrides.iter().find_map(|o| {
-        config::check_config_key(&o.key)
-            .err()
-            .or_else(|| command_line_include_refusal(o))
-    })?;
+    let reason = config_from_parameters(overrides).err()?;
     eprintln!("error: {reason}");
     eprintln!("fatal: unable to parse command-line config");
     Some(ExitCode::from(fatal::EXIT_FATAL))
 }
 
-/// `handle_path_include()`'s refusal of a command-line `include.path`, or `None`
-/// when the reader would follow (or quietly skip) it.
+/// `git_config_from_parameters()` (config.c:731-790) as far as its failures go:
+/// the inherited `GIT_CONFIG_COUNT` entries first, then `GIT_CONFIG_PARAMETERS` —
+/// which is where the C puts every `-c` — each handed to the reader in turn, so
+/// the first one that fails either check is the one named. `Err` is the
+/// `error()` line; the caller adds the `die()`.
+fn config_from_parameters(overrides: &[ConfigOverride]) -> Result<(), String> {
+    setup::for_each_inherited_config_entry(|key, value| command_line_include(key, Some(value)))?;
+    for o in overrides {
+        config::check_config_key(&o.key)?;
+        command_line_include(&o.key, o.value.as_deref())?;
+    }
+    Ok(())
+}
+
+/// `git_config_include()` (config.c:416-448) over one command-line entry:
+/// `handle_path_include()`'s refusal as `Err`, or `Ok` when the reader would
+/// follow (or quietly skip) it.
 ///
-/// Every value the configuration sequence reads goes through
-/// `git_config_include()` (config.c:416-448), which hands an `include.path` to
-/// `handle_path_include()` (config.c:142-191). A command-line value has no file
-/// behind it (`kvi->origin_type` is `CONFIG_ORIGIN_CMDLINE`), so:
+/// A command-line value has no file behind it (`kvi->origin_type` is
+/// `CONFIG_ORIGIN_CMDLINE`), so `handle_path_include()` (config.c:142-191) says:
 ///
 /// ```c
 /// if (!path)
@@ -595,26 +604,44 @@ pub(crate) fn report_bad_config_overrides(overrides: &[ConfigOverride]) -> Optio
 /// An absolute path that does not exist is skipped silently
 /// (`access_or_die()`), as it is here.
 ///
-/// `includeIf.<cond>.path` reaches the same `handle_path_include()` when
-/// `include_condition_is_true()` holds (config.c:432-445), so a true condition
-/// with a relative path is the same refusal; a false one is never followed.
-fn command_line_include_refusal(o: &ConfigOverride) -> Option<String> {
-    let key = config::normalize_key(&o.key);
+/// `includeIf.<cond>.<key>` evaluates the condition before it looks at the key:
+///
+/// ```c
+/// if (!parse_config_key(var, "includeif", &cond, &cond_len, &key) &&
+///     cond && include_condition_is_true(ctx->kvi, inc, cond, cond_len) &&
+///     !strcmp(key, "path")) {
+/// ```
+///
+/// A true condition with a relative path is the same refusal; a false one is
+/// never followed. A `gitdir:./` condition is `prepare_include_condition_pattern()`'s
+/// own `error()` (config.c:214-219) — printed on the spot, whatever the key — and
+/// its `-1` is truthy in that `&&` chain, so a `path` is then followed as if the
+/// condition held: two `error:` lines for a relative one, and only the first for
+/// an absolute one, which leaves the command running.
+fn command_line_include(key: &str, value: Option<&str>) -> Result<(), String> {
+    let key = config::normalize_key(key);
     if key != "include.path" {
-        // `parse_config_key(var, "includeif", &cond, &cond_len, &key)` with a
-        // subsection, and a name of exactly `path`.
-        let cond = key.strip_prefix("includeif.")?.strip_suffix(".path")?;
-        if !config::command_line_include_condition(cond) {
-            return None;
+        let Some((cond, name)) = key.strip_prefix("includeif.").and_then(|rest| rest.rsplit_once('.')) else {
+            return Ok(());
+        };
+        let holds = config::command_line_include_condition(cond).unwrap_or_else(|reason| {
+            eprintln!("error: {reason}");
+            true
+        });
+        if !holds || name != "path" {
+            return Ok(());
         }
     }
-    let Some(value) = o.value.as_deref() else {
-        return Some("missing value for 'include.path'".to_string());
+    let Some(value) = value else {
+        return Err("missing value for 'include.path'".to_string());
     };
     let Some(path) = setup::interpolate_path(value) else {
-        return Some(format!("could not expand include path '{value}'"));
+        return Err(format!("could not expand include path '{value}'"));
     };
-    (!path.is_absolute()).then(|| "relative config includes must come from files".to_string())
+    match path.is_absolute() {
+        true => Ok(()),
+        false => Err("relative config includes must come from files".to_string()),
+    }
 }
 
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
@@ -688,6 +715,7 @@ fn run_command(argv: &[String]) -> ExitCode {
     // so this process's own `-c` is pushed after it and therefore wins, which is
     // the order `git_config_from_parameters()` produces in the C.
     inherit_config_parameters(&mut config_overrides);
+    setup::capture_inherited_config_count();
     // Only the alias caller looks at this; on the command line an option that
     // changes the environment is exactly what the user asked for.
     let mut envchanged = false;
@@ -890,7 +918,7 @@ fn run_command(argv: &[String]) -> ExitCode {
     // Then the first read of configuration, which `get_allowed_bare_repo()` and
     // `ensure_valid_ownership()` both make: a bad `-c` / `GIT_CONFIG_COUNT` triple
     // is reported before either policy refusal below.
-    if let Some(code) = setup::command_line_config_gate(&sub, &rest) {
+    if let Some(code) = setup::command_line_config_gate(&sub, &rest, &config_overrides) {
         return code;
     }
     // `setup_explicit_git_dir()` (setup.c:1176-1190): with `$GIT_DIR` set there is

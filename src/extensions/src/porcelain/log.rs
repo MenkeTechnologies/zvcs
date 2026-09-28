@@ -5647,10 +5647,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         && patch_opts.diff_filter.is_none()
         && !follow;
     // `--no-commit-id` moves the header behind the diff (see the record assembly
-    // below). The layouts that print a header of their own inside the diff
-    // machinery are not ported under it.
-    if no_commit_id && (graph || line_level || separate_merges) {
-        bail!("`--no-commit-id` with `--graph`, `-L` or `-m` is not ported");
+    // below). Under `--graph` the diff ahead of the header is drawn with
+    // `graph_padding_line()` before the commit row, which [`render_graph`] does
+    // not lay out.
+    if no_commit_id && graph {
+        bail!("`--no-commit-id` with `--graph` is not ported");
     }
     if separate_merges && graph && nodes.iter().any(|n| n.parents.len() > 1) {
         bail!("`-m` with `--graph` is not ported: git lays out one graph row per
@@ -5788,6 +5789,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `--no-commit-id`) holding a two-way patch the painter already prefixed:
         // see [`super::diff::PatchOpts::line_prefix`].
         let mut painted: Option<(usize, usize)> = None;
+        // `--no-commit-id`: whether this record ends in `log_tree_commit()`'s
+        // header. A per-parent `-m` record owes it only after the last parent.
+        let mut header_owed = true;
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
@@ -5893,7 +5897,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     diff.extend_from_slice(&super::diff::line_range_patch(&repo, pairs, 3, patch_opts.ws)?);
                 }
             }
-            if !diff.is_empty() {
+            if no_commit_id {
+                // `log_tree_diff_flush()` skips `show_log()` (log-tree.c:939) and
+                // `log_tree_diff()` returns `!opt->loginfo`, i.e. nothing shown
+                // (log-tree.c:1108-1112), so the header follows the diff.
+                diff_before_header = diff;
+            } else if !diff.is_empty() {
                 // A merge's combined diff is separated from the header even under
                 // `oneline`, which is the one format that otherwise runs the patch
                 // straight on: `show_combined_diff()` writes the blank line itself.
@@ -6682,7 +6691,22 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // The flag belongs to one merge, so it is cleared the moment that
             // merge's last per-parent record is reached.
             merge_shown_any = !last_of_merge && (shown_before || !record_queue_empty);
-            if record_queue_empty {
+            if no_commit_id {
+                // `log_tree_diff_flush()` never reaches `show_log()` here, so
+                // `opt->loginfo` survives every parent, `log_tree_diff()` reports
+                // nothing shown, and `log_tree_commit()` prints one header, with
+                // `log.parent = NULL`, after the last parent's diff
+                // (log-tree.c:939, 1156-1172, 1191-1194).
+                if !last_of_merge {
+                    if record_queue_empty {
+                        continue;
+                    }
+                    header_owed = false;
+                } else {
+                    block = entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, None)?;
+                    msg_len = block.len();
+                }
+            } else if record_queue_empty {
                 if !last_of_merge || shown_before {
                     continue;
                 }
@@ -6737,7 +6761,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // only while `always_show_header` holds (log-tree.c:1189-1194). The
             // separator is `show_log()`'s, owed only once a header has been shown.
             piece = diff_before_header;
-            if always_show_header {
+            if always_show_header && header_owed {
                 if !terminator && !first {
                     piece.push(rec_term);
                 }

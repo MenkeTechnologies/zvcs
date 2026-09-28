@@ -653,10 +653,17 @@ fn match_refname_with_pattern(pattern: &[u8], refname: &[u8], replacement: Optio
 /// say. A `^` refspec is matched against the *source* the destination maps back
 /// to, which is why the reversal expands every positive refspec first.
 fn remote_find_tracking(repo: &gix::Repository, remote: &str, dst: &BStr) -> bool {
+    tracking_source(repo, remote, dst).is_some()
+}
+
+/// [`remote_find_tracking`]'s `query.src`: the remote ref the first matching
+/// refspec maps `dst` back from (`query_matches_negative_refspec()` and
+/// `refspec_find_match()`, refspec.c:346-466).
+fn tracking_source(repo: &gix::Repository, remote: &str, dst: &BStr) -> Option<Vec<u8>> {
     use gix::refspec::instruction::Fetch;
     use gix::refspec::Instruction;
     let Ok(remote) = repo.find_remote(remote) else {
-        return false;
+        return None;
     };
     let needle: &[u8] = dst.as_ref();
     let is_pattern = |s: &[u8]| s.contains(&b'*');
@@ -698,17 +705,17 @@ fn remote_find_tracking(repo: &gix::Repository, remote: &str, dst: &BStr) -> boo
         })
     };
     if reversed.iter().any(|name| negative(name)) {
-        return false;
+        return None;
     }
 
-    specs.iter().any(|spec| {
-        let Instruction::Fetch(Fetch::AndUpdate { dst, .. }) = spec else {
-            return false;
+    specs.iter().find_map(|spec| {
+        let Instruction::Fetch(Fetch::AndUpdate { src, dst, .. }) = spec else {
+            return None;
         };
-        let dst: &[u8] = dst.as_ref();
+        let (src, dst): (&[u8], &[u8]) = (src.as_ref(), dst.as_ref());
         match is_pattern(dst) {
-            true => match_refname_with_pattern(dst, needle, None).is_some(),
-            false => dst == needle,
+            true => match_refname_with_pattern(dst, needle, Some(src)),
+            false => (dst == needle).then(|| src.to_vec()),
         }
     })
 }
@@ -2266,26 +2273,30 @@ fn push_status(
     }
 }
 
-/// Sorted short names of the remote-tracking branches for `<name>`: the refs
-/// under `refs/remotes/<name>/` that the fetch refspecs select, with the
-/// `<name>/` prefix stripped and the `HEAD` symref excluded.
+/// The remote branches `show -n` lists: `append_ref_to_tracked_list()`
+/// (builtin/remote.c) runs every local ref that is not a symref through
+/// `remote_find_tracking()` as a destination and keeps the source it maps back
+/// from, `abbrev_branch()`ed — so the tracking refs need not live under
+/// `refs/remotes/<name>/`, and a refspec landing a tag in `refs/heads/` lists
+/// `refs/tags/<t>`. Sorted, as the list is shown.
 fn remote_branches(repo: &gix::Repository, name: &str) -> Result<Vec<String>> {
-    let dsts = fetch_refspec_dsts(repo, name);
-    let prefix = format!("refs/remotes/{name}/");
-
     let mut out = Vec::new();
-    for (ref_name, _) in tracking_refs(repo, name)? {
-        let full = ref_name.as_bstr().to_str_lossy().into_owned();
-        let Some(branch) = full.strip_prefix(&prefix) else {
-            continue;
+    for reference in repo.refs.iter()?.all()? {
+        let ref_name = match reference {
+            Ok(reference) if matches!(reference.target, Target::Symbolic(_)) => continue,
+            Ok(reference) => reference.name,
+            // A ref whose file cannot be parsed is still visited, as a plain one.
+            Err(gix::refs::file::iter::loose_then_packed::Error::ReferenceCreation { relative_path, .. }) => {
+                match FullName::try_from(gix::path::into_bstr(relative_path).as_ref()) {
+                    Ok(broken) => broken,
+                    Err(_) => continue,
+                }
+            }
+            Err(e) => anyhow::bail!("{e}"),
         };
-        if branch == "HEAD" {
-            continue;
+        if let Some(src) = tracking_source(repo, name, ref_name.as_bstr()) {
+            out.push(abbrev_branch(src.as_bstr()));
         }
-        if !dsts.iter().any(|d| refspec_dst_matches(d, &full)) {
-            continue;
-        }
-        out.push(branch.to_string());
     }
     out.sort();
     Ok(out)

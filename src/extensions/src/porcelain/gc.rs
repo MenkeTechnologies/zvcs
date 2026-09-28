@@ -150,6 +150,9 @@
 //! The flag is still *read*, because git gates `report_last_gc_error()` on
 //! `opts.detach > 0` — so it, and `gc.autoDetach` under `--auto`, decide whether
 //! a previous failure's `gc.log` is reported and this run abandoned.
+//! The hidden `--skip-foreground-tasks` leaves out `pack-refs` and `reflog
+//! expire`, which the `gc` task of `maintenance run` has run in its foreground
+//! half before it spawns this `gc`.
 //! `--quiet` suppresses the progress meters the pack write reports, which git
 //! writes to stderr and only on a terminal; see [`crate::progress`].
 //!
@@ -312,6 +315,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // here is that `-1`: it is distinct from `Some(false)`, because only the
     // unasked state lets `gc.autoDetach` fill it in under `--auto`.
     let mut detach: Option<bool> = None;
+    let mut skip_foreground_tasks = false;
     // git's `int keep_largest_pack = -1`: unasked, on, or off, with the last two
     // both overriding `gc.bigPackThreshold`.
     let mut keep_largest_pack: Option<bool> = None;
@@ -368,6 +372,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             // [`report_last_gc_error`].
             "--detach" => detach = Some(true),
             "--no-detach" => detach = Some(false),
+            // `OPT_HIDDEN_BOOL(0, "skip-foreground-tasks", …)` (builtin/gc.c:889):
+            // what `maintenance run`'s `gc` task passes its child, having run
+            // `pack-refs` and `reflog expire` itself before it detached.
+            "--skip-foreground-tasks" => skip_foreground_tasks = true,
+            "--no-skip-foreground-tasks" => skip_foreground_tasks = false,
             // ```c
             // if (keep_largest_pack != -1) {
             //         if (keep_largest_pack)
@@ -618,8 +627,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         repo.config_snapshot().boolean("gc.cruftPacks").unwrap_or(true)
     });
     // git's order: pack-refs, then reflog expire, then repack, then prune, then
-    // worktree prune, then rerere gc, then commit-graph write.
-    if pack_refs_enabled(&repo) {
+    // worktree prune, then rerere gc, then commit-graph write. The first two are
+    // `gc_foreground_tasks()`, skipped under `--skip-foreground-tasks`
+    // (`if (opts.detach <= 0 && !skip_foreground_tasks)`, builtin/gc.c:1012).
+    if !skip_foreground_tasks && pack_refs_enabled(&repo) {
         // `maintenance_task_pack_refs()` (builtin/gc.c:168-175) runs
         // `pack-refs --all --prune`, and an *automatic* run adds `--auto` on top
         // — which is what makes an auto-gc leave `packed-refs` alone until the
@@ -653,7 +664,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // expired entry no longer keeps its object alive. Skipped only when both
     // `gc.reflogExpire` and `gc.reflogExpireUnreachable` are `never`, exactly as
     // git's `cfg->prune_reflogs` gate.
-    if reflog_expire_enabled(&repo) {
+    if !skip_foreground_tasks && reflog_expire_enabled(&repo) {
         expire_reflogs(&repo)?;
     }
 
@@ -1187,12 +1198,18 @@ pub(super) fn mtimes_bytes(hash: gix::hash::Kind, stamps: &[u32], pack_id: &[u8]
 /// `gc.packRefs`: `true` (git's documented default), `false`, or the special
 /// `notbare`, which enables packing only in a repository that has a worktree.
 fn pack_refs_enabled(repo: &gix::Repository) -> bool {
+    pack_refs_setting(repo).unwrap_or_else(|| repo.workdir().is_some())
+}
+
+/// `gc_config()`'s `cfg->pack_refs` (builtin/gc.c:182-187): `None` for `notbare`
+/// (the `-1` `cmd_gc()` later resolves against the repository), otherwise the
+/// boolean. Anything else is a plain boolean; an unparsable value falls back to
+/// the default rather than failing the run, as git's config reader does.
+pub(super) fn pack_refs_setting(repo: &gix::Repository) -> Option<bool> {
     let cfg = repo.config_snapshot();
     match cfg.string("gc.packRefs").as_ref().and_then(|v| v.to_str().ok()) {
-        Some("notbare") => repo.workdir().is_some(),
-        // Anything else is a plain boolean; an unparsable value falls back to
-        // the default rather than failing the run, as git's config reader does.
-        _ => cfg.boolean("gc.packRefs").unwrap_or(true),
+        Some("notbare") => None,
+        _ => Some(cfg.boolean("gc.packRefs").unwrap_or(true)),
     }
 }
 
@@ -1523,7 +1540,7 @@ fn report_last_gc_error(repo: &gix::Repository, gc_log_expire: &str) -> LastGcEr
 /// `gc.reflogExpire` and `gc.reflogExpireUnreachable` are configured to a value
 /// that resolves to the `never` sentinel (`0`). An unset value is not `never`,
 /// so the default is to run — matching `gc_config_is_timestamp_never()`.
-fn reflog_expire_enabled(repo: &gix::Repository) -> bool {
+pub(super) fn reflog_expire_enabled(repo: &gix::Repository) -> bool {
     let cfg = repo.config_snapshot();
     let is_never = |key: &str| {
         cfg.string(key)

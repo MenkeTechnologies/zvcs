@@ -3642,11 +3642,20 @@ fn parse_one(
                 anyhow::Error::new(HeaderError(format!("invalid mode at {file}:{line}: {rest}\n")))
             })
         };
+        // `gitdiff_newfile()` / `gitdiff_delete()` (apply.c:1027-1045): the side that
+        // exists takes the `diff --git` name there and then, which is what the
+        // `---`/`+++` lines are later held against.
         if let Some(rest) = l.strip_prefix("new file mode ") {
             p.is_new = true;
+            if git_style {
+                p.new_name = def_name.clone();
+            }
             p.new_mode = Some(mode(rest)?);
         } else if let Some(rest) = l.strip_prefix("deleted file mode ") {
             p.is_delete = true;
+            if git_style {
+                p.old_name = def_name.clone();
+            }
             p.old_mode = Some(mode(rest)?);
         } else if let Some(rest) = l.strip_prefix("new mode ") {
             p.new_mode = Some(mode(rest)?);
@@ -3687,13 +3696,15 @@ fn parse_one(
             }
         } else if let Some(rest) = l.strip_prefix("--- ") {
             if git_style {
-                p.old_name = header_path(rest, strip)?;
+                // `gitdiff_oldname()`: `/dev/null` is expected exactly when the
+                // header already said the file is new.
+                verify_name(&mut p.old_name, rest, p.is_new, false, strip, spans.location(i))?;
             } else {
                 trad_old = Some(rest.to_string());
             }
         } else if let Some(rest) = l.strip_prefix("+++ ") {
             if git_style {
-                p.new_name = header_path(rest, strip)?;
+                verify_name(&mut p.new_name, rest, p.is_delete, true, strip, spans.location(i))?;
             } else {
                 trad_new = Some(rest.to_string());
             }
@@ -3785,6 +3796,50 @@ fn parse_one(
     }
 
     Ok((normalise(p)?, i))
+}
+
+/// `gitdiff_verify_name()` (apply.c:929-974), for the `---` (`is_new_side` false)
+/// and `+++` lines of a `diff --git` header. A side with no name yet takes the
+/// line's, unless the header already said that side is absent, in which case the
+/// line must be `/dev/null`; a side that already has a name — from `deleted file
+/// mode`/`new file mode` or a rename/copy line — must be named the same again,
+/// and must not be claimed absent.
+fn verify_name(
+    name: &mut Option<String>,
+    rest: &str,
+    isnull: bool,
+    is_new_side: bool,
+    strip: usize,
+    (file, line): (String, usize),
+) -> Result<()> {
+    let bad = |msg: String| anyhow::Error::new(HeaderError(format!("git apply: bad git-diff - {msg}")));
+    // `find_name(state->root, line, NULL, p_value, TERM_TAB)`, which has no notion
+    // of `/dev/null`: on a side not declared absent it is just a path, and
+    // `-p1` makes it `dev/null`.
+    let find_name = |rest: &str| -> Result<Option<String>> {
+        let raw = &rest[..name_end(rest)];
+        Ok(strip_path(&unquote(raw)?, strip)?.map(|n| squash_slash(&n)))
+    };
+    match name.as_deref() {
+        None if !isnull => {
+            *name = find_name(rest)?;
+        }
+        Some(existing) if isnull => {
+            return Err(bad(format!("expected /dev/null, got {existing} at {file}:{line}")));
+        }
+        Some(existing) => {
+            if find_name(rest)?.as_deref() != Some(existing) {
+                let side = if is_new_side { "new" } else { "old" };
+                return Err(bad(format!("inconsistent {side} filename at {file}:{line}")));
+            }
+        }
+        None => {
+            if !is_dev_null(&rest[..name_end(rest)]) {
+                return Err(bad(format!("expected /dev/null at {file}:{line}")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `parse_traditional_patch()` (apply.c:856): the two name lines are resolved

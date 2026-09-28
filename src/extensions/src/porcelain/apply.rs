@@ -3532,6 +3532,20 @@ fn parse_patches(
             let (p, next) = parse_one(lines, i, strip, false, recount, spans)?;
             i = next;
             out.push(p);
+        } else if lines[i].len() >= 6
+            && lines[i].starts_with(b"@@ -")
+            && lines[i].ends_with(b"\n")
+            && hunk_range(&l).is_some()
+        {
+            // `find_header()` (apply.c:1616-1628): a well-formed fragment header
+            // met while looking for a file header is "a sign that we didn't find a
+            // header, and that a patch has become corrupted/broken up".
+            let (name, linenr) = spans.location(i);
+            let shown = &lines[i][..lines[i].len() - 1];
+            return Err(anyhow::Error::new(HeaderError(format!(
+                "patch fragment without header at {name}:{linenr}: {}",
+                shown.to_str_lossy()
+            ))));
         } else {
             i += 1;
         }

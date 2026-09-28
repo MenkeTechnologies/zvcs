@@ -1039,6 +1039,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // newest entry first, instead of the history reachable from its tip.
     // `cmd_log_reflog()` calls `init_reflog_walk()` before any argument is read.
     let mut walk_reflogs = flavor == Flavor::Reflog;
+    // Where `-g` stood: how many revisions and ref-set options of each kind had
+    // been read by then. `add_pending_object_with_path()` hands an object to
+    // `add_reflog_for_walk()` only once `revs->reflog_info` exists
+    // (revision.c:305-318), so what came earlier is pended as an ordinary commit:
+    // excluded if negated, and otherwise never walked, since `get_revision_1()`
+    // takes nothing but reflog entries (revision.c:4386-4388).
+    let mut reflog_walk_from: Option<[usize; 5]> = walk_reflogs.then_some([0; 5]);
     // `revs->date_mode_explicit`: whether `--date=` was given on the command line,
     // which is what the `-g` selector consults (`log.date` alone does not).
     let mut date_explicit = false;
@@ -1971,6 +1978,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // `init_reflog_walk(&revs->reflog_info)`: the walk stops being a
             // traversal of ancestry and becomes one of each named ref's reflog.
             walk_reflogs = true;
+            reflog_walk_from.get_or_insert([
+                revs.len(),
+                ref_selections.len(),
+                reflog_selections.len(),
+                alternate_selections.len(),
+                bisect_selections.len(),
+            ]);
         } else if a == "--reverse" {
             // `revs->reverse ^= 1` (revision.c): a toggle, so an even number of
             // `--reverse`s leaves the walk in its original order.
@@ -3020,16 +3034,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             }
         }
     }
-    // `add_reflog_for_walk()`: `if (commit->object.flags & UNINTERESTING) die("cannot
-    // walk reflogs for %s", name)`. A reflog walk starts from a ref's log, and an
-    // excluded tip has none to start from — git raises it the moment the argument is
-    // pended, so it beats every post-loop conflict check below.
-    if walk_reflogs {
-        if let Some(name) = reflog_excluded_tip(&repo, &revs, &rev_negated, seen_dashdash) {
-            eprintln!("fatal: cannot walk reflogs for {name}");
-            return Ok(ExitCode::from(128));
-        }
-    }
+    // Whether the `nth` pending object of kind `kind` (the slots of
+    // `reflog_walk_from`) was read after `-g`. Arguments are appended in the order
+    // they were read, so the count at `-g` is the dividing line.
+    let after_reflog_walk = |kind: usize, nth: usize| reflog_walk_from.is_some_and(|g| nth >= g[kind]);
+    // The `tip_names` indices pended before `-g`: ordinary commits that no reflog
+    // is walked for.
+    let mut tips_before_reflog_walk: HashSet<usize> = HashSet::new();
     // git resolves each positional token as a revision; the first that is *not* a
     // revision but names an existing path switches to pathspec mode — that token and
     // every one after it become pathspecs, exactly as if a `--` had preceded them
@@ -3084,8 +3095,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // pends to `add_reflog_for_walk()` (revision.c:305-318), which refuses an
     // UNINTERESTING one — `-g --not --all` — by the name `handle_one_ref()` gave it:
     // `die("cannot walk reflogs for %s", name)` (reflog-walk.c:165-166).
-    let refuse_reflog_walk = |negated: bool, name: &str| {
-        (walk_reflogs && negated).then(|| format!("cannot walk reflogs for {name}"))
+    let refuse_reflog_walk = |after: bool, negated: bool, name: &str| {
+        (after && negated).then(|| format!("cannot walk reflogs for {name}"))
     };
     let mut push_ref_tips = |at: usize,
                              tips: &mut Vec<ObjectId>,
@@ -3093,8 +3104,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                              tip_names: &mut Vec<String>,
                              tip_sources: &mut Vec<String>,
                              neg_ids: &mut Vec<ObjectId>,
+                             before_walk: &mut HashSet<usize>,
                              fatal: &mut Option<String>| {
-        for sel in ref_selections.iter().filter(|s| s.at == at) {
+        for (nth, sel) in ref_selections.iter().enumerate().filter(|(_, s)| s.at == at) {
+            let after = after_reflog_walk(1, nth);
             // `handle_one_ref()` names each pending object by the name the
             // iterator handed it: trimmed for `--branches`/`--tags`/`--remotes`,
             // the full refname for `--all`/`--glob`. That is what `--source`
@@ -3105,10 +3118,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                             tip_left: &mut Vec<bool>,
                             tip_names: &mut Vec<String>,
                             tip_sources: &mut Vec<String>,
-                            neg_ids: &mut Vec<ObjectId>| {
+                            neg_ids: &mut Vec<ObjectId>,
+                            before_walk: &mut HashSet<usize>| {
                 if sel.negated {
                     neg_ids.push(oid);
                     return;
+                }
+                if !after {
+                    before_walk.insert(tip_names.len());
                 }
                 tips.push(oid);
                 // A ref-selecting pseudo-option never pends `SYMMETRIC_LEFT`.
@@ -3147,11 +3164,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 if object.kind != gix::objs::Kind::Commit {
                     continue;
                 }
-                if let Some(msg) = refuse_reflog_walk(sel.negated, name) {
+                if let Some(msg) = refuse_reflog_walk(after, sel.negated, name) {
                     *fatal = Some(msg);
                     return;
                 }
-                pend(oid, name, tips, tip_left, tip_names, tip_sources, neg_ids);
+                pend(oid, name, tips, tip_left, tip_names, tip_sources, neg_ids, before_walk);
             }
             // `handle_refs(refs, revs, flags, refs_head_ref)`: `--all` pends
             // `HEAD` too, after the ref list and under that literal name — which
@@ -3159,11 +3176,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             if sel.head && !sel.excluded("HEAD") {
                 if let Some(id) = repo.head().ok().and_then(|mut h| h.try_peel_to_id().ok().flatten())
                 {
-                    if let Some(msg) = refuse_reflog_walk(sel.negated, "HEAD") {
+                    if let Some(msg) = refuse_reflog_walk(after, sel.negated, "HEAD") {
                         *fatal = Some(msg);
                         return;
                     }
-                    pend(id.detach(), "HEAD", tips, tip_left, tip_names, tip_sources, neg_ids);
+                    pend(id.detach(), "HEAD", tips, tip_left, tip_names, tip_sources, neg_ids, before_walk);
                 }
             }
         }
@@ -3171,11 +3188,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // (`add_pending_object(cb->all_revs, o, "")`), so `--source` reports
         // nothing for a commit reached this way — unlike `--all`, which names the
         // ref.
-        for negated in reflog_selections.iter().filter(|(i, _)| *i == at).map(|(_, n)| *n) {
+        for (nth, negated) in reflog_selections.iter().enumerate().filter(|(_, (i, _))| *i == at).map(|(k, (_, n))| (k, *n)) {
             for oid in &reflog_tips {
                 if negated {
                     neg_ids.push(*oid);
                     continue;
+                }
+                if !after_reflog_walk(2, nth) {
+                    before_walk.insert(tip_names.len());
                 }
                 tips.push(*oid);
                 tip_names.push(String::new());
@@ -3184,22 +3204,28 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         }
         // `add_one_alternate_ref()` pends each id under the ref name the alternate
         // reported, which is the name `--source` would print.
-        for negated in alternate_selections.iter().filter(|(i, _)| *i == at).map(|(_, n)| *n) {
+        for (nth, negated) in alternate_selections.iter().enumerate().filter(|(_, (i, _))| *i == at).map(|(k, (_, n))| (k, *n)) {
             for oid in &alternate_tips {
                 if negated {
                     neg_ids.push(*oid);
                     continue;
+                }
+                if !after_reflog_walk(3, nth) {
+                    before_walk.insert(tip_names.len());
                 }
                 tips.push(*oid);
                 tip_names.push(String::new());
                 tip_sources.push(String::new());
             }
         }
-        for negated in bisect_selections.iter().filter(|(i, _)| *i == at).map(|(_, n)| *n) {
+        for (nth, negated) in bisect_selections.iter().enumerate().filter(|(_, (i, _))| *i == at).map(|(k, (_, n))| (k, *n)) {
             for (oid, uninteresting) in &bisect_tips {
                 if *uninteresting != negated {
                     neg_ids.push(*oid);
                     continue;
+                }
+                if !after_reflog_walk(4, nth) {
+                    before_walk.insert(tip_names.len());
                 }
                 tips.push(*oid);
                 tip_names.push(String::new());
@@ -3214,6 +3240,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // (so `git log .` == `git log -- .`). A token that is neither a revision nor a
     // path is the "ambiguous argument" fatal.
     let mut in_paths = false;
+    let mut reflog_refusal_done = false;
     let mut specs = pos_specs.iter().peekable();
     for at in 0..=revs.len() {
         // `REVARG_CANNOT_BE_FILENAME` for a `--stdin` line (see the scan above).
@@ -3229,6 +3256,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             &mut tip_names,
             &mut tip_sources,
             &mut neg_ids,
+            &mut tips_before_reflog_walk,
             &mut fatal_msg,
         );
         if let Some(msg) = fatal_msg.take() {
@@ -3242,6 +3270,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if !in_paths {
             if let Some(msg) = revs.get(at).and_then(|t| crate::objname::dotdot_fatal(&repo, t)) {
                 eprint!("{msg}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+        // `add_reflog_for_walk()`: `if (commit->object.flags & UNINTERESTING)
+        // die("cannot walk reflogs for %s", name)` (reflog-walk.c:165-166), raised
+        // the moment the argument is pended — after whatever ref-set option stood
+        // before it, and only for one read after `-g`.
+        if at < revs.len() && after_reflog_walk(0, at) && !reflog_refusal_done {
+            if crate::objname::is_parent_directory_pathspec(&revs[at], seen_dashdash) {
+                // A bare `..` ends the revisions: see [`reflog_excluded_tip`].
+                reflog_refusal_done = true;
+            } else if let Some(name) = reflog_excluded_tip(
+                &repo,
+                &revs[at..=at],
+                &rev_negated[at..=at],
+                seen_dashdash,
+            ) {
+                eprintln!("fatal: cannot walk reflogs for {name}");
                 return Ok(ExitCode::from(128));
             }
         }
@@ -3328,6 +3374,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     let Some(commit) = crate::objname::walk_pending(&repo, id) else {
                         continue;
                     };
+                    if !after_reflog_walk(0, at) {
+                        tips_before_reflog_walk.insert(tip_names.len());
+                    }
                     tips.push(commit);
                     tip_left.push(*sym_left);
                     tip_names.push(name.clone());
@@ -3650,7 +3699,18 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // effective order is known, and it is raised at the point in this function
     // where git's own `die()` would have fired.
     let (mut nodes, abort) = if walk_reflogs {
-        (reflog_walk(&repo, &tip_names)?, None)
+        let names: Vec<String> = tip_names
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !tips_before_reflog_walk.contains(i))
+            .map(|(_, n)| n.clone())
+            .collect();
+        let mut nodes = reflog_walk(&repo, &names)?;
+        // A commit excluded before `-g` was read makes the walk limited
+        // (revision.c:431-435): `limit_list()` paints its ancestry
+        // UNINTERESTING, and `get_commit_action()` ignores those entries.
+        nodes.retain(|n| !hidden.contains(&n.id));
+        (nodes, None)
     } else {
         walk_reporting(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
     };

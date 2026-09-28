@@ -1671,53 +1671,58 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
         return Ok(());
     }
     let zero = ObjectId::null(repo.object_hash());
-    // A `create` over a reference that is already there is
-    // `REF_TRANSACTION_ERROR_CREATE_EXISTS`, not a generic failure, so
-    // `--batch-updates` drops that one update and keeps the rest
-    // (builtin/update-ref.c:285-289). Dropping the edit it guards is what makes
-    // that true here; the precondition is checked at the position the command
-    // held so the `rejected` lines come out in command order.
-    let mut dropped: std::collections::BTreeSet<usize> = Default::default();
-    let mut rejections: Vec<(usize, String)> = Vec::new();
-    for entry in &batch.absent {
-        if splits.iter().any(|c| c.at == entry.at) {
-            continue;
+    // `print_rejected_refs()` (builtin/update-ref.c:246-266) runs once the batch is
+    // through, over the rejections in the order `files_transaction_prepare()` made
+    // them: each `error()` straight to stderr, each `rejected` line into stdout's
+    // buffer — so off a terminal every error comes out ahead of every line.
+    crate::cstdio::defer();
+    let mut rejected: Vec<(String, String)> = Vec::new();
+    let mut last: Vec<(String, String)> = Vec::new();
+    for index in 0..=batch.edits.len() {
+        // A `create` over a reference that is already there is
+        // `REF_TRANSACTION_ERROR_CREATE_EXISTS`, not a generic failure, so
+        // `--batch-updates` drops that one update and keeps the rest
+        // (builtin/update-ref.c:285-289). The split comes first in
+        // `lock_ref_for_update()`, so a conflicting chain never gets that far.
+        let split = splits.iter().find(|c| c.at == index);
+        let mut dropped = false;
+        for entry in batch.absent.iter().filter(|e| e.at == index) {
+            if split.is_some() || !absent_violated(repo, entry)? {
+                continue;
+            }
+            let new = entry.new.map_or_else(|| "(null)".to_string(), |id| id.to_string());
+            rejected.push((
+                format!("cannot lock ref '{}': reference already exists", entry.name),
+                format!("rejected {} {new} {zero} reference already exists", entry.name),
+            ));
+            dropped |= entry.guards_edit;
         }
-        if !absent_violated(repo, entry)? {
-            continue;
-        }
-        let new = entry.new.map_or_else(|| "(null)".to_string(), |id| id.to_string());
-        eprintln!("error: cannot lock ref '{}': reference already exists", entry.name);
-        rejections.push((
-            entry.at,
-            format!("rejected {} {new} {zero} reference already exists", entry.name),
-        ));
-        if entry.guards_edit {
-            dropped.insert(entry.at);
-        }
-    }
-    let mut pending = rejections.into_iter().peekable();
-    for (index, edit) in batch.edits.into_iter().enumerate() {
-        while pending.peek().is_some_and(|(at, _)| *at == index) {
-            println!("{}", pending.next().expect("peeked").1);
-        }
-        if dropped.contains(&index) {
+        let Some(edit) = batch.edits.get(index).cloned() else { break };
+        if dropped {
             continue;
         }
         let mut edit = edit;
         let name = edit.name.to_string();
         let (new, old) = edit_oids(&edit, &zero, batch.verify_edits.contains(&index));
-        if let Some(conflict) = splits.iter().find(|c| c.at == index) {
-            eprintln!("error: {}", conflict.message);
-            println!("rejected {} {new} {old} refname conflict", conflict.refname);
+        // A conflict met on the update itself is rejected in its turn; one met on
+        // an update split off from it waits until the splits are processed, after
+        // every update the input queued.
+        if let Some(conflict) = split {
+            let entry = (
+                conflict.message.clone(),
+                format!("rejected {} {new} {old} refname conflict", conflict.refname),
+            );
+            match conflict.on_split {
+                false => rejected.push(entry),
+                true => last.push(entry),
+            }
             continue;
         }
         if let Err(refused) = settle_old_value(repo, &mut edit) {
             let Some(kind) = refused.kind else {
                 crate::git_fatal!("{}", refused.message);
             };
-            eprintln!("error: {}", refused.message);
-            println!("rejected {name} {new} {old} {kind}");
+            rejected.push((refused.message, format!("rejected {name} {new} {old} {kind}")));
             continue;
         }
         // `ref_transaction_maybe_set_rejected()` with
@@ -1726,8 +1731,7 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
         // `ref_transaction_error_msg()` spelling the reason `refname conflict`,
         // while the rest of the batch still applies.
         if let Some(reason) = conflicts.get(index).and_then(Option::as_ref) {
-            eprintln!("error: {reason}");
-            println!("rejected {name} {new} {old} refname conflict");
+            rejected.push((reason.clone(), format!("rejected {name} {new} {old} refname conflict")));
             continue;
         }
         if let Err(e) = repo.edit_reference(edit) {
@@ -1737,8 +1741,7 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
             let Some(kind) = rejection_kind(&e) else {
                 crate::git_fatal!("{msg}");
             };
-            eprintln!("error: {msg}");
-            println!("rejected {name} {new} {old} {kind}");
+            rejected.push((msg, format!("rejected {name} {new} {old} {kind}")));
             continue;
         }
         // `--batch-updates` runs each update as its own transaction, so a
@@ -1747,8 +1750,9 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
             write_symref_log(repo, plan)?;
         }
     }
-    for (_, line) in pending {
-        println!("{line}");
+    for (message, line) in rejected.into_iter().chain(last) {
+        eprintln!("error: {message}");
+        crate::cstdio::println!("{line}");
     }
     Ok(())
 }
@@ -1760,6 +1764,8 @@ struct SplitConflict {
     at: usize,
     refname: String,
     message: String,
+    /// Met on an update split off from the one the input queued.
+    on_split: bool,
 }
 
 /// `ref_update_reject_duplicates()` (refs.c:2560-2582), which
@@ -1797,22 +1803,22 @@ fn split_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Vec<SplitConfli
     };
     let mut refnames: std::collections::HashSet<String> =
         edits.iter().filter(|e| !log_only(e)).map(|e| e.name.as_bstr().to_string()).collect();
-    // (root edit, name, deref, came through HEAD)
-    let mut queue: std::collections::VecDeque<(usize, String, bool, bool)> = edits
+    // (root edit, name, deref, came through HEAD, split off)
+    let mut queue: std::collections::VecDeque<(usize, String, bool, bool, bool)> = edits
         .iter()
         .enumerate()
         .filter(|(_, e)| !log_only(e))
-        .map(|(i, e)| (i, e.name.as_bstr().to_string(), e.deref, false))
+        .map(|(i, e)| (i, e.name.as_bstr().to_string(), e.deref, false, false))
         .collect();
     let mut conflicts = Vec::new();
     let mut failed: std::collections::HashSet<usize> = Default::default();
-    while let Some((at, name, deref, via_head)) = queue.pop_front() {
+    while let Some((at, name, deref, via_head, via_split)) = queue.pop_front() {
         if failed.contains(&at) {
             continue;
         }
         let mut refuse = |message: String| {
             failed.insert(at);
-            conflicts.push(SplitConflict { at, refname: name.clone(), message });
+            conflicts.push(SplitConflict { at, refname: name.clone(), message, on_split: via_split });
         };
         if !via_head && head_ref.as_deref() == Some(name.as_str()) {
             if refnames.contains("HEAD") {
@@ -1840,7 +1846,7 @@ fn split_conflicts(repo: &gix::Repository, edits: &[RefEdit]) -> Vec<SplitConfli
             continue;
         }
         refnames.insert(referent.clone());
-        queue.push_back((at, referent, true, name == "HEAD"));
+        queue.push_back((at, referent, true, name == "HEAD", true));
     }
     conflicts
 }
@@ -2000,12 +2006,19 @@ fn edit_oids(edit: &RefEdit, zero: &ObjectId, verify: bool) -> (String, String) 
         PreviousValue::MustExistAndMatch(t) | PreviousValue::ExistingMustMatch(t) => {
             target_oid(t, zero)
         }
-        _ => zero.to_string(),
+        // `create` and a zero old value pass `null_oid`; no old value at all leaves
+        // `REF_HAVE_OLD` unset, so the callback gets NULL for both `old_oid` and
+        // `old_target`, which `%s` prints as `(null)` (builtin/update-ref.c:260-262).
+        PreviousValue::MustNotExist => zero.to_string(),
+        PreviousValue::Any | PreviousValue::MustExist => "(null)".to_string(),
     };
     (new, old)
 }
 
-/// Render a ref target as the oid a `rejected` line wants, zero for a symref.
+/// Render a ref target as the oid a `rejected` line wants: a symbolic target sets
+/// `REF_HAVE_NEW`/`REF_HAVE_OLD` like an oid does (refs.c:1422-1423), so
+/// `ref_transaction_for_each_rejected_update()` (refs.c:3036-3056) hands over the
+/// update's zero `new_oid`/`old_oid` for it.
 fn target_oid(target: &Target, zero: &ObjectId) -> String {
     match target {
         Target::Object(id) => id.to_string(),

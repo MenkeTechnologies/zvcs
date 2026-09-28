@@ -3729,6 +3729,11 @@ fn fetch_one(
     // *first* ref-map entry naming `branch.<name>.merge` becomes the merge candidate, and a
     // second refspec that maps the same remote ref somewhere else does not.
     let mut merge_marked = false;
+    // `branch_has_merge_config(branch_get(NULL))`: `set_merge()` records merge
+    // configuration only for a branch with both `branch.<name>.remote` and
+    // `branch.<name>.merge` (remote.c:1757-1776, 1837-1840) — the upstream.
+    let has_merge = upstream.is_some();
+    let mut first_row_marked = false;
     // Set when a refspec would overwrite a ref some worktree has checked out and
     // `--update-head-ok` was not given: git turns that into a fatal for the whole
     // command rather than a per-ref rejection.
@@ -3811,9 +3816,33 @@ fn fetch_one(
         // builtin/fetch.c:513-515), and with no command-line refspec the single entry
         // `add_merge_config()` picks out is the merge candidate. The rest are
         // `FETCH_HEAD_NOT_FOR_MERGE`.
+        //
+        // ```c
+        // if (!i && !has_merge && ref_map &&
+        //     !remote->fetch.items[0].pattern)
+        //         ref_map->fetch_head_status = FETCH_HEAD_MERGE;
+        // ```
+        //
+        // (`get_ref_map()`, builtin/fetch.c:559-561.) Without a `branch.<name>.merge`
+        // for the current branch, the ref the first configured refspec names exactly
+        // is the merge candidate.
+        let first_exact_refspec_row = !explicit_refspecs
+            && !has_merge
+            && !first_row_marked
+            && matches!(
+                mapping.spec_index,
+                gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(0)
+            )
+            && ref_map
+                .refspecs
+                .first()
+                .is_some_and(|s| !s.to_ref().source().is_some_and(|src| src.contains(&b'*')));
         let status: u8 = if opportunistic {
             2
         } else if from_command_line {
+            0
+        } else if first_exact_refspec_row {
+            first_row_marked = true;
             0
         } else if !explicit_refspecs
             && !merge_marked

@@ -120,6 +120,15 @@ use gix::remote::Direction;
 
 use super::{Arg, LongOpt};
 
+/// The short half of `pull_options[]`: `-s`, `-X` and `-o` take a value, `-r`, `-S`
+/// and `-j` carry `PARSE_OPT_OPTARG` and only ever an attached one.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> = crate::parseopt::Shorts {
+    flags: "vqnatpk46h",
+    values: "sXo",
+    optargs: "rSj",
+    number: false,
+};
+
 /// `cmd_pull()`'s `struct option pull_options[]` (builtin/pull.c), in table order,
 /// as [`super::resolve_long_aliased`] reads it.
 ///
@@ -499,6 +508,10 @@ fn config_rebase(repo: &gix::Repository, branch: Option<&str>) -> Result<(Rebase
 
 pub fn pull(args: &[String]) -> Result<ExitCode> {
     set_reflog_message(args);
+    // Clustered short options (`-qv`, `-Xours`, `-j2`) are split the way
+    // `parse_short_opt()` reads them; the reflog message keeps the words as typed.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
 
     // ---- parse -----------------------------------------------------------
     let mut positionals: Vec<&str> = Vec::new();
@@ -649,6 +662,10 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             }
             "--no-rebase" => rebase_cli = Some(RebaseMode::Disabled),
             "-r" => rebase_cli = Some(RebaseMode::Plain),
+            // `-r<value>`: the `PARSE_OPT_OPTARG` spelling of `--rebase=<value>`.
+            other if other.starts_with("-r") => {
+                rebase_cli = Some(parse_config_rebase("--rebase", &other[2..], false)?);
+            }
 
             // Integration knobs forwarded to merge/rebase.
             "--stat" => diffstat = Some("--stat"),
@@ -741,6 +758,8 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "-j" | "--jobs" => {
                 f_jobs = Some(inline.clone());
             }
+            // `-j<n>`, recreated for the fetch as `--jobs=<n>`.
+            other if other.starts_with("-j") => f_jobs = Some(Some(other[2..].to_string())),
             "--no-jobs" => f_jobs = None,
             "--upload-pack" => f_upload_pack = Some(take_value!("upload-pack")),
             "--no-upload-pack" => f_upload_pack = None,

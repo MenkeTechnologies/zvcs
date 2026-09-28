@@ -156,7 +156,13 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
-    // git's parse_options arity checks, which precede any repository access.
+    // `if (msg && !*msg) die(...)` (builtin/symbolic-ref.c:66-67), straight after
+    // `parse_options()` and ahead of every arity check.
+    if opts.message.as_deref() == Some("") {
+        return fatal("Refusing to perform update with empty message");
+    }
+
+    // git's parse_options arity checks.
     if opts.delete {
         if positional.len() != 1 {
             return usage_error(None);

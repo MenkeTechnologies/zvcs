@@ -2758,6 +2758,14 @@ pub(crate) fn read_order_file_at(
     Ok(order)
 }
 
+/// `diffcore_order()` (diffcore-order.c:112-127) over any queue: a stable sort on
+/// the index of the first pattern each pair's path — `p->two->path`, the
+/// repository-relative name — matches, so pairs no pattern names keep their
+/// place at the end. `compare_objs_order()` breaks ties on the original position.
+pub(crate) fn order_queue<T>(order: &[Vec<u8>], queue: &mut [T], path: impl Fn(&T) -> &[u8]) {
+    queue.sort_by_cached_key(|item| match_order(order, path(item)));
+}
+
 /// `match_order()`: the index of the first order-file pattern that matches `path`,
 /// or `order.len()` when none does. git matches the full path, then repeatedly strips
 /// the trailing `/component` and retries so a pattern can name a parent directory.

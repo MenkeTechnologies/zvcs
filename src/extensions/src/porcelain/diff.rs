@@ -6000,6 +6000,10 @@ pub(crate) struct PatchOpts {
     /// `use_color = GIT_COLOR_ALWAYS` (`diff_opt_word_diff()`), so this is the
     /// disabled table for an ordinary run.
     pub colors: diff_color::DiffColors,
+    /// `o->orderfile` (`-O<file>` / `diff.orderFile`), already read by
+    /// `prepare_order()`: the patterns `diffcore_order()` sorts each commit's queue
+    /// by. `None` leaves the queue in path order.
+    pub order: Option<std::sync::Arc<Vec<Vec<u8>>>>,
 }
 
 impl Default for PatchOpts {
@@ -6036,6 +6040,7 @@ impl Default for PatchOpts {
             ws_error_highlight: diff_color::WSEH_NEW,
             extra: diff_color::ExtraPaint::default(),
             colors: diff_color::DiffColors::disabled(),
+            order: None,
         }
     }
 }
@@ -6259,6 +6264,12 @@ fn commit_deltas(
     // *before* `strip_prefix()` (diff.c:5036-5038) — so the lookup has to happen
     // while the pairs still carry their repository-relative names.
     resolve_drivers(drivers, &mut deltas)?;
+
+    // `diffcore_order()`, the last step of `diffcore_std()` (diff.c:7519-7520),
+    // on the repository-relative names `--relative` has not shortened yet.
+    if let Some(order) = &opts.order {
+        super::diff_files::order_queue(order, &mut deltas, |d| d.path.as_slice());
+    }
 
     // `--relative[=<path>]` is two separate things in git. The *narrowing* is done
     // by `diff_queue()`'s prefix test (diff.c:7630, 7748) and so applies to every

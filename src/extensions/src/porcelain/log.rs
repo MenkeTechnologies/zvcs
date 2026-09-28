@@ -1270,6 +1270,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // (`if (!revs->full_diff) copy_pathspec(...)` in `setup_revisions()`), so
     // each commit's diff shows every path it touched.
     let mut full_diff = false;
+    // `-O<file>` (`OPT_FILENAME('O', …, &options->orderfile)`), over the
+    // `diff.orderFile` default `repo_diff_setup()` seeded.
+    let mut order_cli: Option<String> = None;
     // `save_parents()`: under `--full-diff`, `simplify_commit()` keeps each
     // commit's parent list as `try_to_simplify_commit()` left it, before
     // `rewrite_parents()` replaces it (revision.c:4325-4326), and
@@ -2265,6 +2268,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     reflog_pats.push(v.clone());
                 }
             }
+        } else if a == "-O" {
+            i += 1;
+            let Some(v) = args.get(i) else {
+                eprintln!("error: switch `O' requires a value");
+                return Ok(ExitCode::from(129));
+            };
+            order_cli = Some(v.clone());
+        } else if let Some(v) = a.strip_prefix("-O") {
+            order_cli = Some(v.to_string());
         } else if a == "-S" {
             i += 1;
             let v = args.get(i).cloned().unwrap_or_default();
@@ -5500,6 +5512,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // above it do. The window computes a batch of them across the thread pool
     // while the loop below stays a plain in-order stream — git computes them one
     // at a time on one core.
+    // `prepare_order()` (diffcore-order.c:14-60) reads the order file the first
+    // time `diffcore_order()` meets a non-empty queue and dies there if it
+    // cannot. Read up front so the patch windows can sort by it; a failure is
+    // held until the first record whose queue is non-empty.
+    let mut order_failure: Option<anyhow::Error> = None;
+    let order_read = match &order_cli {
+        Some(path) => Some(super::diff_files::read_order_file(path)),
+        None => super::status::configured_orderfile(&repo)?
+            .map(|path| super::status::read_orderfile(&repo, &path)),
+    };
+    match order_read {
+        Some(Ok(patterns)) => patch_opts.order = Some(std::sync::Arc::new(patterns)),
+        Some(Err(e)) => order_failure = Some(e),
+        None => {}
+    }
     let mut patches =
         PatchWindow::new(emit_patch, show_root, diff_merges, all_need_diff, patch_opts.clone());
     // Each record's text comes out of its own commit object, and reading 6000 of
@@ -6657,6 +6684,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 continue;
             }
             printed += 1;
+        }
+        // `diffcore_order()` reached a non-empty queue with an order file it
+        // could not read: `diffcore_std()` runs before `show_log()`, so nothing of
+        // this record is out yet.
+        if record_has_diff {
+            if let Some(e) = order_failure.take() {
+                stdout.flush()?;
+                return Err(e);
+            }
         }
         if graph {
             // Buffer for the column layout, which spans all commits at once.
@@ -13150,6 +13186,7 @@ fn collect_changes(
                     record_rename_warnings(slot, w);
                 }
             }
+            order_changes(detect, &mut files);
             return Ok(files);
         }
     }
@@ -13194,7 +13231,17 @@ fn collect_changes(
             record_rename_warnings(slot, w);
         }
     }
+    order_changes(detect, &mut out);
     Ok(out)
+}
+
+/// `diffcore_order()` over a history command's change list, when `-O<file>` or
+/// `diff.orderFile` put patterns in the options. See
+/// [`super::diff_files::order_queue`].
+fn order_changes(opts: Option<&super::diff::PatchOpts>, files: &mut [FileChange]) {
+    if let Some(order) = opts.and_then(|o| o.order.as_ref()) {
+        super::diff_files::order_queue(order, files, |f| f.path.as_slice());
+    }
 }
 
 /// `builtin_diffstat()`'s binary test (diff.c:4213-4223) is

@@ -403,6 +403,22 @@ fn get_main_ref_store(repo: &gix::Repository) {
 /// `git remote rename origin upstream` a collision — the port answered from the
 /// merged configuration and refused the rename with `remote upstream already
 /// exists.`
+/// [`remote_exists`], or defined by a legacy `remotes/` or `branches/` file:
+/// `read_remotes_file()` and `read_branches_file()` set `configured_in_repo`
+/// too (remote.c:360, 399).
+fn remote_exists_or_legacy(repo: &gix::Repository, name: &str) -> bool {
+    remote_exists(repo, name) || legacy(repo, name).is_some()
+}
+
+/// The legacy file definition of `name`, consulted only when the configuration
+/// names no URL for it (remote.c:808-815).
+fn legacy(repo: &gix::Repository, name: &str) -> Option<gix::remote::legacy::Remote> {
+    if !effective_urls(repo, name, "url").is_empty() {
+        return None;
+    }
+    crate::remote_legacy::lookup(repo, BStr::new(name))
+}
+
 fn remote_exists(repo: &gix::Repository, name: &str) -> bool {
     let cfg = repo.config_snapshot();
     let found = cfg.plumbing().sections().any(|section| {
@@ -452,6 +468,9 @@ fn effective_urls(repo: &gix::Repository, name: &str, key: &str) -> Vec<String> 
 fn fetch_urls_or_name(repo: &gix::Repository, name: &str) -> Vec<String> {
     let urls = effective_urls(repo, name, "url");
     if urls.is_empty() {
+        if let Some(legacy) = legacy(repo, name).filter(|l| !l.urls.is_empty()) {
+            return legacy.urls.iter().map(|u| u.to_str_lossy().into_owned()).collect();
+        }
         vec![name.to_string()]
     } else {
         urls
@@ -694,8 +713,20 @@ fn remote_find_tracking(repo: &gix::Repository, remote: &str, dst: &BStr) -> boo
     })
 }
 
-/// Raw multi-values of `remote.<name>.<key>` across all config scopes.
+/// The `fetch` or `push` refspecs of `<name>`: the configured ones, then those
+/// of a legacy file (`refspec_append()` in `read_remotes_file()` and
+/// `read_branches_file()` adds to the configured list).
 fn effective_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String> {
+    let mut specs = configured_specs(repo, name, key);
+    if let Some(legacy) = legacy(repo, name) {
+        let extra = if key == "push" { &legacy.push } else { &legacy.fetch };
+        specs.extend(extra.iter().map(|s| s.to_str_lossy().into_owned()));
+    }
+    specs
+}
+
+/// Raw multi-values of `remote.<name>.<key>` across all config scopes.
+fn configured_specs(repo: &gix::Repository, name: &str, key: &str) -> Vec<String> {
     let cfg = repo.config_snapshot();
     let values: Vec<String> = cfg
         .plumbing()
@@ -909,7 +940,7 @@ fn add(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return fatal("specifying branches to track makes sense only with fetch mirrors");
     }
     read_config(repo);
-    if remote_exists(repo, name) {
+    if remote_exists_or_legacy(repo, name) {
         return error(format!("remote {name} already exists."), 3);
     }
     if !valid_remote_name(name) {
@@ -1598,7 +1629,7 @@ fn get_url(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let name = pos[0];
     // `remote = remote_get(remotename)` (builtin/remote.c:1826).
     read_config(repo);
-    if !remote_exists(repo, name) {
+    if !remote_exists_or_legacy(repo, name) {
         return error(format!("No such remote '{name}'"), 2);
     }
 

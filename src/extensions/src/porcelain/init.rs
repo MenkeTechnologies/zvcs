@@ -678,35 +678,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             // `repo_config_get_string()`, which dies through `git_die_config()` on a
             // valueless key. An empty value is a value, not the unset fallback:
             // `refs/heads/` then fails the format check below.
-            None => crate::refname::default_branch_name_override().unwrap_or_else(|| {
-                crate::config::config_get_string(Some(&repo), "init.defaultbranch")
-                    .unwrap_or_else(|| {
-                        // `repo_default_branch_name()` (refs.c:703-712): only the
-                        // compiled-in fallback carries the hint — an explicit
-                        // `-b`, the `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`
-                        // override and a configured `init.defaultBranch` all
-                        // return before it. `quiet` is `git init -q`, which is
-                        // what `create_reference_database()` passes through
-                        // (setup.c:2521).
-                        if !quiet {
-                            crate::advice::Advice::DefaultBranchName.advise_in(
-                                &repo,
-                                "Using 'master' as the name for the initial branch. This default branch name\n\
-                                 will change to \"main\" in Git 3.0. To configure the initial branch name\n\
-                                 to use in all of your new repositories, which will suppress this warning,\n\
-                                 call:\n\
-                                 \n\
-                                 \tgit config --global init.defaultBranch <name>\n\
-                                 \n\
-                                 Names commonly chosen instead of 'master' are 'main', 'trunk' and\n\
-                                 'development'. The just-created branch can be renamed via this command:\n\
-                                 \n\
-                                 \tgit branch -m <name>\n",
-                            );
-                        }
-                        "master".to_string()
-                    })
-            }),
+            // Only the compiled-in fallback carries the hint; `quiet` is
+            // `git init -q`, which is what `create_reference_database()` passes
+            // through (setup.c:2521).
+            None => crate::refname::repo_default_branch_name(&repo, quiet),
         };
 
         // Repoint the unborn HEAD symref to the resolved branch. This is a ref

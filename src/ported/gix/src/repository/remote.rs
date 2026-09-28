@@ -237,26 +237,65 @@ impl crate::Repository {
                                 source: err,
                             })
                         })
-                        .collect()
+                        .collect::<Result<Vec<_>, find::Error>>()
                 })
         };
-        let urls = config_urls(&config::tree::Remote::URL, "fetch");
+        let mut urls = config_urls(&config::tree::Remote::URL, "fetch");
         let push_urls = config_urls(&config::tree::Remote::PUSH_URL, "push");
         let config = &self.config.resolved;
 
-        let fetch_specs = config
-            .strings_filter(&format!("remote.{}.{}", name_or_url, "fetch"), &mut filter)
-            .map(|specs| {
-                config_spec(
-                    specs,
-                    name_or_url,
-                    &config::tree::Remote::FETCH,
-                    gix_refspec::parse::Operation::Fetch,
-                )
-            });
-        let push_specs = config
-            .strings_filter(&format!("remote.{}.{}", name_or_url, "push"), &mut filter)
-            .map(|specs| {
+        // `if (!valid_remote(ret)) read_remotes_file(); if (!valid_remote(ret)) read_branches_file();`
+        // (remote.c:808-815): a remote whose configuration names no URL may still be defined by a
+        // legacy file, whose refspecs are appended to whatever the configuration has.
+        let legacy = match &urls {
+            Some(Ok(configured)) if !configured.is_empty() => None,
+            Some(Err(_)) => None,
+            _ => crate::remote::legacy::read(self, name_or_url),
+        };
+        if let Some(legacy) = &legacy {
+            let parsed: Result<Vec<_>, _> = legacy
+                .urls
+                .iter()
+                .map(|url| {
+                    config::tree::Remote::URL
+                        .try_into_url(std::borrow::Cow::<BStr>::Borrowed(url.as_ref()))
+                        .map_err(|err| find::Error::Url {
+                            kind: "fetch",
+                            remote_name: name_or_url.into(),
+                            source: err,
+                        })
+                })
+                .collect();
+            urls = Some(parsed);
+        }
+        let with_legacy = |configured: Option<Vec<crate::bstr::BString>>, extra: Option<&Vec<crate::bstr::BString>>| {
+            match (configured, extra.filter(|e| !e.is_empty())) {
+                (configured, None) => configured,
+                (configured, Some(extra)) => {
+                    let mut all = configured.unwrap_or_default();
+                    all.extend(extra.iter().cloned());
+                    Some(all)
+                }
+            }
+        };
+
+        let fetch_specs = with_legacy(
+            config.strings_filter(&format!("remote.{}.{}", name_or_url, "fetch"), &mut filter),
+            legacy.as_ref().map(|l| &l.fetch),
+        )
+        .map(|specs| {
+            config_spec(
+                specs,
+                name_or_url,
+                &config::tree::Remote::FETCH,
+                gix_refspec::parse::Operation::Fetch,
+            )
+        });
+        let push_specs = with_legacy(
+            config.strings_filter(&format!("remote.{}.{}", name_or_url, "push"), &mut filter),
+            legacy.as_ref().map(|l| &l.push),
+        )
+        .map(|specs| {
                 config_spec(
                     specs,
                     name_or_url,

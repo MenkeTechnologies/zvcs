@@ -337,6 +337,37 @@ pub fn default_branch_name_override() -> Option<String> {
     std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME").ok().filter(|v| !v.is_empty())
 }
 
+/// `repo_default_branch_name(r, quiet)` (refs.c:691-716): the
+/// `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` override, else `init.defaultBranch`
+/// (dying through `git_die_config()` on a valueless key), else the compiled-in
+/// `master` — the only case that carries the `advice.defaultBranchName` hint,
+/// and only when not `quiet`.
+pub fn repo_default_branch_name(repo: &gix::Repository, quiet: bool) -> String {
+    if let Some(name) = default_branch_name_override() {
+        return name;
+    }
+    if let Some(name) = crate::config::config_get_string(Some(repo), "init.defaultbranch") {
+        return name;
+    }
+    if !quiet {
+        crate::advice::Advice::DefaultBranchName.advise_in(
+            repo,
+            "Using 'master' as the name for the initial branch. This default branch name\n\
+             will change to \"main\" in Git 3.0. To configure the initial branch name\n\
+             to use in all of your new repositories, which will suppress this warning,\n\
+             call:\n\
+             \n\
+             \tgit config --global init.defaultBranch <name>\n\
+             \n\
+             Names commonly chosen instead of 'master' are 'main', 'trunk' and\n\
+             'development'. The just-created branch can be renamed via this command:\n\
+             \n\
+             \tgit branch -m <name>\n",
+        );
+    }
+    "master".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2014,7 +2014,15 @@ fn configured_push_refspecs(repo: &gix::Repository, name: &str) -> Vec<String> {
     // refspec pushed twice is two commands for one ref on the wire, and the
     // server reports the second under no name at all — `! [remote rejected]
     // <ref> (remote end did not report status)` on a push git reports as clean.
-    crate::config::multi_values(repo, &format!("remote.{name}.push"))
+    let mut specs = crate::config::multi_values(repo, &format!("remote.{name}.push"));
+    // A remote with no configured URL may come from a legacy `remotes/` or
+    // `branches/` file, whose `Push:` refspecs are appended (remote.c:808-815).
+    if crate::config::multi_values(repo, &format!("remote.{name}.url")).is_empty() {
+        if let Some(legacy) = crate::remote_legacy::lookup(repo, name.into()) {
+            specs.extend(legacy.push.iter().map(|s| s.to_string()));
+        }
+    }
+    specs
 }
 
 /// `setup_default_push_refspecs()` (builtin/push.c:229-287): what a bare `git push` pushes

@@ -60,6 +60,7 @@ pub mod quote;
 pub mod rcache;
 pub mod refname;
 pub mod refsort;
+pub mod remote_legacy;
 pub mod repo_settings;
 pub mod revfilter;
 pub mod revopt;
@@ -647,6 +648,8 @@ fn command_line_include(key: &str, value: Option<&str>) -> Result<(), String> {
 /// Parse `argv`, dispatch the subcommand, and return the process exit code.
 /// Errors are reported terse on stderr as `zvcs: <command>: <reason>`.
 fn run_command(argv: &[String]) -> ExitCode {
+    // Legacy `remotes/` and `branches/` files join every remote lookup.
+    remote_legacy::install();
     // The very first thing any git process does with the environment:
     // `read_very_early_config()` opens the sequence with
     // `git_config_system()` (config.c:1541), which is

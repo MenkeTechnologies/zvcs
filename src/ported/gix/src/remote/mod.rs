@@ -46,6 +46,8 @@ pub use errors::find;
 ///
 pub mod init;
 
+pub mod legacy;
+
 ///
 pub mod fetch;
 

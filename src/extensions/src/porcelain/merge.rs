@@ -4683,6 +4683,11 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
     }
     // The shared apply reports on stdout for `rebase`; merge's own notices go to
     // stderr, so it runs quiet here and the messages are emitted below.
+    //
+    // The apply is a `git stash apply` child (sequencer.c:4735-4751), so
+    // `start_command()`'s `fflush(NULL)` (run-command.c:743) puts the buffered
+    // merge summary and diffstat out ahead of `Applied autostash.`.
+    crate::cstdio::before_spawn();
     let conflicts = crate::porcelain::stash::apply_autostash(repo, id, true)?;
     if conflicts.is_empty() {
         repo.edit_reference(RefEdit {

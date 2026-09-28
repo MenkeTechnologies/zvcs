@@ -567,8 +567,9 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     let mut f_deepen: Option<String> = None;
     let mut f_shallow_since: Option<String> = None;
     let mut f_shallow_exclude: Vec<String> = Vec::new();
-    let mut f_quiet = false;
-    let mut f_verbose = false;
+    // `OPT__VERBOSITY(&opt_verbosity)`: one signed count, which
+    // `argv_push_verbosity()` hands on as that many `-v` or `-q`.
+    let mut verbosity: i32 = 0;
     // Fetch knobs with no merge/rebase meaning, forwarded verbatim.
     let mut f_progress: Option<bool> = None;
     let mut f_dry_run = false;
@@ -709,10 +710,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             "--no-shallow-exclude" => f_shallow_exclude.clear(),
             // `OPT__VERBOSITY` counts up and down; the `--no-` spellings zero
             // their own side rather than being unknown options.
-            "-q" | "--quiet" => f_quiet = true,
-            "--no-quiet" => f_quiet = false,
-            "-v" | "--verbose" => f_verbose = true,
-            "--no-verbose" => f_verbose = false,
+            // `parse_opt_verbosity_cb()` (parse-options-cb.c:65-85): each switch
+            // first resets a count going the other way, and either negation zeroes it.
+            "-q" | "--quiet" => verbosity = if verbosity <= 0 { verbosity - 1 } else { -1 },
+            "-v" | "--verbose" => verbosity = if verbosity >= 0 { verbosity + 1 } else { 1 },
+            "--no-quiet" | "--no-verbose" => verbosity = 0,
             "--progress" => f_progress = Some(true),
             "--no-progress" => f_progress = Some(false),
             // git's pull runs the fetch with `--dry-run` and then returns
@@ -1036,12 +1038,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         fetch_args.push("--shallow-exclude".into());
         fetch_args.push(r.clone());
     }
-    if f_quiet {
-        fetch_args.push("--quiet".into());
-    }
-    if f_verbose {
-        fetch_args.push("--verbose".into());
-    }
+    argv_push_verbosity(&mut fetch_args, verbosity);
     match f_progress {
         Some(true) => fetch_args.push("--progress".into()),
         Some(false) => fetch_args.push("--no-progress".into()),
@@ -1270,7 +1267,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             eprintln!("fatal: Cannot merge multiple branches into empty head.");
             return Ok(ExitCode::from(128));
         }
-        return pull_into_void(&repo, merge_heads[0].0, curr_head, verify_signatures.is_some(), f_quiet);
+        return pull_into_void(&repo, merge_heads[0].0, curr_head, verify_signatures.is_some(), verbosity < 0);
     }
 
     let head_id = repo.head_id()?.detach();
@@ -1434,12 +1431,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         // `argv_push_verbosity(&args)` in `run_rebase()`: the accumulated `-q`/
         // `-v` count reaches the integration step, which is what makes
         // `pull --quiet` quiet rather than only quieting the fetch.
-        if f_quiet {
-            rebase_args.push("--quiet".into());
-        }
-        if f_verbose {
-            rebase_args.push("--verbose".into());
-        }
+        argv_push_verbosity(&mut rebase_args, verbosity);
         // git's `cmd_pull()` rejects both of these ahead of the rebase, since a
         // rebase has nowhere to put them.
         if squash.is_some() {
@@ -1515,12 +1507,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // `argv_push_verbosity(&args)` in `run_merge()`. Without this the merge
     // printed its `Updating …`/`Fast-forward`/diffstat block even under
     // `pull --quiet`, where only the fetch had been silenced.
-    if f_quiet {
-        merge_args.push("--quiet".into());
-    }
-    if f_verbose {
-        merge_args.push("--verbose".into());
-    }
+    argv_push_verbosity(&mut merge_args, verbosity);
     match squash {
         Some(true) => merge_args.push("--squash".into()),
         Some(false) => merge_args.push("--no-squash".into()),
@@ -1817,4 +1804,13 @@ fn pull_into_void(
         deref: true,
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `argv_push_verbosity()` (builtin/pull.c:125-134): `opt_verbosity` as that
+/// many `-v` or `-q`.
+fn argv_push_verbosity(args: &mut Vec<String>, verbosity: i32) {
+    let switch = if verbosity > 0 { "-v" } else { "-q" };
+    for _ in 0..verbosity.unsigned_abs() {
+        args.push(switch.to_string());
+    }
 }

@@ -1291,6 +1291,17 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
                 if !is_option {
+                    // `read_revisions_from_stdin()` handles each line as it reads
+                    // it, dying on the first that does not resolve — before the
+                    // scan resumes, so ahead of a second `--stdin`'s own refusal.
+                    // The later resolution pass repeats the lookup on a line that
+                    // passed, which reports nothing further.
+                    if let Some(text) =
+                        super::rev_list::stdin_revision_error(&repo, a, negate_revs, ignore_missing)
+                    {
+                        eprint!("{text}");
+                        return Ok(ExitCode::from(128));
+                    }
                     if argument_excludes(a, negate_revs) {
                         no_walk = None;
                     }

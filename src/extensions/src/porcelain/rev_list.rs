@@ -4394,6 +4394,27 @@ fn reflog_for_walk(
 /// `<a>` reaches, and `<a>...<b>` excludes their merge bases and marks `<a>` as
 /// the symmetric left side. `--not` has already flipped `negate`, and `^` flips
 /// it once more, exactly as git XORs `UNINTERESTING | BOTTOM` in both places.
+/// What `read_revisions_from_stdin()`'s `handle_revision_arg()` dies with for
+/// one line (revision.c:2960-2976), or `None` when the line resolves. `log`
+/// reads its revisions before resolving any of them, and a bad `--stdin` line
+/// still has to be reported where git reports it: as the line is read.
+///
+/// `--ignore-missing` excuses only the line that does not resolve (`ret =
+/// revs->ignore_missing ? 0 : -1`, revision.c:2223-2226); the `die()`s from
+/// inside the lookup still fire.
+pub(super) fn stdin_revision_error(
+    repo: &gix::Repository,
+    line: &str,
+    negate: bool,
+    ignore_missing: bool,
+) -> Option<String> {
+    let text = seed_revision(repo, line, negate, true, &mut Vec::new(), &mut Vec::new()).err()?;
+    match ignore_missing && text == unresolvable_in(repo, line, true) {
+        true => None,
+        false => Some(text),
+    }
+}
+
 fn seed_revision(
     repo: &gix::Repository,
     spec: &str,

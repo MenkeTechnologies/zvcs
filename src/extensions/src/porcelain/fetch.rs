@@ -3941,10 +3941,12 @@ fn fetch_one(
         // is the *automatic* half of tag following and has no say over what was
         // asked for by name. `git fetch . tag v0.2.0` on a tag this repository
         // already has still writes its `FETCH_HEAD` row — which is the row
+        // A configured refspec that names tags is no more automatic than one on the
+        // command line: only the implicit tag-following mappings are filtered.
         // `git pull . tag v0.2.0` then merges, and without it the pull ends on
         // `couldn't find remote ref FETCH_HEAD`.
         if is_tag
-            && !from_command_line
+            && mapping.spec_index.implicit_index().is_some()
             && !matches!(opts.tags, Some(Tags::All))
             && update.mode == Mode::NoChangeNeeded
         {

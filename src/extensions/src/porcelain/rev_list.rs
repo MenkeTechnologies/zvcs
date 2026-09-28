@@ -3102,7 +3102,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         true => commits.clone(),
         false => Vec::new(),
     };
-    if bisect {
+    // Under `-g` the reflog entries never reach `revs->pending` (revision.c:305-316,
+    // "do not add the commit itself"), so `find_bisection()` searches an empty
+    // `revs->commits` while `get_revision_1()` still streams the reflog
+    // (revision.c:4364-4387): the listing is the plain walk, no `dist=` is
+    // weighed, and `show_bisect_vars()` bails out on the empty list with exit 1
+    // (builtin/rev-list.c:441-442).
+    if bisect && walk_reflogs && bisect_vars {
+        return Ok(ExitCode::from(1));
+    }
+    if bisect && !walk_reflogs {
         let found = find_bisection(&commits, &parents_of, first_parent, bisect_all, &treesame);
         commits = found.commits.iter().map(|(id, _)| *id).collect();
         if bisect_all {
@@ -3640,13 +3649,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     &super::color::DecorateColors::disabled(),
                     &super::log::DecorationOpts { prefix: "", suffix: "", ..Default::default() },
                 );
-                out.extend_from_slice(b" (");
+                // `dist=` is a name decoration `best_bisection_sorted()` adds only
+                // to the commits it weighed (bisect.c:249-252); under `-g` it
+                // weighed none, and a commit with no decoration at all gets no
+                // parentheses (log-tree.c:433-440).
+                let mut decos: Vec<Vec<u8>> = Vec::new();
                 if !refs.is_empty() {
-                    out.extend_from_slice(&refs);
-                    out.extend_from_slice(b", ");
+                    decos.push(refs);
                 }
-                let dist = bisect_dist.get(id).copied().unwrap_or(0);
-                out.extend_from_slice(format!("dist={dist})").as_bytes());
+                if let Some(dist) = bisect_dist.get(id) {
+                    decos.push(format!("dist={dist}").into_bytes());
+                }
+                if !decos.is_empty() {
+                    out.extend_from_slice(b" (");
+                    out.extend_from_slice(&decos.join(&b", "[..]));
+                    out.push(b')');
+                }
             }
             if show_parents {
                 for parent in parents_of.get(id).into_iter().flatten() {

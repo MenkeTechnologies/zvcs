@@ -526,6 +526,8 @@ struct State {
     revs: bool,
     /// `--incremental`: leave out objects an existing pack already holds.
     incremental: bool,
+    /// `--local`: leave out objects an alternate holds.
+    local: bool,
     /// `--window=<n>`: how many objects the delta search compares each object
     /// against. Overrides `pack.window`.
     window: Option<i64>,
@@ -4571,6 +4573,9 @@ fn collect_counts(
         ids
     };
 
+    if st.local {
+        drop_borrowed(repo, &mut ids);
+    }
     dedup(&mut ids);
     // `pack-objects` builds its pending list from `--all`/`--reflog`/`--revs`,
     // whose entries are commits, and a commit is not something any spec
@@ -4585,6 +4590,39 @@ fn collect_counts(
             entry_pack_location: pack::data::output::count::PackLocation::NotLookedUp,
         })
         .collect())
+}
+
+/// `--local`'s half of `want_object_in_pack()` (builtin/pack-objects.c:1615-1830):
+/// leave out every object an alternate holds, loose or packed — "objects in
+/// packs borrowed from elsewhere are discarded regardless of if they appear in
+/// other packs that weren't borrowed". Shared with `repack -l`, which passes
+/// `--local` to its `pack-objects`.
+pub(crate) fn drop_borrowed(repo: &gix::Repository, ids: &mut Vec<ObjectId>) {
+    let alternates = repo.objects.store_ref().alternate_db_paths().unwrap_or_default();
+    if alternates.is_empty() {
+        return;
+    }
+    let hash = repo.object_hash();
+    let mut indices: Vec<pack::index::File> = Vec::new();
+    for objdir in &alternates {
+        let dir = objdir.join("pack");
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(base) = name.strip_suffix(".idx") else { continue };
+            if !dir.join(format!("{base}.pack")).is_file() {
+                continue;
+            }
+            if let Ok(index) = pack::index::File::at(dir.join(&name), hash) {
+                indices.push(index);
+            }
+        }
+    }
+    ids.retain(|id| {
+        let hex = id.to_hex().to_string();
+        let loose = alternates.iter().any(|objdir| objdir.join(&hex[..2]).join(&hex[2..]).is_file());
+        !loose && !indices.iter().any(|index| index.lookup(id).is_some())
+    });
 }
 
 /// `read_object_list_from_stdin()`: the object list git reads when its internal
@@ -5701,6 +5739,7 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "stdin-packs" => st.stdin_packs = on,
         "unpacked" => st.unpacked = on,
         "incremental" => st.incremental = on,
+        "local" => st.local = on,
         "non-empty" => st.non_empty = on,
         // Both write into git's single `write_bitmap_index`; the hidden one
         // stores `WRITE_BITMAP_QUIET` rather than `WRITE_BITMAP_TRUE`, and every

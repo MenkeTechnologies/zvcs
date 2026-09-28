@@ -436,6 +436,8 @@ struct State {
     /// `LOOSEN_UNREACHABLE`, set by `-A` and by `--unpack-unreachable`.
     loosen_unreachable: bool,
     keep_unreachable: bool,
+    /// `-l` / `--local`: passed to `pack-objects` as `--local`.
+    local: bool,
     cruft: bool,
     /// `--cruft-expiration=<approxidate>`, kept as typed: its presence picks
     /// `enumerate_and_traverse_cruft_objects()` over `enumerate_cruft_objects()`
@@ -802,6 +804,11 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         .into_iter()
         .filter(|id| indexed.contains(id) || keeps_object(st, id, &repo))
         .collect();
+    // `-l` is `pack-objects --local` (builtin/repack.c): nothing an alternate
+    // holds goes into the new pack.
+    if st.local {
+        super::pack_objects::drop_borrowed(&repo, &mut to_pack);
+    }
     // ```c
     // if (keep_unreachable)
     //         strvec_push(&cmd.args, "--keep-unreachable");
@@ -2683,6 +2690,7 @@ fn magnitude_value(label: &str, v: &str) -> Option<ExitCode> {
 fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
     let on = !negated;
     match OPTS[idx].long {
+        "local" => st.local = on,
         // `--no-name-hash-version` restores the default, which git accepts.
         "name-hash-version" => {
             st.name_hash_version = match value {
@@ -2832,9 +2840,9 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
             'f' => st.no_reuse_delta = true,
             // `-F` controls *object* reuse — copying a stored entry's bytes —
             // which this writer never does, so it already behaves as asked.
-            // `-l` scopes the search to local packs and `-i` enables delta
-            // islands; neither is modelled.
-            'F' | 'l' | 'i' => {}
+            // `-i` enables delta islands, which are not modelled.
+            'F' | 'i' => {}
+            'l' => st.local = true,
             'g' => {
                 // The remainder of the cluster is the value, else the next argv.
                 let rest: String = chars[c + 1..].iter().collect();

@@ -1115,6 +1115,41 @@ fn resolved_id(repo: &gix::Repository, name: &str) -> Result<Option<gix::ObjectI
 // remote rename
 // ---------------------------------------------------------------------------
 
+/// `migrate_file()` (builtin/remote.c:762-788): write a legacy remote's URLs,
+/// push and fetch refspecs into `remote.<name>.*`, in that order, then remove
+/// the file it came from — `remotes/<name>` when that is what defined it,
+/// `branches/<name>` otherwise.
+fn migrate_file(repo: &gix::Repository, name: &str, legacy: &gix::remote::legacy::Remote) -> Result<ExitCode> {
+    let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    let (path, mut file) = open_local(repo)?;
+    {
+        let mut section = file.section_mut_or_create_new("remote", Some(BStr::new(name)))?;
+        for (key, values) in [("url", &legacy.urls), ("push", &legacy.push), ("fetch", &legacy.fetch)] {
+            for value in values {
+                section.push(key, value.as_bstr())?;
+            }
+        }
+    }
+    persist(&path, &file)?;
+    let remotes = repo.common_dir().join("remotes").join(name);
+    let origin = if remotes.is_file() {
+        remotes
+    } else {
+        repo.common_dir().join("branches").join(name)
+    };
+    // `unlink_or_warn()`.
+    if let Err(e) = std::fs::remove_file(&origin) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!(
+                "warning: unable to unlink '{}': {}",
+                origin.display(),
+                crate::external::strerror(&e)
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `git remote rename <old> <new>` — move the config section, the tracking
 /// refs and every `branch.*` / `remote.pushDefault` back-reference.
 ///
@@ -1147,8 +1182,20 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     // `oldremote = remote_get(rename.old_name)` (builtin/remote.c:882).
     read_config(repo);
-    if !remote_exists(repo, old) {
+    if !remote_exists_or_legacy(repo, old) {
         return error(format!("No such remote: '{old}'"), 2);
+    }
+    // ```c
+    // if (!strcmp(rename.old_name, rename.new_name) && oldremote->origin != REMOTE_CONFIG)
+    //         return migrate_file(oldremote);
+    // ```
+    //
+    // (builtin/remote.c:888-889.) Renaming a legacy remote onto itself is the
+    // migration its deprecation warning recommends.
+    if old == new {
+        if let Some(legacy) = legacy(repo, old) {
+            return migrate_file(repo, old, &legacy);
+        }
     }
     if !valid_remote_name(new) {
         return fatal(format!("'{new}' is not a valid remote name"));
@@ -1161,9 +1208,25 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     // 1. config: section header and every back-reference to the old name.
     let (path, mut file) = open_local(repo)?;
-    // A remote configured outside the repository has nothing local to rename;
-    // the back-references below still have to be rewritten.
-    let _ = file.rename_section("remote", Some(BStr::new(old)), "remote", new.to_string());
+    // ```c
+    // if (repo_config_rename_section(the_repository, buf.buf, buf2.buf) < 1) {
+    //         result = error(_("Could not rename config section '%s' to '%s'"),
+    //                        buf.buf, buf2.buf);
+    //         goto out;
+    // }
+    // ```
+    //
+    // (builtin/remote.c:900-906.) A remote that exists without a section in the
+    // repository's own configuration — one read from a legacy file — ends here.
+    if file
+        .rename_section("remote", Some(BStr::new(old)), "remote", new.to_string())
+        .is_err()
+    {
+        return error(
+            format!("Could not rename config section 'remote.{old}' to 'remote.{new}'"),
+            1,
+        );
+    }
 
     for branch in branch_subsections(&file) {
         let Ok(mut section) = file.section_mut("branch", Some(branch.as_bstr())) else {

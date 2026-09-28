@@ -3083,6 +3083,19 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         commits = topo_sort(&commits, edges, dates.as_ref());
     }
 
+    // `set_children` runs over the limited list at the end of
+    // `prepare_revision_walk()` (revision.c:4026-4027), before `find_bisection()`
+    // reorders it and before any output-time filter,
+    // and prepends each child, so a commit's children come out newest first.
+    let mut children_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    if show_children {
+        for id in &commits {
+            for parent in parents_of.get(id).into_iter().flatten() {
+                children_of.entry(*parent).or_default().insert(0, *id);
+            }
+        }
+    }
+
     // `--bisect` replaces the whole list with the one commit `find_bisection`
     // picks, before any output-time filter runs. Under `--bisect-all` the list
     // survives whole, reordered by the search and carrying the distance each
@@ -3151,17 +3164,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
-
-    // `set_children` runs over the limited list, before any output-time filter,
-    // and prepends each child, so a commit's children come out newest first.
-    let mut children_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
-    if show_children {
-        for id in &commits {
-            for parent in parents_of.get(id).into_iter().flatten() {
-                children_of.entry(*parent).or_default().insert(0, *id);
-            }
-        }
-    }
 
     // `simplify_commit` drops the TREESAME commits, then `commit_ignore` applies
     // the parent-count bounds and `commit_match` the header predicates.
@@ -3636,7 +3638,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     out.extend_from_slice(b"boundary=yes");
                 }
             }
-            // `--bisect-all`'s decoration list: the refs pointing at the commit,
+            if show_parents {
+                for parent in parents_of.get(id).into_iter().flatten() {
+                    out.push(b' ');
+                    out.extend_from_slice(parent.to_string().as_bytes());
+                }
+            }
+            if show_children {
+                for child in children_of.get(id).into_iter().flatten() {
+                    out.push(b' ');
+                    out.extend_from_slice(child.to_string().as_bytes());
+                }
+            }
+            // `show_decorations()` comes after the parents and children
+            // (builtin/rev-list.c:289-305). `--bisect-all`'s decoration list: the refs pointing at the commit,
             // then the `dist=<n>` `best_bisection_sorted()` attached to it, in
             // `format_decorations()`'s ` (a, b)` shape.
             if let Some(decos) = &bisect_decorations {
@@ -3664,18 +3679,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     out.extend_from_slice(b" (");
                     out.extend_from_slice(&decos.join(&b", "[..]));
                     out.push(b')');
-                }
-            }
-            if show_parents {
-                for parent in parents_of.get(id).into_iter().flatten() {
-                    out.push(b' ');
-                    out.extend_from_slice(parent.to_string().as_bytes());
-                }
-            }
-            if show_children {
-                for child in children_of.get(id).into_iter().flatten() {
-                    out.push(b' ');
-                    out.extend_from_slice(child.to_string().as_bytes());
                 }
             }
             match &pretty {

@@ -4049,7 +4049,63 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `limit_list()` (`if (revs->no_walk) return 0;`), and `get_revision_1()`'s
     // `REV_WALK_NO_WALK` arm runs no `try_to_simplify_commit()` (revision.c:4418-
     // 4434). No commit is ever marked TREESAME, so every named one is shown.
-    if (!pathspecs.is_empty() || simplify_by_decoration) && !follow && no_walk.is_none() {
+    // `-g` simplifies each entry as `next_reflog_entry()` hands it out, and
+    // `rewrite_parents()` walks the real history behind it rather than a limited
+    // list: see [`super::simplify::ReflogWalk`]. `setup_revisions()` has already
+    // refused every option that would need the list (`--graph`,
+    // `--simplify-merges`, `--simplify-by-decoration`, `--children`), so only
+    // `--parents` asks for ancestry here.
+    let reflog_prune = walk_reflogs && !pathspecs.is_empty() && !follow && no_walk.is_none();
+    if reflog_prune {
+        let mode = super::simplify::Mode {
+            dense,
+            simplify_history: !full_history,
+            first_parent,
+        };
+        // `revs->limited`: an UNINTERESTING commit pended before `-g`
+        // (revision.c:431-435).
+        let limited = !neg_ids.is_empty();
+        let mut sim =
+            super::simplify::ReflogWalk::new(&repo, mode, limited, &uninteresting, &bottoms_set);
+        let mut specs = PathspecMatcher::new(&repo, &pathspecs)?;
+        let mut diff = super::rev_list::PathDiff {
+            repo: &repo,
+            specs: &mut specs,
+            decorations: None,
+            pathspec: true,
+        };
+        // `get_commit_action()` counts `commit->parents` as
+        // `try_to_simplify_commit()` left them, before `rewrite_parents()`.
+        let parent_count_ok = |n: usize| {
+            (!only_merges || n >= 2)
+                && (!no_merges || n < 2)
+                && min_parents.is_none_or(|min| n >= min)
+                && max_parents.is_none_or(|max| n <= max)
+        };
+        let mut shown: Vec<Node> = Vec::with_capacity(nodes.len());
+        for mut node in std::mem::take(&mut nodes) {
+            sim.pop(node.id, &mut diff)?;
+            if !parent_count_ok(sim.parents(node.id).len()) {
+                continue;
+            }
+            if dense {
+                if !sim.shows(node.id, show_parents) {
+                    continue;
+                }
+                if show_parents {
+                    sim.rewrite(node.id, &mut diff)?;
+                }
+            }
+            node.parents = sim.parents(node.id).to_vec();
+            shown.push(node);
+        }
+        nodes = shown;
+    }
+    if (!pathspecs.is_empty() || simplify_by_decoration)
+        && !follow
+        && no_walk.is_none()
+        && !reflog_prune
+    {
         // `if (!revs->prune_data.nr) return REV_TREE_SAME;` for every parent
         // comparison. A root is compared by `rev_same_tree_as_empty()`, which
         // never consults decorations or this shortcut.
@@ -4456,16 +4512,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
     // `--merges`/`--no-merges` are git's aliases for `--min-parents=2` /
     // `--max-parents=1`; parent-count limiting happens before commit limiting.
-    if only_merges {
+    if only_merges && !reflog_prune {
         nodes.retain(|n| n.parents.len() >= 2);
     }
-    if no_merges {
+    if no_merges && !reflog_prune {
         nodes.retain(|n| n.parents.len() < 2);
     }
-    if let Some(min) = min_parents {
+    if let Some(min) = min_parents.filter(|_| !reflog_prune) {
         nodes.retain(|n| n.parents.len() >= min);
     }
-    if let Some(max) = max_parents {
+    if let Some(max) = max_parents.filter(|_| !reflog_prune) {
         nodes.retain(|n| n.parents.len() <= max);
     }
 

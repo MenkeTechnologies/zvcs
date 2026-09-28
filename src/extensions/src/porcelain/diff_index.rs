@@ -1526,13 +1526,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // (builtin/diff-index.c:68-70). `--skip`, `--no-walk` and
             // `--first-parent` are not in that test, so they are accepted and inert.
             s if s.starts_with('-') && crate::revopt::parse(args, cur).is_some() => {
-                match crate::revopt::parse(args, cur) {
+                match counts.parse(args, cur) {
                     Some(Ok(hit)) => {
                         i = cur + hit.consumed;
-                        if let Err(message) = counts.apply(hit.what) {
-                            eprintln!("fatal: {message}");
-                            return Ok(ExitCode::from(128));
-                        }
                     }
                     Some(Err(message)) if message.starts_with('-') => {
                         eprintln!("error: {message}");

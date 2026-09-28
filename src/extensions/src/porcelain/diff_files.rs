@@ -1115,10 +1115,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             // claim (builtin/diff-files.c:50). The walk-only fields change
             // nothing here, but `max_count` is the unmerged-stage selector, so
             // `-0`..`-3`, `-01`, `-n 3` and `--max-count=3` all pick the stage.
-            match crate::revopt::parse(args, idx) {
+            match counts.parse(args, idx) {
                 Some(Ok(hit)) => {
                     consumed_next = hit.consumed == 2;
-                    counts.apply(hit.what).map_err(Fatal::RevOptDie)?;
                     continue;
                 }
                 Some(Err(_)) if s == "-n" => return Err(Fatal::MissingArgument("-n")),

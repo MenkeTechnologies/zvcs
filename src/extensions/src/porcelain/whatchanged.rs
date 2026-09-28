@@ -1160,11 +1160,8 @@ fn consume_option(
     // [`crate::revopt`]'s — this classifier only has to agree with git on how
     // many slots each word eats and which refusal a bad value produces, since
     // `cmd_whatchanged` *is* `cmd_log` and the walk itself is `git log`'s.
-    match crate::revopt::parse(args, i) {
+    match p.counts.parse(args, i) {
         Some(Ok(hit)) => {
-            if let Err(message) = p.counts.apply(hit.what) {
-                return Err(Fatal::die(&message));
-            }
             if let crate::revopt::Count::MaxCount(_) | crate::revopt::Count::MaxCountOldest(_) =
                 hit.what
             {

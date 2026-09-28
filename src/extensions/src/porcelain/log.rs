@@ -1408,12 +1408,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // the next argv slot. The spellings, the argv arithmetic and the two
         // `die_for_incompatible_opt2()` conflicts are [`crate::revopt`]'s, so
         // every walking verb answers them the same way.
-        match crate::revopt::parse(&args, i) {
+        match counts.parse(&args, i) {
             Some(Ok(hit)) => {
-                if let Err(message) = counts.apply(hit.what) {
-                    eprintln!("fatal: {message}");
-                    return Ok(ExitCode::from(128));
-                }
                 max_count = counts.max_count;
                 skip = counts.skip;
                 since = counts.max_age;

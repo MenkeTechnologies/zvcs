@@ -456,11 +456,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // attached or in the next argv slot (`parse_long_opt()`,
         // diff.c:5380-5399); `consumed_next` is how this loop, which has no
         // index of its own, skips that slot. See [`crate::revopt`].
-        match crate::revopt::parse(args, idx) {
+        match counts.parse(args, idx) {
             Some(Ok(hit)) => {
-                if let Err(message) = counts.apply(hit.what) {
-                    crate::git_fatal!("{message}");
-                }
                 max_count = counts.max_count;
                 if counts.no_walk_cleared {
                     no_walk = false;

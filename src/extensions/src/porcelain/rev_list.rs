@@ -1293,11 +1293,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // argv slot (`parse_long_opt()`, diff.c:5380-5399), and the two
         // `die_for_incompatible_opt2()` conflicts live with the parse, so every
         // walking verb answers them identically. See [`crate::revopt`].
-        match crate::revopt::parse(&argv, i) {
+        match counts.parse(&argv, i) {
             Some(Ok(hit)) => {
-                if let Err(message) = counts.apply(hit.what) {
-                    return Ok(fatal(&message));
-                }
                 max_count = counts.max_count;
                 skip_count = counts.skip;
                 max_age = counts.max_age;

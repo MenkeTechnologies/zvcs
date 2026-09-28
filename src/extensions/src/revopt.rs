@@ -195,6 +195,8 @@ pub fn long_opt<'a, S: AsRef<str>>(
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Count {
     /// `revs->max_count`. `None` is git's `-1`: no limit. Also clears `no_walk`.
+    /// `--max-count` also sets `max_count_type = 0`; `-<digits>` and `-n` do not
+    /// — see [`Counts::parse`].
     MaxCount(Option<usize>),
     /// `revs->max_count` with `max_count_type = 1` (revision.c:2349-2359).
     MaxCountOldest(Option<usize>),
@@ -296,6 +298,47 @@ impl Counts {
             Count::MaxAgeAsFilter(v) => self.max_age_as_filter = Some(v),
         }
         Ok(())
+    }
+
+    /// [`parse`] and [`Self::apply`] in git's order, for the verbs that keep a
+    /// `Counts`.
+    ///
+    /// `handle_revision_opt()` runs the `die_for_incompatible_opt2()` tests of
+    /// `--max-count`, `--max-count-oldest` and `--skip` *before* `parse_count()`
+    /// reads the value (revision.c:2341-2364), so `--skip=1
+    /// --max-count-oldest=x` names the conflict rather than the bad integer;
+    /// only `parse_long_opt()`'s own "requires a value" comes earlier.
+    ///
+    /// `-<digits>`, `-n <n>` and `-n<n>` set `revs->max_count` and nothing else
+    /// (revision.c:2366-2378): no conflict test, and `max_count_type` stays as
+    /// it was, so after `--max-count-oldest` they change how many of the oldest
+    /// commits are kept.
+    pub fn parse<S: AsRef<str>>(&mut self, args: &[S], i: usize) -> Option<Result<Hit, String>> {
+        let found = |name: &str| matches!(long_opt(name, args, i), Some(Ok(_)));
+        let conflict = if found("max-count") {
+            self.clone().apply(Count::MaxCount(None))
+        } else if found("max-count-oldest") {
+            self.clone().apply(Count::MaxCountOldest(None))
+        } else if found("skip") {
+            self.clone().apply(Count::Skip(0))
+        } else {
+            Ok(())
+        };
+        if let Err(message) = conflict {
+            return Some(Err(message));
+        }
+        let long_form = args[i].as_ref().starts_with("--");
+        Some(parse(args, i)?.and_then(|hit| {
+            match hit.what {
+                Count::MaxCount(n) if !long_form => {
+                    self.max_count = n;
+                    self.max_count_set = n.is_some();
+                    self.no_walk_cleared = true;
+                }
+                what => self.apply(what)?,
+            }
+            Ok(hit)
+        }))
     }
 }
 

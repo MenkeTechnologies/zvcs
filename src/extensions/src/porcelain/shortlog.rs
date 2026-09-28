@@ -1351,7 +1351,7 @@ fn fatal_rev(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> Exit
 /// `0x10` do not), and a leading `-` is allowed. Failure is
 /// `fatal: '<value>': not an integer`, exit 128. Callers map git's negative
 /// sentinels (`--max-count=-1` → unlimited, `--skip=-1` → skip nothing, …).
-/// Run [`crate::revopt::parse`] over `argv[at]` and fold the result into
+/// Run [`crate::revopt::Counts::parse`] over `argv[at]`, folding the result into
 /// `filters`, so shortlog reaches `handle_revision_opt()`'s count-and-age arm
 /// through the same code every other history-walking verb does.
 ///
@@ -1359,19 +1359,13 @@ fn fatal_rev(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> Exit
 /// always exit 128 — these run inside `parse_revision_opt()`, below
 /// parse-options' 129.
 fn apply_count_opt(argv: &[String], at: usize, filters: &mut Filters) -> Option<Result<usize, ExitCode>> {
-    let hit = match crate::revopt::parse(argv, at) {
-        None => return None,
-        Some(Err(message)) => {
+    match filters.counts.parse(argv, at)? {
+        Err(message) => {
             eprintln!("fatal: {message}");
-            return Some(Err(ExitCode::from(128)));
+            Some(Err(ExitCode::from(128)))
         }
-        Some(Ok(hit)) => hit,
-    };
-    if let Err(message) = filters.counts.apply(hit.what) {
-        eprintln!("fatal: {message}");
-        return Some(Err(ExitCode::from(128)));
+        Ok(hit) => Some(Ok(hit.consumed)),
     }
-    Some(Ok(hit.consumed))
 }
 
 fn int_arg(value: &str) -> Result<i32, ExitCode> {

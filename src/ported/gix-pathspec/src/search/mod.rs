@@ -105,3 +105,5 @@ pub(crate) struct Spec {
 }
 
 mod matching;
+/// git's graded pathspec matcher and the directory-walk helpers built on its items.
+pub mod git_match;

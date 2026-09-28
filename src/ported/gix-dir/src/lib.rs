@@ -67,3 +67,6 @@ pub mod entry;
 ///
 pub mod walk;
 pub use walk::function::walk;
+
+/// git's `read_directory()` walk, driven by `DIR_*` flags.
+pub mod read_directory;

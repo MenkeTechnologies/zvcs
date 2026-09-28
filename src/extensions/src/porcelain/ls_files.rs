@@ -823,6 +823,30 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
     )?;
 
+    // ```c
+    // if (recurse_submodules)
+    //         max_prefix = NULL;
+    // else
+    //         max_prefix = common_prefix(&pathspec);
+    // max_prefix_len = get_common_prefix_len(max_prefix);
+    //
+    // prune_index(repo->index, max_prefix, max_prefix_len);
+    // ```
+    //
+    // (builtin/ls-files.c:744-750.) Every entry outside the directory all
+    // pathspec items share is dropped before anything reads the index — the
+    // directory walk included, so `-k -- sub/missing/` finds no index directory
+    // at `sub` and never tries to open `sub/missing/`. `get_common_prefix_len()`
+    // strips the trailing `/` so a submodule named by the prefix survives
+    // (builtin/ls-files.c:526-543).
+    if !opts.recurse_submodules {
+        let max_prefix = ps.search().git_common_prefix();
+        let max_prefix = max_prefix.strip_suffix(b"/").unwrap_or(&max_prefix).to_vec();
+        if !max_prefix.is_empty() {
+            index.remove_entries(|_, path, _| !path.starts_with(&max_prefix));
+        }
+    }
+
     // The exclude stack git assembles from `-x`, `-X` and `--exclude-standard`.
     // `-x`/`-X` become the highest-priority override group (git's `EXC_CMDL`);
     // `--exclude-standard` adds `info/exclude`, `core.excludesFile` and the
@@ -830,19 +854,9 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // ignore files are consulted, exactly like git.
     let mut matcher = Excludes::build(&repo, &index, &opts)?;
 
-    // git runs `fill_directory` for `-o` *or* `-k`; both read the same collected
-    // entry list. For `-k` without `-o` git also sets `DIR_COLLECT_KILLED_ONLY`,
-    // which prunes directories the index has nothing at or below — nothing under
-    // such a directory can ever be killed, so skipping that pruning costs walk
-    // time but cannot change which entries the killed test keeps.
     let walk = opts.others || opts.killed;
-    let worktree = if walk || opts.modified || opts.deleted {
-        // git shows empty untracked directories (`dir/`) under `--directory` by
-        // default; `--no-empty-directory` suppresses them. gix's walk hides them
-        // unless `emit_empty_directories` is set, so enable it to match git's
-        // default whenever a collapsed `--directory` walk is in play.
-        let emit_empty = walk && opts.directory && !opts.hide_empty_dir;
-        Some(collect_worktree(&repo, walk, emit_empty)?)
+    let worktree = if opts.modified || opts.deleted {
+        Some(collect_worktree(&repo)?)
     } else {
         None
     };
@@ -877,169 +891,101 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
 
     // Phase 1: the directory walk, exactly as git emits it before touching the
     // index — every `? ` line first (`show_other_files`), then every `K ` line
-    // (`show_killed_files`), both drawn from the same collected entry list.
+    // (`show_killed_files`), both drawn from the same `dir->entries`.
+    //
+    // ```c
+    // if (show_others || show_killed) {
+    //         if (!show_others)
+    //                 dir->flags |= DIR_COLLECT_KILLED_ONLY;
+    //         fill_directory(dir, repo->index, &pathspec);
+    // ```
+    //
+    // (builtin/ls-files.c:407-410.) `-i`, `--directory` and
+    // `--[no-]empty-directory` are `OPT_BIT`s straight onto `dir.flags`
+    // (builtin/ls-files.c:618-631); the walk's own verdicts — which untracked
+    // directory is listed whole, which ignored path is listed at all — come from
+    // `treat_directory()` under those flags.
     if walk {
-        if let Some(state) = &worktree {
-            // The pathspec is matched against the bare path; the trailing slash
-            // that `--directory` prints is presentation only. The candidate set is
-            // untracked ∪ ignored so our own exclude stack — not gix's `.gitignore`
-            // classification — decides which to keep.
-            let walked: Vec<(BString, bool)> = state
-                .others
-                .iter()
-                .filter(|(path, is_dir)| ps.is_included(path.as_bstr(), Some(*is_dir)))
-                .cloned()
-                .collect();
-            let mut candidates: Vec<(BString, bool)> = walked
-                .iter()
-                .map(|(path, is_dir)| {
-                    if opts.directory {
-                        collapse_other_directory(&index, ps.search(), path.as_bstr(), *is_dir)
-                    } else {
-                        (path.clone(), *is_dir)
-                    }
-                })
-                .collect();
-            // ```c
-            // static int cmp_dir_entry(const void *p1, const void *p2)
-            // {
-            //         const struct dir_entry *e1 = *(const struct dir_entry **)p1;
-            //         const struct dir_entry *e2 = *(const struct dir_entry **)p2;
-            //
-            //         return name_compare(e1->name, e1->len, e2->name, e2->len);
-            // }
-            // ```
-            //
-            // (dir.c.) The names `QSORT(dir->entries, ...)` orders are the ones
-            // `dir_add_name()` stored, and a directory's was stored *with* its
-            // trailing `/` — `treat_directory()` pushes the slash onto the path
-            // before adding it. So the slash takes part in the comparison, and
-            // `path2-junk` sorts before `path2/` because `-` (0x2D) is below `/`
-            // (0x2F), while the bare names would put `path2` first. Sorting the
-            // slashless form is a different order whenever a sibling's name
-            // begins with a byte between `.` and `/`.
-            candidates.sort_by(|a, b| dir_entry_name(a).cmp(&dir_entry_name(b)));
-            candidates.dedup();
+        use gix::dir::read_directory::{
+            DIR_COLLECT_KILLED_ONLY, DIR_HIDE_EMPTY_DIRECTORIES, DIR_SHOW_IGNORED,
+            DIR_SHOW_OTHER_DIRECTORIES,
+        };
+        let mut flags = 0;
+        if opts.ignored {
+            flags |= DIR_SHOW_IGNORED;
+        }
+        if opts.directory {
+            flags |= DIR_SHOW_OTHER_DIRECTORIES;
+        }
+        if opts.hide_empty_dir {
+            flags |= DIR_HIDE_EMPTY_DIRECTORIES;
+        }
+        if !opts.others {
+            flags |= DIR_COLLECT_KILLED_ONLY;
+        }
+        let entries = repo
+            .fill_directory(&index, &mut ps, flags, &mut |path, is_dir| {
+                matcher.is_excluded(path, is_dir)
+            })?
+            .entries;
 
-            // `DIR_HIDE_EMPTY_DIRECTORIES` (`--no-empty-directory`). A collapsed
-            // directory is only reported if `read_directory_recursive()` found
-            // something under it to report; otherwise `treat_directory()` leaves
-            // the state at `path_none` and nothing is emitted:
-            //
-            // ```c
-            // if (state == path_none && !(dir->flags & DIR_HIDE_EMPTY_DIRECTORIES))
-            //         state = excluded ? path_excluded : path_untracked;
-            // ```
-            // (dir.c:2091-2092)
-            //
-            // "Something to report" is a path below it that survives the same
-            // exclude verdict this listing keeps, so a directory holding nothing
-            // but ignored files is as empty as one holding no files at all. A
-            // directory the walk emitted in its own right — a nested repository,
-            // or an empty directory under the default `--empty-directory` — is
-            // never subject to this, exactly as `treat_directory()` returns those
-            // before it ever recurses.
-            let mut nonempty: HashSet<BString> = HashSet::new();
-            if opts.directory && opts.hide_empty_dir {
-                for (path, is_dir) in &walked {
-                    if *is_dir {
-                        nonempty.insert(path.clone());
-                        continue;
-                    }
-                    if matcher.is_excluded(path.as_bstr(), false) != opts.ignored {
-                        continue;
-                    }
-                    for (at, _) in path.iter().enumerate().filter(|(_, b)| **b == b'/') {
-                        nonempty.insert(BString::from(&path[..at]));
-                    }
+        // ```c
+        // static int dir_path_match(struct index_state *istate, const struct dir_entry *ent,
+        //                           const struct pathspec *pathspec, int prefix, char *seen)
+        // {
+        //         int has_trailing_dir = ent->len && ent->name[ent->len - 1] == '/';
+        //         int len = has_trailing_dir ? ent->len - 1 : ent->len;
+        //         return match_pathspec(istate, pathspec, ent->name, len, prefix, seen, has_trailing_dir);
+        // }
+        // ```
+        //
+        // (dir.h:585-594.) `show_dir_entry()` runs this for every line it prints,
+        // and that is the *only* thing that sets `ps_matched` for a `-o`/`-k`
+        // listing: the trailing `/` is dropped and re-offered as the `is_dir` flag.
+        let mut mark = |ps: &mut gix::Pathspec<'_>, name: &BStr| {
+            let is_dir = name.last() == Some(&b'/');
+            let bare = if is_dir { &name[..name.len() - 1] } else { &name[..] };
+            if let Some(m) = ps.pattern_matching_relative_path(bare.as_bstr(), Some(is_dir)) {
+                if !m.is_excluded() {
+                    matched.insert(m.sequence_number);
                 }
             }
-            // `-i` keeps only excluded paths; the default keeps only the rest.
-            // This is the whole of git's `dir->entries`, so `-o` and `-k` share it.
-            // A directory entry carries git's trailing `/` in its very name, which
-            // both the killed test and the printed line depend on.
-            //
-            // Not covered: `-i --directory`'s roll-up of a directory whose whole
-            // subtree is ignored. `treat_directory()` turns that into a
-            // `path_excluded` for the directory itself and then pops the ignored
-            // paths it collected below — all but the first, because the loop starts
-            // at `old_ignored_nr + 1` (dir.c:2070-2074) — so stock reports the
-            // directory *and* one nested level. This listing reports the individual
-            // files instead. Reproducing it needs git's recursive state machine,
-            // not a post-filter over a flat walk.
-            let entries: Vec<BString> = candidates
-                .into_iter()
-                .filter(|(path, is_dir)| matcher.is_excluded(path.as_bstr(), *is_dir) == opts.ignored)
-                .filter(|(path, is_dir)| {
-                    !(*is_dir && opts.directory && opts.hide_empty_dir) || nonempty.contains(path)
-                })
-                .map(|(mut name, is_dir)| {
-                    if is_dir {
-                        name.push(b'/');
-                    }
-                    name
-                })
-                .collect();
+        };
 
-            // ```c
-            // static int dir_path_match(struct index_state *istate, const struct dir_entry *ent,
-            //                           const struct pathspec *pathspec, int prefix, char *seen)
-            // {
-            //         int has_trailing_dir = ent->len && ent->name[ent->len - 1] == '/';
-            //         int len = has_trailing_dir ? ent->len - 1 : ent->len;
-            //         return match_pathspec(istate, pathspec, ent->name, len, prefix, seen, has_trailing_dir);
-            // }
-            // ```
-            //
-            // (builtin/ls-files.c.) `show_dir_entry()` runs this for every line it
-            // prints, and that is the *only* thing that sets `ps_matched` for a
-            // `-o`/`-k` listing: the trailing `/` is dropped and re-offered as the
-            // `is_dir` flag.
-            let mut mark = |ps: &mut gix::Pathspec<'_>, name: &BStr| {
-                let is_dir = name.last() == Some(&b'/');
-                let bare = if is_dir { &name[..name.len() - 1] } else { &name[..] };
-                if let Some(m) = ps.pattern_matching_relative_path(bare.as_bstr(), Some(is_dir)) {
-                    if !m.is_excluded() {
-                        matched.insert(m.sequence_number);
-                    }
-                }
-            };
-
-            if opts.others {
-                // `show_other_files` drops anything the index already knows under
-                // that name; `show_killed_files` below deliberately does not.
-                for name in entries.iter().filter(|n| index_name_is_other(&index, n.as_bstr())) {
-                    mark(&mut ps, name.as_bstr());
-                    let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
-                    lines.push(render(
-                        &opts,
-                        "? ",
-                        None,
-                        &repo,
-                        name.as_bstr(),
-                        &display,
-                        quote,
-                        terminator,
-                        eol.as_mut(),
-                    ));
-                }
+        if opts.others {
+            // `show_other_files` drops anything the index already knows under
+            // that name; `show_killed_files` below deliberately does not.
+            for name in entries.iter().filter(|n| index_name_is_other(&index, n.as_bstr())) {
+                mark(&mut ps, name.as_bstr());
+                let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
+                lines.push(render(
+                    &opts,
+                    "? ",
+                    None,
+                    &repo,
+                    name.as_bstr(),
+                    &display,
+                    quote,
+                    terminator,
+                    eol.as_mut(),
+                ));
             }
-            if opts.killed {
-                for name in entries.iter().filter(|n| is_killed(&index, n.as_bstr())) {
-                    mark(&mut ps, name.as_bstr());
-                    let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
-                    lines.push(render(
-                        &opts,
-                        "K ",
-                        None,
-                        &repo,
-                        name.as_bstr(),
-                        &display,
-                        quote,
-                        terminator,
-                        eol.as_mut(),
-                    ));
-                }
+        }
+        if opts.killed {
+            for name in entries.iter().filter(|n| is_killed(&index, n.as_bstr())) {
+                mark(&mut ps, name.as_bstr());
+                let display = strip_prefix(name.as_bstr(), prefix.as_ref()).to_vec();
+                lines.push(render(
+                    &opts,
+                    "K ",
+                    None,
+                    &repo,
+                    name.as_bstr(),
+                    &display,
+                    quote,
+                    terminator,
+                    eol.as_mut(),
+                ));
             }
         }
     }
@@ -1657,7 +1603,7 @@ impl<'repo> Excludes<'repo> {
     }
 }
 
-/// Worktree-derived facts needed by `-o`, `-m` and `-d`.
+/// Worktree-derived facts needed by `-m` and `-d`.
 struct Worktree {
     /// Tracked paths whose worktree file is gone.
     removed: HashSet<BString>,
@@ -1666,22 +1612,10 @@ struct Worktree {
     /// Paths carrying higher-stage (conflicted) entries; gitoxide folds their
     /// up-to-three stages into one status, so they are re-checked per entry.
     conflicted: HashSet<BString>,
-    /// Every path the directory walk turned up — untracked *and* gix-ignored —
-    /// each flagged as a directory or not (`--directory` prints collapsed
-    /// directories with a `/`). This is git's `dir->entries` before its own
-    /// exclude verdict is applied: gix's `.gitignore` classification is discarded
-    /// because git consults no on-disk ignore file unless asked to, and the
-    /// `-x`/`-X`/`--exclude-per-directory` patterns it is asked to use can differ
-    /// from `.gitignore` entirely.
-    others: Vec<(BString, bool)>,
 }
 
 /// Run one index↔worktree status pass and bucket the result.
-fn collect_worktree(
-    repo: &gix::Repository,
-    others: bool,
-    emit_empty: bool,
-) -> Result<Worktree> {
+fn collect_worktree(repo: &gix::Repository) -> Result<Worktree> {
     use gix::status::index_worktree::Item;
     use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 
@@ -1689,38 +1623,11 @@ fn collect_worktree(
         removed: HashSet::new(),
         modified: HashSet::new(),
         conflicted: HashSet::new(),
-        others: Vec::new(),
     };
 
-    // Always ask for individual files. `--directory` collapsing is git's own
-    // index-driven rule, applied by the caller over the full path list; gix's
-    // `Collapsed` mode decides it from what is tracked *and present*, which
-    // differs whenever a tracked file below the directory has been deleted.
-    let untracked = if others {
-        gix::status::UntrackedFiles::Files
-    } else {
-        gix::status::UntrackedFiles::None
-    };
-
-    // Pathspec filtering is applied by the caller against every candidate, so the
-    // walk itself stays unrestricted and cannot narrow the set incorrectly.
-    let mut platform = repo
+    let platform = repo
         .status(gix::progress::Discard)?
-        .untracked_files(untracked);
-    // gix hides `.gitignore`-matched paths from the walk, but git's walk only
-    // hides what the *caller's* exclude configuration matches, so ask for the
-    // ignored entries too and let [`Excludes`] deliver the single verdict.
-    // `emit_empty` surfaces empty untracked directories so `--directory` can show
-    // them like git's default.
-    if others {
-        platform = platform.dirwalk_options(move |mut o| {
-            o = o.emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
-            if emit_empty {
-                o = o.emit_empty_directories(true);
-            }
-            o
-        });
-    }
+        .untracked_files(gix::status::UntrackedFiles::None);
     for item in platform.into_index_worktree_iter(Vec::<BString>::new())? {
         match item? {
             Item::Modification {
@@ -1743,74 +1650,10 @@ fn collect_worktree(
                 // A racy entry that only needs its stat data refreshed is unchanged.
                 EntryStatus::NeedsUpdate(_) => {}
             },
-            Item::DirectoryContents { entry, .. } => {
-                let is_dir = matches!(
-                    entry.disk_kind,
-                    Some(gix::dir::entry::Kind::Directory)
-                        | Some(gix::dir::entry::Kind::Repository)
-                );
-                match entry.status {
-                    gix::dir::entry::Status::Untracked => {
-                        out.others.push((entry.rela_path, is_dir));
-                    }
-                    // gix stops at a directory its `.gitignore` rules exclude and
-                    // reports just that directory. git's walk has no such rules
-                    // unless the caller supplied them, so recover the contents it
-                    // would have collected.
-                    gix::dir::entry::Status::Ignored(_) => {
-                        let plain_dir = matches!(
-                            entry.disk_kind,
-                            Some(gix::dir::entry::Kind::Directory)
-                        );
-                        match repo.workdir().filter(|_| plain_dir) {
-                            Some(root) => {
-                                expand_ignored_dir(root, entry.rela_path.as_bstr(), &mut out.others);
-                            }
-                            None => out.others.push((entry.rela_path, is_dir)),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Item::Rewrite { .. } => {}
+            Item::DirectoryContents { .. } | Item::Rewrite { .. } => {}
         }
     }
     Ok(out)
-}
-
-/// Collect the paths git's `read_directory_recursive` would have gathered under
-/// `rela`, which gix handed over as one collapsed ignored directory.
-///
-/// Mirrors what that walk does with a `readdir` result: `.git` is never
-/// descended, a nested repository is reported as the directory itself, a symlink
-/// counts as a file rather than a directory to recurse into, and an empty
-/// directory contributes nothing.
-fn expand_ignored_dir(root: &Path, rela: &BStr, out: &mut Vec<(BString, bool)>) {
-    let dir = root.join(gix::path::from_bstr(rela));
-    let Ok(read) = std::fs::read_dir(&dir) else {
-        out.push((rela.to_owned(), true));
-        return;
-    };
-    for entry in read.flatten() {
-        let name = gix::path::into_bstr(PathBuf::from(entry.file_name())).into_owned();
-        if name == ".git" {
-            continue;
-        }
-        let mut child = BString::from(rela.to_vec());
-        child.push(b'/');
-        child.extend_from_slice(&name);
-        // `file_type` does not follow symlinks, so a symlink to a directory is a
-        // file here, exactly as `DT_LNK` is for git.
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            if dir.join(entry.file_name()).join(".git").exists() {
-                out.push((child, true));
-            } else {
-                expand_ignored_dir(root, child.as_bstr(), out);
-            }
-        } else {
-            out.push((child, false));
-        }
-    }
 }
 
 /// Decide `(deleted, modified)` for one index entry, the way git's per-entry
@@ -1892,213 +1735,6 @@ fn index_name_is_other(index: &gix::index::State, name: &BStr) -> bool {
         .entries()
         .get(pos)
         .is_some_and(|e| e.path(index).as_bytes() == bytes)
-}
-
-/// git's `directory_exists_in_index` reduced to its `index_directory` verdict:
-/// does the index hold anything *below* `dir`? Names sort bytewise and `dir/`
-/// sorts before every path under it, so the first entry at or after `dir/` is the
-/// only one that can carry that prefix.
-fn index_has_directory(index: &gix::index::State, dir: &[u8]) -> bool {
-    let mut probe = dir.to_vec();
-    probe.push(b'/');
-    let pos = match index_name_pos(index, &probe) {
-        Ok(pos) | Err(pos) => pos,
-    };
-    index
-        .entries()
-        .get(pos)
-        .is_some_and(|e| e.path(index).as_bytes().starts_with(&probe))
-}
-
-/// The name `dir_add_name()` stored for one walked entry: a directory carries
-/// the trailing `/` that `treat_directory()` appended before adding it, and that
-/// slash is part of every comparison `cmp_dir_entry()` makes (dir.c).
-fn dir_entry_name((path, is_dir): &(BString, bool)) -> BString {
-    let mut name = path.clone();
-    if *is_dir {
-        name.push(b'/');
-    }
-    name
-}
-
-/// git's `MATCHED_*` ladder (dir.h:388-391). `do_match_pathspec()` keeps the
-/// *largest* verdict across the pathspec items (`if (retval < how) retval = how`,
-/// dir.c:575-576), so the constants' order is part of the semantics.
-const MATCHED_RECURSIVELY: u8 = 1;
-const MATCHED_RECURSIVELY_LEADING_PATHSPEC: u8 = 2;
-const MATCHED_FNMATCH: u8 = 3;
-const MATCHED_EXACTLY: u8 = 4;
-
-/// `simple_length()` (pathspec.c): the byte count before the first glob-special
-/// character, which `init_pathspec_item()` stores as `item->nowildcard_len`. A
-/// `:(literal)` pathspec has no wildcards at all, so the whole path counts.
-fn nowildcard_len(pat: &gix::pathspec::Pattern) -> usize {
-    if pat.search_mode == gix::pathspec::SearchMode::Literal {
-        return pat.path().len();
-    }
-    pat.path()
-        .iter()
-        .position(|b| matches!(b, b'*' | b'?' | b'[' | b'\\'))
-        .unwrap_or_else(|| pat.path().len())
-}
-
-/// `match_pathspec_item()` (dir.c:387-489) for one item, under the flags
-/// `treat_directory()` passes — `DO_MATCH_LEADING_PATHSPEC` and nothing else
-/// (dir.c:1999-2005), so the `DO_MATCH_DIRECTORY` arm is out of reach. `name` is
-/// the repository-relative directory path *with* its trailing `/`, which is what
-/// `treat_path()` hands down, and `prefix` is 0 for this call.
-///
-/// `git_fnmatch()` runs `wildmatch()` without `WM_PATHNAME` unless the item
-/// carries `:(glob)` magic (dir.c's `git_fnmatch`, pathspec's `PATHSPEC_GLOB`),
-/// so a plain `*` crosses `/`. Its `PATHSPEC_ONESTAR` shortcut — a single `*`
-/// with no wildcard after it, compared as a suffix — reaches the same verdict as
-/// the `wildmatch()` it stands in for, so only the general path is ported.
-fn pathspec_item_how(pat: &gix::pathspec::Pattern, name: &[u8]) -> u8 {
-    // `if (!*match) return MATCHED_RECURSIVELY;` — "the match was just the prefix".
-    if pat.always_matches() || pat.path().is_empty() {
-        return MATCHED_RECURSIVELY;
-    }
-    let m: &[u8] = pat.path();
-    let matchlen = m.len();
-    let namelen = name.len();
-    let icase = pat.signature.contains(gix::pathspec::MagicSignature::ICASE);
-    let eq = |a: &[u8], b: &[u8]| {
-        if icase {
-            a.eq_ignore_ascii_case(b)
-        } else {
-            a == b
-        }
-    };
-
-    if matchlen <= namelen && eq(m, &name[..matchlen]) {
-        if matchlen == namelen {
-            return MATCHED_EXACTLY;
-        }
-        if m[matchlen - 1] == b'/' || name[matchlen] == b'/' {
-            return MATCHED_RECURSIVELY;
-        }
-    }
-
-    let nowild = nowildcard_len(pat);
-    if nowild < matchlen {
-        let mode = match pat.search_mode {
-            gix::pathspec::SearchMode::PathAwareGlob => {
-                gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL
-            }
-            _ => gix::glob::wildmatch::Mode::empty(),
-        } | if icase {
-            gix::glob::wildmatch::Mode::IGNORE_CASE
-        } else {
-            gix::glob::wildmatch::Mode::empty()
-        };
-        if gix::glob::wildmatch(m.as_bstr(), name.as_bstr(), mode) {
-            return MATCHED_FNMATCH;
-        }
-    }
-
-    // ```c
-    // /* name is a literal prefix of the pathspec */
-    // int offset = name[namelen-1] == '/' ? 1 : 0;
-    // if ((namelen < matchlen) && (match[namelen-offset] == '/') &&
-    //     !ps_strncmp(item, match, name, namelen))
-    //         return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
-    // ```
-    //
-    // (dir.c:457-464.) This is the verdict that makes `treat_directory()` recurse
-    // rather than collapse: the pathspec names something strictly below `name`.
-    let offset = usize::from(name.last() == Some(&b'/'));
-    if namelen < matchlen && m.get(namelen - offset) == Some(&b'/') && eq(&m[..namelen], name) {
-        return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
-    }
-
-    // `ps_strncmp(item, match, name, item->nowildcard_len - prefix)`: a `strncmp`,
-    // so a `name` shorter than the fixed prefix stops at its NUL and mismatches.
-    if nowild < matchlen {
-        if namelen < nowild || !eq(&m[..nowild], &name[..nowild]) {
-            return 0;
-        }
-        // "Here is where we would perform a wildmatch to check if name can be
-        // matched as a directory (or a prefix) against the pathspec. Since
-        // wildmatch doesn't have this capability at the present we have to punt
-        // and say that it is a match, potentially returning a false positive."
-        return MATCHED_RECURSIVELY_LEADING_PATHSPEC;
-    }
-    0
-}
-
-/// `match_pathspec_with_flags(..., DO_MATCH_LEADING_PATHSPEC)` as
-/// `treat_directory()` calls it (dir.c:1999-2005): the strongest verdict any
-/// positive item reaches, or `MATCHED_RECURSIVELY` when there is no pathspec at
-/// all (`if (!ps->nr) return MATCHED_RECURSIVELY`, dir.c:530-534).
-///
-/// The negative (`:(exclude)`) pass is not repeated here: this verdict is only
-/// consulted to decide *how deep* to collapse a directory that the listing has
-/// already kept, and the exclude pass can only turn a kept path into a dropped
-/// one, which the per-entry filter does on its own.
-fn pathspec_how(search: &gix::pathspec::Search, name: &[u8]) -> u8 {
-    let mut retval = 0u8;
-    let mut any = false;
-    for pat in search.patterns() {
-        if pat.is_excluded() {
-            continue;
-        }
-        any = true;
-        let how = pathspec_item_how(pat, name);
-        if how > retval {
-            retval = how;
-        }
-    }
-    if !any {
-        return MATCHED_RECURSIVELY;
-    }
-    retval
-}
-
-/// git's `treat_directory` under `DIR_SHOW_OTHER_DIRECTORIES` (`--directory`): a
-/// walked path is reported as the outermost of its parent directories the index
-/// knows nothing below. A directory the index does have entries under is recursed
-/// into instead, which is why a path such as `a/b/deep` survives uncollapsed while
-/// `a/b/c.txt` is still tracked — even when that tracked file is gone from disk.
-fn collapse_other_directory(
-    index: &gix::index::State,
-    search: &gix::pathspec::Search,
-    path: &BStr,
-    is_dir: bool,
-) -> (BString, bool) {
-    let bytes = path.as_bytes();
-    let mut at = 0;
-    while let Some(off) = bytes[at..].iter().position(|&b| b == b'/') {
-        let cut = at + off;
-        if index_has_directory(index, &bytes[..cut]) {
-            at = cut + 1;
-            continue;
-        }
-        // ```c
-        // /*
-        //  * If we have a pathspec which could match something _below_ this
-        //  * directory (e.g. when checking 'subdir/' having a pathspec like
-        //  * 'subdir/some/deep/path/file' or 'subdir/widget-*.c'), then we
-        //  * need to recurse.
-        //  */
-        // if (matches_how == MATCHED_RECURSIVELY_LEADING_PATHSPEC)
-        //         return path_recurse;
-        // ```
-        //
-        // (`treat_directory()`, dir.c:2074-2081.) `--directory` collapses a wholly
-        // untracked directory only where the pathspec is satisfied *by the
-        // directory*; where it names something strictly below, the walk keeps
-        // descending — which is why `ls-files -o --directory untracked/deep/`
-        // reports `untracked/deep/` rather than `untracked/`. The name carries its
-        // trailing `/` because that is the form `treat_path()` passes down.
-        let mut dirname = bytes[..cut].to_vec();
-        dirname.push(b'/');
-        if pathspec_how(search, &dirname) == MATCHED_RECURSIVELY_LEADING_PATHSPEC {
-            at = cut + 1;
-            continue;
-        }
-        return (BString::from(&bytes[..cut]), true);
-    }
-    (path.to_owned(), is_dir)
 }
 
 /// Port of the predicate inside git's `show_killed_files()`, applied to one

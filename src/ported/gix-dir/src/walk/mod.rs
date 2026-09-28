@@ -323,4 +323,4 @@ pub enum Error {
 
 mod classify;
 pub(crate) mod function;
-mod readdir;
+pub(crate) mod readdir;

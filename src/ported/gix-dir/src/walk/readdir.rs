@@ -155,7 +155,7 @@ pub(super) fn recursive(
 
 /// The bare `strerror` text git's `warning_errno()` prints. Rust appends its own
 /// `(os error N)`, which git never shows, so it is trimmed off.
-fn errno_text(err: &std::io::Error) -> String {
+pub(crate) fn errno_text(err: &std::io::Error) -> String {
     let text = err.to_string();
     match text.find(" (os error ") {
         Some(cut) => text[..cut].to_string(),

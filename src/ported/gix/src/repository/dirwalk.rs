@@ -114,6 +114,51 @@ impl Repository {
         })
     }
 
+    /// git's `fill_directory()` (dir.c:272-294): walk the worktree the way
+    /// `ls-files -o`, `status` and `clean` do, returning `dir->entries` and
+    /// `dir->ignored` as the `flags` (the `gix_dir::read_directory::DIR_*`
+    /// constants) decide them.
+    ///
+    /// `is_excluded(path, is_dir)` is git's `is_excluded()` against whatever
+    /// exclude lists the command set up; `pathspec` narrows the walk.
+    pub fn fill_directory(
+        &self,
+        index: &gix_index::State,
+        pathspec: &mut crate::Pathspec<'_>,
+        flags: u32,
+        is_excluded: &mut dyn FnMut(&BStr, bool) -> bool,
+    ) -> Result<gix_dir::read_directory::Outcome, dirwalk::Error> {
+        let workdir = self.workdir().ok_or(dirwalk::Error::MissingWorkDir)?;
+        let git_dir_realpath =
+            crate::path::realpath_opts(self.git_dir(), self.current_dir(), crate::path::realpath::MAX_SYMLINKS)?;
+        let fs_caps = self.filesystem_options()?;
+        let accelerate_lookup = fs_caps.ignore_case.then(|| index.prepare_icase_backing());
+        let stack = &mut pathspec.stack;
+        let objects = &self.objects;
+        let mut attributes = |relative_path: &BStr,
+                              case: gix_glob::pattern::Case,
+                              is_dir: bool,
+                              out: &mut gix_pathspec::attributes::search::Outcome| {
+            let stack = stack
+                .as_mut()
+                .expect("can only be called if attributes are used in patterns");
+            stack
+                .set_case(case)
+                .at_entry(relative_path, Some(is_dir_to_mode(is_dir)), objects)
+                .is_ok_and(|platform| platform.matching_attributes(out))
+        };
+        let mut ctx = gix_dir::read_directory::Context {
+            index,
+            ignore_case: accelerate_lookup.as_ref(),
+            pathspec: &mut pathspec.search,
+            pathspec_attributes: &mut attributes,
+            is_excluded,
+            git_dir_realpath: git_dir_realpath.as_ref(),
+            precompose_unicode: fs_caps.precompose_unicode,
+        };
+        Ok(gix_dir::read_directory::fill_directory(workdir, flags, &mut ctx))
+    }
+
     /// Create an iterator over a running traversal, which stops if the iterator is dropped. All arguments
     /// are the same as in [`dirwalk()`](Self::dirwalk).
     ///

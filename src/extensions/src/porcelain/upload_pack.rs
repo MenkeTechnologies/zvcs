@@ -2107,8 +2107,9 @@ struct FetchArgs {
     wants: Vec<ObjectId>,
     /// `want-ref <ref>`, answered with a `wanted-refs` section.
     wanted_refs: Vec<(String, ObjectId)>,
-    /// The `have` ids this repository actually has — git's `have_obj`, which is
-    /// what gets ACKed. A `have` for an object we lack is counted but not kept.
+    /// git's `have_obj`, which is what gets ACKed: the `have` ids this repository
+    /// has and that no earlier have had already marked `THEY_HAVE`. A `have` for
+    /// an object we lack is counted but not kept.
     haves: Vec<ObjectId>,
     /// `data->seen_haves`: whether any `have` line arrived at all, however
     /// useless, which is what decides between the ack round and the pack.
@@ -2214,12 +2215,13 @@ fn process_fetch_args(
             }
         }
 
-        // `parse_have()`: only ids we have join `have_obj`, but any `have` line
-        // sets `seen_haves`.
+        // `parse_have()`: any `have` line sets `seen_haves`, and `got_oid()`
+        // puts an id we have in `have_obj` unless an earlier have already
+        // marked it `THEY_HAVE` — as the parent of that have, or itself.
         if let Some(hex) = arg.strip_prefix("have ") {
             args.seen_haves = true;
             if let Ok(id) = ObjectId::from_hex(hex.as_bytes()) {
-                if repo.find_object(id).is_ok() && !args.haves.contains(&id) {
+                if repo.find_object(id).is_ok() && do_got_oid(repo, id) {
                     args.haves.push(id);
                 }
             }
@@ -2326,6 +2328,29 @@ fn process_haves_and_send_acks(
     Ok(false)
 }
 
+std::thread_local! {
+    /// The objects carrying git's `THEY_HAVE` flag. Object flags live as long as
+    /// the process, so the marks one `command=fetch` request left are still set
+    /// when the next request on the same connection arrives.
+    static THEY_HAVE: std::cell::RefCell<std::collections::HashSet<ObjectId>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// `do_got_oid()` (upload-pack.c:522-549): mark a commit's parents `THEY_HAVE`,
+/// then report whether the have itself was not yet marked — the only case in
+/// which it joins `have_obj` and is ACKed.
+fn do_got_oid(repo: &gix::Repository, id: ObjectId) -> bool {
+    THEY_HAVE.with(|set| {
+        let mut set = set.borrow_mut();
+        if let Ok(commit) = repo.find_commit(id) {
+            for parent in commit.parent_ids() {
+                set.insert(parent.detach());
+            }
+        }
+        set.insert(id)
+    })
+}
+
 /// `ok_to_give_up()` (upload-pack.c:561-571): negotiation can stop once every
 /// `want` can reach one of the objects the client said it has, i.e. once the
 /// common history is deep enough to cut the pack at.
@@ -2333,11 +2358,14 @@ fn ok_to_give_up(repo: &gix::Repository, args: &FetchArgs) -> bool {
     if args.haves.is_empty() {
         return false;
     }
+    // `can_all_from_reach_with_flag(&data->want_obj, THEY_HAVE, ...)`: any object
+    // carrying the flag will do, not only the ones that were ACKed.
+    let they_have: Vec<ObjectId> = THEY_HAVE.with(|set| set.borrow().iter().copied().collect());
     args.wants.iter().all(|want| {
         let Some(want) = peel_to_commit(repo, *want) else {
             return false;
         };
-        args.haves.iter().any(|have| {
+        they_have.iter().any(|have| {
             // `have` is an ancestor of `want` exactly when it is their merge base.
             repo.merge_base(want, *have)
                 .map(|base| base.detach() == *have)

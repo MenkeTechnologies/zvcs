@@ -2563,7 +2563,12 @@ fn report<'a>(
                 // `print_one_push_status()`: a refusal that came back from the
                 // server is `[remote rejected]`; one this side decided is
                 // `[rejected]`. Both are padded to `TRANSPORT_SUMMARY_WIDTH`.
-                let label = if s.remote_rejected {
+                // A command the server never answered is still
+                // `REF_STATUS_EXPECTING_REPORT`: `print_ref_status('!',
+                // "[remote failure]", …)` (transport.c:793-798).
+                let label = if s.missing_report {
+                    "! [remote failure] "
+                } else if s.remote_rejected {
                     "! [remote rejected]"
                 } else {
                     "! [rejected]       "
@@ -2776,7 +2781,11 @@ fn report_porcelain<'a>(
             Err(reason) => {
                 any_failed = true;
                 rejected.push((s.name.as_str(), reason.as_str()));
-                let label = if s.remote_rejected { "[remote rejected]" } else { "[rejected]" };
+                let label = match (s.missing_report, s.remote_rejected) {
+                    (true, _) => "[remote failure]",
+                    (false, true) => "[remote rejected]",
+                    (false, false) => "[rejected]",
+                };
                 // `print_ref_status()` in porcelain form: `<from>:<to>`, or `:<to>`
                 // when `from` is `NULL` (transport.c:632-636).
                 let refpair = match s.rejected_from() {

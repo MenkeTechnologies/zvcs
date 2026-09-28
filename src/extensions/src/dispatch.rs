@@ -1359,6 +1359,48 @@ fn stash_ref_exists(repo: &gix::Repository) -> bool {
     repo.try_find_reference("refs/stash").ok().flatten().is_some()
 }
 
+/// The entries of git.c's `commands[]` flagged `RUN_SETUP` (not `_GENTLY`).
+const RUN_SETUP_VERBS: &[&str] = &[
+    "add", "am", "annotate", "backfill", "bisect", "blame", "branch", "cat-file",
+    "check-attr", "check-ignore", "check-mailmap", "checkout", "cherry", "cherry-pick",
+    "clean", "commit", "commit-graph", "commit-tree", "count-objects", "describe",
+    "diff-files", "diff-index", "diff-pairs", "diff-tree", "fast-export", "fast-import",
+    "fetch", "fetch-pack", "fmt-merge-msg", "for-each-ref", "format-patch", "format-rev",
+    "fsck", "fsck-objects", "fsmonitor--daemon", "gc", "history", "last-modified", "log",
+    "ls-files", "ls-tree", "maintenance", "merge", "merge-base", "merge-index", "merge-ours",
+    "merge-recursive", "merge-recursive-ours", "merge-recursive-theirs", "merge-subtree",
+    "merge-tree", "mktag", "mktree", "multi-pack-index", "mv", "name-rev", "notes",
+    "pack-objects", "pack-redundant", "pack-refs", "pickaxe", "prune", "prune-packed", "pull",
+    "push", "range-diff", "read-tree", "rebase", "reflog", "refs", "remote", "repack",
+    "replace", "replay", "repo", "rerere", "reset", "restore", "rev-list", "revert", "rm",
+    "send-pack", "show", "show-branch", "show-ref", "sparse-checkout", "stage", "stash",
+    "status", "submodule--helper", "switch", "symbolic-ref", "tag", "unpack-file",
+    "unpack-objects", "update-index", "update-ref", "update-server-info", "verify-commit",
+    "verify-tag", "whatchanged", "worktree", "write-tree",
+];
+
+/// `run_builtin()`'s `setup_git_directory()` for a `RUN_SETUP` builtin (git.c:474-481):
+/// with no repository it dies "not a git repository" before the builtin parses a
+/// single option — so `git update-ref --bogus` outside one is that fatal at 128,
+/// not the option's usage error at 129. A lone `-h` or `--help-all` demotes the
+/// setup to gentle, and `--help` never gets here (`handle_builtin()` rewrote it).
+///
+/// The walk is probed first, without opening anything; only when it finds nothing
+/// is the full discovery asked, for the answer and the sentence setup would give.
+fn run_setup_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    let help = args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all");
+    if help || args.first().is_some_and(|a| a == "--help") || !RUN_SETUP_VERBS.contains(&sub) {
+        return None;
+    }
+    if gix::discover::upwards(std::path::Path::new(".")).is_ok() {
+        return None;
+    }
+    let err = crate::setup::discover().err()?;
+    let msg = crate::fatal::discovery_message(&err)?;
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
 pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // Fleet command log: record this invocation when `git zcommands` has turned
     // logging on. A single `stat` (no work) when it is off, so the hot path pays
@@ -1428,6 +1470,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         if let Some(code) = porcelain::hash_object_options_refused(args) {
             return Ok(code);
         }
+    }
+    if let Some(code) = run_setup_gate(sub, args) {
+        return Ok(code);
     }
     if let Some(code) = config_file_gate(sub, args) {
         return Ok(code);

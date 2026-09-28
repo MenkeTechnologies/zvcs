@@ -849,6 +849,14 @@ struct Opts {
     /// one `rotate_to` string plus a `skip_instead_of_rotate` bit, so the last of
     /// the two options on the command line wins.
     skip_or_rotate: Option<(bool, Vec<u8>)>,
+    /// `-O<file>` (`OPT_FILENAME('O', …, &options->orderfile)`), over the
+    /// `diff.orderFile` default.
+    orderfile: Option<String>,
+    /// The order file's patterns once `prepare_order()` has read them.
+    order_patterns: Option<std::sync::Arc<Vec<Vec<u8>>>>,
+    /// An order file `prepare_order()` could not read, raised by the first
+    /// non-empty queue (diffcore-order.c:24-26).
+    order_failure: std::cell::RefCell<Option<anyhow::Error>>,
 
     // Rename/copy/break detection — `diffcore_std()`'s first three passes, which
     // this module runs through [`super::diffcore_rename`].
@@ -1201,6 +1209,19 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     if let Some(flag) = opts.deferred.first() {
         bail!("unsupported flag {flag:?}");
     }
+    // `prepare_order()` (diffcore-order.c:14-60): read up front so every queue
+    // can be sorted; a failure waits for the first non-empty queue — the cover
+    // letter's diffstat, when there is one.
+    let order_read = match &opts.orderfile {
+        Some(path) => Some(super::diff_files::read_order_file(path)),
+        None => super::status::configured_orderfile(&repo)?
+            .map(|path| super::status::read_orderfile(&repo, &path)),
+    };
+    match order_read {
+        Some(Ok(patterns)) => opts.order_patterns = Some(std::sync::Arc::new(patterns)),
+        Some(Err(e)) => *opts.order_failure.get_mut() = Some(e),
+        None => {}
+    }
 
     // Auto-numbering kicks in for a series; -n/-N override it. A cover letter
     // always numbers, since it is itself patch 0 of the series.
@@ -1284,7 +1305,11 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         }
 
         let mut msg: Vec<u8> = Vec::new();
-        render_message(
+        // A `die()` inside this patch's diff — `prepare_order()`'s, say — comes
+        // after git has already written every earlier message, and before
+        // `show_log()` wrote any of this one; `open_next_file()` has already
+        // created (and announced) its file, which is left empty.
+        if let Err(e) = render_message(
             &repo,
             &commit,
             nr,
@@ -1293,7 +1318,12 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             &th,
             &notes_trees,
             &mut msg,
-        )?;
+        ) {
+            emit_message(&mut buffered, &[], patch_filename(&commit, nr, &opts)?, &opts)?;
+            stdout.write_all(&buffered)?;
+            stdout.flush()?;
+            return Err(e);
+        }
         // `log_tree_commit()` calls `show_diff_of_diff()` once the patch body is
         // out, and only for the single-patch case — a cover letter has already
         // carried the blocks, and git clears them before the loop in that case.
@@ -1644,7 +1674,7 @@ const DEFERRED: &[&str] = &[
 /// Measured against stock 2.55.0 — `git format-patch -S 5 --stdout -1` prints the
 /// last commit's patch (the `5` was eaten), while `-M 5`, whose value is only ever
 /// attached (`PARSE_OPT_OPTARG`), dies `ambiguous argument '5'` on the `5`.
-const DEFERRED_SHORT_VALUE: &[&str] = &["-O", "-S", "-G"];
+const DEFERRED_SHORT_VALUE: &[&str] = &["-S", "-G"];
 
 /// `builtin_format_patch_options` entries that need a value in the next argv
 /// slot (or attached after `=` / directly after the short letter).
@@ -2085,6 +2115,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         ext_path_counter: std::cell::Cell::new(0),
         irreversible_delete: false,
         skip_or_rotate: None,
+        orderfile: None,
+        order_patterns: None,
+        order_failure: std::cell::RefCell::new(None),
         detect_rename: None,
         rename_score: 0,
         find_copies_harder: false,
@@ -3196,6 +3229,15 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             // else can read it as a revision; without that, `format-patch -S base`
             // reported `fatal: ambiguous argument 'base'` instead of naming the
             // option this module has not ported.
+            "-O" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    eprintln!("error: switch `O' requires a value");
+                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                };
+                o.orderfile = Some(v.clone());
+            }
+            s if s.starts_with("-O") => o.orderfile = Some(s[2..].to_owned()),
             s if DEFERRED_SHORT_VALUE.contains(&s) => {
                 i += 1;
                 if args.get(i).is_none() {
@@ -5520,6 +5562,7 @@ fn emit_commit_diff(
         &RenameOpts::from_opts(opts),
         &mut dissimilarity,
     )?;
+    order_changes(&mut changes, opts)?;
     rotate_changes(&mut changes, opts);
     apply_diff_filter(&mut changes, opts, &dissimilarity);
 
@@ -5643,6 +5686,7 @@ fn emit_commit_diff_stats_only(
         &RenameOpts::from_opts(opts),
         &mut dissimilarity,
     )?;
+    order_changes(&mut changes, opts)?;
     rotate_changes(&mut changes, opts);
     apply_diff_filter(&mut changes, opts, &dissimilarity);
     if changes.is_empty() {
@@ -5979,6 +6023,12 @@ fn render_cover_letter(
             &RenameOpts::from_opts(opts),
             &mut dissimilarity,
         )?;
+        // The diffstat's queue is the first `diffcore_order()` meets: the cover
+        // letter written so far stands, and the run ends there.
+        if let Err(e) = order_changes(&mut changes, opts) {
+            eprintln!("fatal: {e}");
+            return Ok(Err(ExitCode::from(128)));
+        }
         rotate_changes(&mut changes, opts);
         apply_diff_filter(&mut changes, opts, &dissimilarity);
         let mut discard: Vec<u8> = Vec::new();
@@ -6972,6 +7022,20 @@ fn pair_status(change: &ChangeDetached, dissimilarity: &HashMap<Vec<u8>, u32>) -
         }
         ChangeDetached::Rewrite { copy, .. } => (if *copy { b'C' } else { b'R' }, None),
     }
+}
+
+/// `diffcore_order()` (diff.c:7519-7520), which `diffcore_std()` runs just
+/// before `diffcore_rotate()`. See [`super::diff_files::order_queue`].
+fn order_changes(changes: &mut [ChangeDetached], opts: &Opts) -> Result<()> {
+    if !changes.is_empty() {
+        if let Some(e) = opts.order_failure.borrow_mut().take() {
+            return Err(e);
+        }
+    }
+    if let Some(order) = &opts.order_patterns {
+        super::diff_files::order_queue(order, changes, change_path);
+    }
+    Ok(())
 }
 
 fn rotate_changes(changes: &mut Vec<ChangeDetached>, opts: &Opts) {

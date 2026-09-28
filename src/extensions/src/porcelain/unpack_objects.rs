@@ -1,100 +1,50 @@
 //! `git unpack-objects` — read a pack stream from stdin and explode it into
 //! loose objects in the current repository.
 //!
-//! Stock git streams the pack and writes each object the moment it is decoded
-//! (`builtin/unpack-objects.c`). This port takes the equivalent route through
-//! the vendored `gix-pack`: the stdin stream is indexed into a throwaway
-//! pack+idx pair inside a scratch directory under the git dir, every object is
-//! then fully resolved through that index (so `OFS_DELTA` and `REF_DELTA`
-//! chains, including thin-pack bases already present in the object database,
-//! are reconstructed) and written loose. The scratch directory is removed
-//! before returning, so the only lasting change is the set of loose objects —
-//! matching stock git's end state.
+//! A port of `builtin/unpack-objects.c` in its own shape: the pack is read
+//! through the same `fill()`/`use()` pair over a `DEFAULT_IO_BUFFER_SIZE`
+//! buffer, hashed as it is used, and each object is decoded and written the
+//! moment it has been inflated (`unpack_one()`). That is what decides every
+//! observable edge git has:
 //!
-//! Because git writes as it goes, a pack that fails part-way still leaves behind
-//! the objects that preceded the damage, and the trailer check that would reject
-//! it happens only after the last one is out (`:684-686`). A staged pack cannot
-//! hand back a partial result, so the stream is held in memory and re-read in
-//! `Mode::Restore` when the strict pass fails: the salvaged entries are written,
-//! and only then does the run die with the failure the strict pass reported.
-//! Buffering costs little here — `transfer.unpackLimit` (100 objects) is what
-//! decides between this command and `index-pack`, which streams.
+//!   * a stream that runs dry dies `early EOF` wherever it happens, with every
+//!     object before it already written;
+//!   * `get_data()` reports a zlib failure as `git_inflate()`'s `inflate: …`
+//!     line plus `inflate returned <n>` and exits 1, or under `-r` carries on
+//!     from wherever the stream stopped, so later bytes can read as `bad
+//!     object type <n>` before the trailer check;
+//!   * deltas whose base is not known yet wait on `delta_list` and are resolved
+//!     by `added_object()` as bases arrive; one left over is `unresolved deltas
+//!     left after unpacking`, and a base neither in the pack nor the object
+//!     database is `failed to read delta-pack base object <oid>`;
+//!   * the trailer is checked last (`final sha1 did not match`), and whatever
+//!     the last read brought in after it is copied to stdout;
+//!   * `-n` inflates and checks everything and writes nothing;
+//!   * `--strict` writes blobs as they come and holds commits, trees and tags
+//!     in core until `write_rest()`, where `check_object()` runs the fsck
+//!     message layer (`fsck error in packed object`), walks the links (`object
+//!     of unexpected type` for one that is nowhere, `Error on reachable
+//!     objects of <oid>`), and only then writes the object; `fsck_finish()`
+//!     checks the `.gitmodules`/`.gitattributes` blobs;
+//!   * `--pack_header=<version>,<objects>` pre-fills the buffer with the header
+//!     the caller consumed, `--max-input-size=<n>` bounds the bytes used, and
+//!     `Unpacking objects` progress is drawn unless `-q` or stderr is not a
+//!     terminal (`quiet = !isatty(2)`).
 //!
-//! The argument parser mirrors git's loop in `cmd_unpack_objects()` exactly:
-//! the flags are tested in git's order (`-n`, `-q`, `-r`, `--strict`,
-//! `--strict=`, `--pack_header=`, `--max-input-size=`) and both an unknown
-//! dash-argument and any positional fall through to `usage()`. That ordering is
-//! load-bearing: `git unpack-objects --strict does-not-exist` is a usage error
-//! because of the *positional*, not the flag, so a parser that rejected
-//! `--strict` early would answer 1 where git answers 129.
+//! The argument loop mirrors git's exactly: flags are tested in git's order
+//! and anything else — an unknown flag or any positional — is the usage line.
 //!
-//! Covered:
-//!   * the default form: `git unpack-objects < pack`, exit 0, empty stdout.
-//!   * `-n` — dry run: the pack is still fully decoded and verified, nothing is
-//!     written.
-//!   * `-q` — accepted; this port never emits progress, so it is already quiet
-//!     (stock git only paints progress when stderr is a terminal).
-//!   * `-r` — recover: the pack is iterated in `gix-pack`'s `Mode::Restore`,
-//!     which salvages every entry up to the damage instead of failing the whole
-//!     stream, and the exit status becomes 1 when fewer objects came back than
-//!     the pack header declared. git reports the same loss the same way — its
-//!     `cmd_unpack_objects()` ends in `return has_errors`, so a recovered-with-
-//!     losses run is exit 1, not a fatal 128.
-//!   * `--strict` and `--strict=<spec>` — non-blob objects are held back until
-//!     every object they reference resolves, mirroring git's `write_rest()`;
-//!     see the note below for the part of git's fsck that has no substrate.
-//!   * `--pack_header=<version>,<objects>` — git's internal hand-off from
-//!     `receive-pack`, which supplies a header its caller already consumed. The
-//!     12 header bytes are reconstructed exactly as git's
-//!     `parse_pack_header_option()` does and chained back in front of stdin, so
-//!     the decoder sees the stream it expects. A malformed value dies with
-//!     git's `bad --pack_header:` message and 128.
-//!   * `--max-input-size=<n>` — `<n>` is parsed exactly as git's `strtoumax`
-//!     does (leading base-10 digits only, so `1k` means 1 and `abc` means 0),
-//!     and `0` means "no limit". Over the limit dies with git's message and 128.
-//!   * objects already present in the repository are not written again, as git
-//!     documents and does.
-//!   * a lone `-h` prints the usage line on **stdout** with 129, because git.c
-//!     intercepts it before the builtin runs. `-h` next to any other argument
-//!     is not intercepted, so it reaches the flag loop as an unknown argument
-//!     and prints on **stderr**, as does any other unknown flag or positional.
-//!   * not being inside a repository: git's `fatal:` line and 128.
-//!
-//! Not reproduced, and documented rather than papered over:
-//!   * `--strict` applies git's *structural* checks only. git runs every
-//!     unpacked object through `fsck_object()` with the full message-id
-//!     severity table; the vendored `gix-fsck` is 106 lines of connectivity
-//!     traversal and carries no such table, so what this port enforces is the
-//!     contract the manual page states — "don't write objects with broken
-//!     content or links" — via `gix-object`'s decoders plus a link-existence
-//!     check against the pack's own object set and the odb. Content defects
-//!     that parse cleanly but that git's fsck would flag (tree entry ordering,
-//!     `.git`-lookalike path names, zero-padded file modes, author/committer
-//!     timestamp shapes) are not detected. The `--strict=<id>=<severity>`
-//!     spec is still validated in full, because that validation happens at
-//!     parse time and needs only the id table, which is reproduced below.
-//!   * version 3 packs. git unpacks them; `gix-pack`'s entry iterator asserts
-//!     that the version is 2 ("let's stop here if we see undocumented pack
-//!     formats"), so a v3 stream would panic rather than decode. A v3
-//!     `--pack_header` is therefore refused with a fatal and 128 instead of
-//!     being handed through. A v3 pack arriving on stdin still reaches that
-//!     assert, which is a `gix-pack` limit this module cannot route around.
-//!   * the `fatal:` text for a malformed pack is git's only where the error
-//!     chain says which of git's fatals it is — `early EOF`, `bad pack file`,
-//!     `unknown pack file version <n>` and `final sha1 did not match`; see
-//!     [`pack_fatal`]. Everything else keeps `gix-pack`'s own diagnostic. The
-//!     exit code is 128 either way.
-//!   * a pack whose declared object count is zero and whose trailing hash is
-//!     missing is accepted here and exits 0; git reads the trailer through the
-//!     same `fill()` and answers `early EOF`. The pack writer verifies the
-//!     trailer it is given rather than insisting one arrive, so there is no
-//!     short-read to catch. Real packs always carry it.
+//! Known differences: zlib's own diagnostic text comes from `zlib-rs`, which
+//! reports `repeated call with bad state` where C zlib's fast path says
+//! `invalid distance too far back` (and may stop consuming input at a
+//! different byte), and `--strict=<id>=<severity>` is validated but its
+//! severities are not applied: findings use the strict defaults, as
+//! `index-pack --strict` does.
 
 use anyhow::Result;
 use std::collections::HashSet;
-use std::io::{self, BufRead, Read};
+use std::io::{self, Read};
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
 
 use gix::objs::Write as _;
 
@@ -218,6 +168,8 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let mut strict = false;
     let mut max_input_size: u64 = 0; // git: 0 means "unlimited"
     let mut pack_header: Option<[u8; 12]> = None;
+    // `quiet = !isatty(2);` (builtin/unpack-objects.c:626), before `-q`.
+    let mut quiet = !std::io::IsTerminal::is_terminal(&io::stderr());
 
     // git's own order, arm for arm. Anything that falls off the end is a usage
     // error, whether it started with a dash or not.
@@ -225,8 +177,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         let a = a.as_str();
         match a {
             "-n" => dry_run = true,
-            // Progress is never painted by this port, so `-q` is already true.
-            "-q" => {}
+            "-q" => quiet = true,
             "-r" => recover = true,
             "--strict" => strict = true,
             _ if a.starts_with("--strict=") => {
@@ -244,26 +195,9 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
                     eprintln!("fatal: bad --pack_header: {value}");
                     return Ok(ExitCode::from(128));
                 };
-                // A version the decoder cannot handle has to be refused here.
-                // `gix-pack`'s entry iterator asserts on anything but v2 —
-                // `data::header::decode` admits v3 and the assert immediately
-                // behind it panics — so handing the synthesized header straight
-                // through would turn a bad value into a crash.
-                let version = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-                match version {
-                    2 => pack_header = Some(hdr),
-                    // git accepts v3 and unpacks it; this port cannot, and says
-                    // so rather than pretending the version was unrecognized.
-                    3 => {
-                        eprintln!("fatal: pack version 3 is not supported");
-                        return Ok(ExitCode::from(128));
-                    }
-                    // git's own wording, for the versions it also rejects.
-                    v => {
-                        eprintln!("fatal: unknown pack file version {v}");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
+                // The version is `unpack_all()`'s to check, as it checks a
+                // header read from stdin.
+                pack_header = Some(hdr);
             }
             _ if a.starts_with("--max-input-size=") => {
                 max_input_size = parse_magnitude(&a["--max-input-size=".len()..]);
@@ -281,344 +215,673 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     };
 
-    // Scratch space for the intermediate pack+idx. It lives under the git dir
-    // so the tempfile rename `gix-pack` performs stays on one filesystem. A dry
-    // run never needs it: the writer keeps its temporaries elsewhere and
-    // discards them.
-    let scratch = if dry_run {
-        None
-    } else {
-        Some(Scratch::new(&repo)?)
-    };
-
-    let mut stdin = io::stdin().lock();
-
-    // Whatever has to sit in front of the real stdin bytes, plus the object
-    // count the pack header declares when it is knowable up front.
-    //
-    // `--pack_header` supplies both directly. Otherwise the count is only
-    // needed to tell a complete `-r` run from a lossy one, so the header is
-    // read off the stream — and handed straight back — only in that mode; every
-    // other invocation keeps the untouched stdin it has always had.
-    let (prefix, declared_objects) = if let Some(hdr) = pack_header {
-        (hdr.to_vec(), Some(u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]])))
-    } else if recover {
-        match peek_pack_header(&mut stdin) {
-            Ok(peeked) => peeked,
-            Err(e) => {
-                eprintln!("fatal: {e}");
-                return Ok(ExitCode::from(128));
-            }
-        }
-    } else {
-        (Vec::new(), None)
-    };
-
-    let source: Box<dyn BufRead> = if prefix.is_empty() {
-        Box::new(stdin)
-    } else {
-        Box::new(io::Cursor::new(prefix).chain(stdin))
-    };
-
-    // The limit wraps the chained stream rather than bare stdin so a
-    // reconstructed `--pack_header` counts against `--max-input-size`, which is
-    // what git does: `unpack_all()` runs the synthesized header through the same
-    // `use()` that advances `consumed_bytes`.
-    let mut input = Limited {
-        inner: source,
-        limit: max_input_size,
-        consumed: 0,
-    };
-
-    let options = gix::odb::pack::bundle::write::Options {
-        // `Restore` returns everything decoded up to the damage instead of
-        // failing the stream, which is the salvage `-r` asks for.
-        iteration_mode: if recover {
-            gix::odb::pack::data::input::Mode::Restore
-        } else {
-            gix::odb::pack::data::input::Mode::Verify
-        },
-        object_hash: repo.object_hash(),
-        ..Default::default()
-    };
-    let should_interrupt = AtomicBool::new(false);
-    let mut progress = gix::features::progress::Discard;
-
-    // ```c
-    // for (i = 0; i < nr_objects; i++) {
-    //         unpack_one(i);
-    //         display_progress(progress, i + 1);
-    // }
-    // ```
-    //
-    // (`unpack_all()`, builtin/unpack-objects.c:602-605.) git writes each object into the
-    // odb as it decodes it and only checks the trailer afterwards (:684-686), so a pack
-    // that is truncated — or whose trailing hash is wrong — still leaves behind everything
-    // it managed to read. This port decodes through a staged pack instead, which cannot
-    // hand back a partial result; so the bytes are held and, when the strict pass fails,
-    // re-read in `Restore` mode to recover exactly the entries git would have written.
-    //
-    // Buffering is affordable here because `unpack-objects` is the *small* half of the
-    // receive path: `transfer.unpackLimit` (100 objects) is what decides between it and
-    // `index-pack`, which streams and is untouched by this.
-    let mut raw = Vec::new();
-    if let Err(e) = input.read_to_end(&mut raw) {
-        eprintln!("fatal: {}", pack_fatal(&e));
-        return Ok(ExitCode::from(128));
+    let mut unpack = Unpack::new(&repo, dry_run, quiet, recover, strict, max_input_size);
+    if let Some(header) = pack_header {
+        // `parse_pack_header_option(arg, buffer, &len)`: the header the caller
+        // already consumed goes into the input buffer, ahead of stdin's bytes.
+        unpack.buffer[..header.len()].copy_from_slice(&header);
+        unpack.len = header.len();
     }
-
-    // git checks the running byte count as it fills its input buffer, so a pack
-    // over the limit dies whether or not it is otherwise well formed. Checking
-    // the drained total covers both the error and the success path.
-    if max_input_size != 0 && input.consumed > max_input_size {
-        eprintln!("fatal: pack exceeds maximum allowed size");
-        return Ok(ExitCode::from(128));
-    }
-
-    // `fill()` (builtin/unpack-objects.c:78-84) is the only place the reader can
-    // run out, and it dies `early EOF` when it does. `gix-pack` collapses that
-    // into the same `IncompletePack` it reports for a zlib stream that simply
-    // ended short of its declared size — two conditions git words very
-    // differently — so the staged bytes are read through a wrapper that records
-    // whether the decoder ever asked past the end.
-    let saw_eof = std::cell::Cell::new(false);
-    let mut write_pack = |mode| {
-        saw_eof.set(false);
-        gix::odb::pack::Bundle::write_to_directory(
-            &mut super::index_pack::EofWatch { inner: raw.as_slice(), saw_eof: &saw_eof },
-            // A dry run still decodes and verifies every entry; it just discards
-            // the index and pack instead of keeping them around to read back.
-            scratch.as_ref().map(|s| s.path.as_path()),
-            &mut progress,
-            &should_interrupt,
-            // Thin packs reference bases by id that only exist in the odb; letting
-            // the writer look them up completes the pack the way git resolves them.
-            Some(repo.objects.clone()),
-            gix::odb::pack::bundle::write::Options { iteration_mode: mode, ..options },
-        )
-    };
-
-    // `die()` is deferred until the salvage below has written what git would have
-    // written; `None` means the pack was whole.
-    let mut deferred_fatal: Option<String> = None;
-    let outcome = match write_pack(options.iteration_mode) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            let message = pack_fatal_at_eof(&e, saw_eof.get());
-            match write_pack(gix::odb::pack::data::input::Mode::Restore) {
-                Ok(outcome) => {
-                    deferred_fatal = Some(message);
-                    outcome
-                }
-                // Nothing was decodable at all — a bad signature, an empty stream.
-                Err(_) => {
-                    eprintln!("fatal: {message}");
-                    return Ok(ExitCode::from(128));
-                }
-            }
-        }
-    };
-
-    // git's `-r` swallows the per-object failure and reports the loss through
-    // its exit status alone (`return has_errors`), so this is 1 rather than the
-    // 128 a non-recovering run would have produced.
-    let has_errors = recover
-        && declared_objects.is_some_and(|declared| outcome.index.num_objects < declared);
-
-    // `-r` only covers `get_data()`'s `inflate returned %d` branch
-    // (builtin/unpack-objects.c:139-142); the `fill(1)` right below it (`:144`)
-    // and the trailer's own `fill(the_hash_algo->rawsz)` (`:684`) die `early
-    // EOF` whatever `recover` asked for. `Mode::Restore` salvages silently and
-    // reports nothing — it does not even look at the trailer it was given — so
-    // the same bytes are re-read under `Verify` to tell a short pack, which
-    // still has to die, from damage `-r` is entitled to swallow.
-    if recover && deferred_fatal.is_none() {
-        if let Err(e) = write_pack(gix::odb::pack::data::input::Mode::Verify) {
-            let message = pack_fatal_at_eof(&e, saw_eof.get());
-            // The two deaths `recover` never covers, both driven by `fill()`
-            // rather than by `get_data()`'s inflate loop: running out of input
-            // (`:144`) and the trailer comparison (`:684-686`).
-            if matches!(message.as_str(), "early EOF" | "final sha1 did not match") {
-                deferred_fatal = Some(message);
-            }
-        }
-    }
-
-    // The salvaged run still dies — git's does, once every object it decoded is out of
-    // the buffer and into the odb. Every exit below goes through this.
-    let finish = |code: ExitCode| match &deferred_fatal {
-        Some(message) => {
+    Ok(match unpack.run() {
+        Ok(code) => code,
+        Err(Stop::Die(message)) => {
             eprintln!("fatal: {message}");
             ExitCode::from(128)
         }
-        None => code,
-    };
+        Err(Stop::Exit(code)) => ExitCode::from(code),
+    })
+}
 
-    if dry_run {
-        return Ok(finish(done(has_errors)));
+/// How a run ends early: `die()` (`fatal: <message>`, 128) or a plain
+/// `exit(<code>)` after an `error()` line already printed.
+enum Stop {
+    Die(String),
+    Exit(u8),
+}
+
+type Step<T> = std::result::Result<T, Stop>;
+
+fn die<T>(message: impl Into<String>) -> Step<T> {
+    Err(Stop::Die(message.into()))
+}
+
+/// `DEFAULT_IO_BUFFER_SIZE` (git-compat-util.h:737), the size of the static
+/// input buffer `fill()` reads into.
+const DEFAULT_IO_BUFFER_SIZE: usize = 128 * 1024;
+
+/// `struct obj_info` (builtin/unpack-objects.c:196-200): where each object
+/// started, and its id once known — `None` for a delta still waiting on its
+/// base, which `oidclr()` leaves null.
+struct ObjInfo {
+    offset: u64,
+    oid: Option<gix::ObjectId>,
+    /// `obj_list[nr].obj`: a commit, tree or tag `--strict` holds in core.
+    held: bool,
+}
+
+/// `struct delta_info` (builtin/unpack-objects.c:160-167).
+struct DeltaInfo {
+    base_oid: Option<gix::ObjectId>,
+    base_offset: u64,
+    nr: usize,
+    delta: Vec<u8>,
+}
+
+/// The state `builtin/unpack-objects.c` keeps in file-scope statics.
+struct Unpack<'r> {
+    repo: &'r gix::Repository,
+    hash: gix::hash::Kind,
+    /// `buffer`, `offset`, `len`: the bytes read from stdin and not yet used.
+    buffer: Vec<u8>,
+    offset: usize,
+    len: usize,
+    consumed_bytes: u64,
+    max_input_size: u64,
+    /// `ctx`: every byte handed to `use()` so far.
+    hasher: gix::hash::Hasher,
+    dry_run: bool,
+    quiet: bool,
+    recover: bool,
+    strict: bool,
+    has_errors: bool,
+    big_file_threshold: u64,
+    progress: Option<crate::progress::Meter>,
+    obj_list: Vec<ObjInfo>,
+    /// `delta_list`, head first: `add_delta_to_list()` prepends.
+    delta_list: Vec<DeltaInfo>,
+    /// `--strict`'s in-core objects: `obj_decorate`'s buffers (`FLAG_OPEN`),
+    /// `FLAG_WRITTEN`, and every object `lookup_<type>()` has created, by type.
+    buffers: std::collections::HashMap<gix::ObjectId, (gix::object::Kind, Vec<u8>)>,
+    written: HashSet<gix::ObjectId>,
+    known: std::collections::HashMap<gix::ObjectId, gix::object::Kind>,
+    /// `.gitmodules` / `.gitattributes` blobs `fsck_object()` queued for
+    /// `fsck_finish()`.
+    finish_blobs: Vec<(gix::ObjectId, bool, bool)>,
+}
+
+impl<'r> Unpack<'r> {
+    fn new(
+        repo: &'r gix::Repository,
+        dry_run: bool,
+        quiet: bool,
+        recover: bool,
+        strict: bool,
+        max_input_size: u64,
+    ) -> Self {
+        let hash = repo.object_hash();
+        Unpack {
+            repo,
+            hash,
+            buffer: vec![0u8; DEFAULT_IO_BUFFER_SIZE],
+            offset: 0,
+            len: 0,
+            consumed_bytes: 0,
+            max_input_size,
+            hasher: gix::hash::hasher(hash),
+            dry_run,
+            quiet,
+            recover,
+            strict,
+            has_errors: false,
+            big_file_threshold: super::fsck::big_file_threshold(repo),
+            progress: None,
+            obj_list: Vec::new(),
+            delta_list: Vec::new(),
+            buffers: Default::default(),
+            written: Default::default(),
+            known: Default::default(),
+            finish_blobs: Vec::new(),
+        }
     }
 
-    // `to_bundle` is `None` only when nothing was written to disk, which for a
-    // non-dry run means an empty pack — a valid input carrying zero objects.
-    let Some(bundle) = outcome.to_bundle() else {
-        return Ok(finish(done(has_errors)));
-    };
-    let bundle = match bundle {
-        Ok(bundle) => bundle,
-        Err(e) => {
-            eprintln!("fatal: {}", pack_fatal(&e));
-            return Ok(ExitCode::from(128));
+    /// `fill()` (builtin/unpack-objects.c:69-89): make at least `min` bytes
+    /// available at `buffer[offset..]`.
+    fn fill(&mut self, min: usize) -> Step<()> {
+        if min <= self.len {
+            return Ok(());
         }
-    };
+        if min > self.buffer.len() {
+            return die(format!("cannot fill {min} bytes"));
+        }
+        if self.offset != 0 {
+            self.buffer.copy_within(self.offset..self.offset + self.len, 0);
+            self.offset = 0;
+        }
+        loop {
+            let got = {
+                // fd 0 itself: the standard library's `Stdin` would buffer ahead.
+                let mut stdin = std::mem::ManuallyDrop::new(unsafe {
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(0)
+                });
+                stdin.read(&mut self.buffer[self.len..])
+            };
+            match got {
+                Ok(0) => return die("early EOF"),
+                Ok(n) => self.len += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return die(format!("read error on input: {}", crate::external::strerror(&e))),
+            }
+            if self.len >= min {
+                return Ok(());
+            }
+        }
+    }
 
-    let mut buf = Vec::with_capacity(64 * 1024);
-    let mut inflate = gix::zlib::Inflate::default();
-    let mut cache = gix::odb::pack::cache::Never;
+    /// `use()` (builtin/unpack-objects.c:91-104). The bytes are hashed here
+    /// rather than when `fill()` moves them, which feeds the same bytes to
+    /// `ctx` in the same order.
+    fn consume(&mut self, bytes: usize) -> Step<()> {
+        if bytes > self.len {
+            return die("used more bytes than were available");
+        }
+        self.hasher.update(&self.buffer[self.offset..self.offset + bytes]);
+        self.len -= bytes;
+        self.offset += bytes;
+        self.consumed_bytes += bytes as u64;
+        if self.max_input_size != 0 && self.consumed_bytes > self.max_input_size {
+            return die("pack exceeds maximum allowed size");
+        }
+        if let Some(meter) = self.progress.as_mut() {
+            meter.throughput(self.consumed_bytes);
+        }
+        Ok(())
+    }
 
-    // Non-strict is git's streaming path: decode an object, write it, move on.
-    if !strict {
-        for idx in 0..bundle.index.num_objects() {
-            let id = bundle.index.oid_at_index(idx).to_owned();
-            let object = match bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache) {
-                Ok((object, _location)) => object,
+    /// `fill(1)` then one byte of it, `use(1)`.
+    fn next_byte(&mut self) -> Step<u8> {
+        self.fill(1)?;
+        let byte = self.buffer[self.offset];
+        self.consume(1)?;
+        Ok(byte)
+    }
+
+    /// `get_data()` (builtin/unpack-objects.c:106-150): inflate `size` bytes
+    /// off the stream. `None` is its `NULL`: a dry run, which only checks the
+    /// stream, or an inflate failure `-r` let through.
+    fn get_data(&mut self, size: usize) -> Step<Option<Vec<u8>>> {
+        let bufsize = if self.dry_run && size > 8192 { 8192 } else { size };
+        let mut out = vec![0u8; bufsize];
+        let mut z = gix::zlib::Decompress::new();
+        self.fill(1)?;
+        loop {
+            let before_in = z.total_in();
+            let before_out = z.total_out() as usize;
+            // Non-dry runs inflate into the whole object; a dry run reuses its
+            // scratch buffer, capped at what is still to come.
+            let window = if self.dry_run {
+                let left = size - before_out;
+                &mut out[..bufsize.min(left)]
+            } else {
+                &mut out[before_out..]
+            };
+            let input = &self.buffer[self.offset..self.offset + self.len];
+            let status = z.decompress(input, window, gix::zlib::FlushDecompress::None);
+            let used = (z.total_in() - before_in) as usize;
+            self.consume(used)?;
+            // `git_inflate()`'s return, as zlib numbers it.
+            let ret = match status {
+                Ok(gix::zlib::Status::StreamEnd) if z.total_out() as usize == size => break,
+                Ok(gix::zlib::Status::Ok) => 0,
+                Ok(gix::zlib::Status::StreamEnd) => 1,
+                Ok(gix::zlib::Status::BufError) => -5,
                 Err(e) => {
-                    eprintln!("fatal: {}", pack_fatal(&e));
-                    return Ok(ExitCode::from(128));
+                    if matches!(e, gix::zlib::DecompressError::InsufficientMemory) {
+                        return die("inflate: out of memory");
+                    }
+                    eprintln!("{}", super::fsck::inflate_error_line(&z, &e));
+                    zlib_code(&e)
                 }
             };
-            // `Repository::write_buf_with_known_id` skips ids the odb already
-            // has, which is exactly git's "objects that already exist are not
-            // unpacked".
-            if let Err(e) = repo.write_buf_with_known_id(object.kind, object.data, id) {
-                eprintln!("fatal: {e}");
-                return Ok(ExitCode::from(128));
+            if ret != 0 {
+                eprintln!("error: inflate returned {ret}");
+                if !self.recover {
+                    return Err(Stop::Exit(1));
+                }
+                self.has_errors = true;
+                return Ok(None);
             }
+            self.fill(1)?;
         }
-        return Ok(finish(done(has_errors)));
-    }
-
-    // Strict is git's deferred path. Blobs go out as they are decoded; every
-    // other object is parsed for structure now, held back, and only written
-    // once `write_rest()`'s equivalent has confirmed that everything it points
-    // at resolves. Nothing in the pack is written if any link dangles.
-    let pack_ids: HashSet<gix::ObjectId> = (0..bundle.index.num_objects())
-        .map(|idx| bundle.index.oid_at_index(idx).to_owned())
-        .collect();
-
-    let mut deferred: Vec<u32> = Vec::new();
-    let mut referenced: Vec<gix::ObjectId> = Vec::new();
-
-    for idx in 0..bundle.index.num_objects() {
-        let id = bundle.index.oid_at_index(idx).to_owned();
-        let object = match bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache) {
-            Ok((object, _location)) => object,
-            Err(e) => {
-                eprintln!("fatal: {}", pack_fatal(&e));
-                return Ok(ExitCode::from(128));
-            }
-        };
-
-        if object.kind == gix::object::Kind::Blob {
-            if let Err(e) = repo.write_buf_with_known_id(object.kind, object.data, id) {
-                eprintln!("fatal: {e}");
-                return Ok(ExitCode::from(128));
-            }
-            continue;
+        if self.dry_run {
+            return Ok(None);
         }
+        Ok(Some(out))
+    }
 
-        // git: `parse_object_buffer()` failing here is `die("invalid %s", ...)`.
-        let parsed = match gix::objs::ObjectRef::from_bytes(
-            object.data,
-            object.kind,
-            repo.object_hash(),
-        ) {
-            Ok(parsed) => parsed,
-            Err(_) => {
-                eprintln!("fatal: invalid {}", object.kind);
-                return Ok(ExitCode::from(128));
+    /// `odb_write_object()`: the object's id, written loose unless the
+    /// database already has it.
+    fn write_odb(&self, kind: gix::object::Kind, data: &[u8]) -> Step<gix::ObjectId> {
+        let id = gix::objs::compute_hash(self.hash, kind, data)
+            .map_err(|e| Stop::Die(format!("failed to write object: {e}")))?;
+        if let Err(e) = self.repo.write_buf_with_known_id(kind, data, id) {
+            return die(format!("failed to write object: {e}"));
+        }
+        Ok(id)
+    }
+
+    /// `write_object()` (builtin/unpack-objects.c:285-326).
+    fn write_object(&mut self, nr: usize, kind: gix::object::Kind, data: Vec<u8>) -> Step<()> {
+        if !self.strict {
+            let id = self.write_odb(kind, &data)?;
+            self.obj_list[nr].oid = Some(id);
+            self.added_object(nr, kind, &data)?;
+            self.obj_list[nr].held = false;
+        } else if kind == gix::object::Kind::Blob {
+            let id = self.write_odb(kind, &data)?;
+            self.obj_list[nr].oid = Some(id);
+            self.added_object(nr, kind, &data)?;
+            // `lookup_blob()`, dying `invalid blob object` on a clash, then
+            // `FLAG_WRITTEN`.
+            if self.lookup(id, kind).is_err() {
+                return die("invalid blob object");
             }
-        };
-        collect_links(&parsed, &mut referenced);
-        deferred.push(idx);
-    }
-
-    // ```c
-    // for (i = 0; i < nr_objects; i++) {
-    //         unpack_one(i);
-    //         display_progress(progress, i + 1);
-    // }
-    // …
-    // /* Write the last and final delta */
-    // …
-    // if (!hasheq(fill(the_hash_algo->rawsz), oid.hash, …))
-    //         die("final sha1 did not match");
-    // ```
-    //
-    // (`unpack_all()` then `cmd_unpack_objects()`, builtin/unpack-objects.c:602-686.)
-    // A pack cut off mid-object dies inside that loop, so `write_rest()` — and
-    // with it the link check below — never runs and the held-back objects stay
-    // unwritten. A pack whose *trailer* alone is short still completes the loop,
-    // so `write_rest()` writes everything and only then does the trailer check
-    // kill the run. The declared object count tells the two apart.
-    let declared_in_pack = (raw.len() >= 12)
-        .then(|| u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]));
-    let loop_completed =
-        declared_in_pack.is_none_or(|declared| bundle.index.num_objects() >= declared);
-    if deferred_fatal.is_some() && !loop_completed {
-        return Ok(finish(done(has_errors)));
-    }
-
-    // A link resolves if the pack carries it or the odb already had it — the
-    // same two places git looks before deciding an object is unwritable.
-    if let Some(missing) = referenced
-        .iter()
-        .find(|id| !pack_ids.contains(*id) && !repo.has_object(*id))
-    {
-        eprintln!("fatal: missing object referenced by the pack: {missing}");
-        eprintln!("fatal: fsck error in pack objects");
-        return Ok(ExitCode::from(128));
-    }
-
-    for idx in deferred {
-        let id = bundle.index.oid_at_index(idx).to_owned();
-        let object = match bundle.get_object_by_index(idx, &mut buf, &mut inflate, &mut cache) {
-            Ok((object, _location)) => object,
-            Err(e) => {
-                eprintln!("fatal: {}", pack_fatal(&e));
-                return Ok(ExitCode::from(128));
+            self.written.insert(id);
+            self.obj_list[nr].held = false;
+        } else {
+            let id = gix::objs::compute_hash(self.hash, kind, &data)
+                .map_err(|e| Stop::Die(format!("invalid {kind}: {e}")))?;
+            self.obj_list[nr].oid = Some(id);
+            self.added_object(nr, kind, &data)?;
+            if self.lookup(id, kind).is_err()
+                || !super::index_pack::parse_object_buffer(kind, &data, &id, self.hash.len_in_hex())
+            {
+                return die(format!("invalid {kind}"));
             }
-        };
-        if let Err(e) = repo.write_buf_with_known_id(object.kind, object.data, id) {
-            eprintln!("fatal: {e}");
-            return Ok(ExitCode::from(128));
+            // `add_object_buffer()`
+            if self.buffers.contains_key(&id) {
+                return die(format!("object {id} tried to add buffer twice!"));
+            }
+            self.buffers.insert(id, (kind, data));
+            self.obj_list[nr].held = true;
+        }
+        Ok(())
+    }
+
+    /// `lookup_<type>()`: create the in-core object, or find it with the type
+    /// it already has. A clash is `object_as_type()`'s error and a `NULL`.
+    fn lookup(&mut self, id: gix::ObjectId, kind: gix::object::Kind) -> std::result::Result<(), ()> {
+        match self.known.get(&id) {
+            Some(&existing) if existing != kind => {
+                eprintln!("error: object {id} is a {existing}, not a {kind}");
+                Err(())
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.known.insert(id, kind);
+                Ok(())
+            }
         }
     }
 
-    Ok(finish(done(has_errors)))
+    /// `resolve_delta()` (builtin/unpack-objects.c:328-343).
+    fn resolve_delta(
+        &mut self,
+        nr: usize,
+        kind: gix::object::Kind,
+        base: &[u8],
+        delta: &[u8],
+    ) -> Step<()> {
+        let result = match super::pack_check::patch_delta(base, delta) {
+            Ok(result) => result,
+            Err(line) => {
+                if let Some(line) = line {
+                    eprintln!("error: {line}");
+                }
+                return die("failed to apply delta");
+            }
+        };
+        self.write_object(nr, kind, result)
+    }
+
+    /// `added_object()` (builtin/unpack-objects.c:345-368): resolve every
+    /// queued delta whose base is the `nr`-th object, now that it is known.
+    fn added_object(&mut self, nr: usize, kind: gix::object::Kind, data: &[u8]) -> Step<()> {
+        let (oid, offset) = (self.obj_list[nr].oid, self.obj_list[nr].offset);
+        while let Some(i) = self
+            .delta_list
+            .iter()
+            .position(|info| (info.base_oid.is_some() && info.base_oid == oid) || info.base_offset == offset)
+        {
+            let info = self.delta_list.remove(i);
+            self.resolve_delta(info.nr, kind, data, &info.delta)?;
+        }
+        Ok(())
+    }
+
+    /// `resolve_against_held()` (builtin/unpack-objects.c:430-444).
+    fn resolve_against_held(&mut self, nr: usize, base: &gix::ObjectId, delta: &[u8]) -> Step<bool> {
+        let Some((kind, data)) = self.buffers.get(base).map(|(k, d)| (*k, d.clone())) else {
+            return Ok(false);
+        };
+        self.resolve_delta(nr, kind, &data, delta)?;
+        Ok(true)
+    }
+
+    /// `stream_blob()` (builtin/unpack-objects.c:398-428): a blob over
+    /// `core.bigFileThreshold`, written as it inflates. Unlike every other
+    /// object it never reaches `added_object()`.
+    fn stream_blob(&mut self, size: usize, nr: usize) -> Step<()> {
+        let mut data = Vec::with_capacity(size);
+        let mut chunk = vec![0u8; 16 * 1024];
+        let mut z = gix::zlib::Decompress::new();
+        let status = loop {
+            self.fill(1)?;
+            let before_in = z.total_in();
+            let before_out = z.total_out();
+            let input = &self.buffer[self.offset..self.offset + self.len];
+            let status = z.decompress(input, &mut chunk, gix::zlib::FlushDecompress::None);
+            let used = (z.total_in() - before_in) as usize;
+            let produced = (z.total_out() - before_out) as usize;
+            data.extend_from_slice(&chunk[..produced]);
+            self.consume(used)?;
+            match status {
+                Ok(gix::zlib::Status::Ok) => continue,
+                Ok(gix::zlib::Status::StreamEnd) => break 1,
+                Ok(gix::zlib::Status::BufError) => break -5,
+                Err(e) => {
+                    eprintln!("{}", super::fsck::inflate_error_line(&z, &e));
+                    break zlib_code(&e);
+                }
+            }
+        };
+        if data.len() != size {
+            return die("failed to write object in stream");
+        }
+        let id = self.write_odb(gix::object::Kind::Blob, &data)?;
+        if status != 1 {
+            return die(format!("inflate returned ({status})"));
+        }
+        self.obj_list[nr].oid = Some(id);
+        if self.strict {
+            if self.lookup(id, gix::object::Kind::Blob).is_err() {
+                return die("invalid blob object from stream");
+            }
+            self.written.insert(id);
+        }
+        self.obj_list[nr].held = false;
+        Ok(())
+    }
+
+    /// `unpack_delta_entry()` (builtin/unpack-objects.c:446-543).
+    fn unpack_delta_entry(&mut self, kind: i32, delta_size: usize, nr: usize) -> Step<()> {
+        let base_oid;
+        if kind == OBJ_REF_DELTA {
+            let rawsz = self.hash.len_in_bytes();
+            self.fill(rawsz)?;
+            let oid = gix::ObjectId::from_bytes_or_panic(&self.buffer[self.offset..self.offset + rawsz]);
+            self.consume(rawsz)?;
+            let Some(delta) = self.get_data(delta_size)? else {
+                return Ok(());
+            };
+            if self.repo.has_object(oid) {
+                // "Ok we have this one"
+            } else if self.resolve_against_held(nr, &oid, &delta)? {
+                return Ok(());
+            } else {
+                // "cannot resolve yet --- queue it"
+                self.obj_list[nr].oid = None;
+                self.add_delta_to_list(nr, Some(oid), 0, delta);
+                return Ok(());
+            }
+            base_oid = oid;
+            return self.resolve_from(nr, base_oid, delta);
+        }
+
+        let mut c = self.next_byte()?;
+        let mut base_offset = u64::from(c & 127);
+        while c & 128 != 0 {
+            base_offset += 1;
+            if base_offset == 0 || base_offset >> (64 - 7) != 0 {
+                return die("offset value overflow for delta base object");
+            }
+            c = self.next_byte()?;
+            base_offset = (base_offset << 7) + u64::from(c & 127);
+        }
+        let own_offset = self.obj_list[nr].offset;
+        if base_offset == 0 || base_offset >= own_offset {
+            return die("offset value out of bound for delta base object");
+        }
+        let base_offset = own_offset - base_offset;
+
+        let Some(delta) = self.get_data(delta_size)? else {
+            return Ok(());
+        };
+        let found = self.obj_list[..nr]
+            .binary_search_by(|info| info.offset.cmp(&base_offset))
+            .ok()
+            .and_then(|i| self.obj_list[i].oid);
+        let Some(oid) = found else {
+            // "The delta base object is itself a delta that has not been
+            // resolved yet."
+            self.obj_list[nr].oid = None;
+            self.add_delta_to_list(nr, None, base_offset, delta);
+            return Ok(());
+        };
+        self.resolve_from(nr, oid, delta)
+    }
+
+    /// The tail both delta kinds share: an in-core base under `--strict`, or
+    /// else the object database.
+    fn resolve_from(&mut self, nr: usize, base_oid: gix::ObjectId, delta: Vec<u8>) -> Step<()> {
+        if self.resolve_against_held(nr, &base_oid, &delta)? {
+            return Ok(());
+        }
+        let Ok(base) = self.repo.find_object(base_oid) else {
+            eprintln!("error: failed to read delta-pack base object {base_oid}");
+            if !self.recover {
+                return Err(Stop::Exit(1));
+            }
+            self.has_errors = true;
+            return Ok(());
+        };
+        let (kind, data) = (base.kind, base.data.clone());
+        self.resolve_delta(nr, kind, &data, &delta)
+    }
+
+    /// `add_delta_to_list()`: prepended, as git's linked list is.
+    fn add_delta_to_list(&mut self, nr: usize, base_oid: Option<gix::ObjectId>, base_offset: u64, delta: Vec<u8>) {
+        self.delta_list.insert(0, DeltaInfo { base_oid, base_offset, nr, delta });
+    }
+
+    /// `unpack_one()` (builtin/unpack-objects.c:545-593).
+    fn unpack_one(&mut self, nr: usize) -> Step<()> {
+        self.obj_list[nr].offset = self.consumed_bytes;
+        let mut c = self.next_byte()? as usize;
+        let kind = ((c >> 4) & 7) as i32;
+        let mut size = c & 15;
+        let mut shift = 4u32;
+        while c & 0x80 != 0 {
+            if usize::BITS - 7 < shift {
+                return die("object size too large for this platform");
+            }
+            c = self.next_byte()? as usize;
+            size = size.wrapping_add((c & 0x7f) << shift);
+            shift += 7;
+        }
+        let object_kind = match kind {
+            1 => gix::object::Kind::Commit,
+            2 => gix::object::Kind::Tree,
+            3 => gix::object::Kind::Blob,
+            4 => gix::object::Kind::Tag,
+            OBJ_OFS_DELTA | OBJ_REF_DELTA => return self.unpack_delta_entry(kind, size, nr),
+            _ => {
+                eprintln!("error: bad object type {kind}");
+                self.has_errors = true;
+                if self.recover {
+                    return Ok(());
+                }
+                return Err(Stop::Exit(1));
+            }
+        };
+        if object_kind == gix::object::Kind::Blob && !self.dry_run && size as u64 > self.big_file_threshold {
+            return self.stream_blob(size, nr);
+        }
+        // `unpack_non_delta_entry()`
+        if let Some(data) = self.get_data(size)? {
+            self.write_object(nr, object_kind, data)?;
+        }
+        Ok(())
+    }
+
+    /// `unpack_all()` (builtin/unpack-objects.c:595-626).
+    fn unpack_all(&mut self) -> Step<()> {
+        self.fill(12)?;
+        let hdr = &self.buffer[self.offset..self.offset + 12];
+        if &hdr[..4] != b"PACK" {
+            return die("bad pack file");
+        }
+        let version = u32::from_be_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if version != 2 && version != 3 {
+            return die(format!("unknown pack file version {version}"));
+        }
+        let nr_objects = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;
+        self.consume(12)?;
+
+        if !self.quiet {
+            self.progress = Some(crate::progress::Meter::counted("Unpacking objects", nr_objects, true));
+        }
+        self.obj_list = (0..nr_objects).map(|_| ObjInfo { offset: 0, oid: None, held: false }).collect();
+        for nr in 0..nr_objects {
+            self.unpack_one(nr)?;
+            if let Some(meter) = self.progress.as_mut() {
+                meter.set(nr + 1);
+            }
+        }
+        if let Some(meter) = self.progress.take() {
+            meter.stop("done");
+        }
+        if !self.delta_list.is_empty() {
+            return die("unresolved deltas left after unpacking");
+        }
+        Ok(())
+    }
+
+    /// `check_object()` (builtin/unpack-objects.c:216-262), reached through
+    /// `write_rest()` and `fsck_walk()`. `Ok(false)` is its `return 1`.
+    fn check_object(&mut self, id: gix::ObjectId, expected: Option<gix::object::Kind>) -> Step<bool> {
+        if self.written.contains(&id) {
+            return Ok(true);
+        }
+        let own = self.known.get(&id).copied();
+        if let (Some(expected), Some(own)) = (expected, own) {
+            if own != expected {
+                return die("object type mismatch");
+            }
+        }
+        let Some((kind, data)) = self.buffers.get(&id).cloned() else {
+            // Not `FLAG_OPEN`: the object is only somewhere else.
+            let found = self.repo.find_header(id).ok().map(|h| h.kind());
+            if found.is_none() || found != own {
+                return die("object of unexpected type");
+            }
+            self.written.insert(id);
+            return Ok(true);
+        };
+        let reported = super::index_pack::report_fsck_object(kind, &data, &id, self.hash.len_in_hex());
+        for blob in reported.gitmodules {
+            self.finish_blobs.push((blob, true, false));
+        }
+        for blob in reported.gitattributes {
+            self.finish_blobs.push((blob, false, true));
+        }
+        if reported.error {
+            return die("fsck error in packed object");
+        }
+        // `fsck_walk()` with `check_object` as the walker.
+        let mut links = Vec::new();
+        let walked = super::index_pack::collect_links(kind, &data, &id, &mut links, self.hash);
+        let mut result = walked;
+        for (child, child_kind) in links {
+            let ok = match self.lookup(child, child_kind) {
+                Ok(()) => self.check_object(child, Some(child_kind))?,
+                Err(()) => false,
+            };
+            result &= ok;
+        }
+        if !result {
+            return die(format!("Error on reachable objects of {id}"));
+        }
+        // `write_cached_object()`
+        if let Err(e) = self.repo.write_buf_with_known_id(kind, &data, id) {
+            return die(format!("failed to write object {id}: {e}"));
+        }
+        self.written.insert(id);
+        Ok(true)
+    }
+
+    /// `write_rest()` (builtin/unpack-objects.c:264-271).
+    fn write_rest(&mut self) -> Step<()> {
+        for nr in 0..self.obj_list.len() {
+            if !self.obj_list[nr].held {
+                continue;
+            }
+            if let Some(id) = self.obj_list[nr].oid {
+                self.check_object(id, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `fsck_finish()` over the blobs `fsck_object()` queued.
+    fn fsck_finish(&mut self) -> Step<()> {
+        let mut error = false;
+        let mut done: HashSet<gix::ObjectId> = HashSet::new();
+        for (id, as_modules, as_attrs) in std::mem::take(&mut self.finish_blobs) {
+            if !done.insert(id) {
+                continue;
+            }
+            let found = self.repo.find_object(id).ok().map(|o| (o.kind, o.data.clone()));
+            error |= super::index_pack::report_fsck_finish_blob(&id, found, as_modules, as_attrs);
+        }
+        if error {
+            return die("fsck error in pack objects");
+        }
+        Ok(())
+    }
+
+    /// `cmd_unpack_objects()` after the argument loop
+    /// (builtin/unpack-objects.c:667-693).
+    fn run(&mut self) -> Step<ExitCode> {
+        self.unpack_all()?;
+        let computed = self
+            .hasher
+            .clone()
+            .try_finalize()
+            .map_err(|e| Stop::Die(format!("{e}")))?;
+        if self.strict {
+            self.write_rest()?;
+            self.fsck_finish()?;
+        }
+        let rawsz = self.hash.len_in_bytes();
+        self.fill(rawsz)?;
+        if self.buffer[self.offset..self.offset + rawsz] != *computed.as_bytes() {
+            return die("final sha1 did not match");
+        }
+        self.consume(rawsz)?;
+        // "Write the last part of the buffer to stdout"
+        let rest = &self.buffer[self.offset..self.offset + self.len];
+        if !rest.is_empty() {
+            use std::io::Write as _;
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(rest);
+            let _ = stdout.flush();
+        }
+        Ok(ExitCode::from(u8::from(self.has_errors)))
+    }
 }
 
-/// git's `cmd_unpack_objects()` ends in `return has_errors`, so a run that lost
-/// objects to `-r`'s salvage exits 1 — the ordinary "expected negative" code,
-/// not the 128 a fatal would have produced.
-fn done(has_errors: bool) -> ExitCode {
-    if has_errors {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
-}
+/// The pack entry types that carry a delta.
+const OBJ_OFS_DELTA: i32 = 6;
+const OBJ_REF_DELTA: i32 = 7;
 
-/// Record every object id `object` points at, which is what decides whether it
-/// is safe to write under `--strict`.
-fn collect_links(object: &gix::objs::ObjectRef<'_>, out: &mut Vec<gix::ObjectId>) {
-    match object {
-        gix::objs::ObjectRef::Tree(tree) => out.extend(tree.entries.iter().map(|e| e.oid.to_owned())),
-        gix::objs::ObjectRef::Commit(commit) => {
-            out.push(commit.tree());
-            out.extend(commit.parents());
-        }
-        gix::objs::ObjectRef::Tag(tag) => out.push(tag.target()),
-        gix::objs::ObjectRef::Blob(_) => {}
+/// zlib's return code for an inflate failure, as `git_inflate()` passes it on.
+fn zlib_code(e: &gix::zlib::DecompressError) -> i32 {
+    use gix::zlib::DecompressError as E;
+    match e {
+        E::NeedDict => 2,
+        E::StreamError => -2,
+        E::DataError => -3,
+        E::InsufficientMemory => -4,
     }
 }
 
@@ -719,207 +982,6 @@ fn parse_magnitude(s: &str) -> u64 {
     digits.parse().unwrap_or(u64::MAX)
 }
 
-/// Restate a `gix-pack` failure in the words `unpack-objects` would `die()` with.
-///
-/// Three of git's fatals are decidable from the error, and they are the three a
-/// caller is most likely to meet:
-///
-/// * **`early EOF`** — `fill()` (`builtin/unpack-objects.c:78-84`) dies with it
-///   the moment `xread()` returns 0 with the request unsatisfied, which covers
-///   an empty stdin, a short pack header and a truncated entry alike. `gix-pack`
-///   reaches all of those through `read_exact`, so an `UnexpectedEof` is that
-///   same condition.
-/// * **`bad pack file`** — `unpack_all()`'s signature check
-///   (`builtin/unpack-objects.c:587-588`), which is `data::header::decode()`'s
-///   only `Corrupt` (`gix-pack/src/data/header.rs:9`).
-/// * **`unknown pack file version %u`** — the version check right below it
-///   (`:590-592`), which is that decoder's `UnsupportedVersion`.
-///
-/// Anything else keeps gitoxide's own wording; the exit code is 128 either way.
-///
-/// The nesting is descended by hand rather than through `Error::source()`.
-/// Several of these wrappers are `#[error(transparent)]`, and thiserror
-/// implements that by forwarding `source()` to the *wrapped* error's `source()`
-/// — so the wrapped error is never yielded as a link. Walking `source()` from a
-/// `bundle::write::Error::PackIter` therefore skips straight past the
-/// `input::Error` and the `gix_hash::io::Error` under it and never sees the
-/// `io::Error` at all, which is how a truncated pack kept reporting
-/// "An IO operation failed while streaming an entry".
-fn pack_fatal(err: &(dyn std::error::Error + 'static)) -> String {
-    pack_fatal_at_eof(err, false)
-}
-
-/// [`pack_fatal`] for a failure whose reader position is known: `saw_eof` says the
-/// decoder asked for bytes past the end of the input, which is git's `fill()`
-/// running out and so `early EOF`.
-fn pack_fatal_at_eof(err: &(dyn std::error::Error + 'static), saw_eof: bool) -> String {
-    classify_pack_error(err, saw_eof).unwrap_or_else(|| err.to_string())
-}
-
-/// One node of the descent [`pack_fatal`] documents: recognise the wrapper,
-/// step into the error it holds, and stop at the first thing git has a word for.
-fn classify_pack_error(
-    err: &(dyn std::error::Error + 'static),
-    saw_eof: bool,
-) -> Option<String> {
-    use gix::hash::io::Error as HashIoError;
-    use gix::odb::pack::bundle::write::Error as BundleError;
-    use gix::odb::pack::data::header::decode::Error as HeaderError;
-    use gix::odb::pack::data::input::Error as InputError;
-    use gix::odb::pack::index::write::Error as IndexError;
-
-    if let Some(e) = err.downcast_ref::<io::Error>() {
-        return (e.kind() == io::ErrorKind::UnexpectedEof).then(|| "early EOF".to_string());
-    }
-    if let Some(e) = err.downcast_ref::<HeaderError>() {
-        return match e {
-            HeaderError::Corrupt(_) => Some("bad pack file".to_string()),
-            HeaderError::UnsupportedVersion(v) => Some(format!("unknown pack file version {v}")),
-            HeaderError::Io { source, .. } => classify_pack_error(source, saw_eof),
-        };
-    }
-    if let Some(e) = err.downcast_ref::<HashIoError>() {
-        return match e {
-            HashIoError::Io(e) => classify_pack_error(e, saw_eof),
-            HashIoError::Hasher(_) => None,
-        };
-    }
-    if let Some(e) = err.downcast_ref::<InputError>() {
-        return match e {
-            InputError::Io(e) => classify_pack_error(e, saw_eof),
-            InputError::PackParse(e) => classify_pack_error(e, saw_eof),
-            // `if (!hasheq(fill(the_hash_algo->rawsz), oid.hash, …)) die("final sha1 did
-            // not match");` (builtin/unpack-objects.c:684-686) — the trailer check, which
-            // git makes after every object is already in the odb.
-            InputError::Verify(_) => Some("final sha1 did not match".to_string()),
-            // `gix-pack` reports this when `io::copy` over the entry's inflate
-            // reader stopped short of the declared size
-            // (gix-pack/src/data/input/bytes_to_entries.rs:121-126). git reaches
-            // that state two ways and words them differently: a truncated pack
-            // runs `get_data()` back into `fill(1)`
-            // (builtin/unpack-objects.c:144), which dies `early EOF`
-            // (`:78-84`), while a zlib stream that simply ended short falls to
-            // `error("inflate returned %d")` (`:136-137`). Only the first asks
-            // for bytes past the end of the input, which `saw_eof` records.
-            InputError::IncompletePack { .. } if saw_eof => Some("early EOF".to_string()),
-            _ => None,
-        };
-    }
-    if let Some(e) = err.downcast_ref::<IndexError>() {
-        return match e {
-            IndexError::Io(e) => classify_pack_error(e, saw_eof),
-            IndexError::PackEntryDecode(e) => classify_pack_error(e, saw_eof),
-            _ => None,
-        };
-    }
-    if let Some(e) = err.downcast_ref::<BundleError>() {
-        return match e {
-            BundleError::Io(e) => classify_pack_error(e, saw_eof),
-            BundleError::PackIter(e) => classify_pack_error(e, saw_eof),
-            BundleError::IndexWrite(e) => classify_pack_error(e, saw_eof),
-            BundleError::Persist(_) => None,
-        };
-    }
-    None
-}
-
-/// Take the 12-byte pack header off `stream`, returning the bytes read so they
-/// can be chained back in front of it along with the object count they declare.
-///
-/// A short read is handed back verbatim and reported as no count at all: the
-/// pack decoder downstream then produces the same truncation error it would
-/// have without the peek, which keeps an empty stdin answering `early EOF`.
-fn peek_pack_header(stream: &mut impl Read) -> io::Result<(Vec<u8>, Option<u32>)> {
-    let mut header = [0u8; 12];
-    let mut filled = 0;
-    while filled < header.len() {
-        match stream.read(&mut header[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-
-    let bytes = header[..filled].to_vec();
-    let declared = (filled == header.len() && &bytes[0..4] == b"PACK")
-        .then(|| u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]));
-    Ok((bytes, declared))
-}
-
-/// A scratch directory under the git dir, removed when this value is dropped so
-/// the intermediate pack never survives an early return.
-struct Scratch {
-    path: std::path::PathBuf,
-}
-
-impl Scratch {
-    fn new(repo: &gix::Repository) -> Result<Self> {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let path = repo
-            .git_dir()
-            .join(format!("zvcs-unpack-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&path)?;
-        Ok(Scratch { path })
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Stdin wrapper that counts the pack bytes handed downstream and refuses to
-/// serve more once `--max-input-size` has been passed, mirroring the check git
-/// performs in its `fill()`.
-struct Limited<R> {
-    inner: R,
-    /// The byte budget; `0` means unlimited, as in git.
-    limit: u64,
-    /// How many bytes the pack reader has taken so far.
-    consumed: u64,
-}
-
-impl<R> Limited<R> {
-    fn over_budget(&self) -> bool {
-        self.limit != 0 && self.consumed > self.limit
-    }
-
-    fn check(&self) -> io::Result<()> {
-        if self.over_budget() {
-            return Err(io::Error::other("pack exceeds maximum allowed size"));
-        }
-        Ok(())
-    }
-}
-
-impl<R: Read> Read for Limited<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.check()?;
-        let n = self.inner.read(buf)?;
-        self.consumed += n as u64;
-        Ok(n)
-    }
-}
-
-impl<R: BufRead> BufRead for Limited<R> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.check()?;
-        self.inner.fill_buf()
-    }
-
-    // Only `consume` advances the count for the buffered path; `read` accounts
-    // for its own bytes above, and the two paths never overlap.
-    fn consume(&mut self, amt: usize) {
-        self.consumed += amt as u64;
-        self.inner.consume(amt);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,26 +1071,5 @@ mod tests {
         assert_eq!(parse_magnitude("abc"), 0);
         assert_eq!(parse_magnitude(""), 0);
         assert_eq!(parse_magnitude("0"), 0);
-    }
-
-    /// A short stream has to come back untouched so the decoder still reports
-    /// the truncation; an empty stdin is the common case for this.
-    #[test]
-    fn peeking_a_short_header_returns_every_byte() {
-        let (bytes, declared) = peek_pack_header(&mut &b""[..]).expect("empty read succeeds");
-        assert!(bytes.is_empty());
-        assert_eq!(declared, None);
-
-        let (bytes, declared) = peek_pack_header(&mut &b"PACK"[..]).expect("short read succeeds");
-        assert_eq!(bytes, b"PACK");
-        assert_eq!(declared, None);
-
-        let mut full = Vec::from(*b"PACK");
-        full.extend_from_slice(&2u32.to_be_bytes());
-        full.extend_from_slice(&3u32.to_be_bytes());
-        full.extend_from_slice(b"trailing");
-        let (bytes, declared) = peek_pack_header(&mut full.as_slice()).expect("full read succeeds");
-        assert_eq!(bytes.len(), 12);
-        assert_eq!(declared, Some(3));
     }
 }

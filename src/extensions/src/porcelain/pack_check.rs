@@ -315,10 +315,16 @@ impl Reader<'_> {
                     ));
                 }
                 Some(delta) => {
-                    data = patch_delta(&base, &delta, out);
-                    if data.is_none() {
-                        out.error("failed to apply delta".to_string());
-                    }
+                    data = match patch_delta(&base, &delta) {
+                        Ok(result) => Some(result),
+                        Err(line) => {
+                            if let Some(line) = line {
+                                out.lines.push(format!("error: {line}"));
+                            }
+                            out.error("failed to apply delta".to_string());
+                            None
+                        }
+                    };
                 }
             }
         }
@@ -362,23 +368,21 @@ fn delta_hdr_size(data: &[u8], at: &mut usize) -> usize {
     }
 }
 
-/// `patch_delta()` (patch-delta.c:15-96): `None` for a delta that does not fit
-/// `base`, after the one diagnostic git prints for it, if any.
-fn patch_delta(base: &[u8], delta: &[u8], out: &mut PackCheck) -> Option<Vec<u8>> {
+/// `patch_delta()` (patch-delta.c:15-96): the delta applied to `base`, or
+/// `Err` for a delta that does not fit it, carrying the one `error()` git
+/// prints for it, if any. Shared with `unpack-objects`.
+pub(super) fn patch_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, Option<&'static str>> {
     const DELTA_SIZE_MIN: usize = 4;
     if delta.len() < DELTA_SIZE_MIN {
-        return None;
+        return Err(None);
     }
     let mut at = 0usize;
     if delta_hdr_size(delta, &mut at) != base.len() {
-        return None;
+        return Err(None);
     }
     let mut size = delta_hdr_size(delta, &mut at);
     let mut dst = Vec::with_capacity(size);
-    let gone_wild = |out: &mut PackCheck| {
-        out.lines.push("error: delta replay has gone wild".to_string());
-        None
-    };
+    const GONE_WILD: Result<Vec<u8>, Option<&str>> = Err(Some("delta replay has gone wild"));
     while at < delta.len() {
         let cmd = delta[at];
         at += 1;
@@ -394,7 +398,7 @@ fn patch_delta(base: &[u8], delta: &[u8], out: &mut PackCheck) -> Option<Vec<u8>
                 (0x40, 16, false),
             ] {
                 if cmd & bit != 0 {
-                    let Some(&b) = delta.get(at) else { return gone_wild(out) };
+                    let Some(&b) = delta.get(at) else { return GONE_WILD };
                     at += 1;
                     let v = usize::from(b) << shift;
                     if is_off { cp_off |= v } else { cp_size |= v }
@@ -408,23 +412,22 @@ fn patch_delta(base: &[u8], delta: &[u8], out: &mut PackCheck) -> Option<Vec<u8>
                     dst.extend_from_slice(&base[cp_off..end]);
                     size -= cp_size;
                 }
-                _ => return gone_wild(out),
+                _ => return GONE_WILD,
             }
         } else if cmd != 0 {
             let n = usize::from(cmd);
             if n > size || n > delta.len() - at {
-                return gone_wild(out);
+                return GONE_WILD;
             }
             dst.extend_from_slice(&delta[at..at + n]);
             at += n;
             size -= n;
         } else {
-            out.lines.push("error: unexpected delta opcode 0".to_string());
-            return None;
+            return Err(Some("unexpected delta opcode 0"));
         }
     }
     if size != 0 {
-        return gone_wild(out);
+        return GONE_WILD;
     }
-    Some(dst)
+    Ok(dst)
 }

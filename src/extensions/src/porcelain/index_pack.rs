@@ -1331,7 +1331,7 @@ fn fsck_pack(
     hash: Kind,
     foreign_nr: &mut u32,
 ) -> Result<()> {
-    use super::fsck::{check_blob, check_object, Severity};
+    use super::fsck::{check_blob, Severity};
     use gix::object::Kind as ObjKind;
 
     let bundle = pack::Bundle {
@@ -1441,31 +1441,13 @@ fn fsck_pack(
         // raises `strict` alone (builtin/index-pack.c:1939-1941) and so runs the
         // link pass below over content it never lints.
         if do_fsck_object {
-            let checked = check_object(kind, &data, true, hash.len_in_hex());
-            // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
-            // `error()` themselves, with no msg-id and so no severity to consult;
-            // the text arrives carrying its own `error: ` prefix.
-            for line in &checked.raw {
-                eprintln!("{line}");
-                object_error = true;
-            }
-            for finding in &checked.findings {
-                match strict_severity(finding.msg) {
-                    Severity::Ignore => {}
-                    Severity::Info | Severity::Warn => {
-                        eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
-                    }
-                    Severity::Error | Severity::Fatal => {
-                        eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
-                        object_error = true;
-                    }
-                }
-            }
-            for blob in &checked.gitmodules {
+            let reported = report_fsck_object(kind, &data, &id, hash.len_in_hex());
+            object_error |= reported.error;
+            for blob in &reported.gitmodules {
                 queued.push((*blob, true, false));
                 modules_found.insert(*blob);
             }
-            for blob in &checked.gitattributes {
+            for blob in &reported.gitattributes {
                 queued.push((*blob, false, true));
                 attrs_found.insert(*blob);
             }
@@ -1568,49 +1550,108 @@ fn fsck_pack(
             if found.is_none() {
                 found = repo.find_object(*id).ok().map(|o| (o.kind, o.data.clone()));
             }
-            let label = if *as_modules { ".gitmodules" } else { ".gitattributes" };
-            let Some((kind, data)) = found else {
-                // `fsck_objects_error_cb_print_missing_gitmodules()` answers a
-                // missing `.gitmodules` by printing its id and *not* failing:
-                // that id is what `unpack-objects`' caller fetches next.
-                if *as_modules {
-                    println!("{id}");
-                } else {
-                    eprintln!("error: object {id}: gitattributesMissing: unable to read {label} blob");
-                    finish_error = true;
-                }
-                continue;
-            };
-            if kind != ObjKind::Blob {
-                let msg = if *as_modules { "gitmodulesBlob" } else { "gitattributesBlob" };
-                eprintln!("error: object {id}: {msg}: non-blob found at {label}");
-                finish_error = true;
-                continue;
-            }
-            // `fsck_finish()` reaches a queued blob through `fsck_blobs()`, which
-            // always reads the whole object (`fsck.c:1337`), so no blob is
-            // streamed here however big it is. The streamed case belongs to the
-            // per-object pass above, where `unpack_entry_data()` returns `NULL`
-            // for a blob over `core.bigFileThreshold`
-            // (`builtin/index-pack.c:488`) — see [`fsck_pack_blob_buffer`].
-            for finding in check_blob(Some(&data), *as_modules, *as_attrs) {
-                match strict_severity(finding.msg) {
-                    Severity::Ignore => {}
-                    Severity::Info | Severity::Warn => {
-                        eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
-                    }
-                    Severity::Error | Severity::Fatal => {
-                        eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
-                        finish_error = true;
-                    }
-                }
-            }
+            finish_error |= report_fsck_finish_blob(id, found, *as_modules, *as_attrs);
         }
         if finish_error {
             crate::git_fatal!("fsck error in pack objects");
         }
     }
     Ok(())
+}
+
+/// What `fsck_object()` reported for one object, through
+/// `fsck_objects_error_function()` (fsck.c:1282-1297) at strict severity.
+pub(super) struct ReportedObject {
+    /// Some line was an `error:` — `fsck_object()` returned non-zero.
+    pub error: bool,
+    /// The blobs a tree named `.gitmodules` / `.gitattributes`, which
+    /// `fsck_finish()` checks later.
+    pub gitmodules: Vec<ObjectId>,
+    pub gitattributes: Vec<ObjectId>,
+}
+
+/// `fsck_object()` for a commit, tree or tag under strict options, printing
+/// each finding as `error: object <oid>: <msg-id>: <text>` or `warning: …`.
+/// Shared by `index-pack --strict` and `unpack-objects --strict`.
+pub(super) fn report_fsck_object(
+    kind: gix::object::Kind,
+    data: &[u8],
+    id: &ObjectId,
+    hexsz: usize,
+) -> ReportedObject {
+    use super::fsck::{check_object, Severity};
+    let checked = check_object(kind, data, true, hexsz);
+    let mut error = false;
+    // `init_tree_desc_gently()` and `update_tree_entry_gently()` call
+    // `error()` themselves, with no msg-id and so no severity to consult;
+    // the text arrives carrying its own `error: ` prefix.
+    for line in &checked.raw {
+        eprintln!("{line}");
+        error = true;
+    }
+    for finding in &checked.findings {
+        match strict_severity(finding.msg) {
+            Severity::Ignore => {}
+            Severity::Info | Severity::Warn => {
+                eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+            }
+            Severity::Error | Severity::Fatal => {
+                eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                error = true;
+            }
+        }
+    }
+    ReportedObject {
+        error,
+        gitmodules: checked.gitmodules.clone(),
+        gitattributes: checked.gitattributes.clone(),
+    }
+}
+
+/// `fsck_blobs()` (fsck.c) for one `.gitmodules` / `.gitattributes` blob
+/// `fsck_finish()` checks, given what reading it found. Returns whether it
+/// reported an error.
+pub(super) fn report_fsck_finish_blob(
+    id: &ObjectId,
+    found: Option<(gix::object::Kind, Vec<u8>)>,
+    as_modules: bool,
+    as_attrs: bool,
+) -> bool {
+    use super::fsck::{check_blob, Severity};
+    let label = if as_modules { ".gitmodules" } else { ".gitattributes" };
+    let Some((kind, data)) = found else {
+        // `fsck_objects_error_cb_print_missing_gitmodules()` answers a
+        // missing `.gitmodules` by printing its id and *not* failing:
+        // that id is what `unpack-objects`' caller fetches next.
+        if as_modules {
+            println!("{id}");
+            return false;
+        }
+        eprintln!("error: object {id}: gitattributesMissing: unable to read {label} blob");
+        return true;
+    };
+    if kind != gix::object::Kind::Blob {
+        let msg = if as_modules { "gitmodulesBlob" } else { "gitattributesBlob" };
+        eprintln!("error: object {id}: {msg}: non-blob found at {label}");
+        return true;
+    }
+    // `fsck_finish()` reaches a queued blob through `fsck_blobs()`, which
+    // always reads the whole object (`fsck.c:1337`), so no blob is streamed
+    // here however big it is.
+    let mut error = false;
+    for finding in check_blob(Some(&data), as_modules, as_attrs) {
+        match strict_severity(finding.msg) {
+            Severity::Ignore => {}
+            Severity::Info | Severity::Warn => {
+                eprintln!("warning: object {id}: {}: {}", finding.msg.id, finding.text);
+            }
+            Severity::Error | Severity::Fatal => {
+                eprintln!("error: object {id}: {}: {}", finding.msg.id, finding.text);
+                error = true;
+            }
+        }
+    }
+    error
 }
 
 /// `fsck_msg_severity()` for `index-pack`: its options always carry `strict = 1`
@@ -1628,7 +1669,7 @@ fn fsck_pack(
 /// `false` is its `NULL`. The parsers for the two types that can fail print their
 /// own `error:` lines first; a tree is only recorded here and decoded lazily, so
 /// `parse_tree_buffer()` cannot fail, and a blob has no parser at all.
-fn parse_object_buffer(
+pub(super) fn parse_object_buffer(
     kind: gix::object::Kind,
     data: &[u8],
     id: &ObjectId,
@@ -1763,7 +1804,7 @@ fn parse_tag_buffer(data: &[u8], id: &ObjectId, hexsz: usize) -> bool {
     data[at..].contains(&b'\n')
 }
 
-fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
+pub(super) fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
     use super::fsck::Severity;
     match msg.default {
         Severity::Warn => Severity::Error,
@@ -1781,7 +1822,7 @@ fn strict_severity(msg: &super::fsck::Msg) -> super::fsck::Severity {
 /// [`parse_commit_buffer`] read, so a commit with no `author` line still links to
 /// its tree. A gitlink is skipped: it names a commit in another repository, which
 /// `fsck_walk_tree()` never follows.
-fn collect_links(
+pub(super) fn collect_links(
     kind: gix::object::Kind,
     data: &[u8],
     id: &ObjectId,

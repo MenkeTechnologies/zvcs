@@ -5477,6 +5477,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         email: EmailStyle {
             subject_prefix: &cfg_subject_prefix,
             encode_headers: encode_email_headers,
+            output_encoding: &output_encoding,
         },
         output_encoding: &output_encoding,
     });
@@ -9293,14 +9294,20 @@ pub(crate) struct EmailStyle<'a> {
     /// 50, 172, 566-569); `--[no-]encode-email-headers` is `setup_revisions()`'s
     /// own option (revision.c:2526-2529), so the last spelling wins.
     pub(crate) encode_headers: bool,
+    /// `get_log_output_encoding()`, which `pretty_print_commit()` hands to
+    /// `pp_user_info()` and `pp_email_subject()` (pretty.c:2298-2320): the
+    /// charset the RFC2047 words and the 8-bit `Content-Type:` name. The
+    /// commit itself was already re-coded into it.
+    pub(crate) output_encoding: &'a str,
 }
 
 impl EmailStyle<'_> {
     /// `builtin/rev-list.c`'s `struct pretty_print_context ctx = {0}`: no `rev`,
     /// so `fmt_output_email_subject()` is never reached and neither the config
     /// nor the command-line switch behind these two fields is visible to it.
+    /// `rev-list` itself refuses any `--encoding` but UTF-8 and `none`.
     pub(crate) const REV_LIST: EmailStyle<'static> =
-        EmailStyle { subject_prefix: "", encode_headers: false };
+        EmailStyle { subject_prefix: "", encode_headers: false, output_encoding: "UTF-8" };
 }
 
 /// The two keys `git_log_config()` reads for [`EmailStyle`], as
@@ -9368,11 +9375,12 @@ pub(super) fn write_identity_headers_for(
     sb: &mut Vec<u8>,
     who: &gix::actor::SignatureRef<'_>,
     encode: bool,
+    encoding: &str,
     mailmap: Option<&Mailmap>,
 ) -> Result<()> {
     let date = show_ident_date(who.time, DateMode::Rfc, now_secs());
     let (name, mail) = mapped_ident(who.name, who.email, mailmap);
-    super::format_patch::write_identity_headers(sb, &name, &mail, &date, encode, "UTF-8");
+    super::format_patch::write_identity_headers(sb, &name, &mail, &date, encode, encoding);
     Ok(())
 }
 
@@ -9390,7 +9398,7 @@ pub(super) fn email_body(
     // `pp_header()` → `pp_user_info(pp, "Author", …)`, whose mail branch writes
     // `From:` and then the RFC2822 `Date:` (pretty.c:516-595). `add_merge_info()`
     // returns early for a mail format, so a merge has no `Merge:` line here.
-    write_identity_headers_for(&mut sb, &author, style.encode_headers, mailmap)?;
+    write_identity_headers_for(&mut sb, &author, style.encode_headers, style.output_encoding, mailmap)?;
 
     let msg = super::format_patch::skip_blank_lines(raw);
     let (title, rest) = super::format_patch::format_subject(msg);
@@ -9400,7 +9408,7 @@ pub(super) fn email_body(
         sb.extend_from_slice(format!("Subject: [{}] ", style.subject_prefix).as_bytes());
     }
     if style.encode_headers && super::format_patch::needs_rfc2047_encoding(&title) {
-        super::format_patch::add_rfc2047(&mut sb, &title, "UTF-8", false);
+        super::format_patch::add_rfc2047(&mut sb, &title, style.output_encoding, false);
     } else {
         let consumed = -super::format_patch::last_line_length(&sb);
         super::format_patch::wrap_text(
@@ -9417,14 +9425,12 @@ pub(super) fn email_body(
     // only at the *body*: the author line may be non-ASCII while the log is not.
     // It runs on the reencoded message, which — with no `encoding` header and
     // `i18n.commitEncoding` unset — is the raw one.
-    let body_is_8bit = {
-        let after_headers = raw;
-        after_headers.iter().any(|&b| b >= 0x80)
-    };
+    let body_is_8bit = super::format_patch::has_non_ascii(raw);
     if body_is_8bit {
         sb.extend_from_slice(b"MIME-Version: 1.0\n");
-        sb.extend_from_slice(b"Content-Type: text/plain; charset=UTF-8\n");
-        sb.extend_from_slice(b"Content-Transfer-Encoding: 8bit\n");
+        sb.extend_from_slice(b"Content-Type: text/plain; charset=");
+        sb.extend_from_slice(style.output_encoding.as_bytes());
+        sb.extend_from_slice(b"\nContent-Transfer-Encoding: 8bit\n");
     }
     // `if (cmit_fmt_is_mail(pp->fmt)) strbuf_addch(sb, '\n');` (pretty.c:2003-2005).
     sb.push(b'\n');

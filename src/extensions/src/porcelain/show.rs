@@ -2069,6 +2069,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         email: super::log::EmailStyle {
             subject_prefix: &cfg_subject_prefix,
             encode_headers: encode_email_headers.unwrap_or(cfg_encode_email_headers),
+            output_encoding: &output_encoding,
         },
         output_encoding: &output_encoding,
         combined_all_paths,
@@ -2840,6 +2841,9 @@ fn show_tag(
                 &mut sb,
                 &tagger,
                 disp.email.encode_headers,
+                // `show_tagger()`'s `pp_user_info(…, get_log_output_encoding())`
+                // (builtin/log.c:577), over the tag's own bytes.
+                disp.email.output_encoding,
                 None,
             )?;
             out.extend_from_slice(&sb);

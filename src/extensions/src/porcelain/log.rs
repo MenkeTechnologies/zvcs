@@ -3662,11 +3662,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
     // What `--maximal-only` marks is each processed commit's parents *after*
-    // `try_to_simplify_commit()` pruned them; the path-limited walk below keeps
-    // that pruning to itself, so the combination is refused rather than answered
-    // from the unpruned parents.
-    if maximal_only && (!pathspecs.is_empty() || simplify_by_decoration) {
-        bail!("--maximal-only with a pathspec or --simplify-by-decoration is not ported");
+    // `try_to_simplify_commit()` pruned them, which the path-limited walk below
+    // hands back. A reflog walk simplifies entry by entry instead, so that
+    // combination stays refused.
+    let maximal_after_prune = maximal_only
+        && (!pathspecs.is_empty() || simplify_by_decoration)
+        && !follow
+        && no_walk.is_none();
+    if maximal_after_prune && walk_reflogs {
+        bail!("--maximal-only with a pathspec and -g is not ported");
     }
     // `revision.c:3197`: the graph lays its columns out by following each commit's
     // parents into the walk, and `--no-walk` yields the named commits alone — so
@@ -4003,7 +4007,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // return commit_ignore;` (revision.c:4180). `git log` always sets
     // `verbose_header`, so `prepare_maximal_independent()`'s short cut never
     // applies to it. See [`super::rev_list::maximal_passes`].
-    if maximal_only && no_walk.is_none() {
+    if maximal_only && no_walk.is_none() && !maximal_after_prune {
         let limited = !neg_ids.is_empty()
             || order != Order::Default
             || graph
@@ -4017,7 +4021,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             || show_merge
             || line_level;
         let order_ids: Vec<ObjectId> = maximal_processed.iter().map(|(id, _)| *id).collect();
-        let parents: HashMap<ObjectId, Vec<ObjectId>> = maximal_processed.into_iter().collect();
+        let parents: HashMap<ObjectId, Vec<ObjectId>> = maximal_processed.iter().cloned().collect();
         let passes = super::rev_list::maximal_passes(
             &order_ids,
             |id| parents.get(id).cloned().unwrap_or_default(),
@@ -4502,6 +4506,41 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 stack.extend(parents.iter().copied());
             }
         }
+        // `--maximal-only` under a pathspec: `process_parents()` marks
+        // CHILD_VISITED on the parents `try_to_simplify_commit()` left
+        // (revision.c:1174, 1205), and only the commits those reach were ever
+        // processed. `get_commit_action()` tests the mark before TREESAME
+        // (revision.c:4180 vs 4221), so both filters apply — and the marks are
+        // made in `limit_list()` before `simplify_merges()` rewrites anything, so
+        // they are taken here and applied once the simplification below is done.
+        // `--simplify-merges` and `--simplify-by-decoration` set `revs->limited`
+        // (revision.c:2439-2452).
+        let mut maximal_keep: Option<HashSet<ObjectId>> = None;
+        if maximal_after_prune {
+            let processed: Vec<ObjectId> = maximal_processed
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| reachable.contains(id))
+                .collect();
+            let limited = !neg_ids.is_empty()
+                || order != Order::Default
+                || graph
+                || ancestry_path
+                || cherry_mark
+                || cherry_pick
+                || left_only
+                || right_only
+                || show_children
+                || simplify_merges_opt
+                || show_merge
+                || line_level;
+            maximal_keep = Some(super::rev_list::maximal_passes(
+                &processed,
+                |id| simplified.get(id).map(|(p, _)| p.clone()).unwrap_or_default(),
+                first_parent,
+                limited,
+            ));
+        }
         if simplify_merges_opt {
             // `simplify_merges()` prunes `revs->commits` to the commits that
             // simplify to themselves; `get_commit_action()` then applies its own
@@ -4573,6 +4612,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             nodes.retain(|n| {
                 reachable.contains(&n.id) && simplified.get(&n.id).is_some_and(|(_, shown)| *shown)
             });
+        }
+
+        if let Some(keep) = &maximal_keep {
+            nodes.retain(|n| keep.contains(&n.id));
         }
 
         // The in-place prune belongs to the walk, so it lands on every commit that

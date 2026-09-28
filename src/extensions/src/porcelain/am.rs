@@ -112,15 +112,19 @@
 //! `fatal: unable to read from stdin; aborting` with the state directory left in
 //! place. See [`do_interactive`].
 //!
+//! `-S[<key-id>]`/`--gpg-sign[=<key-id>]`/`--no-gpg-sign`, over the
+//! `commit.gpgSign` default `am_state_init()` reads, sign the commit through
+//! `commit-tree -S`; a signing failure is its `error()` followed by `fatal:
+//! failed to write commit object`. `--ignore-date` and
+//! `--committer-date-is-author-date` are honoured: the first drops the mail's
+//! author date, the second dates the committer by it.
+//!
 //! ## What is not served, and why
 //!
 //! These reshape the commit or the flow in ways this port cannot reproduce
 //! faithfully through the ported subcommands, so each refuses *before* it could
 //! write a wrong object or worktree rather than emit a guess:
 //!
-//!   * **`-S`.** Signing the commit needs a path `git commit-tree` does not expose
-//!     here. `--ignore-date` and `--committer-date-is-author-date` are honoured:
-//!     the first drops the mail's author date, the second dates the committer by it.
 //!   * **`GIT binary patch` bodies under `--rebasing`.** `write_commit_patch`
 //!     regenerates the diff with `git diff-tree`, which does not accept
 //!     `--binary` in this binary yet, so a replayed commit that changes a binary
@@ -419,7 +423,12 @@ struct Opts {
     // than the historical no-op) to refuse before writing a wrong commit.
     ignore_date: bool,
     committer_date_is_author_date: bool,
-    gpg_sign: bool,
+    /// `state->sign_commit` as the command line left it: `None` when neither
+    /// `-S` nor `--no-gpg-sign` was given (so `commit.gpgSign` decides, see
+    /// [`sign_commit`]), `Some(None)` for `--no-gpg-sign`, and `Some(Some(key))`
+    /// for `-S[<key-id>]`/`--gpg-sign[=<key-id>]`, whose bare form is the `""`
+    /// default key (builtin/am.c:2429-2438).
+    gpg_sign: Option<Option<String>>,
 }
 
 impl Default for Opts {
@@ -448,7 +457,7 @@ impl Default for Opts {
             apply_opts: Vec::new(),
             ignore_date: false,
             committer_date_is_author_date: false,
-            gpg_sign: false,
+            gpg_sign: None,
         }
     }
 }
@@ -917,10 +926,11 @@ fn parse_long(
             no_value(tok, attached)?;
             o.binary_given = true;
         }
-        "gpg-sign" => o.gpg_sign = true, // optional value, attached only
+        // `PARSE_OPT_OPTARG`: the value is attached or absent.
+        "gpg-sign" => o.gpg_sign = Some(Some(attached.unwrap_or_default().to_owned())),
         "no-gpg-sign" => {
             no_value(tok, attached)?;
-            o.gpg_sign = false;
+            o.gpg_sign = Some(None);
         }
         "rebasing" => {
             no_value(tok, attached)?;
@@ -1019,7 +1029,7 @@ fn parse_short(
             }
             // `-S[<key-id>]` takes an optional attached value.
             'S' => {
-                o.gpg_sign = true;
+                o.gpg_sign = Some(Some(body[at..].to_owned()));
                 at = bytes.len();
             }
             // parse_options_step() tests `internal_help` inside the
@@ -1852,7 +1862,7 @@ struct Cli {
     resolvemsg: Option<String>,
     ignore_date: bool,
     committer_date_is_author_date: bool,
-    gpg_sign: bool,
+    gpg_sign: Option<Option<String>>,
 }
 
 impl Cli {
@@ -1864,7 +1874,7 @@ impl Cli {
             resolvemsg: o.resolvemsg.clone(),
             ignore_date: o.ignore_date,
             committer_date_is_author_date: o.committer_date_is_author_date,
-            gpg_sign: o.gpg_sign,
+            gpg_sign: o.gpg_sign.clone(),
         }
     }
 }
@@ -2207,13 +2217,6 @@ fn run_am_loop(
             }
         }
 
-        if cli.gpg_sign {
-            bail!(
-                "`git am -S` is not ported: signing the commit it writes needs the signing \
-                 path `commit-tree` does not expose here"
-            );
-        }
-
         if let Some(code) = do_commit(
             &ctx,
             repo,
@@ -2223,6 +2226,7 @@ fn run_am_loop(
             cli.no_verify,
             cli.ignore_date,
             cli.committer_date_is_author_date,
+            sign_commit(repo, cli).as_deref(),
         )? {
             return Ok(code);
         }
@@ -2232,6 +2236,17 @@ fn run_am_loop(
     }
 
     finish_am_run(repo, state_dir, &ld)
+}
+
+/// `state->sign_commit` for this invocation: `am_state_init()` seeds it from
+/// `commit.gpgSign` (`""` when true, NULL when false; builtin/am.c:176-177) and
+/// `-S`/`--no-gpg-sign` overwrite it. It is not saved in the state directory, so
+/// a `--continue` is signed by its own command line and configuration.
+fn sign_commit(repo: &gix::Repository, cli: &Cli) -> Option<String> {
+    match &cli.gpg_sign {
+        Some(explicit) => explicit.clone(),
+        None => (repo.config_snapshot().boolean("commit.gpgSign") == Some(true)).then(String::new),
+    }
 }
 
 /// What one turn of the `-i` prompt decided about the patch in hand.
@@ -2946,6 +2961,9 @@ fn do_commit(
     // `--committer-date-is-author-date` dates the committer by the author's.
     ignore_date: bool,
     committer_date_is_author_date: bool,
+    // `state->sign_commit`, handed to `commit_tree_extended()`: `None` writes an
+    // unsigned commit, a key (`""` for the default one) signs it.
+    sign: Option<&str>,
 ) -> Result<Option<ExitCode>> {
     let quiet = ld.quiet;
     // `if (!state->no_verify && run_hooks("pre-applypatch")) exit(1);`
@@ -2983,6 +3001,9 @@ fn do_commit(
 
     let mut ct = ctx.cmd("commit-tree");
     ct.arg(&tree);
+    if let Some(key) = sign {
+        ct.arg(format!("-S{key}"));
+    }
     if let Some(p) = &parent {
         ct.arg("-p").arg(p.to_hex().to_string());
     }
@@ -3041,7 +3062,13 @@ fn do_commit(
         .wait_with_output()
         .map_err(|e| anyhow::anyhow!("failed to run commit-tree: {e}"))?;
     if !out.status.success() {
-        // commit-tree has already reported the reason (e.g. a bad author date).
+        // commit-tree has already reported the reason. Exit 1 is its
+        // `commit_tree()` failure — a signing error, whose `error()` it printed —
+        // on which `do_commit()` dies (builtin/am.c:1704-1707); 128 was a `die()`
+        // of its own (a bad author date, say) and has nothing more to add.
+        if out.status.code() == Some(1) {
+            eprintln!("fatal: failed to write commit object");
+        }
         return Ok(Some(ExitCode::from(128)));
     }
     let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -3174,13 +3201,6 @@ fn am_resolve(
     // user just staged and then hands back to `am_run()`, which is where
     // `state->interactive` is consulted again — so a `-i --continue` asks about
     // the *next* patch and not about this one.
-    if cli.gpg_sign {
-        bail!(
-            "`git am --continue -S` is not ported: signing the commit needs the signing path \
-             `commit-tree` does not expose here"
-        );
-    }
-
     // `repo_rerere(the_repository, 0)` immediately before `do_commit()`
     // (builtin/am.c:1982): the resolution the user just staged is recorded, so a
     // later patch that conflicts the same way replays it. The `0` is git's
@@ -3196,6 +3216,7 @@ fn am_resolve(
         cli.no_verify,
         cli.ignore_date,
         cli.committer_date_is_author_date,
+        sign_commit(repo, cli).as_deref(),
     )? {
         return Ok(code);
     }

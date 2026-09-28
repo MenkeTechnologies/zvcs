@@ -1261,6 +1261,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut unrecognized: Option<String> = None;
     // `--log-size` (`revs->show_log_size`, revision.c:2668-2669).
     let mut log_size = false;
+    let mut show_notes_by_default = false;
 
     // `--stdin` splices its lines in where it stood; `origin` tells them apart
     // from argv. See [`super::rev_list::Origin`].
@@ -1504,6 +1505,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             notes_opt.given = true;
         } else if a == "--no-standard-notes" {
             notes_opt.no_standard();
+        // `revs->show_notes_by_default` (revision.c:2599-2600), read once the
+        // command line is in.
+        } else if a == "--show-notes-by-default" {
+            show_notes_by_default = true;
         } else if a == "--no-notes" || a == "--no-show-notes" {
             notes_opt.disable();
             notes_opt.given = true;
@@ -4832,6 +4837,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // With no `--notes`/`--no-notes` of its own, a run shows notes when the caller
     // picked no format, or when the last saved user format expands `%N` — even if
     // a built-in chosen after it is what renders.
+    // `if (!revs->show_notes_given && revs->show_notes_by_default)` at the end of
+    // `setup_revisions()` (revision.c:3217-3220): the default notes tree, and it
+    // counts as given, so the test below leaves it alone.
+    if !notes_opt.given && show_notes_by_default {
+        notes_opt.enable_default();
+        notes_opt.given = true;
+    }
     if !notes_opt.given && (!pretty_given || user_format_wants_notes) {
         notes_opt.show_only();
     }

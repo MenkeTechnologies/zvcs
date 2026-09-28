@@ -223,6 +223,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // (and its `default_encode_email_headers = 1`) in charge.
     let mut encode_email_headers: Option<bool> = None;
     let mut notes_opt = super::notes::DisplayOpt::default();
+    let mut show_notes_by_default = false;
     let mut after_dashdash = false;
     // `setup_revisions()`'s `seen_dashdash`, which it establishes in a scan of
     // the whole argument vector *before* it resolves anything — so it is in
@@ -611,6 +612,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 notes_opt.given = true;
             }
             "--no-standard-notes" => notes_opt.no_standard(),
+            // `revs->show_notes_by_default` (revision.c:2599-2600), read at the
+            // end of `setup_revisions()` below.
+            "--show-notes-by-default" => show_notes_by_default = true,
             a if a.starts_with("--show-notes=") => {
                 notes_opt.enable_ref_show(&a["--show-notes=".len()..]);
                 notes_opt.given = true;
@@ -2005,6 +2009,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut shown: Vec<ObjectId> = Vec::new();
     // git's `rev_info.shown_one`, which drives the inter-record separator.
     let mut shown_one = false;
+    // `if (!revs->show_notes_given && revs->show_notes_by_default)` at the end of
+    // `setup_revisions()` (revision.c:3217-3220): the default notes tree, and it
+    // counts as given, so the `cmd_log_init_finish()` test below leaves it alone.
+    if !notes_opt.given && show_notes_by_default {
+        notes_opt.enable_default();
+        notes_opt.given = true;
+    }
     if !notes_opt.given && (!pretty_given || matches!(pretty, Pretty::User(_))) {
         notes_opt.show_only();
     }

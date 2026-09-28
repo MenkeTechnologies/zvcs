@@ -385,7 +385,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     let mut write_pack = |mode| {
         saw_eof.set(false);
         gix::odb::pack::Bundle::write_to_directory(
-            &mut EofWatch { inner: &raw, at: 0, saw_eof: &saw_eof },
+            &mut super::index_pack::EofWatch { inner: raw.as_slice(), saw_eof: &saw_eof },
             // A dry run still decodes and verifies every entry; it just discards
             // the index and pack instead of keeping them around to read back.
             scratch.as_ref().map(|s| s.path.as_path()),
@@ -903,44 +903,6 @@ impl<R: Read> Read for Limited<R> {
         let n = self.inner.read(buf)?;
         self.consumed += n as u64;
         Ok(n)
-    }
-}
-
-/// A `BufRead` over the staged pack bytes that notices when the decoder reads
-/// past the end.
-///
-/// `gix-pack` answers both a truncated entry and a zlib stream that ended short
-/// of its declared size with `input::Error::IncompletePack`, but git tells them
-/// apart: the first hits `fill(1)` (builtin/unpack-objects.c:144) and dies
-/// `early EOF`, the second falls out of `get_data()`'s loop into
-/// `error("inflate returned %d")`. Only the first asks for bytes that are not
-/// there, so `saw_eof` is what distinguishes them.
-struct EofWatch<'a> {
-    inner: &'a [u8],
-    at: usize,
-    saw_eof: &'a std::cell::Cell<bool>,
-}
-
-impl Read for EofWatch<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = self.fill_buf()?;
-        let n = available.len().min(buf.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.at += n;
-        Ok(n)
-    }
-}
-
-impl BufRead for EofWatch<'_> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.at >= self.inner.len() {
-            self.saw_eof.set(true);
-        }
-        Ok(&self.inner[self.at..])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        self.at = (self.at + amt).min(self.inner.len());
     }
 }
 

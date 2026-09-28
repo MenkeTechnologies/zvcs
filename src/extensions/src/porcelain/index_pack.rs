@@ -513,6 +513,55 @@ fn git_wording(e: &anyhow::Error) -> Option<String> {
     }
 }
 
+/// A `BufRead` that notices when the pack decoder reads past the end of its
+/// input.
+///
+/// `gix-pack` answers both a truncated entry and a zlib stream that ended short
+/// of its declared size with `input::Error::IncompletePack`, but git tells them
+/// apart: the first runs `fill()` dry and dies `early EOF`
+/// (builtin/index-pack.c:325-331, builtin/unpack-objects.c:78-84), the second
+/// is an inflate failure. Only the first asks for bytes that are not there, so
+/// `saw_eof` is what distinguishes them.
+pub(super) struct EofWatch<'a, R> {
+    pub inner: R,
+    pub saw_eof: &'a std::cell::Cell<bool>,
+}
+
+impl<R: io::BufRead> Read for EofWatch<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = io::BufRead::fill_buf(self)?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        io::BufRead::consume(self, n);
+        Ok(n)
+    }
+}
+
+impl<R: io::BufRead> io::BufRead for EofWatch<'_, R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        let available = self.inner.fill_buf()?;
+        if available.is_empty() {
+            self.saw_eof.set(true);
+        }
+        Ok(available)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+    }
+}
+
+/// `early EOF` for a stream error that ran the input dry — see [`EofWatch`].
+fn early_eof(e: &anyhow::Error, saw_eof: bool) -> bool {
+    saw_eof
+        && e.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<pack::data::input::Error>(),
+                Some(pack::data::input::Error::IncompletePack { .. })
+            )
+        })
+}
+
 /// `index-pack.c::parse_pack_header`, which runs before a byte of pack body is
 /// read: `fill()` dies with `early EOF` when the twelve header bytes are not
 /// there at all, and the signature and version are checked in that order.
@@ -732,7 +781,11 @@ fn write_index_for_pack(
     foreign_nr: &mut u32,
 ) -> Result<ObjectId> {
     let hash = opts.object_hash();
-    let file = io::BufReader::new(fs::File::open(pack_path)?);
+    let saw_eof = std::cell::Cell::new(false);
+    let file = EofWatch {
+        inner: io::BufReader::new(fs::File::open(pack_path)?),
+        saw_eof: &saw_eof,
+    };
     let mut entries = pack::data::input::BytesToEntriesIter::new_from_header(
         file,
         pack::data::input::Mode::Verify,
@@ -768,7 +821,11 @@ fn write_index_for_pack(
         Err(e) => {
             drop(out);
             let _ = fs::remove_file(&tmp);
-            return Err(e.into());
+            let e = anyhow::Error::from(e);
+            if early_eof(&e, saw_eof.get()) {
+                bail!("early EOF");
+            }
+            return Err(e);
         }
     };
     out.flush()?;
@@ -1042,7 +1099,11 @@ fn index_from_stdin(
         return Ok(code);
     }
     let object_count = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
-    let mut chained = io::Cursor::new(header).chain(input);
+    let saw_eof = std::cell::Cell::new(false);
+    let mut chained = EofWatch {
+        inner: io::Cursor::new(header).chain(input),
+        saw_eof: &saw_eof,
+    };
     let input: &mut dyn io::BufRead = &mut chained;
 
     // Where the pack is written before it is renamed onto its destination.
@@ -1090,7 +1151,16 @@ fn index_from_stdin(
             },
         );
         drop(progress);
-        let outcome = outcome?;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                let e = anyhow::Error::from(e);
+                if early_eof(&e, saw_eof.get()) {
+                    bail!("early EOF");
+                }
+                return Err(e);
+            }
+        };
 
         let hash = outcome.index.data_hash;
         let (Some(gix_data), Some(gix_index)) = (&outcome.data_path, &outcome.index_path) else {

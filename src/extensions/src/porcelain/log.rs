@@ -2865,6 +2865,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     if !line_prefix.is_empty() && z {
         bail!("unsupported option --line-prefix with -z");
     }
+    // The two-way patch takes the prefix from the shared painter, which places it
+    // inside a word diff only where `fn_out_diff_words_write_helper()` does. Under
+    // `--graph` the prefix is `graph_padding_line()` as well, drawn per line by
+    // [`render_graph`] over the finished record, so the painter is left out there.
+    if !graph {
+        patch_opts.line_prefix = line_prefix.clone();
+    }
     if name_only as u8 + name_status as u8 + no_output_bit as u8 + check as u8 > 1 {
         eprintln!(
             "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
@@ -5107,7 +5114,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     _ => {
                         let jobs: Vec<(ObjectId, Option<ObjectId>)> =
                             candidates.iter().map(|n| (n.id, n.parents.first().copied())).collect();
-                        let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, ..patch_opts.clone() }, &diff_pathspecs, false)?;
+                        let patches = super::diff::commit_patches(&repo, &jobs, &super::diff::PatchOpts { ctx: 0, line_prefix: Vec::new(), ..patch_opts.clone() }, &diff_pathspecs, false)?;
                         Ok(candidates
                             .into_iter()
                             .zip(patches)
@@ -5777,6 +5784,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         let mut record_queue_empty = false;
         // `--no-commit-id`: the record's diff output, printed ahead of the header.
         let mut diff_before_header: Vec<u8> = Vec::new();
+        // The span of the record (`block`, or `diff_before_header` under
+        // `--no-commit-id`) holding a two-way patch the painter already prefixed:
+        // see [`super::diff::PatchOpts::line_prefix`].
+        let mut painted: Option<(usize, usize)> = None;
         if walk_only {
             let Pretty::User(fmt) = &pretty else { unreachable!() };
             let mut block: Vec<u8> = Vec::new();
@@ -5961,6 +5972,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // (diff.c:7238 sits outside the block that does), so `--dirstat -p` runs
             // the patch straight on.
             let mut separator = false;
+            // Where in `diff` the painter-prefixed patch sits.
+            let mut painted_diff: Option<(usize, usize)> = None;
             // `log_tree_diff_flush()` separates the message from the diff whenever the
             // pair queue is non-empty, even for a format that has nothing to say about
             // those pairs (`--summary` over a plain content change).
@@ -6483,7 +6496,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     true => super::diff::commit_patches(
                         &repo,
                         &[(node.id, diff_parent)],
-                        &patch_opts,
+                        // Spliced below by the `diff --git` lines it finds, so it is
+                        // painted bare and prefixed with the rest of the record.
+                        &super::diff::PatchOpts { line_prefix: Vec::new(), ..patch_opts.clone() },
                         &diff_pathspecs,
                         false,
                     )?
@@ -6529,7 +6544,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         // earlier block and the patch is a NUL instead.
                         diff.push(rec_term);
                     }
+                    let at = diff.len();
                     diff.extend_from_slice(p);
+                    // The two-way patch was painted with the prefix; the combined
+                    // one and a re-merge's spliced patch were not.
+                    if !combined_record && remerge_here.is_none() {
+                        painted_diff = Some((at, diff.len()));
+                    }
                 }
             }
             // A merge's combined diff is separated from the header even under
@@ -6581,6 +6602,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // see the record assembly below.
                 if !probe_queue && (want_names || emit_patch || check) {
                     diff_before_header = std::mem::take(&mut diff);
+                    painted = painted_diff;
                 }
             } else if (!diff.is_empty() || queue_nonempty || combined_here)
                 && !probe_queue
@@ -6613,6 +6635,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                         block.push(b'\n');
                     }
                 }
+                let at = block.len();
+                painted = painted_diff.map(|(s, e)| (at + s, at + e));
                 block.extend_from_slice(&diff);
             }
             record_has_diff =
@@ -6664,6 +6688,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
                 block = entry_block_from(&repo, &nodes[ni], &entries.params, &abbrev_cache, None)?;
                 msg_len = block.len();
+                painted = None;
             }
         }
         // `cmd_whatchanged()` leaves `always_show_header` off, so `log_tree_commit()`
@@ -6723,6 +6748,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             if !terminator && !first {
                 piece.push(rec_term);
             }
+            painted = painted.map(|(s, e)| (piece.len() + s, piece.len() + e));
             piece.extend_from_slice(&block);
             first = false;
         }
@@ -6731,7 +6757,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `show_log()` wrote. Applied per record because the records stream; a
         // record ends in its terminator, so the next record's leading prefix lands
         // exactly where an interior newline would have put it.
-        let piece = super::diff::apply_line_prefix(piece, &line_prefix);
+        let piece = super::diff::apply_line_prefix_except(piece, &line_prefix, painted.as_slice());
         // Each block ends in a newline, so the line-buffered stdout flushes it here;
         // a closed downstream pipe (`| head`) surfaces as a BrokenPipe on this write,
         // which is a normal stop rather than an error. No per-commit flush is needed.

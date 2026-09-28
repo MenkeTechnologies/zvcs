@@ -2091,7 +2091,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         compact_summary,
         relative: patch_opts.relative.clone().unwrap_or_default(),
         dirstat,
-        patch: patch_opts.clone(),
+        // The two-way patch takes `--line-prefix` from the shared painter, which
+        // places it inside a word diff only where git does; see
+        // [`super::diff::PatchOpts::line_prefix`].
+        patch: super::diff::PatchOpts { line_prefix: line_prefix.clone(), ..patch_opts.clone() },
         order_failure: std::cell::RefCell::new(order_failure),
         decorate,
         decorations: decorations.as_ref(),
@@ -4168,10 +4171,20 @@ fn show_commit_record(
                         .map(|p| String::from_utf8_lossy(p).into_owned())
                         .collect(),
                 };
+                let bare;
                 let body = super::diff::commit_patches(
                     repo,
                     &[(commit.id, against)],
-                    &disp.patch,
+                    // A re-merge's notices are spliced in by the `diff --git`
+                    // lines they find, so that patch is painted bare and prefixed
+                    // with the rest of the record.
+                    match remerge_headers.is_empty() {
+                        true => &disp.patch,
+                        false => {
+                            bare = super::diff::PatchOpts { line_prefix: Vec::new(), ..disp.patch.clone() };
+                            &bare
+                        }
+                    },
                     &specs,
                     false,
                 )?
@@ -4181,12 +4194,17 @@ fn show_commit_record(
                 // `create_filepairs_for_header_only_notifications()` injects
                 // (diff.c:7050-7096) — the two halves of how a remerge's conflict
                 // notices reach the patch.
+                let start = out.len();
+                let painted = remerge_headers.is_empty();
                 out.extend_from_slice(&splice_remerge_headers(
                     body,
                     &remerge_headers,
                     show_conflict_headers,
                     &disp.patch.colors,
                 ));
+                if painted && out.len() != start {
+                    disp.no_prefix.borrow_mut().push((start, out.len()));
+                }
             }
         }
     }

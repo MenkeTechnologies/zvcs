@@ -6009,6 +6009,13 @@ pub(crate) struct PatchOpts {
     /// `prepare_order()`: the patterns `diffcore_order()` sorts each commit's queue
     /// by. `None` leaves the queue in path order.
     pub order: Option<std::sync::Arc<Vec<Vec<u8>>>>,
+    /// `diff_line_prefix(o)` (`--line-prefix=<s>`), placed by the shared painter
+    /// (see [`diff_color::PaintOptions::line_prefix`]) so the word diff's records
+    /// carry it only where git writes it. A submodule line gets it like any
+    /// `emit_line()` output; an external driver's stdout never does, since the
+    /// child writes to git's own descriptor. A caller that sets it must leave the
+    /// returned patch out of its own prefixing pass. Empty prefixes nothing.
+    pub line_prefix: Vec<u8>,
 }
 
 impl Default for PatchOpts {
@@ -6046,6 +6053,7 @@ impl Default for PatchOpts {
             extra: diff_color::ExtraPaint::default(),
             colors: diff_color::DiffColors::disabled(),
             order: None,
+            line_prefix: Vec::new(),
         }
     }
 }
@@ -6433,6 +6441,7 @@ fn commit_patch_with(
     let paint_opts = diff_color::PaintOptions {
         ws_error_highlight: opts.ws_error_highlight,
         indicators: opts.indicators,
+        line_prefix: opts.line_prefix.clone(),
         ..Default::default()
     };
     let mut plain: Vec<u8> = Vec::new();
@@ -6523,6 +6532,7 @@ fn commit_patch_with(
                 ));
                 plain.clear();
                 files.clear();
+                let at = out.len();
                 render_submodule(
                     &mut out,
                     repo,
@@ -6532,6 +6542,11 @@ fn commit_patch_with(
                     &opts.colors,
                     r,
                 );
+                // `show_submodule_diff_summary()` and friends write through
+                // `diff_emit_submodule_*()`, i.e. `emit_diff_symbol()`, so each
+                // line opens with `diff_line_prefix()` like the patch around it.
+                let lines = out.split_off(at);
+                out.extend_from_slice(&apply_line_prefix(lines, &opts.line_prefix));
                 continue;
             }
             // A worktree side never arises for a tree diff, so `workdir` is `None`.

@@ -1335,7 +1335,7 @@ impl FilePaint {
 
 /// The parts of `struct diff_options` the emit layer reads that are the same for
 /// every file pair in one invocation.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct PaintOptions {
     /// `o->ws_error_highlight`: which of `WSEH_NEW`/`WSEH_OLD`/`WSEH_CONTEXT` are on.
     pub(crate) ws_error_highlight: u32,
@@ -1356,6 +1356,13 @@ pub(crate) struct PaintOptions {
     /// reverses the hunk header (diff.c:1761-1762). Set by `range-diff` alone
     /// (range-diff.c:524-525).
     pub(crate) dual_color_diffed_diffs: bool,
+    /// `diff_line_prefix(o)` (`--line-prefix=<s>`). Every symbol but the word
+    /// diff's own records starts its line with it (`emit_line_0()`,
+    /// diff.c:763); the word diff places it itself, only where
+    /// `fn_out_diff_words_write_helper()` and `diff_words_show()` do
+    /// (diff.c:2009-2053, 2127-2129, 2237-2275). Empty leaves the patch as is,
+    /// for a caller that prefixes nothing.
+    pub(crate) line_prefix: Vec<u8>,
 }
 
 impl Default for PaintOptions {
@@ -1368,6 +1375,7 @@ impl Default for PaintOptions {
             suppress_blank_empty: false,
             suppress_hunk_header_line_count: false,
             dual_color_diffed_diffs: false,
+            line_prefix: Vec::new(),
         }
     }
 }
@@ -1489,7 +1497,10 @@ pub(crate) fn colorize_patch_ex(
     // With nothing to paint and no word diff to compute, the patch is already
     // exactly what git would print.
     if !colors.enabled() && word_diff == WordDiff::None {
-        return patch.to_vec();
+        // `fn_out_consume()`'s `diff_suppress_blank_empty` rewrite comes before the
+        // line is emitted with its prefix (diff.c `fn_out_consume()`).
+        let patch = super::diff::suppress_blank_empty(patch.to_vec(), opts.suppress_blank_empty);
+        return super::diff::apply_line_prefix(patch, &opts.line_prefix);
     }
     let mut syms = build_syms(patch, colors, opts, files, default_file, extra);
     // `o->emitted_symbols` is only allocated when both are true, so the detector
@@ -1540,7 +1551,7 @@ fn build_syms(
                 // with that pair's `diff_words` still in hand, so whatever the last
                 // hunk left over is flushed under the driver regex it was collected
                 // under and not under the incoming pair's.
-                words.flush(&mut syms, &style, extra, &cur);
+                words.flush(&mut syms, &style, extra, &cur, &opts.line_prefix);
                 cur = files.get(file_no).cloned().unwrap_or_else(|| default_file.clone());
                 file_no += 1;
             }
@@ -1551,13 +1562,13 @@ fn build_syms(
                 lno_post = b;
                 last_kind = ind_ctx;
                 // `if (ecbdata->diff_words) diff_words_flush(ecbdata);`
-                words.flush(&mut syms, &style, extra, &cur);
+                words.flush(&mut syms, &style, extra, &cur, &opts.line_prefix);
                 syms.push(Sym::plain(Kind::Frag, line));
                 continue;
             }
             // A header ends the file pair, which is where `free_diff_words_data()`
             // flushes whatever the last hunk left behind.
-            words.flush(&mut syms, &style, extra, &cur);
+            words.flush(&mut syms, &style, extra, &cur, &opts.line_prefix);
             syms.push(Sym::plain(Kind::Meta, line));
             continue;
         }
@@ -1575,7 +1586,7 @@ fn build_syms(
                 lno_pre = a;
                 lno_post = b;
                 last_kind = ind_ctx;
-                words.flush(&mut syms, &style, extra, &cur);
+                words.flush(&mut syms, &style, extra, &cur, &opts.line_prefix);
                 syms.push(Sym::plain(Kind::Frag, line));
                 continue;
             }
@@ -1590,7 +1601,7 @@ fn build_syms(
             if line.starts_with(b"\\ ") {
                 continue;
             }
-            words.flush(&mut syms, &style, extra, &cur);
+            words.flush(&mut syms, &style, extra, &cur, &opts.line_prefix);
             let kind = if word_diff == WordDiff::Porcelain {
                 Kind::WordsPorcelainCtx
             } else {
@@ -1668,7 +1679,7 @@ fn build_syms(
             _ => syms.push(Sym::plain(Kind::Raw, line)),
         }
     }
-    words.flush(&mut syms, &style, extra, &cur);
+    words.flush(&mut syms, &style, extra, &cur, &opts.line_prefix);
     syms
 }
 
@@ -1684,6 +1695,7 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors, opts: &PaintOptions) -> Vec<u8> 
 
     let mut out: Vec<u8> = Vec::with_capacity(syms.len() * 48);
     for s in syms {
+        let start = out.len();
         match s.kind {
             Kind::Meta => emit_header_line(&mut out, &s.line, meta, reset),
             Kind::Frag if opts.suppress_hunk_header_line_count => {
@@ -1727,6 +1739,23 @@ fn emit_syms(syms: &[Sym], colors: &DiffColors, opts: &PaintOptions) -> Vec<u8> 
             Kind::WordsPorcelainCtx => {
                 emit_line(&mut out, on, context, reset, &s.line);
                 out.extend_from_slice(b"~\n");
+            }
+        }
+        // `diff_line_prefix()`: `emit_line_0()` opens every line it writes with it
+        // (diff.c:763). `DIFF_SYMBOL_WORDS_PORCELAIN` follows its `emit_line()`
+        // with a bare `fputs("~\n")` (diff.c:1547-1552), and the word diff's own
+        // records already carry the prefix where git writes it.
+        let prefix = opts.line_prefix.as_slice();
+        if !prefix.is_empty() {
+            match s.kind {
+                Kind::WordRaw => {}
+                Kind::WordsPorcelainCtx => {
+                    out.splice(start..start, prefix.iter().copied());
+                }
+                _ => {
+                    let emitted = out.split_off(start);
+                    out.extend_from_slice(&super::diff::apply_line_prefix(emitted, prefix));
+                }
             }
         }
     }
@@ -1789,6 +1818,7 @@ impl WordsPair {
         style: &WordStyle,
         extra: &ExtraPaint,
         file: &FilePaint,
+        line_prefix: &[u8],
     ) {
         if extra.words() == WordDiff::None {
             return;
@@ -1803,18 +1833,25 @@ impl WordsPair {
             true => extra.word_regex.as_ref(),
             false => file.word_regex.as_deref().or(extra.word_regex.as_ref()),
         };
-        self.show(&mut out, style, re);
+        self.show(&mut out, style, re, line_prefix);
         if !out.is_empty() {
             syms.push(Sym::plain(Kind::WordRaw, &out));
         }
     }
 
-    /// `diff_words_show()`.
-    fn show(&mut self, out: &mut Vec<u8>, style: &WordStyle, re: Option<&WordRegex>) {
+    /// `diff_words_show()`, with `fn_out_diff_words_aux()` inlined per hunk.
+    ///
+    /// `line_prefix` goes out where git writes it: ahead of the removal-only
+    /// case, and ahead of a hunk or of the trailing context whenever
+    /// `color_words_output_graph_prefix()` says the plus text is at the start
+    /// of a line (diff.c:2090-2098) — besides the ones [`write_helper`] puts
+    /// after each newline it writes.
+    fn show(&mut self, out: &mut Vec<u8>, style: &WordStyle, re: Option<&WordRegex>, line_prefix: &[u8]) {
         // Special case: only removal.
         if self.plus.text.is_empty() {
             let minus = std::mem::take(&mut self.minus.text);
-            write_helper(out, &style.old_word, style.newline, &minus);
+            out.extend_from_slice(line_prefix);
+            write_helper(out, &style.old_word, style.newline, &minus, line_prefix);
             self.minus.orig.clear();
             return;
         }
@@ -1828,6 +1865,12 @@ impl WordsPair {
             self.plus.orig[1..].iter().map(|(b, e)| &self.plus.text[*b..*e]).collect();
 
         let mut current_plus = 0usize;
+        // `diff_words->last_minus`: the `minus_first` of the last hunk shown.
+        let mut last_minus = 0usize;
+        // `color_words_output_graph_prefix()` (diff.c:2090-2098).
+        let at_line_start = |current_plus: usize, last_minus: usize, plus: &[u8]| {
+            (last_minus == 0 && current_plus == 0) || (current_plus > 0 && plus[current_plus - 1] == b'\n')
+        };
         for (i1, n1, i2, n2) in word_hunks(&minus_words, &plus_words) {
             // `xdl_emit_hunk_hdr()` hands the callback a 1-based start, decremented
             // again when the side is empty — which is exactly the index of the fake
@@ -1847,19 +1890,29 @@ impl WordsPair {
                 (at, at)
             };
 
+            if at_line_start(current_plus, last_minus, &self.plus.text) {
+                out.extend_from_slice(line_prefix);
+            }
             if current_plus != plus_begin {
-                write_helper(out, &style.ctx, style.newline, &self.plus.text[current_plus..plus_begin]);
+                let ctx = &self.plus.text[current_plus..plus_begin];
+                write_helper(out, &style.ctx, style.newline, ctx, line_prefix);
             }
             if minus_begin != minus_end {
-                write_helper(out, &style.old_word, style.newline, &self.minus.text[minus_begin..minus_end]);
+                let old = &self.minus.text[minus_begin..minus_end];
+                write_helper(out, &style.old_word, style.newline, old, line_prefix);
             }
             if plus_begin != plus_end {
-                write_helper(out, &style.new_word, style.newline, &self.plus.text[plus_begin..plus_end]);
+                let new = &self.plus.text[plus_begin..plus_end];
+                write_helper(out, &style.new_word, style.newline, new, line_prefix);
             }
             current_plus = plus_end;
+            last_minus = minus_first;
         }
         if current_plus != self.plus.text.len() {
-            write_helper(out, &style.ctx, style.newline, &self.plus.text[current_plus..]);
+            if at_line_start(current_plus, last_minus, &self.plus.text) {
+                out.extend_from_slice(line_prefix);
+            }
+            write_helper(out, &style.ctx, style.newline, &self.plus.text[current_plus..], line_prefix);
         }
         self.minus = WordsBuffer::default();
         self.plus = WordsBuffer::default();
@@ -1870,12 +1923,16 @@ impl WordsPair {
 /// style element's color and literal markers, and separate the runs with the
 /// style's record terminator.
 ///
-/// git batches the pieces into `DIFF_SYMBOL_WORD_DIFF` symbols so that a
-/// `--graph` prefix can be inserted between them; that prefix is empty for these
-/// commands, so appending straight to the buffer produces the same bytes.
-fn write_helper(out: &mut Vec<u8>, st: &WordStyleElem, newline: &str, buf: &[u8]) {
+/// git batches the pieces into `DIFF_SYMBOL_WORD_DIFF` symbols, which print
+/// verbatim; `line_prefix` opens every run after the first newline this call
+/// writes (`if (print) strbuf_addstr(&sb, diff_line_prefix(o))`, diff.c:2019-2020).
+fn write_helper(out: &mut Vec<u8>, st: &WordStyleElem, newline: &str, buf: &[u8], line_prefix: &[u8]) {
     let mut buf = buf;
+    let mut print = false;
     while !buf.is_empty() {
+        if print {
+            out.extend_from_slice(line_prefix);
+        }
         let nl = buf.iter().position(|b| *b == b'\n');
         let content = nl.unwrap_or(buf.len());
         if content != 0 {
@@ -1892,6 +1949,7 @@ fn write_helper(out: &mut Vec<u8>, st: &WordStyleElem, newline: &str, buf: &[u8]
         let Some(nl) = nl else { return };
         out.extend_from_slice(newline.as_bytes());
         buf = &buf[nl + 1..];
+        print = true;
     }
 }
 

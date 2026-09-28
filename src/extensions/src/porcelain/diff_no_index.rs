@@ -1459,13 +1459,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         },
         stat_widths,
         z,
-        line_prefix,
+        line_prefix: line_prefix.clone(),
         dirstat,
         ignore_blank_lines,
         filter,
         pickaxe,
         pickaxe_all,
-        paint: diff_color::PaintOptions { ws_error_highlight, ..Default::default() },
+        paint: diff_color::PaintOptions { ws_error_highlight, line_prefix, ..Default::default() },
         extra: match &repo {
             Some(repo) => match move_word.resolve(repo) {
                 Ok(extra) => extra,
@@ -1569,9 +1569,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             diff_color::FilePaint::new(ws_rule),
             &opts.extra,
         );
-        // `--line-prefix`: `emit_line_0()` writes `diff_line_prefix(o)` in front of
-        // every line it emits, which is every line of the finished stream.
-        let painted = super::diff::apply_line_prefix(painted, &opts.line_prefix);
+        // `--line-prefix` is written by the painter, which knows the word diff's
+        // records place it themselves.
         use std::io::Write;
         // `--output=<file>` swapped the diff stream for a file back at parse time.
         match output_file {

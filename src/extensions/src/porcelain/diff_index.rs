@@ -2179,6 +2179,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // block carries its own `--line-prefix`; everything below is prefixed in one pass.
         let mut out: Vec<u8> = Vec::new();
         let mut rest: Vec<u8> = Vec::new();
+        // The span of `rest` the painter wrote, already carrying `--line-prefix`.
+        let mut painted: Option<(usize, usize)> = None;
         let mut separator = false;
 
         if opts.emit_pairs {
@@ -2239,8 +2241,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // through git's `fn_out_consume()` chain with each pair's whitespace
             // state — `diff_flush_patch_all_file_pairs()`'s ordering, which is what
             // lets `--color-moved` and `--word-diff` see every pair at once.
+            // The painter prefixes what it writes, placing it itself inside the
+            // word diff's records; see [`diff_color::PaintOptions::line_prefix`].
             let paint_opts = diff_color::PaintOptions {
                 ws_error_highlight: opts.ws_error_highlight,
+                line_prefix: opts.line_prefix.clone(),
                 ..Default::default()
             };
             let mut plain: Vec<u8> = Vec::new();
@@ -2276,6 +2281,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     });
                 }
             }
+            let at = rest.len();
             rest.extend_from_slice(&diff_color::colorize_patch_ex(
                 &plain,
                 &colors,
@@ -2284,12 +2290,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 diff_color::FilePaint::new(ws_rule),
                 &extra,
             ));
+            painted = Some((at, rest.len()));
         }
 
-        // `diff_line_prefix()` precedes every rendered line of the stat/dirstat/summary/
-        // patch block (the raw block already emitted its own prefix in `render`).
+        // `diff_line_prefix()` precedes every rendered line of the stat/dirstat/summary
+        // block (the raw block already emitted its own prefix in `render`, and the
+        // painter its own in the patch).
         if !opts.line_prefix.is_empty() {
-            rest = prefix_lines(&rest, &opts.line_prefix);
+            rest = super::diff::apply_line_prefix_except(
+                rest,
+                &opts.line_prefix,
+                painted.as_slice(),
+            );
         }
         out.extend_from_slice(&rest);
         // Through git's stdout buffer, not straight at fd 1: `show_local_changes()`
@@ -4138,12 +4150,3 @@ fn emit_file_line(out: &mut Vec<u8>, lead: &[u8], label: &[u8]) {
     out.push(b'\n');
 }
 
-/// `diff_line_prefix()` applied to every line of a rendered block.
-fn prefix_lines(body: &[u8], prefix: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + prefix.len());
-    for line in body.split_inclusive(|&b| b == b'\n') {
-        out.extend_from_slice(prefix);
-        out.extend_from_slice(line);
-    }
-    out
-}

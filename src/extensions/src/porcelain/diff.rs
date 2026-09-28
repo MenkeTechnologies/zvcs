@@ -3812,8 +3812,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `diff_flush()` bails out before printing anything at all when the change
     // queue is empty, so even `--shortstat` stays silent on a clean tree.
     let mut out: Vec<u8> = Vec::new();
-    // Where each external driver's stdout landed in `out`, so `--line-prefix` can skip
-    // it: git's child writes past `emit_line()` entirely.
+    // The spans of `out` `--line-prefix` must skip: each external driver's stdout,
+    // which git's child writes past `emit_line()` entirely, and each painted patch
+    // run, which the painter has already prefixed the way git does.
     let mut ext_spans: Vec<(usize, usize)> = Vec::new();
     let mut separator = false;
     // `o->found_changes`: what the whitespace-ignoring options make the exit status
@@ -3956,6 +3957,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 ws_error_highlight,
                 suppress_blank_empty,
                 indicators,
+                line_prefix: line_prefix.clone(),
                 ..Default::default()
             };
             let mut plain: Vec<u8> = Vec::new();
@@ -4017,6 +4019,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         _ => None,
                     };
                     if let (Some(ctx), Some(pgm)) = (ext.as_ref(), pgm) {
+                        let at = out.len();
                         out.extend_from_slice(&diff_color::colorize_patch_ex(
                             &plain,
                             &colors,
@@ -4025,6 +4028,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             diff_color::FilePaint::new(ws_rule),
                             &extra,
                         ));
+                        ext_spans.push((at, out.len()));
                         plain.clear();
                         files.clear();
                         let run = super::diff_pairs::run_external_diff(
@@ -4063,6 +4067,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         && !delta.unmerged
                         && delta.is_submodule_pair()
                     {
+                        let at = out.len();
                         out.extend_from_slice(&diff_color::colorize_patch_ex(
                             &plain,
                             &colors,
@@ -4071,6 +4076,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                             diff_color::FilePaint::new(ws_rule),
                             &extra,
                         ));
+                        ext_spans.push((at, out.len()));
                         plain.clear();
                         files.clear();
                         render_submodule(
@@ -4105,6 +4111,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            let at = out.len();
             out.extend_from_slice(&diff_color::colorize_patch_ex(
                 &plain,
                 &colors,
@@ -4113,6 +4120,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 diff_color::FilePaint::new(ws_rule),
                 &extra,
             ));
+            ext_spans.push((at, out.len()));
         }
     }
 
@@ -4134,17 +4142,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `diff.suppressBlankEmpty`: `fn_out_consume()` rewrites any emitted line that
-    // is exactly `" \n"` (an empty context line) to `"\n"` before it is prefixed.
-    // Only the ordinary patch path is fed through that chain — `dump_sline()`
-    // prints the combined patch straight out — so the rewrite runs before the
-    // combined half is appended, not after.
-    let out = apply_suppress_blank_empty(out, suppress_blank_empty);
-
-    // `--line-prefix`: `diff_line_prefix()` prepends the string to every emitted
-    // line, so a whole-buffer pass over the newline-terminated output reproduces it
-    // for the ordinary half. The combined half prefixes itself instead, because
-    // `show_combined_header()` leaves the prefix off two of the lines it prints.
+    // `diff.suppressBlankEmpty` and `--line-prefix` on the ordinary patch are the
+    // painter's (see [`diff_color::PaintOptions`]): `fn_out_consume()` rewrites an
+    // empty context line before it is prefixed, and the word diff places the
+    // prefix itself. What is left — the stat and name formats — takes the prefix
+    // on every line, the painted spans and an external driver's output excepted.
+    // `dump_sline()` prints the combined patch straight out, appended below with a
+    // prefix of its own, because `show_combined_header()` leaves it off two of the
+    // lines it prints.
     let mut out = apply_line_prefix_except(out, &line_prefix, &ext_spans);
 
     // The combined half of `diff_tree_combined()` (combine-diff.c:1611-1631): the
@@ -8819,7 +8824,7 @@ fn push_str(out: &mut Vec<u8>, s: &str) {
 /// added/removed lines (`"+\n"`/`"-\n"`) and a context line whose content is one
 /// space (`"  \n"`, 3 bytes) never match, so a line-oriented pass that drops the
 /// leading space of every standalone `" \n"` line reproduces it byte-for-byte.
-fn apply_suppress_blank_empty(out: Vec<u8>, on: bool) -> Vec<u8> {
+pub(crate) fn suppress_blank_empty(out: Vec<u8>, on: bool) -> Vec<u8> {
     if !on || out.is_empty() {
         return out;
     }

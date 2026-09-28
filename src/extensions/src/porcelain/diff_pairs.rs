@@ -2838,6 +2838,9 @@ fn flush(
             // `diff.suppressBlankEmpty` is not read by this module, so the sign of an
             // empty context line is always kept, as git's default does.
             suppress_blank_empty: false,
+            // The painter prefixes what it writes, placing it itself inside the
+            // word diff's records; see [`diff_color::PaintOptions::line_prefix`].
+            line_prefix: lp.to_vec(),
             ..Default::default()
         };
         let mut sink = PatchSink {
@@ -3360,7 +3363,8 @@ struct PatchSink<'a> {
 }
 
 impl PatchSink<'_> {
-    /// Close the pending internal section, colouring and prefixing it.
+    /// Close the pending internal section, colouring and prefixing it — the
+    /// painter writes `--line-prefix` itself (`self.paint.line_prefix`).
     fn flush_plain(&mut self) {
         if self.plain.is_empty() {
             return;
@@ -3373,7 +3377,7 @@ impl PatchSink<'_> {
             diff_color::FilePaint::new(self.ws_rule),
             self.extra,
         );
-        append_prefixed(&mut self.out, self.lp, &sub);
+        self.out.extend_from_slice(&sub);
         self.plain.clear();
         self.files.clear();
     }

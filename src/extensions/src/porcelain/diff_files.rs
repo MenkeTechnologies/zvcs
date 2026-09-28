@@ -2254,6 +2254,8 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
 
     let mut out: Vec<u8> = Vec::new();
     let mut rest: Vec<u8> = Vec::new();
+    // The spans of `rest` the painter wrote, already carrying `--line-prefix`.
+    let mut painted: Vec<(usize, usize)> = Vec::new();
     let mut separator = false;
     let mut check_failed = false;
 
@@ -2351,6 +2353,9 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             // `diff.suppressBlankEmpty` is not read by this module, so the sign of
             // an empty context line is always kept, as git's default does.
             suppress_blank_empty: false,
+            // The painter prefixes what it writes, placing it itself inside the
+            // word diff's records; see [`diff_color::PaintOptions::line_prefix`].
+            line_prefix: opts.line_prefix.clone(),
             ..Default::default()
         };
         let mut plain = combined_patch.clone();
@@ -2444,6 +2449,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                     && d.src_mode & S_IFMT == 0o160000
                     && d.dst_mode & S_IFMT == 0o160000
                 {
+                    let at = rest.len();
                     rest.extend_from_slice(&diff_color::colorize_patch_ex(
                         &plain,
                         &colors,
@@ -2452,6 +2458,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                         diff_color::FilePaint::new(ws_rule),
                         &extra,
                     ));
+                    painted.push((at, rest.len()));
                     plain.clear();
                     files.clear();
                     // `p->two->oid` for a worktree gitlink is the commit the
@@ -2499,6 +2506,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                 }
             }
         }
+        let at = rest.len();
         rest.extend_from_slice(&diff_color::colorize_patch_ex(
             &plain,
             &colors,
@@ -2507,10 +2515,11 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             diff_color::FilePaint::new(ws_rule),
             &extra,
         ));
+        painted.push((at, rest.len()));
     }
 
     if !opts.line_prefix.is_empty() {
-        rest = prefix_lines(&rest, &opts.line_prefix);
+        rest = super::diff::apply_line_prefix_except(rest, &opts.line_prefix, &painted);
     }
     out.extend_from_slice(&rest);
 
@@ -2784,16 +2793,6 @@ pub(crate) fn match_order(order: &[Vec<u8>], path: &[u8]) -> usize {
         }
     }
     order.len()
-}
-
-/// Emit `prefix` at the start of every line of `body`.
-fn prefix_lines(body: &[u8], prefix: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + prefix.len());
-    for line in byte_lines(body) {
-        out.extend_from_slice(prefix);
-        out.extend_from_slice(line);
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -5220,7 +5219,7 @@ fn header_abbrev(repo: &gix::Repository, opts: &Opts) -> Option<usize> {
 
 /// `show_combined_header()` for a working-tree combined diff (`show_file_header`
 /// is always set for diff-files). `line_prefix` is empty here because the caller
-/// funnels this output through `prefix_lines()`, which stamps `--line-prefix` once.
+/// hands this output to the painter, which stamps `--line-prefix` once.
 fn show_combined_header(
     out: &mut Vec<u8>,
     repo: &gix::Repository,

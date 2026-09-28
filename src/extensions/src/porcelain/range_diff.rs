@@ -306,8 +306,6 @@
 //!   `--stat` is rendered, at the flat 80 columns `repo_diff_setup()`'s zeroed
 //!   widths give it — `builtin/range-diff.c` never calls
 //!   `init_diffstat_widths()`.
-//! * `--word-diff=porcelain`, whose indent `fn_out_diff_words_write_helper()`
-//!   places itself (diff.c:2009-2053) — the symbol pass indents every line.
 //! * A magic (`:(glob)`, `:!exclude`, …) or wildcard pathspec, and every other
 //!   `git diff` option upstream forwards to the inner patches.
 //! * `-h`: upstream's usage text concatenates the entire `git diff` option list,
@@ -2023,13 +2021,6 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     opts.extra = move_word
         .resolve(&repo)
         .map_err(|msg| msg.trim_start_matches("fatal: ").to_string());
-    // `--word-diff=porcelain` puts `output_prefix`'s indent only where
-    // `fn_out_diff_words_write_helper()` and `diff_words_show()` write it
-    // (diff.c:2009-2053, 2237-2275) — its `~` lines and a word that opens a line
-    // go out bare — and the symbol pass indents every line it writes.
-    if matches!(&opts.extra, Ok(e) if e.word_diff == Some(diff_color::WordDiff::Porcelain)) {
-        opts.defer(unsupported_flag("--word-diff=porcelain"));
-    }
     // `whitespace_rule()` and `o->ws_error_highlight`, both read only by
     // `emit_line_ws_markup()` and so both invisible until color is on.
     opts.ws_rule = diff_color::whitespace_rule_cfg(&repo);
@@ -4835,11 +4826,15 @@ fn patch_diff(out: &mut Vec<u8>, a: &[u8], b: &[u8], opts: &Opts) -> Result<()> 
             indicators: (opts.indicators[IND_NEW], opts.indicators[IND_OLD], opts.indicators[IND_CONTEXT]),
             suppress_hunk_header_line_count: true,
             dual_color_diffed_diffs: opts.dual,
+            // `output_prefix_cb()` hands back the indent as `diff_line_prefix()`
+            // (range-diff.c:501-529), which the painter writes itself — only where
+            // git does inside a word diff's records.
+            line_prefix: INDENT.to_vec(),
             ..Default::default()
         };
         let file = diff_color::FilePaint { blank_at_eof, ..diff_color::FilePaint::new(opts.ws_rule) };
         let painted = diff_color::colorize_patch_ex(&plain.buf, &opts.colors, &paint, &[], file, extra);
-        diff_pairs::append_prefixed(out, INDENT, &painted);
+        out.extend_from_slice(&painted);
         return Ok(());
     }
 

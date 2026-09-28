@@ -1164,10 +1164,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             .config_snapshot()
             .string(&format!("branch.{short}.remote"))
             .map(|v| v.to_string())?;
-        let merge = repo
-            .branch_remote_ref_name(h.as_ref(), gix::remote::Direction::Fetch)
-            .and_then(Result::ok)?;
-        Some((remote, merge.as_bstr().to_string()))
+        // Every `branch.<name>.merge`, in order: `add_merge_config()` marks the
+        // first ref-map entry each one names (builtin/fetch.c:212-248).
+        let merges = crate::config::multi_values(&repo, &format!("branch.{short}.merge"));
+        (!merges.is_empty()).then_some((remote, merges))
     });
 
     // Listing refs and negotiating report into a progress tree nothing draws: git
@@ -2799,7 +2799,7 @@ fn fetch_one(
     name_or_url: Option<&BStr>,
     refspecs: &[&str],
     opts: &FetchOpts,
-    upstream: Option<&(String, String)>,
+    upstream: Option<&(String, Vec<String>)>,
     fetch_head: &mut FetchHead,
     progress: &mut prodash::tree::Item,
     tips: &mut SubmoduleTips,
@@ -3750,8 +3750,10 @@ fn fetch_one(
     //
     // (`add_merge_config()`, builtin/fetch.c:223-228.) The `break` is the whole point: the
     // *first* ref-map entry naming `branch.<name>.merge` becomes the merge candidate, and a
-    // second refspec that maps the same remote ref somewhere else does not.
-    let mut merge_marked = false;
+    // second refspec that maps the same remote ref somewhere else does not. The loop runs once
+    // per `branch.<name>.merge` (`branch->merge_nr`), matching with `refname_match()`, so each
+    // value marks its own first entry.
+    let mut merge_marked: Vec<bool> = upstream.map_or_else(Vec::new, |(_, merges)| vec![false; merges.len()]);
     // `branch_has_merge_config(branch_get(NULL))`: `set_merge()` records merge
     // configuration only for a branch with both `branch.<name>.remote` and
     // `branch.<name>.merge` (remote.c:1757-1776, 1837-1840) — the upstream.
@@ -3868,12 +3870,18 @@ fn fetch_one(
             first_row_marked = true;
             0
         } else if !explicit_refspecs
-            && !merge_marked
-            && upstream.is_some_and(|(r, m)| {
-                Some(r.as_str()) == remote_name.as_deref() && *m == remote_full
+            && upstream.is_some_and(|(r, merges)| {
+                Some(r.as_str()) == remote_name.as_deref()
+                    && merges.iter().zip(merge_marked.iter_mut()).fold(false, |hit, (m, marked)| {
+                        if !*marked && crate::refname::refname_match(m, &remote_full) > 0 {
+                            *marked = true;
+                            true
+                        } else {
+                            hit
+                        }
+                    })
             })
         {
-            merge_marked = true;
             0
         } else {
             1

@@ -541,11 +541,11 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 } else if a == "--trailer" {
                     trailers.push(super::take_value(args, &mut i, a)?.to_string());
                 } else if let Some(rest) = a.strip_prefix("--message=") {
-                    messages.push(rest.as_bytes().to_vec());
+                    messages.push(crate::rawarg::to_bytes(rest).into_owned());
                 } else if a == "--message" || a == "-m" {
-                    messages.push(super::take_value(args, &mut i, a)?.as_bytes().to_vec());
+                    messages.push(crate::rawarg::to_bytes(super::take_value(args, &mut i, a)?).into_owned());
                 } else if let Some(rest) = a.strip_prefix("-m") {
-                    messages.push(rest.as_bytes().to_vec());
+                    messages.push(crate::rawarg::to_bytes(rest).into_owned());
                 } else if let Some(rest) = a.strip_prefix("--file=") {
                     message_file = Some(rest.to_string());
                 } else if a == "--file" || a == "-F" {
@@ -643,7 +643,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                                     false => rest.to_string(),
                                 };
                                 match c {
-                                    'm' => messages.push(val.into_bytes()),
+                                    'm' => messages.push(crate::rawarg::to_bytes(&val).into_owned()),
                                     'F' => message_file = Some(val),
                                     _ => keyid = Some(val),
                                 }
@@ -1811,7 +1811,7 @@ fn read_message_file(path: &str) -> Result<Vec<u8>> {
     if path == "-" {
         std::io::stdin().lock().read_to_end(&mut buf)?;
     } else {
-        buf = match std::fs::read(path) {
+        buf = match std::fs::read(crate::rawarg::to_os(path)) {
             Ok(bytes) => bytes,
             Err(e) => crate::git_fatal!(
                 "could not open or read '{path}': {}",

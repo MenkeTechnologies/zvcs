@@ -159,12 +159,11 @@
 //!   * `--cruft-expiration=<time>` is parsed but does not filter by mtime; every
 //!     cruft object is written with its current mtime.
 //!   * an *exclusion* among the revision arguments on stdin — `^<rev>`, anything
-//!     after `--not`, a `<a>..<b>` range, `<rev>^!`, `<rev>^@` — is validated
-//!     the way `handle_revision_arg()` validates it (so an unresolvable one is
-//!     still `fatal: bad revision '<arg>'`) and then dropped, because
-//!     [`collect_counts`] has no boundary-aware walk to narrow. The resulting
-//!     pack is over-inclusive where git's would stop at the boundary. The same
-//!     gap is why `--shallow <oid>` on stdin registers no shallow boundary.
+//!     after `--not`, the left of `<a>..<b>`, the merge bases of `<a>...<b>` —
+//!     removes everything it reaches, as the push and bundle paths do; git only
+//!     marks the boundary commits' trees uninteresting, so an object reachable
+//!     from deep excluded history alone can differ. `<rev>^!` and `<rev>^@` are
+//!     validated and then dropped, and `--shallow <oid>` registers no boundary.
 //!
 //! # Configuration honoured
 //!
@@ -4668,14 +4667,16 @@ fn read_object_list_from_stdin(stdin: &[u8], hex_len: usize) -> Result<Vec<Objec
 /// * `--not` flips the sense of every argument after it for the rest of the
 ///   loop, exactly as a `^` prefix does for one.
 ///
-/// Exclusions themselves are the port's standing gap: [`collect_counts`] has no
-/// boundary-aware walk, so an excluded argument is validated and then dropped
-/// instead of narrowing the traversal. Validating it is not cosmetic — an
-/// unresolvable `^rev` is `fatal: bad revision '^rev'` in stock.
+/// Each argument lands in `pending` or, when it is `UNINTERESTING`, in `hidden`:
+/// `^<rev>` and `--not` combine by XOR (`flags ^ local_flags`,
+/// revision.c:2229), `<a>..<b>` hides `<a>`, and `<a>...<b>` hides their merge
+/// bases (`handle_dotdot_1()`, revision.c:2083-2107). An unresolvable argument
+/// is `fatal: bad revision '<arg>'` either way.
 fn from_stdin_revs(
     repo: &gix::Repository,
     stdin: &[u8],
     pending: &mut Vec<ObjectId>,
+    hidden: &mut Vec<ObjectId>,
 ) -> Result<(), String> {
     // `get_object_list()` brackets this loop with
     // `cfg->warn_on_object_refname_ambiguity = 0`, so a full-length hex on
@@ -4712,7 +4713,32 @@ fn from_stdin_revs(
         if !stdin_rev_resolves(repo, base) {
             return Err(format!("bad revision '{spec}'"));
         }
-        if uninteresting || marked {
+        let resolve = |name: &str| repo.rev_parse_single(name).ok().map(|id| id.detach());
+        let mut file = |id: Option<ObjectId>, hide: bool| {
+            if let Some(id) = id {
+                if hide { hidden.push(id) } else { pending.push(id) }
+            }
+        };
+        if let Some(range) = crate::objname::split_range(base) {
+            let hide_ends = uninteresting ^ marked;
+            let (a, b) = (resolve(range.a), resolve(range.b));
+            if range.symmetric {
+                if let (Some(a), Some(b)) = (a, b) {
+                    if let Ok(bases) = repo.merge_bases_many(a, &[b]) {
+                        for base in bases {
+                            file(Some(base.detach()), !hide_ends);
+                        }
+                    }
+                }
+                file(a, hide_ends);
+            } else {
+                file(a, !hide_ends);
+            }
+            file(b, hide_ends);
+            continue;
+        }
+        if uninteresting ^ marked {
+            file(resolve(base), true);
             continue;
         }
         // The ambiguity bracket above only reaches `get_oid_basic()`'s full-hex
@@ -4753,6 +4779,8 @@ fn rev_list_objects(
     // `handle_commit()` is what peels it.
     let mut pending: Vec<ObjectId> = Vec::new();
     let mut from_stdin: Vec<ObjectId> = Vec::new();
+    // The `UNINTERESTING` half: what the walk must not reach.
+    let mut hidden: Vec<ObjectId> = Vec::new();
 
     if st.all {
         if let Ok(platform) = repo.references() {
@@ -4826,7 +4854,7 @@ fn rev_list_objects(
     // options that sets it. `--all` on its own makes stdin a list of revisions
     // too, and `--thin` does as well (:5233-5234).
     if st.internal_rev_list_at_stdin() {
-        from_stdin_revs(repo, stdin, &mut pending)?;
+        from_stdin_revs(repo, stdin, &mut pending, &mut hidden)?;
     } else {
         from_stdin = read_object_list_from_stdin(stdin, repo.object_hash().len_in_hex())?;
     }
@@ -4839,7 +4867,9 @@ fn rev_list_objects(
     // write reaches it. Both are why these bypass the traversal, which expands
     // trees and can only report objects it could read.
     let mut out = from_stdin;
-    out.extend(traverse_commit_list(repo, pending));
+    // Everything `pending` reaches that `hidden` does not — the difference
+    // `push` and `bundle create` pack as well.
+    out.extend(super::push_proto::objects_to_send(repo, &pending, &hidden));
     Ok(out)
 }
 

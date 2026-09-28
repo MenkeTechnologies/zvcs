@@ -26,8 +26,21 @@ pub mod parse {
         MalformedV2RefLine(BString),
         #[error("The ref attribute {attribute:?} is unknown. Found in line {line:?}")]
         UnknownAttribute { attribute: BString, line: BString },
+        /// The other end closed the stream before the listing's flush packet.
+        /// `{0}` rather than `transparent` so that the [`HangUp`](gix_transport::client::HangUp)
+        /// stays reachable through `source()` from any `transparent` wrapper above.
+        #[error("{0}")]
+        HungUp(#[source] gix_transport::client::HangUp),
         #[error("{message}")]
         InvariantViolation { message: &'static str },
+    }
+
+    /// A read error from a ref listing, with an end of stream turned into `hang_up`.
+    pub(crate) fn eof_as(hang_up: gix_transport::client::HangUp) -> impl FnOnce(std::io::Error) -> Error {
+        move |err| match err.kind() {
+            std::io::ErrorKind::UnexpectedEof => Error::HungUp(hang_up),
+            _ => Error::Io(err),
+        }
     }
 }
 

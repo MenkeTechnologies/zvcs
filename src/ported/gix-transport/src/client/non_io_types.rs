@@ -188,6 +188,15 @@ mod error {
         /// advertisement ended before its flush packet.
         #[error("expected flush after capabilities")]
         CapabilitiesFlush,
+        /// `die_initial_contact(1)` (connect.c:61-72): a v0/v1 ref advertisement
+        /// that ended before its flush, read by `get_remote_heads()`
+        /// (connect.c:351-354).
+        #[error("the remote end hung up upon initial contact")]
+        UponInitialContact,
+        /// `get_remote_refs()` (connect.c:600-606): a v2 `ls-refs` response that
+        /// ended before its flush.
+        #[error("expected flush after ref listing")]
+        RefListingFlush,
     }
 
     impl crate::IsSpuriousError for Error {

@@ -10,7 +10,7 @@ pub async fn from_v2_refs(in_refs: &mut dyn ReadlineBufRead) -> Result<Vec<Ref>,
     while let Some(line) = in_refs
         .readline()
         .await
-        .transpose()?
+        .transpose().map_err(refs::parse::eof_as(gix_transport::client::HangUp::RefListingFlush))?
         .transpose()?
         .and_then(|l| l.as_bstr())
     {
@@ -38,7 +38,7 @@ pub async fn from_v1_refs_received_as_part_of_handshake_and_capabilities<'a>(
     while let Some(line) = in_refs
         .readline()
         .await
-        .transpose()?
+        .transpose().map_err(refs::parse::eof_as(gix_transport::client::HangUp::UponInitialContact))?
         .transpose()?
         .and_then(|l| l.as_bstr())
     {

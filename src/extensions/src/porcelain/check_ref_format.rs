@@ -145,7 +145,8 @@ pub fn check_ref_format(args: &[String]) -> Result<ExitCode> {
         return Ok(usage_error());
     }
 
-    let raw = argv[i].as_bytes();
+    let raw_arg = crate::rawarg::to_bytes(&argv[i]);
+    let raw: &[u8] = &raw_arg;
     let normalized;
     let refname: &[u8] = if normalize {
         normalized = collapse_slashes(raw);
@@ -213,6 +214,13 @@ fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
         // and no `@{…}` shorthand means anything.
         Err(_) => arg.as_bytes().to_vec(),
     };
+    // The argument arrived through [`crate::rawarg`]; hand git's byte world the
+    // bytes it stands for (a ref name holding \x80 is legal: check_refname_component
+    // refuses only control characters and the handful of ASCII specials).
+    let expanded = match String::from_utf8(expanded) {
+        Ok(s) => crate::rawarg::to_bytes(&s).into_owned(),
+        Err(e) => e.into_bytes(),
+    };
 
     let mut full = b"refs/heads/".to_vec();
     full.extend_from_slice(&expanded);
@@ -221,7 +229,10 @@ fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
         || full == b"refs/heads/HEAD"
         || !check_refname_format(&full, 0);
     if rejected {
-        eprintln!("fatal: '{arg}' is not a valid branch name");
+        let mut err = b"fatal: '".to_vec();
+        err.extend_from_slice(&crate::rawarg::to_bytes(arg));
+        err.extend_from_slice(b"' is not a valid branch name\n");
+        std::io::Write::write_all(&mut std::io::stderr(), &err)?;
         return Ok(ExitCode::from(128));
     }
 

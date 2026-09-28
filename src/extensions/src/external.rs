@@ -35,7 +35,7 @@ pub fn try_dashed(cmd: &str, args: &[String]) -> Option<ExitCode> {
     let exe = format!("git-{cmd}");
     // `Command` PATH-searches a slash-free program name (execvp semantics), so a
     // bare `git-<cmd>` resolves against PATH just as git's own lookup does.
-    let err = Command::new(&exe).args(args).exec();
+    let err = Command::new(&exe).args(args.iter().map(|a| crate::rawarg::to_os(a))).exec();
     // `exec` returns only on failure. A missing external is the ordinary case
     // (the verb was simply a typo) — stay silent and let the caller diagnose it.
     if err.kind() == std::io::ErrorKind::NotFound {

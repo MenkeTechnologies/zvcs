@@ -57,6 +57,7 @@ pub mod porcelain;
 pub mod precompose;
 pub mod progress;
 pub mod quote;
+pub mod rawarg;
 pub mod rcache;
 pub mod refname;
 pub mod refsort;
@@ -90,7 +91,7 @@ use std::process::ExitCode;
 /// every path out — including the ones that return early. Both calls are inert
 /// unless a Trace2 event target is configured.
 pub fn run() -> ExitCode {
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = rawarg::args();
     trace2::start(&argv);
     let code = run_command(&argv);
     trace2::exit(exit_status(code));

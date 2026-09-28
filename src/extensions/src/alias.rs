@@ -260,7 +260,7 @@ fn lookup_in(config: &gix::config::File, name: &str) -> Option<String> {
 /// carries that model. Outside a repository setup still exports an empty
 /// `GIT_PREFIX` (setup.c:2069-2076).
 fn run_shell_alias(body: &str, user_args: &[String]) -> ExitCode {
-    let mut cmd = crate::external::prepare_shell_cmd_str(body, user_args);
+    let mut cmd = crate::external::prepare_shell_cmd_str(body, user_args.iter().map(|a| crate::rawarg::to_os(a)));
     match crate::setup::discover() {
         Ok(repo) => {
             let setup = crate::setup::after_setup(&repo);

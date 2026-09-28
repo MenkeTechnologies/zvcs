@@ -389,12 +389,11 @@ pub fn run_auto_maintenance(repo: &gix::Repository, quiet: bool) -> Result<()> {
     let Ok(exe) = crate::hosted::git_exe() else {
         return Ok(());
     };
-    let mut child = std::process::Command::new(exe);
+    let mut child = git_child(repo, exe);
     child
         .args(["maintenance", "run", "--auto"])
         .arg(if quiet { "--quiet" } else { "--no-quiet" })
-        .arg(if detach { "--detach" } else { "--no-detach" })
-        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+        .arg(if detach { "--detach" } else { "--no-detach" });
     crate::cstdio::before_spawn();
     let _ = child.status();
     Ok(())
@@ -926,9 +925,8 @@ fn spawn_git(repo: &gix::Repository, args: &[&str]) -> bool {
     let Ok(exe) = crate::hosted::git_exe() else {
         return false;
     };
-    std::process::Command::new(exe)
+    git_child(repo, exe)
         .args(args)
-        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
         .stdin(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
@@ -1037,12 +1035,11 @@ fn pack_loose(repo: &gix::Repository, quiet: bool) -> bool {
     let Ok(exe) = crate::hosted::git_exe() else {
         return false;
     };
-    let mut child = std::process::Command::new(exe);
+    let mut child = git_child(repo, exe);
     child
         .arg("pack-objects")
         .arg(if quiet { "--quiet" } else { "--no-quiet" })
         .arg(objdir.join("pack").join("loose"))
-        .current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
         .stdin(std::process::Stdio::piped())
         // "git-pack-objects(1) ends up writing the pack hash to stdout, which we
         // do not care for."
@@ -2353,4 +2350,21 @@ mod task_option_tests {
         assert!(take_task(&mut typed, "gc").is_ok());
         assert!(err(&mut typed, "zzbogus"));
     }
+}
+
+/// A `git` child as `run_command()` starts one with `git_cmd = 1` and `cp->dir`
+/// left NULL: in the directory setup left this process standing in, with the
+/// `GIT_DIR` / `GIT_WORK_TREE` setup exported ([`crate::setup::export_to_child`]).
+/// Outside that model the child starts at the top of the work tree, and a relative
+/// `GIT_DIR` this process was handed is made absolute so it still names the
+/// repository from there.
+fn git_child(repo: &gix::Repository, exe: PathBuf) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+    let setup = crate::setup::after_setup(repo);
+    crate::setup::export_to_child(repo, setup.as_ref(), &mut cmd);
+    if setup.is_none() && std::env::var_os("GIT_DIR").is_some_and(|d| Path::new(&d).is_relative()) {
+        cmd.env("GIT_DIR", std::path::absolute(repo.git_dir()).unwrap_or_else(|_| repo.git_dir().to_path_buf()));
+    }
+    cmd
 }

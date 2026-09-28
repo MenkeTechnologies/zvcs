@@ -237,7 +237,13 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
                 signed_explicit = true;
             }
             "--no-atomic" => f.atomic = false,
-            "--no-mirror" => f.mirror = false,
+            // `OPT_BIT(0, "mirror", &flags, …, (TRANSPORT_PUSH_MIRROR|TRANSPORT_PUSH_FORCE))`
+            // (builtin/push.c:686-687): the option owns both bits, so `--no-mirror`
+            // clears the force bit an earlier `-f` set, and `--mirror` sets it.
+            "--no-mirror" => {
+                f.mirror = false;
+                f.force = false;
+            }
             "--no-prune" => f.prune = false,
             "--no-follow-tags" => {
                 f.follow_tags = false;
@@ -261,7 +267,10 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // advertisement; `--atomic` and `-o` are negotiated capabilities.
             // All four are refused by the wire layer when the server lacks the
             // capability rather than being silently downgraded.
-            "--mirror" => f.mirror = true,
+            "--mirror" => {
+                f.mirror = true;
+                f.force = true;
+            }
             "--prune" => f.prune = true,
             "--atomic" => f.atomic = true,
             "-o" | "--push-option" => {

@@ -427,7 +427,7 @@ fn find_invalid_utf8(buf: &[u8]) -> Option<usize> {
 ///
 /// Returns whether the buffer was already valid; a `false` answer means bytes
 /// were rewritten and the caller prints the warning.
-fn verify_utf8(buf: &mut Vec<u8>) -> bool {
+pub(crate) fn verify_utf8(buf: &mut Vec<u8>) -> bool {
     let mut ok = true;
     let mut pos = 0usize;
     loop {

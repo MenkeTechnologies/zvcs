@@ -1468,13 +1468,13 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // valid UTF-8`, which git never does.
             let mut bytes = Vec::new();
             std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)?;
-            String::from_utf8_lossy(&bytes).into_owned()
+            crate::rawarg::from_vec(bytes)
         } else {
             // `if (strbuf_read_file(&sb, logfile, 0) < 0) die_errno(_("could not
             // read log file '%s'"), logfile);` (builtin/commit.c) — `die_errno`,
             // so the bare strerror text follows and the status is 128.
             match std::fs::read(f) {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Ok(bytes) => crate::rawarg::from_vec(bytes),
                 Err(e) => {
                     deferred_fatal.get_or_insert_with(|| {
                         format!(
@@ -1534,7 +1534,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `-C` (unlike `-c`) supplies the message directly, with no editor.
     if let Some(rc) = &reuse_commit {
         if !reedit && !from_flags {
-            message = rc.message_raw()?.to_string();
+            message = crate::rawarg::from_bytes(rc.message_raw()?).into_owned();
             if !message.ends_with('\n') {
                 message.push('\n');
             }
@@ -1571,7 +1571,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             Some(c) => c,
             None => crate::git_fatal!("could not lookup commit '{spec}'"),
         };
-        let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
+        let subject = folded_subject(&crate::rawarg::from_bytes(c.message_raw()?));
         if from_flags {
             // A `-m`/`-F` body follows the `squash!` subject line. A `-C`/`-c`
             // message contributes only its *body* — git's `use_message` arm is
@@ -1620,7 +1620,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             Some(c) => c,
             None => crate::git_fatal!("could not lookup commit '{fixup_spec}'"),
         };
-        let subject = folded_subject(c.message_raw()?.to_str_lossy().as_ref());
+        let subject = folded_subject(&crate::rawarg::from_bytes(c.message_raw()?));
         if fixup_prefix == "fixup" {
             // Default `--fixup`: no editor; a `-m` body follows the subject line.
             message = if from_flags {
@@ -1643,7 +1643,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 crate::git_fatal!("options '-m' and '--fixup:{sub}' cannot be used together");
             }
             allow_empty = true;
-            let orig = c.message_raw()?.to_str_lossy().into_owned();
+            let orig = crate::rawarg::from_bytes(c.message_raw()?).into_owned();
             let carried = if subject_line(&orig).starts_with("amend!") {
                 message_body(&orig)
             } else {
@@ -2066,11 +2066,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut buf = if from_flags {
         message.clone()
     } else if amend && no_edit {
-        let mut m = amend_head
+        let mut m = crate::rawarg::from_bytes(amend_head
             .as_ref()
             .expect("amend implies HEAD")
-            .message_raw()?
-            .to_string();
+            .message_raw()?).into_owned();
         if !m.ends_with('\n') {
             m.push('\n');
         }
@@ -2078,13 +2077,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     } else if let Some(s) = &squash_fixup_seed {
         s.clone()
     } else if let Some(rc) = &reuse_commit {
-        rc.message_raw()?.to_string()
+        crate::rawarg::from_bytes(rc.message_raw()?).into_owned()
     } else if amend {
-        amend_head
+        crate::rawarg::from_bytes(amend_head
             .as_ref()
             .expect("amend implies HEAD")
-            .message_raw()?
-            .to_string()
+            .message_raw()?).into_owned()
     } else if let Some(m) = &merge_msg_seed {
         m.clone()
     } else if let Some(path) = &template_file {
@@ -2307,12 +2305,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         ) {
             Ok(block) => buf.push_str(&block),
             Err(e) => {
-                std::fs::write(&msg_path, &buf)?;
+                std::fs::write(&msg_path, crate::rawarg::to_bytes(&buf))?;
                 return Err(e);
             }
         }
     }
-    std::fs::write(&msg_path, &buf)?;
+    std::fs::write(&msg_path, crate::rawarg::to_bytes(&buf))?;
     if !(use_editor && include_status) {
         // The other arm of that `if`: `index_differs_from(the_repository, parent,
         // &flags, 1)` (builtin/commit.c:1062), reached only when `parent` resolves
@@ -2475,7 +2473,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // the buffer the hook left, cleaned for the object being written and for the
     // two refusals below it.
     message =
-        cleanup_message(&std::fs::read_to_string(&msg_path)?, &comment, cleanup, verbose > 0);
+        cleanup_message(&crate::rawarg::from_vec(std::fs::read(&msg_path)?), &comment, cleanup, verbose > 0);
 
     // An untouched template aborts the commit — `template_untouched()`, which
     // compares the cleaned-up template against the cleaned-up result.
@@ -2537,11 +2535,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("failed to write commit object");
     }
 
-    // `print_commit_summary()` renders `%s`, which is `format_subject(sb, msg,
-    // " ")` — the *whole* first paragraph folded onto one line, not just its
-    // first line. A subject written across two lines prints as one.
-    let subject = folded_subject(&message);
-
     let committer_owned = || -> Result<gix::actor::Signature> {
         Ok(repo
             .committer()
@@ -2593,7 +2586,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             &repo,
             &committer,
             author,
-            message.as_bytes().as_bstr(),
+            crate::rawarg::to_bytes(&message).as_bstr(),
             tree_id,
             parents,
             signer.as_ref(),
@@ -2608,8 +2601,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     // (builtin/commit.c:1854-1856): an amend takes the whence-derived
                     // wording from nowhere, so only `GIT_REFLOG_ACTION` displaces it.
                     message: match &reflog_action {
-                        Some(action) => reflog_line(action, &message).into(),
-                        None => reflog_line("commit (amend)", &message).into(),
+                        Some(action) => crate::rawarg::to_bytes(&reflog_line(action, &message)).into_owned().into(),
+                        None => crate::rawarg::to_bytes(&reflog_line("commit (amend)", &message)).into_owned().into(),
                     },
                 },
                 expected: gix::refs::transaction::PreviousValue::MustExistAndMatch(
@@ -2623,11 +2616,17 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             deref: true,
         })?;
         new.attach(&repo)
-    } else if signer.is_some() || reflog_override.is_some() || commit_encoding(&repo).is_some() {
+    } else if signer.is_some()
+        || reflog_override.is_some()
+        || commit_encoding(&repo).is_some()
+        || matches!(crate::rawarg::to_bytes(&message), std::borrow::Cow::Owned(_))
+    {
         // A signed commit needs the `gpgsig` header, which `Repository::commit`
         // cannot carry — and neither can it carry the `encoding` header
         // `i18n.commitEncoding` asks for. A sequencer commit needs its own reflog
-        // wording; all three write the object here and advance `HEAD` themselves, otherwise with
+        // wording, and a message holding bytes that are not UTF-8 (a `-F` file in
+        // ISO-8859-1, a `-m` argument carried through [`crate::rawarg`]) cannot go
+        // through its `&str` either. All four write the object here and advance `HEAD` themselves, otherwise with
         // gix's `commit`/`commit (initial)`/`commit (merge)` line — the same
         // wording and the same first-parent safety check the fast path uses.
         let committer = committer_owned()?;
@@ -2645,7 +2644,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             &repo,
             &committer,
             &author,
-            message.as_bytes().as_bstr(),
+            crate::rawarg::to_bytes(&message).as_bstr(),
             tree_id,
             parents,
             signer.as_ref(),
@@ -2656,10 +2655,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                     mode: gix::refs::transaction::RefLog::AndReference,
                     force_create_reflog: false,
                     message: match &reflog_override {
-                        Some(m) => m.as_str().into(),
+                        Some(m) => crate::rawarg::to_bytes(m).into_owned().into(),
                         None => gix::reference::log::message(
                             "commit",
-                            message.as_str().into(),
+                            crate::rawarg::to_bytes(&message).as_bstr(),
                             parent_count,
                         ),
                     },
@@ -2814,7 +2813,22 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         None => "detached HEAD".to_string(),
     };
     let root_marker = if is_root { " (root-commit)" } else { "" };
-    println!("[{branch_label}{root_marker} {short}] {subject}");
+    // `print_commit_summary()` renders `%s`, which is `format_subject(sb, msg,
+    // " ")` — the *whole* first paragraph folded onto one line, not just its
+    // first line. A subject written across two lines prints as one. It formats
+    // the commit it just wrote, read back (`lookup_commit(r, oid)`, sequencer.c:1427),
+    // through a `rev_info` whose `log_output_encoding` defaults to
+    // `get_log_output_encoding()` — so the subject is the
+    // stored bytes (after `ensure_utf8()` transcribed any stray Latin-1),
+    // re-coded from the `encoding` header to `i18n.logOutputEncoding`.
+    let mut stored = repo.find_object(commit_id)?.data.clone();
+    super::log::logmsg_reencode(&mut stored, &crate::revfilter::log_output_encoding(&repo, None));
+    let body = stored.find(b"\n\n").map_or(&stored[..0], |p| &stored[p + 2..]);
+    let subject = folded_subject(&crate::rawarg::from_bytes(body));
+    let mut line = format!("[{branch_label}{root_marker} {short}] ").into_bytes();
+    line.extend_from_slice(&crate::rawarg::to_bytes(&subject));
+    line.push(b'\n');
+    std::io::Write::write_all(&mut std::io::stdout(), &line)?;
 
     // git prints ` Author:` when the author identity differs from the
     // committer's (as `--author` and `--amend`-preserved authors do), and
@@ -3988,7 +4002,7 @@ pub(crate) fn write_commit_object(
     parents: Vec<ObjectId>,
     signer: Option<&crate::gitsig::Signer>,
 ) -> Result<ObjectId> {
-    let mut commit = gix::objs::Commit {
+    let commit = gix::objs::Commit {
         tree,
         parents: parents.into(),
         author: author.clone(),
@@ -4000,9 +4014,20 @@ pub(crate) fn write_commit_object(
         message: message.into(),
         extra_headers: Vec::new(),
     };
+    let mut buffer = Vec::new();
+    gix::objs::WriteTo::write_to(&commit, &mut buffer)?;
+    // `if (encoding_is_utf8 && !ensure_utf8(&buffer)) fprintf(stderr, _(commit_utf8_warn));`
+    // (commit.c:1770-1772). The whole buffer, headers included, is checked: a byte
+    // that is not UTF-8 is taken for Latin-1 and transcribed, so `commit -m` with a
+    // raw \xe9 records `\xc3\xa9` unless `i18n.commitEncoding` names the encoding.
+    if commit.encoding.is_none() && !super::commit_tree::verify_utf8(&mut buffer) {
+        eprint!(
+            "Warning: commit message did not conform to UTF-8.\n\
+             You may want to amend it after fixing the message, or set the config\n\
+             variable i18n.commitEncoding to the encoding your project uses.\n"
+        );
+    }
     if let Some(s) = signer {
-        let mut payload = Vec::new();
-        gix::objs::WriteTo::write_to(&commit, &mut payload)?;
         // Both backends already carry the whole text of git's own diagnostic —
         // `sign_buffer_gpg`'s `gpg failed to sign the data:` wrapper around gpg's
         // status stream (gpg-interface.c:1045) and `sign_buffer_ssh`'s verbatim
@@ -4011,7 +4036,7 @@ pub(crate) fn write_commit_object(
         // `commit_tree_extended`'s failure: `fatal:` at 128, not this port's own
         // voice at 1. A `Fatal` came from `get_signing_key()` instead, which dies
         // on the spot with nothing after it.
-        let sig = s.sign(&payload).map_err(|e| match e {
+        let sig = s.sign(&buffer).map_err(|e| match e {
             // Reported in full already (an invalid `gpg.format`); only the exit
             // code is left, and `commit_tree_extended`'s `die()` never runs
             // because git stopped inside the config reader instead.
@@ -4024,9 +4049,10 @@ pub(crate) fn write_commit_object(
                 crate::fatal::die("failed to write commit object")
             }
         })?;
-        commit.extra_headers.push(("gpgsig".into(), sig.into()));
+        // `add_header_signature()` (commit.c:1843) on the checked buffer.
+        crate::gitsig::add_header_signature(&mut buffer, &sig, repo.object_hash());
     }
-    Ok(repo.write_object(&commit)?.detach())
+    Ok(gix::objs::Write::write_buf(&repo.objects, gix::objs::Kind::Commit, &buffer).map_err(|e| anyhow::anyhow!("{e}"))?)
 }
 
 /// git's "false index" for a partial commit — `git commit <pathspec>...`, its

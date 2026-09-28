@@ -65,7 +65,9 @@
 //!     `-v`/`--reroll-count`, `--signature`/`--no-signature`,
 //!     `--signature-file`, `--zero-commit`, `-p`/`--no-stat`, `--root`,
 //!     `-q`/`--quiet`, `--filename-max-length`, `--cover-letter`,
-//!     `-k`/`--keep-subject`, `--to`, `--cc`, `--add-header`, `--in-reply-to`,
+//!     `-k`/`--keep-subject`, `--[no-]to`, `--[no-]cc`, `--[no-]add-header` (a
+//!     `To:`/`Cc:` header joining that recipient list, as `add_header()` routes
+//!     it), `--in-reply-to`,
 //!     `-U`/`--unified`, `-a`/`--text`, `--minimal`, `--patience`,
 //!     `--histogram`, `--diff-algorithm=<name>` (every name
 //!     `parse_algorithm_value()` takes, `default` and mixed case included).
@@ -1818,11 +1820,22 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // flags below override scalars and append to the address/header lists.
     let snap = repo.config_snapshot();
     let cfg_str = |k: &str| snap.string(k).and_then(|v| v.to_str().ok().map(str::to_owned));
-    // The multi-valued `format.*` keys are read through the shared walk rather
-    // than `snapshot.values()`: a `-c format.to=<addr>` reaches gix twice (see
-    // `crate::setup::double_delivered`), and `values()` would then write the
+    // `git_format_config()`'s `format.to`, `format.cc` and `format.headers` arms
+    // (builtin/log.c:983-1004) in configuration order: a `To:`/`Cc:` header joins
+    // the very lists the other two feed. They are read through the shared walk
+    // rather than `snapshot.values()`: a `-c format.to=<addr>` reaches gix twice
+    // (see `crate::setup::double_delivered`), and `values()` would then write the
     // address into the `To:` header twice over.
-    let cfg_list = |k: &str| crate::config::multi_values(repo, k);
+    let (mut cfg_to, mut cfg_cc, mut cfg_hdr) = (Vec::new(), Vec::new(), Vec::new());
+    for v in crate::config::walk_config(repo) {
+        let Some(value) = v.value else { continue };
+        match crate::config::normalize_key(&v.key).as_str() {
+            "format.to" => cfg_to.push(value),
+            "format.cc" => cfg_cc.push(value),
+            "format.headers" => add_header(&mut cfg_hdr, &mut cfg_to, &mut cfg_cc, &value),
+            _ => {}
+        }
+    }
 
     // `format.from` resolves to an identity right away, because a value that is
     // neither a boolean nor a parsable ident line is fatal (exit 128).
@@ -1898,9 +1911,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         },
         keep_subject: false,
         in_reply_to: None,
-        to: cfg_list("format.to"),
-        cc: cfg_list("format.cc"),
-        add_header: cfg_list("format.headers"),
+        to: cfg_to,
+        cc: cfg_cc,
+        add_header: cfg_hdr,
         encode_email_headers: snap.boolean("format.encodeEmailHeaders").unwrap_or(true),
         encoding_opt: None,
         output_encoding: String::new(),
@@ -2246,12 +2259,24 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.cc.push(value_at(args, i, a)?);
             }
             s if s.starts_with("--cc=") => o.cc.push(s["--cc=".len()..].to_owned()),
+            // `OPT_STRING_LIST` (builtin/log.c:2059-2060): the negation empties the
+            // list, configured addresses included.
+            "--no-to" => o.to.clear(),
+            "--no-cc" => o.cc.clear(),
             "--add-header" => {
                 i += 1;
-                o.add_header.push(value_at(args, i, a)?);
+                let v = value_at(args, i, a)?;
+                add_header(&mut o.add_header, &mut o.to, &mut o.cc, &v);
             }
             s if s.starts_with("--add-header=") => {
-                o.add_header.push(s["--add-header=".len()..].to_owned());
+                add_header(&mut o.add_header, &mut o.to, &mut o.cc, &s["--add-header=".len()..]);
+            }
+            // `header_callback()`'s `unset` arm (builtin/log.c:1654-1657) clears the
+            // `To:` and `Cc:` lists along with the headers.
+            "--no-add-header" => {
+                o.add_header.clear();
+                o.to.clear();
+                o.cc.clear();
             }
             "--in-reply-to" => {
                 i += 1;
@@ -6226,6 +6251,22 @@ fn mboxrd_escape(body: &mut Vec<u8>, opts: &Opts) {
 pub(super) fn is_mboxrd_from(line: &[u8]) -> bool {
     let rest = &line[line.iter().take_while(|&&b| b == b'>').count()..];
     rest.starts_with(b"From ")
+}
+
+/// Port of `add_header()` (builtin/log.c:958-977), which both `format.headers` and
+/// `--add-header` go through: trailing newlines are dropped, and a value opening
+/// with `To: ` or `Cc: ` (in any case) is not a header at all but one more
+/// recipient for that list.
+fn add_header(hdr: &mut Vec<String>, to: &mut Vec<String>, cc: &mut Vec<String>, value: &str) {
+    let value = value.trim_end_matches('\n');
+    let prefix = value.as_bytes().get(..4);
+    if prefix.is_some_and(|p| p.eq_ignore_ascii_case(b"to: ")) {
+        to.push(value[4..].to_owned());
+    } else if prefix.is_some_and(|p| p.eq_ignore_ascii_case(b"cc: ")) {
+        cc.push(value[4..].to_owned());
+    } else {
+        hdr.push(value.to_owned());
+    }
 }
 
 /// `--add-header` lines (verbatim), then the `To:` and `Cc:` recipient lists,

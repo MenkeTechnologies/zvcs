@@ -4770,7 +4770,7 @@ fn pathdiff_relative(from: &std::path::Path, to: &std::path::Path) -> String {
 ///
 /// Deliberate scope: `--reference`/`--dissociate`/`--ref-format` are not
 /// accepted.
-fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
+fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     let mut force = false;
     let mut progress = false;
     let mut name: Option<String> = None;
@@ -4805,7 +4805,10 @@ fn add(args: &[String], quiet: bool) -> Result<ExitCode> {
         match opt {
             "--" => end_of_options = true,
             "-f" | "--force" => force = true,
-            "-q" | "--quiet" => {}
+            // `-q|--quiet) quiet=$1` in `cmd_add()` (git-submodule.sh:84-86), handed on
+            // to `submodule--helper add` as `--quiet` — the same switch as the
+            // `git submodule --quiet add` spelling.
+            "-q" | "--quiet" => quiet = true,
             "--progress" => progress = true,
             "--name" => name = Some(value(inline)?),
             "-b" | "--branch" => branch = Some(value(inline)?),

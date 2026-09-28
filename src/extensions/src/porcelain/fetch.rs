@@ -1160,6 +1160,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // --- dispatch by mode -------------------------------------------------
     let mut failure = false;
     let mut fatal = false;
+    let mut refused = false;
     let mut fetch_head = FetchHead {
         path: repo.git_dir().join("FETCH_HEAD"),
         enabled: opts.write_fetch_head && !opts.dry_run,
@@ -1188,6 +1189,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 Verdict::Ok => {}
                 Verdict::Rejected => failure = true,
                 Verdict::Fatal => fatal = true,
+                Verdict::Refused => refused = true,
             }
         } else {
             // ```c
@@ -1234,6 +1236,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // post-fetch work runs.
     if fatal {
         return Ok(ExitCode::from(128));
+    }
+    if refused {
+        return Ok(ExitCode::from(255));
     }
 
     // `--write-commit-graph` / `fetch.writeCommitGraph`: rebuild the commit-graph
@@ -1497,6 +1502,9 @@ pub(super) enum Verdict {
     /// `transfer.credentialsInUrl=die` matched, which git reports as a `fatal:`
     /// and exit 128 before any network traffic.
     Fatal,
+    /// `--negotiate-only` against a server that cannot do it: `transport_fetch_refs()`
+    /// answered -1, which is the exit status.
+    Refused,
 }
 
 /// git's `transfer.credentialsInUrl`, applied before a connection is opened.
@@ -3190,9 +3198,22 @@ fn fetch_one(
     // `--negotiate-only` never lists refs and never asks for a pack: it runs the negotiation on its
     // own and prints the commits the remote acknowledged as common, one per line.
     if opts.negotiate_only {
-        let common = connection
+        // A server that cannot negotiate this way gets `warning()` and `ret = -1`
+        // (transport.c:487-495), which `cmd_fetch()` returns as the exit status:
+        // 255, with nothing acknowledged to print.
+        let common = match connection
             .with_server_options(server_options)
-            .negotiate_only(&mut *progress, restrictions)?;
+            .negotiate_only(&mut *progress, restrictions)
+        {
+            Ok(common) => common,
+            // The vendored negotiation printed git's `warning()` before closing the
+            // connection, which is where it has to appear.
+            Err(
+                gix::remote::negotiate_only::Error::RequiresV2
+                | gix::remote::negotiate_only::Error::WaitForDoneUnsupported,
+            ) => return Ok(Verdict::Refused),
+            Err(e) => return Err(e.into()),
+        };
         let mut out = String::new();
         for id in common {
             out.push_str(&id.to_hex().to_string());

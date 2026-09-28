@@ -52,7 +52,9 @@ pub enum Error {
     Graph(#[from] gix_negotiate::Error),
     #[error(transparent)]
     Response(#[from] gix_protocol::fetch::response::Error),
-    #[error("The server does not support the 'wait-for-done' capability")]
+    #[error("--negotiate-only requires protocol v2")]
+    RequiresV2,
+    #[error("server does not support wait-for-done")]
     WaitForDoneUnsupported,
 }
 
@@ -129,14 +131,27 @@ where
         let fetch = gix_protocol::Command::Fetch;
         // Only a v2 server that advertises `wait-for-done` will stay in the acknowledgement phase for
         // a request without wants; anything else would answer with a pack we never asked for.
-        if handshake.server_protocol_version != gix_transport::Protocol::V2
-            || !handshake
-                .capabilities
-                .capability("fetch")
-                .and_then(|c| c.supports("wait-for-done"))
-                .unwrap_or(false)
+        // `fetch_refs_via_pack()` (transport.c:487-495) refuses the two cases separately,
+        // then closes the connection at `cleanup:` without the flush `disconnect_git()`
+        // would send (transport.c:530-535): the service reads EOF where it expected wants.
+        let refusal = if handshake.server_protocol_version != gix_transport::Protocol::V2 {
+            Some(Error::RequiresV2)
+        } else if !handshake
+            .capabilities
+            .capability("fetch")
+            .and_then(|c| c.supports("wait-for-done"))
+            .unwrap_or(false)
         {
-            return Err(Error::WaitForDoneUnsupported);
+            Some(Error::WaitForDoneUnsupported)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            // The `warning()` comes before that close, and the service's own complaint about the
+            // EOF follows it once dropping the transport waits for the child.
+            eprintln!("warning: {refusal}");
+            self.transport.skip_end_of_interaction();
+            return Err(refusal);
         }
 
         let mut features = fetch.default_features(handshake.server_protocol_version, &handshake.capabilities);

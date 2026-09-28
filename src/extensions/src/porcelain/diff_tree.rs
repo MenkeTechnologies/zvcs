@@ -1442,6 +1442,7 @@ fn emit_commit_header(
         &parents,
         None,
         ">",
+        &crate::revfilter::log_output_encoding(repo, None),
     )?;
     let empty_format = user_format && body.is_empty();
     if !body.is_empty() {

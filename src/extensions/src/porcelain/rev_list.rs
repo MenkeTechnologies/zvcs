@@ -1728,16 +1728,23 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--header" => verbose_header = true,
             "--timestamp" => show_timestamp = true,
             "--not" => negate = !negate,
-            // `--encoding=<enc>`, which the pretty formats take just as `log` does.
-            s if s.starts_with("--encoding=") => {
-                let v = &s["--encoding=".len()..];
-                if !super::blame::encoding_is_passthrough(v) {
-                    eprintln!(
-                        "fatal: unsupported option {s} (only utf-8 and none are ported)"
-                    );
-                    return Ok(ExitCode::from(128));
-                }
-                log_encoding = Some(if v == "none" { String::new() } else { v.to_string() });
+            // `--encoding[=]<enc>`, which the pretty formats take just as `log` does:
+            // `parse_long_opt()` accepts the stuck and the separate spelling and dies
+            // with `Option '--encoding' requires a value` when the value is missing
+            // (revision.c:2701-2707). Any name is taken; one iconv cannot use leaves
+            // the message as stored ([`super::log::logmsg_reencode`]).
+            s if s == "--encoding" || s.starts_with("--encoding=") => {
+                let v = match s.strip_prefix("--encoding=") {
+                    Some(v) => v.to_string(),
+                    None => {
+                        i += 1;
+                        match argv.get(i) {
+                            Some(v) => v.clone(),
+                            None => return Ok(fatal("Option '--encoding' requires a value")),
+                        }
+                    }
+                };
+                log_encoding = Some(if v == "none" { String::new() } else { v });
             }
             "--no-walk" => no_walk = true,
             "--do-walk" => no_walk = false,
@@ -3235,6 +3242,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     // `--grep`/`--author`/`--committer`: git's `commit_match`, applied as each
     // commit is about to be shown rather than during the walk.
+    // `get_log_output_encoding()`: `--encoding`, else `i18n.logOutputEncoding`, else
+    // `i18n.commitEncoding`, else UTF-8 — for the grep filter and the pretty printer.
+    let output_encoding = crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref());
     let cfilter = CommitFilter {
         // `rev-list` loads no mailmap, so its header greps see the recorded identities.
         mailmap: None,
@@ -3259,7 +3269,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         reflog_res: Vec::new(),
         all_match,
         invert_grep,
-        output_encoding: crate::revfilter::log_output_encoding(&repo, log_encoding.as_deref()),
+        output_encoding: output_encoding.clone(),
     };
     if !cfilter.is_empty() && !walk_reflogs {
         let mut kept = Vec::with_capacity(commits.len());
@@ -3847,6 +3857,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     shown_parents,
                     Some(0),
                     mark,
+                    &output_encoding,
                 )?;
                 if !body.is_empty() {
                     out.extend_from_slice(&body);

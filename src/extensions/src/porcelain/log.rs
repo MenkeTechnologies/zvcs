@@ -7666,30 +7666,8 @@ fn entry_block_from(
     };
     let mut block: Vec<u8> = Vec::new();
     render_entry(&mut block, &commit, p.pretty, &ctx)?;
-    // ```c
-    // if (output_enc) {
-    //         if (same_encoding(utf8, output_enc))
-    //                 output_enc = NULL;
-    // } …
-    // if (output_enc) {
-    //         char *out = reencode_string_len(sb->buf, sb->len, output_enc, utf8, &outsz);
-    //         if (out)
-    //                 strbuf_attach(sb, out, outsz, outsz + 1);
-    // }
-    // ```
-    //
-    // (`pretty.c:2026-2046`.) The conversion is of the *rendered record*, and a
-    // conversion that cannot be done leaves the UTF-8 bytes in place. An empty
-    // output encoding — `--encoding=none` — reaches `iconv_open("", "UTF-8")`,
-    // which is the locale's own charset and changes nothing here.
-    if user_format && !p.output_encoding.is_empty() {
-        if !super::mailinfo::same_encoding("UTF-8", p.output_encoding) {
-            if let Some(out) =
-                super::mailinfo::reencode(&block, "UTF-8", p.output_encoding)
-            {
-                block = out;
-            }
-        }
+    if user_format {
+        user_format_to_output_encoding(&mut block, p.output_encoding);
     }
     // A `tformat:` record is terminated by a newline. git still terminates a
     // record whose expansion happened to be empty (so `%d` prints one line per
@@ -9543,7 +9521,6 @@ impl EmailStyle<'_> {
     /// `builtin/rev-list.c`'s `struct pretty_print_context ctx = {0}`: no `rev`,
     /// so `fmt_output_email_subject()` is never reached and neither the config
     /// nor the command-line switch behind these two fields is visible to it.
-    /// `rev-list` itself refuses any `--encoding` but UTF-8 and `none`.
     pub(crate) const REV_LIST: EmailStyle<'static> =
         EmailStyle { subject_prefix: "", encode_headers: false, output_encoding: "UTF-8" };
 }
@@ -12060,7 +12037,17 @@ pub(crate) fn rev_list_pretty_body(
     parents: &[ObjectId],
     expand_tabs: Option<usize>,
     revision_mark: &'static str,
+    output_encoding: &str,
 ) -> Result<Vec<u8>> {
+    // Each caller sets `ctx.output_encoding = get_log_output_encoding()`, and
+    // `pretty_print_commit()` renders from `repo_logmsg_reencode(commit, NULL,
+    // encoding)` (pretty.c:2315-2316) — except for a user format (and `reference`,
+    // which is one), which `repo_format_commit_message()` expands against the
+    // commit re-coded to UTF-8 and converts afterwards (pretty.c:1734, 2026-2046).
+    let user_format = matches!(pretty, Pretty::User(_) | Pretty::Reference);
+    let mut recoded = repo.find_object(commit.id)?.try_into_commit()?;
+    logmsg_reencode(&mut recoded.data, if user_format { "UTF-8" } else { output_encoding });
+    let commit = &recoded;
     let abbrev = std::cell::RefCell::new(AbbrevCache::new(repo));
     let colors = super::color::DecorateColors::disabled();
     let ctx = RenderCtx {
@@ -12106,7 +12093,7 @@ pub(crate) fn rev_list_pretty_body(
         reflog: None,
         date_explicit: false,
         log_size: false,
-        email: EmailStyle::REV_LIST,
+        email: EmailStyle { output_encoding, ..EmailStyle::REV_LIST },
     };
     let mut out = Vec::new();
     match pretty {
@@ -12120,7 +12107,7 @@ pub(crate) fn rev_list_pretty_body(
         // only `show_log()` calls — `rev-list` prints its own `commit <oid>`
         // header instead, above this body.
         Pretty::Email | Pretty::MboxRd => {
-            email_body(&mut out, commit, pretty, EmailStyle::REV_LIST, None)?;
+            email_body(&mut out, commit, pretty, EmailStyle { output_encoding, ..EmailStyle::REV_LIST }, None)?;
         }
         Pretty::User(fmt) => expand_format(&mut out, commit, fmt, &ctx)?,
         Pretty::Reference => {
@@ -12208,6 +12195,9 @@ pub(crate) fn rev_list_pretty_body(
         }
     }
     abbrev.into_inner().flush();
+    if user_format {
+        user_format_to_output_encoding(&mut out, output_encoding);
+    }
     Ok(out)
 }
 
@@ -16265,6 +16255,34 @@ pub(crate) fn logmsg_reencode(data: &mut Vec<u8>, output_encoding: &str) {
         *data = out;
     }
     replace_encoding_header(data, output_encoding);
+}
+
+/// The tail of `repo_format_commit_message()`: a user format was expanded against
+/// the commit re-coded to UTF-8, and the finished record is converted out of UTF-8.
+///
+/// ```c
+/// if (output_enc) {
+///         if (same_encoding(utf8, output_enc))
+///                 output_enc = NULL;
+/// } …
+/// if (output_enc) {
+///         char *out = reencode_string_len(sb->buf, sb->len, output_enc, utf8, &outsz);
+///         if (out)
+///                 strbuf_attach(sb, out, outsz, outsz + 1);
+/// }
+/// ```
+///
+/// (`pretty.c:2026-2046`.) The conversion is of the *rendered record*, and a
+/// conversion that cannot be done leaves the UTF-8 bytes in place. An empty
+/// output encoding — `--encoding=none` — reaches `iconv_open("", "UTF-8")`,
+/// which is the locale's own charset and changes nothing here.
+pub(crate) fn user_format_to_output_encoding(record: &mut Vec<u8>, output_encoding: &str) {
+    if output_encoding.is_empty() || super::mailinfo::same_encoding("UTF-8", output_encoding) {
+        return;
+    }
+    if let Some(out) = super::mailinfo::reencode(record, "UTF-8", output_encoding) {
+        *record = out;
+    }
 }
 
 /// `get_header(msg, key)` → `find_commit_header()`: the value of a header line in

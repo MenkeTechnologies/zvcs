@@ -2039,7 +2039,16 @@ fn expand_format(
     };
     let pretty = super::log::Pretty::User(fmt.to_string());
     let parents = ancestry(commit, parents);
-    Ok(super::log::rev_list_pretty_body(repo, commit, &pretty, &date_mode, &parents, None, ">")?.into())
+    Ok(super::log::rev_list_pretty_body(
+        repo,
+        commit,
+        &pretty,
+        &date_mode,
+        &parents,
+        None,
+        ">",
+        &crate::revfilter::log_output_encoding(repo, None),
+    )?.into())
 }
 
 /// The parent list `%p`/`%P` print: the simplified one when a path limit produced

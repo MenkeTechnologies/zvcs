@@ -3795,6 +3795,20 @@ fn parse_one(
         i = next;
     }
 
+    // The tail of `parse_single_patch()` (apply.c:1967-1970): a creation cannot
+    // have removed anything and a deletion cannot have kept anything — the
+    // fragments' old and new line counts, context included, say otherwise.
+    let oldlines: usize = p.hunks.iter().map(|h| h.pre.len()).sum();
+    let newlines: usize = p.hunks.iter().map(|h| h.post.len()).sum();
+    if p.is_new && oldlines > 0 {
+        let name = p.new_name.as_deref().unwrap_or_default();
+        return Err(anyhow::Error::new(HeaderError(format!("new file {name} depends on old contents"))));
+    }
+    if p.is_delete && newlines > 0 {
+        let name = p.old_name.as_deref().unwrap_or_default();
+        return Err(anyhow::Error::new(HeaderError(format!("deleted file {name} still has contents"))));
+    }
+
     Ok((normalise(p)?, i))
 }
 

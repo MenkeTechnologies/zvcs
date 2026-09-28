@@ -2980,10 +2980,11 @@ fn fetch_one(
             .iter()
             .filter_map(|s| prefetch_spec(s.to_ref().to_bstring().as_bstr()))
             .collect();
+        // Tag following stays on: the rewritten refspecs still have destinations,
+        // so `get_ref_map()` sets `*autotags` (builtin/fetch.c:556-558) and
+        // `find_non_local_tags()` adds the followed tags under `refs/tags/` —
+        // `git maintenance`'s prefetch task passes `--no-tags` for that reason.
         remote.replace_refspecs(specs, gix::remote::Direction::Fetch)?;
-        // Tag following would reintroduce `refs/tags/*`, which git's prefetch
-        // filter removes, so it is switched off for the duration.
-        remote = remote.with_fetch_tags(Tags::None);
     }
 
     // Destination prefixes to prune (glob refspec destinations only), captured

@@ -80,6 +80,13 @@
 //!     what collapses the `---` before the diffstat to a bare blank line), and
 //!     `--base=<commit>|auto`/`--no-base` (the `base-commit:` trailer and the
 //!     `prerequisite-patch-id:` list, via a port of `diff_get_patch_id()`).
+//!   * `--ignore-if-in-upstream`: `get_patch_ids()` walks the range the other
+//!     way round and every commit of the series whose patch id (renames off, as
+//!     `init_patch_ids()` sets them) matches one there is dropped — after the
+//!     single-endpoint promotion, the silent same-commit exit and the two
+//!     refusals (`need exactly one range`, `not a range`). The cover letter's
+//!     diffstat base and the inferred range-diff origin still come from the
+//!     walk's boundary, drops included.
 //!   * output encoding — `--encoding=<name>` (`none` included), else
 //!     `i18n.logOutputEncoding`, else `i18n.commitEncoding`, else UTF-8: git's
 //!     `get_log_output_encoding()`. The message is built as bytes from
@@ -249,12 +256,6 @@
 //!     `fatal: external diff died, stopping at <path>`, while this renders a whole
 //!     patch before writing any of it and so prints the fatal alone. Both exit 128
 //!     with the same stderr.
-//!     `--ignore-if-in-upstream` reproduces
-//!     everything `cmd_format_patch` decides before the comparison — the
-//!     single-endpoint promotion that turns a lone rev into `<rev>..HEAD`, the
-//!     silent exit when both endpoints are the same commit, and the two
-//!     refusals (`need exactly one range`, `not a range`) — but the patch-id
-//!     comparison itself is not ported, so a real range is still refused.
 //!   * `--src-prefix=<p>`, `--dst-prefix=<p>`, `--no-prefix`, `--default-prefix` and
 //!     `--output=<file>` *are* ported; unknown options report git's own
 //!     `fatal: unrecognized argument: <arg>` (128).
@@ -878,6 +879,9 @@ struct Opts {
     /// pre- and post-image record is blank are marked ignorable, exactly as
     /// `-I<regex>` marks the ones its patterns cover.
     ignore_blank_lines: bool,
+    /// `--[no-]ignore-if-in-upstream`: drop every commit of the series whose
+    /// patch id matches a commit on the other side of the range.
+    ignore_if_in_upstream: bool,
     /// `--diff-filter=<letters>` as `(include-bits, exclude-bits)` over
     /// [`super::diff_filter`]'s status set. `None` is no filtering at all.
     diff_filter: Option<super::diff_filter::Filter>,
@@ -1044,7 +1048,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     // silent rather than fatal: `s_r_opt.def` supplies `HEAD`, the rule turns it
     // into `HEAD..HEAD`, and the two endpoints resolve to the same object, which
     // git answers with `goto done` — exit 0, no patches.
-    if opts.deferred.iter().any(|f| f == "--ignore-if-in-upstream") {
+    if opts.ignore_if_in_upstream {
         match upstream_endpoints(&repo, &opts)? {
             Endpoints::Identical => return Ok(ExitCode::SUCCESS),
             Endpoints::Range => {}
@@ -1084,6 +1088,16 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             return Ok(fatal(&format!("{name} does not make sense")));
         }
     }
+    // `if (ignore_if_in_upstream && has_commit_patch_id(commit, &ids)) continue;`
+    // (builtin/log.c:2348-2349), over the commits the walk handed back.
+    // The walk's boundary — the cover letter's diffstat base and the inferred
+    // range-diff origin — is counted while `get_revision()` runs, i.e. over every
+    // commit it returned, before any was dropped (builtin/log.c:2341-2346).
+    let walked = commits.clone();
+    let commits = match opts.ignore_if_in_upstream {
+        true => drop_upstream_patches(&repo, &opts, commits)?,
+        false => commits,
+    };
     if commits.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -1152,7 +1166,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
             if let Err(code) = validate_range_diff(&repo, &rd) {
                 return Ok(code);
             }
-            Some(infer_range_diff_ranges(&repo, &rd, &commits)?)
+            Some(infer_range_diff_ranges(&repo, &rd, &commits, &walked)?)
         }
         None => None,
     };
@@ -1199,7 +1213,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
         // A bad `--commit-list-format` is only caught once the cover letter's
         // headers are already written, so the partial message is emitted first.
         if let Err(code) =
-            render_cover_letter(&repo, &commits, &pending, printed_total, &opts, &th, &mut msg)?
+            render_cover_letter(&repo, &commits, &walked, &pending, printed_total, &opts, &th, &mut msg)?
         {
             emit_message(&mut buffered, &msg, cover_filename(&opts), &opts)?;
             stdout.write_all(&buffered)?;
@@ -1327,6 +1341,7 @@ fn infer_range_diff_ranges(
     repo: &gix::Repository,
     prev: &str,
     commits: &[ObjectId],
+    walked: &[ObjectId],
 ) -> Result<(String, String)> {
     let head = commits.last().expect("caller rejects an empty series");
     let head_hex = head.to_hex().to_string();
@@ -1336,7 +1351,7 @@ fn infer_range_diff_ranges(
     } else {
         format!("{head_hex}..{prev}")
     };
-    let r2 = match series_origin(repo, commits)? {
+    let r2 = match series_origin(repo, walked)? {
         Some(origin) => format!("{}..{head_hex}", origin.to_hex()),
         None if prev_is_range => {
             crate::git_fatal!("failed to infer range-diff origin of current series")
@@ -1541,7 +1556,6 @@ const NO_OP: &[&str] = &[
 /// Flags git accepts that this module has not ported. Matched as `--flag` or
 /// `--flag=<value>`; see the module header for what each of them would change.
 const DEFERRED: &[&str] = &[
-    "--ignore-if-in-upstream",
     // `--textconv` needs `fill_textconv()` to run a `diff.<name>.textconv` program
     // over each side before the differ sees it; `--ext-diff`, which replaces the
     // whole section with a program's stdout instead, is ported.
@@ -1997,6 +2011,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         compact_summary: false,
         inter_hunk_ctx: 0,
         ignore_blank_lines: false,
+        ignore_if_in_upstream: false,
         diff_filter: None,
         colors: DiffColors::disabled(),
         extra: ExtraPaint::default(),
@@ -2137,6 +2152,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--no-signature" => o.sig_cli = SigCli::No,
             "--zero-commit" => o.zero_commit = true,
+            "--ignore-if-in-upstream" => o.ignore_if_in_upstream = true,
+            "--no-ignore-if-in-upstream" => o.ignore_if_in_upstream = false,
             "--no-zero-commit" => o.zero_commit = false,
             "--encode-email-headers" => o.encode_email_headers = true,
             "--no-encode-email-headers" => o.encode_email_headers = false,
@@ -4190,6 +4207,47 @@ fn upstream_endpoints(repo: &gix::Repository, opts: &Opts) -> Result<Endpoints> 
     }
 }
 
+/// `get_patch_ids()` + `has_commit_patch_id()` (builtin/log.c:1170-1210,
+/// patch-ids.c:55-130): walk the range the other way round — the upstream
+/// endpoint as the tip, the series' tip hidden, merges skipped by
+/// `max_parents = 1` — collect each commit's patch id under
+/// `init_patch_ids()`'s `detect_rename = 0`, and drop every commit of `series`
+/// whose own patch id is among them. A merge has no patch id and is never
+/// dropped (`patch_id_defined()`).
+fn drop_upstream_patches(
+    repo: &gix::Repository,
+    opts: &Opts,
+    series: Vec<ObjectId>,
+) -> Result<Vec<ObjectId>> {
+    let Ok(p) = seed_pending(repo, opts)? else {
+        return Ok(series);
+    };
+    let (Some(&tip), Some(&upstream)) = (p.tips.first(), p.hidden.first()) else {
+        return Ok(series);
+    };
+    let peel = |id: ObjectId| -> Result<ObjectId> {
+        Ok(repo.find_object(id)?.peel_to_commit()?.id)
+    };
+    let mut upstream_ids: HashSet<ObjectId> = HashSet::new();
+    for info in repo.rev_walk([peel(upstream)?]).with_hidden([peel(tip)?]).all()? {
+        let commit = info?.object()?;
+        if commit.parent_ids().count() > 1 {
+            continue;
+        }
+        upstream_ids.insert(commit_patch_id(repo, &commit, Some(0))?);
+    }
+    let mut kept = Vec::with_capacity(series.len());
+    for id in series {
+        let commit = repo.find_object(id)?.try_into_commit()?;
+        let defined = commit.parent_ids().count() <= 1;
+        if defined && upstream_ids.contains(&commit_patch_id(repo, &commit, Some(0))?) {
+            continue;
+        }
+        kept.push(id);
+    }
+    Ok(kept)
+}
+
 fn fatal(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}");
     ExitCode::from(128)
@@ -4718,14 +4776,14 @@ fn apply_cherry_limits(
                 continue;
             }
             let commit = repo.find_object(*id)?.try_into_commit()?;
-            ids.entry(commit_patch_id(repo, &commit)?).or_default().push(*id);
+            ids.entry(commit_patch_id(repo, &commit, Some(0))?).or_default().push(*id);
         }
         for id in walked.iter() {
             if left_first == left.contains(id) {
                 continue;
             }
             let commit = repo.find_object(*id)?.try_into_commit()?;
-            let Some(same) = ids.get(&commit_patch_id(repo, &commit)?) else {
+            let Some(same) = ids.get(&commit_patch_id(repo, &commit, Some(0))?) else {
                 continue;
             };
             // `commit->object.flags |= cherry_flag` for the commit found, and the
@@ -5683,6 +5741,9 @@ fn emit_stat_blocks(
 fn render_cover_letter(
     repo: &gix::Repository,
     commits: &[ObjectId],
+    // Every commit the walk returned, `--ignore-if-in-upstream`'s drops included:
+    // the boundary `series_origin()` finds is counted over them.
+    walked: &[ObjectId],
     pending: &[ObjectId],
     total: usize,
     opts: &Opts,
@@ -5796,7 +5857,7 @@ fn render_cover_letter(
     // hard-coded `DIFF_FORMAT_SUMMARY | DIFF_FORMAT_DIFFSTAT`, so the cover
     // letter keeps the stat+summary block whatever the series was asked for, and
     // closes it with a blank line even when the two trees turn out identical.
-    if let Some(origin) = series_origin(repo, commits)? {
+    if let Some(origin) = series_origin(repo, walked)? {
         // `--no-walk` makes `process_parents()` return before it parses any
         // parent, so a boundary commit that the revision arguments did not name
         // themselves reaches `show_diffstat()` unparsed: `get_commit_tree_oid()`
@@ -6340,7 +6401,7 @@ fn resolve_bases(
         if commit.parent_ids().count() > 1 {
             continue;
         }
-        patch_ids.push(commit_patch_id(repo, &commit)?);
+        patch_ids.push(commit_patch_id(repo, &commit, None)?);
     }
     Ok(Ok(Some(Bases { base, patch_ids })))
 }
@@ -6361,7 +6422,15 @@ fn print_bases(out: &mut Vec<u8>, bases: &Bases) {
 /// (`diff--git`, `a/`+`b/` paths with whitespace removed, mode words) followed
 /// by the raw diff lines, and each file's digest is folded into the running
 /// result with `flush_one_hunk()`'s carrying byte-wise sum.
-fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<ObjectId> {
+/// `detect_rename` is the `diff_options` the caller built: `None` for
+/// `prepare_bases()`'s `repo_diff_setup()`, which takes the `diff.renames`
+/// default, and `Some(0)` for `init_patch_ids()`, which clears it
+/// (patch-ids.c:70) — the `--cherry-pick` family and `--ignore-if-in-upstream`.
+fn commit_patch_id(
+    repo: &gix::Repository,
+    commit: &gix::Commit<'_>,
+    detect_rename: Option<u8>,
+) -> Result<ObjectId> {
     let kind = repo.object_hash();
     let new_tree = commit.tree()?;
     let old_tree = match commit.parent_ids().next() {
@@ -6374,7 +6443,7 @@ fn commit_patch_id(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<O
         Some(&new_tree),
         None,
         None,
-        &RenameOpts::default(),
+        &RenameOpts { detect_rename, ..RenameOpts::default() },
         &mut HashMap::new(),
     )?;
 

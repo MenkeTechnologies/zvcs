@@ -160,7 +160,7 @@ fn option_refusals_match_git() {
     }
 
     // A two-endpoint range is what `--ignore-if-in-upstream` wants; it gets past the
-    // range check (the comparison itself is not ported, so it stops later).
+    // range check.
     let ranged = f.run(&["format-patch", "--stdout", "--ignore-if-in-upstream", "HEAD~1..HEAD"]);
     assert!(
         !String::from_utf8_lossy(&ranged.stderr).contains("need exactly one range"),

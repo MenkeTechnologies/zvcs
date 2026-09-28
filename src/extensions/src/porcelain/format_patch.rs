@@ -6265,10 +6265,11 @@ fn resolve_bases(
             None => return Ok(Err(fatal(&format!("unknown commit {spec}")))),
         }
     } else {
+        // `branch_get_upstream(curr_branch, NULL)` (builtin/log.c:1740), which a
+        // `branch.<name>.remote` of `.` answers with the local branch itself.
         let upstream = repo
             .head_ref()?
-            .map(|r| r.name().to_owned())
-            .and_then(|name| repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Fetch).and_then(|r| r.ok()));
+            .and_then(|r| super::branch::upstream_ref(repo, r.name().as_bstr()));
         let Some(upstream) = upstream else {
             give_up!(
                 "failed to get upstream, if you want to record base commit automatically,\n\

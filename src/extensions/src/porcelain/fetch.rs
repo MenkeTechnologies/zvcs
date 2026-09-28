@@ -191,6 +191,15 @@ pub(super) const USAGE_ALL: &str = r#"usage: git fetch [<options>] [<repository>
 
 "#;
 
+/// The short half of `builtin_fetch_options[]`: `-j <n>` and `-o <option>` take a
+/// value, the rest are switches.
+const SHORT_OPTS: crate::parseopt::Shorts<'static> = crate::parseopt::Shorts {
+    flags: "vqafmtnpPku46h",
+    values: "jo",
+    optargs: "",
+    number: false,
+};
+
 /// `cmd_fetch()`'s `struct option builtin_fetch_options[]` (builtin/fetch.c), in
 /// table order, as [`super::resolve_long_aliased`] reads it.
 ///
@@ -321,6 +330,11 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // `--refmap` (repeatable). Kept as raw strings because an empty one is legal and doesn't parse.
     let mut refmap: Vec<String> = Vec::new();
 
+    // Clustered short options (`-pv`, `-j2`, `-oopt`) are split the way
+    // `parse_short_opt()` reads them one character at a time; the reflog action
+    // above keeps the words as typed, as git's does.
+    let expanded = crate::parseopt::expand_short(args, SHORT_OPTS);
+    let args = &expanded[..];
     let mut i = 0;
     while i < args.len() {
         let typed = args[i].as_str();
@@ -500,7 +514,12 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 let v = take_value!("--jobs");
                 // `OPT_INTEGER`, through the shared parse-options grammar so the
                 // unit suffixes its own rejection advertises actually work.
-                let n = match crate::optint::integer(&crate::optint::long_opt("jobs"), &v) {
+                // `optname()` names the spelling that was typed.
+                let name = match key {
+                    "-j" => crate::optint::short_opt('j'),
+                    _ => crate::optint::long_opt("jobs"),
+                };
+                let n = match crate::optint::integer(&name, &v) {
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -656,7 +675,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
                 // `=`, so the message goes back to the token.
                 return Ok(super::unknown_option(typed, USAGE));
             }
-            s if s.starts_with('-') && s.len() > 1 => anyhow::bail!("unsupported option {s:?}"),
+            s if s.starts_with('-') && s.len() > 1 => return Ok(super::unknown_option(s, USAGE)),
             // A non-option argument is handed back unchanged by the resolver, so the
             // argv slice itself is pushed and the operand keeps `args`' lifetime.
             _ => positionals.push(typed),

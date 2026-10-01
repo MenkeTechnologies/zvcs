@@ -3,12 +3,12 @@
 //! Covered, byte-identically with stock git (verified against git 2.55.0):
 //! `--stdin-mode=revs`/`rev`/`text`, `--format=<pretty>`, `-z`/`--null`,
 //! `--null-input`/`--no-null-input`, `--null-output`/`--no-null-output`,
-//! `--no-notes`, the builtin pretty formats `oneline`, `short`, `medium`,
-//! `full`, `fuller`, `raw` and `reference`, `format:`/`tformat:` prefixes, and
-//! the user-format placeholders listed on [`parse_user_format`]. Record
-//! splitting, the terminator-not-separator rule, per-record flushing, the
-//! `Could not get …. Skipping.` warnings on stderr, and the `fatal:` messages
-//! with exit code 128 / usage with 129 all match.
+//! `--no-format`, `--no-stdin-mode`, `--no-notes`, the builtin pretty formats
+//! `oneline`, `short`, `medium`, `full`, `fuller`, `raw` and `reference`,
+//! `format:`/`tformat:` prefixes, and the user-format placeholders listed on
+//! [`parse_user_format`]. Record splitting, the terminator-not-separator rule,
+//! per-record flushing, the `Could not get …. Skipping.` warnings on stderr,
+//! and the `fatal:` messages with exit code 128 / usage with 129 all match.
 //!
 //! Additionally covered, verified byte-for-byte against git 2.55.0's own
 //! `format-rev` output: `%d`/`%D` ref decoration (same reverse-sorted ordering
@@ -248,6 +248,7 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
     let expanded = crate::parseopt::expand_short(args, crate::parseopt::Shorts::flags("zh"));
     let args = &expanded[..];
 
+    let mut positional = 0usize;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -270,7 +271,11 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
         let a = resolved.as_ref();
         match a {
             "--format" => format_arg = Some(value(&mut i, "format")?),
+            // `OPT_STRING` carries no `PARSE_OPT_NONEG`: the unset sense stores
+            // NULL, so a later `--no-format` undoes an earlier `--format`.
+            "--no-format" => format_arg = None,
             "--stdin-mode" => mode_arg = Some(value(&mut i, "stdin-mode")?),
+            "--no-stdin-mode" => mode_arg = None,
             "--notes" => notes.push(value(&mut i, "notes")?),
             "--no-notes" => notes.clear(), // the default: notes are not displayed
             "-h" | "--help-all" => {
@@ -286,7 +291,7 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
             // ctx->argv++; break; }`), so it ends option parsing and is never an
             // unknown option.
             "--" => {
-                i += 1;
+                positional += args.len() - (i + 1);
                 break;
             }
             "-z" | "--null" => {
@@ -307,7 +312,8 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(body) = a.strip_prefix("--") {
                     eprint!("error: unknown option `{body}'\n{USAGE}");
                     return Ok(ExitCode::from(129));
-                } else if a.starts_with('-') {
+                } else if a.starts_with('-') && a != "-" {
+                    // A lone `-` is a non-option (parse-options.c: `*arg != '-' || !arg[1]`).
                     // `PARSE_OPT_UNKNOWN` names a *switch* for a short argument
                     // (parse-options.c:889-898).
                     let c = a[1..].chars().next().unwrap_or_default();
@@ -319,12 +325,20 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
                     }
                     return Ok(ExitCode::from(129));
                 } else {
-                    eprint!("error: too many arguments\n{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    // Collected, not refused: without `PARSE_OPT_STOP_AT_NON_OPTION`
+                    // the sweep goes on, so a bad option after it is reported first.
+                    positional += 1;
                 }
             }
         }
         i += 1;
+    }
+
+    // `if (argc > 0) { error(_("too many arguments")); usage_with_options(…); }`
+    // (builtin/name-rev.c:847-850), once the sweep is over.
+    if positional > 0 {
+        eprint!("error: too many arguments\n{USAGE}");
+        return Ok(ExitCode::from(129));
     }
 
     // git validates in this order: --format present, --stdin-mode present,

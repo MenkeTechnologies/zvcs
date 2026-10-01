@@ -2723,12 +2723,17 @@ fn install_branch_config_multiple_remotes(
                 }
             })
             .collect();
+        // `printf_ln()` writes to stdio's `stdout`, the same buffer `checkout`/`switch`
+        // filled with `show_local_changes()` before `update_refs_for_switch()` reached
+        // here, so off a terminal the notice comes out after that listing. Routed
+        // through [`crate::cstdio`] so it joins the buffer those commands armed; a
+        // command that never armed it (`branch`) writes straight through as before.
         if friendly.len() == 1 {
-            println!("{}", tracking_line(local, &friendly[0], rebasing));
+            crate::cstdio::println!("{}", tracking_line(local, &friendly[0], rebasing));
         } else {
-            println!("branch '{local}' set up to track:");
+            crate::cstdio::println!("branch '{local}' set up to track:");
             for name in &friendly {
-                println!("  {name}");
+                crate::cstdio::println!("  {name}");
             }
         }
     }

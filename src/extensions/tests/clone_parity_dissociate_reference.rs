@@ -120,7 +120,12 @@ fn repack_all_copies_borrowed_objects_and_deletes_only_local_packs() {
         format!("{}\n", f.root.join("ref.git/objects").display()),
     )
     .unwrap();
-    f.run(&plain, &["fetch", "-q", "../ref.git", "main:main"]);
+    // Into a branch that is not checked out: `main` is, unborn, and git refuses
+    // to fetch into it.
+    assert_eq!(
+        f.run(&plain, &["fetch", "-q", "../ref.git", "main:refs/heads/borrowed"]),
+        (String::new(), String::new(), 0)
+    );
 
     let (out, err, code) = f.run(&plain, &["repack", "-a", "-d", "-q"]);
     assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0));

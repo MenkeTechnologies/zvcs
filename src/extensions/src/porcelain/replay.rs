@@ -1023,11 +1023,15 @@ fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<String> {
             .try_find_reference(candidate.as_str())
             .ok()
             .flatten()
-            .is_some_and(|r| r.name().as_bstr() == candidate.as_bytes());
-        if exact {
+            .filter(|r| r.name().as_bstr() == candidate.as_bytes());
+        // `*ref = xstrdup(r)` (refs.c:825-826) keeps what
+        // `refs_resolve_ref_unsafe()` returned, which is the name at the end
+        // of the symref chain — `HEAD` dwims to `refs/heads/<branch>` unless
+        // it is detached — and a dangling symref resolves to nothing at all.
+        if let Some(resolved) = exact.and_then(|r| resolve_symref_chain(repo, r)) {
             matches += 1;
             if first.is_none() {
-                first = Some(candidate);
+                first = Some(resolved);
             }
         }
     }
@@ -1036,6 +1040,24 @@ fn dwim_ref(repo: &gix::Repository, name: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The refname `refs_resolve_ref_unsafe(..., RESOLVE_REF_READING, ...)`
+/// returns for `start`: symbolic targets followed to the reference that holds
+/// an object id. `None` for a dangling symref or a chain deeper than git's
+/// `SYMREF_MAXDEPTH` (5).
+fn resolve_symref_chain(repo: &gix::Repository, start: gix::Reference<'_>) -> Option<String> {
+    let mut current = start;
+    for _ in 0..=5 {
+        let next = match current.target() {
+            gix::refs::TargetRef::Object(_) => {
+                return Some(current.name().as_bstr().to_str_lossy().into_owned())
+            }
+            gix::refs::TargetRef::Symbolic(name) => name.as_bstr().to_str_lossy().into_owned(),
+        };
+        current = repo.try_find_reference(next.as_str()).ok().flatten()?;
+    }
+    None
 }
 
 /// git's `load_branch_decorations` plus the decoration-list ordering its

@@ -310,32 +310,59 @@ impl Pipeline<'_> {
 }
 
 /// Obtain a list of all configured driver, but ignore those in sections that we don't trust enough.
+///
+/// This is `read_convert_config()` (convert.c:1024-1078): every `filter.<name>.<key>` the
+/// config callback sees updates the one driver called `<name>`, created on first sight, so
+/// a driver spread over several sections — `-c filter.x.clean=… -c filter.x.required=true`
+/// produces one section per `-c` — is a single driver, each key taking its last value.
+/// A bare `required` is `git_config_bool()` of a NULL value, which is true.
 fn extract_drivers(repo: &Repository) -> Result<Vec<gix_filter::Driver>, pipeline::options::Error> {
-    repo.config
+    let mut drivers: Vec<gix_filter::Driver> = Vec::new();
+    for section in repo
+        .config
         .resolved
         .sections_by_name("filter")
         .into_iter()
         .flatten()
         .filter(|s| repo.filter_config_section()(s.meta()))
-        .filter_map(|s| {
-            s.header().subsection_name().map(|name| {
-                Ok(gix_filter::Driver {
+    {
+        let Some(name) = section.header().subsection_name() else {
+            continue;
+        };
+        let pos = match drivers.iter().position(|d| d.name == name) {
+            Some(pos) => pos,
+            None => {
+                drivers.push(gix_filter::Driver {
                     name: name.to_owned(),
-                    clean: s.value("clean"),
-                    smudge: s.value("smudge"),
-                    process: s.value("process"),
-                    required: s
-                        .value("required")
-                        .map(|value| gix_config::Boolean::try_from(BStr::new(&value)))
-                        .transpose()
-                        .map_err(|err| pipeline::options::Error::Driver {
-                            name: name.to_owned(),
-                            source: err,
-                        })?
-                        .unwrap_or_default()
-                        .into(),
-                })
-            })
-        })
-        .collect::<Result<Vec<_>, pipeline::options::Error>>()
+                    clean: None,
+                    smudge: None,
+                    process: None,
+                    required: false,
+                });
+                drivers.len() - 1
+            }
+        };
+        let driver = &mut drivers[pos];
+        if let Some(clean) = section.value("clean") {
+            driver.clean = Some(clean);
+        }
+        if let Some(smudge) = section.value("smudge") {
+            driver.smudge = Some(smudge);
+        }
+        if let Some(process) = section.value("process") {
+            driver.process = Some(process);
+        }
+        if let Some(required) = section.value_implicit("required") {
+            driver.required = match required {
+                None => true,
+                Some(value) => gix_config::Boolean::try_from(BStr::new(&value))
+                    .map_err(|err| pipeline::options::Error::Driver {
+                        name: name.to_owned(),
+                        source: err,
+                    })?
+                    .into(),
+            };
+        }
+    }
+    Ok(drivers)
 }

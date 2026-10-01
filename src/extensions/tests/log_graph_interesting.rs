@@ -141,8 +141,10 @@ fn parent_count_limits_close_the_merges_lanes() {
 
     // The merge itself is what `--no-merges` drops, so `tip`'s only parent stops
     // being interesting and its lane closes — `s1` takes the column back over.
+    // Since 2.56 that makes `tip` a visual root with the unrelated `s1` right
+    // below it, so its row is indented one lane (graph.c:1350-1366).
     let got = out(&repo, &home, &["log", "--graph", "--pretty=format:%s", "--no-merges", "--all"]);
-    let want = rows(&["* tip", "* s1", "| * m1", "|/··", "* base"]);
+    let want = rows(&["··* tip", "* s1", "| * m1", "|/··", "* base"]);
     assert_eq!(got, want, "--no-merges graph drifted:\n{got}");
 
     let _ = std::fs::remove_dir_all(root);

@@ -1110,6 +1110,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     let mut graph = false;
     // `revs->graph_max_lanes` (`--graph-lane-limit=<n>`, revision.c:2627-2628).
     let mut graph_max_lanes: i64 = 0;
+    // `revs->no_graph_indent` and `revs->graph_indent_set`: `--[no-]graph-indent`
+    // (revision.c:2661-2666), with `log.graphIndent` read when `--graph` is.
+    let mut no_graph_indent = false;
+    let mut graph_indent_set = false;
     // `revs->show_merge` (`--merge`, revision.c:2434-2435).
     let mut show_merge = false;
     // `revs->track_linear` (`--show-linear-break`, revision.c:2591-2598).
@@ -1634,7 +1638,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // --graph --children` dies with `options '--parents' and '--children'
             // cannot be used together`, which is the `rewrite_parents && children`
             // check.
-            "--graph" => graph = true,
+            "--graph" => {
+                graph = true;
+                // `graph_init()` → `graph_read_config()` (graph.c:420-443) runs
+                // as the option is parsed, so `log.graphIndent` overrides an
+                // earlier `--[no-]graph-indent` and a later one overrides it.
+                match crate::repo_settings::config_bool_strict(&repo, "log.graphIndent") {
+                    Ok(Some(v)) => no_graph_indent = !v,
+                    Ok(None) => {}
+                    Err(message) => return Ok(fatal(&message)),
+                }
+            }
+            // revision.c:2661-2666.
+            "--graph-indent" | "--no-graph-indent" => {
+                no_graph_indent = dispatch == "--no-graph-indent";
+                graph_indent_set = true;
+            }
             // ```c
             // } else if (!strcmp(arg, "--no-graph")) {
             //         graph_clear(revs->graph);
@@ -2384,6 +2403,10 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `if (revs->graph_max_lanes > 0 && !revs->graph) die(…)` (revision.c:3200-3201).
     if graph_max_lanes > 0 && !graph {
         return Ok(fatal("the option '--graph-lane-limit' requires '--graph'"));
+    }
+    // revision.c:3241-3242.
+    if graph_indent_set && !graph {
+        return Ok(fatal("the option '--[no-]graph-indent' requires '--graph'"));
     }
     // The graph draws one block per commit record. `--objects` interleaves object
     // names between those blocks unprefixed, and `--count`/`--quiet`/`--disk-usage`
@@ -3947,6 +3970,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             left_right,
             &interest,
             graph_max_lanes,
+            no_graph_indent,
         )?;
         out.extend_from_slice(&drawn);
     }

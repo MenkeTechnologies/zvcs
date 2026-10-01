@@ -154,6 +154,7 @@ const GIT_LOG_LONG_OPTS: &[&str] = &[
     "git-completion-helper-all",
     "glob",
     "graph",
+    "graph-indent",
     // `graph-lane-limit` is absent here on purpose. git 2.55.0 parses it only
     // through `skip_prefix(arg, "--graph-lane-limit=", …)`, so the bare spelling
     // is `fatal: unrecognized argument: …` — which omission gives — while the
@@ -226,6 +227,7 @@ const GIT_LOG_LONG_OPTS: &[&str] = &[
     "no-full-index",
     "no-function-context",
     "no-graph",
+    "no-graph-indent",
     "no-i-still-use-this",
     "no-ignore-matching-lines",
     "no-indent-heuristic",
@@ -970,6 +972,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut graph = false;
     // `revs->graph_max_lanes` (`--graph-lane-limit=<n>`, revision.c:2627-2628).
     let mut graph_max_lanes: i64 = 0;
+    // `revs->no_graph_indent` and `revs->graph_indent_set`: `--[no-]graph-indent`
+    // (revision.c:2661-2666), with `log.graphIndent` read when `--graph` is.
+    let mut no_graph_indent = false;
+    let mut graph_indent_set = false;
     // `revs->show_merge` (`--merge`, revision.c:2434-2435).
     let mut show_merge = false;
     // `revs->def` from `--default <rev>` (revision.c:2429-2433), standing in for
@@ -1812,6 +1818,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             show_root = true;
         } else if a == "--graph" {
             graph = true;
+            // `graph_init()` → `graph_read_config()` (graph.c:420-443) runs here,
+            // as the option is parsed: `log.graphIndent` overrides whatever an
+            // earlier `--[no-]graph-indent` said, and a later one overrides it.
+            match crate::repo_settings::config_bool_strict(&repo, "log.graphIndent") {
+                Ok(Some(v)) => no_graph_indent = !v,
+                Ok(None) => {}
+                Err(message) => {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+        } else if a == "--graph-indent" || a == "--no-graph-indent" {
+            // revision.c:2661-2666.
+            no_graph_indent = a == "--no-graph-indent";
+            graph_indent_set = true;
         // ```c
         // } else if (!strcmp(arg, "--no-graph")) {
         //         graph_clear(revs->graph);
@@ -3703,6 +3724,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         eprintln!("fatal: the option '--graph-lane-limit' requires '--graph'");
         return Ok(ExitCode::from(128));
     }
+    // revision.c:3241-3242.
+    if graph_indent_set && !graph {
+        eprintln!("fatal: the option '--[no-]graph-indent' requires '--graph'");
+        return Ok(ExitCode::from(128));
+    }
     // `if (argc > 1) die(_("unrecognized argument: %s"), argv[1]);`
     // (builtin/log.c:319-320), the first thing `cmd_log_init_finish()` does once
     // `setup_revisions()` returns. By then every revision has been resolved —
@@ -5464,7 +5490,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // the graph is drawn here, so the widths are measured up front — the same
     // state machine, run for its column bookkeeping alone.
     if graph {
-        measure_graph_widths(&mut nodes, first_parent, &interest, graph_max_lanes);
+        measure_graph_widths(&mut nodes, first_parent, &interest, graph_max_lanes, no_graph_indent);
     }
 
     // `--children`: the map `set_children()` built while the walk was still being
@@ -6830,6 +6856,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             left_right,
             &interest,
             graph_max_lanes,
+            no_graph_indent,
         )?;
         let out = super::diff::apply_line_prefix(out, &line_prefix);
         let rc = match stdout.write_all(&out) {
@@ -14618,13 +14645,18 @@ fn measure_graph_widths(
     first_parent: bool,
     interest: &GraphInterest,
     max_lanes: i64,
+    no_graph_indent: bool,
 ) {
-    let mut graph = Graph::new(vec![String::new()], false, max_lanes);
-    for node in nodes.iter_mut() {
-        let drawn_parents = interest.drawn_parents(node, first_parent);
+    let mut graph = Graph::new(vec![String::new()], false, max_lanes, no_graph_indent);
+    for i in 0..nodes.len() {
+        let drawn_parents = interest.drawn_parents(&nodes[i], first_parent);
+        let candidate = interest.is_visual_root_candidate(&nodes[i]);
+        let lookahead = interest.lookahead(nodes, i);
         // The glyph does not change the row's width, so the cheapest one will do.
-        graph.update(node.id, &drawn_parents, node.boundary, b'*');
-        node.graph_width = graph.width as i32;
+        graph.update(nodes[i].id, &drawn_parents, nodes[i].boundary, b'*', candidate, &lookahead);
+        // `show_log()` draws the commit row (log-tree.c:801) before it reads the
+        // width (log-tree.c:888), and that row adds a visual root's indentation.
+        nodes[i].graph_width = (graph.width + graph.visual_root_padding()) as i32;
     }
 }
 
@@ -14677,6 +14709,25 @@ impl GraphInterest {
             if first_parent { &node.parents[..node.parents.len().min(1)] } else { &node.parents };
         parents.iter().copied().filter(|p| self.is_interesting(p)).collect()
     }
+
+    /// `graph_is_visual_root_candidate()` (graph.c:930-941): a commit none of whose
+    /// parents the graph draws — a root, one whose parents were all simplified
+    /// away, or one whose parents the filters drop. A boundary commit never is:
+    /// it hangs off the child that reached it.
+    fn is_visual_root_candidate(&self, node: &Node) -> bool {
+        !node.boundary && !node.parents.iter().any(|p| self.is_interesting(p))
+    }
+
+    /// The graph's lookahead buffer while `nodes[i]` is drawn: `get_revision()`
+    /// prefetches up to two commits behind the one it returns (revision.c:4777-4793).
+    fn lookahead(&self, nodes: &[Node], i: usize) -> Vec<GraphPeek> {
+        nodes
+            .iter()
+            .skip(i + 1)
+            .take(2)
+            .map(|n| GraphPeek { id: n.id, visual_root_candidate: self.is_visual_root_candidate(n) })
+            .collect()
+    }
 }
 
 /// Prefix every line of every commit's block with git's ASCII graph, flushing the
@@ -14705,8 +14756,9 @@ pub(super) fn render_graph(
     left_right: bool,
     interest: &GraphInterest,
     max_lanes: i64,
+    no_graph_indent: bool,
 ) -> Result<Vec<u8>> {
-    let mut graph = Graph::new(colors, want_color, max_lanes);
+    let mut graph = Graph::new(colors, want_color, max_lanes, no_graph_indent);
     let mut out: Vec<u8> = Vec::new();
     // `opt->shown_one` together with `opt->missing_newline`: whether a record has
     // printed yet, and whether the last one's *message* ended in a newline
@@ -14734,6 +14786,8 @@ pub(super) fn render_graph(
             &interest.drawn_parents(node, first_parent),
             node.boundary,
             commit_char,
+            interest.is_visual_root_candidate(node),
+            &interest.lookahead(nodes, i),
         );
 
         let Some(record) = blocks[i].as_ref() else {
@@ -14759,7 +14813,7 @@ pub(super) fn render_graph(
         // row onto lines of its own — the `...` skip row, and the expansion rows
         // an octopus merge needs — so that the commit's text lands on the row
         // carrying its `*`.
-        while matches!(graph.state, GraphState::Skip | GraphState::PreCommit) {
+        while matches!(graph.state, GraphState::Skip | GraphState::PreCommit | GraphState::PreRoot) {
             out.extend_from_slice(&graph.next_line());
             out.push(b'\n');
         }
@@ -14876,6 +14930,8 @@ enum GraphState {
     Skip,
     /// An expansion row that opens space around an octopus merge.
     PreCommit,
+    /// The ` \` row joining an indented visual root to the column above it.
+    PreRoot,
     Commit,
     PostMerge,
     Collapsing,
@@ -14886,6 +14942,31 @@ enum GraphState {
 struct GraphColumn {
     id: ObjectId,
     color: usize,
+    /// `column::is_merge_parent` (graph.c:63-72): the column was opened for a
+    /// non-first parent of a merge, so the commit it leads to is already joined
+    /// to that merge by an edge and is never indented as a visual root. The first
+    /// parent inherits the merge's own column and is not marked.
+    is_merge_parent: bool,
+}
+
+/// What `graph_peek_next_visible()` (graph.c:986-1004) learns from the lookahead
+/// buffer `get_revision()` fills with the next commits it will return: whether
+/// a commit follows, whether that commit already owns a column, and whether it
+/// is itself a visual-root candidate with yet another commit after it.
+#[derive(Default)]
+struct GraphLookaheadFlags {
+    is_next_visible: bool,
+    is_next_visual_root: bool,
+    next_has_column: bool,
+}
+
+/// One entry of git's graph lookahead buffer (`git_graph::lookahead`,
+/// graph.c:330-336): a commit `get_revision()` has already fetched and will
+/// return next, with the answer `graph_is_visual_root_candidate()` gives for it.
+#[derive(Clone, Copy)]
+pub(super) struct GraphPeek {
+    pub(super) id: ObjectId,
+    pub(super) visual_root_candidate: bool,
 }
 
 /// A row under construction. The visible width is tracked separately from the
@@ -14970,13 +15051,28 @@ struct Graph {
     /// The color the next column to be opened is assigned, cycling through `colors`.
     default_column_color: usize,
     want_color: bool,
+    /// `revs->no_graph_indent`: `--no-graph-indent` or `log.graphIndent=false`.
+    no_graph_indent: bool,
+    /// `git_graph::is_visual_root` (graph.c:339-343): the current commit has no
+    /// interesting parent and something unrelated follows it, so its row is
+    /// indented to keep the two from reading as parent and child.
+    is_visual_root: bool,
+    /// `git_graph::visual_root_depth` (graph.c:345-349): how many visual roots
+    /// in a row ended with this one; each is indented one lane further.
+    visual_root_depth: u32,
+    /// `git_graph::visual_root_cascade` (graph.c:351-356): the run of adjacent
+    /// visual roots started unindented, so every depth is one lane less.
+    visual_root_cascade: bool,
+    /// `git_graph::commit_in_columns` (graph.c:358-362): the current commit was
+    /// already following a column when it was reached.
+    commit_in_columns: bool,
 }
 
 /// `graph_init()`'s starting column capacity; grown by doubling.
 const GRAPH_COLUMN_CAPACITY: usize = 30;
 
 impl Graph {
-    fn new(colors: Vec<String>, want_color: bool, max_lanes: i64) -> Self {
+    fn new(colors: Vec<String>, want_color: bool, max_lanes: i64, no_graph_indent: bool) -> Self {
         // git starts one short of the wrap point, because the first column opened
         // always increments first — which lands the first branch line on index 0.
         let default_column_color = colors.len().saturating_sub(2);
@@ -15005,6 +15101,11 @@ impl Graph {
             colors,
             default_column_color,
             want_color,
+            no_graph_indent,
+            is_visual_root: false,
+            visual_root_depth: 0,
+            visual_root_cascade: false,
+            commit_in_columns: false,
         }
     }
 
@@ -15129,7 +15230,67 @@ impl Graph {
             .all(|(i, &t)| t < 0 || t == (i as i32) / 2)
     }
 
-    fn update(&mut self, id: ObjectId, parents: &[ObjectId], boundary: bool, commit_char: u8) {
+    /// `graph_peek_next_visible()` (graph.c:986-1004): read the lookahead buffer.
+    /// `lookahead` holds at most the two commits `get_revision()` prefetched.
+    fn peek_next_visible(&self, lookahead: &[GraphPeek]) -> GraphLookaheadFlags {
+        let mut flags = GraphLookaheadFlags::default();
+        let Some(next) = lookahead.first() else {
+            return flags;
+        };
+        flags.is_next_visible = true;
+        flags.next_has_column = self.find_new_column_by_commit(next.id).is_some();
+        if next.visual_root_candidate && lookahead.len() >= 2 {
+            flags.is_next_visual_root = true;
+        }
+        flags
+    }
+
+    /// `graph_is_visual_root()` (graph.c:943-981): a candidate is a real visual
+    /// root unless a merge already reaches it by an edge, unless nothing follows
+    /// it, and unless the next commit has a column of its own (so it is drawn
+    /// beside this one rather than under it) — the last only while no run of
+    /// visual roots is in progress.
+    fn is_visual_root_now(&self, candidate: bool, flags: &GraphLookaheadFlags) -> bool {
+        candidate
+            && !(self.commit_in_columns && self.columns[self.commit_index].is_merge_parent)
+            && flags.is_next_visible
+            && (!flags.next_has_column || self.visual_root_depth > 0)
+    }
+
+    /// `graph_needs_pre_root_line()` (graph.c:1006-1011): an indented visual root
+    /// that a column was already leading to needs a `\` row joining the two.
+    fn needs_pre_root_line(&self) -> bool {
+        self.commit_in_columns
+            && self.is_visual_root
+            && !self.columns.is_empty()
+            && !self.visual_root_cascade
+            && !self.no_graph_indent
+    }
+
+    /// The indentation `graph_output_commit_line()` (graph.c:1353-1366) puts in
+    /// front of a visual root's commit character: one lane per depth, less the
+    /// unindented first root of a cascade, wrapping after four lanes.
+    fn visual_root_padding(&self) -> usize {
+        if !self.is_visual_root || self.no_graph_indent {
+            return 0;
+        }
+        let depth = self.visual_root_depth - u32::from(self.visual_root_cascade);
+        (depth % 4) as usize * 2
+    }
+
+    /// `graph_update()` (graph.c:1011-1110). `visual_root_candidate` is
+    /// `graph_is_visual_root_candidate()` (graph.c:930-941) for this commit, and
+    /// `lookahead` the commits `get_revision()` prefetched behind it
+    /// (revision.c:4777-4793).
+    fn update(
+        &mut self,
+        id: ObjectId,
+        parents: &[ObjectId],
+        boundary: bool,
+        commit_char: u8,
+        visual_root_candidate: bool,
+        lookahead: &[GraphPeek],
+    ) {
         self.commit = id;
         self.boundary = boundary;
         self.commit_char = commit_char;
@@ -15137,6 +15298,30 @@ impl Graph {
         self.num_parents = parents.len();
         self.prev_commit_index = self.commit_index;
         self.update_columns();
+
+        let flags = self.peek_next_visible(lookahead);
+        self.is_visual_root = self.is_visual_root_now(visual_root_candidate, &flags);
+        if self.is_visual_root {
+            // A visual root followed by another one is left unindented and
+            // starts the cascade.
+            if self.visual_root_depth == 0 && flags.is_next_visual_root {
+                self.visual_root_cascade = true;
+            }
+            // The cascade wraps after four lanes. When it wraps back to the first
+            // lane and the next commit is not a visual root, stop cascading so
+            // this one is indented rather than lined up above it.
+            if !flags.is_next_visual_root
+                && self.visual_root_depth != 0
+                && self.visual_root_depth % 4 == 0
+            {
+                self.visual_root_cascade = false;
+            }
+            self.visual_root_depth += 1;
+        } else {
+            self.visual_root_depth = 0;
+            self.visual_root_cascade = false;
+        }
+
         self.expansion_row = 0;
         // `graph_update()` assigns the state directly rather than through
         // `graph_update_state()`: no line was drawn for the state being left, so
@@ -15145,6 +15330,8 @@ impl Graph {
             // The previous commit never reached padding, so part of the graph is
             // missing and git marks the gap.
             GraphState::Skip
+        } else if self.needs_pre_root_line() {
+            GraphState::PreRoot
         } else if self.needs_pre_commit_line() {
             GraphState::PreCommit
         } else {
@@ -15157,11 +15344,14 @@ impl Graph {
     /// `idx` is the column the current commit occupies when `id` is one of its
     /// parents, and `-1` for a column merely passing through.
     fn insert_into_new_columns(&mut self, id: ObjectId, idx: i32) {
+        // The layout before the first parent picks it: `-1` while inserting the
+        // first parent of a merge, set for every later one (graph.c:652-656).
+        let initial_merge_layout = self.merge_layout;
         let i = match self.find_new_column_by_commit(id) {
             Some(i) => i,
             None => {
                 let color = self.commit_color(id);
-                self.new_columns.push(GraphColumn { id, color });
+                self.new_columns.push(GraphColumn { id, color, is_merge_parent: false });
                 self.new_columns.len() - 1
             }
         };
@@ -15192,6 +15382,11 @@ impl Graph {
 
         if let Some(slot) = usize::try_from(mapping_idx).ok().and_then(|k| self.mapping.get_mut(k)) {
             *slot = i as i32;
+        }
+
+        // A non-first parent of a merge (graph.c:708-712).
+        if self.num_parents > 1 && initial_merge_layout >= 0 && idx > -1 {
+            self.new_columns[i].is_merge_parent = true;
         }
     }
 
@@ -15245,8 +15440,16 @@ impl Graph {
                 }
             } else {
                 self.insert_into_new_columns(col_commit, -1);
+                // A column passing through keeps its merge-parent mark until the
+                // commit it leads to is reached (graph.c:804-812).
+                if self.columns[i].is_merge_parent {
+                    if let Some(j) = self.find_new_column_by_commit(col_commit) {
+                        self.new_columns[j].is_merge_parent = true;
+                    }
+                }
             }
         }
+        self.commit_in_columns = is_commit_in_columns;
 
         // "If graph_max_lanes is set, cap the width": `| ` per lane plus the `~ `
         // truncation mark (graph.c:708-718).
@@ -15268,6 +15471,7 @@ impl Graph {
             GraphState::Padding => self.padding_line(&mut line),
             GraphState::Skip => self.skip_line(&mut line),
             GraphState::PreCommit => self.pre_commit_line(&mut line),
+            GraphState::PreRoot => self.pre_root_line(&mut line),
             GraphState::Commit => self.commit_line(&mut line),
             GraphState::PostMerge => self.post_merge_line(&mut line),
             GraphState::Collapsing => self.collapsing_line(&mut line),
@@ -15372,6 +15576,23 @@ impl Graph {
         }
     }
 
+    /// `graph_output_pre_root_line()` (graph.c:1738-1760): the row above an
+    /// indented visual root, bending the column that leads to it one place right
+    /// with ` \` while every other column carries straight down.
+    fn pre_root_line(&mut self, line: &mut GraphLine) {
+        for i in 0..self.columns.len() {
+            let col = self.columns[i];
+            if col.id == self.commit {
+                line.addch(b' ');
+                self.write_column(line, &col, b'\\');
+            } else {
+                self.write_column(line, &col, b'|');
+            }
+            line.addch(b' ');
+        }
+        self.update_state(GraphState::Commit);
+    }
+
     /// `graph_draw_octopus_merge()`: the horizontal `-`…`.` run that reaches the
     /// parents beyond the first two. Each dash takes the color of the lane the edge
     /// under it will collapse to, which the mapping — not `new_columns` order —
@@ -15415,6 +15636,13 @@ impl Graph {
 
             if col_commit == self.commit {
                 seen_this = true;
+                // An indented visual root: the padding widens every later row of
+                // this commit too (graph.c:1353-1366).
+                let padding = self.visual_root_padding();
+                for _ in 0..padding {
+                    line.addch(b' ');
+                }
+                self.width += padding;
                 // `graph_output_commit_char()`: a boundary commit is drawn as a
                 // hollow `o`, and every other commit as the character
                 // `get_revision_mark()` answers for it.

@@ -1242,6 +1242,23 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             }
             "--pickaxe-all" => pickaxe_all = true,
             "--pickaxe-regex" => pickaxe_regex = true,
+            // `parse_options()`' own help (diff-no-index.c:373-374): the block
+            // [`usage`] prints, on stdout at exit 0 (`PARSE_OPT_HELP`,
+            // parse-options.c:1207-1208). `--help-all` renders `USAGE_FULL`,
+            // which adds the `PARSE_OPT_HIDDEN` `--no-index` entry
+            // (diff-no-index.c:366-367) ahead of the diff options.
+            "-h" => {
+                return Ok(super::show_usage(&format!(
+                    "{USAGE_LINE}{}",
+                    super::diff_pairs::DIFF_OPTIONS
+                )));
+            }
+            "--help-all" => {
+                return Ok(super::show_usage(&format!(
+                    "{USAGE_LINE}    --no-index\n\n{}",
+                    super::diff_pairs::DIFF_OPTIONS
+                )));
+            }
             // `parse_options()` rejects these outright: they belong to
             // `cmd_diff()`, not to the no-index parser, and never reach it.
             s if NOT_IN_NO_INDEX.contains(&s) => {

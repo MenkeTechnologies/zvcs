@@ -288,7 +288,7 @@ fn log_date_invalid_is_fatal_before_deprecation_and_override() {
     assert_eq!(z2.status.code(), Some(128));
     let e2 = String::from_utf8_lossy(&z2.stderr);
     assert!(e2.contains("unknown date format bogus"), "date fatal, not deprecation:\n{e2}");
-    assert!(!e2.contains("nominated for removal"), "deprecation notice must not appear:\n{e2}");
+    assert!(!e2.contains("will be removed soon"), "deprecation notice must not appear:\n{e2}");
 
     // Config validation also wins over a valid command-line --date override.
     let z3 = zvcs(&repo, &home, &["--date=unix"]);

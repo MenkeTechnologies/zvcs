@@ -120,8 +120,7 @@ pub fn pack_redundant(args: &[String]) -> Result<ExitCode> {
     }
 
     if !i_still_use_this {
-        you_still_use_that("git pack-redundant");
-        return Ok(ExitCode::from(128));
+        return Ok(super::you_still_use_that("git pack-redundant", None));
     }
 
     let repo = crate::setup::discover()?;
@@ -278,42 +277,6 @@ pub fn pack_redundant(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
-}
-
-/// `you_still_use_that("git pack-redundant", NULL)` — the deprecation block plus
-/// `die()`. The mailing-list query is percent-encoded, so the space becomes `%20`.
-fn you_still_use_that(command_name: &str) {
-    let encoded = percent_encode(command_name);
-    let mut err = std::io::stderr().lock();
-    let _ = writeln!(err, "'{command_name}' is nominated for removal.");
-    let _ = write!(
-        err,
-        "If you still use this command, here's what you can do:\n\
-         \n\
-         - read https://git-scm.com/docs/BreakingChanges.html\n\
-         - check if anyone has discussed this on the mailing\n  \
-           list and if they came up with something that can\n  \
-           help you: https://lore.kernel.org/git/?q={encoded}\n\
-         - send an email to <git@vger.kernel.org> to let us\n  \
-           know that you still use this command and were unable\n  \
-           to determine a suitable replacement\n\
-         \n"
-    );
-    let _ = writeln!(err, "fatal: refusing to run without --i-still-use-this");
-}
-
-/// `strbuf_add_percentencode(..., STRBUF_ENCODE_SLASH)`: everything outside the
-/// URL-unreserved set is escaped, and `/` is escaped as well.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
 }
 
 /// `get_object_directory()` as git renders it for output: relative to the work
@@ -661,8 +624,14 @@ mod tests {
     /// is why the deprecation text says `?q=git%20pack-redundant`.
     #[test]
     fn command_name_is_percent_encoded_for_the_mailing_list_url() {
-        assert_eq!(percent_encode("git pack-redundant"), "git%20pack-redundant");
-        assert_eq!(percent_encode("git merge-base"), "git%20merge-base");
+        let encode = |s: &str| {
+            super::super::credential::percent_encode(
+                s.as_bytes(),
+                super::super::credential::EncodeFlags::SLASH,
+            )
+        };
+        assert_eq!(encode("git pack-redundant"), "git%20pack-redundant");
+        assert_eq!(encode("git merge-base"), "git%20merge-base");
     }
 
     #[test]

@@ -605,17 +605,17 @@ fn build_description(cred: &Cred, render: impl Fn(&[u8], Field) -> String) -> St
 }
 
 /// The `flags` of `strbuf_add_percentencode` (strbuf.h).
-struct EncodeFlags;
+pub(crate) struct EncodeFlags;
 impl EncodeFlags {
     const NONE: u8 = 0;
-    const SLASH: u8 = 1;
+    pub(crate) const SLASH: u8 = 1;
     const HOST_AND_PORT: u8 = 2;
 }
 
 /// Port of `strbuf_add_percentencode()` (strbuf.c): `%XX` for every control
 /// byte, every non-ASCII byte, and — depending on `flags` — the url punctuation
 /// that would otherwise be read as structure.
-fn percent_encode(src: &[u8], flags: u8) -> String {
+pub(crate) fn percent_encode(src: &[u8], flags: u8) -> String {
     /// `URL_UNSAFE_CHARS` (strbuf.c).
     const URL_UNSAFE_CHARS: &[u8] = b" <>\"%{}|\\^`:?#[]@!$&'()*+,;=";
     let mut out = String::with_capacity(src.len());

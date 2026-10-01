@@ -72,6 +72,32 @@ pub(crate) fn show_usage(usage: &str) -> std::process::ExitCode {
     std::process::ExitCode::from(129)
 }
 
+/// `you_still_use_that()` (usage.c:381-406): the deprecation notice for a
+/// command slated for removal, then `die()`. Returns the `die()` status, 128.
+///
+/// `command_name` goes into the mailing-list query through
+/// `strbuf_add_percentencode(…, STRBUF_ENCODE_SLASH)`; `hint`, when present,
+/// is written verbatim between the first line and the advice.
+pub(crate) fn you_still_use_that(command_name: &str, hint: Option<&str>) -> std::process::ExitCode {
+    let encoded = credential::percent_encode(command_name.as_bytes(), credential::EncodeFlags::SLASH);
+    eprint!(
+        "'{command_name}' will be removed soon.\n{}\
+         If you need a replacement:\n\
+         \n\
+         - Read https://git-scm.com/docs/BreakingChanges.html.\n\
+         \n\
+         - Check what others on the mailing list suggest as a replacement:\n  \
+         https://lore.kernel.org/git/?q={encoded}\n\
+         \n\
+         - Send an email to <git@vger.kernel.org> asking for help, only if\n  \
+         suggestions by others do not work for you.\n\
+         \n\
+         fatal: refusing to run without --i-still-use-this\n",
+        hint.unwrap_or("")
+    );
+    std::process::ExitCode::from(128)
+}
+
 /// `show_usage_with_options_if_asked()` (parse-options.c:1490-1505): the same
 /// block on stdout at 129, but **only when `-h` or `--help-all` is the sole
 /// argument**.

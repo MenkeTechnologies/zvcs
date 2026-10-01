@@ -71,7 +71,7 @@
 //! * The whole `setup_revisions` classification above, with its exit-128/129 paths.
 //! * `git_log_config`'s validation of `log.date`, which is fatal ahead of the
 //!   deprecation notice and of any argument-parse error.
-//! * The 702-byte deprecation notice (stderr, empty stdout, exit 128) when
+//! * The `you_still_use_that()` deprecation notice (stderr, empty stdout, exit 128) when
 //!   `--i-still-use-this` is absent — the whole behaviour of the stock command on
 //!   modern git, and the path most callers hit.
 //! * Dropping `--i-still-use-this` itself, which `cmd_log_init`'s `parse_options` pass
@@ -90,27 +90,14 @@ use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
 
-/// Stock git's deprecation notice, byte-for-byte (702 bytes). Written to stderr, with
-/// nothing on stdout, when `--i-still-use-this` is absent; exit code 128.
-const DEPRECATION: &str = concat!(
-    "'git whatchanged' is nominated for removal.\n",
+/// The `hint` `cmd_whatchanged` hands `you_still_use_that()` (builtin/log.c:551-557).
+const DEPRECATION_HINT: &str = concat!(
     "\n",
     "hint: You can replace 'git whatchanged <opts>' with:\n",
     "hint:\tgit log <opts> --raw --no-merges\n",
     "hint: Or make an alias:\n",
     "hint:\tgit config set --global alias.whatchanged 'log --raw --no-merges'\n",
     "\n",
-    "If you still use this command, here's what you can do:\n",
-    "\n",
-    "- read https://git-scm.com/docs/BreakingChanges.html\n",
-    "- check if anyone has discussed this on the mailing\n",
-    "  list and if they came up with something that can\n",
-    "  help you: https://lore.kernel.org/git/?q=git%20whatchanged\n",
-    "- send an email to <git@vger.kernel.org> to let us\n",
-    "  know that you still use this command and were unable\n",
-    "  to determine a suitable replacement\n",
-    "\n",
-    "fatal: refusing to run without --i-still-use-this\n",
 );
 
 /// A message git writes before exiting non-zero. `text` is complete, already
@@ -686,8 +673,7 @@ pub fn whatchanged(args: &[String]) -> Result<ExitCode> {
     }
 
     if !opted_in {
-        eprint!("{DEPRECATION}");
-        return Ok(ExitCode::from(128));
+        return Ok(super::you_still_use_that("git whatchanged", Some(DEPRECATION_HINT)));
     }
 
     // `cmd_whatchanged` *is* `cmd_log` with the raw format as the default and

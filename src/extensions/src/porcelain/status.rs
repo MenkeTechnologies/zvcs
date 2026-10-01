@@ -3693,6 +3693,14 @@ struct Comparison {
     /// answer, or it is the upstream and the branch has no separate push
     /// destination. Gates `ENABLE_ADVICE_PUSH`.
     is_push: bool,
+    /// `ENABLE_ADVICE_PULL` (`remote.c:2522-2541`): set for the upstream, and
+    /// since 2.56 also for a push destination that is a distinct
+    /// `refs/remotes/<pushremote>/<branch>` ref.
+    pull_advice: bool,
+    /// `push_remote_name` / `push_branch_name` (`remote.c:2526-2537`): the
+    /// `<remote> <branch>` pair the 2.56 pull hint spells out when the compared
+    /// ref is the push destination and not the upstream.
+    pull_target: Option<(String, String)>,
 }
 
 /// The value of `status.compareBranches`, split as `format_tracking_info()`
@@ -3774,6 +3782,7 @@ fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
     let upstream = super::branch::upstream_ref(repo, full.as_bstr());
     let push = super::branch::push_ref(repo, full.as_bstr());
     let local = repo.head_id().ok();
+    let local_short = full.strip_prefix(b"refs/heads/".as_slice()).map(|s| s.to_str_lossy().into_owned());
 
     let mut seen: std::collections::HashSet<gix::refs::FullName> =
         std::collections::HashSet::new();
@@ -3803,6 +3812,28 @@ fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
         // whole visible effect of `remote.pushDefault` on a default `git status`.
         let is_push = push.as_ref() == Some(&full_ref)
             || (is_upstream && (push.is_none() || push == upstream));
+        // 2.56 `remote.c:2522-2541`: a push destination distinct from the
+        // upstream earns the pull hint too, naming `<pushremote> <branch>` when
+        // the ref spells `refs/remotes/<pushremote>/<branch>`; any other shape
+        // keeps the hint off.
+        let mut pull_advice = is_upstream;
+        let mut pull_target = None;
+        if is_push {
+            if upstream.as_ref() != Some(&full_ref) {
+                let remote = super::branch::pushremote_for_branch(repo, local_short.as_deref());
+                let full_str = full_ref.as_bstr().to_str_lossy();
+                if let Some(branch) = full_str
+                    .strip_prefix("refs/remotes/")
+                    .and_then(|rest| rest.strip_prefix(remote.as_str()))
+                    .and_then(|rest| rest.strip_prefix('/'))
+                {
+                    pull_target = Some((remote.clone(), branch.to_string()));
+                    pull_advice = true;
+                }
+            } else {
+                pull_advice = true;
+            }
+        }
         let counts = super::branch::stat_tracking_info(repo, local, &full_ref);
         out.push(Comparison {
             name: full_ref.shorten().to_str_lossy().into_owned(),
@@ -3811,6 +3842,8 @@ fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
             behind: counts.map_or(0, |c| c.1),
             is_upstream,
             is_push,
+            pull_advice,
+            pull_target,
         });
     }
     Ok(out)
@@ -3896,6 +3929,12 @@ fn tracking_lines(
         };
         let name = &c.name;
         let (ahead, behind) = (c.ahead, c.behind);
+        // `format_branch_comparison()`'s 2.56 `push_remote_name && push_branch_name`
+        // arms (`remote.c:2414-2422`, `2434-2441`).
+        let pull = match &c.pull_target {
+            Some((remote, branch)) => format!("git pull {remote} {branch}"),
+            None => "git pull".to_string(),
+        };
         if ahead == 0 && behind == 0 {
             sb.push_str(&format!("Your branch is up to date with '{name}'.\n"));
         } else if quick {
@@ -3914,14 +3953,14 @@ fn tracking_lines(
             let noun = if behind == 1 { "commit" } else { "commits" };
             sb.push_str(&format!(
                 "Your branch is behind '{name}' by {behind} {noun}, and can be fast-forwarded.\n{}",
-                advice(c.is_upstream, "use \"git pull\" to update your local branch")
+                advice(c.pull_advice, &format!("use \"{pull}\" to update your local branch"))
             ));
         } else {
             sb.push_str(&format!(
                 "Your branch and '{name}' have diverged,\nand have {ahead} and {behind} different commits each, respectively.\n{}",
                 advice(
                     divergence && c.is_upstream,
-                    "use \"git pull\" if you want to integrate the remote branch with yours"
+                    &format!("use \"{pull}\" if you want to integrate the remote branch with yours")
                 )
             ));
         }

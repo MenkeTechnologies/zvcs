@@ -1417,6 +1417,31 @@ pub(crate) fn push_ref(repo: &gix::Repository, full: &BStr) -> Option<FullName> 
         .ok()
 }
 
+/// `pushremote_for_branch()` (`remote.c:698-722`): `branch.<name>.pushRemote`,
+/// then `remote.pushDefault`, then `remotes_remote_for_branch()` —
+/// `branch.<name>.remote`, the sole configured remote, or `origin`.
+pub(crate) fn pushremote_for_branch(repo: &gix::Repository, branch: Option<&str>) -> String {
+    let snap = repo.config_snapshot();
+    let string = |key: &str| snap.string(key).map(|v| v.to_str_lossy().into_owned());
+    if let Some(r) = branch.and_then(|b| string(&format!("branch.{b}.pushRemote"))) {
+        return r;
+    }
+    if let Some(r) = string("remote.pushDefault") {
+        return r;
+    }
+    if let Some(r) = branch.and_then(|b| string(&format!("branch.{b}.remote"))) {
+        return r;
+    }
+    let names = repo.remote_names();
+    match names.len() {
+        1 => names
+            .iter()
+            .next()
+            .map_or_else(|| "origin".to_string(), |n| n.to_str_lossy().into_owned()),
+        _ => "origin".to_string(),
+    }
+}
+
 /// git's `stat_tracking_info` with `AHEAD_BEHIND_FULL`: the commit counts each
 /// side has that the other does not, or `None` for its `-1` return — the
 /// upstream ref is gone, or either end fails to name a commit.

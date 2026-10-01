@@ -14,33 +14,43 @@
 //! canonicalized (`644` → `100644`), and trees are sorted with git's
 //! `base_name_compare` — so the object ids match stock git's exactly.
 //!
-//! Command line: `--force`, `--quiet`, `--stats`, `--done`, `--date-format=`,
-//! `--export-marks=`, `--import-marks=`, `--import-marks-if-exists=`,
-//! `--relative-marks`, `--no-relative-marks`, `--cat-blob-fd=`,
-//! `--signed-commits=`, `--signed-tags=`, `--allow-unsafe-features`, and the
-//! pack-tuning knobs `--depth=`, `--active-branches=`, `--big-file-threshold=`
-//! and `--max-pack-size=`, which are validated the way git validates them and
-//! then ignored because they only steer packing. Refs are updated at EOF (and at
+//! Command line: git 2.56's `parse_options()` over `fast_import_options[]` —
+//! `--force`, `--quiet`, `--stats`, `--done`, `--date-format`,
+//! `--export-marks`, `--import-marks`, `--import-marks-if-exists`,
+//! `--[no-]relative-marks`, `--rewrite-submodules-from/-to`,
+//! `--signed-commits`, `--signed-tags`, the hidden `--allow-unsafe-features`,
+//! `--export-pack-edges` and `--cat-blob-fd`, and the pack-tuning knobs
+//! `--depth`, `--active-branches`, `--big-file-threshold` and
+//! `--max-pack-size`, which are validated the way git validates them and then
+//! ignored because they only steer packing. Names abbreviate, a value may be
+//! the next argument, and `--` is accepted. As in git, the command line is
+//! read only at the first stream command that is not `feature`/`option` (or
+//! at EOF), so stream features are applied first and the command line
+//! overrides them; only the exact `--allow-unsafe-features` spelling, found
+//! by git's early scan, reaches the stream. Refs are updated at EOF (and at
 //! `checkpoint`) with the reflog message `fast-import`; without `--force` a
 //! branch that would lose commits is left alone with git's
 //! `warning: not updating …` and the run exits 1.
 //!
-//! git has three distinct failure contracts here and this module reproduces all
-//! three. An argument that is not an option, or an option value outside the set
-//! git names, ends the run with git's one-line `usage:` text and exit 129,
-//! leaving no ref, object or marks file changed — but leaving behind the empty
-//! `objects/pack/tmp_pack_XXXXXX` git opened before it ever looked at argv,
-//! because `usage()` exits without running any of the cleanup `die_nicely`
-//! runs (see [`TempPack`]). Anything else fatal prints `fatal: <reason>` and
+//! git has three distinct failure contracts here and this module reproduces
+//! all three. A command line `parse_options()` refuses — an unknown or
+//! ambiguous option with the usage block, a missing or unwanted value with one
+//! `error:` line, a positional with the block alone, an option value
+//! `usagef()` rejects — exits 129, leaving no ref, object or marks file changed
+//! but leaving behind the empty `objects/pack/tmp_pack_XXXXXX` git opened
+//! before it ever looked at argv, because those exits run none of the cleanup
+//! `die_nicely` runs (see [`TempPack`]); help asked for mid-line takes the same
+//! route out at 0, on stdout. Anything else fatal prints `fatal: <reason>` and
 //! exits 128 — and, as git's `die_nicely` does, unlinks that temporary and then
 //! still writes the `--export-marks` file on the way out, unless an
-//! `--import-marks` file was named and never successfully read, in which case
+//! import-marks file was named and none was successfully read, in which case
 //! `dump_marks` declines to overwrite an export from a half-loaded table.
-//! Options take effect strictly left to right, so a failure leaves every option
-//! to its left already applied — which is what decides whether the marks file
-//! exists after a fatal. A lone `-h` or `--help-all` is not a failure at all:
-//! `show_usage_if_asked` prints the same summary on *stdout*, exits 0, and
-//! runs before the repository is even opened.
+//! Options take effect strictly left to right, a positional not stopping the
+//! sweep, so a failure leaves every option to its left already applied — which
+//! is what decides whether the marks file exists after a fatal. A lone `-h` or
+//! `--help-all` is not a failure at all: `show_usage_with_options_if_asked()`
+//! prints the block on *stdout*, exits 0, and runs before the repository is
+//! even opened.
 //!
 //! Signatures follow git's `--signed-commits=`/`--signed-tags=` modes:
 //! `verbatim` and `warn-verbatim` keep them (a commit's `gpgsig`/`gpgsig-sha256`
@@ -109,33 +119,166 @@ use gix::objs::{Kind, Write as _};
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-/// git's one-line `fast-import` usage summary, byte-for-byte including its LF.
-const USAGE: &str = concat!(
-    "usage: git fast-import [--date-format=<f>] [--max-pack-size=<n>]",
-    " [--big-file-threshold=<n>] [--depth=<n>] [--active-branches=<n>]",
-    " [--export-marks=<marks.file>]\n",
+/// `usage_with_options(fast_import_usage, fast_import_options)` rendered in
+/// `USAGE_NORMAL`: the `PARSE_OPT_HIDDEN` "Advanced" group is left out.
+/// Measured byte for byte from stock git 2.56.0's `git fast-import -h`.
+const USAGE: &str = "\
+usage: git fast-import [<options>]
+
+Common
+    --date-format <fmt>   format of the commit/tag dates
+    --stats               display some basic statistics (objects, packfiles and memory)
+    --quiet               disable the output shown by --stats
+    --force               force updating modified existing branches
+    --done                require a terminating 'done' command
+    --max-pack-size <n>   maximum size of each output pack file
+    --big-file-threshold <n>
+                          maximum size of a blob that will be deltified
+    --depth <n>           maximum delta depth
+    --active-branches <n> maximum number of branches to maintain active
+
+Marks
+    --import-marks <file> import marks from <file>
+    --import-marks-if-exists <file>
+                          import marks from <file> if it exists
+    --export-marks <file> dump marks to <file>
+    --[no-]relative-marks are --(import|export)-marks= paths relative to '.git/info/fast-import'?
+
+Submodule rewrite
+    --rewrite-submodules-from <name:filename>
+                          rewrite object IDs for submodule <name> from <filename>
+    --rewrite-submodules-to <name:filename>
+                          rewrite object IDs for submodule <name> to <filename>
+
+Signing
+    --signed-commits <mode>
+                          how to handle signed commits
+    --signed-tags <mode>  how to handle signed tags
+
+";
+
+/// The same table in `USAGE_FULL` (`--help-all`), hidden entries included.
+const USAGE_ALL: &str = concat!(
+    "\
+usage: git fast-import [<options>]
+
+Common
+    --date-format <fmt>   format of the commit/tag dates
+    --stats               display some basic statistics (objects, packfiles and memory)
+    --quiet               disable the output shown by --stats
+    --force               force updating modified existing branches
+    --done                require a terminating 'done' command
+    --max-pack-size <n>   maximum size of each output pack file
+    --big-file-threshold <n>
+                          maximum size of a blob that will be deltified
+    --depth <n>           maximum delta depth
+    --active-branches <n> maximum number of branches to maintain active
+
+Marks
+    --import-marks <file> import marks from <file>
+    --import-marks-if-exists <file>
+                          import marks from <file> if it exists
+    --export-marks <file> dump marks to <file>
+    --[no-]relative-marks are --(import|export)-marks= paths relative to '.git/info/fast-import'?
+
+Submodule rewrite
+    --rewrite-submodules-from <name:filename>
+                          rewrite object IDs for submodule <name> from <filename>
+    --rewrite-submodules-to <name:filename>
+                          rewrite object IDs for submodule <name> to <filename>
+
+Signing
+    --signed-commits <mode>
+                          how to handle signed commits
+    --signed-tags <mode>  how to handle signed tags
+
+",
+    "\
+Advanced
+    --allow-unsafe-features
+                          allow unsafe mark commands from the stream
+    --export-pack-edges <file>
+                          dump edge commits to <file>
+    --cat-blob-fd <fd>    write some responses to <fd> instead of stdout
+
+",
 );
 
-/// A command line git rejects through `usage()` — stderr, exit 129, and none of
-/// the cleanup `die_nicely` runs — rather than through `die()`.
+/// `fast_import_options[]` (builtin/fast-import.c:4130-4196) as far as
+/// `parse_long_opt()` reads it, in table order — the order decides which two
+/// names an `ambiguous option:` sentence quotes. Only `relative-marks` lacks
+/// `PARSE_OPT_NONEG`; the `OPT_BOOL`s and `--quiet` are `PARSE_OPT_NOARG`.
+const OPTIONS: &[super::LongOpt] = {
+    use super::Arg::{None as Flag, Required as Value};
+    const fn opt(name: &'static str, neg: bool, arg: super::Arg) -> super::LongOpt {
+        super::LongOpt { name, neg, arg }
+    }
+    &[
+        opt("date-format", false, Value),
+        opt("stats", false, Flag),
+        opt("quiet", false, Flag),
+        opt("force", false, Flag),
+        opt("done", false, Flag),
+        opt("max-pack-size", false, Value),
+        opt("big-file-threshold", false, Value),
+        opt("depth", false, Value),
+        opt("active-branches", false, Value),
+        opt("import-marks", false, Value),
+        opt("import-marks-if-exists", false, Value),
+        opt("export-marks", false, Value),
+        opt("relative-marks", true, Flag),
+        opt("rewrite-submodules-from", false, Value),
+        opt("rewrite-submodules-to", false, Value),
+        opt("signed-commits", false, Value),
+        opt("signed-tags", false, Value),
+        opt("allow-unsafe-features", false, Flag),
+        opt("export-pack-edges", false, Value),
+        opt("cat-blob-fd", false, Value),
+    ]
+};
+
+/// An exit git takes without `die()`, so without the cleanup `die_nicely`
+/// runs: `usage_with_options()`, `usagef()`, a `parse_options()` refusal, or
+/// the help `parse_options()` prints when asked for it mid-line.
 ///
-/// Carries the complete stderr text, trailing LF included, because git uses two
-/// shapes: the bare option summary for an argument it cannot place at all, and
-/// `usage: <complaint>` for an option value outside the set it names.
+/// Carries the complete text, trailing LF included, the stream it goes to and
+/// the status, because `parse_options()` has four shapes: the usage block on
+/// stdout at 0 (help), an `error:` line alone at 129 (`PARSE_OPT_ERROR`), an
+/// `error:` line and the block on stderr at 129 (unknown or ambiguous), and
+/// the block alone on stderr at 129 (a positional `usage_with_options()`
+/// refuses).
 #[derive(Debug)]
-struct UsageError(String);
+struct UsageError {
+    text: String,
+    to_stdout: bool,
+    code: u8,
+}
+
+impl UsageError {
+    /// Text for stderr at 129, the shape of every refusal.
+    fn refuse(text: String) -> anyhow::Error {
+        UsageError { text, to_stdout: false, code: 129 }.into()
+    }
+}
 
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.trim_end())
+        f.write_str(self.text.trim_end())
     }
 }
 
 impl std::error::Error for UsageError {}
 
-/// The bare option summary, for an argument that is not an option at all.
-fn usage() -> anyhow::Error {
-    UsageError(USAGE.to_string()).into()
+/// A `parse_options()` refusal whose text a shared helper has already written
+/// to stderr: only the status is left to carry out.
+fn printed(code: u8) -> anyhow::Error {
+    UsageError { text: String::new(), to_stdout: false, code }.into()
+}
+
+/// `PARSE_OPT_HELP`: the block on stdout, and since 2.56 `exit(0)`
+/// (parse-options.c:1207-1208).
+fn help(usage: &str) -> anyhow::Error {
+    UsageError { text: usage.to_string(), to_stdout: true, code: 0 }.into()
 }
 
 /// The `objects/pack/tmp_pack_XXXXXX` git's `start_packfile()` opens, tracked
@@ -570,7 +713,7 @@ fn signed_mode(flag: &str, value: &str) -> Result<SignedMode> {
         }
         _ if starts(value, "sign-if-invalid=") => SignedMode::NeedsVerification,
         _ => {
-            return Err(UsageError(format!("usage: unknown {flag} mode '{value}'\n")).into());
+            return Err(UsageError::refuse(format!("usage: unknown {flag} mode '{value}'\n")));
         }
     })
 }
@@ -580,16 +723,32 @@ struct Opts {
     force: bool,
     date_format: DateFormat,
     require_done: bool,
-    export_marks: Option<String>,
+    /// `export_marks_file`, already resolved by `make_fast_import_path()` when
+    /// the option or feature named it, so `--relative-marks` applies to the
+    /// names that follow it and not to the ones before.
+    export_marks: Option<std::path::PathBuf>,
     relative_marks: bool,
+    /// `state->allow_unsafe_features`. Set by the early argv scan before the
+    /// stream is read, which is the only setting a `feature` line ever sees.
     allow_unsafe: bool,
     cat_blob_fd: Option<i32>,
     signed_commits: SignedMode,
     signed_tags: SignedMode,
-    /// True once an `--import-marks` file has been named and not yet read. git's
-    /// `dump_marks` refuses to write while this is outstanding, so a fatal
-    /// before the read leaves the export file untouched.
-    import_marks_pending: bool,
+    /// `import_marks_file`, with `import_marks_file_from_stream` and
+    /// `import_marks_file_ignore_missing`: the one marks file to read, named
+    /// but not read until `parse_argv()` finishes.
+    import_marks: Option<ImportMarks>,
+    /// `import_marks_file_done`. `dump_marks()` refuses to write while a named
+    /// import file is unread, so a fatal before the read leaves the export file
+    /// untouched.
+    import_marks_done: bool,
+}
+
+/// The pending `--import-marks`/`feature import-marks` file.
+struct ImportMarks {
+    path: std::path::PathBuf,
+    from_stream: bool,
+    ignore_missing: bool,
 }
 
 impl Opts {
@@ -605,7 +764,8 @@ impl Opts {
             cat_blob_fd: None,
             signed_commits: SignedMode::Verbatim,
             signed_tags: SignedMode::Verbatim,
-            import_marks_pending: false,
+            import_marks: None,
+            import_marks_done: false,
         }
     }
 }
@@ -644,30 +804,34 @@ struct Dir {
 
 /// `git fast-import` — import a stream of objects and ref updates from stdin.
 ///
-/// The three exit contracts are git's. A command line git cannot parse prints
-/// `usage: …` and exits 129; any other failure prints `fatal: <reason>` and
-/// exits 128; a run that imported cleanly but declined a non-fast-forward ref
-/// update exits 1.
+/// The exit contracts are git's. A command line `parse_options()` refuses
+/// exits 129 (help it was asked for mid-line exits 0 on stdout); any other
+/// failure prints `fatal: <reason>` and exits 128; a run that imported cleanly
+/// but declined a non-fast-forward ref update exits 1.
 pub fn fast_import(args: &[String]) -> Result<ExitCode> {
     // Dispatch passes the subcommand itself at index 0.
     let args = match args.first() {
         Some(a) if a == "fast-import" => &args[1..],
         _ => args,
     };
-    // `show_usage_if_asked(argc, argv, fast_import_usage)` at
-    // `builtin/fast-import.c:3941`: the help flag alone, and only alone, prints
-    // the summary on *stdout* and exits 0. It runs ahead of the repository
-    // setup git.c would otherwise do, so it answers outside a repository too,
-    // and ahead of `start_packfile()`, so it leaves no temporary behind.
-    if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
-        return Ok(super::show_usage(USAGE));
+    // `show_usage_with_options_if_asked(argc, argv, fast_import_usage,
+    // fast_import_options)` (builtin/fast-import.c:4199): the help flag alone,
+    // and only alone, prints the block on *stdout* and exits 0. It runs ahead
+    // of the repository setup git.c would otherwise do, so it answers outside a
+    // repository too, and ahead of `start_packfile()`, so it leaves no
+    // temporary behind.
+    if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
+        return Ok(code);
     }
     match run(args) {
         Ok(code) => Ok(code),
         Err(e) => match e.downcast_ref::<UsageError>() {
             Some(u) => {
-                eprint!("{}", u.0);
-                Ok(ExitCode::from(129))
+                match u.to_stdout {
+                    true => crate::cstdio::write_bytes(u.text.as_bytes()),
+                    false => eprint!("{}", u.text),
+                }
+                Ok(ExitCode::from(u.code))
             }
             None => {
                 eprintln!("fatal: {e}");
@@ -708,13 +872,27 @@ fn run(args: &[String]) -> Result<ExitCode> {
         failed: false,
         seen_data_command: false,
         submodule_rewrites: Vec::new(),
+        args: args.to_vec(),
     };
+
+    // The early scan (builtin/fast-import.c:4220-4240): `feature` lines are
+    // read before `parse_argv()` ever runs, so the one option that steers how
+    // they are read is looked for ahead of it — only in its exact spelling, and
+    // only up to the first argument that is not an option, as git looks.
+    for arg in args {
+        if !arg.starts_with('-') || arg == "--" {
+            break;
+        }
+        if arg == "--allow-unsafe-features" {
+            imp.opts.allow_unsafe = true;
+        }
+    }
 
     // `cmd_fast_import` opens the packfile before it reads the stream and before
     // argv is parsed, so it exists no matter how the run ends. See [`TempPack`].
     let pack = TempPack::start(&imp.repo)?;
 
-    match imp.import(args) {
+    match imp.import() {
         Ok(code) => {
             pack.end();
             Ok(code)
@@ -811,10 +989,21 @@ fn strtoumax10(spec: &[u8]) -> usize {
     v
 }
 
-/// The two legacy-unit warnings in `parse_one_option()`'s `max-pack-size=`
-/// arm (builtin/fast-import.c:3755-3766):
+/// `option_depth()` (builtin/fast-import.c:3746-3751): parsed, then held to
+/// the bitfield's ceiling.
+fn option_depth(value: &str) -> Result<()> {
+    if ulong_arg("--depth", value)? > MAX_DEPTH {
+        crate::git_fatal!("--depth cannot exceed {MAX_DEPTH}");
+    }
+    Ok(())
+}
+
+/// `option_max_pack_size()` (builtin/fast-import.c:3815-3829), shared by the
+/// command line and `option git max-pack-size=`:
 ///
 /// ```c
+/// if (!git_parse_ulong(arg, &v))
+///         die(_("--max-pack-size: argument must be a non-negative integer"));
 /// if (v < 8192) {
 ///         warning(_("max-pack-size is now in bytes, assuming --max-pack-size=%lum"), v);
 ///         v *= 1024 * 1024;
@@ -825,28 +1014,27 @@ fn strtoumax10(spec: &[u8]) -> usize {
 /// ```
 ///
 /// The clamped value steers only which pack an object lands in, which this
-/// port does not reproduce, but the warnings are stderr a caller sees.
-fn warn_max_pack_size(v: u64) {
+/// port does not reproduce, but the refusal and the warnings are stderr a
+/// caller sees.
+fn option_max_pack_size(value: &str) -> Result<()> {
+    let Some(v) = super::list_objects_filter::git_parse_ulong(value.as_bytes()) else {
+        crate::git_fatal!("--max-pack-size: argument must be a non-negative integer");
+    };
     if v < 8192 {
         eprintln!("warning: max-pack-size is now in bytes, assuming --max-pack-size={v}m");
     } else if v < 1024 * 1024 {
         eprintln!("warning: minimum max-pack-size is 1 MiB");
     }
+    Ok(())
 }
 
-/// git's `parse_ulong_with_suffix`, used for the two byte-size options. A value
-/// it cannot read is not a distinct error: git falls through and reports the
-/// whole argument as an unknown option.
-fn byte_size(value: &str) -> Option<u64> {
-    // Every suffix git accepts is one ASCII byte, so trimming one byte off the
-    // end cannot split a character.
-    let (digits, scale) = match value.chars().last() {
-        Some('k' | 'K') => (&value[..value.len() - 1], 1024_u64),
-        Some('m' | 'M') => (&value[..value.len() - 1], 1024 * 1024),
-        Some('g' | 'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
-        _ => (value, 1),
-    };
-    digits.parse::<u64>().ok()?.checked_mul(scale)
+/// `option_big_file_threshold()` (builtin/fast-import.c:3831-3838): validated,
+/// then left to steer the deltification this port does not reproduce.
+fn option_big_file_threshold(value: &str) -> Result<()> {
+    if super::list_objects_filter::git_parse_ulong(value.as_bytes()).is_none() {
+        crate::git_fatal!("--big-file-threshold: argument must be a non-negative integer");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,19 +1204,31 @@ struct Importer {
     /// presence is used: a stream that carries a gitlink is refused, because
     /// rewriting the object id it names is not ported.
     submodule_rewrites: Vec<String>,
+    /// The command line, held until `parse_argv()` reads it: at the first
+    /// command that is not `feature` or `option`, or at the end of the stream.
+    args: Vec<String>,
 }
 
 impl Importer {
-    /// Parse the command line, read the marks it names, then drive the stream.
-    fn import(&mut self, args: &[String]) -> Result<ExitCode> {
-        let import_marks = self.parse_args(args)?;
-        for (path, if_exists) in &import_marks {
-            self.import_marks(path, *if_exists)?;
-        }
-        self.opts.import_marks_pending = false;
-
+    /// Drive the stream; the command line is read from inside it, where git
+    /// reads it.
+    ///
+    /// ```c
+    /// while (read_next_command(&state) != EOF) { … }
+    /// /* argv hasn't been parsed yet, do so */
+    /// if (!state.seen_data_command)
+    ///         parse_argv(&state);
+    /// if (require_explicit_termination && feof(stdin))
+    ///         die(_("stream ends early"));
+    /// ```
+    ///
+    /// (builtin/fast-import.c:4244-4290.)
+    fn import(&mut self) -> Result<ExitCode> {
         let mut input = Input::new();
         let saw_done = self.stream(&mut input)?;
+        if !self.seen_data_command {
+            self.parse_argv()?;
+        }
         if self.opts.require_done && !saw_done {
             crate::git_fatal!("stream ends early");
         }
@@ -1041,108 +1241,215 @@ impl Importer {
         })
     }
 
-    /// Apply argv to `self.opts`, returning the `--import-marks` files to read.
+    /// `read_next_command()` for the top-level loop (builtin/fast-import.c:
+    /// 1868-1912): the first line that is neither `feature ` nor `option ` —
+    /// a `#` comment included, since the test comes before the comment is
+    /// skipped — is where the command line gets parsed. A line handed back with
+    /// [`Input::unread`] is not read again, so it never triggers the parse.
+    fn next_command(&mut self, input: &mut Input) -> Result<Option<Vec<u8>>> {
+        loop {
+            let unread = input.pending.is_some();
+            let Some(line) = input.line()? else {
+                return Ok(None);
+            };
+            if !unread
+                && !self.seen_data_command
+                && !line.starts_with(b"feature ")
+                && !line.starts_with(b"option ")
+            {
+                self.parse_argv()?;
+            }
+            if line.first() == Some(&b'#') {
+                continue;
+            }
+            return Ok(Some(line));
+        }
+    }
+
+    /// `parse_argv()` (builtin/fast-import.c:3988-4000): `parse_options()`
+    /// over `fast_import_options[]`, then the marks file it named.
     ///
-    /// Mirrors git's `parse_argv`: options are applied strictly left to right,
-    /// so a failure leaves everything to its left in effect, and the first
-    /// argument that is not an option — or a bare `--` — ends option parsing and,
-    /// because git has no positional arguments here, ends the run with `usage()`.
-    fn parse_args(&mut self, args: &[String]) -> Result<Vec<(String, bool)>> {
-        let mut import_marks: Vec<(String, bool)> = Vec::new();
+    /// ```c
+    /// int argc = parse_options(state->argc, state->argv, state->prefix,
+    ///                          state->option, fast_import_usage,
+    ///                          PARSE_OPT_KEEP_ARGV0);
+    /// if (argc > 1)
+    ///         usage_with_options(fast_import_usage, state->option);
+    /// state->seen_data_command = 1;
+    /// if (import_marks_file)
+    ///         read_marks();
+    /// ```
+    ///
+    /// `parse_options_step()` (parse-options.c:1048-1176) with this table: no
+    /// short options at all, so every `-x` is a check for a long name typed
+    /// with one dash, then help when it is `h`, then ``unknown switch``. A
+    /// positional does not stop the sweep — options after it still take effect
+    /// one by one, left to right — and is refused only once the sweep is over.
+    /// `--` and `--end-of-options` end it, and whatever follows them counts as
+    /// positional too.
+    fn parse_argv(&mut self) -> Result<()> {
+        use crate::parseopt::OptName;
+
+        let args = std::mem::take(&mut self.args);
+        let mut positional = 0usize;
         let mut i = 0;
         while i < args.len() {
-            let a = args[i].as_str();
-            if !a.starts_with('-') || a == "--" {
+            let arg = args[i].as_str();
+            i += 1;
+            if !arg.starts_with('-') || arg == "-" {
+                positional += 1;
+                continue;
+            }
+            if arg == "--" || arg == "--end-of-options" {
+                positional += args.len() - i;
                 break;
             }
-            match a {
-                "--force" => self.opts.force = true,
-                // Both only steer the stderr statistics block, which is not printed.
-                "--quiet" | "--stats" => {}
-                "--done" => self.opts.require_done = true,
-                "--allow-unsafe-features" => self.opts.allow_unsafe = true,
-                "--relative-marks" => self.opts.relative_marks = true,
-                "--no-relative-marks" => self.opts.relative_marks = false,
-                // Pack tuning only: identical objects and refs either way, but
-                // the values are still validated so a typo fails as it does in git.
-                _ if starts(a, "--depth=") => {
-                    // `option_depth`: parsed, then held to the bitfield's ceiling.
-                    if ulong_arg("--depth", &a["--depth=".len()..])? > MAX_DEPTH {
-                        crate::git_fatal!("--depth cannot exceed {MAX_DEPTH}");
-                    }
+            let Some(body) = arg.strip_prefix("--") else {
+                let rest = &arg[1..];
+                crate::parseopt::check_typos(rest, OPTIONS).map_err(printed)?;
+                if rest.starts_with('h') {
+                    return Err(help(USAGE));
                 }
-                _ if starts(a, "--active-branches=") => {
-                    ulong_arg("--active-branches", &a["--active-branches=".len()..])?;
-                }
-                _ if starts(a, "--big-file-threshold=") => {
-                    byte_size(&a["--big-file-threshold=".len()..])
-                        .ok_or_else(|| anyhow!("unknown option {a}"))?;
-                }
-                _ if starts(a, "--max-pack-size=") => {
-                    let v = byte_size(&a["--max-pack-size=".len()..])
-                        .ok_or_else(|| anyhow!("unknown option {a}"))?;
-                    warn_max_pack_size(v);
-                }
-                _ if starts(a, "--date-format=") => {
-                    self.opts.date_format = date_format(&a["--date-format=".len()..])?;
-                }
-                _ if starts(a, "--export-marks=") => {
-                    self.opts.export_marks = Some(a["--export-marks=".len()..].to_string());
-                }
-                _ if starts(a, "--import-marks=") => {
-                    import_marks.push((a["--import-marks=".len()..].to_string(), false));
-                    self.opts.import_marks_pending = true;
-                }
-                _ if starts(a, "--import-marks-if-exists=") => {
-                    import_marks.push((a["--import-marks-if-exists=".len()..].to_string(), true));
-                    self.opts.import_marks_pending = true;
-                }
-                _ if starts(a, "--cat-blob-fd=") => {
-                    let v = &a["--cat-blob-fd=".len()..];
-                    // `option_cat_blob_fd`: the fd has to survive the cast to int.
-                    let fd = ulong_arg("--cat-blob-fd", v)?;
-                    if fd > i32::MAX as u64 {
-                        crate::git_fatal!("--cat-blob-fd cannot exceed {}", i32::MAX);
-                    }
-                    self.opts.cat_blob_fd = Some(fd as i32);
-                }
-                _ if starts(a, "--signed-commits=") => {
-                    self.opts.signed_commits =
-                        signed_mode("--signed-commits", &a["--signed-commits=".len()..])?;
-                }
-                _ if starts(a, "--signed-tags=") => {
-                    self.opts.signed_tags =
-                        signed_mode("--signed-tags", &a["--signed-tags=".len()..])?;
-                }
-                _ if starts(a, "--rewrite-submodules-from=") => {
-                    self.submodule_rewrite(&a["--rewrite-submodules-from=".len()..])?;
-                }
-                _ if starts(a, "--rewrite-submodules-to=") => {
-                    self.submodule_rewrite(&a["--rewrite-submodules-to=".len()..])?;
-                }
-                _ if starts(a, "--export-pack-edges=") => {
-                    let path = &a["--export-pack-edges=".len()..];
-                    // `option_export_pack_edges`: `pack_edges = xfopen(fn, "a")`
-                    // (builtin/fast-import.c:3724). Opened the moment the option
-                    // is parsed — which is why it exists even when the run dies
-                    // further along — and in *append* mode, so a second run adds
-                    // its boundaries below the first's rather than replacing
-                    // them.
-                    std::fs::OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(path)
-                        .with_context(|| format!("Cannot open '{path}'"))?;
-                    self.pack.edges = Some(std::path::PathBuf::from(path));
-                }
-                _ => bail!("unknown option {a}"),
+                crate::parseopt::unknown_option(arg, USAGE);
+                return Err(printed(crate::parseopt::USAGE_ERROR));
+            };
+            if body == "help-all" {
+                return Err(help(USAGE_ALL));
             }
-            i += 1;
+            if body == "help" {
+                return Err(help(USAGE));
+            }
+            let (opt, unset) = match super::resolve_long(OPTIONS, body) {
+                super::Resolved::One(opt, unset) => (opt, unset),
+                super::Resolved::Ambiguous(first, second) => {
+                    super::ambiguous_option(arg, &first, &second, USAGE);
+                    return Err(printed(crate::parseopt::USAGE_ERROR));
+                }
+                super::Resolved::Unknown => {
+                    crate::parseopt::unknown_option(arg, USAGE);
+                    return Err(printed(crate::parseopt::USAGE_ERROR));
+                }
+            };
+            // `do_get_value()` (parse-options.c:130-143): an attached value on
+            // the `no-` spelling, or on a `PARSE_OPT_NOARG` entry.
+            let attached = body.split_once('=').map(|(_, v)| v);
+            if attached.is_some() && (unset || opt.arg == super::Arg::None) {
+                crate::parseopt::takes_no_value(match unset {
+                    true => OptName::Unset(opt.name),
+                    false => OptName::Long(opt.name),
+                });
+                return Err(printed(crate::parseopt::USAGE_ERROR));
+            }
+            let value = match (opt.arg, attached) {
+                (super::Arg::None, _) => "",
+                (_, Some(v)) => v,
+                // `get_arg()`: the next argument, whatever it looks like.
+                (_, None) => match args.get(i) {
+                    Some(v) => {
+                        i += 1;
+                        v.as_str()
+                    }
+                    None => {
+                        crate::parseopt::requires_value(OptName::Long(opt.name));
+                        return Err(printed(crate::parseopt::USAGE_ERROR));
+                    }
+                },
+            };
+            self.apply_option(opt.name, unset, value)?;
         }
-        if i != args.len() {
-            return Err(usage());
+        if positional > 0 {
+            // `usage_with_options()`: the block alone, on stderr.
+            return Err(UsageError::refuse(USAGE.to_string()));
         }
-        Ok(import_marks)
+
+        self.seen_data_command = true;
+        self.read_marks()
+    }
+
+    /// One `fast_import_options[]` callback, run the moment `parse_options()`
+    /// reaches its option (builtin/fast-import.c:4003-4120).
+    fn apply_option(&mut self, name: &str, unset: bool, value: &str) -> Result<()> {
+        match name {
+            "date-format" => self.opts.date_format = date_format(value)?,
+            // Both only steer the stderr statistics block, which is not printed.
+            "stats" | "quiet" => {}
+            "force" => self.opts.force = true,
+            "done" => self.opts.require_done = true,
+            "max-pack-size" => option_max_pack_size(value)?,
+            "big-file-threshold" => option_big_file_threshold(value)?,
+            "depth" => option_depth(value)?,
+            "active-branches" => {
+                ulong_arg("--active-branches", value)?;
+            }
+            "import-marks" => self.option_import_marks(value, false, false)?,
+            "import-marks-if-exists" => self.option_import_marks(value, false, true)?,
+            "export-marks" => self.opts.export_marks = Some(self.marks_path(value)),
+            "relative-marks" => self.opts.relative_marks = !unset,
+            "rewrite-submodules-from" | "rewrite-submodules-to" => self.submodule_rewrite(value)?,
+            "signed-commits" => self.opts.signed_commits = signed_mode("--signed-commits", value)?,
+            "signed-tags" => self.opts.signed_tags = signed_mode("--signed-tags", value)?,
+            "allow-unsafe-features" => self.opts.allow_unsafe = true,
+            "export-pack-edges" => self.option_export_pack_edges(value)?,
+            "cat-blob-fd" => {
+                // `option_cat_blob_fd`: the fd has to survive the cast to int.
+                let fd = ulong_arg("--cat-blob-fd", value)?;
+                if fd > i32::MAX as u64 {
+                    crate::git_fatal!("--cat-blob-fd cannot exceed {}", i32::MAX);
+                }
+                self.opts.cat_blob_fd = Some(fd as i32);
+            }
+            _ => unreachable!("--{name} is not in fast_import_options[]"),
+        }
+        Ok(())
+    }
+
+    /// `option_import_marks()` (builtin/fast-import.c:3703-3721): only one
+    /// marks file is ever pending. Naming a second reads the first right away —
+    /// unless the stream named it, in which case the command line replaces it
+    /// unread — and a stream may name only one.
+    fn option_import_marks(&mut self, marks: &str, from_stream: bool, ignore_missing: bool) -> Result<()> {
+        if let Some(pending) = &self.opts.import_marks {
+            if from_stream {
+                crate::git_fatal!("only one import-marks command allowed per stream");
+            }
+            if !pending.from_stream {
+                self.read_marks()?;
+            }
+        }
+        self.opts.import_marks = Some(ImportMarks {
+            path: self.marks_path(marks),
+            from_stream,
+            ignore_missing,
+        });
+        Ok(())
+    }
+
+    /// `read_marks()` (builtin/fast-import.c:1852-1865) for the pending file.
+    /// `import_marks_file_done` is set and never cleared, so once one file has
+    /// been read a later unread one no longer holds `dump_marks()` back.
+    fn read_marks(&mut self) -> Result<()> {
+        let Some(pending) = &self.opts.import_marks else {
+            return Ok(());
+        };
+        let display = pending.path.display().to_string();
+        for (mark, id) in read_mark_file(&pending.path, &display, pending.ignore_missing)? {
+            self.marks.insert(mark, id);
+        }
+        self.opts.import_marks_done = true;
+        Ok(())
+    }
+
+    /// `option_export_pack_edges()` (builtin/fast-import.c:3774-3781):
+    /// `pack_edges = xfopen(fn, "a")`. Opened the moment the option is parsed —
+    /// which is why it exists even when the run dies further along — and in
+    /// *append* mode, so a second run adds its boundaries below the first's
+    /// rather than replacing them.
+    fn option_export_pack_edges(&mut self, path: &str) -> Result<()> {
+        if let Err(e) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+            crate::git_fatal!("could not open '{path}' for writing: {}", strerror(&e));
+        }
+        self.pack.edges = Some(std::path::PathBuf::from(path));
+        Ok(())
     }
 
     /// `--rewrite-submodules-from/-to=<name>:<marks file>`: validate the spec and
@@ -1192,39 +1499,31 @@ impl Importer {
 
     /// Read commands until `done` or EOF. Returns whether `done` ended the stream.
     fn stream(&mut self, input: &mut Input) -> Result<bool> {
-        while let Some(line) = input.command()? {
+        while let Some(line) = self.next_command(input)? {
             let cmd = line.as_slice();
             if cmd == b"blob" {
-                self.seen_data_command = true;
                 self.parse_blob(input)?;
             } else if let Some(v) = after(cmd, b"commit ") {
-                self.seen_data_command = true;
                 let name = utf8(v, "ref name")?;
                 self.parse_commit(input, &name)?;
             } else if let Some(v) = after(cmd, b"tag ") {
-                self.seen_data_command = true;
                 let name = utf8(v, "tag name")?;
                 self.parse_tag(input, &name)?;
             } else if let Some(v) = after(cmd, b"reset ") {
-                self.seen_data_command = true;
                 let name = utf8(v, "ref name")?;
                 self.parse_reset(input, &name)?;
             } else if cmd == b"alias" {
-                self.seen_data_command = true;
                 self.parse_alias(input)?;
             } else if cmd == b"checkpoint" {
-                self.seen_data_command = true;
                 self.checkpoint()?;
                 input.skip_optional_lf()?;
             } else if let Some(v) = after(cmd, b"progress ") {
-                self.seen_data_command = true;
                 let mut out = b"progress ".to_vec();
                 out.extend_from_slice(v);
                 out.push(b'\n');
                 stdout_write(&out)?;
                 input.skip_optional_lf()?;
             } else if let Some(v) = after(cmd, b"get-mark ") {
-                self.seen_data_command = true;
                 // `if (*p != ':') die(_("not a mark: %s"), p);` — `parse_get_mark()`,
                 // builtin/fast-import.c:3386-3387, the one caller that says so
                 // before `parse_mark_ref()` asserts on the colon.
@@ -1234,15 +1533,15 @@ impl Importer {
                 let id = self.mark_ref(v)?;
                 self.respond(format!("{id}\n").as_bytes())?;
             } else if let Some(v) = after(cmd, b"cat-blob ") {
-                self.seen_data_command = true;
                 self.cat_blob(v)?;
             } else if let Some(v) = after(cmd, b"ls ") {
-                self.seen_data_command = true;
                 self.parse_ls(v, None)?;
             } else if let Some(v) = after(cmd, b"feature ") {
                 self.parse_feature(utf8(v, "feature")?.as_str())?;
-            } else if let Some(v) = after(cmd, b"option ") {
+            } else if let Some(v) = after(cmd, b"option git ") {
                 self.parse_option(utf8(v, "option")?.as_str())?;
+            } else if cmd.starts_with(b"option ") {
+                // Options addressed at another importer are ignored.
             } else if cmd == b"done" {
                 return Ok(true);
             } else {
@@ -1603,68 +1902,78 @@ impl Importer {
         Ok(())
     }
 
-    /// `feature <name>[=<argument>]`.
-    fn parse_feature(&mut self, spec: &str) -> Result<()> {
-        let (name, arg) = match spec.split_once('=') {
-            Some((n, a)) => (n, Some(a)),
-            None => (spec, None),
-        };
-        let unsafe_feature = matches!(name, "export-marks" | "import-marks" | "import-marks-if-exists");
-        if unsafe_feature && !self.opts.allow_unsafe {
-            crate::git_fatal!("feature '{spec}' forbidden in input without --allow-unsafe-features");
+    /// `parse_feature()` and `parse_one_feature()` (builtin/fast-import.c:
+    /// 3884-3961). Every name is matched exactly, or as a `<name>=` prefix
+    /// where it takes an argument, so `feature force=1` is unsupported and
+    /// `feature date-format` without its `=` is too.
+    fn parse_feature(&mut self, feature: &str) -> Result<()> {
+        if self.seen_data_command {
+            crate::git_fatal!("got feature command '{feature}' after data command");
         }
-        match name {
-            "date-format" => {
-                self.opts.date_format = date_format(arg.unwrap_or_default())?;
+        if let Some(arg) = feature.strip_prefix("date-format=") {
+            self.opts.date_format = date_format(arg)?;
+        } else if let Some(arg) = feature.strip_prefix("import-marks=") {
+            self.check_unsafe_feature("import-marks")?;
+            self.option_import_marks(arg, true, false)?;
+        } else if let Some(arg) = feature.strip_prefix("import-marks-if-exists=") {
+            self.check_unsafe_feature("import-marks-if-exists")?;
+            self.option_import_marks(arg, true, true)?;
+        } else if let Some(arg) = feature.strip_prefix("export-marks=") {
+            // git names the whole feature here, argument and all.
+            self.check_unsafe_feature(feature)?;
+            self.opts.export_marks = Some(self.marks_path(arg));
+        } else if let Some(arg) = feature
+            .strip_prefix("rewrite-submodules-to=")
+            .or_else(|| feature.strip_prefix("rewrite-submodules-from="))
+        {
+            self.submodule_rewrite(arg)?;
+        } else {
+            match feature {
+                // Capability probes for commands this port implements.
+                "alias" | "get-mark" | "cat-blob" | "notes" | "ls" => {}
+                "relative-marks" => self.opts.relative_marks = true,
+                "no-relative-marks" => self.opts.relative_marks = false,
+                "done" => self.opts.require_done = true,
+                "force" => self.opts.force = true,
+                _ => crate::git_fatal!("this version of fast-import does not support feature {feature}."),
             }
-            // Command-line marks options win, so a stream request is only honoured
-            // when the command line was silent — which is git's ordering too.
-            "export-marks" => {
-                if self.opts.export_marks.is_none() {
-                    self.opts.export_marks = Some(arg.unwrap_or_default().to_string());
-                }
-            }
-            "import-marks" => self.import_marks(arg.unwrap_or_default(), false)?,
-            "import-marks-if-exists" => self.import_marks(arg.unwrap_or_default(), true)?,
-            "relative-marks" => self.opts.relative_marks = true,
-            "no-relative-marks" => self.opts.relative_marks = false,
-            "force" => self.opts.force = true,
-            "done" => self.opts.require_done = true,
-            // Capability probes for commands this port implements.
-            "get-mark" | "cat-blob" | "ls" | "notes" => {}
-            _ => anyhow::bail!("this version of fast-import does not support feature {spec}."),
         }
         Ok(())
     }
 
-    /// `option <option>`; only `git `-prefixed options are ours to interpret.
-    fn parse_option(&mut self, spec: &str) -> Result<()> {
-        let Some(opt) = spec.strip_prefix("git ") else {
-            // Options addressed at another importer are silently ignored.
-            return Ok(());
-        };
+    /// `check_unsafe_feature()` (builtin/fast-import.c:3876-3882).
+    fn check_unsafe_feature(&self, feature: &str) -> Result<()> {
+        if !self.opts.allow_unsafe {
+            crate::git_fatal!("feature '{feature}' forbidden in input without --allow-unsafe-features");
+        }
+        Ok(())
+    }
+
+    /// `option git <option>`: `parse_option()` and `parse_one_option()`
+    /// (builtin/fast-import.c:3850-3874, 3974-3983). The same callbacks the
+    /// command line runs, so a bad value fails the same way.
+    fn parse_option(&mut self, option: &str) -> Result<()> {
         if self.seen_data_command {
-            crate::git_fatal!("option command must be the first command in the stream");
+            crate::git_fatal!("got option command '{option}' after data command");
         }
-        match opt {
-            "quiet" | "stats" => Ok(()),
-            _ if starts(opt, "max-pack-size=") => {
-                // `parse_one_option()` runs the same arm for the `option git`
-                // spelling as for the command line, so the legacy-unit warnings
-                // belong to both.
-                if let Some(v) = byte_size(&opt["max-pack-size=".len()..]) {
-                    warn_max_pack_size(v);
-                }
-                Ok(())
-            }
-            _ if starts(opt, "big-file-threshold=")
-                || starts(opt, "depth=")
-                || starts(opt, "active-branches=") =>
-            {
-                Ok(())
-            }
-            _ => anyhow::bail!("this version of fast-import does not support option: {opt}"),
+        if let Some(v) = option.strip_prefix("max-pack-size=") {
+            option_max_pack_size(v)?;
+        } else if let Some(v) = option.strip_prefix("big-file-threshold=") {
+            option_big_file_threshold(v)?;
+        } else if let Some(v) = option.strip_prefix("depth=") {
+            option_depth(v)?;
+        } else if let Some(v) = option.strip_prefix("active-branches=") {
+            ulong_arg("--active-branches", v)?;
+        } else if let Some(v) = option.strip_prefix("export-pack-edges=") {
+            self.option_export_pack_edges(v)?;
+        } else if let Some(v) = option.strip_prefix("signed-commits=") {
+            self.opts.signed_commits = signed_mode("--signed-commits", v)?;
+        } else if let Some(v) = option.strip_prefix("signed-tags=") {
+            self.opts.signed_tags = signed_mode("--signed-tags", v)?;
+        } else if !matches!(option, "quiet" | "stats" | "allow-unsafe-features") {
+            crate::git_fatal!("this version of fast-import does not support option: {option}");
         }
+        Ok(())
     }
 
     // -- file changes -------------------------------------------------------
@@ -2252,7 +2561,9 @@ impl Importer {
 
     // -- marks and refs -----------------------------------------------------
 
-    /// Resolve a marks-file path, honouring `--relative-marks`.
+    /// `make_fast_import_path()` (builtin/fast-import.c:3695-3701): resolved
+    /// when the option or feature is read, under the `--relative-marks` in
+    /// effect at that point.
     fn marks_path(&self, path: &str) -> std::path::PathBuf {
         if self.opts.relative_marks {
             self.repo.git_dir().join("info").join("fast-import").join(path)
@@ -2261,29 +2572,18 @@ impl Importer {
         }
     }
 
-    /// Load `:<idnum> SP <oid>` lines into the mark table; later files win.
-    fn import_marks(&mut self, path: &str, if_exists: bool) -> Result<()> {
-        let full = self.marks_path(path);
-        let display = full.display().to_string();
-        for (mark, id) in read_mark_file(&full, &display, if_exists)? {
-            self.marks.insert(mark, id);
-        }
-        Ok(())
-    }
-
-    /// Write out the mark table, ascending by mark number, as git does.
+    /// `dump_marks()`: write out the mark table, ascending by mark number.
     ///
-    /// git's `dump_marks` declines while an `--import-marks` file is named but
-    /// unread, so a run that died before loading it does not overwrite the
+    /// It declines while an import file is named but no marks file has been
+    /// read yet, so a run that died before loading it does not overwrite the
     /// export with a half-populated table.
     fn export_marks(&self) -> Result<()> {
-        if self.opts.import_marks_pending {
+        if self.opts.import_marks.is_some() && !self.opts.import_marks_done {
             return Ok(());
         }
-        let Some(path) = &self.opts.export_marks else {
+        let Some(full) = &self.opts.export_marks else {
             return Ok(());
         };
-        let full = self.marks_path(path);
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -2293,7 +2593,7 @@ impl Importer {
         for (mark, id) in marks {
             out.push_str(&format!(":{mark} {id}\n"));
         }
-        std::fs::write(&full, out).with_context(|| format!("cannot write {}", full.display()))
+        std::fs::write(full, out).with_context(|| format!("cannot write {}", full.display()))
     }
 
     /// Flush the packfile, every pending ref update and the marks file —

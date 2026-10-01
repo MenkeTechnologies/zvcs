@@ -504,6 +504,42 @@ pub fn unknown_option(tok: &str, usage: &str) -> ExitCode {
     ExitCode::from(USAGE_ERROR)
 }
 
+/// `check_typos()` (parse-options.c:622-640): a short-option word that reads
+/// like a long option typed with one dash is refused outright, before
+/// `parse_options_step()` looks at it as `-h` or as an unknown switch.
+///
+/// ```c
+/// if (strlen(arg) < 3)
+///         return;
+/// if (starts_with(arg, "no-")) {
+///         error(_("did you mean `--%s` (with two dashes)?"), arg);
+///         exit(129);
+/// }
+/// for (; options->type != OPTION_END; options++) {
+///         if (!options->long_name)
+///                 continue;
+///         if (starts_with(options->long_name, arg)) {
+///                 error(_("did you mean `--%s` (with two dashes)?"), arg);
+///                 exit(129);
+///         }
+/// }
+/// ```
+///
+/// `arg` is the word without its one dash. `parse_options_step()` calls it
+/// only when the word's *first* character is not one of the table's short
+/// options (parse-options.c:1063-1066), which is the caller's to decide. The
+/// error is printed here; `Err` carries the 129 git exits with.
+pub(crate) fn check_typos(arg: &str, table: &[crate::porcelain::LongOpt]) -> Result<(), u8> {
+    if arg.len() < 3 {
+        return Ok(());
+    }
+    if arg.starts_with("no-") || table.iter().any(|opt| opt.name.starts_with(arg)) {
+        eprintln!("error: did you mean `--{arg}` (with two dashes)?");
+        return Err(USAGE_ERROR);
+    }
+    Ok(())
+}
+
 /// An already-printed parse-options refusal as an error to return with `?`.
 ///
 /// Every helper above has written its own stderr by the time it returns, so what

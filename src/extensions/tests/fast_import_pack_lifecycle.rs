@@ -5,10 +5,10 @@
 //! before it reads the stream and before argv is parsed at all
 //! (`builtin/fast-import.c:3978` against `parse_argv()` at 4020), so the state a
 //! rejected command line leaves behind depends entirely on how it is rejected:
-//! `usage()` calls `exit(129)` without running `die_nicely`, so the temporary
-//! survives, while `die()` and a clean run both reach `end_packfile()` and
-//! unlink it. Every expectation below was checked against stock git 2.55.0 in
-//! the same fixture before being written down.
+//! a `parse_options()` refusal or `usage()` exits without running `die_nicely`,
+//! so the temporary survives, while `die()` and a clean run both reach
+//! `end_packfile()` and unlink it. Every expectation below was checked against
+//! stock git 2.56.0 in the same fixture before being written down.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -72,9 +72,11 @@ fn temp_packs(repo: &Path) -> Vec<String> {
     names
 }
 
-/// An argument that is not an option is rejected by `usage()`, which exits
-/// without any of `die_nicely`'s cleanup — so the temporary packfile
-/// `start_packfile()` already opened stays in the object store.
+/// An argument that is not an option is refused by `usage_with_options()`,
+/// which exits without any of `die_nicely`'s cleanup — so the temporary
+/// packfile `start_packfile()` already opened stays in the object store. An
+/// option outside the table is refused by `parse_options()` itself, the same
+/// way out.
 #[test]
 fn usage_error_leaves_the_temporary_packfile() {
     let (root, repo) = fixture("usage-positional");
@@ -84,8 +86,17 @@ fn usage_error_leaves_the_temporary_packfile() {
 
     assert_eq!(code, 129, "stderr: {stderr}");
     assert_eq!(stdout, "");
-    assert!(stderr.starts_with("usage: git fast-import [--date-format=<f>]"), "{stderr}");
+    assert!(stderr.starts_with("usage: git fast-import [<options>]\n\nCommon\n"), "{stderr}");
     assert_eq!(temp_packs(&repo).len(), 1, "expected exactly one temporary packfile");
+
+    let (stdout, stderr, code) = fast_import(&repo, &home, &["--bogus-opt"], "");
+    assert_eq!(code, 129, "stderr: {stderr}");
+    assert_eq!(stdout, "");
+    assert!(
+        stderr.starts_with("error: unknown option `bogus-opt'\nusage: git fast-import [<options>]\n"),
+        "{stderr}"
+    );
+    assert_eq!(temp_packs(&repo).len(), 2, "each refused run leaves its own temporary");
 }
 
 /// The other `usage()` shape — a value outside the set an option names — takes
@@ -106,13 +117,13 @@ fn rejected_option_value_leaves_the_temporary_packfile() {
 /// before `dump_marks()` — so nothing is left in the object store.
 #[test]
 fn fatal_error_removes_the_temporary_packfile() {
-    let (root, repo) = fixture("fatal-unknown-option");
+    let (root, repo) = fixture("fatal-date-format");
     let home = root.join("home");
 
-    let (_, stderr, code) = fast_import(&repo, &home, &["--bogus-opt"], "");
+    let (_, stderr, code) = fast_import(&repo, &home, &["--date-format=bogus"], "");
 
     assert_eq!(code, 128, "stderr: {stderr}");
-    assert_eq!(stderr, "fatal: unknown option --bogus-opt\n");
+    assert_eq!(stderr, "fatal: unknown --date-format argument bogus\n");
     assert_eq!(temp_packs(&repo), Vec::<String>::new());
 }
 
@@ -200,8 +211,9 @@ fn real_import_lands_the_ref_and_leaves_nothing_behind() {
     );
 }
 
-/// `show_usage_if_asked` answers a lone help flag on *stdout* with exit 0, and
-/// it runs before `start_packfile()`, so no temporary is created at all.
+/// `show_usage_with_options_if_asked()` answers a lone help flag on *stdout*
+/// with exit 0, and it runs before `start_packfile()`, so no temporary is
+/// created at all. `--help-all` adds the hidden "Advanced" group.
 #[test]
 fn lone_help_flag_prints_on_stdout_before_any_packfile() {
     let (root, repo) = fixture("help-flag");
@@ -211,13 +223,17 @@ fn lone_help_flag_prints_on_stdout_before_any_packfile() {
         let (stdout, stderr, code) = fast_import(&repo, &home, &[flag], "");
         assert_eq!(code, 0, "{flag}: stderr: {stderr}");
         assert_eq!(stderr, "", "{flag} must not write to stderr");
-        assert!(stdout.starts_with("usage: git fast-import [--date-format=<f>]"), "{stdout}");
+        assert!(stdout.starts_with("usage: git fast-import [<options>]\n\nCommon\n"), "{stdout}");
+        assert_eq!(stdout.contains("\nAdvanced\n"), flag == "--help-all", "{flag}: {stdout}");
         assert_eq!(temp_packs(&repo), Vec::<String>::new(), "{flag}");
     }
 
-    // Only when it is the sole argument: alongside anything else it is just an
-    // unrecognised option.
-    let (_, stderr, code) = fast_import(&repo, &home, &["-h", "--quiet"], "");
-    assert_eq!(code, 128, "stderr: {stderr}");
-    assert_eq!(stderr, "fatal: unknown option -h\n");
+    // Alongside anything else it is `parse_options()`'s own help, which comes
+    // only once `parse_argv()` runs — after `start_packfile()` — and exits 0
+    // without any cleanup, so the temporary stays.
+    let (stdout, stderr, code) = fast_import(&repo, &home, &["-h", "--quiet"], "");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stderr, "");
+    assert!(stdout.starts_with("usage: git fast-import [<options>]\n"), "{stdout}");
+    assert_eq!(temp_packs(&repo).len(), 1);
 }

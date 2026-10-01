@@ -30,7 +30,7 @@
 //! Covered because these paths are byte-verifiable without touching the object
 //! database:
 //! ```text
-//!   * `-h` → git's 2699-byte usage block on stdout, exit 0
+//!   * `-h` → git's usage block on stdout, exit 0
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--qui` → `--quiet`), `--no-`
 //!     negations, `=value` vs. separate-argv values, clustered short switches,
@@ -54,8 +54,11 @@
 //!     vs. `-a`/`-A`, incremental-with-bitmaps, `--filter-to` without
 //!     `--filter`, and — last of the five — `invalid --name-hash-version
 //!     option: <n>` for any version above 2
+//!   * `--drop-filtered` / `--dry-run` (git 2.56), whose checks run first of
+//!     all, then drop the promisor blobs a `blob:limit` filter rejects — see
+//!     `drop_filtered_setup()`
 //! ```
-//! (all checked against git 2.55.0.)
+//! (all checked against git 2.55.0; `--drop-filtered` against 2.56.0.)
 //!
 //! # What repacking does here
 //!
@@ -255,12 +258,13 @@ use std::process::ExitCode;
 use gix::hash::ObjectId;
 use gix::odb::pack;
 
-/// Stock git's `repack` usage block, byte-for-byte (2699 bytes, git 2.55.0),
+/// Stock git's `repack` usage block, byte-for-byte (git 2.56.0),
 /// including the trailing blank line. Printed on `-h` (stdout) and after the
 /// `unknown option` / `unknown switch` diagnostics (stderr).
 const USAGE: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q] [-b] [-m]
        [--window=<n>] [--depth=<n>] [--threads=<n>] [--keep-pack=<pack-name>]
        [--write-midx[=<mode>]] [--name-hash-version=<n>] [--path-walk]
+       [--filter=<filter-spec>] [--drop-filtered [--dry-run]]
 
     -a                    pack everything in a single pack
     -A                    same as -a, and turn unreachable objects loose
@@ -306,16 +310,19 @@ const USAGE: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q]
                           pack prefix to store a pack containing pruned objects
     --[no-]filter-to <dir>
                           pack prefix to store a pack containing filtered out objects
+    --[no-]drop-filtered  delete filtered out objects (requires --filter)
+    --[no-]dry-run        only show which objects would be dropped
 
 "#;
 
 /// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
 /// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
 /// `-m`.
-/// Captured byte-for-byte from stock git 2.55.0's `git repack --help-all`.
+/// Captured byte-for-byte from stock git 2.56.0's `git repack --help-all`.
 const USAGE_ALL: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] [-q] [-b] [-m]
        [--window=<n>] [--depth=<n>] [--threads=<n>] [--keep-pack=<pack-name>]
        [--write-midx[=<mode>]] [--name-hash-version=<n>] [--path-walk]
+       [--filter=<filter-spec>] [--drop-filtered [--dry-run]]
 
     -a                    pack everything in a single pack
     -A                    same as -a, and turn unreachable objects loose
@@ -362,6 +369,8 @@ const USAGE_ALL: &str = r#"usage: git repack [-a] [-A] [-d] [-f] [-F] [-l] [-n] 
                           pack prefix to store a pack containing pruned objects
     --[no-]filter-to <dir>
                           pack prefix to store a pack containing filtered out objects
+    --[no-]drop-filtered  delete filtered out objects (requires --filter)
+    --[no-]dry-run        only show which objects would be dropped
 
 "#;
 
@@ -421,6 +430,8 @@ const OPTS: &[OptDef] = &[
     OptDef { long: "write-midx", kind: Kind::OptStr, negatable: true },
     OptDef { long: "expire-to", kind: Kind::Str, negatable: true },
     OptDef { long: "filter-to", kind: Kind::Str, negatable: true },
+    OptDef { long: "drop-filtered", kind: Kind::Bool, negatable: true },
+    OptDef { long: "dry-run", kind: Kind::Bool, negatable: true },
 ];
 
 /// The only accepted `--write-midx=<mode>` values; a bare `--write-midx` and
@@ -433,6 +444,18 @@ const WRITE_MIDX_MODES: [&str; 2] = ["", "incremental"];
 struct State {
     /// `ALL_INTO_ONE`, set by `-a`, `-A` and `--cruft`.
     all_into_one: bool,
+    /// `pack_everything & ALL_INTO_ONE` as parse-options leaves it: `-a` and `-A`
+    /// only, before `cmd_repack()` folds `PACK_CRUFT` in. `--drop-filtered`
+    /// tests it ahead of that fold.
+    all_into_one_given: bool,
+    /// `--drop-filtered` (git 2.56): leave the promisor blobs the `blob:limit`
+    /// filter rejects out of the rebuilt promisor pack.
+    drop_filtered: bool,
+    /// `--dry-run`: only list what `--drop-filtered` would drop.
+    dry_run: bool,
+    /// The blobs `--drop-filtered` settled on, in the order git's `oidset`
+    /// iterates them.
+    drop_oids: Vec<ObjectId>,
     /// `LOOSEN_UNREACHABLE`, set by `-A` and by `--unpack-unreachable`.
     loosen_unreachable: bool,
     keep_unreachable: bool,
@@ -552,10 +575,14 @@ pub fn repack(args: &[String]) -> Result<ExitCode> {
         Err(_) => None,
     };
 
-    let state = match parse(args) {
+    let mut state = match parse(args) {
         Parsed::Exit(code) => return Ok(code),
         Parsed::Ok(state) => state,
     };
+
+    if let Some(code) = drop_filtered_setup(&mut state)? {
+        return Ok(code);
+    }
 
     if let Some(code) = preflight(&state, &midx_cfg) {
         return Ok(code);
@@ -1129,12 +1156,22 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // (:56-69), so what `-d` is about to delete is replaced in kind rather than
     // lost. It runs before the main `pack-objects`, so its pack is the first
     // name in `names`.
-    if st.all_into_one && !promisor_held.is_empty() {
+    //
+    // A real `--drop-filtered` run hands it the blobs to leave out, and
+    // `write_oid()` skips them before the child is even started (2.56,
+    // repack-promisor.c:28-35), so a store whose promisor objects are all being
+    // dropped writes no promisor pack.
+    let dropping: HashSet<ObjectId> = match st.drop_filtered && !st.dry_run {
+        true => st.drop_oids.iter().copied().collect(),
+        false => HashSet::new(),
+    };
+    let promisor_kept: Vec<ObjectId> = promisor_held.iter().filter(|id| !dropping.contains(*id)).copied().collect();
+    if st.all_into_one && !promisor_kept.is_empty() {
         // `repack_promisor_objects()` starts its child lazily and clears it again
         // when the store holds no promisor object (repack-promisor.c:104-108), so
         // this child — and its warning — only exist when one does.
         warn_min_pack_size(po_pack_size_limit(st, pack_size_limit_cfg));
-        let mut ids: Vec<ObjectId> = promisor_held.iter().copied().collect();
+        let mut ids = promisor_kept;
         ids.sort();
         let path = write_pack(&repo, st, &ids, &packtmp, write_rev, progress, false)?;
         let hash = pack_hash(&pack_base_name(&path));
@@ -1315,8 +1352,9 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
 
     // With `--filter` git writes a second pack holding the filtered-out objects.
     // The objects have to travel with it: they are only reachable through this
-    // pack once `-d` removes the ones they came from.
-    if st.filter {
+    // pack once `-d` removes the ones they came from. `--drop-filtered` (dry run
+    // included) writes no such pack (2.56, builtin/repack.c:691).
+    if st.filter && !st.drop_filtered {
         // `write_filtered_pack()` is the fourth `pack-objects` child, driven by
         // `po_args` (builtin/repack.c:547-558), so it warns on the same limit the
         // main pack did.
@@ -2742,6 +2780,8 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
             st.filter_to = on;
             st.filter_to_prefix = if on { value.map(str::to_string) } else { None };
         }
+        "drop-filtered" => st.drop_filtered = on,
+        "dry-run" => st.dry_run = on,
         // Kept verbatim, exactly as git's `OPT_STRING` does; `--no-<name>` sets
         // the pointer back to NULL and so drops the option entirely.
         "window" => st.window = value.filter(|_| on).map(str::to_string),
@@ -2818,9 +2858,13 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
             'h' => {
                 return Some(super::show_usage(USAGE));
             }
-            'a' => st.all_into_one = true,
+            'a' => {
+                st.all_into_one = true;
+                st.all_into_one_given = true;
+            }
             'A' => {
                 st.all_into_one = true;
+                st.all_into_one_given = true;
                 st.loosen_unreachable = true;
             }
             'k' => st.keep_unreachable = true,
@@ -2873,6 +2917,172 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
     }
     *i += 1;
     None
+}
+
+/// `--drop-filtered` and `--dry-run` (git 2.56), checked and resolved where
+/// `cmd_repack()` does it: right after parse-options, ahead of every other
+/// option conflict (builtin/repack.c:285-395).
+///
+/// The run then settles on the promisor blobs the `blob:limit` filter rejects
+/// ([`enumerate_promisor_blobs`]), refuses a set the index still names, and under
+/// `--dry-run` lists it — after which the repack itself still runs, without
+/// dropping anything and without `-d`.
+fn drop_filtered_setup(st: &mut State) -> Result<Option<ExitCode>> {
+    // die_for_incompatible_opt2(drop_filtered, "--drop-filtered", !!filter_to, "--filter-to")
+    if st.drop_filtered && st.filter_to {
+        return Ok(Some(fatal("options '--drop-filtered' and '--filter-to' cannot be used together")));
+    }
+    if st.dry_run && !st.drop_filtered {
+        return Ok(Some(fatal("--dry-run only takes effect with --drop-filtered")));
+    }
+    if !st.drop_filtered {
+        return Ok(None);
+    }
+    if !st.filter {
+        return Ok(Some(fatal("--drop-filtered requires --filter")));
+    }
+    if !st.all_into_one_given {
+        return Ok(Some(fatal("--drop-filtered requires -a")));
+    }
+    // `po_args.filter_options.choice != LOFC_BLOB_LIMIT`.
+    let Some(limit) = st
+        .filter_spec
+        .as_deref()
+        .and_then(|spec| spec.strip_prefix("blob:limit="))
+        .and_then(scaled)
+        .and_then(|n| u64::try_from(n).ok())
+    else {
+        return Ok(Some(fatal("--drop-filtered only supports --filter=blob:limit=<n> for now")));
+    };
+    // An explicit `-b` conflicts; a bitmap setting from config is overridden below.
+    if st.write_bitmap == Some(true) {
+        return Ok(Some(fatal("options '--drop-filtered' and '--write-bitmap-index' cannot be used together")));
+    }
+    let Ok(repo) = crate::setup::discover() else {
+        return Ok(Some(fatal("not a git repository (or any of the parent directories): .git")));
+    };
+    if !super::rev_list::has_promisor_remote(&repo) {
+        return Ok(Some(fatal("--drop-filtered requires a promisor remote")));
+    }
+    let bare = repo.workdir().is_none();
+    if !bare && super::status::operation_in_progress(&repo) {
+        return Ok(Some(fatal(
+            "--drop-filtered cannot be used while another operation (merge, rebase, am, \
+             cherry-pick, revert, or bisect) is in progress",
+        )));
+    }
+
+    st.write_bitmap = Some(false);
+    // Dropping means rebuilding the promisor packs without the blobs and removing
+    // the old ones, so a real run implies `-d`.
+    if !st.dry_run {
+        st.delete_redundant = true;
+    }
+
+    let drop = enumerate_promisor_blobs(&repo, limit);
+
+    // A blob the index names would only be fetched straight back.
+    if !bare && !drop.is_empty() {
+        let Ok(index) = repo.index_or_empty() else {
+            return Ok(Some(fatal("could not read the index")));
+        };
+        let dropping: HashSet<ObjectId> = drop.iter().copied().collect();
+        for entry in index.entries() {
+            if dropping.contains(&entry.id) {
+                return Ok(Some(fatal(&format!(
+                    "cannot drop '{}' ({}): it is referenced by the current index",
+                    entry.path(&index),
+                    entry.id
+                ))));
+            }
+        }
+    }
+
+    if st.dry_run {
+        use std::io::Write as _;
+        let mut out = std::io::stdout().lock();
+        for id in &drop {
+            writeln!(out, "{id}")?;
+        }
+    }
+    st.drop_oids = drop;
+    Ok(None)
+}
+
+/// `enumerate_promisor_blobs()` (repack-filtered.c:88-133) with
+/// `list_objects_filter__filter_oidset()` (list-objects-filter.c:840-875): every
+/// blob a promisor pack holds, in `odb_for_each_object(…,
+/// ODB_FOR_EACH_OBJECT_PROMISOR_ONLY)` order, collected into one `oidset`, and
+/// those of them at least `limit` bytes long collected into a second — returned
+/// in the order that second set iterates.
+fn enumerate_promisor_blobs(repo: &gix::Repository, limit: u64) -> Vec<ObjectId> {
+    let blobs: Vec<ObjectId> = promisor_objects_in_odb_order(repo)
+        .into_iter()
+        .filter(|id| repo.find_header(*id).is_ok_and(|h| h.kind() == gix::objs::Kind::Blob))
+        .collect();
+    let omitted: Vec<ObjectId> = crate::oidhash::oidset_init_order(&blobs)
+        .into_iter()
+        .filter(|id| {
+            repo.find_header(*id)
+                .is_ok_and(|h| h.kind() == gix::objs::Kind::Blob && h.size() >= limit)
+        })
+        .collect();
+    crate::oidhash::oidset_init_order(&omitted)
+}
+
+/// The objects `odb_for_each_object(…, ODB_FOR_EACH_OBJECT_PROMISOR_ONLY)` visits,
+/// in its order: source by source (the repository's own objects, then each
+/// alternate), the `multi-pack-index` first in object-name order, then every
+/// other pack — local before non-local, newest `.pack` mtime first, ties in
+/// directory order (`sort_pack()`, odb/source-packed.c:805-830) — in index
+/// order. Only packs with a `.promisor` file beside them count.
+fn promisor_objects_in_odb_order(repo: &gix::Repository) -> Vec<ObjectId> {
+    let store = repo.objects.store_ref();
+    let mut out = Vec::new();
+    for dir in std::iter::once(store.path().to_path_buf())
+        .chain(store.alternate_db_paths().ok().into_iter().flatten())
+    {
+        let pack_dir = dir.join("pack");
+        let open = |idx: &Path| gix::odb::pack::index::File::at(idx, repo.object_hash()).ok();
+        let midx_names = super::multi_pack_index::midx_pack_names(&pack_dir).unwrap_or_default();
+        let mut in_midx: Vec<ObjectId> = midx_names
+            .iter()
+            .map(|name| pack_dir.join(name))
+            .filter(|idx| idx.with_extension("promisor").exists())
+            .filter_map(|idx| open(&idx))
+            .flat_map(|file| file.iter().map(|e| e.oid).collect::<Vec<_>>())
+            .collect();
+        in_midx.sort();
+        in_midx.dedup();
+        out.extend(in_midx);
+
+        let Ok(entries) = std::fs::read_dir(&pack_dir) else { continue };
+        let mut packs: Vec<(PathBuf, Option<std::time::SystemTime>)> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("idx"))
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                !midx_names.iter().any(|m| m == name)
+            })
+            .filter(|p| p.with_extension("promisor").exists())
+            .map(|p| {
+                let mtime = std::fs::metadata(p.with_extension("pack")).and_then(|m| m.modified()).ok();
+                (p, mtime)
+            })
+            .collect();
+        // `sort_pack()` compares whole seconds (`st_mtime`); the sort is stable.
+        let seconds = |t: &Option<std::time::SystemTime>| {
+            t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs())
+        };
+        packs.sort_by(|a, b| seconds(&b.1).cmp(&seconds(&a.1)));
+        for (idx, _) in packs {
+            if let Some(file) = open(&idx) {
+                out.extend(file.iter().map(|e| e.oid));
+            }
+        }
+    }
+    out
 }
 
 /// The option conflicts stock git rejects before it does any work, in git's own

@@ -91,6 +91,17 @@ pub fn khash_order(ids: &[ObjectId]) -> Vec<ObjectId> {
     table.keys.into_iter().flatten().collect()
 }
 
+/// [`khash_order`] for an `oidset` that starts as `OIDSET_INIT` — no buckets at
+/// all, so the first `kh_put` resizes to khash's floor of four and the table
+/// doubles from there.
+pub fn oidset_init_order(ids: &[ObjectId]) -> Vec<ObjectId> {
+    let mut table = KHash::with_capacity(0);
+    for id in ids {
+        table.insert(*id);
+    }
+    table.keys.into_iter().flatten().collect()
+}
+
 /// khash's `__ac_HASH_UPPER`.
 const KHASH_UPPER: f64 = 0.77;
 

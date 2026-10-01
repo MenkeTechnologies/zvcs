@@ -1449,7 +1449,24 @@ fn pick_one(
                     // `if (res)` path whatever produced the conflict — the
                     // external `git merge-<strategy>` child included.
                     super::rerere::repo_rerere(&repo, opts.rerere_auto)?;
-                    return Ok(PickOutcome::Stopped(ExitCode::from(res)));
+                    // 2.56 folds every status but a conflict into an error:
+                    //
+                    // ```c
+                    // if (res && res != 1)
+                    //         res = -1;
+                    // ```
+                    //
+                    // (sequencer.c:2488-2494), which `do_pick_commit()` returns as
+                    // `PICK_RESULT_ERROR`, `single_pick()`/`pick_one_commit()` as
+                    // -1, and `cmd_cherry_pick()` turns into `die(_("cherry-pick
+                    // failed"))` (builtin/revert.c:315-316). A child that could not
+                    // merge at all — `git-merge-resolve` refusing an `-X` it does
+                    // not know exits 2 — therefore ends the command with 128 where
+                    // 2.55 passed the child's 2 through.
+                    if res != 1 {
+                        return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+                    }
+                    return Ok(PickOutcome::Stopped(ExitCode::from(1)));
                 }
             }
             // The child wrote the result into the index and the worktree;

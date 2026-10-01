@@ -256,7 +256,17 @@ fn prepare_to_write_split_index(file: &mut File) -> Saved {
         if entry.flags.contains(entry::Flags::REMOVE) {
             continue;
         }
-        let Some(pos) = si.position_of(entry.path_in(backing), entry.flags.stage()) else {
+        // A base entry the previous split write deleted is no candidate. git marks it
+        // `CE_REMOVE` while merging the halves (`mark_entry_for_delete()`,
+        // split-index.c:126-134) and drops it from `istate->cache[]`, so no entry in the
+        // index carries its `ce->index` any more: an entry at the same path is one staged
+        // since — `rm --cached` then `checkout HEAD -- <path>` — and has `ce->index == 0`.
+        // Matching it by path made it neither a stand-in (its content equals the deleted
+        // one's) nor appended, while the delete bit stayed set, so the write lost it.
+        let Some(pos) = si
+            .position_of(entry.path_in(backing), entry.flags.stage())
+            .filter(|&pos| !si.base[pos].removed)
+        else {
             // `if (!ce->index) … continue;` then `entries[nr_entries++] = ce;` — an entry
             // the shared half does not hold is written whole into the split half.
             appended.push(entry.clone());

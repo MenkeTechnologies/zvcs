@@ -1187,6 +1187,17 @@ fn get_default_remote(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     };
 
+    // `get_default_remote_submodule()`'s "Look up by URL first": a remote of
+    // the submodule that carries its `.gitmodules` url wins outright.
+    let repo = crate::setup::discover()?;
+    let module_path = prefixed_path(&repo, path)?;
+    if let Some(name) =
+        super::submodule::remote_for_submodule_url(&repo, module_path.as_bytes().as_bstr(), &sub)?
+    {
+        println!("{name}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // `repo_get_default_remote`: a symref into `refs/heads/` consults
     // `branch.<name>.remote`; everything else (detached HEAD) is `origin`.
     let head = sub.head()?;

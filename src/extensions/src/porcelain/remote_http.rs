@@ -274,9 +274,13 @@ fn remote_url(name: &str) -> Vec<u8> {
         .strings_by("remote", name, "url")
         .and_then(|urls| urls.into_iter().next());
     let url: BString = configured.unwrap_or_else(|| name.into());
+    alias_url(file, url.as_ref()).into()
+}
 
-    // alias_url(): among all url.<base>.insteadOf values that prefix the URL,
-    // the longest one wins and is replaced by its <base>.
+/// remote.c's `alias_url()`: among all `url.<base>.insteadOf` values that
+/// prefix `url`, the longest one wins and is replaced by its `<base>`; with no
+/// match `url` comes back unchanged.
+pub(crate) fn alias_url(file: &gix::config::File, url: &BStr) -> BString {
     let mut best: Option<(BString, usize)> = None;
     if let Some(sections) = file.sections_by_name("url") {
         for section in sections {
@@ -294,12 +298,11 @@ fn remote_url(name: &str) -> Vec<u8> {
     }
 
     match best {
-        Some((base, len)) => {
-            let mut out: Vec<u8> = base.into();
-            out.extend_from_slice(&url[len..]);
-            out
+        Some((mut base, len)) => {
+            base.extend_from_slice(&url[len..]);
+            base
         }
-        None => url.into(),
+        None => url.to_owned(),
     }
 }
 

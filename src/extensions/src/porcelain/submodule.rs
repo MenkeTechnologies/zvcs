@@ -1875,7 +1875,7 @@ fn sync_one(
     };
 
     // Rewrite `remote.<default-remote>.url` in the submodule's own config.
-    let remote = BString::from(default_remote(&sub_repo)?);
+    let remote = BString::from(default_remote_submodule(repo, path.as_bstr(), &sub_repo)?);
     let sub_config_path = sub_repo.common_dir().join("config");
     {
         let _sub_lock = crate::lock::RepoLock::acquire(sub_repo.git_dir());
@@ -1967,6 +1967,92 @@ fn default_remote(repo: &gix::Repository) -> Result<String> {
     Ok(match configured {
         Some(v) => v.to_str_lossy().into_owned(),
         None => "origin".to_string(),
+    })
+}
+
+/// git's `get_default_remote_submodule()` (builtin/submodule--helper.c:77-119)
+/// once `repo_submodule_init()` has opened `sub_repo`: the submodule's
+/// `.gitmodules` url — resolved against the superproject when it starts with
+/// `./` or `../` — is looked up among the submodule's own remotes first
+/// (`repo_remote_from_url()`), and only when none carries it does
+/// `repo_get_default_remote()` decide.
+fn default_remote_submodule(
+    super_repo: &gix::Repository,
+    module_path: &BStr,
+    sub_repo: &gix::Repository,
+) -> Result<String> {
+    match remote_for_submodule_url(super_repo, module_path, sub_repo)? {
+        Some(name) => Ok(name),
+        None => default_remote(sub_repo),
+    }
+}
+
+/// The "Look up by URL first" half of [`default_remote_submodule`]: the remote
+/// of `sub_repo` that carries the submodule's `.gitmodules` url, if any.
+pub(crate) fn remote_for_submodule_url(
+    super_repo: &gix::Repository,
+    module_path: &BStr,
+    sub_repo: &gix::Repository,
+) -> Result<Option<String>> {
+    // `submodule_from_path(the_repository, null_oid(), module_path)->url`.
+    let url = read_gitmodules(super_repo).and_then(|modules| {
+        let name = modules.sections_by_name("submodule")?.find_map(|section| {
+            let path = section.value("path")?;
+            (path.as_bstr() == module_path)
+                .then(|| section.header().subsection_name().map(ToOwned::to_owned))
+                .flatten()
+        })?;
+        modules.string_by("submodule", Some(name.as_bstr()), "url")
+    });
+    // "Possibly a url relative to parent".
+    let url = match url {
+        Some(u) if u.starts_with(b"./") || u.starts_with(b"../") => {
+            Some(resolve_relative_url(super_repo, u.as_ref(), None, true)?)
+        }
+        other => other,
+    };
+    Ok(url.and_then(|url| remote_from_url(sub_repo, url.as_ref())))
+}
+
+/// remote.c's `repo_remote_from_url()` (remote.c:1840-1861): the first remote, in
+/// configuration order, one of whose `url`s is `url`.
+///
+/// Both sides are compared after `url.<base>.insteadOf` rewriting — the
+/// remote's urls by `alias_all_urls()` when the configuration was read, and
+/// `url` itself by `alias_url()` since 2.56 — so a `.gitmodules` url spelled
+/// with an alias still finds the remote configured with the expanded one.
+fn remote_from_url(repo: &gix::Repository, url: &BStr) -> Option<String> {
+    let snapshot = repo.config_snapshot();
+    let file = snapshot.plumbing();
+    let url = super::remote_http::alias_url(file, url);
+    // `remote_state->remotes`: one entry per remote name in the order its first
+    // `remote.<name>.*` key was read, its `url` values accumulated in order, an
+    // empty value clearing the list (`add_url()`, remote.c:75-81).
+    let mut remotes: Vec<(BString, Vec<BString>)> = Vec::new();
+    for section in file.sections_by_name("remote")? {
+        let Some(name) = section.header().subsection_name() else {
+            continue;
+        };
+        let idx = match remotes.iter().position(|(n, _)| n.as_bstr() == name) {
+            Some(idx) => idx,
+            None => {
+                remotes.push((name.to_owned(), Vec::new()));
+                remotes.len() - 1
+            }
+        };
+        for value in section.values("url") {
+            let urls = &mut remotes[idx].1;
+            if value.is_empty() {
+                urls.clear();
+            } else {
+                urls.push(value);
+            }
+        }
+    }
+    remotes.into_iter().find_map(|(name, urls)| {
+        urls.iter()
+            .any(|u| super::remote_http::alias_url(file, u.as_ref()) == url)
+            .then(|| name.to_str_lossy().into_owned())
     })
 }
 
@@ -3111,7 +3197,17 @@ fn update_repo(
         let subforce = suboid.is_none() || opts.force;
         if Some(oid) != suboid || opts.force {
             let code =
-                run_update_procedure(&sub_repo, sm_dir, &oid, opts, display, strategy, subforce)?;
+                run_update_procedure(
+                    &repo,
+                    entry.path.as_bstr(),
+                    &sub_repo,
+                    sm_dir,
+                    &oid,
+                    opts,
+                    display,
+                    strategy,
+                    subforce,
+                )?;
             if code != 0 {
                 return Ok(code);
             }
@@ -3317,7 +3413,10 @@ fn warn_missing(warn: bool, display: &str) {
 /// is not already reachable, then run the chosen integration strategy (checkout,
 /// merge, or rebase). `subforce` is git's `is_null_oid(suboid) || force`, computed
 /// by the caller (a just-cloned submodule has a null `suboid`).
+#[allow(clippy::too_many_arguments)]
 fn run_update_procedure(
+    super_repo: &gix::Repository,
+    module_path: &BStr,
     sub_repo: &gix::Repository,
     sm_dir: &std::path::Path,
     oid: &ObjectId,
@@ -3341,7 +3440,7 @@ fn run_update_procedure(
         // The usual fetch may still not have brought in `oid`; try fetching it by
         // hash directly, and fail exactly as git does if that does not help.
         if !is_tip_reachable(sub_repo, oid)? {
-            let remote = default_remote(sub_repo)?;
+            let remote = default_remote_submodule(super_repo, module_path, sub_repo)?;
             if fetch_in_submodule(sm_dir, opts.quiet, Some((remote.as_str(), oid)))? != 0 {
                 eprintln!(
                     "fatal: Fetched in submodule path '{display}', but it did not contain {}. Direct fetching of that commit failed.",
@@ -3916,7 +4015,7 @@ fn resolve_remote_oid(
     sm_dir: &std::path::Path,
     opts: &UpdateOpts,
 ) -> Result<std::result::Result<ObjectId, u8>> {
-    let remote_name = default_remote(sub_repo)?;
+    let remote_name = default_remote_submodule(super_repo, entry.path.as_bstr(), sub_repo)?;
     let branch = match remote_submodule_branch(super_repo, sub)? {
         Ok(b) => b,
         Err(code) => return Ok(Err(code)),

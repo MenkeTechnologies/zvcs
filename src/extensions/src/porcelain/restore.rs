@@ -135,6 +135,73 @@ fn path_matches(path: &BStr, match_all: bool, specs: &super::log::PathspecMatche
     match_all || specs.matches(path.as_ref())
 }
 
+/// The stages of one unmerged `path` whose index entries get `CE_MATCHED`.
+///
+/// git matches *per entry*, and an unmerged path is two or three consecutive
+/// entries sharing one `ps_matched` array. `do_match_pathspec()` skips a
+/// wildcard-free item that has already matched exactly:
+///
+/// ```c
+/// if (seen && seen[i] == MATCHED_EXACTLY &&
+///     ps->items[i].nowildcard_len == ps->items[i].len)
+///         continue;
+/// ```
+///
+/// (dir.c:552-554.) That holds for exclusions as well, which
+/// `match_pathspec_with_flags()` consults only once an entry matched positively
+/// (dir.c:584-596). So the lowest stage spends a literal item naming the path: with
+/// `del` the later stages match only through some other item (a leading directory,
+/// a glob, `.`), and with `. ':!f'` the exclusion is spent on `f`'s first stage and
+/// its later stages match after all. gix's `MatchKind::Verbatim` is that
+/// `MATCHED_EXACTLY`. Each item is asked on its own, because git consults every
+/// item that is not spent; with no positive item, the implicit whole-tree item
+/// matches recursively and is never spent.
+fn matched_stages(
+    repo: &gix::Repository,
+    pathspecs: &[String],
+    path: &BStr,
+    stages: &[u32],
+) -> Result<Vec<u32>> {
+    use gix::pathspec::search::MatchKind;
+    let index = repo.index_or_empty()?;
+    let mut items = Vec::new();
+    for raw in pathspecs {
+        let ps = repo.pathspec(
+            true,
+            std::iter::once(BStr::new(raw.as_bytes())),
+            false,
+            &index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        items.push((super::ls_files::is_exclude_pathspec(raw), ps));
+    }
+    let any_positive = items.iter().any(|(exclude, _)| !exclude);
+    let mut spent = vec![false; items.len()];
+    let mut out = Vec::new();
+    for &stage in stages {
+        let mut hit = |want_exclude: bool, spent: &mut Vec<bool>| {
+            let mut any = false;
+            for (i, (exclude, ps)) in items.iter_mut().enumerate() {
+                if *exclude != want_exclude || spent[i] {
+                    continue;
+                }
+                if let Some(m) = ps.pattern_matching_relative_path(path, Some(false)) {
+                    if m.is_excluded() == want_exclude {
+                        any = true;
+                        spent[i] |= m.kind == MatchKind::Verbatim;
+                    }
+                }
+            }
+            any
+        };
+        let positive = hit(false, &mut spent) || !any_positive;
+        if positive && !hit(true, &mut spent) {
+            out.push(stage);
+        }
+    }
+    Ok(out)
+}
+
 /// Which unmerged stage a conflict-resolution flag selects.
 #[derive(Copy, Clone, PartialEq)]
 enum Pick {
@@ -865,14 +932,50 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let is_unmerged =
         |arr: &[Option<(ObjectId, Mode)>; 4]| arr[1].is_some() || arr[2].is_some() || arr[3].is_some();
 
-    // Matched unmerged paths (sorted for git-identical diagnostic ordering).
-    let mut unmerged_matched: Vec<BString> = Vec::new();
+    // Unmerged paths after `read_tree_some()`. One the source tree carries and the
+    // pathspec selects (`read_tree()` filters by the pathspec, set-wise) has had every
+    // stage replaced by the tree's stage-0 entry (`add_index_entry()`,
+    // read-cache.c:1273-1283): `overlaid`. Every other one keeps its stages, each
+    // `CE_MATCHED` on its own (`matched_stages()`) — except in overlay mode with a
+    // source tree, where an entry without `CE_UPDATE` is never matched
+    // (`mark_ce_for_checkout_overlay()`, builtin/checkout.c:394). `unmerged` maps
+    // each path with at least one matched stage to those stages, in index order.
+    let mut overlaid: HashSet<BString> = HashSet::new();
+    let mut unmerged: std::collections::BTreeMap<BString, Vec<u32>> = Default::default();
     for (p, arr) in &stage_blobs {
-        if is_unmerged(arr) && path_matches(BStr::new(p), match_all, &spec_set) {
-            unmerged_matched.push(p.clone());
+        if !is_unmerged(arr) {
+            continue;
+        }
+        let selected = path_matches(BStr::new(p), match_all, &spec_set);
+        if !source_is_index && selected && source_map.contains_key(p) {
+            overlaid.insert(p.clone());
+            continue;
+        }
+        if overlay && !source_is_index {
+            continue;
+        }
+        let stages: Vec<u32> = (1..=3u32).filter(|&s| arr[s as usize].is_some()).collect();
+        let matched = if match_all {
+            stages
+        } else {
+            matched_stages(&repo, &pathspecs, BStr::new(p), &stages)?
+        };
+        if !matched.is_empty() {
+            unmerged.insert(p.clone(), matched);
         }
     }
-    unmerged_matched.sort();
+    // The stages `checkout_paths()` sees from the first matched entry on: both
+    // `check_stage()`/`check_stages()` and `checkout_stage()`/`checkout_merged()` scan
+    // forward from that `pos` (builtin/checkout.c:257-345), so a stage before it does
+    // not exist for them.
+    let visible = |p: &BString| -> [Option<(ObjectId, Mode)>; 4] {
+        let mut arr = stage_blobs[p];
+        let first = unmerged[p][0] as usize;
+        for slot in arr.iter_mut().take(first) {
+            *slot = None;
+        }
+        arr
+    };
 
     // Validate every explicit pathspec matches something git knows about (the
     // union of source and index paths), mirroring git's pathspec error (exit 1).
@@ -918,12 +1021,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     }
 
     // "Any unmerged paths?" — `checkout_paths()`, builtin/checkout.c:662-682, run
-    // for every mode before anything is written. A source tree's stage-0 entry has
-    // already replaced every stage of its path (`add_index_entry()`,
-    // read-cache.c:1273-1283), so only matched unmerged paths the tree does not carry
-    // are left; in overlay mode those are not `CE_MATCHED` either
-    // (`mark_ce_for_checkout_overlay()`, builtin/checkout.c:394). Each remaining path
-    // is judged once, in index order:
+    // for every mode before anything is written. Each path in `unmerged` is judged
+    // once, at its first matched entry, in index order:
     //
     // ```c
     // if (opts->ignore_unmerged) {
@@ -939,11 +1038,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // }
     // ```
     let mut unmerged_errs = false;
-    for p in unmerged_matched
-        .iter()
-        .filter(|p| source_is_index || (!overlay && !source_map.contains_key(*p)))
-    {
-        let arr = &stage_blobs[p];
+    for p in unmerged.keys() {
+        let arr = visible(p);
         if ignore_unmerged {
             if !quiet {
                 eprintln!("warning: path '{p}' is unmerged");
@@ -979,8 +1075,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut resolved_entries: Vec<(BString, ObjectId, Mode)> = Vec::new();
     let mut resolved_remove: HashSet<BString> = HashSet::new();
     if conflict_mode {
-        for p in &unmerged_matched {
-            let arr = &stage_blobs[p];
+        for p in unmerged.keys() {
+            let arr = visible(p);
             if merge_active {
                 let (ours, theirs) = (arr[2], arr[3]);
                 if ours.is_none() && theirs.is_none() {
@@ -1059,6 +1155,20 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // collected here, because `checkout_paths()` invalidates exactly those and
     // repairs nothing (see the cache-tree note at the index write).
     let mut invalidated: Vec<BString> = Vec::new();
+
+    // Unmerged entries a no-overlay source tree did not replace — reachable only
+    // with `--ignore-unmerged`, the check above refuses them otherwise. Each matched
+    // entry gets `CE_REMOVE | CE_WT_REMOVE` (`mark_ce_for_checkout_no_overlay()`,
+    // builtin/checkout.c:428-436), but `checkout_worktree()` only hands stage-0
+    // entries to `checkout_entry()`, the one place `CE_WT_REMOVE` unlinks
+    // (builtin/checkout.c:466-470), so the worktree file stays; in the index only the
+    // matched stages go.
+    let stage_removals: HashMap<BString, Vec<u32>> = if source_is_index {
+        HashMap::new()
+    } else {
+        unmerged.iter().map(|(p, s)| (p.clone(), s.clone())).collect()
+    };
+
     if staged {
         // Resolve unmerged matched paths: drop all their stage entries so the
         // source (a tree) can re-add a single stage-0 entry below.
@@ -1066,10 +1176,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // In git the same thing happens inside `add_index_entry()`: a stage-0 entry
         // "will always replace all non-merged entries" (read-cache.c:1273-1283), and
         // the `cache_tree_invalidate_path()` at read-cache.c:1259-1260 has already run.
-        if !unmerged_matched.is_empty() {
-            let um: HashSet<BString> = unmerged_matched.iter().cloned().collect();
-            cur.remove_entries(|_, p, e| e.stage_raw() != 0 && um.contains(&p.to_owned()));
-            invalidated.extend(unmerged_matched.iter().cloned());
+        if !overlaid.is_empty() {
+            cur.remove_entries(|_, p, e| e.stage_raw() != 0 && overlaid.contains(&p.to_owned()));
+            invalidated.extend(overlaid.iter().cloned());
         }
         let mut need_sort = false;
         // Resolved once, up front. `add_index_entry()` keeps the index sorted at
@@ -1109,8 +1218,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        if !removals.is_empty() {
-            cur.remove_entries(|_, p, _| removals.contains(&p.to_owned()));
+        if !removals.is_empty() || !stage_removals.is_empty() {
+            cur.remove_entries(|_, p, e| {
+                let p = p.to_owned();
+                match stage_removals.get(&p) {
+                    Some(stages) => stages.contains(&e.stage_raw()),
+                    None => removals.contains(&p),
+                }
+            });
         }
         for (path, id, mode, flags, stat) in &inserts {
             cur.dangerously_push_entry(*stat, *id, *flags, *mode, BStr::new(path));
@@ -1127,6 +1242,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // `--source` tree was named, which is the only way an entry gets `CE_REMOVE`
     // here (builtin/checkout.c:430-436).
     invalidated.extend(removals.iter().cloned());
+    invalidated.extend(stage_removals.keys().cloned());
 
     // --- Apply worktree checkout -------------------------------------------
     let mut fresh_stats: HashMap<BString, Stat> = HashMap::new();
@@ -1154,7 +1270,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // removed the file) are applied regardless of overlay.
         let mut remove: Vec<BString> = resolved_remove.iter().cloned().collect();
         if !overlay {
-            remove.extend(removals.iter().cloned());
+            remove.extend(removals.iter().filter(|p| !stage_removals.contains_key(*p)).cloned());
         }
         // `checkout_worktree()`'s one pass over the index, writes and removals in
         // path order, attributes read from the whole index (`state.istate =

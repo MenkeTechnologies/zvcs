@@ -10,7 +10,9 @@
 //! ```c
 //! *new_branch = branchname;
 //! if (guess_remote) {
-//!         char *remote = unique_tracking_name(*new_branch, &oid, NULL);
+//!         remote = unique_tracking_name(*new_branch, &oid, &num_matches,
+//!                                       &matched_remote_names);
+//!         if (!remote && num_matches > 1) { … die(…); }
 //!         return remote;
 //! }
 //! ```
@@ -26,10 +28,11 @@
 //!
 //! * `--no-guess-remote` overrides the config back off — the CLI is `OPT_BOOL`, so
 //!   the negative spelling is a real value, not an absence.
-//! * An ambiguous name — two remotes carrying `<name>` — is a decline, not an
-//!   error: `unique_tracking_name()` returns `NULL` and the add proceeds from
-//!   `HEAD`, exit 0, no upstream. Both remotes here point at the *same* commit, so
-//!   nothing but the count of matching refs can make this fall back.
+//! * An ambiguous name — two remotes carrying `<name>` — is refused since git
+//!   2.56.0: `unique_tracking_name()` returns `NULL` with two matches, and
+//!   `dwim_branch()` lists the remotes and dies, exit 128, rather than proceeding
+//!   from `HEAD`. Both remotes here point at the *same* commit, so nothing but the
+//!   count of matching refs can make this refuse.
 //! * With the guess off, the same add starts at `HEAD` and writes no branch config
 //!   at all.
 //!
@@ -317,12 +320,14 @@ fn no_guess_remote_overrides_the_config() {
     }
 }
 
-/// Two remotes carrying `topic` make `unique_tracking_name()` decline. Both point
-/// at the same commit, so only the *number* of matching remote-tracking refs can
-/// explain the fallback — and the fallback is silent success from `HEAD`, not an
-/// "ambiguous" diagnostic.
+/// Two remotes carrying `topic`, with no `checkout.defaultRemote` to pick one, make
+/// `unique_tracking_name()` decline — and since git 2.56.0 `dwim_branch()` refuses
+/// on that (builtin/worktree.c:807-813) instead of falling back to `HEAD`: the
+/// remotes are listed in a hint, then `matched multiple (2)`, exit 128, and nothing
+/// is created. Both point at the same commit, so only the *number* of matching
+/// remote-tracking refs can explain the refusal.
 #[test]
-fn two_remotes_carrying_the_name_decline_and_fall_back_to_head() {
+fn two_remotes_carrying_the_name_are_refused() {
     let (root, dn) = fixture(BIN, "ambig");
     let up = root.join("up");
     ok(BIN, &dn, &["remote", "add", "other", up.to_str().unwrap()]);
@@ -334,16 +339,33 @@ fn two_remotes_carrying_the_name_decline_and_fall_back_to_head() {
     );
 
     let wt = root.join("topic");
-    let head = rev(BIN, &dn, "HEAD");
     let argv = add_argv(&["-c", "worktree.guessRemote=true"], wt.to_str().unwrap());
     let out = run(BIN, &dn, &argv);
 
-    assert_eq!(code(&out), 0, "ambiguity is a decline, not an error: {}", err(&out));
-    assert_eq!(err(&out), "Preparing worktree (new branch 'topic')\n");
-    assert!(!out_str(&out).contains("set up to track"), "stdout: {}", out_str(&out));
-    assert_eq!(rev(BIN, &dn, "refs/heads/topic"), head);
-    assert_eq!(config(BIN, &dn, "branch.topic.merge"), None);
-    assert_eq!(config(BIN, &dn, "branch.topic.remote"), None);
+    assert_eq!(code(&out), 128, "{}", err(&out));
+    assert_eq!(
+        err(&out),
+        format!(
+            "hint: Branch name 'topic' appears in multiple remotes:\n\
+             hint:   origin\n\
+             hint:   other\n\
+             hint: If you meant to create a worktree from a remote tracking branch on\n\
+             hint: <remote>, you can do so by:\n\
+             hint:\n\
+             hint:     git worktree add -b topic {} <remote>/topic\n\
+             hint:\n\
+             hint: If you'd like to always prefer some remote, e.g. 'origin',\n\
+             hint: consider setting checkout.defaultRemote=origin in your config.\n\
+             fatal: 'topic' matched multiple (2) remote tracking branches\n",
+            wt.display()
+        )
+    );
+    assert_eq!(out_str(&out), "");
+    assert!(
+        run(BIN, &dn, &["rev-parse", "--verify", "-q", "refs/heads/topic"]).status.code() != Some(0),
+        "no branch may be created"
+    );
+    assert!(!wt.exists(), "no worktree may be created");
 
     if let Some((sroot, sdn, sbin)) = stock_fixture("ambig") {
         let sup = sroot.join("up");
@@ -353,9 +375,11 @@ fn two_remotes_carrying_the_name_decline_and_fall_back_to_head() {
         let sout = run(sbin, &sdn, &add_argv(&["-c", "worktree.guessRemote=true"], swt.to_str().unwrap()));
         assert_eq!(code(&sout), code(&out));
         assert_eq!(out_str(&sout), out_str(&out), "stdout differs from stock");
-        assert_eq!(err(&sout), err(&out), "stderr differs from stock");
-        assert_eq!(rev(sbin, &sdn, "refs/heads/topic"), rev(BIN, &dn, "refs/heads/topic"));
-        assert_eq!(config(sbin, &sdn, "branch.topic.merge"), config(BIN, &dn, "branch.topic.merge"));
+        assert_eq!(
+            err(&sout).replace(swt.to_str().unwrap(), "<wt>"),
+            err(&out).replace(wt.to_str().unwrap(), "<wt>"),
+            "stderr differs from stock"
+        );
     }
 }
 

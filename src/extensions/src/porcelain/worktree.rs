@@ -2315,6 +2315,47 @@ fn add(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // ```c
+    // } else if (ac == 2 && new_branch) {
+    //         if (!strcmp(branch, "HEAD"))
+    //                 can_use_local_refs(&opts);
+    // } else if (ac == 2) {
+    //         commit = lookup_commit_reference_by_name(branch);
+    //         if (!commit) {
+    //                 remote = unique_tracking_name(branch, &oid, &num_matches,
+    //                                               &matched_remote_names);
+    //                 if (remote) {
+    //                         new_branch = branch;
+    //                         branch = new_branch_to_free = remote;
+    //                 } else if (num_matches > 1) {
+    //                         … advise_disambiguating_remotes(path, branch, …);
+    //                         die(_("'%s' matched multiple (%d) remote tracking branches"), …);
+    //                 }
+    //         }
+    // ```
+    //
+    // (git 2.56.0 builtin/worktree.c:928-956.) A `<commit-ish>` that names no commit
+    // but a branch on one remote becomes `-b <name> <remote-tracking ref>`, which the
+    // child `git branch` then sets up to track. 2.56 split off the `new_branch` arm:
+    // through 2.55 the guess also ran under an explicit `-b`/`-B` and replaced the
+    // name given there with the guessed one. Two remotes carrying it, with
+    // `checkout.defaultRemote` naming neither, is now refused rather than left to
+    // fail as `invalid reference`.
+    let remote_start = match commit_ish {
+        Some(spec) if new_branch.is_none() && !detach && !orphan && !names_a_commit(&repo, spec) => {
+            let found = unique_tracking_name(&repo, spec)?;
+            if found.dst.is_none() && found.remote_names.len() > 1 {
+                return Ok(ambiguous_remote_branch(&repo, quiet, path_arg, spec, &found.remote_names));
+            }
+            found.dst
+        }
+        _ => None,
+    };
+    let (new_branch, commit_ish) = match (remote_start.as_deref(), commit_ish) {
+        (Some(dst), Some(spec)) => (Some(spec.to_owned()), Some(dst)),
+        _ => (new_branch, commit_ish),
+    };
+
     // `dwim_branch()` (builtin/worktree.c:765-778) hands back the basename itself when
     // `refs/heads/<basename>` exists, and `add()` makes it `branch` (worktree.c:890-892): every
     // later `lookup_commit_reference_by_name(branch)` asks about that name, not `HEAD`.
@@ -2339,29 +2380,43 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // ```c
     // *new_branch = branchname;
     // if (guess_remote) {
-    //         char *remote = unique_tracking_name(*new_branch, &oid, NULL);
+    //         remote = unique_tracking_name(*new_branch, &oid, &num_matches,
+    //                                       &matched_remote_names);
+    //         if (!remote && num_matches > 1) {
+    //                 … advise_disambiguating_remotes(path, *new_branch, …);
+    //                 die(_("'%s' matched multiple (%d) remote tracking branches"), …);
+    //         }
     //         return remote;
     // }
     // ```
     //
-    // The setting only reaches this one decision. It cannot move an explicit
-    // `<commit-ish>` (worktree.c:900-912 DWIMs that one unconditionally) and it
-    // cannot apply once `-b` named the branch.
+    // (git 2.56.0 builtin/worktree.c:798-818.) The setting only reaches this one
+    // decision. It cannot move an explicit `<commit-ish>` (the `ac == 2` arm above
+    // guesses unconditionally) and it cannot apply once `-b` named the branch, or
+    // under `--orphan`, whose arm comes first in `add()`'s chain.
     let guess_remote = guess_remote.unwrap_or_else(|| {
         repo.config_snapshot().boolean("worktree.guessRemote").unwrap_or(false)
     });
-    let guessed_start = (guess_remote
+    let guessed_start = if guess_remote
         && commit_ish.is_none()
         && new_branch.is_none()
         && !detach
+        && !orphan
         && !dwim_name.is_empty()
         && repo
             .try_find_reference(format!("refs/heads/{dwim_name}").as_str())
             .ok()
             .flatten()
-            .is_none())
-    .then(|| unique_tracking_name(&repo, &dwim_name))
-    .flatten();
+            .is_none()
+    {
+        let found = unique_tracking_name(&repo, &dwim_name)?;
+        if found.dst.is_none() && found.remote_names.len() > 1 {
+            return Ok(ambiguous_remote_branch(&repo, quiet, path_arg, &dwim_name, &found.remote_names));
+        }
+        found.dst
+    } else {
+        None
+    };
 
     // worktree.c:877-912, `add()`'s DWIM chain. Every arm that can end up with no
     // start point consults `can_use_local_refs()` — the two `ac < 2` arms through
@@ -2941,66 +2996,136 @@ fn can_use_local_refs(repo: &gix::Repository, quiet: bool) -> Result<bool> {
     Ok(false)
 }
 
-/// Which of `<commit-ish>`, `-b`/`-B` and the DWIM branch this add starts from.
-/// `unique_tracking_name()` (remote.c): the one remote-tracking ref that
-/// `refs/heads/<name>` would be fetched into, or `None` when no remote or more
-/// than one remote offers it.
-///
-/// git runs each remote's *fetch refspecs* over `refs/heads/<name>`
-/// (`check_tracking_name()` → `refspec_find_match()`) and keeps the destination
-/// only if that ref exists, so the answer follows a rewritten refspec rather
-/// than assuming `refs/remotes/<remote>/<name>`. The same src-side match is done
-/// here, mirroring the dst-side one [`super::branch`] already uses: a `*` in the
-/// source matches by prefix and suffix, and whatever it captured is substituted
-/// into the destination's `*`.
-///
-/// Ambiguity is a decline, not an error — two remotes carrying the branch leaves
-/// `worktree add` starting from `HEAD`, which is what git does with the `NULL`
-/// this returns.
-fn unique_tracking_name(repo: &gix::Repository, name: &str) -> Option<String> {
-    let src_ref = format!("refs/heads/{name}");
-    let mut found: Option<String> = None;
-    for remote_name in repo.remote_names() {
-        let Ok(remote) = repo.find_remote(&*remote_name) else { continue };
-        for spec in remote.refspecs(gix::remote::Direction::Fetch) {
-            let gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::AndUpdate {
-                src,
-                dst,
-                ..
-            }) = spec.to_ref().instruction()
-            else {
-                continue;
-            };
-            let (src, dst) = (src.to_str_lossy().into_owned(), dst.to_str_lossy().into_owned());
-            let candidate = match src.split_once('*') {
-                Some((prefix, suffix)) => {
-                    let matched = src_ref
-                        .strip_prefix(prefix)
-                        .and_then(|rest| rest.strip_suffix(suffix))
-                        .filter(|_| src_ref.len() >= prefix.len() + suffix.len())?;
-                    match dst.split_once('*') {
-                        Some((dp, ds)) => format!("{dp}{matched}{ds}"),
-                        None => dst.clone(),
-                    }
-                }
-                None if src == src_ref => dst.clone(),
-                None => continue,
-            };
-            if repo.try_find_reference(candidate.as_str()).ok().flatten().is_none() {
-                continue;
-            }
-            match &found {
-                // A second remote offering the same branch is ambiguous, and
-                // git's DWIM gives up rather than choosing.
-                Some(existing) if *existing != candidate => return None,
-                Some(_) => {}
-                None => found = Some(candidate),
-            }
-        }
-    }
-    found
+/// What `unique_tracking_name()` (git 2.56.0 checkout.c:54-84) found for a name.
+struct TrackingName {
+    /// The remote-tracking ref to start from: the one match, or the
+    /// `checkout.defaultRemote` match among several. `None` otherwise.
+    dst: Option<String>,
+    /// `dwim_remote_names`: every remote that has the branch, in
+    /// `for_each_remote()` order. Its length is `dwim_remotes_matched`.
+    remote_names: Vec<String>,
 }
 
+/// `unique_tracking_name()` (git 2.56.0 checkout.c:54-84) with
+/// `check_tracking_name()` (checkout.c:26-52): the remote-tracking ref that
+/// `refs/heads/<name>` would be fetched into, asked of every remote.
+///
+/// `remote_find_tracking()` runs the remote's *fetch refspecs* over
+/// `refs/heads/<name>` and takes the first one that maps it, so the answer
+/// follows a rewritten refspec rather than assuming `refs/remotes/<remote>/<name>`;
+/// a negative refspec that matches the source leaves that remote out. A `*` in
+/// the source matches by prefix and suffix, and whatever it captured is substituted
+/// into the destination's `*`. A remote counts only once that destination resolves.
+fn unique_tracking_name(repo: &gix::Repository, name: &str) -> Result<TrackingName> {
+    // `repo_config_get_string_tmp(…, "checkout.defaultremote", …)`, read before any
+    // remote is looked at.
+    let default_remote = crate::config::config_get_string(Some(repo), "checkout.defaultremote");
+    let src_ref = format!("refs/heads/{name}");
+    let glob_match = |pattern: &str| -> Option<String> {
+        match pattern.split_once('*') {
+            Some((prefix, suffix)) => src_ref
+                .strip_prefix(prefix)
+                .and_then(|rest| rest.strip_suffix(suffix))
+                .filter(|_| src_ref.len() >= prefix.len() + suffix.len())
+                .map(str::to_owned),
+            None => (pattern == src_ref).then(String::new),
+        }
+    };
+
+    let mut first_dst: Option<String> = None;
+    let mut default_dst: Option<String> = None;
+    let mut remote_names = Vec::new();
+    for remote_name in super::fetch::remotes_in_config_order(repo) {
+        let Ok(remote) = repo.find_remote(remote_name.as_str()) else { continue };
+        let mut dst_ref: Option<String> = None;
+        let mut excluded = false;
+        for spec in remote.refspecs(gix::remote::Direction::Fetch) {
+            match spec.to_ref().instruction() {
+                gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::Exclude { src }) => {
+                    if glob_match(&src.to_str_lossy()).is_some() {
+                        excluded = true;
+                    }
+                }
+                gix::refspec::Instruction::Fetch(gix::refspec::instruction::Fetch::AndUpdate {
+                    src,
+                    dst,
+                    ..
+                }) if dst_ref.is_none() => {
+                    let (src, dst) = (src.to_str_lossy(), dst.to_str_lossy());
+                    if let Some(matched) = glob_match(&src) {
+                        dst_ref = Some(match dst.split_once('*') {
+                            Some((dp, ds)) => format!("{dp}{matched}{ds}"),
+                            None => dst.into_owned(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(dst_ref) = dst_ref.filter(|_| !excluded) else { continue };
+        if repo.rev_parse_single(dst_ref.as_str()).is_err() {
+            continue;
+        }
+        if default_remote.as_deref() == Some(remote_name.as_str()) {
+            default_dst = Some(dst_ref.clone());
+        }
+        remote_names.push(remote_name);
+        first_dst.get_or_insert(dst_ref);
+    }
+    let dst = if remote_names.len() == 1 { first_dst } else { default_dst };
+    Ok(TrackingName { dst, remote_names })
+}
+
+/// The `die()` `add()` and `dwim_branch()` end on once `unique_tracking_name()`
+/// found the branch on more than one remote and `checkout.defaultRemote` named
+/// none of them (git 2.56.0 builtin/worktree.c:807-813, :946-953): the
+/// `advise_disambiguating_remotes()` block unless `--quiet` or the advice is off,
+/// then the count.
+fn ambiguous_remote_branch(
+    repo: &gix::Repository,
+    quiet: bool,
+    path_arg: &str,
+    branch: &str,
+    remote_names: &[String],
+) -> ExitCode {
+    if !quiet {
+        // `advise_disambiguating_remotes()` (git 2.56.0 builtin/worktree.c:766-783),
+        // `git worktree`'s own wording of the block `parse_remote_branch()` prints for
+        // `checkout` and `switch`: `advice_enabled()` is checked by the caller and each
+        // part goes through plain `advise()`, so there is no `Disable this message`
+        // trailer, and one `advise()` over the joined parts splits into the same
+        // `hint:` lines.
+        let path = crate::setup::prefix_filename(crate::setup::startup_prefix(repo).as_deref(), path_arg);
+        let mut body = format!("Branch name '{branch}' appears in multiple remotes:\n");
+        for remote in remote_names {
+            body.push_str(&format!("  {remote}\n"));
+        }
+        body.push_str(&format!(
+            "If you meant to create a worktree from a remote tracking branch on\n\
+             <remote>, you can do so by:\n\
+             \n\
+             \x20   git worktree add -b {branch} {path} <remote>/{branch}\n\
+             \n\
+             If you'd like to always prefer some remote, e.g. 'origin',\n\
+             consider setting checkout.defaultRemote=origin in your config."
+        ));
+        crate::advice::Advice::CheckoutAmbiguousRemoteBranchName.advise_plain_in(repo, &body);
+    }
+    eprintln!("fatal: '{branch}' matched multiple ({}) remote tracking branches", remote_names.len());
+    ExitCode::from(128)
+}
+
+/// `lookup_commit_reference_by_name()`: whether `spec` resolves, through any tags, to
+/// a commit.
+fn names_a_commit(repo: &gix::Repository, spec: &str) -> bool {
+    repo.rev_parse_single(spec)
+        .ok()
+        .and_then(|id| id.object().ok())
+        .and_then(|object| object.peel_to_commit().ok())
+        .is_some()
+}
+
+/// Which of `<commit-ish>`, `-b`/`-B` and the DWIM branch this add starts from.
 fn resolve_start(
     repo: &gix::Repository,
     new_branch: Option<&str>,

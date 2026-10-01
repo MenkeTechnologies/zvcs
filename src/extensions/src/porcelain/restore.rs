@@ -380,6 +380,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let mut merge_flag = false;
     let mut conflict_style: Option<ConflictStyle> = None;
     let mut ignore_unmerged = false;
+    let mut quiet = false;
     let mut pathspec_from_file: Option<String> = None;
     let mut pathspec_file_nul = false;
     let mut ignore_skip_worktree = false;
@@ -529,9 +530,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
-            // Accepted no-ops: quiet/progress/default no-recurse/diff-context knobs
-            // (context knobs only affect interactive `--patch`, unsupported here).
-            "-q" | "--quiet" | "--no-quiet" | "--progress" | "--no-progress" => {}
+            // `--quiet` only silences the `--ignore-unmerged` warnings (builtin/checkout.c:669);
+            // progress has nothing to report for a path restore.
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "--progress" | "--no-progress" => {}
             // ```c
             // if (!opts->ignore_skipworktree && ce_skip_worktree(ce))
             //         return;
@@ -914,20 +917,61 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // Unmerged handling for the pure worktree-from-index restore: without a
-    // conflict-resolution flag such a path is an error (exit 1), unless
-    // `--ignore-unmerged` downgrades it to a skipped warning.
-    if source_is_index && worktree && !conflict_mode && !unmerged_matched.is_empty() {
+    // "Any unmerged paths?" — `checkout_paths()`, builtin/checkout.c:662-682, run
+    // for every mode before anything is written. A source tree's stage-0 entry has
+    // already replaced every stage of its path (`add_index_entry()`,
+    // read-cache.c:1273-1283), so only matched unmerged paths the tree does not carry
+    // are left; in overlay mode those are not `CE_MATCHED` either
+    // (`mark_ce_for_checkout_overlay()`, builtin/checkout.c:394). Each remaining path
+    // is judged once, in index order:
+    //
+    // ```c
+    // if (opts->ignore_unmerged) {
+    //         if (!opts->quiet)
+    //                 warning(_("path '%s' is unmerged"), ce->name);
+    // } else if (opts->writeout_stage) {
+    //         errs |= check_stage(opts->writeout_stage, ce, pos, opts->overlay_mode);
+    // } else if (opts->merge) {
+    //         errs |= check_stages((1<<2) | (1<<3), ce, pos);
+    // } else {
+    //         errs = 1;
+    //         error(_("path '%s' is unmerged"), ce->name);
+    // }
+    // ```
+    let mut unmerged_errs = false;
+    for p in unmerged_matched
+        .iter()
+        .filter(|p| source_is_index || (!overlay && !source_map.contains_key(*p)))
+    {
+        let arr = &stage_blobs[p];
         if ignore_unmerged {
-            for p in &unmerged_matched {
+            if !quiet {
                 eprintln!("warning: path '{p}' is unmerged");
             }
-        } else {
-            for p in &unmerged_matched {
-                eprintln!("error: path '{p}' is unmerged");
+        } else if let Some(pick) = pick {
+            // `check_stage()` (builtin/checkout.c:257-272): a missing side is only an
+            // error in overlay mode; without it `checkout_stage()` unlinks the path.
+            let (stage, whose) = match pick {
+                Pick::Ours => (2, "our"),
+                Pick::Theirs => (3, "their"),
+            };
+            if overlay && arr[stage].is_none() {
+                eprintln!("error: path '{p}' does not have {whose} version");
+                unmerged_errs = true;
             }
-            return Ok(ExitCode::from(1));
+        } else if merge_active {
+            // `check_stages()` (builtin/checkout.c:274-290).
+            if arr[2].is_none() || arr[3].is_none() {
+                eprintln!("error: path '{p}' does not have all necessary versions");
+                unmerged_errs = true;
+            }
+        } else {
+            eprintln!("error: path '{p}' is unmerged");
+            unmerged_errs = true;
         }
+    }
+    if unmerged_errs {
+        return Ok(ExitCode::from(1));
     }
 
     // Conflict-resolution targets for the worktree: the resolved stage-0 blob

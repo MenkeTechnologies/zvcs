@@ -34,6 +34,7 @@ impl Cache {
         }: StageOne,
         git_dir: &std::path::Path,
         branch_name: Option<&gix_ref::FullNameRef>,
+        work_tree: Option<&std::path::Path>,
         filter_config_section: fn(&gix_config::file::Metadata) -> bool,
         git_install_dir: Option<&std::path::Path>,
         home: Option<&std::path::Path>,
@@ -66,6 +67,7 @@ impl Cache {
                     gix_config::file::includes::conditional::Context {
                         git_dir: git_dir.into(),
                         branch_name,
+                        work_tree,
                     },
                 )
             } else {

@@ -2742,17 +2742,19 @@ impl RepositoryDirs {
     }
 }
 
-/// `include_condition_is_true()` (config.c:396-414) for an `includeIf.<cond>.path`
+/// `include_condition_is_true()` (config.c:393-417, git 2.56) for an `includeIf.<cond>.path`
 /// read from the command line, which `do_git_config_sequence()` evaluates against
 /// the repository setup found (`opts->git_dir`, `data->repo`). Located without
 /// opening the repository: opening reads this very configuration.
 ///
-/// * `gitdir:` / `gitdir/i:` — `include_by_gitdir()` (:238-295): the pattern is
+/// * `gitdir:` / `gitdir/i:` — `include_by_path()` (:238-292): the pattern is
 ///   `~`-expanded, made `**/`-relative unless absolute, `**`-completed when it
 ///   names a directory, and wildmatched with `WM_PATHNAME` against the realpath
 ///   of the git directory, then against its plain absolute path. A `./` pattern
 ///   is `prepare_include_condition_pattern()`'s own error (:214-219), the `Err`:
 ///   a command-line value has no file for it to be relative to.
+/// * `worktree:` / `worktree/i:` — the same `include_by_path()` against the work
+///   tree (git 2.56); a bare repository has none, which is false.
 /// * `onbranch:` — `include_by_branch()` (:297-320): the short name of the branch
 ///   `HEAD` points at, same pattern completion, `WM_PATHNAME`.
 /// * `hasconfig:remote.*.url:` — `include_by_remote_url()` (:385-394) has to
@@ -2776,8 +2778,10 @@ pub(crate) fn command_line_include_condition(cond: &str) -> Result<bool, String>
         }
         gix::glob::wildmatch(pattern.into(), text.to_string_lossy().as_ref().into(), mode)
     };
-    let gitdir = |pattern: &str, icase: bool| {
-        let Some(dirs) = repository_directories() else { return Ok(false) };
+    // `include_by_path()` (:238-292) against the git directory or, for `worktree:`
+    // (git 2.56, :403-408), `repo_get_work_tree()`.
+    let by_path = |path: Option<PathBuf>, pattern: &str, icase: bool| {
+        let Some(path) = path else { return Ok(false) };
         let expanded = crate::setup::interpolate_path(pattern)
             .map_or_else(|| pattern.to_owned(), |p| p.to_string_lossy().into_owned());
         if expanded.starts_with("./") {
@@ -2787,14 +2791,29 @@ pub(crate) fn command_line_include_condition(cond: &str) -> Result<bool, String>
             true => complete(expanded),
             false => complete(format!("**/{expanded}")),
         };
-        let absolute = std::path::absolute(&dirs.git_dir).unwrap_or_else(|_| dirs.git_dir.clone());
-        Ok(matches(&pattern, &crate::setup::realpath(&dirs.git_dir), icase) || matches(&pattern, &absolute, icase))
+        let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+        Ok(matches(&pattern, &crate::setup::realpath(&path), icase) || matches(&pattern, &absolute, icase))
     };
-    if let Some(pattern) = cond.strip_prefix("gitdir:") {
-        return gitdir(pattern, false);
+    let git_dir = || repository_directories().map(|dirs| dirs.git_dir);
+    // Setup gives a repository named by `$GIT_DIR` alone the current directory as
+    // its work tree (`setup_explicit_git_dir()`), unless `core.bare` or
+    // `core.worktree` say otherwise — which is not read here.
+    let work_tree = || {
+        repository_directories().and_then(|dirs| match (dirs.work_tree, dirs.explicit) {
+            (Some(top), _) => Some(top),
+            (None, true) => std::env::current_dir().ok(),
+            (None, false) => None,
+        })
+    };
+    for (prefix, icase) in [("gitdir:", false), ("gitdir/i:", true)] {
+        if let Some(pattern) = cond.strip_prefix(prefix) {
+            return by_path(git_dir(), pattern, icase);
+        }
     }
-    if let Some(pattern) = cond.strip_prefix("gitdir/i:") {
-        return gitdir(pattern, true);
+    for (prefix, icase) in [("worktree:", false), ("worktree/i:", true)] {
+        if let Some(pattern) = cond.strip_prefix(prefix) {
+            return by_path(work_tree(), pattern, icase);
+        }
     }
     if let Some(pattern) = cond.strip_prefix("onbranch:") {
         let Some(dirs) = repository_directories() else { return Ok(false) };

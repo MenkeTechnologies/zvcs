@@ -174,6 +174,28 @@ fn include_condition_match(
             options,
             gix_glob::wildmatch::Mode::IGNORE_CASE,
         ),
+        // `include_condition_is_true()` (config.c:403-408, git 2.56): the same
+        // `include_by_path()` as `gitdir:`, against `repo_get_work_tree()`. No
+        // work tree is `if (!path) goto done`, false and never an error.
+        b"worktree" | b"worktree/i" => {
+            let Some(work_tree) = options.conditional.work_tree else {
+                return Ok(false);
+            };
+            let mode = if prefix == b"worktree/i" {
+                gix_glob::wildmatch::Mode::IGNORE_CASE
+            } else {
+                gix_glob::wildmatch::Mode::empty()
+            };
+            // `strbuf_add_absolute_path()` on a work tree git already holds as a clean
+            // absolute path; a relative one here (`..` from a subdirectory) has to be
+            // made absolute and have its `..` resolved before it is matched.
+            let absolute = std::path::absolute(work_tree).unwrap_or_else(|_| work_tree.to_owned());
+            let work_tree = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| gix_path::normalize(absolute.as_path().into(), &cwd).map(std::borrow::Cow::into_owned))
+                .unwrap_or(absolute);
+            path_matches(condition, &work_tree, target_config_path, options, mode)
+        }
         b"onbranch" => Ok(onbranch_matches(condition, options.conditional).is_some()),
         b"hasconfig" => {
             let mut tokens = condition.splitn(2, |b| *b == b':');
@@ -233,8 +255,29 @@ fn onbranch_matches(
 fn gitdir_matches(
     condition_path: &BStr,
     target_config_path: Option<&Path>,
+    options: Options<'_>,
+    wildmatch_mode: gix_glob::wildmatch::Mode,
+) -> Result<bool, Error> {
+    let git_dir = options.conditional.git_dir;
+    if !options.err_on_interpolation_failure && git_dir.is_none() {
+        return Ok(false);
+    }
+    path_matches(
+        condition_path,
+        git_dir.ok_or(Error::MissingGitDir)?,
+        target_config_path,
+        options,
+        wildmatch_mode,
+    )
+}
+
+/// `include_by_path()` (config.c:238-292, git 2.56): the pattern of a `gitdir:` or
+/// `worktree:` condition matched against `path`, then against its realpath.
+fn path_matches(
+    condition_path: &BStr,
+    path: &Path,
+    target_config_path: Option<&Path>,
     Options {
-        conditional: conditional::Context { git_dir, .. },
         interpolate: context,
         err_on_interpolation_failure,
         err_on_missing_config_path,
@@ -242,10 +285,7 @@ fn gitdir_matches(
     }: Options<'_>,
     wildmatch_mode: gix_glob::wildmatch::Mode,
 ) -> Result<bool, Error> {
-    if !err_on_interpolation_failure && git_dir.is_none() {
-        return Ok(false);
-    }
-    let git_dir = gix_path::to_unix_separators_on_windows(gix_path::into_bstr(git_dir.ok_or(Error::MissingGitDir)?));
+    let path_text = gix_path::to_unix_separators_on_windows(gix_path::into_bstr(path));
 
     let mut pattern_path: BString = {
         let path = match check_interpolation_result(
@@ -295,15 +335,15 @@ fn gitdir_matches(
     }
 
     let match_mode = gix_glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL | wildmatch_mode;
-    let is_match = gix_glob::wildmatch(pattern_path.as_bstr(), git_dir.as_bstr(), match_mode);
+    let is_match = gix_glob::wildmatch(pattern_path.as_bstr(), path_text.as_bstr(), match_mode);
     if is_match {
         return Ok(true);
     }
 
-    let expanded_git_dir = gix_path::into_bstr(gix_path::realpath(gix_path::from_byte_slice(&git_dir))?);
+    let real_path = gix_path::into_bstr(gix_path::realpath(gix_path::from_byte_slice(&path_text))?);
     Ok(gix_glob::wildmatch(
         pattern_path.as_bstr(),
-        expanded_git_dir.as_bstr(),
+        real_path.as_bstr(),
         match_mode,
     ))
 }

@@ -122,6 +122,7 @@ impl File {
                 init::includes::conditional::Context {
                     git_dir: Some(git_dir.as_ref()),
                     branch_name: None,
+                    work_tree: None,
                 },
             ),
             ..Default::default()

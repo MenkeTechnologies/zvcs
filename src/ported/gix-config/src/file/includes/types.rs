@@ -133,5 +133,11 @@ pub mod conditional {
         ///
         /// Used for conditional includes, e.g. `includeIf.onbranch:main.…`
         pub branch_name: Option<&'a gix_ref::FullNameRef>,
+        /// The repository's work tree, `repo_get_work_tree()`. `None` for a bare
+        /// repository, or when no repository was found, makes every `worktree`
+        /// condition false.
+        ///
+        /// Used for conditional includes, e.g. `includeIf.worktree:…` or `includeIf.worktree/i:…`.
+        pub work_tree: Option<&'a std::path::Path>,
     }
 }

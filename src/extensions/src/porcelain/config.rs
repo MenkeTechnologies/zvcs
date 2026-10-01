@@ -1889,6 +1889,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 let conditional = gix::config::file::includes::conditional::Context {
                     git_dir: git_dir.as_deref(),
                     branch_name: branch_name.as_ref().map(|n| n.as_ref()),
+                    work_tree: repo.as_ref().and_then(|r| r.workdir()),
                 };
                 f.resolve_includes(gix::config::file::init::Options {
                     includes: gix::config::file::includes::Options::follow(
@@ -1951,6 +1952,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                         let conditional = gix::config::file::includes::conditional::Context {
                             git_dir: git_dir.as_deref(),
                             branch_name: branch_name.as_ref().map(|n| n.as_ref()),
+                            work_tree: repo.as_ref().and_then(|r| r.workdir()),
                         };
                         let opts = gix::config::file::init::Options {
                             includes: gix::config::file::includes::Options::follow(

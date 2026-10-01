@@ -321,6 +321,20 @@ impl ThreadSafeRepository {
         let home = gix_path::env::home_dir().and_then(|home| env.home.check_opt(home));
 
         let mut filter_config_section = filter_config_section.unwrap_or(config::section::is_trusted);
+        // `include_by_path()` for `worktree:` (config.c:403-408, git 2.56) matches
+        // `repo_get_work_tree()`, which git's setup settles before the configuration is
+        // read. Here `core.bare` and `core.worktree` from that same configuration still
+        // settle it, so the includes are first resolved against the work tree setup
+        // implies from the repository files alone, and again below if that changes.
+        let settle_inputs = SettleWorkTree {
+            implicit_work_tree,
+            current_dir,
+            git_dir: &git_dir,
+            work_tree_is_explicit,
+            worktree_config,
+        };
+        let include_work_tree = settle_work_tree(worktree_dir.clone(), false, &settle_inputs, repo_config.is_bare);
+        let config_permissions = config;
         let mut config = config::Cache::from_stage_one(
             repo_config,
             // `opts.git_dir = repo_get_git_dir(repo)` (config.c:1685): an `includeIf "gitdir:…"`
@@ -328,6 +342,7 @@ impl ThreadSafeRepository {
             // `worktrees/<name>` — never against the common directory.
             &git_dir,
             head.as_ref().and_then(|head| head.target.try_name()),
+            include_work_tree.as_deref(),
             filter_config_section,
             git_install_dir.as_deref(),
             home.as_deref(),
@@ -428,46 +443,37 @@ impl ThreadSafeRepository {
             false
         };
 
-        {
-            let looks_like_standard_git_dir =
-                || git_dir.file_name() == Some(OsStr::new(gix_discover::DOT_GIT_DIR));
-            // git's `setup_explicit_git_dir()` reaches `set_git_work_tree(repo, ".")` no matter what
-            // the git directory is called, while `setup_discovered_git_dir()` only ever pairs a
-            // `.git` directory with its parent.
-            let implied = match implicit_work_tree {
-                ImplicitWorkTree::None => None,
-                ImplicitWorkTree::CurrentDir => Some(current_dir.to_owned()),
-                ImplicitWorkTree::ParentOfDotGitDir => looks_like_standard_git_dir()
-                    .then(|| git_dir.parent().expect("parent is always available").to_owned()),
-            };
-            // Both `setup_discovered_git_dir()` (setup.c:1230-1242) and `setup_explicit_git_dir()`
-            // (setup.c:1144-1178) withhold the implied work tree only for `is_bare_repository_cfg > 0`;
-            // an unset `core.bare` gets one.
-            match worktree_dir {
-                None if implied.is_some() && config.is_bare != Some(true) => {
-                    worktree_dir = implied;
-                }
-                // We may assume that the presence of a worktree-dir means it's not bare, but only if there
-                // is no configuration saying otherwise.
-                // Thus, if we are here and the common-dir config claims it's bare, and we have inferred a worktree anyway,
-                // forget about it.
-                // A work tree named by `GIT_WORK_TREE` is not an inference and survives: git sets it
-                // in `setup_explicit_git_dir()` before it ever looks at `core.bare`, which is why
-                // `GIT_WORK_TREE=<dir> git ls-files -o` works from inside a bare repository.
-                // A linked worktree ignores `core.bare` only while `has_common` holds;
-                // `extensions.worktreeConfig` clears it (`setup.c:795-801`, v2.55.0).
-                Some(_)
-                    if !work_tree_is_explicit
-                        && !worktree_dir_override_from_configuration
-                        && (worktree_config
-                            || git_dir.ancestors().nth(1).and_then(|p| p.file_name())
-                                != Some("worktrees".as_ref()))
-                        && config.is_bare.unwrap_or_default() =>
-                {
-                    worktree_dir = None;
-                }
-                None | Some(_) => {}
-            }
+        worktree_dir = settle_work_tree(
+            worktree_dir,
+            worktree_dir_override_from_configuration,
+            &settle_inputs,
+            config.is_bare,
+        );
+        // `core.worktree` moved the work tree, or `core.bare` withdrew it, after the includes
+        // were resolved against the one setup implied: resolve them again against the work
+        // tree git's `repo_get_work_tree()` would answer by the time it reads them.
+        if worktree_dir != include_work_tree && config_permissions.includes {
+            config = config::Cache::from_stage_one(
+                config::cache::StageOne::new(
+                    common_dir.as_deref().unwrap_or(&git_dir),
+                    git_dir.as_ref(),
+                    *git_dir_trust,
+                    lossy_config,
+                    lenient_config,
+                )?,
+                &git_dir,
+                head.as_ref().and_then(|head| head.target.try_name()),
+                worktree_dir.as_deref(),
+                filter_config_section,
+                git_install_dir.as_deref(),
+                home.as_deref(),
+                *env,
+                attributes,
+                config_permissions,
+                lenient_config,
+                api_config_overrides,
+                cli_config_overrides,
+            )?;
         }
 
         // TODO: Testing - it's hard to get non-ownership reliably and without root.
@@ -807,4 +813,64 @@ fn check_safe_directories(
     } else {
         Err(Error::UnsafeGitDir { path: path_to_test })
     }
+}
+
+/// What [`settle_work_tree()`] reads besides the work tree and `core.bare`.
+struct SettleWorkTree<'a> {
+    implicit_work_tree: ImplicitWorkTree,
+    current_dir: &'a Path,
+    git_dir: &'a Path,
+    work_tree_is_explicit: bool,
+    worktree_config: bool,
+}
+
+/// The work tree setup ends up with: `worktree_dir` as discovered, named or taken from
+/// `core.worktree` (`overridden_by_config`), the implied one when there is none, and
+/// none for a repository `core.bare` (`is_bare`) declares bare.
+fn settle_work_tree(
+    mut worktree_dir: Option<std::path::PathBuf>,
+    overridden_by_config: bool,
+    inputs: &SettleWorkTree<'_>,
+    is_bare: Option<bool>,
+) -> Option<std::path::PathBuf> {
+    let git_dir = inputs.git_dir;
+    let looks_like_standard_git_dir = || git_dir.file_name() == Some(OsStr::new(gix_discover::DOT_GIT_DIR));
+    // git's `setup_explicit_git_dir()` reaches `set_git_work_tree(repo, ".")` no matter what
+    // the git directory is called, while `setup_discovered_git_dir()` only ever pairs a
+    // `.git` directory with its parent.
+    let implied = match inputs.implicit_work_tree {
+        ImplicitWorkTree::None => None,
+        ImplicitWorkTree::CurrentDir => Some(inputs.current_dir.to_owned()),
+        ImplicitWorkTree::ParentOfDotGitDir => {
+            looks_like_standard_git_dir().then(|| git_dir.parent().expect("parent is always available").to_owned())
+        }
+    };
+    // Both `setup_discovered_git_dir()` (setup.c:1230-1242) and `setup_explicit_git_dir()`
+    // (setup.c:1144-1178) withhold the implied work tree only for `is_bare_repository_cfg > 0`;
+    // an unset `core.bare` gets one.
+    match worktree_dir {
+        None if implied.is_some() && is_bare != Some(true) => {
+            worktree_dir = implied;
+        }
+        // We may assume that the presence of a worktree-dir means it's not bare, but only if there
+        // is no configuration saying otherwise.
+        // Thus, if we are here and the common-dir config claims it's bare, and we have inferred a worktree anyway,
+        // forget about it.
+        // A work tree named by `GIT_WORK_TREE` is not an inference and survives: git sets it
+        // in `setup_explicit_git_dir()` before it ever looks at `core.bare`, which is why
+        // `GIT_WORK_TREE=<dir> git ls-files -o` works from inside a bare repository.
+        // A linked worktree ignores `core.bare` only while `has_common` holds;
+        // `extensions.worktreeConfig` clears it (`setup.c:795-801`, v2.55.0).
+        Some(_)
+            if !inputs.work_tree_is_explicit
+                && !overridden_by_config
+                && (inputs.worktree_config
+                    || git_dir.ancestors().nth(1).and_then(|p| p.file_name()) != Some("worktrees".as_ref()))
+                && is_bare.unwrap_or_default() =>
+        {
+            worktree_dir = None;
+        }
+        None | Some(_) => {}
+    }
+    worktree_dir
 }

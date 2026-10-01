@@ -665,7 +665,7 @@ Diff rename options
     --no-renames          disable rename detection
     --[no-]rename-empty   use empty blobs as rename source
     --[no-]follow         continue listing the history of a file beyond renames
-    -l <n>                prevent rename/copy detection if the number of rename/copy targets exceeds given limit
+    -l <n>                limit to cheap rename/copy detection if the number of rename/copy targets exceeds this value
 
 Diff algorithm options
     --minimal             produce the smallest possible diff

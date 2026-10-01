@@ -1106,7 +1106,26 @@ fn sign_buffer_gpg(payload: &[u8], program: &str, key: &str) -> Result<Vec<u8>, 
     if !out.status.success() || !created {
         return Err(fail(&out.stderr));
     }
-    Ok(out.stdout)
+    // `strip_cr_before_lf(signature, bottom)` (gpg-interface.c:1049-1050).
+    let mut signature = out.stdout;
+    strip_cr_before_lf(&mut signature);
+    Ok(signature)
+}
+
+/// `strip_cr_before_lf()` (gpg-interface.c:993-1006, v2.56.0): drop each CR that
+/// immediately precedes an LF, in case the signer runs on Windows. A CR anywhere
+/// else is part of the signature and stays. 2.55's `remove_cr_after()` dropped
+/// every CR; this port dropped none.
+fn strip_cr_before_lf(buffer: &mut Vec<u8>) {
+    let mut j = 0;
+    for i in 0..buffer.len() {
+        if buffer[i] == b'\r' && buffer.get(i + 1) == Some(&b'\n') {
+            continue;
+        }
+        buffer[j] = buffer[i];
+        j += 1;
+    }
+    buffer.truncate(j);
 }
 
 /// The status line `sign_buffer_gpg()` searches for, which must start a line.
@@ -1561,13 +1580,20 @@ fn sign_buffer_ssh(
         None => Err(SignFailure::Error(String::new())),
         Some(out) if !out.status.success() => Err(relay(&out.stderr)),
         // `error_errno`, so the reason is `strerror(errno)` with no ` (os error N)`.
-        Some(_) => std::fs::read(&sig_path).map_err(|e| {
-            SignFailure::Error(format!(
-                "failed reading ssh signing data buffer from '{}': {}",
-                sig_path.display(),
-                crate::external::strerror(&e)
-            ))
-        }),
+        // What was read goes through `strip_cr_before_lf(signature, bottom)`
+        // (gpg-interface.c:1136-1137).
+        Some(_) => std::fs::read(&sig_path)
+            .map(|mut signature| {
+                strip_cr_before_lf(&mut signature);
+                signature
+            })
+            .map_err(|e| {
+                SignFailure::Error(format!(
+                    "failed reading ssh signing data buffer from '{}': {}",
+                    sig_path.display(),
+                    crate::external::strerror(&e)
+                ))
+            }),
     };
 
     if let Some(k) = &key_file {

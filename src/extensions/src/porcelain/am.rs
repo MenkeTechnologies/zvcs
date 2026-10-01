@@ -3235,7 +3235,13 @@ fn am_skip(repo: &gix::Repository, state_dir: &Path, cli: &Cli) -> Result<ExitCo
     // `clean_index(&head, &head)`: reset the index and worktree to HEAD,
     // discarding the failed patch's partial application (untracked files are
     // preserved). HEAD does not move, so nothing is written to its reflog.
-    if !clean_index(repo, &ctx, "HEAD")? {
+    // `if (repo_get_oid(…, "HEAD", &head)) oidcpy(&head, the_hash_algo->empty_tree);`
+    let head = repo
+        .head_id()
+        .map(|id| id.detach())
+        .unwrap_or_else(|_| ObjectId::empty_tree(repo.object_hash()))
+        .to_string();
+    if !clean_index(repo, &ctx, &head, &head)? {
         eprintln!("fatal: failed to clean index");
         return Ok(ExitCode::from(128));
     }
@@ -3294,7 +3300,10 @@ fn am_abort(repo: &gix::Repository, state_dir: &Path) -> Result<ExitCode> {
     let orig_head = repo.rev_parse_single("ORIG_HEAD").ok().map(|id| id.detach());
     if let Some(orig_head) = orig_head {
         let curr_head = repo.head_id().ok().map(|id| id.detach());
-        if !clean_index(repo, &ctx, "ORIG_HEAD")? {
+        let head = curr_head
+            .unwrap_or_else(|| ObjectId::empty_tree(repo.object_hash()))
+            .to_string();
+        if !clean_index(repo, &ctx, &head, &orig_head.to_string())? {
             eprintln!("fatal: failed to clean index");
             return Ok(ExitCode::from(128));
         }
@@ -3603,26 +3612,53 @@ fn has_unmerged(repo: &gix::Repository) -> Result<bool> {
     Ok(index.entries().iter().any(|e| e.stage_raw() != 0))
 }
 
-/// Run `git reset --hard -q <rev>` (silent, so no `HEAD is now at …` line), the
-/// re-exec form of `am`'s `clean_index`/worktree reset. Returns success.
-/// `clean_index(head, head)` (builtin/am.c:2058): reset the index to a tree and
-/// bring the worktree with it, **moving no ref**.
+/// `clean_index(head, remote)` (builtin/am.c:2071-2107): bring the index and
+/// worktree from `head` to `remote` without touching what the two trees agree on,
+/// **moving no ref**. Returns success; the caller dies with `failed to clean index`.
 ///
-/// This is not `reset --hard`: that also repoints `HEAD` and writes `ORIG_HEAD`,
-/// so using it for `am --skip` — where git's `clean_index` leaves `HEAD` exactly
-/// where it is — left a spurious `reset: moving to HEAD` line in `HEAD`'s reflog
-/// and an `ORIG_HEAD` stock never creates. `read-tree -u --reset` is the
-/// plumbing that does the index+worktree half alone.
-fn clean_index(repo: &gix::Repository, ctx: &Ctx, rev: &str) -> Result<bool> {
-    let ok = ctx
-        .cmd("read-tree")
-        .arg("-u")
-        .arg("--reset")
-        .arg(rev)
-        .status()
-        .map_err(|e| anyhow::anyhow!("failed to run read-tree: {e}"))?
-        .success();
-    if !ok {
+/// git does it in four unpack steps, each a plumbing child here:
+///
+/// ```c
+/// repo_read_index_unmerged(the_repository);
+/// if (fast_forward_to(head_tree, head_tree, 1))          // read-tree -u --reset H H
+///         return -1;
+/// if (write_index_as_tree(&index, …))                    // write-tree
+///         return -1;
+/// if (fast_forward_to(index_tree, remote_tree, 0))       // read-tree -u -m T R
+///         return -1;
+/// if (merge_tree(remote_tree))                           // read-tree -m R
+///         return -1;
+/// remove_branch_state(the_repository, 0);
+/// ```
+///
+/// The middle step is observable: the index — still carrying whatever the
+/// failed patch staged — is written out as tree objects before it is unwound,
+/// so `am --skip`/`--abort` after a `pre-applypatch` refusal leave that tree in
+/// the object store. A single `read-tree -u --reset <remote>` reached the same
+/// index and worktree but wrote no tree.
+///
+/// `fast_forward_to(…, 1)` resets with `UNPACK_RESET_PROTECT_UNTRACKED` where
+/// `read-tree --reset` overwrites untracked files. They part only where the
+/// index lacks a path both trees hold and an untracked file sits there.
+fn clean_index(repo: &gix::Repository, ctx: &Ctx, head: &str, remote: &str) -> Result<bool> {
+    let run = |args: &[&str]| -> Result<bool> {
+        Ok(ctx
+            .cmd("read-tree")
+            .args(args)
+            .status()
+            .map_err(|e| anyhow::anyhow!("failed to run read-tree: {e}"))?
+            .success())
+    };
+    if !run(&["-u", "--reset", head, head])? {
+        return Ok(false);
+    }
+    let Some(index_tree) = capture(ctx.cmd("write-tree"))? else {
+        return Ok(false);
+    };
+    if !run(&["-u", "-m", &index_tree, remote])? {
+        return Ok(false);
+    }
+    if !run(&["-m", remote])? {
         return Ok(false);
     }
     // `clean_index()` ends in `remove_branch_state(the_repository, 0)`, which is

@@ -18,6 +18,10 @@
 //!   `This reverts commit <hash>.` line) and its use of the *current* user as
 //!   the author of revert commits.
 //! * `--ref=<ref>` with its `refs/`-prefix and refname-format validation.
+//! * `--linearize` (2.56): every non-merge commit stacks on the previous
+//!   result, a merge in the range is dropped and the refs on it move to the
+//!   commit replayed last; refused with `--contained` or with more than one
+//!   branch to update.
 //! * `--ref-action=update|print` and the `replay.refAction` configuration
 //!   variable. `print` emits `update <ref> <new> <old>` lines; `update` runs one
 //!   atomic reference transaction and prints nothing.
@@ -47,7 +51,7 @@
 //!   `--since`, `--merges`, …). git passes those through `setup_revisions`; here
 //!   they are refused rather than silently ignored, because ignoring them would
 //!   change which commits get replayed.
-//! * Replaying merge commits — git refuses these too.
+//! * Replaying merge commits without `--linearize` — git refuses these too.
 //!
 //! ## Known divergences
 //!
@@ -76,7 +80,7 @@ use gix::refs::{FullName, Target};
 /// Verbatim `git replay` usage text, printed to stderr when no mode is given.
 const USAGE: &str = "\
 usage: (EXPERIMENTAL!) git replay ([--contained] --onto=<newbase> | --advance=<branch> | --revert=<branch>)
-       [--ref=<ref>] [--ref-action=<mode>] <revision-range>
+       [--ref=<ref>] [--ref-action=<mode>] [--linearize] <revision-range>
 
     --[no-]contained      update all branches that point at commits in <revision-range>
     --onto <revision>     replay onto given commit
@@ -84,6 +88,7 @@ usage: (EXPERIMENTAL!) git replay ([--contained] --onto=<newbase> | --advance=<b
     --revert <branch>     revert commits onto given branch
     --ref <branch>        reference to update with result
     --ref-action <mode>   control ref update behavior (update|print)
+    --[no-]linearize      drop merge commits, replaying only non-merge commits
 
 ";
 
@@ -126,16 +131,28 @@ pub(super) enum Picked {
     BecameEmpty(ObjectId),
 }
 
-/// git's `pick_regular_commit` (replay.c): three-way merge `pickme` onto the
-/// already-replayed version of its parent, then commit the result.
+/// git's `get_mapped_commit` (replay.c): the replayed version of `commit`, or
+/// `fallback` when `commit` is absent (a root's missing parent) or was never
+/// replayed.
+pub(super) fn get_mapped_commit(
+    replayed: &HashMap<ObjectId, ObjectId>,
+    commit: Option<ObjectId>,
+    fallback: ObjectId,
+) -> ObjectId {
+    commit.and_then(|c| replayed.get(&c).copied()).unwrap_or(fallback)
+}
+
+/// git's `pick_regular_commit` (replay.c): three-way merge `pickme` onto
+/// `replayed_base`, then commit the result.
 ///
-/// `fallback` is `mapped_commit`'s default when `pickme`'s parent has not been
-/// replayed — `onto` in pick mode, the previous result in revert mode.
+/// Since 2.56 the caller chooses `replayed_base` (replay.c:477-485): the
+/// replayed parent via [`get_mapped_commit`], or the previous result under
+/// `--linearize` and in revert mode. The merge base stays `pickme`'s own
+/// first parent either way.
 pub(super) fn pick_regular_commit(
     repo: &gix::Repository,
     pickme: ObjectId,
-    replayed: &HashMap<ObjectId, ObjectId>,
-    fallback: ObjectId,
+    replayed_base: ObjectId,
     merge_options: &gix::merge::tree::Options,
     mode: Mode,
     empty: EmptyAction,
@@ -147,9 +164,6 @@ pub(super) fn pick_regular_commit(
         None => repo.object_hash().empty_tree(),
     };
 
-    let replayed_base = base
-        .and_then(|b| replayed.get(&b).copied())
-        .unwrap_or(fallback);
     let replayed_base_tree = repo.find_commit(replayed_base)?.tree_id()?.detach();
     let pickme_tree = commit.tree_id()?.detach();
 
@@ -300,6 +314,8 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
 
     // --- parse_options ---------------------------------------------------
     let mut contained = false;
+    // `OPT_BOOL(0, "linearize", &opts.linearize, ...)` (builtin/replay.c:114-115).
+    let mut linearize = false;
     let mut onto_name: Option<String> = None;
     let mut advance_name: Option<String> = None;
     let mut revert_name: Option<String> = None;
@@ -327,6 +343,17 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         match name {
             "--contained" if !dashdash => contained = true,
             "--no-contained" if !dashdash => contained = false,
+            // `OPT_BOOL` is `PARSE_OPT_NOARG`, so an attached value is
+            // `do_get_value()`'s `takes no value` refusal, in either sense.
+            "--linearize" | "--no-linearize" if !dashdash && inline.is_some() => {
+                let name = match name {
+                    "--linearize" => crate::parseopt::OptName::Long("linearize"),
+                    _ => crate::parseopt::OptName::Unset("linearize"),
+                };
+                return Ok(crate::parseopt::takes_no_value(name));
+            }
+            "--linearize" if !dashdash => linearize = true,
+            "--no-linearize" if !dashdash => linearize = false,
             "--onto" if !dashdash => onto_name = Some(value_of(args, &mut i, inline, name)?),
             "--advance" if !dashdash => {
                 advance_name = Some(value_of(args, &mut i, inline, name)?)
@@ -360,7 +387,7 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
             "--" => {
                 unported.get_or_insert_with(|| {
                     "unsupported flag \"--\" (pathspec-limited replay is not ported; \
-                     ported: --contained, --onto, --advance, --revert, --ref, --ref-action)"
+                     ported: --contained, --onto, --advance, --revert, --ref, --ref-action, --linearize)"
                         .to_string()
                 });
             }
@@ -395,7 +422,7 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
                     format!(
                         "unsupported flag {s:?} (rev-list commit-limiting options are not \
                          ported; ported: --contained, --onto, --advance, --revert, --ref, \
-                         --ref-action)"
+                         --ref-action, --linearize)"
                     )
                 });
             }
@@ -429,6 +456,8 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         (advance_name.is_some(), "--advance"),
         (revert_name.is_some(), "--revert"),
         (ref_name.is_some(), "--ref"),
+        // builtin/replay.c:137-138, new in 2.56.
+        (linearize, "--linearize"),
     ] {
         if flag && contained {
             return fatal(&format!(
@@ -706,6 +735,11 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         branch_full = Some(full);
     }
 
+    // replay.c:414-418: a linear history can carry only one branch along.
+    if linearize && update_refs.as_ref().is_some_and(|u| u.len() > 1) {
+        return error("'--linearize' cannot be used with multiple branches");
+    }
+
     // --- the single reference `--ref`/`--advance`/`--revert` updates -------
     let single_ref: Option<String>;
     let mut single_old = ObjectId::null(repo.object_hash());
@@ -759,37 +793,48 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
     let mut conflicted = false;
 
     for pickme in order {
-        if repo.find_commit(pickme)?.parent_ids().count() > 1 {
-            return fatal("replaying merge commits is not supported yet!");
+        let parents: Vec<ObjectId> =
+            repo.find_commit(pickme)?.parent_ids().map(|p| p.detach()).collect();
+        if parents.len() > 1 {
+            if !linearize {
+                return fatal("replaying merge commits is not supported yet!");
+            }
+            // `--linearize` drops the merge (replay.c:455-464): nothing is
+            // picked and `last_commit` stays put, so the merge maps to it, the
+            // refs on the merge move to it, and the next commit stacks on it.
+        } else {
+            // replay.c:466-485: the replayed parent, or `onto` when the parent
+            // was not replayed. Revert replays newest-first, so its parent is
+            // never replayed yet; it and `--linearize` stack on `last_commit`.
+            let mut base = get_mapped_commit(&replayed, parents.first().copied(), onto);
+            if linearize || mode == Mode::Revert {
+                base = last_commit;
+            }
+            // The CLI exposes no `--empty`, so the default `drop` is the only
+            // value reachable here.
+            last_commit = match pick_regular_commit(
+                &repo,
+                pickme,
+                base,
+                &merge_options,
+                mode,
+                EmptyAction::Drop,
+            )? {
+                Picked::Commit(id) => id,
+                Picked::Conflict => {
+                    conflicted = true;
+                    break;
+                }
+                // Unreachable with `EmptyAction::Drop`.
+                Picked::BecameEmpty(id) => {
+                    bail!("commit {id} became empty after replay");
+                }
+            };
         }
+        let new_commit = last_commit;
 
-        // In revert mode each commit stacks on the previous result; in pick mode
-        // it stacks on its already-replayed parent, or `onto` if it has none.
-        let fallback = if mode == Mode::Revert { last_commit } else { onto };
-        // The CLI exposes no `--empty`, so the default `drop` is the only value
-        // reachable here.
-        let new_commit = match pick_regular_commit(
-            &repo,
-            pickme,
-            &replayed,
-            fallback,
-            &merge_options,
-            mode,
-            EmptyAction::Drop,
-        )? {
-            Picked::Commit(id) => id,
-            Picked::Conflict => {
-                conflicted = true;
-                break;
-            }
-            // Unreachable with `EmptyAction::Drop`.
-            Picked::BecameEmpty(id) => {
-                bail!("commit {id} became empty after replay");
-            }
-        };
-
+        // `put_mapped_commit()`.
         replayed.insert(pickme, new_commit);
-        last_commit = new_commit;
 
         if single_ref.is_some() {
             continue;

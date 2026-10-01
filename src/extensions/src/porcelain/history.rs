@@ -55,7 +55,7 @@ use gix::merge::tree::TreatAsUnresolved;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-use super::replay::{pick_regular_commit, EmptyAction, Mode, Picked};
+use super::replay::{get_mapped_commit, pick_regular_commit, EmptyAction, Mode, Picked};
 
 /// The three-line synopsis git prints for the command as a whole.
 const USAGE: &str = "\
@@ -859,11 +859,15 @@ fn handle_reference_updates(
     let mut replayed: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut updates: Vec<(String, ObjectId, ObjectId)> = Vec::new();
     for pickme in order {
+        // `get_mapped_commit(replayed_commits, parent, onto)`: the descendants
+        // are never merges (setup_revwalk refused those), so each stacks on its
+        // replayed parent or, for the target's children, on `rewritten`.
+        let parent = repo.find_commit(*pickme)?.parent_ids().next().map(|p| p.detach());
+        let base = get_mapped_commit(&replayed, parent, rewritten);
         let new_commit = match pick_regular_commit(
             repo,
             *pickme,
-            &replayed,
-            rewritten,
+            base,
             &merge_options,
             Mode::Pick,
             empty,

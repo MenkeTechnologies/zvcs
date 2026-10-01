@@ -8,7 +8,7 @@
 //!
 //! Supported subcommands, with stdout/stderr and exit codes matching stock git:
 //!   * `git bisect start [--term-(bad|new)=<t> --term-(good|old)=<t>]
-//!     [--no-checkout] [--first-parent] [<bad> [<good>...]] [--] [<pathspec>...]`
+//!     [--no-checkout] [--first-parent] [--reset-when-found[=<where>]] [<bad> [<good>...]] [--] [<pathspec>...]`
 //!     — the full argument grammar of git's `bisect_start`, including custom
 //!     terms (validated by `check_term_format`), the `--term-*` value taken in
 //!     either `=value` or following-token form, and git's revision-vs-pathspec
@@ -24,7 +24,7 @@
 //!     takes no operand, and refuses one before it looks at any state.
 //!   * `git bisect skip [<rev>...]`
 //!   * `git bisect replay <logfile>` — re-drive a session from a saved log.
-//!   * `git bisect run <cmd> [<arg>...]`
+//!   * `git bisect run [--reset-when-found[=<where>]] <cmd> [<arg>...]`
 //!   * `git bisect visualize|view [<arg>...]`
 //!   * `git bisect help` — the usage block on stderr, exit 129; `-h` prints the
 //!     same block on stdout, because `parse_options` answers it before
@@ -134,7 +134,7 @@ use crate::cstdio::println;
 /// The usage block git prints on a usage error, verbatim.
 const USAGE: &str = "\
 usage: git bisect start [--term-(bad|new)=<term-new> --term-(good|old)=<term-old>]
-                        [--no-checkout] [--first-parent] [<bad> [<good>...]] [--] [<pathspec>...]
+                        [--no-checkout] [--first-parent] [--reset-when-found[=<where>]] [<bad> [<good>...]] [--] [<pathspec>...]
    or: git bisect (bad|new|<term-new>) [<rev>]
    or: git bisect (good|old|<term-old>) [<rev>...]
    or: git bisect terms [--term-(good|old) | --term-(bad|new)]
@@ -144,7 +144,7 @@ usage: git bisect start [--term-(bad|new)=<term-new> --term-(good|old)=<term-old
    or: git bisect (visualize|view)
    or: git bisect replay <logfile>
    or: git bisect log
-   or: git bisect run <cmd> [<arg>...]
+   or: git bisect run [--reset-when-found[=<where>]] <cmd> [<arg>...]
    or: git bisect help
 
 ";
@@ -164,6 +164,41 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
     };
     let rest = &args[1..];
 
+    FIRST_BAD_FOUND.store(false, std::sync::atomic::Ordering::Relaxed);
+    let code = dispatch(sub, args, rest)?;
+
+    // ```c
+    // if (res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND) {
+    //         enum reset_when_found_mode mode;
+    //
+    //         if (read_reset_when_found(&mode))
+    //                 res = BISECT_FAILED;
+    //         else if (mode != RESET_WHEN_FOUND_NONE &&
+    //                  bisect_reset_when_found(mode))
+    //                 res = BISECT_FAILED;
+    // }
+    // ```
+    //
+    // (`cmd_bisect()`, git 2.56.0 builtin/bisect.c:1646-1654.) Whichever subcommand
+    // ended on the first bad commit — a marking word, `skip`, `next`, `start`,
+    // `replay` or `run` — the session recorded by `--reset-when-found` is wound up
+    // here, after the culprit has been reported.
+    if code == ExitCode::SUCCESS && FIRST_BAD_FOUND.load(std::sync::atomic::Ordering::Relaxed) {
+        let ctx = Ctx::open()?;
+        let finished = match read_reset_when_found(&ctx) {
+            Err(()) => false,
+            Ok(None) => true,
+            Ok(Some(mode)) => bisect_reset_when_found(&ctx, mode)?,
+        };
+        if !finished {
+            return Ok(ExitCode::from(BISECT_FAILED));
+        }
+    }
+    Ok(code)
+}
+
+/// `cmd_bisect()`'s `OPT_SUBCOMMAND` table and its `!fn` fallback.
+fn dispatch(sub: &str, args: &[String], rest: &[String]) -> Result<ExitCode> {
     match sub {
         "start" => start(rest),
         "terms" => terms_cmd(rest),
@@ -223,6 +258,11 @@ fn word_fallback(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
     let ctx = Ctx::open()?;
+    // `cmd_bisect()` answers this with a bare `return error(…)`, which is -1 and
+    // leaves the process with 255 rather than going through `is_bisect_success()`.
+    if get_terms_missing_ok(&ctx)?.is_none() {
+        return Ok(ExitCode::from(255));
+    }
     let is_marking = match read_terms(&ctx)? {
         Some(t) => word == t.bad || word == t.good,
         None => terms_for_first_marking(word).is_some(),
@@ -399,6 +439,22 @@ fn read_terms(ctx: &Ctx) -> Result<Option<Terms>> {
     }
 }
 
+/// `set_terms(&terms, "bad", "good"); if (get_terms(&terms, 1)) return error(_("no terms
+/// defined"));` — the guard git 2.56.0 put in front of every entry point that reads the
+/// terms with a missing file allowed (builtin/bisect.c:569-597, :1167, :1528, :1563,
+/// :1576, :1591, :1631). A missing `BISECT_TERMS` still means `bad`/`good`; one that
+/// runs out before its second line — `strbuf_getline_lf()` answering `EOF` — is now
+/// refused instead of leaving a term unset. `None` once the refusal has been printed.
+fn get_terms_missing_ok(ctx: &Ctx) -> Result<Option<Terms>> {
+    if let Ok(text) = std::fs::read(ctx.file("BISECT_TERMS")) {
+        if text.split_inclusive(|&b| b == b'\n').count() < 2 {
+            eprintln!("error: no terms defined");
+            return Ok(None);
+        }
+    }
+    current_terms(ctx).map(Some)
+}
+
 fn write_terms(ctx: &Ctx, terms: &Terms) -> Result<()> {
     std::fs::write(
         ctx.file("BISECT_TERMS"),
@@ -519,6 +575,11 @@ fn next_check_silent(ctx: &Ctx, terms: &Terms) -> Result<bool> {
 /// skipped: `BISECT_HEAD` when the session was opened `--no-checkout`, and
 /// `HEAD` otherwise.
 fn skip_cmd(args: &[String]) -> Result<ExitCode> {
+    // `cmd_bisect__skip()` asks for the terms before `bisect_skip()` runs; a
+    // `bisect run` step reaches `bisect_skip()` with them already in hand.
+    if get_terms_missing_ok(&Ctx::open()?)?.is_none() {
+        return Ok(ExitCode::from(BISECT_FAILED));
+    }
     Ok(state_exit(bisect_skip(args)?))
 }
 
@@ -822,7 +883,9 @@ fn update_bisect_ref(ctx: &Ctx, leaf: &str, id: ObjectId) -> Result<bool> {
 /// two of them, exactly as git does.
 fn visualize_cmd(args: &[String]) -> Result<ExitCode> {
     let ctx = Ctx::open()?;
-    let terms = current_terms(&ctx)?;
+    let Some(terms) = get_terms_missing_ok(&ctx)? else {
+        return Ok(ExitCode::from(BISECT_FAILED));
+    };
     if !next_check_silent(&ctx, &terms)? {
         return Ok(ExitCode::from(1));
     }
@@ -1178,9 +1241,62 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let ctx = Ctx::open()?;
-    let terms = current_terms(&ctx)?;
+    let Some(terms) = get_terms_missing_ok(&ctx)? else {
+        return Ok(ExitCode::from(BISECT_FAILED));
+    };
     if !next_check_silent(&ctx, &terms)? {
         return Ok(ExitCode::from(1));
+    }
+
+    // ```c
+    // if (argc && !strcmp(argv[0], "--reset-when-found")) {
+    //         reset_when_found = RESET_WHEN_FOUND_TO_ORIGINAL;
+    // } else if (argc && skip_prefix(argv[0], "--reset-when-found=", …)) {
+    //         if (parse_reset_when_found(reset_when_found_arg, &reset_when_found))
+    //                 return BISECT_FAILED;
+    // }
+    //
+    // if (reset_when_found != RESET_WHEN_FOUND_NONE &&
+    //     refs_ref_exists(get_main_ref_store(the_repository), "BISECT_HEAD"))
+    //         return error(…, "--reset-when-found", "--no-checkout");
+    //
+    // if (reset_when_found != RESET_WHEN_FOUND_NONE) {
+    //         write_file(git_path_bisect_reset_when_found(), "%s\n", …);
+    //         argc--;
+    //         argv++;
+    // }
+    //
+    // if (!argc) {
+    //         error(_("bisect run failed: no command provided."));
+    //         return BISECT_FAILED;
+    // }
+    // ```
+    //
+    // (`bisect_run()`, git 2.56.0 builtin/bisect.c:1364-1388.) Only the first operand
+    // is looked at, and the mode is on disk before the command count is checked — so
+    // `git bisect run --reset-when-found` alone records it and then refuses.
+    let mut args = args;
+    let reset_when_found = match args[0].as_str() {
+        "--reset-when-found" => Some(ResetWhenFound::Original),
+        first => match first.strip_prefix("--reset-when-found=") {
+            Some(v) => match ResetWhenFound::parse(v) {
+                Some(mode) => Some(mode),
+                None => return Ok(ExitCode::from(BISECT_FAILED)),
+            },
+            None => None,
+        },
+    };
+    if let Some(mode) = reset_when_found {
+        if ctx.file("BISECT_HEAD").exists() {
+            eprintln!("error: options '--reset-when-found' and '--no-checkout' cannot be used together");
+            return Ok(ExitCode::from(BISECT_FAILED));
+        }
+        mode.record(&ctx)?;
+        args = &args[1..];
+    }
+    if args.is_empty() {
+        eprintln!("error: bisect run failed: no command provided.");
+        return Ok(ExitCode::from(BISECT_FAILED));
     }
 
     // `sq_quote_argv(&command, argv)`: every operand is quoted unconditionally
@@ -1385,62 +1501,196 @@ fn reset_cmd(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
+    // ```c
+    // res = bisect_reset(argc ? argv[0] : NULL, false);
+    // if (res)
+    //         return res;
+    // return bisect_clean_state();
+    // ```
+    //
+    // (`cmd_bisect__reset()`, git 2.56.0 builtin/bisect.c:1479-1491.) 2.56 moved the
+    // clean out of `bisect_reset()` so that `--reset-when-found` and `replay` can each
+    // take only the half they need.
     let ctx = Ctx::open()?;
-    // git rev-parses the argument before touching state; a leading `-` is not a
-    // flag here, just a commit-ish that fails to resolve.
-    if let Some(spec) = args.first() {
-        if resolve(&ctx.repo, spec).is_err() {
-            eprintln!("error: '{spec}' is not a valid commit");
-            return Ok(ExitCode::from(1));
-        }
+    if !bisect_reset(&ctx, args.first().map(String::as_str), false)? {
+        return Ok(ExitCode::from(1));
     }
-    let target = match args.first() {
-        Some(spec) => Some(spec.clone()),
+    clean_state(&ctx)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `bisect_reset()` (git 2.56.0 builtin/bisect.c:244-280): put the worktree back on
+/// `commit`, or on the head `BISECT_START` recorded when there is none, without
+/// touching the session state. `quiet` is the `--quiet` 2.56 passes to the child
+/// `checkout` when `--reset-when-found` winds a session up. `false` once the
+/// refusal has been printed.
+fn bisect_reset(ctx: &Ctx, commit: Option<&str>, quiet: bool) -> Result<bool> {
+    // ```c
+    // if (!commit) {
+    //         if (!strbuf_read_file(&branch, git_path_bisect_start(), 0))
+    //                 printf(_("We are not bisecting.\n"));
+    //         else
+    //                 strbuf_rtrim(&branch);
+    // } else {
+    //         if (repo_get_oid_commit(the_repository, commit, &oid))
+    //                 return error(_("'%s' is not a valid commit"), commit);
+    //         strbuf_addstr(&branch, commit);
+    // }
+    // ```
+    //
+    // `strbuf_read_file()` answers -1 for a missing `BISECT_START`, which is not 0, so
+    // only an *empty* one says "We are not bisecting."; both leave `branch` empty and
+    // nothing is checked out. A leading `-` in `commit` is not a flag, just a
+    // commit-ish that fails to resolve.
+    let target = match commit {
+        Some(spec) => {
+            if resolve(&ctx.repo, spec).is_err() {
+                eprintln!("error: '{spec}' is not a valid commit");
+                return Ok(false);
+            }
+            spec.to_owned()
+        }
         None => match std::fs::read_to_string(ctx.file("BISECT_START")) {
-            Ok(text) => Some(text.trim().to_owned()),
-            // Not bisecting and no explicit target: nothing to do, like git.
-            Err(_) => None,
+            Ok(text) if text.is_empty() => {
+                println!("We are not bisecting.");
+                String::new()
+            }
+            Ok(text) => text.trim_end().to_owned(),
+            Err(_) => String::new(),
         },
     };
 
     // ```c
-    // if (!ref_exists("BISECT_HEAD")) {
-    //         … "checkout", branch.buf, "--" …
+    // if (branch.len && !refs_ref_exists(…, "BISECT_HEAD")) {
+    //         … "checkout", "--ignore-other-worktrees", ["--quiet",] branch.buf, "--" …
+    //         if (run_command(&cmd)) {
+    //                 error(_("could not check out original"
+    //                         " HEAD '%s'. Try 'git bisect"
+    //                         " reset <commit>'."), branch.buf);
+    //                 strbuf_release(&branch);
+    //                 return -1;
+    //         }
     // }
     // ```
     //
-    // (`bisect_reset()`, builtin/bisect.c:222-235.) A `--no-checkout` session never
-    // moved the worktree, so there is nothing to move back and `git checkout` is
-    // not run at all — running it anyway reports the transition git stays silent
-    // about.
-    //
-    // A checkout that fails leaves the session exactly as it was:
-    //
-    // ```c
-    // if (run_command(&cmd)) {
-    //         error(_("could not check out original"
-    //                 " HEAD '%s'. Try 'git bisect"
-    //                 " reset <commit>'."), branch.buf);
-    //         strbuf_release(&branch);
-    //         return -1;
-    // }
-    // ```
-    //
-    // (`bisect_reset()`, builtin/bisect--helper.c:229-235, v2.39.0-rc2.) An
-    // unmerged index, or a `.git` subdirectory as cwd where the child `checkout`
-    // dies with `this operation must be run in a work tree`, both end here.
-    if let Some(target) = target {
-        if !ctx.file("BISECT_HEAD").exists()
-            && !run_checkout(&["--ignore-other-worktrees", &target, "--"])?
-        {
+    // A `--no-checkout` session never moved the worktree, so there is nothing to move
+    // back and `git checkout` is not run at all — running it anyway reports the
+    // transition git stays silent about. A checkout that fails leaves the session
+    // exactly as it was: an unmerged index, or a `.git` subdirectory as cwd where the
+    // child `checkout` dies with `this operation must be run in a work tree`, both end
+    // here.
+    if !target.is_empty() && !ctx.file("BISECT_HEAD").exists() {
+        let mut argv = vec!["--ignore-other-worktrees"];
+        if quiet {
+            argv.push("--quiet");
+        }
+        argv.extend([target.as_str(), "--"]);
+        if !run_checkout(&argv)? {
             eprintln!(
                 "error: could not check out original HEAD '{target}'. Try 'git bisect reset <commit>'."
             );
-            return Ok(ExitCode::from(1));
+            return Ok(false);
         }
     }
-    clean_state(&ctx)?;
-    Ok(ExitCode::SUCCESS)
+    Ok(true)
+}
+
+/// `enum reset_when_found_mode` (git 2.56.0 builtin/bisect.c:72-76), less
+/// `RESET_WHEN_FOUND_NONE`, which is an `Option` here.
+#[derive(Clone, Copy)]
+enum ResetWhenFound {
+    /// Back to the head the session was started from.
+    Original,
+    /// Stay on the first bad commit, detached.
+    Found,
+}
+
+impl ResetWhenFound {
+    /// `parse_reset_when_found()` (git 2.56.0 builtin/bisect.c:282-294).
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "original" => Some(Self::Original),
+            "found" => Some(Self::Found),
+            _ => {
+                eprintln!("error: invalid value for '--reset-when-found': '{value}'");
+                None
+            }
+        }
+    }
+
+    /// `reset_when_found_mode_name()` (git 2.56.0 builtin/bisect.c:296-307).
+    fn name(self) -> &'static str {
+        match self {
+            Self::Original => "original",
+            Self::Found => "found",
+        }
+    }
+
+    /// `write_file(git_path_bisect_reset_when_found(), "%s\n", …)`, which both
+    /// `bisect start` and `bisect run` record the mode with.
+    fn record(self, ctx: &Ctx) -> Result<()> {
+        std::fs::write(ctx.file("BISECT_RESET_WHEN_FOUND"), format!("{}\n", self.name()))?;
+        Ok(())
+    }
+}
+
+/// `read_reset_when_found()` (git 2.56.0 builtin/bisect.c:309-329): `Ok(None)` for a
+/// missing or empty `BISECT_RESET_WHEN_FOUND`, `Err(())` once the refusal for an
+/// unreadable file or a mode it does not know has been printed. The value is
+/// `strbuf_trim()`med on both ends before it is parsed.
+fn read_reset_when_found(ctx: &Ctx) -> std::result::Result<Option<ResetWhenFound>, ()> {
+    let path = ctx.file("BISECT_RESET_WHEN_FOUND");
+    match std::fs::metadata(&path) {
+        Ok(md) if md.len() > 0 => {}
+        _ => return Ok(None),
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let value = String::from_utf8_lossy(&bytes);
+            ResetWhenFound::parse(value.trim_matches(|c: char| c.is_ascii_whitespace()))
+                .map(Some)
+                .ok_or(())
+        }
+        Err(e) => {
+            eprintln!(
+                "error: could not read '{}': {}",
+                git_path(ctx, "BISECT_RESET_WHEN_FOUND"),
+                crate::errno_text(&e)
+            );
+            Err(())
+        }
+    }
+}
+
+/// git's `git_path()` spelling of a state file for a message: `$GIT_DIR` as the
+/// setup found it — `.git` relative to the top of the worktree when the command was
+/// started there — joined with the name.
+fn git_path(ctx: &Ctx, name: &str) -> String {
+    let path = ctx.file(name);
+    ctx.repo
+        .workdir()
+        .and_then(|top| path.strip_prefix(top).ok().map(Path::to_path_buf))
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// `bisect_reset_when_found()` (git 2.56.0 builtin/bisect.c:331-352): check out what
+/// the mode asks for, quietly, then clean the session away. `false` once a
+/// refusal has been printed.
+fn bisect_reset_when_found(ctx: &Ctx, mode: ResetWhenFound) -> Result<bool> {
+    // `read_bisect_terms(&terms.term_bad, &terms.term_good); commit =
+    // xstrfmt("refs/bisect/%s", terms.term_bad);` — the bad ref names the culprit
+    // once the search has ended on it.
+    let commit = match mode {
+        ResetWhenFound::Original => None,
+        ResetWhenFound::Found => Some(format!("refs/bisect/{}", current_terms(ctx)?.bad)),
+    };
+    if !bisect_reset(ctx, commit.as_deref(), true)? {
+        return Ok(false);
+    }
+    clean_state(ctx)?;
+    Ok(true)
 }
 
 /// Remove every trace of the session: the state files and the `refs/bisect` tree.
@@ -1452,6 +1702,7 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
     // unlink_or_warn(git_path_bisect_run());
     // unlink_or_warn(git_path_bisect_terms());
     // unlink_or_warn(git_path_bisect_first_parent());
+    // unlink_or_warn(git_path_bisect_reset_when_found());
     // ```
     //
     // (`bisect_clean_state()`, bisect.c.) `BISECT_RUN` and `BISECT_FIRST_PARENT`
@@ -1467,6 +1718,7 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
         "BISECT_RUN",
         "BISECT_TERMS",
         "BISECT_FIRST_PARENT",
+        "BISECT_RESET_WHEN_FOUND",
         "BISECT_HEAD",
         "BISECT_START",
     ] {
@@ -1485,7 +1737,8 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
 /// git's `cmd.git_cmd = 1; strvec_pushl(&cmd.args, "checkout", …); run_command(&cmd)`:
 /// run `git checkout <args>` as a child and report whether it exited 0.
 ///
-/// The child is unquiet: every transition line (`Already on`, `Switched to
+/// Unless `--quiet` is among `args` (only `--reset-when-found` passes it), the
+/// child is unquiet: every transition line (`Already on`, `Switched to
 /// branch`, `Previous HEAD position was`, `HEAD is now at`) and the stdout
 /// report of local modifications and upstream tracking are `checkout`'s own.
 /// `git checkout <current branch>` still writes `checkout: moving from X to X`
@@ -1524,9 +1777,13 @@ fn start(args: &[String]) -> Result<ExitCode> {
         bad: "bad".into(),
         good: "good".into(),
     };
-    let mut no_checkout = false;
+    // `if (is_bare_repository(the_repository)) no_checkout = 1;` (git 2.56.0
+    // builtin/bisect.c:823-824): with no worktree to move, every session is a
+    // `--no-checkout` one — which is also what makes `--reset-when-found` refused there.
+    let mut no_checkout = ctx.repo.workdir().is_none();
     let mut first_parent = false;
     let mut must_write_terms = false;
+    let mut reset_when_found: Option<ResetWhenFound> = None;
     let mut resolved: Vec<ObjectId> = Vec::new();
 
     // git scans once for a `--`: its presence turns an unresolvable revision
@@ -1547,6 +1804,16 @@ fn start(args: &[String]) -> Result<ExitCode> {
             no_checkout = true;
         } else if arg == "--first-parent" {
             first_parent = true;
+        // `--reset-when-found[=<where>]` (git 2.56.0 builtin/bisect.c:844-850): the bare
+        // spelling is `original`, and a value git does not know ends the scan on the
+        // spot, before anything is resolved or written.
+        } else if arg == "--reset-when-found" {
+            reset_when_found = Some(ResetWhenFound::Original);
+        } else if let Some(v) = arg.strip_prefix("--reset-when-found=") {
+            match ResetWhenFound::parse(v) {
+                Some(mode) => reset_when_found = Some(mode),
+                None => return Ok(ExitCode::from(BISECT_FAILED)),
+            }
         } else if arg == "--term-good" || arg == "--term-old" {
             i += 1;
             let Some(v) = args.get(i) else {
@@ -1602,6 +1869,20 @@ fn start(args: &[String]) -> Result<ExitCode> {
             }
         }
         i += 1;
+    }
+    // ```c
+    // if (reset_when_found != RESET_WHEN_FOUND_NONE && no_checkout) {
+    //         res = error(_("options '%s' and '%s' cannot be used together"),
+    //                     "--reset-when-found", "--no-checkout");
+    //         goto finish;
+    // }
+    // ```
+    //
+    // (git 2.56.0 builtin/bisect.c:888-892.) A `--no-checkout` session never moves the
+    // worktree, so there is nothing for the option to put back.
+    if reset_when_found.is_some() && no_checkout {
+        eprintln!("error: options '--reset-when-found' and '--no-checkout' cannot be used together");
+        return Ok(ExitCode::from(BISECT_FAILED));
     }
     // `pathspec_pos`: where the scan stopped — at the `--`, at the first token
     // that is neither an option nor a revision, or past the end.
@@ -1659,6 +1940,11 @@ fn start(args: &[String]) -> Result<ExitCode> {
     std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
     if first_parent {
         std::fs::write(ctx.file("BISECT_FIRST_PARENT"), "\n")?;
+    }
+    // git 2.56.0 builtin/bisect.c:972-974, read back by `cmd_bisect()` once a step
+    // ends on the first bad commit.
+    if let Some(mode) = reset_when_found {
+        mode.record(&ctx)?;
     }
     if no_checkout {
         let head_oid = ctx.repo.head_id()?.detach();
@@ -2055,11 +2341,13 @@ fn next_cmd(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let ctx = Ctx::open()?;
+    let Some(terms) = get_terms_missing_ok(&ctx)? else {
+        return Ok(ExitCode::from(BISECT_FAILED));
+    };
     if !ctx.in_progress() {
         eprint!("You need to start by \"git bisect start\"\n\n");
         return Ok(ExitCode::from(1));
     }
-    let terms = current_terms(&ctx)?;
     let no_checkout = ctx.file("BISECT_HEAD").exists();
     let bad = ctx.bad(&terms)?;
     let goods = ctx.goods(&terms)?;
@@ -2098,6 +2386,14 @@ fn next_cmd(args: &[String]) -> Result<ExitCode> {
 /// time and exiting 0 where stock exits 1. The flag carries the distinction back
 /// without giving every step's return type a second dimension.
 static STEP_COMPLETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set when a step answered `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND` specifically —
+/// the one result `cmd_bisect()` (git 2.56.0 builtin/bisect.c:1646-1654) acts on
+/// for `--reset-when-found`. [`STEP_COMPLETED`] also covers
+/// `BISECT_INTERNAL_SUCCESS_MERGE_BASE`, which must not wind the session up.
+/// Read only when the subcommand exited 0: a replay whose `start` line already
+/// found the culprit is `BISECT_FAILED` to git, not a found commit.
+static FIRST_BAD_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// git's `sq_dequote_to_strvec()`: split an sq-quoted argument list.
 ///
@@ -2190,7 +2486,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     }
 
     // ```c
-    // if (bisect_reset(NULL))
+    // if (bisect_clean_state())
     //         return BISECT_FAILED;
     //
     // fp = fopen(filename, "r");
@@ -2198,14 +2494,13 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     //         return BISECT_FAILED;
     // ```
     //
-    // (`bisect_replay()`, builtin/bisect--helper.c:1044-1049, v2.39.0-rc2.) The
-    // session is reset *before* the log is opened, and the reset unlinks
-    // `BISECT_LOG` — so replaying the live log in place (`git bisect replay
-    // .git/BISECT_LOG`) checks the start branch out, then finds nothing to open
-    // and fails at exit 1 without another word.
-    if reset_cmd(&[])? != ExitCode::SUCCESS {
-        return Ok(ExitCode::from(1));
-    }
+    // (`bisect_replay()`, git 2.56.0 builtin/bisect.c:1207-1212.) The session state is
+    // cleaned *before* the log is opened, and the clean unlinks `BISECT_LOG` — so
+    // replaying the live log in place (`git bisect replay .git/BISECT_LOG`) finds
+    // nothing to open and fails at exit 1 without another word. Through 2.55 this
+    // was `bisect_reset(NULL)`, which also checked the start branch out first; 2.56
+    // leaves the worktree where it is, and the replayed `start` line moves it.
+    clean_state(&ctx)?;
     let Ok(content) = std::fs::read_to_string(&path) else {
         return Ok(ExitCode::from(1));
     };
@@ -3675,6 +3970,7 @@ fn report_first_bad(ctx: &Ctx, bad: ObjectId, terms: &Terms) -> Result<u8> {
     ctx.append_log(&format!("# first '{}' commit: [{hex}] {subj}\n", terms.bad))?;
     // `BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND`; see [`STEP_COMPLETED`].
     STEP_COMPLETED.store(true, std::sync::atomic::Ordering::Relaxed);
+    FIRST_BAD_FOUND.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND)
 }
 

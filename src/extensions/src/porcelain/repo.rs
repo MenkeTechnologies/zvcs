@@ -30,6 +30,7 @@
 //! `fatal: not a git repository` / exit 128, matching every other module here.
 
 use anyhow::Result;
+use crate::path::PathFormat;
 use gix::bstr::BString;
 use gix::odb::pack::Find as _;
 use gix::ObjectId;
@@ -64,10 +65,14 @@ const USAGE_STRUCTURE: &str = "usage: git repo structure [--format=(table|lines|
                                \n";
 
 /// The info keys git knows about, in the order `--keys` and `--all` emit them.
-const KEYS: [&str; 4] = [
+const KEYS: [&str; 8] = [
     "layout.bare",
     "layout.shallow",
     "object.format",
+    "path.commondir.absolute",
+    "path.commondir.relative",
+    "path.gitdir.absolute",
+    "path.gitdir.relative",
     "references.format",
 ];
 
@@ -286,8 +291,26 @@ fn value_of(repo: &gix::Repository, key: &str) -> Option<String> {
         // (refs.c:51-57, v2.55.0) compares with `strcmp`, so a value that is not the
         // exact name of a backend never reaches a report at all.
         "references.format" => Some(crate::setup::ref_storage_format(repo)),
+        // `get_path_{commondir,gitdir}_{absolute,relative}()` (builtin/repo.c:80-122,
+        // v2.56.0): `format_path(buf, repo_get_{common,git}_dir(repo), repo->prefix,
+        // PATH_FORMAT_CANONICAL | PATH_FORMAT_RELATIVE)`, the rendering
+        // `rev-parse --path-format` uses too.
+        "path.commondir.absolute" => Some(path_value(repo, &super::rev_parse::repo_get_common_dir(repo), PathFormat::Canonical)),
+        "path.commondir.relative" => Some(path_value(repo, &super::rev_parse::repo_get_common_dir(repo), PathFormat::Relative)),
+        "path.gitdir.absolute" => Some(path_value(repo, &super::rev_parse::repo_get_git_dir(repo), PathFormat::Canonical)),
+        "path.gitdir.relative" => Some(path_value(repo, &super::rev_parse::repo_get_git_dir(repo), PathFormat::Relative)),
         _ => None,
     }
+}
+
+/// One `path.*` value: `format_path()` measured from where git stands after setup,
+/// with `repo->prefix` — the path from the top of the work tree down to the
+/// directory the command was run in, NULL at the top or outside a work tree.
+fn path_value(repo: &gix::Repository, path: &std::path::Path, format: PathFormat) -> String {
+    let prefix = crate::setup::startup_prefix(repo);
+    let cwd = crate::setup::setup_cwd(repo).unwrap_or_default();
+    let bytes = crate::path::format_path(path, prefix.as_deref(), format, &cwd);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// `git repo structure` — count references and reachable objects, then print the

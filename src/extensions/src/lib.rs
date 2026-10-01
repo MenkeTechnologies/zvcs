@@ -50,6 +50,7 @@ pub mod objpath;
 pub mod optint;
 pub mod pager;
 pub mod parseopt;
+pub mod path;
 pub mod pathspec;
 pub mod pkg;
 pub mod plugin_host;

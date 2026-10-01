@@ -1806,7 +1806,7 @@ fn superproject_working_tree(repo: &gix::Repository) -> Option<std::path::PathBu
     let cwd = crate::setup::setup_cwd(repo)?;
     let one_up = std::fs::canonicalize(cwd.join("..")).ok()?;
     // `relative_path(cwd, one_up)`: the path of this directory below its parent.
-    let subpath = relative_path(
+    let subpath = crate::path::relative_path(
         cwd.as_os_str().as_encoded_bytes(),
         Some(one_up.as_os_str().as_encoded_bytes()),
     );
@@ -3329,59 +3329,39 @@ impl PathCtx {
             .map(|rel| format!("{}/", rel.display()));
         PathCtx { root, prefix, different_commondir: different_commondir(repo) }
     }
-
-    /// `strbuf_realpath_forgiving()`: resolve as much of `path` as exists and keep
-    /// the rest verbatim. A relative path is joined onto [`PathCtx::root`] first,
-    /// which is git's cwd.
-    fn realpath(&self, path: &std::path::Path) -> std::path::PathBuf {
-        let absolute =
-            if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
-        if let Ok(p) = std::fs::canonicalize(&absolute) {
-            return p;
-        }
-        // Peel components off the tail until something resolves, then put them back.
-        let mut tail: Vec<std::ffi::OsString> = Vec::new();
-        let mut head = absolute.clone();
-        while let Some(parent) = head.parent().map(std::path::Path::to_path_buf) {
-            let Some(name) = head.file_name().map(std::ffi::OsString::from) else { break };
-            head = parent;
-            tail.push(name);
-            if let Ok(resolved) = std::fs::canonicalize(&head) {
-                let mut out = resolved;
-                for name in tail.iter().rev() {
-                    out.push(name);
-                }
-                return out;
-            }
-        }
-        absolute
-    }
 }
 
 /// ```c
-/// static void print_path(const char *path, const char *prefix, enum format_type format, enum default_type def)
+/// static void print_path(const char *path, const char *prefix,
+///                        enum format_type format, enum default_type def)
 /// {
-///         char *cwd = NULL;
-///         if (!prefix && (format != FORMAT_DEFAULT || def != DEFAULT_RELATIVE_IF_SHARED))
-///                 prefix = cwd = xgetcwd();
-///         if (format == FORMAT_DEFAULT && def == DEFAULT_UNMODIFIED) {
-///                 puts(path);
-///         } else if (format == FORMAT_RELATIVE ||
-///                   (format == FORMAT_DEFAULT && def == DEFAULT_RELATIVE)) {
-///                 /* both sides are made absolute first */
-///                 puts(relative_path(path, prefix, &buf));
-///         } else if (format == FORMAT_DEFAULT && def == DEFAULT_RELATIVE_IF_SHARED) {
-///                 puts(relative_path(path, prefix, &buf));
+///         if (format == FORMAT_DEFAULT) {
+///                 switch (def) {
+///                 case DEFAULT_RELATIVE:           fmt = PATH_FORMAT_RELATIVE; break;
+///                 case DEFAULT_RELATIVE_IF_SHARED: fmt = PATH_FORMAT_RELATIVE_IF_SHARED; break;
+///                 case DEFAULT_CANONICAL:          fmt = PATH_FORMAT_CANONICAL; break;
+///                 case DEFAULT_UNMODIFIED:
+///                 default:                         fmt = PATH_FORMAT_UNMODIFIED; break;
+///                 }
 ///         } else {
-///                 strbuf_realpath_forgiving(&buf, path, 1);
-///                 puts(buf.buf);
+///                 switch (format) {
+///                 case FORMAT_RELATIVE:  fmt = PATH_FORMAT_RELATIVE; break;
+///                 case FORMAT_CANONICAL: fmt = PATH_FORMAT_CANONICAL; break;
+///                 default:               fmt = PATH_FORMAT_UNMODIFIED; break;
+///                 }
 ///         }
+///         format_path(&sb, path, prefix, fmt);
+///         puts(sb.buf);
 /// }
 /// ```
 ///
-/// (`builtin/rev-parse.c:656-703`.) The `RELATIVE_IF_SHARED` arm is the only one
-/// that can see a NULL `prefix`, and there a NULL prefix makes `relative_path()`
-/// return its input unchanged — which is how a stored `.git` prints as `.git`.
+/// (`builtin/rev-parse.c:656-696`, v2.56.0.) 2.56 moved the rendering into
+/// `format_path()` (`path.c:1582`) so `git repo info` shares it; it is
+/// [`crate::path::format_path`] here, measured from [`PathCtx::root`].
+///
+/// `PATH_FORMAT_RELATIVE_IF_SHARED` is the only format that can see a NULL
+/// `prefix`, and there a NULL prefix makes `relative_path()` return its input
+/// unchanged — which is how a stored `.git` prints as `.git`.
 fn print_path(
     out: &mut impl Write,
     ctx: &PathCtx,
@@ -3389,143 +3369,40 @@ fn print_path(
     format: Format,
     def: DefaultType,
 ) -> Result<()> {
-    let text = path.as_os_str().as_encoded_bytes().to_vec();
-    let shared_default = format == Format::Default && def == DefaultType::RelativeIfShared;
-
-    let rendered: Vec<u8> = if format == Format::Default && def == DefaultType::Unmodified {
-        text
-    } else if format == Format::Relative
-        || (format == Format::Default && def == DefaultType::Relative)
-    {
-        // `relative_path()` compares text, so both sides are absolutized first or a
-        // relative path measured against an absolute one is simply handed back.
-        let abs = ctx.realpath(path);
-        let base = ctx.realpath(std::path::Path::new(ctx.prefix.as_deref().unwrap_or("")));
-        relative_path(
-            abs.as_os_str().as_encoded_bytes(),
-            Some(base.as_os_str().as_encoded_bytes()),
-        )
-    } else if shared_default {
-        // `DEFAULT_RELATIVE_IF_SHARED` relativizes only when the common directory
-        // *is* the git directory — a linked worktree's, or one named by
-        // `$GIT_COMMON_DIR`, is printed as it stands. Measured against stock
-        // 2.55.0: from a subdirectory of a plain checkout `--git-common-dir` is
-        // `../.git` and `--git-path HEAD` is `../.git/HEAD`, while the same two in
-        // a linked worktree's subdirectory are the absolute paths.
-        //
-        // With no prefix there is nothing to measure against and the stored string
-        // is printed unchanged, which is what `--git-path HEAD` inside `.git/refs`
-        // shows: the absolute path, not the `HEAD` a climb from the git directory
-        // would produce.
-        match ctx.prefix.as_deref() {
-            Some(prefix) if !ctx.different_commondir => {
-                // Both operands go to `relative_path()` exactly as git holds them:
-                // the *stored* git-directory string on one side (see
-                // [`repo_gitdir_string`]) and git's own `prefix` on the other. That
-                // is what `have_same_root()` (`path.c:926-934`) is deciding on, and
-                // it is why the answer flips with how the repository was addressed:
-                // a discovered `.git` is the relative string `.git`, shares a root
-                // with the relative prefix `sub/`, and comes out `../.git`, while a
-                // `$GIT_DIR` that `set_git_dir(gitdirenv, 1)` realpath'd is absolute,
-                // shares no root with a relative prefix, and is handed back whole.
-                // Absolutizing either side here erases that distinction.
-                relative_path(
-                    path.as_os_str().as_encoded_bytes(),
-                    Some(prefix.as_bytes()),
-                )
-            }
-            _ => text,
-        }
-    } else {
-        ctx.realpath(path).as_os_str().as_encoded_bytes().to_vec()
+    use crate::path::PathFormat;
+    let fmt = match (format, def) {
+        (Format::Default, DefaultType::Relative) => PathFormat::Relative,
+        (Format::Default, DefaultType::RelativeIfShared) => PathFormat::RelativeIfShared,
+        (Format::Default, DefaultType::Canonical) => PathFormat::Canonical,
+        (Format::Default, DefaultType::Unmodified) => PathFormat::Unmodified,
+        (Format::Relative, _) => PathFormat::Relative,
+        (Format::Canonical, _) => PathFormat::Canonical,
     };
-    out.write_all(&rendered)?;
+    // `DEFAULT_RELATIVE_IF_SHARED` relativizes only when the common directory
+    // *is* the git directory — a linked worktree's, or one named by
+    // `$GIT_COMMON_DIR`, is printed as it stands. Measured against stock git:
+    // from a subdirectory of a plain checkout `--git-common-dir` is `../.git` and
+    // `--git-path HEAD` is `../.git/HEAD`, while the same two in a linked
+    // worktree's subdirectory are the absolute paths. git gets there because the
+    // stored common directory is absolute in that case and shares no root with
+    // the relative prefix; withholding the prefix gives `relative_path()` the
+    // same nothing-to-measure-against answer.
+    //
+    // Both operands otherwise go to `relative_path()` exactly as git holds them:
+    // the *stored* git-directory string on one side (see [`repo_gitdir_string`])
+    // and git's own `prefix` on the other. That is what `have_same_root()`
+    // (`path.c:926-934`) is deciding on, and it is why the answer flips with how
+    // the repository was addressed: a discovered `.git` is the relative string
+    // `.git`, shares a root with the relative prefix `sub/`, and comes out
+    // `../.git`, while a `$GIT_DIR` that `set_git_dir(gitdirenv, 1)` realpath'd
+    // is absolute, shares no root with a relative prefix, and is handed back whole.
+    let prefix = match fmt == PathFormat::RelativeIfShared && ctx.different_commondir {
+        true => None,
+        false => ctx.prefix.as_deref(),
+    };
+    out.write_all(&crate::path::format_path(path, prefix, fmt, &ctx.root))?;
     out.write_all(b"\n")?;
     Ok(())
-}
-
-/// ```c
-/// const char *relative_path(const char *in, const char *prefix, struct strbuf *sb)
-/// ```
-///
-/// (`path.c:942-1037`), byte for byte: an empty `in` is `./`, an empty (or NULL)
-/// `prefix` returns `in` unchanged, and paths that do not share a root are also
-/// returned unchanged. Otherwise the shared directory components are dropped and one
-/// `../` is emitted per component of `prefix` that is left over.
-pub(crate) fn relative_path(input: &[u8], prefix: Option<&[u8]>) -> Vec<u8> {
-    let is_sep = |b: u8| b == b'/';
-    let in_len = input.len();
-    let prefix = prefix.unwrap_or(b"");
-    let prefix_len = prefix.len();
-    if in_len == 0 {
-        return b"./".to_vec();
-    }
-    if prefix_len == 0 {
-        return input.to_vec();
-    }
-    // `have_same_root()`: on a POSIX filesystem that is "both absolute or both
-    // relative", since there is no drive prefix to compare.
-    if input.starts_with(b"/") != prefix.starts_with(b"/") {
-        return input.to_vec();
-    }
-
-    let (mut i, mut j) = (0usize, 0usize);
-    let (mut prefix_off, mut in_off) = (0usize, 0usize);
-    while i < prefix_len && j < in_len && prefix[i] == input[j] {
-        if is_sep(prefix[i]) {
-            while i < prefix_len && is_sep(prefix[i]) {
-                i += 1;
-            }
-            while j < in_len && is_sep(input[j]) {
-                j += 1;
-            }
-            prefix_off = i;
-            in_off = j;
-        } else {
-            i += 1;
-            j += 1;
-        }
-    }
-
-    if i >= prefix_len && prefix_off < prefix_len {
-        if j >= in_len {
-            in_off = in_len;
-        } else if is_sep(input[j]) {
-            while j < in_len && is_sep(input[j]) {
-                j += 1;
-            }
-            in_off = j;
-        } else {
-            i = prefix_off;
-        }
-    } else if j >= in_len && in_off < in_len && i < prefix_len && is_sep(prefix[i]) {
-        while i < prefix_len && is_sep(prefix[i]) {
-            i += 1;
-        }
-        in_off = in_len;
-    }
-
-    let rest = &input[in_off..];
-    if i >= prefix_len {
-        return if rest.is_empty() { b"./".to_vec() } else { rest.to_vec() };
-    }
-
-    let mut sb: Vec<u8> = Vec::with_capacity(rest.len());
-    while i < prefix_len {
-        if is_sep(prefix[i]) {
-            sb.extend_from_slice(b"../");
-            while i < prefix_len && is_sep(prefix[i]) {
-                i += 1;
-            }
-            continue;
-        }
-        i += 1;
-    }
-    if !is_sep(prefix[prefix_len - 1]) {
-        sb.extend_from_slice(b"../");
-    }
-    sb.extend_from_slice(rest);
-    sb
 }
 
 /// ```c
@@ -3913,13 +3790,19 @@ fn join_str(base: &std::path::Path, name: &str) -> String {
 /// The return value of `find_common_dir()` is `repo->different_commondir`, which
 /// is what `print_path()`'s `DEFAULT_RELATIVE_IF_SHARED` branches on — see
 /// [`different_commondir`].
-fn gitdir_common_string(repo: &gix::Repository, ctx: &PathCtx) -> std::path::PathBuf {
+fn gitdir_common_string(repo: &gix::Repository, _ctx: &PathCtx) -> std::path::PathBuf {
+    repo_get_common_dir(repo)
+}
+
+/// `repo_get_common_dir(the_repository)`: the `repo->commondir` string described
+/// above, shared with `git repo info`'s `path.commondir.*` keys.
+pub(crate) fn repo_get_common_dir(repo: &gix::Repository) -> std::path::PathBuf {
     if let Some(value) = std::env::var_os("GIT_COMMON_DIR") {
         return value.into();
     }
     match commondir_file_target(&absolute(repo.git_dir())) {
         Some(target) => target,
-        None => repo_gitdir_string(repo, ctx),
+        None => repo_get_git_dir(repo),
     }
 }
 

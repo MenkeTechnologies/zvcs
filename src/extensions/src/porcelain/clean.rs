@@ -507,7 +507,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
         // (builtin/clean.c:1053-1056), which `remove_dirs()` extends and renders
         // relative to `prefix` again — hence `./f` for a file of the very directory
         // the command runs in, which `rel` names `./`.
-        let rel = BString::from(super::rev_parse::relative_path(&key, Some(&prefix_slash)));
+        let rel = BString::from(crate::path::relative_path(&key, Some(&prefix_slash)));
         let shown = quote_path(&rel);
 
         let Some(abs) = repo.workdir_path(&rela_path) else {
@@ -633,7 +633,7 @@ impl RemoveDirs<'_> {
         let mut ret = false;
         *dir_gone = true;
 
-        let shown = |p: &BStr| quote_path(super::rev_parse::relative_path(p, Some(self.prefix)));
+        let shown = |p: &BStr| quote_path(crate::path::relative_path(p, Some(self.prefix)));
         // stdout is buffered so the `Removing` lines stay in walk order; a
         // warning has to see everything printed before it, as git's unbuffered
         // `printf`/`warning_errno` pair does.

@@ -1154,6 +1154,10 @@ struct Format {
     has_disk_size: bool,
     /// Whether `%(deltabase)` appears; same reasoning, a different lookup.
     has_delta_base: bool,
+    /// The format is [`DEFAULT_FORMAT`] spelled out, which `batch_objects()`
+    /// turns back into `opt->format = NULL` — so `print_default_format()` writes
+    /// the record rather than `expand_format()`.
+    is_default: bool,
 }
 
 const DEFAULT_FORMAT: &str = "%(objectname) %(objecttype) %(objectsize)";
@@ -1229,7 +1233,7 @@ fn compile_format(fmt: &str) -> std::result::Result<Format, String> {
     if !lit.is_empty() {
         tokens.push(Token::Literal(lit));
     }
-    Ok(Format { tokens, has_rest, has_disk_size, has_delta_base })
+    Ok(Format { tokens, has_rest, has_disk_size, has_delta_base, is_default: fmt == DEFAULT_FORMAT })
 }
 
 /// Render one info line into `out` (no trailing delimiter).
@@ -1699,6 +1703,10 @@ fn run_batch(
                         out.flush()?;
                         return Ok(ExitCode::from(code));
                     }
+                    CommandResult::Exit(code) => {
+                        out.flush()?;
+                        return Ok(code);
+                    }
                 }
             }
             _ => {
@@ -1738,6 +1746,8 @@ enum CommandResult {
     Ok,
     /// git `die`d: flush and exit with this code.
     Die(u8),
+    /// A `die()` whose status a shared transport helper already settled.
+    Exit(ExitCode),
 }
 
 /// Outcome of emitting one batch record. `Die` carries the process exit code for
@@ -1802,11 +1812,14 @@ fn handle_command(
     }
     let mut word: &[u8] = b"";
     let mut arg: &[u8] = b"";
+    // `commands[]` in 2.56's order (builtin/cat-file.c:912-922), which added
+    // `remote-object-info`.
     for (name, takes_args) in [
         (&b"contents"[..], true),
-        (&b"info"[..], true),
         (&b"flush"[..], false),
+        (&b"info"[..], true),
         (&b"mailmap"[..], true),
+        (&b"remote-object-info"[..], true),
     ] {
         let Some(rest) = line.strip_prefix(name) else {
             continue;
@@ -1856,6 +1869,13 @@ fn handle_command(
                 EmitOutcome::Die(code) => Ok(CommandResult::Die(code)),
             }
         }
+        b"remote-object-info" => {
+            let result = remote_object_info(out, repo, fmt, arg, delim)?;
+            if !buffer {
+                out.flush()?;
+            }
+            Ok(result)
+        }
         _ => {
             eprintln!(
                 "fatal: unknown command: '{}'",
@@ -1864,6 +1884,353 @@ fn handle_command(
             Ok(CommandResult::Die(128))
         }
     }
+}
+
+/// `MAX_REMOTE_URL_LEN`, `MAX_ALLOWED_OBJ_LIMIT` and `MAX_REMOTE_OBJ_INFO_LINE`
+/// (builtin/cat-file.c:36-47, git 2.56); `GIT_MAX_HEXSZ` is SHA-256's 64.
+const MAX_REMOTE_URL_LEN: usize = 8 * 1024;
+const MAX_ALLOWED_OBJ_LIMIT: usize = 10000;
+const MAX_REMOTE_OBJ_INFO_LINE: usize = MAX_REMOTE_URL_LEN + MAX_ALLOWED_OBJ_LIMIT * (64 + 1);
+
+/// What `fetch_object_info()` (fetch-object-info.c:53-185) brought back: one entry
+/// per requested id, `None` for an id the server does not recognise, and the
+/// two attribute columns only when the server sent them.
+struct RemoteObjectInfo {
+    sizes: Option<Vec<u64>>,
+    types: Option<Vec<Option<Kind>>>,
+    unrecognized: Vec<bool>,
+}
+
+/// `parse_cmd_remote_object_info()` (builtin/cat-file.c:818-886, git 2.56):
+/// `remote-object-info <remote> <oid>...` asks the remote's protocol-v2
+/// `object-info` command for each object's size and type without fetching it.
+///
+/// The line is split like a shell command line, the remote is the first word,
+/// and every other word has to be a full object id. Each answer is written with
+/// the batch format, where only the atoms the server could fill — always
+/// `%(objectname)`, `%(objectsize)` and `%(objecttype)` when it sent them —
+/// expand to anything; every other atom expands to nothing. An id the server does
+/// not know is `<oid> missing`.
+fn remote_object_info(
+    out: &mut impl Write,
+    repo: &gix::Repository,
+    fmt: &Format,
+    arg: &[u8],
+    delim: u8,
+) -> Result<CommandResult> {
+    let die = |message: &str| {
+        eprintln!("fatal: {message}");
+        Ok(CommandResult::Die(128))
+    };
+    if arg.len() >= MAX_REMOTE_OBJ_INFO_LINE {
+        return die("remote-object-info command too long");
+    }
+    let argv = match crate::alias::split_cmdline(&String::from_utf8_lossy(arg)) {
+        Ok(argv) => argv,
+        Err(e) => return die(&format!("remote-object-info: failed to parse command line: {e}")),
+    };
+    if argv.len() - 1 > MAX_ALLOWED_OBJ_LIMIT {
+        return die(&format!("remote-object-info supports at most {MAX_ALLOWED_OBJ_LIMIT} objects"));
+    }
+
+    // `get_remote_info()` (builtin/cat-file.c:683-732). `remote_get()` takes any
+    // other word as a URL, so only the empty name comes back NULL.
+    let remote_name = argv[0].as_str();
+    if remote_name.is_empty() {
+        return die("must supply valid remote when using remote-object-info");
+    }
+    let hexsz = repo.object_hash().len_in_hex();
+    let mut oids = Vec::with_capacity(argv.len() - 1);
+    for word in &argv[1..] {
+        // `get_oid_hex()` reads exactly `hexsz` digits and ignores what follows.
+        match word.get(..hexsz).and_then(|hex| gix::hash::ObjectId::from_hex(hex.as_bytes()).ok()) {
+            Some(oid) => oids.push(oid),
+            None => {
+                if word.len() < hexsz && word.len() >= 4 && word.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return die(&format!(
+                        "remote-object-info does not support short oids, {hexsz} characters required"
+                    ));
+                }
+                return die(&format!("not a valid object name '{word}'"));
+            }
+        }
+    }
+    if oids.is_empty() {
+        return die("remote-object-info requires objects");
+    }
+
+    // The atoms `batch_objects()` marked in its `mark_query` pass decide what is
+    // asked for; the default format names both.
+    let wants_size = fmt.tokens.iter().any(|t| matches!(t, Token::ObjectSize));
+    let wants_type = fmt.tokens.iter().any(|t| matches!(t, Token::ObjectType));
+    let info = match fetch_object_info(repo, remote_name, &oids, wants_size, wants_type)? {
+        Ok(info) => info,
+        Err(code) => return Ok(CommandResult::Exit(code)),
+    };
+
+    for (i, oid) in oids.iter().enumerate() {
+        if info.unrecognized[i] {
+            // `report_object_status(opt, oid_to_hex(&data->oid), …, "missing")`
+            write!(out, "{oid} missing")?;
+            out.write_all(&[delim])?;
+            out.flush()?;
+            continue;
+        }
+        let size = info.sizes.as_ref().map(|s| s[i]);
+        let kind = info.types.as_ref().and_then(|t| t[i]);
+        let mut line = Vec::new();
+        if fmt.is_default {
+            // `print_default_format()` takes no notice of which atoms the server
+            // could answer.
+            line.extend_from_slice(format!("{oid} ").as_bytes());
+            if let Some(kind) = kind {
+                line.extend_from_slice(kind.to_string().as_bytes());
+            }
+            line.extend_from_slice(format!(" {}", size.unwrap_or(0)).as_bytes());
+        } else {
+            // `expand_atom()` with `data->is_remote`: an atom outside
+            // `remote_allowed_atoms` expands to nothing.
+            for token in &fmt.tokens {
+                match token {
+                    Token::Literal(l) => line.extend_from_slice(l),
+                    Token::ObjectName => line.extend_from_slice(oid.to_string().as_bytes()),
+                    Token::ObjectSize => {
+                        if let Some(size) = size {
+                            line.extend_from_slice(size.to_string().as_bytes());
+                        }
+                    }
+                    Token::ObjectType => {
+                        if info.types.is_some() {
+                            if let Some(kind) = kind {
+                                line.extend_from_slice(kind.to_string().as_bytes());
+                            }
+                        }
+                    }
+                    Token::ObjectSizeDisk | Token::DeltaBase | Token::ObjectMode | Token::Rest => {}
+                }
+            }
+        }
+        line.push(delim);
+        out.write_all(&line)?;
+    }
+    Ok(CommandResult::Ok)
+}
+
+/// `transport_get()` plus `fetch_object_info_via_pack()` (transport.c:436-468) and
+/// `fetch_object_info()` (fetch-object-info.c:53-185): connect to `remote_name`,
+/// require protocol v2 and an `object-info` capability, ask for the attributes the
+/// server advertises among those wanted, and read one answer per id.
+///
+/// `Ok(Err(code))` is a `die()` already reported on stderr.
+fn fetch_object_info(
+    repo: &gix::Repository,
+    remote_name: &str,
+    oids: &[gix::hash::ObjectId],
+    wants_size: bool,
+    wants_type: bool,
+) -> Result<std::result::Result<RemoteObjectInfo, ExitCode>> {
+    use gix::protocol::transport::client::blocking_io::TransportV2Ext;
+
+    let die = |message: &str| {
+        eprintln!("fatal: {message}");
+        Ok(Err(ExitCode::from(128)))
+    };
+    let remote = match repo.find_fetch_remote(Some(remote_name.as_bytes().as_bstr())) {
+        Ok(remote) => remote,
+        Err(e) => return die(&e.to_string()),
+    };
+    let url = remote.url(gix::remote::Direction::Fetch).cloned();
+    if let Some(code) = url.as_ref().and_then(crate::setup::check_url_allowed) {
+        return Ok(Err(code));
+    }
+    let configured_name = remote.name().map(|n| n.as_bstr().to_string());
+    let connect_options = gix::remote::connect::Options {
+        upload_pack: super::fetch::local_service_program(
+            url.as_ref(),
+            super::fetch::upload_pack_program(repo, configured_name.as_deref(), None),
+            "upload-pack",
+        ),
+        current_dir: crate::setup::setup_cwd(repo),
+        ..Default::default()
+    };
+    let mut connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
+        Ok(connection) => connection,
+        Err(gix::remote::connect::Error::FileUrl { url, .. }) => {
+            return Ok(Err(crate::transport_err::not_a_repository_fatal(
+                &url.to_bstring().to_string(),
+            )));
+        }
+        Err(e) => return die(&e.to_string()),
+    };
+    let url_text = url.as_ref().map(|u| u.to_bstring().to_string()).unwrap_or_default();
+    let mut authenticate = match url.clone().map(|u| connection.configured_credentials(u)) {
+        Some(Ok(f)) => f,
+        _ => Box::new(gix::credentials::builtin) as gix::remote::AuthenticateFn<'static>,
+    };
+    if let Ok(Some(options)) =
+        repo.transport_options(url_text.as_str(), configured_name.as_deref().map(|n| n.as_bytes().as_bstr()))
+    {
+        if let Err(e) = connection.transport_mut().configure(&*options) {
+            return die(&e.to_string());
+        }
+    }
+    let handshake = match gix::protocol::handshake(
+        connection.transport_mut(),
+        gix::protocol::transport::Service::UploadPack,
+        &mut authenticate,
+        Vec::new(),
+        &mut gix::progress::Discard,
+    ) {
+        Ok(handshake) => handshake,
+        Err(e) => {
+            let err = anyhow::Error::from(e);
+            if let Some(code) = crate::transport_err::ssh_fatal(&url_text, &err)
+                .or_else(|| crate::transport_err::hang_up_fatal(&err))
+            {
+                return Ok(Err(code));
+            }
+            return die(&err.to_string());
+        }
+    };
+    if handshake.server_protocol_version != gix::protocol::transport::Protocol::V2 {
+        // The server is still waiting for an answer to its advertisement, so it
+        // hangs up as the connection closes.
+        eprintln!("fatal: object-info requires protocol v2");
+        eprintln!("fatal: the remote end hung up unexpectedly");
+        return Ok(Err(ExitCode::from(128)));
+    }
+    let Some(capability) = handshake.capabilities.capability("object-info") else {
+        return die("object-info capability is not enabled on the server");
+    };
+    let ask_size = wants_size && capability.supports("size").unwrap_or(false);
+    let ask_type = wants_type && capability.supports("type").unwrap_or(false);
+
+    // `write_command_and_capabilities()` (connect.c:712-745).
+    let mut features: Vec<(&str, Option<String>)> = Vec::new();
+    if handshake.capabilities.contains("agent") {
+        features.push(("agent", Some(super::version::user_agent_sanitized())));
+    }
+    if let Some(format) = handshake.capabilities.capability("object-format").and_then(|c| c.value().map(|v| v.to_string())) {
+        let ours = repo.object_hash().to_string();
+        if format != ours {
+            return die(&format!("mismatched algorithms: client {ours}; server {format}"));
+        }
+        features.push(("object-format", Some(ours)));
+    } else if repo.object_hash() != gix::hash::Kind::Sha1 {
+        return die(&format!("the server does not support algorithm '{}'", repo.object_hash()));
+    }
+    let mut arguments: Vec<gix::bstr::BString> = Vec::new();
+    if ask_size {
+        arguments.push("size".into());
+    }
+    if ask_type {
+        arguments.push("type".into());
+    }
+    arguments.extend(oids.iter().map(|oid| format!("oid {oid}").into()));
+
+    let wanted = usize::from(ask_size) + usize::from(ask_type);
+    let mut info = RemoteObjectInfo {
+        sizes: None,
+        types: None,
+        unrecognized: vec![false; oids.len()],
+    };
+    let (mut size_index, mut type_index) = (None, None);
+    {
+        let transport = connection.transport_mut();
+        let mut reply = match transport.invoke("object-info", features.into_iter(), Some(arguments.into_iter()), false) {
+            Ok(reply) => reply,
+            Err(e) => return die(&e.to_string()),
+        };
+        // `packet_reader_read()` with `PACKET_READ_DIE_ON_ERR_PACKET`: the next data
+        // line, or `None` at a flush, at the end of the stream, or on a bad packet.
+        let mut next_line = |reply: &mut Box<dyn gix::protocol::transport::client::blocking_io::ExtendedBufRead<'_> + Unpin + '_>|
+         -> std::result::Result<Option<String>, String> {
+            match reply.readline() {
+                Some(Ok(Ok(line))) => {
+                    if let Some(err) = line.check_error() {
+                        return Err(format!("remote error: {}", err.0.as_bstr()));
+                    }
+                    Ok(line.as_bstr().map(|l| l.to_str_lossy().trim_end_matches('\n').to_owned()))
+                }
+                _ => Ok(None),
+            }
+        };
+        for i in 0..wanted {
+            let line = match next_line(&mut reply) {
+                Ok(Some(line)) => line,
+                Ok(None) => return die(&format!("object-info: expected {wanted} attributes, got {i}")),
+                Err(message) => return die(&message),
+            };
+            match line.as_str() {
+                "size" => {
+                    if !ask_size {
+                        return die("object-info: unrequested 'size' attribute");
+                    }
+                    if info.sizes.is_some() {
+                        return die("object-info: duplicate 'size' attribute");
+                    }
+                    size_index = Some(i);
+                    info.sizes = Some(vec![0; oids.len()]);
+                }
+                "type" => {
+                    if !ask_type {
+                        return die("object-info: unrequested 'type' attribute");
+                    }
+                    if info.types.is_some() {
+                        return die("object-info: duplicate 'type' attribute");
+                    }
+                    type_index = Some(i);
+                    info.types = Some(vec![None; oids.len()]);
+                }
+                other => return die(&format!("object-info: unknown attribute '{other}'")),
+            }
+        }
+        for (i, oid) in oids.iter().enumerate() {
+            let line = match next_line(&mut reply) {
+                Ok(Some(line)) => line,
+                Ok(None) => return die(&format!("object-info: expected {} objects, got {i}", oids.len())),
+                Err(message) => return die(&message),
+            };
+            // `string_list_split(…, " ", -1)`: every space separates, so a trailing
+            // one leaves an empty last field.
+            let values: Vec<&str> = line.split(' ').collect();
+            let hex = oid.to_string();
+            if values[0] != hex {
+                return die(&format!("object-info: expected OID: {hex}, got {}", values[0]));
+            }
+            if values.len() >= 2 && values[1].is_empty() {
+                info.unrecognized[i] = true;
+                continue;
+            }
+            if wanted + 1 != values.len() {
+                return die(&format!("object-info: unexpected number of attributes: {line}"));
+            }
+            if let (Some(sizes), Some(at)) = (info.sizes.as_mut(), size_index) {
+                let text = values[at + 1];
+                match (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| text.parse::<u64>().ok())
+                    .flatten()
+                {
+                    Some(size) => sizes[i] = size,
+                    None => return die(&format!("object-info: object {hex} has invalid size {text}")),
+                }
+            }
+            if let (Some(types), Some(at)) = (info.types.as_mut(), type_index) {
+                let text = values[at + 1];
+                match Kind::from_bytes(text.as_bytes()) {
+                    Ok(kind) => types[i] = Some(kind),
+                    Err(_) => return die(&format!("object-info: object {hex} has invalid type '{text}'")),
+                }
+            }
+        }
+        let trailing = next_line(&mut reply);
+        if !matches!(trailing, Ok(None))
+            || !matches!(reply.stopped_at(), Some(gix::protocol::transport::client::MessageKind::Flush))
+        {
+            return die(&format!("object-info: expected flush after {} objects", oids.len()));
+        }
+    }
+    Ok(Ok(info))
 }
 
 /// Process one object request line: resolve the name, honor `%(rest)` splitting

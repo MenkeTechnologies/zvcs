@@ -70,25 +70,27 @@
 //!     with the primary base's pack fetch. That fetch order across multiple
 //!     bases cannot be verified against git without a live multi-remote server,
 //!     so a non-empty list bails rather than fabricate an order.
-//!   * **`--packfile=<hash>` / `--index-pack-args=<args>`.** These bypass the
+//!   * **`--packfile=<hash>` with `--index-pack-arg=<arg>`.** These bypass the
 //!     walker entirely: git downloads the one pack named by the positional URL
 //!     and pipes it through `index-pack` with the caller-supplied
-//!     `--index-pack-args` as that program's *entire* argument vector, with its
+//!     `--index-pack-arg` values as that program's *entire* argument vector, with its
 //!     stdout preserved (`preserve_index_pack_stdout`). Those args are git's own
 //!     `index-pack` command line — arbitrary, and routinely including flags this
 //!     port's `index-pack` rejects (`--fix-thin`, `--keep=<msg>`, `--pack_header`)
 //!     — and reproducing that program's exact stdout under them is not something
-//!     the vendored partial `index-pack` can honour. The `--packfile` argument is
-//!     still validated first so git's `fatal: argument to --packfile must be a
-//!     valid hash (got '<v>')` and its exit code 128 are reproduced.
+//!     the vendored partial `index-pack` can honour. Everything
+//!     http-fetch.c:115-168 checks before `fetch_single_packfile()` is ported —
+//!     the in-loop `not a git repository` and hash checks, the argument count,
+//!     and both `the option '<x>' requires '<y>'` pairings — so only an invocation
+//!     that would really download a pack reaches the refusal.
 //!   * **A `ref: <name>` response** to a target fetch (a symbolic ref served as
 //!     a plain file). git records the symref and then walks a null id; that is a
 //!     degenerate path this port refuses instead of imitating.
 //!
-//! One deliberate divergence: git silently ignores unrecognised options (its
-//! parser tests one character and falls through), so `git http-fetch --nonsense
-//! <id> <url>` exits 0. Silently accepting a flag whose effect is unimplemented
-//! is exactly the failure mode this port must not have, so unknown options bail.
+//! Unrecognised options are skipped, as git skips them: its parser tests the
+//! second character and falls through (http-fetch.c:115-146), so an unknown
+//! `--flag` has no effect beyond counting towards the arguments the usage check
+//! sees. `-h` prints the usage line and exits 129 at once (http-fetch.c:126-127).
 //!
 //! One deliberate implementation difference with no observable effect: git
 //! verifies a downloaded object in a temporary file and only then renames it
@@ -127,55 +129,82 @@ pub fn http_fetch(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut recover = false;
     let mut on_stdin = false;
+    let mut packfile = false;
+    let mut index_pack_args: Vec<&str> = Vec::new();
     let mut write_ref: Option<&str> = None;
 
-    // git's loop: every argument starting with `-` is an option, and the tests
-    // are on a single character, so `-w` takes the *next* argv entry.
+    // `setup_git_directory_gently(the_repository, &nongit)` (http-fetch.c:113)
+    // runs before the scan: `--packfile=` consults `nongit` inside the loop.
+    let repo = crate::setup::discover().ok();
+    let not_a_repository = || {
+        eprintln!("fatal: not a git repository");
+        Ok(ExitCode::from(128))
+    };
+
+    // http-fetch.c:115-146: every argument starting with `-` is an option, and
+    // the tests are on its second character, so `-w` takes the *next* argv
+    // entry and anything no branch matches is skipped without a word.
     while arg < argv.len() && argv[arg].starts_with('-') {
         let a = argv[arg];
-        match a.as_bytes()[1..].first().copied() {
-            // Documented as ignored for historical reasons; `-h` matches no
-            // branch in git either and falls through to the argument count check.
-            Some(b't' | b'c' | b'a' | b'h') => {}
+        match a.as_bytes().get(1).copied() {
+            // Documented as ignored for historical reasons.
+            Some(b't' | b'c' | b'a') => {}
             Some(b'v') => verbose = true,
             Some(b'w') => {
                 write_ref = argv.get(arg + 1).copied();
                 arg += 1;
             }
+            Some(b'h') => {
+                eprint!("{USAGE}");
+                return Ok(ExitCode::from(129));
+            }
             _ if a == "--recover" => recover = true,
             _ if a == "--stdin" => on_stdin = true,
             _ if a.starts_with("--packfile=") => {
-                // git validates the hash inside the parse loop, before anything
-                // else, and dies with this exact message.
+                if repo.is_none() {
+                    return not_a_repository();
+                }
+                packfile = true;
                 let value = &a["--packfile=".len()..];
                 if ObjectId::from_hex(value.as_bytes()).is_err() {
                     eprintln!("fatal: argument to --packfile must be a valid hash (got '{value}')");
                     return Ok(ExitCode::from(128));
                 }
-                bail!(
-                    "unsupported flag \"--packfile\" — it pipes one downloaded pack through \
-                     `index-pack` with the caller-supplied --index-pack-args as that program's \
-                     entire argument vector and its stdout preserved; those args are git's own \
-                     index-pack command line (arbitrary, often including flags this port's \
-                     index-pack rejects), so its exact output cannot be reproduced ({PORTED})"
-                )
             }
-            _ if a.starts_with("--index-pack-args=") => bail!(
-                "unsupported flag \"--index-pack-args\" — it carries git's own `index-pack` \
-                 command line and is only meaningful with the unported --packfile ({PORTED})"
-            ),
-            // git ignores anything else; see the module docs for why this does not.
-            _ => bail!("unsupported flag {a:?} ({PORTED})"),
+            _ if a.starts_with("--index-pack-arg=") => index_pack_args.push(&a["--index-pack-arg=".len()..]),
+            _ => {}
         }
         arg += 1;
     }
 
-    // `argc != arg + 2 - commits_on_stdin` — one target plus the URL, or just
-    // the URL when the targets arrive on stdin.
-    let expected = if on_stdin { 1 } else { 2 };
+    // `argc != arg + 2 - (commits_on_stdin || packfile)` — one target plus the
+    // URL, or just the URL when the targets arrive on stdin or a pack is named.
+    let expected = if on_stdin || packfile { 1 } else { 2 };
     if argv.len() != arg + expected {
         eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
+    }
+
+    let Some(repo) = repo else {
+        return not_a_repository();
+    };
+
+    if packfile {
+        if index_pack_args.is_empty() {
+            eprintln!("fatal: the option '--packfile' requires '--index-pack-arg'");
+            return Ok(ExitCode::from(128));
+        }
+        // `fetch_single_packfile()` (http-fetch.c:161) — see the module docs.
+        bail!(
+            "--packfile is not ported: it pipes one downloaded pack through `index-pack` with \
+             the --index-pack-arg values as that program's entire argument vector and its \
+             stdout preserved; those are git's own index-pack command line (often including \
+             flags this port's index-pack rejects), so its exact output cannot be reproduced"
+        )
+    }
+    if !index_pack_args.is_empty() {
+        eprintln!("fatal: the option '--index-pack-arg' requires '--packfile'");
+        return Ok(ExitCode::from(128));
     }
 
     // Targets are `(what to resolve, where to write it)` pairs.
@@ -203,11 +232,6 @@ pub fn http_fetch(args: &[String]) -> Result<ExitCode> {
         format!("{url}/")
     };
     let base = url.trim_end_matches('/').to_string();
-
-    let Ok(repo) = crate::setup::discover() else {
-        eprintln!("fatal: not a git repository");
-        return Ok(ExitCode::from(128));
-    };
 
     // Objects are written, so serialize behind the repo coordinator like the
     // other write commands; a no-op guard when no daemon is running.

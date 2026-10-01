@@ -1780,7 +1780,10 @@ fn start(args: &[String]) -> Result<ExitCode> {
     // `if (is_bare_repository(the_repository)) no_checkout = 1;` (git 2.56.0
     // builtin/bisect.c:823-824): with no worktree to move, every session is a
     // `--no-checkout` one — which is also what makes `--reset-when-found` refused there.
-    let mut no_checkout = ctx.repo.workdir().is_none();
+    // `is_bare_repository()` is `bare_cfg && !repo_get_work_tree()` (environment.c:114-118), so a
+    // non-bare repository entered from inside `.git`, which has no work tree found, is
+    // not bare.
+    let mut no_checkout = ctx.repo.is_bare();
     let mut first_parent = false;
     let mut must_write_terms = false;
     let mut reset_when_found: Option<ResetWhenFound> = None;

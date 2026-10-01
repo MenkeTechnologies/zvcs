@@ -176,9 +176,10 @@ fn a_well_formed_but_absent_id_reaches_the_assertion() {
     assert_eq!(fx.stash_ref(), None);
 
     // A name that resolves to nothing at all *is* the `Cannot update` line, on
-    // stderr, with exit 1 — the other half of `store_stash()`'s branch.
+    // stderr, and `store_stash()`'s `-1` — exit 128 since 2.56, whose `cmd_stash`
+    // maps a negative return there (builtin/stash.c:2498-2510).
     let out = fx.run(&["stash", "store", "-m", "x", "no-such-ref"]);
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(out.status.code(), Some(128), "{out:?}");
     assert_eq!(stderr(&out), "Cannot update refs/stash with no-such-ref\n");
     assert_eq!(fx.stash_ref(), None);
 }
@@ -200,7 +201,7 @@ fn quiet_does_not_soften_the_assertion() {
 
     // The same flag *does* silence the resolution failure.
     let out = fx.run(&["stash", "store", "-q", "-m", "x", "no-such-ref"]);
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(out.status.code(), Some(128), "{out:?}");
     assert_eq!(stderr(&out), "", "{out:?}");
 }
 

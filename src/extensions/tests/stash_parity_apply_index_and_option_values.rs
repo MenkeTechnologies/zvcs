@@ -125,7 +125,9 @@ fn pop_with_index_refuses_over_staged_work_and_keeps_the_entry() {
     f.git(&["add", "b.txt"]);
 
     let (code, _out, err) = f.run(&["stash", "pop", "--index", "-q"]);
-    assert_eq!(code, 1, "a refused pop exits 1: {err}");
+    // `unclean()`'s -1, which `cmd_stash` maps to 128 since 2.56
+    // (builtin/stash.c:2498-2510); 1 is left to a merge that conflicted.
+    assert_eq!(code, 128, "a refused pop exits 128: {err}");
     assert!(
         err.contains(
             "error: Your local changes to the following files would be overwritten by merge:\n  b.txt\n"
@@ -160,7 +162,8 @@ fn unclean_lists_every_staged_path_on_one_line() {
     f.git(&["add", "b.txt", "c.txt"]);
 
     let (code, _out, err) = f.run(&["stash", "apply", "--index", "-q"]);
-    assert_eq!(code, 1, "{err}");
+    // A refused merge is -1, exit 128 since 2.56 (builtin/stash.c:2498-2510).
+    assert_eq!(code, 128, "{err}");
     assert!(
         err.contains("would be overwritten by merge:\n  b.txt c.txt\n"),
         "one `%s`, so the paths are space-joined rather than one per line: {err:?}"

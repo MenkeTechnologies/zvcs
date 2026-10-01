@@ -26,8 +26,8 @@
 //!   reset then subtracts the staged diff from the *worktree* — git's
 //!   `git apply -R` of that patch — so an unstaged edit elsewhere in the same
 //!   file survives, and an edit that overlaps the staged one makes the whole
-//!   reset fail (`Cannot remove worktree changes`, exit 1) with the stash entry
-//!   kept, since `apply` is all-or-nothing. Reverting a staged *deletion* means
+//!   reset fail (`Cannot remove worktree changes`; exit 128 from `git stash push`,
+//!   1 from the assumed `git stash -S`) with the stash entry kept, since `apply` is all-or-nothing. Reverting a staged *deletion* means
 //!   writing the file back, so a path still sitting in the worktree — what
 //!   `git rm --cached` leaves — is reported as
 //!   `<path>: already exists in working directory` and stops the reset the same
@@ -487,6 +487,44 @@ fn usage_requested(args: &[String], usage: &str) -> Option<ExitCode> {
     })
 }
 
+/// A subcommand's negative return value, as `cmd_stash()` reports it for an
+/// explicitly named subcommand since 2.56:
+///
+/// ```c
+/// if (fn) {
+///         ret = fn(argc, argv, prefix, repo);
+///         if (ret < 0)
+///                 return 128;
+///         return ret;
+/// }
+/// ```
+///
+/// (builtin/stash.c:2498-2510.) 128 is the status `die()` uses, so that 1 is
+/// left to mean `STASH_APPLY_CONFLICT` (stash.h) alone — `apply`, `pop` and
+/// `branch` exit 1 only for a merge that left conflicts. A positive return
+/// (that conflict, a child command's status, `diff_result_code()`) passes
+/// through unchanged. The bare `git stash` and the assumed `git stash <opts>`
+/// keep the old `!!ret`, so a failed push there is still 1.
+fn failed() -> ExitCode {
+    ExitCode::from(128)
+}
+
+/// [`failed`] for the subcommands whose every nonzero return is negative —
+/// `push`, `save`, `store` and `create`. Their bodies are shared with the assumed
+/// push (and `build_stash_commit()` with `merge`'s `save_state()`), so they spell
+/// C's `-1` the way the `!!ret` callers want it: `ExitCode::FAILURE`, or a
+/// `Silent(1)` unwinding after its message was printed. Those two become 128;
+/// 129 (usage) and a `die()`'s 128 are left as they are.
+fn explicit_status(result: Result<ExitCode>) -> Result<ExitCode> {
+    match result {
+        Ok(code) if code == ExitCode::FAILURE => Ok(failed()),
+        Err(err) if err.downcast_ref::<crate::fatal::Silent>().is_some_and(|s| s.0 == 1) => {
+            Err(anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL)))
+        }
+        other => other,
+    }
+}
+
 pub fn stash(args: &[String]) -> Result<ExitCode> {
     // `-h` is answered before the repository is even looked for, which is why it
     // works outside one.
@@ -512,10 +550,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             }
             let opts = match parse_push_options(&args[1..], PUSH_USAGE, false)? {
                 Ok(o) => o,
-                Err(code) => return Ok(code),
+                Err(code) => return explicit_status(Ok(code)),
             };
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            push(&repo, &opts)
+            explicit_status(push(&repo, &opts))
         }
         // `save` is `push` with the message taken from the positional words:
         // git's `save_stash()` builds the same `do_push_stash()` call, so every
@@ -526,10 +564,10 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             }
             let opts = match parse_save_options(&args[1..])? {
                 Ok(o) => o,
-                Err(code) => return Ok(code),
+                Err(code) => return explicit_status(Ok(code)),
             };
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            push(&repo, &opts)
+            explicit_status(push(&repo, &opts))
         }
         Some("list") => {
             if let Some(code) = usage_requested(&args[1..], LIST_USAGE) {
@@ -618,7 +656,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             }
             if stop < rest.len() {
                 eprintln!("error: git stash clear with arguments is unimplemented");
-                return Ok(ExitCode::FAILURE);
+                return Ok(failed());
             }
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             clear(&repo)
@@ -638,13 +676,13 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
         }
         // `create` has no option table at all — every argument is message text,
         // `-h` included, which is why it prints a stash id rather than usage.
-        Some("create") => create_stash(&repo, &args[1..]),
+        Some("create") => explicit_status(create_stash(&repo, &args[1..])),
         Some("store") => {
             if let Some(code) = usage_requested(&args[1..], STORE_USAGE) {
                 return Ok(code);
             }
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            store_stash(&repo, &args[1..])
+            explicit_status(store_stash(&repo, &args[1..]))
         }
         // Neither body is ported, but `parse_options()` runs before either one,
         // so the option surface is still git's: `-h` and `--help-all` print the
@@ -691,10 +729,14 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
             crate::git_fatal!("`stash {sub}` is not ported")
         }
         // ```c
-        // if (fn)
-        //         return !!fn(argc, argv, prefix, repo);
-        // else if (!argc)
+        // if (fn) {
+        //         ret = fn(argc, argv, prefix, repo);
+        //         if (ret < 0)
+        //                 return 128;
+        //         return ret;
+        // } else if (!argc) {
         //         return !!push_stash_unassumed(0, NULL, prefix, repo);
+        // }
         //
         // /* Assume 'stash push' */
         // strvec_push(&args, "push");
@@ -703,7 +745,7 @@ pub fn stash(args: &[String]) -> Result<ExitCode> {
         // ret = !!push_stash(args.nr, args_copy, prefix, 1);
         // ```
         //
-        // (`cmd_stash`, builtin/stash.c:2495-2510.) The subcommand table is matched by
+        // (`cmd_stash`, builtin/stash.c:2498-2525; see [`failed`].) The subcommand table is matched by
         // `OPT_SUBCOMMAND` alone: a word that names none of its entries is not an error
         // there, it is simply left in `argv` and handed to `push_stash()` with
         // `push_assumed` set. So `git stash bogus` is refused by *push*'s
@@ -1020,8 +1062,8 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         }
         // …and ends in `remove_branch_state()` (builtin/reset.c:542-543). A
         // `die()` there is the child's: its `fatal:` line is all that is printed,
-        // and `run_command()` failing makes `do_push_stash()` return -1, exit 1
-        // (builtin/stash.c:1822-1825), with the stash already stored.
+        // and `run_command()` failing makes `do_push_stash()` return -1 — exit 128,
+        // or 1 for the assumed push (builtin/stash.c:1822-1825, 2498-2525), with the stash already stored.
         if let Err(err) = super::reset::remove_branch_state(repo, false) {
             eprintln!("fatal: {err}");
             return Ok(ExitCode::FAILURE);
@@ -1033,7 +1075,7 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // `run_command()`'s non-zero status ends `do_push_stash()`. A pathspec naming
     // nothing in `I` is exactly what makes that child fail — `git stash push -a -k
     // -- <an ignored file>` stores and announces the stash, then reports
-    // `error: pathspec '…' did not match any file(s) known to git` and exits 1.
+    // `error: pathspec '…' did not match any file(s) known to git` and fails (`-1`).
     // The check at the top of the push could not have caught it: `-a` skips it.
     if keep_index && !opts.pathspecs.is_empty() && !opts.staged_only {
         let staged: Vec<BString> = tree_map(repo, i_tree_id)?.into_keys().collect();
@@ -1099,8 +1141,9 @@ fn select_matching(
 /// whose lines are all wrong reports all of them — and a spec repeated after one
 /// that *did* match is not reported twice ("the caller might have fed identical
 /// pathspec twice. Do not barf on such a mistake."). `error()` writes `error:`
-/// and the command exits 1; this is not a `die()`, so it is neither `fatal:` nor
-/// 128.
+/// and the command returns `-1`; this is not a `die()`, so there is no `fatal:`.
+/// `cmd_stash` still exits 128 for it from `git stash push` and 1 from the
+/// assumed push (see [`failed`]).
 ///
 /// Exclusions select by removing, so they are never reported as unmatched.
 fn report_path_error(
@@ -1972,7 +2015,7 @@ fn merge_trees_cleanly(
 
 /// `repo_refresh_and_write_index()` refusing an unmerged index, which is how a
 /// `stash push` in the middle of a conflicted merge ends: every unmerged path on
-/// stdout, then `error: could not write index` and exit 1.
+/// stdout, then `error: could not write index` and a `-1` (see [`failed`]).
 fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     let index = repo.open_index()?;
     let backing = index.path_backing();
@@ -2079,8 +2122,8 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // ```
     //
     // The refresh names each conflicted path once on **stdout**, `cache_tree_update()`
-    // then names every *stage* of it on stderr, and the caller's line closes it at
-    // exit 1. Verified against git 2.50.1 on a two-path conflict. `push` never
+    // then names every *stage* of it on stderr, and the caller's line closes it with
+    // `-1`, exit 128 (see [`failed`]). Verified against git 2.50.1 on a two-path conflict. `push` never
     // reaches this: its `refresh_and_write_cache()` fails first, with the shorter
     // `error: could not write index`.
     if let Some(code) = refuse_unmerged_create(repo)? {
@@ -2460,7 +2503,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         Some(b) => (*b).to_string(),
         None => {
             eprintln!("No branch name specified");
-            return Ok(ExitCode::FAILURE);
+            return Ok(failed());
         }
     };
     // `branch_stash()` takes any stash-like commit; only an entry of the reflog
@@ -2492,28 +2535,31 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // ```
     //
     // A failing checkout stops the sub-command there — the stash is neither
-    // applied nor dropped — and its status becomes `cmd_stash`'s `!!ret`, so
-    // `git stash branch <existing-branch>` prints `git checkout`'s
-    // `fatal: a branch named '<x>' already exists` and exits **1**, not 128.
+    // applied nor dropped — and its status is the child's, which `cmd_stash`
+    // passes through since 2.56 (builtin/stash.c:2498-2510): `git stash branch
+    // <existing-branch>` prints `git checkout`'s `fatal: a branch named '<x>'
+    // already exists` and exits 128, as the child did.
     {
         let _child = crate::cstdio::run_command();
         let code = super::checkout::checkout(&["-b".to_string(), branch, b_commit.to_string()]);
-        let failed = match code {
-            Ok(code) => code != ExitCode::SUCCESS,
-            // The child said its piece on stderr; only its status crosses back,
-            // and `!!ret` flattens it. A `die()` inside the in-process checkout
-            // has not printed yet, so its message is rendered here in git's voice.
+        let status = match code {
+            Ok(code) => code,
+            // The child said its piece on stderr; only its status crosses back.
+            // A `die()` inside the in-process checkout has not printed yet, so
+            // its message is rendered here in git's voice.
             Err(err) => {
                 if let Some(f) = err.downcast_ref::<crate::fatal::Fatal>() {
                     eprintln!("fatal: {}", f.0);
-                } else if err.downcast_ref::<crate::fatal::Silent>().is_none() {
+                    ExitCode::from(crate::fatal::EXIT_FATAL)
+                } else if let Some(s) = err.downcast_ref::<crate::fatal::Silent>() {
+                    ExitCode::from(s.0)
+                } else {
                     return Err(err);
                 }
-                true
             }
         };
-        if failed {
-            return Ok(ExitCode::FAILURE);
+        if status != ExitCode::SUCCESS {
+            return Ok(status);
         }
     }
 
@@ -2533,9 +2579,10 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // `do_apply_stash` ends by running `git status` (non-quiet).
     super::status::status(&[])?;
 
-    // An untracked path that could not be written keeps the entry, as for `pop`.
-    if !restored {
-        return Ok(ExitCode::from(1));
+    // A conflict, a refused merge or an untracked path that could not be
+    // written keeps the entry, as for `pop`.
+    if restored != ApplyResult::Clean {
+        return Ok(restored.status());
     }
 
     // Only a `refs/stash` entry is dropped — `is_stash_ref` is false for a
@@ -2592,14 +2639,12 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     }
     rf.push("refs/stash".into());
     rf.push("--".into());
-    // `list_stash()` ends on `return run_command(&cp)`, and `cmd_stash` returns
-    // `!!fn(...)` (builtin/stash.c:2496), so the child's status only survives as
-    // "did it fail": `git stash list --zzbogus` prints `git log`'s
-    // `fatal: unrecognized argument: --zzbogus` and then exits **1**, not 128.
-    // The forwarded parser's message is git's; the forwarded parser's exit code
-    // is not.
-    let status = super::log::log(&rf)?;
-    Ok(ExitCode::from(u8::from(status != ExitCode::SUCCESS)))
+    // `list_stash()` ends on `return run_command(&cp)`, and since 2.56 `cmd_stash`
+    // hands a non-negative return through as it is (builtin/stash.c:2498-2510),
+    // so the child's own status is the command's: `git stash list --reverse`
+    // prints `git log`'s `fatal: options '--reverse' and '--walk-reflogs' cannot
+    // be used together` and exits 128, where 2.55's `!!fn(...)` made it 1.
+    super::log::log(&rf)
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.
@@ -2639,13 +2684,13 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
     if !opts.quiet {
         super::status::status(&[])?;
     }
-    // `pop` drops the entry only once the apply succeeded; an untracked path it
-    // could not write keeps the stash, and says so.
-    if !restored {
+    // `pop` drops the entry only once the apply succeeded; a conflict, a refused
+    // merge or an untracked path it could not write keeps the stash, and says so.
+    if restored != ApplyResult::Clean {
         if pop {
             println!("The stash entry is kept in case you need it again.");
         }
-        return Ok(ExitCode::from(1));
+        return Ok(restored.status());
     }
     if pop {
         return do_drop_stash(repo, &stash, opts.quiet);
@@ -2670,6 +2715,31 @@ fn refresh_before_apply(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     death.die().map(Some)
 }
 
+/// `enum stash_apply_result` (stash.h): what `do_apply_stash()` came to once it
+/// got as far as the merge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyResult {
+    /// `STASH_APPLY_CLEAN`: applied, or nothing to apply.
+    Clean,
+    /// `STASH_APPLY_CONFLICT`: the merge left conflicts; the entry stays.
+    Conflict,
+    /// `STASH_APPLY_ERROR`: the merge was refused, or the untracked files could
+    /// not all be restored.
+    Error,
+}
+
+impl ApplyResult {
+    /// The subcommand's exit status: 1 for a conflict and nothing else, a
+    /// failure through [`failed`].
+    fn status(self) -> ExitCode {
+        match self {
+            ApplyResult::Clean => ExitCode::SUCCESS,
+            ApplyResult::Conflict => ExitCode::from(1),
+            ApplyResult::Error => failed(),
+        }
+    }
+}
+
 /// Restore the stash onto the current tree with a three-way merge, shared by
 /// `apply`/`pop` and `branch`.
 ///
@@ -2684,16 +2754,16 @@ fn refresh_before_apply(repo: &gix::Repository) -> Result<Option<ExitCode>> {
 /// which is what leaves every restored change *unstaged* — git's default, and
 /// the reason a plain `git stash apply` reports ` M` rather than `M ` for a path
 /// that had been `git add`ed. `git stash branch` always passes `true`.
-/// Returns `false` when an untracked path could not be restored — git's
-/// `restore_untracked()` failure, which fails the apply without undoing what it
-/// did manage to write.
+/// `Ok(result)` is how far the merge got. An untracked path that could not be
+/// restored — git's `restore_untracked()` failure — is [`ApplyResult::Error`]
+/// without undoing what it did manage to write.
 fn restore_stash_commit(
     repo: &gix::Repository,
     commit_id: ObjectId,
     restore_index: bool,
     quiet: bool,
     labels: &ConflictLabels,
-) -> Result<std::result::Result<bool, ExitCode>> {
+) -> Result<std::result::Result<ApplyResult, ExitCode>> {
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
@@ -2771,7 +2841,7 @@ fn restore_stash_commit(
                 eprintln!("error: {path}: patch does not apply");
             }
             eprintln!("error: conflicts in index. Try without --index.");
-            return Ok(Err(ExitCode::FAILURE));
+            return Ok(Err(failed()));
             }
         }
         // The `--index` arm ends on `reset_head()`, which is
@@ -2921,6 +2991,8 @@ fn restore_stash_commit(
             crate::merge_apply::write_auto_merge(repo, a.tree_id)?;
         }
     }
+    // `None` is a merge that never ran: `unclean()` or `unpack_trees()` refused it.
+    let merge_ran = applied.is_some();
     let merged_cleanly = applied.as_ref().is_some_and(|a| a.conflicts.is_empty());
     if !merged_cleanly {
         // git leaves the conflicted worktree in place and fails the apply; the
@@ -3008,10 +3080,21 @@ fn restore_stash_commit(
         }
         let _ = sync_worktree(repo, u_tree, &writable, &u_map, &should_interrupt)?;
     }
+    // `ret = clean >= 0 ? !clean : clean;` (builtin/stash.c:726): a merge that
+    // `unclean()` or `unpack_trees()` refused is `merge_ort_nonrecursive()`'s -1,
+    // a conflicted one its 0 and so 1 here; `restore_untracked()` failing then
+    // overrides either with `error()`'s -1 (builtin/stash.c:747-748).
     if !untracked_ok {
         eprintln!("error: could not restore untracked files from stash");
+        return Ok(Ok(ApplyResult::Error));
     }
-    Ok(Ok(merged_cleanly && untracked_ok))
+    Ok(Ok(if merged_cleanly {
+        ApplyResult::Clean
+    } else if merge_ran {
+        ApplyResult::Conflict
+    } else {
+        ApplyResult::Error
+    }))
 }
 
 /// Create an *autostash* from the current dirty worktree+index: build the
@@ -3885,12 +3968,13 @@ fn reflog_len(repo: &gix::Repository, name: &str) -> Result<Option<usize>> {
 /// `parse_stash_revision()`, resolve *that* string, and require the result to
 /// look like a stash — two parents at least.
 ///
-/// The refusals are git's, with git's exit codes: more than one revision is
-/// `Too many revisions specified:` and the list (1), an out-of-range reflog
-/// entry is `get_oid_basic()`'s `fatal: log for '<ref>' only has <n> entries`
-/// (128), an unresolvable name is `error: <revision> is not a valid reference`
-/// (1), and a commit that is not stash-shaped is
-/// `fatal: '<revision>' is not a stash-like commit` (128).
+/// The refusals are git's: more than one revision is `Too many revisions
+/// specified:` and the list, an out-of-range reflog entry is `get_oid_basic()`'s
+/// `fatal: log for '<ref>' only has <n> entries`, an unresolvable name is
+/// `error: <revision> is not a valid reference`, and a commit that is not
+/// stash-shaped is `fatal: '<revision>' is not a stash-like commit`. Every one
+/// exits 128: two are `die()`s, and the others are `get_stash_info()`'s `-1`,
+/// which [`failed`] maps there.
 fn resolve_stash(
     repo: &gix::Repository,
     specs: &[String],
@@ -3898,10 +3982,10 @@ fn resolve_stash(
     if specs.len() > 1 {
         let listed: String = specs.iter().map(|s| format!(" '{s}'")).collect();
         eprintln!("Too many revisions specified:{listed}");
-        return Ok(Err(ExitCode::FAILURE));
+        return Ok(Err(failed()));
     }
     let Some(revision) = parse_stash_revision(repo, specs.first().map(String::as_str))? else {
-        return Ok(Err(ExitCode::FAILURE));
+        return Ok(Err(failed()));
     };
 
     // ```c
@@ -3932,7 +4016,7 @@ fn resolve_stash(
                 }
             }
             eprintln!("error: {revision} is not a valid reference");
-            return Ok(Err(ExitCode::FAILURE));
+            return Ok(Err(failed()));
         }
     };
 
@@ -3963,7 +4047,7 @@ fn require_stash_ref(spec: &StashSpec) -> Option<ExitCode> {
         return None;
     }
     eprintln!("error: '{}' is not a stash reference", spec.revision);
-    Some(ExitCode::FAILURE)
+    Some(failed())
 }
 
 /// `do_drop_stash()`: delete the reflog entry the revision names, then report it
@@ -3981,12 +4065,12 @@ fn do_drop_stash(repo: &gix::Repository, spec: &StashSpec, quiet: bool) -> Resul
         Some(None) => {
             eprintln!("error: {rev}: an `@{{<date>}}` reflog spec is not ported");
             eprintln!("error: {rev}: Could not drop stash entry");
-            return Ok(ExitCode::FAILURE);
+            return Ok(failed());
         }
         None => {
             eprintln!("error: not a reflog: {rev}");
             eprintln!("error: {rev}: Could not drop stash entry");
-            return Ok(ExitCode::FAILURE);
+            return Ok(failed());
         }
     };
     let dropped = drop_reflog_entry(repo, recno)?;
@@ -4438,8 +4522,8 @@ fn parse_store_options(args: &[String]) -> Result<(Option<String>, bool, String)
     // ```
     //
     // A plain `fprintf_ln` and a `return`, not a `die()`: the line carries no
-    // `fatal:` and `cmd_stash`'s `!!fn(...)` turns the `-1` into exit **1**, which
-    // is what a caller testing `$?` sees. `-q` silences the line but not the
+    // `fatal:`. The `-1` is this port's `Silent(1)`, which [`explicit_status`] turns
+    // into 2.56's exit 128. `-q` silences the line but not the
     // failure.
     if positionals.len() != 1 {
         if !quiet {
@@ -4679,17 +4763,17 @@ mod tests {
     fn store_options_require_exactly_one_commit() {
         // git prints `"git stash store" requires one <commit> argument` on 0 or
         // >1 — with `fprintf_ln` and a `return -1`, not `die()`. So the line
-        // carries no `fatal:` and the status is 1, not 128, which is why the
-        // refusal is a `Silent(1)` whose text has already gone to stderr rather
-        // than an error whose message the caller would print a second time.
-        // Measured against stock 2.55.0: `git stash store` in a fresh repository
-        // prints exactly that line and exits 1.
+        // carries no `fatal:`, which is why the refusal is a `Silent(1)` — the
+        // port's `-1`, whose text has already gone to stderr rather than an error
+        // whose message the caller would print a second time. `explicit_status()`
+        // maps it to 2.56's 128: stock 2.56.0's `git stash store` in a fresh
+        // repository prints exactly that line and exits 128.
         for argv in [vec![], vec!["a", "b"]] {
             let err = parse_store_options(&v(&argv)).unwrap_err();
             let silent = err
                 .downcast_ref::<crate::fatal::Silent>()
                 .expect("the refusal is silent: it printed the line itself");
-            assert_eq!(silent.0, 1, "git returns -1, which cmd_stash's !!fn turns into exit 1");
+            assert_eq!(silent.0, 1, "git returns -1, the port's Silent(1)");
             assert_eq!(err.to_string(), "", "a second copy of the line must not reach the caller");
         }
     }

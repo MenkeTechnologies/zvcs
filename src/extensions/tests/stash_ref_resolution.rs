@@ -8,6 +8,9 @@
 //! Also covered: `stash list` is `log -g --first-parent`, and the
 //! `--first-parent` is what gives its diff options anything to describe — every
 //! stash entry is a merge commit, which a plain reflog walk skips.
+//!
+//! Every refusal here exits 128 since 2.56: the `die()`s always did, and
+//! `cmd_stash` now maps a subcommand's `-1` there too (builtin/stash.c:2498-2510).
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -100,7 +103,7 @@ fn pop_and_drop_require_a_stash_reference() {
 
     for sub in ["pop", "drop"] {
         let (code, out, err) = f.run(&["stash", sub, &oid]);
-        assert_eq!(code, 1, "`stash {sub} <oid>` should fail: {out}{err}");
+        assert_eq!(code, 128, "`stash {sub} <oid>` should fail: {out}{err}");
         assert_eq!(err, format!("error: '{oid}' is not a stash reference\n"), "stderr: {err}");
     }
     assert_eq!(f.run(&["stash", "list"]).1.lines().count(), 2, "nothing may be dropped");
@@ -129,7 +132,7 @@ fn a_non_stash_commit_and_an_unknown_name_are_reported_apart() {
     assert_eq!(err, format!("fatal: '{head}' is not a stash-like commit\n"), "stderr: {err}");
 
     let (code, _, err) = f.run(&["stash", "apply", "nosuchthing"]);
-    assert_eq!(code, 1, "stderr: {err}");
+    assert_eq!(code, 128, "stderr: {err}");
     assert_eq!(err, "error: nosuchthing is not a valid reference\n", "stderr: {err}");
 }
 
@@ -194,7 +197,7 @@ fn a_suffixed_stash_reference_still_names_its_entry() {
 fn a_bare_stash_ref_is_not_a_reflog_spec() {
     let f = Fixture::new("bare-ref");
     let (code, out, err) = f.run(&["stash", "drop", "refs/stash"]);
-    assert_eq!(code, 1, "`drop refs/stash` should have failed: {out}{err}");
+    assert_eq!(code, 128, "`drop refs/stash` should have failed: {out}{err}");
     assert_eq!(
         err,
         "error: not a reflog: refs/stash\nerror: refs/stash: Could not drop stash entry\n",
@@ -220,7 +223,7 @@ fn a_second_revision_is_refused_with_the_list() {
     let f = Fixture::new("too-many");
     for sub in ["apply", "show", "drop"] {
         let (code, out, err) = f.run(&["stash", sub, "stash@{0}", "stash@{1}"]);
-        assert_eq!(code, 1, "`stash {sub}` with two revisions: {out}{err}");
+        assert_eq!(code, 128, "`stash {sub}` with two revisions: {out}{err}");
         assert_eq!(
             err,
             "Too many revisions specified: 'stash@{0}' 'stash@{1}'\n",

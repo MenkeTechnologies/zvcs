@@ -153,7 +153,9 @@ fn push_refuses_an_unmerged_index() {
     let _ = f.run(&["merge", "other"]);
 
     let (code, out, err) = f.run(&["stash", "push", "-m", "x"]);
-    assert_eq!(code, 1, "an unmerged index must fail the push: {out}{err}");
+    // `error()`'s -1, which `cmd_stash` maps to 128 since 2.56
+    // (builtin/stash.c:2498-2510); the assumed `git stash` would still exit 1.
+    assert_eq!(code, 128, "an unmerged index must fail the push: {out}{err}");
     assert_eq!(out, "a.txt: needs merge\n", "stdout: {out}");
     assert_eq!(err, "error: could not write index\n", "stderr: {err}");
 }

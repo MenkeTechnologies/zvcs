@@ -550,6 +550,16 @@ fn head_info_of_git_dir(repo: &gix::Repository, git_dir: &Path) -> HeadInfo {
 /// Enumerate the main worktree followed by every linked worktree, sorted by
 /// path — git's `get_worktrees()` plus its trailing `QSORT(list + 1, ...)`.
 fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
+    let mut out = collect_in_readdir_order(repo, expire)?;
+    out[1..].sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// `get_worktrees_internal()` (worktree.c:186-217) without the sort: the main
+/// worktree, then the linked ones in the order `readdir()` yields
+/// `worktrees/<id>`. `repair_worktrees()` walks this order, and it is the order
+/// its reports come out in.
+fn collect_in_readdir_order(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
     let common = gix::path::realpath(repo.common_dir())?;
 
     // The main worktree's path is the common dir with a trailing `/.git` cut off,
@@ -675,7 +685,6 @@ fn collect(repo: &gix::Repository, expire: u64) -> Result<Vec<Wt>> {
         });
     }
 
-    linked.sort_by(|a, b| a.path.cmp(&b.path));
     out.extend(linked);
     Ok(out)
 }
@@ -1149,6 +1158,26 @@ enum GitfileErr {
 /// relative `<path>` is resolved against the gitfile's own directory, then the
 /// result is validated with `is_git_directory()` before it is realpath'd.
 fn read_gitfile(path: &Path) -> Result<PathBuf, GitfileErr> {
+    let raw = read_gitfile_raw(path)?;
+    let named = gix::path::from_byte_slice(&raw);
+    let dir = if named.is_absolute() {
+        named.to_path_buf()
+    } else {
+        match path.parent() {
+            Some(parent) => parent.join(named),
+            None => named.to_path_buf(),
+        }
+    };
+    if !is_git_dir(&dir) {
+        return Err(GitfileErr::NotARepo);
+    }
+    gix::path::realpath(&dir).map_err(|_| GitfileErr::NotARepo)
+}
+
+/// Port of `read_gitfile_raw()` (setup.c:1005-1060, git 2.56.0): the bytes after
+/// `gitdir: ` with trailing newlines removed, neither resolved against the
+/// gitfile's directory nor validated with `is_git_directory()`.
+fn read_gitfile_raw(path: &Path) -> Result<Vec<u8>, GitfileErr> {
     let st = std::fs::metadata(path).map_err(|_| GitfileErr::StatFailed)?;
     if !st.is_file() {
         return Err(GitfileErr::NotAFile);
@@ -1174,19 +1203,7 @@ fn read_gitfile(path: &Path) -> Result<PathBuf, GitfileErr> {
     if len < 9 {
         return Err(GitfileErr::NoPath);
     }
-    let named = gix::path::from_byte_slice(&buf[8..len]);
-    let dir = if named.is_absolute() {
-        named.to_path_buf()
-    } else {
-        match path.parent() {
-            Some(parent) => parent.join(named),
-            None => named.to_path_buf(),
-        }
-    };
-    if !is_git_dir(&dir) {
-        return Err(GitfileErr::NotARepo);
-    }
-    gix::path::realpath(&dir).map_err(|_| GitfileErr::NotARepo)
+    Ok(buf[8..len].to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,7 +1735,7 @@ pub(super) fn relative_path(target: &Path, base: &Path) -> PathBuf {
 /// Port of `repair_worktrees()`: fix each linked worktree's `.git` gitfile
 /// (skipping the main worktree, git's `worktrees + 1`).
 fn repair_worktrees(repo: &gix::Repository, common: &Path, rc: &mut i32, relative: bool) {
-    let Ok(worktrees) = collect(repo, u64::MAX) else {
+    let Ok(worktrees) = collect_in_readdir_order(repo, u64::MAX) else {
         return;
     };
     for wt in worktrees.iter().filter(|w| w.is_linked()) {
@@ -1743,24 +1760,31 @@ fn repair_gitfile(common: &Path, id: &str, wt_path: &Path, rc: &mut i32, relativ
     let repo_dir = gix::path::realpath(&admin).unwrap_or(admin);
     let dotgit = wt_path.join(".git");
 
-    let repair: Option<&str> = match read_gitfile(&dotgit) {
+    // git 2.56.0 reads the gitfile with `read_gitfile_raw()` (worktree.c:671-
+    // 693), so `dotgit_contents` is the recorded text rather than the resolved
+    // directory: an absolute recording is compared as written, a relative one
+    // is resolved against the worktree, and the absolute/relative check now
+    // sees which form is on disk. A plain `worktree repair` therefore rewrites
+    // a relative link as an absolute one, where 2.55.0 — handed an always-
+    // absolute realpath — left it alone.
+    let repair: Option<&str> = match read_gitfile_raw(&dotgit) {
         Err(GitfileErr::NotAFile) => {
             report(rc, true, wt_path, ".git is not a file");
             return;
         }
         Err(_) => Some(".git file broken"),
-        Ok(backlink) => {
-            if path_bytes(&backlink) != path_bytes(&repo_dir) {
+        Ok(contents) => {
+            let recorded = gix::path::from_byte_slice(&contents);
+            let backlink = if recorded.is_absolute() {
+                recorded.to_path_buf()
+            } else {
+                crate::setup::realpath_forgiving(&wt_path.join(recorded))
+            };
+            if !is_git_dir(&backlink) {
+                Some(".git file broken")
+            } else if path_bytes(&backlink) != path_bytes(&repo_dir) {
                 Some(".git file incorrect")
-            } else if relative {
-                // `use_relative_paths == is_absolute_path(dotgit_contents)`.
-                // `dotgit_contents` is what `read_gitfile_gently()` returned,
-                // which is the *resolved* directory and therefore always
-                // absolute — so this arm fires whenever relative linking was
-                // asked for, and never otherwise. That is why stock
-                // `worktree repair --relative-paths` re-reports the same
-                // worktree on every run, while a plain `worktree repair` leaves
-                // an already-relative link alone instead of making it absolute.
+            } else if relative == recorded.is_absolute() {
                 Some(".git file absolute/relative path mismatch")
             } else {
                 None

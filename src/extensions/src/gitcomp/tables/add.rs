@@ -1,6 +1,6 @@
 use crate::gitcomp::*;
 
-/// `builtin_add_options[]` (builtin/add.c:254-285), which `cmd_add()` passes to
+/// `builtin_add_options[]` (builtin/add.c:261-293, git 2.56), which `cmd_add()` passes to
 /// `parse_options()` for both `add` and `stage`.
 pub(super) const BUILTIN_ADD_OPTIONS: &[Opt] = &[
     OPT__DRY_RUN(),
@@ -15,6 +15,7 @@ pub(super) const BUILTIN_ADD_OPTIONS: &[Opt] = &[
     OPT__FORCE(0),
     OPT_BOOL("update"),
     OPT_BOOL("renormalize"),
+    OPT_BOOL("resolved"),
     OPT_BOOL("intent-to-add"),
     OPT_BOOL("all"),
     OPT_CALLBACK_F("ignore-removal", PARSE_OPT_NOARG),

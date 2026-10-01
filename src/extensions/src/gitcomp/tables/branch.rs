@@ -1,6 +1,6 @@
 use crate::gitcomp::*;
 
-/// `options[]` (builtin/branch.c:730-781).
+/// `options[]` (builtin/branch.c:992-1050, git 2.56).
 pub(super) const BRANCH_OPTIONS: &[Opt] = &[
     OPT_GROUP(),
     OPT__VERBOSE(),
@@ -29,9 +29,12 @@ pub(super) const BRANCH_OPTIONS: &[Opt] = &[
     OPT_BOOL("show-current"),
     OPT_BOOL("create-reflog"),
     OPT_BOOL("edit-description"),
+    OPT_CALLBACK_F("delete-merged", PARSE_OPT_NONEG),
+    OPT_BOOL("dry-run"),
     OPT__FORCE(PARSE_OPT_NOCOMPLETE),
     OPT_MERGED(),
     OPT_NO_MERGED(),
+    OPT_CALLBACK_F("forked", PARSE_OPT_NONEG),
     OPT_COLUMN("column"),
     OPT_REF_SORT(),
     OPT_CALLBACK("points-at"),

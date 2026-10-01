@@ -1,6 +1,6 @@
 use crate::gitcomp::*;
 
-/// `builtin_repack_options[]` (builtin/repack.c:167-236).
+/// `builtin_repack_options[]` (builtin/repack.c:191-264, git 2.56).
 pub(super) const BUILTIN_REPACK_OPTIONS: &[Opt] = &[
     OPT_BIT(NULL),
     OPT_BIT(NULL),
@@ -33,4 +33,6 @@ pub(super) const BUILTIN_REPACK_OPTIONS: &[Opt] = &[
     OPT_SET_INT_F(NULL, PARSE_OPT_HIDDEN),
     OPT_STRING("expire-to"),
     OPT_STRING("filter-to"),
+    OPT_BOOL("drop-filtered"),
+    OPT_BOOL("dry-run"),
 ];

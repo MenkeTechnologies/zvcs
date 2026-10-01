@@ -1888,6 +1888,25 @@ pub(crate) fn runs_strict_setup(sub: &str, args: &[String]) -> bool {
         .any(|word| word == "-w")
 }
 
+/// The gentle half of a failed `is_git_directory()`: no candidate is a
+/// repository, so `setup_git_directory_gently()` hands back `*nongit_ok = 1`
+/// instead of dying — from the walk's `GIT_DIR_HIT_CEILING` arm
+/// (setup.c:1966-1969) and from `setup_explicit_git_dir()`'s
+/// `if (!is_git_directory(gitdirenv))` (setup.c:1127-1133) alike. The command
+/// then runs as though there were no repository: `git diff` falls through to
+/// `DIFF_NO_INDEX_IMPLICIT` (builtin/diff.c:466-476) and `git config --local`
+/// refuses with `--local can only be used inside a git repository`.
+///
+/// A verb that never runs setup ([`crate::dispatch::SETUP_FREE_VERBS`]) never
+/// walks, and `ls-remote` stays on the repository for the reason
+/// [`dubious_ownership`] gives.
+fn gentle_setup_found_nothing(sub: &str) {
+    if crate::dispatch::SETUP_FREE_VERBS.contains(&sub) || sub == "ls-remote" {
+        return;
+    }
+    ignore_repository();
+}
+
 /// `is_git_directory()`'s object-database probe (setup.c:433-442).
 ///
 /// ```c
@@ -1921,11 +1940,12 @@ pub(crate) fn runs_strict_setup(sub: &str, args: &[String]) -> bool {
 ///
 /// Returns the exit code to leave with, or `None` to continue.
 pub fn object_directory_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if !runs_strict_setup(sub, args) {
-        return None;
-    }
     let objdir = std::env::var_os("GIT_OBJECT_DIRECTORY")?;
     if access_x_ok(Path::new(&objdir)) {
+        return None;
+    }
+    if !runs_strict_setup(sub, args) {
+        gentle_setup_found_nothing(sub);
         return None;
     }
     // The variable is unusable, so no candidate directory can be a repository.
@@ -2031,17 +2051,18 @@ pub fn core_worktree_chdir_error(repo: &gix::Repository) -> Option<String> {
 ///
 /// Returns the exit code to leave with, or `None` to continue.
 pub fn common_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if !runs_strict_setup(sub, args) {
-        return None;
-    }
     let common = PathBuf::from(std::env::var_os("GIT_COMMON_DIR")?);
     // `$GIT_OBJECT_DIRECTORY` replaces the `objects` half; [`object_directory_gate`]
-    // has already refused an unusable one, so only the `refs` half can fail here.
+    // has already dealt with an unusable one, so only the `refs` half is new here.
     let objects = match std::env::var_os("GIT_OBJECT_DIRECTORY") {
         Some(v) => PathBuf::from(v),
         None => common.join("objects"),
     };
     if access_x_ok(&objects) && access_x_ok(&common.join("refs")) {
+        return None;
+    }
+    if !runs_strict_setup(sub, args) {
+        gentle_setup_found_nothing(sub);
         return None;
     }
     let msg = match std::env::var_os("GIT_DIR") {

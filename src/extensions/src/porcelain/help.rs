@@ -5,7 +5,7 @@
 //! equivalent table, so this port holds the same data verbatim in the
 //! [`GIT_USAGE_STRING`], [`COMMON_CMDS`], [`GIT_MORE_INFO_STRING`],
 //! [`ALL_COMMANDS`], [`GUIDES`], [`USER_INTERFACES`] and
-//! [`DEVELOPER_INTERFACES`] blocks below, transcribed from git 2.55.0. These
+//! [`DEVELOPER_INTERFACES`] blocks below, transcribed from git 2.56.0. These
 //! are static in git as well — they move only when git itself gains, drops or
 //! renames a command — so they are reproduced rather than computed, and they
 //! are the one part of this module that is pinned to a git version.
@@ -26,7 +26,7 @@
 //!   * `git help -g`/`--guides`, `--user-interfaces`, `--developer-interfaces`.
 //!   * `git help -c`/`--config` — every configuration variable name plus git's
 //!     `'git help config' for more information` trailer, from the [`CONFIG_VARS`]
-//!     block transcribed from git 2.55.0.
+//!     block transcribed from git 2.56.0.
 //!   * `git help <command>|<doc>` — the man-page path, reproducing git's
 //!     `cmd_to_page` naming rules (`add` → `git-add`, `revisions` →
 //!     `gitrevisions`, `gitk` → `gitk`) and propagating `man`'s exit code.
@@ -294,7 +294,7 @@ Low-level Commands / Internal Helpers
    credential-store        Helper to store credentials on disk
    fmt-merge-msg           Produce a merge commit message
    hook                    Run Git hooks
-   interpret-trailers      Add or parse structured information in commit messages
+   interpret-trailers      Add or parse metadata in commit messages
    mailinfo                Extracts patch and authorship from a single e-mail message
    mailsplit               Simple UNIX mbox splitter program
    merge-one-file          The standard helper program to use with git-merge-index
@@ -333,6 +333,7 @@ const GUIDES: &str = r#"The Git concept guides are:
    core-tutorial    A Git core tutorial for developers
    credentials      Providing usernames and passwords to Git
    cvs-migration    Git for CVS users
+   datamodel        Git's core data model
    diffcore         Tweaking diff output
    everyday         A useful minimum set of commands for Everyday Git
    faq              Frequently asked questions about using Git
@@ -384,7 +385,7 @@ const DEVELOPER_INTERFACES: &str = r#"File formats, protocols and other develope
 /// in its generated `config-list.h` (compiled from `Documentation/config/*.txt`
 /// by `generate-configlist.sh`), a table gitoxide does not carry, so — like
 /// [`ALL_COMMANDS`] and the guide blocks — it is transcribed verbatim from git
-/// 2.55.0 and moves only when git itself adds, drops or renames a variable.
+/// 2.56.0 and moves only when git itself adds, drops or renames a variable.
 /// Wildcard/placeholder segments (`alias.*`, `branch.<name>.remote`) are kept
 /// exactly as git emits them. The `'git help config' for more information`
 /// trailer git prints after the list is appended in code, not stored here.
@@ -415,6 +416,7 @@ advice.pushNonFFCurrent
 advice.pushNonFFMatching
 advice.pushNonFastForward
 advice.pushRefNeedsUpdate
+advice.pushRepoLooksLikeRef
 advice.pushUnqualifiedRefName
 advice.pushUpdateRejected
 advice.rebaseTodoError
@@ -461,6 +463,7 @@ blame.markIgnoredLines
 blame.markUnblamableLines
 blame.showEmail
 blame.showRoot
+branch.<name>.deleteMerged
 branch.<name>.description
 branch.<name>.merge
 branch.<name>.mergeOptions
@@ -601,6 +604,7 @@ core.commentChar
 core.commentString
 core.commitGraph
 core.compression
+core.configLockTimeout
 core.createObject
 core.deltaBaseCacheLimit
 core.editor
@@ -705,6 +709,7 @@ feature.manyFiles
 fetch.all
 fetch.bundleCreationToken
 fetch.bundleURI
+fetch.followRemoteHEAD
 fetch.fsck.<msg-id>
 fetch.fsck.skipList
 fetch.fsckObjects
@@ -998,6 +1003,7 @@ log.diffMerges
 log.excludeDecoration
 log.follow
 log.graphColors
+log.graphIndent
 log.initialDecorationSet
 log.mailmap
 log.showRoot
@@ -1085,6 +1091,7 @@ pack.writeReverseIndex
 pager.<cmd>
 pretty.<name>
 promisor.acceptFromServer
+promisor.acceptFromServerUrl
 promisor.advertise
 promisor.checkFields
 promisor.quiet
@@ -1218,6 +1225,7 @@ reftable.geometricFactor
 reftable.indexObjects
 reftable.lockTimeout
 reftable.restartInterval
+remote.<name>.advertisedAs
 remote.<name>.fetch
 remote.<name>.followRemoteHEAD
 remote.<name>.mirror
@@ -1259,7 +1267,7 @@ rerere.enabled
 revert.reference
 safe.bareRepository
 safe.directory
-sendemail.<identity>.*
+sendemail.<identity>.<config>
 sendemail.aliasFileType
 sendemail.aliasesFile
 sendemail.annotate
@@ -1441,7 +1449,7 @@ const USAGE: &str = r#"usage: git help [-a|--all] [--[no-]verbose] [--[no-]exter
 /// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
 /// `--[no-]exclude-guides`, `--config-for-completion`,
 /// `--config-sections-for-completion`, `--aliases-for-completion`.
-/// Captured byte-for-byte from stock git 2.55.0's `git help --help-all`.
+/// Captured byte-for-byte from stock git 2.56.0's `git help --help-all`.
 const USAGE_ALL: &str = r#"usage: git help [-a|--all] [--[no-]verbose] [--[no-]external-commands] [--[no-]aliases]
    or: git help [[-i|--info] [-m|--man] [-w|--web]] [<command>|<doc>]
    or: git help [-g|--guides]

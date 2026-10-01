@@ -1076,6 +1076,11 @@ fn dashed_subcommand(arg0: &str) -> Option<String> {
 /// minus the handful (`grep`, `rev-parse`, `archive`) that call
 /// `setup_git_directory()` themselves and therefore *do* die. Everything else
 /// needs a repository, which is what makes `safe.bareRepository` refuse it.
+///
+/// `jump` is not in that table at all: it is the `contrib/git-jump` script,
+/// which git runs through `execv_dashed_external()` with no setup, and whose
+/// `mode_auto` turns a failed `git rev-parse --is-inside-work-tree` into its
+/// usage and exit 1 rather than a fatal.
 pub(crate) const NO_SETUP_VERBS: &[&str] = &[
     "apply",
     "bugreport",
@@ -1100,6 +1105,7 @@ pub(crate) const NO_SETUP_VERBS: &[&str] = &[
     "init",
     "init-db",
     "interpret-trailers",
+    "jump",
     "ls-remote",
     "mailinfo",
     "mailsplit",

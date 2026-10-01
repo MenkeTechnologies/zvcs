@@ -472,8 +472,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // in the store that git never wrote: `add --renormalize --all` over a
     // cone-sparse repo with `in/f.txt` deleted deposited `root.txt`'s normalized
     // blob even though git dies at `in/f.txt` first. The ids are unaffected — the
-    // hash of the converted bytes is the same whether or not it is stored — so the
-    // walk still computes them for the report and the index write.
+    // hash of the converted bytes is the same whether or not it is stored — so
+    // [`index_staged_blobs`] still computes them for the report and the index write.
     let write_content = !dry_run && !refresh && !intent_to_add && !renormalize;
 
     // --- index snapshot: read-only, drives staging decisions and deletions.
@@ -663,40 +663,67 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         mode: Mode,
         stat: Stat,
         was_tracked: bool,
+        /// Set by the walk for a path whose content `index_path()` has yet to read:
+        /// its `id` is a placeholder until [`index_staged_blobs`] fills it in.
+        deferred: bool,
     }
     let mut staged: Vec<Staged> = Vec::new();
-    /// Deposit the blob of every staged path — git's `index_path()` writes, all of
-    /// which happen inside the odb transaction.
+    /// `index_path()` for every path the walk kept — git's `add_files_to_cache()`
+    /// and `add_files()` (builtin/add.c:588-599), which run only once the pathspec
+    /// checks have passed (`:568`). The `convert_to_git()` pipeline runs here and
+    /// nowhere else, once per path: a clean driver is not started for a run that
+    /// dies on a pathspec, and is never started twice for one file. The blob is
+    /// written when `write` (git's `INDEX_WRITE_OBJECT`, read-cache.c:723) and
+    /// only hashed otherwise.
     ///
-    /// The bytes are re-read and re-converted rather than carried out of the walk,
-    /// so an `add -A` over a large worktree holds one file in memory at a time. The
-    /// conversion is silent this time round (see `write_filters`); the id the walk
-    /// computed is replaced by the one the write returned, so the two can never
-    /// disagree even if the file changed in between.
-    fn deposit_staged_blobs(
+    /// The bytes are read here rather than carried out of the walk, so an `add -A`
+    /// over a large worktree holds one file in memory at a time. A conversion
+    /// `core.safecrlf` or a `required` driver refuses is `die()`: the fatal is
+    /// printed and `Some(128)` returned before the index is touched.
+    fn index_staged_blobs(
         repo: &gix::Repository,
         staged: &mut [Staged],
         filters: &mut super::convert_to_git::WorktreeFilter,
-    ) -> Result<()> {
-        for s in staged {
-            // A gitlink has no blob and no worktree bytes: its id is the submodule's
-            // HEAD, which lives in the submodule's own object database.
-            if s.mode == Mode::COMMIT {
-                continue;
-            }
+        write: bool,
+    ) -> Result<Option<ExitCode>> {
+        for s in staged.iter_mut().filter(|s| s.deferred) {
             let abs = repo.workdir_path(&s.path).expect("path came from this worktree");
-            let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
-            // Only the id is taken from this second read. The mode was settled by
+            // Only the id is taken from this read. The mode was settled by
             // `add_to_index()`'s own block before a byte was read
             // (read-cache.c:745-756), and that answer can differ from what this
             // stat says: under `core.fileMode=0` or `core.symlinks=0` it comes off
-            // the entry the index already holds. Re-deriving it here put the
-            // filesystem's executable bit back on every path `git add` staged.
-            let (bytes, _disk_mode) =
-                super::stage::read_converted_bytes(repo, filters, s.path.as_ref(), &abs, &md)?;
-            s.id = repo.write_blob(&bytes)?.detach();
+            // the entry the index already holds.
+            let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
+            let bytes = if md.is_symlink() {
+                // A symlink's target is stored verbatim, never converted.
+                let target = std::fs::read_link(&abs)?;
+                #[cfg(unix)]
+                let bytes = {
+                    use std::os::unix::ffi::OsStrExt;
+                    target.as_os_str().as_bytes().to_vec()
+                };
+                #[cfg(not(unix))]
+                let bytes = target.to_string_lossy().into_owned().into_bytes();
+                bytes
+            } else {
+                let raw = std::fs::read(&abs)?;
+                let rela = gix::path::from_bstr(s.path.as_bstr()).into_owned();
+                match filters.convert(repo, &rela, &raw) {
+                    Ok(converted) => converted,
+                    Err(err) => {
+                        eprintln!("fatal: {err}");
+                        return Ok(Some(ExitCode::from(128)));
+                    }
+                }
+            };
+            s.id = if write {
+                repo.write_blob(&bytes)?.detach()
+            } else {
+                gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?
+            };
+            s.deferred = false;
         }
-        Ok(())
+        Ok(None)
     }
     /// The `-n`/`-v` report, in the order git emits it: first the matched tracked
     /// entries in index order (a removed file → `remove`, a changed file — or any
@@ -768,16 +795,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // *converted* bytes, so staging the verbatim worktree copy writes a different
     // blob than git does in any repository that normalizes line endings.
     //
-    // This walk stands in for git's single `index_path()` call, so it is also the
-    // pass that owns the `core.autocrlf` round-trip warning and the `core.safecrlf`
-    // refusal. `write_content` is exactly git's `pretend ? 0 : INDEX_WRITE_OBJECT`
-    // (read-cache.c:723) plus the `intent_only` and `RENORMALIZE` arms that never
-    // reach the check.
+    // [`index_staged_blobs`] stands in for git's single `index_path()` call, so it
+    // is also the pass that owns the `core.autocrlf` round-trip warning and the
+    // `core.safecrlf` refusal. `write_content` is exactly git's
+    // `pretend ? 0 : INDEX_WRITE_OBJECT` (read-cache.c:723) plus the `intent_only`
+    // and `RENORMALIZE` arms that never reach the check.
     let mut filters = super::convert_to_git::WorktreeFilter::new(&repo, write_content, renormalize)?;
-    // The pipeline the deferred blob-write pass re-converts with. git converts once;
-    // the check therefore stays with the scan above and is off here, or every warned
-    // path would be warned about twice.
-    let mut write_filters = super::convert_to_git::WorktreeFilter::new(&repo, false, renormalize)?;
     // `path_in_sparse_checkout()`: without `--sparse`, a path the sparse-checkout
     // definition leaves out of the worktree is skipped and reported instead of
     // staged. Loaded only when there is a definition to consult.
@@ -886,6 +909,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                         mode: Mode::COMMIT,
                         stat: Default::default(),
                         was_tracked: false,
+                        deferred: false,
                     });
                     continue;
                 }
@@ -910,6 +934,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     mode: Mode::COMMIT,
                     stat,
                     was_tracked: false,
+                    deferred: false,
                 });
                 continue;
             }
@@ -996,6 +1021,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                 mode,
                 stat: stat_now,
                 was_tracked: already_tracked,
+                deferred: false,
             });
             continue;
         }
@@ -1005,22 +1031,17 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // index already holds (read-cache.c:745-756), not off this stat.
         let mode =
             super::update_index::mode_for_added_path(mode_rules, &index, path.as_bstr(), &md);
-        let bytes = if md.is_symlink() {
-            let target = match std::fs::read_link(&abs) {
-                Ok(t) => t,
-                Err(e) => {
-                    read_errors.push((path, os_err_message(&e), already_tracked));
-                    continue;
-                }
-            };
-            #[cfg(unix)]
-            let bytes = {
-                use std::os::unix::ffi::OsStrExt;
-                target.as_os_str().as_bytes().to_vec()
-            };
-            #[cfg(not(unix))]
-            let bytes = target.to_string_lossy().into_owned().into_bytes();
-            bytes
+        // The walk only decides which paths `index_path()` will see; it neither
+        // converts nor hashes them. That happens once, in [`index_staged_blobs`],
+        // after the pathspec checks, which is where git's `add_files_to_cache()`
+        // and `add_files()` run (builtin/add.c:568, 588-599). What the walk does
+        // probe is whether the path can be read at all, so an unreadable one is
+        // reported through `read_errors` as before.
+        if md.is_symlink() {
+            if let Err(e) = std::fs::read_link(&abs) {
+                read_errors.push((path, os_err_message(&e), already_tracked));
+                continue;
+            }
         } else {
             // A symlink's target never reaches the blob hasher that consults the
             // threshold, so only this branch asks — git 2.55.0 adds a lone
@@ -1032,30 +1053,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             }
-            let bytes = match std::fs::read(&abs) {
-                Ok(b) => b,
-                Err(e) => {
-                    read_errors.push((path, os_err_message(&e), already_tracked));
-                    continue;
-                }
-            };
-            // A symlink's target is stored verbatim; a regular file goes through
-            // the pipeline, which is also where git's CRLF round-trip warning
-            // (and `core.safecrlf`'s refusal) comes from.
-            let bytes = {
-                let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
-                match filters.convert(&repo, &rela, &bytes) {
-                    Ok(converted) => converted,
-                    Err(err) => {
-                        // `core.safecrlf=true` makes an unsafe conversion fatal:
-                        // git names the path, stages nothing and exits 128.
-                        eprintln!("fatal: {err}");
-                        return Ok(ExitCode::from(128));
-                    }
-                }
-            };
-            bytes
-        };
+            if let Err(e) = std::fs::File::open(&abs) {
+                read_errors.push((path, os_err_message(&e), already_tracked));
+                continue;
+            }
+        }
 
         // `--chmod` is deliberately NOT applied here: git runs `chmod_pathspec()`
         // over the whole cache once staging is done (builtin/add.c:601-602), so the
@@ -1063,17 +1065,21 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // walk both missed those and reported every matched path as changed under
         // `-n`/`-v`, because the flipped mode always differs from the recorded one.
 
-        // The walk only computes ids; nothing reaches the object database here. git
-        // brackets all of its staging in `odb_transaction_begin()`/`_commit()`
-        // (builtin/add.c:584,603) and every `die()` between them — a pathspec that
-        // matched nothing, an unreadable file under `updating files failed` — leaves
-        // the transaction unfinished, so the blobs it had already hashed are
-        // discarded. Deferring the writes past the last of those dies is the same
-        // guarantee: `git add -A` over an unreadable tracked file used to leave the
-        // blobs of every file the walk reached before it in the store.
+        // Nothing reaches the object database here. git brackets all of its staging
+        // in `odb_transaction_begin()`/`_commit()` (builtin/add.c:584,603) and every
+        // `die()` between them — a pathspec that matched nothing, an unreadable file
+        // under `updating files failed` — leaves the transaction unfinished, so the
+        // blobs it had already hashed are discarded. Deferring the writes past the
+        // last of those dies is the same guarantee.
         indexed_any = true;
-        let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
-        staged.push(Staged { path, id, mode, stat: stat_now, was_tracked: already_tracked });
+        staged.push(Staged {
+            path,
+            id: repo.object_hash().null(),
+            mode,
+            stat: stat_now,
+            was_tracked: already_tracked,
+            deferred: true,
+        });
     }
 
     // Recover the pathspec matcher (usable without borrowing the repo) to decide
@@ -1098,7 +1104,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     for (path, id, stat) in moved_gitlinks(&repo, &index, &staged_set, |p| {
         pathspec.is_included(p, Some(false))
     }) {
-        staged.push(Staged { path, id, mode: Mode::COMMIT, stat, was_tracked: true });
+        staged.push(Staged { path, id, mode: Mode::COMMIT, stat, was_tracked: true, deferred: false });
     }
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
 
@@ -1187,56 +1193,36 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
                     mode,
                     stat: stat_now,
                     was_tracked: true,
+                    deferred: false,
                 });
                 continue;
             }
 
-            // The walk's own read, verbatim: a symlink's target is stored as it
-            // stands, a regular file goes through the `convert_to_git()` pipeline
-            // (and so can raise `core.safecrlf`'s refusal).
+            // As in the walk: probe readability here, convert and hash once in
+            // [`index_staged_blobs`].
             let mode = super::update_index::mode_for_added_path(
                 mode_rules,
                 &index,
                 path.as_bstr(),
                 &md,
             );
-            let bytes = if md.is_symlink() {
-                let target = match std::fs::read_link(&abs) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        read_errors.push((path, os_err_message(&e), true));
-                        continue;
-                    }
-                };
-                #[cfg(unix)]
-                let bytes = {
-                    use std::os::unix::ffi::OsStrExt;
-                    target.as_os_str().as_bytes().to_vec()
-                };
-                #[cfg(not(unix))]
-                let bytes = target.to_string_lossy().into_owned().into_bytes();
-                bytes
-            } else {
-                let bytes = match std::fs::read(&abs) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        read_errors.push((path, os_err_message(&e), true));
-                        continue;
-                    }
-                };
-                let rela = gix::path::from_bstr(path.as_bstr()).into_owned();
-                let bytes = match filters.convert(&repo, &rela, &bytes) {
-                    Ok(converted) => converted,
-                    Err(err) => {
-                        eprintln!("fatal: {err}");
-                        return Ok(ExitCode::from(128));
-                    }
-                };
-                bytes
+            let probe = match md.is_symlink() {
+                true => std::fs::read_link(&abs).map(drop),
+                false => std::fs::File::open(&abs).map(drop),
             };
+            if let Err(e) = probe {
+                read_errors.push((path, os_err_message(&e), true));
+                continue;
+            }
             indexed_any = true;
-            let id = gix::objs::compute_hash(repo.object_hash(), gix::objs::Kind::Blob, &bytes)?;
-            staged.push(Staged { path, id, mode, stat: stat_now, was_tracked: true });
+            staged.push(Staged {
+                path,
+                id: repo.object_hash().null(),
+                mode,
+                stat: stat_now,
+                was_tracked: true,
+                deferred: true,
+            });
         }
     }
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
@@ -1342,13 +1328,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         // and the blobs it hashed are in the store. Only the index write, which
         // `finish:` owns, is skipped.
         super::stage::SpecVerdict::Unknown(code) => {
+            if let Some(code) = index_staged_blobs(&repo, &mut staged, &mut filters, write_content)? {
+                return Ok(code);
+            }
             if dry_run || verbose {
                 for line in report_lines(&index, &staged, &deletions, renormalize) {
                     println!("{line}");
                 }
-            }
-            if write_content {
-                deposit_staged_blobs(&repo, &mut staged, &mut write_filters)?;
             }
             if intent_to_add && indexed_any {
                 repo.write_blob(b"")?;
@@ -1433,12 +1419,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // checks, and `odb_transaction_commit()` closes at :603. Every `die()` in
     // between — including `updating files failed` just above — leaves it
     // unfinished, so the blobs already hashed never land. The walk therefore only
-    // computed ids; they are deposited here, past the last of those dies.
+    // chose the paths; they are converted, hashed and (unless `-n`) written here,
+    // past the last of those dies.
     //
     // `report_path_error()` is the one exit that is *not* a die and does leave them
     // behind — it has its own call above, on the `Unknown` verdict.
-    if write_content {
-        deposit_staged_blobs(&repo, &mut staged, &mut write_filters)?;
+    if let Some(code) = index_staged_blobs(&repo, &mut staged, &mut filters, write_content)? {
+        return Ok(code);
     }
 
     // `-N` reaches `set_object_name_for_intent_to_add_entry()` for every path

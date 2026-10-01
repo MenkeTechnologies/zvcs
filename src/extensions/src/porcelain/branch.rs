@@ -2712,6 +2712,15 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
         if named.is_none() || super::worktree::branch_checked_out(repo, &full)?.is_some() {
             return fatal(format!("no commit on branch '{branch_name}' yet"));
         }
+        // 2.56 builtin/branch.c:1244-1252: with one operand and the advice
+        // enabled, `-u origin main` (meant as `-u origin/main`) is caught first.
+        if let Some(arg) = &named {
+            if crate::advice::Advice::SetUpstreamFailure.enabled_in(repo) {
+                if let Some(code) = die_if_upstream_looks_like_remote(repo, upstream_spec, arg) {
+                    return Ok(code);
+                }
+            }
+        }
         return fatal(format!("branch '{branch_name}' does not exist"));
     }
 
@@ -2743,6 +2752,31 @@ fn set_upstream(repo: &gix::Repository, o: &Opts, upstream_spec: &str) -> Result
     Ok(ExitCode::SUCCESS)
 }
 
+
+/// `die_if_upstream_looks_like_remote()` (builtin/branch.c:946-967, new in
+/// 2.56): an upstream with no slash that names a configured remote, together
+/// with a branch operand `<b>` for which `refs/remotes/<upstream>/<b>` exists,
+/// reads as `<remote> <branch>` given as two words. `Some(128)` after the
+/// refusal and its hint; `None` lets the ordinary "does not exist" die.
+fn die_if_upstream_looks_like_remote(
+    repo: &gix::Repository,
+    new_upstream: &str,
+    branch_name: &str,
+) -> Option<ExitCode> {
+    if new_upstream.contains('/') || !super::fetch::remote_is_configured(repo, new_upstream) {
+        return None;
+    }
+    let remote_ref = format!("refs/remotes/{new_upstream}/{branch_name}");
+    if !matches!(repo.try_find_reference(remote_ref.as_str()), Ok(Some(_))) {
+        return None;
+    }
+    eprintln!("fatal: --set-upstream-to takes a single <remote>/<branch> argument");
+    crate::advice::Advice::SetUpstreamFailure.advise_in(
+        repo,
+        &format!("Did you mean to use: git branch --set-upstream-to={new_upstream}/{branch_name}?"),
+    );
+    Some(ExitCode::from(128))
+}
 
 /// `--unset-upstream`: drop `branch.<name>.remote` and `branch.<name>.merge` for
 /// the given branch (or the current one). Refuses a branch with no upstream.

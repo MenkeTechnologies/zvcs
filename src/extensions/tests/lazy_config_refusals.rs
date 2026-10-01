@@ -9,8 +9,9 @@
 //! * A trailing blank in `-c key=value ` survives in git and made the value
 //!   unreadable; the port read it back through gitoxide's re-parse, which drops
 //!   the blank, and accepted `feature.experimental=' '`.
-//! * `core.logAllRefUpdates` is read when the ref store is built
-//!   (refs.c:2322-2342), `core.warnAmbiguousRefs` when a ref name is dwimmed
+//! * `core.logAllRefUpdates` is read when a ref transaction is finished
+//!   (`files_ref_store_write_options()`, refs/files-backend.c:3327, v2.56.0;
+//!   2.55 read it when the ref store was built), `core.warnAmbiguousRefs` when a ref name is dwimmed
 //!   (refs.c:828), `core.packedRefsTimeout` when `packed-refs` is locked for a
 //!   deletion (refs/packed-backend.c:1222-1228). A bad value kills the commands
 //!   that reach the read and no others; the port killed none.
@@ -88,18 +89,20 @@ fn a_trailing_blank_in_a_command_line_value_is_kept() {
 }
 
 #[test]
-fn log_all_ref_updates_is_refused_where_the_ref_store_is_first_used() {
+fn log_all_ref_updates_is_refused_where_a_ref_is_written() {
     let dir = repo("logall");
     let quiet = run(&dir, &["-c", "core.logAllRefUpdates=none", "rev-parse", "--git-dir"]);
     assert_eq!(quiet.status.code(), Some(0), "{}", String::from_utf8_lossy(&quiet.stderr));
     let quiet = run(&dir, &["-c", "core.logAllRefUpdates=none", "ls-files"]);
     assert_eq!(quiet.status.code(), Some(0), "{}", String::from_utf8_lossy(&quiet.stderr));
-    let out = run(&dir, &["-c", "core.logAllRefUpdates=none", "branch"]);
+    let quiet = run(&dir, &["-c", "core.logAllRefUpdates=none", "branch"]);
+    assert_eq!(quiet.status.code(), Some(0), "{}", String::from_utf8_lossy(&quiet.stderr));
+    let out = run(&dir, &["-c", "core.logAllRefUpdates=none", "branch", "new"]);
     assert_eq!(
         exit_and_first_stderr_line(&out),
         (Some(128), "fatal: bad boolean config value 'none' for 'core.logallrefupdates'".to_owned())
     );
-    let fine = run(&dir, &["-c", "core.logAllRefUpdates=ALWAYS", "branch"]);
+    let fine = run(&dir, &["-c", "core.logAllRefUpdates=ALWAYS", "branch", "new"]);
     assert_eq!(fine.status.code(), Some(0), "{}", String::from_utf8_lossy(&fine.stderr));
 }
 

@@ -1319,6 +1319,12 @@ pub fn config_keys_in_order(repo: Option<&gix::Repository>) -> Vec<String> {
     occurrences_for(repo).into_iter().map(|o| o.key).collect()
 }
 
+/// [`config_keys_in_order`] with each occurrence's value — `None` for git's
+/// valueless `NULL` — for a callback that parses as it walks.
+pub fn config_entries_in_order(repo: Option<&gix::Repository>) -> Vec<(String, Option<String>)> {
+    occurrences_for(repo).into_iter().map(|o| (o.key, o.value)).collect()
+}
+
 /// `git_die_config()` (config.c:2561-2577): report `err` through `error()`, then
 /// die naming where the **last** value of `key` came from.
 ///

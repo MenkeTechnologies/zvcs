@@ -44,8 +44,9 @@ pub struct Store {
 ///
 /// git builds its ref store lazily, the first time a code path asks for it
 /// (`get_main_ref_store()` → `ref_store_init()`, refs.c), and settings it reads
-/// at that point — `core.logAllRefUpdates` among them — are refused there and
-/// nowhere earlier. A store here exists from the moment a repository is opened,
+/// at that point are refused there and nowhere earlier. (Through 2.55 that
+/// included `core.logAllRefUpdates`; 2.56 moved it to the write path — see
+/// [`WRITE_OPTIONS_HOOK`].) A store here exists from the moment a repository is opened,
 /// so a host that needs git's timing installs this hook and makes its decision
 /// on the first use instead. It runs on every entry so the host, not this crate,
 /// decides what "first" means; it must be cheap.
@@ -100,6 +101,33 @@ impl HooksSuspended {
 impl Drop for HooksSuspended {
     fn drop(&mut self) {
         HOOKS_SUSPENDED.with(|s| s.set(self.previous));
+    }
+}
+
+/// A callback run where git's files backend calls
+/// `files_ref_store_write_options()`: on entry to `files_transaction_finish()`
+/// (`refs/files-backend.c:3327`, v2.56.0), once every lock is held.
+///
+/// Since 2.56 that accessor is the only reader of `core.logAllRefUpdates` and
+/// `core.preferSymlinkRefs` for the files backend (`files_ref_store_config()`,
+/// `refs/files-backend.c:130-156`), and it dies on a value `git_config_bool()`
+/// cannot parse — so a command that only reads refs never sees the refusal,
+/// and one that commits a transaction sees it with its locks taken. The hook
+/// gives the host that moment.
+static WRITE_OPTIONS_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the [`WRITE_OPTIONS_HOOK`]. Only the first installation takes effect.
+pub fn set_write_options_hook(hook: fn()) {
+    let _ = WRITE_OPTIONS_HOOK.set(hook);
+}
+
+/// Run the installed write-options hook, if any.
+pub(crate) fn write_options() {
+    if HOOKS_SUSPENDED.with(std::cell::Cell::get) {
+        return;
+    }
+    if let Some(hook) = WRITE_OPTIONS_HOOK.get() {
+        hook();
     }
 }
 

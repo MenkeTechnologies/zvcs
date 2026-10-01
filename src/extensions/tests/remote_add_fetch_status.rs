@@ -102,14 +102,18 @@ fn remote_update_maps_a_dying_fetch_to_one() {
     assert!(run(&repo, &home, &["remote", "add", "o", missing.to_str().unwrap()]).status.success());
 
     for args in [&["remote", "update"][..], &["remote", "update", "o"][..]] {
-        let mut argv = vec!["-c", "core.logAllRefUpdates=none"];
+        // `core.commitGraph` is refused by `prepare_repo_settings()` before the
+        // child fetches. (This used `core.logAllRefUpdates=none` until 2.56 moved
+        // that refusal to the ref-write path, which a fetch from a missing
+        // remote never reaches.)
+        let mut argv = vec!["-c", "core.commitGraph=abc"];
         argv.extend_from_slice(args);
         let out = run(&repo, &home, &argv);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "", "{args:?}");
         assert_eq!(
             String::from_utf8_lossy(&out.stderr),
-            "fatal: bad boolean config value 'none' for 'core.logallrefupdates'\n",
+            "fatal: bad boolean config value 'abc' for 'core.commitgraph'\n",
             "{args:?}"
         );
     }

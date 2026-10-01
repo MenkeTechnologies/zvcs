@@ -30,6 +30,10 @@ impl Transaction<'_, '_> {
     }
 
     fn commit_inner(self, committer: Option<gix_actor::SignatureRef<'_>>) -> Result<Vec<RefEdit>, Error> {
+        // `files_transaction_finish()` opens with `files_ref_store_write_options(refs)`
+        // (refs/files-backend.c:3327, v2.56.0), the lazy config read that dies on a bad
+        // `core.logAllRefUpdates` or `core.preferSymlinkRefs`.
+        crate::store_impl::file::write_options();
         let mut updates = self.updates.expect("BUG: must call prepare before commit");
         let delete_loose_refs = matches!(
             self.packed_refs,

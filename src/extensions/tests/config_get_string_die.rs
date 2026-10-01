@@ -207,16 +207,20 @@ fn remote_readers_die_on_a_valueless_key() {
     assert_died(&f.run(&["-c", "fetch.bundleuri", "fetch", "origin"]), &from_command_line("fetch.bundleuri"));
 }
 
-/// repo-settings.c:107-130 (`prepare_repo_settings()`), repo-settings.c:184
-/// (`ref_store_init()`) and repo-settings.c:204-209 (the hooks directory).
+/// repo-settings.c:107-130 (`prepare_repo_settings()`) and repo-settings.c:204-209
+/// (the hooks directory). `core.logAllRefUpdates` left this list in 2.56: the
+/// files backend now reads it through a `repo_config()` callback
+/// (`files_ref_store_config()`, refs/files-backend.c:130-143), where a valueless
+/// key is `git_config_bool(NULL)`, true, so stock 2.56.0 runs both commands below.
 #[test]
 fn repository_setting_readers_die_on_a_valueless_key() {
     let f = Fixture::new("settings");
     for key in ["core.untrackedcache", "fetch.negotiationalgorithm"] {
         assert_died(&f.run(&["-c", key, "status", "-s"]), &from_command_line(key));
     }
-    assert_died(&f.run(&["-c", "core.logallrefupdates", "status", "-s"]), &from_command_line("core.logallrefupdates"));
-    f.ok(&["-c", "core.logallrefupdates", "ls-files"]);
+    f.ok(&["-c", "core.logallrefupdates", "status", "-s"]);
+    f.ok(&["-c", "core.logallrefupdates", "update-ref", "refs/heads/valueless", "HEAD"]);
+    assert!(f.work.join(".git/logs/refs/heads/valueless").exists());
     assert_died(
         &f.run(&["-c", "core.hookspath", "commit", "-q", "--allow-empty", "-m", "x"]),
         &from_command_line("core.hookspath"),

@@ -356,52 +356,85 @@ pub fn discover() -> Result<gix::Repository, gix::discover::Error> {
     discover_with_overrides().inspect(arm_ref_store_refusal)
 }
 
-/// What `ref_store_init()` (refs.c:2322-2342) would die with when the main ref
-/// store is first created, once a repository has been found.
-/// The `error:` line (for `git_die_config()`'s valueless case), then the `fatal:` one.
-static REF_STORE_REFUSAL: std::sync::OnceLock<Option<(Option<String>, String)>> = std::sync::OnceLock::new();
+/// What `files_ref_store_write_options()` (refs/files-backend.c:145-156, v2.56.0)
+/// would die with the first time a ref transaction is finished.
+static WRITE_OPTIONS_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
-/// Record the refusal for [`ref_store_first_use`] and install that hook.
+/// Record the refusal for [`ref_store_write_options`] and install that hook.
 ///
-/// git reads `core.logAllRefUpdates` while it builds the ref store:
+/// Through 2.55 git read `core.logAllRefUpdates` while it built the ref store
+/// (`repo_settings_get_log_all_ref_updates()`), so any command that so much as
+/// resolved `HEAD` died on a bad value. 2.56 made the files backend read its
+/// write options lazily:
 ///
 /// ```c
-/// struct ref_store_init_options opts = {
-///         .access_flags = flags,
-///         .log_all_ref_updates = repo_settings_get_log_all_ref_updates(repo),
-/// };
+/// static int files_ref_store_config(const char *var, const char *value, …)
+/// {
+///         if (!strcmp(var, "core.prefersymlinkrefs")) {
+///                 opts->prefer_symlink_refs = git_config_bool(var, value);
+///         } else if (!strcmp(var, "core.logallrefupdates")) {
+///                 opts->log_all_ref_updates = refs_parse_log_all_ref_updates_config(value);
+///         }
+///         return 0;
+/// }
 /// ```
 ///
-/// and `repo_settings_get_log_all_ref_updates()` (repo-settings.c:180-194) takes
-/// the last value, answers `always` case-insensitively, and hands anything else
-/// to `git_config_bool()`, which dies. The store is built lazily by
-/// `get_main_ref_store()`, so stock 2.55.0 with `-c core.logAllRefUpdates=none`
-/// dies in `status`, `branch`, `rev-parse HEAD` and `log`, and not in
-/// `rev-parse --git-dir`, `ls-files`, `config` or `hash-object`. gitoxide opens
-/// its ref store eagerly, so the value is read here and the `die()` waits in
-/// the store's first-use hook.
+/// (refs/files-backend.c:130-143), run through `repo_config()` from
+/// `files_ref_store_write_options()`, whose callers are `log_ref_setup()` and
+/// `files_transaction_finish()` (refs/files-backend.c:1916, :3327). So `log`,
+/// `branch --list` and `rev-parse HEAD` no longer die, `update-ref`, `commit`,
+/// `branch -D` and `symbolic-ref` do — and because the read is a callback, every
+/// occurrence is parsed, not the last: `-c core.logAllRefUpdates=none -c
+/// core.logAllRefUpdates=true update-ref …` still dies on `none`. A valueless key
+/// is `git_config_bool(NULL)`, true, where 2.55's `repo_config_get_string_tmp()`
+/// refused it. `refs_parse_log_all_ref_updates_config()` (refs.c:1054-1061)
+/// answers `always` case-insensitively before handing the value to
+/// `git_config_bool()`, which names the key as the literal
+/// `core.logallrefupdates`.
 fn arm_ref_store_refusal(repo: &gix::Repository) {
-    REF_STORE_REFUSAL.get_or_init(|| {
-        let raw = crate::config::last_value_implicit(repo, "core.logallrefupdates")?;
-        // `repo_config_get_string_tmp()` (repo-settings.c:184) dies through
-        // `git_die_config()` on a valueless key, `error:` line first.
-        let Some(raw) = raw else {
-            return Some((
-                Some("missing value for 'core.logallrefupdates'".to_string()),
-                crate::config::die_config_linenr(Some(repo), "core.logallrefupdates"),
-            ));
-        };
-        if raw.eq_ignore_ascii_case("always") || crate::optint::maybe_bool(&raw).is_some() {
-            return None;
-        }
-        Some((None, format!("bad boolean config value '{raw}' for 'core.logallrefupdates'")))
-    });
-    gix::refs::file::set_first_use_hook(ref_store_first_use);
+    WRITE_OPTIONS_REFUSAL.get_or_init(|| write_options_refusal(repo));
+    gix::refs::file::set_write_options_hook(ref_store_write_options);
     REPO_SETTINGS_REFUSAL.get_or_init(|| crate::repo_settings::RepoSettings::load(repo).err());
     gix::odb::store::set_first_use_hook(object_store_first_use);
     PACKED_REFS_TIMEOUT_REFUSAL
         .get_or_init(|| crate::config::config_int(repo, "core.packedrefstimeout").err());
     gix::refs::file::set_packed_refs_lock_hook(packed_refs_lock_first_use);
+}
+
+/// `files_ref_store_config()`'s verdict on one value: `None` when it parses.
+fn write_option_refusal(key: &str, value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let parses = match key {
+        "core.logallrefupdates" => {
+            value.eq_ignore_ascii_case("always") || crate::optint::maybe_bool(value).is_some()
+        }
+        "core.prefersymlinkrefs" => crate::optint::maybe_bool(value).is_some(),
+        _ => true,
+    };
+    (!parses).then(|| format!("bad boolean config value '{value}' for '{key}'"))
+}
+
+/// The first value `files_ref_store_config()` would die on, in callback order.
+///
+/// Every value of the two keys is checked first against the merged snapshot,
+/// which is the common case and costs no ordered walk; only when one of them
+/// fails is the walk made, to find which bad value git meets first.
+fn write_options_refusal(repo: &gix::Repository) -> Option<String> {
+    use gix::bstr::ByteSlice as _;
+    let config = repo.config_snapshot();
+    let any_bad = ["core.logallrefupdates", "core.prefersymlinkrefs"].iter().any(|key| {
+        config.plumbing().raw_values(*key).is_ok_and(|values| {
+            values
+                .iter()
+                .any(|v| write_option_refusal(key, Some(&v.to_str_lossy())).is_some())
+        })
+    });
+    if !any_bad {
+        return None;
+    }
+    crate::config::config_entries_in_order(Some(repo))
+        .into_iter()
+        .find_map(|(key, value)| write_option_refusal(&key, value.as_deref()))
 }
 
 /// What `packed_refs_lock()`'s `repo_config_get_int(…, "core.packedrefstimeout",
@@ -443,13 +476,15 @@ fn packed_refs_lock_first_use() {
     }
 }
 
-/// The ref store's first-use hook: `die()` with the recorded refusal, if any.
-fn ref_store_first_use() {
-    if let Some(Some((error, message))) = REF_STORE_REFUSAL.get() {
-        if let Some(error) = error {
-            crate::trace2::error(error);
-            eprintln!("error: {error}");
-        }
+/// The ref store's write-options hook: `die()` with the recorded refusal, if any.
+///
+/// The hook runs inside the transaction with every ref lock held, as
+/// `files_transaction_finish()` does. git's `die()` releases them through the
+/// tempfile `atexit` handler; `std::process::exit` runs no destructors, so the
+/// registered lock files are removed here before it.
+fn ref_store_write_options() {
+    if let Some(Some(message)) = WRITE_OPTIONS_REFUSAL.get() {
+        gix::tempfile::registry::cleanup_tempfiles();
         crate::trace2::error(message);
         eprintln!("fatal: {message}");
         std::process::exit(i32::from(crate::fatal::EXIT_FATAL));

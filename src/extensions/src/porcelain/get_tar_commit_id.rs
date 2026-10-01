@@ -23,10 +23,8 @@
 //! * Exit 128 on a short read or an EOF before 1024 bytes, matching
 //!   `read_in_full()` + `die_errno()`.
 //! * `-h` and `--help-all`, alone, print the usage line on **stdout** and exit
-//!   129 (`show_usage_if_asked`); any other argument prints the same line on
-//!   **stderr** and exits 129 (`usage()`). Note that git's master branch has
-//!   since changed the `-h` exit to 0 — this module tracks the shipped 2.55
-//!   behaviour of exit 129.
+//!   0 (`show_usage_if_asked`, 2.56); any other argument prints the same line
+//!   on **stderr** and exits 129 (`usage()`).
 //!
 //! ### Honest limitations
 //!
@@ -39,7 +37,7 @@
 //!   and correctly formed; it is not guaranteed to be the same word stock prints.
 //!
 //!   The mechanism was measured rather than guessed. Under the harness environment
-//!   (`GIT_CONFIG_GLOBAL=/dev/null`) stock 2.55.0 prints `Inappropriate ioctl for
+//!   (`GIT_CONFIG_GLOBAL=/dev/null`) stock 2.55.0 and 2.56.0 print `Inappropriate ioctl for
 //!   device` and this port prints `No such file or directory`; point
 //!   `GIT_CONFIG_GLOBAL` at an *empty regular file* instead and stock prints
 //!   `Undefined error: 0`. The difference is macOS libc, not git: `fopen()` +

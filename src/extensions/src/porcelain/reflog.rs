@@ -1640,7 +1640,7 @@ fn is_root_ref(name: &str) -> bool {
 
 /// `copy_reflog_msg()` (refs.c:1031-1045): every run of whitespace becomes one space,
 /// a leading run is dropped outright, and the result is right-trimmed.
-fn normalize_reflog_message(msg: &str) -> String {
+pub(super) fn normalize_reflog_message(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut was_space = true;
     for c in msg.chars() {

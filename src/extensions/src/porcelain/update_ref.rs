@@ -76,7 +76,7 @@ use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
 /// One `<old-oid>`/`<new-oid>` slot as it appears on the command line or on stdin.
-enum Val {
+pub(super) enum Val {
     /// The value and its preceding separator were omitted entirely.
     Missing,
     /// The all-zero object id, or (outside `-z`) the empty string.
@@ -204,24 +204,84 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         Err(e) => return fatal(e),
     };
 
+    let write = CmdlineWrite {
+        name,
+        new: &new,
+        old: &old,
+        delete: opts.delete,
+        deref,
+        create_reflog: opts.create_reflog,
+        msg: opts.msg.as_deref(),
+    };
+    // `refs_update_ref(…, UPDATE_REFS_DIE_ON_ERR)` (builtin/update-ref.c:895-904).
+    write_cmdline(&repo, &write, OnErr::Die)
+}
+
+/// `refs_update_ref()`'s `enum action_on_err` (refs.h): how a failed update is
+/// reported. `update-ref` dies; `git refs create`/`update` (builtin/refs.c,
+/// v2.56.0) pass `UPDATE_REFS_MSG_ON_ERR` and turn the `1` into their exit code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnErr {
+    /// `UPDATE_REFS_DIE_ON_ERR`: `die(str, refname, err.buf)`, exit 128.
+    Die,
+    /// `UPDATE_REFS_MSG_ON_ERR`: `error(str, refname, err.buf)`, exit 1.
+    Msg,
+}
+
+impl OnErr {
+    /// ```c
+    /// const char *str = _("update_ref failed for ref '%s': %s");
+    /// ```
+    /// (refs.c, `refs_update_ref()`), reported as `onerr` asks.
+    fn report(self, name: &str, reason: &str) -> ExitCode {
+        match self {
+            OnErr::Die => {
+                eprintln!("fatal: update_ref failed for ref '{name}': {reason}");
+                ExitCode::from(128)
+            }
+            OnErr::Msg => {
+                eprintln!("error: update_ref failed for ref '{name}': {reason}");
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+/// One command-line write: `refs_delete_ref(msg, name, old, flags)` when `delete`
+/// is set, `refs_update_ref(msg, name, new, old, flags, onerr)` otherwise.
+pub(super) struct CmdlineWrite<'a> {
+    pub name: &'a str,
+    pub new: &'a Val,
+    pub old: &'a Val,
+    pub delete: bool,
+    pub deref: bool,
+    pub create_reflog: bool,
+    pub msg: Option<&'a str>,
+}
+
+/// The write `cmd_update_ref()`'s command-line form and `git refs
+/// create`/`delete`/`update` share once their values are parsed: `refs.c`'s
+/// `refs_delete_ref()` (which reports with `error("%s", err.buf)` and returns 1)
+/// or `refs_update_ref()` (which reports through `onerr`).
+pub(super) fn write_cmdline(repo: &gix::Repository, w: &CmdlineWrite<'_>, onerr: OnErr) -> Result<ExitCode> {
+    let (name, new, old) = (w.name, w.new, w.old);
     // A deletion only requires a "safe" name, not a well-formed one, and a bad
     // one is an `error:` with exit 1 rather than a fatal.
-    if opts.delete && !refname_is_safe(name) {
+    if w.delete && !refname_is_safe(name) {
         eprintln!("error: refusing to update ref with bad name '{name}'");
         return Ok(ExitCode::from(1));
     }
-    // git reports this one through `update_ref`'s die-on-error wrapper, so it
-    // carries the ref name and the same 128 the other update failures use.
-    if let Err(e) = check_new_object(&repo, name, &new) {
-        eprintln!("fatal: update_ref failed for ref '{name}': {e:#}");
-        return Ok(ExitCode::from(128));
+    // git reports this one through `refs_update_ref()`'s `onerr` wrapper, so it
+    // carries the ref name.
+    if let Err(e) = check_new_object(repo, name, new) {
+        return Ok(onerr.report(name, &format!("{e:#}")));
     }
 
-    let edit = match build_edit(name, &new, &old, deref, opts.create_reflog, opts.msg.as_deref()) {
+    let edit = match build_edit(name, new, old, w.deref, w.create_reflog, w.msg) {
         Ok(e) => e,
         // `gix-validate` is stricter than git's `refname_is_safe`; a deletion
         // git would accept targets a ref that cannot exist, so it is a no-op.
-        Err(_) if opts.delete => return Ok(ExitCode::SUCCESS),
+        Err(_) if w.delete => return Ok(ExitCode::SUCCESS),
         // `ref_transaction_update()` validates an update with
         // `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)`, so a
         // single-component name like `main` or `v0.2.0` is well formed and lands
@@ -229,30 +289,27 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
         // `SomeLowercase` rule wants either a `/` or an all-caps pseudo-ref), so
         // the write goes through directly rather than through a transaction.
         Err(_)
-            if !opts.create_reflog
+            if !w.create_reflog
                 && matches!(new, Val::Oid(_))
                 && one_level_update_ok(name) =>
         {
             // A one-level name is well formed to git, so stock got as far as the
             // backend and failed there; this build must not fall through to the
             // direct write and lay a loose ref down beside the reftable store.
-            if let Some(code) = reftable_cmdline_refusal(&repo, name, opts.delete) {
+            if let Some(code) = reftable_cmdline_refusal(repo, name, w.delete, onerr) {
                 return Ok(code);
             }
-            return write_one_level_ref(&repo, name, &new, &old);
+            return write_one_level_ref(repo, name, new, old, onerr);
         }
         Err(_) => {
-            eprintln!(
-                "fatal: update_ref failed for ref '{name}': refusing to update ref with bad name '{name}'"
-            );
-            return Ok(ExitCode::from(128));
+            return Ok(onerr.report(name, &format!("refusing to update ref with bad name '{name}'")));
         }
     };
 
     // `refs_delete_ref()`/`refs_update_ref()` reach the backend only once the name
     // and the values have been accepted, which is why a bad name still outranks
     // this. See [`reftable_transaction_refused`] for the failure itself.
-    if let Some(code) = reftable_cmdline_refusal(&repo, name, opts.delete) {
+    if let Some(code) = reftable_cmdline_refusal(repo, name, w.delete, onerr) {
         return Ok(code);
     }
 
@@ -264,26 +321,26 @@ pub fn update_ref(args: &[String]) -> Result<ExitCode> {
     // an existing `refs/heads/b` came back as `File exists (os error 17)` and, for
     // the other direction, as a reflog that `Is a directory`.
     if let Some(reason) =
-        transaction_conflicts(&repo, std::slice::from_ref(&edit))?.into_iter().flatten().next()
+        transaction_conflicts(repo, std::slice::from_ref(&edit))?.into_iter().flatten().next()
     {
-        eprintln!("fatal: update_ref failed for ref '{name}': {reason}");
-        return Ok(ExitCode::from(128));
+        return Ok(transaction_failure(name, &reason, w.delete, onerr));
     }
 
     match repo.edit_reference(edit) {
         Ok(_) => Ok(ExitCode::SUCCESS),
-        Err(e) => {
-            // `-d` reports `error:` and exits 1; the update form dies with 128.
-            let msg = lock_error(&repo, &e);
-            if opts.delete {
-                eprintln!("error: {msg}");
-                Ok(ExitCode::from(1))
-            } else {
-                eprintln!("fatal: update_ref failed for ref '{name}': {msg}");
-                Ok(ExitCode::from(128))
-            }
-        }
+        Err(e) => Ok(transaction_failure(name, &lock_error(repo, &e), w.delete, onerr)),
     }
+}
+
+/// A transaction that failed to prepare or commit, reported the way its caller
+/// does: `refs_delete_ref()` with `error("%s", err.buf)` and exit 1,
+/// `refs_update_ref()` through `onerr`.
+fn transaction_failure(name: &str, reason: &str, delete: bool, onerr: OnErr) -> ExitCode {
+    if delete {
+        eprintln!("error: {reason}");
+        return ExitCode::from(1);
+    }
+    onerr.report(name, reason)
 }
 
 /// Parse the command line the way git's `parse_options()` does for this command:
@@ -421,12 +478,10 @@ fn one_level_update_ok(name: &str) -> bool {
         && super::check_ref_format::check_refname_format_onelevel(name.as_bytes())
 }
 
-/// `update_ref()`'s die-on-error wrapper around a failed lock: one line,
-/// carrying the ref it was updating and the `cannot lock ref` reason inside it,
-/// then exit 128.
-fn lock_failure(name: &str, reason: &str) -> ExitCode {
-    eprintln!("fatal: update_ref failed for ref '{name}': cannot lock ref '{name}': {reason}");
-    ExitCode::from(128)
+/// `refs_update_ref()`'s `onerr` wrapper around a failed lock: one line,
+/// carrying the ref it was updating and the `cannot lock ref` reason inside it.
+fn lock_failure(name: &str, reason: &str, onerr: OnErr) -> ExitCode {
+    onerr.report(name, &format!("cannot lock ref '{name}': {reason}"))
 }
 
 /// Write a single-component ref the way `files_transaction_finish()` does:
@@ -442,6 +497,7 @@ fn write_one_level_ref(
     name: &str,
     new: &Val,
     old: &Val,
+    onerr: OnErr,
 ) -> Result<ExitCode> {
     let path = repo.git_dir().join(name);
     let current = std::fs::read_to_string(&path)
@@ -455,18 +511,19 @@ fn write_one_level_ref(
         Val::Zero => {
             if let Some(have) = current {
                 let _ = have;
-                return Ok(lock_failure(name, "reference already exists"));
+                return Ok(lock_failure(name, "reference already exists", onerr));
             }
         }
         Val::Oid(want) => match current {
             Some(have) if have == *want => {}
             Some(have) => {
-                return Ok(lock_failure(name, &format!("is at {have} but expected {want}")));
+                return Ok(lock_failure(name, &format!("is at {have} but expected {want}"), onerr));
             }
             None => {
                 return Ok(lock_failure(
                     name,
                     &format!("unable to resolve reference '{name}'"),
+                    onerr,
                 ));
             }
         },
@@ -476,11 +533,11 @@ fn write_one_level_ref(
         Val::Oid(id) => {
             let lock = repo.git_dir().join(format!("{name}.lock"));
             if std::fs::write(&lock, format!("{id}\n")).is_err() {
-                return Ok(lock_failure(name, "unable to create lock file"));
+                return Ok(lock_failure(name, "unable to create lock file", onerr));
             }
             if std::fs::rename(&lock, &path).is_err() {
                 let _ = std::fs::remove_file(&lock);
-                return Ok(lock_failure(name, "unable to write lock file"));
+                return Ok(lock_failure(name, "unable to write lock file", onerr));
             }
         }
         Val::Zero | Val::Missing => {
@@ -561,7 +618,7 @@ fn parse_slot(
 /// (builtin/update-ref.c:875, :887) while `--stdin` says `<cmd> <ref>: invalid
 /// <new-oid>: <spec>` (builtin/update-ref.c:233-237) — while resolving
 /// identically.
-fn resolve_slot(repo: &gix::Repository, spec: &str) -> Option<Val> {
+pub(super) fn resolve_slot(repo: &gix::Repository, spec: &str) -> Option<Val> {
     if spec.len() == repo.object_hash().len_in_hex() && spec.bytes().all(|b| b == b'0') {
         return Some(Val::Zero);
     }
@@ -1158,12 +1215,14 @@ fn reftable_transaction_refused(repo: &gix::Repository) -> Result<()> {
 ///
 /// `cmd_update_ref()` hands a deletion to `refs_delete_ref()`, which reports
 /// through `error("%s", err.buf)` and returns 1 (`refs.c`), and an update to
-/// `refs_update_ref(…, UPDATE_REFS_DIE_ON_ERR)`, which dies with
-/// `update_ref failed for ref '%s': %s` (builtin/update-ref.c:895-904, v2.55.0).
+/// `refs_update_ref()`, which reports `update_ref failed for ref '%s': %s` the
+/// way `onerr` asks — `update-ref` dies (builtin/update-ref.c:895-904), `git refs
+/// create`/`update` print an `error:` and exit 1 (builtin/refs.c, v2.56.0).
 fn reftable_cmdline_refusal(
     repo: &gix::Repository,
     name: &str,
     delete: bool,
+    onerr: OnErr,
 ) -> Option<ExitCode> {
     if !crate::setup::declares_reftable(repo) {
         return None;
@@ -1173,8 +1232,7 @@ fn reftable_cmdline_refusal(
         eprintln!("error: {msg}");
         return Some(ExitCode::from(1));
     }
-    eprintln!("fatal: update_ref failed for ref '{name}': {msg}");
-    Some(ExitCode::from(128))
+    Some(onerr.report(name, msg))
 }
 
 /// git's `prepare`: acquire the locks the staged batch needs and validate its

@@ -16,6 +16,11 @@
 //!     missing subcommand (`error: need a subcommand` + usage on stderr, 129),
 //!     an unknown subcommand, and each subcommand's own `-h` usage block.
 //!
+//!   * `git refs create`/`delete`/`update`/`rename` (new in 2.56): the first
+//!     three share `update-ref`'s command-line write
+//!     ([`super::update_ref::write_cmdline`]), reporting a refused write as
+//!     `error:` and exit 1 where `update-ref` dies; `rename` is
+//!     `files_copy_or_rename_ref()`, which moves the ref and its reflog only.
 //!   * `git refs migrate --ref-format=<format>` up to the point where bytes would
 //!     move: the option scan, `usage: too many arguments`, `usage: missing
 //!     --ref-format=<format>`, `error: unknown ref storage format '<x>'`,
@@ -82,6 +87,10 @@ usage: git refs migrate --ref-format=<format> [--no-reflog] [--dry-run]\n\
 \x20                               [ --stdin | (<pattern>...)]\n\
 \x20  or: git refs exists <ref>\n\
 \x20  or: git refs optimize [--all] [--no-prune] [--auto] [--include <pattern>] [--exclude <pattern>]\n\
+\x20  or: git refs create [--message=<reason>] [--no-deref] [--create-reflog] <ref> <new-value>\n\
+\x20  or: git refs delete [--message=<reason>] [--no-deref] <ref> [<old-value>]\n\
+\x20  or: git refs update [--message=<reason>] [--no-deref] [--create-reflog] <ref> <new-value> [<old-value>]\n\
+\x20  or: git refs rename [--message=<reason>] <old-ref> <new-ref>\n\
 \n\
 ";
 
@@ -215,6 +224,10 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
         "optimize" => optimize(args),
         "migrate" => migrate(&args[1..]),
         "verify" => verify(&args[1..]),
+        "create" => create(&args[1..]),
+        "delete" => delete(&args[1..]),
+        "update" => update(&args[1..]),
+        "rename" => rename(&args[1..]),
         // git's option parser reports an unknown leading dashed argument before
         // it ever looks for a subcommand.
         // `parse_options_step()` consumes a lone `--` before any table lookup
@@ -740,6 +753,614 @@ fn optimize(args: &[String]) -> Result<ExitCode> {
         return Ok(super::show_usage(USAGE_OPTIMIZE));
     }
     super::pack_refs::pack_refs(args)
+}
+
+/// `git refs create -h`, byte-for-byte.
+const USAGE_CREATE: &str = "\
+usage: git refs create [--message=<reason>] [--no-deref] [--create-reflog] <ref> <new-value>\n\
+\n\
+\x20   --[no-]message <reason>\n\
+\x20                         reason of the update\n\
+\x20   --no-deref            update <refname> not the one it points to\n\
+\x20   --deref               opposite of --no-deref\n\
+\x20   --[no-]create-reflog  create a reflog\n\
+\n\
+";
+
+/// `git refs delete -h`, byte-for-byte.
+const USAGE_DELETE: &str = "\
+usage: git refs delete [--message=<reason>] [--no-deref] <ref> [<old-value>]\n\
+\n\
+\x20   --[no-]message <reason>\n\
+\x20                         reason of the update\n\
+\x20   --no-deref            update <refname> not the one it points to\n\
+\x20   --deref               opposite of --no-deref\n\
+\n\
+";
+
+/// `git refs update -h`, byte-for-byte.
+const USAGE_UPDATE: &str = "\
+usage: git refs update [--message=<reason>] [--no-deref] [--create-reflog] <ref> <new-value> [<old-value>]\n\
+\n\
+\x20   --[no-]message <reason>\n\
+\x20                         reason of the update\n\
+\x20   --no-deref            update <refname> not the one it points to\n\
+\x20   --deref               opposite of --no-deref\n\
+\x20   --[no-]create-reflog  create a reflog\n\
+\n\
+";
+
+/// `git refs rename -h`, byte-for-byte.
+const USAGE_RENAME: &str = "\
+usage: git refs rename [--message=<reason>] <old-ref> <new-ref>\n\
+\n\
+\x20   --[no-]message <reason>\n\
+\x20                         reason of the update\n\
+\n\
+";
+
+/// `cmd_refs_create()`'s and `cmd_refs_update()`'s `struct option opts[]`
+/// (builtin/refs.c:200-207, :291-298, v2.56.0): `OPT_STRING` `message`, then two
+/// `OPT_BIT`s. `no-deref` carries its negation in its own name, so `--deref` is
+/// its unset sense.
+const CREATE_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "message",       neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "no-deref",      neg: true, arg: super::Arg::None },
+    super::LongOpt { name: "create-reflog", neg: true, arg: super::Arg::None },
+];
+
+/// `cmd_refs_delete()`'s table (builtin/refs.c:244-250): no `--create-reflog`.
+const DELETE_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "message",  neg: true, arg: super::Arg::Required },
+    super::LongOpt { name: "no-deref", neg: true, arg: super::Arg::None },
+];
+
+/// `cmd_refs_rename()`'s table (builtin/refs.c:339-343): `--message` alone.
+const RENAME_OPTS: &[super::LongOpt] = &[
+    super::LongOpt { name: "message", neg: true, arg: super::Arg::Required },
+];
+
+/// What the four writing subcommands' `parse_options()` leaves behind.
+#[derive(Default)]
+struct WriteOpts {
+    message: Option<String>,
+    no_deref: bool,
+    create_reflog: bool,
+    args: Vec<String>,
+}
+
+/// `parse_options(argc, argv, prefix, opts, usage, 0)` over one of the tables
+/// above: options and operands may interleave, `--` ends the options, `-h` and
+/// `--help-all` print `usage` on stdout. There are no short options, so every
+/// other `-<c>` is an unknown switch.
+fn parse_write_opts(
+    args: &[String],
+    table: &'static [super::LongOpt],
+    usage: &str,
+) -> std::result::Result<WriteOpts, ExitCode> {
+    let mut o = WriteOpts::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        i += 1;
+        if a == "--" {
+            o.args.extend(args[i..].iter().cloned());
+            break;
+        }
+        if a == "-" || !a.starts_with('-') {
+            o.args.push(a.to_string());
+            continue;
+        }
+        if a == "--help-all" || a.starts_with("-h") {
+            return Err(super::show_usage(usage));
+        }
+        let Some(body) = a.strip_prefix("--") else {
+            eprintln!("error: unknown switch `{}'", &a[1..2]);
+            eprint!("{usage}");
+            return Err(ExitCode::from(129));
+        };
+        let inline = body.split_once('=').map(|(_, v)| v);
+        let (opt, unset) = match super::resolve_long(table, body) {
+            super::Resolved::One(opt, unset) => (opt, unset),
+            super::Resolved::Ambiguous(first, second) => {
+                return Err(super::ambiguous_option(a, &first, &second, usage))
+            }
+            super::Resolved::Unknown => {
+                eprintln!("error: unknown option `{body}'");
+                eprint!("{usage}");
+                return Err(ExitCode::from(129));
+            }
+        };
+        let shown = match unset {
+            true => format!("no-{}", opt.name),
+            false => opt.name.to_string(),
+        };
+        if inline.is_some() && (unset || opt.arg == super::Arg::None) {
+            eprintln!("error: option `{shown}' takes no value");
+            return Err(ExitCode::from(129));
+        }
+        match opt.name {
+            "message" if unset => o.message = None,
+            "message" => {
+                let value = match inline {
+                    Some(v) => v.to_string(),
+                    None => match args.get(i) {
+                        Some(v) => {
+                            i += 1;
+                            v.clone()
+                        }
+                        None => {
+                            eprintln!("error: option `{shown}' requires a value");
+                            return Err(ExitCode::from(129));
+                        }
+                    },
+                };
+                o.message = Some(value);
+            }
+            // `OPT_BIT(0, "no-deref", …)`: the plain spelling sets the bit, the
+            // `--deref` spelling (its unset sense) clears it.
+            "no-deref" => o.no_deref = !unset,
+            "create-reflog" => o.create_reflog = !unset,
+            _ => unreachable!("every table entry is matched above"),
+        }
+    }
+    Ok(o)
+}
+
+/// The steps every writing subcommand takes once its operands are counted:
+///
+/// ```c
+/// if (message && !*message)
+///         die(_("refusing to perform update with empty message"));
+///
+/// repo_config(repo, git_default_config, NULL);
+/// ```
+///
+/// The repository is opened here, after the count, because `RUN_SETUP` has
+/// already happened in git by then and an operand-count error must not depend
+/// on it. Every write leaves a reflog line, which is why the identity a bare
+/// runner lacks is synthesized, as `update-ref` does.
+fn open_for_write(o: &WriteOpts) -> Result<std::result::Result<gix::Repository, ExitCode>> {
+    if o.message.as_deref() == Some("") {
+        eprintln!("fatal: refusing to perform update with empty message");
+        return Ok(Err(ExitCode::from(128)));
+    }
+    let mut repo = crate::setup::discover()?;
+    crate::ensure_reflog_identity(&mut repo);
+    Ok(Ok(repo))
+}
+
+/// `repo_get_oid_with_flags(repo, spec, &oid, GET_OID_SKIP_AMBIGUITY_CHECK)`,
+/// shared with `update-ref`'s value slots: the value `spec` names, or `None`
+/// when it names nothing. An empty `spec` names nothing — `update-ref` alone
+/// reads `""` as the null id, before it ever calls this.
+fn get_oid(repo: &gix::Repository, spec: &str) -> Option<super::update_ref::Val> {
+    if spec.is_empty() {
+        return None;
+    }
+    super::update_ref::resolve_slot(repo, spec)
+}
+
+/// `git refs create [--message=<reason>] [--no-deref] [--create-reflog] <ref> <new-value>`
+/// — `cmd_refs_create()` (builtin/refs.c:190-233, v2.56.0).
+///
+/// `refs_update_ref()` with a null old value, so the reference must not exist
+/// yet, and `UPDATE_REFS_MSG_ON_ERR`, so a refused write is `error:` and exit 1.
+fn create(args: &[String]) -> Result<ExitCode> {
+    use super::update_ref::Val;
+    let o = match parse_write_opts(args, CREATE_OPTS, USAGE_CREATE) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    if o.args.len() != 2 {
+        eprintln!("usage: create requires reference name and an object ID");
+        return Ok(ExitCode::from(129));
+    }
+    let repo = match open_for_write(&o)? {
+        Ok(repo) => repo,
+        Err(code) => return Ok(code),
+    };
+    let (name, spec) = (o.args[0].as_str(), o.args[1].as_str());
+    let new = match get_oid(&repo, spec) {
+        Some(Val::Zero) => {
+            eprintln!("fatal: cannot create reference with null new object ID");
+            return Ok(ExitCode::from(128));
+        }
+        Some(v) => v,
+        None => {
+            eprintln!("fatal: invalid object ID: '{spec}'");
+            return Ok(ExitCode::from(128));
+        }
+    };
+    let write = super::update_ref::CmdlineWrite {
+        name,
+        new: &new,
+        old: &Val::Zero,
+        delete: false,
+        deref: !o.no_deref,
+        create_reflog: o.create_reflog,
+        msg: o.message.as_deref(),
+    };
+    super::update_ref::write_cmdline(&repo, &write, super::update_ref::OnErr::Msg)
+}
+
+/// `git refs delete [--message=<reason>] [--no-deref] <ref> [<old-value>]` —
+/// `cmd_refs_delete()` (builtin/refs.c:236-280, v2.56.0), which is
+/// `refs_delete_ref()` exactly as `update-ref -d` calls it.
+fn delete(args: &[String]) -> Result<ExitCode> {
+    use super::update_ref::Val;
+    let o = match parse_write_opts(args, DELETE_OPTS, USAGE_DELETE) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    if o.args.is_empty() || o.args.len() > 2 {
+        eprintln!("usage: delete requires reference name and an optional old object ID");
+        return Ok(ExitCode::from(129));
+    }
+    let repo = match open_for_write(&o)? {
+        Ok(repo) => repo,
+        Err(code) => return Ok(code),
+    };
+    let name = o.args[0].as_str();
+    let old = match o.args.get(1) {
+        None => Val::Missing,
+        Some(spec) => match get_oid(&repo, spec) {
+            Some(Val::Zero) => {
+                eprintln!("fatal: cannot delete reference with null old object ID");
+                return Ok(ExitCode::from(128));
+            }
+            Some(v) => v,
+            None => {
+                eprintln!("fatal: invalid old object ID: '{spec}'");
+                return Ok(ExitCode::from(128));
+            }
+        },
+    };
+    let write = super::update_ref::CmdlineWrite {
+        name,
+        new: &Val::Missing,
+        old: &old,
+        delete: true,
+        deref: !o.no_deref,
+        create_reflog: false,
+        msg: o.message.as_deref(),
+    };
+    super::update_ref::write_cmdline(&repo, &write, super::update_ref::OnErr::Msg)
+}
+
+/// `git refs update [--message=<reason>] [--no-deref] [--create-reflog] <ref>
+/// <new-value> [<old-value>]` — `cmd_refs_update()` (builtin/refs.c:283-330,
+/// v2.56.0). A null `<new-value>` deletes; a null `<old-value>` demands that the
+/// reference not exist yet.
+fn update(args: &[String]) -> Result<ExitCode> {
+    use super::update_ref::Val;
+    let o = match parse_write_opts(args, CREATE_OPTS, USAGE_UPDATE) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    if o.args.len() < 2 || o.args.len() > 3 {
+        eprintln!("usage: update requires reference name, new value and an optional old value");
+        return Ok(ExitCode::from(129));
+    }
+    let repo = match open_for_write(&o)? {
+        Ok(repo) => repo,
+        Err(code) => return Ok(code),
+    };
+    let name = o.args[0].as_str();
+    let Some(new) = get_oid(&repo, &o.args[1]) else {
+        eprintln!("fatal: invalid new object ID: '{}'", o.args[1]);
+        return Ok(ExitCode::from(128));
+    };
+    let old = match o.args.get(2) {
+        None => Val::Missing,
+        Some(spec) => match get_oid(&repo, spec) {
+            Some(v) => v,
+            None => {
+                eprintln!("fatal: invalid old object ID: '{spec}'");
+                return Ok(ExitCode::from(128));
+            }
+        },
+    };
+    let write = super::update_ref::CmdlineWrite {
+        name,
+        new: &new,
+        old: &old,
+        delete: false,
+        deref: !o.no_deref,
+        create_reflog: o.create_reflog,
+        msg: o.message.as_deref(),
+    };
+    super::update_ref::write_cmdline(&repo, &write, super::update_ref::OnErr::Msg)
+}
+
+/// `git refs rename [--message=<reason>] <old-ref> <new-ref>` —
+/// `cmd_refs_rename()` (builtin/refs.c:333-375, v2.56.0):
+///
+/// ```c
+/// if (check_refname_format(oldref, 0))
+///         die(_("invalid ref format: '%s'"), oldref);
+/// if (check_refname_format(newref, 0))
+///         die(_("invalid ref format: '%s'"), newref);
+///
+/// if (!refs_ref_exists(get_main_ref_store(repo), oldref))
+///         die(_("reference does not exist: '%s'"), oldref);
+/// if (refs_ref_exists(get_main_ref_store(repo), newref))
+///         die(_("reference already exists: '%s'"), newref);
+///
+/// ret = refs_rename_ref(get_main_ref_store(repo), oldref, newref, message);
+/// ```
+///
+/// Only the reference and its reflog move: unlike `git branch -m`, nothing
+/// re-points a `HEAD` that named the old reference, and no config follows it.
+fn rename(args: &[String]) -> Result<ExitCode> {
+    let o = match parse_write_opts(args, RENAME_OPTS, USAGE_RENAME) {
+        Ok(o) => o,
+        Err(code) => return Ok(code),
+    };
+    if o.args.len() != 2 {
+        eprintln!("usage: rename requires old and new reference name");
+        return Ok(ExitCode::from(129));
+    }
+    let repo = match open_for_write(&o)? {
+        Ok(repo) => repo,
+        Err(code) => return Ok(code),
+    };
+    let (old, new) = (o.args[0].as_str(), o.args[1].as_str());
+    for name in [old, new] {
+        if !super::check_ref_format::check_refname_format(name.as_bytes(), 0) {
+            eprintln!("fatal: invalid ref format: '{name}'");
+            return Ok(ExitCode::from(128));
+        }
+    }
+    if !crate::refname::ref_exists(&repo, old.as_bytes()) {
+        eprintln!("fatal: reference does not exist: '{old}'");
+        return Ok(ExitCode::from(128));
+    }
+    if crate::refname::ref_exists(&repo, new.as_bytes()) {
+        eprintln!("fatal: reference already exists: '{new}'");
+        return Ok(ExitCode::from(128));
+    }
+    // `refs_rename_ref()` (refs.c:3126-3136) normalizes the message the way every
+    // reflog write does.
+    let msg = o.message.as_deref().map(super::reflog::normalize_reflog_message);
+    match files_rename_ref(&repo, old, new, msg.as_deref().unwrap_or(""))? {
+        true => Ok(ExitCode::SUCCESS),
+        false => Ok(ExitCode::from(1)),
+    }
+}
+
+/// `TMP_RENAMED_LOG` (refs/files-backend.c): where a rename parks the old
+/// reference's reflog while the old reference is taken out of the way.
+const TMP_RENAMED_LOG: &str = "refs/.tmp-renamed-log";
+
+/// `files_ref_path()`/`files_reflog_path()`'s choice of directory: a
+/// per-worktree reference lives in the worktree's own git directory, every
+/// other one in the common directory.
+fn files_base(repo: &gix::Repository, refname: &str) -> std::path::PathBuf {
+    match PER_WORKTREE.iter().any(|p| refname.starts_with(p)) {
+        true => repo.git_dir().to_path_buf(),
+        false => repo.common_dir().to_path_buf(),
+    }
+}
+
+/// `files_copy_or_rename_ref(…, copy = 0)` (refs/files-backend.c:1688-1840,
+/// v2.56.0): the `rename_ref` method `refs_rename_ref()` dispatches to. Returns
+/// `false` once it has reported the failure through `error()`, which
+/// `cmd_refs_rename()` turns into exit 1.
+///
+/// The order is the C function's, and it is what lets `refs/heads/a` become
+/// `refs/heads/a/b`: the old reflog is parked under [`TMP_RENAMED_LOG`] and the
+/// old reference deleted (its `HEAD` mirror carrying `logmsg`) before anything
+/// is written under the new name, then the parked log is moved into place and
+/// the new reference written with a `<oid> <oid> … <logmsg>` entry.
+fn files_rename_ref(repo: &gix::Repository, old: &str, new: &str, logmsg: &str) -> Result<bool> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    use gix::refs::{FullName, Target};
+
+    let sb_oldref = files_base(repo, old).join("logs").join(old);
+    let sb_newref = files_base(repo, new).join("logs").join(new);
+    let tmp_renamed_log = repo.common_dir().join("logs").join(TMP_RENAMED_LOG);
+
+    let loginfo = std::fs::symlink_metadata(&sb_oldref);
+    let log = loginfo.is_ok();
+    if loginfo.is_ok_and(|m| m.file_type().is_symlink()) {
+        eprintln!("error: reflog for {old} is a symlink");
+        return Ok(false);
+    }
+
+    // `refs_resolve_ref_unsafe(…, RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE, …)`.
+    let Some(found) = repo.refs.try_find(old).ok().flatten().filter(|r| r.name.as_bstr() == old) else {
+        eprintln!("error: refname {old} not found");
+        return Ok(false);
+    };
+    let orig_oid = match found.target {
+        Target::Object(id) => id,
+        Target::Symbolic(_) => {
+            eprintln!("error: refname {old} is a symbolic ref, renaming it is not supported");
+            return Ok(false);
+        }
+    };
+    // `refs_rename_ref_available()`: `refs_verify_refname_available(new, NULL,
+    // skip = {old})`, reported through `error("%s", err.buf)`.
+    if let Some(blocker) = refname_conflict(repo, new, old) {
+        eprintln!("error: '{blocker}' exists; cannot create '{new}'");
+        return Ok(false);
+    }
+
+    if log {
+        if let Some(parent) = tmp_renamed_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::rename(&sb_oldref, &tmp_renamed_log) {
+            eprintln!(
+                "error: unable to move logfile logs/{old} to logs/{TMP_RENAMED_LOG}: {}",
+                crate::external::strerror(&e)
+            );
+            return Ok(false);
+        }
+    }
+
+    let full = |name: &str| -> Result<FullName> {
+        name.try_into().map_err(|e| anyhow::anyhow!("invalid ref name '{name}': {e}"))
+    };
+    // `refs_delete_ref(&refs->base, logmsg, oldrefname, &orig_oid, REF_NO_DEREF)`.
+    let deleted = repo.edit_reference(RefEdit {
+        change: Change::Delete {
+            expected: PreviousValue::MustExistAndMatch(Target::Object(orig_oid)),
+            log: RefLog::AndReference,
+            message: logmsg.into(),
+        },
+        name: full(old)?,
+        deref: false,
+    });
+    if deleted.is_err() {
+        eprintln!("error: unable to delete old {old}");
+        return rename_rollback(repo, old, orig_oid, log, false, &sb_oldref, &sb_newref, &tmp_renamed_log);
+    }
+
+    // What stands at the new name: an empty directory tree left behind by
+    // references that once lived below it, which `raceproof_create_file()`
+    // clears (`remove_dir_recursively(…, REMOVE_DIR_EMPTY_ONLY)`) for both the
+    // reference and its log. A real reference there was refused above.
+    remove_empty_directories(&files_base(repo, new).join(new));
+    remove_empty_directories(&sb_newref);
+
+    // `rename_tmp_log()`.
+    if log {
+        if let Some(parent) = sb_newref.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::rename(&tmp_renamed_log, &sb_newref) {
+            match e.raw_os_error() == Some(libc::EISDIR) {
+                true => eprintln!("error: directory not empty: {}", sb_newref.display()),
+                false => eprintln!(
+                    "error: unable to move logfile {} to {}: {}",
+                    tmp_renamed_log.display(),
+                    sb_newref.display(),
+                    crate::external::strerror(&e)
+                ),
+            }
+            return rename_rollback(repo, old, orig_oid, log, false, &sb_oldref, &sb_newref, &tmp_renamed_log);
+        }
+    }
+
+    // `lock_ref_oid_basic()` + `write_ref_to_lockfile()` + `commit_ref_update(…,
+    // logmsg, 0)`, with `lock->old_oid` set to `orig_oid`: the entry reads
+    // `<orig> <orig>`, written only where `log_ref_setup()` would — the log just
+    // moved in, or a name `should_autocreate_reflog()` covers.
+    let written = repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange { mode: RefLog::AndReference, force_create_reflog: false, message: logmsg.into() },
+            expected: PreviousValue::MustNotExist,
+            new: Target::Object(orig_oid),
+        },
+        name: full(new)?,
+        deref: false,
+    });
+    if let Err(e) = written {
+        eprintln!("error: unable to rename '{old}' to '{new}': {e}");
+        return rename_rollback(repo, old, orig_oid, log, log, &sb_oldref, &sb_newref, &tmp_renamed_log);
+    }
+    // gitoxide logs the write as a creation; git's `lock->old_oid` makes it
+    // `<orig> <orig>`.
+    rewrite_last_reflog_old_id(&sb_newref, orig_oid);
+    Ok(true)
+}
+
+/// The `rollback:` and `rollbacklog:` tail of `files_copy_or_rename_ref()`: put
+/// the old reference back (`commit_ref_update(…, NULL, REF_SKIP_CREATE_REFLOG)`,
+/// so no log line) and return its reflog to where it was.
+#[allow(clippy::too_many_arguments)]
+fn rename_rollback(
+    repo: &gix::Repository,
+    old: &str,
+    orig_oid: gix::ObjectId,
+    log: bool,
+    logmoved: bool,
+    sb_oldref: &std::path::Path,
+    sb_newref: &std::path::Path,
+    tmp_renamed_log: &std::path::Path,
+) -> Result<bool> {
+    let ref_path = files_base(repo, old).join(old);
+    let lock = ref_path.with_file_name(format!(
+        "{}.lock",
+        ref_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    let restored = ref_path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| {
+        std::fs::write(&lock, format!("{orig_oid}\n"))?;
+        std::fs::rename(&lock, &ref_path)
+    });
+    if let Err(e) = restored {
+        let _ = std::fs::remove_file(&lock);
+        eprintln!("error: unable to lock {old} for rollback: {}", crate::external::strerror(&e));
+    }
+    if logmoved {
+        if let Err(e) = std::fs::rename(sb_newref, sb_oldref) {
+            eprintln!(
+                "error: unable to restore logfile {old} from {}: {}",
+                sb_newref.display(),
+                crate::external::strerror(&e)
+            );
+        }
+    }
+    if !logmoved && log {
+        if let Err(e) = std::fs::rename(tmp_renamed_log, sb_oldref) {
+            eprintln!(
+                "error: unable to restore logfile {old} from logs/{TMP_RENAMED_LOG}: {}",
+                crate::external::strerror(&e)
+            );
+        }
+    }
+    Ok(false)
+}
+
+/// `refs_verify_refname_available(refname, NULL, skip = {skip})` (refs.c),
+/// answering the one question a rename asks of it: which existing reference,
+/// other than `skip`, stands in the way of creating `refname`? Either one at a
+/// parent path, which would have to become a directory, or one below it, which
+/// already made it one. git words both `'%s' exists; cannot create '%s'`.
+fn refname_conflict(repo: &gix::Repository, refname: &str, skip: &str) -> Option<String> {
+    let mut dir = refname;
+    while let Some(cut) = dir.rfind('/') {
+        dir = &dir[..cut];
+        if dir != skip && crate::refname::ref_exists(repo, dir.as_bytes()) {
+            return Some(dir.to_string());
+        }
+    }
+    let prefix = format!("{refname}/");
+    let platform = repo.references().ok()?;
+    let below = platform.prefixed(prefix.as_str()).ok()?;
+    below
+        .filter_map(std::result::Result::ok)
+        .map(|r| r.name().as_bstr().to_string())
+        .find(|name| name != skip)
+}
+
+/// `remove_empty_directories()` (refs/files-backend.c): remove `path` if it is
+/// a directory holding nothing but empty directories; anything else is left.
+fn remove_empty_directories(path: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(path) else { return };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_empty_directories(&entry.path());
+        }
+    }
+    let _ = std::fs::remove_dir(path);
+}
+
+/// Point the last reflog entry's *old* id at `old`: a rename records a reference
+/// that changed name while pointing where it already pointed.
+fn rewrite_last_reflog_old_id(path: &std::path::Path, old: gix::ObjectId) {
+    let Ok(body) = std::fs::read(path) else { return };
+    let Some(last_nl) = body.iter().rposition(|b| *b == b'\n') else { return };
+    let start = body[..last_nl].iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1);
+    let hex = old.to_hex().to_string();
+    if body.len() < start + hex.len() {
+        return;
+    }
+    let mut out = body;
+    out[start..start + hex.len()].copy_from_slice(hex.as_bytes());
+    let _ = std::fs::write(path, out);
 }
 
 #[cfg(test)]

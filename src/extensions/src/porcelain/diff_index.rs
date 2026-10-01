@@ -53,7 +53,7 @@
 //!     modes are listed under the limitations below.
 //!   * `--diff-filter=<letters>`        — include upper-case, exclude lower-case statuses.
 //!   * `--line-prefix=<s>`              — prefix every emitted record.
-//!   * `--relative[=<path>]`, `--no-relative` — limit to a subdirectory and strip it.
+//!   * `--relative[=<path>]`, `--no-relative` — limit to a path prefix (the cwd by default) and strip it.
 //!   * `-w`, `-b`, `--ignore-all-space`, `--ignore-space-change`,
 //!     `--ignore-space-at-eol`, `--ignore-cr-at-eol`, `-I<s>`/`--ignore-matching-lines=<s>`
 //!     — content comparison: pairs whose contents match once the requested folding is
@@ -343,7 +343,16 @@ struct Opts {
     exit_code: bool,               // --exit-code/--quiet: exit 1 when anything differs
     reverse: bool,                 // -R: swap the two sides
     line_prefix: Vec<u8>,          // --line-prefix=<s>
-    relative: Option<BString>,     // --relative[=<dir>], repository-root relative, no trailing '/'
+    /// `diffopt.prefix` once `diff_setup_done()` has run (diff.c:5270-5275): `Some` only
+    /// while `flags.relative_name` is on and the prefix is non-empty. It is the raw
+    /// bytes, compared with `strncmp()` and stripped by [`strip_relative`], so
+    /// `--relative=sub` narrows to `sub2/` too, exactly as git does.
+    relative: Option<BString>,
+    /// `flags.relative_name`: `--relative[=<path>]` on, `--no-relative` off.
+    relative_name: bool,
+    /// The last `--relative=<path>` argument (`diff_opt_relative()`, diff.c:5884-5893),
+    /// which replaces the cwd prefix `repo_init_revisions()` seeded.
+    relative_arg: Option<BString>,
     filter_include: Vec<u8>,       // --diff-filter upper-case letters
     filter_exclude: Vec<u8>,       // --diff-filter lower-case letters, upper-cased
     ws: Ws,
@@ -1106,8 +1115,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 dirstat!("files");
                 dirstat!("");
             }
-            "--relative" => opts.relative = Some(BString::default()),
-            "--no-relative" => opts.relative = None,
+            "--relative" => opts.relative_name = true,
+            "--no-relative" => opts.relative_name = false,
             // `diff_opt_*`: the patch and stat output formats. `--patch-with-raw` also
             // keeps the raw listing, `--patch-with-stat` also prepends the diffstat.
             "-p" | "-u" | "--patch" => opts.patch = true,
@@ -1395,7 +1404,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 }
             },
             s if s.starts_with("--relative=") => {
-                opts.relative = Some(trim_slashes(&s["--relative=".len()..]));
+                opts.relative_name = true;
+                opts.relative_arg = Some(BString::from(&s["--relative=".len()..]));
             }
             // `--expand-tabs=<n>` is validated by `strtol_i` at option-parse time
             // (revision.c:2579-2583) and dies before any revision is resolved; the
@@ -1709,6 +1719,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
     super::diff_files::init_quote_path(&repo);
+    // `diff_setup_done()` (diff.c:5270-5275): `diffopt.prefix` is the cwd prefix
+    // `repo_init_revisions()` seeded (with its trailing slash) unless `--relative=<path>`
+    // replaced it, and is dropped altogether without `flags.relative_name`.
+    if opts.relative_name {
+        let prefix = match opts.relative_arg.take() {
+            Some(arg) => arg,
+            None => repo_prefix(&repo)?,
+        };
+        opts.relative = (!prefix.is_empty()).then_some(prefix);
+    }
     if !wseh_explicit {
         if let Ok(v) = diff_color::ws_error_highlight_default(&repo) {
             opts.ws_error_highlight = v;
@@ -2021,10 +2041,12 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             deltas.retain(|d| lifted.iter().any(|p| path_matches(&d.path, p)));
         }
     }
+    // The `strncmp(path, prefix, prefix_length)` tests in `diff_queue_addremove()`,
+    // `diff_queue_change()`, `diff_unmerge()` and (2.56) `oneway_diff()` (diff.c:7609-7610,
+    // :7654-7655, :7727-7728; diff-lib.c:541-544): a plain byte prefix, not a
+    // directory match, and unmerged entries outside it are dropped like the rest.
     if let Some(rel) = &opts.relative {
-        if !rel.is_empty() {
-            deltas.retain(|d| path_matches(&d.path, rel));
-        }
+        deltas.retain(|d| d.path.starts_with(rel));
     }
     // git emits index order, which is a plain byte-wise sort of the paths.
     deltas.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2227,7 +2249,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             if opts.summary && !summary_is_empty(&deltas) {
                 for d in &deltas {
-                    render_summary(&mut rest, d, &opts);
+                    render_summary(&mut rest, d);
                 }
                 separator = true;
             }
@@ -2447,10 +2469,6 @@ fn passes_filter(status: u8, opts: &Opts) -> bool {
     opts.filter_include.is_empty() || opts.filter_include.contains(&b'*') || opts.filter_include.contains(&status)
 }
 
-fn trim_slashes(s: &str) -> BString {
-    BString::from(s.trim_matches('/').as_bytes().to_vec())
-}
-
 fn object_is_commit(repo: &gix::Repository, id: &ObjectId) -> bool {
     repo.find_object(*id).map(|o| o.kind == gix::objs::Kind::Commit).unwrap_or(false)
 }
@@ -2472,6 +2490,8 @@ fn plumbing_opts() -> Opts {
         reverse: false,
         line_prefix: Vec::new(),
         relative: None,
+        relative_name: false,
+        relative_arg: None,
         filter_include: Vec::new(),
         filter_exclude: Vec::new(),
         ws: Ws::default(),
@@ -3206,20 +3226,12 @@ fn render(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Result<Vec<u
 
     // Field separator (between status and path) and record terminator.
     let (sep, term): (u8, u8) = if opts.nul { (0, 0) } else { (b'\t', b'\n') };
-    // `--relative=<dir>` reports paths relative to that directory.
-    let strip = opts
-        .relative
-        .as_ref()
-        .filter(|r| !r.is_empty())
-        .map(|r| r.len() + 1)
-        .unwrap_or(0);
-
     let mut out = Vec::new();
     // `diff_flush_raw()` (diff.c:6469) and the `DIFF_FORMAT_NAME` arm of
     // `flush_one_pair()` (diff.c:6742), which differ only in the columns before the
     // status letter and in whether a rename prints both of its names.
-    let mut emit_name = |out: &mut Vec<u8>, path: &BString, term: u8| {
-        let name = &path.as_slice()[strip.min(path.len())..];
+    let emit_name = |out: &mut Vec<u8>, path: &BString, term: u8| {
+        let name = strip_relative(path, opts);
         if opts.nul {
             out.extend_from_slice(name);
         } else {
@@ -3716,16 +3728,22 @@ fn fill_oid_info(
     Ok(hash_worktree(repo, workdir, path)?.unwrap_or(null))
 }
 
-/// The path as rendered, after `--relative` stripping — the same amount [`render`]
-/// removes from the raw listing, so every format agrees on the printed name.
+/// `strip_prefix()` (diff.c:4988-5001): drop `prefix_length` bytes, then one `/` if
+/// that is what follows. Every pair reaching output already starts with the prefix.
+fn strip_relative<'a>(path: &'a BString, opts: &Opts) -> &'a [u8] {
+    let Some(prefix) = &opts.relative else {
+        return path.as_slice();
+    };
+    let rest = &path.as_slice()[prefix.len().min(path.len())..];
+    rest.strip_prefix(b"/").unwrap_or(rest)
+}
+
+/// The path as rendered by the formats that call `strip_prefix()` — `run_diff()`,
+/// `run_diffstat()` for a merged pair, `diff_flush_raw()` and `flush_one_pair()`.
+/// `diff_summary()`, `show_dirstat()` and an unmerged pair's diffstat row print the
+/// full path instead.
 fn display_path(path: &BString, opts: &Opts) -> BString {
-    match &opts.relative {
-        Some(r) if !r.is_empty() => {
-            let strip = (r.len() + 1).min(path.len());
-            BString::from(path.as_slice()[strip..].to_vec())
-        }
-        _ => path.clone(),
-    }
+    BString::from(strip_relative(path, opts))
 }
 
 // ---------------------------------------------------------------------------
@@ -3752,10 +3770,14 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> 
     let mut out = Vec::new();
     for (d, an) in deltas.iter().zip(analyses) {
         if d.unmerged {
+            // `run_diffstat()` hands an unmerged pair to `builtin_diffstat()` before
+            // `strip_prefix()` runs (diff.c:5071-5075), so its row keeps the full path
+            // under `--relative`, and `get_compact_summary()` finds no status or mode
+            // change on its two empty filespecs.
             out.push(StatFile {
-                path: display_path(&d.path, opts),
+                path: d.path.clone(),
                 from_name: None,
-                print_name: stat_print_name(d, opts),
+                print_name: quoted_name(&d.path),
                 added: 0,
                 deleted: 0,
                 binary: false,
@@ -3892,34 +3914,35 @@ fn summary_is_empty(deltas: &[Delta]) -> bool {
     true
 }
 
-/// `diff_summary()` (diff.c:6803).
-fn render_summary(out: &mut Vec<u8>, d: &Delta, opts: &Opts) {
-    let path = display_path(&d.path, opts);
+/// `diff_summary()` (diff.c:6782-6810), which never calls `strip_prefix()`: under
+/// `--relative` its names are still the full paths.
+fn render_summary(out: &mut Vec<u8>, d: &Delta) {
+    let path = &d.path;
     match d.status() {
-        b'D' => summary_mode_name(out, "delete", d.src_mode, &path),
-        b'A' => summary_mode_name(out, "create", d.dst_mode, &path),
+        b'D' => summary_mode_name(out, "delete", d.src_mode, path),
+        b'A' => summary_mode_name(out, "create", d.dst_mode, path),
         // `show_rename_copy()` (diff.c:6787): the `pprint_rename`d name pair, the
         // similarity percentage, then a mode change *without* a name of its own.
         st @ (b'R' | b'C') => {
-            let src = display_path(d.src_path(), opts);
+            let src = d.src_path();
             out.extend_from_slice(if st == b'C' { b" copy " } else { b" rename " });
-            out.extend_from_slice(&super::diff_pairs::pprint_rename(&src, &path));
+            out.extend_from_slice(&super::diff_pairs::pprint_rename(src, path));
             out.extend_from_slice(
                 format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)).as_bytes(),
             );
-            show_mode_change(out, d, false, &path);
+            show_mode_change(out, d, false, path);
         }
         _ => {
             // A pair `diffcore_break()` split announces itself as a rewrite, and then
             // `show_mode_change(opt, p, !p->score)` suppresses the name.
             if d.score != 0 {
                 out.extend_from_slice(b" rewrite ");
-                out.extend_from_slice(&quoted_name(&path));
+                out.extend_from_slice(&quoted_name(path));
                 out.extend_from_slice(
                     format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)).as_bytes(),
                 );
             }
-            show_mode_change(out, d, d.score == 0, &path);
+            show_mode_change(out, d, d.score == 0, path);
         }
     }
 }

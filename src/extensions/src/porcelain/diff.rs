@@ -514,6 +514,11 @@ struct Delta {
     /// analysis; a side whose own driver has no converter carries its raw content
     /// here, which is what `fill_textconv(NULL, df)` hands back.
     textconv: Option<(Vec<u8>, Vec<u8>)>,
+    /// `p->two->path` and the rename source's `p->one->path` as they were before
+    /// `git diff`'s `--relative` shortened [`Delta::path`] and [`Delta::src_path`] —
+    /// the names the formats that never call `strip_prefix()` print. `None` when
+    /// nothing was stripped.
+    unstripped: Option<(BString, Option<BString>)>,
 }
 
 /// `userdiff_find_by_path()` for a pair's two filespecs. git looks the two sides up
@@ -599,6 +604,19 @@ impl Delta {
         }
     }
 
+    /// [`Delta::path`] before `--relative` shortened it.
+    fn full_path(&self) -> &BString {
+        self.unstripped.as_ref().map_or(&self.path, |(path, _)| path)
+    }
+
+    /// [`Delta::old_path`] before `--relative` shortened it.
+    fn full_old_path(&self) -> &BString {
+        match &self.unstripped {
+            Some((path, src)) => src.as_ref().unwrap_or(path),
+            None => self.old_path(),
+        }
+    }
+
     /// The pre-image path: the rename/copy source when there is one, else [`Delta::path`].
     fn old_path(&self) -> &BString {
         self.src_path.as_ref().unwrap_or(&self.path)
@@ -681,6 +699,7 @@ impl Delta {
             new_commit: None,
             drivers: PairDrivers::default(),
             textconv: None,
+            unstripped: None,
         }
     }
 
@@ -1209,6 +1228,7 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         // The deletion half's post-image is git's invalid filespec, which
         // `fill_textconv()` renders as nothing at all.
         textconv: d.textconv.as_ref().map(|(o, _)| (o.clone(), Vec::new())),
+        unstripped: d.unstripped.clone(),
     };
     let creation = Delta {
         path: d.path.clone(),
@@ -1231,6 +1251,7 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         new_commit: d.new_commit,
         drivers: d.drivers.clone(),
         textconv: d.textconv.as_ref().map(|(_, n)| (Vec::new(), n.clone())),
+        unstripped: d.unstripped.clone(),
     };
     Some((deletion, creation))
 }
@@ -1344,9 +1365,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let mut binary = false;
     let mut want_exit_code = false;
     let mut quiet = false;
-    // `--relative[=<path>]`: the prefix stripped from every reported path (with a
-    // trailing slash), or `None` when paths are shown from the repository root.
-    let mut relative: Option<String> = None;
+    // `--relative[=<path>]`: `flags.relative_name`, and the last `<path>` given, which
+    // replaces the cwd prefix `repo_init_revisions()` seeded (`diff_opt_relative()`,
+    // diff.c:5884-5893). `--no-relative` clears only the flag.
+    let mut relative_name = false;
+    let mut relative_arg: Option<String> = None;
     // `--check`: `DIFF_FORMAT_CHECKDIFF`.
     let mut check = false;
     // `options->a_prefix` / `options->b_prefix`, which `diff_setup()` leaves NULL
@@ -1554,10 +1577,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // `diff.relative` seeds the very flag `--relative` sets (`options->flags
         // .relative_name = diff_relative`, diff.c:4639), so the config alone both
         // narrows the change list to the current directory and shortens the paths
-        // reported. `--no-relative` clears it again, which falls out of the flags
-        // below assigning `relative` unconditionally.
+        // reported. `--no-relative` clears it again.
         if snap.boolean("diff.relative") == Some(true) {
-            relative = Some(cwd_prefix(&repo));
+            relative_name = true;
         }
         // `diff_setup()`'s prefix decision, which is the whole of the
         // `diff.mnemonicPrefix` mechanism:
@@ -2337,18 +2359,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 abbrev_explicit = true;
                 raw_abbrev = None;
             }
-            // `--relative[=<path>]`/`--no-relative`: `diff_opt_relative()`. With no
-            // value the prefix is the current directory inside the repository;
-            // with one it is that path. Either way git stores it with a trailing
-            // slash so a plain prefix match cannot cross a name boundary.
-            "--relative" => relative = Some(cwd_prefix(&repo)),
-            "--no-relative" => relative = None,
+            // `--relative[=<path>]`/`--no-relative`: `diff_opt_relative()`. The value is
+            // kept verbatim — no slash is added, so `--relative=sub` also narrows to
+            // `sub2/` — and a later bare `--relative` keeps it.
+            "--relative" => relative_name = true,
+            "--no-relative" => relative_name = false,
             s if s.starts_with("--relative=") => {
-                let mut p = s["--relative=".len()..].to_string();
-                if !p.is_empty() && !p.ends_with('/') {
-                    p.push('/');
-                }
-                relative = Some(p);
+                relative_name = true;
+                relative_arg = Some(s["--relative=".len()..].to_string());
             }
             // `OPT_STRING_F(0, "src-prefix", &options->a_prefix, …)` (diff.c:6106-6110)
             // writes the slot directly, so it fills one side while leaving the other
@@ -3298,6 +3316,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // prefix. The names are shortened later, once every side has been read:
     // stripping here would leave the worktree reads looking for `one.txt` at the
     // repository root.
+    //
+    // `diff_setup_done()` (diff.c:5270-5275) drops the prefix without the flag, and
+    // the test itself is `strncmp(path, prefix, prefix_length)` in
+    // `diff_queue_addremove()`, `diff_queue_change()` and `diff_unmerge()`
+    // (diff.c:7609-7610, :7654-7655, :7727-7728): a byte prefix, not a directory.
+    let relative: Option<String> = relative_name
+        .then(|| relative_arg.unwrap_or_else(|| cwd_prefix(&repo)))
+        .filter(|p| !p.is_empty());
     if let Some(prefix) = &relative {
         deltas.retain(|d| d.path.starts_with(prefix.as_bytes()));
     }
@@ -3726,12 +3752,20 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `--relative`: git reports each path through `relative_path()` at output
     // time, so the shortening happens here — after every blob has been read by
     // its real path, and in one place rather than at each of the format writers.
+    // `strip_prefix()` (diff.c:4988-5001) drops `prefix_length` bytes and then one
+    // `/` if that is what follows. The full names are kept for `diff_summary()`,
+    // `show_dirstat()` and an unmerged pair's diffstat row, which never strip.
     if let Some(prefix) = &relative {
+        let strip = |name: &BString| -> BString {
+            let rest = &name[prefix.len()..];
+            rest.strip_prefix(b"/").unwrap_or(rest).into()
+        };
         for d in &mut deltas {
-            d.path = d.path[prefix.len()..].into();
+            d.unstripped = Some((d.path.clone(), d.src_path.clone()));
+            d.path = strip(&d.path);
             if let Some(src) = &d.src_path {
                 if src.starts_with(prefix.as_bytes()) {
-                    d.src_path = Some(src[prefix.len()..].into());
+                    d.src_path = Some(strip(src));
                 }
             }
         }
@@ -3903,7 +3937,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     } else {
                         an.damage
                     };
-                    (d.path.clone(), damage)
+                    (d.full_path().clone(), damage)
                 })
                 .collect();
             super::diff_files::render_dirstat(&mut out, files, &dirstat);
@@ -4535,6 +4569,7 @@ fn run_diffcore_rename(
             new_commit: sub_state.and_then(|(_, c, _)| c),
             drivers: PairDrivers::default(),
             textconv: None,
+            unstripped: None,
         });
     }
     deltas.extend(held);
@@ -4655,6 +4690,7 @@ fn collect_tree_index(
             new_commit: None,
             drivers: PairDrivers::default(),
             textconv: None,
+            unstripped: None,
         });
     }
     Ok(())
@@ -5063,6 +5099,7 @@ fn collect_index_worktree(
             new_commit: None,
             drivers: PairDrivers::default(),
             textconv: None,
+            unstripped: None,
         });
         // ```c
         // pair = diff_unmerge(&revs->diffopt, ce->name);
@@ -8139,7 +8176,7 @@ fn render_summary(out: &mut Vec<u8>, deltas: &[Delta]) {
         // line without a name.
         if d.renamed() {
             push_str(out, if d.status == b'C' { " copy " } else { " rename " });
-            out.extend_from_slice(&pprint_rename(d.old_path(), &d.path));
+            out.extend_from_slice(&pprint_rename(d.full_old_path(), d.full_path()));
             push_str(
                 out,
                 &format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)),
@@ -8152,14 +8189,14 @@ fn render_summary(out: &mut Vec<u8>, deltas: &[Delta]) {
                 push_str(out, " create mode ");
                 push_str(out, mode_str(nk));
                 out.push(b' ');
-                out.extend_from_slice(&quoted_name(&d.path));
+                out.extend_from_slice(&quoted_name(d.full_path()));
                 out.push(b'\n');
             }
             (Some((_, ok)), None) => {
                 push_str(out, " delete mode ");
                 push_str(out, mode_str(ok));
                 out.push(b' ');
-                out.extend_from_slice(&quoted_name(&d.path));
+                out.extend_from_slice(&quoted_name(d.full_path()));
                 out.push(b'\n');
             }
             _ => {
@@ -8167,7 +8204,7 @@ fn render_summary(out: &mut Vec<u8>, deltas: &[Delta]) {
                 // and suppresses the name on the mode-change line that follows.
                 if d.score != 0 {
                     push_str(out, " rewrite ");
-                    out.extend_from_slice(&quoted_name(&d.path));
+                    out.extend_from_slice(&quoted_name(d.full_path()));
                     push_str(
                         out,
                         &format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)),
@@ -8194,7 +8231,7 @@ fn summary_mode_change(out: &mut Vec<u8>, d: &Delta, show_name: bool) {
     push_str(out, mode_str(nk));
     if show_name {
         out.push(b' ');
-        out.extend_from_slice(&quoted_name(&d.path));
+        out.extend_from_slice(&quoted_name(d.full_path()));
     }
     out.push(b'\n');
 }
@@ -8276,6 +8313,8 @@ fn diffstat_pairs<'a>(deltas: &'a [Delta], analyses: &'a [Analysis]) -> Vec<(&'a
 /// the two raw names, each NUL-terminated and preceded by an extra NUL, under `-z`.
 fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
     for (d, an) in pairs.iter().copied() {
+        // An unmerged row keeps its full path (diff.c:5071-5075); it has one name.
+        let path = if d.unmerged { d.full_path() } else { &d.path };
         if an.binary {
             push_str(out, "-\t-\t");
         } else {
@@ -8287,13 +8326,13 @@ fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
                 out.extend_from_slice(d.old_path());
                 out.push(0);
             }
-            out.extend_from_slice(&d.path);
+            out.extend_from_slice(path);
             out.push(0);
         } else {
             if d.two_names() {
-                out.extend_from_slice(&pprint_rename(d.old_path(), &d.path));
+                out.extend_from_slice(&pprint_rename(d.old_path(), path));
             } else {
-                out.extend_from_slice(&quoted_name(&d.path));
+                out.extend_from_slice(&quoted_name(path));
             }
             out.push(b'\n');
         }
@@ -8404,6 +8443,12 @@ fn compact_comment_for_kinds(
 /// The diffstat display name: the C-quoted path, plus the `--compact-summary`
 /// annotation ` (<comment>)` when one applies (`fill_print_name()`).
 fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
+    // `run_diffstat()` hands an unmerged pair to `builtin_diffstat()` before
+    // `strip_prefix()` (diff.c:5071-5075), and `get_compact_summary()` finds no
+    // status or mode change on its two empty filespecs.
+    if d.unmerged {
+        return quoted_name(d.full_path());
+    }
     // `fill_print_name()`: a pair with two names shows the compressed `pfx{a => b}sfx`
     // form. `diffstat_add()` decides that from the paths, not from the status — see
     // [`Delta::two_names`].

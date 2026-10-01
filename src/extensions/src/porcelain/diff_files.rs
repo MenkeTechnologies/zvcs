@@ -208,14 +208,18 @@ enum Format {
     NameStatus,
 }
 
-/// The `--relative[=<p>]` / `--no-relative` selection.
-enum Relative {
-    /// git's default for `diff-files`: paths stay repository-root relative.
-    No,
-    /// Bare `--relative`: use the current directory's prefix within the worktree.
-    Cwd,
-    /// `--relative=<p>`: use the given directory as the prefix.
-    Path(BString),
+/// `--relative[=<p>]` / `--no-relative`: `diffopt.flags.relative_name` and the
+/// `diffopt.prefix` it switches on (`diff_opt_relative()`, diff.c:5884-5893).
+///
+/// `repo_init_revisions()` seeds the prefix with the cwd's, trailing slash
+/// included, and `--relative=<p>` replaces it with `<p>` verbatim. `--no-relative`
+/// only clears the flag, so `--relative=<p> --no-relative --relative` is `<p>`
+/// again. `diff_setup_done()` drops the prefix when the flag is off
+/// (diff.c:5270-5275).
+#[derive(Default)]
+struct Relative {
+    name: bool,
+    arg: Option<BString>,
 }
 
 /// Where the listing should be re-anchored, per `--rotate-to`/`--skip-to`.
@@ -946,7 +950,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         line_prefix: Vec::new(),
         submodule_format: super::diff::SubmoduleFormat::Short,
         anchor: None,
-        relative: Relative::No,
+        relative: Relative::default(),
         ignore_submodules: None,
         ctx: 3,
         ws: Whitespace::Keep,
@@ -1643,8 +1647,8 @@ fn classify(
         // `XDF_INDENT_HEURISTIC`: where a hunk that can slide freely finally lands.
         "--indent-heuristic" => opts.indent_heuristic = true,
         "--no-indent-heuristic" => opts.indent_heuristic = false,
-        "--relative" => opts.relative = Relative::Cwd,
-        "--no-relative" => opts.relative = Relative::No,
+        "--relative" => opts.relative.name = true,
+        "--no-relative" => opts.relative.name = false,
         "--ignore-submodules" => {
             opts.ignore_submodules = Some(gix::submodule::config::Ignore::All);
         }
@@ -1678,7 +1682,8 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--relative=") {
-        opts.relative = Relative::Path(v.trim_end_matches('/').into());
+        opts.relative.name = true;
+        opts.relative.arg = Some(v.into());
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--ignore-submodules=") {
@@ -2146,8 +2151,9 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         },
     }
 
-    apply_relative(repo, &mut deltas, &opts.relative)?;
-    apply_relative_combined(repo, &mut combined, &opts.relative)?;
+    let prefix = relative_prefix(repo, &opts.relative)?;
+    apply_relative(&mut deltas, prefix.as_ref());
+    apply_relative_combined(&mut combined, prefix.as_ref());
 
     // Content is needed by every non-raw format, by the whitespace family's
     // pruning, and by the `-S`/`-G` pickaxe. `--find-object` reads only the recorded
@@ -2567,67 +2573,52 @@ fn reverse_delta(d: &mut Delta) {
     };
 }
 
-/// `--relative[=<p>]`: keep only records under `<p>`, with that prefix stripped
-/// from the *rendered* path. The on-disk path is left alone.
-fn apply_relative(
-    repo: &gix::Repository,
-    deltas: &mut Vec<Delta>,
-    relative: &Relative,
-) -> Result<()> {
-    let prefix: BString = match relative {
-        Relative::No => return Ok(()),
-        Relative::Path(p) => p.clone(),
-        Relative::Cwd => match repo.prefix()? {
-            Some(p) => gix::path::into_bstr(p).into_owned(),
-            None => return Ok(()),
+/// The `diffopt.prefix` `diff_setup_done()` leaves behind, or `None` when it is
+/// `NULL` or empty (a bare `--relative` at the top of the worktree).
+fn relative_prefix(repo: &gix::Repository, relative: &Relative) -> Result<Option<BString>> {
+    if !relative.name {
+        return Ok(None);
+    }
+    let prefix: BString = match &relative.arg {
+        Some(arg) => arg.clone(),
+        None => match repo.prefix()? {
+            Some(p) if !p.as_os_str().is_empty() => {
+                let mut p = gix::path::into_bstr(p).into_owned();
+                p.push(b'/');
+                p
+            }
+            _ => return Ok(None),
         },
     };
-    if prefix.is_empty() {
-        return Ok(());
-    }
-    let mut needle: Vec<u8> = prefix.into();
-    needle.push(b'/');
-    deltas.retain_mut(
-        |d| match d.path.strip_prefix(needle.as_slice()).map(|r| r.to_vec()) {
-            Some(rest) => {
-                d.path = rest.into();
-                true
-            }
-            None => false,
-        },
-    );
-    Ok(())
+    Ok((!prefix.is_empty()).then_some(prefix))
 }
 
-/// `--relative[=<p>]` for the combined-diff paths, mirroring [`apply_relative`].
-fn apply_relative_combined(
-    repo: &gix::Repository,
-    combined: &mut Vec<CombinedPath>,
-    relative: &Relative,
-) -> Result<()> {
-    let prefix: BString = match relative {
-        Relative::No => return Ok(()),
-        Relative::Path(p) => p.clone(),
-        Relative::Cwd => match repo.prefix()? {
-            Some(p) => gix::path::into_bstr(p).into_owned(),
-            None => return Ok(()),
-        },
+/// `--relative[=<p>]`: keep only the records whose path starts with the prefix —
+/// `run_diff_files()`'s `strncmp(ce->name, prefix, prefix_length)` (diff-lib.c:150-152),
+/// a byte prefix rather than a directory match — and strip it from the *rendered*
+/// path the way `strip_prefix()` does (diff.c:4988-5001): `prefix_length` bytes, then
+/// one `/` if that is what follows. The on-disk path is left alone.
+fn apply_relative(deltas: &mut Vec<Delta>, prefix: Option<&BString>) {
+    let Some(prefix) = prefix else {
+        return;
     };
-    if prefix.is_empty() {
-        return Ok(());
+    deltas.retain_mut(|d| {
+        if !d.disk.starts_with(prefix) {
+            return false;
+        }
+        let rest = &d.disk[prefix.len()..];
+        d.path = rest.strip_prefix(b"/").unwrap_or(rest).into();
+        true
+    });
+}
+
+/// `--relative[=<p>]` for the combined-diff paths: the same `strncmp()` narrowing,
+/// but no stripping — combine-diff.c never consults `diffopt.prefix`, so `-c`/`--cc`
+/// print (and read) the full path.
+fn apply_relative_combined(combined: &mut Vec<CombinedPath>, prefix: Option<&BString>) {
+    if let Some(prefix) = prefix {
+        combined.retain(|c| c.path.starts_with(prefix));
     }
-    let mut needle: Vec<u8> = prefix.into();
-    needle.push(b'/');
-    combined.retain_mut(
-        |c| match c.path.strip_prefix(needle.as_slice()).map(|r| r.to_vec()) {
-            Some(rest) => {
-                c.path = rest.into();
-                true
-            }
-            None => false,
-        },
-    );
-    Ok(())
 }
 
 /// Drop every delta whose `keep` flag is false, in lock step with its analysis.
@@ -3872,9 +3863,13 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec
     let mut out = Vec::new();
     for (d, an) in deltas.iter().zip(analyses) {
         if d.unmerged {
+            // `run_diffstat()` hands an unmerged pair to `builtin_diffstat()` before
+            // `strip_prefix()` runs (diff.c:5071-5075): the row keeps the full path
+            // under `--relative`, and `get_compact_summary()` finds no status or mode
+            // change on its two empty filespecs.
             out.push(StatFile {
-                path: d.path.clone(),
-                print_name: stat_print_name(d, an, opts),
+                path: d.disk.clone(),
+                print_name: quoted_name(&d.disk),
                 added: 0,
                 deleted: 0,
                 binary: false,
@@ -3979,7 +3974,8 @@ fn stat_rows(files: &[StatFile]) -> Vec<diffstat::StatFile> {
 // ---------------------------------------------------------------------------
 
 /// `show_dirstat()`: damage per path, either one unit per file or the byte-level
-/// score `diffcore_count_changes()` produces.
+/// score `diffcore_count_changes()` produces. Each pair is named by its full path:
+/// `show_dirstat()` never calls `strip_prefix()`, whatever `--relative` says.
 fn dirstat_damage(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec<(BString, u64)> {
     let mut out = Vec::new();
     for (d, an) in deltas.iter().zip(analyses) {
@@ -3987,11 +3983,11 @@ fn dirstat_damage(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec<(
         if d.old_valid() && d.new_valid() && !d.src_id.is_null() && !d.dst_id.is_null()
             && d.src_id == d.dst_id
         {
-            out.push((d.path.clone(), 0));
+            out.push((d.disk.clone(), 0));
             continue;
         }
         if opts.dirstat.by_file {
-            out.push((d.path.clone(), 1));
+            out.push((d.disk.clone(), 1));
             continue;
         }
         let damage = if d.old_valid() && d.new_valid() {
@@ -4004,7 +4000,7 @@ fn dirstat_damage(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec<(
         } else {
             continue;
         };
-        out.push((d.path.clone(), if damage == 0 { 1 } else { damage }));
+        out.push((d.disk.clone(), if damage == 0 { 1 } else { damage }));
     }
     out
 }
@@ -4181,11 +4177,12 @@ fn summary_is_empty(deltas: &[Delta]) -> bool {
     true
 }
 
-/// `diff_summary()`.
+/// `diff_summary()` (diff.c:6782-6810), which never calls `strip_prefix()`: under
+/// `--relative` its names are still the full paths.
 fn render_summary(out: &mut Vec<u8>, d: &Delta) {
     match d.status {
-        b'D' => summary_mode_name(out, "delete", d.src_mode, &d.path),
-        b'A' => summary_mode_name(out, "create", d.dst_mode, &d.path),
+        b'D' => summary_mode_name(out, "delete", d.src_mode, &d.disk),
+        b'A' => summary_mode_name(out, "create", d.dst_mode, &d.disk),
         _ => {
             if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
                 out.extend_from_slice(
@@ -4196,7 +4193,7 @@ fn render_summary(out: &mut Vec<u8>, d: &Delta) {
                     )
                     .as_bytes(),
                 );
-                out.extend_from_slice(&quoted_name(&d.path));
+                out.extend_from_slice(&quoted_name(&d.disk));
                 out.push(b'\n');
             }
         }

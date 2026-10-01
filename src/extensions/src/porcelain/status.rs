@@ -4184,6 +4184,21 @@ pub(super) fn switch_blocked_by_operation(repo: &gix::Repository) -> Option<Swit
     state.bisect.then_some(SwitchBlocker::WarnBisecting)
 }
 
+/// Whether `wt_status_get_state()` finds a merge, revert, rebase, bisect,
+/// cherry-pick or `am` in progress — the set `repack --drop-filtered` refuses to
+/// run under (git 2.56, builtin/repack.c:331-345).
+pub(super) fn operation_in_progress(repo: &gix::Repository) -> bool {
+    let merging = repo.git_dir().join("MERGE_HEAD").exists();
+    let state = ProgressState::detect(repo, merging);
+    state.merge
+        || state.revert.is_some()
+        || state.rebase
+        || state.bisect
+        || state.cherry_pick.is_some()
+        || state.am
+        || state.rebase_interactive
+}
+
 impl ProgressState {
     fn detect(repo: &gix::Repository, merging: bool) -> Self {
         let git_dir = repo.git_dir();

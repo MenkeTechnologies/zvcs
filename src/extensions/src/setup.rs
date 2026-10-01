@@ -397,6 +397,8 @@ fn arm_ref_store_refusal(repo: &gix::Repository) {
         Some((None, format!("bad boolean config value '{raw}' for 'core.logallrefupdates'")))
     });
     gix::refs::file::set_first_use_hook(ref_store_first_use);
+    REPO_SETTINGS_REFUSAL.get_or_init(|| crate::repo_settings::RepoSettings::load(repo).err());
+    gix::odb::store::set_first_use_hook(object_store_first_use);
     PACKED_REFS_TIMEOUT_REFUSAL
         .get_or_init(|| crate::config::config_int(repo, "core.packedrefstimeout").err());
     gix::refs::file::set_packed_refs_lock_hook(packed_refs_lock_first_use);
@@ -407,6 +409,30 @@ fn arm_ref_store_refusal(repo: &gix::Repository) {
 /// [`crate::sequencer::packed_refs_lock_timeout`] for the same read made by the
 /// state-ref deletions that never reach a ref transaction here.
 static PACKED_REFS_TIMEOUT_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// What `prepare_repo_settings()` (repo-settings.c:30-159, v2.56.0) would die with
+/// for this repository, recorded when it is opened.
+static REPO_SETTINGS_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The object store's first-use hook: `die()` with the recorded settings refusal.
+///
+/// `prepare_repo_settings()` is lazy in git — there is no command-table flag for
+/// it — and the door almost every command walks through is the object database:
+/// the first lookup, write or count prepares the packed source, which prepares the
+/// settings (`odb_source_packed_prepare()` → `prepare_multi_pack_index_one()`,
+/// odb/source-packed.c:842, midx.c:745). So `-c core.commitGraph=abc branch
+/// --merged` dies with `bad boolean config value 'abc' for 'core.commitgraph'`
+/// while plain `branch`, which never reads an object, lists the branches.
+/// The verbs that reach the settings before any object read — through the index,
+/// a revision lookup or their own `prepare_repo_settings()` call — are refused
+/// up front by `crate::dispatch`'s `REPO_SETTINGS_VERBS` gate instead.
+fn object_store_first_use() {
+    if let Some(Some(message)) = REPO_SETTINGS_REFUSAL.get() {
+        crate::trace2::error(message);
+        eprintln!("fatal: {message}");
+        std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+    }
+}
 
 /// The ref store's packed-refs lock hook: `die()` with the recorded refusal.
 fn packed_refs_lock_first_use() {

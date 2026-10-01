@@ -1517,7 +1517,17 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         }
 
         // A missing object is not an error yet: see [`RefInfo::missing`].
-        let (obj, missing) = match load(&repo, id, needs_data) {
+        //
+        // An object no atom reads is not opened at all, which is also what keeps
+        // `--format=%(refname)` from preparing the object database and with it
+        // `prepare_repo_settings()` (odb/source-packed.c:842, midx.c:745, v2.56.0):
+        // `-c core.commitGraph=abc for-each-ref --format=%(refname)` lists the refs.
+        let loaded = if reads_object {
+            load(&repo, id, needs_data)
+        } else {
+            Err(anyhow!("object not opened"))
+        };
+        let (obj, missing) = match loaded {
             Ok(obj) => (obj, false),
             Err(_) => (
                 ObjInfo {

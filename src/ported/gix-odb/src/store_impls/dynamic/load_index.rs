@@ -204,6 +204,7 @@ impl super::Store {
         load_new_index: bool,
         loose_compression: gix_zlib::Compression,
     ) -> Result<Option<Snapshot>, Error> {
+        super::first_use();
         let index = self.index.load();
         let previous_index_state = Arc::as_ptr(&index) as usize;
 

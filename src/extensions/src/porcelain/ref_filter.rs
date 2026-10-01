@@ -640,7 +640,7 @@ fn populate(
         || atoms(items, sorts).any(|a| {
             matches!(
                 a.field,
-                Field::ObjectType | Field::ObjectSize
+                Field::ObjectType | Field::ObjectSize | Field::Describe(_)
             )
         });
 
@@ -650,7 +650,18 @@ fn populate(
         // branch pointing at a missing object is in. When something does, the ref dies with
         // `missing object %s for %s` only once it is sorted or formatted (see `RefInfo::missing`),
         // after every line formatted before it.
-        let (obj, missing) = match load(repo, c.id, needs_data) {
+        //
+        // Not opening it is also what keeps a format that never looks past the name from preparing
+        // the object database at all, and with it `prepare_repo_settings()` (odb/source-packed.c:842,
+        // midx.c:745, v2.56.0): `-c core.commitGraph=abc branch` lists the branches, `branch -v`
+        // dies. The iteration itself reads no object either — `GIT_REF_PARANOIA` defaults on, which
+        // sets `REFS_FOR_EACH_INCLUDE_BROKEN` and skips `ref_resolves_to_object()` (refs.c:1859-1867).
+        let loaded = if needs_object {
+            load(repo, c.id, needs_data)
+        } else {
+            Err(anyhow::anyhow!("object not opened"))
+        };
+        let (obj, missing) = match loaded {
             Ok(obj) => (obj, false),
             Err(_) => (
                 super::for_each_ref::ObjInfo {

@@ -350,11 +350,14 @@ pub(crate) const SETUP_FREE_VERBS: &[&str] = &[
 /// `for-each-ref` (`--format=%(refname)` never peels an object and never dies),
 /// `commit-graph` and `multi-pack-index` (`write` dies, `verify` does not),
 /// `notes` (`add` dies, `list` does not) and `bisect` (`start` dies, `log` does
-/// not). Also absent: the verbs that never reach it at all under any form tried —
-/// `branch`, `tag`, `remote`, `symbolic-ref`, `update-ref`, `count-objects`,
-/// `config`, `var`, `hash-object`, `bundle`, `replace`, `verify-pack`, `cherry`,
-/// `push`, `ls-remote`, `mktag`, `merge-file`, `merge-index`,
-/// `interpret-trailers`, `stripspace`, `patch-id`, `show-index`, `rerere`.
+/// not). Also absent: the verbs that reach it only through the object database —
+/// `branch`, `tag`, `update-ref`, `count-objects`, `hash-object`, `cherry` and the
+/// like die for `branch -v` or `hash-object -w` and run for plain `branch` or
+/// `hash-object`. Those are refused lazily, on the first object access, by the
+/// object store's first-use hook (`crate::setup`'s `object_store_first_use`),
+/// the way git's `odb_source_packed_prepare()` → `prepare_multi_pack_index_one()`
+/// → `prepare_repo_settings()` (odb/source-packed.c:842, midx.c:745, v2.56.0)
+/// does.
 const REPO_SETTINGS_VERBS: &[&str] = &[
     "add",
     "am",

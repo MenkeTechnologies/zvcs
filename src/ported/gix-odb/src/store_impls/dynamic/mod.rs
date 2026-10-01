@@ -103,6 +103,33 @@ pub fn fetch_if_missing() -> bool {
     FETCH_IF_MISSING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A callback run every time a store is about to read its directories from disk.
+///
+/// git prepares an object source lazily, on the first lookup, write or count that
+/// reaches it, and that preparation is where per-repository settings are first
+/// read: `odb_source_packed_prepare()` opens with `prepare_multi_pack_index_one()`
+/// (odb/source-packed.c:832-842, v2.56.0), which starts with
+/// `prepare_repo_settings(r)` (midx.c:741-745) — and every read, freshen and
+/// count asks the packed source before the loose one (odb/source-files.c:79-107,
+/// :151, :201). A store here exists from the moment a repository is opened and
+/// loads its directories on the first use instead, so a host that needs git's
+/// timing installs this hook and makes its decision there. It runs on every
+/// (re)load so the host, not this crate, decides what "first" means; it must be
+/// cheap.
+static FIRST_USE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the [`FIRST_USE_HOOK`]. Only the first installation takes effect.
+pub fn set_first_use_hook(hook: fn()) {
+    let _ = FIRST_USE_HOOK.set(hook);
+}
+
+/// Run the installed hook, if any.
+pub(crate) fn first_use() {
+    if let Some(hook) = FIRST_USE_HOOK.get() {
+        hook();
+    }
+}
+
 impl Store {
     /// Install `fetch` as the hook consulted when an object is not present locally, unless one is installed
     /// already, in which case this does nothing.

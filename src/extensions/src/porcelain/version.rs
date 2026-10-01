@@ -53,7 +53,8 @@ use std::process::{Command, ExitCode};
 
 use super::{resolve_long, Arg, LongOpt, Resolved};
 
-/// The git version this port reproduces, as printed by `git version`.
+/// The git version this port reproduces: git's `git_version_string`
+/// (`version.c:12`), the `DEF_VER` of the release the port targets.
 ///
 /// This is the one definition. `git version`, `diagnose`/`bugreport`, the
 /// `agent=` capability ([`user_agent_sanitized`]), the format-patch signature and MIME

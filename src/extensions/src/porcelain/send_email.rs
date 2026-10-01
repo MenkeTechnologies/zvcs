@@ -141,8 +141,10 @@
 //! here can or should print. Those messages are:
 //! `Send this email reply required`, `invalid transfer encoding`, `cannot send
 //! message as 7bit`, `The destination IMAP folder is not properly defined.`,
-//! `The required SMTP server is not properly defined.`, `No subject line in
-//! <f>?`, `can't open file <f>` and the three `execute_cmd` failures.
+//! `The required SMTP server is not properly defined.`, `can't open file
+//! <f>` and the three `execute_cmd` failures. 2.56 gave the missing-subject
+//! `die` its own newline (git-send-email.perl:866), so `No 'Subject:' line in
+//! '<f>'` is byte-identical with no suffix.
 //!
 //! ### Not covered
 //!
@@ -2626,7 +2628,7 @@ type LastChild = std::cell::Cell<u8>;
 ///      `$sender` is still undefined at line 838, i.e. when neither `--from`
 ///      nor `sendemail.from` supplied one. Exit 0.
 ///
-/// That ordering is what makes the status of `No subject line in <file>?` depend
+/// That ordering is what makes the status of `No 'Subject:' line in '<file>'` depend
 /// on the sender rather than on the config, which is the opposite of what this
 /// module previously assumed. Measured against git 2.55.0 on a repository whose
 /// only operand is a non-revision file:
@@ -4123,7 +4125,8 @@ fn handle_backup_files(m: &mut Mailer) {
     m.files = result;
 }
 
-/// `get_patch_subject` — the first `Subject:` line, `GIT: `-prefixed.
+/// `get_patch_subject` — the first `Subject:` line, `GIT: `-prefixed. The
+/// failure text is 2.56's (git-send-email.perl:866).
 fn get_patch_subject(fname: &str) -> Step<String> {
     let text = std::fs::read(fname).unwrap_or_default();
     for line in text.split_inclusive(|&b| b == b'\n') {
@@ -4132,7 +4135,7 @@ fn get_patch_subject(fname: &str) -> Step<String> {
             return Ok(format!("GIT: {}", rest.trim_end_matches('\n')));
         }
     }
-    Err(died(format!("No subject line in {fname}?\n")))
+    Err(died(format!("No 'Subject:' line in '{fname}'\n")))
 }
 
 /// The body of the `GIT: ` comment block, before `Git::prefix_lines` runs over

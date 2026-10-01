@@ -41,19 +41,14 @@
 //!     header, the `0x5455` extended-timestamp extra field, the DOS date/time
 //!     from `localtime_r()`, the central directory (creator version `0x0317`
 //!     and `mode << 16` external attributes for an executable, the
-//!     `!buffer_is_binary()` internal-attribute text bit) and the end-of-central
-//!     -directory record.
+//!     `!buffer_is_binary()` internal-attribute text bit), the method choice
+//!     (`write_zip_entry()` deflates a non-empty regular member at
+//!     `Z_DEFAULT_COMPRESSION` and keeps it stored when that does not shrink
+//!     it, through the same raw-deflate coder `git archive --format=zip` uses
+//!     here) and the end-of-central-directory record.
 //!
 //! Divergences, all of them forced and none of them papered over:
 //!
-//!   * **Entries are stored, not deflated.** `write_zip_entry()` deflates a
-//!     regular file of non-zero size at `Z_DEFAULT_COMPRESSION` and falls back
-//!     to `ZIP_METHOD_STORE` when that does not shrink it; this port always
-//!     stores. The container, the member set, the member sizes and the CRCs are
-//!     the same — stock produces exactly these bytes at `--format=zip -0` — but
-//!     the archive is larger. The deflate coder that would close this lives in
-//!     `porcelain::archive`'s private `gzip` module and is not reachable from
-//!     here; no second deflate implementation was written to fake it.
 //!   * **The version block describes this build, not stock's.** [`version_info`]
 //!     is `cmd_diagnose()`'s `get_version_info(&buf, 1)` and is rendered by
 //!     [`super::version::get_version_info`] — the same function
@@ -808,8 +803,7 @@ fn tm_to_time_t(tm: &libc::tm) -> i64 {
 ///
 /// Only the shape `create_diagnostics_archive()` needs is here: whole buffers,
 /// no streaming, no zip64 escapes (every member is a file this command produced
-/// or a `.git` metadata file, none of which reach 4 GiB) and, per the module
-/// docs, the `ZIP_METHOD_STORE` half of the method choice.
+/// or a `.git` metadata file, none of which reach 4 GiB).
 mod zip {
     use super::LocalTime;
     use std::io::{self, Write};
@@ -819,6 +813,11 @@ mod zip {
     const EXTRA_MTIME_SIZE: u16 = 9;
     /// `ZIP_UTF8` — the general-purpose flag saying the name is UTF-8.
     const ZIP_UTF8: u16 = 1 << 11;
+    /// `ZIP_METHOD_STORE` and `ZIP_METHOD_DEFLATE` (archive-zip.c:37-38).
+    const ZIP_METHOD_STORE: u16 = 0;
+    const ZIP_METHOD_DEFLATE: u16 = 8;
+    /// zlib's `Z_DEFAULT_COMPRESSION`, archive.c's default `compression_level`.
+    const Z_DEFAULT_COMPRESSION: i32 = -1;
     /// `version_needed` for a non-zip64 entry.
     const VERSION_NEEDED: u16 = 10;
     /// The creator version git stamps on an entry carrying Unix permissions.
@@ -855,6 +854,23 @@ mod zip {
         pub(super) fn add(&mut self, path: &str, mode: u32, data: &[u8]) -> io::Result<()> {
             let crc = gix::features::hash::crc32(data);
             let size = data.len() as u32;
+
+            // Every member is a regular file and `create_diagnostics_archive()`
+            // passes no `-<level>`, so `compression_level` is
+            // `Z_DEFAULT_COMPRESSION` and a non-empty member is deflated
+            // (archive-zip.c:346-347), then stored after all when the deflated
+            // form is not strictly smaller (archive-zip.c:373-381).
+            let deflated = if data.is_empty() {
+                None
+            } else {
+                Some(crate::porcelain::archive::gzip::deflate_raw(data, Z_DEFAULT_COMPRESSION))
+                    .filter(|z| z.len() < data.len())
+            };
+            let (method, payload) = match &deflated {
+                Some(z) => (ZIP_METHOD_DEFLATE, z.as_slice()),
+                None => (ZIP_METHOD_STORE, data),
+            };
+            let compressed_size = payload.len() as u32;
             let name = path.as_bytes();
             let pathlen = name.len() as u16;
 
@@ -879,11 +895,11 @@ mod zip {
             le32(&mut header, 0x0403_4b50);
             le16(&mut header, VERSION_NEEDED);
             le16(&mut header, flags);
-            le16(&mut header, 0); /* ZIP_METHOD_STORE */
+            le16(&mut header, method);
             le16(&mut header, self.dos_time);
             le16(&mut header, self.dos_date);
             le32(&mut header, crc);
-            le32(&mut header, size); /* compressed size == size when stored */
+            le32(&mut header, compressed_size);
             le32(&mut header, size);
             le16(&mut header, pathlen);
             le16(&mut header, EXTRA_MTIME_SIZE);
@@ -891,19 +907,19 @@ mod zip {
             self.out.write_all(&header)?;
             self.out.write_all(name)?;
             self.out.write_all(&extra)?;
-            self.out.write_all(data)?;
-            self.offset += header.len() as u32 + u32::from(pathlen) + u32::from(EXTRA_MTIME_SIZE) + size;
+            self.out.write_all(payload)?;
+            self.offset += header.len() as u32 + u32::from(pathlen) + u32::from(EXTRA_MTIME_SIZE) + compressed_size;
 
             let dir = &mut self.dir;
             le32(dir, 0x0201_4b50);
             le16(dir, creator_version);
             le16(dir, VERSION_NEEDED);
             le16(dir, flags);
-            le16(dir, 0); /* ZIP_METHOD_STORE */
+            le16(dir, method);
             le16(dir, self.dos_time);
             le16(dir, self.dos_date);
             le32(dir, crc);
-            le32(dir, size);
+            le32(dir, compressed_size);
             le32(dir, size);
             le16(dir, pathlen);
             le16(dir, EXTRA_MTIME_SIZE);

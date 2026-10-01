@@ -2657,7 +2657,7 @@ fn build_header(
 /// block at a time and drains into a 16 KiB `outbuf`, and at `-0`
 /// `deflate_stored()` sizes its blocks from `avail_in` and `avail_out`, so both
 /// sizes are observable in the output.
-mod gzip {
+pub(crate) mod gzip {
     use std::io::{self, Write};
 
     use gix::zlib::deflate::{Deflate, Wrap, Z_BUF_ERROR, Z_FINISH, Z_NO_FLUSH, Z_OK, Z_STREAM_END};
@@ -2760,7 +2760,7 @@ mod gzip {
 
     /// Raw deflate of one buffer at `level`, for a caller that wants the bytes
     /// rather than a stream — a zip entry's payload.
-    pub(super) fn deflate_raw(data: &[u8], level: i32) -> Vec<u8> {
+    pub(crate) fn deflate_raw(data: &[u8], level: i32) -> Vec<u8> {
         let mut out = GzDeflate::new_raw(Vec::new(), level);
         let _ = out.write_all(data);
         out.finish().unwrap_or_default()

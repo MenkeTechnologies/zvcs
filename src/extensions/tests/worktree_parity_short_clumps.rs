@@ -135,6 +135,8 @@ fn list_prune_remove_and_move_split_their_clumps() {
     assert!(!f.work.join(".git/worktrees/m1").exists());
 }
 
+/// A requested `-h` exits 0 since git 2.56 (parse-options.c:1207-1208,
+/// PARSE_OPT_HELP); 2.55 exited 129.
 #[test]
 fn a_help_clump_prints_the_subcommand_usage() {
     let f = Fixture::new("help");
@@ -148,7 +150,7 @@ fn a_help_clump_prints_the_subcommand_usage() {
              \x20   --[no-]expire <expiry-date>\n\
              \x20                         prune missing working trees older than <time>\n\n",
             "",
-            129
+            0
         )
     );
 }

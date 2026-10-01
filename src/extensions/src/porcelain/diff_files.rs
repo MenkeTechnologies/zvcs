@@ -4350,7 +4350,7 @@ fn is_conflict_marker(line: &[u8]) -> bool {
 /// applies (`DEFAULT_CONFLICT_MARKER_SIZE`, merge-ll.h).
 pub(crate) const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
 
-/// `is_conflict_marker_line()` (merge-ll.c:471-501), which 2.56 moved out of
+/// `is_conflict_marker_line()` (merge-ll.c:472-501), which 2.56 moved out of
 /// diff.c so `add --resolved` could share it: `marker_size` repeats of one of
 /// `=`, `>`, `<`, `|` followed by a whitespace byte — and for `<` and `>`, the
 /// two that carry a label, that byte must be a space:

@@ -1,5 +1,5 @@
 //! `diff --check`'s "leftover conflict marker" test is `is_conflict_marker_line()`
-//! since git 2.56 (diff.c now calls the merge-ll.c:471-501 helper `add
+//! since git 2.56 (diff.c now calls the merge-ll.c:472-501 helper `add
 //! --resolved` shares). It adds one rule to the 2.55 `is_conflict_marker()`: a
 //! run of `<` or `>` counts only when a space follows it, since those are the two
 //! markers that carry a label. A tab after `<<<<<<<`, or a bare `>>>>>>>` line,

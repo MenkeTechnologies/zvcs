@@ -7615,6 +7615,7 @@ pub(crate) fn no_index_body(
     binary: bool,
     algorithm: gix::diff::blob::Algorithm,
     ignore_blank_lines: bool,
+    ignore_lines: &[super::diff_pickaxe::Needle],
 ) -> (u32, u32, Vec<u8>) {
     if binary {
         return (0, 0, Vec::new());
@@ -7628,12 +7629,19 @@ pub(crate) fn no_index_body(
     let changes: Vec<super::diff_pairs::Change> = diff
         .hunks()
         .map(|h| {
-            // `xdl_mark_ignorable_lines()` (`--ignore-blank-lines`): a change group
-            // whose every removed and added record is blank is marked, which keeps
-            // `xdl_get_hunk()` from opening a hunk for it.
-            let ignore = ignore_blank_lines
-                && h.before.clone().all(|i| is_blank_record(before[i as usize], ws))
-                && h.after.clone().all(|i| is_blank_record(after[i as usize], ws));
+            // `xdl_mark_ignorable_lines()` (`--ignore-blank-lines`) and
+            // `xdl_mark_ignorable_regex()` (`-I<re>`): a change group whose every
+            // removed and added record is ignorable is marked, which keeps
+            // `xdl_get_hunk()` from opening a hunk for it. The regex pass skips a
+            // change the blank pass already marked (xdiff/xdiffi.c:1070-1074), so
+            // the two verdicts are an or, as in the tracked path.
+            let all = |pred: &dyn Fn(&[u8]) -> bool| {
+                h.before.clone().all(|i| pred(before[i as usize]))
+                    && h.after.clone().all(|i| pred(after[i as usize]))
+            };
+            let ignore = (ignore_blank_lines && all(&|l| is_blank_record(l, ws)))
+                || (!ignore_lines.is_empty()
+                    && all(&|l| ignore_lines.iter().any(|p| p.is_match(l))));
             super::diff_pairs::Change {
                 i1: h.before.start as usize,
                 chg1: h.before.len(),

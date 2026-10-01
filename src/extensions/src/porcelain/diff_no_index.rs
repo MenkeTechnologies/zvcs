@@ -550,6 +550,10 @@ struct Opts {
     /// change group. Not one of `XDF_WHITESPACE_FLAGS`, so it stacks with `-w`
     /// rather than replacing it.
     ignore_blank_lines: bool,
+    /// `-I<re>` / `--ignore-matching-lines=<re>`: `xpp.ignore_regex`, which
+    /// `xdl_mark_ignorable_regex()` turns into the same `ignore` bit on a change
+    /// whose every record matches one of them.
+    ignore_lines: Vec<super::diff_pickaxe::Needle>,
     /// `--diff-filter=<v>`: `diffcore_apply_filter()`'s letter set.
     filter: super::diff_filter::Filter,
     /// `-S`/`-G`: the `diffcore_pickaxe()` pass, which keeps the pairs whose two
@@ -620,6 +624,25 @@ fn resolve_find_object(arg: &str) -> std::result::Result<(), ExitCode> {
         Ok(repo) => crate::objname::find_object(&repo, arg).map(|_| ()).map_err(|e| e.report()),
         Err(_) => {
             eprintln!("error: --find-object requires a git repository");
+            Err(ExitCode::from(129))
+        }
+    }
+}
+
+/// `diff_opt_ignore_regex()` (diff.c:5859-5877): every `-I` appends one pattern,
+/// compiled `REG_EXTENDED | REG_NEWLINE` during the option scan, so a bad one is
+/// the callback's `error()` at its own argv position — exit 129 with no usage.
+fn push_ignore_regex(
+    lines: &mut Vec<super::diff_pickaxe::Needle>,
+    value: &str,
+) -> std::result::Result<(), ExitCode> {
+    match super::diff_pickaxe::compile_regex(value.as_bytes()) {
+        Ok(re) => {
+            lines.push(super::diff_pickaxe::Needle::Regex(re));
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("error: invalid regex given to -I: '{value}'");
             Err(ExitCode::from(129))
         }
     }
@@ -706,6 +729,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut line_prefix: Vec<u8> = Vec::new();
     let mut dirstat = super::diff_files::DirStat::default();
     let mut ignore_blank_lines = false;
+    let mut ignore_lines: Vec<super::diff_pickaxe::Needle> = Vec::new();
     let mut filter = super::diff_filter::Filter::default();
     let mut ws_error_highlight: u32 = diff_color::WSEH_NEW;
     let mut move_word = diff_color::MoveWordOpts::default();
@@ -741,6 +765,11 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                         return Ok(ExitCode::from(129));
                     }
                     pickaxe_needle = Some((kind, a.as_bytes().to_vec()));
+                }
+                "-I" | "--ignore-matching-lines" => {
+                    if let Err(code) = push_ignore_regex(&mut ignore_lines, a) {
+                        return Ok(code);
+                    }
                 }
                 "--skip-to" | "--rotate-to" => {
                     skip_or_rotate = Some((flag == "--skip-to", a.as_str().into()));
@@ -813,6 +842,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
                 | "--ws-error-highlight"
                 | "-S"
                 | "-G"
+                | "-I"
+                | "--ignore-matching-lines"
         ) || diff_color::needs_separate_value(a)
             || super::diff::is_stat_width_flag(a)
         {
@@ -978,6 +1009,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             // replacing them.
             "--check" => fmt.check = true,
             "--ignore-blank-lines" => ignore_blank_lines = true,
+            s if s.starts_with("--ignore-matching-lines=") => {
+                if let Err(code) =
+                    push_ignore_regex(&mut ignore_lines, &s["--ignore-matching-lines=".len()..])
+                {
+                    return Ok(code);
+                }
+            }
             "--ignore-cr-at-eol" => ws = super::diff::Whitespace::IgnoreCrAtEol,
             // `OPT_SET_INT_F('s', "no-patch", ..., DIFF_FORMAT_NO_OUTPUT)`: an
             // assignment, so it wipes the formats already chosen and a later one still
@@ -1472,6 +1510,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         line_prefix: line_prefix.clone(),
         dirstat,
         ignore_blank_lines,
+        ignore_lines,
         filter,
         pickaxe,
         pickaxe_all,
@@ -1870,9 +1909,10 @@ fn compare_with_drivers(
     // change?" a question only the rendered content can answer, so it raises
     // `flags.diff_from_contents`, and `diff_flush()` then reports `found_changes`
     // instead of "the queue was not empty" and runs the raw and name formats
-    // through `diff_flush_patch_quietly()` first. `--ignore-blank-lines` is
-    // deliberately not on that list.
-    let from_contents = opts.ws != super::diff::Whitespace::Keep;
+    // through `diff_flush_patch_quietly()` first. `-I<re>` is on that list
+    // (`options->ignore_regex_nr`, diff.c:5282-5284); `--ignore-blank-lines` is
+    // deliberately not.
+    let from_contents = opts.ws != super::diff::Whitespace::Keep || !opts.ignore_lines.is_empty();
     let mut stats: Vec<Row> = Vec::new();
     // One entry per `diff --git` section, in the order they are written, which is
     // what `colorize_patch_ex()` indexes to reproduce `emit_line_ws_markup()`'s
@@ -1938,6 +1978,7 @@ fn compare_with_drivers(
             binary,
             opts.algorithm,
             opts.ignore_blank_lines,
+            &opts.ignore_lines,
         );
         // `builtin_diffstat()` counts the bytes on disk, never the textconv output.
         let (added, deleted) = match conv_one.is_some() || conv_two.is_some() {
@@ -1951,6 +1992,7 @@ fn compare_with_drivers(
                     !opts.text && stat_binary,
                     opts.algorithm,
                     opts.ignore_blank_lines,
+                    &opts.ignore_lines,
                 );
                 (added, deleted)
             }
@@ -1959,8 +2001,21 @@ fn compare_with_drivers(
         // filespec `queue_diff()` created with the null one, and it runs only
         // inside rename detection. `--raw` therefore prints real ids exactly when
         // detection got far enough to hash — which is what `oid_valid` records.
-        let spec_oid = |i: usize| -> Option<gix::ObjectId> {
-            q.specs[i].oid_valid.then(|| q.specs[i].oid)
+        //
+        // Under `diff_from_contents` there is a second hasher: `diff_flush()`
+        // (diff.c:7210-7212) runs `diff_flush_patch_quietly()` over every pair
+        // before `flush_one_pair()` prints it, and the `run_diff()` underneath
+        // calls `diff_fill_oid_info()` on both sides (diff.c:5049-5050), which
+        // `index_path()`s any existing side that has no id yet. So `-w`/`-b`/`-I`
+        // put real ids in the `--raw` columns where a plain run prints zeros.
+        let spec_oid = |i: usize, data: &[u8]| -> Option<gix::ObjectId> {
+            let spec = &q.specs[i];
+            if spec.oid_valid {
+                return Some(spec.oid);
+            }
+            (from_contents && opts.fmt.raw && spec.valid())
+                .then(|| gix::objs::compute_hash(HASH_KIND, gix::objs::Kind::Blob, data).ok())
+                .flatten()
         };
         stats.push(Row {
             a_name: a.display_name().clone(),
@@ -1985,8 +2040,8 @@ fn compare_with_drivers(
             b_exists: b.file.is_some(),
             a_mode: a.mode,
             b_mode: b.mode,
-            a_oid: spec_oid(pair.one),
-            b_oid: spec_oid(pair.two),
+            a_oid: spec_oid(pair.one, &old_data),
+            b_oid: spec_oid(pair.two, &new_data),
             status: pair.status,
             score: pair.score,
             shown: false,
@@ -2443,7 +2498,24 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts, from_contents:
             out.push(term);
         }
     }
-    let stat_rows: Vec<(BString, BString, u32, u32, bool)> = rows
+    // `builtin_diffstat()` (diff.c:4255-4273): "Omit diffstats of modified files
+    // where nothing changed" — a text pair whose comparison counted no line either
+    // way, both sides present with one mode, never enters the diffstat at all. That
+    // is what `-w`/`-b`/`-I`/`--ignore-blank-lines` leave of a change they discount,
+    // so `--stat`, `--numstat` and `--shortstat` all skip it.
+    let diffstat_rows: Vec<&Row> = rows
+        .iter()
+        .filter(|r| {
+            !(r.status == b'M'
+                && !r.binary
+                && r.added == 0
+                && r.deleted == 0
+                && r.a_exists
+                && r.b_exists
+                && r.a_mode == r.b_mode)
+        })
+        .collect();
+    let stat_rows: Vec<(BString, BString, u32, u32, bool)> = diffstat_rows
         .iter()
         .map(|r| (r.a_name.clone(), r.b_name.clone(), r.added, r.deleted, r.binary))
         .collect();
@@ -2459,12 +2531,14 @@ fn render_non_patch(out: &mut Vec<u8>, rows: &[Row], opts: &Opts, from_contents:
             opts.fmt.compact_summary,
         );
     }
-    if opts.fmt.shortstat {
-        let (adds, dels) = rows
+    // `show_shortstats()` (diff.c:3225-3226) returns before printing anything when
+    // the diffstat holds no file.
+    if opts.fmt.shortstat && !diffstat_rows.is_empty() {
+        let (adds, dels) = diffstat_rows
             .iter()
             .filter(|r| !r.binary)
             .fold((0u32, 0u32), |(a, d), r| (a + r.added, d + r.deleted));
-        super::diffstat::print_stat_summary(out, rows.len() as u64, u64::from(adds), u64::from(dels));
+        super::diffstat::print_stat_summary(out, diffstat_rows.len() as u64, u64::from(adds), u64::from(dels));
     }
     if opts.fmt.summary {
         // `show_file_mode_name(opt, "create", p->two)` and `(…, "delete", p->one)`
@@ -2648,6 +2722,7 @@ mod tests {
             line_prefix: Vec::new(),
             dirstat: super::super::diff_files::DirStat::default(),
             ignore_blank_lines: false,
+            ignore_lines: Vec::new(),
             filter: super::super::diff_filter::Filter::default(),
             pickaxe: None,
             pickaxe_all: false,

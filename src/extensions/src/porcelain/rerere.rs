@@ -328,17 +328,7 @@ fn cmd_gc(repo: &gix::Repository) -> Result<ExitCode> {
     }
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-    let mut cutoff_noresolve = now - 15 * 86400;
-    let mut cutoff_resolve = now - 60 * 86400;
-    let cfg = repo.config_snapshot();
-    if let Some(cutoff) = config_expiry(&cfg, "gc.rerereResolved", now) {
-        cutoff_resolve = cutoff;
-    }
-    if let Some(cutoff) = config_expiry(&cfg, "gc.rerereUnresolved", now) {
-        cutoff_noresolve = cutoff;
-    }
-
+    let cutoffs = rerere_gc_cutoffs(repo)?;
     let rr_cache = rr_cache_dir(repo);
     let dir = std::fs::read_dir(&rr_cache).context("unable to open rr-cache directory")?;
 
@@ -355,18 +345,8 @@ fn cmd_gc(repo: &gix::Repository) -> Result<ExitCode> {
         let mut status = scan_rerere_dir(&id_dir);
 
         for (variant, slot) in status.iter_mut().enumerate() {
-            // `prune_one()`: a postimage dates the resolution, a preimage alone
-            // dates an unresolved conflict; neither means nothing to prune.
-            let post = variant_path(&id_dir, variant as i32, "postimage");
-            let pre = variant_path(&id_dir, variant as i32, "preimage");
-            let (then, cutoff) = match mtime_secs(&post) {
-                Some(t) => (t, cutoff_resolve),
-                None => match mtime_secs(&pre) {
-                    Some(t) => (t, cutoff_noresolve),
-                    None => continue,
-                },
-            };
-            if then < cutoff {
+            // `prune_one()`
+            if rerere_id_is_stale(&id_dir, variant as i32, cutoffs) {
                 unlink_rr_item(&id_dir, variant as i32);
                 *slot = 0;
             }
@@ -381,6 +361,64 @@ fn cmd_gc(repo: &gix::Repository) -> Result<ExitCode> {
         let _ = std::fs::remove_dir(&id_dir);
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `rerere_gc_cutoffs()` (rerere.c:1176-1188): the `(resolved, unresolved)`
+/// timestamps a record has to be older than to be pruned — `gc.rerereResolved`
+/// (default 60 days) and `gc.rerereUnresolved` (default 15 days).
+fn rerere_gc_cutoffs(repo: &gix::Repository) -> Result<(i64, i64)> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let cfg = repo.config_snapshot();
+    let resolve = config_expiry(&cfg, "gc.rerereResolved", now).unwrap_or(now - 60 * 86400);
+    let noresolve = config_expiry(&cfg, "gc.rerereUnresolved", now).unwrap_or(now - 15 * 86400);
+    Ok((resolve, noresolve))
+}
+
+/// `rerere_id_is_stale()` (rerere.c:1190-1206): a postimage dates the
+/// resolution, a preimage alone dates an unresolved conflict; neither means
+/// there is nothing to prune.
+fn rerere_id_is_stale(id_dir: &Path, variant: i32, (cutoff_resolve, cutoff_noresolve): (i64, i64)) -> bool {
+    let (then, cutoff) = match mtime_secs(&variant_path(id_dir, variant, "postimage")) {
+        Some(t) => (t, cutoff_resolve),
+        None => match mtime_secs(&variant_path(id_dir, variant, "preimage")) {
+            Some(t) => (t, cutoff_noresolve),
+            None => return false,
+        },
+    };
+    then < cutoff
+}
+
+/// `rerere_gc_needed()` (rerere.c:1225-1273, git 2.56): whether `maintenance
+/// run --auto` should run the `rerere-gc` task.
+///
+/// Like the loose-object estimate, only the ids starting with `17` are looked
+/// at, and every stale variant among them counts for 256; the task is needed
+/// once that estimate reaches `limit`.
+pub(crate) fn rerere_gc_needed(repo: &gix::Repository, limit: usize) -> bool {
+    let Ok(dir) = std::fs::read_dir(rr_cache_dir(repo)) else {
+        return false;
+    };
+    let Ok(cutoffs) = rerere_gc_cutoffs(repo) else {
+        return false;
+    };
+    let hexsz = repo.object_hash().len_in_hex();
+    let mut count = 0usize;
+    for ent in dir.flatten() {
+        let name = ent.file_name();
+        if !name.as_encoded_bytes().starts_with(b"17") || !is_rr_cache_dirname(&name, hexsz) {
+            continue;
+        }
+        let id_dir = ent.path();
+        for variant in 0..scan_rerere_dir(&id_dir).len() {
+            if rerere_id_is_stale(&id_dir, variant as i32, cutoffs) {
+                count += 256;
+                if count >= limit {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// `rerere_forget()`: drop the recorded resolution for each matched path and

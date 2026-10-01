@@ -59,7 +59,7 @@
 //! commits the graph does not carry, `incremental-repack` counts packs outside
 //! the multi-pack-index, `geometric-repack` computes the pack geometry split,
 //! `pack-refs` weighs loose refs against the packed-refs file, `worktree-prune`
-//! counts prunable worktrees, `rerere-gc` looks for an `rr-cache` entry,
+//! counts prunable worktrees, `rerere-gc` estimates stale `rr-cache` records,
 //! `reflog-expire` counts expiring `HEAD` reflog entries, and `gc` reuses
 //! `need_to_gc()` plus the `pre-auto-gc` hook. `prefetch` is the one task git
 //! leaves without a condition, so `--auto` never selects it.
@@ -1382,19 +1382,19 @@ fn count_loose_objects(repo: &gix::Repository, limit: i64) -> i64 {
     count
 }
 
-/// `rerere_gc_condition()`: an `rr-cache` directory exists and holds at least
-/// one entry. The limit is a plain on/off switch here â git compares nothing
-/// against it, so any positive value behaves like the default 1.
+/// `rerere_gc_condition()` (builtin/gc.c:397-408, git 2.56):
+/// `maintenance.rerere-gc.auto` (default 512) is `0` for never and negative for
+/// always; otherwise [`super::rerere::rerere_gc_needed`] estimates whether that
+/// many stale records have built up.
 fn rerere_gc_condition(repo: &gix::Repository) -> bool {
     let limit = repo
         .config_snapshot()
         .integer("maintenance.rerere-gc.auto")
-        .unwrap_or(1);
+        .unwrap_or(512);
     if limit <= 0 {
         return limit < 0;
     }
-    std::fs::read_dir(repo.git_dir().join("rr-cache"))
-        .is_ok_and(|mut entries| entries.any(|e| e.is_ok()))
+    super::rerere::rerere_gc_needed(repo, limit as usize)
 }
 
 /// `worktree_prune_condition()`: at least `maintenance.worktree-prune.auto`

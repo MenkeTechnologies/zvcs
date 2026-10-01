@@ -2101,8 +2101,8 @@ pub fn common_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
-/// The `die_on_error` half of `setup_git_directory_gently_1()`'s walk
-/// (setup.c:1600-1634, v2.55.0): a `.git` the walk finds but cannot follow ends
+/// The `die_on_error` half of `repo_discovery_find_dir()`'s walk
+/// (setup.c:1569-1724, v2.56.0): a `.git` the walk finds but cannot follow ends
 /// the command where it stands, naming what is wrong with it.
 ///
 /// ```c
@@ -2113,50 +2113,159 @@ pub fn common_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
 ///         case READ_GITFILE_ERR_IS_A_DIR:     … break;
 ///         case READ_GITFILE_ERR_STAT_FAILED:  die(_("error reading '%s'"), dir->buf);
 ///         case READ_GITFILE_ERR_NOT_A_FILE:   die(_("not a regular file: '%s'"), dir->buf);
-///         default:                            read_gitfile_error_die(error_code, dir->buf, NULL);
+///         default:                            read_gitfile_error_die(error_code, dir->buf);
 ///         }
 /// }
 /// ```
 ///
-/// `setup_git_directory()` passes `die_on_error = 1` (setup.c:1951), so this is
-/// what every command that sets up a repository the ordinary way reports for a
-/// `.git` file with no `gitdir:` line, or one naming a directory that is not a
-/// repository. gitoxide's discovery has no such diagnostic — it walks past the
-/// broken file and ends on "not a git repository (or any of the parent
-/// directories)", which describes neither problem.
+/// `setup_git_directory_gently()` passes `die_on_error = 1` (setup.c:1952) whether
+/// or not the caller asked for `nongit_ok`, so this is what every command that
+/// runs setup at all — `RUN_SETUP` and `RUN_SETUP_GENTLY` alike, `-h` included —
+/// reports for a `.git` file with no `gitdir:` line, or one naming a directory
+/// that is not a repository. gitoxide's discovery has no such diagnostic — it
+/// walks past the broken file and ends on "not a git repository (or any of the
+/// parent directories)", which describes neither problem.
+///
+/// The walk stops where git's does: at the first `.git` directory or bare
+/// repository, at `$GIT_CEILING_DIRECTORIES` (setup.c:1592-1604, 1714-1717), and
+/// at a mount point unless `$GIT_DISCOVERY_ACROSS_FILESYSTEM` is set
+/// (setup.c:1623-1625, 1719-1722), so a broken `.git` file beyond any of those is
+/// never read.
 ///
 /// `$GIT_DIR` skips discovery outright, which is [`explicit_git_dir_gate`]'s
 /// branch, so it is not this one's. Returns the exit code to leave with, or
 /// `None` when discovery should carry on.
 pub fn discovery_gitfile_gate() -> Option<ExitCode> {
     use crate::porcelain::rev_parse::{gitfile_error_message, is_git_directory, read_gitfile_gently};
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::MetadataExt;
+
     if std::env::var_os("GIT_DIR").is_some() {
         return None;
     }
-    let mut dir = std::env::current_dir().ok()?;
+    let die = |msg: String| {
+        eprintln!("fatal: {msg}");
+        Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+    };
+    let as_path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
+    let device = |bytes: &[u8]| std::fs::metadata(as_path(bytes)).ok().map(|m| m.dev());
+
+    let mut dir = std::env::current_dir().ok()?.into_os_string().into_vec();
+    // `offset_1st_component()`: the root's `/` is never stripped.
+    let min_offset: isize = if dir.first() == Some(&b'/') { 1 } else { 0 };
+    let mut ceil_offset = std::env::var_os("GIT_CEILING_DIRECTORIES")
+        .map_or(-1, |env| longest_ancestor_length(&dir, &ceiling_dirs(env.as_bytes())));
+    if ceil_offset < 0 {
+        ceil_offset = min_offset - 2;
+    }
+    let one_filesystem = !git_env_bool("GIT_DISCOVERY_ACROSS_FILESYSTEM", false);
+    let current_device = if one_filesystem { device(&dir) } else { None };
+
     loop {
-        let candidate = dir.join(".git");
-        match read_gitfile_gently(&candidate) {
-            // A gitfile that read fine: discovery is over and it succeeded.
-            Ok(Some(_)) => return None,
-            // `READ_GITFILE_ERR_MISSING` / `_IS_A_DIR` / `_NOT_A_FILE` — the
-            // ordinary "no gitfile here" answers, which the walk steps past.
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("fatal: {}", gitfile_error_message(&candidate, err));
-                return Some(ExitCode::from(crate::fatal::EXIT_FATAL));
-            }
+        let mut offset = dir.len() as isize;
+        let mut gitfile = dir.clone();
+        if offset > min_offset {
+            gitfile.push(b'/');
         }
-        // `case READ_GITFILE_ERR_IS_A_DIR: if (is_git_directory(dir->buf))`, and
-        // the `setup_bare_git_dir()` arm below the loop for the directory itself.
-        if is_git_directory(&candidate) || is_git_directory(&dir) {
+        gitfile.extend_from_slice(b".git");
+        let gitfile = PathBuf::from(OsString::from_vec(gitfile));
+        // `read_gitfile_raw()`'s `stat()` and `S_ISDIR` / `S_ISREG` tests
+        // (setup.c:1012-1027) and the walk's answer to each.
+        match std::fs::metadata(&gitfile) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {}
+            Err(_) => return die(format!("error reading '{}'", gitfile.display())),
+            Ok(meta) if meta.is_dir() => {
+                if is_git_directory(&gitfile) {
+                    return None;
+                }
+            }
+            Ok(meta) if !meta.is_file() => {
+                return die(format!("not a regular file: '{}'", gitfile.display()));
+            }
+            Ok(_) => match read_gitfile_gently(&gitfile) {
+                Ok(_) => return None,
+                Err(err) => return die(gitfile_error_message(&gitfile, err)),
+            },
+        }
+        // The bare-repository arm (setup.c:1696-1704): the directory itself.
+        if is_git_directory(&as_path(&dir)) {
             return None;
         }
-        if !dir.pop() {
+        if offset <= min_offset {
+            return None;
+        }
+        // `while (--offset > ceil_offset && !is_dir_sep(dir->buf[offset]));`
+        loop {
+            offset -= 1;
+            if offset <= ceil_offset || dir[offset as usize] == b'/' {
+                break;
+            }
+        }
+        if offset <= ceil_offset {
+            return None;
+        }
+        dir.truncate(offset.max(min_offset) as usize);
+        if one_filesystem && current_device != device(&dir) {
             return None;
         }
     }
 }
+
+/// `$GIT_CEILING_DIRECTORIES` split on `:` and put through
+/// `canonicalize_ceiling_entry()` (setup.c:1333-1356): an empty entry is dropped
+/// and switches off canonicalization for every entry after it, a relative entry
+/// is dropped, and one whose realpath cannot be resolved is dropped.
+fn ceiling_dirs(env: &[u8]) -> Vec<Vec<u8>> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let mut empty_entry_found = false;
+    let mut out = Vec::new();
+    for entry in env.split(|&b| b == b':') {
+        if entry.is_empty() {
+            empty_entry_found = true;
+        } else if entry.first() != Some(&b'/') {
+            continue;
+        } else if empty_entry_found {
+            out.push(entry.to_vec());
+        } else if let Ok(real) = std::fs::canonicalize(std::ffi::OsStr::from_bytes(entry)) {
+            out.push(real.into_os_string().into_vec());
+        }
+    }
+    out
+}
+
+/// `longest_ancestor_length()` (path.c:1245-1272): the length of the longest
+/// entry of `prefixes` that is a proper ancestor directory of `path`, or -1.
+fn longest_ancestor_length(path: &[u8], prefixes: &[Vec<u8>]) -> isize {
+    if path == b"/" {
+        return -1;
+    }
+    let mut max_len = -1isize;
+    for ceil in prefixes {
+        // A root directory's trailing slash is not counted.
+        let len = if ceil.last() == Some(&b'/') { ceil.len() - 1 } else { ceil.len() };
+        if !path.starts_with(&ceil[..len]) || path.get(len) != Some(&b'/') || path.len() == len + 1 {
+            continue;
+        }
+        max_len = max_len.max(len as isize);
+    }
+    max_len
+}
+
+/// [`discovery_gitfile_gate`] for the verbs whose setup git runs before the
+/// command does: every builtin with `RUN_SETUP` or `RUN_SETUP_GENTLY` in git.c's
+/// table, plus `diff` and `hash-object`, which call `setup_git_directory*()`
+/// themselves on every path. The verbs that never walk are skipped
+/// ([`NO_DISCOVERY_VERBS`]), as are `upload-pack` and `receive-pack`, which open
+/// their operand through `enter_repo()` instead ([`enter_repo_gitfile_gate`]), and
+/// `rev-parse`, whose setup is lazy and runs the gate itself.
+pub fn dispatch_gitfile_gate(sub: &str) -> Option<ExitCode> {
+    if NO_DISCOVERY_VERBS.contains(&sub) || matches!(sub, "upload-pack" | "receive-pack" | "rev-parse") {
+        return None;
+    }
+    discovery_gitfile_gate()
+}
+
 
 /// `setup_explicit_git_dir()`'s two refusals (setup.c:1176-1190):
 ///

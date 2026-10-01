@@ -352,6 +352,12 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // The first argument past those two is where `setup_git_directory()` runs, and
+    // with it the walk's refusal of a `.git` file it cannot follow.
+    if let Some(code) = crate::setup::discovery_gitfile_gate() {
+        return Ok(code);
+    }
+
     // `setup_git_directory()` looks at `$GIT_DIR` before it walks upwards, so
     // `git --git-dir=<path> rev-parse <rev>` resolves against THAT repository.
     // Plain discovery ignores the variable and silently answers about whatever
@@ -3176,7 +3182,12 @@ fn read_gitfile(file: &std::path::Path) -> Option<std::path::PathBuf> {
 }
 
 /// `read_gitfile_gently()`'s error codes, in the wording
-/// `read_gitfile_error_die()` (`setup.c:920-940`) gives each of them.
+/// `read_gitfile_error_die()` (`setup.c:927-952`, v2.56.0) gives each of them.
+///
+/// 2.56 names the gitfile, not the directory it points at, when that directory is
+/// not a repository: `die(_("gitfile does not point to a valid repository: %s"),
+/// path)` replaced 2.55's `die(_("not a git repository: %s"), dir)`, whose `dir`
+/// the discovery walk passed as `NULL`.
 ///
 /// `READ_GITFILE_ERR_STAT_FAILED` and `READ_GITFILE_ERR_NOT_A_FILE` are absent
 /// deliberately: `read_gitfile_error_die()` breaks out of its switch for those two
@@ -3190,7 +3201,7 @@ pub(crate) fn gitfile_error_message(file: &std::path::Path, err: GitfileError) -
         GitfileError::ReadFailed => format!("error reading {path}"),
         GitfileError::InvalidFormat => format!("invalid gitfile format: {path}"),
         GitfileError::NoPath => format!("no path in gitfile: {path}"),
-        GitfileError::NotARepo(dir) => format!("not a git repository: {}", dir.display()),
+        GitfileError::NotARepo => format!("gitfile does not point to a valid repository: {path}"),
     }
 }
 
@@ -3203,7 +3214,7 @@ pub(crate) enum GitfileError {
     ReadFailed,
     InvalidFormat,
     NoPath,
-    NotARepo(std::path::PathBuf),
+    NotARepo,
 }
 
 /// `read_gitfile_gently()` (`setup.c:956-1035`) with its error code kept rather
@@ -3240,11 +3251,11 @@ pub(crate) fn read_gitfile_gently(
     if path.is_relative() {
         match file.parent() {
             Some(parent) => path = parent.join(path),
-            None => return Err(GitfileError::NotARepo(path)),
+            None => return Err(GitfileError::NotARepo),
         }
     }
     if !is_git_directory(&path) {
-        return Err(GitfileError::NotARepo(path));
+        return Err(GitfileError::NotARepo);
     }
     Ok(Some(std::fs::canonicalize(&path).unwrap_or(path)))
 }

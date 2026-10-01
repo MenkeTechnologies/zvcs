@@ -905,6 +905,11 @@ fn run_command(argv: &[String]) -> ExitCode {
     // (setup.c:1597), which is read before the walk begins and so beats every
     // refusal below it.
     setup::discovery_environment_gate(&sub);
+    // The walk itself: a `.git` file it cannot follow ends every command that runs
+    // setup (setup.c:1634-1661), before anything below reads configuration.
+    if let Some(code) = setup::dispatch_gitfile_gate(&sub) {
+        return code;
+    }
     // Discovery first: `$GIT_OBJECT_DIRECTORY` is part of the test that decides
     // whether a directory is a repository at all, and it runs before any
     // configuration has been read, so it beats even a malformed command-line

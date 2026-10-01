@@ -169,6 +169,13 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
 
     // Only the comment-aware modes set up the repository and read config, so the
     // default mode neither needs a repository nor notices a bad comment string.
+    // `setup_git_directory_gently()` (builtin/stripspace.c:56-57) still dies on a
+    // `.git` file its walk cannot follow.
+    if mode != Mode::Default {
+        if let Some(code) = crate::setup::discovery_gitfile_gate() {
+            return Ok(code);
+        }
+    }
     let comment = match mode {
         Mode::Default => None,
         _ => match comment_string()? {

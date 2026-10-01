@@ -128,7 +128,10 @@ fn a_git_file_that_cannot_be_followed_ends_the_no_argument_form() {
     std::fs::write(outer.join(".git"), format!("gitdir: {}.nope\n", real.display())).unwrap();
     let (out, err, code) = f.run(&outer, &["rev-parse"]);
     assert_eq!((out.as_str(), code), ("", 128));
-    assert!(err.starts_with("fatal: not a git repository: "), "{err:?}");
+    // 2.56 names the gitfile itself (setup.c:946-948); 2.55 passed the walk's
+    // `NULL` directory to `not a git repository: %s`.
+    assert!(err.starts_with("fatal: gitfile does not point to a valid repository: /"), "{err:?}");
+    assert!(err.ends_with("/outer/.git\n"), "{err:?}");
 
     // And a gitfile that *can* be followed is the ordinary success.
     std::fs::write(outer.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();

@@ -1469,8 +1469,13 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `cmd_hash_object()` runs `parse_options()` before its own setup and
     // `repo_config()` (builtin/hash-object.c:99-115). An option it refuses is
     // therefore 129 ahead of every configuration diagnostic. `--help` first is
-    // still `handle_builtin()`'s rewrite below.
+    // still `handle_builtin()`'s rewrite below, and a lone
+    // `--git-completion-helper[-all]` is answered inside that same
+    // `parse_options()` call (parse-options.c:1057-1060), so it is too.
     if sub == "hash-object" && args.first().is_none_or(|a| a != "--help") {
+        if let Some(result) = crate::gitcomp::answer(sub, args) {
+            return result;
+        }
         if let Some(code) = porcelain::hash_object_options_refused(args) {
             return Ok(code);
         }

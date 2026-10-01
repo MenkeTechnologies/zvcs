@@ -1757,8 +1757,10 @@ fn v2_advertisement(
     if let Some(sid) = &cfg.session_id {
         pkt_line(&mut out, format!("session-id={sid}\n").as_bytes());
     }
+    // `object_info_advertise()` (serve.c:95-107, git 2.56) names the attributes
+    // `cap_object_info()` can answer.
     if cfg.object_info {
-        pkt_line(&mut out, b"object-info\n");
+        pkt_line(&mut out, b"object-info=size type\n");
     }
     // `bundle-uri` sits between `object-info` and `promisor-remote` in git's
     // `capabilities[]` table (serve.c:170-183) and is advertised only when
@@ -1852,7 +1854,7 @@ fn process_request(
                         "bundle-uri" if cfg.bundle_uri => V2Command::BundleUri,
                         _ => die!("invalid command '{name}'"),
                     });
-                } else if !receive_client_capability(repo, cfg, &key, &mut client_hash) {
+                } else if !receive_client_capability(repo, cfg, &key, &mut client_hash)? {
                     die!("unknown capability '{key}'");
                 }
                 seen_capability_or_command = true;
@@ -1914,12 +1916,12 @@ fn receive_client_capability(
     cfg: &V2Config,
     key: &str,
     client_hash: &mut String,
-) -> bool {
+) -> Result<bool, Die> {
     let (name, value) = match key.split_once('=') {
         Some((n, v)) => (n, Some(v)),
         None => (key, None),
     };
-    match name {
+    Ok(match name {
         "agent" | "server-option" => true,
         "object-format" => {
             if let Some(v) = value {
@@ -1937,14 +1939,17 @@ fn receive_client_capability(
         // it only consults `promisor.advertise` when actually building the value.
         // Verified against stock 2.55.0, which answers a `promisor-remote=` sent to
         // a server with `promisor.advertise=false` normally rather than dying.
-        "promisor-remote" => {
-            if let Some(names) = value {
+        // A valueless `promisor-remote` is refused since 2.56 (serve.c:49-50);
+        // before, `mark_promisor_remotes_as_accepted()` dereferenced the NULL.
+        "promisor-remote" => match value {
+            Some(names) => {
                 gix::promisor::accept_reply(repo, names);
+                true
             }
-            true
-        }
+            None => die!("promisor-remote capability requires an argument"),
+        },
         _ => false,
-    }
+    })
 }
 
 /// `ls_refs()` (ls-refs.c:161-216): HEAD (possibly unborn) first, then every ref
@@ -2524,10 +2529,23 @@ fn add_included_tags(repo: &gix::Repository, objects: &mut Vec<ObjectId>) {
 /// packet_writer_flush(&writer);
 /// ```
 ///
-/// `config_to_packet_line()` filters on the `bundle.` prefix and writes the key
-/// exactly as the configuration file spelled it — lowercased section and
-/// variable, subsection verbatim — so a repository with no `bundle.*` keys
-/// answers with a bare flush.
+/// `config_to_packet_line()` (bundle-uri.c:945-957, v2.56.0) filters on the
+/// `bundle.` prefix and writes the key exactly as the configuration file spelled
+/// it — lowercased section and variable, subsection verbatim — so a repository
+/// with no `bundle.*` keys answers with a bare flush. Every entry is visited in
+/// file order, a multi-valued key once per value:
+///
+/// ```c
+/// if (starts_with(key, "bundle.")) {
+///         if (value && *value)
+///                 packet_write_fmt(writer->fd, "%s=%s", key, value);
+///         else
+///                 warning(_("config '%s' has no value"), key);
+/// }
+/// ```
+///
+/// 2.56 stopped sending a valueless (`[bundle] flag`) or empty (`flag =`) entry,
+/// which a client cannot parse, and warns about it instead.
 fn bundle_uri_command(
     repo: &gix::Repository,
     reader: &mut PktReader<std::io::Stdin>,
@@ -2546,40 +2564,40 @@ fn bundle_uri_command(
         }
     }
     let config = repo.config_snapshot();
-    for (key, value) in config
-        .sections_by_name("bundle")
-        .into_iter()
-        .flatten()
-        .flat_map(|section| {
-            let subsection = section.header().subsection_name().map(ToOwned::to_owned);
-            section
-                .value_names()
-                .map(move |name| (subsection.clone(), name.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .filter_map(|(subsection, name)| {
-            let key = match &subsection {
-                Some(sub) => format!("bundle.{sub}.{name}"),
-                None => format!("bundle.{name}"),
-            };
-            config.string(key.as_str()).map(|v| (key, v.to_string()))
-        })
-    {
-        writer.write(&format!("{key}={value}"))?;
+    for section in config.sections_by_name("bundle").into_iter().flatten() {
+        let prefix = match section.header().subsection_name() {
+            Some(sub) => format!("bundle.{sub}."),
+            None => "bundle.".to_owned(),
+        };
+        // `value_names()` yields every occurrence in order; the n-th occurrence
+        // of a name pairs with the n-th of its `values_implicit()`.
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for name in section.value_names() {
+            let nth = seen.entry(name.to_ascii_lowercase()).or_default();
+            let value = section.values_implicit(&name).into_iter().nth(*nth).flatten();
+            *nth += 1;
+            let key = format!("{prefix}{}", name.to_ascii_lowercase());
+            match value {
+                Some(value) if !value.is_empty() => writer.write(&format!("{key}={value}"))?,
+                _ => eprintln!("warning: config '{key}' has no value"),
+            }
+        }
     }
     writer.flush_pkt()?;
     Ok(())
 }
 
-/// `cap_object_info()` (protocol-caps.c:78-113): answer `size` for each `oid`
-/// the client listed. An oid this repository does not have gets an empty size
-/// field rather than an error.
+/// `cap_object_info()` (protocol-caps.c:121-155, git 2.56): answer `size` and/or
+/// `type` for each `oid` the client listed. An oid this repository does not have
+/// is answered with the oid and a single space, whatever was asked for
+/// (`send_info()`, :64-118).
 fn object_info_command(
     repo: &gix::Repository,
     reader: &mut PktReader<std::io::Stdin>,
     writer: &mut PktWriter<std::io::Stdout>,
 ) -> Result<(), Die> {
     let mut want_size = false;
+    let mut want_type = false;
     let mut oids: Vec<String> = Vec::new();
     loop {
         match reader.read()? {
@@ -2587,6 +2605,8 @@ fn object_info_command(
                 let arg = String::from_utf8_lossy(&line).into_owned();
                 if arg == "size" {
                     want_size = true;
+                } else if arg == "type" {
+                    want_type = true;
                 } else if let Some(oid) = arg.strip_prefix("oid ") {
                     oids.push(oid.to_owned());
                 } else {
@@ -2605,6 +2625,9 @@ fn object_info_command(
         if want_size {
             writer.write("size")?;
         }
+        if want_type {
+            writer.write("type")?;
+        }
         for text in &oids {
             let Ok(id) = ObjectId::from_hex(text.as_bytes()) else {
                 writer.error(&format!(
@@ -2613,11 +2636,17 @@ fn object_info_command(
                 continue;
             };
             let mut line = text.clone();
-            if want_size {
-                match repo.find_object(id) {
-                    Ok(object) => line.push_str(&format!(" {}", object.data.len())),
-                    Err(_) => line.push(' '),
+            // `get_object_info()`: the header alone, no fetch, replacements applied.
+            match repo.find_header(id) {
+                Ok(header) => {
+                    if want_size {
+                        line.push_str(&format!(" {}", header.size()));
+                    }
+                    if want_type {
+                        line.push_str(&format!(" {}", header.kind()));
+                    }
                 }
+                Err(_) => line.push(' '),
             }
             writer.write(&line)?;
         }

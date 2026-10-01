@@ -287,26 +287,30 @@ impl Advice {
     }
 }
 
-/// `parse_remote_branch()`'s ambiguous-DWIM block (`builtin/checkout.c`), shared
-/// by `git checkout` and `git switch` — `cmdname` is the *only* thing git
-/// interpolates. The remote in the prose is the literal `origin` even when the
-/// matches are on other remotes: git is naming the conventional default, not the
-/// remotes it found. git checks `advice_enabled()` here and then calls plain
-/// `advise()`, so no `Disable this message with …` trailer is printed.
-pub fn ambiguous_remote_branch_name(repo: &Repository, cmdname: &str) {
-    Advice::CheckoutAmbiguousRemoteBranchName.advise_plain_in(
-        repo,
-        &format!(
-            "If you meant to check out a remote tracking branch on, e.g. 'origin',\n\
-             you can do so by fully qualifying the name with the --track option:\n\
-             \n\
-             \x20   git {cmdname} --track origin/<name>\n\
-             \n\
-             If you'd like to always have checkouts of an ambiguous <name> prefer\n\
-             one remote, e.g. the 'origin' remote, consider setting\n\
-             checkout.defaultRemote=origin in your config."
-        ),
-    );
+/// `advise_disambiguating_remotes()` (git 2.56.0 builtin/checkout.c:1349-1381),
+/// the ambiguous-DWIM block `parse_remote_branch()` prints for `git checkout`
+/// and `git switch`: the branch name, every remote `unique_tracking_name()`
+/// matched it on in `for_each_remote()` order, then the `--track` and
+/// `checkout.defaultRemote` prose. git checks `advice_enabled()` and then calls
+/// plain `advise()` once per part, so no `Disable this message with …` trailer
+/// is printed; one `advise()` over the joined parts splits into the same
+/// `hint:` lines.
+pub fn ambiguous_remote_branch_name(repo: &Repository, cmdname: &str, branch: &str, remotes: &[String]) {
+    let mut body = format!("Branch name '{branch}' appears in multiple remotes:\n");
+    for remote in remotes {
+        body.push_str(&format!("  {remote}\n"));
+    }
+    body.push_str(&format!(
+        "If you meant to check out a remote tracking branch on <remote>,\n\
+         you can do so by fully qualifying the name with the --track option:\n\
+         \n\
+         \x20   git {cmdname} --track <remote>/{branch}\n\
+         \n\
+         If you'd like to always have checkouts of an ambiguous name prefer\n\
+         one remote, e.g. the 'origin' remote, consider setting\n\
+         checkout.defaultRemote=origin in your config."
+    ));
+    Advice::CheckoutAmbiguousRemoteBranchName.advise_plain_in(repo, &body);
 }
 
 /// Port of `die_ff_impossible()` (`advice.c`), minus the `die()`: the hint git

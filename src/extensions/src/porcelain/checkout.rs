@@ -1237,10 +1237,11 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                     maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                     return Ok(code);
                 }
-                Dwim::Many { count } => {
-                    crate::advice::ambiguous_remote_branch_name(&repo, "checkout");
+                Dwim::Many { remotes } => {
+                    crate::advice::ambiguous_remote_branch_name(&repo, "checkout", spec, &remotes);
                     eprintln!(
-                        "fatal: '{spec}' matched multiple ({count}) remote tracking branches"
+                        "fatal: '{spec}' matched multiple ({}) remote tracking branches",
+                        remotes.len()
                     );
                     return Ok(ExitCode::from(128));
                 }
@@ -2477,26 +2478,30 @@ fn restore_conflict_stage(
 // --- DWIM (`--guess`) ------------------------------------------------------
 
 /// Result of resolving a bare `<name>` against the remote-tracking namespace.
-enum Dwim {
+pub(super) enum Dwim {
     /// Exactly one remote has the branch; its short name (`<remote>/<name>`).
     One(String),
     /// More than one remote has it — ambiguous (unless `checkout.defaultRemote`).
-    Many { count: usize },
+    /// `matched_remote_names`: every remote that has it, in `for_each_remote()`
+    /// order, which `num_matches` counts.
+    Many { remotes: Vec<String> },
     /// No remote has it.
     None,
 }
 
 /// Find the remote-tracking branch a bare `<name>` should DWIM to: `refs/remotes/
 /// <remote>/<name>` across every configured remote. `checkout.defaultRemote`
-/// disambiguates a multi-remote match. Mirrors `switch`'s identical resolver.
-fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
+/// disambiguates a multi-remote match. `switch` resolves through it too.
+pub(super) fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
     // `unique_tracking_name()` (checkout.c:50-56) reads the key before looking at
     // any remote, with `repo_config_get_string_tmp()`, which dies through
     // `git_die_config()` on a valueless key.
     let default_remote = crate::config::config_get_string(Some(repo), "checkout.defaultremote");
     let mut matches: Vec<String> = Vec::new();
-    for remote in repo.remote_names() {
-        let remote = remote.to_str_lossy();
+    // `for_each_remote(check_tracking_name, &cb_data)` (checkout.c:68), whose
+    // `string_list_append(cb->remote_names, remote->name)` (checkout.c:44-45)
+    // keeps the configuration order the ambiguity hint lists them in.
+    for remote in super::fetch::remotes_in_config_order(repo) {
         let full = format!("refs/remotes/{remote}/{name}");
         // A name git could never have made a ref under is not a ref, and not an
         // error either: `check_refname_format()` rejects it, `dwim_ref()` — which
@@ -2520,20 +2525,19 @@ fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
             continue;
         }
         if repo.try_find_reference(full.as_str())?.is_some() {
-            matches.push(remote.into_owned());
+            matches.push(remote);
         }
     }
-    matches.sort();
     match matches.len() {
         0 => Ok(Dwim::None),
         1 => Ok(Dwim::One(format!("{}/{name}", matches[0]))),
-        n => {
+        _ => {
             if let Some(def) = default_remote {
                 if matches.contains(&def) {
                     return Ok(Dwim::One(format!("{def}/{name}")));
                 }
             }
-            Ok(Dwim::Many { count: n })
+            Ok(Dwim::Many { remotes: matches })
         }
     }
 }

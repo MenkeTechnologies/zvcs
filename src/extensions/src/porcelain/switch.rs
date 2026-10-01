@@ -67,13 +67,13 @@ use anyhow::{anyhow, Result};
 use crate::cstdio::{print, println};
 use std::process::ExitCode;
 
-use gix::bstr::{BStr, ByteSlice};
+use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 use gix::refs::{FullName, Target};
 
-use super::checkout::TreeIsh;
+use super::checkout::{unique_remote_branch, Dwim, TreeIsh};
 use super::{Arg, LongOpt};
 
 /// `cmd_switch()`'s option table (builtin/checkout.c:2148), in the order
@@ -750,10 +750,11 @@ fn switch_existing(
                         merge_style,
                     );
                 }
-                Dwim::Many { count } => {
-                    crate::advice::ambiguous_remote_branch_name(repo, "switch");
+                Dwim::Many { remotes } => {
+                    crate::advice::ambiguous_remote_branch_name(repo, "switch", branch, &remotes);
                     return fatal(format!(
-                        "'{branch}' matched multiple ({count}) remote tracking branches"
+                        "'{branch}' matched multiple ({}) remote tracking branches",
+                        remotes.len()
                     ));
                 }
                 Dwim::None => {}
@@ -1287,56 +1288,6 @@ fn switch_orphan(
 }
 
 // --- DWIM / tracking -------------------------------------------------------
-
-/// Result of resolving a bare name against the remote-tracking namespace.
-enum Dwim {
-    /// Exactly one remote has the branch; its short name (`<remote>/<branch>`).
-    One(String),
-    /// More than one remote has it — ambiguous.
-    Many { count: usize },
-    /// No remote has it.
-    None,
-}
-
-/// Find the remote-tracking branch a bare `<name>` should DWIM to: `refs/remotes/
-/// <remote>/<name>` across every configured remote.
-fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result<Dwim> {
-    // `unique_tracking_name()` (checkout.c:50-56) reads the key before looking at
-    // any remote, with `repo_config_get_string_tmp()`, which dies through
-    // `git_die_config()` on a valueless key.
-    let default_remote = crate::config::config_get_string(Some(repo), "checkout.defaultremote");
-    let mut matches: Vec<String> = Vec::new();
-    for remote in repo.remote_names() {
-        let remote = remote.to_str_lossy();
-        let full = format!("refs/remotes/{remote}/{name}");
-        // See the identical guard in `checkout::unique_remote_branch`: a name git
-        // could never have made a ref under is not a ref and not an error, and
-        // gix reports that rejection as an `Err` which must not propagate.
-        // `switch` reaches this with anything a caller typed, so without it a
-        // `.lock` argument dies here too.
-        if gix::validate::reference::name(BStr::new(full.as_bytes())).is_err() {
-            continue;
-        }
-        if repo.try_find_reference(full.as_str())?.is_some() {
-            matches.push(remote.into_owned());
-        }
-    }
-    matches.sort();
-    match matches.len() {
-        0 => Ok(Dwim::None),
-        1 => Ok(Dwim::One(format!("{}/{name}", matches[0]))),
-        n => {
-            // checkout.defaultRemote disambiguates: if it names one of the
-            // matching remotes, DWIM to that one instead of erroring.
-            if let Some(def) = default_remote {
-                if matches.contains(&def) {
-                    return Ok(Dwim::One(format!("{def}/{name}")));
-                }
-            }
-            Ok(Dwim::Many { count: n })
-        }
-    }
-}
 
 /// `opts->track` as `checkout_main()` hands it to `create_branch()`: the
 /// command-line value `parse_opt_tracking_mode()` stored (parse-options-cb.c:305-318

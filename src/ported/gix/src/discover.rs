@@ -147,6 +147,11 @@ impl ThreadSafeRepository {
         // `setup_explicit_git_dir()` (setup.c:1217, 1267), so the variable attaches a work tree to a
         // discovered repository — a bare one included.
         let work_tree_dir = std::env::var_os(Core::WORKTREE.the_environment_override()).map(std::path::PathBuf::from);
+        // This is setup's repository, so its object database honors `$GIT_OBJECT_DIRECTORY`
+        // (`odb_new(repo, ODB_NEW_HONOR_ENV)`, setup.c:2104, v2.56.0).
+        let mut trust_map = trust_map;
+        trust_map.full.honor_object_directory_env = true;
+        trust_map.reduced.honor_object_directory_env = true;
         Self::discover_opts_with_work_tree(directory, options, trust_map, work_tree_dir)
     }
 }

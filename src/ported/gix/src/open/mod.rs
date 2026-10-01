@@ -43,6 +43,12 @@ pub struct Options {
     /// (`setup.c:1142`) is set before `core.bare` and `core.worktree` are ever consulted — so neither
     /// may take it away again.
     pub(crate) work_tree_is_explicit: bool,
+    /// The repository is the one git's setup opens, whose object database is created with
+    /// `odb_new(repo, ODB_NEW_HONOR_ENV)` (`setup.c:1901`, `:2104`, v2.56.0): `$GIT_OBJECT_DIRECTORY`
+    /// then replaces `<common dir>/objects` as the primary source (`odb.c:1076-1080`). Every other
+    /// repository — a submodule's, another worktree's — goes through `repo_init()`'s
+    /// `odb_new(repo, 0)` (`repository.c:298`) and keeps its own `objects` directory.
+    pub(crate) honor_object_directory_env: bool,
     /// Internal to pass an already obtained CWD on to where it may also be used. This avoids the CWD being queried more than once per repo.
     pub(crate) current_dir: Option<PathBuf>,
 }

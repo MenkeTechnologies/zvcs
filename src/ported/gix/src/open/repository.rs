@@ -204,6 +204,7 @@ impl ThreadSafeRepository {
         options.git_dir_trust = git_dir_trust.into();
         options.implicit_work_tree = implicit_work_tree;
         options.work_tree_is_explicit = work_tree_is_explicit;
+        options.honor_object_directory_env = true;
         options.current_dir = Some(cwd);
         ThreadSafeRepository::open_from_paths(git_dir, worktree_dir, options)
     }
@@ -230,6 +231,7 @@ impl ThreadSafeRepository {
             open_path_as_is: _,
             implicit_work_tree,
             work_tree_is_explicit,
+            honor_object_directory_env,
             permissions:
                 Permissions {
                     ref env,
@@ -596,10 +598,16 @@ impl ThreadSafeRepository {
             None => None,
         };
         let replacements = replacements.unwrap_or_default();
+        let objects_dir = honor_object_directory_env
+            .then(|| object_directory_from_env(worktree_dir.as_deref(), current_dir))
+            .flatten()
+            .unwrap_or_else(|| common_dir_ref.join("objects"));
+        // Repositories spawned off this one (other worktrees) are `repo_init()`'s, not setup's.
+        options.honor_object_directory_env = false;
 
         Ok(ThreadSafeRepository {
             objects: OwnShared::new(gix_odb::Store::at_opts(
-                common_dir_ref.join("objects"),
+                objects_dir,
                 &mut replacements.into_iter(),
                 gix_odb::store::init::Options {
                     slots: object_store_slots,
@@ -626,6 +634,43 @@ impl ThreadSafeRepository {
             modules: gix_fs::SharedFileSnapshotMut::new().into(),
         })
     }
+}
+
+/// `$GIT_OBJECT_DIRECTORY` as the primary object source of setup's repository, or `None` when it
+/// is unset.
+///
+/// ```c
+/// if (flags & ODB_NEW_HONOR_ENV) {
+///         primary_source = xstrdup_or_null(getenv(DB_ENVIRONMENT));
+///         …
+/// }
+/// if (!primary_source)
+///         primary_source = xstrfmt("%s/objects", repo->commondir);
+/// ```
+///
+/// (`odb_new()`, odb.c:1076-1080, v2.56.0.) The value is used as written, so an existing but
+/// empty directory is an empty object database — not a reason to fall back to `objects`. An
+/// unusable value never gets here: `is_git_directory()`'s `access(X_OK)` probe (setup.c:431-433)
+/// has already refused every candidate repository.
+///
+/// A relative value is opened from wherever setup left the process, because `odb_new()` runs
+/// after setup's `chdir()`s (setup.c:2104). Those end at the top of the work tree when the
+/// current directory is inside it — `GIT_DIR_DISCOVERED` changes there before
+/// `repo_discover_implicit_gitdir()` (setup.c:1958), and `repo_discover_explicit_gitdir()` does the
+/// same for a `$GIT_DIR` whose work tree contains the current directory (setup.c:1221-1227) — and
+/// at the current directory in every other case: a bare repository and a work tree elsewhere both
+/// `chdir()` back to it (setup.c:1252, :1296). This port never changes directory, so the value is
+/// resolved against that directory instead.
+fn object_directory_from_env(worktree_dir: Option<&Path>, current_dir: &Path) -> Option<PathBuf> {
+    let value = PathBuf::from(std::env::var_os("GIT_OBJECT_DIRECTORY")?);
+    if value.is_absolute() {
+        return Some(value);
+    }
+    let base = worktree_dir
+        .and_then(|wt| gix_path::normalize(wt.into(), current_dir))
+        .filter(|wt| current_dir.starts_with(wt.as_ref()))
+        .map_or_else(|| current_dir.to_owned(), Cow::into_owned);
+    Some(base.join(value))
 }
 
 /// Return the worktree directory implied by the `core.worktree` value `wt_path` from repository-owned

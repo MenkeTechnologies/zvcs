@@ -223,8 +223,12 @@ impl Delegate<'_> {
         let repo = self.repo;
         for (r, obj) in self.refs.iter().zip(self.objs.iter_mut()) {
             if let (Some(ref_), obj_opt @ None) = (r, obj) {
+                // A symbolic ref is followed to the object its chain ends at, never peeled past it:
+                // `repo_dwim_ref()` (refs.c:794) answers with what `refs_resolve_ref_unsafe()` (refs.c:2113) read,
+                // in v2.56.0, and opens no object, so `HEAD` resolves even when the object it names is
+                // not in the object database — as a direct ref already does through `try_id()`.
                 if let Some(id) = ref_.target.try_id().map(ToOwned::to_owned).or_else(|| {
-                    match ref_.clone().attach(repo).peel_to_id() {
+                    match ref_.clone().attach(repo).follow_to_object() {
                         Err(err) => {
                             self.delayed_errors.push(
                                 err.raise()

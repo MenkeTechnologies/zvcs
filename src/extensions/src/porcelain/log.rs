@@ -3624,7 +3624,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // default goes through `get_oid_basic()` like any operand, which is where
         // `core.warnAmbiguousRefs` is read and where a `refs/heads/HEAD` next to
         // `HEAD` is warned about — ahead of the unborn-branch fatal below.
-        crate::objname::resolve(&repo, "HEAD");
+        let resolved = crate::objname::resolve(&repo, "HEAD");
         let head = repo.head()?;
         if head.is_unborn() && !all {
             let branch = head
@@ -3632,6 +3632,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 .map(|n| n.shorten().to_str_lossy().into_owned())
                 .unwrap_or_else(|| "master".to_owned());
             eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
+            return Ok(ExitCode::from(128));
+        }
+        // `object = get_reference(revs, revs->def, &oid, 0)` (revision.c:3169), whose
+        // `parse_object()` dies with `bad object HEAD` (revision.c:369) when the id
+        // `HEAD` resolved to is not in the object database.
+        if resolved.is_some_and(|id| repo.find_object(id).is_err()) {
+            eprintln!("fatal: bad object HEAD");
             return Ok(ExitCode::from(128));
         }
         if let Some(id) = repo.head()?.try_peel_to_id()? {

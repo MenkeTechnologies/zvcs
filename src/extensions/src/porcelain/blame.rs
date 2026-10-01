@@ -1990,31 +1990,54 @@ fn display_author(name: &gix::bstr::BStr, email: &gix::bstr::BStr, show_email: b
     }
 }
 
-/// Effective object-name width, following git: `-l` forces the full hash,
-/// otherwise `--abbrev`/`core.abbrev` applies and one extra digit is reserved so
-/// the boundary caret can take a slot without shrinking the column.
-fn object_name_width(repo: &gix::Repository, opts: &Options) -> usize {
+/// How many marker columns `print_marks()` (`builtin/blame.c:461-479`) spends on
+/// `line`: `^` for a boundary commit unless `-b` blanks it or annotate-compat
+/// suppresses it, `*` for an unblamable line under `blame.markUnblamableLines`,
+/// `?` for an ignored line under `blame.markIgnoredLines`. This is git's
+/// `count_marks()` (`builtin/blame.c:481-484`).
+fn count_marks(ci: &CommitInfo, line: &Line, opts: &Options) -> usize {
+    usize::from(ci.boundary && !opts.blank_boundary && !opts.annotate_compat)
+        + usize::from(opts.mark_unblamable_lines && line.unblamable)
+        + usize::from(opts.mark_ignored_lines && line.ignored)
+}
+
+/// Effective object-name width, following git 2.56: `-l` forces the full hash
+/// (`emit_other`, `builtin/blame.c:514-515`); otherwise `--abbrev`/`core.abbrev`
+/// applies, and `find_alignment()` (`builtin/blame.c:708-714`) widens a width
+/// below the hash length by the most marks any line carries, capped at the hash
+/// length. Before 2.56 one column was reserved for the boundary caret whether or
+/// not any line showed a mark.
+fn object_name_width(
+    repo: &gix::Repository,
+    lines: &[Line],
+    info: &HashMap<ObjectId, CommitInfo>,
+    opts: &Options,
+) -> usize {
     let hexsz = repo.object_hash().len_in_hex();
-    let mut width = if opts.long {
-        hexsz
-    } else {
-        match opts.abbrev {
-            // `--abbrev=0` means "no abbreviation" to git.
-            Some(0) => hexsz,
-            // `parse_abbrev_cb` has already applied git's `MINIMUM_ABBREV` floor.
-            // There is deliberately no ceiling: `cmd_blame` only adds the boundary
-            // column when `abbrev < hexsz`, and `emit_other`'s `%.*s` then prints
-            // however much of the hash the budget covers. So `--abbrev=40` spends a
-            // column on `^` and shows 39 digits, while `--abbrev=41` and up show all
-            // 40 — a ceiling here would collapse the two.
-            Some(n) => n,
-            None => configured_abbrev(repo, hexsz).clamp(MINIMUM_ABBREV, hexsz),
-        }
-    };
-    if width < hexsz {
-        width += 1;
+    if opts.long {
+        return hexsz;
     }
-    width
+    let width = match opts.abbrev {
+        // `--abbrev=0` means "no abbreviation" to git (`builtin/blame.c:1077-1078`).
+        Some(0) => hexsz,
+        // `parse_abbrev_cb` has already applied git's `MINIMUM_ABBREV` floor.
+        // There is deliberately no ceiling: `find_alignment` only adds the marks
+        // when `abbrev < hexsz`, and `emit_other`'s `%.*s` then prints however
+        // much of the hash the budget covers. So `--abbrev=40` spends a column on
+        // `^` and shows 39 digits, while `--abbrev=41` and up show all 40 — a
+        // ceiling here would collapse the two.
+        Some(n) => n,
+        None => configured_abbrev(repo, hexsz).clamp(MINIMUM_ABBREV, hexsz),
+    };
+    if width >= hexsz {
+        return width;
+    }
+    let max_marks = lines
+        .iter()
+        .map(|line| count_marks(&info[&line.commit_id], line, opts))
+        .max()
+        .unwrap_or(0);
+    (width + max_marks).min(hexsz)
 }
 
 /// Emit the object-name column into `buf`, following git's `emit_other`, which
@@ -2112,7 +2135,7 @@ fn emit_human(
     colors: &BlameColors,
     refcounts: &std::collections::BTreeMap<(ObjectId, Option<Vec<u8>>), u32>,
 ) -> Result<ExitCode> {
-    let name_width = object_name_width(repo, opts);
+    let name_width = object_name_width(repo, lines, info, opts);
 
     if opts.annotate_compat {
         return emit_annotate_compat(lines, info, name_width, opts);

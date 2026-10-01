@@ -3551,6 +3551,15 @@ fn explicit_gitdir_string(
     }
 }
 
+/// `is_bare_repository_cfg > 0` — `format.is_bare` in 2.56's discovery: `core.bare`,
+/// or `git --bare` (git.c:258) when the config does not say.
+fn discovered_bare_cfg(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .boolean("core.bare")
+        .or(gix::open::bare_repository_cfg().then_some(true))
+        == Some(true)
+}
+
 /// The work tree `setup_explicit_git_dir()` installs before it decides how to
 /// store the git directory (`setup.c:1160-1196`), in its own order:
 /// `$GIT_WORK_TREE`, then `core.bare`, then `core.worktree`, then
@@ -3573,12 +3582,10 @@ fn explicit_work_tree(
         // there.
         return Some(std::fs::canonicalize(&joined).unwrap_or(joined));
     }
-    let config = repo.config_snapshot();
-    // `is_bare_repository_cfg > 0`: `core.bare`, or `git --bare` (git.c:258)
-    // when the config does not say.
-    if config.boolean("core.bare").or(gix::open::bare_repository_cfg().then_some(true)) == Some(true) {
+    if discovered_bare_cfg(repo) {
         return None;
     }
+    let config = repo.config_snapshot();
     if let Some(value) = config.string("core.worktree") {
         let value = std::path::PathBuf::from(std::ffi::OsString::from(value.to_string()));
         let base = if gitdir.is_absolute() { gitdir.to_path_buf() } else { cwd.join(gitdir) };
@@ -3628,6 +3635,23 @@ fn discovered_gitdir_string(
         Some(root) if dot_git && !inside_git_dir && cwd.starts_with(&root) => {
             let climbed = cwd != root;
             let has_work_tree_override = work_tree_override(repo);
+            // A `.git` whose own config says `core.bare = true` takes the bare arm
+            // of `repo_discover_implicit_gitdir()` instead (`setup.c:1260-1265`):
+            //
+            // ```c
+            // if (discovery->format.is_bare > 0) {
+            //         repo_discovery_set_gitdir(discovery, gitdir, (offset != cwd->len));
+            //         if (chdir(cwd->buf)) die_errno(…);
+            //         return;
+            // }
+            // ```
+            //
+            // No work tree and no prefix, and the git directory *is* set — and
+            // exported as `$GIT_DIR` — so the field and `--git-dir` both read
+            // `.git` at the top and the realpath once the walk climbed.
+            if !has_work_tree_override && discovered_bare_cfg(repo) {
+                return if climbed { absolute(&root.join(".git")) } else { ".git".into() };
+            }
             // With a work-tree override the C realpaths the discovered name before
             // handing over — `if (offset != cwd->len && !is_absolute_path(gitdir))
             // gitdir = real_pathdup(gitdir, 1);` (`setup.c:1221-1222`) — and

@@ -15,7 +15,7 @@ const RESET: &str = "\x1b[m";
 
 /// The exact usage block stock git prints for an option-parsing error,
 /// reproduced verbatim so `--list --show-current` and friends match byte for byte.
-pub(super) const USAGE: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged]
+pub(super) const USAGE: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged] [(--forked <branch>)...]
    or: git branch [<options>] [-f] [--recurse-submodules] <branch-name> [<start-point>]
    or: git branch [<options>] [-l] [<pattern>...]
    or: git branch [<options>] [-r] (-d | -D) <branch-name>...
@@ -23,6 +23,7 @@ pub(super) const USAGE: &str = r#"usage: git branch [<options>] [-r | -a] [--mer
    or: git branch [<options>] (-c | -C) [<old-branch>] <new-branch>
    or: git branch [<options>] [-r | -a] [--points-at]
    or: git branch [<options>] [-r | -a] [--format]
+   or: git branch [<options>] (--delete-merged <pattern>)... [<branch-pattern>...]
 
 Generic options
     -v, --[no-]verbose    show hash and subject, give twice for upstream branch
@@ -53,9 +54,13 @@ Specific git-branch actions:
     --[no-]create-reflog  create the branch's reflog
     --[no-]edit-description
                           edit the description for the branch
+    --delete-merged <pattern>
+                          delete merged branches whose upstream matches <pattern> (repeatable)
+    --[no-]dry-run        with --delete-merged, only print which branches would be deleted
     -f, --[no-]force      force creation, move/rename, deletion
     --merged <commit>     print only branches that are merged
     --no-merged <commit>  print only branches that are not merged
+    --forked <branch>     print only branches whose upstream matches <branch> (repeatable)
     --[no-]column[=<style>]
                           list branches in columns
     --[no-]sort <key>     field name to sort on
@@ -73,8 +78,8 @@ Specific git-branch actions:
 /// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
 /// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
 /// `--[no-]set-upstream`, `--with`, `--without`.
-/// Captured byte-for-byte from stock git 2.55.0's `git branch --help-all`.
-pub(super) const USAGE_ALL: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged]
+/// Captured byte-for-byte from stock git 2.56.0's `git branch --help-all`.
+pub(super) const USAGE_ALL: &str = r#"usage: git branch [<options>] [-r | -a] [--merged] [--no-merged] [(--forked <branch>)...]
    or: git branch [<options>] [-f] [--recurse-submodules] <branch-name> [<start-point>]
    or: git branch [<options>] [-l] [<pattern>...]
    or: git branch [<options>] [-r] (-d | -D) <branch-name>...
@@ -82,6 +87,7 @@ pub(super) const USAGE_ALL: &str = r#"usage: git branch [<options>] [-r | -a] [-
    or: git branch [<options>] (-c | -C) [<old-branch>] <new-branch>
    or: git branch [<options>] [-r | -a] [--points-at]
    or: git branch [<options>] [-r | -a] [--format]
+   or: git branch [<options>] (--delete-merged <pattern>)... [<branch-pattern>...]
 
 Generic options
     -v, --[no-]verbose    show hash and subject, give twice for upstream branch
@@ -115,9 +121,13 @@ Specific git-branch actions:
     --[no-]create-reflog  create the branch's reflog
     --[no-]edit-description
                           edit the description for the branch
+    --delete-merged <pattern>
+                          delete merged branches whose upstream matches <pattern> (repeatable)
+    --[no-]dry-run        with --delete-merged, only print which branches would be deleted
     -f, --[no-]force      force creation, move/rename, deletion
     --merged <commit>     print only branches that are merged
     --no-merged <commit>  print only branches that are not merged
+    --forked <branch>     print only branches whose upstream matches <branch> (repeatable)
     --[no-]column[=<style>]
                           list branches in columns
     --[no-]sort <key>     field name to sort on
@@ -232,9 +242,12 @@ const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "show-current", neg: true, arg: Arg::None },
     LongOpt { name: "create-reflog", neg: true, arg: Arg::None },
     LongOpt { name: "edit-description", neg: true, arg: Arg::None },
+    LongOpt { name: "delete-merged", neg: false, arg: Arg::Required },
+    LongOpt { name: "dry-run", neg: true, arg: Arg::None },
     LongOpt { name: "force", neg: true, arg: Arg::None },
     LongOpt { name: "merged", neg: false, arg: Arg::LastArg },
     LongOpt { name: "no-merged", neg: false, arg: Arg::LastArg },
+    LongOpt { name: "forked", neg: false, arg: Arg::Required },
     LongOpt { name: "column", neg: true, arg: Arg::Optional },
     LongOpt { name: "sort", neg: true, arg: Arg::Required },
     LongOpt { name: "points-at", neg: true, arg: Arg::Required },
@@ -636,6 +649,14 @@ struct Opts {
     create_reflog: bool,
     edit_description: bool,
     track: Track,
+    /// `--delete-merged <pattern>` values (`parse_opt_strvec`), in order; any
+    /// at all selects the action.
+    delete_merged: Vec<String>,
+    /// `--dry-run`, which only `--delete-merged` accepts.
+    dry_run: bool,
+    /// `--forked <branch>` (`parse_opt_forked()`), each already passed through
+    /// [`ref_filter::forked_add`] at parse time.
+    forked: Vec<String>,
     /// `-u <up>` / `--set-upstream-to=<up>`: the upstream spec to install.
     set_upstream_to: Option<String>,
     unset_upstream: bool,
@@ -687,6 +708,7 @@ impl Opts {
             || !self.merged.is_empty()
             || !self.no_merged.is_empty()
             || !self.points_at.is_empty()
+            || !self.forked.is_empty()
     }
 }
 
@@ -764,8 +786,10 @@ impl Filters {
 /// the non-creation actions) and then says it is not ported, rather than
 /// claiming the flag is unknown.
 ///
-/// The merge check for `-d` uses reachability from HEAD only (not a configured
-/// upstream), which is git's behavior when no upstream is set.
+/// `-d` judges a branch against its upstream when it has one and against HEAD
+/// otherwise (`branch_merged()`), warning when the two disagree.
+/// `--delete-merged <pattern>` deletes the merged branches whose upstream
+/// matches, and `--forked <branch>` lists only those.
 pub fn branch(args: &[String]) -> Result<ExitCode> {
     let mut o = Opts {
         mode: ListMode::Local,
@@ -784,6 +808,9 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         create_reflog: false,
         edit_description: false,
         track: Track::Unset,
+        delete_merged: Vec::new(),
+        dry_run: false,
+        forked: Vec::new(),
         set_upstream_to: None,
         unset_upstream: false,
         color: None,
@@ -980,7 +1007,8 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         || !o.no_contains.is_empty()
         || !o.merged.is_empty()
         || !o.no_merged.is_empty()
-        || !o.points_at.is_empty();
+        || !o.points_at.is_empty()
+        || !o.forked.is_empty();
     let actions = [
         o.delete,
         o.rename,
@@ -990,12 +1018,17 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         listing,
         o.edit_description,
         o.unset_upstream,
+        !o.delete_merged.is_empty(),
     ]
     .into_iter()
     .filter(|&on| on)
     .count();
     if actions > 1 {
         return usage_exit();
+    }
+    // builtin/branch.c:1099-1100.
+    if o.dry_run && o.delete_merged.is_empty() {
+        return fatal("--dry-run requires --delete-merged");
     }
 
     // Resolve `auto` against the terminal (git's `finalize_colopts(&colopts, -1)`),
@@ -1056,7 +1089,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     if o.delete && !o.names.is_empty() && o.mode == ListMode::All {
         return fatal("cannot use -a with -d");
     }
-    if !o.names.is_empty() && !listing && !o.show_current {
+    if !o.names.is_empty() && !listing && !o.show_current && o.delete_merged.is_empty() {
         let allowed = match o.delete && o.mode == ListMode::Remotes {
             true => Interpret::Remote,
             false => Interpret::Local,
@@ -1086,7 +1119,25 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         return copy_branch(&repo, &o);
     }
     if o.delete {
-        return delete_branches(&repo, &o);
+        // `delete_branches(argc, argv, filter.kind, (delete > 1 ? DELETE_BRANCH_FORCE
+        // : 0) | (quiet ? DELETE_BRANCH_QUIET : 0))` (builtin/branch.c:1133-1139).
+        if o.names.is_empty() {
+            return fatal("branch name required");
+        }
+        let flags = DeleteFlags {
+            force: o.force,
+            quiet: o.quiet,
+            ..DeleteFlags::default()
+        };
+        return delete_branches(&repo, &o.names, o.mode == ListMode::Remotes, flags);
+    }
+    if !o.delete_merged.is_empty() {
+        let flags = DeleteFlags {
+            quiet: o.quiet,
+            dry_run: o.dry_run,
+            ..DeleteFlags::default()
+        };
+        return delete_merged_branches(&repo, &o.delete_merged, &o.names, flags);
     }
     if o.edit_description {
         return edit_description(&repo, &o);
@@ -1280,6 +1331,20 @@ fn apply_long(
         ("show-current", n) => o.show_current = !n,
         ("create-reflog", n) => o.create_reflog = !n,
         ("edit-description", n) => o.edit_description = !n,
+        ("delete-merged", false) => o.delete_merged.push(val()),
+        ("dry-run", n) => o.dry_run = !n,
+        // `parse_opt_forked()` (builtin/branch.c:711-719) resolves while argv is
+        // still being parsed, so its `die()` outranks every later check.
+        ("forked", false) => {
+            let arg = val();
+            let repo = crate::setup::discover()?;
+            match ref_filter::forked_add(&repo, &arg) {
+                Some(pattern) => o.forked.push(pattern),
+                None => {
+                    return fatal(format!("'{arg}' is not a valid branch or pattern")).map(Some)
+                }
+            }
+        }
         ("force", n) => o.force = !n,
         ("ignore-case", n) => o.ignore_case = !n,
         ("recurse-submodules", n) => o.recurse_submodules = !n,
@@ -1775,6 +1840,7 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         // `filter.verbose = !!verbose` (builtin/branch.c), which is what makes `-v` drop a branch
         // whose object is missing while a plain listing still names it.
         verbose: o.verbose > 0,
+        forked: o.forked.clone(),
     };
 
     let lines = match ref_filter::filter_and_format(&spec)? {
@@ -3942,84 +4008,204 @@ fn write_config(path: &std::path::Path, file: &ConfigFile) -> Result<()> {
     Ok(())
 }
 
-/// Delete one or more local branches. Without `-D`, a branch not reachable from
-/// HEAD (not fully merged) is refused. The currently checked-out branch cannot
-/// be deleted. Successfully deleted branches are reported as
-/// `Deleted branch <name> (was <abbrev>).` unless `-q`; git stops at the first
-/// failure with exit 1, leaving earlier deletions committed.
-fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
-    if o.names.is_empty() {
-        return fatal("branch name required");
-    }
+/// `enum delete_branch_flags` (builtin/branch.c:198-204).
+#[derive(Clone, Copy, Default)]
+struct DeleteFlags {
+    /// `DELETE_BRANCH_FORCE`: `-D`, and every `-r` deletion.
+    force: bool,
+    /// `DELETE_BRANCH_QUIET`: `-q`.
+    quiet: bool,
+    /// `DELETE_BRANCH_SKIP_UNMERGED`: an unmerged branch is passed over
+    /// without a diagnostic and without failing the command.
+    skip_unmerged: bool,
+    /// `DELETE_BRANCH_NO_HEAD_FALLBACK`: `head_rev` stays NULL, so a branch is
+    /// judged against its upstream alone.
+    no_head_fallback: bool,
+    /// `DELETE_BRANCH_DRY_RUN`: report, delete nothing.
+    dry_run: bool,
+}
 
+/// `repo_in_merge_bases(rev, reference)`: is `rev` reachable from `reference`.
+fn in_merge_bases(repo: &gix::Repository, rev: ObjectId, reference: ObjectId) -> bool {
+    match repo.merge_base(rev, reference) {
+        Ok(base) => base.detach() == rev,
+        Err(_) => false,
+    }
+}
+
+/// `lookup_commit_reference()`: the commit `id` peels to, printing git's
+/// `object %s is a %s, not a commit` for anything else.
+fn commit_of_id(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
+    match crate::objname::lookup_commit_reference(repo, id) {
+        crate::objname::CommitRef::Commit(commit) => Some(commit),
+        found => {
+            if let Some(note) = found.type_error() {
+                eprintln!("error: {note}");
+            }
+            None
+        }
+    }
+}
+
+/// `branch_merged()` (builtin/branch.c:135-196): whether `rev` is merged into
+/// the branch's upstream when it has one that resolves to a commit, else into
+/// `head_rev`. When both a resolvable upstream and `head_rev` exist and they
+/// disagree, the transition-period warning names the upstream.
+fn branch_merged(
+    repo: &gix::Repository,
+    remote_branch: bool,
+    name: &str,
+    rev: ObjectId,
+    head_rev: Option<ObjectId>,
+) -> bool {
+    let mut reference: Option<(String, ObjectId)> = None;
+    if !remote_branch {
+        let full = format!("refs/heads/{name}");
+        // `refs_resolve_refdup(upstream, RESOLVE_REF_READING, &oid, NULL)` —
+        // the name it returns is the one symbolic refs resolved to.
+        if let Some(upstream) = upstream_ref(repo, BStr::new(full.as_bytes())) {
+            if let Ok(Some(mut r)) = repo.try_find_reference(upstream.as_ref()) {
+                if let Ok(id) = r.follow_to_object() {
+                    let resolved = match r.target().try_name() {
+                        Some(n) => n.as_bstr().to_str_lossy().into_owned(),
+                        None => r.name().as_bstr().to_str_lossy().into_owned(),
+                    };
+                    if let Some(commit) = commit_of_id(repo, id.detach()) {
+                        reference = Some((resolved, commit));
+                    }
+                }
+            }
+        }
+    }
+    let reference_rev = reference.as_ref().map(|(_, id)| *id).or(head_rev);
+    let merged = reference_rev.is_some_and(|r| in_merge_bases(repo, rev, r));
+
+    if let (Some(head), Some((reference_name, reference_id))) = (head_rev, &reference) {
+        if head != *reference_id {
+            let expect = in_merge_bases(repo, rev, head);
+            if expect != merged {
+                if merged {
+                    eprintln!(
+                        "warning: deleting branch '{name}' that has been merged to\n         \
+                         '{reference_name}', but not yet merged to HEAD"
+                    );
+                } else {
+                    eprintln!(
+                        "warning: not deleting branch '{name}' that is not yet merged to\n         \
+                         '{reference_name}', even though it is merged to HEAD"
+                    );
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// `check_branch_commit()` (builtin/branch.c:206-227): `true` when the branch
+/// may be deleted.
+fn check_branch_commit(
+    repo: &gix::Repository,
+    branchname: &str,
+    refname: &str,
+    id: ObjectId,
+    head_rev: Option<ObjectId>,
+    remote_branch: bool,
+    flags: DeleteFlags,
+) -> bool {
+    if flags.force {
+        return true;
+    }
+    let Some(rev) = commit_of_id(repo, id) else {
+        eprintln!("error: couldn't look up commit object for '{refname}'");
+        return false;
+    };
+    if !branch_merged(repo, remote_branch, branchname, rev, head_rev) {
+        if !flags.skip_unmerged {
+            eprintln!("error: the branch '{branchname}' is not fully merged");
+            crate::advice::Advice::ForceDeleteBranch.advise_in(
+                repo,
+                &format!("If you are sure you want to delete it, run 'git branch -D {branchname}'"),
+            );
+        }
+        return false;
+    }
+    true
+}
+
+/// `delete_branches()` (builtin/branch.c:238-383): refuse what a worktree
+/// holds or what is missing or unmerged, reporting each as it is met; then
+/// delete every survivor in one `refs_delete_refs()` and report those — so all
+/// the refusals precede all the `Deleted branch` lines. `names` are already
+/// `copy_branchname()`-interpreted.
+fn delete_branches(
+    repo: &gix::Repository,
+    names: &[String],
+    remote_branch: bool,
+    mut flags: DeleteFlags,
+) -> Result<ExitCode> {
     // Serialize all deletions through the repo coordinator, held across the loop.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    // ```c
-    // switch (kinds) {
-    // case FILTER_REFS_REMOTES:
-    //         fmt = "refs/remotes/%s";
-    //         remote_branch = 1;
-    //         force = 1;
-    //         break;
-    // case FILTER_REFS_BRANCHES:
-    //         fmt = "refs/heads/%s";
-    // ```
-    // (builtin/branch.c.) `-r` deletes remote-tracking refs, and force is implied there: a
-    // remote-tracking branch has no upstream of its own to be "not fully merged" with.
-    let remote_branch = o.mode == ListMode::Remotes;
-    let force = o.force || remote_branch;
-    let kind_word = if remote_branch { "remote-tracking branch" } else { "branch" };
-    // git reports each failure and carries on to the next operand (`ret = 1; continue;`), so one
-    // missing name does not hide the deletion of the ones that follow it.
-    let mut status = ExitCode::SUCCESS;
+    // `case FILTER_REFS_REMOTES: … flags |= DELETE_BRANCH_FORCE;` — a
+    // remote-tracking branch has no upstream of its own to be merged into.
+    if remote_branch {
+        flags.force = true;
+    }
+    let prefix = if remote_branch { "refs/remotes/" } else { "refs/heads/" };
+    let head_rev = match flags.force || flags.no_head_fallback {
+        true => None,
+        false => repo.head_id().ok().and_then(|id| commit_of_id(repo, id.detach())),
+    };
+    let mut ret = ExitCode::SUCCESS;
+    // `refs_to_delete`: the full name and its `(was …)` description.
+    let mut to_delete: Vec<(String, String)> = Vec::new();
 
-    for name in &o.names {
-        let full = match remote_branch {
-            true => format!("refs/remotes/{name}"),
-            false => format!("refs/heads/{name}"),
-        };
+    for bname in names {
+        let full = format!("{prefix}{bname}");
 
-        // `delete_branches()` (builtin/branch.c) refuses when `branch_checked_out(name)`
-        // names a worktree: any worktree's `HEAD`, not just this one's, and the branch an
-        // interrupted rebase or bisect will return to as well. A bare worktree contributes
-        // nothing to that map — a bare repository's `HEAD` is a default for future clones,
-        // not a checkout — so deleting the branch it names is allowed. That is the one way
-        // `branch -d` reaches the deletion-of-`HEAD`'s referent path, where
-        // `split_head_update()` then logs `<old> <null>` into `logs/HEAD` with no message —
-        // `refs_delete_refs()` is called with a null `logmsg`.
-        //
-        // The reported path is the worktree's, which git derives absolutely from the common
-        // dir; `repo.workdir()` is relative whenever the repository was discovered from the
-        // current directory, and printed `.` or `../..` where git prints the checkout's
-        // full path.
-        // `if (kinds == FILTER_REFS_BRANCHES)`: the check is on local branches only, since no
-        // worktree's `HEAD` can be on a remote-tracking ref.
+        // `if (kinds == FILTER_REFS_BRANCHES)`: no worktree's `HEAD` can be on a
+        // remote-tracking ref. A bare worktree contributes nothing, so deleting
+        // the branch a bare repository's `HEAD` names is allowed.
         if !remote_branch {
-            if let Some(path) = super::worktree::branch_checked_out(repo, &full)? {
-                error_exit(format!(
-                    "cannot delete branch '{name}' used by worktree at '{}'",
+            // 2.56 (builtin/branch.c:287-294): a branch an active bisect started
+            // from is reported as such, ahead of the generic refusal.
+            if let Some(path) = super::worktree::branch_bisecting(repo, &full)? {
+                eprintln!(
+                    "error: cannot delete branch '{bname}' used by worktree at '{}' for bisect",
                     super::worktree::path_to_string(&path)
-                ))?;
-                status = ExitCode::from(1);
+                );
+                ret = ExitCode::from(1);
+                continue;
+            }
+            if let Some(path) = super::worktree::branch_checked_out(repo, &full)? {
+                eprintln!(
+                    "error: cannot delete branch '{bname}' used by worktree at '{}'",
+                    super::worktree::path_to_string(&path)
+                );
+                ret = ExitCode::from(1);
                 continue;
             }
         }
 
-        // `refs_resolve_ref_unsafe(..., RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE |
-        // RESOLVE_REF_ALLOW_BAD_NAME, &oid, &flags)`: the ref's *recorded* value, with no
-        // dereference and no object read. A branch pointing at an object that is not in the
-        // repository is still deletable, which is most of the reason `-D` exists.
-        // `RESOLVE_REF_ALLOW_BAD_NAME` also means a name git would never *write*
-        // still gets a lookup rather than a syntax complaint, so an operand an
-        // `@{…}` rewrite declined to touch — `git branch -D @{upstream}` when
-        // the upstream is a remote-tracking ref — is reported as the ordinary
-        // "not found" at exit 1, not as a ref-name error.
+        // `refs_resolve_refdup(..., RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE |
+        // RESOLVE_REF_ALLOW_BAD_NAME, &oid, &ref_flags)`: the recorded value, no
+        // dereference, no object read — a branch at a missing object is still
+        // deletable, which is most of the reason `-D` exists.
         let reference = match repo.try_find_reference(full.as_str()) {
             Ok(Some(r)) => r,
             Ok(None) | Err(_) => {
-                error_exit(format!("{kind_word} '{name}' not found"))?;
-                status = ExitCode::from(1);
+                if remote_branch {
+                    eprintln!("error: remote-tracking branch '{bname}' not found");
+                } else {
+                    let virtual_name = format!("refs/remotes/{bname}");
+                    match repo.try_find_reference(virtual_name.as_str()) {
+                        Ok(Some(_)) => {
+                            eprintln!("error: branch '{bname}' not found.\nDid you forget --remote?")
+                        }
+                        _ => eprintln!("error: branch '{bname}' not found"),
+                    }
+                }
+                ret = ExitCode::from(1);
                 continue;
             }
         };
@@ -4029,13 +4215,13 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             .map(|n| n.as_bstr().to_str_lossy().into_owned());
         let recorded = reference.target().try_id().map(ToOwned::to_owned);
 
-        // `(flags & REF_ISBROKEN) ? "broken" : (flags & REF_ISSYMREF) ? target : find_unique_abbrev()`
-        // — the three spellings of `(was …)`.
+        // `(ref_flags & REF_ISBROKEN) ? "broken" : (ref_flags & REF_ISSYMREF) ?
+        // target : repo_find_unique_abbrev()` — the three spellings of `(was …)`.
         let (was, tip) = match (&symref_target, recorded) {
             (Some(target), _) => (target.clone(), None),
             (None, Some(id)) => {
-                // `find_unique_abbrev()` on an id whose object is absent still answers: the
-                // default length, no disambiguation pass.
+                // `find_unique_abbrev()` on an id whose object is absent still
+                // answers: the default length, no disambiguation pass.
                 let abbrev = {
                     use gix::prelude::ObjectIdExt as _;
                     id.attach(repo)
@@ -4048,64 +4234,385 @@ fn delete_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             (None, None) => ("broken".to_string(), None),
         };
 
-        // `if (!(flags & (REF_ISSYMREF|REF_ISBROKEN)) && check_branch_commit(...))`: the
-        // merged-into-HEAD test needs a commit, so a symbolic or broken ref skips it.
-        if !force && tip.is_some() {
-            let tip = tip.expect("checked");
-            let merged = match repo.head_id() {
-                Ok(head_id) => match repo.merge_base(tip, head_id.detach()) {
-                    Ok(base) => base.detach() == tip,
-                    Err(_) => false, // no common ancestor → not merged
-                },
-                Err(_) => false, // unborn HEAD → nothing merged into
-            };
-            if !merged {
-                error_exit(format!("the branch '{name}' is not fully merged"))?;
-                crate::advice::Advice::ForceDeleteBranch.advise_in(
-                    repo,
-                    &format!("If you are sure you want to delete it, run 'git branch -D {name}'"),
-                );
-                status = ExitCode::from(1);
+        // `if (!(ref_flags & (REF_ISSYMREF|REF_ISBROKEN)) && check_branch_commit(...))`.
+        if let Some(tip) = tip {
+            if !check_branch_commit(repo, bname, &full, tip, head_rev, remote_branch, flags) {
+                if !flags.skip_unmerged {
+                    ret = ExitCode::from(1);
+                }
                 continue;
             }
         }
+        to_delete.push((full, was));
+    }
 
-        let name_full: FullName = full
-            .as_str()
-            .try_into()
-            .map_err(|e| anyhow!("invalid branch name '{name}': {e}"))?;
-        repo.edit_reference(RefEdit {
-            change: Change::Delete {
-                expected: PreviousValue::Any,
-                log: RefLog::AndReference,
-                message: Default::default(),
-            },
-            name: name_full,
-            deref: false,
-        })?;
-
-        // ```c
-        // strbuf_addf(&buf, "branch.%s", bname.buf);
-        // if (repo_config_rename_section(the_repository, buf.buf, NULL) < 0)
-        //         warning(_("Update of config-file failed"));
-        // ```
-        //
-        // (`delete_branches()`, builtin/branch.c.) A deleted branch takes its
-        // `branch.<name>.*` configuration with it — the upstream a `--track`
-        // create wrote, any `branch.<name>.rebase`, everything in the subsection —
-        // so the name is free of stale tracking data if it is ever recreated. The
-        // section name is the branch's *short* name, and this happens for remote
-        // -tracking branches too, where there is simply nothing to remove.
-        remove_branch_config(repo, &name)?;
-
-        if !o.quiet {
-            // `printf(remote_branch ? _("Deleted remote-tracking branch %s (was %s).\n") : …)`.
-            let what = if remote_branch { "remote-tracking branch" } else { "branch" };
-            println!("Deleted {what} {name} (was {was}).");
+    // `refs_delete_refs(…, REF_NO_DEREF)` with a NULL log message: one
+    // transaction for the lot.
+    if !flags.dry_run && !to_delete.is_empty() {
+        let mut edits = Vec::with_capacity(to_delete.len());
+        for (full, _) in &to_delete {
+            let name: FullName = full
+                .as_str()
+                .try_into()
+                .map_err(|e| anyhow!("invalid branch name '{full}': {e}"))?;
+            edits.push(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::Any,
+                    log: RefLog::AndReference,
+                    message: Default::default(),
+                },
+                name,
+                deref: false,
+            });
+        }
+        if let Err(e) = repo.edit_references(edits) {
+            match to_delete.as_slice() {
+                [(only, _)] => eprintln!("error: could not delete reference {only}: {e}"),
+                _ => eprintln!("error: could not delete references: {e}"),
+            }
+            ret = ExitCode::from(1);
         }
     }
 
-    Ok(status)
+    let what = if remote_branch { "remote-tracking branch" } else { "branch" };
+    for (full, was) in &to_delete {
+        let short = &full[prefix.len()..];
+        if flags.dry_run {
+            if !flags.quiet {
+                println!("Would delete {what} {short} (was {was}).");
+            }
+        } else if !matches!(repo.try_find_reference(full.as_str()), Ok(Some(_))) {
+            if !flags.quiet {
+                println!("Deleted {what} {short} (was {was}).");
+            }
+            // `delete_branch_config()`: `repo_config_rename_section("branch.<name>",
+            // NULL)` — the deleted branch takes its whole subsection with it.
+            remove_branch_config(repo, short)?;
+        }
+    }
+
+    Ok(ret)
+}
+
+/// `struct strset` iteration order — a port of `hashmap.c` keyed by
+/// `strhash()`: entries are prepended to their bucket's chain, the table starts
+/// at 64 buckets, grows 4x once the count passes 80% of the size, shrinks 4x
+/// when it drops under `grow_at / 5` (never below 64), and iteration walks the
+/// buckets in index order, each chain from its head.
+///
+/// `--delete-merged` collects its victims in a `strset` and hands them to
+/// `delete_branches()` in this order, so it is the order of the report lines.
+struct StrSet {
+    table: Vec<Vec<(u32, String)>>,
+    size: usize,
+}
+
+impl StrSet {
+    const INITIAL_SIZE: usize = 64;
+    const RESIZE_BITS: u32 = 2;
+    const LOAD_FACTOR: usize = 80;
+
+    fn new() -> Self {
+        StrSet {
+            table: vec![Vec::new(); Self::INITIAL_SIZE],
+            size: 0,
+        }
+    }
+
+    /// `strhash()`: FNV-1 over the bytes.
+    fn hash(s: &str) -> u32 {
+        s.bytes()
+            .fold(0x811c_9dc5u32, |h, c| h.wrapping_mul(0x0100_0193) ^ u32::from(c))
+    }
+
+    fn grow_at(&self) -> usize {
+        self.table.len() * Self::LOAD_FACTOR / 100
+    }
+
+    fn shrink_at(&self) -> usize {
+        match self.table.len() <= Self::INITIAL_SIZE {
+            true => 0,
+            false => self.grow_at() / ((1 << Self::RESIZE_BITS) + 1),
+        }
+    }
+
+    fn bucket(&self, hash: u32) -> usize {
+        (hash as usize) & (self.table.len() - 1)
+    }
+
+    /// `rehash()`: old buckets in order, each chain from its head, every entry
+    /// prepended to its new bucket.
+    fn rehash(&mut self, newsize: usize) {
+        let old = std::mem::replace(&mut self.table, vec![Vec::new(); newsize]);
+        for chain in old {
+            for entry in chain {
+                let b = self.bucket(entry.0);
+                self.table[b].insert(0, entry);
+            }
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        let h = Self::hash(key);
+        self.table[self.bucket(h)].iter().any(|(eh, k)| *eh == h && k == key)
+    }
+
+    /// `strset_add()`: `false` when the key was already present.
+    fn add(&mut self, key: &str) -> bool {
+        if self.contains(key) {
+            return false;
+        }
+        let h = Self::hash(key);
+        let b = self.bucket(h);
+        self.table[b].insert(0, (h, key.to_string()));
+        self.size += 1;
+        if self.size > self.grow_at() {
+            self.rehash(self.table.len() << Self::RESIZE_BITS);
+        }
+        true
+    }
+
+    /// `strset_remove()`.
+    fn remove(&mut self, key: &str) {
+        let h = Self::hash(key);
+        let b = self.bucket(h);
+        let Some(at) = self.table[b].iter().position(|(eh, k)| *eh == h && k == key) else {
+            return;
+        };
+        self.table[b].remove(at);
+        self.size -= 1;
+        if self.size < self.shrink_at() {
+            self.rehash(self.table.len() >> Self::RESIZE_BITS);
+        }
+    }
+
+    /// `strset_for_each_entry()`.
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.table.iter().flat_map(|chain| chain.iter().map(|(_, k)| k.as_str()))
+    }
+}
+
+/// `branch_pushes_to_upstream()` (builtin/branch.c:800-822): whether pushing
+/// `branch` lands on the very remote-tracking ref it tracks — the remote's
+/// push refspecs (or the branch's own name when it has none) mapped through
+/// its fetch refspecs equal `upstream`. Such a branch is "merged" trivially
+/// and `--delete-merged` leaves it alone.
+fn branch_pushes_to_upstream(repo: &gix::Repository, branch: &str, upstream: &str) -> bool {
+    let snap = repo.config_snapshot();
+    // `remote_for_branch(branch, NULL)`.
+    let remote = match snap.string(&format!("branch.{branch}.remote")) {
+        Some(r) => r.to_str_lossy().into_owned(),
+        None => {
+            let names = repo.remote_names();
+            match names.len() {
+                1 => names
+                    .iter()
+                    .next()
+                    .map_or_else(|| "origin".to_string(), |n| n.to_str_lossy().into_owned()),
+                _ => "origin".to_string(),
+            }
+        }
+    };
+    let specs = |key: &str| -> Vec<String> {
+        crate::config::multi_values(repo, &format!("remote.{remote}.{key}"))
+    };
+    let refname = format!("refs/heads/{branch}");
+    let push = specs("push");
+    let push_refname = match push.is_empty() {
+        true => Some(refname),
+        false => crate::objname::apply_refspecs(&push, &refname),
+    };
+    let tracking = push_refname.and_then(|p| crate::objname::apply_refspecs(&specs("fetch"), &p));
+    tracking.as_deref() == Some(upstream)
+}
+
+/// `repo_config_get_bool(the_repository, "branch.<name>.deletemerged", &v)`:
+/// `None` when unset; a value `git_parse_maybe_bool()` rejects is
+/// `git_config_bool()`'s `die()`, which names the key as the caller spelled it.
+fn delete_merged_opt(repo: &gix::Repository, branch: &str) -> Option<bool> {
+    let key = format!("branch.{branch}.deletemerged");
+    let raw = crate::config::last_value_implicit(repo, &key)?;
+    let Some(value) = raw else {
+        return Some(true);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" | "" => Some(false),
+        other => match other.parse::<i64>() {
+            Ok(n) => Some(n != 0),
+            Err(_) => crate::config::die_128(&format!(
+                "bad boolean config value '{value}' for '{key}'"
+            )),
+        },
+    }
+}
+
+/// `delete_merged_branches()` (builtin/branch.c:824-912, new in 2.56): every
+/// local branch matching `patterns` whose upstream matches one of `upstreams`
+/// (as `--forked` would), exists, is not pushed to by the branch itself, and
+/// is merged into it — less what a worktree holds, what
+/// `branch.<name>.deleteMerged=false` opts out, and any branch another
+/// surviving branch is stacked on. The survivors go through
+/// [`delete_branches`] without the HEAD fallback; a protected branch whose own
+/// upstream was one of the deleted loses its upstream configuration.
+fn delete_merged_branches(
+    repo: &gix::Repository,
+    upstreams: &[String],
+    patterns: &[String],
+    flags: DeleteFlags,
+) -> Result<ExitCode> {
+    let mut forked = Vec::with_capacity(upstreams.len());
+    for arg in upstreams {
+        match ref_filter::forked_add(repo, arg) {
+            Some(pattern) => forked.push(pattern),
+            None => return fatal(format!("'{arg}' is not a valid branch or pattern")),
+        }
+    }
+
+    // `filter.kind = FILTER_REFS_BRANCHES; filter.name_patterns = argv;
+    // filter_refs(&candidates, &filter, filter.kind);`
+    let no_format = |_: &[ref_filter::Candidate]| Vec::new();
+    let spec = ref_filter::ListSpec {
+        repo,
+        format: ref_filter::Format::Built(&no_format),
+        sort_specs: Vec::new(),
+        kinds: ref_filter::kind::BRANCHES,
+        patterns: patterns.to_vec(),
+        ignore_case: false,
+        points_at: Vec::new(),
+        filters: super::for_each_ref::Filters {
+            contains: Vec::new(),
+            no_contains: Vec::new(),
+            merged: Vec::new(),
+            no_merged: Vec::new(),
+        },
+        omit_empty: false,
+        color_on: false,
+        head_desc: None,
+        run_is_base: false,
+        can_iterate: false,
+        detached_head_first: false,
+        verbose: false,
+        forked,
+    };
+    let (candidates, pending_die) = ref_filter::filter_refs(&spec)?;
+    if let Some(msg) = pending_die {
+        return fatal(msg);
+    }
+
+    let mut deletable = StrSet::new();
+    for candidate in &candidates {
+        let refname = candidate.refname.to_str_lossy().into_owned();
+        let Some(branch) = refname.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        if super::worktree::branch_checked_out(repo, &refname)?.is_some() {
+            continue;
+        }
+        let Some(upstream) = upstream_ref(repo, BStr::new(refname.as_bytes())) else {
+            continue;
+        };
+        if !matches!(repo.try_find_reference(upstream.as_ref()), Ok(Some(_))) {
+            continue;
+        }
+        let upstream = upstream.as_bstr().to_str_lossy().into_owned();
+        if branch_pushes_to_upstream(repo, branch, &upstream) {
+            continue;
+        }
+        let skip = DeleteFlags {
+            skip_unmerged: true,
+            ..DeleteFlags::default()
+        };
+        if !check_branch_commit(repo, branch, branch, candidate.id, None, false, skip) {
+            continue;
+        }
+        if delete_merged_opt(repo, branch) == Some(false) {
+            if !flags.quiet {
+                eprintln!("Skipping '{branch}' (branch.{branch}.deleteMerged is false)");
+            }
+            continue;
+        }
+        deletable.add(branch);
+    }
+
+    // `protect_stacked_branch_bases()`: a local branch staying behind keeps the
+    // local branch it is stacked on.
+    let mut protected = StrSet::new();
+    for r in repo.references()?.local_branches()? {
+        let r = r.map_err(crate::fatal::ref_iteration_error)?;
+        let refname = r.name().as_bstr().to_owned();
+        let Some(branch) = refname.strip_prefix(b"refs/heads/".as_slice()) else {
+            continue;
+        };
+        let branch = branch.to_str_lossy();
+        if deletable.contains(&branch) {
+            continue;
+        }
+        let Some(upstream) = upstream_ref(repo, refname.as_bstr()) else {
+            continue;
+        };
+        let upstream = upstream.as_bstr().to_str_lossy().into_owned();
+        if let Some(base) = upstream.strip_prefix("refs/heads/") {
+            if deletable.contains(base) {
+                protected.add(base);
+            }
+        }
+    }
+    for name in protected.iter() {
+        deletable.remove(name);
+    }
+
+    let to_delete: Vec<String> = deletable.iter().map(str::to_string).collect();
+    let mut ret = ExitCode::SUCCESS;
+    if !to_delete.is_empty() {
+        let delete_flags = DeleteFlags {
+            skip_unmerged: true,
+            no_head_fallback: true,
+            ..flags
+        };
+        ret = delete_branches(repo, &to_delete, false, delete_flags)?;
+    }
+
+    // `clear_deleted_upstreams()`: a protected branch survives, but the local
+    // upstream it was itself stacked on may be gone now.
+    if ret == ExitCode::SUCCESS && !flags.dry_run {
+        let mut cleared = Vec::new();
+        for name in protected.iter() {
+            let full = format!("refs/heads/{name}");
+            let Some(upstream) = upstream_ref(repo, BStr::new(full.as_bytes())) else {
+                continue;
+            };
+            let upstream = upstream.as_bstr().to_str_lossy().into_owned();
+            if upstream
+                .strip_prefix("refs/heads/")
+                .is_some_and(|base| deletable.contains(base))
+            {
+                cleared.push(name.to_string());
+            }
+        }
+        if !cleared.is_empty() {
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+            let (path, mut file) = local_config(repo)?;
+            for name in &cleared {
+                // `repo_config_set_gently(key, NULL)` for `merge`, then `remote`;
+                // a section left with nothing in it goes with them.
+                let sub = BStr::new(name.as_bytes());
+                let empty = match file.section_mut("branch", Some(sub)) {
+                    Ok(mut section) => {
+                        while section.remove("merge").is_some() {}
+                        while section.remove("remote").is_some() {}
+                        section.num_values() == 0
+                    }
+                    Err(_) => false,
+                };
+                if empty {
+                    file.remove_section("branch", Some(sub));
+                }
+            }
+            write_config(&path, &file)?;
+        }
+    }
+    Ok(ret)
 }
 
 /// Point the last reflog entry's *old* id at `old`, which is what a rename records: the

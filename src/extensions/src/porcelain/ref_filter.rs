@@ -104,6 +104,55 @@ fn match_pattern(pattern: &str, refname: &[u8], ignore_case: bool) -> bool {
     gix::glob::wildmatch(pattern.as_bytes().as_bstr(), stripped.as_bstr(), mode)
 }
 
+/// `has_glob_specials()` (refs.h:545-548): `strpbrk(pattern, "?*[")`.
+pub(super) fn has_glob_specials(pattern: &str) -> bool {
+    pattern.bytes().any(|b| matches!(b, b'?' | b'*' | b'['))
+}
+
+/// `ref_filter_forked_add()` (ref-filter.c:2795-2814, new in 2.56): a glob is
+/// kept as typed; anything else must `repo_dwim_ref()` to exactly one ref
+/// under `refs/heads/` or `refs/remotes/`, which is kept in full. `None` is the
+/// `-1` both callers turn into `'%s' is not a valid branch or pattern`.
+pub(super) fn forked_add(repo: &gix::Repository, arg: &str) -> Option<String> {
+    if has_glob_specials(arg) {
+        return Some(arg.to_string());
+    }
+    match super::rev_parse::dwim_ref_matches(repo, arg).as_slice() {
+        [full] if full.starts_with("refs/heads/") || full.starts_with("refs/remotes/") => {
+            Some(full.clone())
+        }
+        _ => None,
+    }
+}
+
+/// `filter_forked_match()` (ref-filter.c:2747-2793): the local branch
+/// `refname`'s configured upstream against the `--forked` patterns. An exact
+/// pattern is compared with the full upstream refname; a glob is wildmatched
+/// with `WM_PATHNAME` against the upstream with `refs/heads/` or
+/// `refs/remotes/` stripped (`short_upstream_name()`).
+pub(super) fn forked_match(repo: &gix::Repository, forked: &[String], refname: &[u8]) -> bool {
+    use gix::bstr::ByteSlice;
+    if !refname.starts_with(b"refs/heads/") {
+        return false;
+    }
+    let Some(upstream) = super::branch::upstream_ref(repo, refname.as_bstr()) else {
+        return false;
+    };
+    let upstream = upstream.as_bstr().to_str_lossy().into_owned();
+    let short = upstream
+        .strip_prefix("refs/heads/")
+        .or_else(|| upstream.strip_prefix("refs/remotes/"))
+        .unwrap_or(&upstream);
+    forked.iter().any(|pattern| match has_glob_specials(pattern) {
+        true => gix::glob::wildmatch(
+            pattern.as_bytes().as_bstr(),
+            short.as_bytes().as_bstr(),
+            gix::glob::wildmatch::Mode::NO_MATCH_SLASH_LITERAL,
+        ),
+        false => *pattern == upstream,
+    })
+}
+
 /// A ref that survived filtering, before any object body was read.
 ///
 /// This is what a caller sees when it sizes a column: git's `calc_maxwidth()`
@@ -116,7 +165,7 @@ pub(super) struct Candidate {
     /// git's `ref_kind_from_refname()` bit, so a caller can tell a remote-tracking
     /// ref apart without re-deriving it.
     pub(super) kind: u32,
-    id: ObjectId,
+    pub(super) id: ObjectId,
     symref: Vec<u8>,
     packed: bool,
 }
@@ -200,6 +249,9 @@ pub(super) struct ListSpec<'a> {
     /// about the broken one, while `git branch --list` still names it: without
     /// `-v` nothing opens the object at all.
     pub(super) verbose: bool,
+    /// `filter->forked` (2.56): the `--forked` patterns, each either a glob or
+    /// the full refname [`forked_add`] resolved it to.
+    pub(super) forked: Vec<String>,
 }
 
 /// What a listing produced: rendered lines, or the exit code a format/sort parse
@@ -433,7 +485,7 @@ fn atoms<'a>(items: &'a [Item], sorts: &'a [SortKey]) -> impl Iterator<Item = &'
 /// The second value is a `die()` `apply_ref_filter()` raised (`match_points_at()`'s
 /// `malformed object at '%s'`): the walk stopped at that ref, and the candidates are
 /// the refs it kept before it.
-fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option<String>)> {
+pub(super) fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option<String>)> {
     let repo = spec.repo;
     let filters_active = spec.filters.active();
 
@@ -503,6 +555,12 @@ fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option<String>)> 
                 Some(false) => continue,
                 None => return Ok((out, Some(for_each_ref::malformed_object(&refname)))),
             }
+        }
+
+        // `if (filter->forked.nr && !filter_forked_match(filter, ref->name))`
+        // (ref-filter.c:3048-3049), between `--points-at` and the commit lookup.
+        if !spec.forked.is_empty() && !forked_match(repo, &spec.forked, &refname) {
+            continue;
         }
 
         // `apply_ref_filter()`'s gentle commit lookup (ref-filter.c:2987-2991): the reachability

@@ -1267,6 +1267,7 @@ fn list_tags(
         detached_head_first: false,
         // `git tag` has no `-v` listing flag of its own; `filter.verbose` stays 0.
         verbose: false,
+        forked: Vec::new(),
     };
 
     let out_lines = match super::ref_filter::filter_and_format(&spec)? {

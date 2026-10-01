@@ -2977,7 +2977,7 @@ fn upstream_mark_fatal_for(repo: &gix::Repository, name: &str) -> Option<String>
 /// (`refspec.c:refspec_find_match`.) A leading `+` is the force flag and is not
 /// part of the source pattern; a spec with no `:` has no destination and is
 /// skipped, as is a negative (`^`) one.
-fn apply_refspecs(specs: &[String], name: &str) -> Option<String> {
+pub(crate) fn apply_refspecs(specs: &[String], name: &str) -> Option<String> {
     for spec in specs {
         let spec = spec.strip_prefix('+').unwrap_or(spec);
         if spec.starts_with('^') {

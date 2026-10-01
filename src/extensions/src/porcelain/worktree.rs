@@ -3224,12 +3224,56 @@ fn resolve_start(
 /// Not covered: the sequencer's `update-refs` state, git's fourth source, which
 /// would need `rebase --update-refs`' file format parsed.
 pub(super) fn branch_checked_out(repo: &gix::Repository, refname: &str) -> Result<Option<PathBuf>> {
+    Ok(checked_out_branches(repo)?
+        .into_iter()
+        .filter(|c| c.refname == refname)
+        .last()
+        .map(|c| c.path))
+}
+
+/// `branch_bisecting()` (branch.c:488-497, new in 2.56): the worktree whose
+/// in-progress bisect started from `refname`, scanning the registrations in
+/// order and taking the *first* bisect entry — unlike [`branch_checked_out`],
+/// whose map keeps the last writer.
+pub(super) fn branch_bisecting(repo: &gix::Repository, refname: &str) -> Result<Option<PathBuf>> {
+    Ok(checked_out_branches(repo)?
+        .into_iter()
+        .find(|c| c.refname == refname && c.kind == CheckoutKind::Bisect)
+        .map(|c| c.path))
+}
+
+/// `enum branch_checkout_kind` (branch.c:388-393): which of the per-worktree
+/// sources registered a branch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckoutKind {
+    Checkout,
+    Rebase,
+    Bisect,
+}
+
+/// `struct checked_out_branch` (branch.c:395-399).
+struct CheckedOut {
+    refname: String,
+    path: PathBuf,
+    kind: CheckoutKind,
+}
+
+/// `prepare_checked_out_branches()` (branch.c:421-479): every
+/// `register_checked_out_branch()` call, in registration order.
+fn checked_out_branches(repo: &gix::Repository) -> Result<Vec<CheckedOut>> {
     let common = gix::path::realpath(repo.common_dir())?;
-    let mut found = None;
+    let mut out = Vec::new();
     for wt in collect(repo, u64::MAX)? {
         if wt.is_bare {
             continue;
         }
+        let mut register = |refname: String, kind: CheckoutKind| {
+            out.push(CheckedOut {
+                refname,
+                path: wt.path.clone(),
+                kind,
+            });
+        };
         // `get_worktree_git_dir()`: the common dir for the main worktree, the
         // administrative directory for a linked one.
         let wt_gitdir = match &wt.id {
@@ -3238,9 +3282,7 @@ pub(super) fn branch_checked_out(repo: &gix::Repository, refname: &str) -> Resul
         };
 
         if let HeadInfo::Branch { name, .. } = &wt.head {
-            if name.as_bstr() == refname {
-                found = Some(wt.path.clone());
-            }
+            register(name.as_bstr().to_str_lossy().into_owned(), CheckoutKind::Checkout);
         }
         // `wt_status_check_rebase()`: `rebase-apply` without `applying` is a
         // rebase (with it, an `am`, which records no branch), `rebase-merge` is
@@ -3254,21 +3296,17 @@ pub(super) fn branch_checked_out(repo: &gix::Repository, refname: &str) -> Resul
             None
         };
         if let Some(branch) = rebase_head_name.and_then(|p| state_branch(&p)) {
-            if format!("refs/heads/{branch}") == refname {
-                found = Some(wt.path.clone());
-            }
+            register(format!("refs/heads/{branch}"), CheckoutKind::Rebase);
         }
         // `wt_status_check_bisect()`: `BISECT_LOG` marks a bisect in progress and
         // `BISECT_START` names what it started from.
         if wt_gitdir.join("BISECT_LOG").exists() {
             if let Some(branch) = state_branch(&wt_gitdir.join("BISECT_START")) {
-                if format!("refs/heads/{branch}") == refname {
-                    found = Some(wt.path.clone());
-                }
+                register(format!("refs/heads/{branch}"), CheckoutKind::Bisect);
             }
         }
     }
-    Ok(found)
+    Ok(out)
 }
 
 /// `get_branch()` (wt-status.c): read a state file naming a branch, trim its

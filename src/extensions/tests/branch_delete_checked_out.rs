@@ -170,6 +170,8 @@ fn a_branch_an_interrupted_rebase_will_return_to_cannot_be_deleted() {
 }
 
 /// A bisect detaches `HEAD` too; `BISECT_START` holds the branch it began on.
+/// 2.56 reports that holder by name (`branch_bisecting()`, builtin/branch.c:287-294):
+/// the refusal gains a ` for bisect` tail.
 #[test]
 fn a_branch_a_bisect_started_from_cannot_be_deleted() {
     let f = Fixture::new("bisect");
@@ -188,7 +190,7 @@ fn a_branch_a_bisect_started_from_cannot_be_deleted() {
     assert_eq!(
         err,
         format!(
-            "error: cannot delete branch 'main' used by worktree at '{}'",
+            "error: cannot delete branch 'main' used by worktree at '{}' for bisect",
             Fixture::real(&f.work)
         )
     );

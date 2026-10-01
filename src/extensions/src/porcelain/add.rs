@@ -12,6 +12,8 @@
 //!     index entry, staged by this run or not ([`chmod_pathspec`])
 //!   * `git add --refresh`      — refresh the stat cache, do not add content
 //!   * `git add --renormalize`  — restage tracked paths (implies -u)
+//!   * `git add --resolved`     — stage conflicted paths whose files no longer hold
+//!     conflict markers, refusing the run if any still does (git 2.56)
 //!   * `git add --pathspec-from-file=<f>` (`-` = stdin, `--pathspec-file-nul`)
 //!   * `git add --ignore-removal|--no-all` — do not stage worktree deletions
 //!   * `git add --ignore-errors` — skip files that cannot be read, exit 1
@@ -89,6 +91,7 @@ pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "force",                       neg: true,  arg: Arg::None },
     LongOpt { name: "update",                      neg: true,  arg: Arg::None },
     LongOpt { name: "renormalize",                 neg: true,  arg: Arg::None },
+    LongOpt { name: "resolved",                    neg: true,  arg: Arg::None },
     LongOpt { name: "intent-to-add",               neg: true,  arg: Arg::None },
     LongOpt { name: "all",                         neg: true,  arg: Arg::None },
     LongOpt { name: "ignore-removal",              neg: true,  arg: Arg::None },
@@ -120,6 +123,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let mut intent_to_add = false;
     let mut refresh = false;
     let mut renormalize = false;
+    // `--resolved` (git's `add_resolved`, new in 2.56): stage the conflicted
+    // paths whose worktree file no longer carries conflict markers, and nothing
+    // else — see [`resolved_paths`].
+    let mut add_resolved = false;
     // `--sparse` (git's `include_sparse`): stage paths outside the sparse-checkout
     // definition instead of reporting them.
     let mut include_sparse = false;
@@ -242,6 +249,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // are not applied here, so it restages the verbatim worktree bytes.
             "--renormalize" => renormalize = true,
             "--no-renormalize" => renormalize = false,
+            "--resolved" => add_resolved = true,
+            "--no-resolved" => add_resolved = false,
             // `--sparse` lets the add reach paths the sparse-checkout definition
             // leaves out of the worktree; without it those paths are reported and
             // skipped (`advise_on_updating_sparse_paths()`).
@@ -378,19 +387,35 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         return edit_patch(&repo, &pathspecs);
     }
 
-    // `if (addremove && take_worktree_changes) die(...)` (builtin/add.c): `-A` stages
-    // untracked files and `-u` refuses to, so asking for both is a fatal. `addremove`
-    // is the *explicit* `-A`/`--no-all` setting — bare `-u` turns git's default off
-    // instead of tripping this — which is exactly what `all` records here, last
-    // occurrence winning (`-A --no-all -u` is accepted, `-u --no-all -A` is not).
+    // ```c
+    // die_for_incompatible_opt3(take_worktree_changes, "-u/--update",
+    //                           0 < addremove_explicit, "-A/--all",
+    //                           add_resolved, "--resolved");
+    // ```
     //
-    // Its position is load-bearing: verified against git 2.55.0, this fatal is the
-    // only output of `--chmod=bogus -A -u`, `-A -u --ignore-missing`,
+    // (builtin/add.c:519-521.) 2.56 replaced the `-A`/`-u` die with this, which
+    // names each option by both spellings and adds `--resolved` to the set. The
+    // middle test is the *explicit* `-A`/`--no-all` setting — bare `-u` turns
+    // git's default off instead of tripping this — which is exactly what `all`
+    // records here, last occurrence winning (`-A --no-all -u` is accepted,
+    // `-u --no-all -A` is not).
+    //
+    // Its position is load-bearing: this fatal is the only output of
+    // `--chmod=bogus -A -u`, `-A -u --ignore-missing`,
     // `--pathspec-from-file=/nope -A -u`, `-A -u --pathspec-file-nul` and `-A -u ''`,
     // so it outranks every check below — while `-n -p -A -u` and `-U 3 -A -u` still
     // report the interactive-mode fatals above, which outrank it.
-    if all && update_only {
-        return usage_fatal("options '-A' and '-u' cannot be used together".into());
+    if let Some(msg) = crate::parseopt::incompatible_options(&[
+        (update_only, "-u/--update"),
+        (all, "-A/--all"),
+        (add_resolved, "--resolved"),
+    ]) {
+        return usage_fatal(msg);
+    }
+    // `if (add_resolved) … else if (add_renormalize) …` (builtin/add.c:670-673):
+    // with both given, `--renormalize` has no effect at all.
+    if add_resolved {
+        renormalize = false;
     }
 
     // `--ignore-missing` is only meaningful with `--dry-run` (builtin/add.c:444).
@@ -449,7 +474,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         return usage_fatal(msg);
     }
 
-    if pathspecs.is_empty() && !(all || update_only) {
+    // `require_pathspec = !(take_worktree_changes || (0 < addremove_explicit) ||
+    // add_resolved)` (builtin/add.c:532-534): `--resolved` alone means every
+    // conflicted path.
+    if pathspecs.is_empty() && !(all || update_only || add_resolved) {
         // git: message + advice on stderr, exit 0. stdout stays empty.
         eprintln!("Nothing specified, nothing added.");
         // `advise_if_enabled(ADVICE_ADD_EMPTY_PATHSPEC, …)` (builtin/add.c:468):
@@ -459,8 +487,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Update, refresh, and renormalize all restrict staging to tracked paths.
-    let tracked_only = update_only || refresh || renormalize;
+    // Update, refresh, renormalize and `--resolved` all restrict staging to tracked
+    // paths (`add_new_files`, builtin/add.c:530-531).
+    let tracked_only = update_only || refresh || renormalize || add_resolved;
     // A real add writes new content blobs. Dry-run, refresh, and intent-to-add
     // never write per-file content objects (git writes none in those modes).
     //
@@ -868,6 +897,13 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     for item in iter.by_ref() {
         walked.push(item?.entry);
     }
+    // `--resolved` never reaches `add_files_to_cache()` or `add_files()`:
+    // `add_resolved_files()` runs *instead of* both (builtin/add.c:670-676), so
+    // nothing the walk found is staged. The walk still runs to completion for the
+    // pathspec matcher it hands back.
+    if add_resolved {
+        walked.clear();
+    }
     walked.sort_by_key(|e| staging_order(existing.contains(&e.rela_path), &e.rela_path));
     // The names the walk actually reached, whatever it went on to decide about
     // them. An index entry missing from this set was never offered to the loop
@@ -1102,7 +1138,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // stages nothing, matching git. `--refresh` returns before the write below, so
     // it still only refreshes stat and never records a pointer move.
     for (path, id, stat) in moved_gitlinks(&repo, &index, &staged_set, |p| {
-        pathspec.is_included(p, Some(false))
+        !add_resolved && pathspec.is_included(p, Some(false))
     }) {
         staged.push(Staged { path, id, mode: Mode::COMMIT, stat, was_tracked: true, deferred: false });
     }
@@ -1131,7 +1167,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // `--refresh` (`goto finish`, builtin/add.c:516-519) and `--renormalize`
     // (`renormalize_tracked_files()` runs *instead of* it, builtin/add.c:587-588)
     // never reach `add_files_to_cache()` at all, so neither reaches this pass.
-    if !refresh && !renormalize {
+    if !refresh && !renormalize && !add_resolved {
         let backing = index.path_backing();
         for e in index.entries() {
             // A gitlink is the pass just above; a conflicted path has no stage-0
@@ -1230,7 +1266,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // --- deletions: tracked stage-0 paths, matched, whose file is gone ------
     // Suppressed by `--no-all`/`--ignore-removal`.
     let mut deletions: Vec<BString> = Vec::new();
-    if !no_removal {
+    if !no_removal && !add_resolved {
         let backing = index.path_backing();
         for e in index.entries() {
             if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {
@@ -1313,6 +1349,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         mode: match (refresh, renormalize, update_only) {
             (true, _, _) => super::stage::SpecMode::Refresh,
             (_, true, _) => super::stage::SpecMode::Renormalize,
+            // `--resolved` is not `take_worktree_changes`, so `report_path_error()`
+            // is never reached (builtin/add.c:679-681) and an element that exists
+            // on disk is accepted in silence — `--renormalize`'s behaviour exactly.
+            _ if add_resolved => super::stage::SpecMode::Renormalize,
             (_, _, true) => super::stage::SpecMode::Update,
             _ => super::stage::SpecMode::Add,
         },
@@ -1377,6 +1417,102 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         index_failed = outcome.failed;
     }
 
+    // `--resolved` stages the conflicted paths off the index the same way, in its
+    // place; see [`resolved_paths`] for the selection and the marker refusal.
+    // What it picks goes through the shared tail below as `add_file_to_index()`
+    // and `remove_file_from_index_with_flags()` would: every stage of the path
+    // dropped, then one stage-0 entry for a path still on disk.
+    let mut resolved_report: Vec<String> = Vec::new();
+    let mut resolved_failed = false;
+    if add_resolved {
+        let picked = match resolved_paths(&repo, &index, |p| pathspec.is_included(p, Some(false)))? {
+            Ok(paths) => paths,
+            Err(code) => return Ok(code),
+        };
+        for path in picked {
+            let abs = repo.workdir_path(&path).expect("index path lies in this worktree");
+            // ```c
+            // if (lstat(path, &st)) {
+            //         if (errno != ENOENT)
+            //                 die_errno(_("cannot lstat: '%s'"), path);
+            //         if (remove_file_from_index_with_flags(istate, path, flags))
+            //                 exit_status = failed_to_add(flags, path);
+            // } else {
+            //         if (add_file_to_index(istate, path, flags))
+            //                 exit_status = failed_to_add(flags, path);
+            // }
+            // ```
+            //
+            // (builtin/add.c:440-453.) `remove_file_from_index_with_flags()`
+            // (read-cache.c:639-651) prints `remove '<path>'` under `-v` or `-n`
+            // and `add_to_index()` prints `add '<path>'` the same way; an unmerged
+            // path has no stage-0 alias, so `was_same` never silences it.
+            let md = match gix::index::fs::Metadata::from_path_no_follow(&abs) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    resolved_report.push(format!("remove '{path}'"));
+                    deletions.push(path);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("fatal: cannot lstat: '{path}': {}", os_err_message(&e));
+                    return Ok(ExitCode::from(128));
+                }
+            };
+            let stat = Stat::from_fs(&md)?;
+            let mode = super::update_index::mode_for_added_path(mode_rules, &index, path.as_bstr(), &md);
+            if intent_to_add {
+                // `add_to_index()`'s `intent_only` arm: the empty blob, no read.
+                indexed_any = true;
+                resolved_report.push(format!("add '{path}'"));
+                staged.push(Staged {
+                    path,
+                    id: repo.object_hash().empty_blob(),
+                    mode,
+                    stat,
+                    was_tracked: false,
+                    deferred: false,
+                });
+                continue;
+            }
+            // `index_path()` failing is `error()`ed by `add_to_index()` as
+            // `unable to index file`, and `failed_to_add()` turns it into
+            // `die(_("updating file '%s' failed"))` unless `--ignore-errors`
+            // (builtin/add.c:390-395).
+            let readable = match md.is_symlink() {
+                true => std::fs::read_link(&abs).map(drop),
+                false => std::fs::File::open(&abs).map(drop),
+            };
+            if let Err(e) = readable {
+                eprintln!("error: open(\"{path}\"): {}", os_err_message(&e));
+                eprintln!("error: unable to index file '{path}'");
+                if !ignore_errors {
+                    eprintln!("fatal: updating file '{path}' failed");
+                    return Ok(ExitCode::from(128));
+                }
+                resolved_failed = true;
+                continue;
+            }
+            if !md.is_symlink() && !big_file_checked {
+                big_file_checked = true;
+                if let Some(message) = crate::config::big_file_threshold_refusal(&repo) {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+            indexed_any = true;
+            resolved_report.push(format!("add '{path}'"));
+            staged.push(Staged {
+                path,
+                id: repo.object_hash().null(),
+                mode,
+                stat,
+                was_tracked: true,
+                deferred: true,
+            });
+        }
+    }
+
     // `--ignore-errors`: a real add reports the paths it could not index and, if
     // any occurred without `--ignore-errors`, aborts before touching the index.
     // An embedded repository with an unborn HEAD is one of those paths; git names
@@ -1386,7 +1522,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // *instead of* `add_files_to_cache()` and skips `add_files()` entirely
     // (`add_new_files` is 0), so under that flag neither of the two callers that
     // report an unindexable path exists, and the scan above owns the whole story.
-    let had_errors = !renormalize && !(read_errors.is_empty() && headless_repos.is_empty());
+    let had_errors =
+        resolved_failed || (!renormalize && !(read_errors.is_empty() && headless_repos.is_empty()));
     // `--dry-run` does not suppress any of this: `ADD_CACHE_PRETEND` is consulted
     // inside `add_to_index()` only after `index_path()` has already failed, so `-n`
     // reports the same two `error:` lines and dies the same way. Verified against git
@@ -1445,6 +1582,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // then the brand-new untracked files in walk order → `add`.
     let report: Vec<String> = match dry_run || verbose {
         false => Vec::new(),
+        true if add_resolved => resolved_report,
         true => report_lines(&index, &staged, &deletions, renormalize),
     };
 
@@ -1889,6 +2027,117 @@ pub(super) fn invalidate_tree_cache(index: &mut gix::index::File, paths: &HashSe
     for path in paths {
         index.invalidate_path_in_tree(path.as_ref());
     }
+}
+
+/// The selection half of `add_resolved_files()` (builtin/add.c:397-438, new in
+/// 2.56): every conflicted path the pathspec matches, once each in index order,
+/// or the refusal when any of them still holds a conflict marker.
+///
+/// ```c
+/// for (i = 0; i < istate->cache_nr; i++) {
+///         struct cache_entry *ce = istate->cache[i];
+///         if (!ce_stage(ce))
+///                 continue;
+///         if (pathspec->nr && !ce_path_match(istate, ce, pathspec, NULL))
+///                 continue;
+///         if (!unmerged_paths.nr ||
+///             strcmp(unmerged_paths.items[unmerged_paths.nr - 1].string, ce->name))
+///                 string_list_append(&unmerged_paths, ce->name);
+/// }
+/// …
+/// for (i = 0; i < unmerged_paths.nr; i++) {
+///         …
+///         if (!lstat(path, &st) && S_ISREG(st.st_mode)) {
+///                 if (has_conflict_markers(istate, path))
+///                         string_list_append(&unresolved_paths, path);
+///         }
+/// }
+///
+/// if (unresolved_paths.nr) {
+///         …
+///                 strbuf_addf(&sb, "\t%s\n", unresolved_paths.items[i].string);
+///         die(_("the following paths still have conflict markers:\n%s"), sb.buf);
+/// }
+/// ```
+///
+/// Only a regular file is scanned: a symlink or a submodule in conflict, and a
+/// path removed from the worktree, are taken as they stand. The check covers
+/// every selected path before any of them is staged, so one leftover marker
+/// leaves the whole index as it was. Stage-0 entries are never selected, which
+/// is what keeps an unrelated modified file unstaged.
+fn resolved_paths(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    mut matches: impl FnMut(&BStr) -> bool,
+) -> Result<std::result::Result<Vec<BString>, ExitCode>> {
+    let backing = index.path_backing();
+    let mut unmerged: Vec<BString> = Vec::new();
+    for e in index.entries().iter().filter(|e| e.stage() != Stage::Unconflicted) {
+        let path = e.path_in(backing);
+        if !matches(path) {
+            continue;
+        }
+        if unmerged.last().is_none_or(|last| last != path) {
+            unmerged.push(path.to_owned());
+        }
+    }
+
+    let mut unresolved: Vec<&BString> = Vec::new();
+    for path in &unmerged {
+        let abs = repo.workdir_path(path).expect("index path lies in this worktree");
+        let regular = std::fs::symlink_metadata(&abs).is_ok_and(|m| m.file_type().is_file());
+        if regular && has_conflict_markers(repo, index, path.as_bstr(), &abs)? {
+            unresolved.push(path);
+        }
+    }
+    if !unresolved.is_empty() {
+        let mut list = String::new();
+        for path in unresolved {
+            list.push_str(&format!("\t{path}\n"));
+        }
+        eprintln!("fatal: the following paths still have conflict markers:\n{list}");
+        return Ok(Err(ExitCode::from(128)));
+    }
+    Ok(Ok(unmerged))
+}
+
+/// `has_conflict_markers()` (merge-ll.c:503-526, new in 2.56): whether any line
+/// of the file is a conflict marker at the path's `conflict-marker-size`.
+///
+/// ```c
+/// while (strbuf_getwholeline(&sb, f, '\n') != EOF) {
+///         if (is_conflict_marker_line(sb.buf, sb.len, marker_size)) {
+///                 has_markers = 1;
+///                 break;
+///         }
+///         if (buffer_is_binary(sb.buf,
+///                              ULONG_MAX <= sb.len ? ULONG_MAX : sb.len))
+///                 break;
+/// }
+/// ```
+///
+/// Each line is tested with its `\n` attached, and the scan stops at the first
+/// line that reads as binary (a NUL in its first 8000 bytes) without counting
+/// it. A file that cannot be opened has no markers.
+fn has_conflict_markers(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &BStr,
+    abs: &std::path::Path,
+) -> Result<bool> {
+    let marker_size = super::rerere::ll_merge_marker_size(repo, index, path)?;
+    let Ok(data) = std::fs::read(abs) else {
+        return Ok(false);
+    };
+    for line in data.split_inclusive(|b| *b == b'\n') {
+        if super::diff_files::is_conflict_marker_sized(line, marker_size) {
+            return Ok(true);
+        }
+        if super::diffcore_rename::buffer_is_binary(line) {
+            break;
+        }
+    }
+    Ok(false)
 }
 
 /// What [`renormalize_tracked_files`] reads off the command line.
@@ -2665,6 +2914,7 @@ const USAGE: &str = concat!(
     "    -f, --[no-]force      allow adding otherwise ignored files\n",
     "    -u, --[no-]update     update tracked files\n",
     "    --[no-]renormalize    renormalize EOL of tracked files (implies -u)\n",
+    "    --[no-]resolved       add conflict-resolved tracked files\n",
     "    -N, --[no-]intent-to-add\n",
     "                          record only the fact that the path will be added later\n",
     "    -A, --[no-]all        add changes from all tracked and untracked files\n",
@@ -2684,7 +2934,7 @@ const USAGE: &str = concat!(
 /// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
 /// prints. It is [`USAGE`] with the `PARSE_OPT_HIDDEN` entries left in:
 /// `--[no-]warn-embedded-repo`.
-/// Captured byte-for-byte from stock git 2.55.0's `git add --help-all`.
+/// Captured byte-for-byte from stock git 2.56.0's `git add --help-all`.
 const USAGE_ALL: &str = r#"usage: git add [<options>] [--] <pathspec>...
 
     -n, --[no-]dry-run    dry run
@@ -2701,6 +2951,7 @@ const USAGE_ALL: &str = r#"usage: git add [<options>] [--] <pathspec>...
     -f, --[no-]force      allow adding otherwise ignored files
     -u, --[no-]update     update tracked files
     --[no-]renormalize    renormalize EOL of tracked files (implies -u)
+    --[no-]resolved       add conflict-resolved tracked files
     -N, --[no-]intent-to-add
                           record only the fact that the path will be added later
     -A, --[no-]all        add changes from all tracked and untracked files

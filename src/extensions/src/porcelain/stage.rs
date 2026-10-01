@@ -582,8 +582,14 @@ pub fn stage(args: &[String]) -> Result<ExitCode> {
     // is not argv order. Verified against git 2.55.0, highest precedence first:
     // the `-A`/`-u` conflict, then `--ignore-missing` without `--dry-run`, then an
     // empty-string pathspec, then `--pathspec-file-nul` without its file.
-    if o.addremove == Some(true) && o.update {
-        eprintln!("fatal: options '-A' and '-u' cannot be used together");
+    // `die_for_incompatible_opt3()` (builtin/add.c:519-521), which 2.56 put in
+    // place of the `-A`/`-u` die; its third member, `--resolved`, is an option
+    // this parser hands to `add` whole.
+    if let Some(msg) = crate::parseopt::incompatible_options(&[
+        (o.update, "-u/--update"),
+        (o.addremove == Some(true), "-A/--all"),
+    ]) {
+        eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(FATAL));
     }
     if o.ignore_missing && !o.dry_run {

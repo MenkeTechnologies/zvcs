@@ -475,7 +475,7 @@ fn forget_one_path(
     dirs: &mut RrDirs,
 ) -> Result<()> {
     let rr_cache = rr_cache_dir(repo);
-    let marker_size = marker_size(repo, index, path.as_ref())?;
+    let marker_size = ll_merge_marker_size(repo, index, path.as_ref())?;
 
     let (found, hash) = handle_cache(repo, index, path, marker_size, true, None)?;
     if found < 1 {
@@ -598,7 +598,7 @@ fn do_plain_rerere(
     // Some of them may have been hand-resolved since, but the first run catches
     // them all and registers their preimages.
     for path in find_conflict(&index) {
-        let marker_size = marker_size(repo, &index, path.as_ref())?;
+        let marker_size = ll_merge_marker_size(repo, &index, path.as_ref())?;
         let (found, hash) = handle_file(repo, &path, marker_size, true, None)?;
         if found != 0 {
             if let Ok(i) = rr.binary_search_by(|e| e.path.cmp(&path)) {
@@ -657,7 +657,7 @@ fn rerere_one_path(
         (e.path.clone(), e.hex.clone(), e.variant)
     };
     let id_dir = rr_cache.join(&hex);
-    let marker_size = marker_size(repo, index, path.as_ref())?;
+    let marker_size = ll_merge_marker_size(repo, index, path.as_ref())?;
 
     // Has the user resolved it already? A conflict-marker-free worktree file
     // with a preimage on record *is* the resolution.
@@ -903,8 +903,29 @@ fn find_conflict(index: &gix::index::File) -> Vec<BString> {
     out
 }
 
-/// `ll_merge_marker_size()`: the `conflict-marker-size` attribute, or 7.
-fn marker_size(repo: &gix::Repository, index: &gix::index::File, path: &BStr) -> Result<usize> {
+/// `ll_merge_marker_size()` (merge-ll.c:453-470): the `conflict-marker-size`
+/// attribute, or 7.
+///
+/// ```c
+/// if (check->items[0].value) {
+///         if (strtol_i(check->items[0].value, 10, &marker_size)) {
+///                 marker_size = DEFAULT_CONFLICT_MARKER_SIZE;
+///                 warning(_("invalid marker-size '%s', expecting an integer"), check->items[0].value);
+///         }
+///         if (marker_size <= 0)
+///                 marker_size = DEFAULT_CONFLICT_MARKER_SIZE;
+/// }
+/// ```
+///
+/// Only an unspecified attribute has no value. A bare `conflict-marker-size`
+/// carries `ATTR__TRUE`'s `(builtin)true` and `-conflict-marker-size`
+/// `ATTR__FALSE`'s empty string, so both fail `strtol_i()` and are named in the
+/// warning; a parsable value that is not positive falls back in silence.
+pub(crate) fn ll_merge_marker_size(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &BStr,
+) -> Result<usize> {
     let mut stack = repo.attributes_only(
         index,
         gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
@@ -917,18 +938,30 @@ fn marker_size(repo: &gix::Repository, index: &gix::index::File, path: &BStr) ->
     outcome.initialize_with_selection(stack.attributes_collection(), ["conflict-marker-size"]);
     stack.at_entry(path, mode)?.matching_attributes(&mut outcome);
 
-    for m in outcome.iter_selected() {
-        if let gix::attrs::StateRef::Value(v) = m.assignment.state {
-            // `ATTR_INT_VALUE_SET` + `atoi`: only a positive integer wins.
-            if let Ok(n) = v.as_bstr().to_str().unwrap_or("").parse::<usize>() {
-                if n > 0 {
-                    return Ok(n);
-                }
-            }
+    let value: BString = match outcome.iter_selected().next().map(|m| m.assignment.state) {
+        None | Some(gix::attrs::StateRef::Unspecified) => return Ok(DEFAULT_CONFLICT_MARKER_SIZE),
+        Some(gix::attrs::StateRef::Set) => "(builtin)true".into(),
+        Some(gix::attrs::StateRef::Unset) => BString::default(),
+        Some(gix::attrs::StateRef::Value(v)) => v.as_bstr().to_owned(),
+    };
+    // `strtol_i()` (git-compat-util.h:982-993): `strtol()` skips leading
+    // whitespace and takes one sign; the whole rest must be digits and the
+    // result must fit an `int`.
+    let parsed = value
+        .to_str()
+        .ok()
+        .map(|s| s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']))
+        .and_then(|s| s.parse::<i32>().ok());
+    match parsed {
+        Some(n) if n > 0 => Ok(n as usize),
+        Some(_) => Ok(DEFAULT_CONFLICT_MARKER_SIZE),
+        None => {
+            eprintln!("warning: invalid marker-size '{value}', expecting an integer");
+            Ok(DEFAULT_CONFLICT_MARKER_SIZE)
         }
     }
-    Ok(DEFAULT_CONFLICT_MARKER_SIZE)
 }
+
 
 /// `strbuf_getwholeline()` over an in-memory buffer: lines keep their `\n`.
 struct LineReader<'a> {

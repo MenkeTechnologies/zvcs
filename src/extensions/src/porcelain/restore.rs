@@ -977,24 +977,38 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         arr
     };
 
+    // Paths whose entry is still skip-worktree once `read_tree_some()` has run. Both
+    // markers return before `ce_path_match()` for such an entry unless
+    // `--ignore-skip-worktree-bits` (builtin/checkout.c:392, 426), so it is neither
+    // matched nor counted toward `ps_matched`. `update_some()` keeps the old index entry,
+    // flags and all, only when the tree names the same blob in the same mode and the
+    // entry is not intent-to-add (builtin/checkout.c:214-229); any other tree entry is a
+    // fresh `create_ce_flags(0)` one without the bit. So a sparse path the source
+    // *changes* is matched, checked out and staged like any other, while one the source
+    // leaves as it is stays out of reach.
+    let sparse_kept: HashSet<BString> = if ignore_skip_worktree {
+        HashSet::new()
+    } else {
+        let b = cur.path_backing();
+        cur.entries()
+            .iter()
+            .filter(|e| e.stage_raw() == 0 && e.flags.contains(Flags::SKIP_WORKTREE))
+            .map(|e| (e, e.path_in(b).to_owned()))
+            .filter(|(e, p)| {
+                let replaced = !source_is_index
+                    && path_matches(BStr::new(p), match_all, &spec_set)
+                    && source_map.get(p).is_some_and(|(id, mode, _, _)| {
+                        *id != e.id || *mode != e.mode || e.flags.contains(Flags::INTENT_TO_ADD)
+                    });
+                !replaced
+            })
+            .map(|(_, p)| p)
+            .collect()
+    };
+
     // Validate every explicit pathspec matches something git knows about (the
     // union of source and index paths), mirroring git's pathspec error (exit 1).
     if !match_all {
-        // `PS_IGNORE_SKIP_WORKTREE`: a path the sparse-checkout definition keeps out
-        // of the worktree cannot be matched by a pathspec, so naming one is git's
-        // "did not match" rather than a restore of a file that should not be there.
-        let sparse: std::collections::HashSet<BString> = if ignore_skip_worktree {
-            std::collections::HashSet::new()
-        } else {
-            let index = repo.index_or_empty()?;
-            let backing = index.path_backing();
-            index
-                .entries()
-                .iter()
-                .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
-                .map(|e| e.path_in(backing).to_owned())
-                .collect()
-        };
         // Which index entries may fill `ps_matched`. `read_tree_some()` lays the source
         // tree over the index, stamping `CE_UPDATE` on every entry it supplies
         // (`update_some()`, builtin/checkout.c:193). In overlay mode
@@ -1011,7 +1025,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             let hit = source_map
                 .keys()
                 .chain(cur_paths.iter().filter(|_| index_only_counts))
-                .filter(|p| !sparse.contains(&BString::from(p.to_vec())))
+                .filter(|p| !sparse_kept.contains(*p))
                 .any(|p| path_matches(BStr::new(p), false, &single));
             if !hit {
                 eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
@@ -1120,7 +1134,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     candidates.extend(source_map.keys());
     candidates.extend(cur_paths.iter());
     for path in candidates {
-        if !path_matches(BStr::new(path), match_all, &spec_set) {
+        if !path_matches(BStr::new(path), match_all, &spec_set) || sparse_kept.contains(path) {
             continue;
         }
         match (source_map.get(path), cur_paths.contains(path)) {
@@ -1204,8 +1218,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                     // reaches `add_index_entry()` — when the tree names the same blob
                     // in the same mode and the entry is not intent-to-add
                     // (builtin/checkout.c:214-229). Only the other case invalidates.
+                    // The new entry is `create_ce_flags(0)` (builtin/checkout.c:208), so
+                    // skip-worktree, intent-to-add and assume-unchanged do not survive it.
                     if e.id != *id || e.mode != *mode || e.flags.contains(Flags::INTENT_TO_ADD) {
                         invalidated.push(path.clone());
+                        e.flags = Flags::empty();
                     }
                     e.id = *id;
                     e.mode = *mode;
@@ -1252,7 +1269,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // Subset of the source restricted to matched stage-0 entries, plus any
         // conflict-resolved entries; checked out over the existing worktree.
         let mut subset = source_index.clone();
-        subset.remove_entries(|_, p, e| e.stage_raw() != 0 || !path_matches(p, match_all, &spec_set));
+        subset.remove_entries(|_, p, e| {
+            e.stage_raw() != 0 || !path_matches(p, match_all, &spec_set) || sparse_kept.contains(&p.to_owned())
+        });
         if ignore_skip_worktree {
             for e in subset.entries_mut() {
                 e.flags.remove(Flags::SKIP_WORKTREE);

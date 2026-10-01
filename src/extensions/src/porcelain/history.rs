@@ -1,6 +1,6 @@
-//! `git history` — EXPERIMENTAL history rewriting (`fixup`, `reword`, `split`).
+//! `git history` — EXPERIMENTAL history rewriting (`drop`, `fixup`, `reword`, `split`).
 //!
-//! What this module implements, byte-identically with stock git 2.55.0: the
+//! What this module implements, byte-identically with stock git 2.56.0: the
 //! whole command-line surface. That is `-h` for the command and for each
 //! subcommand (usage text on stdout, exit 0), the missing/unknown subcommand
 //! diagnostics, per-subcommand option parsing (`--update-refs`, `-n`/
@@ -11,7 +11,7 @@
 //! wording, stream, and exit status (129 for usage errors, 128 for `fatal:`,
 //! 255 for the `error()` returns the builtin passes up once setup is past).
 //!
-//! All three subcommands are ported end to end:
+//! All four subcommands are ported end to end:
 //!
 //! * `setup_revwalk()` — `--reverse --topo-order --full-history
 //!   --ancestry-path=<commit> ^<commit>` over `--branches HEAD` (or `HEAD`
@@ -28,10 +28,17 @@
 //!   target's parent tree, the interactive hunk selector over it
 //!   (`add_patch::run_index`, git's `run_add_p_index`), the resulting tree, the
 //!   two empty-half refusals, and the two commits the halves become.
-//! * `handle_reference_updates()` — `replay_revisions()` over the descendants
-//!   (sharing `replay.rs`'s `pick_regular_commit`), then the references that
-//!   decorate the target itself, printed as `update <ref> <new> <old>` under
-//!   `--dry-run` and committed as one reference transaction otherwise.
+//! * `handle_reference_updates()` — 2.56's `compute_pending_ref_updates()`
+//!   (`replay_revisions()` over the descendants, sharing `replay.rs`'s
+//!   `pick_regular_commit`, then the references that decorate the target
+//!   itself) and `apply_pending_ref_updates()` (printed as
+//!   `update <ref> <new> <old>` under `--dry-run`, one reference transaction
+//!   otherwise).
+//! * `cmd_history_drop()` (2.56) — the root and merge refusals, the replay onto
+//!   the target's parent, `find_head_tree_change()`, and `update_worktree()`'s
+//!   two-way `checkout` move (`merge_guard::verify_two_way` plus
+//!   `checkout::update_worktree_to_tree`), tried dry before any reference
+//!   moves and run for real after.
 //!
 //! Two deliberate reductions, neither observable in a commit or a reference:
 //!
@@ -57,11 +64,24 @@ use gix::refs::{FullName, Target};
 
 use super::replay::{get_mapped_commit, pick_regular_commit, EmptyAction, Mode, Picked};
 
-/// The three-line synopsis git prints for the command as a whole.
+/// The four-line synopsis git prints for the command as a whole.
 const USAGE: &str = "\
-usage: git history fixup <commit> [--dry-run] [--update-refs=(branches|head)] [--reedit-message] [--empty=(drop|keep|abort)]
+usage: git history drop <commit> [--dry-run] [--update-refs=(branches|head)] [--empty=(drop|keep|abort)]
+   or: git history fixup <commit> [--dry-run] [--update-refs=(branches|head)] [--reedit-message] [--empty=(drop|keep|abort)]
    or: git history reword <commit> [--dry-run] [--update-refs=(branches|head)]
    or: git history split <commit> [--dry-run] [--update-refs=(branches|head)] [--] [<pathspec>...]
+";
+
+/// `drop`'s own `-h` text (2.56). Its `--empty` speaks of descendants: the
+/// target itself is removed outright.
+const USAGE_DROP: &str = "\
+usage: git history drop <commit> [--dry-run] [--update-refs=(branches|head)] [--empty=(drop|keep|abort)]
+
+    --update-refs (branches|head)
+                          control which refs should be updated
+    -n, --[no-]dry-run    perform a dry-run without updating any refs
+    --empty (drop|keep|abort)
+                          how to handle descendants that become empty
 ";
 
 /// `fixup`'s own `-h` text: synopsis, blank line, option list.
@@ -98,6 +118,7 @@ usage: git history split <commit> [--dry-run] [--update-refs=(branches|head)]
 /// Which subcommand is running; selects the option table and usage text.
 #[derive(Clone, Copy, PartialEq)]
 enum Sub {
+    Drop,
     Fixup,
     Reword,
     Split,
@@ -107,6 +128,7 @@ impl Sub {
     /// The `-h` text for this subcommand, also printed after an unknown option.
     fn usage(self) -> &'static str {
         match self {
+            Sub::Drop => USAGE_DROP,
             Sub::Fixup => USAGE_FIXUP,
             Sub::Reword => USAGE_REWORD,
             Sub::Split => USAGE_SPLIT,
@@ -121,7 +143,7 @@ struct Opts {
     head_only: bool,
     /// `--reedit-message` (fixup only).
     reedit_message: bool,
-    /// `--empty=<action>` (fixup only).
+    /// `--empty=<action>` (fixup and drop).
     empty: EmptyAction,
     /// The single `<commit>` argument.
     rev: Option<String>,
@@ -165,6 +187,7 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
     }
 
     let sub = match first.as_str() {
+        "drop" => Sub::Drop,
         "fixup" => Sub::Fixup,
         "reword" => Sub::Reword,
         "split" => Sub::Split,
@@ -236,6 +259,7 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
     // Every remaining failure is git's `error()`, which the builtin returns as
     // -1 and `git` turns into exit 255.
     let outcome = match sub {
+        Sub::Drop => drop_commit(&repo, &opts, rev, original, action),
         Sub::Fixup => fixup(&repo, &opts, rev, original, action),
         Sub::Reword => reword(&repo, &opts, rev, original, action),
         Sub::Split => split(&repo, &opts, rev, original, action),
@@ -833,31 +857,51 @@ fn staged_status_block(
     Ok(out)
 }
 
-/// git's `handle_reference_updates()`: replay every descendant onto `rewritten`,
-/// then move the references that pointed at `original` itself.
-///
-/// `dry_run` is git's `transaction == NULL` path, where each update is printed
-/// as `update <ref> <new> <old>` instead of being staged.
-#[allow(clippy::too_many_arguments)]
-fn handle_reference_updates(
+/// One `struct replay_ref_update`: `(refname, old, new)`.
+type PendingUpdate = (String, ObjectId, ObjectId);
+
+/// Why `replay_revisions()` stopped short, as the return value it hands back.
+enum ReplayFailed {
+    /// `1`: a pick conflicted. Nothing has been printed.
+    Conflict,
+    /// `-1`: an `error()` has already been printed (a descendant became empty
+    /// under `--empty=abort`).
+    Errored,
+}
+
+/// git's `compute_pending_ref_updates()` (2.56): replay every descendant onto
+/// `rewritten`, then queue the references that pointed at `original` itself.
+/// Nothing is written to the reference store.
+fn compute_pending_ref_updates(
     repo: &gix::Repository,
     order: &[ObjectId],
     action: RefAction,
     original: ObjectId,
     rewritten: ObjectId,
-    reflog_msg: &str,
-    dry_run: bool,
     empty: EmptyAction,
-) -> Outcome {
+) -> Result<std::result::Result<Vec<PendingUpdate>, ReplayFailed>> {
     let detached_head = repo.head()?.is_detached();
     let decorations = super::replay::load_branch_decorations(repo, detached_head)?;
+
+    // `update_refs`: what `get_ref_information()` dwims `setup_revwalk()`'s
+    // positive revisions to — every branch for `--branches HEAD`, plus the
+    // name `HEAD` resolves to, which is its branch unless detached. A
+    // descendant's decoration outside the set stays where it is, which is
+    // what keeps `--update-refs=head` off the other branches.
+    let mut update_refs: HashSet<String> = super::replay::dwim_head(repo).into_iter().collect();
+    if action == RefAction::Branches {
+        for r in repo.references()?.prefixed("refs/heads/")? {
+            let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+            update_refs.insert(r.name().as_bstr().to_str_lossy().into_owned());
+        }
+    }
 
     // --- replay_revisions() ------------------------------------------------
     // `opts.onto` is the rewritten commit and neither `ref` nor `advance` is
     // set, so the per-commit decoration loop is the only source of updates.
     let merge_options = repo.tree_merge_options()?;
     let mut replayed: HashMap<ObjectId, ObjectId> = HashMap::new();
-    let mut updates: Vec<(String, ObjectId, ObjectId)> = Vec::new();
+    let mut updates: Vec<PendingUpdate> = Vec::new();
     for pickme in order {
         // `get_mapped_commit(replayed_commits, parent, onto)`: the descendants
         // are never merges (setup_revwalk refused those), so each stacks on its
@@ -873,17 +917,21 @@ fn handle_reference_updates(
             empty,
         )? {
             Picked::Commit(id) => id,
-            // `replay_revisions` returns 1, which `handle_reference_updates`
-            // passes up as a non-zero `ret`.
-            Picked::Conflict => return Ok(Err("failed replaying descendants".into())),
+            // `if (!result.clean) { ret = 1; goto out; }`
+            Picked::Conflict => return Ok(Err(ReplayFailed::Conflict)),
+            // `result->clean = error(...)`, then `ret = -1`.
             Picked::BecameEmpty(id) => {
-                return Ok(Err(format!("commit {id} became empty after replay")));
+                eprintln!("error: commit {id} became empty after replay");
+                return Ok(Err(ReplayFailed::Errored));
             }
         };
         replayed.insert(*pickme, new_commit);
 
         for refname in decorations.get(pickme).into_iter().flatten() {
             if refname == "HEAD" && !detached_head {
+                continue;
+            }
+            if !update_refs.contains(refname) {
                 continue;
             }
             updates.push((refname.clone(), *pickme, new_commit));
@@ -903,20 +951,35 @@ fn handle_reference_updates(
         }
         updates.push((refname.clone(), original, rewritten));
     }
+    Ok(Ok(updates))
+}
 
+/// git's `apply_pending_ref_updates()` (2.56): one reference transaction for
+/// every queued update, or under `dry_run` (git's `transaction == NULL`) each
+/// printed as `update <ref> <new> <old>` instead.
+///
+/// A failure has printed its `error()` already; `Ok(false)` is the `-1` the
+/// caller then words its own error over.
+fn apply_pending_ref_updates(
+    repo: &gix::Repository,
+    updates: &[PendingUpdate],
+    reflog_msg: &str,
+    dry_run: bool,
+) -> Result<bool> {
     if dry_run {
         let mut out: Vec<u8> = Vec::new();
-        for (refname, old, new) in &updates {
+        for (refname, old, new) in updates {
             writeln!(out, "update {refname} {new} {old}")?;
         }
         std::io::stdout().lock().write_all(&out)?;
-        return Ok(Ok(()));
+        return Ok(true);
     }
 
     let mut edits: Vec<RefEdit> = Vec::new();
-    for (refname, old, new) in &updates {
+    for (refname, old, new) in updates {
         let Ok(name) = FullName::try_from(refname.as_str()) else {
-            return Ok(Err(format!("failed to update ref '{refname}'")));
+            eprintln!("error: failed to update ref '{refname}'");
+            return Ok(false);
         };
         edits.push(RefEdit {
             change: Change::Update {
@@ -934,7 +997,164 @@ fn handle_reference_updates(
     }
     if !edits.is_empty() {
         if let Err(e) = repo.edit_references(edits) {
-            return Ok(Err(format!("failed to commit ref transaction: {e}")));
+            eprintln!("error: failed to commit ref transaction: {e}");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// git's `handle_reference_updates()`: [`compute_pending_ref_updates`] then
+/// [`apply_pending_ref_updates`], for `fixup`, `reword` and `split`.
+///
+/// Those callers test `ret < 0` only, so the `1` a conflicted replay returns
+/// is not an error to them: nothing is printed, no reference moves, and the
+/// command exits 0 — exactly as builtin/history.c:689-696 is written.
+#[allow(clippy::too_many_arguments)]
+fn handle_reference_updates(
+    repo: &gix::Repository,
+    order: &[ObjectId],
+    action: RefAction,
+    original: ObjectId,
+    rewritten: ObjectId,
+    reflog_msg: &str,
+    dry_run: bool,
+    empty: EmptyAction,
+) -> Outcome {
+    let updates = match compute_pending_ref_updates(repo, order, action, original, rewritten, empty)? {
+        Ok(u) => u,
+        Err(ReplayFailed::Conflict) => return Ok(Ok(())),
+        Err(ReplayFailed::Errored) => return Ok(Err("failed replaying descendants".into())),
+    };
+    if apply_pending_ref_updates(repo, &updates, reflog_msg, dry_run)? {
+        Ok(Ok(()))
+    } else {
+        Ok(Err("failed replaying descendants".into()))
+    }
+}
+
+/// git's `find_head_tree_change()` (2.56): when the queued updates move the
+/// reference `HEAD` resolves to (one level, so the branch it names or `HEAD`
+/// itself when detached) to a commit with a different tree, the old and new
+/// commits; `None` when HEAD stays or keeps its tree.
+fn find_head_tree_change(
+    repo: &gix::Repository,
+    updates: &[PendingUpdate],
+) -> Result<std::result::Result<Option<(ObjectId, ObjectId)>, String>> {
+    // `refs_resolve_ref_unsafe(..., "HEAD", RESOLVE_REF_NO_RECURSE | ...)`.
+    let head_target = match repo.find_reference("HEAD") {
+        Ok(head) => match head.target() {
+            gix::refs::TargetRef::Symbolic(name) => name.as_bstr().to_str_lossy().into_owned(),
+            gix::refs::TargetRef::Object(_) => "HEAD".to_owned(),
+        },
+        Err(_) => return Ok(Err("cannot look up HEAD".into())),
+    };
+    let Some((_, old, new)) = updates.iter().find(|(name, _, _)| *name == head_target) else {
+        return Ok(Ok(None));
+    };
+    let tree_of = |id: ObjectId| -> Option<ObjectId> {
+        repo.find_commit(id).ok()?.tree_id().ok().map(|t| t.detach())
+    };
+    let (Some(old_tree), Some(new_tree)) = (tree_of(*old), tree_of(*new)) else {
+        return Ok(Err("cannot resolve tree for HEAD".into()));
+    };
+    if old_tree == new_tree {
+        return Ok(Ok(None));
+    }
+    Ok(Ok(Some((*old, *new))))
+}
+
+/// git's `update_worktree()` (2.56): `reset_working_tree()` with `oid_from`
+/// set and no flags but `DRY_RUN` — a two-way `checkout` merge of the index and
+/// worktree from `old_head`'s tree to `new_head`'s, leaving every reference
+/// alone. Refusals print under `setup_unpack_trees_porcelain(..., "checkout")`;
+/// the answer is whether the move went (or, dry, would go) through.
+///
+/// The dry run has `.update = 0`, and `verify_absent_1()` returns early
+/// without `o->update` (unpack-trees.c:2487-2488), so it never sees untracked
+/// files in the way: only the index and modified-file buckets are its to
+/// report. The real run checks everything.
+fn update_worktree(
+    repo: &gix::Repository,
+    old_head: ObjectId,
+    new_head: ObjectId,
+    dry_run: bool,
+) -> Result<bool> {
+    let old_tree = repo.find_commit(old_head)?.tree_id()?.detach();
+    let new_tree = repo.find_commit(new_head)?.tree_id()?.detach();
+    let index = repo.index_or_load_from_head_or_empty()?;
+    let mut clobber = crate::merge_guard::verify_two_way(repo, old_tree, new_tree, &index)?;
+    if dry_run {
+        clobber.not_uptodate_dir.clear();
+        clobber.untracked_overwritten.clear();
+        clobber.untracked_removed.clear();
+    }
+    if !clobber.is_empty() {
+        clobber.report("checkout");
+        return Ok(false);
+    }
+    if !dry_run {
+        super::checkout::update_worktree_to_tree(repo, old_tree, new_tree)?;
+    }
+    Ok(true)
+}
+
+/// `cmd_history_drop()` (2.56) from the root/merge checks onwards: replay the
+/// descendants of `original` onto its parent, move the references, and carry
+/// the worktree along when HEAD's tree changes.
+fn drop_commit(
+    repo: &gix::Repository,
+    opts: &Opts,
+    rev: &str,
+    original: ObjectId,
+    action: RefAction,
+) -> Outcome {
+    let parents: Vec<ObjectId> = repo.find_commit(original)?.parent_ids().map(|p| p.detach()).collect();
+    match parents.len() {
+        0 => {
+            return Ok(Err(format!(
+                "cannot drop root commit {rev}: it has no parent to replay onto"
+            )))
+        }
+        1 => {}
+        _ => return Ok(Err(format!("cannot drop merge commit: {rev}"))),
+    }
+
+    let order = match setup_revwalk(repo, action, original)? {
+        Ok(o) => o,
+        Err(msg) => return Ok(Err(msg)),
+    };
+    let rewritten = parents[0];
+
+    // `if (ret) { ret = error(_("failed replaying descendants")); }` — unlike
+    // the other three, `drop` treats a conflicted replay as failure too.
+    let Ok(updates) = compute_pending_ref_updates(repo, &order, action, original, rewritten, opts.empty)? else {
+        return Ok(Err("failed replaying descendants".into()));
+    };
+
+    // The worktree merge can conflict, so it is tried dry before any
+    // reference moves (builtin/history.c:1150-1170).
+    let mut head_moves = None;
+    if repo.worktree().is_some() {
+        head_moves = match find_head_tree_change(repo, &updates)? {
+            Ok(change) => change,
+            Err(msg) => return Ok(Err(msg)),
+        };
+        if let Some((old_head, new_head)) = head_moves {
+            if !update_worktree(repo, old_head, new_head, true)? {
+                return Ok(Err("dropping this commit would overwrite local changes; aborting".into()));
+            }
+        }
+    }
+
+    let reflog_msg = format!("drop: dropping {rev}");
+    if !apply_pending_ref_updates(repo, &updates, &reflog_msg, opts.dry_run)? {
+        return Ok(Err("failed to update references".into()));
+    }
+
+    if let Some((old_head, new_head)) = head_moves {
+        if !opts.dry_run && !update_worktree(repo, old_head, new_head, false)? {
+            return Ok(Err(format!("could not update working tree to new commit {new_head}")));
         }
     }
     Ok(Ok(()))
@@ -1080,7 +1300,7 @@ fn parse(sub: Sub, args: &[String]) -> Result<Parsed> {
             }
             "--reedit-message" if sub == Sub::Fixup => opts.reedit_message = true,
             "--no-reedit-message" if sub == Sub::Fixup => opts.reedit_message = false,
-            "--empty" if sub == Sub::Fixup => {
+            "--empty" if matches!(sub, Sub::Fixup | Sub::Drop) => {
                 let Some(v) = take(&mut i) else {
                     eprint!("error: option `empty' requires a value\n{}\n", sub.usage());
                     return Ok(Parsed::Exit(ExitCode::from(EXIT_USAGE)));

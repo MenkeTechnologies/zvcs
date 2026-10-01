@@ -1060,6 +1060,13 @@ fn resolve_symref_chain(repo: &gix::Repository, start: gix::Reference<'_>) -> Op
     None
 }
 
+/// What `repo_dwim_ref("HEAD")` hands `get_ref_information()` for a `HEAD`
+/// revision: the branch at the end of its symref chain, or `HEAD` itself when
+/// detached.
+pub(super) fn dwim_head(repo: &gix::Repository) -> Option<String> {
+    dwim_ref(repo, "HEAD")
+}
+
 /// git's `load_branch_decorations` plus the decoration-list ordering its
 /// `add_name_decoration` produces: references are visited in ascending name
 /// order and *prepended*, so each commit's list runs in descending name order,

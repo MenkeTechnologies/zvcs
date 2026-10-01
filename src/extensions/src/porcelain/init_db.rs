@@ -22,24 +22,20 @@ use std::process::ExitCode;
 ///     state.
 ///   * Both object formats are laid down for real — `--object-format=sha1` is
 ///     the no-op default and `--object-format=sha256` writes stock's
-///     `extensions.objectformat` + `core.repositoryformatversion = 1` pair. The
-///     default `--ref-format=files` is likewise a no-op, while
-///     `--ref-format=reftable` is rejected with an honest "not supported" error
-///     (no vendored reftable backend) rather than being silently ignored, so no
-///     run ever produces a repo that differs from what the flag asked for — but
-///     only after git's own diagnostics have had their turn, so reinitializing
-///     an existing repository under a different ref storage format still dies
-///     with git's `attempt to reinitialize repository with different reference
-///     storage format`. An otherwise unrecognized value reproduces git's exact
-///     error text.
+///     `extensions.objectformat` + `core.repositoryformatversion = 1` pair. Both
+///     ref formats are laid down too — `--ref-format=files` is the default and
+///     `--ref-format=reftable` writes stock's `extensions.refstorage` key, the
+///     `reftable/` stack with its `HEAD`/`refs/heads` stubs and a first table
+///     holding the `HEAD` symref. Reinitializing an existing repository under a
+///     different ref storage format dies with git's `attempt to reinitialize
+///     repository with different reference storage format`, and an otherwise
+///     unrecognized value reproduces git's exact error text.
 ///   * Every configuration source `init` consults is consulted here too:
 ///     `init.defaultBranch`, `init.templateDir`, `init.defaultObjectFormat`,
 ///     `init.defaultRefFormat` (each behind its `GIT_DEFAULT_HASH` /
 ///     `GIT_DEFAULT_REF_FORMAT` / `GIT_TEMPLATE_DIR` environment override) and
 ///     `init.defaultSubmodulePathConfig`.
-///   * The divergences documented on [`super::init::init`] apply here unchanged:
-///     a configured `reftable` format is rejected rather than silently laid down
-///     as `files`.
+///   * The divergences documented on [`super::init::init`] apply here unchanged.
 ///
 /// The `advice.defaultBranchName` hint block belongs to `init` rather than to this
 /// synonym and is printed here too, from the same code: `repo_default_branch_name()`

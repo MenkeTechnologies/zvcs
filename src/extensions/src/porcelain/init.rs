@@ -47,9 +47,14 @@ use crate::lock::RepoLock;
 ///     = 1` pair stock writes; the config level is resolved *before* the
 ///     repository is laid down, since the hash it names decides what is written.
 ///   * `git init --ref-format=<format>` / `--ref-format <format>`
-///                                                        (`files` accepted; `reftable` rejected — see deviations)
+///                                                        (`files` and `reftable`)
 ///     with git's precedence: the option > the `GIT_DEFAULT_REF_FORMAT` env var >
-///     the `init.defaultRefFormat` config > the compiled-in `files`.
+///     the `init.defaultRefFormat` config (or `feature.experimental=true`, which
+///     selects `reftable` unless a recognised `init.defaultRefFormat` precedes it) > the
+///     compiled-in `files`. `reftable` writes `extensions.refstorage = reftable`
+///     with the version-1 bump, the `reftable/` stack and its `HEAD` /
+///     `refs/heads` stubs, and a first table holding the `HEAD` symref — the
+///     layout stock lays down, through `gix-reftable`.
 ///   * `init.defaultSubmodulePathConfig=true` seeds
 ///     `extensions.submodulePathConfig=true` (and the `core.repositoryformatversion=1`
 ///     bump it requires) into the new repository, exactly like stock git.
@@ -107,19 +112,9 @@ use crate::lock::RepoLock;
 ///
 /// # Deviations (surfaced honestly, never faked)
 /// ```text
-///   * `--ref-format=reftable` is rejected with an honest "not supported" error
-///     (not "silently accepted", and never faked into a mismatched-format repo):
-///     there is no vendored reftable backend. The refusal comes *last*, though:
-///     every diagnostic git emits before it would build the store is emitted
-///     first, so an unrecognized format still says `unknown ref storage format
-///     '<v>'` and a reinitialization that would change the format still says
-///     `attempt to reinitialize repository with different reference storage
-///     format` — both `fatal:`, both exit 128, exactly as git does. Only a run
-///     that would really have to write a reftable store is refused.
-///     `--ref-format=files` is a no-op that matches the repository gix already
-///     writes, both object formats are laid down for real, and an otherwise
-///     unrecognized value reproduces git's exact error text (`unknown hash
-///     algorithm '<v>'` / `unknown ref storage format '<v>'`).
+///   * a valueless `init.defaultObjectFormat` / `init.defaultRefFormat` is
+///     skipped; git's `git_config_string()` refuses it and the configuration
+///     walk dies.
 /// ```
 
 /// `cmd_init_db()`'s `struct option init_db_options[]` (builtin/init-db.c), in
@@ -522,6 +517,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // `HEAD` inside the git directory, nothing else.
     let reinit = std::fs::symlink_metadata(git_dir.join("HEAD")).is_ok();
 
+    // `repository_format_configure()` walks the configuration first, warning
+    // as it goes, and only then compares the formats it was handed.
+    let defaults = read_default_format_config()?;
+
     // `validate_hash_algorithm()` (`setup.c`), in its order: the command-line
     // hash may not disagree with the hash an existing repository already uses,
     // and only then is `GIT_DEFAULT_HASH` looked at.
@@ -567,16 +566,11 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     let object_format = object_format.or(env_object_format);
     let ref_format = ref_format.or(env_ref_format);
 
-    // Only now, with every diagnostic git produces ahead of the store already
-    // emitted, is a run that would have to *write* a reftable store refused. A
-    // reinitialization was answered above and never reaches here, so this is the
-    // one shape left: a repository that does not exist yet.
-    if matches!(
-        ref_format.as_deref().map(check_ref_format),
-        Some(Ok(FormatCheck::Unimplemented))
-    ) {
-        return Err(reftable_unsupported());
-    }
+    // `repo_fmt->ref_storage_format`: the option, else `GIT_DEFAULT_REF_FORMAT`,
+    // else the configured default (setup.c:2805-2822). Only a repository that
+    // does not exist yet is laid down in it.
+    let reftable = !reinit
+        && ref_format.as_deref().or(defaults.ref_format.as_deref()) == Some("reftable");
 
     // Create the repository. gix lays down the full template + config and returns
     // an opened handle with an unborn HEAD on the default branch. gix refuses
@@ -586,24 +580,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // The object format decides what is laid down, so the config level of its
     // precedence chain has to be resolved *before* the repository exists rather
     // than out of the finished repository's snapshot below. That is also where
-    // git reads it: `cmd_init_db()` calls `git_config_get_string()` for
-    // `init.defaultobjectformat` with no repository open, so the value can only
-    // come from the global/system files — [`crate::config::global_config`] is
-    // that same pair. An unrecognized value selects nothing here and is warned
-    // about below, which is git's fall back to the compiled-in default.
-    let configured_object_format = match object_format {
-        Some(_) => None,
-        None => crate::config::global_config()
-            .string("init.defaultObjectFormat")
-            .map(|v| v.to_string())
-            .filter(|v| matches!(check_object_format(v), Ok(FormatCheck::Implemented))),
-    };
+    // git reads it: [`read_default_format_config`] above, with no repository
+    // open. An unrecognized value selected nothing there and was warned about,
+    // which is git's fall back to the compiled-in default.
     let create_opts = gix::create::Options {
-        object_hash: object_hash_of(
-            object_format
-                .as_deref()
-                .or(configured_object_format.as_deref()),
-        ),
+        object_hash: object_hash_of(object_format.as_deref().or(defaults.hash.as_deref())),
+        ref_storage_reftable: reftable,
         ..Default::default()
     };
     // Where the skeleton goes is decided by the git directory, not by the
@@ -632,34 +614,6 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     };
 
     if let Some(repo) = repo.as_ref() {
-        // The config level of the format precedence chain: consulted only when
-        // neither the option nor the environment variable named a format. An
-        // unrecognized value is a warning and falls back to the compiled-in default,
-        // matching stock git; a *recognized but unimplemented* value (`sha256` /
-        // `reftable`) is rejected with the same honest error the option produces,
-        // rather than silently laying down a repository in the other format.
-        if object_format.is_none() {
-            if let Some(fmt) = config_string(repo, "init.defaultObjectFormat") {
-                if check_object_format(&fmt)? == FormatCheck::Unrecognized {
-                    eprintln!("warning: unknown hash algorithm '{fmt}'");
-                }
-            }
-        }
-        if ref_format.is_none() {
-            if let Some(fmt) = config_string(repo, "init.defaultRefFormat") {
-                match check_ref_format(&fmt)? {
-                    FormatCheck::Unrecognized => {
-                        eprintln!("warning: unknown ref storage format '{fmt}'");
-                    }
-                    // git would have laid down a reftable store here; silently
-                    // leaving a `files` one under that configuration would be a
-                    // repository that does not match what was asked for.
-                    FormatCheck::Unimplemented => return Err(reftable_unsupported()),
-                    FormatCheck::Implemented => {}
-                }
-            }
-        }
-
         // Resolve the initial branch name, matching git's precedence exactly:
         //   1. `-b <name>` / `--initial-branch=<name>` on the command line, else
         //   2. the `init.defaultBranch` config value (any scope), else
@@ -711,7 +665,11 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                 // `objects/{info,pack}` only after the reference database is set up,
                 // so a failed init leaves none. `remove_dir` refuses a non-empty
                 // directory, so a pre-existing object store is never touched.
-                let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
+                // A reftable store's `HEAD` is the `.invalid` stub `ref_store_create_on_disk()`
+                // wrote before the name was checked, and git leaves it there.
+                if !reftable {
+                    let _ = std::fs::remove_file(src_git_dir.join("HEAD"));
+                }
                 for dir in ["objects/pack", "objects/info", "objects"] {
                     let _ = std::fs::remove_dir(src_git_dir.join(dir));
                 }
@@ -725,7 +683,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                 }));
             }
         };
-        {
+        if reftable {
+            // `refs_update_symref(…, "HEAD", ref, NULL)` through the reftable
+            // backend: the stack's first table, holding `HEAD` alone.
+            let _lock = RepoLock::acquire(&src_git_dir);
+            super::refs_migrate::init_symref_head(repo, branch.as_bstr())?;
+        } else {
             let _lock = RepoLock::acquire(&src_git_dir);
             repo.edit_reference(RefEdit {
                 change: Change::Update {
@@ -879,17 +842,11 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
 /// the formats git knows and this port implements.
 #[derive(PartialEq, Eq)]
 enum FormatCheck {
-    /// A name git recognizes and this port lays down (`sha1` / `files`).
+    /// A name git recognizes and this port lays down.
     Implemented,
     /// A name git does not recognize at all. The caller decides whether that is
     /// fatal (command line / environment) or a warning (config).
     Unrecognized,
-    /// A name git recognizes and lays down but this port has no backend for
-    /// (`reftable`). git's own parser accepts it, so every diagnostic git emits
-    /// ahead of actually building the store — an unknown *other* format, a
-    /// reinitialization that would change the format — still has to come out
-    /// first; only a run that would really write the store is refused.
-    Unimplemented,
 }
 
 /// git's `hash_algo_by_name` recognizes exactly `sha1` and `sha256`, and this
@@ -917,24 +874,72 @@ fn object_hash_of(fmt: Option<&str>) -> Option<gix::hash::Kind> {
     }
 }
 
-/// git's ref storage formats are exactly `files` and `reftable`. `files` is the
-/// backend gix writes, so it is a no-op match; `reftable` has no vendored
-/// backend and is rejected honestly.
+/// git's ref storage formats are exactly `files` and `reftable`
+/// (`ref_storage_format_by_name()`, refs.c:51-57, a case-sensitive compare).
+/// `files` is the backend gix writes; `reftable` is laid down through
+/// `gix-reftable` (see [`create_repository`]).
 fn check_ref_format(fmt: &str) -> Result<FormatCheck> {
     match fmt {
-        "files" => Ok(FormatCheck::Implemented),
-        "reftable" => Ok(FormatCheck::Unimplemented),
+        "files" | "reftable" => Ok(FormatCheck::Implemented),
         _ => Ok(FormatCheck::Unrecognized),
     }
 }
 
-/// The error every caller that would actually have to *write* a reftable store
-/// reports, rather than laying down a `files` repository under a name that
-/// promises otherwise.
-fn reftable_unsupported() -> anyhow::Error {
-    anyhow::anyhow!(
-        "the reftable ref storage format is not supported: no vendored reftable backend"
-    )
+/// The formats the configuration asks a new repository for, as
+/// `read_default_format_config()` (setup.c:2718-2761, v2.56.0) leaves them.
+#[derive(Default)]
+struct DefaultFormats {
+    /// `init.defaultObjectFormat`, when its last value names a known hash.
+    hash: Option<String>,
+    /// `init.defaultRefFormat`, or `reftable` from `feature.experimental`.
+    ref_format: Option<String>,
+}
+
+/// `repository_format_configure()`'s `config_with_options(read_default_format_config,
+/// …, .ignore_repo = 1)`: every system, global and command-line value in callback
+/// order. Each `init.default*Format` occurrence replaces the previous answer —
+/// an unknown name resets it to "unknown" with a warning — and
+/// `feature.experimental=true` selects `reftable` only while the ref format is
+/// still unknown at that point of the walk, which is how an explicit
+/// `init.defaultRefFormat` takes precedence wherever it sits.
+fn read_default_format_config() -> Result<DefaultFormats> {
+    let mut cfg = DefaultFormats::default();
+    for (key, value) in crate::config::config_entries_in_order(None) {
+        match (key.as_str(), value) {
+            ("init.defaultobjectformat", Some(v)) => {
+                let known = matches!(check_object_format(&v), Ok(FormatCheck::Implemented));
+                if !known {
+                    eprintln!("warning: unknown hash algorithm '{v}'");
+                }
+                cfg.hash = known.then_some(v);
+            }
+            ("init.defaultrefformat", Some(v)) => {
+                let known = matches!(check_ref_format(&v), Ok(FormatCheck::Implemented));
+                if !known {
+                    eprintln!("warning: unknown ref storage format '{v}'");
+                }
+                cfg.ref_format = known.then_some(v);
+            }
+            ("feature.experimental", value) if cfg.ref_format.is_none() => {
+                // `git_config_bool()`: a valueless key is true, and a value it
+                // cannot read dies.
+                let on = match value.as_deref() {
+                    None => true,
+                    Some(v) => match crate::optint::maybe_bool(v) {
+                        Some(b) => b,
+                        None => crate::git_fatal!(
+                            "bad boolean config value '{v}' for 'feature.experimental'"
+                        ),
+                    },
+                };
+                if on {
+                    cfg.ref_format = Some("reftable".to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(cfg)
 }
 
 /// `extensions.refStorage` as an existing repository records it, defaulting to
@@ -947,15 +952,6 @@ fn repository_ref_format(git_dir: &Path) -> String {
                 .map(|v| v.to_string())
         })
         .unwrap_or_else(|| "files".to_string())
-}
-
-/// Read a non-empty string config value from `repo`'s resolved configuration
-/// (any scope), the way git's `git_config_get_string` sees it.
-fn config_string(repo: &gix::Repository, key: &str) -> Option<String> {
-    repo.config_snapshot()
-        .string(key)
-        .map(|v| v.to_string())
-        .filter(|v| !v.trim().is_empty())
 }
 
 /// Read a boolean config value from `repo`'s resolved configuration (any scope).
@@ -1000,6 +996,13 @@ fn create_repository(
 
     let path = gix::create::into(directory, kind, create_opts)?;
     let (git_dir, _) = path.into_repository_and_work_tree_directories();
+    // `create_reference_database()` → `ref_store_create_on_disk()`: for reftable,
+    // the `reftable/` directory and the `HEAD`/`refs/heads` stubs. gix left the
+    // reference database out, and a git directory is only recognised by its `HEAD`.
+    if create_opts.ref_storage_reftable {
+        super::refs_migrate::create_on_disk_stubs(&git_dir)
+            .map_err(|source| gix::init::Error::Init(gix::create::Error::IoWrite { source, path: git_dir.clone() }))?;
+    }
     let open = gix::open::Options::default_for_level(gix::sec::Trust::Full).open_path_as_is(true);
     Ok(gix::open_opts(git_dir, open)?)
 }

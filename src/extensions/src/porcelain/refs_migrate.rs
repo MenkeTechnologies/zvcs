@@ -173,10 +173,7 @@ fn write_options(repo: &gix::Repository) -> WriteOptions {
 /// `refs_create_refdir_stubs()` (refs.c:2202-2223) — a `HEAD` pointing at the
 /// invalid branch `.invalid`, and a `refs/heads` *file* naming the format.
 fn create_on_disk(repo: &gix::Repository, dir: &Path) -> Result<()> {
-    std::fs::create_dir(dir.join("reftable"))?;
-    std::fs::write(dir.join("HEAD"), "ref: refs/heads/.invalid\n")?;
-    std::fs::create_dir(dir.join("refs"))?;
-    std::fs::write(dir.join("refs/heads"), "this repository uses the reftable format\n")?;
+    create_on_disk_stubs(dir)?;
     let shared = repo
         .config_snapshot()
         .string("core.sharedRepository")
@@ -186,6 +183,35 @@ fn create_on_disk(repo: &gix::Repository, dir: &Path) -> Result<()> {
         super::init::adjust_shared_perm_recursive(dir, shared)?;
     }
     Ok(())
+}
+
+/// The files [`create_on_disk`] lays down, without the shared-permission pass —
+/// what `git init --ref-format=reftable` needs before the repository can even be
+/// opened, since a git directory is only recognised by its `HEAD`. `init` widens
+/// the permissions of the whole git directory afterwards.
+pub(super) fn create_on_disk_stubs(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(dir.join("reftable"))?;
+    std::fs::write(dir.join("HEAD"), "ref: refs/heads/.invalid\n")?;
+    std::fs::create_dir(dir.join("refs"))?;
+    std::fs::write(dir.join("refs/heads"), "this repository uses the reftable format\n")?;
+    Ok(())
+}
+
+/// `refs_update_symref(get_main_ref_store(repo), "HEAD", target, NULL)` on a
+/// fresh reftable store, as `create_reference_database()` (setup.c:2527-2563)
+/// points `HEAD` at the initial branch: one table holding the single symref
+/// record at the stack's first update index. The log message is `NULL`, so no
+/// reflog record is written.
+pub(super) fn init_symref_head(repo: &gix::Repository, target: &gix::bstr::BStr) -> Result<()> {
+    let opts = write_options(repo);
+    let mut stack = Stack::new(&repo.common_dir().join("reftable"), &opts)
+        .map_err(|e| anyhow::anyhow!("reftable: {e}"))?;
+    let head = Ref {
+        name: "HEAD".into(),
+        value: RefValue::Symref(target.to_owned()),
+    };
+    commit_initial(&mut stack, &opts, vec![head], Vec::new())
+        .map_err(|e| anyhow::anyhow!("reftable: transaction failure: {e}"))
 }
 
 /// `refs_for_each_ref_ext(old_refs, migrate_one_ref, …)` with

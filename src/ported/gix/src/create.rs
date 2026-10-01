@@ -139,6 +139,13 @@ pub struct Options {
     /// Otherwise, create a repository without an explicit object-format extension,
     /// which is interpreted as legacy SHA-1.
     pub object_hash: Option<gix_hash::Kind>,
+    /// Lay the repository down for the `reftable` ref storage format: write
+    /// `extensions.refStorage = reftable` (with the version-1 bump every extension
+    /// needs), and leave the reference database — `HEAD`, `refs/` — to the caller,
+    /// which creates the reftable stack and its stubs. git writes neither
+    /// `refs/heads/` nor `refs/tags/` directories for that backend
+    /// (`reftable_be_create_on_disk()`, refs/reftable-backend.c:497-511).
+    pub ref_storage_reftable: bool,
 }
 
 impl Default for Options {
@@ -147,6 +154,7 @@ impl Default for Options {
             destination_must_be_empty: None,
             fs_capabilities: None,
             object_hash: default_object_hash(),
+            ref_storage_reftable: false,
         }
     }
 }
@@ -178,6 +186,7 @@ pub fn into(
         fs_capabilities,
         destination_must_be_empty,
         object_hash,
+        ref_storage_reftable,
     }: Options,
 ) -> Result<gix_discover::repository::Path, Error> {
     let mut dot_git = directory.into();
@@ -246,15 +255,16 @@ pub fn into(
         create_dir(PathCursor(cursor.as_mut()).at("pack"))?;
     }
 
-    {
+    if !ref_storage_reftable {
         let mut cursor = NewDir(&mut dot_git).at("refs")?;
         create_dir(PathCursor(cursor.as_mut()).at("heads"))?;
         create_dir(PathCursor(cursor.as_mut()).at("tags"))?;
     }
 
-    for (tpl, filename) in &[(TPL_HEAD, "HEAD"), (TPL_DESCRIPTION, "description")] {
-        write_file(tpl, PathCursor(&mut dot_git).at(filename))?;
+    if !ref_storage_reftable {
+        write_file(TPL_HEAD, PathCursor(&mut dot_git).at("HEAD"))?;
     }
+    write_file(TPL_DESCRIPTION, PathCursor(&mut dot_git).at("description"))?;
 
     let caps = {
         let (mut config_file, config_path) = {
@@ -274,7 +284,8 @@ pub fn into(
             //  1. `initialize_repository_version()` (setup.c:2419) — the object
             //     format first (which is why a SHA-256 repository opens with
             //     `[extensions]`, before `[core]` exists at all), then
-            //     `core.repositoryformatversion`.
+            //     `extensions.refstorage` (setup.c:2465-2481, v2.56.0) — either one
+            //     bumps the version — then `core.repositoryformatversion`.
             //  2. `core.filemode` (setup.c:2601), `core.bare` (2603/2606).
             //  3. `core.logallrefupdates`, for a non-bare repository only (2609).
             //  4. `core.symlinks`, written *only* as `false` and *only* when the
@@ -285,17 +296,21 @@ pub fn into(
             //     `probe_utf8_pathname_composition()` (compat/precompose_utf8.c:45),
             //     which is a no-op macro off macOS and so writes nothing there.
             #[cfg(feature = "sha256")]
-            if let Some(gix_hash::Kind::Sha256) = object_hash {
+            let sha256 = matches!(object_hash, Some(gix_hash::Kind::Sha256));
+            #[cfg(not(feature = "sha256"))]
+            let sha256 = false;
+            if sha256 || ref_storage_reftable {
                 let mut extensions = config.new_section("extensions", None).expect("valid section name");
-                extensions.push("objectformat", gix_hash::Kind::Sha256.to_string())?;
+                if sha256 {
+                    extensions.push("objectformat", "sha256")?;
+                }
+                if ref_storage_reftable {
+                    extensions.push("refstorage", "reftable")?;
+                }
             }
             let mut core = config.new_section("core", None).expect("valid section name");
 
-            let format_version = match object_hash {
-                #[cfg(feature = "sha256")]
-                Some(gix_hash::Kind::Sha256) => "1",
-                _ => "0",
-            };
+            let format_version = if sha256 || ref_storage_reftable { "1" } else { "0" };
             core.push("repositoryformatversion", format_version)?;
             core.push("filemode", bool(caps.executable_bit))?;
             core.push("bare", bool(bare))?;

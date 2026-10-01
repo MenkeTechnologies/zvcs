@@ -4350,9 +4350,22 @@ fn is_conflict_marker(line: &[u8]) -> bool {
 /// applies (`DEFAULT_CONFLICT_MARKER_SIZE`, merge-ll.h).
 pub(crate) const DEFAULT_CONFLICT_MARKER_SIZE: usize = 7;
 
-/// `is_conflict_marker()` (diff.c:3522): `marker_size` repeats of one of
-/// `=`, `>`, `<`, `|` followed by a whitespace byte. The caller passes the line
-/// *with* its terminator, which is what can satisfy the trailing-space test.
+/// `is_conflict_marker_line()` (merge-ll.c:471-501), which 2.56 moved out of
+/// diff.c so `add --resolved` could share it: `marker_size` repeats of one of
+/// `=`, `>`, `<`, `|` followed by a whitespace byte — and for `<` and `>`, the
+/// two that carry a label, that byte must be a space:
+///
+/// ```c
+/// if (((firstchar == '<') || (firstchar == '>')) &&
+///     line[marker_size] != ' ')
+///         return 0;
+///
+/// if (!isspace((unsigned char)line[marker_size]))
+///         return 0;
+/// ```
+///
+/// The caller passes the line *with* its terminator, which is what can satisfy
+/// the trailing-space test for `=` and `|`.
 pub(crate) fn is_conflict_marker_sized(line: &[u8], marker_size: usize) -> bool {
     if line.len() < marker_size + 1 {
         return false;
@@ -4362,6 +4375,9 @@ pub(crate) fn is_conflict_marker_sized(line: &[u8], marker_size: usize) -> bool 
         return false;
     }
     if line[1..marker_size].iter().any(|b| *b != first) {
+        return false;
+    }
+    if matches!(first, b'<' | b'>') && line[marker_size] != b' ' {
         return false;
     }
     diff_color::is_c_space(line[marker_size])

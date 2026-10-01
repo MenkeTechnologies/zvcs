@@ -384,7 +384,10 @@ pub fn list_cmds(spec: &str) -> ExitCode {
             "main" => list.extend(main_cmds()),
             "others" => list.extend(other_cmds()),
             "nohelpers" => exclude_helpers(&mut list),
-            "alias" => list.extend(help::alias_names()),
+            "alias" => match help::alias_entries() {
+                Ok(entries) => list.extend(entries.into_iter().map(|(name, _)| name)),
+                Err(code) => return code,
+            },
             "config" => apply_completion_commands(&mut list),
             "deprecated" => {
                 list.extend(

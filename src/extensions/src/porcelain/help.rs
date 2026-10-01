@@ -1491,6 +1491,8 @@ enum Mode {
     ConfigVars,
     /// `--config-sections-for-completion`, git's `SHOW_CONFIG_SECTIONS`.
     ConfigSections,
+    /// `--aliases-for-completion`, git's `HELP_ACTION_ALIASES_FOR_COMPLETION`.
+    AliasesForCompletion,
     UserInterfaces,
     DeveloperInterfaces,
 }
@@ -1505,6 +1507,7 @@ impl Mode {
             Mode::Config => "-c",
             Mode::ConfigVars => "--config-for-completion",
             Mode::ConfigSections => "--config-sections-for-completion",
+            Mode::AliasesForCompletion => "--aliases-for-completion",
             Mode::UserInterfaces => "--user-interfaces",
             Mode::DeveloperInterfaces => "--developer-interfaces",
         }
@@ -1518,6 +1521,7 @@ impl Mode {
             Mode::Config => "--config",
             Mode::ConfigVars => "--config-for-completion",
             Mode::ConfigSections => "--config-sections-for-completion",
+            Mode::AliasesForCompletion => "--aliases-for-completion",
             Mode::UserInterfaces => "--user-interfaces",
             Mode::DeveloperInterfaces => "--developer-interfaces",
         }
@@ -1579,6 +1583,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 | "config"
                 | "config-for-completion"
                 | "config-sections-for-completion"
+                | "aliases-for-completion"
                 | "user-interfaces"
                 | "developer-interfaces" => {
                     let m = match long {
@@ -1587,6 +1592,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                         "config" => Mode::Config,
                         "config-for-completion" => Mode::ConfigVars,
                         "config-sections-for-completion" => Mode::ConfigSections,
+                        "aliases-for-completion" => Mode::AliasesForCompletion,
                         "user-interfaces" => Mode::UserInterfaces,
                         _ => Mode::DeveloperInterfaces,
                     };
@@ -1732,6 +1738,24 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             for key in config_keys_uniq(set_config_sections) {
                 println!("{key}");
             }
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Mode::AliasesForCompletion) => {
+            // `printf("%s%c%s%c", name, '\n', value, '\0')` per alias
+            // (builtin/help.c:722-724): the expansion may span lines, so each
+            // record ends in a NUL for `git-completion.zsh` to split on.
+            let entries = match alias_entries() {
+                Ok(entries) => entries,
+                Err(code) => return Ok(code),
+            };
+            let mut out = String::new();
+            for (name, value) in entries {
+                out.push_str(&name);
+                out.push('\n');
+                out.push_str(&value);
+                out.push('\0');
+            }
+            print!("{out}");
             Ok(ExitCode::SUCCESS)
         }
         None => {
@@ -2084,32 +2108,58 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-/// The alias *names* alone, in **configuration order** — `list_aliases()`
-/// (alias.c), which is what `git --list-cmds=alias` prints.
+/// Every configured alias as `(name, expansion)`, in **configuration order** —
+/// `list_aliases()` (alias.c), behind both `git --list-cmds=alias` and
+/// `git help --aliases-for-completion`.
 ///
-/// Not the sorted, last-wins view [`alias_list`] builds. `list_aliases()` is a
-/// config callback that appends every `alias.<name>` it is handed, so the
-/// listing follows the files (system, then global, then repository, then `-c`)
-/// and repeats a name that is defined twice. Stock, verified:
+/// Not the sorted, last-wins view [`alias_list`] builds. `list_aliases()` hands
+/// `config_alias_cb()` to `read_early_config()`, and the callback appends every
+/// alias it is handed, so the listing follows the files (system, then global,
+/// then repository, then `-c`) and repeats a name that is defined twice. Stock,
+/// verified:
 ///
 /// ```text
 /// $ git -c alias.zz=status -c alias.aa=log -c alias.zz=diff --list-cmds=alias
 /// … zz aa zz
 /// ```
 ///
-/// The expansion is carried as the string list's `util` there and never
-/// printed, so it is dropped here too.
-pub(crate) fn alias_names() -> Vec<String> {
+/// The name follows `config_alias_cb()`'s two syntaxes: `alias.<name>` is the
+/// key after `alias.`, `[alias "<name>"] command` is the subsection, and an
+/// empty subsection is plain `[alias]`. A subsection whose variable is not
+/// `command` falls back to the two-level form, so `alias.x.y` names `x.y`.
+///
+/// A valueless alias is `config_error_nonbool()`, whose `-1` aborts the read:
+/// `read_early_config()` dies with the reader's own second line, so `Err` is the
+/// exit status once both lines are on stderr.
+pub(crate) fn alias_entries() -> Result<Vec<(String, String)>, ExitCode> {
     let repo = crate::setup::discover().ok();
-    // `list_aliases()` is a `repo_config()` callback that appends the name after
-    // `alias.` for every occurrence, in callback order. The keys come already
-    // normalised — section and variable lower-cased — so `[alias] Foo` lists as
-    // `foo`. The ordered walk hands each `-c` over once; the raw snapshot sees a
-    // valued one twice once the overrides are recorded for `setup::discover`.
-    crate::config::config_keys_in_order(repo.as_ref())
-        .into_iter()
-        .filter_map(|key| key.strip_prefix("alias.").map(str::to_string))
-        .collect()
+    let mut out = Vec::new();
+    for entry in crate::config::walk_config_gently(repo.as_ref()) {
+        let Some(rest) = entry.key.strip_prefix("alias.") else {
+            continue;
+        };
+        // `parse_config_key()`: the subsection runs to the last dot, the
+        // variable is what follows it.
+        let name = match rest.rsplit_once('.') {
+            Some(("", "command")) => "command",
+            Some((subsection, "command")) => subsection,
+            _ => rest,
+        };
+        let Some(value) = entry.value else {
+            eprintln!("error: missing value for '{}'", entry.key);
+            match &entry.origin {
+                crate::config::ValueOrigin::File { path, line } => {
+                    eprintln!("fatal: bad config line {line} in file {path}")
+                }
+                crate::config::ValueOrigin::CommandLine => {
+                    eprintln!("fatal: unable to parse command-line config")
+                }
+            }
+            return Err(ExitCode::from(128));
+        };
+        out.push((name.to_string(), value));
+    }
+    Ok(out)
 }
 
 /// `completion.commands`, the edit script `--list-cmds=config` applies

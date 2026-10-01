@@ -663,6 +663,10 @@ pub fn set_multivar_in_file(
     comment: Option<&str>,
     multi_replace: bool,
 ) -> Result<(), StoreError> {
+    // The lock comes first and serves a purpose in addition to locking: the new
+    // contents are written into it (config.c:3063-3073).
+    let target = resolve_symlink(path);
+    let lock = ConfigLock::hold(&target).map_err(StoreError::Io)?;
     let matcher = match pattern {
         ValuePattern::Any => Matcher::Any,
         ValuePattern::Never => Matcher::Never,
@@ -696,7 +700,6 @@ pub fn set_multivar_in_file(
         previous_offset: 0,
     };
 
-    let target = resolve_symlink(path);
     let contents = match std::fs::read(&target) {
         Ok(bytes) => Some(bytes),
         // ENOENT takes the "write a minimal version" branch; every other errno is the
@@ -719,7 +722,7 @@ pub fn set_multivar_in_file(
         };
         out.extend_from_slice(&store_create_section(key.as_bytes(), baselen));
         out.extend_from_slice(&write_pair(key.as_bytes(), baselen, value, comment));
-        write_file(&target, &out, None)?;
+        lock.commit(&out, None).map_err(StoreError::Io)?;
         return Ok(());
     };
 
@@ -794,7 +797,7 @@ pub fn set_multivar_in_file(
         out.extend_from_slice(&contents[copy_begin..]);
     }
 
-    write_file(&target, &out, Some(&target))?;
+    lock.commit(&out, Some(&target)).map_err(StoreError::Io)?;
     Ok(())
 }
 
@@ -810,6 +813,9 @@ const MAX_LINE_LEN: usize = 512 * 1024;
 pub enum RenameError {
     /// `refusing to work with overly long line in '<file>' on line <n>`.
     LongLine(usize),
+    /// `could not lock config file <file>` — `error()`, not `error_errno()`, so no
+    /// errno text follows (config.c:3413-3418).
+    NoLock,
     Io(std::io::Error),
 }
 
@@ -882,10 +888,16 @@ pub fn copy_or_rename_section_in_file(
     copy: bool,
 ) -> Result<usize, RenameError> {
     let target = resolve_symlink(path);
+    let lock = ConfigLock::hold(&target).map_err(|_| RenameError::NoLock)?;
     let contents = match std::fs::read(&target) {
         Ok(bytes) => bytes,
-        // No config file means nothing to rename, and no error.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        // No config file means nothing to rename, and no error — but the lock is
+        // still committed (`goto commit_and_out`, config.c:3421-3427), which leaves
+        // an empty file behind.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            lock.commit(&[], None).map_err(RenameError::Io)?;
+            return Ok(0);
+        }
         Err(err) => return Err(RenameError::Io(err)),
     };
 
@@ -965,17 +977,8 @@ pub fn copy_or_rename_section_in_file(
         out.extend_from_slice(&copystr);
     }
 
-    write_file(&target, &out, Some(&target))?;
+    lock.commit(&out, Some(&target)).map_err(RenameError::Io)?;
     Ok(ret)
-}
-
-impl From<StoreError> for RenameError {
-    fn from(err: StoreError) -> Self {
-        match err {
-            StoreError::Io(err) => RenameError::Io(err),
-            _ => RenameError::Io(std::io::Error::other("config write failed")),
-        }
-    }
 }
 
 /// `strbuf_getwholeline(&buf, f, '\n')`: each line keeps its terminator, and a final
@@ -1022,26 +1025,120 @@ fn resolve_symlink(path: &Path) -> PathBuf {
     path
 }
 
-/// Replace `path` with `bytes` atomically, carrying over the permissions of
-/// `mode_from` — git chmods its lock file to `st.st_mode & 07777` of the original
-/// (config.c:3155) so that a `git config` write does not widen a tightened config.
-fn write_file(path: &Path, bytes: &[u8], mode_from: Option<&Path>) -> Result<(), StoreError> {
-    use std::io::Write;
+/// `config_lock_timeout_ms()` (config.c:2966-2982, git 2.56): how long to retry
+/// `config.lock` while another process holds it. `core.configLockTimeout`,
+/// default 1000 to match `core.packedRefsTimeout`, read once per process from
+/// `the_repository` — so a value that is not an `int` dies on every write, before
+/// any contention, with `die_bad_number()`'s text.
+fn config_lock_timeout_ms() -> i64 {
+    static TIMEOUT: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let repo = crate::setup::discover().ok();
+        match crate::config::config_int_gently(repo.as_ref(), "core.configlocktimeout") {
+            Ok(value) => value.unwrap_or(1000),
+            Err(message) => crate::config::die_128(&message),
+        }
+    })
+}
 
-    let tmp = path.with_extension("zvcs-tmp");
-    {
-        let mut f = std::fs::File::create(&tmp).map_err(StoreError::Io)?;
-        f.write_all(bytes).map_err(StoreError::Io)?;
+/// `INITIAL_BACKOFF_MS` and `BACKOFF_MAX_MULTIPLIER` (lockfile.c:198-199).
+const INITIAL_BACKOFF_MS: i64 = 1;
+const BACKOFF_MAX_MULTIPLIER: i64 = 1000;
+
+/// A held `<file>.lock`: `struct lock_file` between `hold_lock_file_for_update()` and
+/// `commit_lock_file()`. Dropping it uncommitted is `rollback_lock_file()`.
+struct ConfigLock {
+    lock_path: PathBuf,
+    target: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl ConfigLock {
+    /// `repo_hold_lock_file_for_update_timeout(r, &lock, path, 0,
+    /// config_lock_timeout_ms(r))` — `lock_file_timeout()` (lockfile.c:206-253) over
+    /// `lock_file()` (lockfile.c:168-190). `target` is already `resolve_symlink()`ed.
+    ///
+    /// Only `EEXIST` is retried; any other errno fails at once. The backoff is
+    /// quadratic in milliseconds, jittered to 0.75-1.25 of the step by `rand()`
+    /// seeded with the pid, and a negative timeout retries forever.
+    fn hold(target: &Path) -> std::io::Result<Self> {
+        let timeout_ms = config_lock_timeout_ms();
+        let mut lock_path = target.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let lock_file = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+        };
+        let held = |file| ConfigLock {
+            lock_path: lock_path.clone(),
+            target: target.to_owned(),
+            file: Some(file),
+        };
+        if timeout_ms == 0 {
+            return lock_file().map(held);
+        }
+        // `random_initialized`: seeded once per process, with the pid.
+        static SEEDED: std::sync::Once = std::sync::Once::new();
+        // SAFETY: `srand()`/`rand()` take and return plain integers; this is the
+        // same libc generator lockfile.c uses.
+        SEEDED.call_once(|| unsafe { libc::srand(std::process::id()) });
+        let mut remaining_ms = timeout_ms;
+        let (mut n, mut multiplier) = (1i64, 1i64);
+        loop {
+            match lock_file() {
+                Ok(file) => return Ok(held(file)),
+                Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err),
+                Err(err) if timeout_ms > 0 && remaining_ms <= 0 => return Err(err),
+                Err(_) => {}
+            }
+            let backoff_ms = multiplier * INITIAL_BACKOFF_MS;
+            // SAFETY: see above.
+            let jitter = i64::from(unsafe { libc::rand() } % 500);
+            let wait_ms = (750 + jitter) * backoff_ms / 1000;
+            std::thread::sleep(std::time::Duration::from_millis(wait_ms as u64));
+            remaining_ms -= wait_ms;
+            multiplier += 2 * n + 1;
+            if multiplier > BACKOFF_MAX_MULTIPLIER {
+                multiplier = BACKOFF_MAX_MULTIPLIER;
+            } else {
+                n += 1;
+            }
+        }
+    }
+
+    /// Write `bytes` into the lock and `commit_lock_file()` it over the target,
+    /// carrying over the permissions of `mode_from` — git chmods its lock file to
+    /// `st.st_mode & 07777` of the original (config.c:3155) so that a `git config`
+    /// write does not widen a tightened config.
+    fn commit(mut self, bytes: &[u8], mode_from: Option<&Path>) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut file = self.file.take().expect("a held lock has its file");
+        file.write_all(bytes)?;
         #[cfg(unix)]
         if let Some(from) = mode_from {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(from) {
                 let mode = meta.permissions().mode() & 0o7777;
-                f.set_permissions(std::fs::Permissions::from_mode(mode)).ok();
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
         }
-        f.sync_all().map_err(StoreError::Io)?;
+        drop(file);
+        std::fs::rename(&self.lock_path, &self.target)?;
+        self.lock_path = PathBuf::new();
+        Ok(())
     }
-    std::fs::rename(&tmp, path).map_err(StoreError::Io)?;
-    Ok(())
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        if !self.lock_path.as_os_str().is_empty() {
+            self.file.take();
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+    }
 }

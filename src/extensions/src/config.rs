@@ -489,6 +489,24 @@ pub fn config_int_named(
     }
 }
 
+/// [`config_int`] for a reader that may run outside a repository:
+/// `repo_config_get_int(the_repository, …)` with no repository found reads the
+/// system/global cascade and the command line only.
+pub fn config_int_gently(repo: Option<&gix::Repository>, key: &str) -> Result<Option<i64>, String> {
+    let wanted = normalize_key(key);
+    let Some(last) = occurrences_for(repo).into_iter().rev().find(|o| o.key == wanted) else {
+        return Ok(None);
+    };
+    let origin = match &last.path {
+        Some(p) => format!(" in file {}", shown_path(p)),
+        None => String::new(),
+    };
+    let raw = last.value.unwrap_or_default();
+    parse_config_int(&raw)
+        .map(Some)
+        .map_err(|reason| format!("bad numeric config value '{raw}' for '{wanted}'{origin}: {reason}"))
+}
+
 /// git's `die_bad_number` message, minus the `fatal: ` prefix the caller adds.
 /// The key is lowercased because git's config reader has already normalised it by
 /// the time the number is parsed.
@@ -1336,7 +1354,7 @@ pub fn die_config_linenr(repo: Option<&gix::Repository>, key: &str) -> String {
 }
 
 /// `die()`: `fatal: <message>` on stderr, flush stdout as `exit()` does, exit 128.
-fn die_128(message: &str) -> ! {
+pub(crate) fn die_128(message: &str) -> ! {
     use std::io::Write as _;
 
     eprintln!("fatal: {message}");

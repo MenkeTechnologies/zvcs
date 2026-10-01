@@ -313,6 +313,15 @@ struct WriteTarget {
     create_parent: bool,
 }
 
+impl WriteTarget {
+    /// `config_filename` as the store's diagnostics print it: gitoxide names the
+    /// repository config `./.git/config`, git `.git/config`.
+    fn shown(&self) -> String {
+        let shown = self.path.to_string_lossy();
+        shown.strip_prefix("./").unwrap_or(&shown).to_string()
+    }
+}
+
 /// Exit 129 — git's usage-error code — after emitting `error: <msg>` on stderr.
 ///
 /// `anyhow::bail!` would collapse to exit 1, so every usage diagnostic has to
@@ -3946,14 +3955,18 @@ fn rename_or_remove(target: &WriteTarget, old: &str, new: Option<&str>) -> Resul
         Err(crate::config_store::RenameError::LongLine(line)) => {
             eprintln!(
                 "error: refusing to work with overly long line in '{}' on line {line}",
-                target.path.display()
+                target.shown()
             );
+            Ok(ExitCode::from(255))
+        }
+        Err(crate::config_store::RenameError::NoLock) => {
+            eprintln!("error: could not lock config file {}", target.shown());
             Ok(ExitCode::from(255))
         }
         Err(crate::config_store::RenameError::Io(err)) => {
             eprintln!(
                 "error: could not lock config file {}: {}",
-                target.path.display(),
+                target.shown(),
                 errno_text(&err)
             );
             Ok(ExitCode::from(255))
@@ -4495,7 +4508,7 @@ fn store_set(
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(crate::config_store::StoreError::NothingSet) => Ok(ExitCode::from(5)),
         Err(crate::config_store::StoreError::InvalidFile) => {
-            eprintln!("error: invalid config file {}", target.path.display());
+            eprintln!("error: invalid config file {}", target.shown());
             Ok(ExitCode::from(3))
         }
         Err(crate::config_store::StoreError::InvalidPattern(pattern)) => {
@@ -4505,7 +4518,7 @@ fn store_set(
         Err(crate::config_store::StoreError::Io(err)) => {
             eprintln!(
                 "error: could not lock config file {}: {}",
-                target.path.display(),
+                target.shown(),
                 errno_text(&err)
             );
             Ok(ExitCode::from(255))

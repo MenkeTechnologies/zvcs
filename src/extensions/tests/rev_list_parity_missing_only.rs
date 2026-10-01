@@ -1,11 +1,11 @@
 //! `git rev-list --missing-only`, new in git 2.56.
 //!
 //! builtin/rev-list.c (2.56.0): the pre-`setup_revisions()` scan takes the
-//! option (:778-779) and dies unless that same scan saw `--missing=print` or
+//! option (:774-775) and dies unless that same scan saw `--missing=print` or
 //! `--missing=print-info` (:782-783); `--count` and `--disk-usage` are refused
 //! (:943-946); `show_commit()` and `show_object()` return before any output
 //! (:263-266, :406-407); and `print_missing_object()` drops the `?` prefix
-//! unless `-z` is in effect (:170-176). Every expectation below was measured
+//! unless `-z` is in effect (:171-176). Every expectation below was measured
 //! against stock git 2.56.0 on this exact fixture.
 
 use std::path::PathBuf;

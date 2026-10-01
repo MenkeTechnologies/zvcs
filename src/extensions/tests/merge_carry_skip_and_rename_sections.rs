@@ -521,29 +521,49 @@ fn nothing_left_but_skips_reports_the_candidates_and_exits_two() {
 }
 
 #[test]
-fn a_range_operand_is_refused_before_any_state_is_written() {
+fn a_range_operand_skips_every_commit_it_names() {
+    // `bisect_skip()` (builtin/bisect.c:1111-1146, v2.56.0) expands an operand
+    // containing `..` with a revision walk and records each commit it yields as
+    // its own skip, newest first. Measured against git 2.56.0 on this fixture.
     let f = linear("bi-range", 15);
     f.run(&["bisect", "start", "c15", "c1"]);
     let before = std::fs::read_to_string(f.work.join(".git/BISECT_LOG")).unwrap();
 
-    let (code, _, err) = f.run(&["bisect", "skip", "c4..c11"]);
-    assert_ne!(code, 0, "the range form must not be silently approximated");
-    assert!(
-        err.contains("`bisect skip <a>..<b>` is not supported"),
-        "stderr: {err:?}"
+    let (code, out, err) = f.run(&["bisect", "skip", "c4..c11"]);
+    assert_eq!(code, 0, "stderr: {err:?}");
+    assert_eq!(err, "", "stderr");
+    let c13 = f.rev("c13");
+    assert_eq!(
+        out,
+        format!("Bisecting: 6 revisions left to test after this (roughly 3 steps)\n[{c13}] c13\n")
     );
-    // Refused up front: no ref, no log line, no move.
-    let (_, refs, _) = f.run(&["for-each-ref", "--format=%(refname)", "refs/bisect/"]);
-    assert!(!refs.contains("skip-"), "a refused range still wrote refs:\n{refs}");
+    assert_eq!(f.rev("HEAD"), c13, "the step after the skip");
+
+    // One ref per commit in the range — c5 through c11, c4 excluded — and nothing else.
+    let (_, refs, _) = f.run(&["for-each-ref", "--format=%(refname)", "refs/bisect/skip-*"]);
+    let mut want: Vec<String> = (5..=11)
+        .map(|i| format!("refs/bisect/skip-{}", f.rev(&format!("c{i}"))))
+        .collect();
+    want.sort();
+    let mut got: Vec<&str> = refs.lines().collect();
+    got.sort_unstable();
+    assert_eq!(got, want, "skip refs");
+
+    // Two log lines per commit, in the walk's order: c11 down to c5.
+    let mut appended = String::new();
+    for i in (5..=11).rev() {
+        let id = f.rev(&format!("c{i}"));
+        appended.push_str(&format!("# skip: [{id}] c{i}\ngit bisect skip {id}\n"));
+    }
     assert_eq!(
         std::fs::read_to_string(f.work.join(".git/BISECT_LOG")).unwrap(),
-        before,
-        "a refused range appended to the log"
+        format!("{before}{appended}"),
+        "BISECT_LOG"
     );
-    assert_eq!(f.rev("HEAD"), f.rev("c8"), "a refused range moved HEAD");
 
-    // The individual revisions are not refused.
+    // The individual revisions are still accepted afterwards.
     let (code, _, err) = f.run(&["bisect", "skip", "c8", "c9"]);
     assert_eq!(code, 0, "explicit revisions must still work: {err}");
     assert!(f.exists(".git/BISECT_LOG"));
 }
+

@@ -46,7 +46,10 @@ impl Repository {
     /// full access to both indices that contributed to the change.
     ///
     /// *(It's notable that internally, the `tree_id` is converted into an index before diffing these)*.
-    /// Set `pathspec` to `Some(_)` to further reduce the set of files to check.
+    /// Set `pathspec` to `Some(_)` to further reduce the set of files to check. With `None` every path in the
+    /// repository is checked, wherever the process was started: git's tree-vs-index comparisons with an empty
+    /// pathspec (`repo_index_has_changes()`, read-cache.c:2518-2544, and `run_diff_index()`) never consult the
+    /// cwd prefix.
     ///
     /// ### Notes
     ///
@@ -97,7 +100,8 @@ impl Repository {
         if pathspec.is_none() {
             pathspec_storage = self
                 .pathspec(
-                    true,
+                    // An empty pattern list matches the whole repository, not just the cwd.
+                    false,
                     None::<&str>,
                     false,
                     &gix_index::State::new(self.object_hash()),

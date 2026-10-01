@@ -1482,6 +1482,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-reftable"
+version = "0.1.0"
+dependencies = [
+ "bstr",
+ "gix-lock",
+ "gix-tempfile",
+ "gix-utils",
+ "gix-zlib",
+ "memmap2",
+ "thiserror",
+]
+
+[[package]]
 name = "gix-revision"
 version = "0.47.0"
 dependencies = [
@@ -4323,6 +4336,7 @@ dependencies = [
  "encoding_rs",
  "fancy-regex",
  "gix",
+ "gix-reftable",
  "ignore",
  "libc",
  "libloading",

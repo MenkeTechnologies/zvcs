@@ -1289,7 +1289,7 @@ fn copy_gecos(gecos: &str, login: &str) -> String {
 /// entry. git reads the account from the passwd database only — `USER` and
 /// `LOGNAME` never take part — so an environment without them still yields the
 /// same address stock git builds.
-fn passwd_self() -> (String, String) {
+pub(crate) fn passwd_self() -> (String, String) {
     // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc;
     // both fields are copied out before anything else can overwrite it.
     let pw = unsafe { libc::getpwuid(libc::getuid()) };

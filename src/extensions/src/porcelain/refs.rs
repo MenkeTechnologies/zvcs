@@ -21,21 +21,21 @@
 //!     ([`super::update_ref::write_cmdline`]), reporting a refused write as
 //!     `error:` and exit 1 where `update-ref` dies; `rename` is
 //!     `files_copy_or_rename_ref()`, which moves the ref and its reflog only.
-//!   * `git refs migrate --ref-format=<format>` up to the point where bytes would
-//!     move: the option scan, `usage: too many arguments`, `usage: missing
-//!     --ref-format=<format>`, `error: unknown ref storage format '<x>'`,
-//!     `error: repository already uses '<x>' format`, and — inside
-//!     `repo_migrate_ref_storage_format()` itself, ahead of either backend —
+//!   * `git refs migrate --ref-format=<format>`: the option scan, `usage: too many
+//!     arguments`, `usage: missing --ref-format=<format>`, `error: unknown ref
+//!     storage format '<x>'`, `error: repository already uses '<x>' format`,
 //!     `error: migrating repositories with worktrees is not supported yet`
-//!     (refs.c:3366) at exit 255. Every one of them is a decision about names,
-//!     the repository's current format, or its worktrees.
+//!     (refs.c:3366) at exit 255, and the `files` -> `reftable` migration itself,
+//!     `--dry-run` and `--no-reflog` included, in [`super::refs_migrate`]. The
+//!     table is written through `gix-reftable`, the port of git's `reftable/`
+//!     library, and matches stock's byte for byte.
 //!
 //! Not covered, and rejected with an error rather than approximated:
-//!   * the migration itself — `git refs migrate --ref-format=reftable` on a repo in
-//!     `files` format. The vendored `gix-ref` has no reftable backend at all (its
-//!     `store/` holds only the loose+packed files backend), so there is nothing to
-//!     migrate to. That same gap is why `verify` never reports
-//!     `badReftableTableName`.
+//!   * `reftable` -> `files`: it needs a files-backend initial transaction
+//!     (everything into `packed-refs`, reflogs written back out) fed from a
+//!     reftable *reader* wired into the ref store, and this build still serves a
+//!     reftable repository from its files stubs (see below). `verify` never
+//!     reports `badReftableTableName` for the same reason.
 //!
 //! Known divergence: usage *errors* raised inside `optimize` are reported by the
 //! `pack-refs` module, so their usage block reads `usage: git pack-refs ...`
@@ -572,10 +572,12 @@ fn verify(args: &[String]) -> Result<ExitCode> {
 /// `usage()` exits 129. The `error()` paths return `-1` up through `cmd_refs()`, which the
 /// process truncates to 255 — not 1, which is what an `error()` returning `1` would give.
 ///
-/// Only step 5, `repo_migrate_ref_storage_format()`, is out of reach: it writes the target
-/// backend, and the vendored `gix-ref` has no reftable implementation to write.
+/// Step 5, `repo_migrate_ref_storage_format()`, is [`super::refs_migrate::files_to_reftable`]
+/// for the `files` -> `reftable` direction; the reverse is refused (see the module docs).
 fn migrate(args: &[String]) -> Result<ExitCode> {
     let mut format_str: Option<String> = None;
+    // `REPO_MIGRATE_REF_STORAGE_FORMAT_DRYRUN` and `…_SKIP_REFLOG`.
+    let (mut dry_run, mut skip_reflog) = (false, false);
     let mut positionals: Vec<&str> = Vec::new();
     let mut end_of_opts = false;
     let mut i = 0usize;
@@ -638,8 +640,14 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
                     eprintln!("error: option `{shown}' takes no value");
                     return Ok(ExitCode::from(129));
                 }
-                // `dry-run` and `no-reflog` only set bits this port never reaches:
-                // the migration itself is refused below, before either could matter.
+                // `OPT_BIT`s: the plain spelling sets the bit, the `--no-` one
+                // (`--reflog` for `no-reflog`, whose name carries the negation)
+                // clears it.
+                match opt.name {
+                    "dry-run" => dry_run = !unset,
+                    "no-reflog" => skip_reflog = !unset,
+                    _ => {}
+                }
             }
             _ => {
                 eprintln!("error: unknown switch `{}'", &a[1..2]);
@@ -689,10 +697,21 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
-    bail!(
-        "refs migrate: cannot convert to '{format_str}': the vendored gix-ref implements only \
-         the loose+packed files backend, so there is no reftable writer to migrate into"
-    )
+    // Only `files` -> `reftable` is written here; see the module docs for why the
+    // other direction is refused rather than approximated.
+    if format_str != "reftable" {
+        bail!(
+            "refs migrate: cannot convert to '{format_str}': reading a reftable store into \
+             the files backend is not ported"
+        );
+    }
+    match super::refs_migrate::files_to_reftable(&repo, dry_run, skip_reflog)? {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(super::refs_migrate::Failed(msg)) => {
+            eprintln!("error: {msg}");
+            Ok(ExitCode::from(255))
+        }
+    }
 }
 
 /// The repository's reference backend, as `repo_settings`'s `ref_storage_format` resolves it:

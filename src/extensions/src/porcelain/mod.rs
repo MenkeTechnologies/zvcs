@@ -777,6 +777,7 @@ mod receive_pack;
 mod ref_filter;
 pub(crate) mod reflog;
 mod refs;
+mod refs_migrate;
 mod remote;
 mod remote_ext;
 mod remote_fd;

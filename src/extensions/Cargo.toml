@@ -40,6 +40,9 @@ gix = { path = "../ported/gix", features = [
     "merge",
     "sha256",
 ] }
+# git's `reftable/` library, ported: `git refs migrate --ref-format=reftable`
+# writes the new store through it.
+gix-reftable = { path = "../ported/gix-reftable" }
 # gitoxide already depends on prodash 31.0.0 (registry) and reports fetch and
 # checkout through its progress traits. `porcelain::fetch_progress` implements
 # those traits to draw git's own fetch meters; nothing renders the tree itself.

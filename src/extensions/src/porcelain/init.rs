@@ -1337,7 +1337,7 @@ const FORCE_DIR_SET_GID: bool = true;
 /// stored shared value. Positive values OR in extra bits; a negative value forces
 /// the low 9 bits to the requested file mode.
 #[cfg(unix)]
-fn calc_shared_perm(shared: i32, mode: u32) -> u32 {
+pub(crate) fn calc_shared_perm(shared: i32, mode: u32) -> u32 {
     const S_IWUSR: u32 = 0o200;
     const S_IXUSR: u32 = 0o100;
 

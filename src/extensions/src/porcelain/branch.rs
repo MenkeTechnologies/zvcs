@@ -671,6 +671,10 @@ struct Opts {
     /// `--recurse-submodules`: git's `recurse_submodules_explicit`, which only
     /// means anything once `submodule.propagateBranches` is enabled.
     recurse_submodules: bool,
+    /// The operands as typed, before `copy_branchname()` rewrote `names`:
+    /// `copy_or_rename_branch()` (builtin/branch.c:575-623) receives `argv`
+    /// untouched and reports and compares the names in that form.
+    raw_names: Vec<String>,
     names: Vec<String>,
 }
 
@@ -793,6 +797,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
         omit_empty: false,
         recurse_submodules: false,
         names: Vec::new(),
+        raw_names: Vec::new(),
     };
 
     // git seeds `colopts` from `column.ui` / `column.branch` while reading config,
@@ -1051,6 +1056,7 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
             || o.set_upstream_to.is_some()
             || o.unset_upstream);
         let count = if creating { 1 } else { o.names.len() };
+        o.raw_names = o.names.clone();
         for name in o.names.iter_mut().take(count) {
             match copy_branchname(&repo, name, allowed) {
                 Ok(rewritten) => *name = rewritten,
@@ -3061,6 +3067,108 @@ fn log_unchanged_rename(
 /// the branch to rename. git's reflog is a file keyed by ref name, so the rename
 /// is a file move followed by a normal update — that preserves history where a
 /// delete-and-create would drop it.
+/// The `(oldname, newname)` pair `cmd_branch()` hands `copy_or_rename_branch()`:
+/// `argv[0]`/`argv[1]` as typed, or the current branch's short name and
+/// `argv[0]` when only one name was given (builtin/branch.c:917-930).
+fn raw_copy_or_rename_names(o: &Opts, head_or_old: &str) -> (String, String) {
+    let raw = |i: usize| o.raw_names.get(i).unwrap_or(&o.names[i]).clone();
+    match o.names.len() {
+        1 => (head_or_old.to_string(), raw(0)),
+        _ => (raw(0), raw(1)),
+    }
+}
+
+/// `check_branch_ref()` (refs.c:762-782) once `copy_branchname()` has run:
+/// the leading-`-` test is on the operand as typed, the rest on the spliced
+/// `refs/heads/<interpreted>`.
+fn check_branch_ref(raw: &str, full: &str) -> bool {
+    !raw.starts_with('-')
+        && full != "refs/heads/HEAD"
+        && gix::validate::reference::branch_name(BStr::new(full.as_bytes())).is_ok()
+}
+
+/// The head of `copy_or_rename_branch()` (builtin/branch.c:584-597):
+///
+/// ```c
+/// if (check_branch_ref(&oldref, oldname)) {
+///         if (refs_ref_exists(get_main_ref_store(the_repository), oldref.buf))
+///                 recovery = 1;
+///         else {
+///                 int code = die_message(_("invalid branch name: '%s'"), oldname);
+///                 advise_if_enabled(ADVICE_REF_SYNTAX, _("See 'git help check-ref-format'"));
+///                 exit(code);
+///         }
+/// }
+/// ```
+///
+/// A bad name that nevertheless exists — `refs/heads/-x` or `refs/heads/HEAD`
+/// made by `update-ref` — is a *recovery*: the operation goes ahead so `-m`
+/// can move it out of the way, and a warning says so afterwards. `Ok(Ok(_))`
+/// carries that flag; `Ok(Err(_))` is the refusal, already reported.
+fn check_old_branch_name(
+    repo: &gix::Repository,
+    old_raw: &str,
+    old_full: &str,
+) -> Result<std::result::Result<bool, ExitCode>> {
+    if check_branch_ref(old_raw, old_full) {
+        return Ok(Ok(false));
+    }
+    if crate::refname::ref_exists(repo, old_full.as_bytes()) {
+        return Ok(Ok(true));
+    }
+    let code = fatal(format!("invalid branch name: '{old_raw}'"))?;
+    ref_syntax_hints(repo);
+    Ok(Err(code))
+}
+
+/// `copy_or_rename_branch()`'s check of the new name (builtin/branch.c:617-623),
+/// which comes after the old name has been found:
+///
+/// ```c
+/// if (!strcmp(oldname, newname))
+///         validate_branchname(newname, &newref);
+/// else
+///         validate_new_branchname(newname, &newref, force);
+/// ```
+///
+/// The comparison is of the operands as typed. `validate_branchname()`
+/// (branch.c:373-383) refuses a bad name with the operand in the message;
+/// `validate_new_branchname()` (branch.c:471-487) adds the existence and,
+/// under `--force`, the checked-out refusals, naming the interpreted branch.
+/// `validate_new_branchname()` asks `refs_ref_exists()`, which follows the
+/// symref chain (RESOLVE_REF_READING) — a dangling one is not an existing
+/// branch, which is why `git branch -m m broken_symref` is not a refusal.
+/// `--force` overrides the destination already existing, never a worktree
+/// standing on it.
+fn validate_copy_or_rename_target(
+    repo: &gix::Repository,
+    o: &Opts,
+    old_raw: &str,
+    new_raw: &str,
+    new_full: &str,
+) -> Result<Option<ExitCode>> {
+    if !check_branch_ref(new_raw, new_full) {
+        let code = fatal(format!("'{new_raw}' is not a valid branch name"))?;
+        ref_syntax_hints(repo);
+        return Ok(Some(code));
+    }
+    if old_raw == new_raw || !crate::refname::ref_exists(repo, new_full.as_bytes()) {
+        return Ok(None);
+    }
+    let new = &new_full["refs/heads/".len()..];
+    if !o.force {
+        return fatal(format!("a branch named '{new}' already exists")).map(Some);
+    }
+    if let Some(path) = super::worktree::branch_checked_out(repo, new_full)? {
+        return fatal(format!(
+            "cannot force update the branch '{new}' used by worktree at '{}'",
+            super::worktree::path_to_string(&path)
+        ))
+        .map(Some);
+    }
+    Ok(None)
+}
+
 fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     let (old, new) = match o.names.len() {
         0 => return fatal("branch name required"),
@@ -3073,15 +3181,15 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         2 => (o.names[0].clone(), o.names[1].clone()),
         _ => return fatal("too many arguments for a rename operation"),
     };
+    let (old_raw, new_raw) = raw_copy_or_rename_names(o, &old);
 
     let old_full = format!("refs/heads/{old}");
     let new_full = format!("refs/heads/{new}");
 
-    if !valid_branch_name(&new) {
-        let code = fatal(format!("'{new}' is not a valid branch name"))?;
-        ref_syntax_hints(repo);
-        return Ok(code);
-    }
+    let recovery = match check_old_branch_name(repo, &old_raw, &old_full)? {
+        Ok(recovery) => recovery,
+        Err(code) => return Ok(code),
+    };
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -3116,11 +3224,22 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Some(r) => r,
         None => {
             if head_usage.is_none() {
-                return fatal(format!("no branch named '{old}'"));
+                return fatal(format!("no branch named '{old_raw}'"));
+            }
+            if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
+                return Ok(code);
             }
             return rename_orphan_branch(repo, &old, &new, &old_full, &new_full);
         }
     };
+    // A dangling-symref destination passes the check and is still *deleted*
+    // below, because `files_copy_or_rename_ref()` looks it up with
+    // RESOLVE_REF_NO_RECURSE.
+    if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
+        return Ok(code);
+    }
+    // The files backend refuses a symref source only once `refs_rename_ref()`
+    // runs, after both names have been validated.
     // ```c
     // if (flag & REF_ISSYMREF) {
     //         if (copy)
@@ -3139,38 +3258,6 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             "error: refname {old_full} is a symbolic ref, renaming it is not supported"
         );
         return fatal("branch rename failed");
-    }
-    // ```c
-    // if (!force)
-    //         die(_("a branch named '%s' already exists"), ref->buf + strlen("refs/heads/"));
-    // worktrees = get_worktrees();
-    // wt = find_shared_symref(worktrees, "HEAD", ref->buf);
-    // if (wt && !wt->is_bare)
-    //         die(_("cannot force update the branch '%s' used by worktree at '%s'"),
-    //             ref->buf + strlen("refs/heads/"), wt->path);
-    // ```
-    //
-    // (`validate_new_branchname()`, branch.c.) `--force` overrides the destination
-    // already existing, never a worktree standing on it — moving the ref would
-    // leave that checkout's index and worktree describing a commit its own `HEAD`
-    // no longer names. Renaming a branch onto its own name skips the whole check,
-    // which is why it is guarded by `old_full != new_full` exactly as git guards
-    // it with `strcmp(oldname, newname)`.
-    // `validate_new_branchname()` asks `refs_ref_exists()`, which follows the
-    // symref chain (RESOLVE_REF_READING) — a dangling one is not an existing
-    // branch, which is why `git branch -m m broken_symref` is not a refusal.
-    // The destination is still *deleted* below, because
-    // `files_copy_or_rename_ref()` looks it up with RESOLVE_REF_NO_RECURSE.
-    if old_full != new_full && crate::refname::ref_exists(repo, new_full.as_bytes()) {
-        if !o.force {
-            return fatal(format!("a branch named '{new}' already exists"));
-        }
-        if let Some(path) = super::worktree::branch_checked_out(repo, &new_full)? {
-            return fatal(format!(
-                "cannot force update the branch '{new}' used by worktree at '{}'",
-                super::worktree::path_to_string(&path)
-            ));
-        }
     }
     let target = old_ref.peel_to_id()?.detach();
 
@@ -3297,6 +3384,10 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         rewrite_last_reflog_old_id(&repo.git_dir().join("logs").join(&new_full), target);
     } else {
         log_unchanged_rename(repo, &new_name, target, &message, o.create_reflog)?;
+    }
+
+    if recovery {
+        eprintln!("warning: renamed a misnamed branch '{old}' away");
     }
 
     if old_full != new_full {
@@ -3566,15 +3657,15 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         2 => (o.names[0].clone(), o.names[1].clone()),
         _ => return fatal("too many branches for a copy operation"),
     };
+    let (old_raw, new_raw) = raw_copy_or_rename_names(o, &old);
 
     let old_full = format!("refs/heads/{old}");
     let new_full = format!("refs/heads/{new}");
 
-    if !valid_branch_name(&new) {
-        let code = fatal(format!("'{new}' is not a valid branch name"))?;
-        ref_syntax_hints(repo);
-        return Ok(code);
-    }
+    let recovery = match check_old_branch_name(repo, &old_raw, &old_full)? {
+        Ok(recovery) => recovery,
+        Err(code) => return Ok(code),
+    };
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -3585,42 +3676,16 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         Some(r) => r,
         None => {
             return match super::worktree::head_ref_usage(repo, &old_full)? {
-                Some(_) => fatal(format!("no commit on branch '{old}' yet")),
-                None => fatal(format!("no branch named '{old}'")),
+                Some(_) => fatal(format!("no commit on branch '{old_raw}' yet")),
+                None => fatal(format!("no branch named '{old_raw}'")),
             }
         }
     };
-    // ```c
-    // if (!force)
-    //         die(_("a branch named '%s' already exists"), ref->buf + strlen("refs/heads/"));
-    // worktrees = get_worktrees();
-    // wt = find_shared_symref(worktrees, "HEAD", ref->buf);
-    // if (wt && !wt->is_bare)
-    //         die(_("cannot force update the branch '%s' used by worktree at '%s'"),
-    //             ref->buf + strlen("refs/heads/"), wt->path);
-    // ```
-    //
-    // (`validate_new_branchname()`, branch.c.) `--force` overrides the destination
-    // already existing, never a worktree standing on it — moving the ref would
-    // leave that checkout's index and worktree describing a commit its own `HEAD`
-    // no longer names. Renaming a branch onto its own name skips the whole check,
-    // which is why it is guarded by `old_full != new_full` exactly as git guards
-    // it with `strcmp(oldname, newname)`.
-    // `validate_new_branchname()` asks `refs_ref_exists()`, which follows the
-    // symref chain (RESOLVE_REF_READING) — a dangling one is not an existing
-    // branch, which is why `git branch -m m broken_symref` is not a refusal.
-    // The destination is still *deleted* below, because
-    // `files_copy_or_rename_ref()` looks it up with RESOLVE_REF_NO_RECURSE.
-    if old_full != new_full && crate::refname::ref_exists(repo, new_full.as_bytes()) {
-        if !o.force {
-            return fatal(format!("a branch named '{new}' already exists"));
-        }
-        if let Some(path) = super::worktree::branch_checked_out(repo, &new_full)? {
-            return fatal(format!(
-                "cannot force update the branch '{new}' used by worktree at '{}'",
-                super::worktree::path_to_string(&path)
-            ));
-        }
+    // A dangling-symref destination passes the check and is still *deleted*
+    // below, because `files_copy_or_rename_ref()` looks it up with
+    // RESOLVE_REF_NO_RECURSE.
+    if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
+        return Ok(code);
     }
     let target = old_ref.peel_to_id()?.detach();
 
@@ -3685,6 +3750,10 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
                 .join(new_name.as_bstr().to_str_lossy().as_ref()),
             target,
         );
+    }
+
+    if recovery {
+        eprintln!("warning: created a copy of a misnamed branch '{old}'");
     }
 
     // git duplicates the branch's config section into the new name.

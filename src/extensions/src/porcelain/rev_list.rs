@@ -925,6 +925,9 @@ struct Traversal<'r> {
 ///   * `--objects` / `--in-commit-order` / `--filter=<spec>` — also list the
 ///                                       trees and blobs reachable from the commits
 ///   * `--missing=(error|allow-any)`  — tolerate objects the repository lacks
+///   * `--missing-only`               — (2.56) with `--missing=print[-info]`,
+///                                       list only the missing objects, bare
+///                                       ids without the `?` prefix
 ///   * `--disk-usage[=human]`         — print the total on-disk size instead
 ///   * `--graph`                      — the ASCII ancestry graph in front of each
 ///                                       record, over the same renderer `log` uses;
@@ -964,6 +967,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             ))
         }
     };
+
+    // `--missing-only` (2.56) is read by the pre-`setup_revisions()` scan,
+    // which looks at every argument with no notion of option values or `--`
+    // (builtin/rev-list.c:767-780), and refused there unless that same scan
+    // saw a collecting `--missing=` action (:782-783). `parse_missing_action_value()`
+    // leaves the action alone for a value it does not know, so the last
+    // *recognised* `--missing=` decides.
+    let missing_only = args.iter().any(|a| a == "--missing-only");
+    if missing_only {
+        let mut collect = false;
+        for value in args.iter().filter_map(|a| a.strip_prefix("--missing=")) {
+            match value {
+                "print" | "print-info" => collect = true,
+                "error" | "allow-any" | "allow-promisor" => collect = false,
+                _ => {}
+            }
+        }
+        if !collect {
+            return Ok(fatal("--missing-only requires --missing=print or --missing=print-info"));
+        }
+    }
 
     let mut count_only = false;
     let mut reverse = false;
@@ -2021,6 +2045,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             // walk changes what it is measuring. `MA_ERROR` deliberately keeps
             // the lazy fetch on, which is why `--missing=error` succeeds in a
             // partial clone rather than dying on the objects the clone skipped.
+            // `if (!strcmp(arg, "--missing-only")) continue;` (builtin/rev-list.c:894-895):
+            // the pre-scan above already took it.
+            "--missing-only" => {}
             s if s.starts_with("--missing=") => match &s["--missing=".len()..] {
                 "allow-any" => {
                     gix::odb::store::set_fetch_if_missing(false);
@@ -2413,7 +2440,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // draw the rows with no record at all; neither shape is rendered here, so those
     // combinations keep the refusal they already had rather than printing something
     // that is not what stock prints.
-    if graph && (objects || count_only || quiet || disk_usage) {
+    if graph && (objects || count_only || quiet || missing_only || disk_usage) {
         return Ok(usage_error());
     }
 
@@ -2574,6 +2601,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // columns, and objects belong to none of them.
     if count_only && objects && (left_right || cherry_mark) {
         return Ok(fatal("marked counting and '--objects' cannot be used together"));
+    }
+    // builtin/rev-list.c:943-946 (2.56).
+    if missing_only && count_only {
+        return Ok(fatal("options '--missing-only' and '--count' cannot be used together"));
+    }
+    if missing_only && disk_usage {
+        return Ok(fatal("options '--missing-only' and '--disk-usage' cannot be used together"));
+    }
+    // `show_commit()` and `show_object()` return on `arg_missing_only` before
+    // any output (builtin/rev-list.c:263-266, 406-407) — the same early return
+    // `REV_LIST_QUIET` takes a few lines later, with `--count` and
+    // `--disk-usage` (the only work between the two) refused just above. Only
+    // the omitted-object and missing-object listings after the walk remain.
+    if missing_only {
+        quiet = true;
     }
     dedup_in_place(&mut tips);
 
@@ -4091,7 +4133,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let Some(entry) = absent.iter().find(|entry| entry.id == id) else {
             continue;
         };
-        sink.write_all(&print_missing_object(entry, missing == Missing::PrintInfo, nul_term))?;
+        sink.write_all(&print_missing_object(entry, missing == Missing::PrintInfo, nul_term, missing_only))?;
     }
     if disk_usage {
         if disk_usage_human {
@@ -6113,13 +6155,21 @@ struct MissingObject {
 /// newline. An empty `path` prints no `path=` field at all — git's
 /// `entry->path && *entry->path` — which is what a root tree or a tip named on
 /// the command line leaves behind.
-fn print_missing_object(entry: &MissingObject, print_missing_info: bool, nul_term: bool) -> Vec<u8> {
+fn print_missing_object(
+    entry: &MissingObject,
+    print_missing_info: bool,
+    nul_term: bool,
+    missing_only: bool,
+) -> Vec<u8> {
     // `if (line_term) printf("?%s", …); else printf("%s%cmissing=yes", …, info_term);`
-    // (builtin/rev-list.c:159-163): `-z` has no room for a `?` prefix, so the
+    // (builtin/rev-list.c:165-176): `-z` has no room for a `?` prefix, so the
     // fact becomes a NUL-introduced field, and the path is written raw rather
-    // than through `quote_path()` (lines 173-182).
+    // than through `quote_path()` (lines 183-195). Under `--missing-only` (2.56)
+    // every line is a missing object, so the `?` is dropped and the bare id is
+    // what a script reads; `-z` keeps its `missing=yes` field.
     let (info_term, mut out) = match nul_term {
         true => (0u8, format!("{}\0missing=yes", entry.id).into_bytes()),
+        false if missing_only => (b' ', entry.id.to_string().into_bytes()),
         false => (b' ', format!("?{}", entry.id).into_bytes()),
     };
     if !print_missing_info {

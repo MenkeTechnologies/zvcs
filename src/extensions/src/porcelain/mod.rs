@@ -679,6 +679,7 @@ mod diff_files;
 /// `--diff-filter=<letters>`: `diff_opt_diff_filter()` and `diffcore_apply_filter()`.
 mod diff_filter;
 mod diff_index;
+mod diff_opt_parse;
 mod diff_optval;
 mod diff_pairs;
 mod diff_pickaxe;

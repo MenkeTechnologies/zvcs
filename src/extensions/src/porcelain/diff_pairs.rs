@@ -388,7 +388,7 @@ pub(crate) enum Whitespace {
 /// `ambiguous option:` sentence names, and `--no-patch` / `--no-prefix` /
 /// `--no-renames` are entries spelled with their own `no-`, which parse-options
 /// reads as the *unset* sense of the stem.
-const LONG_OPTS: &[LongOpt] = &[
+pub(super) const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "patch",                       neg: false, arg: Arg::None },
     LongOpt { name: "no-patch",                    neg: true,  arg: Arg::None },
     LongOpt { name: "unified",                     neg: false, arg: Arg::Optional },
@@ -2033,7 +2033,7 @@ fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<Status> {
 /// leading blanks, then `strtoimax` in base 0 — so `0x10` is hex and `010` is octal —
 /// then an optional `k`/`m`/`g` unit suffix, then the end of the string. The value must
 /// still fit an `int` after the suffix multiplies it.
-fn parse_git_int(value: &str) -> Option<i32> {
+pub(super) fn parse_git_int(value: &str) -> Option<i32> {
     let b = value.as_bytes();
     let mut i = 0usize;
     // `strtoimax` skips leading whitespace, so `" 3"` parses but `"3 "` does not.

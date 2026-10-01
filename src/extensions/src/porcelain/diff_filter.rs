@@ -61,6 +61,13 @@ impl Filter {
         Ok(())
     }
 
+    /// `options->filter || options->filter_not` before `diff_setup_done()` folds
+    /// them — the test `setup_revisions()` turns into `revs->diff = 1`
+    /// (revision.c:3187-3190).
+    pub(crate) fn given(self) -> bool {
+        self.include != 0 || self.exclude != 0
+    }
+
     /// `diff_setup_done()`'s fold (diff.c:5370-5374): an exclusion with no inclusion
     /// beside it starts from every status except `*`, then subtracts.
     fn resolved(self) -> u32 {

@@ -1063,6 +1063,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `use_bitmap_index` (builtin/rev-list.c:801-804).
     let mut use_bitmap_index = false;
     let mut quiet = false;
+    // What the diff options `handle_revision_opt()` hands to `diff_opt_parse()`
+    // (revision.c:2758-2762) did; see [`super::diff_opt_parse`].
+    let mut diffopt = super::diff_opt_parse::DiffOpts::default();
     let mut disk_usage = false;
     let mut disk_usage_human = false;
     // What `cmd_rev_list()`'s loop over the arguments `setup_revisions()` left
@@ -1765,7 +1768,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = 0,
             "--no-max-parents" => max_parents = None,
-            "-q" | "--quiet" => quiet = true,
             "--commit-header" => include_header = true,
             "--no-commit-header" => include_header = false,
             "--header" => verbose_header = true,
@@ -2123,12 +2125,27 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     None => return Ok(not_an_integer(v)),
                 }
             }
-            // Every remaining flag is one git knows and this does not; a
-            // revision never starts with `-`, so anything left is a usage error —
-            // raised by `cmd_rev_list()`'s own loop, once `setup_revisions()` has
-            // finished. See `leftover_failure`.
+            // What `handle_revision_opt()` does not own goes to `diff_opt_parse()`
+            // (revision.c:2758-2762): a diff option is taken here, with its
+            // detached value, and its effect is judged once the scan is over.
+            // Anything it does not claim either is left over — a revision never
+            // starts with `-` — and `cmd_rev_list()`'s own loop refuses it with the
+            // usage block once `setup_revisions()` has finished. See
+            // `leftover_failure`.
+            //
+            // parse-options sees argv only up to the `--` `setup_revisions()` cut
+            // off before its loop, and never the `--stdin` lines.
             s if s.starts_with('-') => {
-                leftover_failure.get_or_insert(None);
+                let end = (i + 1..argv.len())
+                    .find(|&j| origin[j] != Origin::Argv || argv[j] == "--")
+                    .unwrap_or(argv.len());
+                match super::diff_opt_parse::diff_opt_parse(&repo, &argv[i..end], &mut diffopt) {
+                    super::diff_opt_parse::Step::Took(n) => i += n - 1,
+                    super::diff_opt_parse::Step::Exit(code) => return Ok(code),
+                    super::diff_opt_parse::Step::Unknown => {
+                        leftover_failure.get_or_insert(None);
+                    }
+                }
             }
             // `handle_revision_arg_1()`'s guard ahead of `handle_dotdot()`: a
             // bare `..` is the pathspec for the parent directory, never
@@ -2380,6 +2397,22 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     if graph && order == Order::Date {
         order = Order::Topo;
     }
+    // `diff_setup_done(&revs->diffopt)` (revision.c:3212), ahead of the walk and
+    // graph conflicts below; `revs->diffopt.pathspec` is the prune data.
+    if let Err(message) = diffopt.setup_done(&pathspecs) {
+        return Ok(fatal(&message));
+    }
+    // `if (revs.diffopt.flags.quick) info.flags |= REV_LIST_QUIET;`
+    // (builtin/rev-list.c:799-800).
+    if diffopt.quick {
+        quiet = true;
+    }
+    // A diff option whose effect on this walk's own output is not drawn here
+    // (see [`super::diff_opt_parse::DiffOpts::unported`]) keeps the refusal every
+    // unclaimed option gets.
+    if diffopt.unported(graph, verbose_header) {
+        leftover_failure.get_or_insert(None);
+    }
     // `if (revs->reflog_info && revs->limited) die(...)` (revision.c:3180-3181),
     // ahead of the `--parents`/`--children` check. A reflog walk hands its entries
     // out in reflog order, and every option that makes `setup_revisions()` set
@@ -2581,7 +2614,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `prepare_revision_walk()` drops the non-commits, so
     // `git rev-list --indexed-objects` (which names no revision at all) is not a
     // usage error.
-    if tips.is_empty() && !objects && !read_stdin && !rev_input_given && pending.is_empty() {
+    // `|| revs.diff`: a diff option that asked for a diff — any output format, a
+    // pickaxe, `--diff-filter`, `--follow` — is refused the same way
+    // (builtin/rev-list.c:926-933), since rev-list never produces one.
+    if (tips.is_empty() && !objects && !read_stdin && !rev_input_given && pending.is_empty())
+        || diffopt.wants_diff()
+    {
         return Ok(usage_error());
     }
     // `if (!revs->show_notes_given && revs->show_notes_by_default)` turns them on
@@ -4014,8 +4052,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
 
     if graph {
         // The nodes the graph state machine walks, in emission order.
-        // `rev-list` has no `--color` option, so `revs->diffopt.use_color` is never
-        // turned on and the graph is drawn plain.
+        // `revs->diffopt.use_color` is off here: a `--color` spelling that would
+        // turn it on beside `--graph` is refused before the walk
+        // ([`super::diff_opt_parse::DiffOpts::unported`]), so the graph is drawn plain.
         let shown = graph_shown;
         // `--boundary`: every parent of a commit the walk *returned* carries
         // CHILD_SHOWN, which `graph_is_interesting()` accepts on its own; the

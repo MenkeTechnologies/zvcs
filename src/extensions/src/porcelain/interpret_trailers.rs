@@ -1637,11 +1637,16 @@ fn is_blank_line(s: &[u8]) -> bool {
 /// `find_separator()`: where the `<key><sep>` separator sits, or -1.
 ///
 /// A key is alphanumerics and `-`, optionally followed by blanks; anything else
-/// before a separator disqualifies the line.
+/// before a separator disqualifies the line, and so does a separator that opens
+/// `://` straight after the key (a URL such as `https://...`).
 fn find_separator(line: &[u8], separators: &[u8]) -> isize {
     let mut whitespace_found = false;
     for (i, &c) in line.iter().enumerate() {
         if separators.contains(&c) {
+            // avoid accidental URL matches (trailer.c:638-642)
+            if !whitespace_found && line[i..].starts_with(b"://") {
+                return -1;
+            }
             return i as isize;
         }
         if !whitespace_found && (c.is_ascii_alphanumeric() || c == b'-') {

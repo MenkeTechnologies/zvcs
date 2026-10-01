@@ -1247,7 +1247,10 @@ fn pick_one(
         message.push(b'\n');
     }
     if opts.record_origin {
-        if !has_conforming_footer(&message) {
+        // `has_conforming_footer(&ctx->message, NULL, 0)` (sequencer.c:2416):
+        // the trailer block is the shared `trailer_block_get()` port, so a last
+        // paragraph of URLs is no footer (trailer.c:638-642).
+        if super::commit::has_conforming_footer(&message, b"", super::commit::trailer_config()) == 0 {
             message.push(b'\n');
         }
         message.extend_from_slice(b"(cherry picked from commit ");
@@ -1255,13 +1258,8 @@ fn pick_one(
         message.extend_from_slice(b")\n");
     }
     if opts.signoff {
-        let trailer = format!("Signed-off-by: {committer_ident}\n");
-        if !message.ends_with(trailer.as_bytes()) {
-            if !has_conforming_footer(&message) {
-                message.push(b'\n');
-            }
-            message.extend_from_slice(trailer.as_bytes());
-        }
+        // `append_signoff(&ctx->message, 0, 0)` (sequencer.c:2455).
+        super::commit::append_signoff_bytes(&mut message, committer_ident.as_bytes(), 0, false);
     }
     // ```c
     // if (flags & CLEANUP_MSG)
@@ -2463,56 +2461,6 @@ fn print_diffstat(old_tree: ObjectId, new_tree: ObjectId) -> Result<()> {
         new_tree.to_string(),
     ])?;
     Ok(())
-}
-
-/// git's `has_conforming_footer`: does the message end in a trailer block, so
-/// that `-x` may append its line without inserting a blank line first?
-///
-/// The block is the last paragraph, and it only qualifies when it is not also
-/// the first paragraph (a subject is never a footer) and every one of its lines
-/// is a `token: value` trailer, an indented continuation, a `#` comment, or a
-/// `(cherry picked from commit <id>)` line — the last form being what makes a
-/// second `-x` append directly, as stock git does.
-fn has_conforming_footer(msg: &[u8]) -> bool {
-    // Drop trailing blank lines.
-    let mut lines: Vec<&[u8]> = msg.split(|&b| b == b'\n').collect();
-    while lines.last().is_some_and(|l| l.iter().all(u8::is_ascii_whitespace)) {
-        lines.pop();
-    }
-    if lines.is_empty() {
-        return false;
-    }
-
-    // Start of the last paragraph.
-    let mut start = lines.len();
-    while start > 0 && !lines[start - 1].iter().all(u8::is_ascii_whitespace) {
-        start -= 1;
-    }
-    // No preceding blank line means this paragraph is the subject.
-    if start == 0 {
-        return false;
-    }
-
-    let mut saw_trailer = false;
-    for line in &lines[start..] {
-        if line.first().is_some_and(|b| b.is_ascii_whitespace()) || line.starts_with(b"#") {
-            continue;
-        }
-        if line.starts_with(b"(cherry picked from commit ") && line.ends_with(b")") {
-            saw_trailer = true;
-            continue;
-        }
-        match line.iter().position(|&b| b == b':') {
-            // A trailer token is non-empty and contains no whitespace.
-            Some(sep)
-                if sep > 0 && !line[..sep].iter().any(u8::is_ascii_whitespace) =>
-            {
-                saw_trailer = true;
-            }
-            _ => return false,
-        }
-    }
-    saw_trailer
 }
 
 /// Move a clean worktree and its index from the state captured in `old` to

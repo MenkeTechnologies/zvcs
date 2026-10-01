@@ -87,6 +87,11 @@ fn find_separator(line: &[u8]) -> Option<usize> {
     let mut whitespace_found = false;
     for (idx, byte) in line.iter().copied().enumerate() {
         if byte == b':' {
+            // Like git 2.56 trailer.c find_separator(), a `://` right after
+            // the key is a URL scheme, not a separator.
+            if !whitespace_found && line[idx..].starts_with(b"://") {
+                return None;
+            }
             return Some(idx);
         }
         if !whitespace_found && (byte.is_ascii_alphanumeric() || byte == b'-') {

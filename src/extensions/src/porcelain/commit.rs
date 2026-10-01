@@ -5275,7 +5275,7 @@ pub(crate) fn append_signoff_bytes(msg: &mut Vec<u8>, ident: &[u8], ignore_foote
 /// `trailer.<token>.key` are honoured here exactly as they are there.
 ///
 /// [`block_get`]: super::interpret_trailers::block_get
-fn has_conforming_footer(sub: &[u8], sob: &[u8], cfg: &TrailerConfig) -> u8 {
+pub(crate) fn has_conforming_footer(sub: &[u8], sob: &[u8], cfg: &TrailerConfig) -> u8 {
     // `opts.no_divider = 1`: the caller already cut the buffer where it wants.
     let block = super::interpret_trailers::block_get(sub, true, cfg);
     if block.start == block.end {
@@ -5325,7 +5325,7 @@ pub(crate) fn ignore_non_trailer(buf: &[u8]) -> usize {
 /// and git reads the configuration for the first of those only. It cannot fail
 /// either — a configuration git cannot parse has already aborted the command
 /// long before a trailer is looked at.
-fn trailer_config() -> &'static TrailerConfig {
+pub(crate) fn trailer_config() -> &'static TrailerConfig {
     static CONFIGURED: std::sync::OnceLock<TrailerConfig> = std::sync::OnceLock::new();
     CONFIGURED
         .get_or_init(|| super::interpret_trailers::load_config().unwrap_or_default())

@@ -413,7 +413,11 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
 
         let mut out: Vec<u8> = Vec::new();
         match mode {
-            Mode::Revs => emit_rev(&repo, &record, &format, &mailmap, &mut out)?,
+            Mode::Revs => {
+                if !emit_rev(&repo, &record, &format, &mailmap, &mut out)? {
+                    continue;
+                }
+            }
             Mode::Text => emit_text(&repo, &record, &format, hex_len, &mailmap, &mut out)?,
         }
         out.push(out_term);
@@ -981,29 +985,57 @@ fn parse_atom(b: &[u8], i: usize, items: &mut Vec<Item>, lit: &mut Vec<u8>) -> R
     Ok(i + 1)
 }
 
-/// `--stdin-mode=revs`: resolve one record to a commit and render it, or warn and
-/// emit nothing (git still terminates the empty record).
+/// `--stdin-mode=revs`: resolve one record to a commit and render it. A record
+/// that does not reach a commit is warned about and skipped outright — the
+/// `continue`s in builtin/name-rev.c:904-923 bypass the
+/// `printf("%s%c", …, output_terminator)` below them, so no terminator is
+/// written for it. Returns whether the record was rendered.
 fn emit_rev(
     repo: &gix::Repository,
     record: &[u8],
     format: &Format,
     mailmap: &crate::mailmap::Mailmap,
     out: &mut Vec<u8>,
-) -> Result<()> {
-    let Ok(id) = repo.rev_parse_single(record.as_bstr()) else {
-        eprintln!("Could not get object name for {}. Skipping.", record.to_str_lossy());
-        return Ok(());
+) -> Result<bool> {
+    let name = record.to_str_lossy();
+    // `repo_get_oid()`: a full-length hex name is taken as the object id
+    // without asking the object store (`get_oid_basic()`), so a missing object
+    // fails at `parse_object()` below, not here.
+    let oid = match repo.rev_parse_single(record.as_bstr()) {
+        Ok(id) => id.detach(),
+        Err(_) => match ObjectId::from_hex(record) {
+            Ok(oid) if oid.kind() == repo.object_hash() => oid,
+            _ => {
+                eprintln!("Could not get object name for {name}. Skipping.");
+                return Ok(false);
+            }
+        },
     };
-    let oid = id.detach();
-    let peeled = match repo.find_object(oid) {
-        Ok(object) => object.peel_to_commit().ok(),
-        Err(_) => None,
+    // `parse_object()` (name-rev.c:910-915).
+    let Ok(mut object) = repo.find_object(oid) else {
+        eprintln!("Could not get object for {name}. Skipping.");
+        return Ok(false);
     };
-    let Some(commit) = peeled else {
-        eprintln!("Could not get commit for {oid}. Skipping.");
-        return Ok(());
+    // `deref_tag(the_repository, object, scratch_buf.buf, 0)` (tag.c:76-95): a
+    // tag whose target is missing reports it against the record as typed.
+    while object.kind == gix::object::Kind::Tag {
+        let target = object.clone().into_tag().target_id().ok().map(|id| id.detach());
+        match target.and_then(|id| repo.find_object(id).ok()) {
+            Some(next) => object = next,
+            None => {
+                eprintln!("error: missing object referenced by '{name}'");
+                eprintln!("Could not get commit for {name}. Skipping.");
+                return Ok(false);
+            }
+        }
+    }
+    // `if (!peeled || peeled->type != OBJ_COMMIT)` (name-rev.c:917-923).
+    let Ok(commit) = object.try_into_commit() else {
+        eprintln!("Could not get commit for {name}. Skipping.");
+        return Ok(false);
     };
-    render(repo, &commit, format, mailmap, out)
+    render(repo, &commit, format, mailmap, out)?;
+    Ok(true)
 }
 
 /// `--stdin-mode=text`: copy the record through, replacing every maximal run of

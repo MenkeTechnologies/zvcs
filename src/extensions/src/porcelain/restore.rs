@@ -889,12 +889,22 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 .map(|e| e.path_in(backing).to_owned())
                 .collect()
         };
+        // Which index entries may fill `ps_matched`. `read_tree_some()` lays the source
+        // tree over the index, stamping `CE_UPDATE` on every entry it supplies
+        // (`update_some()`, builtin/checkout.c:193). In overlay mode
+        // `mark_ce_for_checkout_overlay()` returns before `ce_path_match()` for an entry
+        // without `CE_UPDATE` when a source tree was given (builtin/checkout.c:394), so a
+        // path present only in the index cannot satisfy a pathspec: `git restore --overlay
+        // --staged <added-file>` is `did not match`, exit 1. The no-overlay marker matches
+        // every entry first (builtin/checkout.c:428), and without a source tree the index
+        // itself is the source.
+        let index_only_counts = !(overlay && !source_is_index);
         for raw in &specs {
             // Each spec is checked on its own: git names the one that matched nothing.
             let single = super::log::PathspecMatcher::new(&repo, std::slice::from_ref(raw))?;
             let hit = source_map
                 .keys()
-                .chain(cur_paths.iter())
+                .chain(cur_paths.iter().filter(|_| index_only_counts))
                 .filter(|p| !sparse.contains(&BString::from(p.to_vec())))
                 .any(|p| path_matches(BStr::new(p), false, &single));
             if !hit {

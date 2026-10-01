@@ -63,6 +63,9 @@ pub enum Advice {
     /// `--force-if-includes` found the remote-tracking ref moved since this
     /// checkout last saw it (`REF_STATUS_REJECT_REMOTE_UPDATED`).
     PushRefNeedsUpdate,
+    /// `git push <remote>/<branch>`: the repository argument is no remote but
+    /// its text before the first slash names one (builtin/push.c:668-689).
+    PushRepoLooksLikeRef,
     /// Git is blocked on an editor the user may not have noticed.
     WaitingForEditor,
     /// A ref name was rejected by `check-ref-format`'s rules.
@@ -158,6 +161,7 @@ impl Advice {
             Advice::PushAlreadyExists => "advice.pushAlreadyExists",
             Advice::PushNeedsForce => "advice.pushNeedsForce",
             Advice::PushRefNeedsUpdate => "advice.pushRefNeedsUpdate",
+            Advice::PushRepoLooksLikeRef => "advice.pushRepoLooksLikeRef",
             Advice::WaitingForEditor => "advice.waitingForEditor",
             Advice::RefSyntax => "advice.refSyntax",
             Advice::SetUpstreamFailure => "advice.setUpstreamFailure",

@@ -1594,7 +1594,7 @@ pub(crate) fn remotes_in_config_order(repo: &gix::Repository) -> Vec<String> {
 /// `remotes.` plus the rest, value name lowercased — with `strcmp`, so a group
 /// is found only under the spelling `git config` stores, and every value's
 /// words (split on space, tab and newline) are appended in configuration order.
-fn add_remote_or_group(repo: &gix::Repository, name: &str, list: &mut Vec<String>) -> bool {
+pub(crate) fn add_remote_or_group(repo: &gix::Repository, name: &str, list: &mut Vec<String>) -> bool {
     let prev = list.len();
     let snapshot = repo.config_snapshot();
     for section in snapshot.plumbing().sections() {
@@ -1634,7 +1634,7 @@ fn add_remote_or_group(repo: &gix::Repository, name: &str, list: &mut Vec<String
 /// `origin` — configuration, or (`remotes_remote_get_1()`, for a name
 /// `valid_remote_nick()` accepts) a readable `$GIT_DIR/remotes/<name>` or
 /// `$GIT_DIR/branches/<name>` file.
-fn remote_is_configured(repo: &gix::Repository, name: &str) -> bool {
+pub(crate) fn remote_is_configured(repo: &gix::Repository, name: &str) -> bool {
     if remotes_in_config_order(repo).iter().any(|n| n == name) {
         return true;
     }

@@ -393,6 +393,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // positional repository overwrites it, and the refspecs always start at the
     // second positional. So `push --repo=origin origin veto` pushes `veto` to
     // `origin`, never a refspec named `origin`.
+    let explicit_repo = !positionals.is_empty() || f.repo.is_some();
     let remote_name: String = match positionals.first().cloned().or_else(|| f.repo.clone()) {
         Some(r) => r,
         None => match default_push_remote(&repo) {
@@ -415,6 +416,16 @@ git push <groupname>\n"
         },
     };
     let typed: Vec<String> = positionals.into_iter().skip(1).collect();
+
+    // 2.56 `cmd_push()` (builtin/push.c:773-784): a repository argument that is
+    // neither a remote nor a group gets `die_if_repo_looks_like_ref()` before it
+    // is tried as a URL or path — only while the advice is enabled.
+    if explicit_repo
+        && !super::fetch::add_remote_or_group(&repo, &remote_name, &mut Vec::new())
+        && crate::advice::Advice::PushRepoLooksLikeRef.enabled_in(&repo)
+    {
+        die_if_repo_looks_like_ref(&repo, &remote_name);
+    }
 
     // Honor the `push.*` config defaults for flags not given explicitly. An
     // explicit command-line flag always wins: git reads config in `git_push_config`
@@ -2822,6 +2833,32 @@ fn short_ref(name: &str) -> &str {
         .or_else(|| name.strip_prefix("refs/tags/"))
         .or_else(|| name.strip_prefix("refs/remotes/"))
         .unwrap_or(name)
+}
+
+/// `die_if_repo_looks_like_ref()` (builtin/push.c:668-689, new in 2.56): a
+/// repository argument with a non-empty tail after its first slash, that is
+/// not a path (`file_exists()` is an `lstat()`, relative to the top of the
+/// working tree `setup_git_directory()` moved to), and whose head names a
+/// configured remote is refused with a hint splitting it into the two
+/// arguments the user most likely meant.
+fn die_if_repo_looks_like_ref(repo: &gix::Repository, arg: &str) {
+    let Some((name, rest)) = arg.split_once('/') else {
+        return;
+    };
+    let base = repo
+        .workdir()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    if rest.is_empty() || std::fs::symlink_metadata(base.join(arg)).is_ok() {
+        return;
+    }
+    if !super::fetch::remote_is_configured(repo, name) {
+        return;
+    }
+    eprintln!("fatal: '{arg}' is not a valid push target");
+    crate::advice::Advice::PushRepoLooksLikeRef
+        .advise_in(repo, &format!("Did you mean to use: git push {name} {rest}?"));
+    std::process::exit(128);
 }
 
 /// The remote `git push` targets with no `<remote>` argument —

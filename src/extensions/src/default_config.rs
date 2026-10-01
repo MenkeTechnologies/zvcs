@@ -858,6 +858,7 @@ const ADVICE_KEYS: &[&str] = &[
     "pushNonFFCurrent",
     "pushNonFFMatching",
     "pushRefNeedsUpdate",
+    "pushRepoLooksLikeRef",
     "pushUnqualifiedRefName",
     "pushUpdateRejected",
     "pushNonFastForward",

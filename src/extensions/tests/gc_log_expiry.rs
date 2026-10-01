@@ -369,28 +369,28 @@ fn pack_count(repo: &Path) -> usize {
 
 #[test]
 fn repack_filter_config_reaches_the_repack_childs_refusals() {
-    // git 2.55.0:
+    // git 2.56.0:
     //     $ git -c gc.repackFilter=bogusfilter gc
     //     fatal: invalid filter-spec 'bogusfilter'
-    //     fatal: failed to run repack
+    //     error: failed to run (null)
     //     (exit 128)
     //     $ git -c gc.repackFilterTo=/tmp/zz gc
     //     fatal: option '--filter-to' can only be used along with '--filter'
-    //     fatal: failed to run repack
+    //     error: failed to run (null)
     //     (exit 128)
     let (repo, home) = fixture("filter-bad");
 
     let bad_spec = run(&repo, &home, &["-c", "gc.repackFilter=bogusfilter", "gc", "-q"]);
     assert_eq!(
         stderr(&bad_spec),
-        "fatal: invalid filter-spec 'bogusfilter'\nfatal: failed to run repack\n"
+        "fatal: invalid filter-spec 'bogusfilter'\nerror: failed to run (null)\n"
     );
     assert_eq!(code(&bad_spec), 128);
 
     let depthless = run(&repo, &home, &["-c", "gc.repackFilter=tree:", "gc", "-q"]);
     assert_eq!(
         stderr(&depthless),
-        "fatal: expected 'tree:<depth>'\nfatal: failed to run repack\n",
+        "fatal: expected 'tree:<depth>'\nerror: failed to run (null)\n",
         "the child's own per-form diagnostics come through too"
     );
     assert_eq!(code(&depthless), 128);
@@ -399,7 +399,7 @@ fn repack_filter_config_reaches_the_repack_childs_refusals() {
     assert_eq!(
         stderr(&orphan_to),
         "fatal: option '--filter-to' can only be used along with '--filter'\n\
-         fatal: failed to run repack\n"
+         error: failed to run (null)\n"
     );
     assert_eq!(code(&orphan_to), 128);
 
@@ -419,7 +419,7 @@ fn a_valid_repack_filter_is_accepted_and_an_empty_one_is_not_a_filter_at_all() {
         let out = run(&repo, &home, &["-c", &format!("gc.repackFilter={spec}"), "gc", "-q"]);
         assert!(out.status.success(), "gc.repackFilter={spec} must be accepted: {}", stderr(&out));
         assert!(
-            !stderr(&out).contains("failed to run repack"),
+            !stderr(&out).contains("failed to run"),
             "gc.repackFilter={spec} must not be refused"
         );
     }
@@ -439,7 +439,7 @@ fn a_valid_repack_filter_is_accepted_and_an_empty_one_is_not_a_filter_at_all() {
     assert_eq!(
         stderr(&empty_filter),
         "fatal: option '--filter-to' can only be used along with '--filter'\n\
-         fatal: failed to run repack\n",
+         error: failed to run (null)\n",
         "an empty filter is not forwarded, so --filter-to has nothing to pair with"
     );
     assert_eq!(code(&empty_filter), 128);

@@ -697,7 +697,8 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         Ok(_) => {}
         Err(message) => {
             eprintln!("fatal: {message}");
-            return Ok(ExitCode::from(128));
+            report_failed_child();
+            return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
         }
     }
 
@@ -741,20 +742,15 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             repack_filter_to: repack_filter_to.as_deref(),
         },
     );
-    // ```c
-    // if (run_command(&repack_cmd))
-    //         die(FAILED_RUN, repack_args.v[0]);
-    // ```
-    //
-    // (`builtin/gc.c:1021-1022`; `FAILED_RUN` is `"failed to run %s"`.) The
-    // child has already said what went wrong, so `gc` adds one line naming the
-    // step that failed and exits 128:
+    // The child has already said what went wrong; `odb_optimize()` adds one
+    // `error:` line and `gc` exits 128 through a silent `die(NULL)` (see
+    // [`report_failed_child`]):
     //
     // ```text
     // $ git gc --quiet          # a ref naming an object the repository lacks
     // error: refs/heads/dangling does not point to a valid object!
     // fatal: bad object refs/heads/dangling
-    // fatal: failed to run repack
+    // error: failed to run (null)
     // ```
     //
     // The delegate reports through the error it returns rather than through a
@@ -767,7 +763,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             None if err.downcast_ref::<crate::fatal::Silent>().is_none() => return Err(err),
             None => {}
         }
-        eprintln!("fatal: failed to run repack");
+        report_failed_child();
         return Err(anyhow::Error::new(crate::fatal::Silent(crate::fatal::EXIT_FATAL)));
     }
 
@@ -1332,7 +1328,7 @@ pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
 /// ```text
 /// $ git -c gc.repackFilter=bogusfilter gc
 /// fatal: invalid filter-spec 'bogusfilter'
-/// fatal: failed to run repack
+/// error: failed to run (null)
 /// ```
 ///
 /// The spec is rejected while the child's parse-options is still running, so it
@@ -1344,8 +1340,8 @@ pub(super) fn too_many_packs(repo: &gix::Repository) -> bool {
 fn check_repack_filter(filter: Option<&str>, filter_to: Option<&str>) -> Option<ExitCode> {
     let failed = |message: &str| {
         eprintln!("fatal: {message}");
-        eprintln!("fatal: failed to run repack");
-        Some(ExitCode::from(128))
+        report_failed_child();
+        Some(ExitCode::from(crate::fatal::EXIT_FATAL))
     };
     if let Some(spec) = filter {
         if let Err(message) = super::pack_objects::gently_parse_filter(spec.as_bytes()) {
@@ -1355,6 +1351,31 @@ fn check_repack_filter(filter: Option<&str>, filter_to: Option<&str>) -> Option<
         return failed("option '--filter-to' can only be used along with '--filter'");
     }
     None
+}
+
+/// The line `odb_optimize()` adds after its `repack` child failed.
+///
+/// ```c
+/// if (run_command(&repack_cmd)) {
+///         ret = error("failed to run %s", repack_cmd.args.v[0]);
+///         goto out;
+/// }
+/// ```
+///
+/// (`odb/source-files.c:730-733`, git 2.56.0.) `run_command()` has already run
+/// `child_process_clear()` on the command by the time the message is formatted,
+/// so `args.v[0]` is NULL and the C library prints `(null)` for it. `cmd_gc()`
+/// then exits 128 through `die(NULL)` (`builtin/gc.c:725-726`), and
+/// `die_message_builtin()` prints nothing for a NULL format (`usage.c:69-72`),
+/// so this is the last line `gc` writes:
+///
+/// ```text
+/// $ git -c gc.repackFilter=bogusfilter gc
+/// fatal: invalid filter-spec 'bogusfilter'
+/// error: failed to run (null)
+/// ```
+fn report_failed_child() {
+    eprintln!("error: failed to run (null)");
 }
 
 /// How git refuses a `gc.logExpiry` it will not accept: `git_die_config()`

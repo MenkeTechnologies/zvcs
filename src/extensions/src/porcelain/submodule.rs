@@ -2446,7 +2446,7 @@ fn deinit_one(
 /// `repo_config_set_in_file_gently(..., NULL)`, which answers `CONFIG_NOTHING_SET`
 /// for an absent key, so a second `deinit` of the same submodule warns even
 /// though the first one already left the config in the wanted state.
-fn unset_core_worktree(repo: &gix::Repository, name: &BStr, display: &str) {
+pub(crate) fn unset_core_worktree(repo: &gix::Repository, name: &BStr, display: &str) {
     let unset = || -> Result<bool> {
         let path = submodule_name_to_gitdir(repo, name)?.join("config");
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());

@@ -1486,17 +1486,18 @@ fn carry_stat_of_unchanged(old: &gix::index::File, new_index: &mut gix::index::F
     }
 }
 
-/// The paths `is_submodule_active()` (submodule.c) says yes to, read from
+/// The paths `is_submodule_active()` (submodule.c) says yes to, each mapped to
+/// the submodule name `submodule_unset_core_worktree()` locates its gitdir by, read from
 /// `.gitmodules` plus `submodule.<name>.url` / `submodule.active`.
 ///
 /// Empty when the repository has no `.gitmodules` at all, which is the common
 /// case and costs one failed open.
-fn active_submodule_paths(repo: &gix::Repository) -> HashSet<BString> {
+fn active_submodule_paths(repo: &gix::Repository) -> HashMap<BString, BString> {
     let Ok(Some(subs)) = repo.submodules() else {
-        return HashSet::new();
+        return HashMap::new();
     };
     subs.filter(|sm| sm.is_active().unwrap_or(false))
-        .filter_map(|sm| sm.path().ok().map(|p| p.to_owned()))
+        .filter_map(|sm| sm.path().ok().map(|p| (p, sm.name().to_owned())))
         .collect()
 }
 
@@ -1536,14 +1537,14 @@ fn unlink_entry(
     path: &BStr,
     mode: Option<Mode>,
     recurse_submodules: bool,
-    active_submodules: &HashSet<BString>,
+    active_submodules: &HashMap<BString, BString>,
 ) {
     let Some(full) = repo.workdir_path(path) else {
         return;
     };
     if mode == Some(Mode::COMMIT) {
-        if recurse_submodules && active_submodules.contains(&path.to_owned()) {
-            submodule_move_head_to_nothing(workdir, path, &full);
+        if let Some(name) = active_submodules.get(&path.to_owned()).filter(|_| recurse_submodules) {
+            submodule_move_head_to_nothing(repo, workdir, path, name.as_ref(), &full);
         }
         // `remove_or_warn()` (entry.c:200-203) sends a gitlink to `rmdir_or_warn()`.
         if let Err(err) = std::fs::remove_dir(&full) {
@@ -1595,8 +1596,10 @@ fn unlink_entry(
 /// submodule survive it — as they do under git — which is what leaves the
 /// directory behind, and the `rmdir` warning with it.
 fn submodule_move_head_to_nothing(
+    repo: &gix::Repository,
     workdir: &std::path::Path,
     rela: &BStr,
+    name: &BStr,
     full: &std::path::Path,
 ) {
     if !full.is_dir() {
@@ -1619,9 +1622,7 @@ fn submodule_move_head_to_nothing(
         }
     }
 
-    let mut sub_git_dir = None;
     if let Ok(sub) = gix::open(full) {
-        sub_git_dir = Some(sub.git_dir().to_owned());
         if let Ok(snapshot) = sub.index_or_empty() {
             let mut emptied = (*snapshot).clone();
             let backing = emptied.path_backing().to_vec();
@@ -1656,18 +1657,13 @@ fn submodule_move_head_to_nothing(
     if std::fs::read_dir(full).is_ok_and(|mut d| d.next().is_none()) {
         let _ = std::fs::remove_dir(full);
     }
-    // `submodule_unset_core_worktree()` (submodule.c): the absorbed gitdir still
-    // records a `core.worktree` pointing at the directory that has just gone, and
-    // leaving it there makes every later `git --git-dir=.git/modules/<name> …`
-    // chase a path that is not a work tree.
-    if let (Some(gitdir), Ok(exe)) = (sub_git_dir, crate::hosted::git_exe()) {
-        crate::cstdio::before_spawn();
-        let _ = std::process::Command::new(&exe)
-            .arg("--git-dir")
-            .arg(&gitdir)
-            .args(["config", "--unset", "core.worktree"])
-            .status();
-    }
+    // `submodule_unset_core_worktree(sub)` (submodule.c:2059-2074): the absorbed
+    // gitdir still records a `core.worktree` pointing at the directory that has
+    // just gone. git edits `<gitdir>/config` in-process through
+    // `repo_config_set_in_file_gently()`; a `git --git-dir=<gitdir> config
+    // --unset` child instead sets up that gitdir first, chases the vanished
+    // `core.worktree`, and dies `cannot chdir` before unsetting anything.
+    crate::porcelain::submodule::unset_core_worktree(repo, name, &rela.to_string());
 }
 
 /// `--hard`: overwrite the worktree and index from `tree`, discarding local changes

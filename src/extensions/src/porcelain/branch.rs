@@ -1948,16 +1948,6 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         None => current_short.clone().unwrap_or_else(|| "HEAD".to_string()),
     };
 
-    // `create_branch()` resolves the start-point through `dwim_branch_start()`
-    // whether or not one was typed: with `argc == 1` git passes `head`, the
-    // current branch's short name (builtin/branch.c:998), and the same DWIM runs
-    // over it.
-    let (target, start_ref): (ObjectId, Option<BString>) =
-        match dwim_branch_start(repo, &start_name, o.track)? {
-            Start::Resolved(id, real_ref) => (id, real_ref),
-            Start::Stop(code) => return Ok(code),
-        };
-
     // Serialize the ref read-modify-write through the repo coordinator.
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
@@ -1985,6 +1975,17 @@ fn create_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
             ));
         }
     }
+
+    // `create_branch()` resolves the start-point through `dwim_branch_start()`
+    // whether or not one was typed: with `argc == 1` git passes `head`, the
+    // current branch's short name (builtin/branch.c:998), and the same DWIM runs
+    // over it. It runs only after `validate_new_branchname()` (branch.c:616-621),
+    // so an existing or checked-out branch is refused before a bad start-point is.
+    let (target, start_ref): (ObjectId, Option<BString>) =
+        match dwim_branch_start(repo, &start_name, o.track)? {
+            Start::Resolved(id, real_ref) => (id, real_ref),
+            Start::Stop(code) => return Ok(code),
+        };
 
     let verb = if existed { "Reset to" } else { "Created from" };
     let message = format!("branch: {verb} {start_name}");

@@ -39,6 +39,13 @@
 //! also what stock does — a tunnel bypasses curl in both dispatch sites
 //! (`imap-send.c:1836-1841` / `:1874-1879`).
 //!
+//! `--draft` (2.56) puts `(\Draft) ` between the mailbox and the literal of
+//! every `APPEND` (`imap-send.c:1422-1423`). On the curl backend stock sets
+//! `CURLOPT_UPLOAD_FLAGS` to `CURLULFLAG_DRAFT` when it was compiled against
+//! libcurl 8.13.0 or later, and otherwise warns `--draft requires libcurl
+//! 8.13.0 or later` and uploads unflagged (`:1725-1731`). This port is the
+//! former build: the flag reaches the wire on both contracts, with no warning.
+//!
 //! Everything downstream of the connection is shared code and identical either
 //! way: `Sending N message(s) to F folder...`, the percent line, and `--list`'s
 //! untagged `* LIST` lines (`imap-send.c:1584-1600` / `:1721-1749`). The wire
@@ -96,11 +103,11 @@
 //!
 //! ### Command line
 //!
-//! `parse_options` over the builtin's five options — `-v`/`--verbose`,
-//! `-q`/`--quiet`, `--curl`, `-f`/`--folder <folder>`, `--list` — including
+//! `parse_options` over the builtin's six options — `-v`/`--verbose`,
+//! `-q`/`--quiet`, `--curl`, `--draft`, `-f`/`--folder <folder>`, `--list` — including
 //! `--no-` forms, `--opt=value`, `-fVALUE` and `-f VALUE`, short bundling
 //! (`-vq`), unique-prefix abbreviation (`--fol`, `--l`), and `--` as a
-//! terminator. `-h` prints the 408-byte usage block on **stdout**, exit 0, at
+//! terminator. `-h` prints the usage block on **stdout**, exit 0, at
 //! the point `-h` is reached. The five `parse_options` diagnostics all go to
 //! stderr with exit 129: ``error: unknown option `bogus'`` and
 //! ``error: unknown switch `Z'``, both followed by the usage block;
@@ -129,14 +136,15 @@ use gix::config::File as ConfigFile;
 use super::send_email::self_exe;
 
 /// The usage block from `imap_send_usage[]` plus the option table
-/// `parse_options` renders under it. 408 bytes.
+/// `parse_options` renders under it.
 const USAGE: &str = concat!(
-    "usage: git imap-send [-v] [-q] [--[no-]curl] [(--folder|-f) <folder>] < <mbox>\n",
+    "usage: git imap-send [-v] [-q] [--[no-]curl] [--[no-]draft] [(--folder|-f) <folder>] < <mbox>\n",
     "   or: git imap-send --list\n",
     "\n",
     "    -v, --[no-]verbose    be more verbose\n",
     "    -q, --[no-]quiet      be more quiet\n",
     "    --[no-]curl           use libcurl to communicate with the IMAP server\n",
+    "    --[no-]draft          mark uploaded messages with the IMAP \\Draft flag\n",
     "    -f, --[no-]folder <folder>\n",
     "                          specify the IMAP folder\n",
     "    --[no-]list           list all folders on the IMAP server\n",
@@ -149,6 +157,7 @@ const LONGS: &[(&str, bool)] = &[
     ("verbose", false),
     ("quiet", false),
     ("curl", false),
+    ("draft", false),
     ("folder", true),
     ("list", false),
 ];
@@ -162,6 +171,8 @@ struct Opts {
     /// `static int use_curl = USE_CURL_DEFAULT`, which is 1 wherever curl is
     /// available; see the module docs for what it selects here.
     curl: bool,
+    /// `--draft` (2.56): `APPEND` the messages with the `\Draft` flag.
+    draft: bool,
     /// `OPT__VERBOSITY`: `-v` counts up, `-q` counts down, and either `--no-`
     /// form resets to zero (`parse_opt_verbosity_cb`).
     verbosity: i32,
@@ -175,6 +186,7 @@ impl Default for Opts {
             folder: None,
             list: false,
             curl: true,
+            draft: false,
             verbosity: 0,
             positional: false,
         }
@@ -268,6 +280,7 @@ fn scan(args: &[String]) -> Scan {
                 match (name, negated) {
                     ("list", n) => opts.list = !n,
                     ("curl", n) => opts.curl = !n,
+                    ("draft", n) => opts.draft = !n,
                     ("folder", true) => {}
                     ("verbose", n) => bump_verbosity(&mut opts.verbosity, true, n),
                     ("quiet", n) => bump_verbosity(&mut opts.verbosity, false, n),
@@ -1651,12 +1664,13 @@ fn split_msg(all: &[u8], ofs: &mut usize) -> Option<Vec<u8>> {
     Some(all[data..data + len].to_vec())
 }
 
-/// `imap_store_msg()` (`imap-send.c:1404`) — one `APPEND` with the message as a
-/// literal.
-fn imap_store_msg(store: &mut Store, msg: &[u8]) -> i32 {
+/// `imap_store_msg()` (`imap-send.c:1407`) — one `APPEND` with the message as a
+/// literal, flagged `(\Draft)` under `--draft` (`:1422-1423`, 2.56).
+fn imap_store_msg(store: &mut Store, msg: &[u8], draft: bool) -> i32 {
     let payload = lf_to_crlf(msg);
     let prefix = if store.name == "INBOX" { "" } else { store.prefix.as_str() };
-    let cmd = format!("APPEND \"{prefix}{}\" ", store.name);
+    let flags = if draft { "(\\Draft) " } else { "" };
+    let cmd = format!("APPEND \"{prefix}{}\" {flags}", store.name);
     let ret = store.exec(&cmd, Some(payload), None);
     // `imap->caps = imap->rcaps` — an APPEND may have changed them.
     store.caps = store.rcaps;
@@ -1672,6 +1686,7 @@ fn append_msgs_to_imap(
     total: usize,
     verbosity: i32,
     progress: bool,
+    draft: bool,
 ) -> u8 {
     let folder = cfg.folder.clone().unwrap_or_default();
     let Some(mut store) = imap_open_store(cfg, &folder, verbosity, false, progress) else {
@@ -1689,7 +1704,7 @@ fn append_msgs_to_imap(
         eprint!("{:>4}% ({n}/{total}) done\r", n * 100 / total);
         let Some(msg) = split_msg(all, &mut ofs) else { break };
         let msg = if cfg.use_html { wrap_in_html(&msg) } else { msg };
-        if imap_store_msg(&mut store, &msg) != RESP_OK {
+        if imap_store_msg(&mut store, &msg, draft) != RESP_OK {
             break;
         }
         n += 1;
@@ -1821,7 +1836,14 @@ pub fn imap_send(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
 
-    Ok(ExitCode::from(append_msgs_to_imap(&mut server, &mbox, total, opts.verbosity, !use_curl)))
+    Ok(ExitCode::from(append_msgs_to_imap(
+        &mut server,
+        &mbox,
+        total,
+        opts.verbosity,
+        !use_curl,
+        opts.draft,
+    )))
 }
 
 #[cfg(test)]

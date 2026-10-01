@@ -814,6 +814,7 @@ fn switch_existing(
             let (abbrev, summary) = describe(repo, id)?;
             eprintln!("Previous HEAD position was {abbrev} {summary}");
         }
+        super::checkout::autostash_conflict_gap(autostashed == Some(true), quiet);
         eprintln!("Switched to branch '{branch}'");
     }
     super::reset::remove_branch_state(repo, !quiet)?;
@@ -822,7 +823,7 @@ fn switch_existing(
         // `update_refs_for_switch()` `checkout` does.
         super::checkout::print_tracking_status(repo);
     }
-    if autostashed {
+    if autostashed.is_some() {
         show_autostash_listing(&target.to_string(), quiet)?;
     }
     Ok(super::checkout::run_post_checkout(
@@ -942,7 +943,7 @@ fn switch_create(
     // merge, and still prints its closing listing, even where `<start>` is the
     // current commit.
     let needs_worktree = start.is_some();
-    let mut autostashed = false;
+    let mut autostashed = None;
     let trees = if needs_worktree {
         let target_tree = repo.find_object(start_commit)?.peel_to_commit()?.tree_id()?.detach();
         let cur_tree = head_tree(repo)?.unwrap_or_else(|| repo.empty_tree().id().detach());
@@ -996,6 +997,7 @@ fn switch_create(
             eprintln!("Previous HEAD position was {abbrev} {summary}");
         }
     }
+    super::checkout::autostash_conflict_gap(autostashed == Some(true), quiet);
 
     // `update_refs_for_switch()` → `create_branch()` (branch.c:596-650), which
     // resolves the start-point a second time through `dwim_branch_start()` — the
@@ -1069,7 +1071,7 @@ fn switch_create(
         }
     }
     super::reset::remove_branch_state(repo, !quiet)?;
-    if autostashed {
+    if autostashed.is_some() {
         show_autostash_listing(&start_commit.to_string(), quiet)?;
     }
     Ok(super::checkout::run_post_checkout(
@@ -1157,7 +1159,7 @@ fn switch_detach(
     // Same `do_merge` rule as [`switch_create`]: a bare `switch --detach` names no
     // operand, so `merge_working_tree()` never runs; with one it always does,
     // whatever the trees turn out to be.
-    let mut autostashed = false;
+    let mut autostashed = None;
     if !positionals.is_empty() {
         if let Some(code) = unmerged_gate(repo, force)? {
             return Ok(code);
@@ -1201,11 +1203,12 @@ fn switch_detach(
                 eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
         }
+        super::checkout::autostash_conflict_gap(autostashed == Some(true), quiet);
         let (abbrev, summary) = describe(repo, target_id)?;
         eprintln!("HEAD is now at {abbrev} {summary}");
     }
     super::reset::remove_branch_state(repo, !quiet)?;
-    if autostashed {
+    if autostashed.is_some() {
         show_autostash_listing(&target_id.to_string(), quiet)?;
     }
     Ok(super::checkout::run_post_checkout(
@@ -1448,7 +1451,8 @@ fn head_tree(repo: &gix::Repository) -> Result<Option<ObjectId>> {
 /// `checkout`'s wording — `git switch` does not have its own), and `--force` /
 /// `--discard-changes` resets instead.
 ///
-/// Returns the exit code of a refusal, or `None` when the worktree moved.
+/// Returns the exit code of a refusal, or, when the worktree moved, whether `-m`
+/// autostashed and if so whether the re-apply conflicted.
 ///
 /// `cur_tree`/`target_tree` may be equal: `merge_working_tree()` is entered for
 /// every switch, and its closing `show_local_changes()` runs whether or not the
@@ -1469,22 +1473,22 @@ fn move_worktree(
     quiet: bool,
     listing_rev: &str,
     merge: Option<super::checkout::MergeOpt<'_>>,
-) -> Result<Result<bool, ExitCode>> {
+) -> Result<Result<Option<bool>, ExitCode>> {
     if discard {
         // `opts->discard_changes` → `reset_tree()`, and the listing is skipped:
         // `if (!opts->discard_changes && !opts->quiet && …)` (checkout.c:930).
         super::checkout::reset_worktree_to_tree(repo, target_tree)?;
-        return Ok(Ok(false));
+        return Ok(Ok(None));
     }
-    let mut autostashed = false;
+    let mut autostashed = None;
     if cur_tree != target_tree {
         match super::checkout::move_worktree(repo, cur_tree, target_tree, merge)? {
             super::checkout::Moved::Refused(code) => return Ok(Err(code)),
-            super::checkout::Moved::Autostashed => autostashed = true,
+            super::checkout::Moved::Autostashed { conflicted } => autostashed = Some(conflicted),
             super::checkout::Moved::Clean => {}
         }
     }
-    if !autostashed {
+    if autostashed.is_none() {
         super::checkout::show_local_changes(listing_rev, quiet)?;
     }
     Ok(Ok(autostashed))

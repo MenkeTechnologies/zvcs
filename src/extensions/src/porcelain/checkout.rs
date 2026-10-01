@@ -1798,12 +1798,13 @@ pub(crate) fn switch_to_branch_opts(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut autostashed = false;
+    let mut autostash_conflicted = false;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else if target_tree != cur_tree || index_unborn(repo)? {
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
-            Moved::Autostashed => autostashed = true,
+            Moved::Autostashed { conflicted } => (autostashed, autostash_conflicted) = (true, conflicted),
             Moved::Clean => {}
         }
     }
@@ -1838,6 +1839,7 @@ pub(crate) fn switch_to_branch_opts(
                 eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
         }
+        autostash_conflict_gap(autostash_conflicted, quiet);
         eprintln!("Switched to branch '{spec}'");
     }
     if update_refs_for_switch {
@@ -1893,13 +1895,14 @@ fn detached_checkout(
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     let mut autostashed = false;
+    let mut autostash_conflicted = false;
     if force {
         reset_worktree_to_tree(repo, target_tree)?;
     } else {
         if target_tree != cur_tree || index_unborn(repo)? {
             match move_worktree(repo, cur_tree, target_tree, merge)? {
                 Moved::Refused(code) => return Ok(code),
-                Moved::Autostashed => autostashed = true,
+                Moved::Autostashed { conflicted } => (autostashed, autostash_conflicted) = (true, conflicted),
                 Moved::Clean => {}
             }
         }
@@ -1921,14 +1924,18 @@ fn detached_checkout(
     }
 
     if !quiet {
+        // `orphaned_commit_warning()` precedes the gap; the advice and `HEAD is
+        // now at` are `update_refs_for_switch()`'s and follow it.
         if old_detached {
             if let (Some(old), true) = (old_commit, old_commit != Some(target_id)) {
                 let (abbrev, summary) = describe(repo, old)?;
                 eprintln!("Previous HEAD position was {abbrev} {summary}");
             }
+        }
+        autostash_conflict_gap(autostash_conflicted, quiet);
         // Through the advice machinery rather than the config key alone, so `--no-advice`
         // (`GIT_ADVICE=0`) silences this block the way it silences every other hint.
-        } else if !force_detach && crate::advice::Advice::DetachedHead.enabled_in(repo) {
+        if !old_detached && !force_detach && crate::advice::Advice::DetachedHead.enabled_in(repo) {
             // Leaving an attached HEAD without an explicit --detach: git warns.
             print_detached_head_advice(spec);
         }
@@ -2047,6 +2054,7 @@ fn create_and_switch(
     }
 
     let mut autostashed = false;
+    let mut autostash_conflicted = false;
     if force {
         // `-f` is `opts->discard_changes`, and `merge_working_tree()` answers it with
         // `reset_tree(new_tree, opts, 1, writeout_error, new_branch_info)` whatever the
@@ -2056,7 +2064,7 @@ fn create_and_switch(
     } else if target_tree != cur_tree || index_unborn(repo)? {
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
-            Moved::Autostashed => autostashed = true,
+            Moved::Autostashed { conflicted } => (autostashed, autostash_conflicted) = (true, conflicted),
             Moved::Clean => {}
         }
     }
@@ -2078,6 +2086,7 @@ fn create_and_switch(
             eprintln!("Previous HEAD position was {abbrev} {summary}");
         }
     }
+    autostash_conflict_gap(autostash_conflicted, quiet);
 
     // `update_refs_for_switch()` → `create_branch(…, new_branch_info->name, …,
     // opts->track, 0)` (builtin/checkout.c:979-986), whose `dwim_branch_start()`
@@ -3450,8 +3459,8 @@ pub(super) fn move_worktree(
         Gate::Autostashed(stash) => {
             update_worktree_to_tree(repo, cur_tree, target_tree)?;
             let opt = merge.expect("only `-m` ever stashes");
-            apply_switch_autostash(repo, stash, target_tree, opt, base_label.as_deref())?;
-            Ok(Moved::Autostashed)
+            let conflicted = apply_switch_autostash(repo, stash, target_tree, opt, base_label.as_deref())?;
+            Ok(Moved::Autostashed { conflicted })
         }
     }
 }
@@ -3490,8 +3499,9 @@ pub(super) enum Moved {
     /// ordinary `merge_working_tree()` listing before it moves `HEAD`.
     Clean,
     /// `-m` stashed and re-applied; the caller prints the headed listing after
-    /// it moves `HEAD`.
-    Autostashed,
+    /// it moves `HEAD`. `conflicted` is `autostash_res == STASH_APPLY_CONFLICT`,
+    /// which [`autostash_conflict_gap`] answers before the switch is announced.
+    Autostashed { conflicted: bool },
     /// The gate refused; this is the exit code, and nothing moved.
     Refused(ExitCode),
 }
@@ -3504,14 +3514,15 @@ pub(super) enum Moved {
 /// worktree). A clean re-apply leaves the changes **unstaged** — the index goes
 /// back to the target tree — and says `Applied autostash.`; a conflicting one
 /// keeps the conflicted index, hands the snapshot to `refs/stash` so the wording
-/// about `git stash pop` is true, and still lets the switch stand.
+/// about `git stash pop` is true, and still lets the switch stand. Returns
+/// whether the re-apply conflicted.
 pub(super) fn apply_switch_autostash(
     repo: &gix::Repository,
     stash: ObjectId,
     ours_tree: ObjectId,
     opt: MergeOpt<'_>,
     base_label: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     let commit = repo.find_commit(stash)?;
     let Some(parent) = commit.parent_ids().next() else {
         return Err(crate::fatal::die("autostash commit has no base"));
@@ -3544,7 +3555,8 @@ pub(super) fn apply_switch_autostash(
         crate::merge_apply::conflict_style(opt.style),
     )?;
 
-    if applied.conflicts.is_empty() {
+    let conflicted = !applied.conflicts.is_empty();
+    if !conflicted {
         // `stash apply` without `--index`: the restored changes come back
         // unstaged, so the index stays the target tree — which is exactly what
         // the checkout just wrote, stat data and all. Rebuilding it from the
@@ -3566,7 +3578,24 @@ pub(super) fn apply_switch_autostash(
         eprintln!("do not want to resolve them now, run \"git reset --hard\" and");
         eprintln!("apply the local changes later by running \"git stash pop\".");
     }
-    Ok(())
+    Ok(conflicted)
+}
+
+/// The blank line that sets a conflicted autostash's warning apart from the
+/// switch announcement below it:
+///
+/// ```c
+/// if (autostash_res == STASH_APPLY_CONFLICT && !opts->quiet)
+///         fputc('\n', stderr);
+/// update_refs_for_switch(opts, &old_branch_info, new_branch_info);
+/// ```
+/// (git 2.56.0 builtin/checkout.c:1259-1261.) It follows
+/// `orphaned_commit_warning()` and precedes everything `update_refs_for_switch()`
+/// prints, `create_branch()`'s output included.
+pub(super) fn autostash_conflict_gap(moved_conflicted: bool, quiet: bool) {
+    if moved_conflicted && !quiet {
+        eprintln!();
+    }
 }
 
 /// `o.ancestor`: the branch the switch is leaving, or its abbreviated commit id

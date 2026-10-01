@@ -493,16 +493,14 @@ pub fn name_rev(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => no_more_opts = true,
             "-h" => {
-                // git's `parse_options` prints the usage on stdout and exits 129.
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                // git's `parse_options` prints the usage on stdout and exits 0.
+                return Ok(super::show_usage(USAGE));
             }
             // `if (internal_help && !strcmp(arg + 2, "help-all"))`
             // (parse-options.c:1122): an exact match, never an abbreviation and
             // never with an `=<value>`, rendering `USAGE_FULL`.
             "--help-all" => {
-                print!("{USAGE_ALL}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_ALL));
             }
             "--name-only" => name_only = true,
             "--no-name-only" => name_only = false,

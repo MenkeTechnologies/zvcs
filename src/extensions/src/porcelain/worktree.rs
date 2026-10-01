@@ -126,7 +126,7 @@ pub fn worktree(args: &[String]) -> Result<ExitCode> {
     // ever producing one, so it reports the missing subcommand instead. A lone
     // `-` is not an option and falls through as a (bogus) subcommand name.
     match sub {
-        // git's parse_options prints `-h` help on stdout and still exits 129.
+        // git's parse_options prints `-h` help on stdout and exits 0.
         // `--help` is intercepted by the `git` wrapper and shows the man page,
         // which this binary has no equivalent for; the usage block is the
         // closest honest substitute.
@@ -139,8 +139,7 @@ pub fn worktree(args: &[String]) -> Result<ExitCode> {
         // `USAGE_FULL` it renders is the block `-h` prints — here and in every
         // subcommand below.
         "-h" | "--help" | "--help-all" => {
-            print!("{MAIN_USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(MAIN_USAGE));
         }
         "--" => return usage(Some("error: need a subcommand"), MAIN_USAGE),
         _ => {}
@@ -699,8 +698,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "vz") => {
-                print!("{LIST_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(LIST_USAGE));
             }
             "--porcelain" => porcelain = true,
             "--no-porcelain" => porcelain = false,
@@ -980,8 +978,7 @@ fn lock(args: &[String]) -> Result<ExitCode> {
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "") => {
-                print!("{LOCK_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(LOCK_USAGE));
             }
             "--reason" => {
                 let Some(v) = args.get(i + 1) else {
@@ -1040,8 +1037,7 @@ fn unlock(args: &[String]) -> Result<ExitCode> {
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "") => {
-                print!("{UNLOCK_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(UNLOCK_USAGE));
             }
             s if s.starts_with('-') && s != "-" => return Ok(super::unknown_option(s, UNLOCK_USAGE)),
             s if target.is_none() => target = Some(s),
@@ -1211,8 +1207,7 @@ fn prune(args: &[String]) -> Result<ExitCode> {
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "nv") => {
-                print!("{PRUNE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(PRUNE_USAGE));
             }
             "-n" | "--dry-run" => show_only = true,
             "--no-dry-run" => show_only = false,
@@ -1559,8 +1554,7 @@ fn repair(args: &[String]) -> Result<ExitCode> {
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "") => {
-                print!("{REPAIR_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(REPAIR_USAGE));
             }
             "--relative-paths" => relative = Some(true),
             "--no-relative-paths" => relative = Some(false),
@@ -2153,8 +2147,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
         match a {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "fdq") => {
-                print!("{ADD_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(ADD_USAGE));
             }
             "-b" | "-B" => {
                 let Some(v) = args.get(i + 1) else {
@@ -3498,8 +3491,7 @@ fn remove(args: &[String]) -> Result<ExitCode> {
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "f") => {
-                print!("{REMOVE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(REMOVE_USAGE));
             }
             "-f" | "--force" => force += 1,
             "--no-force" => force = 0,
@@ -3621,8 +3613,7 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
         match a.as_str() {
             // `--help-all` renders `USAGE_FULL`, the same block: no hidden entry.
             s if s == "--help" || super::asks_for_help(s, "f") => {
-                print!("{MOVE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(MOVE_USAGE));
             }
             "-f" | "--force" => force += 1,
             "--no-force" => force = 0,

@@ -189,8 +189,8 @@ fn value_error(msg: impl std::fmt::Display) -> Result<ExitCode> {
 }
 
 /// [`super::ambiguous_option`] against `git branch`'s usage block: the
-/// explanation on stderr, the block on stdout, exit 129. Verified against stock
-/// 2.55.0, `git branch --col` → `error: ambiguous option: col (could be --color
+/// explanation and the block on stderr, exit 129. Verified against stock
+/// 2.56.0, `git branch --col` → `error: ambiguous option: col (could be --color
 /// or --column)`.
 fn ambiguous_exit(body: &str, first: &str, second: &str) -> Result<ExitCode> {
     Ok(super::ambiguous_option(body, first, second, USAGE))

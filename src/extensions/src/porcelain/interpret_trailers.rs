@@ -48,12 +48,12 @@
 //!   `fatal: could not read input file '<f>': <strerror>` (128),
 //!   `error: file <f> is not a regular file` / `is not writable by user` /
 //!   `error: could not stat <f>: <strerror>` followed by a silent `die(NULL)` (128)
-//! * the usage shapes: `-h` prints git's block on stdout (129); `` error: unknown
+//! * the usage shapes: `-h` prints git's block on stdout (exit 0); `` error: unknown
 //!   option `x' `` and `` error: unknown switch `x' `` print it on stderr after
 //!   the message (`PARSE_OPT_UNKNOWN`, 129); `error: ambiguous option: n (could
-//!   be --no-divider or --no-trailer)` puts its message on stderr and the block
-//!   on **stdout**, because `parse_long_opt()` reports it with `error()` and then
-//!   returns `PARSE_OPT_HELP` (129); `` error: option `x' takes no value `` and
+//!   be --no-divider or --no-trailer)` puts its message and the block on
+//!   stderr, because `parse_long_opt()` reports it with `error()` and then
+//!   returns `PARSE_OPT_HELP_ERROR` (129); `` error: option `x' takes no value `` and
 //!   `` error: option `x' requires a value `` print no usage block at all
 //!   (`PARSE_OPT_ERROR`, 129), and name the entry the way `optname()` spells it,
 //!   so `--divider=x` reports `no-no-divider`; an unrecognised `--where`/`--if-exists`/`--if-missing` value exits 129
@@ -729,16 +729,14 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return Ok(Parsed::Exit(ExitCode::from(USAGE_CODE)));
+            return Ok(Parsed::Exit(super::show_usage(USAGE)));
         }
 
         // Short options: the table declares none, so only the built-in `-h`.
         let Some(long) = arg.strip_prefix("--") else {
             let c = arg[1..].chars().next().expect("`-` was handled as a file");
             if c == 'h' {
-                print!("{USAGE}");
-                return Ok(Parsed::Exit(ExitCode::from(USAGE_CODE)));
+                return Ok(Parsed::Exit(super::show_usage(USAGE)));
             }
             return Ok(Parsed::Exit(usage_error(&format!("unknown switch `{c}'"))));
         };
@@ -753,9 +751,7 @@ fn parse_args(args: &[String]) -> Result<Parsed> {
 
         let (opt, unset) = match super::resolve_long(LONG_OPTS, long) {
             super::Resolved::One(opt, unset) => (opt, unset),
-            // Reported with `error()` on stderr and the block on **stdout**,
-            // which is the one rejection that splits its two halves across the
-            // streams.
+            // `PARSE_OPT_HELP_ERROR`: `error()` and the block, both on stderr.
             super::Resolved::Ambiguous(first, second) => {
                 return Ok(Parsed::Exit(super::ambiguous_option(
                     arg, &first, &second, USAGE,

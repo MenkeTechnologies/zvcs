@@ -777,7 +777,8 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
 /// whether `show_usage_with_options_if_asked()` comes before or after its
 /// `repo_config()` call, and most put the config first. Measured under git 2.55.0
 /// with `-c core.createObject=bogus <verb> -h` and `-c core.ignorecase=bogus
-/// <verb> -h`: the verbs below answer 129 with their usage block, and every other
+/// <verb> -h`: the verbs below answer with their usage block (exit 0 since 2.56,
+/// 129 before), and every other
 /// verb this dispatcher gates answers 128 with the config diagnostic.
 ///
 /// `diff-files`, `diff-index` and `diff-tree` are in here for the same reason
@@ -817,9 +818,9 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "rev-list",
     "rev-parse",
     "sparse-checkout",
-    // `git submodule -h` is a shell script and answers 0 rather than 129, so it
-    // is not a match either way; it is listed so the gate does not make it worse
-    // by refusing a value stock accepts here.
+    // `git submodule -h` is a shell script, whose `-h` never meets the C ordering
+    // at all; it is listed so the gate does not make it worse by refusing a value
+    // stock accepts here.
     "submodule",
     "status",
     "unpack-file",

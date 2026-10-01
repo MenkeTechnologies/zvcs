@@ -39,7 +39,7 @@
 //! Options take effect strictly left to right, so a failure leaves every option
 //! to its left already applied — which is what decides whether the marks file
 //! exists after a fatal. A lone `-h` or `--help-all` is not a failure at all:
-//! `show_usage_if_asked` prints the same summary on *stdout*, exits 129, and
+//! `show_usage_if_asked` prints the same summary on *stdout*, exits 0, and
 //! runs before the repository is even opened.
 //!
 //! Signatures follow git's `--signed-commits=`/`--signed-tags=` modes:
@@ -656,12 +656,11 @@ pub fn fast_import(args: &[String]) -> Result<ExitCode> {
     };
     // `show_usage_if_asked(argc, argv, fast_import_usage)` at
     // `builtin/fast-import.c:3941`: the help flag alone, and only alone, prints
-    // the summary on *stdout* and exits 129. It runs ahead of the repository
+    // the summary on *stdout* and exits 0. It runs ahead of the repository
     // setup git.c would otherwise do, so it answers outside a repository too,
     // and ahead of `start_packfile()`, so it leaves no temporary behind.
     if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
     match run(args) {
         Ok(code) => Ok(code),

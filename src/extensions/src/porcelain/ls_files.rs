@@ -349,7 +349,7 @@ fn check_pathspecs(
 /// ported as well.
 pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // `show_usage_with_options_if_asked()` (builtin/ls-files.c:670): a lone `-h`
-    // answers on stdout at 129, before the index is read.
+    // answers on stdout at exit 0, before the index is read.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }

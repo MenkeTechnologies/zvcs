@@ -96,7 +96,7 @@ fn bad_boolean_pack_settings_are_fatal_before_the_usage_block() {
     // `-h` is the sharpest probe available: it is the earliest thing
     // `parse_options` can do, so a diagnostic that beats it can only have come
     // from a config read that ran first. Reverting any of these reads turns the
-    // exit into 129 and puts the 4170-byte usage block on stdout.
+    // exit into 0 and puts the 4170-byte usage block on stdout.
     for (key, lowered) in BOOL_KEYS {
         let (repo, home) = fixture(&format!("badbool-{}", lowered.replace('.', "-")));
         let out = run(&repo, &home, &["-c", &format!("{key}=bogus"), "pack-objects", "-h"]);
@@ -114,12 +114,12 @@ fn bad_boolean_pack_settings_are_fatal_before_the_usage_block() {
 #[test]
 fn valid_boolean_pack_settings_leave_the_command_alone() {
     // The other half of the same claim: a readable value must not become a
-    // diagnostic. `-h` still prints its usage block and exits 129.
+    // diagnostic. `-h` still prints its usage block and exits 0.
     let (repo, home) = fixture("goodbool");
     for (key, _) in BOOL_KEYS {
         for value in ["true", "false", "on", "off", "1", "0"] {
             let out = run(&repo, &home, &["-c", &format!("{key}={value}"), "pack-objects", "-h"]);
-            assert_eq!(code(&out), 129, "{key}={value} must be accepted");
+            assert_eq!(code(&out), 0, "{key}={value} must be accepted");
             assert!(
                 stderr(&out).is_empty(),
                 "{key}={value} must print nothing on stderr, got: {}",
@@ -152,7 +152,7 @@ fn allow_pack_reuse_takes_words_and_modes_but_not_digits() {
             &home,
             &["-c", &format!("pack.allowPackReuse={value}"), "pack-objects", "-h"],
         );
-        assert_eq!(code(&out), 129, "pack.allowPackReuse={value:?} must be accepted");
+        assert_eq!(code(&out), 0, "pack.allowPackReuse={value:?} must be accepted");
         assert!(stderr(&out).is_empty(), "pack.allowPackReuse={value:?} must be silent");
     }
 
@@ -391,7 +391,7 @@ fn repack_and_gc_reject_the_pack_config_keys_only_once_they_do_real_work() {
 
     for verb in ["repack", "gc"] {
         let help = run(&repo, &home, &["-c", "pack.allowPackReuse=bogus", verb, "-h"]);
-        assert_eq!(code(&help), 129, "{verb} -h must still print usage");
+        assert_eq!(code(&help), 0, "{verb} -h must still print usage");
         assert!(stderr(&help).is_empty(), "{verb} -h must not report the config");
     }
 

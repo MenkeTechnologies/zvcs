@@ -7,7 +7,7 @@
 //! `git stash save -u <msg>`, which scripts have used since long before `push`
 //! existed, fail for no reason.
 //!
-//! `-h` is `parse_options()`' own: the usage block on **stdout**, exit 129, and
+//! `-h` is `parse_options()`' own: the usage block on **stdout**, exit 0, and
 //! for the bare command that block lists every subcommand rather than `push`'s
 //! options alone.
 #![cfg(unix)]
@@ -111,14 +111,14 @@ fn save_keep_index_leaves_the_index_staged() {
     );
 }
 
-/// `-h` prints the subcommand's usage to stdout and exits 129 — the bare form
+/// `-h` prints the subcommand's usage to stdout and exits 0 — the bare form
 /// lists every subcommand, not `push`'s option table.
 #[test]
 fn dash_h_prints_usage_on_stdout() {
     let f = Fixture::new("dash-h");
 
     let (code, out, err) = f.run(&["stash", "-h"]);
-    assert_eq!(code, 129, "wrong exit for `stash -h`");
+    assert_eq!(code, 0, "wrong exit for `stash -h`");
     assert!(err.is_empty(), "usage must not go to stderr: {err}");
     assert!(out.starts_with("usage: git stash list"), "not the full usage block: {out}");
     for sub in ["show", "drop", "pop", "apply", "branch", "save", "clear", "create", "store"] {
@@ -126,7 +126,7 @@ fn dash_h_prints_usage_on_stdout() {
     }
 
     let (code, out, err) = f.run(&["stash", "pop", "-h"]);
-    assert_eq!(code, 129, "wrong exit for `stash pop -h`");
+    assert_eq!(code, 0, "wrong exit for `stash pop -h`");
     assert!(err.is_empty(), "usage must not go to stderr: {err}");
     assert!(out.starts_with("usage: git stash pop"), "not pop's usage: {out}");
 

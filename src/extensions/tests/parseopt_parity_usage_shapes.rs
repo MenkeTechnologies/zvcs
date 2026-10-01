@@ -47,7 +47,7 @@
 //! ```
 //!
 //! so `git <cmd> -h` answers with the usage block **outside** a repository too,
-//! on stdout at 129. Verbs in this port that opened the repository first
+//! on stdout at exit 0 (129 before 2.56). Verbs in this port that opened the repository first
 //! answered `fatal: not a git repository` at 128 instead.
 
 use std::path::{Path, PathBuf};
@@ -300,7 +300,8 @@ fn a_non_ascii_short_option_is_named_by_the_whole_token() {
 
 /// git.c:474-476's demotion: a lone `-h` is answered before the repository is
 /// ever looked for, so it works outside one — usage block on **stdout**, no
-/// `error:` line, 129.
+/// `error:` line, exit 0 (`parse_options()` exits 0 for `PARSE_OPT_HELP` since
+/// 2.56, parse-options.c:1207-1208).
 ///
 /// The first line of each block is stock git 2.55.0's, and `git <verb> -h`
 /// prints the same block inside and outside a repository for every verb here
@@ -335,7 +336,7 @@ fn a_lone_dash_h_is_answered_outside_a_repository() {
         ("update-index", "usage: git update-index [<options>] [--] [<file>...]"),
     ] {
         let out = run(&dir, &[verb, "-h"]);
-        assert_eq!(out.status.code(), Some(129), "exit for git {verb} -h");
+        assert_eq!(out.status.code(), Some(0), "exit for git {verb} -h");
         assert_eq!(
             stderr(&out),
             "",
@@ -436,17 +437,19 @@ fn a_lone_dashdash_ends_option_parsing_rather_than_being_looked_up() {
 }
 
 /// `register_abbrev()` (parse-options.c:497) keeps the last two candidates, and
-/// a prefix that names more than one entry is `ambiguous option:` — the one
-/// refusal that splits its halves across the streams. `parse_long_opt()` reports
-/// the reason with `error()` on stderr and returns `PARSE_OPT_HELP`, which
-/// `parse_options_step()` routes to `usage_with_options_internal(...,
-/// USAGE_TO_STDOUT)`, so the block lands on **stdout** at 129.
+/// a prefix that names more than one entry is `ambiguous option:`.
+/// `parse_long_opt()` reports the reason with `error()` and, since 2.56, returns
+/// `PARSE_OPT_HELP_ERROR` (parse-options.c:578-586), which `parse_options_step()`
+/// routes to `usage_with_options_internal(..., USAGE_TO_STDERR)`
+/// (parse-options.c:1139-1140,1174-1176), so the block follows the reason on
+/// **stderr** at 129. Before 2.56 it returned `PARSE_OPT_HELP` and the block went
+/// to stdout.
 ///
 /// Three verbs wrote the block to stderr or dropped it, and `mktree` answered
 /// the ambiguity with `unknown option` because its private resolver reported a
-/// tie as "no match". Every line below is stock git 2.55.0's.
+/// tie as "no match". Every line below is stock git 2.56.0's.
 #[test]
-fn an_ambiguous_abbreviation_puts_its_block_on_stdout() {
+fn an_ambiguous_abbreviation_puts_its_block_on_stderr() {
     let dir = repo("ambiguous");
     for (args, line) in [
         (
@@ -469,11 +472,11 @@ fn an_ambiguous_abbreviation_puts_its_block_on_stdout() {
         let out = run(&dir, args);
         let what = args.join(" ");
         assert_eq!(out.status.code(), Some(129), "exit for git {what}");
-        assert_eq!(stderr(&out), format!("{line}\n"), "stderr for git {what}");
         assert!(
-            stdout(&out).starts_with("usage: git "),
-            "the block belongs on stdout for git {what}; stdout was {:?}",
-            stdout(&out)
+            stderr(&out).starts_with(&format!("{line}\nusage: git ")),
+            "the block follows the reason on stderr for git {what}; stderr was {:?}",
+            stderr(&out)
         );
+        assert_eq!(stdout(&out), "", "stdout for git {what}");
     }
 }

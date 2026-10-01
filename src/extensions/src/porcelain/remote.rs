@@ -50,8 +50,7 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
         // here instead. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if orig == "--help-all" {
-            print!("{}", USAGE_MAIN);
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(&USAGE_MAIN));
         }
         let resolved = match canonical(orig, OPTS_MAIN, USAGE_MAIN) {
             Ok(name) => name,
@@ -61,8 +60,7 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
             "-v" | "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
             "-h" | "--help" => {
-                print!("{}", USAGE_MAIN);
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(&USAGE_MAIN));
             }
             // `parse_options_step()` consumes a lone `--` before any table
             // lookup (parse-options.c: `if (!arg[2]) { ... ctx->argc--;
@@ -310,8 +308,7 @@ fn canonical<'a>(
 /// `git remote add -h` prints `builtin_remote_add_usage`, not
 /// `builtin_remote_usage`. Both spellings reach
 /// `usage_with_options_internal(..., USAGE_TO_STDOUT)`, so the block goes to
-/// **stdout** with no `error:` line — the one thing that separates asking for
-/// help from being refused, since both exit 129.
+/// **stdout** with no `error:` line, at exit 0 — a refusal is on stderr at 129.
 ///
 /// `shorts` names the sub-command's argument-less short options, which
 /// [`super::asks_for_help`] needs to know where a cluster stops being understood;

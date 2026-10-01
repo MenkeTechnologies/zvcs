@@ -216,14 +216,14 @@ fn an_unknown_character_mid_clump_names_itself() {
 /// `-h` inside a clump: `if (internal_help && *ctx->opt == 'h') goto
 /// show_usage` (parse-options.c:1087-1088) is reached after everything in
 /// front of it has been applied, so `git add -vh` prints the block on *stdout*
-/// at 129 — a help request is not a rejection — while `git add -Zh` never gets
+/// at exit 0 — a help request is not a rejection — while `git add -Zh` never gets
 /// there and refuses `Z`.
 #[test]
 fn h_mid_clump_asks_for_help_but_only_once_it_is_reached() {
     let f = Fixture::new("help-mid-clump");
 
     let out = f.run(&["add", "-vh"]);
-    assert_eq!(out.code, 129);
+    assert_eq!(out.code, 0);
     assert!(out.stdout.starts_with("usage: git add"), "stdout: {:?}", out.stdout);
     assert!(out.stderr.is_empty(), "stderr must stay empty: {:?}", out.stderr);
 

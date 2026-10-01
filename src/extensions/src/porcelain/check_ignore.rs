@@ -15,7 +15,7 @@
 //! (`<source>:<line>:<pattern>\t<path>` and its NUL-delimited variant), C-style
 //! path quoting, the "non-matching" `::\t` records, the fatal argument-validation
 //! errors (exit 128), the usage block with its unknown-option/unknown-switch and
-//! `-h` exits (129), and the 0/1 exit convention.
+//! `-h` (exit 0), and the 0/1 exit convention.
 //!
 //! Wildcards in a pathspec (`*.log`) are matched the way git matches them here,
 //! which is only against the index: `check_ignore()` never expands a pathspec, it
@@ -609,12 +609,9 @@ usage: git check-ignore [<options>] <pathname>...
 
 ";
 
-/// `-h`/`--help`: the usage block goes to standard output, and the exit code is
-/// still the usage-error 129.
+/// `-h`/`--help-all`: the usage block on standard output, `PARSE_OPT_HELP`.
 fn show_usage() -> ExitCode {
-    print!("{USAGE}");
-    let _ = std::io::stdout().flush();
-    ExitCode::from(129)
+    super::show_usage(USAGE)
 }
 
 /// A command-line parsing error: the `error:` line and the usage block both go

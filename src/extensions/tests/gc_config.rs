@@ -202,15 +202,15 @@ fn gc_max_cruft_size_validated_before_override_and_auto() {
 
 #[test]
 fn gc_dash_h_skips_config_validation() {
-    // A bare `gc -h` prints usage and exits 129 before the config is read, so an
+    // A bare `gc -h` prints usage and exits 0 before the config is read, so an
     // otherwise-fatal `gc.maxCruftSize` is never seen — matching git's early
     // `-h` fast path.
     let (repo, home) = fixture("dashh");
     git(&repo, &["config", "gc.maxCruftSize", "bogus"]);
 
     let z = zvcs(&repo, &home, &["-h"]);
-    assert_eq!(z.status.code(), Some(129), "bare -h exits 129");
-    assert_eq!(real(&repo, &home, &["-h"]).status.code(), Some(129), "sanity: git too");
+    assert_eq!(z.status.code(), Some(0), "bare -h exits 0");
+    assert_eq!(real(&repo, &home, &["-h"]).status.code(), Some(0), "sanity: git too");
     assert!(
         String::from_utf8_lossy(&z.stdout).starts_with("usage: git gc"),
         "usage goes to stdout"

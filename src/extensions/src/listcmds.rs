@@ -204,12 +204,12 @@ const COMMON_CATEGORY_SECTIONS: &[(&str, &str)] = &[
 /// `commands[]` table, in its alphabetical order.
 ///
 /// That table is a contract, not just an inventory. git's own suite reads this
-/// group as "the commands `run_builtin()` drives": `t0012-help.sh:254` requires
-/// every name listed to answer `-h` with exit 129 and a usage on stdout, and
-/// `t0450-txt-doc-vs-help.sh:11` diffs each one's `-h` synopsis against its
-/// manual. The scripted commands (`archimport` exits 1 on `-h`, `web--browse`
-/// 0, `credential-netrc` 2) and the `z*` verbs (`zstatus -h` exits 0) do not
-/// keep it, so although this binary serves them in-process they are not
+/// group as "the commands `run_builtin()` drives": `t0012-help.sh:254-266` requires
+/// every name listed to answer `-h` successfully with a usage on stdout and
+/// nothing on stderr (exit 0 since 2.56, which dropped the old
+/// `test_expect_code 129`), and `t0450-txt-doc-vs-help.sh:11` diffs each one's
+/// `-h` synopsis against its manual. The scripted commands and the `z*` verbs
+/// are not held to either, so although this binary serves them in-process they are not
 /// builtins in git's sense; they reach `main` instead, as stock's scripts do
 /// from its exec-path. Filtered through the dispatch table so a name this port
 /// stops serving leaves the listing with it.

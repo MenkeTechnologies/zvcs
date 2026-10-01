@@ -22,7 +22,7 @@
 //!   ``error: unknown switch `C'`` + usage (129),
 //!   ``error: option `NAME' requires a value`` with **no** usage block (129),
 //!   ``error: option `NAME' takes no value`` with **no** usage block (129).
-//!   `-h` anywhere renders usage on **stdout** and exits 129; any positional
+//!   `-h` anywhere renders usage on **stdout** and exits 0; any positional
 //!   argument renders the same block on **stderr** and exits 129.
 //! * `worker_loop`'s `packet_read(0, ...)` framing and its two terminating
 //!   paths. A flush (`0000`), a delim (`0001`), a response-end (`0002`) and an
@@ -118,11 +118,9 @@ pub fn checkout__worker(args: &[String]) -> Result<ExitCode> {
     worker_loop()
 }
 
-/// `-h`: usage goes to stdout, but the exit code is still 129.
+/// `-h`: usage on stdout, `PARSE_OPT_HELP`.
 fn render_help() -> ExitCode {
-    print!("{USAGE}");
-    let _ = io::stdout().flush();
-    ExitCode::from(129)
+    super::show_usage(USAGE)
 }
 
 // ---------------------------------------------------------------------------

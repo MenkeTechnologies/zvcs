@@ -148,8 +148,7 @@ pub fn cherry(args: &[String]) -> Result<ExitCode> {
             // and renders `USAGE_FULL`, which is this same block: no entry of the
             // table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--help" => bail!("unsupported flag \"--help\""),
             _ if a.starts_with("--abbrev=") => {

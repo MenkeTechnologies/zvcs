@@ -927,7 +927,7 @@ fn parse_opts(
                 'N' => o.ita_only = true,
                 '3' => o.three_way = true,
                 // parse_options_step()'s `internal_help` check sits inside the
-                // short-option loop: `-h` answers on stdout at 129, without the
+                // short-option loop: `-h` answers on stdout at exit 0, without the
                 // `error:` line that precedes a rejection's copy of the block.
                 'h' => return Err(super::show_usage(USAGE)),
                 _ => {

@@ -103,14 +103,13 @@ pub fn repo(args: &[String]) -> Result<ExitCode> {
     };
 
     match first {
-        // parse-options writes `-h` output to stdout and still exits 129.
+        // parse-options writes `-h` output to stdout and exits 0.
         // `--help-all` gets there through a `strcmp()` of its own inside
         // parse_options_step(), ahead of parse_long_opt(): never abbreviated,
         // never `=<value>`. It renders `USAGE_FULL`, identical to this block
         // because the table has no `PARSE_OPT_HIDDEN` entry.
         "-h" | "--help-all" => {
-            print!("{USAGE_TOP}");
-            Ok(ExitCode::from(129))
+            Ok(super::show_usage(USAGE_TOP))
         }
         "info" => info(&args[1..]),
         "structure" => structure(&args[1..]),
@@ -156,8 +155,7 @@ fn info(args: &[String]) -> Result<ExitCode> {
             // the `--` break above and before parse_long_opt(): exact name
             // only, and `USAGE_FULL` is this block, no hidden entry existing.
             "-h" | "--help-all" => {
-                print!("{USAGE_INFO}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_INFO));
             }
             "-z" => format = Some(Format::Nul),
             "--all" => all = true,
@@ -200,8 +198,7 @@ fn info(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'z' => format = Some(Format::Nul),
                         'h' => {
-                            print!("{USAGE_INFO}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE_INFO));
                         }
                         _ => return Ok(usage_error(USAGE_INFO, &format!("unknown switch `{c}'"))),
                     }
@@ -317,8 +314,7 @@ fn structure(args: &[String]) -> Result<ExitCode> {
             // parse_long_opt() and after the `--` break: exact name only, and
             // `USAGE_FULL` is this block, the table having no hidden entry.
             "-h" | "--help-all" => {
-                print!("{USAGE_STRUCTURE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_STRUCTURE));
             }
             "-z" => format = Some(Format::Nul),
             "--progress" | "--no-progress" => {}
@@ -359,8 +355,7 @@ fn structure(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'z' => format = Some(Format::Nul),
                         'h' => {
-                            print!("{USAGE_STRUCTURE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE_STRUCTURE));
                         }
                         _ => {
                             return Ok(usage_error(

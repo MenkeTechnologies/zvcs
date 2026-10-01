@@ -115,8 +115,7 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
@@ -140,8 +139,7 @@ pub fn verify_tag(args: &[String]) -> Result<ExitCode> {
             "--raw" => raw = true,
             "--no-raw" => raw = false,
             "-h" | "--help" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `OPT_STRING`: the separate-argument spelling swallows the next
             // argv entry even when that entry looks like an operand, and

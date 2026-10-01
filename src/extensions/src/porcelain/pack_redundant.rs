@@ -14,7 +14,7 @@
 //! * The deprecation gate: without `--i-still-use-this` the command prints the
 //!   `you_still_use_that()` block on stderr and exits 128, before any pack is
 //!   touched. `-h` / `--help-all` as the sole argument still print usage on
-//!   stdout and exit 129 (`show_usage_if_asked`), ahead of the gate.
+//!   stdout and exit 0 (`show_usage_if_asked`), ahead of the gate.
 //! * `usage()` on an unknown dash-argument: usage line on stderr, exit 129.
 //! * The `fatal:` paths — `Zero packs found!`, `Bad pack filename: <name>`,
 //!   `Filename <name> not found in packed_git`, `Bad object ID on stdin: <line>`
@@ -89,8 +89,7 @@ struct Pack {
 pub fn pack_redundant(args: &[String]) -> Result<ExitCode> {
     // show_usage_if_asked(): fires before every other check, including the gate.
     if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
-        println!("usage: {USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("usage: {USAGE}\n")));
     }
 
     let mut load_all_packs = false;

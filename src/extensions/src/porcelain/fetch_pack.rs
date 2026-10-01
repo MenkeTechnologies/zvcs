@@ -128,7 +128,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
     };
 
     // `show_usage_if_asked(argc, argv, fetch_pack_usage)` (builtin/fetch-pack.c:78):
-    // a LONE `-h` on stdout at 129. With anything else on the line `-h` is just
+    // a LONE `-h` on stdout at exit 0. With anything else on the line `-h` is just
     // an unrecognized flag, which the scan below reports on stderr.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);

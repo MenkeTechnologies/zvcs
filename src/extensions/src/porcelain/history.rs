@@ -2,7 +2,7 @@
 //!
 //! What this module implements, byte-identically with stock git 2.55.0: the
 //! whole command-line surface. That is `-h` for the command and for each
-//! subcommand (usage text on stdout, exit 129), the missing/unknown subcommand
+//! subcommand (usage text on stdout, exit 0), the missing/unknown subcommand
 //! diagnostics, per-subcommand option parsing (`--update-refs`, `-n`/
 //! `--dry-run`/`--no-dry-run`, `--reedit-message`/`--no-reedit-message`,
 //! `--empty`, `--` plus trailing pathspecs for `split`), the option-value
@@ -155,15 +155,13 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(EXIT_USAGE));
     };
 
-    // `-h` anywhere in the leading position prints to stdout and still exits 129.
+    // `-h` anywhere in the leading position prints to stdout and exits 0.
     // `--help-all` joins it: parse_options_step() tests that name with a
     // `strcmp()` of its own, ahead of parse_long_opt(), and renders `USAGE_FULL`
     // — the same block, because this option table has no `PARSE_OPT_HIDDEN`
     // entry. The exact compare is why `--help-a` and `--help-all=x` stay errors.
     if first == "-h" || first == "--help" || first == "--help-all" {
-        println!("{USAGE}");
-        std::io::stdout().flush()?;
-        return Ok(ExitCode::from(EXIT_USAGE));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
 
     let sub = match first.as_str() {
@@ -1037,9 +1035,7 @@ fn parse(sub: Sub, args: &[String]) -> Result<Parsed> {
         // table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the
         // same block `-h` prints.
         if a == "--help-all" {
-            println!("{}", sub.usage());
-            std::io::stdout().flush()?;
-            return Ok(Parsed::Exit(ExitCode::from(EXIT_USAGE)));
+            return Ok(Parsed::Exit(super::show_usage(&format!("{}\n", sub.usage()))));
         }
 
         let (name, value) = match a.split_once('=') {
@@ -1060,9 +1056,7 @@ fn parse(sub: Sub, args: &[String]) -> Result<Parsed> {
 
         match name {
             "-h" | "--help" => {
-                println!("{}", sub.usage());
-                std::io::stdout().flush()?;
-                return Ok(Parsed::Exit(ExitCode::from(EXIT_USAGE)));
+                return Ok(Parsed::Exit(super::show_usage(&format!("{}\n", sub.usage()))));
             }
             "-n" | "--dry-run" => opts.dry_run = true,
             "--no-dry-run" => opts.dry_run = false,

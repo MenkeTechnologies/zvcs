@@ -22,7 +22,7 @@
 //! What is ported (checked against git 2.55.0's `builtin/difftool.c`,
 //! `git-difftool--helper.sh` and `git-mergetool--lib.sh`):
 //!
-//!   * `-h` → the usage block on **stdout**, exit 129, before repository setup.
+//!   * `-h` → the usage block on **stdout**, exit 0, before repository setup.
 //!   * `--tool-help` → delegated to the `mergetool` sibling's
 //!     `show_tool_help("diff")`, before repository setup.
 //!   * value-taking option with no value → the parse-options `requires a value`
@@ -232,16 +232,14 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
                 opts.forward.push(a.to_owned());
             }
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `if (internal_help && !strcmp(arg + 2, "help-all"))`
             // (parse-options.c:1122), an exact match tested ahead of
             // parse_long_opt(): never an abbreviation, never with an
             // `=<value>`, and rendered as `USAGE_FULL`.
             "--help-all" => {
-                print!("{USAGE_ALL}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_ALL));
             }
             "--tool-help" => opts.tool_help = true,
             "--no-tool-help" => opts.tool_help = false,
@@ -292,8 +290,7 @@ pub fn difftool(args: &[String]) -> Result<ExitCode> {
                 while let Some(c) = chars.next() {
                     match c {
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         'y' => opts.prompt = Some(false),
                         'g' => opts.gui = Some(true),

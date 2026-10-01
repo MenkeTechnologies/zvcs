@@ -128,8 +128,7 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
             return Ok(code);
@@ -172,8 +171,7 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // Grouped short flags, e.g. `-az`.
             s if s.len() > 1 && s.starts_with('-') => {
@@ -182,8 +180,7 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
                         'a' => all = true,
                         'z' => nul = true,
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => {
                             eprint!("error: unknown switch `{c}'\n{USAGE}");

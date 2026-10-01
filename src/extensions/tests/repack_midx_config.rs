@@ -156,7 +156,7 @@ fn midx_keys_are_parsed_before_option_parsing_and_range_checked_after() {
 
     // The range check is the other side: `-h` wins over it.
     let help = run(&repo, &home, &["-c", "repack.midxSplitFactor=1", "repack", "-h"]);
-    assert_eq!(code(&help), 129, "an out-of-range value must not beat -h");
+    assert_eq!(code(&help), 0, "an out-of-range value must not beat -h");
     assert!(help.stdout.starts_with(b"usage: git repack"));
     assert!(stderr(&help).is_empty());
 

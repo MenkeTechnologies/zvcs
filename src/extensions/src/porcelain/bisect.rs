@@ -129,7 +129,7 @@ use gix::hash::ObjectId;
 // `bisect run` whose script cannot be executed is the reachable case: the
 // `[<oid>] <subject>` line `verify_good()`'s second `bisect_checkout()` prints
 // comes out *after* the `error: bogus exit code …` that follows it.
-use crate::cstdio::{print, println};
+use crate::cstdio::println;
 
 /// The usage block git prints on a usage error, verbatim.
 const USAGE: &str = "\
@@ -175,8 +175,7 @@ pub fn bisect(args: &[String]) -> Result<ExitCode> {
         // what the `help` word reaches) on stderr. Both exit 129. `--help-all`
         // renders `USAGE_FULL`, identical here: no entry is `PARSE_OPT_HIDDEN`.
         "-h" | "--help-all" => {
-            print!("{USAGE}");
-            Ok(ExitCode::from(129))
+            Ok(super::show_usage(USAGE))
         }
         "help" => {
             eprint!("{USAGE}");

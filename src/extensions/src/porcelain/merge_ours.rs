@@ -23,7 +23,7 @@
 //!   commits yet` on an unborn `HEAD`.
 //! * Exit 128 with `fatal: not a git repository (or any of the parent
 //!   directories): .git` outside a repository.
-//! * `-h` as the sole argument: usage line on **stdout**, exit 129.
+//! * `-h` as the sole argument: usage line on **stdout**, exit 0.
 //!   `--help-all` as the sole argument: the same line on **stderr**, exit 129
 //!   (this asymmetry is what `show_usage_with_options_if_asked()` produces in
 //!   2.55). With any other argument present neither is special-cased.

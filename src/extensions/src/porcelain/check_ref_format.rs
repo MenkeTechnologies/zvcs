@@ -33,7 +33,7 @@
 //!   `not a valid branch name` refusal), and the expansion itself for the one
 //!   value `branch_interpret_allowed()` lets through under
 //!   `INTERPRET_BRANCH_LOCAL` — an upstream that is itself a local branch
-//! * `-h` as the only argument — usage on stdout, exit 129; a missing argument,
+//! * `-h` as the only argument — usage on stdout, exit 0; a missing argument,
 //!   an unknown option, or more than one refname — the same usage on stderr,
 //!   exit 129
 //!

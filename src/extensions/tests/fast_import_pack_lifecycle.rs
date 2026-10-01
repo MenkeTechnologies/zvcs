@@ -200,7 +200,7 @@ fn real_import_lands_the_ref_and_leaves_nothing_behind() {
     );
 }
 
-/// `show_usage_if_asked` answers a lone help flag on *stdout* with exit 129, and
+/// `show_usage_if_asked` answers a lone help flag on *stdout* with exit 0, and
 /// it runs before `start_packfile()`, so no temporary is created at all.
 #[test]
 fn lone_help_flag_prints_on_stdout_before_any_packfile() {
@@ -209,7 +209,7 @@ fn lone_help_flag_prints_on_stdout_before_any_packfile() {
 
     for flag in ["-h", "--help-all"] {
         let (stdout, stderr, code) = fast_import(&repo, &home, &[flag], "");
-        assert_eq!(code, 129, "{flag}: stderr: {stderr}");
+        assert_eq!(code, 0, "{flag}: stderr: {stderr}");
         assert_eq!(stderr, "", "{flag} must not write to stderr");
         assert!(stdout.starts_with("usage: git fast-import [--date-format=<f>]"), "{stdout}");
         assert_eq!(temp_packs(&repo), Vec::<String>::new(), "{flag}");

@@ -129,8 +129,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
         // rather than in `LONG_OPTS`. This table has no `PARSE_OPT_HIDDEN`
         // entry, so `USAGE_FULL` renders the same block `-h` prints.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
 
         let resolved = match super::canonical_long(arg, LONG_OPTS) {
@@ -215,8 +214,7 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
                 'p' => to_stdout = true,
                 'q' => quiet = true,
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 'L' => {
                     let rest = &arg[1 + at + c.len_utf8()..];

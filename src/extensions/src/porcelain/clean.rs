@@ -82,8 +82,7 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Err(129);
+            return Err(super::show_usage_status(USAGE));
         }
 
         if let Some(long) = a.strip_prefix("--") {
@@ -181,8 +180,7 @@ fn parse(args: &[String]) -> std::result::Result<Parsed, u8> {
                     p.excludes.push(value);
                 }
                 'h' => {
-                    print!("{USAGE}");
-                    return Err(129);
+                    return Err(super::show_usage_status(USAGE));
                 }
                 _ => {
                     eprint!("error: unknown switch `{c}'\n{USAGE}");

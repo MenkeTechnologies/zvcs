@@ -85,11 +85,9 @@ pub fn remote_ext(args: &[String]) -> Result<ExitCode> {
         .collect();
 
     // `show_usage_if_asked()`: only when the help flag is the sole argument.
-    // git 2.55.0 puts this on stdout but still leaves 129 in `$?`.
+    // On stdout at exit 0 (usage.c:185-199).
     if argv.len() == 2 && (argv[1] == "-h" || argv[1] == "--help-all") {
-        print!("{USAGE_MSG}");
-        std::io::stdout().flush()?;
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE_MSG));
     }
     if argv.len() != 3 {
         eprint!("{USAGE_MSG}");

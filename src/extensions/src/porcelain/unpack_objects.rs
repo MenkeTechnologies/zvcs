@@ -159,8 +159,7 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     // stderr through the catch-all below. `--help-all` is the same sole-argument
     // request for `USAGE_FULL`, which here renders the same single line.
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
-        println!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
 
     let mut dry_run = false;

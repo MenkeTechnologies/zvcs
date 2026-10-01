@@ -74,7 +74,7 @@
 //!     `--prefix` to it), validated (missing colon / empty name) at parse time.
 //!   * Unknown options: `--<opt>` → `error: unknown option '<opt>'`, `-<c>` →
 //!     `error: unknown switch '<c>'`, each followed by the usage block on stderr
-//!     with exit 129; `-h` / `--help` print the same usage to stdout, exit 129;
+//!     with exit 129; `-h` / `--help` print the same usage to stdout, exit 0;
 //!     the `--no-` negations of the boolean and value options.
 //!
 //!   * `--worktree-attributes`, to the extent this port supports attributes at
@@ -519,11 +519,10 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         match a {
             "--" => literal = true,
             // git's `parse_options()` prints the full usage to *stdout* and exits
-            // 129 on `-h` / `--help`. `--help-all` renders `USAGE_FULL`, which is
+            // 0 on `-h` / `--help`. `--help-all` renders `USAGE_FULL`, which is
             // this same block: the option table has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "-l" | "--list" => list = true,
             "--no-list" => list = false,

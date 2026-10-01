@@ -651,10 +651,9 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             err.flush()?;
             return Ok(ExitCode::from(129));
         }
-        // `parse_long_opt()` reports the ambiguity with `error()` on stderr and
-        // then returns `PARSE_OPT_HELP`, so the block that follows it lands on
-        // *stdout* — the one rejection that splits its two halves across the two
-        // streams.
+        // `parse_long_opt()` reports the ambiguity with `error()` and returns
+        // `PARSE_OPT_HELP_ERROR`, which `builtin/blame.c:1042-1045` exits 129
+        // for after `parse_options_step()` put the block on stderr.
         ParseOutcome::Ambiguous(body, first, second) => {
             let mut err = std::io::stderr().lock();
             writeln!(
@@ -662,7 +661,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
                 "error: ambiguous option: {body} (could be --{first} or --{second})"
             )?;
             err.flush()?;
-            return print_usage(cmd, true);
+            return print_usage(cmd, false);
         }
         // The parser has already written everything it had to say.
         ParseOutcome::Reported(code) => return Ok(code),
@@ -2693,13 +2692,13 @@ fn format_tz(offset_seconds: i32) -> String {
     format!("{sign}{:02}{:02}", abs / 3600, (abs % 3600) / 60)
 }
 
-/// Print the usage text for `cmd` and yield `parse_options`' exit status (129).
+/// Print the usage text for `cmd` and yield `parse_options`' exit status.
 ///
 /// git splits the two usage paths by stream, which the parity contract sees
-/// because stdout is compared: `usage_with_options()` from the `-h` handler
-/// writes to **stdout** (`parse-options.c` passes `stdout` when the request was
-/// explicit), while `usage(str_usage)` for a structurally invalid command line
-/// writes to **stderr**. Both exit 129. Verified against git 2.55.0:
+/// because stdout is compared: the `-h` handler writes to **stdout** and exits
+/// 0 (`builtin/blame.c:1040-1041`, `case PARSE_OPT_HELP: exit(0);` since 2.56),
+/// while `usage_with_options()` for a structurally invalid command line writes
+/// to **stderr** and exits 129. Verified against git 2.55.0:
 /// `git blame -h` wrote 2097 bytes to stdout and 0 to stderr; `git blame` with
 /// no operand wrote 0 to stdout and the same 2097 bytes to stderr.
 fn print_usage(cmd: &str, to_stdout: bool) -> Result<ExitCode> {
@@ -2721,9 +2720,9 @@ fn print_synopsis(cmd: &str) -> Result<ExitCode> {
     write_usage(cmd, "", false)
 }
 
-/// `--help-all`: the same synopsis over [`USAGE_BODY_ALL`], always on stdout —
-/// only a help request reaches `USAGE_FULL`, and a help request is never a
-/// rejection.
+/// `--help-all`: the same synopsis over [`USAGE_BODY_ALL`], always on stdout at
+/// exit 0 — only a help request reaches `USAGE_FULL`, and a help request is
+/// never a rejection.
 fn print_usage_all(cmd: &str) -> Result<ExitCode> {
     write_usage(cmd, USAGE_BODY_ALL, true)
 }
@@ -2732,16 +2731,10 @@ fn print_usage_all(cmd: &str) -> Result<ExitCode> {
 /// by whichever option block was asked for.
 fn write_usage(cmd: &str, body: &str, to_stdout: bool) -> Result<ExitCode> {
     let text = format!("usage: git {cmd} [<options>] [<rev-opts>] [<rev>] [--] <file>\n{body}");
-    if to_stdout {
-        let mut out = std::io::stdout().lock();
-        out.write_all(text.as_bytes())?;
-        out.flush()?;
-    } else {
-        let mut err = std::io::stderr().lock();
-        err.write_all(text.as_bytes())?;
-        err.flush()?;
-    }
-    Ok(ExitCode::from(129))
+    Ok(match to_stdout {
+        true => super::show_usage(&text),
+        false => super::help_error(&text),
+    })
 }
 
 /// Outcome of splitting the positionals into `[<rev>...] <file>` and resolving

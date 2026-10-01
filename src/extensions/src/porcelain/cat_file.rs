@@ -340,8 +340,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         // and `-z`; the `--mailmap` line is still the in-`parse_options()`
         // spelling, because this block is rendered from inside it.
         if arg == "--help-all" {
-            print!("{}", usage_all(ALIAS_HELP));
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(&usage_all(ALIAS_HELP)));
         }
 
         let raw = arg;
@@ -451,8 +450,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                             None
                         }
                         'h' => {
-                            print!("{}", usage(ALIAS_HELP));
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(&usage(ALIAS_HELP)));
                         }
                         _ => {
                             eprintln!("error: unknown switch `{c}'");

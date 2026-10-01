@@ -1358,7 +1358,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             "--no-includes" => respect_includes = Some(false),
             "--show-origin" => d.show_origin = true,
             // parse_options_step()'s `internal_help`, ahead of the
-            // subcommand dispatch: the block on stdout at 129.
+            // subcommand dispatch: the block on stdout at exit 0.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),

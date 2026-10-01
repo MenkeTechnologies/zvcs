@@ -41,7 +41,7 @@
 //! * `Bad URL syntax` on stderr with exit 128 for an address that is not a
 //!   number, has a trailing `,` with no second number, or carries any tail that
 //!   does not begin with `/`.
-//! * `-h` as the only argument — usage on stdout, exit 129; any other argument
+//! * `-h` as the only argument — usage on stdout, exit 0; any other argument
 //!   count than exactly `<remote> <url>` — the same usage on stderr, exit 129.
 //! * a failed copy — exit 128 with
 //!   `fatal: Copying data between file descriptors failed`, preceded by git's
@@ -86,11 +86,9 @@ pub fn remote_fd(args: &[String]) -> Result<ExitCode> {
         .collect();
 
     // `show_usage_if_asked()`: a lone `-h` or `--help-all` prints the usage on
-    // stdout, exit 129. remote-fd has no hidden option, so both print the same.
+    // stdout, exit 0. remote-fd has no hidden option, so both print the same.
     if argv.len() == 2 && matches!(argv[1], "-h" | "--help-all") {
-        print!("{USAGE}");
-        std::io::stdout().flush()?;
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
     if argv.len() != 3 {
         eprint!("{USAGE}");

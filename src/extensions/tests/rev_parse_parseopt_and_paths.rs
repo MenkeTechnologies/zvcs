@@ -171,22 +171,30 @@ fn parseopt_negation_and_unique_abbreviation() {
     let o = run_with_stdin(&dir, &["rev-parse", "--parseopt", "--", "--f"], SPEC);
     assert_eq!(out(&o), "set -- --foo --\n", "{}", err(&o));
 
-    // `--b` is `--bar` or `--baz`, and the ambiguity is reported on stderr while
-    // the usage block still goes to stdout inside its heredoc.
+    // `--b` is `--bar` or `--baz`. Since 2.56 the ambiguity is
+    // `PARSE_OPT_HELP_ERROR`: the reason and the bare usage block (no heredoc)
+    // both go to stderr, nothing to stdout (parse-options.c:578-586,1174-1176,
+    // 1378-1379).
     let o = run_with_stdin(&dir, &["rev-parse", "--parseopt", "--", "--b"], SPEC);
     assert_eq!(code(&o), 129);
-    assert_eq!(err(&o), "error: ambiguous option: b (could be --bar or --baz)\n");
-    assert!(out(&o).starts_with("cat <<\\EOF\n"), "{:?}", out(&o));
+    assert!(
+        err(&o).starts_with(
+            "error: ambiguous option: b (could be --bar or --baz)\nusage: some-command "
+        ),
+        "{:?}",
+        err(&o)
+    );
+    assert_eq!(out(&o), "");
 }
 
 #[test]
 fn parseopt_help_prints_the_spec_usage_in_a_heredoc() {
     let dir = fixture("po-help");
     let o = run_with_stdin(&dir, &["rev-parse", "--parseopt", "--", "-h"], SPEC);
-    assert_eq!(code(&o), 129);
+    assert_eq!(code(&o), 0);
     assert_eq!(err(&o), "");
-    // Byte for byte from stock 2.55.0: the `cat <<\EOF` wrapper `PARSE_OPT_SHELL_EVAL`
-    // adds, the `usage: ` prefix, the four-space indent an empty usage line switches
+    // Byte for byte from stock 2.56.0: the `cat <<\EOF` … `EOF` + `exit 0` wrapper
+    // `PARSE_OPT_SHELL_EVAL` adds (parse-options.c:1378-1379,1486-1487), the `usage: ` prefix, the four-space indent an empty usage line switches
     // on, and the option rows padded to column 26.
     assert_eq!(
         out(&o),
@@ -204,7 +212,8 @@ fn parseopt_help_prints_the_spec_usage_in_a_heredoc() {
          An option group Header\n\
          \x20   -C[...]               option C with an optional argument\n\
          \n\
-         EOF\n"
+         EOF\n\
+         exit 0\n"
     );
 }
 

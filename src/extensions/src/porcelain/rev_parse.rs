@@ -235,7 +235,7 @@ impl Default for Opts {
 pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, builtin_rev_parse_usage)`
     // (builtin/rev-parse.c:723) is the first statement of `cmd_rev_parse`: a
-    // lone `-h` goes to stdout at 129, before the repository is opened. `-h`
+    // lone `-h` goes to stdout at exit 0, before the repository is opened. `-h`
     // anywhere else is not help — rev-parse has no parse-options table, so it
     // falls through to the ordinary argument handling.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
@@ -4199,6 +4199,8 @@ enum PoResult {
     Unknown,
     Error,
     Help,
+    /// `PARSE_OPT_HELP_ERROR` (2.56): the block on stderr, exit 129.
+    HelpError,
 }
 
 /// `git rev-parse --parseopt` — read an option spec on stdin, parse the arguments
@@ -4242,8 +4244,14 @@ fn parseopt(args: &[String]) -> Result<ExitCode> {
     }) {
         // The first `parse_options()` runs with no `PARSE_OPT_SHELL_EVAL`, so its
         // `-h` block is the bare usage on stdout — no `cat <<\EOF` wrapper.
+        // `parse_options()` exits 0 for `PARSE_OPT_HELP` and 129 for
+        // `PARSE_OPT_HELP_ERROR` (parse-options.c:1206-1211).
         PoResult::Help => {
             render_usage(&mut std::io::stdout(), &usage, &own, 0)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        PoResult::HelpError => {
+            render_usage(&mut std::io::stderr(), &usage, &own, 0)?;
             return Ok(ExitCode::from(129));
         }
         PoResult::Error => return Ok(ExitCode::from(129)),
@@ -4332,6 +4340,12 @@ fn parseopt(args: &[String]) -> Result<ExitCode> {
     match step {
         PoResult::Help => {
             render_usage(&mut std::io::stdout(), &spec_usage, &opts, CTX_SHELL_EVAL)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        // `usage_with_options_internal()` wraps only the `err == 0` block in the
+        // heredoc, so the stderr one is bare.
+        PoResult::HelpError => {
+            render_usage(&mut std::io::stderr(), &spec_usage, &opts, 0)?;
             return Ok(ExitCode::from(129));
         }
         PoResult::Error => return Ok(ExitCode::from(129)),
@@ -4579,7 +4593,7 @@ fn parse_options_step(
 
         match parse_long_opt(ctx, &arg[2..], options, hit) {
             LongResult::Error => return PoResult::Error,
-            LongResult::Help => return PoResult::Help,
+            LongResult::HelpError => return PoResult::HelpError,
             LongResult::Unknown => return PoResult::Unknown,
             LongResult::Done => {}
         }
@@ -4598,7 +4612,8 @@ enum LongResult {
     Done,
     Unknown,
     Error,
-    Help,
+    /// An ambiguous abbreviation: `PARSE_OPT_HELP_ERROR`.
+    HelpError,
 }
 
 /// `parse_short_opt()` (`parse-options.c:426-461`): the first character of
@@ -4705,7 +4720,7 @@ fn parse_long_opt(
             if bunset { "no-" } else { "" },
             options[bi].long_name.as_deref().unwrap_or(""),
         );
-        return LongResult::Help;
+        return LongResult::HelpError;
     }
     if let Some((idx, sense)) = abbrev {
         // `if (*arg_end) p->opt = arg_end + 1;`
@@ -4898,8 +4913,10 @@ fn render_usage(
         }
     }
     writeln!(out)?;
+    // 2.56 appends `exit 0` so the `eval`ing script stops with success
+    // (parse-options.c:1486-1487).
     if shell_eval {
-        write!(out, "EOF\n")?;
+        write!(out, "EOF\nexit 0\n")?;
     }
     let _ = USAGE_OPTS_WIDTH;
     Ok(())

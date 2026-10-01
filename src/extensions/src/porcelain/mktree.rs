@@ -17,7 +17,7 @@
 //! after a closing quote is discarded, and a `\r` before `\n` is part of the
 //! path because `mktree` reads with `strbuf_getline_lf`, which does not strip CR.
 //!
-//! Exit codes follow git: 0 on success, 128 for every `fatal:`, 129 for `-h` and
+//! Exit codes follow git: 0 on success and for `-h`, 128 for every `fatal:`, 129 for
 //! usage errors. Positional arguments are accepted and ignored, as git ignores
 //! them.
 //!
@@ -70,8 +70,7 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
 
     // git.c answers a lone `-h` before repository setup, so it works anywhere.
     if args.len() == 1 && args[0] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     let repo = crate::setup::discover()?;
@@ -95,8 +94,7 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
         // prints. Unlike the lone-`-h` fast path above, git.c's pre-setup check
         // is `-h` only, so this one runs after repository discovery.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if let Some(long) = arg.strip_prefix("--") {
             if long.is_empty() {
@@ -130,8 +128,7 @@ pub fn mktree(args: &[String]) -> Result<ExitCode> {
             match c {
                 'z' => nul_term_line = true,
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 _ => return Ok(usage_error(&format!("unknown switch `{c}'"))),
             }

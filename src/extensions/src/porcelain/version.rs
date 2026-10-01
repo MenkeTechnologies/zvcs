@@ -10,8 +10,8 @@
 //!   * `git version` → `git version <GIT_VERSION>\n` on stdout, exit 0.
 //!   * Trailing non-option arguments, and anything after `--`, are accepted and
 //!     ignored — `cmd_version` never looks at the residual argv.
-//!   * `-h` → the usage block on **stdout**, exit 129 (git's `-h` path uses
-//!     stdout; only the error paths use stderr). `-h` wins wherever it appears.
+//!   * `-h` → the usage block on **stdout**, exit 0 (`PARSE_OPT_HELP`; only the
+//!     error paths use stderr and 129). `-h` wins wherever it appears.
 //!   * Unknown long option → ``error: unknown option `<name>'`` plus the usage
 //!     block on stderr, exit 129. Unknown short → ``error: unknown switch
 //!     `<c>'``, same shape.
@@ -27,7 +27,7 @@
 //!     so it prints exactly the plain-`git version` output. Because the sole
 //!     entry is negatable, `starts_with("no-", arg)` makes a bare `--n` and
 //!     `--no` name its negation, while `--no-` names it twice over and is the
-//!     `ambiguous option:` refusal — error on stderr, block on stdout, 129.
+//!     `ambiguous option:` refusal — error and block on stderr, 129.
 //!
 //!   * `--build-options` — [`get_version_info`], reduced to the lines that are
 //!     true of *this* binary. Each of git's lines is either reported honestly or
@@ -103,8 +103,7 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
         // `match_long()`. `cmd_version`'s table holds only [`OPT`] and no
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is the block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
 
         if let Some(long) = a.strip_prefix("--") {
@@ -137,9 +136,8 @@ pub fn version(args: &[String]) -> Result<ExitCode> {
                 if c != 'h' {
                     return Ok(usage_error(&format!("unknown switch `{c}'")));
                 }
-                // git's `-h` path prints usage on stdout and exits 129.
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                // git's `-h` path prints usage on stdout and exits 0.
+                return Ok(super::show_usage(USAGE));
             }
         }
     }
@@ -306,6 +304,7 @@ fn host_cpu() -> String {
 fn usage_error(msg: &str) -> ExitCode {
     eprint!("error: {msg}\n{USAGE}");
     ExitCode::from(129)
+}
 
 /// `redact_non_printables()` (`version.c:19-27`): trim, then turn every byte
 /// that is not printable ASCII — and every space — into `.`.
@@ -378,5 +377,4 @@ pub(crate) fn get_uname_info(buf: &mut Vec<u8>, full: bool) -> bool {
     }
     buf.push(b'\n');
     true
-}
 }

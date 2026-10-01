@@ -275,13 +275,11 @@ pub fn format_rev(args: &[String]) -> Result<ExitCode> {
             "--no-notes" => notes.clear(), // the default: notes are not displayed
             "-h" | "--help-all" => {
                 // `parse_options` prints the usage on stdout for an explicit
-                // `-h` and exits 129, leaving stderr empty. `--help-all` is
+                // `-h` and exits 0, leaving stderr empty. `--help-all` is
                 // `parse_options_step()`'s own `strcmp()`, rendering
                 // `USAGE_FULL` — the same block, as no entry of this table is
                 // `PARSE_OPT_HIDDEN`.
-                print!("{USAGE}");
-                std::io::stdout().flush()?;
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `parse_options_step()` consumes a lone `--` before any table
             // lookup (parse-options.c: `if (!arg[2]) { ... ctx->argc--;

@@ -116,7 +116,7 @@ use gix::remote::fetch::{RefLogMessage, Shallow, Status, Tags};
 // the write is needed by every other expansion, so it can't be removed.
 #[allow(unused_assignments)]
 /// `git fetch`'s usage block, byte-for-byte from stock git 2.55.0, printed on stdout
-/// for `-h` with exit 129 — `parse-options` answers it before anything else.
+/// for `-h` with exit 0 — `parse-options` answers it before anything else.
 pub(super) const USAGE: &str = "usage: git fetch [<options>] [<repository> [<refspec>...]]\n   or: git fetch [<options>] <group>\n   or: git fetch --multiple [<options>] [(<repository>|<group>)...]\n   or: git fetch --all [<options>]\n\n    -v, --[no-]verbose    be more verbose\n    -q, --[no-]quiet      be more quiet\n    --[no-]all            fetch from all remotes\n    --[no-]set-upstream   set upstream for git pull/fetch\n    -a, --[no-]append     append to .git/FETCH_HEAD instead of overwriting\n    --[no-]atomic         use atomic transaction to update references\n    --[no-]upload-pack <path>\n                          path to upload pack on remote end\n    -f, --[no-]force      force overwrite of local reference\n    -m, --[no-]multiple   fetch from multiple remotes\n    -t, --[no-]tags       fetch all tags and associated objects\n    -n                    do not fetch all tags (--no-tags)\n    -j, --[no-]jobs <n>   number of submodules fetched in parallel\n    --[no-]prefetch       modify the refspec to place all refs within refs/prefetch/\n    -p, --[no-]prune      prune remote-tracking branches no longer on remote\n    -P, --[no-]prune-tags prune local tags no longer on remote and clobber changed tags\n    --[no-]recurse-submodules[=<on-demand>]\n                          control recursive fetching of submodules\n    --[no-]dry-run        dry run\n    --[no-]porcelain      machine-readable output\n    --[no-]write-fetch-head\n                          write fetched references to the FETCH_HEAD file\n    -k, --[no-]keep       keep downloaded pack\n    -u, --[no-]update-head-ok\n                          allow updating of HEAD ref\n    --[no-]progress       force progress reporting\n    --[no-]depth <depth>  deepen history of shallow clone\n    --[no-]shallow-since <time>\n                          deepen history of shallow repository based on time\n    --[no-]shallow-exclude <ref>\n                          deepen history of shallow clone, excluding ref\n    --[no-]deepen <n>     deepen history of shallow clone\n    --unshallow           convert to a complete repository\n    --refetch             re-fetch without negotiating common commits\n    --[no-]update-shallow accept refs that update .git/shallow\n    --refmap <refmap>     specify fetch refmap\n    -o, --[no-]server-option <server-specific>\n                          option to transmit\n    -4, --ipv4            use IPv4 addresses only\n    -6, --ipv6            use IPv6 addresses only\n    --[no-]negotiation-restrict <revision>\n                          report that we have only objects reachable from this object\n    --[no-]negotiation-tip <revision>\n                          alias of --negotiation-restrict\n    --[no-]negotiation-include <revision>\n                          ensure this ref is always sent as a negotiation have\n    --[no-]negotiate-only do not fetch a packfile; instead, print ancestors of negotiation tips\n    --[no-]filter <args>  object filtering\n    --[no-]auto-maintenance\n                          run 'maintenance --auto' after fetching\n    --[no-]auto-gc        run 'maintenance --auto' after fetching\n    --[no-]show-forced-updates\n                          check for forced-updates on all updated branches\n    --[no-]write-commit-graph\n                          write the commit-graph after fetching\n    --[no-]stdin          accept refspecs from stdin\n\n";
 
 /// `usage_with_options_internal()`'s `USAGE_FULL` rendering — what `--help-all`
@@ -261,8 +261,7 @@ const ALIAS_GROUPS: &[&[&str]] = &[&["negotiation-tip", "negotiation-restrict"]]
 
 pub fn fetch(args: &[String]) -> Result<ExitCode> {
     if args.iter().any(|a| a == "-h") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
     // `--help-all` renders `USAGE_FULL` — `USAGE` plus the hidden
     // `--submodule-prefix` and `--recurse-submodules-default`.
@@ -275,8 +274,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
         .any(|a| a == "--help-all")
     {
-        print!("{USAGE_ALL}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE_ALL));
     }
     let mut repo = crate::setup::discover()?;
 

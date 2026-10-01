@@ -468,7 +468,7 @@ fn reject_attached_value(tok: &str, table: &'static [LongOpt]) -> Option<ExitCod
     Some(ExitCode::from(129))
 }
 
-/// `parse_options()`' built-in `-h`: the usage block on stdout, exit 129. It
+/// `parse_options()`' built-in `-h`: the usage block on stdout, exit 0. It
 /// fires wherever the flag appears in the subcommand's own arguments.
 ///
 /// `--help-all` is the same block. `parse_options_step()` tests it with a
@@ -483,8 +483,7 @@ fn usage_requested(args: &[String], usage: &str) -> Option<ExitCode> {
         .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
         .any(|a| a == "--help-all");
     (help_all || args.iter().any(|a| a == "-h")).then(|| {
-        print!("{usage}");
-        ExitCode::from(129)
+        super::show_usage(&usage)
     })
 }
 

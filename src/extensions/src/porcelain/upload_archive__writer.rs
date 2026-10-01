@@ -11,7 +11,7 @@
 //!
 //! Behaviour verified against stock git 2.55.0 on a fixture repository:
 //!   * `-h` as the only argument: `usage: git upload-archive <repository>` on
-//!     **stdout**, exit 129.
+//!     **stdout**, exit 0.
 //!   * any other argument count: the same line on **stderr**, exit 129. There
 //!     is no option parsing whatsoever — `git upload-archive--writer --foo`
 //!     treats `--foo` as the repository path and fails the repo check, so no
@@ -93,8 +93,7 @@ pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
     // same block with hidden entries shown — there are no options at all here.
     // Every other bad argument count goes to stderr.
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
-        println!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
     if args.len() != 1 {
         // One `write`, for the same sideband-framing reason as `fatal`.

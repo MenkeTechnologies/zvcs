@@ -124,10 +124,10 @@ fn migrating_to_the_current_format_is_refused() {
 }
 
 #[test]
-fn help_goes_to_stdout_and_exits_129() {
+fn help_goes_to_stdout_and_exits_0() {
     let f = Fixture::new("help");
     let (code, out, err) = f.run(&["refs", "migrate", "-h"]);
-    assert_eq!(code, 129);
+    assert_eq!(code, 0);
     assert_eq!(out, USAGE);
     assert_eq!(err, "");
 }

@@ -119,7 +119,7 @@ pub fn hook(args: &[String]) -> Result<ExitCode> {
         Some("list") => list(&args[1..]),
         // `cmd_hook`'s own `parse_options(..., PARSE_OPT_SUBCOMMAND_OPTIONAL)`
         // answers `-h` before it looks for a subcommand: the two usage lines on
-        // stdout, exit 129. Its option table is empty, so no option list follows
+        // stdout, exit 0. Its option table is empty, so no option list follows
         // — only the blank line `usage_with_options_internal()` always ends on.
         // `--help-all` is the same answer: parse_options_step() tests it with a
         // `strcmp()` of its own ahead of parse_long_opt() and renders
@@ -199,7 +199,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
     for a in args {
         match a.as_str() {
             // `cmd_hook_list()`'s own `parse_options()` owns `-h` once `list` has
-            // been named — the sub-command's block on stdout at 129, never
+            // been named — the sub-command's block on stdout at exit 0, never
             // `cmd_hook`'s. `--help-all` renders `USAGE_FULL`, which is this same
             // block: `list`'s table carries no `PARSE_OPT_HIDDEN` entry.
             s if super::asks_for_help(s, "z") => {

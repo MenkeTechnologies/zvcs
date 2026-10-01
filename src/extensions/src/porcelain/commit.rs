@@ -14,7 +14,7 @@ fn usage_error(msg: String) -> anyhow::Error {
 
 /// `usage_with_options()` rendering of `builtin/commit.c`'s option table,
 /// verbatim. `parse_options` writes it after an `error:` line for an unknown
-/// option or a malformed value, and to stdout for `-h`; both exit 129.
+/// option or a malformed value (exit 129), and to stdout for `-h` (exit 0).
 pub(super) const USAGE: &str = r"usage: git commit [-a | --interactive | --patch] [-s] [-v] [-u[<mode>]] [--amend]
                   [--dry-run] [(-c | -C | --squash) <commit> | --fixup [(amend|reword):]<commit>]
                   [-F <file> | -m <msg>] [--reset-author] [--allow-empty]
@@ -1008,7 +1008,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
             // `if (internal_help && *ctx->opt == 'h') goto show_usage`
             // (parse-options.c:1069-1070, 1087-1088): reached once the clump
-            // loop has applied everything in front of it, on stdout at 129 with
+            // loop has applied everything in front of it, on stdout at exit 0 with
             // no `error:` line — a help request is not a rejection.
             "-h" => return Ok(super::show_usage(USAGE)),
             // `PARSE_OPT_UNKNOWN` for the character parsing stopped at. The

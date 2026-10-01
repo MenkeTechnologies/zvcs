@@ -69,7 +69,7 @@ const PACK_SUFFIXES: [&str; 7] = [".idx", ".rev", ".pack", ".bitmap", ".keep", "
 ///   * `-v` / `--verbose`                   → the eight-field report plus `alternate:` lines
 ///   * `-H` / `--human-readable`            → IEC sizes instead of raw KiB counts
 ///   * `-vH`, `--no-verbose`, `--no-human-readable`, `--`
-///   * `-h`                                 → usage on stdout, exit 129
+///   * `-h`                                 → usage on stdout, exit 0
 ///
 /// Packs are only opened in verbose mode, exactly as git only installs its
 /// garbage reporter and consults the pack directory when `-v` is given.
@@ -112,8 +112,7 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
@@ -129,8 +128,7 @@ pub fn count_objects(args: &[String]) -> Result<ExitCode> {
                         'v' => verbose = true,
                         'H' => human = true,
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(usage_error(Some(&format!("unknown switch `{c}'")))),
                     }

@@ -18,11 +18,6 @@
 //! behind every other three-way merge in this build (see `merge_apply.rs`), so
 //! a replay lands exactly where `git merge` would have left the file.
 
-// `print!`/`println!` here go through git's stdout buffer. `merge` reaches this
-// module in-process and arms that buffer (see `crate::cstdio`), so both halves of
-// its output have to be buffered or they interleave against each other; run as
-// its own command nothing arms it and these are unbuffered writes as before.
-use crate::cstdio::print;
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::io::Write;
@@ -137,8 +132,7 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
     // git.c short-circuits a bare `-h` before repository setup, so it works
     // outside a repository; every other form runs RUN_SETUP first.
     if rest.len() == 1 && rest[0] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     let repo = crate::setup::discover()?;
@@ -163,8 +157,7 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
             // `-h` prints. Unlike `-h` it is not short-circuited by git.c
             // before `RUN_SETUP`, so it lands here rather than above.
             if a == "-h" || a == "--help-all" {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // Any unambiguous prefix names the option, so `--rerere-au` and
             // `--r` are both `--rerere-autoupdate` and `--n` is its negation.

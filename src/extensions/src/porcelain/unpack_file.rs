@@ -6,9 +6,9 @@
 //! directory (the worktree root, or the git dir for a bare repository), writes
 //! the blob bytes into it, and prints the file name followed by a newline.
 //!
-//! Not covered: nothing — `unpack-file` has no options. `-h` (and any wrong
-//! argument count) prints git's usage line and exits 129, on stdout for a lone
-//! `-h` and on stderr otherwise; an unresolvable name or a non-blob object is a
+//! Not covered: nothing — `unpack-file` has no options. `-h` prints git's usage
+//! line on stdout and exits 0 when it is the lone argument; any wrong argument
+//! count prints it on stderr and exits 129; an unresolvable name or a non-blob object is a
 //! fatal error and exits 128.
 //!
 //! The six `X` characters are random by construction, so the printed name
@@ -60,13 +60,12 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
     // git checks `argc != 2 || !strcmp(argv[1], "-h")` before anything else, so
     // even `--foo` is treated as an object name rather than an unknown option.
     //
-    // Both arms exit 129 but they use different streams. A lone `-h` is
-    // intercepted by git.c as an explicit help request and printed to stdout;
-    // every other usage error reaches the builtin's own `usage()`, which writes
-    // to stderr. Verified against git 2.55.0:
+    // A lone `-h` or `--help-all` is `show_usage_if_asked()` (usage.c:194-199):
+    // stdout, exit 0 since 2.56. Every other usage error reaches the builtin's
+    // own `usage()`, which writes to stderr at 129. Verified against git 2.56.0:
     //
-    //   git unpack-file -h          -> stdout, 129
-    //   git unpack-file --help-all  -> stdout, 129
+    //   git unpack-file -h          -> stdout, 0
+    //   git unpack-file --help-all  -> stdout, 0
     //   git unpack-file             -> stderr, 129
     //   git unpack-file -h extra    -> stderr, 129
     //   git unpack-file -- <blob>   -> stderr, 129
@@ -75,8 +74,7 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
     // all in the table there is nothing hidden to add, so it prints `USAGE`.
     let help_requested = args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all");
     if help_requested {
-        println!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
     if args.len() != 1 {
         eprintln!("{USAGE}");

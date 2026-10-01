@@ -445,7 +445,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git reset -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }
@@ -617,7 +617,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(129));
             }
             // parse_options_step()'s `internal_help` check: `-h` answers on
-            // stdout at 129, with no `error:` line — it is not a rejection.
+            // stdout at exit 0, with no `error:` line — it is not a rejection.
             "-h" => return Ok(super::show_usage(USAGE)),
             other if other.starts_with('-') && other != "-" => {
                 let sw = other.chars().nth(1).unwrap_or('-');

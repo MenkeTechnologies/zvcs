@@ -25,7 +25,7 @@
 //!   the default mode never opens a repository and never touches config, so it
 //!   works outside a repository and ignores an invalid comment string.
 //! * `--` ends option parsing; a bare `-` is a positional. `-h` anywhere prints
-//!   git's usage block on stdout and exits 129; any positional argument prints
+//!   git's usage block on stdout and exits 0; any positional argument prints
 //!   the same block on stderr and exits 129.
 //! * Option errors in git's own shapes, which differ in whether the usage block
 //!   follows: `` error: unknown option `x' `` and `` error: unknown switch `x' ``
@@ -38,8 +38,8 @@
 //! * Unambiguous long-option abbreviations (`--strip`, `--comment`), as
 //!   `parse_options` accepts them; the error text still names the full option.
 //!   An ambiguous name (`--=x`, whose option name is empty and so prefixes both)
-//!   reproduces git's odd split: `error: ambiguous option: …` on stderr with the
-//!   usage block on stdout, exit 129.
+//!   is `PARSE_OPT_HELP_ERROR`: `error: ambiguous option: …` and the usage block
+//!   both on stderr, exit 129.
 //!
 //! ### Honest limitations
 //!
@@ -113,8 +113,7 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
             // has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same
             // block `-h` prints.
             if long == "help-all" {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             let (name, value) = match long.split_once('=') {
                 Some((name, value)) => (name, Some(value)),
@@ -123,12 +122,10 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
             let (opt_mode, full_name) = match resolve_long(name) {
                 Resolved::One(opt_mode, full_name) => (opt_mode, full_name),
                 Resolved::Unknown => return Ok(usage_error(&format!("unknown option `{long}'"))),
-                // git's ambiguity path is the odd one out: the reason goes to
-                // stderr but the usage block goes to stdout.
+                // `PARSE_OPT_HELP_ERROR`: the reason and the block on stderr.
                 Resolved::Ambiguous(candidates) => {
                     eprintln!("error: ambiguous option: {long} (could be {candidates})");
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::help_error(USAGE));
                 }
             };
             if value.is_some() {
@@ -153,8 +150,7 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
                 's' => Mode::StripComments,
                 'c' => Mode::CommentLines,
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 _ => return Ok(usage_error(&format!("unknown switch `{c}'"))),
             };

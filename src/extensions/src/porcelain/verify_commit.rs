@@ -29,7 +29,7 @@
 //! rather than in the vendored crate.
 //!
 //! Exit codes follow git rather than the caller's generic failure path: usage
-//! errors (including `-h`) exit 129, a failed verification exits 1.
+//! errors exit 129 (`-h` exits 0), a failed verification exits 1.
 
 use anyhow::Result;
 use std::process::ExitCode;
@@ -90,8 +90,7 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
         // no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block
         // `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
 
         // Respell a unique abbreviation as the name it resolves to, so an
@@ -131,8 +130,7 @@ pub fn verify_commit(args: &[String]) -> Result<ExitCode> {
                 'v' => verbose = true,
                 // `-h` short-circuits before anything else, repo included.
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 _ => {
                     eprintln!("error: unknown switch `{c}'");

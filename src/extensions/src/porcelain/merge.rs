@@ -1102,7 +1102,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
                             opts.strategy_options.push(v);
                             break;
                         }
-                        // `internal_help`: the block on stdout at 129, reached as
+                        // `internal_help`: the block on stdout at exit 0, reached as
                         // soon as the first character the table does not define
                         // is `h`.
                         'h' => return Ok(super::show_usage(USAGE)),

@@ -321,8 +321,7 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if orig == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         // An unambiguous prefix names the option it abbreviates. Sub-command
         // names are not in this space (`parse_long_opt()` skips them), so a bare
@@ -342,8 +341,7 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
             Common::NotCommon => {}
         }
         if a == "-h" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         // A bare `--` terminates option parsing. Any subcommand would have been
         // matched above (`subcommand.is_some()` takes the earlier branch), so at
@@ -407,8 +405,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if orig == "--help-all" {
-            print!("{WRITE_USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(WRITE_USAGE));
         }
         let resolved = match super::canonical_long(orig, WRITE_OPTS) {
             super::Long::Name(name) => name,
@@ -426,8 +423,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
         match a {
             "-h" => {
-                print!("{WRITE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(WRITE_USAGE));
             }
             "--bitmap" => bitmap = true,
             "--no-bitmap" => bitmap = false,
@@ -1211,8 +1207,7 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if orig == "--help-all" {
-            print!("{VERIFY_USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(VERIFY_USAGE));
         }
         let resolved = match super::canonical_long(orig, VERIFY_OPTS) {
             super::Long::Name(name) => name,
@@ -1230,8 +1225,7 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
         match a {
             "-h" => {
-                print!("{VERIFY_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(VERIFY_USAGE));
             }
             _ if a.starts_with("--") => {
                 return Ok(usage_error(
@@ -1288,8 +1282,7 @@ fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if orig == "--help-all" {
-            print!("{EXPIRE_USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(EXPIRE_USAGE));
         }
         // `builtin_multi_pack_index_expire_options[]` is `OPT_END()` alone, so
         // `expire`'s table is the two commons — the same as `verify`'s.
@@ -1309,8 +1302,7 @@ fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
         match a {
             "-h" => {
-                print!("{EXPIRE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(EXPIRE_USAGE));
             }
             _ if a.starts_with("--") => {
                 return Ok(usage_error(
@@ -1410,8 +1402,7 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if orig == "--help-all" {
-            print!("{COMPACT_USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(COMPACT_USAGE));
         }
         let resolved = match super::canonical_long(orig, COMPACT_OPTS) {
             super::Long::Name(name) => name,
@@ -1429,8 +1420,7 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
         match a {
             "-h" => {
-                print!("{COMPACT_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(COMPACT_USAGE));
             }
             // Accepted by git's compact option array; each only steers the write
             // of the compacted layer, which is unported and bails below anyway.
@@ -1535,8 +1525,7 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if orig == "--help-all" {
-            print!("{REPACK_USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(REPACK_USAGE));
         }
         let resolved = match super::canonical_long(orig, REPACK_OPTS) {
             super::Long::Name(name) => name,
@@ -1554,8 +1543,7 @@ fn repack(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
         match a {
             "-h" => {
-                print!("{REPACK_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(REPACK_USAGE));
             }
             "--batch-size" => match it.next() {
                 Some(v) => match classify_magnitude(v) {

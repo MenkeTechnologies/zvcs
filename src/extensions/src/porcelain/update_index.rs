@@ -472,7 +472,7 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git update-index -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }
@@ -650,7 +650,7 @@ enum Outcome {
     Die,
     /// git's option parser rejected the command line: exit 129.
     Usage,
-    /// `-h`: the usage block on stdout, exit 129, index untouched.
+    /// `-h`: the usage block on stdout, exit 0, index untouched.
     Help,
     /// git returned before reaching the index write (`--test-untracked-cache`).
     Exit(u8),
@@ -716,7 +716,7 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                         break;
                     }
                     // parse_options_step() tests `internal_help` inside the
-                    // short-option loop: `-h` answers on stdout at 129, with no
+                    // short-option loop: `-h` answers on stdout at exit 0, with no
                     // `error:` line. `show_usage_with_options_if_asked()`
                     // (builtin/update-index.c:1097) covers the lone-`-h` case
                     // ahead of parse_options; both land here.

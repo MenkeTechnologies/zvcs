@@ -16,7 +16,7 @@
 //!     ``error: unknown subcommand: `X'``. Unknown `--long` →
 //!     ``error: unknown option `X'``. Unknown `-x` →
 //!     ``error: unknown switch `x'``. `-h` (including as the first letter of a
-//!     cluster, e.g. `-hx`) → the usage block on **stdout**, exit 129. `--` and
+//!     cluster, e.g. `-hx`) → the usage block on **stdout**, exit 0. `--` and
 //!     `--end-of-options` terminate option scanning without naming a
 //!     subcommand, so both land on ``error: need a subcommand``. The usage
 //!     block is `usage: git submodule--helper <command>\n\n` in every case.
@@ -133,15 +133,14 @@ const USAGE: &str = "usage: git submodule--helper <command>\n\n";
 /// neither takes an `=<value>` — and both jump to `show_usage`, which is
 /// `usage_with_options_internal(ctx, usagestr, options, 0, 0)` (parse-options.c:943).
 /// The last argument is `err`, so the block goes to **stdout**, and the
-/// `PARSE_OPT_HELP` it returns is `exit(129)` (parse-options.c:974-976).
+/// `PARSE_OPT_HELP` it returns is `exit(0)` since 2.56 (parse-options.c:1207-1208).
 ///
 /// The distinction that matters: an unknown option is an `error:` line on stderr
 /// followed by the same block on stderr, while `--help` is the block alone on
-/// stdout. Both exit 129, so only the streams tell them apart.
+/// stdout at exit 0; the unknown option exits 129.
 fn parse_options_help(arg: &str, usage: &str) -> Option<Result<ExitCode>> {
     (arg == "--help" || arg == "--help-all").then(|| {
-        print!("{usage}");
-        Ok(ExitCode::from(129))
+        Ok(super::show_usage(&usage))
     })
 }
 
@@ -150,8 +149,7 @@ fn parse_options_help(arg: &str, usage: &str) -> Option<Result<ExitCode>> {
 /// consumed, so `-qh` prints help just as `-h` does.
 fn parse_options_help_short(c: char, usage: &str) -> Option<Result<ExitCode>> {
     (c == 'h').then(|| {
-        print!("{usage}");
-        Ok(ExitCode::from(129))
+        Ok(super::show_usage(&usage))
     })
 }
 
@@ -186,8 +184,7 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
         // builtin's table holds nothing but `OPT_SUBCOMMAND` entries — no
         // `PARSE_OPT_HIDDEN` one — so `USAGE_FULL` is the block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if let Some(name) = a.strip_prefix("--") {
             eprintln!("error: unknown option `{name}'");
@@ -200,8 +197,7 @@ pub fn submodule__helper(args: &[String]) -> Result<ExitCode> {
             // (so `-hx` prints help), any other letter is reported and stops.
             let c = a[1..].chars().next().expect("len > 1");
             if c == 'h' {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             eprintln!("error: unknown switch `{c}'");
             eprint!("{USAGE}");
@@ -327,8 +323,7 @@ fn foreach(args: &[String]) -> Result<ExitCode> {
     /// `show_usage:` — `usage_with_options_internal(…, USAGE_TO_STDOUT)`, so the
     /// block goes to **stdout** even when an `error:` line preceded it on stderr.
     fn help() -> Result<ExitCode> {
-        print!("{FOREACH_USAGE}");
-        Ok(ExitCode::from(129))
+        Ok(super::show_usage(FOREACH_USAGE))
     }
     /// The same, for the ambiguous-abbreviation path: `parse_long_opt` prints
     /// its `error:` and returns `PARSE_OPT_HELP`, which is a `goto show_usage`.
@@ -397,8 +392,7 @@ fn foreach(args: &[String]) -> Result<ExitCode> {
             return help();
         }
         if body == "help-all" {
-            print!("{FOREACH_USAGE_FULL}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(FOREACH_USAGE_FULL));
         }
 
         // ---- `parse_long_opt`, including its abbreviation matching. ----

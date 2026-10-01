@@ -29,7 +29,7 @@
 //!     unreadable `.idx` is `Cannot open existing pack idx file for '<idx>'`,
 //!     both naming the *index* path, as `read_idx_option()` does.
 //!   * `--threads=<n>` (`0` = auto), `--object-format=<sha1|sha256>`, and `-h`
-//!     (usage on stdout, exit 129). Without the flag the hash comes from the
+//!     (usage on stdout, exit 0). Without the flag the hash comes from the
 //!     surrounding repository, and outside one it is git's compiled-in `sha1`.
 //!
 //! Argument handling mirrors `cmd_index_pack()`'s hand-rolled loop rather than
@@ -280,7 +280,7 @@ pub fn index_pack(args: &[String]) -> Result<ExitCode> {
     // the caller's problem to report, not a reason to go to the network.
     gix::odb::store::set_fetch_if_missing(false);
     // `show_usage_if_asked(argc, argv, index_pack_usage)` (builtin/index-pack.c:1909):
-    // a LONE `-h` on stdout at 129, before any of the scan below.
+    // a LONE `-h` on stdout at exit 0, before any of the scan below.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }

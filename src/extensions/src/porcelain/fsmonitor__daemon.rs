@@ -64,10 +64,9 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
 
     // `run_builtin()` skips `setup_git_directory()` when the whole command line is
     // a lone `-h`, so help answers even outside a repository. parse-options prints
-    // the block to *stdout* and exits 129.
+    // the block to *stdout* and exits 0.
     if rest.len() == 1 && rest[0] == "-h" {
-        println!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
 
     // git runs setup before parse_options (RUN_SETUP), so repository discovery
@@ -92,8 +91,7 @@ pub fn fsmonitor__daemon(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            println!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(&format!("{USAGE}\n")));
         }
         match a {
             "--" => no_more_options = true,

@@ -11,7 +11,7 @@
 //! revision and sparse-checkout validation that runs first, so every observable
 //! failure path keeps git's bytes and exit code:
 //!
-//!   * `-h` — the 340-byte usage block on stdout, exit 129. As in `git.c`, only
+//!   * `-h` — the 340-byte usage block on stdout, exit 0. As in `git.c`, only
 //!     the exact invocation `git backfill -h` skips repository setup.
 //!   * `--min-batch-size=<n>` / `--min-batch-size <n>` — validated with git's
 //!     `git_parse_ulong` semantics (`strtoumax` base 0, optional `k`/`m`/`g`
@@ -147,8 +147,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     // `git.c` skips repository setup only for the exact invocation `git <cmd> -h`,
     // so this is the one path that works outside a repository.
     if args.len() == 1 && args[0] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     let repo = crate::setup::discover()?;
@@ -166,8 +165,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             // own, so it renders `USAGE_FULL` — the same block `-h` prints, this
             // table having no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--" => {
                 rest.extend(args[i..].iter().map(String::as_str));

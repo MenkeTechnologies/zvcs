@@ -68,7 +68,7 @@ const MAX_UNMERGED_REPORTED: usize = 10;
 ///   * `git write-tree`                       → id of the tree the index names
 ///   * `--missing-ok` / `--no-missing-ok`     → skip/perform the odb presence check
 ///   * `--prefix=<prefix>/`, `--prefix <p>/`, `--no-prefix` → id of a sub-tree
-///   * `-h`                                   → usage on stdout, exit 129
+///   * `-h`                                   → usage on stdout, exit 0
 ///
 /// Extra positional arguments are ignored, as stock git ignores them.
 pub fn write_tree(args: &[String]) -> Result<ExitCode> {
@@ -103,15 +103,13 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
         };
         match a {
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `if (internal_help && !strcmp(arg + 2, "help-all"))`
             // (parse-options.c:1122): an exact match, never an abbreviation and
             // never with an `=<value>`, rendering `USAGE_FULL`.
             "--help-all" => {
-                print!("{USAGE_ALL}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_ALL));
             }
             // `--ignore-cache-tree` (builtin/write-tree.c:37, "only useful for
             // debugging") makes git recompute every tree instead of reusing the

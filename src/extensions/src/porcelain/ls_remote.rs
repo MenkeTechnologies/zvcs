@@ -66,7 +66,7 @@ const LONG_OPTS: &[super::LongOpt] = &[
     super::LongOpt { name: "symref",                      neg: true,  arg: super::Arg::None },
     super::LongOpt { name: "server-option",               neg: true,  arg: super::Arg::Required },
 ];
-/// `git ls-remote -h` used with nothing else prints this and exits 129.
+/// `git ls-remote -h` used with nothing else prints this and exits 0.
 const USAGE: &str = "\
 usage: git ls-remote [--branches] [--tags] [--refs] [--upload-pack=<exec>]
                      [-q | --quiet] [--exit-code] [--get-url] [--sort=<key>]
@@ -180,8 +180,7 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     // Bare `-h` is help, consistent with other git subcommands; anywhere else
     // `-h` is the deprecated synonym for `--branches`.
     if args.len() == 1 && args[0] == "-h" {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     let mut opts = Opts {
@@ -473,8 +472,7 @@ fn parse_args<'a>(
         // reaches it — and it renders `USAGE_FULL`, which lists both the hidden
         // `--exec` and the `-h` spelling of `--branches`.
         if arg == "--help-all" {
-            print!("{USAGE_ALL}");
-            return Err(ExitCode::from(129));
+            return Err(super::show_usage(USAGE_ALL));
         }
 
         // Short options cluster (`-tb`) and `-o` may take a sticky value (`-ofoo`).

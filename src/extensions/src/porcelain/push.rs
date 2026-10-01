@@ -10,7 +10,7 @@ use gix::remote::Direction;
 use super::push_proto::{self, Request};
 
 /// `git push`'s usage block, byte-for-byte from stock git 2.55.0. `parse-options`
-/// answers `-h` with it on stdout and exits 129, before any repository setup.
+/// answers `-h` with it on stdout and exits 0, before any repository setup.
 /// `cmd_push()`'s `struct option options[]` (builtin/push.c), in table order, as
 /// [`super::resolve_long_aliased`] reads it. `-4`/`--ipv4` and `-6`/`--ipv6`
 /// come from `OPT_IPVERSION`, which is `PARSE_OPT_NONEG`.
@@ -116,8 +116,7 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
         .take_while(|a| a.as_str() != "--")
         .any(|a| a == "-h" || a == "--help-all")
     {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     let mut f = Flags::default();

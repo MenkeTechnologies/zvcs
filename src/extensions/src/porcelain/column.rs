@@ -145,8 +145,7 @@ pub fn column(args: &[String]) -> Result<ExitCode> {
     match parse_args(args, &mut colopts, &mut opts, &mut real_command) {
         Ok(Outcome::Parsed) => {}
         Ok(Outcome::Help) => {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         Err(ParseError::Usage(msg)) => {
             eprint!("{msg}{USAGE}");
@@ -185,7 +184,7 @@ pub fn column(args: &[String]) -> Result<ExitCode> {
 /// What a successful argument scan produced.
 enum Outcome {
     Parsed,
-    /// `-h`: usage goes to stdout and the exit code is still 129.
+    /// `-h`: usage goes to stdout, exit 0.
     Help,
 }
 

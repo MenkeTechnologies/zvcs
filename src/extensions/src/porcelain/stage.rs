@@ -112,7 +112,7 @@ struct Opts {
     patch_interactive: bool,
     add_interactive: bool,
     /// Hand the untouched argv to [`add`](super::add) instead of staging here:
-    /// `-h` (print the option table, exit 129) and any option this parser does not
+    /// `-h` (print the option table, exit 0) and any option this parser does not
     /// know (git's `unknown option`/`unknown switch` usage error, exit 129). Both
     /// belong to the option table `stage` shares with `add`, so `add` renders them.
     delegate: bool,

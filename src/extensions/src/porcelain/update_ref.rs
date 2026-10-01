@@ -314,8 +314,7 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
         // is never asked about it. update-ref's table has no `PARSE_OPT_HIDDEN`
         // entry, so `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Err(ExitCode::from(129));
+            return Err(super::show_usage(USAGE));
         }
         if let Some(long) = a.strip_prefix("--") {
             let (opt, unset) = match super::resolve_long(LONG_OPTS, long) {
@@ -349,8 +348,7 @@ fn parse_args(args: &[String]) -> Result<Opts, ExitCode> {
                 'z' => o.end_null = true,
                 '0' => o.batch_updates = true,
                 'h' => {
-                    print!("{USAGE}");
-                    return Err(ExitCode::from(129));
+                    return Err(super::show_usage(USAGE));
                 }
                 'm' => {
                     let rest: String = cluster[c + 1..].iter().collect();

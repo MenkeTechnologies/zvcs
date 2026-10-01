@@ -102,7 +102,7 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
 
     // `show_usage_with_options_if_asked()` (builtin/commit-tree.c:131) runs
     // ahead of `parse_options` and of anything that could fail: a lone `-h`
-    // prints the block on stdout at 129, before the identity check below could
+    // prints the block on stdout at exit 0, before the identity check below could
     // complain about a repository that has no author configured.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);

@@ -79,7 +79,7 @@
 //! clustered short flags (`-nv`), `--progress`/`--no-progress`,
 //! `--exclude-promisor-objects`/`--no-exclude-promisor-objects`,
 //! `--expire <time>`/`--expire=<time>`/`--no-expire`, `--`, `<head>...`, and
-//! `-h`. Exit codes match stock git: 129 with git's usage block for `-h` and for
+//! `-h`. Exit codes match stock git: 0 with git's usage block for `-h`, 129 with it for
 //! an unknown option, 129 *without* the usage block for parse-options' value
 //! complaints (`option \`expire' requires a value`, `option \`<name>' takes no
 //! value`), 128 for a `<head>` git cannot use — `fatal: unrecognized argument:
@@ -134,7 +134,7 @@ use gix::objs::Kind;
 use gix::odb::pack;
 
 use super::{Arg, LongOpt};
-use crate::cstdio::{print, println};
+use crate::cstdio::println;
 
 /// `cmd_prune()`'s `struct option options[]` (builtin/prune.c), in table order,
 /// as [`super::resolve_long`] reads it. No entry carries `PARSE_OPT_NONEG`.
@@ -201,8 +201,7 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
             return Ok(code);
@@ -217,8 +216,7 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => end_of_opts = true,
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--dry-run" => dry_run = true,
             "--no-dry-run" => dry_run = false,
@@ -274,8 +272,7 @@ pub fn prune(args: &[String]) -> Result<ExitCode> {
                         'n' => dry_run = true,
                         'v' => verbose = true,
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(usage_error(Some(&format!("unknown switch `{c}'")))),
                     }

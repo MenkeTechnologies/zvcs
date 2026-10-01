@@ -142,7 +142,7 @@ impl Fatal {
         }
     }
 
-    /// parse-options answering `-h`: the usage block on stdout, exit 129.
+    /// parse-options answering `-h`: the usage block on stdout, exit 0.
     fn help(usage: &str) -> Self {
         Fatal {
             text: usage.to_string(),
@@ -828,7 +828,7 @@ fn parse_args(
             continue;
         }
         // parse_options_step()'s `internal_help`. `git whatchanged` is
-        // `builtin/log.c`, so the block is `git log`'s — stdout, 129.
+        // `builtin/log.c`, so the block is `git log`'s — stdout, 0.
         if a == "-h" {
             return Err(Fatal::help(super::log::USAGE));
         }

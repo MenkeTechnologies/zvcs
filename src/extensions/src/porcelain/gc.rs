@@ -12,7 +12,7 @@
 //!
 //! # Argument surface
 //!
-//!   * `-h` → git's 744-byte usage block on stdout, exit 129
+//!   * `-h` → git's 744-byte usage block on stdout, exit 0
 //!   * an unknown long option → ``error: unknown option `<name>'`` + usage on
 //!     stderr, exit 129
 //!   * an unknown short switch → ``error: unknown switch `<c>'`` + usage, exit 129
@@ -261,7 +261,7 @@ enum Prune {
 
 /// `git gc` — housekeeping driver.
 ///
-/// Returns 129 with git's own usage output for `-h` and for every malformed
+/// Returns 0 with git's own usage output for `-h`, 129 for every malformed
 /// invocation, and 0 otherwise. A 0 does **not** mean git's full housekeeping
 /// ran; see the module documentation for the steps that are skipped and why.
 pub fn gc(args: &[String]) -> Result<ExitCode> {
@@ -337,16 +337,14 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => end_of_opts = true,
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `if (internal_help && !strcmp(arg + 2, "help-all"))`
             // (parse-options.c:1122), an exact match tested ahead of
             // parse_long_opt(): never an abbreviation, never with an
             // `=<value>`, and rendered as `USAGE_FULL`.
             "--help-all" => {
-                print!("{USAGE_ALL}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_ALL));
             }
             "--auto" => auto = true,
             "--no-auto" => auto = false,
@@ -450,8 +448,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'q' => {}
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(usage_error(Some(&format!("unknown switch `{c}'")))),
                     }

@@ -143,12 +143,13 @@ fn unknown_option<T>(what: &str) -> Result<T> {
     Err(Exit(129).into())
 }
 
-/// git's `show_usage` label: `error: <what>` on stderr but the usage block on
-/// *stdout* (`usage_with_options_internal(…, err = 0)`), exit 129. Reached for an
-/// ambiguous abbreviation.
+/// git's `show_usage_stderr` label (2.56, parse-options.c:1174-1176):
+/// `error: <what>` and the usage block both on stderr, exit 129. Reached for an
+/// ambiguous abbreviation, which `parse_long_opt()` now answers with
+/// `PARSE_OPT_HELP_ERROR`.
 fn ambiguous_option<T>(what: &str) -> Result<T> {
     eprintln!("error: {what}");
-    print!("{USAGE}");
+    eprint!("{USAGE}");
     Err(Exit(129).into())
 }
 
@@ -206,7 +207,7 @@ const SPECS: &[OptSpec] = &[
 ///
 /// Option and non-option arguments may interleave (git's `parse_options`
 /// permutes), `--` ends option parsing, and `-h`/`--help` prints the usage on
-/// stdout and exits 129 before anything else happens — including before the
+/// stdout and exits 0 before anything else happens — including before the
 /// work-tree check, which is why `git subtree` outside a repository still
 /// answers with usage.
 fn parseopt(argv: &[String]) -> Result<(Vec<String>, Vec<String>)> {
@@ -239,8 +240,7 @@ fn parseopt(argv: &[String]) -> Result<(Vec<String>, Vec<String>)> {
         // not an [`SPECS`] line. The `OPTS_SPEC` declares no hidden option, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return exit_with(129);
+            return exit_with(super::show_usage_status(USAGE));
         }
 
         if let Some(body) = arg.strip_prefix("--") {
@@ -259,8 +259,7 @@ fn parseopt(argv: &[String]) -> Result<(Vec<String>, Vec<String>)> {
                 return unknown_option(&format!("unknown switch `{letter}'"));
             };
             if spec.long == "help" {
-                print!("{USAGE}");
-                return exit_with(129);
+                return exit_with(super::show_usage_status(USAGE));
             }
             let rest: String = letters[c..].iter().collect();
             match spec.value {
@@ -371,8 +370,7 @@ fn parse_long(
     };
 
     if spec.long == "help" && !negated {
-        print!("{USAGE}");
-        return exit_with(129);
+        return exit_with(super::show_usage_status(USAGE));
     }
 
     // A negated option never carries a value, whatever the positive form takes.

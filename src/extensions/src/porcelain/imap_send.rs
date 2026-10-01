@@ -100,7 +100,7 @@
 //! `-q`/`--quiet`, `--curl`, `-f`/`--folder <folder>`, `--list` — including
 //! `--no-` forms, `--opt=value`, `-fVALUE` and `-f VALUE`, short bundling
 //! (`-vq`), unique-prefix abbreviation (`--fol`, `--l`), and `--` as a
-//! terminator. `-h` prints the 408-byte usage block on **stdout**, exit 129, at
+//! terminator. `-h` prints the 408-byte usage block on **stdout**, exit 0, at
 //! the point `-h` is reached. The five `parse_options` diagnostics all go to
 //! stderr with exit 129: ``error: unknown option `bogus'`` and
 //! ``error: unknown switch `Z'``, both followed by the usage block;
@@ -184,7 +184,7 @@ impl Default for Opts {
 /// How the scan ended.
 enum Scan {
     Ok(Opts),
-    /// `-h`: usage on stdout, exit 129.
+    /// `-h`: usage on stdout, exit 0.
     Help,
     /// A diagnostic line, and whether the usage block follows it on stderr.
     Error(String, bool),
@@ -1747,8 +1747,7 @@ pub fn imap_send(args: &[String]) -> Result<ExitCode> {
 
     let opts = match scan(args) {
         Scan::Help => {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         Scan::Error(msg, with_usage) => {
             eprintln!("{msg}");

@@ -110,8 +110,7 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
             // `OPTIONS_SPEC` declares no hidden entry, so `USAGE_FULL` renders
             // the same block `-h` prints.
             "-h" | "--help" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `git rev-parse --parseopt` runs the rejected argument through
             // parse-options, which names an *option* for a `--` spelling and a

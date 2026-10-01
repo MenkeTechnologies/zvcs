@@ -30,7 +30,7 @@
 //!   any that have no value. The `gitoxide.*` layers `gix` synthesizes from the
 //!   ambient environment and from zvcs' API-scope defaults are not git
 //!   configuration and are excluded, exactly as `git config --list` excludes them
-//! * `-h` — git's usage line on stdout, exit 129; no argument, an unknown
+//! * `-h` — git's usage line on stdout, exit 0; no argument, an unknown
 //!   variable, or more than one argument — the same line on stderr, exit 129
 //! * `GIT_CONFIG_GLOBAL` correctly collapses to a single line when the
 //!   environment variable of that name is set, and expands to the XDG path plus

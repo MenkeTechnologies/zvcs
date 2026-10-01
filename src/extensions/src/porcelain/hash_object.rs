@@ -179,9 +179,7 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            let _ = std::io::stdout().flush();
-            return Err(ExitCode::from(129));
+            return Err(super::show_usage(USAGE));
         }
 
         if let Some(body) = a.strip_prefix("--") {
@@ -192,11 +190,8 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
                 None => (body, None),
             };
 
-            // The ambiguity report splits its two halves across the streams:
-            // `error()` on stderr, then `PARSE_OPT_HELP` →
-            // `usage_with_options_internal(..., USAGE_TO_STDOUT)` for the block.
-            // `usage_error` writes both to stderr, which is the `unknown option`
-            // shape.
+            // The ambiguity report is `PARSE_OPT_HELP_ERROR`: `error()` and the
+            // block both on stderr, through the shared `ambiguous_option`.
             let (opt, negated) = match resolve_long(name) {
                 Err(cands) => {
                     return Err(super::ambiguous_option(a, cands[0], cands[1], USAGE))
@@ -265,9 +260,7 @@ fn parse(args: &[String]) -> std::result::Result<Opts, ExitCode> {
             match c {
                 'w' => opts.write = true,
                 'h' => {
-                    print!("{USAGE}");
-                    let _ = std::io::stdout().flush();
-                    return Err(ExitCode::from(129));
+                    return Err(super::show_usage(USAGE));
                 }
                 't' => {
                     let rest = &a[1 + at + c.len_utf8()..];

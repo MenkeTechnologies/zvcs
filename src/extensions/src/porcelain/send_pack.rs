@@ -13,7 +13,7 @@
 //!
 //! The argument surface is covered in full:
 //! ```text
-//!   * `-h` → git's 1472-byte usage block on stdout, exit 129
+//!   * `-h` → git's 1472-byte usage block on stdout, exit 0
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--sign` → `--signed`), `--no-`
 //!     negations, `=value` vs. separate-argv values, and the `-v`/`-q`/`-n`/`-f`
@@ -204,7 +204,7 @@ enum Parsed {
 
 /// `git send-pack` — port of `cmd_send_pack` (`builtin/send-pack.c`).
 ///
-/// Returns 129 with git's own output for `-h`, for every malformed invocation,
+/// Returns 0 with git's own output for `-h`; 129 for every malformed invocation,
 /// for a missing `<directory>`, and for the `--all`/`--mirror`/`<ref>` conflict;
 /// 128 for the `--signed` value git rejects during parsing. Otherwise it runs
 /// the push and returns `send_pack()`'s status: 0 when every ref ended `OK`,
@@ -880,8 +880,7 @@ fn parse(args: &[String]) -> Parsed {
         // sees it. This table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL`
         // renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Parsed::Exit(ExitCode::from(129));
+            return Parsed::Exit(super::show_usage(USAGE));
         }
 
         if let Some(body) = a.strip_prefix("--") {
@@ -911,11 +910,9 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     let (idx, negated) = match resolve_long(name) {
         Resolved::Unique(idx, negated) => (idx, negated),
         Resolved::Ambiguous(first, second) => {
-            // Verified quirk: unlike every other diagnostic here, the ambiguity
-            // message goes to stderr while its usage block goes to *stdout*.
+            // `PARSE_OPT_HELP_ERROR`: the message and the block, both on stderr.
             eprintln!("error: ambiguous option: {name} (could be --{first} or --{second})");
-            print!("{USAGE}");
-            return Some(ExitCode::from(129));
+            return Some(super::help_error(USAGE));
         }
         Resolved::Unknown => {
             // git echoes the argument as written, `=value` included.
@@ -1197,8 +1194,7 @@ fn short_opts(cluster: &str, i: &mut usize, st: &mut State) -> Option<ExitCode> 
     for c in cluster.chars() {
         match c {
             'h' => {
-                print!("{USAGE}");
-                return Some(ExitCode::from(129));
+                return Some(super::show_usage(USAGE));
             }
             // `OPT__VERBOSITY` counts up for `-v` and down for `-q`.
             'v' => st.verbose = true,

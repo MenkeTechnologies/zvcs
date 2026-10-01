@@ -192,7 +192,7 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--exclude=") => {
                 exclude_pats.push(BString::from(&a["--exclude=".len()..]))
             }
-            // parse_options_step() answers `-h` on stdout at 129 — no
+            // parse_options_step() answers `-h` on stdout at exit 0 — no
             // `error:` line, because it is not a rejection.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.

@@ -181,7 +181,7 @@ fn log_expiry_from_a_file_names_the_file_and_h_still_wins() {
     // `gc_config()` runs after `show_usage_with_options_if_asked`, so `-h` is
     // reached first and prints the usage block.
     let help = run(&repo, &home, &["gc", "-h"]);
-    assert_eq!(code(&help), 129);
+    assert_eq!(code(&help), 0);
     assert!(help.stdout.starts_with(b"usage: git gc"));
     assert!(stderr(&help).is_empty());
 

@@ -258,8 +258,7 @@ fn usage_error(msg: &str) -> ExitCode {
 pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `-h` is answered by `parse-options` before anything else, on stdout.
     if args.iter().any(|a| a == "-h") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
     // `--help-all` likewise, rendering `USAGE_FULL` — `USAGE` plus the hidden
     // `--naked`. `parse_options_step()` *breaks* on `--` and `--end-of-options`
@@ -271,8 +270,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
         .any(|a| a == "--help-all")
     {
-        print!("{USAGE_ALL}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE_ALL));
     }
     let mut bare = false;
     let mut mirror = false;

@@ -228,7 +228,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git checkout -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }
@@ -430,7 +430,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => has_dashdash = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
-            // 129, with no `error:` line — a help request is not a rejection.
+            // exit 0, with no `error:` line — a help request is not a rejection.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),

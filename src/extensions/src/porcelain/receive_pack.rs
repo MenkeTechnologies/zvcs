@@ -31,8 +31,8 @@
 //!     It is also the only session shape in which a certificate can echo a nonce
 //!     this process did not mint, which is what `receive.certNonceSlop` grades.
 //!   * **Argument handling**: `-h` prints the 68-byte usage block on *stdout*
-//!     and exits 129; `--help-all` prints the 262-byte block that lists all
-//!     five hidden entries, also on stdout at 129; an unknown option prints
+//!     and exits 0; `--help-all` prints the 262-byte block that lists all
+//!     five hidden entries, also on stdout at exit 0; an unknown option prints
 //!     ``error: unknown option `x'`` (or ``unknown switch `c'``) followed by
 //!     the 68-byte block on stderr, 129; `--quiet=<v>` prints ``error: option
 //!     `quiet' takes no value`` alone, 129; no directory / more than one
@@ -392,8 +392,7 @@ fn parse(args: &[String]) -> Result<Parsed> {
         // it lists all five hidden entries, where [`FULL_USAGE`]'s
         // `usage_msg_opt()` rendering lists only `--advertise-refs`.
         if a == "--help-all" {
-            print!("{HELP_ALL_USAGE}");
-            return Ok(Parsed::Exit(ExitCode::from(129)));
+            return Ok(Parsed::Exit(super::show_usage(HELP_ALL_USAGE)));
         }
 
         if let Some(long) = a.strip_prefix("--") {
@@ -438,8 +437,7 @@ fn parse(args: &[String]) -> Result<Parsed> {
             match c {
                 'q' => quiet = true,
                 'h' => {
-                    print!("{SHORT_USAGE}");
-                    return Ok(Parsed::Exit(ExitCode::from(129)));
+                    return Ok(Parsed::Exit(super::show_usage(SHORT_USAGE)));
                 }
                 _ => {
                     eprint!("error: unknown switch `{c}'\n{SHORT_USAGE}");

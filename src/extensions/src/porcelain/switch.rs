@@ -64,7 +64,7 @@
 use anyhow::{anyhow, Result};
 // Every `print!`/`println!` below goes through git's stdout buffer; see
 // `crate::cstdio` and the `defer()` call in `switch()`.
-use crate::cstdio::{print, println};
+use crate::cstdio::println;
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
@@ -434,7 +434,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
     // `Switched to …` line is stderr, and stdio's buffering of the first is what
     // orders them for a caller capturing both. See `crate::cstdio`.
     crate::cstdio::defer();
-    // `-h` as any argument prints usage on stdout and exits 129.
+    // `-h` as any argument prints usage on stdout and exits 0.
     //
     // `--help-all` prints the same block. parse_options_step() tests it with a
     // `strcmp()` of its own, ahead of parse_long_opt(), so the name never
@@ -448,8 +448,7 @@ pub fn switch(args: &[String]) -> Result<ExitCode> {
         .take_while(|a| a.as_str() != "--" && a.as_str() != "--end-of-options")
         .any(|a| a == "--help-all");
     if help_all || args.iter().any(|a| a == "-h") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     let p = match parse(args)? {

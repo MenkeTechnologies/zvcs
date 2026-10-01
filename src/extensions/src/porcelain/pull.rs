@@ -99,7 +99,7 @@
 //! `error: unknown option \`<name>'` and the whole usage block on stderr and
 //! exits 129, and a value-taking option with nothing after it prints
 //! `error: option \`<name>' requires a value` alone, also 129. Only `-h` writes
-//! the usage to stdout.
+//! the usage to stdout, at exit 0.
 //!
 //! `--autostash` is forwarded to whichever integration step runs — `run_merge()`
 //! and `run_rebase()` both push it — so a dirty tree is stashed and restored on
@@ -193,7 +193,7 @@ const LONG_OPTS: &[LongOpt] = &[
 const ALIAS_GROUPS: &[&[&str]] = &[&["negotiation-tip", "negotiation-restrict"]];
 
 /// `usage_with_options()` rendering of `builtin/pull.c`'s option table, verbatim
-/// (git's `-h` writes it to stdout and exits 129).
+/// (git's `-h` writes it to stdout and exits 0).
 const USAGE: &str = concat!(
     "usage: git pull [<options>] [<repository> [<refspec>...]]\n",
     "\n",
@@ -601,8 +601,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
         // `strcmp` — `--help-a` and `--help-all=x` stay unknown options. It
         // renders `USAGE_FULL`, which for `pull` keeps the hidden `--summary`.
         if typed == "--help-all" {
-            print!("{USAGE_ALL}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE_ALL));
         }
 
         // Respell a unique abbreviation as the name it resolves to, so `--autost`
@@ -847,8 +846,7 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // `parse_options`' built-in `-h`: the option table on stdout,
             // exit 129. It fires wherever it appears, ahead of everything else.
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
 
             "--" => {

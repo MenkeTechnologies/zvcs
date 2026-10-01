@@ -114,8 +114,7 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         let resolved = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => name,
@@ -126,8 +125,7 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
         let a = resolved.as_ref();
         match a {
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--all" => opts.all = true,
             "--no-all" => opts.all = false,

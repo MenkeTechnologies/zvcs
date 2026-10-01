@@ -17,7 +17,7 @@
 //!   ``error: unknown switch `C'`` + usage (129),
 //!   ``error: option `NAME' takes no value`` with **no** usage block (129),
 //!   and a missing `<socket-path>` → usage on stderr (129).
-//!   `-h` prints the same usage block to **stdout** and exits 129.
+//!   `-h` prints the same usage block to **stdout** and exits 0.
 //! * `fatal: socket directory must be an absolute path` (128).
 //! * `init_socket_directory`: POSIX `dirname` of the socket path, the
 //!   loose-permissions refusal (`st_mode & 077`) with git's four-line advice
@@ -117,10 +117,7 @@ pub fn credential_cache__daemon(args: &[String]) -> Result<ExitCode> {
     let (debug, positionals) = match parse_options(rest) {
         Ok(v) => v,
         Err(ParseFailure::Help) => {
-            // `-h` renders usage on stdout; the exit code is still 129.
-            print!("{USAGE}");
-            let _ = io::stdout().flush();
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         Err(ParseFailure::Message(msg)) => {
             eprint!("{msg}");

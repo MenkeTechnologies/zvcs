@@ -45,11 +45,11 @@ pub(crate) fn value_at<'a>(
     crate::parseopt::value_at(args, i, crate::parseopt::OptName::typed(tok))
 }
 
-/// `parse-options`' answer to `-h`: the command's usage block on **stdout**,
-/// exit 129.
+/// `parse-options`' answer to `-h` and `--help-all`: the command's usage block
+/// on **stdout**, exit 0 — `PARSE_OPT_HELP`.
 ///
-/// parse-options.c has one renderer, `usage_with_options_internal()`, and two
-/// callers that differ only in where it writes. A `-h` reaches it through
+/// parse-options.c has one renderer, `usage_with_options_internal()`, and
+/// callers that differ in where it writes. A `-h` reaches it through
 /// `parse_options_step()`:
 ///
 /// ```c
@@ -58,17 +58,39 @@ pub(crate) fn value_at<'a>(
 ///                                            USAGE_NORMAL, USAGE_TO_STDOUT);
 /// ```
 ///
-/// while every *rejection* reaches it through `usage_with_options()`, which
-/// passes `USAGE_TO_STDERR` and prefixes an `error:` line of its own. Both exit
-/// 129 — the status is not what distinguishes them, the stream is. That is the
-/// single rule the whole port kept getting backwards: asking for help is not an
-/// error, so it does not go to stderr and it is not announced as one.
+/// and since 2.56 `parse_options()` exits 0 for it (parse-options.c:1207-1208,
+/// `case PARSE_OPT_HELP: exit(0);`), as `show_usage_with_options_if_asked()`
+/// (parse-options.c:1500-1515) and usage.c's `show_usage_if_asked()` (usage.c:185-199)
+/// do. Every *rejection* reaches the renderer through `usage_with_options()`,
+/// which passes `USAGE_TO_STDERR`, prefixes an `error:` line of its own and
+/// exits 129; [`help_error`] is the one rejection that reuses the help path.
 ///
 /// The block itself is bespoke per command (each `builtin/<cmd>.c` owns its
 /// `<cmd>_usage[]` and `struct option` table), so it stays a per-module `USAGE`
 /// const; what is shared, and lives here, is the policy.
 pub(crate) fn show_usage(usage: &str) -> std::process::ExitCode {
-    print!("{usage}");
+    std::process::ExitCode::from(show_usage_status(usage))
+}
+
+/// [`show_usage`] for the parsers that carry a raw exit status rather than an
+/// [`std::process::ExitCode`]: prints the block and returns that status, 0.
+pub(crate) fn show_usage_status(usage: &str) -> u8 {
+    // Through git's stdout buffer, so a command that armed it keeps its order.
+    crate::cstdio::write_bytes(usage.as_bytes());
+    0
+}
+
+/// `PARSE_OPT_HELP_ERROR` (new in 2.56): the usage block a help path renders,
+/// but on **stderr** at 129, because the help was not asked for.
+///
+/// `usage_with_options_internal()` returns it when `err` is set
+/// (parse-options.c:1375,1489), and `parse_long_opt()` returns it for an
+/// ambiguous abbreviation (parse-options.c:586), which `parse_options_step()`
+/// routes to `show_usage_stderr` (parse-options.c:1139-1140,1174-1176) and
+/// `parse_options()` exits 129 for (parse-options.c:1209-1211). Callers print
+/// their own `error:` line first.
+pub(crate) fn help_error(usage: &str) -> std::process::ExitCode {
+    eprint!("{usage}");
     std::process::ExitCode::from(129)
 }
 
@@ -98,8 +120,8 @@ pub(crate) fn you_still_use_that(command_name: &str, hint: Option<&str>) -> std:
     std::process::ExitCode::from(128)
 }
 
-/// `show_usage_with_options_if_asked()` (parse-options.c:1490-1505): the same
-/// block on stdout at 129, but **only when `-h` or `--help-all` is the sole
+/// `show_usage_with_options_if_asked()` (parse-options.c:1500-1515): the same
+/// block on stdout at exit 0, but **only when `-h` or `--help-all` is the sole
 /// argument**.
 ///
 /// Commands that do their own argv walk rather than calling `parse_options()`
@@ -455,18 +477,18 @@ pub(crate) fn canonical_long_aliased<'a>(
     }
 }
 
-/// The ambiguous-abbreviation refusal, which is the odd one out among
-/// parse-options' rejections: `parse_long_opt()` reports the reason with
-/// `error()` on **stderr** and then returns `PARSE_OPT_HELP`, which
-/// `parse_options_step()` routes to
+/// The ambiguous-abbreviation refusal: `parse_long_opt()` reports the reason
+/// with `error()` and returns `PARSE_OPT_HELP_ERROR` (parse-options.c:578-586),
+/// which `parse_options_step()` routes to
 ///
 /// ```c
-///  show_usage:
+///  show_usage_stderr:
 ///         return usage_with_options_internal(ctx, usagestr, options,
-///                                            USAGE_NORMAL, USAGE_TO_STDOUT);
+///                                            USAGE_NORMAL, USAGE_TO_STDERR);
 /// ```
 ///
-/// so the block lands on **stdout** while its explanation is on stderr, at 129.
+/// so reason and block are both on **stderr**, at 129 ([`help_error`]). Before
+/// 2.56 it returned `PARSE_OPT_HELP` and the block went to stdout.
 ///
 /// `tok` is the argument as typed; git echoes the body after `--`, value and
 /// all (`error(_("ambiguous option: %s ..."), arg)` with `arg = argv[0] + 2`).
@@ -478,8 +500,7 @@ pub(crate) fn ambiguous_option(
 ) -> std::process::ExitCode {
     let body = tok.strip_prefix("--").unwrap_or(tok);
     eprintln!("error: ambiguous option: {body} (could be --{first} or --{second})");
-    print!("{usage}");
-    std::process::ExitCode::from(129)
+    help_error(usage)
 }
 
 /// `PARSE_OPT_UNKNOWN`: the refusal for an argument no table entry claims.

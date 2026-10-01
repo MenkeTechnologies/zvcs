@@ -473,7 +473,7 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
                 break;
             }
 
-            // parse_options()'s own `-h`: the block on stdout, exit 129 — not
+            // parse_options()'s own `-h`: the block on stdout, exit 0 — not
             // `usage_exit()`, whose stderr is reserved for rejections.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.

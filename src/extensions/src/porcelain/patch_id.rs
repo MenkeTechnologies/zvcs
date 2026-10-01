@@ -25,7 +25,7 @@
 //! * `parse_options` long-option spelling: an exact name, or any unambiguous
 //!   prefix of one (`--u`, `--stab`, `--verb`), with `=value` rejected as
 //!   `option `<name>' takes no value`
-//! * `-h` (alone or heading a bundle) — usage on stdout, exit 129; an unknown
+//! * `-h` (alone or heading a bundle) — usage on stdout, exit 0; an unknown
 //!   option, unknown switch or ambiguous prefix — message plus usage on stderr,
 //!   exit 129; two different mode flags — the conflict message, exit 129
 //! * positional arguments and anything after `--` are ignored, because upstream's
@@ -106,8 +106,7 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
             // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block
             // `-h` prints.
             "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             _ if s.starts_with("--") => match resolve_long(&s[2..]) {
                 Long::Mode(val, name) => (val, name),
@@ -135,8 +134,7 @@ pub fn patch_id(args: &[String]) -> Result<ExitCode> {
             _ if s.starts_with('-') && s.len() > 1 => {
                 let c = s[1..].chars().next().unwrap_or('?');
                 if c == 'h' {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 eprintln!("error: unknown switch `{c}'");
                 eprint!("{USAGE}");

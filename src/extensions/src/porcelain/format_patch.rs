@@ -1000,7 +1000,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git format-patch -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }
@@ -2228,7 +2228,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.seen_dashdash = true;
             }
             // parse_options_step()'s `internal_help`, which `cmd_format_patch`
-            // runs before `setup_revisions`: the block on stdout at 129.
+            // runs before `setup_revisions`: the block on stdout at exit 0.
             // `--help-all` is the same step's own `strcmp()` and renders
             // `USAGE_FULL`, identical here — no entry is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => return Ok(Parsed::Exit(super::show_usage(USAGE))),

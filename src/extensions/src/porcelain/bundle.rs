@@ -35,7 +35,7 @@
 //!     installed pack gets its `.promisor` marker and the objects the filter
 //!     dropped read as absent-on-purpose rather than as corruption
 //!   * `-h` for `bundle` itself and for each of the four subcommands (usage to
-//!     stdout, exit 129), plus `need a subcommand`, `unknown subcommand`,
+//!     stdout, exit 0), plus `need a subcommand`, `unknown subcommand`,
 //!     `unknown option`/`unknown switch` and `need a <file> argument`
 //!   * `-` as `<file>`, meaning the bundle is read from stdin
 //!
@@ -191,8 +191,7 @@ pub fn bundle(args: &[String]) -> Result<ExitCode> {
         // rendering `USAGE_FULL` — the same block as `-h` here, since no entry of
         // this table is `PARSE_OPT_HIDDEN`.
         "-h" | "--help-all" => {
-            print!("{TOP_USAGE}");
-            Ok(ExitCode::from(129))
+            Ok(super::show_usage(TOP_USAGE))
         }
         "create" => create(rest),
         "verify" => verify(rest),
@@ -475,8 +474,7 @@ fn list_heads(args: &[String]) -> Result<ExitCode> {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{LIST_HEADS_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(LIST_HEADS_USAGE));
             }
             s if s.starts_with("--") && s.len() > 2 => {
                 return Ok(bad_option(s, LIST_HEADS_USAGE));
@@ -534,8 +532,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{VERIFY_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(VERIFY_USAGE));
             }
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
@@ -704,8 +701,7 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // `USAGE_FULL`, which is this same block — no entry here is
     // `PARSE_OPT_HIDDEN`.
     if args.iter().any(|a| a == "-h" || a == "--help-all") {
-        print!("{CREATE_USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(CREATE_USAGE));
     }
 
     // `builtin_bundle_create_options`: the progress switches are
@@ -1737,8 +1733,7 @@ fn unbundle(args: &[String]) -> Result<ExitCode> {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{UNBUNDLE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(UNBUNDLE_USAGE));
             }
             "--progress" => progress = true,
             "--no-progress" => progress = false,

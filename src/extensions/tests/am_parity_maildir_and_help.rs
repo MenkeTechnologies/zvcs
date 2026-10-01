@@ -126,7 +126,7 @@ fn am_lone_h_answers_usage_without_a_repository() {
     for flag in ["-h", "--help-all"] {
         let out = run(&dir, &["am", flag]);
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.status.code(), Some(129), "`am {flag}` exit code");
+        assert_eq!(out.status.code(), Some(0), "`am {flag}` exit code");
         assert_eq!(
             stdout.lines().next(),
             Some(AM_USAGE_FIRST_LINE),
@@ -150,7 +150,7 @@ fn am_lone_h_answers_usage_before_reading_am_config() {
     git(&repo, &["config", "am.threeWay", "notabool"]);
     for flag in ["-h", "--help-all"] {
         let out = run(&repo, &["am", flag]);
-        assert_eq!(out.status.code(), Some(129), "`am {flag}` exit code");
+        assert_eq!(out.status.code(), Some(0), "`am {flag}` exit code");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).lines().next(),
             Some(AM_USAGE_FIRST_LINE),

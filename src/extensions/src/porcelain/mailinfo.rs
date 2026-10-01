@@ -319,9 +319,7 @@ fn parse_options(
         // takes an `=<value>`. It renders `USAGE_FULL`, which for `mailinfo` is
         // `USAGE` plus the hidden `--inbody-headers`.
         if arg == "--help-all" {
-            print!("{USAGE_ALL}");
-            let _ = std::io::stdout().flush();
-            return Ok(Err(ExitCode::from(129)));
+            return Ok(Err(super::show_usage(USAGE_ALL)));
         }
 
         if let Some(body) = arg.strip_prefix("--") {
@@ -421,15 +419,12 @@ fn parse_options(
     Ok(Ok((msg, patch)))
 }
 
-/// Print the usage block — stdout for `-h`, stderr otherwise — and yield 129.
+/// Print the usage block: stdout at 0 for `-h`, stderr at 129 otherwise.
 fn usage(to_stdout: bool) -> ExitCode {
-    if to_stdout {
-        print!("{USAGE}");
-        let _ = std::io::stdout().flush();
-    } else {
-        eprint!("{USAGE}");
+    match to_stdout {
+        true => super::show_usage(USAGE),
+        false => super::help_error(USAGE),
     }
-    ExitCode::from(129)
 }
 
 /// `mailinfo_parse_quoted_cr_action()`.

@@ -12,7 +12,7 @@
 //!     root refs, and the `packed-refs` parse, each reporting through the
 //!     `fsck.<msg-id>` severities. `git fsck --references` runs this very
 //!     command in git, and reaches the same code here.
-//!   * the subcommand dispatch itself: `-h` (usage on stdout, exit 129), a
+//!   * the subcommand dispatch itself: `-h` (usage on stdout, exit 0), a
 //!     missing subcommand (`error: need a subcommand` + usage on stderr, 129),
 //!     an unknown subcommand, and each subcommand's own `-h` usage block.
 //!
@@ -207,8 +207,7 @@ pub fn refs(args: &[String]) -> Result<ExitCode> {
         // unknown options below. It renders `USAGE_FULL`, which is this same
         // block: the table has no `PARSE_OPT_HIDDEN` entry to reveal.
         "-h" | "--help-all" => {
-            print!("{USAGE}");
-            Ok(ExitCode::from(129))
+            Ok(super::show_usage(USAGE))
         }
         "exists" => exists(&args[1..]),
         "list" => list(&args[1..]),
@@ -267,8 +266,7 @@ fn exists(args: &[String]) -> Result<ExitCode> {
             // `=<value>`, and never seen past the `--` handled above. Its
             // `USAGE_FULL` is this block — the table has no hidden entry.
             if a == "-h" || a == "--help-all" {
-                print!("{USAGE_EXISTS}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_EXISTS));
             }
             if let Some(long) = a.strip_prefix("--") {
                 eprintln!("error: unknown option `{long}'");
@@ -486,8 +484,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
             // takes a value; `USAGE_FULL` equals this block because the table
             // has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{USAGE_VERIFY}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_VERIFY));
             }
             _ if a.starts_with("--") => {
                 let body = &a[2..];
@@ -587,8 +584,7 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
             // only, and `USAGE_FULL` is this block, there being no hidden
             // entry in the table.
             "-h" | "--help-all" => {
-                print!("{USAGE_MIGRATE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_MIGRATE));
             }
             _ if a.starts_with("--") => {
                 let body = &a[2..];
@@ -715,8 +711,7 @@ fn list(args: &[String]) -> Result<ExitCode> {
             // resolution, so no prefix of it and no `=<value>` form counts. The
             // block is the same one `-h` prints: no hidden entry to add.
             } else if a == "-h" || a == "--help-all" {
-                print!("{USAGE_LIST}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_LIST));
             } else if a == "-s" {
                 forwarded.push("--shell".to_string());
                 continue;
@@ -739,12 +734,10 @@ fn optimize(args: &[String]) -> Result<ExitCode> {
     // no `=<value>`) and never past a `--`, which is why this scan stops there.
     // `USAGE_FULL` is the same block, pack-refs' table having no hidden entry.
     if args[1..].iter().take_while(|a| a.as_str() != "--").any(|a| a == "--help-all") {
-        print!("{USAGE_OPTIMIZE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE_OPTIMIZE));
     }
     if args[1..].iter().any(|a| a == "-h") {
-        print!("{USAGE_OPTIMIZE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE_OPTIMIZE));
     }
     super::pack_refs::pack_refs(args)
 }

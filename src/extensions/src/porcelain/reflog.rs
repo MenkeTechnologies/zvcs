@@ -149,7 +149,7 @@ pub fn reflog(args: &[String]) -> Result<ExitCode> {
     // `cmd_reflog`'s `parse_options(..., PARSE_OPT_SUBCOMMAND_OPTIONAL)` scans
     // leading options and stops at the first non-option, which becomes the
     // subcommand. So `-h` is this command's help exactly while it is the FIRST
-    // token — the subcommand synopsis on stdout, exit 129. Once a subcommand has
+    // token — the subcommand synopsis on stdout, exit 0. Once a subcommand has
     // been named, `-h` belongs to that subcommand's own parser instead.
     // `--help-all` answers the same way: parse_options_step() tests it with a
     // `strcmp()` of its own ahead of parse_long_opt(), and renders `USAGE_FULL`

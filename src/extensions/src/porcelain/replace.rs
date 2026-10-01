@@ -249,8 +249,7 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
         // has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same
         // block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
             return Ok(code);
@@ -277,8 +276,7 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
                 "no-raw" => raw = false,
                 "no-format" => format = None,
                 "help" => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 "format" => {
                     i += 1;
@@ -310,8 +308,7 @@ pub fn replace(args: &[String]) -> Result<ExitCode> {
                 'g' => cmdmode!(Mode::Graft, "-g"),
                 'f' => force = true,
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 _ => return unknown_option(&format!("-{c}")),
             }

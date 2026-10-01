@@ -95,8 +95,7 @@ pub fn credential(args: &[String]) -> Result<ExitCode> {
     // fires only for a lone `-h` or `--help-all`. Unlike `usage()` below, it
     // prints to *stdout*.
     if rest.len() == 1 && matches!(rest[0].as_str(), "-h" | "--help-all") {
-        println!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
     if rest.len() != 1 {
         eprintln!("{USAGE}");

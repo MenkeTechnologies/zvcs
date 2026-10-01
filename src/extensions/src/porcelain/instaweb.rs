@@ -34,7 +34,7 @@
 //!   (error *and* usage on stderr); ``option `port' requires a value`` /
 //!   ``switch `p' requires a value`` / ``option `local' takes no value``
 //!   (error alone on stderr); `ambiguous option: s (could be --stop or --start)`
-//!   (error on stderr, usage on stdout).
+//!   (error and usage on stderr).
 //! * `git_dir_init` (`git-sh-setup` line 326), which runs while `git-sh-setup` is
 //!   being sourced — i.e. after parseopt but *before* the config reads and the
 //!   script's own option loop. No repository → `fatal: not a git repository (or
@@ -187,12 +187,15 @@ const SPECS: &[Spec] = &[
 /// Where parseopt puts the usage block for a given outcome, if anywhere.
 enum Usage {
     None,
+    /// The help request: `rev-parse --parseopt` emits `cat <<\EOF … EOF` and,
+    /// since 2.56, `exit 0` (parse-options.c:1486-1487), so the script prints
+    /// the block on stdout and exits 0.
     Stdout,
     Stderr,
 }
 
 /// A parseopt exit: an optional `error:` line on stderr plus a usage block.
-/// Every one of these leaves with status 129.
+/// Every one but the help request leaves with status 129.
 struct Fail {
     error: Option<String>,
     usage: Usage,
@@ -250,7 +253,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
             }
             match fail.usage {
                 Usage::None => {}
-                Usage::Stdout => print!("{USAGE}"),
+                Usage::Stdout => return Err(Exit(super::show_usage_status(USAGE)).into()),
                 Usage::Stderr => eprint!("{USAGE}"),
             }
             return Err(Exit(129).into());
@@ -1464,7 +1467,7 @@ fn parse_long<'a>(
                         error: Some(format!(
                             "error: ambiguous option: {name} (could be --{a} or --{b})"
                         )),
-                        usage: Usage::Stdout,
+                        usage: Usage::Stderr,
                     })
                 }
                 _ => {

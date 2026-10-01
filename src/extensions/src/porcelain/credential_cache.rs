@@ -94,8 +94,7 @@ pub fn credential_cache(args: &[String]) -> Result<ExitCode> {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
 
         if let Some(long) = a.strip_prefix("--") {
@@ -158,11 +157,10 @@ pub fn credential_cache(args: &[String]) -> Result<ExitCode> {
         // (`-hx` is help, `-xh` is the unknown switch).
         let c = a[1..].chars().next().expect("checked non-empty above");
         if c == 'h' {
-            print!("{USAGE}");
-        } else {
-            eprintln!("error: unknown switch `{c}'");
-            eprint!("{USAGE}");
+            return Ok(super::show_usage(USAGE));
         }
+        eprintln!("error: unknown switch `{c}'");
+        eprint!("{USAGE}");
         return Ok(ExitCode::from(129));
     }
 

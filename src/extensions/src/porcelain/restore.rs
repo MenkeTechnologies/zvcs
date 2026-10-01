@@ -530,7 +530,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => after_dashdash = true,
             // parse_options_step()'s `internal_help`: the block on stdout at
-            // 129, with no `error:` line — a help request is not a rejection.
+            // exit 0, with no `error:` line — a help request is not a rejection.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => return Ok(super::show_usage(USAGE)),

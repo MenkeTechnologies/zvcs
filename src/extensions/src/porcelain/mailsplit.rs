@@ -82,10 +82,9 @@ pub fn mailsplit(args: &[String]) -> Result<ExitCode> {
 fn run(args: &[String]) -> R<ExitCode> {
     // show_usage_if_asked(): `-h` or `--help-all` as the sole argument, and
     // nothing else. mailsplit's option table has no hidden entry, so both print
-    // the same block (parse-options.c:1490-1505).
+    // the same block (usage.c:185-199).
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
-        println!("usage: {USAGE}");
-        return Err(Halt(129));
+        return Err(Halt(super::show_usage_status(&format!("usage: {USAGE}\n"))));
     }
 
     let mut nr: i32 = 0;

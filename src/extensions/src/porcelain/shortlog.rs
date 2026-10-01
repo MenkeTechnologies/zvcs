@@ -391,8 +391,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // checked here instead. shortlog's table has no `PARSE_OPT_HIDDEN`
         // entry, so `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
 
         // Respell a unique abbreviation as the name it resolves to, so `--numb`
@@ -784,8 +783,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     break;
                 }
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 // `parse_options_step()` rewrites `ctx->argv[0]` to `-<rest of
                 // the cluster>` before returning PARSE_OPT_UNKNOWN, so what

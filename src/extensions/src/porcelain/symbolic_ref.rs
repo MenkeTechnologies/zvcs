@@ -103,7 +103,7 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
         let a = resolved.as_ref();
         match a {
             "--" => no_more_opts = true,
-            // parse_options_step() answers `-h` on stdout at 129, ahead of
+            // parse_options_step() answers `-h` on stdout at exit 0, ahead of
             // `usage_error()`'s stderr path for a rejection.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.

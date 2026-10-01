@@ -24,9 +24,9 @@
 //! check. Argument parsing and repository resolution are checked against git
 //! 2.55.0 on Darwin:
 //!
-//!   * `-h` → the 368-byte usage block on **stdout**, exit 129, before any
+//!   * `-h` → the 368-byte usage block on **stdout**, exit 0, before any
 //!     repository is touched (so it works outside a repository).
-//!   * `--help-all` → the 532-byte block on **stdout**, exit 129: the same
+//!   * `--help-all` → the 532-byte block on **stdout**, exit 0: the same
 //!     table with the two hidden entries (`--http-backend-info-refs` and its
 //!     `--advertise-refs` alias) left in, each on its own line.
 //!   * no `<directory>`, or more than one → the 458-byte usage block (a third
@@ -37,8 +37,8 @@
 //!   * an unknown short switch → ``error: unknown switch `<c>'`` followed by the
 //!     short usage block, both on **stderr**, exit 129.
 //!   * an ambiguous abbreviation → ``error: ambiguous option: <name> (could be
-//!     --<a> or --<b>)`` on **stderr** with the short usage block on **stdout**,
-//!     exit 129. The split across the two streams is git's, not a mistake here.
+//!     --<a> or --<b>)`` on **stderr** followed by the short usage block, also on **stderr**,
+//!     exit 129 (`PARSE_OPT_HELP_ERROR`).
 //!   * `--timeout` diagnostics — missing value, non-numeric value, empty value,
 //!     and out-of-`i32`-range value — each on **stderr** with no usage block,
 //!     exit 129.
@@ -249,8 +249,7 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
         // option array for the argument-count error, whose alias slot still
         // prints `...`.
         if a == "--help-all" {
-            print!("{USAGE_HELP_ALL}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE_HELP_ALL));
         }
 
         // A long option, possibly abbreviated, possibly `--name=value`.
@@ -272,8 +271,7 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
                     eprintln!(
                         "error: ambiguous option: {name} (could be --{first} or --{second})"
                     );
-                    print!("{USAGE_SHORT}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::help_error(USAGE_SHORT));
                 }
             };
 
@@ -319,8 +317,7 @@ pub fn upload_pack(args: &[String]) -> Result<ExitCode> {
         // never reached.
         if let Some(c) = a.strip_prefix('-').and_then(|s| s.chars().next()) {
             if c == 'h' {
-                print!("{USAGE_SHORT}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_SHORT));
             }
             eprint!("error: unknown switch `{c}'\n{USAGE_SHORT}");
             return Ok(ExitCode::from(129));

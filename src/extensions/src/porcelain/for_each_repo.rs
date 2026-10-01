@@ -12,7 +12,7 @@
 //!   * `--keep-going` / `--no-keep-going` — keep iterating after a failing
 //!     repository; the overall exit code is then 1, never the child's code.
 //!   * `--` — stop option parsing.
-//!   * `-h` — the usage block on stdout, exit 129.
+//!   * `-h` — the usage block on stdout, exit 0.
 //! ```
 //!
 //! Option parsing reproduces `parse_options` with `PARSE_OPT_STOP_AT_NON_OPTION`:
@@ -23,8 +23,8 @@
 //! ```text
 //!   * `error: unknown option \`bogus'` / `error: unknown switch \`x'`, plus the
 //!     usage block on stderr — `PARSE_OPT_UNKNOWN`
-//!   * `error: ambiguous option: n (could be --no-config or --no-keep-going)` on
-//!     stderr with the block on *stdout* — `parse_long_opt()`'s own refusal
+//!   * `error: ambiguous option: n (could be --no-config or --no-keep-going)` and
+//!     the block on stderr — `parse_long_opt()`'s `PARSE_OPT_HELP_ERROR`
 //!   * `error: option \`config' requires a value`
 //!   * `error: option \`no-config' takes no value`, naming the entry the way
 //!     `optname()` spells it however far it was abbreviated
@@ -157,8 +157,7 @@ fn parse_options(args: &[String]) -> Parsed {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return Parsed::Exit(ExitCode::from(129));
+            return Parsed::Exit(super::show_usage(USAGE));
         }
 
         if arg.starts_with("--") {
@@ -217,10 +216,9 @@ fn parse_options(args: &[String]) -> Parsed {
         // the first short switch ends the command with 129.
         let c = arg[1..].chars().next().expect("non-empty after the dash");
         if c == 'h' {
-            print!("{USAGE}");
-        } else {
-            eprint!("error: unknown switch `{c}'\n{USAGE}");
+            return Parsed::Exit(super::show_usage(USAGE));
         }
+        eprint!("error: unknown switch `{c}'\n{USAGE}");
         return Parsed::Exit(ExitCode::from(129));
     }
 

@@ -26,7 +26,7 @@
 //! command-name-specific framing lives in this file:
 //!
 //! * `-h` / `--help-all` as the *sole* argument — the usage line for **this**
-//!   name on **stdout**, exit 129, answered before `setup_git_directory()` (so
+//!   name on **stdout**, exit 0, answered before `setup_git_directory()` (so
 //!   it works outside a repository and in a bare one).
 //! * `RUN_SETUP` / `NEED_WORK_TREE`: `fatal: not a git repository …` (128) and
 //!   `fatal: this operation must be run in a work tree` (128), both before any
@@ -62,8 +62,7 @@ pub fn merge_recursive_ours(args: &[String]) -> Result<ExitCode> {
     // `git.c` answers a lone `-h`/`--help-all` on stdout before RUN_SETUP, so
     // it works outside a repository and in a bare one.
     if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
 
     // RUN_SETUP, then NEED_WORK_TREE — both before any argument is looked at,

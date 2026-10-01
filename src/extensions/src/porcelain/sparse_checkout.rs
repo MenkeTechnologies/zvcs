@@ -131,8 +131,8 @@ const USAGE_CHECK_RULES: &str = "usage: git sparse-checkout check-rules [-z] [--
 const USAGE_CLEAN: &str = "usage: git sparse-checkout clean [-n|--dry-run]\n\n    -n, --[no-]dry-run    dry run\n    -f, --[no-]force      force\n    -v, --[no-]verbose    report each affected file, not just directories\n\n";
 
 /// Report `arg` the way git's `parse_options` does and return its exit code:
-/// `-h` prints the usage block on stdout, anything else names the offending
-/// option or switch on stderr above the block. Both exit 129.
+/// `-h` prints the usage block on stdout at exit 0, anything else names the
+/// offending option or switch on stderr above the block, at 129.
 ///
 /// `--help-all` joins `-h` here because `parse_options_step()` tests it with a
 /// `strcmp()` of its own, ahead of `parse_long_opt()`: the name never
@@ -142,8 +142,9 @@ const USAGE_CLEAN: &str = "usage: git sparse-checkout clean [-n|--dry-run]\n\n  
 /// `USAGE_FULL` it renders is the same block `-h` prints in every subcommand.
 fn opt_error(arg: &str, usage: &str) -> ExitCode {
     if arg == "-h" || arg == "--help-all" {
-        print!("{usage}");
-    } else if let Some(long) = arg.strip_prefix("--") {
+        return super::show_usage(usage);
+    }
+    if let Some(long) = arg.strip_prefix("--") {
         eprint!("error: unknown option `{long}'\n{usage}");
     } else {
         let switch = arg.chars().nth(1).unwrap_or('-');

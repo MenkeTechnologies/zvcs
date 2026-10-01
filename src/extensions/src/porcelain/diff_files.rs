@@ -878,7 +878,7 @@ const FILTER_LETTERS: &[u8] = b"ACDMRTUXB";
 
 pub fn diff_files(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, diff_files_usage)` (builtin/diff-files.c:32):
-    // a lone `-h` answers on stdout at 129, before anything else runs.
+    // a lone `-h` answers on stdout at exit 0, before anything else runs.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }

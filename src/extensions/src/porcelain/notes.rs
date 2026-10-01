@@ -96,8 +96,9 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
         // table has no `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the
         // same block `-h` prints.
         if a == "-h" || a == "--help-all" {
-            print_usage(&mut std::io::stdout())?;
-            return Ok(ExitCode::from(129));
+            let mut buf = Vec::new();
+            print_usage(&mut buf)?;
+            return Ok(super::show_usage(&String::from_utf8_lossy(&buf)));
         }
         // A lone `-` is a non-option, and so is anything not starting with `-`.
         if !a.starts_with('-') || a == "-" {
@@ -1344,8 +1345,8 @@ fn sub_usage(msg: &str, lines: &[&str], options: &[&str]) -> Result<ExitCode> {
 /// Each `git notes` subcommand runs its own `parse_options()` over its own
 /// table, so once the subcommand word has been read the help question is that
 /// subcommand's — `git notes add -h` prints `git_notes_add_usage`, not
-/// `git_notes_usage`. Both still exit 129; the stream and the missing `error:`
-/// line are the whole difference from a refusal.
+/// `git_notes_usage`. It exits 0 and on stdout, with no `error:` line; a
+/// refusal exits 129 on stderr.
 fn sub_help(lines: &[&str], options: &[&str]) -> ExitCode {
     super::show_usage(&rendered(lines, options))
 }
@@ -2375,6 +2376,14 @@ fn bump_verbosity(target: &mut i32, verbose: bool) {
     }
 }
 
+/// `-h`/`--help-all` under `notes merge`: the merge usage block on stdout,
+/// `PARSE_OPT_HELP`.
+fn merge_help() -> Result<ExitCode> {
+    let mut buf = Vec::new();
+    merge_print_usage(&mut buf)?;
+    Ok(super::show_usage(&String::from_utf8_lossy(&buf)))
+}
+
 /// A merge-specific usage error: `error:` then the merge usage block, exit 129.
 fn merge_usage(msg: &str) -> Result<ExitCode> {
     eprintln!("error: {msg}");
@@ -2418,8 +2427,7 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
             // `PARSE_OPT_HIDDEN` entry. The compare is exact, so `--help-a` and
             // `--help-all=x` stay unknown-option reports.
             "--help-all" => {
-                merge_print_usage(&mut std::io::stdout())?;
-                return Ok(ExitCode::from(129));
+                return merge_help();
             }
             s if s.starts_with("--") => {
                 return merge_usage(&format!("unknown option `{}'", &s[2..]))
@@ -2436,8 +2444,7 @@ fn merge(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exi
                         'v' => bump_verbosity(&mut verbosity, true),
                         'q' => bump_verbosity(&mut verbosity, false),
                         'h' => {
-                            merge_print_usage(&mut std::io::stdout())?;
-                            return Ok(ExitCode::from(129));
+                            return merge_help();
                         }
                         's' => {
                             let rest: String = cluster[c + 1..].iter().collect();

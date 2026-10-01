@@ -49,7 +49,7 @@ pub fn show_branch(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git show-branch -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);
     }
@@ -457,7 +457,7 @@ impl Opts {
 /// How `parse_options` stopped short of a parsed command line.
 enum ParseFail {
     /// `-h`: `parse_options_step()` renders the block to **stdout** and exits
-    /// 129 with no `error:` line — a help request is not a rejection.
+    /// 0 with no `error:` line — a help request is not a rejection.
     Help,
     /// A rejection: `usage_with_options()`'s `error:` line (when there is one)
     /// and the block, both on stderr, 129.
@@ -688,7 +688,7 @@ fn parse_args(argv: &[String], opts: &mut Opts) -> Result<Vec<String>, ParseFail
                         break;
                     }
                     // parse_options_step() answers `-h` from inside the
-                    // short-option loop, on stdout at 129.
+                    // short-option loop, on stdout at exit 0.
                     'h' => return Err(ParseFail::Help),
                     _ => return Err(ParseFail::Rejected(Some(format!("error: unknown switch `{c}'")))),
                 }

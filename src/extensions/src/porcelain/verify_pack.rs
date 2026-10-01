@@ -75,7 +75,7 @@ const MAX_CHAIN: u32 = 15;
 ///   * `-s` / `--stat-only`                  → histogram only, no verification
 ///   * `-sv`, `--no-verbose`, `--no-stat-only`, `--`
 ///   * `--object-format[=]sha1`, `--no-object-format`
-///   * `-h`                                  → usage on stdout, exit 129
+///   * `-h`                                  → usage on stdout, exit 0
 ///
 /// Several `<pack>` arguments are processed in order; the exit code is 1 if any
 /// one of them failed, exactly as `cmd_verify_pack()` accumulates `err`.
@@ -108,8 +108,7 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         // Respell a unique abbreviation as the name it resolves to, so an
         // abbreviation lands on the arm its full spelling lands on.
@@ -129,8 +128,7 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => end_of_opts = true,
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--verbose" => verbose = true,
             "--no-verbose" => verbose = false,
@@ -162,8 +160,7 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
                         'v' => verbose = true,
                         's' => stat_only = true,
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(usage_error(Some(&format!("unknown switch `{c}'")))),
                     }

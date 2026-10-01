@@ -447,7 +447,8 @@ fn a_value_taking_character_at_the_end_of_a_cluster_names_itself() {
 /// `internal_help` is tested inside the short-option loop
 /// (parse-options.c:1069, :1087), so a cluster asks for help exactly when the
 /// first character the table does *not* define is `h` — and a help request is
-/// not a rejection, so the block goes to **stdout** with no `error:` line.
+/// not a rejection, so the block goes to **stdout** with no `error:` line, at
+/// exit 0 (parse-options.c:1207-1208, 2.56).
 #[test]
 fn h_inside_a_cluster_is_help_and_not_a_rejection() {
     let f = Fixture::new("clusterhelp");
@@ -467,7 +468,7 @@ fn h_inside_a_cluster_is_help_and_not_a_rejection() {
         (&["merge", "-nh"], "usage: git merge [<options>] [<commit>...]"),
     ] {
         let r = f.run(args);
-        assert_eq!(r.code, 129, "`git {args:?}` exit code");
+        assert_eq!(r.code, 0, "`git {args:?}` exit code");
         assert_eq!(r.stderr, "", "`git {args:?}` wrote to stderr; help is not an error");
         assert_eq!(
             r.stdout.lines().next(),

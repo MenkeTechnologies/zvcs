@@ -421,7 +421,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         }
         let s = a.as_str();
         // parse_options_step()'s `internal_help`. `git show` is `builtin/log.c`,
-        // so the block it prints is `git log`'s — on stdout at 129.
+        // so the block it prints is `git log`'s — on stdout at exit 0.
         if !after_dashdash && s == "-h" {
             return Ok(super::show_usage(super::log::USAGE));
         }

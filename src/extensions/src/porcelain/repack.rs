@@ -30,7 +30,7 @@
 //! Covered because these paths are byte-verifiable without touching the object
 //! database:
 //! ```text
-//!   * `-h` → git's 2699-byte usage block on stdout, exit 129
+//!   * `-h` → git's 2699-byte usage block on stdout, exit 0
 //!   * git's parse-options behaviour for every option in the table, including
 //!     unambiguous long-option abbreviation (`--qui` → `--quiet`), `--no-`
 //!     negations, `=value` vs. separate-argv values, clustered short switches,
@@ -511,7 +511,7 @@ enum Parsed {
 /// `git repack` — argument validation and pre-flight conflict checks only; the
 /// repacking itself is not ported.
 ///
-/// Returns 129 with git's own output for `-h` and for every malformed
+/// Returns 0 with git's own output for `-h`, 129 for every malformed
 /// invocation, and 128 for the option conflicts git rejects before doing any
 /// work. Any invocation that survives both bails, naming the substrate that is
 /// missing; see the module documentation for the full list.
@@ -2343,11 +2343,9 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     let (idx, negated) = match resolve_long(name) {
         Resolved::Unique(idx, negated) => (idx, negated),
         Resolved::Ambiguous(first, second) => {
-            // Verified quirk: unlike every other diagnostic here, the ambiguity
-            // message goes to stderr while its usage block goes to *stdout*.
+            // `PARSE_OPT_HELP_ERROR`: the message and the block, both on stderr.
             eprintln!("error: ambiguous option: {name} (could be --{first} or --{second})");
-            print!("{USAGE}");
-            return Some(ExitCode::from(129));
+            return Some(super::help_error(USAGE));
         }
         Resolved::Unknown => {
             // git echoes the argument as written, `=value` included.
@@ -2818,8 +2816,7 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
     while c < chars.len() {
         match chars[c] {
             'h' => {
-                print!("{USAGE}");
-                return Some(ExitCode::from(129));
+                return Some(super::show_usage(USAGE));
             }
             'a' => st.all_into_one = true,
             'A' => {

@@ -781,7 +781,8 @@ fn every_occurrence_is_validated_and_the_first_bad_one_stops_the_run() {
 /// `show_usage_with_options_if_asked()` comes before or after its
 /// `repo_config()`. Measured under git 2.55.0 for every verb this dispatcher
 /// gates: `status`, `commit`, `gc`, `branch`, `ls-files`, `rev-parse`,
-/// `diff-tree` and a dozen more answer 129 with their usage block, while `diff`,
+/// `diff-tree` and a dozen more answer with their usage block (exit 0 since
+/// 2.56, `parse_options()` at parse-options.c:1207-1208), while `diff`,
 /// `log`, `grep`, `blame`, `tag`, `push` and the rest answer 128 with the config
 /// diagnostic. `prepare_repo_settings()` splits the other way: only `diff`,
 /// `show`, `pull`, `fetch`, `checkout`, `restore` and `switch` let it beat `-h`.
@@ -805,7 +806,7 @@ fn whether_h_outruns_the_config_gate_is_decided_per_verb() {
     for verb in ["status", "commit", "gc", "branch", "ls-files", "rev-parse", "diff-tree"] {
         let out = run(&repo, &home, &["-c", "core.ignorecase=bogus", verb, "-h"]);
         assert_eq!(stderr(&out), "", "for {verb} -h");
-        assert_eq!(code(&out), 129, "for {verb} -h");
+        assert_eq!(code(&out), 0, "for {verb} -h");
         assert!(
             out.stdout.starts_with(b"usage: git "),
             "for {verb} -h: {}",
@@ -823,7 +824,7 @@ fn whether_h_outruns_the_config_gate_is_decided_per_verb() {
     assert_eq!(code(&out), FATAL);
     let out = run(&repo, &home, &["-c", "core.packedGitLimit=bogus", "log", "-h"]);
     assert_eq!(stderr(&out), "");
-    assert_eq!(code(&out), 129);
+    assert_eq!(code(&out), 0);
 }
 
 /// The gate runs before the command parses its own options, so a bad value is

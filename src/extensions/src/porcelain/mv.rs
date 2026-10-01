@@ -44,7 +44,7 @@ const LONG_OPTS: &[LongOpt] = &[
     LongOpt { name: "sparse", neg: true, arg: Arg::None },
 ];
 
-/// `git mv -h` help, printed verbatim to stdout (git exits 129 after it).
+/// `git mv -h` help, printed verbatim to stdout (git exits 0 after it).
 const HELP: &str = "\
 usage: git mv [-v] [-f] [-n] [-k] <source> <destination>
    or: git mv [-v] [-f] [-n] [-k] <source>... <destination-directory>
@@ -118,8 +118,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if a == "--help-all" {
-            print!("{HELP}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(HELP));
         }
         if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
             return Ok(code);
@@ -133,12 +132,11 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         match resolved.as_ref() {
             "--" => opts_done = true,
             "-h" => {
-                // git prints the full help to stdout and exits 129, before any
+                // git prints the full help to stdout and exits 0, before any
                 // repository lookup — so `-h` works outside a work tree too.
                 // (`--help` is deliberately NOT handled here: stock git execs the
                 //  man pager for it, a foreign op this server cannot reproduce.)
-                print!("{HELP}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(HELP));
             }
             "-f" | "--force" => force = true,
             // Every flag here is an `OPT_BOOL`, whose unset writes 0.
@@ -169,8 +167,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                         'n' => dry_run = true,
                         'v' => verbose = true,
                         'h' => {
-                            print!("{HELP}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(HELP));
                         }
                         _ => return Ok(super::unknown_option(&format!("-{}", &s[off..]), HELP)),
                     }

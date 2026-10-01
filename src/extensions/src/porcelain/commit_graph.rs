@@ -209,8 +209,7 @@ pub fn commit_graph(args: &[String]) -> Result<ExitCode> {
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{TOP_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(TOP_USAGE));
             }
             // `--` stops option parsing; no subcommand was seen by then.
             "--" => return Ok(usage_error(Some("need a subcommand"), TOP_USAGE)),
@@ -361,8 +360,7 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{VERIFY_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(VERIFY_USAGE));
             }
             "--" => end_of_opts = true,
             "--object-dir" => {
@@ -492,8 +490,7 @@ fn write_graph(args: &[String], inherited_object_dir: Option<String>) -> Result<
             // `--help-all` renders `USAGE_FULL`, identical to the `-h` block:
             // no entry of this subcommand's table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{WRITE_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(WRITE_USAGE));
             }
             "--" => end_of_opts = true,
             "--object-dir" => {

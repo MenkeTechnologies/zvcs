@@ -2719,17 +2719,15 @@ const USAGE_ALL: &str = r#"usage: git add [<options>] [--] <pathspec>...
 
 "#;
 
-/// `-h`: `parse_options()` prints the whole table on *stdout* and still exits 129.
+/// `-h`: `parse_options()` prints the whole table on *stdout* and exits 0.
 fn print_usage() -> Result<ExitCode> {
-    print!("{USAGE}");
-    Ok(ExitCode::from(129))
+    Ok(super::show_usage(USAGE))
 }
 
 /// `--help-all`: the same renderer over `USAGE_FULL`, so the hidden entry is
 /// listed too. Same stream, same 129.
 fn print_usage_all() -> Result<ExitCode> {
-    print!("{USAGE_ALL}");
-    Ok(ExitCode::from(129))
+    Ok(super::show_usage(USAGE_ALL))
 }
 
 

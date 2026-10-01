@@ -21,7 +21,7 @@
 //! Not covered: nothing. Non-option arguments are ignored, matching git's
 //! `parse_options` call, which declares no positionals.
 //!
-//! Exit codes follow git: 0 on success, 129 for `-h` and for an unknown option,
+//! Exit codes follow git: 0 on success and for `-h`, 129 for an unknown option,
 //! 128 for every fatal (unreadable header, unknown index version, corrupt fan-out
 //! table, truncated body, unknown hash algorithm).
 
@@ -146,8 +146,7 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if raw == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         // Any unambiguous prefix of a long option names it, so `--object-f`
         // lands on the same arm `--object-format` does.
@@ -164,8 +163,7 @@ pub fn show_index(args: &[String]) -> Result<ExitCode> {
         match a {
             "--" => no_more_opts = true,
             "-h" | "--help" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--object-format" => {
                 let Some(v) = argv.get(i + 1) else {

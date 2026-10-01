@@ -338,8 +338,7 @@ fn parse_options(args: &[String]) -> Result<Parsed> {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE_WITH_OPTIONS}");
-            return Ok(Parsed::Exit(EXIT_USAGE));
+            return Ok(Parsed::Exit(super::show_usage_status(USAGE_WITH_OPTIONS)));
         }
 
         if let Some(long) = a.strip_prefix("--") {
@@ -405,8 +404,7 @@ fn parse_options(args: &[String]) -> Result<Parsed> {
         };
         match c {
             'h' => {
-                print!("{USAGE_WITH_OPTIONS}");
-                return Ok(Parsed::Exit(EXIT_USAGE));
+                return Ok(Parsed::Exit(super::show_usage_status(USAGE_WITH_OPTIONS)));
             }
             'o' | 's' => {
                 let Some(v) = take_value(&mut i, attached, "switch", &c.to_string()) else {

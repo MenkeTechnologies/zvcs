@@ -542,7 +542,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git rebase -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
         return Ok(code);
     }
@@ -1107,8 +1107,7 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             }
             match c {
                 'h' => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 'q' => flags &= !(NO_QUIET | VERBOSE | DIFFSTAT),
                 'v' => flags |= NO_QUIET | VERBOSE | DIFFSTAT,

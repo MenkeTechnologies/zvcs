@@ -1579,12 +1579,10 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 // below and rendering `USAGE_FULL` rather than `USAGE_NORMAL`.
                 // Both are exact matches, so neither abbreviates.
                 "help-all" => {
-                    print!("{USAGE_ALL}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE_ALL));
                 }
                 "help" => {
-                    print!("{USAGE}");
-                    return Ok(ExitCode::from(129));
+                    return Ok(super::show_usage(USAGE));
                 }
                 "all"
                 | "guides"
@@ -1635,8 +1633,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             for c in a[1..].chars() {
                 let m = match c {
                     'h' => {
-                        print!("{USAGE}");
-                        return Ok(ExitCode::from(129));
+                        return Ok(super::show_usage(USAGE));
                     }
                     'a' => Some(Mode::All),
                     'g' => Some(Mode::Guides),

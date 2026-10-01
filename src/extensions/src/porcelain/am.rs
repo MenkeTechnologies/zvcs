@@ -465,7 +465,7 @@ impl Default for Opts {
 /// A parse failure. git prints the message and exits 129 without usage text.
 enum Usage {
     /// `-h`: `parse_options_step()` renders the block to **stdout** and exits
-    /// 129, with no `error:` line — a help request is not a rejection.
+    /// 0, with no `error:` line — a help request is not a rejection.
     Help,
     /// `--help-all`: the same renderer with `USAGE_FULL`, which for `am` keeps
     /// the hidden `-b` and `--rebasing` entries.
@@ -481,8 +481,8 @@ enum Usage {
     Unknown(String),
     /// An abbreviation two entries claim: the token as typed and the two candidate
     /// spellings. Unlike [`Usage::Error`] this one also prints the option block —
-    /// `parse_long_opt()` returns `PARSE_OPT_HELP` after its `error()`, which
-    /// routes to `usage_with_options_internal(..., USAGE_TO_STDOUT)`.
+    /// `parse_long_opt()` returns `PARSE_OPT_HELP_ERROR` after its `error()`,
+    /// which routes to `usage_with_options_internal(..., USAGE_TO_STDERR)`.
     Ambiguous(String, String, String),
 }
 

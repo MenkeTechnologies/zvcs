@@ -4,7 +4,7 @@
 //! builtin sees its arguments, so with no repository every `RUN_SETUP` entry of
 //! `commands[]` dies `not a git repository` at 128 — an unknown option, a missing
 //! operand and a `-h` next to anything else included. Only a lone `-h` (or
-//! `--help-all`) demotes the setup to gentle and gets the usage at 129. zvcs let
+//! `--help-all`) demotes the setup to gentle and gets the usage (exit 0 since 2.56). zvcs let
 //! `update-ref`, `symbolic-ref`, `replace`, `notes`, `mv`, `rm`, `clean` and
 //! `status -h …` parse their options first.
 //!
@@ -72,6 +72,6 @@ fn setup_dies_before_the_options_are_read() {
         assert_eq!(f.run(args), fatal, "{args:?}");
     }
     // A lone `-h` is the one exemption.
-    assert_eq!(f.run(&["update-ref", "-h"]).1, 129);
-    assert_eq!(f.run(&["symbolic-ref", "--help-all"]).1, 129);
+    assert_eq!(f.run(&["update-ref", "-h"]).1, 0);
+    assert_eq!(f.run(&["symbolic-ref", "--help-all"]).1, 0);
 }

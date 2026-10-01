@@ -28,7 +28,7 @@
 //!
 //! Covered here in the front end itself:
 //!   * `-h` as the only argument, git's `show_usage_if_asked`: `usage: git
-//!     upload-archive <repository>` on **stdout**, exit 129, before the writer
+//!     upload-archive <repository>` on **stdout**, exit 0, before the writer
 //!     is spawned and before `ACK`. `-h` in any other position is passed
 //!     through to the writer like any other argument, as git passes it.
 //!   * a writer that cannot be spawned: the `NACK unable to spawn subprocess`
@@ -67,11 +67,10 @@ const USAGE: &str = "usage: git upload-archive <repository>";
 
 pub fn upload_archive(args: &[String]) -> Result<ExitCode> {
     // git's `show_usage_if_asked`: `-h` or `--help-all` as the sole argument
-    // prints to stdout and exits 129, before anything protocol-shaped happens.
+    // prints to stdout and exits 0, before anything protocol-shaped happens.
     // There is no hidden option to add, so both print the same line.
     if args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help-all") {
-        println!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(&format!("{USAGE}\n")));
     }
 
     let stdout = std::io::stdout();

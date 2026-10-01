@@ -64,7 +64,7 @@
 //!   included — is `fatal: --merge-base only works with two commits` (exit 128). The
 //!   valid two-commit case is implemented via the vendored merge-base computation
 //!   (`gix::Repository::merge_bases_many`).
-//! * `-h` — git's usage text on stdout, exit 129; no `<tree-ish>` — the same text on
+//! * `-h` — git's usage text on stdout, exit 0; no `<tree-ish>` — the same text on
 //!   stderr, exit 129
 //!
 //! * `--no-abbrev` — `cmd_diff_tree` starts from `opt->abbrev = 0`, so this restores

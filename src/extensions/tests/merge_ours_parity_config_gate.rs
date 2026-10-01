@@ -83,7 +83,7 @@ fn the_default_callback_refuses_before_the_settings_block() {
 fn help_is_answered_before_any_configuration() {
     let repo = fixture("help");
     let out = run(&repo, &["-c", "color.advice=bogus", "merge-ours", "-h"]);
-    assert_eq!(out.status.code(), Some(129));
+    assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "usage: git merge-ours <base>... -- HEAD <remote>...\n"

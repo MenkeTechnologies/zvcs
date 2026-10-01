@@ -762,7 +762,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     };
 
     // `show_usage_if_asked(argc, argv, diff_cache_usage)` is the first statement
-    // of `cmd_diff_index()` (builtin/diff-index.c:29): stdout, exit 129, and only
+    // of `cmd_diff_index()` (builtin/diff-index.c:29): stdout, exit 0, and only
     // for a lone `-h`. Every later refusal is `usage()`, which is stderr.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);

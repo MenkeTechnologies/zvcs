@@ -219,7 +219,7 @@ use super::diff_pickaxe;
 use super::diffstat::{self, StatWidths};
 
 /// Stock git's `diff-pairs` usage line. The option block under it is
-/// [`DIFF_OPTIONS`]; the two together are what `-h` prints (stdout, exit 129).
+/// [`DIFF_OPTIONS`]; the two together are what `-h` prints (stdout, exit 0).
 const USAGE_LINE: &str = "usage: git diff-pairs -z [<diff-options>]\n\n";
 
 /// Everything `add_diff_options()` contributes to a usage block, byte-for-byte
@@ -1177,8 +1177,7 @@ pub(crate) fn render_raw_stream(
             // `=<value>`; it renders `USAGE_FULL`, which is this same block
             // because no entry of the table is `PARSE_OPT_HIDDEN`.
             "-h" | "--help-all" => {
-                print!("{USAGE_LINE}{DIFF_OPTIONS}");
-                return Ok(Status::from(129));
+                return Ok(Status::from(super::show_usage_status(&format!("{USAGE_LINE}{DIFF_OPTIONS}"))));
             }
             "-z" => nul = true,
             "-p" | "-u" | "--patch" => opts.formats.or_patch(),

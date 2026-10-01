@@ -31,7 +31,7 @@
 //!
 //! * The `git rev-parse --parseopt` front end that `git-sh-setup` builds from
 //!   `OPTIONS_SPEC` (line 59 of `git-sh-setup`, before `git_dir_init`): the
-//!   307-byte usage block on **stdout** for `-h` (exit 129), unique-prefix
+//!   307-byte usage block on **stdout** for `-h` (exit 0), unique-prefix
 //!   abbreviation (`--se` → `--series`), `--name=value` sticking (the script
 //!   leaves `OPTIONS_STUCKLONG` empty, so parseopt re-splits it), the four
 //!   error shapes — ``error: unknown option `x'``, ``error: unknown switch `x'``,
@@ -134,8 +134,8 @@ enum Token {
     Negated,
 }
 
-/// `-h` and the script's own `usage()` write the block to stdout; parseopt's
-/// error paths write the message and the block to stderr.
+/// The script's own `usage()` writes the block to stdout; parseopt's error paths
+/// write the message and the block to stderr.
 fn usage_stdout(code: u8) -> ExitCode {
     print!("{USAGE}");
     ExitCode::from(code)
@@ -176,7 +176,7 @@ fn parseopt(args: &[String]) -> Parseopt {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if arg == "--help-all" {
-            return Parseopt::Exit(usage_stdout(129));
+            return Parseopt::Exit(super::show_usage(USAGE));
         }
         // A lone `-` and anything without a leading dash is a positional; they
         // are permuted past the `--` and thus unreachable.
@@ -265,7 +265,7 @@ fn parseopt(args: &[String]) -> Parseopt {
         while let Some(c) = rest.chars().next() {
             rest = &rest[c.len_utf8()..];
             if c == 'h' {
-                return Parseopt::Exit(usage_stdout(129));
+                return Parseopt::Exit(super::show_usage(USAGE));
             }
             match SPECS.iter().find(|s| s.short == Some(c)) {
                 None => return Parseopt::Exit(usage_stderr(format!("unknown switch `{c}'"))),

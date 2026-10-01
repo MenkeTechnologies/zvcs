@@ -693,7 +693,7 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     // and `parse_options()` then answers the request before the builtin has
     // looked at a repository. Answering it only after `discover()` made
     // `git log -h` outside one die `fatal: not a git repository` at 128, where
-    // stock prints the usage block on stdout at 129.
+    // stock prints the usage block on stdout at exit 0.
     if let Some(code) = super::show_usage_if_asked_full(args, USAGE, USAGE_ALL) {
         return Ok(code);
     }
@@ -1363,7 +1363,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             continue;
         }
         // parse_options_step()'s `internal_help`, which `cmd_log_init` runs
-        // before `setup_revisions`: the block on stdout at 129, no `error:` line.
+        // before `setup_revisions`: the block on stdout at exit 0, no `error:` line.
         if a == "-h" {
             return Ok(super::show_usage(USAGE));
         }

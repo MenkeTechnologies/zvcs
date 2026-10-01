@@ -108,11 +108,6 @@
 //! * `--debug-unpack` is accepted and silent; there is no `unpack-trees` to trace.
 //! * `read-tree --help` renders a man page under stock git and is not reproduced.
 
-// `print!`/`println!` here go through git's stdout buffer. `merge` reaches this
-// module in-process and arms that buffer (see `crate::cstdio`), so both halves of
-// its output have to be buffered or they interleave against each other; run as
-// its own command nothing arms it and these are unbuffered writes as before.
-use crate::cstdio::print;
 use anyhow::Result;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -432,8 +427,7 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
         // takes an `=<value>`. It renders `USAGE_FULL`, which for `read-tree`
         // is `USAGE` plus the hidden `--super-prefix`.
         if a == "--help-all" {
-            print!("{USAGE_ALL}");
-            return Ok(Err(ExitCode::from(129)));
+            return Ok(Err(super::show_usage(USAGE_ALL)));
         }
 
         // ---- Short option clusters (`-mu` is accepted by parse-options). ----
@@ -447,8 +441,7 @@ pub(super) fn parse_args(argv: &[String]) -> Result<std::result::Result<Opts, Ex
                     'v' => o.verbose_update = true,
                     'q' => {}
                     'h' => {
-                        print!("{USAGE}");
-                        return Ok(Err(ExitCode::from(129)));
+                        return Ok(Err(super::show_usage(USAGE)));
                     }
                     _ => reject!(usage_err(format!("unknown switch `{c}'"))),
                 }

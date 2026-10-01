@@ -105,7 +105,7 @@ pub fn merge_base(args: &[String]) -> Result<ExitCode> {
             "--independent" => Mode::Independent,
             "--is-ancestor" => Mode::IsAncestor,
             "--fork-point" => Mode::ForkPoint,
-            // parse_options_step() answers `-h` on stdout at 129, with no
+            // parse_options_step() answers `-h` on stdout at exit 0, with no
             // `error:` line — a help request is not a rejection.
             // `--help-all` reaches the same renderer with USAGE_FULL, which this
             // table renders identically: it has no `PARSE_OPT_HIDDEN` entry.

@@ -187,8 +187,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
         // rather than in `LONG_OPTS`. This table has no `PARSE_OPT_HIDDEN`
         // entry, so `USAGE_FULL` renders the same block `-h` prints.
         if !no_more_opts && a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if !no_more_opts && a.len() > 1 && a.starts_with('-') {
             if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
@@ -271,8 +270,7 @@ pub fn ls_tree(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(error_with_usage(&format!("unknown switch `{c}'"))),
                     }

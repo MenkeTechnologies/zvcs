@@ -192,10 +192,10 @@ fn need_work_tree_commands_refuse_in_a_bare_repository() {
     }
 
     // `git <cmd> -h` is exempt: git demotes the setup for it, so the answer is the
-    // usage error (129), never the work-tree refusal.
+    // usage block (exit 0 since 2.56), never the work-tree refusal.
     for args in [&["status", "-h"][..], &["commit", "-h"][..]] {
         let o = git(&bare, &home, args);
-        assert_eq!(o.status.code(), Some(129), "git {args:?} exit: {o:?}");
+        assert_eq!(o.status.code(), Some(0), "git {args:?} exit: {o:?}");
         assert!(
             !String::from_utf8_lossy(&o.stderr).contains("must be run in a work tree"),
             "git {args:?} refused a help request: {o:?}"

@@ -107,7 +107,7 @@
 //!   state probes observe
 //! * the exit codes and diagnostics, including the `error:`/`fatal:` pair and
 //!   exit 128 git emits when the output path cannot be written
-//! * `-h` → git's 4170-byte usage block on stdout, exit 129
+//! * `-h` → git's 4170-byte usage block on stdout, exit 0
 //! * git's parse-options behaviour for every option in the table, including
 //!   unambiguous long-option abbreviation (`--stdi` → `--stdin-packs`), `--no-`
 //!   negations, `=value` vs. separate-argv values, and `-q`/`-h`
@@ -806,7 +806,7 @@ fn resolve_path_walk(st: &State, settings: Option<&crate::repo_settings::RepoSet
 /// `git pack-objects` — argument validation, pre-flight checks, and the empty
 /// pack; a pack with entries in it is not ported.
 ///
-/// Returns 129 with git's own output for `-h`, for every malformed invocation,
+/// Returns 0 with git's own output for `-h`; 129 for every malformed invocation,
 /// and when neither `--stdout` nor exactly one base name was given; 128 for the
 /// value and option conflicts git rejects before it opens the object database.
 /// An invocation that survives both packs nothing when nothing named an object,
@@ -5552,8 +5552,7 @@ fn long_opt(body: &str, args: &[String], i: &mut usize, st: &mut State) -> Optio
     let (idx, negated) = match resolve_long(body) {
         Resolved::Unique(idx, negated) => (idx, negated),
         Resolved::Ambiguous(first, second) => {
-            // Verified quirk: unlike every other diagnostic here, the ambiguity
-            // message goes to stderr while its usage block goes to *stdout* —
+            // `PARSE_OPT_HELP_ERROR`: the message and the block, both on stderr —
             // and it echoes the argument as typed, `=<value>` and all.
             return Some(super::ambiguous_option(body, &first, &second, USAGE));
         }
@@ -5856,8 +5855,7 @@ fn short_opts(cluster: &str, i: &mut usize, st: &mut State) -> Option<ExitCode> 
     for c in cluster.chars() {
         match c {
             'h' => {
-                print!("{USAGE}");
-                return Some(ExitCode::from(129));
+                return Some(super::show_usage(USAGE));
             }
             // `-q` and `--progress` write the same flag, so the last one wins.
             'q' => st.progress = 0,

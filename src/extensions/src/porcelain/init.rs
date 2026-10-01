@@ -224,8 +224,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         // Respell a unique abbreviation as the name it resolves to, so `--init-b`
         // reaches the same arm as `--initial-branch`.
@@ -253,8 +252,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             "--no-bare" => bare = Some(false),
             // `parse-options` answers `-h` before anything else, on stdout.
             "-h" | "--help" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
@@ -323,8 +321,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                             break;
                         }
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => {
                             return Ok(super::unknown_option(&format!("-{}", &arg[off..]), USAGE))

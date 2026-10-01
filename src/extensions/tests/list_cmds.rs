@@ -184,10 +184,10 @@ fn nohelpers_filters_only_what_precedes_it() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
-/// `builtins` is git's `commands[]` table — the set `t0012-help.sh:254` holds to
-/// "`-h` exits 129 with a usage". The scripted commands and the `z*` verbs this
-/// binary also serves in-process do not keep that contract, so they must be in
-/// `main` and not here: `archimport -h` exits 1 and `zstatus -h` exits 0.
+/// `builtins` is git's `commands[]` table — the set `t0012-help.sh:254-266` holds
+/// to "`-h` succeeds with a usage on stdout". The scripted commands and the `z*`
+/// verbs this binary also serves in-process are not that table, so they must be
+/// in `main` and not here.
 #[test]
 fn builtins_is_the_commands_table_and_the_rest_is_main() {
     let repo = fixture("builtins");

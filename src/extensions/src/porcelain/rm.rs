@@ -19,8 +19,8 @@
 //! negations (`--no-cached`), matching git's parse-options; the last spelling of a
 //! toggle wins. Unknown options/switches exit 129 with git's usage block on
 //! stderr; an ambiguous abbreviation (`--p`, which names both
-//! `--pathspec-from-file` and `--pathspec-file-nul`) puts its message on stderr
-//! and the block on **stdout**, also 129; `` error: option `no-cached' takes no
+//! `--pathspec-from-file` and `--pathspec-file-nul`) puts its message and the
+//! block on stderr, also 129; `` error: option `no-cached' takes no
 //! value `` and `` error: option `pathspec-from-file' requires a value `` are
 //! `PARSE_OPT_ERROR` and print no block at all. An empty or missing pathspec
 //! exits 128 ("No pathspec was given").
@@ -254,7 +254,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                     'f' => opts.force = true,
                     'r' => opts.recursive = true,
                     // parse_options_step() tests `internal_help` inside the
-                    // short-option loop: `-h` prints the block on stdout at 129
+                    // short-option loop: `-h` prints the block on stdout at exit 0
                     // and stops, with no `error:` line.
                     'h' => return Ok(super::show_usage(USAGE)),
                     'n' => opts.dry_run = true,

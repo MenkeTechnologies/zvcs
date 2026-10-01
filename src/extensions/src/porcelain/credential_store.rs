@@ -46,8 +46,7 @@ pub fn credential_store(args: &[String]) -> Result<ExitCode> {
     let parsed = match parse_args(args) {
         Ok(p) => p,
         Err(UsageError::Help) => {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         Err(UsageError::Bad(msg)) => {
             if let Some(msg) = msg {

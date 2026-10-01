@@ -79,8 +79,7 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
         // an `=<value>`. This table has no `PARSE_OPT_HIDDEN` entry, so
         // `USAGE_FULL` renders the same block `-h` prints.
         if a == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
 
         if let Some(long) = a.strip_prefix("--") {
@@ -100,11 +99,8 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
                 Err(Ambiguity::Unknown) => {
                     return Ok(usage_error(&format!("unknown option `{}'", &a[2..])));
                 }
-                // The ambiguity report is the odd one out: the explanation is
-                // `error()` on stderr, but the block reaches
-                // `usage_with_options_internal(..., USAGE_TO_STDOUT)` and lands
-                // on **stdout**. `usage_error` puts both on stderr, which is the
-                // `unknown option` shape and not this one.
+                // The ambiguity report is `PARSE_OPT_HELP_ERROR`: `error()` and
+                // the block both on stderr, through the shared `ambiguous_option`.
                 Err(Ambiguity::Multiple(cands)) => {
                     return Ok(super::ambiguous_option(a, cands[0], cands[1], USAGE));
                 }
@@ -150,8 +146,7 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
         // reports the first unrecognised switch of a bundle.
         match a[1..].chars().next() {
             Some('h') => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             Some(c) => return Ok(usage_error(&format!("unknown switch `{c}'"))),
             None => {}

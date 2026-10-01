@@ -153,7 +153,7 @@ struct Ctx<'repo> {
 /// documented "no arguments means no work" contract for scripted use.
 pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
     // `show_usage_with_options_if_asked()` (builtin/checkout-index.c:253) is the
-    // first thing `cmd_checkout_index` does: a lone `-h` goes to stdout at 129,
+    // first thing `cmd_checkout_index` does: a lone `-h` goes to stdout at exit 0,
     // ahead of the index read. Any other `-h` is an unknown switch, as before.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);

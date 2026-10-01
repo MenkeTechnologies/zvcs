@@ -96,8 +96,7 @@ pub fn update_server_info(args: &[String]) -> Result<ExitCode> {
             // never reaches the prefix matching below. The table has no
             // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` is this same block.
             "-h" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             s if s.starts_with("--") => {
                 let name = &s[2..];
@@ -123,8 +122,7 @@ pub fn update_server_info(args: &[String]) -> Result<ExitCode> {
                     match c {
                         'f' => force = true,
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(usage_error(Some(&format!("unknown switch `{c}'")))),
                     }

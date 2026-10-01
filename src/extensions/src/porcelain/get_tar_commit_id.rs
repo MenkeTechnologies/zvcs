@@ -79,8 +79,7 @@ const USAGE: &str = "usage: git get-tar-commit-id\n";
 pub fn get_tar_commit_id(args: &[String]) -> Result<ExitCode> {
     // show_usage_if_asked(): `-h` / `--help-all` as the sole argument.
     if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
-        print!("{USAGE}");
-        return Ok(ExitCode::from(129));
+        return Ok(super::show_usage(USAGE));
     }
     // usage(): the command takes no arguments at all.
     if !args.is_empty() {

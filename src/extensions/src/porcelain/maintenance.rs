@@ -82,7 +82,7 @@
 //! spawn as `--no-quiet` reports its progress meter into the pipe.
 //!
 //! Everything else validates its arguments exactly as git's parse-options does
-//! â `-h` (usage on stdout, exit 129), unknown option/switch, missing option
+//! â `-h` (usage on stdout, exit 0), unknown option/switch, missing option
 //! value, stray positional, invalid `--task`/`--schedule`/`--scheduler` value â
 //! and then bails naming the substrate that is missing, rather than exiting 0
 //! and pretending the work happened:
@@ -424,8 +424,7 @@ pub fn maintenance(args: &[String]) -> Result<ExitCode> {
         // `USAGE_FULL` — the same block, this table having no
         // `PARSE_OPT_HIDDEN` entry.
         "-h" | "--help-all" => {
-            print!("{TOP_USAGE}");
-            Ok(ExitCode::from(129))
+            Ok(super::show_usage(TOP_USAGE))
         }
         // git consumes `--` as end-of-options and then finds no subcommand,
         // whatever follows it.
@@ -506,8 +505,7 @@ fn run_sub(args: &[String]) -> Result<ExitCode> {
             // `USAGE_FULL` — the same block, this table having no
             // `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{RUN_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(RUN_USAGE));
             }
             "--" => end_of_opts = true,
             "--auto" => auto = true,
@@ -1217,8 +1215,7 @@ fn is_needed_sub(args: &[String]) -> Result<ExitCode> {
             // `USAGE_FULL` — the same block, this table having no
             // `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{IS_NEEDED_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(IS_NEEDED_USAGE));
             }
             "--" => end_of_opts = true,
             "--auto" => auto = true,
@@ -1860,8 +1857,7 @@ fn start_sub(args: &[String]) -> Result<ExitCode> {
             // `USAGE_FULL` — the same block, this table having no
             // `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{START_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(START_USAGE));
             }
             "--" => end_of_opts = true,
             "--scheduler" => {
@@ -1916,8 +1912,7 @@ fn stop_sub(args: &[String]) -> Result<ExitCode> {
             // `USAGE_FULL` — the same block, this table having no
             // `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{STOP_USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(STOP_USAGE));
             }
             "--" => end_of_opts = true,
             _ => match option_name(a) {
@@ -2201,8 +2196,7 @@ fn parse_config_file_opts(args: &[String], usage: &str, with_force: bool) -> Res
             // `USAGE_FULL` — the same block, this table having no
             // `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{usage}");
-                return Ok(Parsed::Error(ExitCode::from(129)));
+                return Ok(Parsed::Error(super::show_usage(&usage)));
             }
             "--" => end_of_opts = true,
             "--no-config-file" => config_file = None,

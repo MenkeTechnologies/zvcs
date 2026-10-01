@@ -96,7 +96,7 @@ const ERROR_REFS: u8 = 8;
 ///                                       their content; every other type gets its
 ///                                       id. This is the one flag that mutates the
 ///                                       repository.
-///   * `-h` / `--help`                 — prints the usage block to stdout, exit 129.
+///   * `-h` / `--help`                 — prints the usage block to stdout, exit 0.
 /// ```
 ///
 /// Unknown, ambiguous, and abbreviated long options are resolved by a faithful
@@ -1524,27 +1524,24 @@ impl Options {
             }
             // `git.c` intercepts `--help` into a man page and parse-options turns
             // `-h` into the usage block; neither is reproducible past the usage
-            // text, so both print it to stdout and exit 129 like `-h` does.
+            // text, so both print it to stdout and exit 0 like `-h` does.
             // `--help-all` is a `strcmp()` of its own in `parse_options_step()`,
             // ahead of `parse_long_opt()`: it never abbreviates and never takes
             // an `=<value>`. It renders `USAGE_FULL`, the same block as `-h`
             // here, since no entry of this table is `PARSE_OPT_HIDDEN`.
             if s == "-h" || s == "--help" || s == "--help-all" {
-                print!("{FSCK_USAGE}");
-                return ParseControl::Exit(129);
+                return ParseControl::Exit(super::show_usage_status(FSCK_USAGE));
             }
             if let Some(long) = s.strip_prefix("--") {
                 match resolve_long(long) {
                     LongOutcome::Apply { idx, unset } => self.apply(idx, unset),
-                    // `parse_long_opt()` reports the reason with `error()` on
-                    // stderr and then returns `PARSE_OPT_HELP`, which
-                    // `parse_options_step()` routes to `show_usage:` —
-                    // `usage_with_options_internal(..., USAGE_TO_STDOUT)`. So the
-                    // block lands on **stdout** while its explanation is on
-                    // stderr, at 129. Printing no block at all was the divergence.
+                    // `parse_long_opt()` reports the reason with `error()` and
+                    // returns `PARSE_OPT_HELP_ERROR` (parse-options.c:578-586),
+                    // which `parse_options_step()` routes to `show_usage_stderr:`
+                    // — the block on stderr after its explanation, at 129.
                     LongOutcome::Ambiguous(msg) => {
                         eprintln!("{msg}");
-                        print!("{FSCK_USAGE}");
+                        eprint!("{FSCK_USAGE}");
                         return ParseControl::Exit(129);
                     }
                     LongOutcome::TakesNoValue(name) => {
@@ -1564,8 +1561,7 @@ impl Options {
                     match c {
                         'v' => self.verbose = true,
                         'h' => {
-                            print!("{FSCK_USAGE}");
-                            return ParseControl::Exit(129);
+                            return ParseControl::Exit(super::show_usage_status(FSCK_USAGE));
                         }
                         _ => {
                             eprint!("error: unknown switch `{c}'\n{FSCK_USAGE}");

@@ -950,7 +950,7 @@ struct Traversal<'r> {
 /// where git computes patch ids.
 pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `show_usage_if_asked(argc, argv, rev_list_usage)` (builtin/rev-list.c:711)
-    // fires before the repository is opened, prints to stdout and exits 129 —
+    // fires before the repository is opened, prints to stdout and exits 0 —
     // and only for a lone `-h`. Every other refusal is `usage()`, on stderr.
     if let Some(code) = super::show_usage_if_asked(args, USAGE) {
         return Ok(code);

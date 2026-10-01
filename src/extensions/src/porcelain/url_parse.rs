@@ -159,8 +159,7 @@ pub fn url_parse(args: &[String]) -> Result<ExitCode> {
         // `PARSE_OPT_HIDDEN` entry, so `USAGE_FULL` renders the same block `-h`
         // prints.
         if arg == "--help-all" {
-            print!("{USAGE}");
-            return Ok(ExitCode::from(129));
+            return Ok(super::show_usage(USAGE));
         }
         if arg.starts_with("--") {
             // Respell a unique abbreviation as the name it resolves to, so an
@@ -214,9 +213,8 @@ pub fn url_parse(args: &[String]) -> Result<ExitCode> {
         while j < bytes.len() {
             if bytes[j] == b'h' {
                 // parse-options answers `-h` wherever it appears, even after a
-                // URL, with the usage block on stdout and exit 129.
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                // URL, with the usage block on stdout and exit 0.
+                return Ok(super::show_usage(USAGE));
             }
             if bytes[j] != b'c' {
                 return Ok(unknown_opt("switch", &(bytes[j] as char).to_string()));

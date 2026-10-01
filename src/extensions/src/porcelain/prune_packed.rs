@@ -9,8 +9,8 @@
 //! does not sort, and neither does this port). The real run performs the same
 //! unlinks and the same trailing `rmdir` of each fan-out directory that
 //! `prune_subdir()` does, so post-command repository state matches. Usage text
-//! and exit code 129 for `-h`, an unknown option/switch, and a stray positional
-//! are reproduced byte-for-byte as well.
+//! and exit code (0 for `-h`; 129 for an unknown option/switch and a stray
+//! positional) are reproduced byte-for-byte as well.
 //!
 //! Membership is decided by `has_object_pack()` semantics: an object is pruned
 //! only when a *pack index* contains it — a loose-only object survives — and the
@@ -61,7 +61,7 @@ const LONG_OPTS: [&str; 2] = ["dry-run", "quiet"];
 ///   * `-n` / `--dry-run` / `--no-dry-run`  → list `rm -f <path>` instead of unlinking
 ///   * `-q` / `--quiet` / `--no-quiet`      → accepted; only ever gated a tty progress meter
 ///   * `-nq`, `--dry`, `--`                 → clustering, abbreviation, end-of-options
-///   * `-h`                                 → usage on stdout, exit 129
+///   * `-h`                                 → usage on stdout, exit 0
 pub fn prune_packed(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0; `prune-packed` takes no positional
     // of its own, so dropping a leading copy is unambiguous.
@@ -91,8 +91,7 @@ pub fn prune_packed(args: &[String]) -> Result<ExitCode> {
             // renders `USAGE_FULL` — the same block, this table having no
             // `PARSE_OPT_HIDDEN` entry.
             "-h" | "--help-all" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--help" => bail!("--help is not supported"),
             s if s.starts_with("--") => {
@@ -115,8 +114,7 @@ pub fn prune_packed(args: &[String]) -> Result<ExitCode> {
                         // OPT_NEGBIT: `-q` only ever cleared the progress bit.
                         'q' => {}
                         'h' => {
-                            print!("{USAGE}");
-                            return Ok(ExitCode::from(129));
+                            return Ok(super::show_usage(USAGE));
                         }
                         _ => return Ok(usage_error(&format!("error: unknown switch `{c}'\n"))),
                     }

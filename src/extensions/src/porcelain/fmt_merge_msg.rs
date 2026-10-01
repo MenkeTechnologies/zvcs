@@ -42,8 +42,8 @@
 //!     `--file=x --no-file` still opens `x` (checked against git 2.55, and
 //!     against `git commit -F x --no-file`, which behaves the same way).
 //!   * exit codes: 0 on success, 128 for a malformed input line, for an input
-//!     file that cannot be opened, and for an unborn `HEAD`; 129 for `-h`
-//!     (usage on stdout) and for a bad or extra argument (usage on stderr).
+//!     file that cannot be opened, and for an unborn `HEAD`; 0 for `-h`
+//!     (usage on stdout); 129 for a bad or extra argument (usage on stderr).
 //!     A positional argument is diagnosed after the whole command line is
 //!     parsed but before the input file is opened, as `parse_options`' `argc`
 //!     check runs there.
@@ -180,12 +180,10 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
     if args.len() == 1 {
         match args[0].as_str() {
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             "--help-all" => {
-                print!("{USAGE_ALL}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_ALL));
             }
             _ => {}
         }
@@ -217,16 +215,14 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
         };
         match a {
             "-h" => {
-                print!("{USAGE}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE));
             }
             // `if (internal_help && !strcmp(arg + 2, "help-all"))`
             // (parse-options.c:1122), an exact match tested ahead of
             // parse_long_opt(): never an abbreviation, never with an
             // `=<value>`, and rendered as `USAGE_FULL`.
             "--help-all" => {
-                print!("{USAGE_ALL}");
-                return Ok(ExitCode::from(129));
+                return Ok(super::show_usage(USAGE_ALL));
             }
             "--log" | "--summary" => shortlog_len = DEFAULT_MERGE_LOG_LEN,
             "--no-log" | "--no-summary" => shortlog_len = 0,

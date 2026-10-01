@@ -15,7 +15,7 @@
 //!   * literal `[--] <pathspec>...`, prefixed with the repo-relative cwd like
 //!     git does, with git's exact depth rule (`tree-diff.c:check_recursion_depth`)
 //!   * C-style path quoting (`core.quotePath`) for the newline-terminated form
-//!   * the argv diagnostics: `-h` (usage on stdout, exit 129), an unrecognised
+//!   * the argv diagnostics: `-h` (usage on stdout, exit 0), an unrecognised
 //!     option (`error: unknown last-modified argument:` + usage on stderr, 129),
 //!     `setup_revisions`' three `verify_filename`/`verify_non_filename` fatals,
 //!     and `last-modified can only operate on one commit at a time`
@@ -131,10 +131,8 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
             // `--help-all=x` fall through to the unknown-argument report.
             "-h" | "--help-all" => {
                 // `parse_options` writes the usage to stdout for an explicit
-                // `-h` and exits 129 with nothing on stderr.
-                print!("{USAGE}");
-                std::io::stdout().flush()?;
-                return Ok(ExitCode::from(129));
+                // `-h` and exits 0 with nothing on stderr.
+                return Ok(super::show_usage(USAGE));
             }
             "--" => only_paths = true,
             "-r" | "--recursive" => max_depth = -1,

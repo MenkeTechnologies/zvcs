@@ -74,7 +74,7 @@ fn a_refused_option_wins_over_a_bad_config_value() {
     assert_eq!(f.bad_abbrev(&["--path"]), (String::new(), "error: option `path' requires a value\n".into(), 129));
     let (out, _, code) = f.bad_abbrev(&["-h"]);
     assert!(out.starts_with("usage: git hash-object "), "{out}");
-    assert_eq!(code, 129);
+    assert_eq!(code, 0);
     // The same from outside any repository.
     let (_, err, code) = f.run(&["-C", "/", "-c", "core.abbrev=bogus", "hash-object", "--bogus"]);
     assert_eq!(code, 129);

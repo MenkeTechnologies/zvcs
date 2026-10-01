@@ -2030,8 +2030,10 @@ fn utf8_len(b: u8) -> usize {
     }
 }
 
-/// `handle_ansi_sequence()` (sideband.c:157) for the default
-/// `ALLOW_ANSI_COLOR_SEQUENCES`: `ESC [ [<n> [; <n>]*] m` and nothing else.
+/// `handle_ansi_sequence()` (sideband.c:157-223, v2.56.0) for the default
+/// `ALLOW_ANSI_COLOR_SEQUENCES`: `ESC [ [<n> [; <n>]*] m` and nothing else, where
+/// each `<n>` may itself be colon-separated decimals (`38:5:196`, the 256-color
+/// and true-color forms), which 2.56 stopped escaping.
 /// Returns the sequence's length including the terminating `m`.
 fn ansi_color_sequence_len(src: &[u8]) -> Option<usize> {
     if src.len() < 3 || src[0] != 0x1b || src[1] != b'[' {
@@ -2041,7 +2043,7 @@ fn ansi_color_sequence_len(src: &[u8]) -> Option<usize> {
         if *b == b'm' {
             return Some(i + 1);
         }
-        if !b.is_ascii_digit() && *b != b';' {
+        if !b.is_ascii_digit() && *b != b':' && *b != b';' {
             return None;
         }
     }

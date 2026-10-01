@@ -1220,7 +1220,7 @@ pub fn send_pack(
     if sign_cert {
         cap_buf.push_str(" push-cert");
     }
-    cap_buf.push_str(&format!(" agent={}", agent()));
+    cap_buf.push_str(&format!(" agent={}", super::version::user_agent_sanitized()));
     // ```c
     // repo_config_get_bool(r, "transfer.advertisesid", &advertise_sid);
     // ...
@@ -2500,11 +2500,6 @@ pub(crate) fn expand_roots_ordered(repo: &gix::Repository, roots: &[ObjectId]) -
             roots.iter().copied().filter(|id| seen.insert(*id)).collect()
         }
     }
-}
-
-/// The `agent=` capability value git advertises, as `git/<version>`.
-fn agent() -> String {
-    format!("git/{}", env!("CARGO_PKG_VERSION"))
 }
 
 

@@ -3,8 +3,8 @@
 //! Stock's implementation is `builtin/version.c`: a one-option `parse_options`
 //! table followed by `printf("git version %s\n", git_version_string)`. The
 //! version string it prints is a build-time constant, so this port carries it
-//! as [`GIT_VERSION`], pinned to the same git release the rest of this crate
-//! reproduces (`receive_pack.rs`, `cvsserver.rs` pin the same constant).
+//! as [`GIT_VERSION`], the one definition every other version-bearing output in
+//! this crate reads.
 //!
 //! Covered, byte-identically with stock git:
 //!   * `git version` → `git version <GIT_VERSION>\n` on stdout, exit 0.
@@ -55,9 +55,12 @@ use super::{resolve_long, Arg, LongOpt, Resolved};
 
 /// The git version this port reproduces, as printed by `git version`.
 ///
-/// `diagnose.rs` heads its report with the same string; `git version` and
-/// `git diagnose` must never disagree about what this binary claims to be.
-pub(crate) const GIT_VERSION: &str = "2.55.0";
+/// This is the one definition. `git version`, `diagnose`/`bugreport`, the
+/// `agent=` capability ([`user_agent_sanitized`]), the format-patch signature and MIME
+/// boundary, `send-email`'s `X-Mailer:`, `cvsserver --version` and the
+/// trace2 `exe` field all read it, as every one of them reads
+/// `git_version_string` in git.
+pub(crate) const GIT_VERSION: &str = "2.56.0";
 
 /// `usage_with_options()` rendering of `builtin/version.c`'s option table,
 /// verbatim (including the blank line before the option list and the trailing
@@ -302,4 +305,77 @@ fn host_cpu() -> String {
 fn usage_error(msg: &str) -> ExitCode {
     eprint!("error: {msg}\n{USAGE}");
     ExitCode::from(129)
+
+/// `redact_non_printables()` (`version.c:19-27`): trim, then turn every byte
+/// that is not printable ASCII — and every space — into `.`.
+fn redact_non_printables(buf: &[u8]) -> String {
+    buf.trim_ascii()
+        .iter()
+        .map(|&b| match b.is_ascii_graphic() {
+            true => b as char,
+            false => '.',
+        })
+        .collect()
+}
+
+/// `git_user_agent()` (`version.c:29-40`): `$GIT_USER_AGENT` verbatim when set,
+/// else the Makefile's `GIT_USER_AGENT`, `git/$(GIT_VERSION)`.
+pub(crate) fn user_agent() -> String {
+    match std::env::var_os("GIT_USER_AGENT") {
+        Some(agent) => agent.to_string_lossy().into_owned(),
+        None => format!("git/{GIT_VERSION}"),
+    }
+}
+
+/// `git_user_agent_sanitized()` (`version.c:63-81`), the value every `agent=`
+/// capability carries (`connect.c:496,723`, `fetch-pack.c:418`,
+/// `send-pack.c:599`, `upload-pack.c:1226`, `serve.c:29`,
+/// `builtin/receive-pack.c:281`): [`user_agent`], plus `-<sysname>` when
+/// `GIT_USER_AGENT` is unset, with non-printables redacted.
+pub(crate) fn user_agent_sanitized() -> String {
+    let mut buf = user_agent().into_bytes();
+    if std::env::var_os("GIT_USER_AGENT").is_none() {
+        buf.push(b'-');
+        // `os_info()` (`version.c:47-61`) sanitizes its own copy first.
+        let mut sysname = Vec::new();
+        get_uname_info(&mut sysname, false);
+        buf.extend_from_slice(redact_non_printables(&sysname).as_bytes());
+    }
+    redact_non_printables(&buf)
+}
+
+/// `get_uname_info()` (`version.c:83-102`): `sysname\n`, or with `full`
+/// `sysname release version machine\n`. A failing `uname(2)` appends git's
+/// `uname() failed with error '<strerror>' (<errno>)` line and returns `false`.
+pub(crate) fn get_uname_info(buf: &mut Vec<u8>, full: bool) -> bool {
+    // SAFETY: `utsname` is plain old data; `uname` fills it in place.
+    let mut info: libc::utsname = unsafe { std::mem::zeroed() };
+    if unsafe { libc::uname(&mut info) } != 0 {
+        let err = std::io::Error::last_os_error();
+        let errno = err.raw_os_error().unwrap_or(0);
+        // SAFETY: `strerror` returns a NUL-terminated static string.
+        let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) };
+        buf.extend_from_slice(
+            format!(
+                "uname() failed with error '{}' ({errno})\n",
+                msg.to_string_lossy()
+            )
+            .as_bytes(),
+        );
+        return false;
+    }
+    let field = |f: &[libc::c_char]| {
+        // SAFETY: `uname` NUL-terminates every field.
+        unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }.to_bytes().to_vec()
+    };
+    buf.extend_from_slice(&field(&info.sysname));
+    if full {
+        for f in [&info.release[..], &info.version[..], &info.machine[..]] {
+            buf.push(b' ');
+            buf.extend_from_slice(&field(f));
+        }
+    }
+    buf.push(b'\n');
+    true
+}
 }

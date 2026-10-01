@@ -55,7 +55,7 @@ use super::diagnose::{self, LocalTime, Mode, Setup};
 use anyhow::Result;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 /// `usage_with_options()` output: the synopsis realigned under `usage: ` plus
 /// the option list. Printed to stdout for `-h`, to stderr for a parse error.
@@ -462,7 +462,11 @@ fn system_info(out: &mut String) {
     diagnose::version_info(out);
 
     out.push_str("uname: ");
-    out.push_str(&uname_info());
+    // `get_uname_info(sys_info, 1)` (`builtin/bugreport.c`), shared with the
+    // `agent=` capability through `version.rs`.
+    let mut uname = Vec::new();
+    super::version::get_uname_info(&mut uname, true);
+    out.push_str(&String::from_utf8_lossy(&uname));
 
     // `get_compiler_info()` (compat/compiler.h:10-26): no `__clang__`,
     // `__GNUC__` or `_MSC_VER` describes a Rust binary, so git's fallback is
@@ -488,22 +492,6 @@ fn libc_info() -> String {
     }
     #[allow(unreachable_code)]
     "no libc information available\n".to_string()
-}
-
-/// `get_uname_info(buf, 1)` —`sysname release version machine`, which is
-/// exactly what `uname -srvm` prints.
-///
-/// git calls `uname(2)` directly and reports `strerror`/`errno` on failure;
-/// running the tool instead leaves no errno to report, so the failure line says
-/// so in its own words rather than imitating git's.
-fn uname_info() -> String {
-    match Command::new("uname").arg("-srvm").output() {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            format!("{}\n", text.strip_suffix('\n').unwrap_or(&text))
-        }
-        _ => "unavailable (could not run `uname`)\n".to_string(),
-    }
 }
 
 /// `get_populated_hooks()` — every documented hook name that resolves to an

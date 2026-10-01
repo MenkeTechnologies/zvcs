@@ -20,7 +20,7 @@
 //!     `receive.advertiseAtomic`, `repack.useDeltaBaseOffset`,
 //!     `receive.certNonceSeed` (which adds `push-cert=<nonce>`) and
 //!     `receive.advertisePushOptions`, plus `object-format=<algo>` from the
-//!     repository's hash and `agent=` from `GIT_USER_AGENT` (see [`agent`]).
+//!     repository's hash and `agent=` from `GIT_USER_AGENT` (see [`super::version::user_agent_sanitized`]).
 //!   * **Hidden refs** — `transfer.hideRefs` and `receive.hideRefs` are applied
 //!     to the advertisement through `ref_is_hidden()` (last pattern wins, `!`
 //!     un-hides), and a push to a hidden ref is rejected with
@@ -220,9 +220,6 @@ usage: git receive-pack <git-dir>
                           alias of --http-backend-info-refs
 
 ";
-
-/// The git version this port reproduces, used to build the `agent=` capability.
-const GIT_VERSION: &str = "2.55.0";
 
 /// Parsed command line for a single `receive-pack` invocation.
 struct Opts {
@@ -601,28 +598,8 @@ fn capabilities(repo: &gix::Repository, config: &Config) -> String {
         caps.push_str(" push-options");
     }
     caps.push_str(&format!(" object-format={}", repo.object_hash()));
-    caps.push_str(&format!(" agent={}", agent()));
+    caps.push_str(&format!(" agent={}", super::version::user_agent_sanitized()));
     caps
-}
-
-/// git's `git_user_agent()`: `$GIT_USER_AGENT` when set, else
-/// `git/<version>-<uname -s>`.
-///
-/// The suffix is the kernel name git appends at runtime; the mapping below
-/// covers the platforms zvcs targets, and falls back to Rust's own OS name.
-pub(crate) fn agent() -> String {
-    if let Some(agent) = std::env::var_os("GIT_USER_AGENT") {
-        return agent.to_string_lossy().into_owned();
-    }
-    let sysname = match std::env::consts::OS {
-        "macos" => "Darwin",
-        "linux" => "Linux",
-        "freebsd" => "FreeBSD",
-        "netbsd" => "NetBSD",
-        "openbsd" => "OpenBSD",
-        other => other,
-    };
-    format!("git/{GIT_VERSION}-{sysname}")
 }
 
 /// Append one pkt-line: a four-digit hex length covering the header itself,

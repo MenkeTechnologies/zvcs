@@ -78,7 +78,7 @@ impl Fixture {
 }
 
 const TRAILER: &str = "\nbase-commit: 1abd72c2359c68370f2ab7d909a5e0cee80504f5\n\
-                       prerequisite-patch-id: abfc42adcd1ac1b0c35ceb534df50e69e6a84f0f\n-- \n2.55.0\n\n";
+                       prerequisite-patch-id: abfc42adcd1ac1b0c35ceb534df50e69e6a84f0f\n-- \n2.56.0\n\n";
 
 #[test]
 fn base_auto_uses_a_local_upstream() {

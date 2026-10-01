@@ -793,7 +793,7 @@ mod var;
 mod verify_commit;
 mod verify_pack;
 mod verify_tag;
-mod version;
+pub(crate) mod version;
 #[allow(non_snake_case)] // maps to git's `web--browse` subcommand
 mod web__browse;
 mod whatchanged;

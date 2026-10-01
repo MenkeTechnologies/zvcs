@@ -39,7 +39,7 @@ const EVENT_VERSION: &str = "4";
 
 /// The `exe` field of the `version` record — the git version this port serves,
 /// matching what `git version` prints.
-const GIT_VERSION: &str = "2.55.0";
+use crate::porcelain::version::GIT_VERSION;
 
 /// Sentinel file that parks a directory target once it holds too many traces.
 /// `tr2_dst.c`'s `DISCARD_SENTINEL_NAME`.

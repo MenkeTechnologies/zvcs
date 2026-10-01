@@ -1045,7 +1045,7 @@ fn advertised_refs(
         None => gix::protocol::LsRefsCommand::new(
             None,
             &handshake.capabilities,
-            ("agent", Some(gix::protocol::agent(gix::env::agent()))),
+            ("agent", Some(super::version::user_agent_sanitized())),
             server_options,
             None,
         )

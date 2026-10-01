@@ -1006,7 +1006,7 @@ fn capabilities(
         caps.push_str(" filter");
     }
     // One agent string for both servers: `git_user_agent_sanitized()`, ported in
-    // `receive_pack::agent` — `$GIT_USER_AGENT` when set, else
+    // `version::user_agent_sanitized` — `$GIT_USER_AGENT` when set, else
     // `git/<version>-<uname -s>`. Deriving it keeps `upload-pack` and
     // `receive-pack` from disagreeing about what this binary is, and keeps the
     // platform suffix honest off Darwin, which a literal cannot do.
@@ -1018,7 +1018,7 @@ fn capabilities(
     // itself depending on which protocol the client spoke.
     caps.push_str(&format!(
         " object-format={object_format} agent={}",
-        super::receive_pack::agent()
+        super::version::user_agent_sanitized()
     ));
     caps
 }
@@ -1746,7 +1746,7 @@ fn v2_advertisement(
     let cfg = V2Config::from_repo(repo);
     let mut out = Vec::new();
     pkt_line(&mut out, b"version 2\n");
-    pkt_line(&mut out, format!("agent={}\n", super::receive_pack::agent()).as_bytes());
+    pkt_line(&mut out, format!("agent={}\n", super::version::user_agent_sanitized()).as_bytes());
     match cfg.unborn {
         Unborn::Advertise => pkt_line(&mut out, b"ls-refs=unborn\n"),
         _ => pkt_line(&mut out, b"ls-refs\n"),

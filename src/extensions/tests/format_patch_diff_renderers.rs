@@ -478,7 +478,7 @@ fn line_prefix_follows_the_emitters_that_write_it() {
     assert!(prefixed.contains(">>diff --git a/src/gaps.txt b/src/gaps.txt\n"), "{prefixed}");
     assert!(prefixed.contains(">>+L1\n"), "{prefixed}");
     // `print_signature()` writes straight to the file with no prefix in front.
-    assert!(prefixed.ends_with("\n-- \n2.55.0\n\n"), "{prefixed}");
+    assert!(prefixed.ends_with("\n-- \n2.56.0\n\n"), "{prefixed}");
     // Dropping the prefix from every line is exactly the unprefixed patch.
     let stripped: String = prefixed
         .split_inclusive('\n')

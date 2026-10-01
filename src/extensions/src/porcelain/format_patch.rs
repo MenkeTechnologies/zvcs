@@ -413,7 +413,7 @@ Messaging
 /// signature line comparable; override per-invocation with `--signature=<s>`,
 /// `--no-signature`, `--signature-file`, or the
 /// `format.signature`/`format.signatureFile` config keys.
-const SIGNATURE_VERSION: &str = "2.55.0";
+const SIGNATURE_VERSION: &str = super::version::GIT_VERSION;
 
 /// git's `MAIL_DEFAULT_WRAP` — the diffstat width used by format-patch.
 const MAIL_DEFAULT_WRAP: i64 = 72;

@@ -58,8 +58,8 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::ExitCode;
 
-/// The git version this port reproduces, as printed by `--version`.
-const GIT_VERSION: &str = "2.55.0";
+/// The version printed by `--version`: the script's `@GIT_VERSION@` substitution.
+use super::version::GIT_VERSION;
 
 /// `$usage` from `git-cvsserver.perl:111-123`, verbatim.
 const USAGE: &str = concat!(

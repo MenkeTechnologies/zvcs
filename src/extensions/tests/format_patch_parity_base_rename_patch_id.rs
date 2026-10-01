@@ -85,7 +85,7 @@ fn renamed_prerequisites_hash_under_both_names() {
         out.ends_with(
             "\nbase-commit: 637c5baeeea0ff24d65872d69621eac222e7eb45\n\
              prerequisite-patch-id: 721eef913c7f2068b12dbddfee2143c3bc294fa2\n\
-             prerequisite-patch-id: cb2edc06553f8551c5417473680ce8bc0d0b6a51\n-- \n2.55.0\n\n"
+             prerequisite-patch-id: cb2edc06553f8551c5417473680ce8bc0d0b6a51\n-- \n2.56.0\n\n"
         ),
         "{out}"
     );
@@ -98,7 +98,7 @@ fn diff_renames_false_hashes_a_deletion_and_a_creation() {
     assert!(
         out.ends_with(
             "prerequisite-patch-id: f84ea6a25733f21f812f4b00a322526ba9e91c9a\n\
-             prerequisite-patch-id: c81d488eb7d2eb78290c19da919f3be67d91c61c\n-- \n2.55.0\n\n"
+             prerequisite-patch-id: c81d488eb7d2eb78290c19da919f3be67d91c61c\n-- \n2.56.0\n\n"
         ),
         "{out}"
     );

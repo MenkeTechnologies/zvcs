@@ -3332,8 +3332,8 @@ fn last_reply_line(message: &str) -> &str {
     }
 }
 
-/// The `X-Mailer:` version. The script substitutes git's own version here.
-const GIT_VERSION: &str = "2.55.0";
+/// The `X-Mailer:` version: the script's `@GIT_VERSION@` substitution.
+use super::version::GIT_VERSION;
 
 /// The block printed once when the Cc list grew on its own.
 const INFORM: &str = concat!(

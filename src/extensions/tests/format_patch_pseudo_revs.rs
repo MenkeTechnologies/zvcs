@@ -323,7 +323,7 @@ fn a_formatted_merge_carries_no_diff_body() {
                  Subject: [PATCH] M\n\
                  \n\
                  -- \n\
-                 2.55.0\n\n"
+                 2.56.0\n\n"
             ),
             "{extra:?}"
         );

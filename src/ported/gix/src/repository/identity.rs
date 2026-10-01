@@ -136,7 +136,16 @@ impl Personas {
                     config_date
                         .to_str()
                         .ok()
-                        .and_then(|date| gix_date::parse(date, Some(SystemTime::now())).ok())
+                        // `fmt_ident()` hands `GIT_<ROLE>_DATE` to `parse_date()` (ident.c:534), which is
+                        // `parse_date_basic()` alone (date.c:979-987) — no approxidate fallback. So
+                        // `@1700000000+0000`, which is not the object-header form, still reads as the
+                        // epoch seconds followed by a zone.
+                        .and_then(|date| {
+                            let now = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs() as gix_date::SecondsSinceUnixEpoch);
+                            gix_date::parse::parse_date_basic(date, now)
+                        })
                 })
                 .or_else(|| Some(gix_date::Time::now_local_or_utc()))
                 .map(|time| time.format_or_unix(gix_date::time::Format::Raw))

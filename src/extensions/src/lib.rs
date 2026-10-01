@@ -202,7 +202,7 @@ pub enum Handled {
 ///   option, `--html-path`, `--man-path` and `--info-path` print one directory
 ///   and exit 0, ignoring everything after them.
 /// * The loop can consume the entire command line. `--shallow-file` takes the
-///   next token unconditionally (`git --shallow-file log` uses `log` as the
+///   next token whatever it is (`git --shallow-file log` uses `log` as the
 ///   file name), and `--bare` needs no argument at all, so reaching the end
 ///   with no verb left is a normal outcome — `cmd_main` prints the usage block
 ///   and exits 1 for it.
@@ -449,18 +449,17 @@ pub fn handle_options(
             // environment spelling of this setting worked while the flag did
             // not: the flag was consumed and dropped.
             //
-            // The C takes the next token without checking that there is one:
-            // `git --shallow-file` alone reads past the end of `argv` and stock
-            // 2.55.0 dies of the signal (observed exit 139). The bounds test here
-            // is the one deliberate departure — a NULL dereference is not a
-            // behaviour to reproduce — and leaves the command line empty, which
-            // `cmd_main` answers with the usage block and exit 1.
+            // 2.56 sets `GIT_SHALLOW_FILE` the same way (git.c:306-315) and
+            // checks for the value first, as `-C` does: a bare `--shallow-file`
+            // is "no file given for '--shallow-file' option" plus the usage
+            // synopsis, exit 129.
             "--shallow-file" => {
-                if let Some(path) = argv.get(idx + 1) {
-                    std::env::set_var("GIT_SHALLOW_FILE", path);
-                }
+                let Some(path) = argv.get(idx + 1) else {
+                    return Handled::Exit(usage_missing_value("no file given for '--shallow-file' option"));
+                };
+                std::env::set_var("GIT_SHALLOW_FILE", path);
                 *envchanged = true;
-                idx += if idx + 1 < argv.len() { 2 } else { 1 };
+                idx += 2;
             }
             // `-C <path>` chdirs, guarded by `if ((*argv)[1][0])` — an empty path
             // is a deliberate no-op that succeeds and stays put, and does *not*

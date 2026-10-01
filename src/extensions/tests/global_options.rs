@@ -127,6 +127,8 @@ fn a_global_option_without_its_value_is_usage_129() {
         ("--git-dir", "no directory given for '--git-dir' option"),
         ("--work-tree", "no directory given for '--work-tree' option"),
         ("--namespace", "no namespace given for --namespace"),
+        // 2.56 (git.c:306-310) checks for the value; 2.55 read past argv.
+        ("--shallow-file", "no file given for '--shallow-file' option"),
     ] {
         let out = run(&repo, &[arg]);
         assert_eq!(code(&out), 129, "{arg}: stderr: {}", stderr(&out));

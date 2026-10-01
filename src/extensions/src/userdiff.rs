@@ -64,7 +64,7 @@
 use gix::bstr::{BStr, ByteSlice};
 
 // ---------------------------------------------------------------------------
-// the built-in driver table (userdiff.c:45-372)
+// the built-in driver table (userdiff.c:45-382)
 // ---------------------------------------------------------------------------
 
 /// One entry of `builtin_drivers[]`, reduced to the fields this port reads.
@@ -96,7 +96,7 @@ struct Builtin {
     word_regex: &'static str,
 }
 
-/// `builtin_drivers[]` (userdiff.c:45-372), in git's order. Only drivers carrying a
+/// `builtin_drivers[]` (userdiff.c:45-382), in git's order. Only drivers carrying a
 /// funcname pattern appear — `default`, `driver_true` (`diff`) and `driver_false`
 /// (`-diff`) have none, and answer `None` here as they do in git.
 const BUILTIN: &[Builtin] = &[
@@ -126,6 +126,7 @@ const BUILTIN: &[Builtin] = &[
     Builtin { name: "ruby", pattern: "^[ \t]*((class|module|def)[ \t].*)$", icase: false, word_regex: "(@|@@|\\$)?[a-zA-Z_][a-zA-Z0-9_]*|[-+0-9.e]+|0[xXbB]?[0-9a-fA-F]+|\\?(\\\\C-)?(\\\\M-)?.|//=?|[-+*/<>%&^|=!]=|<<=?|>>=?|===|\\.{1,3}|::|[!=]~|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
     Builtin { name: "rust", pattern: "^[\t ]*((pub(\\([^\\)]+\\))?[\t ]+)?((async|const|unsafe|extern([\t ]+\"[^\"]+\"))[\t ]+)?(struct|enum|union|mod|trait|fn|impl|macro_rules!)[< \t]+[^;]*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|[0-9][0-9_a-fA-Fiosuxz]*(\\.([0-9]*[eE][+-]?)?[0-9_fF]*)?|[-+*\\/<>%&^|=!:]=|<<=?|>>=?|&&|\\|\\||->|=>|\\.{2}=|\\.{3}|::|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
     Builtin { name: "scheme", pattern: "^(\\(.*)$\n^[\t ]*(\\(((define|def(struct|syntax|class|method|rules|record|proto|alias)?)[-*/ \t]|(library|module|struct|class)[*+ \t]).*)$\n^  ?(\\([Dd][Ee][Ff].*)$", icase: false, word_regex: "\\|([^|\\\\]|\\\\.)*\\||([^][)(}{ \t])+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
+    Builtin { name: "swift", pattern: "^[ \t]*((@[A-Za-z_][A-Za-z0-9_]*(\\([^()]*\\))?[ \t]+)*([a-z]+[ \t]+)*(func|init|deinit|subscript|class|struct|enum|protocol|extension|actor)[ \t(?!<].*)$", icase: false, word_regex: "[a-zA-Z_][a-zA-Z0-9_]*|0[xX][0-9a-fA-F_]+|0[oO][0-7_]+|0[bB][01_]+|[0-9][0-9_]*([.][0-9_]+)?([eE][-+]?[0-9]+)?|[-+*/%<>=!&|^~?]=|&&|\\|\\||<<=?|>>=?|\\?\\?|\\.\\.[.<]|->|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
     Builtin { name: "tex", pattern: "^(\\\\((sub)*section|chapter|part)\\*{0,1}\\{.*)$", icase: false, word_regex: "\\\\[a-zA-Z@]+|\\\\.|([a-zA-Z0-9]|[^\x01-\x7f])+|[^[:space:]]|[\\xc0-\\xff][\\x80-\\xbf]+" },
 ];
 

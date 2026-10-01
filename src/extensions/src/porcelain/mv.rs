@@ -283,6 +283,23 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             .map(|s| normalize_rel(&workdir, Path::new(under), dup_basename(s)))
             .collect()
     };
+    // `path_in_sparse_checkout()` is the very last gate git applies, after
+    // every other check has passed, so that it can point at `--sparse`.
+    let sparsity = if repo
+        .config_snapshot()
+        .boolean("core.sparseCheckout")
+        .unwrap_or(false)
+    {
+        Some(super::sparse_checkout::load_sparsity(&repo)?)
+    } else {
+        None
+    };
+    // git's `dst_mode = SPARSE` (builtin/mv.c:298-299): a single destination
+    // that is a file outside a *cone-mode* definition
+    // (`path_in_cone_mode_sparse_checkout()` answers 1 for a non-cone or
+    // non-sparse worktree). The checking loop reads it through
+    // `needs_worktree_rename()`.
+    let mut dst_sparse = false;
     let dst_rels = if dest_rel.is_empty() {
         into_dir(&dest_rel)
     } else if std::fs::symlink_metadata(workdir.join(&dest_rel)).is_ok_and(|m| m.is_dir()) {
@@ -290,6 +307,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     } else if sources.len() != 1 {
         return fatal(format!("destination '{dest_rel}' is not a directory"));
     } else {
+        dst_sparse = sparsity.as_ref().is_some_and(|sp| sp.is_cone() && !sp.includes(&dest_rel));
         Ok(vec![dest_rel.clone()])
     };
     let dst_rels = match dst_rels {
@@ -301,18 +319,6 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //    Without `-k` the first failure aborts before ANY disk/index mutation,
     //    matching git's all-or-nothing behavior. With `-k` a failing source is
     //    silently skipped and the command still succeeds.
-    //
-    //    `path_in_sparse_checkout()` is the very last gate git applies, after
-    //    every other check has passed, so that it can point at `--sparse`.
-    let sparsity = if repo
-        .config_snapshot()
-        .boolean("core.sparseCheckout")
-        .unwrap_or(false)
-    {
-        Some(super::sparse_checkout::load_sparsity(&repo)?)
-    } else {
-        None
-    };
     // git's `ignore_case`, which `core.ignorecase` sets and `git init` records
     // from what the filesystem turned out to be.
     let ignore_case = repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false);
@@ -335,6 +341,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
             dry_run,
             verbose,
             &src_for_dst,
+            dst_sparse,
         ) {
             Ok(Planned::SparseSkip(src)) => only_match_skip_worktree.push(src),
             Ok(Planned::Move(plan)) => {
@@ -463,76 +470,104 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
 
     // 6. Apply phase — print the same lines git prints, then (unless dry-run)
     //    rename on disk and remap the index entries.
+    //
+    //    git walks `sources` in order, and a directory source's expansion was
+    //    appended to its *end* (`MOVE_VIA_PARENT_DIR`, builtin/mv.c:394-410), so
+    //    every named source is announced and renamed first and the entries that
+    //    moved with a directory come after all of them, each remapped in the
+    //    index alone (its mode is `INDEX`, so `needs_worktree_rename()` is false).
     let mut modified = false;
     let mut gitmodules_modified = false;
     // Destinations a `--sparse` move brought back into the cone, checked out once
     // the index that describes them has been written.
     let mut materialize: Vec<String> = Vec::new();
     for plan in &plans {
+        // ```c
+        // if (show_only || verbose)
+        //         printf(_("Renaming %s to %s\n"), src, dst);
+        // if (show_only)
+        //         continue;
+        // if (needs_worktree_rename(mode, dst_mode) &&
+        //     rename(src, dst) < 0) {
+        //         if (ignore_errors)
+        //                 continue;
+        //         die_errno(_("renaming '%s' to '%s' failed"), src, dst);
+        // }
+        // ```
+        //
+        // (builtin/mv.c:585-594.) 2.56 names the destination as well as the
+        // source. Under `-k` the failed entry is dropped — but only that entry: a
+        // directory's own entry has no index work anyway, and the entries
+        // expanded from it are separate entries that still reach
+        // `rename_index_entry_at()` below.
         if verbose || dry_run {
-            // ```c
-            // if (show_only || verbose)
-            //         printf(_("Renaming %s to %s\n"), src, dst);
-            // ```
-            //
-            // (builtin/mv.c:543-544.) A directory source stays in the list *and* every
-            // index entry under it is appended as an entry of its own
-            // (`MOVE_VIA_PARENT_DIR`, builtin/mv.c:394-407), so the report names the
-            // directory and then each file that moved with it.
             println!("Renaming {} to {}", plan.src_rel, plan.dst_rel);
-            // A submodule source returns at builtin/mv.c:370, before the
-            // expansion that appends the directory's index entries, so it has no
-            // second line — its `remaps` list holds only the gitlink entry, which
-            // *is* the move already announced above. Printing it again gave
-            // `git mv -v mod mod2` two identical `Renaming mod to mod2` lines.
-            if plan.is_dir && plan.submodule.is_none() {
-                for (old, new) in &plan.remaps {
-                    println!("Renaming {old} to {new}");
+        }
+        if dry_run {
+            continue;
+        }
+        // A `SPARSE` move has nothing on disk to rename; `act_on_entry` goes
+        // straight to the index remap for it (builtin/mv.c:507-515).
+        if !plan.index_only {
+            if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
+                if skip {
+                    continue;
                 }
+                return fatal(format!(
+                    "renaming '{}' to '{}' failed: {}",
+                    plan.src_rel,
+                    plan.dst_rel,
+                    super::config::errno_text(&e)
+                ));
             }
         }
-        if !dry_run {
-            // A `SPARSE` move has nothing on disk to rename; `act_on_entry` goes
-            // straight to the index remap for it (builtin/mv.c:507-515).
-            if !plan.index_only {
-                if let Err(e) = std::fs::rename(&plan.src_abs, &plan.dst_abs) {
-                    return fatal(format!(
-                        "renaming '{}' failed: {}",
-                        plan.src_rel,
-                        super::config::errno_text(&e)
-                    ));
-                }
+        if let Some(gitfile) = &plan.submodule {
+            // `update_path_in_gitmodules()` then, for a `.git`-file
+            // submodule, `connect_work_tree_and_git_dir()`.
+            if update_path_in_gitmodules(&workdir, &plan.src_rel, &plan.dst_rel)? {
+                gitmodules_modified = true;
             }
-            if let Some(gitfile) = &plan.submodule {
-                // `update_path_in_gitmodules()` then, for a `.git`-file
-                // submodule, `connect_work_tree_and_git_dir()`.
-                if update_path_in_gitmodules(&workdir, &plan.src_rel, &plan.dst_rel)? {
-                    gitmodules_modified = true;
-                }
-                if let Some(git_dir) = gitfile {
-                    connect_work_tree_and_git_dir(&plan.dst_abs, git_dir)?;
-                }
+            if let Some(git_dir) = gitfile {
+                connect_work_tree_and_git_dir(&plan.dst_abs, git_dir)?;
             }
-            apply_remaps(&mut index, &plan.remaps);
-            modified = true;
-            // ```c
-            // if ((mode & SPARSE) &&
-            //     path_in_sparse_checkout(dst, the_repository->index)) {
-            //         /* from out-of-cone to in-cone */
-            //         dst_ce->ce_flags &= ~CE_SKIP_WORKTREE;
-            //         if (checkout_entry(dst_ce, &state, NULL, NULL))
-            //                 die(_("cannot checkout %s"), dst_ce->name);
-            // }
-            // ```
-            //
-            // (`builtin/mv.c:585-595`, under `ignore_sparse && cone`.) A path moved
-            // out of the excluded cone belongs in the worktree again, so the entry
-            // loses `skip-worktree` and the file is written out.
-            if plan.index_only
-                && sparsity.as_ref().is_some_and(|sp| sp.is_cone() && sp.includes(&plan.dst_rel))
-            {
-                clear_skip_worktree(&mut index, &plan.dst_rel);
-                materialize.push(plan.dst_rel.clone());
+        }
+        // `if (mode & (WORKING_DIRECTORY | SKIP_WORKTREE_DIR)) continue;`
+        // (builtin/mv.c:604-605): a directory's entries are remapped in the
+        // second pass. A submodule source returns at builtin/mv.c:370, before
+        // the expansion, so its `remaps` is the gitlink entry itself.
+        if plan.is_dir && plan.submodule.is_none() {
+            continue;
+        }
+        apply_remaps(&mut index, &plan.remaps);
+        modified = true;
+        // ```c
+        // if ((mode & SPARSE) &&
+        //     path_in_sparse_checkout(dst, the_repository->index)) {
+        //         /* from out-of-cone to in-cone */
+        //         dst_ce->ce_flags &= ~CE_SKIP_WORKTREE;
+        //         if (checkout_entry(dst_ce, &state, NULL, NULL))
+        //                 die(_("cannot checkout %s"), dst_ce->name);
+        // }
+        // ```
+        //
+        // (`builtin/mv.c:585-595`, under `ignore_sparse && cone`.) A path moved
+        // out of the excluded cone belongs in the worktree again, so the entry
+        // loses `skip-worktree` and the file is written out.
+        if plan.index_only
+            && sparsity.as_ref().is_some_and(|sp| sp.is_cone() && sp.includes(&plan.dst_rel))
+        {
+            clear_skip_worktree(&mut index, &plan.dst_rel);
+            materialize.push(plan.dst_rel.clone());
+        }
+    }
+    for plan in plans.iter().filter(|p| p.is_dir && p.submodule.is_none()) {
+        for remap @ (old, new) in &plan.remaps {
+            if verbose || dry_run {
+                println!("Renaming {old} to {new}");
+            }
+            if !dry_run {
+                apply_remaps(&mut index, std::slice::from_ref(remap));
+                modified = true;
             }
         }
     }
@@ -602,6 +637,8 @@ fn plan_source(
     // git's `src_for_dst`: the destinations of the file moves already accepted
     // by this run, which is what makes a second source for one target an error.
     src_for_dst: &std::collections::BTreeSet<String>,
+    // git's `dst_mode & SPARSE`, see the call site.
+    dst_sparse: bool,
 ) -> Result<Planned> {
     let src_abs = workdir.join(&src_rel);
     let dst_abs = workdir.join(&dst_rel);
@@ -853,16 +890,69 @@ fn plan_source(
                 "destination directory does not exist, source={src_rel}, destination={dst_rel}"
             ));
         }
+        // ```c
+        // if (has_symlink_leading_path(dst, strlen(dst))) {
+        //         bad = _("destination is beyond a symbolic link");
+        //         goto act_on_entry;
+        // }
+        // ```
+        //
+        // (builtin/mv.c:453-456, new in 2.56.) A destination reached through a
+        // symlinked directory — `git mv README.md lnk/` with `lnk` a symlink to
+        // `src` — would put the file in the directory the link names while the
+        // index recorded `lnk/README.md`.
+        if super::check_ignore::has_symlink_leading_path(workdir, BStr::new(dst_rel.as_bytes())) {
+            return Err(anyhow!(
+                "destination is beyond a symbolic link, source={src_rel}, destination={dst_rel}"
+            ));
+        }
+        // ```c
+        // if (needs_worktree_rename(modes[i], dst_mode)) {
+        //         const char *slash_ = strrchr(dst, '/');
+        //
+        //         if (slash_) {
+        //                 …
+        //                 *slash = '\0';
+        //                 if (lstat(dst_dir, &dir_st) < 0) {
+        //                         if (errno == ENOENT || errno == ENOTDIR)
+        //                                 bad = _("destination directory does not exist");
+        //                 } else if (!S_ISDIR(dir_st.st_mode)) {
+        //                         bad = _("destination is not a directory");
+        //                 }
+        //                 …
+        //         }
+        //
+        //         if (bad)
+        //                 goto act_on_entry;
+        // }
+        // ```
+        //
+        // (builtin/mv.c:458-487, new in 2.56.) A source that reaches this point
+        // carries no mode bit of its own, so only `dst_mode`'s `SPARSE` stands
+        // the check down. Being a `bad`, a missing leading directory is now
+        // reported by `-n` and skipped by `-k`, where 2.55 only found out at
+        // `rename()` time. Any other `lstat()` failure falls through to
+        // `rename()`, which reports it.
+        if !dst_sparse {
+            if let Some(slash) = dst_rel.rfind('/') {
+                let bad = match std::fs::symlink_metadata(workdir.join(&dst_rel[..slash])) {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            || e.raw_os_error() == Some(libc::ENOTDIR) =>
+                    {
+                        Some("destination directory does not exist")
+                    }
+                    Err(_) => None,
+                    Ok(m) if !m.is_dir() => Some("destination is not a directory"),
+                    Ok(_) => None,
+                };
+                if let Some(bad) = bad {
+                    return Err(anyhow!("{bad}, source={src_rel}, destination={dst_rel}"));
+                }
+            }
+        }
         vec![(src_rel.clone(), dst_rel.clone())]
     };
-
-    // Fail early (before any mutation) if the destination's parent is missing,
-    // so the abort stays atomic instead of surfacing mid-rename.
-    if let Some(parent) = dst_abs.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            crate::git_fatal!("renaming '{src_rel}' failed: No such file or directory");
-        }
-    }
 
     let is_dir = meta.is_dir();
     Ok(Planned::Move(Plan {

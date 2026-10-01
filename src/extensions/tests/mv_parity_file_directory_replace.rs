@@ -1,11 +1,13 @@
 //! `rename_index_entry_at()` re-adds each moved entry with
 //! `ADD_CACHE_OK_TO_REPLACE` (read-cache.c:182-185), so
 //! `check_file_directory_conflict()` drops an entry that names a leading
-//! directory of the new path. `git mv README.md lnk/` through a tracked symlink
-//! `lnk` to a directory therefore removes the `lnk` entry. The port kept it, and
+//! directory of the new path. `git mv README.md lnk/` where the tracked symlink
+//! `lnk` has been replaced on disk by a directory therefore removes the `lnk`
+//! entry. The port kept it, and
 //! the index then held both `lnk` and `lnk/README.md`.
 //!
-//! Measured against git 2.55.0.
+//! Measured against git 2.56.0, which refuses the move while `lnk` is still a
+//! symlink (builtin/mv.c:453-456).
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -58,6 +60,18 @@ impl Drop for Fixture {
 #[test]
 fn moving_into_a_tracked_symlink_replaces_its_entry() {
     let fx = Fixture::new("lnk");
+    // 2.56 refuses a destination reached through the symlink itself
+    // (`has_symlink_leading_path()`, builtin/mv.c:453-456) …
+    let out = fx.run(&["mv", "README.md", "lnk/"]);
+    assert_eq!(out.status.code(), Some(128));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "fatal: destination is beyond a symbolic link, source=README.md, destination=lnk/README.md\n"
+    );
+    // … so the entry in the way is a tracked symlink that is a real directory on
+    // disk by the time of the move.
+    std::fs::remove_file(fx.dir.join("lnk")).unwrap();
+    std::fs::create_dir(fx.dir.join("lnk")).unwrap();
     fx.ok(&["mv", "README.md", "lnk/"]);
     assert_eq!(fx.ok(&["ls-files"]), "dir/f\nlnk/README.md\n");
     // The index is one stock can write a tree from; with both `lnk` and

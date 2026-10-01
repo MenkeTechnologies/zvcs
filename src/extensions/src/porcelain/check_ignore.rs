@@ -511,7 +511,7 @@ fn flush_then_fatal(out: &[u8], msg: &str) -> ExitCode {
 ///
 /// The `lstat()`s are relative to the top of the work tree, which is where
 /// `setup_git_directory()` left the process.
-fn has_symlink_leading_path(root_abs: &Path, path: &BStr) -> bool {
+pub(super) fn has_symlink_leading_path(root_abs: &Path, path: &BStr) -> bool {
     let bytes = path.as_bytes();
     let mut start = 0;
     while let Some(off) = bytes[start..].iter().position(|&b| b == b'/') {

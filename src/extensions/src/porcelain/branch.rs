@@ -1042,6 +1042,20 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     // through `validate_branchname()` (branch.c:375). A `--list` pattern is not
     // an operand and is left alone, and neither is a creation's `<start-point>`,
     // which `dwim_branch_start()` resolves as an object name instead.
+    //
+    // `delete_branches()` picks its namespace from `filter.kind` before it
+    // interprets a single operand (builtin/branch.c:237-258), and `-a` is
+    // neither of the two it accepts:
+    //
+    // ```c
+    // default:
+    //         die(_("cannot use -a with -d"));
+    // ```
+    //
+    // `cmd_branch()`'s "branch name required" (:859-860) still comes first.
+    if o.delete && !o.names.is_empty() && o.mode == ListMode::All {
+        return fatal("cannot use -a with -d");
+    }
     if !o.names.is_empty() && !listing && !o.show_current {
         let allowed = match o.delete && o.mode == ListMode::Remotes {
             true => Interpret::Remote,

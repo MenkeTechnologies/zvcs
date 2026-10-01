@@ -647,9 +647,11 @@ struct Opts {
     colopts: u32,
     /// `--abbrev=<n>` for `-v`: `None` = configured default, `Some(0)` = full hash.
     abbrev: Option<usize>,
-    // Reachability filters (each entry is a raw rev spec, resolved at list time).
-    contains: Vec<String>,
-    no_contains: Vec<String>,
+    /// `--contains`/`--no-contains` (and the hidden `--with`/`--without`) are
+    /// `parse_opt_commits()` (parse-options-cb.c:89-105), which resolves the
+    /// operand while argv is being parsed and keeps the commit, so these hold ids.
+    contains: Vec<ObjectId>,
+    no_contains: Vec<ObjectId>,
     /// `--merged`/`--no-merged` are the two that resolve during `parse_options()`
     /// rather than at list time, so they hold commit ids and not specs:
     /// `parse_opt_merge_filter()` (ref-filter.c:3735-3757) calls `repo_get_oid()`
@@ -660,7 +662,9 @@ struct Opts {
     /// `git branch --merged HEAD@{<old>}` where git prints one.
     merged: Vec<ObjectId>,
     no_merged: Vec<ObjectId>,
-    points_at: Vec<String>,
+    /// `--points-at` is `parse_opt_object_name()` (parse-options-cb.c:126-140),
+    /// another parse-time callback: it appends the id it resolved.
+    points_at: Vec<ObjectId>,
     /// `--omit-empty`: drop a formatted line that rendered to nothing, rather
     /// than printing its bare newline (`format.array_opts.omit_empty`).
     omit_empty: bool,
@@ -1199,8 +1203,21 @@ fn apply_long(
         ("all", _) => o.mode = ListMode::All,
         // `--with` / `--without` are the hidden aliases of `--contains` /
         // `--no-contains`, sharing their `filter.with_commit` slot.
-        ("contains" | "with", _) => o.contains.push(val()),
-        ("no-contains" | "without", _) => o.no_contains.push(val()),
+        // `parse_opt_commits()` resolves the operand in argv order, and its
+        // `return error(...)` is `PARSE_OPT_ERROR`: 129 before any later
+        // option is looked at, `--points-at` and `--merged` included.
+        ("contains" | "with" | "no-contains" | "without", _) => {
+            let spec = val();
+            let repo = crate::setup::discover()?;
+            let id = match crate::objname::parse_opt_commits(&repo, &spec) {
+                Ok(id) => id,
+                Err(e) => return Ok(Some(e.report())),
+            };
+            match opt.name {
+                "contains" | "with" => o.contains.push(id),
+                _ => o.no_contains.push(id),
+            }
+        }
         // `OPT_MERGED`/`OPT_NO_MERGED` run `parse_opt_merge_filter()`
         // (ref-filter.c:3735-3757) while argv is still being parsed, so its
         // `die(_("malformed object name %s"))` and its `option `%s' must point
@@ -1253,7 +1270,14 @@ fn apply_long(
             o.sorts.clear();
             o.sort_cleared = true;
         }
-        ("points-at", false) => o.points_at.push(val()),
+        ("points-at", false) => {
+            let spec = val();
+            let repo = crate::setup::discover()?;
+            match crate::objname::parse_opt_object_name(&repo, &spec) {
+                Ok(id) => o.points_at.push(id),
+                Err(e) => return Ok(Some(e.report())),
+            }
+        }
         ("points-at", true) => o.points_at.clear(),
         // `OPT_COLUMN`: a bad `<style>` token is the callback's own error.
         ("column", n) => {
@@ -1620,13 +1644,8 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // `do_filter_refs()` appended it: last.
     let detached_head_first = !sorts.is_empty();
 
-    // Resolve every reachability filter before walking refs. The operand's own
-    // callback decides the diagnostic and the status — 129 for the two that
-    // return `PARSE_OPT_ERROR`, 128 for `--merged`'s outright `die()`.
-    let filters = match resolve_filters(repo, o) {
-        Ok(f) => f,
-        Err(e) => return Ok(e.report()),
-    };
+    // Every reachability filter was resolved by its option callback.
+    let filters = resolve_filters(o);
 
     let colors = resolve_colors(repo, o.color);
 
@@ -1855,41 +1874,22 @@ fn emit_columns(colopts: u32, cells: Vec<Vec<u8>>) {
     let _ = std::io::stdout().write_all(&bytes);
 }
 
-/// Resolve the `--contains`/`--no-contains`/`--points-at` operands, and carry
-/// the `--merged`/`--no-merged` ids the option callback already resolved.
+/// The reachability and points-at filters, all resolved during option parsing.
 ///
-/// git does this from three different `parse_options()` callbacks, and they do
-/// not share a diagnostic: `OPT_CONTAINS` is `parse_opt_commits`, `OPT_MERGED`
+/// git resolves them from three different `parse_options()` callbacks, and they
+/// do not share a diagnostic: `OPT_CONTAINS` is `parse_opt_commits`, `OPT_MERGED`
 /// is `parse_opt_merge_filter`, and `--points-at` is `parse_opt_object_name`
 /// (which never peels and never consults the odb, so it accepts an absent id and
-/// simply matches nothing). Routing all five through one resolver is what made
-/// every one of them report `fatal: malformed object name` at 128.
-///
-/// Only two of the three run here. `parse_opt_merge_filter()` stores the commit
-/// it looked up (ref-filter.c:3752-3754), so `--merged` is resolved exactly once,
-/// while `OPT_CONTAINS` keeps the spec in `filter.with_commit` for list time.
-fn resolve_filters(
-    repo: &gix::Repository,
-    o: &Opts,
-) -> Result<Filters, crate::objname::OperandError> {
-    let commits = |specs: &[String]| -> Result<Vec<ObjectId>, crate::objname::OperandError> {
-        specs
-            .iter()
-            .map(|s| crate::objname::parse_opt_commits(repo, s))
-            .collect()
-    };
-    Ok(Filters {
-        contains: commits(&o.contains)?,
-        no_contains: commits(&o.no_contains)?,
-        // Already resolved by the option callback, as git's are.
+/// simply matches nothing). Each runs as argv is walked, so the first bad operand
+/// on the command line is the one reported.
+fn resolve_filters(o: &Opts) -> Filters {
+    Filters {
+        contains: o.contains.clone(),
+        no_contains: o.no_contains.clone(),
         merged: o.merged.clone(),
         no_merged: o.no_merged.clone(),
-        points_at: o
-            .points_at
-            .iter()
-            .map(|s| crate::objname::parse_opt_object_name(repo, s))
-            .collect::<Result<_, _>>()?,
-    })
+        points_at: o.points_at.clone(),
+    }
 }
 
 /// Create a local branch. With no `<start-point>` it starts at the current HEAD

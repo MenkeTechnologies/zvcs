@@ -4901,17 +4901,19 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         let tip = repo.head_id()?.detach();
         let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
         restore_worktree_to_tree(repo, &old, tip_tree, &seq.should_interrupt)?;
-        // A skipped fixup/squash leaves the chain's message state stale; git
-        // rebuilds it in `commit_staged_changes()`. Dropping the whole chain is
-        // the same thing whenever the skipped instruction was the only member.
-        let _ = std::fs::remove_file(dir.join("stopped-sha"));
         // The per-instruction reset the pick loop runs before every instruction
         // (sequencer.c:4624-4629) — the merge state the stop recorded belongs to
         // the instruction being thrown away. `REBASE_HEAD` is *not* dropped here:
         // stock leaves it naming the skipped commit, and this measured the same.
         let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
         let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
-    } else if let Some(code) = seq.commit_staged_changes()? {
+    }
+    // `ACTION_SKIP` falls through to `sequencer_continue()` (builtin/rebase.c:
+    // 1385-1397), so a skip reaches `commit_staged_changes()` too — with a clean
+    // index, which is where a skipped fixup/squash is taken back off the chain
+    // and, when it ended the chain, the melded commit is re-committed with its
+    // message cleaned up (sequencer.c:5430-5530).
+    if let Some(code) = seq.commit_staged_changes(next_is_fixup)? {
         return Ok(code);
     }
 
@@ -4923,13 +4925,17 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
     seq.run(list, 0)
 }
 
-/// `commit_staged_changes()`'s half that matters here: turn what the user
-/// staged into the commit the stopped instruction was going to make.
+/// `commit_staged_changes()`: turn what the user staged into the commit the
+/// stopped instruction was going to make, and — after a `--skip` — take a
+/// skipped fixup/squash back off the running chain.
+///
+/// `next_is_fixup` is `is_fixup(peek_command(todo_list, 0))`: whether the next
+/// instruction continues the chain.
 ///
 /// Returns `Some(exit_code)` when the rebase must stop again (unstaged changes,
 /// or an unresolved index), and `None` when it may proceed.
 impl Sequencer<'_> {
-    fn commit_staged_changes(&mut self) -> Result<Option<ExitCode>> {
+    fn commit_staged_changes(&mut self, next_is_fixup: bool) -> Result<Option<ExitCode>> {
         let repo = self.repo;
         let dir = rebase_merge_dir(repo);
         let index = repo.index_or_load_from_head()?.into_owned();
@@ -4950,44 +4956,116 @@ impl Sequencer<'_> {
         let head_commit = repo.find_commit(head)?;
         // `is_clean`: the index already matches HEAD, so the instruction that
         // stopped left nothing to commit (an `edit`/`break` stop the user did
-        // not amend, or a conflict resolved back to the tip).
+        // not amend, a conflict resolved back to the tip, or a `--skip`).
         let is_clean = head_commit.tree_id()?.detach() == tree;
-        let amend = dir.join("amend").exists();
 
-        let message = std::fs::read(dir.join("message")).ok();
-        // `if (is_clean) { … if (!final_fixup) { ret = 0; goto out; } }`: an
-        // index that already matches `HEAD` has nothing to commit, whatever the
-        // `amend` marker says — an `edit` stop the user amended (or did not
-        // touch at all) lands here and just carries on.
-        //
-        // git's one exception is `final_fixup`, which it reaches only after
-        // *skipping* the last member of a fixup chain; that re-clean-up is not
-        // modelled here, so a `--skip` of a final `squash` leaves the melded
-        // message with its comment block rather than re-running the editor.
-        if is_clean {
-            let _ = std::fs::remove_file(dir.join("message"));
-            let _ = std::fs::remove_file(dir.join("stopped-sha"));
-            let _ = std::fs::remove_file(dir.join("amend"));
-            return Ok(None);
+        // `flags = ALLOW_EMPTY | EDIT_MSG`; `final_fixup` and the `EDIT_MSG` →
+        // `CLEANUP_MSG` swap come from the fixup-chain arm below.
+        let mut amend = false;
+        let mut edit = true;
+        let mut final_fixup = false;
+        let amend_path = dir.join("amend");
+        if amend_path.exists() {
+            // `read_oneliner(&rev, rebase_path_amend(), 0)` + `get_oid_hex()`.
+            let raw = std::fs::read_to_string(&amend_path).unwrap_or_default();
+            let Ok(to_amend) = ObjectId::from_hex(raw.trim_end().as_bytes()) else {
+                eprintln!("error: invalid contents: '{}'", amend_path.display());
+                return Ok(Some(ExitCode::from(1)));
+            };
+            if !is_clean && head != to_amend {
+                eprintln!(
+                    "error: \nYou have uncommitted changes in your working tree. Please, commit them\n\
+                     first and then run 'git rebase --continue' again."
+                );
+                return Ok(Some(ExitCode::from(1)));
+            }
+            // "When skipping a failed fixup/squash, we need to edit the commit
+            // message, the current fixup list and count, and if it was the last
+            // fixup/squash in the chain, we need to clean up the commit message
+            // and if there was a squash, let the user edit it."
+            if !is_clean || self.fixup_count == 0 {
+                // this is not the final fixup
+            } else if head != to_amend || !dir.join("stopped-sha").exists() {
+                // was a final fixup or squash done manually?
+                if !next_is_fixup {
+                    for f in ["message-fixup", "message-squash", "current-fixups"] {
+                        let _ = std::fs::remove_file(dir.join(f));
+                    }
+                    self.fixups.clear();
+                    self.fixup_count = 0;
+                }
+            } else {
+                // we are in a fixup/squash chain: drop the skipped member
+                // (`current-fixups` loses its last line and the newline before it).
+                self.fixup_count -= 1;
+                self.fixups.pop();
+                std::fs::write(dir.join("current-fixups"), self.fixups.join("\n"))?;
+
+                // Only if it is the final command in the chain, and only if the
+                // chain is longer than the single member just skipped, is the
+                // melded commit re-committed with a cleaned-up message.
+                if self.fixup_count > 0 && !next_is_fixup {
+                    final_fixup = true;
+                    // Without a `squash` or a `fixup -c` in the chain the message
+                    // only needs its comments stripped; no editor.
+                    if !self.seen_squash() && !self.seen_fixup_edit_msg() {
+                        edit = false;
+                    }
+                } else if next_is_fixup {
+                    // The squash message must skip the latest commit message:
+                    // restart it from `HEAD`'s (`find_commit_subject()`).
+                    let message = head_commit.message_raw()?.to_owned();
+                    std::fs::write(dir.join("message-squash"), todo::skip_blank_lines(&message))?;
+                }
+            }
+            amend = true;
         }
 
-        // `run_git_commit(rebase_path_message(), …, ALLOW_EMPTY | EDIT_MSG
-        // [| AMEND_MSG])`: git re-enters `git commit` here, which is what makes
-        // `--continue` open the message in the editor.
-        let mut args: Vec<String> = vec!["-n".into(), "--no-gpg-sign".into()];
+        if is_clean {
+            let git_dir = repo.git_dir();
+            let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+            let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
+            if !final_fixup {
+                let _ = std::fs::remove_file(dir.join("message"));
+                let _ = std::fs::remove_file(dir.join("stopped-sha"));
+                let _ = std::fs::remove_file(&amend_path);
+                return Ok(None);
+            }
+        }
+
+        // `run_git_commit(final_fixup ? NULL : rebase_path_message(), …, flags)`
+        // (sequencer.c:5554-5555, 1123-1181): git re-enters `git commit` here,
+        // which is what makes `--continue` open the message in the editor.
+        let mut args: Vec<String> = vec!["-n".into()];
         if amend {
             args.push("--amend".into());
         }
+        args.push("--no-gpg-sign".into());
         let msg_path = dir.join("message");
-        if message.is_some() {
-            args.push("-F".into());
-            args.push(msg_path.display().to_string());
+        if !final_fixup {
+            if msg_path.exists() {
+                args.push("-F".into());
+                args.push(msg_path.display().to_string());
+            }
+        } else if !edit {
+            args.push("-C".into());
+            args.push("HEAD".into());
         }
-        args.push("-e".into());
+        if !edit {
+            // `CLEANUP_MSG`
+            args.push("--cleanup=strip".into());
+        } else {
+            args.push("-e".into());
+        }
         args.push("--allow-empty".into());
+        if !edit {
+            args.push("--allow-empty-message".into());
+        }
         // The author of the commit being replayed, saved by `write_author_script`
-        // when the instruction started, survives the interruption.
-        let mut env = self.author_env();
+        // when the instruction started, survives the interruption. A final-fixup
+        // re-commit has no message file and amends, so `read_env_script()` is
+        // skipped (sequencer.c:1133-1136) and the melded commit keeps its author.
+        let mut env = if final_fixup && amend { Vec::new() } else { self.author_env() };
         // `const char *reflog_action = reflog_message(opts, "continue", NULL);`
         // (sequencer.c:5267), handed to `run_git_commit(…, reflog_action, …)`
         // (sequencer.c:5429-5430) which exports it as `GIT_REFLOG_ACTION`
@@ -4999,16 +5077,33 @@ impl Sequencer<'_> {
             "GIT_REFLOG_ACTION".to_string(),
             format!("{} (continue)", reflog_action()),
         ));
-        let code = self.run_commit(&args, env)?;
-        if code != 0 {
-            return Ok(Some(ExitCode::from(code as u8)));
+        // `is_rebase_i(opts) && !(flags & EDIT_MSG)` →
+        // `run_command_silent_on_success()`.
+        let ok = if edit {
+            self.run_commit(&args, env)? == 0
+        } else {
+            let (ok, out) = self.run_commit_capture(&args, env)?;
+            if !ok {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(&out);
+            }
+            ok
+        };
+        if !ok {
+            eprintln!("error: could not commit staged changes.");
+            return Ok(Some(ExitCode::from(1)));
         }
         let _ = std::fs::remove_file(dir.join("message"));
-        let _ = std::fs::remove_file(dir.join("amend"));
+        let _ = std::fs::remove_file(&amend_path);
         let _ = std::fs::remove_file(dir.join("stopped-sha"));
-        if self.fixup_count > 0 {
+        let _ = std::fs::remove_file(repo.git_dir().join("MERGE_HEAD"));
+        let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
+        if final_fixup {
             let _ = std::fs::remove_file(dir.join("message-fixup"));
             let _ = std::fs::remove_file(dir.join("message-squash"));
+        }
+        if self.fixup_count > 0 {
+            // Whether final fixup or not, the commit message was just cleaned up.
             let _ = std::fs::remove_file(dir.join("current-fixups"));
             self.fixups.clear();
             self.fixup_count = 0;
@@ -5060,6 +5155,10 @@ struct Sequencer<'r> {
 enum Step {
     /// Move on to the next instruction.
     Next,
+    /// `PICK_RESULT_DROPPED` (sequencer.c:2591-2592, v2.56.0): the pick changed
+    /// nothing and was dropped. The run moves on as for [`Step::Next`], but the
+    /// commit is not recorded as rewritten.
+    Dropped,
     /// Stop, leaving the rebase resumable, with this exit code.
     Stop(u8),
 }
@@ -5137,7 +5236,9 @@ impl<'r> Sequencer<'r> {
     fn load_fixup_state(&mut self) -> Result<()> {
         let raw = std::fs::read_to_string(self.dir().join("current-fixups")).unwrap_or_default();
         self.fixups = raw.lines().map(str::to_string).collect();
-        self.fixup_count = self.fixups.len();
+        // Older versions of git accidentally inserted blank lines when a fixup
+        // was skipped, so a blank line is not counted (sequencer.c:3326-3336).
+        self.fixup_count = self.fixups.iter().filter(|l| !l.is_empty()).count();
         Ok(())
     }
 
@@ -5240,20 +5341,38 @@ impl<'r> Sequencer<'r> {
                     let final_fixup = item.cmd.is_fixup() && !next_is_fixup;
                     let step = self.pick_one_commit(&item, final_fixup)?;
                     // ```c
-                    // if (is_rebase_i(opts) && !res)
+                    // } else if (pick_res == PICK_RESULT_OK) {
                     //         record_in_rewritten(&item->commit->object.oid,
                     //                             peek_command(todo_list, 1));
+                    //         return 0;
+                    // } else if (pick_res == PICK_RESULT_DROPPED) {
+                    //         if (is_final_fixup(todo_list))
+                    //                 flush_rewritten_pending();
+                    //         return 0;
+                    // }
                     // ```
-                    // (sequencer.c:4968-4970). `edit` returns at 4965 before this,
-                    // so its commit is recorded by `--continue` from
-                    // `stopped-sha` instead; every other command records only when
-                    // the pick succeeded, which is what `Step::Next` means here.
-                    if item.cmd != todo::Cmd::Edit && matches!(step, Step::Next) {
-                        if let Some(oid) = item.commit {
-                            rewritten::record(self.repo, &dir, oid, next_is_fixup);
+                    // (sequencer.c:5089-5096, v2.56.0). `edit` returns before this,
+                    // so its commit is recorded by `--continue` from `stopped-sha`
+                    // instead; every other command records only when the pick
+                    // succeeded, which is what `Step::Next` means here. A dropped
+                    // pick is not recorded: 2.55 recorded it as well, which mapped
+                    // it onto whatever `HEAD` was and so copied its notes to an
+                    // unrelated commit.
+                    match step {
+                        Step::Next if item.cmd != todo::Cmd::Edit => {
+                            if let Some(oid) = item.commit {
+                                rewritten::record(self.repo, &dir, oid, next_is_fixup);
+                            }
+                            Step::Next
                         }
+                        Step::Dropped => {
+                            if final_fixup {
+                                rewritten::flush(self.repo, &dir);
+                            }
+                            Step::Next
+                        }
+                        step => step,
                     }
-                    step
                 }
                 todo::Cmd::Exec => self.do_exec(&item)?,
                 todo::Cmd::Noop | todo::Cmd::Drop | todo::Cmd::Comment => Step::Next,
@@ -5307,7 +5426,7 @@ impl<'r> Sequencer<'r> {
                 }
             };
             match step {
-                Step::Next => i += 1,
+                Step::Next | Step::Dropped => i += 1,
                 Step::Stop(code) => {
                     return Ok(if code == 0 {
                         ExitCode::SUCCESS
@@ -5501,6 +5620,14 @@ impl<'r> Sequencer<'r> {
         let create_root = item.cmd.is_pick_or_similar() && Some(head) == self.st.squash_onto;
         if create_root && item.cmd.is_fixup() {
             crate::git_fatal!("cannot fixup root commit");
+        }
+        // `update_squash_messages()` runs *before* the merge (sequencer.c:2429-2434),
+        // so a fixup/squash that conflicts is already counted in
+        // `current-fixups` and `message-squash` when the rebase stops — which is
+        // what `--continue` commits and what `--skip` takes back off again
+        // (`commit_staged_changes()`, sequencer.c:5450-5530).
+        if item.cmd.is_fixup() {
+            self.update_squash_messages(item, &commit)?;
         }
 
         let parent = commit.parent_ids().next().map(|p| p.detach());
@@ -5749,7 +5876,7 @@ impl<'r> Sequencer<'r> {
                             "dropping {} {subject} -- patch contents already upstream",
                             oid.to_hex()
                         );
-                        return Ok(Step::Next);
+                        return Ok(Step::Dropped);
                     }
                     // `allow_empty() == 0`: `do_commit()` runs without
                     // `ALLOW_EMPTY`, `try_to_commit()` returns 1, and the pick is
@@ -6297,11 +6424,7 @@ impl<'r> Sequencer<'r> {
         // `REBASE_HEAD`/`patch`/`message` a conflict stop does — that is what
         // makes `git rebase --show-current-patch` work at an `edit`.
         make_patch(self.repo, &dir, &self.repo.find_commit(at)?)?;
-        std::fs::write(dir.join("amend"), format!("{}\n", self.repo.head_id()?.detach()))?;
-        eprintln!(
-            "You can amend the commit now, with\n\n  git commit --amend \n\n\
-             Once you are satisfied with your changes, run\n\n  git rebase --continue"
-        );
+        self.intend_to_amend()?;
         Ok(Step::Stop(0))
     }
 
@@ -6317,7 +6440,8 @@ impl<'r> Sequencer<'r> {
     ) -> Result<Step> {
         let repo = self.repo;
         let dir = self.dir();
-        self.update_squash_messages(item, commit)?;
+        // `message-squash` / `current-fixups` were brought up to date before the
+        // merge ran (see `pick_one_commit`).
 
         let head = repo.head_id()?.detach();
         let head_commit = repo.find_commit(head)?;
@@ -6564,8 +6688,16 @@ impl<'r> Sequencer<'r> {
         }
 
         std::fs::write(dir.join("message-squash"), &buf)?;
+        // `"%s%s%s %s"` with `" -c"` for a `fixup -c` (sequencer.c:2160-2168), so
+        // that `seen_fixup_edit_msg()` can tell, after a `--skip`, that the
+        // chain still wants the editor.
+        let fixup_flag = if item.cmd == todo::Cmd::Fixup && item.flags & todo::EDIT_FIXUP_MSG != 0 {
+            " -c"
+        } else {
+            ""
+        };
         self.fixups.push(format!(
-            "{} {}",
+            "{}{fixup_flag} {}",
             item.cmd.name(),
             item.commit.expect("fixup names a commit")
         ));
@@ -6576,6 +6708,12 @@ impl<'r> Sequencer<'r> {
     /// `seen_squash()`: does the running chain contain a `squash`?
     fn seen_squash(&self) -> bool {
         self.fixups.iter().any(|l| l.starts_with("squash"))
+    }
+
+    /// `seen_fixup_edit_msg()` (sequencer.c:1932-1936): does the running chain
+    /// contain a `fixup -c`?
+    fn seen_fixup_edit_msg(&self) -> bool {
+        self.fixups.iter().any(|l| l.starts_with("fixup -c"))
     }
 
     /// `make_patch()` + `error_with_patch()`: record everything `--continue`
@@ -6647,12 +6785,14 @@ impl<'r> Sequencer<'r> {
         // The message `--continue` will commit. A conflicted fixup/squash
         // commits the running combination instead of the picked commit's own
         // message (`error_failed_squash()`), and that copy also replaces
-        // `MERGE_MSG` (sequencer.c:3548-3555).
-        if item.cmd.is_fixup() && dir.join("message-squash").exists() {
+        // `MERGE_MSG` (sequencer.c:3911-3926) — whichever merge produced the
+        // conflict, a `merge-<strategy>` child included.
+        let failed_squash = item.cmd.is_fixup() && dir.join("message-squash").exists();
+        if failed_squash {
             std::fs::copy(dir.join("message-squash"), dir.join("message"))?;
-            if conflicts.is_some() {
-                std::fs::copy(dir.join("message"), self.repo.git_dir().join("MERGE_MSG"))?;
-            }
+            let merge_msg = self.repo.git_dir().join("MERGE_MSG");
+            let _ = std::fs::remove_file(&merge_msg);
+            std::fs::copy(dir.join("message"), merge_msg)?;
         } else {
             match &hinted {
                 Some(hinted) => {
@@ -6696,8 +6836,29 @@ impl<'r> Sequencer<'r> {
         // `error_with_patch()` reports the *todo line's* argument, not the
         // commit's subject: with `rebase.instructionFormat` in play the two
         // differ, and this is the one that shows what the sheet said.
-        eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
+        //
+        // A failed fixup/squash goes through `error_failed_squash()`, which
+        // since 2.56 calls `error_with_patch(…, exit_code = 1, to_amend = 1)`
+        // (sequencer.c:3925): the `amend` marker plus the `You can amend the
+        // commit now` text replace the `Could not apply` line.
+        if failed_squash {
+            self.intend_to_amend()?;
+        } else {
+            eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
+        }
         Ok(Step::Stop(1))
+    }
+
+    /// `error_with_patch()`'s `to_amend` arm: `intend_to_amend()` records
+    /// `HEAD` in `$state_dir/amend`, then the `git commit --amend` advice.
+    fn intend_to_amend(&self) -> Result<()> {
+        let head = self.repo.head_id()?.detach();
+        std::fs::write(self.dir().join("amend"), format!("{head}\n"))?;
+        eprintln!(
+            "You can amend the commit now, with\n\n  git commit --amend \n\n\
+             Once you are satisfied with your changes, run\n\n  git rebase --continue"
+        );
+        Ok(())
     }
 
     /// `--empty=stop` — `allow_empty()` returned 0, so the pick has to halt.

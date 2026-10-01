@@ -363,7 +363,7 @@ fn the_separator_ends_fast_exports_own_parsing() {
     let (stdout, stderr, code) = git(&repo, &home, &["fast-export", "main", "--", "--signed-tags=false"]);
     assert_eq!(stdout, "");
     assert!(
-        stderr.starts_with("usage: git fast-export [<rev-list-opts>]\n"),
+        stderr.starts_with("usage: git fast-export [<options>] [<revision-range>] [[--] <path>...]\n"),
         "expected the option list, got:\n{stderr}"
     );
     assert!(

@@ -176,7 +176,7 @@ use super::diffcore_rename;
 /// git's `fast_export_usage` block, byte-for-byte, including the trailing blank
 /// line. Printed to stderr for both "no arguments" and "leftover arguments".
 const USAGE: &str = "\
-usage: git fast-export [<rev-list-opts>]
+usage: git fast-export [<options>] [<revision-range>] [[--] <path>...]
 
     --[no-]progress <n>   show progress after <n> objects
     --[no-]signed-tags <mode>

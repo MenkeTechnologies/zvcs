@@ -1945,16 +1945,37 @@ fn dir_holds_a_file(full: &Path) -> bool {
 /// `ct_path` carries a trailing slash and the root is `""`, which
 /// `path_in_sparse_checkout` always answers "in" — so the root is never collapsed
 /// and the walk always descends at least one level.
+///
+/// A sub-directory whose cache-tree node is invalidated is neither collapsed nor
+/// descended into; its entries stay as they are (2.56, sparse-index.c:116-121):
+///
+/// ```c
+///         span = ct->down[pos]->cache_tree->entry_count;
+///         if (span < 0) {
+///                 /* cache-tree entry is invalidated, cannot collapse. */
+///                 istate->cache[num_converted++] = ce;
+///                 i++;
+///                 continue;
+///         }
+/// ```
+///
+/// `convert_to_sparse()` rebuilds the cache-tree from the entries just before
+/// (sparse-index.c:231-237), and what that rebuild leaves invalidated is the chain
+/// of directories above an intent-to-add entry: `update_one()` skips the entry and
+/// sets `to_invalidate`, and a parent that finds a sub-tree with `entry_count < 0`
+/// does the same, up to the root (cache-tree.c:436-441, :472-481, :517). So a
+/// directory with an intent-to-add path anywhere below it is left alone.
 fn sparse_dirs(index: &gix::index::File, cone: &Cone) -> Vec<String> {
     let backing = index.path_backing();
-    let entries: Vec<(String, bool)> = index
+    let entries: Vec<SparseCandidate> = index
         .entries()
         .iter()
-        .map(|e| {
-            let collapsible = e.stage_raw() == 0
+        .map(|e| SparseCandidate {
+            path: e.path_in(backing).to_str_lossy().into_owned(),
+            collapsible: e.stage_raw() == 0
                 && e.mode != Mode::COMMIT
-                && e.flags.contains(Flags::SKIP_WORKTREE);
-            (e.path_in(backing).to_str_lossy().into_owned(), collapsible)
+                && e.flags.contains(Flags::SKIP_WORKTREE),
+            intent_to_add: e.flags.contains(Flags::INTENT_TO_ADD),
         })
         .collect();
     let mut out = Vec::new();
@@ -1962,8 +1983,17 @@ fn sparse_dirs(index: &gix::index::File, cone: &Cone) -> Vec<String> {
     out
 }
 
+/// One index entry as `convert_to_sparse_rec()` weighs it.
+struct SparseCandidate {
+    path: String,
+    /// Merged, not a gitlink, and `CE_SKIP_WORKTREE` (sparse-index.c:78-85).
+    collapsible: bool,
+    /// `CE_INTENT_TO_ADD`, which invalidates every cache-tree node above it.
+    intent_to_add: bool,
+}
+
 fn collapse(
-    entries: &[(String, bool)],
+    entries: &[SparseCandidate],
     start: usize,
     end: usize,
     dir: &str,
@@ -1972,24 +2002,27 @@ fn collapse(
 ) {
     if !dir.is_empty()
         && !cone.matches(dir)
-        && entries[start..end].iter().all(|(_, collapsible)| *collapsible)
+        && entries[start..end].iter().all(|e| e.collapsible)
     {
         out.push(dir.to_owned());
         return;
     }
     let mut i = start;
     while i < end {
-        let rest = &entries[i].0[dir.len()..];
+        let rest = &entries[i].path[dir.len()..];
         let Some(slash) = rest.find('/') else {
             i += 1;
             continue;
         };
-        let child = entries[i].0[..dir.len() + slash + 1].to_owned();
+        let child = entries[i].path[..dir.len() + slash + 1].to_owned();
         let mut j = i;
-        while j < end && entries[j].0.starts_with(&child) {
+        while j < end && entries[j].path.starts_with(&child) {
             j += 1;
         }
-        collapse(entries, i, j, &child, cone, out);
+        // `span < 0`: the child's cache-tree node is invalidated.
+        if !entries[i..j].iter().any(|e| e.intent_to_add) {
+            collapse(entries, i, j, &child, cone, out);
+        }
         i = j;
     }
 }

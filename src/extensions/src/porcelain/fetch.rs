@@ -284,6 +284,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
 
     // --- argument parsing -------------------------------------------------
     let mut opts = FetchOpts::default();
+    // `repo_config(the_repository, git_fetch_config, &config)` runs before the options are
+    // parsed, so its warnings come first whatever the command line asks for.
+    opts.follow_remote_head = fetch_follow_remote_head(&repo);
     // `cmd_fetch()` builds the reflog action from the command line itself — `fetch`
     // followed by every argument — unless `GIT_REFLOG_ACTION` already named one.
     opts.reflog_action = std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| {
@@ -2006,6 +2009,9 @@ enum Recurse {
 /// Parsed command-line options shared across every remote a single invocation
 /// touches (`--all`/`--multiple` fan out but carry the same flags).
 struct FetchOpts {
+    /// `fetch.followRemoteHEAD` (`fetch_config.follow_remote_head`, git 2.56): the
+    /// fallback for a remote whose own `remote.<name>.followRemoteHEAD` is unset.
+    follow_remote_head: Option<FollowRemoteHead>,
     /// `GIT_REFLOG_ACTION`, or the whole command line as git composes it: `fetch` plus
     /// every argument, which is the prefix each stored ref's reflog line carries.
     reflog_action: String,
@@ -2101,6 +2107,7 @@ struct FetchOpts {
 impl Default for FetchOpts {
     fn default() -> Self {
         FetchOpts {
+            follow_remote_head: None,
             reflog_action: "fetch".to_string(),
             dry_run: false,
             verbose: false,
@@ -3120,7 +3127,13 @@ fn fetch_one(
     // `do_set_head` also decides whether the advertisement has to include `HEAD`: git pushes the
     // literal prefix onto the ls-refs list so `set_head()` has something to guess from.
     // `remote.<name>.followRemoteHEAD` is parsed once, as git parses it once into `struct remote`.
-    let follow_head = remote_name.as_deref().map(|name| follow_remote_head(repo, name));
+    // Unset, `fetch.followRemoteHEAD` stands in, then `BUILTIN_FOLLOW_REMOTE_HEAD_DFLT`
+    // (builtin/fetch.c:1950-1955, git 2.56).
+    let follow_head = remote_name.as_deref().map(|name| {
+        follow_remote_head(repo, name)
+            .or_else(|| opts.follow_remote_head.clone())
+            .unwrap_or(FollowRemoteHead::Create)
+    });
     // Whether the remote's own `HEAD` is what this fetch is asking for.
     //
     // `get_ref_map()` (`builtin/fetch.c`) reaches `HEAD` two ways, and both die
@@ -4661,28 +4674,57 @@ enum FollowRemoteHead {
     Always,
 }
 
-/// Read `remote.<name>.followRemoteHEAD`; an unrecognized value is a warning and leaves the default.
-fn follow_remote_head(repo: &gix::Repository, remote_name: &str) -> FollowRemoteHead {
-    let Some(value) = repo
-        .config_snapshot()
-        .string(&format!("remote.{remote_name}.followRemoteHEAD"))
-        .map(|v| v.to_string())
-    else {
-        return FollowRemoteHead::Create;
-    };
-    match value.as_str() {
-        "never" => FollowRemoteHead::Never,
-        "create" => FollowRemoteHead::Create,
-        "warn" => FollowRemoteHead::Warn(None),
-        "always" => FollowRemoteHead::Always,
-        other => match other.strip_prefix("warn-if-not-") {
-            Some(branch) => FollowRemoteHead::Warn(Some(branch.to_owned())),
-            None => {
-                eprintln!("warning: unrecognized followRemoteHEAD value '{value}' ignored");
-                FollowRemoteHead::Create
-            }
-        },
+/// `remote.<name>.followRemoteHEAD` as `handle_config()` (remote.c:583-600) folds every
+/// value into `struct remote` in configuration order: an unrecognized one is a warning that
+/// leaves the setting as the values before it made it. `None` is git 2.56's
+/// `FOLLOW_REMOTE_UNCONFIGURED`, which hands the choice to `fetch.followRemoteHEAD`.
+fn follow_remote_head(repo: &gix::Repository, remote_name: &str) -> Option<FollowRemoteHead> {
+    let mut follow = None;
+    for value in crate::config::multi_values(repo, &format!("remote.{remote_name}.followRemoteHEAD")) {
+        follow = Some(match value.as_str() {
+            "never" => FollowRemoteHead::Never,
+            "create" => FollowRemoteHead::Create,
+            "warn" => FollowRemoteHead::Warn(None),
+            "always" => FollowRemoteHead::Always,
+            other => match other.strip_prefix("warn-if-not-") {
+                Some(branch) => FollowRemoteHead::Warn(Some(branch.to_owned())),
+                None => {
+                    eprintln!("warning: unrecognized followRemoteHEAD value '{value}' ignored");
+                    continue;
+                }
+            },
+        });
     }
+    follow
+}
+
+/// `fetch.followRemoteHEAD` as `git_fetch_config()` (builtin/fetch.c:178-192, git 2.56)
+/// reads it at the top of `cmd_fetch()`, for every fetch: each value in configuration
+/// order, an unrecognized one (`warn-if-not-<branch>` included) warned about and
+/// skipped, and a valueless one `config_error_nonbool()`, which the config walk dies on.
+fn fetch_follow_remote_head(repo: &gix::Repository) -> Option<FollowRemoteHead> {
+    const KEY: &str = "fetch.followremotehead";
+    let mut follow = None;
+    for entry in crate::config::walk_config(repo) {
+        if entry.key != KEY {
+            continue;
+        }
+        let Some(value) = entry.value else {
+            eprintln!("error: missing value for '{KEY}'");
+            crate::config::die_128(&entry.origin.die_linenr(KEY));
+        };
+        follow = Some(match value.as_str() {
+            "never" => FollowRemoteHead::Never,
+            "create" => FollowRemoteHead::Create,
+            "warn" => FollowRemoteHead::Warn(None),
+            "always" => FollowRemoteHead::Always,
+            _ => {
+                eprintln!("warning: unrecognized fetch.followRemoteHEAD value '{value}' ignored");
+                continue;
+            }
+        });
+    }
+    follow
 }
 
 /// Port of git's `set_head()`: point `refs/remotes/<name>/HEAD` at the branch the remote's `HEAD`
@@ -4744,7 +4786,7 @@ fn set_head_from_remote(
         })?;
     }
 
-    // `report_set_head()`, gated on `verbosity >= 0` exactly as git gates it.
+    // `warn_set_head()`, gated on `verbosity >= 0` exactly as git gates it.
     if let (FollowRemoteHead::Warn(no_warn_branch), false) = (&follow, opts.quiet) {
         if no_warn_branch.as_deref() != Some(head_name.as_str()) {
             report_set_head_warn(remote_name, head_name, previous.as_deref(), was_detached);
@@ -4753,7 +4795,7 @@ fn set_head_from_remote(
     Ok(())
 }
 
-/// git's `report_set_head()` plus the `advice.fetchSetHeadWarn` hint it ends with.
+/// git's `warn_set_head()` (builtin/fetch.c:1731-1751) plus the `advice.fetchRemoteHEADWarn` hint it ends with.
 fn report_set_head_warn(remote: &str, head_name: &str, previous: Option<&str>, was_detached: bool) {
     let prefix = format!("refs/remotes/{remote}/");
     let tracked = previous.and_then(|p| p.strip_prefix(prefix.as_str()));
@@ -4772,13 +4814,19 @@ fn report_set_head_warn(remote: &str, head_name: &str, previous: Option<&str>, w
     if !crate::advice::enabled("fetchRemoteHEADWarn") {
         return;
     }
-    let mut lines = vec![
-        format!("Run 'git remote set-head {remote} {head_name}' to follow the change, or set"),
-        format!("'remote.{remote}.followRemoteHEAD' configuration option to a different value"),
-        "if you do not want to see this message. Specifically running".to_string(),
-        format!("'git config set remote.{remote}.followRemoteHEAD warn-if-not-branch-{head_name}'"),
-        "will disable the warning until the remote changes HEAD to something else.".to_string(),
-    ];
+    // `set_head_advice_msg()` (builtin/fetch.c:1716-1729), reworded in git 2.56 to name
+    // `fetch.followRemoteHEAD` too and to suggest `warn-if-not-<branch>`.
+    let mut body = format!(
+        "Run 'git remote set-head {remote} {head_name}' to follow the change, or modify\n\
+         either of the 'remote.{remote}.followRemoteHEAD' or 'fetch.followRemoteHEAD'\n\
+         configuration variables to handle the situation differently.\n\
+         \n\
+         Using this specific setting\n\
+         \n\
+         \x20   git config set remote.{remote}.followRemoteHEAD warn-if-not-{head_name}\n\
+         \n\
+         will suppress the warning until the remote changes HEAD to something else."
+    );
     // `advise_if_enabled()`'s trailer, which git appends only while the slot is unconfigured.
     let unconfigured = crate::setup::discover()
         .map(|repo| {
@@ -4788,13 +4836,9 @@ fn report_set_head_warn(remote: &str, head_name: &str, previous: Option<&str>, w
         })
         .unwrap_or(true);
     if unconfigured {
-        lines.push(
-            "Disable this message with \"git config set advice.fetchRemoteHEADWarn false\"".to_string(),
-        );
+        body.push_str("\nDisable this message with \"git config set advice.fetchRemoteHEADWarn false\"");
     }
-    for line in lines {
-        eprintln!("hint: {line}");
-    }
+    crate::advice::print_hint(&body);
 }
 
 /// Validate a full ref name the way the ref edits in this module need it.

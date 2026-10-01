@@ -4150,10 +4150,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // The followed path is the whole pathspec set here, so the matcher is
         // rebuilt only when a rename moves it — not once per commit.
         let mut matcher = PathspecMatcher::new(&repo, std::slice::from_ref(&pathspecs[0]))?;
+        // `rev_info::follow_pathspec_slab` (log-tree.c:1093-1150): the path each
+        // commit is to be followed under, recorded by the child that reached it.
+        // Without it the one global path a side branch renamed to would be
+        // carried over to the unrelated commits of the other side.
+        let mut follow_slab: HashMap<ObjectId, gix::bstr::BString> = HashMap::new();
         let mut shown: Vec<Node> = Vec::new();
         for node in std::mem::take(&mut nodes) {
             let commit = repo.find_object(node.id)?.try_into_commit()?;
-            let parent = node.parents.first().copied();
+            let parents = node.parents.clone();
+            let parent = parents.first().copied();
+            // "Any recorded path for this commit? If so, restore it"
+            // (log-tree.c:1279-1287).
+            if let Some(stored) = follow_slab.get(&node.id) {
+                if *stored != current {
+                    current = stored.clone();
+                    matcher = PathspecMatcher::new(&repo, &[current.to_string()])?;
+                }
+            }
             // `--follow` turns pruning off entirely — "Can't prune commits with
             // rename following: the paths change" (revision.c) — and sets
             // `revs->diff`, so what a commit is judged by is whether it *renders a
@@ -4170,8 +4184,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 shown.push(node);
             }
             // The switch happens after the commit is judged: the rename *is* the
-            // change that makes the commit interesting.
-            if let Some(parent) = parent {
+            // change that makes the commit interesting. A merge that renders no
+            // diff never reaches `diff_tree_oid()` (log-tree.c:1242-1243), so it
+            // cannot switch the path either.
+            if let Some(parent) = parent.filter(|_| !merge_without_diff) {
                 // `diff_opts.rename_score = opt->rename_score`: `--follow` runs its
                 // rename search at the threshold the command line set, so
                 // `--follow -M90%` declines a rename the default 50% would take.
@@ -4179,6 +4195,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     current = src;
                     matcher = PathspecMatcher::new(&repo, &[current.to_string()])?;
                 }
+            }
+            // "Record what path each parent of this commit should use"
+            // (log-tree.c:1302-1314): a merge works the path out per parent with
+            // `propagate_follow_pathspec_to_parent()`, a follow-renames diff of
+            // that parent against the merge, so each side of the history is
+            // followed under the name it had there; a single parent inherits the
+            // path as it stands.
+            if parents.len() > 1 {
+                for &p in &parents {
+                    let path = follow_source(&repo, &commit, p, &current, &patch_opts)?
+                        .unwrap_or_else(|| current.clone());
+                    follow_slab.insert(p, path);
+                }
+            } else if let Some(p) = parent {
+                follow_slab.insert(p, current.clone());
             }
         }
         nodes = shown;

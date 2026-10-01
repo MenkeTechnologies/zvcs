@@ -25,6 +25,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// The five patch-only diff.* keys `diff.rs` honors, each with a value distinct
@@ -78,21 +82,6 @@ fn run(repo: &Path, home: &Path, args: &[&str]) -> Output {
         .env("ZVCS_HOME", home)
         .output()
         .unwrap()
-}
-
-/// The stock `git` to compare against, resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else
-/// a known system path) rather than through `PATH`: on a machine where zvcs shadows
-/// git — the machine this is developed on — `PATH` resolution silently makes the
-/// oracle the thing under test, and the comparison proves nothing. `None` when no
-/// stock git exists, in which case callers skip the oracle half.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return std::path::Path::new(&p).exists().then_some(p);
-    }
-    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(str::to_owned)
 }
 
 /// Run the same argv under stock git, in the same repo and environment as [`run`].

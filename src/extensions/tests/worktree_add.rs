@@ -14,41 +14,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-
-/// Where a real git usually lives. Never `PATH`: it finds this binary on any
-/// machine where the shadow is installed, and a worktree interop test that drove
-/// this binary on both sides would pass while proving nothing.
-const STOCK_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"];
-
-/// The first candidate that exists and is not this binary wearing git's name.
-///
-/// The probe is a superset verb run with an emptied environment: zvcs serves
-/// `zverbs` itself, while a stock git looks for a `git-zverbs` on `PATH` and fails.
-/// Clearing the environment is what makes it sound — zvcs's own installation puts
-/// a `git-zverbs` shim on `PATH`, which a stock git would then answer too.
-///
-/// Answering the question means running the candidate, so the run is bounded: an
-/// emptied environment leaves a zvcs with no `HOME`, and an old enough build then
-/// writes its state into the working directory — the crate root, under `cargo
-/// test`. A throwaway `ZVCS_HOME` and a temp working directory keep it out of the
-/// source tree; a stock git ignores both.
-fn stock_git() -> Option<&'static str> {
-    let scratch = std::env::temp_dir().join(format!("zvcs-wtprobe-{}", std::process::id()));
-    let found = STOCK_CANDIDATES.into_iter().find(|bin| {
-        Path::new(bin).exists()
-            && !Command::new(bin)
-                .arg("zverbs")
-                .env_clear()
-                .env("ZVCS_HOME", &scratch)
-                .current_dir(std::env::temp_dir())
-                .output()
-                .map(|o| o.status.success() && !o.stdout.is_empty())
-                .unwrap_or(false)
-    });
-    let _ = std::fs::remove_dir_all(&scratch);
-    found
-}
 
 fn run_with(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(bin)

@@ -34,6 +34,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 // ---------------------------------------------------------------------------
@@ -281,41 +285,6 @@ fn update_ref_messages_are_normalized_too() {
 // ---------------------------------------------------------------------------
 // cross-check against stock git when the machine has one
 // ---------------------------------------------------------------------------
-
-/// A stock git that is definitely *not* this binary, or `None` to skip.
-///
-/// `zjobs` is a zvcs-only verb: stock git fails on it, this binary succeeds. The
-/// probe runs with an **empty `PATH`** because git resolves an unknown verb by
-/// looking for `git-<verb>` on `PATH` (`execv_dashed_external()`), and a machine
-/// with the shadow binary installed has a `git-zjobs` symlink sitting there — so
-/// with the ambient `PATH`, stock git would dispatch into zvcs and the probe would
-/// mistake it for the binary under test.
-fn stock_git() -> Option<String> {
-    fn on_path(name: &str) -> Option<String> {
-        if name.contains('/') {
-            return std::fs::metadata(name).is_ok().then(|| name.to_string());
-        }
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(name))
-                .find(|c| c.is_file())
-                .map(|c| c.to_string_lossy().into_owned())
-        })
-    }
-
-    for cand in ["/opt/homebrew/bin/git", "/usr/bin/git", "/usr/local/bin/git", "git"] {
-        let Some(cand) = on_path(cand) else { continue };
-        let Ok(version) = Command::new(&cand).arg("--version").output() else { continue };
-        if !version.status.success() || !version.stdout.starts_with(b"git version") {
-            continue;
-        }
-        match Command::new(&cand).arg("zjobs").env("PATH", "").output() {
-            Ok(out) if !out.status.success() => return Some(cand),
-            _ => continue,
-        }
-    }
-    None
-}
 
 /// Every shape above, run side by side with stock git. Skipped, not failed, on a
 /// runner that has no stock git — the literal expectations above still hold there.

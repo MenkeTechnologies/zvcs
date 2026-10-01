@@ -20,6 +20,10 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
@@ -32,53 +36,6 @@ fn git(dir: &Path, args: &[&str]) {
 fn stdout_of(bin: &str, cwd: &Path, args: &[&str]) -> String {
     let out = Command::new(bin).args(args).current_dir(cwd).output().unwrap();
     String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
-/// Whether `bin` is zvcs wearing git's name. zvcs serves the superset verb
-/// `zverbs` itself; a stock git looks for a `git-zverbs` on `PATH` and fails.
-/// The probe runs with an emptied `PATH` so an installed `git-zverbs` shim
-/// cannot make stock answer it.
-fn is_zvcs(bin: &str) -> bool {
-    Command::new(bin)
-        .arg("zverbs")
-        .env("PATH", "")
-        .current_dir(std::env::temp_dir())
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// The stock git to compare against, or `None` when this machine has none.
-///
-/// `ZVCS_STOCK_GIT` wins if it names something that is not zvcs; otherwise the
-/// usual install locations are probed and the newest non-zvcs candidate is used,
-/// mirroring `src/parity/src/stock.rs`. Picking the *newest* matters: this port
-/// targets 2.55.0, and `/usr/bin/git` is an older Apple build on macOS.
-fn stock_git() -> Option<String> {
-    fn version(bin: &str) -> Option<(u32, u32, u32)> {
-        let out = Command::new(bin).arg("--version").output().ok()?;
-        let s = String::from_utf8_lossy(&out.stdout).into_owned();
-        let rest = s.split("git version ").nth(1)?;
-        let mut it = rest.split_whitespace().next()?.split('.');
-        Some((
-            it.next()?.parse().ok()?,
-            it.next().unwrap_or("0").parse().unwrap_or(0),
-            it.next().unwrap_or("0").parse().unwrap_or(0),
-        ))
-    }
-
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        if Path::new(&p).exists() && !is_zvcs(&p) {
-            return Some(p);
-        }
-        return None;
-    }
-    ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
-        .into_iter()
-        .filter(|p| Path::new(p).exists() && !is_zvcs(p))
-        .filter_map(|p| version(p).map(|v| (v, p.to_owned())))
-        .max()
-        .map(|(_, p)| p)
 }
 
 /// Assert the zvcs binary's `ls-tree` stdout matches stock git's, verbatim.

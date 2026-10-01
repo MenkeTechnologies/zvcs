@@ -16,40 +16,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-
-/// A STOCK git to compare against, or `None` when the machine has no foreign git
-/// installed.
-///
-/// Resolved EXPLICITLY rather than through `PATH`: on a machine where zvcs
-/// shadows git — the machine this is developed on — a `PATH` lookup silently
-/// makes the oracle the thing under test.
-///
-/// The *newest* installed git wins, the policy `src/parity/src/stock.rs` uses:
-/// a machine usually has an OS-vendored git beside a current one, the port
-/// tracks the current one, and the two disagree about real behaviour. They do so
-/// here in particular — 2.50.1 and 2.55.0 interleave two unrelated branches in a
-/// walked selection differently.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .filter(|p| Path::new(p).exists())
-        .filter_map(|p| Some((version_of(p)?, p.to_owned())))
-        .max()
-        .map(|(_, p)| p)
-}
-
-/// `git version X.Y.Z` as a comparable tuple, or `None` when it will not answer.
-fn version_of(bin: &str) -> Option<(u32, u32, u32)> {
-    let out = Command::new(bin).arg("--version").env_clear().output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let rest = text.trim().strip_prefix("git version ")?;
-    let mut parts = rest.split(['.', ' ', '-']).filter_map(|p| p.parse::<u32>().ok());
-    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
-}
 
 fn run(bin: &str, repo: &Path, home: &Path, date: &str, args: &[&str]) -> Output {
     Command::new(bin)

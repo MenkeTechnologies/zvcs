@@ -33,49 +33,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_git");
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::{stock_git, stock_git_at_least};
 
-/// A STOCK git to compare against, or `None` when the machine has no foreign git
-/// installed.
-///
-/// These are differential tests: their whole point is to diff zvcs against
-/// another implementation, so they are the one place a foreign binary is
-/// legitimate. It is resolved EXPLICITLY (`ZVCS_STOCK_GIT`, else the system
-/// path) rather than through `PATH`, because on a machine where zvcs shadows
-/// git — the machine this is developed on — `PATH` resolution silently makes the
-/// oracle the thing under test, and the comparison proves nothing. When no stock
-/// git exists the oracle half is skipped and the zvcs-side assertions still run.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return std::path::Path::new(&p).exists().then_some(p);
-    }
-    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(str::to_owned)
-}
+const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// The oldest git whose bare `maintenance run` selects the task set this port
 /// reproduces. Earlier gits run `gc` alone (see git-maintenance(1) for 2.50:
 /// "by default, only maintenance.gc.enabled is true"), so they are the wrong
 /// oracle for the `<task>.enabled` gates — the task under test is not even in
 /// their default set. The port itself was read off git 2.55.0 traces.
-const ORACLE_MIN: (u32, u32) = (2, 55);
+const ORACLE_MIN: (u32, u32, u32) = (2, 55, 0);
 
 /// A stock git recent enough to compare against, or `None` — in which case the
 /// test still pins OUR behavior and skips only the equality check.
-fn oracle_git() -> Option<String> {
-    let git = stock_git()?;
-    let out = std::process::Command::new(&git).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let nums: Vec<u32> = text
-        .split_whitespace()
-        .find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    let (major, minor) = (*nums.first()?, *nums.get(1)?);
-    ((major, minor) >= ORACLE_MIN).then_some(git)
+fn oracle_git() -> Option<&'static str> {
+    stock_git_at_least(ORACLE_MIN)
 }
 
 /// A zeroed 40-char object id, used to build a syntactically valid reflog line.

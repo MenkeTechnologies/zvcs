@@ -26,6 +26,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// A well-formed, absent object name: 40 hex digits, nothing behind them.
@@ -33,20 +37,6 @@ const ABSENT: &str = "0123456789012345678901234567890123456789";
 /// The control token: not an object name at all, so it must keep taking the
 /// "ambiguous argument" path no matter what happens to the full-hex rule.
 const UNRESOLVABLE: &str = "nosuchthing";
-
-/// A stock git to cross-check against, or `None` on a machine without one.
-///
-/// Resolved by absolute path, never through `PATH`: zvcs installs itself as
-/// `git`, so a `PATH` lookup would quietly make the port its own oracle.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .map(str::to_owned)
-}
 
 fn run(bin: &str, repo: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(bin)

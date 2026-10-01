@@ -38,35 +38,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-
-/// Where a real git lives. `git` on `PATH` is deliberately not consulted: this
-/// binary shadows stock by name wherever zvcs is installed, so resolving it
-/// there would drive this binary on both sides of the comparison.
-const STOCK_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"];
-
-/// The first candidate that exists and is not this binary wearing git's name.
-///
-/// The probe is a superset verb run with an emptied environment: zvcs serves
-/// `zverbs` itself, while a stock git looks for a `git-zverbs` on `PATH` and
-/// fails. Clearing the environment is what makes it sound — zvcs's installation
-/// puts a `git-zverbs` shim on `PATH`, which a stock git would then answer too.
-fn stock_git() -> Option<&'static str> {
-    let scratch = std::env::temp_dir().join(format!("zvcs-s256probe-{}", std::process::id()));
-    let found = STOCK_CANDIDATES.into_iter().find(|bin| {
-        Path::new(bin).exists()
-            && !Command::new(bin)
-                .arg("zverbs")
-                .env_clear()
-                .env("ZVCS_HOME", &scratch)
-                .current_dir(std::env::temp_dir())
-                .output()
-                .map(|o| o.status.success() && !o.stdout.is_empty())
-                .unwrap_or(false)
-    });
-    let _ = std::fs::remove_dir_all(&scratch);
-    found
-}
 
 /// A throwaway root holding one directory per binary under test.
 fn fixture(tag: &str) -> PathBuf {

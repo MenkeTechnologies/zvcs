@@ -36,21 +36,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_git");
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
 
-/// A stock git to cross-check against, or `None` on a machine without one.
-///
-/// Resolved by absolute path, never through `PATH`: zvcs installs itself as
-/// `git`, so a `PATH` lookup would quietly make the port its own oracle.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .map(str::to_owned)
-}
+const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn run(bin: &str, repo: &Path, home: &Path, date: &str, args: &[&str]) -> Output {
     Command::new(bin)

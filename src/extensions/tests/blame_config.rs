@@ -5,6 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// Run stock git in `dir` with the ambient identity stripped.
@@ -151,7 +155,7 @@ fn zvcs_blame(repo: &Path, home: &Path, extra: &[&str]) -> Output {
 }
 
 fn real_blame(repo: &Path, home: &Path, extra: &[&str]) -> Output {
-    run_blame("git", repo, home, extra)
+    run_blame(stock_git().expect("no stock git to compare against; set ZVCS_STOCK_GIT to one"), repo, home, extra)
 }
 
 #[test]

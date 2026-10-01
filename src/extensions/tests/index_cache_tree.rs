@@ -29,6 +29,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 // ---------------------------------------------------------------------------
@@ -74,56 +78,6 @@ fn ok_with(bin: &str, repo: &Path, args: &[&str]) -> String {
 /// [`ok_with`] for the binary under test.
 fn ok(repo: &Path, args: &[&str]) -> String {
     ok_with(BIN, repo, args)
-}
-
-/// A stock git that is definitely *not* this binary, or `None` to skip.
-///
-/// `zjobs` is a zvcs-only verb: stock git fails on it, this binary succeeds. The
-/// `--version` probe alone is not enough — a shim can report an upstream version
-/// while dispatching somewhere else entirely — so both must hold.
-///
-/// The `zjobs` probe runs with an **empty `PATH`**, and that is the whole reason
-/// this function is not three lines. git resolves an unknown verb by looking for
-/// `git-<verb>` on `PATH` (`execv_dashed_external()`), and a machine that has
-/// installed the shadow binary has a `git-zjobs` symlink to it sitting there — so
-/// with the ambient `PATH`, *stock* git 2.55.0 dispatches into zvcs and exits 0,
-/// the probe reads that as "this candidate is the binary under test", and every
-/// interop assertion below silently degrades to a skip. Emptying `PATH` removes
-/// only the external lookup: this binary answers `zjobs` from its own dispatch
-/// table either way, so the probe still cannot mistake it for stock.
-fn stock_git() -> Option<String> {
-    /// The first executable named `name` on the ambient `PATH`, so the probe below can run
-    /// with `PATH` emptied and still have something to execute.
-    fn on_path(name: &str) -> Option<String> {
-        if name.contains('/') {
-            return Some(name.to_string());
-        }
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(name))
-                .find(|c| c.is_file())
-                .map(|c| c.to_string_lossy().into_owned())
-        })
-    }
-
-    for cand in [
-        "/opt/homebrew/bin/git",
-        "/usr/bin/git",
-        "/usr/local/bin/git",
-        "git",
-    ] {
-        let Some(cand) = on_path(cand) else { continue };
-        let version = Command::new(&cand).arg("--version").output();
-        let Ok(version) = version else { continue };
-        if !version.status.success() || !version.stdout.starts_with(b"git version") {
-            continue;
-        }
-        match Command::new(&cand).arg("zjobs").env("PATH", "").output() {
-            Ok(out) if !out.status.success() => return Some(cand),
-            _ => continue,
-        }
-    }
-    None
 }
 
 /// A fresh, empty directory named after `tag`.
@@ -1507,7 +1461,7 @@ fn the_entry_staging_verbs_leave_the_cache_tree_stock_git_leaves() {
         let tag = format!("apply{mode}");
         let ours = patch_fixture(&git, &format!("staging-{tag}-zvcs"));
         let theirs = patch_fixture(&git, &format!("staging-{tag}-stock"));
-        for (repo, bin) in [(&ours, BIN), (&theirs, git.as_str())] {
+        for (repo, bin) in [(&ours, BIN), (&theirs, git)] {
             let out = run_with(bin, repo, &["apply", mode, "the.patch"]);
             assert!(
                 out.status.success(),

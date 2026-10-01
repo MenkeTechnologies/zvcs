@@ -39,6 +39,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// Components git names only when it links them. None is present in this build:
@@ -318,37 +322,6 @@ fn the_sha256_line_is_backed_by_a_working_object_format() {
         .output()
         .unwrap();
     assert!(out.status.success() && out.stderr.is_empty(), "fsck on a sha256 repo: {out:?}");
-}
-
-/// Where a real git lives. `git` on `PATH` is deliberately not consulted: this
-/// binary shadows stock by name on any machine where zvcs is installed, so a
-/// comparison test that resolved it there would drive this binary on both sides
-/// and prove nothing.
-const STOCK_CANDIDATES: [&str; 3] = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"];
-
-/// The first candidate that exists and is not this binary wearing git's name.
-///
-/// The probe is a superset verb run with an emptied environment: zvcs serves
-/// `zverbs` itself, while a stock git looks for a `git-zverbs` on `PATH` and
-/// fails. Clearing the environment is what makes it sound — zvcs's own
-/// installation puts a `git-zverbs` shim on `PATH`, which a stock git would then
-/// answer too. A throwaway `ZVCS_HOME` and a temp working directory keep an old
-/// zvcs from writing its state into the source tree; a stock git ignores both.
-fn stock_git() -> Option<&'static str> {
-    let scratch = std::env::temp_dir().join(format!("zvcs-boprobe-{}", std::process::id()));
-    let found = STOCK_CANDIDATES.into_iter().find(|bin| {
-        Path::new(bin).exists()
-            && !Command::new(bin)
-                .arg("zverbs")
-                .env_clear()
-                .env("ZVCS_HOME", &scratch)
-                .current_dir(std::env::temp_dir())
-                .output()
-                .map(|o| o.status.success() && !o.stdout.is_empty())
-                .unwrap_or(false)
-    });
-    let _ = std::fs::remove_dir_all(&scratch);
-    found
 }
 
 /// `cmd_diagnose()` renders its version block with `get_version_info(&buf, 1)`,

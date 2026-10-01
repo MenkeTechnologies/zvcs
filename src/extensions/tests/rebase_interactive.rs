@@ -16,23 +16,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_git");
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
 
-/// A stock git to compare against, or `None` when the machine has no foreign git
-/// installed.
-///
-/// Resolved EXPLICITLY rather than through `PATH`: on a machine where zvcs
-/// shadows `git` — the machine this is developed on — `PATH` resolution would
-/// silently make the oracle the thing under test.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .map(str::to_owned)
-}
+const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// The environment every invocation runs under: no ambient config, a pinned
 /// identity and a pinned clock, so commit ids are a function of content alone.
@@ -162,7 +150,7 @@ where
         return;
     };
     let mut results = Vec::new();
-    for (bin, half) in [(stock.as_str(), "stock"), (BIN, "zvcs")] {
+    for (bin, half) in [(stock, "stock"), (BIN, "zvcs")] {
         // Both fixtures are built by the STOCK binary so the starting object ids
         // are identical; only the rebase differs between the two halves.
         let (repo, home) = fixture(&stock, &format!("{tag}-{half}"));
@@ -392,7 +380,7 @@ fn exec_runs_after_every_pick_and_a_failure_stops() {
 fn autosquash_rearranges_the_generated_sheet() {
     let Some(stock) = stock_git() else { return };
     let mut results = Vec::new();
-    for (bin, half) in [(stock.as_str(), "stock"), (BIN, "zvcs")] {
+    for (bin, half) in [(stock, "stock"), (BIN, "zvcs")] {
         let (repo, home) = fixture(&stock, &format!("autosquash-{half}"));
         // A `fixup!` naming the first commit of the range by its subject.
         std::fs::write(repo.join("g"), "t3\nmore\n").unwrap();
@@ -469,7 +457,7 @@ fn missing_commits_check_warn_reports_but_proceeds() {
 fn instruction_format_renders_h_as_a_full_hash() {
     let Some(stock) = stock_git() else { return };
     let mut sheets = Vec::new();
-    for (bin, half) in [(stock.as_str(), "stock"), (BIN, "zvcs")] {
+    for (bin, half) in [(stock, "stock"), (BIN, "zvcs")] {
         let (repo, home) = fixture(&stock, &format!("instrfmt-{half}"));
         ok(bin, &repo, &home, &["config", "rebase.instructionFormat", "%h %s"]);
         // `cat` shows the sheet and leaves it unchanged, so the rebase still runs.
@@ -499,7 +487,7 @@ fn instruction_format_renders_h_as_a_full_hash() {
 fn abbreviate_commands_writes_short_spellings() {
     let Some(stock) = stock_git() else { return };
     let mut sheets = Vec::new();
-    for (bin, half) in [(stock.as_str(), "stock"), (BIN, "zvcs")] {
+    for (bin, half) in [(stock, "stock"), (BIN, "zvcs")] {
         let (repo, home) = fixture(&stock, &format!("abbrev-{half}"));
         ok(bin, &repo, &home, &["config", "rebase.abbreviateCommands", "true"]);
         let out = cmd(bin, &repo, &home)

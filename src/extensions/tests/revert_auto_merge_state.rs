@@ -32,21 +32,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_git");
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
 
-/// A STOCK git to compare against, or `None` on a machine without one.
-///
-/// Resolved explicitly rather than through `PATH`: on a machine where zvcs
-/// shadows `git`, a `PATH` lookup makes the oracle the thing under test.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .map(str::to_owned)
-}
+const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 const DATE: &str = "1112911993 +0000"; // 2005-04-07 in UTC
 

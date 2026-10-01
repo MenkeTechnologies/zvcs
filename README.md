@@ -333,7 +333,10 @@ superset verb `zverbs` is rejected as this binary wearing git's name, and the
 newest of the rest wins. One older than the version this port targets is refused
 outright rather than measured against: the two disagree about real behaviour, so
 its numbers would read like the others while describing a git nobody runs. Name a
-specific binary with `ZVCS_STOCK_GIT` to override the search.
+specific binary with `ZVCS_STOCK_GIT` to override the search. The differential
+tests under `src/extensions/tests` resolve their oracle through one shared
+helper, `tests/support/stock_git.rs`, with the same probe, the same newest-wins
+rule and the same override.
 
 Measuring against one git leaves a question it cannot answer. When zvcs differs
 from the newest installed git, either the port is wrong or *git* changed between

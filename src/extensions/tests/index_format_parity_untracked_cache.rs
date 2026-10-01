@@ -28,21 +28,14 @@
 //! Skipped when no stock git is available.
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_git");
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
 
-/// A stock git to build the cache with and to read the result back, or `None` to skip.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/opt/homebrew/bin/git", "/usr/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-        .map(str::to_owned)
-}
+const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 struct Fixture {
     root: PathBuf,

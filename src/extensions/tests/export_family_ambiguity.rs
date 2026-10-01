@@ -38,45 +38,18 @@
 //! against it and the two outputs compared, which is what catches an expectation
 //! that is self-consistent but not git's.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
+
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git_at_least;
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 /// The first line of `object_name_msg`, enough to tell the explanatory paragraph
 /// apart from the `warning:` line it follows.
 const ADVICE_FIRST_LINE: &str = "Git normally never creates a ref that ends with 40 hex characters";
-
-/// A stock git to compare against, or `None` when the machine has no foreign git
-/// installed.
-///
-/// Resolved explicitly rather than through `PATH`: on a machine where zvcs
-/// shadows `git` a `PATH` lookup silently makes the oracle the thing under test.
-fn stock_git() -> Option<String> {
-    if let Ok(p) = std::env::var("ZVCS_STOCK_GIT") {
-        return Path::new(&p).exists().then_some(p);
-    }
-    ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
-        .into_iter()
-        .filter(|p| Path::new(p).exists())
-        .filter_map(|p| Some((version_of(p)?, p.to_owned())))
-        // The comparisons below are byte-for-byte, and the advice paragraph's
-        // `git config set …` spelling is 2.46 and newer. An older git is a
-        // different oracle, not a worse one, so a machine that only has one runs
-        // the counts without it.
-        .filter(|(v, _)| *v >= (2, 55, 0))
-        .max()
-        .map(|(_, p)| p)
-}
-
-/// `git version X.Y.Z` as a comparable tuple, or `None` when it will not answer.
-fn version_of(bin: &str) -> Option<(u32, u32, u32)> {
-    let out = Command::new(bin).arg("--version").env_clear().output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let rest = text.trim().strip_prefix("git version ")?;
-    let mut parts = rest.split(['.', ' ', '-']).filter_map(|p| p.parse::<u32>().ok());
-    Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
-}
 
 /// A fixture repository plus the binary that built it.
 ///
@@ -201,7 +174,7 @@ where
     let zargs = setup(&zvcs);
     let zerr = zvcs.stderr(&zargs.iter().map(String::as_str).collect::<Vec<_>>());
 
-    if let Some(bin) = stock_git() {
+    if let Some(bin) = stock_git_at_least((2, 55, 0)) {
         let stock = fixture(&bin, &format!("{tag}-stock"));
         let sargs = setup(&stock);
         assert_eq!(sargs, zargs, "{tag}: the two fixtures must produce the same command line");
@@ -473,7 +446,7 @@ fn pack_objects_revs_never_warns() {
     };
     let (zerr, zn) = run(BIN, "silent-pack-zvcs");
     assert_eq!(zn, 0, "pack-objects --revs clears the switch:\n{zerr}");
-    if let Some(bin) = stock_git() {
+    if let Some(bin) = stock_git_at_least((2, 55, 0)) {
         let (_, sn) = run(&bin, "silent-pack-stock");
         assert_eq!(sn, zn, "pack-objects --revs must match stock");
     }
@@ -604,7 +577,7 @@ fn fast_export_first_parent_emits_the_side_branch_before_the_merge() {
             "{args:?}: the merge keeps its second parent:\n{stream}"
         );
 
-        if let Some(bin) = stock_git() {
+        if let Some(bin) = stock_git_at_least((2, 55, 0)) {
             let stock = fixture(&bin, &format!("fp-stock-{}", args.join("-")));
             assert_eq!(stock.stdout(&args), stream, "{args:?}: the whole stream must match stock");
         }

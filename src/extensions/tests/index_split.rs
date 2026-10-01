@@ -19,30 +19,11 @@
 use std::path::Path;
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_git");
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
 
-/// A real git, or `None` when this machine has none to compare against.
-///
-/// The probe asks a candidate to run a superset verb: zvcs serves `zjobs` itself,
-/// a real git does not. That test is only sound with `PATH` **emptied**: git's
-/// `execv_dashed_external()` resolves an unknown verb to a `git-<verb>` on `PATH`,
-/// and zvcs's own installation puts `~/.zvcs/bin/git-zjobs` there as a symlink to
-/// the shadow binary — so with the ambient `PATH` every stock git on this machine
-/// answers `zjobs` successfully and would be misread as zvcs, leaving every test
-/// in this file to return early while reporting a pass. Candidates are absolute
-/// paths for the same reason: `PATH=""` makes a bare `git` unspawnable.
-fn stock_git() -> Option<String> {
-    for cand in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] {
-        if !Path::new(cand).exists() {
-            continue;
-        }
-        match Command::new(cand).args(["zjobs"]).env("PATH", "").output() {
-            Ok(out) if !out.status.success() => return Some(cand.to_string()),
-            _ => continue,
-        }
-    }
-    None
-}
+const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn run(bin: &str, dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(bin)

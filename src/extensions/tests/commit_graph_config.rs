@@ -26,6 +26,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git_at_least;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn git(dir: &Path, args: &[&str]) {
@@ -269,35 +273,7 @@ fn invalid_generation_version_is_fatal_like_git() {
 /// `/usr/bin/git` — macOS 26 carries 2.50.1, which writes no filters no matter
 /// what these keys say — so an older binary would "disagree" about behavior it
 /// simply does not have.
-const MIN_STOCK: (u32, u32) = (2, 55);
-
-/// `(major, minor)` of a git binary, or `None` if it cannot be run or parsed.
-fn git_version(path: &str) -> Option<(u32, u32)> {
-    let out = Command::new(path).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    let nums = text.split_whitespace().find(|w| w.starts_with(char::is_numeric))?;
-    let mut it = nums.split('.');
-    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-}
-
-/// A stock git new enough to compare against, resolved explicitly rather than
-/// through `PATH` — on a machine where zvcs shadows `git`, `PATH` resolution
-/// would silently make the oracle the thing under test. When none is new enough
-/// the byte-comparison half of a test is skipped and the zvcs-side assertions
-/// still run.
-fn stock_git() -> Option<String> {
-    let candidates: Vec<String> = match std::env::var("ZVCS_STOCK_GIT") {
-        Ok(p) => vec![p],
-        Err(_) => ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-    };
-    candidates
-        .into_iter()
-        .filter(|p| std::path::Path::new(p).exists())
-        .find(|p| git_version(p).is_some_and(|v| v >= MIN_STOCK))
-}
+const MIN_STOCK: (u32, u32, u32) = (2, 55, 0);
 
 /// Delete the commit-graph, which both binaries leave read-only as git does.
 fn remove_graph(repo: &Path) {
@@ -362,7 +338,7 @@ fn same_as_stock(tag: &str, config: &[(&str, &str)], args: &[&str]) -> Vec<u8> {
     }
     let ours = write_graph_with(BIN, &repo, &home, args);
 
-    if let Some(stock) = stock_git() {
+    if let Some(stock) = stock_git_at_least(MIN_STOCK) {
         let theirs = write_graph_with(&stock, &repo, &home, args);
         assert_eq!(
             ours, theirs,

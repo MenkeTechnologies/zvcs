@@ -18,6 +18,10 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 const WARNING: &str = "warning: minimum pack size limit is 1 MiB";
 
@@ -73,7 +77,7 @@ fn zvcs(repo: &Path, home: &Path, extra: &[&str]) -> Output {
 }
 
 fn real(repo: &Path, home: &Path, extra: &[&str]) -> Output {
-    run_gc("git", repo, home, extra)
+    run_gc(stock_git().expect("no stock git to compare against; set ZVCS_STOCK_GIT to one"), repo, home, extra)
 }
 
 fn stderr(o: &Output) -> String {

@@ -1,14 +1,15 @@
-//! `--no-walk` with a pathspec dropped the named commits that do not touch it.
+//! `--no-walk` with a pathspec drops the named commits that do not touch it.
 //!
 //! `prepare_revision_walk()` returns before `limit_list()` under `--no-walk`
-//! (`if (revs->no_walk) return 0;`), and `get_revision_1()`'s
-//! `REV_WALK_NO_WALK` arm runs no `try_to_simplify_commit()`
-//! (revision.c:4418-4434). No commit is ever marked TREESAME, so every commit
-//! named on the command line is shown whatever the pathspec says. zvcs ran its
-//! path simplification anyway, in both `log` and `rev-list`, and printed only
-//! the named commits that changed the path.
+//! (`if (revs->no_walk) return 0;`). Up to 2.55 `get_revision_1()`'s
+//! `REV_WALK_NO_WALK` arm ran no `try_to_simplify_commit()`, so every named
+//! commit was shown whatever the pathspec said. 2.56 restored the pathspec
+//! filtering the streaming-walk refactor had lost: the arm now simplifies each
+//! named commit as the reflog arm does (revision.c:4478-4482), and
+//! `get_commit_action()` drops the TREESAME ones. `git show` runs the same
+//! one-entry walk per commit, so it filters too.
 //!
-//! Expectations measured from stock git 2.55.0 under the same environment.
+//! Expectations measured from stock git 2.56.0 under the same environment.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -72,12 +73,19 @@ impl Fixture {
 }
 
 #[test]
-fn every_named_commit_is_shown() {
+fn named_commits_that_miss_the_path_are_dropped() {
     let f = Fixture::new("named");
     let (out, err, code) = f.run(&["log", "--format=%s", "--no-walk", "main", "main~1", "--", "a"]);
-    assert_eq!((out.as_str(), err.as_str(), code), ("C\nB\n", "", 0));
+    assert_eq!((out.as_str(), err.as_str(), code), ("C\n", "", 0));
     let (out, _, code) = f.run(&["rev-list", "--no-walk", "--count", "main", "main~1", "--", "a"]);
-    assert_eq!((out.as_str(), code), ("2\n", 0));
+    assert_eq!((out.as_str(), code), ("1\n", 0));
+    let (out, err, code) = f.run(&["show", "-s", "--format=%s", "main", "main~1", "--", "a"]);
+    assert_eq!((out.as_str(), err.as_str(), code), ("C\n", "", 0));
+    // A topological order makes the walk limited, which skips the simplifying
+    // arm (`get_walk_mode()`, revision.c:4423-4434).
+    let (out, _, code) =
+        f.run(&["log", "--format=%s", "--no-walk", "--topo-order", "main", "main~1", "--", "a"]);
+    assert_eq!((out.as_str(), code), ("C\nB\n", 0));
     // Walking, the same pathspec does simplify B away.
     let (out, _, _) = f.run(&["log", "--format=%s", "main", "main~1", "--", "a"]);
     assert_eq!(out, "C\nA\n");

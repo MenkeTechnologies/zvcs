@@ -2254,6 +2254,29 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // one-entry walk it was set in, so a commit pended twice — the merge base
         // of `A...B` and the endpoint that names it, say — is walked once.
         let mut seen_pending: Vec<ObjectId> = Vec::new();
+        // Each one-entry walk runs `get_revision_1()`'s `REV_WALK_NO_WALK` arm,
+        // which since 2.56 runs `try_to_simplify_commit()` on the commit
+        // (revision.c:4478-4482), so with a pathspec `get_commit_action()` drops a
+        // commit TREESAME to its parent. A topological order or `-L` makes the
+        // walk limited or topological instead (`get_walk_mode()`,
+        // revision.c:4423-4434), which skips the arm. What the simplification
+        // records lives on the commit objects, so one state serves the whole loop.
+        let no_walk_simplify = reflog_from.is_none()
+            && !line_level
+            && order == super::log::Order::Default
+            && !pathspecs.is_empty();
+        let mut no_walk_specs = match no_walk_simplify {
+            true => Some(super::log::PathspecMatcher::new(&repo, &pathspecs)?),
+            false => None,
+        };
+        let nothing: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+        let mut no_walk_sim = super::simplify::ReflogWalk::new(
+            &repo,
+            super::simplify::Mode { dense: true, simplify_history: true, first_parent },
+            false,
+            &nothing,
+            &nothing,
+        );
         // `revs->skip_count`, spent inside `get_revision()` — the one-entry walk
         // `cmd_show` runs per pending commit consults the same counter, so the
         // skip is spread across the pending list rather than restarting at each
@@ -2285,6 +2308,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         .is_some_and(|since| seconds < since);
                 if too_old || counts.min_age.is_some_and(|until| seconds > until) {
                     continue;
+                }
+                if let Some(specs) = no_walk_specs.as_mut() {
+                    let mut diff = super::rev_list::PathDiff {
+                        repo: &repo,
+                        specs,
+                        decorations: None,
+                        pathspec: true,
+                    };
+                    no_walk_sim.pop(*id, &mut diff)?;
+                    if !no_walk_sim.shows(*id, false) {
+                        continue;
+                    }
                 }
                 if skip_left > 0 {
                     skip_left -= 1;

@@ -2853,10 +2853,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `revs->prune`: a pathspec, or `--simplify-by-decoration`, which sets it with
     // no pathspec at all (revision.c:2452).
     //
-    // Under `--no-walk` nothing is pruned: `prepare_revision_walk()` returns before
-    // `limit_list()` (`if (revs->no_walk) return 0;`) and `get_revision_1()`'s
-    // `REV_WALK_NO_WALK` arm runs no `try_to_simplify_commit()` (revision.c:4418-
-    // 4434), so no commit is marked TREESAME and every named one is shown.
+    // Under `--no-walk` nothing is pruned here: `prepare_revision_walk()` returns
+    // before `limit_list()` (`if (revs->no_walk) return 0;`). The named commits
+    // are simplified one at a time instead, by the `no_walk_mode` pass below.
     let prune = (!pathspecs.is_empty() || simplify_by_decoration) && !no_walk;
     // `get_name_decoration()`, which `rev_compare_tree()` consults under
     // `--simplify-by-decoration` (revision.c:789-805). It loads every ref with no
@@ -3343,6 +3342,54 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             if cfilter.matches(&object.into_commit())? {
                 kept.push(*id);
             }
+        }
+        commits = kept;
+    }
+
+    // `--no-walk` with a pathspec: since 2.56 `get_revision_1()`'s
+    // `REV_WALK_NO_WALK` arm runs `try_to_simplify_commit()` on each named commit
+    // as the reflog arm does (revision.c:4478-4482), so `get_commit_action()`
+    // drops the TREESAME ones and `simplify_commit()` rewrites the parents of the
+    // rest when ancestry is wanted (revision.c:4359-4385). The arm is only taken
+    // when nothing made the walk limited or topological (`get_walk_mode()`,
+    // revision.c:4423-4434; `--bisect` sets `revs->limited` too,
+    // builtin/rev-list.c:916-917). The pass is the one `-g` uses, below.
+    let no_walk_mode = no_walk
+        && !walk_reflogs
+        && order == Order::Date
+        && !(ancestry_path
+            || simplify_merges_opt
+            || simplify_by_decoration
+            || left_only
+            || right_only
+            || cherry_mark
+            || cherry_pick
+            || show_children
+            || bisect);
+    if no_walk_mode && !pathspecs.is_empty() {
+        let mode = super::simplify::Mode {
+            dense,
+            simplify_history: !full_history,
+            first_parent,
+        };
+        let nothing: HashSet<ObjectId> = HashSet::new();
+        let mut sim = super::simplify::ReflogWalk::new(&repo, mode, false, &nothing, &nothing);
+        let mut specs = super::log::PathspecMatcher::new(&repo, &pathspecs)?;
+        let mut diff =
+            PathDiff { repo: &repo, specs: &mut specs, decorations: None, pathspec: true };
+        let mut kept = Vec::with_capacity(commits.len());
+        for id in std::mem::take(&mut commits) {
+            sim.pop(id, &mut diff)?;
+            if dense {
+                if !sim.shows(id, show_parents) {
+                    continue;
+                }
+                if show_parents {
+                    sim.rewrite(id, &mut diff)?;
+                }
+            }
+            parents_of.insert(id, sim.parents(id).to_vec());
+            kept.push(id);
         }
         commits = kept;
     }

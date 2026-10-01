@@ -4245,16 +4245,34 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `--simplify-merges`' parent reduction — is the same pass a pathspec gets.
     //
     // `--no-walk` never gets there: `prepare_revision_walk()` returns before
-    // `limit_list()` (`if (revs->no_walk) return 0;`), and `get_revision_1()`'s
-    // `REV_WALK_NO_WALK` arm runs no `try_to_simplify_commit()` (revision.c:4418-
-    // 4434). No commit is ever marked TREESAME, so every named one is shown.
+    // `limit_list()` (`if (revs->no_walk) return 0;`). Since 2.56 its
+    // `REV_WALK_NO_WALK` arm simplifies each named commit the way the reflog arm
+    // does (revision.c:4478-4482), so a pathspec drops the TREESAME ones again.
+    // That arm is only taken when nothing made the walk limited or topological
+    // (`get_walk_mode()`, revision.c:4423-4434): a topo/date order, and every
+    // option that sets `revs->limited` (revision.c:2437-2547, 2747-2750,
+    // 3174-3177), leave the named commits unsimplified.
     // `-g` simplifies each entry as `next_reflog_entry()` hands it out, and
     // `rewrite_parents()` walks the real history behind it rather than a limited
     // list: see [`super::simplify::ReflogWalk`]. `setup_revisions()` has already
     // refused every option that would need the list (`--graph`,
     // `--simplify-merges`, `--simplify-by-decoration`, `--children`), so only
     // `--parents` asks for ancestry here.
-    let reflog_prune = walk_reflogs && !pathspecs.is_empty() && !follow && no_walk.is_none();
+    let no_walk_mode = no_walk.is_some()
+        && !walk_reflogs
+        && effective_order == Order::Default
+        && !(ancestry_path
+            || simplify_merges_opt
+            || simplify_by_decoration
+            || left_only
+            || right_only
+            || cherry_mark
+            || cherry_pick
+            || show_children
+            || line_level);
+    let reflog_prune = ((walk_reflogs && no_walk.is_none()) || no_walk_mode)
+        && !pathspecs.is_empty()
+        && !follow;
     if reflog_prune {
         let mode = super::simplify::Mode {
             dense,

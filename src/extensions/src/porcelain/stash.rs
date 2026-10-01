@@ -4331,22 +4331,52 @@ fn parse_push_options(
     }
     o.interactive = patch_opts.to_interactive(false);
 
-    // git refuses the combination outright rather than picking a winner, on
-    // stderr and unprefixed (`do_push_stash()`).
-    if o.staged_only && o.untracked != Untracked::No {
-        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
-        return Ok(Err(ExitCode::FAILURE));
+    if let Some(code) = refuse_capture_combinations(&mut o) {
+        return Ok(Err(code));
     }
-    // `--patch` and `-u`/`-a` describe two different things to capture, so git
-    // takes neither; `--patch` silently wins over `--staged`.
+    Ok(Ok(o))
+}
+
+/// The head of `do_push_stash()`, shared by `push` and `save` (and so the
+/// assumed push), in its order:
+///
+/// ```c
+/// if (patch_mode && include_untracked) {
+///         fprintf_ln(stderr, _("Can't use --patch and --include-untracked"
+///                              " or --all at the same time"));
+///         ret = -1;
+///         goto done;
+/// }
+///
+/// /* --patch overrides --staged */
+/// if (patch_mode)
+///         only_staged = 0;
+///
+/// if (only_staged && include_untracked) {
+///         fprintf_ln(stderr, _("Can't use --staged and --include-untracked"
+///                              " or --all at the same time"));
+///         ret = -1;
+///         goto done;
+/// }
+/// ```
+///
+/// (builtin/stash.c:1686-1702.) `--patch` is checked first and clears `--staged`
+/// before the `--staged` check runs, so `-p -S -u` is the `--patch` refusal.
+/// Both lines are unprefixed on stderr; the `-1` is `ExitCode::FAILURE`, which
+/// the caller maps (see [`explicit_status`]).
+fn refuse_capture_combinations(o: &mut PushOpts) -> Option<ExitCode> {
     if o.patch && o.untracked != Untracked::No {
         eprintln!("Can't use --patch and --include-untracked or --all at the same time");
-        return Ok(Err(ExitCode::FAILURE));
+        return Some(ExitCode::FAILURE);
     }
     if o.patch {
         o.staged_only = false;
     }
-    Ok(Ok(o))
+    if o.staged_only && o.untracked != Untracked::No {
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Some(ExitCode::FAILURE);
+    }
+    None
 }
 
 /// `parse_options()`'s rejection: the unknown flag, then the subcommand's usage
@@ -4462,16 +4492,8 @@ fn parse_save_options(args: &[String]) -> Result<std::result::Result<PushOpts, E
         return Ok(Err(code));
     }
     o.interactive = patch_opts.to_interactive(false);
-    if o.staged_only && o.untracked != Untracked::No {
-        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
-        return Ok(Err(ExitCode::FAILURE));
-    }
-    if o.patch && o.untracked != Untracked::No {
-        eprintln!("Can't use --patch and --include-untracked or --all at the same time");
-        return Ok(Err(ExitCode::FAILURE));
-    }
-    if o.patch {
-        o.staged_only = false;
+    if let Some(code) = refuse_capture_combinations(&mut o) {
+        return Ok(Err(code));
     }
     // `if (argc) stash_msg = strbuf_join_argv(...)`: the words replace whatever
     // `-m` parsed, and an empty word list leaves that value alone.

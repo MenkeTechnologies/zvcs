@@ -144,6 +144,29 @@ fn refused_push_combinations_follow_the_same_split() {
     assert_eq!(f.stash_count(), 0);
 }
 
+/// `do_push_stash()` refuses `--patch` with `-u`/`-a` *before* `--patch` clears
+/// `--staged` and before the `--staged` check (builtin/stash.c:1686-1702), so
+/// `-p -S -u` is the `--patch` refusal — in either option order, from `push`,
+/// `save` and the assumed push alike.
+#[test]
+fn patch_with_untracked_is_refused_before_staged_is_looked_at() {
+    let f = Fixture::new("patchfirst");
+    f.write("n.txt", "two\n");
+    f.git(&["add", "n.txt"]);
+
+    for (args, code) in [
+        (&["stash", "push", "-p", "-S", "-u"][..], 128),
+        (&["stash", "push", "-S", "-p", "-a"][..], 128),
+        (&["stash", "save", "-S", "-p", "-u"][..], 128),
+        (&["stash", "-p", "-S", "-a"][..], 1),
+    ] {
+        let (got, err) = f.run(args);
+        assert_eq!(got, code, "git {args:?}: {err}");
+        assert_eq!(err, "Can't use --patch and --include-untracked or --all at the same time\n", "git {args:?}");
+    }
+    assert_eq!(f.stash_count(), 0);
+}
+
 /// `apply`/`pop` exit 1 for a conflicted merge and nothing else: a merge
 /// `unpack_trees()` refused over an unstaged edit is `merge_ort_nonrecursive()`'s
 /// -1, so 128, and the entry is kept either way.

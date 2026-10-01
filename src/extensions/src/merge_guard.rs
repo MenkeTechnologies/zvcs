@@ -43,6 +43,10 @@ pub struct Clobber {
     /// `ERROR_NOT_UPTODATE_FILE` — `verify_uptodate()`: the worktree file does
     /// not match the index entry the checkout is about to replace.
     pub not_uptodate: Vec<BString>,
+    /// `ERROR_NOT_UPTODATE_DIR` — `verify_clean_subdirectory()`: a directory
+    /// stands where the checkout wants a file (or wants nothing), and removing
+    /// it would lose the untracked files inside.
+    pub not_uptodate_dir: Vec<BString>,
     /// `ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN` — `verify_absent()`: an
     /// untracked file sits where the new tree wants to write.
     pub untracked_overwritten: Vec<BString>,
@@ -56,6 +60,7 @@ impl Clobber {
     pub fn is_empty(&self) -> bool {
         self.would_overwrite.is_empty()
             && self.not_uptodate.is_empty()
+            && self.not_uptodate_dir.is_empty()
             && self.untracked_overwritten.is_empty()
             && self.untracked_removed.is_empty()
     }
@@ -102,6 +107,15 @@ impl Clobber {
         let move_advice = format!("Please move or remove them before you {action}.");
         block(&self.would_overwrite, &overwritten, &commit_advice);
         block(&self.not_uptodate, &overwritten, &commit_advice);
+        // The one porcelain message with no advice sentence, so `error()`'s
+        // newline after the path list is always the blank line.
+        if !self.not_uptodate_dir.is_empty() {
+            eprintln!("error: Updating the following directories would lose untracked files in them:");
+            for path in &self.not_uptodate_dir {
+                eprintln!("\t{}", quote_path(path));
+            }
+            eprintln!();
+        }
         block(
             &self.untracked_overwritten,
             &format!("The following untracked working tree files would be overwritten by {cmd}:"),
@@ -133,6 +147,9 @@ impl Clobber {
         });
         block(&self.not_uptodate, |p| {
             format!("Entry '{p}' not uptodate. Cannot merge.")
+        });
+        block(&self.not_uptodate_dir, |p| {
+            format!("Updating '{p}' would lose untracked files in it")
         });
         block(&self.untracked_overwritten, |p| {
             format!("Untracked working tree file '{p}' would be overwritten by merge.")
@@ -201,6 +218,9 @@ pub fn report_index_changes(paths: &[BString]) {
 ///   staged, so the checkout would undo it: rejected.
 /// * path absent from both index and old tree — an addition, so
 ///   `verify_absent()` requires nothing untracked in the way.
+/// * a directory on disk where either check looks is `verify_clean_subdirectory()`'s:
+///   it may go only when nothing tracked inside is modified and nothing
+///   untracked is inside.
 /// * anything else (index matching neither side) — rejected.
 ///
 /// A worktree file that was *deleted* without staging is not dirt here: git's
@@ -227,51 +247,161 @@ pub fn verify_two_way(
     }
 
     let (cur, conflicted) = index_map(index);
-    // Paths still needing a look at the disk, deferred so the worktree is
-    // scanned once, and only when the answer can matter.
-    let mut uptodate: Vec<&BString> = Vec::new();
-    let mut absent_overwritten: Vec<&BString> = Vec::new();
-    let mut absent_removed: Vec<&BString> = Vec::new();
-
+    // What each path in the footprint asks of the disk, in traversal order.
+    let mut checks: Vec<(&BString, Check)> = Vec::new();
     for path in touched {
         let (o, n) = (old.get(path), new.get(path));
-        match cur.get(path) {
+        let check = match cur.get(path) {
             // An unmerged path cannot match any tree entry; git dies on a
             // conflicted index long before this, so treat it as a rejection.
-            Some(_) if conflicted.contains(path) => clobber.would_overwrite.push(path.clone()),
+            Some(_) if conflicted.contains(path) => Check::Reject,
             // Already at the target — `keep_entry()`, whatever the worktree holds.
-            Some(c) if n == Some(c) => {}
-            Some(c) if o == Some(c) => uptodate.push(path),
-            Some(_) => clobber.would_overwrite.push(path.clone()),
+            Some(c) if n == Some(c) => continue,
+            // `merged_entry()` / `deleted_entry()` with the index at the old entry.
+            Some(c) if o == Some(c) => match n {
+                Some(_) => Check::Uptodate,
+                None => Check::Deleted(o.expect("matched above").1),
+            },
+            Some(_) => Check::Reject,
             // Staged deletion of a path the merge changes: `twoway_merge()`
             // rejects rather than resurrect it.
-            None if o.is_some() && n.is_some() => clobber.would_overwrite.push(path.clone()),
-            None if n.is_some() => absent_overwritten.push(path),
-            None => absent_removed.push(path),
-        }
+            None if o.is_some() && n.is_some() => Check::Reject,
+            None => match n {
+                Some(entry) => Check::Absent(entry.1, AbsentError::Overwritten),
+                None => Check::Absent(o.expect("in the footprint").1, AbsentError::Removed),
+            },
+        };
+        checks.push((path, check));
     }
 
-    if uptodate.is_empty() && absent_overwritten.is_empty() && absent_removed.is_empty() {
-        return Ok(clobber);
-    }
-    let want_untracked = !absent_overwritten.is_empty() || !absent_removed.is_empty();
-    let worktree = scan(repo, want_untracked)?;
-    for path in uptodate {
-        if worktree.modified.contains(path) {
-            clobber.not_uptodate.push(path.clone());
+    let is_dir = |path: &BString| {
+        repo.workdir_path(path.as_bstr())
+            .and_then(|full| full.symlink_metadata().ok())
+            .is_some_and(|meta| meta.is_dir())
+    };
+    // Untracked files matter to `verify_absent()` and to every directory
+    // `verify_clean_subdirectory()` would look into.
+    let want_untracked = checks.iter().any(|(path, check)| match check {
+        Check::Absent(..) => true,
+        Check::Deleted(_) => is_dir(path),
+        Check::Uptodate | Check::Reject => false,
+    });
+    let worktree = match checks.iter().all(|(_, check)| matches!(check, Check::Reject)) {
+        true => Worktree::default(),
+        false => scan(repo, want_untracked)?,
+    };
+
+    // `verify_uptodate()`: the file must still match the index. A directory
+    // where the index has a file is not `ENOENT` and fails `ie_match_stat()`;
+    // a gitlink is never in the way (see [`scan`]).
+    let uptodate = |path: &BString, mode: Mode| {
+        mode == Mode::COMMIT || !(is_dir(path) || worktree.modified.contains(path))
+    };
+    // `verify_clean_subdirectory()` (unpack-trees.c:2320-2393) for `path`, which
+    // is a directory on disk while the checkout wants `mode` there or nothing:
+    // a gitlink is left alone (this port never recurses into submodules, so
+    // `verify_clean_submodule()` has no submodule to ask); every tracked entry
+    // inside must be up to date, rejected under its own name otherwise; and
+    // `read_directory()` must find no untracked file under `path/`.
+    let clean_subdirectory = |clobber: &mut Clobber, path: &BString, mode: Mode| {
+        if mode == Mode::COMMIT {
+            return true;
         }
-    }
-    for path in absent_overwritten {
-        if worktree.untracked.contains(path) && is_plain_file(repo, path) {
-            clobber.untracked_overwritten.push(path.clone());
+        let mut prefix = path.clone();
+        prefix.push(b'/');
+        let mut inside: Vec<(&BString, Mode)> = cur
+            .iter()
+            .filter(|(p, _)| p.starts_with(&prefix))
+            .map(|(p, (_, mode))| (p, *mode))
+            .collect();
+        inside.sort_by(|a, b| a.0.cmp(b.0));
+        if let Some((stale, _)) = inside.into_iter().find(|(p, mode)| !uptodate(p, *mode)) {
+            clobber.not_uptodate.push(stale.clone());
+            return false;
         }
-    }
-    for path in absent_removed {
-        if worktree.untracked.contains(path) && is_plain_file(repo, path) {
-            clobber.untracked_removed.push(path.clone());
+        if worktree.untracked.iter().any(|p| p.starts_with(&prefix)) {
+            clobber.not_uptodate_dir.push(path.clone());
+            return false;
+        }
+        true
+    };
+
+    // `unpack_callback()` stops at a name whose non-directory entry is
+    // rejected, so the subtree under it is never traversed.
+    let mut rejected: Vec<&BString> = Vec::new();
+    for (path, check) in checks {
+        let under_rejected = rejected
+            .iter()
+            .any(|r| path.len() > r.len() && path.starts_with(r) && path[r.len()] == b'/');
+        if under_rejected {
+            continue;
+        }
+        let ok = match check {
+            Check::Reject => {
+                clobber.would_overwrite.push(path.clone());
+                false
+            }
+            Check::Uptodate => {
+                let ok = uptodate(path, cur[path].1);
+                if !ok {
+                    clobber.not_uptodate.push(path.clone());
+                }
+                ok
+            }
+            // `deleted_entry()`: `verify_absent_if_directory()`, then `verify_uptodate()`.
+            Check::Deleted(mode) => {
+                if is_dir(path) && !clean_subdirectory(&mut clobber, path, mode) {
+                    false
+                } else {
+                    let ok = uptodate(path, cur[path].1);
+                    if !ok {
+                        clobber.not_uptodate.push(path.clone());
+                    }
+                    ok
+                }
+            }
+            // `verify_absent()`: an untracked file is rejected outright, a
+            // directory goes to `verify_clean_subdirectory()`.
+            Check::Absent(mode, error) => {
+                if is_dir(path) {
+                    clean_subdirectory(&mut clobber, path, mode)
+                } else if worktree.untracked.contains(path) {
+                    match error {
+                        AbsentError::Overwritten => clobber.untracked_overwritten.push(path.clone()),
+                        AbsentError::Removed => clobber.untracked_removed.push(path.clone()),
+                    }
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+        if !ok {
+            rejected.push(path);
         }
     }
     Ok(clobber)
+}
+
+/// What `twoway_merge()` asks of the disk for one path of the footprint.
+enum Check {
+    /// `reject_merge()`: the index matches neither tree.
+    Reject,
+    /// `merged_entry()` over the index's old entry: `verify_uptodate()`.
+    Uptodate,
+    /// `deleted_entry()` over the index's old entry, whose tree mode is given.
+    Deleted(Mode),
+    /// A path the index does not have: `verify_absent()` for the entry of this
+    /// mode, failing with the given error.
+    Absent(Mode, AbsentError),
+}
+
+/// The `verify_absent()` error a file in the way is reported under.
+enum AbsentError {
+    /// `ERROR_WOULD_LOSE_UNTRACKED_OVERWRITTEN`
+    Overwritten,
+    /// `ERROR_WOULD_LOSE_UNTRACKED_REMOVED`
+    Removed,
 }
 
 /// `unpack_trees()` with `fn = threeway_merge` and `o->aggressive` — that is,
@@ -429,9 +559,10 @@ pub fn verify_three_way(
 /// `check_ok_to_remove()` rejects a file outright, but hands a directory to
 /// `verify_clean_subdirectory()`, which lets through a gitlink whose submodule
 /// already sits at the target commit and otherwise counts the untracked files
-/// inside. That subdirectory walk is not ported: a directory in the way is left
-/// to the checkout, which keeps meta-repo merges that add a submodule already
-/// present on disk working, as they do under git.
+/// inside. [`verify_two_way`] ports that walk; the three-way gate does not yet,
+/// and leaves a directory in the way to the checkout, which keeps meta-repo
+/// merges that add a submodule already present on disk working, as they do
+/// under git.
 fn is_plain_file(repo: &gix::Repository, path: &BString) -> bool {
     repo.workdir_path(path.as_bstr())
         .and_then(|full| full.symlink_metadata().ok())
@@ -468,6 +599,7 @@ fn index_map(index: &gix::index::State) -> (Flat, HashSet<BString>) {
 }
 
 /// The two facts the gate needs from the worktree, from a single status pass.
+#[derive(Default)]
 struct Worktree {
     /// Tracked paths whose worktree content differs from the index — git's
     /// `ie_match_stat()` mismatch. A path deleted from the worktree is left out:

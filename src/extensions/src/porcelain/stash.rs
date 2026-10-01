@@ -2014,7 +2014,7 @@ fn merge_trees_cleanly(
 }
 
 /// `repo_refresh_and_write_index()` refusing an unmerged index, which is how a
-/// `stash push` in the middle of a conflicted merge ends: every unmerged path on
+/// `stash push`, `apply` or `pop` in the middle of a conflicted merge ends: every unmerged path on
 /// stdout, then `error: could not write index` and a `-1` (see [`failed`]).
 fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     let index = repo.open_index()?;
@@ -2670,8 +2670,8 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
     }
     let restored = match restore_stash_commit(repo, commit_id, opts.restore_index, opts.quiet, &opts.labels)? {
         Ok(restored) => restored,
-        // `--index` could not replay the stash's staged state onto ours: git
-        // reports it and stops before the worktree is touched — and a `pop` says
+        // An unmerged index, or `--index` that could not replay the stash's staged
+        // state onto ours: git reports it and stops before the worktree is touched — and a `pop` says
         // the entry survived, as it does for every other failure.
         Err(code) => {
             if pop {
@@ -2743,10 +2743,10 @@ impl ApplyResult {
 /// Restore the stash onto the current tree with a three-way merge, shared by
 /// `apply`/`pop` and `branch`.
 ///
-/// `Err(code)` is `do_apply_stash`'s early refusal: `--index` asks for the
-/// stash's staged state to be replayed onto the current index (`apply_cached()`),
-/// and when that patch does not apply git says so and stops — before the merge,
-/// so nothing on disk moves.
+/// `Err(code)` is `do_apply_stash`'s early refusal, before the merge, so nothing
+/// on disk moves: an unmerged index fails the opening refresh, and `--index`,
+/// which asks for the stash's staged state to be replayed onto the current index
+/// (`apply_cached()`), stops when that patch does not apply.
 ///
 /// `restore_index` is `do_apply_stash`'s `index` argument: with it the index is
 /// rebuilt from the stash's `I` (staged) tree, so what was staged when the stash
@@ -2788,10 +2788,21 @@ fn restore_stash_commit(
     // unrelated local work — and what makes the local-changes refusal below
     // git's own, since merge-ort ends in the same `unpack_trees` gate every
     // merge does.
-    let mut old_index = repo.open_index()?;
-    if old_index.entries().iter().any(|e| e.stage_raw() != 0) {
-        crate::git_fatal!("cannot apply a stash in the middle of a merge");
+    //
+    // ```c
+    // if (repo_refresh_and_write_index(the_repository, REFRESH_QUIET, 0, 0,
+    //                                  NULL, NULL, NULL))
+    //         return error(_("could not write index"));
+    // ```
+    //
+    // (builtin/stash.c:660-662.) An unmerged index fails that refresh, so a
+    // conflicted path is `<path>: needs merge` on stdout and the apply is `-1`:
+    // exit 128, and `pop` says the entry was kept. The `cannot apply a stash in
+    // the middle of a merge` that follows it in C is never reached that way.
+    if refuse_unmerged_index(repo)?.is_some() {
+        return Ok(Err(failed()));
     }
+    let mut old_index = repo.open_index()?;
     // `do_apply_stash()` gets *ours* from
     // `write_index_as_tree(&c_tree, the_repository->index, repo_get_index_file(), 0, NULL)`
     // (builtin/stash.c:661-663) — the on-disk index file, by name. That function rewrites it:
@@ -3083,7 +3094,7 @@ fn restore_stash_commit(
     // `ret = clean >= 0 ? !clean : clean;` (builtin/stash.c:726): a merge that
     // `unclean()` or `unpack_trees()` refused is `merge_ort_nonrecursive()`'s -1,
     // a conflicted one its 0 and so 1 here; `restore_untracked()` failing then
-    // overrides either with `error()`'s -1 (builtin/stash.c:747-748).
+    // overrides either with `error()`'s -1 (builtin/stash.c:751-752).
     if !untracked_ok {
         eprintln!("error: could not restore untracked files from stash");
         return Ok(Ok(ApplyResult::Error));

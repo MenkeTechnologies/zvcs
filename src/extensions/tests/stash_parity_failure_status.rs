@@ -193,6 +193,42 @@ fn only_a_conflicted_apply_exits_1() {
     assert_eq!(f.stash_count(), 1, "a refused pop keeps its entry");
 }
 
+/// `do_apply_stash()` opens with `repo_refresh_and_write_index()`, which an
+/// unmerged index fails (builtin/stash.c:660-662): the path is `needs merge` on
+/// stdout, then `error: could not write index` and `-1`, so 128 — not a `fatal:`
+/// about applying in the middle of a merge. `pop` keeps the entry and says so.
+#[test]
+fn apply_over_an_unmerged_index_is_the_refresh_refusal() {
+    let f = Fixture::new("unmerged");
+    f.write("b.txt", "x\n");
+    f.git(&["add", "b.txt"]);
+    f.git(&["commit", "-q", "-m", "b"]);
+    f.write("b.txt", "st\n");
+    f.git(&["stash", "-q"]);
+    f.git(&["checkout", "-q", "-b", "other"]);
+    f.write("n.txt", "other\n");
+    f.git(&["commit", "-q", "-am", "other"]);
+    f.git(&["checkout", "-q", "main"]);
+    f.write("n.txt", "main\n");
+    f.git(&["commit", "-q", "-am", "main"]);
+    // Expected to conflict, so the exit code is not asserted.
+    let _ = f.cmd(&["merge", "other"]).output().unwrap();
+
+    for (args, stdout) in [
+        (&["stash", "apply"][..], "n.txt: needs merge\n"),
+        (
+            &["stash", "pop", "-q"][..],
+            "n.txt: needs merge\nThe stash entry is kept in case you need it again.\n",
+        ),
+    ] {
+        let out = f.cmd(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(128), "git {args:?}: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), stdout, "git {args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "error: could not write index\n", "git {args:?}");
+    }
+    assert_eq!(f.stash_count(), 1, "the entry is kept");
+}
+
 /// `get_stash_info()`'s and `get_stash_info_assert()`'s refusals are `-1`.
 #[test]
 fn stash_resolution_refusals_are_128() {

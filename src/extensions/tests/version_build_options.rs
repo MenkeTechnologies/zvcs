@@ -197,9 +197,10 @@ fn the_flate_line_is_the_version_the_lockfile_resolved() {
 /// The two `default-` lines are claims about defaults, and each has to agree
 /// with the command that acts on them: `default-hash: sha1` means a bare
 /// `git init` lays down a sha1 repository (not that sha256 is refused — see
-/// [`the_sha256_line_is_backed_by_a_working_object_format`]), while
-/// `default-ref-format: files` is *also* the only ref format with a backend, so
-/// `--ref-format=reftable` must still be refused.
+/// [`the_sha256_line_is_backed_by_a_working_object_format`]), and
+/// `default-ref-format: files` means a bare `git init` writes no
+/// `extensions.refstorage` (not that reftable is refused: `--ref-format=reftable`
+/// lays down a reftable repository, as git 2.56 does).
 #[test]
 fn the_declared_defaults_are_what_a_bare_init_produces() {
     let dir = fixture("formats");
@@ -220,11 +221,17 @@ fn the_declared_defaults_are_what_a_bare_init_produces() {
     );
     assert!(config.contains("repositoryformatversion = 0"), "{config}");
 
-    let out = run(&dir, &["init", "--ref-format=reftable"]);
     assert!(
-        !out.status.success(),
-        "--ref-format=reftable succeeded, so `files` is no longer the only supported ref format"
+        !config.contains("refstorage"),
+        "`default-ref-format: files` but a bare init recorded a ref storage format:\n{config}"
     );
+
+    let reftable = dir.join("reftable");
+    let out = run(&dir, &["init", "-q", "--ref-format=reftable", "reftable"]);
+    assert!(out.status.success(), "--ref-format=reftable was refused");
+    let config = std::fs::read_to_string(reftable.join(".git/config")).unwrap();
+    assert!(config.contains("refstorage = reftable"), "{config}");
+    assert!(reftable.join(".git/reftable/tables.list").exists());
 }
 
 /// A backend line is only true if the format it names actually works, so this

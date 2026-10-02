@@ -403,10 +403,13 @@ fn repack_and_gc_reject_the_pack_config_keys_only_once_they_do_real_work() {
     );
     assert_eq!(code(&repack), 128);
 
+    // git 2.56 reports the failed repack child after the grandchild's own
+    // diagnostic, with the argument vector `run_command()` already cleared
+    // (odb/source-files.c:730-733): "error: failed to run (null)".
     let gc = run(&repo, &home, &["-c", "pack.useBitmaps=bogus", "gc", "-q"]);
     assert_eq!(
         stderr(&gc),
-        "fatal: bad boolean config value 'bogus' for 'pack.usebitmaps'\n",
+        "fatal: bad boolean config value 'bogus' for 'pack.usebitmaps'\nerror: failed to run (null)\n",
         "a real gc reaches it through its repack"
     );
     assert_eq!(code(&gc), 128);

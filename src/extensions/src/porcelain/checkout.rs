@@ -2235,8 +2235,8 @@ fn switch_unborn_to_new_branch(
 
 /// `git checkout --orphan <name> [<start>]`: point `HEAD` at an unborn branch
 /// `<name>` whose worktree/index come from `<start>`'s tree. The ref is not
-/// created (git materializes it only at the first commit) and no reflog entry is
-/// written, matching stock git.
+/// created (git materializes it only at the first commit); the files store
+/// writes no reflog entry, and the reftable store logs `HEAD`'s move.
 fn orphan_checkout(
     repo: &gix::Repository,
     name: &str,
@@ -2251,6 +2251,8 @@ fn orphan_checkout(
 ) -> Result<ExitCode> {
     // `old_branch_info.commit` for the post-checkout hook at the tail.
     let old_head = head_commit_id(repo);
+    // `old_desc` for the reflog message `HEAD`'s move is logged with.
+    let old_label = head_label(repo, &repo.head()?);
     // With no start-point operand there is nothing for git to resolve:
     // `parse_branchname_arg()` runs only `if (argc && opts->accept_ref)`
     // (builtin/checkout.c:1990-2000), so `new_branch_info.commit` stays NULL and
@@ -2344,10 +2346,14 @@ fn orphan_checkout(
         show_local_changes(&start_commit.to_string(), quiet)?;
     }
 
-    // Write HEAD as a plain symref to the (not-yet-existing) branch. No ref is
-    // created and no reflog line is appended — git's exact orphan behavior.
-    let head_path = repo.git_dir().join("HEAD");
-    std::fs::write(&head_path, format!("ref: {full}\n"))?;
+    // `refs_update_symref(…, "HEAD", new_branch_info->path, msg.buf)`
+    // (builtin/checkout.c:1020-1022): `HEAD` becomes a symref to the
+    // not-yet-existing branch, which is not created. The files store writes
+    // nothing else, so the file is written as it is; the reftable store logs
+    // the move as its transaction decides.
+    let msg = std::env::var("GIT_REFLOG_ACTION")
+        .unwrap_or_else(|_| format!("checkout: moving from {old_label} to {name}"));
+    crate::refstore::state_ref_write(repo, "HEAD", &crate::refstore::StateRef::Symbolic(full.clone().into()), &msg)?;
 
     if !quiet {
         eprintln!("Switched to a new branch '{name}'");
@@ -4126,6 +4132,10 @@ fn write_head_log(
     message: &str,
     dedup: bool,
 ) {
+    if crate::refstore::is_reftable(repo) {
+        reftable_head_log(repo, from, to, message);
+        return;
+    }
     // `log_all_ref_updates` is on by default for a repository with a worktree,
     // and git creates `logs/HEAD` on the first update there.
     let path = repo.git_dir().join("logs").join("HEAD");
@@ -4179,6 +4189,42 @@ fn write_head_log(
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, body);
+}
+
+/// [`write_head_log`] in a reftable repository. The store logs every `HEAD`
+/// update it makes itself, as git's reftable backend does
+/// (`write_transaction_table()`, refs/reftable-backend.c:1463-1664), so the
+/// entry this helper describes is usually there already: the newest `HEAD`
+/// entry with the same ids and message. Only when the caller moved nothing
+/// through the store — `reset: moving to HEAD` re-logging the commit `HEAD`
+/// is already on — is the entry added, as git's `refs_update_ref()` of `HEAD`
+/// to its own value adds it: a log-only update of `HEAD`, whose old value the
+/// store reads as the commit `HEAD` resolves to.
+fn reftable_head_log(repo: &gix::Repository, from: Option<ObjectId>, to: Option<ObjectId>, message: &str) {
+    let null = ObjectId::null(repo.object_hash());
+    let (from, to) = (from.unwrap_or(null), to.unwrap_or(null));
+    let mut logged = false;
+    let _ = crate::refstore::for_each_reflog_entry(repo, "HEAD", true, |entry| {
+        logged = entry.old_oid == from && entry.new_oid == to && entry.message.trim_end_with(|c| c == '\n') == message.as_bytes();
+        std::ops::ControlFlow::Break(())
+    });
+    if logged || to.is_null() {
+        return;
+    }
+    let Ok(name) = FullName::try_from("HEAD") else { return };
+    let _ = repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::Only,
+                force_create_reflog: false,
+                message: message.into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Object(to),
+        },
+        name,
+        deref: false,
+    });
 }
 
 /// Detach `HEAD` at object `id`, logging the move.

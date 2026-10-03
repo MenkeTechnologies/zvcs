@@ -7,6 +7,7 @@
 //! porcelain reset), refusing on a dirty worktree so no work is clobbered.
 
 use anyhow::{anyhow, Result};
+use gix::bstr::ByteSlice;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -18,27 +19,24 @@ struct Entry {
     msg: String,
 }
 
-/// Parse a `.git/logs/HEAD` line: `OLD NEW IDENT... UNIXTIME TZ\tMESSAGE`.
-fn parse_line(line: &str) -> Option<Entry> {
-    let (header, msg) = line.split_once('\t')?;
-    let toks: Vec<&str> = header.split_whitespace().collect();
-    if toks.len() < 4 {
-        return None;
-    }
-    Some(Entry {
-        old: toks[0].to_string(),
-        new: toks[1].to_string(),
-        time: toks[toks.len() - 2].parse().ok()?,
-        msg: msg.to_string(),
-    })
-}
-
-/// Read a repo's HEAD reflog (oldest→newest), empty if none.
+/// The entries of the repository's `HEAD` reflog (oldest→newest), read through
+/// its ref store, so a reftable repository answers as well as a files one.
+/// Empty if the repository cannot be opened or has no such reflog.
 fn read_head_reflog(git_dir: &Path) -> Vec<Entry> {
-    match std::fs::read_to_string(git_dir.join("logs/HEAD")) {
-        Ok(c) => c.lines().filter_map(parse_line).collect(),
-        Err(_) => Vec::new(),
-    }
+    let Ok(repo) = gix::open(git_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let _ = crate::refstore::for_each_reflog_entry(&repo, "HEAD", false, |e| {
+        out.push(Entry {
+            time: e.timestamp as i64,
+            old: e.old_oid.to_string(),
+            new: e.new_oid.to_string(),
+            msg: e.message.trim_end_with(|c| c == '\n').to_str_lossy().into_owned(),
+        });
+        std::ops::ControlFlow::Continue(())
+    });
+    out
 }
 
 /// The most recent HEAD event as `(old_sha, new_sha, kind)`, where `kind` is the
@@ -188,7 +186,8 @@ pub fn zundo(args: &[String]) -> Result<ExitCode> {
 mod tests {
     use super::head_authored_by_zvcs;
 
-    /// Write a `logs/HEAD` whose last entry carries `msg`, then classify it.
+    /// Write a `logs/HEAD` whose last entry carries `msg` into a fresh bare
+    /// repository, then classify it.
     ///
     /// The directory is unique per call: the tests in this binary run in
     /// parallel, and keying it by anything the messages share (their length, say)
@@ -198,6 +197,7 @@ mod tests {
         let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("zvcs-oplog-{}-{seq}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        gix::init_bare(&dir).unwrap();
         std::fs::create_dir_all(dir.join("logs")).unwrap();
         let z = "0000000000000000000000000000000000000000";
         let o = "1111111111111111111111111111111111111111";

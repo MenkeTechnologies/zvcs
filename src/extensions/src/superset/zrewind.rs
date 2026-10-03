@@ -54,7 +54,7 @@ pub fn zrewind(args: &[String]) -> Result<ExitCode> {
             skipped += 1;
             continue;
         }
-        let Some(sha) = reflog_sha_at(repo.git_dir(), cutoff) else {
+        let Some(sha) = reflog_sha_at(repo, cutoff) else {
             println!("skip {name}: no history that far back");
             skipped += 1;
             continue;
@@ -104,25 +104,19 @@ fn has_local_work(exe: &Path, workdir: &Path) -> bool {
     !out.stdout.is_empty()
 }
 
-/// The sha HEAD pointed at, at epoch `cutoff`: the NEW sha of the latest
-/// `logs/HEAD` reflog entry with time ≤ cutoff. `None` if the reflog doesn't reach
-/// that far back. The reflog is chronological, so once an entry is newer than the
-/// cutoff every later one is too — stop there.
-fn reflog_sha_at(git_dir: &Path, cutoff: i64) -> Option<String> {
-    let content = std::fs::read_to_string(git_dir.join("logs/HEAD")).ok()?;
+/// The sha HEAD pointed at, at epoch `cutoff`: the NEW sha of the latest `HEAD`
+/// reflog entry with time ≤ cutoff, read through the ref store. `None` if the
+/// reflog doesn't reach that far back. The reflog is chronological, so once an
+/// entry is newer than the cutoff every later one is too — stop there.
+fn reflog_sha_at(repo: &gix::Repository, cutoff: i64) -> Option<String> {
     let mut sha = None;
-    for line in content.lines() {
-        let Some((header, _msg)) = line.split_once('\t') else { continue };
-        let toks: Vec<&str> = header.split_whitespace().collect();
-        if toks.len() < 4 {
-            continue;
+    let _ = crate::refstore::for_each_reflog_entry(repo, "HEAD", false, |e| {
+        if e.timestamp as i64 > cutoff {
+            return std::ops::ControlFlow::Break(());
         }
-        let Ok(ts) = toks[toks.len() - 2].parse::<i64>() else { continue };
-        if ts <= cutoff {
-            sha = Some(toks[1].to_string());
-        } else {
-            break;
-        }
-    }
+        sha = Some(e.new_oid.to_string());
+        std::ops::ControlFlow::Continue(())
+    });
     sha
 }
+

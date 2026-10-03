@@ -13,29 +13,35 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::Result;
+use gix::bstr::ByteSlice;
 
 use crate::superset::query::{parallel_map, selected};
 
-/// One reflog entry (`OLD NEW IDENT... UNIXTIME TZ\tMESSAGE`). Kept local rather
-/// than shared with `oplog.rs` so this verb owns its own parse.
+/// One `HEAD` reflog entry. Kept local rather than shared with `oplog.rs` so
+/// this verb owns its own reading.
 struct Entry {
     old: String,
     msg: String,
 }
 
-fn parse_line(line: &str) -> Option<Entry> {
-    let (header, msg) = line.split_once('\t')?;
-    let toks: Vec<&str> = header.split_whitespace().collect();
-    if toks.len() < 4 {
-        return None;
-    }
-    Some(Entry { old: toks[0].to_string(), msg: msg.to_string() })
+/// The `HEAD` reflog (oldest→newest), read through the ref store, so a reftable
+/// repository answers as well as a files one.
+fn read_head_reflog(repo: &gix::Repository) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let _ = crate::refstore::for_each_reflog_entry(repo, "HEAD", false, |e| {
+        out.push(Entry::of(e));
+        std::ops::ControlFlow::Continue(())
+    });
+    out
 }
 
-fn read_head_reflog(git_dir: &Path) -> Vec<Entry> {
-    match std::fs::read_to_string(git_dir.join("logs/HEAD")) {
-        Ok(c) => c.lines().filter_map(parse_line).collect(),
-        Err(_) => Vec::new(),
+impl Entry {
+    /// One entry as the ref store's reflog walk yields it.
+    fn of(e: &crate::refstore::ReflogEntry) -> Self {
+        Entry {
+            old: e.old_oid.to_string(),
+            msg: e.message.trim_end_with(|c| c == '\n').to_str_lossy().into_owned(),
+        }
     }
 }
 
@@ -54,14 +60,16 @@ fn target(entries: &[Entry], steps: usize) -> Option<(String, String)> {
 }
 
 /// True if a merge / rebase / cherry-pick / revert is in progress — rolling back
-/// mid-operation is unsafe, so it is a guard.
-fn mid_operation(git_dir: &Path) -> bool {
-    let f = |n: &str| git_dir.join(n).exists();
-    f("MERGE_HEAD")
-        || f("CHERRY_PICK_HEAD")
-        || f("REVERT_HEAD")
-        || f("rebase-merge")
-        || f("rebase-apply")
+/// mid-operation is unsafe, so it is a guard. `CHERRY_PICK_HEAD` and
+/// `REVERT_HEAD` are root refs, asked of the ref store; `MERGE_HEAD` is a file
+/// in every ref storage format, as are the rebase state directories.
+fn mid_operation(repo: &gix::Repository) -> bool {
+    let git_dir = repo.git_dir();
+    crate::refstore::state_ref_exists(repo, "MERGE_HEAD")
+        || crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD")
+        || crate::refstore::state_ref_exists(repo, "REVERT_HEAD")
+        || git_dir.join("rebase-merge").exists()
+        || git_dir.join("rebase-apply").exists()
 }
 
 /// Sync states where the local HEAD is at or behind its remote, so discarding a
@@ -89,14 +97,14 @@ fn plan_repo(git_dir: &Path, workdir: &Path, steps: usize, apply: bool, force: b
     let Ok(repo) = gix::open(git_dir) else { return mk(Verdict::SkipNothing) };
     let (dirty, _detached, sync, _head, current) = crate::superset::status::compute(&repo);
 
-    let entries = read_head_reflog(git_dir);
+    let entries = read_head_reflog(&repo);
     let Some((to, msg)) = target(&entries, steps) else {
         return Plan { workdir: workdir.to_path_buf(), current, verdict: Verdict::SkipNothing };
     };
 
     // Guards, unless --force.
     if !force {
-        if mid_operation(git_dir) {
+        if mid_operation(&repo) {
             return Plan { workdir: workdir.to_path_buf(), current, verdict: Verdict::SkipMidOp };
         }
         if dirty {
@@ -207,7 +215,11 @@ mod tests {
         let c = "c".repeat(40);
         // oldest→newest: z→a (initial), a→b (commit), b→c (commit). HEAD=c.
         let lines = [entry(&z, &a, "commit: init"), entry(&a, &b, "commit: two"), entry(&b, &c, "commit: three")];
-        let entries: Vec<Entry> = lines.iter().filter_map(|l| parse_line(l)).collect();
+        let entries: Vec<Entry> = lines
+            .iter()
+            .filter_map(|l| crate::refstore::parse_reflog_line(format!("{l}\n").as_bytes(), gix::hash::Kind::Sha1))
+            .map(|e| Entry::of(&e))
+            .collect();
         // HEAD@{1} = old of newest = b; HEAD@{2} = old of second-newest = a.
         assert_eq!(target(&entries, 1).unwrap().0, b);
         assert_eq!(target(&entries, 2).unwrap().0, a);

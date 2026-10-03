@@ -949,7 +949,7 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
             if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
                 return Some(Err(fatal("--fixed-value only applies with 'value-pattern'")));
             }
-            if opts.windows(2).any(|w| w[0] == "--default") && (all || url.is_some()) {
+            if default_given(&table, &opts) && (all || url.is_some()) {
                 return Some(Err(fatal("--default= cannot be used with --all or --url=")));
             }
             if url.is_some() && (all || regexp || value_pattern.is_some()) {
@@ -1341,6 +1341,30 @@ fn subcommand_table(sub: &str) -> SubcommandTable {
         _ => (LOCATION, "", "f", USAGE_EDIT),
     };
     SubcommandTable { long, flags, values, usage }
+}
+
+/// Whether `display_opts.default_value` is set once the passed-through options have
+/// been parsed: the last of `--default <v>`, `--default=<v>` and `--no-default` wins.
+/// The value of an option that takes one is the next element and is skipped, so a
+/// `--comment --default` names no default.
+fn default_given(table: &SubcommandTable, opts: &[String]) -> bool {
+    let mut given = false;
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i].as_str() {
+            "--default" => given = true,
+            "--no-default" => given = false,
+            o if o.starts_with("--default=") => given = true,
+            _ => {}
+        }
+        if matches!(opts[i].as_str(), "-f" | "--file" | "--blob" | "-t" | "--type" | "--default" | "--comment")
+            || short_value_pending(table, &opts[i]).is_some()
+        {
+            i += 1;
+        }
+        i += 1;
+    }
+    given
 }
 
 /// The value switch a short cluster ends on with nothing after it, which

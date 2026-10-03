@@ -121,3 +121,21 @@ fn set_over_a_multivar_names_the_subcommand_options() {
     assert_eq!((err, code), (format!("{head}       Use a regexp, --add or --replace-all to change a.b.\n"), 5));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `cmd_config_get()` refuses a default together with `--all` or `--url`
+/// whichever way the default was spelled (builtin/config.c:1106-1108); zvcs only
+/// saw `--default <value>` as two words, so `--default=<value> --all` listed the
+/// values. `--no-default` takes it back.
+#[test]
+fn an_attached_default_is_refused_with_all() {
+    let root = std::env::temp_dir().join(format!("zvcs-config-sub-default-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "a.b", "x"]);
+    let refusal = ("".to_string(), "fatal: --default= cannot be used with --all or --url=\n".to_string(), 128);
+    assert_eq!(git(&root, &["config", "get", "--default=d", "--all", "a.b"]), refusal);
+    assert_eq!(git(&root, &["config", "get", "--def=d", "--url=https://h", "a.b"]), refusal);
+    assert_eq!(git(&root, &["config", "get", "--default=d", "--no-default", "--all", "a.b"]).0, "x\n");
+    let _ = std::fs::remove_dir_all(&root);
+}

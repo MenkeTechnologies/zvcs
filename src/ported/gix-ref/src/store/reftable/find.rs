@@ -45,7 +45,7 @@ impl Backend {
     ///
     /// `FETCH_HEAD` and `MERGE_HEAD` never get here: they stay files for every
     /// backend (`refs_read_raw_ref()`, refs.c:2095-2105).
-    pub(crate) fn read_raw_ref(&self, name: &FullNameRef) -> Result<Option<Target>, Error> {
+    pub fn read_raw_ref(&self, name: &FullNameRef) -> Result<Option<Target>, Error> {
         self.check()?;
         let (stack, refname) = self.backend_for(name.as_bstr(), true)?;
         self.read_ref(&lock(&stack), refname)

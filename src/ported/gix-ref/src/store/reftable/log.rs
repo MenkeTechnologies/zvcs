@@ -28,6 +28,23 @@ fn push_without_crud(out: &mut Vec<u8>, src: &[u8]) {
     out.extend(src[start..end].iter().filter(|c| !matches!(c, b'\n' | b'<' | b'>')));
 }
 
+/// One reflog entry as `each_reflog_ent_fn` (refs.h) receives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogEntry {
+    /// The value before the update.
+    pub old_oid: gix_hash::ObjectId,
+    /// The value after the update.
+    pub new_oid: gix_hash::ObjectId,
+    /// `Name <email>`, as `fmt_ident()` formats the stored identity.
+    pub committer: BString,
+    /// Seconds since the epoch.
+    pub timestamp: u64,
+    /// The time zone as the decimal number `HHMM`, signed (`-0700` is `-700`).
+    pub tz: i32,
+    /// The message as stored, with its trailing newline.
+    pub message: BString,
+}
+
 /// `reftable_reflog_iterator` (refs/reftable-backend.c:2048-2149): the names
 /// of the references with a reflog in one stack.
 struct NameIter {
@@ -138,32 +155,69 @@ impl Backend {
         Ok(records)
     }
 
-    /// `yield_log_record()` (refs/reftable-backend.c:2167-2191) rendered as a
-    /// line of the files format (`old SP new SP name <email> SP time SP tz
-    /// TAB msg LF`), which is what the callback receives from the files
-    /// backend. The existence marker, an entry from the null object id to the
-    /// null object id, is not shown.
-    fn write_log_line(&self, out: &mut Vec<u8>, update: &LogUpdate) {
-        let old = self.oid_from_hash(&update.old_hash);
-        let new = self.oid_from_hash(&update.new_hash);
-        if old.is_null() && new.is_null() {
-            return;
+    /// `yield_log_record()` (refs/reftable-backend.c:2167-2191): what the
+    /// callback of `for_each_reflog_ent()` receives for `update`, `None` for
+    /// the existence marker, an entry from the null object id to the null
+    /// object id, which callers must not see.
+    fn reflog_entry(&self, update: &LogUpdate) -> Option<ReflogEntry> {
+        let old_oid = self.oid_from_hash(&update.old_hash);
+        let new_oid = self.oid_from_hash(&update.new_hash);
+        if old_oid.is_null() && new_oid.is_null() {
+            return None;
         }
         // `fmt_ident(name, email, WANT_COMMITTER_IDENT, NULL, IDENT_NO_DATE)`.
-        write!(out, "{old} {new} ").expect("writing to a Vec cannot fail");
-        push_without_crud(out, &update.name);
-        out.extend_from_slice(b" <");
-        push_without_crud(out, &update.email);
-        write!(out, "> {} {:+05}", update.time, update.tz_offset).expect("writing to a Vec cannot fail");
+        let mut committer = Vec::new();
+        push_without_crud(&mut committer, &update.name);
+        committer.extend_from_slice(b" <");
+        push_without_crud(&mut committer, &update.email);
+        committer.push(b'>');
+        Some(ReflogEntry {
+            old_oid,
+            new_oid,
+            committer: committer.into(),
+            timestamp: update.time,
+            tz: i32::from(update.tz_offset),
+            // A C string: whatever follows a NUL is not seen.
+            message: update.message.split(|&c| c == 0).next().unwrap_or_default().into(),
+        })
+    }
+
+    /// `entry` rendered as a line of the files format (`old SP new SP name
+    /// <email> SP time SP tz TAB msg LF`), which is what the callback receives
+    /// from the files backend.
+    fn write_log_line(out: &mut Vec<u8>, entry: &ReflogEntry) {
+        write!(
+            out,
+            "{} {} {} {} {:+05}",
+            entry.old_oid, entry.new_oid, entry.committer, entry.timestamp, entry.tz
+        )
+        .expect("writing to a Vec cannot fail");
         // Messages are stored with one trailing newline (`reftable_writer_add_log()`,
         // reftable/writer.c), like the files backend hands them on. An empty
         // message is written without the tab, as the files backend does.
-        let message = update.message.strip_suffix(b"\n").unwrap_or(&update.message);
+        let message = entry.message.strip_suffix(b"\n").unwrap_or(&entry.message);
         if !message.is_empty() {
             out.push(b'\t');
             out.extend_from_slice(message);
         }
         out.push(b'\n');
+    }
+
+    /// `reftable_be_for_each_reflog_ent()` (refs/reftable-backend.c:2243-2304)
+    /// and `reftable_be_for_each_reflog_ent_reverse()` (:2193-2241): the
+    /// entries of the reflog of `name`, oldest first, or newest first with
+    /// `reverse`. A reference without a reflog has no entries, which git does
+    /// not tell apart from an empty reflog for this backend.
+    pub fn reflog_entries(&self, name: &FullNameRef, reverse: bool) -> Result<Vec<ReflogEntry>, Error> {
+        let records = self.reflog_records(name)?.unwrap_or_default();
+        let entries = records.iter().filter_map(|update| self.reflog_entry(update));
+        Ok(if reverse {
+            entries.collect()
+        } else {
+            let mut entries: Vec<_> = entries.collect();
+            entries.reverse();
+            entries
+        })
     }
 
     /// `reftable_be_for_each_reflog_ent()` (refs/reftable-backend.c:2243-2304):
@@ -175,7 +229,9 @@ impl Backend {
             return Ok(false);
         };
         for update in records.iter().rev() {
-            self.write_log_line(buf, update);
+            if let Some(entry) = self.reflog_entry(update) {
+                Self::write_log_line(buf, &entry);
+            }
         }
         Ok(true)
     }

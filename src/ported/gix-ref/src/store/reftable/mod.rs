@@ -43,6 +43,7 @@ mod transaction;
 mod worktree;
 
 pub use iter::RefIter;
+pub use log::ReflogEntry;
 pub use maintenance::{ExpireFlags, ExpirePolicy, FsckReport};
 pub use transaction::TransactionData;
 pub use worktree::{WorktreeType, parse_worktree_ref};

@@ -8,9 +8,9 @@
 //! callers branch on [`Repository::ref_storage()`](crate::Repository::ref_storage()).
 
 use gix_ref::{
-    FullName, FullNameRef,
+    FullName, FullNameRef, Target,
     bstr::BStr,
-    reftable::{Backend, ExpireFlags, ExpirePolicy, FsckReport},
+    reftable::{Backend, ExpireFlags, ExpirePolicy, FsckReport, ReflogEntry},
     store::RefStorage,
 };
 
@@ -40,6 +40,27 @@ impl crate::Repository {
     /// (`reftable_be_reflog_iterator_begin()`).
     pub fn reftable_reflog_names(&self) -> Result<Vec<FullName>, Error> {
         Ok(self.reftable_backend()?.reflog_names()?)
+    }
+
+    /// Whether `name` has a reflog entry (`reftable_be_reflog_exists()`). A
+    /// stack that cannot be read has none, as in git.
+    pub fn reftable_reflog_exists(&self, name: &FullNameRef) -> Result<bool, Error> {
+        Ok(self.reftable_backend()?.reflog_exists(name)?)
+    }
+
+    /// The entries of the reflog of `name`, oldest first or, with `reverse`,
+    /// newest first (`reftable_be_for_each_reflog_ent[_reverse]()`). A missing
+    /// reflog has no entries.
+    pub fn reftable_reflog_entries(&self, name: &FullNameRef, reverse: bool) -> Result<Vec<ReflogEntry>, Error> {
+        Ok(self.reftable_backend()?.reflog_entries(name, reverse)?)
+    }
+
+    /// The value of the reference `name` exactly as stored, a symbolic one
+    /// unresolved, `None` if it does not exist (`reftable_be_read_raw_ref()`).
+    /// No namespace is applied and no other name is tried; `FETCH_HEAD` and
+    /// `MERGE_HEAD` are files in every format and are not read here.
+    pub fn reftable_read_raw_ref(&self, name: &FullNameRef) -> Result<Option<Target>, Error> {
+        Ok(self.reftable_backend()?.read_raw_ref(name)?)
     }
 
     /// Create an empty reflog for `name` (`reftable_be_create_reflog()`).

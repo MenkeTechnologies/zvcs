@@ -2850,9 +2850,23 @@ fn do_merge(
         let tree_id = write_tree(repo, &out_notes)?;
         let partial = repo.new_commit(msg, tree_id, vec![l, r])?.id().detach();
 
+        // `refs_update_ref(…, msg.buf, "NOTES_MERGE_PARTIAL", …)` and
+        // `refs_update_symref(…, "NOTES_MERGE_REF", notes_ref, NULL)`
+        // (builtin/notes.c:988-999): files in the files backend, records in
+        // the worktree's stack in a reftable one.
         let git_dir = repo.git_dir();
-        std::fs::write(git_dir.join("NOTES_MERGE_PARTIAL"), format!("{partial}\n"))?;
-        std::fs::write(git_dir.join("NOTES_MERGE_REF"), format!("ref: {local_ref}\n"))?;
+        crate::refstore::state_ref_write(
+            repo,
+            "NOTES_MERGE_PARTIAL",
+            &crate::refstore::StateRef::Object(partial),
+            &format!("notes: {reflog}"),
+        )?;
+        crate::refstore::state_ref_write(
+            repo,
+            "NOTES_MERGE_REF",
+            &crate::refstore::StateRef::Symbolic(local_ref.into()),
+            "",
+        )?;
         let wt = git_dir.join("NOTES_MERGE_WORKTREE");
         std::fs::create_dir_all(&wt)?;
         for (obj, content) in &conflicts {
@@ -2932,20 +2946,22 @@ fn conflict_content(local_ref: &str, remote_ref: &str, l: &[u8], r: &[u8]) -> Ve
 /// `git notes merge --commit` — finalize a manual merge staged on disk.
 fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
-    let partial_raw = match std::fs::read_to_string(git_dir.join("NOTES_MERGE_PARTIAL")) {
-        Ok(s) => s,
-        Err(_) => {
+    // `repo_get_oid(…, "NOTES_MERGE_PARTIAL", …)` and the symbolic target of
+    // `NOTES_MERGE_REF` (builtin/notes.c:832-850).
+    let partial = match crate::refstore::state_ref_read(repo, "NOTES_MERGE_PARTIAL")? {
+        Some(crate::refstore::StateRef::Object(id)) => id,
+        _ => {
             eprintln!("fatal: failed to read ref NOTES_MERGE_PARTIAL");
             return Ok(ExitCode::from(128));
         }
     };
-    let partial = ObjectId::from_hex(partial_raw.trim().as_bytes())
-        .map_err(|e| anyhow!("invalid NOTES_MERGE_PARTIAL: {e}"))?;
-    let local_ref = std::fs::read_to_string(git_dir.join("NOTES_MERGE_REF"))?
-        .trim()
-        .strip_prefix("ref:")
-        .map(|s| s.trim().to_string())
-        .ok_or_else(|| anyhow!("invalid NOTES_MERGE_REF"))?;
+    let local_ref = match crate::refstore::state_ref_read(repo, "NOTES_MERGE_REF")? {
+        Some(crate::refstore::StateRef::Symbolic(target)) => target.to_string(),
+        _ => {
+            eprintln!("fatal: failed to resolve NOTES_MERGE_REF");
+            return Ok(ExitCode::from(128));
+        }
+    };
 
     let _lock = crate::lock::RepoLock::acquire(git_dir);
     let partial_commit = repo.find_commit(partial)?;
@@ -3004,8 +3020,8 @@ fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
     move_notes_ref(repo, &local_ref, local_tip, commit, &reflog)?;
 
     // Clear the staged merge.
-    let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
-    let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
+    let _ = crate::refstore::state_ref_delete(repo, "NOTES_MERGE_PARTIAL", "");
+    let _ = crate::refstore::state_ref_delete(repo, "NOTES_MERGE_REF", "");
     clear_merge_worktree(&wt, &wt_shown, verbosity);
     Ok(ExitCode::SUCCESS)
 }
@@ -3044,7 +3060,7 @@ fn merge_abort(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     clear_merge_worktree(&wt, &shown, verbosity);
-    let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_PARTIAL"));
-    let _ = std::fs::remove_file(git_dir.join("NOTES_MERGE_REF"));
+    let _ = crate::refstore::state_ref_delete(repo, "NOTES_MERGE_PARTIAL", "");
+    let _ = crate::refstore::state_ref_delete(repo, "NOTES_MERGE_REF", "");
     Ok(ExitCode::SUCCESS)
 }

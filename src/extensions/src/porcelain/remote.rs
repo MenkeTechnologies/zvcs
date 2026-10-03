@@ -1729,7 +1729,12 @@ fn set_head(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     if auto {
         let map = match query_ref_map(repo, name) {
             Ok(map) => map,
-            Err(e) => return fatal(e),
+            Err(e) => {
+                if let Some(code) = crate::transport_err::file_url_fatal_in(&e) {
+                    return Ok(code);
+                }
+                return fatal(e);
+            }
         };
         let heads = remote_head_names(&map);
         if heads.is_empty() {
@@ -2162,6 +2167,9 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
                         .cloned()
                         .unwrap_or_else(|| name.to_string());
                     if let Some(code) = crate::transport_err::ssh_fatal(&url, &e) {
+                        return Ok(code);
+                    }
+                    if let Some(code) = crate::transport_err::file_url_fatal_in(&e) {
                         return Ok(code);
                     }
                     eprintln!("fatal: {e}");
@@ -2731,7 +2739,9 @@ fn prune_one(repo: &gix::Repository, name: &str, dry_run: bool) -> Result<bool> 
     let stale = match stale_tracking_refs(repo, name) {
         Ok(stale) => stale,
         Err(e) => {
-            eprintln!("fatal: {e}");
+            if crate::transport_err::file_url_fatal_in(&e).is_none() {
+                eprintln!("fatal: {e}");
+            }
             return Ok(false);
         }
     };

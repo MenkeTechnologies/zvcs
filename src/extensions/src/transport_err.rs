@@ -137,6 +137,14 @@ pub fn file_url_fatal(err: &gix::remote::connect::Error) -> Option<ExitCode> {
     }
 }
 
+/// [`file_url_fatal`] for an error that carries the connect failure somewhere
+/// in its source chain, as one propagated through `?` does.
+pub fn file_url_fatal_in(err: &anyhow::Error) -> Option<ExitCode> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<gix::remote::connect::Error>())
+        .and_then(file_url_fatal)
+}
+
 /// The one line the stderr supervisor swallowed, or `None` when it swallowed
 /// none and the child's words already reached the terminal on their own.
 ///

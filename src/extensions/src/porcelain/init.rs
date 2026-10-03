@@ -633,6 +633,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
                 Err(e) => return Err(anyhow::anyhow!("{e}")),
             },
         )
+    } else if migrated {
+        // `separate_git_dir()` moved an existing `.git` that holds no repository to the
+        // requested place; `create_default_files()` fills it in there.
+        Some(init_into_existing(&git_dir, gix::create::Kind::WithWorktree, create_opts)?)
     } else {
         let worktree = git_dir.parent().unwrap_or(&cwd).to_path_buf();
         Some(
@@ -797,7 +801,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // to the requested path and drop a `gitdir: <abs>` link file in its
         // place, exactly like git's `separate_git_dir()` (`setup.c`). The message
         // then names the real git dir.
-        if let Some(real) = separate_git_dir.as_deref() {
+        if let Some(real) = separate_git_dir.as_deref().filter(|_| !migrated) {
             git_dir = relocate_git_dir(&src_git_dir, &target, real)?;
         }
     } else if let Some(name) = initial_branch.as_deref() {

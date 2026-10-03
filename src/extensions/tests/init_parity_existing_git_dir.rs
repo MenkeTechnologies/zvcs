@@ -55,3 +55,27 @@ fn an_existing_dot_git_directory_is_filled_in() {
     assert_eq!((out.as_str(), code), ("false\n.git\n", 0));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// With `--separate-git-dir`, `separate_git_dir()` first moves such a `.git` to
+/// the requested place and leaves a gitfile, and the init fills it in there.
+/// zvcs built a second repository in the parent directory's `.git` and then
+/// failed to move it onto the one it had already moved: `unable to move
+/// <parent>/.git to <sg>: Directory not empty`.
+#[test]
+fn an_existing_dot_git_directory_moves_to_the_separate_git_dir() {
+    let root = std::env::temp_dir().join(format!("zvcs-init-existing-sep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("e/.git/keep")).unwrap();
+    let real = root.canonicalize().unwrap();
+
+    let (out, _, code) = git(&root, &["init", "-b", "main", "--separate-git-dir=sg", "e"]);
+    let want = format!("Initialized empty Git repository in {}/sg/\n", real.display());
+    assert_eq!((out, code), (want, 0));
+    assert_eq!(
+        std::fs::read_to_string(root.join("e/.git")).unwrap(),
+        format!("gitdir: {}/sg\n", real.display())
+    );
+    assert!(root.join("sg/keep").is_dir() && root.join("sg/HEAD").is_file());
+    assert!(!root.join(".git").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}

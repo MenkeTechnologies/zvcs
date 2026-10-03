@@ -2572,6 +2572,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // precedes the usage block — depends on whether a revision turns up, which
             // may still be later in argv (`git diff --no-such-flag HEAD`).
             "--merge-base" => merge_base = true,
+            s if walk_only_option(s) => {}
             s if s.starts_with('-') && !is_known_option(s) => {
                 invalid_arg.get_or_insert_with(|| s.to_owned());
             }
@@ -5523,6 +5524,77 @@ fn tree_id_for(repo: &gix::Repository, spec: Option<&String>) -> Result<ObjectId
             None => ObjectId::empty_tree(repo.object_hash()),
         },
     })
+}
+
+/// The `setup_revisions()` options that only shape a history walk or a commit
+/// header — ordering, simplification, parent rewriting, the pretty format, notes
+/// display. `git diff` runs the same parser, so it accepts every one of them, and
+/// none reaches anything a diff prints: `cmd_diff()` never walks and never
+/// formats a commit. Options that pend refs (`--all`, `--branches`), that select
+/// a diff-merges mode (`-m`, `-c`, `--cc`), that `builtin_diff_index()` refuses
+/// (`--max-count`, `--since`), or that validate a value are deliberately absent.
+///
+/// Measured against stock git 2.56.0: for each entry, `git diff <fmt> <opt>
+/// <operands>` is byte-identical to the same line without it, on stdout, stderr
+/// and exit code, for `--stat`, `-p`, `--raw` and `--cc` over no operand, one
+/// commit, two commits, `--cached`, a three-tree combined diff, `<merge>^@`,
+/// `A...B` and two blobs.
+fn walk_only_option(a: &str) -> bool {
+    matches!(
+        a,
+        "--graph"
+            | "--oneline"
+            | "--pretty"
+            | "--first-parent"
+            | "--exclude-first-parent-only"
+            | "--no-walk"
+            | "--do-walk"
+            | "--reverse"
+            | "--abbrev-commit"
+            | "--no-abbrev-commit"
+            | "--left-right"
+            | "--left-only"
+            | "--right-only"
+            | "--topo-order"
+            | "--date-order"
+            | "--author-date-order"
+            | "--in-commit-order"
+            | "--boundary"
+            | "--cherry"
+            | "--cherry-mark"
+            | "--cherry-pick"
+            | "--merges"
+            | "--no-merges"
+            | "--no-min-parents"
+            | "--no-max-parents"
+            | "--dense"
+            | "--sparse"
+            | "--full-history"
+            | "--simplify-merges"
+            | "--simplify-by-decoration"
+            | "--ancestry-path"
+            | "--show-pulls"
+            | "--remove-empty"
+            | "--parents"
+            | "--children"
+            | "--log-size"
+            | "--relative-date"
+            | "--show-signature"
+            | "--show-linear-break"
+            | "--expand-tabs"
+            | "--no-expand-tabs"
+            | "--notes"
+            | "--no-notes"
+            | "--show-notes"
+            | "--standard-notes"
+            | "--no-standard-notes"
+            | "--unpacked"
+            | "--objects"
+            | "--no-kept-objects"
+            | "--invert-grep"
+            | "--all-match"
+            | "--single-worktree"
+    )
 }
 
 /// Every option name stock `git diff` resolves — the union of what `setup_revisions()`

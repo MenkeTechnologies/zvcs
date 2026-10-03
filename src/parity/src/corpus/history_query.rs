@@ -99,6 +99,7 @@ use crate::runner::Case;
 pub fn cases(out: &mut Vec<Case>) {
     merge_base(out);
     diff_merge_base(out);
+    diff_walk_options(out);
     name_rev(out);
     range_diff(out);
     show_branch(out);
@@ -153,6 +154,23 @@ fn diff_merge_base(out: &mut Vec<Case>) {
     out.push(Case::strict("diff", &["diff", "--merge-base"], Shape::Branched));
     out.push(Case::strict("diff", &["diff", "--merge-base", "HEAD^{tree}", "feature"], Shape::Branched));
     out.push(Case::strict("diff", &["diff", "--merge-base", "cc-left", "cc-right"], Shape::CrissCross));
+}
+
+/// `git diff` parses its options with `setup_revisions()`, so the walk-ordering,
+/// simplification and pretty-format options are accepted and change nothing a
+/// diff prints. A port that only knows the diff options refuses them.
+fn diff_walk_options(out: &mut Vec<Case>) {
+    each(
+        Shape::Merged,
+        "diff",
+        &[
+            &["diff", "--stat", "--graph", "--oneline", "HEAD~1", "HEAD"],
+            &["diff", "--first-parent", "--no-walk", "--reverse", "HEAD^@"],
+            &["diff", "--raw", "--topo-order", "--left-right", "--boundary"],
+            &["diff", "--cached", "--simplify-merges", "--ancestry-path", "--parents"],
+        ],
+        out,
+    );
 }
 
 fn merge_base(out: &mut Vec<Case>) {

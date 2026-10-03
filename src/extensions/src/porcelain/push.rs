@@ -352,7 +352,11 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     f.quiet = f.verbosity < 0;
 
     // `RUN_SETUP`: the repository is found before `cmd_push()` looks at an option.
-    let repo = crate::setup::discover()?;
+    let mut repo = crate::setup::discover()?;
+    // The remote-tracking refs a push advances are logged with
+    // `git_committer_info(0)`, which falls back to the system identity; gix
+    // refuses the whole edit instead, silently dropping the tracking update.
+    crate::ensure_reflog_identity(&mut repo);
 
     // ```c
     // die_for_incompatible_opt4(deleterefs, "--delete",

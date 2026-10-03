@@ -922,7 +922,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
 
     // `--orphan <name> [<start>]`: start an unborn branch off `<start>`'s tree.
     if let Some(name) = orphan {
-        return orphan_checkout(&repo, &name, pre.first().copied(), quiet, force);
+        return orphan_checkout(&repo, &name, pre.first().copied(), quiet, force, new_branch_log);
     }
 
     // `--ours`/`--theirs <path>…`: write one conflict side into the worktree.
@@ -1052,6 +1052,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
             !only_merge_on_switching_branches,
             force,
             merge_opt(merge, &conflict_style, &name),
+            new_branch_log,
         );
     }
 
@@ -1232,7 +1233,7 @@ pub fn checkout(args: &[String]) -> Result<ExitCode> {
                         // leaves it without an upstream.
                         &repo, spec, false, &remote_short, Some(&full_remote), quiet,
                         super::switch::resolve_track(&repo, None, false),
-                        true, force, merge_opt(merge, &conflict_style, spec),
+                        true, force, merge_opt(merge, &conflict_style, spec), new_branch_log,
                     )?;
                     maybe_recurse_submodules(&repo, recurse_submodules, quiet)?;
                     return Ok(code);
@@ -1983,6 +1984,9 @@ fn create_and_switch(
     merge_worktree: bool,
     force: bool,
     merge: Option<MergeOpt<'_>>,
+    // `-l`, `opts->new_branch_log`: `create_branch()` creates the reflog
+    // whatever `core.logAllRefUpdates` says (`REF_FORCE_CREATE_REFLOG`).
+    new_branch_log: bool,
 ) -> Result<ExitCode> {
     // `old_branch_info.commit` for the post-checkout hook at the tail.
     let old_head = head_commit_id(repo);
@@ -2112,7 +2116,7 @@ fn create_and_switch(
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
-                force_create_reflog: false,
+                force_create_reflog: new_branch_log,
                 // `create_branch()` (branch.c:615-631): the validation that finds the branch
                 // already there sets `forcing`, and a forced creation logs `Reset to`.
                 //
@@ -2248,6 +2252,8 @@ fn orphan_checkout(
     // through `reset_tree()` instead of the two-way merge, so local changes are
     // thrown away rather than carried — and its closing listing is skipped.
     force: bool,
+    // `-l`, `opts->new_branch_log`.
+    new_branch_log: bool,
 ) -> Result<ExitCode> {
     // `old_branch_info.commit` for the post-checkout hook at the tail.
     let old_head = head_commit_id(repo);
@@ -2351,6 +2357,18 @@ fn orphan_checkout(
     // not-yet-existing branch, which is not created. The files store writes
     // nothing else, so the file is written as it is; the reftable store logs
     // the move as its transaction decides.
+    //
+    // Before it, `-l` creates the new branch's reflog unless
+    // `core.logAllRefUpdates` would create it anyway; the setting is read on its
+    // own here, so with none configured the reflog is always created
+    // (builtin/checkout.c:954-979). A failure skips the rest of
+    // `update_refs_for_switch()`, `HEAD` included.
+    if new_branch_log && !should_autocreate_reflog(repo, &full) {
+        if let Err(err) = create_reflog(repo, &full) {
+            eprintln!("Can not do reflog for '{name}': {err}");
+            return Ok(run_post_checkout(repo, old_head, old_head, true));
+        }
+    }
     let msg = std::env::var("GIT_REFLOG_ACTION")
         .unwrap_or_else(|_| format!("checkout: moving from {old_label} to {name}"));
     crate::refstore::state_ref_write(repo, "HEAD", &crate::refstore::StateRef::Symbolic(full.clone().into()), &msg)?;
@@ -2362,6 +2380,44 @@ fn orphan_checkout(
     // The new branch is unborn, so `new_branch_info->commit` is still the commit
     // the orphan was started from — git reports the same id on both sides.
     Ok(run_post_checkout(repo, old_head, old_head, true))
+}
+
+/// `should_autocreate_reflog(log_all_ref_updates, refname)` (refs.c:1064-1078)
+/// with the setting `update_refs_for_switch()` reads: `core.logAllRefUpdates`
+/// alone (`refs_parse_log_all_ref_updates_config()`, refs.c:1055-1062), unset
+/// meaning no reflog is created automatically.
+fn should_autocreate_reflog(repo: &gix::Repository, refname: &str) -> bool {
+    let config = repo.config_snapshot();
+    let Some(value) = config.string("core.logAllRefUpdates") else {
+        return false;
+    };
+    if value.eq_ignore_ascii_case(b"always") {
+        return true;
+    }
+    let normal = config.boolean("core.logAllRefUpdates").unwrap_or(false);
+    normal
+        && (refname.starts_with("refs/heads/")
+            || refname.starts_with("refs/remotes/")
+            || refname.starts_with("refs/notes/")
+            || refname == "HEAD")
+}
+
+/// `refs_create_reflog()`: an empty reflog for `refname` — the files store's
+/// empty log file (`files_create_reflog()`), the reftable store's existence
+/// marker (`reftable_be_create_reflog()`). The error is git's `err` text.
+fn create_reflog(repo: &gix::Repository, refname: &str) -> std::result::Result<(), String> {
+    if crate::refstore::is_reftable(repo) {
+        let name = FullName::try_from(refname).map_err(|e| e.to_string())?;
+        return repo.reftable_create_reflog(name.as_ref()).map_err(|e| e.to_string());
+    }
+    let path = repo.common_dir().join("logs").join(refname);
+    let open = || {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(&path).map(drop)
+    };
+    open().map_err(|err| format!("unable to append to '{}': {err}", path.display()))
 }
 
 /// `git checkout --ours|--theirs <path>…`: write one side of a conflict into the

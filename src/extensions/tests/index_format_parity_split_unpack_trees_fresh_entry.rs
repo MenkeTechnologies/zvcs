@@ -187,3 +187,15 @@ fn a_merge_reset_refills_the_changed_path_from_the_tree() {
     assert_eq!(f.shared_indexes(), 2);
     assert_eq!(entry_count(&f.index()), 0);
 }
+
+/// `reset --keep` runs `reset_index()` twice — `twoway_merge()`, then a `MIXED`
+/// `oneway_merge()` — over one in-memory index and writes it once (builtin/reset.c:522-530).
+/// Written in between and read back, the second pass no longer knew the first had just
+/// written `f3`, found it racily clean against the intermediate index, and kept a stand-in.
+#[test]
+fn a_keep_reset_writes_its_two_passes_once() {
+    let f = Fixture::new("keep");
+    f.ok(&["reset", "-q", "--keep", "side"]);
+    assert_eq!(f.shared_indexes(), 2);
+    assert_eq!(entry_count(&f.index()), 0);
+}

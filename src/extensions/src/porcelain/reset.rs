@@ -963,13 +963,13 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             recurse_submodules,
             &should_interrupt,
         )?;
-        if !applied {
+        let Some(mut index) = applied else {
             // git's `reset_index` failure: `fatal:` line, exit 128, HEAD untouched.
             // The message names `rev` — the spec as typed — not the id it resolved
             // to (`die(_("Could not reset index file to revision '%s'."), rev)`).
             eprintln!("fatal: Could not reset index file to revision '{reflog_spec}'.");
             return Ok(ExitCode::from(128));
-        }
+        };
         // ```c
         // err = reset_index(ref, &oid, reset_type, quiet);
         // if (reset_type == KEEP && !err)
@@ -979,9 +979,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         // one-way MIXED pass, so an entry in neither tree — a newly staged file — is unstaged
         // rather than carried across by `twoway_merge`'s keep-the-current-entry case. Without it
         // `git reset --keep` left `A staged.txt` staged where stock leaves it untracked.
+        //
+        // Both passes run over the one in-memory index, which `cmd_reset()` writes once
+        // (builtin/reset.c:530): what the first pass learnt about the files it wrote
+        // (`ce_mark_uptodate()`) is still true for the second, and reading the index back
+        // from disk in between forgot it.
         if mode == ResetMode::Keep {
-            let current = repo.open_index()?;
-            let mut index = reset_index_to_tree(&repo, &current, target_tree, false)?;
+            let current = index;
+            index = reset_index_to_tree(&repo, &current, target_tree, false)?;
             // And it is `unpack_trees()`, so the untracked cache moves onto the result with
             // every path whose entry changed invalidated.
             super::write_tree::carry_untracked_cache(&current, &mut index);
@@ -989,8 +994,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             // `prime_cache_tree(the_repository, index, tree)` (builtin/reset.c:120-127): the
             // index it writes carries a cache-tree built from the target tree itself.
             index.prime_cache_tree(&repo.objects, &target_tree)?;
-            crate::index_racy::write(&repo, &mut index)?;
         }
+        crate::index_racy::write(&repo, &mut index)?;
         // `if (!pathspec.nr && !unborn)`: an unborn branch has no ref to move and
         // no previous HEAD to save, so `reset_refs()` is skipped outright.
         if let Some(commit) = &head_commit {
@@ -1348,12 +1353,18 @@ fn reset_index_to_tree(
 
     carry_skip_worktree(old, &mut new_index);
 
-    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat)> =
+    // `oneway_merge()`'s `same(old, a)` arm re-adds the old entry itself, so an entry the
+    // reset leaves alone keeps its stat — and its `CE_UPTODATE`, which `--keep`'s second
+    // pass needs for the files its first pass just wrote.
+    let mut old_map: HashMap<BString, (ObjectId, Mode, Stat, Flags)> =
         HashMap::with_capacity(old.entries().len());
     {
         let backing = old.path_backing();
         for e in old.entries() {
-            old_map.insert(e.path_in(backing).to_owned(), (e.id, e.mode, e.stat));
+            old_map.insert(
+                e.path_in(backing).to_owned(),
+                (e.id, e.mode, e.stat, e.flags & Flags::UPTODATE),
+            );
         }
     }
 
@@ -1369,9 +1380,10 @@ fn reset_index_to_tree(
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
-            if let Some((oid, mode, stat)) = old_map.get(&path) {
+            if let Some((oid, mode, stat, uptodate)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
                     e.stat = *stat;
+                    e.flags |= *uptodate;
                 }
             }
         }
@@ -1891,6 +1903,9 @@ fn classify_keep(
 /// preserving local changes to files the reset does not touch, and aborts —
 /// writing nothing and leaving HEAD in place — if a file that must change has
 /// un-committed local modifications.
+///
+/// The result index comes back unwritten, `None` when the merge refused: `--keep` runs a
+/// second `reset_index()` over the same in-memory index before it is written.
 fn reset_two_tree(
     repo: &gix::Repository,
     old: &gix::index::File,
@@ -1899,7 +1914,7 @@ fn reset_two_tree(
     keep: bool,
     recurse_submodules: bool,
     should_interrupt: &AtomicBool,
-) -> Result<bool> {
+) -> Result<Option<gix::index::File>> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| {
@@ -2011,7 +2026,7 @@ fn reset_two_tree(
         for (path, refusal) in &conflicts {
             eprintln!("error: {}", refusal.message(BStr::new(path)));
         }
-        return Ok(false);
+        return Ok(None);
     }
 
     // No conflicts: apply. Start from the old index so kept paths retain their
@@ -2100,8 +2115,7 @@ fn reset_two_tree(
 
     super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    crate::index_racy::write(repo, &mut new_index)?;
-    Ok(true)
+    Ok(Some(new_index))
 }
 
 /// A tree flattened to `path -> (mode, oid)`, via a throwaway index built from it.

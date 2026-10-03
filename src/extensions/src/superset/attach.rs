@@ -36,6 +36,13 @@ pub enum Attached {
 /// Ensure `repo`'s `HEAD` is attached to its mainline branch at `HEAD`'s current
 /// commit. Local, no network, no worktree/index mutation.
 pub fn ensure_attached(repo: &gix::Repository) -> Result<Attached> {
+    // The branch and HEAD writes below are logged to the reflog; give them the
+    // identity git auto-detects when `user.*` is unset (refs/files-backend.c:1994
+    // `git_committer_info(0)`), which gix would otherwise refuse to write without.
+    let mut repo = repo.clone();
+    crate::ensure_reflog_identity(&mut repo);
+    let repo = &repo;
+
     // Symbolic HEAD (`ref: refs/heads/...`) → already attached.
     if repo.head_name()?.is_some() {
         return Ok(Attached::AlreadyAttached);

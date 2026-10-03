@@ -35,6 +35,16 @@ pub fn reconcile_repo_local(repo: &gix::Repository) -> Result<String> {
 }
 
 fn reconcile_repo_inner(repo: &gix::Repository, do_fetch: bool) -> Result<String> {
+    // Every ref this writes (the tracking ref, the mainline branch, HEAD) gets a
+    // reflog entry, and git writes those under the auto-detected identity when
+    // `user.*` is unset (refs/files-backend.c:1994 `git_committer_info(0)`, no
+    // IDENT_STRICT). gix refuses instead, so on a machine with no identity — the
+    // daemon's usual environment — every reconcile failed with "reflog messages
+    // need a committer". Synthesize git's default, in memory only.
+    let mut repo = repo.clone();
+    crate::ensure_reflog_identity(&mut repo);
+    let repo = &repo;
+
     // Serialize the whole check-fetch-ff-write through the repo coordinator, so an
     // autonomous reconcile can't race a concurrent writer. Held for the function;
     // a no-op if no daemon is running (ff-only + skip-dirty still protect).

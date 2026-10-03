@@ -5703,6 +5703,7 @@ impl<'r> Sequencer<'r> {
                         &final_message,
                         None,
                         true,
+                        res == 1 && is_pick_like(item.cmd),
                     );
                 }
                 crate::merge_apply::Applied {
@@ -5761,6 +5762,7 @@ impl<'r> Sequencer<'r> {
                 &final_message,
                 Some(&hint),
                 true,
+                is_pick_like(item.cmd),
             );
         }
 
@@ -6336,7 +6338,7 @@ impl<'r> Sequencer<'r> {
             std::fs::write(repo.git_dir().join("MERGE_MSG"), &message)?;
             let short = todo::short_name(repo, original);
             let subject = first_line(message.as_bstr());
-            return self.stop_for_conflict(item, original, &short, &subject, &message, None, false);
+            return self.stop_for_conflict(item, original, &short, &subject, &message, None, false, false);
         }
 
         write_author_script(repo, &commit)?;
@@ -6724,6 +6726,12 @@ impl<'r> Sequencer<'r> {
         // commit (sequencer.c:3505-3507). The `merge` command's stop is the one
         // that does not, so it is the caller that says.
         patch: bool,
+        // `do_pick_commit()`'s `res == 0 || res == 1` arm for a `pick`,
+        // `reword` or `edit` (sequencer.c:2503-2511) writes `CHERRY_PICK_HEAD`,
+        // and `print_advice()`'s `rebase_resolvemsg` branch deletes it again at
+        // once (sequencer.c:534-537): two ref transactions, which a reftable
+        // repository keeps as two tables.
+        cherry_pick_head: bool,
     ) -> Result<Step> {
         let dir = self.dir();
         // The `merge` command's stop never reaches `make_patch()` below, so the
@@ -6794,6 +6802,10 @@ impl<'r> Sequencer<'r> {
         // `error_with_patch()` opens with `make_patch()` whenever it has a commit
         // (sequencer.c:3505-3507); the `message` above is already on disk, so the
         // `if (!file_exists(…))` arm there leaves it alone.
+        if cherry_pick_head {
+            crate::sequencer::write_state_oid(self.repo, "CHERRY_PICK_HEAD", oid, "")?;
+            crate::sequencer::delete_state_ref(self.repo, "CHERRY_PICK_HEAD")?;
+        }
         if patch {
             make_patch(self.repo, &dir, &self.repo.find_commit(oid)?)?;
         }
@@ -7356,6 +7368,12 @@ fn sign_off(
     let ident = format!("{} <{}>", committer.name, committer.email);
     super::commit::append_signoff(&mut text, &ident, 0, false);
     Ok(BString::from(text))
+}
+
+/// `command == TODO_PICK || command == TODO_REWORD || command == TODO_EDIT`
+/// (sequencer.c:2503-2505): the commands whose stop records `CHERRY_PICK_HEAD`.
+fn is_pick_like(cmd: todo::Cmd) -> bool {
+    matches!(cmd, todo::Cmd::Pick | todo::Cmd::Reword | todo::Cmd::Edit)
 }
 
 fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()> {

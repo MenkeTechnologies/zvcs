@@ -3150,10 +3150,21 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     };
     // `odb_for_each_alternate_ref()` runs a command *in the lender* and reads ids
     // off its stdout, so it is only paid for when `--alternate-refs` was given.
+    //
+    // The lender reports `%(objectname)`, so an annotated tag arrives as the tag:
+    // `prepare_revision_walk()`'s `handle_commit()` peels it to its commit and
+    // drops a tag of a tree or blob, and a tree or blob tip, without a word
+    // (revision.c:382-475), which the walk below cannot do for a non-commit tip.
     let alternate_tips: Vec<ObjectId> = if alternate_selections.is_empty() {
         Vec::new()
     } else {
         crate::alternate_refs::tips(&repo)
+            .into_iter()
+            .map(|id| peel_to_commit(&repo, id))
+            .filter(|id| {
+                repo.find_header(*id).is_ok_and(|h| h.kind() == gix::object::Kind::Commit)
+            })
+            .collect()
     };
     // `--bisect`: the ids under `refs/bisect/`, each with the flag it is pended
     // under — `<term_good>*` takes `*flags ^ (UNINTERESTING | BOTTOM)`, so it
@@ -3280,8 +3291,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 tip_sources.push(String::new());
             }
         }
-        // `add_one_alternate_ref()` pends each id under the ref name the alternate
-        // reported, which is the name `--source` would print.
+        // `add_one_alternate_ref()` pends each id under the literal name
+        // ".alternate" (revision.c:1873-1883), which is what `--source` prints.
         for (nth, negated) in alternate_selections.iter().enumerate().filter(|(_, (i, _))| *i == at).map(|(k, (_, n))| (k, *n)) {
             for oid in &alternate_tips {
                 if negated {
@@ -3292,8 +3303,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     before_walk.insert(tip_names.len());
                 }
                 tips.push(*oid);
-                tip_names.push(String::new());
-                tip_sources.push(String::new());
+                tip_names.push(".alternate".to_string());
+                tip_sources.push(".alternate".to_string());
             }
         }
         for (nth, negated) in bisect_selections.iter().enumerate().filter(|(_, (i, _))| *i == at).map(|(k, (_, n))| (k, *n)) {

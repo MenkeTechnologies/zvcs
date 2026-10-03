@@ -889,6 +889,23 @@ fn parent_sets(out: &mut Vec<Case>) {
         &[&["format-patch", "--stdout", "--no-signature", "HEAD^-2"]],
         out,
     );
+    // `git diff` pends the same expansion and sorts the trees it is left with:
+    // two are a tree diff (`^-<n>` excludes the parent, so it is the left side),
+    // three or more are a combined diff whose result is the first entry a mark
+    // did not pend, and nothing but parents is refused.
+    each(
+        Shape::Octopus,
+        "diff",
+        &[
+            &["diff", "--stat", "HEAD^-2"],
+            &["diff", "--stat", "HEAD^!"],
+            &["diff", "--raw", "HEAD^!"],
+            &["diff", "--stat", "HEAD~1", "HEAD^@"],
+            &["diff", "--name-status", "HEAD^2^!"],
+        ],
+        out,
+    );
+    out.push(Case::strict("diff", &["diff", "HEAD^@", "HEAD^2^@"], Shape::Octopus));
     // The same expansion on a non-merge commit, where `^!` negates one parent
     // rather than four — the degenerate case a port can pass by accident, and
     // the reason the octopus cases above exist.

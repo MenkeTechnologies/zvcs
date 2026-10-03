@@ -1744,6 +1744,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // not alone on the line.
     let mut range_operands = 0usize;
     let mut other_revisions = 0usize;
+    // Indices into `revs` that a `^@`/`^!`/`^-<n>` mark pended as parents
+    // (`REV_CMD_PARENTS_ONLY`); a combined diff's result is the first entry that
+    // is not one of them.
+    let mut parent_only_revs: Vec<usize> = Vec::new();
     // The first argument git would not resolve to an option, held until the whole command
     // line has been read. See [`invalid_option`].
     let mut invalid_arg: Option<String> = None;
@@ -2723,6 +2727,43 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         range_operands += 1;
                         continue;
                     }
+                    // `handle_revision_arg_1()`'s parent marks (revision.c): `<c>^@`
+                    // pends the parents of `<c>` in its place, `<c>^!` and `<c>^-<n>`
+                    // pend them UNINTERESTING and then `<c>` itself. A mark
+                    // `add_parents_only()` declines (no such parent, not a commit)
+                    // leaves the operand whole, to fail as a name.
+                    let mut s = s;
+                    if let crate::objname::ParentsOnly::Mark { base, nth, replaces } =
+                        crate::objname::parents_only(s)
+                    {
+                        let mut queued: Vec<(ObjectId, bool)> = Vec::new();
+                        match crate::objname::add_parents_only(
+                            &repo,
+                            base,
+                            !replaces,
+                            nth,
+                            &mut |_, id, not| queued.push((id, not)),
+                        ) {
+                            crate::objname::Parents::BadObject => {
+                                let name = crate::objname::uninteresting_mark(base).0;
+                                eprintln!("fatal: bad object {name}");
+                                return Ok(ExitCode::from(128));
+                            }
+                            crate::objname::Parents::None => {}
+                            crate::objname::Parents::Queued => {
+                                for (id, not) in queued {
+                                    parent_only_revs.push(revs.len());
+                                    revs.push(id.to_hex().to_string());
+                                    revs_uninteresting.push(not);
+                                    other_revisions += 1;
+                                }
+                                if replaces {
+                                    continue;
+                                }
+                                s = base;
+                            }
+                        }
+                    }
                     // `if (*arg == '^') { local_flags = UNINTERESTING | BOTTOM; arg++; }`
                     // — the mark is a flag, and everything downstream
                     // (`get_oid_with_context()`, `verify_non_filename()`,
@@ -3259,8 +3300,15 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         b_prefix: dst_prefix.clone(),
     };
     if combined {
-        combined_req.result = revs[0].clone();
-        combined_req.parents = revs[1..].to_vec();
+        // `builtin_diff_combined()`: the result is `ent[first_non_parent]` and every
+        // other entry is a parent, in order.
+        let Some(result) = (0..revs.len()).find(|i| !parent_only_revs.contains(i)) else {
+            eprintln!("fatal: no merge given, only parents.");
+            return Ok(ExitCode::from(128));
+        };
+        combined_req.result = revs[result].clone();
+        combined_req.parents =
+            revs.iter().enumerate().filter(|(i, _)| *i != result).map(|(_, r)| r.clone()).collect();
         revs = vec![combined_req.parents[0].clone(), combined_req.result.clone()];
         fmt &= F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_SUMMARY | F_DIRSTAT;
     }

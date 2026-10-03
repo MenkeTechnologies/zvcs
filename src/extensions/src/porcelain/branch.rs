@@ -1404,11 +1404,14 @@ fn show_current(repo: &gix::Repository) -> Result<ExitCode> {
 /// contents with the same suffix removed. A worktree with a detached or
 /// unreadable `HEAD` contributes nothing, so it never marks a branch.
 pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<BString, String> {
-    /// `<dir>/HEAD`'s symbolic target, or `None` when detached/unreadable.
-    fn head_ref(dir: &std::path::Path) -> Option<BString> {
-        let raw = std::fs::read(dir.join("HEAD")).ok()?;
-        let target = raw.strip_prefix(b"ref:".as_slice())?;
-        Some(BString::from(target.trim().to_owned()))
+    /// The symbolic target of the worktree `HEAD` named `head` (`main-worktree/HEAD` or
+    /// `worktrees/<id>/HEAD`) as `add_head_info()` reads it from that worktree's ref store,
+    /// or `None` when detached/unreadable.
+    fn head_ref(repo: &gix::Repository, head: &str) -> Option<BString> {
+        match crate::refstore::state_ref_read(repo, head).ok()?? {
+            crate::refstore::StateRef::Symbolic(target) => Some(target),
+            crate::refstore::StateRef::Object(_) => None,
+        }
     }
     /// Drop the `/.git` a worktree's git dir ends in, leaving the checkout path.
     fn checkout_of(git_dir: &std::path::Path) -> std::path::PathBuf {
@@ -1420,14 +1423,14 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
 
     let mut map = std::collections::HashMap::new();
     let common = gix::path::realpath(repo.common_dir()).unwrap_or_else(|_| repo.common_dir().into());
-    let mut add = |dir: &std::path::Path, path: std::path::PathBuf| {
-        if let Some(name) = head_ref(dir) {
+    let mut add = |head: &str, path: std::path::PathBuf| {
+        if let Some(name) = head_ref(repo, head) {
             map.entry(name)
                 .or_insert_with(|| gix::path::into_bstr(path).to_str_lossy().into_owned());
         }
     };
     if !repo.is_bare() {
-        add(&common, checkout_of(&common));
+        add("main-worktree/HEAD", checkout_of(&common));
     }
     let Ok(dir) = std::fs::read_dir(common.join("worktrees")) else {
         return map;
@@ -1449,7 +1452,8 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
         // --relative-paths` and `worktree.useRelativePaths` write. Taking the string literally
         // printed `../../../wt` where git prints the worktree's absolute path.
         let git_dir = super::worktree::recorded_dot_git(&wt, raw.trim());
-        add(&wt, checkout_of(&git_dir));
+        let id = wt.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        add(&format!("worktrees/{id}/HEAD"), checkout_of(&git_dir));
     }
     map
 }
@@ -3382,6 +3386,10 @@ fn rename_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
         return Ok(code);
     }
+    if crate::refstore::is_reftable(repo) {
+        drop(old_ref);
+        return reftable_copy_or_rename_branch(repo, &old, &new, &old_full, &new_full, recovery, head_usage.is_some(), false);
+    }
     // The files backend refuses a symref source only once `refs_rename_ref()`
     // runs, after both names have been validated.
     // ```c
@@ -3727,6 +3735,90 @@ fn rename_orphan_branch(
     Ok(ExitCode::SUCCESS)
 }
 
+/// The rest of `copy_or_rename_branch()` (builtin/branch.c:672-704) in a reftable repository,
+/// once both names have been checked: `refs_rename_ref()` / `refs_copy_existing_ref()` through
+/// the backend (`reftable_be_rename_ref()` / `reftable_be_copy_ref()`, which carry the reflog
+/// and log `Branch: renamed|copied <old> to <new>`), the recovery warning, for a rename of a
+/// branch some worktree is on `replace_each_worktree_head_symref()` (:579-603), and the
+/// `branch.<name>` section.
+#[allow(clippy::too_many_arguments)]
+fn reftable_copy_or_rename_branch(
+    repo: &gix::Repository,
+    old: &str,
+    new: &str,
+    old_full: &str,
+    new_full: &str,
+    recovery: bool,
+    is_head: bool,
+    copy: bool,
+) -> Result<ExitCode> {
+    let verb = if copy { "copied" } else { "renamed" };
+    let message = format!("Branch: {verb} {old_full} to {new_full}");
+    let old_name: FullName = old_full.try_into().map_err(|e| anyhow!("invalid branch name '{old}': {e}"))?;
+    let new_name: FullName = new_full.try_into().map_err(|e| anyhow!("invalid branch name '{new}': {e}"))?;
+    let committer = repo
+        .committer()
+        .transpose()?
+        .ok_or_else(|| anyhow!("unable to determine the committer identity"))?;
+    let result = if copy {
+        repo.reftable_copy_ref(old_name.as_ref(), new_name.as_ref(), committer, message.as_str().into())
+    } else {
+        repo.reftable_rename_ref(old_name.as_ref(), new_name.as_ref(), committer, message.as_str().into())
+    };
+    if let Err(err) = result {
+        eprintln!("error: {err}");
+        return fatal(if copy { "branch copy failed" } else { "branch rename failed" });
+    }
+    if recovery {
+        match copy {
+            true => eprintln!("warning: created a copy of a misnamed branch '{old}'"),
+            false => eprintln!("warning: renamed a misnamed branch '{old}' away"),
+        }
+    }
+    if !copy && is_head {
+        let mut failed = false;
+        for (path, wt_repo) in worktree_repos(repo) {
+            let on_old = matches!(
+                crate::refstore::state_ref_read(&wt_repo, "HEAD"),
+                Ok(Some(crate::refstore::StateRef::Symbolic(ref t))) if t == old_full
+            );
+            if !on_old {
+                continue;
+            }
+            let value = crate::refstore::StateRef::Symbolic(new_full.into());
+            if crate::refstore::state_ref_write(&wt_repo, "HEAD", &value, &message).is_err() {
+                eprintln!("error: HEAD of working tree {} is not updated", path.display());
+                failed = true;
+            }
+        }
+        if failed {
+            return fatal(format!("branch renamed to {new}, but HEAD is not updated"));
+        }
+    }
+    if old != new {
+        move_branch_config(repo, old, new, !copy)?;
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `get_worktrees()` opened as repositories, each with its path: the main worktree, then
+/// every linked one gix can open, as `get_worktree_ref_store()` reaches their ref stores.
+fn worktree_repos(repo: &gix::Repository) -> Vec<(std::path::PathBuf, gix::Repository)> {
+    let mut out = Vec::new();
+    let common = repo.common_dir();
+    if let Ok(main) = gix::open_opts(common, repo.open_options().clone()) {
+        let path = main.workdir().map_or_else(|| common.to_owned(), std::path::Path::to_owned);
+        out.push((path, main));
+    }
+    for proxy in repo.worktrees().unwrap_or_default() {
+        let path = proxy.base().unwrap_or_default();
+        if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree() {
+            out.push((path, linked));
+        }
+    }
+    out
+}
+
 /// Port of `replace_each_worktree_head_symref()` (`worktree.c`): repoint every
 /// *linked* worktree whose `HEAD` is symbolic to `old_full` at `new_name`,
 /// writing the rename's own message into that worktree's `logs/HEAD`. The
@@ -3830,6 +3922,10 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     // RESOLVE_REF_NO_RECURSE.
     if let Some(code) = validate_copy_or_rename_target(repo, o, &old_raw, &new_raw, &new_full)? {
         return Ok(code);
+    }
+    if crate::refstore::is_reftable(repo) {
+        drop(old_ref);
+        return reftable_copy_or_rename_branch(repo, &old, &new, &old_full, &new_full, recovery, false, true);
     }
     let target = old_ref.peel_to_id()?.detach();
 

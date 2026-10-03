@@ -288,3 +288,28 @@ fn fetch_head_keeps_repeated_refspecs_without_destination() {
     }
     case.compare(Fixture::RFiles, "R", &["fetch", ".", "HEAD", "HEAD", "side", "side"]);
 }
+
+/// A reftable clone (`--ref-format`, `GIT_DEFAULT_REF_FORMAT` or
+/// `init.defaultRefFormat`) stores its refs in the transactions git's clone
+/// makes: the initial one of every mapped ref, the followed tags, the remote's
+/// `HEAD` symref and `update_head()` (builtin/clone.c:473-613), with the
+/// `[extensions]` section ahead of `[core]` in the new config.
+#[test]
+fn clone_into_reftable() {
+    let Some(case) = Case::new("clone") else { return };
+    for args in [
+        &["clone", "--ref-format=reftable", ".", "../c"][..],
+        &["clone", "-q", "--bare", "--ref-format=reftable", ".", "../c"],
+        &["clone", "-q", "--mirror", "--ref-format=reftable", ".", "../c"],
+        &["clone", "-q", "-b", "side", "--ref-format=reftable", ".", "../c"],
+        &["clone", "-q", "-b", "v1", "--ref-format=reftable", ".", "../c"],
+        &["clone", "-q", "--single-branch", "--ref-format=reftable", ".", "../c"],
+        &["-c", "init.defaultRefFormat=reftable", "clone", "-q", ".", "../c"],
+    ] {
+        case.compare(Fixture::RFiles, "R", args);
+    }
+    case.compare(Fixture::R, "R", &["clone", "-q", "--ref-format=reftable", "--separate-git-dir=../gd", ".", "../c"]);
+    case.compare_after(Fixture::R, &[&["init", "-q", "--bare", "../e"]], "R", &[
+        "clone", "-q", "--ref-format=reftable", "../e", "../c",
+    ]);
+}

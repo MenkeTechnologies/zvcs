@@ -262,6 +262,8 @@ pub struct Transaction<'s, 'p> {
     /// view of its updates (`struct reftable_transaction_data`). Commit consumes it; dropping it
     /// rolls the transaction back.
     reftable: Option<crate::store_impl::reftable::TransactionData>,
+    /// git's transaction flags that have no spelling in a [`RefEdit`][crate::transaction::RefEdit].
+    options: transaction::Options,
 }
 
 ///

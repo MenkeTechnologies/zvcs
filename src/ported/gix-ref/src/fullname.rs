@@ -47,6 +47,18 @@ impl TryFrom<&BString> for FullName {
     }
 }
 
+impl FullName {
+    /// A name `check_refname_format(refname, REFNAME_ALLOW_ONELEVEL)` accepts, which is what git's ref
+    /// transactions require of a name to write (`transaction_refname_valid()`, refs.c:1368-1394, v2.56.0):
+    /// unlike [`TryFrom`], a single lowercase component such as `main` is taken too. The reftable backend
+    /// stores such a reference as a record of that name.
+    pub fn try_from_onelevel(name: impl Into<BString>) -> Result<Self, gix_validate::reference::name::Error> {
+        let name = name.into();
+        gix_validate::reference::name_partial(name.as_ref())?;
+        Ok(FullName(name))
+    }
+}
+
 impl From<FullName> for BString {
     fn from(name: FullName) -> Self {
         name.0

@@ -20,14 +20,14 @@ use gix_reftable::{Addition, LogRecord, LogUpdate, LogValue, RefRecord, RefValue
 
 use super::{
     Backend, Error, StackRef, lock,
-    common::{Held, Unavailable, fill_log_record, hash_of, strndup},
+    common::{Held, StringList, Unavailable, fill_log_record, hash_of, strndup},
     is_pseudo_ref,
 };
 use crate::{
     FullName, Namespace, Target,
     store::WriteReflog,
-    store_impl::file::transaction::{ErrorKind, commit, prepare},
-    transaction::{Change, LogChange, PreviousValue, RefEdit, RefEditsExt, RefLog},
+    store_impl::file::transaction::{ErrorKind, Options, Rejection, commit, prepare},
+    transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
 };
 
 /// git's `SYMREF_MAXDEPTH` (refs-internal.h).
@@ -69,6 +69,9 @@ struct Update {
     parent: Option<usize>,
     /// The value prepare found, reported in the edits a commit returns.
     previous: Option<Target>,
+    /// `rejection_err`: the update was refused in a transaction that may fail
+    /// partially, and is neither written nor logged.
+    rejected: bool,
     /// The edit as a commit reports it.
     edit: RefEdit,
 }
@@ -148,6 +151,10 @@ pub struct TransactionData {
     updates: Vec<Update>,
     object_hash: gix_hash::Kind,
     log_refs_default: WriteReflog,
+    /// `REF_TRANSACTION_ALLOW_FAILURE`.
+    allow_failure: bool,
+    /// `transaction->rejections`, in the order the updates were refused.
+    rejections: Vec<Rejection>,
 }
 
 impl std::fmt::Debug for TransactionData {
@@ -163,6 +170,38 @@ impl TransactionData {
     /// The edits as prepared, splits included, for a rollback to report.
     pub(crate) fn edits(&self) -> Vec<RefEdit> {
         self.updates.iter().map(|u| u.edit.clone()).collect()
+    }
+
+    /// The updates refused so far, see [`Rejection`].
+    pub(crate) fn rejections(&self) -> &[Rejection] {
+        &self.rejections
+    }
+
+    /// `ref_transaction_maybe_set_rejected()` (refs.c:1276-1312): record
+    /// `err` as the reason update `idx` is dropped, if the transaction may fail
+    /// partially and `err` is about the update's values; `false` otherwise,
+    /// and the transaction fails. A rejected name stops counting as one the
+    /// transaction updates.
+    fn maybe_set_rejected(&mut self, idx: usize, err: &prepare::Error, refnames: &mut StringList) -> bool {
+        let prepare::Error::Reftable { kind, message } = err else {
+            return false;
+        };
+        if !self.allow_failure || *kind == ErrorKind::Generic {
+            return false;
+        }
+        let u = &mut self.updates[idx];
+        refnames.remove(&u.refname);
+        u.rejected = true;
+        self.rejections.push(Rejection {
+            refname: u.refname.clone(),
+            new_oid: u.have_new.then_some(u.new_oid),
+            old_oid: u.have_old.then_some(u.old_oid),
+            new_target: u.new_target.clone(),
+            old_target: u.old_target.clone(),
+            kind: *kind,
+            message: message.clone(),
+        });
+        true
     }
 }
 
@@ -330,6 +369,8 @@ impl Backend {
     /// - `objects` peels annotated tags, whose peeled value git stores with the
     ///   reference (`REF_HAVE_PEELED`, refs.c:1433-1455); without it a reference
     ///   to a tag is written without one.
+    /// - `options` carries `REF_TRANSACTION_ALLOW_FAILURE` and the edits that
+    ///   only verify (`ref_transaction_verify()`).
     pub(crate) fn transaction_prepare(
         &self,
         edits: Vec<RefEdit>,
@@ -337,6 +378,7 @@ impl Backend {
         log_refs_default: WriteReflog,
         namespace: Option<&Namespace>,
         objects: Option<&dyn gix_object::Find>,
+        options: &Options,
     ) -> Result<TransactionData, prepare::Error> {
         let kind = object_hash;
         let mut data = TransactionData {
@@ -344,9 +386,11 @@ impl Backend {
             updates: Vec::with_capacity(edits.len()),
             object_hash: kind,
             log_refs_default,
+            allow_failure: options.allow_failure,
+            rejections: Vec::new(),
         };
 
-        for edit in &edits {
+        for (idx, edit) in edits.iter().enumerate() {
             let log_only = match &edit.change {
                 Change::Update { log, .. } => log.mode == RefLog::Only,
                 Change::Delete { log, .. } => *log == RefLog::Only,
@@ -364,6 +408,7 @@ impl Backend {
             data.updates.push(Self::update_from_edit(
                 edit.clone(),
                 log_only,
+                options.verify_only.contains(&idx),
                 kind,
                 namespace,
                 objects,
@@ -372,23 +417,17 @@ impl Backend {
 
         // `ref_update_reject_duplicates()` (refs.c:2574-2596) over the names of
         // all updates that are not log-only, `transaction->refnames`.
-        let named: Vec<RefEdit> = data
-            .updates
-            .iter()
-            .filter(|u| !u.log_only)
-            .map(|u| RefEdit {
-                change: u.edit.change.clone(),
-                name: FullName(u.refname.clone()),
-                deref: false,
-            })
-            .collect();
-        named.assure_one_name_has_one_edit().map_err(|name| {
-            rejected(
+        let mut refnames = StringList::default();
+        for u in data.updates.iter().filter(|u| !u.log_only) {
+            refnames.append(u.refname.clone());
+        }
+        refnames.sort();
+        if let Some(pair) = refnames.items().windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(rejected(
                 ErrorKind::Generic,
-                format!("multiple updates for ref '{name}' not allowed"),
-            )
-        })?;
-        let mut refnames: BTreeSet<BString> = named.into_iter().map(|e| e.name.0).collect();
+                format!("multiple updates for ref '{}' not allowed", pair[1]),
+            ));
+        }
 
         self.check().map_err(|err| prepare_failure(&err))?;
 
@@ -416,18 +455,41 @@ impl Backend {
         // Updates added by splits are prepared by this same loop.
         let mut idx = 0;
         while idx < data.updates.len() {
-            self.prepare_single_update(
+            if let Err(err) = self.prepare_single_update(
                 &mut data,
                 idx,
                 &mut refnames,
                 &mut refnames_to_check,
                 head_referent.as_ref(),
-            )?;
+            ) {
+                if !data.maybe_set_rejected(idx, &err, &mut refnames) {
+                    return Err(err);
+                }
+            }
             idx += 1;
         }
 
-        self.verify_refnames_available(&refnames_to_check, Some(&refnames), &BTreeSet::new(), None)
-            .map_err(|err| match err {
+        let to_check: Vec<BString> = refnames_to_check.iter().map(|(name, _)| name.clone()).collect();
+        let mut conflicts = Vec::new();
+        let mut reject = |at: usize, message: &str| {
+            let taken = data.allow_failure;
+            if taken {
+                conflicts.push((refnames_to_check[at].1, message.to_owned()));
+            }
+            taken
+        };
+        let available = self.verify_refnames_available(
+            &to_check,
+            Some(&mut refnames),
+            &BTreeSet::new(),
+            None,
+            Some(&mut reject),
+        );
+        for (idx, message) in conflicts {
+            let err = rejected(ErrorKind::NameConflict, message);
+            data.maybe_set_rejected(idx, &err, &mut refnames);
+        }
+        available.map_err(|err| match err {
                 Unavailable::Conflict(message) => rejected(ErrorKind::NameConflict, message),
                 Unavailable::Backend(err) => prepare_failure(&err),
             })?;
@@ -439,6 +501,7 @@ impl Backend {
     fn update_from_edit(
         edit: RefEdit,
         log_only: bool,
+        verify_only: bool,
         kind: gix_hash::Kind,
         namespace: Option<&Namespace>,
         objects: Option<&dyn gix_object::Find>,
@@ -466,6 +529,7 @@ impl Backend {
             is_symref: false,
             parent: None,
             previous: None,
+            rejected: false,
             edit: RefEdit {
                 deref: false,
                 ..edit.clone()
@@ -503,8 +567,15 @@ impl Backend {
                 }
             }
         }
+        if verify_only {
+            // `ref_transaction_verify()` passes no new value at all.
+            update.have_new = false;
+            update.new_oid = kind.null();
+            update.new_target = None;
+            update.force_create_reflog = false;
+        }
         if let Some(objects) = objects {
-            if update.new_target.is_none() && !update.new_oid.is_null() && !update.log_only {
+            if update.have_new && update.new_target.is_none() && !update.new_oid.is_null() && !update.log_only {
                 update.peeled = peel_tag(objects, &update.new_oid);
             }
         }
@@ -516,7 +587,7 @@ impl Backend {
     /// `refname`, of the given `kind`; its index.
     fn add_split_update(
         data: &mut TransactionData,
-        refnames: &mut BTreeSet<BString>,
+        refnames: &mut StringList,
         from: usize,
         refname: BString,
         kind: Split,
@@ -575,6 +646,7 @@ impl Backend {
             is_symref: false,
             parent,
             previous: None,
+            rejected: false,
             edit: RefEdit {
                 change,
                 name: FullName(refname.clone()),
@@ -583,7 +655,7 @@ impl Backend {
         };
         data.updates.push(update);
         if !log_only {
-            refnames.insert(refname);
+            refnames.append(refname);
         }
         data.updates.len() - 1
     }
@@ -593,8 +665,8 @@ impl Backend {
         &self,
         data: &mut TransactionData,
         idx: usize,
-        refnames: &mut BTreeSet<BString>,
-        refnames_to_check: &mut Vec<BString>,
+        refnames: &mut StringList,
+        refnames_to_check: &mut Vec<(BString, usize)>,
         head_referent: Option<&BString>,
     ) -> Result<(), prepare::Error> {
         let kind = data.object_hash;
@@ -613,7 +685,7 @@ impl Backend {
         // accordingly.
         let u = &data.updates[idx];
         if head_referent.is_some_and(|referent| *referent == rewritten) && !u.log_only && !u.via_head {
-            if refnames.contains(b"HEAD".as_bstr()) {
+            if refnames.has(b"HEAD") {
                 return Err(rejected(
                     ErrorKind::NameConflict,
                     format!(
@@ -643,7 +715,7 @@ impl Backend {
             if !u.expects_existing_old_ref() {
                 // The reference does not exist and is not expected to: only
                 // check that nothing conflicts with creating it.
-                refnames_to_check.push(u.refname.clone());
+                refnames_to_check.push((u.refname.clone(), idx));
                 // There is no need to write the reference deletion when the
                 // reference in question doesn't exist.
                 if u.have_new && !u.has_null_new_value() {
@@ -676,7 +748,7 @@ impl Backend {
                     ));
                 }
             } else {
-                if refnames.contains(&referent) {
+                if refnames.has(&referent) {
                     return Err(rejected(
                         ErrorKind::NameConflict,
                         format!(
@@ -791,6 +863,8 @@ impl Backend {
             updates,
             object_hash: _,
             log_refs_default,
+            allow_failure: _,
+            rejections: _,
         } = data;
         let missing_committer = Cell::new(false);
         let failure = |err: gix_reftable::Error| {
@@ -824,7 +898,7 @@ impl Backend {
                 .map_err(failure)?;
             addition.commit(&mut st).map_err(failure)?;
         }
-        Ok(updates.into_iter().map(Update::into_edit).collect())
+        Ok(updates.into_iter().filter(|u| !u.rejected).map(Update::into_edit).collect())
     }
 
     /// `write_transaction_table()` (refs/reftable-backend.c:1463-1664): the
@@ -855,6 +929,9 @@ impl Backend {
         let mut logs = Vec::new();
         for (idx, current_oid) in stack_updates.iter() {
             let u = &updates[*idx];
+            if u.rejected {
+                continue;
+            }
             if u.have_new && !u.is_symref && u.has_null_new_value() {
                 // When deleting refs we also delete all reflog entries with
                 // them, one tombstone per entry.

@@ -548,7 +548,7 @@ impl Backend {
         held: (&StackRef, &Stack),
     ) -> Result<(), Error> {
         let skip: BTreeSet<BString> = skip.into_iter().map(ToOwned::to_owned).collect();
-        self.verify_refnames_available(&[refname.to_owned()], None, &skip, Some(held))
+        self.verify_refnames_available(&[refname.to_owned()], None, &skip, Some(held), None)
             .map_err(|err| match err {
                 Unavailable::Conflict(msg) => message(msg),
                 Unavailable::Backend(err) => err,

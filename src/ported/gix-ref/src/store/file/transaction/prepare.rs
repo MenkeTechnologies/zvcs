@@ -737,6 +737,7 @@ impl Transaction<'_, '_> {
             self.store.write_reflog,
             self.store.namespace.as_ref(),
             objects,
+            &self.options,
         )?;
         let updates: Vec<Edit> = data
             .edits()

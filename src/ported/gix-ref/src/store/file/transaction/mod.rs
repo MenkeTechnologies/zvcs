@@ -53,6 +53,56 @@ pub enum ErrorKind {
     CaseConflict,
 }
 
+impl ErrorKind {
+    /// `ref_transaction_error_msg()` (refs.c:3542-3562, v2.56.0): how
+    /// `update-ref --batch-updates` names the error in a `rejected` line.
+    pub fn message(self) -> &'static str {
+        match self {
+            ErrorKind::NameConflict => "refname conflict",
+            ErrorKind::CreateExists => "reference already exists",
+            ErrorKind::NonexistentRef => "reference does not exist",
+            ErrorKind::IncorrectOldValue => "incorrect old value provided",
+            ErrorKind::InvalidNewValue => "invalid new value provided",
+            ErrorKind::ExpectedSymref => "expected symref but found regular ref",
+            ErrorKind::CaseConflict => "reference conflict due to case-insensitive filesystem",
+            ErrorKind::Generic => "unknown failure",
+        }
+    }
+}
+
+/// An update a transaction that may fail partially refused, as
+/// `ref_transaction_for_each_rejected_update()` (refs.c:3048-3069, v2.56.0)
+/// hands it to its callback: the values are those of git's `struct ref_update`,
+/// an oid only where the update has one (`REF_HAVE_NEW`, `REF_HAVE_OLD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The name of the refused update; one a symbolic reference was split into
+    /// is named for the referent.
+    pub refname: BString,
+    /// `new_oid` if `REF_HAVE_NEW`; a symbolic update has the null id here.
+    pub new_oid: Option<ObjectId>,
+    /// `old_oid` if `REF_HAVE_OLD`.
+    pub old_oid: Option<ObjectId>,
+    /// `new_target`.
+    pub new_target: Option<BString>,
+    /// `old_target`.
+    pub old_target: Option<BString>,
+    /// `rejection_err`.
+    pub kind: ErrorKind,
+    /// `rejection_details`, git's error text.
+    pub message: BString,
+}
+
+/// git's transaction flags that a [`RefEdit`] cannot express. Only a store with
+/// the reftable backend reads them; the files backend prepares as before.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Options {
+    /// `REF_TRANSACTION_ALLOW_FAILURE`.
+    pub allow_failure: bool,
+    /// Indices of the edits that only verify their expected value.
+    pub verify_only: std::collections::BTreeSet<usize>,
+}
+
 #[derive(Debug)]
 pub(in crate::store_impl::file) struct Edit {
     update: RefEdit,
@@ -145,6 +195,7 @@ impl file::Store {
             updates: None,
             packed_refs: PackedRefs::default(),
             reftable: None,
+            options: Options::default(),
         }
     }
 }
@@ -154,6 +205,35 @@ impl<'p> Transaction<'_, 'p> {
     pub fn packed_refs(mut self, packed_refs: PackedRefs<'p>) -> Self {
         self.packed_refs = packed_refs;
         self
+    }
+
+    /// Let single updates fail without failing the transaction, git's
+    /// `REF_TRANSACTION_ALLOW_FAILURE` (`update-ref --batch-updates`): an update
+    /// refused for any reason but [`ErrorKind::Generic`] is dropped and listed by
+    /// [`rejections()`](Self::rejections()), while the others are committed.
+    ///
+    /// Only a store with the reftable backend honours it.
+    pub fn allow_failure(mut self) -> Self {
+        self.options.allow_failure = true;
+        self
+    }
+
+    /// Make the edits at `indices` (positions in what [`prepare()`](Self::prepare())
+    /// is given) verify their expected value only, git's `ref_transaction_verify()`
+    /// (refs.c:1537-1554, v2.56.0): the update carries no new value
+    /// (`REF_HAVE_NEW` is unset), so its `new` is ignored, nothing is written and
+    /// no reflog entry is made for it.
+    ///
+    /// Only a store with the reftable backend honours it.
+    pub fn verify_only(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
+        self.options.verify_only.extend(indices);
+        self
+    }
+
+    /// The updates a prepared transaction that [may fail partially](Self::allow_failure())
+    /// refused, in the order they were refused.
+    pub fn rejections(&self) -> &[Rejection] {
+        self.reftable.as_ref().map_or(&[], |data| data.rejections())
     }
 }
 

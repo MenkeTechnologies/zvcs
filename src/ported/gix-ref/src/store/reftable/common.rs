@@ -77,6 +77,63 @@ pub(super) fn fill_log_record(committer: &gix_actor::SignatureRef<'_>) -> LogUpd
     }
 }
 
+/// git's `struct string_list` as `transaction->refnames` uses it: sorted once
+/// (`string_list_sort()`), appended to unsorted afterwards
+/// (`string_list_append()`, refs.c:1361), and searched by bisection all the
+/// same (`get_entry_index()`, string-list.c:18-41). A name appended after
+/// the sort can therefore be missed by a lookup, exactly as git misses it.
+#[derive(Debug, Default, Clone)]
+pub(super) struct StringList(Vec<BString>);
+
+impl StringList {
+    /// `string_list_append()`.
+    pub(super) fn append(&mut self, string: BString) {
+        self.0.push(string);
+    }
+
+    /// `string_list_sort()`.
+    pub(super) fn sort(&mut self) {
+        self.0.sort();
+    }
+
+    /// The items in list order.
+    pub(super) fn items(&self) -> &[BString] {
+        &self.0
+    }
+
+    /// `get_entry_index()`: where `string` is or would be inserted, and
+    /// whether it was found there.
+    fn entry_index(&self, string: &[u8]) -> (usize, bool) {
+        let (mut left, mut right) = (0, self.0.len());
+        while left < right {
+            let middle = left + (right - left) / 2;
+            match string.cmp(self.0[middle].as_slice()) {
+                std::cmp::Ordering::Less => right = middle,
+                std::cmp::Ordering::Greater => left = middle + 1,
+                std::cmp::Ordering::Equal => return (middle, true),
+            }
+        }
+        (right, false)
+    }
+
+    /// `string_list_has_string()`.
+    pub(super) fn has(&self, string: &[u8]) -> bool {
+        self.entry_index(string).1
+    }
+
+    /// `string_list_find_insert_index()`.
+    pub(super) fn find_insert_index(&self, string: &[u8]) -> usize {
+        self.entry_index(string).0
+    }
+
+    /// `string_list_remove()`.
+    pub(super) fn remove(&mut self, string: &[u8]) {
+        if let (index, true) = self.entry_index(string) {
+            self.0.remove(index);
+        }
+    }
+}
+
 /// Why `refs_verify_refnames_available()` refused.
 pub(super) enum Unavailable {
     /// `REF_TRANSACTION_ERROR_NAME_CONFLICT` with git's message.
@@ -214,15 +271,33 @@ impl Backend {
     /// of an existing reference or of one of `extras`; names in `skip` do not
     /// count. git's single-name `refs_verify_refname_available()`
     /// (:2953-2968) is this with one name.
+    ///
+    /// `reject` is `ref_transaction_maybe_set_rejected()` for a transaction
+    /// that may fail partially: it is handed the position in `refnames` and
+    /// the message of a conflict, and when it takes the conflict the check
+    /// moves on to the next name, which is removed from `extras`, the
+    /// transaction's names (`string_list_remove(&transaction->refnames, …)`,
+    /// refs.c:1296-1300).
     pub(super) fn verify_refnames_available(
         &self,
         refnames: &[BString],
-        extras: Option<&BTreeSet<BString>>,
+        mut extras: Option<&mut StringList>,
         skip: &BTreeSet<BString>,
         held: Held<'_>,
+        mut reject: Option<&mut dyn FnMut(usize, &str) -> bool>,
     ) -> Result<(), Unavailable> {
         let mut dirnames = HashSet::<BString>::new();
-        for refname in refnames {
+        let mut conflicting_dirnames = HashSet::<BString>::new();
+        'next_ref: for (idx, refname) in refnames.iter().enumerate() {
+            let mut take = |message: &str, extras: &mut Option<&mut StringList>| {
+                let taken = reject.as_mut().is_some_and(|reject| reject(idx, message));
+                if taken {
+                    if let Some(extras) = extras {
+                        extras.remove(refname);
+                    }
+                }
+                taken
+            };
             for slash in refname.find_iter(b"/") {
                 let dirname: BString = refname[..slash].into();
                 if skip.contains(&dirname) {
@@ -232,15 +307,24 @@ impl Backend {
                     continue;
                 }
                 // Any error reading it counts as absent.
-                if let Ok(Some(_)) = self.read_raw_ref_in(dirname.as_ref(), held) {
-                    return Err(Unavailable::Conflict(format!(
-                        "'{dirname}' exists; cannot create '{refname}'"
-                    )));
+                if conflicting_dirnames.contains(&dirname)
+                    || matches!(self.read_raw_ref_in(dirname.as_ref(), held), Ok(Some(_)))
+                {
+                    let message = format!("'{dirname}' exists; cannot create '{refname}'");
+                    if take(&message, &mut extras) {
+                        dirnames.remove(&dirname);
+                        conflicting_dirnames.insert(dirname);
+                        continue 'next_ref;
+                    }
+                    return Err(Unavailable::Conflict(message));
                 }
-                if extras.is_some_and(|extras| extras.contains(&dirname)) {
-                    return Err(Unavailable::Conflict(format!(
-                        "cannot process '{refname}' and '{dirname}' at the same time"
-                    )));
+                if extras.as_ref().is_some_and(|extras| extras.has(&dirname)) {
+                    let message = format!("cannot process '{refname}' and '{dirname}' at the same time");
+                    if take(&message, &mut extras) {
+                        dirnames.remove(&dirname);
+                        continue 'next_ref;
+                    }
+                    return Err(Unavailable::Conflict(message));
                 }
             }
 
@@ -250,20 +334,25 @@ impl Backend {
                 .first_ref_with_prefix(&prefix, skip, held)
                 .map_err(Unavailable::Backend)?;
             if let Some(existing) = existing {
-                return Err(Unavailable::Conflict(format!(
-                    "'{existing}' exists; cannot create '{refname}'"
-                )));
+                let message = format!("'{existing}' exists; cannot create '{refname}'");
+                if take(&message, &mut extras) {
+                    continue 'next_ref;
+                }
+                return Err(Unavailable::Conflict(message));
             }
             // `find_descendant_ref()` (refs.c:1787-1811).
-            if let Some(extra) = extras.and_then(|extras| {
-                extras
-                    .range(prefix.clone()..)
+            if let Some(extra) = extras.as_ref().and_then(|extras| {
+                extras.items()[extras.find_insert_index(&prefix)..]
+                    .iter()
                     .take_while(|e| e.starts_with(&prefix))
                     .find(|e| !skip.contains(*e))
+                    .cloned()
             }) {
-                return Err(Unavailable::Conflict(format!(
-                    "cannot process '{refname}' and '{extra}' at the same time"
-                )));
+                let message = format!("cannot process '{refname}' and '{extra}' at the same time");
+                if take(&message, &mut extras) {
+                    continue 'next_ref;
+                }
+                return Err(Unavailable::Conflict(message));
             }
         }
         Ok(())

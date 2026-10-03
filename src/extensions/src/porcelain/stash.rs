@@ -61,10 +61,11 @@
 //!   `--label-theirs`/`--label-base` name the conflict sides. Both then run
 //!   `git status` unless `-q`/`--quiet` was given, which also silences `pop`'s
 //!   `Dropped …` line.
-//! * `drop` / `clear` — remove one / all entries, rewriting the reflog exactly
-//!   like `git reflog delete --rewrite --updateref`. The ref itself moves (or is
-//!   deleted) through the ref store, so a `refs/stash` that lives in
-//!   `packed-refs` is removed rather than left resolving to a dropped stash.
+//! * `drop` / `clear` — remove one / all entries; `drop` is
+//!   `git reflog delete --rewrite --updateref` itself, in either ref store. The
+//!   ref itself moves (or is deleted) through the ref store, so a `refs/stash`
+//!   that lives in `packed-refs` is removed rather than left resolving to a
+//!   dropped stash.
 //!   Both parse their argv first: `drop` takes only `OPT__QUIET`, and `clear`
 //!   takes nothing at all (`PARSE_OPT_STOP_AT_NON_OPTION` over an empty table,
 //!   so an operand is `error: git stash clear with arguments is unimplemented`
@@ -3310,8 +3311,11 @@ fn delete_stash_ref(repo: &gix::Repository) -> Result<()> {
         deref: false,
     })?;
     // The reflog is the stash's list, so it goes with the ref whether or not the
-    // ref store keeps logs of deleted references around.
-    let _ = std::fs::remove_file(repo.common_dir().join("logs/refs/stash"));
+    // files store kept a log of the deleted reference around; the reftable
+    // store deletes a reference's log entries with it.
+    if !crate::refstore::is_reftable(repo) {
+        let _ = std::fs::remove_file(repo.common_dir().join("logs/refs/stash"));
+    }
     Ok(())
 }
 
@@ -3750,98 +3754,6 @@ fn write_target_index(
 }
 
 // ---------------------------------------------------------------------------
-// Reflog helpers
-// ---------------------------------------------------------------------------
-
-/// Remove `stash@{n}` from the reflog, rewriting the chain and repointing the
-/// ref, exactly like `git reflog delete --rewrite --updateref stash@{n}`.
-/// Returns the dropped commit id.
-fn drop_reflog_entry(repo: &gix::Repository, n: usize) -> Result<ObjectId> {
-    let common = repo.common_dir();
-    let log_path = common.join("logs/refs/stash");
-
-    let data = std::fs::read(&log_path).map_err(|_| anyhow!("No stash entries found."))?;
-    // Reflog lines are stored oldest-first, one per line.
-    let mut lines: Vec<Vec<u8>> = data.split(|b| *b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect();
-    let len = lines.len();
-    if n >= len {
-        crate::git_fatal!("stash@{{{n}}} is not a valid reference");
-    }
-    let target = len - 1 - n; // stash@{0} is the last (newest) line
-
-    let dropped = parse_new_oid(&lines[target])?;
-
-    // Preserve chain consistency: the entry after the dropped one inherits the
-    // dropped entry's previous oid (its new "old" side).
-    if target + 1 < len {
-        let prev = field_prev(&lines[target])?.to_vec();
-        set_prev(&mut lines[target + 1], &prev)?;
-    }
-    lines.remove(target);
-
-    if lines.is_empty() {
-        // The last entry: `--updateref` on an emptied log deletes the ref, which
-        // has to go through the ref store so a packed `refs/stash` goes too.
-        delete_stash_ref(repo)?;
-    } else {
-        let newest = parse_new_oid(lines.last().expect("non-empty"))?;
-        // Move the ref through the ref store (loose or packed, whichever holds
-        // it), then lay down the rewritten log — the update appends an entry of
-        // its own, and `reflog delete --rewrite` leaves no such trace.
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: false,
-                    message: "reflog delete".into(),
-                },
-                expected: PreviousValue::Any,
-                new: Target::Object(newest),
-            },
-            name: "refs/stash"
-                .try_into()
-                .map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
-            deref: false,
-        })?;
-        let mut out = Vec::with_capacity(data.len());
-        for l in &lines {
-            out.extend_from_slice(l);
-            out.push(b'\n');
-        }
-        std::fs::write(&log_path, &out)?;
-    }
-
-    Ok(dropped)
-}
-
-/// Byte offsets of the first two spaces in a reflog line (`<old> <new> …`).
-fn split2(line: &[u8]) -> Result<(usize, usize)> {
-    let s1 = line.iter().position(|b| *b == b' ').ok_or_else(|| anyhow!("malformed reflog line"))?;
-    let s2 = line[s1 + 1..]
-        .iter()
-        .position(|b| *b == b' ')
-        .map(|p| p + s1 + 1)
-        .ok_or_else(|| anyhow!("malformed reflog line"))?;
-    Ok((s1, s2))
-}
-
-fn parse_new_oid(line: &[u8]) -> Result<ObjectId> {
-    let (s1, s2) = split2(line)?;
-    ObjectId::from_hex(&line[s1 + 1..s2]).map_err(|e| anyhow!("invalid oid in reflog: {e}"))
-}
-
-fn field_prev(line: &[u8]) -> Result<&[u8]> {
-    let (s1, _) = split2(line)?;
-    Ok(&line[..s1])
-}
-
-fn set_prev(line: &mut Vec<u8>, prev: &[u8]) -> Result<()> {
-    let (s1, _) = split2(line)?;
-    line.splice(0..s1, prev.iter().copied());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
 
@@ -3963,17 +3875,20 @@ fn reflog_recno(revision: &str) -> Option<Option<usize>> {
     Some(Some(spec[..digits].parse().unwrap_or(0)))
 }
 
-/// How many entries a ref's reflog holds, or `None` when the ref is unknown.
+/// How many entries a ref's reflog holds, counted through the ref store, or
+/// `None` when the ref is unknown.
 fn reflog_len(repo: &gix::Repository, name: &str) -> Result<Option<usize>> {
     let Some(reference) = repo.try_find_reference(name)? else {
         return Ok(None);
     };
-    let mut platform = reference.log_iter();
-    Ok(Some(match platform.all()? {
-        Some(iter) => iter.count(),
-        None => 0,
-    }))
+    let mut count = 0;
+    crate::refstore::for_each_reflog_entry(repo, &reference.name().as_bstr().to_str_lossy(), false, |_| {
+        count += 1;
+        std::ops::ControlFlow::Continue(())
+    })?;
+    Ok(Some(count))
 }
+
 
 /// Resolve a `<stash>` argument the way `get_stash_info()` does: expand it with
 /// `parse_stash_revision()`, resolve *that* string, and require the result to
@@ -4061,35 +3976,34 @@ fn require_stash_ref(spec: &StashSpec) -> Option<ExitCode> {
     Some(failed())
 }
 
-/// `do_drop_stash()`: delete the reflog entry the revision names, then report it
-/// under that same spelling.
-///
-/// The deletion is `reflog_delete(rev, REWRITE|UPDATE_REF)`, which needs an
-/// `@{…}` in the revision — a bare `refs/stash` is not a reflog spec and is
-/// refused as one — and reads a number out of it. An `@{<date>}` payload sends
-/// git into `approxidate()`-driven expiry, which this port does not have; it
-/// says so rather than guess an entry.
+/// `do_drop_stash()` (builtin/stash.c:826-843): delete the reflog entry the
+/// revision names with `reflog_delete(rev, EXPIRE_REFLOGS_REWRITE |
+/// EXPIRE_REFLOGS_UPDATE_REF, 0)` — [`super::reflog::reflog_delete`], the same
+/// deletion `git reflog delete` makes, in either ref store — report it under
+/// that same spelling, and clear the stash once its reflog is empty.
 fn do_drop_stash(repo: &gix::Repository, spec: &StashSpec, quiet: bool) -> Result<ExitCode> {
     let rev = &spec.revision;
-    let recno = match reflog_recno(rev) {
-        Some(Some(n)) => n,
-        Some(None) => {
-            eprintln!("error: {rev}: an `@{{<date>}}` reflog spec is not ported");
-            eprintln!("error: {rev}: Could not drop stash entry");
-            return Ok(failed());
-        }
-        None => {
-            eprintln!("error: not a reflog: {rev}");
-            eprintln!("error: {rev}: Could not drop stash entry");
-            return Ok(failed());
-        }
-    };
-    let dropped = drop_reflog_entry(repo, recno)?;
+    if !super::reflog::reflog_delete(repo, rev, true, true, false, false)? {
+        eprintln!("error: {rev}: Could not drop stash entry");
+        return Ok(failed());
+    }
     if !quiet {
-        println!("Dropped {rev} ({dropped})");
+        println!("Dropped {rev} ({})", spec.id);
+    }
+    // `if (reflog_is_empty(ref_stash)) do_clear_stash();`, where an empty log
+    // is one `refs_for_each_reflog_ent()` walks to the end without an entry —
+    // not one it cannot open, which the files store answers with -1.
+    let mut has_entry = false;
+    let walked = crate::refstore::for_each_reflog_entry(repo, "refs/stash", false, |_| {
+        has_entry = true;
+        std::ops::ControlFlow::Break(())
+    })?;
+    if walked && !has_entry {
+        delete_stash_ref(repo)?;
     }
     Ok(ExitCode::SUCCESS)
 }
+
 
 /// Which files beyond the tracked changes a push takes.
 #[derive(Clone, Copy, PartialEq, Eq)]

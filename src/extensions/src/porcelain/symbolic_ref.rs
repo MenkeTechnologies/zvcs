@@ -176,33 +176,18 @@ pub fn symbolic_ref(args: &[String]) -> Result<ExitCode> {
     // `core.preferSymlinkRefs` is read when the files ref store is created
     // (refs/files-backend.c:129), which every form of this command does — so an
     // unreadable value refuses the read form as much as the write form, and
-    // refuses before any update is applied.
-    let prefer_symlink =
-        match crate::repo_settings::config_bool_strict(&repo, "core.prefersymlinkrefs") {
+    // refuses before any update is applied. The reftable backend never reads it.
+    let prefer_symlink = match crate::refstore::is_reftable(&repo) {
+        true => false,
+        false => match crate::repo_settings::config_bool_strict(&repo, "core.prefersymlinkrefs") {
             Ok(v) => v.unwrap_or(false),
             Err(msg) => return fatal(&msg),
-        };
+        },
+    };
 
     if opts.delete {
         delete_symref(&repo, positional[0])
     } else if positional.len() == 2 {
-        // `refs_update_symref()` against a reftable store this build has no
-        // backend for cannot open the stack, so the transaction never gets past
-        // prepare. `cmd_symbolic_ref()` turns that into its exit status with
-        // `ret = !!refs_update_symref(...)` (`builtin/symbolic-ref.c:114-116`,
-        // v2.55.0), which is 1 for any failure. Measured against stock 2.55.0 in
-        // a files repository declaring `extensions.refStorage = reftable`:
-        // `symbolic-ref HEAD refs/heads/feature` prints
-        // `error: reftable: transaction prepare: I/O error` and exits 1.
-        //
-        // Refusing here is what keeps the repository intact: the port's ref store
-        // is rooted at `<gitdir>/reftable`, so a files-backend write would create
-        // that directory and drop a loose `HEAD` inside it — a file stock would
-        // never write and cannot read.
-        if crate::setup::declares_reftable(&repo) {
-            eprintln!("error: reftable: transaction prepare: I/O error");
-            return Ok(ExitCode::from(1));
-        }
         set_symref(&repo, positional[0], positional[1], opts.message.as_deref(), prefer_symlink)
     } else {
         read_symref(&repo, positional[0], &opts)
@@ -277,6 +262,10 @@ fn set_symref(
     if !refname_is_safe(name) {
         eprintln!("error: refusing to update ref with bad name '{name}'");
         return Ok(ExitCode::from(1));
+    }
+
+    if crate::refstore::is_reftable(repo) {
+        return reftable_symref_write(repo, name, Some(target), message);
     }
 
     // `cmd_symbolic_ref()` format-checks the *target* and nothing else
@@ -543,6 +532,9 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
     let Some(target) = symbolic_target(repo, BStr::new(name))? else {
         return fatal(&format!("Cannot delete {name}, not a symbolic ref"));
     };
+    if crate::refstore::is_reftable(repo) {
+        return reftable_symref_write(repo, name, None, None);
+    }
 
     repo.edit_reference(RefEdit {
         change: Change::Delete {
@@ -554,6 +546,57 @@ fn delete_symref(repo: &gix::Repository, name: &str) -> Result<ExitCode> {
         deref: false,
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The write `refs_update_symref()` (refs.c:2512-2566) makes in a reftable
+/// repository — or with no `target`, the `refs_delete_ref(…, NULL, REF_NO_DEREF)`
+/// of `--delete` (refs.c:1007-1028) — as one transaction of the backend, which
+/// logs the symref and the `HEAD` update it implies itself
+/// (`write_transaction_table()`, refs/reftable-backend.c:1463-1664). A failure
+/// is `error: <reason>` and exit 1 either way (`ret = !!…`,
+/// builtin/symbolic-ref.c:114-116).
+fn reftable_symref_write(
+    repo: &gix::Repository,
+    name: &str,
+    target: Option<&str>,
+    message: Option<&str>,
+) -> Result<ExitCode> {
+    // `check_refname_format(…, REFNAME_ALLOW_ONELEVEL)` was the check made of
+    // either name; one only `refname_is_safe()` lets through, like
+    // `refs/heads/bad name`, has no `FullName`.
+    let spell = |n: &str| {
+        FullName::try_from(n)
+            .or_else(|_| FullName::try_from_onelevel(n))
+            .map_err(|e| anyhow!("cannot address reference {n:?}: {e}"))
+    };
+    let change = match target {
+        Some(target) => Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: message.unwrap_or_default().into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(spell(target)?),
+        },
+        None => Change::Delete {
+            expected: PreviousValue::Any,
+            log: RefLog::AndReference,
+            message: BString::default(),
+        },
+    };
+    let edit = RefEdit {
+        change,
+        name: spell(name)?,
+        deref: false,
+    };
+    Ok(match super::update_ref::reftable_commit(repo, vec![edit], &Default::default(), false) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("error: {reason}");
+            ExitCode::from(1)
+        }
+    })
 }
 
 /// The pseudorefs git's `symbolic-ref` refuses to point elsewhere. Determined
@@ -609,6 +652,13 @@ fn resolve_ref(repo: &gix::Repository, name: &str, recurse: bool) -> Result<Reso
         // branch file the repository's hash width cannot read.
         let found = match find_exact(repo, current.as_bstr()) {
             Ok(found) => found,
+            // A symref whose target is no valid refname is read as it is, and
+            // `RESOLVE_REF_NO_RECURSE` hands that target back before
+            // `check_refname_format()` would refuse it (refs.c:2172-2186, v2.56.0).
+            Err(e) if !recurse && bad_symref_target(&e).is_some() => {
+                let target = bad_symref_target(&e).expect("just checked");
+                return Ok(Resolution::Symbolic(target));
+            }
             Err(e) if is_unparsable_ref(&e) => return Ok(Resolution::NoSuchRef),
             Err(e) => return Err(e),
         };
@@ -907,14 +957,24 @@ fn usage_error(error: Option<&str>) -> Result<ExitCode> {
     Ok(ExitCode::from(129))
 }
 
-/// Whether a ref lookup failed because the ref file's body would not parse —
-/// git's *broken ref*, which `refs_resolve_ref_unsafe()` reports as an absence
-/// rather than as a failure.
+/// Whether a ref lookup failed because the ref file's body would not parse, or
+/// names a symref target that is no valid refname — git's *broken ref*, which
+/// `refs_resolve_ref_unsafe()` reports as an absence rather than as a failure.
 fn is_unparsable_ref(err: &anyhow::Error) -> bool {
     use gix::refs::file::loose::reference::decode::Error as DecodeError;
     err.chain().any(|cause| {
         cause
             .downcast_ref::<DecodeError>()
-            .is_some_and(|d| matches!(d, DecodeError::Parse { .. }))
+            .is_some_and(|d| matches!(d, DecodeError::Parse { .. } | DecodeError::RefnameValidation { .. }))
+    })
+}
+
+/// The target of a symref that names no valid refname, if that is why the
+/// lookup failed.
+fn bad_symref_target(err: &anyhow::Error) -> Option<BString> {
+    use gix::refs::file::loose::reference::decode::Error as DecodeError;
+    err.chain().find_map(|cause| match cause.downcast_ref::<DecodeError>()? {
+        DecodeError::RefnameValidation { path, .. } => Some(path.clone()),
+        DecodeError::Parse { .. } => None,
     })
 }

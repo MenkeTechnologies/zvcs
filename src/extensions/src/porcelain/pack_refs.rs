@@ -38,6 +38,28 @@ use gix::refs::{FullName, Target};
 
 use super::{Arg, LongOpt};
 
+/// `refs_optimize()` of a reftable store, `reftable_be_optimize()`
+/// (refs/reftable-backend.c:1699-1730, v2.56.0): compact the current
+/// worktree's stack — geometrically with `auto` — and remove the tables it no
+/// longer lists.
+///
+/// `pack_refs_core()` (pack-refs.c:9-58) returns what that gives back and
+/// `main()` exits with it: 0, -1 for a compaction it reported with `error()`,
+/// or a reftable error code unreported — the one the stack failed to open
+/// with (`refs->err`), or the one cleaning it failed with.
+pub(super) fn reftable_optimize(repo: &gix::Repository, auto: bool) -> ExitCode {
+    use gix::refs::reftable::Error;
+    match repo.reftable_optimize(auto) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(gix::repository::reftable::Error::Backend(Error::Io(message))) => {
+            eprintln!("error: {message}");
+            ExitCode::from(255)
+        }
+        Err(gix::repository::reftable::Error::Backend(Error::Reftable(err))) => ExitCode::from(err.code() as u8),
+        Err(gix::repository::reftable::Error::NotReftable) => unreachable!("the caller checked the format"),
+    }
+}
+
 /// The first line of a `packed-refs` file, byte-identical to what git writes.
 const HEADER_LINE: &[u8] = b"# pack-refs with: peeled fully-peeled sorted \n";
 
@@ -178,18 +200,10 @@ pub fn pack_refs(args: &[String]) -> Result<ExitCode> {
 
     let repo = crate::setup::discover()?;
 
-    // `pack_refs_core()` (`pack-refs.c:50-55`, v2.55.0) returns whatever
-    // `refs_optimize()` hands back, unexamined and unreported. For the reftable
-    // backend that is `refs->err` — the error recorded when the stack failed to
-    // open, returned before any work in `reftable_be_optimize()`
-    // (`refs/reftable-backend.c:1664-1665`, v2.55.0). A declared store that was
-    // never created fails to open with `REFTABLE_IO_ERROR`
-    // (`reftable/reftable-error.h:20`, v2.55.0), which is -2, and `main()` passes
-    // that straight to `exit()`. Measured against stock 2.55.0 in a files
-    // repository declaring `extensions.refStorage = reftable`: `pack-refs --all`
-    // and bare `pack-refs` both exit 254 with nothing on stdout or stderr.
-    if crate::setup::declares_reftable(&repo) {
-        return Ok(ExitCode::from(254));
+    // The reftable backend has no loose references to pack: it compacts its
+    // stack, and the patterns and `--prune` do not apply.
+    if crate::refstore::is_reftable(&repo) {
+        return Ok(reftable_optimize(&repo, opts.auto));
     }
 
     let store = &repo.refs;

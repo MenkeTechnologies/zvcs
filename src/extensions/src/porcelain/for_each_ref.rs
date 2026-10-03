@@ -1396,22 +1396,25 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // Materialise every ref name first: the iterator holds the packed-refs
     // buffer, which would block the per-ref object lookups below.
     let mut names: Vec<Vec<u8>> = Vec::new();
-    for r in repo.references()?.all()? {
-        let Some(r) = skip_broken_ref(r)? else { continue };
-        names.push(r.name().as_bstr().to_vec());
-    }
     // `--include-root-refs` also lists HEAD and the pseudorefs in the git dir
     // that git's `is_root_ref` accepts. They live directly under `$GIT_DIR`, so
-    // the loose scan there finds them; `sort_refs` re-orders everything by name.
+    // the loose scan there finds them, ahead of everything under `refs/` in the
+    // iteration order; `sort_refs` re-orders everything by name.
     // `add_root_refs()` is the *files* backend's (refs/files-backend.c:421-451,
     // v2.55.0): it walks the git directory while the loose-ref cache is built, so
-    // it exists only where loose refs do. A repository declaring `reftable` takes
-    // its root refs out of the reftable stack instead, and a declared store this
-    // build never created holds none — stock lists nothing there. Scanning the git
-    // directory anyway would report `HEAD` (the file every repository has, whatever
-    // its backend) as a ref, and then fail to resolve it against a store rooted at
-    // `<gitdir>/reftable`.
-    if include_root_refs && !crate::setup::declares_reftable(&repo) {
+    // it exists only where loose refs do. The reftable backend iterates its root
+    // records instead, those `is_root_ref()` accepts (reftable_ref_iterator_advance(),
+    // refs/reftable-backend.c:632-646, v2.56.0); the `HEAD` file in its git
+    // directory is a stub and no reference.
+    if include_root_refs && crate::refstore::is_reftable(&repo) {
+        for r in repo.references()?.pseudo()? {
+            let Some(r) = skip_broken_ref(r)? else { continue };
+            if is_root_ref(r.name().as_bstr()) {
+                names.push(r.name().as_bstr().to_vec());
+            }
+        }
+    } else if include_root_refs {
+        let mut roots = Vec::new();
         for entry in std::fs::read_dir(repo.git_dir())? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -1420,10 +1423,22 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
             let file_name = entry.file_name();
             if let Some(name) = file_name.to_str() {
                 if is_root_ref(name.as_bytes()) {
-                    names.push(name.as_bytes().to_vec());
+                    roots.push(name.to_owned());
                 }
             }
         }
+        // The loose-ref cache holds them sorted, and reads each as it is added.
+        roots.sort();
+        for name in roots {
+            match repo.find_reference(name.as_str()) {
+                Ok(_) => names.push(name.into_bytes()),
+                Err(e) => skip_broken_lookup(&name, e)?,
+            }
+        }
+    }
+    for r in repo.references()?.all()? {
+        let Some(r) = skip_broken_ref(r)? else { continue };
+        names.push(r.name().as_bstr().to_vec());
     }
     // The `:short` disambiguation rules test candidate names against every ref.
     let all_names: HashSet<Vec<u8>> = names.iter().cloned().collect();
@@ -1482,7 +1497,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
         let name_str = refname
             .to_str()
             .map_err(|_| anyhow!("ref name is not valid utf-8: {:?}", refname.as_bstr()))?;
-        let mut reference = repo.find_reference(name_str)?;
+        let mut reference = match repo.find_reference(name_str) {
+            Ok(reference) => reference,
+            Err(e) => {
+                skip_broken_lookup(name_str, e)?;
+                continue;
+            }
+        };
         let symref = reference
             .target()
             .try_name()
@@ -3483,6 +3504,11 @@ fn render_upstream(
 /// Whether the ref that ultimately holds `name`'s object id came out of
 /// `packed-refs` rather than a loose file, following symrefs to the leaf.
 pub(super) fn is_packed(repo: &gix::Repository, name: &str) -> bool {
+    // The reftable backend never sets `REF_ISPACKED` (reftable_ref_iterator_advance(),
+    // refs/reftable-backend.c:632-716, v2.56.0).
+    if crate::refstore::is_reftable(repo) {
+        return false;
+    }
     let loose = |n: &str| repo.common_dir().join(n).is_file() || repo.git_dir().join(n).is_file();
     let mut current = name.to_string();
     // A cycle is impossible in a well-formed store; the bound keeps a corrupt
@@ -4931,6 +4957,17 @@ fn skip_broken_ref<'r>(
                 return Err(crate::fatal::die(line.to_string()));
             }
             match e.downcast_ref::<IterError>() {
+                // A symref whose target is no valid refname, like the
+                // `ref: refs/heads/.invalid` stub a reftable repository keeps in
+                // `HEAD`: `refs_resolve_ref_unsafe()` fails on it, so
+                // `loose_fill_ref_dir_regular_file()` marks it `REF_ISSYMREF |
+                // REF_ISBROKEN` (refs/files-backend.c:319-356, v2.56.0), and the
+                // iteration ref-filter asks for omits dangling symrefs without a
+                // word (`REFS_FOR_EACH_OMIT_DANGLING_SYMREFS`, refs.c:1859-1868).
+                Some(IterError::ReferenceCreation {
+                    source: gix::refs::file::loose::reference::decode::Error::RefnameValidation { .. },
+                    ..
+                }) => Ok(None),
                 Some(IterError::ReferenceCreation { relative_path, .. }) => {
                     eprintln!(
                         "warning: ignoring broken ref {}",
@@ -4941,6 +4978,24 @@ fn skip_broken_ref<'r>(
                 _ => Err(anyhow!("{e}")),
             }
         }
+    }
+}
+
+/// A lookup of the root ref `name` the git-directory scan found, which failed
+/// because the ref is broken: `loose_fill_ref_dir_regular_file()` marks it
+/// (refs/files-backend.c:319-356, v2.56.0), and the iteration ref-filter asks
+/// for omits it silently when it is a symref (`REFS_FOR_EACH_OMIT_DANGLING_SYMREFS`,
+/// refs.c:1859-1868) and warns about it otherwise (ref-filter.c:3008-3022).
+/// Any other failure is returned.
+fn skip_broken_lookup(name: &str, e: gix::reference::find::existing::Error) -> Result<()> {
+    use gix::refs::file::loose::reference::decode::Error as DecodeError;
+    match std::error::Error::source(&e).and_then(|s| s.downcast_ref::<DecodeError>()) {
+        Some(DecodeError::RefnameValidation { .. }) => Ok(()),
+        Some(DecodeError::Parse { .. }) => {
+            eprintln!("warning: ignoring broken ref {name}");
+            Ok(())
+        }
+        None => Err(e.into()),
     }
 }
 
@@ -4966,7 +5021,7 @@ fn broken_ref_is_absent<T>(
         Err(e) => {
             let broken = std::error::Error::source(&e)
                 .and_then(|s| s.downcast_ref::<DecodeError>())
-                .is_some_and(|d| matches!(d, DecodeError::Parse { .. }));
+                .is_some_and(|d| matches!(d, DecodeError::Parse { .. } | DecodeError::RefnameValidation { .. }));
             if broken { Ok(None) } else { Err(e.into()) }
         }
     }

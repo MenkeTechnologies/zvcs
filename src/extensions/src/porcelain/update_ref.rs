@@ -288,17 +288,20 @@ pub(super) fn write_cmdline(repo: &gix::Repository, w: &CmdlineWrite<'_>, onerr:
         // in `$GIT_DIR/<name>`. gitoxide's `FullName` refuses those (its
         // `SomeLowercase` rule wants either a `/` or an all-caps pseudo-ref), so
         // the write goes through directly rather than through a transaction.
+        // The reftable backend stores such a name as a record of its own.
+        Err(_)
+            if matches!(new, Val::Oid(_))
+                && one_level_update_ok(name)
+                && crate::refstore::is_reftable(repo) =>
+        {
+            let full = FullName::try_from_onelevel(name).map_err(|e| anyhow!("{e}"))?;
+            edit_named(full, new, old, w.deref, w.create_reflog, w.msg)
+        }
         Err(_)
             if !w.create_reflog
                 && matches!(new, Val::Oid(_))
                 && one_level_update_ok(name) =>
         {
-            // A one-level name is well formed to git, so stock got as far as the
-            // backend and failed there; this build must not fall through to the
-            // direct write and lay a loose ref down beside the reftable store.
-            if let Some(code) = reftable_cmdline_refusal(repo, name, w.delete, onerr) {
-                return Ok(code);
-            }
             return write_one_level_ref(repo, name, new, old, onerr);
         }
         Err(_) => {
@@ -306,11 +309,13 @@ pub(super) fn write_cmdline(repo: &gix::Repository, w: &CmdlineWrite<'_>, onerr:
         }
     };
 
-    // `refs_delete_ref()`/`refs_update_ref()` reach the backend only once the name
-    // and the values have been accepted, which is why a bad name still outranks
-    // this. See [`reftable_transaction_refused`] for the failure itself.
-    if let Some(code) = reftable_cmdline_refusal(repo, name, w.delete, onerr) {
-        return Ok(code);
+    // The reftable backend checks names, old values and conflicts itself
+    // (`reftable_be_transaction_prepare()`, refs/reftable-backend.c:1314-1416).
+    if crate::refstore::is_reftable(repo) {
+        return Ok(match reftable_commit(repo, vec![edit], &Default::default(), false) {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(reason) => transaction_failure(name, &reason, w.delete, onerr),
+        });
     }
 
     // `refs_update_ref()` runs the same transaction the `--stdin` form does, so
@@ -678,10 +683,16 @@ pub(super) fn resolve_slot(repo: &gix::Repository, spec: &str) -> Option<Val> {
 /// one, and anything else is passed through unchanged.
 fn lock_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String {
     use gix::refs::file::transaction::prepare::Error as P;
-    let gix::reference::edit::Error::FileTransactionPrepare(p) = e else {
-        return chain(e);
+    let p = match e {
+        gix::reference::edit::Error::FileTransactionPrepare(p) => p,
+        // A reftable store words its failures as git does.
+        gix::reference::edit::Error::FileTransactionCommit(gix::refs::file::transaction::commit::Error::Reftable {
+            message,
+        }) => return message.to_string(),
+        _ => return chain(e),
     };
     match p {
+        P::Reftable { message, .. } => message.to_string(),
         P::ReferenceOutOfDate {
             full_name,
             expected,
@@ -821,6 +832,18 @@ fn build_edit(
     create_reflog: bool,
     msg: Option<&str>,
 ) -> Result<RefEdit> {
+    Ok(edit_named(refname(name)?, new, old, deref, create_reflog, msg))
+}
+
+/// [`build_edit`] for a name already validated.
+fn edit_named(
+    name: FullName,
+    new: &Val,
+    old: &Val,
+    deref: bool,
+    create_reflog: bool,
+    msg: Option<&str>,
+) -> RefEdit {
     let change = match new {
         Val::Oid(id) => Change::Update {
             log: log_change(create_reflog, msg),
@@ -833,11 +856,7 @@ fn build_edit(
             message: delete_message(msg),
         },
     };
-    Ok(RefEdit {
-        change,
-        name: refname(name)?,
-        deref,
-    })
+    RefEdit { change, name, deref }
 }
 
 /// The reflog policy shared by every edit we emit: write the log alongside the
@@ -1175,70 +1194,124 @@ fn c_string(s: &str) -> &str {
     s.split('\0').next().unwrap_or(s)
 }
 
-/// The failure every reference transaction meets in a repository that declares
-/// the `reftable` backend this build has none for.
+/// Run `edits` as one transaction of a reftable store: `ref_transaction_prepare()`
+/// and, unless `dry_run`, `ref_transaction_commit()` (refs.c), with the
+/// backend's own checks of names, old values and name conflicts
+/// (`reftable_be_transaction_prepare()`, refs/reftable-backend.c:1314-1416).
 ///
-/// `reftable_be_transaction_prepare()` opens the stack before it looks at a
-/// single update, and a declared store that was never created fails to open with
-/// `REFTABLE_IO_ERROR` (`reftable/reftable-error.h:20`, v2.55.0) — which
-/// `reftable_error_str()` spells `I/O error`. Nothing in the transaction is
-/// examined first, so this outranks every precondition the batch carries: a
-/// `create` over a ref that already exists reports the I/O error, not
-/// "reference already exists". What it does *not* outrank is the staging-time
-/// validation `ref_transaction_update()` does as each command is read — a
-/// malformed refname and a new value naming an object that is not in the
-/// repository are both refused before any backend is asked.
+/// `verify` lists the edits that are `ref_transaction_verify()`s and
+/// `allow_failure` is `--batch-updates`' `REF_TRANSACTION_ALLOW_FAILURE`. The
+/// object database goes along so a reference to an annotated tag is stored with
+/// its peeled value, as `ref_transaction_update()` does (refs.c:1433-1455).
 ///
-/// Measured against stock 2.55.0 in a files repository declaring
-/// `extensions.refStorage = reftable`: `update-ref -d refs/heads/main` prints
-/// `error: reftable: transaction prepare: I/O error` and exits 1, the update form
-/// dies with `fatal: update_ref failed for ref '<name>': …` and 128, and
-/// `--stdin` dies with `fatal: reftable: transaction prepare: I/O error` and 128
-/// — while a transaction that accumulated no updates at all (empty `--stdin`, a
-/// bare `prepare`/`commit` pair) succeeds silently, because
-/// `ref_transaction_prepare()` returns early on an empty transaction and never
-/// reaches the backend.
-///
-/// Refusing here is also what keeps the repository intact: the port roots its ref
-/// store at `<gitdir>/reftable`, so a files-backend write would create that
-/// directory and drop loose refs inside it — files stock would never write and
-/// cannot read.
-fn reftable_transaction_refused(repo: &gix::Repository) -> Result<()> {
-    if crate::setup::declares_reftable(repo) {
-        crate::git_fatal!("reftable: transaction prepare: I/O error");
-    }
-    Ok(())
-}
-
-/// The command-line form's two shapes of that same failure, or `None` when the
-/// repository has a store this build can write.
-///
-/// `cmd_update_ref()` hands a deletion to `refs_delete_ref()`, which reports
-/// through `error("%s", err.buf)` and returns 1 (`refs.c`), and an update to
-/// `refs_update_ref()`, which reports `update_ref failed for ref '%s': %s` the
-/// way `onerr` asks — `update-ref` dies (builtin/update-ref.c:895-904), `git refs
-/// create`/`update` print an `error:` and exit 1 (builtin/refs.c, v2.56.0).
-fn reftable_cmdline_refusal(
+/// `Ok` carries the updates the backend refused under `allow_failure`; `Err` is
+/// git's `err` text.
+pub(super) fn reftable_commit(
     repo: &gix::Repository,
-    name: &str,
-    delete: bool,
-    onerr: OnErr,
-) -> Option<ExitCode> {
-    if !crate::setup::declares_reftable(repo) {
-        return None;
-    }
-    let msg = "reftable: transaction prepare: I/O error";
-    if delete {
-        eprintln!("error: {msg}");
-        return Some(ExitCode::from(1));
-    }
-    Some(onerr.report(name, msg))
+    edits: Vec<RefEdit>,
+    verify: &std::collections::BTreeSet<usize>,
+    allow_failure: bool,
+) -> std::result::Result<Vec<gix::refs::file::transaction::Rejection>, String> {
+    reftable_transaction(repo, edits, verify, allow_failure, false)
 }
 
-/// git's `prepare`: acquire the locks the staged batch needs and validate its
-/// preconditions, then roll everything back. gitoxide's prepared transaction is
-/// perfectly rolled back when dropped, so this catches a doomed batch at
-/// `prepare` time exactly like stock git, without writing anything.
+/// [`reftable_commit`], or only its prepare with `dry_run`.
+fn reftable_transaction(
+    repo: &gix::Repository,
+    edits: Vec<RefEdit>,
+    verify: &std::collections::BTreeSet<usize>,
+    allow_failure: bool,
+    dry_run: bool,
+) -> std::result::Result<Vec<gix::refs::file::transaction::Rejection>, String> {
+    use gix::refs::file::transaction::{commit, prepare, PackedRefs};
+    let mut transaction = repo
+        .refs
+        .transaction()
+        .packed_refs(PackedRefs::DeletionsAndNonSymbolicUpdates(Box::new(&repo.objects)))
+        .verify_only(verify.iter().copied());
+    if allow_failure {
+        transaction = transaction.allow_failure();
+    }
+    // The lock modes are the files backend's; the reftable backend waits for
+    // `tables.list.lock` as `reftable.lockTimeout` says.
+    let fail = gix::lock::acquire::Fail::Immediately;
+    let prepared = transaction.prepare(edits, fail, fail).map_err(|e| match e {
+        prepare::Error::Reftable { message, .. } => message.to_string(),
+        other => chain(&other),
+    })?;
+    let rejections = prepared.rejections().to_vec();
+    if dry_run {
+        return Ok(rejections);
+    }
+    let committer = repo.committer().transpose().map_err(|e| chain(&e))?;
+    prepared.commit(committer).map_err(|e| match e {
+        commit::Error::Reftable { message } => message.to_string(),
+        other => chain(&other),
+    })?;
+    Ok(rejections)
+}
+
+/// The batch as git's transaction holds it in a reftable repository: the
+/// staged edits in command order with a `verify` of an absent reference
+/// spelled as the verification it is, and the positions of the verifications.
+///
+/// The files emulation's extra edits and checks are left out — the `HEAD`
+/// mirror of a `verify` and the explicit absence checks of `create` — because
+/// the reftable backend splits and checks updates itself.
+fn reftable_batch(repo: &gix::Repository, batch: &Batch) -> Result<(Vec<RefEdit>, std::collections::BTreeSet<usize>)> {
+    let null = ObjectId::null(repo.object_hash());
+    let mut edits = Vec::new();
+    let mut verify = std::collections::BTreeSet::new();
+    for index in 0..=batch.edits.len() {
+        for absent in batch.absent.iter().filter(|a| a.at == index && !a.guards_edit) {
+            verify.insert(edits.len());
+            edits.push(RefEdit {
+                change: Change::Update {
+                    log: LogChange::default(),
+                    expected: PreviousValue::MustNotExist,
+                    new: Target::Object(null),
+                },
+                name: refname(&absent.name)?,
+                deref: absent.deref,
+            });
+        }
+        let Some(edit) = batch.edits.get(index) else { break };
+        if log_only(edit) {
+            continue;
+        }
+        if batch.verify_edits.contains(&index) {
+            verify.insert(edits.len());
+        }
+        edits.push(edit.clone());
+    }
+    Ok((edits, verify))
+}
+
+/// `print_rejected_refs()` (builtin/update-ref.c:246-266) for each update a
+/// `--batch-updates` transaction refused: its details as an `error:` and a
+/// `rejected <ref> <new> <old> <reason>` line on stdout, which is buffered,
+/// so off a terminal every error comes out first.
+fn print_rejections(rejections: &[gix::refs::file::transaction::Rejection]) {
+    crate::cstdio::defer();
+    let value = |oid: &Option<ObjectId>, target: &Option<gix::bstr::BString>| match (oid, target) {
+        (Some(oid), _) => oid.to_string(),
+        (None, Some(target)) => target.to_string(),
+        (None, None) => "(null)".to_string(),
+    };
+    for r in rejections {
+        if !r.message.is_empty() {
+            eprintln!("error: {}", r.message);
+        }
+        crate::cstdio::println!(
+            "rejected {} {} {} {}",
+            r.refname,
+            value(&r.new_oid, &r.new_target),
+            value(&r.old_oid, &r.old_target),
+            r.kind.message()
+        );
+    }
+}
+
 /// Every reference the store already holds, by full name — the set
 /// `refs_verify_refname_available()` reads through `refs_read_raw_ref()` and its
 /// prefix iterator (refs.c:2828-2906, v2.55.0). Packed and loose alike, because
@@ -1456,14 +1529,22 @@ fn absent_violated(repo: &gix::Repository, entry: &Absent) -> Result<bool> {
     Ok(repo.try_find_reference(target.as_str())?.is_some())
 }
 
-fn validate_prepare(repo: &gix::Repository, batch: &Batch) -> Result<()> {
+/// git's `prepare`: acquire the locks the staged batch needs and validate its
+/// preconditions, then roll everything back. gitoxide's prepared transaction is
+/// perfectly rolled back when dropped, so this catches a doomed batch at
+/// `prepare` time exactly like stock git, without writing anything.
+fn validate_prepare(repo: &gix::Repository, batch: &Batch, batch_updates: bool) -> Result<()> {
     for entry in &batch.absent {
         refname(&entry.name)?;
     }
     if batch.edits.is_empty() && batch.absent.is_empty() {
         return Ok(());
     }
-    reftable_transaction_refused(repo)?;
+    if crate::refstore::is_reftable(repo) {
+        let (edits, verify) = reftable_batch(repo, batch)?;
+        reftable_transaction(repo, edits, &verify, batch_updates, true).map_err(|e| anyhow!(e))?;
+        return Ok(());
+    }
     if let Some(message) = duplicate_update(&batch.edits) {
         crate::git_fatal!("{message}");
     }
@@ -1591,7 +1672,7 @@ fn run_stdin(
                 state = TxnState::Started;
             }
             "prepare" => {
-                if let Err(e) = validate_prepare(repo, &batch) {
+                if let Err(e) = validate_prepare(repo, &batch, batch_updates) {
                     eprintln!("fatal: prepare: {e:#}");
                     return Ok(ExitCode::from(128));
                 }
@@ -1693,7 +1774,12 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
     if batch.is_empty() {
         return Ok(());
     }
-    reftable_transaction_refused(repo)?;
+    if crate::refstore::is_reftable(repo) {
+        let (edits, verify) = reftable_batch(repo, &batch)?;
+        let rejections = reftable_commit(repo, edits, &verify, batch_updates).map_err(|e| anyhow!(e))?;
+        print_rejections(&rejections);
+        return Ok(());
+    }
     if let Some(message) = duplicate_update(&batch.edits) {
         crate::git_fatal!("{message}");
     }
@@ -2042,6 +2128,7 @@ fn rejection_kind(e: &gix::reference::edit::Error) -> Option<&'static str> {
         P::ReferenceOutOfDate { .. } => "incorrect old value provided",
         P::MustNotExist { .. } => "reference already exists",
         P::MustExist { .. } | P::DeleteReferenceMustExist { .. } => "reference does not exist",
+        P::Reftable { kind, .. } if *kind != gix::refs::file::transaction::ErrorKind::Generic => kind.message(),
         _ => return None,
     })
 }

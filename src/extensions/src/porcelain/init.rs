@@ -628,7 +628,7 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             match create_repository(&git_dir, gix::create::Kind::Bare, create_opts) {
                 Ok(r) => r,
                 Err(gix::init::Error::Init(gix::create::Error::DirectoryNotEmpty { .. })) => {
-                    init_bare_into_nonempty(&git_dir, create_opts)?
+                    init_into_existing(&git_dir, gix::create::Kind::Bare, create_opts)?
                 }
                 Err(e) => return Err(anyhow::anyhow!("{e}")),
             },
@@ -636,8 +636,13 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     } else {
         let worktree = git_dir.parent().unwrap_or(&cwd).to_path_buf();
         Some(
-            create_repository(&worktree, gix::create::Kind::WithWorktree, create_opts)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
+            match create_repository(&worktree, gix::create::Kind::WithWorktree, create_opts) {
+                Ok(r) => r,
+                Err(gix::init::Error::Init(gix::create::Error::DirectoryExists { .. })) => {
+                    init_into_existing(&git_dir, gix::create::Kind::WithWorktree, create_opts)?
+                }
+                Err(e) => return Err(anyhow::anyhow!("{e}")),
+            },
         )
     };
 
@@ -1175,26 +1180,37 @@ fn create_repository(
     Ok(gix::open_opts(git_dir, open)?)
 }
 
-/// Build a bare repository inside a non-empty `target`. gix hard-refuses this
-/// (`create::into` checks emptiness unconditionally for bare), while stock git
-/// permits it. Lay the layout down in an empty scratch subdirectory, then move
-/// each entry up into `target`, yielding the same on-disk result git produces.
-fn init_bare_into_nonempty(
+/// Build a repository whose git directory `target` already exists. gix refuses
+/// both shapes — a non-empty directory for a bare repository
+/// (`DirectoryNotEmpty`), any existing `<worktree>/.git` directory for a
+/// non-bare one (`DirectoryExists`) — while git's `safe_create_dir()` takes the
+/// directory as it finds it and `create_default_files()` fills it in, so
+/// `mkdir -p e/.git && git init e` initializes `e/.git`. Lay the layout down in
+/// an empty scratch subdirectory, then move each entry up into `target`,
+/// yielding the same on-disk result git produces.
+fn init_into_existing(
     target: &Path,
+    kind: gix::create::Kind,
     create_opts: gix::create::Options,
 ) -> Result<gix::Repository> {
     std::fs::create_dir_all(target)?;
     let scratch = target.join(format!(".git-init-scratch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
-    create_repository(&scratch, gix::create::Kind::Bare, create_opts)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    for entry in std::fs::read_dir(&scratch)? {
+    create_repository(&scratch, kind, create_opts).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let layout = match kind {
+        gix::create::Kind::Bare => scratch.clone(),
+        gix::create::Kind::WithWorktree => scratch.join(".git"),
+    };
+    for entry in std::fs::read_dir(&layout)? {
         let entry = entry?;
         std::fs::rename(entry.path(), target.join(entry.file_name()))?;
     }
+    if layout != scratch {
+        std::fs::remove_dir(&layout)?;
+    }
     std::fs::remove_dir(&scratch)?;
     // `gix::open` would discover the *worktree* repository a `.git` directory beside
-    // the new layout still names; the bare repository just laid down is `target` itself.
+    // the new layout still names; the repository just laid down is `target` itself.
     gix::open_opts(
         target,
         gix::open::Options::isolated().open_path_as_is(true),

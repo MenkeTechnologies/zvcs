@@ -641,6 +641,58 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         )
     };
 
+    // `create_default_files()` runs `copy_templates()` before
+    // `create_reference_database()` resolves the initial branch, so a missing
+    // template's warning precedes the `defaultBranchName` hint and the reinit
+    // `--initial-branch` warning. A fresh `--separate-git-dir` is still built in
+    // `<target>/.git` here and moved below, which lands the payload in the same place.
+    //
+    // Resolve the template directory with git's `copy_templates()` precedence
+    // (`builtin/init-db.c`): the `--template` command-line value wins, else the
+    // `GIT_TEMPLATE_DIR` environment variable, else the `init.templateDir`
+    // config (read as a pathname, so a leading `~` expands, matching git's
+    // `git_config_get_pathname("init.templatedir")`), else the compiled-in
+    // default template, which for this port is [`DEFAULT_TEMPLATE`] rather than
+    // a directory under `$(prefix)/share/git-core`. An explicit (even empty)
+    // `--template` or a set `GIT_TEMPLATE_DIR` short-circuits before the config
+    // is consulted, so the config is a DEFAULT the flag/env override — never the
+    // other way around.
+    let template = template
+        .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
+        .or_else(|| configured_template_dir(repo.as_ref(), &git_dir));
+
+    // Seed the git dir from the resolved template. git runs `copy_templates()`
+    // on every init, reinitialization included, and it fills in only what is
+    // missing — but on a *fresh* init git has nothing to fill in around, because
+    // `create_default_files()` writes no template-provided file itself. gix does:
+    // it lays down its own built-in payload (its `description` wording, its hook
+    // samples, its `info/exclude`) before this port ever gets the handle back. So
+    // that payload is stripped first on a fresh init, and the resolved template —
+    // git's own, or the one the flag names — then fully defines which
+    // template-provided files exist and what is in them. Structural files
+    // (`HEAD`, `config`, `objects/`, `refs/`) are never touched.
+    //
+    // The destination is the *common* directory, not the git directory:
+    // `copy_templates()` ends in `strbuf_addstr(&path, repo_get_common_dir(repo))`
+    // before it descends. So `git init` standing inside a linked worktree — whose
+    // git directory is `<main>/.git/worktrees/<name>` — fills in the payload of
+    // the repository they share, where it already exists and nothing is copied,
+    // rather than giving that worktree a `description` and a `hooks/` of its own
+    // that stock git never writes.
+    let template_dir = common_dir(&git_dir);
+    if !reinit {
+        strip_default_template(&template_dir)?;
+    }
+    match template.as_deref() {
+        // `if (!template_dir || !*template_dir) return;` — `--template=` names no
+        // template at all, and is not the same thing as omitting the flag: git
+        // copies nothing and does not warn, leaving a repository with no
+        // `description`, no `info/exclude` and no `hooks/`.
+        Some("") => {}
+        Some(tpl) => copy_templates(tpl, &template_dir)?,
+        None => copy_default_template(&template_dir)?,
+    }
+
     if let Some(repo) = repo.as_ref() {
         // Resolve the initial branch name, matching git's precedence exactly:
         //   1. `-b <name>` / `--initial-branch=<name>` on the command line, else
@@ -746,52 +798,6 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     } else if let Some(name) = initial_branch.as_deref() {
         // `if (reinit && initial_branch) warning(_("re-init: ignored --initial-branch=%s"))`.
         eprintln!("warning: re-init: ignored --initial-branch={name}");
-    }
-
-    // Resolve the template directory with git's `copy_templates()` precedence
-    // (`builtin/init-db.c`): the `--template` command-line value wins, else the
-    // `GIT_TEMPLATE_DIR` environment variable, else the `init.templateDir`
-    // config (read as a pathname, so a leading `~` expands, matching git's
-    // `git_config_get_pathname("init.templatedir")`), else the compiled-in
-    // default template, which for this port is [`DEFAULT_TEMPLATE`] rather than
-    // a directory under `$(prefix)/share/git-core`. An explicit (even empty)
-    // `--template` or a set `GIT_TEMPLATE_DIR` short-circuits before the config
-    // is consulted, so the config is a DEFAULT the flag/env override — never the
-    // other way around.
-    let template = template
-        .or_else(|| std::env::var("GIT_TEMPLATE_DIR").ok())
-        .or_else(|| configured_template_dir(repo.as_ref(), &git_dir));
-
-    // Seed the git dir from the resolved template. git runs `copy_templates()`
-    // on every init, reinitialization included, and it fills in only what is
-    // missing — but on a *fresh* init git has nothing to fill in around, because
-    // `create_default_files()` writes no template-provided file itself. gix does:
-    // it lays down its own built-in payload (its `description` wording, its hook
-    // samples, its `info/exclude`) before this port ever gets the handle back. So
-    // that payload is stripped first on a fresh init, and the resolved template —
-    // git's own, or the one the flag names — then fully defines which
-    // template-provided files exist and what is in them. Structural files
-    // (`HEAD`, `config`, `objects/`, `refs/`) are never touched.
-    //
-    // The destination is the *common* directory, not the git directory:
-    // `copy_templates()` ends in `strbuf_addstr(&path, repo_get_common_dir(repo))`
-    // before it descends. So `git init` standing inside a linked worktree — whose
-    // git directory is `<main>/.git/worktrees/<name>` — fills in the payload of
-    // the repository they share, where it already exists and nothing is copied,
-    // rather than giving that worktree a `description` and a `hooks/` of its own
-    // that stock git never writes.
-    let template_dir = common_dir(&git_dir);
-    if !reinit {
-        strip_default_template(&template_dir)?;
-    }
-    match template.as_deref() {
-        // `if (!template_dir || !*template_dir) return;` — `--template=` names no
-        // template at all, and is not the same thing as omitting the flag: git
-        // copies nothing and does not warn, leaving a repository with no
-        // `description`, no `info/exclude` and no `hooks/`.
-        Some("") => {}
-        Some(tpl) => copy_templates(tpl, &template_dir)?,
-        None => copy_default_template(&template_dir)?,
     }
 
     // `create_default_files()` → `initialize_repository_version()` (setup.c:2612), which on a

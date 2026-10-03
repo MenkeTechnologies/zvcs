@@ -339,6 +339,22 @@ impl Opts {
     fn active_relative(&self) -> Option<&str> {
         self.relative_name.then_some(self.relative_prefix.as_str())
     }
+
+    /// The two trees one diff compares, in the order `-R` leaves them.
+    /// `diff_change()`/`diff_addremove()` swap every pair as it is queued under
+    /// `reverse_diff`, and the queue `diffcore_std()` then sees is the one a diff of
+    /// the swapped trees would have built — renames, additions and deletions
+    /// included.
+    fn oriented<'a, 'r>(
+        &self,
+        old: Option<&'a gix::Tree<'r>>,
+        new: Option<&'a gix::Tree<'r>>,
+    ) -> (Option<&'a gix::Tree<'r>>, Option<&'a gix::Tree<'r>>) {
+        match self.reverse_diff {
+            true => (new, old),
+            false => (old, new),
+        }
+    }
 }
 
 /// `usage_with_options()` over `builtin/log.c`'s `format-patch` option table.
@@ -756,6 +772,10 @@ struct Opts {
     max_count: Option<usize>,
     skip: usize,
     reverse: bool,
+    /// `-R` (`diffopt.flags.reverse_diff`): every diff the series prints — patches,
+    /// the cover letter's diffstat and the interdiff, which all copy `rev.diffopt` —
+    /// runs new-to-old, and `builtin_diff()` swaps the `a/`/`b/` prefixes with it.
+    reverse_diff: bool,
     min_parents: usize,
     max_parents: Option<usize>,
     /// `revs->first_parent_only`: follow only the first parent of each merge.
@@ -1484,10 +1504,11 @@ fn emit_diff_of_diff(
         let mut body: Vec<u8> = Vec::new();
         let abbrev = index_abbrev(repo, &new_tree, opts)?;
         let mut dissimilarity = HashMap::new();
+        let (one, two) = opts.oriented(Some(&old_tree), Some(&new_tree));
         let changes = tree_changes(
             repo,
-            Some(&old_tree),
-            Some(&new_tree),
+            one,
+            two,
             opts.pathspec.as_ref(),
             opts.active_relative(),
             &RenameOpts::from_opts(opts),
@@ -2091,6 +2112,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         max_count: None,
         skip: 0,
         reverse: false,
+        reverse_diff: false,
         min_parents: 0,
         // format-patch sets `rev.max_parents = 1`: merges never get a patch.
         max_parents: Some(1),
@@ -2491,6 +2513,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                 o.base_commit = None;
             }
             "--reverse" => o.reverse = true,
+            "-R" => o.reverse_diff = true,
             // The three ordering flags are the same option in `revision.c`: each
             // sets `topo_order` and differs only in the `sort_order` tie-break, so
             // the last one on the command line wins.
@@ -5558,10 +5581,11 @@ fn emit_commit_diff(
     };
     let abbrev = index_abbrev(repo, &new_tree, opts)?;
     let mut dissimilarity = HashMap::new();
+    let (one, two) = opts.oriented(old_tree.as_ref(), Some(&new_tree));
     let mut changes = tree_changes(
         repo,
-        old_tree.as_ref(),
-        Some(&new_tree),
+        one,
+        two,
         opts.pathspec.as_ref(),
         opts.active_relative(),
         &RenameOpts::from_opts(opts),
@@ -5682,10 +5706,11 @@ fn emit_commit_diff_stats_only(
     let old_tree = repo.find_object(parent)?.try_into_commit()?.tree()?;
     let abbrev = index_abbrev(repo, &new_tree, opts)?;
     let mut dissimilarity = HashMap::new();
+    let (one, two) = opts.oriented(Some(&old_tree), Some(&new_tree));
     let mut changes = tree_changes(
         repo,
-        Some(&old_tree),
-        Some(&new_tree),
+        one,
+        two,
         opts.pathspec.as_ref(),
         opts.active_relative(),
         &RenameOpts::from_opts(opts),
@@ -6019,10 +6044,11 @@ fn render_cover_letter(
         let head_tree = repo.find_object(head)?.try_into_commit()?.tree()?;
         let abbrev = index_abbrev(repo, &head_tree, opts)?;
         let mut dissimilarity = HashMap::new();
+        let (one, two) = opts.oriented(base.as_ref(), Some(&head_tree));
         let mut changes = tree_changes(
             repo,
-            base.as_ref(),
-            Some(&head_tree),
+            one,
+            two,
             opts.pathspec.as_ref(),
             opts.active_relative(),
             &RenameOpts::from_opts(opts),
@@ -8863,7 +8889,12 @@ fn strip_relative<'a>(path: &'a [u8], opts: &Opts) -> &'a [u8] {
 
 /// The source/destination prefixes, as the options and configuration left them.
 fn prefixes(opts: &Opts) -> (&str, &str) {
-    (opts.src_prefix.as_str(), opts.dst_prefix.as_str())
+    // `builtin_diff()` (diff.c:3841-3847): under `-R` the pre-image is named with
+    // `b_prefix` and the post-image with `a_prefix`.
+    match opts.reverse_diff {
+        true => (opts.dst_prefix.as_str(), opts.src_prefix.as_str()),
+        false => (opts.src_prefix.as_str(), opts.dst_prefix.as_str()),
+    }
 }
 
 /// Emit the `---`/`+++` headers and hunks, returning `(added, deleted)` line

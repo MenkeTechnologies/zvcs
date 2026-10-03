@@ -4184,6 +4184,38 @@ pub(super) fn switch_blocked_by_operation(repo: &gix::Repository) -> Option<Swit
     state.bisect.then_some(SwitchBlocker::WarnBisecting)
 }
 
+/// `get_head_description()` (ref-filter.c:2297-2327): the name `git branch`
+/// lists a detached `HEAD` under. A rebase or bisect in progress outranks the
+/// reflog's `detached at`/`from` wording, because `HEAD` is detached only as a
+/// side effect of the operation.
+pub(super) fn head_description(repo: &gix::Repository) -> String {
+    let merging = repo.git_dir().join("MERGE_HEAD").exists();
+    let state = ProgressState::detect(repo, merging);
+    let detached = detached_from(repo);
+    if state.rebase || state.rebase_interactive {
+        return match state.branch {
+            Some(branch) => format!("(no branch, rebasing {branch})"),
+            // `%s` of a NULL `detached_from` is libc's `(null)`.
+            None => format!(
+                "(no branch, rebasing detached HEAD {})",
+                detached.map_or_else(|| "(null)".to_string(), |(name, _)| name)
+            ),
+        };
+    }
+    if state.bisect {
+        return format!(
+            "(no branch, bisect started on {})",
+            state.bisecting_from.as_deref().unwrap_or("(null)")
+        );
+    }
+    match detached {
+        Some((name, true)) => format!("(HEAD detached at {name})"),
+        Some((name, false)) => format!("(HEAD detached from {name})"),
+        // NULL `detached_from`: a hand-written HEAD, or a pruned reflog.
+        None => "(no branch)".to_string(),
+    }
+}
+
 /// Whether `wt_status_get_state()` finds a merge, revert, rebase, bisect,
 /// cherry-pick or `am` in progress — the set `repack --drop-filtered` refuses to
 /// run under (git 2.56, builtin/repack.c:331-345).

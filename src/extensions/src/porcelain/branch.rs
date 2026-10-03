@@ -1782,31 +1782,9 @@ fn list_branches(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     //             filter.kind |= FILTER_REFS_DETACHED_HEAD;
     let head = repo.head()?;
     let head_desc = if kinds & ref_filter::kind::BRANCHES != 0 && head.is_detached() {
-        // `get_head_description()` (ref-filter.c:2297-2327) names the *switch* the
-        // reflog recorded, not the object HEAD holds, and says `at` only while
-        // HEAD still sits on it:
-        //
-        // ```c
-        // else if (state.detached_from) {
-        //         if (state.detached_at)
-        //                 strbuf_addf(&desc, _("(HEAD detached at %s)"), state.detached_from);
-        //         else
-        //                 strbuf_addf(&desc, _("(HEAD detached from %s)"), state.detached_from);
-        // } else
-        //         strbuf_addstr(&desc, _("(no branch)"));
-        // ```
-        //
-        // `wt_status_get_detached_from()` is the same one `git status`'s long
-        // format uses, so the two commands cannot disagree about the wording.
-        Some(
-            match super::status::detached_from(repo) {
-                Some((name, true)) => format!("(HEAD detached at {name})"),
-                Some((name, false)) => format!("(HEAD detached from {name})"),
-                // NULL `detached_from`: a hand-written HEAD, or a pruned reflog.
-                None => "(no branch)".to_string(),
-            }
-            .into_bytes(),
-        )
+        // `get_head_description()` (ref-filter.c:2297-2327): a rebase or bisect in
+        // progress first, then the switch the reflog recorded.
+        Some(super::status::head_description(repo).into_bytes())
     } else {
         None
     };

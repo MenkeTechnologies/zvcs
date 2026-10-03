@@ -90,3 +90,22 @@ fn show_origin_and_comment_are_refused_outside_their_actions() {
         ],
     );
 }
+
+#[test]
+fn writers_check_their_operand_count() {
+    let Some(stock) = stock_git::stock_git_at_least((2, 56, 0)) else { return };
+    compare(
+        stock,
+        &base("argc"),
+        &[
+            &["config", "--remove-section", "s", "a"],
+            &["config", "--remove-section"],
+            &["config", "--unset", "a.b", "1", "2"],
+            &["config", "--unset-all", "a.b", "1", "2"],
+            &["config", "--add", "a.c"],
+            &["config", "--add", "a.c", "1", "2"],
+            &["config", "--unset", "a.b", "1"],
+            &["config", "remove-section", "s", "a"],
+        ],
+    );
+}

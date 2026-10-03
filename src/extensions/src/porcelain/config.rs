@@ -1570,6 +1570,18 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::ReplaceAll if !(2..=3).contains(&positional.len()) => {
             return usage_error("wrong number of arguments, should be from 2 to 3");
         }
+        // The legacy `check_argc()` windows of the writers (builtin/config.c:1515-1599);
+        // the `unset`/`set`/`remove-section` subcommands count their own operands and
+        // refuse in their own words.
+        Mode::Unset | Mode::UnsetAll if !from_subcommand && !(1..=2).contains(&positional.len()) => {
+            return usage_error("wrong number of arguments, should be from 1 to 2");
+        }
+        Mode::Add if !from_subcommand && positional.len() != 2 => {
+            return usage_error("wrong number of arguments, should be 2");
+        }
+        Mode::RemoveSection if !from_subcommand && positional.len() != 1 => {
+            return usage_error("wrong number of arguments, should be 1");
+        }
         _ => {}
     }
 

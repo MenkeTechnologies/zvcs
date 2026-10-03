@@ -211,3 +211,14 @@ fn a_fast_forward_merge_keeps_the_index_split() {
     assert_eq!(f.shared_indexes(), 2, "and f3, refilled, crossed the 20% default");
     assert_eq!(entry_count(&f.index()), 0);
 }
+
+/// A clean pick checks its result out through `unpack_trees()` as well, so it keeps the
+/// shared half too; rebuilt from the tree alone it wrote the split index back whole.
+#[test]
+fn a_clean_cherry_pick_keeps_the_index_split() {
+    let f = Fixture::new("pick");
+    f.ok(&["cherry-pick", "side"]);
+    assert_eq!(&f.index()[12..16], b"link", "the index is still split");
+    assert_eq!(f.shared_indexes(), 2);
+    assert_eq!(entry_count(&f.index()), 0);
+}

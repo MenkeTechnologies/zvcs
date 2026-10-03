@@ -2531,32 +2531,29 @@ fn update_clean_worktree(
         }
     }
 
-    let mut subset_stats: HashMap<BString, Stat> = HashMap::with_capacity(subset.entries().len());
-    {
-        let backing = subset.path_backing();
-        for e in subset.entries() {
-            subset_stats.insert(e.path_in(backing).to_owned(), e.stat);
-        }
-    }
-
+    // Unchanged entries reuse the old stat; the ones the checkout wrote then take the fresh
+    // stat (and up-to-date mark) it recorded.
     {
         let backing = new_index.path_backing().to_owned();
         for e in new_index.entries_mut() {
             let path = e.path_in(&backing).to_owned();
-            if let Some(stat) = subset_stats.get(&path) {
-                e.stat = *stat;
-            } else if let Some((oid, mode, stat)) = old_map.get(&path) {
+            if let Some((oid, mode, stat)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
                     e.stat = *stat;
                 }
             }
         }
     }
+    crate::worktree::carry_written_stat(&subset, &mut new_index);
 
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
 
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
 
+    // `unpack_trees()`'s result: the source index's timestamp and shared half
+    // (unpack-trees.c:1941-1957), and no `ce->index` on `merged_entry()`'s fresh entries.
+    new_index.inherit_split_index(old);
+    new_index.unshare_entries_built_from_trees(old);
     super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
     crate::index_racy::write(repo, &mut new_index)?;

@@ -418,6 +418,13 @@ fn update_index_placement(out: &mut Vec<Case>) {
     // <path>`, exit 128, index unchanged.
     out.push(Case::strict("update-index", &["update-index", "--add", "--cacheinfo", &file_over_dir], Shape::Linear));
     out.push(Case::strict("update-index", &["update-index", "--add", "--cacheinfo", &dir_over_file], Shape::Linear));
+    // A worktree path under a *file*: `lstat()` fails with `ENOTDIR`, which
+    // `is_missing_file_error()` counts as missing exactly like `ENOENT`. So the
+    // refusal is `--remove`'s (`does not exist and --remove not passed`), and with
+    // `--remove` it is a silent no-op; a port that treats only `ENOENT` as missing
+    // prints `lstat("README.md/x"): Not a directory` instead.
+    out.push(Case::strict("update-index", &["update-index", "--add", "README.md/x"], Shape::Linear));
+    out.push(Case::strict("update-index", &["update-index", "--add", "--remove", "README.md/x"], Shape::Linear));
 
     // A mode that is not one of the five a tree may carry. git canonicalizes the
     // permission bits rather than refusing: `100777` becomes `100755`. An

@@ -1649,10 +1649,14 @@ fn process_path(
     let meta = match meta {
         Some(Ok(m)) => m,
         Some(Err(e)) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            // `process_lstat_error()`: `is_missing_file_error()` (git-compat-util.h) is
+            // `ENOENT || ENOTDIR`, so `d/c/x` under a *file* `d/c` is a missing path
+            // like any other; everything else is `error("lstat(\"%s\"): %s")` with
+            // the bare `strerror()` text.
+            if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR) {
                 return Ok(remove_one_path(ctx, path));
             }
-            eprintln!("error: lstat(\"{path}\"): {e}");
+            eprintln!("error: lstat(\"{path}\"): {}", crate::external::strerror(&e));
             return Ok(Err(Die));
         }
         None => unreachable!("update_one always stats before reaching process_path"),

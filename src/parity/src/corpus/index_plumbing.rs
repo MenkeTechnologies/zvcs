@@ -425,6 +425,12 @@ fn update_index_placement(out: &mut Vec<Case>) {
     // prints `lstat("README.md/x"): Not a directory` instead.
     out.push(Case::strict("update-index", &["update-index", "--add", "README.md/x"], Shape::Linear));
     out.push(Case::strict("update-index", &["update-index", "--add", "--remove", "README.md/x"], Shape::Linear));
+    // `remove_file_from_index()` invalidates the cache-tree along the path before
+    // it looks for the entry, so removing a path the index never held still
+    // leaves the root and `src` invalid and rewrites the index. Exit 0 and an
+    // unchanged entry list on both sides: only the `TREE` extension differs.
+    out.push(Case::new("update-index", &["update-index", "--force-remove", "src/nosuch"], Shape::Linear));
+    out.push(Case::new("update-index", &["update-index", "--remove", "nosuch"], Shape::Linear));
 
     // A mode that is not one of the five a tree may carry. git canonicalizes the
     // permission bits rather than refusing: `100777` becomes `100755`. An

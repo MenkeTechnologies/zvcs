@@ -2213,7 +2213,14 @@ fn chmod_path(ctx: &mut Ctx, flip: char, path: &BString) -> Step {
     Ok(())
 }
 
-/// Drop every stage of `path` from the index.
+/// Drop every stage of `path` from the index: `remove_file_from_index()`
+/// (read-cache.c:626-637).
+///
+/// Its `cache_tree_invalidate_path()` runs before the entries are looked at, so a
+/// path the index never held still invalidates every cache-tree node above it —
+/// and `do_invalidate_path()` reporting that sets `CACHE_TREE_CHANGED`, so the
+/// index is rewritten. `update-index --force-remove src/nosuch` therefore leaves
+/// the root and `src` invalid even though no entry moved.
 fn remove_path_entries(ctx: &mut Ctx, path: &BStr) {
     let owned = path.to_owned();
     let mut removed = false;
@@ -2222,10 +2229,8 @@ fn remove_path_entries(ctx: &mut Ctx, path: &BStr) {
         removed |= hit;
         hit
     });
-    if removed {
-        ctx.dirty = true;
-        ctx.invalidate(owned.as_bstr());
-    }
+    let tree_changed = ctx.index.invalidate_path_in_tree(owned.as_bstr());
+    ctx.dirty |= removed || tree_changed;
 }
 
 /// git's `refresh_index`: re-`lstat` every entry, silently repair stale stat data

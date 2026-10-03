@@ -121,7 +121,24 @@ pub fn var(args: &[String]) -> Result<ExitCode> {
     let mut out = stdout.lock();
 
     if request == "-l" {
-        list_config(&cfg, &mut out)?;
+        // `show_config()` prints each value and then chains to
+        // `git_default_config()` (builtin/var.c:207-215), so a value that
+        // callback refuses dies right after its own line is printed. The
+        // dispatch gate skips `var -l` for this reason.
+        let refused = match crate::setup::discover() {
+            Ok(repo) => crate::default_config::validate_counted(&crate::config::walk_config(&repo)).err(),
+            Err(_) => None,
+        };
+        if let Some((at, rejection)) = refused {
+            // The listing sits in stdio's buffer when `die()` writes to stderr,
+            // and reaches a non-terminal stdout only at `exit()`.
+            let mut listed = Vec::new();
+            list_config(&cfg, &mut listed, Some(at + 1))?;
+            crate::cstdio::defer();
+            crate::cstdio::write_bytes(&listed);
+            return Err(rejection.into_error());
+        }
+        list_config(&cfg, &mut out, None)?;
         for name in VARS {
             let Some(values) = resolve(name, &cfg)? else {
                 continue;
@@ -503,8 +520,15 @@ fn config_paths(sources: &[Source]) -> Option<Vec<BString>> {
 ///
 /// The entries come from the same walker `git config --list` uses, so the two
 /// listings agree on order, multivars, synthetic gitoxide layers and `-c` echoes.
-fn list_config(cfg: &ConfigFile, out: &mut impl Write) -> Result<()> {
+///
+/// `limit` stops the listing after that many entries.
+fn list_config(cfg: &ConfigFile, out: &mut impl Write, limit: Option<usize>) -> Result<()> {
+    let mut left = limit.unwrap_or(usize::MAX);
     super::config::for_each_entry(cfg, true, |key, value, implicit, _meta| {
+        if left == 0 {
+            return Ok(());
+        }
+        left -= 1;
         out.write_all(key.as_bytes())?;
         if !implicit {
             out.write_all(b"=")?;

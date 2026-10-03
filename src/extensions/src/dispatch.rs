@@ -1562,8 +1562,12 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `git_config(git_default_config)` and `prepare_repo_settings()`
     // (builtin/sparse-checkout.c:938-944), so a missing or unknown subcommand, or
     // any option ahead of it, is a 129 usage error no config value can pre-empt.
-    let parse_before_config =
-        sub == "sparse-checkout" && crate::porcelain::sparse_checkout_top_level_refused(args);
+    // `cmd_var()` checks `argc != 2` and answers with `usage()` before it reads
+    // any configuration, and `-l` lists the configuration before anything
+    // validates it (builtin/var.c:225-234); see `porcelain::var`.
+    let parse_before_config = (sub == "sparse-checkout"
+        && crate::porcelain::sparse_checkout_top_level_refused(args))
+        || (sub == "var" && (args.len() != 1 || args[0] == "-l"));
     let settings_help_skip =
         (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config;
     let config_help_skip =

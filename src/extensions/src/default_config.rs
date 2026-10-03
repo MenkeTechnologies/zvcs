@@ -212,12 +212,19 @@ pub fn validate(repo: &gix::Repository) -> Result<DefaultConfig, Rejection> {
 /// what `repo_config(the_repository, git_default_config, NULL)` walks in a
 /// `RUN_SETUP_GENTLY` builtin run outside one.
 pub fn validate_values(values: Vec<ConfigValue>) -> Result<DefaultConfig, Rejection> {
+    validate_counted(&values).map_err(|(_, rejection)| rejection)
+}
+
+/// [`validate_values`], with the position of the refused value: a callback that
+/// does its own work per value before chaining to `git_default_config()` (`git
+/// var -l`'s `show_config`) has acted on every value up to and including it.
+pub fn validate_counted(values: &[ConfigValue]) -> Result<DefaultConfig, (usize, Rejection)> {
     let mut resolved = DefaultConfig {
         object_creation_mode: ObjectCreationMode::Renames,
         sparse_expect_files_outside_of_patterns: false,
     };
-    for value in values {
-        git_default_config(&value, &mut resolved)?;
+    for (at, value) in values.iter().enumerate() {
+        git_default_config(value, &mut resolved).map_err(|rejection| (at, rejection))?;
     }
     Ok(resolved)
 }

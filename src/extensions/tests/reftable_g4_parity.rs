@@ -313,3 +313,41 @@ fn clone_into_reftable() {
         "clone", "-q", "--ref-format=reftable", "../e", "../c",
     ]);
 }
+
+/// `zworktree add` (no stock counterpart) lays a reftable repository's linked
+/// worktree down as `git worktree add` does — its own stack holding `HEAD` on
+/// `zwt/<name>` — so stock git verifies it and resolves the branch, and
+/// `zworktree remove` leaves the main stack clean.
+#[test]
+fn zworktree_in_a_reftable_repository() {
+    let Some(case) = Case::new("zwt") else { return };
+    let dir = case.build("z", Fixture::R, &[]);
+    let repo = dir.join("R");
+    let wt = dir.join("feat-wt");
+    let home = dir.join("home");
+    let zvcs = |args: &[&str]| {
+        let out = Command::new(BIN)
+            .args(args)
+            .current_dir(&repo)
+            .env("ZVCS_HOME", &home)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_COMMITTER_NAME", "C")
+            .env("GIT_COMMITTER_EMAIL", "c@x")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    zvcs(&["zworktree", "add", "feat", wt.to_str().unwrap()]);
+    assert_eq!(case.run(case.stock, &wt, &["refs", "verify"]).2, Some(0));
+    assert_eq!(case.run(case.stock, &wt, &["symbolic-ref", "HEAD"]).0, "refs/heads/zwt/feat\n");
+    assert!(!repo.join(".git/worktrees/feat/logs").exists(), "no files-format reflog");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".git/worktrees/feat/HEAD")).unwrap(),
+        "ref: refs/heads/.invalid\n"
+    );
+    zvcs(&["zworktree", "remove", "feat"]);
+    let (refs, _, code) = case.run(case.stock, &repo, &["for-each-ref", "--format=%(refname)", "refs/heads/"]);
+    assert_eq!((refs.as_str(), code), ("refs/heads/main\nrefs/heads/side\n", Some(0)));
+    assert_eq!(case.run(case.stock, &repo, &["refs", "verify"]).2, Some(0));
+}

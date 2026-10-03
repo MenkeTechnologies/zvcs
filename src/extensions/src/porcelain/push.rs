@@ -428,7 +428,9 @@ git push <groupname>\n"
         && !super::fetch::add_remote_or_group(&repo, &remote_name, &mut Vec::new())
         && crate::advice::Advice::PushRepoLooksLikeRef.enabled_in(&repo)
     {
-        die_if_repo_looks_like_ref(&repo, &remote_name);
+        if let Some(head) = die_if_repo_looks_like_ref(&repo, &remote_name) {
+            f.looked_up.push(head);
+        }
     }
 
     // Honor the `push.*` config defaults for flags not given explicitly. An
@@ -1086,6 +1088,10 @@ git push <groupname>\n"
 /// The push flag state.
 #[derive(Default)]
 struct Flags {
+    /// Remotes `make_remote()` registered as a side effect of a lookup before
+    /// `setup_default_push_refspecs()` runs: remote.c keeps every name it was
+    /// asked about, and `remotes_remote_for_branch()` counts them.
+    looked_up: Vec<String>,
     force: bool,
     dry_run: bool,
     /// `--progress` forced on / `--no-progress` forced off / unset = follow
@@ -2093,7 +2099,9 @@ fn default_push_refspec(
     // `git push origin` without a remote `origin` is still the branch's own remote.
     // `remote_for_branch()` is the *fetch* side's answer: `remote.pushDefault` and
     // `branch.<name>.pushRemote` play no part in it.
-    let branch_remote = remote_for_branch(repo, Some(&branch), Some(remote_name));
+    let mut made: Vec<&str> = vec![remote_name];
+    made.extend(f.looked_up.iter().map(String::as_str));
+    let branch_remote = remote_for_branch(repo, Some(&branch), &made);
     let same_remote = remote_name == branch_remote;
 
     // `get_upstream_ref()` (builtin/push.c:196-227). Only `push.autoSetupRemote`'s
@@ -2845,19 +2853,21 @@ fn short_ref(name: &str) -> &str {
 /// working tree `setup_git_directory()` moved to), and whose head names a
 /// configured remote is refused with a hint splitting it into the two
 /// arguments the user most likely meant.
-fn die_if_repo_looks_like_ref(repo: &gix::Repository, arg: &str) {
-    let Some((name, rest)) = arg.split_once('/') else {
-        return;
-    };
+///
+/// Returns the head it looked up when the lookup ran without dying: git's
+/// `remote_get(name.buf)` registers that name as a remote, which changes the
+/// count `remotes_remote_for_branch()` later reads.
+fn die_if_repo_looks_like_ref(repo: &gix::Repository, arg: &str) -> Option<String> {
+    let (name, rest) = arg.split_once('/')?;
     let base = repo
         .workdir()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
     if rest.is_empty() || std::fs::symlink_metadata(base.join(arg)).is_ok() {
-        return;
+        return None;
     }
     if !super::fetch::remote_is_configured(repo, name) {
-        return;
+        return Some(name.to_string());
     }
     eprintln!("fatal: '{arg}' is not a valid push target");
     crate::advice::Advice::PushRepoLooksLikeRef
@@ -2893,7 +2903,7 @@ fn default_push_remote(repo: &gix::Repository) -> Option<String> {
             return Some(r.to_string());
         }
     }
-    let name = remote_for_branch(repo, branch.as_deref(), None);
+    let name = remote_for_branch(repo, branch.as_deref(), &[]);
     let urls = crate::config::multi_values(repo, &format!("remote.{name}.url"));
     (!urls.is_empty()).then_some(name)
 }
@@ -2902,10 +2912,11 @@ fn default_push_remote(repo: &gix::Repository) -> Option<String> {
 /// it is set, otherwise the sole configured remote when there is exactly one,
 /// otherwise `origin`.
 ///
-/// `made` is a remote `pushremote_get()` already created under a name no
-/// configuration spells (`make_remote()`, remote.c:807): it joins
-/// `remote_state->remotes`, so it counts toward "exactly one".
-fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>, made: Option<&str>) -> String {
+/// `made` are the remotes earlier lookups already created under names no
+/// configuration spells (`make_remote()`, remote.c:807) — `pushremote_get()`'s
+/// own, and the head `die_if_repo_looks_like_ref()` asked about: each joins
+/// `remote_state->remotes`, so each counts toward "exactly one".
+fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>, made: &[&str]) -> String {
     let configured = branch.and_then(|b| {
         repo.config_snapshot()
             .string(&format!("branch.{b}.remote"))
@@ -2915,8 +2926,10 @@ fn remote_for_branch(repo: &gix::Repository, branch: Option<&str>, made: Option<
         return name;
     }
     let mut names = super::fetch::remotes_in_config_order(repo);
-    if let Some(made) = made.filter(|m| !names.iter().any(|n| n == m)) {
-        names.push(made.to_string());
+    for made in made {
+        if !names.iter().any(|n| n == made) {
+            names.push(made.to_string());
+        }
     }
     match names.len() {
         1 => names.remove(0),

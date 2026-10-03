@@ -2823,7 +2823,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // side is marked `PATCHSAME`. git computes the ids for the smaller side and looks the larger
     // side up in that table — the same work `git cherry` does, through the same
     // `commit_patch_id()`.
-    let patch_same: HashSet<ObjectId> = if cherry_mark || cherry_pick {
+    let patch_same: HashSet<ObjectId> = if (cherry_mark || cherry_pick) && !no_walk {
         // `ids.diffopts.pathspec = revs->diffopt.pathspec;` (revision.c:1242): the
         // ids are of the change *within the limited view*, so this runs ahead of
         // the pathspec filter below with the same specs in hand.
@@ -2837,19 +2837,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     };
     // `if (revs->cherry_pick && (commit->object.flags & PATCHSAME)) continue;`: `--cherry-pick`
     // without `--cherry-mark` drops the equivalent commits instead of marking them.
-    if cherry_pick && !cherry_mark {
+    // These three filters are `limit_list()`'s (revision.c:1497-1503), which
+    // `prepare_revision_walk()` never reaches while `revs->no_walk` survived.
+    if cherry_pick && !cherry_mark && !no_walk {
         commits.retain(|id| !patch_same.contains(id));
     }
     // `--left-only` / `--right-only` keep one side of the difference.
-    if left_only {
+    if left_only && !no_walk {
         commits.retain(|id| left.contains(id));
     }
-    if right_only {
+    if right_only && !no_walk {
         commits.retain(|id| !left.contains(id));
     }
 
     // `--ancestry-path`: keep only the commits that descend from an excluded tip.
-    if ancestry_path {
+    if ancestry_path && !no_walk {
         // `collect_bottom_commits()` runs only for the argument-less spelling
         // (`ancestry_path_implicit_bottoms`, revision.c:1448-1453), so a
         // `--ancestry-path=<commit>` needs no range to have excluded anything.

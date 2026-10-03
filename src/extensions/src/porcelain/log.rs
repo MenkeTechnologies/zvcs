@@ -3879,7 +3879,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             node.symmetric_left = left.contains(&node.id);
         }
 
-        if cherry_mark || cherry_pick {
+        if (cherry_mark || cherry_pick) && no_walk.is_none() {
             // git computes patch ids for the smaller side and probes with the larger one, which
             // is the side whose diffs it would otherwise have to hold all at once.
             let (mut lefts, mut rights): (Vec<ObjectId>, Vec<ObjectId>) = (Vec::new(), Vec::new());
@@ -3932,13 +3932,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
 
         // `if (revs->cherry_pick && (commit->object.flags & PATCHSAME)) continue;` — without
         // `--cherry-mark` the equivalent commits are dropped rather than marked.
-        if cherry_pick && !cherry_mark {
+        // These three filters are `limit_list()`'s (revision.c:1497-1503), which
+        // `prepare_revision_walk()` never reaches while `revs->no_walk` survived.
+        let limited = no_walk.is_none();
+        if cherry_pick && !cherry_mark && limited {
             nodes.retain(|n| !n.patch_same);
         }
-        if left_only {
+        if left_only && limited {
             nodes.retain(|n| n.symmetric_left);
         }
-        if right_only {
+        if right_only && limited {
             nodes.retain(|n| !n.symmetric_left);
         }
     }
@@ -4110,7 +4113,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // range, and the merge bases of a symmetric one) marks. It runs after the walk
     // and before the TREESAME recheck, so the path limit below sees the reduced
     // list.
-    if ancestry_path {
+    if ancestry_path && no_walk.is_none() {
         // `collect_bottom_commits()` reads the flag off the commits the walk
         // started from, so a range that excluded nothing — two unrelated tips,
         // whose symmetric difference has no merge base — has no bottoms at all.

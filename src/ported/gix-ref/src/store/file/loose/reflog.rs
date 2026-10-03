@@ -28,7 +28,7 @@ impl file::Store {
         &self,
         name: Name,
         buf: &'b mut [u8],
-    ) -> Result<Option<log::iter::Reverse<'b, std::fs::File>>, Error>
+    ) -> Result<Option<log::iter::Reverse<'b, log::iter::ReflogSource>>, Error>
     where
         Name: TryInto<&'a FullNameRef, Error = E>,
         crate::name::Error: From<E>,
@@ -40,7 +40,7 @@ impl file::Store {
             return Ok(None);
         }
         match std::fs::File::open(&path) {
-            Ok(file) => Ok(Some(log::iter::reverse(file, buf)?)),
+            Ok(file) => Ok(Some(log::iter::reverse(log::iter::ReflogSource::File(file), buf)?)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err.into()),
         }

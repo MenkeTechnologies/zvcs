@@ -29,7 +29,7 @@ impl Reference {
         &self,
         store: &file::Store,
         buf: &'b mut [u8],
-    ) -> std::io::Result<Option<log::iter::Reverse<'b, std::fs::File>>> {
+    ) -> std::io::Result<Option<log::iter::Reverse<'b, log::iter::ReflogSource>>> {
         store.reflog_iter_rev(self.name.as_ref(), buf).map_err(must_be_io_err)
     }
 

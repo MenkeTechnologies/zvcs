@@ -25,9 +25,12 @@ pub(crate) mod iter;
 pub mod reference;
 
 mod init {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
-    use crate::store_impl::file;
+    use crate::{
+        store::RefStorage,
+        store_impl::{file, reftable},
+    };
 
     impl file::Store {
         /// Create a new instance at the given `git_dir`, which commonly is a standard git repository with a
@@ -36,6 +39,8 @@ mod init {
         ///
         /// Note that if [`precompose_unicode`](crate::store::init::Options::precompose_unicode) is set in the options,
         /// the `git_dir` is also expected to use precomposed unicode, or else some operations that strip prefixes will fail.
+        ///
+        /// With [`RefStorage::Reftable`], the reftable stack under `git_dir` is opened as well.
         pub fn at(
             git_dir: PathBuf,
             crate::store::init::Options {
@@ -43,8 +48,11 @@ mod init {
                 object_hash,
                 precompose_unicode,
                 prohibit_windows_device_names,
+                ref_storage,
             }: crate::store::init::Options,
         ) -> Self {
+            let reftable = (ref_storage == RefStorage::Reftable)
+                .then(|| Arc::new(reftable::Backend::open(&git_dir, None, object_hash)));
             file::Store {
                 git_dir,
                 packed_buffer_mmap_threshold: packed_refs_mmap_threshold(),
@@ -55,6 +63,7 @@ mod init {
                 packed: gix_fs::SharedFileSnapshotMut::new().into(),
                 object_hash,
                 precompose_unicode,
+                reftable,
             }
         }
 
@@ -63,6 +72,8 @@ mod init {
         ///
         /// Note that if [`precompose_unicode`](crate::store::init::Options::precompose_unicode) is set, the `git_dir` and
         /// `common_dir` are also expected to use precomposed unicode, or else some operations that strip prefixes will fail.
+        ///
+        /// With [`RefStorage::Reftable`], the stacks under `common_dir` and `git_dir` are opened as well.
         pub fn for_linked_worktree(
             git_dir: PathBuf,
             common_dir: PathBuf,
@@ -71,8 +82,11 @@ mod init {
                 object_hash,
                 precompose_unicode,
                 prohibit_windows_device_names,
+                ref_storage,
             }: crate::store::init::Options,
         ) -> Self {
+            let reftable = (ref_storage == RefStorage::Reftable)
+                .then(|| Arc::new(reftable::Backend::open(&git_dir, Some(&common_dir), object_hash)));
             file::Store {
                 git_dir,
                 packed_buffer_mmap_threshold: packed_refs_mmap_threshold(),
@@ -83,6 +97,7 @@ mod init {
                 packed: gix_fs::SharedFileSnapshotMut::new().into(),
                 object_hash,
                 precompose_unicode,
+                reftable,
             }
         }
     }

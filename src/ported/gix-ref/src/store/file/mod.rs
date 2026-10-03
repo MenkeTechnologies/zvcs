@@ -38,6 +38,9 @@ pub struct Store {
     /// It's updated only in one spot, which is prior to reading it based on file stamps.
     /// Doing it like this has the benefit of being able to hand snapshots out to people without blocking others from updating it.
     packed: packed::modifiable::MutableSharedBuffer,
+    /// The reftable backend, set if the store was opened with
+    /// [`RefStorage::Reftable`](crate::store::RefStorage::Reftable). Shared by all clones of the store.
+    reftable: Option<std::sync::Arc<crate::store_impl::reftable::Backend>>,
 }
 
 /// A callback run every time a file store is about to read or write references.
@@ -190,6 +193,19 @@ mod access {
         /// This is also the directory in which the packed references file would be placed.
         pub fn common_dir_resolved(&self) -> &Path {
             self.common_dir.as_deref().unwrap_or(&self.git_dir)
+        }
+
+        /// The format references are stored in.
+        pub fn ref_storage(&self) -> crate::store::RefStorage {
+            match self.reftable {
+                Some(_) => crate::store::RefStorage::Reftable,
+                None => crate::store::RefStorage::Files,
+            }
+        }
+
+        /// The reftable backend, if references are stored in reftables.
+        pub fn reftable(&self) -> Option<&crate::store_impl::reftable::Backend> {
+            self.reftable.as_deref()
         }
 
         /// Return `Some(true)` if this is a freshly initialized ref store without any observable changes.

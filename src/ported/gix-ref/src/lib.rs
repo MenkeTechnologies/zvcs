@@ -14,6 +14,9 @@
 //!     * one reference maps to a file on disk
 //!   * **packed**
 //!     * references are stored in a single human-readable file, along with their targets if they are symbolic.
+//! * **[reftable][reftable::Backend]**
+//!   * references and reflogs are stored in stacks of binary tables, selected with
+//!     [`RefStorage::Reftable`](store::RefStorage::Reftable) and reached through the same [file store][file::Store].
 //!
 //! ## Feature Flags
 #![cfg_attr(
@@ -29,7 +32,7 @@ use gix_object::bstr::{BStr, BString};
 
 #[path = "store/mod.rs"]
 mod store_impl;
-pub use store_impl::{file, packed};
+pub use store_impl::{file, packed, reftable};
 
 mod fullname;
 ///
@@ -70,8 +73,22 @@ pub mod store {
             /// to avoid side effects. This only needs to be `true` on Windows, but can be `true` on other platforms
             /// if they need to remain compatible with Windows.
             pub prohibit_windows_device_names: bool,
+            /// The ref storage format of the repository, `extensions.refStorage`.
+            pub ref_storage: super::RefStorage,
         }
     }
+    /// The format references and reflogs are stored in, git's `enum ref_storage_format`
+    /// (`refs.h`) as `extensions.refStorage` selects it.
+    #[derive(Default, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+    pub enum RefStorage {
+        /// `REF_STORAGE_FORMAT_FILES`: loose files under `refs/` and `logs/`, plus `packed-refs`.
+        #[default]
+        Files,
+        /// `REF_STORAGE_FORMAT_REFTABLE`: stacks of reftables under `reftable/`, see
+        /// [`reftable`](crate::reftable).
+        Reftable,
+    }
+
     /// The way a file store handles the reflog
     #[derive(Default, Debug, PartialOrd, PartialEq, Ord, Eq, Hash, Clone, Copy)]
     pub enum WriteReflog {

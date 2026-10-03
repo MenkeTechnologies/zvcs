@@ -290,6 +290,9 @@ impl ThreadSafeRepository {
                 object_hash,
                 precompose_unicode: repo_config.precompose_unicode,
                 prohibit_windows_device_names: repo_config.protect_windows,
+                // Reading reftables through the store is not wired up yet; a
+                // declared `reftable` store is rooted at its `reftable/` directory below.
+                ref_storage: gix_ref::store::RefStorage::Files,
             };
             // A declared `reftable` store does not live at the git directory: it is
             // a stack of its own under `<common dir>/reftable`

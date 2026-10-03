@@ -1460,6 +1460,7 @@ dependencies = [
  "gix-lock",
  "gix-object",
  "gix-path",
+ "gix-reftable",
  "gix-tempfile",
  "gix-utils",
  "gix-validate",

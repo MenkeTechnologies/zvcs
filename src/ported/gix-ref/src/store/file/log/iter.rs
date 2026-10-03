@@ -89,7 +89,7 @@ pub struct Platform<'a, 's> {
 
 impl Platform<'_, '_> {
     /// Return a forward iterator over all log-lines, most recent to oldest.
-    pub fn rev(&mut self) -> std::io::Result<Option<log::iter::Reverse<'_, std::fs::File>>> {
+    pub fn rev(&mut self) -> std::io::Result<Option<log::iter::Reverse<'_, log::iter::ReflogSource>>> {
         self.buf.clear();
         self.buf.resize(1024 * 4, 0);
         self.store
@@ -101,6 +101,34 @@ impl Platform<'_, '_> {
     pub fn all(&mut self) -> std::io::Result<Option<log::iter::Forward<'_>>> {
         self.buf.clear();
         self.store.reflog_iter(self.name, &mut self.buf).map_err(must_be_io_err)
+    }
+}
+
+/// Where a store's [`Reverse`] reflog iterator reads from: the reflog file of
+/// the `files` backend, or the files-format rendering of a `reftable` reflog.
+#[derive(Debug)]
+pub enum ReflogSource {
+    /// `logs/<refname>` of the `files` backend.
+    File(std::fs::File),
+    /// The entries of a reftable reflog as lines of the files format, oldest first.
+    Buffer(std::io::Cursor<Vec<u8>>),
+}
+
+impl std::io::Read for ReflogSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ReflogSource::File(f) => f.read(buf),
+            ReflogSource::Buffer(b) => b.read(buf),
+        }
+    }
+}
+
+impl std::io::Seek for ReflogSource {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            ReflogSource::File(f) => f.seek(pos),
+            ReflogSource::Buffer(b) => b.seek(pos),
+        }
     }
 }
 

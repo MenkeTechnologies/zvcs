@@ -896,6 +896,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                             return Ok(ExitCode::from(129));
                         }
                     }
+                } else if s == "-R" {
+                    patch_opts.reverse = true;
                 } else if s == "-D" || s == "--irreversible-delete" {
                     patch_opts.irreversible_delete = true;
                 } else if s == "-W" || s == "--function-context" {
@@ -1326,6 +1328,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
     if !dst_prefix_given {
         patch_opts.dst_prefix = dst_prefix;
+    }
+    // `builtin_diff()` hands a pair's two names their prefixes the other way
+    // round under `-R`, so the pre-image is written `b/` and the post-image `a/`.
+    if patch_opts.reverse {
+        std::mem::swap(&mut patch_opts.src_prefix, &mut patch_opts.dst_prefix);
     }
 
     // `setup_revisions()`'s filename fallback (revision.c:3078-3092):
@@ -4427,10 +4434,18 @@ fn collect_changes(
         Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
         None => None,
     };
+    // `-R` (`flags.reverse_diff`): `diff_change()` and `diff_addremove()` swap
+    // the two sides of every pair as the queue is built, ahead of diffcore, so
+    // an addition is queued as a deletion and a rename runs back to its source.
+    // Swapping the trees the queue is built from is the same queue.
+    let (old_tree, new_tree) = match (opts.reverse, old_tree) {
+        (false, old) => (old, Some(new_tree)),
+        (true, old) => (Some(new_tree), old),
+    };
 
     let mut changes = repo.diff_tree_to_tree(
         old_tree.as_ref(),
-        Some(&new_tree),
+        new_tree.as_ref(),
         gix::diff::Options::default(),
     )?;
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));

@@ -665,6 +665,18 @@ fn naming(out: &mut Vec<Case>) {
         ],
         out,
     );
+    // `-R` swaps every pair as the queue is built, so a rename runs back to its
+    // source, an addition is a deletion, and the patch's prefixes trade places.
+    each(
+        Shape::Renamed,
+        "show",
+        &[
+            &["show", "-R", "HEAD~2"],
+            &["show", "-R", "--stat", "--summary", "HEAD~2"],
+            &["show", "-R", "--raw", "HEAD~3"],
+        ],
+        out,
+    );
     out.push(
         Case::new("diff", &["diff", "--default-prefix", "-M", "HEAD~3", "HEAD~2"], Shape::Renamed)
             .with_config(&[("diff.noprefix", "true")]),

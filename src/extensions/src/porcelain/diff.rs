@@ -6053,6 +6053,9 @@ pub(crate) struct PatchOpts {
     /// child writes to git's own descriptor. A caller that sets it must leave the
     /// returned patch out of its own prefixing pass. Empty prefixes nothing.
     pub line_prefix: Vec<u8>,
+    /// `-R` (`flags.reverse_diff`): swap the two sides of every pair, and with
+    /// them the `a/`/`b/` prefixes. Read by the history verbs' own queue builder.
+    pub reverse: bool,
 }
 
 impl Default for PatchOpts {
@@ -6091,6 +6094,7 @@ impl Default for PatchOpts {
             colors: diff_color::DiffColors::disabled(),
             order: None,
             line_prefix: Vec::new(),
+            reverse: false,
         }
     }
 }
@@ -6255,10 +6259,16 @@ fn commit_deltas(
         Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
         None => None,
     };
+    // `-R` swaps every pair as the queue is built (`diff_change()`,
+    // `diff_addremove()`), which is the queue of the swapped trees.
+    let (old_tree, new_tree) = match opts.reverse {
+        false => (old_tree, Some(new_tree)),
+        true => (Some(new_tree), old_tree),
+    };
 
     let changes = repo.diff_tree_to_tree(
         old_tree.as_ref(),
-        Some(&new_tree),
+        new_tree.as_ref(),
         Some(gix::diff::Options::default()),
     )?;
     let mut deltas: Vec<Delta> = Vec::new();

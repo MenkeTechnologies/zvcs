@@ -550,6 +550,10 @@ struct Opts {
     /// change group. Not one of `XDF_WHITESPACE_FLAGS`, so it stacks with `-w`
     /// rather than replacing it.
     ignore_blank_lines: bool,
+    /// `XDF_INDENT_HEURISTIC`: `diff_setup()` sets it from `diff.indentHeuristic`
+    /// (default on, `git_diff_basic_config()`), and `--[no-]indent-heuristic`
+    /// overrides it.
+    indent_heuristic: bool,
     /// `-I<re>` / `--ignore-matching-lines=<re>`: `xpp.ignore_regex`, which
     /// `xdl_mark_ignorable_regex()` turns into the same `ignore` bit on a change
     /// whose every record matches one of them.
@@ -729,6 +733,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut line_prefix: Vec<u8> = Vec::new();
     let mut dirstat = super::diff_files::DirStat::default();
     let mut ignore_blank_lines = false;
+    let mut indent_heuristic_flag: Option<bool> = None;
     let mut ignore_lines: Vec<super::diff_pickaxe::Needle> = Vec::new();
     let mut filter = super::diff_filter::Filter::default();
     let mut ws_error_highlight: u32 = diff_color::WSEH_NEW;
@@ -1009,6 +1014,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             // replacing them.
             "--check" => fmt.check = true,
             "--ignore-blank-lines" => ignore_blank_lines = true,
+            "--indent-heuristic" => indent_heuristic_flag = Some(true),
+            "--no-indent-heuristic" => indent_heuristic_flag = Some(false),
+            // `OPT_BIT_F(0, "ext-diff", &options->flags.allow_external, ...)`: the
+            // negation clears the bit `cmd_diff()` set (builtin/diff.c:511). This port
+            // never hands a no-index pair to an external program, so the cleared bit is
+            // the state it already runs in.
+            "--no-ext-diff" => {}
             s if s.starts_with("--ignore-matching-lines=") => {
                 if let Err(code) =
                     push_ignore_regex(&mut ignore_lines, &s["--ignore-matching-lines=".len()..])
@@ -1459,6 +1471,16 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         },
         (None, None) => gix::diff::blob::Algorithm::Myers,
     };
+    // `diff_setup()` copies `diff_indent_heuristic` (diff.c:57, 291, 5143) — read by
+    // the same `git_diff_ui_config()` pass, with or without a repository — and
+    // `--[no-]indent-heuristic` then sets or clears the bit over it.
+    let indent_heuristic = indent_heuristic_flag.unwrap_or_else(|| {
+        let cfg: gix::config::File = match &repo {
+            Some(repo) => repo.config_snapshot().plumbing().clone(),
+            None => crate::config::global_config(),
+        };
+        cfg.boolean("diff.indentHeuristic").ok().flatten().unwrap_or(true)
+    });
     if fmt.exclusive_conflict() {
         eprintln!(
             "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
@@ -1527,6 +1549,7 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         line_prefix: line_prefix.clone(),
         dirstat,
         ignore_blank_lines,
+        indent_heuristic,
         ignore_lines,
         filter,
         pickaxe,
@@ -1994,6 +2017,7 @@ fn compare_with_drivers(
             opts.ws,
             binary,
             opts.algorithm,
+            opts.indent_heuristic,
             opts.ignore_blank_lines,
             &opts.ignore_lines,
         );
@@ -2008,6 +2032,7 @@ fn compare_with_drivers(
                     opts.ws,
                     !opts.text && stat_binary,
                     opts.algorithm,
+                    opts.indent_heuristic,
                     opts.ignore_blank_lines,
                     &opts.ignore_lines,
                 );
@@ -2739,6 +2764,7 @@ mod tests {
             line_prefix: Vec::new(),
             dirstat: super::super::diff_files::DirStat::default(),
             ignore_blank_lines: false,
+            indent_heuristic: true,
             ignore_lines: Vec::new(),
             filter: super::super::diff_filter::Filter::default(),
             pickaxe: None,

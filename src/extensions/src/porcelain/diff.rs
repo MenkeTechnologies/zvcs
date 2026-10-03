@@ -7888,6 +7888,7 @@ pub(crate) fn no_index_body(
     ws: Whitespace,
     binary: bool,
     algorithm: gix::diff::blob::Algorithm,
+    indent_heuristic: bool,
     ignore_blank_lines: bool,
     ignore_lines: &[super::diff_pickaxe::Needle],
 ) -> (u32, u32, Vec<u8>) {
@@ -7899,7 +7900,7 @@ pub(crate) fn no_index_body(
     let mut input: InternedInput<Vec<u8>> = InternedInput::default();
     input.update_before(before.iter().map(|l| normalize_line(l, ws)));
     input.update_after(after.iter().map(|l| normalize_line(l, ws)));
-    let diff = super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, true);
+    let diff = super::diff_pairs::compute_compacted(algorithm, &input, &before, &after, indent_heuristic);
     let changes: Vec<super::diff_pairs::Change> = diff
         .hunks()
         .map(|h| {

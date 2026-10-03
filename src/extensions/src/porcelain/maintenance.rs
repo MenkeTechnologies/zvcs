@@ -1477,14 +1477,21 @@ fn reflog_expire_condition(repo: &gix::Repository) -> bool {
     count >= limit
 }
 
-/// `pack_refs_condition()`: more loose references than git's packed-refs-size
-/// heuristic allows.
+/// `pack_refs_condition()` (builtin/gc.c:247-269):
+/// `refs_optimize_required(…, REFS_OPTIMIZE_PRUNE | REFS_OPTIMIZE_AUTO)` on the
+/// main ref store. A reftable store answers whether its auto-compaction would
+/// do anything (`reftable_be_optimize_required()`); for the files store it is
+/// more loose references than git's packed-refs-size heuristic allows.
 ///
 /// The budget is `log2(packed-refs size / 100) * 5`, floored at 16 â roughly
 /// sixteen more loose refs per factor of ten of already-packed refs. Only the
 /// refs `pack-refs --all` would actually pack are counted: shared (non
 /// per-worktree) names that are neither symbolic nor broken.
 fn pack_refs_condition(repo: &gix::Repository) -> bool {
+    if crate::refstore::is_reftable(repo) {
+        // `if (refs_optimize_required(…, &required)) return 0;`
+        return repo.reftable_optimize_required(true).unwrap_or(false);
+    }
     // git's `log2u(packed_size / 100) * 5`, floored at 16.
     let packed_size = std::fs::metadata(repo.refs.packed_refs_path()).map_or(0usize, |m| m.len() as usize);
     let scaled = packed_size / 100;

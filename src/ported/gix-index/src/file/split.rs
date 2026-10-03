@@ -210,12 +210,18 @@ fn too_many_not_shared_entries(file: &File, max_percent_split_change: Option<u32
         return false;
     };
     let backing = file.state.path_backing();
-    // `if (!ce->index) not_shared++` — an entry the shared half does not hold.
+    // `if (!ce->index) not_shared++` — an entry the shared half does not hold, which is
+    // also one standing where a removed base entry stood: the same test
+    // `prepare_to_write_split_index()` below applies before it appends an entry whole.
     let not_shared = file
         .state
         .entries()
         .iter()
-        .filter(|e| si.position_of(e.path_in(backing), e.flags.stage()).is_none())
+        .filter(|e| {
+            si.position_of(e.path_in(backing), e.flags.stage())
+                .filter(|&pos| !si.base[pos].removed)
+                .is_none()
+        })
         .count();
     let cache_nr = file.state.entries().len();
     (cache_nr as u64) * u64::from(max_split) < (not_shared as u64) * 100

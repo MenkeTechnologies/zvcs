@@ -756,6 +756,51 @@ impl State {
         self.split_index = src.split_index.clone();
         self.link_at_decode_time = src.link_at_decode_time;
     }
+    /// Detach from the shared half every entry `unpack_trees()` built fresh rather than
+    /// carried over from `src`, the index it read — call after
+    /// [`inherit_split_index()`](Self::inherit_split_index()) on a state whose entries are
+    /// the merge result.
+    ///
+    /// Every merge function ends in one of two ways for a path it keeps. `keep_entry()`
+    /// adds the source index's own entry, and `merged_entry()` adds
+    /// `dup_cache_entry(ce, &o->internal.result)` of the *tree's* entry — a cache entry that
+    /// never stood on the shared half, so its `ce->index` is 0 — unless the two are the same:
+    ///
+    /// ```c
+    /// if (same(old, merge)) {
+    ///         copy_cache_entry(merge, old);
+    /// ```
+    ///
+    /// (unpack-trees.c:2608-2609, `copy_cache_entry()` carrying `old->index` across.)
+    /// `same()` is mode and id, and never true for a `CE_CONFLICTED` entry
+    /// (unpack-trees.c:2207-2217). A conflict stage the merge writes is a tree entry too.
+    ///
+    /// `prepare_to_write_split_index()` then writes an entry with `!ce->index` whole into
+    /// the split half and sets the delete bit of the base entry nothing matched any more
+    /// (split-index.c:255-272, :361-364, :376-383) — not a name-stripped stand-in, and an entry
+    /// `too_many_not_shared_entries()` counts. The base entry that path used to stand on
+    /// is marked removed, which is exactly that: not a candidate for the path, and deleted
+    /// on the next split write.
+    pub fn unshare_entries_built_from_trees(&mut self, src: &State) {
+        let Some(si) = self.split_index.as_mut() else {
+            return;
+        };
+        let backing = &self.path_backing;
+        for entry in &self.entries {
+            let path = entry.path_in(backing);
+            let stage = entry.flags.stage();
+            let kept = stage == entry::Stage::Unconflicted
+                && src
+                    .entry_by_path_and_stage(path, entry::Stage::Unconflicted)
+                    .is_some_and(|old| old.mode == entry.mode && old.id == entry.id);
+            if kept {
+                continue;
+            }
+            if let Some(pos) = si.position_of(path, stage) {
+                si.base[pos].removed = true;
+            }
+        }
+    }
     /// Obtain the resolve-undo extension.
     pub fn resolve_undo(&self) -> Option<&extension::resolve_undo::Paths> {
         self.resolve_undo.as_ref()

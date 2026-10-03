@@ -1694,6 +1694,8 @@ fn reset_worktree_hard(
     // an index rebuilt from a tree keeps the shared half the one it replaces stood on, so
     // the write below writes a split index again rather than dissolving the repository's.
     new_index.inherit_split_index(old);
+    // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
+    new_index.unshare_entries_built_from_trees(old);
     // Carried before the checkout, not after: the worktree writer skips a
     // `SKIP_WORKTREE` entry, which is what keeps a `--hard` from materialising the
     // paths the sparse checkout deliberately left out.

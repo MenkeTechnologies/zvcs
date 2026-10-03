@@ -801,6 +801,8 @@ fn finish(o: Opts) -> Result<ExitCode> {
     // — the un-split git's own NEEDSWORK comment right above that line describes.
     if o.merge_like() {
         new_index.inherit_split_index(&old);
+        // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
+        new_index.unshare_entries_built_from_trees(&old);
         carry_version(&mut new_index, &old);
     }
 
@@ -1411,6 +1413,8 @@ fn multi_tree_read(
         }
     }
     new_index.sort_entries();
+    // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
+    new_index.unshare_entries_built_from_trees(old);
 
     // Sparse checkout loops #1 and #2 (unpack-trees.c:1974-1976, :2035-2073), as
     // in the single-tree read: the pattern list decides which of the result's

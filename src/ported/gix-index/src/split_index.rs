@@ -21,11 +21,13 @@
 //!    is gone and its delete bit has to be written again.
 //!
 //! Entries are matched back to the base by path rather than by a stored position. git's
-//! `ce->index` survives only where a code path reuses the very same `cache_entry`, and
-//! `prepare_to_write_split_index()` falls back to exactly this comparison whenever it
-//! does not (`ce->ce_namelen != base->ce_namelen || strcmp(...)`, split-index.c:315-318,
-//! and `compare_ce_content()` at :354): a base entry whose path is in the index is the
-//! base entry that path stands on.
+//! `ce->index` follows an entry wherever a code path copies it — `replace_index_entry()`,
+//! `rename_index_entry_at()`, `keep_entry()` — and `prepare_to_write_split_index()` drops
+//! it for an entry whose name no longer matches the base entry it points at
+//! (split-index.c:315-318), so for those a base entry whose path is in the index is the
+//! base entry that path stands on. Where git builds an entry for a path the base holds
+//! *without* that position — `unpack_trees()`'s `merged_entry()` is the bulk of it — the
+//! path's base entry is marked [`BaseEntry::removed`], which takes it out of the match.
 
 use std::ops::Range;
 
@@ -41,6 +43,11 @@ pub struct BaseEntry {
     pub replaced: bool,
     /// git's `CE_REMOVE`, set by the delete bitmap: this base entry is not part of the
     /// index any more and its delete bit is written again.
+    ///
+    /// Also set for a base entry whose path `unpack_trees()` refilled with a fresh tree
+    /// entry ([`State::unshare_entries_built_from_trees()`](crate::State::unshare_entries_built_from_trees())):
+    /// git's `ce->index` is 0 on that entry, so nothing matches the base entry, and the
+    /// write deletes it and appends the new one whole.
     pub removed: bool,
 }
 

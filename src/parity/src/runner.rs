@@ -159,7 +159,7 @@
 //! it paid for and what it cost.
 
 use crate::env;
-use crate::fixture::{Shape, Templates};
+use crate::fixture::{RefFormat, Shape, Templates};
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -2072,10 +2072,16 @@ fn probe_state(repo: &Path, home: &Path) -> String {
         digest.push_str(&format!("# {}\n{}", probe.join(" "), rendered));
     }
     digest.push_str(&probe_storage(repo));
-    digest.push_str(&probe_reflogs(repo));
+    match ref_format() {
+        RefFormat::Files => digest.push_str(&probe_reflogs(repo)),
+        RefFormat::Reftable => digest.push_str(&probe_reflogs_reftable(repo, home)),
+    }
     digest.push_str(&probe_rr_cache(repo));
     digest.push_str(&probe_op_state(repo));
-    digest.push_str(&probe_worktrees(repo));
+    match ref_format() {
+        RefFormat::Files => digest.push_str(&probe_worktrees(repo)),
+        RefFormat::Reftable => digest.push_str(&probe_worktrees_reftable(repo, home)),
+    }
     digest.push_str(&probe_pack_headers(repo));
     digest.push_str(&probe_worktree_content(repo));
     digest.push_str(&probe_index_meta(repo));
@@ -3342,13 +3348,19 @@ fn reflog_listing(root: &Path, logs: &Path) -> String {
 /// file's length is taken: a length is content-derived — entry count and
 /// extensions determine it — and stat data does not move it.
 fn probe_worktrees(repo: &Path) -> String {
+    worktree_admin_files(repo, |_| false)
+}
+
+/// [`probe_worktrees`]'s walk, leaving out the files `skip` names (by their
+/// path relative to `.git/worktrees`). The files run skips nothing.
+fn worktree_admin_files(repo: &Path, skip: impl Fn(&str) -> bool) -> String {
     let dir = git_dir(repo).join("worktrees");
     let mut out = String::from("# linked-worktrees\n");
     if !dir.is_dir() {
         out.push_str("<absent>\n");
         return out;
     }
-    for (rel, path) in walk_files(&dir) {
+    for (rel, path) in walk_files(&dir).into_iter().filter(|(rel, _)| !skip(rel)) {
         let is_index = Path::new(&rel).file_name().and_then(|n| n.to_str()) == Some("index");
         let value = if let Some((note, false)) = link_note(repo, &path) {
             // Never followed out of the fixture; see [`link_note`].
@@ -3362,6 +3374,124 @@ fn probe_worktrees(repo: &Path) -> String {
             read_as_value(repo, &path)
         };
         out.push_str(&format!("{rel}: {value}\n"));
+    }
+    out
+}
+
+/// The `log -g` rendering of one reflog entry in a reftable run: selector (with
+/// `--date=raw`, the entry's own timestamp), new object id, reflog identity and
+/// message. One line per entry, newest first, so position is the entry index.
+///
+/// The entry's **old** object id is the one field of a reflog line no pretty
+/// placeholder exposes (2.56.0 pretty.c:1625-1648: the `%g*` family stops at
+/// the selector, the identity and the message), so a reftable run does not see
+/// it; the files run still compares it as part of the raw line.
+const REFLOG_ENTRY_FORMAT: &str = "--format=%gD %H %gn <%ge> %gs";
+
+/// Every reflog of one repository (or of one linked worktree, when `git_dir`
+/// names its administrative directory), as stock git reads it.
+///
+/// `reflog list` names the logs and `log -g` walks each one. Both go through
+/// git's ref-store API, so the answer does not depend on which backend holds
+/// the logs: this is the reflog question a reftable run can ask at all, since a
+/// reftable keeps its logs inside the same `0x…-0x…-<random>.ref` tables as the
+/// refs and those bytes cannot be compared across two runs (see
+/// `corpus/ref_storage.rs`'s determinism notes). The fixture builder uses the
+/// same rendering to check a reftable variant against its files template.
+///
+/// Each section carries its exit code, so a log stock cannot walk (an entry
+/// naming a missing object) is still a fact on both sides rather than an abort.
+pub(crate) fn reflogs_via_stock(cwd: &Path, home: &Path, git_dir: Option<&Path>) -> String {
+    let run = |args: &[&str]| stock_in(cwd, home, git_dir, args);
+    let list = run(&["reflog", "list"]);
+    let mut out = format!("## reflog list: {list}");
+    for name in list.lines().skip(1) {
+        let entries =
+            run(&["log", "-g", "--no-decorate", "--date=raw", REFLOG_ENTRY_FORMAT, name, "--"]);
+        out.push_str(&format!("## {name}: {entries}"));
+    }
+    out
+}
+
+/// Every ref stock git can name in one repository (or linked worktree), `HEAD`
+/// and the other root refs included, with the symref target where there is one.
+pub(crate) fn refs_with_roots_via_stock(cwd: &Path, home: &Path, git_dir: Option<&Path>) -> String {
+    stock_in(
+        cwd,
+        home,
+        git_dir,
+        &[
+            "for-each-ref",
+            "--include-root-refs",
+            "--format=%(refname) %(objecttype) %(objectname) %(symref)",
+        ],
+    )
+}
+
+/// One stock git invocation for the reftable-run probes: `exit <code>` on the
+/// first line, then stdout exactly. `git_dir` becomes `--git-dir=<dir>`.
+fn stock_in(cwd: &Path, home: &Path, git_dir: Option<&Path>, args: &[&str]) -> String {
+    let Ok(stock) = crate::stock::git() else {
+        return "<no-stock-git>\n".to_string();
+    };
+    let mut cmd = Command::new(stock);
+    env::harden(&mut cmd, home);
+    cmd.current_dir(cwd);
+    if let Some(dir) = git_dir {
+        cmd.arg(format!("--git-dir={}", dir.display()));
+    }
+    cmd.args(args);
+    match cmd.output() {
+        Ok(out) => format!("exit {:?}\n{}", out.status.code(), decode_exact(out.stdout)),
+        Err(_) => "<spawn-failed>\n".to_string(),
+    }
+}
+
+/// [`probe_reflogs`] for a reftable run, plus the root refs.
+///
+/// The reflogs are [`reflogs_via_stock`]'s rendering, asked the same way of
+/// both sides. The root refs are here because the files run reads them as
+/// files — [`probe_op_state`] opens `.git/ORIG_HEAD`, `.git/CHERRY_PICK_HEAD`,
+/// `.git/REBASE_HEAD` and the rest by name — and in a reftable repository every
+/// one of them except the two pseudorefs `FETCH_HEAD` and `MERGE_HEAD` (2.56.0
+/// refs.c:887-900, `is_pseudo_ref`) lives in the table instead, so that probe
+/// would read `<absent>` on both sides and compare nothing.
+/// `for-each-ref --include-root-refs` lists them from whichever store holds
+/// them.
+fn probe_reflogs_reftable(repo: &Path, home: &Path) -> String {
+    format!(
+        "# reflogs (stock reflog list + log -g)\n{}# root-refs\n{}",
+        reflogs_via_stock(repo, home, None),
+        refs_with_roots_via_stock(repo, home, None)
+    )
+}
+
+/// [`probe_worktrees`] for a reftable run.
+///
+/// A linked worktree of a reftable repository keeps its `HEAD`, its other
+/// per-worktree refs and its reflog in its own table stack under
+/// `.git/worktrees/<name>/reftable/`, whose file names embed a random suffix.
+/// Those files are left out of the walk — every other administrative file is
+/// still read exactly as the files run reads it — and the refs and reflogs they
+/// hold are asked of stock git with `--git-dir` pointed at the administrative
+/// directory, which is how git itself addresses a worktree's ref store.
+fn probe_worktrees_reftable(repo: &Path, home: &Path) -> String {
+    let in_table = |rel: &str| rel.split('/').nth(1) == Some("reftable");
+    let mut out = worktree_admin_files(repo, in_table);
+    let dir = git_dir(repo).join("worktrees");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let mut names: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name())
+        .collect();
+    names.sort();
+    for name in names {
+        let admin = dir.join(&name);
+        let refs = refs_with_roots_via_stock(repo, home, Some(&admin));
+        let name = name.to_string_lossy();
+        out.push_str(&format!("## {name} refs: {refs}"));
+        out.push_str(&reflogs_via_stock(repo, home, Some(&admin)));
     }
     out
 }
@@ -5178,6 +5308,21 @@ fn alt_exec_dir(bin: &Path, home: &Path) -> &'static Path {
 /// measurement for a tidy one.
 static ALT_EVERY_CASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
+/// The ref backend the run's fixtures use (`--ref-format`), fixed once from
+/// `main` before the first case, like [`ALT_EVERY_CASE`]. It selects how the
+/// state probes read refs that are not in `for-each-ref`'s default view: a
+/// files run reads `.git/logs/**` byte for byte exactly as it always has, and a
+/// reftable run asks stock git (see [`probe_reflogs_reftable`]).
+static REF_FORMAT: std::sync::OnceLock<RefFormat> = std::sync::OnceLock::new();
+
+pub fn set_ref_format(format: RefFormat) {
+    let _ = REF_FORMAT.set(format);
+}
+
+fn ref_format() -> RefFormat {
+    *REF_FORMAT.get().unwrap_or(&RefFormat::Files)
+}
+
 pub fn set_alt_every_case(on: bool) {
     let _ = ALT_EVERY_CASE.set(on);
 }
@@ -6086,6 +6231,15 @@ impl Job {
         }
     }
 
+    /// The case a single job is, or the envelope (shape, cwd, config,
+    /// environment) every step of a sequence runs under.
+    pub fn envelope(&self) -> &Case {
+        match self {
+            Job::Single(c) => c,
+            Job::Sequence(s) => &s.envelope,
+        }
+    }
+
     /// How many invocations per side this job costs, before any repeat. Reported
     /// at startup so the price of the sequence corpus is visible rather than
     /// inferred from a wall clock.
@@ -6279,8 +6433,8 @@ mod tests {
         adjudicate, alt_reproduced, alt_speaks_to, case_timeout, classify, config_premise, git_dir,
         decode_varint, escape_bytes, ext_detail, index_meta, walk_files, interop_disagreement, is_unsupported, judge, oracle_diff, probe_op_state,
         probe_fetch_head, probe_index_meta, probe_modules, probe_pack_headers, probe_peer,
-        probe_reflogs, probe_rr_cache, probe_worktree_content,
-        probe_worktrees,
+        probe_reflogs, probe_reflogs_reftable, probe_rr_cache, probe_worktree_content,
+        probe_worktrees, probe_worktrees_reftable,
         quote_config_value, render_config_entry, repeat_disagreement,
         scope_file, split_config_key, step_is_final, AltFinding, AltRun, Case, Compared,
         ConfigEntry, ConfigScope, OracleSurface,
@@ -9576,6 +9730,55 @@ mod tests {
         let rendered = ext_detail(b"link", &run);
         assert!(rendered.contains("rep=70:[0 1 2"), "got:\n{rendered}");
         assert!(rendered.ends_with("68 69])"), "the run stops at the declared width:\n{rendered}");
+    }
+
+    /// A reftable run's ref probes must see through the table files: two
+    /// repositories built by the same commands hold tables with different random
+    /// names (`0x…-0x…-<random>.ref`) and must still digest equal, while a
+    /// reflog entry with a different message — in the main repository or in a
+    /// linked worktree's own stack — must not.
+    #[test]
+    fn reftable_ref_probes_read_through_stock_not_table_bytes() {
+        let stock = crate::stock::git().expect("this crate needs a stock git to measure anything");
+        let build = |tag: &str, wt_message: &str| -> PathBuf {
+            let repo = scratch(tag);
+            let ok = |dir: &Path, args: &[&str]| {
+                let mut cmd = Command::new(stock);
+                crate::env::harden(&mut cmd, &repo);
+                let out = cmd.current_dir(dir).args(args).output().expect("stock git runs");
+                assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            };
+            std::fs::remove_dir_all(repo.join(".git")).unwrap();
+            ok(&repo, &["init", "-q", "-b", "main", "--ref-format=reftable"]);
+            std::fs::write(repo.join("a.txt"), b"a\n").unwrap();
+            ok(&repo, &["add", "a.txt"]);
+            ok(&repo, &["commit", "-qm", "one"]);
+            ok(&repo, &["commit", "-q", "--allow-empty", "-m", "two"]);
+            ok(&repo, &["worktree", "add", "--relative-paths", "-q", "-b", "linked", "wt"]);
+            ok(&repo.join("wt"), &["update-ref", "-m", wt_message, "HEAD", "HEAD~1"]);
+            repo
+        };
+        let a = build("reftable-probe-a", "moved");
+        let b = build("reftable-probe-b", "moved");
+        let c = build("reftable-probe-c", "moved differently");
+        let tables = |repo: &Path| -> Vec<String> {
+            walk_files(&repo.join(".git/worktrees/wt/reftable")).into_iter().map(|(r, _)| r).collect()
+        };
+        assert_ne!(tables(&a), tables(&b), "premise: table names embed a random suffix");
+
+        let home = a.clone();
+        assert_eq!(probe_reflogs_reftable(&a, &home), probe_reflogs_reftable(&b, &home));
+        assert_eq!(probe_worktrees_reftable(&a, &home), probe_worktrees_reftable(&b, &home));
+        assert!(!probe_worktrees_reftable(&a, &home).contains("reftable/"));
+        assert_ne!(probe_worktrees_reftable(&a, &home), probe_worktrees_reftable(&c, &home));
+        assert!(
+            probe_worktrees_reftable(&a, &home).lines().any(|l| l.contains(" moved") && l.starts_with("HEAD@{")),
+            "the linked worktree's own reflog entry is read:\n{}",
+            probe_worktrees_reftable(&a, &home)
+        );
+        // `update-ref HEAD` in `wt` moved `refs/heads/linked` through the symref,
+        // and that branch log is shared, so the main digest sees the message too.
+        assert_ne!(probe_reflogs_reftable(&a, &home), probe_reflogs_reftable(&c, &home));
     }
 
     /// The widened mirror costs a process only where there is a structure to

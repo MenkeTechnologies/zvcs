@@ -206,10 +206,24 @@ cargo run -p zvcs-parity -- --fuzz 12 --list-cases         # print what that run
 cargo run -p zvcs-parity -- --alt-git /usr/bin/git         # name the second oracle
 cargo run -p zvcs-parity -- --alt-git-every-case           # ask it about passing cases too
 cargo run -p zvcs-parity -- --concurrency                  # concurrent writers and held locks
+cargo run -p zvcs-parity -- --ref-format reftable          # same corpus, reftable fixtures
 ```
 
 It builds fixture repositories with stock git, runs each invocation against both
 binaries, and compares stdout, exit code, and the resulting repository state.
+
+`--ref-format reftable` reruns the selected corpus on reftable variants of every
+fixture: stock `refs migrate --ref-format=reftable` on a copy of each shape, or,
+for shapes with linked worktrees (which stock refuses to migrate), the same
+recipe built with `GIT_DEFAULT_REF_FORMAT=reftable`. Each variant must read the
+same refs and reflog entries through stock git as its files twin before the run
+starts. Reflogs and root refs are then compared through stock `reflog list`,
+`log -g` and `for-each-ref --include-root-refs` rather than as bytes, because
+reftable file names carry a random suffix; the old object id of a reflog entry is
+the one field that route does not show. Cases that run from `.git/refs/heads`
+are dropped and counted, since that path is a regular file in a reftable
+repository. The default files run is measured exactly as before, and `--html`
+refuses a reftable run so the published report stays the files-format numbers.
 
 A fourth comparison covers what the first three structurally cannot. Every state
 probe asks stock git what a repository *means* and recomputes the answer from

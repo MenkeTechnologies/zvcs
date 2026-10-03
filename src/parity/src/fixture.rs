@@ -955,6 +955,9 @@ impl Shape {
 fn git(dir: &Path, home: &Path, args: &[&str]) -> Result<String> {
     let mut cmd = crate::stock::command()?;
     env::harden(&mut cmd, home);
+    if let Some(format) = DIRECT_REF_FORMAT.with(std::cell::Cell::get) {
+        cmd.env("GIT_DEFAULT_REF_FORMAT", format);
+    }
     cmd.current_dir(dir).args(args);
     let out = cmd
         .output()
@@ -3300,6 +3303,150 @@ fn copy_file(from: &Path, to: &Path, meta: &std::fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Which ref backend the fixtures a run measures against keep their refs in.
+///
+/// `Files` is every run there has ever been: loose refs, `packed-refs`, and
+/// `.git/logs/**`. `Reftable` reruns the same corpus on the same shapes with
+/// the ref store converted (see [`build_reftable`]), which is the only way the
+/// harness can see the port *read* a reftable repository — no case's argv can
+/// leave one behind for the probes when the port refuses to write one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefFormat {
+    Files,
+    Reftable,
+}
+
+impl RefFormat {
+    /// The spelling `--ref-format` accepts, which is git's own
+    /// (`init --ref-format=<format>`, `rev-parse --show-ref-format`).
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "files" => Ok(Self::Files),
+            "reftable" => Ok(Self::Reftable),
+            other => bail!("unknown ref format {other:?} (expected files or reftable)"),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Reftable => "reftable",
+        }
+    }
+}
+
+thread_local! {
+    /// Set only while [`build_reftable`] builds a shape directly in the reftable
+    /// format; [`git`] then passes it as `GIT_DEFAULT_REF_FORMAT`, which
+    /// only repository creation consults (2.56.0 setup.c:2803, in
+    /// `repository_format_configure`, reached from `init` and `clone`). Thread-local rather than a build
+    /// parameter so the shape recipes stay one recipe for both formats.
+    static DIRECT_REF_FORMAT: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Produce the reftable variant of `shape` at `dst`, from its files-format
+/// template at `files_dir`.
+///
+/// # Two routes, chosen by what stock git allows
+///
+/// * **Migrate** (every shape without a linked worktree): copy the files
+///   template and run stock `refs migrate --ref-format=reftable` on the copy.
+///   The shape is then the files shape byte for byte everywhere except the ref
+///   store, which is the most faithful variant there is — it is the same
+///   repository with one property changed. Hand-written refs survive this:
+///   `Damaged`'s `refs/heads/dangling` (a ref to a missing object) and
+///   `refs/heads/broken-symref` are carried across, which a direct build could
+///   not do because a reftable repository's `.git/refs/heads` is a regular
+///   file and the recipe's `write(".git/refs/heads/…")` would fail.
+/// * **Direct build** (shapes with `.git/worktrees`): stock 2.56.0 refuses to
+///   migrate them (`error: migrating repositories with worktrees is not
+///   supported yet`, which `corpus/ref_storage.rs` measures as a case), so the
+///   shape's recipe is rerun from scratch with `GIT_DEFAULT_REF_FORMAT=reftable`
+///   in [`git`]'s environment. That makes every linked worktree a reftable one
+///   too, which is what git does when it creates a worktree in a reftable
+///   repository. Only recipes that write no ref file by hand can take this
+///   route, and `Worktree`/`WorktreeLocked` write none.
+///
+/// Only the repository the shape *is* gets converted. A bare peer
+/// (`.remote.git`) and a submodule's own git directory (`.git/modules/**`) stay
+/// in the files format: they are other repositories the case talks to, and a
+/// reftable superproject with files submodules is a state git produces itself.
+///
+/// # The variant is checked before it is used
+///
+/// Whatever route built it, stock git must say the variant is `reftable`
+/// (`rev-parse --show-ref-format`) and must read the same refs, root refs
+/// included, and the same reflogs out of it as out of the files template. A
+/// mismatch fails the run naming the shape: a variant that silently lost a ref
+/// or a reflog would make every case on it measure a different premise from
+/// the one its files-format twin measures.
+fn build_reftable(shape: Shape, files_dir: &Path, dst: &Path, home: &Path) -> Result<()> {
+    if files_dir.join(".git").join("worktrees").is_dir() {
+        DIRECT_REF_FORMAT.with(|f| f.set(Some("reftable")));
+        let built = build(shape, dst, home);
+        DIRECT_REF_FORMAT.with(|f| f.set(None));
+        built?;
+    } else {
+        copy_tree(files_dir, dst)?;
+        git(dst, home, &["refs", "migrate", "--ref-format=reftable"])?;
+    }
+
+    let format = git(dst, home, &["rev-parse", "--show-ref-format"])?;
+    if format.trim() != "reftable" {
+        bail!("fixture: reftable variant reports ref format {:?}", format.trim());
+    }
+    for (what, files, reftable) in [
+        (
+            "refs",
+            crate::runner::refs_with_roots_via_stock(files_dir, home, None),
+            crate::runner::refs_with_roots_via_stock(dst, home, None),
+        ),
+        (
+            "reflogs",
+            reflogs_with_entries(&crate::runner::reflogs_via_stock(files_dir, home, None)),
+            reflogs_with_entries(&crate::runner::reflogs_via_stock(dst, home, None)),
+        ),
+    ] {
+        if files != reftable {
+            bail!(
+                "fixture: reftable variant reads different {what} from its files template\n\
+                 --- files\n{files}--- reftable\n{reftable}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The sections of a [`crate::runner::reflogs_via_stock`] rendering that hold at
+/// least one entry (or that stock failed to walk), without the `reflog list` section.
+///
+/// A files repository can keep a reflog that exists and is empty —
+/// `Shape::Packed` runs `reflog expire --expire=all --all`, which truncates
+/// `.git/logs/HEAD` and `.git/logs/refs/heads/main` to zero bytes — and stock
+/// `refs migrate` carries no such log into the reftable (it copies entries, and
+/// there are none), so `reflog list` names two logs on one side and none on the
+/// other. No entry was lost, so the template check compares entries only. The
+/// runner's probe is not filtered: there both sides of a case are the same
+/// backend, and an empty log one of them created is a difference.
+fn reflogs_with_entries(rendering: &str) -> String {
+    let mut sections: Vec<(&str, String)> = Vec::new();
+    for line in rendering.lines() {
+        if line.starts_with("## ") {
+            sections.push((line, String::new()));
+        } else if let Some((_, body)) = sections.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    sections
+        .into_iter()
+        .skip(1)
+        .filter(|(head, body)| !body.is_empty() || !head.ends_with(": exit Some(0)"))
+        .map(|(head, body)| format!("{head}\n{body}"))
+        .collect()
+}
+
 /// Prebuilt template directories, one per shape.
 pub struct Templates {
     root: PathBuf,
@@ -3307,8 +3454,11 @@ pub struct Templates {
 }
 
 impl Templates {
-    /// Build every shape once under `root`.
-    pub fn build_all(root: &Path) -> Result<Self> {
+    /// Build every shape once under `root`, in the files format, and — for a
+    /// reftable run — its reftable variant beside it; [`Self::instantiate`]
+    /// then hands out the variant. The files templates are built either way
+    /// because the variant is derived from (or checked against) them.
+    pub fn build_all(root: &Path, format: RefFormat) -> Result<Self> {
         let home = root.join("home");
         std::fs::create_dir_all(&home)?;
         let templates = root.join("templates");
@@ -3321,7 +3471,39 @@ impl Templates {
             build(shape, &dir, &home)
                 .with_context(|| format!("building fixture shape {}", shape.name()))?;
         }
-        Ok(Self { root: templates, home })
+        if format == RefFormat::Files {
+            return Ok(Self { root: templates, home });
+        }
+        let variants = root.join("templates-reftable");
+        std::fs::create_dir_all(&variants)?;
+        for &shape in Shape::ALL {
+            let dir = variants.join(shape.name());
+            if dir.exists() {
+                continue;
+            }
+            build_reftable(shape, &templates.join(shape.name()), &dir, &home)
+                .with_context(|| format!("building reftable variant of {}", shape.name()))?;
+        }
+        Ok(Self { root: variants, home })
+    }
+
+    /// Whether a case can run from `rel` (relative to the root of `shape`):
+    /// false only when some prefix of it exists in the template as something
+    /// other than a directory.
+    ///
+    /// Every files template answers true for every cwd the corpus names. A
+    /// reftable template does not for `.git/refs/heads`: git writes that path
+    /// as a regular file in a reftable repository (2.56.0 refs.c:2202-2223,
+    /// `refs_create_refdir_stubs`, called from `ref_store_create_on_disk` at
+    /// refs.c:2235-2239 with `this repository uses the reftable format`), so the
+    /// case's premise — "run from inside the loose-ref directory" — does not
+    /// exist there to be measured.
+    pub fn cwd_available(&self, shape: Shape, rel: &str) -> bool {
+        let mut path = self.root.join(shape.name());
+        Path::new(rel).components().all(|part| {
+            path.push(part);
+            !path.exists() || path.is_dir()
+        })
     }
 
     /// Materialize a pristine copy of `shape` at `dst`.

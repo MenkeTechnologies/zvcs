@@ -106,22 +106,29 @@
 //!   so a fixture change breaks one constant rather than silently changing what
 //!   a transaction means.
 //!
-//! # What could not be measured, and why
+//! # Where the port reading a real reftable repository is measured
 //!
-//! **The port reading a real reftable repository.** This is the question the
-//! module most wants to ask and cannot: it needs a fixture whose ref store *is*
-//! a reftable, a `Shape` cannot be added from here, and the port refuses to
-//! create one (`refs migrate`, `init --ref-format` and `clone --ref-format` all
-//! exit non-zero with `no vendored reftable backend`), so no single argv leaves
-//! one behind for the probes to find. Asked by hand instead, against a
-//! reftable repository produced by stock `refs migrate` from a `Shape::Branched`
-//! copy — the results are in the report accompanying this file and they are the
-//! bad direction: `show-ref` exits 1 with no output, `status` and `log` print a
-//! parse error on stderr and still **exit 0**, and `update-ref refs/heads/x
-//! HEAD` says `fatal: HEAD: not a valid SHA1` and also exits 0. Closing this
-//! properly needs a reftable `Shape`, which is a `fixture.rs` change.
+//! Not in this file's cases on a default run, and not by any single argv: the
+//! fixtures are files-format repositories, and a case whose own command would
+//! have to create the reftable cannot be relied on to leave one behind for the
+//! probes. It is measured by rerunning the corpus with `--ref-format reftable`,
+//! which builds a reftable variant of every shape (`fixture::build_reftable`:
+//! stock `refs migrate --ref-format=reftable` on a copy of the files template,
+//! or — for the shapes with linked worktrees, which stock refuses to migrate —
+//! the same recipe built with `GIT_DEFAULT_REF_FORMAT=reftable`, each variant
+//! checked against its files template for identical refs and reflog entries)
+//! and runs every selected case against those. In that run the state probes
+//! read reflogs through stock `reflog list` + `log -g` and root refs through
+//! `for-each-ref --include-root-refs`, because the reftable's own files embed a
+//! random suffix and cannot be compared (`runner::probe_reflogs_reftable`,
+//! `runner::probe_worktrees_reftable`); an entry's old object id is the one
+//! reflog field that route cannot see. Cases that run from `.git/refs/heads`
+//! are dropped from that run and counted — the path is a regular file in a
+//! reftable repository. The default run, and every number it reports, is
+//! unchanged by any of this.
 //!
-//! What *is* reachable, and is below, is the declaration without the store:
+//! What this file reaches on the default run, and is below, is the
+//! declaration without the store:
 //! `extensions.refStorage` set from repository configuration over a files
 //! repository. Stock believes the declaration and reads an empty reftable; the
 //! port ignores it and serves the loose refs. That is the same defect measured
@@ -185,8 +192,10 @@ pub fn cases(out: &mut Vec<Case>) {
 /// (`error: migrating repositories with worktrees is not supported yet`, exit
 /// 255), so it is the one shape where the right answer is a refusal, and a port
 /// that migrated it anyway would be the interesting failure. It is also why the
-/// determinism note above does not need to cover `.git/worktrees`: no reftable
-/// is ever written under it.
+/// determinism note above does not need to cover `.git/worktrees` on a default
+/// run: no case here writes a reftable under it. (The `--ref-format reftable`
+/// run's `Worktree` variant does hold one there, built directly rather than
+/// migrated, and `runner::probe_worktrees_reftable` reads it through stock git.)
 fn migrate(out: &mut Vec<Case>) {
     let to_reftable = |shape: Shape, out: &mut Vec<Case>| {
         out.push(Case::new("refs", &["refs", "migrate", "--ref-format=reftable"], shape));

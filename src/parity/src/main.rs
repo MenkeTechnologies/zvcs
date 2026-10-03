@@ -24,6 +24,7 @@
 //!   zvcs-parity --alt-git-every-case           # ask the second oracle about
 //!                                              #   passing cases too
 //!   zvcs-parity --concurrency        # also run the concurrent-writer corpus
+//!   zvcs-parity --ref-format reftable  # rerun on reftable variants of every shape
 //!
 //! A machine with two real gits gets the second oracle without being asked: a
 //! difference against the newest git is otherwise reported identically whether
@@ -123,6 +124,15 @@ struct Args {
     /// is a defect (the port lost a write it said it had done), but a run that
     /// found none has not proved the race absent.
     concurrency: bool,
+    /// `--ref-format <files|reftable>`: the ref backend of the fixtures.
+    ///
+    /// `files` (the default) is every run before this flag existed, measured
+    /// identically. `reftable` builds the reftable variant of every shape
+    /// (`fixture::build_reftable`) and runs the selected corpus against those,
+    /// with the state probes reading refs and reflogs through stock git rather
+    /// than through `.git/logs` — the only way the harness can measure the port
+    /// reading a reftable repository at all.
+    ref_format: fixture::RefFormat,
 }
 
 fn parse_args() -> Result<Args> {
@@ -141,6 +151,7 @@ fn parse_args() -> Result<Args> {
         alt_git: stock::AltChoice::Auto,
         alt_git_every_case: false,
         concurrency: false,
+        ref_format: fixture::RefFormat::Files,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -206,8 +217,18 @@ fn parse_args() -> Result<Args> {
                 a.concurrency = true;
                 i += 1;
             }
+            "--ref-format" => {
+                a.ref_format = fixture::RefFormat::parse(&next(i)?)?;
+                i += 2;
+            }
             other => anyhow::bail!("unknown argument {other:?}"),
         }
+    }
+    // The HTML port report is the published headline, and its numbers are the
+    // files-format corpus's. A reftable run measures a different premise, so it
+    // must not be able to overwrite that page.
+    if a.ref_format != fixture::RefFormat::Files && a.html.is_some() {
+        anyhow::bail!("--html reports the files-format corpus; drop --ref-format to regenerate it");
     }
     Ok(a)
 }
@@ -273,6 +294,7 @@ fn real_main() -> Result<ExitCode> {
     // down its length is worse than one that never asked.
     stock::set_alt_choice(args.alt_git.clone());
     runner::set_alt_every_case(args.alt_git_every_case);
+    runner::set_ref_format(args.ref_format);
 
     // Everything lands under one root so a run leaves nothing behind.
     let root = std::env::temp_dir().join(format!("zvcs-parity-{}", std::process::id()));
@@ -281,8 +303,11 @@ fn real_main() -> Result<ExitCode> {
 
     eprintln!("binary   : {}", zvcs_bin.display());
     eprintln!("workdir  : {}", root.display());
+    if args.ref_format != fixture::RefFormat::Files {
+        eprintln!("refs     : {} variants of every shape", args.ref_format.name());
+    }
     eprintln!("building fixtures…");
-    let templates = fixture::Templates::build_all(&root)?;
+    let templates = fixture::Templates::build_all(&root, args.ref_format)?;
 
     // Single invocations and multi-step sequences share one list: the pool
     // schedules by index, and two lists would mean two passes over the same
@@ -308,6 +333,21 @@ fn real_main() -> Result<ExitCode> {
     }
     if !args.only.is_empty() {
         cases.retain(|c| args.only.iter().any(|o| o == c.cmd()));
+    }
+    // A reftable variant has no `.git/refs/heads` directory to run from (see
+    // `Templates::cwd_available`). Those cases are dropped and counted rather
+    // than run against a different premise or failed for the harness's reason.
+    if args.ref_format != fixture::RefFormat::Files {
+        let before = cases.len();
+        cases.retain(|j| {
+            let c = j.envelope();
+            c.cwd.is_none_or(|rel| templates.cwd_available(c.shape, rel))
+        });
+        eprintln!(
+            "dropped  : {} case(s) whose working directory is not a directory in the {} variant",
+            before - cases.len(),
+            args.ref_format.name()
+        );
     }
     // Sequences are counted apart from the invocations they cost, so the price of
     // the multi-step corpus is stated rather than left to be inferred from a

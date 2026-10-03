@@ -277,10 +277,13 @@ struct Filters {
     /// `--no-points-at` (`oid_array_clear`) drops all of them. Keeping a single
     /// slot made the last one win.
     points_at: Vec<ObjectId>,
-    contains: Option<ObjectId>,
-    no_contains: Option<ObjectId>,
-    merged: Option<ObjectId>,
-    no_merged: Option<ObjectId>,
+    /// The reachability filters are `commit_list`s in C, appended to by every
+    /// occurrence: repeated `--contains`/`--merged` are OR-ed, repeated
+    /// `--no-contains`/`--no-merged` exclude each.
+    contains: Vec<ObjectId>,
+    no_contains: Vec<ObjectId>,
+    merged: Vec<ObjectId>,
+    no_merged: Vec<ObjectId>,
 }
 
 impl Filters {
@@ -289,19 +292,19 @@ impl Filters {
     /// the ref's own id before any commit lookup happens.
     fn shared(&self) -> super::for_each_ref::Filters {
         super::for_each_ref::Filters {
-            contains: self.contains.into_iter().collect(),
-            no_contains: self.no_contains.into_iter().collect(),
-            merged: self.merged.into_iter().collect(),
-            no_merged: self.no_merged.into_iter().collect(),
+            contains: self.contains.clone(),
+            no_contains: self.no_contains.clone(),
+            merged: self.merged.clone(),
+            no_merged: self.no_merged.clone(),
         }
     }
 
     fn any(&self) -> bool {
         !self.points_at.is_empty()
-            || self.contains.is_some()
-            || self.no_contains.is_some()
-            || self.merged.is_some()
-            || self.no_merged.is_some()
+            || !self.contains.is_empty()
+            || !self.no_contains.is_empty()
+            || !self.merged.is_empty()
+            || !self.no_merged.is_empty()
     }
 }
 
@@ -362,12 +365,8 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     let mut positionals: Vec<&str> = Vec::new();
     let mut operands_only = false;
 
-    // Raw (unresolved) filter operands, resolved once the repository is open.
-    let mut points_at: Vec<String> = Vec::new();
-    let mut contains: Option<String> = None;
-    let mut no_contains: Option<String> = None;
-    let mut merged: Option<String> = None;
-    let mut no_merged: Option<String> = None;
+    // The listing filters, each resolved by its option callback as argv is walked.
+    let mut filters = Filters::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -464,7 +463,7 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--no-cleanup" => cleanup = None,
             // git's `points-at` is a `parse_opt_object_name` callback whose unset
             // branch clears the oid array, dropping the filter entirely.
-            "--no-points-at" => points_at.clear(),
+            "--no-points-at" => filters.points_at.clear(),
             // git's `OPT_STRING_LIST` unset (`string_list_clear`) empties every
             // sort key gathered so far, CLI and `tag.sort` config alike.
             "--no-sort" => {
@@ -473,17 +472,45 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             }
             // Hidden `--with`/`--without` aliases for `--contains`/`--no-contains`
             // (git's OPT_WITH/OPT_WITHOUT), same `LASTARG_DEFAULT` HEAD semantics.
-            "--with" => contains = Some(optarg(args, &mut i)),
-            "--without" => no_contains = Some(optarg(args, &mut i)),
+            "--with" => {
+                if let Some(code) = add_filter(&mut filters, Filter::Contains, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
+            "--without" => {
+                if let Some(code) = add_filter(&mut filters, Filter::NoContains, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
             "-s" | "--sign" => sign = Some(true),
             "-u" | "--local-user" => keyid = Some(super::take_value(args, &mut i, a)?.to_string()),
             "-e" | "--edit" => edit_flag = true,
             "-n" => lines = Some(1),
-            "--points-at" => points_at.push(optarg(args, &mut i)),
-            "--contains" => contains = Some(optarg(args, &mut i)),
-            "--no-contains" => no_contains = Some(optarg(args, &mut i)),
-            "--merged" => merged = Some(optarg(args, &mut i)),
-            "--no-merged" => no_merged = Some(optarg(args, &mut i)),
+            "--points-at" => {
+                if let Some(code) = add_filter(&mut filters, Filter::PointsAt, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
+            "--contains" => {
+                if let Some(code) = add_filter(&mut filters, Filter::Contains, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
+            "--no-contains" => {
+                if let Some(code) = add_filter(&mut filters, Filter::NoContains, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
+            "--merged" => {
+                if let Some(code) = add_filter(&mut filters, Filter::Merged, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
+            "--no-merged" => {
+                if let Some(code) = add_filter(&mut filters, Filter::NoMerged, &optarg(args, &mut i))? {
+                    return Ok(code);
+                }
+            }
             _ => {
                 if let Some(rest) = a.strip_prefix("--sort=") {
                     sorts.push(rest.to_string());
@@ -523,19 +550,33 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                         }
                     }
                 } else if let Some(rest) = a.strip_prefix("--points-at=") {
-                    points_at.push(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::PointsAt, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--contains=") {
-                    contains = Some(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::Contains, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--with=") {
-                    contains = Some(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::Contains, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--no-contains=") {
-                    no_contains = Some(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::NoContains, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--without=") {
-                    no_contains = Some(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::NoContains, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--merged=") {
-                    merged = Some(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::Merged, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--no-merged=") {
-                    no_merged = Some(rest.to_string());
+                    if let Some(code) = add_filter(&mut filters, Filter::NoMerged, rest)? {
+                        return Ok(code);
+                    }
                 } else if let Some(rest) = a.strip_prefix("--trailer=") {
                     trailers.push(rest.to_string());
                 } else if a == "--trailer" {
@@ -713,16 +754,11 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     //         else if (filter.with_commit || … || filter.lines != -1) cmdmode = 'l';
     // }
     // ```
-    // (builtin/tag.c:559-566). The filters are tested as *given*, before any of
-    // them is resolved against the odb, so this reads the raw operands.
+    // (builtin/tag.c:559-566).
     if cmdmode == CmdMode::None
         && (positionals.is_empty()
             || lines.is_some()
-            || contains.is_some()
-            || no_contains.is_some()
-            || merged.is_some()
-            || no_merged.is_some()
-            || !points_at.is_empty())
+            || filters.any())
     {
         cmdmode = CmdMode::List;
     }
@@ -795,42 +831,6 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
         return super::ref_filter::report(e);
     }
 
-    // Resolve the listing filters now that the object database is open. Each
-    // option keeps its own `parse_options()` callback's diagnostic and status:
-    // `--points-at` is `parse_opt_object_name` (no odb lookup at all, so an
-    // absent id is a filter that matches nothing), `--contains`/`--no-contains`
-    // are `parse_opt_commits`, and `--merged`/`--no-merged` are
-    // `parse_opt_merge_filter`, whose unresolvable-name case is a `die()`.
-    let mut filters = Filters::default();
-    for spec in &points_at {
-        match crate::objname::parse_opt_object_name(&repo, spec) {
-            Ok(id) => filters.points_at.push(id),
-            Err(e) => return Ok(e.report()),
-        }
-    }
-    for (raw, slot) in [
-        (&contains, &mut filters.contains),
-        (&no_contains, &mut filters.no_contains),
-    ] {
-        if let Some(spec) = raw {
-            match crate::objname::parse_opt_commits(&repo, spec) {
-                Ok(id) => *slot = Some(id),
-                Err(e) => return Ok(e.report()),
-            }
-        }
-    }
-    for (raw, slot, long_name) in [
-        (&merged, &mut filters.merged, "merged"),
-        (&no_merged, &mut filters.no_merged, "no-merged"),
-    ] {
-        if let Some(spec) = raw {
-            match crate::objname::parse_opt_merge_filter(&repo, spec, long_name) {
-                Ok(id) => *slot = Some(id),
-                Err(e) => return Ok(e.report()),
-            }
-        }
-    }
-
     // The mode `cmdmode` settled on above, which already folds in the listing git
     // infers from an empty argv, a `-n`, or any filter.
     if cmdmode == CmdMode::List {
@@ -853,15 +853,15 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
     // in its own fixed order rather than the order they were typed in.
     let only_in_list = if lines.is_some() {
         Some("-n")
-    } else if contains.is_some() {
+    } else if !filters.contains.is_empty() {
         Some("--contains")
-    } else if no_contains.is_some() {
+    } else if !filters.no_contains.is_empty() {
         Some("--no-contains")
-    } else if !points_at.is_empty() {
+    } else if !filters.points_at.is_empty() {
         Some("--points-at")
-    } else if merged.is_some() {
+    } else if !filters.merged.is_empty() {
         Some("--merged")
-    } else if no_merged.is_some() {
+    } else if !filters.no_merged.is_empty() {
         Some("--no-merged")
     } else {
         None
@@ -1104,6 +1104,44 @@ fn verify_tags(
 /// git's `--contains`/`--merged`/`--points-at` use `PARSE_OPT_LASTARG_DEFAULT`: a
 /// separated argument, when present, is consumed unconditionally; otherwise the
 /// option defaults to `HEAD`.
+/// Which listing filter an option feeds.
+#[derive(Clone, Copy)]
+enum Filter {
+    PointsAt,
+    Contains,
+    NoContains,
+    Merged,
+    NoMerged,
+}
+
+/// The option callbacks of the listing filters (builtin/tag.c's `options[]`):
+/// `--points-at` is `parse_opt_object_name`, `--contains`/`--no-contains` (and
+/// the hidden `--with`/`--without`) `parse_opt_commits`, `--merged`/`--no-merged`
+/// `parse_opt_merge_filter`. Each resolves its operand while argv is walked, so
+/// the first bad operand typed is reported, ahead of every later option and of
+/// every post-parse check. `Some` is the exit status of that report.
+fn add_filter(filters: &mut Filters, kind: Filter, spec: &str) -> Result<Option<ExitCode>> {
+    let repo = crate::setup::discover()?;
+    let resolved = match kind {
+        Filter::PointsAt => crate::objname::parse_opt_object_name(&repo, spec),
+        Filter::Contains | Filter::NoContains => crate::objname::parse_opt_commits(&repo, spec),
+        Filter::Merged => crate::objname::parse_opt_merge_filter(&repo, spec, "merged"),
+        Filter::NoMerged => crate::objname::parse_opt_merge_filter(&repo, spec, "no-merged"),
+    };
+    let id = match resolved {
+        Ok(id) => id,
+        Err(e) => return Ok(Some(e.report())),
+    };
+    match kind {
+        Filter::PointsAt => filters.points_at.push(id),
+        Filter::Contains => filters.contains.push(id),
+        Filter::NoContains => filters.no_contains.push(id),
+        Filter::Merged => filters.merged.push(id),
+        Filter::NoMerged => filters.no_merged.push(id),
+    }
+    Ok(None)
+}
+
 fn optarg(args: &[String], i: &mut usize) -> String {
     crate::parseopt::get_arg_lastarg(args, i, "HEAD").to_string()
 }

@@ -18,7 +18,8 @@ pub(crate) struct StageOne {
     pub reflog: Option<gix_ref::store::WriteReflog>,
     pub precompose_unicode: bool,
     pub protect_windows: bool,
-    /// Whether the repository declares `extensions.refStorage = reftable`.
+    /// The ref storage format the repository declares, `files` unless
+    /// `extensions.refStorage = reftable`.
     ///
     /// `extensions.refStorage` is a repository format version 1 extension, so
     /// `check_repo_format()` only reaches `handle_extension()` for it once the
@@ -28,7 +29,7 @@ pub(crate) struct StageOne {
     /// `ref_storage_format_by_name()` (`refs.c:51-57`, v2.55.0), which compares
     /// with `strcmp`, so the value is case-*sensitive* even though the key is
     /// not. A value no backend answers to is refused before any store is built.
-    pub reftable: bool,
+    pub ref_storage: gix_ref::store::RefStorage,
     /// Whether `extensions.worktreeConfig` is on, so `$GIT_DIR/config.worktree`
     /// was read and `check_repository_format_gently()` cleared `has_common`
     /// (`setup.c:787-796`, v2.55.0): a linked worktree then takes `core.bare`
@@ -69,10 +70,15 @@ impl StageOne {
         // Read next to `objectFormat` and from the same file, before the
         // worktree configuration is appended: `extensions.refStorage` describes
         // the whole repository, and git never looks for it in `config.worktree`.
-        let reftable = repo_format_version == 1
+        let ref_storage = if repo_format_version == 1
             && config
                 .string("extensions.refStorage")
-                .is_some_and(|format| format == "reftable");
+                .is_some_and(|format| format == "reftable")
+        {
+            gix_ref::store::RefStorage::Reftable
+        } else {
+            gix_ref::store::RefStorage::Files
+        };
 
         let extension_worktree = util::config_bool(
             &config,
@@ -128,7 +134,7 @@ impl StageOne {
             reflog,
             precompose_unicode,
             protect_windows,
-            reftable,
+            ref_storage,
             worktree_config: extension_worktree,
         })
     }

@@ -10,6 +10,7 @@ pub use snapshot::credential_helpers;
 
 ///
 pub mod overrides;
+pub mod reftable;
 
 pub mod tree;
 pub use tree::root::Tree;

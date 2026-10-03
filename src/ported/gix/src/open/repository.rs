@@ -280,7 +280,7 @@ impl ThreadSafeRepository {
             current_dir_ref.as_path()
         };
 
-        let reftable = repo_config.reftable;
+        let ref_storage = repo_config.ref_storage;
         let worktree_config = repo_config.worktree_config;
         let mut refs = {
             let reflog = repo_config.reflog.unwrap_or(gix_ref::store::WriteReflog::Disable);
@@ -290,33 +290,18 @@ impl ThreadSafeRepository {
                 object_hash,
                 precompose_unicode: repo_config.precompose_unicode,
                 prohibit_windows_device_names: repo_config.protect_windows,
-                // Reading reftables through the store is not wired up yet; a
-                // declared `reftable` store is rooted at its `reftable/` directory below.
-                ref_storage: gix_ref::store::RefStorage::Files,
+                ref_storage,
             };
-            // A declared `reftable` store does not live at the git directory: it is
-            // a stack of its own under `<common dir>/reftable`
-            // (`reftable_be_init()`, `refs/reftable-backend.c:418-429`, v2.55.0).
-            // No reftable format is read here — the point of rooting the store
-            // there is that a repository which only *declares* the format has no
-            // `reftable/` directory at all, so every lookup answers "no such ref",
-            // which is what stock answers in the same repository. The git
-            // directory is carried separately below so the index, hooks and
-            // common directory keep addressing the git directory itself.
-            let root = |dir: &Path| -> PathBuf {
-                if reftable {
-                    dir.join("reftable")
-                } else {
-                    dir.to_owned()
-                }
-            };
+            // Both backends are rooted at the git directory, as git's ref store
+            // is (`refs_compute_filesystem_location()`, refs.c): the reftable
+            // backend opens its stacks under `<common dir>/reftable` and, in a
+            // linked worktree, `<git dir>/reftable` itself
+            // (`reftable_be_init()`, refs/reftable-backend.c:406-475).
             match &common_dir {
-                Some(common_dir) => crate::RefStore::for_linked_worktree(
-                    root(&git_dir),
-                    root(common_dir).into(),
-                    ref_store_init_opts,
-                ),
-                None => crate::RefStore::at(root(&git_dir), ref_store_init_opts),
+                Some(common_dir) => {
+                    crate::RefStore::for_linked_worktree(git_dir.clone(), common_dir.clone(), ref_store_init_opts)
+                }
+                None => crate::RefStore::at(git_dir.clone(), ref_store_init_opts),
             }
         };
         let head = refs.find("HEAD").ok();
@@ -557,6 +542,11 @@ impl ThreadSafeRepository {
 
         refs.write_reflog = config::cache::util::reflog_or_default(config.reflog, worktree_dir.is_some());
         refs.namespace.clone_from(&config.refs_namespace);
+        // The reftable backend reads its write options from the final
+        // configuration, lazily, on its first write (`reftable_be_write_options()`).
+        if let Some(backend) = refs.reftable() {
+            crate::config::reftable::install(backend, config.resolved.clone());
+        }
         let prefix = replacement_objects_refs_prefix(&config.resolved, lenient_config, filter_config_section)?;
 
         if *git_dir_trust == gix_sec::Trust::Reduced && config.alloc_limit_bytes.is_none() {
@@ -628,9 +618,6 @@ impl ThreadSafeRepository {
                 },
             )?),
             common_dir,
-            // Set only when the ref store was rooted somewhere other than the git
-            // directory, so `git_dir()` keeps answering with the git directory.
-            git_dir: reftable.then(|| git_dir.clone()),
             refs,
             work_tree: worktree_dir,
             config,

@@ -99,17 +99,21 @@ fn non_bare_reftable() -> crate::Result {
         }
         Err(err) => panic!("{err}"),
     };
-    assert!(
-        repo.head_id().is_err(),
-        "Trying to do anything with head will fail as we don't support reftables yet"
+    assert_eq!(repo.ref_storage(), gix::refs::store::RefStorage::Reftable);
+    assert_eq!(
+        repo.head_name()?.expect("not detached").as_bstr(),
+        "refs/heads/main",
+        "HEAD is read from the reftable stack, not from the `refs/heads/.invalid` stub file"
+    );
+    assert_eq!(
+        repo.head_id()?,
+        repo.find_reference("refs/remotes/origin/main")?.id(),
+        "the clone's branch points where the origin's does"
     );
     assert!(!repo.is_bare());
     assert_eq!(repo.kind(), gix::repository::Kind::Common);
-    assert_ne!(
-        repo.workdir(),
-        None,
-        "Otherwise it can be used, but it's hard to do without refs"
-    );
+    assert!(repo.git_dir().ends_with("reftable-clone/.git"));
+    assert_ne!(repo.workdir(), None);
     Ok(())
 }
 

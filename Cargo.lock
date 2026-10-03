@@ -923,6 +923,7 @@ dependencies = [
  "nonempty",
  "parking_lot",
  "regex",
+ "rustix",
  "signal-hook 0.4.4",
  "smallvec",
  "thiserror",

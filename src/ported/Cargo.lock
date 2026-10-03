@@ -1269,6 +1269,7 @@ dependencies = [
  "pretty_assertions",
  "prodash",
  "regex",
+ "rustix",
  "serde",
  "serial_test",
  "signal-hook",

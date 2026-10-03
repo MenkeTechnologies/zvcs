@@ -423,6 +423,10 @@ parking_lot = { version = "0.12.4", optional = true }
 
 document-features = { version = "0.2.0", optional = true }
 
+# `umask()` for the reftable backend's file permissions.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
+
 [dev-dependencies]
 # For additional features that aren't enabled by default due to MSRV
 gix = { path = ".", default-features = false, features = [

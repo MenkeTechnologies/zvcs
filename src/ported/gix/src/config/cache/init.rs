@@ -29,7 +29,7 @@ impl Cache {
             reflog: _,
             precompose_unicode: _,
             protect_windows: _,
-            reftable: _,
+            ref_storage: _,
             worktree_config: _,
         }: StageOne,
         git_dir: &std::path::Path,

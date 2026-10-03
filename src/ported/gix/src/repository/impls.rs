@@ -10,7 +10,6 @@ impl Clone for crate::Repository {
             self.objects.clone(),
             self.work_tree.clone(),
             self.common_dir.clone(),
-            self.git_dir.clone(),
             self.config.clone(),
             self.options.clone(),
             #[cfg(feature = "index")]
@@ -53,7 +52,6 @@ impl From<&crate::ThreadSafeRepository> for crate::Repository {
             gix_odb::memory::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
             repo.work_tree.clone(),
             repo.common_dir.clone(),
-            repo.git_dir.clone(),
             repo.config.clone(),
             repo.linked_worktree_options.clone(),
             #[cfg(feature = "index")]
@@ -72,7 +70,6 @@ impl From<crate::ThreadSafeRepository> for crate::Repository {
             gix_odb::memory::Proxy::from(gix_odb::Cache::from(repo.objects.to_handle())).with_write_passthrough(),
             repo.work_tree,
             repo.common_dir,
-            repo.git_dir,
             repo.config,
             repo.linked_worktree_options,
             #[cfg(feature = "index")]
@@ -91,7 +88,6 @@ impl From<crate::Repository> for crate::ThreadSafeRepository {
             objects: r.objects.into_inner().store(),
             work_tree: r.work_tree,
             common_dir: r.common_dir,
-            git_dir: r.git_dir,
             config: r.config,
             linked_worktree_options: r.options,
             #[cfg(feature = "index")]

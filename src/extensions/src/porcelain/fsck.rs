@@ -127,9 +127,7 @@ const ERROR_REFS: u8 = 8;
 ///    reference database by default (`--references`) by *running* `git refs
 ///    verify` as a child; [`fsck_refs`] is that check, called directly instead.
 ///    Its findings, its `--verbose` trace and its `ERROR_REFS` exit bit are all
-///    reproduced. One message id of the family is missing —
-///    `badReftableTableName`, which only the reftable backend raises and the
-///    vendored `gix-ref` has no reftable backend.
+///    reproduced, for the files and the reftable backend alike.
 /// 3. **No re-hashing.** git recomputes each object's hash to catch a silent
 ///    `hash mismatch`; this port trusts the odb's own integrity checking.
 /// 3b. **A reference the ref store cannot resolve is reported, not fatal.**
@@ -3800,14 +3798,7 @@ msg_refs!(BAD_PACKED_REF_ENTRY, "badPackedRefEntry", "fsck.badPackedRefEntry", "
 msg_refs!(PACKED_REF_ENTRY_NOT_TERMINATED, "packedRefEntryNotTerminated", "fsck.packedRefEntryNotTerminated", "receive.fsck.packedRefEntryNotTerminated", "fetch.fsck.packedRefEntryNotTerminated", Error);
 msg_refs!(PACKED_REF_UNSORTED, "packedRefUnsorted", "fsck.packedRefUnsorted", "receive.fsck.packedRefUnsorted", "fetch.fsck.packedRefUnsorted", Error);
 msg_refs!(EMPTY_PACKED_REFS_FILE, "emptyPackedRefsFile", "fsck.emptyPackedRefsFile", "receive.fsck.emptyPackedRefsFile", "fetch.fsck.emptyPackedRefsFile", Info);
-msg_config_only!(BAD_REFTABLE_TABLE_NAME, "badReftableTableName", "fsck.badReftableTableName", "receive.fsck.badReftableTableName", "fetch.fsck.badReftableTableName", Warn,
-    "`refs/reftable-backend.c::reftable_fsck_error_handler` raises it for a table \
-     file inside `reftable/` whose name does not match the \
-     `0x%012<PRIx64>-0x%012<PRIx64>-%08x.ref` form the backend writes. The \
-     vendored `gix-ref` has no reftable backend at all — only the `files` backend \
-     with its `packed-refs` — so a reftable repository cannot even be opened here, \
-     let alone have its table names walked. Porting the id would mean porting the \
-     backend.");
+msg_refs!(BAD_REFTABLE_TABLE_NAME, "badReftableTableName", "fsck.badReftableTableName", "receive.fsck.badReftableTableName", "fetch.fsck.badReftableTableName", Warn);
 
 /// Every row this port implements, for severity resolution and for telling a
 /// misspelled `fsck.<x>` key from a real one.
@@ -4181,7 +4172,7 @@ fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
 // as a child, forwarding `--verbose` and `--strict`, and ORs `ERROR_REFS` into
 // the exit code when that child fails. `cmd_refs_verify()` in turn calls
 // `refs_fsck()` once per worktree, which dispatches to the storage backend's
-// `fsck` — `files_fsck()` in `refs/files-backend.c`, which walks
+// `fsck` — for the files backend `files_fsck()` in `refs/files-backend.c`, which walks
 // `$GIT_DIR/refs`, then the root refs directly under `$GIT_DIR`, then hands
 // `packed-refs` to `packed_fsck()` in `refs/packed-backend.c`.
 //
@@ -4198,10 +4189,15 @@ fn read_skip_list(path: &str) -> Result<HashSet<ObjectId>, String> {
 // `fsck_report_ref()` deliberately does not consult `fsck.skipList` — that list
 // holds object ids and these findings name a path — but it does go through the
 // same `fsck_msg_type()`, so `fsck.<msg-id>` behaves exactly as it does for the
-// object checks. `--strict` is accepted and changes nothing here: it only
-// promotes a *defaulted* `Warn`, and every ported reference id defaults to
-// `Error` or `Info`. The one id of this family that is not ported is
-// `badReftableTableName`; see [`BAD_REFTABLE_TABLE_NAME`].
+// object checks. `--strict` promotes a *defaulted* `Warn` to an error, which
+// among the reference ids is only `badReftableTableName`: the reftable
+// backend's table-name check (`reftable_fsck_error_handler()`,
+// refs/reftable-backend.c:2747-2767).
+//
+// In a reftable repository `refs_fsck()` dispatches to `reftable_be_fsck()`
+// (refs/reftable-backend.c:2769-2860), which the ref store performs
+// ([`gix::Repository::reftable_fsck`]); its findings go through the same
+// `fsck_report_ref()` here.
 //
 // ### Known divergences
 //
@@ -4271,7 +4267,11 @@ pub fn fsck_refs(repo: &gix::Repository, cfg: &MsgConfig, verbose: bool) -> bool
         if verbose {
             eprintln!("Checking references consistency");
         }
-        check.files_fsck(&wt);
+        if crate::refstore::is_reftable(repo) {
+            check.reftable_fsck(repo, &wt);
+        } else {
+            check.files_fsck(&wt);
+        }
     }
     check.failed
 }
@@ -4353,6 +4353,35 @@ impl RefCheck<'_> {
         }
         self.failed = true;
         true
+    }
+
+    /// `reftable_be_fsck()` (refs/reftable-backend.c:2769-2860), performed by
+    /// the ref store: each table-name and reference problem is reported through
+    /// [`Self::report`], each progress message printed under `--verbose`
+    /// (`reftable_fsck_verbose_handler()`), and a stack that cannot be read is
+    /// git's `error()` and a failure.
+    fn reftable_fsck(&mut self, repo: &gix::Repository, wt: &RefWorktree) {
+        let verbose = self.verbose;
+        let worktree = wt.id.as_deref().map(gix::bstr::BStr::new);
+        let result = repo.reftable_fsck(
+            worktree,
+            &mut |finding| {
+                let msg = MSGS.iter().find(|m| m.id == finding.msg_id).expect("git's reference message ids are all rows");
+                i32::from(self.report(finding.path, msg, finding.message.as_bytes()))
+            },
+            &mut |progress| {
+                if verbose {
+                    eprintln!("{progress}");
+                }
+            },
+        );
+        match result {
+            Ok(errors) => self.failed |= errors,
+            Err(err) => {
+                eprintln!("error: {err}");
+                self.failed = true;
+            }
+        }
     }
 
     /// `refs/files-backend.c::files_fsck()`.

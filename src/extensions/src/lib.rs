@@ -94,10 +94,40 @@ use std::process::ExitCode;
 /// unless a Trace2 event target is configured.
 pub fn run() -> ExitCode {
     let argv: Vec<String> = rawarg::args();
+    remove_lock_files_on_abort();
     trace2::start(&argv);
     let code = run_command(&argv);
     trace2::exit(exit_status(code));
     code
+}
+
+/// Remove this process's registered lock files (`index.lock`, ref locks — every
+/// `gix::lock` file lives in the tempfile registry) when it aborts.
+///
+/// git cleans its tempfiles on the termination signals and at `exit`, but not on
+/// `SIGABRT`, and an abort is exactly what a runtime library raises when it gives
+/// up — libobjc's fork-safety check among them. Without this an aborted writer
+/// leaves a 0-byte `index.lock` that fails every later writer with "File exists"
+/// until someone deletes it by hand.
+///
+/// The handler is one-shot (`SA_RESETHAND`) and only unlinks through the
+/// registry's signal-safe walk; when it returns, `abort()` re-raises with the
+/// default disposition, so the process still dies of `SIGABRT` and its parent
+/// still sees 134. Installed by the standalone binary only: a host owns its
+/// own signal dispositions.
+pub fn remove_lock_files_on_abort() {
+    extern "C" fn on_abort(_: libc::c_int) {
+        gix::tempfile::registry::cleanup_tempfiles_signal_safe();
+    }
+    // Safety: a zeroed `sigaction` is a valid "no flags, empty mask" value, and
+    // the handler only performs the registry's async-signal-safe cleanup.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_abort as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESETHAND;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGABRT, &action, std::ptr::null_mut());
+    }
 }
 
 /// Run one `git` invocation inside a host process and return its exit status.
@@ -113,6 +143,13 @@ pub fn run() -> ExitCode {
 /// handled by [`hosted::run`], which this wraps.
 pub fn run_argv(argv: &[String]) -> i32 {
     hosted::run(|| {
+        // A forked copy of the host (a pipeline element) may not run a verb
+        // in-process: see `hosted`'s "A forked copy of the host".
+        if hosted::forked_from_host() {
+            if let Some(code) = hosted::run_in_child(argv) {
+                return code;
+            }
+        }
         trace2::start(argv);
         let code = exit_status(run_command(argv));
         trace2::exit(code);

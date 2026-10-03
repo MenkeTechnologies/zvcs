@@ -28,11 +28,88 @@
 //! effect nobody asked for — a shell whose working directory silently moved
 //! because a command it ran used `-C` is broken. [`run`] restores the working
 //! directory on the way out, whichever way it leaves.
+//!
+//! # A forked copy of the host
+//!
+//! A shell that hosts `git` still forks for its own reasons: every element of
+//! a pipeline but the last runs in a `fork()` child of the shell, which then
+//! dispatches the builtin there, without an exec. That child is a copy of a
+//! multithreaded process, and POSIX allows it only async-signal-safe calls
+//! until it execs. A git verb is nowhere near that. On macOS it is fatal in a
+//! specific way: the https transport verifies certificates through
+//! Security.framework (`rustls-platform-verifier`), which sends the first
+//! messages to Foundation classes such as `NSNumber`, and libobjc refuses to
+//! run a class's `+initialize` in the child of a multithreaded fork —
+//! `objc[PID]: +[NSNumber initialize] may have been in progress in another
+//! thread when fork() was called ... Crashing instead.` — aborting with
+//! SIGABRT (`zshrs -c 'git ls-remote https://… | cat'`, every time). Locks
+//! that a host thread held at the fork (a rayon registry, any `Mutex`) are a
+//! deadlock in the same child on every platform.
+//!
+//! So [`forked_from_host`] tells a forked copy apart from the host itself —
+//! the process id recorded when the image was loaded no longer matches — and
+//! [`run_in_child`] serves that invocation from a freshly exec'd `git` instead,
+//! which is what the pipeline element would have been without the builtin.
 
 use std::cell::Cell;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Once;
+
+/// The process id at image load, written by [`record_load_pid`] before `main`
+/// (and before any host thread exists). `0` when no loader ran it.
+static LOAD_PID: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn record_load_pid() {
+    // Safety: getpid(2) has no preconditions.
+    LOAD_PID.store(unsafe { libc::getpid() }, Ordering::Relaxed);
+}
+
+/// An image initializer: dyld runs `__mod_init_func` entries and the ELF loader
+/// runs `.init_array` entries before `main`, for the executable and for every
+/// library linked into it, so the pid is that of the process that loaded zvcs —
+/// the host — and a `fork()` child inherits it unchanged.
+#[used]
+#[cfg_attr(target_vendor = "apple", link_section = "__DATA,__mod_init_func")]
+#[cfg_attr(not(target_vendor = "apple"), link_section = ".init_array")]
+static LOAD_PID_INIT: extern "C" fn() = record_load_pid;
+
+/// Whether this process is a `fork()` copy of the one that loaded zvcs.
+///
+/// Reading the initializer through `black_box` is what keeps its object file in
+/// the link: a static nothing refers to is dropped from an rlib member the
+/// linker never had to pull in, and the pid would then never be recorded.
+pub fn forked_from_host() -> bool {
+    std::hint::black_box(&LOAD_PID_INIT);
+    let loaded = LOAD_PID.load(Ordering::Relaxed);
+    // Safety: getpid(2) has no preconditions.
+    loaded != 0 && loaded != unsafe { libc::getpid() }
+}
+
+/// Run `argv` (argv[0] included) in a freshly exec'd [`git_exe`] that inherits
+/// this process's descriptors, environment and working directory, and return
+/// its status the way a shell reports it: the exit code, or `128 + signal` for
+/// a child that was killed — never `0` for a child that did not finish.
+///
+/// `None` when no git binary can be found or spawned; the caller then runs the
+/// verb in-process as before, which is no worse than not delegating.
+pub fn run_in_child(argv: &[String]) -> Option<i32> {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let exe = git_exe().ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    // argv[0] reaches the child as given: zvcs dispatches `git-<verb>` off it.
+    if let Some(name) = argv.first() {
+        cmd.arg0(crate::rawarg::to_os(name));
+    }
+    cmd.args(argv.iter().skip(1).map(|a| crate::rawarg::to_os(a)));
+    let status = cmd.status().ok()?;
+    Some(match (status.code(), status.signal()) {
+        (Some(code), _) => code,
+        (None, Some(sig)) => 128 + sig,
+        (None, None) => 128,
+    })
+}
 
 thread_local! {
     /// True while this thread is running a hosted invocation.

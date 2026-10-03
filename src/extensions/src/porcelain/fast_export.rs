@@ -2371,37 +2371,41 @@ fn dwim_ref(repo: &gix::Repository, spec: &str) -> Option<(BString, ObjectId)> {
     Some((name, target))
 }
 
-/// git's `add_reflogs_to_pending`: every object a reflog ever pointed at becomes
-/// an unnamed tip.
+/// git's `add_reflogs_to_pending()` (revision.c:1735-1747): every object a
+/// reflog ever pointed at becomes an unnamed tip.
+///
+/// The walk is over the reflogs themselves, not over the references —
+/// `refs_for_each_reflog()` of the current worktree's store, then of every other
+/// worktree's (`add_other_reflogs_to_pending()`, revision.c:1716-1733), with
+/// names spelled through `strbuf_worktree_ref()` — which
+/// [`crate::refstore::reflog_names`] lists for either ref storage format.
+/// `handle_one_reflog_ent()` (revision.c:1688-1699) takes both ids of an entry;
+/// `handle_one_reflog_commit()` (revision.c:1670-1686) skips the null id and
+/// warns once per reflog about one that names no object.
 fn collect_reflog_tips(repo: &gix::Repository, tips: &mut Vec<ObjectId>) -> Result<()> {
-    let mut refs: Vec<gix::Reference<'_>> = Vec::new();
-    if let Ok(head) = repo.find_reference("HEAD") {
-        refs.push(head);
-    }
-    let platform = repo.references()?;
-    for reference in platform.all()?.flatten() {
-        refs.push(reference);
-    }
-    for reference in &refs {
-        let mut platform = reference.log_iter();
-        let Ok(Some(iter)) = platform.all() else {
-            continue;
-        };
-        for line in iter {
-            let Ok(line) = line else { continue };
-            for id in [line.previous_oid(), line.new_oid()] {
+    for name in crate::refstore::reflog_names(repo, true)? {
+        let name = name.to_string();
+        let mut warned_bad_reflog = false;
+        crate::refstore::for_each_reflog_entry(repo, &name, false, |entry| {
+            for id in [entry.old_oid, entry.new_oid] {
                 if id.is_null() {
                     continue;
                 }
-                if let Some(commit) = repo
-                    .find_object(id)
-                    .ok()
-                    .and_then(|o| o.peel_to_commit().ok())
-                {
-                    tips.push(commit.id);
+                match repo.find_object(id) {
+                    Ok(object) => {
+                        if let Ok(commit) = object.peel_to_commit() {
+                            tips.push(commit.id);
+                        }
+                    }
+                    Err(_) if !warned_bad_reflog => {
+                        eprintln!("warning: reflog of '{name}' references pruned commits");
+                        warned_bad_reflog = true;
+                    }
+                    Err(_) => {}
                 }
             }
-        }
+            std::ops::ControlFlow::Continue(())
+        })?;
     }
     Ok(())
 }

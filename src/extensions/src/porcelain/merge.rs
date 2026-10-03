@@ -763,6 +763,7 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
     let args: &[String] = &args;
 
     let mut i = 0;
+    let mut literal_until = 0;
     while i < args.len() {
         // `at` is this argument's own index; `i` steps past it immediately, so it
         // is already `parse_opt_ctx_t`'s "next unread argument" and `take_value`
@@ -771,6 +772,21 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
         // hand-rolled its own missing-value message as a result.
         let at = i;
         i += 1;
+        // `parse_options()` without `PARSE_OPT_KEEP_DASHDASH` consumes `--` and
+        // takes every later word as a non-option, so `git merge -- topic` merges
+        // `topic` and `git merge -- --continue` names a head called `--continue`.
+        // The `mergeoptions` words are their own `parse_options()` run, so a
+        // `--` there ends options only up to the real argv.
+        if at < literal_until {
+            if at >= config_argc {
+                refs.push(args[at].clone());
+            }
+            continue;
+        }
+        if args[at] == "--" {
+            literal_until = if at < config_argc { config_argc } else { args.len() };
+            continue;
+        }
         // Respell a unique abbreviation as the name it resolves to, so `--allow-unre`
         // reaches the same arm as `--allow-unrelated-histories`.
         let canonical;

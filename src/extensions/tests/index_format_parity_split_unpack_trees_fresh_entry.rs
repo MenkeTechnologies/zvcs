@@ -222,3 +222,16 @@ fn a_clean_cherry_pick_keeps_the_index_split() {
     assert_eq!(f.shared_indexes(), 2);
     assert_eq!(entry_count(&f.index()), 0);
 }
+
+/// `stash push` puts the worktree back with `reset --hard`, an `unpack_trees()` whose result
+/// keeps the source index's shared half. Rebuilt from `HEAD`'s tree alone, the index the
+/// stash left behind had none, and every stash dissolved the repository's split index.
+#[test]
+fn a_stash_keeps_the_index_split() {
+    let f = Fixture::new("stash");
+    f.write("f2", "changed\n");
+    f.ok(&["stash", "-q"]);
+    let index = f.index();
+    let at = 12 + 64 * entry_count(&index) as usize;
+    assert_eq!(&index[at..at + 4], b"link", "the index is still split");
+}

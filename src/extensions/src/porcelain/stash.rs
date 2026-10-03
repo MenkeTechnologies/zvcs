@@ -3650,6 +3650,10 @@ fn write_target_index(
     cache_tree: CacheTree<'_>,
 ) -> Result<()> {
     let mut new_index = repo.index_from_tree(&tree_id)?;
+    // Every arm below stands in for an index git read and rewrote, so the result keeps that
+    // index's timestamp and shared half (unpack-trees.c:1941-1957 for the `reset_tree()`
+    // arms; `read_from_tree()` edits the read index in place for the mixed one).
+    new_index.inherit_split_index(old_index);
 
     let mut old_map: HashMap<BString, (ObjectId, Mode, Stat, gix::index::entry::Flags)> =
         HashMap::with_capacity(old_index.entries().len());
@@ -3706,6 +3710,8 @@ fn write_target_index(
     // it can prove and nothing more.
     match cache_tree {
         CacheTree::LikeUnpackTrees => {
+            // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
+            new_index.unshare_entries_built_from_trees(old_index);
             super::write_tree::carry_untracked_cache(old_index, &mut new_index);
             super::write_tree::rebuild_cache_tree(repo, &mut new_index);
         }

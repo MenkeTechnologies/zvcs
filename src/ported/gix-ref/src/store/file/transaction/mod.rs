@@ -101,6 +101,31 @@ pub(crate) struct Options {
     pub allow_failure: bool,
     /// Indices of the edits that only verify their expected value.
     pub verify_only: std::collections::BTreeSet<usize>,
+    /// Indices of the edits that write no reflog entry (`REF_SKIP_CREATE_REFLOG`).
+    pub skip_create_reflog: std::collections::BTreeSet<usize>,
+    /// Reflog entries written as they are given.
+    pub reflog_updates: Vec<ReflogUpdate>,
+}
+
+/// One reflog entry written as given, git's `ref_transaction_update_reflog()`
+/// (refs.c:1463-1496, v2.56.0): it does not look at or change the reference,
+/// and carries its own committer and its place among the transaction's
+/// entries, so a reflog can be copied entry by entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogUpdate {
+    /// The reference whose reflog gains the entry.
+    pub name: crate::FullName,
+    /// The entry's old value.
+    pub old_oid: ObjectId,
+    /// The entry's new value.
+    pub new_oid: ObjectId,
+    /// `committer_info`: `Name <email> <seconds> <+|-HHMM>`, as `fmt_ident()` writes it.
+    pub committer_info: BString,
+    /// The message, normalized like every reflog message.
+    pub message: BString,
+    /// `index`: entries are written in this order, each under the update index
+    /// of the transaction's table plus this.
+    pub index: u64,
 }
 
 #[derive(Debug)]
@@ -227,6 +252,23 @@ impl<'p> Transaction<'_, 'p> {
     /// Only a store with the reftable backend honours it.
     pub fn verify_only(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
         self.options.verify_only.extend(indices);
+        self
+    }
+
+    /// Make the edits at `indices` (positions in what [`prepare()`](Self::prepare())
+    /// is given) write no reflog entry, git's `REF_SKIP_CREATE_REFLOG`.
+    ///
+    /// Only a store with the reftable backend honours it.
+    pub fn skip_create_reflog(mut self, indices: impl IntoIterator<Item = usize>) -> Self {
+        self.options.skip_create_reflog.extend(indices);
+        self
+    }
+
+    /// Add reflog entries to write as they are given, see [`ReflogUpdate`].
+    ///
+    /// Only a store with the reftable backend honours it.
+    pub fn update_reflogs(mut self, entries: impl IntoIterator<Item = ReflogUpdate>) -> Self {
+        self.options.reflog_updates.extend(entries);
         self
     }
 

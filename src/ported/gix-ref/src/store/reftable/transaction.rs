@@ -26,7 +26,7 @@ use super::{
 use crate::{
     FullName, Namespace, Target,
     store::WriteReflog,
-    store_impl::file::transaction::{ErrorKind, Options, Rejection, commit, prepare},
+    store_impl::file::transaction::{ErrorKind, Options, ReflogUpdate, Rejection, commit, prepare},
     transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
 };
 
@@ -57,6 +57,16 @@ struct Update {
     via_head: bool,
     /// `REF_FORCE_CREATE_REFLOG`
     force_create_reflog: bool,
+    /// `REF_SKIP_CREATE_REFLOG`
+    skip_create_reflog: bool,
+    /// `REF_LOG_USE_PROVIDED_OIDS`: a reflog entry with the given old and new
+    /// value, written without looking at the reference.
+    provided_oids: bool,
+    /// `index`: where the entry goes among the transaction's reflog entries.
+    index: u64,
+    /// `committer_info`, git's `Name <email> <time> <zone>`; `None` is the
+    /// committer the commit is given.
+    committer_info: Option<BString>,
     /// [`PreviousValue::MustExist`], which git has no flag for: the reference
     /// must exist, whatever its value.
     must_exist: bool,
@@ -151,6 +161,8 @@ pub struct TransactionData {
     updates: Vec<Update>,
     object_hash: gix_hash::Kind,
     log_refs_default: WriteReflog,
+    /// `transaction->max_index`, the largest index of a reflog entry.
+    max_index: u64,
     /// `REF_TRANSACTION_ALLOW_FAILURE`.
     allow_failure: bool,
     /// `transaction->rejections`, in the order the updates were refused.
@@ -386,6 +398,7 @@ impl Backend {
             updates: Vec::with_capacity(edits.len()),
             object_hash: kind,
             log_refs_default,
+            max_index: 0,
             allow_failure: options.allow_failure,
             rejections: Vec::new(),
         };
@@ -413,6 +426,19 @@ impl Backend {
                 namespace,
                 objects,
             )?);
+            if options.skip_create_reflog.contains(&idx) {
+                data.updates.last_mut().expect("just pushed").skip_create_reflog = true;
+            }
+        }
+        for entry in &options.reflog_updates {
+            if is_pseudo_ref(entry.name.as_bstr()) {
+                return Err(rejected(
+                    ErrorKind::Generic,
+                    format!("refusing to update reflog for pseudoref '{}'", entry.name.as_bstr()),
+                ));
+            }
+            data.max_index = data.max_index.max(entry.index);
+            data.updates.push(Self::update_from_reflog_entry(entry));
         }
 
         // `ref_update_reject_duplicates()` (refs.c:2574-2596) over the names of
@@ -524,6 +550,10 @@ impl Backend {
             log_only,
             via_head: false,
             force_create_reflog: false,
+            skip_create_reflog: false,
+            provided_oids: false,
+            index: 0,
+            committer_info: None,
             must_exist: false,
             old_may_be_missing: false,
             is_symref: false,
@@ -580,6 +610,51 @@ impl Backend {
             }
         }
         Ok(update)
+    }
+
+    /// `ref_transaction_update_reflog()` (refs.c:1463-1496): the update writing
+    /// `entry` as it is, `REF_HAVE_OLD | REF_HAVE_NEW | REF_LOG_ONLY |
+    /// REF_FORCE_CREATE_REFLOG | REF_NO_DEREF | REF_LOG_USE_PROVIDED_OIDS`.
+    fn update_from_reflog_entry(entry: &ReflogUpdate) -> Update {
+        let msg = crate::log::normalize_message(entry.message.as_ref());
+        Update {
+            refname: entry.name.0.clone(),
+            new_oid: entry.new_oid,
+            old_oid: entry.old_oid,
+            new_target: None,
+            old_target: None,
+            peeled: None,
+            msg: msg.clone(),
+            have_new: true,
+            have_old: true,
+            no_deref: true,
+            log_only: true,
+            via_head: false,
+            force_create_reflog: true,
+            skip_create_reflog: false,
+            provided_oids: true,
+            index: entry.index,
+            committer_info: Some(entry.committer_info.clone()),
+            must_exist: false,
+            old_may_be_missing: false,
+            is_symref: false,
+            parent: None,
+            previous: None,
+            rejected: false,
+            edit: RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::Only,
+                        force_create_reflog: true,
+                        message: msg,
+                    },
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(entry.old_oid)),
+                    new: Target::Object(entry.new_oid),
+                },
+                name: entry.name.clone(),
+                deref: false,
+            },
+        }
     }
 
     /// `ref_transaction_add_update()` (refs.c:1307-1366) for an update that
@@ -641,6 +716,10 @@ impl Backend {
             log_only,
             via_head,
             force_create_reflog: p.force_create_reflog,
+            skip_create_reflog: p.skip_create_reflog,
+            provided_oids: false,
+            index: 0,
+            committer_info: p.committer_info.clone(),
             must_exist: p.must_exist,
             old_may_be_missing: p.old_may_be_missing,
             is_symref: false,
@@ -679,6 +758,12 @@ impl Backend {
                 .map_err(|_| generic_failure())?;
             (stack, rewritten.to_owned())
         };
+
+        // A reflog entry with provided values touches nothing else.
+        if data.updates[idx].provided_oids {
+            let old_oid = data.updates[idx].old_oid;
+            return self.queue_update(data, idx, old_oid);
+        }
 
         // When we update the reference that HEAD points to we enqueue a
         // second log-only update for HEAD so that its reflog is updated
@@ -863,6 +948,7 @@ impl Backend {
             updates,
             object_hash: _,
             log_refs_default,
+            max_index,
             allow_failure: _,
             rejections: _,
         } = data;
@@ -892,6 +978,7 @@ impl Backend {
                         &updates,
                         committer,
                         log_refs_default,
+                        max_index,
                         &missing_committer,
                     )
                 })
@@ -912,6 +999,7 @@ impl Backend {
         updates: &[Update],
         committer: Option<gix_actor::SignatureRef<'_>>,
         log_refs_default: WriteReflog,
+        max_index: u64,
         missing_committer: &Cell<bool>,
     ) -> gix_reftable::Result<()> {
         let to_reftable = |err: Error| match err {
@@ -922,9 +1010,17 @@ impl Backend {
         let ts = st.next_update_index();
         let block_size = self.write_config().opts.block_size;
 
-        // `transaction_update_cmp()`: no update has an index, so by name.
-        stack_updates.sort_by(|a, b| updates[a.0].refname.cmp(&updates[b.0].refname));
-        writer.set_limits(ts, ts)?;
+        // `transaction_update_cmp()`: by index where either has one, else by name.
+        stack_updates.sort_by(|a, b| {
+            let (a, b) = (&updates[a.0], &updates[b.0]);
+            if a.index != 0 || b.index != 0 {
+                a.index.cmp(&b.index)
+            } else {
+                a.refname.cmp(&b.refname)
+            }
+        });
+        // Each reflog entry takes its own update index (refs/reftable-backend.c:1480-1486).
+        writer.set_limits(ts, ts + max_index)?;
 
         let mut logs = Vec::new();
         for (idx, current_oid) in stack_updates.iter() {
@@ -949,7 +1045,8 @@ impl Backend {
                         });
                     }
                 }
-            } else if u.have_new
+            } else if !u.skip_create_reflog
+                && u.have_new
                 && (u.force_create_reflog
                     || self
                         .should_write_log(u.refname.as_ref(), log_refs_default, Some(held))
@@ -965,7 +1062,14 @@ impl Backend {
                     None => true,
                 };
                 if resolved {
-                    let Some(committer) = committer else {
+                    let provided = match &u.committer_info {
+                        // git BUG()s on a committer it cannot split.
+                        Some(info) => Some(
+                            gix_actor::SignatureRef::from_bytes(info.as_ref()).map_err(|_| gix_reftable::Error::Api)?,
+                        ),
+                        None => None,
+                    };
+                    let Some(committer) = provided.or(committer) else {
                         missing_committer.set(true);
                         return Err(gix_reftable::Error::Api);
                     };
@@ -973,7 +1077,7 @@ impl Backend {
                     let message = strndup(&u.msg, block_size as usize / 2);
                     logs.push(LogRecord {
                         refname: u.refname.clone(),
-                        update_index: ts,
+                        update_index: ts + u.index,
                         value: LogValue::Update(LogUpdate {
                             new_hash: hash_of(&new_oid),
                             old_hash: hash_of(current_oid),

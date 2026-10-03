@@ -82,3 +82,24 @@ fn an_option_outside_the_subcommand_table_is_unknown() {
     assert_eq!(git(&root, &["config", "get", "--show-o", "a.b"]).0, "file:.git/config\tx\n");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `get_arg()` reads a clustered value switch's argument from the next word, and
+/// `--no-url` / `--no-value` are `OPT_STRING`'s unset sense, clearing the string.
+/// zvcs took `-zf <file>` for `-z -f` with `<file>` an operand and refused the
+/// two negations as unknown legacy options.
+#[test]
+fn clustered_values_and_negated_strings() {
+    let root = std::env::temp_dir().join(format!("zvcs-config-sub-values-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "a.b", "x"]);
+
+    let (out, err, code) = git(&root, &["config", "get", "-zf", ".git/config", "a.b"]);
+    assert_eq!((out.as_str(), err.as_str(), code), ("x\0", "", 0));
+    let (out, err, code) = git(&root, &["config", "list", "-zf"]);
+    assert_eq!((out.as_str(), err.as_str(), code), ("", "error: switch `f' requires a value\n", 129));
+    assert_eq!(git(&root, &["config", "get", "--url", "https://h", "--no-url", "a.b"]).0, "x\n");
+    assert_eq!(git(&root, &["config", "get", "--value=y", "--no-value", "a.b"]).0, "x\n");
+    let _ = std::fs::remove_dir_all(&root);
+}

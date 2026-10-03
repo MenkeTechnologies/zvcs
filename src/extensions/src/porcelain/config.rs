@@ -908,6 +908,19 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
                 opts.push(v.clone());
                 i += 1;
             }
+            "--no-value" => value_pattern = None,
+            "--no-url" => url = None,
+            // A cluster that ends on a switch taking a value (`-zf`) takes the next argument,
+            // as `-f` alone does.
+            _ if short_value_pending(&table, a).is_some() => {
+                let Some(v) = rest.get(i + 1) else {
+                    let c = short_value_pending(&table, a).expect("checked by the guard");
+                    return Some(Err(super::missing_option_value(&format!("-{c}"))));
+                };
+                opts.push(a.to_string());
+                opts.push(v.clone());
+                i += 1;
+            }
             _ if a.starts_with('-') && a != "-" => opts.push(a.to_string()),
             _ => operands.push(a.to_string()),
         }
@@ -1328,6 +1341,15 @@ fn subcommand_table(sub: &str) -> SubcommandTable {
         _ => (LOCATION, "", "f", USAGE_EDIT),
     };
     SubcommandTable { long, flags, values, usage }
+}
+
+/// The value switch a short cluster ends on with nothing after it, which
+/// `get_arg()` then reads from the next argument: `-zf` is `-z -f <next>`, where
+/// `-fz` is `-f z`.
+fn short_value_pending(table: &SubcommandTable, tok: &str) -> Option<char> {
+    let body = tok.strip_prefix('-').filter(|b| !b.is_empty() && !b.starts_with('-'))?;
+    let (at, c) = body.char_indices().find(|(_, c)| table.values.contains(*c))?;
+    (at + c.len_utf8() == body.len()).then_some(c)
 }
 
 /// `parse_options_step()` over one subcommand's table, for a dashed argument

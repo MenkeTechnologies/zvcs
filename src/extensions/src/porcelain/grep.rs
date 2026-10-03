@@ -532,6 +532,10 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         }
     }
     let mut patterns: Vec<String> = Vec::new();
+    // Parallel to `patterns`: each one's `p->origin`/`p->no` as
+    // `compile_regexp_failed()` (grep.c:220-233) prints them — `-e option, `,
+    // `command line, ` or `In '<file>' at <n>, `.
+    let mut pattern_origins: Vec<String> = Vec::new();
     // The boolean-grammar token stream, in git's append order: every `-e`/`-f`
     // pattern is an `Atom`, and `--and`/`--not`/`(`/`)` interleave with them.
     // `--or` records nothing (it is git's default, implicit operator).
@@ -727,8 +731,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     let f = value!();
                     match read_pattern_file(&f) {
                         Ok(pats) => {
-                            for p in pats {
+                            for (n, p) in pats.into_iter().enumerate() {
                                 tokens.push(Tok::Atom(p.clone()));
+                                pattern_origins.push(format!("In '{f}' at {}, ", n + 1));
                                 patterns.push(p);
                             }
                         }
@@ -904,6 +909,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 'e' => {
                     let p = short_value!('e');
                     tokens.push(Tok::Atom(p.clone()));
+                    pattern_origins.push("-e option, ".to_owned());
                     patterns.push(p);
                     c = group.len();
                     continue;
@@ -912,8 +918,9 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                     let f = short_value!('f');
                     match read_pattern_file(&f) {
                         Ok(pats) => {
-                            for p in pats {
+                            for (n, p) in pats.into_iter().enumerate() {
                                 tokens.push(Tok::Atom(p.clone()));
+                                pattern_origins.push(format!("In '{f}' at {}, ", n + 1));
                                 patterns.push(p);
                             }
                         }
@@ -961,6 +968,7 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
     if tokens.is_empty() && !rest.is_empty() {
         let p = rest.remove(0);
         tokens.push(Tok::Atom(p.clone()));
+        pattern_origins.push("command line, ".to_owned());
         patterns.push(p);
     }
     // `if (!opt.pattern_list) die(_("no pattern given"))` (builtin/grep.c:1245-1246),
@@ -1197,9 +1205,16 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    // git's regcomp failure is a fatal (exit 128); the regex crate's message
-    // differs from git's regcomp wording, but that goes to stderr, which is not
-    // a compatibility surface — the exit code is.
+    // `compile_grep_patterns()` hands every atom to `compile_regexp()` in list
+    // order (grep.c:776-787), and a `regcomp()` failure is
+    // `compile_regexp_failed()`'s `die("%s'%s': %s", where, pattern, regerror)`.
+    // See [`regcomp_failure`].
+    if let Some(msg) = regcomp_failure(&patterns, &pattern_origins, dialect) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+    // Whatever `regcomp()` would accept but the engines here cannot build is still
+    // a fatal (exit 128), in this binary's own words.
     let matcher = match Matcher::build(&patterns, dialect, opts.ignore_case, opts.word) {
         Ok(m) => m,
         Err(e) => {
@@ -4648,4 +4663,22 @@ mod tests {
         let mut all = DirSpecs::Bare(bare_pathspec(&[], cwd).expect("empty spec list"));
         assert!(all.is_included(BString::from("sub/c.txt").as_bstr(), Some(false)));
     }
+}
+
+/// The first atom `compile_regexp()` would fail on, as `compile_regexp_failed()`
+/// words it (grep.c:220-233, 563-568): `<where>'<pattern>': <regerror text>`.
+///
+/// Only the POSIX dialects reach `regcomp()`: `-F` and a pattern with no regex
+/// special at all (`is_fixed()`) take the literal matcher, and `-P` is PCRE's. The
+/// `regerror()` text is reproduced by the same checker `--grep` and `-L` use,
+/// [`super::line_log::bre_syntax_error`] / [`super::line_log::ere_syntax_error`].
+fn regcomp_failure(patterns: &[String], origins: &[String], dialect: Dialect) -> Option<String> {
+    patterns.iter().zip(origins).find_map(|(p, origin)| {
+        let text = match dialect {
+            Dialect::Basic => super::line_log::bre_syntax_error(p),
+            Dialect::Extended => super::line_log::ere_syntax_error(p),
+            Dialect::Fixed | Dialect::Perl => None,
+        }?;
+        Some(format!("{origin}'{p}': {text}"))
+    })
 }

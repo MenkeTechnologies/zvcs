@@ -42,8 +42,12 @@ impl<'spec> MatchGroup<'spec> {
     ) -> match_lhs::Outcome<'spec, 'item> {
         let mut out = Vec::new();
         let mut seen = BTreeSet::default();
-        let mut push_unique = |mapping| {
-            if seen.insert(calculate_hash(&mapping)) {
+        // `ref_remove_duplicates()` (remote.c:915-947) folds only mappings that
+        // have a destination; one without (`HEAD`, a bare `refs/heads/x`) is kept
+        // as often as a refspec produced it, so a repeated value reaches
+        // FETCH_HEAD once per occurrence.
+        let mut push_unique = |mapping: Mapping<'item, 'spec>| {
+            if mapping.rhs.is_none() || seen.insert(calculate_hash(&mapping)) {
                 out.push(mapping);
             }
         };

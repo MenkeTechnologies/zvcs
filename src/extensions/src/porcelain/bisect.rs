@@ -309,32 +309,16 @@ impl Ctx {
     /// itself, so a session opened with `--term-new=broken` keeps its tip in
     /// `refs/bisect/broken`, not `refs/bisect/bad`.
     fn bad(&self, terms: &Terms) -> Result<Option<ObjectId>> {
-        read_ref(&self.refs_dir().join(&terms.bad))
+        self.bisect_ref_read(&terms.bad)
     }
 
     /// Every marked good-side commit, sorted for deterministic iteration.
     /// The refs are named `<term-good>-<oid>`, per `register_ref`'s
     /// `good_prefix`.
     fn goods(&self, terms: &Terms) -> Result<Vec<ObjectId>> {
-        let dir = self.refs_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Ok(Vec::new());
-        };
         let prefix = format!("{}-", terms.good);
-        let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                continue;
-            };
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            if let Some(id) = read_ref(&entry.path())? {
-                out.push(id);
-            }
-        }
+        let mut out: Vec<ObjectId> =
+            self.bisect_refs(|name| name.starts_with(&prefix))?.into_iter().map(|(_, id)| id).collect();
         out.sort();
         Ok(out)
     }
@@ -350,24 +334,120 @@ impl Ctx {
     /// opened with `--term-old`/`--term-new` still records its skips under
     /// `refs/bisect/skip-<oid>`.
     fn skipped(&self) -> Result<Vec<ObjectId>> {
-        let Ok(entries) = std::fs::read_dir(self.refs_dir()) else {
-            return Ok(Vec::new());
-        };
+        let mut out: Vec<ObjectId> =
+            self.bisect_refs(|name| name.starts_with("skip-"))?.into_iter().map(|(_, id)| id).collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Whether the refs live in a reftable stack rather than as loose files.
+    fn reftable(&self) -> bool {
+        crate::refstore::is_reftable(&self.repo)
+    }
+
+    /// `refs_read_ref()` of the root ref `name` (`BISECT_HEAD`,
+    /// `BISECT_EXPECTED_REV`): the loose file in the files backend, the record
+    /// in this worktree's stack in a reftable repository.
+    fn state_read(&self, name: &str) -> Result<Option<ObjectId>> {
+        if !self.reftable() {
+            return read_ref(&self.file(name));
+        }
+        Ok(crate::sequencer::read_state_oid(&self.repo, name))
+    }
+
+    /// `refs_ref_exists()` of the root ref `name`.
+    fn state_exists(&self, name: &str) -> bool {
+        if !self.reftable() {
+            return self.file(name).exists();
+        }
+        crate::refstore::state_ref_exists(&self.repo, name)
+    }
+
+    /// `refs_update_ref(…, NULL, name, id, NULL, 0, …)` of the root ref `name`.
+    fn state_write(&self, name: &str, id: ObjectId) -> Result<()> {
+        if !self.reftable() {
+            return write_ref(&self.file(name), id);
+        }
+        crate::sequencer::write_state_oid(&self.repo, name, id, "")
+    }
+
+    /// `refs_delete_ref(…, NULL, name, NULL, REF_NO_DEREF)` of the root ref `name`.
+    fn state_delete(&self, name: &str) -> Result<()> {
+        if !self.reftable() {
+            let _ = std::fs::remove_file(self.file(name));
+            return Ok(());
+        }
+        crate::refstore::state_ref_delete(&self.repo, name, "")
+    }
+
+    /// `refs/bisect/<leaf>`, or `None` when it does not exist.
+    fn bisect_ref_read(&self, leaf: &str) -> Result<Option<ObjectId>> {
+        if !self.reftable() {
+            return read_ref(&self.refs_dir().join(leaf));
+        }
+        Ok(self
+            .repo
+            .try_find_reference(format!("refs/bisect/{leaf}").as_str())?
+            .and_then(|r| r.target().try_id().map(ToOwned::to_owned)))
+    }
+
+    /// `refs_update_ref(…, NULL, "refs/bisect/<leaf>", id, NULL, 0, …)`
+    /// (builtin/bisect.c:395), which logs nothing for a name outside the
+    /// autocreated namespaces.
+    fn bisect_ref_write(&self, leaf: &str, id: ObjectId) -> Result<()> {
+        if !self.reftable() {
+            return write_ref(&self.refs_dir().join(leaf), id);
+        }
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+        self.repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: Default::default(),
+                },
+                expected: PreviousValue::Any,
+                new: gix::refs::Target::Object(id),
+            },
+            name: format!("refs/bisect/{leaf}").as_str().try_into()?,
+            deref: true,
+        })?;
+        Ok(())
+    }
+
+    /// Every `refs/bisect/<leaf>` holding an object id, as
+    /// `refs_for_each_ref_ext(…, .prefix = "refs/bisect/")` walks them, in
+    /// `readdir()` order for loose files and in name order for reftable.
+    fn bisect_refs(&self, keep: impl Fn(&str) -> bool) -> Result<Vec<(String, ObjectId)>> {
         let mut out = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
+        if !self.reftable() {
+            let Ok(entries) = std::fs::read_dir(self.refs_dir()) else {
+                return Ok(out);
+            };
+            for entry in entries {
+                let entry = entry?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !keep(&name) {
+                    continue;
+                }
+                if let Some(id) = read_ref(&entry.path())? {
+                    out.push((name, id));
+                }
+            }
+            return Ok(out);
+        }
+        for reference in self.repo.references()?.prefixed("refs/bisect/")? {
+            let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let Some(id) = reference.target().try_id().map(ToOwned::to_owned) else {
                 continue;
             };
-            if !name.starts_with("skip-") {
-                continue;
-            }
-            if let Some(id) = read_ref(&entry.path())? {
-                out.push(id);
+            let leaf = reference.name().as_bstr().to_string()["refs/bisect/".len()..].to_owned();
+            if keep(&leaf) {
+                out.push((leaf, id));
             }
         }
-        out.sort();
         Ok(out)
     }
 
@@ -632,7 +712,7 @@ fn bisect_skip(args: &[String]) -> Result<u8> {
         return Ok(BISECT_FAILED);
     }
     let terms = current_terms(&ctx)?;
-    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let no_checkout = ctx.state_exists("BISECT_HEAD");
     if specs.is_empty() {
         // `get_oid("BISECT_HEAD")`, falling back to `HEAD` when that ref is
         // missing — which is the only difference `--no-checkout` makes here.
@@ -658,7 +738,7 @@ fn bisect_skip(args: &[String]) -> Result<u8> {
         }
     }
 
-    let mut verify_expected = read_ref(&ctx.file("BISECT_EXPECTED_REV"))?;
+    let mut verify_expected = ctx.state_read("BISECT_EXPECTED_REV")?;
     if let Some(model) = flags.as_ref() {
         let loses_ancestors_ok = verify_expected.is_some_and(|expected| ids.iter().any(|id| *id != expected));
         refuse_unmodelled_step(&ctx, &terms, model.clone(), loses_ancestors_ok)?;
@@ -674,7 +754,7 @@ fn bisect_skip(args: &[String]) -> Result<u8> {
         // asked for invalidates both cached answers, once.
         if verify_expected.is_some_and(|expected| expected != *id) {
             let _ = std::fs::remove_file(ctx.file("BISECT_ANCESTORS_OK"));
-            let _ = std::fs::remove_file(ctx.file("BISECT_EXPECTED_REV"));
+            ctx.state_delete("BISECT_EXPECTED_REV")?;
             verify_expected = None;
         }
     }
@@ -840,7 +920,7 @@ fn update_bisect_ref(ctx: &Ctx, leaf: &str, id: ObjectId) -> Result<bool> {
         );
         return Ok(false);
     }
-    write_ref(&ctx.refs_dir().join(leaf), id)?;
+    ctx.bisect_ref_write(leaf, id)?;
     Ok(true)
 }
 
@@ -1138,29 +1218,18 @@ fn do_bisect_run(command: &str) -> Result<i32> {
 /// `get_first_good` stops at the first match in ref iteration order, which is
 /// sorted, so the good end tested here is the lowest-named `refs/bisect/<good>-*`.
 fn verify_good(ctx: &Ctx, terms: &Terms, command: &str) -> Result<i32> {
-    let mut goods: Vec<(String, ObjectId)> = Vec::new();
-    let dir = ctx.refs_dir();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.starts_with(&format!("{}-", terms.good)) {
-                continue;
-            }
-            if let Some(id) = read_ref(&entry.path())? {
-                goods.push((name, id));
-            }
-        }
-    }
+    let good_prefix = format!("{}-", terms.good);
+    let mut goods = ctx.bisect_refs(|name| name.starts_with(&good_prefix))?;
     goods.sort_by(|a, b| a.0.cmp(&b.0));
     let Some(good_rev) = goods.first().map(|(_, id)| *id) else {
         return Ok(-1);
     };
 
-    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let no_checkout = ctx.state_exists("BISECT_HEAD");
     let head_file = if no_checkout { "BISECT_HEAD" } else { "HEAD" };
     // `if (read_ref(no_checkout ? "BISECT_HEAD" : "HEAD", &current_rev)) return -1;`
     let Some(current_rev) = (match no_checkout {
-        true => read_ref(&ctx.file(head_file))?,
+        true => ctx.state_read(head_file)?,
         false => resolve(&ctx.repo, "HEAD").ok(),
     }) else {
         return Ok(-1);
@@ -1208,9 +1277,9 @@ fn verify_good(ctx: &Ctx, terms: &Terms, command: &str) -> Result<i32> {
 ///         return BISECT_FAILED;
 /// ```
 fn bisect_checkout(ctx: &Ctx, id: ObjectId, no_checkout: bool) -> Result<u8> {
-    write_ref(&ctx.file("BISECT_EXPECTED_REV"), id)?;
+    ctx.state_write("BISECT_EXPECTED_REV", id)?;
     if no_checkout {
-        write_ref(&ctx.file("BISECT_HEAD"), id)?;
+        ctx.state_write("BISECT_HEAD", id)?;
     } else {
         // Through `run_command()` in git; see `crate::cstdio::run_command`.
         let _child = crate::cstdio::run_command();
@@ -1287,7 +1356,7 @@ fn run_cmd(args: &[String]) -> Result<ExitCode> {
         },
     };
     if let Some(mode) = reset_when_found {
-        if ctx.file("BISECT_HEAD").exists() {
+        if ctx.state_exists("BISECT_HEAD") {
             eprintln!("error: options '--reset-when-found' and '--no-checkout' cannot be used together");
             return Ok(ExitCode::from(BISECT_FAILED));
         }
@@ -1579,7 +1648,7 @@ fn bisect_reset(ctx: &Ctx, commit: Option<&str>, quiet: bool) -> Result<bool> {
     // exactly as it was: an unmerged index, or a `.git` subdirectory as cwd where the
     // child `checkout` dies with `this operation must be run in a work tree`, both end
     // here.
-    if !target.is_empty() && !ctx.file("BISECT_HEAD").exists() {
+    if !target.is_empty() && !ctx.state_exists("BISECT_HEAD") {
         let mut argv = vec!["--ignore-other-worktrees"];
         if quiet {
             argv.push("--quiet");
@@ -1710,6 +1779,35 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
     // second by `bisect start --first-parent`, and either one left behind
     // changes what the *next* session does — a stale `BISECT_FIRST_PARENT`
     // silently makes an ordinary `bisect start` walk first parents only.
+    //
+    // In a reftable repository the refs go first, as git orders it: every
+    // `refs/bisect/*` plus `BISECT_HEAD` and `BISECT_EXPECTED_REV` in one
+    // `refs_delete_refs(…, "bisect: remove", …, REF_NO_DEREF)` transaction.
+    if ctx.reftable() {
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+        let mut names: Vec<String> = Vec::new();
+        for reference in ctx.repo.references()?.prefixed("refs/bisect/")? {
+            let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+            names.push(reference.name().as_bstr().to_string());
+        }
+        names.push("BISECT_HEAD".into());
+        names.push("BISECT_EXPECTED_REV".into());
+        let edits = names
+            .iter()
+            .map(|name| {
+                Ok(RefEdit {
+                    change: Change::Delete {
+                        expected: PreviousValue::Any,
+                        log: RefLog::AndReference,
+                        message: "bisect: remove".into(),
+                    },
+                    name: name.as_str().try_into()?,
+                    deref: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ctx.repo.edit_references(edits)?;
+    }
     for name in [
         "BISECT_ANCESTORS_OK",
         "BISECT_EXPECTED_REV",
@@ -1938,7 +2036,9 @@ fn start(args: &[String]) -> Result<ExitCode> {
     };
     clean_state(&ctx)?;
 
-    std::fs::create_dir_all(ctx.refs_dir())?;
+    if !ctx.reftable() {
+        std::fs::create_dir_all(ctx.refs_dir())?;
+    }
     std::fs::write(ctx.file("BISECT_START"), format!("{start_head}\n"))?;
     std::fs::write(ctx.file("BISECT_NAMES"), bisect_names(args, pathspec_pos))?;
     if first_parent {
@@ -1951,7 +2051,7 @@ fn start(args: &[String]) -> Result<ExitCode> {
     }
     if no_checkout {
         let head_oid = ctx.repo.head_id()?.detach();
-        write_ref(&ctx.file("BISECT_HEAD"), head_oid)?;
+        ctx.state_write("BISECT_HEAD", head_oid)?;
     }
 
     // `bisect_write()` per revision, then `write_terms()` — in that order, which
@@ -1970,10 +2070,10 @@ fn start(args: &[String]) -> Result<ExitCode> {
     // same word writes both revisions to `refs/bisect/<term>`.
     for (idx, id) in resolved.iter().enumerate() {
         let term = if idx == 0 { &terms.bad } else { &terms.good };
-        let path = if *term == terms.bad {
-            ctx.refs_dir().join(term)
+        let leaf = if *term == terms.bad {
+            term.clone()
         } else {
-            ctx.refs_dir().join(format!("{term}-{}", id.to_hex()))
+            format!("{term}-{}", id.to_hex())
         };
         let tag = format!("refs/bisect/{term}");
         if gix::validate::reference::name(tag.as_bytes().as_bstr()).is_err() {
@@ -1982,7 +2082,7 @@ fn start(args: &[String]) -> Result<ExitCode> {
             );
             return Ok(ExitCode::from(1));
         }
-        write_ref(&path, *id)?;
+        ctx.bisect_ref_write(&leaf, *id)?;
         ctx.append_log(&format!(
             "# {term}: [{}] {}\n",
             id.to_hex(),
@@ -2167,7 +2267,7 @@ fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
         // branch the session started from — so marking `HEAD` would mark the
         // wrong commit, and with the bad end still checked out it marks the
         // *bad* one, which answers `<oid> was both 'good' and 'bad'`.
-        vec![if ctx.file("BISECT_HEAD").exists() {
+        vec![if ctx.state_exists("BISECT_HEAD") {
             "BISECT_HEAD"
         } else {
             "HEAD"
@@ -2199,16 +2299,13 @@ fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
     // ```
     //
     // (builtin/bisect.c:1001-1002.)
-    let mut verify_expected = read_ref(&ctx.file("BISECT_EXPECTED_REV"))?;
+    let mut verify_expected = ctx.state_read("BISECT_EXPECTED_REV")?;
     for id in &ids {
-        let (term, path) = match side {
-            Side::Bad => (&terms.bad, ctx.refs_dir().join(&terms.bad)),
-            Side::Good => (
-                &terms.good,
-                ctx.refs_dir().join(format!("{}-{}", terms.good, id.to_hex())),
-            ),
+        let (term, leaf) = match side {
+            Side::Bad => (&terms.bad, terms.bad.clone()),
+            Side::Good => (&terms.good, format!("{}-{}", terms.good, id.to_hex())),
         };
-        write_ref(&path, *id)?;
+        ctx.bisect_ref_write(&leaf, *id)?;
         ctx.append_log(&format!(
             "# {term}: [{}] {}\n",
             id.to_hex(),
@@ -2230,13 +2327,13 @@ fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
         // checks instead of trusting the stale flag file.
         if verify_expected.is_some_and(|expected| expected != *id) {
             let _ = std::fs::remove_file(ctx.file("BISECT_ANCESTORS_OK"));
-            let _ = std::fs::remove_file(ctx.file("BISECT_EXPECTED_REV"));
+            ctx.state_delete("BISECT_EXPECTED_REV")?;
             verify_expected = None;
         }
     }
 
     // A session opened with `--no-checkout` records its position in BISECT_HEAD.
-    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let no_checkout = ctx.state_exists("BISECT_HEAD");
     auto_next(&ctx, &terms, no_checkout)
 }
 
@@ -2351,7 +2448,7 @@ fn next_cmd(args: &[String]) -> Result<ExitCode> {
         eprint!("You need to start by \"git bisect start\"\n\n");
         return Ok(ExitCode::from(1));
     }
-    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let no_checkout = ctx.state_exists("BISECT_HEAD");
     let bad = ctx.bad(&terms)?;
     let goods = ctx.goods(&terms)?;
 
@@ -2663,7 +2760,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     }
 
     let terms = current_terms(&ctx)?;
-    let no_checkout = ctx.file("BISECT_HEAD").exists();
+    let no_checkout = ctx.state_exists("BISECT_HEAD");
     Ok(state_exit(auto_next(&ctx, &terms, no_checkout)?))
 }
 
@@ -3124,7 +3221,7 @@ fn handle_bad_merge_base(
 /// Whether `id` is the commit the last step asked to be tested, per
 /// `BISECT_EXPECTED_REV` (git's `is_expected_rev`).
 fn is_expected_rev(ctx: &Ctx, id: ObjectId) -> Result<bool> {
-    Ok(read_ref(&ctx.file("BISECT_EXPECTED_REV"))? == Some(id))
+    Ok(ctx.state_read("BISECT_EXPECTED_REV")? == Some(id))
 }
 
 /// The commits still under suspicion — reachable from `bad`, not from any good — in the

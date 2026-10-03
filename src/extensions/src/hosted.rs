@@ -97,12 +97,22 @@ fn install_quiet_hook() {
 /// for the git binary by name instead, which is what this returns:
 ///
 ///  1. `$ZVCS_GIT_EXE`, for a host that knows exactly which binary it wants;
-///  2. the first executable `git` on `PATH` that is not the host binary
-///     itself — the guard matters because the host may well BE on `PATH` under
-///     a name that resolves back here, and spawning it would loop;
-///  3. failing both, `NotFound`, which every caller already handles by
+///  2. the first executable `zvcs` on `PATH` — the same engine as a process,
+///     which is what every caller actually wants: a queued `add` re-run, the
+///     coordinator autostart, `zstash`/`zrewind`/hooks, all of which spawn a
+///     zvcs verb;
+///  3. the first executable `git` on `PATH`, last, because on most machines it
+///     is STOCK git: it knows no superset verb, and it takes `.git/index.lock`
+///     with `O_EXCL` and dies on contention instead of waiting. Taking it
+///     first meant an in-shell `git add` that met a status' momentary lock
+///     queued itself as a job that stock git then ran and failed with
+///     `Unable to create '.git/index.lock': File exists`;
+///  4. failing all, `NotFound`, which every caller already handles by
 ///     degrading (no submodule summary, no daemonised credential cache)
 ///     rather than by pretending the child ran.
+///
+/// Steps 2 and 3 skip the host binary itself — it may well BE on `PATH` under
+/// a name that resolves back here, and spawning it would loop.
 ///
 /// Not cached: `PATH` is the host's live environment and a shell changes it.
 pub fn git_exe() -> std::io::Result<PathBuf> {
@@ -117,23 +127,27 @@ pub fn git_exe() -> std::io::Result<PathBuf> {
     }
     let own = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
     let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join("git");
-        if !is_executable(&candidate) {
-            continue;
-        }
-        // The host under another name is not a git to spawn; skipping it is
-        // what keeps a `git` symlink that points back at the host from
-        // re-entering this process's own command line forever.
-        if candidate.canonicalize().ok() == own {
-            continue;
-        }
-        return Ok(candidate);
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "no `git` on PATH to run as a child (set ZVCS_GIT_EXE)",
-    ))
+    spawn_target_on_path(&path, own.as_deref()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no `zvcs` or `git` on PATH to run as a child (set ZVCS_GIT_EXE)",
+        )
+    })
+}
+
+/// Steps 2 and 3 of [`git_exe`]: the first `zvcs` on `path`, else the first
+/// `git`, never one that canonicalizes to `own` (the host binary).
+fn spawn_target_on_path(path: &std::ffi::OsStr, own: Option<&std::path::Path>) -> Option<PathBuf> {
+    ["zvcs", "git"].iter().find_map(|name| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(name))
+            // The host under another name is not a git to spawn; skipping it
+            // is what keeps a `git` symlink that points back at the host from
+            // re-entering this process's own command line forever.
+            .find(|candidate| {
+                is_executable(candidate) && candidate.canonicalize().ok().as_deref() != own
+            })
+    })
 }
 
 /// A path that exists, is a file, and carries an execute bit.
@@ -248,6 +262,33 @@ mod tests {
         assert!(is_executable(&plain));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stock `git` ahead of `zvcs` on `PATH` — the ordinary Homebrew layout —
+    /// must not win: a queued `add` re-run by stock git dies on the very
+    /// `index.lock` it was queued to wait out. The host itself is skipped under
+    /// either name, and with no `zvcs` the first `git` is still a target.
+    #[test]
+    fn a_zvcs_on_path_beats_an_earlier_git() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("zvcs_hosted_spawn_{}", std::process::id()));
+        let (stock, zv) = (root.join("stock"), root.join("zv"));
+        for (dir, name) in [(&stock, "git"), (&zv, "zvcs")] {
+            std::fs::create_dir_all(dir).unwrap();
+            let bin = dir.join(name);
+            std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([&stock, &zv]).unwrap();
+        let zvcs_bin = zv.join("zvcs").canonicalize().unwrap();
+
+        assert_eq!(spawn_target_on_path(&path, None), Some(zv.join("zvcs")));
+        assert_eq!(spawn_target_on_path(&path, Some(&zvcs_bin)), Some(stock.join("git")));
+        let only_stock = std::env::join_paths([&stock]).unwrap();
+        assert_eq!(spawn_target_on_path(&only_stock, None), Some(stock.join("git")));
+        assert_eq!(spawn_target_on_path(std::ffi::OsStr::new(""), None), None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

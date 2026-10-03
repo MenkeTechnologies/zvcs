@@ -946,10 +946,10 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
                 return wrong_argc(1);
             }
             // The three refusals `cmd_config_get()` owns, in its order (:1104-1112).
-            if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
+            if option_given(&table, &opts, "fixed-value") && value_pattern.is_none() {
                 return Some(Err(fatal("--fixed-value only applies with 'value-pattern'")));
             }
-            if default_given(&table, &opts) && (all || url.is_some()) {
+            if option_given(&table, &opts, "default") && (all || url.is_some()) {
                 return Some(Err(fatal("--default= cannot be used with --all or --url=")));
             }
             if url.is_some() && (all || regexp || value_pattern.is_some()) {
@@ -992,7 +992,7 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
             if operands.len() != 2 {
                 return wrong_argc(2);
             }
-            if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
+            if option_given(&table, &opts, "fixed-value") && value_pattern.is_none() {
                 return Some(Err(fatal("--fixed-value only applies with --value=<pattern>")));
             }
             if append && value_pattern.is_some() {
@@ -1017,7 +1017,7 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
             if operands.len() != 1 {
                 return wrong_argc(1);
             }
-            if opts.iter().any(|o| o == "--fixed-value") && value_pattern.is_none() {
+            if option_given(&table, &opts, "fixed-value") && value_pattern.is_none() {
                 return Some(Err(fatal("--fixed-value only applies with 'value-pattern'")));
             }
             out.push(if all { "--unset-all".into() } else { "--unset".into() });
@@ -1343,19 +1343,21 @@ fn subcommand_table(sub: &str) -> SubcommandTable {
     SubcommandTable { long, flags, values, usage }
 }
 
-/// Whether `display_opts.default_value` is set once the passed-through options have
-/// been parsed: the last of `--default <v>`, `--default=<v>` and `--no-default` wins.
-/// The value of an option that takes one is the next element and is skipped, so a
+/// Whether the passed-through options leave `--<name>` set once parsed: the last of
+/// `--<name>`, `--<name>=<v>` and `--no-<name>` wins, as it does for the `OPT_STRING`
+/// behind `--default` and the `OPT_BIT` behind `--fixed-value`. The value of an
+/// option that takes one is the next element and is skipped, so a
 /// `--comment --default` names no default.
-fn default_given(table: &SubcommandTable, opts: &[String]) -> bool {
+fn option_given(table: &SubcommandTable, opts: &[String], name: &str) -> bool {
     let mut given = false;
     let mut i = 0;
     while i < opts.len() {
-        match opts[i].as_str() {
-            "--default" => given = true,
-            "--no-default" => given = false,
-            o if o.starts_with("--default=") => given = true,
-            _ => {}
+        if let Some(body) = opts[i].strip_prefix("--") {
+            if body == name || body.strip_prefix(name).is_some_and(|r| r.starts_with('=')) {
+                given = true;
+            } else if body.strip_prefix("no-") == Some(name) {
+                given = false;
+            }
         }
         if matches!(opts[i].as_str(), "-f" | "--file" | "--blob" | "-t" | "--type" | "--default" | "--comment")
             || short_value_pending(table, &opts[i]).is_some()

@@ -139,3 +139,24 @@ fn an_attached_default_is_refused_with_all() {
     assert_eq!(git(&root, &["config", "get", "--default=d", "--no-default", "--all", "a.b"]).0, "x\n");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `--no-fixed-value` clears the `OPT_BIT` `--fixed-value` set, so the
+/// subcommands' `--fixed-value only applies with …` refusal does not fire; zvcs
+/// refused on any `--fixed-value` it had seen.
+#[test]
+fn no_fixed_value_takes_the_flag_back() {
+    let root = std::env::temp_dir().join(format!("zvcs-config-sub-fixed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "a.b", "x"]);
+    assert_eq!(git(&root, &["config", "get", "--fixed-value", "--no-fixed-value", "a.b"]).0, "x\n");
+    assert_eq!(git(&root, &["config", "set", "--fixed-value", "--no-fixed-value", "a.b", "y"]).2, 0);
+    assert_eq!(git(&root, &["config", "get", "a.b"]).0, "y\n");
+    assert_eq!(git(&root, &["config", "unset", "--fixed-value", "--no-fixed-value", "a.b"]).2, 0);
+    assert_eq!(
+        git(&root, &["config", "get", "--fixed-value", "a.b"]),
+        (String::new(), "fatal: --fixed-value only applies with 'value-pattern'\n".to_string(), 128)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

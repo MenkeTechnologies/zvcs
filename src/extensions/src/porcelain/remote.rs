@@ -38,11 +38,6 @@ use gix::refs::{FullName, Target};
 ///     `fast-forwardable`, `local out of date`, …) needs the remote objects in
 ///     the local object database to run the ahead/behind reachability check,
 ///     which a bare ref advertisement does not provide.
-///   * `rename` in a reftable repository: git 2.56 moves the refs and copies
-///     every reflog entry in one transaction through
-///     `ref_transaction_update_reflog()` (builtin/remote.c:630-756), which the
-///     ref store's transaction API cannot express yet, so the renamed refs lose
-///     their reflogs and a symbolic `HEAD` among them.
 pub fn remote(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut idx = 0;
@@ -1255,7 +1250,19 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     persist(&path, &file)?;
 
     // 2. refs: refuse before touching anything if a destination is occupied.
-    let refs = tracking_refs(repo, old)?;
+    //
+    // A reftable store gets git 2.56's single transaction instead, which the
+    // files emulation below is not (see [`rename_refs_in_one_transaction`]).
+    let reftable = crate::refstore::is_reftable(repo);
+    if reftable {
+        if let Some(code) = rename_refs_in_one_transaction(repo, old, new)? {
+            return Ok(code);
+        }
+    }
+    let refs = match reftable {
+        true => Vec::new(),
+        false => tracking_refs(repo, old)?,
+    };
     let mut moves = Vec::with_capacity(refs.len());
     for (name, target) in refs {
         let text = name.as_bstr().to_str_lossy().into_owned();
@@ -1369,6 +1376,152 @@ fn rename(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     Ok(ExitCode::SUCCESS)
 }
+
+/// `compute_renamed_ref()` (builtin/remote.c:620-628): `name` with the
+/// component after `refs/remotes/` replaced, whatever `name` is.
+fn renamed_ref(name: &str, old: &str, new: &str) -> String {
+    const PREFIX: &str = "refs/remotes/";
+    match name.get(PREFIX.len()..PREFIX.len() + old.len()) {
+        Some(_) => format!("{}{new}{}", &name[..PREFIX.len()], &name[PREFIX.len() + old.len()..]),
+        None => name.to_owned(),
+    }
+}
+
+/// The reference half of `mv()` in git 2.56 (builtin/remote.c:609-756 and
+/// :913-942, :987-995) in a reftable repository: when a fetch refspec of the
+/// remote maps into `refs/remotes/<old>/`, one transaction deletes every
+/// reference there, creates it under the new name without a reflog entry
+/// (`REF_SKIP_CREATE_REFLOG`), and copies its reflog entry by entry with the
+/// original committers (`ref_transaction_update_reflog()`), followed by a
+/// `remote: renamed <old> to <new>` entry — all in iteration order, each
+/// entry under its own index.
+///
+/// `Some(exit code)` when git dies: a prepare it reports as `renaming remote
+/// references failed: <reason>` (with the advice for a name conflict), or a
+/// failed commit.
+fn rename_refs_in_one_transaction(repo: &gix::Repository, old: &str, new: &str) -> Result<Option<ExitCode>> {
+    use gix::refs::file::transaction::{prepare, ErrorKind, ReflogUpdate};
+
+    let context = format!(":refs/remotes/{old}/");
+    let needs_update = repo
+        .config_snapshot()
+        .strings(format!("remote.{old}.fetch").as_str())
+        .unwrap_or_default()
+        .iter()
+        .any(|spec| spec.contains_str(context.as_bytes()));
+    if !needs_update {
+        return Ok(None);
+    }
+
+    let null = repo.object_hash().null();
+    let committer_info = match repo.committer().transpose()? {
+        Some(committer) => {
+            let mut info = Vec::new();
+            committer.trim().write_to(&mut info)?;
+            gix::bstr::BString::from(info)
+        }
+        None => gix::bstr::BString::default(),
+    };
+    let mut edits = Vec::new();
+    let mut skip_create_reflog = Vec::new();
+    let mut reflogs = Vec::new();
+    let mut index = 0u64;
+    for (name, target) in tracking_refs(repo, old)? {
+        let text = name.as_bstr().to_str_lossy().into_owned();
+        let new_name = full_name(&renamed_ref(&text, old, new))?;
+        let (expected, new_target, oid) = match target {
+            Target::Symbolic(referent) => {
+                let renamed = full_name(&renamed_ref(&referent.as_bstr().to_str_lossy(), old, new))?;
+                (Target::Symbolic(referent), Target::Symbolic(renamed), None)
+            }
+            Target::Object(id) => (Target::Object(id), Target::Object(id), Some(id)),
+        };
+        edits.push(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::MustExistAndMatch(expected),
+                log: RefLog::AndReference,
+                message: Default::default(),
+            },
+            name: name.clone(),
+            deref: false,
+        });
+        skip_create_reflog.push(edits.len());
+        edits.push(RefEdit {
+            change: Change::Update {
+                log: LogChange::default(),
+                expected: PreviousValue::MustNotExist,
+                new: new_target,
+            },
+            name: new_name.clone(),
+            deref: false,
+        });
+        // `rename_one_reflog()`.
+        if !crate::refstore::reflog_exists(repo, &text) {
+            continue;
+        }
+        for log in super::refs_migrate::reftable_reflog(repo, &text, &mut index)? {
+            reflogs.push(ReflogUpdate {
+                name: new_name.clone(),
+                old_oid: log.old,
+                new_oid: log.new,
+                committer_info: log.committer_info().into(),
+                message: log.message.as_str().into(),
+                index: log.index,
+            });
+        }
+        let id = oid.unwrap_or(null);
+        reflogs.push(ReflogUpdate {
+            name: new_name.clone(),
+            old_oid: id,
+            new_oid: id,
+            committer_info: committer_info.clone(),
+            message: format!("remote: renamed {text} to {}", new_name.as_bstr()).into(),
+            index,
+        });
+        index += 1;
+    }
+
+    let fail = gix::lock::acquire::Fail::Immediately;
+    let prepared = match repo
+        .refs
+        .transaction()
+        .skip_create_reflog(skip_create_reflog)
+        .update_reflogs(reflogs)
+        .prepare(edits, fail, fail)
+    {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            let (message, conflict) = match &e {
+                prepare::Error::Reftable { kind, message } => (message.to_string(), *kind == ErrorKind::NameConflict),
+                other => (other.to_string(), false),
+            };
+            eprintln!("error: renaming remote references failed: {message}");
+            if conflict {
+                crate::advice::print_hint(CONFLICTING_REMOTE_REFS_ADVICE);
+            }
+            return Ok(Some(ExitCode::from(128)));
+        }
+    };
+    let committer = repo.committer().transpose()?;
+    if prepared.commit(committer).is_err() {
+        // `die(_("renaming remote refs failed: %s"), rename.err->buf)`: the
+        // buffer is the one queueing used, which holds nothing.
+        eprintln!("fatal: renaming remote refs failed: ");
+        return Ok(Some(ExitCode::from(128)));
+    }
+    Ok(None)
+}
+
+/// `conflicting_remote_refs_advice` (builtin/remote.c:847-854).
+const CONFLICTING_REMOTE_REFS_ADVICE: &str = "\
+The remote you are trying to rename has conflicting references in the
+new target refspec. This is most likely caused by you trying to nest
+a remote into itself, e.g. by renaming 'parent' into 'parent/child'
+or by unnesting a remote, e.g. the other way round.
+
+If that is the case, you can address this by first renaming the
+remote to a different name.
+";
 
 // ---------------------------------------------------------------------------
 // remote remove

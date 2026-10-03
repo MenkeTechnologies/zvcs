@@ -44,18 +44,28 @@ struct Ref {
     value: gix::refs::Target,
 }
 
-/// One reflog entry, as `migrate_one_reflog_entry()` hands it to
+/// One reflog entry, as `migrate_one_reflog_entry()` and
+/// `rename_one_reflog_entry()` (builtin/remote.c:630-670) hand it to
 /// `ref_transaction_update_reflog()`.
-struct Log {
-    refname: BString,
-    old: gix::ObjectId,
-    new: gix::ObjectId,
+pub(super) struct Log {
+    pub refname: BString,
+    pub old: gix::ObjectId,
+    pub new: gix::ObjectId,
     name: BString,
     email: BString,
     time: u64,
     tz_offset: i16,
-    message: String,
-    index: u64,
+    pub message: String,
+    pub index: u64,
+}
+
+impl Log {
+    /// The `committer_info` the entry is written with,
+    /// `fmt_ident(name, mail, WANT_BLANK_IDENT, show_date(…, DATE_MODE(NORMAL)), 0)`
+    /// as the backend reads it back: `Name <email> <seconds> <+|-HHMM>`.
+    pub(super) fn committer_info(&self) -> String {
+        format!("{} <{}> {} {:+05}", self.name, self.email, self.time, self.tz_offset)
+    }
 }
 
 /// Migrate `repo` to the ref storage format `to`, which it does not use yet.
@@ -328,30 +338,7 @@ fn collect_logs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Log>> {
         let mut out = Vec::new();
         let mut index = 0u64;
         for refname in crate::refstore::reflog_names(repo, false)? {
-            let refname = refname.to_str_lossy().into_owned();
-            crate::refstore::for_each_reflog_entry(repo, &refname, false, |e| {
-                let message = e.message.strip_suffix(b"\n").unwrap_or(&e.message);
-                let mut line = format!(
-                    "{} {} {} {} {}{:04}",
-                    e.old_oid,
-                    e.new_oid,
-                    e.committer,
-                    e.timestamp,
-                    if e.tz < 0 { '-' } else { '+' },
-                    e.tz.abs()
-                )
-                .into_bytes();
-                if !message.is_empty() {
-                    line.push(b'\t');
-                    line.extend_from_slice(message);
-                }
-                line.push(b'\n');
-                if let Some(log) = parse_reflog_line(repo, &refname, &line, index) {
-                    out.push(log);
-                    index += 1;
-                }
-                std::ops::ControlFlow::Continue(())
-            })?;
+            out.extend(reftable_reflog(repo, &refname.to_str_lossy(), &mut index)?);
         }
         return Ok(out);
     }
@@ -369,6 +356,38 @@ fn collect_logs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Log>> {
             }
         }
     }
+    Ok(out)
+}
+
+/// `refs_for_each_reflog_ent()` over the reflog of `refname` in a reftable
+/// store, each entry as `migrate_one_reflog_entry()` makes it, taking `index`
+/// and the next ones. Each entry is read back through the parser a files line
+/// takes, which turns the identity into what `fmt_ident()` would.
+pub(super) fn reftable_reflog(repo: &gix::Repository, refname: &str, index: &mut u64) -> Result<Vec<Log>> {
+    let mut out = Vec::new();
+    crate::refstore::for_each_reflog_entry(repo, refname, false, |e| {
+        let message = e.message.strip_suffix(b"\n").unwrap_or(&e.message);
+        let mut line = format!(
+            "{} {} {} {} {}{:04}",
+            e.old_oid,
+            e.new_oid,
+            e.committer,
+            e.timestamp,
+            if e.tz < 0 { '-' } else { '+' },
+            e.tz.abs()
+        )
+        .into_bytes();
+        if !message.is_empty() {
+            line.push(b'\t');
+            line.extend_from_slice(message);
+        }
+        line.push(b'\n');
+        if let Some(log) = parse_reflog_line(repo, refname, &line, *index) {
+            out.push(log);
+            *index += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    })?;
     Ok(out)
 }
 

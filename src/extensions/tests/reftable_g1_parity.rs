@@ -421,3 +421,23 @@ fn stubs_read_as_broken_refs_without_ref_storage() {
         ],
     );
 }
+
+/// `remote rename` moves the remote's references in one transaction that
+/// copies every reflog entry with its own committer and index
+/// (`ref_transaction_update_reflog()`, builtin/remote.c:630-756), so the
+/// renamed references keep their reflogs; a destination that exists fails
+/// the prepare.
+#[test]
+fn remote_rename_keeps_the_reflogs() {
+    let Some(case) = Case::new("remote") else { return };
+    let setup: &[&[&str]] = &[
+        &["remote", "add", "origin", "."],
+        &["fetch", "-q", "origin"],
+        &["remote", "set-head", "origin", "main"],
+        &["update-ref", "-m", "again", "refs/remotes/origin/side", "HEAD~"],
+    ];
+    case.compare(Fixture::R, setup, "R", &[cmd(&["remote", "rename", "origin", "up"])]);
+    case.compare(Fixture::R, setup, "R", &[cmd(&["remote", "rename", "origin", "origin/x"])]);
+    let occupied: Vec<&[&str]> = setup.iter().copied().chain([&["update-ref", "refs/remotes/up/main", "HEAD"][..]]).collect();
+    case.compare(Fixture::R, &occupied, "R", &[cmd(&["remote", "rename", "origin", "up"])]);
+}

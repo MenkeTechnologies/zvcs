@@ -1920,13 +1920,18 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                     // which the `edit_reference` above already produced — and then
                     // `refs_update_symref("HEAD", <branch>)`, appended here. Both carry
                     // the same message, so an unmoved branch still gains two identical
-                    // `logs/HEAD` lines. Verified against stock 2.55.0.
-                    super::checkout::append_head_log(
-                        &repo,
-                        Some(head_oid),
-                        Some(head_oid),
-                        &message,
-                    );
+                    // `logs/HEAD` lines. Verified against stock 2.55.0. The reftable
+                    // backend logs both itself, the second through the real symref update.
+                    if crate::refstore::is_reftable(&repo) {
+                        update_head_symref(&repo, name.clone(), &message)?;
+                    } else {
+                        super::checkout::append_head_log(
+                            &repo,
+                            Some(head_oid),
+                            Some(head_oid),
+                            &message,
+                        );
+                    }
                 } else {
                     // Detached (`<branch>` named a commit-ish rather than a local
                     // branch, so `options.head_name` is NULL and `reset_head()` gets
@@ -2569,7 +2574,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             // The vendored `gix-ref` writes no reflog line for a symbolic-target
             // update, so `HEAD`'s own log would lose the entry git ends every
             // rebase with — the same compensation `checkout` makes.
-            super::checkout::record_head_move(&repo, Some(tip), Some(tip), &message);
+            if !crate::refstore::is_reftable(&repo) {
+                super::checkout::record_head_move(&repo, Some(tip), Some(tip), &message);
+            }
             name
         }
         None => "detached HEAD".to_string(),
@@ -4422,7 +4429,9 @@ fn move_to_original_branch(
     })?;
     let message = format!("{} (finish): returning to {name}", reflog_action());
     set_head(repo, Target::Symbolic(full), &message)?;
-    super::checkout::record_head_move(repo, Some(tip), Some(tip), &message);
+    if !crate::refstore::is_reftable(repo) {
+        super::checkout::record_head_move(repo, Some(tip), Some(tip), &message);
+    }
     Ok(())
 }
 
@@ -7023,7 +7032,9 @@ impl<'r> Sequencer<'r> {
             // The vendored `gix-ref` writes no reflog line for a symbolic-target
             // update, so `HEAD`'s own log would lose the entry git ends every
             // rebase with — the same compensation `checkout` makes.
-            super::checkout::record_head_move(repo, Some(tip), Some(tip), &message);
+            if !crate::refstore::is_reftable(repo) {
+                super::checkout::record_head_move(repo, Some(tip), Some(tip), &message);
+            }
             label
         } else {
             "detached HEAD".to_string()
@@ -7376,7 +7387,30 @@ fn set_head(repo: &gix::Repository, target: Target, message: &str) -> Result<()>
         name: full_name("HEAD")?,
         deref: false,
     })?;
-    super::checkout::record_head_move(repo, from, to, message);
+    // The reftable backend writes `HEAD`'s entry itself, symbolic target and
+    // resolved old value included (refs/reftable-backend.c:1560-1600).
+    if !crate::refstore::is_reftable(repo) {
+        super::checkout::record_head_move(repo, from, to, message);
+    }
+    Ok(())
+}
+
+/// `refs_update_symref(…, "HEAD", <branch>, msg)` in a reftable repository,
+/// where the store logs the update itself.
+fn update_head_symref(repo: &gix::Repository, branch: gix::refs::FullName, message: &str) -> Result<()> {
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: message.into(),
+            },
+            expected: PreviousValue::Any,
+            new: Target::Symbolic(branch),
+        },
+        name: full_name("HEAD")?,
+        deref: false,
+    })?;
     Ok(())
 }
 

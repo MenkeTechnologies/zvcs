@@ -1522,6 +1522,32 @@ pub fn write_state_oid(repo: &gix::Repository, name: &str, id: ObjectId, msg: &s
     crate::refstore::state_ref_write(repo, name, &crate::refstore::StateRef::Object(id), msg)
 }
 
+/// `refs_update_ref(…, msg, "HEAD", id, NULL, 0, …)` in a reftable repository,
+/// for the callers whose files-backend path appends the `HEAD` reflog line by
+/// hand because the update moves nothing.
+///
+/// The reftable backend logs it itself: a `HEAD` that points at a branch gets a
+/// log-only entry and the unchanged branch is skipped
+/// (refs/reftable-backend.c:1206-1225, 1295-1309); a detached `HEAD` already at
+/// `id` is a no-op that writes nothing.
+pub fn update_head_reftable(repo: &gix::Repository, id: ObjectId, msg: &str) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: msg.into(),
+            },
+            expected: PreviousValue::Any,
+            new: gix::refs::Target::Object(id),
+        },
+        name: "HEAD".try_into()?,
+        deref: true,
+    })?;
+    Ok(())
+}
+
 /// `refs_delete_ref(…, REF_NO_DEREF)` for a root-level pseudo-ref, reporting
 /// whether it had existed.
 ///

@@ -1657,8 +1657,12 @@ fn abort() -> Result<ExitCode> {
     // `record_head_move`'s replace-the-identical-tail rule would instead eat the
     // line an *earlier* `merge --abort` left behind. `log_ref_write_fd()` appends
     // unconditionally, so aborting twice leaves two `reset: moving to HEAD`
-    // entries.
-    super::checkout::append_head_log(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
+    // entries. The reftable backend writes its own entry for the update.
+    if crate::refstore::is_reftable(&repo) {
+        crate::sequencer::update_head_reftable(&repo, head_id, "reset: moving to HEAD")?;
+    } else {
+        super::checkout::append_head_log(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
+    }
     remove_merge_state(&repo, true);
     // `apply_autostash_oid(stash_oid_hex)` (builtin/merge.c:1438-1441).
     if let Some(id) = stash {

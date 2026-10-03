@@ -554,12 +554,17 @@ fn verify(args: &[String]) -> Result<ExitCode> {
     // `<file> is okay` with `fprintf(stderr, …)` (builtin/bundle.c:161), so off
     // a terminal the listing reaches the fd at `exit()`, after that line.
     crate::cstdio::defer();
+    // `if (!startup_info->have_repository)` (builtin/bundle.c) is asked before
+    // `open_bundle()`, and is an `error()`, not a `die()`: exit 1.
+    let Ok(repo) = crate::setup::discover() else {
+        eprintln!("error: need a repository to verify a bundle");
+        return Ok(ExitCode::from(1));
+    };
     let header = match read_header(file) {
         Ok(h) => h,
         Err(e) => return report(file, e),
     };
 
-    let repo = crate::setup::discover()?;
 
     if !report_missing_prereqs(&repo, &header, quiet) {
         return Ok(ExitCode::from(1));
@@ -808,7 +813,11 @@ fn create(args: &[String]) -> Result<ExitCode> {
         rev_args = kept;
     }
 
-    let repo = crate::setup::discover()?;
+    // git's `if (!startup_info->have_repository) die(...)`, which exits 128.
+    let Ok(repo) = crate::setup::discover() else {
+        eprintln!("fatal: Need a repository to create a bundle.");
+        return Ok(ExitCode::from(128));
+    };
     let (pending, pathspecs) = match resolve_revisions(&repo, &rev_args)? {
         Ok(p) => p,
         Err(code) => return Ok(code),

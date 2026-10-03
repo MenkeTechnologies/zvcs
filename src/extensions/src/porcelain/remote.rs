@@ -78,12 +78,16 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
     }
     let rest = &args[idx..];
 
-    let repo = match crate::setup::discover() {
+    let mut repo = match crate::setup::discover() {
         Ok(repo) => repo,
         Err(_) => {
             return fatal("not a git repository (or any of the parent directories): .git");
         }
     };
+    // `rename` and `set-head` write reflog lines; git signs those with
+    // `git_committer_info(0)`, which falls back to the system identity
+    // instead of refusing as a commit would.
+    crate::ensure_reflog_identity(&mut repo);
 
     match rest.first().map(String::as_str) {
         None => {

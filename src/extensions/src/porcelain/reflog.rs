@@ -740,13 +740,14 @@ pub(super) fn reflog_delete(
         eprintln!("error: no reflog for '{spec}'");
         return Ok(false);
     };
-    // `strtoul(spec + 2, &ep, 10)`: leading digits, and `*ep == '}'` is what says
-    // the whole selector was the number. `count_reflog_ent()` then counts the
-    // entries `refs_for_each_reflog_ent()` yields: all of them for `@{<n>}`
-    // (`opts.recno = -recno` then one `++` each), or those older than the date.
+    // `strtoul(spec + 2, &ep, 10)`: leading digits, and `*ep == '}'` — the one
+    // character after them, whatever follows the brace — says it was a number.
+    // `count_reflog_ent()` then counts the entries `refs_for_each_reflog_ent()`
+    // yields: all of them for `@{<n>}` (`opts.recno = -recno` then one `++`
+    // each), or those older than the date.
     let tail = &spec[at + 2..];
     let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let older_than = (tail[digits..] != *"}").then(|| crate::date::approxidate(tail));
+    let older_than = (!tail[digits..].starts_with('}')).then(|| crate::date::approxidate(tail));
     let mut recno: i64 = match older_than {
         None => -tail[..digits].parse::<i64>().unwrap_or(0),
         Some(_) => 0,

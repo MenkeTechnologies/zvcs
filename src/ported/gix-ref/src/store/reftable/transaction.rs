@@ -1133,7 +1133,7 @@ impl Backend {
                         value: LogValue::Update(LogUpdate {
                             new_hash: hash_of(&new_oid),
                             old_hash: hash_of(current_oid),
-                            message: message.into(),
+                            message: Some(message.into()),
                             ..log_update(committer)
                         }),
                     });

@@ -136,7 +136,7 @@ fn dump_log(stack: &Stack, refname: &str) -> Vec<String> {
     let mut out = Vec::new();
     while it.next_log(&mut l).unwrap() && l.refname == refname {
         let Some(u) = l.update() else { continue };
-        out.push(format!("{} {} {}", hex(&u.old_hash[..20]), hex(&u.new_hash[..20]), u.message));
+        out.push(format!("{} {} {}", hex(&u.old_hash[..20]), hex(&u.new_hash[..20]), String::from_utf8_lossy(u.message_or_empty())));
     }
     out
 }
@@ -294,7 +294,7 @@ fn log_update(new: &str, message: &str, time: u64) -> LogValue {
         email: "committer@example.com".into(),
         time,
         tz_offset: -700,
-        message: message.into(),
+        message: Some(message.into()),
     })
 }
 
@@ -569,4 +569,62 @@ fn sha256_tables() {
         Stack::new(&repo.dir.join(".git/reftable"), &StackOptions::default()).is_err(),
         "a SHA-1 stack refuses SHA-256 tables"
     );
+}
+
+/// The placeholder `reflog expire --expire=all` leaves in an emptied reflog
+/// has a `NULL` message (`write_reflog_expiry_table()`,
+/// refs/reftable-backend.c:2548-2560), which `reftable_writer_add_log()`
+/// (reftable/writer.c:441-497) stores as the empty string without the newline
+/// every other message gets. Re-writing git's expiry table with that record's
+/// message as `None` reproduces its bytes; as `Some("")` it is `"\n"`.
+#[test]
+fn a_missing_log_message_is_stored_empty() {
+    let Some(repo) = Repo::new() else { return };
+    repo.commit("one");
+    repo.commit("two");
+    let out = Command::new(&repo.git)
+        .args(["reflog", "expire", "--expire=all", "refs/heads/main"])
+        .current_dir(&repo.dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", repo._tmp.path())
+        .env("GIT_TEST_REFTABLE_AUTOCOMPACTION", "false")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let name = repo.table_files().pop().unwrap();
+    let original = std::fs::read(repo.dir.join(".git/reftable").join(&name)).unwrap();
+    let table = Table::new(gix_reftable::blocksource::BlockSource::from_buf(original.clone()), &name).unwrap();
+    let mut logs = Vec::new();
+    let mut it = table.log_iterator();
+    it.seek_log(b"").unwrap();
+    let mut l = LogRecord::default();
+    while it.next_log(&mut l).unwrap() {
+        logs.push(l.clone());
+    }
+    let is_marker = |u: &LogUpdate| u.old_hash == [0; 32] && u.new_hash == [0; 32];
+    let marker = logs
+        .iter()
+        .filter_map(LogRecord::update)
+        .find(|u| is_marker(u))
+        .expect("the emptied reflog keeps a placeholder");
+    assert_eq!(marker.message.as_ref().map(|m| m.len()), Some(0), "read back, the message is empty");
+
+    let rewrite = |message: Option<&str>| {
+        let mut logs = logs.clone();
+        for log in &mut logs {
+            if let LogValue::Update(u) = &mut log.value {
+                if is_marker(u) {
+                    u.message = message.map(Into::into);
+                }
+            }
+        }
+        let mut w = Writer::new(Vec::new(), table.hash_id(), &WriteOptions::default()).unwrap();
+        w.set_limits(table.min_update_index(), table.max_update_index()).unwrap();
+        w.add_logs(&mut logs).unwrap();
+        w.close().unwrap();
+        w.into_sink()
+    };
+    assert!(rewrite(None) == original, "NULL is stored as git stores it");
+    assert!(rewrite(Some("")) != original, "an empty message gets its newline");
 }

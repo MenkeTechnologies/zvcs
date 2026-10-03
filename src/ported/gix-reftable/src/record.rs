@@ -306,8 +306,20 @@ pub struct LogUpdate {
     pub time: u64,
     /// The timezone offset as `HHMM`, signed.
     pub tz_offset: i16,
-    /// The reflog message.
-    pub message: BString,
+    /// The reflog message. `None` is C's `NULL`, the message of the reflog
+    /// existence marker: it is stored as the empty string and, unlike every
+    /// other message, gets no trailing newline from
+    /// [`Writer::add_log()`](crate::Writer::add_log). A record read back has
+    /// `Some`, the empty string included.
+    pub message: Option<BString>,
+}
+
+impl LogUpdate {
+    /// The message, the empty string for `None`, as `null_streq()`
+    /// (`record.c:961-971`) and the encoder (`record.c:816`) see it.
+    pub fn message_or_empty(&self) -> &[u8] {
+        self.message.as_ref().map_or(&[], |m| m.as_slice())
+    }
 }
 
 /// `value_type` plus `value` of `struct reftable_log_record`.
@@ -357,7 +369,7 @@ impl LogRecord {
                     && a.time == b.time
                     && a.tz_offset == b.tz_offset
                     && a.email == b.email
-                    && a.message == b.message
+                    && a.message_or_empty() == b.message_or_empty()
                     && a.old_hash[..hash_size] == b.old_hash[..hash_size]
                     && a.new_hash[..hash_size] == b.new_hash[..hash_size]
             }
@@ -404,7 +416,7 @@ impl LogRecord {
         s[pos..pos + 2].copy_from_slice(&(u.tz_offset as u16).to_be_bytes());
         pos += 2;
 
-        pos += encode_string(&u.message, &mut s[pos..])?;
+        pos += encode_string(u.message_or_empty(), &mut s[pos..])?;
         Ok(pos)
     }
 
@@ -456,8 +468,9 @@ impl LogRecord {
         pos += 2;
 
         pos += decode_string(scratch, &input[pos..]).ok_or(Error::Format)?;
-        u.message.clear();
-        u.message.extend_from_slice(scratch);
+        let message = u.message.get_or_insert_with(BString::default);
+        message.clear();
+        message.extend_from_slice(scratch);
         Ok(pos)
     }
 }

@@ -428,7 +428,7 @@ fn commit_initial(
                         time: l.time,
                         tz_offset: l.tz_offset,
                         // `xstrndup(u->msg, block_size / 2)`.
-                        message: l.message.as_bytes()[..l.message.len().min(limit)].into(),
+                        message: Some(l.message.as_bytes()[..l.message.len().min(limit)].into()),
                     }),
                 })
                 .collect();

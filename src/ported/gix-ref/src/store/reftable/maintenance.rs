@@ -14,24 +14,17 @@
 //! passes to `error()`; callers print it as `error: <message>`. An
 //! [`Error::Reftable`] is a library error git returns without printing anything.
 //!
-//! # Reflog records without a message
-//!
 //! The reflog existence marker and the placeholder written when expiry
-//! leaves a reflog empty are records whose message is a C `NULL`, which the
-//! writer stores as the empty string, while any other message gets a trailing
-//! newline (`reftable_writer_add_log()`, reftable/writer.c:441-497).
-//! [`gix_reftable::LogUpdate::message`] cannot be `NULL`, so tables holding such
-//! records are written with [`WriteOptions::exact_log_message`] and the message
-//! of every other record is cleaned here exactly as the writer would have
-//! ([`clean_log_message()`]). Auto-compaction after the commit runs with the
-//! configured options, as git's does.
+//! leaves a reflog empty are records without a message, C's `NULL`, which
+//! the writer stores as the empty string while any other message gets a
+//! trailing newline (`reftable_writer_add_log()`, reftable/writer.c:441-497).
 
 use std::{fmt::Write as _, path::Path, sync::Arc};
 
 use gix_hash::{ObjectId, oid};
 use gix_object::bstr::{BStr, BString, ByteSlice};
 use gix_reftable::{
-    LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, WriteOptions, Writer, record::Hash, stack::TableFile,
+    LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, Writer, record::Hash, stack::TableFile,
 };
 
 use super::{Backend, Error, StackRef, WorktreeType, lock, parse_worktree_ref};
@@ -133,48 +126,6 @@ fn is_null(h: &Hash, hash_len: usize) -> bool {
     h[..hash_len].iter().all(|&b| b == 0)
 }
 
-/// What `reftable_writer_add_log()` (reftable/writer.c:466-490) makes of a
-/// message unless `exact_log_message` is set: trailing newlines become exactly
-/// one, and a message of several lines is a misuse of the API.
-fn clean_log_message(message: &BStr) -> Result<BString, gix_reftable::Error> {
-    let mut msg = message.to_vec();
-    while msg.last() == Some(&b'\n') {
-        msg.pop();
-    }
-    // `strchr()` stops at a NUL, so a newline after one goes unnoticed.
-    let visible = msg.find_byte(0).map_or(&msg[..], |n| &msg[..n]);
-    if visible.contains(&b'\n') {
-        return Err(gix_reftable::Error::Api);
-    }
-    msg.push(b'\n');
-    Ok(msg.into())
-}
-
-/// The options of an addition writing records without a message (see the
-/// module docs): verbatim messages, and no auto-compaction on commit as that
-/// has to use `opts` itself.
-fn verbatim_options(opts: &WriteOptions) -> WriteOptions {
-    WriteOptions {
-        exact_log_message: true,
-        disable_auto_compact: true,
-        ..opts.clone()
-    }
-}
-
-/// The tail of `reftable_addition_commit()` (reftable/stack.c:831-844) for an
-/// addition made with [`verbatim_options()`] that committed a table:
-/// auto-compact with the configured `opts`, ignoring the benign lock and
-/// outdated errors of a concurrent writer.
-fn auto_compact_after_commit(st: &mut Stack, opts: &WriteOptions) -> Result<(), gix_reftable::Error> {
-    if opts.disable_auto_compact {
-        return Ok(());
-    }
-    match st.auto_compact(Some(opts)) {
-        Ok(()) | Err(gix_reftable::Error::Lock | gix_reftable::Error::Outdated) => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
 /// `xstrndup(msg, n)`: at most `n` bytes of `msg`, ending early at a NUL.
 fn strndup(msg: &BStr, n: usize) -> BString {
     let msg = msg.find_byte(0).map_or(msg.as_bytes(), |nul| &msg[..nul]);
@@ -225,7 +176,8 @@ fn committer_log_update(committer: &gix_actor::SignatureRef<'_>) -> LogUpdate {
 fn log_line(u: &LogUpdate, hash_len: usize) -> crate::log::Line {
     let tz = i32::from(u.tz_offset);
     let offset = tz.signum() * ((tz.abs() / 100) * 3600 + (tz.abs() % 100) * 60);
-    let message = u.message.strip_suffix(b"\n").unwrap_or(&u.message);
+    let message = u.message_or_empty();
+    let message = message.strip_suffix(b"\n").unwrap_or(message);
     crate::log::Line {
         previous_oid: oid_of(&u.old_hash, hash_len),
         new_oid: oid_of(&u.new_hash, hash_len),
@@ -404,8 +356,7 @@ impl Backend {
         let opts = self.write_config().opts.clone();
         let mut st = lock(&stack);
 
-        let mut wrote = false;
-        let mut add = st.addition_new(Some(&verbatim_options(&opts)))?;
+        let mut add = st.addition_new(Some(&opts))?;
         add.add(&st, |wr, st| {
             let ts = st.next_update_index();
             if st.read_log(refname)?.is_some() {
@@ -417,13 +368,11 @@ impl Backend {
                 update_index: ts,
                 value: LogValue::Update(LogUpdate::default()),
             })?;
-            wrote = true;
             Ok(())
         })?;
+        // Without a table, which an existing reflog leaves, there is nothing to
+        // commit or compact.
         add.commit(&mut st)?;
-        if wrote {
-            auto_compact_after_commit(&mut st, &opts)?;
-        }
         Ok(())
     }
 
@@ -481,7 +430,7 @@ impl Backend {
         let hash_len = self.hash_len();
         let mut st = lock(&stack);
 
-        let mut add = st.addition_new(Some(&verbatim_options(&opts)))?;
+        let mut add = st.addition_new(Some(&opts))?;
         let res = (|| -> Result<bool, Error> {
             let mut it = st.log_iterator()?;
             let positioned = it.seek_log(refname)?;
@@ -553,7 +502,6 @@ impl Backend {
         res?;
         if !flags.dry_run {
             add.commit(&mut st)?;
-            auto_compact_after_commit(&mut st, &opts)?;
         }
         Ok(())
     }
@@ -932,10 +880,7 @@ fn write_reflog_expiry_table(
         })?;
     }
 
-    for mut record in records {
-        if let LogValue::Update(u) = &mut record.value {
-            u.message = clean_log_message(u.message.as_bstr())?;
-        }
+    for record in records {
         wr.add_log(&record)?;
     }
     Ok(())
@@ -1008,7 +953,7 @@ impl CopyArg<'_> {
             value: LogValue::Update(LogUpdate {
                 old_hash,
                 new_hash,
-                message: self.logmsg.clone(),
+                message: Some(self.logmsg.clone()),
                 ..self.committer.clone()
             }),
         };

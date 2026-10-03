@@ -178,7 +178,7 @@ impl Backend {
             timestamp: update.time,
             tz: i32::from(update.tz_offset),
             // A C string: whatever follows a NUL is not seen.
-            message: update.message.split(|&c| c == 0).next().unwrap_or_default().into(),
+            message: update.message_or_empty().split(|&c| c == 0).next().unwrap_or_default().into(),
         })
     }
 

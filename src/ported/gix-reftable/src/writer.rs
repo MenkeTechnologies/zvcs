@@ -320,7 +320,8 @@ impl<S: Sink> Writer<S> {
 
     /// `reftable_writer_add_log()` (`writer.c:441-497`). Unless
     /// [`WriteOptions::exact_log_message`] is set, the message must be a single
-    /// line; trailing newlines are normalized to exactly one.
+    /// line; trailing newlines are normalized to exactly one. A message that
+    /// is `None`, C's `NULL`, is stored as the empty string as it is.
     pub fn add_log(&mut self, log: &LogRecord) -> Result<()> {
         let LogValue::Update(update) = &log.value else {
             return self.add_log_verbatim(log);
@@ -332,10 +333,10 @@ impl<S: Sink> Writer<S> {
             return Err(Error::Api);
         }
 
-        if self.opts.exact_log_message {
+        let Some(message) = update.message.as_ref().filter(|_| !self.opts.exact_log_message) else {
             return self.add_log_verbatim(log);
-        }
-        let mut msg = update.message.to_vec();
+        };
+        let mut msg = message.to_vec();
         while msg.last() == Some(&b'\n') {
             msg.pop();
         }
@@ -348,7 +349,7 @@ impl<S: Sink> Writer<S> {
 
         let mut cleaned = log.clone();
         if let LogValue::Update(u) = &mut cleaned.value {
-            u.message = msg.into();
+            u.message = Some(msg.into());
         }
         self.add_log_verbatim(&cleaned)
     }

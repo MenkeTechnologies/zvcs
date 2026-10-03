@@ -2823,11 +2823,73 @@ pub(crate) fn command_line_include_condition(cond: &str) -> Result<bool, String>
     }
     if let Some(pattern) = cond.strip_prefix("onbranch:") {
         let Some(dirs) = repository_directories() else { return Ok(false) };
-        let head = std::fs::read_to_string(dirs.git_dir.join("HEAD")).unwrap_or_default();
-        let Some(short) = head.trim_end().strip_prefix("ref: refs/heads/") else { return Ok(false) };
-        return Ok(matches(&complete(pattern.to_owned()), std::path::Path::new(short), false));
+        let branch = match reftable_head_branch(&dirs) {
+            Some(branch) => branch,
+            None => {
+                let head = std::fs::read_to_string(dirs.git_dir.join("HEAD")).unwrap_or_default();
+                head.trim_end().strip_prefix("ref: refs/heads/").map(str::to_owned)
+            }
+        };
+        let Some(short) = branch else { return Ok(false) };
+        return Ok(matches(&complete(pattern.to_owned()), std::path::Path::new(&short), false));
     }
     Ok(cond.starts_with("hasconfig:remote.*.url:"))
+}
+
+/// `include_by_branch()`'s read of `HEAD` (config.c:305-310, git 2.56) in a
+/// repository whose references live in reftables, or `None` for any other
+/// repository.
+///
+/// ```c
+/// refname = refs_resolve_ref_unsafe(get_main_ref_store(data->repo),
+///                                   "HEAD", 0, NULL, &flags);
+/// if (!refname || !(flags & REF_ISSYMREF) ||
+///     !skip_prefix(refname, "refs/heads/", &shortname))
+///         return 0;
+/// ```
+///
+/// The `HEAD` file of such a repository is the stub `ref: refs/heads/.invalid`
+/// (refs.c:2199-2220), so the branch has to come from the backend. Without
+/// `RESOLVE_REF_READING` the chain may end at a reference that does not exist
+/// (an unborn branch); it is followed for at most `SYMREF_MAXDEPTH` hops. The
+/// inner `Option` is the branch's short name, `None` where git returns 0.
+///
+/// The repository is opened isolated: the command line's configuration is
+/// what is being read, and the reference store does not depend on it.
+fn reftable_head_branch(dirs: &RepositoryDirs) -> Option<Option<String>> {
+    let bytes = std::fs::read(dirs.common_dir.join("config")).ok()?;
+    let file = gix::config::File::from_bytes_no_includes(
+        &bytes,
+        gix::config::file::Metadata::from(gix::config::Source::Local),
+        Default::default(),
+    )
+    .ok()?;
+    // `extensions.refStorage` counts only at repository format version 1.
+    let version = file.integer("core.repositoryformatversion").ok().flatten().unwrap_or(0);
+    if version < 1 || file.string("extensions.refstorage").is_none_or(|v| v.as_slice() != b"reftable") {
+        return None;
+    }
+    let Ok(repo) = gix::open_opts(&dirs.git_dir, gix::open::Options::isolated()) else {
+        return Some(None);
+    };
+    // git's `SYMREF_MAXDEPTH`.
+    const MAX_DEPTH: usize = 5;
+    let mut name = String::from("HEAD");
+    let mut is_symref = false;
+    for _ in 0..MAX_DEPTH {
+        let found = repo.refs.try_find(name.as_str()).ok().flatten();
+        match found.filter(|r| r.name.as_bstr() == name.as_str()).map(|r| r.target) {
+            Some(gix::refs::Target::Symbolic(next)) => {
+                is_symref = true;
+                name = next.as_bstr().to_string();
+            }
+            _ => {
+                let short = name.strip_prefix("refs/heads/").filter(|_| is_symref);
+                return Some(short.map(str::to_owned));
+            }
+        }
+    }
+    Some(None)
 }
 
 /// Locate the repository without opening it — opening is what fails when the

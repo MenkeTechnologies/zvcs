@@ -6,6 +6,7 @@ use gix::bstr::{BStr, ByteSlice};
 use gix::hash::ObjectId;
 use gix::prelude::ObjectIdExt;
 use gix::refs::FullName;
+use crate::refstore::StateRef;
 
 /// `git worktree` — inspect and lock the working trees attached to a repository.
 ///
@@ -57,7 +58,9 @@ use gix::refs::FullName;
 ///
 /// `add` reproduces `add_worktree()`: the administrative directory under
 /// `worktrees/<id>` (`HEAD`, `commondir`, `gitdir`, `ORIG_HEAD`, `index`,
-/// `logs/HEAD`, `refs/`), the `<path>/.git` gitfile pointing back at it, and the
+/// `logs/HEAD`, `refs/`; in a reftable repository the worktree's own `reftable/`
+/// stack holding `HEAD` and `ORIG_HEAD` and their logs, beside the `HEAD` and
+/// `refs/heads` stubs), the `<path>/.git` gitfile pointing back at it, and the
 /// checkout itself. `-b`/`-B`, `--detach`, `-f`, `--[no-]checkout`, `-q` and
 /// `--lock [--reason]` are honoured, as is the DWIM branch named after the path's
 /// last component when no `<commit-ish>` is given. The messages keep git's
@@ -2701,8 +2704,13 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // git's `<name>N` de-duplication when that name is taken.
     let id = unique_admin_id(&common, &dwim_name);
     let admin = common.join("worktrees").join(&id);
-    std::fs::create_dir_all(admin.join("logs"))?;
-    std::fs::create_dir_all(admin.join("refs"))?;
+    let reftable = crate::refstore::is_reftable(&repo);
+    if reftable {
+        std::fs::create_dir_all(&admin)?;
+    } else {
+        std::fs::create_dir_all(admin.join("logs"))?;
+        std::fs::create_dir_all(admin.join("refs"))?;
+    }
     std::fs::create_dir_all(&path)?;
     let worktree_abs = gix::path::realpath(&path)?;
 
@@ -2717,13 +2725,32 @@ fn add(args: &[String]) -> Result<ExitCode> {
     write_worktree_linking_files(&common, &path.join(".git"), &admin.join("gitdir"), relative);
     std::fs::write(admin.join("commondir"), "../..\n")?;
 
-    let head_line = match &start {
-        Start::Branch(name, _) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
-        Start::NewBranch { name, .. } => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
-        Start::Detached(oid) => format!("{}\n", oid.to_hex()),
-        Start::Orphan(name) => format!("ref: {}\n", name.as_bstr().to_str_lossy()),
+    let head = match &start {
+        Start::Branch(name, _) | Start::NewBranch { name, .. } | Start::Orphan(name) => {
+            StateRef::Symbolic(name.as_bstr().to_owned())
+        }
+        Start::Detached(oid) => StateRef::Object(*oid),
     };
-    std::fs::write(admin.join("HEAD"), head_line)?;
+    // builtin/worktree.c:551-563: the worktree's own ref store is created and `HEAD` written
+    // through it — `ref_store_create_on_disk(wt_refs, REF_STORE_CREATE_ON_DISK_IS_WORKTREE)`,
+    // then `refs_update_ref(wt_refs, NULL, "HEAD", …)` for a commit or
+    // `refs_update_symref(wt_refs, "HEAD", symref, NULL)` for a branch. For reftable that is
+    // `reftable/` plus the `HEAD` and `refs/heads` stubs (refs.c:2226-2244, no alternate-refs
+    // payload) and a stack in the administrative directory holding `HEAD`; the files backend
+    // writes the `HEAD` file.
+    let wt_repo = if reftable {
+        gix::refs::reftable::Backend::create_on_disk(&admin)?;
+        let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
+        crate::refstore::state_ref_write(&wt_repo, "HEAD", &head, "")?;
+        Some(wt_repo)
+    } else {
+        let head_line = match &head {
+            StateRef::Symbolic(name) => format!("ref: {name}\n"),
+            StateRef::Object(oid) => format!("{}\n", oid.to_hex()),
+        };
+        std::fs::write(admin.join("HEAD"), head_line)?;
+        None
+    };
 
     // builtin/worktree.c:570-583, in this order and at this point — after `HEAD`
     // exists and before the checkout child runs, because the child reads both
@@ -2753,6 +2780,11 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // that follows leaves an empty index and an empty worktree — no `ORIG_HEAD`, no
     // `HEAD is now at` line, and no ref: the branch is born with the first commit.
     if let Start::Orphan(_) = start {
+        // `make_worktree_orphan()` (builtin/worktree.c:411-423) runs `symbolic-ref HEAD
+        // refs/heads/<branch>` in the new worktree, `refs_update_symref(…, NULL)` once more.
+        if let Some(wt_repo) = &wt_repo {
+            crate::refstore::state_ref_write(wt_repo, "HEAD", &head, "")?;
+        }
         let mut empty = gix::index::State::new(repo.object_hash());
         // The `reset --hard` over an unborn `HEAD` unpacks the empty tree, so its cache-tree names
         // that tree over zero entries. git records the id whether or not the object was ever
@@ -2779,11 +2811,20 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // dereferences to already names the same commit, so the branch update is a no-op while the
     // symref's own log-only entry is still appended. A detached `HEAD` updates itself to the value
     // it already holds and logs nothing.
-    if checkout {
-        std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
+    match &wt_repo {
+        Some(wt_repo) => {
+            if checkout {
+                reset_ref_updates(wt_repo, start.oid())?;
+            }
+        }
+        None => {
+            if checkout {
+                std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
+            }
+            let reset_line = checkout && !matches!(start, Start::Detached(_));
+            write_worktree_reflog(&repo, &admin, start.oid(), reset_line)?;
+        }
     }
-    let reset_line = checkout && !matches!(start, Start::Detached(_));
-    write_worktree_reflog(&repo, &admin, start.oid(), reset_line)?;
 
     // `add_worktree()` writes `initializing` into `locked` for the duration of the setup and
     // removes it at the end; `--lock` keeps the file, and its content is the `--reason` or, with
@@ -3474,6 +3515,31 @@ fn create_branch(
             "a branch named '{}' already exists: {e}",
             name.as_bstr().to_str_lossy().trim_start_matches("refs/heads/")
         )
+    })?;
+    Ok(())
+}
+
+/// The ref updates of the `reset --hard` child `checkout_worktree()` runs (builtin/worktree.c:396-406)
+/// in a worktree whose `HEAD` names `oid`, through the worktree's ref store: `reset_refs()`
+/// (builtin/reset.c:283-311) sets `ORIG_HEAD` to the old `HEAD`, logged as `updating ORIG_HEAD`
+/// only where a reflog asks for it, then `HEAD` — dereferenced — to the same commit with
+/// `reset: moving to HEAD`. Which of the two the backend logs, and that the unchanged branch
+/// behind a symbolic `HEAD` is left alone, is the backend's `prepare_single_update()`.
+fn reset_ref_updates(wt_repo: &gix::Repository, oid: ObjectId) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    crate::refstore::state_ref_write(wt_repo, "ORIG_HEAD", &StateRef::Object(oid), "updating ORIG_HEAD")?;
+    wt_repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: false,
+                message: "reset: moving to HEAD".into(),
+            },
+            expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(oid)),
+            new: gix::refs::Target::Object(oid),
+        },
+        name: "HEAD".try_into()?,
+        deref: true,
     })?;
     Ok(())
 }

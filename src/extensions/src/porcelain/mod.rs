@@ -642,7 +642,7 @@ pub(crate) mod cat_file;
 mod check_attr;
 mod check_ignore;
 mod check_mailmap;
-mod check_ref_format;
+pub(crate) mod check_ref_format;
 mod checkout;
 #[allow(non_snake_case)] // maps to git's `checkout--worker` subcommand
 mod checkout__worker;

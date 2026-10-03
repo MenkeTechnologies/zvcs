@@ -62,6 +62,7 @@ pub mod rawarg;
 pub mod rcache;
 pub mod refname;
 pub mod refsort;
+pub mod refstore;
 pub mod remote_legacy;
 pub mod repo_settings;
 pub mod revfilter;

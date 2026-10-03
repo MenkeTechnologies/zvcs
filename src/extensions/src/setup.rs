@@ -394,6 +394,7 @@ static WRITE_OPTIONS_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::O
 fn arm_ref_store_refusal(repo: &gix::Repository) {
     WRITE_OPTIONS_REFUSAL.get_or_init(|| write_options_refusal(repo));
     gix::refs::file::set_write_options_hook(ref_store_write_options);
+    gix::config::reftable::set_die_hook(reftable_write_options_die);
     REPO_SETTINGS_REFUSAL.get_or_init(|| crate::repo_settings::RepoSettings::load(repo).err());
     gix::odb::store::set_first_use_hook(object_store_first_use);
     PACKED_REFS_TIMEOUT_REFUSAL
@@ -491,6 +492,19 @@ fn ref_store_write_options() {
     }
 }
 
+/// The reftable backend's counterpart of [`ref_store_write_options`]:
+/// `reftable_be_write_options()` (refs/reftable-backend.c:361-392, v2.56.0)
+/// reads its configuration on the first write or compaction, and
+/// `reftable_be_config()` (:323-359) `die()`s on a value it refuses. gix hands
+/// the message here; this dies the way git does, through the tempfile cleanup,
+/// with the trace2 error event and `fatal:` at 128.
+fn reftable_write_options_die(message: &str) -> ! {
+    gix::tempfile::registry::cleanup_tempfiles();
+    crate::trace2::error(message);
+    eprintln!("fatal: {message}");
+    std::process::exit(i32::from(crate::fatal::EXIT_FATAL))
+}
+
 fn discover_with_overrides() -> Result<gix::Repository, gix::discover::Error> {
     if IGNORED_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(gix::discover::Error::Discover(gix::discover::upwards::Error::NoGitRepository {
@@ -551,17 +565,17 @@ pub fn ref_storage_format(repo: &gix::Repository) -> String {
     }
 }
 
-/// Whether the repository declares the `reftable` ref storage format.
+/// Whether the repository stores its references in reftables
+/// (`extensions.refStorage = reftable` at format version 1).
 ///
-/// The store such a repository names is a reftable stack under
-/// `<common dir>/reftable` (`reftable_be_init()`,
-/// `refs/reftable-backend.c:418-429`, v2.55.0), which this build has no backend
-/// for. Reads there answer "no such ref" because the port roots its ref store at
-/// that same path and nothing is in it; writes are the half that has to be
-/// refused explicitly, because a files-backend write would lay down loose refs
-/// inside a directory that is supposed to hold reftable data.
+/// gix opens such a repository with the reftable backend, whose stacks are
+/// `<common dir>/reftable` and, in a linked worktree, `<its git dir>/reftable`
+/// (`reftable_be_init()`, refs/reftable-backend.c:406-475, v2.56.0); reads and
+/// transactions through gix's reference API go there. Callers that still read
+/// or write ref storage files themselves branch on this, or use
+/// [`crate::refstore`], which answers for both formats.
 pub fn declares_reftable(repo: &gix::Repository) -> bool {
-    ref_storage_format(repo) == "reftable"
+    crate::refstore::is_reftable(repo)
 }
 
 /// The path from the top of the work tree down to the current directory, or

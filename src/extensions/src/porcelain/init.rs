@@ -851,6 +851,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             "worktree",
             &work_tree_abs.to_string_lossy(),
         )?;
+        // Those writes come before the filesystem probes in `create_default_files()`
+        // (`core.ignorecase`, `core.symlinks`, `core.precomposeunicode`), which gix
+        // laid down with the skeleton; they move behind them.
+        probe_keys_last(&git_dir)?;
     }
 
     // `create_object_directory()`: `GIT_OBJECT_DIRECTORY` moves the object store
@@ -1811,6 +1815,31 @@ fn set_config_default(git_dir: &Path, section: &str, key: &str, value: &str) -> 
         return Ok(());
     }
     file.set_raw_value_by(section, None, key, value)?;
+    std::fs::write(&path, file.to_bstring())?;
+    Ok(())
+}
+
+/// Move the `[core]` keys `create_default_files()` writes from its filesystem
+/// probes (setup.c, after `bare`/`logallrefupdates`/`worktree`) to the end of
+/// the section, in their order, so keys written after gix's skeleton precede
+/// them as they do in git's file.
+fn probe_keys_last(git_dir: &Path) -> Result<()> {
+    let path = config_path(git_dir);
+    let mut file =
+        gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    {
+        let mut core = file.section_mut("core", None)?;
+        let mut moved = Vec::new();
+        for key in ["ignorecase", "symlinks", "precomposeunicode"] {
+            if let Some(value) = core.remove(key) {
+                moved.push((key, value));
+            }
+        }
+        for (key, value) in moved {
+            core.push(key, Some(value.as_ref()))?;
+        }
+    }
     std::fs::write(&path, file.to_bstring())?;
     Ok(())
 }

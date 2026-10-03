@@ -442,6 +442,20 @@ index 0000000..3b18e51
 +hello world
 ";
 
+/// A modification under a path whose leading component is a *file*: `README.md`
+/// is a regular file in every shape, so `lstat("README.md/x")` fails with
+/// `ENOTDIR`, not `ENOENT`. `check_preimage()` (apply.c) reports anything but
+/// `ENOENT` through `error_errno()` before it looks at the index, so stock says
+/// `error: README.md/x: Not a directory` where the missing-file refusal would
+/// say `No such file or directory`.
+const A_UNDER_A_FILE: &[u8] = b"diff --git a/README.md/x b/README.md/x
+--- a/README.md/x
++++ b/README.md/x
+@@ -1 +1,2 @@
+ # fixture
++more
+";
+
 /// Two files in one patch: the first applies, the second cannot. `apply` is
 /// **all or nothing** across files, so stock writes neither — and `--reject`
 /// turns the same input into a half-applied tree with a `.rej` beside the file
@@ -997,6 +1011,13 @@ fn path_rewriting(out: &mut Vec<Case>) {
     ax("apply", &["apply"], Shape::Linear, A_PATH_IS_DIR, out);
     a("apply", &["apply", "--check"], Shape::Linear, A_PATH_IS_DIR, out);
     a("apply", &["apply", "--cached"], Shape::Linear, A_PATH_IS_DIR, out);
+
+    // The pre-image's leading component is a file: `ENOTDIR` from `lstat()`,
+    // reported as itself on the worktree paths and never reached under `--cached`.
+    ax("apply", &["apply"], Shape::Linear, A_UNDER_A_FILE, out);
+    ax("apply", &["apply", "--check"], Shape::Linear, A_UNDER_A_FILE, out);
+    ax("apply", &["apply", "--index"], Shape::Linear, A_UNDER_A_FILE, out);
+    ax("apply", &["apply", "--cached"], Shape::Linear, A_UNDER_A_FILE, out);
 }
 
 /// `apply` run from a **subdirectory**, which no case in the corpus does.

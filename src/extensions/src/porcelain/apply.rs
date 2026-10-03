@@ -1481,6 +1481,21 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             let previous_mode: Option<u32> = previous_entry.flatten();
+            // `check_preimage()` (apply.c:3749-3752): with no earlier patch to read from
+            // and not `--cached`, the pre-image is `lstat()`ed first, and any failure but
+            // `ENOENT` is `error_errno()` on the spot — `-p0` on `a/a` where `a` is a file
+            // is `error: a/a: Not a directory`, not the missing-file refusal.
+            if previous_entry.is_none() && !o.cached && !p.is_new {
+                if let Some(old) = p.old_name.as_deref() {
+                    if let Err(e) = std::fs::symlink_metadata(old) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            err(o.quiet(), &format!("error: {old}: {}", crate::external::strerror(&e)));
+                            failed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
 
             // `check_preimage()`'s `st_mode`: the mode the pre-image actually has
             // right now, which the patch's own `old_mode` is then measured against.

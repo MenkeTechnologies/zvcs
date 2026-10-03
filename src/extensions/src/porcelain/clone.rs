@@ -1207,7 +1207,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     //
     // (builtin/clone.c:1324-1331.) `--no-local` sets `option_local` to 0, so the clone runs
     // the transport after all and the selectors are honoured rather than warned about.
-    if is_local && !quiet {
+    // They are `warning()`s, which `-q` does not silence.
+    if is_local {
         for (given, flag) in [
             (shallow_depth_given, "--depth"),
             (shallow_since_given, "--shallow-since"),

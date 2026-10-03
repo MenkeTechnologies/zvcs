@@ -192,20 +192,15 @@ impl crate::Repository {
                         source: err,
                     })
                 })
+                // Every value is kept, in configuration order and repeats included:
+                // `handle_config()` calls `refspec_append()` once per value (remote.c:536-541).
+                // `get_ref_map()` walks `remote->fetch` item by item (builtin/fetch.c:559-560),
+                // so the ref map, `FETCH_HEAD` and the summary follow it, and the first refspec
+                // decides the merge candidate. Repeats are folded only afterwards and only for
+                // mappings with a destination: `ref_remove_duplicates()` keys on the peer ref
+                // (remote.c:915-947), so `HEAD` configured twice is fetched, and written to
+                // `FETCH_HEAD`, twice.
                 .collect::<Result<Vec<_>, _>>()
-                // Configuration order is kept: `get_ref_map()` walks `remote->fetch` item by item
-                // (builtin/fetch.c:554-562), so the ref map, `FETCH_HEAD` and the summary follow it,
-                // and the first refspec decides the merge candidate. A repeated refspec adds
-                // nothing — `ref_remove_duplicates()` keeps the first of identical entries.
-                .map(|specs| {
-                    let mut kept: Vec<gix_refspec::RefSpec> = Vec::with_capacity(specs.len());
-                    for spec in specs {
-                        if !kept.contains(&spec) {
-                            kept.push(spec);
-                        }
-                    }
-                    kept
-                })
         }
 
         let mut filter = self.filter_config_section();

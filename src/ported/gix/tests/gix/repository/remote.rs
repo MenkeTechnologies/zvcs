@@ -269,13 +269,19 @@ mod find_remote {
     fn many_fetchspecs() {
         let repo = remote::repo("many-fetchspecs");
         let remote = repo.find_remote("origin").expect("present");
+        // Stock git 2.56.0 with this configuration writes FETCH_HEAD in the order
+        // heads, HEAD (from `@`), tags, HEAD: `remote->fetch` holds every configured
+        // value in order, and the repeated `HEAD` has no destination for
+        // `ref_remove_duplicates()` to fold it on.
         assert_eq!(
             remote.refspecs(Direction::Fetch),
             &[
-                fetchspec("HEAD"),
                 fetchspec("+refs/heads/*:refs/remotes/origin/*"),
-                fetchspec("refs/tags/*:refs/tags/*")
-            ]
+                fetchspec("HEAD"),
+                fetchspec("refs/tags/*:refs/tags/*"),
+                fetchspec("HEAD"),
+            ],
+            "configuration order is kept, `@` reads as `HEAD`, and a repeat is not dropped"
         );
     }
 

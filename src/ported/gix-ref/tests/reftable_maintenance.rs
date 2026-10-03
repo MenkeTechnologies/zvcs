@@ -403,6 +403,25 @@ fn delete_reflog_like_reflog_drop() {
     assert!(!f.run(&ours, &["reflog", "exists", "refs/heads/side"]).status.success());
 }
 
+/// git deletes under the name it was given, before `backend_for()` strips the
+/// worktree prefix (refs/reftable-backend.c:2486-2491); the stack keeps `HEAD`'s
+/// log as `HEAD`, so `main-worktree/HEAD` matches no entry and stays.
+#[test]
+fn delete_reflog_of_a_prefixed_name_matches_no_entry() {
+    let Some(f) = Fixture::new() else { return };
+    let (stock, ours) = f.copies("drop-prefixed");
+    f.ok(&stock, &["reflog", "drop", "main-worktree/HEAD"]);
+    backend(&ours, |_| {})
+        .delete_reflog(name("main-worktree/HEAD"))
+        .expect("delete");
+    f.assert_same(&stock, &ours);
+    assert_eq!(
+        f.ok(&ours, &["log", "-g", "--format=%gs", "HEAD"]).lines().count(),
+        3,
+        "HEAD keeps the entries of its three commits"
+    );
+}
+
 #[test]
 fn rename_like_branch_m() {
     let Some(f) = Fixture::new() else { return };

@@ -314,6 +314,37 @@ fn reflog_drop_deletes_through_the_stack() {
     }
 }
 
+/// `reftable_be_delete_reflog()` deletes under the name it was handed, before
+/// `backend_for()` strips a `main-worktree/` or `worktrees/<id>/` prefix
+/// (refs/reftable-backend.c:2486-2491). The stack the name routes to keeps that
+/// worktree's `HEAD` log as `HEAD`, so a prefixed name deletes nothing: `drop
+/// --all` keeps the other worktree's `HEAD` log, and so does naming it.
+#[test]
+fn reflog_drop_keeps_a_reflog_named_through_its_worktree_prefix() {
+    let Some(case) = Case::new("drop-wt") else { return };
+    let observe: &[Step] = &[
+        &["log", "-g", "--date=raw", "--format=%H %gs", "HEAD", "--"],
+        &["log", "-g", "--date=raw", "--format=%H %gs", "main-worktree/HEAD", "--"],
+        &["log", "-g", "--date=raw", "--format=%H %gs", "worktrees/wt/HEAD", "--"],
+        &["reflog", "exists", "main-worktree/HEAD"],
+        &["reflog", "exists", "worktrees/wt/HEAD"],
+    ];
+    fn with<'a>(first: &[Step<'a>], observe: &[Step<'a>]) -> Vec<Step<'a>> {
+        first.iter().chain(observe).copied().collect()
+    }
+    for cwd in ["wt", "R"] {
+        case.compare(Fixture::Rw, &[], cwd, &with(&[&["reflog", "drop", "--all"]], observe));
+        case.compare(Fixture::Rw, &[], cwd, &with(&[&["reflog", "drop", "--all", "--single-worktree"]], observe));
+        case.compare(Fixture::Rw, &[], cwd, &with(&[&["reflog", "drop", "HEAD", "refs/heads/side"]], observe));
+    }
+    case.compare(Fixture::Rw, &[], "wt", &with(&[&["reflog", "drop", "main-worktree/HEAD"]], observe));
+    case.compare(Fixture::Rw, &[], "R", &with(&[&["reflog", "drop", "worktrees/wt/HEAD"]], observe));
+    // `reflog delete` expires through the stack under the stripped name and
+    // does remove the entry.
+    case.compare(Fixture::Rw, &[], "R", &with(&[&["reflog", "delete", "worktrees/wt/HEAD@{0}"]], observe));
+    case.compare(Fixture::Rw, &[], "wt", &with(&[&["reflog", "delete", "--rewrite", "main-worktree/HEAD@{1}"]], observe));
+}
+
 /// `stash drop` is `reflog_delete(rev, REWRITE | UPDATE_REF)` and clears the
 /// stash once its reflog is empty (builtin/stash.c:826-843); the reflog the
 /// stash lives in is read and rewritten through the ref store.

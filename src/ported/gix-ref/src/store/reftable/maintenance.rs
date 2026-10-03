@@ -308,8 +308,16 @@ impl Backend {
     /// `reftable_be_delete_reflog()` (refs/reftable-backend.c:2480-2510) with
     /// `write_reflog_delete_table()` (:2439-2478): a tombstone for each entry
     /// of the reflog of `name`.
+    ///
+    /// git fills `arg.refname` with the name it was given *before*
+    /// `backend_for()` strips a `worktrees/<id>/` or `main-worktree/` prefix
+    /// (:2486-2491), and seeks, compares and writes tombstones under that full
+    /// name in the stack the stripped name routes to. That stack keeps the
+    /// worktree's reflog under the stripped name, so a prefixed name finds no
+    /// entry and the reflog stays.
     pub fn delete_reflog(&self, name: &FullNameRef) -> Result<(), Error> {
-        let (stack, refname) = self.backend_for(name.as_bstr(), true)?;
+        let refname = name.as_bstr();
+        let (stack, _) = self.backend_for(refname, true)?;
         let opts = self.write_config().opts.clone();
         let mut st = lock(&stack);
         st.add(

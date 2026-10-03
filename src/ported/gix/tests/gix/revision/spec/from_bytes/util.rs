@@ -192,5 +192,7 @@ pub fn parse_spec(spec: impl AsRef<str>, repo: &gix::Repository) -> Result<gix::
 
 pub fn repo(name: &str) -> crate::Result<gix::Repository> {
     let base = gix_testtools::scripted_fixture_read_only(FIXTURE_NAME)?;
-    Ok(gix::open(base.join(name))?)
+    // Isolated: a `core.abbrev` in the global config would change every short id
+    // the error messages print.
+    Ok(gix::open_opts(base.join(name), gix::open::Options::isolated())?)
 }

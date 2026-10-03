@@ -991,10 +991,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // ---- 4. the rest of the head set ----------------------------------------
     default_refs += default_refs_snapshot;
     if opt.include_reflogs {
-        let logs_root = repo.common_dir().join("logs");
         errors |= collect_reflog_heads(
             &repo,
-            &logs_root,
             &mut state,
             &mut heads,
             &mut names,
@@ -1003,8 +1001,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             opt.verbose,
         )?;
     }
-    // Every linked worktree contributes its own HEAD, index, and per-worktree
-    // reflogs, exactly as git's `get_default_heads()` iterates all worktrees.
+    // Every linked worktree contributes its own HEAD and index, exactly as
+    // git's `get_default_heads()` iterates all worktrees (their reflogs were
+    // walked with every other above).
     // Order is irrelevant: heads only feed the reachability set and `known`,
     // both of which are membership-based.
     {
@@ -1015,8 +1014,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 &mut heads,
                 &mut index_blobs,
                 &mut names,
-                &has_obj,
-                &promisor,
                 &opt,
                 explicit_heads,
             )?;
@@ -2085,12 +2082,16 @@ fn collect_default_heads(
     Ok(count)
 }
 
-/// Reflog entries as heads. A reflog id that is not in the odb is an error for
-/// git (`ERROR_REACHABLE`) rather than a head, and — because `fsck_handle_reflog_oid()`
-/// calls `lookup_object()`, which does not create — it never enters `obj_hash`.
+/// Reflog entries as heads: `refs_for_each_reflog(get_worktree_ref_store(wt),
+/// fsck_handle_reflog, wt)` over every worktree (builtin/fsck.c:668-676), each
+/// name spelt by `strbuf_worktree_ref()` and its entries read through the main
+/// ref store (`fsck_handle_reflog()`, :497-508).
+///
+/// A reflog id that is not in the odb is an error for git (`ERROR_REACHABLE`)
+/// rather than a head, and — because `fsck_handle_reflog_oid()` calls
+/// `lookup_object()`, which does not create — it never enters `obj_hash`.
 fn collect_reflog_heads(
     repo: &gix::Repository,
-    logs_root: &Path,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
     names: &mut ObjectNames,
@@ -2098,61 +2099,59 @@ fn collect_reflog_heads(
     promisor: &HashSet<ObjectId>,
     verbose: bool,
 ) -> Result<u8> {
+    // `now = time(NULL)` once the refs are snapshot (:644-645): an entry dated
+    // later is ignored (:485-486).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let mut errors = 0u8;
-    let mut log_names: Vec<String> = Vec::new();
-    collect_log_names(logs_root, "", &mut log_names)?;
-    let mut buf = Vec::new();
-    for name in log_names {
-        // A log file whose path is not a well-formed ref name is skipped rather
-        // than fatal, matching git's tolerance of stray files there.
-        let Ok(Some(iter)) = repo.refs.reflog_iter(name.as_str(), &mut buf) else {
-            continue;
-        };
-        for line in iter {
-            let line = line?;
-            // `fsck_handle_reflog_ent()` announces the entry before either end
-            // of it is handled, null ids included.
-            if verbose {
-                eprintln!(
-                    "Checking reflog {}->{}",
-                    line.previous_oid(),
-                    line.new_oid()
-                );
-            }
-            // `fsck_handle_reflog_ent()` passes `0` for the old id's timestamp
-            // and the entry's own for the new one (builtin/fsck.c:511-512), and
-            // `fsck_handle_reflog_oid()` only names when that timestamp is
-            // non-zero (:482-485).
-            let stamp = line.signature.time().map(|t| t.seconds).unwrap_or_default();
-            for (id, timestamp) in [(line.previous_oid(), None), (line.new_oid(), Some(stamp))] {
-                if id.is_null() {
-                    continue;
+    for wt in super::prune::get_worktrees(repo) {
+        for log_name in wt.reflog_names(repo)? {
+            let name = wt.ref_name(log_name.as_ref()).to_string();
+            crate::refstore::for_each_reflog_entry(repo, &name, false, |entry| {
+                if now != 0 && entry.timestamp > now {
+                    return std::ops::ControlFlow::Continue(());
                 }
-                // ```c
-                // obj = lookup_object(repo, oid);
-                // if (obj && (obj->flags & HAS_OBJ)) { … mark_object_reachable(obj); }
-                // else if (!is_promisor_object(repo, oid)) {
-                //         error(_("%s: invalid reflog entry %s"), refname, oid_to_hex(oid));
-                //         errors_found |= ERROR_REACHABLE;
-                // }
-                // ```
-                //
-                // (`fsck_handle_reflog_oid()`, builtin/fsck.c:479-493.) This is a
-                // *lookup*, not a read: the test is whether the object-directory
-                // scan created the object and set `HAS_OBJ`, not whether the odb
-                // could produce it. `--no-full` therefore turns every reflog
-                // entry naming a packed object into an error.
-                if has_obj.contains(&id) {
-                    if let Some(timestamp) = timestamp {
-                        names.put(id, || format!("{name}@{{{timestamp}}}"));
+                // `fsck_handle_reflog_ent()` announces the entry before either end
+                // of it is handled, null ids included.
+                if verbose {
+                    eprintln!("Checking reflog {}->{}", entry.old_oid, entry.new_oid);
+                }
+                // `fsck_handle_reflog_ent()` passes `0` for the old id's timestamp
+                // and the entry's own for the new one (builtin/fsck.c:492-493), and
+                // `fsck_handle_reflog_oid()` only names when that timestamp is
+                // non-zero (:463-466).
+                for (id, timestamp) in [(entry.old_oid, 0), (entry.new_oid, entry.timestamp)] {
+                    if id.is_null() {
+                        continue;
                     }
-                    state.note(id);
-                    heads.push(id);
-                } else if !promisor.contains(&id) {
-                    eprintln!("error: {name}: invalid reflog entry {id}");
-                    errors |= ERROR_REACHABLE;
+                    // ```c
+                    // obj = lookup_object(repo, oid);
+                    // if (obj && (obj->flags & HAS_OBJ)) { … mark_object_reachable(obj); }
+                    // else if (!is_promisor_object(repo, oid)) {
+                    //         error(_("%s: invalid reflog entry %s"), refname, oid_to_hex(oid));
+                    //         errors_found |= ERROR_REACHABLE;
+                    // }
+                    // ```
+                    //
+                    // (`fsck_handle_reflog_oid()`, builtin/fsck.c:454-475.) This is a
+                    // *lookup*, not a read: the test is whether the object-directory
+                    // scan created the object and set `HAS_OBJ`, not whether the odb
+                    // could produce it. `--no-full` therefore turns every reflog
+                    // entry naming a packed object into an error.
+                    if has_obj.contains(&id) {
+                        if timestamp != 0 {
+                            names.put(id, || format!("{name}@{{{timestamp}}}"));
+                        }
+                        state.note(id);
+                        heads.push(id);
+                    } else if !promisor.contains(&id) {
+                        eprintln!("error: {name}: invalid reflog entry {id}");
+                        errors |= ERROR_REACHABLE;
+                    }
                 }
-            }
+                std::ops::ControlFlow::Continue(())
+            })?;
         }
     }
     Ok(errors)
@@ -2270,38 +2269,6 @@ fn collect_cache_tree(
         errors |= collect_cache_tree(repo, child, state, heads, names, index_path, verbose);
     }
     errors
-}
-
-/// Append every reflog file below `dir` to `out` as a `/`-joined ref name.
-///
-/// Pre-order, and sorted by raw byte order within each directory — files and
-/// subdirectories together, as one list. `reflog_iterator_begin()` asks for
-/// `DIR_ITERATOR_SORTED` (refs/files-backend.c:2409), which reads a directory
-/// whole and runs `string_list_sort()` over it (dir-iterator.c:116-132), so the
-/// reflogs of one directory reach `for_each_reflog()` in `strcmp` order rather
-/// than `readdir()` order. Shared with [`super::shortlog`], whose `--reflog`
-/// walks the same directory through the same iterator.
-pub(super) fn collect_log_names(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
-    let read = match std::fs::read_dir(dir) {
-        Ok(read) => read,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut entries: Vec<std::fs::DirEntry> = Vec::new();
-    for entry in read {
-        entries.push(entry?);
-    }
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let full = format!("{prefix}{name}");
-        if entry.file_type()?.is_dir() {
-            collect_log_names(&entry.path(), &format!("{full}/"), out)?;
-        } else {
-            out.push(full);
-        }
-    }
-    Ok(())
 }
 
 /// `--full`: git's `verify_pack()` over every pack `get_all_packs()` yields — the
@@ -2910,19 +2877,17 @@ fn odb_source_count(repo: &gix::Repository) -> usize {
     odb_sources(repo).len()
 }
 
-/// Every linked worktree's HEAD, index, and per-worktree reflogs as heads,
-/// matching git's `get_default_heads()` iterating all worktrees. The main
-/// worktree's HEAD/index/reflogs are collected by the callers above; this adds
-/// only the linked ones. Returns the number of HEADs (git's `default_refs`
-/// contribution) and any reflog errors, exactly like the main collectors.
+/// Every linked worktree's HEAD and index as heads, matching git's
+/// `get_default_heads()` iterating all worktrees. The main worktree's HEAD and
+/// index are collected by the callers above, and every worktree's reflogs by
+/// [`collect_reflog_heads`]; this adds only the linked ones. Returns the number
+/// of HEADs (git's `default_refs` contribution) and the errors found.
 fn collect_linked_worktree_heads(
     repo: &gix::Repository,
     state: &mut State,
     heads: &mut Vec<ObjectId>,
     index_blobs: &mut HashSet<ObjectId>,
     names: &mut ObjectNames,
-    has_obj: &HashSet<ObjectId>,
-    promisor: &HashSet<ObjectId>,
     opt: &Options,
     explicit_heads: bool,
 ) -> Result<(usize, u8)> {
@@ -2934,9 +2899,8 @@ fn collect_linked_worktree_heads(
         Err(_) => return Ok((count, errors)),
     };
     for proxy in worktrees {
-        let logs_root = proxy.git_dir().join("logs");
         // The worktree's working tree may be missing (a prunable worktree); its
-        // HEAD/index/reflogs still live in the git dir and are read regardless.
+        // HEAD and index still live in the git dir and are read regardless.
         let Ok(wt) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
             continue;
         };
@@ -2951,18 +2915,6 @@ fn collect_linked_worktree_heads(
                     count += 1;
                 }
             }
-        }
-        if opt.include_reflogs {
-            errors |= collect_reflog_heads(
-                &wt,
-                &logs_root,
-                state,
-                heads,
-                names,
-                has_obj,
-                promisor,
-                opt.verbose,
-            )?;
         }
         if !explicit_heads || opt.keep_cache_objects {
             let label = index_path_label(&wt);

@@ -4857,7 +4857,10 @@ fn rev_list_objects(
     }
 
     if st.reflog {
-        pending.extend(reflog_objects(repo));
+        pending.extend(
+            super::prune::add_reflogs_to_pending(repo, false, super::prune::PrunedReflogWarning::Print)
+                .map_err(|e| e.to_string())?,
+        );
     }
 
     if st.indexed_objects {
@@ -5082,50 +5085,6 @@ fn commit_date(repo: &gix::Repository, id: ObjectId) -> i64 {
         .and_then(|o| o.try_into_commit().ok())
         .and_then(|c| c.committer().ok().map(|c| c.seconds()))
         .unwrap_or(0)
-}
-
-/// Every object id named by any reflog in this repository, old and new.
-///
-/// Null ids (a ref's creation or deletion line) name no object and are skipped,
-/// as git's `parse_object()` returns NULL for them.
-fn reflog_objects(repo: &gix::Repository) -> Vec<ObjectId> {
-    let mut out = Vec::new();
-    let null = ObjectId::null(repo.object_hash());
-    let mut dirs = vec![repo.common_dir().join("logs")];
-    let per_worktree = repo.git_dir().join("logs");
-    if per_worktree != dirs[0] {
-        dirs.push(per_worktree);
-    }
-
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for dir in &dirs {
-        collect_files(dir, &mut files);
-    }
-    for file in files {
-        let Ok(buf) = std::fs::read(&file) else { continue };
-        for line in gix::refs::file::log::iter::forward(&buf) {
-            let Ok(line) = line else { continue };
-            for id in [line.previous_oid(), line.new_oid()] {
-                if id != null {
-                    out.push(id);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Every regular file under `dir`, recursively.
-fn collect_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => collect_files(&path, out),
-            Ok(t) if t.is_file() => out.push(path),
-            _ => {}
-        }
-    }
 }
 
 /// Add every valid cache-tree id, recursively. A section with no entry count is

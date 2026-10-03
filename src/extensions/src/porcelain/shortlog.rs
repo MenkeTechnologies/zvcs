@@ -1557,71 +1557,16 @@ fn select_refs(
 }
 
 /// git's `add_reflogs_to_pending()`: the old and the new id of every entry of
-/// every reflog, in the order `revision.c` visits them.
-///
-/// `refs_head_ref()` runs first and feeds HEAD's own log to `handle_one_reflog`,
-/// then `refs_for_each_reflog()` walks `$GIT_DIR/logs` — HEAD included a second
-/// time — through the unsorted `dir_iterator` [`super::fsck::collect_log_names`]
-/// reproduces. Duplicates are deliberately kept: the walk queue dedupes on first
-/// sight, and first sight is what orders commits that share a commit date.
-///
-/// A null id (a ref's creation or deletion line) names no object and is skipped,
-/// as `parse_object()` returns NULL for it. An id the object store cannot
-/// produce is `handle_one_reflog_commit()`'s pruned-commit warning, printed once
-/// per log.
+/// every reflog, in the order `revision.c` visits them — see
+/// [`super::prune::add_reflogs_to_pending`], which also reports a reflog naming
+/// a pruned commit. Each id is then peeled to the commit it names, as
+/// `handle_commit()` does with a tag.
 pub(super) fn reflog_pending(repo: &gix::Repository) -> Result<Vec<ObjectId>> {
-    let mut names: Vec<String> = Vec::new();
-    // `refs_head_ref()` calls its callback only when HEAD resolves, so an unborn
-    // HEAD contributes nothing here. Its log file, if any, is still walked below.
-    let head_resolves = repo
-        .head()
-        .ok()
-        .and_then(|mut head| head.try_peel_to_id().ok().flatten())
-        .is_some();
-    if head_resolves {
-        names.push("HEAD".to_string());
-    }
-    // git reads the main ref store, which is the common directory's logs; a
-    // linked worktree's per-worktree logs are merged in ahead of them.
-    let mut dirs = vec![repo.git_dir().join("logs")];
-    let common = repo.common_dir().join("logs");
-    if common != dirs[0] {
-        dirs.push(common);
-    }
-    for dir in &dirs {
-        super::fsck::collect_log_names(dir, "", &mut names)?;
-    }
-
-    let mut out = Vec::new();
-    let mut buf = Vec::new();
-    for name in names {
-        // A log file whose path is not a well-formed ref name has no reflog to
-        // iterate, exactly as `refs_for_each_reflog_ent()` finds nothing there.
-        let Ok(Some(iter)) = repo.refs.reflog_iter(name.as_str(), &mut buf) else {
-            continue;
-        };
-        let mut warned = false;
-        for line in iter {
-            let Ok(line) = line else { break };
-            for id in [line.previous_oid(), line.new_oid()] {
-                if id.is_null() {
-                    continue;
-                }
-                let Ok(object) = repo.find_object(id) else {
-                    if !warned {
-                        eprintln!("warning: reflog of '{name}' references pruned commits");
-                        warned = true;
-                    }
-                    continue;
-                };
-                // `handle_commit()` peels a tag to the commit it names.
-                if let Ok(commit) = object.peel_to_commit() {
-                    out.push(commit.id);
-                }
-            }
-        }
-    }
-    Ok(out)
+    let ids = super::prune::add_reflogs_to_pending(repo, false, super::prune::PrunedReflogWarning::Print)?;
+    Ok(ids
+        .into_iter()
+        .filter_map(|id| repo.find_object(id).ok()?.peel_to_commit().ok().map(|c| c.id))
+        .collect())
 }
 
 /// How a ref selector decides membership: a whole namespace, or a glob.

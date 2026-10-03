@@ -129,6 +129,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use gix::bstr::{BStr, BString, ByteSlice};
 use gix::hash::ObjectId;
 use gix::objs::Kind;
 use gix::odb::pack;
@@ -501,7 +502,7 @@ fn reachability<'a>(
 ) -> Result<&'a HashSet<ObjectId>> {
     if cache.is_none() {
         let mut roots: Vec<ObjectId> = heads.to_vec();
-        collect_roots(repo, &mut roots)?;
+        collect_roots(repo, &mut roots, PrunedReflogWarning::Print)?;
         collect_recent_roots(objdir, repo.object_hash(), expire, &mut roots)?;
         // The only failure `collect_hook_roots` reports is git's
         // `unable to enumerate additional recent objects` at 128, which it has
@@ -949,7 +950,13 @@ pub(super) fn bad_object_ref(repo: &gix::Repository) -> Option<String> {
     None
 }
 
-pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -> Result<()> {
+/// `warning` says whether a reflog naming a pruned commit is reported here,
+/// which only the walk git itself runs for the command does.
+pub(super) fn collect_roots(
+    repo: &gix::Repository,
+    roots: &mut Vec<ObjectId>,
+    warning: PrunedReflogWarning,
+) -> Result<()> {
     // Index blobs (gitlinks excluded, as `do_add_index_objects_to_pending()`
     // skips `S_ISGITLINK`) plus the cache-tree, whose invalid sections git skips
     // via `entry_count >= 0` — gitoxide models that as `num_entries: None`.
@@ -993,7 +1000,7 @@ pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -
         }
     }
 
-    collect_reflog_roots(repo, roots);
+    roots.extend(add_reflogs_to_pending(repo, false, warning)?);
     collect_other_worktree_roots(repo, roots);
     Ok(())
 }
@@ -1014,32 +1021,36 @@ pub(super) fn collect_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) -
 /// }
 /// ```
 ///
-/// (`mark_reachable_objects()`, reachable.c.) A linked worktree keeps its own `HEAD` and its
-/// own index, and neither is reachable from the common ref store: a detached worktree HEAD
-/// and anything staged there would otherwise be pruned out from under it.
+/// (`mark_reachable_objects()`, reachable.c:316-325, `other_head_refs()`,
+/// worktree.c:602-633, `add_index_objects_to_pending()`, revision.c:1836-1866.)
+/// Every other worktree keeps its own `HEAD` and its own index, and neither is
+/// reachable from the common ref store: a detached worktree HEAD and anything
+/// staged there would otherwise be pruned out from under it. `HEAD` is read
+/// through the ref store as `main-worktree/HEAD` or `worktrees/<id>/HEAD` and
+/// resolved like `RESOLVE_REF_READING`.
 fn collect_other_worktree_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) {
-    let Ok(entries) = fs::read_dir(repo.common_dir().join("worktrees")) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let admin = entry.path();
+    for wt in get_worktrees(repo) {
         // The worktree this command is running in has already contributed both.
-        if admin == repo.git_dir() {
+        if wt.is_current {
             continue;
         }
-        if let Ok(text) = fs::read_to_string(admin.join("HEAD")) {
-            let text = text.trim();
-            // A symbolic HEAD names a ref of the common store, which the loop above already
-            // collected; only a detached one names an object nothing else does.
-            if !text.starts_with("ref:") {
-                if let Ok(id) = ObjectId::from_hex(text.as_bytes()) {
-                    roots.push(id);
+        let head = wt.ref_name("HEAD".into());
+        match crate::refstore::state_ref_read(repo, &head.to_str_lossy()) {
+            Ok(Some(crate::refstore::StateRef::Object(id))) => roots.push(id),
+            Ok(Some(crate::refstore::StateRef::Symbolic(target))) => {
+                if let Some(id) = repo
+                    .try_find_reference(target.as_bstr())
+                    .ok()
+                    .flatten()
+                    .and_then(|mut r| r.peel_to_id().ok())
+                {
+                    roots.push(id.detach());
                 }
             }
+            _ => {}
         }
-        let index = admin.join("index");
         let Ok(index) = gix::index::File::at(
-            &index,
+            wt.git_dir.join("index"),
             repo.object_hash(),
             false,
             gix::index::decode::Options::default(),
@@ -1066,49 +1077,6 @@ fn push_cache_tree(tree: &gix::index::extension::Tree, roots: &mut Vec<ObjectId>
     }
     for child in &tree.children {
         push_cache_tree(child, roots);
-    }
-}
-
-/// Add the old and new id of every entry of every reflog, matching
-/// `for_each_reflog()` + `add_one_reflog_ent()`. Null ids (a ref's creation or
-/// deletion line) name no object and are skipped, as `parse_object()` returns
-/// NULL for them.
-fn collect_reflog_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId>) {
-    let mut dirs = vec![repo.common_dir().join("logs")];
-    let per_worktree = repo.git_dir().join("logs");
-    if per_worktree != dirs[0] {
-        dirs.push(per_worktree);
-    }
-
-    let mut files: Vec<PathBuf> = Vec::new();
-    for dir in &dirs {
-        collect_files(dir, &mut files);
-    }
-
-    let null = ObjectId::null(repo.object_hash());
-    for file in files {
-        let Ok(buf) = fs::read(&file) else { continue };
-        for line in gix::refs::file::log::iter::forward(&buf) {
-            let Ok(line) = line else { continue };
-            for id in [line.previous_oid(), line.new_oid()] {
-                if id != null {
-                    roots.push(id);
-                }
-            }
-        }
-    }
-}
-
-/// Append every regular file below `dir`, recursively.
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(read) = fs::read_dir(dir) else { return };
-    for entry in read.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => collect_files(&path, out),
-            Ok(_) => out.push(path),
-            Err(_) => {}
-        }
     }
 }
 
@@ -1283,4 +1251,200 @@ pub(super) fn pack_indices(repo: &gix::Repository, objdir: &Path) -> Vec<pack::i
         }
     }
     indices
+}
+
+// ---------------------------------------------------------------------------
+// Worktrees and reflogs, shared by every reachability walk
+// ---------------------------------------------------------------------------
+//
+// `prune`, `repack`, `pack-objects --reflog`, `rev-list`/`log`/`shortlog
+// --reflog`, `fsck`, `reflog expire --all` and `reflog drop --all` all walk
+// the reflogs of every worktree. git does it through the ref store
+// (`refs_for_each_reflog()`, `refs_for_each_reflog_ent()`), so it reads
+// `logs/` or the reftable stacks alike; this is that walk, built on
+// [`crate::refstore`], and the one implementation those commands use.
+
+/// One entry of `get_worktrees()` (worktree.c:190-221): the main worktree
+/// first, then each `worktrees/<id>` whose `gitdir` file is not empty, in
+/// `readdir()` order (`get_linked_worktree()`, worktree.c:141-176).
+pub(super) struct ListedWorktree {
+    /// `get_worktree_git_dir()` (worktree.c:437-445).
+    pub(super) git_dir: PathBuf,
+    /// `wt->id`: `None` for the main worktree.
+    pub(super) id: Option<String>,
+    /// `wt->is_current`.
+    pub(super) is_current: bool,
+}
+
+impl ListedWorktree {
+    /// `strbuf_worktree_ref()` (worktree.c:587-600): a per-worktree `name`
+    /// of a worktree other than the current one gets its `main-worktree/` or
+    /// `worktrees/<id>/` prefix.
+    pub(super) fn ref_name(&self, name: &BStr) -> BString {
+        let per_worktree = gix::refs::reftable::parse_worktree_ref(name).0
+            == gix::refs::reftable::WorktreeType::Current;
+        let mut out = BString::default();
+        if per_worktree && !self.is_current {
+            match &self.id {
+                None => out.extend_from_slice(b"main-worktree/"),
+                Some(id) => {
+                    out.extend_from_slice(b"worktrees/");
+                    out.extend_from_slice(id.as_bytes());
+                    out.push(b'/');
+                }
+            }
+        }
+        out.extend_from_slice(name);
+        out
+    }
+
+    /// `refs_for_each_reflog(get_worktree_ref_store(wt), …)`: the names of
+    /// the reflogs that worktree's ref store holds, its own merged with the
+    /// shared ones, unprefixed. The current worktree's store is the main ref
+    /// store (refs.c:2453-2454); a worktree that cannot be opened has none.
+    pub(super) fn reflog_names(&self, repo: &gix::Repository) -> Result<Vec<BString>> {
+        if self.is_current {
+            return crate::refstore::reflog_names(repo, false);
+        }
+        match gix::open_opts(&self.git_dir, repo.open_options().clone()) {
+            Ok(store) => crate::refstore::reflog_names(&store, false),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+}
+
+/// `get_worktrees()`, each entry's `is_current` decided as
+/// [`any_worktree_is_current`] explains.
+pub(super) fn get_worktrees(repo: &gix::Repository) -> Vec<ListedWorktree> {
+    let real = |p: &Path| gix::path::realpath(p).unwrap_or_else(|_| p.to_path_buf());
+    let current = any_worktree_is_current(repo).then(|| real(repo.git_dir()));
+    let is_current = |git_dir: &Path| current.as_ref().is_some_and(|c| *c == real(git_dir));
+    let common = repo.common_dir().to_path_buf();
+    let mut out = vec![ListedWorktree {
+        is_current: is_current(&common),
+        git_dir: common.clone(),
+        id: None,
+    }];
+    let Ok(read) = fs::read_dir(common.join("worktrees")) else {
+        return out;
+    };
+    for entry in read.flatten() {
+        let git_dir = entry.path();
+        if fs::read(git_dir.join("gitdir")).map_or(true, |c| c.is_empty()) {
+            continue;
+        }
+        out.push(ListedWorktree {
+            is_current: is_current(&git_dir),
+            id: Some(entry.file_name().to_string_lossy().into_owned()),
+            git_dir,
+        });
+    }
+    out
+}
+
+/// Whether any entry of `get_worktrees()` has `is_current` set, as
+/// `is_current_worktree()` (worktree.c:58-66) decides it:
+///
+/// ```c
+/// char *git_dir = absolute_pathdup(repo_get_git_dir(wt->repo));
+/// char *wt_git_dir = get_worktree_git_dir(wt);
+/// int is_current = !fspathcmp(git_dir, absolute_path(wt_git_dir));
+/// ```
+///
+/// This is a string comparison, so the *spelling* of `$GIT_DIR` decides it:
+///
+/// * In the main repository `get_worktree_git_dir()` answers the common dir,
+///   which without a `commondir` file is the git dir as spelled — equal to
+///   itself however it is spelled.
+/// * In a linked worktree it answers `<commondir>/worktrees/<id>`, and
+///   `get_common_dir_noenv()` (setup.c:323-350) runs the `commondir` file
+///   through `strbuf_add_real_path()`, so that side is a resolved path. The git
+///   dir matches it only when it is spelled that way too. Discovery standing *in*
+///   the admin directory sets it to `"."` (`setup_bare_git_dir()`,
+///   setup.c:1283-1284), which `strbuf_add_absolute_path()` (abspath.c:293-316)
+///   turns into `<cwd>/.` — never equal. Discovery from below it, or through a
+///   checkout's gitfile, spells it resolved and matches; `$GIT_DIR` is taken as
+///   given.
+///
+/// Measured on git 2.55.0 with a linked worktree `wt`: `reflog expire --all` run
+/// in `.git/worktrees/wt` (or with `GIT_DIR=.` there) keeps the reflogs of
+/// `refs/heads/*`, while `GIT_DIR=$PWD`, `.git/worktrees/wt/logs` and `.git`
+/// all expire them.
+fn any_worktree_is_current(repo: &gix::Repository) -> bool {
+    let real = |p: &Path| gix::path::realpath(p).unwrap_or_else(|_| p.to_path_buf());
+    let common = real(repo.common_dir());
+    let git_dir = real(repo.git_dir());
+    if git_dir == common {
+        return true;
+    }
+    let Some(id) = git_dir.file_name() else { return true };
+    let wt_git_dir = common.join("worktrees").join(id);
+    let Ok(cwd) = std::env::current_dir() else { return true };
+    let spelled = match std::env::var_os("GIT_DIR") {
+        Some(value) => PathBuf::from(value),
+        None if real(&cwd) == git_dir => PathBuf::from("."),
+        None => return true,
+    };
+    let absolute = if spelled.is_absolute() {
+        spelled.into_os_string()
+    } else {
+        // `strbuf_add_absolute_path()` prefixes `$PWD` when it names the same
+        // directory as `getcwd()`, and joins with one `/` without normalizing.
+        let pwd = std::env::var_os("PWD").map(PathBuf::from).filter(|pwd| real(pwd) == real(&cwd));
+        let mut base = pwd.unwrap_or(cwd).into_os_string();
+        if !base.to_string_lossy().ends_with('/') {
+            base.push("/");
+        }
+        base.push(spelled.as_os_str());
+        base
+    };
+    absolute == wt_git_dir.into_os_string()
+}
+
+/// `add_reflogs_to_pending(revs, flags)` (revision.c:1735-1747) with
+/// `handle_one_reflog_commit()` (:1670-1685): the old and the new id of every
+/// entry of every reflog, in the order git pends them — the main ref store's
+/// reflogs, then, unless `single_worktree`, every other worktree's
+/// (`add_other_reflogs_to_pending()`, :1716-1733), each named by
+/// `strbuf_worktree_ref()` and read through the main ref store.
+///
+/// A null id names no object and is skipped. An id `parse_object()` cannot
+/// produce is not pended, and with [`PrunedReflogWarning::Print`] the first
+/// one of each reflog is reported with
+/// `warning: reflog of '<name>' references pruned commits`.
+pub(super) fn add_reflogs_to_pending(
+    repo: &gix::Repository,
+    single_worktree: bool,
+    warning: PrunedReflogWarning,
+) -> Result<Vec<ObjectId>> {
+    let mut pending = Vec::new();
+    for name in crate::refstore::reflog_names(repo, !single_worktree)? {
+        let name = name.to_str_lossy();
+        let mut warned = false;
+        crate::refstore::for_each_reflog_entry(repo, &name, false, |entry| {
+            for id in [entry.old_oid, entry.new_oid] {
+                if id.is_null() {
+                    continue;
+                }
+                if repo.find_object(id).is_ok() {
+                    pending.push(id);
+                } else if !warned && warning == PrunedReflogWarning::Print {
+                    eprintln!("warning: reflog of '{name}' references pruned commits");
+                    warned = true;
+                }
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+    }
+    Ok(pending)
+}
+
+/// Whether [`add_reflogs_to_pending`] reports a reflog that names an object
+/// the repository no longer has, as `handle_one_reflog_commit()` does. A
+/// command that repeats git's single walk for a second purpose passes
+/// `Silent` for the repetition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrunedReflogWarning {
+    Print,
+    Silent,
 }

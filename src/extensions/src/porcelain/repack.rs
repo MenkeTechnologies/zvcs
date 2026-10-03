@@ -776,7 +776,9 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
 
     // git's `--all --reflog --indexed-objects`, which `prune` already builds.
     let mut roots = Vec::new();
-    super::prune::collect_roots(&repo, &mut roots)?;
+    // `pack-objects` reports a reflog naming a pruned commit, from the walk
+    // [`pack_objects_pending`] stands for; this set is the same walk again.
+    super::prune::collect_roots(&repo, &mut roots, super::prune::PrunedReflogWarning::Silent)?;
     let reachable = super::prune::close_over_excluding(&repo, roots, &promisor_held);
 
     let existing = super::prune::pack_indices(&repo, &objdir);
@@ -1667,27 +1669,10 @@ fn pack_objects_pending(repo: &gix::Repository, excluded: &HashSet<ObjectId>) ->
         }
     }
 
-    // `--reflog`: `add_one_reflog_ent()` pends the old and the new id of every
-    // entry. A null id is a ref's creation or deletion line and names no object.
-    let null = ObjectId::null(repo.object_hash());
-    let mut logs = vec![repo.common_dir().join("logs")];
-    let per_worktree = repo.git_dir().join("logs");
-    if per_worktree != logs[0] {
-        logs.push(per_worktree);
-    }
-    let mut files: Vec<PathBuf> = Vec::new();
-    for dir in &logs {
-        collect_log_files(dir, &mut files);
-    }
-    for file in files {
-        let Ok(buf) = fs::read(&file) else { continue };
-        for line in gix::refs::file::log::iter::forward(&buf).flatten() {
-            for id in [line.previous_oid(), line.new_oid()] {
-                if id != null {
-                    pending.push(id);
-                }
-            }
-        }
+    // `--reflog`: `add_reflogs_to_pending()`, the pending list of the
+    // `pack-objects` child, which is the walk that reports a pruned commit.
+    if let Ok(ids) = super::prune::add_reflogs_to_pending(repo, false, super::prune::PrunedReflogWarning::Print) {
+        pending.extend(ids);
     }
 
     // `--indexed-objects`: `do_add_index_objects_to_pending()` skips gitlinks,
@@ -1705,19 +1690,6 @@ fn pack_objects_pending(repo: &gix::Repository, excluded: &HashSet<ObjectId>) ->
 
     pending.retain(|id| !excluded.contains(id));
     pending
-}
-
-/// Every regular file below `dir`, recursively — the reflogs under `logs/`.
-fn collect_log_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => collect_log_files(&path, out),
-            Ok(t) if t.is_file() => out.push(path),
-            _ => {}
-        }
-    }
 }
 
 /// Every valid cache-tree id, recursively. A section with no entry count is

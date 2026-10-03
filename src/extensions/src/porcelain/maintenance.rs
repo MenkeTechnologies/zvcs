@@ -738,9 +738,8 @@ impl Drop for MaintenanceLock {
 ///
 ///   * **`pack-refs`** — the `git pack-refs --all --prune [--auto]` child
 ///     `maintenance_task_pack_refs()` runs.
-///   * **`reflog-expire`** — [`super::gc::expire_reflogs`], the same
-///     `reflog expire --all` port `git gc` runs, including the per-pattern
-///     `gc.<pattern>.reflogExpire*` policy and the reachability arm.
+///   * **`reflog-expire`** — the `git reflog expire --all` child
+///     `maintenance_task_reflog_expire()` runs (builtin/gc.c:329-336).
 ///   * **`gc`** — in the foreground `gc_foreground_tasks()` (builtin/gc.c:834-842):
 ///     `pack-refs` unless `gc.packRefs` is false, then `reflog expire --all`
 ///     unless both reflog expiries are `never`. In the background
@@ -779,7 +778,7 @@ fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> 
         // ends that process with 128, which the task reports as
         // `error: task 'pack-refs' failed` at exit 1.
         ("pack-refs", _) => pack_refs(),
-        ("reflog-expire", _) => super::gc::expire_reflogs(repo).is_ok(),
+        ("reflog-expire", _) => spawn_git(repo, &["reflog", "expire", "--all"]),
         ("gc", Phase::Foreground) => {
             // `cfg->pack_refs` is `-1` for `notbare`, which is true here: only
             // `cmd_gc()` resolves it against the repository.
@@ -1454,40 +1453,28 @@ fn reflog_expire_condition(repo: &gix::Repository) -> bool {
         Gate::Threshold(limit) => limit,
     };
 
-    let now = std::time::SystemTime::now();
-    let now_secs = now
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let (expire_total, expire_unreach) =
-        super::gc::load_reflog_config(repo, now_secs).resolve("HEAD");
+        super::reflog::ExpireConfig::read(repo, now).for_ref("HEAD", None, None);
 
-    let Ok(body) = std::fs::read(repo.git_dir().join("logs").join("HEAD")) else {
-        return false;
-    };
+    // `refs_for_each_reflog_ent(get_main_ref_store(the_repository), "HEAD",
+    // count_reflog_entries, &data)`, which reads the log through the ref store.
     let mut count: i64 = 0;
-    for line in body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        let Some((old, new, at)) = reflog_entry(line) else {
-            continue;
-        };
+    let _ = crate::refstore::for_each_reflog_entry(repo, "HEAD", false, |entry| {
+        let at = entry.timestamp as i64;
         let expires = at < expire_total
-            || (at < expire_unreach && (!old.is_null() || !new.is_null()));
+            || (at < expire_unreach && (!entry.old_oid.is_null() || !entry.new_oid.is_null()));
         if expires {
             count += 1;
             if count >= limit {
-                return true;
+                return std::ops::ControlFlow::Break(());
             }
         }
-    }
-    false
-}
-
-/// One reflog line as `(old, new, committer-seconds)`; `None` when the line does
-/// not parse, which git's iterator skips rather than counts.
-fn reflog_entry(line: &[u8]) -> Option<(gix::ObjectId, gix::ObjectId, i64)> {
-    let mut iter = gix::refs::file::log::iter::forward(line);
-    let parsed = iter.next()?.ok()?;
-    let at = parsed.signature.time().ok()?.seconds;
-    Some((parsed.previous_oid(), parsed.new_oid(), at))
+        std::ops::ControlFlow::Continue(())
+    });
+    count >= limit
 }
 
 /// `pack_refs_condition()`: more loose references than git's packed-refs-size

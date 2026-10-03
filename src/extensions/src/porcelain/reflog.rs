@@ -1,9 +1,11 @@
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use gix::bstr::ByteSlice;
 use gix::hash::ObjectId;
+use gix::refs::reftable::ExpireFlags;
 
 // ---------------------------------------------------------------------------
 // usage blocks — one per `parse_options()` call in builtin/reflog.c.
@@ -292,23 +294,19 @@ fn list(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if repo.git_dir() != repo.common_dir() {
-        bail!("`reflog list` from a linked worktree is not supported");
+    // `refs_for_each_reflog(get_main_ref_store(repo), show_reflog, NULL)`
+    // (builtin/reflog.c:167-178): in a linked worktree its own reflogs merged
+    // with the shared ones.
+    let mut out = Vec::new();
+    for name in crate::refstore::reflog_names(repo, false)? {
+        out.extend_from_slice(&name);
+        out.push(b'\n');
     }
-
-    let mut names: Vec<String> = Vec::new();
-    collect_logs(&repo.git_dir().join("logs"), "", &mut names)?;
-
-    let mut out = String::new();
-    for name in names {
-        out.push_str(&name);
-        out.push('\n');
-    }
-    print!("{out}");
+    std::io::Write::write_all(&mut std::io::stdout(), &out)?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// `git reflog exists <ref>` — a literal test for `$GIT_DIR/logs/<ref>`.
+/// `git reflog exists <ref>` — `refs_reflog_exists()` on the main ref store.
 fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
     let operands = match scan_no_options(rest, EXISTS_USAGE) {
         Ok(operands) => operands,
@@ -328,10 +326,7 @@ fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(128));
     }
 
-    let present = reflog_roots(repo)
-        .iter()
-        .any(|root| root.join(name).is_file());
-    Ok(if present {
+    Ok(if crate::refstore::reflog_exists(repo, name) {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -341,47 +336,6 @@ fn exists(repo: &gix::Repository, rest: &[String]) -> Result<ExitCode> {
 // ---------------------------------------------------------------------------
 // shared helpers
 // ---------------------------------------------------------------------------
-
-/// The directories that hold reflog files. Normally one; a linked worktree keeps
-/// its per-worktree logs (`HEAD`, `refs/bisect/*`) beside the shared ones.
-fn reflog_roots(repo: &gix::Repository) -> Vec<PathBuf> {
-    let git = repo.git_dir().join("logs");
-    let common = repo.common_dir().join("logs");
-    if git == common {
-        vec![git]
-    } else {
-        vec![git, common]
-    }
-}
-
-/// Append every log file below `dir` to `out` as a `/`-joined ref name, sorting
-/// each directory's entries by name so the result matches git's tree walk (a
-/// sub-directory is descended at its own sort position, not after its siblings).
-fn collect_logs(dir: &Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
-    let read = match std::fs::read_dir(dir) {
-        Ok(read) => read,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-
-    let mut items: Vec<(String, bool)> = Vec::new();
-    for entry in read {
-        let entry = entry?;
-        let is_dir = entry.file_type()?.is_dir();
-        items.push((entry.file_name().to_string_lossy().into_owned(), is_dir));
-    }
-    items.sort();
-
-    for (name, is_dir) in items {
-        let full = format!("{prefix}{name}");
-        if is_dir {
-            collect_logs(&dir.join(&name), &format!("{full}/"), out)?;
-        } else {
-            out.push(full);
-        }
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // delete / expire — the reflog write path
@@ -441,7 +395,7 @@ fn raw_line_message(line: &RawLine) -> Vec<u8> {
 
 /// `reflog_expire_config()` (reflog.c:35-83): the `gc.reflogExpire` /
 /// `gc.reflogExpireUnreachable` defaults plus the `gc.<pattern>.reflog*` entries.
-struct ExpireConfig {
+pub(super) struct ExpireConfig {
     /// `opts->default_expire_total`.
     default_total: i64,
     /// `opts->default_expire_unreachable`.
@@ -451,10 +405,13 @@ struct ExpireConfig {
 }
 
 impl ExpireConfig {
-    fn read(repo: &gix::Repository, default_total: i64, default_unreachable: i64) -> Self {
+    /// `REFLOG_EXPIRE_OPTIONS_INIT(now)` (reflog.h:25-28) — entries 30 days old
+    /// expire, and unreachable ones after 90 — then `reflog_expire_config()`.
+    pub(super) fn read(repo: &gix::Repository, now: i64) -> Self {
+        const DAY: i64 = 24 * 60 * 60;
         let mut out = ExpireConfig {
-            default_total,
-            default_unreachable,
+            default_total: now - 30 * DAY,
+            default_unreachable: now - 90 * DAY,
             entries: Vec::new(),
         };
         let config = repo.config_snapshot();
@@ -508,7 +465,7 @@ impl ExpireConfig {
     /// `reflog_expire_options_set_refname()` (reflog.c:99-133) for one ref: what the
     /// command line did not pin is filled from the first matching pattern, from
     /// `refs/stash`'s never-expire rule, or from the defaults.
-    fn for_ref(&self, refname: &str, cli_total: Option<i64>, cli_unreach: Option<i64>) -> (i64, i64) {
+    pub(super) fn for_ref(&self, refname: &str, cli_total: Option<i64>, cli_unreach: Option<i64>) -> (i64, i64) {
         if let (Some(total), Some(unreach)) = (cli_total, cli_unreach) {
             return (total, unreach);
         }
@@ -553,52 +510,27 @@ fn glob_matches(pattern: &str, refname: &str) -> bool {
     )
 }
 
-/// The per-worktree `logs` directory of every linked worktree, with the id that
-/// prefixes the ref names inside it.
-///
-/// A linked worktree's refs live at `$GIT_COMMON_DIR/worktrees/<id>/logs/<ref>`
-/// and are named `worktrees/<id>/<ref>`, which is what `strbuf_worktree_ref()`
-/// builds in `collect_reflog()`.
-fn linked_worktree_log_roots(repo: &gix::Repository) -> Vec<(String, PathBuf)> {
-    let dir = repo.common_dir().join("worktrees");
-    let Ok(read) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<(String, PathBuf)> = read
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .filter_map(|e| {
-            let id = e.file_name().to_string_lossy().into_owned();
-            // The current worktree's own logs were already collected by name.
-            (e.path() != repo.git_dir()).then(|| (id, e.path().join("logs")))
-        })
-        .collect();
-    out.sort();
-    out
+/// `files_reflog_path()` (refs/files-backend.c:239-264): the file the files
+/// backend keeps the reflog of `full_name` in. A per-worktree name (`HEAD`,
+/// `refs/bisect/…`, …) is the current worktree's, `main-worktree/<ref>` the
+/// main one's, `worktrees/<id>/<ref>` that worktree's, and anything else is
+/// shared.
+pub(crate) fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
+    use gix::refs::reftable::{parse_worktree_ref, WorktreeType};
+    let (kind, worktree, bare) = parse_worktree_ref(full_name.into());
+    let bare = gix::path::from_bstr(bare);
+    match kind {
+        WorktreeType::Current => repo.git_dir().join("logs").join(full_name),
+        WorktreeType::Shared | WorktreeType::Main => repo.common_dir().join("logs").join(bare),
+        WorktreeType::Other => repo
+            .common_dir()
+            .join("worktrees")
+            .join(gix::path::from_bstr(worktree.unwrap_or_default()))
+            .join("logs")
+            .join(bare),
+    }
 }
 
-/// The file a ref's reflog lives in. `HEAD` (and the other per-worktree
-/// pseudo-refs) belong to this worktree; everything else is shared.
-pub(crate) fn log_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
-    // `worktrees/<id>/<ref>` is another worktree's private ref, whose store is
-    // `$GIT_COMMON_DIR/worktrees/<id>` — the `logs/` goes *inside* it, not in front.
-    if let Some(rest) = full_name.strip_prefix("worktrees/") {
-        if let Some((id, ref_name)) = rest.split_once('/') {
-            return repo
-                .common_dir()
-                .join("worktrees")
-                .join(id)
-                .join("logs")
-                .join(ref_name);
-        }
-    }
-    let root = if full_name.starts_with("refs/") {
-        repo.common_dir()
-    } else {
-        repo.git_dir()
-    };
-    root.join("logs").join(full_name)
-}
 
 /// Read a reflog file as raw lines, oldest first. `None` when there is no log.
 fn read_raw_log(path: &Path) -> Result<Option<Vec<RawLine>>> {
@@ -756,7 +688,7 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // only decides the exit status.
     let mut status = ExitCode::SUCCESS;
     for spec in selectors {
-        if !delete_one(repo, spec, rewrite, updateref, dry_run, verbose)? {
+        if !reflog_delete(repo, spec, rewrite, updateref, dry_run, verbose)? {
             status = ExitCode::from(255);
         }
     }
@@ -792,7 +724,7 @@ fn delete_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// be a date: `count_reflog_ent()` then counts the entries older than it and
 /// `expire_total` is reset to 0, which turns the date into an ordinal before the
 /// expiry walk ever runs.
-fn delete_one(
+pub(super) fn reflog_delete(
     repo: &gix::Repository,
     spec: &str,
     rewrite: bool,
@@ -808,53 +740,46 @@ fn delete_one(
         eprintln!("error: no reflog for '{spec}'");
         return Ok(false);
     };
-    let path = log_file(repo, &full);
-    let mut lines = read_raw_log(&path)?.unwrap_or_default();
-
     // `strtoul(spec + 2, &ep, 10)`: leading digits, and `*ep == '}'` is what says
-    // the whole selector was the number.
+    // the whole selector was the number. `count_reflog_ent()` then counts the
+    // entries `refs_for_each_reflog_ent()` yields: all of them for `@{<n>}`
+    // (`opts.recno = -recno` then one `++` each), or those older than the date.
     let tail = &spec[at + 2..];
     let digits = tail.len() - tail.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-    let mut countdown: i64 = if tail[digits..] == *"}" {
-        // `opts.recno = -recno` then one `++` per entry.
-        lines.len() as i64 - tail[..digits].parse::<i64>().unwrap_or(0)
-    } else {
-        // `if (!cb->expire_total || timestamp < cb->expire_total) cb->recno++;`
-        let target = crate::date::approxidate(tail);
-        lines.iter().filter(|l| l.time < target).count() as i64
+    let older_than = (tail[digits..] != *"}").then(|| crate::date::approxidate(tail));
+    let mut recno: i64 = match older_than {
+        None => -tail[..digits].parse::<i64>().unwrap_or(0),
+        Some(_) => 0,
     };
+    let count = |time: i64| older_than.map_or(true, |target| time < target);
 
     // `refs_reflog_expire()` walks the log oldest entry first, and
     // `should_expire_reflog_ent()` reduces — with everything but `recno` unset —
     // to `if (cb->opts.recno && --(cb->opts.recno) == 0) return 1;`. So exactly one
     // entry is dropped, and a countdown that never reaches 0 drops none.
+    let flags = ExpireFlags { dry_run, update_ref: updateref, rewrite };
+    if crate::refstore::is_reftable(repo) {
+        crate::refstore::for_each_reflog_entry(repo, &full, false, |entry| {
+            if count(entry.timestamp as i64) {
+                recno += 1;
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+        let mut cb = ExpirePolicyCb::new(repo, 0, 0, verbose, dry_run);
+        cb.recno = recno;
+        return reftable_reflog_expire(repo, &full, flags, &mut cb);
+    }
+
+    let path = log_file(repo, &full);
+    let mut lines = read_raw_log(&path)?.unwrap_or_default();
+    recno += lines.iter().filter(|l| count(l.time)).count() as i64;
+    let mut cb = ExpirePolicyCb::new(repo, 0, 0, verbose, dry_run);
+    cb.recno = recno;
+    cb.prepare_for(&full, ref_value_resolved(repo, &full));
     let mut doomed: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
-        let expire = countdown != 0 && {
-            countdown -= 1;
-            countdown == 0
-        };
-        if expire {
+        if cb.should_expire(line.old, line.new, line.time, &raw_line_message(line)) {
             doomed = Some(i);
-        }
-        if verbose {
-            // `printf("keep %s", message)` — the reflog message already carries its
-            // own newline, so git adds none.
-            let verb = if !expire {
-                "keep"
-            } else if dry_run {
-                "would prune"
-            } else {
-                "prune"
-            };
-            let message = match line.bytes.iter().position(|b| *b == b'\t') {
-                Some(tab) => &line.bytes[tab + 1..],
-                None => &[][..],
-            };
-            let mut out = format!("{verb} ").into_bytes();
-            out.extend_from_slice(message);
-            out.push(b'\n');
-            std::io::Write::write_all(&mut std::io::stdout(), &out)?;
         }
     }
 
@@ -876,6 +801,7 @@ fn delete_one(
     }
     Ok(true)
 }
+
 
 /// ```c
 /// /*
@@ -940,15 +866,23 @@ fn update_ref_to(repo: &gix::Repository, full_name: &str, oid: ObjectId) -> Resu
     Ok(())
 }
 
-/// The loose file a ref lives in, by the same per-worktree rule as [`log_file`].
+/// `files_ref_path()` (refs/files-backend.c:266-290): the loose file a ref
+/// lives in, by the same per-worktree rule as [`log_file`].
 fn ref_file(repo: &gix::Repository, full_name: &str) -> PathBuf {
-    let root = if full_name.starts_with("refs/") {
-        repo.common_dir()
-    } else {
-        repo.git_dir()
-    };
-    root.join(full_name)
+    use gix::refs::reftable::{parse_worktree_ref, WorktreeType};
+    let (kind, worktree, bare) = parse_worktree_ref(full_name.into());
+    let bare = gix::path::from_bstr(bare);
+    match kind {
+        WorktreeType::Current => repo.git_dir().join(full_name),
+        WorktreeType::Shared | WorktreeType::Main => repo.common_dir().join(bare),
+        WorktreeType::Other => repo
+            .common_dir()
+            .join("worktrees")
+            .join(gix::path::from_bstr(worktree.unwrap_or_default()))
+            .join(bare),
+    }
 }
+
 
 /// `cmd_reflog_expire`'s `struct option options[]` (builtin/reflog.c), in table order,
 /// as [`super::resolve_long`] reads it.
@@ -993,12 +927,6 @@ const EXPIRE_OPTS: &[super::LongOpt] = &[
 /// `-1` and reaches the process as 255. Reading the log file and skipping it when it is
 /// absent — which is what this did instead — reports that repository as expired.
 fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
-    const DAY: i64 = 24 * 60 * 60;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
     let mut all = false;
     let mut single_worktree = false;
     let mut dry_run = false;
@@ -1133,12 +1061,70 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         refs.push(s.to_owned());
     }
 
-    // `repo_config(the_repository, reflog_expire_config, &opts)` (builtin/reflog.c:216).
-    let config = ExpireConfig::read(repo, now - 90 * DAY, now - 30 * DAY);
+    let request = ExpireRequest {
+        all,
+        single_worktree,
+        refs,
+        expire,
+        expire_unreachable,
+        flags: ExpireFlags { dry_run, update_ref: updateref, rewrite },
+        verbose,
+    };
+    // `return status`: `-1` from any `error()`, which the process truncates to 255.
+    Ok(match expire_reflogs(repo, &request)? {
+        true => ExitCode::SUCCESS,
+        false => ExitCode::from(255),
+    })
+}
+
+/// What `cmd_reflog_expire()` was asked to do once its options are parsed.
+pub(super) struct ExpireRequest {
+    /// `--all`.
+    pub(super) all: bool,
+    /// `--single-worktree`.
+    pub(super) single_worktree: bool,
+    /// The `<refs>` operands.
+    pub(super) refs: Vec<String>,
+    /// `--expire`, when given.
+    pub(super) expire: Option<i64>,
+    /// `--expire-unreachable`, when given.
+    pub(super) expire_unreachable: Option<i64>,
+    /// `--dry-run`, `--updateref`, `--rewrite`.
+    pub(super) flags: ExpireFlags,
+    /// `--verbose`.
+    pub(super) verbose: bool,
+}
+
+impl ExpireRequest {
+    /// `git reflog expire --all`, the request `gc` and `maintenance` run.
+    pub(super) fn all() -> Self {
+        ExpireRequest {
+            all: true,
+            single_worktree: false,
+            refs: Vec::new(),
+            expire: None,
+            expire_unreachable: None,
+            flags: ExpireFlags::default(),
+            verbose: false,
+        }
+    }
+}
+
+/// The body of `cmd_reflog_expire()` (builtin/reflog.c:215-300) after option
+/// parsing: `false` is the `-1` status of an `error()` along the way.
+pub(super) fn expire_reflogs(repo: &gix::Repository, request: &ExpireRequest) -> Result<bool> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // `repo_config(the_repository, reflog_expire_config, &opts)` (builtin/reflog.c:216)
+    // over `REFLOG_EXPIRE_OPTIONS_INIT(now)`.
+    let config = ExpireConfig::read(repo, now);
 
     // `int status = 0`, which every `error()` below ORs `-1` into.
-    let mut failed = false;
-    let targets: Vec<String> = if all {
+    let mut ok = true;
+    let mut targets: Vec<String> = Vec::new();
+    if request.all {
         // ```c
         // worktrees = get_worktrees();
         // for (p = worktrees; *p; p++) {
@@ -1149,137 +1135,49 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         // }
         // ```
         //
-        // (builtin/reflog.c:253-260.) `--all` covers every worktree, not just this one —
-        // a linked worktree contributes its per-worktree logs under
-        // `worktrees/<id>/<ref>` (`collect_reflog()` drops the shared refs it would
-        // otherwise report a second time).
-        let mut names = Vec::new();
-        for root in reflog_roots(repo) {
-            collect_logs(&root, "", &mut names)?;
-        }
-        if !single_worktree {
-            for (id, root) in linked_worktree_log_roots(repo) {
-                let mut own = Vec::new();
-                collect_logs(&root, "", &mut own)?;
-                names.extend(
-                    own.into_iter()
-                        // The shared half of a linked worktree's store is the same
-                        // `refs/…` this worktree already listed.
-                        .filter(|name| !name.starts_with("refs/"))
-                        .map(|name| format!("worktrees/{id}/{name}")),
-                );
+        // (builtin/reflog.c:253-260.) `--all` covers every worktree, in
+        // `get_worktrees()` order.
+        targets = collect_reflogs(repo, request.single_worktree)?;
+    }
+    // `repo_dwim_log()`, and the `error()` for a name it does not answer. The
+    // loop continues past a miss, so `expire nosuchref refs/heads/main` still
+    // expires the branch and still fails.
+    for name in &request.refs {
+        match dwim_log(repo, name) {
+            Some(full) => targets.push(full),
+            None => {
+                eprintln!("error: reflog could not be found: '{name}'");
+                ok = false;
             }
         }
-        names.sort();
-        names.dedup();
-        names
-    } else if refs.is_empty() {
-        // `cmd_reflog_expire` loops over `argc` refs and says nothing when there
-        // are none: `git reflog expire` on its own is a successful no-op, not a
-        // usage error.
-        Vec::new()
-    } else {
-        // `repo_dwim_log()`, and the `error()` for a name it does not answer. The
-        // loop continues past a miss, so `expire nosuchref refs/heads/main` still
-        // expires the branch and still fails.
-        let mut names = Vec::new();
-        for name in &refs {
-            match dwim_log(repo, name) {
-                Some(full) => names.push(full),
-                None => {
-                    eprintln!("error: reflog could not be found: '{name}'");
-                    failed = true;
-                }
-            }
-        }
-        names
-    };
+    }
 
     for full in targets {
         // `reflog_expire_options_set_refname(&cb.opts, ref)` before each expiry: the
         // command line wins, then the first `gc.<pattern>.reflog*` whose pattern matches,
         // then `refs/stash`'s never-expire rule, then the `gc.reflog*` defaults.
-        let (expire, expire_unreachable) = config.for_ref(&full, expire, expire_unreachable);
+        let (expire, expire_unreachable) = config.for_ref(&full, request.expire, request.expire_unreachable);
+        let mut cb = ExpirePolicyCb::new(repo, expire, expire_unreachable, request.verbose, request.flags.dry_run);
+        if crate::refstore::is_reftable(repo) {
+            ok &= reftable_reflog_expire(repo, &full, request.flags, &mut cb)?;
+            continue;
+        }
         let path = log_file(repo, &full);
         let Some(lines) = read_raw_log(&path)? else {
             continue;
         };
-        // ```c
-        // if (!cb->opts.expire_unreachable || is_head(refname)) {
-        //         cb->unreachable_expire_kind = UE_HEAD;
-        // } else {
-        //         commit = lookup_commit_reference_gently(the_repository, oid, 1);
-        //         …
-        //         cb->unreachable_expire_kind = commit ? UE_NORMAL : UE_ALWAYS;
-        // }
-        //
-        // if (cb->opts.expire_unreachable <= cb->opts.expire_total)
-        //         cb->unreachable_expire_kind = UE_ALWAYS;
-        //
-        // switch (cb->unreachable_expire_kind) {
-        // case UE_ALWAYS:  return;
-        // case UE_HEAD:    refs_for_each_ref(…, push_tip_to_list, &cb->tips); …
-        // case UE_NORMAL:  commit_list_insert(commit, &cb->mark_list);
-        // }
-        // ```
-        //
-        // (`reflog_expiry_prepare()`, reflog.c:446-483.) `HEAD`'s reachability set is
-        // built from *every ref*, not from HEAD's own tip — which is what keeps a `HEAD`
-        // entry naming a commit that some branch still holds. `UE_ALWAYS` skips the
-        // reachability question entirely and expires on age alone.
-        let kind = if expire_unreachable == 0 || is_head_log(&full) {
-            Unreachable::Head
-        } else if ref_tip_commit(repo, &full).is_some() {
-            Unreachable::Normal
-        } else {
-            Unreachable::Always
-        };
-        let kind = match expire_unreachable <= expire {
-            true => Unreachable::Always,
-            false => kind,
-        };
-        let reachable = match kind {
-            Unreachable::Always => None,
-            Unreachable::Head => Some(reachable_from_all_refs(repo)?),
-            Unreachable::Normal => Some(reachable_from_ref(repo, &full)?),
-        };
+        cb.prepare_for(&full, ref_value_resolved(repo, &full));
         let mut kept: Vec<RawLine> = Vec::new();
         for line in lines {
-            // `is_unreachable()` answers "keep" for a null id and for anything that is
-            // not a commit, and it is asked about *both* ends of the entry.
-            let unreachable = |id: &ObjectId| {
-                reachable.as_ref().is_some_and(|set| {
-                    !id.is_null() && repo.find_commit(*id).is_ok() && !set.contains(id)
-                })
-            };
-            let expired = line.time < expire
-                || (line.time < expire_unreachable
-                    && match kind {
-                        Unreachable::Always => true,
-                        _ => unreachable(&line.old) || unreachable(&line.new),
-                    });
-            if verbose {
-                // `should_expire_reflog_ent_verbose()` (reflog.c:404-424). `message`
-                // carries its own newline.
-                let what = match (expired, dry_run) {
-                    (false, _) => "keep",
-                    (true, true) => "would prune",
-                    (true, false) => "prune",
-                };
-                let mut out = Vec::from(what.as_bytes());
-                out.push(b' ');
-                out.extend_from_slice(&raw_line_message(&line));
-                let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
-            }
-            if !expired {
+            if !cb.should_expire(line.old, line.new, line.time, &raw_line_message(&line)) {
                 kept.push(line);
             }
         }
-        if dry_run {
+        if request.flags.dry_run {
             continue;
         }
-        write_raw_log(&path, &kept, rewrite)?;
-        if updateref {
+        write_raw_log(&path, &kept, request.flags.rewrite)?;
+        if request.flags.update_ref {
             if let Some(newest) = kept.last() {
                 if !is_symref(repo, &full) {
                     update_ref_to(repo, &full, newest.new)?;
@@ -1287,11 +1185,50 @@ fn expire_entries(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    // `return status`: `-1` from any `error()` above, which the process truncates to 255.
-    Ok(match failed {
-        true => ExitCode::from(255),
-        false => ExitCode::SUCCESS,
-    })
+    Ok(ok)
+}
+
+/// `collect_reflog()` (builtin/reflog.c:91-109) over every worktree's ref store,
+/// or only the current one's with `single_worktree`: the reflogs `--all` names,
+/// each spelt by `strbuf_worktree_ref()`, a shared one only through the current
+/// worktree so it is not collected once per worktree.
+fn collect_reflogs(repo: &gix::Repository, single_worktree: bool) -> Result<Vec<String>> {
+    use gix::refs::reftable::{parse_worktree_ref, WorktreeType};
+    let mut names = Vec::new();
+    for wt in super::prune::get_worktrees(repo) {
+        if single_worktree && !wt.is_current {
+            continue;
+        }
+        for name in wt.reflog_names(repo)? {
+            if !wt.is_current && parse_worktree_ref(name.as_ref()).0 == WorktreeType::Shared {
+                continue;
+            }
+            names.push(wt.ref_name(name.as_ref()).to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// `refs_reflog_expire()` on a reftable repository (`reftable_be_reflog_expire()`,
+/// refs/reftable-backend.c:2575-2737), the policy deciding each entry. A failure is
+/// git's `error()`, reported and returned as `false`.
+fn reftable_reflog_expire(
+    repo: &gix::Repository,
+    full: &str,
+    flags: ExpireFlags,
+    cb: &mut ExpirePolicyCb<'_>,
+) -> Result<bool> {
+    let name = gix::refs::FullName::try_from(full)?;
+    if (cb.expire_unreachable == 0 || is_head_log(full)) && cb.expire_unreachable > cb.expire_total {
+        cb.head_tips = Some(all_ref_tip_commits(repo));
+    }
+    match repo.reftable_reflog_expire(name.as_ref(), flags, cb) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            eprintln!("error: {err}");
+            Ok(false)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,22 +1308,13 @@ fn drop_reflogs(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 
     if all {
         // git collects from every worktree's ref store, or from this one alone under
-        // `--single-worktree`, and deletes what it collected from the *main* store.
-        // [`reflog_roots`] returns this worktree's private root and the shared one, so
-        // both settings produce the same set here and the flag changes nothing: what
-        // is missed is another worktree's per-worktree logs, which `--single-worktree`
-        // would have excluded anyway. Kept as the same walk `expire --all` uses.
-        let _ = single_worktree;
-        let mut names = Vec::new();
-        for root in reflog_roots(repo) {
-            collect_logs(&root, "", &mut names)?;
+        // `--single-worktree`, and deletes what it collected from the *main* store
+        // (builtin/reflog.c:370-393).
+        let mut ok = true;
+        for name in collect_reflogs(repo, single_worktree)? {
+            ok &= delete_reflog(repo, &name)?;
         }
-        names.sort();
-        names.dedup();
-        for name in names {
-            remove_reflog_file(&log_file(repo, &name))?;
-        }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(255) });
     }
 
     let mut ret = ExitCode::SUCCESS;
@@ -1396,70 +1324,38 @@ fn drop_reflogs(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             ret = ExitCode::from(255);
             continue;
         };
-        remove_reflog_file(&log_file(repo, &full))?;
+        if !delete_reflog(repo, &full)? {
+            ret = ExitCode::from(255);
+        }
     }
     Ok(ret)
 }
 
-/// `repo_dwim_log()` (refs.c:840-879): the first of git's rev-parse spellings of
-/// `name` that both resolves as a reference and has a reflog. When the reference
-/// resolves somewhere else and only the target carries a log, that target is the
-/// answer instead — which is how a symref's log is found through its own name.
-pub(crate) fn dwim_log(repo: &gix::Repository, name: &str) -> Option<String> {
-    let substituted = substitute_branch_name(repo, name);
-    let name = substituted.as_deref().unwrap_or(name);
-    // `ref_rev_parse_rules` (refs.c), in order.
-    const RULES: &[&str] = &[
-        "",
-        "refs/",
-        "refs/tags/",
-        "refs/heads/",
-        "refs/remotes/",
-    ];
-    let candidates = RULES
-        .iter()
-        .map(|prefix| format!("{prefix}{name}"))
-        .chain(std::iter::once(format!("refs/remotes/{name}/HEAD")));
-    for path in candidates {
-        // `refs_resolve_ref_unsafe(refs, path.buf, RESOLVE_REF_READING, …)`: the
-        // spelling has to name a reference that exists, not merely a log file, and a
-        // symref chain that dead-ends counts as not existing.
-        let Some(resolved) = resolve_ref_reading(repo, &path) else {
-            continue;
-        };
-        if log_file(repo, &path).is_file() {
-            return Some(path);
-        }
-        // `else if (strcmp(ref, path.buf) && refs_reflog_exists(refs, ref))`.
-        if resolved != path && log_file(repo, &resolved).is_file() {
-            return Some(resolved);
+/// `refs_delete_reflog()` on the main ref store: the files backend unlinks the
+/// log, the reftable backend writes deletions for its entries
+/// (`reftable_be_delete_reflog()`, refs/reftable-backend.c:2480-2501). `false`
+/// is a reported `error()`.
+fn delete_reflog(repo: &gix::Repository, full: &str) -> Result<bool> {
+    if !crate::refstore::is_reftable(repo) {
+        remove_reflog_file(&log_file(repo, full))?;
+        return Ok(true);
+    }
+    let name = gix::refs::FullName::try_from(full)?;
+    match repo.reftable_delete_reflog(name.as_ref()) {
+        Ok(()) => Ok(true),
+        Err(err) => {
+            eprintln!("error: {err}");
+            Ok(false)
         }
     }
-    None
 }
 
-/// `substitute_branch_name()` (refs.c:826-841): the name `repo_dwim_log()` really
-/// looks up, when `repo_interpret_branch_name()` rewrites the whole spec. `None`
-/// leaves the spec as typed.
-///
-/// Two of the three rewrites are here: the bare `@` that `interpret_empty_at()` turns
-/// into `HEAD`, and `@{-<n>}`, which `interpret_nth_prior_checkout()` reads off HEAD's
-/// own log. The third, `@{upstream}`/`@{push}`, is not — it resolves through the
-/// branch's remote configuration and carries its own family of `die()`s, so
-/// `git reflog drop @{u}` still reports the spec as a reflog it could not find rather
-/// than git's `no upstream configured for branch '<name>'`.
-fn substitute_branch_name(repo: &gix::Repository, name: &str) -> Option<String> {
-    if name == "@" {
-        return Some("HEAD".to_owned());
-    }
-    // The rewrite only applies when it consumed the entire spec; `@{-1}~2` keeps the
-    // remainder, which is not a reflog name anyway.
-    let (nth, used) = super::check_ref_format::parse_nth_prior(name.as_bytes())?;
-    if used != name.len() {
-        return None;
-    }
-    let branch = super::check_ref_format::nth_branch_switch(repo, nth)?;
-    String::from_utf8(branch).ok()
+/// `repo_dwim_log()` (refs.c:839-878): the first of git's rev-parse spellings of
+/// `name` that both resolves as a reference and has a reflog in the ref store,
+/// or the reference it resolves to when only that one carries a log — the one
+/// port in [`crate::objname::dwim_log`].
+pub(crate) fn dwim_log(repo: &gix::Repository, name: &str) -> Option<String> {
+    crate::objname::dwim_log(repo, name).1
 }
 
 /// `refs_resolve_ref_unsafe(…, RESOLVE_REF_READING, …)` — see
@@ -1528,6 +1424,14 @@ fn write_reflog(repo: &mut gix::Repository, args: &[String]) -> Result<ExitCode>
 
     let old = parse_write_oid(repo, old_spec, "old")?;
     let new = parse_write_oid(repo, new_spec, "new")?;
+
+    // `ref_transaction_update_reflog()` queues a `REF_LOG_ONLY` update that
+    // records the two ids as given (`REF_LOG_USE_PROVIDED_OIDS`, refs.c:1464-1494);
+    // the reftable transaction this port drives always logs the reference's
+    // current value as the old one, so it cannot write this entry.
+    if crate::refstore::is_reftable(repo) {
+        bail!("reflog write is not supported in a reftable repository: the ref store cannot log provided object ids");
+    }
 
     // `git_committer_info(0)`: `<name> <<email>> <seconds> <tz>`, the same string the
     // reflog writer would have filled in on its own. The non-strict form, so a machine
@@ -1657,8 +1561,6 @@ pub(super) fn normalize_reflog_message(msg: &str) -> String {
     out
 }
 
-/// Every commit reachable from a ref's current tip, which is what decides whether an
-/// entry counts as unreachable for `--expire-unreachable`.
 /// `reflog_expiry_prepare()`'s three reachability regimes.
 #[derive(Clone, Copy, PartialEq)]
 enum Unreachable {
@@ -1670,78 +1572,218 @@ enum Unreachable {
     Normal,
 }
 
-/// `is_head()` (reflog.c:439-444): the ref name with any worktree prefix stripped
-/// is exactly `HEAD`.
-fn is_head_log(full_name: &str) -> bool {
-    full_name == "HEAD"
-        || full_name
-            .rsplit_once('/')
-            .is_some_and(|(head, tail)| tail == "HEAD" && head.starts_with("worktrees/"))
+/// `struct expire_reflog_policy_cb` (reflog.h) and the three callbacks
+/// `refs_reflog_expire()` drives with it — `reflog_expiry_prepare()`,
+/// `should_expire_reflog_ent[_verbose]()` and `reflog_expiry_cleanup()`
+/// (reflog.c:337-505) — for one reflog. `reflog expire` and `reflog delete`
+/// (and through it `stash drop`) decide every entry here, whichever backend
+/// stores the log.
+pub(super) struct ExpirePolicyCb<'r> {
+    repo: &'r gix::Repository,
+    /// `opts.expire_total`.
+    expire_total: i64,
+    /// `opts.expire_unreachable`.
+    expire_unreachable: i64,
+    /// `opts.recno`: `reflog delete`'s count-down to the entry it drops, 0 when unused.
+    recno: i64,
+    /// `unreachable_expire_kind`.
+    kind: Unreachable,
+    /// The commits `mark_reachable()` reaches from the tips; `is_unreachable()`
+    /// digs to the root on a miss, so this is the full closure.
+    reachable: HashSet<ObjectId>,
+    /// `UE_HEAD`'s tips, read before the reftable store takes the lock on
+    /// its stack: the callbacks run under that lock, so they cannot read
+    /// references through the store themselves.
+    head_tips: Option<Vec<ObjectId>>,
+    /// `--verbose`: `should_expire_reflog_ent_verbose()`.
+    verbose: bool,
+    /// `cb->dry_run`, which only changes what `--verbose` says.
+    dry_run: bool,
 }
 
-/// `lookup_commit_reference_gently(the_repository, oid, 1)` on a ref's target: the
-/// commit it names, or `None` when it names none.
-fn ref_tip_commit(repo: &gix::Repository, full_name: &str) -> Option<ObjectId> {
-    repo.try_find_reference(full_name)
-        .ok()
-        .flatten()
-        .and_then(|mut r| r.peel_to_id_in_place().ok())
-        .filter(|id| repo.find_commit(id.detach()).is_ok())
-        .map(|id| id.detach())
-}
+impl<'r> ExpirePolicyCb<'r> {
+    pub(super) fn new(repo: &'r gix::Repository, expire_total: i64, expire_unreachable: i64, verbose: bool, dry_run: bool) -> Self {
+        ExpirePolicyCb {
+            repo,
+            expire_total,
+            expire_unreachable,
+            recno: 0,
+            kind: Unreachable::Always,
+            reachable: HashSet::new(),
+            head_tips: None,
+            verbose,
+            dry_run,
+        }
+    }
 
-/// `push_tip_to_list()` over `refs_for_each_ref()`, closed over: the commits every
-/// non-symbolic ref reaches, which is `UE_HEAD`'s notion of reachable.
-fn reachable_from_all_refs(
-    repo: &gix::Repository,
-) -> Result<std::collections::HashSet<ObjectId>> {
-    let mut tips: Vec<ObjectId> = Vec::new();
-    if let Ok(platform) = repo.references() {
-        if let Ok(iter) = platform.all() {
-            for reference in iter.flatten() {
-                let mut reference = reference;
-                if reference.target().try_id().is_none() {
-                    continue; // `if (ref->flags & REF_ISSYMREF) return 0;`
-                }
-                if let Ok(id) = reference.peel_to_id_in_place() {
-                    if repo.find_commit(id.detach()).is_ok() {
-                        tips.push(id.detach());
+    /// `reflog_expiry_prepare()` (reflog.c:446-483) for the reflog of
+    /// `refname`, whose reference holds `oid` (null when symbolic or missing).
+    ///
+    /// `HEAD`'s reachability set is built from *every ref*, not from HEAD's own
+    /// tip — which is what keeps a `HEAD` entry naming a commit that some branch
+    /// still holds. `UE_ALWAYS` skips the reachability question entirely and
+    /// expires on age alone.
+    fn prepare_for(&mut self, refname: &str, oid: ObjectId) {
+        let tip = (!oid.is_null()).then(|| peel_to_commit(self.repo, oid)).flatten();
+        self.kind = if self.expire_unreachable == 0 || is_head_log(refname) {
+            Unreachable::Head
+        } else if tip.is_some() {
+            Unreachable::Normal
+        } else {
+            Unreachable::Always
+        };
+        if self.expire_unreachable <= self.expire_total {
+            self.kind = Unreachable::Always;
+        }
+        self.reachable = match self.kind {
+            Unreachable::Always => HashSet::new(),
+            Unreachable::Head => {
+                let tips = self.head_tips.take().unwrap_or_else(|| all_ref_tip_commits(self.repo));
+                reachable_commits(self.repo, tips)
+            }
+            Unreachable::Normal => reachable_commits(self.repo, tip.into_iter().collect()),
+        };
+    }
+
+    /// `should_expire_reflog_ent()` (reflog.c:370-402), printed as
+    /// `should_expire_reflog_ent_verbose()` (:404-424) does under `--verbose`.
+    /// `message` is the entry's message as git passes it, its newline included.
+    fn should_expire(&mut self, old: ObjectId, new: ObjectId, timestamp: i64, message: &[u8]) -> bool {
+        let expire = self.decide(old, new, timestamp);
+        if self.verbose {
+            let what = match (expire, self.dry_run) {
+                (false, _) => "keep",
+                (true, true) => "would prune",
+                (true, false) => "prune",
+            };
+            let mut out = Vec::from(what.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(message);
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &out);
+        }
+        expire
+    }
+
+    fn decide(&mut self, old: ObjectId, new: ObjectId, timestamp: i64) -> bool {
+        if timestamp < self.expire_total {
+            return true;
+        }
+        // `opts.stalefix` is accepted and not acted on; see `--stale-fix` above.
+        if timestamp < self.expire_unreachable {
+            match self.kind {
+                Unreachable::Always => return true,
+                Unreachable::Head | Unreachable::Normal => {
+                    if self.is_unreachable(old) || self.is_unreachable(new) {
+                        return true;
                     }
                 }
             }
         }
+        if self.recno != 0 {
+            self.recno -= 1;
+            if self.recno == 0 {
+                return true;
+            }
+        }
+        false
     }
-    let mut set = std::collections::HashSet::new();
+
+    /// `is_unreachable()` (reflog.c:337-365): a null id and anything that does
+    /// not peel to a commit are kept; a commit is unreachable when it is not in
+    /// the closure of the tips.
+    fn is_unreachable(&self, oid: ObjectId) -> bool {
+        if oid.is_null() {
+            return false;
+        }
+        peel_to_commit(self.repo, oid).is_some_and(|commit| !self.reachable.contains(&commit))
+    }
+}
+
+/// The reftable backend calls back into the same policy.
+impl gix::refs::reftable::ExpirePolicy for ExpirePolicyCb<'_> {
+    fn prepare(&mut self, refname: &gix::refs::FullNameRef, oid: &gix::hash::oid) {
+        self.prepare_for(&refname.as_bstr().to_str_lossy(), oid.to_owned());
+    }
+
+    fn should_prune(&mut self, entry: &gix::refs::log::Line) -> bool {
+        // The record's message is handed over without its newline. git's
+        // writer ends every message it stores with one, an empty message
+        // included (`reftable_writer_add_log()`, reftable/writer.c:466-489), and
+        // `should_expire_reflog_ent_verbose()` prints it as stored.
+        let mut message = entry.message.to_vec();
+        message.push(b'\n');
+        self.should_expire(entry.previous_oid, entry.new_oid, entry.signature.time.seconds, &message)
+    }
+
+    fn cleanup(&mut self) {
+        self.reachable.clear();
+    }
+
+    /// `peel_object()`: the object an annotated tag at `oid` finally names,
+    /// stored with the reference `--updateref` writes.
+    fn peel(&mut self, oid: &gix::hash::oid) -> Option<ObjectId> {
+        let object = self.repo.find_object(oid).ok()?;
+        if object.kind != gix::object::Kind::Tag {
+            return None;
+        }
+        object.peel_tags_to_end().ok().map(|peeled| peeled.id)
+    }
+}
+
+/// `is_head()` (reflog.c:439-444): the ref name with any worktree prefix stripped
+/// is exactly `HEAD`.
+fn is_head_log(full_name: &str) -> bool {
+    gix::refs::reftable::parse_worktree_ref(full_name.into()).2 == "HEAD"
+}
+
+/// `lookup_commit_reference_gently(the_repository, oid, 1)`: the commit `oid`
+/// names, through any chain of annotated tags, or `None` for anything else.
+fn peel_to_commit(repo: &gix::Repository, oid: ObjectId) -> Option<ObjectId> {
+    let object = repo.find_object(oid).ok()?;
+    object.peel_tags_to_end().ok().filter(|o| o.kind == gix::object::Kind::Commit).map(|o| o.id)
+}
+
+/// The value `files_reflog_expire()` hands to the prepare callback:
+/// `lock_ref_oid_basic()` resolves the reference through symbolic ones
+/// (refs/files-backend.c:1296-1303), null when it does not resolve.
+fn ref_value_resolved(repo: &gix::Repository, full_name: &str) -> ObjectId {
+    repo.try_find_reference(full_name)
+        .ok()
+        .flatten()
+        .and_then(|mut r| r.follow_to_object().ok())
+        .map(|id| id.detach())
+        .unwrap_or_else(|| ObjectId::null(repo.object_hash()))
+}
+
+/// `push_tip_to_list()` over `refs_for_each_ref()`: the commit of every
+/// reference that is not symbolic, `UE_HEAD`'s tips.
+fn all_ref_tip_commits(repo: &gix::Repository) -> Vec<ObjectId> {
+    let mut tips = Vec::new();
+    if let Ok(platform) = repo.references() {
+        if let Ok(iter) = platform.all() {
+            for reference in iter.flatten() {
+                // `if (ref->flags & REF_ISSYMREF) return 0;`
+                let Some(id) = reference.target().try_id().map(ToOwned::to_owned) else {
+                    continue;
+                };
+                tips.extend(peel_to_commit(repo, id));
+            }
+        }
+    }
+    tips
+}
+
+/// The commits reachable from `tips` through their parents.
+fn reachable_commits(repo: &gix::Repository, tips: Vec<ObjectId>) -> HashSet<ObjectId> {
+    let mut set = HashSet::new();
     if let Ok(walk) = repo.rev_walk(tips).all() {
         for info in walk.flatten() {
             set.insert(info.id);
         }
     }
-    Ok(set)
+    set
 }
 
-fn reachable_from_ref(
-    repo: &gix::Repository,
-    full_name: &str,
-) -> Result<std::collections::HashSet<ObjectId>> {
-    let mut set = std::collections::HashSet::new();
-    let Some(tip) = repo
-        .try_find_reference(full_name)
-        .ok()
-        .flatten()
-        .and_then(|mut r| r.peel_to_id_in_place().ok())
-        .map(|id| id.detach())
-    else {
-        return Ok(set);
-    };
-    let Ok(walk) = repo.rev_walk([tip]).all() else {
-        return Ok(set);
-    };
-    for info in walk.flatten() {
-        set.insert(info.id);
-    }
-    Ok(set)
-}
 
 #[cfg(test)]
 mod drop_write_tests {

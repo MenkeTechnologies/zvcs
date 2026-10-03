@@ -38,8 +38,11 @@ use gix::refs::{FullName, Target};
 ///     `fast-forwardable`, `local out of date`, …) needs the remote objects in
 ///     the local object database to run the ahead/behind reachability check,
 ///     which a bare ref advertisement does not provide.
-///   * Creating `refs/remotes/<name>/HEAD` writes no reflog entry (gitoxide
-///     skips reflogs for symbolic-target updates); stock `set-head` writes one.
+///   * `rename` in a reftable repository: git 2.56 moves the refs and copies
+///     every reflog entry in one transaction through
+///     `ref_transaction_update_reflog()` (builtin/remote.c:630-756), which the
+///     ref store's transaction API cannot express yet, so the renamed refs lose
+///     their reflogs and a symbolic `HEAD` among them.
 pub fn remote(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
     let mut idx = 0;
@@ -1093,6 +1096,11 @@ fn log_symref_update(
     previous: Option<gix::ObjectId>,
     message: &str,
 ) -> Result<()> {
+    // The reftable backend logs a symref update in the same transaction, as
+    // `write_transaction_table()` (refs/reftable-backend.c:1540-1599) does.
+    if crate::refstore::is_reftable(repo) {
+        return Ok(());
+    }
     let full = full_name(name)?;
     let Some(new) = resolved_id(repo, name)? else {
         return Ok(());
@@ -1413,6 +1421,7 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         .filter(|n| n != name)
         .collect();
     let mut skipped: Vec<String> = Vec::new();
+    let mut branches: Vec<FullName> = Vec::new();
     for ref_name in all_ref_names(repo)? {
         let full = ref_name.as_bstr();
         if !remote_find_tracking(repo, name, full) {
@@ -1428,7 +1437,20 @@ fn remove(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        delete_ref(repo, ref_name)?;
+        branches.push(ref_name);
+    }
+    // `refs_delete_refs(…, "remote: remove", &branches, REF_NO_DEREF)` (builtin/remote.c:1070-1073):
+    // one transaction for every collected ref, so a reftable store gains a single table.
+    if !branches.is_empty() {
+        repo.edit_references(branches.into_iter().map(|name| RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+                message: "remote: remove".into(),
+            },
+            name,
+            deref: false,
+        }))?;
     }
     if !skipped.is_empty() {
         eprintln!(

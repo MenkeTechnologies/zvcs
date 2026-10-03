@@ -4527,49 +4527,38 @@ fn rev_name(repo: &gix::Repository, oid: &ObjectId) -> Result<Option<String>> {
         }
     }
 
-    // 3. `git describe --contains` is `git name-rev`, a different algorithm that
-    // the vendored crates do not implement. It names a commit *relative to a tag
-    // that reaches it*, so it can only produce a name when some tag has `oid` in
-    // its history — when none does it fails and git falls through to step 4,
-    // which is then exactly what happens here.
-    if tag_reaches(repo, oid)? {
-        bail!(
-            "naming {oid} needs `git describe --contains` (name-rev), which is not ported; \
-             the submodule has a tag that reaches it but neither `describe` nor \
-             `describe --tags` named it"
-        );
+    // 3. `git describe --contains`: name-rev's answer, relative to a tag that
+    // reaches the commit. git runs every step as a `git describe` child in the
+    // submodule (`compute_rev_name()`, builtin/submodule--helper.c) with stderr
+    // discarded, and takes its stdout minus the newline when it exits 0.
+    if let Some(name) = describe_contains(repo, oid)? {
+        return Ok(Some(name));
     }
 
     // 4. `git describe --all --always`.
     describe_all_always(repo, oid)
 }
 
-/// Whether any tag in this repository has `oid` in its history — the precondition
-/// `git describe --contains` (`git name-rev --tags`) needs to name it at all.
-///
-/// One traversal from every tag, stopping as soon as `oid` turns up, which is the
-/// same ground `name-rev` covers before it decides it cannot describe the commit.
-fn tag_reaches(repo: &gix::Repository, oid: &ObjectId) -> Result<bool> {
-    let mut tips: Vec<ObjectId> = Vec::new();
-    {
-        let refs = repo.references()?;
-        for tag in refs.tags()? {
-            let Ok(mut tag) = tag else { continue };
-            if let Ok(peeled) = tag.peel_to_id() {
-                tips.push(peeled.detach());
-            }
-        }
-    }
-    if tips.is_empty() {
-        return Ok(false);
-    }
-    if tips.iter().any(|t| t == oid) {
-        return Ok(true);
-    }
-    let Ok(walk) = repo.rev_walk(tips).all() else {
-        return Ok(false);
+/// `git describe --contains <oid>` run as git runs it: a child in the
+/// submodule's work tree with the repository environment cleared
+/// (`prepare_submodule_repo_env()`), stderr discarded (`cp.no_stderr`), stdout
+/// captured. `None` when the child fails — no tag reaches the commit.
+fn describe_contains(repo: &gix::Repository, oid: &ObjectId) -> Result<Option<String>> {
+    let Some(dir) = repo.workdir() else {
+        return Ok(None);
     };
-    Ok(walk.filter_map(Result::ok).any(|info| info.id == *oid))
+    let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+    cmd.args(["describe", "--contains"]).arg(oid.to_hex().to_string());
+    submodule_child_env(&mut cmd, dir);
+    let out = cmd.stderr(std::process::Stdio::null()).output()?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let mut name = String::from_utf8_lossy(&out.stdout).into_owned();
+    if name.ends_with('\n') {
+        name.pop();
+    }
+    Ok(Some(name))
 }
 
 /// `git describe --all --always <oid>`, with the candidate table built the way

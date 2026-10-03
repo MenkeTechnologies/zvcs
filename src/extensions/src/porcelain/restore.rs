@@ -1220,13 +1220,15 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                     // (builtin/checkout.c:214-229). Only the other case invalidates.
                     // The new entry is `create_ce_flags(0)` (builtin/checkout.c:208), so
                     // skip-worktree, intent-to-add and assume-unchanged do not survive it.
+                    // The kept entry keeps its stat data too: zeroing it made the next
+                    // `status` re-hash a file nothing had touched.
                     if e.id != *id || e.mode != *mode || e.flags.contains(Flags::INTENT_TO_ADD) {
                         invalidated.push(path.clone());
                         e.flags = Flags::empty();
+                        e.id = *id;
+                        e.mode = *mode;
+                        e.stat = *stat;
                     }
-                    e.id = *id;
-                    e.mode = *mode;
-                    e.stat = *stat;
                 }
                 Err(_) => {
                     cur.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, BStr::new(path));

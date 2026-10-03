@@ -1,4 +1,4 @@
-//! A port of git's reftable library (`reftable/*.c`, git v2.55.0).
+//! A port of git's reftable library (`reftable/*.c`, git v2.56.0).
 //!
 //! A reftable is a binary, block-oriented file holding references and reflog
 //! entries sorted by name. A repository keeps a *stack* of them under
@@ -46,7 +46,7 @@ pub use error::{Error, Result};
 pub use iter::Iterator;
 pub use merged::MergedTable;
 pub use record::{LogRecord, LogUpdate, LogValue, RefRecord, RefValue};
-pub use stack::{Addition, LogExpiryConfig, Stack};
+pub use stack::{Addition, LogExpiryConfig, Stack, StackOptions};
 pub use table::Table;
 pub use writer::{WriteOptions, Writer};
 

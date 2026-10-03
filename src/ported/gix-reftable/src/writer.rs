@@ -24,8 +24,6 @@ pub struct WriteOptions {
     pub skip_index_objects: bool,
     /// How often to write complete keys. `0` means 16.
     pub restart_interval: u16,
-    /// The hash of the object IDs in the table.
-    pub hash_id: HashId,
     /// Mode for new files; `None` uses 0666 minus the umask.
     pub default_permissions: Option<u32>,
     /// Copy log messages exactly instead of requiring one line and appending `\n`.
@@ -44,7 +42,7 @@ pub struct WriteOptions {
 }
 
 impl WriteOptions {
-    /// `options_set_defaults()` (`writer.c:77-89`).
+    /// `options_set_defaults()` (`writer.c:77-86`).
     fn with_defaults(mut self) -> Self {
         if self.restart_interval == 0 {
             self.restart_interval = 16;
@@ -121,6 +119,8 @@ pub struct Writer<S: Sink> {
     min_update_index: u64,
     max_update_index: u64,
     opts: WriteOptions,
+    /// The hash of the object IDs in the table (`writer.h:30`).
+    hash_id: HashId,
     /// The writer for the current section, if one is open.
     block_writer: Option<BlockWriter>,
     /// Pending index records for the current section.
@@ -133,8 +133,9 @@ pub struct Writer<S: Sink> {
 }
 
 impl<S: Sink> Writer<S> {
-    /// `reftable_writer_new()` (`writer.c:147-182`).
-    pub fn new(sink: S, opts: &WriteOptions) -> Result<Self> {
+    /// `reftable_writer_new()` (`writer.c:144-191`): a writer of a table whose
+    /// object IDs are of `hash_id`.
+    pub fn new(sink: S, hash_id: HashId, opts: &WriteOptions) -> Result<Self> {
         let opts = opts.clone().with_defaults();
         if opts.block_size >= (1 << 24) {
             return Err(Error::Api);
@@ -148,6 +149,7 @@ impl<S: Sink> Writer<S> {
             min_update_index: 0,
             max_update_index: 0,
             opts,
+            hash_id,
             block_writer: None,
             index: Vec::new(),
             obj_index: BTreeMap::new(),
@@ -157,7 +159,7 @@ impl<S: Sink> Writer<S> {
         Ok(w)
     }
 
-    /// `reftable_writer_set_limits()` (`writer.c:184-202`): the update index
+    /// `reftable_writer_set_limits()` (`writer.c:193-211`): the update index
     /// range of the records to come. Must be called before adding any.
     pub fn set_limits(&mut self, min: u64, max: u64) -> Result<()> {
         if self.next != 0 || !self.last_key.is_empty() {
@@ -188,12 +190,12 @@ impl<S: Sink> Writer<S> {
         self.sink
     }
 
-    /// `writer_version()` (`writer.c:91-96`).
+    /// `writer_version()` (`writer.c:88-93`).
     fn version(&self) -> u8 {
-        if self.opts.hash_id == HashId::Sha1 { 1 } else { 2 }
+        if self.hash_id == HashId::Sha1 { 1 } else { 2 }
     }
 
-    /// `writer_write_header()` (`writer.c:98-125`): write the header into
+    /// `writer_write_header()` (`writer.c:95-122`): write the header into
     /// `dest`, returning its length.
     fn write_header(&self, dest: &mut [u8]) -> usize {
         dest[..4].copy_from_slice(b"REFT");
@@ -202,16 +204,16 @@ impl<S: Sink> Writer<S> {
         dest[8..16].copy_from_slice(&self.min_update_index.to_be_bytes());
         dest[16..24].copy_from_slice(&self.max_update_index.to_be_bytes());
         if self.version() == 2 {
-            dest[24..28].copy_from_slice(&self.opts.hash_id.format_id().to_be_bytes());
+            dest[24..28].copy_from_slice(&self.hash_id.format_id().to_be_bytes());
         }
         header_size(self.version())
     }
 
-    /// `writer_reinit_block_writer()` (`writer.c:127-145`).
+    /// `writer_reinit_block_writer()` (`writer.c:124-142`).
     fn reinit_block_writer(&mut self, typ: u8) {
         let block_start = if self.next == 0 { header_size(self.version()) as u32 } else { 0 };
         self.last_key.clear();
-        let mut bw = BlockWriter::new(typ, self.opts.block_size, block_start, self.opts.hash_id.size());
+        let mut bw = BlockWriter::new(typ, self.opts.block_size, block_start, self.hash_id.size());
         bw.restart_interval = self.opts.restart_interval;
         self.block_writer = Some(bw);
     }
@@ -237,7 +239,7 @@ impl<S: Sink> Writer<S> {
         self.sink.write(data)
     }
 
-    /// `writer_index_hash()` (`writer.c:241-281`): note that the ref block
+    /// `writer_index_hash()` (`writer.c:250-290`): note that the ref block
     /// about to be written mentions `hash`.
     fn index_hash(&mut self, hash: &[u8]) {
         let off = self.next;
@@ -248,7 +250,7 @@ impl<S: Sink> Writer<S> {
         offsets.push(off);
     }
 
-    /// `writer_add_record()` (`writer.c:283-343`).
+    /// `writer_add_record()` (`writer.c:292-352`).
     fn add_record(&mut self, rec: &Record) -> Result<()> {
         rec.key(&mut self.scratch);
         if self.last_key >= self.scratch {
@@ -276,7 +278,7 @@ impl<S: Sink> Writer<S> {
         self.block_writer.as_mut().expect("just set").add(rec)
     }
 
-    /// `reftable_writer_add_ref()` (`writer.c:345-395`). Records must be added
+    /// `reftable_writer_add_ref()` (`writer.c:354-404`). Records must be added
     /// in name order and within the limits of [`set_limits()`](Self::set_limits).
     pub fn add_ref(&mut self, r: &RefRecord) -> Result<()> {
         if r.update_index < self.min_update_index || r.update_index > self.max_update_index {
@@ -286,7 +288,7 @@ impl<S: Sink> Writer<S> {
         stored.update_index -= self.min_update_index;
         self.add_record(&Record::Ref(stored))?;
 
-        let hash_size = self.opts.hash_id.size();
+        let hash_size = self.hash_id.size();
         if !self.opts.skip_index_objects {
             if let Some(h) = r.val1() {
                 self.index_hash(&h[..hash_size]);
@@ -298,13 +300,13 @@ impl<S: Sink> Writer<S> {
         Ok(())
     }
 
-    /// `reftable_writer_add_refs()` (`writer.c:397-409`): sort by name, then add.
+    /// `reftable_writer_add_refs()` (`writer.c:406-418`): sort by name, then add.
     pub fn add_refs(&mut self, refs: &mut [RefRecord]) -> Result<()> {
         refs.sort_by(|a, b| a.refname.cmp(&b.refname));
         refs.iter().try_for_each(|r| self.add_ref(r))
     }
 
-    /// `reftable_writer_add_log_verbatim()` (`writer.c:411-430`).
+    /// `reftable_writer_add_log_verbatim()` (`writer.c:420-439`).
     fn add_log_verbatim(&mut self, log: &LogRecord) -> Result<()> {
         if self.block_writer.as_ref().is_some_and(|bw| bw.typ() == BLOCK_TYPE_REF) {
             self.finish_public_section()?;
@@ -316,7 +318,7 @@ impl<S: Sink> Writer<S> {
         self.add_record(&Record::Log(log.clone()))
     }
 
-    /// `reftable_writer_add_log()` (`writer.c:432-488`). Unless
+    /// `reftable_writer_add_log()` (`writer.c:441-497`). Unless
     /// [`WriteOptions::exact_log_message`] is set, the message must be a single
     /// line; trailing newlines are normalized to exactly one.
     pub fn add_log(&mut self, log: &LogRecord) -> Result<()> {
@@ -351,13 +353,13 @@ impl<S: Sink> Writer<S> {
         self.add_log_verbatim(&cleaned)
     }
 
-    /// `reftable_writer_add_logs()` (`writer.c:490-502`): sort by key, then add.
+    /// `reftable_writer_add_logs()` (`writer.c:499-511`): sort by key, then add.
     pub fn add_logs(&mut self, logs: &mut [LogRecord]) -> Result<()> {
         logs.sort_by(LogRecord::compare_key);
         logs.iter().try_for_each(|l| self.add_log(l))
     }
 
-    /// `writer_finish_section()` (`writer.c:504-595`): flush the last block and
+    /// `writer_finish_section()` (`writer.c:513-604`): flush the last block and
     /// write as many index levels as the section needs.
     fn finish_section(&mut self) -> Result<()> {
         let typ = self.block_writer.as_ref().expect("section open").typ();
@@ -397,7 +399,7 @@ impl<S: Sink> Writer<S> {
         Ok(())
     }
 
-    /// `writer_dump_object_index()` (`writer.c:682-704`) with
+    /// `writer_dump_object_index()` (`writer.c:691-713`) with
     /// `update_common()` and `write_object_record()`.
     fn dump_object_index(&mut self) -> Result<()> {
         // The shortest prefix that tells all object IDs apart, at least 2.
@@ -445,7 +447,7 @@ impl<S: Sink> Writer<S> {
         self.finish_section()
     }
 
-    /// `writer_finish_public_section()` (`writer.c:706-733`).
+    /// `writer_finish_public_section()` (`writer.c:715-742`).
     fn finish_public_section(&mut self) -> Result<()> {
         let Some(bw) = &self.block_writer else {
             return Ok(());
@@ -460,7 +462,7 @@ impl<S: Sink> Writer<S> {
         Ok(())
     }
 
-    /// `reftable_writer_close()` (`writer.c:735-787`): finish the last section
+    /// `reftable_writer_close()` (`writer.c:744-796`): finish the last section
     /// and write the footer. An empty table is still written, header and
     /// footer, and reported as [`Error::EmptyTable`].
     pub fn close(&mut self) -> Result<()> {
@@ -499,7 +501,7 @@ impl<S: Sink> Writer<S> {
         Ok(())
     }
 
-    /// `writer_flush_nonempty_block()` (`writer.c:798-873`).
+    /// `writer_flush_nonempty_block()` (`writer.c:807-882`).
     fn flush_nonempty_block(&mut self) -> Result<()> {
         let mut bw = self.block_writer.take().expect("block open");
         let typ = bw.typ();
@@ -547,7 +549,7 @@ impl<S: Sink> Writer<S> {
         Ok(())
     }
 
-    /// `writer_flush_block()` (`writer.c:875-882`).
+    /// `writer_flush_block()` (`writer.c:884-891`).
     fn flush_block(&mut self) -> Result<()> {
         match &self.block_writer {
             Some(bw) if bw.entries > 0 => self.flush_nonempty_block(),

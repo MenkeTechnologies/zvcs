@@ -12,7 +12,7 @@ use std::{
 };
 
 use gix_reftable::{
-    HashId, LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, WriteOptions, Writer,
+    HashId, LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, StackOptions, WriteOptions, Writer,
     record::Hash,
     table::Table,
 };
@@ -85,7 +85,7 @@ impl Repo {
         self.git(&["commit", "-q", "--allow-empty", "-m", msg]);
     }
 
-    fn stack(&self, opts: &WriteOptions) -> Stack {
+    fn stack(&self, opts: &StackOptions) -> Stack {
         Stack::new(&self.dir.join(".git/reftable"), opts).unwrap()
     }
 
@@ -110,7 +110,8 @@ fn unhex(s: &str) -> Hash {
     h
 }
 
-/// All live refs of `stack` as `name value` lines, symrefs as `name -> target`.
+/// All live refs of `stack` as `name value` lines, symrefs as `name -> target`,
+/// skipping deletion records as git's backend does (reftable-backend.c:654-655).
 fn dump_refs(stack: &Stack) -> Vec<String> {
     let mut it = stack.ref_iterator().unwrap();
     it.seek_ref(b"").unwrap();
@@ -120,20 +121,21 @@ fn dump_refs(stack: &Stack) -> Vec<String> {
         out.push(match &r.value {
             RefValue::Val1(h) | RefValue::Val2 { value: h, .. } => format!("{} {}", r.refname, hex(&h[..20])),
             RefValue::Symref(t) => format!("{} -> {t}", r.refname),
-            RefValue::Deletion => unreachable!("the stack suppresses deletions"),
+            RefValue::Deletion => continue,
         });
     }
     out
 }
 
-/// The log entries of `refname`, newest first, as `old new message`.
+/// The log entries of `refname`, newest first, as `old new message`, skipping
+/// deletion records as git's backend does (reftable-backend.c:2283-2286).
 fn dump_log(stack: &Stack, refname: &str) -> Vec<String> {
     let mut it = stack.log_iterator().unwrap();
     it.seek_log(refname.as_bytes()).unwrap();
     let mut l = LogRecord::default();
     let mut out = Vec::new();
     while it.next_log(&mut l).unwrap() && l.refname == refname {
-        let u = l.update().unwrap();
+        let Some(u) = l.update() else { continue };
         out.push(format!("{} {} {}", hex(&u.old_hash[..20]), hex(&u.new_hash[..20]), u.message));
     }
     out
@@ -157,7 +159,7 @@ fn populated() -> Option<Repo> {
 fn reads_what_stock_git_wrote() {
     let Some(repo) = populated() else { return };
     assert!(repo.table_files().len() > 1, "several additions leave several tables before compaction");
-    let stack = repo.stack(&WriteOptions::default());
+    let stack = repo.stack(&StackOptions::default());
 
     let mut expected: Vec<String> = repo
         .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
@@ -219,7 +221,7 @@ fn reads_compacted_and_indexed_tables() {
     repo.git(&["pack-refs", "--all"]);
     assert_eq!(repo.table_files().len(), 1, "pack-refs compacts the whole stack");
 
-    let stack = repo.stack(&WriteOptions::default());
+    let stack = repo.stack(&StackOptions::default());
     let expected = repo.git(&["for-each-ref", "--format=%(refname) %(objectname)"]).lines().count();
     assert_eq!(dump_refs(&stack).len(), expected + 1);
 
@@ -269,7 +271,7 @@ fn assert_rewrite_identical(repo: &Repo) {
     }
     assert!(!logs.is_empty());
 
-    let mut w = Writer::new(Vec::new(), &WriteOptions::default()).unwrap();
+    let mut w = Writer::new(Vec::new(), table.hash_id(), &WriteOptions::default()).unwrap();
     w.set_limits(table.min_update_index(), table.max_update_index()).unwrap();
     w.add_refs(&mut refs).unwrap();
     w.add_logs(&mut logs).unwrap();
@@ -307,7 +309,7 @@ fn stock_git_reads_what_was_written() {
         disable_auto_compact: true,
         ..Default::default()
     };
-    let mut stack = repo.stack(&opts);
+    let mut stack = repo.stack(&StackOptions::default());
 
     stack
         .add(
@@ -333,7 +335,7 @@ fn stock_git_reads_what_was_written() {
                     value: log_update(&head, "branch: Created by hand", 1112912000),
                 })
             },
-            0,
+            Some(&opts),
         )
         .unwrap();
     // Delete a branch git created, with its reflog, in a second table.
@@ -360,7 +362,7 @@ fn stock_git_reads_what_was_written() {
                 }
                 w.add_logs(&mut tombstones)
             },
-            0,
+            Some(&opts),
         )
         .unwrap();
 
@@ -384,7 +386,7 @@ fn stock_git_reads_what_was_written() {
 
     // Compacting everything keeps what git sees, and git keeps working on top.
     let before = repo.git(&["for-each-ref"]);
-    stack.compact_all(None).unwrap();
+    stack.compact_all(Some(&opts), None).unwrap();
     assert_eq!(repo.table_files().len(), 1);
     assert_eq!(repo.git(&["for-each-ref"]), before);
     repo.commit("four");
@@ -395,44 +397,152 @@ fn stock_git_reads_what_was_written() {
     );
 }
 
-#[test]
-fn concurrent_addition_is_outdated() {
-    let Some(repo) = populated() else { return };
-    let mut stale = repo.stack(&WriteOptions::default());
-    repo.commit("behind the stack's back");
-    let res = stale.add(
+fn add_symref(stack: &mut Stack, name: &str, target: &str, opts: Option<&WriteOptions>) -> gix_reftable::Result<()> {
+    stack.add(
         |w, st| {
             let ts = st.next_update_index();
             w.set_limits(ts, ts)?;
             w.add_ref(&RefRecord {
-                refname: "refs/heads/x".into(),
+                refname: name.into(),
                 update_index: ts,
-                value: RefValue::Deletion,
+                value: RefValue::Symref(target.into()),
             })
         },
-        0,
-    );
-    assert_eq!(res, Err(gix_reftable::Error::Outdated));
-    // With the reload flag, the addition goes through after catching up.
-    let mut stale = repo.stack(&WriteOptions::default());
-    repo.commit("again");
-    stale
-        .add(
-            |w, st| {
-                let ts = st.next_update_index();
-                w.set_limits(ts, ts)?;
-                w.add_ref(&RefRecord {
-                    refname: "refs/heads/y".into(),
-                    update_index: ts,
-                    value: RefValue::Symref("refs/heads/main".into()),
-                })
-            },
-            gix_reftable::stack::NEW_ADDITION_RELOAD,
-        )
-        .unwrap();
-    assert_eq!(repo.git(&["symbolic-ref", "refs/heads/y"]), "refs/heads/main\n");
-    assert_eq!(stale.hash_id(), HashId::Sha1);
+        opts,
+    )
 }
+
+/// Since 2.56 an addition reloads a stack that is out of date once locked
+/// (`reftable_stack_init_addition()`, stack.c:702-710) instead of failing.
+#[test]
+fn stale_addition_reloads() {
+    let Some(repo) = populated() else { return };
+    let mut stale = repo.stack(&StackOptions::default());
+    repo.commit("behind the stack's back");
+    let main = repo.git(&["rev-parse", "main"]);
+    add_symref(&mut stale, "refs/heads/y", "refs/heads/main", None).unwrap();
+    assert_eq!(repo.git(&["symbolic-ref", "refs/heads/y"]), "refs/heads/main\n");
+    assert_eq!(
+        repo.git(&["rev-parse", "main"]),
+        main,
+        "the concurrent commit survives the stale writer"
+    );
+    assert_eq!(
+        hex(&stale.read_ref(b"refs/heads/main").unwrap().unwrap().val1().unwrap()[..20]),
+        main.trim(),
+        "the stale stack caught up"
+    );
+    repo.git(&["refs", "verify"]);
+}
+
+/// The `tables.list` lock lives on the stack (stack.h:20-24); an addition that
+/// failed to take it must not release the lock another addition holds
+/// (`locked`, stack.c:643-648, 671-673).
+#[test]
+fn failed_addition_keeps_the_other_additions_lock() {
+    let Some(repo) = populated() else { return };
+    let mut stack = repo.stack(&StackOptions::default());
+    let lock = repo.dir.join(".git/reftable/tables.list.lock");
+    let opts = WriteOptions::default();
+
+    let mut first = stack.addition_new(Some(&opts)).unwrap();
+    assert!(lock.is_file(), "the addition holds the list lock");
+    assert_eq!(
+        stack.addition_new(Some(&opts)).err(),
+        Some(gix_reftable::Error::Lock),
+        "a second addition fails at once with a zero timeout"
+    );
+    assert_eq!(
+        add_symref(&mut stack, "refs/heads/z", "refs/heads/main", Some(&opts)),
+        Err(gix_reftable::Error::Lock)
+    );
+    assert!(lock.is_file(), "the failed additions left the first one's lock in place");
+    stack.reload().unwrap();
+
+    first
+        .add(&stack, |w, st| {
+            let ts = st.next_update_index();
+            w.set_limits(ts, ts)?;
+            w.add_ref(&RefRecord {
+                refname: "refs/heads/w".into(),
+                update_index: ts,
+                value: RefValue::Symref("refs/heads/main".into()),
+            })
+        })
+        .unwrap();
+    first.commit(&mut stack).unwrap();
+    assert!(!lock.exists(), "committing released the lock");
+    assert_eq!(repo.git(&["symbolic-ref", "refs/heads/w"]), "refs/heads/main\n");
+
+    // A dropped addition releases its lock, too.
+    let dropped = stack.addition_new(Some(&opts)).unwrap();
+    drop(dropped);
+    assert!(!lock.exists());
+    add_symref(&mut stack, "refs/heads/z", "refs/heads/main", Some(&opts)).unwrap();
+    repo.git(&["refs", "verify"]);
+}
+
+/// `suppress_deletions` became a stack option in 2.56 (reftable-stack.h:46,
+/// stack.c:341), off by default: git's backend skips deletions itself.
+#[test]
+fn deletions_are_suppressed_only_on_request() {
+    let Some(repo) = populated() else { return };
+    let out = Command::new(&repo.git)
+        .args(["branch", "-D", "topic"])
+        .current_dir(&repo.dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", repo._tmp.path())
+        .env("GIT_TEST_REFTABLE_AUTOCOMPACTION", "false")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let find_topic = |opts: &StackOptions| {
+        let stack = repo.stack(opts);
+        let mut it = stack.ref_iterator().unwrap();
+        it.seek_ref(b"refs/heads/topic").unwrap();
+        let mut r = RefRecord::default();
+        let found = it.next_ref(&mut r).unwrap() && r.refname == "refs/heads/topic";
+        assert!(stack.read_ref(b"refs/heads/topic").unwrap().is_none());
+        found.then_some(r)
+    };
+    let tombstone = find_topic(&StackOptions::default()).expect("the deletion record is visible");
+    assert!(tombstone.is_deletion());
+    assert!(
+        find_topic(&StackOptions {
+            suppress_deletions: true,
+            ..Default::default()
+        })
+        .is_none(),
+        "the merged iterator hides it"
+    );
+}
+
+/// `on_reload` runs after every reload (stack.c:498-499), including the
+/// initial one, and not when the stack is up to date.
+#[test]
+fn on_reload_runs_per_reload() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let Some(repo) = populated() else { return };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let mut stack = repo.stack(&StackOptions {
+        on_reload: Some(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        })),
+        ..Default::default()
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "opening the stack loads it");
+    stack.reload().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "an up-to-date stack is not reloaded");
+    repo.commit("four");
+    stack.reload().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 
 #[test]
 fn sha256_tables() {
@@ -448,7 +558,7 @@ fn sha256_tables() {
         &["init", "-q", "--object-format=sha256", "--ref-format=reftable", "repo"],
     );
     repo.commit("one");
-    let stack = repo.stack(&WriteOptions {
+    let stack = repo.stack(&StackOptions {
         hash_id: HashId::Sha256,
         ..Default::default()
     });
@@ -456,7 +566,7 @@ fn sha256_tables() {
     let head = repo.git(&["rev-parse", "HEAD"]);
     assert_eq!(hex(main.unwrap().val1().unwrap()), head.trim());
     assert!(
-        Stack::new(&repo.dir.join(".git/reftable"), &WriteOptions::default()).is_err(),
+        Stack::new(&repo.dir.join(".git/reftable"), &StackOptions::default()).is_err(),
         "a SHA-1 stack refuses SHA-256 tables"
     );
 }

@@ -8,7 +8,7 @@
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -24,9 +24,40 @@ use crate::{
     writer::{Sink, WriteOptions, Writer},
 };
 
-/// `REFTABLE_STACK_NEW_ADDITION_RELOAD`: reload the stack when it is out of
-/// date after locking it, instead of failing with [`Error::Outdated`].
-pub const NEW_ADDITION_RELOAD: u32 = 1 << 0;
+/// `struct reftable_stack_options` (`reftable-stack.h:29-48`): options related
+/// to opening a stack. The options for writing to it are passed to each
+/// operation that writes, as [`WriteOptions`].
+#[derive(Clone, Default)]
+pub struct StackOptions {
+    /// The hash of the object IDs in the tables.
+    pub hash_id: HashId,
+    /// Called whenever the stack is being reloaded, to discard cached
+    /// information that relies on the old stack's data. C's `on_reload` with
+    /// its `on_reload_payload` captured by the closure.
+    pub on_reload: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Hide deletion records from iterators over the merged stack.
+    pub suppress_deletions: bool,
+}
+
+impl std::fmt::Debug for StackOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StackOptions")
+            .field("hash_id", &self.hash_id)
+            .field("on_reload", &self.on_reload.is_some())
+            .field("suppress_deletions", &self.suppress_deletions)
+            .finish()
+    }
+}
+
+/// C's `st->list_lock` (`stack.h:20-24`): the lock on `tables.list` that an
+/// [`Addition`] holds, kept with the stack so that [`Stack::reload()`] can tell
+/// that the stack is locked. Shared with the addition, which releases it when
+/// it is committed or dropped.
+type ListLock = Arc<Mutex<Option<gix_lock::File>>>;
+
+fn lock_list(l: &ListLock) -> MutexGuard<'_, Option<gix_lock::File>> {
+    l.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// `struct reftable_log_expiry_config`: which reflog entries compaction drops.
 #[derive(Debug, Clone, Copy, Default)]
@@ -52,7 +83,7 @@ pub struct CompactionStats {
 
 /// The open `tables.list` of the last reload and the identity of the file it
 /// was, C's `list_fd` and `list_st`. Keeping the file open keeps its inode
-/// number from being recycled (`stack.c:450-485`).
+/// number from being recycled (`stack.c:463-492`).
 struct ListHandle {
     _file: std::fs::File,
     dev: u64,
@@ -63,8 +94,9 @@ struct ListHandle {
 pub struct Stack {
     list_file: PathBuf,
     list_handle: Option<ListHandle>,
+    list_lock: ListLock,
     reftable_dir: PathBuf,
-    opts: WriteOptions,
+    opts: StackOptions,
     /// The loaded tables; C's `st->tables` and `st->merged` share them.
     merged: MergedTable,
     stats: CompactionStats,
@@ -92,7 +124,7 @@ fn rand_u32() -> u32 {
     gix_utils::rng::usize(0..=u32::MAX as usize) as u32
 }
 
-/// `format_name()` (`stack.c:742-750`): `0x<min>-0x<max>-<random>`.
+/// `format_name()` (`stack.c:756-764`): `0x<min>-0x<max>-<random>`.
 fn format_name(min: u64, max: u64) -> String {
     format!("0x{min:012x}-0x{max:012x}-{:08x}", rand_u32())
 }
@@ -217,12 +249,13 @@ fn commit_lock(mut lock: gix_lock::File, buf: &[u8], fsync: bool) -> Result<()> 
 }
 
 impl Stack {
-    /// `reftable_new_stack()` (`stack.c:503-549`): open the stack in `dir`,
+    /// `reftable_new_stack()` (`stack.c:504-552`): open the stack in `dir`,
     /// which must exist; a missing `tables.list` is an empty stack.
-    pub fn new(dir: &Path, opts: &WriteOptions) -> Result<Self> {
+    pub fn new(dir: &Path, opts: &StackOptions) -> Result<Self> {
         let mut st = Stack {
             list_file: dir.join("tables.list"),
             list_handle: None,
+            list_lock: Arc::new(Mutex::new(None)),
             reftable_dir: dir.to_owned(),
             opts: opts.clone(),
             merged: MergedTable::new(Vec::new(), opts.hash_id)?,
@@ -237,8 +270,8 @@ impl Stack {
         &self.reftable_dir
     }
 
-    /// The write options of this stack.
-    pub fn options(&self) -> &WriteOptions {
+    /// The options this stack was opened with.
+    pub fn options(&self) -> &StackOptions {
         &self.opts
     }
 
@@ -276,7 +309,7 @@ impl Stack {
         self.reftable_dir.join(name)
     }
 
-    /// `reftable_stack_reload_once()` (`stack.c:226-366`): open the tables in
+    /// `reftable_stack_reload_once()` (`stack.c:227-367`): open the tables in
     /// `names`, reusing the already open ones of the same name if `reuse_open`.
     fn reload_once(&mut self, names: &[String], reuse_open: bool) -> Result<()> {
         let mut cur: Vec<Option<Arc<Table>>> = self.merged.tables.iter().cloned().map(Some).collect();
@@ -305,12 +338,12 @@ impl Stack {
             let _ = std::fs::remove_file(path);
         }
 
-        new_merged.suppress_deletions = true;
+        new_merged.suppress_deletions = self.opts.suppress_deletions;
         self.merged = new_merged;
         Ok(())
     }
 
-    /// `reftable_stack_reload_maybe_reuse()` (`stack.c:368-501`): reload from
+    /// `reftable_stack_reload_maybe_reuse()` (`stack.c:369-502`): reload from
     /// `tables.list`, retrying for up to three seconds while a concurrent
     /// writer replaces tables under us.
     fn reload_maybe_reuse(&mut self, reuse_open: bool) -> Result<()> {
@@ -374,12 +407,22 @@ impl Stack {
                 }
             }
         }
+        if let Some(on_reload) = &self.opts.on_reload {
+            on_reload();
+        }
         res
     }
 
-    /// `stack_uptodate()` (`stack.c:556-619`): `Ok(false)` if the stack in
-    /// memory matches `tables.list`.
-    fn is_outdated(&self) -> Result<bool> {
+    /// `stack_uptodate()` (`stack.c:554-629`): `Ok(false)` if the stack in
+    /// memory matches `tables.list`. With `skip_if_locked`, a stack an
+    /// [`Addition`] holds locked counts as up to date, so that a reload does not
+    /// change it under the addition; right after taking the lock the check must
+    /// not be skipped, to notice concurrent updates.
+    fn is_outdated(&self, skip_if_locked: bool) -> Result<bool> {
+        if skip_if_locked && lock_list(&self.list_lock).is_some() {
+            return Ok(false);
+        }
+
         // Cached stat information tells whether the file was rewritten; it is
         // only ever replaced by rename, never written in place.
         if let Some(h) = &self.list_handle {
@@ -405,64 +448,60 @@ impl Stack {
         Ok(self.merged.tables.iter().zip(&names).any(|(t, n)| t.name() != n))
     }
 
-    /// `reftable_stack_reload()` (`stack.c:621-627`): reload if `tables.list` changed.
+    /// `reftable_stack_reload()` (`stack.c:631-637`): reload if `tables.list`
+    /// changed, unless an [`Addition`] holds the stack locked.
     pub fn reload(&mut self) -> Result<()> {
-        if self.is_outdated()? {
+        if self.is_outdated(true)? {
             self.reload_maybe_reuse(true)?;
         }
         Ok(())
     }
 
-    /// `reftable_stack_next_update_index()` (`stack.c:958-965`).
+    /// `reftable_stack_next_update_index()` (`stack.c:973-980`).
     pub fn next_update_index(&self) -> u64 {
         self.merged.tables.last().map_or(1, |t| t.max_update_index() + 1)
     }
 
-    /// `reftable_stack_new_addition()` / `reftable_stack_init_addition()`
-    /// (`stack.c:658-700`): lock the stack for adding tables. `flags` takes
-    /// [`NEW_ADDITION_RELOAD`].
-    pub fn new_addition(&mut self, flags: u32) -> Result<Addition> {
-        let lock = flock_acquire(&self.list_file, self.opts.lock_timeout_ms)?;
+    /// `reftable_stack_addition_new()` / `reftable_stack_init_addition()`
+    /// (`stack.c:850-866`, `677-718`): lock the stack for adding tables, written
+    /// with `opts` (`None`: the defaults). A stack that is out of date once
+    /// locked is reloaded first.
+    pub fn addition_new(&mut self, opts: Option<&WriteOptions>) -> Result<Addition> {
+        let opts = opts.cloned().unwrap_or_default();
+        let lock = flock_acquire(&self.list_file, opts.lock_timeout_ms)?;
+        let lock_path = lock.lock_path().to_owned();
+        *lock_list(&self.list_lock) = Some(lock);
+        // From here on, dropping `add` releases the lock (`reftable_addition_close()`).
         let mut add = Addition {
-            lock: Some(lock),
+            list_lock: Arc::clone(&self.list_lock),
+            locked: true,
+            opts,
             reftable_dir: self.reftable_dir.clone(),
             new_tables: Vec::new(),
             next_update_index: 0,
         };
-        if let Some(lock) = &add.lock {
-            set_permissions(lock.lock_path(), self.opts.default_permissions)?;
-        }
+        set_permissions(&lock_path, add.opts.default_permissions)?;
 
-        if self.is_outdated()? {
-            if flags & NEW_ADDITION_RELOAD == 0 {
-                return Err(Error::Outdated);
-            }
+        if self.is_outdated(false)? {
             self.reload_maybe_reuse(true)?;
         }
         add.next_update_index = self.next_update_index();
         Ok(add)
     }
 
-    /// `reftable_stack_add()` (`stack.c:702-740`): add one table written by
-    /// `write_table`, which must set the writer's limits.
+    /// `reftable_stack_add()` / `stack_try_add()` (`stack.c:720-754`): add one
+    /// table written by `write_table`, which must set the writer's limits.
     pub fn add(
         &mut self,
         write_table: impl FnOnce(&mut Writer<TableFile>, &Stack) -> Result<()>,
-        flags: u32,
+        opts: Option<&WriteOptions>,
     ) -> Result<()> {
-        let res = (|| {
-            let mut add = self.new_addition(flags)?;
-            add.add(self, write_table)?;
-            add.commit(self)
-        })();
-        if res == Err(Error::Outdated) {
-            // The error to report is the outdated one.
-            let _ = self.reload();
-        }
-        res
+        let mut add = self.addition_new(opts)?;
+        add.add(self, write_table)?;
+        add.commit(self)
     }
 
-    /// `stack_write_compact()` (`stack.c:967-1064`): merge tables
+    /// `stack_write_compact()` (`stack.c:982-1079`): merge tables
     /// `first..=last` into `wr`, dropping tombstones when compacting from the
     /// bottom of the stack, and expired log entries.
     fn write_compact<S: Sink>(
@@ -516,24 +555,25 @@ impl Stack {
         res
     }
 
-    /// `stack_compact_locked()` (`stack.c:1066-1130`): write the compacted
+    /// `stack_compact_locked()` (`stack.c:1081-1145`): write the compacted
     /// table into a closed temporary file.
     fn compact_locked(
         &mut self,
         first: usize,
         last: usize,
         config: Option<&LogExpiryConfig>,
+        opts: &WriteOptions,
     ) -> Result<gix_tempfile::Handle<gix_tempfile::handle::Closed>> {
         let min = self.merged.tables[first].min_update_index();
         let max = self.merged.tables[last].max_update_index();
-        let file = new_table_file(&self.reftable_dir, min, max, &self.opts)?;
-        let mut wr = Writer::new(file, &self.opts)?;
+        let file = new_table_file(&self.reftable_dir, min, max, opts)?;
+        let mut wr = Writer::new(file, self.opts.hash_id, opts)?;
         self.write_compact(&mut wr, first, last, config)?;
         wr.close()?;
         wr.into_sink().handle.close().map_err(|_| Error::Io)
     }
 
-    /// `stack_compact_range()` (`stack.c:1150-1513`): compact tables
+    /// `stack_compact_range()` (`stack.c:1166-1530`): compact tables
     /// `first..=last` into one. [`Error::Lock`] means part of the stack is
     /// locked by another process, which callers may ignore.
     fn compact_range(
@@ -541,13 +581,14 @@ impl Stack {
         mut first: usize,
         last: usize,
         expiry: Option<&LogExpiryConfig>,
+        opts: &WriteOptions,
         best_effort: bool,
     ) -> Result<()> {
         if first > last || (expiry.is_none() && first == last) {
             return Ok(());
         }
         self.stats.attempts += 1;
-        let res = self.compact_range_inner(&mut first, last, expiry, best_effort);
+        let res = self.compact_range_inner(&mut first, last, expiry, opts, best_effort);
         if res == Err(Error::Lock) {
             self.stats.failures += 1;
         }
@@ -559,14 +600,15 @@ impl Stack {
         first: &mut usize,
         last: usize,
         expiry: Option<&LogExpiryConfig>,
+        opts: &WriteOptions,
         best_effort: bool,
     ) -> Result<()> {
         // Hold the list lock to read "tables.list" and lock the tables of the range.
-        let tables_list_lock = flock_acquire(&self.list_file, self.opts.lock_timeout_ms)?;
+        let tables_list_lock = flock_acquire(&self.list_file, opts.lock_timeout_ms)?;
 
         // The range the caller asked for may have changed if the stack is
         // outdated; rather than guessing, abort.
-        if self.is_outdated()? {
+        if self.is_outdated(false)? {
             return Err(Error::Outdated);
         }
 
@@ -599,19 +641,19 @@ impl Stack {
         drop(tables_list_lock);
 
         // Tombstones may cancel out every ref in the range, leaving no table.
-        let new_table = match self.compact_locked(first, last, expiry) {
+        let new_table = match self.compact_locked(first, last, expiry, opts) {
             Ok(t) => Some(t),
             Err(Error::EmptyTable) => None,
             Err(e) => return Err(e),
         };
 
         // Re-lock "tables.list" to replace the compacted range with the new table.
-        let tables_list_lock = flock_acquire(&self.list_file, self.opts.lock_timeout_ms)?;
-        set_permissions(tables_list_lock.lock_path(), self.opts.default_permissions)?;
+        let tables_list_lock = flock_acquire(&self.list_file, opts.lock_timeout_ms)?;
+        set_permissions(tables_list_lock.lock_path(), opts.default_permissions)?;
 
         // A concurrent process may have updated the stack while it was unlocked.
         // Continue only if the compacted tables are still in it, in order.
-        let (names, first_to_replace, last_to_replace) = if self.is_outdated()? {
+        let (names, first_to_replace, last_to_replace) = if self.is_outdated(false)? {
             let names = read_lines(&self.list_file)?;
             let first_name = self.merged.tables[first].name();
             let Some(new_offset) = names.iter().position(|n| n == first_name) else {
@@ -661,7 +703,7 @@ impl Stack {
             list.push('\n');
         }
 
-        if let Err(e) = commit_lock(tables_list_lock, list.as_bytes(), self.opts.fsync) {
+        if let Err(e) = commit_lock(tables_list_lock, list.as_bytes(), opts.fsync) {
             if let Some(p) = new_table_path {
                 let _ = std::fs::remove_file(p);
             }
@@ -680,50 +722,54 @@ impl Stack {
         Ok(())
     }
 
-    /// `reftable_stack_compact_all()` (`stack.c:1515-1520`): compact the whole
-    /// stack into one table, expiring reflog entries per `config`.
-    pub fn compact_all(&mut self, config: Option<&LogExpiryConfig>) -> Result<()> {
+    /// `reftable_stack_compact_all()` (`stack.c:1532-1543`): compact the whole
+    /// stack into one table written with `opts` (`None`: the defaults),
+    /// expiring reflog entries per `config`.
+    pub fn compact_all(&mut self, opts: Option<&WriteOptions>, config: Option<&LogExpiryConfig>) -> Result<()> {
+        let opts = opts.cloned().unwrap_or_default();
         let last = self.merged.tables.len().saturating_sub(1);
-        self.compact_range(0, last, config, false)
+        self.compact_range(0, last, config, &opts, false)
     }
 
-    /// `stack_segments_for_compaction()` (`stack.c:1603-1622`).
-    fn segments_for_compaction(&self) -> Segment {
+    /// `stack_segments_for_compaction()` (`stack.c:1626-1646`).
+    fn segments_for_compaction(&self, opts: &WriteOptions) -> Segment {
         let version = if self.opts.hash_id == HashId::Sha1 { 1 } else { 2 };
         let overhead = header_size(version) as u64 - 1;
         let sizes: Vec<u64> = self.merged.tables.iter().map(|t| t.size - overhead).collect();
-        suggest_compaction_segment(&sizes, self.opts.auto_compaction_factor)
+        suggest_compaction_segment(&sizes, opts.auto_compaction_factor)
     }
 
-    /// `update_segment_if_compaction_required()` (`stack.c:1624-1647`).
-    fn compaction_segment(&self, use_geometric: bool) -> (bool, Segment) {
+    /// `update_segment_if_compaction_required()` (`stack.c:1648-1672`).
+    fn compaction_segment(&self, opts: &WriteOptions, use_geometric: bool) -> (bool, Segment) {
         if self.merged.tables.len() < 2 {
             return (false, Segment::default());
         }
         if !use_geometric {
             return (true, Segment::default());
         }
-        let seg = self.segments_for_compaction();
+        let seg = self.segments_for_compaction(opts);
         (seg.end > seg.start, seg)
     }
 
-    /// `reftable_stack_compaction_required()` (`stack.c:1649-1656`): whether
+    /// `reftable_stack_compaction_required()` (`stack.c:1674-1687`): whether
     /// all tables could be compacted, or with `use_heuristics`, whether the
-    /// geometric sequence needs restoring.
-    pub fn compaction_required(&self, use_heuristics: bool) -> bool {
-        self.compaction_segment(use_heuristics).0
+    /// geometric sequence `opts` asks for needs restoring.
+    pub fn compaction_required(&self, opts: Option<&WriteOptions>, use_heuristics: bool) -> bool {
+        let opts = opts.cloned().unwrap_or_default();
+        self.compaction_segment(&opts, use_heuristics).0
     }
 
-    /// `reftable_stack_auto_compact()` (`stack.c:1658-1673`).
-    pub fn auto_compact(&mut self) -> Result<()> {
-        let (required, seg) = self.compaction_segment(true);
+    /// `reftable_stack_auto_compact()` (`stack.c:1689-1711`).
+    pub fn auto_compact(&mut self, opts: Option<&WriteOptions>) -> Result<()> {
+        let opts = opts.cloned().unwrap_or_default();
+        let (required, seg) = self.compaction_segment(&opts, true);
         if required {
-            return self.compact_range(seg.start, seg.end - 1, None, true);
+            return self.compact_range(seg.start, seg.end - 1, None, &opts, true);
         }
         Ok(())
     }
 
-    /// `reftable_stack_read_ref()` (`stack.c:1681-1709`): `Ok(None)` if absent.
+    /// `reftable_stack_read_ref()` (`stack.c:1719-1747`): `Ok(None)` if absent.
     pub fn read_ref(&self, refname: &[u8]) -> Result<Option<RefRecord>> {
         let mut it = self.merged.ref_iterator()?;
         if !it.seek_ref(refname)? {
@@ -736,7 +782,7 @@ impl Stack {
         Ok(Some(r))
     }
 
-    /// `reftable_stack_read_log()` (`stack.c:1711-1741`): the newest log entry
+    /// `reftable_stack_read_log()` (`stack.c:1749-1779`): the newest log entry
     /// of `refname`, `Ok(None)` if there is none.
     pub fn read_log(&self, refname: &[u8]) -> Result<Option<LogRecord>> {
         let mut it = self.merged.log_iterator()?;
@@ -750,16 +796,16 @@ impl Stack {
         Ok(Some(log))
     }
 
-    /// `reftable_stack_clean()` (`stack.c:1807-1825`): delete table files no
+    /// `reftable_stack_clean()` (`stack.c:1845-1858`): delete table files no
     /// longer in the stack whose updates it has already absorbed.
     pub fn clean(&mut self) -> Result<()> {
-        let _add = self.new_addition(0)?;
-        self.reload()?;
+        // Taking the lock reloads an outdated stack.
+        let _add = self.addition_new(None)?;
         self.clean_locked()
     }
 
-    /// `reftable_stack_clean_locked()` (`stack.c:1780-1805`) with
-    /// `remove_maybe_stale_table()` (`stack.c:1749-1778`).
+    /// `reftable_stack_clean_locked()` (`stack.c:1818-1843`) with
+    /// `remove_maybe_stale_table()` (`stack.c:1787-1816`).
     fn clean_locked(&self) -> Result<()> {
         let max = self.merged.max_update_index();
         let dir = std::fs::read_dir(&self.reftable_dir).map_err(|_| Error::Io)?;
@@ -786,10 +832,16 @@ impl Stack {
     }
 }
 
-/// `struct reftable_addition`: a transaction adding tables to a stack, which
-/// holds the `tables.list` lock until committed or dropped.
+/// `struct reftable_addition`: a transaction adding tables to a stack. It
+/// holds the stack's `tables.list` lock until committed or dropped, and while
+/// it does, [`Stack::reload()`] leaves the stack as it is.
 pub struct Addition {
-    lock: Option<gix_lock::File>,
+    /// The lock of the stack this addition was created for.
+    list_lock: ListLock,
+    /// Whether this addition is the one holding `list_lock`, so that it never
+    /// releases the lock of another addition (`stack.c:643-648`).
+    locked: bool,
+    opts: WriteOptions,
     reftable_dir: PathBuf,
     new_tables: Vec<String>,
     next_update_index: u64,
@@ -801,7 +853,21 @@ impl Addition {
         self.next_update_index
     }
 
-    /// `reftable_addition_add()` (`stack.c:854-956`): write one table with
+    /// The options the tables of this addition are written with.
+    pub fn options(&self) -> &WriteOptions {
+        &self.opts
+    }
+
+    /// `st` must be the stack this addition locked; C keeps a pointer to it.
+    fn check_stack(&self, st: &Stack) -> Result<()> {
+        if Arc::ptr_eq(&self.list_lock, &st.list_lock) {
+            Ok(())
+        } else {
+            Err(Error::Api)
+        }
+    }
+
+    /// `reftable_addition_add()` (`stack.c:869-971`): write one table with
     /// `write_table`, which must set the writer's limits to at least
     /// [`next_update_index()`](Self::next_update_index). A table without
     /// records is not added.
@@ -810,8 +876,9 @@ impl Addition {
         st: &Stack,
         write_table: impl FnOnce(&mut Writer<TableFile>, &Stack) -> Result<()>,
     ) -> Result<()> {
-        let file = new_table_file(&self.reftable_dir, self.next_update_index, self.next_update_index, &st.opts)?;
-        let mut wr = Writer::new(file, &st.opts)?;
+        self.check_stack(st)?;
+        let file = new_table_file(&self.reftable_dir, self.next_update_index, self.next_update_index, &self.opts)?;
+        let mut wr = Writer::new(file, st.opts.hash_id, &self.opts)?;
         write_table(&mut wr, st)?;
         match wr.close() {
             Err(Error::EmptyTable) => return Ok(()),
@@ -830,9 +897,10 @@ impl Addition {
         Ok(())
     }
 
-    /// `reftable_addition_commit()` (`stack.c:761-833`): rewrite `tables.list`
+    /// `reftable_addition_commit()` (`stack.c:775-848`): rewrite `tables.list`
     /// with the new tables appended, reload, and auto-compact.
     pub fn commit(mut self, st: &mut Stack) -> Result<()> {
+        self.check_stack(st)?;
         if self.new_tables.is_empty() {
             return Ok(());
         }
@@ -845,18 +913,20 @@ impl Addition {
             list.push_str(n);
             list.push('\n');
         }
-        let lock = self.lock.take().expect("held until commit");
-        commit_lock(lock, list.as_bytes(), st.opts.fsync)?;
+        // Committing or failing to, the lock is gone afterwards.
+        let lock = lock_list(&self.list_lock).take().ok_or(Error::Api)?;
+        self.locked = false;
+        commit_lock(lock, list.as_bytes(), self.opts.fsync)?;
 
         // Success: the new tables belong to the stack now.
         self.new_tables.clear();
 
         st.reload_maybe_reuse(true)?;
 
-        if !st.opts.disable_auto_compact {
+        if !self.opts.disable_auto_compact {
             // A concurrent writer may be compacting part of the stack
             // (`Lock`), or have rewritten it (`Outdated`); both are benign.
-            match st.auto_compact() {
+            match st.auto_compact(Some(&self.opts)) {
                 Ok(()) | Err(Error::Lock | Error::Outdated) => {}
                 Err(e) => return Err(e),
             }
@@ -866,11 +936,16 @@ impl Addition {
 }
 
 impl Drop for Addition {
-    /// `reftable_addition_close()` (`stack.c:638-656`): delete uncommitted
-    /// tables; dropping the lock releases it.
+    /// `reftable_addition_close()` (`stack.c:655-675`): delete uncommitted
+    /// tables and release the stack's lock if this addition holds it.
     fn drop(&mut self) {
         for name in &self.new_tables {
             let _ = std::fs::remove_file(self.reftable_dir.join(name));
+        }
+        if self.locked {
+            // Dropping the lock file rolls it back.
+            lock_list(&self.list_lock).take();
+            self.locked = false;
         }
     }
 }
@@ -886,7 +961,7 @@ pub struct Segment {
     pub bytes: u64,
 }
 
-/// `suggest_compaction_segment()` (`stack.c:1527-1601`): the segment to
+/// `suggest_compaction_segment()` (`stack.c:1550-1624`): the segment to
 /// compact so that each table is at least `factor` times the size of the next.
 pub fn suggest_compaction_segment(sizes: &[u64], factor: u8) -> Segment {
     let factor = u64::from(if factor == 0 { crate::DEFAULT_GEOMETRIC_FACTOR } else { factor });
@@ -926,3 +1001,13 @@ pub fn suggest_compaction_segment(sizes: &[u64], factor: u8) -> Segment {
     }
     seg
 }
+
+/// A stack is shared between threads behind a lock by its users (the ref
+/// store keeps one per worktree), and an addition may outlive the borrow of
+/// the stack it locked.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Stack>();
+    assert_send_sync::<Addition>();
+    assert_send_sync::<StackOptions>();
+};

@@ -21,7 +21,7 @@
 
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
-use gix_reftable::{LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, WriteOptions};
+use gix_reftable::{LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, StackOptions, WriteOptions};
 use std::path::{Path, PathBuf};
 
 /// How a migration ended when it did not succeed: the text git collects in
@@ -90,7 +90,7 @@ pub(super) fn files_to_reftable(
             true => Vec::new(),
             false => collect_logs(repo, &gitdir)?,
         };
-        let mut stack = Stack::new(&new_abs.join("reftable"), &opts)
+        let mut stack = Stack::new(&new_abs.join("reftable"), &stack_options(repo))
             .map_err(|e| anyhow::anyhow!("reftable: {e}"))?;
         if let Err(e) = commit_initial(&mut stack, &opts, refs, logs) {
             return Ok(Err(Failed(format!("reftable: transaction failure: {e}"))));
@@ -135,7 +135,20 @@ pub(super) fn files_to_reftable(
     }
 }
 
-/// `reftable_be_write_options()` (refs/reftable-backend.c:361-392): the
+/// `reftable_be_init()` (refs/reftable-backend.c:422-433): the stack is opened
+/// with the repository's hash; everything about writing comes from
+/// [`write_options`].
+fn stack_options(repo: &gix::Repository) -> StackOptions {
+    StackOptions {
+        hash_id: match repo.object_hash() {
+            gix::hash::Kind::Sha256 => gix_reftable::HashId::Sha256,
+            _ => gix_reftable::HashId::Sha1,
+        },
+        ..StackOptions::default()
+    }
+}
+
+/// `reftable_be_write_options()` (refs/reftable-backend.c:361-389): the
 /// library's write options with the `reftable.*` configuration applied, a
 /// 100ms lock timeout, and new files created `0666` less the umask, widened by
 /// `core.sharedRepository`.
@@ -153,10 +166,6 @@ fn write_options(repo: &gix::Repository) -> WriteOptions {
         .and_then(|v| super::init::parse_shared_value(&v.to_string()).ok())
         .unwrap_or(0);
     WriteOptions {
-        hash_id: match repo.object_hash() {
-            gix::hash::Kind::Sha256 => gix_reftable::HashId::Sha256,
-            _ => gix_reftable::HashId::Sha1,
-        },
         block_size: ulong("reftable.blockSize").map_or(gix_reftable::DEFAULT_BLOCK_SIZE, |v| v as u32),
         restart_interval: ulong("reftable.restartInterval").map_or(0, |v| v as u16),
         skip_index_objects: config.boolean("reftable.indexObjects").is_some_and(|v| !v),
@@ -204,7 +213,7 @@ pub(super) fn create_on_disk_stubs(dir: &Path) -> std::io::Result<()> {
 /// reflog record is written.
 pub(super) fn init_symref_head(repo: &gix::Repository, target: &gix::bstr::BStr) -> Result<()> {
     let opts = write_options(repo);
-    let mut stack = Stack::new(&repo.common_dir().join("reftable"), &opts)
+    let mut stack = Stack::new(&repo.common_dir().join("reftable"), &stack_options(repo))
         .map_err(|e| anyhow::anyhow!("reftable: {e}"))?;
     let head = Ref {
         name: "HEAD".into(),
@@ -428,7 +437,7 @@ fn commit_initial(
             }
             Ok(())
         },
-        gix_reftable::stack::NEW_ADDITION_RELOAD,
+        Some(opts),
     )
 }
 

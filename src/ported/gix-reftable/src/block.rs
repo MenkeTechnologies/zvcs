@@ -48,7 +48,7 @@ pub(crate) struct BlockWriter {
 }
 
 impl BlockWriter {
-    /// `block_writer_init()` (`block.c:73-94`): start a block of type `typ`.
+    /// `block_writer_init()` (`block.c:73-97`): start a block of type `typ`.
     pub(crate) fn new(typ: u8, block_size: u32, header_off: u32, hash_size: usize) -> Self {
         let mut block = vec![0u8; block_size as usize];
         block[header_off as usize] = typ;
@@ -98,7 +98,7 @@ impl BlockWriter {
         Ok(())
     }
 
-    /// `block_writer_add()` (`block.c:105-147`): append `rec`, or fail with
+    /// `block_writer_add()` (`block.c:108-150`): append `rec`, or fail with
     /// [`Error::EntryTooBig`] if the block is full.
     pub(crate) fn add(&mut self, rec: &Record) -> Result<()> {
         rec.key(&mut self.scratch);
@@ -117,7 +117,7 @@ impl BlockWriter {
         self.register_restart((n + m) as u32, is_restart)
     }
 
-    /// `block_writer_finish()` (`block.c:149-212`): append the restart points,
+    /// `block_writer_finish()` (`block.c:152-215`): append the restart points,
     /// compress log blocks, and return the number of bytes of the block to write.
     pub(crate) fn finish(&mut self) -> Result<usize> {
         for i in 0..self.restarts.len() {
@@ -163,7 +163,7 @@ pub struct Block {
     pub(crate) block_type: u8,
 }
 
-/// `read_block()` (`block.c:214-225`): `sz` bytes at `off`, clamped to the source.
+/// `read_block()` (`block.c:217-228`): `sz` bytes at `off`, clamped to the source.
 fn read_block(source: &Arc<BlockSource>, off: u64, mut sz: u32) -> BlockData {
     let size = source.size();
     if off >= size {
@@ -176,7 +176,7 @@ fn read_block(source: &Arc<BlockSource>, off: u64, mut sz: u32) -> BlockData {
 }
 
 impl Block {
-    /// `reftable_block_init()` (`block.c:227-350`): read the block at `offset`.
+    /// `reftable_block_init()` (`block.c:230-375`): read the block at `offset`.
     ///
     /// Returns `Ok(None)` where C returns `1`: the block is not of `want_type`.
     pub fn init(
@@ -212,12 +212,15 @@ impl Block {
             data = read_block(source, offset, block_size);
         }
 
+        // The block size must cover at least the table header, the block
+        // header and the 2 byte restart counter.
+        if (block_size as usize) < h + 4 + 2 {
+            return Err(Error::Format);
+        }
+
         if block_type == BLOCK_TYPE_LOG {
             let skip = 4 + h;
             let block_size = block_size as usize;
-            if block_size < skip {
-                return Err(Error::Format);
-            }
             // Log blocks give the *uncompressed* size in their header, which is
             // copied over verbatim.
             let src = data.bytes();
@@ -247,10 +250,13 @@ impl Block {
             full_block_size = block_size;
         }
 
+        // Enough data must be available now to satisfy the claimed block size.
         let bytes = data.bytes();
-        if (block_size as usize) > bytes.len() || (block_size as usize) < h + 4 + 2 {
+        if (block_size as usize) > bytes.len() {
             return Err(Error::Format);
         }
+        // C's unsigned `block_size - 2 - 3 * restart_count` wraps around when
+        // too many restarts are claimed, which its upper bound check rejects.
         let restart_count = get_be16(&bytes[block_size as usize - 2..]);
         let restart_off = block_size
             .checked_sub(2 + 3 * u32::from(restart_count))
@@ -278,7 +284,7 @@ impl Block {
         self.block_type
     }
 
-    /// `reftable_block_first_key()` (`block.c:366-384`).
+    /// `reftable_block_first_key()` (`block.c:391-409`).
     pub(crate) fn first_key(&self, key: &mut Vec<u8>) -> Result<()> {
         let off = self.header_off as usize + 4;
         key.clear();
@@ -289,7 +295,7 @@ impl Block {
         Ok(())
     }
 
-    /// `block_restart_offset()` (`block.c:386-389`).
+    /// `block_restart_offset()` (`block.c:411-414`).
     fn restart_offset(&self, idx: usize) -> u32 {
         get_be24(&self.bytes()[self.restart_off as usize + 3 * idx..])
     }
@@ -309,13 +315,13 @@ pub(crate) struct BlockIter {
 }
 
 impl BlockIter {
-    /// `block_iter_init()` / `block_iter_seek_start()` (`block.c:391-401`).
+    /// `block_iter_init()` / `block_iter_seek_start()` (`block.c:416-426`).
     pub(crate) fn seek_start(&mut self, block: &Block) {
         self.last_key.clear();
         self.next_off = block.header_off + 4;
     }
 
-    /// `block_iter_next()` (`block.c:445-473`): `Ok(false)` at the end of the block.
+    /// `block_iter_next()` (`block.c:479-507`): `Ok(false)` at the end of the block.
     pub(crate) fn next(&mut self, block: &Block, rec: &mut Record) -> Result<bool> {
         if self.next_off >= block.restart_off {
             return Ok(false);
@@ -332,22 +338,30 @@ impl BlockIter {
         Ok(true)
     }
 
-    /// `block_iter_reset()` (`block.c:475-480`).
+    /// `block_iter_reset()` (`block.c:509-514`).
     pub(crate) fn reset(&mut self) {
         self.last_key.clear();
         self.next_off = 0;
     }
 
-    /// `block_iter_seek_key()` (`block.c:488-589`): position the cursor so that
+    /// `block_iter_seek_key()` (`block.c:522-623`): position the cursor so that
     /// the next call to [`next()`](Self::next) yields the first record whose key
     /// is at or after `want`, if the block has one.
     pub(crate) fn seek_key(&mut self, block: &Block, want: &[u8]) -> Result<()> {
+        let mut rec = Record::new(block.block_type)?;
+
         // Binary search over the restart points for the first one _greater_
         // than the wanted key. Records at restart points are stored without
         // prefix compression, so their keys compare without decoding.
         let mut error = false;
         let i = binsearch(block.restart_count as usize, |idx| {
             let off = block.restart_offset(idx) as usize;
+            // The restart offset must point to a record, which is stored
+            // before the restart table.
+            if off >= block.restart_off as usize {
+                error = true;
+                return -1;
+            }
             let input = &block.bytes()[off..block.restart_off as usize];
             let Some((prefix_len, suffix_len, _extra, n)) = decode_keylen(input) else {
                 error = true;
@@ -385,7 +399,6 @@ impl BlockIter {
 
         // Go one entry too far and back up, so that the next call to `next()`
         // yields the wanted record.
-        let mut rec = Record::new(block.block_type)?;
         loop {
             let prev_off = self.next_off;
             if !self.next(block, &mut rec)? {

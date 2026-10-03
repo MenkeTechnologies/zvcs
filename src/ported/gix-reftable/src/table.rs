@@ -44,7 +44,7 @@ pub struct Table {
 }
 
 impl Table {
-    /// `reftable_table_new()` (`table.c:520-596`): open the table in `source`;
+    /// `reftable_table_new()` (`table.c:522-603`): open the table in `source`;
     /// `name` is its file name within the stack.
     pub fn new(source: Arc<BlockSource>, name: &str) -> Result<Arc<Table>> {
         let file_size = source.size();
@@ -63,9 +63,10 @@ impl Table {
         if version != 1 && version != 2 {
             return Err(Error::Format);
         }
-        let size = file_size
-            .checked_sub(footer_size(version) as u64)
-            .ok_or(Error::Format)?;
+        if file_size < (header_size(version) + footer_size(version)) as u64 {
+            return Err(Error::Format);
+        }
+        let size = file_size - footer_size(version) as u64;
         let footer = &bytes[size as usize..size as usize + footer_size(version)];
 
         let mut t = Table {
@@ -191,7 +192,7 @@ impl Table {
         )
     }
 
-    /// `table_init_iter()` (`table.c:487-506`).
+    /// `table_init_iter()` (`table.c:489-508`).
     pub(crate) fn init_iter(self: &Arc<Self>, typ: u8) -> Box<dyn RecordIter> {
         if self.offsets_for(typ).is_present {
             Box::new(TableIter::new(Arc::clone(self)))
@@ -214,7 +215,7 @@ impl Table {
         }
     }
 
-    /// `reftable_table_refs_for()` (`table.c:716-722`): the refs pointing to
+    /// `reftable_table_refs_for()` (`table.c:727-733`): the refs pointing to
     /// `oid` (the full object ID), through the object index if there is one.
     pub fn refs_for(self: &Arc<Self>, oid: &[u8]) -> Result<Iterator> {
         if self.obj_offsets.is_present {
@@ -224,7 +225,7 @@ impl Table {
         }
     }
 
-    /// `reftable_table_refs_for_indexed()` (`table.c:614-667`).
+    /// `reftable_table_refs_for_indexed()` (`table.c:621-674`).
     fn refs_for_indexed(self: &Arc<Self>, oid: &[u8]) -> Result<Iterator> {
         let prefix_len = self.object_id_len.min(oid.len());
         let want = Record::Obj(ObjRecord {
@@ -250,7 +251,7 @@ impl Table {
         )?))
     }
 
-    /// `reftable_table_refs_for_unindexed()` (`table.c:669-714`).
+    /// `reftable_table_refs_for_unindexed()` (`table.c:676-725`).
     fn refs_for_unindexed(self: &Arc<Self>, oid: &[u8]) -> Result<Iterator> {
         let mut ti = TableIter::new(Arc::clone(self));
         ti.seek_start(BLOCK_TYPE_REF, false)?;
@@ -323,20 +324,21 @@ impl TableIter {
         }
     }
 
-    /// `table_iter_seek_to()` (`table.c:240-253`); `typ` 0 accepts any block.
-    fn seek_to(&mut self, off: u64, typ: u8) -> Result<bool> {
+    /// `table_iter_seek_to()` (`table.c:240-255`); `typ` 0 accepts any block.
+    /// A block past the end of the table or of another type is corrupt.
+    fn seek_to(&mut self, off: u64, typ: u8) -> Result<()> {
         let Some(block) = self.table.init_block(off, typ)? else {
-            return Ok(false);
+            return Err(Error::Format);
         };
         self.typ = block.block_type();
         self.block = block;
         self.block_off = off;
         self.bi.seek_start(&self.block);
         self.is_finished = false;
-        Ok(true)
+        Ok(())
     }
 
-    /// `table_iter_seek_start()` (`table.c:255-268`): the first block of the
+    /// `table_iter_seek_start()` (`table.c:257-270`): the first block of the
     /// section of `typ`, or of its index.
     fn seek_start(&mut self, typ: u8, index: bool) -> Result<bool> {
         let offs = self.table.offsets_for(typ);
@@ -344,12 +346,12 @@ impl TableIter {
             if offs.index_offset == 0 {
                 return Ok(false);
             }
-            return self.seek_to(offs.index_offset, BLOCK_TYPE_INDEX);
+            return self.seek_to(offs.index_offset, BLOCK_TYPE_INDEX).map(|()| true);
         }
-        self.seek_to(offs.offset, typ)
+        self.seek_to(offs.offset, typ).map(|()| true)
     }
 
-    /// `table_iter_seek_linear()` (`table.c:270-354`): scan blocks until the
+    /// `table_iter_seek_linear()` (`table.c:272-356`): scan blocks until the
     /// first one whose first key is past `want`; the record, if it exists, is in
     /// the block before it.
     fn seek_linear(&mut self, want: &Record) -> Result<()> {
@@ -372,7 +374,7 @@ impl TableIter {
         self.bi.seek_key(&self.block, &want_key)
     }
 
-    /// `table_iter_seek_indexed()` (`table.c:356-433`): search the highest index
+    /// `table_iter_seek_indexed()` (`table.c:358-435`): search the highest index
     /// level linearly, then descend level by level.
     fn seek_indexed(&mut self, rec: &Record) -> Result<bool> {
         let mut want_key = Vec::new();
@@ -392,9 +394,7 @@ impl TableIter {
             let Record::Index(idx) = &index_result else {
                 return Err(Error::Api);
             };
-            if !self.seek_to(idx.offset, 0)? {
-                return Ok(false);
-            }
+            self.seek_to(idx.offset, 0)?;
             self.bi.seek_key(&self.block, &want_key)?;
             if self.typ == rec.typ() {
                 return Ok(true);
@@ -407,7 +407,7 @@ impl TableIter {
 }
 
 impl RecordIter for TableIter {
-    /// `table_iter_seek()` (`table.c:435-456`).
+    /// `table_iter_seek()` (`table.c:437-458`).
     fn seek(&mut self, want: &Record) -> Result<bool> {
         let offs = self.table.offsets_for(want.typ());
         let indexed = offs.index_offset != 0;

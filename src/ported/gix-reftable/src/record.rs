@@ -283,8 +283,7 @@ impl RefRecord {
                 RefValue::Symref(std::mem::take(scratch).into())
             }
             0 => RefValue::Deletion,
-            // C aborts on a value type it does not know; a corrupt table is not
-            // a reason to take the process down here.
+            // An unknown value type is a corrupt table (`record.c:427-429`).
             _ => return Err(Error::Format),
         };
         Ok(pos)

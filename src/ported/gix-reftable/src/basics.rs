@@ -65,11 +65,11 @@ pub(crate) fn get_be64(p: &[u8]) -> u64 {
     u64::from_be_bytes([p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]])
 }
 
-/// `binsearch()` (`basics.c:150-176`): the smallest index `i` in `[0, sz)` at
+/// `binsearch()` (`basics.c:150-179`): the smallest index `i` in `[0, sz)` at
 /// which `f(i) > 0`, assuming `f` is ascending, or `sz` if there is none. A
 /// negative `f` aborts the search and also yields `sz`.
 pub(crate) fn binsearch(sz: usize, mut f: impl FnMut(usize) -> i32) -> usize {
-    // C would probe `f(0)` of an empty range; nothing can be there.
+    // Nothing can be found in an empty range.
     if sz == 0 {
         return 0;
     }

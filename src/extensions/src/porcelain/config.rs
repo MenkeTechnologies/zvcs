@@ -2224,15 +2224,19 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 )
                 .into());
             };
-            scoped = match blob_config(repo, spec) {
-                Ok((file, bytes)) => {
+            // A writer never reads the blob: `check_write()` (builtin/config.c:812-822)
+            // refuses `--blob` before anything is resolved.
+            let read = reads_config.then(|| blob_config(repo, spec));
+            scoped = match read {
+                None => ConfigFile::new(gix::config::file::Metadata::from(Source::Cli)),
+                Some(Ok((file, bytes))) => {
                     // `bad config line <n> in blob <spec>` names no file either.
                     d.source_text = Some(bytes);
                     file
                 }
                 // The three `error()`s are already on stderr; what happens next is
                 // the caller's, and only `--list` makes it fatal.
-                Err(()) => {
+                Some(Err(())) => {
                     blob_failed = true;
                     ConfigFile::new(gix::config::file::Metadata::from(Source::Cli))
                 }

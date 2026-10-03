@@ -179,15 +179,39 @@ impl<'repo> Remote<'repo> {
                     Some(dir) => dir.to_owned(),
                     None => gix_fs::current_dir(false)?,
                 };
-                let kind = gix_discover::is_git(&cwd.join(dir.as_ref()))
-                    .or_else(|_| {
-                        dir.to_mut().push(gix_discover::DOT_GIT_DIR);
-                        gix_discover::is_git(&cwd.join(dir.as_ref()))
-                    })
-                    .map_err(|err| Error::FileUrl {
-                        source: err.into(),
-                        url: url.clone(),
-                    })?;
+                // `enter_repo()` (setup.c), which `upload-pack`/`receive-pack` run on the
+                // path they are handed, tries `<path>/.git`, `<path>`, `<path>.git/.git`
+                // and `<path>.git` in that order, so `git clone src` reaches a lone
+                // `src.git`, bare or not.
+                let base = dir.clone().into_owned();
+                let mut found = None;
+                let mut first_err = None;
+                for suffix in ["/.git", "", ".git/.git", ".git"] {
+                    let mut candidate = base.clone().into_os_string();
+                    candidate.push(suffix);
+                    let candidate = std::path::PathBuf::from(candidate);
+                    match gix_discover::is_git(&cwd.join(&candidate)) {
+                        Ok(kind) => {
+                            found = Some((candidate, kind));
+                            break;
+                        }
+                        Err(err) => {
+                            first_err.get_or_insert(err);
+                        }
+                    }
+                }
+                let kind = match found {
+                    Some((candidate, kind)) => {
+                        dir = Cow::Owned(candidate);
+                        kind
+                    }
+                    None => {
+                        return Err(Error::FileUrl {
+                            source: first_err.expect("at least one candidate was tried").into(),
+                            url: url.clone(),
+                        })
+                    }
+                };
                 let (git_dir, _work_dir) = gix_discover::repository::Path::from_dot_git_dir(
                     dir.clone().into_owned(),
                     kind,

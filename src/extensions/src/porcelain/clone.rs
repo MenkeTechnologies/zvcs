@@ -781,26 +781,28 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // shallow clone of a path on this machine.
     //
     // A source that is shallow itself takes `is_local` away again further down.
-    let mut is_local = !no_local && !url_str.contains("://") && Path::new(url_str).is_dir();
-    // The other half of the same probe. `get_repo_path_1()` walks four repository
-    // spellings — `<path>/.git`, `<path>`, `<path>.git/.git`, `<path>.git` — and
-    // only then tries `<path>.bundle` and `<path>` as a *regular file*
-    // (builtin/clone.c:97-141, v2.55.0), setting `*is_bundle` on the second pass.
-    // So a bundle is never a local clone: `is_local` above already excludes it by
-    // requiring a directory, and everything a local clone would have ignored —
-    // the shallow selectors, `--filter` — a bundle ignores too, because
-    // `transport_get()` gives a bundle `ret->smart_options = NULL` and a vtable
-    // of three entries (transport.c:1162-1166, 1212), none of which is
-    // `set_option`.
-    let bundle_source: Option<PathBuf> = match (!url_str.contains("://"))
+    //
+    // `get_repo_path_1()` walks four repository spellings — `<path>/.git`, `<path>`,
+    // `<path>.git/.git`, `<path>.git` — and only then tries `<path>.bundle` and
+    // `<path>` as a *regular file* (builtin/clone.c:97-141), setting `*is_bundle` on
+    // the second pass. So a bundle is never a local clone, and everything a local
+    // clone would have ignored — the shallow selectors, `--filter` — a bundle
+    // ignores too, because `transport_get()` gives a bundle
+    // `ret->smart_options = NULL` and a vtable of three entries
+    // (transport.c:1162-1166, 1212), none of which is `set_option`. A source that
+    // only `<path>.git` names is local as well, and is read through that spelling.
+    let (local_source, bundle_source) = match (!url_str.contains("://"))
         .then(|| classify_local_source(url_str))
     {
-        Some(LocalSource::Bundle(path)) => Some(path),
-        _ => None,
+        Some(LocalSource::Repository(path)) => (Some(path), None),
+        Some(LocalSource::Bundle(path)) => (None, Some(path)),
+        _ => (None, None),
     };
+    let mut is_local = !no_local && local_source.is_some();
     let is_bundle = bundle_source.is_some();
+    let local_source = local_source.unwrap_or_else(|| PathBuf::from(url_str));
     let mut reject_shallow_source = false;
-    if is_local && gix::open(url_str).map(|r| r.is_shallow()).unwrap_or(false) {
+    if is_local && gix::open(&local_source).map(|r| r.is_shallow()).unwrap_or(false) {
         // ```c
         // if (!access(mkpath("%s/shallow", path), F_OK)) {
         //         if (reject_shallow)
@@ -1406,7 +1408,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         // file that says where, so git falls back to the transport, which
         // negotiates the boundary and writes `shallow` here.
         if shared && is_local {
-            if let Some(objects) = local_path_of(&url).and_then(|p| objects_dir_of(&p).ok()) {
+            if let Ok(objects) = objects_dir_of(&local_source) {
                 alternates.push(objects);
             }
         }
@@ -1458,7 +1460,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     let adopted_pack_files = ((is_local || is_bundle) && !shared)
         .then(|| {
-            adopt_local_objects(Path::new(url_str), &git_dir, hardlinks)
+            adopt_local_objects(&local_source, &git_dir, hardlinks)
                 .map(|()| pack_dir_entries(&git_dir))
         })
         .transpose()?;
@@ -3493,8 +3495,9 @@ fn split_config_key(key: &str) -> Result<(String, Option<String>, String)> {
 /// What `get_repo_path_1()` (`builtin/clone.c:97`) makes of a local source path.
 enum LocalSource {
     /// One of `<path>/.git`, `<path>`, `<path>.git/.git`, `<path>.git` is a repository — the
-    /// ordinary local clone.
-    Repository,
+    /// ordinary local clone. Carries the path the rest of the clone reads the source through:
+    /// the operand itself, or `<path>.git` when only that spelling names a repository.
+    Repository(PathBuf),
     /// None of those is, but the path (or `<path>.bundle`) is a regular file, which is git's
     /// second reading of a local source: a bundle. Carries the path git would name.
     Bundle(PathBuf),
@@ -3507,6 +3510,11 @@ enum LocalSource {
 /// when it is longer than its own signature, which is git's `st.st_size > 8` guard.
 fn classify_local_source(repo_name: &str) -> LocalSource {
     let base = Path::new(repo_name);
+    // `<path>/.git` and `<path>` are both read through `<path>`; the other two need the suffix.
+    let source_path = |suffix: &str| match suffix {
+        ".git/.git" | ".git" => PathBuf::from(format!("{repo_name}.git")),
+        _ => base.to_path_buf(),
+    };
     for suffix in ["/.git", "", ".git/.git", ".git"] {
         let candidate = PathBuf::from(format!("{}{suffix}", base.display()));
         let Ok(meta) = std::fs::metadata(&candidate) else {
@@ -3514,14 +3522,14 @@ fn classify_local_source(repo_name: &str) -> LocalSource {
         };
         if meta.is_dir() {
             if gix::open(&candidate).is_ok() {
-                return LocalSource::Repository;
+                return LocalSource::Repository(source_path(suffix));
             }
         } else if meta.is_file() && meta.len() > 8 {
             let is_gitfile = std::fs::read(&candidate)
                 .map(|bytes| bytes.starts_with(b"gitdir: "))
                 .unwrap_or(false);
             if is_gitfile {
-                return LocalSource::Repository;
+                return LocalSource::Repository(source_path(suffix));
             }
         }
     }
@@ -3747,14 +3755,6 @@ fn rewrite_clone_reflog_source(git_dir: &Path, from: &str, to: &str) -> Result<(
         }
     }
     Ok(())
-}
-
-/// The local filesystem path a clone URL names, if any. `-s`/`--shared` only
-/// applies "when the repository to clone is on the local machine", which is
-/// exactly the `file://` and bare-path URLs gix classifies as `Scheme::File`.
-fn local_path_of(url: &gix::Url) -> Option<PathBuf> {
-    (url.scheme == gix::url::Scheme::File)
-        .then(|| gix::path::from_bstr(url.path.as_bstr()).into_owned())
 }
 
 /// The object store `clone_local()` copies from.

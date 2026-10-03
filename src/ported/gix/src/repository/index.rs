@@ -232,6 +232,50 @@ impl crate::Repository {
         ))
     }
 
+    /// git's `ensure_full_index()` — `expand_index(istate, NULL)` (sparse-index.c:330-474):
+    /// replace every sparse-directory entry of `index` with the entries of the tree it names,
+    /// and mark the index expanded, so it is a full index from here on and is written without
+    /// the `sdir` extension. An index holding no sparse-directory entry is left as it is,
+    /// marker included: git would re-collapse it on write, and this port writes the marker
+    /// back instead (`index_racy::convert_to_sparse`).
+    ///
+    /// Each expanded entry is `add_path_to_index()`'s (sparse-index.c:275-328): the tree's
+    /// mode and id at the directory's path, `CE_SKIP_WORKTREE | CE_EXTENDED`, and no stat data.
+    /// The advice git gives on expansion and the cache-tree it recomputes afterwards are the
+    /// caller's to decide.
+    ///
+    /// Returns whether any sparse-directory entry was expanded.
+    pub fn ensure_full_index(&self, index: &mut gix_index::State) -> Result<bool, super::index_from_tree::Error> {
+        use gix_index::entry::{Flags, Mode};
+        let sparse: Vec<(crate::bstr::BString, gix_hash::ObjectId)> = index
+            .entries()
+            .iter()
+            .filter(|e| e.mode == Mode::DIR)
+            .map(|e| (e.path(index).to_owned(), e.id))
+            .collect();
+        if sparse.is_empty() {
+            return Ok(false);
+        }
+        index.remove_entries(|_, _, e| e.mode == Mode::DIR);
+        for (dir, tree_id) in &sparse {
+            let subtree = self.index_from_tree(tree_id)?;
+            for e in subtree.entries() {
+                let mut path = dir.clone();
+                path.extend_from_slice(e.path(&subtree));
+                index.dangerously_push_entry(
+                    gix_index::entry::Stat::default(),
+                    e.id,
+                    Flags::SKIP_WORKTREE | Flags::EXTENDED,
+                    e.mode,
+                    path.as_ref(),
+                );
+            }
+        }
+        index.sort_entries();
+        index.set_expanded();
+        Ok(true)
+    }
+
     /// The index git's `do_read_index()` produces when `.git/index` does not exist: empty,
     /// and — because `read_index_from()` runs `post_read_index_from()` whatever the read found
     /// (read-cache.c:2365-2371) — already tweaked by `core.untrackedCache`.

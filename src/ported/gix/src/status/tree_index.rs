@@ -72,6 +72,19 @@ impl Repository {
     {
         let _span = gix_trace::coarse!("gix::tree_index_status");
         let tree_index: gix_index::State = self.index_from_tree(tree_id)?.into();
+        // A sparse index — one stock git wrote with `index.sparse` — is compared as the full
+        // index it stands for: `diff-index` over a sparse-directory entry reports exactly what
+        // comparing the tree it names would. The caller's index is left as it was read.
+        let expanded;
+        let worktree_index = if worktree_index.is_sparse() {
+            let mut full = worktree_index.clone();
+            self.ensure_full_index(&mut full)?;
+            full.set_expanded();
+            expanded = full;
+            &expanded
+        } else {
+            worktree_index
+        };
         let rewrites = match renames {
             TrackRenames::AsConfigured => {
                 let (mut rewrites, mut is_configured) = crate::diff::utils::new_rewrites_inner(

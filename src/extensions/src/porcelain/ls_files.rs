@@ -1347,47 +1347,9 @@ pub(crate) fn expand_sparse_index(
     index: &mut gix::index::File,
     advise: bool,
 ) -> Result<bool> {
-    let sparse: Vec<(BString, gix::ObjectId)> = {
-        let state: &gix::index::State = index;
-        state
-            .entries()
-            .iter()
-            .filter(|e| e.mode == gix::index::entry::Mode::DIR)
-            .map(|e| (e.path(state).to_owned(), e.id))
-            .collect()
-    };
-    if sparse.is_empty() {
+    if !repo.ensure_full_index(index)? {
         return Ok(false);
     }
-
-    index.remove_entries(|_, _, e| e.mode == gix::index::entry::Mode::DIR);
-    // `istate->sparse_index = INDEX_EXPANDED` (sparse-index.c): what is written back is a
-    // full index, without the `sdir` extension that would tell a reader otherwise.
-    index.set_expanded();
-    for (dir, tree_id) in &sparse {
-        let Some(tree) = repo
-            .find_object(*tree_id)
-            .ok()
-            .and_then(|o| o.peel_to_tree().ok())
-        else {
-            continue;
-        };
-        // The traversal records the trees it descends through as well; only the
-        // leaves become index entries, which is what git's `add_path_to_index`
-        // callback does with its `READ_TREE_RECURSIVE` return.
-        for te in tree.traverse().breadthfirst.files()?.into_iter().filter(|te| !te.mode.is_tree()) {
-            let mut path = dir.clone();
-            path.extend_from_slice(&te.filepath);
-            index.dangerously_push_entry(
-                gix::index::entry::Stat::default(),
-                te.oid,
-                gix::index::entry::Flags::SKIP_WORKTREE,
-                gix::index::entry::Mode::from(te.mode),
-                path.as_bstr(),
-            );
-        }
-    }
-    index.sort_entries();
 
     // `advise_if_enabled(ADVICE_SPARSE_INDEX_EXPANDED, …)` (sparse-index.c): the
     // shared gate, which also honors `GIT_ADVICE` and prints the `Disable this

@@ -386,6 +386,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // Set while a detached `--glob <pattern>` (`Some(true)`) or
     // `--exclude <pattern>` (`Some(false)`) waits for its value.
     let mut pending_ref_value: Option<bool> = None;
+    // The options `setup_revisions()` is handed, each with the number of operands
+    // read before it — what the filename fallback below refuses when one stands
+    // after the first path. See `log`'s copy of the same record.
+    let mut setup_opts: Vec<(usize, &str)> = Vec::new();
     // `--reverse`: reverses `cmd_log_walk`'s output. Inert while `no_walk` holds,
     // because `cmd_show` prints its pending list without consulting it.
     let mut reverse = false;
@@ -441,6 +445,18 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         if after_dashdash {
             pathspecs.push(a.as_bytes().to_vec());
             continue;
+        }
+        let value_slot = pending_pickaxe.is_some()
+            || pending_order
+            || pending_line_range
+            || pending_ignore_regex
+            || pending_move_word.is_some()
+            || pending_indicator.is_some()
+            || pending_ws_error_highlight
+            || pending_decorate_refs.is_some()
+            || pending_ref_value.is_some();
+        if !value_slot && s.starts_with('-') && s != "--" && !super::log::log_parse_options_word(s) {
+            setup_opts.push((specs.len(), s));
         }
         // A short option that spends the *next* argv slot on its value, with no
         // slot left to spend: `get_arg()` (parse-options.c:59-60) — or, for `-n`,
@@ -1360,7 +1376,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         if let Some(k) = specs[..argv_specs].iter().position(|s| {
             !s.starts_with('^') && is_unresolvable_path(&repo, s)
         }) {
-            for tail in &specs[k + 1..argv_specs] {
+            for at in k + 1..=argv_specs {
+                for (_, opt) in setup_opts.iter().filter(|(before, _)| *before == at) {
+                    if let Some(msg) = crate::setup::verify_filename(opt, false) {
+                        eprintln!("fatal: {msg}");
+                        return Ok(ExitCode::from(128));
+                    }
+                }
+                let Some(tail) = specs[..argv_specs].get(at) else { break };
                 if super::log::spec_is_path(&repo, tail) {
                     continue;
                 }

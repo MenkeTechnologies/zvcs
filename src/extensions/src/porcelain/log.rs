@@ -1269,6 +1269,14 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // claimed. `cmd_log_init_finish()` dies on it only after the whole command
     // line has been through `setup_revisions()` (builtin/log.c:316-320).
     let mut unrecognized: Option<String> = None;
+    // The options `setup_revisions()` itself is handed, each with the number of
+    // operands read before it. Its filename fallback breaks out of the option loop
+    // at the first path, so an option standing after that path is never parsed:
+    // `verify_filename()` dies on it instead (revision.c:3127-3129, setup.c:285-286).
+    // `cmd_log_init_finish()`'s own `parse_options()` pass has already removed
+    // its options wherever they stood (builtin/log.c:280-312), so those are not
+    // recorded — see [`log_parse_options_word`].
+    let mut setup_opts: Vec<(usize, String)> = Vec::new();
     // `--log-size` (`revs->show_log_size`, revision.c:2668-2669).
     let mut log_size = false;
     let mut show_notes_by_default = false;
@@ -1363,6 +1371,12 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             rev_from_stdin.push(false);
             i += 1;
             continue;
+        }
+        if origin[i] == super::rev_list::Origin::Argv
+            && a.starts_with('-')
+            && !log_parse_options_word(a)
+        {
+            setup_opts.push((revs.len(), a.clone()));
         }
         // `if (!strcmp(arg, "--end-of-options")) { seen_end_of_options = 1; continue; }`
         // (revision.c:3062-3065), read after the pseudo-options and `--stdin` but
@@ -1845,7 +1859,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // ```
         //
         // (revision.c.) `--graph`'s implied `--topo-order` and parent rewrite are
-        // not set here but in `revision_opts_finish()` (revision.c:2749-2752), which
+        // not set here but in `setup_opts_finish()` (revision.c:2749-2752), which
         // runs once the whole command line has been read and only looks at whether
         // `revs->graph` is still there — so `--graph --no-graph` keeps neither, while
         // an explicit `--topo-order --no-graph` or `--parents --no-graph` keeps its
@@ -3539,8 +3553,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     // first, which is the difference between `git reflog show ..`
                     // ending at `'..' is outside repository` and `git reflog show
                     // .. nosuchfile` ending at `nosuchfile`.
+                    // The tail is argv's, so the options `setup_revisions()` would
+                    // have parsed after this operand are in it, in place, and
+                    // `verify_filename()` refuses each of them as an option.
                     if !in_paths {
-                        for tail in &revs[at + 1..] {
+                        for k in at + 1..=revs.len() {
+                            let opts = setup_opts.iter().filter(|(before, _)| *before == k);
+                            for (_, opt) in opts {
+                                if let Some(msg) = crate::setup::verify_filename(opt, false) {
+                                    eprintln!("fatal: {msg}");
+                                    return Ok(ExitCode::from(128));
+                                }
+                            }
+                            let Some(tail) = revs.get(k) else { break };
                             if spec_is_path(&repo, tail) {
                                 continue;
                             }
@@ -3580,7 +3605,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // with `SYMMETRIC_LEFT`, the other head, their merge bases excluded, and the
     // conflicted paths — as root-relative literal paths — in place of the
     // pathspec that selected them.
-    // `revision_opts_finish()` (revision.c:2744-2747), run once the arguments —
+    // `setup_opts_finish()` (revision.c:2744-2747), run once the arguments —
     // revisions included — have been read.
     if graph && break_bar.is_some() {
         eprintln!("fatal: options '--show-linear-break' and '--graph' cannot be used together");
@@ -3679,7 +3704,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `revision.c` guards the ancestry decorations with
     // `revs->rewrite_parents && revs->children.name` rather than with `--parents`
     // itself: `--simplify-merges` and `--simplify-by-decoration` set
-    // `rewrite_parents` where they are parsed and `revision_opts_finish()` sets it
+    // `rewrite_parents` where they are parsed and `setup_opts_finish()` sets it
     // for `--graph`, so each of those conflicts with `--children` exactly as
     // `--parents` does. The two decorations share one slot in the header and git
     // refuses to print both rather than pick an order.
@@ -16741,4 +16766,36 @@ fn extra_headers(data: &[u8]) -> Vec<&[u8]> {
         }
     }
     out
+}
+
+/// Whether `cmd_log_init_finish()`'s `parse_options()` pass claims `a` before
+/// `setup_revisions()` runs (builtin/log.c:280-312). That pass scans the whole
+/// command line up to `--` (`PARSE_OPT_KEEP_UNKNOWN_OPT | PARSE_OPT_KEEP_DASHDASH`,
+/// which also turns abbreviation off), so these options are taken wherever they
+/// stand — after a path included. A separate value (`--decorate-refs <p>`,
+/// `-L <r>`) is consumed with its option and never reaches this test.
+pub(super) fn log_parse_options_word(a: &str) -> bool {
+    matches!(
+        a,
+        "-q" | "--quiet"
+            | "--no-quiet"
+            | "--source"
+            | "--no-source"
+            | "--use-mailmap"
+            | "--no-use-mailmap"
+            | "--mailmap"
+            | "--no-mailmap"
+            | "--i-still-use-this"
+            | "--no-i-still-use-this"
+            | "--clear-decorations"
+            | "--decorate-refs"
+            | "--no-decorate-refs"
+            | "--decorate-refs-exclude"
+            | "--no-decorate-refs-exclude"
+            | "--decorate"
+            | "--no-decorate"
+    ) || a.starts_with("--decorate=")
+        || a.starts_with("--decorate-refs=")
+        || a.starts_with("--decorate-refs-exclude=")
+        || a.starts_with("-L")
 }

@@ -302,6 +302,9 @@ impl Transaction<'_, '_> {
     ) -> Result<Self, Error> {
         assert!(self.updates.is_none(), "BUG: Must not call prepare(…) multiple times");
         let store = self.store;
+        if let Some(backend) = store.reftable() {
+            return self.prepare_reftable(backend, edits.collect());
+        }
         let mut updates: Vec<_> = edits
             .map(|update| Edit {
                 update,
@@ -310,6 +313,7 @@ impl Transaction<'_, '_> {
                 leaf_referent_previous_oid: None,
                 log_only_split: false,
                 previous_is_symbolic: false,
+                reftable: None,
             })
             .collect();
         updates
@@ -328,6 +332,7 @@ impl Transaction<'_, '_> {
                     leaf_referent_previous_oid: None,
                     log_only_split: false,
                     previous_is_symbolic: false,
+                    reftable: None,
                 },
             )
             .map_err(Error::PreprocessingFailed)?;
@@ -444,6 +449,7 @@ impl Transaction<'_, '_> {
                                     // `REF_LOG_ONLY` on a deletion: append to the log and keep it,
                                     // rather than gix's "delete the log, keep the reference".
                                     log_only_split,
+                                    reftable: None,
                                 },
                             ));
                             // At most one edit can name `head_ref` — `pre_process` above
@@ -712,6 +718,48 @@ impl Transaction<'_, '_> {
             .map(|updates| updates.into_iter().map(|u| u.update).collect())
             .unwrap_or_default()
     }
+
+    /// Prepare `edits` in a store with the reftable backend, see
+    /// [`reftable_be_transaction_prepare()`](crate::store_impl::reftable::Backend).
+    ///
+    /// The prepared state goes onto the first edit; the edits themselves are what
+    /// [`rollback()`](Self::rollback()) reports, splits included.
+    fn prepare_reftable(
+        mut self,
+        backend: &crate::store_impl::reftable::Backend,
+        edits: Vec<RefEdit>,
+    ) -> Result<Self, Error> {
+        let objects = match &self.packed_refs {
+            PackedRefs::DeletionsAndNonSymbolicUpdates(objects)
+            | PackedRefs::DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(objects) => Some(&**objects),
+            PackedRefs::DeletionsOnly => None,
+        };
+        let data = backend.transaction_prepare(
+            edits,
+            self.store.object_hash,
+            self.store.write_reflog,
+            self.store.namespace.as_ref(),
+            objects,
+        )?;
+        let mut updates: Vec<Edit> = data
+            .edits()
+            .into_iter()
+            .map(|update| Edit {
+                update,
+                lock: None,
+                parent_index: None,
+                leaf_referent_previous_oid: None,
+                log_only_split: false,
+                previous_is_symbolic: false,
+                reftable: None,
+            })
+            .collect();
+        if let Some(first) = updates.first_mut() {
+            first.reftable = Some(Box::new(data));
+        }
+        self.updates = Some(updates);
+        Ok(self)
+    }
 }
 
 /// The reflog mode an edit carries, whichever kind of change it is.
@@ -808,6 +856,13 @@ mod error {
         },
         #[error("Could not read reference")]
         ReferenceDecode(#[from] file::loose::reference::decode::Error),
+        /// A store with the reftable backend refused the transaction; `message` is git's
+        /// error text verbatim, like `cannot lock ref 'refs/heads/main': is at <id> but expected <id>`.
+        #[error("{message}")]
+        Reftable {
+            kind: file::transaction::ErrorKind,
+            message: BString,
+        },
     }
 }
 

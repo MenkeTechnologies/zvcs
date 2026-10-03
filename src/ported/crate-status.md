@@ -1042,6 +1042,7 @@ See its [README.md](https://github.com/GitoxideLabs/gitoxide/blob/main/gix-lock/
     * [x] find single ref by name, `FETCH_HEAD`/`MERGE_HEAD` staying files (`refs/reftable-backend.c` of git 2.56.0, through `file::Store`)
     * [x] iterate refs with optional prefix and root refs, merging a linked worktree's stack with the main one
     * [x] reflog existence, forward and backward iteration, names of all reflogs
+    * [x] transactions: one locked table per stack, symref and `HEAD` splits, old-value and name-conflict checks with git's messages, reflog writing and deletion, peeled tags, auto-compaction
 * [x] API documentation
     * [ ] Some examples
 

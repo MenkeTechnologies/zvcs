@@ -29,6 +29,30 @@ pub enum PackedRefs<'a> {
     DeletionsAndNonSymbolicUpdatesRemoveLooseSourceReference(Box<dyn gix_object::Find + 'a>),
 }
 
+/// Why a transaction of a reftable store was refused, `enum ref_transaction_error`
+/// (refs.h:20-37, v2.56.0); `ref_transaction_error_msg()` (refs.c) words each for
+/// `update-ref --batch-updates`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// `REF_TRANSACTION_ERROR_GENERIC`: not caused by the values of an update.
+    Generic,
+    /// `REF_TRANSACTION_ERROR_NAME_CONFLICT`: a reference with a conflicting name exists or is updated as well.
+    NameConflict,
+    /// `REF_TRANSACTION_ERROR_CREATE_EXISTS`: the reference to create exists.
+    CreateExists,
+    /// `REF_TRANSACTION_ERROR_NONEXISTENT_REF`: the reference expected to exist does not.
+    NonexistentRef,
+    /// `REF_TRANSACTION_ERROR_INCORRECT_OLD_VALUE`: the reference does not have the expected value.
+    IncorrectOldValue,
+    /// `REF_TRANSACTION_ERROR_INVALID_NEW_VALUE`: the new value cannot be written.
+    InvalidNewValue,
+    /// `REF_TRANSACTION_ERROR_EXPECTED_SYMREF`: the reference expected to be symbolic is not.
+    ExpectedSymref,
+    /// `REF_TRANSACTION_ERROR_CASE_CONFLICT`: the name differs from an existing one only in case,
+    /// which only the files backend on a case-insensitive file system reports.
+    CaseConflict,
+}
+
 #[derive(Debug)]
 pub(in crate::store_impl::file) struct Edit {
     update: RefEdit,
@@ -78,6 +102,10 @@ pub(in crate::store_impl::file) struct Edit {
     /// `git update-ref --no-deref HEAD $(git rev-parse HEAD)` appends `<id> <id> <ident> <ts>`
     /// to `.git/logs/HEAD` and leaves `HEAD` detached.
     previous_is_symbolic: bool,
+    /// In a reftable store, the whole prepared transaction: its stack locks and git's view of its
+    /// updates. Prepare leaves it on the first edit, as [`Transaction`] has no field for it, and
+    /// commit takes it from there; dropping it with the edits rolls the transaction back.
+    reftable: Option<Box<crate::store_impl::reftable::TransactionData>>,
 }
 
 impl Edit {
@@ -106,6 +134,12 @@ impl file::Store {
     /// will never have been altered.
     ///
     /// The transaction inherits the parent namespace.
+    ///
+    /// In a store with the reftable backend the transaction follows git's reftable backend instead: each
+    /// stack it writes to is locked for the whole transaction, with `reftable.lockTimeout` rather than the
+    /// lock modes passed to [`prepare()`](Transaction::prepare()), and committing writes one table per
+    /// stack. There is no `packed-refs` then; an object database handed to [`packed_refs()`](Transaction::packed_refs())
+    /// only serves to peel annotated tags, whose peeled value a table stores with the reference.
     pub fn transaction(&self) -> Transaction<'_, '_> {
         file::first_use();
         Transaction {

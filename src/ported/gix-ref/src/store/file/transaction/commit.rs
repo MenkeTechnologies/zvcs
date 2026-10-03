@@ -29,7 +29,14 @@ impl Transaction<'_, '_> {
         self.commit_inner(committer.into())
     }
 
-    fn commit_inner(self, committer: Option<gix_actor::SignatureRef<'_>>) -> Result<Vec<RefEdit>, Error> {
+    fn commit_inner(mut self, committer: Option<gix_actor::SignatureRef<'_>>) -> Result<Vec<RefEdit>, Error> {
+        if let Some(backend) = self.store.reftable() {
+            let updates = self.updates.as_mut().expect("BUG: must call prepare before commit");
+            return match updates.first_mut().and_then(|first| first.reftable.take()) {
+                Some(data) => backend.transaction_finish(*data, committer),
+                None => Ok(Vec::new()),
+            };
+        }
         // `files_transaction_finish()` opens with `files_ref_store_write_options(refs)`
         // (refs/files-backend.c:3327, v2.56.0), the lazy config read that dies on a bad
         // `core.logAllRefUpdates` or `core.preferSymlinkRefs`.
@@ -265,6 +272,10 @@ mod error {
         DeleteReflog { full_name: BString, source: std::io::Error },
         #[error("The reflog could not be created or updated")]
         CreateOrUpdateRefLog(#[from] file::log::create_or_update::Error),
+        /// A store with the reftable backend failed to write or commit a table;
+        /// `message` is git's `reftable: transaction failure: <reason>`.
+        #[error("{message}")]
+        Reftable { message: BString },
     }
 }
 pub use error::Error;

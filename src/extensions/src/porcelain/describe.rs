@@ -254,6 +254,19 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     // `--broken`'s own mark is only for a `diff-index` that could not finish, which is
     // not a failure mode this port has. The check is over tracked changes only:
     // untracked files never make describe report dirty.
+    //
+    // The in-process `--dirty` arm (builtin/describe.c:756-766) starts with
+    // `refresh_index(REFRESH_QUIET|REFRESH_UNMERGED)`, whose first `ce_compare_data()`
+    // asks attributes and so dies on an `--attr-source` / `GIT_ATTR_SOURCE` naming no
+    // tree-ish — see [`super::read_tree::StatCtx::refresh_dies_on_attr_source`].
+    // `REFRESH_UNMERGED` skips conflicted paths silently. `--broken` runs its
+    // refresh in a child instead and is not covered by this.
+    if dirty.is_some() && broken.is_none() {
+        let index = repo.index_or_empty()?;
+        if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)? {
+            return death.die();
+        }
+    }
     let dirty_mark = match (&dirty, &broken) {
         (None, None) => None,
         (mark, _) => {

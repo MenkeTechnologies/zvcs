@@ -199,3 +199,15 @@ fn a_keep_reset_writes_its_two_passes_once() {
     assert_eq!(f.shared_indexes(), 2);
     assert_eq!(entry_count(&f.index()), 0);
 }
+
+/// A fast-forward is `checkout_fast_forward()`, an `unpack_trees()` whose result inherits
+/// the source index's shared half (unpack-trees.c:1944-1959). Built from the tree alone, the
+/// result had none, and the merge wrote the repository's split index back whole.
+#[test]
+fn a_fast_forward_merge_keeps_the_index_split() {
+    let f = Fixture::new("ff");
+    f.ok(&["merge", "-q", "side"]);
+    assert_eq!(&f.index()[12..16], b"link", "the index is still split");
+    assert_eq!(f.shared_indexes(), 2, "and f3, refilled, crossed the 20% default");
+    assert_eq!(entry_count(&f.index()), 0);
+}

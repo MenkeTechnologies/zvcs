@@ -1462,6 +1462,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "gix-reftable",
+ "gix-sec",
  "gix-tempfile",
  "gix-utils",
  "gix-validate",

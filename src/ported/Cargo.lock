@@ -2027,6 +2027,7 @@ dependencies = [
  "gix-odb",
  "gix-path",
  "gix-reftable",
+ "gix-sec",
  "gix-tempfile",
  "gix-testtools",
  "gix-utils",

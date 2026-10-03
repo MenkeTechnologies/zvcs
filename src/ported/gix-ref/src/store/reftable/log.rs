@@ -147,9 +147,15 @@ impl Backend {
         if old_oid.is_null() && new_oid.is_null() {
             return None;
         }
-        // `fmt_ident(name, email, WANT_COMMITTER_IDENT, NULL, IDENT_NO_DATE)`.
+        // `fmt_ident(name, email, WANT_COMMITTER_IDENT, NULL, IDENT_NO_DATE)`
+        // (ident.c:456-546), which is not strict: an empty name is replaced by
+        // the login name of the account (`xgetpwuid_self()`, ident.c:509-518).
         let mut committer = Vec::new();
-        push_without_crud(&mut committer, &update.name);
+        if update.name.first().is_none_or(|&c| c == 0) {
+            push_without_crud(&mut committer, gix_sec::identity::passwd_self().name.as_bytes());
+        } else {
+            push_without_crud(&mut committer, &update.name);
+        }
         committer.extend_from_slice(b" <");
         push_without_crud(&mut committer, &update.email);
         committer.push(b'>');

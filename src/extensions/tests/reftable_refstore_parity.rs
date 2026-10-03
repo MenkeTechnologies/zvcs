@@ -336,3 +336,29 @@ fn reflog_names_of_all_worktrees_in_both_formats() {
         assert_eq!(via_main, wt_head, "{format}: another worktree's log by its prefixed name");
     }
 }
+
+/// A reftable log record with an empty name reads back with the account's
+/// login name, as `fmt_ident()` substitutes it (ident.c:509-518); stock's
+/// `log -g` shows the same name. The record is made by migrating a files
+/// reflog whose line has no name.
+#[test]
+fn an_empty_reflog_name_reads_as_the_login_name() {
+    let Some(f) = Fixture::new("empty-name") else { return };
+    f.run(&["init", "-q", "-b", "main", "F"]);
+    f.run(&["-C", "F", "commit", "-q", "--allow-empty", "-m", "one"]);
+    let log = f.path("F/.git/logs/refs/heads/main");
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::write(&log, text.replace(" C O Mitter <", " <")).unwrap();
+    let status = Command::new("cp").arg("-R").arg(f.path("F")).arg(f.path("T")).status().unwrap();
+    assert!(status.success());
+    f.run(&["-C", "T", "refs", "migrate", "--ref-format=reftable"]);
+
+    let shown = f.run(&["-C", "T", "log", "-g", "--format=%gn <%ge>", "main"]);
+    let (_, reftable) = entries(&open(&f.path("T")), "refs/heads/main", false);
+    assert_eq!(reftable.len(), 1);
+    assert_eq!(reftable[0].committer, shown.trim_end(), "the login name, as stock shows it");
+    assert!(!shown.starts_with(" <"), "stock substituted a name: {shown}");
+
+    let (_, files) = entries(&open(&f.path("F")), "refs/heads/main", false);
+    assert_eq!(files[0].committer, "<committer@example.com>", "files hands the line on as it is");
+}

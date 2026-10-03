@@ -1302,21 +1302,8 @@ fn copy_gecos(gecos: &str, login: &str) -> String {
 /// `LOGNAME` never take part — so an environment without them still yields the
 /// same address stock git builds.
 pub(crate) fn passwd_self() -> (String, String) {
-    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc;
-    // both fields are copied out before anything else can overwrite it.
-    let pw = unsafe { libc::getpwuid(libc::getuid()) };
-    if pw.is_null() {
-        return ("unknown".to_string(), "Unknown".to_string());
-    }
-    let field = |raw: *const libc::c_char| -> String {
-        if raw.is_null() {
-            String::new()
-        } else {
-            // SAFETY: a non-null passwd field is a NUL-terminated C string.
-            unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
-        }
-    };
-    (field(unsafe { (*pw).pw_name }), field(unsafe { (*pw).pw_gecos }))
+    let pw = gix::sec::identity::passwd_self();
+    (pw.name, pw.gecos)
 }
 
 /// `<login>@<domain>` the way `add_domainname()` builds it, and whether git

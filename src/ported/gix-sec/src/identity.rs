@@ -12,6 +12,51 @@ pub struct Account {
     pub oauth_refresh_token: Option<String>,
 }
 
+/// The passwd entry of the account the process runs as, the two fields git
+/// reads from it.
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub struct Passwd {
+    /// `pw_name`, the login name.
+    pub name: String,
+    /// `pw_gecos`, whose part up to the first comma git uses as the full name.
+    pub gecos: String,
+}
+
+/// git's `xgetpwuid_self()` (ident.c:41-58): the passwd entry of the real user
+/// id, or `unknown` with the full name `Unknown` when there is none. Only the
+/// passwd database is consulted, never `USER` or `LOGNAME`. Fields that are not
+/// valid UTF-8 are converted lossily. Platforms without a passwd database get
+/// the fallback.
+#[allow(unsafe_code)]
+pub fn passwd_self() -> Passwd {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getpwuid` returns NULL or a pointer to a static entry owned by
+        // libc; both fields are copied out before anything else can overwrite it.
+        let pw = unsafe { libc::getpwuid(libc::getuid()) };
+        if !pw.is_null() {
+            let field = |raw: *const libc::c_char| -> String {
+                if raw.is_null() {
+                    String::new()
+                } else {
+                    // SAFETY: a non-null passwd field is a NUL-terminated C string.
+                    unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned()
+                }
+            };
+            // SAFETY: `pw` is non-null and points to a valid entry, see above.
+            let (name, gecos) = unsafe { ((*pw).pw_name, (*pw).pw_gecos) };
+            return Passwd {
+                name: field(name),
+                gecos: field(gecos),
+            };
+        }
+    }
+    Passwd {
+        name: "unknown".into(),
+        gecos: "Unknown".into(),
+    }
+}
+
 /// Returns true if the given `path` is owned by the user who is executing the current process.
 ///
 /// Note that this method is very specific to avoid having to deal with any operating system types.

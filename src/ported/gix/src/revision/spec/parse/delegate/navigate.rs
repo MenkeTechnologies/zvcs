@@ -203,7 +203,7 @@ impl delegate::Navigate for Delegate<'_> {
                 for oid in objs.iter() {
                     // `peel_onion()` treats `^{/<text>}` as `expected_type =
                     // OBJ_COMMIT` and runs `repo_peel_to_type()` before seeding
-                    // the one-line search — object-name.c:1146-1196. Without that
+                    // the one-line search — object-name.c:907-1000. Without that
                     // peel an annotated tag has no ancestry to search.
                     let start = match commit_reference(repo, oid) {
                         Ok(commit) => commit.id,
@@ -212,162 +212,66 @@ impl delegate::Navigate for Delegate<'_> {
                             continue;
                         }
                     };
-                    match start
-                        .attach(repo)
-                        .ancestors()
-                        .sorting(crate::revision::walk::Sorting::ByCommitTime(Default::default()))
-                        .all()
-                    {
-                        Ok(iter) => {
-                            let mut matched = false;
-                            let mut count = 0;
-                            let commits = iter.map(|res| {
-                                res.map_err(|err| err.raise_erased()).and_then(|commit| {
-                                    commit
-                                        .id()
-                                        .object()
-                                        .map_err(|err| err.raise_erased())
-                                        .map(Object::into_commit)
-                                })
-                            });
-                            for commit in commits {
-                                count += 1;
-                                match commit {
-                                    Ok(commit) => {
-                                        if matches(commit.message_raw_sloppy()) {
-                                            replacements.push((*oid, commit.id));
-                                            matched = true;
-                                            break;
-                                        }
-                                    }
-                                    Err(err) => errors.push((*oid, err)),
+                    // `peel_onion()` hands `get_oid_oneline()` a one-entry list
+                    // holding the peeled commit (object-name.c:996-997).
+                    let (found, count) = oneline_search(repo, &[start], &matches);
+                    match found {
+                        Some(id) => replacements.push((*oid, id)),
+                        None => errors.push((
+                            *oid,
+                            message!(
+                                "None of {commits_searched} commits from {oid} matched {kind} {regex:?}",
+                                regex = regex,
+                                commits_searched = count,
+                                oid = oid.attach(repo).shorten_or_id(),
+                                kind = if cfg!(feature = "revparse-regex") {
+                                    "regex"
+                                } else {
+                                    "text"
                                 }
-                            }
-                            if !matched {
-                                errors.push((
-                                    *oid,
-                                    message!(
-                                        "None of {commits_searched} commits from {oid} matched {kind} {regex:?}",
-                                        regex = regex,
-                                        commits_searched = count,
-                                        oid = oid.attach(repo).shorten_or_id(),
-                                        kind = if cfg!(feature = "revparse-regex") {
-                                            "regex"
-                                        } else {
-                                            "text"
-                                        }
-                                    )
-                                    .raise_erased(),
-                                ));
-                            }
-                        }
-                        Err(err) => errors.push((*oid, err.raise_erased())),
+                            )
+                            .raise_erased(),
+                        )),
                     }
                 }
                 handle_errors_and_replacements(&mut self.delayed_errors, objs, errors, &mut replacements)
             }
             None => {
-                // `:/<text>` with no anchor is `get_oid_oneline()` over the list
-                // `handle_one_ref()` built (`object-name.c:1308-1381`):
-                //
-                // ```c
-                // for_each_ref(handle_one_ref, &cb);      /* commit_list_insert(), i.e. prepend */
-                // …
-                // while (list) {
-                //         commit = pop_most_recent_commit(&list, ONELINE_SEEN);
-                //         …
-                //         if (matches) { oidcpy(oid, &commit->object.oid); found = 1; break; }
-                // }
-                // ```
-                //
-                // Two things about that walk are load-bearing and a generic
-                // commit-time traversal reproduces neither. `for_each_ref()` visits
-                // refs in name order while `commit_list_insert()` *prepends*, so the
-                // seeds are consumed in **reverse** name order — the last branch
-                // alphabetically is searched first. And `pop_most_recent_commit()`
-                // takes the list head and puts each parent back with
-                // `commit_list_insert_by_date()`, which walks past every entry whose
-                // date is `>=` the new one — so equal timestamps keep insertion
-                // order rather than heap order. On a fixture where every commit
-                // carries the same timestamp and two branches hold the same subject
-                // (an original and its cherry-pick), those two rules are the whole
-                // answer: stock names the pick on the later branch, and a
-                // `ByCommitTime` walk named the original.
+                // `:/<text>` with no anchor runs `get_oid_oneline()` over the list
+                // `handle_one_ref()` built (object-name.c:1763-1771):
+                // `refs_for_each_ref()` visits refs in name order and then
+                // `refs_head_ref()` adds HEAD, and `commit_list_insert()`
+                // *prepends* each, so the list starts with HEAD followed by the
+                // refs in reverse name order. `handle_one_ref()` derefs tags and
+                // keeps only commits (object-name.c:1164-1181).
                 let references = self.repo.references().or_erased()?;
                 let references = references.all().or_erased()?;
-                let mut list: Vec<(ObjectId, gix_date::SecondsSinceUnixEpoch)> = Vec::new();
-                for r in references
+                let mut seeds: Vec<ObjectId> = references
                     .peeled()
                     .or_raise_erased(|| message("Couldn't configure iterator for peeling"))?
                     .filter_map(Result::ok)
-                    .filter(|r| r.id().header().ok().is_some_and(|obj| obj.kind().is_commit()))
                     .filter_map(|r| r.detach().peeled)
+                    .filter_map(|id| commit_reference(self.repo, &id).ok().map(|c| c.id))
+                    .collect();
+                if let Some(head) = self
+                    .repo
+                    .head_id()
+                    .ok()
+                    .and_then(|id| commit_reference(self.repo, &id).ok().map(|c| c.id))
                 {
-                    if list.iter().any(|(id, _)| *id == r) {
-                        continue;
-                    }
-                    let time = self
-                        .repo
-                        .find_object(r)
-                        .ok()
-                        .and_then(|o| o.try_into_commit().ok())
-                        .and_then(|c| c.committer().ok().map(|s| s.seconds()))
-                        .unwrap_or_default();
-                    // `commit_list_insert()`: prepend.
-                    list.insert(0, (r, time));
+                    seeds.push(head);
                 }
-                let mut seen: std::collections::HashSet<ObjectId> =
-                    list.iter().map(|(id, _)| *id).collect();
-                let mut matched = false;
-                let mut count = 0;
-                while !list.is_empty() {
-                    let (oid, _) = list.remove(0);
-                    count += 1;
-                    let commit = match self
-                        .repo
-                        .find_object(oid)
-                        .map_err(|err| err.raise_erased())
-                        .map(Object::into_commit)
-                    {
-                        Ok(commit) => commit,
-                        Err(err) => {
-                            self.delayed_errors.push(err);
-                            continue;
-                        }
-                    };
-                    // `pop_most_recent_commit()` queues the parents before the caller
-                    // looks at the commit, so a match still leaves them queued — but
-                    // the loop breaks, so only the ordering up to the match matters.
-                    let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
-                    if matches(commit.message_raw_sloppy()) {
+                seeds.reverse();
+                let (found, count) = oneline_search(self.repo, &seeds, matches);
+                match found {
+                    Some(id) => {
                         let objs = self.objs[self.idx].get_or_insert_with(Vec::new);
-                        if !objs.contains(&commit.id) {
-                            objs.push(commit.id);
+                        if !objs.contains(&id) {
+                            objs.push(id);
                         }
-                        matched = true;
-                        break;
+                        Ok(())
                     }
-                    for parent in parents {
-                        if !seen.insert(parent) {
-                            continue;
-                        }
-                        let time = self
-                            .repo
-                            .find_object(parent)
-                            .ok()
-                            .and_then(|o| o.try_into_commit().ok())
-                            .and_then(|c| c.committer().ok().map(|s| s.seconds()))
-                            .unwrap_or_default();
-                        // `commit_list_insert_by_date()`: after every entry whose
-                        // date is not strictly smaller.
-                        let at = list.iter().position(|(_, d)| *d < time).unwrap_or(list.len());
-                        list.insert(at, (parent, time));
-                    }
-                }
-                if matched {
-                    Ok(())
-                } else {
-                    Err(message!(
+                    None => Err(message!(
                         "None of {commits_searched} commits reached from all references matched {kind} {regex:?}",
                         regex = regex,
                         commits_searched = count,
@@ -377,7 +281,7 @@ impl delegate::Navigate for Delegate<'_> {
                             "text"
                         }
                     )
-                    .raise_erased())
+                    .raise_erased()),
                 }
             }
         }
@@ -487,4 +391,64 @@ fn handle_errors_and_replacements(
         }
         Ok(())
     }
+}
+
+/// Port of the walk in `get_oid_oneline()` (object-name.c:1183-1235): the seeds
+/// go into a `prio_queue` ordered by `compare_commits_by_commit_date()`
+/// (commit.c:923-933, newest first), ties broken by insertion order
+/// (prio-queue.c:4-12), and `pop_most_recent_commit()` (commit.c:782-797) queues
+/// every not-yet-seen parent of the popped commit. The first commit whose message
+/// matches wins. Returns the match and how many commits were looked at.
+///
+/// A seed listed twice is queued once: git queues both copies, but the later
+/// copy pops after the first with the same message and no unseen parents, so it
+/// can neither match first nor change the order.
+fn oneline_search(
+    repo: &crate::Repository,
+    seeds: &[ObjectId],
+    matches: impl Fn(&BStr) -> bool,
+) -> (Option<ObjectId>, usize) {
+    use std::{cmp::Reverse, collections::BinaryHeap};
+
+    let commit_date = |id: ObjectId| {
+        repo.find_object(id)
+            .ok()
+            .and_then(|obj| obj.try_into_commit().ok())
+            .and_then(|commit| commit.committer().ok().map(|sig| sig.seconds()))
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = BinaryHeap::new();
+    let mut insertion_ctr = 0usize;
+    let mut put = |queue: &mut BinaryHeap<_>, id: ObjectId, date: gix_date::SecondsSinceUnixEpoch| {
+        queue.push((date, Reverse(insertion_ctr), id));
+        insertion_ctr += 1;
+    };
+    for &id in seeds {
+        if seen.insert(id) {
+            put(&mut queue, id, commit_date(id).unwrap_or_default());
+        }
+    }
+
+    let mut count = 0;
+    while let Some((_, _, id)) = queue.pop() {
+        count += 1;
+        let Some(commit) = repo.find_object(id).ok().and_then(|obj| obj.try_into_commit().ok()) else {
+            continue;
+        };
+        // `pop_most_recent_commit()` queues the parents before the caller
+        // reads the message; a parent that does not parse is skipped.
+        for parent in commit.parent_ids().map(|id| id.detach()) {
+            if seen.contains(&parent) {
+                continue;
+            }
+            if let Some(date) = commit_date(parent) {
+                seen.insert(parent);
+                put(&mut queue, parent, date);
+            }
+        }
+        if matches(commit.message_raw_sloppy()) {
+            return (Some(commit.id), count);
+        }
+    }
+    (None, count)
 }

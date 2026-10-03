@@ -55,6 +55,11 @@ use crate::lock::RepoLock;
 ///     with the version-1 bump, the `reftable/` stack and its `HEAD` /
 ///     `refs/heads` stubs, and a first table holding the `HEAD` symref — the
 ///     layout stock lays down, through `gix-reftable`.
+///     Reinitializing applies the same chain to the existing repository as 2.56.0
+///     does: the environment only stands in for a format the repository does not
+///     record, but the configured or compiled-in default replaces the recorded one,
+///     so a plain `git init` turns a reftable repository's config back to `files`
+///     and rewrites `extensions.*` and `core.repositoryformatversion` accordingly.
 ///   * `init.defaultSubmodulePathConfig=true` seeds
 ///     `extensions.submodulePathConfig=true` (and the `core.repositoryformatversion=1`
 ///     bump it requires) into the new repository, exactly like stock git.
@@ -563,6 +568,29 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             return Ok(fatal(&format!("unknown ref storage format '{fmt}'")));
         }
     }
+    // `repository_format_configure()` (setup.c:2765-2838) for a repository that already exists.
+    // The command line wins (and was checked against the repository above); the environment
+    // only fills a format the repository does not record (`repo_fmt->version < 0`); after that
+    // the configured default and finally the compiled-in default replace whatever the
+    // repository records. So a plain `git init` over a reftable repository reinitializes it as
+    // `files`, exactly as stock 2.56.0 does.
+    let reinit_formats = reinit.then(|| {
+        let version_set = local_config(&git_dir)
+            .is_some_and(|f| f.string_by("core", None, "repositoryformatversion").is_some());
+        let hash = match (&object_format, &env_object_format) {
+            (Some(cli), _) => cli.clone(),
+            (None, Some(env)) if !version_set => env.clone(),
+            (None, Some(_)) => repository_object_format(&git_dir),
+            (None, None) => defaults.hash.clone().unwrap_or_else(|| repository_object_format(&git_dir)),
+        };
+        let refs = match (&ref_format, &env_ref_format) {
+            (Some(cli), _) => cli.clone(),
+            (None, Some(env)) if !version_set => env.clone(),
+            (None, Some(_)) => repository_ref_format(&git_dir),
+            (None, None) => defaults.ref_format.clone().unwrap_or_else(|| "files".to_string()),
+        };
+        (hash, refs)
+    });
     let object_format = object_format.or(env_object_format);
     let ref_format = ref_format.or(env_ref_format);
 
@@ -766,6 +794,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         None => copy_default_template(&template_dir)?,
     }
 
+    // `create_default_files()` → `initialize_repository_version()` (setup.c:2612), which on a
+    // fresh repository gix's skeleton already carries.
+    if let Some((hash, refs)) = &reinit_formats {
+        reinitialize_repository_version(&git_dir, hash, refs)?;
+    }
+
     // `init.defaultSubmodulePathConfig=true` asks every new repository to opt into
     // the submodule-path extension, which git records as
     // `extensions.submodulePathConfig=true` plus the `core.repositoryformatversion=1`
@@ -819,7 +853,16 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     let shared = shared.or_else(|| configured_shared(&git_dir));
     if let Some(shared) = shared {
         write_shared_config(&git_dir, shared)?;
-        #[cfg(unix)]
+    }
+    // `create_reference_database()` (setup.c:2525-2563): on reinit only the ref store's
+    // `create_on_disk()`, for whatever format the repository was just given.
+    if let Some((_, refs)) = &reinit_formats {
+        if let Some(code) = create_ref_store_on_disk(&git_dir, refs == "reftable")? {
+            return Ok(code);
+        }
+    }
+    #[cfg(unix)]
+    if let Some(shared) = shared {
         adjust_shared_perm_recursive(&git_dir, shared)?;
     }
 
@@ -940,6 +983,125 @@ fn read_default_format_config() -> Result<DefaultFormats> {
         }
     }
     Ok(cfg)
+}
+
+/// `initialize_repository_version()` (setup.c:2444-2512) with `reinit` set: record `hash` and
+/// `refs` (`files` / `reftable`) in the repository's config, removing the extension of a
+/// default one, and set `core.repositoryformatversion` to 1 when either is not the default or
+/// another version-1-only extension (`handle_extension()`, setup.c:653-715) remains, 0
+/// otherwise. `init.defaultSubmodulePathConfig` adds its extension and forces version 1.
+fn reinitialize_repository_version(git_dir: &Path, hash: &str, refs: &str) -> Result<()> {
+    use crate::config_store::ValuePattern;
+    let path = config_path(git_dir);
+    // `repo_config_set[_gently]()`: `git_config_set_multivar_in_file_gently(…, NULL, NULL, 0)`.
+    // The gentle unset of a key that is not there changes nothing.
+    let set = |key: &str, value: Option<&str>| -> Result<()> {
+        match crate::config_store::set_multivar_in_file(
+            &path,
+            key,
+            key,
+            key.rfind('.').expect("the key has a section"),
+            value.map(str::as_bytes),
+            ValuePattern::Any,
+            None,
+            false,
+        ) {
+            Ok(()) => Ok(()),
+            Err(_) if value.is_none() => Ok(()),
+            // `repo_config_set()` (config.c) dies on any failure.
+            Err(_) => Err(crate::fatal::die(format!("could not set '{key}' to '{}'", value.unwrap_or_default()))),
+        }
+    };
+    let mut target_version = if hash != "sha1" || refs != "files" { 1 } else { 0 };
+    set("extensions.objectformat", (hash != "sha1").then_some(hash))?;
+    set("extensions.refstorage", (refs != "files").then_some(refs))?;
+
+    // `read_repository_format()` of the config as it now is.
+    const V1_ONLY: &[&str] = &[
+        "noop-v1",
+        "objectformat",
+        "compatobjectformat",
+        "refstorage",
+        "relativeworktrees",
+        "submodulepathconfig",
+    ];
+    if let Some(file) = local_config(git_dir) {
+        let v1_only = file.sections_by_name("extensions").into_iter().flatten().any(|section| {
+            section.header().subsection_name().is_none()
+                && section
+                    .value_names()
+                    .any(|name| V1_ONLY.contains(&name.to_string().to_ascii_lowercase().as_str()))
+        });
+        if v1_only {
+            target_version = 1;
+        }
+    }
+
+    // `repo_config_get_bool(repo, "init.defaultSubmodulePathConfig", …)`, the repository's own
+    // value over every other scope.
+    let submodule_path_config = local_config(git_dir)
+        .and_then(|f| f.boolean_by("init", None, "defaultSubmodulePathConfig").ok().flatten())
+        .or_else(|| {
+            crate::config::config_entries_in_order(None)
+                .into_iter()
+                .filter(|(key, _)| key == "init.defaultsubmodulepathconfig")
+                .last()
+                .map(|(_, value)| value.map_or(true, |v| gix::config::Boolean::try_from(gix::bstr::BStr::new(v.as_bytes())).is_ok_and(|b| b.0)))
+        })
+        .unwrap_or(false);
+    if submodule_path_config {
+        if target_version == 0 {
+            target_version = 1;
+        }
+        set("extensions.submodulepathconfig", Some("true"))?;
+    }
+    set("core.repositoryformatversion", Some(&target_version.to_string()))
+}
+
+/// `ref_store_create_on_disk(get_main_ref_store(repo), 0, …)` (refs.c:2226-2244) as a
+/// reinitialization reaches it, for the format the repository now records. Directories that
+/// exist are left alone (`safe_create_dir()`, path.c:791-801, whose other failures are
+/// `perror()` and exit 1); the stubs are rewritten (`write_file()`, which dies).
+///
+/// - files (refs/files-backend.c:3658-3700): `refs/` in the git directory, `refs/heads` and
+///   `refs/tags` in the common one.
+/// - reftable (refs/reftable-backend.c:497-510): `reftable/`, then `refs_create_refdir_stubs()`
+///   (refs.c:2202-2223): `HEAD` naming `refs/heads/.invalid`, `refs/`, and a `refs/heads`
+///   file. Over a files repository whose `refs/heads` is a directory that last write dies.
+fn create_ref_store_on_disk(git_dir: &Path, reftable: bool) -> Result<Option<ExitCode>> {
+    let safe_create_dir = |dir: &Path| -> Option<ExitCode> {
+        match std::fs::create_dir(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                eprintln!("{}: {}", dir.display(), crate::external::strerror(&e));
+                Some(ExitCode::from(1))
+            }
+            _ => None,
+        }
+    };
+    let write_file = |path: &Path, contents: &str| -> Result<()> {
+        if let Err(e) = std::fs::write(path, contents) {
+            crate::git_fatal!("could not open '{}' for writing: {}", path.display(), crate::external::strerror(&e));
+        }
+        Ok(())
+    };
+    if reftable {
+        if let Some(code) = safe_create_dir(&git_dir.join("reftable")) {
+            return Ok(Some(code));
+        }
+        write_file(&git_dir.join("HEAD"), "ref: refs/heads/.invalid\n")?;
+        if let Some(code) = safe_create_dir(&git_dir.join("refs")) {
+            return Ok(Some(code));
+        }
+        write_file(&git_dir.join("refs/heads"), "this repository uses the reftable format\n")?;
+        return Ok(None);
+    }
+    let common = common_dir(git_dir);
+    for dir in [git_dir.join("refs"), common.join("refs/heads"), common.join("refs/tags")] {
+        if let Some(code) = safe_create_dir(&dir) {
+            return Ok(Some(code));
+        }
+    }
+    Ok(None)
 }
 
 /// `extensions.refStorage` as an existing repository records it, defaulting to

@@ -677,6 +677,20 @@ fn naming(out: &mut Vec<Case>) {
         ],
         out,
     );
+    // The same swap in `git log`, and under `--follow`: reversed, the commit that
+    // created the followed name deletes it, so the limited queue has no creation,
+    // `diff_might_be_rename()` says no, and the deletion is the record.
+    each(
+        Shape::Renamed,
+        "log",
+        &[
+            &["log", "-R", "-p", "--format=%s"],
+            &["log", "-R", "--stat", "--summary", "--format=%s"],
+            &["log", "-R", "--follow", "--stat", "--format=%s", "--", "moved/alpha.txt"],
+            &["log", "-R", "--follow", "-p", "--format=%s", "--", "moved/alpha.txt"],
+        ],
+        out,
+    );
     out.push(
         Case::new("diff", &["diff", "--default-prefix", "-M", "HEAD~3", "HEAD~2"], Shape::Renamed)
             .with_config(&[("diff.noprefix", "true")]),

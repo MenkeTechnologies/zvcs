@@ -2618,6 +2618,8 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     return Ok(ExitCode::from(129));
                 }
             }
+        } else if a == "-R" {
+            patch_opts.reverse = true;
         } else if a == "-D" || a == "--irreversible-delete" {
             patch_opts.irreversible_delete = true;
         } else if a == "--textconv" {
@@ -2889,6 +2891,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // splitting on NUL would write three. Refused rather than approximated.
     if !line_prefix.is_empty() && z {
         bail!("unsupported option --line-prefix with -z");
+    }
+    // `builtin_diff()` hands a pair's two names their prefixes the other way
+    // round under `-R`, so the pre-image is written `b/` and the post-image `a/`.
+    if patch_opts.reverse {
+        std::mem::swap(&mut patch_opts.src_prefix, &mut patch_opts.dst_prefix);
     }
     // The two-way patch takes the prefix from the shared painter, which places it
     // inside a word diff only where `fn_out_diff_words_write_helper()` does. Under
@@ -6111,7 +6118,40 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // `--follow` is the exception: its record is the rename *pair*
                 // (`R100 a.txt renamed.txt`), so both sides have to survive into
                 // rename detection and the limit is applied to the result instead.
-                let pre = if followed.is_some() { None } else { path_limit.as_mut() };
+                //
+                // Only when `diff_might_be_rename()` finds a creation in the queue
+                // the followed name limits, though (tree-diff.c): otherwise
+                // `try_to_follow_renames()` never runs and that limited queue is the
+                // record — which is how `-R` reports the followed file's deletion
+                // rather than a rename nobody asked for.
+                let follow_search = match followed.as_mut() {
+                    Some(m) => {
+                        let probe = super::diff::PatchOpts {
+                            renames: Some(0),
+                            break_opt: -1,
+                            find_copies_harder: false,
+                            ..patch_opts.clone()
+                        };
+                        collect_changes(
+                            &repo,
+                            &commit,
+                            diff_parent,
+                            false,
+                            super::diff::Whitespace::Keep,
+                            Some(&probe),
+                            Some(m),
+                            None,
+                        )?
+                        .iter()
+                        .any(|f| f.status == b'A')
+                    }
+                    None => false,
+                };
+                let pre = match followed.as_mut() {
+                    Some(_) if follow_search => None,
+                    Some(m) => Some(m),
+                    None => path_limit.as_mut(),
+                };
                 // `try_to_follow_renames()` (tree-diff.c:631-640) does not reuse the
                 // command's diffcore settings for the pair it goes looking for: it
                 // builds its own `diff_options` with `flags.find_copies_harder = 1`,
@@ -6124,7 +6164,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 // --name-status c.txt` reported `C100 d.txt c.txt` for the commit that
                 // copied `d.txt`, where the command's own settings (plain `-M`, no
                 // harder pass) can only see an addition.
-                let follow_opts = followed.is_some().then(|| super::diff::PatchOpts {
+                let follow_opts = follow_search.then(|| super::diff::PatchOpts {
                     find_copies_harder: true,
                     renames: Some(super::diffcore_rename::DETECT_COPY),
                     ..patch_opts.clone()
@@ -13304,6 +13344,12 @@ fn collect_changes(
         Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
         None => None,
     };
+    // `-R` swaps every pair as the queue is built (`diff_change()`,
+    // `diff_addremove()`), which is the queue of the swapped trees.
+    let (old_tree, new_tree) = match detect.is_some_and(|o| o.reverse) {
+        false => (old_tree, Some(new_tree)),
+        true => (Some(new_tree), old_tree),
+    };
 
     // A tree-to-tree diff is a pure function of two immutable trees, so the file
     // list — and the per-file line tallies, which cost a blob read each — are
@@ -13311,7 +13357,7 @@ fn collect_changes(
     // parent/child pairs on every invocation; git does too, but this sidesteps
     // the work instead of racing it.
     let old_key = old_tree.as_ref().map(|t| t.id.to_string()).unwrap_or_default();
-    let new_key = new_tree.id.to_string();
+    let new_key = new_tree.as_ref().map(|t| t.id.to_string()).unwrap_or_default();
     // The cached list is the raw one the tree walk produced; rename detection runs on
     // the way out, so `--follow` (which does its own rename search on the raw list) and
     // the reporting formats can share one cache entry.
@@ -13345,7 +13391,7 @@ fn collect_changes(
 
     let mut changes = repo.diff_tree_to_tree(
         old_tree.as_ref(),
-        Some(&new_tree),
+        new_tree.as_ref(),
         gix::diff::Options::default(),
     )?;
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));

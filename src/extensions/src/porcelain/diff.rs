@@ -6280,7 +6280,16 @@ fn commit_deltas(
     // `-- <pathspec>`: git limits the patch to the paths it was asked about, the
     // same list that decided which commits are shown.
     let mut specs = specs;
+    let mut follow = follow;
     if let Some(s) = specs.as_mut() {
+        // `diff_tree_oid()` only reaches `try_to_follow_renames()` when
+        // `diff_might_be_rename()` finds a creation in the *limited* queue
+        // (tree-diff.c); otherwise the limited queue is the answer, so a followed
+        // path that is modified or deleted (`-R` turns the creation into one) is
+        // never paired with anything.
+        if follow && !deltas.iter().any(|d| d.old.is_none() && s.matches(&d.path)) {
+            follow = false;
+        }
         if !follow {
             deltas.retain(|delta| s.matches(&delta.path));
         }

@@ -1925,6 +1925,10 @@ fn reset_two_tree(
     // `merged_entry()`/`deleted_entry()` skip `verify_uptodate()` for it — which
     // is why `git reset --merge` succeeds over a conflicted index while the same
     // worktree state would abort a clean one.
+    // `setup_standard_excludes()` on `o->internal.dir`, consulted by `verify_absent()`.
+    let mut excludes = repo
+        .excludes(old, None, gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped)
+        .ok();
     let mut index = index_entry_map(old);
     let unmerged = unmerged_paths(old);
     for (path, mode) in &unmerged {
@@ -1982,7 +1986,7 @@ fn reset_two_tree(
                         Refusal::NotUptodate,
                     ),
                     None => (
-                        worktree_absent_or_matches(repo, BStr::new(path), to),
+                        worktree_absent_or_ignored(repo, &mut excludes, BStr::new(path)),
                         Refusal::WouldLoseUntracked,
                     ),
                 };
@@ -2209,9 +2213,17 @@ fn worktree_uptodate(
     blob_oid(repo, &full, &meta) == Some(oid)
 }
 
-/// Whether it is safe to create `path` from the target: no worktree file exists,
-/// or the one that does already matches the target content (no untracked data lost).
-fn worktree_absent_or_matches(repo: &gix::Repository, path: &BStr, target_oid: ObjectId) -> bool {
+/// `verify_absent()` for a path the index does not track: whether it is safe to
+/// create `path` from the target. `check_ok_to_remove()` (unpack-trees.c) never
+/// looks at the content of the file in the way — an untracked file is refused even
+/// when it already holds the target blob — and lets it through only when no file
+/// is there or when the standard excludes match it (`reset_index()` runs with
+/// `preserve_ignored = 0`, so ignored files are expendable).
+fn worktree_absent_or_ignored(
+    repo: &gix::Repository,
+    excludes: &mut Option<gix::AttributeStack<'_>>,
+    path: &BStr,
+) -> bool {
     let Some(full) = repo.workdir_path(path) else {
         return true;
     };
@@ -2219,7 +2231,15 @@ fn worktree_absent_or_matches(repo: &gix::Repository, path: &BStr, target_oid: O
         Ok(m) => m,
         Err(_) => return true,
     };
-    blob_oid(repo, &full, &meta) == Some(target_oid)
+    if meta.is_dir() {
+        return false;
+    }
+    excludes.as_mut().is_some_and(|stack| {
+        stack
+            .at_entry(path, Some(Mode::FILE))
+            .map(|p| p.is_excluded())
+            .unwrap_or(false)
+    })
 }
 
 /// The blob object id a worktree file would hash to (the link target for a

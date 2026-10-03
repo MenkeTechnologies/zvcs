@@ -1796,6 +1796,26 @@ fn unwind(out: &mut Vec<Sequence>) {
             .step(&["merge", "--abort"]),
     );
 
+    // `reset --merge` / `--keep` onto a tree that re-adds a path the worktree
+    // still holds untracked, with the very bytes the tree wants. `merged_entry()`
+    // over no index entry is `verify_absent()`, and `check_ok_to_remove()`
+    // (unpack-trees.c) never reads the file: anything not excluded is refused
+    // with `Untracked working tree file 'README.md' would be overwritten by
+    // merge.` and `fatal: Could not reset index file to revision 'HEAD~1'.`,
+    // exit 128, HEAD unmoved. A port that compares the squatter's content with
+    // the target blob lets it through and moves HEAD.
+    for mode in ["--merge", "--keep"] {
+        out.push(
+            Sequence::new("reset", format!("{mode}-refuses-identical-untracked"), Shape::Linear)
+                .strict()
+                .step(&["rm", "-q", "--cached", "README.md"])
+                .step(&["commit", "-q", "-m", "untrack readme"])
+                .step(&["reset", mode, "HEAD~1"])
+                .step(&["status", "--porcelain"])
+                .step(&["log", "--oneline", "-1"]),
+        );
+    }
+
     // `checkout -m -- <path>`: the inverse of every other step in this file. It
     // re-creates a conflict in the *worktree* from the path's stage 1/2/3 index
     // entries. Step 3's `checkout --ours` is what sets that up: it overwrites

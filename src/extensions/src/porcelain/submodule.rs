@@ -458,13 +458,10 @@ fn status_repo(
             continue;
         };
 
-        let Ok(head) = sub_repo.head_id() else {
-            bail!(
-                "submodule '{}' has an unborn HEAD; git's null-oid reporting for that case is not ported",
-                entry.path
-            );
-        };
-        let head = head.detach();
+        // `ce_compare_gitlink()` (read-cache.c) counts a gitlink whose HEAD does
+        // not resolve — an unborn branch — as matching, so `diff-files` reports
+        // no change and the line is the recorded commit with a space.
+        let head = sub_repo.head_id().map_or(entry.oid, |id| id.detach());
 
         // `git diff-files --ignore-submodules=dirty -- <path>` reduces to "does
         // the submodule's HEAD match what the superproject recorded in its index".
@@ -4508,22 +4505,22 @@ fn pathspec_matches_any(
 // -------------------------------------------------------------- rev name ----
 
 /// git's `compute_rev_name`: the first of four `git describe` invocations that
-/// succeeds, or `None` when all of them fail (which includes the case where
-/// `oid` is not present in the submodule's object database at all).
+/// succeeds, or `None` when all of them fail.
+///
+/// An `oid` the submodule does not have fails the first two but not the third:
+/// `describe --contains` warns `Could not get object for <oid>. Skipping.` on
+/// the stderr git discards and exits 0 with nothing on stdout, so the name is
+/// the empty string and the line ends in ` ()`.
 fn rev_name(repo: &gix::Repository, oid: &ObjectId) -> Result<Option<String>> {
-    let commit = match repo.find_object(*oid) {
-        Ok(obj) => match obj.peel_to_commit() {
-            Ok(commit) => commit,
-            Err(_) => return Ok(None),
-        },
-        Err(_) => return Ok(None),
-    };
+    let commit = repo.find_object(*oid).ok().and_then(|obj| obj.peel_to_commit().ok());
 
     // 1. `git describe` — annotated tags only. 2. `git describe --tags`.
-    for select in [SelectRef::AnnotatedTags, SelectRef::AllTags] {
-        let platform = commit.describe().names(select);
-        if let Some(resolution) = platform.try_resolve()? {
-            return Ok(Some(resolution.format()?.to_string()));
+    if let Some(commit) = &commit {
+        for select in [SelectRef::AnnotatedTags, SelectRef::AllTags] {
+            let platform = commit.describe().names(select);
+            if let Some(resolution) = platform.try_resolve()? {
+                return Ok(Some(resolution.format()?.to_string()));
+            }
         }
     }
 

@@ -51,6 +51,8 @@ mod object;
 #[cfg(feature = "attributes")]
 mod pathspec;
 mod reference;
+///
+pub mod reftable;
 mod remote;
 mod revision;
 mod shallow;

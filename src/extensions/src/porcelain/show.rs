@@ -94,14 +94,13 @@ const DEFAULT_ABBREV: usize = 7;
 /// heuristic, three lines of context, `@@`-hunk function-context, binary-file
 /// detection, and the `\ No newline at end of file` marker.
 ///
-/// Output is uncolored — the `git --no-color show` / non-tty case — except under
-/// `--color-words[=<re>]` and `--word-diff=color`, the two spellings that set
-/// `options->use_color = GIT_COLOR_ALWAYS` in `diff_opt_word_diff()`.
-/// `log_tree_commit()` hands the header the same `o->use_color`, so those two paint
-/// the whole record: the `commit <id>` line, the decorations, the patch body, the
-/// diffstat graph and a merge's combined sections alike. `--color`/`--color=always`
-/// stay refused — nothing but this family has been measured against stock — while
-/// `--no-color`, `--color=never` and `--color=auto` are accepted and inert.
+/// Color is `diffopt.use_color`: `--color[=<when>]`, `--no-color`, and the two
+/// spellings that set it to `GIT_COLOR_ALWAYS` in `diff_opt_word_diff()`
+/// (`--color-words[=<re>]`, `--word-diff=color`) share the one slot, last wins, and
+/// `color.diff`/`color.ui` decide when none of them is given. `log_tree_commit()`
+/// hands the header the same `o->use_color`, so it paints the whole record: the
+/// `commit <id>` line, the decorations, the patch body, the diffstat graph, a
+/// merge's combined sections, and the `tag`/`tree` header lines alike.
 ///
 /// `--word-diff=plain` and `=porcelain`, which need no colour, are rendered.
 ///
@@ -331,8 +330,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `--color-moved*` / `--word-diff*` / `--color-words`, resolved against
     // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` after discovery.
     let mut move_word = diff_color::MoveWordOpts::default();
-    // The `GIT_COLOR_ALWAYS` the two color spellings of that family force.
-    let mut move_word_color: Option<diff_color::ColorWhen> = None;
+    // `diffopt.use_color` as the command line leaves it: `--color[=<when>]` and
+    // `--no-color` write it, and so do the two color spellings of that family
+    // (`GIT_COLOR_ALWAYS`) — one slot, so the last of them wins. `None` leaves
+    // `color.diff`/`color.ui` in charge.
+    let mut color: Option<diff_color::ColorWhen> = None;
     // Set while a separated `--color-moved-ws` / `--word-diff-regex` waits for its
     // value, and likewise for `--output-indicator-*` and `--ws-error-highlight`.
     let mut pending_move_word: Option<String> = None;
@@ -538,7 +540,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         if let Some(flag) = pending_move_word.take() {
-            if let Some(Err(msg)) = move_word.parse_flag(&format!("{flag}={a}"), &mut move_word_color)
+            if let Some(Err(msg)) = move_word.parse_flag(&format!("{flag}={a}"), &mut color)
             {
                 eprintln!("{msg}");
                 return Ok(ExitCode::from(129));
@@ -759,8 +761,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             // spelling on the line wins over `format.encodeEmailHeaders`.
             "--encode-email-headers" => encode_email_headers = Some(true),
             "--no-encode-email-headers" => encode_email_headers = Some(false),
-            // We never colorize; accept the flags that request no/auto color.
-            "--no-color" | "--color=never" | "--color=auto" => {}
+            // `OPT_COLOR_FLAG` through `diff_opt_parse()`: bare `--color` is `always`,
+            // and the value is `git_config_colorbool()`'s, compared case-insensitively.
+            "--color" => color = Some(diff_color::ColorWhen::Always),
+            "--no-color" => color = Some(diff_color::ColorWhen::Never),
+            s if s.starts_with("--color=") => match diff_color::parse_color_when(&s["--color=".len()..]) {
+                Some(when) => color = Some(when),
+                None => {
+                    eprintln!("error: option `color' expects \"always\", \"auto\", or \"never\"");
+                    return Ok(ExitCode::from(129));
+                }
+            },
             _ => {
                 if let Some(v) = s.strip_prefix("--date=") {
                     match parse_date_mode(v) {
@@ -1167,15 +1178,13 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 // `--color-moved*` / `--word-diff*` / `--color-words`: the family that
                 // re-emits the assembled patch instead of changing how it is built.
                 // The two color spellings set `options->use_color = GIT_COLOR_ALWAYS`
-                // (`diff_opt_word_diff()`), and this module has no colored output path
-                // at all, so they stay refused rather than silently dropping the ANSI
-                // stock would emit.
+                // (`diff_opt_word_diff()`), the slot `--color` writes too.
                 //
                 // `--color-moved-ws` and `--word-diff-regex` are declared without
                 // `PARSE_OPT_OPTARG`, so a bare one takes the next argv entry.
                 } else if diff_color::needs_separate_value(s) {
                     pending_move_word = Some(s.to_string());
-                } else if let Some(res) = move_word.parse_flag(s, &mut move_word_color) {
+                } else if let Some(res) = move_word.parse_flag(s, &mut color) {
                     if let Err(msg) = res {
                         eprintln!("{msg}");
                         return Ok(ExitCode::from(129));
@@ -1414,10 +1423,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     }
 
     // `--word-diff`/`--color-moved` layered over `diff.wordRegex` / `diff.colorMoved`.
-    // The palette stays disabled: this module has no colored output path, and both
-    // spellings that would force color on are refused above, so the move detector
-    // (which git only runs with `o->emitted_symbols` allocated, i.e. with color on)
-    // is inert here exactly as it is in stock.
+    // The move detector only runs with color on (git allocates `o->emitted_symbols`
+    // only then), which the palette resolved below decides.
     // `--relative[=<path>]`, plus the `diff.relative` config that seeds the same
     // flag (`options->flags.relative_name = diff_relative`, diff.c:5155). An explicit
     // `--no-relative` beats the config.
@@ -1431,10 +1438,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `diff_opt_word_diff()` sets `options->use_color = GIT_COLOR_ALWAYS` for the
     // two color spellings (`--color-words[=<re>]`, `--word-diff=color`), and
     // `log_tree_commit()` hands the header the same `o->use_color` — so one of them
-    // anywhere on the line paints the whole record, exactly as it does in `git log`.
-    // No other spelling turns color on here: `--color`/`--color=always` are still
-    // refused, since nothing but this family has been measured against stock.
-    let want_color = move_word_color == Some(diff_color::ColorWhen::Always);
+    // paints the whole record, exactly as it does in `git log` — unless a later
+    // `--color=<when>`/`--no-color` rewrote the slot.
+    let want_color = diff_color::resolve_color(&repo, color);
     patch_opts.extra = match move_word.resolve(&repo) {
         Ok(e) => e,
         Err(msg) => {
@@ -1444,7 +1450,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     };
     // The palette the re-emit pass paints with, resolved from `color.diff`/`color.ui`
     // exactly as `git log` resolves it — the empty table when this run is not
-    // coloring, which is every run but the `--color-words` family's.
+    // coloring.
     patch_opts.colors = diff_color::DiffColors::resolve(&repo, want_color);
 
     // `revs->abbrev` reaches every abbreviation in the run, so it goes in front of
@@ -2922,7 +2928,7 @@ fn show_one(
                 if *shown_one {
                     out.push(b'\n');
                 }
-                show_tree(out, &obj, spec)?;
+                show_tree(out, &obj, spec, &disp.patch.colors)?;
                 exempt(start, out);
                 *shown_one = true;
                 break;
@@ -2961,9 +2967,18 @@ fn show_one(
 
 /// `tree <name>` header followed by the top-level entry names. git echoes the name
 /// as it was written on the command line, not the resolved object id.
-fn show_tree(out: &mut Vec<u8>, obj: &gix::Object<'_>, name: &str) -> Result<()> {
+///
+/// The header line is painted in the `commit` color (builtin/log.c:735-738).
+fn show_tree(
+    out: &mut Vec<u8>,
+    obj: &gix::Object<'_>,
+    name: &str,
+    colors: &diff_color::DiffColors,
+) -> Result<()> {
+    out.extend_from_slice(colors.get(diff_color::DiffSlot::Commit).as_bytes());
     out.extend_from_slice(b"tree ");
     out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(colors.reset().as_bytes());
     out.extend_from_slice(b"\n\n");
     for entry in TreeRefIter::from_bytes(&obj.data, obj.id.kind()) {
         let entry = entry?;
@@ -3024,8 +3039,12 @@ fn show_tag(
     if *shown_one {
         out.push(b'\n');
     }
+    // `printf("%stag %s%s\n", <commit color>, t->tag, <reset>)` (builtin/log.c:717-719).
+    let colors = &disp.patch.colors;
+    out.extend_from_slice(colors.get(diff_color::DiffSlot::Commit).as_bytes());
     out.extend_from_slice(b"tag ");
     out.extend_from_slice(tag.name);
+    out.extend_from_slice(colors.reset().as_bytes());
     out.push(b'\n');
 
     match (tag.tagger()?, pretty) {

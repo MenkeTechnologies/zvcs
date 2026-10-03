@@ -1189,6 +1189,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // The diff options the per-commit patch is rendered with; `-U3` and no whitespace
     // folding until a flag says otherwise.
     let mut patch_opts = super::diff::PatchOpts::default();
+    // `diff_setup()` installs the configured prefixes ahead of every option, so
+    // `--no-prefix`, `--src-prefix` and friends below simply overwrite them.
+    (patch_opts.src_prefix, patch_opts.dst_prefix) =
+        super::diff::ui_config_prefixes(&repo.config_snapshot(), true);
     // `--color-moved*` / `--word-diff*` / `--color-words`, layered over
     // `diff.colorMoved` / `diff.colorMovedWS` / `diff.wordRegex` once the repository
     // is readable.

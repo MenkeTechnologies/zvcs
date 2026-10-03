@@ -709,11 +709,10 @@ struct Opts {
     /// applies. Measured against stock 2.55.0: `--pretty=mboxrd -o <dir>` escapes,
     /// `-c format.mboxrd=true -o <dir>` does not.
     pretty_mboxrd: bool,
-    /// `--no-prefix`/`format.noprefix`: drop the `a/`+`b/` path prefixes from
-    /// `diff --git`, `---` and `+++`. `--default-prefix` puts them back.
-    noprefix: bool,
-    /// `--src-prefix=<p>`/`--dst-prefix=<p>`: what those prefixes are when they are
-    /// not suppressed. git's defaults are `a/` and `b/`.
+    /// The source/destination path prefixes of `diff --git`, `---` and `+++`.
+    /// `--no-prefix` and `format.noprefix` empty both (`diff_set_noprefix()`),
+    /// `--src-prefix=<p>`/`--dst-prefix=<p>` then write one slot each, so
+    /// `--no-prefix --src-prefix=Q/` is `Q/` against nothing.
     src_prefix: String,
     dst_prefix: String,
 
@@ -1919,6 +1918,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
     // git reads the `format.*` config as the defaults for its options; the CLI
     // flags below override scalars and append to the address/header lists.
     let snap = repo.config_snapshot();
+    // `diff.srcPrefix`/`diff.dstPrefix` reach format-patch through
+    // `git_diff_ui_config()`; `diff.noprefix` does not, and `format.noprefix`
+    // empties both slots before any option is parsed.
+    let cfg_prefixes = match snap.boolean("format.noprefix") == Some(true) {
+        true => (Vec::new(), Vec::new()),
+        false => super::diff::ui_config_prefixes(&snap, false),
+    };
     let cfg_str = |k: &str| snap.string(k).and_then(|v| v.to_str().ok().map(str::to_owned));
     // `git_format_config()`'s `format.to`, `format.cc` and `format.headers` arms
     // (builtin/log.c:983-1004) in configuration order: a `To:`/`Cc:` header joins
@@ -2020,9 +2026,8 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         output_encoding: String::new(),
         mboxrd: snap.boolean("format.mboxrd") == Some(true),
         pretty_mboxrd: false,
-        noprefix: snap.boolean("format.noprefix") == Some(true),
-        src_prefix: "a/".to_owned(),
-        dst_prefix: "b/".to_owned(),
+        src_prefix: String::from_utf8_lossy(&cfg_prefixes.0).into_owned(),
+        dst_prefix: String::from_utf8_lossy(&cfg_prefixes.1).into_owned(),
         signoff: snap.boolean("format.signOff") == Some(true),
         from: cfg_from,
         force_in_body_from: snap.boolean("format.forceInBodyFrom") == Some(true),
@@ -2274,11 +2279,13 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             "--no-zero-commit" => o.zero_commit = false,
             "--encode-email-headers" => o.encode_email_headers = true,
             "--no-encode-email-headers" => o.encode_email_headers = false,
-            "--no-prefix" => o.noprefix = true,
+            "--no-prefix" => {
+                o.src_prefix.clear();
+                o.dst_prefix.clear();
+            }
             "--no-binary" => o.no_binary = true,
             "--binary" => o.no_binary = false,
             "--default-prefix" => {
-                o.noprefix = false;
                 o.src_prefix = "a/".to_owned();
                 o.dst_prefix = "b/".to_owned();
             }
@@ -2831,11 +2838,9 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             s if s.starts_with("--src-prefix=") => {
                 o.src_prefix = s["--src-prefix=".len()..].to_owned();
-                o.noprefix = false;
             }
             s if s.starts_with("--dst-prefix=") => {
                 o.dst_prefix = s["--dst-prefix=".len()..].to_owned();
-                o.noprefix = false;
             }
             // xdiff's `XDF_WHITESPACE_FLAGS`. Each is a plain assignment in
             // `diff_opt_parse()`, so the last one on the command line decides.
@@ -8856,12 +8861,8 @@ fn strip_relative<'a>(path: &'a [u8], opts: &Opts) -> &'a [u8] {
     }
 }
 
-/// The `a/`+`b/` source/destination prefixes, emptied by `--no-prefix` /
-/// `format.noprefix`.
+/// The source/destination prefixes, as the options and configuration left them.
 fn prefixes(opts: &Opts) -> (&str, &str) {
-    if opts.noprefix {
-        return ("", "");
-    }
     (opts.src_prefix.as_str(), opts.dst_prefix.as_str())
 }
 

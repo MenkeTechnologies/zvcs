@@ -227,6 +227,18 @@ fn format_patch(out: &mut Vec<Case>) {
             Shape::Branched,
         ));
     }
+    // `format.noprefix` and `--no-prefix` empty both slots; a later
+    // `--src-prefix` writes only its own, so the destination stays empty.
+    out.push(Case::new(
+        "format-patch",
+        &["-c", "format.noprefix=true", "format-patch", "--stdout", "-1", "--src-prefix=Q/"],
+        Shape::Branched,
+    ));
+    out.push(Case::new(
+        "format-patch",
+        &["format-patch", "--stdout", "-1", "--no-prefix", "--dst-prefix=Q/"],
+        Shape::Branched,
+    ));
     // Config that only bites when files are written.
     out.push(Case::new(
         "format-patch",

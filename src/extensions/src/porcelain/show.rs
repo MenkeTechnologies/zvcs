@@ -311,6 +311,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut stat_widths = StatWidths::default();
     // The patch-shaping options, handed to the shared renderer.
     let mut patch_opts = super::diff::PatchOpts::default();
+    // Which prefix slots the command line wrote. `diff_setup()` installs the
+    // configured prefixes before any option is parsed, so a slot an option wrote
+    // keeps the option's value and the rest take the configuration's, which can
+    // only be read once the repository is open.
+    let mut src_prefix_given = false;
+    let mut dst_prefix_given = false;
     // `--dirstat[=<params>]` / `--dirstat-by-file[=<params>]` / `--cumulative`
     // (`diff_opt_dirstat()`, diff.c), all of which also turn the format on.
     let mut dirstat = super::diff_files::DirStat::default();
@@ -899,13 +905,17 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 } else if s == "--no-prefix" {
                     patch_opts.src_prefix.clear();
                     patch_opts.dst_prefix.clear();
+                    (src_prefix_given, dst_prefix_given) = (true, true);
                 } else if s == "--default-prefix" {
                     patch_opts.src_prefix = b"a/".to_vec();
                     patch_opts.dst_prefix = b"b/".to_vec();
+                    (src_prefix_given, dst_prefix_given) = (true, true);
                 } else if let Some(v) = s.strip_prefix("--src-prefix=") {
                     patch_opts.src_prefix = v.as_bytes().to_vec();
+                    src_prefix_given = true;
                 } else if let Some(v) = s.strip_prefix("--dst-prefix=") {
                     patch_opts.dst_prefix = v.as_bytes().to_vec();
+                    dst_prefix_given = true;
                 } else if let Some(v) = s
                     .strip_prefix("-U")
                     .filter(|v| !v.is_empty())
@@ -1309,6 +1319,14 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
 
     let mut repo = crate::setup::discover()?;
     let hex_len = repo.object_hash().len_in_hex();
+    let (src_prefix, dst_prefix) =
+        super::diff::ui_config_prefixes(&repo.config_snapshot(), true);
+    if !src_prefix_given {
+        patch_opts.src_prefix = src_prefix;
+    }
+    if !dst_prefix_given {
+        patch_opts.dst_prefix = dst_prefix;
+    }
 
     // `setup_revisions()`'s filename fallback (revision.c:3078-3092):
     //

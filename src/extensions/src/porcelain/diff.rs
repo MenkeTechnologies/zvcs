@@ -6095,6 +6095,39 @@ impl Default for PatchOpts {
     }
 }
 
+/// The `a/` and `b/` a history command starts from before its own options are
+/// read: `diff_setup()`'s prefix decision (diff.c:5149-5153) over the values
+/// `git_diff_ui_config()` loaded, which `git log`, `git show` and
+/// `git format-patch` all read.
+///
+/// ```c
+/// if (diff_no_prefix) {
+///         diff_set_noprefix(options);
+/// } else if (!diff_mnemonic_prefix) {
+///         diff_set_default_prefix(options);
+/// }
+/// ```
+///
+/// With `diff.mnemonicPrefix` on, neither slot is assigned and the `a/`/`b/`
+/// fallback stands, so `diff.srcPrefix` is ignored. `honor_noprefix` is false
+/// for `format-patch`, whose `git_format_config()` swallows `diff.noprefix`
+/// before the diff layer sees it (it has `format.noprefix` instead).
+pub(crate) fn ui_config_prefixes(
+    snap: &gix::config::Snapshot<'_>,
+    honor_noprefix: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    if honor_noprefix && snap.boolean("diff.noPrefix") == Some(true) {
+        return (Vec::new(), Vec::new());
+    }
+    if snap.boolean("diff.mnemonicPrefix") == Some(true) {
+        return (b"a/".to_vec(), b"b/".to_vec());
+    }
+    let slot = |key: &str, default: &[u8]| {
+        snap.string(key).map_or_else(|| default.to_vec(), |p| p.to_vec())
+    };
+    (slot("diff.srcPrefix", b"a/"), slot("diff.dstPrefix", b"b/"))
+}
+
 /// The patch bodies for a batch of commits, one per job, in the caller's order.
 ///
 /// Every entry is an independent tree-to-tree diff over immutable objects, so the

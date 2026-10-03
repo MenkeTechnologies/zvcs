@@ -174,6 +174,11 @@ fn diff_rendering(out: &mut Vec<Case>) {
         [("diff.srcPrefix", "old/"), ("diff.dstPrefix", "new/"), ("diff.noPrefix", "true")]
     {
         under(out, "diff", &["diff", "HEAD~1", "HEAD"], Shape::Branched, (key, value));
+        // `git_diff_ui_config()` is `git_log_config()`'s fallback too, so the
+        // history verbs start from the same prefixes `diff` does.
+        under(out, "log", &["log", "-1", "-p", "--format="], Shape::Branched, (key, value));
+        under(out, "show", &["show", "--format="], Shape::Branched, (key, value));
+        under(out, "format-patch", &["format-patch", "--stdout", "-1"], Shape::Branched, (key, value));
     }
     // `diff.orderFile` naming a file that is not there. Not an ordering test —
     // no fixture carries an order file whose globs reorder its paths — but the

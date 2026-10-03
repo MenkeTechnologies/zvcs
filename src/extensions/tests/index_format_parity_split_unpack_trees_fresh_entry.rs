@@ -168,3 +168,22 @@ fn one_refilled_path_in_four_crosses_the_default_threshold() {
     );
     assert_eq!(entry_count(&f.index()), 0, "and it holds every entry");
 }
+
+/// The same refill through a branch switch: `switch_branches()` is `twoway_merge()`, and
+/// for `f3` it takes `merged_entry()`'s fresh entry.
+#[test]
+fn a_branch_switch_refills_the_changed_path_from_the_tree() {
+    let f = Fixture::new("switch");
+    f.ok(&["checkout", "-q", "side"]);
+    assert_eq!(f.shared_indexes(), 2);
+    assert_eq!(entry_count(&f.index()), 0);
+}
+
+/// And through `reset --merge`, `reset_index()`'s `oneway_merge()` with `o->update`.
+#[test]
+fn a_merge_reset_refills_the_changed_path_from_the_tree() {
+    let f = Fixture::new("merge");
+    f.ok(&["reset", "-q", "--merge", "side"]);
+    assert_eq!(f.shared_indexes(), 2);
+    assert_eq!(entry_count(&f.index()), 0);
+}

@@ -279,6 +279,35 @@ where
     res.map(|_| ())
 }
 
+/// Put what a checkout of `written` recorded back onto `index`: the stat of each file it
+/// wrote, and the up-to-date mark [`mark_written_uptodate`] gave it.
+///
+/// Only onto the entry naming the content that was written. A stat is true of the blob it
+/// was measured from and of no other: stamped on an entry that names a different blob it
+/// tells every later `status`, `diff` and `add` that the worktree matches the index when it
+/// does not.
+pub fn carry_written_stat(written: &gix::index::State, index: &mut gix::index::State) {
+    use gix::index::entry::Flags;
+    let fresh: std::collections::HashMap<BString, (gix::ObjectId, gix::index::entry::Mode, gix::index::entry::Stat, bool)> = {
+        let backing = written.path_backing();
+        written
+            .entries()
+            .iter()
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat, e.flags.contains(Flags::UPTODATE))))
+            .collect()
+    };
+    let backing = index.path_backing().to_owned();
+    for e in index.entries_mut() {
+        if let Some((_, _, stat, uptodate)) = fresh
+            .get(e.path_in(&backing))
+            .filter(|(id, mode, ..)| *id == e.id && *mode == e.mode)
+        {
+            e.stat = *stat;
+            e.flags.set(Flags::UPTODATE, *uptodate);
+        }
+    }
+}
+
 /// `update_ce_after_write()` (entry.c:270-279) under `state->refresh_cache`, which every
 /// `unpack_trees()` checkout sets (unpack-trees.c:438): `fill_stat_cache_info()` records the
 /// stat of the file just written and, for a regular file, `ce_mark_uptodate()`

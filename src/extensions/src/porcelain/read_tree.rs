@@ -2284,30 +2284,6 @@ fn checkout_subset(
         opts,
     )?;
 
-    // The stat of a file that was just written belongs to the blob it was written from, and to no
-    // other: stamping it on an entry that names different content tells every later `status`,
-    // `diff` and `add` that the worktree matches the index when it does not.
-    //
-    // `ce_mark_uptodate()` travels with it (`fill_stat_cache_info()`, read-cache.c:200-203):
-    // a file written this second is not racily clean against the index this one replaces.
-    let uptodate = gix::index::entry::Flags::UPTODATE;
-    let fresh: HashMap<BString, (gix::ObjectId, gix::index::entry::Mode, Stat, bool)> = {
-        let backing = subset.path_backing();
-        subset
-            .entries()
-            .iter()
-            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat, e.flags.contains(uptodate))))
-            .collect()
-    };
-    let backing = index.path_backing().to_owned();
-    for e in index.entries_mut() {
-        if let Some((_, _, stat, written)) = fresh
-            .get(&e.path_in(&backing).to_owned())
-            .filter(|(id, mode, ..)| *id == e.id && *mode == e.mode)
-        {
-            e.stat = *stat;
-            e.flags.set(uptodate, *written);
-        }
-    }
+    crate::worktree::carry_written_stat(&subset, index);
     Ok(())
 }

@@ -3817,6 +3817,9 @@ pub(super) fn update_worktree_to_tree(
     updating.stop();
 
     let untracked_before = super::write_tree::untracked_entry_states(&old);
+    // What `unpack_trees()` read, for telling `keep_entry()`'s carried entries from
+    // `merged_entry()`'s fresh ones below — needed only when there is a shared half.
+    let src = old.split_index().is_some().then(|| old.clone());
     // The index moves with the worktree, one path at a time: the touched entries
     // are replaced by the new tree's, the rest stay exactly as they were.
     let mut index = old;
@@ -3844,6 +3847,10 @@ pub(super) fn update_worktree_to_tree(
         }
     }
     index.sort_entries();
+    // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
+    if let Some(src) = &src {
+        index.unshare_entries_built_from_trees(src);
+    }
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::invalidate_untracked_changes(untracked_before.as_ref(), &mut index);

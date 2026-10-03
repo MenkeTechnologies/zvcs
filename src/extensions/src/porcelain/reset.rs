@@ -2032,6 +2032,8 @@ fn reset_two_tree(
         new_index.dangerously_push_entry(Stat::default(), *oid, Flags::empty(), *mode, BStr::new(p));
     }
     new_index.sort_entries();
+    // `merged_entry()`'s fresh entries carry no `ce->index` (unpack-trees.c:2567).
+    new_index.unshare_entries_built_from_trees(old);
     // The entries just pushed lost whatever the old index said about them; a path the
     // sparse checkout had left out of the work tree has to keep saying so. The
     // `checkout_subset` below then skips it, as `unpack_trees()` does.
@@ -2089,26 +2091,7 @@ fn reset_two_tree(
         )?;
         // Copy the fresh stats back onto the persisted index so the just-written
         // files are not reported modified before the next refresh.
-        // The id and mode ride with the stat: a stat is only true of the entry naming the content
-        // it was measured from. Stamping one on an entry that names a different blob claims the
-        // worktree matches the index when it does not, and the difference then disappears from
-        // `status`, `diff` and `add`.
-        let stat_map: HashMap<BString, (ObjectId, Mode, Stat)> = {
-            let backing = wt.path_backing();
-            wt.entries()
-                .iter()
-                .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat)))
-                .collect()
-        };
-        let backing = new_index.path_backing().to_owned();
-        for e in new_index.entries_mut() {
-            if let Some((_, _, stat)) = stat_map
-                .get(e.path_in(&backing))
-                .filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
-            {
-                e.stat = *stat;
-            }
-        }
+        crate::worktree::carry_written_stat(&wt, &mut new_index);
     }
 
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`

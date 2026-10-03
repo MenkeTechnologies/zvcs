@@ -17,7 +17,14 @@ impl file::Store {
         crate::name::Error: From<E>,
     {
         file::first_use();
-        Ok(self.reflog_path(name.try_into()?).is_file())
+        let name = name.try_into()?;
+        if let Some(backend) = self.reftable.as_deref() {
+            // git reports a stack it cannot read as a reflog that does not exist.
+            return Ok(backend
+                .reflog_exists(self.reftable_refname(name).as_ref())
+                .unwrap_or(false));
+        }
+        Ok(self.reflog_path(name).is_file())
     }
 
     /// Return a reflog reverse iterator for the given fully qualified `name`, reading chunks from the back into the fixed buffer `buf`.
@@ -35,6 +42,14 @@ impl file::Store {
     {
         file::first_use();
         let name: &FullNameRef = name.try_into().map_err(|err| Error::RefnameValidation(err.into()))?;
+        if let Some(backend) = self.reftable.as_deref() {
+            let mut lines = Vec::new();
+            if !self.reftable_reflog_into(backend, name, &mut lines)? {
+                return Ok(None);
+            }
+            let source = log::iter::ReflogSource::Buffer(std::io::Cursor::new(lines));
+            return Ok(Some(log::iter::reverse(source, buf)?));
+        }
         let path = self.reflog_path(name);
         if path.is_dir() {
             return Ok(None);
@@ -61,6 +76,11 @@ impl file::Store {
     {
         file::first_use();
         let name: &FullNameRef = name.try_into().map_err(|err| Error::RefnameValidation(err.into()))?;
+        if let Some(backend) = self.reftable.as_deref() {
+            return Ok(self
+                .reftable_reflog_into(backend, name, buf)?
+                .then(|| log::iter::forward(buf)));
+        }
         let path = self.reflog_path(name);
         match std::fs::File::open(&path) {
             Ok(mut file) => {
@@ -79,6 +99,19 @@ impl file::Store {
 }
 
 impl file::Store {
+    /// The reflog of `name` in the reftable stacks of `backend`, oldest entry first, as lines of
+    /// the files format written into `buf`; `false` if there is none.
+    fn reftable_reflog_into(
+        &self,
+        backend: &crate::store_impl::reftable::Backend,
+        name: &FullNameRef,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool, Error> {
+        backend
+            .reflog_into(self.reftable_refname(name).as_ref(), buf)
+            .map_err(|err| Error::Io(std::io::Error::other(err)))
+    }
+
     /// Implements the logic required to transform a fully qualified refname into its log name
     pub(crate) fn reflog_path(&self, name: &FullNameRef) -> PathBuf {
         let (base, rela_path) = self.reflog_base_and_relative_path(name);

@@ -165,6 +165,11 @@ impl file::Store {
         let full_name = precomposed_partial_name
             .unwrap_or(partial_name)
             .construct_full_name_ref(inbetween, path_buf, consider_pseudo_ref);
+        if let Some(backend) = self.reftable.as_deref() {
+            if !is_pseudo_ref_file(full_name.as_bstr()) {
+                return self.find_in_reftable(backend, full_name);
+            }
+        }
         let content_buf = match self.ref_contents(full_name) {
             Ok(content_buf) => content_buf,
             Err(err) if err.kind() == io::ErrorKind::NotADirectory => return Ok(None),
@@ -214,6 +219,59 @@ impl file::Store {
                     })?,
             )),
         }
+    }
+}
+
+/// `is_pseudo_ref()` (refs.c:887-900): `FETCH_HEAD` and `MERGE_HEAD` are files
+/// in the git directory whatever the ref storage format, and
+/// `refs_read_raw_ref()` reads them as such (refs.c:2099-2101).
+pub(crate) fn is_pseudo_ref_file(name: &[u8]) -> bool {
+    name == b"FETCH_HEAD" || name == b"MERGE_HEAD"
+}
+
+/// Reading from the reftable backend.
+impl file::Store {
+    /// The name `name` has in the reftable stacks: within the namespace, if
+    /// one is set, like the name of a reference file would be.
+    pub(crate) fn reftable_refname(&self, name: &FullNameRef) -> crate::FullName {
+        match &self.namespace {
+            Some(namespace) => namespace.to_owned().into_namespaced_name(name),
+            None => name.to_owned(),
+        }
+    }
+
+    /// `refs_read_raw_ref()` (refs.c:2095-2105) on a reftable store.
+    fn find_in_reftable(
+        &self,
+        backend: &crate::store_impl::reftable::Backend,
+        full_name: &FullNameRef,
+    ) -> Result<Option<Reference>, Error> {
+        let refname = self.reftable_refname(full_name);
+        let Some(target) = backend.read_raw_ref(refname.as_ref())? else {
+            return Ok(None);
+        };
+        // A file store refuses a symbolic reference to an invalid name when
+        // decoding the file; the same error is reported here.
+        if let crate::Target::Symbolic(target) = &target {
+            if let Err(err) = gix_validate::reference::name(target.as_bstr()) {
+                return Err(Error::ReferenceCreation {
+                    source: loose::reference::decode::Error::RefnameValidation {
+                        source: err,
+                        path: target.as_bstr().to_owned(),
+                    },
+                    relative_path: full_name.to_path().to_owned(),
+                });
+            }
+        }
+        let mut reference = Reference {
+            name: refname,
+            target,
+            peeled: None,
+        };
+        if let Some(namespace) = &self.namespace {
+            reference.strip_namespace(namespace);
+        }
+        Ok(Some(reference))
     }
 }
 
@@ -512,6 +570,8 @@ mod error {
         PackedRef(#[from] packed::find::Error),
         #[error("Could not open the packed refs buffer when trying to find references.")]
         PackedOpen(#[from] packed::buffer::open::Error),
+        #[error(transparent)]
+        Reftable(#[from] crate::store_impl::reftable::Error),
     }
 
     impl From<Infallible> for Error {

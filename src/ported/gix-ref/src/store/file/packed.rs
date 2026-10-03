@@ -25,7 +25,12 @@ impl file::Store {
     ///
     /// Note that it will automatically be memory mapped if it exceeds the default threshold of 32KB.
     /// Change the threshold with [file::Store::set_packed_buffer_mmap_threshold()].
+    ///
+    /// A store of the `reftable` format has no packed references, and yields `Ok(None)`.
     pub fn open_packed_buffer(&self) -> Result<Option<packed::Buffer>, packed::buffer::open::Error> {
+        if self.reftable.is_some() {
+            return Ok(None);
+        }
         match packed::Buffer::open(
             self.packed_refs_path(),
             self.packed_buffer_mmap_threshold,
@@ -95,6 +100,9 @@ pub(crate) mod modifiable {
         /// As some filesystems don't have nanosecond granularity, changes are likely to be missed
         /// if they happen within one second otherwise.
         pub fn force_refresh_packed_buffer(&self) -> Result<(), packed::buffer::open::Error> {
+            if self.reftable.is_some() {
+                return Ok(());
+            }
             self.packed.force_refresh(|| {
                 let modified = self.packed_refs_path().metadata()?.modified()?;
                 self.open_packed_buffer().map(|packed| Some(modified).zip(packed))
@@ -104,6 +112,10 @@ pub(crate) mod modifiable {
             &self,
         ) -> Result<Option<super::SharedBufferSnapshot>, packed::buffer::open::Error> {
             crate::store_impl::file::first_use();
+            // A `packed-refs` file in a reftable repository is not read by git.
+            if self.reftable.is_some() {
+                return Ok(None);
+            }
             self.packed.recent_snapshot(
                 || self.packed_refs_path().metadata().and_then(|m| m.modified()).ok(),
                 || self.open_packed_buffer(),

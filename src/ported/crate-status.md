@@ -1039,6 +1039,9 @@ See its [README.md](https://github.com/GitoxideLabs/gitoxide/blob/main/gix-lock/
       * [x] handle unsorted packed refs and those without a header
   * [ ] **[reftable][reftable-spec]**,
     * see [here for a Go/C implementation][reftable-impl]
+    * [x] find single ref by name, `FETCH_HEAD`/`MERGE_HEAD` staying files (`refs/reftable-backend.c` of git 2.56.0, through `file::Store`)
+    * [x] iterate refs with optional prefix and root refs, merging a linked worktree's stack with the main one
+    * [x] reflog existence, forward and backward iteration, names of all reflogs
 * [x] API documentation
     * [ ] Some examples
 

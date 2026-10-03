@@ -11,14 +11,31 @@ use std::{
 use crate::{
     BStr, FullName, Namespace, Reference,
     file::loose::{self, iter::SortedLoosePaths},
-    store_impl::{file, packed},
+    store_impl::{file, packed, reftable},
 };
 
 /// An iterator stepping through sorted input of loose references and packed references, preferring loose refs over otherwise
 /// equivalent packed references.
 ///
 /// All errors will be returned verbatim, while packed errors are depleted first if loose refs also error.
+///
+/// In a store of the `reftable` format, it yields the references of the reftable stacks instead.
 pub struct LooseThenPacked<'p, 's> {
+    inner: Inner<'p, 's>,
+}
+
+enum Inner<'p, 's> {
+    Files(Files<'p, 's>),
+    Reftable {
+        iter: reftable::RefIter,
+        namespace: Option<&'s Namespace>,
+        /// Stop at the first reference under `refs/`, for root references only.
+        root_refs_only: bool,
+    },
+}
+
+/// Loose references, then packed ones.
+struct Files<'p, 's> {
     git_dir: &'s Path,
     common_dir: Option<&'s Path>,
     object_hash: gix_hash::Kind,
@@ -42,7 +59,7 @@ pub struct Platform<'s> {
     packed: Option<file::packed::SharedBufferSnapshot>,
 }
 
-impl<'p> LooseThenPacked<'p, '_> {
+impl<'p> Files<'p, '_> {
     fn strip_namespace(&self, mut r: Reference) -> Reference {
         if let Some(namespace) = &self.namespace {
             r.strip_namespace(namespace);
@@ -111,6 +128,30 @@ impl<'p> LooseThenPacked<'p, '_> {
 }
 
 impl Iterator for LooseThenPacked<'_, '_> {
+    type Item = Result<Reference, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            Inner::Files(files) => files.next(),
+            Inner::Reftable {
+                iter,
+                namespace,
+                root_refs_only,
+            } => match iter.next()? {
+                Ok(r) if *root_refs_only && r.name.as_bstr().starts_with(b"refs/") => None,
+                Ok(mut r) => {
+                    if let Some(namespace) = namespace {
+                        r.strip_namespace(namespace);
+                    }
+                    Some(Ok(r))
+                }
+                Err(err) => Some(Err(err.into())),
+            },
+        }
+    }
+}
+
+impl Iterator for Files<'_, '_> {
     type Item = Result<Reference, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -364,6 +405,9 @@ impl file::Store {
         &'s self,
         packed: Option<&'p packed::Buffer>,
     ) -> std::io::Result<LooseThenPacked<'p, 's>> {
+        if let Some(backend) = self.reftable.as_deref() {
+            return Ok(self.iter_reftable(backend, "".into(), false));
+        }
         match self.namespace.as_ref() {
             Some(namespace) => self.iter_from_info(
                 IterInfo::PrefixAndBase {
@@ -396,7 +440,13 @@ impl file::Store {
     /// in the root of the `.git` directory, sorted by name.
     ///
     /// Errors are returned similarly to what would happen when loose refs were iterated by themselves.
+    ///
+    /// In a store of the `reftable` format, these are the root references of its stacks as git lists
+    /// them (`is_root_ref()`, refs.c:914-937), which leaves out `FETCH_HEAD` and `MERGE_HEAD`.
     pub fn iter_pseudo<'p>(&'_ self) -> std::io::Result<LooseThenPacked<'p, '_>> {
+        if let Some(backend) = self.reftable.as_deref() {
+            return Ok(self.iter_reftable(backend, "".into(), true));
+        }
         self.iter_from_info(
             IterInfo::Pseudo {
                 base: self.git_dir(),
@@ -419,6 +469,9 @@ impl file::Store {
         prefix: &RelativePath,
         packed: Option<&'p packed::Buffer>,
     ) -> std::io::Result<LooseThenPacked<'p, 's>> {
+        if let Some(backend) = self.reftable.as_deref() {
+            return Ok(self.iter_reftable(backend, prefix.as_ref().as_bstr(), false));
+        }
         match self.namespace.as_ref() {
             None => {
                 let git_dir_info = IterInfo::from_prefix(self.git_dir(), prefix, self.precompose_unicode)?;
@@ -449,25 +502,61 @@ impl file::Store {
     ) -> std::io::Result<LooseThenPacked<'p, 's>> {
         file::first_use();
         Ok(LooseThenPacked {
-            git_dir: self.git_dir(),
-            common_dir: self.common_dir(),
-            object_hash: self.object_hash,
-            iter_packed: match packed {
-                Some(packed) => Some(
-                    match git_dir_info.prefix() {
-                        Some(prefix) => packed.iter_prefixed(prefix.into_owned()),
-                        None => packed.iter(),
-                    }
-                    .map_err(std::io::Error::other)?
-                    .peekable(),
-                ),
-                None => None,
-            },
-            iter_git_dir: git_dir_info.into_iter(),
-            iter_common_dir: common_dir_info.map(IterInfo::into_iter),
-            buf: Vec::new(),
-            namespace: self.namespace.as_ref(),
+            inner: Inner::Files(Files {
+                git_dir: self.git_dir(),
+                common_dir: self.common_dir(),
+                object_hash: self.object_hash,
+                iter_packed: match packed {
+                    Some(packed) => Some(
+                        match git_dir_info.prefix() {
+                            Some(prefix) => packed.iter_prefixed(prefix.into_owned()),
+                            None => packed.iter(),
+                        }
+                        .map_err(std::io::Error::other)?
+                        .peekable(),
+                    ),
+                    None => None,
+                },
+                iter_git_dir: git_dir_info.into_iter(),
+                iter_common_dir: common_dir_info.map(IterInfo::into_iter),
+                buf: Vec::new(),
+                namespace: self.namespace.as_ref(),
+            }),
         })
+    }
+
+    /// `refs_ref_iterator_begin()` on a reftable store: the references starting
+    /// with `prefix`, within the namespace if one is set. With `root_refs_only`,
+    /// the root references instead (`REFS_FOR_EACH_INCLUDE_ROOT_REFS`), which
+    /// sort before every reference under `refs/`.
+    fn iter_reftable<'p>(
+        &self,
+        backend: &reftable::Backend,
+        prefix: &BStr,
+        root_refs_only: bool,
+    ) -> LooseThenPacked<'p, '_> {
+        file::first_use();
+        let namespace = self.namespace.as_ref().filter(|_| !root_refs_only);
+        let prefix = match namespace {
+            Some(namespace) => {
+                let mut namespaced = namespace.as_bstr().to_owned();
+                namespaced.extend_from_slice(prefix);
+                namespaced
+            }
+            None => prefix.to_owned(),
+        };
+        let flags = if root_refs_only {
+            reftable::RefIter::INCLUDE_ROOT_REFS
+        } else {
+            0
+        };
+        LooseThenPacked {
+            inner: Inner::Reftable {
+                iter: backend.iter_refs(prefix.as_ref(), &[], flags),
+                namespace,
+                root_refs_only,
+            },
+        }
     }
 }
 
@@ -498,6 +587,8 @@ mod error {
             line: gix_ref_packed::InvalidLine,
             line_number: usize,
         },
+        #[error(transparent)]
+        Reftable(#[from] crate::store_impl::reftable::Error),
     }
 }
 pub use error::Error;

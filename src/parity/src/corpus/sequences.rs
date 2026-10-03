@@ -1816,6 +1816,20 @@ fn unwind(out: &mut Vec<Sequence>) {
         );
     }
 
+    // `reset -- <path>` and `restore --staged <path>` on a path whose index entry
+    // already is the tree's: `read_from_tree()` only touches what `do_diff_cache()`
+    // reports and `update_some()` leaves a same-blob entry in place, so the entry
+    // keeps its assume-unchanged bit (the `h` in `ls-files -v`) and its stat data.
+    // A port that rebuilds every matched entry from the tree prints `H` instead.
+    for argv in [&["reset", "-q", "--", "README.md"][..], &["restore", "--staged", "README.md"][..]] {
+        out.push(
+            Sequence::new(argv[0], format!("{}-keeps-an-unchanged-entry", argv[0]), Shape::Linear)
+                .step(&["update-index", "--assume-unchanged", "README.md"])
+                .step(argv)
+                .step(&["ls-files", "-v"]),
+        );
+    }
+
     // `checkout -m -- <path>`: the inverse of every other step in this file. It
     // re-creates a conflict in the *worktree* from the path's stage 1/2/3 index
     // entries. Step 3's `checkout --ours` is what sets that up: it overwrites

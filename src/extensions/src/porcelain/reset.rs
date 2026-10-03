@@ -2325,6 +2325,35 @@ fn pathspec_index(
         }
     }
 
+    // `read_from_tree()` walks `do_diff_cache()`, so `update_index_from_diff()` only
+    // ever sees the paths where the index and the tree differ. A path that already
+    // holds the tree's blob and mode at stage 0 alone is never touched: it keeps its
+    // stat data, its assume-unchanged / skip-worktree bits and its cache-tree node.
+    // Rebuilding it from the tree zeroed the stat, so the next status had to re-hash it.
+    {
+        let backing = index.path_backing();
+        let mut stages: HashMap<&BStr, (usize, Option<(ObjectId, Mode)>)> = HashMap::new();
+        for e in index.entries() {
+            let path = e.path_in(backing);
+            if !ops.contains(&path.to_owned()) {
+                continue;
+            }
+            let slot = stages.entry(path).or_insert((0, None));
+            slot.0 += 1;
+            let plain = e.stage_raw() == 0 && !e.flags.contains(Flags::INTENT_TO_ADD);
+            slot.1 = plain.then_some((e.id, e.mode));
+        }
+        for (path, (count, entry)) in stages {
+            let unchanged = count == 1
+                && entry.is_some_and(|(id, mode)| {
+                    target_map.get(path).is_some_and(|(_, tid, _, tmode)| *tid == id && *tmode == mode)
+                });
+            if unchanged {
+                ops.remove(&path.to_owned());
+            }
+        }
+    }
+
     if ops.is_empty() {
         return Ok(index);
     }

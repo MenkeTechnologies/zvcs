@@ -1298,13 +1298,56 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `read_revisions_from_stdin()` though, which clears
     // `warn_on_object_refname_ambiguity` for its whole loop, so the boundary
     // between argv and stdin specs is remembered for the warning below.
-    let argv_specs = specs.len();
+    let mut argv_specs = specs.len();
     for line in stdin_text.lines().filter(|l| !l.is_empty()) {
         if super::log::argument_excludes(line, negate_revs) {
             no_walk = false;
         }
         specs.push(line);
         spec_negated.push(negate_revs);
+    }
+
+    let mut repo = crate::setup::discover()?;
+    let hex_len = repo.object_hash().len_in_hex();
+
+    // `setup_revisions()`'s filename fallback (revision.c:3078-3092):
+    //
+    // ```c
+    // if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+    //         int j;
+    //         if (seen_dashdash || *arg == '^')
+    //                 die(_("bad revision '%s'"), arg);
+    //         for (j = i; j < argc; j++)
+    //                 verify_filename(revs->prefix, argv[j], j == i);
+    //         strvec_pushv(&prune_data, argv + i);
+    //         break;
+    // }
+    // ```
+    //
+    // The first command-line operand that names no revision but does name a path
+    // turns itself and every operand after it into pathspecs, so `git show <file>`
+    // limits `HEAD`'s diff to that file. It has to be decided before `revs->def`
+    // below: when the path was the only operand, nothing was pended and `HEAD`
+    // is. Only an operand with no revision shape at all is taken here; one that
+    // looks like a range or a parent mark still reaches the resolver, which owns
+    // every diagnostic for those.
+    if !seen_dashdash {
+        if let Some(k) = specs[..argv_specs].iter().position(|s| {
+            !s.starts_with('^') && is_unresolvable_path(&repo, s)
+        }) {
+            for tail in &specs[k + 1..argv_specs] {
+                if super::log::spec_is_path(&repo, tail) {
+                    continue;
+                }
+                if let Some(msg) = crate::setup::verify_filename(tail, false) {
+                    eprintln!("fatal: {msg}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+            pathspecs.extend(specs.drain(k..argv_specs).map(|s| s.as_bytes().to_vec()));
+            spec_negated.drain(k..argv_specs);
+            argv_specs = k;
+        }
     }
 
     // `revs->def`: the fallback pending object is added with no flags at all, so a
@@ -1315,9 +1358,6 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         specs.push("HEAD");
         spec_negated.push(false);
     }
-
-    let mut repo = crate::setup::discover()?;
-    let hex_len = repo.object_hash().len_in_hex();
 
     // `--word-diff`/`--color-moved` layered over `diff.wordRegex` / `diff.colorMoved`.
     // The palette stays disabled: this module has no colored output path, and both
@@ -2432,6 +2472,17 @@ fn range_endpoint(spec: &str, sep: &str, right: bool) -> String {
 fn fatal(msg: &str) -> ExitCode {
     eprint!("fatal: {msg}");
     ExitCode::from(128)
+}
+
+/// Whether a command-line operand is `setup_revisions()`'s filename fallback: it
+/// names a path in the working tree (or the index) and has no reading as a
+/// revision. Anything with range or parent-mark syntax is left to the resolver.
+fn is_unresolvable_path(repo: &gix::Repository, spec: &str) -> bool {
+    super::log::spec_is_path(repo, spec)
+        && !spec.contains("..")
+        && matches!(crate::objname::parents_only(spec), crate::objname::ParentsOnly::Absent)
+        && repo.rev_parse(BStr::new(spec)).is_err()
+        && crate::objname::resolve_quiet(repo, spec).is_none()
 }
 
 /// The fatal `setup_revisions()` raises for an unresolvable revision argument,

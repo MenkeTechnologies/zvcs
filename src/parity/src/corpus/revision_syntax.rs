@@ -175,6 +175,7 @@ pub fn cases(out: &mut Vec<Case>) {
     peel_refusals(out);
     reflog_and_dwim(out);
     index_and_path(out);
+    path_operands(out);
     search(out);
     ranges(out);
     parent_sets(out);
@@ -662,6 +663,25 @@ fn index_and_path(out: &mut Vec<Case>) {
     out.push(Case::strict("cat-file", &["cat-file", "-p", ":1:conflict.txt"], Shape::Conflicted));
     // From the root, the cwd-relative form names nothing.
     out.push(Case::strict("rev-parse", &["rev-parse", "HEAD:./lib.rs"], Shape::Branched));
+}
+
+/// `setup_revisions()`'s filename fallback: the first operand that names no
+/// revision but does name a working-tree path turns itself and every operand
+/// after it into pathspecs, and `HEAD` is pended when nothing else was. Every
+/// operand after it must be a path too, and a revision there is
+/// `no such path in the working tree`, not a second commit to show.
+fn path_operands(out: &mut Vec<Case>) {
+    each(
+        Shape::Branched,
+        "show",
+        &[
+            &["show", "src/lib.rs"],
+            &["show", "--stat", "HEAD~1", "src/lib.rs", "README.md"],
+        ],
+        out,
+    );
+    out.push(Case::strict("show", &["show", "src/lib.rs", "HEAD"], Shape::Branched));
+    out.push(Case::strict("show", &["show", "src/lib.rs", "nosuch"], Shape::Branched));
 }
 
 // ---------------------------------------------------------------------------

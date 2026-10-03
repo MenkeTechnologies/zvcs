@@ -736,11 +736,23 @@ impl State {
         self.link_at_decode_time = false;
         self.split_index.take()
     }
-    /// Adopt `src`'s shared half, git's carry-over in `unpack_trees()`
+    /// Adopt `src`'s timestamp and shared half, git's carry-over in `unpack_trees()`
     /// (unpack-trees.c:1941-1957): an index rebuilt from a tree keeps the split index the
     /// one it was built from had, so writing it writes the split half again rather than
     /// dissolving the repository's shared index.
+    ///
+    /// ```c
+    /// o->internal.result.timestamp.sec = o->src_index->timestamp.sec;
+    /// o->internal.result.timestamp.nsec = o->src_index->timestamp.nsec;
+    /// ```
+    ///
+    /// The timestamp is what `is_racy_timestamp()` measures every entry against, in
+    /// `prepare_to_write_split_index()` and in `do_write_index()`'s smudge alike. A state
+    /// built from a tree has none, so without it no entry of the rebuilt index was racy: an
+    /// entry stock moves into the split half (and smudges, if its content moved) stayed in
+    /// the shared half with stat data that no longer proves anything.
     pub fn inherit_split_index(&mut self, src: &State) {
+        self.timestamp = src.timestamp;
         self.split_index = src.split_index.clone();
         self.link_at_decode_time = src.link_at_decode_time;
     }

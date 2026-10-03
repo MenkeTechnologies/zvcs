@@ -2476,7 +2476,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         // No action flag: one positional reads, two set the value.
         Mode::Auto if positional.len() == 1 => get(file, positional[0], false, None, &d),
         Mode::Auto if positional.len() == 2 => match normalized(d.ty, positional[0], positional[1]) {
-            Ok(value) => write_scoped(&write_target()?, positional[0], &value, WriteOp::Set, comment.as_deref()),
+            Ok(value) => write_scoped(&write_target()?, positional[0], &value, WriteOp::Set, comment.as_deref(), from_subcommand),
             Err(code) => Ok(code),
         },
         // `<name> <value> <value-pattern>` rewrites the values whose text matches
@@ -2497,7 +2497,7 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         Mode::Add => {
             let (name, value) = name_and_value(&positional)?;
             match normalized(d.ty, name, value) {
-                Ok(value) => write_scoped(&write_target()?, name, &value, WriteOp::Add, comment.as_deref()),
+                Ok(value) => write_scoped(&write_target()?, name, &value, WriteOp::Add, comment.as_deref(), false),
                 Err(code) => Ok(code),
             }
         }
@@ -4930,12 +4930,16 @@ fn value_pattern_of(pattern: Option<&str>, fixed: bool) -> crate::config_store::
 ///
 /// (builtin/config.c:1510-1517.) `--add` passes `CONFIG_REGEX_NONE` in place of the NULL
 /// value-pattern, so no existing value ever matches and the new one is appended.
+///
+/// `git config set` (`cmd_config_set()`, builtin/config.c:1178-1184) refuses with the same
+/// error but names its own options: `Use --value=<pattern>, --append or --all`.
 fn write_scoped(
     target: &WriteTarget,
     name: &str,
     value: &str,
     op: WriteOp,
     comment: Option<&str>,
+    subcommand: bool,
 ) -> Result<ExitCode> {
     let comment = comment.map(prepare_comment).transpose()?;
     let pattern = match op {
@@ -4944,9 +4948,13 @@ fn write_scoped(
     };
     let code = store_set(target, name, Some(value.as_bytes()), pattern, comment.as_deref(), false)?;
     if matches!(op, WriteOp::Set) && code == ExitCode::from(5) {
+        let options = match subcommand {
+            true => "--value=<pattern>, --append or --all",
+            false => "a regexp, --add or --replace-all",
+        };
         eprintln!(
             "error: cannot overwrite multiple values with a single value\n       \
-             Use a regexp, --add or --replace-all to change {name}."
+             Use {options} to change {name}."
         );
     }
     Ok(code)

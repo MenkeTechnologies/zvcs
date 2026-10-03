@@ -103,3 +103,21 @@ fn clustered_values_and_negated_strings() {
     assert_eq!(git(&root, &["config", "get", "--value=y", "--no-value", "a.b"]).0, "x\n");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `cmd_config_set()`'s refusal to overwrite a multivar names the subcommand's
+/// options (builtin/config.c:1182-1184); the legacy form names its own.
+#[test]
+fn set_over_a_multivar_names_the_subcommand_options() {
+    let root = std::env::temp_dir().join(format!("zvcs-config-sub-multivar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "a.b", "x"]);
+    git(&root, &["config", "--add", "a.b", "y"]);
+    let head = "warning: a.b has multiple values\nerror: cannot overwrite multiple values with a single value\n";
+    let (_, err, code) = git(&root, &["config", "set", "a.b", "z"]);
+    assert_eq!((err, code), (format!("{head}       Use --value=<pattern>, --append or --all to change a.b.\n"), 5));
+    let (_, err, code) = git(&root, &["config", "a.b", "z"]);
+    assert_eq!((err, code), (format!("{head}       Use a regexp, --add or --replace-all to change a.b.\n"), 5));
+    let _ = std::fs::remove_dir_all(&root);
+}

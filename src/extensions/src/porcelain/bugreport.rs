@@ -523,29 +523,9 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 
-/// `safe_create_leading_directories()` (path.c:832), reduced to the two outcomes
+/// [`crate::path::safe_create_leading_directories`] reduced to the two outcomes
 /// `cmd_bugreport` tells apart: `SCLD_OK`/`SCLD_EXISTS` (`true`) and everything
 /// else (`false`).
-///
-/// The C walks every `/`-separated prefix of the path, `stat`s it, and `mkdir`s
-/// the ones that are missing:
-///
-/// ```c
-/// if (!stat(path, &st)) {
-///         /* path exists */
-///         if (!S_ISDIR(st.st_mode)) {
-///                 errno = ENOTDIR;
-///                 ret = SCLD_EXISTS;
-///         }
-/// } else if (mkdir(path, 0777)) {
-///         if (errno == EEXIST && !stat(path, &st) && S_ISDIR(st.st_mode))
-///                 ; /* somebody created it since we checked */
-///         else if (errno == ENOENT)
-///                 ret = SCLD_VANISHED;
-///         else
-///                 ret = SCLD_FAILED;
-/// }
-/// ```
 ///
 /// A prefix that exists and is not a directory ends the walk as `SCLD_EXISTS` —
 /// *not* a failure — which is why `git bugreport -o README.md/sub` reaches the
@@ -553,42 +533,9 @@ fn is_executable(path: &Path) -> bool {
 /// directory` rather than complaining about the directories. `create_dir_all`
 /// cannot express that: it reports the same `NotADirectory` as any other error.
 pub(crate) fn safe_create_leading_directories(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    // `offset_1st_component()`: the leading separator of an absolute path is not
-    // a component that can be created.
-    let mut next = usize::from(bytes.first() == Some(&b'/'));
-    while next < bytes.len() {
-        let Some(offset) = bytes[next..].iter().position(|b| *b == b'/') else {
-            break;
-        };
-        let slash = next + offset;
-        // Skip a run of separators; a path that ends in them has no further
-        // component to create.
-        let mut after = slash + 1;
-        while bytes.get(after) == Some(&b'/') {
-            after += 1;
-        }
-        if after >= bytes.len() {
-            break;
-        }
-        next = after;
-
-        let prefix = &path[..slash];
-        match std::fs::metadata(prefix) {
-            Ok(meta) => {
-                if !meta.is_dir() {
-                    // `SCLD_EXISTS`, which the caller accepts.
-                    return true;
-                }
-            }
-            Err(_) => match std::fs::create_dir(prefix) {
-                Ok(()) => {}
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::AlreadyExists
-                        && std::fs::metadata(prefix).is_ok_and(|meta| meta.is_dir()) => {}
-                Err(_) => return false,
-            },
-        }
-    }
-    true
+    matches!(
+        crate::path::safe_create_leading_directories(path),
+        Ok(()) | Err(crate::path::Scld::Exists)
+    )
 }
+

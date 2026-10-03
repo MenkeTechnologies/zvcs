@@ -166,3 +166,83 @@ pub fn relative_path(input: &[u8], prefix: Option<&[u8]>) -> Vec<u8> {
     sb.extend_from_slice(rest);
     sb
 }
+
+/// The failing outcomes of `safe_create_leading_directories()` (`enum
+/// scld_error`, path.h:246-252, v2.56.0).
+#[derive(Debug)]
+pub enum Scld {
+    /// `SCLD_FAILED`: `mkdir()` refused a prefix for a reason other than the two below.
+    Failed(std::io::Error),
+    /// `SCLD_EXISTS`: a prefix exists and is not a directory; `errno` is `ENOTDIR`.
+    Exists,
+    /// `SCLD_VANISHED`: `mkdir()` answered `ENOENT`, a parent disappeared underneath.
+    Vanished,
+}
+
+impl Scld {
+    /// The `errno` a `die_errno()` after the call reports.
+    pub fn errno(&self) -> std::io::Error {
+        match self {
+            Scld::Failed(err) => std::io::Error::from_raw_os_error(err.raw_os_error().unwrap_or(libc::EIO)),
+            Scld::Exists => std::io::Error::from_raw_os_error(libc::ENOTDIR),
+            Scld::Vanished => std::io::Error::from_raw_os_error(libc::ENOENT),
+        }
+    }
+}
+
+/// `safe_create_leading_directories()` (path.c, v2.56.0): create every missing
+/// directory above the last component of `path`, leaving that component alone.
+///
+/// ```c
+/// if (!stat(path, &st)) {
+///         /* path exists */
+///         if (!S_ISDIR(st.st_mode)) {
+///                 errno = ENOTDIR;
+///                 ret = SCLD_EXISTS;
+///         }
+/// } else if (mkdir(path, 0777)) {
+///         if (errno == EEXIST && !stat(path, &st) && S_ISDIR(st.st_mode))
+///                 ; /* somebody created it since we checked */
+///         else if (errno == ENOENT)
+///                 ret = SCLD_VANISHED;
+///         else
+///                 ret = SCLD_FAILED;
+/// }
+/// ```
+pub fn safe_create_leading_directories(path: &str) -> Result<(), Scld> {
+    let bytes = path.as_bytes();
+    // `offset_1st_component()`: the leading separator of an absolute path is not
+    // a component that can be created.
+    let mut next = usize::from(bytes.first() == Some(&b'/'));
+    while next < bytes.len() {
+        let Some(offset) = bytes[next..].iter().position(|b| *b == b'/') else {
+            break;
+        };
+        let slash = next + offset;
+        // Skip a run of separators; a path that ends in them has no further
+        // component to create.
+        let mut after = slash + 1;
+        while bytes.get(after) == Some(&b'/') {
+            after += 1;
+        }
+        if after >= bytes.len() {
+            break;
+        }
+        next = after;
+
+        let prefix = &path[..slash];
+        match std::fs::metadata(prefix) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Err(Scld::Exists),
+            Err(_) => match std::fs::create_dir(prefix) {
+                Ok(()) => {}
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::AlreadyExists
+                        && std::fs::metadata(prefix).is_ok_and(|meta| meta.is_dir()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(Scld::Vanished),
+                Err(err) => return Err(Scld::Failed(err)),
+            },
+        }
+    }
+    Ok(())
+}

@@ -926,6 +926,44 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
     let created_destination = !dst.exists();
+    // builtin/clone.c:1108-1123, all of it before the banner:
+    //
+    // ```c
+    // if (!option_bare) {
+    //         if (safe_create_leading_directories_const(the_repository, work_tree) < 0)
+    //                 die_errno(_("could not create leading directories of '%s'"),
+    //                           work_tree);
+    //         if (dest_exists)
+    //                 junk_work_tree_flags |= REMOVE_DIR_KEEP_TOPLEVEL;
+    //         else if (mkdir(work_tree, 0777))
+    //                 die_errno(_("could not create work tree dir '%s'"),
+    //                           work_tree);
+    // [...]
+    // if (safe_create_leading_directories_const(the_repository, git_dir) < 0)
+    //         die(_("could not create leading directories of '%s'"), git_dir);
+    // ```
+    //
+    // `SCLD_EXISTS` counts as failure here. `create_dir_all("")` succeeds without
+    // creating anything where `mkdir("")` is `ENOENT`, so `git clone src ""` used to go
+    // on and open a repository at the empty path.
+    if !bare {
+        if let Err(scld) = crate::path::safe_create_leading_directories(&dir) {
+            crate::git_fatal!(
+                "could not create leading directories of '{dir}': {}",
+                crate::external::strerror(&scld.errno())
+            );
+        }
+        if created_destination {
+            if let Err(e) = std::fs::create_dir(dst) {
+                crate::git_fatal!(
+                    "could not create work tree dir '{dir}': {}",
+                    crate::external::strerror(&e)
+                );
+            }
+        }
+    } else if crate::path::safe_create_leading_directories(&dir).is_err() {
+        crate::git_fatal!("could not create leading directories of '{dir}'");
+    }
     std::fs::create_dir_all(dst)?;
     // ```c
     // atexit(remove_junk);
@@ -1023,6 +1061,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             config_pairs.push(("submodule.alternateLocation".to_string(), "superproject".to_string()));
             config_pairs.push(("submodule.alternateErrorStrategy".to_string(), strategy.to_string()));
         }
+    }
+
+    // `init_db()` opens with `real_pathdup(git_dir, 1)`, and `strbuf_realpath()` dies on
+    // an empty path; only a bare clone gets here with one, below the banner.
+    if dir.is_empty() {
+        crate::git_fatal!("The empty string is not a valid path");
     }
 
     // `init_db()` (builtin/clone.c:1188) → `repository_format_configure()` (setup.c:2765-2838):

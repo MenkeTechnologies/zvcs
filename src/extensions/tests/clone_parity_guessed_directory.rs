@@ -86,3 +86,19 @@ fn a_directory_without_a_repository_does_not_exist() {
         );
     }
 }
+
+/// `strip_dir_trailing_slashes(dir)` applies to an explicit directory too: the
+/// banner names `d`, not `d/`.
+#[test]
+fn an_explicit_directory_loses_its_trailing_slashes() {
+    let root = fixture("explicit");
+    for (arg, dir) in [("d/", "d"), ("e//", "e")] {
+        let out = git(&root, &["clone", "src", arg]);
+        assert_eq!(out.status.code(), Some(0), "{arg}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("Cloning into '{dir}'...\ndone.\n"),
+            "{arg}"
+        );
+    }
+}

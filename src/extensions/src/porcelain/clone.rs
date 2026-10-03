@@ -879,6 +879,11 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             }
         },
     };
+    // `strip_dir_trailing_slashes(dir)`: `d/` and `d//` are `d`, but `/` stays `/`.
+    let dir = match dir.trim_end_matches('/') {
+        "" if !dir.is_empty() => "/".to_string(),
+        trimmed => trimmed.to_string(),
+    };
     let dst = Path::new(&dir);
 
     // git refuses to clone onto a non-empty existing path; gix's create options

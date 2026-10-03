@@ -847,6 +847,7 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
     let mut regexp = false;
     let mut append = false;
     let mut value_pattern: Option<String> = None;
+    let table = subcommand_table(sub);
     let mut url: Option<String> = None;
     let mut i = 0;
     while i < rest.len() {
@@ -856,6 +857,18 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
             i += 1;
             continue;
         }
+        let checked;
+        let a = match a {
+            "--" | "-" | "--help-all" => a,
+            _ if a.starts_with('-') => match check_subcommand_option(&table, a) {
+                Ok(spelled) => {
+                    checked = spelled;
+                    checked.as_str()
+                }
+                Err(code) => return Some(Err(code)),
+            },
+            _ => a,
+        };
         match a {
             "--" => {
                 operands.extend(rest[i + 1..].iter().cloned());
@@ -867,7 +880,7 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
             "--no-regexp" => regexp = false,
             "--append" => append = true,
             "--no-append" => append = false,
-            "-h" | "--help-all" => return Some(Err(super::show_usage(subcommand_usage(sub)))),
+            "-h" | "--help-all" => return Some(Err(super::show_usage(table.usage))),
             _ if a.starts_with("--value=") => value_pattern = Some(a["--value=".len()..].to_string()),
             "--value" => {
                 let Some(v) = rest.get(i + 1) else {
@@ -1028,17 +1041,330 @@ fn rewrite_subcommand(args: &[String]) -> Option<std::result::Result<Vec<String>
     Some(Ok(rewritten))
 }
 
-/// The usage line `-h` prints for each subcommand (builtin/config.c:32-65).
-fn subcommand_usage(sub: &str) -> &'static str {
-    match sub {
-        "list" => "usage: git config list [<file-option>] [<display-option>] [--includes]\n\n",
-        "get" => "usage: git config get [<file-option>] [<display-option>] [--includes] [--all] [--regexp=<regexp>] [--value=<pattern>] [--fixed-value] [--default=<default>] <name>\n\n",
-        "set" => "usage: git config set [<file-option>] [--type=<type>] [--comment=<message>] [--all] [--value=<pattern>] [--fixed-value] <name> <value>\n\n",
-        "unset" => "usage: git config unset [<file-option>] [--all] [--value=<pattern>] [--fixed-value] <name>\n\n",
-        "rename-section" => "usage: git config rename-section [<file-option>] <old-name> <new-name>\n\n",
-        "remove-section" => "usage: git config remove-section [<file-option>] <name>\n\n",
-        _ => "usage: git config edit [<file-option>]\n\n",
+/// The block each subcommand's `parse_options()` prints for `-h` (on stdout) and
+/// under a refusal (on stderr): `builtin_config_<sub>_usage[]` (builtin/config.c:32-65)
+/// over its option table, as stock 2.56.0 renders it.
+const USAGE_LIST: &str = r#"usage: git config list [<file-option>] [<display-option>] [--includes]
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+Display options
+    -z, --[no-]null       terminate values with NUL byte
+    --[no-]name-only      show variable names only
+    --[no-]show-origin    show origin of config (file, standard input, blob, command line)
+    --[no-]show-scope     show scope of config (worktree, local, global, system, command)
+    --[no-]show-names     show config keys in addition to their values
+
+Type
+    -t, --[no-]type <type>
+                          value is given this type
+    --bool                value is "true" or "false"
+    --int                 value is decimal number
+    --bool-or-int         value is --bool or --int
+    --bool-or-str         value is --bool or string
+    --path                value is a path (file or directory name)
+    --expiry-date         value is an expiry date
+
+Other
+    --[no-]includes       respect include directives on lookup
+
+"#;
+const USAGE_GET: &str = r#"usage: git config get [<file-option>] [<display-option>] [--includes] [--all] [--regexp=<regexp>] [--value=<pattern>] [--fixed-value] [--default=<default>] <name>
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+Filter options
+    --[no-]all            return all values for multi-valued config options
+    --[no-]regexp         interpret the name as a regular expression
+    --[no-]value <pattern>
+                          show config with values matching the pattern
+    --[no-]fixed-value    use string equality when comparing values to value pattern
+    --[no-]url <URL>      show config matching the given URL
+
+Display options
+    -z, --[no-]null       terminate values with NUL byte
+    --[no-]name-only      show variable names only
+    --[no-]show-origin    show origin of config (file, standard input, blob, command line)
+    --[no-]show-scope     show scope of config (worktree, local, global, system, command)
+    --[no-]show-names     show config keys in addition to their values
+
+Type
+    -t, --[no-]type <type>
+                          value is given this type
+    --bool                value is "true" or "false"
+    --int                 value is decimal number
+    --bool-or-int         value is --bool or --int
+    --bool-or-str         value is --bool or string
+    --path                value is a path (file or directory name)
+    --expiry-date         value is an expiry date
+
+Other
+    --[no-]includes       respect include directives on lookup
+    --[no-]default <value>
+                          use default value when missing entry
+
+"#;
+const USAGE_SET: &str = r#"usage: git config set [<file-option>] [--type=<type>] [--comment=<message>] [--all] [--value=<pattern>] [--fixed-value] <name> <value>
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+Type
+    -t, --[no-]type <type>
+                          value is given this type
+    --bool                value is "true" or "false"
+    --int                 value is decimal number
+    --bool-or-int         value is --bool or --int
+    --bool-or-str         value is --bool or string
+    --path                value is a path (file or directory name)
+    --expiry-date         value is an expiry date
+
+Filter
+    --[no-]all            replace multi-valued config option with new value
+    --[no-]value <pattern>
+                          show config with values matching the pattern
+    --[no-]fixed-value    use string equality when comparing values to value pattern
+
+Other
+    --[no-]comment <value>
+                          human-readable comment string (# will be prepended as needed)
+    --[no-]append         add a new line without altering any existing values
+
+"#;
+const USAGE_UNSET: &str = r#"usage: git config unset [<file-option>] [--all] [--value=<pattern>] [--fixed-value] <name>
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+Filter
+    --[no-]all            unset all multi-valued config options
+    --[no-]value <pattern>
+                          unset multi-valued config options with matching values
+    --[no-]fixed-value    use string equality when comparing values to value pattern
+
+"#;
+const USAGE_RENAME_SECTION: &str = r#"usage: git config rename-section [<file-option>] <old-name> <new-name>
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+"#;
+const USAGE_REMOVE_SECTION: &str = r#"usage: git config remove-section [<file-option>] <name>
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+"#;
+const USAGE_EDIT: &str = r#"usage: git config edit [<file-option>]
+
+Config file location
+    --[no-]global         use global config file
+    --[no-]system         use system config file
+    --[no-]local          use repository config file
+    --[no-]worktree       use per-worktree config file
+    -f, --[no-]file <file>
+                          use given config file
+    --[no-]blob <blob-id> read config from given blob object
+
+"#;
+
+/// One `cmd_config_<subcommand>()` option table (builtin/config.c:1038-1340): its
+/// long options in table order, the short switches it declares, and the block its
+/// `parse_options()` prints. Each subcommand composes `CONFIG_LOCATION_OPTIONS`,
+/// `CONFIG_DISPLAY_OPTIONS` and `CONFIG_TYPE_OPTIONS` differently, so an option
+/// the legacy form accepts can be unknown to a subcommand: `git config set
+/// --show-origin` is `unknown option`, exit 129.
+struct SubcommandTable {
+    long: &'static [super::LongOpt],
+    /// Short switches that take no value (`-z`).
+    flags: &'static str,
+    /// Short switches whose value is the rest of the word or the next argument
+    /// (`-f`, `-t`).
+    values: &'static str,
+    usage: &'static str,
+}
+
+fn subcommand_table(sub: &str) -> SubcommandTable {
+    use super::{Arg, LongOpt};
+    const fn opt(name: &'static str, arg: Arg) -> LongOpt {
+        LongOpt { name, neg: true, arg }
     }
+    /// `OPT_CALLBACK_VALUE` is `PARSE_OPT_NOARG | PARSE_OPT_NONEG`.
+    const fn type_value(name: &'static str) -> LongOpt {
+        LongOpt { name, neg: false, arg: Arg::None }
+    }
+    const LIST: &[LongOpt] = &[
+        opt("global", Arg::None),
+        opt("system", Arg::None),
+        opt("local", Arg::None),
+        opt("worktree", Arg::None),
+        opt("file", Arg::Required),
+        opt("blob", Arg::Required),
+        opt("null", Arg::None),
+        opt("name-only", Arg::None),
+        opt("show-origin", Arg::None),
+        opt("show-scope", Arg::None),
+        opt("show-names", Arg::None),
+        opt("type", Arg::Required),
+        type_value("bool"),
+        type_value("int"),
+        type_value("bool-or-int"),
+        type_value("bool-or-str"),
+        type_value("path"),
+        type_value("expiry-date"),
+        opt("includes", Arg::None),
+    ];
+    const GET: &[LongOpt] = &[
+        opt("global", Arg::None),
+        opt("system", Arg::None),
+        opt("local", Arg::None),
+        opt("worktree", Arg::None),
+        opt("file", Arg::Required),
+        opt("blob", Arg::Required),
+        opt("all", Arg::None),
+        opt("regexp", Arg::None),
+        opt("value", Arg::Required),
+        opt("fixed-value", Arg::None),
+        opt("url", Arg::Required),
+        opt("null", Arg::None),
+        opt("name-only", Arg::None),
+        opt("show-origin", Arg::None),
+        opt("show-scope", Arg::None),
+        opt("show-names", Arg::None),
+        opt("type", Arg::Required),
+        type_value("bool"),
+        type_value("int"),
+        type_value("bool-or-int"),
+        type_value("bool-or-str"),
+        type_value("path"),
+        type_value("expiry-date"),
+        opt("includes", Arg::None),
+        opt("default", Arg::Required),
+    ];
+    const SET: &[LongOpt] = &[
+        opt("global", Arg::None),
+        opt("system", Arg::None),
+        opt("local", Arg::None),
+        opt("worktree", Arg::None),
+        opt("file", Arg::Required),
+        opt("blob", Arg::Required),
+        opt("type", Arg::Required),
+        type_value("bool"),
+        type_value("int"),
+        type_value("bool-or-int"),
+        type_value("bool-or-str"),
+        type_value("path"),
+        type_value("expiry-date"),
+        opt("all", Arg::None),
+        opt("value", Arg::Required),
+        opt("fixed-value", Arg::None),
+        opt("comment", Arg::Required),
+        opt("append", Arg::None),
+    ];
+    const UNSET: &[LongOpt] = &[
+        opt("global", Arg::None),
+        opt("system", Arg::None),
+        opt("local", Arg::None),
+        opt("worktree", Arg::None),
+        opt("file", Arg::Required),
+        opt("blob", Arg::Required),
+        opt("all", Arg::None),
+        opt("value", Arg::Required),
+        opt("fixed-value", Arg::None),
+    ];
+    const LOCATION: &[LongOpt] = &[
+        opt("global", Arg::None),
+        opt("system", Arg::None),
+        opt("local", Arg::None),
+        opt("worktree", Arg::None),
+        opt("file", Arg::Required),
+        opt("blob", Arg::Required),
+    ];
+    let (long, flags, values, usage) = match sub {
+        "list" => (LIST, "z", "ft", USAGE_LIST),
+        "get" => (GET, "z", "ft", USAGE_GET),
+        "set" => (SET, "", "ft", USAGE_SET),
+        "unset" => (UNSET, "", "f", USAGE_UNSET),
+        "rename-section" => (LOCATION, "", "f", USAGE_RENAME_SECTION),
+        "remove-section" => (LOCATION, "", "f", USAGE_REMOVE_SECTION),
+        _ => (LOCATION, "", "f", USAGE_EDIT),
+    };
+    SubcommandTable { long, flags, values, usage }
+}
+
+/// `parse_options_step()` over one subcommand's table, for a dashed argument
+/// before the first operand: the spelling the rewrite below dispatches on (an
+/// abbreviation expanded), or the exit status of git's refusal — `unknown
+/// option`/`unknown switch` or `ambiguous option` with the subcommand's block on
+/// stderr, or a `takes no value`, all at 129.
+fn check_subcommand_option(table: &SubcommandTable, tok: &str) -> std::result::Result<String, ExitCode> {
+    if let Some(body) = tok.strip_prefix("--") {
+        if let Some(code) = super::long_takes_no_value(tok, table.long) {
+            return Err(code);
+        }
+        if matches!(super::resolve_long(table.long, body), super::Resolved::Unknown) {
+            return Err(super::unknown_option(tok, table.usage));
+        }
+        return match super::canonical_long(tok, table.long) {
+            super::Long::Name(name) => Ok(name.into_owned()),
+            super::Long::Ambiguous(first, second) => {
+                Err(super::ambiguous_option(tok, &first, &second, table.usage))
+            }
+        };
+    }
+    // `parse_short_opt()`: switches cluster until one takes the rest of the word
+    // as its value.
+    for c in tok[1..].chars() {
+        if c == 'h' {
+            return Err(super::show_usage(table.usage));
+        }
+        if table.values.contains(c) {
+            break;
+        }
+        if !table.flags.contains(c) {
+            let named = if c.is_ascii() { format!("-{c}") } else { tok.to_string() };
+            return Err(super::unknown_option(&named, table.usage));
+        }
+    }
+    Ok(tok.to_string())
 }
 
 /// `die()` from inside a subcommand: `fatal: <message>`, exit 128.

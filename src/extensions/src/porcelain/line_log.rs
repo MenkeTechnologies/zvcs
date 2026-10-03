@@ -440,6 +440,10 @@ pub(crate) fn ere_syntax_error(pattern: &str) -> Option<&'static str> {
 fn syntax_error(pattern: &str, extended: bool) -> Option<&'static str> {
     let b = pattern.as_bytes();
     let (mut parens, mut braces) = (0i32, 0i32);
+    // BRE groups by number, in the order their `\(` opened: those still open, and
+    // those already closed. A `\<n>` may only name a closed one (REG_ESUBREG).
+    let (mut open_groups, mut closed_groups): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    let mut groups_opened = 0u32;
     let mut i = 0usize;
     while i < b.len() {
         match b[i] {
@@ -512,12 +516,17 @@ fn syntax_error(pattern: &str, extended: bool) -> Option<&'static str> {
                     continue;
                 }
                 match n {
-                    b'(' => parens += 1,
+                    b'(' => {
+                        parens += 1;
+                        groups_opened += 1;
+                        open_groups.push(groups_opened);
+                    }
                     b')' => {
                         parens -= 1;
                         if parens < 0 {
                             return Some("parentheses not balanced");
                         }
+                        closed_groups.extend(open_groups.pop());
                     }
                     b'{' => {
                         braces += 1;
@@ -538,7 +547,7 @@ fn syntax_error(pattern: &str, extended: bool) -> Option<&'static str> {
                         }
                     }
                     b'1'..=b'9' => {
-                        if (n - b'0') as i32 > parens {
+                        if !closed_groups.contains(&u32::from(n - b'0')) {
                             return Some("invalid backreference number");
                         }
                     }

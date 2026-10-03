@@ -83,6 +83,9 @@ fn regcomp_failures_name_origin_pattern_and_reason() {
         (&["grep", "-e", "ok", "-e", "["][..], "fatal: -e option, '[': brackets ([ ]) not balanced\n".to_owned()),
         (&["grep", "-e", "\\("][..], "fatal: -e option, '\\(': parentheses not balanced\n".to_owned()),
         (&["grep", "-e", "a\\{2,1\\}"][..], "fatal: -e option, 'a\\{2,1\\}': invalid repetition count(s)\n".to_owned()),
+        // A back reference may only name a group that has closed.
+        (&["grep", "-e", "\\(o\\)\\2"][..], "fatal: -e option, '\\(o\\)\\2': invalid backreference number\n".to_owned()),
+        (&["grep", "-e", "\\(o\\1\\)"][..], "fatal: -e option, '\\(o\\1\\)': invalid backreference number\n".to_owned()),
         (&["grep", "-f", pats][..], format!("fatal: In '{pats}' at 2, 'x\\(': parentheses not balanced\n")),
     ] {
         assert_eq!(f.run(args), (String::new(), msg, 128), "{args:?}");
@@ -96,4 +99,6 @@ fn literal_and_valid_patterns_still_search() {
     assert_eq!(f.run(&["grep", "-F", "a{1"]), ("f:a{1\n".into(), String::new(), 0));
     assert_eq!(f.run(&["grep", "-E", "-e", "a{1}"]), ("f:a{1\n".into(), String::new(), 0));
     assert_eq!(f.run(&["grep", "-e", "a\\{1\\}"]), ("f:a{1\n".into(), String::new(), 0));
+    // Group 1 is closed by the time `\1` names it.
+    assert_eq!(f.run(&["grep", "-e", "\\(o\\)\\1*k"]), ("f:ok\n".into(), String::new(), 0));
 }

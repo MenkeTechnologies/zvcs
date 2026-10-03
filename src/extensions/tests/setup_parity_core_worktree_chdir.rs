@@ -114,3 +114,29 @@ fn resolvable_relative_worktree_is_used() {
     let top = std::fs::canonicalize(&f.work).unwrap();
     assert_eq!((out.as_str(), err.as_str(), code), (format!("{}\n", top.display()).as_str(), "", 0));
 }
+
+/// Only the repository's own files feed setup's `core.worktree`:
+/// `check_repository_format_gently()` reads `config` (and `config.worktree`),
+/// so a value from `-c`, `GIT_CONFIG_*` or the global file is never chdir()ed to
+/// and the verb runs as if it were unset.
+#[test]
+fn worktree_outside_the_repository_files_is_ignored() {
+    let f = Fixture::new("cli");
+    let (_, err, code) = f.run(&["-c", "core.worktree=no-such", "merge", "nope"]);
+    assert_eq!((err.as_str(), code), ("merge: nope - not something we can merge\n", 1));
+    let (out, err, code) = f.run(&["-c", "core.worktree=no-such", "status", "--short"]);
+    assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0));
+    let global = f.root.join("global");
+    std::fs::write(&global, "[core]\n\tworktree = no-such\n").unwrap();
+    let out = Command::new(BIN)
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&f.work)
+        .env("HOME", &f.root)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    let top = std::fs::canonicalize(&f.work).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{}\n", top.display()));
+    assert_eq!(out.status.code(), Some(0));
+}

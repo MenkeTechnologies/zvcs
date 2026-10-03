@@ -2079,8 +2079,19 @@ pub fn core_worktree_chdir_error(repo: &gix::Repository) -> Option<String> {
     if repo.bare_config_at_setup() == Some(true) {
         return None;
     }
+    // `git_work_tree_cfg` comes from `check_repository_format_gently()`, which reads
+    // `<commondir>/config` and, under `extensions.worktreeConfig`, `config.worktree`
+    // — never `-c`, the environment or the global files. A linked worktree drops the
+    // shared file's value unless `worktreeConfig` is on (setup.c:784-812).
+    use gix::config::Source;
     let config = repo.config_snapshot();
-    let value = config.string("core.worktree")?;
+    let linked = repo.common_dir() != repo.git_dir();
+    let worktree_config = config.boolean("extensions.worktreeConfig") == Some(true);
+    let value = config.plumbing().string_filter("core.worktree", |meta| match meta.source {
+        Source::Worktree => true,
+        Source::Local => !linked || worktree_config,
+        _ => false,
+    })?;
     let value = value.to_string();
     let path = Path::new(&value);
     if value.is_empty() || path.is_absolute() {

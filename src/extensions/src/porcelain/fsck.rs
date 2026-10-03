@@ -498,6 +498,21 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         all.retain(|id| loose.contains(id));
         in_odb.retain(|id| loose.contains(id));
     }
+    // A loose subdirectory that cannot be opened ends the walk of its source, and
+    // the objects past it are never scanned — unless `verify_pack()` meets them
+    // in a pack. `odb_for_each_object()` under `--connectivity-only` walks the
+    // same way, stops in the same place, and lists the packs as well.
+    let unvisited: HashSet<ObjectId> = loose_unvisited(&repo);
+    if !unvisited.is_empty() {
+        let packed: HashSet<ObjectId> = if opt.check_full || opt.connectivity_only {
+            unvisited.iter().copied().filter(|id| in_pack_index(&repo, *id)).collect()
+        } else {
+            HashSet::new()
+        };
+        let scanned = |id: &ObjectId| !unvisited.contains(id) || packed.contains(id);
+        all.retain(scanned);
+        in_odb.retain(scanned);
+    }
     let snapshot_reads = (!explicit_heads && !snapshot_missed).then_some(heads.as_slice());
     let pack_lists = PackLists::load(&repo, snapshot_reads);
     let scan_ordered = match loose_scan_order(&repo, opt.check_full, pack_lists.as_ref()) {
@@ -547,9 +562,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `missing` line for one carries the type expected at the reference site.
     let mut corrupt: HashSet<ObjectId> = HashSet::new();
     // Stray files in `.git/objects/??`, which `fsck_cruft()` reports as part of
-    // the same walk. `--connectivity-only` replaces that walk entirely.
+    // the same walk. `--connectivity-only` replaces that walk with
+    // `odb_for_each_object()`, which reports only a subdirectory it cannot open.
     let cruft_lines: Vec<(usize, String)> = if opt.connectivity_only {
-        Vec::new()
+        loose_unopenable(&repo).into_iter().map(|line| (0, line)).collect()
     } else {
         loose_cruft(&repo)
     };
@@ -1063,9 +1079,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // passes no parent (builtin/fsck.c:163-175). The object is still in
             // `obj_hash`, so `check_reachable_object()` reports it `missing` with
             // the type its head site gave it — `OBJ_BLOB` for an index entry.
+            // A head the loose walk never reached is a readable object of its
+            // own type, which `parse_object()`/`lookup_tree()` gave it.
             if !has_obj.contains(&id) {
-                if index_blobs.contains(&id) && !in_pack(&repo, id, &pack_check.bad) {
-                    state.missing.insert(id, Kind::Blob);
+                if !in_pack(&repo, id, &pack_check.bad) {
+                    if index_blobs.contains(&id) {
+                        state.missing.insert(id, Kind::Blob);
+                    } else if unvisited.contains(&id) {
+                        if let Ok(header) = repo.find_header(id) {
+                            state.missing.insert(id, header.kind());
+                        }
+                    }
                 }
                 continue;
             }
@@ -1287,6 +1311,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // its referents in `obj_hash` — and marks what it names `USED`. Reachable
     // objects are skipped: `traverse_reachable()` has already covered them.
     if opt.connectivity_only && (opt.show_dangling || opt.write_lost_and_found) {
+        // The second `odb_for_each_object()` walk stops where the first did, and
+        // says so again.
+        for line in loose_unopenable(&repo) {
+            eprintln!("{line}");
+        }
         for &id in &all {
             if state.reachable.contains(&id) {
                 continue;
@@ -2361,6 +2390,19 @@ fn in_pack(repo: &gix::Repository, id: ObjectId, bad: &HashSet<ObjectId>) -> boo
     repo.has_object(id) && !is_loose(repo, id) && !bad.contains(&id)
 }
 
+/// Whether any odb source's pack index lists `id`, loose copies aside.
+fn in_pack_index(repo: &gix::Repository, id: ObjectId) -> bool {
+    odb_sources(repo).into_iter().any(|objdir| {
+        std::fs::read_dir(objdir.join("pack")).is_ok_and(|entries| {
+            entries.flatten().any(|e| {
+                e.path().extension().is_some_and(|x| x == "idx")
+                    && pack::index::File::at(e.path(), repo.object_hash())
+                        .is_ok_and(|index| index.lookup(id).is_some())
+            })
+        })
+    })
+}
+
 fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
     let hex = id.to_hex().to_string();
     odb_sources(repo)
@@ -3365,34 +3407,87 @@ fn move_to_front<P: std::borrow::Borrow<ListedPack>>(sources: &mut [(PathBuf, Ve
     }
 }
 
+/// One step of `for_each_loose_file_in_source()` over every odb source.
+enum LooseWalk<'a> {
+    /// A `readdir()` entry of a subdirectory the walk reached: an object when
+    /// its name is `hexsz - 2` hex digits, cruft otherwise.
+    Entry { sub: u16, name: &'a [u8], path: PathBuf },
+    /// `opendir()` failed with anything but `ENOENT`. `for_each_file_in_obj_subdir()`
+    /// returns `error_errno(_("unable to open %s"), path)`, and the non-zero
+    /// return ends the source's walk (object-file.c:1061-1066, :1121-1126).
+    Unopenable { dir: PathBuf, err: std::io::Error },
+    /// An object in a subdirectory after the one that ended the walk: on disk,
+    /// but never handed to `fsck_loose()`, so it never gets `HAS_OBJ`.
+    Unvisited { sub: u16, name: &'a [u8] },
+}
+
+/// Walk every odb source's 256 `.git/objects/??` subdirectories in numeric
+/// order, entries in raw `readdir()` order, stopping a source's walk where git
+/// does.
+fn for_each_loose_file(repo: &gix::Repository, mut visit: impl FnMut(LooseWalk<'_>)) {
+    for objdir in odb_sources(repo) {
+        let mut stopped = false;
+        for sub in 0u16..=0xff {
+            let dir = objdir.join(format!("{sub:02x}"));
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) if stopped => continue,
+                Err(err) => {
+                    visit(LooseWalk::Unopenable { dir, err });
+                    stopped = true;
+                    continue;
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.as_bytes();
+                if stopped {
+                    visit(LooseWalk::Unvisited { sub, name });
+                } else {
+                    visit(LooseWalk::Entry { sub, name, path: entry.path() });
+                }
+            }
+        }
+    }
+}
+
+/// The loose id `<sub>/<name>` spells, when the name is one.
+fn loose_id(sub: u16, name: &[u8], hexsz: usize) -> Option<ObjectId> {
+    if name.len() != hexsz - 2 {
+        return None;
+    }
+    let mut hex = format!("{sub:02x}").into_bytes();
+    hex.extend_from_slice(name);
+    ObjectId::from_hex(&hex).ok()
+}
+
 /// The loose half of [`loose_scan_order`].
 fn loose_only_scan_order(repo: &gix::Repository) -> Vec<ObjectId> {
     let hexsz = repo.object_hash().len_in_hex();
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut out: Vec<ObjectId> = Vec::new();
-    for objdir in odb_sources(repo) {
-        for sub in 0u16..=0xff {
-            let dir = objdir.join(format!("{sub:02x}"));
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.as_bytes();
-                if name.len() != hexsz - 2 {
-                    continue;
-                }
-                let mut hex = format!("{sub:02x}").into_bytes();
-                hex.extend_from_slice(name);
-                let Ok(id) = ObjectId::from_hex(&hex) else {
-                    continue;
-                };
-                if seen.insert(id) {
-                    out.push(id);
-                }
+    for_each_loose_file(repo, |step| {
+        if let LooseWalk::Entry { sub, name, .. } = step {
+            if let Some(id) = loose_id(sub, name, hexsz).filter(|id| seen.insert(*id)) {
+                out.push(id);
             }
         }
-    }
+    });
+    out
+}
+
+/// The loose objects an unopenable subdirectory kept the walk from reaching.
+/// They are in the odb, so gitoxide lists them, but git never scans them: a
+/// reachable one is `missing`, a reflog entry naming one is invalid.
+fn loose_unvisited(repo: &gix::Repository) -> HashSet<ObjectId> {
+    let hexsz = repo.object_hash().len_in_hex();
+    let mut out = HashSet::new();
+    for_each_loose_file(repo, |step| {
+        if let LooseWalk::Unvisited { sub, name } = step {
+            out.extend(loose_id(sub, name, hexsz));
+        }
+    });
     out
 }
 
@@ -3414,41 +3509,49 @@ fn loose_only_scan_order(repo: &gix::Repository) -> Vec<ObjectId> {
 /// hex digits (object-file.c:1490-1514), so a subdirectory with a stray file is
 /// the only way to reach it. The line is plain `fprintf_ln()`, not `error()`:
 /// `errors_found` is untouched and `git fsck` still exits 0.
+///
+/// The `unable to open` line of a subdirectory that ends the walk comes out of
+/// the same walk, so it is keyed the same way. It is an `error()` whose return
+/// `odb_source_loose_fsck()` discards: it sets no error bit either.
 fn loose_cruft(repo: &gix::Repository) -> Vec<(usize, String)> {
     let hexsz = repo.object_hash().len_in_hex();
     let mut objects = 0usize;
     let mut out: Vec<(usize, String)> = Vec::new();
-    for objdir in odb_sources(repo) {
-        for sub in 0u16..=0xff {
-            let dir = objdir.join(format!("{sub:02x}"));
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let bytes = name.as_bytes();
-                // `hex_to_bytes()` reads through `hexval_table`, which maps
-                // `A`-`F` as well as `a`-`f` (hex-ll.c), so an upper-case name
-                // is an object to git and never reaches the cruft callback.
-                let is_object =
-                    bytes.len() == hexsz - 2 && bytes.iter().all(|b| b.is_ascii_hexdigit());
-                if is_object {
-                    objects += 1;
-                    continue;
-                }
+    for_each_loose_file(repo, |step| match step {
+        LooseWalk::Entry { name, path, .. } => {
+            // `hex_to_bytes()` reads through `hexval_table`, which maps
+            // `A`-`F` as well as `a`-`f` (hex-ll.c), so an upper-case name
+            // is an object to git and never reaches the cruft callback.
+            if name.len() == hexsz - 2 && name.iter().all(|b| b.is_ascii_hexdigit()) {
+                objects += 1;
+            } else if !name.starts_with(b"tmp_obj_") {
                 // `basename` is the dirent name; git keeps the temporary files
                 // `write_loose_object()` leaves behind out of the report.
-                if bytes.starts_with(b"tmp_obj_") {
-                    continue;
-                }
-                out.push((
-                    objects,
-                    format!("bad sha1 file: {}", loose_label_of(repo, &entry.path())),
-                ));
+                out.push((objects, format!("bad sha1 file: {}", loose_label_of(repo, &path))));
             }
         }
-    }
+        LooseWalk::Unopenable { dir, err } => out.push((objects, unopenable_line(repo, &dir, &err))),
+        LooseWalk::Unvisited { .. } => {}
+    });
     out
+}
+
+/// What `odb_for_each_object()` prints on its way over the loose objects, which
+/// `--connectivity-only` runs in place of the scan: the walk is the same, and so
+/// is where it stops, but it has no cruft callback.
+fn loose_unopenable(repo: &gix::Repository) -> Vec<String> {
+    let mut out = Vec::new();
+    for_each_loose_file(repo, |step| {
+        if let LooseWalk::Unopenable { dir, err } = step {
+            out.push(unopenable_line(repo, &dir, &err));
+        }
+    });
+    out
+}
+
+/// `error_errno(_("unable to open %s"), path)` (object-file.c:1065).
+fn unopenable_line(repo: &gix::Repository, dir: &Path, err: &std::io::Error) -> String {
+    format!("error: unable to open {}: {}", loose_label_of(repo, dir), crate::external::strerror(err))
 }
 
 /// The size `obj_hash` ends at after `n` objects have been created, replaying

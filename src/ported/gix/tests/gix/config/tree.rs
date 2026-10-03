@@ -533,9 +533,16 @@ mod core {
                 .to_string(),
             "Invalid value for 'core.abbrev' = '   '. It must be between 4 and 40"
         );
-        for invalid in ["foo", "3", "41"] {
+        // Stock 2.56.0 refuses `-c core.abbrev=foo` and `=3` (128); `=41` in a
+        // SHA-1 repository prints the whole 40-character id and succeeds.
+        for invalid in ["foo", "3"] {
             assert!(Core::ABBREV.try_into_abbreviation(invalid, object_hash).is_err());
         }
+        assert_eq!(
+            Core::ABBREV.try_into_abbreviation("41", object_hash)?,
+            Some(object_hash.len_in_hex()),
+            "a length past the hash width is capped at it, not refused"
+        );
         Ok(())
     }
 
@@ -610,18 +617,25 @@ mod core {
     #[test]
     #[cfg(feature = "attributes")]
     fn eol() -> crate::Result {
+        // `git_default_core_config()` compares with `strcasecmp()`; stock 2.56.0
+        // checks out `* text` files with CRLF under `core.eol=CRLF` as under `crlf`.
         for (value, expected) in [
             ("lf", gix_filter::eol::Mode::Lf),
+            ("LF", gix_filter::eol::Mode::Lf),
             ("crlf", gix_filter::eol::Mode::CrLf),
+            ("CRLF", gix_filter::eol::Mode::CrLf),
             ("native", gix_filter::eol::Mode::default()),
+            ("Native", gix_filter::eol::Mode::default()),
         ] {
-            assert_eq!(Core::EOL.try_into_eol(value).unwrap(), expected);
+            assert_eq!(Core::EOL.try_into_eol(value).unwrap(), Some(expected), "{value}");
             assert!(Core::EOL.validate(value.into()).is_ok());
         }
-        assert_eq!(
-            Core::EOL.try_into_eol("LF").unwrap_err().to_string(),
-            "The key \"core.eol=LF\" was invalid"
-        );
+        // Any other value is `EOL_UNSET`, not an error: stock checks out LF under
+        // `core.eol=bogus` and refuses nothing.
+        for value in ["bogus", ""] {
+            assert_eq!(Core::EOL.try_into_eol(value).unwrap(), None, "{value:?} leaves core.eol unset");
+            assert!(Core::EOL.validate(value.into()).is_ok());
+        }
         Ok(())
     }
 

@@ -127,7 +127,8 @@ fn author_from_different_config_sections() -> crate::Result {
     let _env = Env::new()
         .set("GIT_CONFIG_GLOBAL", work_dir.join("global.config").to_str().unwrap())
         .set("GIT_CONFIG_SYSTEM", work_dir.join("system.config").to_str().unwrap())
-        .set("GIT_AUTHOR_DATE", "42 +0030")
+        // `@` marks epoch seconds; stock rejects a bare `42 +0030` (date.c:684).
+        .set("GIT_AUTHOR_DATE", "@42 +0030")
         .unset("GIT_AUTHOR_NAME")
         .set("GIT_COMMITTER_DATE", "1980-02-26 18:30:00 +0000")
         .unset("GIT_COMMITTER_NAME")

@@ -185,7 +185,11 @@ pub fn hex_to_id_sha1_only(hex: &str) -> gix_hash::ObjectId {
 }
 
 pub fn freeze_time() -> gix_testtools::Env<'static> {
-    let frozen_time = "42 +0030";
+    // GIT_<ROLE>_DATE goes through `parse_date_basic()` (date.c:978-986), which
+    // takes a bare number as epoch seconds only from 100000000 up (date.c:684),
+    // so stock git 2.56.0 rejects `42 +0030` ("invalid date format");
+    // `@42 +0030` is the epoch-seconds form and reads back as `42 +0030`.
+    let frozen_time = "@42 +0030";
     gix_testtools::Env::new()
         .unset("GIT_AUTHOR_NAME")
         .unset("GIT_AUTHOR_EMAIL")

@@ -2501,7 +2501,7 @@ pub fn reflog_reach_of(repo: &gix::Repository, name: &str) -> Option<ReflogReach
             .map(|r| r.name().as_bstr().to_string())
             .unwrap_or_else(|| "HEAD".to_string())
     } else {
-        crate::porcelain::reflog::dwim_log(repo, looked_up)?
+        dwim_log(repo, looked_up).1?
     };
 
     let (nth, at_time) = {
@@ -3106,7 +3106,7 @@ fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, i6
     let full = if base.is_empty() {
         crate::refname::resolve_ref_reading(repo, "HEAD")?
     } else {
-        crate::porcelain::reflog::dwim_log(repo, base)?
+        dwim_log(repo, base).1?
     };
 
     // The selector, read exactly as `get_oid_basic()` reads it: an all-digit run is
@@ -3297,25 +3297,81 @@ fn read_ref_at(
 
 /// `repo_dwim_log()`'s `logs_found`: how many `ref_rev_parse_rules` spellings of
 /// `name` both resolve and have a reflog. It is the count `get_oid_basic()` tests
-/// for the ambiguity warning, and unlike [`crate::porcelain::reflog::dwim_log`] it
-/// does not stop at the first hit.
+/// for the ambiguity warning.
 fn dwim_log_matches(repo: &gix::Repository, name: &str) -> usize {
-    crate::refname::REV_PARSE_RULES
-        .iter()
-        .filter(|(prefix, suffix)| {
-            let path = format!(
-                "{}{name}{}",
-                String::from_utf8_lossy(prefix),
-                String::from_utf8_lossy(suffix)
-            );
-            let Some(resolved) = crate::refname::resolve_ref_reading(repo, &path) else {
-                return false;
-            };
-            crate::porcelain::reflog::log_file(repo, &path).is_file()
-                || (resolved != path
-                    && crate::porcelain::reflog::log_file(repo, &resolved).is_file())
-        })
-        .count()
+    dwim_log(repo, name).0
+}
+
+/// `repo_dwim_log()` (refs.c:839-878): how many `ref_rev_parse_rules` spellings
+/// of `name` resolve as a reference and have a reflog, and the log the first of
+/// them names.
+///
+/// ```c
+/// ref = refs_resolve_ref_unsafe(refs, path.buf, RESOLVE_REF_READING, oid ? &hash : NULL, NULL);
+/// if (!ref)
+///         continue;
+/// if (refs_reflog_exists(refs, path.buf))
+///         it = path.buf;
+/// else if (strcmp(ref, path.buf) && refs_reflog_exists(refs, ref))
+///         it = ref;
+/// else
+///         continue;
+/// if (!logs_found++) {
+///         *log = xstrdup(it);
+///         …
+/// }
+/// if (!repo_settings_get_warn_ambiguous_refs(r))
+///         break;
+/// ```
+///
+/// The reflog test is `refs_reflog_exists()` of the repository's backend
+/// ([`crate::refstore::reflog_exists`]), so a reftable repository answers from
+/// its log records rather than from `logs/`. A symref whose own log is missing
+/// is answered with its target's log.
+///
+/// `substitute_branch_name()` (refs.c:843) rewrites the whole operand first; of
+/// its rewrites only the two that callers here have not already applied through
+/// [`interpret_branch_name`] are left: a bare `@` is `HEAD`
+/// (`interpret_empty_at()`), and a whole `@{-<n>}` is the branch HEAD's log
+/// switched away from `n` checkouts ago (`interpret_nth_prior_checkout()`).
+pub(crate) fn dwim_log(repo: &gix::Repository, name: &str) -> (usize, Option<String>) {
+    let substituted = if name == "@" {
+        Some("HEAD".to_owned())
+    } else {
+        parse_nth_prior(name.as_bytes())
+            .filter(|&(_, used)| used == name.len())
+            .and_then(|(nth, _)| nth_branch_switch(repo, nth))
+            .and_then(|branch| String::from_utf8(branch).ok())
+    };
+    let name = substituted.as_deref().unwrap_or(name);
+    let warn_ambiguous = crate::refname::warn_ambiguous_refs(repo);
+    let mut logs_found = 0;
+    let mut log = None;
+    for (prefix, suffix) in crate::refname::REV_PARSE_RULES {
+        let path = format!(
+            "{}{name}{}",
+            String::from_utf8_lossy(prefix),
+            String::from_utf8_lossy(suffix)
+        );
+        let Some(resolved) = crate::refname::resolve_ref_reading(repo, &path) else {
+            continue;
+        };
+        let it = if crate::refstore::reflog_exists(repo, &path) {
+            path
+        } else if resolved != path && crate::refstore::reflog_exists(repo, &resolved) {
+            resolved
+        } else {
+            continue;
+        };
+        logs_found += 1;
+        if logs_found == 1 {
+            log = Some(it);
+        }
+        if !warn_ambiguous {
+            break;
+        }
+    }
+    (logs_found, log)
 }
 
 /// One ref's reflog as `(old, new, time)` triples, newest entry first.

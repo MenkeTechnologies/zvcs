@@ -116,12 +116,30 @@ pub fn hash_object(args: &[String]) -> Result<ExitCode> {
         _ => args,
     };
 
-    let opts = match parse(args).and_then(|opts| check_combinations(&opts).map(|()| opts)) {
+    let opts = match parse(args) {
         Ok(opts) => opts,
         Err(code) => return Ok(code),
     };
 
-    match run(&opts) {
+    // `setup_git_directory()` under `-w`, `setup_git_directory_gently()` without
+    // (builtin/hash-object.c), both ahead of the option combinations: with `-w`
+    // and no repository git dies here, whatever else the command line holds and
+    // even when it names nothing to hash.
+    let repo = match crate::setup::discover() {
+        Ok(repo) => Some(repo),
+        Err(err) if opts.write => {
+            let msg = crate::fatal::discovery_message(&err).unwrap_or_else(|| err.to_string());
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+        Err(_) => None,
+    };
+
+    if let Err(code) = check_combinations(&opts) {
+        return Ok(code);
+    }
+
+    match run(&opts, repo) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(Fatal(msg)) => {
             eprintln!("fatal: {msg}");
@@ -327,24 +345,15 @@ fn check_combinations(opts: &Opts) -> std::result::Result<(), ExitCode> {
 }
 
 /// Hash everything the options ask for, in git's order.
-fn run(opts: &Opts) -> std::result::Result<(), Fatal> {
+fn run(opts: &Opts, repo: Option<gix::Repository>) -> std::result::Result<(), Fatal> {
     // Nothing to hash at all: git exits 0 without output, without even looking
     // at `-t`, which is why the type is still unvalidated here.
     if opts.stdin == 0 && !opts.stdin_paths && opts.files.is_empty() {
         return Ok(());
     }
 
-    // The repository is required only for `-w`; hashing alone works anywhere,
-    // falling back to SHA-1 when there is no repository to ask.
-    let repo = match crate::setup::discover() {
-        Ok(repo) => Some(repo),
-        Err(err) => {
-            if opts.write {
-                return Err(Fatal::new(err.to_string()));
-            }
-            None
-        }
-    };
+    // Hashing alone works anywhere, falling back to SHA-1 when there is no
+    // repository to ask.
     let hash_kind = repo
         .as_ref()
         .map_or(gix::hash::Kind::Sha1, gix::Repository::object_hash);

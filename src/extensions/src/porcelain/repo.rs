@@ -533,7 +533,7 @@ fn collect(repo: &gix::Repository) -> Result<Structure> {
     for &c in &commit_order {
         let obj = repo.find_object(c)?;
         let inflated = obj.data.len() as u64;
-        let disk = disk_size(repo, c)?;
+        let disk = super::cat_file::disk_size(repo, c)?;
         let commit = obj.try_into_commit()?;
         let parents = commit.parent_ids().count() as u64;
         let root = commit.tree_id()?.detach();
@@ -552,7 +552,7 @@ fn collect(repo: &gix::Repository) -> Result<Structure> {
     for &t in &tag_objects {
         let obj = repo.find_object(t)?;
         let inflated = obj.data.len() as u64;
-        let disk = disk_size(repo, t)?;
+        let disk = super::cat_file::disk_size(repo, t)?;
         st.counts.tags += 1;
         st.inflated.tags += inflated;
         st.disk.tags += disk;
@@ -573,7 +573,7 @@ fn collect(repo: &gix::Repository) -> Result<Structure> {
         idx += 1;
         let obj = repo.find_object(toid)?;
         let inflated = obj.data.len() as u64;
-        let disk = disk_size(repo, toid)?;
+        let disk = super::cat_file::disk_size(repo, toid)?;
         let tree = gix::objs::TreeRef::from_bytes(&obj.data, hash)?;
         let entries = tree.entries.len() as u64;
 
@@ -601,7 +601,7 @@ fn collect(repo: &gix::Repository) -> Result<Structure> {
     for &b in &blobs {
         let obj = repo.find_object(b)?;
         let inflated = obj.data.len() as u64;
-        let disk = disk_size(repo, b)?;
+        let disk = super::cat_file::disk_size(repo, b)?;
         st.counts.blobs += 1;
         st.inflated.blobs += inflated;
         st.disk.blobs += disk;
@@ -653,25 +653,6 @@ fn walk_commits(repo: &gix::Repository, seeds: &[ObjectId]) -> Result<Vec<Object
 /// Committer timestamp in seconds, git's sort key for the revision walk.
 fn commit_time(repo: &gix::Repository, oid: ObjectId) -> Result<i64> {
     Ok(repo.find_object(oid)?.try_into_commit()?.time()?.seconds)
-}
-
-/// On-disk footprint of one object, matching git's `disk_sizep`: the loose file's
-/// length, or a packed object's entry size (compressed payload plus header).
-fn disk_size(repo: &gix::Repository, oid: ObjectId) -> Result<u64> {
-    let hex = oid.to_string();
-    let loose = repo
-        .git_dir()
-        .join("objects")
-        .join(&hex[..2])
-        .join(&hex[2..]);
-    if let Ok(meta) = std::fs::metadata(&loose) {
-        return Ok(meta.len());
-    }
-    let mut buf = Vec::new();
-    if let Some(loc) = repo.objects.location_by_oid(oid.as_ref(), &mut buf) {
-        return Ok(loc.entry_size as u64);
-    }
-    crate::git_fatal!("repo: cannot determine on-disk size of {hex}")
 }
 
 /// One table row: a plain label (section header / spacer) or a value cell.

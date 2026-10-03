@@ -250,9 +250,21 @@ fn fatal(msg: &str) -> ExitCode {
 
 /// A `parse-options` usage error: the message, a blank line, then the usage block on
 /// stderr, exit 129.
+///
+/// `usage_msg_opt()` renders `builtin_clone_options` as declared, not the copy
+/// `parse_options()` worked on: `preprocess_options()` (parse-options.c:899-960)
+/// gives that copy's `OPT_ALIAS` entry the argument help of the option it aliases,
+/// and the original keeps none, so `usage_argh()` prints `...` for it
+/// (parse-options.c:1296) and no continuation line follows.
 fn usage_error(msg: &str) -> ExitCode {
     eprintln!("fatal: {msg}\n");
-    eprint!("{USAGE}");
+    eprint!(
+        "{}",
+        USAGE.replace(
+            "    --[no-]recursive[=<pathspec>]\n                          alias of --recurse-submodules\n",
+            "    --[no-]recursive ...  alias of --recurse-submodules\n",
+        )
+    );
     ExitCode::from(129)
 }
 

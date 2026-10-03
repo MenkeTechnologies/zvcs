@@ -1484,6 +1484,44 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
                 | Mode::GetKeyRegexpAll
                 | Mode::GetUrlMatch
         );
+    d.name_only = name_only;
+    if name_only && !get_subcommand && !matches!(mode, Mode::List | Mode::GetRegexp) {
+        return usage_error("--name-only is only applicable to --list or --get-regexp");
+    }
+    // `--show-origin` and `--comment` (builtin/config.c:1436-1453), between
+    // `--name-only` and `--fixed-value` like every other applicability check.
+    // Only the legacy form: the `get`/`list`/`set` subcommand tables either
+    // take them or refuse them as unknown options.
+    let implicit = |n: usize| mode == Mode::Auto && positional.len() == n;
+    if d.show_origin
+        && !from_subcommand
+        && !(matches!(mode, Mode::Get | Mode::GetAll | Mode::GetRegexp | Mode::List) || implicit(1))
+    {
+        return usage_error(
+            "--show-origin is only applicable to --get, --get-all, --get-regexp, and --list",
+        );
+    }
+    // ```c
+    // if (display_opts.default_value && !(actions & ACTION_GET)) {
+    //         error(_("--default is only applicable to --get"));
+    //         exit(129);
+    // }
+    // ```
+    // (`builtin/config.c:1440-1443`.) It runs *after* the implicit action is
+    // resolved (`case 1: actions = ACTION_GET`), so the bare one-operand read —
+    // `git config --default=x some.missing` — is a `--get` by then and is allowed.
+    if d.default_value.is_some()
+        && !get_subcommand
+        && !(mode == Mode::Get || (mode == Mode::Auto && positional.len() == 1))
+    {
+        return usage_error("--default is only applicable to --get");
+    }
+    if comment.is_some()
+        && !from_subcommand
+        && !(matches!(mode, Mode::Add | Mode::ReplaceAll) || implicit(2) || implicit(3))
+    {
+        return usage_error("--comment is only applicable to add/set/replace operations");
+    }
     // `--fixed-value` only says *how* a `<value-pattern>` is compared, so the
     // legacy form refuses it when the command line carries none — one `error:`
     // line and exit 129, for every action alike, verified against stock 2.55.0
@@ -1506,25 +1544,6 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
         if !has_pattern {
             return usage_error("--fixed-value only applies with 'value-pattern'");
         }
-    }
-    d.name_only = name_only;
-    if name_only && !get_subcommand && !matches!(mode, Mode::List | Mode::GetRegexp) {
-        return usage_error("--name-only is only applicable to --list or --get-regexp");
-    }
-    // ```c
-    // if (display_opts.default_value && !(actions & ACTION_GET)) {
-    //         error(_("--default is only applicable to --get"));
-    //         exit(129);
-    // }
-    // ```
-    // (`builtin/config.c:1440-1443`.) It runs *after* the implicit action is
-    // resolved (`case 1: actions = ACTION_GET`), so the bare one-operand read —
-    // `git config --default=x some.missing` — is a `--get` by then and is allowed.
-    if d.default_value.is_some()
-        && !get_subcommand
-        && !(mode == Mode::Get || (mode == Mode::Auto && positional.len() == 1))
-    {
-        return usage_error("--default is only applicable to --get");
     }
     match mode {
         Mode::List if !positional.is_empty() => {

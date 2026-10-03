@@ -147,7 +147,6 @@ fn provision(repo: &gix::Repository, wt_path: &Path, name: &str, count: &mut usi
     // 2. Linked-worktree metadata `<gitdir>/worktrees/<name>/`.
     let meta = git_dir.join("worktrees").join(name);
     std::fs::create_dir_all(&meta)?;
-    std::fs::write(meta.join("HEAD"), format!("ref: {branch_name}\n"))?;
     std::fs::write(meta.join("commondir"), "../..\n")?;
 
     // 3. The worktree's `.git` file <-> metadata gitdir pointer.
@@ -155,6 +154,18 @@ fn provision(repo: &gix::Repository, wt_path: &Path, name: &str, count: &mut usi
     let dotgit = wt_path.join(".git");
     std::fs::write(meta.join("gitdir"), format!("{}\n", dotgit.display()))?;
     std::fs::write(&dotgit, format!("gitdir: {}\n", meta.display()))?;
+
+    // The worktree's `HEAD` on the branch, through its own ref store as `git worktree add`
+    // writes it: a reftable repository gets the worktree's stack and stubs
+    // (`ref_store_create_on_disk()`, refs.c:2226-2244), a files one the `HEAD` file.
+    if crate::refstore::is_reftable(repo) {
+        gix::refs::reftable::Backend::create_on_disk(&meta)?;
+        let wt_repo = gix::open_opts(&meta, repo.open_options().clone())?;
+        let head = crate::refstore::StateRef::Symbolic(branch_name.clone().into());
+        crate::refstore::state_ref_write(&wt_repo, "HEAD", &head, "")?;
+    } else {
+        std::fs::write(meta.join("HEAD"), format!("ref: {branch_name}\n"))?;
+    }
 
     // 4. Check out the tree and write the per-worktree index.
     checkout_tree(repo, head_id, wt_path, &meta.join("index"))?;

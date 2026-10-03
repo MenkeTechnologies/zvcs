@@ -154,3 +154,21 @@ fn log_parse_options_and_paths_after_dashdash_still_work() {
     let (out, err, code) = f.run(&["show", "-s", "--format=%s", "f", "--source"]);
     assert_eq!((out.as_str(), err.as_str(), code), ("two\n", "", 0));
 }
+
+/// `cmd_log_init_finish()` refuses `-L` with a pathspec after `setup_revisions()`
+/// returns (builtin/log.c:322-323), so a path the filename fallback took is
+/// refused as one after `--` is. `show` only refused the `--` spelling.
+#[test]
+fn line_range_refuses_a_positional_path() {
+    let f = Fixture::new("lpath");
+    for verb in ["log", "show"] {
+        for args in [&[verb, "-L1,1:f", "f"][..], &[verb, "-L1,1:f", "HEAD", "f"][..], &[verb, "f", "-L1,1:f"][..]] {
+            let (out, err, code) = f.run(args);
+            assert_eq!(
+                (out.as_str(), err.as_str(), code),
+                ("", "fatal: -L<range>:<file> cannot be used with pathspec\n", 128),
+                "{args:?}"
+            );
+        }
+    }
+}

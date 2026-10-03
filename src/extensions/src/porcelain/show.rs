@@ -1397,6 +1397,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             argv_specs = k;
         }
     }
+    // `cmd_log_init_finish()` tests `rev->prune_data.nr` after `setup_revisions()`
+    // returns (builtin/log.c:322-323), so a path the fallback took counts as much
+    // as one after `--`, which the check above already refused.
+    if line_level && !pathspecs.is_empty() {
+        return Ok(fatal("-L<range>:<file> cannot be used with pathspec\n"));
+    }
 
     // `revs->def`: the fallback pending object is added with no flags at all, so a
     // trailing `--not` never turns the implicit `HEAD` into an exclusion. A ref

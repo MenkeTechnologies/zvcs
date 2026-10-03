@@ -1345,6 +1345,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         return super::diff_no_index::run(args);
     }
     let mut cached = false;
+    // `--merge-base`, read by `builtin_diff_index()` and `builtin_diff_tree()`.
+    let mut merge_base = false;
     // `revs->max_count`, as `--base`/`--ours`/`--theirs` set it. `None` is git's
     // `-1`: stage 2 is compared and the combined diff is free.
     let mut unmerged_stage: Option<u8> = None;
@@ -2565,6 +2567,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // dispatch targets receives the leftover — and so whether the `error:` line
             // precedes the usage block — depends on whether a revision turns up, which
             // may still be later in argv (`git diff --no-such-flag HEAD`).
+            "--merge-base" => merge_base = true,
             s if s.starts_with('-') && !is_known_option(s) => {
                 invalid_arg.get_or_insert_with(|| s.to_owned());
             }
@@ -3110,6 +3113,68 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // `setup_revisions()`, so an earlier ambiguous positional (128) wins.
     if cached && revs.len() >= 2 {
         return Ok(usage_error());
+    }
+
+    // `--merge-base`: `builtin_diff_index()` (one tree-ish, or `--cached`) and
+    // `builtin_diff_tree()` (two) replace the first operand with
+    // `diff_get_merge_base()`'s answer (diff-lib.c), whose second child is the
+    // other operand or `HEAD`. Three or more operands reach neither and are the
+    // usage block; none at all reaches `builtin_diff_files()`, which names the
+    // option it does not know.
+    if merge_base {
+        // `builtin_diff_blobs()` leaves the word in argv and `usage()`s on it.
+        if blob_run {
+            return Ok(usage_error());
+        }
+        if revs.is_empty() && !cached {
+            return Ok(invalid_option("--merge-base", false));
+        }
+        if revs.len() > 2 {
+            return Ok(usage_error());
+        }
+        if range_operands > 0 || revs_uninteresting.iter().any(|&u| u) {
+            eprintln!("fatal: --merge-base does not work with ranges");
+            return Ok(ExitCode::from(128));
+        }
+        let mut children: Vec<&str> = revs.iter().map(String::as_str).collect();
+        // `--cached` with no operand pends `HEAD` itself, and the missing
+        // second child is `HEAD` again.
+        while children.len() < 2 {
+            children.push("HEAD");
+        }
+        // `lookup_commit_reference()` reports a child that does not peel to a
+        // commit, and `repo_get_merge_bases()` then has nothing to answer with.
+        let mut commits = Vec::with_capacity(2);
+        for name in &children {
+            let id = crate::objname::resolve_quiet(&repo, name)
+                .ok_or_else(|| anyhow::anyhow!("unable to get {name}"))?;
+            match repo.find_object(id)?.peel_tags_to_end() {
+                Ok(o) if o.kind == gix::object::Kind::Commit => commits.push(o.id),
+                Ok(o) => {
+                    eprintln!("error: object {} is a {}, not a commit", o.id, o.kind);
+                    eprintln!("fatal: no merge base found");
+                    return Ok(ExitCode::from(128));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let bases = repo.merge_bases_many(commits[0], &[commits[1]]).unwrap_or_default();
+        match bases.len() {
+            0 => {
+                eprintln!("fatal: no merge base found");
+                return Ok(ExitCode::from(128));
+            }
+            1 => {}
+            _ => {
+                eprintln!("fatal: multiple merge bases found");
+                return Ok(ExitCode::from(128));
+            }
+        }
+        let base = bases[0].detach().to_hex().to_string();
+        match revs.first_mut() {
+            Some(first) => *first = base,
+            None => revs.push(base),
+        }
     }
 
     // `diff_set_mnemonic_prefix()` (diff.c:3720-3726):

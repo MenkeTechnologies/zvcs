@@ -98,6 +98,7 @@ use crate::runner::Case;
 /// Append this subsystem's cases to the corpus.
 pub fn cases(out: &mut Vec<Case>) {
     merge_base(out);
+    diff_merge_base(out);
     name_rev(out);
     range_diff(out);
     show_branch(out);
@@ -130,6 +131,30 @@ const README_BLOB: &str = "9741694d75caeb49d3b7c1f59451c0c56bf6216c";
 /// `--is-ancestor` reports through the exit code with no output at all — an
 /// implementation that prints the base and exits 0 passes every stdout
 /// comparison and is still wrong in both directions.
+/// `git diff --merge-base`: `diff_get_merge_base()` replaces the first operand
+/// with its merge base against the second, or against `HEAD` when there is one
+/// operand (or none, under `--cached`). A range is refused at 128, three
+/// operands are the usage block, two merge bases are refused, and with no
+/// operand at all the word is `builtin_diff_files()`'s unknown option.
+fn diff_merge_base(out: &mut Vec<Case>) {
+    each(
+        Shape::Branched,
+        "diff",
+        &[
+            &["diff", "--merge-base", "feature", "main"],
+            &["diff", "--merge-base", "main", "feature", "--stat"],
+            &["diff", "--merge-base", "--cached", "feature", "--name-status"],
+            &["diff", "--merge-base", "feature"],
+        ],
+        out,
+    );
+    out.push(Case::strict("diff", &["diff", "--merge-base", "main...feature"], Shape::Branched));
+    out.push(Case::strict("diff", &["diff", "--merge-base", "main", "feature", "HEAD"], Shape::Branched));
+    out.push(Case::strict("diff", &["diff", "--merge-base"], Shape::Branched));
+    out.push(Case::strict("diff", &["diff", "--merge-base", "HEAD^{tree}", "feature"], Shape::Branched));
+    out.push(Case::strict("diff", &["diff", "--merge-base", "cc-left", "cc-right"], Shape::CrissCross));
+}
+
 fn merge_base(out: &mut Vec<Case>) {
     // Three or more parents. `main` is the octopus merge, so `HEAD^2`…`HEAD^4`
     // are the three merged branch tips and `HEAD^` is the trunk they joined.

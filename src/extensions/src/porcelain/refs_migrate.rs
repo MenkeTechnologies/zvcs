@@ -1,27 +1,33 @@
-//! `repo_migrate_ref_storage_format()` (refs.c:3344-3542, v2.56.0) for the one
-//! direction this build can write: a `files` repository into `reftable`.
+//! `repo_migrate_ref_storage_format()` (refs.c:3344-3542, v2.56.0): move a
+//! repository's references and reflogs from the `files` backend into
+//! `reftable`, or back.
 //!
 //! The steps are git's, in git's order:
 //!
-//!  1. `mkdtemp("<gitdir>/ref_migration.XXXXXX")` and create a reftable store in
-//!     it — `reftable/` plus the `HEAD` and `refs/heads` stubs that keep older
-//!     clients from mistaking the repository for a files one;
-//!  2. one initial transaction holding every reference (root refs, symrefs and
-//!     broken refs included) and, unless `--no-reflog`, every reflog entry, each
-//!     entry under its own update index so a reflog keeps its order;
+//!  1. `mkdtemp("<gitdir>/ref_migration.XXXXXX")` and create the new store in
+//!     it (`ref_store_create_on_disk()`): `reftable/` plus the `HEAD` and
+//!     `refs/heads` stubs that keep older clients from mistaking the repository
+//!     for a files one, or `refs/`, `refs/heads/` and `refs/tags/`;
+//!  2. one initial transaction holding every reference of the old store (root
+//!     refs, symrefs and broken refs included) and, unless `--no-reflog`, every
+//!     reflog entry, each under its own index so a reflog keeps its order;
 //!  3. `--dry-run` stops here and names the directory;
-//!  4. otherwise the files store is deleted (`refs/`, `logs/`, the root refs,
-//!     `packed-refs`), the new store's files are renamed into the git directory,
-//!     and the repository format is rewritten to `extensions.refStorage =
-//!     reftable`.
+//!  4. otherwise the old store is deleted (`ref_store_remove_on_disk()`), the new
+//!     store's files are renamed into the git directory, and the repository
+//!     format is rewritten (`initialize_repository_version()`).
 //!
-//! The table itself is written by `gix-reftable`, the port of git's `reftable/`
+//! A reftable table is written by `gix-reftable`, the port of git's `reftable/`
 //! library, exactly as `write_transaction_table()` (refs/reftable-backend.c:
-//! 1463-1636) feeds it.
+//! 1463-1636) feeds it. A files store gets what `files_transaction_finish_initial()`
+//! (refs/files-backend.c:3194-3320) writes: every reference that is neither
+//! symbolic nor a root ref in `packed-refs`, the others as loose files, and the
+//! reflog entries appended to `logs/`.
 
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
+use gix::refs::store::RefStorage;
 use gix_reftable::{LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, StackOptions, WriteOptions};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// How a migration ended when it did not succeed: the text git collects in
@@ -30,10 +36,12 @@ pub(super) struct Failed(pub String);
 
 /// One reference of the old store, as `migrate_one_ref()` hands it to the
 /// transaction: `ref_transaction_create()` for an object id,
-/// `ref_transaction_update()` with a `new_target` for a symref.
+/// `ref_transaction_update()` with a `new_target` for a symref. A tag is never
+/// peeled: `REF_SKIP_OID_VERIFICATION` keeps `ref_transaction_update()` from
+/// reading the object (refs.c:1433-1455).
 struct Ref {
     name: BString,
-    value: RefValue,
+    value: gix::refs::Target,
 }
 
 /// One reflog entry, as `migrate_one_reflog_entry()` hands it to
@@ -50,11 +58,12 @@ struct Log {
     index: u64,
 }
 
-/// Migrate `repo`, which uses the files backend, to reftable. The caller has
-/// already made `cmd_refs_migrate()`'s checks and refused a repository with
-/// worktrees.
-pub(super) fn files_to_reftable(
+/// Migrate `repo` to the ref storage format `to`, which it does not use yet.
+/// The caller has already made `cmd_refs_migrate()`'s checks and refused a
+/// repository with worktrees.
+pub(super) fn migrate(
     repo: &gix::Repository,
+    to: RefStorage,
     dry_run: bool,
     skip_reflog: bool,
 ) -> Result<std::result::Result<(), Failed>> {
@@ -83,17 +92,22 @@ pub(super) fn files_to_reftable(
     let new_abs = cwd.join(&new_gitdir);
 
     let migrated = (|| -> Result<std::result::Result<(), Failed>> {
-        let opts = write_options(repo);
-        create_on_disk(repo, &new_abs)?;
+        create_on_disk(repo, to, &new_abs)?;
         let refs = collect_refs(repo, &gitdir)?;
         let logs = match skip_reflog {
             true => Vec::new(),
             false => collect_logs(repo, &gitdir)?,
         };
-        let mut stack = Stack::new(&new_abs.join("reftable"), &stack_options(repo))
-            .map_err(|e| anyhow::anyhow!("reftable: {e}"))?;
-        if let Err(e) = commit_initial(&mut stack, &opts, refs, logs) {
-            return Ok(Err(Failed(format!("reftable: transaction failure: {e}"))));
+        match to {
+            RefStorage::Reftable => {
+                let opts = write_options(repo)?;
+                let mut stack = Stack::new(&new_abs.join("reftable"), &stack_options(repo))
+                    .map_err(|e| anyhow::anyhow!("reftable: {e}"))?;
+                if let Err(e) = commit_initial(&mut stack, &opts, refs, logs) {
+                    return Ok(Err(Failed(format!("reftable: transaction failure: {e}"))));
+                }
+            }
+            RefStorage::Files => files_commit_initial(&new_abs, refs, logs)?,
         }
         Ok(Ok(()))
     })()?;
@@ -110,7 +124,11 @@ pub(super) fn files_to_reftable(
     }
 
     let finish = (|| -> std::result::Result<(), String> {
-        files_remove_on_disk(&gitdir)?;
+        match to {
+            // The old store is the other one.
+            RefStorage::Reftable => files_remove_on_disk(&gitdir)?,
+            RefStorage::Files => gix::refs::reftable::Backend::remove_on_disk(&gitdir)?,
+        }
         move_files(&new_gitdir, &new_abs, &gitdir_str, &gitdir)?;
         if let Err(e) = std::fs::remove_dir(&new_abs) {
             eprintln!(
@@ -119,7 +137,7 @@ pub(super) fn files_to_reftable(
                 crate::external::strerror(&e)
             );
         }
-        initialize_repository_version(repo).map_err(|e| format!("{e:#}"))
+        initialize_repository_version(repo, to).map_err(|e| format!("{e:#}"))
     })();
     match finish {
         Ok(()) => Ok(Ok(())),
@@ -148,41 +166,48 @@ fn stack_options(repo: &gix::Repository) -> StackOptions {
     }
 }
 
-/// `reftable_be_write_options()` (refs/reftable-backend.c:361-389): the
-/// library's write options with the `reftable.*` configuration applied, a
-/// 100ms lock timeout, and new files created `0666` less the umask, widened by
-/// `core.sharedRepository`.
-fn write_options(repo: &gix::Repository) -> WriteOptions {
-    let config = repo.config_snapshot();
-    let ulong = |key: &str| config.integer(key).and_then(|v| u64::try_from(v).ok());
+/// `reftable_be_write_options()` (refs/reftable-backend.c:323-392, v2.56.0),
+/// the reftable backend's own reading of the configuration: the `reftable.*`
+/// values with git's range checks, `core.sharedRepository` and
+/// `GIT_TEST_REFTABLE_AUTOCOMPACTION`. A value git dies on is a `fatal:`.
+fn write_options(repo: &gix::Repository) -> Result<WriteOptions> {
+    let entries = gix::config::reftable::entries_in_order(&repo.config_snapshot());
+    let autocompaction = std::env::var_os("GIT_TEST_REFTABLE_AUTOCOMPACTION");
     // SAFETY: `umask()` only swaps the process mask; it is read and restored.
     let mask = unsafe {
         let mask = libc::umask(0);
         libc::umask(mask);
         u32::from(mask)
     };
-    let shared = config
-        .string("core.sharedRepository")
-        .and_then(|v| super::init::parse_shared_value(&v.to_string()).ok())
-        .unwrap_or(0);
-    WriteOptions {
-        block_size: ulong("reftable.blockSize").map_or(gix_reftable::DEFAULT_BLOCK_SIZE, |v| v as u32),
-        restart_interval: ulong("reftable.restartInterval").map_or(0, |v| v as u16),
-        skip_index_objects: config.boolean("reftable.indexObjects").is_some_and(|v| !v),
-        auto_compaction_factor: ulong("reftable.geometricFactor").map_or(0, |v| v as u8),
-        lock_timeout_ms: config.integer("reftable.lockTimeout").unwrap_or(100),
-        default_permissions: Some(super::init::calc_shared_perm(shared, 0o666 & !mask)),
-        disable_auto_compact: !crate::setup::git_env_bool("GIT_TEST_REFTABLE_AUTOCOMPACTION", true),
-        ..WriteOptions::default()
-    }
+    gix::config::reftable::write_config(&entries, mask, autocompaction.as_ref())
+        .map(|config| config.opts)
+        .map_err(crate::fatal::die)
 }
 
-/// `ref_store_create_on_disk()` for the reftable backend (refs.c:2226-2244 and
-/// refs/reftable-backend.c:497-510): the `reftable/` directory, then
-/// `refs_create_refdir_stubs()` (refs.c:2202-2223) — a `HEAD` pointing at the
-/// invalid branch `.invalid`, and a `refs/heads` *file* naming the format.
-fn create_on_disk(repo: &gix::Repository, dir: &Path) -> Result<()> {
-    create_on_disk_stubs(dir)?;
+/// `ref_store_create_on_disk(new_refs, 0, …)` (refs.c:2223-2241) in the
+/// migration directory `dir`, with `core.sharedRepository` applied to what was
+/// created (`adjust_shared_perm()`):
+///
+/// - reftable: `reftable_be_create_on_disk()` and the stubs, see
+///   [`gix::refs::reftable::Backend::create_on_disk`];
+/// - files: `files_ref_store_create_on_disk()` (refs/files-backend.c:3658-3700),
+///   `refs/`, `refs/heads/` and `refs/tags/`.
+fn create_on_disk(repo: &gix::Repository, to: RefStorage, dir: &Path) -> Result<()> {
+    match to {
+        RefStorage::Reftable => {
+            gix::refs::reftable::Backend::create_on_disk(dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        RefStorage::Files => {
+            for sub in ["refs", "refs/heads", "refs/tags"] {
+                match std::fs::create_dir(dir.join(sub)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                        crate::git_fatal!("{}: {}", dir.join(sub).display(), crate::external::strerror(&e))
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     let shared = repo
         .config_snapshot()
         .string("core.sharedRepository")
@@ -212,12 +237,14 @@ pub(super) fn create_on_disk_stubs(dir: &Path) -> std::io::Result<()> {
 /// record at the stack's first update index. The log message is `NULL`, so no
 /// reflog record is written.
 pub(super) fn init_symref_head(repo: &gix::Repository, target: &gix::bstr::BStr) -> Result<()> {
-    let opts = write_options(repo);
+    let opts = write_options(repo)?;
     let mut stack = Stack::new(&repo.common_dir().join("reftable"), &stack_options(repo))
         .map_err(|e| anyhow::anyhow!("reftable: {e}"))?;
     let head = Ref {
         name: "HEAD".into(),
-        value: RefValue::Symref(target.to_owned()),
+        value: gix::refs::Target::Symbolic(
+            gix::refs::FullName::try_from(target).map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
     };
     commit_initial(&mut stack, &opts, vec![head], Vec::new())
         .map_err(|e| anyhow::anyhow!("reftable: transaction failure: {e}"))
@@ -225,10 +252,23 @@ pub(super) fn init_symref_head(repo: &gix::Repository, target: &gix::bstr::BStr)
 
 /// `refs_for_each_ref_ext(old_refs, migrate_one_ref, …)` with
 /// `REFS_FOR_EACH_INCLUDE_ROOT_REFS | REFS_FOR_EACH_INCLUDE_BROKEN`: the root
-/// refs in the git directory (`HEAD`, `ORIG_HEAD`, … — never `FETCH_HEAD` or
-/// `MERGE_HEAD`), then everything under `refs/`, loose over packed.
+/// refs (`HEAD`, `ORIG_HEAD`, … — never `FETCH_HEAD` or `MERGE_HEAD`), then
+/// everything under `refs/`. A files store has its root refs in the git
+/// directory and takes loose over packed; a reftable store has them as records
+/// (`reftable_ref_iterator_advance()`, refs/reftable-backend.c:632-646).
 fn collect_refs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Ref>> {
     let mut out = Vec::new();
+    if crate::refstore::is_reftable(repo) {
+        let references = repo.references()?;
+        for r in references.pseudo()?.chain(references.all()?) {
+            let r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+            let name = r.name().as_bstr().to_owned();
+            if name.starts_with(b"refs/") || super::for_each_ref::is_root_ref(&name) {
+                out.push(Ref { name, value: r.inner.target });
+            }
+        }
+        return Ok(out);
+    }
     let mut roots: Vec<String> = std::fs::read_dir(gitdir)?
         .filter_map(std::result::Result::ok)
         .filter(|e| std::fs::metadata(e.path()).is_ok_and(|m| m.is_file()))
@@ -239,7 +279,7 @@ fn collect_refs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Ref>> {
     roots.sort();
     for name in roots {
         if let Some(r) = repo.refs.try_find(name.as_str())?.filter(|r| r.name.as_bstr() == name.as_str()) {
-            out.push(Ref { name: name.into(), value: ref_value(&r.target) });
+            out.push(Ref { name: name.into(), value: r.target });
         }
     }
     for r in repo.references()?.all()? {
@@ -248,15 +288,14 @@ fn collect_refs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Ref>> {
         if !name.starts_with(b"refs/") {
             continue;
         }
-        let value = ref_value(&r.inner.target);
-        out.push(Ref { name, value });
+        out.push(Ref { name, value: r.inner.target });
     }
     Ok(out)
 }
 
-/// `migrate_one_ref()`: a symref keeps its referent (`REF_NO_DEREF`), anything
-/// else its object id. `ref_transaction_create()` is never given a peeled
-/// value, so a tag is a `VAL1` record, not a `VAL2`.
+/// `migrate_one_ref()` into a reftable record: a symref keeps its referent
+/// (`REF_NO_DEREF`), anything else its object id. `ref_transaction_create()` is
+/// never given a peeled value, so a tag is a `VAL1` record, not a `VAL2`.
 fn ref_value(target: &gix::refs::Target) -> RefValue {
     match target {
         gix::refs::Target::Symbolic(to) => RefValue::Symref(to.as_bstr().to_owned()),
@@ -271,14 +310,51 @@ fn hash(id: &gix::oid) -> gix_reftable::record::Hash {
     out
 }
 
-/// `refs_for_each_reflog(old_refs, migrate_one_reflog, …)`: every reflog under
-/// `<gitdir>/logs`, walked as `dir_iterator_begin(…, DIR_ITERATOR_SORTED)`
+/// `refs_for_each_reflog(old_refs, migrate_one_reflog, …)`: every reflog of
+/// the old store, each entry taking the next value of `data->index`, from 0.
+///
+/// A reftable store lists its reflogs and their entries itself; each entry is
+/// read back through the same parser a files line takes, which is what
+/// `migrate_one_reflog_entry()` makes of the entry either way.
+///
+/// A files store has them under `<gitdir>/logs`, walked as `dir_iterator_begin(…, DIR_ITERATOR_SORTED)`
 /// walks it — each directory's entries in `strcmp()` order, a directory's
 /// contents right after the directory itself — skipping what is not a regular
 /// file or whose basename is not a well-formed one-level refname
 /// (`files_reflog_iterator_advance()`, refs/files-backend.c:2411-2430). Each
 /// entry takes the next value of `data->index`, starting at 0.
 fn collect_logs(repo: &gix::Repository, gitdir: &Path) -> Result<Vec<Log>> {
+    if crate::refstore::is_reftable(repo) {
+        let mut out = Vec::new();
+        let mut index = 0u64;
+        for refname in crate::refstore::reflog_names(repo, false)? {
+            let refname = refname.to_str_lossy().into_owned();
+            crate::refstore::for_each_reflog_entry(repo, &refname, false, |e| {
+                let message = e.message.strip_suffix(b"\n").unwrap_or(&e.message);
+                let mut line = format!(
+                    "{} {} {} {} {}{:04}",
+                    e.old_oid,
+                    e.new_oid,
+                    e.committer,
+                    e.timestamp,
+                    if e.tz < 0 { '-' } else { '+' },
+                    e.tz.abs()
+                )
+                .into_bytes();
+                if !message.is_empty() {
+                    line.push(b'\t');
+                    line.extend_from_slice(message);
+                }
+                line.push(b'\n');
+                if let Some(log) = parse_reflog_line(repo, &refname, &line, index) {
+                    out.push(log);
+                    index += 1;
+                }
+                std::ops::ControlFlow::Continue(())
+            })?;
+        }
+        return Ok(out);
+    }
     let logs_dir = gitdir.join("logs");
     let mut names = Vec::new();
     walk_sorted(&logs_dir, "", &mut names);
@@ -412,7 +488,7 @@ fn commit_initial(
                 wr.add_ref(&RefRecord {
                     refname: r.name.clone(),
                     update_index: ts,
-                    value: r.value.clone(),
+                    value: ref_value(&r.value),
                 })?;
             }
             let mut records: Vec<LogRecord> = logs
@@ -439,6 +515,68 @@ fn commit_initial(
         },
         Some(opts),
     )
+}
+
+/// `files_transaction_finish_initial()` (refs/files-backend.c:3194-3320) into
+/// the files store at `dir`: the packed transaction writes `packed-refs` — the
+/// header and every reference that is neither symbolic nor a root ref, sorted,
+/// none peeled — and the loose one the rest as files, then each reflog entry
+/// as a line appended to `logs/<ref>` (`REF_FORCE_CREATE_REFLOG`), its
+/// committer `fmt_ident()`'s `Name <email> <time> <zone>`
+/// (`log_ref_write_fd()`, :1986-2006).
+fn files_commit_initial(dir: &Path, mut refs: Vec<Ref>, logs: Vec<Log>) -> Result<()> {
+    refs.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut packed = b"# pack-refs with: peeled fully-peeled sorted \n".to_vec();
+    for r in &refs {
+        match &r.value {
+            gix::refs::Target::Object(id) if !super::for_each_ref::is_root_ref(&r.name) => {
+                packed.extend_from_slice(format!("{id} {}\n", r.name).as_bytes());
+            }
+            _ => {}
+        }
+    }
+    write_through_lock(&dir.join("packed-refs"), &packed)?;
+    for r in &refs {
+        let contents = match &r.value {
+            gix::refs::Target::Symbolic(target) => format!("ref: {}\n", target.as_bstr()),
+            gix::refs::Target::Object(id) if super::for_each_ref::is_root_ref(&r.name) => format!("{id}\n"),
+            gix::refs::Target::Object(_) => continue,
+        };
+        let path = dir.join(gix::path::from_bstr(r.name.as_bstr()));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_through_lock(&path, contents.as_bytes())?;
+    }
+    for log in &logs {
+        let path = dir.join("logs").join(gix::path::from_bstr(log.refname.as_bstr()));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut line = format!(
+            "{} {} {} <{}> {} {:+05}",
+            log.old, log.new, log.name, log.email, log.time, log.tz_offset
+        );
+        if !log.message.is_empty() {
+            line.push('\t');
+            line.push_str(&log.message);
+        }
+        line.push('\n');
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?
+            .write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` through `<path>.lock`, as a lockfile commits.
+fn write_through_lock(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut lock = gix::lock::File::acquire_to_update_resource(path, gix::lock::acquire::Fail::Immediately, None)?;
+    lock.write_all(contents)?;
+    lock.commit()?;
+    Ok(())
 }
 
 /// `ref_store_remove_on_disk()` for the files backend
@@ -525,30 +663,68 @@ fn move_files(
     Ok(())
 }
 
-/// `initialize_repository_version(repo, hash, REF_STORAGE_FORMAT_REFTABLE,
-/// reinit = 1)` (setup.c:2444-2512): `extensions.objectformat` set for SHA-256
-/// and dropped for SHA-1, `extensions.refstorage = reftable`,
-/// `extensions.submodulepathconfig` when `init.defaultSubmodulePathConfig`
-/// asks for it, and `core.repositoryformatversion = 1`, in that order.
-fn initialize_repository_version(repo: &gix::Repository) -> Result<()> {
+/// `initialize_repository_version(repo, hash, to, reinit = 1)`
+/// (setup.c:2444-2512): `extensions.objectformat` set for SHA-256 and unset
+/// for SHA-1, `extensions.refstorage` set to `reftable` or unset for `files`,
+/// `extensions.submodulepathconfig` when `init.defaultSubmodulePathConfig` asks
+/// for it, and `core.repositoryformatversion` 1 when any of these, or another
+/// extension only version 1 knows, remains — 0 otherwise. Each is one
+/// `repo_config_set[_gently]()`, which drops a section its last key leaves.
+fn initialize_repository_version(repo: &gix::Repository, to: RefStorage) -> Result<()> {
+    use crate::config_store::ValuePattern;
     let path = repo.common_dir().join("config");
-    let mut file = gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
+    let set = |key: &str, value: Option<&str>| -> Result<()> {
+        match crate::config_store::set_multivar_in_file(
+            &path,
+            key,
+            key,
+            key.rfind('.').expect("the key has a section"),
+            value.map(str::as_bytes),
+            ValuePattern::Any,
+            None,
+            false,
+        ) {
+            Ok(()) => Ok(()),
+            // `repo_config_set_gently()` of a key that is not there.
+            Err(_) if value.is_none() => Ok(()),
+            Err(_) => Err(crate::fatal::die(format!(
+                "could not set '{key}' to '{}'",
+                value.unwrap_or_default()
+            ))),
+        }
+    };
+    let sha256 = repo.object_hash() == gix::hash::Kind::Sha256;
+    let reftable = to == RefStorage::Reftable;
+    let mut target_version = if sha256 || reftable { 1 } else { 0 };
+    set("extensions.objectformat", sha256.then_some("sha256"))?;
+    set("extensions.refstorage", reftable.then_some("reftable"))?;
+
+    // `read_repository_format()` of the config as it now is: an extension only
+    // version 1 knows keeps it there (`handle_extension()`, setup.c:653-715).
+    const V1_ONLY: &[&str] = &[
+        "noop-v1",
+        "objectformat",
+        "compatobjectformat",
+        "refstorage",
+        "relativeworktrees",
+        "submodulepathconfig",
+    ];
+    let file = gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    match repo.object_hash() {
-        gix::hash::Kind::Sha256 => {
-            file.set_raw_value_by("extensions", None, "objectformat", "sha256")?;
-        }
-        _ => {
-            if let Ok(mut section) = file.section_mut("extensions", None) {
-                section.remove("objectformat");
-            }
-        }
+    let v1_only = file.sections_by_name("extensions").into_iter().flatten().any(|section| {
+        section.header().subsection_name().is_none()
+            && section
+                .value_names()
+                .any(|name| V1_ONLY.contains(&name.to_string().to_ascii_lowercase().as_str()))
+    });
+    if v1_only {
+        target_version = 1;
     }
-    file.set_raw_value_by("extensions", None, "refstorage", "reftable")?;
     if repo.config_snapshot().boolean("init.defaultSubmodulePathConfig") == Some(true) {
-        file.set_raw_value_by("extensions", None, "submodulepathconfig", "true")?;
+        if target_version == 0 {
+            target_version = 1;
+        }
+        set("extensions.submodulepathconfig", Some("true"))?;
     }
-    file.set_raw_value_by("core", None, "repositoryformatversion", "1")?;
-    std::fs::write(&path, file.to_bstring())?;
-    Ok(())
+    set("core.repositoryformatversion", Some(&target_version.to_string()))
 }

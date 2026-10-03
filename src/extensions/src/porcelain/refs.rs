@@ -25,50 +25,19 @@
 //!     arguments`, `usage: missing --ref-format=<format>`, `error: unknown ref
 //!     storage format '<x>'`, `error: repository already uses '<x>' format`,
 //!     `error: migrating repositories with worktrees is not supported yet`
-//!     (refs.c:3366) at exit 255, and the `files` -> `reftable` migration itself,
-//!     `--dry-run` and `--no-reflog` included, in [`super::refs_migrate`]. The
-//!     table is written through `gix-reftable`, the port of git's `reftable/`
+//!     (refs.c:3366) at exit 255, and the migration itself in either direction,
+//!     `--dry-run` and `--no-reflog` included, in [`super::refs_migrate`]. A
+//!     reftable is written through `gix-reftable`, the port of git's `reftable/`
 //!     library, and matches stock's byte for byte.
 //!
-//! Not covered, and rejected with an error rather than approximated:
-//!   * `reftable` -> `files`: it needs a files-backend initial transaction
-//!     (everything into `packed-refs`, reflogs written back out) fed from a
-//!     reftable *reader* wired into the ref store, and this build still serves a
-//!     reftable repository from its files stubs (see below). `verify` never
-//!     reports `badReftableTableName` for the same reason.
+//! In a reftable repository every verb here goes through the reftable backend:
+//! `exists` reads the record ([`read_raw_ref`]), `create`/`delete`/`update`
+//! run its transaction, `optimize` compacts the stack, `list` reads the stack.
 //!
 //! Known divergence: usage *errors* raised inside `optimize` are reported by the
 //! `pack-refs` module, so their usage block reads `usage: git pack-refs ...`
 //! where git would print `usage: git refs optimize ...`. `refs optimize -h` is
 //! handled here and does print the `git refs optimize` form.
-//!
-//! Known divergence, and the larger half of the same gap: a repository that
-//! *declares* `extensions.refStorage = reftable` at
-//! `core.repositoryFormatVersion = 1` is read here — and by `show-ref`,
-//! `symbolic-ref`, `update-ref`, `pack-refs` and `reflog` — as though the
-//! declaration were absent, so the loose and packed files under `refs/` are
-//! served as the ref store. [`current_ref_format`] is the only place in this
-//! cluster that consults the declaration at all, and it only *reports* it.
-//!
-//! Stock git believes the declaration: it opens a reftable store, and over a
-//! files repository (the state a half-finished migration leaves behind) that
-//! store is empty. Measured against git 2.55.0 on such a repository —
-//! `show-ref` exits 1 printing nothing, `symbolic-ref HEAD` dies with `ref HEAD
-//! is not a symbolic ref` at 128, `pack-refs --all` exits 254 and
-//! `symbolic-ref HEAD refs/heads/<b>` fails the write with `reftable:
-//! transaction prepare: I/O error`. This port answers all four from the files
-//! backend and exits 0, which is the dangerous direction: a caller cannot tell
-//! "these are the refs" from "these are the refs of a store git is not using".
-//!
-//! The fix is not per-command. A reader may only serve the files backend when
-//! the repository declares it, so the decision belongs with the config read that
-//! already refuses a backend *value* this build does not know
-//! ([`crate::config::extension_value_refusal`], which is what turns
-//! `extensions.refStorage = bogusbackend` into `invalid value for
-//! 'extensions.refstorage'`), not repeated in each verb — a gate added to some
-//! verbs and not others would make `show-ref` and `for-each-ref` disagree about
-//! the same repository. Honouring the declaration rather than refusing it needs
-//! a reftable backend `gix-ref` does not have.
 
 use anyhow::{bail, Result};
 use std::process::ExitCode;
@@ -381,6 +350,9 @@ pub(super) fn exit_for_raw_ref(result: RawRef) -> ExitCode {
 /// git does for e.g. `refs/heads/../x`; it also keeps the name from being joined
 /// onto a path it could escape.
 pub(super) fn read_raw_ref(repo: &gix::Repository, name: &str) -> RawRef {
+    if crate::refstore::is_reftable(repo) {
+        return read_raw_reftable_ref(repo, name);
+    }
     if gix::refs::FullName::try_from(name).is_err() {
         return RawRef::Missing;
     }
@@ -423,6 +395,23 @@ pub(super) fn read_raw_ref(repo: &gix::Repository, name: &str) -> RawRef {
         // they cannot map or parse; the errno that reaches the caller is not
         // `ENOENT`, so it lands on the same side of the split as `EINVAL`.
         Err(_) => RawRef::Unreadable(libc::EINVAL),
+    }
+}
+
+/// `refs_read_raw_ref()` against the reftable backend,
+/// `reftable_be_read_raw_ref()` (refs/reftable-backend.c:880-908, v2.56.0): the
+/// record of exactly that name — `FETCH_HEAD` and `MERGE_HEAD` from their files
+/// (refs.c:2094-2105) — with `ENOENT` when there is none. A stack that cannot
+/// be read fails with a reftable error code and leaves `failure_errno` at 0.
+fn read_raw_reftable_ref(repo: &gix::Repository, name: &str) -> RawRef {
+    let Ok(full) = gix::refs::FullName::try_from(name).or_else(|_| gix::refs::FullName::try_from_onelevel(name))
+    else {
+        return RawRef::Missing;
+    };
+    match repo.reftable_read_raw_ref(full.as_ref()) {
+        Ok(Some(_)) => RawRef::Present,
+        Ok(None) => RawRef::Missing,
+        Err(_) => RawRef::Unreadable(0),
     }
 }
 
@@ -572,8 +561,7 @@ fn verify(args: &[String]) -> Result<ExitCode> {
 /// `usage()` exits 129. The `error()` paths return `-1` up through `cmd_refs()`, which the
 /// process truncates to 255 — not 1, which is what an `error()` returning `1` would give.
 ///
-/// Step 5, `repo_migrate_ref_storage_format()`, is [`super::refs_migrate::files_to_reftable`]
-/// for the `files` -> `reftable` direction; the reverse is refused (see the module docs).
+/// Step 5, `repo_migrate_ref_storage_format()`, is [`super::refs_migrate::migrate`].
 fn migrate(args: &[String]) -> Result<ExitCode> {
     let mut format_str: Option<String> = None;
     // `REPO_MIGRATE_REF_STORAGE_FORMAT_DRYRUN` and `…_SKIP_REFLOG`.
@@ -697,15 +685,11 @@ fn migrate(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
-    // Only `files` -> `reftable` is written here; see the module docs for why the
-    // other direction is refused rather than approximated.
-    if format_str != "reftable" {
-        bail!(
-            "refs migrate: cannot convert to '{format_str}': reading a reftable store into \
-             the files backend is not ported"
-        );
-    }
-    match super::refs_migrate::files_to_reftable(&repo, dry_run, skip_reflog)? {
+    let to = match format_str.as_str() {
+        "reftable" => gix::refs::store::RefStorage::Reftable,
+        _ => gix::refs::store::RefStorage::Files,
+    };
+    match super::refs_migrate::migrate(&repo, to, dry_run, skip_reflog)? {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(super::refs_migrate::Failed(msg)) => {
             eprintln!("error: {msg}");

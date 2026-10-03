@@ -250,8 +250,11 @@ where
         (0..up_to_date).for_each(|_| on_entry());
     }
     if stale.len() == index.entries().len() {
-        return gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options)
-            .map(|_| ());
+        let res = gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options);
+        if res.is_ok() {
+            mark_written_uptodate(index.entries_mut());
+        }
+        return res.map(|_| ());
     }
 
     // Narrow the state to the entries that still need writing, check those out, then put
@@ -265,12 +268,34 @@ where
     }
     index.swap_entries(stale.iter().map(|&i| all[i].clone()).collect());
     let res = gix::worktree::state::checkout(index, dir, objects, files, bytes, should_interrupt, options);
-    let written = index.swap_entries(Vec::new());
+    let mut written = index.swap_entries(Vec::new());
+    if res.is_ok() {
+        mark_written_uptodate(&mut written);
+    }
     for (slot, entry) in stale.into_iter().zip(written) {
         all[slot] = entry;
     }
     index.swap_entries(all);
     res.map(|_| ())
+}
+
+/// `update_ce_after_write()` (entry.c:270-279) under `state->refresh_cache`, which every
+/// `unpack_trees()` checkout sets (unpack-trees.c:438): `fill_stat_cache_info()` records the
+/// stat of the file just written and, for a regular file, `ce_mark_uptodate()`
+/// (read-cache.c:193-204). The checkout recorded the stat; this is the mark.
+///
+/// It is what keeps a file written in the current second from counting as racily clean
+/// against an index dated by the one it replaces: `is_racy_timestamp()` is only asked of
+/// an entry that is `!ce_uptodate(ce)`, both in `do_write_index()`'s smudge and in
+/// `prepare_to_write_split_index()`. An entry the checkout skipped — `SKIP_WORKTREE` — was
+/// not written and is not marked.
+fn mark_written_uptodate(entries: &mut [gix::index::Entry]) {
+    use gix::index::entry::{Flags, Mode};
+    for entry in entries {
+        if !entry.flags.contains(Flags::SKIP_WORKTREE) && matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE) {
+            entry.flags.insert(Flags::UPTODATE);
+        }
+    }
 }
 
 /// `ie_match_stat()` (read-cache.c) as `checkout_entry_ca()` asks it: does the work tree

@@ -46,7 +46,8 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `-s`/`--shared`, `--reference <repo>`, `--reference-if-able <repo>`,
 ///     `--dissociate`               → `objects/info/alternates` borrowing
 ///   * `--sparse`                    → cone-mode sparse checkout of the top level only
-///   * `--ref-format <format>`       → `files` accepted; `reftable` rejected (see below)
+///   * `--ref-format <format>`       → `files` or `reftable` (also from `GIT_DEFAULT_REF_FORMAT`
+///     and `init.defaultRefFormat`)
 ///   * `--recursive`/`--recurse-submodules[=<pathspec>]` → update submodules after
 ///     clone and record `submodule.active`
 ///   * `-j`/`--jobs <n>`             → clone that many submodules at once (forwarded to
@@ -99,10 +100,10 @@ use gix::remote::fetch::{Shallow, Tags};
 ///   * `--dissociate` writes no alternate at all. The pack is fetched in full,
 ///     which is the state git reaches by copying the borrowed objects in, so the
 ///     resulting repository is self-contained either way.
-///   * `--ref-format=reftable` is rejected with an honest "not supported" error
-///     (no vendored reftable backend). `--ref-format=files` is the format gix
-///     writes and is honored; any other value reproduces git's exact
-///     `unknown ref storage format '<v>'`.
+///   * A reftable clone is fetched and settled through the files ref store first;
+///     its refs are then written into a reftable stack in the transactions git's
+///     clone makes (see `adopt_reftable`). Any `--ref-format` other than `files`
+///     and `reftable` reproduces git's exact `unknown ref storage format '<v>'`.
 ///   * `--depth` combined with `--no-single-branch` costs one extra ls-refs round
 ///     trip, because gitoxide has already resolved its implicit single-branch
 ///     refspec by the time the replacement wildcard remote is installed.
@@ -712,9 +713,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     };
 
     // git's ref storage formats are exactly `files` and `reftable`, and an unknown
-    // name dies here. `files` is the backend gix writes; `reftable` has no vendored
-    // backend, and its refusal waits for the source and destination checks git runs
-    // before anything is created (see beside the destination tests).
+    // name dies here.
     if let Some(fmt) = ref_format.as_deref() {
         match fmt {
             "files" | "reftable" => {}
@@ -907,12 +906,6 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     }
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
-    // This port's own gap, refused only once every check git makes before creating
-    // anything has passed: stock 2.55.0 answers `clone --ref-format=reftable nope` with
-    // `repository 'nope' does not exist`, so it may not pre-empt that.
-    if ref_format.as_deref() == Some("reftable") {
-        bail!("the reftable ref storage format is not supported: no vendored reftable backend");
-    }
     let created_destination = !dst.exists();
     std::fs::create_dir_all(dst)?;
     // ```c
@@ -1013,6 +1006,20 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `init_db()` (builtin/clone.c:1188) → `repository_format_configure()` (setup.c:2765-2838):
+    // the ref storage format is `--ref-format`, else `GIT_DEFAULT_REF_FORMAT` (dying on a name it
+    // does not know), else `init.defaultRefFormat` / `feature.experimental`, else `files`. The
+    // configured defaults are read here, below the banner, warning about values git does not know.
+    let defaults = super::init::read_default_format_config()?;
+    let reftable = match ref_format.as_deref() {
+        Some(fmt) => fmt == "reftable",
+        None => match std::env::var("GIT_DEFAULT_REF_FORMAT").ok().as_deref() {
+            Some(env @ ("files" | "reftable")) => env == "reftable",
+            Some(env) => crate::git_fatal!("unknown ref storage format '{env}'"),
+            None => defaults.ref_format.as_deref() == Some("reftable"),
+        },
+    };
+
     // ```c
     // if (!access(mkpath("%s/shallow", path), F_OK)) {
     //         if (reject_shallow)
@@ -1089,15 +1096,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // ```
     //
     // The value named is the version the *new* repository would get, not the one
-    // `-c` supplied. It is `0` here because a clone this port performs is always
-    // sha1 with `files` ref storage; `--ref-format=reftable` and a sha256 source
-    // are refused earlier, so no path reaches this line wanting `1`.
+    // `-c` supplied: 1 for a reftable clone, 0 otherwise (a sha256 source is refused
+    // earlier, so no other path reaches this line wanting 1).
     if config_pairs
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("core.repositoryformatversion"))
     {
         eprintln!("warning: core.repositoryformatversion has multiple values");
-        crate::git_fatal!("could not set 'core.repositoryformatversion' to '0'");
+        crate::git_fatal!("could not set 'core.repositoryformatversion' to '{}'", u8::from(reftable));
     }
 
     // `transport_check_allowed()`, here rather than at the top of the command
@@ -2438,6 +2444,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // git leaves in `packed-refs` and why a ref that is in both files is one
     // gitoxide wrote twice.
     drop_doubly_written_refs(&git_dir)?;
+
+    // A reftable clone: the refs the files pipeline above settled are written into a reftable
+    // stack in the transactions git's clone makes — see [`adopt_reftable`].
+    if reftable {
+        adopt_reftable(&git_dir)?;
+    }
 
     // `--sparse`: git initializes a cone-mode sparse-checkout containing only the
     // top-level files. This port's own `sparse-checkout set --cone` writes the
@@ -4308,6 +4320,171 @@ fn remove_initial_remote_reflogs(git_dir: &Path, remote: &str) {
             _ => std::fs::remove_file(&path),
         };
     }
+}
+
+/// Store a finished clone's references in reftables, written in the transactions git's clone
+/// makes against a reftable ref store (builtin/clone.c, v2.56.0):
+///
+/// 1. `write_remote_refs()` (:473-498): one `REF_TRANSACTION_FLAG_INITIAL` transaction creating
+///    every mapped ref — the files backend puts exactly these into `packed-refs`;
+/// 2. `write_followtags()` (:500-514): one `refs_update_ref(msg, …)` per tag a `--single-branch`
+///    clone follows — the loose `refs/tags/*` files;
+/// 3. `update_remote_refs()` (:556-568): `refs_update_symref(<branch_top>HEAD, …, msg)` — the
+///    loose `refs/remotes/<name>/HEAD` symref;
+/// 4. `update_head()` (:572-613): `HEAD` as a symref with no message and, outside a bare clone,
+///    the branch created through it with `msg` — the loose `refs/heads/<branch>` — or a detached
+///    `HEAD` written with `msg`.
+///
+/// `msg` is the `clone: from <url>` the files pipeline logged. Each transaction logs what the
+/// backend's `should_write_log()` asks for, and tags carry their peeled value
+/// (`ref_transaction_update()`, refs.c:1450-1454). The files ref store is removed and the
+/// reftable one laid down first (`ref_store_create_on_disk()`, refs.c:2226-2244), and the config
+/// gets what `initialize_repository_version()` (setup.c:2444-2512) writes into a clone's
+/// still-empty config before anything else: an `[extensions]` section ahead of `[core]`, and
+/// version 1.
+fn adopt_reftable(git_dir: &Path) -> Result<()> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+    use gix::refs::Target;
+
+    let files = gix::open(git_dir)?;
+    let bare = files.is_bare();
+    let head = std::fs::read(git_dir.join("HEAD"))?;
+    let head = match head.trim().strip_prefix(b"ref:") {
+        Some(target) => Target::Symbolic(target.trim().as_bstr().try_into()?),
+        None => Target::Object(gix::ObjectId::from_hex(head.trim())?),
+    };
+    let msg = std::fs::read(git_dir.join("logs").join("HEAD"))
+        .ok()
+        .and_then(|log| {
+            let last = log.lines().last()?.to_owned();
+            Some(last.find_byte(b'\t').map_or_else(Vec::new, |tab| last[tab + 1..].to_vec()))
+        })
+        .unwrap_or_default();
+
+    let mut initial = Vec::new();
+    let mut followtags = Vec::new();
+    let mut remote_heads = Vec::new();
+    let mut created_branch = None;
+    for reference in files.references()?.all()? {
+        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name = reference.name().to_owned();
+        let target = reference.target().into_owned();
+        let loose = git_dir.join(gix::path::from_bstr(name.as_bstr())).is_file();
+        let full = name.as_bstr();
+        if !loose {
+            initial.push((name, target));
+        } else if full.starts_with(b"refs/tags/") {
+            followtags.push((name, target));
+        } else if full.starts_with(b"refs/remotes/") && full.ends_with(b"/HEAD") && target.try_name().is_some() {
+            remote_heads.push((name, target));
+        } else if !bare && matches!(&head, Target::Symbolic(h) if h == &name) {
+            created_branch = target.try_id().map(ToOwned::to_owned);
+        } else {
+            initial.push((name, target));
+        }
+    }
+    drop(files);
+
+    // The files ref store goes, the reftable one comes.
+    let _ = std::fs::remove_file(git_dir.join("packed-refs"));
+    let _ = std::fs::remove_dir_all(git_dir.join("refs"));
+    let _ = std::fs::remove_dir_all(git_dir.join("logs"));
+    gix::refs::reftable::Backend::create_on_disk(git_dir)?;
+    let config = git_dir.join("config");
+    let text = std::fs::read(&config)?;
+    let has_extensions = gix::config::File::from_bytes_no_includes(
+        &text,
+        gix::config::file::Metadata::from(gix::config::Source::Local),
+        Default::default(),
+    )
+    .is_ok_and(|f| f.section_by_key("extensions").is_ok());
+    if !has_extensions {
+        let mut prefixed = b"[extensions]\n\trefstorage = reftable\n".to_vec();
+        prefixed.extend_from_slice(&text);
+        std::fs::write(&config, prefixed)?;
+    }
+    let set = |key: &str, value: &str| {
+        crate::config_store::set_multivar_in_file(
+            &config,
+            key,
+            key,
+            key.rfind('.').expect("the key has a section"),
+            Some(value.as_bytes()),
+            crate::config_store::ValuePattern::Any,
+            None,
+            false,
+        )
+        .map_err(|_| crate::fatal::die(format!("could not set '{key}' to '{value}'")))
+    };
+    if has_extensions {
+        set("extensions.refstorage", "reftable")?;
+    }
+    set("core.repositoryformatversion", "1")?;
+
+    let repo = gix::open(git_dir)?;
+    let log = |message: &[u8]| LogChange {
+        mode: RefLog::AndReference,
+        force_create_reflog: false,
+        message: message.into(),
+    };
+    let commit = |edits: Vec<RefEdit>| -> Result<()> {
+        let (file_lock_fail, packed_refs_lock_fail) = (
+            gix::lock::acquire::Fail::Immediately,
+            gix::lock::acquire::Fail::Immediately,
+        );
+        repo.refs
+            .transaction()
+            .packed_refs(gix::refs::file::transaction::PackedRefs::DeletionsAndNonSymbolicUpdates(Box::new(
+                repo.objects.clone(),
+            )))
+            .prepare(edits, file_lock_fail, packed_refs_lock_fail)?
+            .commit(repo.committer().transpose()?)?;
+        Ok(())
+    };
+    let update = |name, new, message: &[u8], deref| RefEdit {
+        change: Change::Update {
+            log: log(message),
+            expected: PreviousValue::Any,
+            new,
+        },
+        name,
+        deref,
+    };
+
+    // `if (refs)`: a remote that advertised nothing has no initial transaction.
+    if !initial.is_empty() {
+        commit(
+            initial
+                .into_iter()
+                .map(|(name, target)| RefEdit {
+                    change: Change::Update {
+                        log: log(b""),
+                        expected: PreviousValue::MustNotExist,
+                        new: target,
+                    },
+                    name,
+                    deref: false,
+                })
+                .collect(),
+        )?;
+    }
+    for (name, target) in followtags {
+        commit(vec![update(name, target, &msg, false)])?;
+    }
+    for (name, target) in remote_heads {
+        commit(vec![update(name, target, &msg, false)])?;
+    }
+    let head_name: gix::refs::FullName = "HEAD".try_into()?;
+    match head {
+        Target::Symbolic(branch) => {
+            commit(vec![update(head_name.clone(), Target::Symbolic(branch), b"", false)])?;
+            if let Some(id) = created_branch {
+                commit(vec![update(head_name, Target::Object(id), &msg, true)])?;
+            }
+        }
+        Target::Object(id) => commit(vec![update(head_name, Target::Object(id), &msg, false)])?,
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -931,11 +931,11 @@ fn check_ref_format(fmt: &str) -> Result<FormatCheck> {
 /// The formats the configuration asks a new repository for, as
 /// `read_default_format_config()` (setup.c:2718-2761, v2.56.0) leaves them.
 #[derive(Default)]
-struct DefaultFormats {
+pub(super) struct DefaultFormats {
     /// `init.defaultObjectFormat`, when its last value names a known hash.
-    hash: Option<String>,
+    pub(super) hash: Option<String>,
     /// `init.defaultRefFormat`, or `reftable` from `feature.experimental`.
-    ref_format: Option<String>,
+    pub(super) ref_format: Option<String>,
 }
 
 /// `repository_format_configure()`'s `config_with_options(read_default_format_config,
@@ -945,7 +945,7 @@ struct DefaultFormats {
 /// `feature.experimental=true` selects `reftable` only while the ref format is
 /// still unknown at that point of the walk, which is how an explicit
 /// `init.defaultRefFormat` takes precedence wherever it sits.
-fn read_default_format_config() -> Result<DefaultFormats> {
+pub(super) fn read_default_format_config() -> Result<DefaultFormats> {
     let mut cfg = DefaultFormats::default();
     for (key, value) in crate::config::config_entries_in_order(None) {
         match (key.as_str(), value) {

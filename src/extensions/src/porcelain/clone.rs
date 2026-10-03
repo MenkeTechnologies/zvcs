@@ -736,12 +736,21 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("options '--bare' and '--separate-git-dir' cannot be used together");
     }
 
-    // `cmd_clone` resolves a local path before anything is created or announced, so a
-    // source that is not there is reported on its own.
-    if !url_str.contains("://")
-        && !url_str.contains('@')
-        && !Path::new(url_str).exists()
-    {
+    // ```c
+    // path = get_repo_path(repo_name, &is_bundle);
+    // if (path) {
+    //         ...
+    // } else if (strchr(repo_name, ':')) {
+    //         ...
+    // } else
+    //         die(_("repository '%s' does not exist"), repo_name);
+    // ```
+    //
+    // (`cmd_clone()`, builtin/clone.c.) Before anything is created or announced, a
+    // source that is neither a repository, a gitfile nor a bundle on disk, and has
+    // no colon to be a URL, is refused — an existing directory that holds no
+    // repository included.
+    if !url_str.contains(':') && matches!(classify_local_source(url_str), LocalSource::Neither) {
         return Ok(fatal(&format!("repository '{url_str}' does not exist")));
     }
 
@@ -861,9 +870,14 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // URL the way git's `guess_dir_name` does (humanish last component).
     let dir = match positionals.get(1) {
         Some(d) => (*d).to_string(),
-        // `guess_dir_name()` falls back to the argument itself, which is how
-        // `git clone .` ends up refusing `.` as a non-empty destination.
-        None => derive_dir_name(url_str, bare).unwrap_or_else(|| url_str.to_string()),
+        None => match derive_dir_name(url_str, is_bundle, bare) {
+            Some(dir) => dir,
+            None => {
+                return Ok(fatal(
+                    "No directory name could be guessed.\nPlease specify a directory on the command line",
+                ))
+            }
+        },
     };
     let dst = Path::new(&dir);
 
@@ -3994,23 +4008,109 @@ fn check_transport_allowed(url: &gix::Url) -> Result<()> {
     Ok(())
 }
 
-/// Derive the default clone directory from a repository URL, mirroring git's
-/// `guess_dir_name`: take the last `/`- or `:`-separated component, drop a
-/// single trailing `.git`, and (for a bare clone) re-append `.git`.
+/// `git_url_basename()` (dir.c): the directory `git clone <repo>` creates when
+/// none is given.
 ///
-/// Returns `None` when nothing usable remains (e.g. the URL is just `/` or `.`).
-fn derive_dir_name(url: &str, bare: bool) -> Option<String> {
-    let trimmed = url.trim_end_matches('/');
-    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
-    let name = last.strip_suffix(".git").unwrap_or(last);
-    if name.is_empty() || name == "." || name == ".." {
+/// Skip the scheme and any `user@` before the first slash; strip trailing
+/// slashes and whitespace, then one `/.git` and the slashes before it; strip a
+/// `:<port>` from a bare `host:port`; take the last `/`- or `:`-separated
+/// component and drop `.bundle` (for a bundle) or `.git` from it; append `.git`
+/// for a bare clone; and finally fold every run of whitespace and control
+/// characters into one space, trimming both ends.
+///
+/// `None` is git's `die(_("No directory name could be guessed.\n..."))`.
+fn derive_dir_name(url: &str, is_bundle: bool, bare: bool) -> Option<String> {
+    let is_dir_sep = |b: u8| b == b'/';
+    // C-locale `isspace()`.
+    let is_space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+    let repo = url.as_bytes();
+    let mut end = repo.len();
+
+    // Skip scheme.
+    let mut start = match url.find("://") {
+        Some(i) => i + 3,
+        None => 0,
+    };
+    // Skip authentication data, greedily up to the last '@' in the host part.
+    let mut ptr = start;
+    while ptr < end && !is_dir_sep(repo[ptr]) {
+        if repo[ptr] == b'@' {
+            start = ptr + 1;
+        }
+        ptr += 1;
+    }
+
+    // Strip trailing spaces, slashes and /.git.
+    while start < end && (is_dir_sep(repo[end - 1]) || is_space(repo[end - 1])) {
+        end -= 1;
+    }
+    if end > start + 5 && is_dir_sep(repo[end - 5]) && &repo[end - 4..end] == b".git" {
+        end -= 5;
+        while start < end && is_dir_sep(repo[end - 1]) {
+            end -= 1;
+        }
+    }
+    if end < start {
         return None;
     }
-    Some(if bare {
-        format!("{name}.git")
-    } else {
-        name.to_string()
-    })
+
+    // Strip a trailing port number when there is only a hostname: no separator,
+    // but a colon. `/foo/bar:2222.git` keeps its `2222`.
+    let host = &repo[start..end];
+    if !host.contains(&b'/') && host.contains(&b':') {
+        let mut p = end;
+        while start < p && repo[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if start < p && repo[p - 1] == b':' {
+            end = p - 1;
+        }
+    }
+
+    // Find the last component; colons count as separators too.
+    let mut p = end;
+    while start < p && !is_dir_sep(repo[p - 1]) && repo[p - 1] != b':' {
+        p -= 1;
+    }
+    start = p;
+
+    // Strip .{bundle,git}.
+    let mut name = &repo[start..end];
+    let suffix: &[u8] = if is_bundle { b".bundle" } else { b".git" };
+    if let Some(stripped) = name.strip_suffix(suffix) {
+        name = stripped;
+    }
+    if name.is_empty() || name == b"/" {
+        return None;
+    }
+
+    let mut dir = name.to_vec();
+    if bare {
+        dir.extend_from_slice(b".git");
+    }
+
+    // Fold runs of control characters and whitespace into one space, dropping
+    // leading and trailing ones.
+    let mut out = Vec::with_capacity(dir.len());
+    let mut prev_space = true;
+    for mut ch in dir {
+        if ch < 0x20 {
+            ch = b' ';
+        }
+        if is_space(ch) {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        out.push(ch);
+    }
+    if prev_space {
+        out.pop();
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// `clone_local()` + `copy_or_link_directory()` (builtin/clone.c): adopt the source's

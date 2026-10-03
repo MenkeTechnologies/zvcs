@@ -227,6 +227,7 @@ const LONG_OPTS: &[LongOpt] = &[
 ];
 use gix::prelude::ObjectIdExt;
 use gix::ObjectId;
+use crate::sequencer::read_state_oid;
 
 /// git's `status_format` for `git commit`'s report (builtin/commit.c). `None` is
 /// the unset default and the only value that still records a commit; every other
@@ -441,26 +442,6 @@ fn determine_whence(repo: &gix::Repository) -> Whence {
     } else {
         Whence::CherryPick
     }
-}
-
-/// Resolve one of the sequencer's pseudo-refs (`CHERRY_PICK_HEAD`, `REVERT_HEAD`,
-/// `REBASE_HEAD`, `AUTO_MERGE`) to an object id, or `None` when it does not exist.
-///
-/// git reaches these through the ref store with `REF_NO_DEREF`, so a loose file
-/// holding a raw object id is the normal representation.
-fn read_state_oid(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
-    // These are written as a bare loose file holding the id (that is what the ref
-    // store produces for a root-level pseudo-ref, and what `cherry_pick` writes),
-    // so read the file first and only then ask the ref store.
-    if let Ok(text) = std::fs::read_to_string(repo.git_dir().join(name)) {
-        if let Ok(id) = gix::ObjectId::from_hex(text.trim().as_bytes()) {
-            return Some(id);
-        }
-    }
-    repo.find_reference(name)
-        .ok()
-        .and_then(|mut r| r.peel_to_id().ok())
-        .map(|id| id.detach())
 }
 
 /// git's `refresh_cache_or_die()` → `die_resolve_conflict("commit")`: the exact

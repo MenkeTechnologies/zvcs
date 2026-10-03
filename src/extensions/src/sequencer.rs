@@ -943,10 +943,11 @@ pub fn have_finished_the_last_pick(git_dir: &Path) -> bool {
 /// being started — and its advice offers `--skip` only when a pick is actually
 /// stopped (`CHERRY_PICK_HEAD`/`REVERT_HEAD` present). The caller turns the
 /// error into `fatal: <action> failed` and status 128.
-pub fn create(git_dir: &Path) -> Result<std::result::Result<(), ()>> {
+pub fn create(repo: &gix::Repository) -> Result<std::result::Result<(), ()>> {
+    let git_dir = repo.git_dir();
     if let Some(live) = get_last_command(git_dir) {
-        let advise_skip =
-            git_dir.join("REVERT_HEAD").exists() || git_dir.join("CHERRY_PICK_HEAD").exists();
+        let advise_skip = crate::refstore::state_ref_exists(repo, "REVERT_HEAD")
+            || crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD");
         eprintln!("error: {} is already in progress", live.name());
         crate::advice::Advice::SequencerInUse.advise_plain(&format!(
             "try \"git {} (--continue | {}--abort | --quit)\"",
@@ -1497,6 +1498,30 @@ pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) -> 
     Ok(())
 }
 
+/// `repo_get_oid(r, name, …)` for one of the operation state refs
+/// (`CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, `ORIG_HEAD`,
+/// `MERGE_AUTOSTASH`, …): the object id it holds, a symbolic one resolved, or
+/// `None` when it does not exist. The value comes from
+/// [`crate::refstore::state_ref_read`], the root ref file in a files
+/// repository and the worktree stack's record in a reftable one.
+pub fn read_state_oid(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    match crate::refstore::state_ref_read(repo, name).ok().flatten()? {
+        crate::refstore::StateRef::Object(id) => Some(id),
+        crate::refstore::StateRef::Symbolic(target) => repo
+            .find_reference(gix::bstr::ByteSlice::as_bstr(target.as_slice()))
+            .ok()
+            .and_then(|mut r| r.peel_to_id().ok())
+            .map(|id| id.detach()),
+    }
+}
+
+/// `refs_update_ref(…, msg, name, id, NULL, REF_NO_DEREF, …)` for one of the
+/// operation state refs, through [`crate::refstore::state_ref_write`]. `msg`
+/// is the reflog message, `""` for git's `NULL`.
+pub fn write_state_oid(repo: &gix::Repository, name: &str, id: ObjectId, msg: &str) -> Result<()> {
+    crate::refstore::state_ref_write(repo, name, &crate::refstore::StateRef::Object(id), msg)
+}
+
 /// `refs_delete_ref(…, REF_NO_DEREF)` for a root-level pseudo-ref, reporting
 /// whether it had existed.
 ///
@@ -1510,7 +1535,17 @@ pub fn print_advice(repo: &gix::Repository, action: Action, no_commit: bool) -> 
 /// That lock is where `core.packedRefsTimeout` is first read, so a value
 /// `git_config_int()` cannot parse is fatal at this point
 /// ([`packed_refs_lock_timeout`]).
+///
+/// The reftable backend keeps these refs in the stack of the current worktree
+/// and takes no `packed-refs` lock: the deletion goes through
+/// [`crate::refstore::state_ref_delete`], after the `refs_ref_exists()` test
+/// the sequencer's callers make first (sequencer.c:3029-3047).
 pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> Result<bool> {
+    if crate::refstore::is_reftable(repo) {
+        let existed = crate::refstore::state_ref_exists(repo, name);
+        crate::refstore::state_ref_delete(repo, name, "")?;
+        return Ok(existed);
+    }
     packed_refs_lock_timeout(repo)?;
     let mut removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
     if let Ok(reference) = repo.find_reference(name) {

@@ -109,12 +109,11 @@ pub struct Applied {
 /// ("Already up to date."), which is why a `git stash apply` of an
 /// untracked-only stash writes nothing.
 ///
-/// Written as a loose root ref file, not through the ref store: that is what the
-/// files backend produces for a name outside `refs/`, and what
-/// [`crate::sequencer::delete_state_ref`] expects to remove.
+/// `refs_update_ref(…, "", "AUTO_MERGE", …, REF_NO_DEREF, …)` through
+/// [`crate::refstore::state_ref_write`]: the loose root ref file in a files
+/// repository, a record in the worktree's stack in a reftable one.
 pub fn write_auto_merge(repo: &gix::Repository, tree_id: ObjectId) -> Result<()> {
-    std::fs::write(repo.git_dir().join("AUTO_MERGE"), format!("{tree_id}\n"))?;
-    Ok(())
+    crate::refstore::state_ref_write(repo, "AUTO_MERGE", &crate::refstore::StateRef::Object(tree_id), "")
 }
 
 /// The paths the index still holds at a non-zero stage, in index order and

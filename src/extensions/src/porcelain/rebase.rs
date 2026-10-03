@@ -2926,7 +2926,7 @@ fn peel_to_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// merge's tree named for the next command to find.
 fn finish_rebase_refs(repo: &gix::Repository) {
     for name in ["REBASE_HEAD", "AUTO_MERGE"] {
-        let _ = std::fs::remove_file(repo.git_dir().join(name));
+        let _ = crate::refstore::state_ref_delete(repo, name, "");
     }
 }
 
@@ -3851,26 +3851,14 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     } else {
         set_head(repo, Target::Object(st.orig_head), &head_msg)?;
     }
-    // `remove_branch_state(the_repository, 0)` (builtin/rebase.c's `ACTION_ABORT`),
-    // which is `remove_merge_branch_state()` plus `SQUASH_MSG` (branch.c:803-818),
-    // and `finish_rebase()`'s `delete_ref(NULL, "REBASE_HEAD", …)`
-    // (builtin/rebase.c:551). An abort is the one resume path that drops
+    // `remove_branch_state(the_repository, 0)` (builtin/rebase.c's `ACTION_ABORT`;
+    // branch.c:874-879, its `save_autostash_ref(r, "MERGE_AUTOSTASH")` included),
+    // then `finish_rebase()`'s `refs_delete_ref(…, "REBASE_HEAD", …)`
+    // (builtin/rebase.c:564). An abort is the one resume path that drops
     // `REBASE_HEAD` — `--continue` and `--skip` both leave it naming the commit
     // they were applying, which stock does too.
-    for f in [
-        "MERGE_HEAD",
-        "MERGE_RR",
-        "MERGE_MSG",
-        "MERGE_MODE",
-        "AUTO_MERGE",
-        "SQUASH_MSG",
-        "REBASE_HEAD",
-    ] {
-        let _ = std::fs::remove_file(repo.git_dir().join(f));
-    }
-    // `remove_branch_state()`'s `save_autostash_ref(r, "MERGE_AUTOSTASH")`
-    // (branch.c:837), before `finish_rebase()` (builtin/rebase.c:1417-1418).
-    super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
+    super::reset::remove_branch_state(repo, false)?;
+    let _ = crate::refstore::state_ref_delete(repo, "REBASE_HEAD", "");
     // Re-apply any autostash the interrupted rebase saved, onto the restored
     // orig-head tree, before dropping the state dir that holds its reference.
     let autostash = read_autostash(repo);
@@ -4327,20 +4315,11 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
             // `rerere_clear(&merge_rr)`.
             let _ = std::fs::remove_file(repo.git_dir().join("MERGE_RR"));
             reset_to_orig_head(repo, st.orig_head, st.head_name.as_deref())?;
-            for f in [
-                "MERGE_HEAD",
-                "MERGE_RR",
-                "MERGE_MSG",
-                "MERGE_MODE",
-                "AUTO_MERGE",
-                "SQUASH_MSG",
-                "REBASE_HEAD",
-            ] {
-                let _ = std::fs::remove_file(repo.git_dir().join(f));
-            }
-            // `remove_branch_state()`'s `save_autostash_ref(r, "MERGE_AUTOSTASH")`
-            // (branch.c:837), before `finish_rebase()` (builtin/rebase.c:1417-1418).
-            super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
+            // `remove_branch_state(the_repository, 0)` (branch.c:874-879), its
+            // `save_autostash_ref(r, "MERGE_AUTOSTASH")` included, then `finish_rebase()`'s
+            // `refs_delete_ref(…, "REBASE_HEAD", …)` (builtin/rebase.c:564).
+            super::reset::remove_branch_state(repo, false)?;
+            let _ = crate::refstore::state_ref_delete(repo, "REBASE_HEAD", "");
             // `finish_rebase()` (builtin/rebase.c) is what `ACTION_ABORT` ends in, and it
             // runs `apply_autostash(state_dir_path("autostash", opts))` *before*
             // `remove_dir_recursively(state_dir)` — the snapshot's only reference lives in
@@ -4383,8 +4362,8 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
     match run_am_resume(&a, skip)? {
         AmOutcome::Done(tip) => {
             move_to_original_branch(repo, tip, st.head_name.as_deref(), st.onto)?;
-            let _ = std::fs::remove_file(repo.git_dir().join("REBASE_HEAD"));
-            let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
+            let _ = crate::refstore::state_ref_delete(repo, "REBASE_HEAD", "");
+            let _ = crate::refstore::state_ref_delete(repo, "AUTO_MERGE", "");
             // `finish_rebase()`'s `apply_autostash(state_dir_path("autostash", opts))`: the
             // replay is done, so the snapshot goes back on top of the rebased tree.
             if let Some(oid) = autostash {
@@ -4906,7 +4885,7 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         // the instruction being thrown away. `REBASE_HEAD` is *not* dropped here:
         // stock leaves it naming the skipped commit, and this measured the same.
         let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
-        let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
+        let _ = crate::refstore::state_ref_delete(repo, "AUTO_MERGE", "");
     }
     // `ACTION_SKIP` falls through to `sequencer_continue()` (builtin/rebase.c:
     // 1385-1397), so a skip reaches `commit_staged_changes()` too — with a clean
@@ -5023,7 +5002,7 @@ impl Sequencer<'_> {
 
         if is_clean {
             let git_dir = repo.git_dir();
-            let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+            let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
             let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
             if !final_fixup {
                 let _ = std::fs::remove_file(dir.join("message"));
@@ -5097,7 +5076,7 @@ impl Sequencer<'_> {
         let _ = std::fs::remove_file(&amend_path);
         let _ = std::fs::remove_file(dir.join("stopped-sha"));
         let _ = std::fs::remove_file(repo.git_dir().join("MERGE_HEAD"));
-        let _ = std::fs::remove_file(repo.git_dir().join("AUTO_MERGE"));
+        let _ = crate::refstore::state_ref_delete(repo, "AUTO_MERGE", "");
         if final_fixup {
             let _ = std::fs::remove_file(dir.join("message-fixup"));
             let _ = std::fs::remove_file(dir.join("message-squash"));
@@ -5301,8 +5280,9 @@ impl<'r> Sequencer<'r> {
             // the last pick's record and writes no merge of its own.
             let _ = std::fs::remove_file(dir.join("author-script"));
             let git_dir = self.repo.git_dir();
-            for name in ["MERGE_HEAD", "AUTO_MERGE", "REBASE_HEAD"] {
-                let _ = std::fs::remove_file(git_dir.join(name));
+            let _ = std::fs::remove_file(git_dir.join("MERGE_HEAD"));
+            for name in ["AUTO_MERGE", "REBASE_HEAD"] {
+                let _ = crate::refstore::state_ref_delete(self.repo, name, "");
             }
 
             if item.cmd != todo::Cmd::Comment {
@@ -5564,7 +5544,7 @@ impl<'r> Sequencer<'r> {
         // instruction named a commit, which `label`, `reset`, `update-ref` and
         // `exec` never do and `merge -C <commit>` always does.
         if let Some(oid) = item.commit {
-            std::fs::write(self.repo.git_dir().join("REBASE_HEAD"), format!("{oid}\n"))?;
+            crate::sequencer::write_state_oid(self.repo, "REBASE_HEAD", oid, "rebase")?;
         }
         Ok(())
     }
@@ -5869,9 +5849,9 @@ impl<'r> Sequencer<'r> {
                         // so a dropped pick leaves no trace of the merge that
                         // produced it.
                         let git_dir = repo.git_dir();
-                        let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+                        let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
                         let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-                        let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+                        let _ = crate::refstore::state_ref_delete(repo, "AUTO_MERGE", "");
                         eprintln!(
                             "dropping {} {subject} -- patch contents already upstream",
                             oid.to_hex()
@@ -6253,7 +6233,7 @@ impl<'r> Sequencer<'r> {
             std::fs::write(&msg_path, super::format_patch::skip_blank_lines(&raw))?;
             // `refs_delete_ref(…, "CHERRY_PICK_HEAD", …)` right before the child,
             // so the `git commit` inside it does not conclude a pick instead.
-            let _ = std::fs::remove_file(repo.git_dir().join("CHERRY_PICK_HEAD"));
+            let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
             self.term_clear_line();
             let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
             cmd.current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
@@ -6890,10 +6870,10 @@ impl<'r> Sequencer<'r> {
         // pick that goes on to commit has them removed again, a halted one does
         // not. `MERGE_MSG` is also the `-F` file the child below is given.
         std::fs::write(git_dir.join("MERGE_MSG"), message)?;
-        std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{oid}\n"))?;
+        crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", oid, "")?;
         write_author_script(repo, commit)?;
         // `write_rebase_head()` in `do_commit()`'s `res == 1` arm.
-        std::fs::write(git_dir.join("REBASE_HEAD"), format!("{oid}\n"))?;
+        crate::sequencer::write_state_oid(repo, "REBASE_HEAD", oid, "rebase")?;
         self.term_clear_line();
         // `run_git_commit(msg_file, …, flags = 0)`: `-n` (no `VERIFY_MSG`),
         // `--no-gpg-sign`, `-F <MERGE_MSG>`, `--cleanup=verbatim` (no
@@ -7127,10 +7107,11 @@ fn fixup_reflog_message(message: &[u8]) -> String {
 fn make_patch(repo: &gix::Repository, dir: &std::path::Path, commit: &gix::Commit<'_>) -> Result<()> {
     let oid = commit.id().detach();
     std::fs::write(dir.join("stopped-sha"), format!("{oid}\n"))?;
-    // `write_rebase_head()` (sequencer.c:1614-1621). The pseudo-ref is a bare
-    // loose file holding the id, with no reflog — verified against stock, whose
-    // `.git/logs` gains nothing when the stop happens.
-    std::fs::write(repo.git_dir().join("REBASE_HEAD"), format!("{oid}\n"))?;
+    // `write_rebase_head()` (sequencer.c:1614-1621). The root ref is a
+    // loose file holding the id in the files backend and a record in the reftable
+    // one, with no reflog — verified against stock, whose `.git/logs` gains
+    // nothing when the stop happens.
+    crate::sequencer::write_state_oid(repo, "REBASE_HEAD", oid, "rebase")?;
     let parent = commit.parent_ids().next().map(|p| p.detach());
     std::fs::write(dir.join("patch"), stopped_patch(repo, commit, parent)?)?;
     let message = dir.join("message");

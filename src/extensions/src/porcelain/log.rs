@@ -8353,6 +8353,20 @@ pub(super) fn prepare_show_merge(
     // octopus holds one per line). A `ref: ` line reads back as the null id.
     let mut found: Option<(&'static str, ObjectId)> = None;
     for name in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"] {
+        // A reftable repository keeps all but `MERGE_HEAD` in the worktree's
+        // stack: the record itself, a symbolic one refused the same way.
+        if crate::refstore::is_reftable(repo) {
+            match crate::refstore::state_ref_read(repo, name)? {
+                Some(crate::refstore::StateRef::Object(id)) => {
+                    found = Some((name, id));
+                    break;
+                }
+                Some(crate::refstore::StateRef::Symbolic(_)) => {
+                    return Ok(Err(format!("{name} exists but is a symbolic ref")));
+                }
+                None => continue,
+            }
+        }
         let Ok(text) = std::fs::read(repo.git_dir().join(name)) else { continue };
         let first = text.split(|&b| b == b'\n').next().unwrap_or_default();
         if first.starts_with(b"ref:") {

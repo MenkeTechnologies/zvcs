@@ -239,7 +239,6 @@ use anyhow::Result;
 use crate::cstdio::{print, println};
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
-use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
@@ -1210,12 +1209,16 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
 // --abort / --quit
 // ---------------------------------------------------------------------------
 
-/// The state files `remove_merge_branch_state()` (branch.c) unlinks.
-const MERGE_STATE_FILES: &[&str] = &["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE", "AUTO_MERGE"];
+/// The state `remove_merge_branch_state()` (branch.c:863-872) drops: four files
+/// it unlinks, then the `AUTO_MERGE` ref it deletes.
+const MERGE_STATE_FILES: &[&str] = &["MERGE_HEAD", "MERGE_RR", "MERGE_MSG", "MERGE_MODE"];
+const MERGE_STATE_REFS: &[&str] = &["AUTO_MERGE"];
 
-/// The extra state `remove_branch_state()` unlinks on top of the merge state;
-/// `git merge --abort` reaches it by running `git reset --merge`.
-const BRANCH_STATE_FILES: &[&str] = &["SQUASH_MSG", "CHERRY_PICK_HEAD", "REVERT_HEAD"];
+/// The extra state `remove_branch_state()` drops on top of the merge state;
+/// `git merge --abort` reaches it by running `git reset --merge`: `SQUASH_MSG`,
+/// and the sequencer's state refs `sequencer_post_commit_cleanup()` deletes.
+const BRANCH_STATE_FILES: &[&str] = &["SQUASH_MSG"];
+const BRANCH_STATE_REFS: &[&str] = &["CHERRY_PICK_HEAD", "REVERT_HEAD"];
 
 /// `restore_state()` (builtin/merge.c:403-427): rewind the index and worktree to
 /// `head`, then put the `save_state()` snapshot back on top.
@@ -1572,13 +1575,20 @@ fn try_merge_strategy(
     }
 }
 
-fn remove_merge_state(git_dir: &Path, and_branch_state: bool) {
+fn remove_merge_state(repo: &gix::Repository, and_branch_state: bool) {
+    let git_dir = repo.git_dir();
     for name in MERGE_STATE_FILES {
         let _ = std::fs::remove_file(git_dir.join(name));
+    }
+    for name in MERGE_STATE_REFS {
+        let _ = crate::refstore::state_ref_delete(repo, name, "");
     }
     if and_branch_state {
         for name in BRANCH_STATE_FILES {
             let _ = std::fs::remove_file(git_dir.join(name));
+        }
+        for name in BRANCH_STATE_REFS {
+            let _ = crate::refstore::state_ref_delete(repo, name, "");
         }
         let _ = std::fs::remove_dir_all(git_dir.join("sequencer"));
     }
@@ -1589,7 +1599,7 @@ fn remove_merge_state(git_dir: &Path, and_branch_state: bool) {
 fn quit() -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    remove_merge_state(repo.git_dir(), false);
+    remove_merge_state(&repo, false);
     // `remove_merge_branch_state()` (builtin/merge.c:1452) ends in
     // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837).
     super::reset::save_autostash_ref(&repo, MERGE_AUTOSTASH)?;
@@ -1649,7 +1659,7 @@ fn abort() -> Result<ExitCode> {
     // unconditionally, so aborting twice leaves two `reset: moving to HEAD`
     // entries.
     super::checkout::append_head_log(&repo, Some(head_id), Some(head_id), "reset: moving to HEAD");
-    remove_merge_state(repo.git_dir(), true);
+    remove_merge_state(&repo, true);
     // `apply_autostash_oid(stash_oid_hex)` (builtin/merge.c:1438-1441).
     if let Some(id) = stash {
         super::stash::apply_autostash(&repo, id, false)?;
@@ -1952,7 +1962,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     }
 
     // builtin/merge.c:1486-1492, the same shape for an unfinished cherry-pick.
-    if repo.git_dir().join("CHERRY_PICK_HEAD").exists() {
+    if crate::refstore::state_ref_exists(&repo, "CHERRY_PICK_HEAD") {
         eprintln!("fatal: You have not concluded your cherry-pick (CHERRY_PICK_HEAD exists).");
         if crate::advice::Advice::ResolveConflict.enabled_in(&repo) {
             eprintln!("Please, commit your changes before you merge.");
@@ -2500,7 +2510,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // (builtin/merge.c:539), and *that* apply is a `git stash apply` child that
     // records its own `AUTO_MERGE`. Removing the merge state first would leave
     // the file behind, which is exactly what `git pull --autostash` was doing.
-    remove_merge_state(repo.git_dir(), false);
+    remove_merge_state(&repo, false);
     // …whose last step is `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837);
     // `end_autostash()` above already consumed the ref, as `finish()` does.
     super::reset::save_autostash_ref(&repo, MERGE_AUTOSTASH)?;
@@ -3458,7 +3468,7 @@ fn finalize_clean(
     // 1038), in that order — `finish()` re-applies the autostash, whose `git
     // stash apply` child writes its own `AUTO_MERGE`, and only then is the merge
     // state cleared. Clearing first left that file behind.
-    remove_merge_state(git_dir, false);
+    remove_merge_state(repo, false);
     // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837), which finds the
     // ref already consumed by `end_autostash()`.
     super::reset::save_autostash_ref(repo, MERGE_AUTOSTASH)?;

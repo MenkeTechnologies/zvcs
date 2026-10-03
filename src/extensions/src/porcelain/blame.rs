@@ -4181,7 +4181,7 @@ fn setup_revisions(
 fn lookup_other_head(repo: &gix::Repository) -> Option<&'static str> {
     ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"]
         .into_iter()
-        .find(|name| repo.try_find_reference(*name).ok().flatten().is_some())
+        .find(|name| crate::refstore::state_ref_read(repo, name).ok().flatten().is_some())
 }
 
 /// One `-`-leading operand, routed the way `setup_revisions()` routes it: first

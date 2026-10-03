@@ -1575,7 +1575,7 @@ fn status_report(
                         })
                         .collect()
                 }),
-                repo.git_dir(),
+                &repo,
                 sparse_checkout,
                 untracked,
                 show_ignored,
@@ -4227,7 +4227,7 @@ impl ProgressState {
         }
 
         state.cherry_pick = sequencer_head(repo, "CHERRY_PICK_HEAD");
-        state.cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD").exists();
+        state.cherry_pick_head = crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD");
         state.revert = sequencer_head(repo, "REVERT_HEAD");
 
         // `wt_status_check_bisect()`.
@@ -4281,15 +4281,13 @@ fn read_state_branch(repo: &gix::Repository, rela: &str) -> Option<String> {
 /// `sequencer_get_last_command()`: a stopped sequencer whose head ref is already gone
 /// still reports the operation, then with no commit to name.
 fn sequencer_head(repo: &gix::Repository, name: &str) -> Option<Option<String>> {
-    if let Ok(text) = std::fs::read_to_string(repo.git_dir().join(name)) {
-        if let Ok(id) = gix::ObjectId::from_hex(text.trim().as_bytes()) {
-            return Some(Some(
-                repo.find_object(id)
-                    .ok()
-                    .map(|obj| obj.id().shorten_or_id().to_string())
-                    .unwrap_or_else(|| id.to_hex_with_len(7).to_string()),
-            ));
-        }
+    if let Some(id) = crate::sequencer::read_state_oid(repo, name) {
+        return Some(Some(
+            repo.find_object(id)
+                .ok()
+                .map(|obj| obj.id().shorten_or_id().to_string())
+                .unwrap_or_else(|| id.to_hex_with_len(7).to_string()),
+        ));
     }
     let todo = repo.git_dir().join("sequencer/todo");
     let text = std::fs::read_to_string(todo).ok()?;
@@ -4429,7 +4427,7 @@ fn abbrev_oid_in_line(repo: &gix::Repository, line: &str) -> String {
 /// "Changes not staged for commit" set) and a detached `HEAD`; a clean stop at an
 /// `edit` is "editing", not "splitting".
 fn split_commit_in_progress(
-    git_dir: &std::path::Path,
+    repo: &gix::Repository,
     head_state: &HeadState,
     workdir_dirty: bool,
 ) -> bool {
@@ -4437,12 +4435,18 @@ fn split_commit_in_progress(
         return false;
     }
     let line = |rela: &str| -> Option<String> {
-        std::fs::read_to_string(git_dir.join(rela))
+        std::fs::read_to_string(repo.git_dir().join(rela))
             .ok()
             .map(|s| s.trim().to_string())
     };
-    // Both refs have to resolve; git bails when either read fails.
-    let (Some(head), Some(orig_head)) = (line("HEAD"), line("ORIG_HEAD")) else {
+    // `refs_read_ref_full(…, RESOLVE_REF_READING | RESOLVE_REF_NO_RECURSE, …)`:
+    // both refs have to hold an object id; git bails when either read fails or
+    // is a symbolic ref.
+    let object = |name: &str| match crate::refstore::state_ref_read(repo, name).ok().flatten() {
+        Some(crate::refstore::StateRef::Object(id)) => Some(id.to_string()),
+        _ => None,
+    };
+    let (Some(head), Some(orig_head)) = (object("HEAD"), object("ORIG_HEAD")) else {
         return false;
     };
     let (Some(amend), Some(rebase_orig_head)) = (
@@ -4507,8 +4511,9 @@ fn render_long(
     // `show_rebase_information()`'s block, rendered by the caller because it reads the
     // todo files and abbreviates their object ids.
     rebase_info: &str,
-    // `$GIT_DIR`, for the rebase state files the banners read.
-    git_dir: &std::path::Path,
+    // The repository: `$GIT_DIR`'s rebase state files the banners read, and
+    // the `HEAD`/`ORIG_HEAD` refs `split_commit_in_progress()` compares.
+    repo: &gix::Repository,
     // `s->state.sparse_checkout_percentage`, as [`sparse_checkout_state`] computed it.
     sparse_checkout: Option<Option<u32>>,
     untracked_mode: Untracked,
@@ -4547,6 +4552,7 @@ fn render_long(
     // `submodule summary` fork is real — see [`LongSink`].
     sink: LongSink,
 ) -> String {
+    let git_dir = repo.git_dir();
     let mut out = String::new();
     // When columns are active, the untracked/ignored path lists are replaced by a
     // sentinel line, laid out through the shared engine, and spliced back in after
@@ -4690,7 +4696,7 @@ fn render_long(
             if hints {
                 out.push_str(&h("  (all conflicts fixed: run \"git rebase --continue\")\n"));
             }
-        } else if split_commit_in_progress(git_dir, head_state, !unstaged.is_empty()) {
+        } else if split_commit_in_progress(repo, head_state, !unstaged.is_empty()) {
             out.push_str(&h(&match &progress.branch {
                 Some(branch) => format!(
                     "You are currently splitting a commit while rebasing branch '{branch}' on '{}'.\n",

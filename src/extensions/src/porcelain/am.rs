@@ -3665,20 +3665,9 @@ fn clean_index(repo: &gix::Repository, ctx: &Ctx, head: &str, remote: &str) -> R
     // `remove_merge_branch_state()` plus `SQUASH_MSG` (branch.c:803-829). Without
     // it the `AUTO_MERGE` the three-way fallback recorded for the conflict being
     // discarded survives the skip, and `git diff AUTO_MERGE` then reports against
-    // a merge that no longer exists.
-    for name in [
-        "MERGE_HEAD",
-        "MERGE_RR",
-        "MERGE_MSG",
-        "MERGE_MODE",
-        "AUTO_MERGE",
-        "SQUASH_MSG",
-    ] {
-        let _ = std::fs::remove_file(repo.git_dir().join(name));
-    }
-    // …and `remove_merge_branch_state()`'s last step, `save_autostash_ref(r,
-    // "MERGE_AUTOSTASH")` (branch.c:837).
-    super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
+    // a merge that no longer exists. Its last step is `save_autostash_ref(r,
+    // "MERGE_AUTOSTASH")` (branch.c:871).
+    super::reset::remove_branch_state(repo, false)?;
     Ok(true)
 }
 

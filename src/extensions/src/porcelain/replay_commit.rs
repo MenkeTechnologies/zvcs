@@ -146,16 +146,12 @@ pub(crate) fn run_git_commit(
 /// alone, so a stopped **revert** leaves `whence` at `FROM_COMMIT` and its
 /// concluding commit is logged as a plain `commit:` — which is exactly what
 /// stock writes (`commit: Revert "…"`, measured against 2.55.0).
-fn whence_reflog_default(git_dir: &std::path::Path) -> &'static str {
-    if !git_dir.join("CHERRY_PICK_HEAD").exists() {
+fn whence_reflog_default(repo: &gix::Repository) -> &'static str {
+    if !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
         return "commit";
     }
-    let read = |name: &str| {
-        std::fs::read_to_string(git_dir.join(name))
-            .ok()
-            .map(|raw| raw.trim().to_string())
-    };
-    let rebase_pick = git_dir.join("rebase-merge").exists()
+    let read = |name: &str| crate::sequencer::read_state_oid(repo, name);
+    let rebase_pick = repo.git_dir().join("rebase-merge").exists()
         && match (read("REBASE_HEAD"), read("CHERRY_PICK_HEAD")) {
             (Some(a), Some(b)) => a == b,
             _ => false,
@@ -195,9 +191,9 @@ fn whence_reflog_default(git_dir: &std::path::Path) -> &'static str {
 /// resumed revert `commit: <subject>` — *not* `cherry-pick:`/`revert:`, which is
 /// what the sequencer's own in-process picks write and what this port used to
 /// write here as well.
-pub(crate) fn continue_reflog_action(git_dir: &std::path::Path) -> String {
+pub(crate) fn continue_reflog_action(repo: &gix::Repository) -> String {
     std::env::var("GIT_REFLOG_ACTION")
         .ok()
         .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| whence_reflog_default(git_dir).to_string())
+        .unwrap_or_else(|| whence_reflog_default(repo).to_string())
 }

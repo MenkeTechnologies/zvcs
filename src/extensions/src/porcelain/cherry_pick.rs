@@ -917,7 +917,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         let git_dir = repo.git_dir();
         // `create_seq_dir` refuses over a live sequence; `cmd_cherry_pick` turns
         // that `-1` into `die(_("cherry-pick failed"))`.
-        if crate::sequencer::create(git_dir)?.is_err() {
+        if crate::sequencer::create(&repo)?.is_err() {
             return Ok(sequencer_failed_tail());
         }
         crate::sequencer::save_head(git_dir, head_id)?;
@@ -1438,10 +1438,7 @@ fn pick_one(
                         // removed again by the commit, so it is only
                         // persisted on the stop.
                         if !opts.no_commit {
-                            std::fs::write(
-                                repo.git_dir().join("CHERRY_PICK_HEAD"),
-                                format!("{pick_id}\n"),
-                            )?;
+                            crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
                         }
                         crate::sequencer::print_advice(&repo, crate::sequencer::Action::Pick, opts.no_commit)?;
                     }
@@ -1541,7 +1538,7 @@ fn pick_one(
         // claiming a pick was in progress — `git status` reports it, and
         // `git cherry-pick --abort` then has state stock never wrote.
         if !opts.no_commit {
-            std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+            crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", pick_id, "")?;
         }
 
         // git's `append_conflicts_hint()` (sequencer.c:721-744): a blank line,
@@ -1614,9 +1611,9 @@ fn pick_one(
                 // both `MERGE_MSG` and `AUTO_MERGE` before it reports the
                 // drop, so a strategy child's `MERGE_MSG` does not survive.
                 let git_dir = repo.git_dir();
-                let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+                let _ = crate::refstore::state_ref_delete(&repo, "CHERRY_PICK_HEAD", "");
                 let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
-                let _ = std::fs::remove_file(git_dir.join("AUTO_MERGE"));
+                let _ = crate::refstore::state_ref_delete(&repo, "AUTO_MERGE", "");
                 eprintln!(
                     "dropping {pick_id} {subject} -- patch contents already upstream"
                 );
@@ -1650,10 +1647,7 @@ fn pick_one(
     // which is why the non-editor path above can skip it.
     if super::replay_commit::should_edit(opts.edit_given, super::replay_commit::Action::Pick) {
         state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
-        std::fs::write(
-            repo.git_dir().join("CHERRY_PICK_HEAD"),
-            format!("{pick_id}\n"),
-        )?;
+        crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
         let code = super::replay_commit::run_git_commit(
             super::replay_commit::Action::Pick,
             opts.gpg_sign,
@@ -1716,7 +1710,7 @@ fn pick_one(
         let git_dir = repo.git_dir();
         let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
         if merge.is_none() {
-            let _ = std::fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+            let _ = crate::refstore::state_ref_delete(&repo, "CHERRY_PICK_HEAD", "");
         }
     }
 
@@ -1842,28 +1836,10 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
         // index or the worktree, and succeeds even with nothing in progress.
         Verb::Quit => {
             crate::sequencer::remove_state(&git_dir);
-            // `remove_branch_state()` (branch.c) is the whole of it: the two
-            // sequencer pseudo-refs `sequencer_post_commit_cleanup()` drops, then
-            // `MERGE_HEAD`, `MERGE_RR`, `MERGE_MSG`, `MERGE_MODE`, `SQUASH_MSG`
-            // and `AUTO_MERGE`. Measured against stock 2.55.0: `cherry-pick
-            // --quit` in a repository holding a conflicted merge leaves none of
-            // those seven behind, so a `--quit` that forgets `MERGE_HEAD` leaves
-            // the worktree claiming a merge is still in progress.
-            for name in [
-                "CHERRY_PICK_HEAD",
-                "REVERT_HEAD",
-                "MERGE_HEAD",
-                "MERGE_RR",
-                "MERGE_MSG",
-                "MERGE_MODE",
-                "SQUASH_MSG",
-                "AUTO_MERGE",
-            ] {
-                let _ = std::fs::remove_file(git_dir.join(name));
-            }
-            // `remove_merge_branch_state()` ends in `save_autostash_ref(r,
-            // "MERGE_AUTOSTASH")` (branch.c:837).
-            super::reset::save_autostash_ref(&repo, "MERGE_AUTOSTASH")?;
+            // `remove_branch_state(the_repository, 0)` (branch.c:874-879):
+            // the sequencer's state refs, `SQUASH_MSG`, the merge state files,
+            // `AUTO_MERGE`, and `MERGE_AUTOSTASH` filed as a stash entry.
+            super::reset::remove_branch_state(&repo, false)?;
             Ok(ExitCode::SUCCESS)
         }
         Verb::Continue => sequencer_continue(&repo),
@@ -1909,7 +1885,7 @@ fn sequencer_continue(repo: &gix::Repository) -> Result<ExitCode> {
         eprintln!("error: {msg}");
         return Ok(sequencer_failed_tail());
     }
-    if git_dir.join("CHERRY_PICK_HEAD").exists() || git_dir.join("REVERT_HEAD").exists() {
+    if crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") || crate::refstore::state_ref_exists(repo, "REVERT_HEAD") {
         if let Err(code) = continue_single_pick(repo, &git_dir)? {
             return Ok(code);
         }
@@ -2012,7 +1988,7 @@ fn sequencer_rollback(repo: &gix::Repository) -> Result<ExitCode> {
     let git_dir = repo.git_dir().to_owned();
     let head_file = crate::sequencer::head_path(&git_dir);
     let Ok(text) = std::fs::read_to_string(&head_file) else {
-        return rollback_single_pick(repo, &git_dir);
+        return rollback_single_pick(repo);
     };
     let Some(oid) = text
         .lines()
@@ -2037,11 +2013,10 @@ fn sequencer_rollback(repo: &gix::Repository) -> Result<ExitCode> {
 }
 
 /// `rollback_single_pick()`: undo one stopped pick, or report that none is.
-fn rollback_single_pick(
-    repo: &gix::Repository,
-    git_dir: &std::path::Path,
-) -> Result<ExitCode> {
-    if !git_dir.join("CHERRY_PICK_HEAD").exists() && !git_dir.join("REVERT_HEAD").exists() {
+fn rollback_single_pick(repo: &gix::Repository) -> Result<ExitCode> {
+    if !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD")
+        && !crate::refstore::state_ref_exists(repo, "REVERT_HEAD")
+    {
         return Ok(sequencer_failed("no cherry-pick or revert in progress"));
     }
     let head = repo.head_id()?.detach();
@@ -2056,7 +2031,7 @@ fn rollback_single_pick(
 /// state there is nothing left to skip, so git points at `--continue` instead.
 fn sequencer_skip(repo: &gix::Repository) -> Result<ExitCode> {
     let git_dir = repo.git_dir().to_owned();
-    if !git_dir.join("CHERRY_PICK_HEAD").exists() {
+    if !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
         if crate::sequencer::get_last_command(&git_dir) != Some(crate::sequencer::Action::Pick) {
             return Ok(sequencer_failed("no cherry-pick in progress"));
         }
@@ -2112,8 +2087,8 @@ fn continue_single_pick(
 ) -> Result<std::result::Result<(), ExitCode>> {
     let stopped = ["CHERRY_PICK_HEAD", "REVERT_HEAD"]
         .into_iter()
-        .find_map(|name| std::fs::read_to_string(git_dir.join(name)).ok());
-    let Some(raw) = stopped else {
+        .find(|name| crate::refstore::state_ref_exists(repo, name));
+    let Some(stopped) = stopped else {
         return Ok(Err(sequencer_failed("no cherry-pick or revert in progress")));
     };
     // The child is `git commit`, whose `git_config(git_commit_config, &s)`
@@ -2121,8 +2096,8 @@ fn continue_single_pick(
     // callback refuses (`diff.context=no`) dies there, ahead of the
     // unmerged-paths report below.
     crate::status_config::validate_commit(repo).map_err(|r| r.into_error())?;
-    let pick_id = ObjectId::from_hex(raw.trim().as_bytes())
-        .map_err(|e| anyhow::anyhow!("invalid CHERRY_PICK_HEAD: {e}"))?;
+    let pick_id = crate::sequencer::read_state_oid(repo, stopped)
+        .ok_or_else(|| anyhow::anyhow!("invalid {stopped}"))?;
     let pick = repo.find_commit(pick_id)?;
 
     // The resolution must be complete: any conflict stage left blocks the
@@ -2164,7 +2139,7 @@ fn continue_single_pick(
     // it — only `git commit --allow-empty` or `--skip` moves past that.
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     if tree_id == head_tree {
-        let whence = match std::fs::read_to_string(git_dir.join("REBASE_HEAD")).is_ok() {
+        let whence = match crate::refstore::state_ref_exists(repo, "REBASE_HEAD") {
             true => super::commit::Whence::RebasePick,
             false => super::commit::Whence::CherryPick,
         };
@@ -2199,7 +2174,7 @@ fn continue_single_pick(
     // wording is `builtin/commit.c`'s whence-derived default rather than the
     // `cherry-pick:` the *unstopped* picks above write. See
     // [`super::replay_commit::continue_reflog_action`].
-    let action = super::replay_commit::continue_reflog_action(git_dir);
+    let action = super::replay_commit::continue_reflog_action(repo);
     let reflog = gix::reference::log::message(&action, message.as_bstr(), 1);
     advance_head(repo, head_id, new_id, reflog)?;
     // `sequencer_post_commit_cleanup()`, which is what the child `git commit`
@@ -2272,7 +2247,7 @@ fn stop_empty(
     message: &BString,
 ) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
-    std::fs::write(git_dir.join("CHERRY_PICK_HEAD"), format!("{pick_id}\n"))?;
+    crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", pick_id, "")?;
     std::fs::write(git_dir.join("MERGE_MSG"), &message[..])?;
 
     // ```c

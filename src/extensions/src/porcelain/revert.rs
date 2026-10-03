@@ -571,7 +571,7 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         // `create_seq_dir()` / `save_head()` / `save_opts()` /
         // `update_abort_safety_file()`, in `sequencer_pick_revisions()`'s order.
         let git_dir = repo.git_dir();
-        if crate::sequencer::create(git_dir)?.is_err() {
+        if crate::sequencer::create(&repo)?.is_err() {
             eprintln!("fatal: revert failed");
             return Ok(ExitCode::from(128));
         }
@@ -714,28 +714,10 @@ fn run_mode(repo: &gix::Repository, mode: Cmd) -> Result<ExitCode> {
         // `cmd == 'q'`: `sequencer_remove_state()` then `remove_branch_state()`.
         Cmd::Quit => {
             crate::sequencer::remove_state(&git_dir);
-            // `remove_branch_state()` (branch.c) in full: the two sequencer
-            // pseudo-refs `sequencer_post_commit_cleanup()` drops, then
-            // `MERGE_HEAD`, `MERGE_RR`, `MERGE_MSG`, `MERGE_MODE`, `SQUASH_MSG`
-            // and `AUTO_MERGE`. Measured against stock 2.55.0: `revert --quit` in
-            // a repository holding a conflicted merge leaves none of the seven,
-            // so forgetting `MERGE_HEAD` leaves the worktree claiming a merge is
-            // still in progress.
-            for name in [
-                "CHERRY_PICK_HEAD",
-                "REVERT_HEAD",
-                "MERGE_HEAD",
-                "MERGE_RR",
-                "MERGE_MSG",
-                "MERGE_MODE",
-                "SQUASH_MSG",
-                "AUTO_MERGE",
-            ] {
-                let _ = std::fs::remove_file(git_dir.join(name));
-            }
-            // `remove_merge_branch_state()` ends in `save_autostash_ref(r,
-            // "MERGE_AUTOSTASH")` (branch.c:837).
-            super::reset::save_autostash_ref(repo, "MERGE_AUTOSTASH")?;
+            // `remove_branch_state(the_repository, 0)` (branch.c:874-879):
+            // the sequencer's state refs, `SQUASH_MSG`, the merge state files,
+            // `AUTO_MERGE`, and `MERGE_AUTOSTASH` filed as a stash entry.
+            super::reset::remove_branch_state(repo, false)?;
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Abort => sequencer_rollback(repo, &git_dir),
@@ -763,7 +745,7 @@ fn sequencer_rollback(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
     let head_file = crate::sequencer::head_path(git_dir);
     let Ok(text) = std::fs::read_to_string(&head_file) else {
         // `rollback_single_pick()`.
-        if !git_dir.join("REVERT_HEAD").exists() && !git_dir.join("CHERRY_PICK_HEAD").exists() {
+        if !crate::refstore::state_ref_exists(repo, "REVERT_HEAD") && !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
             eprintln!("error: no cherry-pick or revert in progress");
             eprintln!("fatal: revert failed");
             return Ok(ExitCode::from(128));
@@ -796,7 +778,7 @@ fn sequencer_rollback(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
 /// `sequencer_skip()`: drop the stopped revert, then resume the sequence if one
 /// is live.
 fn sequencer_skip(repo: &gix::Repository, git_dir: &std::path::Path) -> Result<ExitCode> {
-    if !git_dir.join("REVERT_HEAD").exists() {
+    if !crate::refstore::state_ref_exists(repo, "REVERT_HEAD") {
         if crate::sequencer::get_last_command(git_dir) != Some(crate::sequencer::Action::Revert) {
             eprintln!("error: no revert in progress");
             eprintln!("fatal: revert failed");
@@ -834,7 +816,7 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
         eprintln!("fatal: revert failed");
         return Ok(ExitCode::from(128));
     }
-    if git_dir.join("REVERT_HEAD").exists() || git_dir.join("CHERRY_PICK_HEAD").exists() {
+    if crate::refstore::state_ref_exists(repo, "REVERT_HEAD") || crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
         if let Err(code) = continue_single_pick(repo, git_dir)? {
             return Ok(code);
         }
@@ -883,7 +865,7 @@ fn continue_single_pick(
     repo: &gix::Repository,
     git_dir: &std::path::Path,
 ) -> Result<std::result::Result<(), ExitCode>> {
-    if !git_dir.join("REVERT_HEAD").exists() && !git_dir.join("CHERRY_PICK_HEAD").exists() {
+    if !crate::refstore::state_ref_exists(repo, "REVERT_HEAD") && !crate::refstore::state_ref_exists(repo, "CHERRY_PICK_HEAD") {
         eprintln!("error: no cherry-pick or revert in progress");
         eprintln!("fatal: revert failed");
         return Ok(Err(ExitCode::from(128)));
@@ -954,7 +936,7 @@ fn continue_single_pick(
                 // See [`super::replay_commit::continue_reflog_action`].
                 message: format!(
                     "{}: {subject}",
-                    super::replay_commit::continue_reflog_action(git_dir)
+                    super::replay_commit::continue_reflog_action(repo)
                 )
                 .into(),
             },
@@ -1324,7 +1306,7 @@ fn revert_one(
         crate::index_racy::write(repo, &mut new_index)?;
 
         let git_dir = repo.git_dir();
-        std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
+        crate::sequencer::write_state_oid(repo, "REVERT_HEAD", target_id, "")?;
 
         // `append_conflicts_hint()` (sequencer.c:721-744): a blank line, the
         // header, then one commented line per path the **index** still holds at
@@ -1373,7 +1355,7 @@ fn revert_one(
 
     if o.no_commit {
         let git_dir = repo.git_dir();
-        std::fs::write(git_dir.join("REVERT_HEAD"), format!("{target_id}\n"))?;
+        crate::sequencer::write_state_oid(repo, "REVERT_HEAD", target_id, "")?;
         std::fs::write(git_dir.join("MERGE_MSG"), &message)?;
         return Ok(Step::Done);
     }
@@ -1489,9 +1471,8 @@ fn revert_one(
     // `AUTO_MERGE` is *not* one of them: `sequencer_post_commit_cleanup()` only
     // runs when a pick was stopped, and a revert that lands never was — so stock
     // leaves the merge result behind for `git rev-parse AUTO_MERGE` to find.
-    for f in ["REVERT_HEAD", "MERGE_MSG"] {
-        let _ = std::fs::remove_file(repo.git_dir().join(f));
-    }
+    let _ = crate::refstore::state_ref_delete(repo, "REVERT_HEAD", "");
+    let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
 
     print_summary(
         repo,

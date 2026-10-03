@@ -13,14 +13,13 @@
 //! | module          | contents                                                         |
 //! |-----------------|------------------------------------------------------------------|
 //! | this one        | [`Backend`], its construction, [`Error`], the lazy [`WriteConfig`] |
-//! | `worktree`      | [`parse_worktree_ref()`] and [`Backend::backend_for()`]          |
+//! | `worktree`      | [`parse_worktree_ref()`], [`Backend::backend_for()`], root-ref names |
+//! | `common`        | reads under a held stack, refname availability, log records     |
 //! | `find`          | reading one reference                                            |
 //! | `iter`          | iterating references, merging worktree and main stack            |
 //! | `log`           | reading reflogs                                                  |
 //! | `transaction`   | preparing and committing transactions                            |
 //! | `maintenance`   | reflog creation/deletion/expiry, optimize, rename/copy, fsck     |
-//!
-//! Operations not ported yet fail with [`Error::Unsupported`].
 //!
 //! Like git, every operation reloads the stacks it reads from (`reload` of
 //! [`Backend::backend_for()`]); a stack is behind a mutex so that a reload, which
@@ -35,6 +34,7 @@ use std::{
 use gix_object::bstr::BString;
 use gix_reftable::{Stack, StackOptions, WriteOptions};
 
+mod common;
 mod find;
 mod iter;
 mod log;
@@ -47,6 +47,7 @@ pub use log::ReflogEntry;
 pub use maintenance::{ExpireFlags, ExpirePolicy, FsckReport};
 pub use transaction::TransactionData;
 pub use worktree::{WorktreeType, parse_worktree_ref};
+pub(crate) use worktree::{is_pseudo_ref, is_root_ref};
 
 /// One stack of the backend, git's `struct reftable_backend`, shared between the
 /// backend and the operations using it. Lock it with [`lock()`].
@@ -64,25 +65,12 @@ pub fn lock(stack: &StackRef) -> MutexGuard<'_, Stack> {
 /// The error of backend operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The operation is not ported to the reftable backend yet.
-    #[error("reftable: {operation} is not supported yet")]
-    Unsupported {
-        /// The name of the backend operation, as git's `refs_be_reftable` calls it.
-        operation: &'static str,
-    },
     /// The reftable library failed; its message is `reftable_error_str()`.
     #[error(transparent)]
     Reftable(#[from] gix_reftable::Error),
     /// A file system operation of the backend itself failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-}
-
-impl Error {
-    /// The error of an operation that is not ported yet.
-    pub(crate) fn unsupported(operation: &'static str) -> Self {
-        Error::Unsupported { operation }
-    }
 }
 
 /// The options git parses lazily before the first write or compaction,

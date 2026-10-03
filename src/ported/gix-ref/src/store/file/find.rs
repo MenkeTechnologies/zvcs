@@ -166,7 +166,7 @@ impl file::Store {
             .unwrap_or(partial_name)
             .construct_full_name_ref(inbetween, path_buf, consider_pseudo_ref);
         if let Some(backend) = self.reftable.as_deref() {
-            if !is_pseudo_ref_file(full_name.as_bstr()) {
+            if !crate::store_impl::reftable::is_pseudo_ref(full_name.as_bstr()) {
                 return self.find_in_reftable(backend, full_name);
             }
         }
@@ -220,13 +220,6 @@ impl file::Store {
             )),
         }
     }
-}
-
-/// `is_pseudo_ref()` (refs.c:887-900): `FETCH_HEAD` and `MERGE_HEAD` are files
-/// in the git directory whatever the ref storage format, and
-/// `refs_read_raw_ref()` reads them as such (refs.c:2099-2101).
-pub(crate) fn is_pseudo_ref_file(name: &[u8]) -> bool {
-    name == b"FETCH_HEAD" || name == b"MERGE_HEAD"
 }
 
 /// Reading from the reftable backend.

@@ -102,10 +102,6 @@ pub(in crate::store_impl::file) struct Edit {
     /// `git update-ref --no-deref HEAD $(git rev-parse HEAD)` appends `<id> <id> <ident> <ts>`
     /// to `.git/logs/HEAD` and leaves `HEAD` detached.
     previous_is_symbolic: bool,
-    /// In a reftable store, the whole prepared transaction: its stack locks and git's view of its
-    /// updates. Prepare leaves it on the first edit, as [`Transaction`] has no field for it, and
-    /// commit takes it from there; dropping it with the edits rolls the transaction back.
-    reftable: Option<Box<crate::store_impl::reftable::TransactionData>>,
 }
 
 impl Edit {
@@ -148,6 +144,7 @@ impl file::Store {
             packed_buffer: None,
             updates: None,
             packed_refs: PackedRefs::default(),
+            reftable: None,
         }
     }
 }

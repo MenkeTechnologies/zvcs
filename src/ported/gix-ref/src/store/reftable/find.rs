@@ -21,7 +21,7 @@ impl Backend {
     ///
     /// The target of a symbolic reference is the referent as stored, not
     /// validated: whoever follows it decides what an invalid one means.
-    fn read_ref(&self, stack: &gix_reftable::Stack, refname: &[u8]) -> Result<Option<Target>, Error> {
+    pub(super) fn read_ref(&self, stack: &gix_reftable::Stack, refname: &[u8]) -> Result<Option<Target>, Error> {
         let mut it = stack.ref_iterator()?;
         if !it.seek_ref(refname)? {
             return Ok(None);

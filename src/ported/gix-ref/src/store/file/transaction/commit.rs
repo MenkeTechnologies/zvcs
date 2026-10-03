@@ -31,11 +31,9 @@ impl Transaction<'_, '_> {
 
     fn commit_inner(mut self, committer: Option<gix_actor::SignatureRef<'_>>) -> Result<Vec<RefEdit>, Error> {
         if let Some(backend) = self.store.reftable() {
-            let updates = self.updates.as_mut().expect("BUG: must call prepare before commit");
-            return match updates.first_mut().and_then(|first| first.reftable.take()) {
-                Some(data) => backend.transaction_finish(*data, committer),
-                None => Ok(Vec::new()),
-            };
+            assert!(self.updates.is_some(), "BUG: must call prepare before commit");
+            let data = self.reftable.take().expect("prepare keeps the reftable transaction");
+            return backend.transaction_finish(data, committer);
         }
         // `files_transaction_finish()` opens with `files_ref_store_write_options(refs)`
         // (refs/files-backend.c:3327, v2.56.0), the lazy config read that dies on a bad

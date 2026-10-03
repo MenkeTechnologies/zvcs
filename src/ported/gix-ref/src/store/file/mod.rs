@@ -258,6 +258,10 @@ pub struct Transaction<'s, 'p> {
     packed_buffer: Option<packed::SharedBufferSnapshot>,
     updates: Option<Vec<transaction::Edit>>,
     packed_refs: transaction::PackedRefs<'p>,
+    /// In a store with the reftable backend, the prepared transaction: its stack locks and git's
+    /// view of its updates (`struct reftable_transaction_data`). Commit consumes it; dropping it
+    /// rolls the transaction back.
+    reftable: Option<crate::store_impl::reftable::TransactionData>,
 }
 
 ///

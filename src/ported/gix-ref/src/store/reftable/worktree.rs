@@ -19,8 +19,32 @@ pub enum WorktreeType {
 }
 
 /// `is_root_ref_syntax()` (refs.c:902-912): only uppercase letters, `-` and `_`.
-fn is_root_ref_syntax(name: &[u8]) -> bool {
+pub(crate) fn is_root_ref_syntax(name: &[u8]) -> bool {
     name.iter().all(|&c| c.is_ascii_uppercase() || c == b'-' || c == b'_')
+}
+
+/// `is_pseudo_ref()` (refs.c:887-900): the two root refs that stay files in
+/// the git directory whatever the backend, and that `refs_read_raw_ref()`
+/// reads as such (refs.c:2099-2101).
+pub(crate) fn is_pseudo_ref(name: &[u8]) -> bool {
+    name == b"FETCH_HEAD" || name == b"MERGE_HEAD"
+}
+
+/// `is_root_ref()` (refs.c:914-937): a name of root syntax, other than a
+/// pseudo ref, that ends in `_HEAD` or is one of the irregular root refs.
+pub(crate) fn is_root_ref(name: &[u8]) -> bool {
+    const IRREGULAR_ROOT_REFS: [&[u8]; 6] = [
+        b"HEAD",
+        b"AUTO_MERGE",
+        b"BISECT_EXPECTED_REV",
+        b"NOTES_MERGE_PARTIAL",
+        b"NOTES_MERGE_REF",
+        b"MERGE_AUTOSTASH",
+    ];
+    if !is_root_ref_syntax(name) || is_pseudo_ref(name) {
+        return false;
+    }
+    name.ends_with(b"_HEAD") || IRREGULAR_ROOT_REFS.contains(&name)
 }
 
 /// `is_per_worktree_ref()` (refs.c:880-885).

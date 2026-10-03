@@ -12,17 +12,17 @@
 //! that is dereferenced is split *here*, after its stack is locked, and an
 //! update of the branch `HEAD` points to gains a log-only update of `HEAD`.
 
-use std::{
-    cell::Cell,
-    collections::{BTreeSet, HashSet},
-    sync::Arc,
-};
+use std::{cell::Cell, collections::BTreeSet, sync::Arc};
 
 use gix_hash::ObjectId;
 use gix_object::bstr::{BStr, BString, ByteSlice};
 use gix_reftable::{Addition, LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, Writer, stack::TableFile};
 
-use super::{Backend, Error, StackRef, WorktreeType, lock, parse_worktree_ref};
+use super::{
+    Backend, Error, StackRef, lock,
+    common::{Held, Unavailable, fill_log_record, hash_of, strndup},
+    is_pseudo_ref,
+};
 use crate::{
     FullName, Namespace, Target,
     store::WriteReflog,
@@ -166,12 +166,6 @@ impl TransactionData {
     }
 }
 
-/// A reference's value as its stack stores it.
-enum Raw {
-    Object(ObjectId),
-    Symbolic(BString),
-}
-
 /// A failed transaction, with git's message in `err` and the kind of error.
 fn rejected(kind: ErrorKind, message: impl Into<BString>) -> prepare::Error {
     prepare::Error::Reftable {
@@ -185,7 +179,6 @@ fn error_str(err: &Error) -> String {
     match err {
         Error::Reftable(err) => err.to_string(),
         Error::Io(_) => gix_reftable::Error::Io.to_string(),
-        Error::Unsupported { .. } => err.to_string(),
     }
 }
 
@@ -206,11 +199,6 @@ fn generic_failure() -> prepare::Error {
         ErrorKind::Generic,
         format!("reftable: transaction prepare: {}", gix_reftable::Error::General),
     )
-}
-
-/// `is_pseudo_ref()` (refs.c:887-900): the references that stay files.
-fn is_pseudo_ref(name: &[u8]) -> bool {
-    name == b"FETCH_HEAD" || name == b"MERGE_HEAD"
 }
 
 /// `should_autocreate_reflog()` (refs.c:1064-1078).
@@ -255,260 +243,35 @@ fn peel_tag(objects: &dyn gix_object::Find, id: &ObjectId) -> Option<ObjectId> {
 }
 
 /// `atol()`/`atoi()`: an optionally signed decimal prefix, 0 without digits.
-fn parse_c_int(s: &str) -> i64 {
-    let s = s.trim_start();
-    let (sign, digits) = match s.as_bytes().first() {
-        Some(b'-') => (-1, &s[1..]),
-        Some(b'+') => (1, &s[1..]),
-        _ => (1, s),
-    };
-    let end = digits.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(digits.len());
-    sign * digits[..end].parse::<i64>().unwrap_or(0)
-}
-
-/// `fill_reftable_log_record()` (refs/reftable-backend.c:297-321): the
-/// committer part of a log entry. `time` is `<seconds> <+|-HHMM>`.
-fn log_update(committer: gix_actor::SignatureRef<'_>) -> LogUpdate {
-    let committer = committer.trim();
-    let mut parts = committer.time.split_ascii_whitespace();
-    let time = parse_c_int(parts.next().unwrap_or("")) as u64;
-    let tz = parts.next().unwrap_or("");
-    let (sign, tz) = match tz.as_bytes().first() {
-        Some(b'-') => (-1, &tz[1..]),
-        Some(b'+') => (1, &tz[1..]),
-        _ => (1, tz),
-    };
-    LogUpdate {
-        name: committer.name.to_owned(),
-        email: committer.email.to_owned(),
-        time,
-        tz_offset: (sign * parse_c_int(tz)) as i16,
-        ..LogUpdate::default()
-    }
-}
-
-/// An object id as a record's hash.
-fn hash_of(id: &ObjectId) -> gix_reftable::record::Hash {
-    let mut hash = gix_reftable::record::Hash::default();
-    hash[..id.as_slice().len()].copy_from_slice(id.as_slice());
-    hash
-}
-
 impl Backend {
-    /// An object id from a record's hash.
-    fn oid_of(&self, hash: &gix_reftable::record::Hash, kind: gix_hash::Kind) -> ObjectId {
-        ObjectId::from_bytes_or_panic(&hash[..kind.len_in_bytes()])
-    }
-
-    /// `reftable_backend_read_ref()` (refs/reftable-backend.c:62-118): the
-    /// value of `refname` in `stack`, `None` if it does not exist there.
-    fn read_ref_in(&self, stack: &Stack, refname: &[u8], kind: gix_hash::Kind) -> Result<Option<Raw>, Error> {
-        Ok(stack.read_ref(refname)?.map(|record| match record.value {
-            RefValue::Symref(target) => Raw::Symbolic(target),
-            RefValue::Val1(hash) | RefValue::Val2 { value: hash, .. } => Raw::Object(self.oid_of(&hash, kind)),
-            RefValue::Deletion => unreachable!("read_ref() skips deletions"),
-        }))
-    }
-
-    /// Run `f` on the stack `refname` lives in and the name within that stack,
-    /// reloaded first as every reading operation does. `held` is a stack whose
-    /// mutex the caller holds already: it is used as it is, which is what a
-    /// reload amounts to for the stack an addition has locked.
-    fn with_stack_for<T>(
-        &self,
-        refname: &BStr,
-        held: Option<(&StackRef, &Stack)>,
-        f: impl FnOnce(&Stack, &BStr) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        let (stack, rewritten) = self.backend_for(refname, false)?;
-        match held {
-            Some((held_ref, held_stack)) if Arc::ptr_eq(held_ref, &stack) => f(held_stack, rewritten),
-            _ => {
-                let mut guard = lock(&stack);
-                guard.reload()?;
-                f(&guard, rewritten)
-            }
-        }
-    }
-
-    /// `refs_read_raw_ref()` (refs.c:2094-2105) with `reftable_be_read_raw_ref()`
-    /// (refs/reftable-backend.c:880-908): pseudo references are read from their
-    /// files, all others from their stack.
-    fn read_raw(
-        &self,
-        refname: &BStr,
-        kind: gix_hash::Kind,
-        held: Option<(&StackRef, &Stack)>,
-    ) -> Result<Option<Raw>, Error> {
-        if is_pseudo_ref(refname) {
-            // `refs_read_special_head()` (refs.c:2070-2092).
-            let contents = match std::fs::read(self.git_dir().join(gix_path::from_bstr(refname))) {
-                Ok(contents) => contents,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(err) => return Err(err.into()),
-            };
-            let name = FullName(refname.to_owned());
-            return Ok(
-                match crate::file::loose::Reference::try_from_path(name, &contents, kind).map(|r| r.target) {
-                    Ok(Target::Object(id)) => Some(Raw::Object(id)),
-                    Ok(Target::Symbolic(target)) => Some(Raw::Symbolic(target.0)),
-                    Err(_) => None,
-                },
-            );
-        }
-        self.with_stack_for(refname, held, |stack, name| self.read_ref_in(stack, name, kind))
-    }
-
     /// `refs_resolve_ref_unsafe()` (refs.c:2113-2200) without
     /// `RESOLVE_REF_ALLOW_BAD_NAME`: the name `refname` ends at and its object,
     /// `None` where git returns `NULL`. With `reading` the reference must
     /// exist; without, a missing one resolves to the null id.
-    fn resolve(
-        &self,
-        refname: &BStr,
-        reading: bool,
-        kind: gix_hash::Kind,
-        held: Option<(&StackRef, &Stack)>,
-    ) -> Option<(BString, ObjectId)> {
+    fn resolve(&self, refname: &BStr, reading: bool, held: Held<'_>) -> Option<(BString, ObjectId)> {
+        let kind = self.object_hash();
         let mut name = refname.to_owned();
         for _ in 0..SYMREF_MAXDEPTH {
             if gix_validate::reference::name_partial(name.as_ref()).is_err() {
                 return None;
             }
-            match self.read_raw(name.as_ref(), kind, held).ok()? {
+            match self.read_raw_ref_in(name.as_ref(), held).ok()? {
                 None if reading => return None,
                 None => return Some((name, kind.null())),
-                Some(Raw::Object(id)) => return Some((name, id)),
-                Some(Raw::Symbolic(target)) => name = target,
+                Some(Target::Object(id)) => return Some((name, id)),
+                Some(Target::Symbolic(target)) => name = target.0,
             }
         }
         None
     }
 
-    /// `reftable_be_reflog_exists()` (refs/reftable-backend.c:2306-2366):
-    /// whether `refname` has a log entry that is not a deletion.
-    fn reflog_exists_in(&self, refname: &BStr, held: Option<(&StackRef, &Stack)>) -> Result<bool, Error> {
-        self.check()?;
-        self.with_stack_for(refname, held, |stack, name| {
-            let mut it = stack.log_iterator()?;
-            if !it.seek_log(name)? {
-                return Ok(false);
-            }
-            let mut log = LogRecord::default();
-            while it.next_log(&mut log)? {
-                if log.refname != name {
-                    return Ok(false);
-                }
-                if !log.is_deletion() {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })
-    }
-
     /// `should_write_log()` (refs/reftable-backend.c:1443-1461).
-    fn should_write_log(
-        &self,
-        refname: &BStr,
-        log_refs_default: WriteReflog,
-        held: Option<(&StackRef, &Stack)>,
-    ) -> Result<bool, Error> {
+    fn should_write_log(&self, refname: &BStr, log_refs_default: WriteReflog, held: Held<'_>) -> Result<bool, Error> {
         let config = self.write_config().log_all_ref_updates.unwrap_or(log_refs_default);
         if should_autocreate_reflog(config, refname) {
             return Ok(true);
         }
         self.reflog_exists_in(refname, held)
-    }
-
-    /// The first reference whose name starts with `prefix` (which ends in a
-    /// slash), as `refs_ref_iterator_begin(refs, prefix, NULL, 0,
-    /// REFS_FOR_EACH_INCLUDE_BROKEN)` yields it: in a linked worktree, the
-    /// worktree's stack merged with the shared references of the main one
-    /// (`reftable_be_iterator_begin()`, refs/reftable-backend.c:846-878, and
-    /// `ref_iterator_select()`, refs/iterator.c:97-130).
-    fn first_ref_below(&self, prefix: &[u8]) -> Result<Option<BString>, Error> {
-        // `reftable_ref_iterator_advance()` (refs/reftable-backend.c:625-660)
-        // for one stack, skipping what `shared_only` filters out.
-        fn first_in(stack: &StackRef, prefix: &[u8], shared_only: bool) -> Result<Option<BString>, Error> {
-            let mut stack = lock(stack);
-            stack.reload()?;
-            let mut it = stack.ref_iterator()?;
-            if !it.seek_ref(prefix)? {
-                return Ok(None);
-            }
-            let mut record = RefRecord::default();
-            while it.next_ref(&mut record)? {
-                if !record.refname.starts_with(b"refs/") {
-                    continue;
-                }
-                if !record.refname.starts_with(prefix) {
-                    break;
-                }
-                if record.is_deletion() {
-                    continue;
-                }
-                if shared_only && parse_worktree_ref(record.refname.as_ref()).0 != WorktreeType::Shared {
-                    continue;
-                }
-                return Ok(Some(record.refname));
-            }
-            Ok(None)
-        }
-
-        let worktree = self.worktree_stack();
-        let main = first_in(&self.main_stack()?, prefix, worktree.is_some())?;
-        let Some(worktree) = worktree else { return Ok(main) };
-        let private = first_in(&worktree, prefix, false)?;
-        Ok(match (private, main) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        })
-    }
-
-    /// `refs_verify_refnames_available()` (refs.c:2789-2955) for a transaction
-    /// that is not the initial one, skipping nothing: none of `refnames` may
-    /// be a directory of an existing reference or of one in `extras`, nor have
-    /// one as its directory.
-    fn verify_refnames_available(
-        &self,
-        refnames: &[BString],
-        extras: &BTreeSet<BString>,
-        kind: gix_hash::Kind,
-    ) -> Result<(), prepare::Error> {
-        let conflict = |message: String| rejected(ErrorKind::NameConflict, message);
-        let mut dirnames = HashSet::<BString>::new();
-        for refname in refnames {
-            for slash in refname.find_iter(b"/") {
-                let dirname: BString = refname[..slash].into();
-                if !dirnames.insert(dirname.clone()) {
-                    continue;
-                }
-                // Any error reading it counts as absent, like the files backend's ENOENT.
-                if let Ok(Some(_)) = self.read_raw(dirname.as_ref(), kind, None) {
-                    return Err(conflict(format!("'{dirname}' exists; cannot create '{refname}'")));
-                }
-                if extras.contains(&dirname) {
-                    return Err(conflict(format!(
-                        "cannot process '{refname}' and '{dirname}' at the same time"
-                    )));
-                }
-            }
-
-            let mut prefix = refname.clone();
-            prefix.push(b'/');
-            let existing = self.first_ref_below(&prefix).map_err(|err| prepare_failure(&err))?;
-            if let Some(existing) = existing {
-                return Err(conflict(format!("'{existing}' exists; cannot create '{refname}'")));
-            }
-            // `find_descendant_ref()` (refs.c:1787-1811).
-            if let Some(extra) = extras.range(prefix.clone()..).next().filter(|e| e.starts_with(&prefix)) {
-                return Err(conflict(format!(
-                    "cannot process '{refname}' and '{extra}' at the same time"
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// `prepare_transaction_update()` (refs/reftable-backend.c:968-1029): the
@@ -642,10 +405,10 @@ impl Backend {
             .backend_for(b"HEAD".as_bstr(), false)
             .map_err(|err| prepare_failure(&err))?;
         let head = self
-            .read_ref_in(&lock(&head_stack), b"HEAD", kind)
+            .read_ref(&lock(&head_stack), b"HEAD")
             .map_err(|err| prepare_failure(&err))?;
         let head_referent = match head {
-            Some(Raw::Symbolic(referent)) => Some(referent),
+            Some(Target::Symbolic(referent)) => Some(referent.0),
             _ => None,
         };
 
@@ -663,7 +426,11 @@ impl Backend {
             idx += 1;
         }
 
-        self.verify_refnames_available(&refnames_to_check, &refnames, kind)?;
+        self.verify_refnames_available(&refnames_to_check, Some(&refnames), &BTreeSet::new(), None)
+            .map_err(|err| match err {
+                Unavailable::Conflict(message) => rejected(ErrorKind::NameConflict, message),
+                Unavailable::Backend(err) => prepare_failure(&err),
+            })?;
         Ok(data)
     }
 
@@ -859,13 +626,13 @@ impl Backend {
         }
 
         let found = self
-            .read_ref_in(&lock(&stack), &rewritten, kind)
+            .read_ref(&lock(&stack), &rewritten)
             .map_err(|_| generic_failure())?;
         let mut referent = BString::default();
         match &found {
-            Some(Raw::Object(id)) => current_oid = *id,
-            Some(Raw::Symbolic(target)) => {
-                referent = target.clone();
+            Some(Target::Object(id)) => current_oid = *id,
+            Some(Target::Symbolic(target)) => {
+                referent = target.0.clone();
                 data.updates[idx].is_symref = true;
             }
             None => {}
@@ -896,7 +663,7 @@ impl Backend {
 
         if data.updates[idx].is_symref {
             // The stack is locked, so resolving cannot race.
-            let resolved = self.resolve(data.updates[idx].refname.as_ref(), false, kind, None);
+            let resolved = self.resolve(data.updates[idx].refname.as_ref(), false, None);
             if let Some((_, id)) = &resolved {
                 current_oid = *id;
             }
@@ -998,7 +765,7 @@ impl Backend {
         }
 
         let previous = match found {
-            Some(Raw::Symbolic(target)) => Target::Symbolic(FullName(target)),
+            Some(Target::Symbolic(target)) => Target::Symbolic(target),
             _ => Target::Object(current_oid),
         };
         let u = &mut data.updates[idx];
@@ -1075,7 +842,7 @@ impl Backend {
     ) -> gix_reftable::Result<()> {
         let to_reftable = |err: Error| match err {
             Error::Reftable(err) => err,
-            Error::Io(_) | Error::Unsupported { .. } => gix_reftable::Error::Io,
+            Error::Io(_) => gix_reftable::Error::Io,
         };
         let st = held.1;
         let ts = st.next_update_index();
@@ -1115,7 +882,7 @@ impl Backend {
                 // Dangling symref updates get no log entry.
                 let resolved = match &u.new_target {
                     Some(target) => self
-                        .resolve(target.as_ref(), true, new_oid.kind(), Some(held))
+                        .resolve(target.as_ref(), true, Some(held))
                         .map(|(_, id)| new_oid = id)
                         .is_some(),
                     None => true,
@@ -1126,15 +893,15 @@ impl Backend {
                         return Err(gix_reftable::Error::Api);
                     };
                     // `xstrndup(u->msg, block_size / 2)`.
-                    let message = u.msg[..u.msg.len().min(block_size as usize / 2)].to_owned();
+                    let message = strndup(&u.msg, block_size as usize / 2);
                     logs.push(LogRecord {
                         refname: u.refname.clone(),
                         update_index: ts,
                         value: LogValue::Update(LogUpdate {
                             new_hash: hash_of(&new_oid),
                             old_hash: hash_of(current_oid),
-                            message: Some(message.into()),
-                            ..log_update(committer)
+                            message: Some(message),
+                            ..fill_log_record(&committer)
                         }),
                     });
                 }
@@ -1174,22 +941,3 @@ impl Backend {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn committer_time_parses_like_atol_and_atoi() {
-        let sig = gix_actor::SignatureRef {
-            name: " A U Thor ".into(),
-            email: "a@example.com".into(),
-            time: "1700000000 -0130",
-        };
-        let update = log_update(sig);
-        assert_eq!(update.name, "A U Thor", "split_ident_line() trims the name");
-        assert_eq!(update.time, 1_700_000_000);
-        assert_eq!(update.tz_offset, -130, "the offset stays HHMM, signed");
-        let sig = gix_actor::SignatureRef { time: "5 +0200", ..sig };
-        assert_eq!(log_update(sig).tz_offset, 200);
-    }
-}

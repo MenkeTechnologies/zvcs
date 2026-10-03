@@ -17,28 +17,8 @@ use std::cmp::Ordering;
 use gix_object::bstr::{BStr, BString, ByteSlice};
 use gix_reftable::{RefRecord, RefValue};
 
-use super::{Backend, Error, StackRef, WorktreeType, lock, parse_worktree_ref};
+use super::{Backend, Error, StackRef, WorktreeType, lock, parse_worktree_ref, worktree::is_root_ref};
 use crate::{FullName, Reference, Target};
-
-/// `is_root_ref()` (refs.c:914-937). A name of root syntax is one that
-/// [`parse_worktree_ref()`] sees as the current worktree's without being
-/// under `refs/`.
-fn is_root_ref(name: &[u8]) -> bool {
-    const IRREGULAR_ROOT_REFS: [&[u8]; 6] = [
-        b"HEAD",
-        b"AUTO_MERGE",
-        b"BISECT_EXPECTED_REV",
-        b"NOTES_MERGE_PARTIAL",
-        b"NOTES_MERGE_REF",
-        b"MERGE_AUTOSTASH",
-    ];
-    let is_root_ref_syntax =
-        !name.starts_with(b"refs/") && parse_worktree_ref(name.as_bstr()).0 == WorktreeType::Current;
-    if !is_root_ref_syntax || crate::store_impl::file::find::is_pseudo_ref_file(name) {
-        return false;
-    }
-    name.ends_with(b"_HEAD") || IRREGULAR_ROOT_REFS.contains(&name)
-}
 
 /// `refname_is_safe()` (refs.c:382-412): a name that cannot escape `refs/`,
 /// or one of only uppercase letters and `_`.

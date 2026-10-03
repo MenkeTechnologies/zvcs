@@ -313,7 +313,6 @@ impl Transaction<'_, '_> {
                 leaf_referent_previous_oid: None,
                 log_only_split: false,
                 previous_is_symbolic: false,
-                reftable: None,
             })
             .collect();
         updates
@@ -332,7 +331,6 @@ impl Transaction<'_, '_> {
                     leaf_referent_previous_oid: None,
                     log_only_split: false,
                     previous_is_symbolic: false,
-                    reftable: None,
                 },
             )
             .map_err(Error::PreprocessingFailed)?;
@@ -449,7 +447,6 @@ impl Transaction<'_, '_> {
                                     // `REF_LOG_ONLY` on a deletion: append to the log and keep it,
                                     // rather than gix's "delete the log, keep the reference".
                                     log_only_split,
-                                    reftable: None,
                                 },
                             ));
                             // At most one edit can name `head_ref` — `pre_process` above
@@ -722,7 +719,7 @@ impl Transaction<'_, '_> {
     /// Prepare `edits` in a store with the reftable backend, see
     /// [`reftable_be_transaction_prepare()`](crate::store_impl::reftable::Backend).
     ///
-    /// The prepared state goes onto the first edit; the edits themselves are what
+    /// The prepared state is kept by the transaction; the edits are what
     /// [`rollback()`](Self::rollback()) reports, splits included.
     fn prepare_reftable(
         mut self,
@@ -741,7 +738,7 @@ impl Transaction<'_, '_> {
             self.store.namespace.as_ref(),
             objects,
         )?;
-        let mut updates: Vec<Edit> = data
+        let updates: Vec<Edit> = data
             .edits()
             .into_iter()
             .map(|update| Edit {
@@ -751,13 +748,10 @@ impl Transaction<'_, '_> {
                 leaf_referent_previous_oid: None,
                 log_only_split: false,
                 previous_is_symbolic: false,
-                reftable: None,
             })
             .collect();
-        if let Some(first) = updates.first_mut() {
-            first.reftable = Some(Box::new(data));
-        }
         self.updates = Some(updates);
+        self.reftable = Some(data);
         Ok(self)
     }
 }

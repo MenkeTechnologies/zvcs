@@ -115,25 +115,7 @@ impl Backend {
     /// whether `name` has at least one reflog entry that is not a deletion.
     /// As in git, failing to read the stack means there is none.
     pub fn reflog_exists(&self, name: &FullNameRef) -> Result<bool, Error> {
-        let exists = || -> Result<bool, Error> {
-            self.check()?;
-            let (stack, refname) = self.backend_for(name.as_bstr(), true)?;
-            let mut iter = lock(&stack).log_iterator()?;
-            if !iter.seek_log(refname)? {
-                return Ok(false);
-            }
-            let mut log = LogRecord::default();
-            while iter.next_log(&mut log)? {
-                if log.refname != refname {
-                    return Ok(false);
-                }
-                if !log.is_deletion() {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        };
-        Ok(exists().unwrap_or(false))
+        Ok(self.reflog_exists_in(name.as_bstr(), None).unwrap_or(false))
     }
 
     /// The reflog records of `name`, newest first, without deletions; `None`

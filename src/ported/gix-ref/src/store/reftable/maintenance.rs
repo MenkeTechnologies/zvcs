@@ -19,15 +19,19 @@
 //! the writer stores as the empty string while any other message gets a
 //! trailing newline (`reftable_writer_add_log()`, reftable/writer.c:441-497).
 
-use std::{fmt::Write as _, path::Path, sync::Arc};
+use std::{collections::BTreeSet, fmt::Write as _, path::Path};
 
-use gix_hash::{ObjectId, oid};
+use gix_hash::ObjectId;
 use gix_object::bstr::{BStr, BString, ByteSlice};
 use gix_reftable::{
     LogRecord, LogUpdate, LogValue, RefRecord, RefValue, Stack, Writer, record::Hash, stack::TableFile,
 };
 
-use super::{Backend, Error, StackRef, WorktreeType, lock, parse_worktree_ref};
+use super::{
+    Backend, Error, StackRef, lock,
+    common::{Unavailable, fill_log_record, hash_of, strndup},
+    is_root_ref, parse_worktree_ref,
+};
 use crate::FullNameRef;
 
 /// `enum expire_reflog_flags` (refs.h:1134-1138).
@@ -114,62 +118,9 @@ fn oid_of(h: &Hash, hash_len: usize) -> ObjectId {
     ObjectId::from_bytes_or_panic(&h[..hash_len])
 }
 
-/// `oid` in a record's hash buffer.
-fn hash_of(oid: &oid) -> Hash {
-    let mut h = Hash::default();
-    h[..oid.as_bytes().len()].copy_from_slice(oid.as_bytes());
-    h
-}
-
 /// `is_null_oid()` on the first `hash_len` bytes of `h`.
 fn is_null(h: &Hash, hash_len: usize) -> bool {
     h[..hash_len].iter().all(|&b| b == 0)
-}
-
-/// `xstrndup(msg, n)`: at most `n` bytes of `msg`, ending early at a NUL.
-fn strndup(msg: &BStr, n: usize) -> BString {
-    let msg = msg.find_byte(0).map_or(msg.as_bytes(), |nul| &msg[..nul]);
-    msg[..msg.len().min(n)].into()
-}
-
-/// `atol()` / `atoi()`: leading whitespace, an optional sign, then digits.
-fn atol(s: &[u8]) -> i64 {
-    let s = s.trim_start();
-    let (neg, digits) = match s.first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let val = digits
-        .iter()
-        .take_while(|c| c.is_ascii_digit())
-        .fold(0i64, |acc, &c| acc.wrapping_mul(10).wrapping_add(i64::from(c - b'0')));
-    if neg { -val } else { val }
-}
-
-/// `fill_reftable_log_record()` (refs/reftable-backend.c:297-321): an update
-/// record by `committer`, whose time is git's raw `<seconds> <+|-HHMM>`.
-fn committer_log_update(committer: &gix_actor::SignatureRef<'_>) -> LogUpdate {
-    let time = committer.time.as_bytes();
-    let (date, tz) = match time.trim_start().find_byte(b' ') {
-        Some(pos) => {
-            let time = time.trim_start();
-            (&time[..pos], time[pos..].trim_start())
-        }
-        None => (time, &b""[..]),
-    };
-    let (sign, tz) = match tz.first() {
-        Some(b'-') => (-1, &tz[1..]),
-        Some(b'+') => (1, &tz[1..]),
-        _ => (1, tz),
-    };
-    LogUpdate {
-        name: committer.name.into(),
-        email: committer.email.into(),
-        time: atol(date) as u64,
-        tz_offset: (sign * atol(tz)) as i16,
-        ..LogUpdate::default()
-    }
 }
 
 /// The reflog entry `should_prune()` sees for the update `u`.
@@ -256,28 +207,6 @@ fn check_refname_format(refname: &[u8]) -> bool {
         rest = &rest[len + 1..];
     }
     components >= 2
-}
-
-/// `is_pseudo_ref()` (refs.c:887-900).
-fn is_pseudo_ref(name: &[u8]) -> bool {
-    name == b"FETCH_HEAD" || name == b"MERGE_HEAD"
-}
-
-/// `is_root_ref()` (refs.c:914-937).
-fn is_root_ref(name: &[u8]) -> bool {
-    const IRREGULAR: [&[u8]; 6] = [
-        b"HEAD",
-        b"AUTO_MERGE",
-        b"BISECT_EXPECTED_REV",
-        b"NOTES_MERGE_PARTIAL",
-        b"NOTES_MERGE_REF",
-        b"MERGE_AUTOSTASH",
-    ];
-    let root_syntax = name.iter().all(|&c| c.is_ascii_uppercase() || c == b'-' || c == b'_');
-    if !root_syntax || is_pseudo_ref(name) {
-        return false;
-    }
-    name.ends_with(b"_HEAD") || IRREGULAR.contains(&name)
 }
 
 impl Backend {
@@ -506,11 +435,6 @@ impl Backend {
         Ok(())
     }
 
-    /// The object hash of this backend.
-    fn object_hash(&self) -> gix_hash::Kind {
-        gix_hash::Kind::from_hex_len(self.hash_len() * 2).expect("the stack hash is one gix-hash supports")
-    }
-
     /// The stack `refs_compact()` and friends work on: the worktree's own in a
     /// linked worktree, the main stack otherwise.
     fn optimize_stack(&self) -> Result<StackRef, Error> {
@@ -601,7 +525,7 @@ impl Backend {
             oldname: old.as_bstr(),
             newname,
             logmsg: strndup(logmsg.as_bstr(), opts.block_size as usize / 2),
-            committer: committer_log_update(committer),
+            committer: fill_log_record(committer),
             delete_old,
         };
         st.add(
@@ -614,113 +538,21 @@ impl Backend {
         .map_err(|err| addition_error(failure, err))
     }
 
-    /// The reference `name` as `refs_read_raw_ref()` (refs.c:2094-2105) sees
-    /// it, for whether it exists. `held` is the stack locked by the caller,
-    /// read as it is, as git does not reload a stack locked for an addition.
-    fn raw_ref_exists(&self, name: &BStr, held: (&StackRef, &Stack)) -> Result<bool, Error> {
-        if is_pseudo_ref(name) {
-            // `refs_read_special_head()`: the file in the git directory.
-            let Ok(contents) = std::fs::read(self.git_dir().join(gix_path::from_bstr(name))) else {
-                return Ok(false);
-            };
-            let Ok(full_name) = crate::FullName::try_from(name) else {
-                return Ok(false);
-            };
-            return Ok(crate::file::loose::Reference::try_from_path(full_name, &contents, self.object_hash()).is_ok());
-        }
-        let (stack, rewritten) = self.backend_for(name, false)?;
-        if Arc::ptr_eq(&stack, held.0) {
-            return Ok(held.1.read_ref(rewritten)?.is_some());
-        }
-        let mut st = lock(&stack);
-        st.reload()?;
-        Ok(st.read_ref(rewritten)?.is_some())
-    }
-
-    /// The first reference whose name starts with `prefix` and is not `skip`,
-    /// as the reference iterator yields them (`reftable_be_iterator_begin()`,
-    /// refs/reftable-backend.c:846-878, with `REFS_FOR_EACH_INCLUDE_BROKEN`):
-    /// only names below `refs/`, and in a linked worktree the worktree's
-    /// references merged with the shared ones of the main stack
-    /// (`ref_iterator_select()`, refs/iterator.c:97-130).
-    fn first_ref_with_prefix(
-        &self,
-        prefix: &BStr,
-        skip: Option<&BStr>,
-        held: (&StackRef, &Stack),
-    ) -> Result<Option<BString>, Error> {
-        let first_in = |st: &Stack, shared_only: bool| -> Result<Option<BString>, Error> {
-            let mut it = st.ref_iterator()?;
-            if !it.seek_ref(prefix)? {
-                return Ok(None);
-            }
-            let mut r = RefRecord::default();
-            while it.next_ref(&mut r)? {
-                if !r.refname.starts_with(b"refs/") {
-                    continue;
-                }
-                if !r.refname.starts_with(prefix) {
-                    break;
-                }
-                if r.is_deletion() || skip.is_some_and(|s| s == r.refname) {
-                    continue;
-                }
-                if shared_only && parse_worktree_ref(r.refname.as_bstr()).0 != WorktreeType::Shared {
-                    continue;
-                }
-                return Ok(Some(r.refname));
-            }
-            Ok(None)
-        };
-        let search = |stack: StackRef, shared_only: bool| -> Result<Option<BString>, Error> {
-            if Arc::ptr_eq(&stack, held.0) {
-                return first_in(held.1, shared_only);
-            }
-            let mut st = lock(&stack);
-            st.reload()?;
-            first_in(&st, shared_only)
-        };
-        let main = search(self.main_stack()?, self.worktree_stack().is_some())?;
-        let Some(worktree) = self.worktree_stack() else {
-            return Ok(main);
-        };
-        let worktree = search(worktree, false)?;
-        Ok(match (main, worktree) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        })
-    }
-
-    /// `refs_verify_refname_available()` (refs.c:2953-2968, 2789-2951) for one
-    /// name, no extra names and no transaction: `refname` can be created
-    /// unless one of its leading directories is a reference, or it is the
-    /// directory of one, ignoring `skip`. The error is git's message.
+    /// `refs_verify_refname_available()` (refs.c:2953-2968) for `refname`
+    /// with no extra names, ignoring `skip`; `held` is the stack the caller
+    /// locked. The error is git's message.
     fn verify_refname_available(
         &self,
         refname: &BStr,
         skip: Option<&BStr>,
         held: (&StackRef, &Stack),
     ) -> Result<(), Error> {
-        for slash in refname
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| **c == b'/')
-            .map(|(pos, _)| pos)
-        {
-            let dirname = refname[..slash].as_bstr();
-            if skip == Some(dirname) {
-                continue;
-            }
-            if self.raw_ref_exists(dirname, held)? {
-                return Err(message(format!("'{dirname}' exists; cannot create '{refname}'")));
-            }
-        }
-        let mut dirname = BString::from(refname);
-        dirname.push(b'/');
-        if let Some(existing) = self.first_ref_with_prefix(dirname.as_bstr(), skip, held)? {
-            return Err(message(format!("'{existing}' exists; cannot create '{refname}'")));
-        }
-        Ok(())
+        let skip: BTreeSet<BString> = skip.into_iter().map(ToOwned::to_owned).collect();
+        self.verify_refnames_available(&[refname.to_owned()], None, &skip, Some(held))
+            .map_err(|err| match err {
+                Unavailable::Conflict(msg) => message(msg),
+                Unavailable::Backend(err) => err,
+            })
     }
 
     /// `reftable_be_fsck()` (refs/reftable-backend.c:2769-2860): check the stack
@@ -1039,7 +871,7 @@ mod tests {
             email: "committer@example.com".into(),
             time: "1112911993 -0700",
         };
-        let u = committer_log_update(&sig);
+        let u = fill_log_record(&sig);
         assert_eq!((u.time, u.tz_offset), (1112911993, -700));
         let line = log_line(&u, 20);
         assert_eq!(line.signature.time.offset, -7 * 3600);

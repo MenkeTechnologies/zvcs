@@ -349,9 +349,9 @@ mod writable {
                     new_id_linked,
                     "private worktree refs are written into the correct place"
                 );
-                assert_eq!(
-                    reflog_for_name(&store, reference.name.as_ref(), &mut buf),
-                    vec![new_id_linked.to_string()]
+                assert!(
+                    !store.reflog_exists(reference.name.as_ref())?,
+                    "refs/worktree/* is not among the refs whose reflog git creates on its own (should_autocreate_reflog(), refs.c:1064-1078)"
                 );
             }
 
@@ -651,10 +651,9 @@ mod writable {
             {
                 let reference = store.find(edits[3].name.as_ref())?;
                 assert_eq!(reference.target.id(), new_id);
-                assert_eq!(
-                    reflog_for_name(&store, reference.name.as_ref(), &mut buf),
-                    vec![new_id.to_string()],
-                    "private worktree refs do have a changelog"
+                assert!(
+                    !store.reflog_exists(reference.name.as_ref())?,
+                    "refs/worktree/* is not among the refs whose reflog git creates on its own (should_autocreate_reflog(), refs.c:1064-1078)"
                 );
             }
 

@@ -154,6 +154,14 @@ fn a_color_spec_is_parsed_the_way_config_colors_are() {
 /// `compile_regexp_failed()` (grep.c) words a bad pattern by where it came from:
 /// `--grep` is `command line`, `--author`/`--committer` are `header`, and the
 /// pickaxe is neither — it compiles its own regex and dies without an origin.
+
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn a_bad_pattern_is_reported_by_where_it_came_from() {
     let dir = fixture("regex");
@@ -164,23 +172,15 @@ fn a_bad_pattern_is_reported_by_where_it_came_from() {
         stderr_of(&out)
     };
 
-    assert_eq!(
-        fails(&["log", "--grep=[bad"]),
-        "fatal: command line, '[bad': brackets ([ ]) not balanced\n"
-    );
-    assert_eq!(
-        fails(&["log", "--author=[bad"]),
-        "fatal: header, '[bad': brackets ([ ]) not balanced\n"
-    );
-    assert_eq!(
-        fails(&["log", "-G[bad"]),
-        "fatal: invalid regex: brackets ([ ]) not balanced\n"
-    );
+    let bracket = regerror("brackets ([ ]) not balanced", "Unmatched [, [^, [:, [., or [=");
+    assert_eq!(fails(&["log", "--grep=[bad"]), format!("fatal: command line, '[bad': {bracket}\n"));
+    assert_eq!(fails(&["log", "--author=[bad"]), format!("fatal: header, '[bad': {bracket}\n"));
+    assert_eq!(fails(&["log", "-G[bad"]), format!("fatal: invalid regex: {bracket}\n"));
     // An unbalanced `(` is an error only where it is an operator: in an extended
     // regular expression, not in the default basic one.
     assert_eq!(
         fails(&["log", "-E", "--grep=(unclosed"]),
-        "fatal: command line, '(unclosed': parentheses not balanced\n"
+        format!("fatal: command line, '(unclosed': {}\n", regerror("parentheses not balanced", "Unmatched ( or \\("))
     );
     assert!(ok(&dir, &["log", "--grep=(unclosed"]).stdout.is_empty(), "a BRE `(` is a literal");
 }

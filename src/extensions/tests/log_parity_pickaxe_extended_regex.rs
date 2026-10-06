@@ -105,6 +105,13 @@ fn the_needle_is_an_extended_expression_whatever_grep_dialect_is_chosen() {
     assert_eq!(f.subjects(&["-i", "-GBETA [0-9]+"]), "digits\n");
 }
 
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn a_bad_needle_dies_only_once_a_commit_is_diffed() {
     let f = Fixture::new("bad");
@@ -115,10 +122,10 @@ fn a_bad_needle_dies_only_once_a_commit_is_diffed() {
     }
     assert_eq!(
         f.run(&["log", "--format=%s", "-G("]),
-        (String::new(), "fatal: invalid regex: parentheses not balanced\n".into(), 128)
+        (String::new(), format!("fatal: invalid regex: {}\n", regerror("parentheses not balanced", "Unmatched ( or \\(")), 128)
     );
     assert_eq!(
         f.run(&["log", "--format=%s", "--pickaxe-regex", "-S["]),
-        (String::new(), "fatal: invalid regex: brackets ([ ]) not balanced\n".into(), 128)
+        (String::new(), format!("fatal: invalid regex: {}\n", regerror("brackets ([ ]) not balanced", "Invalid regular expression")), 128)
     );
 }

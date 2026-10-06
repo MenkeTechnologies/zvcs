@@ -89,6 +89,13 @@ impl Fixture {
     }
 }
 
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn the_first_matched_body_dies_after_its_header() {
     let f = Fixture::new("dies");
@@ -107,13 +114,13 @@ fn the_first_matched_body_dies_after_its_header() {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         assert_eq!(
             f.range_diff(&args),
-            (header.clone(), "fatal: invalid regex: parentheses not balanced\n".into(), 128),
+            (header.clone(), format!("fatal: invalid regex: {}\n", regerror("parentheses not balanced", "Unmatched ( or \\(")), 128),
             "{args:?}"
         );
     }
     assert_eq!(
         f.range_diff(&["--stat", "--pickaxe-regex", "-S["]),
-        (header, "fatal: invalid regex: brackets ([ ]) not balanced\n".into(), 128)
+        (header, format!("fatal: invalid regex: {}\n", regerror("brackets ([ ]) not balanced", "Invalid regular expression")), 128)
     );
 }
 

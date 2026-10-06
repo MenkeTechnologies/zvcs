@@ -87,6 +87,13 @@ fn the_needle_is_an_extended_expression() {
     assert_eq!(f.run(&["show", "-s", "--format=%s", "-G\\(x", "HEAD~1", "HEAD"]), ok("paren\n"));
 }
 
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn a_bad_needle_dies_at_the_first_commit_diffed() {
     let f = Fixture::new("bad");
@@ -95,11 +102,11 @@ fn a_bad_needle_dies_at_the_first_commit_diffed() {
     assert_eq!(f.run(&["show", "-G(", "HEAD:f"]), (blob.to_string(), String::new(), 0));
     assert_eq!(
         f.run(&["show", "-s", "-G(", "HEAD"]),
-        (String::new(), "fatal: invalid regex: parentheses not balanced\n".into(), 128)
+        (String::new(), format!("fatal: invalid regex: {}\n", regerror("parentheses not balanced", "Unmatched ( or \\(")), 128)
     );
     // The blob ahead of the commit is already out when the commit dies.
     assert_eq!(
         f.run(&["show", "--pickaxe-regex", "-S[", "HEAD:f", "HEAD"]),
-        (blob.to_string(), "fatal: invalid regex: brackets ([ ]) not balanced\n".into(), 128)
+        (blob.to_string(), format!("fatal: invalid regex: {}\n", regerror("brackets ([ ]) not balanced", "Invalid regular expression")), 128)
     );
 }

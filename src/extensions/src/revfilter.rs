@@ -85,7 +85,7 @@ fn regex_failure(
         Dialect::Fixed => None,
     };
     match text {
-        Some(text) => crate::fatal::Fatal(origin.describe(pattern, text)).into(),
+        Some(text) => crate::fatal::Fatal(origin.describe(pattern, &text)).into(),
         None => anyhow!("invalid regex: {err}"),
     }
 }

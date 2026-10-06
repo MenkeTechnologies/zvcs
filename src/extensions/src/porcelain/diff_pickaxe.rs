@@ -89,7 +89,7 @@ pub(crate) fn compile_regex_icase(pat: &[u8], icase: bool) -> std::result::Resul
         .case_insensitive(icase)
         .build()
         .map_err(|e| match super::line_log::ere_syntax_error(s) {
-            Some(text) => text.to_owned(),
+            Some(text) => text,
             None => e.to_string(),
         })
 }

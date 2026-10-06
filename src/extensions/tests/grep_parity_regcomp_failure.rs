@@ -18,8 +18,8 @@
 //! the unterminated interval `a\{1` (its engine read the brace literally) and
 //! reported the rest in the regex crate's words.
 //!
-//! The `regerror()` tail is the one stock git 2.56.0 prints on macOS, the same
-//! text `--grep` and `-L` reproduce.
+//! The `regerror()` tail is the C library's: the one stock git 2.56.0 prints on
+//! macOS, and glibc's on Linux — the same text `--grep` and `-L` use.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -71,22 +71,29 @@ impl Fixture {
     }
 }
 
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn regcomp_failures_name_origin_pattern_and_reason() {
     let f = Fixture::new("fail");
     let pats = f.root.join("pats");
     let pats = pats.to_str().unwrap();
     for (args, msg) in [
-        (&["grep", "a\\{1"][..], "fatal: command line, 'a\\{1': braces not balanced\n".to_owned()),
-        (&["grep", "-e", "a\\{1,"][..], "fatal: -e option, 'a\\{1,': braces not balanced\n".to_owned()),
-        (&["grep", "-E", "-e", "a{1"][..], "fatal: -e option, 'a{1': braces not balanced\n".to_owned()),
-        (&["grep", "-e", "ok", "-e", "["][..], "fatal: -e option, '[': brackets ([ ]) not balanced\n".to_owned()),
-        (&["grep", "-e", "\\("][..], "fatal: -e option, '\\(': parentheses not balanced\n".to_owned()),
-        (&["grep", "-e", "a\\{2,1\\}"][..], "fatal: -e option, 'a\\{2,1\\}': invalid repetition count(s)\n".to_owned()),
+        (&["grep", "a\\{1"][..], format!("fatal: command line, 'a\\{{1': {}\n", regerror("braces not balanced", "Unmatched \\{"))),
+        (&["grep", "-e", "a\\{1,"][..], format!("fatal: -e option, 'a\\{{1,': {}\n", regerror("braces not balanced", "Unmatched \\{"))),
+        (&["grep", "-E", "-e", "a{1"][..], format!("fatal: -e option, 'a{{1': {}\n", regerror("braces not balanced", "Unmatched \\{"))),
+        (&["grep", "-e", "ok", "-e", "["][..], format!("fatal: -e option, '[': {}\n", regerror("brackets ([ ]) not balanced", "Invalid regular expression"))),
+        (&["grep", "-e", "\\("][..], format!("fatal: -e option, '\\(': {}\n", regerror("parentheses not balanced", "Unmatched ( or \\("))),
+        (&["grep", "-e", "a\\{2,1\\}"][..], format!("fatal: -e option, 'a\\{{2,1\\}}': {}\n", regerror("invalid repetition count(s)", "Invalid content of \\{\\}"))),
         // A back reference may only name a group that has closed.
-        (&["grep", "-e", "\\(o\\)\\2"][..], "fatal: -e option, '\\(o\\)\\2': invalid backreference number\n".to_owned()),
-        (&["grep", "-e", "\\(o\\1\\)"][..], "fatal: -e option, '\\(o\\1\\)': invalid backreference number\n".to_owned()),
-        (&["grep", "-f", pats][..], format!("fatal: In '{pats}' at 2, 'x\\(': parentheses not balanced\n")),
+        (&["grep", "-e", "\\(o\\)\\2"][..], format!("fatal: -e option, '\\(o\\)\\2': {}\n", regerror("invalid backreference number", "Invalid back reference"))),
+        (&["grep", "-e", "\\(o\\1\\)"][..], format!("fatal: -e option, '\\(o\\1\\)': {}\n", regerror("invalid backreference number", "Invalid back reference"))),
+        (&["grep", "-f", pats][..], format!("fatal: In '{pats}' at 2, 'x\\(': {}\n", regerror("parentheses not balanced", "Unmatched ( or \\("))),
     ] {
         assert_eq!(f.run(args), (String::new(), msg, 128), "{args:?}");
     }

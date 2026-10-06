@@ -421,22 +421,59 @@ fn compile(pattern: &str) -> std::result::Result<regex::bytes::Regex, String> {
         .map_err(|_| "invalid regular expression".to_string())
 }
 
-/// The POSIX `regcomp` diagnostics this port reproduces verbatim. Checked before
-/// handing the pattern to the regex crate, whose own error text is its own.
+/// The `regerror()` text git's `regcomp()` would refuse `pattern` with, or `None`
+/// when it compiles. Checked before handing the pattern to the regex crate, whose
+/// own error text is its own.
 ///
-/// In an extended regular expression the grouping and interval operators are the
-/// *bare* `(`/`)` and `{`/`}` — the escaped forms are literals — which is the one
-/// difference between the two dialects here. `-L`'s own patterns are BRE, hence
-/// the default.
-pub(crate) fn bre_syntax_error(pattern: &str) -> Option<&'static str> {
-    syntax_error(pattern, false)
+/// git compiles with the platform's `regcomp()`, so the wording — and which
+/// patterns are refused at all — is the C library's. On Linux that library is
+/// asked directly; elsewhere [`syntax_error`] reproduces the Darwin `regcomp()`
+/// git's macOS build links against. `-L`'s own patterns are BRE, hence the
+/// default.
+pub(crate) fn bre_syntax_error(pattern: &str) -> Option<String> {
+    platform_regcomp_error(pattern, false)
 }
 
 /// [`bre_syntax_error`] for an extended regular expression.
-pub(crate) fn ere_syntax_error(pattern: &str) -> Option<&'static str> {
-    syntax_error(pattern, true)
+pub(crate) fn ere_syntax_error(pattern: &str) -> Option<String> {
+    platform_regcomp_error(pattern, true)
 }
 
+/// `regcomp(&re, pattern, REG_NEWLINE | (extended ? REG_EXTENDED : 0))` and, on
+/// failure, `regerror()`'s text — the call `compile_regexp()` (grep.c:563-568) and
+/// `regcomp_or_die()` make. A pattern holding a NUL is the C string before it, as
+/// it is for git.
+#[cfg(target_os = "linux")]
+fn platform_regcomp_error(pattern: &str, extended: bool) -> Option<String> {
+    let c_pattern = std::ffi::CString::new(pattern.split('\0').next().unwrap_or_default()).ok()?;
+    let flags = libc::REG_NEWLINE | if extended { libc::REG_EXTENDED } else { 0 };
+    // SAFETY: `regex_t` is plain data that `regcomp()` initialises; it is freed
+    // with `regfree()` only after a successful compile, since a failed one has
+    // already released what it allocated.
+    unsafe {
+        let mut re: libc::regex_t = std::mem::zeroed();
+        let rc = libc::regcomp(&mut re, c_pattern.as_ptr(), flags);
+        if rc == 0 {
+            libc::regfree(&mut re);
+            return None;
+        }
+        let mut buf = [0 as std::ffi::c_char; 256];
+        libc::regerror(rc, &re, buf.as_mut_ptr(), buf.len());
+        Some(std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_regcomp_error(pattern: &str, extended: bool) -> Option<String> {
+    syntax_error(pattern, extended).map(str::to_owned)
+}
+
+/// Darwin `regcomp()`'s diagnostics, reproduced.
+///
+/// In an extended regular expression the grouping and interval operators are the
+/// *bare* `(`/`)` and `{`/`}` — the escaped forms are literals — which is the one
+/// difference between the two dialects here.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn syntax_error(pattern: &str, extended: bool) -> Option<&'static str> {
     let b = pattern.as_bytes();
     let (mut parens, mut braces) = (0i32, 0i32);

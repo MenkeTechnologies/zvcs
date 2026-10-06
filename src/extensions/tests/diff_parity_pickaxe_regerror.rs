@@ -76,15 +76,22 @@ impl Fixture {
     }
 }
 
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn each_verb_dies_with_the_regerror_wording() {
     let f = Fixture::new("verbs");
     for (args, text) in [
-        (&["diff", "HEAD", "-G["][..], "brackets ([ ]) not balanced"),
-        (&["diff", "--pickaxe-regex", "-S(a"][..], "parentheses not balanced"),
-        (&["diff-index", "HEAD", "-Ga{1"][..], "braces not balanced"),
-        (&["diff-index", "--cached", "HEAD", "--pickaxe-regex", "-Sa\\"][..], "trailing backslash (\\)"),
-        (&["diff-files", "-G[[:alpha:]"][..], "brackets ([ ]) not balanced"),
+        (&["diff", "HEAD", "-G["][..], regerror("brackets ([ ]) not balanced", "Invalid regular expression")),
+        (&["diff", "--pickaxe-regex", "-S(a"][..], regerror("parentheses not balanced", "Unmatched ( or \\(")),
+        (&["diff-index", "HEAD", "-Ga{1"][..], regerror("braces not balanced", "Unmatched \\{")),
+        (&["diff-index", "--cached", "HEAD", "--pickaxe-regex", "-Sa\\"][..], regerror("trailing backslash (\\)", "Trailing backslash")),
+        (&["diff-files", "-G[[:alpha:]"][..], regerror("brackets ([ ]) not balanced", "Unmatched [, [^, [:, [., or [=")),
     ] {
         let want = format!("fatal: invalid regex: {text}\n");
         assert_eq!(f.run(args), (String::new(), want, 128), "{args:?}");

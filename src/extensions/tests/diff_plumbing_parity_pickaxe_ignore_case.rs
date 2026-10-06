@@ -101,6 +101,13 @@ fn diff_index_folds_case() {
     assert_eq!(f.ok(&["diff-index", "-i", "-SFOO", "--name-only", "HEAD"]), "f\ng\n");
 }
 
+/// `regerror()`'s text is the C library's, since git compiles with the platform
+/// `regcomp()`: Darwin's wording on macOS, glibc's on Linux (measured with glibc
+/// 2.36's `regcomp(3)`/`regerror(3)`, which git 2.39 on the same system prints).
+fn regerror(darwin: &'static str, glibc: &'static str) -> &'static str {
+    if cfg!(all(target_os = "linux", target_env = "gnu")) { glibc } else { darwin }
+}
+
 #[test]
 fn diff_tree_folds_case_and_still_reports_a_bad_regex() {
     let f = Fixture::new("tree");
@@ -114,7 +121,7 @@ fn diff_tree_folds_case_and_still_reports_a_bad_regex() {
     let (out, err, code) = f.run(&["diff-tree", "-r", "-i", "-G(", "HEAD~", "HEAD"]);
     assert_eq!(
         (out.as_str(), err.as_str(), code),
-        ("", "fatal: invalid regex: parentheses not balanced\n", 128)
+        ("", format!("fatal: invalid regex: {}\n", regerror("parentheses not balanced", "Unmatched ( or \\(")).as_str(), 128)
     );
 }
 

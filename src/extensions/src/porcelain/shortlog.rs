@@ -1393,7 +1393,7 @@ fn fatal_rev(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> Exit
         }
     }
     let message = super::log::early_revision_fatal(repo, spec, cant_be_filename)
-        .unwrap_or_else(|| super::log::bad_revision_message_in(repo, spec));
+        .unwrap_or_else(|| super::log::bad_revision_message_in_gated(repo, spec, cant_be_filename));
     eprint!("{message}");
     ExitCode::from(128)
 }

@@ -9,6 +9,8 @@
 //! after it is `must come before non-option arguments`. zvcs died on the first
 //! path with git's `ambiguous argument` block.
 //!
+//! With a `--` on the line the same operand is `bad revision`, never a path.
+//!
 //! Expectations measured from stock git 2.56.0 under the same environment.
 
 use std::path::PathBuf;
@@ -95,4 +97,14 @@ fn the_tail_after_the_first_path_must_be_paths() {
         f.run(&["shortlog", "-s", "a", "--all"]),
         (String::new(), "fatal: option '--all' must come before non-option arguments\n".into(), 128)
     );
+}
+
+/// With a `--` anywhere on the line the fallback is off: `if (seen_dashdash ||
+/// *arg == '^') die("bad revision '%s'", arg);` (revision.c:3119-3120), even for
+/// an operand that names a file. zvcs printed the `ambiguous argument` block.
+#[test]
+fn a_separator_makes_an_unresolved_operand_a_bad_revision() {
+    let f = Fixture::new("dashdash");
+    assert_eq!(f.run(&["shortlog", "-s", "HEAD", "a", "--", "b"]), (String::new(), "fatal: bad revision 'a'\n".into(), 128));
+    assert_eq!(f.run(&["shortlog", "-s", "nosuch", "--", "b"]), (String::new(), "fatal: bad revision 'nosuch'\n".into(), 128));
 }

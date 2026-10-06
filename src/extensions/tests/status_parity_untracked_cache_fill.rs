@@ -297,6 +297,17 @@ fn show_untracked_files_all_fills_a_cache_for_all_files() {
     });
 }
 
+/// `feature.manyFiles` turns the cache on together with `index.skipHash`, whose null trailer
+/// must not stop the write.
+#[test]
+fn feature_many_files_fills_the_cache() {
+    if let Some((first, _)) = assert_like_stock("many-files", &[("feature.manyFiles", "true")], &["--porcelain"], |w| {
+        std::fs::write(w.join("u/g"), "g\n").unwrap();
+    }) {
+        assert!(cached_directories(&first.index.bytes).is_some_and(|n| n > 1), "stock filled nothing");
+    }
+}
+
 /// `core.autocrlf=true` makes `would_convert_to_git()` true for every `.gitignore`, so even a
 /// tracked, unchanged one is hashed from the file rather than taken from the index.
 #[test]

@@ -243,12 +243,13 @@ fn add_interactive_revert_writes_the_configured_trailer() {
         let mut args: Vec<&str> = cfg.to_vec();
         args.extend_from_slice(&["add", "-i"]);
         run_with_stdin(&repo, &home, &args, "revert\n1\n\nq\n");
+        // Read before `status`, which writes the index back under the repository's own
+        // configuration (stock rehashes the trailer there too).
+        let trailer = index_trailer(&repo);
 
         // The revert really happened: the staged change is unstaged again.
         let status = run(&repo, &home, &["status", "--porcelain"]);
         assert_eq!(String::from_utf8_lossy(&status.stdout), " M f\n");
-
-        let trailer = index_trailer(&repo);
         match name {
             "unset" => assert_ne!(trailer, zeroes()),
             _ => assert_eq!(trailer, zeroes(), "add -i: `{name}` must zero the index trailer"),

@@ -1755,10 +1755,12 @@ fn has_racy_timestamp(index: &gix::index::File) -> bool {
 /// disk against the one the in-memory index was read with. A file too short to hold
 /// a header and a hash, or one that cannot be opened, fails the check — git treats
 /// every one of those as "do not write".
+///
+/// An `index.skipHash` index (which `feature.manyFiles` turns on) ends in a null trailer,
+/// which the reader records as no checksum at all; `istate->oid` is that null id and git
+/// compares it like any other, so such an index is written back too.
 fn verify_index(repo: &gix::Repository, index: &gix::index::File) -> bool {
-    let Some(read_with) = index.checksum() else {
-        return false;
-    };
+    let read_with = index.checksum().unwrap_or_else(|| repo.object_hash().null());
     let len = read_with.as_bytes().len();
     let Ok(bytes) = std::fs::read(repo.index_path()) else {
         return false;

@@ -5949,7 +5949,7 @@ fn invalid_option(arg: &str, have_revision: bool) -> ExitCode {
 /// `-l` is `OPT_INTEGER('l', NULL, &options->rename_limit, ...)`, so the
 /// diagnostic is parse-options' integer wording at 129 — ``switch `l' expects an
 /// integer value with an optional k/m/g suffix``.
-fn parse_rename_limit(value: &str) -> Result<i64, ExitCode> {
+pub(super) fn parse_rename_limit(value: &str) -> Result<i64, ExitCode> {
     crate::optint::integer(&crate::optint::short_opt('l'), value).map_err(|e| {
         eprintln!("error: {e}");
         ExitCode::from(129)
@@ -6255,6 +6255,9 @@ pub(crate) struct PatchOpts {
     /// an empty file that moved reports as a deletion plus an addition rather than
     /// an `R100`.
     pub rename_empty: bool,
+    /// `-l<n>`: `options->rename_limit` (diff.c:6167), `-1` until given; a
+    /// negative value leaves `diff.renameLimit` in charge (diff.c:5317-5318).
+    pub rename_limit: i64,
     /// The `index` line's abbreviation, when it must differ from `core.abbrev`:
     /// `--no-abbrev` zeroes `revs->abbrev`, which the raw format reads as "print the
     /// whole id" while the `index` line falls back to the configured default.
@@ -6339,6 +6342,7 @@ impl Default for PatchOpts {
             find_copies_harder: false,
             break_opt: -1,
             rename_empty: true,
+            rename_limit: -1,
             index_abbrev: None,
             algorithm: None,
             // `XDF_INDENT_HEURISTIC` is git's default (diff.c `diff_setup()`).

@@ -2307,6 +2307,24 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                     reflog_pats.push(v.clone());
                 }
             }
+        // `OPT_INTEGER('l', NULL, &options->rename_limit, …)` (diff.c:6167), glued
+        // or separated.
+        } else if a == "-l" || (a.len() > 2 && a.starts_with("-l")) {
+            let v = match a.len() {
+                2 => {
+                    i += 1;
+                    let Some(v) = args.get(i) else {
+                        eprintln!("error: switch `l' requires a value");
+                        return Ok(ExitCode::from(129));
+                    };
+                    v.as_str()
+                }
+                _ => &a[2..],
+            };
+            match super::diff::parse_rename_limit(v) {
+                Ok(n) => patch_opts.rename_limit = n,
+                Err(code) => return Ok(code),
+            }
         } else if a == "-O" {
             i += 1;
             let Some(v) = args.get(i) else {
@@ -13561,9 +13579,10 @@ fn detect_renames(
         find_copies_harder: opts.find_copies_harder,
         break_opt: opts.break_opt,
         rename_empty: opts.rename_empty,
-        rename_limit: cfg
-            .integer("diff.renameLimit")
-            .unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        rename_limit: match opts.rename_limit {
+            n if n >= 0 => n,
+            _ => cfg.integer("diff.renameLimit").unwrap_or(super::diffcore_rename::DEFAULT_RENAME_LIMIT),
+        },
         hash_kind: repo.object_hash(),
         ..Default::default()
     };

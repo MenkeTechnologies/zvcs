@@ -233,3 +233,52 @@ fn a_conflicted_rebase_reports_the_conflict() {
     assert!(status.contains("  (fix conflicts and then run \"git rebase --continue\")\n"), "{status}");
     assert!(status.contains("  (use \"git rebase --abort\" to check out the original branch)\n"), "{status}");
 }
+
+/// Which object names in a todo line get shortened is per command
+/// (`format_todo_line()`, wt-status.c:1435-1503): the one after `fixup -C`/`-c`,
+/// every parent of a `merge` — but not a parent that is a `refs/rewritten/`
+/// label — and a `reset` target; never an `exec`/`label` argument or a line with
+/// no command. zvcs shortened only the second word of any line, so it left
+/// `fixup -C <full id>` and `merge -C <full id> …` whole and shortened a
+/// hex-looking `label` argument. Expectations measured against stock git 2.56.0.
+#[test]
+fn todo_lines_shorten_the_object_names_their_command_takes() {
+    let f = Fixture::new("todo-abbrev");
+    f.write("f.txt", b"one\n");
+    f.git(&["commit", "-q", "-am", "one"]);
+    f.write("f.txt", b"two\n");
+    f.git(&["commit", "-q", "-am", "two"]);
+    let rev = |args: &[&str]| {
+        String::from_utf8_lossy(&f.cmd(args).output().unwrap().stdout).trim().to_string()
+    };
+    let (one, two) = (rev(&["rev-parse", "HEAD~1"]), rev(&["rev-parse", "HEAD"]));
+    let (s1, s2) = (rev(&["rev-parse", "--short", "HEAD~1"]), rev(&["rev-parse", "--short", "HEAD"]));
+    let out = f
+        .cmd(&["rebase", "-i", "HEAD~2"])
+        .env("GIT_SEQUENCE_EDITOR", "perl -i -ne 'print qq(break\\n) if $. == 1'")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "rebase -i failed: {out:?}");
+    f.git(&["update-ref", "refs/rewritten/abc123", &one]);
+    f.git(&["pack-refs", "--all"]);
+
+    let cases = [
+        (format!("fixup -C {one} one\nf -c {two}\n"), format!("   fixup -C {s1} one\n   f -c {s2}\n")),
+        (
+            format!("merge -C {one} abc123 {two} # Merge\nreset abc123\n"),
+            format!("   merge -C {s1} abc123 {s2} # Merge\n   reset abc123\n"),
+        ),
+        (format!("reset {one}\nexec echo {one}\n"), format!("   reset {s1}\n   exec echo {one}\n")),
+        (format!("frobnicate {one}\nreset {}\n", &one[..12]), format!("   frobnicate {one}\n   reset {s1}\n")),
+        (format!("  pick   {two} two  \nmerge {two} #x\n"), format!("   pick   {s2} two\n   merge {s2} #x\n")),
+        (format!("update-ref refs/heads/x\nlabel {one}\n"), format!("   update-ref refs/heads/x\n   label {one}\n")),
+    ];
+    for (todo, want) in cases {
+        f.write(".git/rebase-merge/git-rebase-todo", todo.as_bytes());
+        let status = f.status();
+        assert!(
+            status.contains(&format!("Next commands to do (2 remaining commands):\n{want}")),
+            "{todo}\n{status}"
+        );
+    }
+}

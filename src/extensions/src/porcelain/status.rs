@@ -4405,50 +4405,101 @@ fn rebase_information(
     out
 }
 
-/// `read_rebase_todolist()` (wt-status.c:1399): the todo file without its comments
-/// and blank lines, each line run through `abbrev_oid_in_line()`. `None` when the
-/// file is missing.
+/// `read_rebase_todolist()` (wt-status.c:1505-1530): the todo file's lines, each
+/// trimmed and run through `format_todo_line()`, which drops the comments and
+/// blank lines. `None` when the file is missing.
 fn read_rebase_todolist(
     repo: &gix::Repository,
     git_dir: &std::path::Path,
     rela: &str,
 ) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(git_dir.join(rela)).ok()?;
+    let text = std::fs::read(git_dir.join(rela)).ok()?;
+    let comment = super::rebase_todo::comment_prefix(repo);
+    // `strbuf_getline_lf()` yields no line after a final newline.
+    let body = text.strip_suffix(b"\n").unwrap_or(&text);
     Some(
-        text.lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| abbrev_oid_in_line(repo, line))
+        body.split(|&b| b == b'\n')
+            .filter_map(|line| format_todo_line(repo, comment.as_bytes(), line.trim_ascii()))
+            .map(|line| String::from_utf8_lossy(&line).into_owned())
             .collect(),
     )
 }
 
-/// `abbrev_oid_in_line()` (wt-status.c:1376): turn
-/// `pick d6a2f0303e897ec2… some message` into `pick d6a2f03 some message`, leaving
-/// the commands that carry no object id alone.
-fn abbrev_oid_in_line(repo: &gix::Repository, line: &str) -> String {
-    if ["exec ", "x ", "label ", "l "]
-        .iter()
-        .any(|verb| line.starts_with(verb))
-    {
-        return line.to_string();
-    }
-    let mut parts = line.splitn(3, ' ');
-    let (Some(verb), Some(oid)) = (parts.next(), parts.next()) else {
-        return line.to_string();
+/// `format_todo_line()` (wt-status.c:1435-1503): turn
+/// `pick d6a2f0303e897ec2… some message` into `pick d6a2f03 some message`, for
+/// every object name a command takes — after `fixup`'s `-C`/`-c`, and each of a
+/// `merge`'s parents. `None` for a comment line; a line naming no command is kept
+/// as it is.
+fn format_todo_line(repo: &gix::Repository, comment: &[u8], line: &[u8]) -> Option<Vec<u8>> {
+    use super::rebase_todo::Cmd;
+    let Some((cmd, rest)) = super::rebase_todo::parse_todo_command(comment, line) else {
+        return Some(line.to_vec());
     };
-    let rest = parts.next();
-    let Some(short) = gix::ObjectId::from_hex(oid.as_bytes())
-        .ok()
-        .and_then(|id| repo.find_object(id).ok())
-        .map(|obj| obj.id().shorten_or_id().to_string())
-    else {
-        return line.to_string();
+    let mut line = line.to_vec();
+    let mut p = line.len() - rest.len();
+    // `skip_dash_c()` (wt-status.c:1422-1432): `[ \t]*(-[cC])?`.
+    let skip_dash_c = |line: &[u8], p: &mut usize| -> bool {
+        *p += line[*p..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+        let skipped = line[*p..].starts_with(b"-C") || line[*p..].starts_with(b"-c");
+        if skipped {
+            *p += 2;
+        }
+        skipped
     };
-    match rest {
-        Some(rest) => format!("{verb} {short} {rest}"),
-        None => format!("{verb} {short}"),
+    match cmd {
+        Cmd::Comment => return None,
+        Cmd::Merge => {
+            // The argument to `-C` cannot be a label, but the parents can be.
+            let mut maybe_label = !skip_dash_c(&line, &mut p);
+            loop {
+                p += line[p..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+                let tail = &line[p..];
+                if tail.is_empty() || (tail[0] == b'#' && tail.get(1).is_none_or(|b| b.is_ascii_whitespace())) {
+                    break;
+                }
+                abbrev_oid_in_line(repo, &mut line, maybe_label, &mut p);
+                maybe_label = true;
+            }
+        }
+        Cmd::Fixup => {
+            skip_dash_c(&line, &mut p);
+            abbrev_oid_in_line(repo, &mut line, false, &mut p);
+        }
+        Cmd::Drop | Cmd::Edit | Cmd::Pick | Cmd::Revert | Cmd::Reword | Cmd::Squash => {
+            abbrev_oid_in_line(repo, &mut line, false, &mut p);
+        }
+        Cmd::Reset => abbrev_oid_in_line(repo, &mut line, true, &mut p),
+        Cmd::Break | Cmd::Exec | Cmd::Label | Cmd::Noop | Cmd::UpdateRef | Cmd::Invalid => {}
     }
+    Some(line)
+}
+
+/// `abbrev_oid_in_line()` (wt-status.c:1379-1420): shorten the object name at
+/// `*p` in place when it is all hex digits, names an object, and is not a label
+/// (`refs/rewritten/<name>`, for the commands whose argument may be one) or a
+/// refname that merely looks like hex. `*p` ends up past the name either way.
+fn abbrev_oid_in_line(repo: &gix::Repository, line: &mut Vec<u8>, maybe_label: bool, p: &mut usize) {
+    *p += line[*p..].iter().take_while(|b| matches!(b, b' ' | b'\t')).count();
+    let start = *p;
+    let end = start + line[start..].iter().take_while(|b| !matches!(b, b' ' | b'\t')).count();
+    *p = end;
+    let name = &line[start..end];
+    if !name.iter().all(u8::is_ascii_hexdigit) {
+        return;
+    }
+    let name = String::from_utf8_lossy(name).into_owned();
+    if maybe_label && repo.try_find_reference(format!("refs/rewritten/{name}").as_str()).ok().flatten().is_some() {
+        return;
+    }
+    let Ok(id) = repo.rev_parse_single(name.as_str()) else {
+        return;
+    };
+    let abbrev = super::rebase_todo::short_name(repo, id.detach());
+    if !name.starts_with(&abbrev) {
+        return;
+    }
+    line.drain(start + abbrev.len()..end);
+    *p = start + abbrev.len();
 }
 
 /// `split_commit_in_progress()` (wt-status.c:1333): a rebase that stopped to edit a

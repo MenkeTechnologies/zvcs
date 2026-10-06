@@ -484,6 +484,20 @@ fn parse_insn_line(
     Ok(item)
 }
 
+/// `sequencer_parse_todo_command()` (sequencer.c:2674-2693): the command a todo
+/// line starts with and the rest of the line after it, `Comment` for a line that
+/// starts with `comment` or is empty, `None` for a line that names no command.
+/// Unlike [`parse_insn_line`] it neither trims nor looks at the arguments.
+pub(crate) fn parse_todo_command<'a>(comment: &[u8], bol: &'a [u8]) -> Option<(Cmd, &'a [u8])> {
+    if let Some(found) = TABLE.iter().find_map(|&cmd| is_command(cmd, bol).map(|rest| (cmd, rest))) {
+        return Some(found);
+    }
+    if bol.starts_with(comment) || bol.is_empty() || bol[0] == b'\n' || bol.starts_with(b"\r\n") {
+        return Some((Cmd::Comment, bol));
+    }
+    None
+}
+
 /// `is_command()`: the long spelling or the one-letter nick, either way
 /// followed by a separator or end of line. Returns the rest of the line.
 fn is_command(cmd: Cmd, bol: &[u8]) -> Option<&[u8]> {

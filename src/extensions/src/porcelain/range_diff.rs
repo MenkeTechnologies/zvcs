@@ -3228,7 +3228,11 @@ fn build_patch(
     notes: &[super::notes::Tree],
     order: &mut OrderFile<'_>,
 ) -> Result<Option<Patch>> {
-    let commit = repo.find_object(id)?.try_into_commit()?;
+    let mut commit = repo.find_object(id)?.try_into_commit()?;
+    // The patches are `git log --pretty=medium` output (range-diff.c:54-70), and
+    // the header line is `pp_commit_easy()` (range-diff.c:463): both render the
+    // commit re-coded to the log output encoding (pretty.c:2315-2316).
+    super::log::logmsg_reencode(&mut commit.data, &crate::revfilter::log_output_encoding(repo, None));
 
     // ` ## Metadata ##` — only the `Author:` line of `--pretty=medium` survives
     // upstream's header filter; `Date:` and `commit` are dropped.

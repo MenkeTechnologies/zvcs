@@ -192,8 +192,14 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--porcelain" => f.porcelain = true,
             "--no-porcelain" => f.porcelain = false,
             "--repo" => f.repo = Some(take_value(inline)?),
-            "--force-with-lease" => f.lease = parse_lease(inline)?,
-            "--no-force-with-lease" => f.lease = Lease::None,
+            "--force-with-lease" => {
+                if let Err(msg) = parse_lease(&mut f.lease, inline)? {
+                    eprintln!("error: {msg}");
+                    return Ok(ExitCode::from(129));
+                }
+            }
+            // `clear_cas_option()`: every entry and the bare form go.
+            "--no-force-with-lease" => f.lease = Lease::default(),
             // Accepted, but inert here or already matched by the engine's behavior.
             "-v" | "--verbose" => f.verbosity = bump_verbosity(f.verbosity, true),
             // `--quiet` drives `transport->verbose` negative, which is what
@@ -793,7 +799,7 @@ git push <groupname>\n"
     };
 
     // Resolve `--force-with-lease` into each request's expected old value.
-    if !matches!(f.lease, Lease::None) {
+    if !f.lease.is_empty() {
         for req in &mut requests {
             req.expected = lease_for(&repo, &remote, &f.lease, &req.name);
         }
@@ -1222,57 +1228,63 @@ fn maybe_bool(v: &str) -> Option<bool> {
     }
 }
 
-/// `--force-with-lease` state.
+/// `struct push_cas_option` (remote.h): the `--force-with-lease` entries in the
+/// order they were given, plus the bare form's "lease everything else".
 #[derive(Default)]
-enum Lease {
-    /// Not given.
-    #[default]
-    None,
-    /// `--force-with-lease` with no value: lease every ref against its tracking ref.
-    Implicit,
-    /// `--force-with-lease=<ref>[:<expect>]`: lease one ref, optionally against an
-    /// explicit expected value rather than its tracking ref.
-    Explicit {
-        ref_name: String,
-        expect: Option<ObjectId>,
-    },
+struct Lease {
+    /// `cas->entry[]`: `<ref>` and its expected value, `None` for `use_tracking`
+    /// (no `:<expect>` given).
+    entries: Vec<(String, Option<ObjectId>)>,
+    /// `cas->use_tracking_for_rest`: a bare `--force-with-lease`.
+    use_tracking_for_rest: bool,
 }
 
-/// Parse a `--force-with-lease[=<ref>[:<expect>]]` value.
-fn parse_lease(value: Option<String>) -> Result<Lease> {
+impl Lease {
+    /// `is_empty_cas()` (remote.c:2758-2761).
+    fn is_empty(&self) -> bool {
+        !self.use_tracking_for_rest && self.entries.is_empty()
+    }
+
+    /// The entry `apply_cas()` settles on for `remote_ref`: the first explicit
+    /// one that matches, else the bare form's (remote.c:2917-2944). `Some(None)`
+    /// is a lease against the tracking ref; `None` is no lease at all.
+    fn for_ref(&self, remote_ref: &str) -> Option<Option<ObjectId>> {
+        match self.entries.iter().find(|(name, _)| ref_matches(name, remote_ref)) {
+            Some((_, expect)) => Some(*expect),
+            None => self.use_tracking_for_rest.then_some(None),
+        }
+    }
+}
+
+/// `parse_push_cas_option()` (remote.c:2723-2751) for one `--force-with-lease`
+/// occurrence. The bare form leaves the explicit entries in place; `<ref>:` with
+/// nothing after the colon expects the ref not to exist (`oidclr()`); a value
+/// `repo_get_oid()` cannot resolve is an `error()` from the option callback,
+/// which `parse_options()` turns into exit 129 — returned here as the message.
+fn parse_lease(lease: &mut Lease, value: Option<String>) -> Result<Result<(), String>> {
     let Some(v) = value else {
-        return Ok(Lease::Implicit);
+        lease.use_tracking_for_rest = true;
+        return Ok(Ok(()));
     };
-    let (ref_name, expect) = match v.split_once(':') {
-        Some((r, e)) if !e.is_empty() => {
-            // ```c
-            // if (!repo_get_oid(the_repository, colon + 1, &entry->expect))
-            //         entry->use_tracking = 0;
-            // else if (!repo_get_oid_hex(the_repository, colon + 1, &entry->expect))
-            //         ; /* the object may not exist locally */
-            // ```
-            //
-            // (`parse_push_cas_option()`, remote.c.) The hex fallback is the whole
-            // point of the second arm: the value leased is *the remote's* tip, and
-            // a checkout that has never seen it cannot resolve it. git records the
-            // raw id and lets the server's compare-and-swap answer, which it does
-            // with `! [rejected] <ref> -> <ref> (stale info)`. Resolving only
-            // through `rev_parse` turned that rejection into a failure to run.
+    let entry = match v.split_once(':') {
+        None => (v, None),
+        Some((r, "")) => (r.to_string(), Some(ObjectId::null(gix::hash::Kind::Sha1))),
+        Some((r, e)) => {
+            // `repo_get_oid()` takes a full hex id as it is, whether or not the
+            // object exists locally — the value leased is *the remote's* tip.
+            let repo = crate::setup::discover()?;
             let id = match gix::ObjectId::from_hex(e.as_bytes()) {
-                Ok(id) => id,
-                Err(_) => {
-                    let repo = crate::setup::discover()?;
-                    repo.rev_parse_single(e)
-                        .map_err(|_| anyhow!("cannot parse expected object name '{e}'"))?
-                        .detach()
-                }
+                Ok(id) if e.len() == repo.object_hash().len_in_hex() => id,
+                _ => match repo.rev_parse_single(e) {
+                    Ok(id) => id.detach(),
+                    Err(_) => return Ok(Err(format!("cannot parse expected object name '{e}'"))),
+                },
             };
             (r.to_string(), Some(id))
         }
-        Some((r, _)) => (r.to_string(), None),
-        None => (v, None),
     };
-    Ok(Lease::Explicit { ref_name, expect })
+    lease.entries.push(entry);
+    Ok(Ok(()))
 }
 
 /// The expected old value a lease requires for `remote_ref`, or `None` when the
@@ -1284,21 +1296,12 @@ fn lease_for(
     lease: &Lease,
     remote_ref: &str,
 ) -> Option<ObjectId> {
-    match lease {
-        Lease::None => None,
-        Lease::Implicit => Some(tracking_oid(repo, remote, remote_ref).unwrap_or_else(|| null(repo))),
-        Lease::Explicit { ref_name, expect } => {
-            if ref_matches(ref_name, remote_ref) {
-                Some(
-                    expect
-                        .or_else(|| tracking_oid(repo, remote, remote_ref))
-                        .unwrap_or_else(|| null(repo)),
-                )
-            } else {
-                None
-            }
-        }
-    }
+    let expect = lease.for_ref(remote_ref)?;
+    Some(match expect {
+        Some(id) if id.is_null() => null(repo),
+        Some(id) => id,
+        None => tracking_oid(repo, remote, remote_ref).unwrap_or_else(|| null(repo)),
+    })
 }
 
 /// Whether the lease covering `remote_ref` takes its expected value from the
@@ -1306,11 +1309,7 @@ fn lease_for(
 /// git's `entry->use_tracking` / `use_tracking_for_rest`, the only case in which
 /// `--force-if-includes` has any effect.
 fn lease_uses_tracking(lease: &Lease, remote_ref: &str) -> bool {
-    match lease {
-        Lease::None => false,
-        Lease::Implicit => true,
-        Lease::Explicit { ref_name, expect } => expect.is_none() && ref_matches(ref_name, remote_ref),
-    }
+    lease.for_ref(remote_ref) == Some(None)
 }
 
 /// The null object id for the repository's hash.

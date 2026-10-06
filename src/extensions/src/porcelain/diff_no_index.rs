@@ -61,6 +61,13 @@
 //! `fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be
 //! used together`, and whatever survives is written before the patch with
 //! `DIFF_SYMBOL_SEPARATOR`'s blank line between the two blocks.
+//!
+//! `GIT_EXTERNAL_DIFF`, `diff.external` and a path's `diff.<driver>.command` take
+//! a pair's patch section exactly as they do for `git diff` (`cmd_diff()` raises
+//! `allow_external` before branching here, builtin/diff.c:511); see
+//! [`run_external`]. The one piece not ported is the quiet probe a trusted exit
+//! code would need under `-w`/`-I` with a raw, name, check or quiet format, which
+//! is refused.
 
 use anyhow::Result;
 use gix::bstr::{BString, ByteSlice};
@@ -573,6 +580,12 @@ struct Opts {
     paint: diff_color::PaintOptions,
     /// `o->word_diff` / `o->word_regex` / `o->color_moved`, likewise.
     extra: diff_color::ExtraPaint,
+    /// `o->flags.allow_external`: whether a pair may go to an external program at
+    /// all, the `diff.<driver>.command` of its path included.
+    allow_external: bool,
+    /// `external_diff()` (diff.c:558) under that flag: `GIT_EXTERNAL_DIFF`, else
+    /// `diff.external`.
+    external: Option<super::diff_pairs::ExternalDiff>,
 }
 
 /// `add_diff_options()`'s short options by how `parse_short_opt()` consumes them
@@ -687,6 +700,9 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     let mut full_index = false;
     let mut text = false;
     let mut textconv = true;
+    // `o->flags.allow_external`, which `cmd_diff()` raises before it branches to
+    // the no-index path (builtin/diff.c:511) and `--[no-]ext-diff` moves.
+    let mut allow_external = true;
     let mut color_when: Option<diff_color::ColorWhen> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut after_dashdash = false;
@@ -1019,10 +1035,9 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "--indent-heuristic" => indent_heuristic_flag = Some(true),
             "--no-indent-heuristic" => indent_heuristic_flag = Some(false),
             // `OPT_BIT_F(0, "ext-diff", &options->flags.allow_external, ...)`: the
-            // negation clears the bit `cmd_diff()` set (builtin/diff.c:511). This port
-            // never hands a no-index pair to an external program, so the cleared bit is
-            // the state it already runs in.
-            "--no-ext-diff" => {}
+            // negation clears the bit `cmd_diff()` set (builtin/diff.c:511).
+            "--ext-diff" => allow_external = true,
+            "--no-ext-diff" => allow_external = false,
             s if s.starts_with("--ignore-matching-lines=") => {
                 if let Err(code) =
                     push_ignore_regex(&mut ignore_lines, &s["--ignore-matching-lines=".len()..])
@@ -1524,7 +1539,25 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         }
         None => None,
     };
-    let opts = Opts {
+    // `external_diff()` (diff.c:558-574): `GIT_EXTERNAL_DIFF` first, then the
+    // `diff.external` / `diff.trustExitCode` pair `git_diff_ui_config()` read before
+    // `cmd_diff()` branched here (builtin/diff.c:489) — off the repository's cascade
+    // when the comparison started inside one, else off the global one.
+    let external = match (allow_external, &repo) {
+        (false, _) => None,
+        (true, Some(repo)) => super::diff::external_diff_program(repo)?,
+        (true, None) => match super::diff_pairs::external_diff_env().map_err(crate::fatal::die)? {
+            Some(env) => Some(env),
+            None => {
+                let cfg = crate::config::global_config();
+                cfg.string("diff.external").map(|cmd| super::diff_pairs::ExternalDiff {
+                    cmd: cmd.to_string(),
+                    trust_exit_code: cfg.boolean("diff.trustExitCode").ok().flatten().unwrap_or(false),
+                })
+            }
+        },
+    };
+    let mut opts = Opts {
         fmt: fmt.resolved(),
         ctx,
         ws,
@@ -1557,6 +1590,8 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         pickaxe,
         pickaxe_all,
         paint: diff_color::PaintOptions { ws_error_highlight, line_prefix, ..Default::default() },
+        allow_external,
+        external,
         extra: match &repo {
             Some(repo) => match move_word.resolve(repo) {
                 Ok(extra) => extra,
@@ -1576,6 +1611,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             },
         },
     };
+    // `diff_setup_done()`: `if (options->flags.allow_external && external_diff())
+    // options->color_moved = 0;` (diff.c:5346-5347). The program's output is never
+    // painted, so there would be nothing for move detection to pair it with.
+    if opts.external.is_some() {
+        opts.extra.color_moved = None;
+    }
 
     // `diff_setup_done()`: `--find-copies-harder` implies copy detection
     // (diff.c:5288-5289), and `--quiet` — git's `flags.quick` — turns detection
@@ -1627,7 +1668,19 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
         Some(repo) => Some(crate::userdiff::Lookup::new(repo)?),
         None => None,
     };
-    let (out, changed, paints, check_failed) = match compare_with_drivers(
+    // `diff_flush()` asks `diff_flush_patch_quietly()` — which hands the pair to the
+    // external program with no output — before each raw, name or check line, and
+    // before the exit status of a `--quiet` run, whenever `diff_from_contents` is up
+    // (diff.c:7190, 7244-7252). Running the program for that probe is not ported;
+    // refuse rather than report the built-in comparison's answer as the program's.
+    // A program that cannot report "no change" is never run by the probe — the pair
+    // simply counts as changed (diff.c:4774-4777) — so only a trusted exit code
+    // needs the probe itself.
+    let from_contents = opts.ws != super::diff::Whitespace::Keep || !opts.ignore_lines.is_empty();
+    if opts.external.as_ref().is_some_and(|p| p.trust_exit_code) && from_contents && probes_quietly(&opts) {
+        anyhow::bail!("unsupported: a trusted external diff exit code under a whitespace or -I option with a raw, name, check or quiet format");
+    }
+    let compared = match compare_with_drivers(
         &pair[0],
         &pair[1],
         reverse,
@@ -1646,20 +1699,32 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // `diffcore_pickaxe()`'s objfind arm keeps a pair only when a side is
     // `DIFF_FILE_VALID` with an oid in the set (diffcore-pickaxe.c). A no-index
     // filespec never has a valid oid, so `--find-object` drops every pair.
-    let (out, changed, paints, check_failed) = match find_object {
-        true => (Vec::new(), false, Vec::new(), false),
-        false => (out, changed, paints, check_failed),
+    let compared = match find_object {
+        true => Compared::default(),
+        false => compared,
     };
 
     if !opts.fmt.quiet {
-        let painted = diff_color::colorize_patch_ex(
-            &out,
-            &opts.colors,
-            &opts.paint,
-            &paints,
-            diff_color::FilePaint::new(ws_rule),
-            &opts.extra,
-        );
+        // The port's own sections are painted; what an external program wrote goes
+        // out as it wrote it, between them.
+        let paint = |bytes: &[u8], paints: &[diff_color::FilePaint]| {
+            diff_color::colorize_patch_ex(
+                bytes,
+                &opts.colors,
+                &opts.paint,
+                paints,
+                diff_color::FilePaint::new(ws_rule),
+                &opts.extra,
+            )
+        };
+        let mut painted = Vec::new();
+        let (mut at, mut painted_files) = (0, 0);
+        for (span, files_before) in &compared.raw {
+            painted.extend(paint(&compared.out[at..span.start], &compared.paints[painted_files..*files_before]));
+            painted.extend_from_slice(&compared.out[span.clone()]);
+            (at, painted_files) = (span.end, *files_before);
+        }
+        painted.extend(paint(&compared.out[at..], &compared.paints[painted_files..]));
         // `--line-prefix` is written by the painter, which knows the word diff's
         // records place it themselves.
         use std::io::Write;
@@ -1676,9 +1741,12 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             }
         }
     }
+    if let Some(msg) = compared.died {
+        return Err(crate::fatal::die(msg));
+    }
     // `diff_result_code()`: `01` for a difference — git-diff(1): "this option
     // implies --exit-code" — and `02` for `--check`'s `check_failed`.
-    let code = u8::from(changed) | (u8::from(check_failed) << 1);
+    let code = u8::from(compared.changed) | (u8::from(compared.check_failed) << 1);
     Ok(ExitCode::from(code))
 }
 
@@ -1693,7 +1761,7 @@ fn compare(
     rename_opts: &super::diffcore_rename::Options,
     ws_rule: u32,
     stdin_data: Option<Vec<u8>>,
-) -> std::result::Result<(Vec<u8>, bool, Vec<diff_color::FilePaint>, bool), String> {
+) -> std::result::Result<Compared, String> {
     compare_with_drivers(lhs, rhs, reverse, opts, rename_opts, ws_rule, stdin_data, None)
 }
 
@@ -1791,7 +1859,7 @@ fn compare_with_drivers(
     ws_rule: u32,
     stdin_data: Option<Vec<u8>>,
     mut drivers: Option<&mut crate::userdiff::Lookup<'_>>,
-) -> std::result::Result<(Vec<u8>, bool, Vec<diff_color::FilePaint>, bool), String> {
+) -> std::result::Result<Compared, String> {
     let mut pairs = queue(lhs, rhs)?;
     // `queue_diff()`'s `SWAP(mode1, mode2); SWAP(name1, name2); SWAP(special1,
     // special2)` (diff-no-index.c:279-283). It sits at the leaf of the walk, past
@@ -1947,6 +2015,12 @@ fn compare_with_drivers(
     let mut check_out: Vec<u8> = Vec::new();
     let mut check_failed = false;
     let mut changed = false;
+    // Spans of `patch` an external program wrote, each with the number of `paints`
+    // entries written before it; `o->diff_path_counter`; and the program's `die()`.
+    let mut raw: Vec<(std::ops::Range<usize>, usize)> = Vec::new();
+    let mut counter = 0u32;
+    let mut died: Option<String> = None;
+    let total = q.pairs.len();
     // `diff_setup_done()` (diff.c:4899): the whitespace family makes "is there a
     // change?" a question only the rendered content can answer, so it raises
     // `flags.diff_from_contents`, and `diff_flush()` then reports `found_changes`
@@ -1988,6 +2062,24 @@ fn compare_with_drivers(
         };
         let old_data = content.bytes(&a.name).filter(|_| a.file.is_some()).unwrap_or_default();
         let new_data = content.bytes(&b.name).filter(|_| b.file.is_some()).unwrap_or_default();
+        // `run_diff_cmd()` (diff.c:4931-4935): `attr_path` is the pre-image name, and
+        // a driver it selects that names a `diff.<driver>.command` outranks
+        // `external_diff()`'s program. Either way the program's output is the pair's
+        // whole patch section, so `builtin_diff()` — textconv included — never runs
+        // for it.
+        let pgm = match opts.allow_external && (opts.fmt.patch || from_contents) {
+            false => None,
+            true => drivers
+                .as_deref_mut()
+                .and_then(|lookup| lookup.for_path(a.name.as_bstr()).ok().flatten())
+                .and_then(|drv| {
+                    drv.settings.external.clone().map(|cmd| super::diff_pairs::ExternalDiff {
+                        cmd,
+                        trust_exit_code: drv.settings.trust_exit_code,
+                    })
+                })
+                .or_else(|| opts.external.clone()),
+        };
         // A pair that reaches this point and still has identical content is a
         // rename or copy the detection just made; the stat-unmatch pass above
         // already dropped every same-name pair whose content never changed.
@@ -2001,7 +2093,7 @@ fn compare_with_drivers(
         // between the sides' textconv output, and a side that has one is never
         // binary there. The header's `index` line and the stat formats keep the
         // bytes on disk.
-        let (conv_one, conv_two) = match opts.textconv && opts.fmt.patch {
+        let (conv_one, conv_two) = match opts.textconv && opts.fmt.patch && pgm.is_none() {
             true => (
                 textconv_side(drivers.as_deref_mut(), &drv_one, a, &old_data),
                 textconv_side(drivers.as_deref_mut(), &drv_two, b, &new_data),
@@ -2120,6 +2212,16 @@ fn compare_with_drivers(
             // The binary arm prints `Binary files … differ` and its header with it,
             // but only once the two sides are known to differ (diff.c:3672).
             || (binary && !same_content);
+        // Under `diff_from_contents` the quiet probe asks the pair's program, and
+        // one without a trusted exit code is not even run: the pair has changed
+        // (diff.c:4774-4777).
+        let must_show = match (&pgm, from_contents) {
+            (Some(p), true) if p.trust_exit_code && probes_quietly(opts) => {
+                return Err("unsupported: a trusted external diff exit code under a whitespace or -I option with a raw, name, check or quiet format".into());
+            }
+            (Some(p), true) if !p.trust_exit_code => true,
+            _ => must_show,
+        };
         stats.last_mut().expect("just pushed").shown = must_show;
         // `diff_flush_checkdiff()` (diff.c): an unmodified pair is skipped, and only
         // the *new* side is examined — `--check` reports what the change introduces.
@@ -2132,6 +2234,19 @@ fn compare_with_drivers(
                 ws_rule,
                 &opts.colors,
             );
+        }
+        if let Some(pgm) = pgm.filter(|_| opts.fmt.patch) {
+            counter += 1;
+            let run = run_external(&pgm, a, b, &old_data, &new_data, opts, stat_binary, &pair, counter, total)?;
+            changed |= !from_contents || run.found_changes;
+            let start = patch.len();
+            patch.extend_from_slice(&run.stdout);
+            raw.push((start..patch.len(), paints.len()));
+            if run.died.is_some() {
+                died = run.died;
+                break;
+            }
+            continue;
         }
         changed |= !from_contents || must_show;
         if opts.fmt.patch && must_show {
@@ -2230,9 +2345,13 @@ fn compare_with_drivers(
         if !out.is_empty() {
             out.push(if opts.z { 0 } else { b'\n' });
         }
+        let base = out.len();
+        for (span, _) in &mut raw {
+            *span = span.start + base..span.end + base;
+        }
         out.extend_from_slice(&patch);
     }
-    Ok((out, changed, paints, check_failed))
+    Ok(Compared { out, changed, paints, check_failed, raw, died })
 }
 
 /// `builtin_checkdiff()` (diff.c:4281) driving `checkdiff_consume()` (diff.c:3555)
@@ -2398,16 +2517,7 @@ fn emit_header(
     // really is binary, so text pairs in the same run keep the abbreviation.
     // `diff_abbrev_oid()` truncates whatever id it is given to that same width, so
     // the null id of an absent — or standard-input — side widens with it.
-    let hexsz = HASH_KIND.len_in_hex();
-    let width = if opts.full_index || (opts.binary && binary) { hexsz } else { opts.abbrev.min(hexsz) };
-    let hash = |data: &[u8], exists: bool, is_stdin: bool| -> String {
-        // `diff_fill_oid_info()` returns the null id for a filespec fed from
-        // standard input rather than hashing the stream.
-        if !exists || is_stdin {
-            return "0".repeat(width);
-        }
-        blob_id(data).to_hex().to_string()[..width].to_string()
-    };
+    let width = index_width(opts, binary);
 
     match (a.file.is_some(), b.file.is_some()) {
         (false, true) => {
@@ -2426,21 +2536,7 @@ fn emit_header(
     // `fill_metainfo()`'s `xfrm_msg` for a rename or copy, between the mode lines
     // and the `index` line. The two names go in raw — no `a/`/`b/` prefix and, as
     // stock confirms for an absolute operand, no leading-slash strip either.
-    if matches!(pair.status, b'R' | b'C') {
-        let verb = if pair.status == b'C' { "copy" } else { "rename" };
-        out.extend_from_slice(
-            format!(
-                "similarity index {}%\n",
-                super::diffcore_rename::similarity_index(pair.score)
-            )
-            .as_bytes(),
-        );
-        out.extend_from_slice(format!("{verb} from ").as_bytes());
-        out.extend_from_slice(a.name.as_bytes());
-        out.extend_from_slice(format!("\n{verb} to ").as_bytes());
-        out.extend_from_slice(b.name.as_bytes());
-        out.push(b'\n');
-    }
+    push_rename_lines(out, a, b, pair);
 
     // A pure mode change — and a rename or copy that moved the content unaltered —
     // has nothing to describe, so no `index` line and no file markers follow.
@@ -2448,15 +2544,7 @@ fn emit_header(
         return;
     }
 
-    out.extend_from_slice(b"index ");
-    out.extend_from_slice(hash(old_data, a.file.is_some(), a.name == STDIN_NAME).as_bytes());
-    out.extend_from_slice(b"..");
-    out.extend_from_slice(hash(new_data, b.file.is_some(), b.name == STDIN_NAME).as_bytes());
-    // The mode is repeated on the index line only when both sides share it.
-    if a.file.is_some() && b.file.is_some() && a.mode == b.mode {
-        out.extend_from_slice(format!(" {:o}", a.mode).as_bytes());
-    }
-    out.push(b'\n');
+    push_index_line(out, a, b, old_data, new_data, width);
 
     // `emit_diff_symbol(DIFF_SYMBOL_FILEPAIR_*)` is skipped for a binary pair:
     // there are no line markers to introduce. `-D` skips them for the same reason —
@@ -2471,6 +2559,198 @@ fn emit_header(
     out.extend_from_slice(b"+++ ");
     push_name(out, &opts.dst_prefix, b.header_name(a), b.file.is_some());
     out.push(b'\n');
+}
+
+/// Whether `diff_flush()` runs `diff_flush_patch_quietly()` for the selected
+/// formats under `diff_from_contents` (diff.c:7180-7192, 7244-7252).
+fn probes_quietly(opts: &Opts) -> bool {
+    opts.fmt.raw || opts.fmt.name_only || opts.fmt.name_status || opts.fmt.check || opts.fmt.quiet
+}
+
+/// The `index` line's width: `fill_metainfo()`'s abbreviation, widened to the full
+/// object name under `--full-index`, and under `--binary` for a binary pair.
+fn index_width(opts: &Opts, binary: bool) -> usize {
+    let hexsz = HASH_KIND.len_in_hex();
+    if opts.full_index || (opts.binary && binary) { hexsz } else { opts.abbrev.min(hexsz) }
+}
+
+/// `fill_metainfo()`'s similarity block for a rename or copy (diff.c:4871-4886).
+/// The two names go in raw — no `a/`/`b/` prefix and, as stock confirms for an
+/// absolute operand, no leading-slash strip either.
+fn push_rename_lines(out: &mut Vec<u8>, a: &Side, b: &Side, pair: &super::diffcore_rename::Pair) {
+    if !matches!(pair.status, b'R' | b'C') {
+        return;
+    }
+    let verb = if pair.status == b'C' { "copy" } else { "rename" };
+    out.extend_from_slice(
+        format!("similarity index {}%\n", super::diffcore_rename::similarity_index(pair.score)).as_bytes(),
+    );
+    out.extend_from_slice(format!("{verb} from ").as_bytes());
+    out.extend_from_slice(a.name.as_bytes());
+    out.extend_from_slice(format!("\n{verb} to ").as_bytes());
+    out.extend_from_slice(b.name.as_bytes());
+    out.push(b'\n');
+}
+
+/// `diff_fill_oid_info()` (diff.c:4969-4995) for a no-index side: the null id for
+/// a side that does not exist or is fed from standard input, the blob hash of the
+/// bytes on disk otherwise.
+fn side_oid(side: &Side, data: &[u8]) -> gix::ObjectId {
+    if side.file.is_none() || side.name == STDIN_NAME {
+        return gix::ObjectId::null(HASH_KIND);
+    }
+    blob_id(data)
+}
+
+/// `fill_metainfo()`'s `index <old>..<new>[ <mode>]` line (diff.c:4895-4913). The
+/// mode is repeated only when both sides share it.
+fn push_index_line(out: &mut Vec<u8>, a: &Side, b: &Side, old_data: &[u8], new_data: &[u8], width: usize) {
+    out.extend_from_slice(b"index ");
+    out.extend_from_slice(side_oid(a, old_data).to_hex().to_string()[..width].as_bytes());
+    out.extend_from_slice(b"..");
+    out.extend_from_slice(side_oid(b, new_data).to_hex().to_string()[..width].as_bytes());
+    if a.file.is_some() && b.file.is_some() && a.mode == b.mode {
+        out.extend_from_slice(format!(" {:06o}", a.mode).as_bytes());
+    }
+    out.push(b'\n');
+}
+
+/// What [`compare_with_drivers`] hands back to be painted and written.
+#[derive(Default)]
+struct Compared {
+    /// The whole stream, uncoloured.
+    out: Vec<u8>,
+    /// `has_changes`, or `found_changes` under `diff_from_contents`.
+    changed: bool,
+    /// One entry per `diff --git` section the port itself wrote, in order.
+    paints: Vec<diff_color::FilePaint>,
+    check_failed: bool,
+    /// Byte ranges of `out` an external program wrote, each with the number of
+    /// `paints` entries before it. git's child writes straight to the output
+    /// descriptor (diff.c:4799-4803), so these bytes are never painted and never
+    /// carry `--line-prefix`.
+    raw: Vec<(std::ops::Range<usize>, usize)>,
+    /// `die(_("external diff died, stopping at %s"))` (diff.c:4811), raised once
+    /// everything before it — the child's own output included — has gone out.
+    died: Option<String>,
+}
+
+/// `prepare_temp_file()` (diff.c:4697-4754) for a no-index side, which never has
+/// a valid object id, so it always takes the "borrow from the work tree" arm:
+/// `lstat(one->path)`, then the path itself named by the null id, or — for a
+/// symlink — a temporary file holding its target, named by the null id and
+/// `S_IFLNK`. A side that is not a valid filespec, or whose path does not exist
+/// (standard input, read from `-`), is the `/dev/null . .` triple.
+fn temp_side(side: &Side) -> std::result::Result<super::diff_pairs::TempSide, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let not_a_valid_file = || super::diff_pairs::TempSide {
+        dir: None,
+        name: std::ffi::OsString::from(DEV_NULL),
+        hex: ".".to_string(),
+        mode: ".".to_string(),
+    };
+    if side.file.is_none() {
+        return Ok(not_a_valid_file());
+    }
+    let path = Path::new(std::ffi::OsStr::from_bytes(&side.name));
+    let null = gix::ObjectId::null(HASH_KIND).to_hex().to_string();
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(not_a_valid_file()),
+        Err(e) => return Err(format!("stat({}): {}", side.name, super::diff_pairs::io_reason(&e))),
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(super::diff_pairs::TempSide {
+            dir: None,
+            name: path.as_os_str().to_os_string(),
+            hex: null,
+            mode: format!("{:06o}", side.mode),
+        });
+    }
+    let target = std::fs::read_link(path)
+        .map_err(|e| format!("readlink({}): {}", side.name, super::diff_pairs::io_reason(&e)))?;
+    let dir = super::cat_file::temp_blob_dir().map_err(|e| e.to_string())?;
+    // `mks_tempfile_ts()` names the file after the path's last component.
+    let base = side.name.rsplit(|&c| c == b'/').find(|c| !c.is_empty()).unwrap_or(b"blob");
+    let file = dir.join(std::ffi::OsStr::from_bytes(base));
+    if let Err(e) = std::fs::write(&file, target.as_os_str().as_bytes()) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!("unable to write temp-file: {e}"));
+    }
+    Ok(super::diff_pairs::TempSide {
+        dir: Some(dir),
+        name: file.into_os_string(),
+        hex: null,
+        mode: "120000".to_string(),
+    })
+}
+
+/// `run_external_diff()` (diff.c:4756-4814) for one no-index pair: `<name>
+/// <old-file> <old-hex> <old-mode> <new-file> <new-hex> <new-mode>`, then — the
+/// two names differ for every pair a no-index walk queues — the post-image name
+/// and `fill_metainfo()`'s uncoloured header when it has one. That header carries
+/// no mode lines; `builtin_diff()` writes those itself.
+#[allow(clippy::too_many_arguments)]
+fn run_external(
+    pgm: &super::diff_pairs::ExternalDiff,
+    a: &Side,
+    b: &Side,
+    old_data: &[u8],
+    new_data: &[u8],
+    opts: &Opts,
+    binary: bool,
+    pair: &super::diffcore_rename::Pair,
+    counter: u32,
+    total: usize,
+) -> std::result::Result<super::diff_pairs::ExtRun, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let one = temp_side(a)?;
+    let two = match temp_side(b) {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(d) = &one.dir {
+                let _ = std::fs::remove_dir_all(d);
+            }
+            return Err(e);
+        }
+    };
+    let mut argv: Vec<std::ffi::OsString> = vec![
+        std::ffi::OsStr::from_bytes(&a.name).to_os_string(),
+        one.name.clone(),
+        one.hex.clone().into(),
+        one.mode.clone().into(),
+        two.name.clone(),
+        two.hex.clone().into(),
+        two.mode.clone().into(),
+    ];
+    if a.name != b.name {
+        argv.push(std::ffi::OsStr::from_bytes(&b.name).to_os_string());
+        let mut msg = Vec::new();
+        push_rename_lines(&mut msg, a, b, pair);
+        if pair.status == b'M' && pair.score != 0 {
+            msg.extend_from_slice(
+                format!("dissimilarity index {}%\n", super::diffcore_rename::similarity_index(pair.score))
+                    .as_bytes(),
+            );
+        }
+        if side_oid(a, old_data) != side_oid(b, new_data) {
+            push_index_line(&mut msg, a, b, old_data, new_data, index_width(opts, binary));
+        }
+        if !msg.is_empty() {
+            // `fill_metainfo()` opens every line with `diff_line_prefix(o)`; only the
+            // program's own output goes without it.
+            let msg: Vec<u8> = msg
+                .split_inclusive(|&c| c == b'\n')
+                .flat_map(|line| opts.line_prefix.iter().chain(line).copied())
+                .collect();
+            argv.push(std::ffi::OsStr::from_bytes(&msg).to_os_string());
+        }
+    }
+    let run = super::diff_pairs::spawn_external(pgm, &a.name, &argv, None, counter, total, true);
+    for dir in [one.dir, two.dir].into_iter().flatten() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    Ok(run)
 }
 
 /// `--stat` / `--numstat` / `--shortstat` / `--name-only` / `--name-status` /
@@ -2728,7 +3008,7 @@ mod tests {
 
     fn compared(s: &Scratch, fmt: Format, rename: &super::super::diffcore_rename::Options) -> String {
         let o = opts(fmt.resolved(), 7);
-        let (out, ..) = compare(&s.at("A"), &s.at("B"), false, &o, rename, 0, None)
+        let Compared { out, .. } = compare(&s.at("A"), &s.at("B"), false, &o, rename, 0, None)
             .expect("readable operands");
         String::from_utf8(out).expect("ascii fixtures")
     }
@@ -2773,6 +3053,8 @@ mod tests {
             pickaxe_all: false,
             paint: diff_color::PaintOptions::default(),
             extra: diff_color::ExtraPaint::default(),
+            allow_external: false,
+            external: None,
         }
     }
 

@@ -3482,13 +3482,13 @@ pub(crate) fn external_for_path(
 }
 
 /// One side of the argument triple `run_external_diff()` hands the driver.
-struct TempSide {
+pub(crate) struct TempSide {
     /// The private directory holding the temporary file, removed once the driver
     /// has run. `None` for the `/dev/null` placeholder, which owns nothing.
-    dir: Option<std::path::PathBuf>,
-    name: std::ffi::OsString,
-    hex: String,
-    mode: String,
+    pub(crate) dir: Option<std::path::PathBuf>,
+    pub(crate) name: std::ffi::OsString,
+    pub(crate) hex: String,
+    pub(crate) mode: String,
 }
 
 /// `prepare_temp_file()` (diff.c:4698).
@@ -3743,15 +3743,38 @@ pub(crate) fn run_external_diff(
             argv.push(std::ffi::OsStr::from_bytes(&xfrm).to_os_string());
         }
     }
-    let mut cmd = crate::external::prepare_shell_cmd_str(&pgm.cmd, &argv);
     // The child inherits git's working directory, which `setup_git_directory()`
     // moved to the top of the worktree: the worktree paths in `argv` are relative
     // to it, and so is anything the program itself opens.
-    if let Some(workdir) = repo.workdir() {
-        cmd.current_dir(workdir);
-    }
     ctx.counter.set(ctx.counter.get() + 1);
-    cmd.env("GIT_DIFF_PATH_COUNTER", ctx.counter.get().to_string());
+    let run = spawn_external(pgm, &name, &argv, repo.workdir(), ctx.counter.get(), total, want_output);
+    for dir in [one.dir, two.dir].into_iter().flatten() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    Ok(run)
+}
+
+/// The child half of `run_external_diff()` (diff.c:4779-4811): `argv` is the
+/// seven-or-more argument group after the program, `counter` is the
+/// already-incremented `o->diff_path_counter`, and `total` is `q->nr`.
+///
+/// Shared by every caller that hands a pair to an external program, whatever
+/// prepared the two temporary sides — the tracked diffs through
+/// [`prepare_temp_file`], `diff --no-index` straight from the paths on disk.
+pub(crate) fn spawn_external(
+    pgm: &ExternalDiff,
+    name: &[u8],
+    argv: &[std::ffi::OsString],
+    cwd: Option<&std::path::Path>,
+    counter: u32,
+    total: usize,
+    want_output: bool,
+) -> ExtRun {
+    let mut cmd = crate::external::prepare_shell_cmd_str(&pgm.cmd, argv);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    cmd.env("GIT_DIFF_PATH_COUNTER", counter.to_string());
     cmd.env("GIT_DIFF_PATH_TOTAL", total.to_string());
     cmd.stdout(if want_output {
         std::process::Stdio::piped()
@@ -3761,9 +3784,6 @@ pub(crate) fn run_external_diff(
     });
 
     let spawned = cmd.spawn().and_then(|child| child.wait_with_output());
-    for dir in [one.dir, two.dir].into_iter().flatten() {
-        let _ = std::fs::remove_dir_all(dir);
-    }
 
     let died = format!("external diff died, stopping at {}", name.to_str_lossy());
     let (rc, stdout) = match spawned {
@@ -3778,11 +3798,11 @@ pub(crate) fn run_external_diff(
             } else {
                 eprintln!("error: cannot run {}: {}", pgm.cmd, io_reason(&e));
             }
-            return Ok(ExtRun {
+            return ExtRun {
                 stdout: Vec::new(),
                 found_changes: false,
                 died: Some(died),
-            });
+            };
         }
     };
 
@@ -3792,11 +3812,11 @@ pub(crate) fn run_external_diff(
         (true, 1) => (true, None),
         _ => (false, Some(died)),
     };
-    Ok(ExtRun {
+    ExtRun {
         stdout,
         found_changes,
         died,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------

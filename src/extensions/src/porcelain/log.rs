@@ -10628,10 +10628,15 @@ fn expand_one(
         // ```
         //
         // (`pretty.c:1747-1751`.) The `encoding` header verbatim, and nothing at
-        // all for a commit without one — which is every commit git writes itself,
-        // since it re-encodes the message to UTF-8 and drops the header.
+        // all for a commit without one. `c->commit_encoding` is the header of the
+        // *stored* commit — `repo_logmsg_reencode()` hands it back before it
+        // re-codes (pretty.c:724-726) — while the buffer rendered here has already
+        // been re-coded to UTF-8, which drops the header. So it is read from the
+        // object as stored.
         'e' => {
-            if let Some(encoding) = commit.decode()?.encoding {
+            let stored = ctx.repo.find_object(commit.id)?;
+            let header = stored.data.split(|&b| b == b'\n').take_while(|line| !line.is_empty());
+            if let Some(encoding) = header.filter_map(|line| line.strip_prefix(b"encoding ")).next() {
                 out.extend_from_slice(encoding);
             }
         }

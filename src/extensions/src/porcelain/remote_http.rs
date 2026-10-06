@@ -281,13 +281,20 @@ fn remote_url(name: &str) -> Vec<u8> {
 /// prefix `url`, the longest one wins and is replaced by its `<base>`; with no
 /// match `url` comes back unchanged.
 pub(crate) fn alias_url(file: &gix::config::File, url: &BStr) -> BString {
+    alias_url_by(file, url, "insteadOf").unwrap_or_else(|| url.to_owned())
+}
+
+/// `alias_url()` over one table of rewrites — `url.<base>.insteadOf`
+/// (`rewrites`) or `url.<base>.pushInsteadOf` (`rewrites_push`) — and `None`
+/// where git returns `NULL` because no prefix matched.
+pub(crate) fn alias_url_by(file: &gix::config::File, url: &BStr, key: &str) -> Option<BString> {
     let mut best: Option<(BString, usize)> = None;
     if let Some(sections) = file.sections_by_name("url") {
         for section in sections {
             let Some(base) = section.header().subsection_name() else {
                 continue;
             };
-            for prefix in section.values("insteadOf") {
+            for prefix in section.values(key) {
                 if url.starts_with(prefix.as_slice())
                     && best.as_ref().is_none_or(|(_, len)| prefix.len() > *len)
                 {
@@ -297,13 +304,10 @@ pub(crate) fn alias_url(file: &gix::config::File, url: &BStr) -> BString {
         }
     }
 
-    match best {
-        Some((mut base, len)) => {
-            base.extend_from_slice(&url[len..]);
-            base
-        }
-        None => url.to_owned(),
-    }
+    best.map(|(mut base, len)| {
+        base.extend_from_slice(&url[len..]);
+        base
+    })
 }
 
 /// `credential.c::credential_from_url_1(c, url, allow_partial = 0, quiet = 0)`,

@@ -1055,7 +1055,10 @@ git push <groupname>\n"
         record_upstreams(&repo, &remote_name, &outcome, &upstreams, f.dry_run, f.quiet);
     }
     if !f.dry_run {
-        update_tracking_refs(&repo, &remote, &outcome, f.verbose);
+        match remote_for_push_tracking(&repo, &remote, remote_name.as_str()) {
+            Some(configured) => update_tracking_refs(&repo, &configured, &outcome, f.verbose),
+            None => update_tracking_refs(&repo, &remote, &outcome, f.verbose),
+        }
     }
     // ```c
     // if (porcelain && !push_ret)
@@ -2346,6 +2349,72 @@ fn record_upstreams(
             println!("branch '{branch}' set up to track '{remote_name}/{short}'.");
         }
     }
+}
+
+/// `repo_remote_for_push_tracking()` (remote.c:1916-1945): a push to a URL or
+/// path rather than a remote name updates the tracking refs of the one
+/// configured remote whose push URL is exactly that string, or of none when
+/// two remotes share it. `None` means "the transport's own remote", which is
+/// what a named remote always gets.
+///
+/// The URL lists are the ones `alias_all_urls()` (remote.c:605-635) leaves on
+/// each configured remote — `pushurl` rewritten by `insteadOf`, or, with no
+/// `pushurl`, the `pushInsteadOf` aliases of its `url`s, else those `url`s
+/// rewritten by `insteadOf` (`push_url_of_remote()`, remote.c:959-962) — and,
+/// for the anonymous remote, the same rules applied to the name it was given
+/// (`add_url_alias()`, remote.c:100-107).
+fn remote_for_push_tracking<'repo>(
+    repo: &'repo gix::Repository,
+    remote: &gix::Remote<'_>,
+    given: &str,
+) -> Option<gix::Remote<'repo>> {
+    use gix::bstr::BStr;
+    if remote.name().is_some() {
+        return None;
+    }
+    let config = repo.config_snapshot();
+    let file = config.plumbing();
+    let alias = |url: &BStr, key: &str| super::remote_http::alias_url_by(file, url, key);
+    let push_urls = |url: Vec<gix::bstr::BString>, pushurl: Vec<gix::bstr::BString>| -> Vec<gix::bstr::BString> {
+        if !pushurl.is_empty() {
+            return pushurl.iter().map(|u| alias(u.as_ref(), "insteadOf").unwrap_or_else(|| u.clone())).collect();
+        }
+        let aliased: Vec<_> = url.iter().filter_map(|u| alias(u.as_ref(), "pushInsteadOf")).collect();
+        match aliased.is_empty() {
+            false => aliased,
+            true => url.iter().map(|u| alias(u.as_ref(), "insteadOf").unwrap_or_else(|| u.clone())).collect(),
+        }
+    };
+    let check = push_urls(vec![given.into()], Vec::new());
+    let [check] = check.as_slice() else {
+        return None;
+    };
+    // `add_url()`/`add_pushurl()` (remote.c:75-89): an empty value clears the list.
+    let values = |name: &BStr, key: &str| {
+        file.strings_by("remote", Some(name), key)
+            .unwrap_or_default()
+            .into_iter()
+            .fold(Vec::new(), |mut list, value| {
+                if value.is_empty() {
+                    list.clear();
+                } else {
+                    list.push(value);
+                }
+                list
+            })
+    };
+    let mut first_match = None;
+    for name in repo.remote_names() {
+        let candidate = push_urls(values(name.as_ref(), "url"), values(name.as_ref(), "pushurl"));
+        if !candidate.contains(check) {
+            continue;
+        }
+        if first_match.is_some() {
+            return None;
+        }
+        first_match = Some(name);
+    }
+    repo.find_remote(first_match?.as_bstr()).ok()
 }
 
 /// Advance (or delete) the local remote-tracking refs for every ref the remote

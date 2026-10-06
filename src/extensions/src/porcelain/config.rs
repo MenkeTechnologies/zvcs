@@ -4749,7 +4749,8 @@ fn resolve_write_target(scope: &Scope, repo: Option<&gix::Repository>) -> Result
                 Scope::Local => {
                     anyhow::anyhow!("--local can only be used inside a git repository")
                 }
-                _ => anyhow::anyhow!("not in a git directory"),
+                // `check_write()` (builtin/config.c:815): a `die()`, exit 128.
+                _ => crate::fatal::die("not in a git directory"),
             })?;
             Ok(WriteTarget {
                 path: repo.common_dir().join("config"),

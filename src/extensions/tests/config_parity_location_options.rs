@@ -196,3 +196,15 @@ fn repo_scopes_outside_a_repository_are_fatal() {
     assert_eq!((out.as_str(), code), ("", 128));
     assert_eq!(err, "fatal: --blob can only be used inside a git repository\n");
 }
+
+/// Every write with no repository and no file is `check_write()`'s
+/// `die(_("not in a git directory"))` (builtin/config.c:812-815), exit 128 —
+/// the `<name> <value> <value-pattern>` form included, which zvcs reported as an
+/// ordinary error with a `zvcs:` prefix at exit 1.
+#[test]
+fn a_write_outside_a_repository_dies() {
+    let f = Fixture::new("write-outside");
+    for args in [&["core.x", "y"][..], &["core\\..*", "core\\..*", "core."], &["--replace-all", "core.x", "y", "z"]] {
+        assert_eq!(f.run(args), (String::new(), "fatal: not in a git directory\n".into(), 128), "{args:?}");
+    }
+}

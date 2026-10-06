@@ -331,7 +331,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // Shallow-boundary selectors that combine (git's `--shallow-exclude` is a
     // repeatable list → `deepen_not`, `--shallow-since` → `deepen_since`, and the
     // two may be given together). Resolved into a single `Shallow` after parsing.
-    let mut depth: Option<NonZeroU32> = None;
+    let mut depth: Option<String> = None;
     let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
     let mut shallow_since: Option<gix::date::Time> = None;
     // `-c <key>=<value>`, in command-line order; repeats of a key are kept so each
@@ -558,18 +558,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             "--no-shallow-since" => shallow_since = None,
             "--no-shallow-exclude" => shallow_exclude.clear(),
             "--no-config" => config_pairs.clear(),
-            "--depth" => {
-                let v = take_value!();
-                // `die(_("depth %s is not a positive number"), option_depth)`
-                // (builtin/clone.c) — the value is interpolated bare, without quotes,
-                // and the refusal is a `die()` at 128.
-                let n: u32 = v
-                    .parse()
-                    .map_err(|_| crate::fatal::die(format!("depth {v} is not a positive number")))?;
-                depth = Some(NonZeroU32::new(n).ok_or_else(|| {
-                    crate::fatal::die(format!("depth {v} is not a positive number"))
-                })?);
-            }
+            "--depth" => depth = Some(take_value!()),
             // Shallow boundary at a cutoff date (git's `deepen_since`). `fetch-pack.c:439` runs
             // the value through `approxidate()`, which never fails — an unreadable date is the
             // current time, not an error.
@@ -765,6 +754,32 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     if !url_str.contains(':') && matches!(classify_local_source(url_str), LocalSource::Neither) {
         return Ok(fatal(&format!("repository '{url_str}' does not exist")));
     }
+
+    // ```c
+    // if (option_depth && atoi(option_depth) < 1)
+    //         die(_("depth %s is not a positive number"), option_depth);
+    // ```
+    //
+    // (`cmd_clone()`, builtin/clone.c:1065-1066.) `--depth` is an `OPT_STRING`, so
+    // the value is only judged here — after the operand count and the source
+    // check — and by `atoi()`, which reads ` 2` and `+2` as 2 and `3x` as 3. The
+    // transport then takes it through `strtol(value, &end, 0)` and refuses
+    // trailing junk (transport.c:261-268) — a die that comes later, once the
+    // transport exists, so it is held in `depth_junk` until then.
+    let mut depth_junk: Option<String> = None;
+    let depth: Option<NonZeroU32> = match depth.as_deref() {
+        None => None,
+        Some(v) => {
+            if c_atoi(v) < 1 {
+                return Ok(fatal(&format!("depth {v} is not a positive number")));
+            }
+            let parsed = c_strtol_full(v).and_then(|n| u32::try_from(n).ok()).and_then(NonZeroU32::new);
+            if parsed.is_none() {
+                depth_junk = Some(v.to_string());
+            }
+            Some(parsed.unwrap_or(NonZeroU32::MIN))
+        }
+    };
 
     // Parse the URL up front so a malformed one is reported before touching disk.
     let url = gix::url::parse(url_str.into())?;
@@ -1219,6 +1234,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 eprintln!("warning: {flag} is ignored in local clones; use file:// instead.");
             }
         }
+    }
+
+    // `transport_set_option(transport, TRANS_OPT_DEPTH, option_depth)`, after the
+    // banner and the local-clone warnings and before `git_connect()`.
+    if let Some(v) = depth_junk.as_deref() {
+        eprintln!("fatal: transport: invalid depth option '{v}'");
+        return Ok(ExitCode::from(128));
     }
 
     // git's `transport_check_allowed()`, reached from `git_connect()`
@@ -4733,4 +4755,50 @@ mod tests {
         assert!(read(logs.join("other")).ends_with("commit: /tmp/scratch\n"));
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// C's `atoi()`: leading blanks, one sign, then decimal digits up to the first
+/// other byte; no digits is 0.
+fn c_atoi(s: &str) -> i64 {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let value = digits
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .fold(0i64, |acc, d| acc.saturating_mul(10).saturating_add(i64::from(d - b'0')));
+    if negative { -value } else { value }
+}
+
+/// `strtol(value, &end, 0)` that must consume the whole string (`*end == 0`):
+/// leading blanks, one sign, and a `0x`/`0` prefix choosing hex or octal. `None`
+/// for trailing junk; an empty digit run leaves `end` at the start, which is junk
+/// unless the string is empty.
+fn c_strtol_full(s: &str) -> Option<i64> {
+    if s.is_empty() {
+        return Some(0);
+    }
+    let body = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, rest) = match body.as_bytes().first() {
+        Some(b'-') => (true, &body[1..]),
+        Some(b'+') => (false, &body[1..]),
+        _ => (false, body),
+    };
+    let (radix, digits) = if (rest.starts_with("0x") || rest.starts_with("0X"))
+        && rest[2..].bytes().next().is_some_and(|b| b.is_ascii_hexdigit())
+    {
+        (16, &rest[2..])
+    } else if rest.starts_with('0') {
+        (8, rest)
+    } else {
+        (10, rest)
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let value = i64::from_str_radix(digits, radix).unwrap_or(i64::MAX);
+    Some(if negative { -value } else { value })
 }

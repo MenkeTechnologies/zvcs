@@ -1554,29 +1554,40 @@ pub(crate) fn parse_shared_value(value: &str) -> Result<i32> {
 }
 
 /// Whole-string octal parse mirroring C's `strtol(value, &endptr, 8)` with
-/// `*endptr == 0`: an empty string is 0 (as `strtol` reports), a fully-octal
-/// string is its value, anything else is `None` (falls through to boolean).
+/// `*endptr == 0`: leading whitespace and one sign are skipped, an empty string
+/// is 0 (no digits leaves `endptr` at the start, which is its NUL), a string
+/// that is octal digits to the end is its value — truncated to `int` the way
+/// `i = strtol(…)` assigns it — and anything else is `None` (falls through to
+/// boolean).
 fn parse_octal_full(s: &str) -> Option<i32> {
     if s.is_empty() {
         return Some(0);
     }
-    if s.bytes().all(|b| b.is_ascii_digit() && b <= b'7') {
-        i32::from_str_radix(s, 8).ok()
-    } else {
-        None
+    let body = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match body.as_bytes().first() {
+        Some(b'-') => (true, &body[1..]),
+        Some(b'+') => (false, &body[1..]),
+        _ => (false, body),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        return None;
     }
+    // `strtol()` saturates at `LONG_MAX`; the assignment to `int` then truncates.
+    let value = i64::from_str_radix(digits, 8).unwrap_or(i64::MAX);
+    Some((if negative { value.wrapping_neg() } else { value }) as i32)
 }
 
 /// Port of `git_parse_maybe_bool()` (`config.c`): the three truthy and three
-/// falsy spellings, the empty string as false, and — failing those — a plain
-/// integer read as C's `!!value`. `None` is git's `-1`, the answer that makes
+/// falsy spellings, the empty string as false, and — failing those —
+/// `git_parse_int()` (parse.c:197-198), unit suffixes included, read as C's
+/// `!!value`: `2m` is true. `None` is git's `-1`, the answer that makes
 /// `git_config_bool()` die.
 fn parse_maybe_bool(s: &str) -> Option<bool> {
     match s.to_ascii_lowercase().as_str() {
         "" => Some(false),
         "true" | "yes" | "on" => Some(true),
         "false" | "no" | "off" => Some(false),
-        _ => s.parse::<i64>().ok().map(|v| v != 0),
+        _ => super::range_diff::git_parse_signed(s, i64::from(i32::MIN), i64::from(i32::MAX)).ok().map(|v| v != 0),
     }
 }
 

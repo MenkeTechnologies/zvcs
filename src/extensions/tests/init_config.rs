@@ -276,3 +276,24 @@ fn init_template_replaces_default_template() {
 
     let _ = std::fs::remove_dir_all(zvcs.parent().unwrap());
 }
+
+/// `git_config_perm()` (setup.c:2132-2180) as `--shared=` hands it each value:
+/// `strtol(…, 8)` skips leading blanks and takes a sign, so `-1` is the mode
+/// `0666` and ` 0640` is `0640`; a value that is not octal to its end is a
+/// boolean through `git_parse_maybe_bool()`, whose integer fallback is
+/// `git_parse_int()` with its unit suffixes, so `2m` is true (`1`). The last
+/// `--shared` wins, so a bad-looking earlier one is never parsed into a die of
+/// its own — zvcs died on `2m` with `bad boolean config value`.
+#[test]
+fn init_shared_values_parse_like_git_config_perm() {
+    for (perm, want) in [("-1", "0666"), (" 0640", "0640"), ("+0660", "0660"), ("2m", "1"), ("1k", "1")] {
+        let (home, zvcs, _) = fixture(&format!("shared-perm-{}", perm.trim().replace(['+', '-'], "s")), None);
+        run_init(BIN, &zvcs, &home, &[&format!("--shared={perm}")]);
+        assert_eq!(git_config_get(&zvcs, "core.sharedrepository").as_deref(), Some(want), "--shared={perm:?}");
+        let _ = std::fs::remove_dir_all(zvcs.parent().unwrap());
+    }
+    let (home, zvcs, _) = fixture("shared-last-wins", None);
+    run_init(BIN, &zvcs, &home, &["--shared=0640", "--shared=2m", "--shared=false"]);
+    assert_eq!(git_config_get(&zvcs, "core.sharedrepository"), None);
+    let _ = std::fs::remove_dir_all(zvcs.parent().unwrap());
+}

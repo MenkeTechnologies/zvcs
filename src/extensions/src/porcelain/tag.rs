@@ -1911,6 +1911,13 @@ fn join_verbatim(messages: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Delete each named tag, printing `Deleted tag '<name>' (was <short>)`.
+///
+/// `delete_tags()` (builtin/tag.c:118-140) runs in three passes, and the order of
+/// its lines follows from them: `for_each_tag_name()` reports every name that is
+/// not a tag (`tag '%s' not found.`) while collecting the rest, one
+/// `refs_delete_refs()` transaction removes them all — so naming one tag twice is
+/// `multiple updates for ref '<ref>' not allowed` and nothing is deleted — and only
+/// then is `Deleted tag` printed, for each collected ref that no longer exists.
 fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode> {
     if positionals.is_empty() {
         return Ok(ExitCode::SUCCESS);
@@ -1918,61 +1925,54 @@ fn delete_tags(repo: &gix::Repository, positionals: &[&str]) -> Result<ExitCode>
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    // `delete_tags()` collects the refs and hands them to `repo_delete_refs()`,
-    // which is one transaction: naming the same tag twice is
-    // `multiple updates for ref '<ref>' not allowed`, and *nothing* is deleted —
-    // not even the tags named only once. The check is on the refs that exist, so
-    // a repeated name that resolves to no tag still reports "not found" instead.
-    {
-        let mut seen: Vec<String> = Vec::new();
-        for name in positionals {
-            let ref_name = format!("refs/tags/{name}");
-            if FullName::try_from(ref_name.as_str()).is_err()
-                || repo.try_find_reference(ref_name.as_str())?.is_none()
-            {
-                continue;
-            }
-            if seen.contains(&ref_name) {
-                eprintln!(
-                    "error: could not delete references: multiple updates for ref '{ref_name}' not allowed"
-                );
-                return Ok(ExitCode::FAILURE);
-            }
-            seen.push(ref_name);
-        }
-    }
-
     let mut had_failure = false;
+    let mut to_delete: Vec<(String, FullName, Option<gix::ObjectId>)> = Vec::new();
     for name in positionals {
         let ref_name = format!("refs/tags/{name}");
-        let found = if FullName::try_from(ref_name.as_str()).is_err() {
-            None
-        } else {
-            repo.try_find_reference(ref_name.as_str())?
+        let found = match FullName::try_from(ref_name.as_str()) {
+            Ok(full) => repo.try_find_reference(ref_name.as_str())?.map(|r| (full, r)),
+            Err(_) => None,
         };
-        let Some(r) = found else {
+        let Some((full, r)) = found else {
             eprintln!("error: tag '{name}' not found.");
             had_failure = true;
             continue;
         };
-        let old = r.try_id().map(|id| id.detach());
+        to_delete.push((name.to_string(), full, r.try_id().map(|id| id.detach())));
+    }
 
-        let full: FullName = ref_name
-            .as_str()
-            .try_into()
-            .map_err(|e| anyhow!("invalid tag name {name:?}: {e}"))?;
-        repo.edit_reference(RefEdit {
+    // `ref_transaction_add_update()` refuses a second update of the same ref for
+    // the whole transaction.
+    let duplicate = to_delete
+        .iter()
+        .enumerate()
+        .find(|(i, (_, full, _))| to_delete[..*i].iter().any(|(_, seen, _)| seen == full));
+    if let Some((_, (_, full, _))) = duplicate {
+        eprintln!("error: could not delete references: multiple updates for ref '{full}' not allowed");
+        return Ok(ExitCode::FAILURE);
+    }
+    if !to_delete.is_empty() {
+        let edits = to_delete.iter().map(|(_, full, _)| RefEdit {
             change: Change::Delete {
                 expected: PreviousValue::MustExist,
                 log: RefLog::AndReference,
                 message: Default::default(),
             },
-            name: full,
+            name: full.clone(),
             deref: false,
-        })?;
+        });
+        if let Err(err) = repo.edit_references(edits) {
+            eprintln!("error: could not delete references: {err}");
+            had_failure = true;
+        }
+    }
 
+    for (name, full, old) in &to_delete {
+        if repo.try_find_reference(full.as_ref())?.is_some() {
+            continue;
+        }
         match old {
-            Some(id) => println!("Deleted tag '{name}' (was {})", short_hex(repo, id)),
+            Some(id) => println!("Deleted tag '{name}' (was {})", short_hex(repo, *id)),
             None => println!("Deleted tag '{name}'"),
         }
     }

@@ -1024,48 +1024,27 @@ fn status_report(
         // only picks a progress meter, so the machine formats refresh too.
         //
         // `use_optional_locks()` gates the write, not the walk (:1635-1638), but a
-        // refresh whose result cannot be saved is pure cost, so both sit behind it
-        // here. The index is written through the same racy-entry path
-        // [`update_index_if_able`] uses, and under the same verification: another
-        // process may have rewritten the file while this one was reading it.
-        if crate::setup::git_env_bool("GIT_OPTIONAL_LOCKS", true) && repo.index_path().exists() {
-            let ps_index = repo.index_or_empty()?;
+        // refresh whose result cannot be saved is pure cost, so it runs where the
+        // write is decided — [`update_index_if_able`], under the lock `cmd_status()`
+        // holds — and what it dirtied lands in the same index as what the untracked
+        // walk filled, as in git's single write. Writing the refresh here, ahead of
+        // the report, renewed the index timestamp and so hid the racy entries whose
+        // write would have carried the walk's cache.
+        if crate::setup::git_env_bool("GIT_OPTIONAL_LOCKS", true) && repo.index_path().exists() && !pathspecs.is_empty() {
             // A pathspec the engine refuses is the collection's to report; git has
-            // already died on it in `parse_pathspec()` by this point, so there is
-            // nothing to refresh either way.
-            let ps = match pathspecs.is_empty() {
-                true => None,
-                false => match repo.pathspec(
+            // already died on it in `parse_pathspec()` by this point.
+            let ps_index = repo.index_or_empty()?;
+            if repo
+                .pathspec(
                     false,
                     &pathspecs,
                     false,
                     &ps_index,
                     gix::worktree::stack::state::attributes::Source::IdMapping,
-                ) {
-                    Ok(ps) => Some(ps),
-                    Err(_) => return Ok(ExitCode::from(128)),
-                },
-            };
-            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-            let mut index = repo.open_index()?;
-            let flags = super::update_index::RefreshFlags {
-                quiet: true,
-                allow_unmerged: true,
-                ..Default::default()
-            };
-            let outcome = match ps {
-                Some(mut ps) => super::update_index::refresh_index(
-                    &repo,
-                    &mut index,
-                    flags,
-                    None,
-                    Some(&mut |p: &gix::bstr::BStr| ps.is_included(p, Some(false))),
-                )?,
-                None => super::update_index::refresh_index(&repo, &mut index, flags, None, None)?,
-            };
-            if outcome.dirty && verify_index(&repo, &index) {
-                super::write_tree::prepare_offset_table(&repo, &mut index);
-                write_index_if_lockable(&repo, &mut index)?;
+                )
+                .is_err()
+            {
+                return Ok(ExitCode::from(128));
             }
         }
     }
@@ -1120,7 +1099,7 @@ fn status_report(
             orderfile.as_deref(),
         )?;
         if let Some(lock) = index_lock {
-            update_index_if_able(&repo, lock, untracked_walk)?;
+            update_index_if_able(&repo, lock, &pathspecs, untracked_walk)?;
         }
         return Ok(code);
     }
@@ -1461,7 +1440,7 @@ fn status_report(
     // `cmd_status` runs it — `cmd_commit`'s `run_status()` calls do not, and neither
     // does the block that goes into `COMMIT_EDITMSG`.
     if let Some(lock) = index_lock {
-        update_index_if_able(&repo, lock, untracked_walk)?;
+        update_index_if_able(&repo, lock, &pathspecs, untracked_walk)?;
     }
 
     // git orders each section (and each short-format block) by path.
@@ -1659,19 +1638,20 @@ fn status_report(
 /// has, so it makes the same `tweak_split_index()` decision and performs the same
 /// smudge git's `do_write_index()` does.
 ///
-/// ### What is deliberately not here
-///
-/// `refresh_index()` (builtin/commit.c:1630) runs before this and updates the stat
-/// data of every entry whose worktree file moved but whose content did not, setting
-/// `cache_changed` as it goes. This port's `status` has no refresh pass, so the
-/// entries it writes back carry the stat data they were read with. The condition
-/// above is unaffected — `has_racy_timestamp()` and the split-index half of
-/// `cache_changed` are both computed from the index as read — but an index this
-/// leaves behind can still hold stat data git would have refreshed.
+/// `refresh_index()` (builtin/commit.c:1630) runs here too, on the index re-read under
+/// the lock, so the stat data it repairs, the cache the walk fills and the racy check
+/// all meet in one in-memory index and one write, as they do in git. The report itself
+/// was collected from the index on disk; refreshing changes stat data only, never what
+/// the report says.
 ///
 /// `lock` is the `<index>.lock` `cmd_status` has held since before the collection
 /// (`fd >= 0`); every early return drops it, which is `rollback_lock_file()`.
-fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File, untracked_walk: Option<u32>) -> Result<()> {
+fn update_index_if_able(
+    repo: &gix::Repository,
+    lock: gix::lock::File,
+    pathspecs: &[BString],
+    untracked_walk: Option<u32>,
+) -> Result<()> {
     if !repo.index_path().exists() {
         return Ok(());
     }
@@ -1681,16 +1661,43 @@ fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File, untracked
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let mut index = repo.open_index()?;
 
-    // The untracked walk of `wt_status_collect()`, over the index as read: it fills the
+    // `refresh_index(REFRESH_QUIET|REFRESH_UNMERGED, &s.pathspec)` (builtin/commit.c:1630).
+    let flags = super::update_index::RefreshFlags {
+        quiet: true,
+        allow_unmerged: true,
+        ..Default::default()
+    };
+    let refreshed = if pathspecs.is_empty() {
+        super::update_index::refresh_index(repo, &mut index, flags, None, None)?
+    } else {
+        let ps_index = index.clone();
+        let mut ps = repo.pathspec(
+            false,
+            pathspecs,
+            false,
+            &ps_index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?;
+        super::update_index::refresh_index(
+            repo,
+            &mut index,
+            flags,
+            None,
+            Some(&mut |p: &gix::bstr::BStr| ps.is_included(p, Some(false))),
+        )?
+    };
+
+    // The untracked walk of `wt_status_collect()`, over the refreshed index: it fills the
     // untracked cache and sets `UNTRACKED_CHANGED` when that is worth writing.
     if let Some(dir_flags) = untracked_walk {
         crate::untracked_cache::collect(repo, &mut index, dir_flags)?;
     }
 
-    // `remove_split_index()`'s contribution to `cache_changed`, and `UNTRACKED_CHANGED` from
-    // `tweak_untracked_cache()` on the read or from the walk. The rest of it comes from
-    // `refresh_index()`, which ran and wrote before the report.
-    let cache_changed = (index.had_link() && crate::config::split_index(repo) == Some(false)) || index.untracked_changed();
+    // `cache_changed`: what the refresh dirtied, `remove_split_index()`'s contribution, and
+    // `UNTRACKED_CHANGED` from `tweak_untracked_cache()` on the read or from the walk.
+    let cache_changed = refreshed.dirty
+        || (index.had_link() && crate::config::split_index(repo) == Some(false))
+        || index.untracked_changed();
     if !(cache_changed || has_racy_timestamp(&index)) {
         return Ok(());
     }
@@ -1704,29 +1711,6 @@ fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File, untracked
     super::write_tree::prepare_offset_table(repo, &mut index);
     crate::index_racy::write_holding(repo, &mut index, lock)?;
     Ok(())
-}
-
-/// `write_locked_index()` for a caller whose lock is optional.
-///
-/// `fd = repo_hold_locked_index(the_repository, &index_lock, 0)`
-/// (builtin/commit.c:1635-1638) carries no `LOCK_DIE_ON_ERROR`: when the lock
-/// cannot be taken — a git directory this user cannot write to, or another
-/// process holding `index.lock` — `fd` stays -1 and
-/// `repo_update_index_if_able()` is skipped entirely (:1657), so the report
-/// still prints and only the refreshed stat data is lost. That is the whole of
-/// what is optional: a failure past the lock is a real write failure and is
-/// still raised.
-fn write_index_if_lockable(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
-    match crate::index_racy::write(repo, index) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let e = anyhow::Error::new(e);
-            match crate::lock::is_lock_contention(&e) {
-                true => Ok(()),
-                false => Err(e),
-            }
-        }
-    }
 }
 
 /// `has_racy_timestamp()` (read-cache.c:2735-2746) over `is_racy_timestamp()`

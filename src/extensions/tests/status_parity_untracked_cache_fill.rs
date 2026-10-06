@@ -330,3 +330,15 @@ fn walks_that_bypass_the_cache_leave_it_alone() {
         });
     }
 }
+
+/// `core.untrackedCache` unset, with a cache `update-index --untracked-cache` made: the walk
+/// fills it in memory but does not ask for a write (`force_untracked_cache` is off), so it
+/// reaches disk only with a write made for another reason — the racy entries, or the refresh
+/// of entries an earlier write smudged — and then in the same write as that refresh.
+#[test]
+fn a_kept_cache_rides_along_with_the_refresh_write() {
+    let pre: &[&[&str]] = &[&["update-index", "--untracked-cache"]];
+    assert_like_stock_after("keep", &[], pre, &["--porcelain"], |w| {
+        std::fs::write(w.join("u/g"), "g\n").unwrap();
+    });
+}

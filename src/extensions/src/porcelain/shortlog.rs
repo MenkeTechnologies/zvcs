@@ -45,7 +45,9 @@
 //!     `--reverse`, `--ancestry-path`, `--date-order`/`--topo-order` and
 //!     `--author-date-order` (`REV_SORT_BY_AUTHOR_DATE`).
 //!   * path-limited traversal: `<rev>... [--] <path>...`. Everything after `--`
-//!     is a pathspec; when a revision is pending, a commit is shown iff its diff
+//!     is a pathspec, and without one the first positional that names a file
+//!     rather than a revision starts it (`setup_revisions()`'s filename
+//!     fallback, see `filename_fallback`); when a revision is pending, a commit is shown iff its diff
 //!     against a parent touched a matching path (git's TREESAME test) — a merge
 //!     iff it differs from *every* parent, a root commit iff its tree contains a
 //!     match, `--first-parent` limiting a merge to its first parent. When no
@@ -327,6 +329,9 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut group_special: Vec<GroupBy> = Vec::new();
 
     let mut actions: Vec<RevAction> = Vec::new();
+    // Each action's command-line spelling, parallel to `actions`: the filename
+    // fallback refuses a pseudo-option in the tail by its text.
+    let mut action_args: Vec<String> = Vec::new();
     let mut ignore_missing = false;
     // `revs->dense` / `revs->simplify_history` / `revs->simplify_merges`, the
     // three knobs the shared [`super::simplify`] passes read.
@@ -381,6 +386,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 pathspecs.push(a.as_bytes().to_vec());
             } else {
                 actions.push(RevAction::Rev(a.to_string()));
+                action_args.push(a.to_string());
             }
             continue;
         }
@@ -527,6 +533,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             };
             if let Some(action) = pseudo {
                 actions.push(action);
+                action_args.push(a.to_string());
                 continue;
             }
             if matches!(name, "bisect" | "alternate-refs" | "exclude-hidden") {
@@ -906,7 +913,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     let mut excludes: Vec<String> = Vec::new();
     let mut negate = false;
 
-    for action in &actions {
+    for (at, action) in actions.iter().enumerate() {
         let repo = repo
             .as_ref()
             .expect("outside-repository positional args were already rejected");
@@ -1025,7 +1032,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         if ignore_missing {
                             continue;
                         }
-                        return Ok(fatal_rev(repo, spec, seen_dashdash));
+                        match filename_fallback(repo, &actions[at + 1..], &action_args[at + 1..], spec, seen_dashdash) {
+                            Some(Ok(tail)) => {
+                                pathspecs.extend(tail);
+                                break;
+                            }
+                            Some(Err(code)) => return Ok(code),
+                            None => return Ok(fatal_rev(repo, spec, seen_dashdash)),
+                        }
                     };
                     // `handle_dotdot_1()` restores the separator before its own
                     // `verify_non_filename()` (revision.c:2024-2028), so the whole
@@ -1046,7 +1060,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                         if ignore_missing {
                             continue;
                         }
-                        return Ok(fatal_rev(repo, spec, seen_dashdash));
+                        match filename_fallback(repo, &actions[at + 1..], &action_args[at + 1..], spec, seen_dashdash) {
+                            Some(Ok(tail)) => {
+                                pathspecs.extend(tail);
+                                break;
+                            }
+                            Some(Err(code)) => return Ok(code),
+                            None => return Ok(fatal_rev(repo, spec, seen_dashdash)),
+                        }
                     };
                     if let Some(code) = super::log::non_filename_fatal(repo, spec, seen_dashdash) {
                         return Ok(code);
@@ -1073,7 +1094,14 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                         None if ignore_missing => {}
-                        None => return Ok(fatal_rev(repo, spec, seen_dashdash)),
+                        None => match filename_fallback(repo, &actions[at + 1..], &action_args[at + 1..], spec, seen_dashdash) {
+                            Some(Ok(tail)) => {
+                                pathspecs.extend(tail);
+                                break;
+                            }
+                            Some(Err(code)) => return Ok(code),
+                            None => return Ok(fatal_rev(repo, spec, seen_dashdash)),
+                        },
                     }
                 }
             }
@@ -1368,6 +1396,55 @@ fn fatal_rev(repo: &gix::Repository, spec: &str, cant_be_filename: bool) -> Exit
         .unwrap_or_else(|| super::log::bad_revision_message_in(repo, spec));
     eprint!("{message}");
     ExitCode::from(128)
+}
+
+/// `setup_revisions()`'s filename fallback, for an operand that did not resolve:
+///
+/// ```c
+/// if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+///         int j;
+///         if (seen_dashdash || *arg == '^')
+///                 die("bad revision '%s'", arg);
+///         for (j = i; j < argc; j++)
+///                 verify_filename(the_repository, revs->prefix, argv[j], j == i);
+///         strvec_pushv(&prune_data, argv + i);
+///         break;
+/// }
+/// ```
+///
+/// (revision.c:3117-3132.) `None` is "not a path either": the caller dies with
+/// [`fatal_rev`]'s diagnosis, which is what `verify_filename(…, 1)` and the
+/// deaths inside `handle_revision_arg()` print. `Some(Ok(_))` is the operand and
+/// every positional after it, which become the pathspec. The tail is still in
+/// argv order, so a pseudo-option there (`--all`, `--not`, …) reaches
+/// `verify_filename()` too and is refused as an option; `j == i` is false for
+/// the tail, so a missing path in it says `no such path in the working tree`.
+fn filename_fallback(
+    repo: &gix::Repository,
+    tail: &[RevAction],
+    tail_args: &[String],
+    operand: &str,
+    seen_dashdash: bool,
+) -> Option<Result<Vec<Vec<u8>>, ExitCode>> {
+    if seen_dashdash
+        || operand.starts_with('^')
+        || super::log::early_revision_fatal(repo, operand, false).is_some()
+        || !super::log::spec_is_path(repo, operand)
+    {
+        return None;
+    }
+    let mut paths = vec![operand.as_bytes().to_vec()];
+    for (action, arg) in tail.iter().zip(tail_args) {
+        let is_path = matches!(action, RevAction::Rev(_)) && super::log::spec_is_path(repo, arg);
+        if !is_path {
+            if let Some(msg) = crate::setup::verify_filename(arg, false) {
+                eprintln!("fatal: {msg}");
+                return Some(Err(ExitCode::from(128)));
+            }
+        }
+        paths.push(arg.as_bytes().to_vec());
+    }
+    Some(Ok(paths))
 }
 
 /// Parse an option's integer argument the way git does: the whole string must be

@@ -367,6 +367,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // error bit, and `default_refs` is left alone so the head set stays
             // empty.
             Some(id) if !repo.has_object(id) => {
+                die_if_unreadable_loose(&repo, id)?;
                 eprintln!("error: {arg}: invalid sha1 pointer {id}");
                 errors |= ERROR_REACHABLE;
             }
@@ -455,7 +456,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut all: Vec<ObjectId> = Vec::new();
     let mut in_odb: HashSet<ObjectId> = HashSet::new();
     for id in repo.objects.iter()? {
-        let id = id?;
+        // A loose subdirectory the walk cannot open is `fsck_source()`'s own
+        // `unable to open` line (object-file.c:1063-1066) and the end of that
+        // source's walk, not a failure of the command; see `cruft_lines` and
+        // `loose_unvisited()` below.
+        let Ok(id) = id else { continue };
         // The odb iterator can yield the same id from more than one source.
         if in_odb.insert(id) {
             all.push(id);
@@ -1051,7 +1056,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             &mut names,
             None,
             opt.verbose,
-        );
+        )?;
     }
 
     // ---- 6. reachability ----------------------------------------------------
@@ -2023,15 +2028,16 @@ fn collect_default_heads(
                             errors: &mut u8,
                             name: &str,
                             id: ObjectId|
-     -> usize {
+     -> Result<usize> {
         if !repo.has_object(id) {
+            die_if_unreadable_loose(repo, id)?;
             *missed = true;
             if promisor.contains(&id) {
-                return 1;
+                return Ok(1);
             }
             eprintln!("error: {name}: invalid sha1 pointer {id}");
             *errors |= ERROR_REACHABLE;
-            return 0;
+            return Ok(0);
         }
         state.note(id);
         let kind = repo.find_header(id).map(|h| h.kind()).ok();
@@ -2058,7 +2064,7 @@ fn collect_default_heads(
             }
         }
         heads.push(id);
-        1
+        Ok(1)
     };
 
     // References, taking each ref's direct target rather than its fully peeled
@@ -2085,7 +2091,7 @@ fn collect_default_heads(
                 }
             },
         };
-        count += snapshot_ref(state, heads, pre_parsed, errors, &name, id);
+        count += snapshot_ref(state, heads, pre_parsed, errors, &name, id)?;
         // `fsck_handle_ref()` names the head with the reference it came from
         // (builtin/fsck.c:590-591). It runs over the *snapshot*, i.e. only the
         // references `snapshot_ref()` kept, and in snapshot order.
@@ -2099,7 +2105,7 @@ fn collect_default_heads(
     if let Ok(head) = repo.head() {
         if let Some(id) = head.id() {
             let id = id.detach();
-            count += snapshot_ref(state, heads, pre_parsed, errors, "HEAD", id);
+            count += snapshot_ref(state, heads, pre_parsed, errors, "HEAD", id)?;
             if heads.last() == Some(&id) {
                 names.put(id, || "HEAD".to_string());
             }
@@ -2194,9 +2200,9 @@ fn collect_index_heads(
     names: &mut ObjectNames,
     label: Option<&str>,
     verbose: bool,
-) -> u8 {
+) -> anyhow::Result<u8> {
     let Ok(index) = repo.index_or_empty() else {
-        return 0;
+        return Ok(0);
     };
     for entry in index.entries() {
         if entry.mode.is_submodule() {
@@ -2227,7 +2233,7 @@ fn collect_index_heads(
         let path = index_path_label(repo);
         return collect_cache_tree(repo, tree, state, heads, names, &path, verbose);
     }
-    0
+    Ok(0)
 }
 
 /// The index path as `fsck_index()` names it — git runs from the top of the
@@ -2270,7 +2276,7 @@ fn collect_cache_tree(
     names: &mut ObjectNames,
     index_path: &str,
     verbose: bool,
-) -> u8 {
+) -> anyhow::Result<u8> {
     // `fsck_cache_tree()` announces itself once per node, subtrees included, and
     // before the entry-count guard below.
     if verbose {
@@ -2278,11 +2284,12 @@ fn collect_cache_tree(
     }
     if tree.num_entries.is_some() {
         if !repo.has_object(tree.id) {
+            die_if_unreadable_loose(repo, tree.id)?;
             eprintln!(
                 "error: {}: invalid sha1 pointer in cache-tree of {index_path}",
                 tree.id
             );
-            return ERROR_REFS;
+            return Ok(ERROR_REFS);
         }
         // `fsck_put_object_name(&fsck_walk_options, &it->oid, ":")`
         // (builtin/fsck.c:830) — every cache-tree node, root or subtree, is
@@ -2293,9 +2300,9 @@ fn collect_cache_tree(
     }
     let mut errors = 0u8;
     for child in &tree.children {
-        errors |= collect_cache_tree(repo, child, state, heads, names, index_path, verbose);
+        errors |= collect_cache_tree(repo, child, state, heads, names, index_path, verbose)?;
     }
-    errors
+    Ok(errors)
 }
 
 /// `--full`: git's `verify_pack()` over every pack `get_all_packs()` yields — the
@@ -2472,6 +2479,41 @@ fn unreadable_unreachable_object(repo: &gix::Repository, id: ObjectId) -> Option
         loose_label_of(repo, &path)
     );
     Some(ExitCode::from(128))
+}
+
+/// `parse_object()` of an id the odb does not produce, when a loose file for it
+/// exists but cannot be opened (an unreadable fan-out directory, say).
+///
+/// `parse_object_with_flags()` first asks `odb_read_object_info(…, NULL)`
+/// (object.c:345-346), whose loose read only `lstat()`s and fails silently
+/// (odb/source-loose.c:100-107). `odb_read_object()` then reads with
+/// `OBJECT_INFO_DIE_IF_CORRUPT`: each source's `git_open()` that fails with an
+/// errno other than `ENOENT` prints `unable to open loose object %s`
+/// (odb/source-loose.c:121-129), once on the first read and once on the second
+/// (odb.c:574-585), and the first failure's message becomes the die
+/// (odb.c:597-605, odb/source-loose.c:196-198).
+fn die_if_unreadable_loose(repo: &gix::Repository, id: ObjectId) -> anyhow::Result<()> {
+    let hex = id.to_hex().to_string();
+    let failing: Vec<(PathBuf, std::io::Error)> = odb_sources(repo)
+        .into_iter()
+        .map(|objdir| objdir.join(&hex[..2]).join(&hex[2..]))
+        .filter_map(|path| match std::fs::File::open(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Some((path, err)),
+            _ => None,
+        })
+        .collect();
+    let Some((first, _)) = failing.first() else {
+        return Ok(());
+    };
+    for _ in 0..2 {
+        for (_, err) in &failing {
+            eprintln!("error: unable to open loose object {id}: {}", super::config::errno_text(err));
+        }
+    }
+    Err(crate::fatal::die(format!(
+        "loose object {id} (stored in {}) is corrupt",
+        loose_label_of(repo, first)
+    )))
 }
 
 /// See [`loose_object_label`].
@@ -2966,7 +3008,7 @@ fn collect_linked_worktree_heads(
                 names,
                 Some(&label),
                 opt.verbose,
-            );
+            )?;
         }
     }
     Ok((count, errors))

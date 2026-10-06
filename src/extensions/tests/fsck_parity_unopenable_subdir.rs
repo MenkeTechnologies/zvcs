@@ -79,3 +79,70 @@ fn objects_past_an_unopenable_subdirectory_are_missing() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A mode-0 fan-out directory under a superuser is still readable; the claims
+/// below are about `EACCES` and have nothing to observe there.
+fn unreadable(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::read_dir(dir).is_err()
+}
+
+fn readable_again(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A head or cache-tree id whose loose file exists but cannot be opened is not
+/// absent: `parse_object()` reads it with `OBJECT_INFO_DIE_IF_CORRUPT`, each of
+/// the two reads prints `unable to open loose object` (odb/source-loose.c:121-129,
+/// odb.c:574-585), and the die names the file (odb.c:597-605,
+/// odb/source-loose.c:196-198). zvcs took the odb's miss at face value — an
+/// `invalid sha1 pointer` line for the ref, or for the cache-tree node — and kept
+/// going; for a ref it also failed the whole command on gitoxide's own walk error.
+#[test]
+fn an_unopenable_head_or_cache_tree_object_dies_as_corrupt() {
+    let root = std::env::temp_dir().join(format!("zvcs-fsck-eacces-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("d")).unwrap();
+    git(&root, &["init", "-q", "-b", "master"]);
+    std::fs::write(root.join("a"), "a\n").unwrap();
+    git(&root, &["add", "a"]);
+    git(&root, &["commit", "-q", "-m", "x"]);
+    std::fs::write(root.join("d/b"), "b\n").unwrap();
+    git(&root, &["add", "d"]);
+    let tree = "c9b801068840df6bd9a0cd4efec5d00fafdbe36a";
+    assert_eq!(git(&root, &["write-tree"]).0.trim_end(), tree);
+
+    let corrupt = |id: &str| {
+        let open = format!("error: unable to open loose object {id}: Permission denied\n");
+        format!("{open}{open}fatal: loose object {id} (stored in .git/objects/{}/{}) is corrupt\n", &id[..2], &id[2..])
+    };
+
+    let dir = root.join(".git/objects/ec");
+    if unreadable(&dir) {
+        let (out, err, code) = git(&root, &["fsck"]);
+        readable_again(&dir);
+        assert_eq!((out.as_str(), code), ("", 128));
+        assert_eq!(err, corrupt(COMMIT));
+    }
+    readable_again(&dir);
+
+    let dir = root.join(".git/objects/c9");
+    if unreadable(&dir) {
+        let (out, err, code) = git(&root, &["fsck"]);
+        readable_again(&dir);
+        assert_eq!((out.as_str(), code), ("", 128));
+        assert_eq!(
+            err,
+            format!(
+                "error: unable to open .git/objects/c9: Permission denied\n\
+                 error: HEAD: invalid reflog entry {COMMIT}\n\
+                 error: refs/heads/master: invalid reflog entry {COMMIT}\n{}",
+                corrupt(tree)
+            )
+        );
+    }
+    readable_again(&dir);
+    let _ = std::fs::remove_dir_all(&root);
+}

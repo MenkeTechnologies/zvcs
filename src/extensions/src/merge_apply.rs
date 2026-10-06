@@ -814,8 +814,54 @@ fn update_worktree_to_tree(
             }
         }
     }
+    // And the up-to-date marks with them: `keep_entry()` adds the source index's own entry,
+    // flags and all, and `checkout_entry()` marks what it writes (`ce_mark_uptodate()`). An
+    // entry the refresh before the merge verified is not racily clean in the index the merge
+    // writes, and must not become a stand-in in a split index.
+    {
+        use gix::index::entry::Flags;
+        let verified: HashSet<BString> = {
+            let backing = old.path_backing();
+            old.entries()
+                .iter()
+                .filter(|e| e.flags.contains(Flags::UPTODATE) && e.stage_raw() == 0)
+                .map(|e| e.path_in(backing).to_owned())
+                .collect()
+        };
+        let skipped: HashSet<BString> = {
+            let backing = old.path_backing();
+            old.entries()
+                .iter()
+                .filter(|e| e.flags.contains(Flags::SKIP_WORKTREE) && e.stage_raw() == 0)
+                .map(|e| e.path_in(backing).to_owned())
+                .collect()
+        };
+        let backing = new_index.path_backing().to_owned();
+        for e in new_index.entries_mut() {
+            let path = e.path_in(&backing).to_owned();
+            let kept = old_map.get(&path).is_some_and(|(id, mode, _)| *id == e.id && *mode == e.mode);
+            if kept && verified.contains(&path) {
+                e.flags.insert(Flags::UPTODATE);
+            }
+            // `keep_entry()` keeps the entry's `CE_SKIP_WORKTREE` too.
+            if kept && skipped.contains(&path) {
+                e.flags.insert(Flags::SKIP_WORKTREE | Flags::EXTENDED);
+            }
+        }
+    }
+    crate::worktree::carry_written_stat(&subset, &mut new_index);
 
     new_index.remove_tree();
+    // merge-ort's `checkout()` runs `unpack_trees()` with `src_index == dst_index`, so the
+    // result keeps the source index's timestamp and shared half (unpack-trees.c:1941-1957),
+    // and `merged_entry()`'s fresh entries stand on no shared entry. Without this every
+    // merge-shaped verb wrote a split index back whole.
+    new_index.inherit_split_index(old);
+    new_index.unshare_entries_built_from_trees(old);
+    // A sparse index stays collapsed through the merge, its sparse directories carried onto
+    // the merged tree's.
+    new_index.inherit_sparse_index(old);
+    crate::sparse_index::retarget_virtual_sparse_dirs(repo, &mut new_index, new_tree_id);
     Ok(new_index)
 }
 

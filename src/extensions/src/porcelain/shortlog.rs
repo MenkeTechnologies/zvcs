@@ -1894,10 +1894,13 @@ fn commit_records(
     // Sixteen commits per worker: one record is a single object read plus a
     // format expansion, so the batch has to be sizeable to repay a thread.
     let workers = crate::threads::count(ids.len(), 16);
+    // `ctx.output_encoding = get_log_output_encoding()` (builtin/shortlog.c:251).
+    let output_encoding = crate::revfilter::log_output_encoding(repo, None);
+    let output_encoding = output_encoding.as_str();
     if workers <= 1 {
         return ids
             .iter()
-            .map(|(id, parents)| one_record(repo, *id, parents.as_deref(), mailmap, opts))
+            .map(|(id, parents)| one_record(repo, *id, parents.as_deref(), mailmap, opts, output_encoding))
             .collect();
     }
 
@@ -1916,7 +1919,7 @@ fn commit_records(
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some((id, parents)) = ids.get(i) else { break };
-                    mine.push((i, one_record(&repo, *id, parents.as_deref(), mailmap, opts)?));
+                    mine.push((i, one_record(&repo, *id, parents.as_deref(), mailmap, opts, output_encoding)?));
                 }
                 Ok(mine)
             }));
@@ -1952,9 +1955,33 @@ fn one_record(
     parents: Option<&[ObjectId]>,
     mailmap: &crate::mailmap::Mailmap,
     opts: &Opts,
+    output_encoding: &str,
 ) -> Result<(Vec<BString>, BString)> {
     let commit = repo.find_commit(id)?;
-    let idents = group_keys(repo, &commit, parents, mailmap, opts)?;
+    // Every key and the default record text come from
+    // `repo_format_commit_message()` (builtin/shortlog.c:231, 257), which expands
+    // against the commit re-coded to UTF-8 and converts the result to the log
+    // output encoding (pretty.c:1734, 2026-2046). Only a commit that carries an
+    // `encoding` header, or an output encoding other than UTF-8, has anything to
+    // convert.
+    let recode = commit.decode()?.encoding.is_some()
+        || !super::mailinfo::same_encoding("UTF-8", output_encoding);
+    let utf8 = match recode {
+        false => None,
+        true => {
+            let mut utf8 = repo.find_commit(id)?;
+            super::log::logmsg_reencode(&mut utf8.data, "UTF-8");
+            Some(utf8)
+        }
+    };
+    let to_output = |text: BString| -> BString {
+        let mut text: Vec<u8> = text.into();
+        if recode {
+            super::log::user_format_to_output_encoding(&mut text, output_encoding);
+        }
+        text.into()
+    };
+    let idents = group_keys(repo, utf8.as_ref().unwrap_or(&commit), parents, mailmap, opts, &to_output)?;
 
     // git computes the record text once and substitutes `<none>` when it comes
     // out empty.
@@ -1965,7 +1992,7 @@ fn one_record(
             Some(fmt) => {
                 expand_format(repo, &commit, parents, fmt, opts)?
             }
-            None => commit.message()?.summary().into_owned(),
+            None => to_output(utf8.as_ref().unwrap_or(&commit).message()?.summary().into_owned()),
         };
         if text.is_empty() {
             BString::from("<none>")
@@ -1982,6 +2009,8 @@ fn group_keys(
     parents: Option<&[ObjectId]>,
     mailmap: &crate::mailmap::Mailmap,
     opts: &Opts,
+    // Into the log output encoding; a `--group=format:` key is already there.
+    convert: &dyn Fn(BString) -> BString,
 ) -> Result<Vec<BString>> {
     let mut keys: Vec<BString> = Vec::new();
     let push = |key: BString, keys: &mut Vec<BString>| {
@@ -1992,11 +2021,11 @@ fn group_keys(
     for group in &opts.groups {
         match group {
             GroupBy::Author => push(
-                format_ident(commit.author()?.trim(), mailmap, opts.email),
+                convert(format_ident(commit.author()?.trim(), mailmap, opts.email)),
                 &mut keys,
             ),
             GroupBy::Committer => push(
-                format_ident(commit.committer()?.trim(), mailmap, opts.email),
+                convert(format_ident(commit.committer()?.trim(), mailmap, opts.email)),
                 &mut keys,
             ),
             GroupBy::Format(fmt) => push(
@@ -2028,7 +2057,7 @@ fn group_keys(
                             ),
                             None => BString::from(value.to_vec()),
                         };
-                        push(key, &mut keys);
+                        push(convert(key), &mut keys);
                     }
                 }
             }

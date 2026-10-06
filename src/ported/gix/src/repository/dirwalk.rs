@@ -127,6 +127,7 @@ impl Repository {
         pathspec: &mut crate::Pathspec<'_>,
         flags: u32,
         is_excluded: &mut dyn FnMut(&BStr, bool) -> bool,
+        untracked: Option<gix_dir::read_directory::UntrackedCacheContext<'_>>,
     ) -> Result<gix_dir::read_directory::Outcome, dirwalk::Error> {
         let workdir = self.workdir().ok_or(dirwalk::Error::MissingWorkDir)?;
         let git_dir_realpath =
@@ -156,7 +157,7 @@ impl Repository {
             git_dir_realpath: git_dir_realpath.as_ref(),
             precompose_unicode: fs_caps.precompose_unicode,
         };
-        Ok(gix_dir::read_directory::fill_directory(workdir, flags, &mut ctx))
+        Ok(gix_dir::read_directory::fill_directory(workdir, flags, &mut ctx, untracked))
     }
 
     /// Create an iterator over a running traversal, which stops if the iterator is dropped. All arguments

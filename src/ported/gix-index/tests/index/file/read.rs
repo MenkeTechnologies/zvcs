@@ -317,6 +317,13 @@ fn untr_extension_empty() {
                     exclude_filename_per_dir: ".gitignore",
                     dir_flags: 6,
                     directories: [],
+                    stats: Statistics {
+                        dir_created: 0,
+                        gitignore_invalidated: 0,
+                        dir_invalidated: 0,
+                        dir_opened: 0,
+                    },
+                    use_fsmonitor: false,
                 },
             ),
             has_fs_monitor: false,
@@ -381,6 +388,7 @@ fn untr_extension_populated() {
                             ),
                             exclude_file_oid: None,
                             check_only: false,
+                            recurse: true,
                         },
                         Directory {
                             name: "tracked-dir",
@@ -391,6 +399,7 @@ fn untr_extension_populated() {
                             ),
                             exclude_file_oid: None,
                             check_only: false,
+                            recurse: true,
                         },
                         Directory {
                             name: "untracked-dir-2",
@@ -403,6 +412,7 @@ fn untr_extension_populated() {
                             ),
                             exclude_file_oid: None,
                             check_only: true,
+                            recurse: true,
                         },
                         Directory {
                             name: "untracked-dir-3",
@@ -415,8 +425,16 @@ fn untr_extension_populated() {
                             ),
                             exclude_file_oid: None,
                             check_only: true,
+                            recurse: true,
                         },
                     ],
+                    stats: Statistics {
+                        dir_created: 0,
+                        gitignore_invalidated: 0,
+                        dir_invalidated: 0,
+                        dir_opened: 0,
+                    },
+                    use_fsmonitor: false,
                 },
             ),
             has_fs_monitor: false,
@@ -486,6 +504,7 @@ fn untr_extension_nested() {
                             ),
                             exclude_file_oid: None,
                             check_only: false,
+                            recurse: true,
                         },
                         Directory {
                             name: "tracked-dir-with-ignore",
@@ -503,6 +522,7 @@ fn untr_extension_nested() {
                                 Oid(2),
                             ),
                             check_only: false,
+                            recurse: true,
                         },
                         Directory {
                             name: "nested-untracked-dir",
@@ -517,6 +537,7 @@ fn untr_extension_nested() {
                             ),
                             exclude_file_oid: None,
                             check_only: true,
+                            recurse: true,
                         },
                         Directory {
                             name: "deep-untracked-dir",
@@ -529,6 +550,7 @@ fn untr_extension_nested() {
                             ),
                             exclude_file_oid: None,
                             check_only: true,
+                            recurse: true,
                         },
                         Directory {
                             name: "untracked-dir-2",
@@ -541,6 +563,7 @@ fn untr_extension_nested() {
                             ),
                             exclude_file_oid: None,
                             check_only: true,
+                            recurse: true,
                         },
                         Directory {
                             name: "untracked-dir-3",
@@ -553,8 +576,16 @@ fn untr_extension_nested() {
                             ),
                             exclude_file_oid: None,
                             check_only: true,
+                            recurse: true,
                         },
                     ],
+                    stats: Statistics {
+                        dir_created: 0,
+                        gitignore_invalidated: 0,
+                        dir_invalidated: 0,
+                        dir_opened: 0,
+                    },
+                    use_fsmonitor: false,
                 },
             ),
             has_fs_monitor: false,

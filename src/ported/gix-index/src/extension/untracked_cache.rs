@@ -71,15 +71,36 @@ pub struct Directory {
     /// indices for sub-directories similar to this one.
     pub sub_directories: Vec<usize>,
 
-    /// The directories stat data, if available or valid // TODO: or is it the exclude file?
+    /// git's `valid` bit together with `stat_data`: `Some` when everything but the
+    /// sub-directories is good, holding the directory's stat as of the walk that listed it.
     pub stat: Option<entry::Stat>,
-    /// The oid of a .gitignore file, if it exists
+    /// `exclude_oid`: the id of the directory's `.gitignore` as `add_patterns()` computed it,
+    /// `None` (or null) when the directory has none.
     pub exclude_file_oid: Option<ObjectId>,
-    /// TODO: figure out what this really does
+    /// `check_only`: the directory was last read only to learn whether it holds anything
+    /// untracked (`treat_directory()` under `DIR_HIDE_EMPTY_DIRECTORIES`), so its untracked
+    /// list stops at the first name found.
     pub check_only: bool,
+    /// `recurse`: the directory was reached by the last walk and is written out. One that was
+    /// only looked up — by invalidation, or by `prep_exclude()` on its way down — stays unset
+    /// and is dropped when the cache is written (dir.c:3656-3671).
+    pub recurse: bool,
 }
 
 impl Directory {
+    /// A directory `lookup_untracked()` just made: zeroed, so invalid and not to be written.
+    pub(crate) fn empty(name: BString) -> Self {
+        Directory {
+            name,
+            untracked_entries: Vec::new(),
+            sub_directories: Vec::new(),
+            stat: None,
+            exclude_file_oid: None,
+            check_only: false,
+            recurse: false,
+        }
+    }
+
     /// The directory name, or an empty string if this is the root directory.
     /// `/` is always used as path-separator.
     pub fn name(&self) -> &bstr::BStr {
@@ -159,6 +180,8 @@ impl UntrackedCache {
             exclude_filename_per_dir: ".gitignore".into(),
             dir_flags,
             directories: Vec::new(),
+            stats: Statistics::default(),
+            use_fsmonitor: false,
         }
     }
 
@@ -211,7 +234,9 @@ impl UntrackedCache {
 
     /// `invalidate_one_directory()` (dir.c:3957-3964): `valid = 0` and the untracked names go.
     fn invalidate_one_directory(&mut self, dir: Option<usize>) {
-        if let Some(dir) = dir.and_then(|dir| self.directories.get_mut(dir)) {
+        if let Some(dir) = dir.filter(|&dir| dir < self.directories.len()) {
+            self.stats.dir_invalidated += 1;
+            let dir = &mut self.directories[dir];
             dir.stat = None;
             dir.untracked_entries.clear();
         }
@@ -225,6 +250,109 @@ impl UntrackedCache {
         subs.binary_search_by(|&sub| self.directories[sub].name.as_slice().cmp(name))
             .ok()
             .map(|at| subs[at])
+    }
+
+    /// The root directory, `untracked->root`, if the cache has one yet.
+    pub fn root(&self) -> Option<usize> {
+        (!self.directories.is_empty()).then_some(0)
+    }
+
+    /// `FLEX_ALLOC_STR(dir->untracked->root, name, "")` (dir.c:3080-3084): give a cache that
+    /// has none its root directory. Returns whether one was made.
+    pub fn ensure_root(&mut self) -> bool {
+        if !self.directories.is_empty() {
+            return false;
+        }
+        self.directories.push(Directory::empty(BString::default()));
+        true
+    }
+
+    /// Directory `dir`, for a walk that updates it.
+    pub fn directory_mut(&mut self, dir: usize) -> &mut Directory {
+        &mut self.directories[dir]
+    }
+
+    /// `lookup_untracked()` (dir.c:1059-1095): the sub-directory of `dir` called `name` (a
+    /// trailing `/` is ignored), created zeroed — invalid, without `recurse` — at its sorted
+    /// place when `dir` has none.
+    pub fn lookup_or_create(&mut self, dir: usize, name: &[u8]) -> usize {
+        let name = name.strip_suffix(b"/").unwrap_or(name);
+        let subs = &self.directories[dir].sub_directories;
+        match subs.binary_search_by(|&sub| self.directories[sub].name.as_slice().cmp(name)) {
+            Ok(at) => subs[at],
+            Err(at) => {
+                self.stats.dir_created += 1;
+                let created = self.directories.len();
+                self.directories.push(Directory::empty(name.into()));
+                self.directories[dir].sub_directories.insert(at, created);
+                created
+            }
+        }
+    }
+
+    /// `invalidate_gitignore()` (dir.c:1114-1119) over `do_invalidate_gitignore()`
+    /// (dir.c:1104-1112): an ignore file `dir` and everything below it were judged by changed,
+    /// so none of their untracked lists can be trusted.
+    pub fn invalidate_gitignore(&mut self, dir: usize) {
+        self.stats.gitignore_invalidated += 1;
+        self.do_invalidate_gitignore(dir);
+    }
+
+    fn do_invalidate_gitignore(&mut self, dir: usize) {
+        let d = &mut self.directories[dir];
+        d.stat = None;
+        d.untracked_entries.clear();
+        for at in 0..self.directories[dir].sub_directories.len() {
+            let sub = self.directories[dir].sub_directories[at];
+            self.do_invalidate_gitignore(sub);
+        }
+    }
+
+    /// `invalidate_directory()` (dir.c:1121-1141): `dir` is being read from disk again, so its
+    /// untracked list is dropped and none of its sub-directories is known to be reached until
+    /// the read reaches it.
+    pub fn invalidate_directory(&mut self, dir: usize) {
+        if self.directories[dir].stat.is_some() {
+            self.stats.dir_invalidated += 1;
+        }
+        let d = &mut self.directories[dir];
+        d.stat = None;
+        d.untracked_entries.clear();
+        for at in 0..self.directories[dir].sub_directories.len() {
+            let sub = self.directories[dir].sub_directories[at];
+            self.directories[sub].recurse = false;
+        }
+    }
+
+    /// Replace the stat and id of `$GIT_DIR/info/exclude` (`ss_info_exclude`).
+    pub fn set_info_exclude(&mut self, oid_stat: Option<OidStat>) {
+        self.info_exclude = oid_stat;
+    }
+
+    /// Replace the stat and id of `core.excludesFile` (`ss_excludes_file`).
+    pub fn set_excludes_file(&mut self, oid_stat: Option<OidStat>) {
+        self.excludes_file = oid_stat;
+    }
+
+    /// The counters `read_directory()` reads back to decide whether the walk changed the cache.
+    pub fn stats(&self) -> &Statistics {
+        &self.stats
+    }
+
+    /// The counters, for a walk that opens directories.
+    pub fn stats_mut(&mut self) -> &mut Statistics {
+        &mut self.stats
+    }
+
+    /// `use_fsmonitor`: whether fsmonitor answered this process's query, so a directory's
+    /// `valid` bit can be trusted without an `lstat()`.
+    pub fn use_fsmonitor(&self) -> bool {
+        self.use_fsmonitor
+    }
+
+    /// Set [`use_fsmonitor()`](Self::use_fsmonitor()).
+    pub fn set_use_fsmonitor(&mut self, on: bool) {
+        self.use_fsmonitor = on;
     }
 
     /// `write_untracked_extension()` (dir.c:3677-3727): serialise the cache as the body of an
@@ -276,8 +404,8 @@ impl UntrackedCache {
     ///
     /// An invalid directory is written with no untracked names and without `check_only` — git
     /// clears both on the spot "for safety" — and only the directories whose `recurse` bit is
-    /// set are counted and descended into. Every directory this crate holds was either decoded,
-    /// which sets `recurse` (dir.c:3780), or is the root, so all of them qualify.
+    /// set are counted and descended into: a decoded directory has it (dir.c:3780), one a walk
+    /// or an invalidation only looked up does not.
     fn write_one_dir(&self, dir: usize, wd: &mut WriteData) {
         let untracked = &self.directories[dir];
         let i = wd.index;
@@ -298,15 +426,21 @@ impl UntrackedCache {
 
         let names: &[BString] = if valid { &untracked.untracked_entries } else { &[] };
         wd.out.extend_from_slice(&encode_varint(names.len() as u64));
-        wd.out
-            .extend_from_slice(&encode_varint(untracked.sub_directories.len() as u64));
+        // "skip non-recurse directories"
+        let subs: Vec<usize> = untracked
+            .sub_directories
+            .iter()
+            .copied()
+            .filter(|&sub| self.directories[sub].recurse)
+            .collect();
+        wd.out.extend_from_slice(&encode_varint(subs.len() as u64));
         wd.out.extend_from_slice(&untracked.name);
         wd.out.push(0);
         for name in names {
             wd.out.extend_from_slice(name);
             wd.out.push(0);
         }
-        for &sub in &untracked.sub_directories {
+        for sub in subs {
             self.write_one_dir(sub, wd);
         }
     }
@@ -384,6 +518,8 @@ pub fn decode(data: &[u8], object_hash: gix_hash::Kind, alloc_limit_bytes: Optio
         exclude_filename_per_dir: exclude_filename_per_dir.into(),
         dir_flags,
         directories: Vec::new(),
+        stats: Statistics::default(),
+        use_fsmonitor: false,
     };
     if num_directory_blocks == 0 {
         return data.is_empty().then_some(res);
@@ -486,6 +622,8 @@ fn decode_directory_block<'a>(
         stat: None,
         exclude_file_oid: None,
         check_only: false,
+        // `read_one_dir()` sets it on every directory it decodes (dir.c:3780).
+        recurse: true,
     });
 
     for _ in 0..num_dirs {
@@ -554,4 +692,19 @@ impl IndexNames {
             .map(|(path, _)| bstr::BStr::new(*path))
             .collect()
     }
+}
+
+/// The counters git keeps in `struct untracked_cache` (dir.h:204-208). They are not written;
+/// `read_directory()` reads them after a walk to tell whether the walk changed the cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Statistics {
+    /// `dir_created`: directories `lookup_untracked()` had to make.
+    pub dir_created: usize,
+    /// `gitignore_invalidated`: `invalidate_gitignore()` calls.
+    pub gitignore_invalidated: usize,
+    /// `dir_invalidated`: directories invalidated while they were valid, or by a path the
+    /// index gained or lost.
+    pub dir_invalidated: usize,
+    /// `dir_opened`: directories read from disk rather than from the cache.
+    pub dir_opened: usize,
 }

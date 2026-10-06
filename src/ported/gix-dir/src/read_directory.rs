@@ -12,9 +12,16 @@
 //! [--ignored] [-u…]` and `clean [-d] [-x|-X]` each set a different combination,
 //! and their output *is* those lists. This module reproduces them.
 //!
-//! The untracked cache is not ported: git bypasses it whenever ignored paths are
-//! collected or a pathspec is given (dir.c:2920-2926), and its answers are by
-//! construction the ones the uncached walk would give.
+//! With an untracked cache (`dir->untracked`) the walk is the cached one git runs for
+//! `status`: a directory whose stat, `check_only` mode and ignore files are what the
+//! cache recorded is listed from the cache (`valid_cached_dir()`, `read_cached_dir()`,
+//! `treat_path_fast()`), any other is read from disk and its listing recorded
+//! (`open_cached_dir()`, `add_untracked()`, `close_cached_dir()`), and the ignore files
+//! are consulted in `prep_exclude()`'s order so a changed one invalidates exactly the
+//! directories git invalidates. Deciding whether a cache may be used at all
+//! (`validate_untracked_cache()`) is the caller's, since it reads configuration and the
+//! global ignore files; git bypasses the cache whenever ignored paths are collected or a
+//! pathspec is given (dir.c:2977-3010).
 use std::path::{Path, PathBuf};
 
 use bstr::{BStr, BString, ByteSlice};
@@ -115,6 +122,18 @@ pub struct Context<'a> {
     pub precompose_unicode: bool,
 }
 
+/// What a walk over an untracked cache needs besides the cache.
+pub struct UntrackedCacheContext<'a> {
+    /// The cache, read and updated in place.
+    pub cache: &'a mut gix_index::extension::UntrackedCache,
+    /// `add_patterns()`'s id for the per-directory ignore file at the given
+    /// worktree-relative path (dir.c:1150-1251), null when there is none.
+    pub exclude_oid: &'a mut dyn FnMut(&BStr) -> gix_index::hash::ObjectId,
+    /// `match_stat_data_racy(istate, stored, current) != 0`: whether a directory's stat
+    /// moved, or is too close to the index's own timestamp to say.
+    pub stat_changed: &'a dyn Fn(&gix_index::entry::Stat, &gix_index::entry::Stat) -> bool,
+}
+
 /// `dir->entries` and `dir->ignored` after `read_directory()` sorted them
 /// (`cmp_dir_entry()`, dir.c:2799-2805). A directory's name ends in `/`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -126,49 +145,85 @@ pub struct Outcome {
 }
 
 /// `fill_directory()` (dir.c:272-294): walk from the directory every pathspec
-/// item shares, with `flags` a combination of the `DIR_*` constants.
+/// item shares, with `flags` a combination of the `DIR_*` constants. `untracked` is
+/// `dir->untracked` once the caller ran `validate_untracked_cache()`; it is used only
+/// for a walk from the top of the worktree, as git uses it.
 ///
 /// # Panics
 ///
 /// If both `DIR_SHOW_IGNORED` and `DIR_SHOW_IGNORED_TOO` are set, as git's `BUG()` does.
-pub fn fill_directory(worktree_root: &Path, flags: u32, ctx: &mut Context<'_>) -> Outcome {
+pub fn fill_directory(
+    worktree_root: &Path,
+    flags: u32,
+    ctx: &mut Context<'_>,
+    untracked: Option<UntrackedCacheContext<'_>>,
+) -> Outcome {
     let exclusive = DIR_SHOW_IGNORED | DIR_SHOW_IGNORED_TOO;
     assert!(
         flags & exclusive != exclusive,
         "BUG: DIR_SHOW_IGNORED and DIR_SHOW_IGNORED_TOO are exclusive"
     );
     let prefix = ctx.pathspec.git_common_prefix();
-    read_directory(worktree_root, flags, ctx, prefix.as_bstr())
+    read_directory(worktree_root, flags, ctx, prefix.as_bstr(), untracked)
 }
 
-/// `read_directory()` (dir.c:3135-3180) from `path`, a worktree-relative
-/// directory that is empty or ends in `/`.
-pub fn read_directory(worktree_root: &Path, flags: u32, ctx: &mut Context<'_>, path: &BStr) -> Outcome {
+/// `read_directory()` (dir.c:3140-3180) from `path`, a worktree-relative
+/// directory that is empty or ends in `/`, listing from and filling `untracked` when
+/// the walk starts at the top.
+pub fn read_directory(
+    worktree_root: &Path,
+    flags: u32,
+    ctx: &mut Context<'_>,
+    path: &BStr,
+    untracked: Option<UntrackedCacheContext<'_>>,
+) -> Outcome {
+    // "Optimize for the main use case only: whole-tree git status" (dir.c:3001-3008).
+    let untracked = untracked.filter(|_| path.is_empty());
     let mut dir = Dir {
+        untracked,
         root: worktree_root,
         flags,
         ctx,
         out: Outcome::default(),
+        exclude_stack: Vec::new(),
+        exclude_basebuf: BString::default(),
+        exclude_pattern: false,
     };
     if dir.has_symlink_leading_path(path) {
         return dir.out;
     }
     if path.is_empty() || dir.treat_leading_path(path) {
-        dir.read_directory_recursive(path, false, false);
+        // `validate_untracked_cache()` gave the root its `recurse` bit (dir.c:3104-3105).
+        let untracked = dir.untracked.as_mut().and_then(|c| {
+            let root = c.cache.root()?;
+            c.cache.directory_mut(root).recurse = true;
+            Some(root)
+        });
+        dir.read_directory_recursive(path, untracked, false, false);
     }
     dir.out.entries.sort();
     dir.out.ignored.sort();
     dir.out
 }
 
-struct Dir<'r, 'c, 'a> {
+struct Dir<'r, 'c, 'a, 'u> {
+    /// `dir->untracked`: the untracked cache to list directories from and fill, once
+    /// `validate_untracked_cache()` accepted it for this walk.
+    untracked: Option<UntrackedCacheContext<'u>>,
     root: &'r Path,
     flags: u32,
     ctx: &'c mut Context<'a>,
     out: Outcome,
+    /// `dir->internal.exclude_stack` as far as the untracked cache needs it: the length of
+    /// each directory prefix whose ignore file was consulted, and its cache directory.
+    exclude_stack: Vec<(usize, Option<usize>)>,
+    /// `dir->internal.basebuf`.
+    exclude_basebuf: BString,
+    /// `dir->internal.pattern != NULL`: the directory on top of the stack is excluded.
+    exclude_pattern: bool,
 }
 
-impl Dir<'_, '_, '_> {
+impl Dir<'_, '_, '_, '_> {
     fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0
     }
@@ -340,48 +395,100 @@ impl Dir<'_, '_, '_> {
             }
             sb.truncate(prevlen);
             let name = BString::from(&path[prevlen..baselen]);
-            state = self.treat_path(&mut sb, prevlen, name.as_bstr(), DType::Dir);
+            state = self.treat_path(&mut sb, prevlen, name.as_bstr(), DType::Dir, None);
             if state != PathTreatment::Recurse || len <= baselen {
                 break;
             }
         }
-        self.add_path_to_appropriate_result_list(sb.as_bstr(), state);
+        self.add_path_to_appropriate_result_list(sb.as_bstr(), 0, None, false, state);
         state == PathTreatment::Recurse
     }
 
-    /// `read_directory_recursive()` (dir.c:2698-2797).
-    fn read_directory_recursive(&mut self, base: &BStr, check_only: bool, stop_at_first_file: bool) -> PathTreatment {
+    /// `read_directory_recursive()` (dir.c:2703-2804). `untracked` is the cache's
+    /// directory for `base` when the untracked cache is in use.
+    fn read_directory_recursive(
+        &mut self,
+        base: &BStr,
+        untracked: Option<usize>,
+        check_only: bool,
+        stop_at_first_file: bool,
+    ) -> PathTreatment {
         let mut dir_state = PathTreatment::None;
-        // `open_cached_dir()` (dir.c:2571-2595): a directory that cannot be opened
-        // is warned about and contributes nothing.
-        let disk = if base.is_empty() {
-            self.root.to_owned()
-        } else {
-            self.disk_path(base)
-        };
-        let entries = match gix_fs::read_dir(&disk, self.ctx.precompose_unicode) {
-            Ok(entries) => entries,
-            Err(err) => {
-                let shown = if base.is_empty() { ".".into() } else { base.to_str_lossy() };
-                eprintln!(
-                    "warning: could not open directory '{shown}': {}",
-                    crate::walk::readdir::errno_text(&err)
-                );
-                return dir_state;
-            }
-        };
-
         let mut path = BString::from(base);
-        for entry in entries {
-            let Ok(entry) = entry else { break };
-            let name: BString = gix_path::try_os_str_into_bstr(entry.file_name()).map(|n| n.into_owned()).unwrap_or_default();
-            let dtype = entry.file_type().map_or(DType::Unknown, DType::from);
-            let mut state = self.treat_path(&mut path, base.len(), name.as_bstr(), dtype);
+        let baselen = base.len();
+
+        // `open_cached_dir()` (dir.c:2576-2600): a directory the cache vouches for is
+        // listed from it; any other is read from disk, and one that cannot be opened is
+        // warned about and contributes nothing.
+        let (cached, stat_data) = self.valid_cached_dir(untracked, base, check_only);
+        let mut disk = None;
+        if !cached {
+            let at = if base.is_empty() {
+                self.root.to_owned()
+            } else {
+                self.disk_path(base)
+            };
+            let opened = gix_fs::read_dir(&at, self.ctx.precompose_unicode);
+            if let (Some(cache), Some(u)) = (self.untracked.as_mut(), untracked) {
+                cache.cache.invalidate_directory(u);
+                cache.cache.stats_mut().dir_opened += 1;
+            }
+            match opened {
+                Ok(entries) => disk = Some(entries),
+                Err(err) => {
+                    let shown = if base.is_empty() { ".".into() } else { base.to_str_lossy() };
+                    eprintln!(
+                        "warning: could not open directory '{shown}': {}",
+                        crate::walk::readdir::errno_text(&err)
+                    );
+                    return dir_state;
+                }
+            }
+        }
+        if let (Some(cache), Some(u)) = (self.untracked.as_mut(), untracked) {
+            cache.cache.directory_mut(u).check_only = check_only;
+        }
+
+        // `read_cached_dir()`'s cursor over the cache: sub-directories first, then names.
+        let (mut nr_dirs, mut nr_files) = (0, 0);
+        loop {
+            // `read_cached_dir()` (dir.c:2602-2634) feeding `treat_path()`.
+            let mut state = if let Some(entries) = disk.as_mut() {
+                let Some(Ok(entry)) = entries.next() else { break };
+                let name: BString = gix_path::try_os_str_into_bstr(entry.file_name())
+                    .map(|n| n.into_owned())
+                    .unwrap_or_default();
+                let dtype = entry.file_type().map_or(DType::Unknown, DType::from);
+                self.treat_path(&mut path, baselen, name.as_bstr(), dtype, untracked)
+            } else {
+                let cache = &self.untracked.as_ref().expect("a cached listing has a cache").cache;
+                let dir = &cache.directories()[untracked.expect("a cached listing has a directory")];
+                let mut ucd = None;
+                while nr_dirs < dir.sub_directories.len() {
+                    let sub = dir.sub_directories[nr_dirs];
+                    nr_dirs += 1;
+                    if cache.directories()[sub].recurse {
+                        ucd = Some(sub);
+                        break;
+                    }
+                }
+                match ucd {
+                    Some(ucd) => self.treat_path_fast(&mut path, baselen, ucd),
+                    None if nr_files < dir.untracked_entries.len() => {
+                        path.truncate(baselen);
+                        path.extend_from_slice(&dir.untracked_entries[nr_files]);
+                        nr_files += 1;
+                        PathTreatment::Untracked
+                    }
+                    None => break,
+                }
+            };
             dir_state = dir_state.max(state);
 
             if state == PathTreatment::Recurse {
+                let ud = self.lookup_untracked(untracked, &path[baselen..]);
                 let sub = path.clone();
-                let subdir_state = self.read_directory_recursive(sub.as_bstr(), check_only, stop_at_first_file);
+                let subdir_state = self.read_directory_recursive(sub.as_bstr(), ud, check_only, stop_at_first_file);
                 dir_state = dir_state.max(subdir_state);
                 if self.match_pathspec(path.as_bstr(), 0) == 0 {
                     state = PathTreatment::None;
@@ -394,19 +501,189 @@ impl Dir<'_, '_, '_> {
                     break;
                 }
                 if dir_state == PathTreatment::Untracked {
+                    if disk.is_some() {
+                        self.add_untracked(untracked, &path[baselen..]);
+                    }
                     break;
                 }
                 continue;
             }
-            self.add_path_to_appropriate_result_list(path.as_bstr(), state);
+            self.add_path_to_appropriate_result_list(path.as_bstr(), baselen, untracked, disk.is_some(), state);
+        }
+
+        // `close_cached_dir()` (dir.c:2636-2649): the directory was gone through, so what
+        // the cache now holds for it is complete.
+        if let (Some(cache), Some(u)) = (self.untracked.as_mut(), untracked) {
+            let dir = cache.cache.directory_mut(u);
+            dir.stat = Some(stat_data);
+            dir.recurse = true;
         }
         dir_state
+    }
+
+    /// `valid_cached_dir()` (dir.c:2528-2574): whether the cache's listing of `base` can be
+    /// used instead of reading it, together with the `stat_data` the directory keeps —
+    /// refreshed whenever the stored one no longer matches.
+    fn valid_cached_dir(&mut self, untracked: Option<usize>, base: &BStr, check_only: bool) -> (bool, gix_index::entry::Stat) {
+        let (Some(cache), Some(u)) = (self.untracked.as_ref(), untracked) else {
+            return (false, Default::default());
+        };
+        let dir = &cache.cache.directories()[u];
+        let valid = dir.stat.is_some();
+        let mut stat_data = dir.stat.unwrap_or_default();
+        // "With fsmonitor, we can trust the untracked cache's valid field."
+        if !(cache.cache.use_fsmonitor() && valid) {
+            let at = if base.is_empty() {
+                self.root.to_owned()
+            } else {
+                self.disk_path(base)
+            };
+            let Some(st) = gix_index::fs::Metadata::from_path_no_follow(&at)
+                .ok()
+                .and_then(|meta| gix_index::entry::Stat::from_fs(&meta).ok())
+            else {
+                return (false, Default::default());
+            };
+            if !valid || (cache.stat_changed)(&stat_data, &st) {
+                return (false, st);
+            }
+            stat_data = dir.stat.unwrap_or_default();
+        }
+        if dir.check_only != check_only {
+            return (false, stat_data);
+        }
+        // "prep_exclude will be called eventually on this directory, but it's called much
+        // later in last_matching_pattern(). We need it now to determine the validity of the
+        // cache for this path."
+        self.prep_exclude(base);
+        let valid = self.untracked.as_ref().is_some_and(|c| c.cache.directories()[u].stat.is_some());
+        (valid, stat_data)
+    }
+
+    /// `treat_path_fast()` (dir.c:2394-2429): a sub-directory the cache listed. It is
+    /// walked again only if it was last read to see whether it held anything; otherwise
+    /// the recursion picks it up.
+    fn treat_path_fast(&mut self, path: &mut BString, baselen: usize, ucd: usize) -> PathTreatment {
+        let cache = &self.untracked.as_ref().expect("cached").cache;
+        let dir = &cache.directories()[ucd];
+        path.truncate(baselen);
+        path.extend_from_slice(&dir.name);
+        // `strbuf_complete(path, '/')`
+        if path.last() != Some(&b'/') {
+            path.push(b'/');
+        }
+        if dir.check_only {
+            let sub = path.clone();
+            return self.read_directory_recursive(sub.as_bstr(), Some(ucd), true, false);
+        }
+        PathTreatment::Recurse
+    }
+
+    /// `lookup_untracked()` (dir.c:1059-1095) for a walk: no directory without a cache.
+    fn lookup_untracked(&mut self, dir: Option<usize>, name: &[u8]) -> Option<usize> {
+        let cache = self.untracked.as_mut()?;
+        Some(cache.cache.lookup_or_create(dir?, name))
+    }
+
+    /// `add_untracked()` (dir.c:2519-2526).
+    fn add_untracked(&mut self, dir: Option<usize>, name: &[u8]) {
+        if let (Some(cache), Some(dir)) = (self.untracked.as_mut(), dir) {
+            cache.cache.directory_mut(dir).untracked_entries.push(name.into());
+        }
+    }
+
+    /// The untracked-cache half of `prep_exclude()` (dir.c:1654-1803) for `base`, a
+    /// directory that is empty or ends in `/`: the per-directory ignore file of every
+    /// directory from the root down to `base` is looked at once per descent, and a
+    /// directory whose ignore file is not the one its listing was made under loses that
+    /// listing, as does everything below it.
+    ///
+    /// The patterns themselves are matched by [`Context::is_excluded`]; only the stack
+    /// that decides *when* each ignore file is consulted is kept here, since that is
+    /// what decides which directories are invalidated. Without a cache there is nothing
+    /// to do.
+    fn prep_exclude(&mut self, base: &BStr) {
+        if self.untracked.is_none() {
+            return;
+        }
+        let baselen = base.len();
+        // Pop the directories that are not a prefix of `base`.
+        while let Some(&(len, _)) = self.exclude_stack.last() {
+            if len <= baselen && self.exclude_basebuf.get(..len) == base.get(..len) {
+                break;
+            }
+            self.exclude_stack.pop();
+            self.exclude_pattern = false;
+        }
+        // "Skip traversing into sub directories if the parent is excluded"
+        if self.exclude_pattern {
+            return;
+        }
+        let top = self.exclude_stack.last().copied();
+        let mut current: Option<usize> = top.map(|(len, _)| len);
+        self.exclude_basebuf.truncate(current.unwrap_or(0));
+        let mut untracked = match top {
+            Some((_, ucd)) => ucd,
+            None => self.untracked.as_ref().and_then(|c| c.cache.root()),
+        };
+        while current.is_none_or(|c| c < baselen) {
+            let (start, end) = match current {
+                None => (0, 0),
+                Some(c) => {
+                    let Some(slash) = base[c + 1..].find_byte(b'/') else {
+                        panic!("oops in prep_exclude");
+                    };
+                    let end = c + 1 + slash + 1;
+                    untracked = self.lookup_untracked(untracked, &base[c..end]);
+                    (c, end)
+                }
+            };
+            self.exclude_stack.push((end, untracked));
+            self.exclude_basebuf.extend_from_slice(&base[start..end]);
+
+            // "Abort if the directory is excluded"
+            if end > 0 {
+                let dirname = BString::from(&self.exclude_basebuf[..end - 1]);
+                if (self.ctx.is_excluded)(dirname.as_bstr(), true) {
+                    self.exclude_pattern = true;
+                    return;
+                }
+            }
+
+            // "Try to read per-directory file", which an untracked cache skips for a
+            // directory it knows to hold no ignore file and no new names.
+            if let Some(u) = untracked {
+                let cache = self.untracked.as_mut().expect("checked above");
+                let dir = &cache.cache.directories()[u];
+                let known = dir.exclude_file_oid.filter(|oid| !oid.is_null());
+                let read = dir.stat.is_none() || known.is_some();
+                let mut oid = None;
+                if read {
+                    let mut file = BString::from(&self.exclude_basebuf[..end]);
+                    file.extend_from_slice(cache.cache.exclude_filename_per_dir());
+                    oid = Some((cache.exclude_oid)(file.as_bstr())).filter(|oid| !oid.is_null());
+                }
+                if oid != known {
+                    cache.cache.invalidate_gitignore(u);
+                    cache.cache.directory_mut(u).exclude_file_oid = oid;
+                }
+            }
+            current = Some(end);
+        }
+        self.exclude_basebuf.truncate(baselen);
     }
 
     /// `treat_path()` (dir.c:2426-2521). On return `path` holds `base` +
     /// `d_name`, with a `/` appended for a directory that reached
     /// `treat_directory()`.
-    fn treat_path(&mut self, path: &mut BString, baselen: usize, d_name: &BStr, dtype: DType) -> PathTreatment {
+    fn treat_path(
+        &mut self,
+        path: &mut BString,
+        baselen: usize,
+        d_name: &BStr,
+        dtype: DType,
+        untracked: Option<usize>,
+    ) -> PathTreatment {
         let is_dot_git = if self.ctx.ignore_case.is_some() {
             d_name.eq_ignore_ascii_case(b".git")
         } else {
@@ -437,6 +714,9 @@ impl Dir<'_, '_, '_> {
             return PathTreatment::None;
         }
 
+        // `is_excluded()` loads the ignore files down to the directory holding `path` first.
+        let base_end = path.rfind_byte(b'/').map_or(0, |at| at + 1);
+        self.prep_exclude(path[..base_end].as_bstr());
         let excluded = (self.ctx.is_excluded)(path.as_bstr(), dtype == DType::Dir);
 
         if excluded && !self.has(DIR_SHOW_IGNORED | DIR_SHOW_IGNORED_TOO) {
@@ -447,7 +727,7 @@ impl Dir<'_, '_, '_> {
             DType::Dir => {
                 path.push(b'/');
                 let dirname = path.clone();
-                self.treat_directory(dirname.as_bstr(), excluded)
+                self.treat_directory(dirname.as_bstr(), baselen, excluded, untracked)
             }
             DType::Reg | DType::Lnk => {
                 if self.match_pathspec(path.as_bstr(), 0) == 0 {
@@ -463,7 +743,7 @@ impl Dir<'_, '_, '_> {
     }
 
     /// `treat_directory()` (dir.c:1966-2221). `dirname` ends in `/`.
-    fn treat_directory(&mut self, dirname: &BStr, excluded: bool) -> PathTreatment {
+    fn treat_directory(&mut self, dirname: &BStr, baselen: usize, excluded: bool, untracked: Option<usize>) -> PathTreatment {
         use gix_pathspec::search::git_match::{DO_MATCH_LEADING_PATHSPEC, MATCHED_RECURSIVELY_LEADING_PATHSPEC};
 
         match self.directory_exists_in_index(dirname[..dirname.len() - 1].as_bstr()) {
@@ -500,7 +780,7 @@ impl Dir<'_, '_, '_> {
                 if !self.has(DIR_HIDE_EMPTY_DIRECTORIES) {
                     return PathTreatment::Excluded;
                 }
-                if self.read_directory_recursive(dirname, true, true) == PathTreatment::Excluded {
+                if self.read_directory_recursive(dirname, untracked, true, true) == PathTreatment::Excluded {
                     return PathTreatment::Excluded;
                 }
                 return PathTreatment::None;
@@ -537,7 +817,9 @@ impl Dir<'_, '_, '_> {
         let old_ignored_nr = self.out.ignored.len();
         let old_untracked_nr = self.out.entries.len();
 
-        let mut state = self.read_directory_recursive(dirname, check_only, stop_early);
+        // "Actually recurse into dirname now, we'll fixup the state later."
+        let untracked = self.lookup_untracked(untracked, &dirname[baselen..]);
+        let mut state = self.read_directory_recursive(dirname, untracked, check_only, stop_early);
 
         if state == PathTreatment::Excluded {
             // Everything below was ignored. `--ignored=matching` wants those
@@ -569,7 +851,14 @@ impl Dir<'_, '_, '_> {
 
     /// `add_path_to_appropriate_result_list()` (dir.c:2645-2677) with
     /// `dir_add_name()` / `dir_add_ignored()` (dir.c:1849-1870).
-    fn add_path_to_appropriate_result_list(&mut self, path: &BStr, state: PathTreatment) {
+    fn add_path_to_appropriate_result_list(
+        &mut self,
+        path: &BStr,
+        baselen: usize,
+        untracked: Option<usize>,
+        from_disk: bool,
+        state: PathTreatment,
+    ) {
         match state {
             PathTreatment::Excluded => {
                 if self.has(DIR_SHOW_IGNORED) {
@@ -585,6 +874,9 @@ impl Dir<'_, '_, '_> {
             PathTreatment::Untracked => {
                 if !self.has(DIR_SHOW_IGNORED) {
                     self.dir_add_name(path);
+                    if from_disk {
+                        self.add_untracked(untracked, &path[baselen..]);
+                    }
                 }
             }
             PathTreatment::None | PathTreatment::Recurse => {}

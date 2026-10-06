@@ -887,6 +887,23 @@ impl State {
     pub fn untracked_changed(&self) -> bool {
         self.untracked_changed
     }
+    /// The untracked cache, for the directory walk that fills it.
+    pub fn untracked_mut(&mut self) -> Option<&mut extension::UntrackedCache> {
+        self.untracked.as_mut()
+    }
+    /// Run `f` over this state's entries and its untracked cache together — what a directory
+    /// walk needs, since it reads the one while it fills the other. `None` without a cache.
+    pub fn with_untracked_mut<R>(&mut self, f: impl FnOnce(&State, &mut extension::UntrackedCache) -> R) -> Option<R> {
+        let mut untracked = self.untracked.take()?;
+        let out = f(self, &mut untracked);
+        self.untracked = Some(untracked);
+        Some(out)
+    }
+    /// `istate->cache_changed |= UNTRACKED_CHANGED`: the cache was filled or reorganised in a
+    /// way that is worth writing.
+    pub fn mark_untracked_changed(&mut self) {
+        self.untracked_changed = true;
+    }
     /// Adopt `src`'s untracked cache — the half of `move_index_extensions()`
     /// (read-cache.c:3497-3503) that `unpack_trees()` runs on its result (unpack-trees.c:2077) —
     /// together with the entries it was last reconciled against, so that the names this state

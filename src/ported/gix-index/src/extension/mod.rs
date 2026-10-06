@@ -59,6 +59,10 @@ pub struct UntrackedCache {
 
     /// A list of directories and sub-directories, with `directories[0]` being the root.
     directories: Vec<untracked_cache::Directory>,
+    /// The in-core counters, never written.
+    stats: untracked_cache::Statistics,
+    /// `use_fsmonitor`, never written.
+    use_fsmonitor: bool,
 }
 
 /// The extension for keeping state on recent information provided by the filesystem monitor.

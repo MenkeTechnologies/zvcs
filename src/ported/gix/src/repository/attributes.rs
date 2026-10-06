@@ -137,4 +137,15 @@ impl Repository {
             self,
         ))
     }
+
+    /// `repo_excludes_file()`: the user-level ignore file [`excludes()`](Self::excludes()) reads —
+    /// `core.excludesFile` when set, `$XDG_CONFIG_HOME/git/ignore` otherwise — whether or not it
+    /// exists.
+    #[cfg(feature = "excludes")]
+    pub fn excludes_file(&self) -> Result<Option<std::path::PathBuf>, config::exclude_stack::Error> {
+        Ok(match self.config.excludes_file()? {
+            Some(user_path) => Some(user_path),
+            None => self.config.xdg_config_path("ignore")?,
+        })
+    }
 }

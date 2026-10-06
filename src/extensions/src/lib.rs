@@ -79,6 +79,7 @@ pub mod userdiff;
 pub mod transport_err;
 pub mod trace2;
 pub mod unicode_width;
+pub mod untracked_cache;
 pub mod unix_socket;
 pub mod utf8;
 pub mod worktree;

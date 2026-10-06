@@ -1089,6 +1089,11 @@ fn status_report(
         true => crate::index_racy::hold_locked_index(&repo),
         false => None,
     };
+    // `wt_status_collect_untracked()` hands the index's untracked cache to the walk only when
+    // it collects no ignored paths (wt-status.c:819-826), and `validate_untracked_cache()`
+    // takes it only for a whole-tree walk without a pathspec (dir.c:3001-3008).
+    let untracked_walk = (untracked != Untracked::No && !show_ignored && pathspecs.is_empty())
+        .then(|| crate::untracked_cache::status_dir_flags(untracked == Untracked::All));
 
     // The porcelain-v2 machine format is a separate renderer with its own,
     // richer per-path fields (HEAD/index/worktree modes + oids); it shares none
@@ -1115,7 +1120,7 @@ fn status_report(
             orderfile.as_deref(),
         )?;
         if let Some(lock) = index_lock {
-            update_index_if_able(&repo, lock)?;
+            update_index_if_able(&repo, lock, untracked_walk)?;
         }
         return Ok(code);
     }
@@ -1456,7 +1461,7 @@ fn status_report(
     // `cmd_status` runs it — `cmd_commit`'s `run_status()` calls do not, and neither
     // does the block that goes into `COMMIT_EDITMSG`.
     if let Some(lock) = index_lock {
-        update_index_if_able(&repo, lock)?;
+        update_index_if_able(&repo, lock, untracked_walk)?;
     }
 
     // git orders each section (and each short-format block) by path.
@@ -1645,6 +1650,10 @@ fn status_report(
 ///     very next write drops the `link` extension and lands one whole index. Until
 ///     something writes, the shared half survives — and `status` is exactly the
 ///     command that writes it, without staging a thing.
+///   * the untracked cache. `wt_status_collect_untracked()` walks the worktree through
+///     it and sets `UNTRACKED_CHANGED` when the walk had to read or invalidate
+///     anything under `core.untrackedCache=true` (dir.c:3157-3171); see
+///     [`crate::untracked_cache::collect`].
 ///
 /// The write goes through [`crate::index_racy::write`], the one writer this port
 /// has, so it makes the same `tweak_split_index()` decision and performs the same
@@ -1662,7 +1671,7 @@ fn status_report(
 ///
 /// `lock` is the `<index>.lock` `cmd_status` has held since before the collection
 /// (`fd >= 0`); every early return drops it, which is `rollback_lock_file()`.
-fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File) -> Result<()> {
+fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File, untracked_walk: Option<u32>) -> Result<()> {
     if !repo.index_path().exists() {
         return Ok(());
     }
@@ -1672,9 +1681,16 @@ fn update_index_if_able(repo: &gix::Repository, lock: gix::lock::File) -> Result
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     let mut index = repo.open_index()?;
 
-    // `remove_split_index()`'s contribution to `cache_changed`. The rest of it
-    // comes from `refresh_index()`, which this port's `status` does not run.
-    let cache_changed = index.had_link() && crate::config::split_index(repo) == Some(false);
+    // The untracked walk of `wt_status_collect()`, over the index as read: it fills the
+    // untracked cache and sets `UNTRACKED_CHANGED` when that is worth writing.
+    if let Some(dir_flags) = untracked_walk {
+        crate::untracked_cache::collect(repo, &mut index, dir_flags)?;
+    }
+
+    // `remove_split_index()`'s contribution to `cache_changed`, and `UNTRACKED_CHANGED` from
+    // `tweak_untracked_cache()` on the read or from the walk. The rest of it comes from
+    // `refresh_index()`, which ran and wrote before the report.
+    let cache_changed = (index.had_link() && crate::config::split_index(repo) == Some(false)) || index.untracked_changed();
     if !(cache_changed || has_racy_timestamp(&index)) {
         return Ok(());
     }

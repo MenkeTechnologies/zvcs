@@ -926,7 +926,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         let entries = repo
             .fill_directory(&index, &mut ps, flags, &mut |path, is_dir| {
                 matcher.is_excluded(path, is_dir)
-            })?
+            }, None)?
             .entries;
 
         // ```c

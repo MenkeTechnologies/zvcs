@@ -723,12 +723,9 @@ fn bisect_skip(args: &[String]) -> Result<u8> {
     // junk revs" — a bad operand leaves no ref and no log line behind.
     let mut ids = Vec::with_capacity(specs.len());
     for spec in &specs {
-        match resolve(&ctx.repo, spec) {
-            Ok(id) => ids.push(id),
-            Err(_) => {
-                eprintln!("error: Bad rev input: {spec}");
-                return Ok(BISECT_FAILED);
-            }
+        match state_operand(&ctx.repo, spec)? {
+            Some(id) => ids.push(id),
+            None => return Ok(BISECT_FAILED),
         }
         // `lookup_commit_reference()` parses what it resolves, and the navigation
         // on the way there parses more.
@@ -2278,12 +2275,9 @@ fn bisect_state(word: &str, args: &[String]) -> Result<u8> {
     };
     let mut ids = Vec::with_capacity(specs.len());
     for spec in &specs {
-        match resolve(&ctx.repo, spec) {
-            Ok(id) => ids.push(id),
-            Err(_) => {
-                eprintln!("error: Bad rev input: {spec}");
-                return Ok(BISECT_FAILED);
-            }
+        match state_operand(&ctx.repo, spec)? {
+            Some(id) => ids.push(id),
+            None => return Ok(BISECT_FAILED),
         }
     }
 
@@ -2764,7 +2758,41 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     Ok(state_exit(auto_next(&ctx, &terms, no_checkout)?))
 }
 
+/// `bisect_state()`'s operand check (builtin/bisect.c:1099-1113): a name
+/// `repo_get_oid()` cannot resolve is `Bad rev input` and `BISECT_FAILED`; one
+/// that resolves to something `lookup_commit_reference()` cannot turn into a
+/// commit — a blob, a tree, an id the odb lacks — is a `die()`, after the
+/// lookup's own `object %s is a %s, not a commit` line.
+fn state_operand(repo: &gix::Repository, spec: &str) -> Result<Option<ObjectId>> {
+    let Some(id) = get_oid(repo, spec) else {
+        eprintln!("error: Bad rev input: {spec}");
+        return Ok(None);
+    };
+    match crate::objname::lookup_commit_reference(repo, id) {
+        crate::objname::CommitRef::Commit(commit) => Ok(Some(commit)),
+        other => {
+            if let Some(err) = other.type_error() {
+                eprintln!("error: {err}");
+            }
+            Err(crate::fatal::die(format!("Bad rev input (not a commit): {spec}")))
+        }
+    }
+}
+
+/// `interpret_branch_mark()` dies inside `repo_get_oid()` itself when an
+/// `@{upstream}` or `@{push}` mark names nothing (object-name.c), so every
+/// resolution in this command ends the process there, whatever its caller
+/// would have made of a plain failure.
+fn die_on_branch_mark(repo: &gix::Repository, spec: &str) {
+    if let Some(msg) = crate::objname::upstream_mark_fatal(repo, spec) {
+        crate::cstdio::flush();
+        eprintln!("fatal: {msg}");
+        std::process::exit(128);
+    }
+}
+
 fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
+    die_on_branch_mark(repo, spec);
     let commit = repo.rev_parse_single(spec)?.object()?.peel_to_commit()?;
     Ok(commit.id)
 }
@@ -2794,6 +2822,7 @@ fn resolve(repo: &gix::Repository, spec: &str) -> Result<ObjectId> {
 ///     commit that no longer exists gets past this check and is refused by
 ///     `update_ref` instead, with a different message.
 fn get_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
+    die_on_branch_mark(repo, spec);
     if spec.len() == repo.object_hash().len_in_hex() {
         if let Ok(id) = ObjectId::from_hex(spec.as_bytes()) {
             return Some(id);

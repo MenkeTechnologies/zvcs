@@ -79,3 +79,30 @@ fn an_existing_dot_git_directory_moves_to_the_separate_git_dir() {
     assert!(!root.join(".git").exists());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Reinitializing a repository whose git directory is read-only: the two
+/// gentle unsets `initialize_repository_version()` makes on a reinit
+/// (setup.c:2468-2469, :2482-2483) each fail to take the config lock and say so
+/// (config.c:3069-3071) without dying, and the version write that follows
+/// prints the same line before `repo_config_set()` dies. zvcs swallowed all
+/// three lines and printed only the fatal one.
+#[test]
+fn a_read_only_git_dir_reports_each_config_lock_before_the_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = std::env::temp_dir().join(format!("zvcs-init-read-only-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "r"]);
+    let dot_git = root.join("r/.git");
+    std::fs::set_permissions(&dot_git, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // A superuser writes through the mode; nothing to observe there.
+    if std::fs::File::create(dot_git.join("probe")).is_err() {
+        let (out, err, code) = git(&root, &["init", "r"]);
+        let config = dot_git.canonicalize().unwrap().join("config");
+        let lock = format!("error: could not lock config file {}: Permission denied\n", config.display());
+        assert_eq!((out.as_str(), code), ("", 128));
+        assert_eq!(err, format!("{lock}{lock}{lock}fatal: could not set 'core.repositoryformatversion' to '0'\n"));
+    }
+    std::fs::set_permissions(&dot_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -1013,9 +1013,13 @@ fn reinitialize_repository_version(git_dir: &Path, hash: &str, refs: &str) -> Re
     use crate::config_store::ValuePattern;
     let path = config_path(git_dir);
     // `repo_config_set[_gently]()`: `git_config_set_multivar_in_file_gently(…, NULL, NULL, 0)`.
-    // The gentle unset of a key that is not there changes nothing.
+    // The gentle unset of a key that is not there changes nothing. Every other failure is
+    // reported by `repo_config_set_multivar_in_file_gently()` itself (config.c:3070 for the
+    // lock, :3264 for the write) before the caller decides whether it dies, so the gentle
+    // unsets of a read-only git directory each leave their own `error:` line ahead of the
+    // fatal one.
     let set = |key: &str, value: Option<&str>| -> Result<()> {
-        match crate::config_store::set_multivar_in_file(
+        let result = crate::config_store::set_multivar_in_file(
             &path,
             key,
             key,
@@ -1024,7 +1028,17 @@ fn reinitialize_repository_version(git_dir: &Path, hash: &str, refs: &str) -> Re
             ValuePattern::Any,
             None,
             false,
-        ) {
+        );
+        match &result {
+            Err(crate::config_store::StoreError::Io(err)) => {
+                eprintln!("error: could not lock config file {}: {}", path.display(), super::config::errno_text(err));
+            }
+            Err(crate::config_store::StoreError::InvalidFile) => {
+                eprintln!("error: invalid config file {}", path.display());
+            }
+            _ => {}
+        }
+        match result {
             Ok(()) => Ok(()),
             Err(_) if value.is_none() => Ok(()),
             // `repo_config_set()` (config.c) dies on any failure.

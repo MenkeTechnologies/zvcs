@@ -135,3 +135,23 @@ fn a_plain_status_is_unaffected() {
         ("On branch main\nnothing to commit, working tree clean\n".to_string(), 0)
     );
 }
+
+/// `rebase --abort` leaves `REBASE_HEAD` behind. It does not make a later pick
+/// a rebase pick: `sequencer_determine_whence()` also wants `rebase-merge` and a
+/// `REBASE_HEAD` equal to `CHERRY_PICK_HEAD` (sequencer.c:6986-6992). zvcs's
+/// `--continue` looked at `REBASE_HEAD` alone and told the user to
+/// `git rebase --skip`.
+#[test]
+fn a_stale_rebase_head_does_not_turn_the_advice_into_a_rebase_one() {
+    let f = Fixture::new("stale-rebase-head");
+    let base = String::from_utf8(f.command(&["rev-parse", "main~1"]).output().unwrap().stdout).unwrap();
+    std::fs::write(f.work.join(".git/REBASE_HEAD"), base).unwrap();
+    let short = String::from_utf8(
+        f.command(&["rev-parse", "--short", "s1"]).output().unwrap().stdout,
+    )
+    .unwrap();
+    let want = format!("{ADVICE}{}", report(short.trim()));
+    for args in [&["cherry-pick", "s1"][..], &["cherry-pick", "--continue"], &["commit"]] {
+        assert_eq!(f.merged(args), (want.clone(), 1), "{args:?}");
+    }
+}

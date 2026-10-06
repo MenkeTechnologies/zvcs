@@ -2139,10 +2139,12 @@ fn continue_single_pick(
     // it — only `git commit --allow-empty` or `--skip` moves past that.
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     if tree_id == head_tree {
-        let whence = match crate::refstore::state_ref_exists(repo, "REBASE_HEAD") {
-            true => super::commit::Whence::RebasePick,
-            false => super::commit::Whence::CherryPick,
-        };
+        // The child decides where it came from itself (`determine_whence()`,
+        // builtin/commit.c:198-206): a rebase pick needs `rebase-merge` *and* a
+        // `REBASE_HEAD` naming the commit being picked (sequencer.c:6986-6992), so
+        // the `REBASE_HEAD` an aborted rebase leaves behind does not make a later
+        // cherry-pick one.
+        let whence = super::commit::determine_whence(repo);
         // A `git commit` child (sequencer.c:5240-5256): its buffered report
         // flushes at its exit, after its advice on stderr.
         let _child = crate::cstdio::run_command();

@@ -423,7 +423,7 @@ fn die_unless_head_is_a_commit(repo: &gix::Repository) -> Result<Option<ExitCode
     }
 }
 
-fn determine_whence(repo: &gix::Repository) -> Whence {
+pub(super) fn determine_whence(repo: &gix::Repository) -> Whence {
     let git_dir = repo.git_dir();
     if git_dir.join("MERGE_HEAD").exists() {
         return Whence::Merge;

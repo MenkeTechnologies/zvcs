@@ -3283,6 +3283,18 @@ pub fn repository_format_refusal() -> Option<String> {
     verify_repository_format(&format)
 }
 
+/// `copy_templates()`'s vintage check (setup.c:2401-2417): the `config` a
+/// template directory carries is read as a repository format, and when it names
+/// a version at all, the message `verify_repository_format()` fills is the
+/// reason the template is not copied. `None` copies it.
+pub fn template_format_refusal(template_config: &std::path::Path) -> Option<String> {
+    let format = read_repository_format(template_config);
+    if format.version < 0 {
+        return None;
+    }
+    verify_repository_format(&format)
+}
+
 /// `repo->worktree_config_is_bogus` — set once [`check_bare_and_worktree`] has
 /// warned, and read by every port of `setup_work_tree()` through
 /// [`crate::fatal::need_work_tree`].

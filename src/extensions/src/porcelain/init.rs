@@ -698,7 +698,12 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         // copies nothing and does not warn, leaving a repository with no
         // `description`, no `info/exclude` and no `hooks/`.
         Some("") => {}
-        Some(tpl) => copy_templates(tpl, &template_dir)?,
+        Some(tpl) => {
+            copy_templates(tpl, &template_dir)?;
+            if !reinit {
+                adopt_template_config(tpl, &git_dir)?;
+            }
+        }
         None => copy_default_template(&template_dir)?,
     }
 
@@ -1313,10 +1318,20 @@ pub(super) fn apply_template(template: &str, git_dir: &Path) -> Result<()> {
 /// `description` and `info/exclude` stay exactly as they are, and only paths the
 /// template names and the repository lacks are filled in.
 pub(super) fn copy_templates(template: &str, git_dir: &Path) -> Result<()> {
-    // `if (!template_dir[0]) goto free_return;` — an explicitly empty
-    // `--template=` names no template and is not a warning.
+    if let Some(src) = template_source(template, true)? {
+        copy_template_dir(&src, git_dir)?;
+    }
+    Ok(())
+}
+
+/// The template directory `copy_templates()` (setup.c:2376-2428) would copy out
+/// of, or `None` where it returns early: an explicitly empty `--template=` (no
+/// warning), a directory it cannot open (`templates not found in %s`), or one
+/// whose `config` names a repository format this build does not read (`not
+/// copying templates from '%s': %s`). `warn` prints those two warnings.
+fn template_source(template: &str, warn: bool) -> Result<Option<PathBuf>> {
     if template.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let src = {
         let p = PathBuf::from(template);
@@ -1326,12 +1341,68 @@ pub(super) fn copy_templates(template: &str, git_dir: &Path) -> Result<()> {
             std::env::current_dir()?.join(p)
         }
     };
-    // git warns and skips when the template dir cannot be opened.
     if std::fs::read_dir(&src).is_err() {
-        eprintln!("warning: templates not found in {template}");
+        if warn {
+            eprintln!("warning: templates not found in {template}");
+        }
+        return Ok(None);
+    }
+    if let Some(err) = crate::config::template_format_refusal(&src.join("config")) {
+        if warn {
+            eprintln!("warning: not copying templates from '{template}': {err}");
+        }
+        return Ok(None);
+    }
+    Ok(Some(src))
+}
+
+/// A fresh repository built from a template that carries a `config` starts from
+/// that file: git's git directory is empty when `copy_templates_1()` copies it,
+/// and every key `create_default_files()` then sets goes into it through
+/// `repo_config_set()` — replacing a key the template already spells in place,
+/// appending the rest to their sections. gix wrote its own `config` before the
+/// template was copied, so its entries are replayed, in order, onto the
+/// template's file. Nothing happens on a reinitialization, where
+/// `copy_templates_1()` leaves the existing `config` alone.
+fn adopt_template_config(template: &str, git_dir: &Path) -> Result<()> {
+    use crate::config_store::ValuePattern;
+    let Some(src) = template_source(template, false)? else {
+        return Ok(());
+    };
+    let template_config = src.join("config");
+    if !template_config.is_file() {
         return Ok(());
     }
-    copy_template_dir(&src, git_dir)?;
+    let path = config_path(git_dir);
+    let written = gix::config::File::from_path_no_includes(path.clone(), gix::config::Source::Local)?;
+    let mut entries: Vec<(String, gix::bstr::BString)> = Vec::new();
+    for section in written.sections() {
+        let header = section.header();
+        let base = match header.subsection_name() {
+            Some(sub) => format!("{}.{sub}", header.name().to_string().to_ascii_lowercase()),
+            None => header.name().to_string().to_ascii_lowercase(),
+        };
+        for name in section.value_names() {
+            let name = name.to_string();
+            if let Some(value) = section.value(name.as_str()) {
+                entries.push((format!("{base}.{}", name.to_ascii_lowercase()), value));
+            }
+        }
+    }
+    std::fs::copy(&template_config, &path)?;
+    for (key, value) in entries {
+        crate::config_store::set_multivar_in_file(
+            &path,
+            &key,
+            &key,
+            key.rfind('.').expect("the key has a section"),
+            Some(value.as_slice()),
+            ValuePattern::Any,
+            None,
+            false,
+        )
+        .map_err(|e| anyhow::anyhow!("could not set '{key}': {e:?}"))?;
+    }
     Ok(())
 }
 

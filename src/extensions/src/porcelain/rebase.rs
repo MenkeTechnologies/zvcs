@@ -1891,13 +1891,15 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
             // not the current branch is checked out here and nowhere else, which is
             // why a rebase that replays leaves no `rebase: checkout <branch>` line.
             if let Some(requested) = eager_switch.as_ref() {
-                super::checkout::switch_to_branch(
+                let switched = super::checkout::switch_to_branch(
                     &repo,
                     requested,
                     true,
                     false,
                     Some(&format!("{}: checkout {requested}", reflog_action())),
-                )?;
+                );
+                super::checkout::settle_refreshed_index(&switched)?;
+                switched?;
             } else if let Some(requested) = switch_to.as_ref() {
                 let message = format!("{}: checkout {requested}", reflog_action());
                 if let Some(name) = &branch {

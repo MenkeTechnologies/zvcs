@@ -1547,7 +1547,7 @@ fn try_merge_strategy(
     // (builtin/merge.c:795-798), ahead of the dispatch: every back-end below
     // decides what it may overwrite from the index's `stat` data, and the two
     // that run as separate programs read that data back off the file.
-    refresh_and_write_index(repo)?;
+    let refreshed = refresh_and_write_index(repo)?;
     if pick.kind.is_ort() {
         // `if (remoteheads->next) { error(…); return 2; }` (builtin/merge.c:809-812)
         if ctx.targets.len() > 1 {
@@ -1574,7 +1574,14 @@ fn try_merge_strategy(
                 return Ok(Attempt::Done { code: ExitCode::from(128), autostash_applied: false });
             }
         };
-        return ort_attempt(repo, ctx, opts, &xopts);
+        // merge-ort works on `the_repository->index` as the refresh left it, up-to-date
+        // marks and all; the strategies that run as programs read the file instead.
+        if let Some(index) = refreshed {
+            crate::held_index::hold(repo, index);
+        }
+        let attempt = ort_attempt(repo, ctx, opts, &xopts);
+        crate::held_index::discard();
+        return attempt;
     }
     match pick.kind {
         Strategy::Ours => ours_attempt(repo, ctx),
@@ -2637,9 +2644,9 @@ fn exit_status(code: ExitCode) -> u8 {
 /// `SKIP_IF_UNCHANGED` is the write flag: an index the refresh did not move is
 /// not rewritten. git's non-negative returns are both "carry on" — only a
 /// failed write is `< 0` — so a reported path does not stop the merge.
-fn refresh_and_write_index(repo: &gix::Repository) -> Result<()> {
+fn refresh_and_write_index(repo: &gix::Repository) -> Result<Option<gix::index::File>> {
     if repo.workdir().is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let mut index = repo.index_or_load_from_head()?.into_owned();
     let outcome = super::update_index::refresh_index(
@@ -2652,7 +2659,7 @@ fn refresh_and_write_index(repo: &gix::Repository) -> Result<()> {
     if outcome.dirty {
         crate::index_racy::write(repo, &mut index)?;
     }
-    Ok(())
+    Ok(Some(index))
 }
 
 /// `read_tree_trivial()` (builtin/merge.c:743-777): `unpack_trees()` over
@@ -2778,7 +2785,10 @@ fn ort_attempt(
     opts: &Opts,
     xopts: &crate::merge_apply::StrategyOptions,
 ) -> Result<Attempt> {
-    let old_index = repo.index_or_load_from_head()?.into_owned();
+    let old_index = match crate::held_index::take() {
+        Some(index) => index,
+        None => repo.index_or_load_from_head()?.into_owned(),
+    };
     // merge-ort's `merge_start()`: the index must match HEAD before the engine
     // runs, whatever the change is and wherever it sits. A fast-forward never
     // reaches this — git happily fast-forwards over a staged change.
@@ -3542,6 +3552,16 @@ fn settle_index_for_commit(
     drop_resolve_undo: bool,
 ) -> Result<()> {
     let mut index = repo.open_index()?;
+    // `write_index_as_tree()` writes the index only when its cache-tree was not already
+    // fully valid (cache-tree.c:825-839) — and after merge-ort's own write it is, so git
+    // writes nothing here. Writing it again anyway re-examined, without the marks the merge
+    // had, every entry racily clean against the merge's write, and turned each into a
+    // stand-in in a split index.
+    let odb = super::write_tree::RepoOdb { repo };
+    let resolve_undo_to_drop = drop_resolve_undo && index.resolve_undo().is_some();
+    if index.cache_tree_fully_valid(&odb) && !resolve_undo_to_drop {
+        return Ok(());
+    }
     let cache_tree = cache_tree_node(repo, &[], tree)?;
     index.set_tree(Some(cache_tree));
     if drop_resolve_undo {

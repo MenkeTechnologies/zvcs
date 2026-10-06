@@ -430,6 +430,12 @@ fn parse<'a>(args: &'a [String]) -> Result<Parse<'a>> {
 }
 
 pub fn switch(args: &[String]) -> Result<ExitCode> {
+    let result = switch_main(args);
+    super::checkout::settle_refreshed_index(&result)?;
+    result
+}
+
+fn switch_main(args: &[String]) -> Result<ExitCode> {
     // Same split as `checkout`: the worktree-change listing is stdout, the
     // `Switched to …` line is stderr, and stdio's buffering of the first is what
     // orders them for a caller capturing both. See `crate::cstdio`.

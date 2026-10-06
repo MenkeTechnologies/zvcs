@@ -223,6 +223,24 @@ pub(super) const LONG_OPTS: &[super::LongOpt] = {
 };
 
 pub fn checkout(args: &[String]) -> Result<ExitCode> {
+    let result = checkout_main(args);
+    settle_refreshed_index(&result)?;
+    result
+}
+
+/// Write the index a successful switch refreshed but never handed to a two-way merge, and drop
+/// it when the switch failed — git's `merge_working_tree()` commits its lock only on success.
+pub(crate) fn settle_refreshed_index(result: &Result<ExitCode>) -> Result<()> {
+    match result {
+        Ok(code) if *code == ExitCode::SUCCESS => crate::held_index::flush(),
+        _ => {
+            crate::held_index::discard();
+            Ok(())
+        }
+    }
+}
+
+fn checkout_main(args: &[String]) -> Result<ExitCode> {
     // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
     // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
     // and `parse_options()` then answers the request before the builtin has
@@ -3406,6 +3424,13 @@ pub(super) enum Gate {
 /// matches is repaired here, so `show_local_changes()`'s `diff-index` afterwards does not list it
 /// as `M`. The repaired stat data reaches disk with the index the switch writes; on the refusal
 /// git rolls the lock back, so nothing is written then either.
+///
+/// The refreshed index is therefore not written here: it is held (`crate::held_index`) for
+/// the two-way merge to start from, exactly as git's `unpack_trees()` starts from
+/// `the_repository->index`, and is written once — by [`update_worktree_to_tree`], or by
+/// `settle_refreshed_index` when the switch moves nothing. Writing it here and reading it
+/// back lost what the refresh had learnt (`ce_mark_uptodate()`), so the switch's own write
+/// re-examined those entries as racy and left stand-ins in a split index that stock does not.
 pub(super) fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     let mut index = repo.index_or_load_from_head_or_empty()?.into_owned();
     let refreshed = if repo.workdir().is_some() {
@@ -3430,9 +3455,10 @@ pub(super) fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<Exi
         eprintln!("error: you need to resolve your current index first");
         return Ok(Some(ExitCode::from(1)));
     }
-    if refreshed {
-        crate::index_racy::write(repo, &mut index)?;
-    }
+    // Held whether or not the refresh changed anything: what it verified is what the two-way
+    // merge starts from, and `merge_working_tree()` writes the index either way.
+    let _ = refreshed;
+    crate::held_index::hold(repo, index);
     Ok(None)
 }
 
@@ -3442,7 +3468,7 @@ pub(super) fn switch_gate(
     target_tree: ObjectId,
     merge: Option<MergeOpt<'_>>,
 ) -> Result<Gate> {
-    let index = repo.index_or_load_from_head_or_empty()?;
+    let index = crate::held_index::peek_or_read(repo)?;
     let clobber = crate::merge_guard::verify_two_way(repo, cur_tree, target_tree, &index)?;
     if clobber.is_empty() {
         return Ok(Gate::Clean);
@@ -3761,7 +3787,12 @@ pub(super) fn update_worktree_to_tree(
     let old = if initial_checkout {
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
     } else {
-        repo.index_or_load_from_head_or_empty()?.into_owned()
+        // The index `merge_working_tree()` refreshed, when it did: `unpack_trees()` starts
+        // from that in-memory index, not from a copy read back off disk.
+        match crate::held_index::take() {
+            Some(index) => index,
+            None => repo.index_or_load_from_head_or_empty()?.into_owned(),
+        }
     };
     let old_stats: HashMap<BString, (ObjectId, Mode, Stat)> = {
         let backing = old.path_backing();
@@ -4038,6 +4069,9 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
 /// would name every path the two branches disagree about on top of the local
 /// changes it is meant to list.
 pub(super) fn show_local_changes(rev: &str, quiet: bool) -> Result<()> {
+    // It runs at the tail of `merge_working_tree()`, after the index is written; a switch
+    // that moved nothing still writes the index its refresh changed.
+    crate::held_index::flush()?;
     if quiet {
         return Ok(());
     }

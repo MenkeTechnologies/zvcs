@@ -28,6 +28,7 @@ pub mod external;
 pub mod fatal;
 pub mod gitcomp;
 pub mod gitsig;
+pub mod held_index;
 pub mod hooks;
 pub mod hosted;
 pub mod index_commit;

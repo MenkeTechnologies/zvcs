@@ -314,8 +314,10 @@ fn queue_dirs(lhs: &str, rhs: &str, l_dir: bool, r_dir: bool) -> Vec<(Side, Side
             return Side { name: BString::from(root), file: Some(path), mode };
         }
         let path = PathBuf::from(&joined);
+        // `get_mode()` (diff-no-index.c:94) is an `lstat()`: a symlink whose target
+        // is missing is still a side, holding its target text.
         match mode_of(&path) {
-            Ok(mode) if path.exists() => Side { name: BString::from(joined), file: Some(path), mode },
+            Ok(mode) => Side { name: BString::from(joined), file: Some(path), mode },
             _ => Side::absent(BString::from(DEV_NULL)),
         }
     };

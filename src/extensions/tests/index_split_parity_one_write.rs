@@ -177,3 +177,38 @@ fn a_non_fast_forward_merge_keeps_the_index_split() {
     assert_eq!(ours, theirs);
 }
 
+/// Rewrite `d` in both copies with an old mtime: a change for `stash` to take.
+fn edit_d(f: &Fixture) {
+    for side in ["stock", "ours"] {
+        let path = f.root.join(side).join("d");
+        std::fs::write(&path, "x\n").unwrap();
+        let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_577_840_400);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(past).unwrap();
+    }
+}
+
+/// `stash push` writes the index three times before its child `reset --hard` writes it again,
+/// and its temporary index — split under `core.splitIndex=true` — leaves a shared index of its
+/// own behind.
+#[test]
+fn stash_push_writes_the_index_as_often_as_stock() {
+    let Some(stock) = stock_git() else { return };
+    let f = Fixture::new(stock, "stash-push");
+    edit_d(&f);
+    let (theirs, ours) = f.both(stock, &["stash", "-q"]);
+    assert_eq!(ours, theirs);
+}
+
+/// `stash pop` writes the refreshed index, the merge's and the unstaged one in turn, each
+/// deciding its split half on its own.
+#[test]
+fn stash_pop_writes_the_index_as_often_as_stock() {
+    let Some(stock) = stock_git() else { return };
+    let f = Fixture::new(stock, "stash-pop");
+    edit_d(&f);
+    for side in ["stock", "ours"] {
+        ok(stock, &f.root.join(side), &f.root, &["stash", "-q"]);
+    }
+    let (theirs, ours) = f.both(stock, &["stash", "pop", "-q"]);
+    assert_eq!(ours, theirs);
+}

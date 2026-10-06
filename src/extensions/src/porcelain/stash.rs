@@ -527,6 +527,13 @@ fn explicit_status(result: Result<ExitCode>) -> Result<ExitCode> {
 }
 
 pub fn stash(args: &[String]) -> Result<ExitCode> {
+    let result = stash_main(args);
+    // An index a step held for the next one is never written behind the command's back.
+    crate::held_index::discard();
+    result
+}
+
+fn stash_main(args: &[String]) -> Result<ExitCode> {
     // `-h` is answered before the repository is even looked for, which is why it
     // works outside one.
     if args.first().is_none_or(|a| a.starts_with('-')) {
@@ -849,6 +856,15 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // is not what the selection came from.
     let keep_index = opts.keep_index.unwrap_or(opts.patch);
 
+    // `do_create_stash()` refreshes and writes the index a second time (builtin/stash.c:1524),
+    // then records `i_tree` through `write_index_as_tree()` (:1561), which writes it back once
+    // more when its cache-tree was not fully valid. What follows — the reset — is a child
+    // `git reset --hard` that reads the index off disk, so nothing stays held past here.
+    refresh_and_write_index(repo)?;
+    if let Some(mut index) = crate::held_index::take() {
+        let _ = super::write_tree::refresh_cache_tree(repo, &mut index, false)?;
+    }
+
     let StashBuild {
         w_commit,
         stash_msg,
@@ -883,6 +899,13 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
             println!("No local changes to save");
         }
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if !opts.patch && !opts.staged_only {
+        if let Some(w) = w_commit {
+            let w_tree = repo.find_commit(w)?.tree_id()?.detach();
+            write_working_tree_index(repo, w_tree)?;
+        }
     }
 
     // Append the reflog entry and move refs/stash to the new W commit.
@@ -2029,6 +2052,7 @@ fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     // The index holds up to three stages per conflicted path; git names each path once.
     unmerged.dedup();
     if unmerged.is_empty() {
+        refresh_and_write_index(repo)?;
         return Ok(None);
     }
     for path in unmerged {
@@ -2036,6 +2060,69 @@ fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     }
     eprintln!("error: could not write index");
     Ok(Some(ExitCode::FAILURE))
+}
+
+/// The one lasting trace of `stash_working_tree()`'s temporary index (builtin/stash.c:1444-1500).
+///
+/// git builds `W`'s tree in `.git/index.stash.<pid>`: `reset_tree()` writes the index tree
+/// there, a child `git update-index --add --remove --stdin` run with `GIT_INDEX_FILE` pointing
+/// at it stages the worktree's changes, and `write_index_as_tree()` reads the tree back before
+/// the file is removed. The child reads a whole index, and under `core.splitIndex=true`
+/// `tweak_split_index()` orders it split (read-cache.c:1932-1946), so its write puts a new
+/// `sharedindex.<id>` beside the real index — one that outlives the temporary file until
+/// `splitIndex.sharedIndexExpire` reaps it. This port builds the tree without an index, so it
+/// writes that index here for the shared half it leaves behind: `W`'s tracked entries, each
+/// with the stat of the file it was hashed from.
+fn write_working_tree_index(repo: &gix::Repository, w_tree: ObjectId) -> Result<()> {
+    if crate::config::split_index(repo) != Some(true) || repo.workdir().is_none() {
+        return Ok(());
+    }
+    let path = repo.git_dir().join(format!("index.stash.{}", std::process::id()));
+    let state: gix::index::State = repo.index_from_tree(&w_tree)?.into();
+    let mut temp = gix::index::File::from_state(state, path.clone());
+    let backing = temp.path_backing().to_owned();
+    for e in temp.entries_mut() {
+        let Some(full) = repo.workdir_path(e.path_in(&backing)) else { continue };
+        if let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&full) {
+            if let Ok(stat) = Stat::from_fs(&md) {
+                e.stat = stat;
+            }
+        }
+    }
+    let written = temp.write_split(repo.git_dir(), crate::config::index_write_options(repo));
+    let _ = std::fs::remove_file(&path);
+    written.map_err(|e| anyhow!("could not write temporary index {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// `repo_refresh_and_write_index(the_repository, REFRESH_QUIET, 0, 0, NULL, NULL, NULL)`
+/// (read-cache.c:1631-1648) over a merged index: refresh it, write it whether or not the
+/// refresh changed anything (`write_flags == 0`, no `SKIP_IF_UNCHANGED`), and keep working on
+/// it — it is held ([`crate::held_index`]) with every mark the refresh made, for the next step
+/// of the same command to take.
+///
+/// `push` reaches it twice, once in `do_push_stash()` (builtin/stash.c:1723) and once in
+/// `do_create_stash()` (:1524); `apply`/`pop` once, in `do_apply_stash()` (:660). Each is a real
+/// write: in a split index each one decides on its own what goes into the split half and
+/// whether a new shared index is due, and the reset `push` ends with runs as a separate
+/// `git reset --hard`, which reads the last of them back off disk.
+fn refresh_and_write_index(repo: &gix::Repository) -> Result<()> {
+    let mut index = match crate::held_index::take() {
+        Some(index) => index,
+        None => crate::index_open::or_empty(repo)?,
+    };
+    if repo.workdir().is_some() {
+        super::update_index::refresh_index(
+            repo,
+            &mut index,
+            super::update_index::RefreshFlags { quiet: true, ..Default::default() },
+            None,
+            None,
+        )?;
+    }
+    crate::index_racy::write(repo, &mut index)?;
+    crate::held_index::hold(repo, index);
+    Ok(())
 }
 
 /// `do_create_stash()`'s refusal of a conflicted index, as `git stash create`
@@ -2803,7 +2890,12 @@ fn restore_stash_commit(
     if refuse_unmerged_index(repo)?.is_some() {
         return Ok(Err(failed()));
     }
-    let mut old_index = repo.open_index()?;
+    // The index `repo_refresh_and_write_index()` just refreshed and wrote, as git goes on
+    // working on it in memory.
+    let mut old_index = match crate::held_index::take() {
+        Some(index) => index,
+        None => repo.open_index()?,
+    };
     // `do_apply_stash()` gets *ours* from
     // `write_index_as_tree(&c_tree, the_repository->index, repo_get_index_file(), 0, NULL)`
     // (builtin/stash.c:661-663) — the on-disk index file, by name. That function rewrites it:
@@ -3021,7 +3113,12 @@ fn restore_stash_commit(
     // the merge brought in shows up unstaged), or — under `--index` — to the
     // stash's own staged tree. Worktree stats come from the merge's own index so
     // a following `status` does not re-hash every file.
-    if let Some(applied) = applied.filter(|_| merged_cleanly) {
+    if let Some(mut applied) = applied.filter(|_| merged_cleanly) {
+        // `write_locked_index(o.repo->index, &lock, COMMIT_LOCK | SKIP_IF_UNCHANGED)`
+        // (builtin/stash.c:729-731): the merge's index reaches disk on its own before the
+        // unstaging below rewrites it, and in a split index that write settles its own
+        // split half and shared index.
+        crate::index_racy::write(repo, &mut applied.index)?;
         let fresh: HashMap<BString, (ObjectId, Mode, Stat)> = {
             let backing = applied.index.path_backing();
             applied
@@ -3740,6 +3837,37 @@ fn write_target_index(
         // the merge added and the unstage left alone does not.
         CacheTree::LikeUnstagedOverMerge { merged } => {
             super::write_tree::carry_cache_tree_invalidating_changes(repo, merged, &mut new_index);
+            // The index being unstaged is the merge's own, just written: it stands on the
+            // shared half that write left, an entry `add_index_entry()` puts back is a fresh
+            // one with no `ce->index`, and every entry left alone keeps the up-to-date mark
+            // the merge's checkout gave it.
+            new_index.inherit_split_index(merged);
+            new_index.unshare_entries_built_from_trees(merged);
+            new_index.inherit_sparse_index(merged);
+            let verified: HashSet<BString> = {
+                let backing = merged.path_backing();
+                merged
+                    .entries()
+                    .iter()
+                    .filter(|e| e.flags.contains(gix::index::entry::Flags::UPTODATE))
+                    .map(|e| e.path_in(backing).to_owned())
+                    .collect()
+            };
+            let backing = new_index.path_backing().to_owned();
+            for e in new_index.entries_mut() {
+                let path = e.path_in(&backing);
+                let same = merged
+                    .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+                    .is_some_and(|m| m.id == e.id && m.mode == e.mode);
+                if same && verified.contains(&path.to_owned()) {
+                    e.flags.insert(gix::index::entry::Flags::UPTODATE);
+                }
+                // `make_cache_entry(..., 0, 0)` (builtin/stash.c:622-626): the entry an unstage
+                // puts back carries no stat data at all.
+                if !same {
+                    e.stat = Stat::default();
+                }
+            }
         }
     }
     // The reset arms stand on indexes built from a tree, which have no untracked cache of their

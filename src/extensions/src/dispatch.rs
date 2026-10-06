@@ -1411,6 +1411,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // essentially nothing; best-effort, never fails the command.
     superset::zcommands::log_invocation(sub, args);
 
+    // `prepare_repo_settings()` + the builtin's own `command_requires_full_index = 0`: how
+    // every index this command reads is to be held (`crate::sparse_index`).
+    crate::sparse_index::note_command(sub, args);
+
     // Fleet-wide command policy (`git zguard`): refuse or warn on a matching
     // command before it runs. A single `stat` when no rule is set. The policy
     // management verbs are exempt so a bad rule can never lock you out of fixing it.

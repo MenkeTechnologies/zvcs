@@ -75,8 +75,9 @@ impl Repository {
         // A sparse index — one stock git wrote with `index.sparse` — is compared as the full
         // index it stands for: `diff-index` over a sparse-directory entry reports exactly what
         // comparing the tree it names would. The caller's index is left as it was read.
+        // An index already expanded on read (`State::virtual_sparse_dirs()`) holds no such entry.
         let expanded;
-        let worktree_index = if worktree_index.is_sparse() {
+        let worktree_index = if worktree_index.has_sparse_dir_entries() {
             let mut full = worktree_index.clone();
             self.ensure_full_index(&mut full)?;
             full.set_expanded();

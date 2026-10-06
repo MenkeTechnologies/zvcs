@@ -38,7 +38,7 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
     Find: gix_object::FindObjectOrHeader,
 {
-    if lhs.is_sparse() || rhs.is_sparse() {
+    if lhs.has_sparse_dir_entries() || rhs.has_sparse_dir_entries() {
         return Err(Error::IsSparse);
     }
     if lhs

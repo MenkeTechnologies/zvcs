@@ -921,8 +921,11 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
 
     // ---- 3. Path form: reset the named index entries only; no HEAD move. ----
     if with_paths {
+        // `if (pathspec->nr && pathspec_needs_expanded_index(...)) ensure_full_index(...)`
+        // (builtin/reset.c:214-215), before the diff stages anything.
+        let expand_first = crate::sparse_index::pathspec_needs_expanded_index(&repo, &old_index, &paths);
         let mut index = pathspec_index(&repo, &old_index, target_tree, &paths, intent_to_add)?;
-        finish_mixed(&repo, &old_index, &mut index, quiet, refresh)?;
+        finish_mixed(&repo, &old_index, &mut index, quiet, refresh, expand_first)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1028,7 +1031,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         ResetMode::Soft => {}
         ResetMode::Mixed => {
             let mut index = reset_index_to_tree(&repo, &old_index, target_tree, intent_to_add)?;
-            finish_mixed(&repo, &old_index, &mut index, quiet, refresh)?;
+            mark_new_entries_outside_the_cone(&repo, &old_index, &mut index);
+            finish_mixed(&repo, &old_index, &mut index, quiet, refresh, false)?;
         }
         ResetMode::Hard => {
             let should_interrupt = AtomicBool::new(false);
@@ -1243,7 +1247,9 @@ fn finish_mixed(
     index: &mut gix::index::File,
     quiet: bool,
     refresh: bool,
+    expand_first: bool,
 ) -> Result<()> {
+    settle_sparsity_like_read_from_tree(repo, old_index, index, expand_first);
     // ```c
     // int flags = quiet ? REFRESH_QUIET : REFRESH_IN_PORCELAIN;
     // …
@@ -2362,8 +2368,13 @@ fn pathspec_index(
     index.remove_entries(|_, path, _| ops.contains(&path.to_owned()));
     let mut ita: Option<ObjectId> = None;
     for path in &ops {
+        let skip = if reset_entry_skips_worktree(repo, old, BStr::new(path)) {
+            Flags::SKIP_WORKTREE | Flags::EXTENDED
+        } else {
+            Flags::empty()
+        };
         if let Some((stat, id, flags, mode)) = target_map.get(path) {
-            index.dangerously_push_entry(*stat, *id, *flags, *mode, BStr::new(path));
+            index.dangerously_push_entry(*stat, *id, *flags | skip, *mode, BStr::new(path));
         } else if intent_to_add {
             let id = match ita {
                 Some(id) => id,
@@ -2373,7 +2384,7 @@ fn pathspec_index(
             index.dangerously_push_entry(
                 Stat::default(),
                 id,
-                Flags::INTENT_TO_ADD | Flags::EXTENDED,
+                Flags::INTENT_TO_ADD | Flags::EXTENDED | skip,
                 Mode::FILE,
                 BStr::new(path),
             );
@@ -2382,4 +2393,103 @@ fn pathspec_index(
     index.sort_entries();
 
     Ok(index)
+}
+
+/// What `read_from_tree()` does to the sparsity of the index it stages into
+/// (builtin/reset.c:150-200).
+///
+/// `update_index_from_diff()` takes the changed paths in diff order and looks each one up with
+/// `index_name_pos()` — through `remove_file_from_index()` for a path the tree drops, directly
+/// for one it stages — and the first of them that lies inside a sparse directory expands the
+/// whole index (read-cache.c:543-560), whose cache-tree is recomputed over the index as it
+/// stands at that moment: the paths before it already staged, the rest not yet. The reset
+/// index is then full, and its write collapses it again from scratch. When no changed path
+/// reaches into a sparse directory the index stays collapsed, and `new` takes over the
+/// directories `old` was read with so its write puts them back.
+///
+/// `expand_first` is `pathspec_needs_expanded_index()`'s verdict, which expands the index
+/// before the diff stages anything (builtin/reset.c:214-215).
+fn settle_sparsity_like_read_from_tree(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    new: &mut gix::index::File,
+    expand_first: bool,
+) {
+    use super::write_tree::{changed_paths, entry_states};
+    if expand_first {
+        let mut mid = old.clone();
+        crate::sparse_index::ensure_full_index(repo, &mut mid);
+        new.forget_virtual_sparse_dirs();
+        return;
+    }
+    let (before, after) = (entry_states(old), entry_states(new));
+    let mut changed: Vec<&BString> = changed_paths(&before, &after);
+    changed.sort();
+    changed.dedup();
+    let Some(first) = changed
+        .iter()
+        .position(|p| old.virtual_sparse_dir_containing(p.as_ref()).is_some())
+    else {
+        new.inherit_sparse_index(old);
+        return;
+    };
+
+    // The index git expands: `old` with the changes before `first` already staged.
+    let staged: HashSet<&BString> = changed[..first].iter().copied().collect();
+    let mut mid = old.clone();
+    mid.remove_entries(|_, path, _| staged.contains(&path.to_owned()));
+    {
+        let backing = new.path_backing();
+        for e in new.entries() {
+            let path = e.path_in(backing);
+            if staged.contains(&path.to_owned()) {
+                mid.dangerously_push_entry(e.stat, e.id, e.flags, e.mode, path);
+            }
+        }
+    }
+    mid.sort_entries();
+    crate::sparse_index::expand_on_lookup(repo, &mut mid, changed[first].as_ref());
+    new.forget_virtual_sparse_dirs();
+}
+
+/// `update_index_from_diff()`'s skip-worktree rule for an entry it makes (builtin/reset.c:170-181):
+///
+/// ```c
+/// pos = index_name_pos(the_repository->index, one->path, strlen(one->path));
+/// if ((pos >= 0 && ce_skip_worktree(the_repository->index->cache[pos])) ||
+///     (pos < 0 && !path_in_sparse_checkout(one->path, the_repository->index)))
+///         ce->ce_flags |= CE_SKIP_WORKTREE;
+/// ```
+///
+/// `old` is the index the entry replaces an entry of; only its stage-0 entry is found.
+fn reset_entry_skips_worktree(repo: &gix::Repository, old: &gix::index::File, path: &BStr) -> bool {
+    match old.entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted) {
+        Some(e) => e.flags.contains(Flags::SKIP_WORKTREE),
+        None => !crate::sparse_index::path_in_sparse_checkout(repo, path),
+    }
+}
+
+/// [`reset_entry_skips_worktree`] for every entry of a whole-tree `--mixed` reset that `old`
+/// did not hold at stage 0; the ones it did hold carry their own bit across
+/// ([`carry_skip_worktree`]).
+fn mark_new_entries_outside_the_cone(repo: &gix::Repository, old: &gix::index::File, new: &mut gix::index::File) {
+    if !repo.config_snapshot().boolean("core.sparseCheckout").unwrap_or(false) {
+        return;
+    }
+    let mark: Vec<usize> = {
+        let backing = new.path_backing();
+        new.entries()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                let path = e.path_in(backing);
+                old.entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted).is_none()
+                    && reset_entry_skips_worktree(repo, old, path)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    for i in mark {
+        new.entries_mut()[i].flags |= Flags::SKIP_WORKTREE | Flags::EXTENDED;
+    }
 }

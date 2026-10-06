@@ -816,7 +816,7 @@ mod show_index;
 mod show_ref;
 /// The `Net::SMTP` transport `send_email` sends over; not a subcommand.
 mod smtp;
-mod sparse_checkout;
+pub(crate) mod sparse_checkout;
 mod stage;
 mod stash;
 mod status;

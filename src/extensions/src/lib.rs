@@ -69,6 +69,7 @@ pub mod revfilter;
 pub mod revopt;
 pub mod sequencer;
 pub mod setup;
+pub mod sparse_index;
 pub mod shallow_serve;
 pub mod showdate;
 pub mod sigpipe;

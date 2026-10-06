@@ -325,6 +325,7 @@ impl State {
                 untracked,
                 untracked_index_names: None,
                 untracked_changed: false,
+                virtual_sparse_dirs: Vec::new(),
                 fs_monitor,
             },
             checksum,

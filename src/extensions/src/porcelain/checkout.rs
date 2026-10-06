@@ -3790,8 +3790,22 @@ pub(super) fn update_worktree_to_tree(
     // worktree's `.gitattributes` when the result index has none (attr.c:784-787), so a
     // switch to a branch without one must delete it before it writes anything — else the
     // outgoing branch's attributes would still be smudging files that no longer have any.
+    // A path the sparse checkout leaves out of the worktree has no file to remove:
+    // `apply_sparse_checkout()` clears `CE_WT_REMOVE` along with `CE_UPDATE` for every entry
+    // that stays `CE_SKIP_WORKTREE` (unpack-trees.c:596-620).
+    let skipped_before: HashSet<BString> = {
+        let backing = old.path_backing();
+        old.entries()
+            .iter()
+            .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
+    };
     let updating = unpack_progress(touched.len())?;
-    for path in touched.iter().filter(|p| !new_flat.contains_key(*p)) {
+    for path in touched
+        .iter()
+        .filter(|p| !new_flat.contains_key(*p) && !skipped_before.contains(*p))
+    {
         updating.tick();
         if let Some(full) = repo.workdir_path(path.as_bstr()) {
             let _ = std::fs::remove_file(&full);
@@ -3813,7 +3827,22 @@ pub(super) fn update_worktree_to_tree(
     // not stand in for it, which is what removing the touched paths here ensures.
     let mut result_attrs = old.clone();
     result_attrs.remove_entries(|_, path, _| touched.contains(&path.to_owned()));
-    checkout_subset(repo, &mut subset, &result_attrs, &should_interrupt, &updating)?;
+    // The sparse-checkout loops (unpack-trees.c:2000-2066): every entry the merge produced
+    // takes `CE_SKIP_WORKTREE` from the patterns — `mark_new_skip_worktree()` — and
+    // `apply_sparse_checkout()` keeps such an entry's file out of the worktree. Without them a
+    // switch wrote every changed path outside the cone, and the index lost the bit for it.
+    let sparse_patterns = if repo.config_snapshot().boolean("core.sparseCheckout").unwrap_or(false) {
+        let cone = repo.config_snapshot().boolean("core.sparseCheckoutCone").unwrap_or(false);
+        super::sparse_checkout::UnpackPatterns::load(repo, cone)
+    } else {
+        None
+    };
+    if let Some(patterns) = &sparse_patterns {
+        patterns.mark_new_skip_worktree(&mut subset, &|_| true, false)?;
+    }
+    let mut written = subset.clone();
+    written.remove_entries(|_, _, e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE));
+    checkout_subset(repo, &mut written, &result_attrs, &should_interrupt, &updating)?;
     updating.stop();
 
     let untracked_before = super::write_tree::untracked_entry_states(&old);
@@ -3824,6 +3853,7 @@ pub(super) fn update_worktree_to_tree(
     // are replaced by the new tree's, the rest stay exactly as they were.
     let mut index = old;
     index.remove_entries(|_, path, _| touched.contains(&path.to_owned()));
+    crate::worktree::carry_written_stat(&written, &mut subset);
     let subset_stats = stats_by_path(&subset);
     {
         let backing = subset.path_backing().to_owned();
@@ -3851,6 +3881,8 @@ pub(super) fn update_worktree_to_tree(
     if let Some(src) = &src {
         index.unshare_entries_built_from_trees(src);
     }
+    // A sparse directory the switch moved is carried across collapsed, as the new tree's.
+    crate::sparse_index::retarget_virtual_sparse_dirs(repo, &mut index, new_tree);
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::invalidate_untracked_changes(untracked_before.as_ref(), &mut index);

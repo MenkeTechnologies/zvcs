@@ -40,6 +40,8 @@ pub(crate) mod identity;
 mod impls;
 #[cfg(feature = "index")]
 mod index;
+#[cfg(feature = "index")]
+pub use index::{PostReadIndexHook, set_post_read_index_hook};
 pub(crate) mod init;
 mod location;
 #[cfg(feature = "mailmap")]

@@ -69,6 +69,7 @@ impl crate::Repository {
         )?;
         let mut index = index;
         self.tweak_untracked_cache(&mut index);
+        run_post_read_index_hook(self, &mut index, false);
 
         Ok(index)
     }
@@ -282,6 +283,7 @@ impl crate::Repository {
     pub fn missing_index(&self) -> gix_index::File {
         let mut index = gix_index::File::from_state(gix_index::State::new(self.object_hash()), self.index_path());
         self.tweak_untracked_cache(&mut index);
+        run_post_read_index_hook(self, &mut index, true);
         index
     }
 
@@ -357,5 +359,35 @@ impl IndexPersistedOrInMemory {
             IndexPersistedOrInMemory::Persisted(i) => gix_index::File::clone(&i),
             IndexPersistedOrInMemory::InMemory(i) => i,
         }
+    }
+}
+
+/// What the binary built on this crate runs at the end of every index read — git's tail of
+/// `do_read_index()` (read-cache.c:2335-2341), which settles the index's sparsity for the
+/// running command:
+///
+/// ```c
+/// if (istate->repo->settings.command_requires_full_index)
+///         ensure_full_index(istate);
+/// else
+///         ensure_correct_sparsity(istate);
+/// ```
+///
+/// and, for an index that did not exist, `set_new_index_sparsity()` (read-cache.c:2198-2208).
+/// The decision needs the sparse-checkout patterns, the command being run and the ability to
+/// write tree objects, none of which this crate has, so the binary registers it here once at
+/// start-up. The `bool` is `true` for a state made up because no index file existed.
+pub type PostReadIndexHook = fn(&crate::Repository, &mut gix_index::File, bool);
+
+static POST_READ_INDEX_HOOK: std::sync::OnceLock<PostReadIndexHook> = std::sync::OnceLock::new();
+
+/// Register the [`PostReadIndexHook`]. Only the first registration takes effect.
+pub fn set_post_read_index_hook(hook: PostReadIndexHook) {
+    let _ = POST_READ_INDEX_HOOK.set(hook);
+}
+
+fn run_post_read_index_hook(repo: &crate::Repository, index: &mut gix_index::File, fresh: bool) {
+    if let Some(hook) = POST_READ_INDEX_HOOK.get() {
+        hook(repo, index, fresh);
     }
 }

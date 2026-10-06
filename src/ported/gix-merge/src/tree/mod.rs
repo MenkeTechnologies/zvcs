@@ -573,7 +573,7 @@ pub mod apply_index_entries {
             index: &mut gix_index::State,
             removal_mode: RemovalMode,
         ) -> bool {
-            if index.is_sparse() {
+            if index.has_sparse_dir_entries() {
                 gix_trace::error!("Refusing to apply index entries to sparse index - it's not tested yet");
                 return false;
             }

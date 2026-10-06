@@ -441,6 +441,9 @@ fn cmd_disable(args: &[String]) -> Result<ExitCode> {
         }
     }
     let repo = crate::setup::discover()?;
+    // `give_advice_on_expansion = 0` (builtin/sparse-checkout.c:1068-1072): disabling expands
+    // the index on purpose.
+    crate::sparse_index::no_advice_on_expansion();
     // git leaves the pattern file in place so a later `init` can restore it.
     apply(&repo, &Sparsity::Full)?;
     disable_config(&repo)?;
@@ -919,6 +922,32 @@ impl UnpackPatterns {
 
     fn use_cone_patterns(&self) -> bool {
         self.sparsity.is_cone()
+    }
+
+    /// `path_in_sparse_checkout()` (dir.c:1576-1622): is `path` — a directory carrying its
+    /// trailing `/` — inside the sparse-checkout definition? The empty path always is, and a
+    /// pattern that leaves a path `UNDECIDED` defers to its parent directories, falling back to
+    /// "outside" at the top.
+    pub(crate) fn path_in_sparse_checkout(&self, path: &[u8]) -> bool {
+        if path.is_empty() {
+            return true;
+        }
+        // `dtype` starts as `DT_REG` and is `DT_DIR` for every parent tried after.
+        let mut end = path.len();
+        let mut is_dir = false;
+        while end > 0 {
+            // `for (slash = end - 1; slash > path && *slash != '/'; slash--)`: the scan
+            // includes `end - 1` and never treats the first byte as a separator.
+            let slash = path[1..end].iter().rposition(|b| *b == b'/').map_or(0, |p| p + 1);
+            let basename = if slash > 0 { slash + 1 } else { 0 };
+            match self.matches(&path[..end], basename, is_dir) {
+                PatternMatch::Undecided => {}
+                m => return m != PatternMatch::NotMatched,
+            }
+            is_dir = true;
+            end = slash;
+        }
+        false
     }
 
     /// `mark_new_skip_worktree()` (unpack-trees.c:1799-1827) over the entries of
@@ -1673,6 +1702,23 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
         .workdir()
         .ok_or_else(|| crate::fatal::need_work_tree())?
         .to_owned();
+
+    // The settings this subcommand just wrote, as git holds them in-process from here on:
+    // `disable` runs with `repo->settings.sparse_index = 0` (builtin/sparse-checkout.c:1083-1084),
+    // the others with the `index.sparse` and cone mode `enable_config()` recorded. The
+    // repository's configuration snapshot predates those writes.
+    crate::sparse_index::override_settings(match sparsity {
+        Sparsity::Full => crate::sparse_index::Settings {
+            apply_sparse_checkout: true,
+            cone: false,
+            sparse_index: false,
+        },
+        _ => crate::sparse_index::Settings {
+            apply_sparse_checkout: true,
+            cone: sparsity.is_cone(),
+            sparse_index: config_bool(repo, "index", "sparse")?.unwrap_or(false),
+        },
+    });
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     // `update_working_directory()` (builtin/sparse-checkout.c:203-210):

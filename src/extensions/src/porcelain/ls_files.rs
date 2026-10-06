@@ -715,6 +715,10 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // marked skip-worktree, before any index-derived line is produced.
     if !opts.sparse && (opts.shows_index_entries() || opts.deleted || opts.modified) {
         expand_sparse_index(&repo, &mut index, true)?;
+    } else if opts.sparse {
+        // `--sparse` lists the index as git holds it, so the directories the read
+        // expanded are shown collapsed again. Nothing is written.
+        index.collapse_virtual_sparse_dirs();
     }
 
     // `--with-tree <tree-ish>` overlays the named tree onto the index so that
@@ -1319,45 +1323,25 @@ pub(super) fn is_exclude_pathspec(raw: &str) -> bool {
     keywords.split(',').any(|k| k.trim() == "exclude")
 }
 
-/// git's `ADVICE_MSG` from `sparse-index.c`, printed once through the `hint:`
-/// channel when a sparse index has to be expanded to a full one.
-const SPARSE_EXPANDED_ADVICE: &str = "\
-The sparse index is expanding to a full index, a slow operation.
-Your working directory likely has contents that are outside of
-your sparse-checkout patterns. Use 'git sparse-checkout list' to
-see your sparse-checkout definition and compare it to your working
-directory contents. Cleaning up any merge conflicts or staged
-changes before running 'git sparse-checkout clean' or 'git
-sparse-checkout reapply' may assist in this cleanup.";
-
-/// Port of git's `ensure_full_index`/`expand_index(istate, NULL)`.
+/// The `ensure_full_index()` a builtin calls on reaching a sparse-directory entry
+/// (`ls-files`, builtin/ls-files.c:425-432): nothing happens unless the index holds
+/// one — collapsed on disk, or remembered from the read that expanded it
+/// ([`gix::index::State::virtual_sparse_dirs()`]) — and then the whole index is
+/// expanded for real by [`crate::sparse_index::ensure_full_index`], advice included
+/// unless `advise` is `false` (git's cleared `give_advice_on_expansion`).
 ///
-/// A sparse index stores a whole out-of-cone directory as a single entry whose
-/// mode is `040000` and whose name carries a trailing `/`, pointing at the tree
-/// that directory would expand to. Replace each of those with the blobs of that
-/// tree, prefixed by the directory name and flagged `SKIP_WORKTREE`, which is
-/// what git's `add_path_to_index` callback produces.
-///
-/// Returns `true` when at least one entry was expanded, which is also the
-/// condition under which git emits its `advice.sparseIndexExpanded` hint —
-/// unless the caller cleared `give_advice_on_expansion` (sparse-index.c:29), which
-/// is what `advise == false` stands for.
+/// Returns whether the index was expanded.
 pub(crate) fn expand_sparse_index(
     repo: &gix::Repository,
     index: &mut gix::index::File,
     advise: bool,
 ) -> Result<bool> {
-    if !repo.ensure_full_index(index)? {
+    let has_sparse_dir =
+        !index.virtual_sparse_dirs().is_empty() || index.entries().iter().any(|e| e.mode.is_sparse());
+    if !has_sparse_dir {
         return Ok(false);
     }
-
-    // `advise_if_enabled(ADVICE_SPARSE_INDEX_EXPANDED, …)` (sparse-index.c): the
-    // shared gate, which also honors `GIT_ADVICE` and prints the `Disable this
-    // message with …` trailer only while the slot is unconfigured.
-    if advise {
-        crate::advice::Advice::SparseIndexExpanded.advise_in(repo, SPARSE_EXPANDED_ADVICE);
-    }
-    Ok(true)
+    Ok(crate::sparse_index::ensure_full_index_with_advice(repo, index, advise))
 }
 
 /// The exclude machinery git configures from `-x`, `-X`, `--exclude-standard` and

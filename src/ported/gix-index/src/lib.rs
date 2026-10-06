@@ -42,6 +42,10 @@ pub mod write;
 pub mod split_index;
 pub use split_index::SplitIndex;
 
+/// A sparse index held expanded in memory while git would hold it collapsed.
+pub mod sparse_index;
+pub use sparse_index::VirtualSparseDir;
+
 pub mod fs;
 
 /// All known versions of a git index file.
@@ -172,6 +176,9 @@ pub struct State {
     path_backing: PathStorage,
     /// True if one entry in the index has a special marker mode
     is_sparse: bool,
+    /// The sparse-directory entries this state was read with and holds expanded only because
+    /// this crate's users need a full index; see [`sparse_index`].
+    virtual_sparse_dirs: Vec<sparse_index::VirtualSparseDir>,
 
     // Extensions
     end_of_index_at_decode_time: bool,

@@ -156,17 +156,33 @@ impl Fixture {
         let raw = std::fs::read(self.work.join(".git/index")).unwrap();
         assert!(!raw.windows(4).any(|w| w == b"sdir"), "sdir written for a full index");
     }
+
+    /// The index stock git leaves: still sparse (`sdir`), with exactly `dirs` collapsed —
+    /// `convert_to_sparse()` collapses every directory the new cone leaves out
+    /// (sparse-index.c:201-259), measured on stock git 2.56.0.
+    fn assert_collapsed(&self, dirs: &[&str]) {
+        let (out, _, code) = self.run(&["ls-files", "--sparse", "-s"]);
+        assert_eq!(code, 0);
+        let collapsed: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("040000 "))
+            .filter_map(|l| l.split('\t').nth(1))
+            .collect();
+        assert_eq!(collapsed, dirs, "collapsed directories:\n{out}");
+        let raw = std::fs::read(self.work.join(".git/index")).unwrap();
+        assert!(raw.windows(4).any(|w| w == b"sdir"), "a sparse index keeps its sdir extension");
+    }
 }
 
 #[test]
-fn add_expands_the_collapsed_directories_silently() {
+fn add_expands_the_directory_it_adds_silently() {
     let f = Fixture::new("add");
     let (out, err, code) = f.run(&["sparse-checkout", "add", "c"]);
     assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0));
     assert_eq!(f.ls_files_t(), "H a/b/y\nH a/x\nH c/z\nS d/e/w\nH top\n");
     assert_eq!(std::fs::read_to_string(f.work.join("c/z")).unwrap(), "c/z\n");
     assert!(!f.work.join("d").exists());
-    f.assert_full_index();
+    f.assert_collapsed(&["d/"]);
 }
 
 #[test]
@@ -175,13 +191,14 @@ fn reapply_and_set_keep_the_hidden_directories_hidden() {
     let (out, err, code) = f.run(&["sparse-checkout", "reapply"]);
     assert_eq!((out.as_str(), err.as_str(), code), ("", "", 0));
     assert_eq!(f.ls_files_t(), "H a/b/y\nH a/x\nS c/z\nS d/e/w\nH top\n");
-    f.assert_full_index();
+    f.assert_collapsed(&["c/", "d/"]);
 
     let f = Fixture::new("set");
     assert_eq!(f.run(&["sparse-checkout", "set", "d"]), (String::new(), String::new(), 0));
     assert_eq!(f.ls_files_t(), "S a/b/y\nS a/x\nS c/z\nH d/e/w\nH top\n");
     assert_eq!(std::fs::read_to_string(f.work.join("d/e/w")).unwrap(), "d/e/w\n");
     assert!(!f.work.join("a").exists());
+    f.assert_collapsed(&["a/", "c/"]);
 }
 
 #[test]

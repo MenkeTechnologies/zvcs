@@ -936,6 +936,9 @@ pub(super) fn unmatched_pathspec_check(
     let mut unknown: Vec<&str> = Vec::new();
     // `is_excluded()`, built only if the `--ignore-missing` arm actually asks.
     let mut excludes = None;
+    // The walk's ignored entries, collapsed as `fill_directory()` records them,
+    // built only if an existing element is not excluded on its own account.
+    let mut walked: Option<Vec<String>> = None;
 
     for (i, spec) in c.original.iter().enumerate() {
         if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
@@ -1058,7 +1061,14 @@ pub(super) fn unmatched_pathspec_check(
                     Ok(md) if md.is_dir() => gix::index::entry::Mode::DIR,
                     _ => gix::index::entry::Mode::FILE,
                 };
-                if !stack.at_entry(BStr::new(relative.as_bytes()), Some(mode))?.is_excluded() {
+                // A directory no rule names but whose every entry is ignored is
+                // still in `dir.ignored`: `treat_directory()` collapses it into one
+                // ignored entry (dir.c), so `git add logs/` under `*.log` lands in
+                // the block although `logs` itself is not excluded.
+                let excluded = stack.at_entry(BStr::new(relative.as_bytes()), Some(mode))?.is_excluded()
+                    || covering_ignored_name(walked.get_or_insert_with(|| walk_ignored_names(repo, index)), relative)
+                        .is_some();
+                if !excluded {
                     continue;
                 }
                 ignored.insert(relative);
@@ -1112,10 +1122,24 @@ fn collapsed_ignored_names(
     index: &gix::index::File,
     relative: &BTreeSet<&str>,
 ) -> BTreeSet<String> {
-    // The collapse is a property of the walk, not of the element that reached it,
-    // so the walk has to run over the whole worktree — restricting it to the
-    // element would hand back the element again, which is the very thing the
-    // collapse replaces.
+    let collapsed = walk_ignored_names(repo, index);
+    relative
+        .iter()
+        .map(|spec| {
+            covering_ignored_name(&collapsed, spec)
+                .unwrap_or_else(|| spec.trim_end_matches('/'))
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every ignored entry of a whole-worktree dirwalk in `CollapseDirectory` mode.
+///
+/// The collapse is a property of the walk, not of the element that reached it,
+/// so the walk has to run over the whole worktree — restricting it to the
+/// element would hand back the element again, which is the very thing the
+/// collapse replaces.
+fn walk_ignored_names(repo: &gix::Repository, index: &gix::index::File) -> Vec<String> {
     let collapsed = || -> Result<Vec<String>> {
         let options = repo
             .dirwalk_options()?
@@ -1132,24 +1156,18 @@ fn collapsed_ignored_names(
         }
         Ok(names)
     };
-    let collapsed = collapsed().unwrap_or_default();
-    relative
-        .iter()
-        .map(|spec| {
-            let spec = spec.trim_end_matches('/');
-            collapsed
-                .iter()
-                .find_map(|name| {
-                    let name = name.trim_end_matches('/');
-                    // The entry covers the element when it *is* it, or is a
-                    // directory it sits under.
-                    let covers = spec == name
-                        || spec.strip_prefix(name).is_some_and(|r| r.starts_with('/'));
-                    covers.then(|| name.to_string())
-                })
-                .unwrap_or_else(|| spec.to_string())
-        })
-        .collect()
+    collapsed().unwrap_or_default()
+}
+
+/// The walked ignored entry that covers `spec` — the entry that *is* it, or a
+/// directory it sits under — without its trailing slash.
+fn covering_ignored_name<'a>(collapsed: &'a [String], spec: &str) -> Option<&'a str> {
+    let spec = spec.trim_end_matches('/');
+    collapsed.iter().find_map(|name| {
+        let name = name.trim_end_matches('/');
+        let covers = spec == name || spec.strip_prefix(name).is_some_and(|r| r.starts_with('/'));
+        covers.then_some(name)
+    })
 }
 
 // ---------------------------------------------------------------------------

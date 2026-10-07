@@ -2009,7 +2009,7 @@ fn reset_two_tree(
                         Refusal::NotUptodate,
                     ),
                     None => (
-                        worktree_absent_or_ignored(repo, &mut excludes, BStr::new(path)),
+                        worktree_absent_or_ignored(repo, old, &mut excludes, BStr::new(path)),
                         Refusal::WouldLoseUntracked,
                     ),
                 };
@@ -2226,6 +2226,7 @@ fn worktree_uptodate(
 /// `preserve_ignored = 0`, so ignored files are expendable).
 fn worktree_absent_or_ignored(
     repo: &gix::Repository,
+    old: &gix::index::File,
     excludes: &mut Option<gix::AttributeStack<'_>>,
     path: &BStr,
 ) -> bool {
@@ -2236,6 +2237,16 @@ fn worktree_absent_or_ignored(
         Ok(m) => m,
         Err(_) => return true,
     };
+    // `check_ok_to_remove()`'s first arm:
+    //     if (ignore_case && icase_exists(o, name, len, st))
+    //             return 0;
+    // On a case-insensitive file system the file in the way may be a tracked
+    // entry spelled in another case (`git mv a A`, then a reset bringing `a` back).
+    if repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false)
+        && icase_exists(repo, old, path, &full, &meta)
+    {
+        return true;
+    }
     if meta.is_dir() {
         return false;
     }
@@ -2245,6 +2256,47 @@ fn worktree_absent_or_ignored(
             .map(|p| p.is_excluded())
             .unwrap_or(false)
     })
+}
+
+/// `icase_exists()` (unpack-trees.c): the source index holds `path` under another
+/// case, and that entry still describes the file found there —
+/// `!ie_match_stat(o->src_index, src, st, CE_MATCH_IGNORE_VALID | CE_MATCH_IGNORE_SKIP_WORKTREE)`.
+/// `ie_match_stat()` is `ce_match_stat_basic()`'s type and stat comparison and, for
+/// a racily clean entry (`is_racy_timestamp()`, whole seconds), the content check
+/// `ce_modified_check_fs()`.
+fn icase_exists(
+    repo: &gix::Repository,
+    old: &gix::index::File,
+    path: &BStr,
+    full: &std::path::Path,
+    meta: &std::fs::Metadata,
+) -> bool {
+    let backing = old.path_backing();
+    let Some(entry) = old.entries().iter().find(|e| {
+        e.stage() == gix::index::entry::Stage::Unconflicted
+            && e.path_in(backing).eq_ignore_ascii_case(path)
+    }) else {
+        return false;
+    };
+    let type_matches = match entry.mode {
+        Mode::SYMLINK => meta.file_type().is_symlink(),
+        Mode::FILE | Mode::FILE_EXECUTABLE => meta.is_file(),
+        _ => false,
+    };
+    if !type_matches {
+        return false;
+    }
+    let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(full) else {
+        return false;
+    };
+    let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
+        return false;
+    };
+    if !entry.stat.matches(&current, repo.stat_options().unwrap_or_default()) {
+        return false;
+    }
+    let racy = old.timestamp().unix_seconds() as u32 <= entry.stat.mtime.secs;
+    !racy || !crate::index_racy::modified_check_fs(repo.object_hash(), full, meta, &entry.id)
 }
 
 /// The blob object id a worktree file would hash to (the link target for a

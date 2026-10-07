@@ -3522,7 +3522,10 @@ fn merge_opt<'a>(merge: bool, style: &'a str, name: &'a str) -> Option<MergeOpt<
 /// fabricates `HEAD`'s tree when the file is missing, which is the very case
 /// being tested for.
 pub(super) fn index_unborn(repo: &gix::Repository) -> Result<bool> {
-    Ok(repo.index_or_empty()?.entries().is_empty())
+    // `return (!istate->cache_nr && !istate->timestamp.sec);` (read-cache.c:2529-2532): an
+    // index file that was read, even one every entry has left, is not unborn.
+    let index = repo.index_or_empty()?;
+    Ok(index.entries().is_empty() && index.timestamp().unix_seconds() == 0)
 }
 
 /// `merge_working_tree()` as every switch in this file runs it: gate the move,
@@ -3785,6 +3788,9 @@ pub(super) fn update_worktree_to_tree(
     // tree, and every path of it the new tree drops would then survive into the
     // index as an entry no worktree file backs.
     let old = if initial_checkout {
+        // The refresh held the same empty index; this step owns it now, and must not
+        // leave it for the final flush to write over the index built here.
+        let _ = crate::held_index::take();
         gix::index::File::from_state(gix::index::State::new(repo.object_hash()), repo.index_path())
     } else {
         // The index `merge_working_tree()` refreshed, when it did: `unpack_trees()` starts

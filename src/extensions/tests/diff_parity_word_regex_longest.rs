@@ -25,18 +25,27 @@
 //! on. Under leftmost-longest that distinction stops being cosmetic: read as
 //! characters the class covers ASCII and wins over every real branch.
 //!
-//! Every expectation below was read off stock git 2.55.0 on this fixture before it
-//! was written down.
+//! Every command runs in a hermetic environment — its own `HOME`,
+//! `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM` — so no user colour or diff
+//! setting reaches it. The fixed expectations are stock git's output there, and each
+//! one is also checked live against stock git when one is installed.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
-fn run(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+fn run(bin: &str, dir: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
         .args(args)
         .current_dir(dir)
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("LC_ALL", "C")
         .env("GIT_AUTHOR_NAME", "t")
@@ -50,11 +59,11 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = run(dir, args);
+fn git(bin: &str, dir: &Path, args: &[&str]) {
+    let out = run(bin, dir, args);
     assert!(
         out.status.success(),
-        "git {args:?} failed: {}",
+        "{bin} {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -64,19 +73,36 @@ fn last_line(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).trim_end_matches('\n').rsplit('\n').next().unwrap().to_string()
 }
 
-fn fixture(tag: &str, pre: &str, post: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("zvcs-wordlongest-{tag}-{}", std::process::id()));
+fn fixture(bin: &str, tag: &str, pre: &str, post: &str) -> PathBuf {
+    let side = if bin == BIN { "zvcs" } else { "stock" };
+    let root = std::env::temp_dir()
+        .join(format!("zvcs-wordlongest-{tag}-{side}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let repo = root.canonicalize().unwrap();
 
-    git(&repo, &["init", "-q", "-b", "main"]);
+    git(bin, &repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join(".gitattributes"), "* diff=cpp\n").unwrap();
     std::fs::write(repo.join("t.cpp"), pre).unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "c0"]);
+    git(bin, &repo, &["add", "-A"]);
+    git(bin, &repo, &["commit", "-q", "-m", "c0"]);
     std::fs::write(repo.join("t.cpp"), post).unwrap();
     repo
+}
+
+/// The reworded line zvcs prints for `args` over a `pre` → `post` change, checked
+/// against stock git's on its own copy of the fixture when one is installed.
+fn reworded(tag: &str, pre: &str, post: &str, args: &[&str]) -> String {
+    let repo = fixture(BIN, tag, pre, post);
+    let got = last_line(&run(BIN, &repo, args));
+    let _ = std::fs::remove_dir_all(&repo);
+    if let Some(stock) = stock_git() {
+        let repo = fixture(stock, tag, pre, post);
+        let want = last_line(&run(stock, &repo, args));
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(got, want, "{args:?}: zvcs must print what stock prints");
+    }
+    got
 }
 
 /// Three separate leftmost-first traps on one line. Under leftmost-first the
@@ -84,20 +110,23 @@ fn fixture(tag: &str, pre: &str, post: &str) -> PathBuf {
 /// `<=` prefix all become their own words, so the change lands on the tail.
 #[test]
 fn the_cpp_driver_takes_the_longest_alternative() {
-    let repo = fixture("cpp", "0xdead 0b1000 i<=j\n", "0xdeaf 0b1100 i<=>j\n");
-
-    let o = run(&repo, &["diff", "--word-diff=plain", "--", "t.cpp"]);
-    assert_eq!(last_line(&o), "[-0xdead 0b1000-]{+0xdeaf 0b1100+} i[-<=-]{+<=>+}j");
-
-    // `--color-words` is the same tokenizer with a different frame.
-    let o = run(
-        &repo,
-        &["-c", "color.diff=always", "diff", "--color-words", "--", "t.cpp"],
-    );
+    let (pre, post) = ("0xdead 0b1000 i<=j\n", "0xdeaf 0b1100 i<=>j\n");
     assert_eq!(
-        last_line(&o),
-        "\u{1b}[1;31m0xdead 0b1000\u{1b}[m\u{1b}[1;32m0xdeaf 0b1100\u{1b}[m\
-\u{1b}[34m i\u{1b}[m\u{1b}[1;31m<=\u{1b}[m\u{1b}[1;32m<=>\u{1b}[m\u{1b}[34mj\u{1b}[m"
+        reworded("cpp", pre, post, &["diff", "--word-diff=plain", "--", "t.cpp"]),
+        "[-0xdead 0b1000-]{+0xdeaf 0b1100+} i[-<=-]{+<=>+}j"
+    );
+
+    // `--color-words` is the same tokenizer with a different frame, in the
+    // default `color.diff.old` / `color.diff.new` and uncoloured context.
+    assert_eq!(
+        reworded(
+            "cpp-color",
+            pre,
+            post,
+            &["-c", "color.diff=always", "diff", "--color-words", "--", "t.cpp"],
+        ),
+        "\u{1b}[31m0xdead 0b1000\u{1b}[m\u{1b}[32m0xdeaf 0b1100\u{1b}[m i\
+\u{1b}[31m<=\u{1b}[m\u{1b}[32m<=>\u{1b}[mj"
     );
 }
 
@@ -108,10 +137,13 @@ fn the_cpp_driver_takes_the_longest_alternative() {
 /// leftmost-longest, swallows `<<b c>>` whole into one word.
 #[test]
 fn the_cpp_driver_takes_the_longest_operator() {
-    let repo = fixture("ops", "b->v d.e a<<b c>>d\n", "b->*v d.*e a<<=b c>>=d\n");
-    let o = run(&repo, &["diff", "--word-diff=plain", "--", "t.cpp"]);
     assert_eq!(
-        last_line(&o),
+        reworded(
+            "ops",
+            "b->v d.e a<<b c>>d\n",
+            "b->*v d.*e a<<=b c>>=d\n",
+            &["diff", "--word-diff=plain", "--", "t.cpp"],
+        ),
         "b[-->-]{+->*+}v d[-.-]{+.*+}e a[-<<-]{+<<=+}b c[->>-]{+>>=+}d"
     );
 }

@@ -15,18 +15,28 @@
 //!   every `--diff-merges` spelling runs first, and
 //!   `diff_merges_setup_revs()` dies without `-c`/`--cc` (diff-merges.c:184-185).
 //!
-//! Every expectation below was read off stock git 2.55.0 on this fixture before it
-//! was written down.
+//! Every command runs in a hermetic environment — its own `HOME`,
+//! `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM` — so no user `core.abbrev`
+//! or diff setting reaches it. The fixed expectations are stock git's output there,
+//! and every command is also run live against stock git, when one is installed, on
+//! its own copy of the fixture: stdout, stderr and exit code must match.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
-fn run(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
+fn exec(bin: &str, dir: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
         .args(args)
         .current_dir(dir)
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join(".config"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("LC_ALL", "C")
         .env("GIT_AUTHOR_NAME", "t")
@@ -40,17 +50,52 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = run(dir, args);
+fn git(bin: &str, dir: &Path, args: &[&str]) {
+    let out = exec(bin, dir, args);
     assert!(
         out.status.success(),
-        "git {args:?} failed: {}",
+        "{bin} {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
 
 fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
+}
+
+/// The fixture built by zvcs, and the same fixture built by stock git when one is
+/// installed. The commits are fully determined by the environment, so both
+/// repositories hold the same object ids.
+struct Fixture {
+    zvcs: PathBuf,
+    stock: Option<(&'static str, PathBuf)>,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.zvcs);
+        if let Some((_, dir)) = &self.stock {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+impl Fixture {
+    /// zvcs's answer to `args`, after checking it against stock git's.
+    fn run(&self, args: &[&str]) -> Output {
+        let got = exec(BIN, &self.zvcs, args);
+        if let Some((bin, dir)) = &self.stock {
+            let want = exec(bin, dir, args);
+            assert_eq!(stdout(&got), stdout(&want), "{args:?}: stdout must match stock");
+            assert_eq!(
+                String::from_utf8_lossy(&got.stderr),
+                String::from_utf8_lossy(&want.stderr),
+                "{args:?}: stderr must match stock"
+            );
+            assert_eq!(got.status.code(), want.status.code(), "{args:?}: exit code must match stock");
+        }
+        got
+    }
 }
 
 /// A two-parent merge of a seven-line file with two independent changes:
@@ -62,37 +107,44 @@ fn stdout(o: &Output) -> String {
 ///
 /// Three lines separate them, so at `-U0` and `-U1` they are two hunks and at the
 /// default `-U3` they are one. That is what makes both knobs observable at once.
-fn fixture(tag: &str) -> PathBuf {
+fn fixture(tag: &str) -> Fixture {
+    Fixture {
+        zvcs: build(BIN, &format!("{tag}-zvcs")),
+        stock: stock_git().map(|bin| (bin, build(bin, &format!("{tag}-stock")))),
+    }
+}
+
+fn build(bin: &str, tag: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("zvcs-combined-ctx-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let repo = root.canonicalize().unwrap();
     let f = repo.join("f.txt");
 
-    git(&repo, &["init", "-q", "-b", "main"]);
+    git(bin, &repo, &["init", "-q", "-b", "main"]);
     std::fs::write(&f, "a\nb\nc\nd\ne\nf\ng\n").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "base"]);
+    git(bin, &repo, &["add", "-A"]);
+    git(bin, &repo, &["commit", "-q", "-m", "base"]);
 
-    git(&repo, &["checkout", "-q", "-b", "side"]);
+    git(bin, &repo, &["checkout", "-q", "-b", "side"]);
     std::fs::write(&f, "a\nSIDE\nc\nd\ne\nf\ng\n").unwrap();
-    git(&repo, &["commit", "-q", "-a", "-m", "side"]);
+    git(bin, &repo, &["commit", "-q", "-a", "-m", "side"]);
 
-    git(&repo, &["checkout", "-q", "main"]);
+    git(bin, &repo, &["checkout", "-q", "main"]);
     std::fs::write(&f, "a\nMAIN\nc\nd\nMAINE\nf\ng\n").unwrap();
-    git(&repo, &["commit", "-q", "-a", "-m", "main"]);
+    git(bin, &repo, &["commit", "-q", "-a", "-m", "main"]);
 
     // The merge conflicts on line 2 by construction; its failure is the point, so
     // the exit status is deliberately not asserted here.
-    let _ = run(&repo, &["merge", "side"]);
+    let _ = exec(bin, &repo, &["merge", "side"]);
     std::fs::write(&f, "a\nRESOLVED\nc\nd\nMAINE\nf\ng\n").unwrap();
-    git(&repo, &["add", "-A"]);
-    git(&repo, &["commit", "-q", "-m", "merge"]);
+    git(bin, &repo, &["add", "-A"]);
+    git(bin, &repo, &["commit", "-q", "-m", "merge"]);
     repo
 }
 
 const HEADER: &str = "\
-index f2b94c7ecd,53e4cbf30d..82e49b41fb
+index f2b94c7,53e4cbf..82e49b4
 --- a/f.txt
 +++ b/f.txt
 ";
@@ -103,7 +155,7 @@ index f2b94c7ecd,53e4cbf30d..82e49b41fb
 #[test]
 fn a_bare_c_keeps_a_single_parent_hunk_and_honours_u0() {
     let repo = fixture("c-u0");
-    let o = run(&repo, &["diff-tree", "--no-commit-id", "-c", "-p", "-U0", "HEAD"]);
+    let o = repo.run(&["diff-tree", "--no-commit-id", "-c", "-p", "-U0", "HEAD"]);
     assert_eq!(
         stdout(&o),
         format!(
@@ -120,7 +172,7 @@ fn a_bare_c_keeps_a_single_parent_hunk_and_honours_u0() {
 #[test]
 fn dense_cc_drops_the_single_parent_hunk_at_u0() {
     let repo = fixture("cc-u0");
-    let o = run(&repo, &["diff-tree", "--no-commit-id", "--cc", "-p", "-U0", "HEAD"]);
+    let o = repo.run(&["diff-tree", "--no-commit-id", "--cc", "-p", "-U0", "HEAD"]);
     assert_eq!(
         stdout(&o),
         format!(
@@ -136,7 +188,7 @@ fn dense_cc_drops_the_single_parent_hunk_at_u0() {
 fn combined_context_width_follows_unified() {
     let repo = fixture("u1");
 
-    let o = run(&repo, &["diff-tree", "--no-commit-id", "-c", "-p", "-U1", "HEAD"]);
+    let o = repo.run(&["diff-tree", "--no-commit-id", "-c", "-p", "-U1", "HEAD"]);
     assert_eq!(
         stdout(&o),
         format!(
@@ -145,7 +197,7 @@ fn combined_context_width_follows_unified() {
         )
     );
 
-    let o = run(&repo, &["diff-tree", "--no-commit-id", "--cc", "-p", "-U1", "HEAD"]);
+    let o = repo.run(&["diff-tree", "--no-commit-id", "--cc", "-p", "-U1", "HEAD"]);
     assert_eq!(
         stdout(&o),
         format!(
@@ -166,14 +218,14 @@ fn show_and_log_pass_unified_context_to_the_combined_patch() {
 @@@ -5,1 -5,1 +5,1 @@@\n -e\n +MAINE\n"
     );
 
-    let o = run(&repo, &["show", "-c", "-U0", "--format=%s", "HEAD"]);
+    let o = repo.run(&["show", "-c", "-U0", "--format=%s", "HEAD"]);
     assert_eq!(stdout(&o), want);
 
-    let o = run(&repo, &["log", "-1", "-c", "-U0", "--format=%s", "HEAD"]);
+    let o = repo.run(&["log", "-1", "-c", "-U0", "--format=%s", "HEAD"]);
     assert_eq!(stdout(&o), want);
 
     // `--cc -U1` is the dense twin: three lines, not the whole file.
-    let o = run(&repo, &["show", "--cc", "-U1", "--format=%s", "HEAD"]);
+    let o = repo.run(&["show", "--cc", "-U1", "--format=%s", "HEAD"]);
     assert_eq!(
         stdout(&o),
         format!(
@@ -193,33 +245,31 @@ const RAW_ONE: &str = "::100644 100644 100644 f2b94c7ecd3cc2fc38b319a0cd196ab72d
 fn combined_all_paths_is_cleared_by_a_later_diff_merges_option() {
     let repo = fixture("allpaths-order");
 
-    let before = run(
-        &repo,
+    let before = repo.run(
         &["diff-tree", "--no-commit-id", "--combined-all-paths", "-c", "--raw", "HEAD"],
     );
     assert_eq!(stdout(&before), RAW_ONE);
 
-    let after = run(
-        &repo,
+    let after = repo.run(
         &["diff-tree", "--no-commit-id", "-c", "--combined-all-paths", "--raw", "HEAD"],
     );
     assert_eq!(stdout(&after), format!("{}\tf.txt\tf.txt\n", RAW_ONE.trim_end_matches('\n')));
 
     // `git show` shares the rule through its own parser.
-    let before = run(&repo, &["show", "--combined-all-paths", "-c", "--raw", "--format=%s", "HEAD"]);
+    let before = repo.run(&["show", "--combined-all-paths", "-c", "--raw", "--format=%s", "HEAD"]);
     assert_eq!(
         stdout(&before),
-        "merge\n\n::100644 100644 100644 f2b94c7ecd 53e4cbf30d 82e49b41fb MM\tf.txt\n"
+        "merge\n\n::100644 100644 100644 f2b94c7 53e4cbf 82e49b4 MM\tf.txt\n"
     );
-    let after = run(&repo, &["show", "-c", "--combined-all-paths", "--raw", "--format=%s", "HEAD"]);
+    let after = repo.run(&["show", "-c", "--combined-all-paths", "--raw", "--format=%s", "HEAD"]);
     assert_eq!(
         stdout(&after),
-        "merge\n\n::100644 100644 100644 f2b94c7ecd 53e4cbf30d 82e49b41fb MM\tf.txt\tf.txt\tf.txt\n"
+        "merge\n\n::100644 100644 100644 f2b94c7 53e4cbf 82e49b4 MM\tf.txt\tf.txt\tf.txt\n"
     );
 
     // `-m` is `set_separate()`, which also starts from `suppress()`: the flag is
     // cleared, so the run is a plain per-parent listing and not the `die()` below.
-    let m = run(&repo, &["diff-tree", "--no-commit-id", "--combined-all-paths", "-m", "--raw", "HEAD"]);
+    let m = repo.run(&["diff-tree", "--no-commit-id", "--combined-all-paths", "-m", "--raw", "HEAD"]);
     assert!(m.status.success(), "{}", String::from_utf8_lossy(&m.stderr));
     assert_eq!(
         stdout(&m),
@@ -240,7 +290,7 @@ fn combined_all_paths_without_c_is_fatal() {
         vec!["diff-tree", "--combined-all-paths", "--raw", "HEAD"],
         vec!["diff-tree", "--combined-all-paths", "--name-only", "--name-status", "HEAD"],
     ] {
-        let o = run(&repo, &extra);
+        let o = repo.run(&extra);
         assert_eq!(o.status.code(), Some(128), "{extra:?}");
         assert_eq!(
             String::from_utf8_lossy(&o.stderr),
@@ -262,8 +312,7 @@ fn combined_all_paths_without_c_is_fatal() {
 #[test]
 fn the_combined_header_reads_full_index_and_the_path_prefixes() {
     let repo = fixture("header");
-    let o = run(
-        &repo,
+    let o = repo.run(
         &[
             "diff-tree",
             "--no-commit-id",
@@ -284,9 +333,9 @@ fn the_combined_header_reads_full_index_and_the_path_prefixes() {
 
     // `--no-prefix` empties both, which is the `opt->a_prefix == NULL` case reached
     // from the other side.
-    let o = run(&repo, &["show", "--cc", "-U0", "--no-prefix", "--format=%s", "HEAD"]);
+    let o = repo.run(&["show", "--cc", "-U0", "--no-prefix", "--format=%s", "HEAD"]);
     assert_eq!(
         stdout(&o),
-        "merge\n\ndiff --cc f.txt\nindex f2b94c7ecd,53e4cbf30d..82e49b41fb\n--- f.txt\n+++ f.txt\n@@@ -2,1 -2,1 +2,1 @@@\n- MAIN\n -SIDE\n++RESOLVED\n"
+        "merge\n\ndiff --cc f.txt\nindex f2b94c7,53e4cbf..82e49b4\n--- f.txt\n+++ f.txt\n@@@ -2,1 -2,1 +2,1 @@@\n- MAIN\n -SIDE\n++RESOLVED\n"
     );
 }

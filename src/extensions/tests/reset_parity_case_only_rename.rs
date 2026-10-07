@@ -12,17 +12,23 @@
 //! which takes the file just written.
 //!
 //! The first group holds on any file system; the rest only where `A` and `a` name
-//! one file, and are asserted only there.
+//! one file, which is probed at run time, and are asserted only there.
 //!
-//! Expectations measured from stock git 2.55.0 under the same environment, on a
-//! case-insensitive APFS volume.
+//! Every scenario also runs under stock git in the same hermetic environment (its
+//! own `HOME`, `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM`), and zvcs must
+//! leave the same exit code, files and status as stock does on this file system.
 
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+use stock_git::stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 struct Fixture {
+    bin: &'static str,
     root: PathBuf,
     work: PathBuf,
 }
@@ -34,13 +40,15 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    /// `name` and `b`, committed.
-    fn new(tag: &str, name: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("zvcs-case-only-rename-{tag}-{}", std::process::id()));
+    /// `name` and `b`, committed, by `bin`.
+    fn new(bin: &'static str, tag: &str, name: &str) -> Self {
+        let side = if bin == BIN { "zvcs" } else { "stock" };
+        let root = std::env::temp_dir()
+            .join(format!("zvcs-case-only-rename-{tag}-{side}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let work = root.join("work");
         std::fs::create_dir_all(&work).unwrap();
-        let f = Fixture { root, work };
+        let f = Fixture { bin, root, work };
         f.run(&["init", "-q", "."]);
         std::fs::write(f.work.join(name), "a\n").unwrap();
         std::fs::write(f.work.join("b"), "b\n").unwrap();
@@ -50,10 +58,11 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> (String, String, i32) {
-        let out = Command::new(BIN)
+        let out = Command::new(self.bin)
             .args(args)
             .current_dir(&self.work)
             .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join(".config"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_AUTHOR_NAME", "A U Thor")
@@ -92,6 +101,26 @@ impl Fixture {
     }
 }
 
+/// What a scenario leaves: each step's exit code, then the files and the status.
+type Outcome = (Vec<i32>, Vec<String>, String);
+
+/// Run `steps` over a fresh fixture holding `name` and `b` under `bin`.
+fn outcome(bin: &'static str, tag: &str, name: &str, steps: &[&[&str]]) -> Outcome {
+    let f = Fixture::new(bin, tag, name);
+    let codes = steps.iter().map(|s| f.run(s).2).collect();
+    (codes, f.files(), f.status())
+}
+
+/// zvcs's outcome, checked against stock git's on the same file system when a
+/// stock git is installed.
+fn zvcs_outcome(tag: &str, name: &str, steps: &[&[&str]]) -> Outcome {
+    let got = outcome(BIN, tag, name, steps);
+    if let Some(stock) = stock_git() {
+        assert_eq!(got, outcome(stock, tag, name, steps), "{tag}: zvcs must leave what stock leaves");
+    }
+    got
+}
+
 #[test]
 fn every_reset_brings_the_lowercase_name_back() {
     for (tag, undo) in [
@@ -102,30 +131,28 @@ fn every_reset_brings_the_lowercase_name_back() {
         ("restore", &["restore", "-SW", "."][..]),
         ("checkoutf", &["checkout", "-q", "-f", "HEAD"][..]),
     ] {
-        let f = Fixture::new(tag, "a");
-        assert_eq!(f.run(&["mv", "a", "A"]).2, 0, "{tag}");
-        assert_eq!(f.run(undo).2, 0, "{tag}");
-        assert_eq!(f.files(), ["a", "b"], "{tag}");
-        assert_eq!(f.status(), "", "{tag}");
+        let (codes, files, status) = zvcs_outcome(tag, "a", &[&["mv", "a", "A"], undo]);
+        assert_eq!(codes, [0, 0], "{tag}");
+        assert_eq!(files, ["a", "b"], "{tag}");
+        assert_eq!(status, "", "{tag}");
     }
 }
 
 #[test]
 fn restore_follows_index_order_when_the_names_collide() {
-    let f = Fixture::new("upper", "A");
-    if !f.case_insensitive() {
+    if !Fixture::new(BIN, "probe-upper", "A").case_insensitive() {
         return;
     }
-    f.run(&["mv", "A", "a"]);
-    assert_eq!(f.run(&["restore", "-SW", "."]).2, 0);
+    let (_, files, status) =
+        zvcs_outcome("upper", "A", &[&["mv", "A", "a"], &["restore", "-SW", "."]]);
     // `A` is written, then the removal of `a` takes the same file.
-    assert_eq!(f.files(), ["b"]);
-    assert_eq!(f.status(), " D A\n");
+    assert_eq!(files, ["b"]);
+    assert_eq!(status, " D A\n");
 }
 
 #[test]
 fn a_kept_entry_is_settled_before_the_removals() {
-    let f = Fixture::new("both", "a");
+    let f = Fixture::new(BIN, "both", "a");
     if !f.case_insensitive() {
         return;
     }
@@ -138,4 +165,13 @@ fn a_kept_entry_is_settled_before_the_removals() {
     // the removal of `A` took its file.
     assert_eq!(f.files(), ["b"]);
     assert_eq!(f.status(), " D a\n");
+    if let Some(stock) = stock_git() {
+        let steps: &[&[&str]] =
+            &[&["mv", "a", "A"], &["checkout", "HEAD", "--", "."], &["reset", "-q", "--hard"]];
+        assert_eq!(
+            outcome(stock, "both", "a", steps),
+            (vec![0, 0, 0], f.files(), f.status()),
+            "zvcs must leave what stock leaves"
+        );
+    }
 }

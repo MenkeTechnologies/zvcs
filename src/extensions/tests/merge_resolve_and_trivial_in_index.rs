@@ -48,6 +48,12 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
+        // zvcs keeps its own state — lane locks, caches, its database — under
+        // `$ZVCS_HOME`, which defaults to `$HOME/.zvcs`. With `HOME` at the
+        // repository that is inside the work tree, where `add -A` stages it and
+        // the next `checkout` refuses to overwrite the lane file. Stock git
+        // writes nothing to `HOME`, so the state goes to a directory of its own.
+        .env("ZVCS_HOME", zvcs_home())
         .env("GIT_CONFIG_GLOBAL", dir.join("nonexistent-global"))
         .env("GIT_CONFIG_SYSTEM", dir.join("nonexistent-system"))
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -60,6 +66,11 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .env("LC_ALL", "C")
         .output()
         .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+}
+
+/// This test binary's `ZVCS_HOME`, outside every fixture repository.
+fn zvcs_home() -> PathBuf {
+    std::env::temp_dir().join(format!("zvcs-mergeres-home-{}", std::process::id()))
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {

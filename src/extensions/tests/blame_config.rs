@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 
 #[path = "support/stock_git.rs"]
 mod stock_git;
-use stock_git::stock_git;
+use stock_git::{stock_git, stock_git_at_least};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
@@ -380,6 +380,11 @@ fn blame_date_local_and_strftime_modes_match_git() {
 
 #[test]
 fn blame_boundary_and_output_flags_match_git() {
+    // Up to 2.55 the name column is a digit wider than the abbreviation and `-b`
+    // blanks eight; 2.56 (the port target) drops that, so an older oracle disagrees.
+    if stock_git_at_least((2, 56, 0)).is_none() {
+        return;
+    }
     let (repo, home) = dated_fixture("outflags", "1700000000 +0000");
 
     for extra in [

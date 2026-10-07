@@ -475,6 +475,13 @@ fn serve(repo: &gix::Repository, advertise_only: bool, stateless_rpc: bool) -> R
     match serve_inner(repo, advertise_only, stateless_rpc) {
         Ok(code) => Ok(code),
         Err(err) => {
+            // A write into a pipe the client already closed — the advertisement
+            // outrunning a client that hung up — is `write_or_die()`'s
+            // `check_pipe()` in git: death by `SIGPIPE`, nothing on stderr. It is
+            // the same event the v2 serve loop's `Die` conversion handles.
+            if crate::sigpipe::is_broken_pipe(err.as_ref()) {
+                crate::sigpipe::exit_broken_pipe();
+            }
             eprintln!("fatal: {err}");
             Ok(ExitCode::from(128))
         }

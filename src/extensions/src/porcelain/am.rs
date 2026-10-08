@@ -1092,19 +1092,22 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
         },
     };
 
-    // `delete_ref(REBASE_HEAD)` runs before the split, so it happens even when
-    // the split then fails.
-    if repo.find_reference("REBASE_HEAD").is_ok() {
-        repo.edit_reference(RefEdit {
-            change: Change::Delete {
-                expected: PreviousValue::Any,
-                log: RefLog::AndReference,
-                message: Default::default(),
-            },
-            name: full_name("REBASE_HEAD")?,
-            deref: false,
-        })?;
-    }
+    // `mkdir(state->dir)` comes first, so a `die()` out of the next statement leaves the
+    // empty directory behind; a failed split removes it again (`am_destroy()`).
+    std::fs::create_dir_all(state_dir)?;
+
+    // `delete_ref(REBASE_HEAD)` runs before the split, so it happens even when the split then
+    // fails, and it opens a ref transaction whether or not the ref exists — which is where a
+    // `core.logAllRefUpdates` that `git_config_bool()` refuses is first read.
+    repo.edit_reference(RefEdit {
+        change: Change::Delete {
+            expected: PreviousValue::Any,
+            log: RefLog::AndReference,
+            message: Default::default(),
+        },
+        name: full_name("REBASE_HEAD")?,
+        deref: false,
+    })?;
 
     let messages = match split_mail(repo, format, &o.paths, o.keep_cr)? {
         Split::Failed(errors) => {
@@ -1114,12 +1117,11 @@ fn setup(repo: &gix::Repository, state_dir: &Path, o: &Opts) -> Result<Setup> {
                 eprintln!("error: {e}");
             }
             eprintln!("fatal: Failed to split patches.");
+            let _ = std::fs::remove_dir_all(state_dir);
             return Ok(Setup::Failed(128));
         }
         Split::Messages(m) => m,
     };
-
-    std::fs::create_dir_all(state_dir)?;
 
     // `mailsplit` numbers the messages `0001`, `0002`, … in the session; `am_run`
     // reads them back one at a time.

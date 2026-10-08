@@ -1625,14 +1625,11 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     }
 
     // Nothing to write: leave the index file alone so its extensions survive a run
-    // that changed nothing. Under `-N` only the brand-new paths become entries — a
-    // tracked one is `ADD_CACHE_NEW_ONLY`, i.e. reported and then left as it was —
-    // so a `-N` run that matched only tracked paths is one of these.
-    let index_entries = if intent_to_add {
-        staged.iter().filter(|s| !s.was_tracked).count()
-    } else {
-        staged.len()
-    };
+    // that changed nothing. Under `-N` a tracked path is `ADD_CACHE_NEW_ONLY` — left as it
+    // was — but it still reached `add_index_entry_with_check()`, whose
+    // `cache_tree_invalidate_path()` runs first and marks the cache changed, so a `-N` run
+    // that matched only tracked paths still rewrites the index with those nodes invalid.
+    let index_entries = staged.len();
     // …unless the shape of the index itself has to change. `tweak_split_index()` calls
     // `remove_split_index()` on every index read under `core.splitIndex=false`
     // (read-cache.c:1932-1946), and that sets `SOMETHING_CHANGED` (split-index.c:491) —

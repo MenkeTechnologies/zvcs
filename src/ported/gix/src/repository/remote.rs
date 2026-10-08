@@ -305,18 +305,11 @@ impl crate::Repository {
                     gix_refspec::parse::Operation::Push,
                 )
             });
+        // remote.c handle_config() only recognises "--no-tags" and "--tags"; any other tagopt value is ignored.
         let fetch_tags = config
             .string_filter(&format!("remote.{}.{}", name_or_url, "tagOpt"), &mut filter)
-            .map(|value| {
-                config::tree::Remote::TAG_OPT
-                    .try_into_tag_opt(value)
-                    .map_err(Into::into)
-            });
-        let fetch_tags = match fetch_tags {
-            Some(Ok(v)) => v,
-            Some(Err(err)) => return Some(Err(err)),
-            None => Default::default(),
-        };
+            .and_then(|value| config::tree::Remote::TAG_OPT.try_into_tag_opt(value).ok())
+            .unwrap_or_default();
 
         match (urls, fetch_specs, push_urls, push_specs) {
             (None, None, None, None) if !remote_is_configured => None,

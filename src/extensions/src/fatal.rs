@@ -345,3 +345,26 @@ pub fn packed_refs_in_iteration(
 ) -> Option<anyhow::Error> {
     packed_refs_fatal(&ref_iteration_error(err)).map(die)
 }
+
+/// A lock git takes with `LOCK_DIE_ON_ERROR` that another process already holds.
+///
+/// git's `unable_to_lock_die()` is `die("%s", unable_to_lock_message(path, err))`: `fatal:
+/// Unable to create '<absolute path>.lock': File exists.`, the holder paragraph, exit 128. The
+/// port takes the same locks through gitoxide, whose acquisition failure
+/// ([`gix::lock::acquire::Error::PermanentlyLocked`]) says `EEXIST` and nothing else, so that is
+/// what is reconstructed here. A lock that failed for any other reason is not recognised.
+pub fn lock_held_fatal(err: &anyhow::Error) -> Option<String> {
+    err.chain().find_map(|source| {
+        match source.downcast_ref::<gix::lock::acquire::Error>()? {
+            gix::lock::acquire::Error::PermanentlyLocked { resource_path, .. } => Some(
+                gix::lock::pid::unable_to_lock_message(resource_path, &std::io::Error::from_raw_os_error(libc_eexist())),
+            ),
+            gix::lock::acquire::Error::Io(_) => None,
+        }
+    })
+}
+
+/// `EEXIST`, the errno `O_EXCL` answers with; 17 on every platform this port targets.
+const fn libc_eexist() -> i32 {
+    17
+}

@@ -1061,6 +1061,14 @@ fn run_command(argv: &[String]) -> ExitCode {
             eprintln!("fatal: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)
         }
+        // Another process holds a lock the command needs: git `die()`s with
+        // `unable_to_lock_message()` at 128; see [`fatal::lock_held_fatal`].
+        Err(e) if fatal::lock_held_fatal(&e).is_some() => {
+            let msg = fatal::lock_held_fatal(&e).expect("checked");
+            trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
         // A `packed-refs` record the parser refuses is a `die()` inside the
         // packed backend (`die_invalid_line()`, refs/packed-backend.c:257-268,
         // v2.39.0-rc2), below every command — so in git no verb arranges this

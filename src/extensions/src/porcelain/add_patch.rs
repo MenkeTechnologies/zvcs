@@ -91,9 +91,7 @@ struct PatchMode {
     is_reverse: bool,
     /// The mode only ever touches the index. git uses this to skip the
     /// `repo_refresh_and_write_index()` it otherwise runs before the selector;
-    /// this port never does that refresh (it only rewrites the stat cache), so
-    /// the flag is carried for table fidelity and read by nothing.
-    #[allow(dead_code)]
+    /// (its only visible output is the `needs merge` lines, see [`print_refresh_unmerged`]).
     index_only: bool,
     /// Apply to index *and* worktree, with git's fall-back dance when only one
     /// of the two accepts the patch.
@@ -747,6 +745,31 @@ fn run_git_in_index(
     }
     let status = child.wait()?;
     Ok((status.success(), out))
+}
+
+/// The unmerged half of `repo_refresh_and_write_index(r, REFRESH_QUIET, …)`: `refresh_index()`
+/// names every conflicted path as `<path>: needs merge` on stdout, once per path, even under
+/// `REFRESH_QUIET`. `run_add_p()` refreshes before the selector for every mode that is not
+/// `index_only`, and `run_add_i()` before its first menu; `patch_update_file()` refreshes again
+/// after it applies a selection. A selector working in a scratch index (`stash -p`, `commit -p`,
+/// `history split`) has no conflict stages to name.
+pub(super) fn print_refresh_unmerged(repo: &gix::Repository) {
+    if !repo.index_path().exists() {
+        return;
+    }
+    let Ok(index) = repo.open_index() else { return };
+    let backing = index.path_backing();
+    let mut last: Option<&gix::bstr::BStr> = None;
+    for entry in index.entries() {
+        if entry.stage() == gix::index::entry::Stage::Unconflicted {
+            continue;
+        }
+        let path = entry.path_in(backing);
+        if last != Some(path) {
+            println!("{path}: needs merge");
+        }
+        last = Some(path);
+    }
 }
 
 /// Run `command`, feeding it `input` and capturing its stdout — git's
@@ -1774,6 +1797,9 @@ impl State<'_> {
                 eprintln!("error: 'git apply' failed");
             }
         }
+        if self.index_file.is_none() {
+            print_refresh_unmerged(self.repo);
+        }
     }
 }
 
@@ -2608,6 +2634,9 @@ pub(crate) fn run_index(
 /// git's `run_add_p_common`: parse the diff, walk the files, then report the
 /// two whole-run diagnostics.
 fn run_common(mut state: State<'_>, opts: Options, pathspecs: &[String]) -> Result<u8> {
+    if state.index_file.is_none() && !state.mode.index_only {
+        print_refresh_unmerged(state.repo);
+    }
     if let Err(e) = state.parse_diff(pathspecs) {
         // An empty message means the diagnostic was already written where git's
         // own `error()` writes it (see `mismatched_output`).

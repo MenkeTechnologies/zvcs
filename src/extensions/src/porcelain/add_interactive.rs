@@ -979,6 +979,8 @@ pub(crate) fn run_status(
         only_names: false,
     };
 
+    super::add_patch::print_refresh_unmerged(repo);
+
     let mut res = state.cmd_status(&header);
 
     // The main loop runs over its own item list (the command names), so the file

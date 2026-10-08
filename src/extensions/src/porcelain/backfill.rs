@@ -36,15 +36,8 @@
 //!     also take the value from the next argument and report `Option '<opt>'
 //!     requires a value` when it is missing or is the `--` terminator.
 //!
-//! What is **not** covered: the download itself, i.e. `backfill`'s entire reason
-//! for existing in a partial clone. The vendored gitoxide has no partial-clone
-//! support at all: no crate mentions promisor remotes or `extensions.partialClone`,
-//! `gix-protocol`'s fetch arguments expose no `filter` line (the string appears
-//! only in the accepted-capability list in `gix-protocol/src/command.rs:44`), and
-//! there is no client path that requests explicit blob ids. So when the
-//! repository *does* have a promisor remote, this bails naming that gap rather
-//! than exiting 0 and leaving the missing blobs undownloaded — which would be
-//! indistinguishable from success while silently failing the command's purpose.
+//! With a promisor remote the missing blobs are requested from it in one batch
+//! (`download_missing_blobs`), through the lazy-fetch hook the object database carries.
 //!
 //! Commit-limiting options that `setup_revisions` accepts (`--first-parent`,
 //! `--all`, `--since=`, `--merges`, …) are accepted and have no effect here.
@@ -373,7 +366,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     }
 
     if has_promisor_remote(&repo) {
-        download_missing_blobs(&repo);
+        download_missing_blobs(&repo)?;
     }
 
     // No promisor remote: there is nothing to request and nothing to write.
@@ -402,12 +395,13 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
 /// `--min-batch-size` decides how many round trips those ids are split across
 /// and nothing else, so one request is made here: the objects that end up on
 /// disk are the same set either way, which is the whole of what the command
-/// leaves behind. A blob the remote will not hand over is not an error —
-/// `download_batch()` ignores the outcome and `cmd_backfill()` still returns 0.
-fn download_missing_blobs(repo: &gix::Repository) {
+/// leaves behind. A blob the promisor packs promised that no remote hands over ends the
+/// command: `promisor_remote_get_direct()` dies with `could not fetch <oid> from promisor remote`
+/// (promisor-remote.c:320-324), after the failed fetch has said why.
+fn download_missing_blobs(repo: &gix::Repository) -> Result<()> {
     use gix::object::Kind;
 
-    let Ok(head) = repo.head_id() else { return };
+    let Ok(head) = repo.head_id() else { return Ok(()) };
 
     // `fill_missing_blobs()` asks `odb_has_object(ctx->repo->objects, &oid, 0)` —
     // flags `0`, so *without* `ODB_HAS_OBJECT_FETCH_PROMISOR`. The point of the
@@ -480,6 +474,31 @@ fn download_missing_blobs(repo: &gix::Repository) {
     // time before it was ever sent. The ids collected above are already known to
     // be absent.
     repo.objects.store_ref().fetch_from_promisor(&missing);
+    // `promisor_remote_get_direct()` ends with
+    //
+    // ```c
+    // for (i = 0; i < remaining_nr; i++) {
+    //         if (is_promisor_object(repo, &remaining_oids[i]))
+    //                 die(_("could not fetch %s from promisor remote"),
+    //                     oid_to_hex(&remaining_oids[i]));
+    // }
+    // ```
+    //
+    // (promisor-remote.c:320-324.) An object the promisor packs promised that no remote handed
+    // over ends the command at 128, after the `git fetch` child has said why on its own stderr.
+    gix::odb::store::set_fetch_if_missing(false);
+    for id in &missing {
+        if repo.has_object(id) || !super::rev_list::promisor_objects(repo).contains(id) {
+            continue;
+        }
+        gix::odb::store::set_fetch_if_missing(restore);
+        if let Some(gix::promisor::Error::Connect(err)) = gix::promisor::take_last_fetch_error() {
+            crate::transport_err::file_url_fatal(&err);
+        }
+        crate::git_fatal!("could not fetch {id} from promisor remote");
+    }
+    gix::odb::store::set_fetch_if_missing(restore);
+    Ok(())
 }
 
 /// git's `strtol_i`: is `s` a base-10 signed `int` the way `strtol(s, &end, 10)`

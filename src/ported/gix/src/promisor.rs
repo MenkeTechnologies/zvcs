@@ -105,10 +105,31 @@ pub(crate) fn install_hook_for(repo: &crate::Repository, promisors: Vec<Remote>)
         let Ok(repo) = crate::open_opts(&git_dir, open_options.clone()) else {
             return false;
         };
-        promisors
-            .iter()
-            .any(|promisor| fetch(&repo, promisor, ids).unwrap_or(false))
+        promisors.iter().any(|promisor| match fetch(&repo, promisor, ids) {
+            Ok(fetched) => fetched,
+            Err(err) => {
+                *LAST_FETCH_ERROR.lock().expect("never poisoned: nothing panics while holding it") = Some(err);
+                false
+            }
+        })
     }));
+}
+
+/// Why the most recent lazy fetch failed, for a caller that has to say so.
+///
+/// git runs the fetch as a child process whose own `fatal:` lines reach the terminal before the
+/// parent dies with `could not fetch <oid> from promisor remote`. The hook above only answers
+/// whether objects arrived, so the reason is parked here for [`take_last_fetch_error()`].
+#[cfg(feature = "blocking-network-client")]
+static LAST_FETCH_ERROR: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+
+/// The error of the lazy fetch that failed last, if any, clearing it.
+#[cfg(feature = "blocking-network-client")]
+pub fn take_last_fetch_error() -> Option<Error> {
+    LAST_FETCH_ERROR
+        .lock()
+        .expect("never poisoned: nothing panics while holding it")
+        .take()
 }
 
 /// Obtain every object in `ids` that is not present locally, in a single fetch from the promisor remote.

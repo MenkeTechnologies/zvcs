@@ -2072,6 +2072,10 @@ pub enum ConfigScopes {
     EarlyGlobal,
     /// `$GIT_COMMON_DIR/config` and `$GIT_DIR/config.worktree`.
     Repository,
+    /// `$GIT_COMMON_DIR/config` alone: the `read_early_config()` an external command (`git
+    /// jump`, a script) is run through never learns `extensions.worktreeConfig`, so
+    /// `config.worktree` is not read.
+    EarlyRepository,
 }
 
 /// `fatal: bad config line <n> in file <path>` for the first file in `scopes`
@@ -2590,7 +2594,7 @@ fn config_file_sequence(scopes: ConfigScopes, naming: GitDirNaming) -> Vec<Confi
     // worktree reads the main repository's `config` and only `config.worktree`
     // is its own (config.c:1590-1600).
     out.push(dirs.candidate(&dirs.common_dir, "config", naming));
-    if worktree_config_enabled(&dirs.common_dir.join("config")) {
+    if scopes == ConfigScopes::Repository && worktree_config_enabled(&dirs.common_dir.join("config")) {
         out.push(dirs.candidate(&dirs.git_dir, "config.worktree", naming));
     }
     out

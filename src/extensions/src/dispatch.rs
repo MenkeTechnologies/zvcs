@@ -1352,7 +1352,13 @@ fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
         "init" | "init-db" => crate::config::GitDirNaming::Absolute,
         _ => crate::config::GitDirNaming::AsDiscovered,
     };
-    let msg = crate::config::bad_config_line(crate::config::ConfigScopes::Repository, naming)?;
+    // `git jump` is an external command: git.c reaches the repository configuration only through
+    // `read_early_config()`, which never applies `extensions.worktreeConfig`.
+    let scopes = match sub {
+        "jump" => crate::config::ConfigScopes::EarlyRepository,
+        _ => crate::config::ConfigScopes::Repository,
+    };
+    let msg = crate::config::bad_config_line(scopes, naming)?;
     crate::trace2::error(&msg);
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))

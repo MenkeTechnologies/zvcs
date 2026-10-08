@@ -165,6 +165,43 @@ fn post_read_index(repo: &gix::Repository, index: &mut gix::index::File, fresh: 
         ensure_full_index(repo, index);
     }
     expand_virtually(repo, index);
+    clear_skip_worktree_from_present_files(repo, index);
+}
+
+/// `clear_skip_worktree_from_present_files()` (sparse-index.c:643-685), which `repo_read_index()`
+/// runs after every read: a sparse directory whose path exists in the working tree is expanded
+/// (`ensure_full_index()`), and every `SKIP_WORKTREE` entry whose file is on disk (`lstat()`
+/// succeeds) loses the bit. `sparse.expectFilesOutsideOfPatterns` turns the scan off.
+fn clear_skip_worktree_from_present_files(repo: &gix::Repository, index: &mut gix::index::State) {
+    if !settings(repo).apply_sparse_checkout {
+        return;
+    }
+    let snapshot = repo.config_snapshot();
+    if snapshot.boolean("sparse.expectFilesOutsideOfPatterns").unwrap_or(false) {
+        return;
+    }
+    let Some(workdir) = repo.workdir().map(std::path::Path::to_owned) else {
+        return;
+    };
+    let present = |path: &[u8]| std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(path.as_bstr()))).is_ok();
+    if index.virtual_sparse_dirs().iter().any(|dir| present(&dir.path)) {
+        ensure_full_index_with_advice(repo, index, false);
+    }
+    let collapsed: Vec<BString> = index.virtual_sparse_dirs().iter().map(|dir| dir.path.clone()).collect();
+    let skip = gix::index::entry::Flags::SKIP_WORKTREE;
+    let cleared: Vec<usize> = index
+        .entries()
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.flags.contains(skip) && !e.mode.is_sparse())
+        .map(|(i, e)| (i, e.path(index)))
+        .filter(|(_, path)| !collapsed.iter().any(|dir| path.starts_with(dir.as_slice())))
+        .filter(|(_, path)| present(path))
+        .map(|(i, _)| i)
+        .collect();
+    for i in cleared {
+        index.entries_mut()[i].flags.remove(skip);
+    }
 }
 
 /// Replace each sparse-directory entry by the entries of its tree while keeping the index

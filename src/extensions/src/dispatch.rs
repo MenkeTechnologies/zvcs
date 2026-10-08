@@ -1329,6 +1329,11 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
             }
         }
     }
+    // `read_repository_format()` dies inside the config reader on a version it cannot
+    // parse, so the gentle verbs are refused as well.
+    if let Some(msg) = crate::config::repository_version_refusal() {
+        return Some(msg);
+    }
     if FORMAT_GENTLE_VERBS.contains(&sub) {
         return None;
     }

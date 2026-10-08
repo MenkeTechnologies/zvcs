@@ -3103,6 +3103,10 @@ const GIT_REPO_VERSION_READ: i64 = 1;
 #[derive(Default)]
 struct RepositoryFormat {
     version: i64,
+    /// `die_bad_number()`'s message for a `core.repositoryformatversion` that `git_config_int()`
+    /// refuses: `read_repository_format()` dies on it while it reads the file, before any
+    /// verdict about the format exists.
+    bad_version: Option<(String, &'static str)>,
     v1_only_extensions: Vec<String>,
     unknown_extensions: Vec<String>,
 }
@@ -3186,8 +3190,11 @@ fn read_repository_format(path: &std::path::Path) -> RepositoryFormat {
                 // `EXTENSION_ERROR` note above.
                 if let Some(value) = body.value(&key) {
                     let text = String::from_utf8_lossy(value.as_slice()).into_owned();
-                    if let Ok(v) = crate::optint::config_int(&text) {
-                        format.version = v;
+                    match crate::optint::config_int(&text) {
+                        Ok(v) => format.version = v,
+                        Err(e) => {
+                            format.bad_version.get_or_insert((text, reason_text(e)));
+                        }
                     }
                 }
                 continue;
@@ -3286,6 +3293,20 @@ fn offender_list(singular: &str, plural: &str, offenders: &[String]) -> String {
 /// `None` also covers "there is no repository here": with nothing found there is
 /// nothing to verify, and the caller's command carries on to fail (or not) on its
 /// own terms.
+/// `git_config_int()` dying on the repository's own `core.repositoryformatversion`, from
+/// inside `read_repository_format()` (setup.c:866-876): `fatal: bad numeric config value '<v>'
+/// for 'core.repositoryformatversion' in file .git/config: invalid unit` (or `out of range`).
+/// It is a `die()` of the config reader, so it applies to the `RUN_SETUP_GENTLY` verbs as well.
+pub fn repository_version_refusal() -> Option<String> {
+    let dirs = repository_directories()?;
+    let format = read_repository_format(&dirs.common_dir.join("config"));
+    let (text, reason) = format.bad_version?;
+    let shown = dirs.candidate(&dirs.common_dir, "config", GitDirNaming::AsDiscovered).shown;
+    Some(format!(
+        "bad numeric config value '{text}' for 'core.repositoryformatversion' in file {shown}: {reason}"
+    ))
+}
+
 pub fn repository_format_refusal() -> Option<String> {
     let dirs = repository_directories()?;
     let format = read_repository_format(&dirs.common_dir.join("config"));

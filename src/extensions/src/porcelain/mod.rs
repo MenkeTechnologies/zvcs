@@ -624,6 +624,7 @@ pub(crate) fn unknown_option(tok: &str, usage: &str) -> std::process::ExitCode {
 }
 
 mod add;
+mod add_support;
 pub(crate) mod add_interactive;
 pub(crate) mod add_patch;
 mod am;
@@ -817,7 +818,6 @@ mod show_ref;
 /// The `Net::SMTP` transport `send_email` sends over; not a subcommand.
 mod smtp;
 pub(crate) mod sparse_checkout;
-mod stage;
 mod stash;
 mod status;
 mod stripspace;
@@ -1008,7 +1008,14 @@ pub use show_index::show_index;
 pub use show_ref::show_ref;
 pub use sparse_checkout::sparse_checkout;
 pub use sparse_checkout::top_level_refused as sparse_checkout_top_level_refused;
-pub use stage::stage;
+
+/// `git stage`: an entry in git's command table pointing at `cmd_add()` (`git-stage(1)`: "This is a
+/// synonym for git-add(1)"; `git stage -h` and `git add -h` print the same block). It is `git add`,
+/// not a second implementation of it, so every behaviour `add` carries is `stage`'s too.
+pub fn stage(args: &[String]) -> anyhow::Result<std::process::ExitCode> {
+    add::add(args)
+}
+
 pub use stash::stash;
 pub use status::status;
 pub use stripspace::stripspace;

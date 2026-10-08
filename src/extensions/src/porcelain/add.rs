@@ -557,10 +557,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // (read-cache.c:717), so each of them is indexed — and hashed with
     // `INDEX_WRITE_OBJECT` — regardless of what its content says. That is what
     // makes `git add -N -v .` report every tracked path in a freshly built
-    // worktree. See [`super::stage::racy_paths`].
-    let racily_clean: HashSet<BString> = super::stage::racy_paths(&index, &repo);
-    // `ce_match_stat_basic()`'s configurable field selection; see [`super::stage::stat_match`].
-    let stat_match = super::stage::stat_match(&repo);
+    // worktree. See [`super::add_support::racy_paths`].
+    let racily_clean: HashSet<BString> = super::add_support::racy_paths(&index, &repo);
+    // `ce_match_stat_basic()`'s configurable field selection; see [`super::add_support::stat_match`].
+    let stat_match = super::add_support::stat_match(&repo);
 
     // A bare `.` / `./` at the repository root is git's "everything under the
     // current directory", i.e. the whole worktree. gitoxide's dirwalk mishandles
@@ -628,7 +628,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             ps.is_included(p, Some(false))
         })?;
         if let Some(death) = death {
-            super::stage::print_refresh_unmerged(&death.unmerged, verbose);
+            super::add_support::print_refresh_unmerged(&death.unmerged, verbose);
             return death.die();
         }
 
@@ -1312,7 +1312,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // leaves the repository, and the object database, completely untouched.
     //
     // The whole check is `stage`'s, because stock git dispatches both verbs to the
-    // same `cmd_add()` — see [`super::stage::unmatched_pathspec_check`]. What this
+    // same `cmd_add()` — see [`super::add_support::unmatched_pathspec_check`]. What this
     // side owns is the `seen` universe: `prune_directory()` marks a pathspec from
     // the walk entries it kept plus every index entry
     // (`add_pathspec_matches_against_index`, `PS_IGNORE_SKIP_WORKTREE`), and the
@@ -1330,7 +1330,7 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     universe.extend(staged_set.iter().cloned());
 
     let mut seen: HashSet<usize> = HashSet::new();
-    super::stage::mark_seen_per_spec(&repo, &index, &patterns, &pathspecs, &universe, &mut seen)?;
+    super::add_support::mark_seen_per_spec(&repo, &index, &patterns, &pathspecs, &universe, &mut seen)?;
     // `if (!include_sparse && matches_skip_worktree(&pathspec, i, ...))`
     // (builtin/add.c:549-554): a pathspec that matched nothing so far but *does*
     // match an index entry the sparse-checkout definition hides is named through
@@ -1341,38 +1341,38 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // report, named as typed (`pathspec.items[i].original`).
     let hidden: Vec<BString> = sparse_hidden.iter().cloned().collect();
     let mut hidden_seen = seen.clone();
-    super::stage::mark_seen_per_spec(&repo, &index, &patterns, &pathspecs, &hidden, &mut hidden_seen)?;
+    super::add_support::mark_seen_per_spec(&repo, &index, &patterns, &pathspecs, &hidden, &mut hidden_seen)?;
     for i in hidden_seen.difference(&seen) {
         sparse_skipped.insert(BString::from(typed[*i].as_bytes()));
     }
 
-    let check = super::stage::SpecCheck {
+    let check = super::add_support::SpecCheck {
         original: &typed,
         resolved: &resolved,
         ignore_missing,
         ignore_errors,
         mode: match (refresh, renormalize, update_only) {
-            (true, _, _) => super::stage::SpecMode::Refresh,
-            (_, true, _) => super::stage::SpecMode::Renormalize,
+            (true, _, _) => super::add_support::SpecMode::Refresh,
+            (_, true, _) => super::add_support::SpecMode::Renormalize,
             // `--resolved` is not `take_worktree_changes`, so `report_path_error()`
             // is never reached (builtin/add.c:679-681) and an element that exists
             // on disk is accepted in silence — `--renormalize`'s behaviour exactly.
-            _ if add_resolved => super::stage::SpecMode::Renormalize,
-            (_, _, true) => super::stage::SpecMode::Update,
-            _ => super::stage::SpecMode::Add,
+            _ if add_resolved => super::add_support::SpecMode::Renormalize,
+            (_, _, true) => super::add_support::SpecMode::Update,
+            _ => super::add_support::SpecMode::Add,
         },
     };
     // `add_files()` prints the gitignore block and sets `exit_status = 1` from
     // *inside* the odb transaction, so everything else the run matched is still
     // staged and the 1 only surfaces at `finish:`. Only a fatal stops the run.
     let mut gitignored = false;
-    match super::stage::unmatched_pathspec_check(&repo, &index, &check, &hidden_seen)? {
-        super::stage::SpecVerdict::Fatal(code) => return Ok(code),
+    match super::add_support::unmatched_pathspec_check(&repo, &index, &check, &hidden_seen)? {
+        super::add_support::SpecVerdict::Fatal(code) => return Ok(code),
         // `report_path_error()` exits from inside the odb transaction, so everything
         // `add_files_to_cache()` already did stays: its `-v`/`-n` lines are on stdout
         // and the blobs it hashed are in the store. Only the index write, which
         // `finish:` owns, is skipped.
-        super::stage::SpecVerdict::Unknown(code) => {
+        super::add_support::SpecVerdict::Unknown(code) => {
             if let Some(code) = index_staged_blobs(&repo, &mut staged, &mut filters, write_content)? {
                 return Ok(code);
             }
@@ -1386,8 +1386,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             }
             return Ok(code);
         }
-        super::stage::SpecVerdict::Ignored => gitignored = true,
-        super::stage::SpecVerdict::Ok => {}
+        super::add_support::SpecVerdict::Ignored => gitignored = true,
+        super::add_support::SpecVerdict::Ok => {}
     }
 
     // `--refresh` only refreshes the stat cache (invisible to the object/ref/index
@@ -2270,7 +2270,7 @@ pub(super) fn renormalize_tracked_files(
         let read = gix::index::fs::Metadata::from_path_no_follow(&abs)
             .map_err(|e| e.to_string())
             .and_then(|md| {
-                super::stage::read_converted_bytes(repo, filters, path, &abs, &md)
+                super::add_support::read_converted_bytes(repo, filters, path, &abs, &md)
                     .map_err(|e| e.to_string())
             });
         let (content, _) = match read {

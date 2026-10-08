@@ -1509,8 +1509,8 @@ pub(super) fn maybe_recurse_submodules(
 
 /// git's "nothing to do" ref case: `new_branch_info->name` is "HEAD" and there is
 /// no branch path to move to, so `update_refs_for_switch()` touches no ref and
-/// prints nothing. Reached by `git checkout` with no arguments and by
-/// `git checkout HEAD`.
+/// prints no switch line (only the tracking summary of the current branch). Reached by
+/// `git checkout` with no arguments and by `git checkout HEAD`.
 ///
 /// Only `merge_working_tree()` has an effect: forced, it resets the worktree and
 /// index to `HEAD`'s tree; unforced, the 2-way merge against an identical tree is
@@ -1532,6 +1532,12 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
     // `update_refs_for_switch()`'s "Nothing to do" arm still ends in
     // `remove_branch_state(the_repository, !opts->quiet)` (builtin/checkout.c:1044).
     super::reset::remove_branch_state(repo, !quiet)?;
+    // ...and then `report_tracking()`, which the `|| !strcmp(new_branch_info->name, "HEAD")`
+    // arm of the closing condition admits: `branch_get("HEAD")` is the current branch, so a
+    // branch with an upstream gets its ahead/behind summary even though no ref moved.
+    if !quiet {
+        print_tracking_status(repo);
+    }
     Ok(run_post_checkout(repo, head, head_commit_id(repo), true))
 }
 

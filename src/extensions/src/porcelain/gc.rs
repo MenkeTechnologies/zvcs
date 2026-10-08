@@ -465,6 +465,17 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // A `gc` started inside the git directory (`.git/refs/heads`, say) is a bare-style
+    // discovery: `setup_bare_git_dir()` chdirs to the git directory before the builtin runs.
+    // That is what lets `pack-refs --prune` remove the now-empty `refs/heads` underneath the
+    // process and the rest of the run carry on; staying put left every later step without a
+    // working directory.
+    if let (Ok(cwd), Ok(git_dir)) = (std::env::current_dir(), repo.git_dir().canonicalize()) {
+        if cwd.canonicalize().is_ok_and(|cwd| cwd.starts_with(&git_dir)) {
+            let _ = std::env::set_current_dir(&git_dir);
+        }
+    }
+
     // `gc.maxCruftSize` supplies the default for `--max-cruft-size`, and git
     // validates it the moment the config is read — through `git_config_ulong`,
     // before parse-options and before the `--auto` gate. So a value git cannot

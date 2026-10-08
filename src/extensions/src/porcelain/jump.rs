@@ -198,12 +198,10 @@ esac"#;
 
 /// `mode_auto`. `Ok(None)` is the script's `usage >&2; exit 1` path.
 fn mode_auto(args: &[String]) -> Result<Option<Vec<u8>>> {
-    // `test "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true"` —
-    // false both outside a repository and inside its git directory.
-    let Ok(repo) = crate::setup::discover() else {
-        return Ok(None);
-    };
-    if !is_inside_work_tree(&repo) {
+    // `test "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true"` — false outside a
+    // repository, inside its git directory, and wherever `rev-parse` dies (a malformed
+    // `config.worktree`, say), whose message the redirect swallows.
+    if !inside_work_tree()? {
         return Ok(None);
     }
 
@@ -518,19 +516,13 @@ fn has_unstaged_changes(args: &[String]) -> Result<bool> {
     Ok(!status.success())
 }
 
-/// `git rev-parse --is-inside-work-tree` — a worktree exists and the current
-/// directory is not inside the git directory itself.
-fn is_inside_work_tree(repo: &gix::Repository) -> bool {
-    if repo.workdir().is_none() {
-        return false;
-    }
-    let (Ok(cwd), Ok(git_dir)) = (
-        std::env::current_dir().and_then(std::fs::canonicalize),
-        std::fs::canonicalize(repo.git_dir()),
-    ) else {
-        return false;
-    };
-    !cwd.starts_with(git_dir)
+/// `git rev-parse --is-inside-work-tree 2>/dev/null` printing `true`.
+fn inside_work_tree() -> Result<bool> {
+    let out = std::process::Command::new(crate::hosted::git_exe()?)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    Ok(out.stdout.trim_ascii() == b"true")
 }
 
 #[cfg(test)]

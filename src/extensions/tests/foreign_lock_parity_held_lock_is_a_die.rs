@@ -72,3 +72,37 @@ fn a_held_index_lock_is_fatal_at_128() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Without `ZVCS_QUEUED` a contended verb is queued; with no daemon the queue runs the job
+/// inline, and the job's own status (128) is the command's, not a flattened 1.
+#[test]
+fn an_inline_queued_rerun_keeps_the_childs_exit_status() {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let base = std::env::temp_dir().join(format!("zvcs-held-lock-queued-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (s, z) = (base.join("s").join("repo"), base.join("z").join("repo"));
+    fixture(&s);
+    fixture(&z);
+    for root in [&s, &z] {
+        std::fs::write(root.join(".git/index.lock"), "").unwrap();
+    }
+    let want = run(stock, &s, &["add", "b"]);
+    let out = Command::new(BIN)
+        .args(["add", "b"])
+        .current_dir(&z)
+        .env("HOME", &z)
+        .env("ZVCS_HOME", base.join("zhome"))
+        .env("ZVCS_SOCK", base.join("no-such-daemon.sock"))
+        .env("ZVCS_INDEX_LOCK_WAIT_MS", "50")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("ZVCS_QUEUED")
+        .output()
+        .unwrap();
+    assert_eq!(want.1, Some(128));
+    assert_eq!(out.status.code(), Some(128), "{}", String::from_utf8_lossy(&out.stderr));
+    // The job's output is captured as one stream and replayed on stdout.
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(said.contains("fatal: Unable to create"), "{said}");
+    let _ = std::fs::remove_dir_all(&base);
+}

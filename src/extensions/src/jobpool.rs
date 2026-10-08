@@ -188,6 +188,7 @@ fn run_job_inner(id: i64, spec_json: &str) {
             output: format!("invalid job spec: {e}\n"),
             sha_after: None,
             cancelled: false,
+            code: None,
         },
     };
 

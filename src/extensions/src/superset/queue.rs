@@ -350,7 +350,8 @@ fn run_inline(spec: &Value) -> Result<ExitCode> {
         }
         Ok(ExitCode::SUCCESS)
     } else {
-        Ok(ExitCode::FAILURE)
+        // The command run directly would have ended with the child's own status.
+        Ok(result.code.map_or(ExitCode::FAILURE, |c| ExitCode::from(c as u8)))
     }
 }
 

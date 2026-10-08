@@ -63,6 +63,10 @@ pub struct JobResult {
     pub sha_after: Option<String>,
     /// True if the job was cancelled mid-run (distinguishes stopped from failed).
     pub cancelled: bool,
+    /// Exit status of the child that failed the job (the last one run, for a multi-step job);
+    /// `None` when it was killed by a signal or never ran. A synchronous caller reports it as
+    /// its own, the way a command run directly would.
+    pub code: Option<i32>,
 }
 
 /// This binary's path, for spawning child porcelain with a set cwd.
@@ -72,9 +76,9 @@ fn self_exe() -> Result<std::path::PathBuf> {
 
 /// Run one child `git <args>` in `cwd`; return `(success, combined-output)`.
 /// Registers the child's pid on `cancel` so a concurrent `zjob stop` can kill it.
-fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel: &Cancel) -> (bool, String) {
+fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel: &Cancel) -> (bool, String, Option<i32>) {
     if cancel.cancelled() {
-        return (false, "cancelled\n".to_string());
+        return (false, "cancelled\n".to_string(), None);
     }
     let mut cmd = Command::new(exe);
     cmd.args(args)
@@ -95,7 +99,7 @@ fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel
     }
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return (false, format!("spawn `git {}` failed: {e}\n", args.join(" "))),
+        Err(e) => return (false, format!("spawn `git {}` failed: {e}\n", args.join(" ")), None),
     };
     cancel.set_child(child.id());
     let out = child.wait_with_output();
@@ -105,9 +109,9 @@ fn run(exe: &Path, cwd: &Path, args: &[String], env: &[(String, String)], cancel
             let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
             s.push_str(&String::from_utf8_lossy(&out.stderr));
             // A killed child reports failure; treat cancellation distinctly.
-            (out.status.success() && !cancel.cancelled(), s)
+            (out.status.success() && !cancel.cancelled(), s, out.status.code())
         }
-        Err(e) => (false, format!("`git {}` failed: {e}\n", args.join(" "))),
+        Err(e) => (false, format!("`git {}` failed: {e}\n", args.join(" ")), None),
     }
 }
 
@@ -124,6 +128,7 @@ pub fn execute(spec: &Value, cancel: &Cancel) -> JobResult {
             output: format!("{e:#}\n"),
             sha_after: None,
             cancelled: cancel.cancelled(),
+            code: None,
         },
     }
 }
@@ -154,6 +159,7 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
             let mut output = String::new();
             let mut ok = true;
             let mut commit_ok = false;
+            let mut code = None;
 
             // Stage the given paths (if any) first.
             let paths: Vec<String> = spec
@@ -164,9 +170,10 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
             if !paths.is_empty() {
                 let mut args = vec!["add".to_string()];
                 args.extend(paths);
-                let (a_ok, a_out) = run(&exe, workdir, &args, &env, cancel);
+                let (a_ok, a_out, a_code) = run(&exe, workdir, &args, &env, cancel);
                 output.push_str(&a_out);
                 ok &= a_ok;
+                code = a_code;
             }
 
             // Commit.
@@ -175,7 +182,7 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
                     .get("message")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("commit job missing message"))?;
-                let (c_ok, c_out) = run(
+                let (c_ok, c_out, c_code) = run(
                     &exe,
                     workdir,
                     &["commit".into(), "-m".into(), message.to_string()],
@@ -185,13 +192,15 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
                 output.push_str(&c_out);
                 ok &= c_ok;
                 commit_ok = c_ok;
+                code = c_code;
             }
 
             // Optional push.
             if ok && spec.get("push").and_then(Value::as_bool).unwrap_or(false) {
-                let (p_ok, p_out) = run(&exe, workdir, &["push".into()], &env, cancel);
+                let (p_ok, p_out, p_code) = run(&exe, workdir, &["push".into()], &env, cancel);
                 output.push_str(&p_out);
                 ok &= p_ok;
+                code = p_code;
             }
 
             // Report the resulting HEAD whenever the COMMIT itself landed — even if
@@ -200,15 +209,15 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
             // from a failed one and re-commits work that is already in. (`ok` still
             // reflects the whole job, so the state stays `failed` on a push error.)
             let sha_after = if commit_ok { head_sha(&exe, workdir) } else { None };
-            Ok(JobResult { ok, output, sha_after, cancelled: false })
+            Ok(JobResult { ok, output, sha_after, cancelled: false, code })
         }
         "push" => {
             let mut args = vec!["push".to_string()];
             if let Some(rs) = spec.get("refspec").and_then(Value::as_str) {
                 args.extend(rs.split_whitespace().map(String::from));
             }
-            let (ok, output) = run(&exe, workdir, &args, &env, cancel);
-            Ok(JobResult { ok, output, sha_after: None, cancelled: false })
+            let (ok, output, code) = run(&exe, workdir, &args, &env, cancel);
+            Ok(JobResult { ok, output, sha_after: None, cancelled: false, code })
         }
         "exec" => {
             // A generic job: run an arbitrary command (argv[0] + args) in the
@@ -220,10 +229,10 @@ fn execute_inner(spec: &Value, cancel: &Cancel) -> Result<JobResult> {
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
             let Some((prog, rest)) = argv.split_first() else {
-                return Ok(JobResult { ok: false, output: "exec job: empty argv\n".into(), sha_after: None, cancelled: false });
+                return Ok(JobResult { ok: false, output: "exec job: empty argv\n".into(), sha_after: None, cancelled: false, code: None });
             };
-            let (ok, output) = run(Path::new(prog), workdir, rest, &env, cancel);
-            Ok(JobResult { ok, output, sha_after: None, cancelled: false })
+            let (ok, output, code) = run(Path::new(prog), workdir, rest, &env, cancel);
+            Ok(JobResult { ok, output, sha_after: None, cancelled: false, code })
         }
         other => Err(anyhow!("unknown job kind {other:?}")),
     }

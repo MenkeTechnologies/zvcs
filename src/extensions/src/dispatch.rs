@@ -1655,7 +1655,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `cmd_mv()` runs `git_default_config` first but reaches `prepare_repo_settings()` at
     // its `repo_read_index()`, after the option parse and the operand-count usage error;
     // `porcelain::mv` keeps that order itself.
-    let parse_before_settings = sub == "mv";
+    let parse_before_settings = sub == "mv"
+        // `cmd_worktree()`'s top-level `parse_options()` refuses a missing or unknown
+        // subcommand and any option ahead of it before a subcommand reads the settings.
+        || (sub == "worktree" && crate::porcelain::worktree_top_level_refused(args));
     let settings_help_skip =
         (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config || parse_before_settings;
     let config_help_skip =

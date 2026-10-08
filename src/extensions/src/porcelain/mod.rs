@@ -1035,6 +1035,7 @@ pub use version::version;
 pub use web__browse::web__browse;
 pub use whatchanged::whatchanged;
 pub use worktree::worktree;
+pub use worktree::top_level_refused as worktree_top_level_refused;
 pub use write_tree::write_tree;
 
 #[cfg(test)]

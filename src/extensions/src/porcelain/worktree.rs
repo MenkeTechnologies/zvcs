@@ -111,6 +111,26 @@ use crate::refstore::StateRef;
 /// use `char` counts where git uses `utf8_strwidth()`, so a path containing
 /// double-width characters can pad differently. Both are byte-identical for the
 /// ASCII paths that occur in practice.
+/// Whether the top-level `parse_options()` of `cmd_worktree()` refuses `args` with a usage
+/// error: no subcommand (or only `--`), an option ahead of it, or a name that is not a
+/// subcommand. That parse runs before any subcommand reaches `prepare_repo_settings()`, so
+/// the dispatcher consults this to keep the settings gate from pre-empting the 129.
+/// `-h` / `--help-all` are not refusals: they are answered with the usage block.
+pub fn top_level_refused(args: &[String]) -> bool {
+    let args: &[String] = match args.first() {
+        Some(a) if a == "worktree" => &args[1..],
+        _ => args,
+    };
+    match args.first().map(String::as_str) {
+        None => true,
+        Some("-h" | "--help" | "--help-all") => false,
+        Some(sub) => !SUBCOMMANDS.contains(&sub),
+    }
+}
+
+/// The subcommands `cmd_worktree()` dispatches, in the order of its `OPT_SUBCOMMAND` table.
+const SUBCOMMANDS: &[&str] = &["add", "prune", "list", "lock", "unlock", "move", "remove", "repair"];
+
 pub fn worktree(args: &[String]) -> Result<ExitCode> {
     // Dispatch hands us the tail *after* the verb, so the subcommand is at index
     // 0. Tolerate a leading `worktree` as well, matching the other multi-verb

@@ -1644,6 +1644,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // `cmd_history_*()` parse options and count operands ahead of
         // `repo_config(git_default_config)`; `porcelain::history` keeps that order.
         || sub == "history"
+        // `cmd_backfill()` parses its options and revisions, then reads
+        // `git_default_config`, the sparse patterns and the settings block, in that order;
+        // `porcelain::backfill` keeps it itself.
+        || sub == "backfill"
         // `cmd_unpack_file()` resolves its operand, so it reports a usage error or an
         // unknown name, ahead of `repo_config(git_default_config)`
         // (builtin/unpack-file.c); `porcelain::unpack_file` keeps that order.

@@ -344,10 +344,11 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: object filtering requires --objects");
         return Ok(ExitCode::from(128));
     }
-    if saw_ancestry_path && !has_bottom {
-        eprintln!("fatal: --ancestry-path given but there are no bottom commits");
-        return Ok(ExitCode::from(128));
-    }
+
+    // `repo_config(repo, git_default_config, NULL)` follows the option parse and
+    // `setup_revisions()`, so none of their errors is pre-empted by a bad value; the
+    // dispatcher leaves `backfill` to this order (`parse_before_config`).
+    crate::default_config::validate(&repo).map_err(crate::default_config::Rejection::into_error)?;
 
     // Sparse mode defaults to whatever `core.sparseCheckout` says. git loads the
     // patterns before doing any work, and an unreadable file is fatal.
@@ -363,6 +364,15 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             // git's `return error(...)` propagates -1 out of `run_builtin`.
             return Ok(ExitCode::from(255));
         }
+    }
+
+    // `prepare_repo_settings()` is reached by the walk, after the sparse patterns were
+    // loaded and ahead of `prepare_revision_walk()`'s own refusals.
+    crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
+
+    if saw_ancestry_path && !has_bottom {
+        eprintln!("fatal: --ancestry-path given but there are no bottom commits");
+        return Ok(ExitCode::from(128));
     }
 
     if has_promisor_remote(&repo) {

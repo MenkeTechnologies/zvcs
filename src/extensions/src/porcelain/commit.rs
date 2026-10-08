@@ -3005,6 +3005,29 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// The diff queue `add_files_to_cache()` drives, as far as `diff.orderFile` is concerned.
+///
+/// `run_diff_files()` fills the queue and `diffcore_std()` then runs `diffcore_order()`,
+/// which reads the order file as soon as the queue holds a pair and dies on one it cannot
+/// open (diffcore-order.c:119-126, :24-26). That is ahead of `update_callback()` hashing a
+/// single file and ahead of the `pre-commit` hook, so a changed path has to be announced
+/// with [`QueuedOrder::queued`] before anything is written for it.
+#[derive(Default)]
+struct QueuedOrder {
+    read: bool,
+}
+
+impl QueuedOrder {
+    /// The queue holds a pair: read `diff.orderFile` once, failing as git does.
+    fn queued(&mut self, repo: &gix::Repository) -> Result<()> {
+        if !std::mem::replace(&mut self.read, true) {
+            let orderfile = super::status::configured_orderfile(repo)?;
+            super::status::diffcore_order_read(repo, orderfile.as_deref(), true)?;
+        }
+        Ok(())
+    }
+}
+
 /// The (path → id, mode) view of an index, used to decide which pathspec-matched
 /// paths are modifications and which have vanished from the worktree.
 fn tracked_map(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode)> {
@@ -4248,12 +4271,22 @@ fn include_stage(
     // Unlike `--only`'s `list_paths()`, which `exit(1)`s on an unmatched pathspec, the
     // `also` arm's refusal after `add_files_to_cache()` ends the command with 128 (measured
     // against 2.56.0: `commit -i <untracked>` prints the `error:` line alone, exit 128).
-    stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree_paths(index), false).map_err(|e| {
-        match e.downcast_ref::<crate::fatal::Silent>() {
+    let set = stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree_paths(index), false)
+        .map_err(|e| match e.downcast_ref::<crate::fatal::Silent>() {
             Some(crate::fatal::Silent(1)) => anyhow::Error::new(crate::fatal::Silent(128)),
             _ => e,
-        }
-    })
+        })?;
+    // `add_files_to_cache()`'s diff queue holds only the paths that differ from the index;
+    // `diffcore_order()` reads `diff.orderFile` once there is one.
+    let differs = !set.deletions.is_empty()
+        || set
+            .staged
+            .iter()
+            .any(|s| tracked.get(&s.path).is_none_or(|(id, mode)| *id != s.id || *mode != s.mode));
+    if differs {
+        QueuedOrder::default().queued(repo)?;
+    }
+    Ok(set)
 }
 
 /// The paths a sparse checkout marks `CE_SKIP_WORKTREE`, which is what
@@ -4762,6 +4795,7 @@ fn collect_tracked_changes(
     }
     let mut staged: Vec<StagedFile> = Vec::new();
     let mut deletions: Vec<BString> = Vec::new();
+    let mut order = QueuedOrder::default();
 
     {
         let backing = index.path_backing();
@@ -4793,6 +4827,7 @@ fn collect_tracked_changes(
             // A vanished (or unreadable) tracked path stages as a deletion — a
             // submodule whose whole worktree is gone included.
             let Ok(md) = gix::index::fs::Metadata::from_path_no_follow(&abs) else {
+                order.queued(repo)?;
                 deletions.push(path);
                 continue;
             };
@@ -4810,6 +4845,7 @@ fn collect_tracked_changes(
                 if !unmerged && id == e.id && e.mode == Mode::COMMIT {
                     continue;
                 }
+                order.queued(repo)?;
                 staged.push(StagedFile {
                     path,
                     id,
@@ -4845,6 +4881,7 @@ fn collect_tracked_changes(
             if !unmerged && id == e.id && mode == e.mode {
                 continue;
             }
+            order.queued(repo)?;
             let id = repo.write_blob(&bytes)?.detach();
             staged.push(StagedFile {
                 path,

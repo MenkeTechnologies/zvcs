@@ -159,8 +159,8 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
         index.remove_tree();
     }
 
-    let tree_id = match refresh_cache_tree(&repo, &mut index, missing_ok)? {
-        Ok(id) => id,
+    let (tree_id, changed) = match update_cache_tree(&repo, &mut index, missing_ok)? {
+        Ok(updated) => updated,
         Err(err) => {
             report_tree_build_failure(&err);
             eprintln!("fatal: git-write-tree: error building trees");
@@ -186,6 +186,9 @@ pub fn write_tree(args: &[String]) -> Result<ExitCode> {
             }
         }
     };
+    if changed {
+        write_refreshed_cache_tree(&repo, &mut index)?;
+    }
 
     println!("{out_id}");
     Ok(ExitCode::SUCCESS)
@@ -324,28 +327,52 @@ pub(super) fn refresh_cache_tree(
     index: &mut gix::index::File,
     missing_ok: bool,
 ) -> Result<std::result::Result<gix::ObjectId, cache_tree::Error>> {
-    let odb = RepoOdb { repo };
-    if index.cache_tree_fully_valid(&odb) {
-        // `was_valid` — the id is already recorded, and the index stays untouched.
-        return Ok(Ok(index
-            .tree()
-            .expect("a fully valid cache-tree is a present cache-tree")
-            .id));
-    }
-    match index.cache_tree_update(
-        &odb,
-        cache_tree::Options {
-            missing_ok,
-            repair: false,
-        },
-    ) {
-        Ok(id) => {
-            prepare_offset_table(repo, index);
-            crate::index_racy::write(repo, index)?;
+    match update_cache_tree(repo, index, missing_ok)? {
+        Ok((id, changed)) => {
+            if changed {
+                write_refreshed_cache_tree(repo, index)?;
+            }
             Ok(Ok(id))
         }
         Err(err) => Ok(Err(err)),
     }
+}
+
+/// `write_index_as_tree_internal()` (cache-tree.c:741-795) without the write that
+/// follows it: the root tree id, and whether `cache_tree_update()` changed the
+/// extension (`!was_valid`, cache-tree.c:818). `write-tree --prefix` looks its
+/// subtree up between the two, and a prefix that is not there leaves the index
+/// file as it was (`if (!ret && !was_valid)`).
+pub(super) fn update_cache_tree(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    missing_ok: bool,
+) -> Result<std::result::Result<(gix::ObjectId, bool), cache_tree::Error>> {
+    let odb = RepoOdb { repo };
+    if index.cache_tree_fully_valid(&odb) {
+        // `was_valid` — the id is already recorded, and the index stays untouched.
+        let id = index
+            .tree()
+            .expect("a fully valid cache-tree is a present cache-tree")
+            .id;
+        return Ok(Ok((id, false)));
+    }
+    Ok(index
+        .cache_tree_update(
+            &odb,
+            cache_tree::Options {
+                missing_ok,
+                repair: false,
+            },
+        )
+        .map(|id| (id, true)))
+}
+
+/// The `write_locked_index()` that ends `write_index_as_tree()` (cache-tree.c:818-824).
+pub(super) fn write_refreshed_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
+    prepare_offset_table(repo, index);
+    crate::index_racy::write(repo, index)?;
+    Ok(())
 }
 
 /// The as-is `prepare_index()` step (builtin/commit.c:486-491): update the

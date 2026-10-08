@@ -4557,11 +4557,38 @@ fn build_fake_ancestor(patches: &[Patch], path: &str, quiet: bool) -> Result<boo
         );
     }
     result.sort_entries();
+    take_fake_ancestor_lock(path)?;
     // `INDEX_STATE_INIT` leaves the version at zero, so `do_write_index()` picks it
     // (`get_index_format_default()`), and `record_eoie()` governs `EOIE` as for any
     // other index write (read-cache.c:2957).
     result.write(crate::config::index_write_options_fresh(&repo))?;
     Ok(true)
+}
+
+/// `hold_lock_file_for_update(&lock, state->fake_ancestor, LOCK_DIE_ON_ERROR)` (apply.c:4243): the
+/// `<file>.lock` is created exclusively before the index is written, and a refusal is
+/// `unable_to_lock_message()` as a `die()`, named by the absolute path (lockfile.c). Letting the
+/// index writer find the lock itself reported a missing directory as lock contention, which the
+/// dispatcher answers by queueing the command as a job.
+fn take_fake_ancestor_lock(path: &str) -> Result<()> {
+    let lock = std::env::current_dir()?.join(format!("{path}.lock"));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&lock);
+            Ok(())
+        }
+        Err(e) => {
+            let text = e.to_string();
+            let reason = super::add::strip_os_error(&text);
+            // 2.56 shortened the long editor/crash hint to one line (lockfile.c).
+            let hint = if e.kind() == std::io::ErrorKind::AlreadyExists {
+                ".\n\nAnother git process seems to be running in this repository, or the lock file may be stale"
+            } else {
+                ""
+            };
+            Err(crate::fatal::die(format!("Unable to create '{}': {reason}{hint}", lock.display())))
+        }
+    }
 }
 
 /// `repo_get_oid_blob()` for the `index` line's id: git writes it abbreviated, so

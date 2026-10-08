@@ -5418,26 +5418,28 @@ fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
     if let Some(origin) = described_line(spec) {
         return origin;
     }
-    if let Ok(Some(r)) = repo.try_find_reference(spec) {
-        let full = r.name().as_bstr().to_str_lossy().into_owned();
-        if full.starts_with("refs/heads/") {
+    if let Some(full) = dwim_full_name(repo, spec) {
+        // `merge_name()` reports the name `dwim_ref()` landed on with its category
+        // prefix cut off, not the spelling it was handed: `@{-1}` is the branch it
+        // names, `heads/topic` is `topic`.
+        if let Some(name) = full.strip_prefix("refs/heads/") {
             return SpecOrigin {
-                described: format!("branch '{spec}'"),
-                origin: spec.to_string(),
+                described: format!("branch '{name}'"),
+                origin: name.to_string(),
                 is_local_branch: true,
             };
         }
-        if full.starts_with("refs/tags/") {
+        if let Some(name) = full.strip_prefix("refs/tags/") {
             return SpecOrigin {
-                described: format!("tag '{spec}'"),
-                origin: format!("tag '{spec}'"),
+                described: format!("tag '{name}'"),
+                origin: format!("tag '{name}'"),
                 is_local_branch: false,
             };
         }
-        if full.starts_with("refs/remotes/") {
+        if let Some(name) = full.strip_prefix("refs/remotes/") {
             return SpecOrigin {
-                described: format!("remote-tracking branch '{spec}'"),
-                origin: spec.to_string(),
+                described: format!("remote-tracking branch '{name}'"),
+                origin: name.to_string(),
                 is_local_branch: false,
             };
         }
@@ -5459,6 +5461,21 @@ fn describe_spec(repo: &gix::Repository, spec: &str) -> SpecOrigin {
         origin: format!("commit '{spec}'"),
         is_local_branch: false,
     }
+}
+
+/// The full name `dwim_ref()` resolves `spec` to: the rule list (`""`, tags, heads, remotes) over a
+/// plain name, and for a spelling that names a branch indirectly (`@{-1}`, `@{u}`,
+/// `topic@{upstream}`) the branch `interpret_branch_name()` expands it to.
+fn dwim_full_name(repo: &gix::Repository, spec: &str) -> Option<String> {
+    if let Ok(Some(r)) = repo.try_find_reference(spec) {
+        return Some(r.name().as_bstr().to_str_lossy().into_owned());
+    }
+    if !spec.contains("@{") {
+        return None;
+    }
+    let resolved = repo.rev_parse(spec).ok()?;
+    let reference = resolved.first_reference()?;
+    Some(reference.name.as_bstr().to_str_lossy().into_owned())
 }
 
 /// `merge_name()`'s second attempt: `<name>^^^` or `<name>~<number>` naming a

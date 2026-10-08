@@ -3217,8 +3217,9 @@ fn porcelain_v2_output(
             }
         }
 
-        // 1/2/u entry lines, together and sorted by path.
-        let mut lines: Vec<(BString, Vec<u8>)> = Vec::new();
+        // 1/2 entry lines sorted by path, then the u lines sorted by path: git prints
+        // unmerged entries in a second pass (wt_porcelain_v2_print), not interleaved.
+        let mut lines: Vec<((bool, BString), Vec<u8>)> = Vec::new();
         for (path, r) in &recs {
             let xy = format!("{}{}", r.x as char, r.y as char);
             let sub = v2_submodule_token(&[r.m_h, r.m_i, r.m_w], r.sub);
@@ -3244,7 +3245,7 @@ fn porcelain_v2_output(
                 );
                 line.extend_from_slice(path);
             }
-            lines.push((path.clone(), line));
+            lines.push(((false, path.clone()), line));
         }
         for (mask, path) in &unmerged {
             let xy = match mask {
@@ -3291,7 +3292,7 @@ fn porcelain_v2_output(
                 .as_bytes(),
             );
             line.extend_from_slice(path);
-            lines.push((path.clone(), line));
+            lines.push(((true, path.clone()), line));
         }
         lines.sort_by(|a, b| a.0.cmp(&b.0));
         for (_, line) in lines {
@@ -3318,8 +3319,8 @@ fn porcelain_v2_output(
     }
 
     // ------------------------------------------------------------- render
-    // git emits 1/2/u lines together, sorted by path, then '?' then '!'.
-    let mut lines: Vec<(BString, String)> = Vec::new();
+    // git emits the 1/2 lines sorted by path, then the u lines, then '?' then '!'.
+    let mut lines: Vec<((bool, BString), String)> = Vec::new();
     for (path, r) in &recs {
         let xy = format!("{}{}", r.x as char, r.y as char);
             let sub = v2_submodule_token(&[r.m_h, r.m_i, r.m_w], r.sub);
@@ -3347,7 +3348,7 @@ fn porcelain_v2_output(
                 quote_path(path, prefix),
             )
         };
-        lines.push((path.clone(), line));
+        lines.push(((false, path.clone()), line));
     }
     for (mask, path) in &unmerged {
         let xy = match mask {
@@ -3397,7 +3398,7 @@ fn porcelain_v2_output(
             sh[2],
             quote_path(path, prefix),
         );
-        lines.push((path.clone(), line));
+        lines.push(((true, path.clone()), line));
     }
     lines.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, line) in lines {

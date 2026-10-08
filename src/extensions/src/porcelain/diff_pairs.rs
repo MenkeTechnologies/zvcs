@@ -1344,11 +1344,19 @@ pub(crate) fn render_raw_stream(
             // patch format, so `-W --stat` prints a diffstat and nothing else.
             "-W" | "--function-context" => opts.func_context = true,
             "--no-function-context" => opts.func_context = false,
+            // `OPT_MAGNITUDE`: a k/m/g suffix is accepted, and a value it cannot read is the
+            // callback-error `error:` line at 129.
             "--inter-hunk-context" => {
-                opts.inter_hunk_ctx = parse_ctx(&want_value!(s.len()))? as usize;
+                opts.inter_hunk_ctx = match inter_hunk_ctx(&want_value!(s.len())) {
+                    Ok(n) => n,
+                    Err(code) => return Ok(code),
+                };
             }
             _ if s.starts_with("--inter-hunk-context=") => {
-                opts.inter_hunk_ctx = parse_ctx(&s["--inter-hunk-context=".len()..])? as usize;
+                opts.inter_hunk_ctx = match inter_hunk_ctx(&s["--inter-hunk-context=".len()..]) {
+                    Ok(n) => n,
+                    Err(code) => return Ok(code),
+                };
             }
             // -a / --text: force a textual diff for content git would flag as binary.
             "-a" | "--text" => opts.text = true,
@@ -2137,9 +2145,16 @@ fn unified_ctx(value: &str) -> std::result::Result<u32, Status> {
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
-fn parse_ctx(s: &str) -> Result<u32> {
-    s.parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("invalid context line count {s:?}"))
+/// `--inter-hunk-context=<n>` (`OPT_MAGNITUDE`): `parse-options`' unsigned reading of the
+/// value, reported as it reports a bad one: the message alone on stderr, exit 129.
+fn inter_hunk_ctx(value: &str) -> std::result::Result<usize, Status> {
+    match crate::optint::unsigned_prec(&crate::optint::long_opt("inter-hunk-context"), value, 4) {
+        Ok(n) => Ok(n as usize),
+        Err(e) => {
+            eprintln!("error: {e}");
+            Err(Status::from(129))
+        }
+    }
 }
 
 /// Parse a bare integer for the `--stat-*` width options; git treats a bad value as unset.

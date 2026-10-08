@@ -683,6 +683,26 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `cmd_reset()` handles `--pathspec-from-file` right after `parse_args()`
+    // (builtin/reset.c:391-404): it refuses `--patch` and inline pathspecs, reads the
+    // list through the one `parse_pathspec_file()` every verb shares, and a NUL
+    // separator without the file option is refused. All of it precedes the
+    // hunk-selector option check and the `--patch` run below.
+    if let Some(f) = &pathspec_from_file {
+        if patch_mode {
+            eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        if !paths.is_empty() {
+            eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+            return Ok(ExitCode::from(128));
+        }
+        paths = super::commit::read_pathspec_file(f, pathspec_file_nul)?;
+    } else if pathspec_file_nul {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Ok(ExitCode::from(128));
+    }
+
     // git collects the hunk-selector options into `add_p_opt` and refuses them
     // here — after `parse_args()` has verified the leading positional (so a bad
     // revision still reports `ambiguous argument` first) and before every other
@@ -709,38 +729,6 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             patch_opts.to_interactive(false),
             &paths,
         );
-    }
-
-    // `parse_pathspec_from_file()` (builtin/reset.c): a NUL separator needs the file
-    // option; the file list and inline pathspecs are mutually exclusive; then the
-    // file/stdin is split into pathspecs that join the path form.
-    if pathspec_file_nul && pathspec_from_file.is_none() {
-        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
-        return Ok(ExitCode::from(128));
-    }
-    if let Some(f) = pathspec_from_file {
-        if !paths.is_empty() {
-            eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
-            return Ok(ExitCode::from(128));
-        }
-        let data = if f == "-" {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut std::io::stdin(), &mut buf)?;
-            buf
-        } else {
-            std::fs::read(&f)?
-        };
-        let sep = if pathspec_file_nul { b'\0' } else { b'\n' };
-        for part in data.split(|&c| c == sep) {
-            let mut s = part;
-            if !pathspec_file_nul && s.last() == Some(&b'\r') {
-                s = &s[..s.len() - 1];
-            }
-            if s.is_empty() {
-                continue;
-            }
-            paths.push(String::from_utf8_lossy(s).into_owned());
-        }
     }
 
     // `parse_args()` ends in `parse_pathspec(pathspec, 0, PATHSPEC_PREFER_FULL | …,

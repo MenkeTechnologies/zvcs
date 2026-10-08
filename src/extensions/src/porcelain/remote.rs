@@ -40,6 +40,7 @@ use gix::refs::{FullName, Target};
 ///     which a bare ref advertisement does not provide.
 pub fn remote(args: &[String]) -> Result<ExitCode> {
     let mut verbose = false;
+    let mut after_dashdash = false;
     let mut idx = 0;
     while let Some(orig) = args.get(idx).map(String::as_str) {
         // parse_options_step() tests `--help-all` with a `strcmp()` of its own,
@@ -65,6 +66,7 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
             // ctx->argv++; break; }`), so it ends option parsing and is never an
             // unknown option.
             "--" => {
+                after_dashdash = true;
                 idx += 1;
                 break;
             }
@@ -88,6 +90,14 @@ pub fn remote(args: &[String]) -> Result<ExitCode> {
     // `git_committer_info(0)`, which falls back to the system identity
     // instead of refusing as a commit would.
     crate::ensure_reflog_identity(&mut repo);
+
+    // The subcommand is only recognised by `parse_options()` ahead of a `--`
+    // (`PARSE_OPT_SUBCOMMAND_OPTIONAL`); whatever follows one is a leftover argument, which
+    // `cmd_remote()` answers with `unknown subcommand` even when it names a real one.
+    if let (true, Some(other)) = (after_dashdash, rest.first()) {
+        eprintln!("error: unknown subcommand: `{other}'");
+        return usage(USAGE_MAIN);
+    }
 
     match rest.first().map(String::as_str) {
         None => {

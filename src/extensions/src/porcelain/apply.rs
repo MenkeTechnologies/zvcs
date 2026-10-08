@@ -4026,6 +4026,11 @@ fn parse_hunk(
         if !recount && old_rem == 0 && new_rem == 0 {
             break;
         }
+        // `if (!len || line[len-1] != '\n') return -1;` — a last line cut off before its
+        // newline is not a body line, and the line reported is that line itself.
+        if raw.last() != Some(&b'\n') {
+            return Err(spans.corrupt_at(start, i));
+        }
         // A context line whose single leading space was stripped in transit is
         // still a context line; git accepts the bare newline.
         let (marker, body): (u8, &[u8]) = match raw.first() {

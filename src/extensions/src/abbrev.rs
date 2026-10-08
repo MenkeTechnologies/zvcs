@@ -11,12 +11,19 @@ use gix::bstr::ByteSlice;
 /// git's effective `core.abbrev`: an explicit number, `auto`/absent → derived
 /// from the object count, or `no`/`off`/`false` → the full hash length.
 pub fn configured_abbrev(repo: &gix::Repository, hexsz: usize) -> usize {
+    configured_abbrev_uncapped(repo, hexsz).min(hexsz)
+}
+
+/// [`configured_abbrev`] without the cap at the hash width: `default_abbrev` keeps whatever
+/// number `core.abbrev` named, and only `blame` can tell `40` (one column goes to the `^`
+/// mark) from `41` and up (the whole name) by it.
+pub fn configured_abbrev_uncapped(repo: &gix::Repository, hexsz: usize) -> usize {
     let value = repo
         .config_snapshot()
         .string("core.abbrev")
         .as_ref()
         .and_then(|v| v.to_str().ok().map(str::to_ascii_lowercase));
-    resolve(value, hexsz, || auto_abbrev(repo, hexsz))
+    resolve_uncapped(value, hexsz, || auto_abbrev(repo, hexsz))
 }
 
 /// git's `FALLBACK_DEFAULT_ABBREV` (object-name.h:140) — the width `auto` means
@@ -47,15 +54,32 @@ pub fn global_abbrev(hexsz: usize) -> usize {
 /// a value already lowercased: `auto` and an unreadable number defer to `auto`,
 /// a false-y word means the whole name, anything else is the number itself.
 fn resolve(value: Option<String>, hexsz: usize, auto: impl Fn() -> usize) -> usize {
+    resolve_uncapped(value, hexsz, auto).min(hexsz)
+}
+
+/// [`resolve`] before the cap at the hash width: a number past it stays as written.
+fn resolve_uncapped(value: Option<String>, hexsz: usize, auto: impl Fn() -> usize) -> usize {
     match value {
         None => auto(),
         Some(v) => match v.as_str() {
             "auto" => auto(),
-            "no" | "off" | "false" => hexsz,
-            other => other.parse::<usize>().unwrap_or_else(|_| auto()),
+            // The whole name, and then some: `blame -c core.abbrev=no` keeps all forty digits
+            // after the `^` mark, which only a length past `hexsz` does.
+            "no" | "off" | "false" => hexsz.max(MAX_HEXSZ),
+            // `git_config_int()`: the base-0 grammar, so `0x10` is sixteen, `010` is eight and `1k`
+            // is 1024. A length past the hash width prints the whole name
+            // (`repo_find_unique_abbrev_r()` caps it at `hexsz`, which [`resolve`] applies); one
+            // below `MINIMUM_ABBREV` is an `error()` that `validate` turns into the fatal.
+            other => match crate::optint::config_int(other) {
+                Ok(n) if n >= MINIMUM_ABBREV as i64 => n as usize,
+                _ => auto(),
+            },
         },
     }
 }
+
+/// `GIT_MAX_HEXSZ`: the width of the longest hash git knows.
+const MAX_HEXSZ: usize = 64;
 
 /// git's `MINIMUM_ABBREV`: the shortest id `--abbrev=<n>` can ask for.
 pub const MINIMUM_ABBREV: usize = 4;

@@ -417,6 +417,38 @@ mod abbrev {
 
     use crate::{bstr::ByteSlice, config, config::tree::core::Abbrev};
 
+    /// `git_parse_signed()`'s reading of a config integer: `strtoimax()` with base 0 — a `0x`
+    /// prefix is hexadecimal and a leading `0` is octal, so `core.abbrev = 0x10` is sixteen and
+    /// `010` is eight — followed by an optional `k`/`m`/`g` unit. `None` for anything else,
+    /// overflow included.
+    fn parse_c_integer(value: &crate::bstr::BStr) -> Option<i64> {
+        let s = std::str::from_utf8(value).ok()?.trim_start();
+        let (negative, s) = match s.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, s.strip_prefix('+').unwrap_or(s)),
+        };
+        let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Some(rest) => (16, rest),
+            None if s.len() > 1 && s.starts_with('0') => (8, &s[1..]),
+            None => (10, s),
+        };
+        let end = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
+        let (number, unit) = digits.split_at(end);
+        let magnitude = i64::from_str_radix(if number.is_empty() { "0" } else { number }, radix).ok()?;
+        if number.is_empty() && radix != 8 {
+            return None;
+        }
+        let factor: i64 = match unit {
+            "" => 1,
+            "k" | "K" => 1 << 10,
+            "m" | "M" => 1 << 20,
+            "g" | "G" => 1 << 30,
+            _ => return None,
+        };
+        let value = magnitude.checked_mul(factor)?;
+        Some(if negative { -value } else { value })
+    }
+
     impl Abbrev {
         /// Convert the given `hex_len_str` into the amount of characters that a short hash should have.
         /// If `None` is returned, the correct value can be determined based on the amount of objects in the repo.
@@ -440,16 +472,10 @@ mod abbrev {
                 if let Ok(false) = gix_config::Boolean::try_from(value_bytes).map(Into::into) {
                     Ok(object_hash.len_in_hex().into())
                 } else {
-                    let value = gix_config::Integer::try_from(value_bytes)
-                        .map_err(|_| Error {
-                            value: hex_len_str.into(),
-                            max,
-                        })?
-                        .to_decimal()
-                        .ok_or_else(|| Error {
-                            value: hex_len_str.into(),
-                            max,
-                        })?;
+                    let value = parse_c_integer(value_bytes).ok_or_else(|| Error {
+                        value: hex_len_str.into(),
+                        max,
+                    })?;
                     if value < 4 {
                         return Err(Error {
                             value: hex_len_str.into(),

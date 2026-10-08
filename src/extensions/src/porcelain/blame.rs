@@ -2027,7 +2027,7 @@ fn object_name_width(
         // `^` and shows 39 digits, while `--abbrev=41` and up show all 40 — a
         // ceiling here would collapse the two.
         Some(n) => n,
-        None => configured_abbrev(repo, hexsz).clamp(MINIMUM_ABBREV, hexsz),
+        None => crate::abbrev::configured_abbrev_uncapped(repo, hexsz).max(MINIMUM_ABBREV),
     };
     if width >= hexsz {
         return width;

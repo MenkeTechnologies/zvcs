@@ -1658,8 +1658,9 @@ pub(crate) fn parse_nonneg_int(s: &str) -> Option<i64> {
 ///
 /// `Some(code)` means the message was written and the command must exit with it.
 /// Short options whose value is the next argv entry when nothing is glued on, and
-/// which re-glue without an `=` (`-Sdd`, not `-S=dd`).
-const SHORT_GLUED_WHEN_SEPARATED: &[&str] = &["-S", "-G", "-I"];
+/// which re-glue without an `=` (`-Sdd`, not `-S=dd`). `-l` is `OPT_INTEGER` and
+/// `-O` `OPT_FILENAME`: both require a value, so both take the next entry too.
+const SHORT_GLUED_WHEN_SEPARATED: &[&str] = &["-S", "-G", "-I", "-l", "-O"];
 
 fn validate_render_value(flag: &str, value: &str) -> Option<ExitCode> {
     match flag {
@@ -1700,6 +1701,9 @@ fn validate_render_value(flag: &str, value: &str) -> Option<ExitCode> {
             eprintln!("{}", super::diff_optval::pickaxe_empty(flag.as_bytes()[1]));
             Some(ExitCode::from(USAGE_ERROR))
         }
+        // `-l` is `OPT_INTEGER`: the value is checked as parse-options checks it, whether it
+        // was glued on or taken from the next word.
+        "-l" => super::diff::parse_rename_limit(value).err(),
         _ => None,
     }
 }

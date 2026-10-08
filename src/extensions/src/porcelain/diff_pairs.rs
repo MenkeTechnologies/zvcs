@@ -1598,22 +1598,17 @@ pub(crate) fn render_raw_stream(
                     }
                 }
             }
+            // `-l<n>` is `OPT_INTEGER`: parse-options' integer wording, `k`/`m`/`g` suffixes included.
             "-l" => {
                 let v = want_value!(s.len());
-                match v.parse::<i64>() {
+                match super::diff::parse_rename_limit(&v) {
                     Ok(n) => opts.rename.rename_limit = n,
-                    Err(_) => {
-                        eprintln!("error: option `l' expects a numerical value");
-                        return Ok(Status::from(129));
-                    }
+                    Err(_) => return Ok(Status::from(129)),
                 }
             }
-            _ if s.starts_with("-l") => match s[2..].parse::<i64>() {
+            _ if s.starts_with("-l") => match super::diff::parse_rename_limit(&s[2..]) {
                 Ok(n) => opts.rename.rename_limit = n,
-                Err(_) => {
-                    eprintln!("error: option `l' expects a numerical value");
-                    return Ok(Status::from(129));
-                }
+                Err(_) => return Ok(Status::from(129)),
             },
             // `ita_invisible_in_index` is only consulted when a diff is computed against
             // the index (`diff-lib.c`). `diff-pairs` reads its pairs from stdin and never

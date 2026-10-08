@@ -191,14 +191,31 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
         positional.push(a.as_str());
     }
 
+    // `cmd_rerere()` parses its options first and only then reads the configuration —
+    // `git_config(git_xmerge_config, NULL)` — so a bad value never pre-empts `-h` or an
+    // option error, and it refuses every subcommand, the unknown ones included. The
+    // dispatcher leaves `rerere` to this order (`parse_before_config`), so its config gate
+    // runs here; the repository-settings block is built by the first index read, which
+    // only the bare form, `remaining` and `forget` reach.
+    crate::cmd_config::validate_xmerge(&repo).map_err(|r| r.into_error())?;
+
     match positional.first().copied() {
-        None => cmd_record(&repo, autoupdate),
+        None => {
+            load_settings(&repo)?;
+            cmd_record(&repo, autoupdate)
+        }
         Some("status") => cmd_status(&repo),
-        Some("remaining") => cmd_remaining(&repo),
+        Some("remaining") => {
+            load_settings(&repo)?;
+            cmd_remaining(&repo)
+        }
         Some("diff") => cmd_diff(&repo),
         Some("clear") => cmd_clear(&repo),
         Some("gc") => cmd_gc(&repo),
-        Some("forget") => cmd_forget(&repo, &positional[1..]),
+        Some("forget") => {
+            load_settings(&repo)?;
+            cmd_forget(&repo, &positional[1..])
+        }
         Some(_) => {
             eprint!("{USAGE}");
             Ok(ExitCode::from(129))
@@ -206,9 +223,26 @@ pub fn rerere(args: &[String]) -> Result<ExitCode> {
     }
 }
 
+/// `prepare_repo_settings()`, which refuses an unreadable `core.*` / `index.*` value.
+fn load_settings(repo: &gix::Repository) -> Result<()> {
+    crate::repo_settings::RepoSettings::load(repo).map_err(crate::fatal::die)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Subcommands
 // ---------------------------------------------------------------------------
+
+/// The path git opens for a recorded `path`: it is relative to the work-tree root, which
+/// is the cwd for every command that runs in a work tree. Without one (cwd inside the
+/// git directory) the C opens the bare name against the cwd, so the file is simply
+/// missing and the caller reports `could not open`.
+fn work_path(repo: &gix::Repository, path: impl AsRef<BStr>) -> PathBuf {
+    let path = path.as_ref();
+    repo.workdir_path(path)
+        .unwrap_or_else(|| PathBuf::from(path.to_os_str_lossy().into_owned()))
+}
+
 
 /// `rerere_status()`: print every path recorded in `MERGE_RR`, sorted.
 fn cmd_status(repo: &gix::Repository) -> Result<ExitCode> {
@@ -276,9 +310,7 @@ fn cmd_diff(repo: &gix::Repository) -> Result<ExitCode> {
         let fail = || anyhow::anyhow!("unable to generate diff for '{}'", id_dir.display());
 
         let minus = std::fs::read(variant_path(&id_dir, e.variant, "preimage")).map_err(|_| fail())?;
-        let worktree = repo
-            .workdir_path(&e.path)
-            .ok_or_else(|| crate::fatal::need_work_tree())?;
+        let worktree = work_path(repo, &e.path);
         let plus = std::fs::read(&worktree).map_err(|_| fail())?;
 
         out.extend_from_slice(b"--- a/");
@@ -700,9 +732,7 @@ fn rerere_one_path(
     // Has the user resolved it already? A conflict-marker-free worktree file
     // with a preimage on record *is* the resolution.
     if variant >= 0 && handle_file(repo, &path, marker_size, false, None)?.0 == 0 {
-        let Some(src) = repo.workdir_path(&path) else {
-            crate::git_fatal!("this operation must be run in a work tree");
-        };
+        let src = work_path(repo, &path);
         std::fs::copy(&src, variant_path(&id_dir, variant, "postimage"))
             .with_context(|| format!("could not write postimage for '{path}'"))?;
         dirs.fit(&rr_cache, &hex, variant as usize);
@@ -811,9 +841,7 @@ fn replay(
         let _ = f.set_modified(SystemTime::now());
     }
 
-    let Some(dst) = repo.workdir_path(path) else {
-        crate::git_fatal!("this operation must be run in a work tree");
-    };
+    let dst = work_path(repo, path);
     std::fs::write(&dst, &merged).with_context(|| format!("could not write '{path}'"))?;
     Ok(true)
 }
@@ -851,9 +879,7 @@ fn update_paths(repo: &gix::Repository, update: &[BString]) -> Result<()> {
     let mut index = read_index(repo)?;
 
     for path in update {
-        let Some(abs) = repo.workdir_path(path) else {
-            crate::git_fatal!("this operation must be run in a work tree");
-        };
+        let abs = work_path(repo, path);
         let md = gix::index::fs::Metadata::from_path_no_follow(&abs)?;
         let bytes = std::fs::read(&abs).with_context(|| format!("could not open '{path}'"))?;
         let id = repo.write_blob(&bytes)?.detach();
@@ -1170,9 +1196,7 @@ fn handle_file(
     want_hash: bool,
     output: Option<&Path>,
 ) -> Result<(i32, Option<gix::ObjectId>)> {
-    let Some(abs) = repo.workdir_path(path) else {
-        crate::git_fatal!("this operation must be run in a work tree");
-    };
+    let abs = work_path(repo, path);
     let data = match std::fs::read(&abs) {
         Ok(d) => d,
         Err(e) => {

@@ -1388,6 +1388,17 @@ fn reported(v: &ConfigValue, errors: Vec<String>) -> Rejection {
 // merge
 // ---------------------------------------------------------------------------
 
+/// `git_config(git_xmerge_config, NULL)` alone: what `git rerere` runs once its options
+/// are parsed (builtin/rerere.c `cmd_rerere`). `merge.conflictStyle` is the only key it
+/// reads itself; everything else falls through to `git_default_config()`.
+pub fn validate_xmerge(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_xmerge_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
 /// `repo_config(the_repository, git_merge_config, &merge_log_config)` —
 /// `cmd_merge` (builtin/merge.c:1400), after `show_usage_with_options_if_asked()`
 /// and before `parse_options()`, so it refuses `--abort`, `--quit` and

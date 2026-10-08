@@ -1006,7 +1006,7 @@ fn saved_opts<'a>(opts: &'a Opts<'a>, cleanup: Option<Cleanup>) -> crate::sequen
         // (sequencer.c:3711-3713), so an unsigned sequence records no key at all.
         gpg_sign: opts.gpg_sign,
         xopts: &opts.xopts,
-        allow_rerere_auto: None,
+        allow_rerere_auto: opts.rerere_auto,
         default_msg_cleanup: cleanup.map(Cleanup::name),
     }
 }
@@ -1943,7 +1943,7 @@ fn resume_todo(
         // sequence started — a resumed pick never re-checks them.
         keep_redundant_flag: loaded.keep_redundant_commits,
         empty_given: false,
-        rerere_auto: None,
+        rerere_auto: loaded.allow_rerere_auto,
     };
     let cleanup = match opts.cleanup {
         Some(raw) => match parse_cleanup(raw) {

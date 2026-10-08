@@ -188,6 +188,11 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         Ok(r) => r,
         Err(_) => return fatal("not a git repository (or any of the parent directories): .git"),
     };
+    // `cmd_mv()` runs `git_default_config` first (the dispatcher's gate) and
+    // `prepare_repo_settings()` only at `repo_read_index()`, after its option parse and
+    // operand count, so a bad settings value never pre-empts a usage error. The
+    // dispatcher leaves `mv` to this order (`parse_before_settings`).
+    crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
     let workdir = match repo.workdir() {
         Some(w) => w.to_owned(),
         None => return fatal("this operation must be run in a work tree"),

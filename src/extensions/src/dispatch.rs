@@ -1652,8 +1652,12 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // directory and the format checks — and from the repository it creates; see
         // [`init_config_gate`].
         || matches!(sub, "init" | "init-db");
+    // `cmd_mv()` runs `git_default_config` first but reaches `prepare_repo_settings()` at
+    // its `repo_read_index()`, after the option parse and the operand-count usage error;
+    // `porcelain::mv` keeps that order itself.
+    let parse_before_settings = sub == "mv";
     let settings_help_skip =
-        (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config;
+        (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config || parse_before_settings;
     let config_help_skip =
         (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config;
     let in_repo_settings =

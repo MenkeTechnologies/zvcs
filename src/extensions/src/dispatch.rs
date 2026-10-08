@@ -1356,6 +1356,64 @@ fn config_file_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
+/// Which configuration callback `git init` is running when it reads the repository it is
+/// creating.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum InitConfigPass {
+    /// `init_db()`'s `repo_config(git_default_core_config)` (setup.c): the `core.*` keys
+    /// alone, read before the skeleton is laid down.
+    Core,
+    /// `create_default_files()`'s `repo_config(git_default_config)` (setup.c), after the
+    /// templates were copied: every key `git_default_config()` checks.
+    Full,
+}
+
+/// The configuration gates `git init` / `git init-db` run, at the point `cmd_init_db()`
+/// reaches them rather than ahead of the command.
+///
+/// `cmd_init_db()` parses its options, enters the operand directory (creating it), validates
+/// `--object-format` / `--ref-format` and only then reads configuration — the files of the
+/// git directory it is initialising (`./.git`, or `$GIT_DIR`), not those of whatever
+/// repository the cwd was in. [`InitConfigPass::Core`] also carries the repository-format
+/// reads (`read_and_verify_repository_format()`), which precede the `core.*` walk.
+///
+/// `git_dir` stands in for `$GIT_DIR` while the gates run, because they locate the
+/// repository through it. Returns the exit code to leave with, as the other gates do.
+pub(crate) fn init_config_gate(
+    sub: &str,
+    git_dir: &std::path::Path,
+    pass: InitConfigPass,
+) -> Result<Option<ExitCode>> {
+    struct GitDirEnv(Option<std::ffi::OsString>);
+    impl Drop for GitDirEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("GIT_DIR", previous),
+                None => std::env::remove_var("GIT_DIR"),
+            }
+        }
+    }
+    let _restore = GitDirEnv(std::env::var_os("GIT_DIR"));
+    std::env::set_var("GIT_DIR", git_dir);
+
+    if pass == InitConfigPass::Core {
+        if let Some(code) = config_file_gate(sub, &[]) {
+            return Ok(Some(code));
+        }
+        if let Some(code) = repository_format_gate(sub, &[]) {
+            return Ok(Some(code));
+        }
+    }
+    let repo = crate::setup::discover().ok();
+    let mut values = crate::config::walk_config_gently(repo.as_ref());
+    if pass == InitConfigPass::Core {
+        values.retain(|v| v.key.starts_with("core."));
+    }
+    crate::default_config::validate_values(values)
+        .map_err(crate::default_config::Rejection::into_error)?;
+    Ok(None)
+}
+
 /// Whether `refs/stash` exists, i.e. whether `list_stash()` would reach its
 /// `git log` child at all (builtin/stash.c:963-964). Used only to decide
 /// whether that child's config refusals are owed.
@@ -1487,11 +1545,16 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     if let Some(code) = run_setup_gate(sub, args) {
         return Ok(code);
     }
-    if let Some(code) = config_file_gate(sub, args) {
-        return Ok(code);
-    }
-    if let Some(code) = repository_format_gate(sub, args) {
-        return Ok(code);
+    // `init` reads the configuration of the repository it is about to create, not the one
+    // the cwd happens to sit in, and only after it has entered (and created) its operand
+    // directory: `porcelain::init` runs these gates itself, see [`init_config_gate`].
+    if !matches!(sub, "init" | "init-db") {
+        if let Some(code) = config_file_gate(sub, args) {
+            return Ok(code);
+        }
+        if let Some(code) = repository_format_gate(sub, args) {
+            return Ok(code);
+        }
     }
 
     // `handle_builtin()` (git.c): `git <cmd> --help` is rewritten to
@@ -1582,7 +1645,11 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // `cmd_unpack_file()` resolves its operand, so it reports a usage error or an
         // unknown name, ahead of `repo_config(git_default_config)`
         // (builtin/unpack-file.c); `porcelain::unpack_file` keeps that order.
-        || sub == "unpack-file";
+        || sub == "unpack-file"
+        // `cmd_init_db()` reads configuration last — after its options, its operand
+        // directory and the format checks — and from the repository it creates; see
+        // [`init_config_gate`].
+        || matches!(sub, "init" | "init-db");
     let settings_help_skip =
         (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config;
     let config_help_skip =

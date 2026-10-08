@@ -568,6 +568,16 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             return Ok(fatal(&format!("unknown ref storage format '{fmt}'")));
         }
     }
+    // `read_and_verify_repository_format()` and `init_db()`'s
+    // `repo_config(git_default_core_config)`: the git directory being initialised is read
+    // here, after the operand directory exists and the formats were validated — never the
+    // configuration of the repository the cwd was in. The dispatcher leaves `init` to this
+    // order (`parse_before_config`).
+    if let Some(code) =
+        crate::dispatch::init_config_gate("init", &git_dir, crate::dispatch::InitConfigPass::Core)?
+    {
+        return Ok(code);
+    }
     // `repository_format_configure()` (setup.c:2765-2838) for a repository that already exists.
     // The command line wins (and was checked against the repository above); the environment
     // only fills a format the repository does not record (`repo_fmt->version < 0`); after that
@@ -705,6 +715,27 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
             }
         }
         None => copy_default_template(&template_dir)?,
+    }
+
+    // `create_default_files()`: the templates are in place, so `repo_config(git_default_config)`
+    // now also sees a `config` they brought, and every key `git_default_config()` checks is
+    // refused here — after the templates were copied, unlike the `core.*` keys above, and
+    // before `config`, `HEAD`, `objects/` and `refs/` exist. gix laid those down together
+    // with the skeleton, so a refusal takes them back out of a repository that did not exist
+    // before (`remove_dir` leaves anything non-empty alone).
+    if let Err(refusal) =
+        crate::dispatch::init_config_gate("init", &git_dir, crate::dispatch::InitConfigPass::Full)
+    {
+        if !reinit {
+            let _ = std::fs::remove_file(git_dir.join("config"));
+            if !reftable {
+                let _ = std::fs::remove_file(git_dir.join("HEAD"));
+            }
+            for dir in ["objects/pack", "objects/info", "objects", "refs/heads", "refs/tags", "refs"] {
+                let _ = std::fs::remove_dir(git_dir.join(dir));
+            }
+        }
+        return Err(refusal);
     }
 
     if let Some(repo) = repo.as_ref() {

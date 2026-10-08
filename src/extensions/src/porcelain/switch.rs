@@ -1589,6 +1589,9 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
 /// Remove every tracked file from the worktree (pruning emptied parent dirs) and
 /// write an empty index — the state a `--orphan` switch leaves behind.
 fn clear_tracked_worktree(repo: &gix::Repository, old: &gix::index::File) -> Result<()> {
+    // The refresh behind the clean-gate holds the pre-clear index; this step supersedes it, and
+    // the final flush must not write it back over the emptied one.
+    let _ = crate::held_index::take();
     let workdir = repo.workdir().map(|p| p.to_owned());
     {
         let backing = old.path_backing();

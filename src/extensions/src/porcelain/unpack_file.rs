@@ -112,6 +112,11 @@ pub fn unpack_file(args: &[String]) -> Result<ExitCode> {
         }
     };
 
+    // `repo_config(the_repository, git_default_config, NULL)` follows `repo_get_oid()`
+    // (builtin/unpack-file.c), so an unknown name is reported ahead of a bad value. The
+    // dispatcher leaves `unpack-file` to this order (`parse_before_config`).
+    crate::default_config::validate(&repo).map_err(crate::default_config::Rejection::into_error)?;
+
     // The object must be a blob, and the diagnostic names the resolved id — not
     // the spec the user typed.
     let object = match repo.find_object(oid) {

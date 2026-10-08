@@ -227,9 +227,18 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
     };
 
     let Some(rev) = opts.rev.as_deref() else {
-        eprintln!("error: command expects a single revision");
+        // `cmd_history_split()` takes a committish and trailing pathspecs, so it words the
+        // missing operand differently (builtin/history.c:963 vs :552, :731, :1111).
+        let what = if sub == Sub::Split { "a committish" } else { "a single revision" };
+        eprintln!("error: command expects {what}");
         return Ok(ExitCode::from(EXIT_DIE));
     };
+
+    // Every `cmd_history_*()` parses its options, checks the operand count and only then
+    // runs `repo_config(repo, git_default_config, NULL)` (builtin/history.c:555, :734,
+    // :966, :1114). The dispatcher leaves `history` to this order
+    // (`parse_before_config`), so a bad value never pre-empts a usage error.
+    crate::default_config::validate(&repo).map_err(crate::default_config::Rejection::into_error)?;
 
     // `fixup` reads staged changes, so it needs an index and a worktree.
     if sub == Sub::Fixup && repo.worktree().is_none() {
@@ -247,6 +256,12 @@ pub fn history(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: commit cannot be found: {rev}");
         return Ok(ExitCode::from(EXIT_DIE));
     }
+
+    // `setup_revwalk()` -> `repo_init_revisions()`: the repository-settings block comes
+    // after the commit lookup — measured against git 2.56.0,
+    // `-c core.packedGitLimit=bogus history reword nonexist` still reports the missing
+    // commit.
+    crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
 
     let original = commit.expect("checked above").id;
     // `if (action == REF_ACTION_DEFAULT) action = REF_ACTION_BRANCHES;`
@@ -454,6 +469,15 @@ fn split(
     // reported before a merge at the target.
     if repo.find_commit(original)?.parent_ids().count() > 1 {
         return Ok(Err("cannot split up merge commit".into()));
+    }
+
+    // The hunk selector diffs through `git_diff_basic_config`; a value it refuses is a
+    // `fatal:` followed by the caller's `error: could not parse diff` at 255. The other
+    // subcommands never reach that callback before their own checks (measured against
+    // git 2.56.0 with `-c diff.renameLimit=bogus`: `drop`, `fixup` and `reword` carry on).
+    if let Err(rejection) = crate::diff_config::validate_basic(repo) {
+        eprintln!("fatal: {}", rejection.into_fatal());
+        return Ok(Err("could not parse diff".into()));
     }
 
     let rewritten = match split_commit(repo, original, &opts.pathspecs)? {
@@ -1021,6 +1045,11 @@ fn handle_reference_updates(
     dry_run: bool,
     empty: EmptyAction,
 ) -> Outcome {
+    // The replay diffs through `git_diff_basic_config`, read once the rewritten commit
+    // exists (measured against git 2.56.0: `-c diff.renameLimit=bogus history reword HEAD`
+    // is `fatal:` at 128 where the earlier checks — identity, a root commit, nothing
+    // staged — still win).
+    crate::diff_config::validate_basic(repo).map_err(|r| r.into_error())?;
     let updates = match compute_pending_ref_updates(repo, order, action, original, rewritten, empty)? {
         Ok(u) => u,
         Err(ReplayFailed::Conflict) => return Ok(Ok(())),

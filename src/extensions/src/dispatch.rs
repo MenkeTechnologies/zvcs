@@ -1575,7 +1575,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     let parse_before_config = (sub == "sparse-checkout"
         && crate::porcelain::sparse_checkout_top_level_refused(args))
         || (sub == "var" && (args.len() != 1 || args[0] == "-l"))
-        || sub == "rerere";
+        || sub == "rerere"
+        // `cmd_history_*()` parse options and count operands ahead of
+        // `repo_config(git_default_config)`; `porcelain::history` keeps that order.
+        || sub == "history"
+        // `cmd_unpack_file()` resolves its operand, so it reports a usage error or an
+        // unknown name, ahead of `repo_config(git_default_config)`
+        // (builtin/unpack-file.c); `porcelain::unpack_file` keeps that order.
+        || sub == "unpack-file";
     let settings_help_skip =
         (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config;
     let config_help_skip =

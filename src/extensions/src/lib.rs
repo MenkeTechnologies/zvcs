@@ -1066,8 +1066,14 @@ fn run_command(argv: &[String]) -> ExitCode {
         Err(e) if fatal::lock_held_fatal(&e).is_some() => {
             let msg = fatal::lock_held_fatal(&e).expect("checked");
             trace2::error(&msg);
-            eprintln!("fatal: {msg}");
-            ExitCode::from(fatal::EXIT_FATAL)
+            // The sequencer reports a failed ref update with `error()` and ends the command at 1.
+            if matches!(sub.as_str(), "cherry-pick" | "revert") {
+                eprintln!("error: {msg}");
+                ExitCode::FAILURE
+            } else {
+                eprintln!("fatal: {msg}");
+                ExitCode::from(fatal::EXIT_FATAL)
+            }
         }
         // A `packed-refs` record the parser refuses is a `die()` inside the
         // packed backend (`die_invalid_line()`, refs/packed-backend.c:257-268,

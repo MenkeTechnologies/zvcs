@@ -187,6 +187,24 @@ mod filter {
         };
 
         impl CheckRoundTripEncoding {
+            /// Like [`try_into_encodings()`](Self::try_into_encodings()), but a label no encoding answers
+            /// to is dropped instead of failing.
+            ///
+            /// git keeps the value as a plain string (`git_config_string()`) and only compares it with a
+            /// file's encoding when a round trip is checked, so such a label never matches and is never
+            /// an error.
+            pub fn into_known_encodings(value: Option<impl gix_utils::AsBStr>) -> Vec<&'static gix_filter::encoding::Encoding> {
+                match value {
+                    None => vec![gix_filter::encoding::SHIFT_JIS],
+                    Some(value) => value
+                        .as_bstr()
+                        .split(|b| *b == b',' || *b == b' ')
+                        .filter(|e| !e.trim().is_empty())
+                        .filter_map(|label| gix_filter::encoding::Encoding::for_label(label.trim()))
+                        .collect(),
+                }
+            }
+
             /// Convert `value` into a list of encodings, which are either space or coma separated. Fail if an encoding is unknown.
             /// If `None`, the default is returned.
             pub fn try_into_encodings(

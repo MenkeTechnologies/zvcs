@@ -15,6 +15,17 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+/// Held while a stub is being written and across every `fork()`. libtest runs these tests
+/// on parallel threads, so a fork that lands while another test still has its stub open
+/// for writing hands that descriptor to the child, and the stub then cannot be exec'd
+/// (`ETXTBSY` on Linux); the delegate silently falls back to running in-process.
+static FORK_LOCK: Mutex<()> = Mutex::new(());
+
+fn fork_guard() -> MutexGuard<'static, ()> {
+    FORK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zvcs-hosted-fork-{name}-{}", std::process::id()));
@@ -24,6 +35,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn script(dir: &Path, body: &str) -> PathBuf {
+    let _guard = fork_guard();
     let path = dir.join("zvcs-stub");
     std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -35,7 +47,11 @@ fn script(dir: &Path, body: &str) -> PathBuf {
 fn in_fork(child: impl FnOnce() -> i32) -> libc::c_int {
     // Safety: the child only runs `child` and then `_exit`s, never returning
     // into the test harness.
-    match unsafe { libc::fork() } {
+    let pid = {
+        let _guard = fork_guard();
+        unsafe { libc::fork() }
+    };
+    match pid {
         -1 => panic!("fork: {}", std::io::Error::last_os_error()),
         0 => {
             let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(child)).unwrap_or(101);

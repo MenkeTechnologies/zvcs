@@ -843,10 +843,12 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     // not the same set:
     //
     // * `skip_worktree_entries` is `PS_IGNORE_SKIP_WORKTREE`
-    //   (pathspec.c:50-55, via `prune_directory()`): `seen` is computed with that
-    //   flag, so an entry carrying the `skip-worktree` bit never marks a pathspec
-    //   matched. It tests the BIT ONLY, and it applies whether or not `--sparse`
-    //   was given.
+    //   (pathspec.c add_pathspec_matches_against_index, via `prune_directory()`):
+    //   `seen` is computed with that flag, so an entry carrying the `skip-worktree`
+    //   bit, or one the sparse-checkout definition leaves out, never marks a
+    //   pathspec matched. The second half matters once
+    //   `clear_skip_worktree_from_present_files()` has dropped the bit of a file that
+    //   is on disk. It applies whether or not `--sparse` was given.
     // * `sparse_hidden` is `find_pathspecs_matching_skip_worktree()`
     //   (pathspec.c:76-89): the bit OR a path the definition excludes. A pathspec
     //   that matched nothing else but matches one of these is
@@ -856,11 +858,14 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     //   what [`skipped_as_sparse`] folds in.
     let (skip_worktree_entries, sparse_hidden): (HashSet<BString>, HashSet<BString>) = {
         let backing = index.path_backing();
+        let definition = sparsity_to_consult(&repo, false)?;
         let mut bit = HashSet::new();
         let mut hidden = HashSet::new();
         for e in index.entries().iter().filter(|e| e.stage() == Stage::Unconflicted) {
             let path = e.path_in(backing);
-            if e.flags.contains(Flags::SKIP_WORKTREE) {
+            if e.flags.contains(Flags::SKIP_WORKTREE)
+                || definition.as_ref().is_some_and(|s| !s.includes(&path.to_str_lossy()))
+            {
                 bit.insert(path.to_owned());
             }
             if skipped_as_sparse(e.flags, path, include_sparse, sparsity.as_ref()) {

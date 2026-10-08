@@ -1569,9 +1569,13 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // `cmd_var()` checks `argc != 2` and answers with `usage()` before it reads
     // any configuration, and `-l` lists the configuration before anything
     // validates it (builtin/var.c:225-234); see `porcelain::var`.
+    // `cmd_rerere()` parses its options and then walks the configuration itself with
+    // `git_xmerge_config` (builtin/rerere.c:67-69), so the dispatcher's own walk would
+    // be a second one and every diagnostic would come out twice.
     let parse_before_config = (sub == "sparse-checkout"
         && crate::porcelain::sparse_checkout_top_level_refused(args))
-        || (sub == "var" && (args.len() != 1 || args[0] == "-l"));
+        || (sub == "var" && (args.len() != 1 || args[0] == "-l"))
+        || sub == "rerere";
     let settings_help_skip =
         (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config;
     let config_help_skip =

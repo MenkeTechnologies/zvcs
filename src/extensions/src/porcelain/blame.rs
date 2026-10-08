@@ -749,13 +749,13 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // runs from `handle_revision_opt()` and dies there on a format it cannot
     // read — `git annotate --date=bogus` is fatal even though the mode it would
     // have produced is then discarded.
-    let from_argv = match opts.date_arg.take() {
-        Some(s) => match resolve_date_mode(&s)? {
-            DateOutcome::Mode(m) => Some(m),
+    let mut from_argv = None;
+    for s in std::mem::take(&mut opts.date_args) {
+        match resolve_date_mode(&s)? {
+            DateOutcome::Mode(m) => from_argv = Some(m),
             DateOutcome::Fatal(code) => return Ok(code),
-        },
-        None => None,
-    };
+        }
+    }
     opts.date_mode = if cmd == "annotate" {
         let mut mode = date_default.mode.clone();
         mode.kind = crate::showdate::DateType::Iso8601;
@@ -4811,7 +4811,10 @@ struct Options {
     /// that does *not* turn it on, unlike `git diff`.
     textconv: bool,
     /// Raw `--date` value before repo-side validation; `None` if not given.
-    date_arg: Option<String>,
+    /// Every `--date` in argv order: each one is `parse_date_format()`-ed when
+    /// `handle_revision_opt()` reaches it, so a bad one dies even when a later
+    /// `--date` would have replaced it.
+    date_args: Vec<String>,
     /// Resolved date mode for the human-format timestamp column, after applying
     /// blame.date and any `--date` override.
     date_mode: DateMode,
@@ -5100,7 +5103,7 @@ impl Options {
         let mut ignore_rev: Vec<String> = Vec::new();
         let mut ignore_revs_file: Vec<String> = ignore_revs_file_default;
         // Raw `--date` value (last one wins); resolved against the repo in `blame`.
-        let mut date_arg: Option<String> = None;
+        let mut date_args: Vec<String> = Vec::new();
         // Positionals before the first `--`; `post` collects those after it.
         // `post.is_some()` means a `--` separator was seen.
         let mut pre: Vec<String> = Vec::new();
@@ -5289,10 +5292,10 @@ impl Options {
                             .expect("--date is in REV_OPT_REVISION_VALUE");
                         return Ok(ParseOutcome::Reported(code));
                     };
-                    date_arg = Some(v.clone());
+                    date_args.push(v.clone());
                 }
                 _ if a.starts_with("--date=") => {
-                    date_arg = Some(a["--date=".len()..].to_string());
+                    date_args.push(a["--date=".len()..].to_string());
                 }
                 "--diff-algorithm" => {
                     i += 1;
@@ -5598,7 +5601,7 @@ impl Options {
             mark_unblamable_lines,
             mark_ignored_lines,
             textconv,
-            date_arg,
+            date_args,
             // Overwritten in `blame` once blame.date / `--date` are resolved.
             date_mode: DateMode::iso8601(),
         })))

@@ -372,6 +372,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 errors |= ERROR_REACHABLE;
             }
             Some(id) => {
+                // `parse_object()` on a loose file that exists but will not inflate dies
+                // (`loose object … is corrupt`) while the arguments are still being read,
+                // ahead of every object check below.
+                if let Some(code) = unreadable_unreachable_object(&repo, id, 2) {
+                    return Ok(code);
+                }
                 default_refs += 1;
                 // `snapshot_ref()` calls `parse_object()`, which creates the
                 // object and then parses it — and the parse creates the links it
@@ -1331,7 +1337,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             let header = match repo.find_header(id) {
                 Ok(header) => header,
                 Err(_) => {
-                    if let Some(code) = unreadable_unreachable_object(&repo, id) {
+                    if let Some(code) = unreadable_unreachable_object(&repo, id, 3) {
                         return Ok(code);
                     }
                     continue;
@@ -2457,7 +2463,15 @@ fn loose_object_label(repo: &gix::Repository, id: ObjectId) -> Option<String> {
 /// Each read prints zlib's complaint and then `unable to unpack %s header`
 /// naming the **oid** — `read_loose_object()`'s scan-time walk is the one that
 /// names the file instead (see [`read_loose_object`]).
-fn unreadable_unreachable_object(repo: &gix::Repository, id: ObjectId) -> Option<ExitCode> {
+///
+/// `reads` is how many of them the caller makes: three from the unreachable-object walk, two from
+/// `snapshot_ref()`'s `parse_object()` of an explicit `<object>` argument (the type probe in
+/// front of it only `lstat()`s).
+fn unreadable_unreachable_object(
+    repo: &gix::Repository,
+    id: ObjectId,
+    reads: usize,
+) -> Option<ExitCode> {
     let path = loose_object_path(repo, id)?;
     let map = std::fs::read(&path).ok()?;
     let mut diag: Vec<String> = Vec::new();
@@ -2469,7 +2483,7 @@ fn unreadable_unreachable_object(repo: &gix::Repository, id: ObjectId) -> Option
             diag.push(format!("error: unable to unpack {id} header"));
         }
     }
-    for _ in 0..3 {
+    for _ in 0..reads {
         for line in &diag {
             eprintln!("{line}");
         }

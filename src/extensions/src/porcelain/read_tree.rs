@@ -220,6 +220,26 @@ fn write_options(repo: &gix::Repository, o: &Opts) -> gix::index::write::Options
     }
 }
 
+/// `write_locked_index()` for the result: with `--index-output=<file>` the lock is `<file>.lock`,
+/// and a lock that cannot be created (the directory is missing, say) ends the command with
+/// `fatal: unable to write new index file` where the default index would have been locked
+/// ahead of the read. A lock that already exists is left for the writer's own diagnostic.
+fn write_index(repo: &gix::Repository, index: &mut gix::index::File, o: &Opts) -> Result<()> {
+    if let Some(out) = &o.index_output {
+        let mut lock = out.clone().into_os_string();
+        lock.push(".lock");
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&lock);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => crate::git_fatal!("unable to write new index file"),
+        }
+    }
+    crate::index_racy::write_with(repo, index, write_options(repo, o))?;
+    Ok(())
+}
+
 /// `o->internal.result.version = o->src_index->version` (unpack-trees.c:1940): the
 /// result of a merge-like read is written in the version of the index it replaces,
 /// so `GIT_INDEX_VERSION` / `index.version` only decide when that index was never on
@@ -1001,7 +1021,7 @@ fn finish(o: Opts) -> Result<ExitCode> {
         }
         _ => super::write_tree::rebuild_cache_tree(&repo, &mut new_index),
     }
-    crate::index_racy::write_with(&repo, &mut new_index, write_options(&repo, &o))?;
+    write_index(&repo, &mut new_index, &o)?;
     // `core.fsync=index` (or an aggregate that contains it) hardens the index git
     // has just rewritten; the default set does not, so this is normally a no-op.
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
@@ -1461,7 +1481,7 @@ fn multi_tree_read(
     // an unmerged path — comes out invalid.
     super::write_tree::carry_untracked_cache(old, &mut new_index);
     super::write_tree::rebuild_cache_tree(repo, &mut new_index);
-    crate::index_racy::write_with(repo, &mut new_index, write_options(repo, o))?;
+    write_index(repo, &mut new_index, o)?;
     fsync.harden_path(crate::config::FsyncComponent::Index, new_index.path());
     Ok(ExitCode::SUCCESS)
 }

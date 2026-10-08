@@ -86,6 +86,9 @@ fn run(cwd: &Path, args: &[&str]) -> Output {
         .env_remove("GIT_REFLOG_ACTION")
         .env_remove("EDITOR")
         .env_remove("VISUAL")
+        // `--squash` without `-m` opens the editor; pin it rather than inherit
+        // whatever the developer (or nothing, on a CI runner) has set.
+        .env("GIT_EDITOR", "true")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_AUTHOR_NAME", "A U Thor")

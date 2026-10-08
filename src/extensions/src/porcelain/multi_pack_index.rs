@@ -117,7 +117,7 @@
 
 use anyhow::{bail, Result};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
@@ -1383,6 +1383,10 @@ fn expire(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
 /// itself is not — see the module docs for the missing `gix-pack` substrate.
 fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut positional: Vec<&str> = Vec::new();
+    // `MIDX_WRITE_INCREMENTAL` and `MIDX_WRITE_NO_CHAIN`: `OPT_BIT` and `OPT_NEGBIT` over one
+    // flag word, so the last spelling of each wins.
+    let mut incremental = false;
+    let mut no_chain = false;
     let mut after_dd = false;
     let mut it = rest.iter().copied();
     while let Some(orig) = it.next() {
@@ -1424,13 +1428,11 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             }
             // Accepted by git's compact option array; each only steers the write
             // of the compacted layer, which is unported and bails below anyway.
-            "--bitmap"
-            | "--no-bitmap"
-            | "--incremental"
-            | "--no-incremental"
-            | "--write-chain-file"
-            | "--no-write-chain-file"
-            | "--no-base" => {}
+            "--bitmap" | "--no-bitmap" | "--no-base" => {}
+            "--incremental" => incremental = true,
+            "--no-incremental" => incremental = false,
+            "--write-chain-file" => no_chain = false,
+            "--no-write-chain-file" => no_chain = true,
             "--base" => match it.next() {
                 Some(_) => {}
                 None => {
@@ -1454,6 +1456,15 @@ fn compact(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         return Ok(usage_error(None, COMPACT_USAGE));
     }
     let (from, to) = (positional[0], positional[1]);
+
+    // `cmd_multi_pack_index_compact()` (builtin/multi-pack-index.c): checked before the
+    // object directory is looked at.
+    if no_chain && !incremental {
+        return Ok(usage_error(
+            Some("cannot use --no-write-chain-file without --incremental"),
+            COMPACT_USAGE,
+        ));
+    }
 
     let (_repo, pack_dir) = object_store(object_dir)?;
     let layers = midx_chain_layers(&pack_dir);
@@ -1958,7 +1969,22 @@ fn midx_chain_layers(pack_dir: &Path) -> Vec<String> {
 /// The repository and its `<objdir>/pack` directory, honouring `--object-dir`.
 fn object_store(object_dir: Option<PathBuf>) -> Result<(gix::Repository, PathBuf)> {
     let repo = crate::setup::discover()?;
-    let objdir = object_dir.unwrap_or_else(|| repo.objects.store_ref().path().to_path_buf());
+    let primary = repo.objects.store_ref().path().to_path_buf();
+    let objdir = object_dir.unwrap_or_else(|| primary.clone());
+
+    // `handle_object_dir_option()` (builtin/multi-pack-index.c:89-96): `odb_find_source()`
+    // compares the real path of the directory with that of the repository's own object
+    // directory and of each alternate.
+    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let wanted = real(&objdir);
+    let mut sources = vec![primary];
+    sources.extend(repo.objects.store_ref().alternate_db_paths().unwrap_or_default());
+    if !sources.iter().any(|source| real(source) == wanted) {
+        crate::git_fatal!(
+            "object directory is not an alternate of the current repository: '{}'",
+            objdir.display()
+        );
+    }
     let pack_dir = objdir.join("pack");
     Ok((repo, pack_dir))
 }
@@ -2007,19 +2033,69 @@ fn take_common<'a>(
         }
         "--object-dir" => match it.next() {
             Some(v) => {
-                *object_dir = Some(PathBuf::from(v));
+                *object_dir = Some(real_pathdup(v)?);
                 Ok(Common::Consumed)
             }
             None => Ok(Common::MissingValue("object-dir")),
         },
         _ => match a.strip_prefix("--object-dir=") {
             Some(v) => {
-                *object_dir = Some(PathBuf::from(v));
+                *object_dir = Some(real_pathdup(v)?);
                 Ok(Common::Consumed)
             }
             None => Ok(Common::NotCommon),
         },
     }
+}
+
+/// `real_pathdup(arg, 1)` (abspath.c `strbuf_realpath()` with `REALPATH_DIE_ON_ERROR`), which
+/// `parse_object_dir()` runs the moment the option is read: every component but the last has
+/// to exist, the last may be missing, and the first that fails dies as
+/// `Invalid path '<path up to it>': <strerror>`.
+///
+/// The argument is taken relative to the process's working directory, not to the prefix —
+/// `OPT_CALLBACK` hands the raw string over.
+fn real_pathdup(arg: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let mut resolved = std::env::current_dir()?;
+    let mut components = Path::new(arg).components().peekable();
+    if arg.starts_with('/') {
+        resolved = PathBuf::from("/");
+    }
+    while let Some(component) = components.next() {
+        match component {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        // Follow it the way the kernel would, then carry on from the target.
+                        resolved = fs::canonicalize(&resolved).map_err(|e| {
+                            crate::fatal::die(format!(
+                                "Invalid path '{}': {}",
+                                resolved.display(),
+                                crate::external::strerror(&e)
+                            ))
+                        })?;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && components.peek().is_none() => {}
+                    Err(e) => {
+                        return Err(crate::fatal::die(format!(
+                            "Invalid path '{}': {}",
+                            resolved.display(),
+                            crate::external::strerror(&e)
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// Every `*.idx` in `dir` whose `.pack` sibling exists, sorted — the set

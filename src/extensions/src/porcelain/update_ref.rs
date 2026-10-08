@@ -785,12 +785,19 @@ fn chain(e: &dyn std::error::Error) -> String {
     out
 }
 
-/// git's `ref_transaction_prepare` check: the object a ref is about to point at
-/// has to exist. The `<old-oid>` guard is deliberately exempt.
+/// git's `ref_transaction_update` checks on the object a ref is about to point
+/// at: it has to exist, and a branch (`HEAD` or `refs/heads/*`, `is_branch()`)
+/// may only hold a commit — the object's own type, so an annotated tag aimed at
+/// a commit is refused too. The `<old-oid>` guard is deliberately exempt.
 fn check_new_object(repo: &gix::Repository, name: &str, new: &Val) -> Result<()> {
     if let Val::Oid(id) = new {
-        if !repo.has_object(*id) {
+        let Ok(header) = repo.find_header(*id) else {
             crate::git_fatal!("trying to write ref '{name}' with nonexistent object {id}");
+        };
+        if header.kind() != gix::object::Kind::Commit
+            && (name == "HEAD" || name.starts_with("refs/heads/"))
+        {
+            crate::git_fatal!("trying to write non-commit object {id} to branch '{name}'");
         }
     }
     Ok(())

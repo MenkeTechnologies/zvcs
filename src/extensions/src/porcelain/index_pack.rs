@@ -2151,31 +2151,37 @@ fn validate_fsck_msg_types(values: &str) -> std::result::Result<(), ExitCode> {
 /// `0`, decimal otherwise. A negative value wraps as C does, which always
 /// leaves it above any limit the caller accepts.
 fn strtoul(s: &str, base: u32) -> (u64, &str) {
-    let (negative, digits_at) = match s.as_bytes().first() {
+    // `isspace()` in the C locale: space, \t, \n, \v, \f, \r.
+    let trimmed = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits_at) = match trimmed.as_bytes().first() {
         Some(b'-') => (true, 1),
         Some(b'+') => (false, 1),
         _ => (false, 0),
     };
-    let body = &s[digits_at..];
+    let body = &trimmed[digits_at..];
 
+    // A `0x` prefix counts only when a hex digit follows it; otherwise the `0` is the
+    // whole number and the `x` stays in the tail.
+    let has_hex_prefix = (body.starts_with("0x") || body.starts_with("0X"))
+        && body[2..].starts_with(|c: char| c.is_ascii_hexdigit());
     let (base, body_at) = match base {
-        0 if body.starts_with("0x") || body.starts_with("0X") => (16, 2),
-        0 if body.starts_with('0') && body.len() > 1 => (8, 1),
+        0 if has_hex_prefix => (16, 2),
+        0 if body.starts_with('0') => (8, 0),
         0 => (10, 0),
         b => (b, 0),
     };
-    let body = &body[body_at..];
+    let digits = &body[body_at..];
 
-    let end = body
+    let end = digits
         .find(|c: char| !c.is_digit(base))
-        .unwrap_or(body.len());
+        .unwrap_or(digits.len());
     if end == 0 {
-        // Nothing was consumed, so neither was the sign or the base prefix.
+        // No digits at all: nothing was consumed, so `endptr` is the original `s`.
         return (0, s);
     }
-    let value = u64::from_str_radix(&body[..end], base).unwrap_or(u64::MAX);
+    let value = u64::from_str_radix(&digits[..end], base).unwrap_or(u64::MAX);
     let value = if negative { value.wrapping_neg() } else { value };
-    (value, &body[end..])
+    (value, &digits[end..])
 }
 
 /// `strbuf_humanise_bytes()` from `strbuf.c`, used for the `--max-input-size`

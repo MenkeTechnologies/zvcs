@@ -13900,6 +13900,10 @@ impl PathspecMatcher {
     /// list — git treats "no pathspec" as "no limiting", not as a set that matches
     /// nothing — so this is only ever handed a non-empty one.
     pub(crate) fn new<S: AsRef<[u8]>>(repo: &gix::Repository, specs: &[S]) -> Result<Self> {
+        // `init_pathspec_magic()`: contradictory global settings die at the first element parsed.
+        if let Some(msg) = crate::pathspec::global_magic_fatal() {
+            return Err(crate::fatal::die(msg));
+        }
         // git's `parse_pathspec()` runs over the whole list before the command does
         // anything, and every way it can fail is a `die()`. gitoxide raises the same
         // failures from inside the constructor below, where `?` would render them in

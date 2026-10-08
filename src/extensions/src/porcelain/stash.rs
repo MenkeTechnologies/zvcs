@@ -778,6 +778,11 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
 
 /// `git stash push` — snapshot tracked changes, then reset the worktree+index to HEAD.
 fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
+    // `push_stash()` parses the pathspec before `do_push_stash()` does anything, and every way
+    // `parse_pathspec()` can fail is a `die()`.
+    if let Some(message) = crate::pathspec::parse_pathspec_fatal(repo, &opts.pathspecs) {
+        return Err(crate::fatal::die(message));
+    }
     // `-S` computes its reset by merging trees that describe the *worktree*, which
     // git never writes: it reverses the staged patch over the files themselves
     // (`git apply -R`). Those intermediate objects go here instead of into the

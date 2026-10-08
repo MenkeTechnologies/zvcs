@@ -160,7 +160,7 @@ pub fn first_magic_fatal<S: AsRef<[u8]>>(
 /// glob_global    = git_env_bool(GIT_GLOB_PATHSPECS_ENVIRONMENT, 0);
 /// noglob_global  = git_env_bool(GIT_NOGLOB_PATHSPECS_ENVIRONMENT, 0);
 /// icase_global   = git_env_bool(GIT_ICASE_PATHSPECS_ENVIRONMENT, 0);
-/// if (literal_global && (glob_global || noglob_global || icase_global))
+/// if (literal_global && (glob_global || icase_global))
 ///         die(_("global 'literal' pathspec setting is incompatible "
 ///               "with all other global pathspec settings"));
 /// if (glob_global && noglob_global)
@@ -186,7 +186,9 @@ pub fn global_magic_fatal() -> Option<String> {
     let glob = env_bool("GIT_GLOB_PATHSPECS");
     let noglob = env_bool("GIT_NOGLOB_PATHSPECS");
     let icase = env_bool("GIT_ICASE_PATHSPECS");
-    if literal && (glob || noglob || icase) {
+    // Measured against git 2.56.0: `literal` with `noglob` is accepted, `literal` with `glob` or
+    // `icase` is not.
+    if literal && (glob || icase) {
         return Some(
             "global 'literal' pathspec setting is incompatible with all other global pathspec \
              settings"
@@ -362,6 +364,10 @@ pub fn parse_pathspec_fatal_masked<S: AsRef<[u8]>>(
 ) -> Option<String> {
     if specs.is_empty() {
         return None;
+    }
+    // `init_pathspec_magic()`: the contradictory global settings die at the first pathspec parsed.
+    if let Some(msg) = global_magic_fatal() {
+        return Some(msg);
     }
     if let Some(msg) = empty_element_fatal(specs) {
         return Some(msg);

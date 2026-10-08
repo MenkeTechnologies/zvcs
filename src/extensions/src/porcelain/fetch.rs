@@ -1127,18 +1127,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // leaving no refspecs at all.
     if !refmap.is_empty() {
         let has_refspecs = !positional_specs.is_empty() || (!all && !multiple && !stdin_specs.is_empty());
-        if !has_refspecs {
-            // The refusal lives in `get_ref_map()` (builtin/fetch.c:544-545), and
-            // `do_fetch()` has already run `truncate_fetch_head()` by then
-            // (:1912-1917). So stock leaves an *empty* `FETCH_HEAD` behind rather
-            // than the previous fetch's rows — the file is emptied on the way in,
-            // not written on the way out.
-            if opts.write_fetch_head && !opts.dry_run && !opts.append {
-                let _ = std::fs::File::create(repo.git_dir().join("FETCH_HEAD"));
-            }
-            eprintln!("fatal: --refmap option is only meaningful with command-line refspec(s)");
-            return Ok(ExitCode::from(128));
-        }
+        opts.refmap_without_refspecs = !has_refspecs;
         opts.refmap = Some(
             refmap
                 .iter()
@@ -2110,6 +2099,9 @@ struct FetchOpts {
     /// The refspecs `--refmap` supplied, already parsed. `None` means no `--refmap` was given at all,
     /// which is what decides whether the configured refspecs act as the opportunistic ones.
     refmap: Option<Vec<gix::refspec::RefSpec>>,
+    /// `--refmap` was given without a command-line refspec; `get_ref_map()` refuses that, but only once
+    /// the remote has been reached (`refmap.nr` is read after `transport_get_remote_refs()`).
+    refmap_without_refspecs: bool,
     /// `--negotiation-restrict`/`--negotiation-tip`, still unresolved. `None` means the flag was never
     /// given, which is what tells the negotiator to start from every local ref instead.
     negotiation_restrict: Option<Vec<String>>,
@@ -2168,6 +2160,7 @@ impl Default for FetchOpts {
             depth_junk: None,
             server_options: Vec::new(),
             refmap: None,
+            refmap_without_refspecs: false,
             negotiation_restrict: None,
             negotiation_include: None,
             negotiate_only: false,
@@ -3404,6 +3397,13 @@ fn fetch_one(
             return Err(err);
         }
     };
+
+    // `get_ref_map()` (builtin/fetch.c:544-545) runs on the advertisement, so an unreachable remote
+    // dies first, and `FETCH_HEAD` was already truncated by `do_fetch()` (:1912-1917).
+    if opts.refmap_without_refspecs {
+        eprintln!("fatal: --refmap option is only meaningful with command-line refspec(s)");
+        return Ok(Verdict::Fatal);
+    }
 
     // `get_fetch_map()` in `remote.c` is called with `missing_ok == 0` for every refspec that came
     // from the command line or from `remote.<name>.fetch`, so a refspec that names one exact ref the

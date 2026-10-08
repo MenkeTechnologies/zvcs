@@ -1556,7 +1556,13 @@ fn show(repo: &gix::Repository, notes_ref: &str, args: &[String]) -> Result<Exit
     match notes.map.get(&object) {
         Some(note) => {
             // `git notes show` execs `git show <blob>`, which writes the blob
-            // out untouched.
+            // out untouched — after reading the configuration `git show` reads
+            // (`git_log_config()`, then `repo_init_revisions()`'s grep pass), so a
+            // refused `diff.*` / `log.*` value dies here, and only when a note exists:
+            // `notes list` and a miss never start the child.
+            crate::log_config::validate_log(repo)
+                .and_then(|()| crate::cmd_config::validate_grep_only(repo))
+                .map_err(crate::default_config::Rejection::into_error)?;
             use std::io::Write;
             let blob = repo.find_object(*note)?;
             std::io::stdout().write_all(&blob.data)?;

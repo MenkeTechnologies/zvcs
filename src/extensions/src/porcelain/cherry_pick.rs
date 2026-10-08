@@ -1600,6 +1600,12 @@ fn pick_one(
         let keep = action == Empty::Keep || (initially_empty && opts.allow_empty);
         allow_empty_flag = keep;
         if !keep {
+            // The in-tree merge has already written its result index
+            // (`write_locked_index()` in `merge_switch_to_result()`), which is the
+            // `HEAD` tree here; rewriting it applies the index-write settings
+            // (`index.recordEndOfIndexEntries`) to what the stop leaves behind.
+            let mut written = crate::index_open::or_empty(repo)?;
+            crate::index_racy::write(repo, &mut written)?;
             // `--empty` governs commits that *became* empty; an initially
             // empty one is only ever kept via `--allow-empty`/`--empty=keep`.
             if !initially_empty && action == Empty::Drop {

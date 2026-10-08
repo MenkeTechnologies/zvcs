@@ -3535,8 +3535,9 @@ fn write_basic_state(repo: &gix::Repository, st: &RebaseState) -> Result<()> {
     }
     // `write_file(state_dir_path("signoff", opts), "--signoff")` — content-bearing,
     // unlike the empty markers above, though only its presence is ever read back.
+    // `write_file()` completes the line, so the content is `--signoff\n`.
     if st.signoff {
-        std::fs::write(dir.join("signoff"), b"--signoff")?;
+        std::fs::write(dir.join("signoff"), b"--signoff\n")?;
     } else {
         let _ = std::fs::remove_file(dir.join("signoff"));
     }

@@ -2770,7 +2770,11 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // `info/sparse-checkout` is per-worktree (path.c:103 lists it with
     // `is_common = 0`), so without the copy the new worktree has no definition at
     // all and checks the whole tree out — which is what this port used to do.
-    let sparsity = super::sparse_checkout::load_sparsity_if_enabled(&repo)?;
+    // The child's `unpack_trees()` only applies sparse patterns it can read: with no
+    // `info/sparse-checkout` to copy, `get_sparse_checkout_patterns()` fails and
+    // `skip_sparse_checkout` is set, so the whole tree is written out.
+    let sparsity = super::sparse_checkout::load_sparsity_if_enabled(&repo)?
+        .filter(|_| repo.git_dir().join("info").join("sparse-checkout").exists());
     if sparsity.is_some() {
         copy_sparse_checkout(&repo, &admin);
     }

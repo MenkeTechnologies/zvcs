@@ -192,6 +192,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "--porcelain" => f.porcelain = true,
             "--no-porcelain" => f.porcelain = false,
             "--repo" => f.repo = Some(take_value(inline)?),
+            // `OPT_STRING`: the negation resets the value to NULL.
+            "--no-repo" => f.repo = None,
             "--force-with-lease" => {
                 if let Err(msg) = parse_lease(&mut f.lease, inline)? {
                     eprintln!("error: {msg}");
@@ -281,6 +283,8 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             "-o" | "--push-option" => {
                 f.push_options.push(take_value(inline)?);
             }
+            // `OPT_STRING_LIST`: the negation is `string_list_clear()`.
+            "--no-push-option" => f.push_options.clear(),
             // `--signed[=<mode>]`: send a gpg-signed push certificate. The
             // modes are git's — `if-asked` only signs when the server offers a
             // nonce, plain/`true` insists on one.

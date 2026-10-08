@@ -4979,22 +4979,12 @@ fn resolve_strategy(name: &str) -> std::result::Result<Strategy, ExitCode> {
     }
 }
 
-/// `core.commentChar` for cleanup, defaulting to `#` (and treating `auto` and an
-/// empty value as `#`). The full multi-valued `commentChar`/`commentString`
-/// interleaving lives in `fmt-merge-msg`; a single character covers the merge
-/// message paths.
+/// `comment_line_str` as the merge message paths see it: `core.commentString`
+/// and `core.commentChar` interleaved in config order, `#` when neither is set
+/// (`auto` is never revised outside `git commit`). One implementation, shared
+/// with the sequencer verbs and `interpret-trailers`.
 fn comment_char(repo: &gix::Repository) -> String {
-    match repo.config_snapshot().string("core.commentChar") {
-        Some(v) => {
-            let s = v.to_string();
-            if s.is_empty() || s == "auto" {
-                "#".to_string()
-            } else {
-                s
-            }
-        }
-        None => "#".to_string(),
-    }
+    super::rebase_todo::comment_prefix(repo)
 }
 
 /// Append git's `Signed-off-by:` trailer (from the committer identity) to a merge

@@ -821,7 +821,17 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         // `rerere()` is handed the arguments the verb was dispatched with, so the
         // verb itself is not one of them: a leading "rerere" reads as an unknown
         // subcommand and prints the usage block instead of collecting anything.
-        super::rerere::rerere(&["gc".to_string()])?;
+        // `run_command(&rerere)` failing is `die(FAILED_RUN, "rerere")`: the child's own
+        // diagnostic (an unreadable `rerere.enabled` / `rerere.autoUpdate`, say) comes first.
+        if let Err(err) = super::rerere::rerere(&["gc".to_string()]) {
+            match err.downcast::<crate::fatal::Fatal>() {
+                Ok(fatal) => eprintln!("fatal: {fatal}"),
+                Err(err) if err.is::<crate::fatal::Silent>() => {}
+                Err(err) => return Err(err),
+            }
+            eprintln!("fatal: failed to run rerere");
+            return Ok(ExitCode::from(crate::fatal::EXIT_FATAL));
+        }
     }
 
     // `gc.writeCommitGraph` defaults to true.

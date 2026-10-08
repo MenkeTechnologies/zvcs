@@ -1327,10 +1327,10 @@ fn is_rerere_enabled(repo: &gix::Repository) -> Result<bool> {
     // silently treated `rerere.enabled = bogus` as *unset* and fell back to
     // "enabled iff rr-cache/ exists", where git exits 128 without recording a
     // thing.
-    if let Some(Some(raw)) = crate::config::last_value_implicit(repo, "rerere.enabled") {
-        if repo.config_snapshot().boolean("rerere.enabled").is_none() {
-            crate::git_fatal!("bad boolean config value '{raw}' for 'rerere.enabled'");
-        }
+    //
+    // `rerere.autoupdate` is read the same way, and like `rerere.enabled` by the last value.
+    for key in ["rerere.enabled", "rerere.autoupdate"] {
+        crate::repo_settings::config_bool_strict(repo, key).map_err(crate::fatal::die)?;
     }
     // The rest of `git_rerere_config()` (rerere.c:875-880), which `setup_rerere()`
     // runs before it asks whether rerere is enabled at all:

@@ -289,11 +289,16 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
             // modes are git's — `if-asked` only signs when the server offers a
             // nonce, plain/`true` insists on one.
             "--signed" => {
+                // `option_parse_push_signed()`: `git_parse_maybe_bool()` first (words and any
+                // integer, so `-0` is no and `2` is yes), then `if-asked`, else `die()`.
                 f.signed = match inline.as_deref() {
-                    None | Some("true") | Some("yes") => push_proto::Signed::Always,
-                    Some("false") | Some("no") => push_proto::Signed::Never,
-                    Some("if-asked") => push_proto::Signed::IfAsked,
-                    Some(v) => crate::git_fatal!("bad signed argument: {v}"),
+                    None => push_proto::Signed::Always,
+                    Some(v) => match crate::optint::maybe_bool(v) {
+                        Some(true) => push_proto::Signed::Always,
+                        Some(false) => push_proto::Signed::Never,
+                        None if v.eq_ignore_ascii_case("if-asked") => push_proto::Signed::IfAsked,
+                        None => crate::git_fatal!("bad signed argument: {v}"),
+                    },
                 };
                 signed_explicit = true;
             }

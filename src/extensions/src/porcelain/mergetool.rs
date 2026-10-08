@@ -1685,7 +1685,8 @@ fn is_executable(path: &Path) -> bool {
 /// The unmerged paths of the index, deduplicated, in index (path-sorted) order —
 /// what `git diff --name-only --diff-filter=U` reports.
 fn unmerged_paths(repo: &gix::Repository) -> Result<Vec<BString>> {
-    let index = repo.open_index()?;
+    // A missing index file is an empty index (git's `read_index()` succeeds on it).
+    let index = crate::index_open::or_empty(repo)?;
     let mut out: Vec<BString> = Vec::new();
     for entry in index.entries() {
         if entry.stage_raw() == 0 {
@@ -1716,7 +1717,7 @@ fn rerere_remaining(repo: &gix::Repository, unmerged: &[BString]) -> Result<Vec<
 
     // `check_one_conflict()`: only a plain stage #2 + stage #3 pair of regular
     // files is recordable; every other unmerged shape is always reported.
-    let index = repo.open_index()?;
+    let index = crate::index_open::or_empty(repo)?;
     let cache = index.entries();
     let mut i = 0usize;
     while i < cache.len() {

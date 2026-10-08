@@ -857,7 +857,10 @@ fn render_plain(repo: &gix::Repository, worktrees: &[Wt], verbose: bool) -> Stri
             match &wt.head {
                 HeadInfo::Detached(_) => out.push_str("(detached HEAD)"),
                 HeadInfo::Branch { name, .. } => {
-                    out.push_str(&format!("[{}]", name.as_ref().shorten().to_str_lossy()));
+                    // `refs_shorten_unambiguous_ref(…, wt->head_ref, 0)` (builtin/worktree.c
+                    // `show_worktree()`): any ref, not just a branch, with the ambiguity rules.
+                    let short = crate::refname::shorten_unambiguous(&repo, name.as_bstr(), false);
+                    out.push_str(&format!("[{}]", String::from_utf8_lossy(&short)));
                 }
                 HeadInfo::Unknown(_) => out.push_str("(error)"),
             }

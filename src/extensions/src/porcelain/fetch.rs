@@ -3804,6 +3804,7 @@ fn fetch_one(
         if !fsck_objects && !from_promisor && !opts.keep {
             explode_small_pack(repo, write_pack_bundle)?;
         }
+        finish_kept_pack(repo, write_pack_bundle);
     }
 
     // Both status variants carry the ref-update outcome; the ref_map ties each
@@ -5712,6 +5713,29 @@ pub(super) fn fetch_pack_fsck_objects(repo: &gix::Repository) -> bool {
         .boolean("fetch.fsckObjects")
         .or_else(|| snapshot.boolean("transfer.fsckObjects"))
         .unwrap_or(false)
+}
+
+/// What `index-pack` leaves beside a pack it keeps: the pack and its index read-only, and the
+/// reverse index `pack.writeReverseIndex` asks for (default on). gitoxide writes the pack and the
+/// index with the creating process's umask and no `.rev`, so a pack that survives the fetch (a
+/// `--keep`, or one at or over `fetch.unpackLimit`) is brought to git's state here. A pack that
+/// [`explode_small_pack`] took apart is gone and skipped.
+fn finish_kept_pack(repo: &gix::Repository, bundle: &gix::odb::pack::bundle::write::Outcome) {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(index_path), Some(data_path)) = (&bundle.index_path, &bundle.data_path) else {
+        return;
+    };
+    if !data_path.exists() {
+        return;
+    }
+    if repo.config_snapshot().boolean("pack.writeReverseIndex").unwrap_or(true) {
+        if let Some(pack_dir) = data_path.parent() {
+            super::index_pack::write_missing_rev_indexes(pack_dir, repo.object_hash());
+        }
+    }
+    for path in [data_path, index_path] {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444));
+    }
 }
 
 /// `fetch_pack()`'s `unpack-objects` path: a pack carrying fewer objects than

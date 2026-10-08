@@ -2738,6 +2738,10 @@ impl RepositoryDirs {
             {
                 std::path::Path::new(".git").to_path_buf()
             }
+            // A git directory the walk found by standing in it (a bare repository, or the
+            // inside of a `.git`): `setup_bare_git_dir()` chdirs to its top and calls
+            // `set_git_dir(".")`, so the message says `./config` from every depth.
+            None => std::path::Path::new(".").to_path_buf(),
             _ => dir.to_path_buf(),
         };
         let shown = shown_dir.join(file).to_string_lossy().into_owned();

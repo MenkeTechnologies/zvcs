@@ -42,6 +42,9 @@ fn run(dir: &Path, home: &Path, envs: &[(&str, &str)], args: &[&str]) -> Output 
         .env_remove("GIT_CONFIG_COUNT")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_IMPLICIT_WORK_TREE")
+        // `git var GIT_EDITOR` fails when no editor resolves (a dumb terminal
+        // with none set, as on a CI runner); pin one so only GIT_WORK_TREE varies.
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "a")
         .env("GIT_AUTHOR_EMAIL", "a@example.com")
         .env("GIT_AUTHOR_DATE", "@1000000000 +0000")

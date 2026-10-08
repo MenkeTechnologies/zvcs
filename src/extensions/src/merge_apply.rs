@@ -211,8 +211,9 @@ pub fn append_conflicts_hint(msg: &mut Vec<u8>, paths: &[BString], comment: &str
 /// where stock leaves nothing: `git merge-recursive main -- main alien` between
 /// unrelated roots dropped `src/lib.rs` and kept `src/`.
 ///
-/// The current working directory is never removed, the same refusal
-/// `schedule_dir_for_removal()` opens with (symlinks.c:303-305).
+/// The directory the process started in is never removed (symlinks.c:288-291, :303-305);
+/// [`crate::worktree::prune_empty_dirs`] compares it by realpath, so a relative work-tree
+/// path (`../src` from inside `src`) is recognised as the cwd.
 pub fn remove_worktree_entry(repo: &gix::Repository, path: &BStr) {
     let Some(full) = repo.workdir_path(path) else {
         return;
@@ -223,20 +224,7 @@ pub fn remove_worktree_entry(repo: &gix::Repository, path: &BStr) {
     let Some(workdir) = repo.workdir() else {
         return;
     };
-    let cwd = std::env::current_dir().ok();
-    let mut dir = full.parent().map(std::path::Path::to_path_buf);
-    while let Some(candidate) = dir {
-        if candidate == workdir || !candidate.starts_with(workdir) {
-            break;
-        }
-        if cwd.as_deref() == Some(candidate.as_path()) {
-            break;
-        }
-        if std::fs::remove_dir(&candidate).is_err() {
-            break;
-        }
-        dir = candidate.parent().map(std::path::Path::to_path_buf);
-    }
+    crate::worktree::prune_empty_dirs(workdir, &full);
 }
 
 /// Three-way merge `ours_tree` and `theirs_tree` against `base_tree`.

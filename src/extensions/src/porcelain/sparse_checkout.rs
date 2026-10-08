@@ -1755,12 +1755,17 @@ fn apply(repo: &gix::Repository, sparsity: &Sparsity) -> Result<()> {
     // (`update_modes()`'s `ensure_full_index()`, builtin/sparse-checkout.c:432-441) —
     // both announce `advice.sparseIndexExpanded` (sparse-index.c:363-366). `disable`
     // clears `give_advice_on_expansion` first (builtin/sparse-checkout.c:1071).
+    //
+    // The expansion is unconditional on the index being collapsed, not on it holding a sparse
+    // directory: reading an index with `index.sparse` on marks it `INDEX_COLLAPSED` even when
+    // nothing collapsed yet (every entry still in the cone), and `expand_index()` is what turns
+    // that back into `INDEX_EXPANDED` so the write below runs `convert_to_sparse()`.
     let advise = match sparsity {
         Sparsity::Full => false,
         Sparsity::Patterns(_) => true,
         Sparsity::Cone(_) => !config_bool(repo, "index", "sparse")?.unwrap_or(false),
     };
-    super::ls_files::expand_sparse_index(repo, &mut index, advise)?;
+    crate::sparse_index::ensure_full_index_with_advice(repo, &mut index, advise);
 
     let snapshot: Vec<Snapshot> = {
         let backing = index.path_backing();

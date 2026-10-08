@@ -1053,6 +1053,11 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "-s" | "--no-patch" => fmt = Format { no_output: true, quiet: fmt.quiet, ..Format::default() },
             "--quiet" => fmt.quiet = true,
             "--exit-code" => {}
+            // `--relative[=<p>]` and `--no-relative` are in the option table but do nothing here:
+            // two paths outside any tree have no prefix to strip (measured against 2.56.0, with
+            // and without a repository around the paths).
+            "--relative" | "--no-relative" => {}
+            s if s.starts_with("--relative=") => {}
             "-w" | "--ignore-all-space" => ws = super::diff::Whitespace::IgnoreAll,
             "-b" | "--ignore-space-change" => ws = super::diff::Whitespace::IgnoreChange,
             "--ignore-space-at-eol" => ws = super::diff::Whitespace::IgnoreAtEol,

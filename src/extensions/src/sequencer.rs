@@ -1735,3 +1735,16 @@ mod tests {
         assert_eq!(unquote_config_value("q\\\"uote"), "q\"uote");
     }
 }
+
+/// `sequencer_init_config()`'s `default_strategy` (sequencer.c:308-320): `pull.twohead`,
+/// the first value only, cut at its first space.
+///
+/// `run_sequencer()` adopts it for a pick or revert that was given no `--strategy`
+/// (builtin/revert.c:222-225), and `get_replay_opts()` does the same for a
+/// merge-backend rebase (builtin/rebase.c), which then records it in
+/// `$state_dir/strategy`.
+pub fn default_strategy(repo: &gix::Repository) -> Option<String> {
+    let values = repo.config_snapshot().strings("pull.twohead")?;
+    let first = values.into_iter().next()?.to_string();
+    Some(first.split(' ').next().unwrap_or(&first).to_string())
+}

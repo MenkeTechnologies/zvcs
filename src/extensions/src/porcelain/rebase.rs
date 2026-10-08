@@ -2288,7 +2288,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
                 committer_date_is_author_date,
                 ignore_date,
                 empty,
-                strategy: strategy.clone(),
+                // `get_replay_opts()`: with no `-s` (and no `-X`, which implies `ort`), the
+                // sequencer's `default_strategy` becomes the rebase's strategy.
+                strategy: strategy.clone().or_else(|| crate::sequencer::default_strategy(&repo)),
                 strategy_opts: strategy_opts.clone(),
             },
             onto_spec: &onto_spec,

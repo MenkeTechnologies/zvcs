@@ -825,13 +825,9 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
     // the first value only, cut at its first space. `run_sequencer()` adopts it
     // when no `--strategy` was given (builtin/revert.c:222-225), so
     // `-c pull.twohead=bogus cherry-pick X` runs `git merge-bogus` and fails.
-    let default_strategy = repo
-        .config_snapshot()
-        .strings("pull.twohead")
-        .and_then(|values| values.into_iter().next())
-        .map(|v| v.to_string());
+    let default_strategy = crate::sequencer::default_strategy(&repo);
     if opts.strategy.is_none() {
-        opts.strategy = default_strategy.as_deref().map(|v| v.split(' ').next().unwrap_or(v));
+        opts.strategy = default_strategy.as_deref();
     }
     // The whole sequence (tree build, commit, HEAD move, worktree update) is one
     // logical write; hold the coordinator lock across all of it, like `merge`.

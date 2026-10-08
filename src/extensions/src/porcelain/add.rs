@@ -1269,9 +1269,10 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
     let staged_set: HashSet<BString> = staged.iter().map(|s| s.path.clone()).collect();
 
     // --- deletions: tracked stage-0 paths, matched, whose file is gone ------
-    // Suppressed by `--no-all`/`--ignore-removal`.
+    // Suppressed by `--no-all`/`--ignore-removal`, which `-u` overrides: `update_callback()` only
+    // honours `ADD_CACHE_IGNORE_REMOVAL` for the paths `-u` is not after.
     let mut deletions: Vec<BString> = Vec::new();
-    if !no_removal && !add_resolved {
+    if (!no_removal || update_only) && !add_resolved {
         let backing = index.path_backing();
         for e in index.entries() {
             if e.stage() != Stage::Unconflicted || e.mode == Mode::COMMIT {

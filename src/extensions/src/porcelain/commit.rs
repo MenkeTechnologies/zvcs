@@ -1981,6 +1981,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         None => None,
     };
 
+    let snap = repo.config_snapshot();
+    // `-t`/`--template <file>` beats `commit.template`; both seed the buffer and
+    // both arm git's `template_untouched()` abort. `--no-template` only clears the
+    // option: a configured `commit.template` still applies.
+    let template_file: Option<std::path::PathBuf> = match &template_arg {
+        Some(t) => Some(expand_tilde(t)),
+        None => snap.string("commit.template").map(|v| expand_tilde(&v.to_string())),
+    };
+
     // --- nothing-to-commit guard -----------------------------------------
     let unchanged = match parent_tree_id {
         Some(pt) => pt == tree_id,
@@ -1994,6 +2003,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // stays one whatever its tree says.
     let amending_a_merge = amend && parents.len() > 1;
     if unchanged && !allow_empty && whence != Whence::Merge && !amending_a_merge {
+        // `prepare_to_commit()` reads the template into the message buffer before it
+        // reaches the `!committable` guard, so an unreadable one dies first.
+        if let Some(path) = &template_file {
+            let seeded_elsewhere = from_flags
+                || squash_fixup_seed.is_some()
+                || reuse_commit.is_some()
+                || amend
+                || repo.git_dir().join("MERGE_MSG").exists()
+                || repo.git_dir().join("SQUASH_MSG").exists();
+            if !seeded_elsewhere {
+                if let Err(e) = std::fs::read_to_string(path) {
+                    crate::git_fatal!("could not read '{}': {}", path.display(), crate::external::strerror(&e));
+                }
+            }
+        }
         // `run_status(stdout, index_file, prefix, 0, s)` (builtin/commit.c:1085).
         // The refusal *is* a status report: git runs the engine `git status` runs,
         // over the index this commit would have used, on stdout — and only then
@@ -2031,7 +2055,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     // --- message: `prepare_to_commit()` -----------------------------------
     // `use_editor` and `no_edit` are settled above, before `pre-commit` runs.
-    let snap = repo.config_snapshot();
     let cleanup = resolve_cleanup(cleanup_arg.as_deref(), &snap, use_editor)?;
     // `auto` is resolved to `#` at config time and only becomes something else
     // once `prepare_to_commit()` can see the message body, below.

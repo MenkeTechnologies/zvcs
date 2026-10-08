@@ -31,9 +31,10 @@
 //!     first — the opposite of `cherry-pick`
 //!   * `-n`/`--no-commit`, `-s`/`--signoff`, `-m <n>`/`--mainline <n>`,
 //!     `-e`/`--edit`, `--no-edit`, `--reference`, `--cleanup=<mode>`
-//!   * `--strategy`/`-X`, which git's sequencer ignores outright for a revert:
+//!   * `--strategy`, which git's sequencer ignores outright for a revert:
 //!     `do_pick_commit` routes `TODO_REVERT` to the recursive merge regardless
-//!     of the selected strategy, so an unknown strategy name is not an error
+//!     of the selected strategy, so an unknown strategy name is not an error;
+//!     `-X` reaches that merge through `parse_merge_opt()`, unknown values dropped
 //!   * `--rerere-autoupdate`/`--no-rerere-autoupdate` — handed to the
 //!     `repo_rerere()` a conflicted revert runs, and without effect on a
 //!     conflict-free one — and `--no-gpg-sign`
@@ -1146,6 +1147,12 @@ fn revert_one(
     if super::merge::merge_recursive_config_check(repo).is_some() {
         return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
     }
+    // `do_recursive_merge()` hands every `-X` to `parse_merge_opt()` for a revert as
+    // it does for a pick, and discards the result, so an unknown one is ignored.
+    let mut strategy = super::merge_tree::StrategyOptions::default();
+    for x in &o.xopts {
+        strategy.absorb(x);
+    }
     let mut merge = repo.merge_trees(
         base_tree,
         ours_tree,
@@ -1155,7 +1162,7 @@ fn revert_one(
             current: Some(BStr::new("HEAD")),
             other: Some(BStr::new(other_label.as_bytes())),
         },
-        repo.tree_merge_options()?,
+        strategy.apply(repo.tree_merge_options()?)?,
     )?;
     // The tree — conflict markers and all — is written before anything is checked
     // out, so the object exists even when a checkout below is refused.

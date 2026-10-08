@@ -6,6 +6,8 @@
 //!   `/` (no `:(glob)`), a directory no item rules out is descended into.
 //! * `diff_setup_done()` refuses a depth limit together with a wildcard pathspec before
 //!   `last-modified` reports an unknown argument; without `-r` the depth is 0.
+//! * `:^`/`:!`/`:(exclude)` items are a second pass over what the positive items accepted, and an
+//!   all-exclude pathspec gains an implicit "match everything" item.
 //! * A path outside the repository dies with git's pathspec wording.
 #![cfg(unix)]
 
@@ -87,6 +89,13 @@ const CASES: &[(&str, &[&str])] = &[
     ("", &["--", "*.rs"]),
     ("", &["--max-depth=1", "--", "src/*"]),
     ("", &["--max-depth=0", "--bogus-option", "--", "*.md"]),
+    ("", &["-r", "--", ":^src"]),
+    ("", &["-r", "--", "src", ":!src/deep"]),
+    ("", &["-r", "--", ":(exclude)*.md"]),
+    ("", &["-r", "--", "*.rs", ":^src/deep/x"]),
+    ("", &["--max-depth=1", "--", "src", ":^src/deep"]),
+    ("", &["--", ":^src"]),
+    ("src", &["-r", "--", ":^deep"]),
     ("", &["-r", "--", "/"]),
     ("", &["-r", "--", "../x"]),
 ];

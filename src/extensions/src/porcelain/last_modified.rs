@@ -93,6 +93,11 @@ struct Opts {
     /// (cwd prefix applied, trailing slashes preserved), sorted like
     /// `parse_pathspec` sorts them.
     pathspecs: Vec<BString>,
+    /// The `:(exclude)` items, which `tree_entry_interesting()` evaluates in a second pass.
+    excludes: Vec<BString>,
+    /// Every item in argument order, the implicit "match everything" one last when all were
+    /// excludes: what `check_recursion_depth()` walks.
+    depth_items: Vec<BString>,
 }
 
 /// `git last-modified` — see the module docs for the covered surface.
@@ -215,27 +220,42 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         specs.push(p);
     }
 
-    // `diff_setup_done()` runs at the end of `setup_revisions()`, before the unknown-argument
-    // check: a depth limit and a wildcard pathspec exclude each other.
     if let Some(msg) = crate::pathspec::first_outside_repository_fatal(&repo, &specs, gix::pathspec::Defaults::default()) {
         eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(128));
     }
     let mut pathspecs: Vec<BString> = Vec::new();
+    let mut excludes: Vec<BString> = Vec::new();
+    let mut depth_items: Vec<BString> = Vec::new();
     for s in &specs {
-        if s.starts_with(':') {
+        let Some((exclude, path)) = split_exclude_magic(s) else {
             anyhow::bail!("unsupported pathspec magic {s:?}");
-        }
-        match crate::pathspec::prefix_path(&repo, s.as_bytes().as_bstr()) {
-            Ok(p) => pathspecs.push(p),
+        };
+        match crate::pathspec::prefix_path(&repo, path.as_bytes().as_bstr()) {
+            Ok(p) => {
+                depth_items.push(p.clone());
+                if exclude {
+                    excludes.push(p);
+                } else {
+                    pathspecs.push(p);
+                }
+            }
             Err(msg) => {
                 eprintln!("fatal: {s}: {msg}");
                 return Ok(ExitCode::from(128));
             }
         }
     }
+    // `parse_pathspec()`: when every item is an exclude, one positive item matching everything
+    // is added.
+    if pathspecs.is_empty() && !excludes.is_empty() {
+        pathspecs.push(BString::default());
+        depth_items.push(BString::default());
+    }
     pathspecs.sort();
-    if max_depth >= 0 && pathspecs.iter().any(|p| nowildcard_len(p) < p.len()) {
+    // `diff_setup_done()` runs at the end of `setup_revisions()`, before the unknown-argument
+    // check: a depth limit and a wildcard pathspec exclude each other.
+    if max_depth >= 0 && pathspecs.iter().chain(&excludes).any(|p| nowildcard_len(p) < p.len()) {
         eprintln!("fatal: max-depth cannot be used with wildcard pathspecs");
         return Ok(ExitCode::from(128));
     }
@@ -267,6 +287,8 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         show_trees,
         nul,
         pathspecs,
+        excludes,
+        depth_items,
     };
 
     // Resolve the single starting commit (`rev.def = "HEAD"`).
@@ -572,10 +594,54 @@ fn interesting(path: &BString, is_dir: bool, opts: &Opts) -> bool {
     }
     let p = path.as_bytes();
     let (base, name) = p.split_at(p.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1));
-    opts.pathspecs
+    let positive = match_level(&opts.pathspecs, base, name, is_dir);
+    if opts.excludes.is_empty() || positive == Level::No {
+        return positive != Level::No;
+    }
+    // The table at the end of `tree_entry_interesting()`: what the exclude items make of an
+    // entry the positive items accepted.
+    let negative = match_level(&opts.excludes, base, name, is_dir);
+    match (positive, negative) {
+        (_, Level::No) => true,
+        (_, Level::Some) if is_dir => true,
+        _ => false,
+    }
+}
+
+/// `enum interesting` as `do_match()` returns it, less the "never interesting" early exits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    No,
+    Some,
+    All,
+}
+
+/// `do_match()`: the first item (last to first) that has an opinion decides.
+fn match_level(items: &[BString], base: &[u8], name: &[u8], is_dir: bool) -> Level {
+    items
         .iter()
         .rev()
-        .any(|item| item_interesting(item.as_bytes(), base, name, is_dir))
+        .map(|item| item_interesting(item.as_bytes(), base, name, is_dir))
+        .find(|level| *level != Level::No)
+        .unwrap_or(Level::No)
+}
+
+/// `:^`/`:!`/`:(exclude)` magic taken off a pathspec element: `(is_exclude, rest)`. `None` for
+/// any other magic, which this command does not model.
+fn split_exclude_magic(spec: &str) -> Option<(bool, &str)> {
+    let Some(magic) = spec.strip_prefix(':') else {
+        return Some((false, spec));
+    };
+    if let Some(long) = magic.strip_prefix('(') {
+        let (words, rest) = long.split_once(')')?;
+        return (words == "exclude").then_some((true, rest));
+    }
+    let end = magic.find(|c| c != '!' && c != '^').unwrap_or(magic.len());
+    if end == 0 {
+        return None;
+    }
+    let rest = &magic[end..];
+    Some((true, rest.strip_prefix(':').unwrap_or(rest)))
 }
 
 /// `nowildcard_len`: length of the leading part of a pathspec free of glob specials.
@@ -600,39 +666,44 @@ fn git_fnmatch(pattern: &[u8], string: &[u8], prefix: usize) -> bool {
 
 /// One iteration of `do_match()`'s loop over the pathspec items. `base` is the
 /// directory of the entry (empty or ending in `/`), `name` the entry itself.
-fn item_interesting(m: &[u8], base: &[u8], name: &[u8], is_dir: bool) -> bool {
+fn item_interesting(m: &[u8], base: &[u8], name: &[u8], is_dir: bool) -> Level {
     let nowild = nowildcard_len(m);
     let wild = nowild < m.len();
 
     if base.len() >= m.len() {
-        // match_dir_prefix(): `base` is `m` itself or below it.
+        // match_dir_prefix(): `base` is `m` itself or below it, so everything under it matches.
         if base.starts_with(m) && (m.is_empty() || base.get(m.len()) == Some(&b'/') || m.last() == Some(&b'/')) {
-            return true;
+            return Level::All;
         }
     } else if base.is_empty() || m.starts_with(base) {
         if match_entry(&m[base.len()..], name, is_dir) {
-            return true;
+            return Level::Some;
         }
         // a directory no item rules out is kept so its children can be matched
-        return wild && (git_fnmatch(&m[base.len()..], name, nowild.saturating_sub(base.len())) || is_dir);
+        let hit = wild && (git_fnmatch(&m[base.len()..], name, nowild.saturating_sub(base.len())) || is_dir);
+        return if hit { Level::Some } else { Level::No };
     }
     if !wild {
-        return false;
+        return Level::No;
     }
 
     // match_wildcard_base(): the part of `base` inside the literal prefix must agree.
     if nowild > 0 && !base.is_empty() {
         if base.len() >= nowild {
             if base[..nowild] != m[..nowild] {
-                return false;
+                return Level::No;
             }
         } else if !m.starts_with(base) {
-            return false;
+            return Level::No;
         }
     }
     let mut full = base.to_vec();
     full.extend_from_slice(name);
-    git_fnmatch(m, &full, nowild) || is_dir
+    if git_fnmatch(m, &full, nowild) || is_dir {
+        Level::Some
+    } else {
+        Level::No
+    }
 }
 
 /// `match_entry()`: `m` (the pathspec below `base`) names the entry or a directory above it.
@@ -659,7 +730,8 @@ fn should_recurse(path: &BString, opts: &Opts) -> bool {
     if opts.max_depth < 0 {
         return true;
     }
-    check_recursion_depth(path.as_bytes(), &opts.pathspecs, opts.max_depth)
+    let items = if opts.excludes.is_empty() { &opts.pathspecs } else { &opts.depth_items };
+    check_recursion_depth(path.as_bytes(), items, opts.max_depth)
 }
 
 /// Port of `check_recursion_depth()`: depth is measured from the end of the

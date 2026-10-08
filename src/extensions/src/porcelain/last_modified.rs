@@ -23,7 +23,7 @@
 //! Not covered — these `bail!` rather than emit output that would diverge:
 //!   * `<revision-range>` forms (`A..B`, `^X`, `--not`, `--all`, `-n`): they
 //!     drive git's `not_queue`/boundary logic and the `^`-prefixed output
-//!   * pathspec magic (`:(...)`) and wildcards
+//!   * pathspec magic (`:(...)`)
 
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -215,6 +215,31 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         specs.push(p);
     }
 
+    // `diff_setup_done()` runs at the end of `setup_revisions()`, before the unknown-argument
+    // check: a depth limit and a wildcard pathspec exclude each other.
+    if let Some(msg) = crate::pathspec::first_outside_repository_fatal(&repo, &specs, gix::pathspec::Defaults::default()) {
+        eprintln!("fatal: {msg}");
+        return Ok(ExitCode::from(128));
+    }
+    let mut pathspecs: Vec<BString> = Vec::new();
+    for s in &specs {
+        if s.starts_with(':') {
+            anyhow::bail!("unsupported pathspec magic {s:?}");
+        }
+        match crate::pathspec::prefix_path(&repo, s.as_bytes().as_bstr()) {
+            Ok(p) => pathspecs.push(p),
+            Err(msg) => {
+                eprintln!("fatal: {s}: {msg}");
+                return Ok(ExitCode::from(128));
+            }
+        }
+    }
+    pathspecs.sort();
+    if max_depth >= 0 && pathspecs.iter().any(|p| nowildcard_len(p) < p.len()) {
+        eprintln!("fatal: max-depth cannot be used with wildcard pathspecs");
+        return Ok(ExitCode::from(128));
+    }
+
     if let Some(a) = unknown {
         eprint!("error: unknown last-modified argument: {a}\n{USAGE}");
         return Ok(ExitCode::from(129));
@@ -232,21 +257,6 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     // the whole chain carries `GDA2`, and the topological level otherwise
     // (commit-graph.c:902-917). Holding the graph open for the walk gives all three.
     let commit_graph = repo.commit_graph_if_enabled()?;
-
-    let mut pathspecs: Vec<BString> = Vec::new();
-    let prefix = cwd_prefix(&repo)?;
-    for s in specs {
-        if s.starts_with(':') {
-            anyhow::bail!("unsupported pathspec magic {s:?}");
-        }
-        if s.contains('*') || s.contains('?') || s.contains('[') {
-            anyhow::bail!("unsupported wildcard pathspec {s:?}");
-        }
-        let mut full = prefix.clone();
-        full.extend_from_slice(s.as_bytes());
-        pathspecs.push(BString::from(full));
-    }
-    pathspecs.sort();
 
     // git reads `core.quotePath` once, in its config callback, into the global
     // every `quote_c_style()` caller shares.
@@ -370,12 +380,6 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
 
     std::io::stdout().write_all(&out)?;
     Ok(ExitCode::SUCCESS)
-}
-
-/// The repo-relative path of the current directory, with a trailing `/`, which
-/// git prepends to every pathspec. Empty at the worktree root or in a bare repo.
-fn cwd_prefix(repo: &gix::Repository) -> Result<Vec<u8>> {
-    Ok(crate::setup::prefix_bytes(repo))
 }
 
 /// git's `commit_graph_generation()` (commit-graph.c:126) for `id`.
@@ -557,30 +561,89 @@ fn diff_trees(
     Ok(())
 }
 
-/// `tree_entry_interesting` for literal pathspecs: an entry matches when a
-/// pathspec names it or a leading directory of it, and a directory is also kept
-/// when it is a leading directory of a pathspec (it must be recursed into).
+
+/// `tree_entry_interesting()` (tree-walk.c) for plain pathspecs, wildcards included:
+/// the entry named `path` is interesting when any pathspec item says so. The
+/// recursive flag is always set for last-modified, so a directory that no item
+/// rules out is kept for its children to be matched.
 fn interesting(path: &BString, is_dir: bool, opts: &Opts) -> bool {
     if opts.pathspecs.is_empty() {
         return true;
     }
-    opts.pathspecs.iter().any(|m| {
-        let m = trim_trailing_slashes(m);
-        if m.is_empty() {
-            return true;
-        }
-        path.as_bytes() == m
-            || is_dir_prefix(path.as_bytes(), m)
-            || (is_dir && is_dir_prefix(m, path.as_bytes()))
-    })
+    let p = path.as_bytes();
+    let (base, name) = p.split_at(p.iter().rposition(|&c| c == b'/').map_or(0, |i| i + 1));
+    opts.pathspecs
+        .iter()
+        .rev()
+        .any(|item| item_interesting(item.as_bytes(), base, name, is_dir))
 }
 
-fn trim_trailing_slashes(m: &BString) -> &[u8] {
-    let mut s = m.as_bytes();
-    while s.last() == Some(&b'/') {
-        s = &s[..s.len() - 1];
+/// `nowildcard_len`: length of the leading part of a pathspec free of glob specials.
+fn nowildcard_len(m: &[u8]) -> usize {
+    m.iter()
+        .position(|c| matches!(c, b'*' | b'?' | b'[' | b'\\'))
+        .unwrap_or(m.len())
+}
+
+/// `git_fnmatch()` for a pathspec without `:(glob)`/`:(icase)`: the first `prefix`
+/// bytes compare literally, the rest goes to `wildmatch()` with no `WM_PATHNAME`.
+fn git_fnmatch(pattern: &[u8], string: &[u8], prefix: usize) -> bool {
+    if prefix > pattern.len() || string.len() < prefix || pattern[..prefix] != string[..prefix] {
+        return false;
     }
-    s
+    gix::glob::wildmatch(
+        pattern[prefix..].as_bstr(),
+        string[prefix..].as_bstr(),
+        gix::glob::wildmatch::Mode::empty(),
+    )
+}
+
+/// One iteration of `do_match()`'s loop over the pathspec items. `base` is the
+/// directory of the entry (empty or ending in `/`), `name` the entry itself.
+fn item_interesting(m: &[u8], base: &[u8], name: &[u8], is_dir: bool) -> bool {
+    let nowild = nowildcard_len(m);
+    let wild = nowild < m.len();
+
+    if base.len() >= m.len() {
+        // match_dir_prefix(): `base` is `m` itself or below it.
+        if base.starts_with(m) && (m.is_empty() || base.get(m.len()) == Some(&b'/') || m.last() == Some(&b'/')) {
+            return true;
+        }
+    } else if base.is_empty() || m.starts_with(base) {
+        if match_entry(&m[base.len()..], name, is_dir) {
+            return true;
+        }
+        // a directory no item rules out is kept so its children can be matched
+        return wild && (git_fnmatch(&m[base.len()..], name, nowild.saturating_sub(base.len())) || is_dir);
+    }
+    if !wild {
+        return false;
+    }
+
+    // match_wildcard_base(): the part of `base` inside the literal prefix must agree.
+    if nowild > 0 && !base.is_empty() {
+        if base.len() >= nowild {
+            if base[..nowild] != m[..nowild] {
+                return false;
+            }
+        } else if !m.starts_with(base) {
+            return false;
+        }
+    }
+    let mut full = base.to_vec();
+    full.extend_from_slice(name);
+    git_fnmatch(m, &full, nowild) || is_dir
+}
+
+/// `match_entry()`: `m` (the pathspec below `base`) names the entry or a directory above it.
+fn match_entry(m: &[u8], name: &[u8], is_dir: bool) -> bool {
+    if name.len() > m.len() {
+        return false;
+    }
+    if m.len() > name.len() && (m[name.len()] != b'/' || !is_dir) {
+        return false;
+    }
+    m[..name.len()] == *name
 }
 
 /// `is_dir_prefix()`: true when `dir` is a leading directory of `path`.

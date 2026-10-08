@@ -25,7 +25,7 @@
 //!   consulted — even a bogus config value cannot break the merge.
 //!
 //! Every expectation was measured against git 2.55.0 (`/opt/homebrew/bin/git`)
-//! first and copied byte for byte; where that binary is present the same fixture is
+//! first and copied byte for byte; where a stock git is present the same fixture is
 //! rebuilt with it and the outputs are compared directly, so the pins cannot drift
 //! into "whatever this port happens to print". Identity and dates are pinned, which
 //! makes the fixtures byte-identical between the two binaries — the tests assert
@@ -42,13 +42,16 @@ use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
-/// Stock git for the comparison arms. Absent on Linux CI, where every test below
-/// still asserts the full behavior on its own — the stock arm only adds the proof
-/// that the pinned bytes are git's rather than this port's.
+/// Stock git for the comparison arms, chosen by the shared policy in
+/// `support/stock_git.rs`. Without one, every test below still asserts the
+/// full behavior on its own — the stock arm only adds the proof that the
+/// pinned bytes are git's rather than this port's.
 fn stock() -> Option<&'static str> {
-    let p = "/opt/homebrew/bin/git";
-    Path::new(p).exists().then_some(p)
+    stock_git::stock_git()
 }
+
+#[path = "support/stock_git.rs"]
+mod stock_git;
 
 /// Identity and date vars git honors above config. CI exports some of these for
 /// the whole job, which would change the commits these fixtures build — and the

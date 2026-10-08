@@ -47,12 +47,15 @@ use std::process::{Command, Output, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
-/// Stock git for the comparison arms; absent on Linux CI, where each test still
-/// asserts the whole behavior on its own.
+/// Stock git for the comparison arms, chosen by the shared policy in
+/// `support/stock_git.rs`; without one each test still asserts the whole
+/// behavior on its own.
 fn stock() -> Option<&'static str> {
-    let p = "/opt/homebrew/bin/git";
-    Path::new(p).exists().then_some(p)
+    stock_git::stock_git()
 }
+
+#[path = "support/stock_git.rs"]
+mod stock_git;
 
 /// Identity and date vars git honors above config, pinned so the fixture's commits
 /// are reproducible across binaries and CI environments.

@@ -253,7 +253,9 @@ pub(super) fn require_toplevel(repo: &Repository) -> Option<ExitCode> {
         return None;
     }
     let here = std::env::current_dir().ok()?.canonicalize().ok()?;
-    if top.canonicalize().ok()? == here {
+    // A work tree that does not exist cannot be the cwd; stock `--show-cdup` then
+    // prints the (absolute) path to it, which is non-empty.
+    if top.canonicalize().is_ok_and(|top| top == here) {
         return None;
     }
     eprintln!("You need to run this command from the toplevel of the working tree.");

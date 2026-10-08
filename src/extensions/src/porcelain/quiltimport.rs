@@ -689,14 +689,12 @@ pub fn quiltimport(args: &[String]) -> Result<ExitCode> {
             .arg(&commit)
             .env("GIT_AUTHOR_NAME", &author_name)
             .env("GIT_AUTHOR_EMAIL", &author_email)
+            // exported unconditionally by the script: an empty value means "now"
+            // and shadows any GIT_AUTHOR_DATE the caller had in the environment
+            .env("GIT_AUTHOR_DATE", &author_date)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // git treats an empty GIT_AUTHOR_DATE as "now"; leaving it unset is the
-        // same, and avoids feeding an empty string to the date parser.
-        if !author_date.is_empty() {
-            commit_tree.env("GIT_AUTHOR_DATE", &author_date);
-        }
         let mut child = commit_tree
             .spawn()
             .map_err(|e| anyhow::anyhow!("failed to run commit-tree: {e}"))?;

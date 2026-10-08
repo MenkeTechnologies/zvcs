@@ -3788,12 +3788,14 @@ fn remove(args: &[String]) -> Result<ExitCode> {
             if let Some(code) = validate_no_submodules(&repo, wt) {
                 return Ok(code);
             }
-            if let Some(dirty) = worktree_is_dirty(&wt.path)? {
-                if dirty {
+            match worktree_is_dirty(&wt.path, arg)? {
+                Ok(Some(true)) => {
                     return die(&format!(
                         "'{arg}' contains modified or untracked files, use --force to delete it"
                     ));
                 }
+                Ok(_) => {}
+                Err(code) => return Ok(code),
             }
         }
         if let Err(e) = std::fs::remove_dir_all(&wt.path) {
@@ -3971,30 +3973,35 @@ fn move_worktree(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `check_clean_worktree()`'s question, asked of the worktree at `path`: does
-/// `status --porcelain` have anything to say? `None` when the checkout cannot be
-/// opened at all, which git treats as nothing to protect.
-fn worktree_is_dirty(path: &Path) -> Result<Option<bool>> {
-    let Ok(repo) = gix::open(path) else {
-        return Ok(None);
-    };
-    if repo.is_dirty()? {
-        return Ok(Some(true));
+/// `status --porcelain --ignore-submodules=none` have anything to say? git runs it as a
+/// child with `GIT_DIR` and `GIT_WORK_TREE` pointing at the worktree
+/// (builtin/worktree.c:1336-1355), so the worktree's own configuration is parsed by that
+/// child, and a child that dies makes `remove` die too:
+///
+/// ```c
+/// if (ret)
+///         die_errno(_("failed to run 'git status' on '%s', code %d"), ...);
+/// ```
+///
+/// `die_errno()` appends whatever `errno` holds, which nothing on that path sets, so the
+/// tail is the text of errno 0. `Ok(None)` when the checkout cannot be opened at all, which
+/// git treats as nothing to protect; `Err` is the exit code once the message is out.
+fn worktree_is_dirty(path: &Path, name: &str) -> Result<std::result::Result<Option<bool>, ExitCode>> {
+    if gix::open(path).is_err() {
+        return Ok(Ok(None));
     }
-    // `is_dirty()` only knows about tracked paths; git refuses over an untracked file
-    // just as readily, so the same dirwalk `clean` uses answers the rest.
-    let index = repo.index_or_empty()?;
-    let options = repo
-        .dirwalk_options()?
-        .emit_untracked(gix::dir::walk::EmissionMode::CollapseDirectory)
-        .emit_ignored(None)
-        .emit_empty_directories(false);
-    let patterns: Vec<gix::bstr::BString> = Vec::new();
-    let iter = repo.dirwalk_iter(index, patterns, Default::default(), options)?;
-    for item in iter {
-        let item = item?;
-        if matches!(item.entry.status, gix::dir::entry::Status::Untracked) {
-            return Ok(Some(true));
-        }
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["status", "--porcelain", "--ignore-submodules=none"])
+        .current_dir(path)
+        .env("GIT_DIR", path.join(".git"))
+        .env("GIT_WORK_TREE", path)
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    if !output.status.success() {
+        let code = output.status.code().unwrap_or(-1);
+        let tail = errno_str(&std::io::Error::from_raw_os_error(0));
+        eprintln!("fatal: failed to run 'git status' on '{name}', code {code}: {tail}");
+        return Ok(Err(ExitCode::from(128)));
     }
-    Ok(Some(false))
+    Ok(Ok(Some(!output.stdout.is_empty())))
 }

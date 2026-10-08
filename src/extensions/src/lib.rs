@@ -1137,6 +1137,7 @@ pub(crate) const NO_SETUP_VERBS: &[&str] = &[
     "diagnose",
     "diff",
     "difftool",
+    "filter-branch",
     "for-each-repo",
     "get-tar-commit-id",
     "hash-object",

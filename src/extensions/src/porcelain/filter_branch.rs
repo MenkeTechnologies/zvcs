@@ -588,7 +588,17 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // through `git_default_config()` (no repository settings block), so a value
     // that callback refuses prints its `fatal:` here; the assignment swallows the
     // exit status and the script carries on.
-    if let Ok(repo) = crate::setup::discover() {
+    //
+    // A configuration file the parser refuses (`bad config line`) fails that child before
+    // any callback runs, and the script's own `git rev-parse --git-dir` in `git-sh-setup`
+    // fails the same way a second time, ending the run at 128 — see below.
+    let bad_config_line = crate::config::bad_config_line(
+        crate::config::ConfigScopes::Repository,
+        crate::config::GitDirNaming::AsDiscovered,
+    );
+    if let Some(msg) = &bad_config_line {
+        eprintln!("fatal: {msg}");
+    } else if let Ok(repo) = crate::setup::discover() {
         if let Err(rejection) = crate::default_config::validate(&repo) {
             let msg = rejection.into_fatal();
             if !msg.is_empty() {
@@ -614,6 +624,10 @@ fn run(args: &[String]) -> Result<ExitCode> {
     if args.first().is_some_and(|a| a == "-h") {
         println!("usage: git filter-branch {USAGE}");
         return Ok(ExitCode::SUCCESS);
+    }
+
+    if let Some(msg) = bad_config_line {
+        return die_with_status(128, &format!("fatal: {msg}"));
     }
 
     let repo = crate::setup::discover()?;
@@ -999,7 +1013,7 @@ fn rewrite(
     // `get_oid_basic()`'s ambiguity warning is printed here — before `select`,
     // which resolves quietly for all four at once. See [`warn_rev_args`].
     warn_rev_args(repo, rev_args);
-    let selection = select(repo, rev_args)?;
+    let selection = select(repo, &ctx.workdir, rev_args)?;
     let mut heads: Vec<String> = Vec::new();
     for name in &selection.head_refs {
         match repo
@@ -2091,7 +2105,9 @@ struct Selection {
     /// records them in.
     bad_object: Option<ObjectId>,
     /// The first argument no `rev-parse` pass can turn into an object and that is
-    /// not an existing file — the one that ends the run with
+    /// not a file of the scratch work tree `$tempdir/t` the script has `cd`ed into
+    /// (empty when line 269 runs, so a name of the real work tree does not count) —
+    /// the one that ends the run with
     /// `fatal: ambiguous argument '<arg>'` and exit 128.
     ///
     /// It is recorded rather than raised on the spot because the script asks two
@@ -2296,7 +2312,7 @@ fn warn_rev_args(repo: &gix::Repository, args: &[String]) {
 /// Deliberately silent: the ambiguity warning those four processes print is
 /// [`warn_rev_args`]'s, called four times at the script's own points, because
 /// resolving here once would produce one warning where stock prints four.
-fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
+fn select(repo: &gix::Repository, cwd: &Path, args: &[String]) -> Result<Selection> {
     let mut sel = Selection::default();
     let mut in_paths = false;
     let mut saw_rev = false;
@@ -2430,7 +2446,7 @@ fn select(repo: &gix::Repository, args: &[String]) -> Result<Selection> {
                 }
                 saw_rev = true;
             }
-            Resolved::Unresolvable if Path::new(arg).exists() => {
+            Resolved::Unresolvable if cwd.join(arg).exists() => {
                 sel.pathspecs.push(arg.clone());
                 sel.saw_nonrev = true;
             }

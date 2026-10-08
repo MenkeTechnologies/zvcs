@@ -911,6 +911,8 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     }
                 } else if s == "--binary" {
                     patch_opts.binary = true;
+                    // `diff_opt_binary()` ends in `enable_patch_output()` (diff.c:5564).
+                    formats.patch = true;
                 // `--submodule[=<format>]`: a bare flag is `DIFF_SUBMODULE_LOG`
                 // (diff.c:6269), an unknown value a usage error (129).
                 } else if s == "--submodule" {
@@ -954,6 +956,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                         Ok(n) => patch_opts.ctx = n,
                         Err(_) => crate::git_fatal!("invalid argument to -U: {v}"),
                     }
+                    // `diff_opt_unified()` ends in `enable_patch_output()` (diff.c:5961),
+                    // so `-U<n>` asks for a patch even after `--quiet`.
+                    formats.patch = true;
                 } else if s == "--no-renames" {
                     patch_opts.renames = Some(0);
                 // `diff_opt_find_copies()`: a second `-C` is `--find-copies-harder`.

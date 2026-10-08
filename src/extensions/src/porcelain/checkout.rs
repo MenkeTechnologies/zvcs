@@ -4083,6 +4083,11 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
             }
         }
     }
+    // `o->internal.result.version = o->src_index->version` (unpack-trees.c:1940): an index read
+    // off disk is rewritten in the version it had, whatever `index.version` says.
+    if !old.version_is_unset() {
+        new_index.set_version(old.version());
+    }
     // `unpack_trees()` ends with `cache_tree_update(..., WRITE_TREE_SILENT | WRITE_TREE_REPAIR)`
     // (unpack-trees.c:2088-2092), so the index git leaves here carries a cache-tree.
     super::write_tree::carry_untracked_cache(&old, &mut new_index);

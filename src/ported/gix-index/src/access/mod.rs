@@ -744,7 +744,12 @@ impl State {
     /// ```c
     /// o->internal.result.timestamp.sec = o->src_index->timestamp.sec;
     /// o->internal.result.timestamp.nsec = o->src_index->timestamp.nsec;
+    /// o->internal.result.version = o->src_index->version;
     /// ```
+    ///
+    /// The version is why `index.version` and `feature.manyFiles` do not turn a version 2 index
+    /// into version 4 when `reset --hard`, `checkout` or `merge --abort` rewrite it: only a
+    /// source that was never on disk (version unset) leaves the choice to `do_write_index()`.
     ///
     /// The timestamp is what `is_racy_timestamp()` measures every entry against, in
     /// `prepare_to_write_split_index()` and in `do_write_index()`'s smudge alike. A state
@@ -753,6 +758,10 @@ impl State {
     /// the shared half with stat data that no longer proves anything.
     pub fn inherit_split_index(&mut self, src: &State) {
         self.timestamp = src.timestamp;
+        if !src.version_unset {
+            self.version = src.version;
+            self.version_unset = false;
+        }
         self.split_index = src.split_index.clone();
         self.link_at_decode_time = src.link_at_decode_time;
     }

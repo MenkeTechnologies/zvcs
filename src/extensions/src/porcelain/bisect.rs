@@ -1982,6 +1982,11 @@ fn start(args: &[String]) -> Result<ExitCode> {
         eprintln!("error: options '--reset-when-found' and '--no-checkout' cannot be used together");
         return Ok(ExitCode::from(BISECT_FAILED));
     }
+    // The `HEAD` lookup behind it (`refs_resolve_ref_unsafe()` / `repo_get_oid()`, git 2.56.0
+    // builtin/bisect.c) is the first revision-name resolution of a `start` that named no
+    // revision, and every one of them builds the repository settings: a `core.*` value
+    // git cannot read ends the command here, ahead of the term checks and every write.
+    crate::repo_settings::RepoSettings::load(&ctx.repo).map_err(crate::fatal::die)?;
     // `pathspec_pos`: where the scan stopped — at the `--`, at the first token
     // that is neither an option nor a revision, or past the end.
     let pathspec_pos = i;

@@ -821,6 +821,10 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // together` followed by `fatal: the remote end hung up unexpectedly`.
     let depth_carried = match opts.shallow {
         Some(Shallow::DepthAtRemote(n)) => Some(n),
+        // `--deepen` is the same `depth` variable by the time the transport reads it
+        // (builtin/fetch.c:2666-2670), so it is sent beside a rev-list selector too and the
+        // server refuses the pair.
+        Some(Shallow::Deepen(n)) => NonZeroU32::new(n),
         _ => None,
     };
     if !shallow_exclude.is_empty() {

@@ -53,8 +53,10 @@
 //!     asks the terminal via `TIOCGWINSZ` when stdout is a tty; there is no
 //!     ioctl in the vendored crates, so a tty-attached run with `COLUMNS` unset
 //!     uses 80 where git would use the window width.
-//!   * when the remote cannot be reached the `fatal:` line on stderr is
-//!     gitoxide's transport error, not git's. stdout and the exit code match.
+//!   * when a network remote cannot be reached the `fatal:` line on stderr is
+//!     gitoxide's transport error, not git's. stdout and the exit code match. A local
+//!     path that is not a repository gets git's own `does not appear to be a git
+//!     repository` block.
 
 use anyhow::{bail, Result};
 use std::io::Write;
@@ -136,6 +138,13 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `git-sh-setup` has already run `git rev-parse` by now: outside a repository that is
+    // `fatal: not a git repository`, and inside one it reads the configuration through
+    // `git_default_config()`, so a refused `core.*` value ends the run at 128 even ahead of
+    // the usage text.
+    let repo = crate::setup::discover()?;
+    crate::default_config::validate(&repo).map_err(crate::default_config::Rejection::into_error)?;
+
     // `test -n "$base" && test -n "$url" || usage`
     let (Some(base), Some(url_arg)) = (positional.first().copied(), positional.get(1).copied())
     else {
@@ -143,8 +152,6 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
     let end = positional.get(2).copied().unwrap_or("");
-
-    let repo = crate::setup::discover()?;
 
     // baserev=$(git rev-parse --verify --quiet "$base"^0)
     let Some(baserev) = peel_to_commit(&repo, base) else {
@@ -243,7 +250,7 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
                 .url(gix::remote::Direction::Fetch)
                 .map(ToString::to_string)
                 .unwrap_or_else(|| url_arg.to_owned());
-            (expanded, ls_remote(remote_handle))
+            (expanded, ls_remote(&repo, remote_handle))
         }
         Err(e) => {
             eprintln!("fatal: {e}");
@@ -273,6 +280,18 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
         if *name == format!("refs/tags/{pretty_remote}") {
             pretty_remote = format!("tags/{pretty_remote}");
         }
+    }
+
+    // `git show -s` is the script's first diff-aware command, and `cmd_show()` reads the
+    // configuration through `git_log_config()`: a refused `diff.*`/`log.*` value is its
+    // `fatal:`, which breaks the `&&` chain before anything reaches stdout, and the
+    // script's `|| status=1` makes the run exit 1.
+    if let Err(rejection) = crate::log_config::validate_log(&repo) {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        return Ok(ExitCode::from(1));
     }
 
     // ------------------------------------------------------------------
@@ -451,10 +470,19 @@ struct Advertised {
 /// The rows `git ls-remote <url>` would print, sorted by refname as the builtin
 /// sorts them. A transport failure reports git-style on stderr and yields no
 /// rows, which is the script's "no match" path.
-fn ls_remote(remote: gix::Remote<'_>) -> Vec<Advertised> {
-    let connection = match remote.connect(gix::remote::Direction::Fetch) {
+fn ls_remote(repo: &gix::Repository, remote: gix::Remote<'_>) -> Vec<Advertised> {
+    // The script's `git ls-remote` has already moved to the top of the work tree, so a
+    // relative URL such as `.` is read from there.
+    let options = gix::remote::connect::Options {
+        current_dir: crate::setup::setup_cwd(repo),
+        ..Default::default()
+    };
+    let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, options) {
         Ok(c) => c,
         Err(e) => {
+            if crate::transport_err::file_url_fatal(&e).is_some() {
+                return Vec::new();
+            }
             eprintln!("fatal: {e}");
             return Vec::new();
         }

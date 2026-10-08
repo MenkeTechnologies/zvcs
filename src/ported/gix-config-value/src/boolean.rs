@@ -39,11 +39,9 @@ impl TryFrom<&BStr> for Boolean {
         } else if parse_false(value) {
             Ok(Boolean(false))
         } else {
-            use std::str::FromStr;
-            if let Some(integer) = value.to_str().ok().and_then(|s| i64::from_str(s).ok()) {
-                Ok(Boolean(integer != 0))
-            } else {
-                Err(bool_err(value))
+            match parse_git_int(value) {
+                Some(integer) => Ok(Boolean(integer != 0)),
+                None => Err(bool_err(value)),
             }
         }
     }
@@ -111,4 +109,54 @@ fn parse_false(value: &BStr) -> bool {
         || value.eq_ignore_ascii_case(b"off")
         || value.eq_ignore_ascii_case(b"false")
         || value.is_empty()
+}
+
+/// git's `git_parse_int()` (config.c `git_parse_signed` with an `INT_MAX` ceiling), the number
+/// `git_parse_maybe_bool()` falls back to: C `strtoimax` with base 0 — `0x` hex, a leading `0`
+/// octal, otherwise decimal — then an optional single `k`/`m`/`g` unit (1024-based) and nothing
+/// after it. `None` is its `EINVAL` or `ERANGE`.
+fn parse_git_int(value: &BStr) -> Option<i64> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        i += 1;
+    }
+    let negative = bytes.get(i) == Some(&b'-');
+    if matches!(bytes.get(i), Some(b'+' | b'-')) {
+        i += 1;
+    }
+    let base: i64 = if bytes.get(i) == Some(&b'0') {
+        if matches!(bytes.get(i + 1), Some(b'x' | b'X')) && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit) {
+            i += 2;
+            16
+        } else {
+            8
+        }
+    } else {
+        10
+    };
+    let digits_start = i;
+    let mut magnitude: i64 = 0;
+    while let Some(digit) = bytes.get(i).and_then(|b| (*b as char).to_digit(16)) {
+        if i64::from(digit) >= base {
+            break;
+        }
+        magnitude = magnitude.checked_mul(base)?.checked_add(i64::from(digit))?;
+        i += 1;
+    }
+    if i == digits_start {
+        return None;
+    }
+    let factor: i64 = match &bytes[i..] {
+        b"" => 1,
+        b"k" | b"K" => 1 << 10,
+        b"m" | b"M" => 1 << 20,
+        b"g" | b"G" => 1 << 30,
+        _ => return None,
+    };
+    let limit = i64::from(i32::MAX) / factor;
+    if magnitude > limit {
+        return None;
+    }
+    Some(if negative { -magnitude } else { magnitude } * factor)
 }

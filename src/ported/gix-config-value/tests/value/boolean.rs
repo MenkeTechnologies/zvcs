@@ -46,3 +46,20 @@ fn from_str_err() {
     assert!(Boolean::try_from("yesn't").is_err());
     assert!(Boolean::try_from("yesno").is_err());
 }
+
+#[test]
+fn integers_are_read_like_git_parse_int() {
+    // `git_parse_maybe_bool()` falls back to `git_parse_int()`: base 0 (hex, octal) and a
+    // `k`/`m`/`g` unit, non-zero meaning true.
+    for truthy in ["0x10", "0X1f", "010", "1k", "1g", " 7", "+0x1"] {
+        assert_eq!(Boolean::try_from(truthy), Ok(Boolean(true)), "{truthy:?}");
+    }
+    for falsy in ["0x0", "00", "0k", "-0"] {
+        assert_eq!(Boolean::try_from(falsy), Ok(Boolean(false)), "{falsy:?}");
+    }
+    // Trailing junk, a digit outside the base, a bare `0x`, a second unit and anything past
+    // `INT_MAX` are `git_parse_int()` failures.
+    for invalid in ["0x", "08", "1kk", "1x", "2147483648", "3g", "99999999999999999999", "0x10z"] {
+        assert!(Boolean::try_from(invalid).is_err(), "{invalid:?}");
+    }
+}

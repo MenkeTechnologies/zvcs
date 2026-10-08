@@ -4762,7 +4762,7 @@ mod tests {
 
 /// C's `atoi()`: leading blanks, one sign, then decimal digits up to the first
 /// other byte; no digits is 0.
-fn c_atoi(s: &str) -> i64 {
+pub(super) fn c_atoi(s: &str) -> i64 {
     let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     let (negative, digits) = match s.as_bytes().first() {
         Some(b'-') => (true, &s[1..]),
@@ -4780,7 +4780,7 @@ fn c_atoi(s: &str) -> i64 {
 /// leading blanks, one sign, and a `0x`/`0` prefix choosing hex or octal. `None`
 /// for trailing junk; an empty digit run leaves `end` at the start, which is junk
 /// unless the string is empty.
-fn c_strtol_full(s: &str) -> Option<i64> {
+pub(super) fn c_strtol_full(s: &str) -> Option<i64> {
     if s.is_empty() {
         return Some(0);
     }

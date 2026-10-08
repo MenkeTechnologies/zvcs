@@ -317,6 +317,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // cross-checks them after parsing (builtin/fetch.c:2666-2684), so these track which
     // of the three were given rather than only the boundary they collapse to.
     let mut depth_given = false;
+    let mut depth_raw: Option<String> = None;
     let mut deepen_relative: Option<i64> = None;
     let mut unshallow = false;
 
@@ -532,17 +533,32 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             }
 
             "--depth" => {
-                let v = take_value!("--depth");
-                // `--depth` is an `OPT_STRING` in git; the number is checked by
-                // `cmd_fetch()` itself, which is why a bad one is a `fatal:` and
-                // not parse-options' 129.
-                let Some(n) = v.parse::<u32>().ok().and_then(NonZeroU32::new) else {
-                    eprintln!("fatal: depth {v} is not a positive number");
-                    return Ok(ExitCode::from(128));
-                };
-                opts.shallow = Some(Shallow::DepthAtRemote(n));
+                // `--depth` is an `OPT_STRING` in git; the number is judged after
+                // parsing (see `depth_raw` below), which is why a bad one is a
+                // `fatal:` and not parse-options' 129.
+                depth_raw = Some(take_value!("--depth"));
                 depth_given = true;
             }
+            // Negations of the value-taking options (`parse_options` resets each
+            // to its initial state: NULL for strings, 0 for integers, an emptied
+            // list for string lists).
+            "--no-depth" => {
+                depth_raw = None;
+                depth_given = false;
+            }
+            "--no-deepen" => {
+                deepen_relative = None;
+                if matches!(opts.shallow, Some(Shallow::Deepen(_))) {
+                    opts.shallow = None;
+                }
+            }
+            "--no-jobs" => jobs = Some(0),
+            "--no-upload-pack" => opts.upload_pack = None,
+            "--no-shallow-since" => shallow_since = None,
+            "--no-shallow-exclude" => shallow_exclude.clear(),
+            "--no-negotiation-restrict" | "--no-negotiation-tip" => opts.negotiation_restrict = None,
+            "--no-negotiation-include" => opts.negotiation_include = None,
+            "--no-negotiate-only" => opts.negotiate_only = false,
             "--deepen" => {
                 let v = take_value!("--deepen");
                 // `OPT_INTEGER`, so a bad value is parse-options' rejection.
@@ -770,6 +786,16 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         if !repo.is_shallow() {
             crate::git_fatal!("--unshallow on a complete repository does not make sense");
         }
+    }
+    // `--depth` is judged by `atoi()` here; the transport later takes it through
+    // `strtol(value, &end, 0)` and refuses trailing junk, once it exists (`fetch_one`).
+    if let Some(v) = depth_raw.as_deref() {
+        if super::clone::c_atoi(v) < 1 {
+            crate::git_fatal!("depth {v} is not a positive number");
+        }
+        let parsed = super::clone::c_strtol_full(v).and_then(|n| u32::try_from(n).ok()).and_then(NonZeroU32::new);
+        opts.depth_junk = parsed.is_none().then(|| v.to_string());
+        opts.shallow = Some(Shallow::DepthAtRemote(parsed.unwrap_or(NonZeroU32::MIN)));
     }
     // `--deepen=<n>` counts "from the current shallow boundary instead of from the
     // tip of each remote branch history" (git-fetch(1)), so a repository with no
@@ -2071,6 +2097,8 @@ struct FetchOpts {
     compact: bool,
     /// Resolved `-j`/`--jobs` / `fetch.parallel`, always at least 1.
     jobs: usize,
+    /// `--depth` value the transport refuses (`transport: invalid depth option`).
+    depth_junk: Option<String>,
     /// `--upload-pack <path>`; `remote.<name>.uploadpack` supplies the per-remote default.
     upload_pack: Option<String>,
     /// `-o`/`--server-option`, repeatable; `remote.<name>.serverOption` supplies the default.
@@ -2133,6 +2161,7 @@ impl Default for FetchOpts {
             compact: false,
             jobs: 1,
             upload_pack: None,
+            depth_junk: None,
             server_options: Vec::new(),
             refmap: None,
             negotiation_restrict: None,
@@ -2832,6 +2861,10 @@ fn fetch_one(
                 return Ok(Verdict::Fatal);
             }
         }
+    }
+    if let Some(v) = opts.depth_junk.as_deref() {
+        eprintln!("fatal: transport: invalid depth option '{v}'");
+        return Ok(Verdict::Fatal);
     }
     if let Some(spec) = name_or_url {
         let spec = spec.to_string();

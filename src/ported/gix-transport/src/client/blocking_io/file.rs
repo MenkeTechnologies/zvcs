@@ -189,10 +189,7 @@ impl SpawnProcessOnDemand {
                 // `git-receive-pack` reports outside the sideband — `advice.ignoredHook` for a
                 // non-executable hook, a `fatal:` from a broken remote configuration, and
                 // anything a `--receive-pack`/`--upload-pack` wrapper writes there.
-                let mut cmd = gix_command::prepare(&program).stderr(Stdio::inherit());
-                if self.service_program_override(service).is_some() {
-                    cmd = cmd.command_may_be_shell_script();
-                }
+                let cmd = gix_command::prepare(&program).stderr(Stdio::inherit());
                 (cmd, None, program.clone())
             }
         };
@@ -200,6 +197,24 @@ impl SpawnProcessOnDemand {
             return Err(client::Error::AmbiguousPath {
                 path: self.path.clone(),
             });
+        }
+        let overridden = self.ssh_cmd.is_none() && self.service_program_override(service).is_some();
+        if overridden {
+            // `git_connect()` pushes the program and the quoted path as ONE argument and sets
+            // `conn->use_shell`, so `prepare_shell_cmd()` runs
+            // `sh -c "<prog> '<path>'" "<prog> '<path>'"`: `argv[0]` is also `$0`, which the
+            // shell prefixes its diagnostics with (`1k '/x': 1k: command not found`). The quote makes
+            // the line a shell command even for a bare program name, so a program that does not exist
+            // is the shell's 127 and a closed pipe, never a failure to spawn.
+            let mut line = program.clone();
+            line.push(OsStr::new(" "));
+            line.push(gix_quote::single(self.path.as_ref()).to_os_str_lossy().into_owned());
+            let cmd = gix_command::prepare(gix_path::env::shell())
+                .stderr(Stdio::inherit())
+                .arg("-c")
+                .arg(&line)
+                .arg(&line);
+            return Ok((cmd, None, program));
         }
         let repo_path = if self.ssh_cmd.is_some() {
             // Over ssh the service and its path travel as ONE argument — the remote

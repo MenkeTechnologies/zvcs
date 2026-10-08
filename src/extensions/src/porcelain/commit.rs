@@ -1158,7 +1158,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // *used* put both behind the "nothing to commit" exit, which meant a typo in
     // either was reported as a clean tree.
     if let Some(u) = &untracked_arg {
-        if !matches!(u.as_str(), "no" | "normal" | "all") {
+        // The named modes, or anything `git_parse_maybe_bool` reads (`1`, `true`, `0x10`).
+        if super::status::parse_untracked_mode(u).is_none() {
             crate::git_fatal!("Invalid untracked files mode '{u}'");
         }
     }
@@ -2993,7 +2994,7 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     // `-u<mode>` is validated before the report is produced so an invalid mode is
     // a fatal error rather than a status-engine usage message mid-dry-run.
     if let Some(u) = &o.untracked {
-        if !matches!(u.as_str(), "no" | "normal" | "all") {
+        if super::status::parse_untracked_mode(u).is_none() {
             crate::git_fatal!("Invalid untracked files mode '{u}'");
         }
     }

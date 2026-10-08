@@ -64,7 +64,7 @@ const USAGE: &str = "usage: git status [<options>] [--] [<pathspec>...]
 
 /// How untracked files are reported, mirroring git's `--untracked-files` modes.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Untracked {
+pub(super) enum Untracked {
     /// `-uno` — no directory walk at all.
     No,
     /// `-unormal` (git's default) — collapse wholly-untracked directories.
@@ -2120,7 +2120,7 @@ pub(crate) fn validate_show_untracked_files(repo: &gix::Repository) -> Option<Ex
 /// The three named modes match verbatim; any other value is run through git's
 /// `git_parse_maybe_bool`, where a truthy value means `normal` and a falsy value
 /// means `no`. `None` is git's "Invalid untracked files mode" (fatal, exit 128).
-fn parse_untracked_mode(value: &str) -> Option<Untracked> {
+pub(super) fn parse_untracked_mode(value: &str) -> Option<Untracked> {
     match value {
         "no" => Some(Untracked::No),
         "normal" => Some(Untracked::Normal),

@@ -2665,7 +2665,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     };
 
     // `do_apply_stash` ends by running `git status` (non-quiet).
-    super::status::status(&[])?;
+    run_status_child(&repo)?;
 
     // A conflict, a refused merge or an untracked path that could not be
     // written keeps the entry, as for `pop`.
@@ -2735,6 +2735,21 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     super::log::log(&rf)
 }
 
+/// The `git status` child `do_apply_stash()` runs after the restore. Its status is
+/// ignored, so a config value its `git_status_config` callback refuses ends only that
+/// child: the `fatal:` goes to stderr and the apply carries on to the drop and exit 0.
+fn run_status_child(repo: &gix::Repository) -> Result<()> {
+    if let Err(rejection) = crate::status_config::validate_status(repo) {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        return Ok(());
+    }
+    super::status::status(&[])?;
+    Ok(())
+}
+
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.
 ///
 /// Port of `do_apply_stash`'s tail: the restore, then `git status` (skipped under
@@ -2770,7 +2785,7 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
     };
 
     if !opts.quiet {
-        super::status::status(&[])?;
+        run_status_child(repo)?;
     }
     // `pop` drops the entry only once the apply succeeded; a conflict, a refused
     // merge or an untracked path it could not write keeps the stash, and says so.
@@ -2792,6 +2807,17 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
 /// [`super::read_tree::StatCtx::refresh_dies_on_attr_source`]. It is a `die()`, so
 /// `pop` never gets to say the entry was kept.
 fn refresh_before_apply(repo: &gix::Repository) -> Result<Option<ExitCode>> {
+    // `init_ui_merge_options()` reads `diff.algorithm` and `die()`s on a name it does not
+    // know (merge-ort.c), ahead of any change to the index or worktree; the other
+    // diff-config keys are refused by the dispatcher gate.
+    if let Some(name) = repo.config_snapshot().string("diff.algorithm") {
+        let name = name.to_str_lossy();
+        if super::diff_optval::parse_algorithm_value(&name).is_none() {
+            return Err(crate::fatal::die(format!(
+                "unknown value for config 'diff.algorithm': {name}"
+            )));
+        }
+    }
     let Some(death) =
         super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &*repo.index_or_empty()?, |_| true)?
     else {

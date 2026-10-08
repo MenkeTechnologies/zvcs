@@ -678,9 +678,22 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // `gc.reflogExpire` and `gc.reflogExpireUnreachable` are `never`, exactly as
     // git's `cfg->prune_reflogs` gate.
     if !skip_foreground_tasks && reflog_expire_enabled(&repo) {
-        if !super::reflog::expire_reflogs(&repo, &super::reflog::ExpireRequest::all())? {
-            // `die(FAILED_RUN, reflog.args.v[0])`.
-            crate::git_fatal!("failed to run reflog");
+        // `gc_foreground_tasks()` (builtin/gc.c): a `reflog expire` child that fails is reported
+        // as `error: failed to run reflog` and the run carries on with the other tasks; it
+        // does not end `gc`. The child's own diagnostics come first — a configured expiry it
+        // cannot parse dies in `reflog_expire_config()` before anything is expired.
+        let failed = match crate::cmd_config::validate_reflog_expire(&repo) {
+            Err(rejection) => {
+                let fatal = rejection.into_fatal();
+                if !fatal.is_empty() {
+                    eprintln!("fatal: {fatal}");
+                }
+                true
+            }
+            Ok(()) => !super::reflog::expire_reflogs(&repo, &super::reflog::ExpireRequest::all())?,
+        };
+        if failed {
+            eprintln!("error: failed to run reflog");
         }
     }
 

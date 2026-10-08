@@ -1558,3 +1558,47 @@ pub fn validate_merge_recursive(repo: &gix::Repository) -> Result<(), Rejection>
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// reflog expire
+// ---------------------------------------------------------------------------
+
+/// `reflog_expire_config()` (reflog.c:35-83) over every configured value, as
+/// `repo_config(the_repository, reflog_expire_config, &opts)` runs it at the top of
+/// `reflog expire` (builtin/reflog.c:216): `gc.reflogExpire` and
+/// `gc.reflogExpireUnreachable`, bare or under a `gc.<pattern>.` subsection, go through
+/// `git_config_expiry_date()`.
+///
+/// ```c
+/// if (!value)
+///         return config_error_nonbool(var);
+/// if (parse_expiry_date(value, timestamp))
+///         return error(_("'%s' for '%s' is not a valid timestamp"), value, var);
+/// ```
+///
+/// The `-1` makes `repo_config()` die, naming the file and line (or `command-line config`).
+/// Every occurrence is parsed, not just the last: an earlier bad value dies even when a
+/// later one would have replaced it.
+pub fn validate_reflog_expire(repo: &gix::Repository) -> Result<(), Rejection> {
+    for v in walk_config(repo) {
+        let Some(rest) = v.key.strip_prefix("gc.") else {
+            continue;
+        };
+        // `parse_config_key()`: the variable name is the last component, whatever
+        // subsection precedes it.
+        let name = rest.rsplit('.').next().unwrap_or(rest);
+        if name != "reflogexpire" && name != "reflogexpireunreachable" {
+            continue;
+        }
+        let Some(raw) = v.value.as_deref() else {
+            return Err(reported(&v, vec![format!("missing value for '{}'", v.key)]));
+        };
+        if crate::date::parse_expiry_date(raw).is_none() {
+            return Err(reported(
+                &v,
+                vec![format!("'{raw}' for '{}' is not a valid timestamp", v.key)],
+            ));
+        }
+    }
+    Ok(())
+}

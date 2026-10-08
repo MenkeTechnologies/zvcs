@@ -31,10 +31,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability checks below skip as they always have.
+fn stock() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Command::new(STOCK).arg("--version").output().is_ok_and(|o| o.status.success())
+    Command::new(stock()).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// A repository with an isolated `$HOME`, so only the configuration each test
@@ -95,7 +103,7 @@ fn man_tool_cmd_runs_the_configured_command_line() {
     assert_eq!(stdout(&out), "git-status\n", "the configured viewer did not receive the page");
 
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"]).output().unwrap();
+        let stock = command(stock(), &repo, &["help", "-m", "status"]).output().unwrap();
         assert_eq!(out.stdout, stock.stdout, "diverges from stock");
     }
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
@@ -115,7 +123,7 @@ fn man_tool_path_overrides_the_program() {
     assert_eq!(stdout(&out), "git-status\n");
 
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"]).output().unwrap();
+        let stock = command(stock(), &repo, &["help", "-m", "status"]).output().unwrap();
         assert_eq!(out.stdout, stock.stdout, "diverges from stock");
     }
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
@@ -155,7 +163,7 @@ fn mismatched_path_and_cmd_warn_the_way_stock_does() {
     assert_eq!(stdout(&out), "git-status\n", "a dropped `cmd` value was run anyway");
 
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"]).output().unwrap();
+        let stock = command(stock(), &repo, &["help", "-m", "status"]).output().unwrap();
         let stock_text = stderr(&stock);
         for line in [
             "warning: 'zvcsecho.path': path for unsupported man viewer.",
@@ -201,7 +209,7 @@ fn the_viewer_list_falls_through_in_configuration_order() {
     );
 
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"]).output().unwrap();
+        let stock = command(stock(), &repo, &["help", "-m", "status"]).output().unwrap();
         assert_eq!(out.stdout, stock.stdout, "diverges from stock");
         assert_eq!(out.stderr, stock.stderr, "warnings diverge from stock");
     }
@@ -226,7 +234,7 @@ fn a_cmd_naming_a_missing_program_ends_the_chain() {
     assert!(stdout(&out).is_empty(), "the chain continued past a started shell");
 
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"]).output().unwrap();
+        let stock = command(stock(), &repo, &["help", "-m", "status"]).output().unwrap();
         assert_eq!(out.status.code(), stock.status.code());
         assert_eq!(out.stdout, stock.stdout);
     }
@@ -249,7 +257,7 @@ fn no_viewer_at_all_dies_the_way_stock_dies() {
         stderr(&out)
     );
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"]).output().unwrap();
+        let stock = command(stock(), &repo, &["help", "-m", "status"]).output().unwrap();
         assert_eq!(out.status.code(), stock.status.code());
         assert_eq!(out.stderr, stock.stderr, "diverges from stock");
     }
@@ -272,7 +280,7 @@ fn git_man_viewer_env_is_tried_after_the_configured_list() {
     assert_eq!(stdout(&out), "env:git-status\n");
 
     if stock_available() {
-        let stock = command(STOCK, &repo, &["help", "-m", "status"])
+        let stock = command(stock(), &repo, &["help", "-m", "status"])
             .env("GIT_MAN_VIEWER", "zvcsenv")
             .output()
             .unwrap();

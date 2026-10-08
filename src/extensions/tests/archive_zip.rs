@@ -12,7 +12,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability checks below skip as they always have.
+fn stock() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn run_with(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(bin)
@@ -72,8 +80,8 @@ fn fixture() -> (PathBuf, PathBuf, PathBuf) {
 
 #[test]
 fn zip_archives_are_byte_identical_to_git() {
-    if !Path::new(STOCK).exists() {
-        eprintln!("skipping: {STOCK} not installed");
+    if !Path::new(stock()).exists() {
+        eprintln!("skipping: {} not installed", stock());
         return;
     }
     let (root, repo, home) = fixture();
@@ -93,7 +101,7 @@ fn zip_archives_are_byte_identical_to_git() {
     ];
     for args in &cases {
         let mine = run_with(BIN, &repo, &home, args);
-        let theirs = run_with(STOCK, &repo, &home, args);
+        let theirs = run_with(stock(), &repo, &home, args);
         assert_eq!(
             mine.status.code(),
             theirs.status.code(),

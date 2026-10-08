@@ -30,7 +30,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability checks below skip as they always have.
+fn stock() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 /// A repository with an isolated `$HOME` — `alias` and `config` read the
 /// configuration, and the `main`/`others` scans read `$PATH`.
@@ -68,7 +76,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
 }
 
 fn run_stock(dir: &Path, args: &[&str]) -> Output {
-    command(STOCK, dir, args).output().unwrap()
+    command(stock(), dir, args).output().unwrap()
 }
 
 fn lines(out: &Output) -> Vec<String> {
@@ -83,7 +91,7 @@ fn set_of(out: &Output) -> BTreeSet<String> {
 /// are pinned against it rather than against a copy of `command-list.txt`, so a
 /// machine without it skips those comparisons instead of asserting stale bytes.
 fn stock_available() -> bool {
-    Command::new(STOCK).arg("--version").output().is_ok_and(|o| o.status.success())
+    Command::new(stock()).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Every `command-list.txt` category git 2.55.0 accepts after `list-`: the ten
@@ -483,7 +491,7 @@ fn completion_helper_runs_after_repository_setup() {
         assert_eq!(ours.status.code(), Some(128), "{dir:?}: {ours:?}");
         assert!(ours.stdout.is_empty(), "{dir:?}: {ours:?}");
         if stock_available() {
-            let mut cmd = command(STOCK, dir, &["add", "--git-completion-helper"]);
+            let mut cmd = command(stock(), dir, &["add", "--git-completion-helper"]);
             let stock = cmd.env("GIT_CEILING_DIRECTORIES", repo.parent().unwrap()).output().unwrap();
             assert_eq!(ours.stderr, stock.stderr, "{dir:?}");
         }

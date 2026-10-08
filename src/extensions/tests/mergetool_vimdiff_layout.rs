@@ -26,7 +26,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability checks below skip as they always have.
+fn stock() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 /// git's default when nothing is configured — the four-window layout, compiled.
 /// Captured from stock git 2.55.0 so the test still asserts something exact on
@@ -36,7 +44,7 @@ leftabove vertical split | 1b | wincmd l | leftabove vertical split | 2b | wincm
 wincmd j | 4b | execute 'tabdo windo diffthis' | tabfirst";
 
 fn stock_available() -> bool {
-    Command::new(STOCK).arg("--version").output().is_ok_and(|o| o.status.success())
+    Command::new(stock()).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// A repository stopped in a two-sided conflict, with a stand-in "editor" that
@@ -152,7 +160,7 @@ fn capture(bin: &str, repo: &Path, tool: &str, config: &[&str]) -> String {
 fn assert_matches_stock(repo: &Path, tool: &str, config: &[&str]) -> String {
     let ours = capture(BIN, repo, tool, config);
     if stock_available() {
-        let stock = capture(STOCK, repo, tool, config);
+        let stock = capture(stock(), repo, tool, config);
         assert_eq!(ours, stock, "tool={tool} config={config:?} diverges from stock");
     }
     ours

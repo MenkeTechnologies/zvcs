@@ -5680,6 +5680,14 @@ impl<'r> Sequencer<'r> {
             .as_deref()
             .filter(|name| !matches!(*name, "recursive" | "ort"))
             .filter(|_| !fast_forward);
+        // `if (is_rebase_i(opts) && write_author_script(msg.message) < 0)` (sequencer.c:2298)
+        // runs *before* the merge, and before the merge reads its configuration, so the picked
+        // commit's author survives a conflict (a `git commit` made during the stop and
+        // `--continue` read it back through `read_env_script()`) and a merge that dies on a
+        // bad `merge.verbosity` or `diff.algorithm` has already left it behind.
+        if !fast_forward {
+            write_author_script(repo, &commit)?;
+        }
         let applied = match child_strategy {
             Some(strategy) => {
                 let xopts: Vec<&str> =
@@ -5708,7 +5716,6 @@ impl<'r> Sequencer<'r> {
                     // and then `pick_commits()`'s `error_with_patch()` — which is
                     // what [`Self::stop_for_conflict`] already is.
                     self.index = index;
-                    write_author_script(repo, &commit)?;
                     return self.stop_for_conflict(
                         item,
                         oid,
@@ -5754,13 +5761,6 @@ impl<'r> Sequencer<'r> {
             // having, and `sequencer_post_commit_cleanup()` is what removes it
             // again once the stop is over.
             crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
-            // `if (is_rebase_i(opts) && write_author_script(msg.message) < 0)`
-            // (sequencer.c:2298) runs *before* the merge, so the picked commit's
-            // author survives a conflict: both a `git commit` made during the
-            // stop and `--continue` read it back through `read_env_script()`.
-            // Writing it only on the paths that reach the commit left a stop with
-            // no record of the author it was replaying.
-            write_author_script(repo, &commit)?;
             // `append_conflicts_hint()` reads the **index**, not the conflict
             // messages: a rename/rename leaves three unmerged paths behind one
             // `CONFLICT (rename/rename)` line and a directory rename leaves the
@@ -5886,8 +5886,6 @@ impl<'r> Sequencer<'r> {
                 }
             }
         }
-
-        write_author_script(repo, &commit)?;
 
         if item.cmd.is_fixup() {
             return self.commit_fixup(item, &commit, applied.tree_id, final_fixup);

@@ -4885,13 +4885,9 @@ fn append_message(buf: &mut Option<String>, arg: &str) {
 ///
 /// Returns the exit code to hand back, having already printed git's `fatal:`.
 pub(super) fn merge_recursive_config_check(repo: &gix::Repository) -> Option<ExitCode> {
-    for key in ["merge.verbosity", "diff.renameLimit", "merge.renameLimit"] {
-        if let Err(msg) = crate::config::config_int(repo, key) {
-            eprintln!("fatal: {msg}");
-            return Some(ExitCode::from(128));
-        }
-    }
-    None
+    let msg = crate::merge_apply::merge_recursive_config_error(repo)?;
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(128))
 }
 
 /// Append one `-F`/`--file` payload to the same buffer `-m` accumulates into,

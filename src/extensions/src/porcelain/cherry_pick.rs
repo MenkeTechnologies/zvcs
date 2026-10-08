@@ -1310,6 +1310,7 @@ fn pick_one(
             if super::merge::merge_recursive_config_check(repo).is_some() {
                 return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
             }
+            crate::merge_apply::ui_diff_algorithm_check(repo)?;
             let mut merge = repo.merge_trees(
                 base_tree,
                 head_tree,

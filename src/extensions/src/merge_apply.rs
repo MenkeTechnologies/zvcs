@@ -1115,6 +1115,32 @@ pub(crate) fn merge_diff_algorithm(repo: &gix::Repository, ui: bool) -> Algorith
         .unwrap_or(Algorithm::Histogram)
 }
 
+/// `init_merge_options()` → `merge_recursive_config()`: the numeric keys it reads are
+/// dies-on-bad-value lookups, so an unreadable one ends every merge that builds its options.
+/// Returns the message git's `fatal:` carries.
+pub(crate) fn merge_recursive_config_error(repo: &gix::Repository) -> Option<String> {
+    ["merge.verbosity", "diff.renameLimit", "merge.renameLimit"]
+        .into_iter()
+        .find_map(|key| crate::config::config_int(repo, key).err())
+}
+
+/// `init_ui_merge_options()` reads `diff.algorithm` and dies on a name
+/// `parse_algorithm_value()` rejects (merge-ort.c:5472-5480), whatever `-X` says later:
+/// `fatal: unknown value for config 'diff.algorithm': <value>` at 128, with no
+/// config-source suffix. `merge` never gets here with one, its configuration layer refuses
+/// it first; `cherry-pick` and `revert` reach it on every pick, clean or not.
+pub(crate) fn ui_diff_algorithm_check(repo: &gix::Repository) -> Result<()> {
+    if let Some(raw) = repo.config_snapshot().string("diff.algorithm") {
+        if parse_algorithm_value(&raw.to_str_lossy()).is_none() {
+            return Err(crate::fatal::die(format!(
+                "unknown value for config 'diff.algorithm': {}",
+                raw.to_str_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `Repository::tree_merge_options()` with the `-X` knobs folded in.
 ///
 /// Shared with the strategy *plumbing* (`git merge-recursive` and its three
@@ -1131,6 +1157,10 @@ pub(crate) fn tree_merge_options(
 ) -> Result<gix::merge::tree::Options> {
     use gix::merge::plumbing::blob::builtin_driver::{binary, text};
 
+    if let Some(msg) = merge_recursive_config_error(repo) {
+        return Err(crate::fatal::die(msg));
+    }
+
     // `merge.conflictStyle` is read *here*, where the merge engine's options are
     // built, not while the configuration is parsed — which is what decides when
     // an unusable value is fatal. Measured against git 2.55.0 with
@@ -1139,6 +1169,10 @@ pub(crate) fn tree_merge_options(
     // `git status` and `git diff` all succeed — none of them reaches a real
     // three-way merge. `git merge-tree` and `git cherry-pick` die like `merge`.
     validate_conflict_style(repo).map_err(|r| r.into_error())?;
+
+    if ui {
+        ui_diff_algorithm_check(repo)?;
+    }
 
     let mut opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
 

@@ -40,6 +40,9 @@ fn run(dir: &Path, home: &Path, envs: &[(&str, &str)], args: &[&str]) -> Output 
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_TEST_ASSUME_DIFFERENT_OWNER")
+        // `git var GIT_EDITOR` fails when no editor resolves (a dumb terminal
+        // with none set, as on a CI runner); pin one so only the setup varies.
+        .env("GIT_EDITOR", "true")
         .env("GIT_AUTHOR_NAME", "a")
         .env("GIT_AUTHOR_EMAIL", "a@example.com")
         .env("GIT_AUTHOR_DATE", "@1000000000 +0000")

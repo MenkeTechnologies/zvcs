@@ -1493,9 +1493,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // A bundle adopts the scratch repository `unbundle()` just filled, not the bundle file
+    // that `local_source` still names.
+    let adopt_from = bundle_transport.as_ref().map_or(local_source.as_path(), |bt| bt.dir.as_path());
     let adopted_pack_files = ((is_local || is_bundle) && !shared)
         .then(|| {
-            adopt_local_objects(&local_source, &git_dir, hardlinks)
+            adopt_local_objects(adopt_from, &git_dir, hardlinks)
                 .map(|()| pack_dir_entries(&git_dir))
         })
         .transpose()?;

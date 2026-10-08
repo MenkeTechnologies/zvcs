@@ -112,12 +112,10 @@
 //!     `create`'s options are `PARSE_OPT_STOP_AT_NON_OPTION`, so the `<file>`
 //!     operand ends option parsing: `git bundle create <file> -q` reports
 //!     `error: unrecognized argument: -q` and writes nothing, exactly as stock
-//!     does — except for the exit code, because git 2.55.0 prints that line and
-//!     then aborts (a shell sees 134): the `goto out` at bundle.c:515 reaches
+//!     does, including the death that follows: the `goto out` at bundle.c:515 reaches
 //!     `object_array_clear(&revs_copy.pending)` (:600) before `revs_copy` is
-//!     initialised (:551). This returns the 1 the path means —
-//!     `ret = !!create_bundle(...)` (builtin/bundle.c:104) over `error()`'s -1 —
-//!     rather than reproducing undefined behaviour.
+//!     initialised (:551), so git 2.54.0, 2.55.0 and 2.56.0 all print that line and then
+//!     abort (a shell sees 134). This aborts too.
 //!
 //! One deliberate gap, so this doc claims no more than the code does: a header
 //! that parses as neither a capability nor a ref line is surfaced as a plain
@@ -1264,16 +1262,16 @@ fn resolve_revisions(
         // ended option parsing, which is why `git bundle create <file> -q` is an
         // error while `git bundle create -q <file>` is not.
         //
-        // (git 2.55.0 aborts on this path — one `error:` line, then SIGABRT from
-        // freeing the uninitialised `revs_copy` at bundle.c:600, so a shell sees
-        // 134. This returns the 1 `!!create_bundle()` makes of the -1
-        // (builtin/bundle.c:104), and writes no bundle.)
+        // Stock aborts on this path: one `error:` line, then SIGABRT from freeing the
+        // uninitialised `revs_copy` at bundle.c:600 (a shell sees 134; measured on git
+        // 2.54.0, 2.55.0 and 2.56.0). The `error:` line is written unbuffered above, and
+        // no bundle is written.
         if matches!(a, "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied")
             || a == "--version"
             || a.starts_with("--version=")
         {
             eprintln!("error: unrecognized argument: {a}");
-            return Ok(Err(ExitCode::from(1)));
+            std::process::abort();
         }
         // `handle_revision_arg_1()`'s very first test, ahead of everything
         // below:

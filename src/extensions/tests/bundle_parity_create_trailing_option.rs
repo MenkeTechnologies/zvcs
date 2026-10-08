@@ -5,13 +5,13 @@
 //! `ret = error(_("unrecognized argument: %s"), argv[1]); goto out;`
 //! (bundle.c:513-516). Stock git 2.55.0 prints that line and then dies of
 //! SIGABRT: `out:` runs `object_array_clear(&revs_copy.pending)` (:600) on a
-//! `revs_copy` that is only initialised at :551. The exit code the code path
-//! means is `ret = !!create_bundle(...)` (builtin/bundle.c:104) over the -1,
-//! i.e. 1 — that, the message, and the absence of any bundle are what this
-//! pins. The message and the empty output were measured against 2.55.0.
+//! `revs_copy` that is only initialised at :551. The port dies the same way:
+//! the message, SIGABRT and the absence of any bundle are what this pins. The
+//! abort was measured on git 2.54.0, 2.55.0 and 2.56.0.
 #![cfg(unix)]
 
 use std::path::PathBuf;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Output};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
@@ -66,7 +66,7 @@ fn a_version_after_the_file_is_an_unrecognized_revision_argument() {
     let out = f.run(&["bundle", "create", "-", "--all", "--version=3"]);
     assert_eq!(String::from_utf8_lossy(&out.stderr), "error: unrecognized argument: --version=3\n");
     assert!(out.stdout.is_empty(), "no bundle bytes on stdout");
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.signal(), Some(6), "SIGABRT, as stock");
 }
 
 #[test]
@@ -74,6 +74,6 @@ fn no_bundle_file_is_written() {
     let f = Fixture::new("file");
     let out = f.run(&["bundle", "create", "b.bundle", "main", "-q"]);
     assert_eq!(String::from_utf8_lossy(&out.stderr), "error: unrecognized argument: -q\n");
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.signal(), Some(6), "SIGABRT, as stock");
     assert!(!f.root.join("b.bundle").exists());
 }

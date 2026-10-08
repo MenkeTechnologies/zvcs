@@ -430,15 +430,6 @@ usage: git reset [--mixed | --soft | --hard | --merge | --keep] [-q] [<commit>]
 
 ";
 
-/// `fatal: ambiguous argument ...` — `die()` from `verify_filename()` (setup.c) when a
-/// leading positional is neither a revision nor an existing worktree path.
-fn ambiguous_argument(arg: &str) -> ExitCode {
-    eprintln!("fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.");
-    eprintln!("Use '--' to separate paths from revisions, like this:");
-    eprintln!("'git <command> [<revision>...] -- [<file>...]'");
-    ExitCode::from(128)
-}
-
 pub fn reset(args: &[String]) -> Result<ExitCode> {
     // git.c:474-476 demotes this command's `RUN_SETUP` to `RUN_SETUP_GENTLY`
     // for a lone `-h` — "demote to GENTLY to allow 'git cmd -h' outside repo" —
@@ -675,11 +666,14 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    // `check_filename()` is a bare `lstat` probe: a tracked-but-deleted path fails it
-    // just like a typo'd revision does, and both die before anything is touched.
+    // `verify_filename()`: a wildcard or long-form magic passes untouched
+    // (`looks_like_pathspec()`), anything else is a bare `lstat` probe, so a
+    // tracked-but-deleted path fails it just like a typo'd revision does, and both die
+    // before anything is touched.
     if let Some(first) = unverified {
-        if std::fs::symlink_metadata(first).is_err() {
-            return Ok(ambiguous_argument(first));
+        if let Some(message) = crate::setup::verify_filename(first, true) {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
         }
     }
 

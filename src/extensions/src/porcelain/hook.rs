@@ -356,11 +356,15 @@ fn run(args: &[String]) -> Result<ExitCode> {
         eprint!("{USAGE_RUN}{OPTS_RUN}");
         return Ok(ExitCode::from(129));
     };
+    // `repo_config(repo, git_default_config, NULL)` (builtin/hook.c:171) comes after the
+    // option parse and the missing-event usage error, and ahead of the unknown-event check.
+    let repo = gentle_repo();
+    crate::default_config::validate_values(crate::config::walk_config_gently(repo.as_ref()))
+        .map_err(crate::default_config::Rejection::into_error)?;
     if let Some(code) = reject_unknown_event(&event, allow_unknown) {
         return Ok(code);
     }
 
-    let repo = gentle_repo();
     let cfg = match with_config(repo.as_ref(), parse_config)? {
         Ok(cfg) => cfg,
         Err(code) => return Ok(code),

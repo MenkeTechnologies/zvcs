@@ -1658,6 +1658,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // unknown name, ahead of `repo_config(git_default_config)`
         // (builtin/unpack-file.c); `porcelain::unpack_file` keeps that order.
         || sub == "unpack-file"
+        // `cmd_hook_run()` reads `git_default_config` after its `parse_options()` and the
+        // missing-event usage error (builtin/hook.c:171), and `cmd_hook()` and `hook list` never
+        // do; `porcelain::hook` validates it itself at that point.
+        || sub == "hook"
         // `cmd_init_db()` reads configuration last — after its options, its operand
         // directory and the format checks — and from the repository it creates; see
         // [`init_config_gate`].

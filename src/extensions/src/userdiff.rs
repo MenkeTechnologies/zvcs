@@ -560,6 +560,16 @@ pub struct Driver {
     pub funcname: Option<FuncName>,
 }
 
+/// The first attribute lookup's `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`
+/// (attr.c:1201-1228), for a renderer that reads an attribute (patch, stat, check) and
+/// has at least one file pair to render.
+pub fn check_attr_source(repo: &gix::Repository) -> anyhow::Result<()> {
+    match crate::porcelain::bad_default_attr_source(repo) {
+        Some(message) => Err(crate::fatal::die(message.to_owned())),
+        None => Ok(()),
+    }
+}
+
 /// `userdiff_find_by_path()` for one command: the gitattributes stack, the driver
 /// table, and the compiled patterns, resolved once per driver name.
 ///
@@ -571,6 +581,9 @@ pub struct Lookup<'repo> {
     names: crate::porcelain::cat_file::Textconv<'repo>,
     /// Driver name to resolved driver; a run touches at most a handful.
     cache: std::collections::HashMap<String, Option<std::sync::Arc<Driver>>>,
+    /// `compute_default_attr_source()`'s `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`,
+    /// raised by the first attribute lookup (attr.c:1201-1228).
+    bad_attr_source: Option<&'static str>,
 }
 
 impl<'repo> Lookup<'repo> {
@@ -579,6 +592,7 @@ impl<'repo> Lookup<'repo> {
             repo,
             names: crate::porcelain::cat_file::Textconv::new(repo)?,
             cache: std::collections::HashMap::new(),
+            bad_attr_source: crate::porcelain::bad_default_attr_source(repo),
         })
     }
 
@@ -591,7 +605,17 @@ impl<'repo> Lookup<'repo> {
     /// those either, which behaves identically to having no driver.
     ///
     /// `Err` carries git's `die(_("Invalid regexp to look for hunk header: %s"))`.
+    /// A lookup that never raises the bad `--attr-source` refusal, for the renderers that
+    /// resolve drivers without git reading any attribute (`--dirstat`).
+    pub fn without_attr_source_check(mut self) -> Self {
+        self.bad_attr_source = None;
+        self
+    }
+
     pub fn for_path(&mut self, path: &BStr) -> Result<Option<std::sync::Arc<Driver>>, String> {
+        if let Some(message) = self.bad_attr_source {
+            return Err(message.to_owned());
+        }
         let Some(name) = self.names.driver_name(path).map_err(|e| e.to_string())? else {
             return Ok(None);
         };

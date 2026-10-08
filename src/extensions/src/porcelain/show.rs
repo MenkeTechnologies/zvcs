@@ -4069,6 +4069,11 @@ fn show_commit_record(
             // `find_paths_generic()`'s `i == 0` pass — so they run over the very
             // two-way queue `files` already holds, and they run *before* the raw
             // block below. Their order among themselves is `diff_flush()`'s.
+            // The count formats read each pair's `diff` attribute (see
+            // [`crate::userdiff::check_attr_source`]).
+            if (numstat || stat || shortstat) && !files.is_empty() {
+                crate::userdiff::check_attr_source(repo)?;
+            }
             if numstat {
                 emit_numstat(out, &files, &disp.relative, disp.z);
                 needsep = true;
@@ -4281,6 +4286,9 @@ fn show_commit_record(
             if raw {
                 emit_raw(repo, out, &files, disp.z, &disp.relative)?;
                 wrote_block = true;
+            }
+            if (numstat || stat || shortstat) && !files.is_empty() {
+                crate::userdiff::check_attr_source(repo)?;
             }
             if numstat {
                 emit_numstat(out, &files, &disp.relative, disp.z);

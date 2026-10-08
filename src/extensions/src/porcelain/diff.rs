@@ -6683,12 +6683,23 @@ pub(crate) fn commit_dirstat(
     out: &mut Vec<u8>,
 ) -> Result<()> {
     let mut cache = repo.diff_resource_cache_for_tree_diff()?;
-    let mut drivers = DriverCache::new(repo)?;
+    // `commit_deltas()` resolves a driver for every pair, but git reads an attribute only
+    // for the pairs the loop below names, so the lookup itself does not raise a bad
+    // `--attr-source`.
+    let mut drivers = DriverCache::new(repo)?.without_attr_source_check();
     let deltas = commit_deltas(repo, &mut cache, &mut drivers, commit_id, parent, opts, specs, false, false)?;
     let hash_kind = repo.object_hash();
     let want_damage = !ds.by_file && !ds.by_line;
     let mut files: Vec<(BString, u64)> = Vec::with_capacity(deltas.len());
     for delta in &deltas {
+        // The attribute lookup a pair makes before git counts it, which dies on a bad
+        // `--attr-source`: `--dirstat=lines` runs the diffstat for every pair, the default
+        // `changes` count (`diffcore_count_changes()`) only for a pair that exists on both
+        // sides with different content, and `--dirstat=files` for none.
+        let counts_content = !matches!(status_char(delta), b'A' | b'D') && !delta.dirstat_oid_unchanged();
+        if ds.by_line || (!ds.by_file && counts_content) {
+            crate::userdiff::check_attr_source(repo)?;
+        }
         let an = analyze(
             &mut cache,
             &repo.objects,

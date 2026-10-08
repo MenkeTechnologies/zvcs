@@ -962,6 +962,7 @@ pub use name_rev::name_rev;
 pub use notes::notes;
 pub use p4::p4;
 pub use pack_objects::pack_objects;
+pub(crate) use pack_objects::bad_default_attr_source;
 pub use pack_redundant::pack_redundant;
 pub use pack_refs::pack_refs;
 pub use patch_id::patch_id;

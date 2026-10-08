@@ -354,12 +354,43 @@ pub fn packed_refs_in_iteration(
 /// ([`gix::lock::acquire::Error::PermanentlyLocked`]) says `EEXIST` and nothing else, so that is
 /// what is reconstructed here. A lock that failed for any other reason is not recognised.
 pub fn lock_held_fatal(err: &anyhow::Error) -> Option<String> {
-    err.chain().find_map(|source| {
+    let held = err.chain().find_map(|source| {
         match source.downcast_ref::<gix::lock::acquire::Error>()? {
             gix::lock::acquire::Error::PermanentlyLocked { resource_path, .. } => Some(
                 gix::lock::pid::unable_to_lock_message(resource_path, &std::io::Error::from_raw_os_error(libc_eexist())),
             ),
             gix::lock::acquire::Error::Io(_) => None,
+        }
+    })?;
+    // A loose reference's lock is reported by `lock_raw_ref()` as `cannot lock ref '<name>': `
+    // plus the same message, naming the ref the caller asked to change (`HEAD` for a commit).
+    Some(match locked_ref_name(err) {
+        Some(name) => format!("cannot lock ref '{name}': {held}"),
+        None => held,
+    })
+}
+
+/// The reference a failed ref transaction could not lock, from whichever carrier the porcelain
+/// handed back (see `crate::lock::is_ref_race` for why each has to be named).
+fn locked_ref_name(err: &anyhow::Error) -> Option<String> {
+    use gix::refs::file::transaction::prepare::Error as Prepare;
+    fn name(e: &Prepare) -> Option<String> {
+        match e {
+            Prepare::LockAcquire { full_name, .. } => Some(full_name.to_string()),
+            _ => None,
+        }
+    }
+    err.chain().find_map(|e| {
+        if let Some(p) = e.downcast_ref::<Prepare>() {
+            return name(p);
+        }
+        match e.downcast_ref::<gix::reference::edit::Error>() {
+            Some(gix::reference::edit::Error::FileTransactionPrepare(p)) => return name(p),
+            _ => {}
+        }
+        match e.downcast_ref::<gix::commit::Error>() {
+            Some(gix::commit::Error::ReferenceEdit(gix::reference::edit::Error::FileTransactionPrepare(p))) => name(p),
+            _ => None,
         }
     })
 }

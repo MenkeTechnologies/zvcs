@@ -3496,6 +3496,19 @@ pub(super) fn switch_gate(
     target_tree: ObjectId,
     merge: Option<MergeOpt<'_>>,
 ) -> Result<Gate> {
+    // `merge_working_tree()` starts with `repo_hold_locked_index(&lock_file, LOCK_DIE_ON_ERROR)`,
+    // so a held `index.lock` ends the switch before any of the checks below are made.
+    // The lock is only probed here and let go again: the index write takes it for itself.
+    match crate::index_racy::hold_locked_index(repo) {
+        Some(probe) => drop(probe),
+        None if std::fs::symlink_metadata(format!("{}.lock", repo.index_path().display())).is_ok() => {
+            return Err(crate::fatal::die(gix::lock::pid::unable_to_lock_message(
+                &repo.index_path(),
+                &std::io::Error::from_raw_os_error(17),
+            )));
+        }
+        None => {}
+    }
     let index = crate::held_index::peek_or_read(repo)?;
     let clobber = crate::merge_guard::verify_two_way(repo, cur_tree, target_tree, &index)?;
     if clobber.is_empty() {

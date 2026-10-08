@@ -989,18 +989,19 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         crate::index_racy::write(&repo, &mut index)?;
         // `if (!pathspec.nr && !unborn)`: an unborn branch has no ref to move and
         // no previous HEAD to save, so `reset_refs()` is skipped outright.
+        let mut head_moved = true;
         if let Some(commit) = &head_commit {
             if let Ok(prev) = repo.head_id() {
                 set_orig_head(&repo, prev.detach())?;
             }
-            move_head(&repo, commit.id, reflog_spec)?;
+            head_moved = move_head_reporting(&repo, commit.id, reflog_spec)?;
         }
         remove_branch_state(&repo, false)?;
         super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
         // No `HEAD is now at` here: `cmd_reset()` gates `print_new_head_line()`
         // on `reset_type == HARD`, so `--merge` and `--keep` move the branch in
         // silence even though they touch the worktree.
-        return Ok(ExitCode::SUCCESS);
+        return Ok(if head_moved { ExitCode::SUCCESS } else { ExitCode::FAILURE });
     }
 
     // soft/mixed/hard: `reset_refs()` records the pre-reset HEAD in ORIG_HEAD
@@ -1008,11 +1009,12 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // merge/cherry-pick/revert state. `reset_refs()` is gated on `!unborn`, so an
     // unborn branch keeps both HEAD and ORIG_HEAD as they were; `remove_branch_state()`
     // is not gated and runs for every whole-tree reset.
+    let mut head_moved = true;
     if let Some(commit) = &head_commit {
         if let Ok(prev) = repo.head_id() {
             set_orig_head(&repo, prev.detach())?;
         }
-        move_head(&repo, commit.id, reflog_spec)?;
+        head_moved = move_head_reporting(&repo, commit.id, reflog_spec)?;
     }
 
     match mode {
@@ -1031,7 +1033,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             super::checkout::maybe_recurse_submodules(&repo, recurse_submodules, true)?;
             // `print_new_head_line()` sits inside the same `!unborn` guard as
             // `reset_refs()`, so an unborn `--hard` empties the worktree silently.
-            if !quiet {
+            if !quiet && head_moved {
                 if let Some(commit) = &head_commit {
                     let summary = commit.message()?.summary().into_owned();
                     println!("HEAD is now at {} {}", commit.short_id()?, summary);
@@ -1048,7 +1050,7 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // printed — so a `die()` inside it leaves both behind.
     remove_branch_state(&repo, false)?;
 
-    Ok(ExitCode::SUCCESS)
+    Ok(if head_moved { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 /// `set_reflog_message()` (builtin/reset.c): the reflog text every `git reset`
@@ -1102,6 +1104,22 @@ pub(crate) fn reflog_message(action: &str, rev: Option<&str>) -> String {
         (Ok(rla), _) if !rla.is_empty() => format!("{rla}: {action}"),
         (_, Some(rev)) => format!("reset: moving to {rev}"),
         (_, None) => format!("reset: {action}"),
+    }
+}
+
+/// [`move_head`] as `reset_refs()` calls it: `update_ref(…, UPDATE_REFS_MSG_ON_ERR)` reports a ref it
+/// could not lock as `error: update_ref failed for ref 'HEAD': …` and the reset carries on, ending in
+/// status 1. `Ok(false)` is that outcome.
+fn move_head_reporting(repo: &gix::Repository, target: ObjectId, spec: &str) -> Result<bool> {
+    match move_head(repo, target, spec) {
+        Ok(()) => Ok(true),
+        Err(e) => match crate::fatal::lock_held_fatal(&e) {
+            Some(message) => {
+                eprintln!("error: update_ref failed for ref 'HEAD': {message}");
+                Ok(false)
+            }
+            None => Err(e),
+        },
     }
 }
 

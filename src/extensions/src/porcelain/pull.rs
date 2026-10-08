@@ -1135,6 +1135,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             if e.downcast_ref::<crate::fatal::Silent>().is_some() {
                 return Ok(ExitCode::FAILURE);
             }
+            // A lock the child could not take is its `die()` as well.
+            if let Some(msg) = crate::fatal::lock_held_fatal(&e) {
+                eprintln!("fatal: {msg}");
+                return Ok(ExitCode::FAILURE);
+            }
             return Err(e);
         }
     };

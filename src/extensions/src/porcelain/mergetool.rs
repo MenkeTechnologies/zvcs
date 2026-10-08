@@ -172,10 +172,17 @@ pub fn mergetool(args: &[String]) -> Result<ExitCode> {
         return Err(crate::fatal::die(msg));
     }
     crate::default_config::validate(&repo).map_err(|r| r.into_error())?;
-    // `require_work_tree`. git's wording embeds the script's own absolute path,
-    // which cannot be reproduced, so this states the condition instead.
-    if repo.workdir().is_none() {
-        crate::git_fatal!("this operation must be run in a work tree");
+    // `require_work_tree` (git-sh-setup.sh:185-190): `git rev-parse
+    // --is-inside-work-tree` must say `true`. A bare repository, a cwd outside the
+    // work tree (`--work-tree=src` from the root) and a `core.worktree` that
+    // names nothing all fail it. `die` is `die_with_status 1` and `$program_name`
+    // is `$0`, the script under the exec-path.
+    if !crate::setup::is_inside_work_tree(&repo) {
+        eprintln!(
+            "fatal: {}/git-mergetool cannot be used without a working tree.",
+            crate::exec_path()
+        );
+        return Ok(ExitCode::from(1));
     }
 
     // `get_merge_tool` (main line `merge_tool=$(get_merge_tool)`), which runs

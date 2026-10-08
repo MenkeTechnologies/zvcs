@@ -1831,6 +1831,12 @@ pub(crate) fn ignore_repository() {
     IGNORED_REPOSITORY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether [`ignore_repository`] has run, i.e. setup reported `*nongit_ok = 1` and the
+/// repository's configuration files are not read.
+pub(crate) fn repository_ignored() -> bool {
+    IGNORED_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Returns the exit code to leave with, or `None` to continue.
 ///
 /// A command that sets up strictly dies with git's message. One that sets up

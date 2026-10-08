@@ -2896,6 +2896,12 @@ fn reftable_head_branch(dirs: &RepositoryDirs) -> Option<Option<String>> {
 /// config will not parse, so the location has to come from the discovery walk
 /// alone.
 fn repository_directories() -> Option<RepositoryDirs> {
+    // A command that sets up gently has been told `*nongit_ok = 1` — setup refused
+    // every candidate (`$GIT_OBJECT_DIRECTORY` unusable, ownership, `safe.bareRepository`) —
+    // and never reads the repository's configuration.
+    if crate::setup::repository_ignored() {
+        return None;
+    }
     // `setup_git_directory_gently_1()` reads `$GIT_DIR` before it walks anywhere
     // and returns `GIT_DIR_EXPLICIT` when it is set, so the variable short-circuits
     // discovery entirely.

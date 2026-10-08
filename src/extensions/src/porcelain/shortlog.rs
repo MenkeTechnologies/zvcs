@@ -836,24 +836,6 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         filters.order = Order::Topo;
     }
 
-    // Compile the message/ident patterns to byte regexes now that the dialect
-    // and `-i` are final. git's default is POSIX basic; `-E`/`-P` extended/perl,
-    // `-F` a literal. A pattern that cannot compile is git's fatal regcomp error.
-    filters.commit_filter.grep_res = compile_patterns(
-        &filters.grep,
-        filters.dialect,
-        filters.ignore_case,
-        crate::revfilter::Origin::CommandLine,
-    )?;
-    filters.commit_filter.author_res = compile_patterns(
-        &filters.author,
-        filters.dialect,
-        filters.ignore_case,
-        crate::revfilter::Origin::Header,
-    )?;
-    filters.commit_filter.all_match = filters.all_match;
-    filters.commit_filter.invert_grep = filters.invert_grep;
-
     let mut repo = crate::setup::discover().ok();
     // `revision.c` clamps `--abbrev=<n>` against the repository's hash width, so
     // the value can only be resolved once the repository is open. Outside one,
@@ -1107,6 +1089,26 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+
+    // Compile the message/ident patterns to byte regexes once the dialect and `-i` are
+    // final, as `setup_revisions()` does after it has resolved every revision operand
+    // (`compile_grep_patterns()`), so an unknown revision is reported ahead of a bad
+    // pattern. git's default is POSIX basic; `-E`/`-P` extended/perl,
+    // `-F` a literal. A pattern that cannot compile is git's fatal regcomp error.
+    filters.commit_filter.grep_res = compile_patterns(
+        &filters.grep,
+        filters.dialect,
+        filters.ignore_case,
+        crate::revfilter::Origin::CommandLine,
+    )?;
+    filters.commit_filter.author_res = compile_patterns(
+        &filters.author,
+        filters.dialect,
+        filters.ignore_case,
+        crate::revfilter::Origin::Header,
+    )?;
+    filters.commit_filter.all_match = filters.all_match;
+    filters.commit_filter.invert_grep = filters.invert_grep;
 
     // Both option parsing and revision resolution above have now had their
     // chance to emit git's exact `fatal:`/usage exit code in argv order. Only if

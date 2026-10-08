@@ -940,6 +940,7 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
 
     // `--orphan <name> [<start>]`: start an unborn branch off `<start>`'s tree.
     if let Some(name) = orphan {
+        refuse_paths_beside_new_branch(&repo, &name, &pre, &post, has_dashdash)?;
         return orphan_checkout(&repo, &name, pre.first().copied(), quiet, force, new_branch_log);
     }
 
@@ -954,49 +955,7 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
     }
 
     if let Some((name, reset)) = new_branch {
-        // A bare `--` introduces no pathspec at all — `git checkout -B main origin/main --`
-        // is a plain branch creation, which is how the JetBrains client spells it. Only a
-        // path *after* the separator (or before it, without one) is a path restore.
-        // `parse_branchname_arg()` takes the leading operand as the start-point
-        // only when it resolves; whatever is left is `opts->pathspec`.
-        // `parse_branchname_arg()`'s own resolution, which is `get_oid_mb()`'s:
-        // an operand holding `...` is a start-point too (the merge base), not a
-        // pathspec.
-        let start_resolved = pre
-            .first()
-            .map(|p| super::branch::get_oid_mb_quiet(&repo, p).is_some())
-            .unwrap_or(false);
-        let remaining: &[&str] = if has_dashdash {
-            &post
-        } else if start_resolved {
-            &pre[1..]
-        } else {
-            &pre
-        };
-        if !remaining.is_empty() {
-            // ```c
-            // /* Try to give more helpful suggestion. new_branch && argc > 1 will be caught later. */
-            // if (opts->new_branch && argc == 1 && !new_branch_info.commit)
-            //         die(_("'%s' is not a commit and a branch '%s' cannot be created from it"),
-            //             argv[0], opts->new_branch);
-            // ```
-            // (builtin/checkout.c:2024-2027, then `checkout_paths()`'s
-            // `die(_("Cannot update paths and switch to branch '%s' at the same
-            // time."), opts->new_branch)` at :551.) The friendlier wording needs
-            // *both* conditions: exactly one operand left, and no start-point
-            // resolved for it to have been. `git checkout -b o master -- f.txt`
-            // has a start-point, so it gets the blunt one.
-            if remaining.len() == 1 && !start_resolved {
-                crate::git_fatal!(
-                    "'{}' is not a commit and a branch '{name}' cannot be created from it",
-                    remaining[0]
-                );
-            }
-            eprintln!(
-                "fatal: Cannot update paths and switch to branch '{name}' at the same time."
-            );
-            return Ok(ExitCode::from(128));
-        }
+        refuse_paths_beside_new_branch(&repo, &name, &pre, &post, has_dashdash)?;
         // ```c
         // if (opts->new_branch) {
         //         struct strbuf buf = STRBUF_INIT;
@@ -2259,6 +2218,69 @@ fn switch_unborn_to_new_branch(
     super::reset::remove_branch_state(repo, !quiet)?;
     let head = head_commit_id(repo);
     Ok(run_post_checkout(repo, head, head, true))
+}
+
+/// `parse_branchname_arg()` and the tail of `cmd_checkout()` for the forms that create a branch.
+/// `opts->new_branch` has absorbed `--orphan` by then (builtin/checkout.c:1957-1962), so `-b`, `-B`
+/// and `--orphan` meet the same refusals when a pathspec comes along.
+///
+/// A bare `--` introduces no pathspec at all: `git checkout -B main origin/main --` is a plain
+/// branch creation, which is how the JetBrains client spells it. Only a path *after* the separator
+/// (or before it, without one) is a path restore. `parse_branchname_arg()` takes the leading operand
+/// as the start-point only when it resolves, by `get_oid_mb()`'s rules (an operand holding `...` is
+/// a start-point too: the merge base); whatever is left is `opts->pathspec`.
+///
+/// ```c
+/// if (has_dash_dash)          /* case (3) */
+///         die(_("invalid reference: %s"), arg);
+/// ```
+///
+/// (builtin/checkout.c:1512-1513) — with `--` after it, the operand can only have been a revision.
+///
+/// ```c
+/// /* Try to give more helpful suggestion. new_branch && argc > 1 will be caught later. */
+/// if (opts->new_branch && argc == 1 && !new_branch_info.commit)
+///         die(_("'%s' is not a commit and a branch '%s' cannot be created from it"),
+///             argv[0], opts->new_branch);
+/// ```
+///
+/// (builtin/checkout.c:2024-2027, then `checkout_paths()`'s `die(_("Cannot update paths and switch to
+/// branch '%s' at the same time."), opts->new_branch)` at :551.) The friendlier wording needs *both*
+/// conditions: exactly one operand left, and no start-point resolved for it to have been. `git
+/// checkout -b o master -- f.txt` has a start-point, so it gets the blunt one.
+fn refuse_paths_beside_new_branch(
+    repo: &gix::Repository,
+    name: &str,
+    pre: &[&str],
+    post: &[&str],
+    has_dashdash: bool,
+) -> Result<()> {
+    let start_resolved = pre
+        .first()
+        .map(|p| super::branch::get_oid_mb_quiet(repo, p).is_some())
+        .unwrap_or(false);
+    if has_dashdash && !start_resolved {
+        if let Some(arg) = pre.first() {
+            crate::git_fatal!("invalid reference: {arg}");
+        }
+    }
+    let remaining: &[&str] = if has_dashdash {
+        post
+    } else if start_resolved {
+        &pre[1..]
+    } else {
+        pre
+    };
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    if remaining.len() == 1 && !start_resolved {
+        crate::git_fatal!(
+            "'{}' is not a commit and a branch '{name}' cannot be created from it",
+            remaining[0]
+        );
+    }
+    crate::git_fatal!("Cannot update paths and switch to branch '{name}' at the same time.");
 }
 
 /// `git checkout --orphan <name> [<start>]`: point `HEAD` at an unborn branch

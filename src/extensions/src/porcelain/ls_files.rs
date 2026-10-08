@@ -301,6 +301,24 @@ fn check_pathspecs(
     Ok(None)
 }
 
+/// Whether `match_pathspec_item()` would check attributes: an `:(attr:…)` element is
+/// checked against an entry *before* its path part is compared (dir.c), so any such
+/// element and any entry left after `prune_index()` is enough.
+fn attr_pathspec_reaches_entry(
+    repo: &gix::Repository,
+    patterns: &[BString],
+    index: &gix::index::State,
+) -> Result<bool> {
+    if index.entries().is_empty() {
+        return Ok(false);
+    }
+    let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
+    Ok(patterns
+        .iter()
+        .filter_map(|pattern| gix::pathspec::parse(pattern.as_slice(), defaults).ok())
+        .any(|parsed| !parsed.attributes.is_empty()))
+}
+
 /// `git ls-files` — list index entries, and optionally worktree-derived sets.
 ///
 /// Supported invocations:
@@ -848,6 +866,18 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         let max_prefix = max_prefix.strip_suffix(b"/").unwrap_or(&max_prefix).to_vec();
         if !max_prefix.is_empty() {
             index.remove_entries(|_, path, _| !path.starts_with(&max_prefix));
+        }
+    }
+
+    // The first `git_check_attr()` of a run reaches `compute_default_attr_source()`, which dies on
+    // a `GIT_ATTR_SOURCE` that names no tree-ish (attr.c:1201-1228). A `:(attr:…)` element makes
+    // that call from `match_pathspec_item()` once its path part matches an entry.
+    if let Some(message) = super::pack_objects::bad_default_attr_source(&repo) {
+        if (opts.shows_index_entries() || opts.deleted || opts.modified)
+            && attr_pathspec_reaches_entry(&repo, &patterns, &index)?
+        {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
         }
     }
 

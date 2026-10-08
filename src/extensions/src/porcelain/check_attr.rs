@@ -98,7 +98,10 @@ pub fn check_attr(args: &[String]) -> Result<ExitCode> {
             .config_snapshot()
             .boolean("core.bare")
             .unwrap_or(true);
-        if !bare_cfg && repo.workdir().is_none() {
+        // `setup_work_tree()` also dies when the work tree it was given cannot be entered
+        // (setup.c:503-505), which is how `--work-tree=src` typed inside `.git` ends: the
+        // directory is `.git/hooks/src`, and it is not there.
+        if (!bare_cfg && repo.workdir().is_none()) || repo.workdir().is_some_and(|wt| !wt.is_dir()) {
             return Err(crate::fatal::need_work_tree());
         }
     }

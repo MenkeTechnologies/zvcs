@@ -73,6 +73,10 @@ pub fn merge_ours(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: your current branch '{branch}' does not have any commits yet");
         return Ok(ExitCode::from(128));
     };
+    // `repo_get_oid("HEAD")` matched a ref, so the dwim asks
+    // `repo_settings_get_warn_ambiguous_refs()`, whose `git_config_bool()` dies on
+    // a value it cannot read (`core.warnAmbiguousRefs=always`).
+    crate::refname::warn_ambiguous_refs(&repo);
     let head_tree_id = repo.find_commit(head_commit.detach())?.tree_id()?.detach();
 
     // A missing index file is an empty index, not an error (git's read_index()

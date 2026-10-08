@@ -3592,7 +3592,16 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `get_revision()` applies to the *whole* sequence, boundary commits included
     // (revision.c:4673-4692), putting them in front and reversing their own order.
     let mut boundary_commits = if boundary {
-        boundary_list(&repo, &commits, &mut parents_of, order == Order::DateTopo)
+        boundary_list_by(
+            &repo,
+            &commits,
+            &mut parents_of,
+            match order {
+                Order::DateTopo => Some(commit_date as DateOf),
+                Order::AuthorDateTopo => Some(author_date as DateOf),
+                Order::Date | Order::Topo => None,
+            },
+        )
     } else {
         Vec::new()
     };
@@ -5442,6 +5451,22 @@ pub(crate) fn boundary_list(
     parents_of: &mut HashMap<ObjectId, Vec<ObjectId>>,
     by_date: bool,
 ) -> Vec<ObjectId> {
+    boundary_list_by(repo, shown, parents_of, by_date.then_some(commit_date as DateOf))
+}
+
+/// A commit's sort key for [`boundary_list_by`].
+type DateOf = fn(&gix::Repository, ObjectId) -> i64;
+
+/// [`boundary_list`] with the date the topological sort orders by chosen by the
+/// caller: `None` keeps the graph-order stack, `Some(commit_date)` is
+/// `--date-order` and `Some(author_date)` is `--author-date-order`
+/// (`REV_SORT_BY_AUTHOR_DATE`, revision.c:2456-2458).
+fn boundary_list_by(
+    repo: &gix::Repository,
+    shown: &[ObjectId],
+    parents_of: &mut HashMap<ObjectId, Vec<ObjectId>>,
+    date_of: Option<DateOf>,
+) -> Vec<ObjectId> {
     let shown_set: HashSet<ObjectId> = shown.iter().copied().collect();
     let mut candidates: Vec<ObjectId> = Vec::new();
     let mut child_shown: HashSet<ObjectId> = HashSet::new();
@@ -5462,11 +5487,8 @@ pub(crate) fn boundary_list(
             .entry(*id)
             .or_insert_with(|| commit_parents(repo, *id));
     }
-    let dates: Option<HashMap<ObjectId, i64>> = by_date.then(|| {
-        list.iter()
-            .map(|id| (*id, commit_date(repo, *id)))
-            .collect()
-    });
+    let dates: Option<HashMap<ObjectId, i64>> =
+        date_of.map(|date_of| list.iter().map(|id| (*id, date_of(repo, *id))).collect());
     topo_sort(&list, parents_of, dates.as_ref())
 }
 

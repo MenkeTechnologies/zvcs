@@ -117,6 +117,24 @@
 //!     initialised (:551), so git 2.54.0, 2.55.0 and 2.56.0 all print that line and then
 //!     abort (a shell sees 134). This aborts too.
 //!
+//!     Everything after `<file>` is `setup_revisions()`'s, so rev-list options are
+//!     accepted there. `claim_revision_opt()` is that function's option chain: the
+//!     count-and-age arm ([`crate::revopt`]), [`REVISION_OPTS`], then
+//!     `diff_opt_parse()`. A word none of them claims is remembered and reported
+//!     once the line is read, so a bad revision later on it dies first (128). An
+//!     option that only shapes output is dropped; one that limits the walk
+//!     (`--max-count`, `--since`, `--no-merges`, a pathspec, ...) sends the revision
+//!     words through `rev-list --boundary` ([`limited_walk`]), whose boundary lines
+//!     are the prerequisites and whose other lines are the commits `SHOWN` — a tip
+//!     missing from them is `ref '<name>' is excluded by the rev-list options`.
+//!
+//!     Gaps: the pseudo-options `--reflog`, `--alternate-refs`, `--indexed-objects`,
+//!     `--bisect`, `--ignore-missing` and `--single-worktree` are not implemented and
+//!     end as unrecognized arguments; and `--left-only` / `--right-only` / `--cherry`
+//!     over a symmetric difference keep the commits they hide (`SHOWN` without being
+//!     emitted) only as the set a walk without them shows, which differs from git when
+//!     a limit such as `--max-count` is also given.
+//!
 //! One deliberate gap, so this doc claims no more than the code does: a header
 //! that parses as neither a capability nor a ref line is surfaced as a plain
 //! error rather than git's `unrecognized header:` text. A capability that is
@@ -700,13 +718,6 @@ fn history_is_complete(repo: &gix::Repository, tips: &[ObjectId]) -> bool {
 /// prerequisite lines, the ref lines, the blank line that ends the header, and
 /// the pack.
 fn create(args: &[String]) -> Result<ExitCode> {
-    // `--help-all` is its own `strcmp()` inside `parse_options_step()` and prints
-    // `USAGE_FULL`, which is this same block — no entry here is
-    // `PARSE_OPT_HIDDEN`.
-    if args.iter().any(|a| a == "-h" || a == "--help-all") {
-        return Ok(super::show_usage(CREATE_USAGE));
-    }
-
     // `builtin_bundle_create_options`: the progress switches are
     // `OPT_PASSTHRU_ARGV` into `pack_opts`, after the `--progress` that
     // `isatty(STDERR_FILENO)` pushes and before the unconditional
@@ -745,6 +756,12 @@ fn create(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "--" => end_of_opts = true,
+            // `-h` and `--help-all` are read by `parse_options()` only while it is still
+            // looking at options; after the `<file>` operand they are `setup_revisions()`
+            // leftovers like any other. `--help-all` is its own `strcmp()` inside
+            // `parse_options_step()` and prints `USAGE_FULL`, which is this same block —
+            // no entry here is `PARSE_OPT_HIDDEN`.
+            "-h" | "--help-all" => return Ok(super::show_usage(CREATE_USAGE)),
             "-q" | "--quiet" => progress = false,
             "--progress" | "--all-progress" => progress = true,
             "--all-progress-implied" => {}
@@ -816,10 +833,11 @@ fn create(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: Need a repository to create a bundle.");
         return Ok(ExitCode::from(128));
     };
-    let (pending, pathspecs) = match resolve_revisions(&repo, &rev_args)? {
-        Ok(p) => p,
-        Err(code) => return Ok(code),
-    };
+    let Setup { pending, pathspecs, walk_args, unrecognized, diff, max_age, min_age } =
+        match resolve_revisions(&repo, &rev_args)? {
+            Ok(setup) => setup,
+            Err(code) => return Ok(code),
+        };
     // `setup_revisions()`'s tail: `parse_pathspec(&revs->prune_data, …)` over
     // whatever reached `prune_data`, which is where a `..` that never was a
     // range finally lands. It runs inside `setup_revisions()`, so it precedes
@@ -829,6 +847,27 @@ fn create(args: &[String]) -> Result<ExitCode> {
     if let Some(msg) = crate::pathspec::parse_pathspec_fatal(&repo, &pathspecs) {
         eprintln!("fatal: {msg}");
         return Ok(ExitCode::from(128));
+    }
+    // `diff_setup_done(&revs->diffopt)` (revision.c:3212), still inside
+    // `setup_revisions()`: `--follow` without exactly one pathspec, two pickaxes,
+    // and the other option combinations the diff machinery refuses.
+    if let Err(message) = diff.setup_done(&pathspecs) {
+        eprintln!("fatal: {message}");
+        return Ok(ExitCode::from(128));
+    }
+    // `if (argc > 1) error(_("unrecognized argument: %s"), argv[1])`
+    // (bundle.c:513-516): whatever `setup_revisions()` left behind. `bundle
+    // create`'s own switches are exactly that once the `<file>` operand has
+    // ended option parsing, which is why `git bundle create <file> -q` is an
+    // error while `git bundle create -q <file>` is not.
+    //
+    // Stock aborts on this path: one `error:` line, then SIGABRT from freeing the
+    // uninitialised `revs_copy` at bundle.c:600 (a shell sees 134; measured on git
+    // 2.54.0, 2.55.0 and 2.56.0). The `error:` line is written unbuffered above, and
+    // no bundle is written.
+    if let Some(word) = unrecognized {
+        eprintln!("error: unrecognized argument: {word}");
+        std::process::abort();
     }
 
     // `if (version == -1) version = min_version;` — 2 for sha1, and only 2 or 3
@@ -900,7 +939,22 @@ fn create(args: &[String]) -> Result<ExitCode> {
     } else {
         super::log::ancestor_closure(&repo, &hidden)?
     };
-    let prereqs = boundary_commits(&repo, &tips, &hidden, &excluded_closure);
+    // A limiting option or a pathspec makes `get_revision()` show fewer commits than
+    // the closure of the tips, so the boundary and the shown set come from the walk
+    // itself; without one the closure computed above is the whole answer.
+    let limited = match &walk_args {
+        // Nothing to walk from: the pack is empty and the bundle is refused below, and
+        // `rev-list` would only answer with its usage.
+        Some(walk_args) if pending.iter().any(|p| !p.uninteresting) => match limited_walk(walk_args)? {
+            Ok(limited) => Some(limited),
+            Err(code) => return Ok(code),
+        },
+        _ => None,
+    };
+    let prereqs = match &limited {
+        Some(limited) => limited.boundary.clone(),
+        None => boundary_commits(&repo, &tips, &hidden, &excluded_closure),
+    };
     for id in &prereqs {
         let subject = commit_oneline(&repo, *id);
         out.extend_from_slice(format!("-{id} {subject}\n").as_bytes());
@@ -921,6 +975,37 @@ fn create(args: &[String]) -> Result<ExitCode> {
         .filter(|p| !p.uninteresting && !excluded_closure.contains(&p.id))
     {
         let Some(display) = &entry.display_ref else { continue };
+        // ```c
+        // if (!(e->item->flags & SHOWN) && e->item->type == OBJ_COMMIT) {
+        //         warning(_("ref '%s' is excluded by the rev-list options"), e->name);
+        //         goto skip_write_ref;
+        // }
+        // ```
+        //
+        // `--max-count` and the other limiting options can keep a tip out of the
+        // walk's output; a tag or blob is not a commit and is never affected.
+        if let Some(limited) = &limited {
+            // A boundary commit is `UNINTERESTING`, which the loop skips before it dwims.
+            if limited.boundary.contains(&entry.id) {
+                continue;
+            }
+            let entry_kind = repo.find_object(entry.id).ok().map(|o| o.kind);
+            let is_commit = entry_kind == Some(Kind::Commit);
+            if is_commit && !limited.shown.contains(&entry.id) {
+                eprintln!("warning: ref '{}' is excluded by the rev-list options", entry.name);
+                continue;
+            }
+            // A tag is never warned about, but `--since` and `--until` still drop one whose
+            // own date is outside the window (its tagger line, 0 without one). Measured on
+            // git 2.56.0: `bundle create <file> v1 --since=<after the tag was made>` and
+            // `--until=<before it>` both refuse an empty bundle, while a cut that falls
+            // between the tagged commit and the tag keeps the ref.
+            if entry_kind == Some(Kind::Tag)
+                && !tag_in_age_window(&repo, entry.id, max_age, min_age)
+            {
+                continue;
+            }
+        }
         if seen.iter().any(|s| s == display) {
             continue;
         }
@@ -1034,6 +1119,10 @@ fn parse_version(v: &str) -> std::result::Result<i64, ExitCode> {
 /// negated.
 struct Pending {
     id: ObjectId,
+    /// `e->name`: the entry as typed (a full ref name for `--all`, `--branches` and
+    /// friends), which is what `write_bundle_refs()` quotes in its
+    /// `ref '%s' is excluded by the rev-list options` warning.
+    name: String,
     /// `display_ref` in `write_bundle_refs`: the dwim-resolved full ref name,
     /// or the name as typed when that name is a symref (which is what keeps
     /// `HEAD` printing as `HEAD` rather than as its target). `None` for an
@@ -1053,6 +1142,320 @@ struct Item {
     from_stdin: bool,
 }
 
+/// How `handle_revision_opt()` / `handle_revision_pseudo_opt()` take a value.
+#[derive(Clone, Copy)]
+enum Take {
+    /// `--name` and nothing else: `--name=x` is not this option.
+    Flag,
+    /// `--name` or `--name=<v>` (`skip_prefix(arg, "--name=")` / `starts_with`).
+    Opt,
+    /// `--name=<v>` only; the bare word is not this option.
+    Attached,
+    /// `parse_long_opt()`: `--name=<v>`, or `--name` plus the next argv word,
+    /// which `die()`s `Option '--name' requires a value` when there is none.
+    Detached,
+}
+
+/// The options `setup_revisions()` consumes that are neither the count-and-age
+/// arm ([`crate::revopt`]) nor `diff_opt_parse()`'s table, with whether the
+/// option changes which commits `get_revision()` hands back. Derived by running
+/// each spelling through stock `git bundle create <file> main <opt>` and keeping
+/// those that do not answer `unrecognized argument`.
+///
+/// `bundle create` runs no diff and prints no log, so every option that only
+/// shapes output (`--oneline`, `--parents`, `--left-right`, `--graph`, …) is
+/// accepted and ignored, exactly as stock ignores it. The `walk` ones are handed
+/// to the limited walk in [`limited_walk`].
+const REVISION_OPTS: &[(&str, Take, bool)] = &[
+    // Commit selection.
+    ("--merges", Take::Flag, true),
+    ("--no-merges", Take::Flag, true),
+    ("--min-parents", Take::Attached, true),
+    ("--max-parents", Take::Attached, true),
+    ("--no-min-parents", Take::Flag, true),
+    ("--no-max-parents", Take::Flag, true),
+    ("--first-parent", Take::Flag, true),
+    ("--exclude-first-parent-only", Take::Flag, true),
+    ("--ancestry-path", Take::Opt, true),
+    ("--full-history", Take::Flag, true),
+    ("--sparse", Take::Flag, true),
+    ("--dense", Take::Flag, true),
+    ("--simplify-merges", Take::Flag, true),
+    ("--simplify-by-decoration", Take::Flag, true),
+    ("--remove-empty", Take::Flag, true),
+    ("--show-pulls", Take::Flag, true),
+    ("--maximal-only", Take::Flag, true),
+    ("--cherry-pick", Take::Flag, true),
+    ("--cherry", Take::Flag, true),
+    // See [`limited_walk`]: these hide commits by setting `SHOWN`, not by dropping them.
+    ("--left-only", Take::Flag, true),
+    ("--right-only", Take::Flag, true),
+    ("--unpacked", Take::Opt, true),
+    ("--no-kept-objects", Take::Opt, true),
+    ("--merge", Take::Flag, true),
+    ("-g", Take::Flag, true),
+    ("--walk-reflogs", Take::Flag, true),
+    // Order and direction.
+    ("--reverse", Take::Flag, true),
+    ("--no-walk", Take::Opt, true),
+    ("--do-walk", Take::Flag, true),
+    ("--topo-order", Take::Flag, true),
+    ("--date-order", Take::Flag, true),
+    ("--author-date-order", Take::Flag, true),
+    // The commit-message predicates and the dialect flags that compile them.
+    ("--grep", Take::Detached, true),
+    ("--author", Take::Detached, true),
+    ("--committer", Take::Detached, true),
+    ("--grep-reflog", Take::Detached, true),
+    ("-i", Take::Flag, true),
+    ("--regexp-ignore-case", Take::Flag, true),
+    ("-E", Take::Flag, true),
+    ("--extended-regexp", Take::Flag, true),
+    ("-F", Take::Flag, true),
+    ("--fixed-strings", Take::Flag, true),
+    ("-P", Take::Flag, true),
+    ("--perl-regexp", Take::Flag, true),
+    ("--basic-regexp", Take::Flag, true),
+    ("--all-match", Take::Flag, true),
+    ("--invert-grep", Take::Flag, true),
+    // Output shape only.
+    ("--boundary", Take::Flag, false),
+    ("--children", Take::Flag, false),
+    ("--parents", Take::Flag, false),
+    ("--left-right", Take::Flag, false),
+    ("--cherry-mark", Take::Flag, false),
+    ("--count", Take::Flag, false),
+    ("--objects", Take::Flag, false),
+    ("--objects-edge", Take::Flag, false),
+    ("--objects-edge-aggressive", Take::Flag, false),
+    ("--verify-objects", Take::Flag, false),
+    ("--in-commit-order", Take::Flag, false),
+    ("--graph", Take::Flag, false),
+    ("--no-graph", Take::Flag, false),
+    ("--oneline", Take::Flag, false),
+    ("--abbrev-commit", Take::Flag, false),
+    ("--no-abbrev-commit", Take::Flag, false),
+    ("--relative-date", Take::Flag, false),
+    ("--log-size", Take::Flag, false),
+    ("--always", Take::Flag, false),
+    ("--root", Take::Flag, false),
+    ("--cc", Take::Flag, false),
+    ("--dd", Take::Flag, false),
+    ("--remerge-diff", Take::Flag, false),
+    ("--full-diff", Take::Flag, false),
+    ("--no-commit-id", Take::Flag, false),
+    ("--no-diff-merges", Take::Flag, false),
+    ("-c", Take::Flag, false),
+    ("-m", Take::Flag, false),
+    ("-r", Take::Flag, false),
+    ("-t", Take::Flag, false),
+    ("-v", Take::Flag, false),
+    ("--show-signature", Take::Flag, false),
+    ("--no-show-signature", Take::Flag, false),
+    ("--no-notes", Take::Flag, false),
+    ("--standard-notes", Take::Flag, false),
+    ("--no-standard-notes", Take::Flag, false),
+    ("--show-notes-by-default", Take::Flag, false),
+    ("--encode-email-headers", Take::Flag, false),
+    ("--no-encode-email-headers", Take::Flag, false),
+    ("--no-expand-tabs", Take::Flag, false),
+    ("--git-completion-helper", Take::Flag, false),
+    ("--git-completion-helper-all", Take::Flag, false),
+    ("--pretty", Take::Opt, false),
+    ("--format", Take::Attached, false),
+    ("--notes", Take::Opt, false),
+    ("--show-notes", Take::Opt, false),
+    ("--show-linear-break", Take::Opt, false),
+    ("--expand-tabs", Take::Opt, false),
+    ("--date", Take::Detached, false),
+    ("--encoding", Take::Detached, false),
+    ("--diff-merges", Take::Detached, false),
+];
+
+/// What `setup_revisions()` made of one `-`-prefixed word.
+enum Claimed {
+    /// Left in `argv` for the caller; `bundle create` reports it unrecognized.
+    No,
+    /// Consumed, this many argv words; `walk` says whether it limits the walk.
+    Yes { words: usize, walk: bool },
+}
+
+/// The `handle_revision_opt()` chain for one word: the count-and-age arm, then the
+/// table above, then `diff_opt_parse()` (revision.c:2758-2762). `Err` is the exit
+/// status of a `die()` / parse-options refusal whose message is already out.
+fn claim_revision_opt(
+    repo: &gix::Repository,
+    args: &[String],
+    i: usize,
+    counts: &mut crate::revopt::Counts,
+    diff: &mut super::diff_opt_parse::DiffOpts,
+) -> std::result::Result<Claimed, ExitCode> {
+    let a = args[i].as_str();
+    match counts.parse(args, i) {
+        Some(Ok(hit)) => return Ok(Claimed::Yes { words: hit.consumed, walk: true }),
+        Some(Err(msg)) => {
+            // `-n` with nothing after it is an `error()`, the rest are `die()`s.
+            let level = if msg == "-n requires an argument" { "error" } else { "fatal" };
+            eprintln!("{level}: {msg}");
+            return Err(ExitCode::from(128));
+        }
+        None => {}
+    }
+    // `--no-walk[=sorted|unsorted]`: any other value is an `error()` and the word is left
+    // in `argv`.
+    if a.strip_prefix("--no-walk=").is_some_and(|v| !matches!(v, "sorted" | "unsorted")) {
+        eprintln!("error: invalid argument to --no-walk");
+        return Ok(Claimed::No);
+    }
+    // `--default <rev>` (revision.c:2429-2433): the revision to use when none was given.
+    if a == "--default" {
+        if args.get(i + 1).is_none() {
+            eprintln!("error: bad --default argument");
+            return Err(ExitCode::from(128));
+        }
+        return Ok(Claimed::Yes { words: 2, walk: false });
+    }
+    for &(name, take, walk) in REVISION_OPTS {
+        let attached = a.strip_prefix(name).and_then(|rest| rest.strip_prefix('='));
+        let words = match take {
+            Take::Flag if a == name => 1,
+            Take::Opt if a == name || attached.is_some() => 1,
+            Take::Attached if attached.is_some() => 1,
+            Take::Detached if attached.is_some() => 1,
+            Take::Detached if a == name => {
+                if args.get(i + 1).is_none() {
+                    eprintln!("fatal: Option '{name}' requires a value");
+                    return Err(ExitCode::from(128));
+                }
+                2
+            }
+            _ => continue,
+        };
+        // `--unpacked=<packfile>` is a `die()` since the pack-list form was removed.
+        if name == "--unpacked" && attached.is_some() {
+            eprintln!("fatal: --unpacked=<packfile> no longer supported");
+            return Err(ExitCode::from(128));
+        }
+        return Ok(Claimed::Yes { words, walk });
+    }
+    match super::diff_opt_parse::diff_opt_parse(repo, &args[i..], diff) {
+        super::diff_opt_parse::Step::Unknown => Ok(Claimed::No),
+        super::diff_opt_parse::Step::Took(words) => Ok(Claimed::Yes { words, walk: false }),
+        super::diff_opt_parse::Step::Exit(code) => Err(code),
+    }
+}
+
+/// Everything `setup_revisions()` hands `create_bundle()`.
+struct Setup {
+    pending: Vec<Pending>,
+    /// `revs->prune_data`.
+    pathspecs: Vec<Vec<u8>>,
+    /// The revision words with the output-only options removed, for the walk
+    /// that decides which commits are shown. `None` when nothing limits it.
+    walk_args: Option<Vec<String>>,
+    /// `argv[1]` once `setup_revisions()` returns: the first word nothing claimed.
+    unrecognized: Option<String>,
+    /// `revs->diffopt`, for the `diff_setup_done()` checks.
+    diff: super::diff_opt_parse::DiffOpts,
+    /// `revs->max_age` and `revs->min_age`: `--since` / `--until` and their spellings.
+    max_age: Option<i64>,
+    min_age: Option<i64>,
+}
+
+/// Whether a tag's own date, its tagger line or 0, lies inside the `--since` /
+/// `--until` window.
+fn tag_in_age_window(
+    repo: &gix::Repository,
+    id: ObjectId,
+    max_age: Option<i64>,
+    min_age: Option<i64>,
+) -> bool {
+    let date = repo
+        .find_object(id)
+        .ok()
+        .and_then(|o| o.try_into_tag().ok())
+        .and_then(|tag| tag.tagger().ok().flatten().map(|t| t.seconds()))
+        .unwrap_or(0);
+    max_age.is_none_or(|min| date >= min) && min_age.is_none_or(|max| date <= max)
+}
+
+/// What the limited revision walk showed.
+struct Limited {
+    /// The `BOUNDARY` commits, in the order the walk lists them: the bundle's
+    /// prerequisites.
+    boundary: Vec<ObjectId>,
+    /// Every commit the walk showed (`SHOWN`). A boundary commit is `UNINTERESTING`
+    /// instead, which is why a ref on one is dropped without a warning.
+    shown: std::collections::HashSet<ObjectId>,
+}
+
+/// `revs.boundary = 1` and `traverse_commit_list()` (bundle.c:564-575) for a walk
+/// the closure of the tips cannot describe — `--max-count`, `--since`, `--skip`,
+/// the parent-count and message filters, `--first-parent`, a pathspec, `--reverse`
+/// and the rest of `walk` options in [`REVISION_OPTS`]. `rev-list --boundary` is
+/// that same traversal, so it is asked instead of re-deriving every filter here:
+/// a plain line is a shown commit, a `-`-prefixed one a boundary commit.
+///
+/// `Err` carries the exit status of a walk that died; its diagnostic is already
+/// on stderr.
+fn limited_walk(walk_args: &[String]) -> Result<std::result::Result<Limited, ExitCode>> {
+    let mut limited = match rev_list_boundary(walk_args)? {
+        Ok(limited) => limited,
+        Err(code) => return Ok(Err(code)),
+    };
+    // `limit_left_right()` (revision.c) hides the commits of the other side of a
+    // symmetric difference by setting `SHOWN` on them instead of removing them from
+    // the list, so they never reach `show_commit()` — no prerequisite comes of them —
+    // yet `write_bundle_refs()` finds the flag set and keeps their refs without the
+    // "excluded" warning. `rev-list` prints only what was not hidden, so the commits
+    // that carry the flag are the ones a walk without the option shows. `--cherry` is
+    // `--left-only` plus `--cherry-pick` and hides the same way.
+    const HIDING: [&str; 3] = ["--left-only", "--right-only", "--cherry"];
+    if walk_args.iter().any(|a| HIDING.contains(&a.as_str())) {
+        let unhidden: Vec<String> = walk_args
+            .iter()
+            .filter(|a| !HIDING.contains(&a.as_str()))
+            .cloned()
+            .collect();
+        match rev_list_boundary(&unhidden)? {
+            Ok(all) => limited.shown.extend(all.shown),
+            Err(code) => return Ok(Err(code)),
+        }
+    }
+    Ok(Ok(limited))
+}
+
+/// One `git rev-list --boundary <args>` run, read the way `bundle.c` reads the
+/// traversal: a plain line is a shown commit, a `-`-prefixed one a boundary commit.
+fn rev_list_boundary(walk_args: &[String]) -> Result<std::result::Result<Limited, ExitCode>> {
+    let out = std::process::Command::new(std::env::current_exe()?)
+        .arg("rev-list")
+        .arg("--boundary")
+        .args(walk_args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()?;
+    if !out.status.success() {
+        return Ok(Err(ExitCode::from(out.status.code().unwrap_or(128) as u8)));
+    }
+    let mut limited = Limited { boundary: Vec::new(), shown: Default::default() };
+    for line in out.stdout.split(|b| *b == b'\n') {
+        let (boundary, rest) = match line.strip_prefix(b"-") {
+            Some(rest) => (true, rest),
+            None => (false, line),
+        };
+        // `--cherry` implies `--cherry-mark`, which puts `+` or `=` in front of the id.
+        let hex = rest.strip_prefix(b"+").or_else(|| rest.strip_prefix(b"=")).unwrap_or(rest);
+        let Ok(id) = ObjectId::from_hex(hex) else { continue };
+        if boundary {
+            limited.boundary.push(id);
+        } else {
+            limited.shown.insert(id);
+        }
+    }
+    Ok(Ok(limited))
+}
+
 /// `setup_revisions()` reduced to the grammar `bundle create` is documented
 /// with: the ref-selecting pseudo-options (`--all`, `--branches`, `--tags`,
 /// `--remotes`, `--glob`, each filtered by the `--exclude` patterns it consumes),
@@ -1068,8 +1471,17 @@ struct Item {
 fn resolve_revisions(
     repo: &gix::Repository,
     args: &[&str],
-) -> Result<std::result::Result<(Vec<Pending>, Vec<Vec<u8>>), ExitCode>> {
+) -> Result<std::result::Result<Setup, ExitCode>> {
     let mut pending = Vec::new();
+    let mut counts = crate::revopt::Counts::default();
+    let mut diff = super::diff_opt_parse::DiffOpts::default();
+    let mut unrecognized: Option<String> = None;
+    // Indices into `items` of the output-only options, which the limited walk must not see.
+    let mut inert: Vec<usize> = Vec::new();
+    let mut limiting = false;
+    let mut seen_end_of_options = false;
+    let mut default_rev: Option<String> = None;
+    let mut used_default: Option<String> = None;
     let mut excludes: Vec<String> = Vec::new();
     let mut negate = false;
 
@@ -1134,7 +1546,8 @@ fn resolve_revisions(
         if a == "--exclude" {
             i += 1;
             let Some(v) = items.get(i) else {
-                anyhow::bail!("option 'exclude' requires a value");
+                eprintln!("fatal: Option '--exclude' requires a value");
+                return Ok(Err(ExitCode::from(128)));
             };
             excludes.push(v.text.clone());
             i += 1;
@@ -1150,7 +1563,10 @@ fn resolve_revisions(
             i += 1;
             match items.get(i) {
                 Some(v) => Some(v.text.clone()),
-                None => anyhow::bail!("option 'glob' requires a value"),
+                None => {
+                    eprintln!("fatal: Option '--glob' requires a value");
+                    return Ok(Err(ExitCode::from(128)));
+                }
             }
         } else {
             None
@@ -1207,8 +1623,20 @@ fn resolve_revisions(
                     // `write_bundle_refs()` re-dwims each pending name through
                     // `repo_dwim_ref()`, so a `--branches` entry named `topic`
                     // comes back out as `refs/heads/topic`.
+                    // `--branches`, `--tags` and `--remotes` iterate with the namespace
+                    // trimmed (`trim_prefix`), so `e->name` is the short name; `--all` and
+                    // `--glob` keep the whole ref name.
+                    let name = match kind {
+                        super::log::RefSelector::Branches => full.strip_prefix("refs/heads/"),
+                        super::log::RefSelector::Tags => full.strip_prefix("refs/tags/"),
+                        super::log::RefSelector::Remotes => full.strip_prefix("refs/remotes/"),
+                        _ => None,
+                    }
+                    .unwrap_or(&full)
+                    .to_string();
                     pending.push(Pending {
                         id,
+                        name,
                         display_ref: Some(full),
                         uninteresting: negate,
                     });
@@ -1218,6 +1646,7 @@ fn resolve_revisions(
                 if let Ok(head) = repo.head_id() {
                     pending.push(Pending {
                         id: head.detach(),
+                        name: "HEAD".into(),
                         display_ref: Some("HEAD".into()),
                         uninteresting: negate,
                     });
@@ -1256,22 +1685,37 @@ fn resolve_revisions(
             i += 1;
             continue;
         }
-        // `if (argc > 1) error(_("unrecognized argument: %s"), argv[1])`
-        // (bundle.c:503-506): whatever `setup_revisions()` left behind. `bundle
-        // create`'s own switches are exactly that once the `<file>` operand has
-        // ended option parsing, which is why `git bundle create <file> -q` is an
-        // error while `git bundle create -q <file>` is not.
-        //
-        // Stock aborts on this path: one `error:` line, then SIGABRT from freeing the
-        // uninitialised `revs_copy` at bundle.c:600 (a shell sees 134; measured on git
-        // 2.54.0, 2.55.0 and 2.56.0). The `error:` line is written unbuffered above, and
-        // no bundle is written.
-        if matches!(a, "-q" | "--quiet" | "--progress" | "--all-progress" | "--all-progress-implied")
-            || a == "--version"
-            || a.starts_with("--version=")
-        {
-            eprintln!("error: unrecognized argument: {a}");
-            std::process::abort();
+        // `--end-of-options` and then `handle_revision_opt()` (revision.c:3062-3090),
+        // which run for every `-`-prefixed word until `--end-of-options` is seen.
+        // What neither claims stays in `argv`; `create()` reports the first such
+        // word once `setup_revisions()` has finished — a bad revision later on the
+        // line therefore still dies first, as in stock.
+        if !from_stdin && !seen_end_of_options && a.starts_with('-') {
+            if a == "--end-of-options" {
+                seen_end_of_options = true;
+                i += 1;
+                continue;
+            }
+            let tail: Vec<String> = items[i..].iter().map(|it| it.text.clone()).collect();
+            if a == "--default" {
+                default_rev = tail.get(1).cloned();
+            }
+            match claim_revision_opt(repo, &tail, 0, &mut counts, &mut diff) {
+                Err(code) => return Ok(Err(code)),
+                Ok(Claimed::Yes { words, walk }) => {
+                    if walk {
+                        limiting = true;
+                    } else {
+                        inert.extend(i..i + words);
+                    }
+                    i += words;
+                }
+                Ok(Claimed::No) => {
+                    unrecognized.get_or_insert_with(|| a.to_string());
+                    i += 1;
+                }
+            }
+            continue;
         }
         // `handle_revision_arg_1()`'s very first test, ahead of everything
         // below:
@@ -1310,6 +1754,7 @@ fn resolve_revisions(
                 }
             }
             pathspecs.extend(items[i..].iter().map(|it| it.text.as_bytes().to_vec()));
+            items.truncate(i);
             break;
         }
         // `handle_dotdot()`, which runs before the three-mark block below and is
@@ -1368,6 +1813,7 @@ fn resolve_revisions(
                 for base in repo.merge_bases_many(a_oid, &[b_oid])? {
                     pending.push(Pending {
                         id: base.detach(),
+                        name: base.to_string(),
                         display_ref: None,
                         uninteresting: !negate,
                     });
@@ -1377,6 +1823,7 @@ fn resolve_revisions(
                 // bases carry `flags_exclude`.
                 pending.push(Pending {
                     id: a_raw,
+                    name: r.a.to_string(),
                     display_ref: display_ref(repo, r.a),
                     uninteresting: negate,
                 });
@@ -1385,12 +1832,14 @@ fn resolve_revisions(
                 // excluded one, and a preceding `--not` flips both.
                 pending.push(Pending {
                     id: a_raw,
+                    name: r.a.to_string(),
                     display_ref: display_ref(repo, r.a),
                     uninteresting: !negate,
                 });
             }
             pending.push(Pending {
                 id: b_raw,
+                name: r.b.to_string(),
                 display_ref: display_ref(repo, r.b),
                 uninteresting: negate,
             });
@@ -1418,6 +1867,7 @@ fn resolve_revisions(
                 let mut queue = |name: &str, parent, uninteresting| {
                     pending.push(Pending {
                         id: parent,
+                        name: name.to_string(),
                         display_ref: display_ref(repo, name),
                         uninteresting,
                     });
@@ -1463,15 +1913,83 @@ fn resolve_revisions(
                 // whole, exclusion mark and all.
                 if from_stdin {
                     eprintln!("fatal: bad revision '{a}'");
-                } else {
-                    eprint!("{}", super::log::bad_revision_message_in(repo, a));
+                    return Ok(Err(ExitCode::from(128)));
                 }
+                let message = super::log::bad_revision_message_in(repo, a);
+                // ```c
+                // if (handle_revision_arg(arg, revs, flags, revarg_opt)) {
+                //         if (seen_dashdash || *arg == '^')
+                //                 die(_("bad revision '%s'"), arg);
+                //         for (j = i; j < argc; j++)
+                //                 verify_filename(revs->prefix, argv[j], j == i);
+                //         append_prune_data(&prune_data, argv + i);
+                //         break;
+                // }
+                // ```
+                //
+                // (revision.c:3080-3097.) An operand that is not a revision but is, or
+                // may be, a path ends the revision list: it and everything after it
+                // become pathspecs — and a later word that looks like an option is
+                // `option '%s' must come before non-option arguments`. A failure that
+                // `handle_revision_arg()` raised itself keeps its own text.
+                let may_be_path = !seen_dashdash
+                    && !text.starts_with('^')
+                    && message.starts_with("fatal: ambiguous argument")
+                    && (text.starts_with('-') || super::log::spec_is_path(repo, &text));
+                if may_be_path {
+                    for (n, item) in items[i..].iter().enumerate() {
+                        if let Some(msg) = crate::setup::verify_filename(&item.text, n == 0) {
+                            eprintln!("fatal: {msg}");
+                            return Ok(Err(ExitCode::from(128)));
+                        }
+                    }
+                    pathspecs.extend(items[i..].iter().map(|it| it.text.as_bytes().to_vec()));
+                    items.truncate(i);
+                    break;
+                }
+                eprint!("{message}");
                 return Ok(Err(ExitCode::from(128)));
             }
         }
         i += 1;
     }
-    Ok(Ok((pending, pathspecs)))
+    // `--follow` clears `revs->prune` (revision.c: "Can't prune commits with rename
+    // following"), so its single pathspec does not limit the walk at all.
+    // `if (revs->def && !revs->pending.nr && !got_rev_arg)`: `--default` stands in for a
+    // command line that named no revision.
+    if let (true, Some(def)) = (pending.is_empty(), default_rev.as_deref()) {
+        match one_pending(repo, def, false) {
+            Ok(p) => {
+                pending.push(p);
+                used_default = Some(def.to_string());
+            }
+            Err(_) => {
+                eprint!("{}", super::log::bad_revision_message_in(repo, def));
+                return Ok(Err(ExitCode::from(128)));
+            }
+        }
+    }
+    let follow = inert
+        .iter()
+        .map(|n| items[*n].text.as_str())
+        .rfind(|t| matches!(*t, "--follow" | "--no-follow"))
+        == Some("--follow");
+    let limiting_paths = !pathspecs.is_empty() && !follow;
+    let walk_args = (limiting || limiting_paths).then(|| {
+        let mut walk: Vec<String> = items
+            .iter()
+            .enumerate()
+            .filter(|(n, it)| !inert.contains(n) && (it.from_stdin || it.text != "--stdin"))
+            .map(|(_, it)| it.text.clone())
+            .collect();
+        walk.extend(used_default);
+        if limiting_paths {
+            walk.push("--".to_string());
+            walk.extend(pathspecs.iter().map(|p| String::from_utf8_lossy(p).into_owned()));
+        }
+        walk
+    });
+    Ok(Ok(Setup { pending, pathspecs, walk_args, unrecognized, diff, max_age: counts.max_age, min_age: counts.min_age }))
 }
 
 /// git's `read_revisions_from_stdin()` (revision.c), the whole of it:
@@ -1556,7 +2074,7 @@ fn one_pending(repo: &gix::Repository, spec: &str, uninteresting: bool) -> Resul
     let id = crate::objname::resolve(repo, spec)
         .filter(|id| repo.find_object(*id).is_ok())
         .ok_or_else(|| anyhow::anyhow!("bad revision '{spec}'"))?;
-    Ok(Pending { id, display_ref: display_ref(repo, spec), uninteresting })
+    Ok(Pending { id, name: spec.to_string(), display_ref: display_ref(repo, spec), uninteresting })
 }
 
 /// `write_bundle_refs()`'s `display_ref` (bundle.c:398-403): `repo_dwim_ref()`

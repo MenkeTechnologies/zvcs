@@ -218,6 +218,12 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
     let name_or_url = repository.map(BStr::new);
     let remote = match repo.find_fetch_remote(name_or_url) {
         Ok(remote) => remote,
+        // `remote_get(NULL)` comes back NULL when the branch names no remote and `origin` is not
+        // configured, which `cmd_ls_remote()` answers with its own sentence.
+        Err(_) if repository.is_none() => {
+            eprintln!("fatal: No remote configured to list refs from.");
+            return Ok(ExitCode::from(128));
+        }
         Err(e) => {
             eprintln!("fatal: {e}");
             return Ok(ExitCode::from(128));

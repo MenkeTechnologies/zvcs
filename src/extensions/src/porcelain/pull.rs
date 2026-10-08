@@ -740,14 +740,17 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
             // — `bad recurse-submodules argument: <value>` — and never reaches the
             // child whose failures pull reports as 1.
             "--recurse-submodules" => {
-                let value = inline.clone().unwrap_or_else(|| "yes".into());
-                if !matches!(
-                    value.as_str(),
-                    "yes" | "true" | "no" | "false" | "on-demand"
-                ) {
-                    crate::git_fatal!("bad recurse-submodules argument: {value}");
-                }
-                f_recurse = Some(value)
+                // `parse_fetch_recurse()`: `git_parse_maybe_bool()`'s whole grammar (words
+                // and integers, so `1` and an empty value are legal), then `on-demand`.
+                f_recurse = Some(match inline.as_deref() {
+                    None => "yes".into(),
+                    Some(v) => match crate::optint::maybe_bool(v) {
+                        Some(true) => "yes".into(),
+                        Some(false) => "no".into(),
+                        None if v == "on-demand" => "on-demand".into(),
+                        None => crate::git_fatal!("bad recurse-submodules argument: {v}"),
+                    },
+                });
             }
             "--no-recurse-submodules" => f_recurse = Some("no".into()),
             // `OPT_PASSTHRU('j', "jobs", …, PARSE_OPT_OPTARG)`: an attached value

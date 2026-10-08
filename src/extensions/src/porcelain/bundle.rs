@@ -112,10 +112,11 @@
 //!     `create`'s options are `PARSE_OPT_STOP_AT_NON_OPTION`, so the `<file>`
 //!     operand ends option parsing: `git bundle create <file> -q` reports
 //!     `error: unrecognized argument: -q` and writes nothing, exactly as stock
-//!     does, including the death that follows: the `goto out` at bundle.c:515 reaches
-//!     `object_array_clear(&revs_copy.pending)` (:600) before `revs_copy` is
-//!     initialised (:551), so git 2.54.0, 2.55.0 and 2.56.0 all print that line and then
-//!     abort (a shell sees 134). This aborts too.
+//!     does, including the death that follows where the allocator notices: the
+//!     `goto out` at bundle.c:515 reaches `object_array_clear(&revs_copy.pending)`
+//!     (:600) before `revs_copy` is initialised (:551), so git 2.54.0, 2.55.0 and
+//!     2.56.0 on macOS print that line and then abort (a shell sees 134). That free is
+//!     undefined behaviour: on glibc stock git exits 1 instead. This follows the host.
 //!
 //!     Everything after `<file>` is `setup_revisions()`'s, so rev-list options are
 //!     accepted there. `claim_revision_opt()` is that function's option chain: the
@@ -861,13 +862,20 @@ fn create(args: &[String]) -> Result<ExitCode> {
     // ended option parsing, which is why `git bundle create <file> -q` is an
     // error while `git bundle create -q <file>` is not.
     //
-    // Stock aborts on this path: one `error:` line, then SIGABRT from freeing the
-    // uninitialised `revs_copy` at bundle.c:600 (a shell sees 134; measured on git
-    // 2.54.0, 2.55.0 and 2.56.0). The `error:` line is written unbuffered above, and
-    // no bundle is written.
+    // Stock dies on this path where the allocator notices: one `error:` line, then
+    // SIGABRT from freeing the uninitialised `revs_copy` at bundle.c:600 (a shell
+    // sees 134; measured on macOS with git 2.54.0, 2.55.0 and 2.56.0). That free is
+    // undefined behaviour, so the outcome is the host allocator's: macOS's aborts,
+    // glibc's lets it pass and git exits 1 (measured on the ubuntu CI runner, where
+    // `git bundle create <file> --foo` prints the same line and returns 1). This
+    // follows the host the same way. The `error:` line is written unbuffered above,
+    // and no bundle is written either way.
     if let Some(word) = unrecognized {
         eprintln!("error: unrecognized argument: {word}");
-        std::process::abort();
+        if cfg!(target_vendor = "apple") {
+            std::process::abort();
+        }
+        return Ok(ExitCode::from(1));
     }
 
     // `if (version == -1) version = min_version;` — 2 for sha1, and only 2 or 3

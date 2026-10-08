@@ -119,8 +119,25 @@ pub(crate) fn run_git_commit(
     if allow_empty {
         args.push("--allow-empty".to_string());
     }
+    if let Ok(repo) = crate::setup::discover() {
+        enter_toplevel(&repo);
+    }
     std::env::set_var("GIT_REFLOG_ACTION", reflog_action(action));
     super::commit::commit(&args)
+}
+
+/// The directory a `git commit` child of a sequencer verb starts in.
+///
+/// `setup_git_directory()` `chdir()`s the verb itself to the top of the work tree and keeps
+/// only the prefix, so the `git commit` it spawns (`run_git_commit()`,
+/// `continue_single_pick()`) inherits that cwd and finds no prefix: its status report names
+/// every path from the root, not relative to where the user stood. The delegations here are
+/// calls rather than forks, so the cwd is moved explicitly. A repository without a work
+/// tree, or a top that cannot be entered, leaves the cwd alone.
+pub(crate) fn enter_toplevel(repo: &gix::Repository) {
+    if let Some(top) = repo.workdir().and_then(|w| w.canonicalize().ok()) {
+        let _ = std::env::set_current_dir(top);
+    }
 }
 
 /// `sequencer_determine_whence()` (sequencer.c:6847-6866), reduced to the answer

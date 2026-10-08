@@ -897,6 +897,18 @@ fn continue_single_pick(
     };
     let head_id = repo.head_id()?.detach();
 
+    // The child is `git commit`, which refuses a commit with nothing in it: the status
+    // report on stdout, the cherry-pick advice on stderr when the stop was a cherry-pick
+    // (`CHERRY_PICK_HEAD` is what `revert --continue` resumes either way), and exit 1
+    // (builtin/commit.c:1078-1095). Same refusal as `cherry-pick --continue`.
+    let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
+    if tree_id == head_tree {
+        let whence = super::commit::determine_whence(repo);
+        let _child = crate::cstdio::run_command();
+        super::replay_commit::enter_toplevel(repo);
+        return Ok(Err(super::commit::refuse_nothing_to_commit(None, false, whence)?));
+    }
+
     // `--cleanup=strip` is what git passes, so the `# Conflicts:` block the stop
     // appended is dropped along with every other comment line.
     let raw = std::fs::read_to_string(git_dir.join("MERGE_MSG")).unwrap_or_default();

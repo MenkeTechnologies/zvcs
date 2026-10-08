@@ -2148,6 +2148,7 @@ fn continue_single_pick(
         // A `git commit` child (sequencer.c:5240-5256): its buffered report
         // flushes at its exit, after its advice on stderr.
         let _child = crate::cstdio::run_command();
+        super::replay_commit::enter_toplevel(repo);
         return Ok(Err(super::commit::refuse_nothing_to_commit(None, false, whence)?));
     }
 
@@ -2274,6 +2275,7 @@ fn stop_empty(
     // own stdio buffer, flushed at its exit — after the advice on stderr.
     let _ = (head_id, pick_id);
     let _child = crate::cstdio::run_command();
+    super::replay_commit::enter_toplevel(repo);
     super::commit::refuse_nothing_to_commit(None, false, super::commit::Whence::CherryPick)
 }
 

@@ -85,3 +85,37 @@ fn pull_twohead_is_the_rebase_strategy_when_none_was_given() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `do_pick_commit()` takes the fast-forward arm before it looks at the strategy, so
+/// the picks of a continued rebase fast-forward — and never run a `merge-all` child,
+/// which does not exist — however the strategy was chosen.
+#[test]
+fn a_fast_forwarding_pick_never_runs_the_strategy_child() {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let base = std::env::temp_dir().join(format!("zvcs-rebase-defstrat-ff-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (s, z) = (base.join("stock"), base.join("zvcs"));
+    for (strategy_args, label) in [
+        (&["-c", "pull.twohead=all"][..], "configured"),
+        (&[][..], "none"),
+    ] {
+        for root in [&s, &z] {
+            let _ = std::fs::remove_dir_all(root);
+            fixture(stock, root);
+        }
+        let start: Vec<&str> =
+            strategy_args.iter().copied().chain(["rebase", "-i", "--exec", "false", "HEAD~2"]).collect();
+        let cont: Vec<&str> = strategy_args.iter().copied().chain(["rebase", "--continue"]).collect();
+        for args in [&start, &cont] {
+            assert_eq!(run(BIN, &z, args), run(stock, &s, args), "{label}: {args:?}");
+        }
+        for probe in [
+            &["log", "--format=%H %s", "--all"][..],
+            &["reflog", "--format=%gs"][..],
+            &["status", "--porcelain=v2", "--branch"][..],
+        ] {
+            assert_eq!(run(BIN, &z, probe), run(stock, &s, probe), "{label}: {probe:?}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

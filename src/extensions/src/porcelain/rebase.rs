@@ -5665,11 +5665,21 @@ impl<'r> Sequencer<'r> {
         // The same dispatch has always been in [`super::cherry_pick`]; the two
         // verbs share `do_pick_commit()` in git and now share the child runner
         // here, so `-s` means one thing across both.
+        // `do_pick_commit()` tests the fast-forward arm before it looks at the strategy, so a
+        // pick that fast-forwards never runs a `merge-<name>` child — not even one that does
+        // not exist.
+        let fast_forward = self.st.allow_ff
+            && !item.cmd.is_fixup()
+            && match parent {
+                Some(p) => p == head,
+                None => create_root,
+            };
         let child_strategy = self
             .st
             .strategy
             .as_deref()
-            .filter(|name| !matches!(*name, "recursive" | "ort"));
+            .filter(|name| !matches!(*name, "recursive" | "ort"))
+            .filter(|_| !fast_forward);
         let applied = match child_strategy {
             Some(strategy) => {
                 let xopts: Vec<&str> =
@@ -5770,12 +5780,6 @@ impl<'r> Sequencer<'r> {
             );
         }
 
-        let fast_forward = self.st.allow_ff
-            && !item.cmd.is_fixup()
-            && match parent {
-                Some(p) => p == head,
-                None => create_root,
-            };
         // `merge_switch_to_result()`'s `write_auto_merge` region — but only for
         // a pick that git really merged. `do_pick_commit()` tests the
         // fast-forward arm *before* `do_recursive_merge()` and `goto leave`s

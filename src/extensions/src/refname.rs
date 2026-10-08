@@ -305,14 +305,22 @@ pub fn all_ref_names(repo: &gix::Repository) -> Vec<String> {
 /// `branch` or `ls-files`. It ends the process for the reason
 /// [`crate::objname::resolve_with_flags`] does: the callers answer with a
 /// `bool`, below every return path that could carry the refusal.
+///
+/// The function begins with `prepare_repo_settings(repo)`, so the whole settings
+/// block is validated first: `-c core.maxTreeDepth= tag --format=%(refname:short)`
+/// dies on `core.maxtreedepth`, not on anything `core.warnambiguousrefs` holds.
 pub fn warn_ambiguous_refs(repo: &gix::Repository) -> bool {
+    let die = |message: String| -> ! {
+        crate::trace2::error(&message);
+        eprintln!("fatal: {message}");
+        std::process::exit(crate::fatal::EXIT_FATAL as i32);
+    };
+    if let Err(message) = crate::repo_settings::RepoSettings::load(repo) {
+        die(message);
+    }
     match crate::repo_settings::config_bool_strict(repo, "core.warnambiguousrefs") {
         Ok(v) => v.unwrap_or(true),
-        Err(message) => {
-            crate::trace2::error(&message);
-            eprintln!("fatal: {message}");
-            std::process::exit(crate::fatal::EXIT_FATAL as i32);
-        }
+        Err(message) => die(message),
     }
 }
 

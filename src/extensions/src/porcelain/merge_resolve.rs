@@ -128,6 +128,17 @@ fn parse(args: &[String]) -> Args {
 
 /// `git merge-resolve` — see the module docs for what is and is not covered.
 pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
+    resolve(args, true)
+}
+
+/// The strategy as `git merge` runs it. `cmd_merge()` is a `NEED_WORK_TREE` builtin, so
+/// `setup_work_tree()` has already moved git to the top of the work tree and the child
+/// script's toplevel check passes whatever directory `merge` was typed in.
+pub(super) fn merge_resolve_from_merge(args: &[String]) -> Result<ExitCode> {
+    resolve(args, false)
+}
+
+fn resolve(args: &[String], check_toplevel: bool) -> Result<ExitCode> {
     // `git-sh-setup` inspects only `$1`, and does so before `git_dir_init` and
     // before the script's own first line of logic.
     if args.first().map(String::as_str) == Some("-h") {
@@ -140,8 +151,10 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: not a git repository (or any of the parent directories): .git");
         return Ok(ExitCode::from(128));
     };
-    if let Some(code) = require_toplevel(&repo) {
-        return Ok(code);
+    if check_toplevel {
+        if let Some(code) = require_toplevel(&repo) {
+            return Ok(code);
+        }
     }
 
     // `if ! git diff-index --quiet --cached HEAD --` — the script's first
@@ -249,7 +262,12 @@ pub fn merge_resolve(args: &[String]) -> Result<ExitCode> {
 /// their own first line runs.
 pub(super) fn require_toplevel(repo: &Repository) -> Option<ExitCode> {
     let top = repo.workdir()?;
-    if crate::setup::is_inside_git_dir(repo) {
+    // Inside the git directory `--show-cdup` is empty only when no work tree was
+    // named: `core.worktree` or `GIT_WORK_TREE` (a submodule's `.git/modules/<n>`)
+    // puts the cwd outside it, and `rev-parse` then prints the work tree path.
+    let named_work_tree = std::env::var_os("GIT_WORK_TREE").is_some()
+        || repo.config_snapshot().string("core.worktree").is_some();
+    if crate::setup::is_inside_git_dir(repo) && !named_work_tree {
         return None;
     }
     let here = std::env::current_dir().ok()?.canonicalize().ok()?;

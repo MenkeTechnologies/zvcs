@@ -2755,7 +2755,7 @@ fn resolve_attempt(repo: &gix::Repository, ctx: &MergeCtx<'_>, opts: &Opts) -> R
     argv.push("HEAD".to_string());
     argv.push(ctx.targets[0].to_string());
 
-    match exit_status(super::merge_resolve::merge_resolve(&argv)?) {
+    match exit_status(super::merge_resolve::merge_resolve_from_merge(&argv)?) {
         0 => {
             let index = repo.open_index()?;
             Ok(Attempt::Clean {

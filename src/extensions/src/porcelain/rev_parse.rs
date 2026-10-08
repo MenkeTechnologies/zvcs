@@ -891,12 +891,10 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                 match parsed {
                     Some(Parsed::Range(range)) => {
                         emit_range(&mut out, &repo, &o, range, arg)?;
-                        // A range is never a single revision. Under
-                        // `--verify`/`--short` the endpoints still print, but the
-                        // scan then fails afterward with "Needed a single revision".
-                        if o.verify {
-                            revs += 2;
-                        }
+                        // `try_difference()` runs before `revs_count++` is reachable
+                        // (`builtin/rev-parse.c`), so a range prints its endpoints
+                        // and is not counted: `--verify a..b HEAD` still has one
+                        // revision.
                         continue;
                     }
                     Some(Parsed::Single { id, reversed }) => {

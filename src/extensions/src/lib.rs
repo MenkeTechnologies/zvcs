@@ -974,8 +974,15 @@ fn run_command(argv: &[String]) -> ExitCode {
     // `setup_explicit_git_dir()` (setup.c:1176-1190): with `$GIT_DIR` set there is
     // no walk, so a directory that is not a repository is reported by name rather
     // than as a failed search.
-    if let Some(code) = setup::explicit_git_dir_gate(&sub, &rest) {
-        return code;
+    //
+    // `archive` and `grep` are `RUN_SETUP_GENTLY` entries that call `setup_git_directory()`
+    // themselves once their options are parsed, so a `$GIT_DIR` that is no repository is
+    // the usage error, the `--list` output or the `-h` text first; the refusal comes from
+    // the command when it reaches for its repository.
+    if !matches!(sub.as_str(), "archive" | "grep") {
+        if let Some(code) = setup::explicit_git_dir_gate(&sub, &rest) {
+            return code;
+        }
     }
     // `safe.bareRepository` (setup.c:1676-1678), one line ahead of ownership.
     if let Some(code) = disallowed_bare_repository(&sub) {

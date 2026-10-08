@@ -1543,6 +1543,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("options '--squash' and '--fixup' cannot be used together");
     }
     if let Some(spec) = &squash_arg {
+        // `prepare_to_commit()` does the lookup, after `prepare_index()` has reported
+        // unmatched pathspecs, so its death is deferred like an unreadable `-F`.
+        'squash: {
         // `-c`/`-C` is *not* refused alongside `--squash`: measured against git
         // 2.55.0, `commit -C HEAD --squash HEAD` records the message
         // `squash! <subject>` and takes only its authorship from the reused
@@ -1557,7 +1560,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // (builtin/commit.c:794-796.)
         let c = match lookup_commit_reference_by_name(&repo, spec.as_str()) {
             Some(c) => c,
-            None => crate::git_fatal!("could not lookup commit '{spec}'"),
+            None => {
+                deferred_fatal.get_or_insert_with(|| format!("could not lookup commit '{spec}'"));
+                break 'squash;
+            }
         };
         let subject = folded_subject(&crate::rawarg::from_bytes(c.message_raw()?));
         if from_flags {
@@ -1574,8 +1580,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         } else {
             squash_fixup_seed = Some(format!("squash! {subject}\n\n"));
         }
+        }
     }
     if let Some(raw) = &fixup_arg {
+        'fixup: {
         // `-c`/`-C`/`-F` are rejected with `--fixup` in every form.
         if reuse_arg.is_some() || !file_args.is_empty() {
             crate::git_fatal!("options '-c/-C/-F' and '--fixup' cannot be used together");
@@ -1606,7 +1614,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // (builtin/commit.c:829-831.)
         let c = match lookup_commit_reference_by_name(&repo, fixup_spec) {
             Some(c) => c,
-            None => crate::git_fatal!("could not lookup commit '{fixup_spec}'"),
+            None => {
+                deferred_fatal.get_or_insert_with(|| format!("could not lookup commit '{fixup_spec}'"));
+                break 'fixup;
+            }
         };
         let subject = folded_subject(&crate::rawarg::from_bytes(c.message_raw()?));
         if fixup_prefix == "fixup" {
@@ -1638,6 +1649,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 orig
             };
             squash_fixup_seed = Some(format!("amend! {subject}\n\n{carried}"));
+        }
         }
     }
     // `--date=<date>` overrides the author date. `parse_force_date()` (builtin/commit.c:614)

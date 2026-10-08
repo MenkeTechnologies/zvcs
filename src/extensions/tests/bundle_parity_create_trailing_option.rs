@@ -60,13 +60,25 @@ impl Fixture {
     }
 }
 
+/// How `bundle create` ends after reporting an unclaimed word. Stock frees an
+/// uninitialised `revs_copy` there (bundle.c:600): undefined behaviour, so macOS's
+/// allocator aborts (SIGABRT) while glibc lets it pass and git exits 1 (measured on
+/// the ubuntu CI runner with git 2.56.0).
+fn assert_unclaimed_word_exit(out: &std::process::Output) {
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(out.status.signal(), Some(6), "SIGABRT, as stock");
+    } else {
+        assert_eq!((out.status.code(), out.status.signal()), (Some(1), None), "exit 1, as stock");
+    }
+}
+
 #[test]
 fn a_version_after_the_file_is_an_unrecognized_revision_argument() {
     let f = Fixture::new("stdout");
     let out = f.run(&["bundle", "create", "-", "--all", "--version=3"]);
     assert_eq!(String::from_utf8_lossy(&out.stderr), "error: unrecognized argument: --version=3\n");
     assert!(out.stdout.is_empty(), "no bundle bytes on stdout");
-    assert_eq!(out.status.signal(), Some(6), "SIGABRT, as stock");
+    assert_unclaimed_word_exit(&out);
 }
 
 #[test]
@@ -74,6 +86,6 @@ fn no_bundle_file_is_written() {
     let f = Fixture::new("file");
     let out = f.run(&["bundle", "create", "b.bundle", "main", "-q"]);
     assert_eq!(String::from_utf8_lossy(&out.stderr), "error: unrecognized argument: -q\n");
-    assert_eq!(out.status.signal(), Some(6), "SIGABRT, as stock");
+    assert_unclaimed_word_exit(&out);
     assert!(!f.root.join("b.bundle").exists());
 }

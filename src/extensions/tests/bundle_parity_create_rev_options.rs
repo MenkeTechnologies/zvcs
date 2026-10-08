@@ -187,12 +187,24 @@ fn a_tip_the_walk_never_shows_is_warned_about_and_left_out() {
     assert!(v.bundle.is_none());
 }
 
+/// How `bundle create` ends after reporting an unclaimed word. Stock frees an
+/// uninitialised `revs_copy` there (bundle.c:600), which is undefined behaviour:
+/// macOS's allocator aborts (SIGABRT, a shell sees 134), glibc's lets it pass and
+/// git exits 1 (measured on the ubuntu CI runner with git 2.56.0).
+fn assert_unclaimed_word_exit(v: &Verdict, what: &str) {
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(v.signal, Some(6), "SIGABRT, as stock: {what}");
+    } else {
+        assert_eq!((v.code, v.signal), (Some(1), None), "exit 1, as stock: {what}");
+    }
+}
+
 #[test]
 fn an_unclaimed_word_is_reported_after_the_whole_line_and_aborts() {
     let f = Fixture::new("unknown");
     let v = f.create(BIN, "b.bundle", &["main", "--foo"]);
     assert_eq!(v.stderr, "error: unrecognized argument: --foo\n");
-    assert_eq!(v.signal, Some(6), "SIGABRT, as stock");
+    assert_unclaimed_word_exit(&v, "main --foo");
     assert!(v.bundle.is_none());
 
     // The first unclaimed word is the one named, whatever follows it.
@@ -222,7 +234,7 @@ fn bundle_options_after_the_file_are_not_bundle_options() {
     for word in ["-q", "--progress", "--all-progress", "--version=3", "-h", "--help-all"] {
         let v = f.create(BIN, "b.bundle", &["main", word]);
         assert_eq!(v.stderr, format!("error: unrecognized argument: {word}\n"), "{word}");
-        assert_eq!(v.signal, Some(6), "{word}");
+        assert_unclaimed_word_exit(&v, word);
     }
 }
 

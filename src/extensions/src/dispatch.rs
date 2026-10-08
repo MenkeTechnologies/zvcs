@@ -848,9 +848,11 @@ const SETTINGS_BEFORE_HELP_VERBS: &[&str] =
 ///
 /// `git grep` is absent because it reaches the same keys through its own
 /// callback, in one chain; `rev-list`, `shortlog`, `diff-tree`, `diff` and
-/// `status` are absent because they were measured not to reach them at all.
+/// `status` are absent because they were measured not to reach them at all. `range-diff`
+/// is absent because only the `git log` child it spawns reaches them, after its own
+/// operand checks (`porcelain::range_diff`).
 const GREP_REVISION_VERBS: &[&str] =
-    &["log", "show", "whatchanged", "format-patch", "range-diff"];
+    &["log", "show", "whatchanged", "format-patch"];
 
 /// Whether this command line reaches `check_updates()` (`unpack-trees.c:404`) and
 /// therefore `get_parallel_checkout_configs()` at `:482` — the read of

@@ -2049,6 +2049,15 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(255));
     }
 
+    // The inner `git log` opens with `repo_config(git_log_config)` and
+    // `repo_init_revisions()`'s `grep_config` pass, so a value they refuse is the log's
+    // `fatal:` followed by `could not parse log`, ahead of resolving the range. The
+    // parent runs neither, which is why a usage error (`need two commit ranges`)
+    // above is never pre-empted by one.
+    if let Some(code) = inner_log_config_refusal(&repo, &range1) {
+        return Ok(code);
+    }
+
     // Upstream resolves each range by running `git log` over it, oldest range
     // first; a range naming an unknown revision is fatal before any patch is
     // read, and `git log`'s -1 return becomes exit status 255.
@@ -2341,6 +2350,39 @@ fn usage_error(reason: &str) -> ExitCode {
 fn could_not_parse_log(repo: &gix::Repository, range: &str) -> ExitCode {
     eprint!("{}", super::log::bad_revision_message_in(repo, range));
     log_parse_failed(range)
+}
+
+/// What the inner `git log` dies with while reading its configuration: `git_log_config()`
+/// (builtin/log.c) and then `repo_init_revisions()`'s `grep_config()` pass. `None` when
+/// both accept the configuration.
+fn inner_log_config_refusal(repo: &gix::Repository, range: &str) -> Option<ExitCode> {
+    let refused = crate::log_config::validate_log(repo).and_then(|()| crate::cmd_config::validate_grep_only(repo));
+    if let Err(rejection) = refused {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        return Some(log_parse_failed(range));
+    }
+    // `cmd_log_init_defaults()` resolves `format.pretty` before the log reads its
+    // arguments, so a name that is no format is refused even though the log is given
+    // `--pretty=medium` afterwards.
+    let snap = repo.config_snapshot();
+    if let Some(configured) = snap.string("format.pretty") {
+        let spec = gix::bstr::ByteSlice::to_str_lossy(configured.as_ref() as &[u8]);
+        if matches!(super::log::get_commit_format(Some(repo), &spec), Ok(None)) {
+            eprintln!("fatal: invalid --pretty format: {spec}");
+            return Some(log_parse_failed(range));
+        }
+    }
+    // then `log.date`, which `parse_date_format()` refuses by name.
+    let configured = snap.string("log.date")?;
+    let date = gix::bstr::ByteSlice::to_str_lossy(configured.as_ref() as &[u8]);
+    if super::log::parse_date_mode(&date).is_none() {
+        eprintln!("fatal: unknown date format {date}");
+        return Some(log_parse_failed(range));
+    }
+    None
 }
 
 /// `builtin/range-diff.c`'s own `error()` for a failed inner log, on its own:

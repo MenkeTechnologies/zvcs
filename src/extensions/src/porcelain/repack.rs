@@ -880,7 +880,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
                 to_pack.push(id);
             }
         }
-    } else if st.keep_unreachable && !st.cruft {
+    } else if st.keep_unreachable && pushes_keep_unreachable(st, &existing, &pack_dir) {
         let packed: HashSet<ObjectId> = to_pack.iter().copied().collect();
         for id in super::prune::all_object_ids(&repo, &objdir) {
             if !packed.contains(&id) {
@@ -2280,6 +2280,30 @@ impl Geometry {
 /// half `clone --dissociate` relies on before it unlinks `objects/info/alternates`.
 fn is_existing_local(pack_dir: &Path, index_path: &Path) -> bool {
     index_path.parent() == Some(pack_dir)
+}
+
+/// Whether `cmd_repack()` hands `pack-objects` `--keep-unreachable --pack-loose-unreachable`.
+///
+/// ```c
+/// if (has_existing_non_kept_packs(&existing) && delete_redundant &&
+///     !(pack_everything & PACK_CRUFT)) {
+///         [...]
+///         } else if (keep_unreachable) {
+///                 strvec_push(&cmd.args, "--keep-unreachable");
+///                 strvec_push(&cmd.args, "--pack-loose-unreachable");
+///         }
+/// }
+/// ```
+///
+/// (inside `if (pack_everything & ALL_INTO_ONE)`.) So `-k` alone, or without `-d`, or with
+/// nothing to delete, leaves the unreachable objects where they are.
+fn pushes_keep_unreachable(st: &State, existing: &[pack::index::File], pack_dir: &Path) -> bool {
+    st.all_into_one
+        && st.delete_redundant
+        && !st.cruft
+        && existing
+            .iter()
+            .any(|file| is_existing_local(pack_dir, file.path()) && droppable(st, file.path()))
 }
 
 fn droppable(st: &State, index_path: &Path) -> bool {

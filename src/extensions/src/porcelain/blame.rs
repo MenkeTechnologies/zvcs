@@ -539,7 +539,16 @@ pub fn blame(args: &[String]) -> Result<ExitCode> {
 /// `cmd` is `argv[0]` as `parse_options` sees it, which only affects the `usage:`
 /// line.
 pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
-    let mut repo = crate::setup::discover()?;
+    // `run_builtin()` demotes `RUN_SETUP` to `RUN_SETUP_GENTLY` for a lone `-h` (git.c:474-477),
+    // so the usage is printed outside a repository too. `annotate` splices a `-c` in front of
+    // what the user typed, which git.c never sees.
+    let typed = if cmd == "annotate" { args.get(1..).unwrap_or_default() } else { args };
+    let mut repo = match crate::setup::discover() {
+        Ok(repo) => repo,
+        Err(_) if matches!(typed, [a] if a == "-h") => return print_usage(cmd, true),
+        Err(_) if matches!(typed, [a] if a == "--help-all") => return print_usage_all(cmd),
+        Err(err) => return Err(err.into()),
+    };
     // Object-heavy path: give gix the caches it does not enable by default —
     // a decoded-object cache and a git-sized delta-base cache (gix ships a
     // 64-entry linked list; git's core.deltaBaseCacheLimit default is 96MB).

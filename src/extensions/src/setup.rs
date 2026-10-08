@@ -2361,6 +2361,11 @@ pub fn explicit_git_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     if !runs_strict_setup(sub, args) {
         return None;
     }
+    // `run_builtin()` demotes `RUN_SETUP` to `RUN_SETUP_GENTLY` for a lone `-h` (git.c:474-477),
+    // so `git --git-dir=nosuch <cmd> -h` prints the usage instead of dying here.
+    if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
+        return None;
+    }
     let env = std::env::var_os("GIT_DIR")?;
     let path = PathBuf::from(&env);
     let target = match crate::porcelain::rev_parse::read_gitfile_gently(&path) {

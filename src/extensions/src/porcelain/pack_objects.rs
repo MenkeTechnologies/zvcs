@@ -846,6 +846,13 @@ pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             };
+            // `git_pack_config()` ends in `git_default_config()`, so every `core.*` / `push.*` /
+            // `advice.*` value the default callback refuses dies here, after the settings
+            // block. Measured against git 2.56.0: `-c core.quotePath=warn pack-objects
+            // --stdout` is fatal, `-h` included.
+            if let Err(rejection) = crate::default_config::validate(&repo) {
+                return Err(rejection.into_error());
+            }
             let limit = match crate::config::config_ulong(&repo, "pack.packSizeLimit") {
                 Ok(limit) => limit,
                 Err(message) => {

@@ -194,6 +194,21 @@ pub(crate) fn scp(input: &BStr, colon: usize) -> Result<crate::Url, Error> {
         });
     }
 
+    // git's `parse_connect_url()` takes the text before the first `:` as the host whatever it is,
+    // so `:refs/heads/x` is an ssh target with an empty host and the `ssh` it spawns is the one to
+    // complain (`Could not resolve hostname`). `ssh://` alone is not a URL, so build this one by hand.
+    if host.is_empty() {
+        return Ok(crate::Url {
+            serialize_alternative_form: true,
+            scheme: Scheme::Ssh,
+            user: None,
+            password: None,
+            host: Some(String::new()),
+            port: None,
+            path: path.into(),
+        });
+    }
+
     // The path returned by the parsed url often has the wrong number of leading `/` characters but
     // should never differ in any other way (ssh URLs should not contain a query or fragment part).
     // To avoid the various off-by-one errors caused by the `/` characters, we keep using the path

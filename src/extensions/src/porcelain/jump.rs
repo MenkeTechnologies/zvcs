@@ -1,12 +1,12 @@
 //! `git jump` — emit "quickfix" lines for interesting spots and hand them to an
 //! editor. **All four modes (`diff`, `merge`, `grep`, `ws`) plus `auto` are
-//! ported; only the editor hand-off bails.**
+//! ported, and so is the editor hand-off.**
 //!
 //! Stock `git jump` is a `/bin/sh` script installed in `$(git --exec-path)`
 //! (originally `contrib/git-jump/git-jump`; 2.55.0 ships it at
 //! `libexec/git-core/git-jump`). It is a driver: every mode is a shell pipeline
 //! over other git commands plus `perl`, `sort` and `grep`, and the default exit
-//! path writes the result to a `mktemp` file and `eval`s `git var GIT_EDITOR`.
+//! path writes the result to a `mktemp` file and `eval`s `git var GIT_EDITOR` (ported: `open_editor`).
 //!
 //! Ported, byte-verified against git 2.55.0 on Darwin:
 //!
@@ -20,8 +20,9 @@
 //!     runs the mode first and `test -s "$tmp" || exit 0` — an empty result is
 //!     exit 0 with no editor, which is reproduced exactly.
 //!   * `mode_merge`: `git ls-files -u <args>` → strip through the first tab →
-//!     `sort -u` → `grep -Hn '^<<<<<<<'` per file. Paths are cwd-relative and
-//!     pathspec-limited exactly as `ls-files` resolves them, `grep`'s
+//!     `sort -u` → `grep -Hn '^<<<<<<<'` per file. `ls-files` itself is run, so
+//!     its options, usage text and quoting are its own; paths are cwd-relative and
+//!     pathspec-limited exactly as it resolves them, `grep`'s
 //!     `grep: <file>: No such file or directory` is reproduced on stderr for a
 //!     delete/modify conflict, and its exit status is discarded as the pipeline
 //!     does.
@@ -44,15 +45,6 @@
 //!     goes to stderr and the script still exits 0, because only the pipeline's
 //!     output is consulted.
 //!
-//! NOT ported — each bails, naming the missing substrate:
-//!
-//!   1. **The editor hand-off** — `git var GIT_EDITOR`, the `mktemp` file, and the
-//!      emacs/vi `eval` split. Spawning the user's editor is not gitoxide
-//!      substrate; a non-empty result therefore bails instead of pretending.
-//!   2. **Options for `merge`.** Stock forwards them to `ls-files`, which answers
-//!      an unknown one with its own multi-screen usage and the script still exits
-//!      0. That text is not reproduced here; only `--` and pathspecs are accepted.
-//!
 //! `diff` and `ws` inherit whatever `diff.rs` gets right or wrong about
 //! `--no-prefix`/`--relative`/`--check`; that is the same coupling stock has,
 //! since the script shells out to the `git` it ships with.
@@ -62,7 +54,7 @@
 //! paths), and a conflicted file containing NUL makes system `grep` print
 //! `Binary file <f> matches` — that case bails instead of emitting line hits.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::ExitCode;
@@ -163,13 +155,45 @@ pub fn jump(args: &[String]) -> Result<ExitCode> {
     if quickfix.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
-    bail!(
-        "unsupported: handing the quickfix list to an editor is not ported ({} bytes of \
-         elements found; re-run with --stdout to print them). Stock resolves `git var \
-         GIT_EDITOR`, writes a mktemp file and `eval`s the editor with -q (or an emacs \
-         --eval form) — spawning the user's editor is not gitoxide substrate",
-        quickfix.len()
-    );
+    open_editor(&quickfix)
+}
+
+/// `open_editor` as `git-jump` runs it on a `mktemp -t git-jump.XXXXXX` file: the editor is
+/// `git var GIT_EDITOR`, an emacs gets `--eval` with a `grep` buffer and anything else is
+/// assumed vi-compatible and called with `-q`. The exit status is the editor's, and the
+/// temporary file is removed afterwards (the script's exit trap).
+fn open_editor(quickfix: &[u8]) -> Result<ExitCode> {
+    const OPEN_EDITOR: &str = r#"case "$editor" in
+*emacs*)
+	eval "$editor --eval \"(let ((buf (grep \\\"cat \$1\\\"))) (pop-to-buffer buf) (select-frame-set-input-focus (selected-frame)) (while (get-buffer-process buf) (sleep-for 0.1)))\""
+	;;
+*)
+	eval "$editor -q \$1"
+	;;
+esac"#;
+
+    let mktemp = std::process::Command::new("mktemp")
+        .args(["-t", "git-jump.XXXXXX"])
+        .output()?;
+    if !mktemp.status.success() {
+        return Ok(ExitCode::from(1));
+    }
+    let tmp = String::from_utf8_lossy(&mktemp.stdout).trim_end_matches('\n').to_owned();
+    std::fs::write(&tmp, quickfix)?;
+
+    // `editor=`git var GIT_EDITOR`` — command substitution drops trailing newlines.
+    let var = std::process::Command::new(crate::hosted::git_exe()?)
+        .args(["var", "GIT_EDITOR"])
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    let editor = String::from_utf8_lossy(&var.stdout).trim_end_matches('\n').to_owned();
+
+    let status = std::process::Command::new("sh")
+        .args(["-c", OPEN_EDITOR, "git-jump", &tmp])
+        .env("editor", &editor)
+        .status();
+    let _ = std::fs::remove_file(&tmp);
+    Ok(ExitCode::from(status?.code().unwrap_or(1) as u8))
 }
 
 /// `mode_auto`. `Ok(None)` is the script's `usage >&2; exit 1` path.
@@ -184,14 +208,13 @@ fn mode_auto(args: &[String]) -> Result<Option<Vec<u8>>> {
     }
 
     // `test -n "$(git ls-files -u "$@")"` — any unmerged entry selects merge mode.
-    let conflicted = unmerged_paths(&repo, args)?;
-    if !conflicted.is_empty() {
-        return Ok(Some(grep_markers(&conflicted)?));
+    if run_self(&["ls-files", "-u"], args)?.iter().any(|&b| b != b'\n') {
+        return Ok(Some(mode_merge(args)?));
     }
 
     // `! git diff --quiet "$@"` — index vs worktree only, staged changes and
     // untracked files do not count.
-    if has_unstaged_changes(&repo, args)? {
+    if has_unstaged_changes(args)? {
         return Ok(Some(mode_diff(args)?));
     }
     Ok(None)
@@ -318,14 +341,7 @@ fn hunk_new_start(rest: &[u8]) -> Option<u64> {
 /// `mode_merge`: `git ls-files -u "$@"` → first-tab strip → `sort -u` →
 /// `grep -Hn '^<<<<<<<' "$fn"` per file.
 fn mode_merge(args: &[String]) -> Result<Vec<u8>> {
-    // Outside a repository `git ls-files` prints its own fatal and the script
-    // ignores the status, so the run still ends at exit 0 with no elements.
-    let Ok(repo) = crate::setup::discover() else {
-        eprintln!("fatal: not a git repository (or any of the parent directories): .git");
-        return Ok(Vec::new());
-    };
-    let paths = unmerged_paths(&repo, args)?;
-    grep_markers(&paths)
+    grep_markers(&unmerged_paths(args)?)
 }
 
 /// `mode_grep`:
@@ -413,73 +429,38 @@ fn squeeze_blanks(input: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The `ls-files -u` half of `mode_merge`: cwd-relative paths of every entry at
-/// a conflict stage, pathspec-limited, deduplicated and byte-sorted (`sort -u`).
-fn unmerged_paths(repo: &gix::Repository, args: &[String]) -> Result<BTreeSet<BString>> {
-    let mut patterns: Vec<BString> = Vec::new();
-    let mut no_more_flags = false;
-    for a in args {
-        if !no_more_flags && a == "--" {
-            no_more_flags = true;
+/// The `ls-files -u` half of `mode_merge`:
+///
+/// ```sh
+/// git ls-files -u "$@" | perl -pe 's/^.*?\t//' | sort -u | while IFS= read fn; do ...
+/// ```
+///
+/// `ls-files` is the one that parses the arguments, so its option errors, usage text and
+/// quoting of awkward paths are reached by running it. What the shell then does with each
+/// line is reproduced here: the perl substitution drops everything through the first tab,
+/// `sort -u` orders and deduplicates (bytewise here), and `read` without `-r` treats a
+/// backslash as an escape for the byte after it.
+fn unmerged_paths(args: &[String]) -> Result<BTreeSet<BString>> {
+    let listing = run_self(&["ls-files", "-u"], args)?;
+    let mut out = BTreeSet::new();
+    for line in listing.split(|&b| b == b'\n') {
+        let name = match line.iter().position(|&b| b == b'\t') {
+            Some(tab) => &line[tab + 1..],
+            None => line,
+        };
+        if name.is_empty() {
             continue;
         }
-        if !no_more_flags && a.starts_with('-') {
-            anyhow::bail!(
-                "unsupported argument {a:?}: git jump forwards it to `git ls-files -u`, whose \
-                 option parser and usage text are not reproduced here"
-            );
-        }
-        patterns.push(BString::from(a.as_str()));
-    }
-
-    let index = repo.open_index()?;
-
-    // Index paths are repository-relative; `ls-files` prints them relative to the
-    // current directory, which is what the following `grep` then opens.
-    let prefix: Option<BString> = match repo.prefix()? {
-        Some(p) if !p.as_os_str().is_empty() => {
-            let mut b = gix::path::into_bstr(p).into_owned();
-            b.push(b'/');
-            Some(b)
-        }
-        _ => None,
-    };
-
-    // `empty_patterns_match_prefix = true` reproduces git's default of limiting a
-    // bare invocation from a subdirectory to that subdirectory.
-    let mut ps = repo.pathspec(
-        true,
-        &patterns,
-        false,
-        &index,
-        gix::worktree::stack::state::attributes::Source::IdMapping,
-    )?;
-
-    let mut out = BTreeSet::new();
-    if let Some(iter) = ps.index_entries_with_paths(&index) {
-        for (path, entry) in iter {
-            if entry.stage_raw() == 0 {
-                continue;
+        let mut unescaped = Vec::with_capacity(name.len());
+        let mut bytes = name.iter().copied();
+        while let Some(b) = bytes.next() {
+            if b == b'\\' {
+                unescaped.extend(bytes.next());
+            } else {
+                unescaped.push(b);
             }
-            let display: &[u8] = match &prefix {
-                Some(pref) => path
-                    .as_bytes()
-                    .strip_prefix(pref.as_bytes())
-                    .unwrap_or_else(|| path.as_bytes()),
-                None => path.as_bytes(),
-            };
-            // A path git would render with `core.quotePath` reaches the shell as
-            // its quoted spelling, which `grep` then fails to open. Refuse rather
-            // than guess which of the two spellings the harness will see.
-            if crate::quote::needs_c_quote(display) {
-                anyhow::bail!(
-                    "unsupported path {:?}: git ls-files renders it in quoted form and stock \
-                     git-jump then greps a filename that does not exist",
-                    display.as_bstr()
-                );
-            }
-            out.insert(BString::from(display));
         }
+        out.insert(BString::from(unescaped));
     }
     Ok(out)
 }
@@ -527,26 +508,14 @@ fn grep_markers(paths: &BTreeSet<BString>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// `git diff --quiet "$@"` — true when the worktree differs from the index for a
-/// tracked path. Untracked files and stat-only staleness do not count, matching
-/// `diff-files` after the refresh git performs first.
-fn has_unstaged_changes(repo: &gix::Repository, args: &[String]) -> Result<bool> {
-    let patterns: Vec<BString> = args.iter().map(|a| BString::from(a.as_str())).collect();
-    for item in repo.status(gix::progress::Discard)?.into_iter(patterns)? {
-        if let gix::status::Item::IndexWorktree(iw) = item? {
-            use gix::status::index_worktree::Item;
-            use gix::status::plumbing::index_as_worktree::EntryStatus;
-            match iw {
-                Item::Modification { status, .. } => match status {
-                    EntryStatus::NeedsUpdate(_) => {}
-                    _ => return Ok(true),
-                },
-                Item::Rewrite { .. } => return Ok(true),
-                Item::DirectoryContents { .. } => {}
-            }
-        }
-    }
-    Ok(false)
+/// `! git diff --quiet "$@"` — true when this binary's `diff --quiet` exits non-zero: the work
+/// tree differs from the index, or `diff` refused an argument (its usage goes to stderr).
+fn has_unstaged_changes(args: &[String]) -> Result<bool> {
+    let status = std::process::Command::new(crate::hosted::git_exe()?)
+        .args(["diff", "--quiet"])
+        .args(args)
+        .status()?;
+    Ok(!status.success())
 }
 
 /// `git rev-parse --is-inside-work-tree` — a worktree exists and the current

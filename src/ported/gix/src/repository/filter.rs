@@ -42,10 +42,14 @@ impl Repository {
     ) -> Result<(filter::Pipeline<'_>, IndexPersistedOrInMemory), pipeline::Error> {
         let (cache, index) = if self.is_bare() {
             let index = self.index_from_tree(&tree_if_bare.map_or_else(
-                || {
-                    self.head_commit()
-                        .map_err(pipeline::Error::from)
-                        .and_then(|c| c.tree_id().map(Id::detach).map_err(Into::into))
+                || match self.head_commit() {
+                    Ok(commit) => commit.tree_id().map(Id::detach).map_err(Into::into),
+                    // A bare repository whose HEAD names no commit yet has no `.gitattributes` to
+                    // read: git ignores the unborn default attribute source, so nothing applies.
+                    Err(_) if self.head().is_ok_and(|head| head.is_unborn()) => {
+                        Ok(gix_hash::ObjectId::empty_tree(self.object_hash()))
+                    }
+                    Err(err) => Err(pipeline::Error::from(err)),
                 },
                 Ok,
             )?)?;

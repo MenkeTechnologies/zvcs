@@ -1574,6 +1574,7 @@ pub fn delete_state_ref(repo: &gix::Repository, name: &str) -> Result<bool> {
     }
     packed_refs_lock_timeout(repo)?;
     let mut removed = std::fs::remove_file(repo.git_dir().join(name)).is_ok();
+    crate::refstore::remove_root_ref_log(repo, name);
     if let Ok(reference) = repo.find_reference(name) {
         let current = reference.target().into_owned();
         removed |= repo

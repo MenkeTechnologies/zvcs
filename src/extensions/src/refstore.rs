@@ -441,6 +441,32 @@ pub fn state_ref_exists(repo: &gix::Repository, name: &str) -> bool {
     files_ref_path(repo, name.as_bytes().as_bstr()).exists()
 }
 
+/// Whether git's files backend logs a write of the root ref `name`.
+///
+/// Every root ref but `HEAD`, `FETCH_HEAD` and `MERGE_HEAD` (see [`is_pseudo_ref`]) is set through a
+/// reference transaction, so `-c core.logAllRefUpdates=always` leaves a `logs/<name>` behind it
+/// (`logs/AUTO_MERGE`, `logs/REBASE_HEAD`, …) and any reflog that already exists is appended to.
+/// Without either, nothing is logged and the plain file write is all there is to do, so that is
+/// still what happens.
+fn is_logged_root_ref(repo: &gix::Repository, name: &str) -> bool {
+    if name == "HEAD" || is_pseudo_ref(name) {
+        return false;
+    }
+    let always = repo
+        .config_snapshot()
+        .string("core.logAllRefUpdates")
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"always"));
+    always || repo.git_dir().join("logs").join(name).exists()
+}
+
+/// `refs_delete_ref()` takes the reflog with the ref: a root ref that was logged (see
+/// [`is_logged_root_ref`]) leaves no `logs/<name>` behind once it is gone.
+pub fn remove_root_ref_log(repo: &gix::Repository, name: &str) {
+    if name != "HEAD" && !is_pseudo_ref(name) {
+        let _ = std::fs::remove_file(repo.git_dir().join("logs").join(name));
+    }
+}
+
 /// Set the root ref `name` to `value` without dereferencing it, as
 /// `refs_update_ref(…, msg, name, oid, NULL, REF_NO_DEREF, …)` does for the
 /// sequencer's, merge's, bisect's and notes' state refs. `msg` is the reflog
@@ -453,7 +479,7 @@ pub fn state_ref_exists(repo: &gix::Repository, name: &str) -> bool {
 ///   (`reftable_be_transaction_prepare()`/`_finish()`), logged when
 ///   `core.logAllRefUpdates` or an existing reflog says so.
 pub fn state_ref_write(repo: &gix::Repository, name: &str, value: &StateRef, msg: &str) -> Result<()> {
-    if is_reftable(repo) && !is_pseudo_ref(name) {
+    if (is_reftable(repo) && !is_pseudo_ref(name)) || (!is_reftable(repo) && is_logged_root_ref(repo, name)) {
         let full = FullName::try_from(name)?;
         repo.edit_reference(RefEdit {
             change: Change::Update {
@@ -501,6 +527,7 @@ pub fn state_ref_delete(repo: &gix::Repository, name: &str, msg: &str) -> Result
         })?;
         return Ok(());
     }
+    remove_root_ref_log(repo, name);
     match std::fs::remove_file(files_ref_path(repo, name.as_bytes().as_bstr())) {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
         _ => Ok(()),

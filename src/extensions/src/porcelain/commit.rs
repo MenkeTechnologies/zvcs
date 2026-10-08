@@ -1373,6 +1373,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // commit succeeds.
     let mut interactive_stage = None;
     if interactive {
+        // `prepare_index()` holds the index lock and runs `refresh_cache_or_die()` ahead of
+        // `interactive_add()`, so unmerged paths end the command before any selector output.
+        let unmerged = crate::index_open::or_empty(&repo)?;
+        if unmerged.entries().iter().any(|e| e.stage() != gix::index::entry::Stage::Unconflicted) {
+            return Ok(die_resolve_conflict(&unmerged));
+        }
         let mut guard = InteractiveStage::hold(&repo, patch_interactive)?;
         let status = if patch_interactive {
             // git's `interactive_add()` under a `GIT_INDEX_FILE` pointed at the
@@ -4203,7 +4209,15 @@ fn include_stage(
 ) -> Result<StagedSet> {
     let tracked = tracked_map(index);
     let known: HashSet<BString> = tracked.keys().cloned().collect();
-    stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree_paths(index))
+    // Unlike `--only`'s `list_paths()`, which `exit(1)`s on an unmatched pathspec, the
+    // `also` arm's refusal after `add_files_to_cache()` ends the command with 128 (measured
+    // against 2.56.0: `commit -i <untracked>` prints the `error:` line alone, exit 128).
+    stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree_paths(index), false).map_err(|e| {
+        match e.downcast_ref::<crate::fatal::Silent>() {
+            Some(crate::fatal::Silent(1)) => anyhow::Error::new(crate::fatal::Silent(128)),
+            _ => e,
+        }
+    })
 }
 
 /// The paths a sparse checkout marks `CE_SKIP_WORKTREE`, which is what
@@ -4282,7 +4296,7 @@ fn only_mode_stage(
     // `list_paths()` reads `ce_skip_worktree(ce)` off the *real* index, not the
     // HEAD-derived one this false index is built from.
     let skip_worktree = skip_worktree_paths(&real);
-    let staged = stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree)?;
+    let staged = stage_pathspecs(repo, pathspecs, &tracked, &known, &skip_worktree, true)?;
     staged.apply_to(&mut temp);
     Ok((temp, staged))
 }
@@ -4435,15 +4449,84 @@ fn prefix_path(spec: &[u8], cwd_prefix: &[u8]) -> Vec<u8> {
     out.join(&b'/')
 }
 
+/// `report_path_error()` over the literal pathspecs: every one must name a path (or a directory
+/// of paths) in `known`, and each that does not is reported before the command gives up.
+///
+/// `--only` runs it from `list_paths()`, ahead of everything that touches the worktree; the
+/// `--include` arm reports after `add_files_to_cache()` has hashed the matched files.
+fn report_unmatched_pathspecs(
+    repo: &gix::Repository,
+    pathspecs: &[String],
+    known: &HashSet<BString>,
+) -> Result<()> {
+    // Each explicit (non-magic, non-glob) pathspec must match a path git already
+    // knows — `report_path_error()`'s `did not match any file(s) known to git`. A
+    // known path that is present but unchanged still counts (its entry is simply
+    // left alone), which is why the whole `known` set is searched, not just the
+    // paths that were restaged.
+    let mut unmatched = false;
+    // `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL, prefix, argv)`
+    // (builtin/commit.c:365-367) spells every spec from the top of the work tree
+    // before `ce_path_match()` ever sees it, so the literal compared against the
+    // index is `prefix_path()`'s: the current directory's prefix joined with the
+    // spec, with `.` and `..` resolved away. Comparing the spec as typed instead
+    // meant a `git commit <path>` run anywhere but the top of the work tree
+    // reported every path as unknown -- `b.txt` from `bar/` never equals the
+    // `bar/b.txt` the index holds -- and refused the commit. The walk itself was
+    // already prefix-aware, which is why only the specs this loop looks at (the
+    // literal ones) were affected.
+    let cwd_prefix = crate::setup::prefix_bytes(repo);
+    for p in pathspecs {
+        if p == "." || p.starts_with(':') || p.contains(['*', '?', '[']) {
+            continue;
+        }
+        let pb = prefix_path(p.as_bytes(), &cwd_prefix);
+        let pb = pb.as_slice();
+        let mut prefix = pb.to_vec();
+        prefix.push(b'/');
+        let matched = known
+            .iter()
+            .any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix));
+        if !matched {
+            // `report_path_error()` writes `error:` and the caller exits 1 — this
+            // is not a `die()`, so it is neither `fatal:` nor 128.
+            eprintln!("error: pathspec '{p}' did not match any file(s) known to git");
+            unmatched = true;
+        }
+    }
+    // ```c
+    // for (i = 0; i < pathspec->nr; i++) {
+    //         ...
+    //         if (!seen[i]) error(_("pathspec '%s' did not match any file(s) known to git"), ...);
+    //         ...
+    // }
+    // return errors;
+    // ```
+    //
+    // (`report_path_error()`, pathspec.c.) Every unmatched spec is reported before the
+    // caller gives up, so a `--pathspec-from-file` whose lines are all wrong names them
+    // all rather than stopping at the first.
+    if unmatched {
+        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+    }
+    Ok(())
+}
+
+
 fn stage_pathspecs(
     repo: &gix::Repository,
     pathspecs: &[String],
     tracked: &HashMap<BString, (ObjectId, Mode)>,
     known: &HashSet<BString>,
     skip_worktree: &HashSet<BString>,
+    check_first: bool,
 ) -> Result<StagedSet> {
     if repo.workdir().is_none() {
         crate::git_fatal!("this operation must be run in a work tree");
+    }
+
+    if check_first {
+        report_unmatched_pathspecs(repo, pathspecs, known)?;
     }
 
     // Walk the worktree for files matching the pathspecs (mirrors `git add`).
@@ -4585,55 +4668,8 @@ fn stage_pathspecs(
         }
     }
 
-    // Each explicit (non-magic, non-glob) pathspec must match a path git already
-    // knows — `report_path_error()`'s `did not match any file(s) known to git`. A
-    // known path that is present but unchanged still counts (its entry is simply
-    // left alone), which is why the whole `known` set is searched, not just the
-    // paths that were restaged.
-    let mut unmatched = false;
-    // `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL, prefix, argv)`
-    // (builtin/commit.c:365-367) spells every spec from the top of the work tree
-    // before `ce_path_match()` ever sees it, so the literal compared against the
-    // index is `prefix_path()`'s: the current directory's prefix joined with the
-    // spec, with `.` and `..` resolved away. Comparing the spec as typed instead
-    // meant a `git commit <path>` run anywhere but the top of the work tree
-    // reported every path as unknown -- `b.txt` from `bar/` never equals the
-    // `bar/b.txt` the index holds -- and refused the commit. The walk itself was
-    // already prefix-aware, which is why only the specs this loop looks at (the
-    // literal ones) were affected.
-    let cwd_prefix = crate::setup::prefix_bytes(repo);
-    for p in pathspecs {
-        if p == "." || p.starts_with(':') || p.contains(['*', '?', '[']) {
-            continue;
-        }
-        let pb = prefix_path(p.as_bytes(), &cwd_prefix);
-        let pb = pb.as_slice();
-        let mut prefix = pb.to_vec();
-        prefix.push(b'/');
-        let matched = known
-            .iter()
-            .any(|x| x.as_slice() == pb || x.as_slice().starts_with(&prefix));
-        if !matched {
-            // `report_path_error()` writes `error:` and the caller exits 1 — this
-            // is not a `die()`, so it is neither `fatal:` nor 128.
-            eprintln!("error: pathspec '{p}' did not match any file(s) known to git");
-            unmatched = true;
-        }
-    }
-    // ```c
-    // for (i = 0; i < pathspec->nr; i++) {
-    //         ...
-    //         if (!seen[i]) error(_("pathspec '%s' did not match any file(s) known to git"), ...);
-    //         ...
-    // }
-    // return errors;
-    // ```
-    //
-    // (`report_path_error()`, pathspec.c.) Every unmatched spec is reported before the
-    // caller gives up, so a `--pathspec-from-file` whose lines are all wrong names them
-    // all rather than stopping at the first.
-    if unmatched {
-        return Err(anyhow::Error::new(crate::fatal::Silent(1)));
+    if !check_first {
+        report_unmatched_pathspecs(repo, pathspecs, known)?;
     }
 
     Ok(StagedSet { staged, deletions })

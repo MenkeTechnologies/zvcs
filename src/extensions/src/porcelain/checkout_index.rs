@@ -107,7 +107,8 @@ struct Opts {
     not_new: bool,              // -n/--no-create
     refresh_cache: bool,        // -u/--index
     ignore_skip_worktree: bool, // --ignore-skip-worktree-bits
-    to_tempfile: bool,          // --temp (implied by --stage=all)
+    to_tempfile: bool,          // --temp (implied by --stage=all), settled once the options are parsed
+    temp_opt: Option<bool>,     // --temp / --no-temp as given; `None` is git's `to_tempfile = -1`
     nul_term: bool,             // -z
     from_stdin: bool,           // --stdin
     base_dir: String,           // --prefix=<string>
@@ -229,8 +230,8 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
                 "no-index" => opts.refresh_cache = false,
                 "stdin" => opts.from_stdin = true,
                 "no-stdin" => opts.from_stdin = false,
-                "temp" => opts.to_tempfile = true,
-                "no-temp" => opts.to_tempfile = false,
+                "temp" => opts.temp_opt = Some(true),
+                "no-temp" => opts.temp_opt = Some(false),
                 "ignore-skip-worktree-bits" => opts.ignore_skip_worktree = true,
                 "no-ignore-skip-worktree-bits" => opts.ignore_skip_worktree = false,
                 "prefix" => opts.base_dir = value(&mut i)?,
@@ -238,7 +239,6 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
                 "stage" => {
                     let v = value(&mut i)?;
                     if v == "all" {
-                        opts.to_tempfile = true;
                         opts.stage = CHECKOUT_ALL;
                     } else {
                         // git inspects only the first byte of the argument.
@@ -276,6 +276,12 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         i += 1;
     }
 
+    // `if (to_tempfile < 0) to_tempfile = (checkout_stage == CHECKOUT_ALL);` and the refusal of
+    // an explicit `--no-temp` beside `--stage=all` (builtin/checkout-index.c:277-281).
+    opts.to_tempfile = opts.temp_opt.unwrap_or(opts.stage == CHECKOUT_ALL);
+    if !opts.to_tempfile && opts.stage == CHECKOUT_ALL {
+        return die("options '--stage=all' and '--no-temp' cannot be used together");
+    }
     if opts.all && opts.from_stdin {
         return die("git checkout-index: don't mix '--all' and '--stdin'");
     }

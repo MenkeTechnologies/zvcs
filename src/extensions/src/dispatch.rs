@@ -1359,7 +1359,9 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
         let discovered = crate::setup::discover().err();
         if let Some(gix::discover::Error::Open(gix::open::Error::Config(config))) = &discovered {
             if let Some(msg) = crate::config::repository_format_message(config) {
-                return Some(msg);
+                // `gix` stops at the first offender it knows; git lists every one, so the
+                // port of `verify_repository_format()` answers whenever it has the file.
+                return Some(crate::config::repository_format_refusal().unwrap_or(msg));
             }
         }
     }

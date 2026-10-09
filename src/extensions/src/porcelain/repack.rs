@@ -1263,6 +1263,10 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // `pack-objects` and before the filtered pack, so `names` — the set whose
     // objects are already delivered — is the main pack plus the promisor one.
     // What is left over is by construction what the traversal did not reach.
+    //
+    // `cruft_written` is what that pack holds: the filtered pack is written after it, with the
+    // cruft pack among its `^` exclusions.
+    let mut cruft_written: HashSet<ObjectId> = HashSet::new();
     if st.cruft {
         // `write_cruft_pack()` spawns a `pack-objects` of its own whether or not
         // anything is left over, so its floor warning is unconditional here too.
@@ -1364,6 +1368,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
             )?;
             let hash = pack_hash(&pack_base_name(&path));
             write_mtimes(&repo, &path, &suffixed(&packtmp, &format!("-{hash}.mtimes")), &stamps)?;
+            cruft_written.extend(cruft.iter().copied());
             new_packs.push((hash, cruft.len()));
         }
 
@@ -1381,6 +1386,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // pack once `-d` removes the ones they came from. `--drop-filtered` (dry run
     // included) writes no such pack (2.56, builtin/repack.c:691).
     if st.filter && !st.drop_filtered {
+        filtered_out.retain(|id| !cruft_written.contains(id));
         // `write_filtered_pack()` is the fourth `pack-objects` child, driven by
         // `po_args` (builtin/repack.c:547-558), so it warns on the same limit the
         // main pack did.

@@ -6752,8 +6752,10 @@ impl<'r> Sequencer<'r> {
         let dir = self.dir();
         // The `merge` command's stop never reaches `make_patch()` below, so the
         // stopped commit is recorded here; a `pick`'s `make_patch()` rewrites the
-        // same id.
-        std::fs::write(dir.join("stopped-sha"), format!("{oid}\n"))?;
+        // same id, later (see `stop_files`).
+        if !patch {
+            std::fs::write(dir.join("stopped-sha"), format!("{oid}\n"))?;
+        }
         // `do_recursive_merge()` appends `append_conflicts_hint()`'s block to the
         // message buffer, and `do_pick_commit()` then writes that buffer out with
         // `write_message(msgbuf.buf, msgbuf.len, git_path_merge_msg(r), 0)`
@@ -6801,32 +6803,22 @@ impl<'r> Sequencer<'r> {
         // `MERGE_MSG` (sequencer.c:3911-3926) — whichever merge produced the
         // conflict, a `merge-<strategy>` child included.
         let failed_squash = item.cmd.is_fixup() && dir.join("message-squash").exists();
+        // `MERGE_MSG` is `do_pick_commit()`'s; the state directory's own files are
+        // `error_with_patch()`'s and come after `repo_rerere()` (see `stop_files`).
+        // A `merge` stop (`patch == false`) has no later step to wait for.
         if failed_squash {
-            std::fs::copy(dir.join("message-squash"), dir.join("message"))?;
             let merge_msg = self.repo.git_dir().join("MERGE_MSG");
             let _ = std::fs::remove_file(&merge_msg);
-            std::fs::copy(dir.join("message"), merge_msg)?;
-        } else {
-            match &hinted {
-                Some(hinted) => {
-                    std::fs::write(dir.join("message"), hinted)?;
-                    std::fs::write(self.repo.git_dir().join("MERGE_MSG"), hinted)?;
-                }
-                None => std::fs::write(dir.join("message"), message)?,
-            }
+            std::fs::copy(dir.join("message-squash"), merge_msg)?;
+        } else if let Some(hinted) = &hinted {
+            std::fs::write(self.repo.git_dir().join("MERGE_MSG"), hinted)?;
         }
-        // `error_with_patch()` opens with `make_patch()` whenever it has a commit
-        // (sequencer.c:3505-3507); the `message` above is already on disk, so the
-        // `if (!file_exists(…))` arm there leaves it alone.
+        if !patch {
+            self.stop_files(&dir, oid, message, hinted.as_deref(), failed_squash, false)?;
+        }
         if cherry_pick_head {
             crate::sequencer::write_state_oid(self.repo, "CHERRY_PICK_HEAD", oid, "")?;
             crate::sequencer::delete_state_ref(self.repo, "CHERRY_PICK_HEAD")?;
-        }
-        if patch {
-            make_patch(self.repo, &dir, &self.repo.find_commit(oid)?)?;
-        }
-        if let Some(oid) = self.autostash {
-            let _ = std::fs::write(dir.join("autostash"), format!("{oid}\n"));
         }
         self.term_clear_line();
         eprintln!("error: could not apply {short}... {}", subject.to_str_lossy());
@@ -6850,6 +6842,11 @@ impl<'r> Sequencer<'r> {
         // wrote it before reaching here — and rerere reopens it, so a staged
         // replay lands in the file `--continue` will read.
         super::rerere::repo_rerere(self.repo, self.st.rerere_autoupdate)?;
+        // `error_with_patch()` begins here: `make_patch()` and the files `--continue` reads. A
+        // `repo_rerere()` that dies (`rerere.autoUpdate=warn`) leaves none of them behind.
+        if patch {
+            self.stop_files(&dir, oid, message, hinted.as_deref(), failed_squash, true)?;
+        }
         // `error_with_patch()` reports the *todo line's* argument, not the
         // commit's subject: with `rebase.instructionFormat` in play the two
         // differ, and this is the one that shows what the sheet said.
@@ -6864,6 +6861,38 @@ impl<'r> Sequencer<'r> {
             eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
         }
         Ok(Step::Stop(1))
+    }
+
+    /// The state-directory files of a stop: the `message` `--continue` will commit, then
+    /// `make_patch()` (`stopped-sha`, `REBASE_HEAD`, `patch`) for a stop that has a commit, and the
+    /// `autostash` marker. `error_with_patch()` writes them all, so they follow `repo_rerere()`.
+    fn stop_files(
+        &self,
+        dir: &std::path::Path,
+        oid: ObjectId,
+        message: &BString,
+        hinted: Option<&[u8]>,
+        failed_squash: bool,
+        patch: bool,
+    ) -> Result<()> {
+        if failed_squash {
+            std::fs::copy(dir.join("message-squash"), dir.join("message"))?;
+        } else {
+            match hinted {
+                Some(hinted) => std::fs::write(dir.join("message"), hinted)?,
+                None => std::fs::write(dir.join("message"), message)?,
+            }
+        }
+        // `error_with_patch()` opens with `make_patch()` whenever it has a commit
+        // (sequencer.c:3505-3507); the `message` above is already on disk, so the
+        // `if (!file_exists(…))` arm there leaves it alone.
+        if patch {
+            make_patch(self.repo, dir, &self.repo.find_commit(oid)?)?;
+        }
+        if let Some(oid) = self.autostash {
+            let _ = std::fs::write(dir.join("autostash"), format!("{oid}\n"));
+        }
+        Ok(())
     }
 
     /// `error_with_patch()`'s `to_amend` arm: `intend_to_amend()` records

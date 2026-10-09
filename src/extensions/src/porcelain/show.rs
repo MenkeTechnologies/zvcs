@@ -1102,6 +1102,10 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                 } else if s == "--no-show-signature" {
                     show_signature = false;
                 } else if let Some(v) = s.strip_prefix("--diff-filter=") {
+                    if let Err(bad) = super::diff_filter::Filter::default().accumulate(v) {
+                        eprintln!("error: unknown change class '{bad}' in --diff-filter={v}");
+                        return Ok(ExitCode::from(129));
+                    }
                     patch_opts
                         .diff_filter
                         .get_or_insert_with(Vec::new)

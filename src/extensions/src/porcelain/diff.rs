@@ -2359,6 +2359,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             }
             s if s.starts_with("--diff-filter=") => {
+                let value = &s["--diff-filter=".len()..];
+                if let Err(bad) = super::diff_filter::Filter::default().accumulate(value) {
+                    eprintln!("error: unknown change class '{bad}' in --diff-filter={value}");
+                    return Ok(ExitCode::from(129));
+                }
                 diff_filter = Some(s.as_bytes()["--diff-filter=".len()..].to_vec());
             }
             s if s.starts_with("--abbrev=") => {

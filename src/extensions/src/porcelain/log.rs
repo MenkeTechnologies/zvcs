@@ -2205,6 +2205,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // `diff_opt_diff_filter()`: the letters accumulate across repeats, and
             // `diffcore_apply_filter()` drops every pair whose final status is not
             // selected.
+            if let Err(bad) = super::diff_filter::Filter::default().accumulate(v) {
+                eprintln!("error: unknown change class '{bad}' in --diff-filter={v}");
+                return Ok(ExitCode::from(129));
+            }
             patch_opts.diff_filter.get_or_insert_with(Vec::new).extend_from_slice(v.as_bytes());
         } else if a == "--relative" {
             relative = Some(super::diff::cwd_prefix(&repo));

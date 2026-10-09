@@ -1308,7 +1308,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         // has no reader here, so an object it would have rescued is dated by its
         // own mtime like any other.
         if let Some(spec) = st.cruft_expiration.as_deref() {
-            let expire = crate::date::parse_expiry_date(spec).unwrap_or(0);
+            let expire = crate::date::approxidate(spec);
             let expire = expire.clamp(0, i64::from(u32::MAX)) as u32;
             let tips: Vec<ObjectId> = stamps
                 .iter()

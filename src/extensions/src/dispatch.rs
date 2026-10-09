@@ -1627,6 +1627,16 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             return Ok(code);
         }
     }
+    // `cmd_cat_file()` likewise runs `parse_options()` ahead of every repository setting it
+    // reads, so a refused option is the 129 no configuration value can pre-empt.
+    if sub == "cat-file" && args.first().is_none_or(|a| a != "--help") {
+        if let Some(result) = crate::gitcomp::answer(sub, args) {
+            return result;
+        }
+        if let Some(code) = porcelain::cat_file_options_refused(args) {
+            return Ok(code);
+        }
+    }
     if let Some(code) = run_setup_gate(sub, args) {
         return Ok(code);
     }

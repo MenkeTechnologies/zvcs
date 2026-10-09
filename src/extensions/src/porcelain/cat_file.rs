@@ -225,48 +225,27 @@ enum BatchKind {
     Command,
 }
 
-/// `git cat-file` — inspect objects in the database.
-///
-/// Implemented modes:
-///   * `git cat-file -t <object>` → object type
-///   * `git cat-file -s <object>` → object size in bytes
-///   * `git cat-file -p <object>` → pretty-printed content
-///   * `git cat-file -e <object>` → exit 0 if the object exists, 1 if it does not
-///   * `git cat-file <type> <object>` → raw content, after peeling to `<type>`
-///   * `git cat-file (--batch | --batch-check | --batch-command)` → batch stream
-///   * `git cat-file --filters <rev>:<path>` → object with worktree filters applied
-///   * `git cat-file --batch --filters` → batch stream, each blob smudged by path
-///   * `git cat-file --textconv <rev>:<path>` → object rendered by the
-///     `diff.<driver>.textconv` program the path's `diff` gitattribute names,
-///     falling back to `-p` output when no driver applies
-///   * `git cat-file --batch --textconv` → batch stream, each blob run through the
-///     textconv program for the path given after the object name
-///
-/// `--use-mailmap`/`--mailmap` rewrites author/committer/tagger identities in
-/// commit and tag output. `--batch-all-objects`, `--buffer`, `--unordered`, `-Z`
-/// (NUL stdin+stdout), `-z` (NUL stdin only) and `--filter` shape the batch
-/// stream. `--allow-unknown-type` is accepted as a hidden no-op (git only uses
-/// it to read loose objects of an unknown type, which gix cannot decode).
-///
-/// `--follow-symlinks` (batch modes only) resolves each `<rev>:<path>` request by
-/// walking the tree and following in-tree symlink blobs — a port of git's
-/// `get_tree_entry_follow_symlinks` (tree-walk.c) driving `batch_one_object`
-/// (builtin/cat-file.c): a symlink that escapes the tree (absolute target or `..`
-/// past the root) prints `symlink <len>\n<path>`, a broken one `dangling
-/// <len>\n<name>`, a cycle `loop <len>\n<name>`, and a non-directory prefix
-/// `notdir <len>\n<name>`.
-///
-/// `--textconv` runs the external program named by `diff.<driver>.textconv` for
-/// the driver the path's `diff` gitattribute selects, over a temporary copy of
-/// the blob in its checked-out form — a port of `userdiff_find_by_path()` plus
-/// `prep_temp_blob()`/`run_textconv()`. `diff.<driver>.cachetextconv` is not read:
-/// it only decides whether the result is memoised in a notes tree, and no output
-/// depends on it.
-///
-/// Not ported: the `%(objectsize:disk)` / `%(deltabase)` format atoms (require
-/// pack-entry internals gix's header lookup does not expose), and `--filter` specs
-/// beyond `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
-pub fn cat_file(args: &[String]) -> Result<ExitCode> {
+/// Everything `parse_options()` reads out of the command line.
+struct Parsed<'a> {
+    mode: Option<Mode>,
+    batch: Option<BatchKind>,
+    batch_format: Option<String>,
+    buffer: Option<bool>,
+    unordered: bool,
+    nul_in: bool,
+    nul_out: bool,
+    nul_flag: Option<&'static str>,
+    path: Option<String>,
+    filter: Option<String>,
+    use_mailmap: bool,
+    follow_symlinks: bool,
+    positional: Vec<&'a str>,
+}
+
+/// `parse_options()` alone: what it refuses is the exit code in `Err`, the diagnostic already
+/// printed. `cmd_cat_file()` runs it before any repository setting is read, so the
+/// dispatcher runs it ahead of its config gates ([`options_refused`]).
+fn parse(args: &[String]) -> std::result::Result<Parsed<'_>, ExitCode> {
     let mut mode: Option<Mode> = None;
     let mut batch: Option<BatchKind> = None;
     let mut batch_dup = false;
@@ -312,7 +291,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                         next.flag(),
                         prev.flag()
                     );
-                    return Ok(ExitCode::from(129));
+                    return Err(ExitCode::from(129));
                 }
             }
             mode = Some(next);
@@ -340,17 +319,17 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         // and `-z`; the `--mailmap` line is still the in-`parse_options()`
         // spelling, because this block is rendered from inside it.
         if arg == "--help-all" {
-            return Ok(super::show_usage(&usage_all(ALIAS_HELP)));
+            return Err(super::show_usage(&usage_all(ALIAS_HELP)));
         }
 
         let raw = arg;
         if let Some(code) = super::long_takes_no_value_aliased(arg, LONG_OPTS, ALIAS_GROUPS) {
-            return Ok(code);
+            return Err(code);
         }
         let resolved = match super::canonical_long_aliased(arg, LONG_OPTS, ALIAS_GROUPS) {
             super::Long::Name(name) => name,
             super::Long::Ambiguous(first, second) => {
-                return Ok(super::ambiguous_option(
+                return Err(super::ambiguous_option(
                     arg,
                     &first,
                     &second,
@@ -405,7 +384,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                             // — no usage block, unlike the unknown-option arm.
                             None => {
                                 eprintln!("error: option `{name}' requires a value");
-                                return Ok(ExitCode::from(129));
+                                return Err(ExitCode::from(129));
                             }
                         },
                     };
@@ -418,7 +397,7 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 _ => {
                     eprintln!("error: unknown option `{long}'");
                     parse_usage_err();
-                    return Ok(ExitCode::from(129));
+                    return Err(ExitCode::from(129));
                 }
             }
             continue;
@@ -450,12 +429,12 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                             None
                         }
                         'h' => {
-                            return Ok(super::show_usage(&usage(ALIAS_HELP)));
+                            return Err(super::show_usage(&usage(ALIAS_HELP)));
                         }
                         _ => {
                             eprintln!("error: unknown switch `{c}'");
                             parse_usage_err();
-                            return Ok(ExitCode::from(129));
+                            return Err(ExitCode::from(129));
                         }
                     };
                     if let Some(next) = next {
@@ -471,12 +450,94 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         positional.push(raw);
     }
 
-    // ---- cross-option validation, in git's order ---------------------------
-
     if batch_dup {
         eprintln!("error: only one batch option may be specified");
-        return Ok(ExitCode::from(129));
+        return Err(ExitCode::from(129));
     }
+    Ok(Parsed {
+        mode,
+        batch,
+        batch_format,
+        buffer,
+        unordered,
+        nul_in,
+        nul_out,
+        nul_flag,
+        path,
+        filter,
+        use_mailmap,
+        follow_symlinks,
+        positional,
+    })
+}
+
+/// The exit code of an option `parse_options()` refuses, or `None` when the command line parses.
+pub fn options_refused(args: &[String]) -> Option<ExitCode> {
+    parse(args).err()
+}
+
+/// `git cat-file` — inspect objects in the database.
+///
+/// Implemented modes:
+///   * `git cat-file -t <object>` → object type
+///   * `git cat-file -s <object>` → object size in bytes
+///   * `git cat-file -p <object>` → pretty-printed content
+///   * `git cat-file -e <object>` → exit 0 if the object exists, 1 if it does not
+///   * `git cat-file <type> <object>` → raw content, after peeling to `<type>`
+///   * `git cat-file (--batch | --batch-check | --batch-command)` → batch stream
+///   * `git cat-file --filters <rev>:<path>` → object with worktree filters applied
+///   * `git cat-file --batch --filters` → batch stream, each blob smudged by path
+///   * `git cat-file --textconv <rev>:<path>` → object rendered by the
+///     `diff.<driver>.textconv` program the path's `diff` gitattribute names,
+///     falling back to `-p` output when no driver applies
+///   * `git cat-file --batch --textconv` → batch stream, each blob run through the
+///     textconv program for the path given after the object name
+///
+/// `--use-mailmap`/`--mailmap` rewrites author/committer/tagger identities in
+/// commit and tag output. `--batch-all-objects`, `--buffer`, `--unordered`, `-Z`
+/// (NUL stdin+stdout), `-z` (NUL stdin only) and `--filter` shape the batch
+/// stream. `--allow-unknown-type` is accepted as a hidden no-op (git only uses
+/// it to read loose objects of an unknown type, which gix cannot decode).
+///
+/// `--follow-symlinks` (batch modes only) resolves each `<rev>:<path>` request by
+/// walking the tree and following in-tree symlink blobs — a port of git's
+/// `get_tree_entry_follow_symlinks` (tree-walk.c) driving `batch_one_object`
+/// (builtin/cat-file.c): a symlink that escapes the tree (absolute target or `..`
+/// past the root) prints `symlink <len>\n<path>`, a broken one `dangling
+/// <len>\n<name>`, a cycle `loop <len>\n<name>`, and a non-directory prefix
+/// `notdir <len>\n<name>`.
+///
+/// `--textconv` runs the external program named by `diff.<driver>.textconv` for
+/// the driver the path's `diff` gitattribute selects, over a temporary copy of
+/// the blob in its checked-out form — a port of `userdiff_find_by_path()` plus
+/// `prep_temp_blob()`/`run_textconv()`. `diff.<driver>.cachetextconv` is not read:
+/// it only decides whether the result is memoised in a notes tree, and no output
+/// depends on it.
+///
+/// Not ported: the `%(objectsize:disk)` / `%(deltabase)` format atoms (require
+/// pack-entry internals gix's header lookup does not expose), and `--filter` specs
+/// beyond `blob:none` / `blob:limit=<n>` / `object:type=<t>`.
+pub fn cat_file(args: &[String]) -> Result<ExitCode> {
+    let Parsed {
+        mode,
+        batch,
+        batch_format,
+        buffer,
+        unordered,
+        nul_in,
+        nul_out,
+        nul_flag,
+        path,
+        filter,
+        use_mailmap,
+        follow_symlinks,
+        positional,
+    } = match parse(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return Ok(code),
+    };
+
+    // ---- cross-option validation, in git's order ---------------------------
 
     // Split the cmdmode slot into the three roles it plays. `--textconv` and
     // `--filters` become the batch stream's transform (git's `transform_mode`)

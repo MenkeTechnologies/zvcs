@@ -863,6 +863,7 @@ pub use branch::branch;
 pub use bugreport::bugreport;
 pub use bundle::bundle;
 pub use cat_file::cat_file;
+pub use cat_file::options_refused as cat_file_options_refused;
 pub use check_attr::check_attr;
 pub use check_ignore::check_ignore;
 pub use check_mailmap::check_mailmap;

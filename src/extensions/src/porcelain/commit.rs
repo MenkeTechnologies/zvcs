@@ -1710,6 +1710,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- build a tree object from the index ------------------------------
+    // The as-is branch's `refresh_cache_or_die()` is the first attribute lookup when an
+    // entry is racily clean: a bad `--attr-source` / `GIT_ATTR_SOURCE` dies there, after
+    // `refresh_index()` has reported the unmerged paths it walked past (stdout, flushed at
+    // `exit()` like `die_resolve_conflict`) — see
+    // [`super::read_tree::StatCtx::refresh_dies_on_attr_source`].
+    if !all && !include_flag && !only_mode {
+        let index = crate::index_open::or_empty(&repo)?;
+        if let Some(death) =
+            super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)?
+        {
+            crate::cstdio::defer();
+            for path in &death.unmerged {
+                crate::cstdio::println!("U\t{path}");
+            }
+            return death.die();
+        }
+    }
     // A freshly-init'd repo has no index file yet, which is an empty index — git's
     // root empty commit (`commit --allow-empty` on a fresh repo) then produces the
     // empty tree instead of failing to open a file that isn't there.
@@ -3104,6 +3121,9 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
         // that were never committed, which is why `-a` and `-i` — whose prepared
         // index lives in a lock file — leave the real one alone while this does not.
         let mut real = crate::index_open::or_empty(repo)?;
+        if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &real, |_| true)? {
+            return death.die();
+        }
         super::write_tree::update_cache_tree_if_stale(repo, &mut real)?;
         None
     };

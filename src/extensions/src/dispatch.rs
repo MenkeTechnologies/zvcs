@@ -1317,17 +1317,7 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
     // `url-parse`, `mailsplit`, `check-ref-format`, `credential-store get` and a
     // bare `help` run.
     if reads_repository_config(sub, args) {
-        // Named the way [`config_file_gate`] names it: `cmd_init_db()` reads the
-        // config through `set_git_dir(real_path(…))`, so `init` spells the file
-        // absolutely where a `RUN_SETUP` verb keeps the relative `.git/config`.
-        let naming = match sub {
-            "init" | "init-db" => crate::config::GitDirNaming::Absolute,
-            _ => crate::config::GitDirNaming::AsDiscovered,
-        };
-        if let Some((diagnostic, fatal)) = crate::config::extension_value_refusal(naming) {
-            if let Some(diagnostic) = diagnostic {
-                eprintln!("error: {diagnostic}");
-            }
+        if let Some(fatal) = extension_value_refusal(sub) {
             return Some(fatal);
         }
     }
@@ -1340,14 +1330,49 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
         }
     }
     // `read_repository_format()` dies inside the config reader on a version it cannot
-    // parse, so the gentle verbs are refused as well.
-    if let Some(msg) = crate::config::repository_version_refusal() {
-        return Some(msg);
+    // parse, so the gentle verbs are refused as well. `stripspace` is the exception: it reaches
+    // the read only in `-s` and `-c`, after its option parse, through [`gentle_setup_gates`].
+    if sub != "stripspace" {
+        if let Some(msg) = crate::config::repository_version_refusal() {
+            return Some(msg);
+        }
     }
     if FORMAT_GENTLE_VERBS.contains(&sub) {
         return None;
     }
     crate::config::repository_format_refusal()
+}
+
+/// `check_repo_format()` refusing an `extensions.<key>` value of the repository's config: prints
+/// the `error:` line and returns the `fatal:` text, or `None` to carry on.
+fn extension_value_refusal(sub: &str) -> Option<String> {
+    // Named the way [`config_file_gate`] names it: `cmd_init_db()` reads the
+    // config through `set_git_dir(real_path(…))`, so `init` spells the file
+    // absolutely where a `RUN_SETUP` verb keeps the relative `.git/config`.
+    let naming = match sub {
+        "init" | "init-db" => crate::config::GitDirNaming::Absolute,
+        _ => crate::config::GitDirNaming::AsDiscovered,
+    };
+    let (diagnostic, fatal) = crate::config::extension_value_refusal(naming)?;
+    if let Some(diagnostic) = diagnostic {
+        eprintln!("error: {diagnostic}");
+    }
+    Some(fatal)
+}
+
+/// The reads of the repository's configuration that `setup_git_directory_gently()` performs
+/// for a verb which only reaches it in some modes, after the verb has parsed its own options:
+/// a line the parser rejects, an `extensions.<key>` value `check_repo_format()` rejects, and a
+/// repository version it cannot parse. [`reads_repository_config`] exempts such a verb from the
+/// dispatcher's own pass, so the verb calls this at the point git does. Returns the exit code to
+/// leave with.
+pub(crate) fn gentle_setup_gates(sub: &str) -> Option<ExitCode> {
+    let msg = crate::config::bad_config_line(crate::config::ConfigScopes::Repository, crate::config::GitDirNaming::AsDiscovered)
+        .or_else(|| extension_value_refusal(sub))
+        .or_else(crate::config::repository_version_refusal)?;
+    crate::trace2::error(&msg);
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
 }
 
 /// `fatal: bad config line <n> in file <path>` for the repository's own config

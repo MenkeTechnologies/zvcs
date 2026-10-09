@@ -166,6 +166,11 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
         if let Some(code) = crate::setup::discovery_gitfile_gate() {
             return Ok(code);
         }
+        // The repository's config files are read for its format on the way: a line the parser
+        // rejects or an `extensions.<key>` value it refuses ends the command here.
+        if let Some(code) = crate::dispatch::gentle_setup_gates("stripspace") {
+            return Ok(code);
+        }
     }
     let comment = match mode {
         Mode::Default => None,

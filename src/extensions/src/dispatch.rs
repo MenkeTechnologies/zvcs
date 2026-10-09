@@ -1388,7 +1388,9 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
     // `read_repository_format()` dies inside the config reader on a version it cannot
     // parse, so the gentle verbs are refused as well. `stripspace` is the exception: it reaches
     // the read only in `-s` and `-c`, after its option parse, through [`gentle_setup_gates`].
-    if sub != "stripspace" {
+    // `version`, `url-parse`, `credential-cache` and `mailsplit` never reach it at all (measured
+    // under git 2.56.0: `mailsplit -o.` with `core.repositoryFormatVersion = all` prints `0`).
+    if !matches!(sub, "stripspace" | "version" | "url-parse" | "credential-cache" | "mailsplit") {
         if let Some(msg) = crate::config::repository_version_refusal() {
             return Some(msg);
         }

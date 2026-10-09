@@ -1050,6 +1050,10 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             report("Untracked cache disabled");
         }
         UntrackedCache::Test => {
+            // `case UC_TEST: setup_work_tree();` (builtin/update-index.c) precedes the probe.
+            if ctx.repo.workdir().is_none() {
+                crate::git_fatal!("this operation must be run in a work tree");
+            }
             return Ok(Outcome::Exit(u8::from(!test_untracked_cache_supported())))
         }
         UntrackedCache::Enable | UntrackedCache::Force => {

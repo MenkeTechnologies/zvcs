@@ -703,17 +703,20 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
             };
             let rest = &args[1..];
             let mut i = 0;
+            let mut operands = 0;
             while let Some(a) = rest.get(i).map(String::as_str) {
                 i += 1;
                 // `PARSE_OPT_KEEP_DASHDASH` leaves the `--` in argv but still
                 // ends the option scan, so nothing past it is an option.
                 if a == "--" {
+                    operands += 1;
                     break;
                 }
                 if super::asks_for_help(a, "") {
                     return Ok(super::show_usage(usage));
                 }
                 if !a.starts_with('-') || a == "-" {
+                    operands += 1;
                     continue;
                 }
                 let resolved = match canonical(a, table, usage) {
@@ -732,6 +735,15 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
                     },
                     other if other.starts_with("--to-ref=") => {}
                     _ => return Ok(usage_error(a, usage)),
+                }
+            }
+            // `import_stash()`: `if (argc != 1) usage_msg_opt(_("a revision is required"), ...)`,
+            // judged once `parse_options()` has consumed the options; the `--` it keeps is an operand.
+            if sub == "import" {
+                operands += rest[i..].len();
+                if operands != 1 {
+                    eprint!("fatal: a revision is required\n\n{usage}");
+                    return Ok(ExitCode::from(129));
                 }
             }
             crate::git_fatal!("`stash {sub}` is not ported")

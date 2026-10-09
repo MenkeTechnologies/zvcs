@@ -286,7 +286,11 @@ pub fn request_pull(args: &[String]) -> Result<ExitCode> {
     // configuration through `git_log_config()`: a refused `diff.*`/`log.*` value is its
     // `fatal:`, which breaks the `&&` chain before anything reaches stdout, and the
     // script's `|| status=1` makes the run exit 1.
-    if let Err(rejection) = crate::log_config::validate_log(&repo) {
+    // `repo_init_revisions()` then walks the configuration once more for `grep.*`
+    // (`grep_init()`), so a bad `grep.patternType` is the same fatal.
+    let refused = crate::log_config::validate_log(&repo)
+        .and_then(|()| crate::cmd_config::validate_grep_only(&repo));
+    if let Err(rejection) = refused {
         let fatal = rejection.into_fatal();
         if !fatal.is_empty() {
             eprintln!("fatal: {fatal}");

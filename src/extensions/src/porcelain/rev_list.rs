@@ -527,13 +527,13 @@ fn not_an_integer(value: &str) -> ExitCode {
     fatal(&format!("'{value}': not an integer"))
 }
 
-/// Parse a flag value the way git's `git_parse_signed` does: optional surrounding
-/// ASCII whitespace, an optional sign, then base-10 digits with nothing trailing.
-/// `0x10`, `3abc`, an empty string, and out-of-range values all fail — matching
-/// git, which then dies "not an integer".
+/// Parse a flag value the way `strtol_i()` does: `strtol` skips leading whitespace, takes
+/// an optional sign and base-10 digits, and anything trailing — a space included — is
+/// refused. `0x10`, `3abc`, `"1 "`, an empty string, and out-of-range values all fail,
+/// and git then dies "not an integer".
 fn parse_git_int(value: &str) -> Option<i64> {
     value
-        .trim_matches(|c: char| c.is_ascii_whitespace())
+        .trim_start_matches(|c: char| matches!(c, ' ' | '\t'..='\r'))
         .parse::<i64>()
         .ok()
 }

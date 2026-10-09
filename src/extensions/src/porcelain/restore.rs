@@ -672,9 +672,23 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     let merge_active = merge_flag || conflict_style.is_some();
     let conflict_mode = pick.is_some() || merge_active;
 
+    // `if (opts->overlay_mode == 1 && opts->patch_mode) die(_("options '%s' and '%s' cannot be
+    // used together"), "-p", "--overlay");` (builtin/checkout.c:1931) is the first combination
+    // check, ahead of everything below.
+    if patch_mode && overlay {
+        eprintln!("fatal: options '-p' and '--overlay' cannot be used together");
+        return Ok(ExitCode::from(128));
+    }
+
     // --- Pathspec-from-file -------------------------------------------------
     if pathspec_file_nul && pathspec_from_file.is_none() {
         eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Ok(ExitCode::from(128));
+    }
+    // `cmd_checkout()`'s `if (opts->pathspec_from_file) { … if (opts->patch_mode) die(…) }`
+    // judges the pair before the file is opened.
+    if patch_mode && pathspec_from_file.is_some() {
+        eprintln!("fatal: options '--pathspec-from-file' and '--patch' cannot be used together");
         return Ok(ExitCode::from(128));
     }
     if let Some(f) = pathspec_from_file.clone() {

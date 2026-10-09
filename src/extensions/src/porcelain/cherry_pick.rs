@@ -2497,6 +2497,10 @@ fn update_clean_worktree(
         Some((oid, mode, _)) => *oid == entry.id && *mode == entry.mode,
         None => false,
     });
+    // A path the sparse checkout left out of the work tree stays out of it, and keeps the bit that
+    // says so (`unpack_trees()` seeds its result from the source index).
+    super::reset::carry_skip_worktree(old, &mut new_index);
+    super::reset::carry_skip_worktree(old, &mut subset);
 
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;

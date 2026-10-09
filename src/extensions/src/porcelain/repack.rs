@@ -458,6 +458,8 @@ struct State {
     drop_oids: Vec<ObjectId>,
     /// `LOOSEN_UNREACHABLE`, set by `-A` and by `--unpack-unreachable`.
     loosen_unreachable: bool,
+    /// `--unpack-unreachable=<approxidate>` as typed (`unpack_unreachable` in `cmd_repack()`).
+    unpack_expire: Option<String>,
     keep_unreachable: bool,
     /// `-l` / `--local`: passed to `pack-objects` as `--local`.
     local: bool,
@@ -880,9 +882,15 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
                 to_pack.push(id);
             }
         }
-    } else if st.keep_unreachable && pushes_keep_unreachable(st, &existing, &pack_dir) {
+    } else if st.keep_unreachable && pushes_pack_loose_unreachable(st) {
+        // `--pack-loose-unreachable` adds every loose object; `--keep-unreachable`, which only
+        // comes with packs to delete, adds the unreachable ones those packs hold on top.
         let packed: HashSet<ObjectId> = to_pack.iter().copied().collect();
-        for id in super::prune::all_object_ids(&repo, &objdir) {
+        let candidates = match pushes_keep_unreachable(st, &existing, &pack_dir) {
+            true => super::prune::all_object_ids(&repo, &objdir),
+            false => super::prune::loose_object_ids(&repo, &objdir),
+        };
+        for id in candidates {
             if !packed.contains(&id) {
                 to_pack.push(id);
             }
@@ -1104,6 +1112,11 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
             (candidates, kept)
         }
     };
+    // `-A` / `--unpack-unreachable`: turn what the packs `-d` will delete held and the new one does
+    // not carry back into loose objects (builtin/repack.c:505-523).
+    if st.delete_redundant && st.all_into_one && !st.cruft && st.loosen_unreachable {
+        loosen_unreachable(&repo, st, &existing, &pack_dir, &objdir, &in_new_pack)?;
+    }
     drop(existing);
 
     fs::create_dir_all(&pack_dir)?;
@@ -2282,7 +2295,129 @@ fn is_existing_local(pack_dir: &Path, index_path: &Path) -> bool {
     index_path.parent() == Some(pack_dir)
 }
 
-/// Whether `cmd_repack()` hands `pack-objects` `--keep-unreachable --pack-loose-unreachable`.
+/// `loosen_unused_packed_objects()` (builtin/pack-objects.c), which `-A` and
+/// `--unpack-unreachable[=<date>]` reach through `pack-objects --unpack-unreachable`: the
+/// objects of the packs `-d` is about to delete that the new pack does not carry — the
+/// unreachable ones — are written back as loose objects, dated with their pack, so that `-d`
+/// does not destroy them.
+///
+/// ```c
+/// for (p = get_all_packs(the_repository); p; p = p->next) {
+///         if (!p->pack_local || p->pack_keep || p->pack_keep_in_core)
+///                 continue;
+///         [...]
+///         for (i = 0; i < p->num_objects; i++) {
+///                 [...]
+///                 if (!packlist_find(&to_pack, &oid) &&
+///                     !has_sha1_pack_kept_or_nonlocal(&oid) &&
+///                     !loosened_object_can_be_discarded(&oid, p->mtime))
+///                         force_object_loose(&oid, p->mtime)
+/// ```
+///
+/// With a date (`unpack_unreachable_expiration = approxidate(arg)`) an object whose pack is no
+/// newer than it, and which no recent object reaches, is discarded instead
+/// (`loosened_object_can_be_discarded()`). "Recent" is `add_unseen_recent_objects_to_traversal()`:
+/// every local object dated after the cut — a loose file by its mtime, a packed object by its
+/// pack's, a cruft pack's by its `.mtimes` — and everything reachable from one of them.
+fn loosen_unreachable(
+    repo: &gix::Repository,
+    st: &State,
+    existing: &[pack::index::File],
+    pack_dir: &Path,
+    objdir: &Path,
+    in_new_pack: &HashSet<ObjectId>,
+) -> Result<()> {
+    let pack_stamp = |file: &pack::index::File| {
+        super::prune::mtime_of(&file.path().with_extension("pack")).unwrap_or(0)
+    };
+    let expire: Option<i64> = st.unpack_expire.as_deref().map(crate::date::approxidate).filter(|t| *t != 0);
+
+    // `has_sha1_pack_kept_or_nonlocal()`: a pack that stays, or one that is not ours.
+    let mut elsewhere: HashSet<ObjectId> = HashSet::new();
+    for file in existing {
+        if !(is_existing_local(pack_dir, file.path()) && droppable(st, file.path())) {
+            elsewhere.extend(file.iter().map(|e| e.oid));
+        }
+    }
+
+    let recent: HashSet<ObjectId> = match expire {
+        None => HashSet::new(),
+        Some(cut) => {
+            let mut tips: Vec<ObjectId> = Vec::new();
+            for id in super::prune::loose_object_ids(repo, objdir) {
+                if super::prune::mtime_of(&loose_path(objdir, &id)).is_some_and(|m| m > cut) {
+                    tips.push(id);
+                }
+            }
+            for file in existing.iter().filter(|f| is_existing_local(pack_dir, f.path())) {
+                let stamp = pack_stamp(file);
+                let per_object = read_mtimes(&file.path().with_extension("mtimes"), file.num_objects());
+                for (pos, entry) in file.iter().enumerate() {
+                    let dated = per_object.as_ref().and_then(|m| m.get(pos)).map_or(stamp, |m| i64::from(*m));
+                    if dated > cut {
+                        tips.push(entry.oid);
+                    }
+                }
+            }
+            super::prune::close_over(repo, tips)
+        }
+    };
+
+    for file in existing {
+        if !(is_existing_local(pack_dir, file.path()) && droppable(st, file.path())) {
+            continue;
+        }
+        let stamp = pack_stamp(file);
+        for entry in file.iter() {
+            let id = entry.oid;
+            if in_new_pack.contains(&id) || elsewhere.contains(&id) {
+                continue;
+            }
+            if expire.is_some_and(|cut| stamp <= cut && !recent.contains(&id)) {
+                continue;
+            }
+            force_object_loose(repo, objdir, id, stamp)?;
+        }
+    }
+    Ok(())
+}
+
+/// `force_object_loose()`: write `id` as a loose object unless one is there already, and date the
+/// file `mtime`.
+fn force_object_loose(repo: &gix::Repository, objdir: &Path, id: ObjectId, mtime: i64) -> Result<()> {
+    let path = loose_path(objdir, &id);
+    if path.exists() {
+        return Ok(());
+    }
+    let Ok(object) = repo.find_object(id) else { return Ok(()) };
+    use gix::objs::Write;
+    repo.objects
+        .write_buf_with_known_id(object.kind, &object.data, id)
+        .map_err(|e| anyhow::anyhow!("unable to write loose object {id}: {e}"))?;
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.max(0) as u64);
+    if let Ok(file) = fs::File::options().write(true).open(&path) {
+        let _ = file.set_modified(when);
+    }
+    Ok(())
+}
+
+/// Whether `cmd_repack()` hands `pack-objects` `--pack-loose-unreachable`
+/// (builtin/repack.c, git 2.54 and 2.56), which packs every loose object the traversal did not
+/// reach:
+///
+/// ```c
+/// if (keep_unreachable && delete_redundant && !(pack_everything & PACK_CRUFT))
+///         strvec_push(&cmd.args, "--pack-loose-unreachable");
+/// ```
+///
+/// (inside `if (pack_everything & ALL_INTO_ONE)`.) So `-k` alone, or without `-d`, leaves the
+/// unreachable objects where they are.
+fn pushes_pack_loose_unreachable(st: &State) -> bool {
+    st.all_into_one && st.delete_redundant && !st.cruft
+}
+
+/// Whether it also hands it `--keep-unreachable`, which adds the unreachable objects of the
+/// packs about to be deleted:
 ///
 /// ```c
 /// if (has_existing_non_kept_packs(&existing) && delete_redundant &&
@@ -2290,13 +2425,11 @@ fn is_existing_local(pack_dir: &Path, index_path: &Path) -> bool {
 ///         [...]
 ///         } else if (keep_unreachable) {
 ///                 strvec_push(&cmd.args, "--keep-unreachable");
-///                 strvec_push(&cmd.args, "--pack-loose-unreachable");
 ///         }
 /// }
 /// ```
 ///
-/// (inside `if (pack_everything & ALL_INTO_ONE)`.) So `-k` alone, or without `-d`, or with
-/// nothing to delete, leaves the unreachable objects where they are.
+/// So with nothing to delete only the loose ones are packed.
 fn pushes_keep_unreachable(st: &State, existing: &[pack::index::File], pack_dir: &Path) -> bool {
     st.all_into_one
         && st.delete_redundant
@@ -2756,7 +2889,10 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         "keep-unreachable" => st.keep_unreachable = on,
         "write-bitmap-index" => st.write_bitmap = Some(on),
         "pack-kept-objects" => st.pack_kept_objects = Some(on),
-        "unpack-unreachable" => st.loosen_unreachable = on,
+        "unpack-unreachable" => {
+            st.loosen_unreachable = on;
+            st.unpack_expire = value.filter(|_| on).map(str::to_string);
+        }
         "write-midx" => {
             st.write_midx = on;
             st.write_midx_incremental = on && value == Some("incremental");

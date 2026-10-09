@@ -156,6 +156,28 @@ pub(crate) fn packed_refs_lock() {
     }
 }
 
+/// A callback run where git's files backend takes a loose ref lock: `lock_raw_ref()` passes
+/// `get_files_ref_lock_timeout_ms()` to `hold_lock_file_for_update_timeout()`
+/// (`refs/files-backend.c:731`), whose first call reads `core.filesRefLockTimeout` and dies on a
+/// value `git_config_int()` cannot parse — so every command that writes a ref sees the refusal
+/// and a command that only reads refs never does. The hook gives the host that moment.
+static FILES_REF_LOCK_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Install the [`FILES_REF_LOCK_HOOK`]. Only the first installation takes effect.
+pub fn set_files_ref_lock_hook(hook: fn()) {
+    let _ = FILES_REF_LOCK_HOOK.set(hook);
+}
+
+/// Run the installed files-ref lock hook, if any.
+pub(crate) fn files_ref_lock() {
+    if HOOKS_SUSPENDED.with(std::cell::Cell::get) {
+        return;
+    }
+    if let Some(hook) = FILES_REF_LOCK_HOOK.get() {
+        hook();
+    }
+}
+
 mod access {
     use std::path::Path;
 

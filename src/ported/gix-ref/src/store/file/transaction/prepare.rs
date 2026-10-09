@@ -103,6 +103,8 @@ impl Transaction<'_, '_> {
             "locks can only be acquired once and it's all or nothing"
         );
 
+        file::files_ref_lock();
+
         // Reject Windows reserved device names before acquiring the lock.
         // The lock file itself (e.g. `CON.lock`) is also a device name,
         // so acquiring it would fail or open the device instead of

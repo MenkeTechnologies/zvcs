@@ -400,6 +400,9 @@ fn arm_ref_store_refusal(repo: &gix::Repository) {
     PACKED_REFS_TIMEOUT_REFUSAL
         .get_or_init(|| crate::config::config_int(repo, "core.packedrefstimeout").err());
     gix::refs::file::set_packed_refs_lock_hook(packed_refs_lock_first_use);
+    FILES_REF_LOCK_TIMEOUT_REFUSAL
+        .get_or_init(|| crate::config::config_int(repo, "core.filesreflocktimeout").err());
+    gix::refs::file::set_files_ref_lock_hook(files_ref_lock_first_use);
 }
 
 /// `files_ref_store_config()`'s verdict on one value: `None` when it parses.
@@ -462,6 +465,21 @@ static REPO_SETTINGS_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::O
 /// up front by `crate::dispatch`'s `REPO_SETTINGS_VERBS` gate instead.
 fn object_store_first_use() {
     if let Some(Some(message)) = REPO_SETTINGS_REFUSAL.get() {
+        crate::trace2::error(message);
+        eprintln!("fatal: {message}");
+        std::process::exit(i32::from(crate::fatal::EXIT_FATAL));
+    }
+}
+
+/// What `lock_raw_ref()`'s `get_files_ref_lock_timeout_ms()` (refs/files-backend.c:731) would die
+/// with: `repo_config_get_int(…, "core.filesreflocktimeout", …)` on the first loose ref lock.
+static FILES_REF_LOCK_TIMEOUT_REFUSAL: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The ref store's loose-ref lock hook: `die()` with the recorded refusal. Locks already taken
+/// by the transaction are released first, as `die()`'s tempfile `atexit` handler does.
+fn files_ref_lock_first_use() {
+    if let Some(Some(message)) = FILES_REF_LOCK_TIMEOUT_REFUSAL.get() {
+        gix::tempfile::registry::cleanup_tempfiles();
         crate::trace2::error(message);
         eprintln!("fatal: {message}");
         std::process::exit(i32::from(crate::fatal::EXIT_FATAL));

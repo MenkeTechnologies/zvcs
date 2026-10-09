@@ -3389,6 +3389,9 @@ fn render_upstream(
     if !refname.starts_with(b"refs/heads/") {
         return Ok(Vec::new());
     }
+    // `branch_get()` makes the first `read_config()` pass over `remote.*` (remote.c:630-650),
+    // which dies on a value `handle_config()` cannot parse.
+    crate::cmd_config::read_remote_config(repo).map_err(|r| r.into_error())?;
     let full = refname.as_bstr();
     let short = full
         .strip_prefix(b"refs/heads/".as_slice())

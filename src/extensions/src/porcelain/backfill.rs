@@ -21,8 +21,8 @@
 //!     implicitly via `core.sparseCheckout`), a `$GIT_DIR/info/sparse-checkout`
 //!     that cannot be read yields `error: problem loading sparse-checkout` and
 //!     exit 255, git's `return error(...)` shape.
-//!   * `--include-edges` / `--no-include-edges` — accepted; they only steer
-//!     which blobs would be downloaded.
+//!   * `--include-edges` / `--no-include-edges` — accepted; with a promisor remote they
+//!     decide whether the trees of the excluded commits a range borders are walked.
 //!   * the `<revision-range>`, resolved for real, so `^<bad>` gives
 //!     `fatal: bad revision` and a bad rev or range gives the
 //!     `fatal: ambiguous argument` block, both on exit 128. An argument that
@@ -40,11 +40,11 @@
 //! (`download_missing_blobs`), through the lazy-fetch hook the object database carries.
 //!
 //! Commit-limiting options that `setup_revisions` accepts (`--first-parent`,
-//! `--all`, `--since=`, `--merges`, …) are accepted and have no effect here.
-//! That is sound only because the ported path is a proven no-op: with no
-//! promisor remote the chosen revision set cannot change stdout, the exit code
-//! or repository state. Any repository where the revision set *would* matter has
-//! a promisor remote, and that case bails before returning success. Options
+//! `--all`, `--since=`, `--merges`, …) change nothing observable without a
+//! promisor remote: there the walk is a no-op and the options are only validated.
+//! With one, the commits to walk are the ones the `rev-list` of this binary yields
+//! for the same revisions, options and pathspecs, plus (`--include-edges`, on by default) the
+//! excluded commits that border them. Options
 //! outside the verified accept-list below are rejected exactly as git rejects
 //! them, so nothing unknown is ever silently swallowed. `--stdin` is the one
 //! form git accepts that this rejects: it feeds revisions in from stdin, and
@@ -149,6 +149,8 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     // leaves in place for `setup_revisions`. Its errors precede every revision
     // error, matching git's ordering.
     let mut sparse: Option<bool> = None;
+    // `ctx.include_edges`, on unless `--no-include-edges` says otherwise.
+    let mut include_edges = true;
     let mut rest: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -166,7 +168,8 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             }
             "--sparse" => sparse = Some(true),
             "--no-sparse" => sparse = Some(false),
-            "--include-edges" | "--no-include-edges" => {}
+            "--include-edges" => include_edges = true,
+            "--no-include-edges" => include_edges = false,
             "--min-batch-size" => {
                 let Some(value) = args.get(i + 1) else {
                     return Ok(bare_error("option `min-batch-size' requires a value"));
@@ -193,6 +196,14 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     let mut saw_objects = false;
     let mut saw_filter = false;
     let mut saw_ancestry_path = false;
+    // `ctx->revs.pending.nr`: whether any revision, range or ref-set option named a starting
+    // point; when none did, `do_backfill()` walks from `HEAD`.
+    let mut has_pending = false;
+    // The starting points that are excluded (`^x`, the left of `x..y`, anything after `--not`):
+    // the commits reachable from them are the ones flagged `UNINTERESTING`.
+    let mut negatives: Vec<String> = Vec::new();
+    // Where the revision arguments stop and the pathspecs begin.
+    let mut paths_from: Option<usize> = None;
     // `setup_revisions` hands back the options it did not recognize and lets the
     // caller complain; `cmd_backfill` does so only once the whole scan is over, so
     // a revision error later in the argv is reported ahead of this one.
@@ -220,6 +231,10 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
                 return Ok(ExitCode::from(128));
             }
             has_bottom = true;
+            has_pending = true;
+            if !negating {
+                negatives.push(spec.to_string());
+            }
             continue;
         }
 
@@ -282,6 +297,12 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
             }
 
             if REV_OPTS.contains(&a) || REV_OPTS_WITH_VALUE.contains(&name) {
+                if matches!(
+                    name,
+                    "--all" | "--tags" | "--branches" | "--remotes" | "--glob" | "--reflog" | "--alternate-refs" | "--indexed-objects"
+                ) {
+                    has_pending = true;
+                }
                 match name {
                     "--not" => negating = !negating,
                     "--objects" => saw_objects = true,
@@ -314,6 +335,16 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
         };
         if resolved {
             has_bottom |= negating || a.contains("..");
+            has_pending = true;
+            match a.split_once("..") {
+                Some((left, right)) if !right.starts_with('.') => {
+                    let excluded = if negating { right } else { left };
+                    negatives.push(if excluded.is_empty() { "HEAD" } else { excluded }.to_string());
+                }
+                Some(_) => {}
+                None if negating => negatives.push(a.to_string()),
+                None => {}
+            }
             continue;
         }
 
@@ -331,6 +362,7 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
                 return Ok(code);
             }
         }
+        paths_from = Some(j - 1);
         break;
     }
 
@@ -376,12 +408,109 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
     }
 
     if has_promisor_remote(&repo) {
-        download_missing_blobs(&repo)?;
+        // What `setup_revisions()` left as pathspecs: everything after `--`, or the arguments
+        // from the first one that is no revision.
+        let (revs, paths): (&[&str], &[&str]) = match (seen_dashdash, paths_from) {
+            (true, _) => (head, &rest[head.len() + 1..]),
+            (false, Some(from)) => (&head[..from], &head[from..]),
+            (false, None) => (head, &[]),
+        };
+        download_missing_blobs(&repo, &WalkSpec { revs, paths, has_pending, include_edges, negatives: &negatives })?;
     }
 
     // No promisor remote: there is nothing to request and nothing to write.
     // Stock git prints nothing, touches nothing and exits 0.
     Ok(ExitCode::SUCCESS)
+}
+
+/// What `setup_revisions()` made of the command line: the revision arguments and options (in
+/// source order), the pathspecs behind them, and whether any of the first named a starting point.
+struct WalkSpec<'a> {
+    revs: &'a [&'a str],
+    paths: &'a [&'a str],
+    has_pending: bool,
+    /// `--include-edges`: also walk the trees of the excluded commits the walk borders.
+    include_edges: bool,
+    /// The excluded starting points; see `negatives` in [`backfill`].
+    negatives: &'a [String],
+}
+
+/// `walk_objects_by_path()`'s root trees: with `--include-edges` first the trees of the excluded
+/// commits that border the walk (`mark_edges_uninteresting()` handing each to `show_edge()` under
+/// `edge_hint`), then those of the commits the revision walk yields, each once.
+///
+/// The commits come from this binary's own `rev-list`, which applies the same revisions,
+/// commit-limiting options and pathspec history simplification as `setup_revisions()`. An edge is
+/// a parent of a commit of the walk that is flagged `UNINTERESTING`, which is to say reachable from
+/// an excluded starting point: `rev-list --boundary` names the parents it did not list, and those
+/// that the excluded starting points reach are the edges. (A parent a date or count limit merely
+/// stopped short of is not flagged.) The commits whose parents count are those `limit_list()` kept,
+/// before `--max-count`, `--skip` and `-<n>` cut the output and before a pathspec simplifies the
+/// history, so the boundary is listed without either.
+fn walk_root_trees(repo: &gix::Repository, spec: &WalkSpec<'_>) -> Result<Vec<ObjectId>> {
+    let rev_list = |limited_walk: bool| -> Result<Vec<(bool, ObjectId)>> {
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        cmd.args(["rev-list", "--boundary"]);
+        // `--quiet` would silence the listing, and `--objects`/`--filter` change what it lists.
+        let mut revs = spec.revs.iter().copied().filter(|a| !matches!(*a, "--quiet" | "--objects") && !a.starts_with("--filter"));
+        while let Some(arg) = revs.next() {
+            let is_count = arg.starts_with("--max-count=")
+                || arg.starts_with("--skip=")
+                || arg.strip_prefix('-').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+            if limited_walk && is_count {
+                continue;
+            }
+            if limited_walk && matches!(arg, "--max-count" | "--skip") {
+                revs.next();
+                continue;
+            }
+            cmd.arg(arg);
+        }
+        if !spec.has_pending {
+            cmd.arg("HEAD");
+        }
+        if !spec.paths.is_empty() && !limited_walk {
+            cmd.arg("--").args(spec.paths);
+        }
+        let out = cmd.stderr(std::process::Stdio::piped()).output()?;
+        if !out.status.success() {
+            std::io::Write::write_all(&mut std::io::stderr(), &out.stderr)?;
+            return Err(crate::fatal::Silent(out.status.code().unwrap_or(128) as u8).into());
+        }
+        let mut listed: Vec<(bool, ObjectId)> = Vec::new();
+        for line in out.stdout.lines() {
+            let Some(word) = line.split(|b| b.is_ascii_whitespace()).next() else { continue };
+            let (edge, hex) = match word.strip_prefix(b"-") {
+                Some(hex) => (true, hex),
+                None => (false, word),
+            };
+            if let Ok(id) = ObjectId::from_hex(hex) {
+                listed.push((edge, id));
+            }
+        }
+        Ok(listed)
+    };
+    let tree_of = |id: ObjectId| repo.find_commit(id).ok().and_then(|c| c.tree_id().ok()).map(|t| t.detach());
+    let listed = rev_list(false)?;
+    let mut edges: Vec<ObjectId> = Vec::new();
+    if spec.include_edges && !spec.negatives.is_empty() {
+        let limited = rev_list(true)?;
+        let mut cmd = std::process::Command::new(std::env::current_exe()?);
+        let out = cmd.arg("rev-list").args(spec.negatives).arg("--").stderr(std::process::Stdio::null()).output()?;
+        let excluded: std::collections::HashSet<ObjectId> = out
+            .stdout
+            .lines()
+            .filter_map(|line| ObjectId::from_hex(line.split(|b| b.is_ascii_whitespace()).next()?).ok())
+            .collect();
+        edges = limited.iter().filter(|(edge, id)| *edge && excluded.contains(id)).filter_map(|(_, id)| tree_of(*id)).collect();
+    }
+    let commits = listed.iter().filter(|(edge, _)| !*edge).filter_map(|(_, id)| tree_of(*id));
+    Ok(edges.into_iter().chain(commits).collect())
+}
+
+/// `git_path_walk`'s `dir_prefix(buf, dir)` (path.c:59): `buf` is `dir` or lies under it.
+fn dir_prefix(buf: &[u8], dir: &[u8]) -> bool {
+    buf.starts_with(dir) && matches!(buf.get(dir.len()), None | Some(b'/'))
 }
 
 /// `do_backfill()`: hand the promisor remote every blob the history reaches that
@@ -399,8 +528,15 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
 ///
 /// with `fill_missing_blobs()` keeping the ids `odb_has_object()` says are
 /// absent, and `download_batch()` handing them to `promisor_remote_get_direct()`.
-/// The walk starts at `HEAD` when no revision range was given
-/// (`add_head_to_pending()`), which is every case this port accepts today.
+/// The walk starts at `HEAD` when no revision was given (`add_head_to_pending()`).
+///
+/// `walk_objects_by_path()` is reproduced as it runs: the root trees ([`walk_root_trees`]) form
+/// the list for the path `""`; the paths are then taken off a queue that serves blob lists before
+/// tree lists and breaks ties by `strcmp()`, a tree list being expanded into one list per child
+/// path. An object is listed under the first path that reaches it and gets past the pathspec
+/// filter (`SEEN`), which decides what the pathspec sees: with pathspecs and no wildcard or magic (`exact_pathspecs`) an entry survives
+/// only when its path and a pathspec are one a directory prefix of the other, and a blob list is
+/// reported only when its path matches the pathspecs (`walk_path()`).
 ///
 /// `--min-batch-size` decides how many round trips those ids are split across
 /// and nothing else, so one request is made here: the objects that end up on
@@ -408,10 +544,40 @@ pub fn backfill(args: &[String]) -> Result<ExitCode> {
 /// leaves behind. A blob the promisor packs promised that no remote hands over ends the
 /// command: `promisor_remote_get_direct()` dies with `could not fetch <oid> from promisor remote`
 /// (promisor-remote.c:320-324), after the failed fetch has said why.
-fn download_missing_blobs(repo: &gix::Repository) -> Result<()> {
-    use gix::object::Kind;
+fn download_missing_blobs(repo: &gix::Repository, spec: &WalkSpec<'_>) -> Result<()> {
+    use gix::bstr::{BStr, BString};
+    use gix::object::tree::EntryKind;
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
-    let Ok(head) = repo.head_id() else { return Ok(()) };
+    if !spec.has_pending && repo.head_id().is_err() {
+        return Ok(());
+    }
+
+    // `walk_objects_by_path()` opens with `ctx.exact_pathspecs`: pathspecs, none of them a glob or
+    // carrying magic (`:(…)`, `:/`, or a global `GIT_*_PATHSPECS` switch).
+    let literal_only = ["GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS"]
+        .iter()
+        .all(|var| std::env::var_os(var).is_none());
+    let exact: Option<Vec<BString>> = (!spec.paths.is_empty()
+        && literal_only
+        && spec.paths.iter().all(|p| !p.starts_with(':') && !p.contains(['*', '?', '[', '\\'])))
+    .then(|| {
+        spec.paths
+            .iter()
+            .map(|p| crate::pathspec::prefix_path(repo, BStr::new(p)).unwrap_or_else(|_| BString::from(*p)))
+            .collect()
+    });
+    let index = repo.index_or_empty()?;
+    let mut matcher = match spec.paths.is_empty() {
+        true => None,
+        false => Some(repo.pathspec(
+            false,
+            spec.paths.iter().map(|p| BString::from(*p)),
+            false,
+            &index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?),
+    };
 
     // `fill_missing_blobs()` asks `odb_has_object(ctx->repo->objects, &oid, 0)` —
     // flags `0`, so *without* `ODB_HAS_OBJECT_FETCH_PROMISOR`. The point of the
@@ -420,59 +586,78 @@ fn download_missing_blobs(repo: &gix::Repository) -> Result<()> {
     let restore = gix::odb::store::fetch_if_missing();
     gix::odb::store::set_fetch_if_missing(false);
 
-    // Walk commits and trees only, never blobs: reading a blob is what the walk
-    // is trying to *avoid* doing one at a time. Tree entries name the blobs, and
-    // a tree in a `blob:none` clone is present by construction.
-    let mut seen: std::collections::HashSet<gix::ObjectId> = std::collections::HashSet::new();
-    let mut stack: Vec<gix::ObjectId> = vec![head.detach()];
-    let mut missing: Vec<gix::ObjectId> = Vec::new();
-    seen.insert(head.detach());
-    while let Some(id) = stack.pop() {
-        let Ok(object) = repo.find_object(id) else { continue };
-        let mut next: Vec<gix::ObjectId> = Vec::new();
-        match object.kind {
-            Kind::Commit => {
-                if let Some((tree, parents)) = object
-                    .into_commit()
-                    .decode()
-                    .ok()
-                    .map(|c| (c.tree(), c.parents().collect::<Vec<_>>()))
-                {
-                    next.push(tree);
-                    next.extend(parents);
+    struct List {
+        is_tree: bool,
+        oids: Vec<ObjectId>,
+    }
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut lists: HashMap<Vec<u8>, List> = HashMap::new();
+    let mut pushed: HashSet<Vec<u8>> = HashSet::new();
+    // `compare_by_type()`: blob lists before tree lists, then `strcmp()` of the path.
+    let mut queue: BTreeSet<(bool, Vec<u8>)> = BTreeSet::new();
+    let mut missing: Vec<ObjectId> = Vec::new();
+
+    let mut roots = Vec::new();
+    for tree in walk_root_trees(repo, spec)? {
+        if seen.insert(tree) {
+            roots.push(tree);
+        }
+    }
+    lists.insert(Vec::new(), List { is_tree: true, oids: roots });
+    pushed.insert(Vec::new());
+    queue.insert((true, Vec::new()));
+
+    while let Some((_, path)) = queue.pop_first() {
+        let Some(list) = lists.remove(&path) else { continue };
+        if list.oids.is_empty() {
+            continue;
+        }
+        if !list.is_tree {
+            if let Some(matcher) = matcher.as_mut() {
+                if !matcher.is_included(BStr::new(&path), Some(false)) {
+                    continue;
                 }
             }
-            Kind::Tag => {
-                if let Ok(tag) = object.into_tag().decode() {
-                    next.push(tag.target());
+            missing.extend(list.oids.iter().copied().filter(|oid| !repo.has_object(*oid)));
+            continue;
+        }
+        for oid in list.oids {
+            let Ok(object) = repo.find_object(oid) else { continue };
+            let Ok(tree) = object.try_into_tree() else { continue };
+            let Ok(decoded) = tree.decode() else { continue };
+            for entry in &decoded.entries {
+                let kind = entry.mode.kind();
+                // "Skip submodules."
+                if kind == EntryKind::Commit {
+                    continue;
                 }
-            }
-            Kind::Tree => {
-                if let Ok(tree) = object.into_tree().decode() {
-                    for entry in &tree.entries {
-                        let oid = entry.oid.to_owned();
-                        match entry.mode.kind() {
-                            // `process_tree()` never descends into a submodule,
-                            // and a gitlink names a commit this repository is not
-                            // expected to hold.
-                            gix::object::tree::EntryKind::Commit => {}
-                            gix::object::tree::EntryKind::Tree => next.push(oid),
-                            // Blob, executable or link: `fill_missing_blobs()`
-                            // keeps the ones the object database does not have.
-                            _ => {
-                                if seen.insert(oid) && !repo.has_object(oid) {
-                                    missing.push(oid);
-                                }
-                            }
-                        }
+                let child = entry.oid.to_owned();
+                if seen.contains(&child) {
+                    continue;
+                }
+                let is_tree = kind == EntryKind::Tree;
+                let mut child_path = path.clone();
+                child_path.extend_from_slice(entry.filename);
+                // `exact_pathspecs`: skip an entry that is not a directory prefix of a
+                // pathspec, nor has one as its directory prefix.
+                if let Some(items) = &exact {
+                    if !items.iter().any(|item| dir_prefix(&child_path, item) || dir_prefix(item, &child_path)) {
+                        continue;
                     }
                 }
-            }
-            Kind::Blob => {}
-        }
-        for id in next {
-            if seen.insert(id) {
-                stack.push(id);
+                seen.insert(child);
+                // "Trees will end with "/" for concatenation and distinction from blobs."
+                if is_tree {
+                    child_path.push(b'/');
+                }
+                lists
+                    .entry(child_path.clone())
+                    .or_insert_with(|| List { is_tree, oids: Vec::new() })
+                    .oids
+                    .push(child);
+                if pushed.insert(child_path.clone()) {
+                    queue.insert((is_tree, child_path));
+                }
             }
         }
     }

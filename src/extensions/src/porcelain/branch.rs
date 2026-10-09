@@ -1050,6 +1050,12 @@ pub fn branch(args: &[String]) -> Result<ExitCode> {
     let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
 
+    // `cmd_branch()` resolves `HEAD` before it looks at the mode: `if (!head) die(_("failed to
+    // resolve HEAD as a valid ref"))`.
+    if repo.head().is_err() {
+        return fatal("failed to resolve HEAD as a valid ref");
+    }
+
     // `track = cfg->branch_track;` (builtin/branch.c:799) seeds `track` from
     // `branch.autoSetupMerge` *before* `parse_options()` runs, so `--track` and
     // `--no-track` overwrite it rather than being read alongside it. This port

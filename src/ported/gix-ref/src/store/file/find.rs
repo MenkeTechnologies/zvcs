@@ -240,6 +240,11 @@ impl file::Store {
         full_name: &FullNameRef,
     ) -> Result<Option<Reference>, Error> {
         let refname = self.reftable_refname(full_name);
+        // `reftable_be_read_raw_ref()` answers `refs->err` when a stack failed to open, and every
+        // resolver turns a negative return into a reference that is not there.
+        if backend.check().is_err() {
+            return Ok(None);
+        }
         let Some(target) = backend.read_raw_ref(refname.as_ref())? else {
             return Ok(None);
         };

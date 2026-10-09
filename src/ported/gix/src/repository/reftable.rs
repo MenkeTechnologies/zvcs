@@ -55,6 +55,12 @@ impl crate::Repository {
         Ok(self.reftable_backend()?.reflog_entries(name, reverse)?)
     }
 
+    /// Whether a stack failed to open (`refs->err < 0`), which makes every read of a reference
+    /// report no value rather than a missing one. `false` outside the reftable format.
+    pub fn reftable_init_failed(&self) -> bool {
+        self.refs.reftable().is_some_and(|backend| backend.check().is_err())
+    }
+
     /// The value of the reference `name` exactly as stored, a symbolic one
     /// unresolved, `None` if it does not exist (`reftable_be_read_raw_ref()`).
     /// No namespace is applied and no other name is tried; `FETCH_HEAD` and

@@ -84,6 +84,14 @@ impl StackIter {
             flags,
             hash_len: backend.stack_options().hash_id.size(),
         };
+        // `ret = refs->err; if (ret) goto done;` leaves `iter->err` negative, so the iterator
+        // ends in `ITER_ERROR` before it yields anything. The walkers that list references
+        // (`for-each-ref`, `rev-list --all`, `log --all`) drop that status, which is an empty
+        // listing; it is kept off the item stream so none of them reports it.
+        if backend.check().is_err() {
+            this.done = true;
+            return this;
+        }
         let res = stack.and_then(|stack| {
             backend.check()?;
             let mut stack = lock(&stack);

@@ -638,6 +638,11 @@ enum Resolution {
 /// reference, so the whole resolution must terminate within `SYMREF_MAXDEPTH`
 /// reads — counting the starting name.
 fn resolve_ref(repo: &gix::Repository, name: &str, recurse: bool) -> Result<Resolution> {
+    // `reftable_be_read_raw_ref()` answers `refs->err` with no errno, which
+    // `refs_resolve_ref_unsafe()` does not take for a missing reference: it returns NULL.
+    if repo.reftable_init_failed() {
+        return Ok(Resolution::NoSuchRef);
+    }
     if !valid_refname(name) {
         return Ok(Resolution::NoSuchRef);
     }

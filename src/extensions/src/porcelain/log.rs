@@ -3717,7 +3717,16 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `core.warnAmbiguousRefs` is read and where a `refs/heads/HEAD` next to
         // `HEAD` is warned about — ahead of the unborn-branch fatal below.
         let resolved = crate::objname::resolve(&repo, "HEAD");
-        let head = repo.head()?;
+        // A `HEAD` that does not read at all is `diagnose_missing_default()`'s "broken".
+        let head = match repo.head() {
+            Ok(head) => head,
+            Err(_) if resolved.is_none() => {
+                let message = resolve_default(&repo, "HEAD").err().unwrap_or_default();
+                eprintln!("fatal: {message}");
+                return Ok(ExitCode::from(128));
+            }
+            Err(err) => return Err(err.into()),
+        };
         if head.is_unborn() && !all {
             let branch = head
                 .referent_name()

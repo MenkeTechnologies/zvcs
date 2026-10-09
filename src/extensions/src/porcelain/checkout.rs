@@ -1475,6 +1475,14 @@ pub(super) fn maybe_recurse_submodules(
 /// index to `HEAD`'s tree; unforced, the 2-way merge against an identical tree is
 /// a no-op and all that remains is the local-changes listing.
 fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> Result<ExitCode> {
+    // `merge_working_tree()` refreshes the index before it lists anything, so a file that was
+    // only touched, copied or restored without its stat data is not reported as `M`; it also
+    // refuses an unmerged index. A forced checkout skips it, as in every other switch.
+    if !force {
+        if let Some(code) = refuse_unmerged_index(repo)? {
+            return Ok(code);
+        }
+    }
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
     // `switch_branches()` runs even when the branch does not change, so the
     // post-checkout hook fires here too — with the same id on both sides.

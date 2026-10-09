@@ -454,19 +454,36 @@ impl PackLog {
     ///
     /// `pack.depth` and `pack.packSizeLimit` are read there too and steer the
     /// delta window and the pack-cycling threshold; see the module header for
-    /// why neither is reproduced.
-    fn configure(&mut self, repo: &gix::Repository) {
-        let config = repo.config_snapshot();
-        self.unpack_limit = config
-            .integer("fastimport.unpackLimit")
-            .or_else(|| config.integer("transfer.unpackLimit"))
-            .unwrap_or(100);
-        // git rejects a version above 2 through `git_die_config`; 1 and 2 are the
-        // two `write_idx_file()` can write and the two [`index_file`] emits.
-        self.index_version = match config.integer("pack.indexVersion") {
+    /// why neither is reproduced. They are still read, in git's order, because a value
+    /// `git_config_ulong()` cannot parse is fatal, and the function ends in
+    /// `repo_config(the_repository, git_default_config, NULL)`, which refuses every
+    /// `core.*`, `push.*` and similar value the default callback refuses.
+    fn configure(&mut self, repo: &gix::Repository) -> Result<()> {
+        let die = crate::fatal::die;
+        crate::config::config_ulong(repo, "pack.depth").map_err(die)?;
+        let index_version = crate::config::config_int(repo, "pack.indexversion").map_err(die)?;
+        if let Some(version) = index_version.map(|v| v as i32 as u32).filter(|v| *v > 2) {
+            // `git_die_config()`: the `error:` text, then the origin-naming `fatal:`.
+            crate::config::die_config(
+                Some(repo),
+                "pack.indexversion",
+                Some(&format!("bad pack.indexVersion={version}")),
+            );
+        }
+        crate::config::config_ulong(repo, "pack.packsizelimit").map_err(die)?;
+        let unpack_limit = match crate::config::config_int(repo, "fastimport.unpacklimit").map_err(die)? {
+            Some(limit) => Some(limit),
+            None => crate::config::config_int(repo, "transfer.unpacklimit").map_err(die)?,
+        };
+        crate::default_config::validate(repo).map_err(crate::default_config::Rejection::into_error)?;
+
+        self.unpack_limit = unpack_limit.unwrap_or(100);
+        // 1 and 2 are the two versions `write_idx_file()` can write and [`index_file`] emits.
+        self.index_version = match index_version {
             Some(1) => 1,
             _ => 2,
         };
+        Ok(())
     }
 
     /// The loose path `<objdir>/ab/cdef…` an object would be written to.
@@ -834,6 +851,10 @@ pub fn fast_import(args: &[String]) -> Result<ExitCode> {
                 Ok(ExitCode::from(u.code))
             }
             None => {
+                // A refusal from the default config callback has said all it has to say.
+                if e.is::<crate::fatal::Silent>() {
+                    return Err(e);
+                }
                 eprintln!("fatal: {e}");
                 Ok(ExitCode::from(128))
             }
@@ -859,7 +880,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     // before the stream, so `fastimport.unpackLimit` is settled by the time the
     // first object is stored.
     let mut pack = PackLog::new(&repo);
-    pack.configure(&repo);
+    pack.configure(&repo)?;
 
     let mut imp = Importer {
         pack,

@@ -587,6 +587,9 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     // `parse_options()` (builtin/ls-tree.c:381); the settings block is read
     // lazily, after the tree-ish is named, by `porcelain::ls_tree` itself.
     "ls-tree",
+    // `repo_config(the_repository, git_diff_basic_config, NULL)` ahead of the option parse, so a
+    // bad `advice.*` / `core.*` default-config value ends it before the `-z` usage error.
+    "diff-pairs",
     "mailinfo",
     // `cmd_merge_recursive`'s `init_merge_options()`; see
     // `crate::cmd_config::validate_merge_recursive`.
@@ -768,7 +771,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
                 _ => ConfigCallback::DiffBasic,
             }
         }
-        "diff-files" | "diff-index" | "diff-tree" | "merge-tree" | "cherry-pick" | "revert" => {
+        "diff-files" | "diff-index" | "diff-pairs" | "diff-tree" | "merge-tree" | "cherry-pick" | "revert" => {
             ConfigCallback::DiffBasic
         }
         "grep" => ConfigCallback::Grep,
@@ -830,6 +833,7 @@ const HELP_BEFORE_CONFIG_VERBS: &[&str] = &[
     "commit",
     "diff-files",
     "diff-index",
+    "diff-pairs",
     "diff-tree",
     "fsck",
     "fsck-objects",

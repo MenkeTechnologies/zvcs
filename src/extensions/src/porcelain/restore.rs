@@ -694,6 +694,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         pathspecs = super::commit::read_pathspec_file(&f, pathspec_file_nul)?;
     }
 
+    // `if (1 < !!opts->writeout_stage + !!opts->force + !!opts->merge) die(...)`
+    // (builtin/checkout.c:2054, checkout_main) runs before every other combination
+    // check below; `restore` has no `--force`, so the pair is `--ours`/`--theirs` with
+    // `-m`/`--conflict`.
+    if pick.is_some() && merge_active {
+        eprintln!("fatal: git checkout: --ours/--theirs, --force and --merge are incompatible when\nchecking out of the index.");
+        return Ok(ExitCode::from(128));
+    }
     // --- Incompatible-flag combinations (git's fatal/exit-128 diagnostics) --
     // `if (opts->ignore_unmerged && opts->merge) die(_("options '%s' and '%s'
     // cannot be used together"), opts->ignore_unmerged_opt, "-m");`

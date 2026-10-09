@@ -3083,7 +3083,8 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         "geometric" => {
             st.geometric = on;
             st.geometric_factor = match on {
-                true => value.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0),
+                // `OPT_INTEGER`: `git_parse_int()`, which skips leading whitespace and takes a k/m/g suffix.
+                true => value.and_then(|v| int_value("geometric", v).ok()).map_or(0.0, |n| n as f64),
                 false => 0.0,
             };
         }
@@ -3472,6 +3473,12 @@ fn preflight(st: &State, midx: &MidxConfig) -> Option<ExitCode> {
         )));
     }
 
+    // A geometric run hands `pack-objects` `--stdin-packs` beside the `--filter` it forwards, and
+    // the child refuses the pair (`die_for_incompatible_opt2()`) before it reads a pack name or
+    // writes a byte; `cmd_repack()` returns the child's 128 as it is.
+    if st.geometric && st.filter_spec.is_some() {
+        return Some(fatal("options '--stdin-packs' and '--filter' cannot be used together"));
+    }
 
     None
 }

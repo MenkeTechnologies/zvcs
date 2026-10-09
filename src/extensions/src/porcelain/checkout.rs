@@ -652,6 +652,11 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
     // `if (opts->pathspec_from_file) { … if (opts->patch_mode) die(…) }`
     // (builtin/checkout.c:2043) runs in `cmd_checkout()` itself, ahead of both
     // halves' own option gates, so it is checked before them here too.
+    // `else if (opts->pathspec_file_nul) die(_("the option '%s' requires '%s'"), …)` — judged
+    // before the `-p` pairing and ahead of every branch-creation check.
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        crate::git_fatal!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+    }
     if patch_mode && pathspec_from_file.is_some() {
         crate::git_fatal!("options '--pathspec-from-file' and '--patch' cannot be used together");
     }
@@ -922,13 +927,22 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
     // never the command line. A single positional may still precede them as the
     // `<tree-ish>` source; anything else is git's incompatibility error.
     if let Some(file) = pathspec_from_file {
-        if has_dashdash || !post.is_empty() {
+        // A lone operand that is no revision is a pathspec argument too.
+        let pathspec_arg = has_dashdash
+            || !post.is_empty()
+            || pre.len() > 1
+            || pre.first().is_some_and(|p| !names_a_revision(p));
+        if pathspec_arg {
             crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together");
         }
+        if detach {
+            crate::git_fatal!("options '--pathspec-from-file' and '--detach' cannot be used together");
+        }
+        // The file is read before the branch-creation / stage-side refusal.
+        let specs = super::commit::read_pathspec_file(&file, pathspec_file_nul)?;
         if new_branch.is_some() || orphan.is_some() || writeout_stage.is_some() {
             crate::git_fatal!("--pathspec-from-file cannot be combined with branch creation or --ours/--theirs");
         }
-        let specs = super::commit::read_pathspec_file(&file, pathspec_file_nul)?;
         let refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         return match pre.len() {
             0 => restore_from_index(&repo, &refs, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),

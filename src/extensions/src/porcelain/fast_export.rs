@@ -98,6 +98,8 @@
 //!   does not, matching git
 //! * `--refspec=<src>:<dst>` — renames exported ref labels/resets/tags through the
 //!   exact and single-`*` wildcard forms; a ref matching no refspec passes through
+//!   unchanged. A refspec with an empty source (`--refspec=:<ref>`) is a deletion: after the
+//!   refs and tags it prints `reset <ref>` from the null id, once per such refspec (`handle_deletes()`)
 //! * `--anonymize` with `--no-data`, `--show-original-ids`, or a gitlink entry —
 //!   `original-oid` keeps git's real id, and hash-named object refs (`--no-data`
 //!   blobs, gitlinks) use git's `anonymize_oid` sequential fake ids

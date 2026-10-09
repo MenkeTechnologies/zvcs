@@ -2658,9 +2658,37 @@ fn strtoul_10(value: &str) -> Option<u64> {
 /// hooking every object read. This reports each missing entry exactly once, before
 /// the command runs, for any command that opens a repository — so the diagnostic
 /// and its text are git's, and the repetition is not.
+/// The `RUN_SETUP_GENTLY` verbs that never reach repository setup at all, measured against
+/// git 2.56.0 in a repository holding a missing alternate: none of these names it, where the
+/// rest of [`crate::NO_SETUP_VERBS`] do as soon as a repository is found.
+const NEVER_SET_UP_VERBS: &[&str] = &[
+    "check-ref-format",
+    "clone",
+    "credential-cache",
+    "credential-cache--daemon",
+    "credential-store",
+    "get-tar-commit-id",
+    "help",
+    "mailsplit",
+    "receive-pack",
+    "remote-ext",
+    "remote-fd",
+    "stripspace",
+    "upload-archive",
+    "upload-archive--writer",
+    "upload-pack",
+    "url-parse",
+    "verify-pack",
+    "version",
+];
+
 pub fn report_missing_alternates(sub: &str) {
     if crate::NO_SETUP_VERBS.contains(&sub) {
-        return;
+        // A gentle setup that found a repository opens its object database like any other; one
+        // that found none has nothing to complain about.
+        if NEVER_SET_UP_VERBS.contains(&sub) || discover_with_overrides().is_err() {
+            return;
+        }
     }
     let Some(raw) = std::env::var_os("GIT_ALTERNATE_OBJECT_DIRECTORIES") else {
         return;

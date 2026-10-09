@@ -5,7 +5,9 @@
 //! `error: can't open patch` (128), `--stat` still reports, and a patch that wants a file
 //! fails on that file. zvcs canonicalised the work tree to chdir into it and died with the
 //! raw `No such file or directory (os error 2)` at 1.
-
+//!
+//! The same run names a missing alternate object directory first: a `RUN_SETUP_GENTLY` verb that
+//! found a repository opens its object database like any other.
 
 #[path = "support/stock_git.rs"]
 mod stock_git;
@@ -69,7 +71,8 @@ fn an_unenterable_work_tree_leaves_the_process_where_it_stands() {
         vec!["--work-tree=src", "apply", "-"],
         vec!["--glob-pathspecs", "--work-tree=src", "apply", "-z", "--allow-empty", "does-not-exist"],
     ];
-    let envs: [&[(&str, &str)]; 1] = [&[]];
+    let envs: [&[(&str, &str)]; 2] =
+        [&[], &[("GIT_ALTERNATE_OBJECT_DIRECTORIES", "<NOSUCH>")]];
     for env in envs {
         for args in &cases {
             let mut seen = Vec::new();

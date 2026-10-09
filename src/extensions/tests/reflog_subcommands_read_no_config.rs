@@ -121,3 +121,28 @@ fn drop_skips_the_settings_block() {
 fn delete_still_prepares_the_settings_block() {
     same("delete-settings", "[core]\n\tdeltaBaseCacheLimit = -1\n", &["reflog", "delete", "--dry-run", "HEAD@{0}"]);
 }
+
+/// `cmd_log_reflog()` runs `repo_init_revisions()`, whose second `grep_config` pass refuses
+/// `grep.patternType=true`; zvcs only ran that pass for `log`, `show`, `whatchanged` and
+/// `format-patch`.
+const BAD_GREP_PATTERN_TYPE: &str = "[grep]\n\tpatternType = true\n";
+
+#[test]
+fn bare_reflog_refuses_a_bad_grep_pattern_type() {
+    same("grep-bare", BAD_GREP_PATTERN_TYPE, &["reflog"]);
+}
+
+#[test]
+fn reflog_show_refuses_a_bad_grep_pattern_type() {
+    same("grep-show", BAD_GREP_PATTERN_TYPE, &["reflog", "show"]);
+}
+
+#[test]
+fn reflog_list_ignores_a_bad_grep_pattern_type() {
+    same("grep-list", BAD_GREP_PATTERN_TYPE, &["reflog", "list"]);
+}
+
+#[test]
+fn reflog_expire_ignores_a_bad_grep_pattern_type() {
+    same("grep-expire", BAD_GREP_PATTERN_TYPE, &["reflog", "expire", "--all", "--dry-run"]);
+}

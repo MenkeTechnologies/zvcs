@@ -859,7 +859,8 @@ const SETTINGS_BEFORE_HELP_VERBS: &[&str] =
 /// callback, in one chain; `rev-list`, `shortlog`, `diff-tree`, `diff` and
 /// `status` are absent because they were measured not to reach them at all. `range-diff`
 /// is absent because only the `git log` child it spawns reaches them, after its own
-/// operand checks (`porcelain::range_diff`).
+/// operand checks (`porcelain::range_diff`). `reflog` joins them when it shows (bare, or
+/// `reflog show`), which the caller decides.
 const GREP_REVISION_VERBS: &[&str] =
     &["log", "show", "whatchanged", "format-patch"];
 
@@ -1808,7 +1809,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                 }
                 // `repo_init_revisions()`'s own pass, which runs after the
                 // command's callback has finished.
-                if GREP_REVISION_VERBS.contains(&sub) {
+                // `reflog` is `git log -g` when it shows: `cmd_log_reflog()` runs the same
+                // `repo_init_revisions()`, the other subcommands never do.
+                let reflog_shows = sub == "reflog" && config_callback(sub, args) == ConfigCallback::Log;
+                if GREP_REVISION_VERBS.contains(&sub) || reflog_shows {
                     if let Err(rejection) = crate::cmd_config::validate_grep_only(&repo) {
                         return Err(rejection.into_error());
                     }

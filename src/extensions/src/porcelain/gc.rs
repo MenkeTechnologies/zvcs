@@ -816,8 +816,8 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // Guarded on the directory: `rerere gc` returns early when rerere is
     // disabled, but a repository with rerere on and no `rr-cache` yet would hit
     // the delegate's `read_dir` error path, which git does not have.
-    // The child dies on an unreadable `rerere.*` boolean whether or not `rr-cache` exists.
-    if repo.git_dir().join("rr-cache").is_dir() || super::rerere::bool_config(&repo).is_err() {
+    // The child dies on a configuration it cannot read whether or not `rr-cache` exists.
+    if super::rerere::gc_child_runs(&repo) {
         // `rerere()` is handed the arguments the verb was dispatched with, so the
         // verb itself is not one of them: a leading "rerere" reads as an unknown
         // subcommand and prints the usage block instead of collecting anything.

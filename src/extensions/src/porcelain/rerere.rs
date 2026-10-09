@@ -1326,6 +1326,16 @@ pub(super) fn bool_config(repo: &gix::Repository) -> Result<()> {
     Ok(())
 }
 
+/// Whether the `git rerere gc` child that `gc` and the `rerere-gc` maintenance task spawn has
+/// anything to say: it reads the `rr-cache` directory when there is one, and it dies on a
+/// configuration it cannot read - `rerere.*` booleans, `merge.conflictStyle` and the default
+/// callback - whether or not the directory exists.
+pub(super) fn gc_child_runs(repo: &gix::Repository) -> bool {
+    repo.git_dir().join("rr-cache").is_dir()
+        || bool_config(repo).is_err()
+        || crate::cmd_config::validate_xmerge(repo).is_err()
+}
+
 /// `is_rerere_enabled()`: an explicit `rerere.enabled=false` disables it; unset
 /// means "enabled only if `rr-cache` already exists"; true creates `rr-cache`.
 fn is_rerere_enabled(repo: &gix::Repository) -> Result<bool> {

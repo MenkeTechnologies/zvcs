@@ -822,10 +822,9 @@ fn run_task(repo: &gix::Repository, task: &str, phase: Phase, opts: RunOpts) -> 
             ])))
         }
         ("rerere-gc", _) => {
-            !repo.git_dir().join("rr-cache").is_dir()
-                // Unlike `repack` above, `rerere()` takes the verb's arguments
-                // only; a leading "rerere" reads as an unknown subcommand.
-                || delegate(super::rerere::rerere(&strings(&["gc"])))
+            // `run_command(&rerere)`: a child, so that what it dies with (an unreadable
+            // `rerere.*` or `merge.conflictStyle`) reaches stderr whole, `fatal:` line included.
+            !super::rerere::gc_child_runs(repo) || spawn_git(repo, &["rerere", "gc"])
         }
         ("worktree-prune", _) => super::gc::prune_worktrees(repo).is_ok(),
         ("commit-graph", _) => spawn_git(repo, &["commit-graph", "write", "--split", "--reachable"]),

@@ -283,6 +283,7 @@ fn run(args: &[String]) -> Result<ExitCode> {
     let mut to_stdin: Option<String> = None;
     let mut jobs_flag: Option<i64> = None;
     let mut event: Option<String> = None;
+    let mut extra_positional = false;
     let mut hook_args: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -343,18 +344,25 @@ fn run(args: &[String]) -> Result<ExitCode> {
                 return Ok(super::unknown_option(a, &format!("{USAGE_RUN}{OPTS_RUN}")));
             }
             s => {
+                // A second positional is not an error until the whole argv has been
+                // parsed: `cmd_hook_run()` checks `argv[1]` for `--` only after
+                // `parse_options()`, so an unknown option later on still wins.
                 if event.is_some() {
-                    crate::git_fatal!("unexpected extra argument {s:?} (hook arguments go after `--`)");
+                    extra_positional = true;
+                } else {
+                    event = Some(s.to_string());
                 }
-                event = Some(s.to_string());
             }
         }
         i += 1;
     }
 
-    let Some(event) = event else {
-        eprint!("{USAGE_RUN}{OPTS_RUN}");
-        return Ok(ExitCode::from(129));
+    let event = match event {
+        Some(event) if !extra_positional => event,
+        _ => {
+            eprint!("{USAGE_RUN}{OPTS_RUN}");
+            return Ok(ExitCode::from(129));
+        }
     };
     // `repo_config(repo, git_default_config, NULL)` (builtin/hook.c:171) comes after the
     // option parse and the missing-event usage error, and ahead of the unknown-event check.

@@ -1913,15 +1913,18 @@ impl Ctx {
         // The two are compared absolute: `--work-tree=..` typed in a subdirectory
         // leaves gitoxide with a relative work tree beside an absolute git dir,
         // and a textual prefix test then ran the children from the user's cwd.
+        //
+        // `am` is `RUN_SETUP | NEED_WORK_TREE`, so git stands in the work tree root whatever the
+        // state directory is — a submodule's lives in the superproject's `.git/modules/<name>`,
+        // outside the tree it checks out. Then the children start there too, and reach the state
+        // directory by its absolute path.
         let (cwd, sdir) = match repo.workdir().map(crate::hooks::absolutize) {
-            Some(w) if crate::hooks::absolutize(state_dir).starts_with(&w) => {
-                let sdir = crate::hooks::absolutize(state_dir)
-                    .strip_prefix(&w)
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|_| state_dir.to_path_buf());
+            Some(w) => {
+                let state = crate::hooks::absolutize(state_dir);
+                let sdir = state.strip_prefix(&w).map(Path::to_path_buf).unwrap_or(state);
                 (Some(w), sdir)
             }
-            _ => (None, state_dir.to_path_buf()),
+            None => (None, state_dir.to_path_buf()),
         };
         let sdir_abs = if state_dir.is_absolute() {
             state_dir.to_path_buf()

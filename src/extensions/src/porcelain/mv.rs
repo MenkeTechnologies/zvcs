@@ -488,6 +488,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         workdir: workdir.clone(),
         stat_options: repo.stat_options().unwrap_or_default(),
         trust_executable_bit: repo.config_snapshot().boolean("core.fileMode").unwrap_or(true),
+        big_file_refusal: crate::config::big_file_threshold_refusal(&repo),
     };
     let mut gitmodules_modified = false;
     // Destinations a `--sparse` move brought back into the cone, checked out once
@@ -550,7 +551,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         if plan.is_dir && plan.submodule.is_none() {
             continue;
         }
-        apply_remaps(&mut index, &plan.remaps, &refresh);
+        if let Err(message) = apply_remaps(&mut index, &plan.remaps, &refresh) {
+            return fatal(message);
+        }
         modified = true;
         // ```c
         // if ((mode & SPARSE) &&
@@ -578,7 +581,9 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
                 println!("Renaming {old} to {new}");
             }
             if !dry_run {
-                apply_remaps(&mut index, std::slice::from_ref(remap), &refresh);
+                if let Err(message) = apply_remaps(&mut index, std::slice::from_ref(remap), &refresh) {
+                    return fatal(message);
+                }
                 modified = true;
             }
         }
@@ -1168,6 +1173,8 @@ struct Refresh {
     workdir: PathBuf,
     stat_options: gix::index::entry::stat::Options,
     trust_executable_bit: bool,
+    /// [`crate::config::big_file_threshold_refusal`]: the die the first blob hashing meets.
+    big_file_refusal: Option<String>,
 }
 
 impl Refresh {
@@ -1178,34 +1185,47 @@ impl Refresh {
     /// `ie_modified()` finds the content or mode changed; only a stat-only
     /// difference over unchanged content is refreshed (`fill_stat_cache_info()`).
     /// A gitlink is left as it was.
-    fn stat_for(&self, path: &BString, stat: Stat, id: ObjectId, flags: Flags, mode: Mode) -> Stat {
+    fn stat_for(&self, path: &BString, stat: Stat, id: ObjectId, flags: Flags, mode: Mode) -> Result<Stat, String> {
         if flags.contains(Flags::SKIP_WORKTREE) || !matches!(mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK) {
-            return stat;
+            return Ok(stat);
         }
         let Ok(rela) = gix::path::try_from_bstr(path.as_bstr()) else {
-            return stat;
+            return Ok(stat);
         };
         let full = self.workdir.join(rela);
         let Ok(md) = std::fs::symlink_metadata(&full) else {
-            return stat;
+            return Ok(stat);
         };
         let Ok(fs_md) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
-            return stat;
+            return Ok(stat);
         };
         let Ok(current) = Stat::from_fs(&fs_md) else {
-            return stat;
+            return Ok(stat);
         };
         if stat.matches(&current, self.stat_options) {
-            return stat;
+            return Ok(stat);
         }
         let same_type = match mode {
             Mode::SYMLINK => md.file_type().is_symlink(),
             _ => md.is_file() && (!self.trust_executable_bit || (mode == Mode::FILE_EXECUTABLE) == fs_md.is_executable()),
         };
-        if !same_type || crate::index_racy::modified_check_fs(id.kind(), &full, &md, &id) {
-            return stat;
+        if !same_type {
+            return Ok(stat);
         }
-        current
+        // `ie_modified()` only reads the content when the size is unchanged (or was never
+        // recorded); a regular file read goes through `index_fd()`, whose
+        // `core.bigFileThreshold` lookup dies on a value `git_config_ulong()` refuses.
+        // A symlink target is compared without it.
+        let reads_content = stat.size == 0 || stat.size == current.size;
+        if reads_content && mode != Mode::SYMLINK {
+            if let Some(message) = &self.big_file_refusal {
+                return Err(message.clone());
+            }
+        }
+        if crate::index_racy::modified_check_fs(id.kind(), &full, &md, &id) {
+            return Ok(stat);
+        }
+        Ok(current)
     }
 }
 
@@ -1213,7 +1233,7 @@ impl Refresh {
 /// entries' fields, drop the old entries and any entry occupying a new path
 /// (the force-overwrite case), then re-append the entries at their new paths.
 /// A `sort_entries()` by the caller restores lookup invariants afterward.
-fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)], refresh: &Refresh) {
+fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)], refresh: &Refresh) -> Result<(), String> {
     // `cmd_mv()` moves each entry with `rename_index_entry_at()`
     // (builtin/mv.c:615), which invalidates the cache-tree along the *old* name
     // (read-cache.c:169) and then re-adds the entry under the new one, where
@@ -1265,9 +1285,10 @@ fn apply_remaps(index: &mut gix::index::File, remaps: &[(String, String)], refre
                 e.stage() == Stage::Unconflicted && in_way.iter().any(|c| c.as_bstr() == path)
             });
         }
-        let stat = refresh.stat_for(&new_bytes, stat, id, flags, mode);
+        let stat = refresh.stat_for(&new_bytes, stat, id, flags, mode)?;
         index.dangerously_push_entry(stat, id, flags, mode, BStr::new(&new_bytes));
     }
+    Ok(())
 }
 
 /// `prefix_path()` (setup.c:149-160) — what `builtin/mv.c` runs every operand

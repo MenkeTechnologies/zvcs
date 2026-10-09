@@ -1148,12 +1148,14 @@ pub(crate) fn set_orig_head(repo: &gix::Repository, id: ObjectId) -> Result<()> 
     let name: FullName = "ORIG_HEAD"
         .try_into()
         .map_err(|e| anyhow!("invalid ref name ORIG_HEAD: {e}"))?;
+    // `reset_refs()` writes `<GIT_REFLOG_ACTION or "reset">: updating ORIG_HEAD`.
+    let action = std::env::var("GIT_REFLOG_ACTION").unwrap_or_else(|_| "reset".to_string());
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: "updating ORIG_HEAD".into(),
+                message: format!("{action}: updating ORIG_HEAD").into(),
             },
             expected: PreviousValue::Any,
             new: Target::Object(id),

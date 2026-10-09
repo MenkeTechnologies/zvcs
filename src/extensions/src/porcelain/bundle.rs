@@ -1073,6 +1073,17 @@ fn create(args: &[String]) -> Result<ExitCode> {
         }
         enumerating.stop("done");
     }
+    // The child reads its configuration before it packs anything. Its death is reported by the
+    // parent as `error: pack-objects died` and ends the command at 1; the header the parent
+    // streams as it builds it has reached a `-` destination by then, and a file is rolled back.
+    if super::pack_objects::child_config_dies(&repo) {
+        if file == "-" {
+            io::stdout().write_all(&out)?;
+            io::stdout().flush()?;
+        }
+        eprintln!("error: pack-objects died");
+        return Ok(ExitCode::from(1));
+    }
     // `write_pack_data()` spawns `pack-objects --stdout --thin --delta-base-offset`
     // (bundle.c:333-336) — both flags are unconditional there, so a bundle's
     // deltas are always `OBJ_OFS_DELTA` where the base is in the pack and

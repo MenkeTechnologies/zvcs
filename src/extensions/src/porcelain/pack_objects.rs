@@ -812,6 +812,39 @@ fn resolve_path_walk(st: &State, settings: Option<&crate::repo_settings::RepoSet
 /// An invocation that survives both packs nothing when nothing named an object,
 /// and otherwise bails, naming the substrate that is missing; see the module
 /// documentation for the full list.
+/// The configuration reads a `pack-objects` child makes before it looks at its command line —
+/// `prepare_repo_settings()`, then `repo_config(git_pack_config)` ending in `git_default_config()`
+/// — for a caller that packs in-process but whose git runs the child: a value any of them refuses
+/// is the child's `fatal:` (with whatever `error:` lines precede it) on stderr. `true` when the
+/// child would have died there, leaving its parent to report `error: pack-objects died`.
+pub(crate) fn child_config_dies(repo: &gix::Repository) -> bool {
+    let settings = match crate::repo_settings::RepoSettings::load(repo) {
+        Ok(settings) => settings,
+        Err(message) => {
+            eprintln!("fatal: {message}");
+            return true;
+        }
+    };
+    if let Err(rejection) = crate::default_config::validate(repo) {
+        let message = rejection.into_fatal();
+        if !message.is_empty() {
+            eprintln!("fatal: {message}");
+        }
+        return true;
+    }
+    let failure = crate::config::config_ulong(repo, "pack.packSizeLimit")
+        .err()
+        .or_else(|| PackConfig::load(repo, &settings).err())
+        .or_else(|| DeltaConfig::from_repo(repo).err());
+    match failure {
+        Some(message) => {
+            eprintln!("fatal: {message}");
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn pack_objects(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0. `pack-objects` does take a
     // positional (the base name), so the leading verb must be dropped rather

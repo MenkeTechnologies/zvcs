@@ -336,9 +336,10 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // another and each `die()`s/`usage()`s on the spot, so a command line that
     // trips several is judged by the FIRST one git reaches, not by ours:
     //   1. `--separate-git-dir` with `--bare`   → die, exit 128
-    //   2. more than one `<directory>` operand  → usage(), exit 129
-    //   3. an unknown `--object-format`         → die, exit 128
-    //   4. an unknown `--ref-format`            → die, exit 128
+    //   2. a relative `--separate-git-dir` that cannot be resolved → die, exit 128
+    //   3. more than one `<directory>` operand  → usage(), exit 129
+    //   4. an unknown `--object-format`         → die, exit 128
+    //   5. an unknown `--ref-format`            → die, exit 128
     // Verified against stock 2.55.0: `git init --object-format=bogus a b` prints
     // the usage block and exits 129 (the operand count is judged first), while
     // `git init --separate-git-dir=x --bare a b` dies with the option-conflict
@@ -358,6 +359,15 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
         );
     }
 
+    // `real_pathdup(real_git_dir, 1)` runs right after the conflict check and ahead of
+    // the operand count, so an unresolvable `--separate-git-dir` dies (128) even when
+    // the command line also holds a stray operand; the `--template` resolution further
+    // down is the later of the two.
+    let separate_git_dir = match separate_git_dir {
+        Some(p) if !Path::new(&p).is_absolute() => Some(real_pathdup(&p)?),
+        other => other,
+    };
+
     // `} else if (0 < argc) { usage(init_db_usage[0]); }` — anything past the
     // single optional `<directory>` is a usage error, not a `die()`.
     if positionals.len() > 1 {
@@ -371,10 +381,6 @@ pub fn init(args: &[String]) -> Result<ExitCode> {
     // was invoked from — before the `<directory>` operand moves it — and a path
     // whose leading components do not exist is fatal on the spot. An absolute
     // value is left untouched, exactly as `is_absolute_path()` decides.
-    let separate_git_dir = match separate_git_dir {
-        Some(p) if !Path::new(&p).is_absolute() => Some(real_pathdup(&p)?),
-        other => other,
-    };
     let template = match template {
         Some(p) if !p.is_empty() && !Path::new(&p).is_absolute() => Some(real_pathdup(&p)?),
         other => other,
@@ -1925,7 +1931,15 @@ fn set_config_value(git_dir: &Path, section: &str, key: &str, value: &str) -> Re
     {
         return Ok(());
     }
-    file.set_raw_value_by(section, None, key, value)?;
+    // `git_config_set` rewrites the value where it already stands; gix's
+    // `set_raw_value_by` would instead write into the *last* section block and
+    // leave the earlier assignment behind.
+    match file.raw_value_mut_by(section, None, key) {
+        Ok(mut existing) => existing.set_string(value)?,
+        Err(_) => {
+            file.set_raw_value_by(section, None, key, value)?;
+        }
+    }
     std::fs::write(&path, file.to_bstring())?;
     Ok(())
 }

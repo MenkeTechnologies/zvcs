@@ -588,6 +588,11 @@ fn convert_for_checkin<'repo>(
     write: bool,
 ) -> std::result::Result<Option<Vec<u8>>, Fatal> {
     let Some(repo) = repo else { return Ok(None) };
+    // `convert_to_git()` reads the path's attributes, and the first attribute lookup is where
+    // `compute_default_attr_source()` dies on an `--attr-source` naming nothing (attr.c:1201-1228).
+    if let Some(message) = super::bad_default_attr_source(repo) {
+        return Err(Fatal::new(message));
+    }
     if filters.is_none() {
         let (mut pipeline, index) = repo
             .filter_pipeline(None)

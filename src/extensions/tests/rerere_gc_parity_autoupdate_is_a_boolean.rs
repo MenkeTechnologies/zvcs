@@ -76,5 +76,13 @@ fn a_non_boolean_autoupdate_or_enabled_dies_in_every_rerere_verb() {
             assert_eq!(run(BIN, &root, &args), run(stock, &root, &args), "{args:?}");
         }
     }
+
+    // `gc` runs the `rerere gc` child whether or not `rr-cache` exists.
+    std::fs::remove_dir_all(root.join(".git/rr-cache")).unwrap();
+    for config in configs {
+        let mut args: Vec<&str> = config.to_vec();
+        args.extend_from_slice(&["gc", "--quiet"]);
+        assert_eq!(run(BIN, &root, &args), run(stock, &root, &args), "{args:?}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

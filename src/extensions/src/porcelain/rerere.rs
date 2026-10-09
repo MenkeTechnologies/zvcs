@@ -1317,6 +1317,15 @@ fn variant_path(id_dir: &Path, variant: i32, file: &str) -> PathBuf {
     }
 }
 
+/// `git_rerere_config()`'s two booleans: `rerere.enabled` and `rerere.autoupdate`, each read by
+/// its last value like any `git_config_get_bool()`, dying on one that is not a boolean.
+pub(super) fn bool_config(repo: &gix::Repository) -> Result<()> {
+    for key in ["rerere.enabled", "rerere.autoupdate"] {
+        crate::repo_settings::config_bool_strict(repo, key).map_err(crate::fatal::die)?;
+    }
+    Ok(())
+}
+
 /// `is_rerere_enabled()`: an explicit `rerere.enabled=false` disables it; unset
 /// means "enabled only if `rr-cache` already exists"; true creates `rr-cache`.
 fn is_rerere_enabled(repo: &gix::Repository) -> Result<bool> {
@@ -1329,9 +1338,7 @@ fn is_rerere_enabled(repo: &gix::Repository) -> Result<bool> {
     // thing.
     //
     // `rerere.autoupdate` is read the same way, and like `rerere.enabled` by the last value.
-    for key in ["rerere.enabled", "rerere.autoupdate"] {
-        crate::repo_settings::config_bool_strict(repo, key).map_err(crate::fatal::die)?;
-    }
+    bool_config(repo)?;
     // The rest of `git_rerere_config()` (rerere.c:875-880), which `setup_rerere()`
     // runs before it asks whether rerere is enabled at all:
     // `repo_config(the_repository, git_default_config, NULL)`. A second walk of

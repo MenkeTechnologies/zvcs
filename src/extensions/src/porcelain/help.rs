@@ -1776,6 +1776,28 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             // `cmd_help()` (builtin/help.c:743), so `-a`, `-g`, `--config` and a
             // bare `help` never meet a repository's setup warnings.
             crate::config::check_bare_and_worktree()?;
+            // `repo_config(the_repository, git_help_config, NULL)` (builtin/help.c:744), value by
+            // value in parse order: `help.format` is judged where it stands (`parse_help_format()`
+            // dies in the callback), `help.htmlpath` and `man.*` are collected, and everything else
+            // goes to `git_default_config()`, so the first refusal of either kind ends the command
+            // before any page is looked up.
+            let repo = crate::setup::discover().ok();
+            for value in crate::config::walk_config_gently(repo.as_ref()) {
+                match value.key.as_str() {
+                    "help.format" => {
+                        if let Some(format) = value.value.as_deref() {
+                            if let Err(code) = parse_help_format(format) {
+                                return Ok(code);
+                            }
+                        }
+                    }
+                    "help.htmlpath" => {}
+                    key if key.starts_with("man.") => {}
+                    _ => {
+                        crate::default_config::validate_values(vec![value]).map_err(|r| r.into_error())?;
+                    }
+                }
+            }
             let config = match help_config() {
                 Ok(c) => c,
                 Err(code) => return Ok(code),

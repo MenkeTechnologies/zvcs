@@ -281,6 +281,10 @@ pub fn real_path_strict(arg: &str) -> Result<std::path::PathBuf, String> {
     let invalid = |path: &std::path::Path, e: &std::io::Error| {
         format!("Invalid path '{}': {}", path.display(), crate::external::strerror(e))
     };
+    // `if (!*path) { if (flags & REALPATH_DIE_ON_ERROR) die("The empty string is not a valid path"); … }`
+    if arg.is_empty() {
+        return Err("The empty string is not a valid path".to_string());
+    }
     let mut resolved = std::env::current_dir().map_err(|e| invalid(std::path::Path::new(""), &e))?;
     if arg.starts_with('/') {
         resolved = std::path::PathBuf::from("/");

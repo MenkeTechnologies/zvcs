@@ -782,7 +782,15 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // `pack-objects` reports a reflog naming a pruned commit, from the walk
     // [`pack_objects_pending`] stands for; this set is the same walk again.
     super::prune::collect_roots(&repo, &mut roots, super::prune::PrunedReflogWarning::Silent)?;
-    let reachable = super::prune::close_over_excluding(&repo, roots, &promisor_held);
+    let existing = super::prune::pack_indices(&repo, &objdir);
+    // An incremental run passes `--unpacked`: a commit some pack already holds is ignored by the
+    // walk, so its tree is not reached from it.
+    let reachable = match st.all_into_one {
+        true => super::prune::close_over_excluding(&repo, roots, &promisor_held),
+        false => super::prune::close_over_unpacked(&repo, roots, &promisor_held, &|id| {
+            existing.iter().any(|pack| pack.lookup(*id).is_some())
+        }),
+    };
 
     // `--filter=tree:<depth>` is decided by pack-objects' traversal as a whole, not object by
     // object, so what it shows is worked out up front.
@@ -792,7 +800,6 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
         .any(|f| matches!(f, FilterSub::TreeDepth(_)))
         .then(|| filtered_traversal(&repo, &filters, &reachable, &promisor_held));
 
-    let existing = super::prune::pack_indices(&repo, &objdir);
     // ```c
     // if (geometric_factor) {
     //         [...]

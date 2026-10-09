@@ -1098,6 +1098,18 @@ pub(super) fn close_over_excluding(
     roots: Vec<ObjectId>,
     uninteresting: &HashSet<ObjectId>,
 ) -> HashSet<ObjectId> {
+    close_over_unpacked(repo, roots, uninteresting, &|_| false)
+}
+
+/// [`close_over_excluding`] for a walk run with `--unpacked`: a commit that `packed` names is
+/// ignored (`get_commit_action()` returns `commit_ignore`), so its tree is never added to the
+/// pending list, though the walk still goes on to its parents.
+pub(super) fn close_over_unpacked(
+    repo: &gix::Repository,
+    roots: Vec<ObjectId>,
+    uninteresting: &HashSet<ObjectId>,
+    packed: &dyn Fn(&ObjectId) -> bool,
+) -> HashSet<ObjectId> {
     // `register_shallow()` (shallow.c:34-47) installs a graft with
     // `nr_parent = -1` for every commit named in `.git/shallow` and clears the
     // parents of one already parsed, so a shallow boundary commit contributes no
@@ -1134,7 +1146,9 @@ pub(super) fn close_over_excluding(
                     .ok()
                     .map(|c| (c.tree(), c.parents().collect::<Vec<_>>()));
                 if let Some((tree, parents)) = ids {
-                    next.push(tree);
+                    if !packed(&id) {
+                        next.push(tree);
+                    }
                     if !shallow.contains(&id) {
                         next.extend(parents);
                     }

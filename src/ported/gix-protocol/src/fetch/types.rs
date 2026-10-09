@@ -266,7 +266,8 @@ pub enum Shallow {
     Exclude {
         /// The ref names to exclude, short or long. Note that ambiguous short names will cause the remote to abort
         /// without an error message being transferred (because the protocol does not support it)
-        remote_refs: Vec<gix_ref::PartialName>,
+        /// The names are sent as given, valid or not: it is the server that decides whether one is a ref, as git's own client leaves it to it.
+        remote_refs: Vec<bstr::BString>,
         /// If some, this field has the same meaning as [`Shallow::Since`] which can be used in combination
         /// with excluded references.
         since_cutoff: Option<gix_date::Time>,

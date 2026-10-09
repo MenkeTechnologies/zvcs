@@ -36,6 +36,15 @@ impl std::error::Error for Fatal {}
 /// git's exit code for `die()`.
 pub const EXIT_FATAL: u8 = 128;
 
+/// What `vreportf()` (usage.c) writes for a message: every control character but tab and newline
+/// is shown as `?`, so a CR inside a quoted refspec cannot rewrite the terminal line.
+pub fn report_text(message: &str) -> String {
+    message
+        .chars()
+        .map(|c| if c.is_ascii_control() && c != '\t' && c != '\n' { '?' } else { c })
+        .collect()
+}
+
 /// A diagnostic already written to stderr; only the exit code is left to carry.
 ///
 /// Not every git diagnostic is a `die()`. `report_path_error()` writes `error: …`

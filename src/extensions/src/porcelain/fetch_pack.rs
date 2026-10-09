@@ -912,13 +912,8 @@ fn build_shallow(
         .and_then(NonZeroU32::new);
 
     if !shallow_exclude.is_empty() {
-        let remote_refs = shallow_exclude
-            .iter()
-            .map(|s| {
-                gix::refs::PartialName::try_from(s.as_str())
-                    .map_err(|e| anyhow::anyhow!("invalid --shallow-exclude ref {s:?}: {e}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Sent as written: the server decides whether a name is a ref.
+        let remote_refs = shallow_exclude.iter().map(|s| gix::bstr::BString::from(s.as_str())).collect();
         let since_cutoff = shallow_since.map(parse_date).transpose()?;
         return Ok(Shallow::Exclude {
             remote_refs,

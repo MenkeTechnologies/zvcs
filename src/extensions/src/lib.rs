@@ -1031,7 +1031,7 @@ fn run_command(argv: &[String]) -> ExitCode {
         Err(e) if e.downcast_ref::<fatal::Fatal>().is_some() => {
             let msg = e.downcast_ref::<fatal::Fatal>().expect("checked").0.clone();
             trace2::error(&msg);
-            eprintln!("fatal: {msg}");
+            eprintln!("fatal: {}", fatal::report_text(&msg));
             ExitCode::from(fatal::EXIT_FATAL)
         }
         // Repository setup is git's, not this port's. git runs it in the

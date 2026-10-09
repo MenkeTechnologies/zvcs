@@ -332,7 +332,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // repeatable list → `deepen_not`, `--shallow-since` → `deepen_since`, and the
     // two may be given together). Resolved into a single `Shallow` after parsing.
     let mut depth: Option<String> = None;
-    let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
+    let mut shallow_exclude: Vec<gix::bstr::BString> = Vec::new();
     let mut shallow_since: Option<gix::date::Time> = None;
     // `-c <key>=<value>`, in command-line order; repeats of a key are kept so each
     // value is written, as git documents.
@@ -569,9 +569,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // Exclude history reachable from a ref (git's repeatable `deepen_not`).
             "--shallow-exclude" => {
                 let v = take_value!();
-                let name = gix::refs::PartialName::try_from(v.as_str())
-                    .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
-                shallow_exclude.push(name);
+                // Sent to the server as `deepen-not <value>` whatever it is; the server judges it.
+                shallow_exclude.push(gix::bstr::BString::from(v));
             }
             // `--recursive` / `--recurse-submodules[=<pathspec>]`: after the clone,
             // initialize and update submodules recursively. A pathspec-limited

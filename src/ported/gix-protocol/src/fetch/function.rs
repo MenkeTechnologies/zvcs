@@ -294,7 +294,7 @@ fn add_shallow_args(
                 args.deepen_since(cutoff.seconds);
             }
             for ref_ in remote_refs {
-                args.deepen_not(ref_.as_ref().as_bstr());
+                args.deepen_not(ref_.as_ref());
             }
         }
     }

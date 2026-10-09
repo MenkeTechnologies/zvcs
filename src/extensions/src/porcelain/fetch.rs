@@ -311,7 +311,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // repeatable OPT_STRING_LIST → `deepen_not`, `--shallow-since` → `deepen_since`,
     // and the two may be given together). Accumulated here and resolved into a
     // single `Shallow` value after parsing.
-    let mut shallow_exclude: Vec<gix::refs::PartialName> = Vec::new();
+    let mut shallow_exclude: Vec<BString> = Vec::new();
     let mut shallow_since: Option<gix::date::Time> = None;
     // git keeps `--depth`, `--deepen` and `--unshallow` in three separate variables and
     // cross-checks them after parsing (builtin/fetch.c:2666-2684), so these track which
@@ -582,9 +582,9 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
             // Exclude history reachable from a ref (git's repeatable `deepen_not`).
             "--shallow-exclude" => {
                 let v = take_value!("--shallow-exclude");
-                let name = gix::refs::PartialName::try_from(v.as_str())
-                    .map_err(|_| anyhow::anyhow!("--shallow-exclude expects a valid ref, got {v:?}"))?;
-                shallow_exclude.push(name);
+                // `--shallow-exclude` is an `OPT_STRING_LIST`: whatever is written goes to the server
+                // as `deepen-not <value>`, which is what answers for a name that is no ref.
+                shallow_exclude.push(BString::from(v));
             }
             // Hidden, and set only by the parent fetch when it recurses: the path of the
             // submodule being fetched, relative to the top-level superproject, with a
@@ -751,12 +751,20 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // `--stdin` refspecs are appended after everything named on the command line,
     // as git's `add_refspec` on the stdin lines does.
     let stdin_specs: Vec<String> = if read_stdin {
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        buf.lines()
-            .map(str::trim)
+        // `while (strbuf_getline_lf(&line, stdin) != EOF) refspec_append(&rs, line.buf)`
+        // (builtin/fetch.c): lines end at LF alone - a CR stays in the refspec - and
+        // are taken as written. A blank one is dropped here, as it always was: the fetch below has no
+        // "fetch HEAD" refspec to hand it.
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf)?;
+        let mut lines: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
+        if lines.last().is_some_and(|last| last.is_empty()) {
+            lines.pop();
+        }
+        lines
+            .into_iter()
             .filter(|l| !l.is_empty())
-            .map(str::to_string)
+            .map(|l| String::from_utf8_lossy(l).into_owned())
             .collect()
     } else {
         Vec::new()
@@ -1129,8 +1137,7 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         .filter(|s| !s.is_empty())
     {
         if !refspec_globs_agree(spec) || !refspec_is_valid(spec) {
-            eprintln!("fatal: invalid refspec '{spec}'");
-            return Ok(ExitCode::from(128));
+            crate::git_fatal!("invalid refspec '{spec}'");
         }
     }
 

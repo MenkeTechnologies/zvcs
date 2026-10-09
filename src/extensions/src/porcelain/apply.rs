@@ -1403,6 +1403,7 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // `trust_executable_bit`, which `check_preimage()` consults when it works out
         // the mode the pre-image actually has (apply.c:3896).
         let trust_exec = trust_executable_bit(idx_repo.as_ref());
+        SYMLINKS_OFF.store(!has_symlinks(idx_repo.as_ref()), std::sync::atomic::Ordering::Relaxed);
 
         // `read_old_data()` (apply.c:2401-2427) runs every pre-image it reads off disk through
         // `convert_to_git()`, so a `clean` driver, a `working-tree-encoding`, `ident` and the
@@ -2689,6 +2690,23 @@ fn create_ce_mode(mode: u32) -> u32 {
 /// filesystem carries the bit (environment.c). `check_preimage()` reads it at
 /// apply.c:3896 to decide whether the pre-image's mode comes from the file or
 /// from the index entry that shadows it.
+/// `core.symlinks=false`: the file system cannot hold links, so a symlink the patch creates is
+/// written as a regular file whose content is the link target (what a checkout does too).
+static SYMLINKS_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `has_symlinks` (environment.c): `core.symlinks`, true unless configured off.
+fn has_symlinks(repo: Option<&gix::Repository>) -> bool {
+    fn read(r: Option<&gix::Repository>) -> bool {
+        crate::config::config_get_string(r, "core.symlinks")
+            .as_deref()
+            .map_or(true, crate::userdiff::config_bool)
+    }
+    match repo {
+        Some(r) => read(Some(r)),
+        None => read(crate::setup::discover().ok().as_ref()),
+    }
+}
+
 fn trust_executable_bit(repo: Option<&gix::Repository>) -> bool {
     fn read(r: Option<&gix::Repository>) -> bool {
         crate::config::config_get_string(r, "core.fileMode")
@@ -5110,12 +5128,12 @@ fn write_created(path: &Path, mode: u32, data: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    if mode & 0o170000 == 0o120000 {
+    if mode & 0o170000 == 0o120000 && !SYMLINKS_OFF.load(std::sync::atomic::Ordering::Relaxed) {
         let target = String::from_utf8_lossy(data).into_owned();
         std::os::unix::fs::symlink(&target, path)?;
         return Ok(());
     }
-    let perm = if mode & 0o100 != 0 { 0o777 } else { 0o666 };
+    let perm = if mode & 0o100 != 0 && mode & 0o170000 != 0o120000 { 0o777 } else { 0o666 };
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

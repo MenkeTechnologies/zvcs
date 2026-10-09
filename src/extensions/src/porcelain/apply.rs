@@ -1077,6 +1077,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
     // as `apply_option_parse_directory()` leaves it.
     let apply_root = o.directory.clone().unwrap_or_default();
     if !prefix.is_empty() {
+        // `OPT_FILENAME` hands the value through `fix_filename(prefix, …)`, so a relative
+        // `--build-fake-ancestor` names a file under the directory `apply` was typed in.
+        if let Some(path) = o.fake_ancestor.as_mut() {
+            if !std::path::Path::new(path.as_str()).is_absolute() {
+                *path = format!("{prefix}{path}");
+            }
+        }
         for src in &mut sources {
             if src != "-" && !std::path::Path::new(src.as_str()).is_absolute() {
                 *src = format!("{prefix}{src}");

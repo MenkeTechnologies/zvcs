@@ -22,8 +22,9 @@
 //! `--pathspec-from-file` and `--pathspec-file-nul`) puts its message and the
 //! block on stderr, also 129; `` error: option `no-cached' takes no
 //! value `` and `` error: option `pathspec-from-file' requires a value `` are
-//! `PARSE_OPT_ERROR` and print no block at all. An empty or missing pathspec
-//! exits 128 ("No pathspec was given").
+//! `PARSE_OPT_ERROR` and print no block at all. With no pathspec at all, a command run below
+//! the top level takes its own directory as the pathspec (`PATHSPEC_PREFER_CWD`); at the top
+//! level it exits 128 ("No pathspec was given").
 //!
 //! The name is looked up in the option table *before* any `=<value>` is split
 //! off, which is what `parse_long_opt()` does and what keeps a value-carrying
@@ -314,6 +315,17 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         return Ok(fatal("the option '--pathspec-file-nul' requires '--pathspec-from-file'"));
     }
 
+    // `PATHSPEC_PREFER_CWD`: with no pathspec argument, a command run from a subdirectory takes
+    // that directory (its prefix) as the pathspec. The engine resolves a pattern against the
+    // current directory, so it is handed `.`; messages still name the prefix, as git's
+    // `item->original` does.
+    let mut prefix_shown: Option<String> = None;
+    if pathspecs.is_empty() && opts.pathspec_from_file.is_none() {
+        if let Some(prefix) = crate::setup::startup_prefix(&repo).filter(|p| !p.is_empty()) {
+            pathspecs.push(".".to_owned());
+            prefix_shown = Some(prefix);
+        }
+    }
     if pathspecs.is_empty() {
         return Ok(fatal("No pathspec was given. Which files should I remove?"));
     }
@@ -530,6 +542,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let mut seen_any = false;
     let mut only_match_skip_worktree: Vec<String> = Vec::new();
     for (idx, raw) in pathspecs.iter().enumerate() {
+        let shown = prefix_shown.as_deref().unwrap_or(raw);
         // Exclusions are judged like every other item: `seen[]` holds them as matched once
         // anything hit a positive item (dir.c:564-565), which is what makes them optional.
         if is_exclude[idx] && all_exclude {
@@ -543,12 +556,12 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         } else if sparse_seen[idx] {
             // Matched only entries the sparse-checkout definition excludes: git
             // defers to `advise_on_updating_sparse_paths()` instead of dying.
-            only_match_skip_worktree.push(raw.clone());
+            only_match_skip_worktree.push(shown.to_owned());
         } else {
-            return Ok(fatal(format!("pathspec '{raw}' did not match any files")));
+            return Ok(fatal(format!("pathspec '{shown}' did not match any files")));
         }
         if !opts.recursive && how == RECURSIVELY {
-            return Ok(fatal(format!("not removing '{raw}' recursively without -r")));
+            return Ok(fatal(format!("not removing '{shown}' recursively without -r")));
         }
     }
     // The all-exclusions case: git treats the implicit whole-tree match as `.`.

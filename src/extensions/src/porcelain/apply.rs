@@ -4665,7 +4665,11 @@ fn worktree_prefix() -> Result<String> {
     let Some(workdir) = repo.workdir() else {
         return Ok(String::new());
     };
-    let root = workdir.canonicalize()?;
+    // A work tree that does not exist (`--work-tree=<missing>`) cannot be entered; git leaves the
+    // process where it stands and takes the patch's paths as given.
+    let Ok(root) = workdir.canonicalize() else {
+        return Ok(String::new());
+    };
     let here = std::env::current_dir()?.canonicalize()?;
     let Ok(rel) = here.strip_prefix(&root) else {
         return Ok(String::new());

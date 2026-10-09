@@ -40,21 +40,15 @@
 //!   An ambiguous name (`--=x`, whose option name is empty and so prefixes both)
 //!   is `PARSE_OPT_HELP_ERROR`: `error: ambiguous option: …` and the usage block
 //!   both on stderr, exit 129.
-//!
-//! ### Honest limitations
-//!
-//! * A rejected comment string (empty, or containing a newline) reports git's
-//!   `error:` line verbatim and exits 128, but the following `fatal:` line omits
-//!   the config line number for file-backed sections — `gix_config` does not
-//!   expose one — so it reads `bad config variable '<var>' in file '<path>'`
-//!   where git appends ` at line <n>`. The command-line and environment forms
-//!   match git exactly.
+//! * `-s` / `-c` run `git_default_config()` over every configured value, so a value it
+//!   refuses (`core.quotePath=input`, `push.default=bogus`, a bad `core.commentChar`) is
+//!   fatal at 128 with git's diagnostic; the default mode never reads configuration.
 
 use anyhow::Result;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use gix::config::{File as ConfigFile, Source};
+use gix::config::File as ConfigFile;
 
 /// Stock git's `stripspace` usage block, byte-for-byte, including the trailing
 /// blank line. Printed on `-h` (stdout) and for a usage error (stderr).
@@ -64,9 +58,6 @@ const USAGE: &str = "usage: git stripspace [-s | --strip-comments]\n\
                      \x20   -s, --strip-comments  skip and remove all lines starting with comment character\n\
                      \x20   -c, --comment-lines   prepend comment character and space to each line\n\
                      \n";
-
-/// git's exit code for a `die()`.
-const FATAL: u8 = 128;
 
 /// git's compiled-in comment string, and what `auto` resolves to here.
 const DEFAULT_COMMENT: &[u8] = b"#";
@@ -178,10 +169,7 @@ pub fn stripspace(args: &[String]) -> Result<ExitCode> {
     }
     let comment = match mode {
         Mode::Default => None,
-        _ => match comment_string()? {
-            Ok(comment) => Some(comment),
-            Err(code) => return Ok(code),
-        },
+        _ => Some(comment_string()?),
     };
 
     let mut input = Vec::new();
@@ -368,9 +356,8 @@ fn cleanup(line: &[u8]) -> usize {
 /// absent value. Every occurrence is validated as it is seen, so a bad value
 /// that a later section overrides is still fatal.
 ///
-/// The outer `Result` carries an I/O failure; the inner one carries git's
-/// already-reported exit code.
-fn comment_string() -> Result<Result<Vec<u8>, ExitCode>> {
+/// Rejection of a bad value is `default_config`'s job, run first on the same walk.
+fn comment_string() -> Result<Vec<u8>> {
     // Like `setup_git_directory_gently()`: a repository is preferred, but the
     // command is legal outside one, where git reads the global set plus the
     // `GIT_CONFIG_*` overrides.
@@ -378,9 +365,16 @@ fn comment_string() -> Result<Result<Vec<u8>, ExitCode>> {
     // `-s` and `-c` are the only modes that run that setup
     // (builtin/stripspace.c:56-59), after option parsing.
     crate::config::check_bare_and_worktree()?;
-    let config = match crate::setup::discover() {
-        Ok(repo) => repo.config_snapshot().plumbing().clone(),
-        Err(_) => {
+    let repo = crate::setup::discover().ok();
+    // `repo_config(the_repository, git_default_config, NULL)` (builtin/stripspace.c:57)
+    // walks every value in parse order and refuses the first one the callback rejects,
+    // `core.commentChar` among them — so the comment string resolved below is already
+    // validated, and so is every other key `git_default_config()` checks.
+    crate::default_config::validate_values(crate::config::walk_config_gently(repo.as_ref()))
+        .map_err(crate::default_config::Rejection::into_error)?;
+    let config = match repo {
+        Some(repo) => repo.config_snapshot().plumbing().clone(),
+        None => {
             let mut file = ConfigFile::from_globals()?;
             file.append(ConfigFile::from_environment_overrides()?)?;
             file
@@ -425,38 +419,12 @@ fn comment_string() -> Result<Result<Vec<u8>, ExitCode>> {
             let value: &[u8] = value.as_slice();
             if value.eq_ignore_ascii_case(b"auto") {
                 chosen = DEFAULT_COMMENT.to_vec();
-            } else if value.is_empty() {
-                return Ok(Err(config_fatal(
-                    var,
-                    "must have at least one character",
-                    section.meta(),
-                )));
-            } else if value.contains(&b'\n') {
-                return Ok(Err(config_fatal(
-                    var,
-                    "cannot contain newline",
-                    section.meta(),
-                )));
             } else {
                 chosen = value.to_vec();
             }
         }
     }
 
-    Ok(Ok(chosen))
+    Ok(chosen)
 }
 
-/// Report a rejected comment string as git does — the `error:` reason, then a
-/// `fatal:` naming where the value came from — and yield exit 128.
-fn config_fatal(var: &str, reason: &str, meta: &gix::config::file::Metadata) -> ExitCode {
-    let origin = match meta.source {
-        Source::Cli | Source::Env => format!("unable to parse '{var}' from command-line config"),
-        _ => match &meta.path {
-            Some(path) => format!("bad config variable '{var}' in file '{}'", path.display()),
-            None => format!("bad config variable '{var}'"),
-        },
-    };
-    eprintln!("error: {var} {reason}");
-    eprintln!("fatal: {origin}");
-    ExitCode::from(FATAL)
-}

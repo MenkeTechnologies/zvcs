@@ -1,7 +1,8 @@
-//! `cmd_cat_file()` runs `parse_options()` before any repository setting is read, so an
-//! option it refuses (a cmdmode conflict, an unknown option, a missing value) is the 129 no
-//! configuration value can pre-empt. zvcs ran its settings gate first and died at 128 on
-//! `index.sparse = <overflowing number>`.
+//! `cmd_cat_file()` reads `git_default_config` first, then runs `parse_options()`, and only then
+//! reaches `prepare_repo_settings()`. So an option it refuses (a cmdmode conflict, an unknown
+//! option, a missing value) is the 129 a bad settings value (`index.sparse = <overflowing
+//! number>`) cannot pre-empt, while a bad default-config value (`core.bare = auto`) still
+//! precedes it. zvcs ran its settings gate first and died at 128 on the former.
 #![cfg(unix)]
 
 #[path = "support/stock_git.rs"]
@@ -43,4 +44,26 @@ fn refused_options_win_over_a_bad_setting_and_valid_ones_still_hit_it() {
     );
     let reached = s.git_env(&env, &["cat-file", "-s", "HEAD"]);
     assert_eq!(reached.code, 128, "{reached:?}");
+}
+
+#[test]
+fn a_bad_default_config_value_still_precedes_the_option_parse() {
+    let Some((s, z)) = world("cat-file-default-config-first") else { return };
+    for side in [&s, &z] {
+        std::fs::write(side.root.join("global.config"), "[core]\n\tbare = auto\n").unwrap();
+    }
+    let run = |side: &Side, args: &[&str]| {
+        let global = side.root.join("global.config");
+        side.git_env(&[("GIT_CONFIG_GLOBAL", global.to_str().unwrap())], args)
+    };
+    for args in [
+        &["cat-file", "-s", "-t", "HEAD"][..],
+        &["cat-file", "--batch-command", "-p", "--batch-command", "--batch-check"],
+        &["cat-file", "--bogus"],
+        &["cat-file", "-h"],
+    ] {
+        let want = run(&s, args);
+        assert_eq!(want.code, 128, "{args:?}: {want:?}");
+        assert_eq!(run(&z, args), want, "{args:?}");
+    }
 }

@@ -243,8 +243,7 @@ struct Parsed<'a> {
 }
 
 /// `parse_options()` alone: what it refuses is the exit code in `Err`, the diagnostic already
-/// printed. `cmd_cat_file()` runs it before any repository setting is read, so the
-/// dispatcher runs it ahead of its config gates ([`options_refused`]).
+/// printed.
 fn parse(args: &[String]) -> std::result::Result<Parsed<'_>, ExitCode> {
     let mut mode: Option<Mode> = None;
     let mut batch: Option<BatchKind> = None;
@@ -471,11 +470,6 @@ fn parse(args: &[String]) -> std::result::Result<Parsed<'_>, ExitCode> {
     })
 }
 
-/// The exit code of an option `parse_options()` refuses, or `None` when the command line parses.
-pub fn options_refused(args: &[String]) -> Option<ExitCode> {
-    parse(args).err()
-}
-
 /// `git cat-file` — inspect objects in the database.
 ///
 /// Implemented modes:
@@ -536,6 +530,14 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         Ok(parsed) => parsed,
         Err(code) => return Ok(code),
     };
+
+    // `cmd_cat_file()` runs `git_default_config` first (the dispatcher's gate) and reaches
+    // `prepare_repo_settings()` only after `parse_options()`, so a refused option is the 129 a
+    // bad settings value cannot pre-empt. The dispatcher leaves `cat-file` to this order
+    // (`parse_before_settings`).
+    if let Ok(repo) = crate::setup::discover() {
+        crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
+    }
 
     // ---- cross-option validation, in git's order ---------------------------
 

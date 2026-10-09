@@ -1614,7 +1614,7 @@ pub(crate) fn refuse_branch_in_other_worktree(
 /// the shorthand at all, or when HEAD's reflog does not hold that many branch
 /// switches — `interpret_nth_prior_checkout()` returns -1 there and git leaves
 /// the operand alone.
-fn expand_prev_branch(repo: &gix::Repository, arg: &str) -> Option<String> {
+pub(super) fn expand_prev_branch(repo: &gix::Repository, arg: &str) -> Option<String> {
     let dashed = if arg == "-" { "@{-1}" } else { arg };
     let (nth, used) = super::check_ref_format::parse_nth_prior(dashed.as_bytes())?;
     let mut branch = super::check_ref_format::nth_branch_switch(repo, nth)?;

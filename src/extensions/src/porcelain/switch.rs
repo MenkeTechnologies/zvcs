@@ -861,7 +861,12 @@ fn switch_create(
     if positionals.len() > 1 {
         return fatal("only one reference expected");
     }
-    let start = positionals.first().copied();
+    // `setup_branch_path()` expands `@{-N}` into the branch (or id) it names, and that is the
+    // spelling the branch reflog and the merge labels carry.
+    let typed = positionals.first().copied().map(dash_is_previous_branch);
+    let expanded: Option<String> =
+        typed.map(|t| super::checkout::expand_prev_branch(repo, t).unwrap_or_else(|| t.to_string()));
+    let start = expanded.as_deref();
     let full = format!("refs/heads/{branch}");
 
     if let Some(code) = reject_invalid_branch_name(repo, branch) {
@@ -1109,6 +1114,7 @@ fn switch_detach(
         // name resolves without the odb, so `git switch --detach <absent-sha>` is
         // git's `unable to read tree`, not `invalid reference`.
         Some(s) => {
+            let s = dash_is_previous_branch(s);
             let Some(id) = super::branch::get_oid_mb(repo, s) else {
                 // `--detach` does not turn the `--guess` DWIM off: `dwim_ok` is
                 // `!patch_mode && dwim_new_local_branch && track == UNSPECIFIED &&
@@ -1192,7 +1198,12 @@ fn switch_detach(
     // git logs the name the caller typed, not the id it resolved to — `switch
     // --detach HEAD~1` records `to HEAD~1`, and a bare `--detach` (which detaches
     // where `HEAD` already is) records `to HEAD`.
-    let to_desc = positionals.first().copied().unwrap_or("HEAD").to_string();
+    // `setup_branch_path()` has by then run `@{-N}` through `strbuf_branchname()`, so the log
+    // names the branch (or the id) the shorthand stood for.
+    let to_desc = match positionals.first().copied() {
+        Some(typed) => super::checkout::expand_prev_branch(repo, typed).unwrap_or_else(|| typed.to_string()),
+        None => "HEAD".to_string(),
+    };
     set_head_detached(
         repo,
         target_id,
@@ -1225,6 +1236,14 @@ fn switch_detach(
     ))
 }
 
+/// `parse_branchname_arg()` reads a lone `-` as `@{-1}`, the branch checked out before this one,
+/// for the start-point of `-c`/`-C`, the commit of `--detach` and the refused one of `--orphan`
+/// alike (builtin/checkout.c: `if (!strcmp(arg, "-")) arg = "@{-1}";`); the diagnostics name
+/// the argument as rewritten.
+fn dash_is_previous_branch(arg: &str) -> &str {
+    if arg == "-" { "@{-1}" } else { arg }
+}
+
 /// `git switch --orphan <new>` — point `HEAD` at an unborn branch and clear the
 /// tracked worktree and index.
 fn switch_orphan(
@@ -1236,7 +1255,7 @@ fn switch_orphan(
 ) -> Result<ExitCode> {
     // `--orphan` takes no start-point; a resolvable extra arg is a start-point
     // error, an unresolvable one is a bad reference (git's evaluation order).
-    if let Some(p) = positionals.first().copied() {
+    if let Some(p) = positionals.first().copied().map(dash_is_previous_branch) {
         let Some(id) = super::branch::get_oid_mb(repo, p) else {
             return fatal(format!("invalid reference: {p}"));
         };

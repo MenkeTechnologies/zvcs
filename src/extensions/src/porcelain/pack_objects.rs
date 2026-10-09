@@ -5677,7 +5677,7 @@ pub(super) fn gently_parse_filter(arg: &[u8]) -> Result<(), String> {
 /// argument as written, which is why `--index-version=-1` reports "unsupported"
 /// (the unsigned read wraps past 2) rather than "bad".
 fn check_index_version(v: &str) -> Option<ExitCode> {
-    let (version, rest) = strtoul(v);
+    let (version, rest) = strtoul(v, 10);
     if version > 2 {
         return Some(fatal(&format!("unsupported index version {v}")));
     }
@@ -5685,7 +5685,7 @@ fn check_index_version(v: &str) -> Option<ExitCode> {
     // The `,<offset>` tail is only read when a digit could follow the comma; a
     // bare trailing comma is left in `rest` and reported as a bad version.
     let (off32_limit, rest) = match rest.strip_prefix(',').filter(|t| !t.is_empty()) {
-        Some(tail) => strtoul(tail),
+        Some(tail) => strtoul(tail, 0),
         None => (0, rest),
     };
     if !rest.is_empty() || off32_limit & 0x8000_0000 != 0 {
@@ -5694,33 +5694,46 @@ fn check_index_version(v: &str) -> Option<ExitCode> {
     None
 }
 
-/// C's `strtoul` over a base-10 prefix of `s`: an optional sign, then digits,
-/// wrapping on overflow and on a negative sign. Returns the value and the
-/// unconsumed remainder (which is all of `s` when there are no digits).
-fn strtoul(s: &str) -> (u64, &str) {
+/// C's `strtoul(s, &end, base)` for base 10 or 0 (`0x` hex, leading-`0` octal, else decimal): an
+/// optional sign, then digits, wrapping on overflow and on a negative sign. Returns the value
+/// and the unconsumed remainder (which is all of `s` when there are no digits).
+fn strtoul(s: &str, base: u32) -> (u64, &str) {
+    let original = s;
+    // `strtoul` skips leading `isspace` bytes before the sign.
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     let (negative, digits_at) = match s.as_bytes().first() {
         Some(b'-') => (true, 1),
         Some(b'+') => (false, 1),
         _ => (false, 0),
     };
-    let digits: String = s[digits_at..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let unsigned = &s[digits_at..];
+    let (radix, prefix) = if base == 0 && (unsigned.starts_with("0x") || unsigned.starts_with("0X")) {
+        (16, 2)
+    } else if base == 0 && unsigned.starts_with('0') {
+        (8, 0)
+    } else {
+        (10, 0)
+    };
+    let digits: String = unsigned[prefix..].chars().take_while(|c| c.is_digit(radix)).collect();
+    if digits.is_empty() && prefix == 2 {
+        // `0x` without a hex digit converts just the `0`.
+        return (0, &unsigned[1..]);
+    }
     if digits.is_empty() {
-        return (0, s);
+        // No conversion: `endptr` is the start of the string, whitespace included.
+        return (0, original);
     }
 
     let mut value: u64 = 0;
     for c in digits.chars() {
         value = value
-            .wrapping_mul(10)
-            .wrapping_add(u64::from(c as u8 - b'0'));
+            .wrapping_mul(u64::from(radix))
+            .wrapping_add(u64::from(c.to_digit(radix).unwrap_or(0)));
     }
     if negative {
         value = 0u64.wrapping_sub(value);
     }
-    (value, &s[digits_at + digits.len()..])
+    (value, &unsigned[prefix + digits.len()..])
 }
 
 /// Record the effect of long option `long`; `on` is false for the `--no-` form.
@@ -5809,7 +5822,7 @@ fn set_long(long: &str, value: Option<&str>, on: bool, st: &mut State) {
         "reuse-object" => st.reuse_object = Some(on),
         // Already validated by `check_index_version`, so the `strtoul` prefix is
         // the version and the rest is the `,<offset>` tail.
-        "index-version" => st.index_version = value.map(|v| strtoul(v).0),
+        "index-version" => st.index_version = value.map(|v| strtoul(v, 10).0),
         _ => {}
     }
 }

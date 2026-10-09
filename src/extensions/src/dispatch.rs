@@ -713,6 +713,12 @@ enum ConfigCallback {
 /// through the diff it runs: the choice here is per verb, and taking the
 /// narrower layer under-matches on that one subcommand rather than refusing
 /// `stash list` for a key git lets through.
+/// The first token of a `reflog` command line that is not the verb itself: the subcommand, or
+/// whatever `cmd_reflog()` treats as the implied `show`'s first argument.
+fn reflog_subcommand(args: &[String]) -> Option<&str> {
+    args.iter().map(String::as_str).find(|a| *a != "reflog")
+}
+
 fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
     match sub {
         // `cmd_reflog()` hands `show` — named, or implied by a first token that is
@@ -721,15 +727,10 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         // (builtin/log.c:792). `list`, `exists`, `expire`, `delete`, `drop` and
         // `write` install no diff callback, and stock 2.55.0 runs them under
         // `-c color.diff=bogus` at exit 0 where `reflog` and `reflog show` die.
-        "reflog" => {
-            let first = args.iter().map(String::as_str).find(|a| *a != "reflog");
-            match first {
-                Some("list" | "exists" | "expire" | "delete" | "drop" | "write") => {
-                    ConfigCallback::Default
-                }
-                _ => ConfigCallback::Log,
-            }
-        }
+        "reflog" => match reflog_subcommand(args) {
+            Some("list" | "exists" | "expire" | "delete" | "drop" | "write") => ConfigCallback::Default,
+            _ => ConfigCallback::Log,
+        },
         "status" => ConfigCallback::Status,
         "commit" => ConfigCallback::Commit,
         "checkout" | "switch" | "restore" => ConfigCallback::Checkout,
@@ -1683,10 +1684,20 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // `cmd_worktree()`'s top-level `parse_options()` refuses a missing or unknown
         // subcommand and any option ahead of it before a subcommand reads the settings.
         || (sub == "worktree" && crate::porcelain::worktree_top_level_refused(args));
-    let settings_help_skip =
-        (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub)) || parse_before_config || parse_before_settings;
+    // `cmd_reflog()` hands `list`, `exists`, `delete`, `drop` and `write` to subcommands that
+    // never call `git_default_config` (builtin/reflog.c), so no config value is refused for them
+    // — `-c color.advice.reset=off reflog list` lists. `list`, `exists` and `drop` read no object
+    // either, so the settings block is never prepared for them; `delete` and `write` still reach it
+    // through the object lookup, and `expire` through both.
+    let reflog_sub = (sub == "reflog").then(|| reflog_subcommand(args)).flatten();
+    let reflog_no_config = matches!(reflog_sub, Some("list" | "exists" | "delete" | "drop" | "write"));
+    let reflog_no_settings = matches!(reflog_sub, Some("list" | "exists" | "drop"));
+    let settings_help_skip = (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub))
+        || parse_before_config
+        || parse_before_settings
+        || reflog_no_settings;
     let config_help_skip =
-        (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config;
+        (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config || reflog_no_config;
     let in_repo_settings =
         !settings_help_skip && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
     // `git_default_config()`'s own two keys (`crate::default_config`) are checked

@@ -1148,6 +1148,7 @@ fn revert_one(
         return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
     }
     crate::merge_apply::ui_diff_algorithm_check(repo)?;
+    crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
     // `do_recursive_merge()` hands every `-X` to `parse_merge_opt()` for a revert as
     // it does for a pick, and discards the result, so an unknown one is ignored.
     let mut strategy = super::merge_tree::StrategyOptions::default();

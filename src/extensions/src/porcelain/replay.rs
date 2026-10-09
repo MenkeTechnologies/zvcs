@@ -786,6 +786,11 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         HashMap::new()
     };
 
+    // `init_basic_merge_options()` reads the merge configuration, `merge.conflictStyle` included.
+    if let Some(code) = super::merge::merge_recursive_config_check(&repo) {
+        return Ok(code);
+    }
+    crate::merge_apply::validate_conflict_style(&repo).map_err(|r| r.into_error())?;
     let merge_options = repo.tree_merge_options()?;
     let mut replayed: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut last_commit = onto;

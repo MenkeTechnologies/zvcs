@@ -635,6 +635,7 @@ fn resolve_outcome<'repo>(
         if let Some(code) = super::merge::merge_recursive_config_check(repo) {
             return Ok(Err(code));
         }
+        crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
         let (base, theirs) = strategy.shift(repo, ours, base, theirs)?;
         (
             crate::merge_apply::merge_trees(repo, base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?,
@@ -655,6 +656,7 @@ fn resolve_outcome<'repo>(
         if let Some(code) = super::merge::merge_recursive_config_check(repo) {
             return Ok(Err(code));
         }
+        crate::merge_apply::validate_conflict_style(repo).map_err(|r| r.into_error())?;
         let bases = repo.merge_bases_many(ours, &[theirs])?;
         if !allow_unrelated && bases.is_empty() {
             eprintln!("fatal: refusing to merge unrelated histories");

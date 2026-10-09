@@ -513,9 +513,6 @@ pub fn validate_conflict_style(repo: &gix::Repository) -> Result<(), crate::defa
     Ok(())
 }
 
-/// The shared body: merge the trees, report, then (unless the guard refuses)
-/// move the worktree and index onto the result.
-#[allow(clippy::too_many_arguments)]
 /// `repo.merge_trees()` for the verbs that run merge-ort, with merge-ort's first
 /// `git_check_attr()` in front of it.
 ///
@@ -545,6 +542,9 @@ pub(crate) fn merge_trees<'r>(
     Ok(repo.merge_trees(base, ours, theirs, labels, options)?)
 }
 
+/// The shared body: merge the trees, report, then (unless the guard refuses)
+/// move the worktree and index onto the result.
+#[allow(clippy::too_many_arguments)]
 fn merge_and_apply(
     repo: &gix::Repository,
     base_tree: ObjectId,

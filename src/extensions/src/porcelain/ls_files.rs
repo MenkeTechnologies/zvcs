@@ -535,14 +535,17 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             "--no-with-tree" => opts.with_tree = None,
             _ if s.starts_with("--abbrev=") => {
                 let raw = &s["--abbrev=".len()..];
-                let Ok(n) = raw.parse::<usize>() else {
+                // The `strtol`-then-narrow quirks live in one place; see
+                // [`crate::abbrev::parse_opt_abbrev_value`].
+                let Some(n) = crate::abbrev::parse_opt_abbrev_value(raw) else {
                     return Ok(option_error("option `abbrev' expects a numerical value"));
                 };
-                // git maps `--abbrev=0` to "print the full object name".
+                // git maps `--abbrev=0` to "print the full object name"; a negative value
+                // is raised to the minimum like any other short one.
                 opts.abbrev = if n == 0 {
                     None
                 } else {
-                    Some(Some(n.max(MINIMUM_ABBREV)))
+                    Some(Some((n.max(MINIMUM_ABBREV as i32)) as usize))
                 };
             }
             _ if s.starts_with("--") => {

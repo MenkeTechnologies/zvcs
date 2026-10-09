@@ -328,6 +328,13 @@ fn cmd_diff(repo: &gix::Repository) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `rerere_clear(the_repository, &merge_rr)` as `git rebase --skip` and `--abort` call it: a
+/// configuration `setup_rerere()` cannot read is the `fatal:`, otherwise the incomplete records
+/// and `MERGE_RR` go.
+pub(super) fn rerere_clear(repo: &gix::Repository) -> Result<()> {
+    cmd_clear(repo).map(|_| ())
+}
+
 /// `rerere_clear()`: forget every record whose resolution was never completed,
 /// then drop `MERGE_RR` itself.
 fn cmd_clear(repo: &gix::Repository) -> Result<ExitCode> {

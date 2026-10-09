@@ -3810,6 +3810,8 @@ fn write_autostash_in(dir: &std::path::Path, oid: ObjectId) -> Result<()> {
 /// re-attach `HEAD`, clear the merge state the stop recorded, and drop the state
 /// directory.
 fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
+    // `ACTION_ABORT` opens with `rerere_clear(the_repository, &merge_rr)`.
+    super::rerere::rerere_clear(repo)?;
     let st = read_basic_state(repo)?;
     let should_interrupt = AtomicBool::new(false);
     let old_index = repo.index_or_load_from_head()?.into_owned();
@@ -4354,6 +4356,7 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
         }
         ModeOption::Abort => {
             // `rerere_clear(&merge_rr)`.
+            super::rerere::rerere_clear(repo)?;
             let _ = std::fs::remove_file(repo.git_dir().join("MERGE_RR"));
             reset_to_orig_head(repo, st.orig_head, st.head_name.as_deref())?;
             // `remove_branch_state(the_repository, 0)` (branch.c:874-879), its
@@ -4398,6 +4401,7 @@ fn rebase_apply_resume(repo: &gix::Repository, action: ModeOption) -> Result<Exi
         // `ACTION_SKIP`'s `reset_head(RESET_HEAD_HARD)` before the `am --skip`:
         // `am` does its own `clean_index`, but git discards the worktree here
         // first so a half-applied patch cannot survive into the next one.
+        super::rerere::rerere_clear(repo)?;
         let _ = std::fs::remove_file(repo.git_dir().join("MERGE_RR"));
     }
     match run_am_resume(&a, skip)? {
@@ -4875,6 +4879,10 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
     // `error:` pair. `refresh_index()` prints its own `<path>: needs merge` line
     // for every unmerged path first, also on stdout. `ACTION_SKIP` runs no such
     // check: it throws the half-applied work away regardless.
+    // `ACTION_SKIP` opens with `rerere_clear(the_repository, &merge_rr)`.
+    if skip {
+        super::rerere::rerere_clear(repo)?;
+    }
     if !skip {
         let (unstaged, _staged, conflicts) = dirty_state(repo)?;
         for path in &conflicts {

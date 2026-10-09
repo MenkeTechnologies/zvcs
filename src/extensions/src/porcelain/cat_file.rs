@@ -541,7 +541,10 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    if batch.is_some() && !all_objects && !positional.is_empty() {
+    // The arity check hangs off the no-`opt` arm: `--textconv`/`--filters` fill `opt` (they
+    // are `cmdmode` options), so a batch run under either never reaches it and its
+    // positionals are ignored.
+    if batch.is_some() && !all_objects && transform.is_none() && !positional.is_empty() {
         return die_usage("batch modes take no arguments");
     }
 

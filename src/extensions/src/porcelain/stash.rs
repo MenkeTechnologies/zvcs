@@ -1544,7 +1544,14 @@ fn build_stash_commit(
     // (`-S` whose `apply -R` cannot place its patch never gets as far as the reset, yet
     // stock's index is 19 bytes longer than it was). Without this the port left the root
     // marked invalid where stock had recorded the tree.
-    if let Ok(mut index) = repo.open_index() {
+    // A missing index file reads as an empty index (`repo_read_index()`), and the same
+    // `write_index_as_tree()` then writes the empty one out, so every later reader finds it.
+    let index = match repo.open_index() {
+        Ok(index) => Some(index),
+        Err(_) if !repo.index_path().exists() => Some(gix::index::File::clone(&*repo.index_or_empty()?)),
+        Err(_) => None,
+    };
+    if let Some(mut index) = index {
         super::write_tree::update_cache_tree_if_stale(repo, &mut index)?;
     }
     let head_id = repo.head_id()?.detach();
@@ -1613,6 +1620,8 @@ fn build_stash_commit(
     // Build the index tree `I` = HEAD tree + staged changes.
     let mut affected: HashSet<BString> = HashSet::new();
     let mut i_editor = repo.edit_tree(head_tree_id)?;
+    // Paths the index lost relative to `HEAD`.
+    let mut staged_removed: Vec<BString> = Vec::new();
     for change in &staged {
         match change {
             ChangeRef::Addition { location, entry_mode, id, .. }
@@ -1625,6 +1634,7 @@ fn build_stash_commit(
             ChangeRef::Deletion { location, .. } => {
                 let path: BString = (**location).to_owned();
                 i_editor.remove(path.as_bstr())?;
+                staged_removed.push(path.clone());
                 affected.insert(path);
             }
             ChangeRef::Rewrite { source_location, location, entry_mode, id, .. } => {
@@ -1632,6 +1642,7 @@ fn build_stash_commit(
                 let path: BString = (**location).to_owned();
                 let oid: ObjectId = (**id).to_owned();
                 i_editor.remove(source.as_bstr())?;
+                staged_removed.push(source.clone());
                 i_editor.upsert(path.as_bstr(), entry_kind(*entry_mode)?, oid)?;
                 affected.insert(source);
                 affected.insert(path);
@@ -1639,6 +1650,16 @@ fn build_stash_commit(
         }
     }
     let i_tree_id = i_editor.write()?.detach();
+
+    // `stash_working_tree()` builds `W` from `diff-index HEAD` against the worktree, not from the
+    // index: a path `HEAD` has and the index lost (`git rm --cached`, or an index that is
+    // missing) is listed too, and `update-index --add --remove` takes whatever the worktree
+    // holds there back into `W`.
+    for path in staged_removed {
+        if !wt_mods.iter().any(|(known, _)| *known == path) {
+            wt_mods.push((path, false));
+        }
+    }
 
     // A pathspec narrows which *worktree* changes are taken and which paths are
     // reset — never the index tree above, which git always captures whole (a
@@ -2146,7 +2167,8 @@ fn refresh_and_write_index(repo: &gix::Repository) -> Result<()> {
 /// reaches it. See [`create_stash`] for the C and for why `push` answers
 /// differently.
 fn refuse_unmerged_create(repo: &gix::Repository) -> Result<Option<ExitCode>> {
-    let index = repo.open_index()?;
+    // A missing index file is an empty index, with nothing unmerged in it.
+    let index = repo.index_or_empty()?;
     let backing = index.path_backing();
     let stages: Vec<(&BStr, ObjectId)> = index
         .entries()
@@ -2208,7 +2230,16 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
     // `check_changes_tracked_files`: no tracked changes → nothing to create.
-    if !repo.is_dirty()? {
+    // A missing index file reads as an empty one, which differs from a non-empty `HEAD` tree by
+    // every one of its entries.
+    let dirty = match repo.is_dirty() {
+        Ok(dirty) => dirty,
+        Err(_) if !repo.index_path().exists() => {
+            !repo.index_from_tree(&repo.head_tree_id()?.detach())?.entries().is_empty()
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !dirty {
         return Ok(ExitCode::SUCCESS);
     }
     // `create_stash()` has no `repo_refresh_and_write_index()` gate of its own —

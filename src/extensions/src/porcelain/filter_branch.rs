@@ -742,10 +742,30 @@ fn require_clean_work_tree(repo: &gix::Repository) -> Result<()> {
         eprintln!("fatal: Needed a single revision");
         return Err(Exit(1).into());
     }
-    if let Ok(exe) = crate::hosted::git_exe() {
+    let exe = crate::hosted::git_exe().ok();
+    if let Some(exe) = &exe {
         let _ = Command::new(exe)
             .args(["update-index", "-q", "--ignore-submodules", "--refresh"])
             .status();
+    }
+    // The script judges by the exit status of the two `diff` children, so a child that dies on a
+    // config value it refuses (`diff.renameLimit=false`) counts as a difference and prints its own
+    // `fatal:` between the script's messages.
+    if let Some(exe) = &exe {
+        let differs = |args: &[&str]| !Command::new(exe).args(args).status().is_ok_and(|s| s.success());
+        let unstaged = differs(&["diff-files", "--quiet", "--ignore-submodules"]);
+        if unstaged {
+            eprintln!("Cannot rewrite branches: You have unstaged changes.");
+        }
+        let staged = differs(&["diff-index", "--cached", "--quiet", "--ignore-submodules", "HEAD", "--"]);
+        if staged {
+            if unstaged {
+                eprintln!("Additionally, your index contains uncommitted changes.");
+            } else {
+                eprintln!("Cannot rewrite branches: Your index contains uncommitted changes.");
+            }
+        }
+        return if unstaged || staged { Err(Exit(1).into()) } else { Ok(()) };
     }
     let (unstaged, staged) = dirty_state(repo)?;
     if unstaged {

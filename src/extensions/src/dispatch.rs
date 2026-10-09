@@ -497,6 +497,21 @@ const SETTINGS_ONLY_VERBS: &[&str] = &["mktree", "prune", "prune-packed"];
 /// (builtin/pull.c:1018) before anything that prepares the settings.
 const CONFIG_BEFORE_SETTINGS_VERBS: &[&str] = &["merge-ours", "pull"];
 
+/// The entries of [`REPO_SETTINGS_VERBS`] that run `git_config()` up front but prepare the
+/// settings block only with the first object they read, so a branch operand that resolves to
+/// nothing ends in `merge-tree: <name> - not something we can merge` ahead of a `core.*`
+/// value only the settings block refuses. Measured against git 2.55.0:
+///
+/// ```text
+/// $ git -c core.deltaBaseCacheLimit=no merge-tree nosuch main
+/// merge-tree: nosuch - not something we can merge
+/// $ git -c core.deltaBaseCacheLimit=no merge-tree main nosuch
+/// fatal: bad numeric config value 'no' for 'core.deltabasecachelimit': invalid unit
+/// ```
+///
+/// The refusal is left to the object store's first-use hook (`crate::setup`).
+const SETTINGS_ON_FIRST_OBJECT_VERBS: &[&str] = &["merge-tree"];
+
 /// Whether `sub` reads its configuration even when no repository was found.
 ///
 /// A `RUN_SETUP` builtin never gets that far — `setup_git_directory()` dies with
@@ -1772,7 +1787,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     let config_help_skip =
         (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config;
     let in_repo_settings =
-        !settings_help_skip && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
+        !settings_help_skip && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub)
+            && !SETTINGS_ON_FIRST_OBJECT_VERBS.contains(&sub);
     // `git_default_config()`'s own two keys (`crate::default_config`) are checked
     // while the config is *parsed*, so they refuse a much wider set of commands
     // than the settings block does — `branch` and `hash-object` die for them and

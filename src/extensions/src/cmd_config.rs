@@ -1580,14 +1580,32 @@ pub fn validate_merge_recursive(repo: &gix::Repository) -> Result<(), Rejection>
 /// Every occurrence is parsed, not just the last: an earlier bad value dies even when a
 /// later one would have replaced it.
 pub fn validate_reflog_expire(repo: &gix::Repository) -> Result<(), Rejection> {
+    reflog_expire_walk(repo, false)
+}
+
+/// [`validate_reflog_expire`] with the tail the C callback has: every value that is not
+/// one of the two expiry keys goes on to `git_default_config()` (reflog.c:47, :58), in
+/// the same parse order, so the first refusal of either kind is the one reported.
+pub fn validate_reflog_expire_chain(repo: &gix::Repository) -> Result<(), Rejection> {
+    reflog_expire_walk(repo, true)
+}
+
+fn reflog_expire_walk(repo: &gix::Repository, chain_default: bool) -> Result<(), Rejection> {
+    let mut resolved = defaults();
     for v in walk_config(repo) {
         let Some(rest) = v.key.strip_prefix("gc.") else {
+            if chain_default {
+                git_default_config(&v, &mut resolved)?;
+            }
             continue;
         };
         // `parse_config_key()`: the variable name is the last component, whatever
         // subsection precedes it.
         let name = rest.rsplit('.').next().unwrap_or(rest);
         if name != "reflogexpire" && name != "reflogexpireunreachable" {
+            if chain_default {
+                git_default_config(&v, &mut resolved)?;
+            }
             continue;
         }
         let Some(raw) = v.value.as_deref() else {

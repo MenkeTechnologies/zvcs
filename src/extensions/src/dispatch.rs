@@ -647,6 +647,10 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
 enum ConfigCallback {
     /// `git_default_config` (config.c's chain terminus).
     Default,
+    /// `git_ident_config` alone (builtin/reflog.c:421).
+    Ident,
+    /// `reflog_expire_config` (reflog.c:35) — the two `gc.reflogExpire*` keys, then the default.
+    ReflogExpire,
     /// `git_color_default_config`: `git_color_config` then the default.
     Color,
     /// `git_diff_basic_config`: the plumbing diff callback, no colour.
@@ -727,11 +731,17 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         // `cmd_reflog()` hands `show` — named, or implied by a first token that is
         // no subcommand — to `cmd_log_reflog()` (builtin/reflog.c:154, :491),
         // which runs `repo_config(the_repository, git_log_config, &cfg)`
-        // (builtin/log.c:792). `list`, `exists`, `expire`, `delete`, `drop` and
-        // `write` install no diff callback, and stock 2.55.0 runs them under
-        // `-c color.diff=bogus` at exit 0 where `reflog` and `reflog show` die.
+        // (builtin/log.c:792). `expire` runs `reflog_expire_config`
+        // (builtin/reflog.c:216), whose chain ends at `git_default_config`; `write`
+        // runs `git_ident_config` alone (builtin/reflog.c:421); `list`, `exists`,
+        // `delete` and `drop` read no callback at all. Measured on 2.54.0 with
+        // `-c core.ignorecase=bogus`, `-c core.abbrev=bogus` and
+        // `-c color.advice.reset=bogus`: those four exit 0, while `expire`, `show`
+        // and bare `reflog` die.
         "reflog" => match reflog_subcommand(args) {
-            Some("list" | "exists" | "expire" | "delete" | "drop" | "write") => ConfigCallback::Default,
+            Some("list" | "exists" | "delete" | "drop") => ConfigCallback::Verb,
+            Some("write") => ConfigCallback::Ident,
+            Some("expire") => ConfigCallback::ReflogExpire,
             _ => ConfigCallback::Log,
         },
         "status" => ConfigCallback::Status,
@@ -777,6 +787,22 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "add" | "stage" | "clean" | "show-branch" => ConfigCallback::Color,
         "patch-id" | "mailinfo" => ConfigCallback::Verb,
         _ => ConfigCallback::Default,
+    }
+}
+
+/// Whether a `reflog` invocation reaches the settings block. Measured on 2.54.0
+/// with `-c core.packedGitLimit=bogus`: `show`, `expire` with `--all` or a ref,
+/// `delete` of an `@{}` spec and `drop` of a ref die; `list`, `exists`, `write`,
+/// bare `expire`, `drop --all` and a `delete` of a name with no `@{` do not.
+fn reflog_reads_settings(args: &[String]) -> bool {
+    let rest: Vec<&str> = args.iter().map(String::as_str).skip_while(|a| *a == "reflog").skip(1).collect();
+    let positional = rest.iter().any(|a| !a.starts_with('-'));
+    match reflog_subcommand(args) {
+        Some("list" | "exists" | "write") => false,
+        Some("expire") => positional || rest.contains(&"--all"),
+        Some("delete") => rest.iter().any(|a| a.contains("@{")),
+        Some("drop") => positional,
+        _ => true,
     }
 }
 
@@ -1713,20 +1739,14 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // `cmd_worktree()`'s top-level `parse_options()` refuses a missing or unknown
         // subcommand and any option ahead of it before a subcommand reads the settings.
         || (sub == "worktree" && crate::porcelain::worktree_top_level_refused(args));
-    // `cmd_reflog()` hands `list`, `exists`, `delete`, `drop` and `write` to subcommands that
-    // never call `git_default_config` (builtin/reflog.c), so no config value is refused for them
-    // — `-c color.advice.reset=off reflog list` lists. `list`, `exists` and `drop` read no object
-    // either, so the settings block is never prepared for them; `delete` and `write` still reach it
-    // through the object lookup, and `expire` through both.
-    let reflog_sub = (sub == "reflog").then(|| reflog_subcommand(args)).flatten();
-    let reflog_no_config = matches!(reflog_sub, Some("list" | "exists" | "delete" | "drop" | "write"));
-    let reflog_no_settings = matches!(reflog_sub, Some("list" | "exists" | "drop"));
-    let settings_help_skip = (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub))
-        || parse_before_config
-        || parse_before_settings
-        || reflog_no_settings;
+    let reflog_no_settings = sub == "reflog" && !reflog_reads_settings(args);
+    let settings_help_skip =
+        (help_only && !SETTINGS_BEFORE_HELP_VERBS.contains(&sub))
+            || parse_before_config
+            || parse_before_settings
+            || reflog_no_settings;
     let config_help_skip =
-        (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config || reflog_no_config;
+        (help_only && HELP_BEFORE_CONFIG_VERBS.contains(&sub)) || parse_before_config;
     let in_repo_settings =
         !settings_help_skip && !rev_parse_no_setup && REPO_SETTINGS_VERBS.contains(&sub);
     // `git_default_config()`'s own two keys (`crate::default_config`) are checked
@@ -1827,6 +1847,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::FmtMergeMsg => {
                         crate::cmd_config::validate_fmt_merge_msg(&repo)
                     }
+                    ConfigCallback::ReflogExpire => crate::cmd_config::validate_reflog_expire_chain(&repo),
+                    ConfigCallback::Ident => crate::default_config::validate_ident(&repo),
                     ConfigCallback::Verb => Ok(()),
                 };
                 if let Err(rejection) = outcome {

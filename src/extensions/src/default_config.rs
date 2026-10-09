@@ -207,6 +207,18 @@ pub fn validate(repo: &gix::Repository) -> Result<DefaultConfig, Rejection> {
     validate_values(walk_config(repo))
 }
 
+/// `git_ident_config()` alone over every configured value, in parse order: the
+/// callback `git reflog write` installs (builtin/reflog.c:421) and nothing else.
+pub fn validate_ident(repo: &gix::Repository) -> Result<(), Rejection> {
+    for v in walk_config(repo) {
+        let key = v.key.as_str();
+        if key.starts_with("user.") || key.starts_with("author.") || key.starts_with("committer.") {
+            ident_config(&v, key)?;
+        }
+    }
+    Ok(())
+}
+
 /// [`validate`] over an already-walked configuration — the repository's, or
 /// [`crate::config::walk_config_gently`]'s read with no repository, which is
 /// what `repo_config(the_repository, git_default_config, NULL)` walks in a

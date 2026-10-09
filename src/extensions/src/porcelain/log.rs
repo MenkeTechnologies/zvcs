@@ -1145,6 +1145,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut log_encoding: Option<String> = None;
     // `diff_options.anchors` — the repeatable `--anchored=<text>` list.
     let mut anchors: Vec<String> = Vec::new();
+    // The first diff-option value check that failed after a revision had been read, with
+    // the number of revisions before it. `setup_revisions()` takes its arguments in order,
+    // so a revision before the option that fails to resolve dies first.
+    let mut deferred_opt_error: Option<(usize, String)> = None;
     let mut revs: Vec<String> = Vec::new();
     // Parallel to `revs`: whether a `--not` was in force when it was read, which
     // reverses the sense the `^` prefix would otherwise give it.
@@ -1447,8 +1451,13 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // `cmd_log` hands the whole argument list to `setup_revisions`, so a diff
         // option's value is validated here whether or not this command renders it.
         if let Some(line) = super::diff_optval::reject(a) {
-            eprintln!("{line}");
-            return Ok(ExitCode::from(129));
+            if revs.is_empty() {
+                eprintln!("{line}");
+                return Ok(ExitCode::from(129));
+            }
+            deferred_opt_error.get_or_insert((revs.len(), line));
+            i += 1;
+            continue;
         }
         // `handle_revision_opt()`'s count-and-age arm (revision.c:2341-2399):
         // `--max-count`, `--max-count-oldest`, `--skip`, `-<digits>`, `-n`, and
@@ -3414,6 +3423,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         if let Some(msg) = fatal_msg.take() {
             eprintln!("fatal: {msg}");
             return Ok(ExitCode::from(128));
+        }
+        if let Some((_, line)) = deferred_opt_error.as_ref().filter(|(pos, _)| *pos <= at) {
+            eprintln!("{line}");
+            return Ok(ExitCode::from(129));
         }
         // `handle_dotdot()` is the first thing `handle_revision_arg_1()` tries, so a
         // range whose endpoints resolve as names but not as usable objects dies here

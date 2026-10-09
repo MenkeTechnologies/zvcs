@@ -516,6 +516,35 @@ pub fn validate_conflict_style(repo: &gix::Repository) -> Result<(), crate::defa
 /// The shared body: merge the trees, report, then (unless the guard refuses)
 /// move the worktree and index onto the result.
 #[allow(clippy::too_many_arguments)]
+/// `repo.merge_trees()` for the verbs that run merge-ort, with merge-ort's first
+/// `git_check_attr()` in front of it.
+///
+/// `handle_content_merge()` calls `ll_merge()` for every blob both sides changed, and the
+/// attribute lookup there runs `compute_default_attr_source()`: an `--attr-source` (or
+/// `GIT_ATTR_SOURCE`) naming nothing resolvable is `die(_("bad --attr-source or
+/// GIT_ATTR_SOURCE"))` (attr.c:1201-1228). That happens while the merge is still collecting,
+/// before it writes a blob, a tree or a message, so nothing of the merge may reach the object
+/// store. gix writes the merged blob as it merges, hence the dry run: when the source is bad the
+/// merge is first run against an in-memory object store, and a content merge in it is the fatal.
+/// A merge with no content to merge goes on to run for real.
+pub(crate) fn merge_trees<'r>(
+    repo: &'r gix::Repository,
+    base: impl AsRef<gix::hash::oid>,
+    ours: impl AsRef<gix::hash::oid>,
+    theirs: impl AsRef<gix::hash::oid>,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    options: gix::merge::tree::Options,
+) -> Result<gix::merge::tree::Outcome<'r>> {
+    if let Some(message) = crate::porcelain::bad_default_attr_source(repo) {
+        let scratch = repo.clone().with_object_memory();
+        let dry = scratch.merge_trees(base.as_ref(), ours.as_ref(), theirs.as_ref(), labels, options.clone())?;
+        if crate::merge_msg::runs_content_merge(&dry.conflicts) {
+            return Err(crate::fatal::die(message.to_owned()));
+        }
+    }
+    Ok(repo.merge_trees(base, ours, theirs, labels, options)?)
+}
+
 fn merge_and_apply(
     repo: &gix::Repository,
     base_tree: ObjectId,
@@ -554,7 +583,8 @@ fn merge_and_apply(
     let label1 = labels.current.unwrap_or_default().to_string();
     let label2 = labels.other.unwrap_or_default().to_string();
 
-    let mut merge = repo.merge_trees(
+    let mut merge = merge_trees(
+        repo,
         base_tree,
         ours_tree,
         theirs_tree,

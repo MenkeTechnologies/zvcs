@@ -200,7 +200,7 @@ pub(super) fn pick_regular_commit(
     };
 
     let mut outcome =
-        repo.merge_trees(ancestor_tree, our_tree, their_tree, labels, merge_options.clone())?;
+        crate::merge_apply::merge_trees(repo, ancestor_tree, our_tree, their_tree, labels, merge_options.clone())?;
     // `merge_incore_nonrecursive()` produces `result->tree` whether or not the
     // merge came out clean — `pick_regular_commit` only inspects `result->clean`
     // afterwards — so the tree objects land in the odb either way. Writing after

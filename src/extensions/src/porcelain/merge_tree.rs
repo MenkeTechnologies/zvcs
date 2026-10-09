@@ -637,7 +637,7 @@ fn resolve_outcome<'repo>(
         }
         let (base, theirs) = strategy.shift(repo, ours, base, theirs)?;
         (
-            repo.merge_trees(base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?,
+            crate::merge_apply::merge_trees(repo, base, ours, theirs, labels, strategy.apply(repo.tree_merge_options()?)?)?,
             [base, ours, theirs],
         )
     } else {
@@ -688,7 +688,7 @@ fn resolve_outcome<'repo>(
         let theirs_tree = repo.find_commit(theirs)?.tree_id()?.detach();
         let (base, theirs_tree) = strategy.shift(repo, ours_tree, base, theirs_tree)?;
         (
-            repo.merge_trees(base, ours_tree, theirs_tree, labels, options)?,
+            crate::merge_apply::merge_trees(repo, base, ours_tree, theirs_tree, labels, options)?,
             [base, ours_tree, theirs_tree],
         )
     };

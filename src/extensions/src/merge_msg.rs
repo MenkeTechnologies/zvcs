@@ -145,6 +145,18 @@ pub fn render<'r, 's>(
     Ok(out)
 }
 
+/// Whether merge-ort ran `ll_merge()` for any of `conflicts`: a blob both sides changed, which is
+/// where `Auto-merging <path>` comes from (see [`render_one`]).
+pub fn runs_content_merge(conflicts: &[Conflict]) -> bool {
+    conflicts.iter().any(|c| {
+        matches!(
+            &c.resolution,
+            Ok(Resolution::OursModifiedTheirsModifiedThenBlobContentMerge { .. })
+                | Ok(Resolution::OursModifiedTheirsRenamedAndChangedThenRename { merged_blob: Some(_), .. })
+        ) && Stages::of(c).is_some_and(|s| s.needs_content_merge())
+    })
+}
+
 /// The messages for one conflict, or `None` when the class is not ported.
 fn render_one<'r, 's>(
     repo: &'r gix::Repository,

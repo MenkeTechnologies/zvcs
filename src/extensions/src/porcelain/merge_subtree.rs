@@ -301,7 +301,8 @@ pub fn merge_subtree(args: &[String]) -> Result<ExitCode> {
         current: Some(BStr::new(label1.as_bytes())),
         other: Some(BStr::new(label2.as_bytes())),
     };
-    let mut outcome = merge_repo.merge_trees(
+    let mut outcome = crate::merge_apply::merge_trees(
+        &merge_repo,
         base_shifted,
         head_tree,
         remote_shifted,

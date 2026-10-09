@@ -1311,7 +1311,8 @@ fn pick_one(
                 return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
             }
             crate::merge_apply::ui_diff_algorithm_check(repo)?;
-            let mut merge = repo.merge_trees(
+            let mut merge = crate::merge_apply::merge_trees(
+                repo,
                 base_tree,
                 head_tree,
                 pick_tree,

@@ -1154,7 +1154,8 @@ fn revert_one(
     for x in &o.xopts {
         strategy.absorb(x);
     }
-    let mut merge = repo.merge_trees(
+    let mut merge = crate::merge_apply::merge_trees(
+        repo,
         base_tree,
         ours_tree,
         theirs_tree,

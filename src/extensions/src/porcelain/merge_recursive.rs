@@ -354,7 +354,7 @@ pub fn merge_recursive(args: &[String]) -> Result<ExitCode> {
             current: Some(BStr::new(label1.as_bytes())),
             other: Some(BStr::new(label2.as_bytes())),
         };
-        merge_repo.merge_trees(base_tree, head_tree, remote_tree, labels, tree_options)?
+        crate::merge_apply::merge_trees(&merge_repo, base_tree, head_tree, remote_tree, labels, tree_options)?
     };
 
     // Render every message first: an unrenderable conflict class must fail

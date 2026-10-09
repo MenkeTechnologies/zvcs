@@ -1842,6 +1842,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 if let Err(code) = check_max_count(a) {
                     return Ok(code);
                 }
+                unmerged_stage = max_count_stage(a).or(unmerged_stage);
             } else if flag == "--anchored" {
                 // `OPT_CALLBACK_F(0, "anchored", options, N_("<text>"), …, PARSE_OPT_NONEG,
                 // diff_opt_anchored)` (diff.c:6228-6230): the separated form of a
@@ -2049,6 +2050,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // (`diff_merges_set_dense_combined_if_unset()`, builtin/diff.c:280-282)
             // — so `git diff --ours` prints `* Unmerged path` and a two-way patch
             // where plain `git diff` prints one `diff --cc` section.
+            // `-<number>` and `--max-count=<number>` are `--max-count` too (`handle_revision_opt()`),
+            // and the count is the same `revs->max_count` the three spellings below set.
+            s if s.len() > 1 && s.starts_with('-') && s[1..].bytes().all(|b| b.is_ascii_digit()) => {
+                unmerged_stage = max_count_stage(&s[1..]).or(unmerged_stage);
+            }
+            s if s.starts_with("--max-count=") => {
+                if let Err(code) = check_max_count(&s["--max-count=".len()..]) {
+                    return Ok(code);
+                }
+                unmerged_stage = max_count_stage(&s["--max-count=".len()..]).or(unmerged_stage);
+            }
             "--base" => unmerged_stage = Some(1),
             "--ours" => unmerged_stage = Some(2),
             "--theirs" => unmerged_stage = Some(3),
@@ -2537,6 +2549,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 if let Err(code) = check_max_count(&s[2..]) {
                     return Ok(code);
                 }
+                unmerged_stage = max_count_stage(&s[2..]).or(unmerged_stage);
             }
             // `-U` / `--unified[=<n>]`: git's `diff_opt_unified()` enables patch
             // output unconditionally, so any of these implies `-p` even alongside
@@ -5316,9 +5329,26 @@ fn collect_index_worktree(
         // both sides created — stops at the `U` pair alone.
         let wanted = stage_table
             .get(&path)
-            .and_then(|s| s[usize::from(unmerged_stage.unwrap_or(2)) - 1]);
+            .and_then(|s| {
+                usize::from(unmerged_stage.unwrap_or(2))
+                    .checked_sub(1)
+                    .and_then(|at| s.get(at).copied().flatten())
+            });
         if let (Some(side), Some(k)) = (wanted, wt_kind) {
-            deltas.push(Delta::plain(path, Some(side), NewSide::Worktree(k)));
+            // `git diff` arms `skip_stat_unmatch` (builtin/diff.c:525), which drops a pair whose
+            // worktree side carries no object name when both sides have the same mode and
+            // identical content: the stage-2 pair of a conflicted path whose file still holds
+            // the stage-2 blob is no change at all, though the `U` pair stays.
+            let identical = side.1 == k
+                && repo.filter_pipeline(None).ok().is_some_and(|(mut pipeline, wt_index)| {
+                    matches!(
+                        pipeline.worktree_file_to_object(path.as_bstr(), &wt_index),
+                        Ok(Some((id, kind, _))) if id == side.0 && kind == side.1
+                    )
+                });
+            if !identical {
+                deltas.push(Delta::plain(path, Some(side), NewSide::Worktree(k)));
+            }
         }
     }
     Ok(())
@@ -5978,6 +6008,15 @@ pub(super) fn parse_rename_limit(value: &str) -> Result<i64, ExitCode> {
 /// `fatal: '<value>': not an integer` at 128. The parsed count is discarded:
 /// `cmd_diff()` diffs the pending trees rather than walking, so `--max-count`
 /// changes nothing it prints.
+/// `revs->max_count` as `run_diff_files()` reads it for `diff_unmerged_stage`: any non-negative
+/// count, with stages above 3 simply matching nothing.
+fn max_count_stage(value: &str) -> Option<u8> {
+    match super::log::parse_max_count(value) {
+        Ok(Some(n)) => Some(u8::try_from(n).unwrap_or(u8::MAX)),
+        _ => None,
+    }
+}
+
 fn check_max_count(value: &str) -> Result<(), ExitCode> {
     match super::log::parse_max_count(value) {
         Ok(_) => Ok(()),

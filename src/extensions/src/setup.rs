@@ -672,6 +672,21 @@ fn is_inside_dir(dir: &Path) -> bool {
         .is_some_and(|cwd| cwd.starts_with(dir))
 }
 
+/// Whether git's discovery stopped *at* the git directory — the command was started in `.git`
+/// or below it, with no `GIT_DIR`, `GIT_WORK_TREE` or `core.worktree` naming a work tree.
+///
+/// `setup_git_directory_gently_1()` tests `is_git_directory(<dir>)` at each level it walks, so
+/// from `<repo>/.git` or `<repo>/.git/refs` it settles on the git directory before ever
+/// reaching `<repo>/.git` as an entry of `<repo>`. That is `setup_bare_git_dir()`: no work
+/// tree, no `chdir()`, and a relative path stays relative to where the user typed the command
+/// (setup.c:1252-1281), even though gitoxide reports `<repo>` as this repository's work tree.
+fn started_in_git_dir(repo: &gix::Repository, cwd: &Path) -> bool {
+    std::env::var_os("GIT_DIR").is_none()
+        && std::env::var_os("GIT_WORK_TREE").is_none()
+        && repo.config_snapshot().string("core.worktree").is_none()
+        && cwd.starts_with(realpath(repo.git_dir()))
+}
+
 /// The directory git is standing in by the time a command asks
 /// `is_inside_git_dir()` — which is not always the one the process was started in.
 ///
@@ -696,7 +711,7 @@ fn is_inside_dir(dir: &Path) -> bool {
 pub(crate) fn setup_cwd(repo: &gix::Repository) -> Option<PathBuf> {
     let cwd = std::fs::canonicalize(std::env::current_dir().ok()?).ok()?;
     Some(match work_tree(repo) {
-        Some(top) if cwd.starts_with(&top) => top,
+        Some(top) if cwd.starts_with(&top) && !started_in_git_dir(repo, &cwd) => top,
         _ => cwd,
     })
 }
@@ -765,7 +780,7 @@ pub(crate) fn after_setup(repo: &gix::Repository) -> Option<AfterSetup> {
     let has_core_worktree = repo.config_snapshot().string("core.worktree").is_some();
     let gitfile = |p: &Path| crate::porcelain::rev_parse::read_gitfile_gently(p).ok().flatten();
 
-    let Some(work_tree) = work_tree(repo) else {
+    let Some(work_tree) = work_tree(repo).filter(|_| !started_in_git_dir(repo, &cwd)) else {
         return bare_setup(repo, cwd, explicit.map(PathBuf::from), gitfile);
     };
     let (git_dir, export) = match explicit {

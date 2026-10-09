@@ -202,7 +202,14 @@ impl<'repo> Remote<'repo> {
                 }
                 let kind = match found {
                     Some((candidate, kind)) => {
-                        dir = Cow::Owned(candidate);
+                        // `.` and `./` have no file name of their own: they name the directory the
+                        // probe above resolved against `cwd`, and a `.git` directory reached that way
+                        // (`enter_repo` standing inside it) would otherwise be read as a work tree
+                        // whose `.git` sits below it.
+                        dir = Cow::Owned(match candidate.file_name() {
+                            Some(_) => candidate,
+                            None => cwd.join(candidate),
+                        });
                         kind
                     }
                     None => {

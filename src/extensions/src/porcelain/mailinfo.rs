@@ -592,8 +592,14 @@ impl Mailinfo {
         }
         self.handle_body(&mut line)?;
 
-        std::fs::write(msg, &self.log_message)?;
-        std::fs::write(patch, &self.patch)?;
+        // Both files were opened with `fopen(…, "w")` before a byte was read, and their stdio
+        // buffers reach the disk when `mailinfo()` closes them: the message first, the patch
+        // second, each at offset 0 of a file that already exists. Named twice (`mailinfo m m`)
+        // the patch therefore overwrites the front of the message and leaves its tail; writing
+        // each by name would truncate the first one's bytes away instead.
+        for (path, bytes) in [(msg, &self.log_message), (patch, &self.patch)] {
+            std::fs::OpenOptions::new().write(true).open(path)?.write_all(bytes)?;
+        }
 
         let out = self.handle_info();
         std::io::stdout().write_all(&out)?;

@@ -3874,6 +3874,7 @@ fn rebase_abort(repo: &gix::Repository) -> Result<ExitCode> {
     // Re-apply any autostash the interrupted rebase saved, onto the restored
     // orig-head tree, before dropping the state dir that holds its reference.
     let autostash = read_autostash(repo);
+    delete_rewritten_refs_in(repo, &rebase_merge_dir(repo));
     let _ = std::fs::remove_dir_all(rebase_merge_dir(repo));
     if let Some(oid) = autostash {
         crate::porcelain::stash::apply_autostash(repo, oid, false)?;
@@ -3962,10 +3963,38 @@ fn rebase_show_current_patch(repo: &gix::Repository) -> Result<ExitCode> {
     super::show(&[stopped.to_string(), "--".to_string()])
 }
 
+/// `sequencer_remove_state()`: drop every `refs/rewritten/<label>` a `--rebase-merges` run
+/// created, listed in `<state_dir>/refs-to-delete`. Best effort, as git's is — a ref that
+/// will not delete only earns a warning.
+fn delete_rewritten_refs_in(repo: &gix::Repository, dir: &std::path::Path) {
+    let Ok(body) = std::fs::read_to_string(dir.join("refs-to-delete")) else {
+        return;
+    };
+    for name in body.lines().filter(|l| !l.is_empty()) {
+        let Ok(full) = gix::refs::FullName::try_from(name) else {
+            eprintln!("warning: could not delete '{name}'");
+            continue;
+        };
+        let deleted = repo.edit_reference(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+                message: Default::default(),
+            },
+            name: full,
+            deref: false,
+        });
+        if deleted.is_err() {
+            eprintln!("warning: could not delete '{name}'");
+        }
+    }
+}
+
 /// `git rebase --quit`: drop the state directory and leave `HEAD` where it is.
 fn rebase_quit(repo: &gix::Repository) -> Result<ExitCode> {
     let dir = rebase_merge_dir(repo);
     save_autostash_in(repo, &dir)?;
+    delete_rewritten_refs_in(repo, &dir);
     let _ = std::fs::remove_dir_all(dir);
     Ok(ExitCode::SUCCESS)
 }
@@ -5985,27 +6014,7 @@ impl<'r> Sequencer<'r> {
     /// created, listed in `$state_dir/refs-to-delete`. Best effort, as git's is —
     /// a ref that will not delete only earns a warning.
     fn delete_rewritten_refs(&self) {
-        let Ok(body) = std::fs::read_to_string(self.dir().join("refs-to-delete")) else {
-            return;
-        };
-        for name in body.lines().filter(|l| !l.is_empty()) {
-            let Ok(full) = gix::refs::FullName::try_from(name) else {
-                eprintln!("warning: could not delete '{name}'");
-                continue;
-            };
-            let deleted = self.repo.edit_reference(RefEdit {
-                change: Change::Delete {
-                    expected: PreviousValue::Any,
-                    log: RefLog::AndReference,
-                    message: Default::default(),
-                },
-                name: full,
-                deref: false,
-            });
-            if deleted.is_err() {
-                eprintln!("warning: could not delete '{name}'");
-            }
-        }
+        delete_rewritten_refs_in(self.repo, &self.dir());
     }
 
     /// `do_label()`: point `refs/rewritten/<name>` at the current `HEAD` so a

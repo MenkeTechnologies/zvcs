@@ -217,7 +217,26 @@ pub fn fetch(repo: &crate::Repository, promisor: &Remote, ids: &[gix_hash::Objec
         }
         return Ok(false);
     }
-    let remote = repo.find_remote(promisor.name.as_str())?;
+    let mut remote = repo.find_remote(promisor.name.as_str())?;
+    // The fetch git spawns runs in the work tree's top directory (or the git directory of a bare
+    // repository), where a relative local URL such as `./.remote.git` is written from; this process
+    // may have been started in a subdirectory, which would make the path point elsewhere.
+    if let Some(url) = remote.url(crate::remote::Direction::Fetch) {
+        if url.scheme == crate::url::Scheme::File {
+            let raw: &crate::bstr::BStr = url.path.as_ref();
+            let path = gix_path::from_bstr(raw).into_owned();
+            if path.is_relative() {
+                let top = repo.workdir().unwrap_or_else(|| repo.git_dir());
+                let absolute = gix_path::into_bstr(top.join(path)).into_owned();
+                let absolute: &crate::bstr::BStr = absolute.as_ref();
+                if let Ok(url) = crate::url::parse(absolute) {
+                    if let Ok(replaced) = remote.clone().with_url_without_url_rewrite(url) {
+                        remote = replaced;
+                    }
+                }
+            }
+        }
+    }
     let mut con = remote.connect_with_options(
         crate::remote::Direction::Fetch,
         crate::remote::connect::Options {

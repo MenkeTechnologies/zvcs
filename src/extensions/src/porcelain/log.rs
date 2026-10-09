@@ -1613,16 +1613,19 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             // from `HEAD@{0}` to `HEAD@{<date>}`.
             date_explicit = true;
         } else if let Some(v) = a.strip_prefix("--min-parents=") {
-            match parse_nonneg(v) {
-                Some(n) => min_parents = Some(n),
+            // `parse_count()` (`strtol_i`): leading whitespace and a sign are fine; a negative
+            // lower bound constrains nothing.
+            match crate::revopt::strtol_i(v) {
+                Some(n) => min_parents = Some(n.max(0) as usize),
                 None => {
                     eprintln!("fatal: '{v}': not an integer");
                     return Ok(ExitCode::from(128));
                 }
             }
         } else if let Some(v) = a.strip_prefix("--max-parents=") {
-            match parse_nonneg(v) {
-                Some(n) => max_parents = Some(n),
+            // A negative upper bound is `-1`, the "no limit" the field starts at.
+            match crate::revopt::strtol_i(v) {
+                Some(n) => max_parents = (n >= 0).then_some(n as usize),
                 None => {
                     eprintln!("fatal: '{v}': not an integer");
                     return Ok(ExitCode::from(128));
@@ -7165,15 +7168,6 @@ pub(crate) fn parse_max_count(value: &str) -> Result<Option<usize>, ()> {
         Some(n) if n < 0 => Ok(None),
         Some(n) => Ok(Some(n as usize)),
         None => Err(()),
-    }
-}
-
-/// A non-negative base-10 integer (`--min-parents`, `--max-parents`).
-/// `None` for anything git would reject with `fatal: '<value>': not an integer`.
-fn parse_nonneg(value: &str) -> Option<usize> {
-    match parse_int(value) {
-        Some(n) if n >= 0 => Some(n as usize),
-        _ => None,
     }
 }
 

@@ -480,6 +480,18 @@ fn atoms<'a>(items: &'a [Item], sorts: &'a [SortKey]) -> impl Iterator<Item = &'
         .chain(sorts.iter().map(|s| &s.atom))
 }
 
+/// Every ref name the `:short` disambiguation tests candidates against. A ref whose file would not
+/// parse does not resolve (`refs_ref_exists()`), so it takes no part.
+fn existing_ref_names(repo: &gix::Repository) -> Result<HashSet<Vec<u8>>> {
+    let mut set = HashSet::new();
+    for r in repo.references()?.all()? {
+        if let crate::fatal::RefWalkEntry::Ref(r) = crate::fatal::ref_walk_entry(r)? {
+            set.insert(r.name().as_bstr().to_vec());
+        }
+    }
+    Ok(set)
+}
+
 /// `filter_refs()`: walk the ref store and keep the refs this verb asked for.
 ///
 /// The second value is a `die()` `apply_ref_filter()` raised (`match_points_at()`'s
@@ -489,10 +501,27 @@ pub(super) fn filter_refs(spec: &ListSpec<'_>) -> Result<(Vec<Candidate>, Option
     let repo = spec.repo;
     let filters_active = spec.filters.active();
 
+    // `do_filter_refs()` iterates only the namespace a single-kind request names; any mix, and
+    // a detached `HEAD` entry counts as one, walks all of `refs/`.
+    let scope: &[u8] = match spec.kinds {
+        kind::BRANCHES => b"refs/heads/",
+        kind::REMOTES => b"refs/remotes/",
+        kind::TAGS => b"refs/tags/",
+        _ => b"refs/",
+    };
     let mut names: Vec<Vec<u8>> = Vec::new();
     for r in repo.references()?.all()? {
-        let r = r.map_err(crate::fatal::ref_iteration_error)?;
-        names.push(r.name().as_bstr().to_vec());
+        match crate::fatal::ref_walk_entry(r)? {
+            crate::fatal::RefWalkEntry::Ref(r) => names.push(r.name().as_bstr().to_vec()),
+            // `ref_filter_handler()` drops a ref that would not parse before it tests the kind or
+            // the patterns, so the warning is for every one in the walked namespace.
+            crate::fatal::RefWalkEntry::Broken(name) => {
+                if name.as_bytes().starts_with(scope) {
+                    eprintln!("warning: ignoring broken ref {name}");
+                }
+            }
+            crate::fatal::RefWalkEntry::Omitted => {}
+        }
     }
     // `do_filter_refs()` appends the HEAD pseudo entry *after* the `refs/` walk
     // (ref-filter.c:3339-3342).
@@ -621,12 +650,7 @@ fn populate(
     // The `:short` disambiguation rules test candidate names against every ref in
     // the repository, including the ones this verb's `kind` mask dropped.
     let all_names: HashSet<Vec<u8>> = if needs_short || needs_symref_short {
-        let mut set = HashSet::new();
-        for r in repo.references()?.all()? {
-            let r = r.map_err(crate::fatal::ref_iteration_error)?;
-            set.insert(r.name().as_bstr().to_vec());
-        }
-        set
+        existing_ref_names(repo)?
     } else {
         HashSet::new()
     };
@@ -759,12 +783,7 @@ pub(super) fn pretty_print_ref(
         _ => None,
     };
     let short = if needs_short {
-        let mut all = HashSet::new();
-        for r in repo.references()?.all()? {
-            let r = r.map_err(crate::fatal::ref_iteration_error)?;
-            all.insert(r.name().as_bstr().to_vec());
-        }
-        short_name(repo, name, &all)
+        short_name(repo, name, &existing_ref_names(repo)?)
     } else {
         Vec::new()
     };

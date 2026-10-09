@@ -3171,11 +3171,20 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // the tie-break between tips that share a commit date. Materialised once, and only
     // when a ref-naming option asked for it — the iterator holds the packed-refs
     // buffer, which would block the per-ref object lookups.
+    // A loose ref whose file will not parse is yielded too, with a null id (`REF_ISBROKEN`);
+    // `handle_one_ref()` then dies `bad object <name>` when a pseudo-option selects it.
+    let mut broken_refs: HashSet<String> = HashSet::new();
     let ref_names: Vec<String> = if !ref_selections.is_empty() {
         let mut names: Vec<Vec<u8>> = Vec::new();
         for r in repo.references()?.all()? {
-            let r = r.map_err(|e| anyhow!("{e}"))?;
-            names.push(r.name().as_bstr().to_vec());
+            match crate::fatal::ref_walk_entry(r)? {
+                crate::fatal::RefWalkEntry::Ref(r) => names.push(r.name().as_bstr().to_vec()),
+                crate::fatal::RefWalkEntry::Broken(name) => {
+                    broken_refs.insert(name.clone());
+                    names.push(name.into_bytes());
+                }
+                crate::fatal::RefWalkEntry::Omitted => {}
+            }
         }
         names.sort();
         names.iter().filter_map(|n| n.to_str().ok().map(str::to_owned)).collect()
@@ -3269,6 +3278,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 let Some(name) = sel.selects(full) else {
                     continue;
                 };
+                if broken_refs.contains(full) {
+                    *fatal = Some(format!("bad object {name}"));
+                    return;
+                }
                 let Ok(reference) = repo.find_reference(full.as_str()) else {
                     continue;
                 };
@@ -11356,7 +11369,10 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
     let mut map: HashMap<ObjectId, Vec<Deco>> = HashMap::new();
     let replace_enabled = replace_refs_enabled(repo);
     for r in repo.references()?.all()? {
-        let r = r.map_err(|e| anyhow!("{e}"))?;
+        // A broken ref carries a null id, which `add_ref_decoration()` cannot parse: no decoration.
+        let crate::fatal::RefWalkEntry::Ref(r) = crate::fatal::ref_walk_entry(r)? else {
+            continue;
+        };
         let Ok(full) = r.name().as_bstr().to_str().map(str::to_owned) else {
             continue;
         };

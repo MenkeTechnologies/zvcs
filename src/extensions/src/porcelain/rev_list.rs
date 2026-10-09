@@ -4510,7 +4510,19 @@ fn seed_ref_set(
     let refs = repo.references().map_err(|e| e.to_string())?;
     let iter = refs.all().map_err(|e| e.to_string())?;
     for reference in iter {
-        let reference = reference.map_err(|e| e.to_string())?;
+        let reference = match crate::fatal::ref_walk_entry(reference).map_err(|e| e.to_string())? {
+            crate::fatal::RefWalkEntry::Ref(r) => r,
+            // `handle_one_ref()` gets the null id of a ref that would not parse, and
+            // `get_reference()` dies on it with the name the iterator reported.
+            crate::fatal::RefWalkEntry::Broken(full) => {
+                let Some(name) = sel.selects(&full) else { continue };
+                if ref_is_hidden(name, hidden) {
+                    continue;
+                }
+                return Err(format!("fatal: bad object {name}\n"));
+            }
+            crate::fatal::RefWalkEntry::Omitted => continue,
+        };
         let full = reference.name().as_bstr().to_string();
         let Some(name) = sel.selects(&full) else { continue };
         // `ref_excluded()` tests the `--exclude` patterns and then

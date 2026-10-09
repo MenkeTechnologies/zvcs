@@ -346,6 +346,46 @@ pub fn packed_refs_in_iteration(
     packed_refs_fatal(&ref_iteration_error(err)).map(die)
 }
 
+/// One step of a ref iteration, classified the way git's `refs_for_each_ref()` hands it over.
+///
+/// git yields a loose ref whose file will not parse with a null id and `REF_ISBROKEN`, and
+/// each caller decides: `for-each-ref`, `branch` and `tag` warn `ignoring broken ref` and go on,
+/// `log` and `rev-list` die `bad object <name>` when the pseudo-option selects it, `rev-parse`
+/// prints the null id. gitoxide reports it as an iteration error, so every caller needs this
+/// split to avoid failing the whole walk on one bad file.
+pub enum RefWalkEntry<'r> {
+    Ref(gix::Reference<'r>),
+    /// A loose ref that would not parse, named by its path relative to the git directory.
+    Broken(String),
+    /// A ref whose name is no valid refname (a dangling `ref:` stub): git omits it silently.
+    Omitted,
+}
+
+/// [`RefWalkEntry`] for one item of `repo.references()?.all()` (or `prefixed`). A `packed-refs`
+/// record that will not parse is git's `die()`, and any other failure is a real error.
+pub fn ref_walk_entry<'r>(
+    entry: Result<gix::Reference<'r>, Box<dyn std::error::Error + Send + Sync + 'static>>,
+) -> anyhow::Result<RefWalkEntry<'r>> {
+    use gix::refs::file::iter::loose_then_packed::Error as IterError;
+    use gix::refs::file::loose::reference::decode::Error as DecodeError;
+    let err = match entry {
+        Ok(r) => return Ok(RefWalkEntry::Ref(r)),
+        Err(e) => ref_iteration_error(e),
+    };
+    if packed_refs_fatal(&err).is_some() {
+        return Err(packed_refs_die(err));
+    }
+    match err.downcast_ref::<IterError>() {
+        Some(IterError::ReferenceCreation { source: DecodeError::RefnameValidation { .. }, .. }) => {
+            Ok(RefWalkEntry::Omitted)
+        }
+        Some(IterError::ReferenceCreation { relative_path, .. }) => Ok(RefWalkEntry::Broken(
+            relative_path.to_string_lossy().replace('\\', "/"),
+        )),
+        _ => Err(err),
+    }
+}
+
 /// A lock git takes with `LOCK_DIE_ON_ERROR` that another process already holds.
 ///
 /// git's `unable_to_lock_die()` is `die("%s", unable_to_lock_message(path, err))`: `fatal:

@@ -2620,7 +2620,21 @@ fn collect_refs(
 ) -> Result<Vec<(BString, BString, ObjectId)>> {
     let mut refs = Vec::new();
     for reference in repo.references()?.all()? {
-        let reference = reference.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reference = match crate::fatal::ref_walk_entry(reference)? {
+            crate::fatal::RefWalkEntry::Ref(r) => r,
+            // The iteration yields a ref that would not parse with a null id, and
+            // `show_rev()` prints it like any other.
+            crate::fatal::RefWalkEntry::Broken(name) => {
+                let Some(echo) = selection.selects(&name) else { continue };
+                refs.push((
+                    BString::from(echo.as_bytes()),
+                    BString::from(name.as_bytes()),
+                    ObjectId::null(repo.object_hash()),
+                ));
+                continue;
+            }
+            crate::fatal::RefWalkEntry::Omitted => continue,
+        };
         let full = reference.name().as_bstr().to_owned();
         let Some(full_str) = full.to_str().ok() else { continue };
         let Some(echo) = selection.selects(full_str) else { continue };

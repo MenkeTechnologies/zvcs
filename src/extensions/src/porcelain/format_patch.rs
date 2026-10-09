@@ -1225,7 +1225,10 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
 
     // Everything below emits bytes, so an unported flag can no longer be
     // deferred: it would change what those bytes are.
-    if let Some(flag) = opts.deferred.first() {
+    // `--ignore-submodules=all` changes nothing where no commit of the series has a gitlink on
+    // either side of its diff.
+    let hides_nothing = |flag: &String| flag == "--ignore-submodules=all" && !series_has_gitlinks(&repo, &commits);
+    if let Some(flag) = opts.deferred.iter().find(|flag| !hides_nothing(flag)) {
         bail!("unsupported flag {flag:?}");
     }
     // `prepare_order()` (diffcore-order.c:14-60): read up front so every queue
@@ -1459,6 +1462,21 @@ fn is_range_diff_range(repo: &gix::Repository, arg: &str) -> bool {
 /// while not being listed itself. git sets `origin` only while exactly one
 /// boundary commit has been seen (`origin = (boundary_count == 1) ? commit :
 /// NULL`), so a series with several roots or several bases has none.
+/// Whether the tree of any of `commits`, or of its first parent, holds a gitlink anywhere.
+fn series_has_gitlinks(repo: &gix::Repository, commits: &[ObjectId]) -> bool {
+    let has_gitlink = |tree: ObjectId| {
+        repo.index_from_tree(&tree)
+            .map(|index| index.entries().iter().any(|e| e.mode == gix::index::entry::Mode::COMMIT))
+            .unwrap_or(true)
+    };
+    commits.iter().any(|id| {
+        let Ok(commit) = repo.find_commit(*id) else { return true };
+        let parent_tree = commit.parent_ids().next().and_then(|p| repo.find_commit(p).ok()).and_then(|p| p.tree_id().ok());
+        commit.tree_id().map(|t| has_gitlink(t.detach())).unwrap_or(true)
+            || parent_tree.is_some_and(|t| has_gitlink(t.detach()))
+    })
+}
+
 fn series_origin(repo: &gix::Repository, commits: &[ObjectId]) -> Result<Option<ObjectId>> {
     let listed: std::collections::HashSet<ObjectId> = commits.iter().copied().collect();
     let mut boundary: Vec<ObjectId> = Vec::new();
@@ -2687,12 +2705,15 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             // git's `parse_ignore_submodules_arg()` accepts only these four
             // words; anything else is `die("bad --ignore-submodules argument")`
             // (exit 128) from setup_revisions. "none" is already this module's
-            // behavior (submodule changes are shown); the other three only affect
-            // an unported render, so they are deferred.
+            // behavior (submodule changes are shown). `dirty` and `untracked` only qualify
+            // how a submodule's *work tree* is judged, and a diff between two commits has
+            // none; `all` hides the submodule entries themselves, so it is deferred and only
+            // refused when a commit of the series has a submodule to hide.
             s if s.starts_with("--ignore-submodules=") => {
                 match &s["--ignore-submodules=".len()..] {
                     "none" => {}
-                    "all" | "untracked" | "dirty" => o.deferred.push(a.to_owned()),
+                    "untracked" | "dirty" => {}
+                "all" => o.deferred.push(a.to_owned()),
                     v => record_opt_error(
                         &mut o.opt_error,
                         i,

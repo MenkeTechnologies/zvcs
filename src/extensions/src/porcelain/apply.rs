@@ -3298,7 +3298,10 @@ fn find_pos(
 ///
 /// `eof_fudge` is `--inaccurate-eof`: the pre-image's last line had its newline
 /// taken off, and git compares the shortened buffer, so that line matches the
-/// file's as a prefix.
+/// file's as a prefix. A hunk that must match the end of the file (`match_end`: no
+/// trailing context) is compared as `current + preimage.len == img.len`, so the shortened
+/// buffer has to reach the very end — the file's last line is then the shortened one,
+/// newline-less, and not merely prefixed by it.
 fn matches_at(
     image: &[Vec<u8>],
     // `img->line[].flag & LINE_PATCHED` (apply.c:2650), one entry per image line.
@@ -3331,7 +3334,8 @@ fn matches_at(
     }
     if eof_fudge && !pre.is_empty() {
         let last = pre.len() - 1;
-        if image[at..at + last] == pre[..last] && image[at + last].starts_with(&pre[last]) {
+        let ends_the_file = !match_end || image[at + last].len() == pre[last].len();
+        if ends_the_file && image[at..at + last] == pre[..last] && image[at + last].starts_with(&pre[last]) {
             return Some(None);
         }
     } else if image[at..at + pre.len()] == *pre {

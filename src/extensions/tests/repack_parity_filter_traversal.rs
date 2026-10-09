@@ -80,14 +80,29 @@ fn the_filter_decides_what_the_new_pack_holds() {
         "blob:limit=3",
         "blob:limit=5",
         "blob:limit=1k",
+        // Repeated `--filter` options combine (`filter_combine()`).
+        "blob:none,tree:0",
+        "tree:0,blob:none",
+        "tree:1,blob:none",
+        "blob:none,tree:2",
+        "tree:3,blob:limit=3",
+        "tree:1,tree:2",
+        "tree:2,tree:1",
+        "blob:limit=2,tree:1,tree:3",
+        "combine:tree:1+blob:none",
     ] {
-        let (s, z) = twin_repo::pair(&format!("repack-filter-{}", spec.replace([':', '='], "-")), stock);
+        let (s, z) = twin_repo::pair(&format!("repack-filter-{}", spec.replace([':', '=', ','], "-")), stock);
         build(&s);
         build(&z);
-        let flag = format!("--filter={spec}");
-        let want = s.git(&["repack", &flag]);
+        let flags: Vec<String> = match spec.starts_with("combine:") {
+            true => vec![format!("--filter={spec}")],
+            false => spec.split(',').map(|one| format!("--filter={one}")).collect(),
+        };
+        let mut args = vec!["repack"];
+        args.extend(flags.iter().map(String::as_str));
+        let want = s.git(&args);
         assert_eq!(want.code, 0, "{spec}: {want:?}");
-        assert_eq!(z.git(&["repack", &flag]), want, "{spec}");
+        assert_eq!(z.git(&args), want, "{spec}");
         assert_eq!(packs(&z), packs(&s), "{spec}: pack contents");
     }
 }

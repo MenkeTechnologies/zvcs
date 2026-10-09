@@ -101,7 +101,7 @@
 //!     confirms (on the `branched` fixture, `blob:none` yields 11 of 13 objects:
 //!     13 less 4 blobs, plus the 2 blobs the index holds).
 //!     `tree:<depth>` is worked out as pack-objects' traversal works it out, see
-//!     [`tree_depth_shown`]: the index's blobs and cache-tree nodes are objects the
+//!     [`filtered_traversal`]: the index's blobs and cache-tree nodes are objects the
 //!     user named, which the filter is never asked about, so a `tree:0` pack still
 //!     holds every index blob and the cache-tree nodes that no earlier named tree
 //!     listed as a child.
@@ -786,13 +786,11 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
 
     // `--filter=tree:<depth>` is decided by pack-objects' traversal as a whole, not object by
     // object, so what it shows is worked out up front.
-    let tree_shown = st
-        .filter_spec
-        .as_deref()
-        .and_then(|spec| spec.strip_prefix("tree:"))
-        .and_then(scaled)
-        .and_then(|depth| u64::try_from(depth).ok())
-        .map(|depth| tree_depth_shown(&repo, depth, &reachable, &promisor_held));
+    let filters = st.filter_spec.as_deref().map(filter_subs).unwrap_or_default();
+    let tree_shown = filters
+        .iter()
+        .any(|f| matches!(f, FilterSub::TreeDepth(_)))
+        .then(|| filtered_traversal(&repo, &filters, &reachable, &promisor_held));
 
     let existing = super::prune::pack_indices(&repo, &objdir);
     // ```c
@@ -2152,7 +2150,7 @@ fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
 /// Both are applied to the traversal only; the index objects the caller already
 /// folded in are what git unions back afterwards, and since this filter runs
 /// over the closed set the two coincide for every blob the index names.
-/// `tree:<depth>` is decided by [`tree_depth_shown`], whose result arrives as `tree_shown`: a
+/// `tree:<depth>` is decided by [`filtered_traversal`], whose result arrives as `tree_shown`: a
 /// commit or tag always stays, a tree or blob only when the traversal showed it.
 fn keeps_object(
     st: &State,
@@ -2169,11 +2167,15 @@ fn keeps_object(
             _ => true,
         };
     }
-    let limit = if spec == "blob:none" {
-        Some(0)
-    } else {
-        spec.strip_prefix("blob:limit=").and_then(scaled).map(|n| n as u64)
-    };
+    // Several blob filters keep only what each of them keeps: the smallest limit wins.
+    let limit = filter_subs(spec)
+        .into_iter()
+        .filter_map(|f| match f {
+            FilterSub::BlobNone => Some(0),
+            FilterSub::BlobLimit(n) => Some(n),
+            FilterSub::TreeDepth(_) => None,
+        })
+        .min();
     let Some(limit) = limit else {
         return true;
     };
@@ -2183,9 +2185,61 @@ fn keeps_object(
     }
 }
 
-/// The trees and blobs `pack-objects --all --reflog --indexed-objects --filter=tree:<depth>`
-/// shows, which is `traverse_commit_list_filtered()` over the pending list
-/// `get_object_list()` builds: the index's blobs, then the cache-tree's valid nodes in
+/// One filter of a `--filter` spec, which is one `combine:` member when there are several.
+#[derive(Clone, Copy, Debug)]
+enum FilterSub {
+    /// `blob:none`.
+    BlobNone,
+    /// `blob:limit=<n>`: a blob is kept when it is smaller than `n`.
+    BlobLimit(u64),
+    /// `tree:<depth>`.
+    TreeDepth(u64),
+}
+
+/// The filters `spec` names - `combine:a+b` splits into its percent-decoded members - leaving
+/// out the kinds this port does not apply (`object:type=`, `sparse:oid=`).
+fn filter_subs(spec: &str) -> Vec<FilterSub> {
+    let members: Vec<String> = match spec.strip_prefix("combine:") {
+        Some(rest) => rest
+            .split('+')
+            .filter(|member| !member.is_empty())
+            .map(|member| {
+                String::from_utf8_lossy(&super::list_objects_filter::url_percent_decode(member.as_bytes()))
+                    .into_owned()
+            })
+            .collect(),
+        None => vec![spec.to_string()],
+    };
+    members
+        .iter()
+        .flat_map(|member| {
+            if member == "blob:none" {
+                return Some(FilterSub::BlobNone);
+            }
+            if let Some(n) = member.strip_prefix("blob:limit=").and_then(scaled) {
+                return u64::try_from(n).ok().map(FilterSub::BlobLimit);
+            }
+            let depth = member.strip_prefix("tree:").and_then(scaled)?;
+            u64::try_from(depth).ok().map(FilterSub::TreeDepth)
+        })
+        .collect()
+}
+
+/// Add `spec` to the `--filter` already given. A second `--filter` does not replace the first:
+/// `parse_list_objects_filter()` turns the pair into `combine:<first>+<second>`, and a third
+/// extends it.
+fn push_filter_spec(previous: Option<String>, spec: &str) -> String {
+    let encode = |s: &str| s.replace('%', "%25").replace('+', "%2B");
+    match previous {
+        None => spec.to_string(),
+        Some(previous) if previous.starts_with("combine:") => format!("{previous}+{}", encode(spec)),
+        Some(previous) => format!("combine:{}+{}", encode(&previous), encode(spec)),
+    }
+}
+
+/// The trees and blobs `pack-objects --all --reflog --indexed-objects --filter=<spec>` shows when
+/// the spec holds a `tree:<depth>`: `traverse_commit_list_filtered()` over the pending list
+/// `get_object_list()` builds - the index's blobs, then the cache-tree's valid nodes in
 /// pre-order, then (as the walk adds them) the root tree of every commit.
 ///
 /// What the filter decides is who it is asked about. `list_objects_filter__filter_object()`
@@ -2204,34 +2258,161 @@ fn keeps_object(
 /// deeper; one met again at a depth no shallower than before is skipped
 /// (`seen_at_depth`). A filtered blob is shown when `current_depth < depth`, `current_depth`
 /// already counting the tree that holds it.
-fn tree_depth_shown(
+///
+/// Two or more filters are `filter_combine()`: an object is shown when every member shows it,
+/// and a tree's contents are skipped only when every member skips them, so the descendants of a
+/// tree one member omits are still visited - and flagged `NOT_USER_GIVEN` - for the others.
+/// A member that marked an object `SEEN` is not asked about it again.
+fn filtered_traversal(
     repo: &gix::Repository,
-    depth: u64,
+    subs: &[FilterSub],
     reachable: &HashSet<ObjectId>,
     uninteresting: &HashSet<ObjectId>,
 ) -> HashSet<ObjectId> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Situation {
+        BeginTree,
+        EndTree,
+        Blob,
+    }
+
+    /// `enum list_objects_filter_result`.
+    #[derive(Clone, Copy, Default)]
+    struct Verdict {
+        show: bool,
+        mark_seen: bool,
+        skip_tree: bool,
+    }
+    const ZERO: Verdict = Verdict { show: false, mark_seen: false, skip_tree: false };
+    const SHOW_AND_SEEN: Verdict = Verdict { show: true, mark_seen: true, skip_tree: false };
+
+    /// One member filter and what `combine_filter_data` keeps beside it.
+    struct Member {
+        kind: FilterSub,
+        /// `struct filter::is_skipping_tree` / `skip_tree`.
+        skipping: Option<ObjectId>,
+        /// `struct subfilter::seen`: what the member marked `SEEN`.
+        seen: HashSet<ObjectId>,
+        /// `filter_trees_depth_data`.
+        seen_at_depth: HashMap<ObjectId, u64>,
+        current_depth: u64,
+    }
+
+    impl Member {
+        /// The member's own `filter_object_fn`. `pack-objects` collects no omitted ids, so the
+        /// `omits` set is NULL and an omitted tree is always skipped.
+        fn event(&mut self, situation: Situation, id: ObjectId, blob_size: u64) -> Verdict {
+            match self.kind {
+                FilterSub::BlobNone => match situation {
+                    Situation::BeginTree => SHOW_AND_SEEN,
+                    Situation::EndTree => ZERO,
+                    Situation::Blob => Verdict { mark_seen: true, ..ZERO },
+                },
+                FilterSub::BlobLimit(limit) => match situation {
+                    Situation::BeginTree => SHOW_AND_SEEN,
+                    Situation::EndTree => ZERO,
+                    Situation::Blob if blob_size < limit => SHOW_AND_SEEN,
+                    Situation::Blob => Verdict { mark_seen: true, ..ZERO },
+                },
+                FilterSub::TreeDepth(depth) => {
+                    let include = self.current_depth < depth;
+                    match situation {
+                        Situation::EndTree => {
+                            self.current_depth = self.current_depth.saturating_sub(1);
+                            ZERO
+                        }
+                        Situation::Blob => {
+                            if include { SHOW_AND_SEEN } else { ZERO }
+                        }
+                        Situation::BeginTree => {
+                            let already_seen = match self.seen_at_depth.get(&id) {
+                                Some(&at) => self.current_depth >= at,
+                                None => false,
+                            };
+                            let verdict = if already_seen {
+                                Verdict { skip_tree: true, ..ZERO }
+                            } else {
+                                self.seen_at_depth.insert(id, self.current_depth);
+                                if include {
+                                    Verdict { show: true, ..ZERO }
+                                } else {
+                                    Verdict { skip_tree: true, ..ZERO }
+                                }
+                            };
+                            self.current_depth += 1;
+                            verdict
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     struct Walk<'a> {
         repo: &'a gix::Repository,
-        depth: u64,
         uninteresting: &'a HashSet<ObjectId>,
+        members: Vec<Member>,
         /// `obj->flags & NOT_USER_GIVEN`.
         filtered: HashSet<ObjectId>,
         /// `obj->flags & SEEN`.
         seen: HashSet<ObjectId>,
-        /// `filter_data->seen_at_depth`.
-        seen_at_depth: HashMap<ObjectId, u64>,
-        /// `filter_data->current_depth`.
-        current_depth: u64,
         shown: HashSet<ObjectId>,
     }
 
     impl Walk<'_> {
+        /// `list_objects_filter__filter_object()` for an object the filter is asked about.
+        fn ask(&mut self, situation: Situation, id: ObjectId) -> Verdict {
+            let blob_size = match (situation, self.members.iter().any(|m| matches!(m.kind, FilterSub::BlobLimit(_)))) {
+                (Situation::Blob, true) => self.repo.find_header(id).map_or(0, |h| h.size()),
+                _ => 0,
+            };
+            if let [only] = self.members.as_mut_slice() {
+                return only.event(situation, id, blob_size);
+            }
+            // `filter_combine()` and `process_subfilter()`.
+            let mut combined = Verdict { show: true, mark_seen: true, skip_tree: true };
+            for member in &mut self.members {
+                let verdict = if member.skipping.is_some()
+                    && !(situation == Situation::EndTree && member.skipping == Some(id))
+                {
+                    ZERO
+                } else {
+                    if situation == Situation::EndTree && member.skipping == Some(id) {
+                        member.skipping = None;
+                    }
+                    if member.seen.contains(&id) {
+                        ZERO
+                    } else {
+                        let verdict = member.event(situation, id, blob_size);
+                        if verdict.mark_seen {
+                            member.seen.insert(id);
+                        }
+                        if verdict.skip_tree {
+                            member.skipping = Some(id);
+                        }
+                        verdict
+                    }
+                };
+                combined.show &= verdict.show;
+                combined.mark_seen &= verdict.mark_seen;
+                combined.skip_tree &= member.skipping.is_some();
+            }
+            combined
+        }
+
         fn blob(&mut self, id: ObjectId) {
             if self.seen.contains(&id) || self.uninteresting.contains(&id) {
                 return;
             }
-            if !self.filtered.contains(&id) || self.current_depth < self.depth {
+            let verdict = if self.filtered.contains(&id) {
+                self.ask(Situation::Blob, id)
+            } else {
+                SHOW_AND_SEEN
+            };
+            if verdict.mark_seen {
                 self.seen.insert(id);
+            }
+            if verdict.show {
                 self.shown.insert(id);
             }
         }
@@ -2253,29 +2434,14 @@ fn tree_depth_shown(
             };
 
             let user_given = !self.filtered.contains(&id);
-            let mut skip = false;
-            if user_given {
+            let verdict = if user_given { SHOW_AND_SEEN } else { self.ask(Situation::BeginTree, id) };
+            if verdict.mark_seen {
                 self.seen.insert(id);
-                self.shown.insert(id);
-            } else {
-                let include = self.current_depth < self.depth;
-                let already_seen = match self.seen_at_depth.get(&id) {
-                    Some(&at) => self.current_depth >= at,
-                    None => false,
-                };
-                if already_seen {
-                    skip = true;
-                } else {
-                    self.seen_at_depth.insert(id, self.current_depth);
-                    if include {
-                        self.shown.insert(id);
-                    } else {
-                        skip = true;
-                    }
-                }
-                self.current_depth += 1;
             }
-            if !skip {
+            if verdict.show {
+                self.shown.insert(id);
+            }
+            if !verdict.skip_tree {
                 for (kind, oid) in entries {
                     match kind {
                         EntryKind::Tree => {
@@ -2291,19 +2457,26 @@ fn tree_depth_shown(
                 }
             }
             if !user_given {
-                self.current_depth -= 1;
+                self.ask(Situation::EndTree, id);
             }
         }
     }
 
     let mut walk = Walk {
         repo,
-        depth,
         uninteresting,
+        members: subs
+            .iter()
+            .map(|&kind| Member {
+                kind,
+                skipping: None,
+                seen: HashSet::new(),
+                seen_at_depth: HashMap::new(),
+                current_depth: 0,
+            })
+            .collect(),
         filtered: HashSet::new(),
         seen: HashSet::new(),
-        seen_at_depth: HashMap::new(),
-        current_depth: 0,
         shown: HashSet::new(),
     };
 
@@ -3096,7 +3269,7 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
         }
         "filter" => {
             st.filter = on;
-            st.filter_spec = if on { value.map(str::to_string) } else { None };
+            st.filter_spec = if on { value.map(|v| push_filter_spec(st.filter_spec.take(), v)) } else { None };
         }
         "filter-to" => {
             st.filter_to = on;

@@ -3262,6 +3262,7 @@ fn restore_from_tree(
     // therefore interleave by path, and on a case-insensitive file system the order is
     // what `restore -SW .` after `mv a A` leaves behind: `A` sorts first, goes, and `a`
     // is then written.
+    die_on_bad_attr_source_for_writes(repo, &index, &subset)?;
     let fresh = checkout_interleaved(repo, &mut subset, &to_remove, &index, &should_interrupt)?;
 
     // Fold the tree's blobs (with fresh checkout stats) into the real index.
@@ -4735,4 +4736,24 @@ fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, 
 pub(crate) fn print_tracking_status(repo: &gix::Repository) {
     let block = super::status::tracking_block(repo);
     print!("{}", block.strip_suffix('\n').unwrap_or(&block));
+}
+
+/// `compute_default_attr_source()`'s `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`, raised by
+/// the first attribute lookup of a worktree checkout — which only happens once a regular file is
+/// actually written or compared ([`crate::index_racy::first_attribute_lookup`]).
+pub(super) fn die_on_bad_attr_source_for_writes(
+    repo: &gix::Repository,
+    cur: &gix::index::File,
+    subset: &gix::index::File,
+) -> Result<()> {
+    let Some(message) = super::bad_default_attr_source(repo) else { return Ok(()) };
+    match crate::index_racy::first_attribute_lookup(repo, cur, subset) {
+        None => Ok(()),
+        Some(lookup) => {
+            if let crate::index_racy::AttributeLookup::AfterUnlink(path) = lookup {
+                let _ = std::fs::remove_file(path);
+            }
+            Err(crate::fatal::die(message.to_owned()))
+        }
+    }
 }

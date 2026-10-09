@@ -411,3 +411,70 @@ fn tweak_split_index(
 pub(crate) fn display(path: &gix::bstr::BStr) -> String {
     path.to_str_lossy().into_owned()
 }
+
+/// What the first attribute lookup of a worktree checkout of `subset` is preceded by.
+pub(crate) enum AttributeLookup {
+    /// An existing file in the way is unlinked first (`checkout_entry()` removes it before it
+    /// writes the replacement), so a `die()` at the lookup leaves it gone.
+    AfterUnlink(std::path::PathBuf),
+    /// Nothing is touched first.
+    Plain,
+}
+
+/// Would `checkout_entry()` reach an attribute lookup for any file or symlink in `subset`, and
+/// if so, for the first one in index order, what has been done to the worktree by then?
+///
+/// `checkout_entry()` (entry.c) returns early for an entry whose file `ie_match_stat()` calls
+/// unchanged, and `ie_match_stat()` only reads the file (`ce_compare_data()` -> `index_fd()` ->
+/// attributes) for a racily clean entry. So the first attribute lookup — the one that dies on a
+/// bad `--attr-source` / `GIT_ATTR_SOURCE` — happens when a regular file has to be written
+/// (missing, stat-different, or not the index's own) or compared because its recorded `mtime`
+/// is not older than the index's.
+///
+/// A symlink differs, as measured against stock: writing a changed or missing one never asks
+/// for attributes, but comparing a racy one does.
+pub(crate) fn first_attribute_lookup(
+    repo: &gix::Repository,
+    cur: &gix::index::File,
+    subset: &gix::index::File,
+) -> Option<AttributeLookup> {
+    use gix::index::entry::Mode;
+    let stat_opts = repo.stat_options().unwrap_or_default();
+    let snapshot = repo.config_snapshot();
+    let trust_executable_bit = snapshot.boolean("core.fileMode").unwrap_or(true);
+    let has_symlinks = snapshot.boolean("core.symlinks").unwrap_or(true);
+    let empty_blob = cur.object_hash().empty_blob();
+    let timestamp = cur.timestamp().unix_seconds();
+    let backing = subset.path_backing();
+    subset.entries().iter().find_map(|wanted| {
+        let regular = wanted.mode == Mode::FILE || wanted.mode == Mode::FILE_EXECUTABLE;
+        if !regular && wanted.mode != Mode::SYMLINK {
+            return None;
+        }
+        let path = wanted.path_in(backing);
+        let full = repo.workdir_path(path)?;
+        // A write: the file in the way, if there is one, goes first.
+        let write = |exists: bool| {
+            regular.then(|| if exists { AttributeLookup::AfterUnlink(full.clone()) } else { AttributeLookup::Plain })
+        };
+        let exists = std::fs::symlink_metadata(&full).is_ok();
+        // A source entry that is the index's own keeps the index's stat data; any other is a
+        // fresh entry with none, which can only differ from the file.
+        let Some(own) = cur
+            .entry_by_path_and_stage(path, gix::index::entry::Stage::Unconflicted)
+            .filter(|own| own.id == wanted.id && own.mode == wanted.mode)
+        else {
+            return write(exists);
+        };
+        let Ok(fs_meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+            return write(exists);
+        };
+        let Ok(current) = gix::index::entry::Stat::from_fs(&fs_meta) else {
+            return write(exists);
+        };
+        if match_stat_basic_differs(own, &fs_meta, &current, stat_opts, trust_executable_bit, has_symlinks, &empty_blob) {
+            return write(exists);
+        }
+        (timestamp != 0 && timestamp <= i64::from(own.stat.mtime.secs)).then_some(AttributeLookup::Plain)
+    })
+}

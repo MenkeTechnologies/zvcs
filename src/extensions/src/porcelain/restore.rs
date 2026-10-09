@@ -1306,6 +1306,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // path order, attributes read from the whole index (`state.istate =
         // the_repository->index`, builtin/checkout.c:412) — `cur` supplies the
         // `.gitattributes` files the subset dropped.
+        super::checkout::die_on_bad_attr_source_for_writes(&repo, &cur, &subset)?;
         let written =
             super::checkout::checkout_interleaved(&repo, &mut subset, &remove, &cur, &should_interrupt)?;
         fresh_stats.extend(written.into_iter().map(|(path, (_, _, stat))| (path, stat)));

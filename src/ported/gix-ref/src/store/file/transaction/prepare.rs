@@ -663,11 +663,13 @@ impl Transaction<'_, '_> {
                             let mut ref_name = change.name();
                             while let Some(parent_idx) = cursor {
                                 let parent = &updates[parent_idx];
+                                // The chain ends at the root of the split, which names the
+                                // requested ref; the cursor has to move on from it, or a lock
+                                // that cannot be taken spins here forever.
                                 if parent.parent_index.is_none() {
                                     ref_name = parent.name();
-                                } else {
-                                    cursor = parent.parent_index;
                                 }
+                                cursor = parent.parent_index;
                             }
                             ref_name
                         },

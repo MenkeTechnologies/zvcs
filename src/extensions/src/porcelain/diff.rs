@@ -294,6 +294,10 @@ struct Render {
     /// unless a `-c` asked for `diff --combined` (`builtin_diff_files()` only
     /// raises the dense form when nothing set a combined mode, builtin/diff.c:279-281).
     combined_dense: bool,
+    /// `opt->a_prefix` / `opt->b_prefix` as configured, before `-R` swaps the pair:
+    /// `show_combined_header()` prints them on the `---` / `+++` lines
+    /// (combine-diff.c:931-932).
+    combined_prefixes: (Vec<u8>, Vec<u8>),
 }
 
 /// The `xdiff` knobs that decide which changes make it into the hunk stream at all,
@@ -3886,6 +3890,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         indicators,
         hash_kind,
         combined_dense: !combine_merges || dense_combined,
+        combined_prefixes: (combined_req.a_prefix.clone(), combined_req.b_prefix.clone()),
     };
 
     // `--color[=<when>]` and `--no-color`, falling back to `color.diff` /
@@ -4300,7 +4305,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         });
                         // Every `builtin_diff()` arm that emits a header or a hunk sets
                         // `o->found_changes`, so having written anything is the answer.
-                        found_changes = true;
+                        found_changes |= !(delta.unmerged && delta.stages.is_some());
                     }
                 }
             }
@@ -4421,8 +4426,19 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // Neither happens for a combined diff: every pair it queues is queued on the
     // copy of the options (combine-diff.c:1524), so the caller's `has_changes` stays
     // clear and `git diff --exit-code <a> <b> <c>` exits 0 however much it printed.
+    // `run_diff_files()` hands an unmerged path to `show_combined_diff()` and `continue`s
+    // before `diff_unmerge()` / `diff_change()` (diff-lib.c:210-214), so a patch whose
+    // combined section covers every queued pair never sets `has_changes` either.
+    let combined_covered: BTreeSet<&BString> = match fmt & F_PATCH != 0 {
+        true => deltas.iter().filter(|d| d.unmerged && d.stages.is_some()).map(|d| &d.path).collect(),
+        false => BTreeSet::new(),
+    };
     if want_exit_code && !combined {
-        let changed = if from_contents { found_changes } else { !deltas.is_empty() };
+        let changed = if from_contents {
+            found_changes
+        } else {
+            deltas.iter().any(|d| !combined_covered.contains(&d.path))
+        };
         if changed {
             return Ok(ExitCode::from(1));
         }
@@ -4472,9 +4488,6 @@ fn reverse_delta(d: &mut Delta, null: ObjectId) {
     // `SWAP(old_dirty_submodule, new_dirty_submodule)`: the `-dirty` marker belongs
     // to the worktree side wherever it lands.
     std::mem::swap(&mut d.old_dirty_submodule, &mut d.dirty_submodule);
-    if let Some((a, b)) = d.stages {
-        d.stages = Some((b, a));
-    }
 }
 
 /// `--find-copies-harder`: append an unmodified pair for every pre-image blob that
@@ -6214,6 +6227,7 @@ fn patch_render(repo: &gix::Repository, opts: &PatchOpts) -> Render {
         indicators: opts.indicators,
         hash_kind,
         combined_dense: true,
+        combined_prefixes: (opts.src_prefix.clone(), opts.dst_prefix.clone()),
     }
 }
 
@@ -8999,7 +9013,7 @@ fn render_patch(
     r: &Render,
 ) -> Result<()> {
     if delta.unmerged {
-        return render_combined(out, repo, delta, ctx, r.combined_dense);
+        return render_combined(out, repo, delta, ctx, r.combined_dense, &r.combined_prefixes);
     }
 
     // The `index` line honors `--abbrev` / `--full-index`. `fill_metainfo()` also
@@ -10293,6 +10307,7 @@ fn render_combined(
     delta: &Delta,
     ctx: u32,
     dense: bool,
+    (a_prefix, b_prefix): &(Vec<u8>, Vec<u8>),
 ) -> Result<()> {
     let Some((ours, theirs)) = delta.stages else {
         // No stage 2/3 pair to combine (e.g. `--cached`): git prints the notice.
@@ -10331,8 +10346,8 @@ fn render_combined(
     out.push(b'\n');
     // This renders into the ordinary output buffer, which the caller prefixes as a
     // whole, so no prefix is emitted here.
-    dump_quoted_path(out, b"", b"--- ", &quote_one(b"a/", &delta.path));
-    dump_quoted_path(out, b"", b"+++ ", &quote_one(b"b/", &delta.path));
+    dump_quoted_path(out, b"", b"--- ", &quote_one(a_prefix, &delta.path));
+    dump_quoted_path(out, b"", b"+++ ", &quote_one(b_prefix, &delta.path));
 
     dump_sline(out, &sline, cnt, ctx);
     Ok(())

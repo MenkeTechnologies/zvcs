@@ -290,6 +290,14 @@ fn check_pathspecs(
         // quotes the path portion (magic stripped), captured before normalize
         // consumes it, and prefixes the whole line with the raw spelling.
         let path = parsed.path().to_str_lossy().into_owned();
+        // `prefix_path_gently()` resolves an absolute element with `real_path()` first, which
+        // dies on a missing parent before the inside/outside question is asked.
+        if path.starts_with('/') {
+            if let Err(message) = crate::pathspec::real_path_strict(&path) {
+                eprintln!("fatal: {message}");
+                return Ok(Some(ExitCode::from(128)));
+            }
+        }
         if parsed.normalize(&prefix, &root).is_err() {
             eprintln!(
                 "fatal: {raw}: '{path}' is outside repository at '{}'",

@@ -252,6 +252,13 @@ pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
         let mut pattern = gix::pathspec::parse(spec.as_ref(), defaults).ok()?;
         // `copyfrom`: the path with the magic already taken off.
         let copyfrom = pattern.path().to_owned();
+        // `prefix_path_gently()` resolves an absolute element with `real_path()` first, which
+        // dies on a missing parent before the inside/outside question is asked.
+        if gix::path::is_absolute(gix::path::from_bstr(copyfrom.as_bstr())) {
+            if let Err(message) = real_path_strict(&copyfrom.to_str_lossy()) {
+                return Some(message);
+            }
+        }
         pattern.normalize(&prefix, &root).err().map(|_| {
             format!(
                 "{}: '{}' is outside repository at '{}'",
@@ -261,6 +268,45 @@ pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
             )
         })
     })
+}
+
+/// `strbuf_realpath()` with `REALPATH_DIE_ON_ERROR` (abspath.c), as `real_pathdup(arg, 1)` and
+/// `real_path()` run it: every component but the last has to exist, the last may be missing,
+/// and the first that fails is `Invalid path '<path up to it>': <strerror>`.
+///
+/// A relative `arg` is taken relative to the process's working directory.
+pub fn real_path_strict(arg: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+
+    let invalid = |path: &std::path::Path, e: &std::io::Error| {
+        format!("Invalid path '{}': {}", path.display(), crate::external::strerror(e))
+    };
+    let mut resolved = std::env::current_dir().map_err(|e| invalid(std::path::Path::new(""), &e))?;
+    if arg.starts_with('/') {
+        resolved = std::path::PathBuf::from("/");
+    }
+    let mut components = std::path::Path::new(arg).components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        // Follow it the way the kernel would, then carry on from the target.
+                        resolved = std::fs::canonicalize(&resolved).map_err(|e| invalid(&resolved, &e))?;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && components.peek().is_none() => {}
+                    Err(e) => return Err(invalid(&resolved, &e)),
+                }
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// [`first_outside_repository_fatal`] in a repository without a working tree.

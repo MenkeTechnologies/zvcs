@@ -2056,46 +2056,7 @@ fn take_common<'a>(
 /// The argument is taken relative to the process's working directory, not to the prefix —
 /// `OPT_CALLBACK` hands the raw string over.
 fn real_pathdup(arg: &str) -> Result<PathBuf> {
-    use std::path::Component;
-
-    let mut resolved = std::env::current_dir()?;
-    let mut components = Path::new(arg).components().peekable();
-    if arg.starts_with('/') {
-        resolved = PathBuf::from("/");
-    }
-    while let Some(component) = components.next() {
-        match component {
-            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
-            Component::ParentDir => {
-                resolved.pop();
-            }
-            Component::Normal(name) => {
-                resolved.push(name);
-                match fs::symlink_metadata(&resolved) {
-                    Ok(meta) if meta.file_type().is_symlink() => {
-                        // Follow it the way the kernel would, then carry on from the target.
-                        resolved = fs::canonicalize(&resolved).map_err(|e| {
-                            crate::fatal::die(format!(
-                                "Invalid path '{}': {}",
-                                resolved.display(),
-                                crate::external::strerror(&e)
-                            ))
-                        })?;
-                    }
-                    Ok(_) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound && components.peek().is_none() => {}
-                    Err(e) => {
-                        return Err(crate::fatal::die(format!(
-                            "Invalid path '{}': {}",
-                            resolved.display(),
-                            crate::external::strerror(&e)
-                        )))
-                    }
-                }
-            }
-        }
-    }
-    Ok(resolved)
+    crate::pathspec::real_path_strict(arg).map_err(crate::fatal::die)
 }
 
 /// Every `*.idx` in `dir` whose `.pack` sibling exists, sorted — the set

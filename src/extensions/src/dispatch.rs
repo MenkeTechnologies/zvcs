@@ -1560,7 +1560,14 @@ fn run_setup_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     if help || args.first().is_some_and(|a| a == "--help") || !RUN_SETUP_VERBS.contains(&sub) {
         return None;
     }
-    if gix::discover::upwards(std::path::Path::new(".")).is_ok() {
+    // The walk stops at `$GIT_CEILING_DIRECTORIES` like setup's does; a ceiling with no entry above
+    // the starting directory is no ceiling at all (see `setup::discover_with_overrides`).
+    let walk = gix::discover::upwards::Options {
+        match_ceiling_dir_or_error: false,
+        ..Default::default()
+    }
+    .apply_environment();
+    if gix::discover::upwards_opts(std::path::Path::new("."), walk).is_ok() {
         return None;
     }
     let err = crate::setup::discover().err()?;

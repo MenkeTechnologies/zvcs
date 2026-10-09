@@ -378,6 +378,32 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         gix::worktree::stack::state::attributes::Source::IdMapping,
     )?;
 
+    // `do_match_pathspec()` walks *every* item against a path, not just the first that matches, and
+    // records the strongest match of each in `seen[]` — also for a path a later exclusion removes
+    // (builtin/rm.c, dir.c:550-586). The engine above answers "included or not"; these answer which
+    // positive items a path hit.
+    let mut item_ps = Vec::with_capacity(patterns.len());
+    for (idx, pattern) in patterns.iter().enumerate() {
+        item_ps.push(match is_exclude[idx] {
+            true => None,
+            false => Some(repo.pathspec(
+                false,
+                [pattern],
+                false,
+                &index,
+                gix::worktree::stack::state::attributes::Source::IdMapping,
+            )?),
+        });
+    }
+    let literal: Vec<bool> = pathspecs.iter().map(|p| !p.contains(['*', '?', '[', '\\'])).collect();
+    let rank_of = |kind: MatchKind| match kind {
+        MatchKind::Prefix | MatchKind::Always => RECURSIVELY,
+        MatchKind::WildcardMatch => FNMATCH,
+        MatchKind::Verbatim => EXACTLY,
+    };
+    let any_exclude = is_exclude.iter().any(|e| *e);
+    let all_exclude = is_exclude.iter().all(|e| *e);
+
     let mut seen: Vec<u8> = vec![0; pathspecs.len()];
     // `find_pathspecs_matching_skip_worktree()` (pathspec.c): the parallel `seen[]`
     // built from the entries the sparse-checkout definition excludes, consulted
@@ -393,20 +419,56 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let mut matched_verbatim: HashSet<usize> = HashSet::new();
 
     for t in &targets_all {
+        // The items this path hits, strongest rank each; with nothing but exclusions the implicit
+        // whole-tree item hits everything.
+        let mut hits: Vec<(usize, u8)> = Vec::new();
+        for (idx, item) in item_ps.iter_mut().enumerate() {
+            if let Some(item) = item {
+                if let Some(m) = item.pattern_matching_relative_path(t.path.as_bstr(), Some(false)) {
+                    if !m.is_excluded() {
+                        hits.push((idx, rank_of(m.kind)));
+                    }
+                }
+            }
+        }
+        let positive = !hits.is_empty() || all_exclude;
+        // An entry outside the sparse-checkout definition is invisible to the removal (and to
+        // `seen[]`) unless `--sparse` was given; it only feeds the separate skip-worktree tally
+        // that turns "did not match any files" into the sparse-path report. That tally is
+        // `ce_path_match()` over the skip-worktree entries with a fresh `seen[]`: every item the
+        // path hits, and, once one did, every exclusion (`seen[i] = MATCHED_FNMATCH` before the
+        // exclusion pass, dir.c:564-565) — whether or not the path ends up excluded.
+        if t.sparse && !opts.sparse {
+            for (idx, _) in &hits {
+                sparse_seen[*idx] = true;
+            }
+            if positive {
+                for (idx, excluded) in is_exclude.iter().enumerate() {
+                    if *excluded {
+                        sparse_seen[idx] = true;
+                    }
+                }
+            }
+            continue;
+        }
+        // The same for the entries that are visible: a path that hit an item marks it, and the
+        // exclusions, even if an exclusion then removes the path.
+        for (idx, rank) in &hits {
+            if !(seen[*idx] == EXACTLY && literal[*idx]) && seen[*idx] < *rank {
+                seen[*idx] = *rank;
+            }
+        }
+        if positive && any_exclude {
+            for (idx, excluded) in is_exclude.iter().enumerate() {
+                if *excluded {
+                    seen[idx] = seen[idx].max(FNMATCH);
+                }
+            }
+        }
         let Some(m) = ps.pattern_matching_relative_path(t.path.as_bstr(), Some(false)) else {
             continue;
         };
         if m.is_excluded() {
-            continue;
-        }
-        // An entry outside the sparse-checkout definition is invisible to the
-        // removal (and to `seen[]`) unless `--sparse` was given; it only feeds
-        // the separate skip-worktree tally that turns "did not match any files"
-        // into the sparse-path report.
-        if t.sparse && !opts.sparse {
-            if m.sequence_number < sparse_seen.len() {
-                sparse_seen[m.sequence_number] = true;
-            }
             continue;
         }
         let rank = match m.kind {
@@ -468,7 +530,9 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let mut seen_any = false;
     let mut only_match_skip_worktree: Vec<String> = Vec::new();
     for (idx, raw) in pathspecs.iter().enumerate() {
-        if is_exclude[idx] {
+        // Exclusions are judged like every other item: `seen[]` holds them as matched once
+        // anything hit a positive item (dir.c:564-565), which is what makes them optional.
+        if is_exclude[idx] && all_exclude {
             continue;
         }
         let how = seen[idx];

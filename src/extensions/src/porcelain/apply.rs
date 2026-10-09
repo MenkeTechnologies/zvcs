@@ -1011,6 +1011,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+        // `git_apply_config()` ends in `git_xmerge_config()` (apply.c:54): `merge.conflictStyle` is
+        // judged with the rest of the configuration, ahead of the command line. Under `git am` the
+        // refusal is a `die()` of the process that links `apply` in.
+        if let Err(rejection) = crate::cmd_config::validate_xmerge(&repo) {
+            let message = rejection.into_fatal();
+            return Ok(if message.is_empty() { ExitCode::from(128) } else { die(&message) });
+        }
     }
 
     if let Err(code) = parse_opts(args, &mut o, &mut sources) {

@@ -844,6 +844,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         &index,
         gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
     )?;
+    let mut seen_items = SeenItems::new(&repo, &patterns, &raw_patterns, &index)?;
 
     // ```c
     // if (recurse_submodules)
@@ -976,14 +977,10 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         // (dir.h:585-594.) `show_dir_entry()` runs this for every line it prints,
         // and that is the *only* thing that sets `ps_matched` for a `-o`/`-k`
         // listing: the trailing `/` is dropped and re-offered as the `is_dir` flag.
-        let mut mark = |ps: &mut gix::Pathspec<'_>, name: &BStr| {
+        let mut mark = |_ps: &mut gix::Pathspec<'_>, name: &BStr| {
             let is_dir = name.last() == Some(&b'/');
             let bare = if is_dir { &name[..name.len() - 1] } else { &name[..] };
-            if let Some(m) = ps.pattern_matching_relative_path(bare.as_bstr(), Some(is_dir)) {
-                if !m.is_excluded() {
-                    matched.insert(m.sequence_number);
-                }
-            }
+            seen_items.mark(bare.as_bstr(), is_dir, &mut matched);
         };
 
         if opts.others {
@@ -1069,13 +1066,13 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
+        seen_items.mark(path, false, &mut matched);
         let Some(m) = ps.pattern_matching_relative_path(path, Some(false)) else {
             continue;
         };
         if m.is_excluded() {
             continue;
         }
-        matched.insert(m.sequence_number);
 
         // Under `-i`, every index-derived line (cached, deleted, modified) is
         // restricted to entries the exclude stack matches, exactly as git's
@@ -1166,13 +1163,13 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             };
             for rec in records {
                 let name = rec.name();
+                seen_items.mark(name, false, &mut matched);
                 let Some(m) = ps.pattern_matching_relative_path(name, Some(false)) else {
                     continue;
                 };
                 if m.is_excluded() {
                     continue;
                 }
-                matched.insert(m.sequence_number);
                 let display = strip_prefix(name, prefix.as_ref());
                 let display = display.as_slice();
                 let path_bytes = if quote {
@@ -1333,6 +1330,51 @@ fn keep_trailing_spaces(pattern: &str) -> String {
         out.push_str("\\ ");
     }
     out
+}
+
+/// git's `ps_matched` bookkeeping. `do_match_pathspec()` walks *every* positive
+/// item against a path and sets `seen[i]` for each that matches, also when a
+/// later exclusion then removes the path (dir.c:550-586). The combined engine
+/// only answers "included or not", so each positive item gets an engine of its own.
+struct SeenItems<'r> {
+    items: Vec<Option<gix::Pathspec<'r>>>,
+}
+
+impl<'r> SeenItems<'r> {
+    fn new(
+        repo: &'r gix::Repository,
+        patterns: &[BString],
+        raw_patterns: &[String],
+        index: &gix::index::State,
+    ) -> Result<Self> {
+        let mut items = Vec::with_capacity(patterns.len());
+        for (pattern, raw) in patterns.iter().zip(raw_patterns) {
+            items.push(if is_exclude_pathspec(raw) {
+                None
+            } else {
+                Some(repo.pathspec(
+                    false,
+                    [pattern],
+                    false,
+                    index,
+                    gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+                )?)
+            });
+        }
+        Ok(Self { items })
+    }
+
+    /// Record every positive item that `path` hits.
+    fn mark(&mut self, path: &BStr, is_dir: bool, matched: &mut HashSet<usize>) {
+        for (i, item) in self.items.iter_mut().enumerate() {
+            let Some(item) = item else { continue };
+            if let Some(m) = item.pattern_matching_relative_path(path, Some(is_dir)) {
+                if !m.is_excluded() {
+                    matched.insert(i);
+                }
+            }
+        }
+    }
 }
 
 /// Whether a pathspec element carries `exclude` magic, in either spelling —

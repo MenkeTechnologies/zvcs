@@ -22,3 +22,25 @@ impl Store {
         self.replacements.iter().copied()
     }
 }
+
+/// Port of `do_lookup_replace_object()` (replace-object.c): follow `refs/replace/` links from `id`
+/// for at most `MAXREPLACEDEPTH` (5) steps and return the object finally read.
+///
+/// A chain that is still replacing after five steps - which includes an object replaced by itself -
+/// is `die("replace depth too high for object %s")`: `fatal:` on stderr and exit 128, from whichever
+/// code asked for the object, so nothing the caller would have done next happens.
+pub(crate) fn follow_replacements<'a>(
+    replacements: &'a [(gix_hash::ObjectId, gix_hash::ObjectId)],
+    id: &'a gix_hash::oid,
+) -> &'a gix_hash::oid {
+    const MAX_REPLACE_DEPTH: usize = 5;
+    let mut current = id;
+    for _ in 0..MAX_REPLACE_DEPTH {
+        match replacements.binary_search_by(|(replaced, _)| replaced.as_ref().cmp(current)) {
+            Ok(pos) => current = replacements[pos].1.as_ref(),
+            Err(_) => return current,
+        }
+    }
+    eprintln!("fatal: replace depth too high for object {id}");
+    std::process::exit(128);
+}

@@ -101,13 +101,7 @@ where
                 });
             }
         } else if !self.ignore_replacements {
-            if let Ok(pos) = self
-                .store
-                .replacements
-                .binary_search_by(|(map_this, _)| map_this.as_ref().cmp(id))
-            {
-                id = self.store.replacements[pos].1.as_ref();
-            }
+            id = super::access::follow_replacements(&self.store.replacements, id);
         }
 
         loop {

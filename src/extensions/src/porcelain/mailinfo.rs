@@ -267,7 +267,16 @@ pub fn mailinfo(args: &[String]) -> Result<ExitCode> {
     std::io::stdin().read_to_end(&mut stdin)?;
     mi.input = Input::new(stdin);
 
-    mi.run(&files.0, &files.1)
+    // `prefix_filename(prefix, argv[i])` (builtin/mailinfo.c:111-112): git has already moved to the
+    // top of the work tree, so the names it opens and reports carry the directory the command was
+    // started in. This port stays where it was started, so it opens the operands as typed and only
+    // reports the prefixed spelling.
+    let prefix = crate::setup::discover().ok().and_then(|repo| crate::setup::startup_prefix(&repo));
+    let shown = (
+        crate::setup::prefix_filename(prefix.as_deref(), &files.0),
+        crate::setup::prefix_filename(prefix.as_deref(), &files.1),
+    );
+    mi.run(&files.0, &files.1, &shown)
 }
 
 /// `cmd_mailinfo`'s `struct option options[]` (builtin/mailinfo.c:22-45), in
@@ -552,15 +561,15 @@ impl Mailinfo {
     }
 
     /// `mailinfo()` plus `cmd_mailinfo()`'s `!!` on the return value.
-    fn run(&mut self, msg: &str, patch: &str) -> Result<ExitCode> {
+    fn run(&mut self, msg: &str, patch: &str, shown: &(String, String)) -> Result<ExitCode> {
         // git opens both files for writing before reading a single byte, so an
         // early failure still leaves them truncated.
         if let Err(e) = std::fs::File::create(msg) {
-            eprintln!("{msg}: {}", perror(&e));
+            eprintln!("{}: {}", shown.0, perror(&e));
             return Ok(ExitCode::from(1));
         }
         if let Err(e) = std::fs::File::create(patch) {
-            eprintln!("{patch}: {}", perror(&e));
+            eprintln!("{}: {}", shown.1, perror(&e));
             return Ok(ExitCode::from(1));
         }
 
@@ -570,7 +579,7 @@ impl Mailinfo {
                 Some(b) if is_space(b) => self.input.advance(),
                 Some(_) => break,
                 None => {
-                    eprintln!("error: empty patch: '{patch}'");
+                    eprintln!("error: empty patch: '{}'", shown.1);
                     return Ok(ExitCode::from(1));
                 }
             }

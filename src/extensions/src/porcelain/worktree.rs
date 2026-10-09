@@ -596,7 +596,9 @@ fn collect_in_readdir_order(repo: &gix::Repository, expire: u64) -> Result<Vec<W
     // `get_worktree_git_dir()` (:437-445) is the common directory for the main
     // worktree and `worktrees/<id>` for a linked one.
     let this_git_dir = gix::path::realpath(repo.git_dir()).unwrap_or_else(|_| repo.git_dir().to_owned());
-    let is_bare = repo.is_bare();
+    // `get_main_worktree()` (worktree.c:126): `repo->bare_cfg == 1 || is_bare_repository(repo)`, so
+    // `core.bare = true` marks the main worktree bare even where a work tree is checked out.
+    let is_bare = repo.is_bare() || repo.config_snapshot().boolean("core.bare") == Some(true);
     // `add_head_info()` reads each entry's `HEAD` from *that worktree's* ref store
     // (worktree.c:46), and the main worktree's is the common one. Reading the current repository's
     // `HEAD` instead reports the main worktree as sitting on the branch of whichever linked

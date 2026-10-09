@@ -395,12 +395,25 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
     //
     // A submodule source never reaches the expansion (`goto act_on_entry` at
     // `:370`), so its self-remap is not announced.
-    if dry_run {
-        for plan in plans.iter().filter(|p| p.is_dir && p.submodule.is_none()) {
-            for (old, new) in &plan.remaps {
+    //
+    // Each expansion is then checked like any other source: `lstat()` failing on a tracked file
+    // the work tree lacks is `bad source` (`:322`) unless `skip-worktree` explains it, and `-k`
+    // drops just that entry.
+    for plan in plans.iter_mut().filter(|p| p.is_dir && p.submodule.is_none()) {
+        let mut kept = Vec::with_capacity(plan.remaps.len());
+        for (old, new) in std::mem::take(&mut plan.remaps) {
+            if dry_run {
                 println!("Checking rename of '{old}' to '{new}'");
             }
+            if std::fs::symlink_metadata(workdir.join(&old)).is_err() && !skip_worktree_entry(&index, &old) {
+                if skip {
+                    continue;
+                }
+                return fatal(format!("bad source, source={old}, destination={new}"));
+            }
+            kept.push((old, new));
         }
+        plan.remaps = kept;
     }
 
     // ```c

@@ -399,6 +399,10 @@ pub fn checkout_index(args: &[String]) -> Result<ExitCode> {
         let entries = index.entries_mut();
         for (idx, stat) in &ctx.stat_updates {
             entries[*idx].stat = *stat;
+            // `fill_stat_cache_info()` (read-cache.c:197): `core.ignoreStat` marks what it records.
+            if crate::default_config::assume_unchanged() {
+                entries[*idx].flags.insert(gix::index::entry::Flags::ASSUME_VALID);
+            }
         }
         // `-u` rewrites the index with the refreshed stat cache
         // (builtin/checkout-index.c:341-347, `write_locked_index()`), and that

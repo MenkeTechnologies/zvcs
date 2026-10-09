@@ -4097,6 +4097,10 @@ pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId)
                 subset_stats.get(&path).filter(|(oid, mode, _)| *oid == e.id && *mode == e.mode)
             {
                 e.stat = *stat;
+                // `fill_stat_cache_info()` (read-cache.c:197): `core.ignoreStat` marks what it records.
+                if crate::default_config::assume_unchanged() {
+                    e.flags.insert(Flags::ASSUME_VALID);
+                }
             } else if let Some((oid, mode, stat, _)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
                     e.stat = *stat;

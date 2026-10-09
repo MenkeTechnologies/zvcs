@@ -288,22 +288,27 @@ where
 /// does not.
 pub fn carry_written_stat(written: &gix::index::State, index: &mut gix::index::State) {
     use gix::index::entry::Flags;
-    let fresh: std::collections::HashMap<BString, (gix::ObjectId, gix::index::entry::Mode, gix::index::entry::Stat, bool)> = {
+    let fresh: std::collections::HashMap<BString, (gix::ObjectId, gix::index::entry::Mode, gix::index::entry::Stat, bool, bool)> = {
         let backing = written.path_backing();
         written
             .entries()
             .iter()
-            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat, e.flags.contains(Flags::UPTODATE))))
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode, e.stat, e.flags.contains(Flags::UPTODATE), e.flags.contains(Flags::ASSUME_VALID))))
             .collect()
     };
     let backing = index.path_backing().to_owned();
     for e in index.entries_mut() {
-        if let Some((_, _, stat, uptodate)) = fresh
+        if let Some((_, _, stat, uptodate, valid)) = fresh
             .get(e.path_in(&backing))
             .filter(|(id, mode, ..)| *id == e.id && *mode == e.mode)
         {
             e.stat = *stat;
             e.flags.set(Flags::UPTODATE, *uptodate);
+            // `CE_VALID` from `fill_stat_cache_info()` under `core.ignoreStat`; an entry
+            // already marked stays marked.
+            if *valid {
+                e.flags.insert(Flags::ASSUME_VALID);
+            }
         }
     }
 }
@@ -320,7 +325,16 @@ pub fn carry_written_stat(written: &gix::index::State, index: &mut gix::index::S
 /// not written and is not marked.
 fn mark_written_uptodate(entries: &mut [gix::index::Entry]) {
     use gix::index::entry::{Flags, Mode};
+    // `fill_stat_cache_info()` sets `CE_VALID` before it looks at the file type (read-cache.c:197),
+    // so under `core.ignoreStat` every entry written carries it, symlinks included.
+    let valid = crate::default_config::assume_unchanged();
     for entry in entries {
+        if valid
+            && !entry.flags.contains(Flags::SKIP_WORKTREE)
+            && matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE | Mode::SYMLINK)
+        {
+            entry.flags.insert(Flags::ASSUME_VALID);
+        }
         if !entry.flags.contains(Flags::SKIP_WORKTREE) && matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE) {
             entry.flags.insert(Flags::UPTODATE);
         }

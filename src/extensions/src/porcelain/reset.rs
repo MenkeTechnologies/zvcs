@@ -1361,7 +1361,8 @@ fn reset_index_to_tree(
 
     // `oneway_merge()`'s `same(old, a)` arm re-adds the old entry itself, so an entry the
     // reset leaves alone keeps its stat — and its `CE_UPTODATE`, which `--keep`'s second
-    // pass needs for the files its first pass just wrote.
+    // pass needs for the files its first pass just wrote, and its `CE_VALID`, which the first
+    // pass gave them under `core.ignoreStat` (`fill_stat_cache_info()`).
     let mut old_map: HashMap<BString, (ObjectId, Mode, Stat, Flags)> =
         HashMap::with_capacity(old.entries().len());
     {
@@ -1369,7 +1370,7 @@ fn reset_index_to_tree(
         for e in old.entries() {
             old_map.insert(
                 e.path_in(backing).to_owned(),
-                (e.id, e.mode, e.stat, e.flags & Flags::UPTODATE),
+                (e.id, e.mode, e.stat, e.flags & (Flags::UPTODATE | Flags::ASSUME_VALID)),
             );
         }
     }

@@ -101,6 +101,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Whether `git_default_config()` has been run over a value in this process.
 static WALKED: AtomicBool = AtomicBool::new(false);
 
+/// git's `assume_unchanged` (environment.c:45), set by `core.ignoreStat` while the configuration
+/// is walked. [`assume_unchanged`] reads it.
+static ASSUME_UNCHANGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether `core.ignoreStat` was in force when the default configuration was walked: every index
+/// entry a checkout writes then carries `CE_VALID` (`fill_stat_cache_info()`).
+pub(crate) fn assume_unchanged() -> bool {
+    ASSUME_UNCHANGED.load(Ordering::Relaxed)
+}
+
 /// C's `fsync_object_files >= 0`: set by the first `core.fsyncObjectFiles` read.
 static FSYNC_OBJECT_FILES_SEEN: AtomicBool = AtomicBool::new(false);
 
@@ -319,7 +329,7 @@ fn core_config(v: &ConfigValue, name: &str, out: &mut DefaultConfig) -> Result<(
         // `git_config_bool(var, value)`, so a value neither the word nor the
         // integer grammar reads dies with `bad boolean config value`.
         "filemode" | "trustctime" | "quotepath" | "symlinks" | "ignorecase" | "bare"
-        | "ignorestat" | "sparsecheckout" | "sparsecheckoutcone" | "precomposeunicode"
+        | "sparsecheckout" | "sparsecheckoutcone" | "precomposeunicode"
         | "protecthfs" | "protectntfs" => {
             bool_value(v, key)?;
         }
@@ -504,6 +514,13 @@ fn core_config(v: &ConfigValue, name: &str, out: &mut DefaultConfig) -> Result<(
         // with `bad boolean config value` on anything else.
         "lockfilepid" => {
             gix::lock::pid::set_enabled(bool_value(v, key)?);
+        }
+
+        // `core.ignorestat` — environment.c:374: `assume_unchanged = git_config_bool(var, value)`,
+        // a process global that `fill_stat_cache_info()` consults for every entry a checkout
+        // writes (read-cache.c:197). Assigned at this callback, as `core.lockfilePid` is.
+        "ignorestat" => {
+            ASSUME_UNCHANGED.store(bool_value(v, key)?, Ordering::Relaxed);
         }
 
         // environment.c:475-480: `config_error_nonbool` for the valueless

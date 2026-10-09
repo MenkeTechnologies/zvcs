@@ -465,3 +465,21 @@ fn revision_parsing_stops_at_the_first_pathspec() {
     assert_eq!(stderr, "fatal: bad revision '^nosuchrev'\n");
     assert_eq!(code, 128);
 }
+
+/// `--reencode` takes a `git_parse_maybe_bool` value, whose integer fallback is
+/// `strtoimax` and so skips leading whitespace: ` 1` and `\t0` are accepted where
+/// `maybe` is not.
+#[test]
+fn reencode_integer_fallback_skips_leading_whitespace() {
+    let (root, repo) = fixture("reencodews");
+    let home = root.join("home");
+
+    for arg in ["--reencode= 1", "--reencode=\t0", "--reencode=\n-2"] {
+        let (stdout, stderr, code) = git(&repo, &home, &["fast-export", "--max-count=1", arg, "main"]);
+        assert_eq!(code, 0, "for {arg:?}: {stderr}");
+        assert!(stdout.starts_with("blob\n"), "for {arg:?}: {stdout}");
+    }
+    let (_, stderr, code) = git(&repo, &home, &["fast-export", "--reencode= maybe", "main"]);
+    assert_eq!(stderr, "error: unknown reencoding mode:  maybe\n");
+    assert_eq!(code, 129);
+}

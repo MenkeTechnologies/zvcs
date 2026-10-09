@@ -2041,6 +2041,8 @@ fn default_head(s: &str) -> &str {
 /// fits a signed C `int`. Returns `None` for anything git rejects with a usage
 /// error (empty, non-numeric, bad suffix, trailing junk, out of range).
 fn parse_progress_int(s: &str) -> Option<i64> {
+    // `strtoimax` skips leading `isspace` before the sign.
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
     let b = s.as_bytes();
     let (neg, mut i) = match b.first() {
         Some(b'+') => (false, 1),

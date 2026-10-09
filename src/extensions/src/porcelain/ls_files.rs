@@ -259,14 +259,16 @@ fn check_pathspecs(
     patterns: &[BString],
     raw_patterns: &[String],
 ) -> Result<Option<ExitCode>> {
-    // `init_pathspec_magic()` runs first and looks only at the four global
-    // settings, so a contradictory pair is fatal before any element is read.
+    // `parse_pathspec()` returns before `init_pathspec_item()` when there is no element,
+    // so the global settings are only examined once there is a pathspec to parse.
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    // `init_pathspec_magic()` looks only at the four global settings, so a
+    // contradictory pair is fatal before any element is read.
     if let Some(msg) = crate::pathspec::global_magic_fatal() {
         eprintln!("fatal: {msg}");
         return Ok(Some(ExitCode::from(128)));
-    }
-    if patterns.is_empty() {
-        return Ok(None);
     }
     let defaults = repo.pathspec_defaults_inherit_ignore_case(false)?;
     // The CWD relative to the worktree root; git's `prefix`. Empty at the top level.

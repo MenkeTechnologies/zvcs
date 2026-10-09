@@ -1319,8 +1319,12 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
         None => gix::pathspec::Defaults::from_environment(&mut |name| std::env::var_os(name))
             .unwrap_or_default(),
     };
-    if let Some(msg) = crate::pathspec::global_magic_fatal() {
-        return Err(crate::fatal::die(msg));
+    // `parse_pathspec()` returns before `init_pathspec_item()` for an empty list, so the
+    // global settings are only examined when there is an element.
+    if !specs.is_empty() {
+        if let Some(msg) = crate::pathspec::global_magic_fatal() {
+            return Err(crate::fatal::die(msg));
+        }
     }
     match repo.as_ref() {
         // Inside a repository `init_pathspec_item()`'s second `die()` applies too:

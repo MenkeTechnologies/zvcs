@@ -2697,7 +2697,8 @@ fn pathspec_matches(specs: &[String], path: &BStr) -> bool {
 /// then restored from the index's resolve-undo (`REUC`) records.
 fn do_unresolve(ctx: &mut Ctx, specs: &[String]) -> Result<Step> {
     for spec in specs {
-        let path = match resolve_path(ctx, spec.as_bytes().as_bstr())? {
+        let raw = spec.as_bytes().as_bstr();
+        let path = match if ctx.workdir.is_some() { resolve_path(ctx, raw)? } else { resolve_without_worktree(ctx, raw)? } {
             Ok(p) => p,
             Err(Die) => return Ok(Err(Die)),
         };
@@ -2961,7 +2962,40 @@ fn resolve_path(ctx: &Ctx, raw: &BStr) -> Result<std::result::Result<BString, Di
     let Some(workdir) = ctx.workdir.as_ref() else {
         return Err(crate::fatal::need_work_tree());
     };
+    resolve_in_workdir(ctx, workdir, raw)
+}
 
+/// `prefix_path()` for a command that never called `setup_work_tree()` (`--unresolve`
+/// runs from its option callback without it): with no work tree there is no prefix, so a
+/// relative path is only normalised and an absolute one, or one that climbs above the
+/// root, is `fatal: '<path>' is outside repository at '<git dir>'` (setup.c
+/// `prefix_path()`, with `get_git_work_tree()` NULL so the hint is the absolute git dir).
+fn resolve_without_worktree(ctx: &Ctx, raw: &BStr) -> Result<std::result::Result<BString, Die>> {
+    let mut kept: Vec<&[u8]> = Vec::new();
+    let mut outside = raw.first() == Some(&b'/');
+    if !outside {
+        for part in raw.split(|&b| b == b'/') {
+            match part {
+                b"" | b"." => {}
+                b".." if kept.pop().is_none() => outside = true,
+                b".." => {}
+                other => kept.push(other),
+            }
+        }
+    }
+    if outside {
+        let hint = crate::pathspec::absolute_path(&crate::porcelain::rev_parse::repo_get_git_dir(&ctx.repo));
+        eprintln!("fatal: '{raw}' is outside repository at '{}'", hint.display());
+        return Ok(Err(Die));
+    }
+    let mut out = kept.join(&b'/');
+    if raw.last() == Some(&b'/') && !out.is_empty() {
+        out.push(b'/');
+    }
+    Ok(Ok(BString::from(out)))
+}
+
+fn resolve_in_workdir(ctx: &Ctx, workdir: &Path, raw: &BStr) -> Result<std::result::Result<BString, Die>> {
     let raw_os = bytes_to_os(raw);
     let joined: PathBuf = if raw.first() == Some(&b'/') {
         PathBuf::from(&raw_os)

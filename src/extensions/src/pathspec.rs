@@ -346,7 +346,7 @@ fn bare_outside_repository_fatal<S: AsRef<[u8]>>(
 /// `strbuf_add_absolute_path()` (abspath.c): a relative path is appended to the
 /// current directory — spelled as `$PWD` when that names the same directory as
 /// `getcwd()` — with one `/` between, and nothing is normalised.
-fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn absolute_path(path: &std::path::Path) -> std::path::PathBuf {
     if path.is_absolute() {
         return path.to_owned();
     }

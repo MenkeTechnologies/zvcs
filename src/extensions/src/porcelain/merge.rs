@@ -5204,6 +5204,9 @@ fn continue_merge() -> Result<ExitCode> {
         eprintln!("fatal: There is no merge in progress (MERGE_HEAD missing).");
         return Ok(ExitCode::from(128));
     }
+    // The child is `git commit`, whose `git_config(git_commit_config, &s)` runs before anything
+    // it checks: a value that callback refuses dies there, ahead of the unmerged-paths report.
+    crate::status_config::validate_commit(&repo).map_err(|r| r.into_error())?;
     drop(repo);
     super::commit::commit(&[])
 }

@@ -2399,6 +2399,17 @@ pub fn explicit_git_dir_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
     if args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all") {
         return None;
     }
+    // `cmd_rev_parse()` sets up lazily: a leading `--parseopt` or `--sq-quote` is answered before
+    // any setup, `--local-env-vars` and `--resolve-git-dir` ahead of the first argument that needs
+    // one, where `rev_parse` runs this gate itself.
+    if sub == "rev-parse"
+        && matches!(
+            args.first().map(String::as_str),
+            Some("--local-env-vars" | "--resolve-git-dir" | "--parseopt" | "--sq-quote")
+        )
+    {
+        return None;
+    }
     let env = std::env::var_os("GIT_DIR")?;
     let path = PathBuf::from(&env);
     let target = match crate::porcelain::rev_parse::read_gitfile_gently(&path) {

@@ -352,6 +352,14 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // The first argument past those two is where `setup_git_directory()` runs; for an explicit
+    // `$GIT_DIR` naming no repository that is the refusal dispatch skipped for a leading
+    // pre-setup option.
+    if start > 0 {
+        if let Some(code) = crate::setup::explicit_git_dir_gate("rev-parse", args) {
+            return Ok(code);
+        }
+    }
     // The first argument past those two is where `setup_git_directory()` runs, and
     // with it the walk's refusal of a `.git` file it cannot follow.
     if let Some(code) = crate::setup::discovery_gitfile_gate() {

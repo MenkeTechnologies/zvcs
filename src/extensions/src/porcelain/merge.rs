@@ -1624,6 +1624,18 @@ fn remove_merge_state(repo: &gix::Repository, and_branch_state: bool) {
 fn quit() -> Result<ExitCode> {
     let repo = crate::setup::discover()?;
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
+    // `remove_merge_branch_state()` unlinks the state files and then `refs_delete_ref()`s
+    // `AUTO_MERGE`, whether or not it exists: a files-backend transaction takes the
+    // `packed-refs` lock in prepare (`core.packedRefsTimeout`) and reads its write options in
+    // finish (`core.logAllRefUpdates`), and a value either refuses is the `fatal:` — after the
+    // unlinks, which stay done.
+    if !crate::refstore::is_reftable(&repo) {
+        for name in MERGE_STATE_FILES {
+            let _ = std::fs::remove_file(repo.git_dir().join(name));
+        }
+        crate::sequencer::packed_refs_lock_timeout(&repo)?;
+        crate::setup::ref_store_write_options_gate();
+    }
     remove_merge_state(&repo, false);
     // `remove_merge_branch_state()` (builtin/merge.c:1452) ends in
     // `save_autostash_ref(r, "MERGE_AUTOSTASH")` (branch.c:837).

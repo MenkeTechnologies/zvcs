@@ -501,6 +501,12 @@ fn packed_refs_lock_first_use() {
 /// `files_transaction_finish()` does. git's `die()` releases them through the
 /// tempfile `atexit` handler; `std::process::exit` runs no destructors, so the
 /// registered lock files are removed here before it.
+/// [`ref_store_write_options`] for a caller that finishes a ref deletion without a gix
+/// transaction to run the hook.
+pub fn ref_store_write_options_gate() {
+    ref_store_write_options();
+}
+
 fn ref_store_write_options() {
     if let Some(Some(message)) = WRITE_OPTIONS_REFUSAL.get() {
         gix::tempfile::registry::cleanup_tempfiles();

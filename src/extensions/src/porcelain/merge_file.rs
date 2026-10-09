@@ -13,6 +13,11 @@
 //! `merge.conflictStyle` config default. Long options may be abbreviated to any
 //! unique prefix, as [`super::resolve_long`] resolves them.
 //!
+//! The whole configuration is walked first, as `repo_config(repo, git_xmerge_config, NULL)` does
+//! (builtin/merge-file.c:99): inside a repository a value `git_default_config()` refuses
+//! (`core.fileMode=input`, `core.bare=always`, …) is fatal at 128 ahead of any option or usage
+//! error, in parse order against a bad `merge.conflictStyle`.
+//!
 //! `merge.conflictStyle` is read and validated the way git's `git_xmerge_config`
 //! does: it runs before option parsing, so an unknown value (`Diff3`, `zealous`,
 //! empty, …) is fatal (exit 128) even when a `--diff3`/`--zdiff3` flag would
@@ -90,6 +95,9 @@ pub fn merge_file(args: &[String]) -> Result<ExitCode> {
     // before option parsing, `-h`, or the operand count check, so an invalid
     // `merge.conflictStyle` is fatal (exit 128) regardless of the command line.
     let repo = crate::setup::discover().ok();
+    if let Some(repo) = repo.as_ref() {
+        crate::cmd_config::validate_xmerge(repo).map_err(crate::default_config::Rejection::into_error)?;
+    }
     let config_style = match conflict_style_config(repo.as_ref()) {
         Ok(style) => style,
         Err(code) => return Ok(code),

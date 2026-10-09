@@ -8205,7 +8205,7 @@ impl ReflogEntry {
 fn reflog_display_name(repo: &gix::Repository, name: &str) -> String {
     if reflog_candidates(repo, name)
         .iter()
-        .any(|cand| super::reflog::log_file(repo, cand).is_file())
+        .any(|cand| crate::refstore::reflog_exists(repo, cand))
     {
         return name.to_string();
     }

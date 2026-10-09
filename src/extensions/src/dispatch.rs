@@ -691,6 +691,9 @@ enum ConfigCallback {
     /// `git_checkout_config` (builtin/checkout.c:1277), installed by
     /// `checkout_main()` for `checkout`, `switch` and `restore`.
     Checkout,
+    /// `git_reset_config` (builtin/reset.c): the default chain with `submodule.recurse` read as
+    /// a boolean first.
+    Reset,
     /// `grep_cmd_config` (builtin/grep.c:297).
     Grep,
     /// `git_blame_config` (builtin/blame.c:714).
@@ -766,6 +769,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "status" => ConfigCallback::Status,
         "commit" => ConfigCallback::Commit,
         "checkout" | "switch" | "restore" => ConfigCallback::Checkout,
+        "reset" | "read-tree" => ConfigCallback::Reset,
         "log" | "show" | "whatchanged" => ConfigCallback::Log,
         "format-patch" => ConfigCallback::Format,
         "diff" | "range-diff" => ConfigCallback::DiffUi,
@@ -1884,6 +1888,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::Status => crate::status_config::validate_status(&repo),
                     ConfigCallback::Commit => crate::status_config::validate_commit(&repo),
                     ConfigCallback::Checkout => crate::cmd_config::validate_checkout(&repo),
+                    ConfigCallback::Reset => crate::cmd_config::validate_reset(&repo),
                     ConfigCallback::Grep => crate::cmd_config::validate_grep(&repo),
                     ConfigCallback::Blame => crate::cmd_config::validate_blame(&repo),
                     ConfigCallback::Fetch => crate::cmd_config::validate_fetch(&repo),

@@ -1654,6 +1654,9 @@ fn abort() -> Result<ExitCode> {
         eprintln!("fatal: There is no merge to abort (MERGE_HEAD missing).");
         return Ok(ExitCode::from(128));
     }
+    // The work is a `git reset --merge` child, whose `git_reset_config` dies on a
+    // `submodule.recurse` that is not a boolean before it touches anything.
+    crate::cmd_config::validate_reset(&repo).map_err(|r| r.into_error())?;
 
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 

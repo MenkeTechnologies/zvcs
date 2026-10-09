@@ -845,6 +845,30 @@ fn git_checkout_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), R
     git_xmerge_config(v, out)
 }
 
+/// `git_reset_config()` (builtin/reset.c): `submodule.recurse` through
+/// `git_default_submodule_config()` — a boolean that dies when it is not one, and nothing else
+/// under `submodule.` — and everything else through `git_default_config()`.
+fn git_reset_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    if key.starts_with("submodule.") {
+        if key == "submodule.recurse" {
+            bool_value(v, key)?;
+        }
+        return Ok(());
+    }
+    git_default_config(v, out)
+}
+
+/// `repo_config(the_repository, git_reset_config, NULL)` — `reset`, `read-tree`, and the
+/// `reset --merge` child that `merge --abort` runs.
+pub fn validate_reset(repo: &gix::Repository) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in walk_config(repo) {
+        git_reset_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
 /// `git_xmerge_config()` (xdiff-interface.c:342-355), with the
 /// `parse_conflict_style_name()` table (xdiff-interface.c:312-326) inline: three
 /// exact, case-sensitive names.

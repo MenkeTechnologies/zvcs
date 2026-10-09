@@ -218,15 +218,22 @@ pub fn fetch(repo: &crate::Repository, promisor: &Remote, ids: &[gix_hash::Objec
         return Ok(false);
     }
     let mut remote = repo.find_remote(promisor.name.as_str())?;
-    // The fetch git spawns runs in the work tree's top directory (or the git directory of a bare
-    // repository), where a relative local URL such as `./.remote.git` is written from; this process
-    // may have been started in a subdirectory, which would make the path point elsewhere.
+    // The fetch git spawns runs in the work tree's top directory, where `setup_git_directory()` left
+    // it, and a relative local URL such as `./.remote.git` is written from there; this process may
+    // have been started in a subdirectory, which would make the path point elsewhere. Standing
+    // anywhere else — inside the git directory, say — git has not moved, and neither does the URL.
     if let Some(url) = remote.url(crate::remote::Direction::Fetch) {
         if url.scheme == crate::url::Scheme::File {
             let raw: &crate::bstr::BStr = url.path.as_ref();
             let path = gix_path::from_bstr(raw).into_owned();
-            if path.is_relative() {
-                let top = repo.workdir().unwrap_or_else(|| repo.git_dir());
+            let top = repo.workdir().filter(|top| {
+                let real = |p: &std::path::Path| gix_path::realpath(p).unwrap_or_else(|_| p.to_path_buf());
+                std::env::current_dir().is_ok_and(|cwd| {
+                    let cwd = real(&cwd);
+                    cwd.starts_with(real(top)) && !cwd.starts_with(real(repo.git_dir()))
+                })
+            });
+            if let (true, Some(top)) = (path.is_relative(), top) {
                 let absolute = gix_path::into_bstr(top.join(path)).into_owned();
                 let absolute: &crate::bstr::BStr = absolute.as_ref();
                 if let Ok(url) = crate::url::parse(absolute) {

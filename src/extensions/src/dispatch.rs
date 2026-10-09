@@ -1316,13 +1316,21 @@ const FORMAT_GENTLE_VERBS: &[&str] = &[
 /// `setup_git_directory()` in `builtin/rev-parse.c` and so skip both, exactly as
 /// they skip the settings block.
 fn repository_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if sub == "rev-parse" && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote") {
+    if rev_parse_before_setup_mode(sub, args) {
         return None;
     }
     let msg = format_refusal(sub, args)?;
     crate::trace2::error(&msg);
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
+/// `cmd_rev_parse()` answers `--parseopt` and `--sq-quote` before `setup_git_directory()`
+/// only as `argv[1]` (builtin/rev-parse.c:725-729); anywhere later they are ordinary
+/// arguments of a command that has already set up.
+fn rev_parse_before_setup_mode(sub: &str, args: &[String]) -> bool {
+    sub == "rev-parse"
+        && matches!(args.first().map(String::as_str), Some("--parseopt" | "--sq-quote"))
 }
 
 /// The `err.buf` half of [`repository_format_gate`], split out so the two
@@ -1671,7 +1679,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // builtin says — its usage, its `-h`, the work-tree gate below — and it is
     // placed after the `--help` rewrite because `cmd_help()` runs its own setup.
     let rev_parse_before_setup =
-        sub == "rev-parse" && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote");
+        rev_parse_before_setup_mode(sub, args);
     if !SETUP_FREE_VERBS.contains(&sub)
         && !SUPERSET_VERBS.contains(&sub)
         && !rev_parse_before_setup
@@ -1695,8 +1703,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // listed verb that runs without repository setup at all (builtin/rev-parse.c
     // handles both before `setup_git_directory()`), so they skip the gate the way
     // git skips the settings block for them.
-    let rev_parse_no_setup = sub == "rev-parse"
-        && args.iter().any(|a| a == "--parseopt" || a == "--sq-quote");
+    let rev_parse_no_setup = rev_parse_before_setup_mode(sub, args);
     // Each gate has its own answer to "does `-h` come first?", and the two do not
     // agree — see [`HELP_BEFORE_CONFIG_VERBS`] and [`SETTINGS_BEFORE_HELP_VERBS`].
     // `cmd_sparse_checkout()` runs its top-level `parse_options()` before both

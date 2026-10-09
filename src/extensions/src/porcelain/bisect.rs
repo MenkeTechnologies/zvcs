@@ -2034,7 +2034,13 @@ fn start(args: &[String]) -> Result<ExitCode> {
         }
         start_head
     } else {
-        head_label(&ctx.repo)?
+        match head_label(&ctx.repo)? {
+            Some(label) => label,
+            None => {
+                eprintln!("error: bad HEAD - strange symbolic ref");
+                return Ok(ExitCode::from(1));
+            }
+        }
     };
     clean_state(&ctx)?;
 
@@ -2159,23 +2165,34 @@ fn bisect_names(args: &[String], pathspec_pos: usize) -> String {
     format!("{quoted}\n")
 }
 
-/// The label `BISECT_START` records: the branch name, or the full oid when HEAD
-/// is detached.
-fn head_label(repo: &gix::Repository) -> Result<String> {
+/// The label `BISECT_START` records: the branch name when HEAD is a symref to
+/// `refs/heads/*` that resolves, the full oid when HEAD is detached or a symref
+/// elsewhere that resolves, and `None` (git's `bad HEAD - strange symbolic ref`)
+/// when the symref does not resolve:
+///
+/// ```c
+/// if (!repo_get_oid(the_repository, head, &head_oid) &&
+///     !starts_with(head, "refs/heads/")) {
+///         strbuf_addstr(&start_head, oid_to_hex(&head_oid));
+/// } else if (!repo_get_oid(the_repository, head, &head_oid) &&
+///            skip_prefix(head, "refs/heads/", &head)) {
+///         strbuf_addstr(&start_head, head);
+/// } else {
+///         return error(_("bad HEAD - strange symbolic ref"));
+/// }
+/// ```
+/// — builtin/bisect.c `bisect_start()`.
+fn head_label(repo: &gix::Repository) -> Result<Option<String>> {
     let head = repo.head()?;
-    if head.is_unborn() {
-        crate::git_fatal!("cannot bisect: HEAD does not point at a commit yet");
-    }
-    if head.is_detached() {
-        let id = head
-            .id()
-            .ok_or_else(|| anyhow!("cannot resolve detached HEAD"))?
-            .detach();
-        return Ok(id.to_hex().to_string());
-    }
-    head.referent_name()
-        .map(|n| n.shorten().to_str_lossy().into_owned())
-        .ok_or_else(|| anyhow!("cannot determine the current branch"))
+    let Some(id) = head.id() else {
+        return Ok(None);
+    };
+    let id = id.detach();
+    let branch = head
+        .referent_name()
+        .and_then(|n| n.as_bstr().strip_prefix(b"refs/heads/"))
+        .map(|b| b.to_str_lossy().into_owned());
+    Ok(Some(branch.unwrap_or_else(|| id.to_hex().to_string())))
 }
 
 /// git's `sq_quote_buf`: single-quote unconditionally, escaping `'` and `!`.

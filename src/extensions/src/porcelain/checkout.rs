@@ -523,7 +523,8 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             // `OPT_STRING`/`OPT_FILENAME` pointer and clears the `OPT_BOOL`, so
             // each is "as if never given".
             "--no-orphan" => orphan = None,
-            "--no-pathspec-from-file" => pathspec_from_file = None,
+            // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
+            "--no-pathspec-from-file" => {}
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--progress" => progress = Some(true),
             "--no-progress" => progress = Some(false),
@@ -720,6 +721,19 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
     // ref" and "this operand is a pathspec" — so it has to be known before that split.
     let guess = guess_flag
         .unwrap_or_else(|| repo.config_snapshot().boolean("checkout.guess") != Some(false));
+    // Whether a lone leading operand is a revision (a branch, a rev, or a DWIM remote branch)
+    // rather than a pathspec — `parse_branchname_arg()`'s split.
+    let names_a_revision = |spec: &str| {
+        repo.try_find_reference(format!("refs/heads/{spec}").as_str())
+            .ok()
+            .flatten()
+            .is_some()
+            || crate::objname::resolve_quiet(&repo, spec).is_some()
+            // Only when the DWIM is allowed to run: with `--no-guess` git never
+            // calls `parse_remote_branch()`, so a name that exists only on a remote
+            // stays an ordinary pathspec.
+            || (guess && matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_))))
+    };
     let path_op = if pathspec_from_file.is_some() {
         true
     } else if has_dashdash {
@@ -735,20 +749,7 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
                 // `HEAD` and `@` are revisions only while `HEAD` resolves: on an
                 // unborn branch `repo_get_oid_mb()` fails for them as for any name,
                 // and they are pathspecs (builtin/checkout.c:1476-1518).
-                let is_ref = repo
-                        .try_find_reference(format!("refs/heads/{spec}").as_str())
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    || crate::objname::resolve_quiet(&repo, spec).is_some()
-                    // Only when the DWIM is allowed to run: with `--no-guess` git never
-                    // calls `parse_remote_branch()`, so a name that exists only on a remote
-                    // stays an ordinary pathspec — `git checkout --no-guess <b>` is
-                    // `error: pathspec '<b>' did not match any file(s) known to git`, and
-                    // `git checkout --detach --no-guess <b>` is the `--detach does not take
-                    // a path argument` refusal below.
-                    || (guess && matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_))));
-                !is_ref
+                !names_a_revision(spec)
             }
             _ => true,
         }
@@ -933,8 +934,12 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             0 => restore_from_index(&repo, &refs, false, quiet, merge_opt(merge, &conflict_style, ""), force, ignore_skipworktree),
             // `--pathspec-from-file` rejects a `--` above, so this is the bare
             // form: stock reports `Updated N paths from <tree>` here.
-            1 => restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet, ignore_skipworktree),
-            _ => crate::git_fatal!("only one <tree-ish> may precede pathspecs"),
+            1 if names_a_revision(pre[0]) => {
+                restore_from_tree(&repo, pre[0], &refs, overlay, true, quiet, ignore_skipworktree)
+            }
+            // A lone operand that is no revision, or anything after a tree-ish, is a
+            // pathspec argument, which `--pathspec-from-file` refuses.
+            _ => crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together"),
         };
     }
 

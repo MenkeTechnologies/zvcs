@@ -584,7 +584,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             "--no-ignore-unmerged" => ignore_unmerged = false,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
-            "--no-pathspec-from-file" => pathspec_from_file = None,
+            // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
+            "--no-pathspec-from-file" => {}
             "--no-source" => source = None,
             "--no-conflict" => conflict_style = None,
             "--pathspec-from-file" => {

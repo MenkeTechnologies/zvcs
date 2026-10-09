@@ -579,7 +579,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             "-N" | "--intent-to-add" => intent_to_add = true,
             "--no-intent-to-add" => intent_to_add = false,
             "--pathspec-from-file" => take_pff_value = true,
-            "--no-pathspec-from-file" => pathspec_from_file = None,
+            // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
+            "--no-pathspec-from-file" => {}
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             s if s.starts_with("--pathspec-from-file=") => {

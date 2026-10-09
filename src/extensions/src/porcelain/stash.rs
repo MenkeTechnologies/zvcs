@@ -4328,7 +4328,8 @@ fn parse_push_options(
             // `OPT_STRING`/`OPT_FILENAME`/`OPT_BOOL` negations: git NULLs the
             // pointer or clears the int, i.e. "as if never given".
             "--no-message" => o.message = None,
-            "--no-pathspec-from-file" => from_file = None,
+            // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
+            "--no-pathspec-from-file" => {}
             "--no-pathspec-file-nul" => nul = false,
             "-q" | "--quiet" => o.quiet = true,
             "--no-quiet" => o.quiet = false,

@@ -294,10 +294,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pathspec-from-file=") => {
                 from_file = Some(s["--pathspec-from-file=".len()..].to_string());
             }
-            // `OPT_FILENAME`'s unset writes NULL (parse-options.c:214-215), so a
-            // later `--no-pathspec-from-file` discards an earlier value and the
-            // pathspecs come from argv again.
-            "--no-pathspec-from-file" => from_file = None,
+            // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
+            "--no-pathspec-from-file" => {}
             // Interactive hunk selection (`add-patch.c`), served by
             // [`super::add_patch`]. `-e`/`--edit` is the other machine:
             // [`edit_patch`] below.

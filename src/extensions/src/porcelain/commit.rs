@@ -947,7 +947,8 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--pathspec-from-file=") => {
                 pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string())
             }
-            "--no-pathspec-from-file" => pathspec_from_file = None,
+            // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
+            "--no-pathspec-from-file" => {}
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             // --- message shaping -----------------------------------------------

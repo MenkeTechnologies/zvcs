@@ -240,9 +240,9 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 "ignore-unmatch" => opts.ignore_unmatch = on,
                 "sparse" => opts.sparse = on,
                 "pathspec-file-nul" => opts.pathspec_file_nul = on,
-                // Reached only as `--no-pathspec-from-file`; the set sense
+                // Reached only as `--no-pathspec-from-file`, which keeps an earlier value (measured against stock); the set sense
                 // returned above.
-                "pathspec-from-file" => opts.pathspec_from_file = None,
+                "pathspec-from-file" => {}
                 _ => unreachable!("resolve_long only returns LONG_OPTS entries"),
             }
             i += 1;

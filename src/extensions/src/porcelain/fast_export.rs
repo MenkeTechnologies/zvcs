@@ -1395,6 +1395,26 @@ pub fn fast_export(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // `handle_deletes()`: a refspec with an empty source is a deletion (`--refspec=:<ref>`, as
+    // in a push), written as a reset to the null id of its destination - which is the C
+    // `printf("reset %s\nfrom %s\n\n", refspec->dst, null_oid)`, so a refspec with no colon at
+    // all has a NULL destination and prints as `(null)`.
+    for spec in &opts.refspecs {
+        let raw: &[u8] = spec;
+        let raw = raw.strip_prefix(b"+").unwrap_or(raw);
+        let (src, dst): (&[u8], &[u8]) = match raw.iter().position(|b| *b == b':') {
+            Some(colon) => (&raw[..colon], &raw[colon + 1..]),
+            None => (raw, b"(null)"),
+        };
+        if src.is_empty() {
+            st.out.extend_from_slice(b"reset ");
+            st.out.extend_from_slice(dst);
+            st.out.extend_from_slice(
+                format!("\nfrom {}\n\n", ObjectId::null(repo.object_hash())).as_bytes(),
+            );
+        }
+    }
+
     if opts.use_done {
         st.out.extend_from_slice(b"done\n");
     }

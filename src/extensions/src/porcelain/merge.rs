@@ -924,6 +924,8 @@ pub fn merge(args: &[String]) -> Result<ExitCode> {
             // effect on stdout (it silences the summary/diffstat). `--verbose`'s
             // extra diagnostics go to stderr and are not reproduced.
             "-q" | "--quiet" => opts.quiet = true,
+            // `verbosity_callback()`: either option unset puts the level back at 0.
+            "-v" | "--verbose" | "--no-verbose" | "--no-quiet" => opts.quiet = false,| "--quiet" => opts.quiet = true,
             "-v" | "--verbose" => opts.quiet = false,
             // `-e`/`--edit`/`--no-edit`: whether the merge message is opened in an
             // editor before the merge commit is written. Left `None` here so

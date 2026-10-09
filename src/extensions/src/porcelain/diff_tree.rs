@@ -1305,6 +1305,21 @@ fn peel_tree(repo: &gix::Repository, id: ObjectId) -> Option<ObjectId> {
     repo.find_object(id).ok()?.peel_to_tree().ok().map(|t| t.id)
 }
 
+/// `log_tree_diff()` returned 0 for a commit with nothing to diff (a root without `--root`,
+/// a merge without `-m`/`-c`): `log_tree_commit()` then prints the header anyway when
+/// `--always` set `always_show_header`.
+fn no_diff_shown(
+    repo: &gix::Repository,
+    commit_id: ObjectId,
+    opts: &Opts,
+    out: &mut Vec<u8>,
+) -> Result<u8> {
+    if opts.always {
+        emit_commit_header(repo, out, commit_id, opts)?;
+    }
+    Ok(0)
+}
+
 /// The body of [`single_commit`] once the commit, its tree and its parent list are
 /// known — shared with the `--stdin` loop, whose parents may have been grafted.
 fn emit_commit_diff(
@@ -1331,11 +1346,11 @@ fn emit_commit_diff(
         if opts.root {
             vec![None]
         } else {
-            return Ok(0);
+            return no_diff_shown(repo, commit_id, opts, out);
         }
     } else if parents.len() > 1 && !opts.merges {
         // A merge is silently skipped unless -m asks for per-parent diffs.
-        return Ok(0);
+        return no_diff_shown(repo, commit_id, opts, out);
     } else if opts.merges {
         // `first_parent_merges` (log-tree.c:1168) stops the per-parent loop after
         // the first parent.

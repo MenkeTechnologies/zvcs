@@ -1919,6 +1919,23 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
             return usage_error("--fixed-value only applies with 'value-pattern'");
         }
     }
+    // ```c
+    // if (!source->file && !startup_info->have_repository)
+    //         die(_("not in a git directory"));
+    // ```
+    //
+    // `check_write()` (builtin/config.c:812-822) is the first line of each legacy writer's
+    // branch, ahead of its `check_argc()`; the `set`/`unset` subcommands count their
+    // operands first. `GIT_CONFIG` names a file, which satisfies it.
+    let legacy_writer = !from_subcommand
+        && matches!(mode, Mode::Add | Mode::ReplaceAll | Mode::Unset | Mode::UnsetAll | Mode::RemoveSection);
+    if legacy_writer
+        && matches!(scope, Scope::Default)
+        && std::env::var_os(CONFIG_ENVIRONMENT).is_none()
+        && crate::setup::discover().is_err()
+    {
+        crate::git_fatal!("not in a git directory");
+    }
     match mode {
         Mode::List if !positional.is_empty() => {
             return usage_error("wrong number of arguments, should be 0");

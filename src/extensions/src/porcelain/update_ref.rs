@@ -265,11 +265,15 @@ pub(super) struct CmdlineWrite<'a> {
 /// or `refs_update_ref()` (which reports through `onerr`).
 pub(super) fn write_cmdline(repo: &gix::Repository, w: &CmdlineWrite<'_>, onerr: OnErr) -> Result<ExitCode> {
     let (name, new, old) = (w.name, w.new, w.old);
-    // A deletion only requires a "safe" name, not a well-formed one, and a bad
-    // one is an `error:` with exit 1 rather than a fatal.
-    if w.delete && !refname_is_safe(name) {
-        eprintln!("error: refusing to update ref with bad name '{name}'");
-        return Ok(ExitCode::from(1));
+    // `transaction_refname_valid()` (refs.c): `FETCH_HEAD` and `MERGE_HEAD` are
+    // never written through a transaction, and a null new value (a deletion, or an
+    // update to the all-zero id) only requires a "safe" name, not a well-formed
+    // one. A refusal is an `error:` with exit 1 for a deletion, `onerr` otherwise.
+    if crate::refstore::is_pseudo_ref(name) {
+        return Ok(transaction_failure(name, &format!("refusing to update pseudoref '{name}'"), w.delete, onerr));
+    }
+    if (w.delete || !matches!(new, Val::Oid(_))) && !refname_is_safe(name) {
+        return Ok(transaction_failure(name, &format!("refusing to update ref with bad name '{name}'"), w.delete, onerr));
     }
     // git reports this one through `refs_update_ref()`'s `onerr` wrapper, so it
     // carries the ref name.

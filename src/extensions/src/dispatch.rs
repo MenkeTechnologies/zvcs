@@ -1736,6 +1736,10 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
     // its `repo_read_index()`, after the option parse and the operand-count usage error;
     // `porcelain::mv` keeps that order itself.
     let parse_before_settings = sub == "mv"
+        // `cmd_prune_packed()` parses its options and refuses a stray operand ahead of
+        // `prune_packed_objects()`, which is where the settings block is first prepared;
+        // `porcelain::prune_packed` loads it itself at that point.
+        || sub == "prune-packed"
         // `cmd_worktree()`'s top-level `parse_options()` refuses a missing or unknown
         // subcommand and any option ahead of it before a subcommand reads the settings.
         || (sub == "worktree" && crate::porcelain::worktree_top_level_refused(args));

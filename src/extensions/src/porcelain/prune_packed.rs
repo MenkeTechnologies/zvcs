@@ -130,6 +130,7 @@ pub fn prune_packed(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
+    crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
     let hash = repo.object_hash();
     let objdir = repo.objects.store_ref().path().to_path_buf();
     let shown_objdir = display_objdir(&repo, &objdir);

@@ -1799,7 +1799,11 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         && !rev_parse_no_setup;
     let in_parallel_checkout = !help_only && updates_worktree(sub, args);
     if in_repo_settings || in_default_config || in_parallel_checkout {
-        if let Ok(repo) = crate::setup::discover() {
+        // A builtin whose `commands[]` entry carries no setup flag (`clone`, `verify-pack`)
+        // never opens the repository the working directory sits in, so its
+        // `repo_config()` sees system, global and command-line values only.
+        let found = if SETUP_FREE_VERBS.contains(&sub) { None } else { crate::setup::discover().ok() };
+        if let Some(repo) = found {
             // Settings block first, because that is the order the two diagnostics
             // come out of stock git for a command that reaches both: with
             // `-c core.createObject=bogus -c core.packedGitLimit=bogus`, git 2.55.0's

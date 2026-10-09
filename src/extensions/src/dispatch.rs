@@ -1734,6 +1734,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
         // `git_default_config`, the sparse patterns and the settings block, in that order;
         // `porcelain::backfill` keeps it itself.
         || sub == "backfill"
+        // `cmd_last_modified()` parses its options, then reads `git_default_config`; the settings
+        // block waits for the first revision. `porcelain::last_modified` keeps that order.
+        || sub == "last-modified"
         // `cmd_unpack_file()` resolves its operand, so it reports a usage error or an
         // unknown name, ahead of `repo_config(git_default_config)`
         // (builtin/unpack-file.c); `porcelain::unpack_file` keeps that order.

@@ -67,6 +67,27 @@ fn die_no_such_path(arg: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// `check_filename()` (setup.c): whether the argument names something on disk, after
+/// `:/` (a path from the work-tree root) and `:!` / `:^` (an exclude) are taken off. A bare
+/// `:/`, `:!` or `:^` is "always exists". `lstat`, so a dangling symlink counts.
+fn check_filename(repo: &gix::Repository, arg: &str) -> bool {
+    let path = if let Some(rest) = arg.strip_prefix(":/") {
+        if rest.is_empty() {
+            return true;
+        }
+        let root = repo.workdir().unwrap_or_else(|| std::path::Path::new("."));
+        return std::fs::symlink_metadata(root.join(rest)).is_ok();
+    } else if let Some(rest) = arg.strip_prefix(":!").or_else(|| arg.strip_prefix(":^")) {
+        if rest.is_empty() {
+            return true;
+        }
+        rest
+    } else {
+        arg
+    };
+    std::fs::symlink_metadata(path).is_ok()
+}
+
 /// `--max-depth`'s value through `OPTION_INTEGER` (`precision = sizeof(int)`),
 /// or the refusal: `error: option `max-depth' expects …` and exit 129, with no
 /// usage block.
@@ -173,6 +194,18 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     }
 
     let repo = crate::setup::discover()?;
+    // `repo_config(git_default_config)` runs once the options are parsed. The settings block is
+    // lazy: `prepare_repo_settings()` first runs when the first revision resolves, so a bad
+    // `core.packedGitLimit` loses to every error `setup_revisions()` raises before then.
+    crate::default_config::validate(&repo).map_err(crate::default_config::Rejection::into_error)?;
+    let mut settings_loaded = false;
+    let mut load_settings = || -> Result<()> {
+        if !settings_loaded {
+            settings_loaded = true;
+            crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
+        }
+        Ok(())
+    };
 
     // Split positionals into `<revision>` and pathspecs the way `setup_revisions`
     // does: a leading argument that names an object is the revision, everything
@@ -188,8 +221,9 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         if p.contains("..") || p.starts_with('^') {
             anyhow::bail!("unsupported <revision-range> {p:?} (only a single revision is ported)");
         }
-        let exists = std::path::Path::new(p).exists();
+        let exists = check_filename(&repo, p);
         if repo.rev_parse_single(p).is_ok() {
+            load_settings()?;
             if exists {
                 // `verify_non_filename()`.
                 eprintln!(
@@ -246,13 +280,14 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
+    // The implicit `HEAD` resolves after the pathspecs are parsed.
+    load_settings()?;
     // `parse_pathspec()`: when every item is an exclude, one positive item matching everything
     // is added.
     if pathspecs.is_empty() && !excludes.is_empty() {
         pathspecs.push(BString::default());
         depth_items.push(BString::default());
     }
-    pathspecs.sort();
     // `diff_setup_done()` runs at the end of `setup_revisions()`, before the unknown-argument
     // check: a depth limit and a wildcard pathspec exclude each other.
     if max_depth >= 0 && pathspecs.iter().chain(&excludes).any(|p| nowildcard_len(p) < p.len()) {

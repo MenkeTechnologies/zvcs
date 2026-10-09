@@ -547,15 +547,6 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         });
     }
 
-    // `prepare_repo_settings()` is lazy in git: `cmd_gc()` reaches it through the first
-    // object-database access (`need_to_gc()`'s pack count, `find_base_packs()`, or the
-    // children it spawns), so a usage error or an unreadable `--prune` date is answered
-    // first and only a run that gets this far dies on `index.sparse=bogus`.
-    if let Err(message) = crate::repo_settings::RepoSettings::load(&repo) {
-        eprintln!("fatal: {message}");
-        return Ok(ExitCode::from(128));
-    }
-
     // `gc --auto` is a no-op below the thresholds; git returns before touching
     // anything, so nothing below this point may run either. `need_to_gc()`
     // decides in two steps and the second one was missing here: the counters
@@ -574,6 +565,14 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             None => return Ok(ExitCode::SUCCESS),
         },
     };
+
+    // `prepare_repo_settings()` is lazy in git: `cmd_gc()` reaches it through the children it
+    // spawns, so a usage error, an unreadable `--prune` date and a below-threshold `--auto` run
+    // are all answered first, and only a run that gets this far dies on `index.sparse=bogus`.
+    if let Err(message) = crate::repo_settings::RepoSettings::load(&repo) {
+        eprintln!("fatal: {message}");
+        return Ok(ExitCode::from(128));
+    }
 
     // `cmd_gc()`: `if (cfg.detach_auto && opts.detach < 0) opts.detach = 1;`
     // inside the `--auto` branch (builtin/gc.c:930-931), so only `--auto` lets

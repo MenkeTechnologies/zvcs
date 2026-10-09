@@ -385,7 +385,6 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "format-patch",
     "fsck",
     "fsck-objects",
-    "gc",
     "grep",
     "last-modified",
     "log",
@@ -564,6 +563,10 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     // (builtin/fmt-merge-msg.c:56); see `crate::cmd_config::validate_fmt_merge_msg`.
     "fmt-merge-msg",
     "for-each-ref",
+    // `cmd_gc()` reads `gc_config()` (builtin/gc.c:899) ahead of `parse_options()` but reaches
+    // `prepare_repo_settings()` only with the first object-database access, after every usage
+    // error; `porcelain::gc` loads the settings block itself at that point.
+    "gc",
     "hash-object",
     "hook",
     "index-pack",

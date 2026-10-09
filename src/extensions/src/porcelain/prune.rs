@@ -1071,7 +1071,7 @@ fn collect_other_worktree_roots(repo: &gix::Repository, roots: &mut Vec<ObjectId
 
 /// Add every valid cache-tree id, recursively. A section with no entry count is
 /// invalid and its id meaningless, exactly as in `add_cache_tree()`.
-fn push_cache_tree(tree: &gix::index::extension::Tree, roots: &mut Vec<ObjectId>) {
+pub(super) fn push_cache_tree(tree: &gix::index::extension::Tree, roots: &mut Vec<ObjectId>) {
     if tree.num_entries.is_some() {
         roots.push(tree.id);
     }

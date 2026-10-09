@@ -95,10 +95,16 @@
 //!     any pack named by `--keep-pack`, is left alone.
 //!   * **`--filter`** makes git write a *second* pack for the filtered-out
 //!     objects, so two `.pack`/`.idx`/`.rev` triples appear rather than one.
-//!     `blob:none` and `blob:limit=<n>` are applied to the traversal, which the
+//!     `blob:none` and `blob:limit=<n>` (which keeps a blob only when it is
+//!     *smaller* than `n`) are applied to the traversal, which the
 //!     index objects are then unioned back into — the model git's own output
 //!     confirms (on the `branched` fixture, `blob:none` yields 11 of 13 objects:
 //!     13 less 4 blobs, plus the 2 blobs the index holds).
+//!     `tree:<depth>` is worked out as pack-objects' traversal works it out, see
+//!     [`tree_depth_shown`]: the index's blobs and cache-tree nodes are objects the
+//!     user named, which the filter is never asked about, so a `tree:0` pack still
+//!     holds every index blob and the cache-tree nodes that no earlier named tree
+//!     listed as a child.
 //!     That second pack is not the traversal's leftovers but *the existing packs
 //!     minus the new one*: `write_filtered_pack()` runs `pack-objects
 //!     --stdin-packs` over the non-kept and cruft packs with the new pack
@@ -212,11 +218,6 @@
 //!     pack bitmap this port writes, and `gix-pack` has no writer for it. The
 //!     pack `.bitmap` is not written in its place either, git putting none there
 //!     under `--write-midx`, so the run is a MIDX with no bitmap at all.
-//!   * **`--filter=tree:<depth>`** is accepted but not applied to the traversal;
-//!     unlike the blob filters its interaction with `--indexed-objects` did not
-//!     reduce to a rule the observed output confirms, and guessing one would put
-//!     the wrong object set in the pack. Observable only under `--filter=tree:*`
-//!     *together with* `-d`, where a loose object git prunes may survive.
 //!   * **`-f`/`-F`/`--path-walk`/`--delta-islands`/`--name-hash-version`** tune
 //!     parts of git's search that have no counterpart here, and stay no-ops.
 //!   * `repack.writeBitmaps`, or its older spelling `pack.writeBitmaps`, turns
@@ -783,6 +784,16 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     super::prune::collect_roots(&repo, &mut roots, super::prune::PrunedReflogWarning::Silent)?;
     let reachable = super::prune::close_over_excluding(&repo, roots, &promisor_held);
 
+    // `--filter=tree:<depth>` is decided by pack-objects' traversal as a whole, not object by
+    // object, so what it shows is worked out up front.
+    let tree_shown = st
+        .filter_spec
+        .as_deref()
+        .and_then(|spec| spec.strip_prefix("tree:"))
+        .and_then(scaled)
+        .and_then(|depth| u64::try_from(depth).ok())
+        .map(|depth| tree_depth_shown(&repo, depth, &reachable, &promisor_held));
+
     let existing = super::prune::pack_indices(&repo, &objdir);
     // ```c
     // if (geometric_factor) {
@@ -833,7 +844,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // now — `git repack -a -d --filter=blob:none` must leave every blob readable.
     let mut to_pack: Vec<ObjectId> = candidates
         .into_iter()
-        .filter(|id| indexed.contains(id) || keeps_object(st, id, &repo))
+        .filter(|id| indexed.contains(id) || keeps_object(st, id, &repo, tree_shown.as_ref()))
         .collect();
     // `-l` is `pack-objects --local` (builtin/repack.c): nothing an alternate
     // holds goes into the new pack.
@@ -2131,15 +2142,27 @@ fn append_checksum(bytes: &mut Vec<u8>, kind: gix::hash::Kind) -> Result<()> {
 
 /// Whether `id` survives the `--filter` spec.
 ///
-/// `blob:none` drops every blob and `blob:limit=<n>` every blob over `n` bytes.
+/// `blob:none` drops every blob and `blob:limit=<n>` every blob of `n` bytes or more.
 /// Both are applied to the traversal only; the index objects the caller already
 /// folded in are what git unions back afterwards, and since this filter runs
 /// over the closed set the two coincide for every blob the index names.
-/// `tree:<depth>` is accepted but not applied — see the module docs.
-fn keeps_object(st: &State, id: &ObjectId, repo: &gix::Repository) -> bool {
+/// `tree:<depth>` is decided by [`tree_depth_shown`], whose result arrives as `tree_shown`: a
+/// commit or tag always stays, a tree or blob only when the traversal showed it.
+fn keeps_object(
+    st: &State,
+    id: &ObjectId,
+    repo: &gix::Repository,
+    tree_shown: Option<&HashSet<ObjectId>>,
+) -> bool {
     let Some(spec) = st.filter_spec.as_deref() else {
         return true;
     };
+    if let Some(shown) = tree_shown {
+        return match repo.find_object(*id) {
+            Ok(obj) if matches!(obj.kind, gix::objs::Kind::Tree | gix::objs::Kind::Blob) => shown.contains(id),
+            _ => true,
+        };
+    }
     let limit = if spec == "blob:none" {
         Some(0)
     } else {
@@ -2149,9 +2172,169 @@ fn keeps_object(st: &State, id: &ObjectId, repo: &gix::Repository) -> bool {
         return true;
     };
     match repo.find_object(*id) {
-        Ok(obj) if obj.kind == gix::objs::Kind::Blob => obj.data.len() as u64 <= limit,
+        Ok(obj) if obj.kind == gix::objs::Kind::Blob => (obj.data.len() as u64) < limit,
         _ => true,
     }
+}
+
+/// The trees and blobs `pack-objects --all --reflog --indexed-objects --filter=tree:<depth>`
+/// shows, which is `traverse_commit_list_filtered()` over the pending list
+/// `get_object_list()` builds: the index's blobs, then the cache-tree's valid nodes in
+/// pre-order, then (as the walk adds them) the root tree of every commit.
+///
+/// What the filter decides is who it is asked about. `list_objects_filter__filter_object()`
+/// only consults the filter for an object flagged `NOT_USER_GIVEN`; one the user named, which
+/// an index blob or cache-tree node is, is shown and marked `SEEN` outright, and skips the
+/// depth bookkeeping altogether (its `LOFS_BEGIN_TREE` never reaches `filter_trees_depth()`,
+/// so `current_depth` does not move). Everything `process_tree_contents()` reaches is flagged
+/// `NOT_USER_GIVEN` first, including an object that is *also* a later pending entry:
+///
+/// * a commit's root tree is flagged when the walk adds it, so `tree:0` omits it even when
+///   the index names the same tree;
+/// * a cache-tree node is shown only if no earlier user-given tree listed it as a child, which
+///   under `tree:0` (whose children are all omitted) leaves exactly the nodes at even depth.
+///
+/// A filtered tree is shown when `current_depth < depth` and its contents are walked one level
+/// deeper; one met again at a depth no shallower than before is skipped
+/// (`seen_at_depth`). A filtered blob is shown when `current_depth < depth`, `current_depth`
+/// already counting the tree that holds it.
+fn tree_depth_shown(
+    repo: &gix::Repository,
+    depth: u64,
+    reachable: &HashSet<ObjectId>,
+    uninteresting: &HashSet<ObjectId>,
+) -> HashSet<ObjectId> {
+    struct Walk<'a> {
+        repo: &'a gix::Repository,
+        depth: u64,
+        uninteresting: &'a HashSet<ObjectId>,
+        /// `obj->flags & NOT_USER_GIVEN`.
+        filtered: HashSet<ObjectId>,
+        /// `obj->flags & SEEN`.
+        seen: HashSet<ObjectId>,
+        /// `filter_data->seen_at_depth`.
+        seen_at_depth: HashMap<ObjectId, u64>,
+        /// `filter_data->current_depth`.
+        current_depth: u64,
+        shown: HashSet<ObjectId>,
+    }
+
+    impl Walk<'_> {
+        fn blob(&mut self, id: ObjectId) {
+            if self.seen.contains(&id) || self.uninteresting.contains(&id) {
+                return;
+            }
+            if !self.filtered.contains(&id) || self.current_depth < self.depth {
+                self.seen.insert(id);
+                self.shown.insert(id);
+            }
+        }
+
+        fn tree(&mut self, id: ObjectId) {
+            use gix::object::tree::EntryKind;
+
+            if self.seen.contains(&id) || self.uninteresting.contains(&id) {
+                return;
+            }
+            let Ok(object) = self.repo.find_object(id) else { return };
+            let Ok(entries) = object.into_tree().decode().map(|tree| {
+                tree.entries
+                    .iter()
+                    .map(|entry| (entry.mode.kind(), entry.oid.to_owned()))
+                    .collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+
+            let user_given = !self.filtered.contains(&id);
+            let mut skip = false;
+            if user_given {
+                self.seen.insert(id);
+                self.shown.insert(id);
+            } else {
+                let include = self.current_depth < self.depth;
+                let already_seen = match self.seen_at_depth.get(&id) {
+                    Some(&at) => self.current_depth >= at,
+                    None => false,
+                };
+                if already_seen {
+                    skip = true;
+                } else {
+                    self.seen_at_depth.insert(id, self.current_depth);
+                    if include {
+                        self.shown.insert(id);
+                    } else {
+                        skip = true;
+                    }
+                }
+                self.current_depth += 1;
+            }
+            if !skip {
+                for (kind, oid) in entries {
+                    match kind {
+                        EntryKind::Tree => {
+                            self.filtered.insert(oid);
+                            self.tree(oid);
+                        }
+                        EntryKind::Commit => {}
+                        _ => {
+                            self.filtered.insert(oid);
+                            self.blob(oid);
+                        }
+                    }
+                }
+            }
+            if !user_given {
+                self.current_depth -= 1;
+            }
+        }
+    }
+
+    let mut walk = Walk {
+        repo,
+        depth,
+        uninteresting,
+        filtered: HashSet::new(),
+        seen: HashSet::new(),
+        seen_at_depth: HashMap::new(),
+        current_depth: 0,
+        shown: HashSet::new(),
+    };
+
+    // The walk adds each commit's root tree to the pending list, flagged `NOT_USER_GIVEN`,
+    // before the pending list is traversed.
+    let mut commit_trees = Vec::new();
+    let mut ids: Vec<&ObjectId> = reachable.iter().collect();
+    ids.sort();
+    for id in ids {
+        let Ok(object) = repo.find_object(*id) else { continue };
+        if object.kind != gix::objs::Kind::Commit {
+            continue;
+        }
+        if let Some(tree) = object.into_commit().decode().ok().map(|c| c.tree()) {
+            walk.filtered.insert(tree);
+            commit_trees.push(tree);
+        }
+    }
+
+    if let Ok(index) = repo.index_or_empty() {
+        for entry in index.entries() {
+            if entry.mode != gix::index::entry::Mode::COMMIT {
+                walk.blob(entry.id);
+            }
+        }
+        let mut nodes = Vec::new();
+        if let Some(tree) = index.tree() {
+            super::prune::push_cache_tree(tree, &mut nodes);
+        }
+        for node in nodes {
+            walk.tree(node);
+        }
+    }
+    for tree in commit_trees {
+        walk.tree(tree);
+    }
+    walk.shown
 }
 
 /// Whether `-d` may remove the pack whose index is at `index_path`: a `.keep`
@@ -3288,6 +3471,7 @@ fn preflight(st: &State, midx: &MidxConfig) -> Option<ExitCode> {
             st.name_hash_version
         )));
     }
+
 
     None
 }

@@ -730,11 +730,23 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     }
     // `config.recurse_submodules` as `cmd_fetch()` leaves it: `None` is
     // `RECURSE_SUBMODULES_DEFAULT`, which `add_options_to_argv()` does not forward.
-    let resolved_recurse = if opts.negotiate_only || opts.porcelain {
-        Some(Recurse::No)
-    } else {
-        recurse_for_children(&repo, recurse_submodules)
-    };
+    let from_config = recurse_for_children(&repo, recurse_submodules);
+    // ```c
+    // if (config.recurse_submodules != RECURSE_SUBMODULES_OFF) {
+    //         ...
+    //         fetch_config_from_gitmodules(sfjc, rs);
+    // }
+    // ```
+    //
+    // (builtin/fetch.c:2632-2637.) The read comes before the `--porcelain` switch-off below it
+    // and after `--negotiate-only`'s, and a `.gitmodules` the config parser refuses ends the
+    // command there, before FETCH_HEAD is touched.
+    if !opts.negotiate_only && from_config != Some(Recurse::No) {
+        if let Some(message) = repo.workdir().and_then(crate::config::gitmodules_bad_line) {
+            return Err(crate::fatal::die(message));
+        }
+    }
+    let resolved_recurse = if opts.negotiate_only || opts.porcelain { Some(Recurse::No) } else { from_config };
 
     // `--stdin` refspecs are appended after everything named on the command line,
     // as git's `add_refspec` on the stdin lines does.

@@ -3414,21 +3414,24 @@ fn render_upstream(
         }
     };
 
-    let local = repo
-        .try_find_reference(full)
-        .ok()
-        .flatten()
-        .and_then(|r| r.into_fully_peeled_id().ok());
     // `:track` and `:trackshort` always measure the atom's own direction, which
-    // is not necessarily the one that produced `tracking`.
-    let measured = if for_push {
-        branch::push_ref(repo, full)
-    } else {
-        branch::upstream_ref(repo, full)
+    // is not necessarily the one that produced `tracking`. Only they read the
+    // branch tip's object, so the plain, `:short` and remote-name options never do.
+    let counts = || {
+        let local = repo
+            .try_find_reference(full)
+            .ok()
+            .flatten()
+            .and_then(|r| r.into_fully_peeled_id().ok());
+        let measured = if for_push {
+            branch::push_ref(repo, full)
+        } else {
+            branch::upstream_ref(repo, full)
+        };
+        measured
+            .as_ref()
+            .and_then(|t| branch::stat_tracking_info(repo, local, t))
     };
-    let counts = measured
-        .as_ref()
-        .and_then(|t| branch::stat_tracking_info(repo, local, t));
 
     let value = match &rr.option {
         RrOption::Ref(m) => {
@@ -3451,7 +3454,7 @@ fn render_upstream(
             });
         }
         RrOption::Track => {
-            let text = match counts {
+            let text = match counts() {
                 None => "gone".to_string(),
                 Some((0, 0)) => String::new(),
                 Some((0, t)) => format!("behind {t}"),
@@ -3464,7 +3467,7 @@ fn render_upstream(
                 format!("[{text}]")
             }
         }
-        RrOption::TrackShort => match counts {
+        RrOption::TrackShort => match counts() {
             None => String::new(),
             Some((0, 0)) => "=".into(),
             Some((0, _)) => "<".into(),

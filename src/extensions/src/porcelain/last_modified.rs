@@ -212,6 +212,10 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     // after it is a pathspec, and anything that is neither is fatal.
     let mut rev: Option<&str> = None;
     let mut specs: Vec<&str> = Vec::new();
+    // Set once a second revision is read: `populate_paths_from_revs()` refuses it only after
+    // `setup_revisions()` has taken every argument, so a later one that is neither a revision
+    // nor a path dies first.
+    let mut extra_tip = false;
     let mut seen_path = false;
     for &(p, after_dashdash) in &positionals {
         if after_dashdash {
@@ -238,9 +242,8 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             if !seen_path {
-                // `populate_paths_from_revs()` rejects a second interesting tip.
-                eprintln!("error: last-modified can only operate on one commit at a time");
-                return Ok(ExitCode::from(255));
+                extra_tip = true;
+                continue;
             }
         }
         if !exists {
@@ -298,6 +301,11 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     if let Some(a) = unknown {
         eprint!("error: unknown last-modified argument: {a}\n{USAGE}");
         return Ok(ExitCode::from(129));
+    }
+    if extra_tip {
+        // `populate_paths_from_revs()` rejects a second interesting tip.
+        eprintln!("error: last-modified can only operate on one commit at a time");
+        return Ok(ExitCode::from(255));
     }
 
     // `struct prio_queue queue = { compare_commits_by_gen_then_commit_date }`

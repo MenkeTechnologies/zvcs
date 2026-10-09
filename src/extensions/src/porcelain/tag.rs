@@ -1703,32 +1703,28 @@ fn create_tag(
     }
 
     // git always computes a reflog message describing the *target* object (built
-    // before the tag object exists), then writes the ref with `REF_FORCE_CREATE_REFLOG`
-    // only under `--create-reflog`. Mirror that: force the reflog via an explicit
-    // transaction when asked, else keep the plain `tag_reference` path (whose default
-    // `LogChange` never forces a tag reflog), matching stock git for both cases.
-    if create_reflog {
-        let message = reflog_message(repo, target)?;
-        let full: FullName = ref_name
-            .as_str()
-            .try_into()
-            .map_err(|e| anyhow!("invalid tag name {name:?}: {e}"))?;
-        repo.edit_reference(RefEdit {
-            change: Change::Update {
-                log: LogChange {
-                    mode: RefLog::AndReference,
-                    force_create_reflog: true,
-                    message,
-                },
-                expected: constraint,
-                new: Target::Object(new_id),
+    // before the tag object exists) and hands it to the transaction, which writes it
+    // wherever a reflog is written: `REF_FORCE_CREATE_REFLOG` under `--create-reflog`,
+    // otherwise only for a tag whose reflog exists or that `core.logAllRefUpdates`
+    // asks for.
+    let message = reflog_message(repo, target)?;
+    let full: FullName = ref_name
+        .as_str()
+        .try_into()
+        .map_err(|e| anyhow!("invalid tag name {name:?}: {e}"))?;
+    repo.edit_reference(RefEdit {
+        change: Change::Update {
+            log: LogChange {
+                mode: RefLog::AndReference,
+                force_create_reflog: create_reflog,
+                message,
             },
-            name: full,
-            deref: false,
-        })?;
-    } else {
-        repo.tag_reference(name, new_id, constraint)?;
-    }
+            expected: constraint,
+            new: Target::Object(new_id),
+        },
+        name: full,
+        deref: false,
+    })?;
     // `if (path) { unlink_or_warn(path); free(path); }` (builtin/tag.c:704-707):
     // the editor buffer is discarded only once the reference is in place.
     if annotate {

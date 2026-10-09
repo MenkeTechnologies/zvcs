@@ -409,15 +409,9 @@ pub(crate) fn parse_decoration_style(value: &str) -> Option<DecorateStyle> {
         }
         _ => {}
     }
-    // git falls back to integer parsing: a non-zero value is true (Short).
-    if let Ok(n) = lower.parse::<i64>() {
-        return Some(if n != 0 {
-            DecorateStyle::Short
-        } else {
-            DecorateStyle::Off
-        });
-    }
-    None
+    // `git_parse_maybe_bool()` reads any integer `git_parse_int()` takes, hex and
+    // unit suffixes included: a non-zero value is true (Short).
+    crate::optint::maybe_bool(value).map(|on| if on { DecorateStyle::Short } else { DecorateStyle::Off })
 }
 
 /// `git log` — commit history reachable from a starting revision (default `HEAD`).

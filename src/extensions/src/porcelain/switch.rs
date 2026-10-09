@@ -1207,7 +1207,7 @@ fn switch_detach(
     set_head_detached(
         repo,
         target_id,
-        &format!("checkout: moving from {from_desc} to {to_desc}"),
+        &super::checkout::moving_message(&from_desc, &to_desc),
         old_id,
     )?;
 
@@ -1513,7 +1513,7 @@ fn attach_head(
             .flatten()
             .map(|id| id.detach())
     });
-    let message = format!("checkout: moving from {from_desc} to {to_short}");
+    let message = super::checkout::moving_message(from_desc, to_short);
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {

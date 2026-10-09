@@ -1749,7 +1749,7 @@ pub(crate) fn switch_to_branch_opts(
             set_head_symbolic(
                 repo,
                 branch_full,
-                reflog_message.unwrap_or(&format!("checkout: moving from {spec} to {spec}")),
+                reflog_message.unwrap_or(&moving_message(spec, spec)),
                 head_id,
                 head_id,
             )?;
@@ -1818,7 +1818,7 @@ pub(crate) fn switch_to_branch_opts(
     set_head_symbolic(
         repo,
         branch_full,
-        reflog_message.unwrap_or(&format!("checkout: moving from {old_label} to {spec}")),
+        reflog_message.unwrap_or(&moving_message(&old_label, spec)),
         old_id,
         Some(commit.id),
     )?;
@@ -1912,7 +1912,7 @@ fn detached_checkout(
     set_head_detached(
         repo,
         target_id,
-        &format!("checkout: moving from {old_label} to {spec}"),
+        &moving_message(&old_label, spec),
         old_id,
     )?;
 
@@ -2152,7 +2152,7 @@ fn create_and_switch(
     set_head_symbolic(
         repo,
         branch_full,
-        &format!("checkout: moving from {old_label} to {name}"),
+        &moving_message(&old_label, name),
         // `update_refs_for_switch()` logs `HEAD` *after* `create_branch()` has moved the ref, and
         // the entry's old value is whatever `HEAD` resolves to then. Resetting the branch `HEAD`
         // is already on (`-B <current>`) therefore records `<new> <new>`, not the tip the branch
@@ -2428,8 +2428,7 @@ fn orphan_checkout(
             return Ok(run_post_checkout(repo, old_head, old_head, true));
         }
     }
-    let msg = std::env::var("GIT_REFLOG_ACTION")
-        .unwrap_or_else(|_| format!("checkout: moving from {old_label} to {name}"));
+    let msg = moving_message(&old_label, name);
     crate::refstore::state_ref_write(repo, "HEAD", &crate::refstore::StateRef::Symbolic(full.clone().into()), &msg)?;
 
     if !quiet {
@@ -4756,4 +4755,19 @@ pub(super) fn die_on_bad_attr_source_for_writes(
             Err(crate::fatal::die(message.to_owned()))
         }
     }
+}
+
+/// The reflog message `update_refs_for_switch()` writes for `HEAD`: `checkout: moving from
+/// <old> to <new>`, unless `GIT_REFLOG_ACTION` is set, which replaces the whole line.
+///
+/// ```c
+/// reflog_msg = getenv("GIT_REFLOG_ACTION");
+/// if (!reflog_msg)
+///         strbuf_addf(&msg, "checkout: moving from %s to %s", …);
+/// else
+///         strbuf_insertstr(&msg, 0, reflog_msg);
+/// ```
+pub(super) fn moving_message(old_label: &str, new_name: &str) -> String {
+    std::env::var("GIT_REFLOG_ACTION")
+        .unwrap_or_else(|_| format!("checkout: moving from {old_label} to {new_name}"))
 }

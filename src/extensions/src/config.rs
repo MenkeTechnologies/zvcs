@@ -2240,9 +2240,13 @@ pub fn extension_value_refusal(naming: GitDirNaming) -> Option<(Option<String>, 
         let Ok(bytes) = std::fs::read(&candidate.path) else {
             continue;
         };
+        // `read_repository_format()` runs `handle_extension()` over `<commondir>/config` alone
+        // (setup.c); an `extensions.<key>` in `config.worktree` is never examined. The valueless
+        // `core.worktree` is a different arm and does reach it.
+        let in_worktree_config = candidate.path.file_name().is_some_and(|name| name == "config.worktree");
         // Every refusal comes from the one `check_repo_format()` pass over the
         // file, so whichever key sits first is the one reported.
-        let extension = first_invalid_extension_value(&bytes);
+        let extension = if in_worktree_config { None } else { first_invalid_extension_value(&bytes) };
         let worktree = first_valueless_core_worktree(&bytes).map(|line| {
             let refusal = ExtensionRefusal::Invalid {
                 key: "core.worktree",

@@ -1947,10 +1947,14 @@ fn is_worktree_path(repo: &gix::Repository, arg: &str) -> bool {
     if path.is_empty() {
         return false;
     }
-    // A bare repository has no work tree: `setup_bare_git_dir()` leaves git in the git directory
-    // itself, which is where the `lstat()` runs, so `git rev-parse HEAD` there is the file `HEAD`.
-    let base = repo.workdir().unwrap_or_else(|| repo.git_dir());
-    base.join(path).symlink_metadata().is_ok()
+    // A bare repository has no work tree: `setup_bare_git_dir()` chdir()s back to the directory
+    // the command was started in (`if (chdir(cwd->buf))`, setup.c), which is where the `lstat()`
+    // runs, so `git rev-parse HEAD` at the top of the git directory is the file `HEAD` and from
+    // `refs/` it is not.
+    let Some(workdir) = repo.workdir() else {
+        return std::path::Path::new(&path).symlink_metadata().is_ok();
+    };
+    workdir.join(path).symlink_metadata().is_ok()
 }
 
 /// Whether `arg` still carries a revision-walk mark (`^!`, `^@`, `^-<n>`) where

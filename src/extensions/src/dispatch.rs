@@ -610,6 +610,9 @@ const DEFAULT_CONFIG_EXTRA_VERBS: &[&str] = &[
     "symbolic-ref",
     "tag",
     "update-ref",
+    // `repo_config(the_repository, git_default_config, NULL)` ahead of `show_usage_if_asked()`
+    // and the argument loop (builtin/unpack-objects.c:624-628), so even `-h` meets it.
+    "unpack-objects",
     "var",
     "verify-pack",
 ];

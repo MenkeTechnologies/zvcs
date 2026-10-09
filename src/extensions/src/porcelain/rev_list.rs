@@ -989,6 +989,21 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // The same scan refuses `--exclude-promisor-objects` next to any recognised
+    // `--missing=` action but `error`, once `--missing-only`'s own check has passed.
+    // The option name is spelled with underscores.
+    let mut missing_action_is_error = true;
+    for value in args.iter().filter_map(|a| a.strip_prefix("--missing=")) {
+        match value {
+            "error" => missing_action_is_error = true,
+            "print" | "print-info" | "allow-any" | "allow-promisor" => missing_action_is_error = false,
+            _ => {}
+        }
+    }
+    if !missing_action_is_error && args.iter().any(|a| a == "--exclude-promisor-objects") {
+        return Ok(fatal("options '--exclude_promisor_objects' and '--missing' cannot be used together"));
+    }
+
     let mut count_only = false;
     let mut reverse = false;
     let mut first_parent = false;

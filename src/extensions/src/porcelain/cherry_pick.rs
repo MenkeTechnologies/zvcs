@@ -1899,6 +1899,16 @@ fn sequencer_continue(repo: &gix::Repository) -> Result<ExitCode> {
     // `index_differs_from(r, "HEAD", NULL, 0)` → `error_dirty_index()`. Resuming
     // on top of staged-but-uncommitted work would fold it into the next pick.
     let index = repo.open_index()?;
+    // `error_dirty_index()` starts with `repo_read_index_unmerged()`, which turns an index that
+    // still holds conflict stages into `error_resolve_conflict()`'s report instead.
+    if unmerged_entries(&index).is_some() {
+        eprintln!("error: Cherry-picking is not possible because you have unmerged files.");
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
+        return Ok(sequencer_failed_tail());
+    }
     let head_tree = repo.head_commit()?.tree_id()?.detach();
     if tree_from_index(repo, &index)? != head_tree {
         eprintln!("error: your local changes would be overwritten by cherry-pick.");

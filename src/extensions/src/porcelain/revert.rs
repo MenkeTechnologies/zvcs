@@ -825,6 +825,17 @@ fn sequencer_continue(repo: &gix::Repository, git_dir: &std::path::Path) -> Resu
 
     // `index_differs_from(r, "HEAD", NULL, 0)` → `error_dirty_index()`.
     let index = repo.open_index()?;
+    // `error_dirty_index()` opens with `repo_read_index_unmerged()`: an index that still holds
+    // conflict stages is `error_resolve_conflict()`'s report, not a dirty-index one.
+    if index.entries().iter().any(|e| e.stage_raw() != 0) {
+        eprintln!("error: Reverting is not possible because you have unmerged files.");
+        crate::advice::Advice::ResolveConflict.advise_plain(
+            "Fix them up in the work tree, and then use 'git add/rm <file>'\n\
+             as appropriate to mark resolution and make a commit.",
+        );
+        eprintln!("fatal: revert failed");
+        return Ok(ExitCode::from(128));
+    }
     let head_tree = repo.head_commit()?.tree_id()?.detach();
     if index_tree(repo, &index)? != head_tree {
         eprintln!("error: your local changes would be overwritten by revert.");

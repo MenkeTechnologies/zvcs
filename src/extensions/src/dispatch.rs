@@ -410,6 +410,7 @@ const REPO_SETTINGS_VERBS: &[&str] = &[
     "mktree",
     "mv",
     "name-rev",
+    "pickaxe",
     "prune",
     "prune-packed",
     "pull",
@@ -771,7 +772,7 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
             ConfigCallback::DiffBasic
         }
         "grep" => ConfigCallback::Grep,
-        "blame" | "annotate" => ConfigCallback::Blame,
+        "blame" | "annotate" | "pickaxe" => ConfigCallback::Blame,| "annotate" => ConfigCallback::Blame,
         "fetch" => ConfigCallback::Fetch,
         "repack" => ConfigCallback::Repack,
         "gc" => ConfigCallback::Gc,

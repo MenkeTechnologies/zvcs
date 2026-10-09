@@ -2794,8 +2794,20 @@ fn run_status_child(repo: &gix::Repository) -> Result<()> {
         }
         return Ok(());
     }
-    super::status::status(&[])?;
-    Ok(())
+    // A `die()` inside the child (an unreadable `diff.orderFile`) ends only the child.
+    match super::status::status(&[]) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if let Some(fatal) = e.downcast_ref::<crate::fatal::Fatal>() {
+                eprintln!("fatal: {}", crate::fatal::report_text(&fatal.0));
+                Ok(())
+            } else if e.downcast_ref::<crate::fatal::Silent>().is_some() {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `git stash apply` / `pop` — restore `stash@{n}` onto a clean worktree+index.

@@ -2192,6 +2192,17 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     // pair. It supplies both `pe` (diff.c:3622-3624) and, under `--textconv`, the
     // `diff.<driver>.textconv` program `builtin_diff()` runs.
     let mut lookup = crate::userdiff::Lookup::new(repo)?;
+    // `--summary` reports creations, deletions and mode changes from the queue alone.
+    let reads_attributes = want_content
+        && (opts.fmt & ((F_CONTENT | F_CHECKDIFF) & !F_SUMMARY) != 0
+            || opts.diff_from_contents()
+            || pickaxe_needs_content
+            || opts.find_copies);
+    if !reads_attributes {
+        // A raw or name-only listing never reads an attribute, so a bad `--attr-source`
+        // is not diagnosed (attr.c:1201-1228 runs on the first lookup).
+        lookup = lookup.without_attr_source_check();
+    }
     let funcnames = resolve_drivers(&mut lookup, &deltas)?;
     let mut analyses: Vec<Analysis> = Vec::with_capacity(deltas.len());
     if let Some(cache) = cache.as_mut() {

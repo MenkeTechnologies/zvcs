@@ -786,7 +786,10 @@ pub fn replay(args: &[String]) -> Result<ExitCode> {
         HashMap::new()
     };
 
-    // `init_basic_merge_options()` reads the merge configuration, `merge.conflictStyle` included.
+    // `init_basic_merge_options()` reads the merge configuration through `merge_recursive_config()`,
+    // whose chain ends at `git_default_config()`: `merge.conflictStyle` and every core key it
+    // refuses are fatal here, after the operands were resolved.
+    crate::cmd_config::validate_merge_recursive(&repo).map_err(|r| r.into_error())?;
     if let Some(code) = super::merge::merge_recursive_config_check(&repo) {
         return Ok(code);
     }

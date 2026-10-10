@@ -1866,6 +1866,18 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         } else {
             pathspec_mode = true;
             paths.push(arg.as_str().into());
+            // `for (j = i; j < argc; j++) verify_filename(revs->prefix, argv[j], j == i);`:
+            // from the first path on, every remaining word is a path and is never parsed as
+            // an option, so a dash-word is `option '<w>' must come before non-option
+            // arguments` (setup.c) ahead of anything those words would have set.
+            for rest in &args[idx + 1..] {
+                if let Some(message) = crate::setup::verify_filename(rest, false) {
+                    eprintln!("fatal: {message}");
+                    return Ok(ExitCode::from(128));
+                }
+            }
+            paths.extend(args[idx + 1..].iter().map(|rest| BString::from(rest.as_str())));
+            break;
         }
     }
     // An option-value error after every positional (or with no positional that failed

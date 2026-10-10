@@ -3701,10 +3701,22 @@ fn show_commit_record(
         let mut warn = super::diffcore_rename::Warnings::default();
         // Built before the diff so `--find-copies-harder` can only draw copy sources
         // from paths the pathspec admits, which is what limiting git's tree walk does.
-        let specs = match pathspecs.is_empty() {
+        let mut specs = match pathspecs.is_empty() {
             true => None,
             false => Some(super::log::PathspecMatcher::new(repo, pathspecs)?),
         };
+        // `diffcore_std()` (diff.c) prefetches the queue's blobs ahead of any format that
+        // reads content, so a promised blob the remote cannot supply ends the command
+        // before the record's header, with the `git fetch` child's own words first.
+        let reads_content = pickaxe_path
+            || matches!(
+                selection,
+                Selection::Blocks { numstat, stat, shortstat, dirstat, patch, .. }
+                    if numstat || stat || shortstat || dirstat || patch
+            );
+        if reads_content && remerge.is_none() && !combined && super::rev_list::has_promisor_remote(repo) {
+            super::log::prefetch_diff_pairs(repo, commit.id, against, specs.as_mut())?;
+        }
         let mut f = collect_changes(repo, commit, against, &disp.patch, &mut warn, specs.as_ref())?;
         // Only a pass that reached `too_many_rename_candidates()` writes the
         // `diff_options` fields (see `git log`'s `record_rename_warnings`); an

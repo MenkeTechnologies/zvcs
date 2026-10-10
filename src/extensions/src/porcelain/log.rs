@@ -13336,7 +13336,7 @@ fn record_rename_warnings(
 ///
 /// The same shape as [`super::pack_objects`]'s `prefetch_to_pack()`, which is the
 /// other explicit `promisor_remote_get_direct()` caller in the port.
-fn prefetch_diff_pairs(
+pub(super) fn prefetch_diff_pairs(
     repo: &gix::Repository,
     id: ObjectId,
     parent: Option<ObjectId>,
@@ -13385,6 +13385,10 @@ fn prefetch_diff_pairs(
         }
         if super::rev_list::promisor_objects(repo).contains(oid) {
             gix::odb::store::set_fetch_if_missing(restore);
+            // The `git fetch` child said why on its own stderr before the parent died.
+            if let Some(gix::promisor::Error::Connect(err)) = gix::promisor::take_last_fetch_error() {
+                crate::transport_err::file_url_fatal(&err);
+            }
             crate::git_fatal!("could not fetch {oid} from promisor remote");
         }
     }

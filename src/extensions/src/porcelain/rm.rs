@@ -390,6 +390,15 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         gix::worktree::stack::state::attributes::Source::IdMapping,
     )?;
 
+    // `refresh_index(…, REFRESH_QUIET | REFRESH_UNMERGED, &pathspec, …)` (builtin/rm.c) hashes the first
+    // matching entry whose stat data cannot vouch for it, which dies on an unreadable
+    // `core.bigFileThreshold` or a bad `--attr-source`. `REFRESH_UNMERGED` keeps it from naming conflicts.
+    if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |p| {
+        ps.is_included(p, Some(false))
+    })? {
+        return death.die();
+    }
+
     // `do_match_pathspec()` walks *every* item against a path, not just the first that matches, and
     // records the strongest match of each in `seen[]` — also for a path a later exclusion removes
     // (builtin/rm.c, dir.c:550-586). The engine above answers "included or not"; these answer which

@@ -3267,12 +3267,14 @@ fn set_long(idx: usize, negated: bool, value: Option<&str>, st: &mut State) {
             st.write_midx_incremental = on && value == Some("incremental");
         }
         "geometric" => {
-            st.geometric = on;
             st.geometric_factor = match on {
                 // `OPT_INTEGER`: `git_parse_int()`, which skips leading whitespace and takes a k/m/g suffix.
                 true => value.and_then(|v| int_value("geometric", v).ok()).map_or(0.0, |n| n as f64),
                 false => 0.0,
             };
+            // `if (geometry.split_factor)` is what every geometric conflict check tests (builtin/repack.c:267),
+            // so `--geometric=0` is as good as no option.
+            st.geometric = st.geometric_factor != 0.0;
         }
         "filter" => {
             st.filter = on;
@@ -3403,10 +3405,13 @@ fn short_opts(cluster: &str, args: &[String], i: &mut usize, st: &mut State) -> 
                 } else {
                     rest
                 };
-                if let Err(code) = int_value("switch `g'", &value) {
-                    return Some(code);
+                match int_value("switch `g'", &value) {
+                    Ok(n) => {
+                        st.geometric_factor = n as f64;
+                        st.geometric = n != 0;
+                    }
+                    Err(code) => return Some(code),
                 }
-                st.geometric = true;
                 *i += 1;
                 return None;
             }

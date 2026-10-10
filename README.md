@@ -7,6 +7,8 @@
 ╚══════╝  ╚═══╝   ╚═════╝╚══════╝
 ```
 
+<p align="center"><img src="docs/logo.png" alt="zvcs" width="640"></p>
+
 ![Rust](https://img.shields.io/badge/Rust-2021-05d9e8?style=flat-square)
 [![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://menketechnologies.github.io/zvcs/)
 [![Built on](https://img.shields.io/badge/built%20on-gitoxide-8a2be2.svg)](https://github.com/GitoxideLabs/gitoxide)

@@ -858,8 +858,14 @@ fn plan_source(
         // check stands down for it — without that, `git mv README.md readme.md`
         // reports the file it is about to move as being in its own way.
         let clobbers = dst_abs.exists() && !(ignore_case && src_rel.eq_ignore_ascii_case(&dst_rel));
-        if !force && (clobbers || is_tracked(index, &dst_rel)) {
+        // Only the file system decides: a destination that is in the index but not on disk (deleted,
+        // or outside the sparse-checkout definition) is no obstacle here.
+        if !force && clobbers {
             crate::git_fatal!("destination exists, source={src_rel}, destination={dst_rel}");
+        }
+        // `--sparse` moving onto a sparse entry that is in the index but not on disk.
+        if !force && ignore_sparse && skip_worktree_entry(index, &dst_rel) {
+            crate::git_fatal!("destination exists in the index, source={src_rel}, destination={dst_rel}");
         }
         // ```c
         // if (force) {

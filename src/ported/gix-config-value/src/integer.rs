@@ -58,29 +58,16 @@ impl TryFrom<&BStr> for Integer {
     type Error = Error;
 
     fn try_from(s: &BStr) -> Result<Self, Self::Error> {
-        let s = std::str::from_utf8(s).map_err(|err| int_err(s).with_err(err))?;
-        if let Ok(value) = s.parse() {
+        let text = std::str::from_utf8(s).map_err(|err| int_err(s).with_err(err))?;
+        let (value, rest) = strtoimax(text).ok_or_else(|| int_err(s))?;
+        if rest.is_empty() {
             return Ok(Self { value, suffix: None });
         }
-
-        if s.len() <= 1 {
-            return Err(int_err(s));
-        }
-
-        let last_idx = s.len() - 1;
-        if !s.is_char_boundary(last_idx) {
-            return Err(int_err(s));
-        }
-
-        let (number, suffix) = s.split_at(s.len() - 1);
-        if let (Ok(value), Ok(suffix)) = (number.parse(), suffix.parse()) {
-            Ok(Self {
-                value,
-                suffix: Some(suffix),
-            })
-        } else {
-            Err(int_err(s))
-        }
+        let suffix = rest.parse().map_err(|_| int_err(s))?;
+        Ok(Self {
+            value,
+            suffix: Some(suffix),
+        })
     }
 }
 
@@ -176,4 +163,29 @@ impl TryFrom<&BStr> for Suffix {
     fn try_from(s: &BStr) -> Result<Self, Self::Error> {
         Self::from_str(std::str::from_utf8(s).map_err(|_| ())?)
     }
+}
+
+/// `strtoimax(text, &end, 0)` as `git_parse_signed()` calls it (config.c): leading whitespace is
+/// skipped, one sign is taken, and the base is read from the prefix — `0x`/`0X` is hex, a leading
+/// `0` is octal, anything else decimal. Returns the value and the text after the digits, or `None`
+/// where C reports no conversion (`end == value`) or `ERANGE`.
+fn strtoimax(text: &str) -> Option<(i64, &str)> {
+    let text = text.trim_start_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    let (negative, unsigned) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (radix, digits) = match unsigned.as_bytes() {
+        [b'0', b'x' | b'X', next, ..] if next.is_ascii_hexdigit() => (16, &unsigned[2..]),
+        [b'0', ..] => (8, unsigned),
+        _ => (10, unsigned),
+    };
+    let end = digits.find(|c: char| !c.is_digit(radix)).unwrap_or(digits.len());
+    if end == 0 {
+        return None;
+    }
+    let magnitude = i128::from_str_radix(&digits[..end], radix).ok()?;
+    let value = if negative { -magnitude } else { magnitude };
+    Some((i64::try_from(value).ok()?, &digits[end..]))
 }

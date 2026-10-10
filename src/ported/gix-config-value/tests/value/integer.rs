@@ -82,3 +82,26 @@ fn as_decimal() {
     assert_eq!(decimal(&format!("{}g", i64::MAX)), None, "overflow results in None");
     assert_eq!(decimal(&format!("{}g", i64::MIN)), None, "underflow results in None");
 }
+
+#[test]
+fn read_like_strtoimax_with_base_zero() {
+    let parse = |input: &str| Integer::try_from(input).ok();
+    let plain = |value| Some(Integer { value, suffix: None });
+    assert_eq!(parse(" 1"), plain(1), "leading whitespace is skipped");
+    assert_eq!(parse("\t\n+7"), plain(7), "whitespace then an explicit plus sign");
+    assert_eq!(parse("0x1F"), plain(31), "0x selects hex");
+    assert_eq!(parse("010"), plain(8), "a leading zero selects octal");
+    assert_eq!(parse("-0x10"), plain(-16));
+    assert_eq!(
+        parse("0x1k"),
+        Some(Integer {
+            value: 1,
+            suffix: Some(Suffix::Kibi)
+        }),
+        "the unit applies after the base prefix"
+    );
+    assert_eq!(parse("08"), None, "8 is no octal digit, so `8` is left over and is no unit");
+    assert_eq!(parse("1 "), None, "trailing whitespace is not a unit");
+    assert_eq!(parse("0x"), None, "no hex digit after the prefix");
+    assert_eq!(parse("9223372036854775808"), None, "ERANGE");
+}

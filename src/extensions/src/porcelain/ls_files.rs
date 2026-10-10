@@ -1886,7 +1886,8 @@ struct Eol<'r> {
     repo: &'r gix::Repository,
     /// Absolute worktree root. git's `RUN_SETUP` has already chdir'd there, so its
     /// `lstat(fullname)` is worktree-relative; this port keeps the caller's
-    /// directory and joins instead.
+    /// directory and joins instead. In a bare repository there is no
+    /// root and it is the current directory.
     workdir: Option<PathBuf>,
     stack: gix::AttributeStack<'r>,
     outcome: gix::attrs::search::Outcome,
@@ -1896,7 +1897,9 @@ impl<'r> Eol<'r> {
     fn new(repo: &'r gix::Repository, index: &gix::index::State) -> Result<Self> {
         Ok(Eol {
             repo,
-            workdir: repo.workdir().map(Path::to_path_buf),
+            // A bare repository never changed into a work tree, so git's cwd-relative `lstat()`
+            // still sees the files of the directory it was started in.
+            workdir: repo.workdir().map(Path::to_path_buf).or_else(|| std::env::current_dir().ok()),
             stack: repo.attributes_only(
                 index,
                 gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,

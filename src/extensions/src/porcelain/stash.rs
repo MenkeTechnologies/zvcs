@@ -1090,7 +1090,11 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     if opts.pathspecs.is_empty() && !opts.staged_only && !opts.patch {
         if let Ok(head_id) = repo.head_id() {
             let id = head_id.detach();
-            super::checkout::record_head_move(repo, Some(id), Some(id), "reset: moving to HEAD");
+            // A detached `HEAD` is a plain ref whose unchanged value the update skips, so it logs
+            // nothing there; an attached one gets its entry through the branch it follows.
+            if repo.head_name()?.is_some() {
+                super::checkout::record_head_move(repo, Some(id), Some(id), "reset: moving to HEAD");
+            }
             // The same `reset --hard` also runs `reset_refs()`, which records
             // the pre-reset `HEAD` in `ORIG_HEAD` (builtin/reset.c:314). The
             // reset names no revision, so the value is `HEAD` itself — but it

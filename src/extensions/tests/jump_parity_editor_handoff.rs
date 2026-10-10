@@ -39,6 +39,14 @@ fn run(bin: &str, dir: &Path, args: &[&str], envs: &[(&str, &Path)]) -> (String,
     (text(&out.stdout), text(&out.stderr), out.status.code())
 }
 
+/// The stock git, when it ships the `git-jump` script — contrib, so a git built from source
+/// without it answers `jump` with "is not a git command" and has nothing to compare against.
+fn stock_with_jump() -> Option<&'static str> {
+    let stock = stock_git::stock_git()?;
+    let probe = run(stock, &std::env::temp_dir(), &["jump", "-h"], &[]);
+    (!probe.1.contains("is not a git command")).then_some(stock)
+}
+
 /// A repository with one unstaged change, and an editor script that records what it was given.
 fn fixture(root: &Path, editor_name: &str) -> std::path::PathBuf {
     run(BIN, root, &["init", "-q", "-b", "main"], &[]);
@@ -80,7 +88,7 @@ fn observe(bin: &str, root: &Path, editor_name: &str) -> (String, String, Option
 }
 
 fn compare(editor_name: &str, expected_list: &str) {
-    let Some(stock) = stock_git::stock_git() else { return };
+    let Some(stock) = stock_with_jump() else { return };
     let base = std::env::temp_dir().join(format!("zvcs-jump-editor-{editor_name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let want = observe(stock, &base.join("s").canonicalize_or(&base.join("s")), editor_name);
@@ -118,7 +126,7 @@ fn an_emacs_editor_gets_the_grep_eval_form() {
 /// errors and flags decide what happens before any file is searched for markers.
 #[test]
 fn merge_mode_arguments_are_ls_files_arguments() {
-    let Some(stock) = stock_git::stock_git() else { return };
+    let Some(stock) = stock_with_jump() else { return };
     let base = std::env::temp_dir().join(format!("zvcs-jump-merge-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let conflicted = |root: &Path, bin: &str| {

@@ -250,7 +250,7 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
                     std::io::stdin().lock().read_to_end(&mut buf)?;
                     message.extend_from_slice(&buf);
                 } else {
-                    match std::fs::read(value) {
+                    match std::fs::read(crate::setup::path_below_work_tree_top(&repo, value)) {
                         Ok(buf) => message.extend_from_slice(&buf),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             return fatal(&format!(

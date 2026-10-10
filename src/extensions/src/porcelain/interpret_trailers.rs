@@ -635,8 +635,15 @@ pub fn interpret_trailers(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // `setup_git_directory_gently()` chdirs to the top of the work tree, and the file operands are
+    // opened as given afterwards.
+    let repo = crate::setup::discover().ok();
     for file in &run.files {
-        let mut input = match std::fs::read(file) {
+        let target = match &repo {
+            Some(repo) => crate::setup::path_below_work_tree_top(repo, file).to_string_lossy().into_owned(),
+            None => file.clone(),
+        };
+        let mut input = match std::fs::read(&target) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Ok(fatal(&format!(
@@ -650,7 +657,7 @@ pub fn interpret_trailers(args: &[String]) -> Result<ExitCode> {
         // git creates the temporary before processing, so a non-writable target
         // fails before any output is produced.
         let temp = if run.opts.in_place {
-            match prepare_temp(file) {
+            match prepare_temp(&target) {
                 Ok(t) => Some(t),
                 Err(code) => return Ok(code),
             }
@@ -669,7 +676,7 @@ pub fn interpret_trailers(args: &[String]) -> Result<ExitCode> {
                         errno(&e)
                     )));
                 }
-                if let Err(e) = std::fs::rename(&path, file) {
+                if let Err(e) = std::fs::rename(&path, &target) {
                     let _ = std::fs::remove_file(&path);
                     return Ok(fatal(&format!(
                         "could not rename temporary file to {file}: {}",

@@ -619,6 +619,26 @@ pub fn prefix(repo: &gix::Repository) -> Option<PathBuf> {
     (!rel.as_os_str().is_empty()).then(|| rel.to_owned())
 }
 
+/// A file argument as a command that skips `prefix_filename()` opens it: `setup_git_directory()`
+/// has already chdir'd to the top of the work tree, so a relative `arg` names a path below the
+/// top, not below the directory the command was started in (`git commit-tree -F msg` and
+/// `git interpret-trailers <file>` from a subdirectory). Nothing moves when the repository has no
+/// work tree, when the current directory is outside it, or when it is inside the git directory.
+pub fn path_below_work_tree_top(repo: &gix::Repository, arg: &str) -> PathBuf {
+    let plain = PathBuf::from(arg);
+    if plain.is_absolute() {
+        return plain;
+    }
+    let (Some(top), Ok(cwd)) = (work_tree(repo), std::env::current_dir()) else {
+        return plain;
+    };
+    let cwd = realpath_forgiving(&cwd);
+    if !cwd.starts_with(&top) || cwd.starts_with(realpath_forgiving(repo.git_dir())) {
+        return plain;
+    }
+    top.join(arg)
+}
+
 /// A prefix a command installed in place of the computed one: `git rev-parse
 /// --prefix <dir>` does
 ///

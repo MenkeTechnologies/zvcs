@@ -2432,6 +2432,8 @@ pub(super) fn setup_tracking(
         // — the callers guard this, and so do ours.
         return Ok(None);
     }
+    // `branch_get()` reads the whole remote configuration and dies on a malformed value.
+    crate::cmd_config::read_remote_config(repo).map_err(|r| r.into_error())?;
     let mut srcs: Vec<String>;
     let mut remote: Option<String>;
     let mut matches = 0usize;

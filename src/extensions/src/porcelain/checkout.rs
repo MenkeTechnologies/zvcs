@@ -728,6 +728,9 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
         .unwrap_or_else(|| repo.config_snapshot().boolean("checkout.guess") != Some(false));
     // Whether a lone leading operand is a revision (a branch, a rev, or a DWIM remote branch)
     // rather than a pathspec — `parse_branchname_arg()`'s split.
+    // A DWIM lookup that dies (a malformed remote setting) is kept here and raised once the
+    // operand split is done, since this closure can only answer yes or no.
+    let dwim_error: std::cell::RefCell<Option<anyhow::Error>> = std::cell::RefCell::new(None);
     let names_a_revision = |spec: &str| {
         repo.try_find_reference(format!("refs/heads/{spec}").as_str())
             .ok()
@@ -737,7 +740,14 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             // Only when the DWIM is allowed to run: with `--no-guess` git never
             // calls `parse_remote_branch()`, so a name that exists only on a remote
             // stays an ordinary pathspec.
-            || (guess && matches!(unique_remote_branch(&repo, spec), Ok(Dwim::One(_))))
+            || (guess
+                && match unique_remote_branch(&repo, spec) {
+                    Ok(found) => matches!(found, Dwim::One(_)),
+                    Err(e) => {
+                        dwim_error.borrow_mut().get_or_insert(e);
+                        false
+                    }
+                })
     };
     let path_op = if pathspec_from_file.is_some() {
         true
@@ -759,6 +769,9 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             _ => true,
         }
     };
+    if let Some(e) = dwim_error.take() {
+        return Err(e);
+    }
 
     // `opts->overlay_mode` resolved for the path forms: git's default is on
     // (`-1` behaves as overlay), and only `--no-overlay` turns it off.
@@ -932,6 +945,9 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
             || !post.is_empty()
             || pre.len() > 1
             || pre.first().is_some_and(|p| !names_a_revision(p));
+        if let Some(e) = dwim_error.take() {
+            return Err(e);
+        }
         if pathspec_arg {
             crate::git_fatal!("'--pathspec-from-file' and pathspec arguments cannot be used together");
         }
@@ -1522,7 +1538,7 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
     // arm of the closing condition admits: `branch_get("HEAD")` is the current branch, so a
     // branch with an upstream gets its ahead/behind summary even though no ref moved.
     if !quiet {
-        print_tracking_status(repo);
+        print_tracking_status(repo)?;
     }
     Ok(run_post_checkout(repo, head, head_commit_id(repo), true))
 }
@@ -1781,7 +1797,7 @@ pub(crate) fn switch_to_branch_opts(
                 // `git checkout <current-branch>` lost the
                 // `Your branch is up to date with '<upstream>'.` line that both
                 // git 2.50.1 and 2.55.0 print, while a real switch kept it.
-                print_tracking_status(repo);
+                print_tracking_status(repo)?;
             }
             return Ok(run_post_checkout(repo, old_head, head_commit_id(repo), true));
         }
@@ -1860,7 +1876,7 @@ pub(crate) fn switch_to_branch_opts(
     if !quiet {
         // `report_tracking()`: the ahead/behind summary for a branch with an upstream,
         // the same block `status` prints under its header.
-        print_tracking_status(repo);
+        print_tracking_status(repo)?;
     }
     Ok(run_post_checkout(repo, old_head, Some(commit.id), true))
 }
@@ -2193,7 +2209,7 @@ fn create_and_switch(
         // `report_tracking()` follows for a branch that already existed; a brand-new
         // one has nothing to report beyond the upstream just configured.
         if existed {
-            print_tracking_status(repo);
+            print_tracking_status(repo)?;
         }
     }
     if autostashed && !quiet {
@@ -2631,6 +2647,9 @@ pub(super) fn unique_remote_branch(repo: &gix::Repository, name: &str) -> Result
     // any remote, with `repo_config_get_string_tmp()`, which dies through
     // `git_die_config()` on a valueless key.
     let default_remote = crate::config::config_get_string(Some(repo), "checkout.defaultremote");
+    // `for_each_remote()` reads the whole remote configuration first (`read_config()`),
+    // which dies on a malformed `remote.<name>.prune` and its siblings.
+    crate::cmd_config::read_remote_config(repo).map_err(|r| r.into_error())?;
     let mut matches: Vec<String> = Vec::new();
     // `for_each_remote(check_tracking_name, &cb_data)` (checkout.c:68), whose
     // `string_list_append(cb->remote_names, remote->name)` (checkout.c:44-45)
@@ -4746,9 +4765,12 @@ fn stats_by_path(index: &gix::index::File) -> HashMap<BString, (ObjectId, Mode, 
 ///
 /// The text comes from the same renderer `status` uses, which appends the blank line
 /// that separates it from the file lists there; a switch has nothing to separate from.
-pub(crate) fn print_tracking_status(repo: &gix::Repository) {
+pub(crate) fn print_tracking_status(repo: &gix::Repository) -> Result<()> {
+    // `branch_get()` reads the remote configuration before anything is reported.
+    crate::cmd_config::read_remote_config(repo).map_err(|r| r.into_error())?;
     let block = super::status::tracking_block(repo);
     print!("{}", block.strip_suffix('\n').unwrap_or(&block));
+    Ok(())
 }
 
 /// `compute_default_attr_source()`'s `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`, raised by

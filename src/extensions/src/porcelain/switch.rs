@@ -722,7 +722,7 @@ fn switch_existing(
             // wordings, so the ahead/behind summary follows all three. Only the `Switched to`
             // arm below had it, which left `git switch <current-branch>` one line short of
             // `git checkout <current-branch>`.
-            super::checkout::print_tracking_status(repo);
+            super::checkout::print_tracking_status(repo)?;
         }
         return Ok(super::checkout::run_post_checkout(
             repo,
@@ -827,7 +827,7 @@ fn switch_existing(
     if !quiet {
         // `report_tracking()`, which `cmd_switch` reaches through the same
         // `update_refs_for_switch()` `checkout` does.
-        super::checkout::print_tracking_status(repo);
+        super::checkout::print_tracking_status(repo)?;
     }
     if autostashed.is_some() {
         show_autostash_listing(&target.to_string(), quiet)?;

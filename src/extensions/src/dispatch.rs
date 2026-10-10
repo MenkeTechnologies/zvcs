@@ -510,7 +510,11 @@ const CONFIG_BEFORE_SETTINGS_VERBS: &[&str] = &["merge-ours", "pull"];
 /// ```
 ///
 /// The refusal is left to the object store's first-use hook (`crate::setup`).
-const SETTINGS_ON_FIRST_OBJECT_VERBS: &[&str] = &["merge-tree"];
+///
+/// `verify-tag` is the same: `repo_config(git_default_config)` first, and the settings block only
+/// when `gpg_verify_tag()` reads the tag, so an operand that names no ref ends in
+/// `error: tag '<name>' not found.` with a bad `core.packedGitLimit` unread.
+const SETTINGS_ON_FIRST_OBJECT_VERBS: &[&str] = &["merge-tree", "verify-tag"];
 
 /// Whether `sub` reads its configuration even when no repository was found.
 ///

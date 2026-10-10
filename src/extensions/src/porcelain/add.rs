@@ -1769,7 +1769,9 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         .collect();
     index.remove_entries(|_, path, _| remove.contains(&path.to_owned()));
     for s in &staged {
-        index.dangerously_push_entry(s.stat, s.id, Flags::empty(), s.mode, s.path.as_ref());
+        // `add_to_index()` records the stat through `fill_stat_cache_info()`, which marks the entry
+        // `CE_VALID` under `core.ignoreStat`.
+        index.dangerously_push_entry(s.stat, s.id, crate::default_config::stat_cache_flags(), s.mode, s.path.as_ref());
     }
     index.sort_entries();
 

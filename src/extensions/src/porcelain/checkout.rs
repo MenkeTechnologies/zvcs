@@ -3102,6 +3102,7 @@ fn restore_from_index(
                 e.id = *id;
                 e.mode = *mode;
                 e.stat = *stat;
+                e.flags.insert(crate::default_config::stat_cache_flags());
             }
         }
     }
@@ -3337,6 +3338,7 @@ fn restore_from_tree(
                 e.id = *id;
                 e.mode = *mode;
                 e.stat = *stat;
+                e.flags.insert(crate::default_config::stat_cache_flags());
                 // `clear_skip_worktree_from_present_files()` (sparse-index.c:643-671): a
                 // `SKIP_WORKTREE` entry whose file is on disk stops being one, and
                 // `--ignore-skip-worktree-bits` has just put this one there. git clears it on
@@ -3367,7 +3369,7 @@ fn restore_from_tree(
                 index.dangerously_push_entry(
                     *stat,
                     *id,
-                    gix::index::entry::Flags::empty(),
+                    crate::default_config::stat_cache_flags(),
                     *mode,
                     BStr::new(path),
                 );

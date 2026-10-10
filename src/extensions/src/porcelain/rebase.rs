@@ -7647,6 +7647,10 @@ fn update_clean_worktree(
                 subset_stats.get(&path).filter(|(id, mode, _)| *id == e.id && *mode == e.mode)
             {
                 e.stat = *stat;
+                // `fill_stat_cache_info()` (read-cache.c:197): `core.ignoreStat` marks what it records.
+                if crate::default_config::assume_unchanged() {
+                    e.flags.insert(gix::index::entry::Flags::ASSUME_VALID);
+                }
             } else if let Some((oid, mode, stat)) = old_map.get(&path) {
                 if *oid == e.id && *mode == e.mode {
                     e.stat = *stat;

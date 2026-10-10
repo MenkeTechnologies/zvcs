@@ -1251,10 +1251,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                         e.id = *id;
                         e.mode = *mode;
                         e.stat = *stat;
+                        if worktree {
+                            e.flags.insert(crate::default_config::stat_cache_flags());
+                        }
                     }
                 }
                 Err(_) => {
-                    cur.dangerously_push_entry(*stat, *id, Flags::empty(), *mode, BStr::new(path));
+                    let flags = if worktree { crate::default_config::stat_cache_flags() } else { Flags::empty() };
+                    cur.dangerously_push_entry(*stat, *id, flags, *mode, BStr::new(path));
                     invalidated.push(path.clone());
                     need_sort = true;
                 }
@@ -1376,6 +1380,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
                 if let Some(stat) = fresh_stats.get(&p.to_owned()) {
                     e.stat = *stat;
+                    e.flags.insert(crate::default_config::stat_cache_flags());
                     // The file is in the worktree now, so the bit that said it was not
                     // there no longer describes it.
                     if ignore_skip_worktree {

@@ -2015,13 +2015,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
                         // For `--index` the entry's stat comes from the file just written
                         // (git's `fill_stat_cache_info`); `--cached` writes no file, so the
                         // stat is zeroed, exactly as `make_empty_cache_entry` leaves it.
-                        let stat = if o.cached {
-                            Stat::default()
+                        let (stat, flags) = if o.cached {
+                            (Stat::default(), Flags::empty())
                         } else {
                             let md = gix::index::fs::Metadata::from_path_no_follow(Path::new(&path))?;
-                            Stat::from_fs(&md)?
+                            (Stat::from_fs(&md)?, crate::default_config::stat_cache_flags())
                         };
-                        (id, stat, Flags::empty())
+                        (id, stat, flags)
                     };
                     // `add_index_file()` (apply.c:4488) writes the blob *first* and
                     // only then calls `add_index_entry()`, so a refusal below still

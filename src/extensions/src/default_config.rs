@@ -111,6 +111,16 @@ pub(crate) fn assume_unchanged() -> bool {
     ASSUME_UNCHANGED.load(Ordering::Relaxed)
 }
 
+/// The flags `fill_stat_cache_info()` (read-cache.c:197) adds to an entry whose stat it records:
+/// `CE_VALID` under `core.ignoreStat`, nothing otherwise.
+pub(crate) fn stat_cache_flags() -> gix::index::entry::Flags {
+    if assume_unchanged() {
+        gix::index::entry::Flags::ASSUME_VALID
+    } else {
+        gix::index::entry::Flags::empty()
+    }
+}
+
 /// C's `fsync_object_files >= 0`: set by the first `core.fsyncObjectFiles` read.
 static FSYNC_OBJECT_FILES_SEEN: AtomicBool = AtomicBool::new(false);
 

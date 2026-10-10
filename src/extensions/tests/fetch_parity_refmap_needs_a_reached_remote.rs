@@ -33,6 +33,10 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> Outcome {
         .env("GIT_AUTHOR_EMAIL", "a@x")
         .env("GIT_COMMITTER_NAME", "C")
         .env("GIT_COMMITTER_EMAIL", "c@x")
+        // Fixed stamps: the stock and zvcs fixtures are built one after the other, and ids that
+        // hash the wall clock differ whenever a second boundary falls between them.
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();

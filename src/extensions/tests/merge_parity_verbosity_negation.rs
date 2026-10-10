@@ -15,6 +15,10 @@ use stock_git::stock_git;
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn run(bin: &str, dir: &Path, args: &[&str]) -> (String, String, Option<i32>) {
+    run_env(bin, dir, args, &[])
+}
+
+fn run_env(bin: &str, dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (String, String, Option<i32>) {
     let out = Command::new(bin)
         .args(args)
         .current_dir(dir)
@@ -27,6 +31,7 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> (String, String, Option<i32>) {
         .env("GIT_MERGE_AUTOEDIT", "no")
         .env("HOME", dir)
         .env("LC_ALL", "C")
+        .envs(env.iter().copied())
         .output()
         .unwrap();
     (
@@ -42,17 +47,22 @@ fn fixture(tag: &str, stock: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dir.canonicalize().unwrap();
     run(stock, &dir, &["init", "-q", "-b", "main"]);
+    // Pinned, strictly increasing commit dates: `log --all` orders by date, and commits
+    // made within one wall-clock second tie, which made the listing order racy.
+    let commit = |msg: &str, date: &str| {
+        run_env(stock, &dir, &["commit", "-qm", msg], &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)]);
+    };
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
     run(stock, &dir, &["add", "."]);
-    run(stock, &dir, &["commit", "-qm", "one"]);
+    commit("one", "1700000000 +0000");
     run(stock, &dir, &["checkout", "-q", "-b", "side"]);
     std::fs::write(dir.join("b.txt"), "b\n").unwrap();
     run(stock, &dir, &["add", "."]);
-    run(stock, &dir, &["commit", "-qm", "two"]);
+    commit("two", "1700000100 +0000");
     run(stock, &dir, &["checkout", "-q", "main"]);
     std::fs::write(dir.join("c.txt"), "c\n").unwrap();
     run(stock, &dir, &["add", "."]);
-    run(stock, &dir, &["commit", "-qm", "three"]);
+    commit("three", "1700000200 +0000");
     dir
 }
 

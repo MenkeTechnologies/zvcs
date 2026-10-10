@@ -1877,7 +1877,20 @@ fn object_directory(
     if dir.is_empty() {
         return Err(fatal("The empty string is not a valid path"));
     }
-    match resolve_object_dir(dir, &repo_objects) {
+    // `commit-graph` takes `--object-dir` as a plain string (no `OPT_FILENAME`), so a relative one is
+    // read from where `setup_git_directory()` left git standing, the work tree top, not from the
+    // directory the user typed it in.
+    let at_setup = match (Path::new(dir).is_relative(), crate::setup::setup_cwd(repo)) {
+        (true, Some(top)) => top.join(dir),
+        _ => PathBuf::from(dir),
+    };
+    // `odb_find_source_or_die()` resolves it with `real_pathdup(path, 1)`, which dies on a missing
+    // intermediate component.
+    let want = match crate::setup::realpath_or_die(&at_setup) {
+        Ok(p) => p,
+        Err(message) => return Err(fatal(&message)),
+    };
+    match resolve_object_dir(want, &repo_objects) {
         Some(p) => Ok(p),
         None => Err(fatal(&format!(
             "could not find object directory matching {dir}"
@@ -1890,8 +1903,7 @@ fn object_directory(
 /// git rejects a directory that is neither the repository's own object database
 /// nor one of its alternates; mirror that by comparing canonicalised paths
 /// against the main objects dir and every entry of `info/alternates`.
-fn resolve_object_dir(dir: &str, repo_objects: &Path) -> Option<PathBuf> {
-    let want = std::fs::canonicalize(dir).ok()?;
+fn resolve_object_dir(want: PathBuf, repo_objects: &Path) -> Option<PathBuf> {
     let mut candidates = vec![repo_objects.to_path_buf()];
 
     if let Ok(alternates) = std::fs::read_to_string(repo_objects.join("info").join("alternates")) {

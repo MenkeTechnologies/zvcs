@@ -30,7 +30,9 @@ fn a_missing_upload_pack_program_is_the_shells_not_found() {
     let Some(t) = world("override-missing") else { return };
     let (stock, zvcs) = t.run_in("work", &["ls-remote", "--upload-pack=no-such-prog", "../bare.git"]);
     assert_eq!(stock.code, 128, "{stock:?}");
-    assert!(stock.stderr.contains("no-such-prog '../bare.git': no-such-prog: command not found"), "{stock:?}");
+    // The shell words its own diagnostic (`command not found` from bash, `1: ...: not found` from dash).
+    assert!(stock.stderr.contains("no-such-prog '../bare.git': "), "{stock:?}");
+    assert!(stock.stderr.contains("no-such-prog: ") && stock.stderr.contains("not found"), "{stock:?}");
     assert_eq!(zvcs, stock);
     t.same(&["fetch", "--upload-pack=no-such-prog", "../bare.git"]);
     t.same(&["fetch", "-u", "no-such-prog", "../bare.git"]);

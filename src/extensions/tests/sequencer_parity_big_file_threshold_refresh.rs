@@ -79,3 +79,19 @@ fn the_refresh_hashes_a_racily_clean_entry_and_dies_on_the_threshold() {
         assert_eq!(f.run(&["core.bigFileThreshold=input"], &args), (REFUSAL.to_string(), 128), "{args:?}");
     }
 }
+
+#[test]
+fn merge_checkout_and_commit_hash_the_same_entry_and_die_alike() {
+    for (i, args) in [
+        vec!["merge", "side"],
+        vec!["checkout", "side"],
+        vec!["commit", "-a", "-m", "x"],
+        vec!["commit", "-m", "x", "a"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let f = Fixture::new(&format!("more{i}"));
+        assert_eq!(f.run(&["core.bigFileThreshold=input"], &args), (REFUSAL.to_string(), 128), "{args:?}");
+    }
+}

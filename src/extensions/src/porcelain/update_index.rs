@@ -2909,10 +2909,14 @@ fn is_racy_entry(index: &gix::index::File, stat: &Stat) -> bool {
 
 /// `ce_compare_data()` hashes a regular file through `index_fd()`, which consults
 /// attributes first (object-file.c:1368), and the first lookup dies on an
-/// `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish (attr.c:1221-1226).
+/// `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish (attr.c:1221-1226). Before that,
+/// `index_fd()` asks for `core.bigFileThreshold`, whose unparsable value dies first.
 /// `ce_compare_link()` reads a symlink without asking.
 fn die_on_bad_attr_source(ctx: &Ctx, meta: &gix::index::fs::Metadata) -> Result<()> {
     if meta.is_file() {
+        if let Some(message) = crate::config::big_file_threshold_refusal(&ctx.repo) {
+            crate::git_fatal!("{message}");
+        }
         if let Some(message) = super::pack_objects::bad_default_attr_source(&ctx.repo) {
             crate::git_fatal!("{message}");
         }

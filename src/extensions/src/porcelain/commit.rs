@@ -4640,6 +4640,10 @@ fn stage_pathspecs(
     let dirwalk_index = repo.index_or_load_from_head_or_empty()?;
     let mut iter = repo.dirwalk_iter(dirwalk_index, patterns, Default::default(), options)?;
 
+    // `add_remove_files()` hashes every listed path with `add_file_to_index()`, which asks for
+    // `core.bigFileThreshold` before it reads a regular file.
+    let big_file_refusal = crate::config::big_file_threshold_refusal(repo);
+
     let mut staged: Vec<StagedFile> = Vec::new();
     let mut staged_set: HashSet<BString> = HashSet::new();
 
@@ -4675,6 +4679,9 @@ fn stage_pathspecs(
             let bytes = target.to_string_lossy().into_owned().into_bytes();
             (bytes, Mode::SYMLINK)
         } else {
+            if let Some(message) = &big_file_refusal {
+                return Err(crate::fatal::die(message.clone()));
+            }
             let bytes = std::fs::read(&abs)?;
             let mode = if md.is_executable() {
                 Mode::FILE_EXECUTABLE
@@ -4826,6 +4833,13 @@ fn collect_tracked_changes(
     let mut staged: Vec<StagedFile> = Vec::new();
     let mut deletions: Vec<BString> = Vec::new();
     let mut order = QueuedOrder::default();
+    // `add_file_to_index()` hashes every entry `run_diff_files()` reports changed, and `index_fd()` asks
+    // for `core.bigFileThreshold` first: an unparsable value dies at the first regular file it reaches.
+    let big_file_refusal = crate::config::big_file_threshold_refusal(repo);
+    let stat_ctx = match big_file_refusal {
+        Some(_) => Some(super::read_tree::StatCtx::new(repo, index)?),
+        None => None,
+    };
 
     {
         let backing = index.path_backing();
@@ -4896,6 +4910,12 @@ fn collect_tracked_changes(
                 let bytes = target.to_string_lossy().into_owned().into_bytes();
                 (bytes, Mode::SYMLINK)
             } else {
+                if let (Some(message), Some(ctx)) = (&big_file_refusal, &stat_ctx) {
+                    let path = path.as_bstr();
+                    if unmerged || ctx.probe(repo, e, path) != super::read_tree::Probe::Uptodate || ctx.match_stat_compares_data(e, path) {
+                        return Err(crate::fatal::die(message.clone()));
+                    }
+                }
                 let bytes = std::fs::read(&abs)?;
                 let mode = if md.is_executable() {
                     Mode::FILE_EXECUTABLE

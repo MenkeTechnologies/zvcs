@@ -3083,6 +3083,40 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
     }
 }
 
+/// `run_diff_files()` stats every entry through `ie_match_stat()`, and a racily clean one is
+/// read back by `ce_compare_data()`, whose first attribute lookup dies on a
+/// `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish — whatever format is asked for.
+/// `refresh_index()` and so `require_clean_work_tree()` stat the same way.
+pub(crate) fn die_on_bad_attr_source_by_stat(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    patterns: &[BString],
+) -> Result<()> {
+    let Some(message) = crate::porcelain::bad_default_attr_source(repo) else {
+        return Ok(());
+    };
+    let ctx = super::read_tree::StatCtx::new(repo, index)?;
+    let mut pathspec = match patterns.is_empty() {
+        true => None,
+        false => Some(repo.pathspec(
+            false,
+            patterns,
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?),
+    };
+    let state: &gix::index::State = index;
+    for e in state.entries() {
+        let path = e.path(state);
+        let included = pathspec.as_mut().map_or(true, |ps| ps.is_included(path, Some(false)));
+        if e.stage_raw() == 0 && included && ctx.match_stat_compares_data(e, path) {
+            return Err(crate::fatal::die(message.to_owned()));
+        }
+    }
+    Ok(())
+}
+
 /// Run the index↔worktree stat comparison and reduce every entry to [`Delta`]s,
 /// diverting combined unmerged paths into a separate list.
 fn collect(
@@ -3097,30 +3131,7 @@ fn collect(
         .to_owned();
     let caps = repo.filesystem_options()?;
 
-    // `run_diff_files()` stats every entry through `ie_match_stat()`, and a racily clean one is
-    // read back by `ce_compare_data()`, whose first attribute lookup dies on a
-    // `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish — whatever format is asked for.
-    if let Some(message) = crate::porcelain::bad_default_attr_source(repo) {
-        let ctx = super::read_tree::StatCtx::new(repo, &index)?;
-        let mut pathspec = match patterns.is_empty() {
-            true => None,
-            false => Some(repo.pathspec(
-                false,
-                &patterns,
-                false,
-                &index,
-                gix::worktree::stack::state::attributes::Source::IdMapping,
-            )?),
-        };
-        let state: &gix::index::State = &index;
-        for e in state.entries() {
-            let path = e.path(state);
-            let included = pathspec.as_mut().map_or(true, |ps| ps.is_included(path, Some(false)));
-            if e.stage_raw() == 0 && included && ctx.match_stat_compares_data(e, path) {
-                return Err(crate::fatal::die(message.to_owned()));
-            }
-        }
-    }
+    die_on_bad_attr_source_by_stat(repo, &index, &patterns)?;
 
     let submodules = match opts.ignore_submodules {
         Some(ignore) => gix::status::Submodule::Given {

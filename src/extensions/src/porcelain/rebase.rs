@@ -3195,6 +3195,10 @@ pub(super) fn dirty_state(repo: &gix::Repository) -> Result<(bool, bool, Vec<Str
         return Ok((true, true, conflicts));
     }
 
+    // `refresh_index()` stats every entry first; a changed-looking one is read back through the
+    // attribute machinery, which dies on a bad `--attr-source`.
+    super::diff_files::die_on_bad_attr_source_by_stat(repo, &repo.index_or_load_from_head()?.into_owned(), &[])?;
+
     let mut unstaged = false;
     let mut staged = false;
     let patterns: Vec<BString> = Vec::new();

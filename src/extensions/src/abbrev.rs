@@ -65,7 +65,8 @@ fn resolve_uncapped(value: Option<String>, hexsz: usize, auto: impl Fn() -> usiz
             "auto" => auto(),
             // The whole name, and then some: `blame -c core.abbrev=no` keeps all forty digits
             // after the `^` mark, which only a length past `hexsz` does.
-            "no" | "off" | "false" => hexsz.max(MAX_HEXSZ),
+            // `git_parse_maybe_bool_text()` answering false: `no`, `off`, `false` and the empty string.
+            v if crate::optint::maybe_bool_text(v) == Some(false) => hexsz.max(MAX_HEXSZ),
             // `git_config_int()`: the base-0 grammar, so `0x10` is sixteen, `010` is eight and `1k`
             // is 1024. A length past the hash width prints the whole name
             // (`repo_find_unique_abbrev_r()` caps it at `hexsz`, which [`resolve`] applies); one
@@ -451,7 +452,7 @@ mod tests {
         assert_eq!(resolve(None, 40, auto), 12);
         assert_eq!(resolve(Some("auto".into()), 40, auto), 12);
         // The false-y words mean the whole name.
-        for word in ["no", "off", "false"] {
+        for word in ["no", "off", "false", ""] {
             assert_eq!(resolve(Some(word.into()), 40, auto), 40, "{word}");
         }
         // A number is itself — this is the `core.abbrev = 10` that makes a

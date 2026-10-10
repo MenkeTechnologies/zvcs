@@ -459,6 +459,11 @@ mod abbrev {
         ) -> Result<Option<usize>, Error> {
             let hex_len_str = hex_len_str.as_bstr();
             let max = object_hash.len_in_hex() as u8;
+            // `git_parse_maybe_bool_text("")` is 0 (environment.c:349-363), the same answer `no` gets, so
+            // an empty value means the whole name. Whitespace alone is no boolean and no number.
+            if hex_len_str.is_empty() {
+                return Ok(object_hash.len_in_hex().into());
+            }
             if hex_len_str.trim().is_empty() {
                 return Err(Error {
                     value: hex_len_str.into(),

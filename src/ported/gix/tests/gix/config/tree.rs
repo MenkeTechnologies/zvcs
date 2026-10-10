@@ -527,6 +527,11 @@ mod core {
         );
 
         assert_eq!(
+            Core::ABBREV.try_into_abbreviation("", object_hash)?,
+            Some(object_hash.len_in_hex()),
+            "git_parse_maybe_bool_text(\"\") is false, which means the whole name"
+        );
+        assert_eq!(
             Core::ABBREV
                 .try_into_abbreviation("   ", object_hash)
                 .unwrap_err()

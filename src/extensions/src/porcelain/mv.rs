@@ -295,7 +295,7 @@ pub fn mv(args: &[String]) -> Result<ExitCode> {
         .boolean("core.sparseCheckout")
         .unwrap_or(false)
     {
-        Some(super::sparse_checkout::load_sparsity(&repo)?)
+        super::sparse_checkout::load_sparsity_for_path_checks(&repo)?
     } else {
         None
     };

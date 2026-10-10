@@ -1908,7 +1908,7 @@ pub(super) fn sparsity_to_consult(
     if include_sparse || !repo.config_snapshot().boolean("core.sparseCheckout").unwrap_or(false) {
         return Ok(None);
     }
-    Ok(Some(super::sparse_checkout::load_sparsity(repo)?))
+    super::sparse_checkout::load_sparsity_for_path_checks(repo)
 }
 
 /// git's `!include_sparse && (ce_skip_worktree(ce) || !path_in_sparse_checkout(...))`

@@ -786,6 +786,17 @@ pub(crate) fn load_sparsity_if_enabled(repo: &gix::Repository) -> Result<Option<
     load_sparsity(repo).map(Some)
 }
 
+/// [`load_sparsity`] for `path_in_sparse_checkout()`'s callers (`add`, `mv`). A
+/// `core.sparseCheckout` worktree whose `info/sparse-checkout` is not there has no definition to
+/// consult: `init_sparse_checkout_patterns()` fails to load it and every path counts as inside,
+/// where an *empty* file is a definition that includes nothing.
+pub(crate) fn load_sparsity_for_path_checks(repo: &gix::Repository) -> Result<Option<Sparsity>> {
+    if std::fs::metadata(pattern_path(repo)).is_err() {
+        return Ok(None);
+    }
+    load_sparsity(repo).map(Some)
+}
+
 pub(crate) fn load_sparsity(repo: &gix::Repository) -> Result<Sparsity> {
     load_sparsity_with(repo, is_cone(repo)?)
 }

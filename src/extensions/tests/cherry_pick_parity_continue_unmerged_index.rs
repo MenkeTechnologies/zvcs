@@ -25,6 +25,10 @@ fn run(bin: &str, dir: &Path, args: &[&str]) -> (String, String, Option<i32>) {
         .env("GIT_AUTHOR_EMAIL", "a@example.com")
         .env("GIT_COMMITTER_NAME", "a")
         .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        // Fixed stamps: the stock and zvcs fixtures are built one after the other, and ids that
+        // hash the wall clock differ whenever a second boundary falls between them.
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+        .env("GIT_COMMITTER_DATE", "1700000000 +0000")
         .env("GIT_EDITOR", "true")
         .env("HOME", dir)
         .env("LC_ALL", "C")

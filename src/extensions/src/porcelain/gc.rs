@@ -344,9 +344,16 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
             }
             "--auto" => auto = true,
             "--no-auto" => auto = false,
-            "--prune" => prune = Some(Prune::Dated),
+            "--prune" => {
+                // An `OPTARG` whose `defval` is the sentinel: it puts the sentinel back, so an earlier
+                // `--prune=<v>` is forgotten (builtin/gc.c:868-872).
+                prune = Some(Prune::Dated);
+                prune_raw = None;
+                prune_expire_arg = None;
+            }
             "--no-prune" => {
                 prune = Some(Prune::Disabled);
+                prune_raw = None;
                 prune_expire_arg = Some(None);
             }
             "--cruft" => cruft = Some(true),

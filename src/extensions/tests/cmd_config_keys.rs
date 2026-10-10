@@ -136,21 +136,21 @@ fn the_grep_keys_are_refused_by_grep() {
 fn the_grep_keys_reach_the_commit_listing_commands_last() {
     let (repo, home) = fixture("grep-revs");
 
-    for verb in [
-        vec!["log", "-1"],
-        vec!["show"],
-        vec!["whatchanged", "-1"],
-        vec!["format-patch", "-1", "--stdout"],
-        vec!["range-diff", "HEAD~1...HEAD"],
+    // `range-diff` reads each range through an inner `git log`, so that log's `fatal:` is
+    // followed by the parent's own `could not parse log` (stock git 2.56 prints both).
+    let fatal = "fatal: bad grep.patterntype argument: bogus\n";
+    let range_diff = format!("{fatal}error: could not parse log for 'HEAD..HEAD~1'\n");
+    for (verb, want) in [
+        (vec!["log", "-1"], fatal),
+        (vec!["show"], fatal),
+        (vec!["whatchanged", "-1"], fatal),
+        (vec!["format-patch", "-1", "--stdout"], fatal),
+        (vec!["range-diff", "HEAD~1...HEAD"], range_diff.as_str()),
     ] {
         let mut argv = vec!["-c", "grep.patternType=bogus"];
         argv.extend(verb.iter().copied());
         let out = run(&repo, &home, &argv);
-        assert_eq!(
-            stderr(&out),
-            "fatal: bad grep.patterntype argument: bogus\n",
-            "for {verb:?}"
-        );
+        assert_eq!(stderr(&out), want, "for {verb:?}");
     }
 
     // Verbs that never build a rev walk do not read them at all.

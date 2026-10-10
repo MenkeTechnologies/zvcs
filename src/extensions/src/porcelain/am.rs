@@ -3592,7 +3592,10 @@ fn first_line(msg: &[u8]) -> &[u8] {
 /// `decode_header()` only re-codes RFC 2047 encoded words, so git prints
 /// `Applying: caf\xe9 change` byte for byte. Rendering it through
 /// `String::from_utf8_lossy` instead would print U+FFFD and lose the byte.
+/// A `%s` conversion stops at the first NUL, precision or not, so a subject carrying one is
+/// printed up to it.
 fn say_subject(prefix: &str, subject: &[u8]) {
+    let subject = subject.split(|b| *b == 0).next().unwrap_or_default();
     let mut line = Vec::with_capacity(prefix.len() + subject.len() + 1);
     line.extend_from_slice(prefix.as_bytes());
     line.extend_from_slice(subject);

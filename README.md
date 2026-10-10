@@ -29,10 +29,10 @@ vendored [gitoxide](https://github.com/GitoxideLabs/gitoxide) crates — there i
 failure modes of driving a large meta-repo of submodules under many concurrent
 automated agents.
 
-The world's-first leg is not "git in Rust" — gitoxide is already that. It is the
-superset coordination layer: a fair FIFO index-lock daemon, a
-reconcile-to-mainline attacher, and forward-only gitlink bumps, served from the
-same binary that answers `rev-parse`.
+gitoxide already provides git in Rust. What zvcs adds is the superset
+coordination layer: a fair FIFO index-lock daemon, a reconcile-to-mainline
+attacher, and forward-only gitlink bumps, served from the same binary that
+answers `rev-parse`.
 
 ### [`Read the Docs`](https://menketechnologies.github.io/zvcs/) &middot; [`Engineering Report`](https://menketechnologies.github.io/zvcs/report.html) &middot; [`Parity Report`](https://menketechnologies.github.io/zvcs/port_report.html) &middot; [`gitoxide`](https://github.com/GitoxideLabs/gitoxide)
 
@@ -113,9 +113,10 @@ eval "$(git zshadow)"       # …and apply them to this shell
 git zshadow --print --all   # print without installing (to paste into ~/.zshrc)
 ```
 
-The workspace has two members-by-convention: `src/ported` (the vendored gitoxide
-crates, a self-contained workspace excluded from the root) is consumed by
-`src/extensions` (the zvcs crate) as a path dependency. `gix` is built with the
+The root workspace members are `src/extensions` (the zvcs crate), `src/parity`
+(the differential harness) and `src/plugin` (the `znative` SDK). `src/ported`
+(the vendored gitoxide crates, a self-contained workspace excluded from the
+root) is consumed by `src/extensions` as a path dependency. `gix` is built with the
 `blocking-http-transport-reqwest-rust-tls` feature so `zsync`'s reconcile fetch
 runs over HTTPS on a pure-Rust TLS stack — no curl/openssl C toolchain.
 
@@ -154,7 +155,7 @@ Two namespaces share one dispatch table (`src/extensions/src/dispatch.rs`):
 | Audit | `zaudit [--agent <ppid>] [--repo <s>] [--cmd <s>] [--mutating] [--summary]` | queryable **audit trail** over that same command log — filter by agent (which ppid ran it), repo, or command; `--mutating` keeps only state-changing commands; `--summary` tallies per-agent and per-command; `--json` for tooling |
 | Event feed | `zevents` `ztail` | one live semantic feed of commits, reconciles, and status changes across the whole tree (from the append-only events table) |
 | AOP | `zintercept before\|after\|around <pattern> -- <cmd>` | aspect-oriented hooks on git commands (ported from zshrs) — run advice before/after/around any matching command, with `INTERCEPT_NAME`/`ARGS`/`CMD` (and `STATUS`/`MS`/`US` for after) in the environment; an around advice runs `eval "$INTERCEPT_CMD"` to proceed |
-| Plugins | `znative add\|load\|remove\|list\|info\|update\|gc <SOURCE\|NAME>` | the **plugin package manager** (ported from zshrs) — install third-party subcommands from one content-addressed store under `$ZVCS_HOME/pkg`, in two kinds: a **native** plugin is a Rust cdylib compiled against the stable `znative` C ABI and `dlopen`ed, a **script** plugin is a repo of `git-<verb>` executables. Sources are `owner/repo`, `git+URL` or `path:DIR`, `@ref`-pinnable and SHA-256 integrity-pinned; a plugin verb resolves after built-ins and before the `git-<verb>` PATH lookup, and a native plugin may **override** an existing verb and delegate back to the original |
+| Plugins | `znative add\|load\|remove\|list\|info\|update\|gc\|clean <SOURCE\|NAME>` | the **plugin package manager** (ported from zshrs) — install third-party subcommands from one content-addressed store under `$ZVCS_HOME/pkg`, in two kinds: a **native** plugin is a Rust cdylib compiled against the stable `znative` C ABI and `dlopen`ed, a **script** plugin is a repo of `git-<verb>` executables. Sources are `owner/repo`, `git+URL` or `path:DIR`, `@ref`-pinnable and SHA-256 integrity-pinned; a plugin verb resolves after built-ins and before the `git-<verb>` PATH lookup, and a native plugin may **override** an existing verb and delegate back to the original |
 | Policy | `zguard`/`zpolicy` `deny\|warn <pattern> [--when <pred>]` | declarative fleet-wide command policy — refuse or warn on a matching git command *before it runs* (the veto evolution of `zintercept`). Glob on the command line (`deny 'push*--force*'`, `warn 'rm*-rf*'`) plus repo-state predicates (`--when detached\|dirty\|protected\|unsigned`, e.g. `deny 'commit*' --when unsigned` requires signed commits). `list`/`rm`/`clear`/`test`; a single `stat` on the hot path when no rule is set |
 | Autonomy config | `zconfig [<name> on\|off\|<n>]` | toggle the daemon's feature switches from the CLI (`autoreconcile`, `autobump`, `autostatus`, …, `statusinterval`, `watchmru`); `all on\|off` flips them together, reloading a running daemon |
 | Automation | `zpin` `zunpin` `zbroadcast` `zhandoff` `zon` `zsince` `zcontend` `zwaitfor` `zgraph` `zrewind` | freeze repos from autonomy; inter-agent messaging and claim hand-off; run a command on a semantic feed event; a time-window feed; live agent-vs-agent contention; block until a tree-wide state holds; fleet topology (dup groups) |
@@ -654,6 +655,8 @@ Wire protocol — line-based over the unix socket:
 | `RELEASE <id>` | client → daemon | Current holder releases; next waiter granted. |
 | `SUBMIT <json>` | client → daemon | Queue an async job; answered `JOB <id>`. |
 | `JOBSTOP <id>` / `JOBRESTART <id>` | client → daemon | Cancel / re-enqueue a job. |
+| `TRYACQUIRE <id> <git-dir>` | client → daemon | Non-blocking acquire; answered `GRANTED`, or `BUSY` when the lane is held or the repo has queued jobs. |
+| `HOLDER <git-dir>` | client → daemon | Read-only probe; answered `holder=<id>` or `holder=none`. |
 | `STATUS` / `STOP` | client → daemon | Snapshot / shut down. |
 
 ### Autonomous mode + configuration
@@ -729,6 +732,7 @@ own writes. For a repo's *git* hook (ref-change semantics in `.git/config`), use
 |------|----------|
 | `src/ported` | Vendored gitoxide crates (`gix` + the `gix-*` library crates), in-tree. A self-contained workspace, excluded from the root and consumed as a path dependency. The `gix`/`ein` CLI binaries and their `gitoxide-core` backend are removed; `git` is the only binary. |
 | `src/extensions` | The zvcs crate (library + the `git` binary): `main.rs`/`lib.rs` (entry, `session_key`, notify-on-next-command), `dispatch.rs` (routing), `porcelain/` (git-compat), `lock.rs` (daemon client), `config.rs` (`[zvcs]` settings plus the shared stock-git config primitives, the ordered config walk, and the config-*file* refusals — `bad config line <n> in file <path>` and the repository-format check, neither of which `-c` can reach), `repo_settings.rs`/`default_config.rs`/`diff_config.rs`/`status_config.rs`/`log_config.rs`/`cmd_config.rs` (git's config callbacks, which refuse an unreadable value with git's own diagnostic before the command runs), `autostart.rs` (daemon auto-spawn), `db.rs` (SQLite ledger/index), `rcache.rs` (zero-copy rkyv caches for tree diffs/blames/abbreviations), `crawler.rs` (repo crawl), `jobpool.rs`/`jobrun.rs`/`index_commit.rs` (async jobs), `worktree.rs` (checkout helper), and `superset/` (`zdaemon`, `zsync`, `zbump`, `reconcile`, `attach`, `watch`, `hooks`, `trigger`, `ledger`, `status`, `oplog`, `snapshot`, `claim`, `queue`, `repl`, `zworktree`). |
+| `src/parity` | `zvcs-parity`, the differential harness: builds fixture repositories with stock git, runs each invocation against both binaries, and compares stdout, exit code and resulting repository state. |
 | `src/plugin` | The `znative` plugin SDK — the stable, versioned C ABI (`#[repr(C)]` structs + `extern "C"` function pointers) that the plugin host and every native plugin compile against, so the two agree on the exact layout. Deliberately dependency-free. |
 | `examples` | Standalone plugin crates, built on install by `git znative add path:examples/…` rather than by this workspace. |
 

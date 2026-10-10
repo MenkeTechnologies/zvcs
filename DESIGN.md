@@ -17,7 +17,7 @@ should be checked before it is relied on.
 
 ## 1. Motivating problem
 
-The target workload: one meta repository that is a shell of ~162 git submodules
+The target workload: one meta repository that is a shell of many git submodules
 (some nested one level deeper), worked by ~16 concurrent CLI agents launched from
 the **meta root**, one agent per submodule, with cross-submodule work common.
 Stock git makes this painful in three specific ways:
@@ -56,8 +56,8 @@ behavior change. Scripts and muscle memory are unaffected.
 Two locks sit underneath, with distinct jobs:
 
 - **Fair FIFO lock (zvcs-internal).** Every index-writing porcelain command
-  acquires `RepoLock` before its write (`porcelain/commit.rs:85`,
-  `porcelain/add.rs:271`, `pull.rs`, `merge.rs`, `fetch.rs`, `reset.rs`,
+  acquires `RepoLock` before its write (`porcelain/commit.rs`,
+  `porcelain/add.rs`, `pull.rs`, `merge.rs`, `fetch.rs`, `reset.rs`,
   `stash.rs`, `switch.rs`, `checkout.rs`, `rebase.rs`, …). A contended writer
   **waits its turn** in the daemon's per-repo FIFO and then succeeds, instead of
   failing on `index.lock`. Same semantics, no fail-retry storm. Already wired.
@@ -66,7 +66,7 @@ Two locks sit underneath, with distinct jobs:
   `<git_dir>/zvcs-lane.lock` with `flock(LOCK_EX)` and holds it for the whole
   command. The fallback cannot be a no-op: an index write is a read-modify-write
   and the port's only index lock is taken at *write* time
-  (`gix-index/src/file/write.rs:85`), so two unserialized writers read the same
+  (`gix-index/src/file/write.rs`), so two unserialized writers read the same
   base index and each write back their own copy — the loser's entry is gone and
   both exit 0. Measured before the lane file: eight concurrent `git add`s on
   distinct paths, no daemon, lost a write in 9 of 10 trials with `queued=0`. Git
@@ -167,7 +167,7 @@ Thread topology — **no timers, no polling; everything is reactive**:
 - **Scheduler** — owns `HashMap<RepoKey, RepoState>` (per-repo FIFO lock lane),
   lazily created on first use, dropped when idle. `RepoKey` = canonical
   `git_dir`. Invariant: ≤1 in-flight index writer per repo. This is the evolved
-  `worker_loop` (`superset/zdaemon.rs:191`), whose single global critical
+  `worker_loop` (`superset/zdaemon.rs`), whose single global critical
   section is shattered into per-repo lanes so unrelated repos never serialize
   against each other.
 - **Watcher** — `notify`-based file watches; drives all autonomy (§5).
@@ -216,7 +216,7 @@ existing `STATUS`/`STOP` protocol + the pidfile — no new wire verbs.
 
 Each submodule is its own repository with its own index at
 `<root>/.git/modules/<path>/index` and its own `index.lock`. A commit inside
-submodule `foo` touches only `foo`'s index → **162 independent FIFO lanes**,
+submodule `foo` touches only `foo`'s index → **one independent FIFO lane per submodule**,
 fully parallel. Nested submodules nest the same way and add more lanes.
 
 The **one** shared resource is the **root index** (`<root>/.git/index`) — every
@@ -261,7 +261,7 @@ meet a detached HEAD and the stash/attach/pop dance becomes unnecessary.
   `git submodule update`) re-attaches within the debounce window.
 - **Clean vs dirty:**
   - *Clean* → full reconcile: attach `refs/heads/main` and fast-forward the
-    worktree to `origin/main` if behind (`reconcile_repo`, `superset/zsync.rs:24`).
+    worktree to `origin/main` if behind (`reconcile_repo`, `superset/zsync.rs`).
   - *Dirty* → **in-place attach**: `refs/heads/main` set to the current
     commit + `HEAD` made symbolic to it. This is a pure ref operation — it does
     **not** move the commit, touch the worktree, or touch the index, so dirty
@@ -283,9 +283,9 @@ On a submodule HEAD move, debounced and coalesced, the daemon bumps the parent
 gitlink to the submodule's **local** HEAD and **commits** it locally.
 
 - **Local only, no network, no auth.** The bump targets `subrepo.head_id()`
-  (`superset/zbump.rs:76`) — the submodule's current HEAD — not `origin/main`.
+  (`superset/zbump.rs`) — the submodule's current HEAD — not `origin/main`.
 - **Forward-only.** Bump only when the submodule HEAD is a descendant of the
-  recorded pointer (`zbump.rs:86-102`); a rewritten/rewound submodule is refused
+  recorded pointer (`zbump.rs`); a rewritten/rewound submodule is refused
   and logged, never recorded as a diverged pointer.
 - **Coalesced.** One root commit per debounce burst covering every changed
   submodule (message `zvcs: autobump <n> pointer(s)`), not one commit per
@@ -319,7 +319,7 @@ operator's **next** `git` invocation (at-least-once):
 
 - Failures (`{repo, reason, ts, notified}`) are recorded (§6, `jobs`/failure
   rows).
-- `run()` (`src/extensions/src/lib.rs:18`), before dispatch, prints unnotified
+- `run()` (`src/extensions/src/lib.rs`), before dispatch, prints unnotified
   failures for the current repo terse on **stderr**
   (`zvcs: <sub>: autobump refused (not a fast-forward)`), then marks them
   notified. No hint text; stdout stays clean so `$(git …)` capture is unaffected.
@@ -375,10 +375,10 @@ Hook output goes to `~/.zvcs/zvcs.log`; a failing hook is recorded in the ledger
 and surfaced by notify-on-next-command. `zdaemon` starts automatically when a
 hook is set, even without other autonomy (`autostart` gates on `should_watch()`).
 
-- `ZvcsConfig::load` (`src/extensions/src/config.rs:28`) reads these; absent keys
+- `ZvcsConfig::load` (`src/extensions/src/config.rs`) reads these; absent keys
   default to `false` (`interval` defaults to a small debounce). `any_autonomous()`
-  (`config.rs:42`) is the master gate.
-- **Spawn is also gated.** `autostart::ensure_if_configured` (`autostart.rs:18`)
+  (`config.rs`) is the master gate.
+- **Spawn is also gated.** `autostart::ensure_if_configured` (`autostart.rs`)
   only launches the daemon when `any_autonomous()` is true — so on a machine
   without the config, no daemon is ever spawned. That is the "otherwise not"
   behavior with zero cost.
@@ -529,7 +529,7 @@ commits/pushes that should not block.
 - **Job lifecycle:** `queued → running → {done | failed | stopped}`. Stop is
   **cooperative** (jobs are daemon threads, not processes) via a per-job
   `AtomicBool should_interrupt` (the pattern already in
-  `superset/zsync.rs:46`); long ops (fetch/push) abort at the next gix
+  `superset/zsync.rs`); long ops (fetch/push) abort at the next gix
   checkpoint. Restart re-enqueues a **new** row with `parent_job_id` set.
 - **Output discipline:** job# → **stderr**, suppressed when stdout is not a tty,
   so scripted `$(git …)` capture is unaffected.
@@ -554,7 +554,7 @@ commits/pushes that should not block.
 | `git zjobs` / `git zjob <id>[ stop\|restart]` | 2 | read/ctl | job ledger status & control |
 | `git zrepos` / `git zreindex [path]` | 2 | read/ctl | indexed-repo listing & rescan |
 | `git zrepl` | 2 | interactive | line REPL into the live daemon |
-| `git znative add\|load\|remove\|list\|info\|update\|gc` | 2 | read/ctl | the plugin package manager (§18) — install native (cdylib) and script (`git-<verb>`) plugins into one content-addressed store |
+| `git znative add\|load\|remove\|list\|info\|update\|gc\|clean` | 2 | read/ctl | the plugin package manager (§18) — install native (cdylib) and script (`git-<verb>`) plugins into one content-addressed store |
 | `git <plugin verb>` | plugin | sync | a verb an installed plugin provides, served from the `dlopen`ed library or the stored executable |
 
 ## 9. Design principles / non-goals

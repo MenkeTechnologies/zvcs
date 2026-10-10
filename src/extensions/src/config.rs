@@ -3402,6 +3402,10 @@ pub fn check_bare_and_worktree() -> anyhow::Result<()> {
         return Ok(());
     };
     let common_config = dirs.common_dir.join("config");
+    // `read_worktree_config()` runs `git_config_bool()` on every `core.bare` while
+    // `read_repository_format()` walks the file, so an unparsable value dies before the
+    // format is judged.
+    let (mut is_bare, mut work_tree) = read_bare_and_worktree(&common_config)?;
     let format = read_repository_format(&common_config);
     if format.version < 0 || verify_repository_format(&format).is_some() {
         return Ok(());
@@ -3409,9 +3413,8 @@ pub fn check_bare_and_worktree() -> anyhow::Result<()> {
     // `get_common_dir()`: `$GIT_COMMON_DIR`, or a `commondir` file in `$GIT_DIR`.
     let mut has_common = std::env::var_os("GIT_COMMON_DIR").is_some()
         || dirs.git_dir.join("commondir").is_file();
-    let (mut is_bare, mut work_tree) = read_bare_and_worktree(&common_config);
     if worktree_config_enabled(&common_config) {
-        let (bare, tree) = read_bare_and_worktree(&dirs.git_dir.join("config.worktree"));
+        let (bare, tree) = read_bare_and_worktree(&dirs.git_dir.join("config.worktree"))?;
         is_bare = bare.or(is_bare);
         work_tree = tree.or(work_tree);
         has_common = false;
@@ -3446,20 +3449,35 @@ pub fn check_bare_and_worktree() -> anyhow::Result<()> {
 /// `read_worktree_config()` over one file: the last `core.bare` and the last
 /// `core.worktree` it names. A valueless `core.worktree` never gets here — the
 /// read refuses it first ([`extension_value_refusal`]).
-fn read_bare_and_worktree(path: &std::path::Path) -> (Option<bool>, Option<String>) {
+fn read_bare_and_worktree(path: &std::path::Path) -> anyhow::Result<(Option<bool>, Option<String>)> {
     let Ok(bytes) = std::fs::read(path) else {
-        return (None, None);
+        return Ok((None, None));
     };
     let Ok(file) = gix::config::File::from_bytes_no_includes(
         &bytes,
         gix::config::file::Metadata::from(gix::config::Source::Local),
         Default::default(),
     ) else {
-        return (None, None);
+        return Ok((None, None));
     };
-    let is_bare = file.boolean("core.bare").ok().flatten();
+    // `git_config_bool()` on each occurrence, the first unparsable one fatal; a key written
+    // with no `=` is true.
+    let mut is_bare = file.boolean("core.bare").ok().flatten();
+    if let Ok(values) = file.raw_values("core.bare") {
+        for value in values {
+            let text = value.to_string();
+            match crate::optint::maybe_bool(&text) {
+                Some(parsed) => is_bare = Some(parsed),
+                None => {
+                    return Err(crate::fatal::die(format!(
+                        "bad boolean config value '{text}' for 'core.bare'"
+                    )))
+                }
+            }
+        }
+    }
     let work_tree = file.string("core.worktree").map(|v| v.to_string());
-    (is_bare, work_tree)
+    Ok((is_bare, work_tree))
 }
 
 /// The `fatal:` line git would have printed for a repository this port failed to

@@ -2026,7 +2026,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 
     // `o->flags.check_failed`, set by the `--check` walk below.
     let mut check_failed = false;
-    let mut deltas = collect(&repo, &tree_id, &opts)?;
+    let (mut deltas, mut racy_paths) = collect(&repo, &tree_id, &opts)?;
     if !paths.is_empty() {
         if needs_gix {
             let index = repo.index_or_empty()?;
@@ -2038,6 +2038,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 gix::worktree::stack::state::attributes::Source::IdMapping,
             )?;
             deltas.retain(|d| ps.is_included(d.path.as_bstr(), Some(false)));
+            racy_paths.retain(|p| ps.is_included(p.as_bstr(), Some(false)));
         } else {
             // Pathspecs are cwd-relative in git while output paths are root-relative, so
             // lift every pattern into repository-root space before matching.
@@ -2051,6 +2052,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 })
                 .collect();
             deltas.retain(|d| lifted.iter().any(|p| path_matches(&d.path, p)));
+            racy_paths.retain(|r| lifted.iter().any(|p| path_matches(r, p)));
+        }
+    }
+    // A racily clean entry inside the pathspec was read back by `ce_modified_check_fs()` while
+    // the queue was built, and the first attribute lookup of that read is
+    // `compute_default_attr_source()`'s `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`.
+    if !racy_paths.is_empty() {
+        if let Some(message) = crate::porcelain::bad_default_attr_source(&repo) {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
         }
     }
     // The `strncmp(path, prefix, prefix_length)` tests in `diff_queue_addremove()`,
@@ -2555,10 +2566,12 @@ pub(crate) fn cached_name_only(repo: &gix::Repository, tree_id: &ObjectId) -> Re
         cached: true,
         ..plumbing_opts()
     };
-    Ok(collect(repo, tree_id, &opts)?.into_iter().map(|d| d.path).collect())
+    Ok(collect(repo, tree_id, &opts)?.0.into_iter().map(|d| d.path).collect())
 }
 
-fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Vec<Delta>> {
+/// The deltas, plus the paths whose racy stat data made `ie_match_stat()` read the file back
+/// (`ce_modified_check_fs()`), which is where an attribute lookup can die.
+fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(Vec<Delta>, Vec<BString>)> {
     let null = ObjectId::null(repo.object_hash());
     let mut tree: BTreeMap<BString, (u32, ObjectId)> = BTreeMap::new();
     flatten_tree(repo, tree_id, &BString::default(), &mut tree)?;
@@ -2609,6 +2622,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
     let stat_opts = repo.stat_options()?;
 
     let all: BTreeSet<&BString> = tree.keys().chain(idx.keys()).collect();
+    let mut racy_paths: Vec<BString> = Vec::new();
     let mut deltas = Vec::new();
     for path in all {
         let src = tree.get(path).copied();
@@ -2689,7 +2703,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
                     // submodule is dirty needs a full status of its own worktree.
                     if (info.mode & S_IFMT) != 0o160000
                         && (info.intent_to_add
-                            || entry_is_dirty(repo, info, &md, index_timestamp, stat_opts, &full))
+                            || entry_is_dirty(repo, info, &md, index_timestamp, stat_opts, &full, &mut racy_paths, path))
                     {
                         dst_mode = mode_from_stat(&md);
                         dst_id = null;
@@ -2731,7 +2745,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<Ve
         });
     }
 
-    Ok(deltas)
+    Ok((deltas, racy_paths))
 }
 
 /// Flatten `tree_id` into `out`, keyed by repository-root relative path.
@@ -2773,6 +2787,8 @@ fn entry_is_dirty(
     index_timestamp: i64,
     stat_opts: gix::index::entry::stat::Options,
     full: &Path,
+    racy_paths: &mut Vec<BString>,
+    path: &BString,
 ) -> bool {
     if mode_changed(info.mode, md) || stat_data_changed(&info.stat, md, stat_opts) {
         return true;
@@ -2782,6 +2798,11 @@ fn entry_is_dirty(
     // with no timestamp of its own (never written) is never racy, as in `is_racy_stat`.
     if index_timestamp == 0 || i64::from(info.stat.mtime.secs) < index_timestamp {
         return false;
+    }
+    // Only a regular file is hashed through `index_fd()` and so consults attributes; a symlink
+    // is compared by its target.
+    if (info.mode & S_IFMT) == 0o100000 {
+        racy_paths.push(path.clone());
     }
     // `ie_match_stat()`: `changed |= ce_modified_check_fs(istate, ce, st)`, which switches on the
     // filesystem type — a symlink is compared against its own target bytes, not against what the

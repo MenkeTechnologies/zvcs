@@ -2029,6 +2029,25 @@ impl StatCtx {
     /// `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`. `None` when the source is
     /// fine or no entry reaches the compare, so the refresh runs to completion.
     ///
+    /// `ie_match_stat()` (read-cache.c:431-436) on a regular file whose stat data matches but
+    /// is racy: the one way a run that does not refresh the index (`diff-files`, `diff-index`)
+    /// reaches `ce_compare_data()`, and so the first attribute lookup.
+    pub(super) fn match_stat_compares_data(&self, entry: &gix::index::Entry, path: &gix::bstr::BStr) -> bool {
+        if entry.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID | Flags::INTENT_TO_ADD)
+            || !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE)
+        {
+            return false;
+        }
+        let Some(workdir) = &self.workdir else {
+            return false;
+        };
+        let full = workdir.join(gix::path::from_bstr(path).as_ref());
+        let Ok(meta) = gix::index::fs::Metadata::from_path_no_follow(&full) else {
+            return false;
+        };
+        !self.basic_changed(entry, &meta) && self.is_racy(entry)
+    }
+
     /// `include` is `ce_path_match()` against the refresh's pathspec: an entry it
     /// rejects is skipped, an unmerged one without being named (read-cache.c:1548-1563).
     pub(super) fn refresh_dies_on_attr_source(

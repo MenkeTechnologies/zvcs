@@ -17,6 +17,7 @@
 
 #![allow(dead_code)]
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -90,7 +91,8 @@ impl World {
         let root = self.root.to_string_lossy().into_owned();
         let clean = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace(&root, "<root>");
         Outcome {
-            code: out.status.code().expect("no signal"),
+            // A death by signal reports as the shell would: 128 + the signal number.
+            code: out.status.code().unwrap_or_else(|| 128 + out.status.signal().expect("no exit code and no signal")),
             stdout: clean(&out.stdout),
             stderr: clean(&out.stderr),
         }
@@ -139,6 +141,13 @@ impl Twin {
     /// Run setup `args` in `work` of both worlds without comparing them.
     pub fn prepare(&self, args: &[&str]) {
         self.run_in("work", args);
+    }
+
+    /// Remove the file `rel` (relative to the world root) from both worlds, if present.
+    pub fn forget(&self, rel: &str) {
+        for w in [&self.stock, &self.zvcs] {
+            let _ = std::fs::remove_file(w.root.join(rel));
+        }
     }
 
     /// Create the directory `rel` (relative to the world root) in both worlds.

@@ -14,6 +14,27 @@ mod stock_git;
 mod twin;
 use twin::Twin;
 
+/// `128 + SIGPIPE`.
+const SIGPIPE_EXIT: i32 = 141;
+
+/// `write_pack_data()` (bundle.c) feeds the child's standard input with `write_or_die()` and
+/// leaves `SIGPIPE` at its default, so stock git's parent is itself killed by `SIGPIPE`, leaving
+/// its `.lock` behind, whenever the child has already died on the refused value by the time the
+/// parent writes. That is a scheduling race in the oracle, not behaviour zvcs is meant to mimic:
+/// rerun until stock got far enough to be the deterministic `pack-objects died`, then compare.
+#[track_caller]
+fn same_without_the_oracles_sigpipe_race(t: &Twin, args: &[&str]) {
+    for _ in 0..50 {
+        let (stock, zvcs) = t.run_in("work", args);
+        if stock.code != SIGPIPE_EXIT {
+            assert_eq!(zvcs, stock, "git {args:?}: left is zvcs, right is stock");
+            return;
+        }
+        t.forget("work/out.bundle.lock");
+    }
+    panic!("git {args:?}: stock git died of SIGPIPE on every attempt");
+}
+
 const REFUSED: &[&str] = &[
     "color.advice=input",
     "push.default=no",
@@ -30,7 +51,7 @@ const REFUSED: &[&str] = &[
 fn a_refused_value_ends_bundle_create_with_the_childs_death() {
     let Some(t) = Twin::new("bundle-child-config") else { return };
     for key in REFUSED {
-        t.same(&["-c", key, "bundle", "create", "out.bundle", "--all"]);
+        same_without_the_oracles_sigpipe_race(&t, &["-c", key, "bundle", "create", "out.bundle", "--all"]);
         let (stock, zvcs) = t.run_in("work", &["ls-files", "--others"]);
         assert_eq!(zvcs, stock, "{key}: left is zvcs, right is stock");
     }
@@ -39,13 +60,16 @@ fn a_refused_value_ends_bundle_create_with_the_childs_death() {
 #[test]
 fn the_header_reaches_standard_output_first() {
     let Some(t) = Twin::new("bundle-child-config-stdout") else { return };
-    t.same(&["-c", "color.advice=input", "bundle", "create", "-", "--all"]);
+    same_without_the_oracles_sigpipe_race(&t, &["-c", "color.advice=input", "bundle", "create", "-", "--all"]);
 }
 
 #[test]
 fn the_settings_block_is_the_childs_first_read() {
     let Some(t) = Twin::new("bundle-child-settings") else { return };
-    t.same(&["-c", "feature.manyFiles=bogus", "-c", "color.advice=input", "bundle", "create", "out.bundle", "--all"]);
+    same_without_the_oracles_sigpipe_race(
+        &t,
+        &["-c", "feature.manyFiles=bogus", "-c", "color.advice=input", "bundle", "create", "out.bundle", "--all"],
+    );
 }
 
 #[test]

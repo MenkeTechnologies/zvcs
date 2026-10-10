@@ -6793,16 +6793,14 @@ impl<'r> Sequencer<'r> {
         // `core.commentString = ;`.
         let comment = todo::comment_prefix(self.repo);
         let hinted = conflicts.map(|paths| {
+            // `opts->default_msg_cleanup` from `commit.cleanup` puts the block below a cut line.
             let mut out = message.to_vec();
-            out.push(b'\n');
-            out.extend_from_slice(comment.as_bytes());
-            out.extend_from_slice(b" Conflicts:\n");
-            for path in paths {
-                out.extend_from_slice(comment.as_bytes());
-                out.push(b'\t');
-                out.extend_from_slice(&path[..]);
-                out.push(b'\n');
-            }
+            crate::merge_apply::append_conflicts_hint(
+                &mut out,
+                paths,
+                &comment,
+                crate::merge_apply::config_cleanup_is_scissors(self.repo),
+            );
             out
         });
         // The message `--continue` will commit. A conflicted fixup/squash

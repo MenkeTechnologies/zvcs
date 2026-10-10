@@ -1562,7 +1562,7 @@ fn pick_one(
             &mut merge_msg,
             &crate::merge_apply::unmerged_paths(&new_index),
             &comment,
-            cleanup == Some(Cleanup::Scissors),
+            cleanup.map_or_else(|| crate::merge_apply::config_cleanup_is_scissors(&repo), |c| c == Cleanup::Scissors),
         );
         std::fs::write(git_dir.join("MERGE_MSG"), &merge_msg[..])?;
 

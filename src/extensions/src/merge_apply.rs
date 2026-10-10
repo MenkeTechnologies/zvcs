@@ -198,6 +198,22 @@ pub fn append_conflicts_hint(msg: &mut Vec<u8>, paths: &[BString], comment: &str
     }
 }
 
+/// `opts->default_msg_cleanup == COMMIT_MSG_CLEANUP_SCISSORS` as `git_sequencer_config()` leaves
+/// it when no `--cleanup` was given: every `commit.cleanup` value is applied in configuration
+/// order, an unrecognized one is skipped (git only warns), so the last recognized one wins.
+pub fn config_cleanup_is_scissors(repo: &gix::Repository) -> bool {
+    let Some(values) = repo.config_snapshot().strings("commit.cleanup") else {
+        return false;
+    };
+    let recognized = ["verbatim", "whitespace", "strip", "scissors"];
+    values
+        .iter()
+        .map(|v| v.to_string())
+        .filter(|v| recognized.contains(&v.as_str()))
+        .last()
+        .is_some_and(|v| v == "scissors")
+}
+
 /// Remove the worktree file `path` names, then `rmdir` every directory the
 /// removal may have emptied, deepest first.
 ///

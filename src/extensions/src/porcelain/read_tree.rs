@@ -1904,7 +1904,7 @@ pub(super) struct RefreshDeath {
     /// `REFRESH_UNMERGED`.
     pub(super) unmerged: Vec<BString>,
     /// The `fatal:` body.
-    message: &'static str,
+    message: String,
 }
 
 impl RefreshDeath {
@@ -2048,6 +2048,18 @@ impl StatCtx {
         !self.basic_changed(entry, &meta) && self.is_racy(entry)
     }
 
+    /// [`Self::refresh_dies_on_attr_source`] for a caller that has no output of its own to order:
+    /// the unmerged paths it reached are named on stdout, then the refusal is the `fatal:`.
+    pub(super) fn refresh_or_die(repo: &gix::Repository, index: &gix::index::File) -> Result<()> {
+        if let Some(death) = Self::refresh_dies_on_attr_source(repo, index, |_| true)? {
+            for path in &death.unmerged {
+                println!("{path}: needs merge");
+            }
+            return Err(crate::fatal::die(death.message));
+        }
+        Ok(())
+    }
+
     /// `include` is `ce_path_match()` against the refresh's pathspec: an entry it
     /// rejects is skipped, an unmerged one without being named (read-cache.c:1548-1563).
     pub(super) fn refresh_dies_on_attr_source(
@@ -2055,7 +2067,11 @@ impl StatCtx {
         index: &gix::index::File,
         mut include: impl FnMut(&gix::bstr::BStr) -> bool,
     ) -> Result<Option<RefreshDeath>> {
-        let Some(message) = super::pack_objects::bad_default_attr_source(repo) else {
+        // `index_fd()` asks for `core.bigFileThreshold` before it converts anything, so an
+        // unreadable threshold is the refusal that comes first.
+        let Some(message) = crate::config::big_file_threshold_refusal(repo)
+            .or_else(|| super::pack_objects::bad_default_attr_source(repo).map(str::to_owned))
+        else {
             return Ok(None);
         };
         let ctx = Self::new(repo, index)?;

@@ -1054,6 +1054,9 @@ fn revert_one(
     // unmerged or dirty index outranks "is a merge but no -m was given". Under
     // `--no-commit` the only demand is that the index be merged, because the
     // index itself then becomes the *ours* side and a staged change is fine.
+    // The refresh before the merge hashes the first entry whose stat data cannot vouch for it; an
+    // unreadable `core.bigFileThreshold` or a bad `--attr-source` dies there.
+    super::read_tree::StatCtx::refresh_or_die(repo, &repo.index_or_load_from_head()?.into_owned())?;
     let index_state = read_index_state(repo, head_tree)?;
     if o.no_commit {
         if index_state.unmerged {

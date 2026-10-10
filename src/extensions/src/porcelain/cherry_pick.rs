@@ -1093,6 +1093,11 @@ fn pick_one(
     let head_id = state.head_id;
     let pick = repo.find_commit(pick_id)?;
 
+    // `do_pick_commit()` refreshes the index before it merges, and the first entry whose stat data
+    // cannot vouch for it is hashed from the work tree: an unreadable `core.bigFileThreshold` or a
+    // bad `--attr-source` dies there.
+    super::read_tree::StatCtx::refresh_or_die(repo, &state.index)?;
+
     // --- the index gate, and with it the *ours* side ------------------
     //
     // `do_pick_commit` inspects the index before it so much as looks at the

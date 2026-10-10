@@ -3087,12 +3087,17 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
 /// read back by `ce_compare_data()`, whose first attribute lookup dies on a
 /// `--attr-source` / `GIT_ATTR_SOURCE` naming no tree-ish — whatever format is asked for.
 /// `refresh_index()` and so `require_clean_work_tree()` stat the same way.
-pub(crate) fn die_on_bad_attr_source_by_stat(
+///
+/// The same read hashes the file, and `index_fd()` asks for `core.bigFileThreshold` before it
+/// converts anything, so an unreadable threshold is the refusal that comes first.
+pub(crate) fn die_on_worktree_hash_refusal_by_stat(
     repo: &gix::Repository,
     index: &gix::index::File,
     patterns: &[BString],
 ) -> Result<()> {
-    let Some(message) = crate::porcelain::bad_default_attr_source(repo) else {
+    let Some(message) = crate::config::big_file_threshold_refusal(repo)
+        .or_else(|| crate::porcelain::bad_default_attr_source(repo).map(str::to_owned))
+    else {
         return Ok(());
     };
     let ctx = super::read_tree::StatCtx::new(repo, index)?;
@@ -3111,7 +3116,7 @@ pub(crate) fn die_on_bad_attr_source_by_stat(
         let path = e.path(state);
         let included = pathspec.as_mut().map_or(true, |ps| ps.is_included(path, Some(false)));
         if e.stage_raw() == 0 && included && ctx.match_stat_compares_data(e, path) {
-            return Err(crate::fatal::die(message.to_owned()));
+            return Err(crate::fatal::die(message));
         }
     }
     Ok(())
@@ -3131,7 +3136,7 @@ fn collect(
         .to_owned();
     let caps = repo.filesystem_options()?;
 
-    die_on_bad_attr_source_by_stat(repo, &index, &patterns)?;
+    die_on_worktree_hash_refusal_by_stat(repo, &index, &patterns)?;
 
     let submodules = match opts.ignore_submodules {
         Some(ignore) => gix::status::Submodule::Given {

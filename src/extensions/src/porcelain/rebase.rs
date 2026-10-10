@@ -4523,6 +4523,9 @@ struct SequencerStart<'a> {
 /// instruction sheet, let the user edit it, then execute it.
 fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
     let repo = start.repo;
+    // `get_replay_opts()` reads the configuration through `git_sequencer_config()`, whose chain ends at
+    // `git_diff_basic_config()`, before anything of the rebase has been touched.
+    crate::diff_config::validate_basic(repo).map_err(|r| r.into_error())?;
     let dir = rebase_merge_dir(repo);
     let abbreviate = repo
         .config_snapshot()
@@ -4899,6 +4902,8 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
+    // The same `get_replay_opts()` read as at the start.
+    crate::diff_config::validate_basic(repo).map_err(|r| r.into_error())?;
     let st = read_basic_state(repo)?;
     let dir = rebase_merge_dir(repo);
     let (list, parsed_ok) = todo::List::parse(

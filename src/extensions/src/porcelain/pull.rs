@@ -1112,6 +1112,14 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // command line still has the pull read the remote configuration itself.
     if rebasing {
         crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
+        // `get_tracking_branch()` runs `refspec_item_init_or_die()` on the first refspec
+        // (builtin/pull.c:1079), so a malformed one ends the pull itself at 128 before the
+        // fetch child starts.
+        if let Some(spec) = positionals.get(1).filter(|s| !s.is_empty()) {
+            if !super::fetch::refspec_globs_agree(spec) || !super::fetch::refspec_is_valid(spec) {
+                crate::git_fatal!("invalid refspec '{spec}'");
+            }
+        }
     }
     // The child is a new process with its own `remote_state`, so it reads the remote
     // configuration again, diagnostics and all.

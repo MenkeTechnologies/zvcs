@@ -2441,7 +2441,7 @@ fn fetch_head_note(id: gix::ObjectId, for_merge: bool, remote_ref: &str, url: &s
 /// A `*` on one side must be matched by a `*` on the other, and a pattern source with no destination at all
 /// is refused — `refs/heads/*` alone would name a set of refs with nowhere to put them. Negative (`^`) specs
 /// carry only a left-hand side and are exempt from the second rule.
-fn refspec_globs_agree(spec: &str) -> bool {
+pub(super) fn refspec_globs_agree(spec: &str) -> bool {
     let (negative, body) = match spec.strip_prefix('^') {
         Some(rest) => (true, rest),
         None => (false, spec.strip_prefix('+').unwrap_or(spec)),
@@ -2546,7 +2546,7 @@ fn negative_spec_is_inert(spec: &str) -> bool {
 /// The exception is [`negative_spec_is_inert`]: git's negative sources may be
 /// one-level names and the vendored parser's may not, so those are checked with a
 /// `refs/` prefix bolted on and accepted here.
-fn refspec_is_valid(spec: &str) -> bool {
+pub(super) fn refspec_is_valid(spec: &str) -> bool {
     negative_spec_is_inert(spec)
         || gix::refspec::parse(spec.into(), gix::refspec::parse::Operation::Fetch).is_ok()
 }

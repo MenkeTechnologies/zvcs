@@ -269,6 +269,15 @@ pub fn write_with(
 /// [`State::version_is_unset()`](gix::index::State::version_is_unset()); a caller that
 /// already resolved the version itself (`update-index --index-version <n>`,
 /// `read-tree`'s fresh-state options) has filled in `options.version` and is left alone.
+/// `o->internal.result.version = o->internal.src_index->version` (unpack-trees.c:1940): an index
+/// rebuilt from a tree is rewritten in the version of the one it replaces, whatever `index.version`
+/// says. An `old` that was never read off disk has no version to hand on.
+pub fn inherit_version(old: &gix::index::File, new: &mut gix::index::File) {
+    if !old.version_is_unset() {
+        new.set_version(old.version());
+    }
+}
+
 fn resolve_index_version(repo: &gix::Repository, index: &gix::index::File, options: &mut gix::index::write::Options) {
     if options.version.is_none() && index.version_is_unset() {
         options.version = Some(crate::config::index_format_default(repo));

@@ -1237,6 +1237,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // the user did not give rather than refusing — except under
     // `user.useConfigOnly`, which is the one case it says so.
     let mut repo = crate::setup::discover()?;
+    // `get_cleanup_mode()` reads `commit.cleanup` as well when no `--cleanup` was given, still inside
+    // `parse_and_validate_options()`, so a bad configured mode dies before any hook or staging.
+    if cleanup_arg.is_none() {
+        if let Some(c) = repo.config_snapshot().string("commit.cleanup") {
+            if !matches!(c.to_string().as_str(), "default" | "verbatim" | "whitespace" | "strip" | "scissors") {
+                crate::git_fatal!("Invalid cleanup mode {c}");
+            }
+        }
+    }
     if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
         return Ok(code);
     }

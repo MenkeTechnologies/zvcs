@@ -52,6 +52,11 @@ fn bad_threshold_from_a_file_names_it() {
 fn symlink_and_valid_threshold_moves_are_unaffected() {
     let Some(stock) = stock_git::stock_git() else { return };
     let (s, z) = twin_repo::pair("mv-big-file-threshold-ok", stock);
+    // Stock git compares stat times to the second, so a regular file written in the same second
+    // as the last index write is racily clean and gets its content re-read (the threshold
+    // lookup) when the index is written back. Let the clock tick before the link commit rewrites
+    // the index, so that is not what this test measures.
+    settle();
     for side in [&s, &z] {
         std::os::unix::fs::symlink("a", side.repo().join("lnk")).unwrap();
         side.git(&["add", "lnk"]);

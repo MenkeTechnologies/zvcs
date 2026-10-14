@@ -112,6 +112,14 @@ impl Fixture {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // `commit` ends with `run_auto_maintenance()`, which detaches by
+            // default and leaves a child holding `objects/maintenance.lock`
+            // after the commit returns. `copy_tree` walking `.git` then lists
+            // that lock and finds it gone by the time it copies it. Running
+            // maintenance in the foreground puts the lock back inside the call.
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "maintenance.autoDetach")
+            .env("GIT_CONFIG_VALUE_0", "false")
             .env("GIT_AUTHOR_NAME", "A U Thor")
             .env("GIT_AUTHOR_EMAIL", "author@example.com")
             .env("GIT_COMMITTER_NAME", "C O Mitter")

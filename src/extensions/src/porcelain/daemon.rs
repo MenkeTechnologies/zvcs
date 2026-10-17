@@ -66,8 +66,7 @@
 //!     arm `alarm()` around the request read, `--verbose` logs
 //!     `Ready to rumble`, `Connection from <ip>:<port>` and `Disconnected`, and
 //!     `--pid-file` is written (not removed at exit). The service child is run
-//!     on the absolute repository path rather than `.`, because the services
-//!     refuse a relative `.` inside a non-bare `.git` directory.
+//!     on `.`, as git does, since `path_ok()` has already entered the repository.
 //!   * The die-routine swap. When the effective log destination is `syslog`
 //!     (`--syslog`, or the default under `--inetd`/`--detach`), `daemon`
 //!     installs `daemon_die`, which logs to syslog and exits **1** — so those
@@ -1222,12 +1221,9 @@ fn run_service_command(
     use std::io::BufRead;
 
     let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
-    // git passes `.`. The absolute spelling is the same directory, and it is what
-    // the services accept when the repository is a non-bare `.git` directory:
-    // `upload-pack .`, `receive-pack .` and `upload-archive .` all refuse a
-    // relative `.` there.
+    // git passes `.`: `path_ok()` has already entered the repository.
     cmd.args(args)
-        .arg(std::env::current_dir()?)
+        .arg(".")
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::piped());

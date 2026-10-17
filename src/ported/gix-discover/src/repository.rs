@@ -52,7 +52,12 @@ mod path {
         /// `None` is returned if `dir` could not be resolved due to being relative and trying to reach outside of the filesystem root.
         pub fn from_dot_git_dir(dir: PathBuf, kind: Kind, current_dir: &std::path::Path) -> Option<Self> {
             let cwd = current_dir;
+            // A bare `.` names the current directory, whose last component is only known from `cwd`;
+            // `normalize()` leaves it untouched, so popping `.git` off it would yield a bogus work tree.
             let normalize_on_trailing_dot_dot = |dir: PathBuf| -> Option<PathBuf> {
+                if matches!(dir.components().next_back(), Some(std::path::Component::CurDir)) {
+                    return Some(cwd.to_path_buf());
+                }
                 if !matches!(dir.components().next_back(), Some(std::path::Component::ParentDir)) {
                     dir
                 } else {

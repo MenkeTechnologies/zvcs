@@ -1,6 +1,5 @@
 //! `git daemon` — the `git://` protocol server.
-//! **`--inetd` — one request off stdin, answered — is ported end to end. The
-//! listening accept loop is not.**
+//! **`--inetd` (one request off stdin) and the listening accept loop are both ported.**
 //!
 //! `daemon` binds TCP port 9418, accepts connections, reads a `git-upload-pack`
 //! / `git-upload-archive` / `git-receive-pack` request line, and runs that
@@ -58,9 +57,17 @@
 //!     `[<pid>] Could not bind to <addr>: <strerror>` and tolerated, and
 //!     `fatal: unable to allocate any listen sockets on port <n>` (exit 128)
 //!     only when every address failed — the exit `git daemon` takes when the
-//!     port is already in use. The sockets are closed again immediately: there
-//!     is nothing to serve on them, and holding the port would lock out a real
-//!     daemon.
+//!     port is already in use.
+//!   * `serve()`: `poll()` over the listen sockets, and every accepted connection
+//!     becomes a `git daemon --inetd` child whose stdin and stdout are the
+//!     socket (git forks and `dup2()`s; the request path is then the one above).
+//!     `--max-connections` (default 32) drops a connection after a one-second
+//!     pause when that many children are live, `--init-timeout`/`--timeout`
+//!     arm `alarm()` around the request read, `--verbose` logs
+//!     `Ready to rumble`, `Connection from <ip>:<port>` and `Disconnected`, and
+//!     `--pid-file` is written (not removed at exit). The service child is run
+//!     on the absolute repository path rather than `.`, because the services
+//!     refuse a relative `.` inside a non-bare `.git` directory.
 //!   * The die-routine swap. When the effective log destination is `syslog`
 //!     (`--syslog`, or the default under `--inetd`/`--detach`), `daemon`
 //!     installs `daemon_die`, which logs to syslog and exits **1** — so those
@@ -74,13 +81,8 @@
 //!
 //! NOT ported — these `bail!` instead of pretending to have run:
 //!
-//!   1. **The accept loop.** `poll()` over the listen sockets, forking a child
-//!      per connection, `--max-connections` child reaping, `--timeout`/
-//!      `--init-timeout` alarm handling, `--detach` daemonisation and
-//!      `--pid-file` are process-level work with no substrate in gitoxide,
-//!      which is a repository-format library. `--inetd` reaches the same
-//!      `execute()` without any of it, which is why the request path is ported
-//!      and the listening one is not.
+//!   1. **`--detach`.** Daemonising is a fork/setsid/redirect sequence with no
+//!      substrate in gitoxide.
 //!   2. **`--interpolated-path=` and `--access-hook=`.** `%CH` and `%IP` expand
 //!      to the canonical hostname and IP address of the accepted connection,
 //!      and the hook is handed the same; neither exists without a connection to
@@ -165,7 +167,15 @@ struct Opts {
     /// `--timeout=<n>`, git's `static unsigned int timeout`. Handed on to
     /// `upload-pack` as `--timeout=%u` (daemon.c:485), and 0 unless given.
     timeout: u32,
-    /// Trailing `<directory>...`, i.e. git's `ok_paths`.
+    /// `--verbose`, git's `verbose`: gates `loginfo()`.
+    verbose: bool,
+    /// `--init-timeout=<n>`: seconds a client has to send its request line.
+    init_timeout: u32,
+    /// `--max-connections=<n>`; git's default is 32 and a negative value means unlimited (0).
+    max_connections: i32,
+    /// `--pid-file=<file>`.
+    pid_file: Option<String>,
+        /// Trailing `<directory>...`, i.e. git's `ok_paths`.
     ok_paths: Vec<String>,
 }
 
@@ -203,6 +213,10 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         enabled: [false, true, false],
         overridable: [true, true, true],
         timeout: 0,
+        verbose: false,
+        init_timeout: 0,
+        max_connections: 32,
+        pid_file: None,
         ok_paths: Vec::new(),
     };
 
@@ -232,7 +246,11 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
                 o.inetd = true;
                 continue;
             }
-            "--verbose" | "--reuseaddr"
+            "--verbose" => {
+                o.verbose = true;
+                continue;
+            }
+            "--reuseaddr"
             // `--serve` is git's undocumented per-connection child mode; it is
             // accepted by the parser and, unlike --inetd/--detach, does not
             // change the default log destination.
@@ -296,7 +314,10 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         }
         if let Some(v) = arg.strip_prefix("--init-timeout=") {
             match strtoul_ui(v) {
-                Some(_) => continue,
+                Some(n) => {
+                    o.init_timeout = n;
+                    continue;
+                }
                 None => {
                     return Ok(die(&format!(
                         "invalid init-timeout '{v}', expecting a non-negative integer"
@@ -306,7 +327,10 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
         }
         if let Some(v) = arg.strip_prefix("--max-connections=") {
             match strtol_i(v) {
-                Some(_) => continue,
+                Some(n) => {
+                    o.max_connections = n.max(0);
+                    continue;
+                }
                 None => {
                     return Ok(die(&format!(
                         "invalid max-connections '{v}', expecting an integer"
@@ -353,7 +377,8 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
             o.user_path = Some(v.to_string());
             continue;
         }
-        if arg.starts_with("--pid-file=") {
+        if let Some(v) = arg.strip_prefix("--pid-file=") {
+            o.pid_file = Some(v.to_string());
             continue;
         }
         if let Some(v) = arg.strip_prefix("--user=") {
@@ -449,56 +474,198 @@ pub fn daemon(args: &[String]) -> Result<ExitCode> {
     } else {
         o.listen_port
     };
-    if let Some(code) = socksetup(&o.listen_addrs, port, log_dest, quiet) {
-        return Ok(code);
-    }
-
-    bail!(
-        "the git:// service loop is not ported: the listen sockets bind, but accepting a \
-         connection needs a server-side upload-pack/receive-pack, and the vendored crates \
-         implement only the client half (gix-transport/src/client, gix-protocol \
-         handshake/fetch/ls_refs)"
-    );
+    let listeners = match socksetup(&o.listen_addrs, port, log_dest, quiet) {
+        Ok(listeners) => listeners,
+        Err(code) => return Ok(code),
+    };
+    serve(&o, args, listeners, log_dest)
 }
 
 /// `daemon.c`'s `DEFAULT_GIT_PORT`.
 const DEFAULT_GIT_PORT: i32 = 9418;
 
+/// `loginfo()`: `logerror()`'s record, but only under `--verbose`.
+fn loginfo(o: &Opts, log_dest: LogDest, msg: &str) {
+    if o.verbose {
+        logerror(msg, log_dest);
+    }
+}
+
+/// The options a per-connection `daemon --inetd` child is started with: the
+/// parent's own, minus everything only the listening process acts on (the bind
+/// address and port, daemonising, privilege drop, the pid file, connection
+/// accounting and `--syslog`/`--log-destination=`, which the child gets back in
+/// resolved form), followed by the directory list.
+fn inetd_child_args(args: &[String], o: &Opts, log_dest: LogDest) -> Vec<String> {
+    const PARENT_ONLY_EXACT: [&str; 6] = [
+        "--inetd",
+        "--detach",
+        "--reuseaddr",
+        "--syslog",
+        "--serve",
+        "--",
+    ];
+    const PARENT_ONLY_PREFIX: [&str; 7] = [
+        "--listen=",
+        "--port=",
+        "--pid-file=",
+        "--user=",
+        "--group=",
+        "--max-connections=",
+        "--log-destination=",
+    ];
+    let options = &args[..args.len() - o.ok_paths.len()];
+    let mut child: Vec<String> = vec!["daemon".into(), "--inetd".into()];
+    child.push(
+        match log_dest {
+            LogDest::Syslog => "--log-destination=syslog",
+            LogDest::None => "--log-destination=none",
+            _ => "--log-destination=stderr",
+        }
+        .into(),
+    );
+    child.extend(
+        options
+            .iter()
+            .filter(|a| {
+                !PARENT_ONLY_EXACT.contains(&a.as_str())
+                    && !PARENT_ONLY_PREFIX.iter().any(|p| a.starts_with(p))
+            })
+            .cloned(),
+    );
+    if !o.ok_paths.is_empty() {
+        child.push("--".into());
+        child.extend(o.ok_paths.iter().cloned());
+    }
+    child
+}
+
+/// `serve()` / `service_loop()` / `handle()`: poll the listen sockets and hand
+/// every accepted connection to its own `git daemon --inetd` child, with the
+/// socket as that child's stdin and stdout — what git's forked `handle()` does
+/// by `dup2()`ing the socket over fds 0 and 1 before calling `execute()`. The
+/// child's stderr is the daemon's own, so its log records land where git's do.
+///
+/// A connection past `--max-connections` live children is closed after a
+/// second's pause (`handle()`'s `sleep(1); close(incoming)`), without git's
+/// `kill_some_child()` — a process-group reaper keyed on the peer address that
+/// only matters for a flood from one host. `--pid-file` is written but not
+/// removed at exit; `--user` and `--detach` are refused earlier.
+fn serve(
+    o: &Opts,
+    args: &[String],
+    listeners: Vec<std::net::TcpListener>,
+    log_dest: LogDest,
+) -> Result<ExitCode> {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Arc;
+
+    if let Some(path) = &o.pid_file {
+        std::fs::write(path, format!("{}\n", std::process::id()))?;
+    }
+    let exe = crate::hosted::git_exe()?;
+    let child_args = inetd_child_args(args, o, log_dest);
+    let live = Arc::new(AtomicI32::new(0));
+    let mut fds: Vec<libc::pollfd> = listeners
+        .iter()
+        .map(|l| libc::pollfd {
+            fd: l.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+
+    loginfo(o, log_dest, "Ready to rumble");
+    loop {
+        // SAFETY: `fds` is a live, correctly sized array of `pollfd`.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Ok(ExitCode::from(128));
+        }
+        for (pfd, listener) in fds.iter().zip(&listeners) {
+            if pfd.revents & libc::POLLIN == 0 {
+                continue;
+            }
+            let Ok((stream, peer)) = listener.accept() else {
+                continue;
+            };
+            if o.max_connections > 0 && live.load(Ordering::SeqCst) >= o.max_connections {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+            let Ok(stdout_end) = stream.try_clone() else {
+                continue;
+            };
+            let spawned = std::process::Command::new(&exe)
+                .args(&child_args)
+                .stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(stream)))
+                .stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(stdout_end)))
+                .spawn();
+            let mut child = match spawned {
+                Ok(child) => child,
+                Err(e) => {
+                    logerror(&format!("unable to fork: {e}"), log_dest);
+                    continue;
+                }
+            };
+            let pid = child.id();
+            // Logged by git's forked child, so the record carries the child's pid.
+            if o.verbose && log_dest == LogDest::Stderr {
+                eprintln!("[{pid}] Connection from {}:{}", peer.ip().to_canonical(), peer.port());
+            }
+            live.fetch_add(1, Ordering::SeqCst);
+            let live = Arc::clone(&live);
+            let verbose = o.verbose;
+            std::thread::spawn(move || {
+                let clean = child.wait().map(|s| s.success()).unwrap_or(false);
+                live.fetch_sub(1, Ordering::SeqCst);
+                // `child_handler()`: `loginfo("[%"PRIuMAX"] Disconnected%s", …)`.
+                if verbose {
+                    logerror(
+                        &format!(
+                            "[{pid}] Disconnected{}",
+                            if clean { "" } else { " (with error)" }
+                        ),
+                        log_dest,
+                    );
+                }
+            });
+        }
+    }
+}
+
 /// `socksetup()` followed by `serve()`'s `if (socklist.nr == 0) die(...)`.
 ///
-/// Returns `Some(exit)` when not one socket could be bound — git's
-/// `unable to allocate any listen sockets on port <n>` — and `None` when at
-/// least one was, which is the point where git enters `service_loop()`.
+/// Returns `Err(exit)` when not one socket could be bound — git's
+/// `unable to allocate any listen sockets on port <n>` — and the bound listeners
+/// otherwise, which is the point where git enters `service_loop()`.
 ///
-/// Every socket opened here is closed again on return: there is no server-side
-/// protocol implementation to hand it to (see the module docs), so holding the
-/// port would only lock out a real daemon. What is reproduced is the part that
-/// decides the exit status — which addresses are tried, in which order, and that
-/// a failure on every one of them is fatal while a failure on some is not.
-///
-/// One deliberate divergence, not observable in the exit code: `IPV6_V6ONLY` is
-/// not set (Rust's `TcpListener` has no pre-bind hook for it), so on a platform
-/// that defaults it off the `::` bind also covers IPv4 and the following
-/// `0.0.0.0` bind reports the port as taken — one socket where git gets two,
-/// and a listen set that is not empty either way. `SO_REUSEADDR` needs no code:
-/// `TcpListener::bind` sets it on every non-Windows target, as
+/// `IPV6_V6ONLY` is not set (Rust's `TcpListener` has no pre-bind hook for it),
+/// so on a platform that defaults it off the `::` bind also covers IPv4 and the
+/// following `0.0.0.0` bind reports the port as taken — one socket where git
+/// gets two, and a listen set that is not empty either way. `SO_REUSEADDR` needs
+/// no code: `TcpListener::bind` sets it on every non-Windows target, as
 /// `set_reuse_addr()` does.
 fn socksetup(
     listen_addrs: &[String],
     port: i32,
     log_dest: LogDest,
     quiet: bool,
-) -> Option<ExitCode> {
-    let mut bound = 0usize;
+) -> std::result::Result<Vec<std::net::TcpListener>, ExitCode> {
+    let mut listeners = Vec::new();
     if listen_addrs.is_empty() {
         // `if (!listen_addr->nr) setup_named_sock(NULL, …)` — the wildcard.
-        bound += setup_named_sock(None, port, log_dest);
+        listeners.extend(setup_named_sock(None, port, log_dest));
     } else {
         for addr in listen_addrs {
-            let socknum = setup_named_sock(Some(addr), port, log_dest);
+            let found = setup_named_sock(Some(addr), port, log_dest);
             // `if (socknum == 0) logerror("unable to allocate any listen
             //  sockets for host %s on port %u", …)`.
-            if socknum == 0 {
+            if found.is_empty() {
                 logerror(
                     &format!(
                         "unable to allocate any listen sockets for host {addr} on port {}",
@@ -507,11 +674,11 @@ fn socksetup(
                     log_dest,
                 );
             }
-            bound += socknum;
+            listeners.extend(found);
         }
     }
 
-    if bound == 0 {
+    if listeners.is_empty() {
         // `%u` of git's `int listen_port`. This `die` is the one that lands
         // *after* `freopen("/dev/null", "w", stderr)` at `cmd_main`'s line 1455,
         // so under the `none` destination the message is discarded while the
@@ -519,18 +686,22 @@ fn socksetup(
         // the redirect.
         let msg = format!("unable to allocate any listen sockets on port {}", port as u32);
         if log_dest != LogDest::Stderr {
-            return Some(ExitCode::from(if quiet { 1 } else { 128 }));
+            return Err(ExitCode::from(if quiet { 1 } else { 128 }));
         }
-        return Some(die_maybe_quiet(&msg, quiet));
+        return Err(die_maybe_quiet(&msg, quiet));
     }
-    None
+    Ok(listeners)
 }
 
 /// `setup_named_sock()`: resolve one listen address and bind every result,
-/// returning how many sockets came up. Neither a resolution failure nor a bind
+/// returning the listeners that came up. Neither a resolution failure nor a bind
 /// failure is fatal on its own — only an empty socket list is, and that is the
 /// caller's decision.
-fn setup_named_sock(listen_addr: Option<&str>, port: i32, log_dest: LogDest) -> usize {
+fn setup_named_sock(
+    listen_addr: Option<&str>,
+    port: i32,
+    log_dest: LogDest,
+) -> Vec<std::net::TcpListener> {
     // `getaddrinfo(listen_addr, pbuf, &hints, &ai0)` with `AI_PASSIVE` and
     // `AF_UNSPEC`. Rust has no passive resolution, so the wildcard is spelled
     // out as the two addresses the resolver returns for it, in that order; the
@@ -568,16 +739,14 @@ fn setup_named_sock(listen_addr: Option<&str>, port: i32, log_dest: LogDest) -> 
             ),
             log_dest,
         );
-        return 0;
+        return Vec::new();
     }
 
-    let mut socknum = 0;
+    let mut listeners = Vec::new();
     for addr in addrs {
         match std::net::TcpListener::bind(addr) {
             Ok(listener) => {
-                socknum += 1;
-                // Closed immediately; see the note on `socksetup`.
-                drop(listener);
+                listeners.push(listener);
             }
             // `logerror("Could not bind to %s: %s", ip2str(…), strerror(errno))`
             // — one line per address, and not fatal on its own.
@@ -587,7 +756,7 @@ fn setup_named_sock(listen_addr: Option<&str>, port: i32, log_dest: LogDest) -> 
             ),
         }
     }
-    socknum
+    listeners
 }
 
 /// `logerror()`: the message prefixed with the pid, on stderr — except under the
@@ -776,7 +945,15 @@ const SERVICE_CONFIG_NAMES: [&str; 3] = ["uploadarch", "uploadpack", "receivepac
 /// `cmd_main` has already redirected stderr to `/dev/null`, so nothing this
 /// function logs is visible — only the `ERR` packet on stdout and the status.
 fn execute(o: &Opts) -> Result<ExitCode> {
-    let (line, pktlen) = match read_request_packet() {
+    // `alarm(init_timeout ? init_timeout : timeout)` around the request read: a
+    // client that connects and says nothing is cut off by SIGALRM.
+    let init = if o.init_timeout != 0 { o.init_timeout } else { o.timeout };
+    // SAFETY: `alarm` takes and returns plain integers.
+    unsafe { libc::alarm(init) };
+    let request_packet = read_request_packet();
+    // SAFETY: as above.
+    unsafe { libc::alarm(0) };
+    let (line, pktlen) = match request_packet {
         Some(request) => request,
         // A read error is git's `packet_read()` dying; there is no request to
         // answer either way.
@@ -964,8 +1141,10 @@ fn run_service(
         // `repo_config_get_bool(the_repository, "daemon.<config_name>", &enabled)`
         // leaves `enabled` alone when the key is unset, which is how a service
         // that is off by default stays off.
-        let repo = gix::open_opts(".", gix::open::Options::default().open_path_as_is(true))?;
-        if let Some(value) = repo
+        let repo = gix::open_opts(
+            std::env::current_dir()?,
+            gix::open::Options::default().open_path_as_is(true),
+        )?;        if let Some(value) = repo
             .config_snapshot()
             .boolean(&format!("daemon.{}", SERVICE_CONFIG_NAMES[index]))
         {
@@ -1043,8 +1222,12 @@ fn run_service_command(
     use std::io::BufRead;
 
     let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+    // git passes `.`. The absolute spelling is the same directory, and it is what
+    // the services accept when the repository is a non-bare `.git` directory:
+    // `upload-pack .`, `receive-pack .` and `upload-archive .` all refuse a
+    // relative `.` there.
     cmd.args(args)
-        .arg(".")
+        .arg(std::env::current_dir()?)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::piped());

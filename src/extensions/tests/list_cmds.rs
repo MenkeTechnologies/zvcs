@@ -209,12 +209,16 @@ fn builtins_is_the_commands_table_and_the_rest_is_main() {
     }
     let builtins = set_of(&out);
     let main = set_of(&run(&repo, &["--list-cmds=main"]));
+    let others = set_of(&run(&repo, &["--list-cmds=others"]));
     for verb in ["commit", "submodule--helper", "format-rev", "rev-parse"] {
         assert!(builtins.contains(verb), "commands[] entry {verb} is not listed");
     }
     for verb in ["archimport", "submodule", "web--browse", "zstatus", "zrepos"] {
         assert!(!builtins.contains(verb), "{verb} is not in commands[] but was listed as a builtin");
-        assert!(main.contains(verb), "{verb} is dispatched but missing from `main`");
+        assert!(
+            main.contains(verb) != others.contains(verb),
+            "{verb} is dispatched but is not listed in exactly one of `main` and `others`"
+        );
     }
     assert!(builtins.is_subset(&main), "`main` lost a builtin");
 
@@ -266,16 +270,19 @@ fn main_and_others_scan_the_real_directories() {
     assert!(!others.contains("zvcsplanted-exec"), "an exec-path command leaked into `others`");
     assert!(!others.contains("commit"), "a builtin was listed as external");
 
-    // A `git-z*` link on `$PATH` — what `git zdashed` installs — is this
-    // binary's own verb, not an external command, so it must not be listed in
-    // both groups.
+    // A `git-z*` link on `$PATH` — what `git zdashed` installs — is an external
+    // command to stock, so it moves from `main` to `others`, never both.
     plant(&path_dir.join("git-zstatus"));
-    let out = command(BIN, &repo, &["--list-cmds=others"])
-        .env("GIT_EXEC_PATH", &exec_dir)
-        .env("PATH", &path_dir)
-        .output()
-        .unwrap();
-    assert!(!set_of(&out).contains("zstatus"), "a dashed superset link was listed as external");
+    let listing = |group: &str| {
+        let out = command(BIN, &repo, &[group])
+            .env("GIT_EXEC_PATH", &exec_dir)
+            .env("PATH", &path_dir)
+            .output()
+            .unwrap();
+        set_of(&out)
+    };
+    assert!(listing("--list-cmds=others").contains("zstatus"), "a dashed superset link was not listed as external");
+    assert!(!listing("--list-cmds=main").contains("zstatus"), "a dashed superset link was listed in both groups");
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -523,4 +530,32 @@ fn the_query_names_itself_to_trace2() {
         .expect("no cmd_name record was written");
     assert!(cmd_name.contains("\"name\":\"_query_\""), "cmd_name record: {cmd_name}");
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
+/// When this binary's exec-path is the directory holding the dashed `git-z*`
+/// links (`~/.zvcs/bin`), stock git — which sees that directory only through
+/// `$PATH` — lists them under `others`. They must leave `main` and appear in
+/// `others` exactly once, while a real exec-path helper stays in `main`.
+#[test]
+fn dashed_superset_links_in_the_exec_path_are_external() {
+    let repo = fixture("execlinks");
+    let root = repo.parent().unwrap();
+    let exec_dir = root.join("execdir");
+    std::fs::create_dir_all(&exec_dir).unwrap();
+    plant(&exec_dir.join("git-zstatus"));
+    plant(&exec_dir.join("git-zvcsplanted-exec"));
+
+    let listing = |group: &str| {
+        let out = command(BIN, &repo, &[group])
+            .env("GIT_EXEC_PATH", &exec_dir)
+            .env("PATH", &exec_dir)
+            .output()
+            .unwrap();
+        set_of(&out)
+    };
+    let (main, others) = (listing("--list-cmds=main"), listing("--list-cmds=others"));
+    assert!(others.contains("zstatus"), "an exec-path `git-z*` link was not external");
+    assert!(!main.contains("zstatus"), "an exec-path `git-z*` link stayed in `main`");
+    assert!(main.contains("zvcsplanted-exec"), "a real exec-path helper left `main`");
+    let _ = std::fs::remove_dir_all(root);
 }

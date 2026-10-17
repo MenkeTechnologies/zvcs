@@ -26,12 +26,11 @@
 //! moved: it would advertise stock verbs this binary does not serve and hide
 //! every `z*` verb it does.
 //!
-//! The same derivation is why `others` answers differently here than stock does
-//! on this machine. Stock lists every `git-z*` dashed link `git zdashed`
-//! installed as an *external* command, because they are not builtins of its
-//! binary; this one dispatches them, so they appear under `main` instead and
-//! `exclude_cmds()` keeps them out of `others`. Neither listing loses a name —
-//! `main,others` covers the same set both ways.
+//! A `git-z*` dashed link on `$PATH` (what `git zdashed` installs) is listed under
+//! `others`, exactly as stock lists it: to stock it is an external command. A
+//! superset verb with no such link is still dispatched in-process, so it is
+//! listed under `main` instead, which keeps `main,others` covering every verb
+//! this binary serves whether or not `git zdashed` has run.
 //!
 //! The documentation-driven groups are the opposite case and are handled the
 //! opposite way. `list-<category>` answers from `command-list.txt`
@@ -237,7 +236,13 @@ fn builtins() -> Vec<String> {
 fn main_cmds() -> Vec<String> {
     let mut out: std::collections::BTreeSet<String> = help::load_command_list().0;
     out.extend(builtins());
-    out.extend(dispatch::SUPERSET_VERBS.iter().map(|v| (*v).to_string()));
+    let external = other_cmds();
+    out.extend(
+        dispatch::SUPERSET_VERBS
+            .iter()
+            .filter(|v| !external.iter().any(|name| name == *v))
+            .map(|v| (*v).to_string()),
+    );
     out.into_iter().collect()
 }
 
@@ -245,16 +250,10 @@ fn main_cmds() -> Vec<String> {
 /// does not itself provide (`load_command_list()`'s `other_cmds`, which already
 /// has `exclude_cmds()` applied).
 ///
-/// The superset verbs are subtracted for the same reason git subtracts its own
-/// builtins: `git zdashed` installs a `git-zstatus` link, and a command served
-/// in-process is not an external one — listing it in both groups would make
-/// `main,others` offer it twice.
+/// Dashed `git-z*` links are kept, as stock lists them; [`main_cmds`] drops from
+/// `main` the superset verbs found here so no name appears in both groups.
 fn other_cmds() -> Vec<String> {
-    help::load_command_list()
-        .1
-        .into_iter()
-        .filter(|name| !dispatch::SUPERSET_VERBS.contains(&name.as_str()))
-        .collect()
+    help::load_command_list().1.into_iter().collect()
 }
 
 /// One `list-<category>` request: the members of `command-list.txt`'s

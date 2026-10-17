@@ -1963,9 +1963,16 @@ pub(crate) fn load_command_list() -> (BTreeSet<String>, BTreeSet<String>) {
         .iter()
         .map(|v| (*v).to_string())
         .collect();
-    main_cmds.extend(list_commands_in_dir(&exec_dir));
+    // Dashed `git-z*` links are not git commands: stock git, scanning the same
+    // directory as `$PATH`, lists them as external, so they are routed to
+    // `other_cmds` even when this binary's exec-path is where they live.
+    let (linked_superset, exec_cmds): (BTreeSet<String>, BTreeSet<String>) =
+        list_commands_in_dir(&exec_dir)
+            .into_iter()
+            .partition(|n| crate::dispatch::SUPERSET_VERBS.contains(&n.as_str()));
+    main_cmds.extend(exec_cmds);
 
-    let mut other_cmds = BTreeSet::new();
+    let mut other_cmds = linked_superset;
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             if dir == exec_dir {
@@ -1975,7 +1982,12 @@ pub(crate) fn load_command_list() -> (BTreeSet<String>, BTreeSet<String>) {
         }
     }
     let documented = command_names();
-    other_cmds.retain(|n| !main_cmds.contains(n) && !documented.contains(n));
+    // A dashed `git-z*` link is an external command to stock git, which has no
+    // such builtin, so the superset verbs are exempt from the documented-name filter.
+    other_cmds.retain(|n| {
+        !main_cmds.contains(n)
+            && (!documented.contains(n) || crate::dispatch::SUPERSET_VERBS.contains(&n.as_str()))
+    });
 
     (main_cmds, other_cmds)
 }

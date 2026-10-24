@@ -434,6 +434,39 @@ fn unknown_tokens_die_the_way_stock_does() {
     let _ = std::fs::remove_dir_all(repo.parent().unwrap());
 }
 
+/// `list_cmds()` calls `setup_git_directory_gently()` before walking the spec
+/// (git.c:87), so a repository config that will not parse kills every listing
+/// — even one with a bad token — with the reader's `fatal:` at 128, from a
+/// subdirectory too, while `parseopt` (answered in `handle_options()`, never
+/// reaching setup) still lists.
+#[test]
+fn listing_dies_on_an_unparsable_repository_config() {
+    let repo = fixture("badconfig");
+    let config = repo.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("garbage line\n");
+    std::fs::write(&config, &text).unwrap();
+    let line = text.lines().count();
+    let sub = repo.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    for (dir, spec) in [(&repo, "--list-cmds=main"), (&sub, "--list-cmds=bogus")] {
+        let ours = run(dir, &[spec]);
+        assert_eq!(ours.status.code(), Some(128), "{spec}");
+        assert!(ours.stdout.is_empty(), "{spec} printed a listing anyway");
+        assert_eq!(
+            String::from_utf8_lossy(&ours.stderr),
+            format!("fatal: bad config line {line} in file .git/config\n")
+        );
+        if stock_available() {
+            let stock = run_stock(dir, &[spec]);
+            assert_eq!(ours.stderr, stock.stderr, "{spec} diverges from stock");
+            assert_eq!(ours.status.code(), stock.status.code());
+        }
+    }
+    assert!(run(&repo, &["--list-cmds=parseopt"]).status.success());
+    let _ = std::fs::remove_dir_all(repo.parent().unwrap());
+}
+
 /// `parseopt` names the commands that answer `--git-completion-helper`, which
 /// this port does from a ported `struct option` table per builtin. Every name
 /// it prints must answer both helper forms exactly as stock does — the option

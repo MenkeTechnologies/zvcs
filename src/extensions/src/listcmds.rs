@@ -370,6 +370,14 @@ pub fn parseopt() -> ExitCode {
 /// ```
 pub fn list_cmds(spec: &str) -> ExitCode {
     crate::trace2::cmd_name("_query_");
+    // `setup_git_directory_gently(the_repository, &nongit)` (git.c:87) runs
+    // before the spec is looked at, so its repository-format read dies first:
+    // `git --list-cmds=main` (or `=bogus`) in a repository whose `.git/config`
+    // will not parse exits 128 with `fatal: bad config line <n> in file
+    // .git/config` and lists nothing. `parseopt` never gets here.
+    if let Some(code) = dispatch::gentle_setup_gates("_query_") {
+        return code;
+    }
 
     let mut list: Vec<String> = Vec::new();
     let mut rest = spec;

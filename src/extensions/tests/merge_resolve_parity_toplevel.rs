@@ -53,3 +53,20 @@ fn merge_s_resolve_from_a_subdirectory_runs_the_strategy_at_the_top() {
     };
     assert_eq!(run(&z), run(&s));
 }
+
+/// The pre-flight `git diff-index --quiet --cached HEAD --` reads
+/// `git_diff_basic_config`, so a rename limit it cannot parse kills it at 128. The
+/// script's `if !` takes that as a dirty index: one `fatal:` from each diff-index
+/// run around the `Error:` line, no paths, exit 2 — with an index that is clean.
+#[test]
+fn merge_resolve_parity_bad_rename_limit_fails_the_preflight() {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let (s, z) = twin_repo::pair("merge-resolve-renamelimit", stock);
+    for side in [&s, &z] {
+        side.write("a", "dirty in the work tree only\n");
+    }
+    let run = |side: &twin_repo::Side| {
+        side.git(&["-c", "diff.renameLimit=", "merge-resolve", "main", "--", "HEAD", "main"])
+    };
+    assert_eq!(run(&z), run(&s));
+}

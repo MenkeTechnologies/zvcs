@@ -160,6 +160,21 @@ fn resolve(args: &[String], check_toplevel: bool) -> Result<ExitCode> {
     // `if ! git diff-index --quiet --cached HEAD --` — the script's first
     // action, ahead of the argument loop, so it fires even for arguments that
     // would be rejected by the guards below.
+    //
+    // `cmd_diff_index()` reads `git_config(git_diff_basic_config)`
+    // (builtin/diff-index.c:39), so a value that callback refuses
+    // (`diff.renameLimit=""`) kills the child at 128. `if !` reads that as
+    // "dirty": the script prints its `Error:` line, the `--name-only` listing
+    // (git-merge-resolve.sh:13) dies the same way and lists nothing, and the
+    // script exits 2 (git-merge-resolve.sh:10-15).
+    if let Err(rejection) = crate::diff_config::validate_basic(&repo) {
+        report_child_fatal(rejection);
+        println!("Error: Your local changes to the following files would be overwritten by merge");
+        if let Err(rejection) = crate::diff_config::validate_basic(&repo) {
+            report_child_fatal(rejection);
+        }
+        return Ok(ExitCode::from(2));
+    }
     let dirty = dirty_paths(&repo)?;
     if !dirty.is_empty() {
         println!("Error: Your local changes to the following files would be overwritten by merge");
@@ -301,6 +316,16 @@ pub(super) fn child_status(result: Result<ExitCode>) -> Result<u8> {
             }
             Err(err)
         }
+    }
+}
+
+/// What a child `diff-index` prints when its config callback dies: any
+/// `error:` lines, then `fatal: <msg>` (a `Silent` rejection already spoke).
+fn report_child_fatal(rejection: crate::default_config::Rejection) {
+    let silent = matches!(rejection, crate::default_config::Rejection::Silent);
+    let fatal = rejection.into_fatal();
+    if !silent {
+        eprintln!("fatal: {fatal}");
     }
 }
 

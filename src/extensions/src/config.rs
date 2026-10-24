@@ -3322,6 +3322,48 @@ pub fn repository_format_refusal() -> Option<String> {
     verify_repository_format(&format)
 }
 
+/// What a gently set-up command needs to carry on outside a repository whose
+/// format `verify_repository_format()` refuses: the walk found a work tree,
+/// `repo_discover_implicit_gitdir()` (setup.c:1238-1244) reached
+/// `read_and_verify_repository_format()` with a non-`NULL` `nongit_ok`, and that
+/// warned and set `*nongit_ok = -1` (setup.c:771-777).
+pub struct GentleFormatRefusal {
+    /// The `err` strbuf, printed as `warning: <message>` by setup and again by
+    /// `discover_git_directory_reason()` as `ignoring git dir '<dir>': <message>`.
+    pub message: String,
+    /// The directory the walk stopped in. `setup_git_directory_gently()` chdir()ed
+    /// there before verifying (setup.c:1957-1959) and never comes back on this arm.
+    pub top: PathBuf,
+    /// The git directory as `discover_git_directory_reason()` names it from `top`:
+    /// the relative `.git`, or the `strbuf_realpath()` `read_gitfile_gently()`
+    /// returns for a `.git` file (setup.c:987).
+    pub git_dir_shown: String,
+}
+
+/// [`GentleFormatRefusal`] for the repository the current directory is in, or
+/// `None` when there is nothing to refuse or the setup is one this reading does
+/// not cover: an explicit `$GIT_DIR` (`repo_discover_explicit_gitdir()`), and a
+/// walk that stopped inside a git directory (`GIT_DIR_BARE`).
+pub fn gentle_repository_format_refusal() -> Option<GentleFormatRefusal> {
+    let dirs = repository_directories()?;
+    if dirs.explicit {
+        return None;
+    }
+    let top = crate::setup::realpath(dirs.work_tree.as_deref()?);
+    let git_dir = crate::setup::realpath(&dirs.git_dir);
+    let cwd = crate::setup::realpath(&std::env::current_dir().ok()?);
+    if cwd.starts_with(&git_dir) {
+        return None;
+    }
+    let message = repository_format_refusal()?;
+    let git_dir_shown = if top.join(".git").is_dir() {
+        ".git".to_owned()
+    } else {
+        git_dir.to_string_lossy().into_owned()
+    };
+    Some(GentleFormatRefusal { message, top, git_dir_shown })
+}
+
 /// `copy_templates()`'s vintage check (setup.c:2401-2417): the `config` a
 /// template directory carries is read as a repository format, and when it names
 /// a version at all, the message `verify_repository_format()` fills is the

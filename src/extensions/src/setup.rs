@@ -1896,6 +1896,54 @@ pub(crate) fn repository_ignored() -> bool {
     IGNORED_REPOSITORY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The `warning:` text `discover_git_directory_reason()` (setup.c:1765-1767) prints
+/// every time `read_early_config()` re-walks to a repository whose format setup
+/// already refused, set by [`refuse_repository_format_gently`].
+static IGNORED_FORMAT_WARNING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// `read_and_verify_repository_format()` with a non-`NULL` `nongit_ok`
+/// (setup.c:771-777) for a command that sets up gently:
+///
+/// ```c
+/// if (verify_repository_format(format, &err) < 0) {
+///         if (nongit_ok) {
+///                 warning("%s", err.buf);
+///                 strbuf_release(&err);
+///                 *nongit_ok = -1;
+///                 return -1;
+///         }
+/// ```
+///
+/// The walk has already chdir()ed to the directory it found the repository in
+/// (setup.c:1957-1959) and this arm returns before anything comes back to the
+/// original cwd, so the command runs from there, outside any repository.
+pub(crate) fn refuse_repository_format_gently() -> Option<ExitCode> {
+    let refusal = crate::config::gentle_repository_format_refusal()?;
+    // setup.c:1958-1959, ahead of the format check:
+    // `if (dir.len < cwd.len && chdir(dir.buf)) die(_("cannot change to '%s'"), dir.buf);`
+    if std::env::set_current_dir(&refusal.top).is_err() {
+        eprintln!("fatal: cannot change to '{}'", refusal.top.display());
+        return Some(ExitCode::from(crate::fatal::EXIT_FATAL));
+    }
+    eprintln!("warning: {}", refusal.message);
+    ignore_repository();
+    let _ = IGNORED_FORMAT_WARNING.set(format!(
+        "warning: ignoring git dir '{}': {}",
+        refusal.git_dir_shown, refusal.message
+    ));
+    None
+}
+
+/// `read_early_config()`'s `discover_git_directory()` (config.c:1706) after
+/// [`refuse_repository_format_gently`]: the walk finds the same repository, the
+/// format check fails again and warns again, and the early config carries on
+/// without the repository's files.
+pub(crate) fn read_early_config_ignored_format() {
+    if let Some(warning) = IGNORED_FORMAT_WARNING.get() {
+        eprintln!("{warning}");
+    }
+}
+
 /// Returns the exit code to leave with, or `None` to continue.
 ///
 /// A command that sets up strictly dies with git's message. One that sets up

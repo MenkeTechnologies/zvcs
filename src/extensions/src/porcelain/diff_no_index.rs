@@ -703,6 +703,9 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
     // `o->flags.allow_external`, which `cmd_diff()` raises before it branches to
     // the no-index path (builtin/diff.c:511) and `--[no-]ext-diff` moves.
     let mut allow_external = true;
+    // `options->flags.exit_with_status` as `--[no-]exit-code` leaves it; `--quiet` raises it
+    // too, in `diff_setup_done()` (diff.c:5327-5329).
+    let mut exit_code = false;
     let mut color_when: Option<diff_color::ColorWhen> = None;
     let mut operands: Vec<String> = Vec::new();
     let mut after_dashdash = false;
@@ -1052,7 +1055,10 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             // prints the stat block.
             "-s" | "--no-patch" => fmt = Format { no_output: true, quiet: fmt.quiet, ..Format::default() },
             "--quiet" => fmt.quiet = true,
-            "--exit-code" => {}
+            "--no-quiet" => fmt.quiet = false,
+            // `OPT_BOOL(0, "exit-code", &options->flags.exit_with_status, …)` (diff.c:6235).
+            "--exit-code" => exit_code = true,
+            "--no-exit-code" => exit_code = false,
             // `--relative[=<p>]` and `--no-relative` are in the option table but do nothing here:
             // two paths outside any tree have no prefix to strip (measured against 2.56.0, with
             // and without a repository around the paths).
@@ -1356,6 +1362,13 @@ fn run_with(args: &[String], implicit: bool) -> Result<ExitCode> {
             "warning: Limiting comparison with pathspecs is only supported if both paths are directories."
         );
         return usage();
+    }
+
+    // `setup_diff_pager()` (diff.c:7846-7859), after `diff_setup_done()` and ahead of
+    // `queue_diff()`: unless the exit status was asked for, `check_pager_config()` runs
+    // `read_early_config()`, whose walk re-finds a repository setup refused.
+    if !(exit_code || fmt.quiet) {
+        crate::setup::read_early_config_ignored_format();
     }
 
     // `diff_no_index()` (diff-no-index.c:264-271) rewrites a bare `-` operand to

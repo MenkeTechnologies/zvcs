@@ -1266,12 +1266,13 @@ const REPO_FORMAT_GATE_VERBS: &[&str] = &["init", "init-db", "rev-parse"];
 /// [`crate::NO_SETUP_VERBS`] excludes, because the question that list answers
 /// ("what still works with no repository at all") is not this one.
 ///
-/// The warning half is **not** ported. Reproducing it means running these verbs
-/// with the repository suppressed — `discover_git_directory_reason()`
-/// (setup.c:1700-1750) emits a second `warning: ignoring git dir '<dir>': …` and
-/// the command then behaves as though it were outside a repository — which is a
-/// restructuring of discovery, not a diagnostic. Listing them here keeps this
-/// gate from inventing a `fatal:` git does not raise; they carry on as before.
+/// The warning half is ported for `diff` alone ([`gentle_format_gate`]). For the
+/// rest it means running each verb with the repository suppressed — every
+/// `read_early_config()` then has `discover_git_directory_reason()`
+/// (setup.c:1765-1767) emit a second `warning: ignoring git dir '<dir>': …`, at
+/// whatever point that verb reads early config — and each verb's own `nongit`
+/// arm. Listing them here keeps this gate from inventing a `fatal:` git does not
+/// raise; they carry on as before.
 const FORMAT_GENTLE_VERBS: &[&str] = &[
     "apply",
     "archive",
@@ -1408,6 +1409,20 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
         return None;
     }
     crate::config::repository_format_refusal()
+}
+
+/// The warning half of `check_repository_format_gently()` for the gentle verbs
+/// this port carries on outside the repository for, see
+/// [`crate::setup::refuse_repository_format_gently`]. Only `diff` so far: its
+/// `nongit` arm is `DIFF_NO_INDEX_IMPLICIT` (builtin/diff.c:458-477), which
+/// [`crate::porcelain::diff`] already reaches whenever discovery finds nothing.
+/// `--help` first is `handle_builtin()`'s rewrite to `git help diff`, which never
+/// reaches `cmd_diff()`'s `setup_git_directory_gently()`.
+fn gentle_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
+    if sub != "diff" || args.first().is_some_and(|a| a == "--help") {
+        return None;
+    }
+    crate::setup::refuse_repository_format_gently()
 }
 
 /// `check_repo_format()` refusing an `extensions.<key>` value of the repository's config: prints
@@ -1675,6 +1690,9 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             return Ok(code);
         }
         if let Some(code) = repository_format_gate(sub, args) {
+            return Ok(code);
+        }
+        if let Some(code) = gentle_format_gate(sub, args) {
             return Ok(code);
         }
     }

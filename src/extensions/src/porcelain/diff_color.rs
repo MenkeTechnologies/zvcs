@@ -3001,6 +3001,10 @@ pub(crate) fn whitespace_error_string(ws: u32) -> String {
     if ws & WS_TAB_IN_INDENT != 0 {
         add("tab in indent");
     }
+    // ws.c:143-147.
+    if ws & WS_INCOMPLETE_LINE != 0 {
+        add("no newline at the end of file");
+    }
     err
 }
 

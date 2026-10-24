@@ -2303,6 +2303,8 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             separator = true;
         }
         if opts.fmt & F_CHECKDIFF != 0 {
+            // `builtin_checkdiff()` asks both attributes per pair (diff.c:4276-4277).
+            let mut check_rules = super::diff::WsRules::new(repo);
             let pairs: Vec<CheckPair<'_>> = deltas
                 .iter()
                 .zip(&analyses)
@@ -2312,9 +2314,17 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
                     old_data: &an.old_data,
                     new_data: &an.new_data,
                     hunks: an.hunks.as_deref(),
+                    // `attr_path` is the unstripped name (diff.c:5102-5107).
+                    ws_rule: check_rules.for_path(d.disk.as_bstr()),
+                    // `run_checkdiff()` returns before the lookup for an unmerged pair.
+                    marker_size: match d.unmerged {
+                        true => DEFAULT_CONFLICT_MARKER_SIZE,
+                        false => check_rules.marker_size(d.disk.as_bstr()),
+                    },
+                    new_is_link: d.new_valid() && d.dst_mode & S_IFMT == 0o120000,
                 })
                 .collect();
-            check_failed = render_check(&mut rest, &pairs, ws_rule, &colors);
+            check_failed = render_check(&mut rest, &pairs, &colors);
         }
 
         let dirstat_by_line = opts.fmt & F_DIRSTAT != 0 && opts.dirstat.by_line;
@@ -4286,12 +4296,18 @@ pub(crate) struct CheckPair<'a> {
     pub(crate) new_data: &'a [u8],
     /// The rendered unified hunks; `None` when the pair produced none.
     pub(crate) hunks: Option<&'a [u8]>,
+    /// `whitespace_rule(istate, attr_path)` (diff.c:4276).
+    pub(crate) ws_rule: u32,
+    /// `ll_merge_marker_size(istate, attr_path)` (diff.c:4277).
+    pub(crate) marker_size: usize,
+    /// The post-image is a symlink, whose missing final newline is no error
+    /// (diff.c:4279-4281).
+    pub(crate) new_is_link: bool,
 }
 
 pub(crate) fn render_check(
     out: &mut Vec<u8>,
     pairs: &[CheckPair<'_>],
-    ws_rule: u32,
     colors: &diff_color::DiffColors,
 ) -> bool {
     let mut failed = false;
@@ -4301,6 +4317,10 @@ pub(crate) fn render_check(
     for pair in pairs {
         if !pair.checkable {
             continue;
+        }
+        let mut ws_rule = pair.ws_rule;
+        if pair.new_is_link {
+            ws_rule &= !diff_color::WS_INCOMPLETE_LINE;
         }
         let name = quoted_name(pair.path);
         let new_lines = byte_lines(pair.new_data);
@@ -4340,7 +4360,7 @@ pub(crate) fn render_check(
                 Some(b'+') => {
                     lineno += 1;
                     let raw = &line[1..];
-                    if is_conflict_marker(raw) {
+                    if is_conflict_marker_sized(raw, pair.marker_size) {
                         failed = true;
                         out.extend_from_slice(&name);
                         out.extend_from_slice(
@@ -4390,11 +4410,6 @@ fn hunk_new_start(header: &[u8]) -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1)
-}
-
-/// `is_conflict_marker()` with git's default marker size of 7.
-fn is_conflict_marker(line: &[u8]) -> bool {
-    is_conflict_marker_sized(line, DEFAULT_CONFLICT_MARKER_SIZE)
 }
 
 /// `ll_merge_marker_size()`'s default when no `conflict-marker-size` attribute

@@ -1008,9 +1008,15 @@ pub(crate) fn ll_merge_marker_size(
     let mut outcome = gix::attrs::search::Outcome::default();
     outcome.initialize_with_selection(stack.attributes_collection(), ["conflict-marker-size"]);
     stack.at_entry(path, mode)?.matching_attributes(&mut outcome);
+    let size = marker_size_from_attr(outcome.iter_selected().next().map(|m| m.assignment.state));
+    Ok(size)
+}
 
-    let value: BString = match outcome.iter_selected().next().map(|m| m.assignment.state) {
-        None | Some(gix::attrs::StateRef::Unspecified) => return Ok(DEFAULT_CONFLICT_MARKER_SIZE),
+/// The value half of `ll_merge_marker_size()` (merge-ll.c:461-468), for a caller
+/// that already ran `git_check_attr()` on `conflict-marker-size` itself.
+pub(crate) fn marker_size_from_attr(state: Option<gix::attrs::StateRef<'_>>) -> usize {
+    let value: BString = match state {
+        None | Some(gix::attrs::StateRef::Unspecified) => return DEFAULT_CONFLICT_MARKER_SIZE,
         Some(gix::attrs::StateRef::Set) => "(builtin)true".into(),
         Some(gix::attrs::StateRef::Unset) => BString::default(),
         Some(gix::attrs::StateRef::Value(v)) => v.as_bstr().to_owned(),
@@ -1024,11 +1030,11 @@ pub(crate) fn ll_merge_marker_size(
         .map(|s| s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']))
         .and_then(|s| s.parse::<i32>().ok());
     match parsed {
-        Some(n) if n > 0 => Ok(n as usize),
-        Some(_) => Ok(DEFAULT_CONFLICT_MARKER_SIZE),
+        Some(n) if n > 0 => n as usize,
+        Some(_) => DEFAULT_CONFLICT_MARKER_SIZE,
         None => {
             eprintln!("warning: invalid marker-size '{value}', expecting an integer");
-            Ok(DEFAULT_CONFLICT_MARKER_SIZE)
+            DEFAULT_CONFLICT_MARKER_SIZE
         }
     }
 }

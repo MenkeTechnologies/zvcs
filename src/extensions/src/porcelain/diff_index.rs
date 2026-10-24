@@ -2250,19 +2250,33 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // `builtin_checkdiff()`, in `diff_flush()`'s raw/name/checkdiff block —
             // the same walk `diff-files --check` does, over this command's pair list.
             if opts.format == Format::Check {
+                // `builtin_checkdiff()` asks both attributes per pair (diff.c:4276-4277).
+                let mut check_rules = super::diff::WsRules::new(&repo);
+                // `run_checkdiff()` reports the `strip_prefix()`ed name and looks the
+                // attributes up by the full one (diff.c:5102-5107).
+                let names: Vec<BString> =
+                    deltas.iter().map(|d| display_path(&d.path, &opts)).collect();
                 let pairs: Vec<super::diff_files::CheckPair<'_>> = deltas
                     .iter()
                     .zip(&analyses)
-                    .map(|(d, an)| super::diff_files::CheckPair {
+                    .zip(&names)
+                    .map(|((d, an), name)| super::diff_files::CheckPair {
                         checkable: !d.unmerged && d.new_valid() && !an.binary,
-                        path: &d.path,
+                        path: name,
                         old_data: &an.old_data,
                         new_data: &an.new_data,
                         hunks: an.hunks.as_deref(),
+                        ws_rule: check_rules.for_path(d.path.as_bstr()),
+                        // `run_checkdiff()` returns before the lookup for an unmerged pair.
+                        marker_size: match d.unmerged {
+                            true => super::diff_files::DEFAULT_CONFLICT_MARKER_SIZE,
+                            false => check_rules.marker_size(d.path.as_bstr()),
+                        },
+                        new_is_link: d.new_valid() && d.dst_mode & S_IFMT == 0o120000,
                     })
                     .collect();
                 check_failed =
-                    super::diff_files::render_check(&mut rest, &pairs, ws_rule, &colors);
+                    super::diff_files::render_check(&mut rest, &pairs, &colors);
             }
             if opts.numstat || opts.diffstat || opts.shortstat {
                 let stats = compute_diffstat(&deltas, &analyses, &opts);

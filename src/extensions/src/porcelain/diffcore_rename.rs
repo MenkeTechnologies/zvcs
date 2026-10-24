@@ -247,6 +247,12 @@ pub struct Pair {
     pub broken_pair: bool,
     /// The status letter assigned by `diff_resolve_rename_copy()`.
     pub status: u8,
+    /// git's `is_unmerged`, which only `diff_unmerge()` sets (diff.c:7734). The pair
+    /// keeps whatever sides its caller filled in afterwards — the worktree file's
+    /// mode for `run_diff_files()` (diff-lib.c:222-224), the tree entry for a cached
+    /// `do_oneway_diff()` (diff-lib.c:469-472) — so it can still be a rename
+    /// destination or a copy source (diffcore-rename.c:1420-1456).
+    pub unmerged: bool,
 }
 
 /// The diff queue: an arena of filespecs plus the pair list that indexes into it.
@@ -280,6 +286,7 @@ impl Queue {
             renamed_pair: false,
             broken_pair: false,
             status: 0,
+            unmerged: false,
         });
         self.pairs.len() - 1
     }
@@ -315,9 +322,11 @@ impl Queue {
         !one.oid_valid && !two.oid_valid
     }
 
-    /// git's `DIFF_PAIR_UNMERGED()`: neither side is valid.
+    /// git's `DIFF_PAIR_UNMERGED()` (diffcore.h:134), `p->is_unmerged`. A caller that
+    /// queues `diff_unmerge()`'s pair with neither side filled in may leave the flag
+    /// clear: such a pair has both sides invalid, which no other pair has.
     fn unmerged(&self, p: usize) -> bool {
-        !self.one(p).valid() && !self.two(p).valid()
+        self.pairs[p].unmerged || (!self.one(p).valid() && !self.two(p).valid())
     }
 
     /// git's `DIFF_PAIR_TYPE_CHANGED()`: both sides valid but of different `S_IFMT`.
@@ -1507,6 +1516,7 @@ pub fn diffcore_break(q: &mut Queue, break_opt: i64, c: &mut dyn Content) {
                     renamed_pair: false,
                     broken_pair: true,
                     status: 0,
+                    unmerged: false,
                 });
                 let null_two = q.add_spec(FileSpec::absent(q.specs[two].path.clone()));
                 outq.push(Pair {
@@ -1516,6 +1526,7 @@ pub fn diffcore_break(q: &mut Queue, break_opt: i64, c: &mut dyn Content) {
                     renamed_pair: false,
                     broken_pair: true,
                     status: 0,
+                    unmerged: false,
                 });
                 free_blob(&mut q.specs[one]);
                 free_blob(&mut q.specs[two]);
@@ -1561,6 +1572,7 @@ pub fn diffcore_merge_broken(q: &mut Queue) {
                         renamed_pair: false,
                         broken_pair: true,
                         status: 0,
+                        unmerged: false,
                     });
                     taken[j] = true;
                     merged = true;

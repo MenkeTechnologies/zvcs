@@ -4330,14 +4330,10 @@ impl<'repo> WsRules<'repo> {
                         gix::attrs::StateRef::Unspecified => self.cfg,
                     };
                 }
+                // `ll_merge_marker_size()` (merge-ll.c:453-470), whose warning for a
+                // value `strtol_i()` refuses reaches `diff-tree --check` too.
                 "conflict-marker-size" => {
-                    if let gix::attrs::StateRef::Value(v) = m.assignment.state {
-                        if let Ok(n) = v.as_bstr().to_str_lossy().parse::<usize>() {
-                            if n > 0 {
-                                marker = n;
-                            }
-                        }
-                    }
+                    marker = super::rerere::marker_size_from_attr(Some(m.assignment.state));
                 }
                 _ => {}
             }

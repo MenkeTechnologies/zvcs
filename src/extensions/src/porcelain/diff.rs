@@ -3911,9 +3911,17 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // (diff.c:5122-5133 at v2.55.0), which is the pair's post-image name *before*
     // `strip_prefix()` shortens the printed one — so the lookup has to happen ahead
     // of the `--relative` rewrite below, whose whole job is to shorten `d.path`.
-    let check_rules: Option<Vec<u32>> = (check && !quiet && !combined).then(|| {
+    // `ll_merge_marker_size()` reads the same `attr_path` (diff.c:4277).
+    let check_rules: Option<Vec<(u32, usize)>> = (check && !quiet && !combined).then(|| {
         let mut rules = WsRules::new(&repo);
-        deltas.iter().map(|d| rules.for_path(d.path.as_bstr())).collect()
+        deltas
+            .iter()
+            .map(|d| match d.unmerged {
+                // `run_checkdiff()` returns before either lookup (diff.c:5097-5100).
+                true => (ws_rule, super::diff_files::DEFAULT_CONFLICT_MARKER_SIZE),
+                false => (rules.for_path(d.path.as_bstr()), rules.marker_size(d.path.as_bstr())),
+            })
+            .collect()
     });
     let extra = match move_word.resolve(&repo) {
         Ok(e) => e,
@@ -3988,8 +3996,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
                 found_changes = true;
             }
-            let rule = rules.get(i).copied().unwrap_or(ws_rule);
-            found |= report_whitespace_to(&mut buf, delta, analysis, rule, &colors);
+            let (rule, marker_size) = rules
+                .get(i)
+                .copied()
+                .unwrap_or((ws_rule, super::diff_files::DEFAULT_CONFLICT_MARKER_SIZE));
+            found |= report_whitespace_to(&mut buf, delta, analysis, rule, marker_size, &colors);
         }
         // `checkdiff_consume()` writes through `emit_line()` like every other
         // format, so `--line-prefix` reaches these lines too.
@@ -4642,10 +4653,11 @@ impl diffcore_rename::Content for DeltaContent<'_> {
 /// list: build git's filespec/filepair queue, run the passes, resolve every status
 /// letter, then rebuild the delta list from the surviving pairs.
 ///
-/// Unmerged deltas never enter the queue. git represents a conflicted path as a pair
-/// with *both* sides invalid, which the rename passes carry through untouched; this
-/// port models it as a delta of its own, so it is simply held aside and
-/// re-appended (the caller re-sorts by path afterwards, restoring git's order).
+/// An unmerged delta enters the queue as `diff_unmerge()`'s pair, flagged
+/// `is_unmerged` and carrying whichever side its walk filled in. With a worktree file
+/// behind it that pair is a rename destination (diffcore-rename.c:1420-1433): it is
+/// hashed, so `--raw` prints the worktree id, and it can take a deleted path as its
+/// source, which then drops out of the queue.
 fn run_diffcore_rename(
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
@@ -4653,7 +4665,6 @@ fn run_diffcore_rename(
     opts: &diffcore_rename::Options,
     worktree_mode: bool,
 ) -> Result<diffcore_rename::Warnings> {
-    let mut held: Vec<Delta> = Vec::new();
     let mut q = diffcore_rename::Queue::default();
     // spec index -> the "new" side it came from, so a surviving pair can be turned
     // back into a delta that still knows whether to read the worktree. A gitlink
@@ -4670,10 +4681,6 @@ fn run_diffcore_rename(
         BTreeMap::new();
 
     for d in deltas.drain(..) {
-        if d.unmerged {
-            held.push(d);
-            continue;
-        }
         // `p->one->path`, which is `p->two->path` for every pair a tree, index or
         // worktree walk produces and a different name only for a pair queued with two
         // of them — `builtin_diff_blobs()`'s `git diff <blob> <blob>`. The pre-image
@@ -4717,7 +4724,8 @@ fn run_diffcore_rename(
         if d.dirty_submodule != 0 || d.new_commit.is_some() {
             submodule_state.insert(two, (d.dirty_submodule, d.new_commit, d.new_id));
         }
-        q.add_pair(one, two);
+        let pair = q.add_pair(one, two);
+        q.pairs[pair].unmerged = d.unmerged;
     }
 
     let workdir = if worktree_mode {
@@ -4757,7 +4765,7 @@ fn run_diffcore_rename(
             old,
             new,
             old_worktree: old_worktree_specs.contains(&p.one),
-            unmerged: false,
+            unmerged: p.unmerged,
             src_path,
             score: p.score,
             status: p.status,
@@ -4781,7 +4789,6 @@ fn run_diffcore_rename(
             unstripped: None,
         });
     }
-    deltas.extend(held);
     Ok(warnings)
 }
 
@@ -4918,6 +4925,8 @@ fn collect_tree_worktree(
     // Path -> new side and its `dirty_submodule` bits, in index order (the order
     // `diff-index` reports in).
     let mut new_sides: BTreeMap<BString, (NewSide, u8, Option<ObjectId>)> = BTreeMap::new();
+    // `trust_executable_bit` / `has_symlinks` for `ce_mode_from_stat()`.
+    let mode_rules = super::update_index::ModeRules::from_repo(repo);
 
     let iter = repo
         .status(gix::progress::Discard)?
@@ -4950,7 +4959,7 @@ fn collect_tree_worktree(
                 }
             }
             gix::status::Item::IndexWorktree(item) => {
-                if let Some((path, new, dirty, head)) = worktree_new_side(repo.workdir(), item)? {
+                if let Some((path, new, dirty, head)) = worktree_new_side(repo.workdir(), mode_rules, item)? {
                     new_sides.insert(path, (new, dirty, head));
                 }
             }
@@ -5233,6 +5242,7 @@ fn collect_index_worktree(
         .into_index_worktree_iter(patterns)?;
 
     let mut seen_conflicts: Vec<BString> = Vec::new();
+    let mode_rules = super::update_index::ModeRules::from_repo(repo);
     for item in iter {
         let item = item?;
         if let gix::status::index_worktree::Item::Modification {
@@ -5249,7 +5259,7 @@ fn collect_index_worktree(
                 continue;
             }
         }
-        if let Some((path, new, dirty, head)) = worktree_new_side(Some(workdir), item)? {
+        if let Some((path, new, dirty, head)) = worktree_new_side(Some(workdir), mode_rules, item)? {
             // A worktree entry with no index counterpart cannot happen here (the
             // dirwalk is off), so the old side is always the index entry.
             let entry = index
@@ -5296,14 +5306,22 @@ fn collect_index_worktree(
     // stage 2 as the first parent and stage 3 as the second, each `M`. Neither the
     // `U` pair nor the stage pair is queued for such a path.
     for path in seen_conflicts {
-        let wt_kind = worktree_kind(workdir, &path);
+        // `wt_mode` (diff-lib.c:157-167) is `check_removed()` and
+        // `ce_mode_from_stat()` against the path's first entry, its lowest stage.
+        let first_stage_kind = stage_table
+            .get(&path)
+            .and_then(|s| s.iter().flatten().next().map(|(_, k)| *k))
+            .unwrap_or(EntryKind::Blob);
+        let unmerged_kind = conflict_worktree_kind(workdir, mode_rules, first_stage_kind, &path);
         if let (true, Some(s)) = (combine, conflicts.get(&path)) {
             let side = |(id, kind): (ObjectId, EntryKind)| -> Result<CombinedSide> {
                 Ok(CombinedSide { kind: Some(kind), id, bytes: blob_bytes(repo, id)?, status: b'M' })
             };
             combined.push(CombinedPath {
                 path: path.clone(),
-                kind: wt_kind,
+                // A removed result is `deleted_file` in `show_patch_diff()`; one that
+                // is there takes the mode of its own `lstat()` (combine-diff.c:1079).
+                kind: unmerged_kind.and_then(|_| worktree_kind(workdir, &path)),
                 id: repo.object_hash().null(),
                 bytes: read_worktree_bytes(Some(workdir), &path).unwrap_or_default(),
                 parents: vec![side(s.ours)?, side(s.theirs)?],
@@ -5314,7 +5332,7 @@ fn collect_index_worktree(
             path: path.clone(),
             old: None,
             old_worktree: false,
-            new: match wt_kind {
+            new: match unmerged_kind {
                 Some(k) => NewSide::Worktree(k),
                 None => NewSide::Absent,
             },
@@ -5347,11 +5365,14 @@ fn collect_index_worktree(
                     .checked_sub(1)
                     .and_then(|at| s.get(at).copied().flatten())
             });
-        // A file `check_removed()` cannot find is `diff_addremove('-', ...)` of the
-        // stage entry (diff-lib.c:252-262), the same deletion a stage-0 entry gets.
-        if let (Some(side), None) = (wanted, wt_kind) {
+        // The stage entry goes through `check_removed()` and `ce_mode_from_stat()`
+        // again as `ce` (diff-lib.c:258-273). A file it cannot find is
+        // `diff_addremove('-', ...)` of the stage entry (diff-lib.c:252-262), the
+        // same deletion a stage-0 entry gets.
+        let stage_kind = wanted.and_then(|(_, k)| conflict_worktree_kind(workdir, mode_rules, k, &path));
+        if let (Some(side), None) = (wanted, stage_kind) {
             deltas.push(Delta::plain(path, Some(side), NewSide::Absent));
-        } else if let (Some(side), Some(k)) = (wanted, wt_kind) {
+        } else if let (Some(side), Some(k)) = (wanted, stage_kind) {
             // `git diff` arms `skip_stat_unmatch` (builtin/diff.c:525), which drops a pair whose
             // worktree side carries no object name when both sides have the same mode and
             // identical content: the stage-2 pair of a conflicted path whose file still holds
@@ -5447,6 +5468,7 @@ fn removed_or_gitlink(
 /// `None` when the item is not a change.
 fn worktree_new_side(
     workdir: Option<&std::path::Path>,
+    mode_rules: super::update_index::ModeRules,
     item: gix::status::index_worktree::Item,
 ) -> Result<Option<(BString, NewSide, u8, Option<ObjectId>)>> {
     use gix::status::index_worktree::Item;
@@ -5509,9 +5531,30 @@ fn worktree_new_side(
         EntryStatus::Change(Change::Type { worktree_mode }) => {
             worktree_type_change(rela_path, worktree_mode)?
         }
-        // A conflicted path still has worktree content; only `git diff` with no
-        // revision treats it specially, and that caller intercepts it first.
-        EntryStatus::Conflict { .. } => Some((rela_path, NewSide::Worktree(old_kind), 0, None)),
+        // Only `git diff <rev>` reaches here with a conflicted path (`git diff` with
+        // no revision intercepts it first). `unpack_trees()` hands `oneway_diff()`
+        // the path's lowest stage as `idx`, which is `entry`, and `show_modified()`
+        // asks `get_stat_data()` (diff-lib.c:315-342) for the worktree side:
+        // `check_removed()` finding no file — or failing — returns -1, which
+        // `report_missing` turns into the tree entry's deletion (diff-lib.c:400-406);
+        // a file that is there never matches the stage's zeroed stat, so the pair
+        // takes `ce_mode_from_stat(idx, st.st_mode)` and the null id.
+        EntryStatus::Conflict { .. } => {
+            let Some(root) = workdir else {
+                return Ok(Some((rela_path, NewSide::Worktree(old_kind), 0, None)));
+            };
+            match conflict_worktree_kind(root, mode_rules, old_kind, &rela_path) {
+                None => Some((rela_path, NewSide::Absent, 0, None)),
+                // The submodule's checked-out commit rides along, as in
+                // [`removed_or_gitlink`].
+                Some(EntryKind::Commit) => {
+                    let abs = root.join(gix::path::from_bstr(rela_path.as_bstr()));
+                    let head = gix::open(&abs).ok().and_then(|sub| sub.head_id().ok().map(|h| h.detach()));
+                    Some((rela_path, NewSide::Worktree(EntryKind::Commit), 0, head))
+                }
+                Some(kind) => Some((rela_path, NewSide::Worktree(kind), 0, None)),
+            }
+        }
         // gix reports an `add -N` entry as its own status rather than as a
         // modification. The file is known to exist — the removal and directory
         // tests both run ahead of the flag check
@@ -5595,6 +5638,34 @@ fn unmerged_paths(index: &gix::index::State) -> Vec<BString> {
         }
     }
     out
+}
+
+/// The worktree side of a conflicted entry `ce` whose stat cannot match (an
+/// unmerged stage carries none): `check_removed()` (diff-lib.c:42-66), then
+/// `ce_mode_from_stat(ce, st.st_mode)` (read-cache.h:8-21) for an entity that is
+/// still there. `None` is a removed file — no `lstat()`, a symlink leading the path,
+/// or a directory that is neither the gitlink `ce` names nor a repository — and
+/// also `check_removed()`'s -1, which `get_stat_data()` reports as the same
+/// deletion (diff-lib.c:322-324).
+fn conflict_worktree_kind(
+    workdir: &std::path::Path,
+    rules: super::update_index::ModeRules,
+    ce_kind: EntryKind,
+    path: &BString,
+) -> Option<EntryKind> {
+    let abs = workdir.join(gix::path::from_bstr(path.as_bstr()));
+    let meta = gix::index::fs::Metadata::from_path_no_follow(&abs).ok()?;
+    if super::check_ignore::has_symlink_leading_path(workdir, path.as_bstr()) {
+        return None;
+    }
+    if meta.is_dir() {
+        // `if (!S_ISGITLINK(ce->ce_mode) && resolve_gitlink_ref(ce->name, "HEAD", &sub))
+        //         return 1;` — and a directory that stays is `create_ce_mode(S_IFDIR)`.
+        let repo_head = gix::open(&abs).ok().and_then(|sub| sub.head_id().ok().map(|h| h.detach()));
+        return (ce_kind == EntryKind::Commit || repo_head.is_some()).then_some(EntryKind::Commit);
+    }
+    let ce_mode = gix::index::entry::Mode::from_bits_truncate(kind_mode(ce_kind));
+    index_mode_kind(super::update_index::ce_mode_from_stat(rules, Some(ce_mode), &meta))
 }
 
 fn worktree_kind(workdir: &std::path::Path, path: &BString) -> Option<EntryKind> {
@@ -8520,6 +8591,9 @@ fn render_raw(
                 None if *k == EntryKind::Commit => null,
                 None => hashed(|an| an.new_id).unwrap_or(null),
             },
+            // `diff_unmerge()`'s pair is never filled by `diff_fill_oid_info()`, but
+            // as a rename destination `hash_filespec()` gave its worktree side an id.
+            (NewSide::Worktree(_), true) => delta.new_id.map_or(null, |id| abbrev(&id)),
             _ => null,
         };
         push_str(out, ":");
@@ -8574,9 +8648,9 @@ fn name_field(path: &BString, z: bool) -> Vec<u8> {
 /// mode-change lines, one per delta in queue order.
 fn render_summary(out: &mut Vec<u8>, deltas: &[Delta]) {
     for d in deltas {
-        if d.unmerged {
-            continue;
-        }
+        // `diff_summary()` switches on `p->status` (diff.c:6784), and an unmerged
+        // pair's `U` lands in the default arm below — where a pair that took a rename
+        // source carries that score.
         // `show_rename_copy()`: `<verb> <pprint'd names> (<n>%)`, then the mode change
         // line without a name.
         if d.renamed() {
@@ -8590,14 +8664,14 @@ fn render_summary(out: &mut Vec<u8>, deltas: &[Delta]) {
             continue;
         }
         match (d.old, d.new_kind()) {
-            (None, Some(nk)) => {
+            (None, Some(nk)) if !d.unmerged => {
                 push_str(out, " create mode ");
                 push_str(out, mode_str(nk));
                 out.push(b' ');
                 out.extend_from_slice(&quoted_name(d.full_path()));
                 out.push(b'\n');
             }
-            (Some((_, ok)), None) => {
+            (Some((_, ok)), None) if !d.unmerged => {
                 push_str(out, " delete mode ");
                 push_str(out, mode_str(ok));
                 out.push(b' ');
@@ -8718,15 +8792,16 @@ fn diffstat_pairs<'a>(deltas: &'a [Delta], analyses: &'a [Analysis]) -> Vec<(&'a
 /// the two raw names, each NUL-terminated and preceded by an extra NUL, under `-z`.
 fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
     for (d, an) in pairs.iter().copied() {
-        // An unmerged row keeps its full path (diff.c:5071-5075); it has one name.
-        let path = if d.unmerged { d.full_path() } else { &d.path };
+        // An unmerged row keeps the full `p->one->path` (diff.c:5071-5075); it has one name.
+        let path = if d.unmerged { d.full_old_path() } else { &d.path };
+        let two_names = !d.unmerged && d.two_names();
         if an.binary {
             push_str(out, "-\t-\t");
         } else {
             push_str(out, &format!("{}\t{}\t", an.added, an.deleted));
         }
         if z {
-            if d.two_names() {
+            if two_names {
                 out.push(0);
                 out.extend_from_slice(d.old_path());
                 out.push(0);
@@ -8734,7 +8809,7 @@ fn render_numstat(out: &mut Vec<u8>, pairs: &[(&Delta, &Analysis)], z: bool) {
             out.extend_from_slice(path);
             out.push(0);
         } else {
-            if d.two_names() {
+            if two_names {
                 out.extend_from_slice(&pprint_rename(d.old_path(), path));
             } else {
                 out.extend_from_slice(&quoted_name(path));
@@ -8852,7 +8927,7 @@ fn stat_display_name(d: &Delta, compact: bool) -> Vec<u8> {
     // `strip_prefix()` (diff.c:5071-5075), and `get_compact_summary()` finds no
     // status or mode change on its two empty filespecs.
     if d.unmerged {
-        return quoted_name(d.full_path());
+        return quoted_name(d.full_old_path());
     }
     // `fill_print_name()`: a pair with two names shows the compressed `pfx{a => b}sfx`
     // form. `diffstat_add()` decides that from the paths, not from the status — see
@@ -10368,7 +10443,8 @@ fn colorize_combined(
 /// before the queue is flushed (see [`collect_index_worktree`]).
 fn render_unmerged(out: &mut Vec<u8>, delta: &Delta) {
     push_str(out, "* Unmerged path ");
-    out.extend_from_slice(&delta.path);
+    // `name` is `p->one->path` (diff.c:5013), a rename source's when the pair took one.
+    out.extend_from_slice(delta.old_path());
     out.push(b'\n');
 }
 
@@ -10953,6 +11029,33 @@ impl<'repo> WsRules<'repo> {
         }
     }
 
+    /// `ll_merge_marker_size(istate, path)` (merge-ll.c:453-470), which
+    /// `builtin_checkdiff()` asks next to `whitespace_rule()` (diff.c:4276-4277):
+    /// the `conflict-marker-size` gitattribute, or 7 wherever the lookup cannot
+    /// answer.
+    pub(crate) fn marker_size(&mut self, path: &gix::bstr::BStr) -> usize {
+        let default = super::diff_files::DEFAULT_CONFLICT_MARKER_SIZE;
+        if path.is_empty() {
+            return default;
+        }
+        let Some(stack) = self.stack.as_mut() else {
+            return default;
+        };
+        let mode = Some(gix::index::entry::Mode::FILE);
+        if stack.at_entry(path, mode).is_err() {
+            return default;
+        }
+        self.outcome
+            .initialize_with_selection(stack.attributes_collection(), ["conflict-marker-size"]);
+        match stack.at_entry(path, mode) {
+            Ok(platform) => platform.matching_attributes(&mut self.outcome),
+            Err(_) => return default,
+        };
+        super::rerere::marker_size_from_attr(
+            self.outcome.iter_selected().next().map(|m| m.assignment.state),
+        )
+    }
+
     /// `git_check_attr()` for the single `whitespace` attribute. Every way the
     /// lookup can decline to answer — no stack, a path the stack cannot descend to,
     /// or the empty path a root tree carries — is Unspecified, which is git's NULL
@@ -10998,7 +11101,8 @@ fn report_whitespace_to(
     out: &mut Vec<u8>,
     delta: &Delta,
     analysis: &Analysis,
-    ws_rule: u32,
+    mut ws_rule: u32,
+    marker_size: usize,
     colors: &diff_color::DiffColors,
 ) -> bool {
     let set = colors.get(diff_color::DiffSlot::New);
@@ -11007,9 +11111,21 @@ fn report_whitespace_to(
     let Some(hunks) = &analysis.hunks else {
         return false;
     };
+    // "symlink being an incomplete line is not a news" (diff.c:4279-4281).
+    if matches!(
+        delta.new,
+        NewSide::Blob(_, EntryKind::Link) | NewSide::Worktree(EntryKind::Link)
+    ) {
+        ws_rule &= !super::diff_color::WS_INCOMPLETE_LINE;
+    }
     let mut found = false;
     let mut lineno = 0usize;
+    // `data->last_line_kind` (diff.c:3546-3547): the `\ No newline at end of file`
+    // record belongs to whichever side the line before it came from.
+    let mut last_line_kind = 0u8;
     for line in hunks.split_inclusive(|&b| b == b'\n') {
+        let previous_kind = last_line_kind;
+        last_line_kind = line.first().copied().unwrap_or(0);
         if line.starts_with(b"@@") {
             // `@@ -a,b +c,d @@` — the new-side start, minus one so the first
             // line of the hunk lands on `c`.
@@ -11018,9 +11134,30 @@ fn report_whitespace_to(
         }
         match line.first() {
             Some(b' ') => lineno += 1,
+            // diff.c:3576-3586: an incomplete last line, reported only when it
+            // ends the post-image.
+            Some(b'\\') => {
+                if ws_rule & super::diff_color::WS_INCOMPLETE_LINE != 0 && previous_kind == b'+' {
+                    found = true;
+                    let _ = writeln!(
+                        out,
+                        "{}:{lineno}: {}.",
+                        delta.path,
+                        super::diff_color::whitespace_error_string(
+                            super::diff_color::WS_INCOMPLETE_LINE
+                        )
+                    );
+                }
+            }
             Some(b'+') => {
                 lineno += 1;
                 let body = &line[1..];
+                // diff.c:3551-3556: a leftover marker is reported ahead of, and
+                // independently of, the whitespace check of the same line.
+                if super::diff_files::is_conflict_marker_sized(body, marker_size) {
+                    found = true;
+                    let _ = writeln!(out, "{}:{lineno}: leftover conflict marker", delta.path);
+                }
                 let bad = super::diff_color::ws_check(body, ws_rule);
                 if bad == 0 {
                     continue;
@@ -11137,7 +11274,8 @@ pub(crate) fn commit_check(
                 },
             )?;
             let rule = ws_rules.for_path(delta.path.as_bstr());
-            found |= report_whitespace_to(out, delta, &an, rule, colors);
+            let marker_size = ws_rules.marker_size(delta.path.as_bstr());
+            found |= report_whitespace_to(out, delta, &an, rule, marker_size, colors);
         }
     }
     Ok(found)

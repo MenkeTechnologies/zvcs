@@ -883,12 +883,15 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     /// else has set an output format.
     let mut merges_need_diff = false;
 
-    // git `die()`s on a bad dirstat parameter the moment it parses it, before it looks
-    // at anything else on the command line, so each call site returns straight away.
+    // git `die()`s on a bad dirstat parameter the moment `parse_dirstat_opt()` parses
+    // it (diff.c:5433-5438), inside the same left-to-right `diff_opt_parse()` pass that
+    // rejects a bad option value with 129 (e.g. `--color-moved=` in
+    // `diff_opt_color_moved()`, diff.c:5585-5603). So the die is deferred with its argv
+    // index like those: an earlier bad value or revision still wins, a later one loses.
     macro_rules! dirstat {
-        ($params:expr) => {
-            if let Some(code) = apply_dirstat(&mut opts, $params) {
-                return Ok(code);
+        ($at:expr, $params:expr) => {
+            if let Some(msg) = apply_dirstat(&mut opts, $params) {
+                deferred.get_or_insert(($at, 128, msg));
             }
         };
     }
@@ -1109,11 +1112,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             "-E" | "--extended-regexp" | "-F" | "--fixed-strings" | "-P" | "--perl-regexp" | "--basic-regexp" => {}
             // `diff_opt_dirstat()`: `--cumulative` and `--dirstat-by-file` are spelled
             // as parameter lists, and every spelling also turns the format on.
-            "--dirstat" | "-X" => dirstat!(""),
-            "--cumulative" => dirstat!("cumulative"),
+            "--dirstat" | "-X" => dirstat!(cur, ""),
+            "--cumulative" => dirstat!(cur, "cumulative"),
             "--dirstat-by-file" => {
-                dirstat!("files");
-                dirstat!("");
+                dirstat!(cur, "files");
+                dirstat!(cur, "");
             }
             "--relative" => opts.relative_name = true,
             "--no-relative" => opts.relative_name = false,
@@ -1346,14 +1349,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     pickaxe_arg = Some((kind, value.as_bytes().to_vec()));
                 }
             }
-            s if s.starts_with("--dirstat=") => dirstat!(&s["--dirstat=".len()..]),
+            s if s.starts_with("--dirstat=") => dirstat!(cur, &s["--dirstat=".len()..]),
             s if s.starts_with("--dirstat-by-file=") => {
-                dirstat!("files");
-                dirstat!(&s["--dirstat-by-file=".len()..]);
+                dirstat!(cur, "files");
+                dirstat!(cur, &s["--dirstat-by-file=".len()..]);
             }
             // `-X` takes its parameters attached only; a following argument is a
             // positional, which is why `-X 10 HEAD` makes git complain about `10`.
-            s if s.len() > 2 && s.starts_with("-X") => dirstat!(&s[2..]),
+            s if s.len() > 2 && s.starts_with("-X") => dirstat!(cur, &s[2..]),
             s if s.starts_with("--find-renames=") || (s.starts_with("-M") && s.len() > 2) => {
                 let raw = s.strip_prefix("--find-renames=").unwrap_or(&s[2..]);
                 let (score, rest) = diffcore_rename::parse_rename_score(raw);
@@ -2370,17 +2373,16 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 }
 
 /// `parse_dirstat_opt()`: fold one parameter list into the accumulated `--dirstat`
-/// state, turning the format on. Returns git's exit code when a parameter is bad,
-/// having already written the `die()` text `parse_dirstat_params()` builds.
-fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<ExitCode> {
+/// state, turning the format on. Returns the `die()` text `parse_dirstat_params()`
+/// builds when a parameter is bad (exit 128).
+fn apply_dirstat(opts: &mut Opts, params: &str) -> Option<Vec<u8>> {
     opts.dirstat_params.push(params.to_owned());
     let ds = opts.dirstat.get_or_insert_with(DirStat::default);
     let errors = super::diff_files::parse_dirstat_params(params, ds);
     if errors.is_empty() {
         return None;
     }
-    eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n");
-    Some(ExitCode::from(128))
+    Some(format!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}\n").into_bytes())
 }
 
 /// `show_dirstat()` and `show_dirstat_by_line()`: the damage each path contributes.

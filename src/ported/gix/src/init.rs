@@ -66,10 +66,35 @@ impl ThreadSafeRepository {
         directory: impl AsRef<Path>,
         kind: crate::create::Kind,
         create_options: crate::create::Options,
-        mut open_options: crate::open::Options,
+        open_options: crate::open::Options,
     ) -> Result<Self, Error> {
         let path = crate::create::into(directory.as_ref(), kind, create_options)?;
         let (git_dir, worktree_dir) = path.into_repository_and_work_tree_directories();
+        Self::open_new(git_dir, worktree_dir, open_options)
+    }
+
+    /// Like [`init_opts`][Self::init_opts()], but lay the git directory down at `git_dir` itself with
+    /// its work tree at `work_tree`, as [`crate::create::into_with_separate_work_tree()`] describes.
+    /// `core_worktree` is the `core.worktree` value to record, if any.
+    pub fn init_with_separate_work_tree_opts(
+        git_dir: impl AsRef<Path>,
+        work_tree: impl AsRef<Path>,
+        core_worktree: Option<&str>,
+        create_options: crate::create::Options,
+        open_options: crate::open::Options,
+    ) -> Result<Self, Error> {
+        let path = crate::create::into_with_separate_work_tree(git_dir.as_ref(), core_worktree, create_options)?;
+        let (git_dir, _) = path.into_repository_and_work_tree_directories();
+        Self::open_new(git_dir, Some(work_tree.as_ref().to_owned()), open_options)
+    }
+
+    /// Open the repository [`init_opts`][Self::init_opts()] just laid down and point `HEAD` at the
+    /// configured default branch.
+    fn open_new(
+        git_dir: std::path::PathBuf,
+        worktree_dir: Option<std::path::PathBuf>,
+        mut open_options: crate::open::Options,
+    ) -> Result<Self, Error> {
         open_options.git_dir_trust = Some(gix_sec::Trust::Full);
         // The repo will use `core.precomposeUnicode` to adjust the value as needed.
         open_options.current_dir = gix_fs::current_dir(false)?.into();

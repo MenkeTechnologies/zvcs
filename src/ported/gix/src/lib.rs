@@ -365,6 +365,34 @@ where
     )
 }
 
+/// Create a platform for configuring a clone whose git directory is `git_dir` itself and whose work tree
+/// is `work_tree`, recording `core_worktree` as `core.worktree` if given.
+///
+/// See [`clone::PrepareFetch::new_with_separate_work_tree()`].
+#[expect(
+    clippy::result_large_err,
+    reason = "will be removed once `gix-error` is used consistently"
+)]
+pub fn prepare_clone_with_separate_work_tree<Url, E>(
+    url: Url,
+    git_dir: impl AsRef<std::path::Path>,
+    work_tree: impl AsRef<std::path::Path>,
+    core_worktree: Option<&str>,
+) -> Result<clone::PrepareFetch, clone::Error>
+where
+    Url: std::convert::TryInto<gix_url::Url, Error = E>,
+    gix_url::parse::Error: From<E>,
+{
+    clone::PrepareFetch::new_with_separate_work_tree(
+        url,
+        git_dir,
+        work_tree,
+        core_worktree,
+        create::Options::default(),
+        open_opts_with_git_binary_config(),
+    )
+}
+
 fn open_opts_with_git_binary_config() -> open::Options {
     use gix_sec::trust::DefaultForLevel;
     let mut opts = open::Options::default_for_level(gix_sec::Trust::Full);

@@ -182,15 +182,43 @@ fn default_object_hash() -> Option<gix_hash::Kind> {
 pub fn into(
     directory: impl Into<PathBuf>,
     kind: Kind,
+    options: Options,
+) -> Result<gix_discover::repository::Path, Error> {
+    lay_down(directory.into(), kind, options, None)
+}
+
+/// Create a git directory at `git_dir` itself, laid out like a bare repository, whose work tree
+/// lives elsewhere: the repository `init_db()` makes when `cmd_clone()` hands it `git_dir = dir`
+/// because `$GIT_WORK_TREE` named the work tree (builtin/clone.c:1099-1104, setup.c:2869-2875).
+///
+/// `is_bare_repository()` is false once a work tree is set, so `create_default_files()` writes
+/// `core.bare = false` and `core.logallrefupdates = true`, then `core.worktree` when
+/// `needs_work_tree_config()` finds the work tree is not the git directory's parent
+/// (setup.c:2628-2641). `core_worktree` is that value, already made real by the caller, or `None`
+/// where no key is written.
+pub fn into_with_separate_work_tree(
+    git_dir: impl Into<PathBuf>,
+    core_worktree: Option<&str>,
+    options: Options,
+) -> Result<gix_discover::repository::Path, Error> {
+    lay_down(git_dir.into(), Kind::Bare, options, Some(core_worktree))
+}
+
+/// The body of [`into()`]. `separate_work_tree` is `Some` for [`into_with_separate_work_tree()`]:
+/// the directory is laid down as `kind` says, but configured as a repository with a work tree.
+fn lay_down(
+    mut dot_git: PathBuf,
+    kind: Kind,
     Options {
         fs_capabilities,
         destination_must_be_empty,
         object_hash,
         ref_storage_reftable,
     }: Options,
+    separate_work_tree: Option<Option<&str>>,
 ) -> Result<gix_discover::repository::Path, Error> {
-    let mut dot_git = directory.into();
     let bare = matches!(kind, Kind::Bare);
+    let has_work_tree = !bare || separate_work_tree.is_some();
 
     if bare || destination_must_be_empty.unwrap_or(false) {
         let num_entries_in_dot_git = fs::read_dir(&dot_git)
@@ -313,9 +341,12 @@ pub fn into(
             let format_version = if sha256 || ref_storage_reftable { "1" } else { "0" };
             core.push("repositoryformatversion", format_version)?;
             core.push("filemode", bool(caps.executable_bit))?;
-            core.push("bare", bool(bare))?;
-            if !bare {
+            core.push("bare", bool(!has_work_tree))?;
+            if has_work_tree {
                 core.push("logallrefupdates", "true")?;
+            }
+            if let Some(Some(work_tree)) = separate_work_tree {
+                core.push("worktree", work_tree)?;
             }
             if !caps.symlink {
                 core.push("symlinks", "false")?;

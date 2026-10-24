@@ -160,7 +160,8 @@ fn cmd_list(args: &[String]) -> Result<ExitCode> {
     // `sparse_checkout_list()` calls `setup_work_tree()` before it looks at sparsity, so a bare
     // repository or a cwd inside the git dir reports the missing work tree, not the missing
     // sparsity.
-    if repo.workdir().is_none() {
+    // `setup_work_tree()` refuses a work tree it cannot `chdir()` into the same way (setup.c:502-503).
+    if repo.workdir().is_none_or(|wt| !wt.is_dir()) {
         return Err(crate::fatal::need_work_tree());
     }
     // git checks for sparsity before it parses options.
@@ -216,7 +217,8 @@ fn cmd_set(args: &[String], add: bool) -> Result<ExitCode> {
     // file is written. Leaving the check to `apply()` writes
     // `info/sparse-checkout` and `config.worktree` into a bare repository first
     // and only then dies — the message is the same, the repository is not.
-    if !add && repo.work_dir().is_none() {
+    // A work tree that is configured but not there is refused alike (setup.c:502-503).
+    if !add && repo.work_dir().is_none_or(|wt| !wt.is_dir()) {
         return Err(crate::fatal::need_work_tree());
     }
     // `add` demands an existing sparse-checkout before it looks at options.

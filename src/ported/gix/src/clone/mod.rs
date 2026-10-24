@@ -108,6 +108,37 @@ impl PrepareFetch {
             kind,
             create_opts,
             open_opts,
+            None,
+        )
+    }
+
+    /// Like [`new()`][Self::new()], but create the git directory at `git_dir` itself with its work tree at
+    /// `work_tree`, the layout `cmd_clone()` builds when `$GIT_WORK_TREE` names the work tree
+    /// (builtin/clone.c:1099-1104). `core_worktree` is the `core.worktree` value to record, if any; see
+    /// [`crate::create::into_with_separate_work_tree()`]. The work tree is what a failed clone removes on drop.
+    #[expect(
+        clippy::result_large_err,
+        reason = "will be removed once `gix-error` is used consistently"
+    )]
+    pub fn new_with_separate_work_tree<Url, E>(
+        url: Url,
+        git_dir: impl AsRef<std::path::Path>,
+        work_tree: impl AsRef<std::path::Path>,
+        core_worktree: Option<&str>,
+        create_opts: crate::create::Options,
+        open_opts: crate::open::Options,
+    ) -> Result<Self, Error>
+    where
+        Url: TryInto<gix_url::Url, Error = E>,
+        gix_url::parse::Error: From<E>,
+    {
+        Self::new_inner(
+            url.try_into().map_err(gix_url::parse::Error::from)?,
+            git_dir.as_ref(),
+            crate::create::Kind::Bare,
+            create_opts,
+            open_opts,
+            Some((work_tree.as_ref(), core_worktree)),
         )
     }
 
@@ -121,13 +152,14 @@ impl PrepareFetch {
         kind: crate::create::Kind,
         mut create_opts: crate::create::Options,
         open_opts: crate::open::Options,
+        separate_work_tree: Option<(&std::path::Path, Option<&str>)>,
     ) -> Result<Self, Error> {
         if create_opts.destination_must_be_empty.is_none() {
             create_opts.destination_must_be_empty = Some(true);
         }
 
         // Capture this before init_opts creates `.git`, otherwise the check below would see our own files.
-        let remove_worktree_on_drop = match std::fs::read_dir(path) {
+        let remove_worktree_on_drop = match std::fs::read_dir(separate_work_tree.map_or(path, |(work_tree, _)| work_tree)) {
             Ok(mut entries) => entries.next().is_none(),
             // Non-existent destinations will be created by init_opts.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
@@ -135,7 +167,17 @@ impl PrepareFetch {
             Err(_) => false,
         };
 
-        let mut repo = crate::ThreadSafeRepository::init_opts(path, kind, create_opts, open_opts)?.to_thread_local();
+        let mut repo = match separate_work_tree {
+            Some((work_tree, core_worktree)) => crate::ThreadSafeRepository::init_with_separate_work_tree_opts(
+                path,
+                work_tree,
+                core_worktree,
+                create_opts,
+                open_opts,
+            )?,
+            None => crate::ThreadSafeRepository::init_opts(path, kind, create_opts, open_opts)?,
+        }
+        .to_thread_local();
         // `builtin/clone.c:1057` records `absolute_pathdup(repo_name)`: the path made absolute
         // against the current directory and nothing else. Resolving it instead — symlinks, `.`,
         // `..` — writes a different string into `remote.<name>.url` and into the

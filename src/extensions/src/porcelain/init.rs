@@ -1288,6 +1288,13 @@ fn init_into_existing(
 /// from git's `setup.c` for the fresh-init case. Shared with `git clone`, whose
 /// `--separate-git-dir` lands on the same on-disk result.
 pub(super) fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<PathBuf> {
+    relocate_git_dir_to_link(src, &target.join(".git"), real)
+}
+
+/// [`relocate_git_dir`] with the `gitdir: <abs>` link file written at `link` itself. `git clone`
+/// under `$GIT_WORK_TREE` hands `init_db()` the destination as the git dir (builtin/clone.c:1099-1100),
+/// so `separate_git_dir()` leaves the link file where the destination directory stood.
+pub(super) fn relocate_git_dir_to_link(src: &Path, link: &Path, real: &str) -> Result<PathBuf> {
     let real_pb = {
         let p = PathBuf::from(real);
         if p.is_absolute() {
@@ -1315,10 +1322,7 @@ pub(super) fn relocate_git_dir(src: &Path, target: &Path, real: &str) -> Result<
             real_abs.display()
         )
     })?;
-    std::fs::write(
-        target.join(".git"),
-        format!("gitdir: {}\n", real_abs.display()),
-    )?;
+    std::fs::write(link, format!("gitdir: {}\n", real_abs.display()))?;
     Ok(real_abs)
 }
 
@@ -1736,7 +1740,7 @@ fn display_git_dir(git_dir: &Path) -> String {
 /// `--separate-git-dir` and `--template`: resolve `path` against the current
 /// directory and die on a path git cannot resolve. The empty string is refused
 /// outright, matching `strbuf_realpath`'s first test.
-fn real_pathdup(path: &str) -> Result<String> {
+pub(super) fn real_pathdup(path: &str) -> Result<String> {
     if path.is_empty() {
         crate::git_fatal!("The empty string is not a valid path");
     }

@@ -967,16 +967,27 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `git --work-tree=. clone src dst` dies naming `.` exactly as written.
     // `path_exists()` (builtin/clone.c:863-867) is a `stat()`, so a dangling symlink
     // does not count and falls through to the `mkdir()` below.
-    if !bare {
-        if let Some(work_tree) = std::env::var_os("GIT_WORK_TREE") {
-            if std::fs::metadata(&work_tree).is_ok() {
-                return Ok(fatal(&format!(
-                    "working tree '{}' already exists.",
-                    work_tree.to_string_lossy()
-                )));
-            }
+    let env_work_tree = (!bare)
+        .then(|| std::env::var_os("GIT_WORK_TREE"))
+        .flatten()
+        .map(|work_tree| work_tree.to_string_lossy().into_owned());
+    if let Some(work_tree) = &env_work_tree {
+        if std::fs::metadata(work_tree).is_ok() {
+            return Ok(fatal(&format!("working tree '{work_tree}' already exists.")));
         }
     }
+    // ```c
+    // if (option_bare || work_tree)
+    //         git_dir = xstrdup(dir);
+    // else {
+    //         work_tree = dir;
+    //         git_dir = mkpathdup("%s/.git", dir);
+    // }
+    // ```
+    //
+    // (builtin/clone.c:1099-1104.) A `$GIT_WORK_TREE` the stat() above did not find is
+    // the work tree to make, and the destination becomes the git directory itself.
+    let work_tree: &str = env_work_tree.as_deref().unwrap_or(&dir);
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
     let created_destination = !dst.exists();
@@ -1000,22 +1011,28 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `SCLD_EXISTS` counts as failure here. `create_dir_all("")` succeeds without
     // creating anything where `mkdir("")` is `ENOENT`, so `git clone src ""` used to go
     // on and open a repository at the empty path.
+    //
+    // `work_tree` is `$GIT_WORK_TREE` when that is set, which is why a dangling symlink there
+    // ends at `could not create work tree dir 'ln': File exists`. It is only made when the
+    // destination did not exist: under `$GIT_WORK_TREE` an existing empty destination leaves
+    // the work tree unmade, and `checkout()` dies on it below.
     if !bare {
-        if let Err(scld) = crate::path::safe_create_leading_directories(&dir) {
+        if let Err(scld) = crate::path::safe_create_leading_directories(work_tree) {
             crate::git_fatal!(
-                "could not create leading directories of '{dir}': {}",
+                "could not create leading directories of '{work_tree}': {}",
                 crate::external::strerror(&scld.errno())
             );
         }
         if created_destination {
-            if let Err(e) = std::fs::create_dir(dst) {
+            if let Err(e) = std::fs::create_dir(work_tree) {
                 crate::git_fatal!(
-                    "could not create work tree dir '{dir}': {}",
+                    "could not create work tree dir '{work_tree}': {}",
                     crate::external::strerror(&e)
                 );
             }
         }
-    } else if crate::path::safe_create_leading_directories(&dir).is_err() {
+    }
+    if (bare || env_work_tree.is_some()) && crate::path::safe_create_leading_directories(&dir).is_err() {
         crate::git_fatal!("could not create leading directories of '{dir}'");
     }
     std::fs::create_dir_all(dst)?;
@@ -1029,12 +1046,22 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `die()` that takes the half-built clone down with it. The git dir it would also remove
     // lives inside `dst` until `--separate-git-dir` relocates it, which happens after the
     // fetch, so the one path covers both.
-    let junk = JunkDir::arm(created_destination.then(|| dst.to_path_buf()));
+    //
+    // Under `$GIT_WORK_TREE` the two are apart (builtin/clone.c:1113-1129): `junk_git_dir` is the
+    // destination and `junk_work_tree` the work tree, each emptied but kept
+    // (`REMOVE_DIR_KEEP_TOPLEVEL`) when the destination already existed.
+    let junk = match &env_work_tree {
+        Some(work_tree) => JunkDir::arm(vec![
+            (dst.to_path_buf(), !created_destination),
+            (PathBuf::from(work_tree), !created_destination),
+        ]),
+        None => JunkDir::arm(created_destination.then(|| (dst.to_path_buf(), false)).into_iter().collect()),
+    };
 
     // Serialize the ref/index writes through the repo coordinator, matching the
     // other write commands. On a freshly created clone no daemon is listening, so
     // this degrades to a no-op guard; it is held for the whole fetch+checkout.
-    let git_dir = if bare {
+    let git_dir = if bare || env_work_tree.is_some() {
         dst.to_path_buf()
     } else {
         dst.join(".git")
@@ -1121,6 +1148,28 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // an empty path; only a bare clone gets here with one, below the banner.
     if dir.is_empty() {
         crate::git_fatal!("The empty string is not a valid path");
+    }
+    // ```c
+    // if (real_git_dir) {
+    //         struct stat st;
+    //
+    //         if (!exist_ok && !stat(git_dir, &st))
+    //                 die(_("%s already exists"), git_dir);
+    //
+    //         if (!exist_ok && !stat(real_git_dir, &st))
+    //                 die(_("%s already exists"), real_git_dir);
+    // ```
+    //
+    // (`init_db()`, setup.c:2856-2864.) `git_dir` is the destination itself under
+    // `$GIT_WORK_TREE`, so an existing empty destination is refused here; otherwise it is
+    // `<dir>/.git`, which a destination that passed the emptiness test never holds.
+    if let Some(real) = separate_git_dir.as_deref() {
+        if env_work_tree.is_some() && !created_destination {
+            crate::git_fatal!("{dir} already exists");
+        }
+        if std::fs::metadata(real).is_ok() {
+            crate::git_fatal!("{real} already exists");
+        }
     }
 
     // `init_db()` (builtin/clone.c:1188) → `repository_format_configure()` (setup.c:2765-2838):
@@ -1287,9 +1336,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         Some(path) => {
             let shown = absolute_pathdup(&path);
             if !looks_like_bundle(&path) {
-                if created_destination {
-                    let _ = std::fs::remove_dir_all(dst);
-                }
+                junk.remove_now();
                 eprintln!("error: '{shown}' does not look like a v2 or v3 bundle file");
                 eprintln!("fatal: invalid gitfile format: {shown}");
                 eprintln!("fatal: Could not read from remote repository.");
@@ -1318,9 +1365,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 Err(e) => return super::bundle::report(&shown, e),
             };
             if header.filter.is_some() {
-                if created_destination {
-                    let _ = std::fs::remove_dir_all(dst);
-                }
+                junk.remove_now();
                 return Ok(fatal("cannot clone from filtered bundle"));
             }
             Some(BundleTransport::new(path, shown, &git_dir)?)
@@ -1387,6 +1432,21 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // the first fetch.
     let mut prepare = if bare {
         gix::prepare_clone_bare(url.clone(), dst)?
+    } else if env_work_tree.is_some() {
+        // `init_db(git_dir = dir, ..., work_tree)` (builtin/clone.c:1188-1191): `set_git_work_tree()`
+        // keeps the work tree's real path, and `create_default_files()` records it as
+        // `core.worktree` unless `needs_work_tree_config()` finds the git dir is its `.git`
+        // (setup.c:2434-2442, :2640-2641).
+        let original_git_dir = super::init::real_pathdup(&dir)?;
+        let real_work_tree = super::init::real_pathdup(work_tree)?;
+        let needs_work_tree_config = !(real_work_tree == "/" && original_git_dir == "/.git")
+            && original_git_dir.strip_prefix(real_work_tree.as_str()) != Some("/.git");
+        gix::prepare_clone_with_separate_work_tree(
+            url.clone(),
+            dst,
+            &real_work_tree,
+            needs_work_tree_config.then_some(real_work_tree.as_str()),
+        )?
     } else {
         gix::prepare_clone(url.clone(), dst)?
     };
@@ -1914,6 +1974,21 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     // Set when `git_sparse_checkout_init()` failed ahead of the checkout.
     let mut sparse_init_failed = false;
+    // Set when the `$GIT_WORK_TREE` work tree was never made, so `checkout()`'s
+    // `setup_work_tree()` cannot enter it.
+    let mut work_tree_missing = false;
+    // Set once `checkout()` has run `setup_work_tree()`, which leaves the process in the work
+    // tree with `GIT_WORK_TREE=.` (setup.c:505-510) for every child that follows.
+    let mut work_tree_entered = false;
+    // Under `$GIT_WORK_TREE` a child does not find the repository from where it runs, so it
+    // needs the `GIT_DIR` that `init_db()`'s `apply_and_export_relative_gitdir()` exported
+    // (setup.c:1088, :2866-2868) and, past `setup_work_tree()`, the work tree to run in.
+    let child_setup = |git_dir: &Path, entered: bool| -> Option<ChildSetup> {
+        env_work_tree.as_ref()?;
+        let git_dir = std::fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+        let work_tree = entered.then(|| super::init::real_pathdup(work_tree).ok()).flatten();
+        Some(ChildSetup { git_dir, work_tree })
+    };
     // Run the clone, capturing the result so a `remote: ` line the stream left
     // unterminated is flushed before any error is propagated.
     let result = (|| -> Result<()> {
@@ -2065,7 +2140,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     .config_snapshot()
                     .boolean("core.sparseCheckoutCone")
                     .unwrap_or(false);
-                if run_self(&dir, &["sparse-checkout", "set", "--cone"], true)? != 0 {
+                if run_self(&dir, &["sparse-checkout", "set", "--cone"], true, child_setup(&git_dir, false).as_ref())? != 0 {
                     sparse_init_failed = true;
                     return Ok(());
                 }
@@ -2085,6 +2160,20 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // `option_no_checkout` next to its warning (builtin/clone.c:1560-1563), so
             // nothing is unpacked and HEAD is never resolved.
             if cloned_empty {
+                checkout.persist();
+                return Ok(());
+            }
+            // ```c
+            // /* We need to be in the new work tree for the checkout */
+            // setup_work_tree(the_repository);
+            // ```
+            //
+            // (`checkout()`, builtin/clone.c:671-672.) `setup_work_tree()` dies when it cannot
+            // `chdir()` into the work tree (setup.c:494-503), which is what a `$GIT_WORK_TREE`
+            // left unmade beside an existing destination comes to. Nothing is unpacked; the
+            // death itself comes once `HEAD` is resolved, below.
+            if env_work_tree.is_some() && !Path::new(work_tree).is_dir() {
+                work_tree_missing = true;
                 checkout.persist();
                 return Ok(());
             }
@@ -2123,6 +2212,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             };
             let (repo, _) =
                 checkout.main_worktree_with_index_hook(gix::progress::Discard, &should_interrupt, &mut prepare)?;
+            work_tree_entered = true;
             if let Some(updating) = updating {
                 updating.stop();
             }
@@ -2154,9 +2244,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `return 1` with `junk_mode` still unset, so the clone is removed.
     if sparse_init_failed {
         eprintln!("error: failed to initialize sparse-checkout");
-        if created_destination {
-            let _ = std::fs::remove_dir_all(dst);
-        }
+        junk.remove_now();
         return Ok(ExitCode::from(1));
     }
 
@@ -2172,6 +2260,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // `gitdir: <abs>` link file behind, the same relocation `git init` performs.
     // Everything below works on the relocated dir, as git's post-init steps do.
     let git_dir = match &separate_git_dir {
+        Some(real) if env_work_tree.is_some() => super::init::relocate_git_dir_to_link(&git_dir, dst, real)?,
         Some(real) => super::init::relocate_git_dir(&git_dir, dst, real)?,
         None => git_dir,
     };
@@ -2324,7 +2413,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // go away — which is also why a `--dissociate` clone ends with one pack and no loose
     // objects, where the same clone without it keeps whatever layout it adopted.
     if dissociate && git_dir.join("objects").join("info").join("alternates").exists() {
-        let code = run_self(&dir, &["repack", "-a", "-d"], false)?;
+        let code = run_self(&dir, &["repack", "-a", "-d"], false, child_setup(&git_dir, work_tree_entered).as_ref())?;
         if code != 0 {
             crate::git_fatal!("cannot repack to clean up");
         }
@@ -2530,9 +2619,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         });
         if let Some(name) = first_tag {
             eprintln!("fatal: multiple updates for ref '{name}' not allowed");
-            if created_destination {
-                let _ = std::fs::remove_dir_all(dst);
-            }
+            junk.remove_now();
             return Ok(ExitCode::from(128));
         }
     }
@@ -2620,12 +2707,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // (see above); only a bare or `--no-checkout` clone, which never unpacks, is
     // set up here.
     if sparse && (bare || no_checkout) {
-        let code = run_self(&dir, &["sparse-checkout", "set", "--cone"], true)?;
+        let code = run_self(&dir, &["sparse-checkout", "set", "--cone"], true, child_setup(&git_dir, false).as_ref())?;
         if code != 0 {
             eprintln!("error: failed to initialize sparse-checkout");
-            if created_destination {
-                let _ = std::fs::remove_dir_all(dst);
-            }
+            junk.remove_now();
             return Ok(ExitCode::from(1));
         }
     }
@@ -2658,6 +2743,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                         let id = head.id().expect("checked above");
                         super::checkout::print_detached_head_advice(&id.to_string());
                     }
+                    if work_tree_missing {
+                        checkout_died_with("this operation must be run in a work tree");
+                    }
                 }
                 _ => eprintln!("warning: remote HEAD refers to nonexistent ref, unable to checkout"),
             }
@@ -2670,7 +2758,10 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // in the new worktree. `--remote-submodules` adds git's `--remote`, which
     // updates each submodule to its remote-tracking branch instead of the
     // superproject's recorded commit.
-    if recurse_submodules && !bare && !no_checkout {
+    //
+    // An empty clone set `option_no_checkout` (builtin/clone.c:1560-1563), so `checkout()`
+    // returns before it reaches the submodule update (builtin/clone.c:652-653, :704).
+    if recurse_submodules && !bare && !no_checkout && !cloned_empty {
         let mut sub: Vec<String> = ["submodule", "update", "--require-init", "--recursive"]
             .iter()
             .map(ToString::to_string)
@@ -2694,7 +2785,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             sub.push("--no-fetch".into());
         }
         let sub: Vec<&str> = sub.iter().map(String::as_str).collect();
-        let code = run_self(&dir, &sub, false)?;
+        let code = run_self(&dir, &sub, false, child_setup(&git_dir, work_tree_entered).as_ref())?;
         if code != 0 {
             return Ok(ExitCode::from(code));
         }
@@ -2717,27 +2808,61 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 /// (builtin/clone.c:1113-1118.) A directory the clone created is the clone's to take back
 /// when it dies; one it found is left where it was. [`JunkDir::leave`] is `junk_mode =
 /// JUNK_LEAVE_REPO`, after which git keeps what it built.
+///
+/// Each entry is a directory and whether `REMOVE_DIR_KEEP_TOPLEVEL` applies to it, in
+/// `remove_junk()`'s order: the git dir, then the work tree (builtin/clone.c:404-412).
 struct JunkDir {
-    path: std::cell::RefCell<Option<PathBuf>>,
+    paths: Vec<(PathBuf, bool)>,
+    armed: std::cell::Cell<bool>,
 }
 
 impl JunkDir {
-    fn arm(path: Option<PathBuf>) -> Self {
+    fn arm(paths: Vec<(PathBuf, bool)>) -> Self {
         JunkDir {
-            path: std::cell::RefCell::new(path),
+            paths,
+            armed: std::cell::Cell::new(true),
         }
     }
 
     /// Stop removing on drop — the repository is far enough along to keep.
     fn leave(&self) {
-        self.path.borrow_mut().take();
+        self.armed.set(false);
+    }
+
+    /// `remove_junk()` run now, for a `return 1` that bypasses the `cleanup:` label after
+    /// [`JunkDir::leave`] was already called on this port's side.
+    fn remove_now(&self) {
+        for (path, keep_toplevel) in &self.paths {
+            remove_dir_recursively(path, *keep_toplevel);
+        }
     }
 }
 
 impl Drop for JunkDir {
     fn drop(&mut self) {
-        if let Some(path) = self.path.borrow_mut().take() {
-            let _ = std::fs::remove_dir_all(path);
+        if self.armed.get() {
+            self.remove_now();
+        }
+    }
+}
+
+/// `remove_dir_recursively()` (dir.c:3392-3447) as `remove_junk()` calls it: everything below
+/// `path` goes, and `path` itself too unless `keep_toplevel` (`REMOVE_DIR_KEEP_TOPLEVEL`).
+fn remove_dir_recursively(path: &Path, keep_toplevel: bool) {
+    if !keep_toplevel {
+        let _ = std::fs::remove_dir_all(path);
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else { return };
+    for entry in entries.flatten() {
+        let child = entry.path();
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                let _ = std::fs::remove_dir_all(&child);
+            }
+            _ => {
+                let _ = std::fs::remove_file(&child);
+            }
         }
     }
 }
@@ -4026,7 +4151,13 @@ fn write_alternates(git_dir: &Path, alternates: &[PathBuf]) -> Result<()> {
 /// (builtin/clone.c:384-398). The exit is taken here, as `die()` takes it, so
 /// nothing unwinds into the cleanup that would delete the clone.
 fn checkout_died(e: crate::progress::DelayError) -> ! {
-    eprintln!("fatal: {e}");
+    checkout_died_with(&e.to_string())
+}
+
+/// A `die()` inside `checkout()`, with `junk_mode == JUNK_LEAVE_REPO`: the message, then
+/// `remove_junk()`'s warning, and the repository stays.
+fn checkout_died_with(msg: &str) -> ! {
+    eprintln!("fatal: {msg}");
     eprintln!(
         "warning: Clone succeeded, but checkout failed.\n\
          You can inspect what was checked out with 'git status'\n\
@@ -4035,9 +4166,29 @@ fn checkout_died(e: crate::progress::DelayError) -> ! {
     std::process::exit(128);
 }
 
-fn run_self(dir: &str, args: &[&str], from_user: bool) -> Result<u8> {
+/// What a child of a `$GIT_WORK_TREE` clone inherits: the exported `GIT_DIR`, and the work
+/// tree `setup_work_tree()` entered, if it has run.
+struct ChildSetup {
+    git_dir: PathBuf,
+    work_tree: Option<String>,
+}
+
+fn run_self(dir: &str, args: &[&str], from_user: bool, setup: Option<&ChildSetup>) -> Result<u8> {
     let exe = crate::hosted::git_exe()?;
     let mut cmd = std::process::Command::new(&exe);
+    let dir = match setup {
+        Some(setup) => {
+            cmd.env("GIT_DIR", &setup.git_dir);
+            match &setup.work_tree {
+                Some(work_tree) => {
+                    cmd.env("GIT_WORK_TREE", ".");
+                    work_tree.as_str()
+                }
+                None => dir,
+            }
+        }
+        None => dir,
+    };
     cmd.arg("-C").arg(dir).args(args);
     if !from_user {
         cmd.env("GIT_PROTOCOL_FROM_USER", "0");

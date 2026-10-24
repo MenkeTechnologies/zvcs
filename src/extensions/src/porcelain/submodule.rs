@@ -4106,6 +4106,13 @@ fn child_code(status: std::process::ExitStatus) -> u8 {
 /// registration pass) is reflected in the in-memory snapshot the update loop
 /// reads. gix caches config at open time, so the write is otherwise invisible.
 fn reopen(repo: &gix::Repository) -> Result<gix::Repository> {
+    // git re-reads the configuration of the repository it already has; it never looks for one
+    // again. A work tree with no `.git` of its own was reached through `GIT_DIR` (as
+    // `git clone` under `$GIT_WORK_TREE` runs this, builtin/clone.c:704-739), and only the same
+    // environment-driven setup finds that repository a second time.
+    if repo.workdir().is_some_and(|wt| !wt.join(".git").exists()) {
+        return Ok(crate::setup::discover()?);
+    }
     let path = repo
         .workdir()
         .map(ToOwned::to_owned)

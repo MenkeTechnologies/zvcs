@@ -114,9 +114,10 @@ const BASIC_ONLY_VERBS: &[&[&str]] = &[
 /// above. `cmd_stash` installs `git_diff_basic_config` in the parent
 /// (builtin/stash.c:994) — so the basic keys die there at 128, like any other
 /// fatal — and `list_stash()` then runs a `git log` child, which refuses
-/// everything `git_log_config` reads. `cmd_stash` flattens that child's status
-/// to `!!fn(...)` (builtin/stash.c:2496), so those refusals arrive at exit 1
-/// with the same text. Measured on git 2.55.0:
+/// everything `git_log_config` reads. Since 2.56 `cmd_stash` hands that child's
+/// status through (builtin/stash.c:2498-2510), so those refusals arrive at the
+/// child's 128 with the same text; 2.55's `!!fn(...)` flattened them to 1.
+/// Measured on git 2.56.0:
 ///
 /// ```text
 /// $ git -c diff.renameLimit=bogus stash list; echo $?
@@ -124,14 +125,14 @@ const BASIC_ONLY_VERBS: &[&[&str]] = &[
 /// 128
 /// $ git -c color.ui=bogus stash list; echo $?
 /// fatal: bad boolean config value 'bogus' for 'color.ui'
-/// 1
+/// 128
 /// $ git -c diff.relative=bogus stash list; echo $?
 /// fatal: bad boolean config value 'bogus' for 'diff.relative'
-/// 1
+/// 128
 /// ```
 const CHILD_LOG_VERBS: &[&[&str]] = &[&["stash", "list"]];
 /// The status those verbs report for a refusal raised in the child.
-const CHILD_FATAL: i32 = 1;
+const CHILD_FATAL: i32 = 128;
 /// Verbs that colour but never diff.
 const COLOR_ONLY_VERBS: &[&[&str]] =
     &[&["branch"], &["tag"], &["grep", "one"], &["clean", "-n"], &["show-branch"]];

@@ -298,3 +298,34 @@ fn store_clear_and_create_refusals_are_128() {
     assert_eq!(code, 128, "{err}");
     assert_eq!(err, "error: git stash clear with arguments is unimplemented\n");
 }
+
+/// `check_changes_tracked_files()` asks `repo_get_oid(the_repository, "HEAD", …)`
+/// before it reads the index (builtin/stash.c:1247-1249), and `repo_dwim_ref()`
+/// reads `core.warnAmbiguousRefs` the moment `HEAD` matches (refs.c:827). So an
+/// unreadable value kills `push` (with or without `-u`, dirty or clean) and
+/// `create` there, before anything is written; an unborn `HEAD` matches no rule,
+/// never reads the setting and gets `You do not have the initial commit yet`.
+#[test]
+fn unreadable_warn_ambiguous_refs_dies_at_the_head_lookup() {
+    let f = Fixture::new("warnambig");
+    let bad = ["-c", "core.warnAmbiguousRefs=="];
+    let fatal = "fatal: bad boolean config value '=' for 'core.warnambiguousrefs'\n";
+
+    for sub in [&["stash", "push"][..], &["stash", "create"][..]] {
+        let (code, err) = f.run(&[&bad[..], sub].concat());
+        assert_eq!((code, err.as_str()), (128, fatal), "clean `git {sub:?}`");
+    }
+    f.write("n.txt", "two\n");
+    f.write("u.txt", "untracked\n");
+    let (code, err) = f.run(&[&bad[..], &["stash", "push", "-u", "-m", "gen"]].concat());
+    assert_eq!((code, err.as_str()), (128, fatal));
+    assert_eq!(f.stash_count(), 0, "nothing is stored");
+    assert!(f.work.join("u.txt").exists(), "the untracked file is left in place");
+    assert_eq!(std::fs::read_to_string(f.work.join("n.txt")).unwrap(), "two\n");
+
+    let u = Fixture::unborn("warnambig-unborn");
+    u.write("a", "a\n");
+    u.git(&["add", "a"]);
+    let (code, err) = u.run(&[&bad[..], &["stash", "push"]].concat());
+    assert_eq!((code, err.as_str()), (128, "You do not have the initial commit yet\n"));
+}

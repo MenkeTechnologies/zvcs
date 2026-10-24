@@ -283,8 +283,9 @@ fn log_honors_the_diff_color_alias() {
 }
 
 /// `list_stash()` runs a `git log` child, so `git stash list` takes the whole
-/// `git_log_config` refusal surface — but `cmd_stash` returns `!!fn(...)`
-/// (builtin/stash.c:2496), so the status the user sees is 1, not 128.
+/// `git_log_config` refusal surface, and since 2.56 `cmd_stash` returns the
+/// child's status as it is (builtin/stash.c:2498-2510) — the `die()`'s 128, where
+/// 2.55's `!!fn(...)` made it 1.
 /// `show_stash()` reaches the diff UI layer instead and dies at 128; every other
 /// subcommand stops at `git_diff_basic_config` and does not die at all.
 #[test]
@@ -293,7 +294,7 @@ fn stash_subcommands_take_the_right_color_config_refusal() {
     ok(&repo, &["stash", "-q"]);
     for key in ["color.ui", "color.diff"] {
         let o = run(&repo, &["-c", &format!("{key}=bogus"), "stash", "list"]);
-        assert_eq!(o.status.code(), Some(1), "stash list {key}=bogus: wrong exit");
+        assert_eq!(o.status.code(), Some(128), "stash list {key}=bogus: wrong exit");
         assert_eq!(
             stderr(&o),
             format!("fatal: bad boolean config value 'bogus' for '{key}'\n"),

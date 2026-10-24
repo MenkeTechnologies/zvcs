@@ -1388,6 +1388,20 @@ fn check_changes(repo: &gix::Repository, opts: &PushOpts) -> Result<bool> {
 /// `check_changes_tracked_files()`: `diff-index HEAD` then `diff-files`, both
 /// under the pathspec, either of which reporting a change is enough.
 fn tracked_changes_match(repo: &gix::Repository, specs: &[String]) -> Result<bool> {
+    // ```c
+    // /* No initial commit. */
+    // if (repo_get_oid(the_repository, "HEAD", &dummy))
+    //         return -1;
+    // ```
+    //
+    // (builtin/stash.c:1247-1249.) The lookup goes through `get_oid_basic()`, whose
+    // `repo_dwim_ref()` asks `repo_settings_get_warn_ambiguous_refs()` the moment
+    // `HEAD` matches (refs.c:827), so `git -c core.warnAmbiguousRefs== stash push`
+    // dies `bad boolean config value` here, before anything is written. A nonzero
+    // return counts as a change in `check_changes()`.
+    if crate::objname::resolve(repo, "HEAD").is_none() {
+        return Ok(true);
+    }
     let mut changed: Vec<BString> = Vec::new();
     let iter = repo
         .status(gix::progress::Discard)?
@@ -2216,6 +2230,11 @@ pub(crate) fn create_snapshot(repo: &gix::Repository) -> Result<Option<ObjectId>
 /// `create_stash` (builtin/stash.c): the message is every remaining arg joined
 /// by a space (no option parsing), and a clean tree prints nothing (exit 0).
 fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+    // `create_stash()` opens with `check_changes_tracked_files()` (builtin/stash.c:1658),
+    // whose first act is `repo_get_oid(the_repository, "HEAD", &dummy)` (:1248): the
+    // lookup that dies on an unreadable `core.warnAmbiguousRefs` (refs.c:827) ahead of
+    // the index read and its racy hashing. Its answer is re-asked below.
+    let _ = crate::objname::resolve(repo, "HEAD");
     // `check_changes_tracked_files()` hashes a racily clean entry in
     // `run_diff_files()`, and whatever it lets through reaches
     // `do_create_stash()`'s refresh (builtin/stash.c:1521) — which, unborn HEAD

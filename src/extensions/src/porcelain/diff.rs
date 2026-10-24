@@ -208,9 +208,11 @@
 //!   pins the algorithm to patience and is repeatable, and a later `--patience`
 //!   discards every anchor named before it. The plumbing verbs (`diff-files`,
 //!   `diff-index`, `diff-tree`) still refuse it.
-//! * `git diff` on an unmerged path renders the combined (`--cc`) patch, and only that —
-//!   the duplicate stage-2-vs-worktree pair the raw/name/stat formats also report is not
-//!   given a `diff --git` section. `--cached` renders git's `* Unmerged path` line.
+//! * `git diff` on a path holding conflict stages #2 and #3, under the patch format or
+//!   `-c`/`--cc`, queues no pair for it and prints it through `show_combined_diff()`
+//!   first: the `::` raw record when a raw/name format was asked for, otherwise the
+//!   combined patch. Every other shape reports the `U` pair and the stage pair, and
+//!   the patch renders the `U` pair as git's `* Unmerged path` line.
 
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -290,14 +292,6 @@ struct Render {
     /// and the diffstat all keep reading a real unified diff.
     indicators: (u8, u8, u8),
     hash_kind: gix::hash::Kind,
-    /// `rev->dense_combined_merges` for an unmerged worktree path: `diff --cc`
-    /// unless a `-c` asked for `diff --combined` (`builtin_diff_files()` only
-    /// raises the dense form when nothing set a combined mode, builtin/diff.c:279-281).
-    combined_dense: bool,
-    /// `opt->a_prefix` / `opt->b_prefix` as configured, before `-R` swaps the pair:
-    /// `show_combined_header()` prints them on the `---` / `+++` lines
-    /// (combine-diff.c:931-932).
-    combined_prefixes: (Vec<u8>, Vec<u8>),
 }
 
 /// The `xdiff` knobs that decide which changes make it into the hunk stream at all,
@@ -481,9 +475,6 @@ struct Delta {
     /// An unmerged (conflicted) index entry: rendered as status `U`, counted as
     /// zero changes by the stat formats, and never diffed through the blob pipeline.
     unmerged: bool,
-    /// Stage 2 / stage 3 blobs, present only for the combined (`--cc`) patch of an
-    /// unmerged worktree path.
-    stages: Option<(ObjectId, ObjectId)>,
     /// The rename/copy *source* path (git's `p->one->path`) when detection matched
     /// this destination to a differently-named source. `None` means both sides of the
     /// pair name the same path.
@@ -696,7 +687,6 @@ impl Delta {
             new,
             old_worktree: false,
             unmerged: false,
-            stages: None,
             src_path: None,
             score: 0,
             status: 0,
@@ -1223,7 +1213,6 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         old_worktree: d.old_worktree,
         new: NewSide::Absent,
         unmerged: false,
-        stages: None,
         src_path: None,
         score: 0,
         status: b'D',
@@ -1248,7 +1237,6 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
             NewSide::Worktree(k) => NewSide::Worktree(k),
         },
         unmerged: false,
-        stages: None,
         src_path: None,
         score: 0,
         status: b'A',
@@ -3151,24 +3139,26 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         fmt = F_PATCH;
     }
 
-    // The worktree diff's (`builtin_diff_files()`) one supported shape for `-c`/`--cc`,
-    // now that the format is settled: exactly the one
-    // `builtin_diff_files()` would have set the same two flags for on its own — the
-    // patch format and no `--base`/`--ours`/`--theirs`. There `--cc` asks for what is
-    // already true, and `-c` only takes the density off (`Render::combined_dense`).
-    // Any other shape reaches
-    // `run_diff_files()` with `revs->combine_merges` set where this port leaves it
-    // clear, which sends every unmerged path through `show_combined_diff()` — a
-    // renderer this port has only for the patch format — so it is refused rather
-    // than answered with the uncombined records that would otherwise come out.
-    // The other entry points need no such gate: against one revision the combined
-    // paths are rendered in every format (see [`OnewayCombined`]), and `--cached`
-    // or two trees never read the flag.
+    // `revs->combine_merges` as `run_diff_files()` reads it, now that the format is
+    // settled. `-c`/`--cc` raise it outright; otherwise `builtin_diff_files()` raises
+    // it for the patch format when no `--base`/`--ours`/`--theirs` was given:
+    //
+    // ```c
+    // if (revs->max_count == -1 &&
+    //     (revs->diffopt.output_format & DIFF_FORMAT_PATCH))
+    //         diff_merges_set_dense_combined_if_unset(revs);
+    // ```
+    //
+    // (builtin/diff.c:280-282.) `diff_setup_done()` has already cleared
+    // `DIFF_FORMAT_PATCH` under `--name-only`/`--name-status`/`--check`, so those
+    // never combine unless asked to. `--quiet` is `flags.quick`, which
+    // `diff_setup_done()` turns into `DIFF_FORMAT_NO_OUTPUT` (diff.c:5348-5353), so it
+    // does not combine either. `--cached` and the tree forms never read it
+    // here; against one revision it is [`oneway_combined_path`]'s.
     let diff_files_shape = revs.is_empty() && !cached && !blob_run;
-    if diff_files_shape && combine_merges && (unmerged_stage.is_some() || fmt != F_PATCH) {
-        let flag = if dense_combined { "--cc" } else { "-c" };
-        bail!("unsupported option \"{flag}\" outside a plain patch of the working tree");
-    }
+    let files_combine =
+        diff_files_shape && (combine_merges || (!quiet && unmerged_stage.is_none() && fmt & F_PATCH != 0));
+    let mut files_combined: Vec<CombinedPath> = Vec::new();
 
     // `builtin_diff_tree()` (builtin/diff.c:196):
     //
@@ -3418,7 +3408,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 &mut deltas,
                 ita_invisible,
                 unmerged_stage,
+                files_combine,
+                &mut files_combined,
             )?;
+            // `run_diff_files()` walks the index in order, so the combined paths
+            // print in path order.
+            files_combined.sort_by(|a, b| a.path.cmp(&b.path));
         }
         // The gitlinks this pass hands to `match_stat_with_submodule()`
         // (diff-lib.c:88-107), each of which is a child `git status` inside the
@@ -3483,6 +3478,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         .filter(|p| !p.is_empty());
     if let Some(prefix) = &relative {
         deltas.retain(|d| d.path.starts_with(prefix.as_bytes()));
+        files_combined.retain(|cp| cp.path.starts_with(prefix.as_bytes()));
     }
 
     // `show_modified()`'s combined arm (diff-lib.c:408-424): against one revision
@@ -3490,13 +3486,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // tree, the index and the file all hold and print it on the spot. See
     // [`oneway_combined_path`]. It runs inside the tree walk, after the pathspec and
     // the `--relative` prefix test and ahead of `-R`, diffcore and every format.
-    let mut oneway_combined: Vec<CombinedPath> = Vec::new();
+    let mut walk_combined: Vec<CombinedPath> = files_combined;
     if combine_merges && worktree_mode && revs.len() == 1 {
         let index = repo.index_or_empty()?;
         let mut kept: Vec<Delta> = Vec::with_capacity(deltas.len());
         for d in deltas.drain(..) {
             match oneway_combined_path(&repo, &index, &d)? {
-                Some(cp) => oneway_combined.push(cp),
+                Some(cp) => walk_combined.push(cp),
                 None => kept.push(d),
             }
         }
@@ -3902,8 +3898,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         dst_prefix,
         indicators,
         hash_kind,
-        combined_dense: !combine_merges || dense_combined,
-        combined_prefixes: (combined_req.a_prefix.clone(), combined_req.b_prefix.clone()),
     };
 
     // `--color[=<when>]` and `--no-color`, falling back to `color.diff` /
@@ -3984,7 +3978,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     &repo,
                     delta,
                     analysis,
-                    ctx,
                     &r,
                     submodule_format,
                 )? {
@@ -4042,7 +4035,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // whitespace-only change is absent from these formats as well.
                 if names_need_patch {
                     let an = &analyses[i];
-                    if !pair_reports_change(&mut scratch, &repo, delta, an, ctx, &r, submodule_format)? {
+                    if !pair_reports_change(&mut scratch, &repo, delta, an, &r, submodule_format)? {
                         continue;
                     }
                 }
@@ -4094,7 +4087,28 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             let files: Vec<(BString, u64)> = deltas
                 .iter()
                 .zip(analyses.iter())
-                .map(|(d, an)| {
+                .filter_map(|(d, an)| {
+                    // A `U` pair has at most one valid side, and `show_dirstat()`
+                    // charges it that side's whole size (diff.c:3414-3426): the
+                    // tree entry `--cached` names is `p->one->size - copied` with
+                    // nothing copied, the worktree file `run_diff_files()` gave a
+                    // `wt_mode` is `added`, and a pair with neither — the file gone —
+                    // is the `continue`. `--dirstat-by-file` charged it one unit
+                    // before any of those tests.
+                    if d.unmerged && !dirstat.by_file && !dirstat.by_line {
+                        let size = match (&d.old, &d.new) {
+                            (Some((id, _)), _) => repo.find_header(*id).map_or(0, |h| h.size()),
+                            (None, NewSide::Worktree(_)) => repo
+                                .workdir()
+                                .and_then(|w| {
+                                    std::fs::symlink_metadata(w.join(gix::path::from_bstr(d.full_path().as_bstr())))
+                                        .ok()
+                                })
+                                .map_or(0, |m| m.len()),
+                            (None, _) => return None,
+                        };
+                        return Some((d.full_path().clone(), size.max(1)));
+                    }
                     let damage = if !dirstat.by_line && d.dirstat_oid_unchanged() {
                         // `show_dirstat()` (diff.c:3390-3399) short-circuits an
                         // oid-identical pair to zero damage *before* consulting
@@ -4114,7 +4128,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     } else {
                         an.damage
                     };
-                    (d.full_path().clone(), damage)
+                    Some((d.full_path().clone(), damage))
                 })
                 .collect();
             super::diff_files::render_dirstat(&mut out, files, &dirstat);
@@ -4139,25 +4153,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // arrives with the whole-buffer `apply_line_prefix()` below.
                 out.push(if r.z { 0 } else { b'\n' });
             }
-            // `run_diff_files()` queues an unmerged path twice — once as the `U`
-            // pair and once as the ordinary stage-2-vs-worktree modification — and
-            // the raw/name/stat formats above print both. The patch format prints
-            // only the combined (`--cc`) patch for such a path; the duplicate pair
-            // contributes no `diff --git` section of its own.
-            // …but only while `revs->combine_merges` is on. `run_diff_files()`
-            // (diff-lib.c:210-214) emits the combined section and `continue`s
-            // *before* `diff_unmerge()`, so the second pair does not exist at all
-            // there; with `--base`/`--ours`/`--theirs` the free combined diff is
-            // never armed and both pairs reach the patch — a `* Unmerged path`
-            // marker followed by an ordinary `diff --git` section.
-            let unmerged: BTreeSet<&BString> = match unmerged_stage {
-                Some(_) => BTreeSet::new(),
-                None => deltas
-                    .iter()
-                    .filter(|d| d.unmerged)
-                    .map(|d| &d.path)
-                    .collect(),
-            };
             // The whole patch is assembled uncolored and then re-emitted in one
             // pass through git's `fn_out_consume()` chain, carrying each pair's own
             // whitespace state so the blank-at-EOF check never leaks from one file
@@ -4210,9 +4205,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             };
             let null_id = repo.object_hash().null();
             for (i, (queued, queued_an)) in deltas.iter().zip(&analyses).enumerate() {
-                if !queued.unmerged && unmerged.contains(&queued.path) {
-                    continue;
-                }
                 // The submodule branch lives in `builtin_diff()`, downstream of
                 // `run_diff()`'s split, so each half is tested on its own: the
                 // deletion half of a gitlink-to-blob change is a submodule pair even
@@ -4305,7 +4297,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         continue;
                     }
                     let before = plain.len();
-                    render_patch(&mut plain, &repo, delta, an, ctx, &r)?;
+                    render_patch(&mut plain, &repo, delta, an, &r)?;
                     if plain.len() != before {
                         files.push(diff_color::FilePaint {
                             ws_rule,
@@ -4318,7 +4310,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                         });
                         // Every `builtin_diff()` arm that emits a header or a hunk sets
                         // `o->found_changes`, so having written anything is the answer.
-                        found_changes |= !(delta.unmerged && delta.stages.is_some());
+                        found_changes = true;
                     }
                 }
             }
@@ -4345,7 +4337,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // change is asked about as its two halves.
             for (delta, an) in patch_steps(queued, queued_an, splits.get(i).and_then(|s| s.as_ref()))
             {
-                if pair_reports_change(&mut sink, &repo, delta, an, ctx, &r, submodule_format)? {
+                if pair_reports_change(&mut sink, &repo, delta, an, &r, submodule_format)? {
                     found_changes = true;
                     break 'pairs;
                 }
@@ -4367,10 +4359,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // still running (combine-diff.c:1284-1296), so all of them come ahead of
     // whatever `diff_flush()` makes of the queue — raw/name records for those
     // formats, otherwise the patch, and nothing for any other format.
-    if !oneway_combined.is_empty() && !quiet {
+    if !walk_combined.is_empty() && !quiet {
         let mut head: Vec<u8> = Vec::new();
         if fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0 {
-            for cp in &oneway_combined {
+            for cp in &walk_combined {
                 render_combined_raw_at(&mut head, cp, fmt, r.raw_abbrev, r.z, &line_prefix, combined_all_paths);
             }
         } else if fmt & F_PATCH != 0 {
@@ -4379,9 +4371,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 false => crate::abbrev::configured_abbrev(&repo, r.hash_kind.len_in_hex()),
             };
             head = combined_patch(
-                &oneway_combined,
+                &walk_combined,
                 ctx,
-                dense_combined,
+                // `rev->dense_combined_merges`, which `builtin_diff_files()` raises
+                // along with `combine_merges` when nothing set either.
+                !combine_merges || dense_combined,
                 abbrev,
                 &combined_req.a_prefix,
                 &combined_req.b_prefix,
@@ -4440,17 +4434,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // copy of the options (combine-diff.c:1524), so the caller's `has_changes` stays
     // clear and `git diff --exit-code <a> <b> <c>` exits 0 however much it printed.
     // `run_diff_files()` hands an unmerged path to `show_combined_diff()` and `continue`s
-    // before `diff_unmerge()` / `diff_change()` (diff-lib.c:210-214), so a patch whose
-    // combined section covers every queued pair never sets `has_changes` either.
-    let combined_covered: BTreeSet<&BString> = match fmt & F_PATCH != 0 {
-        true => deltas.iter().filter(|d| d.unmerged && d.stages.is_some()).map(|d| &d.path).collect(),
-        false => BTreeSet::new(),
-    };
+    // before `diff_unmerge()` / `diff_change()` (diff-lib.c:211-215), so a combined path
+    // never sets `has_changes` either — it is not in the queue at all.
     if want_exit_code && !combined {
         let changed = if from_contents {
             found_changes
         } else {
-            deltas.iter().any(|d| !combined_covered.contains(&d.path))
+            !deltas.is_empty()
         };
         if changed {
             return Ok(ExitCode::from(1));
@@ -4651,7 +4641,7 @@ impl diffcore_rename::Content for DeltaContent<'_> {
 ///
 /// Unmerged deltas never enter the queue. git represents a conflicted path as a pair
 /// with *both* sides invalid, which the rename passes carry through untouched; this
-/// port models it as a delta with its own `stages`, so it is simply held aside and
+/// port models it as a delta of its own, so it is simply held aside and
 /// re-appended (the caller re-sorts by path afterwards, restoring git's order).
 fn run_diffcore_rename(
     repo: &gix::Repository,
@@ -4765,7 +4755,6 @@ fn run_diffcore_rename(
             new,
             old_worktree: old_worktree_specs.contains(&p.one),
             unmerged: false,
-            stages: None,
             src_path,
             score: p.score,
             status: p.status,
@@ -4896,7 +4885,6 @@ fn collect_tree_index(
             new: NewSide::Absent,
             old_worktree: false,
             unmerged: true,
-            stages: None,
             src_path: None,
             score: 0,
             status: 0,
@@ -5221,9 +5209,12 @@ fn collect_index_worktree(
     ita_invisible: bool,
     // `revs->max_count` → `diff_unmerged_stage` (diff-lib.c:107): which conflict
     // stage the ordinary pair of an unmerged path compares. `None` is git's `-1`,
-    // which `run_diff_files()` reads as stage 2 and which also leaves the free
-    // combined diff in place.
+    // which `run_diff_files()` reads as stage 2.
     unmerged_stage: Option<u8>,
+    // `revs->combine_merges`: a path with both stage 2 and stage 3 goes to
+    // `combined` instead of the queue.
+    combine: bool,
+    combined: &mut Vec<CombinedPath>,
 ) -> Result<()> {
     let index = repo.index_or_empty()?;
     let stage_table = conflict_stage_table(&index);
@@ -5286,10 +5277,36 @@ fn collect_index_worktree(
     }
 
     // `run_diff_files()` reports an unmerged path twice: once as the `U` pair, and
-    // once as the ordinary stage-2-vs-worktree modification.
+    // once as the ordinary stage-2-vs-worktree modification — unless the combined
+    // diff takes it first:
+    //
+    // ```c
+    // if (revs->combine_merges && num_compare_stages == 2) {
+    //         show_combined_diff(dpath, 2, revs);
+    //         free(dpath);
+    //         continue;
+    // }
+    // ```
+    //
+    // (diff-lib.c:211-215.) `dpath` is the file as the result — `wt_mode` from
+    // `ce_mode_from_stat()`, `0` for a removed file, and the null id — against
+    // stage 2 as the first parent and stage 3 as the second, each `M`. Neither the
+    // `U` pair nor the stage pair is queued for such a path.
     for path in seen_conflicts {
-        let stages = conflicts.get(&path);
         let wt_kind = worktree_kind(workdir, &path);
+        if let (true, Some(s)) = (combine, conflicts.get(&path)) {
+            let side = |(id, kind): (ObjectId, EntryKind)| -> Result<CombinedSide> {
+                Ok(CombinedSide { kind: Some(kind), id, bytes: blob_bytes(repo, id)?, status: b'M' })
+            };
+            combined.push(CombinedPath {
+                path: path.clone(),
+                kind: wt_kind,
+                id: repo.object_hash().null(),
+                bytes: read_worktree_bytes(Some(workdir), &path).unwrap_or_default(),
+                parents: vec![side(s.ours)?, side(s.theirs)?],
+            });
+            continue;
+        }
         deltas.push(Delta {
             path: path.clone(),
             old: None,
@@ -5299,13 +5316,6 @@ fn collect_index_worktree(
                 None => NewSide::Absent,
             },
             unmerged: true,
-            // With an explicit stage git never reaches
-            // `diff_merges_set_dense_combined_if_unset()`, so this pair stays the
-            // `* Unmerged path` marker rather than becoming a combined section.
-            stages: match unmerged_stage {
-                Some(_) => None,
-                None => stages.map(|s| (s.ours.0, s.theirs.0)),
-            },
             src_path: None,
             score: 0,
             status: 0,
@@ -5334,7 +5344,11 @@ fn collect_index_worktree(
                     .checked_sub(1)
                     .and_then(|at| s.get(at).copied().flatten())
             });
-        if let (Some(side), Some(k)) = (wanted, wt_kind) {
+        // A file `check_removed()` cannot find is `diff_addremove('-', ...)` of the
+        // stage entry (diff-lib.c:252-262), the same deletion a stage-0 entry gets.
+        if let (Some(side), None) = (wanted, wt_kind) {
+            deltas.push(Delta::plain(path, Some(side), NewSide::Absent));
+        } else if let (Some(side), Some(k)) = (wanted, wt_kind) {
             // `git diff` arms `skip_stat_unmatch` (builtin/diff.c:525), which drops a pair whose
             // worktree side carries no object name when both sides have the same mode and
             // identical content: the stage-2 pair of a conflicted path whose file still holds
@@ -6265,8 +6279,6 @@ fn patch_render(repo: &gix::Repository, opts: &PatchOpts) -> Render {
         dst_prefix: opts.dst_prefix.clone(),
         indicators: opts.indicators,
         hash_kind,
-        combined_dense: true,
-        combined_prefixes: (opts.src_prefix.clone(), opts.dst_prefix.clone()),
     }
 }
 
@@ -7000,7 +7012,7 @@ fn commit_patch_with(
                 },
             )?;
             let before = plain.len();
-            render_patch(&mut plain, repo, delta, &an, opts.ctx, r)?;
+            render_patch(&mut plain, repo, delta, &an, r)?;
             if plain.len() != before {
                 files.push(diff_color::FilePaint {
                     ws_rule,
@@ -7075,7 +7087,7 @@ pub(crate) fn line_range_patch(
             false,
             &IgnoreOpts::default(),
         )?;
-        render_patch(&mut out, repo, &delta, &an, ctx, &r)?;
+        render_patch(&mut out, repo, &delta, &an, &r)?;
     }
     Ok(out)
 }
@@ -9030,7 +9042,6 @@ fn pair_reports_change(
     repo: &gix::Repository,
     delta: &Delta,
     an: &Analysis,
-    ctx: u32,
     r: &Render,
     submodule_format: SubmoduleFormat,
 ) -> Result<bool> {
@@ -9038,7 +9049,7 @@ fn pair_reports_change(
         return Ok(true);
     }
     scratch.clear();
-    render_patch(scratch, repo, delta, an, ctx, r)?;
+    render_patch(scratch, repo, delta, an, r)?;
     Ok(!scratch.is_empty())
 }
 
@@ -9048,11 +9059,11 @@ fn render_patch(
     repo: &gix::Repository,
     delta: &Delta,
     an: &Analysis,
-    ctx: u32,
     r: &Render,
 ) -> Result<()> {
     if delta.unmerged {
-        return render_combined(out, repo, delta, ctx, r.combined_dense, &r.combined_prefixes);
+        render_unmerged(out, delta);
+        return Ok(());
     }
 
     // The `index` line honors `--abbrev` / `--full-index`. `fill_metainfo()` also
@@ -10156,14 +10167,19 @@ fn combined_patch(
         // 1132-1147): a binary path gets the header without its `---`/`+++` pair and
         // `Binary files differ`, and no line diff is run for it.
         let binary = looks_binary(&cp.bytes) || cp.parents.iter().any(|p| looks_binary(&p.bytes));
-        let (sline, cnt) = match binary {
+        // `deleted_file:` (combine-diff.c:1111-1116): a worktree result that `lstat()`
+        // cannot find is `result_deleted`, which `combine_diff()` and `dump_sline()`
+        // both return on at once (combine-diff.c:436-437, 767-768) — the header is
+        // all such a path prints.
+        let result_deleted = working_tree_file && cp.kind.is_none();
+        let (sline, cnt) = match binary || result_deleted {
             true => (Vec::new(), 0),
             false => {
                 let parent_bytes: Vec<Vec<u8>> = cp.parents.iter().map(|p| p.bytes.clone()).collect();
                 build_combined_sline(&cp.bytes, &parent_bytes, ctx, dense)
             }
         };
-        let show_hunks = !binary && sline_has_marks(&sline, cnt);
+        let show_hunks = !binary && !result_deleted && sline_has_marks(&sline, cnt);
         // `for (i = 0; i < num_parent; i++) if (elem->parent[i].mode != elem->mode)`
         // (combine-diff.c:1123-1128).
         let mode_differs = cp.parents.iter().any(|p| p.kind != cp.kind);
@@ -10259,7 +10275,9 @@ fn combined_patch(
         // `dump_sline()` prefixes every line it prints (combine-diff.c:809, 841,
         // 853), which a whole-buffer pass over its output reproduces.
         let mut hunks: Vec<u8> = Vec::new();
-        dump_sline(&mut hunks, &sline, cnt, ctx);
+        if !result_deleted {
+            dump_sline(&mut hunks, &sline, cnt, ctx);
+        }
         out.extend_from_slice(&apply_line_prefix(hunks, line_prefix));
     }
     Ok(colorize_combined(out, colors, line_prefix, NUM_PARENT))
@@ -10311,6 +10329,12 @@ fn colorize_combined(
                 res.push(b'\n');
             }
             continue;
+        } else if rest == b"Binary files differ" {
+            // A bare `printf("Binary files differ\n")` (combine-diff.c:1150): no
+            // color at all. A hunk body line always opens with its sign columns, so
+            // it can never read this way.
+            res.extend_from_slice(line);
+            continue;
         } else if rest.starts_with(b"@") {
             diff_color::DiffSlot::Frag
         } else {
@@ -10335,61 +10359,14 @@ fn colorize_combined(
     res
 }
 
-/// A combined diff of the two conflict stages against the working-tree file, as
-/// `show_combined_diff()` renders it for `git diff` on a conflicted path.
-///
-/// Port of `show_patch_diff()` / `combine_diff()` / `make_hunks()` / `dump_sline()`
-/// from `combine-diff.c`, specialized to the two-parent (stage 2 / stage 3) case.
-fn render_combined(
-    out: &mut Vec<u8>,
-    repo: &gix::Repository,
-    delta: &Delta,
-    ctx: u32,
-    dense: bool,
-    (a_prefix, b_prefix): &(Vec<u8>, Vec<u8>),
-) -> Result<()> {
-    let Some((ours, theirs)) = delta.stages else {
-        // No stage 2/3 pair to combine (e.g. `--cached`): git prints the notice.
-        push_str(out, "* Unmerged path ");
-        out.extend_from_slice(&delta.path);
-        out.push(b'\n');
-        return Ok(());
-    };
-    let workdir = match repo.workdir() {
-        Some(w) => w,
-        None => {
-            push_str(out, "* Unmerged path ");
-            out.extend_from_slice(&delta.path);
-            out.push(b'\n');
-            return Ok(());
-        }
-    };
-    let result = std::fs::read(workdir.join(gix::path::from_bstr(delta.path.as_bstr())))?;
-    let parents = vec![blob_bytes(repo, ours)?, blob_bytes(repo, theirs)?];
-    // `run_diff_files()` hands `combine_diff_path`s to `show_combined_diff()` with
-    // the density the caller set: `--cc` (or nothing) is dense, `-c` is not.
-    let (sline, cnt) = build_combined_sline(&result, &parents, ctx, dense);
-
-    // ---- header (`show_combined_header()`) --------------------------------
-    push_str(out, if dense { "diff --cc " } else { "diff --combined " });
-    out.extend_from_slice(&quoted_name(&delta.path));
+/// `run_diff()`'s unmerged arm (diff.c:4962-4966): a queued `U` pair prints the
+/// notice and nothing else. The combined patch of a conflicted path is not a
+/// queued pair at all — `run_diff_files()` prints it through `show_combined_diff()`
+/// before the queue is flushed (see [`collect_index_worktree`]).
+fn render_unmerged(out: &mut Vec<u8>, delta: &Delta) {
+    push_str(out, "* Unmerged path ");
+    out.extend_from_slice(&delta.path);
     out.push(b'\n');
-    push_str(out, "index ");
-    let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
-    push_str(out, &ours.to_hex_with_len(abbrev).to_string());
-    push_str(out, ",");
-    push_str(out, &theirs.to_hex_with_len(abbrev).to_string());
-    push_str(out, "..");
-    // The result lives only in the worktree, so it has no object id.
-    push_str(out, &repo.object_hash().null().to_hex_with_len(abbrev).to_string());
-    out.push(b'\n');
-    // This renders into the ordinary output buffer, which the caller prefixes as a
-    // whole, so no prefix is emitted here.
-    dump_quoted_path(out, b"", b"--- ", &quote_one(a_prefix, &delta.path));
-    dump_quoted_path(out, b"", b"+++ ", &quote_one(b_prefix, &delta.path));
-
-    dump_sline(out, &sline, cnt, ctx);
-    Ok(())
 }
 
 fn blob_bytes(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {

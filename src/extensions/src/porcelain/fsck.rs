@@ -19,6 +19,9 @@ const ERROR_REACHABLE: u8 = 2;
 const ERROR_PACK: u8 = 4;
 /// `builtin/fsck.c`'s `ERROR_REFS` — the `git refs verify` child failed.
 const ERROR_REFS: u8 = 8;
+/// `builtin/fsck.c`'s `ERROR_COMMIT_GRAPH` — a `git commit-graph verify` child
+/// failed.
+const ERROR_COMMIT_GRAPH: u8 = 16;
 
 /// `git fsck` — verify connectivity of the object database.
 ///
@@ -1144,204 +1147,213 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             queue.push((id, None));
         }
     }
+    // `traverse_reachable()` (builtin/fsck.c:185-198): a delayed meter with no
+    // total, advanced by `display_progress(progress, ++nr)` after each object
+    // `object_array_pop()` hands `traverse_one_object()`, whatever that walk
+    // made of it.
+    let mut connectivity = crate::progress::Meter::delayed("Checking connectivity", 0, show_progress)?;
     while let Some((id, expected)) = queue.pop() {
-        let kind = match repo.find_header(id) {
-            Ok(h) => h.kind(),
-            // The odb cannot read it. Under a full scan the object is in
-            // `corrupt` and was never queued, so this is `--connectivity-only`,
-            // where nothing has read it yet. `fsck_walk_blob()` reads nothing,
-            // so a blob stays quiet; anything else is `parse_tree()` /
-            // `parse_commit()` failing, which is where git gives up. Its own
-            // diagnostic ahead of this line names the specific odb failure and
-            // is not reproduced.
-            Err(_) => match expected {
-                Some(Kind::Blob) | None => continue,
-                Some(_) => {
+        'traverse: {
+            let kind = match repo.find_header(id) {
+                Ok(h) => h.kind(),
+                // The odb cannot read it. Under a full scan the object is in
+                // `corrupt` and was never queued, so this is `--connectivity-only`,
+                // where nothing has read it yet. `fsck_walk_blob()` reads nothing,
+                // so a blob stays quiet; anything else is `parse_tree()` /
+                // `parse_commit()` failing, which is where git gives up. Its own
+                // diagnostic ahead of this line names the specific odb failure and
+                // is not reproduced.
+                Err(_) => match expected {
+                    Some(Kind::Blob) | None => break 'traverse,
+                    Some(_) => {
+                        let path = loose_object_label(&repo, id)
+                            .map(|p| format!(" (stored in {p})"))
+                            .unwrap_or_default();
+                        eprintln!("fatal: loose object {id}{path} is corrupt");
+                        return Ok(ExitCode::from(128));
+                    }
+                },
+            };
+            if kind == Kind::Blob {
+                break 'traverse;
+            }
+            // An object `parse_object_buffer()` rejected has no links to follow:
+            // `fsck_walk_commit()`/`fsck_walk_tag()` read fields the failed parse
+            // never filled in. The scan above already reported it.
+            let decoded = match decode(&repo, id) {
+                Ok(Ok(d)) => d,
+                // Rejected by `parse_object_buffer()`; the scan above reported it.
+                Ok(Err(_)) => break 'traverse,
+                // Readable a moment ago, unreadable now: treat it as git's
+                // `parse_object()` failure, as above.
+                Err(_) => {
                     let path = loose_object_label(&repo, id)
                         .map(|p| format!(" (stored in {p})"))
                         .unwrap_or_default();
                     eprintln!("fatal: loose object {id}{path} is corrupt");
                     return Ok(ExitCode::from(128));
                 }
-            },
-        };
-        if kind == Kind::Blob {
-            continue;
-        }
-        // An object `parse_object_buffer()` rejected has no links to follow:
-        // `fsck_walk_commit()`/`fsck_walk_tag()` read fields the failed parse
-        // never filled in. The scan above already reported it.
-        let decoded = match decode(&repo, id) {
-            Ok(Ok(d)) => d,
-            // Rejected by `parse_object_buffer()`; the scan above reported it.
-            Ok(Err(_)) => continue,
-            // Readable a moment ago, unreadable now: treat it as git's
-            // `parse_object()` failure, as above.
-            Err(_) => {
-                let path = loose_object_label(&repo, id)
-                    .map(|p| format!(" (stored in {p})"))
-                    .unwrap_or_default();
-                eprintln!("fatal: loose object {id}{path} is corrupt");
-                return Ok(ExitCode::from(128));
+            };
+            // `traverse_one_object()` is another `fsck_walk()`, so a tree whose
+            // entries will not decode complains a second time — once for the scan's
+            // `fsck_obj()` call and once here (builtin/fsck.c:186-195). Only the
+            // scan's copy is followed by `broken links`; `traverse_reachable()`
+            // folds the `-1` into its own return instead of reporting the object.
+            if let Some((line, _)) = &decoded.walk_error {
+                eprintln!("{line}");
             }
-        };
-        // `traverse_one_object()` is another `fsck_walk()`, so a tree whose
-        // entries will not decode complains a second time — once for the scan's
-        // `fsck_obj()` call and once here (builtin/fsck.c:186-195). Only the
-        // scan's copy is followed by `broken links`; `traverse_reachable()`
-        // folds the `-1` into its own return instead of reporting the object.
-        if let Some((line, _)) = &decoded.walk_error {
-            eprintln!("{line}");
-        }
-        // ```c
-        // name = fsck_get_object_name(options, &tree->object.oid);
-        // …
-        // if (name && obj) fsck_put_object_name(options, &entry.oid, "%s%s/", name, entry.path);
-        // ```
-        //
-        // (`fsck_walk_tree`, fsck.c:364-386, and `fsck_walk_commit`/`fsck_walk_tag`,
-        // :413-478.) A child is named only when its parent has a name, which is
-        // why a name spreads out from the head that carries one and no further.
-        // The names are put *before* `options->walk()` runs, so every child of
-        // one object is named before any of them is descended into.
-        let parent_name = names.get(&id).map(str::to_owned);
-        if let Some(parent) = &parent_name {
-            let mut counter = 0usize;
-            for (index, (child, child_kind)) in decoded.children.iter().enumerate() {
-                match kind {
-                    Kind::Tree => {
-                        let path = decoded
-                            .child_paths
-                            .get(index)
-                            .map(|p| String::from_utf8_lossy(p).into_owned())
-                            .unwrap_or_default();
-                        let slash = if *child_kind == Kind::Tree { "/" } else { "" };
-                        names.put(*child, || format!("{parent}{path}{slash}"));
-                    }
-                    // `fsck_walk_commit()`: children[0] is the tree, the rest
-                    // are the parents in order.
-                    Kind::Commit if index == 0 => names.put(*child, || format!("{parent}:")),
-                    Kind::Commit => {
-                        let child = *child;
-                        if counter > 0 {
-                            let n = counter + 1;
-                            names.put(child, || format!("{parent}^{n}"));
-                        } else {
-                            let (generation, prefix_len) = parent_name_suffix(parent);
-                            if generation > 0 {
-                                let n = generation + 1;
-                                names.put(child, || format!("{}~{n}", &parent[..prefix_len]));
-                            } else {
-                                names.put(child, || format!("{parent}^"));
-                            }
+            // ```c
+            // name = fsck_get_object_name(options, &tree->object.oid);
+            // …
+            // if (name && obj) fsck_put_object_name(options, &entry.oid, "%s%s/", name, entry.path);
+            // ```
+            //
+            // (`fsck_walk_tree`, fsck.c:364-386, and `fsck_walk_commit`/`fsck_walk_tag`,
+            // :413-478.) A child is named only when its parent has a name, which is
+            // why a name spreads out from the head that carries one and no further.
+            // The names are put *before* `options->walk()` runs, so every child of
+            // one object is named before any of them is descended into.
+            let parent_name = names.get(&id).map(str::to_owned);
+            if let Some(parent) = &parent_name {
+                let mut counter = 0usize;
+                for (index, (child, child_kind)) in decoded.children.iter().enumerate() {
+                    match kind {
+                        Kind::Tree => {
+                            let path = decoded
+                                .child_paths
+                                .get(index)
+                                .map(|p| String::from_utf8_lossy(p).into_owned())
+                                .unwrap_or_default();
+                            let slash = if *child_kind == Kind::Tree { "/" } else { "" };
+                            names.put(*child, || format!("{parent}{path}{slash}"));
                         }
-                        counter += 1;
+                        // `fsck_walk_commit()`: children[0] is the tree, the rest
+                        // are the parents in order.
+                        Kind::Commit if index == 0 => names.put(*child, || format!("{parent}:")),
+                        Kind::Commit => {
+                            let child = *child;
+                            if counter > 0 {
+                                let n = counter + 1;
+                                names.put(child, || format!("{parent}^{n}"));
+                            } else {
+                                let (generation, prefix_len) = parent_name_suffix(parent);
+                                if generation > 0 {
+                                    let n = generation + 1;
+                                    names.put(child, || format!("{}~{n}", &parent[..prefix_len]));
+                                } else {
+                                    names.put(child, || format!("{parent}^"));
+                                }
+                            }
+                            counter += 1;
+                        }
+                        // `fsck_walk_tag()` hands the tagged object the tag's own name.
+                        Kind::Tag => names.put(*child, || parent.clone()),
+                        Kind::Blob => {}
                     }
-                    // `fsck_walk_tag()` hands the tagged object the tag's own name.
-                    Kind::Tag => names.put(*child, || parent.clone()),
-                    Kind::Blob => {}
                 }
             }
-        }
-        for (child, child_kind) in decoded.children {
-            // `fsck_walk_tree()` resolves every entry through `lookup_tree()` /
-            // `lookup_blob()`, and a lookup moves a displaced object back to its
-            // home slot, so the call has to be replayed here as well as in the
-            // scan. `fsck_walk_commit()` and `fsck_walk_tag()` follow pointers
-            // `parse_object()` already stored and look nothing up, which is why
-            // only a tree's children are recorded.
-            if kind == Kind::Tree {
-                state.note(child);
-            }
-            // A shallow boundary commit has no parents at all as far as the
-            // object graph is concerned: `parse_commit()` applies the graft, so
-            // `fsck_walk_commit()` never sees them and their absence is not a
-            // break in the chain. Its tree is still walked.
-            if child_kind == Kind::Commit && shallow.contains(&id) {
-                continue;
-            }
-            // ```c
-            // if (is_promisor_object(options->repo, &obj->oid))
-            //         /*
-            //          * Further recursion does not need to be performed on this
-            //          * object since it is a promisor object …
-            //          */
-            //         return 0;
-            // ```
-            //
-            // (`mark_object()`, builtin/fsck.c:155-161, after the object has
-            // been marked REACHABLE.) `check_reachable_object()` (:265-267)
-            // likewise says nothing about a promisor object that is missing —
-            // the remote still has it, which is the whole point of the pack that
-            // promised it.
-            // ```c
-            // if (obj->flags & REACHABLE)
-            //         return 0;
-            // obj->flags |= REACHABLE;
-            // ```
-            //
-            // (`mark_object()`, builtin/fsck.c:151-153.) The guard precedes both
-            // the promisor stop and the `HAS_OBJ` test, so however many parents
-            // name one object it is judged — and reported — exactly once.
-            if !state.reachable.insert(child) {
-                continue;
-            }
-            if promisor.contains(&child) {
-                continue;
-            }
-            // A corrupt object never got `HAS_OBJ`, so `check_reachable_object()`
-            // prints `missing` for it with the type the reference site expected.
-            if !has_obj.contains(&child) {
-                // ```c
-                // if (!(obj->flags & HAS_OBJ)) {
-                //         if (parent && !odb_has_object(options->repo->objects, &obj->oid,
-                //                                       ODB_HAS_OBJECT_RECHECK_PACKED)) {
-                //                 printf_ln(_("broken link from %7s %s\n"
-                //                             "              to %7s %s"), …);
-                //                 errors_found |= ERROR_REACHABLE;
-                //         }
-                //         return 1;
-                // }
-                // ```
-                //
-                // (`mark_object()`, builtin/fsck.c:163-175.) `HAS_OBJ` and
-                // `odb_has_object()` part company for exactly one shape: an
-                // object whose file is there but which the scan could not read
-                // or parse. git then prints `missing` without the pair of
-                // `broken link` lines, which is why the odb is asked again here
-                // rather than the `corrupt` set being taken as the answer.
-                if !repo.has_object(child) {
-                    // `%7s` on both type names — `gix`'s `Kind` writes itself
-                    // through `write_str`, which ignores a width, so the padding
-                    // is applied to the rendered name instead.
-                    broken_links.push(format!(
-                        "broken link from {:>7} {}\n              to {:>7} {}",
-                        kind.to_string(),
-                        names.describe(&id),
-                        child_kind.to_string(),
-                        names.describe(&child)
-                    ));
-                    errors |= ERROR_REACHABLE;
+            for (child, child_kind) in decoded.children {
+                // `fsck_walk_tree()` resolves every entry through `lookup_tree()` /
+                // `lookup_blob()`, and a lookup moves a displaced object back to its
+                // home slot, so the call has to be replayed here as well as in the
+                // scan. `fsck_walk_commit()` and `fsck_walk_tag()` follow pointers
+                // `parse_object()` already stored and look nothing up, which is why
+                // only a tree's children are recorded.
+                if kind == Kind::Tree {
+                    state.note(child);
+                }
+                // A shallow boundary commit has no parents at all as far as the
+                // object graph is concerned: `parse_commit()` applies the graft, so
+                // `fsck_walk_commit()` never sees them and their absence is not a
+                // break in the chain. Its tree is still walked.
+                if child_kind == Kind::Commit && shallow.contains(&id) {
+                    continue;
                 }
                 // ```c
-                // if (!(obj->flags & HAS_OBJ)) {
-                //         if (is_promisor_object(repo, &obj->oid)) return;
-                //         if (has_object_pack(repo, &obj->oid))
-                //                 return; /* it is in pack - forget about it */
-                //         printf_ln(_("missing %s %s"), …);
+                // if (is_promisor_object(options->repo, &obj->oid))
+                //         /*
+                //          * Further recursion does not need to be performed on this
+                //          * object since it is a promisor object …
+                //          */
+                //         return 0;
                 // ```
                 //
-                // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
-                // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
-                // there, so the pack is consulted before anything is reported.
-                if !in_pack(&repo, child, &pack_check.bad) {
-                    state.missing.insert(child, child_kind);
+                // (`mark_object()`, builtin/fsck.c:155-161, after the object has
+                // been marked REACHABLE.) `check_reachable_object()` (:265-267)
+                // likewise says nothing about a promisor object that is missing —
+                // the remote still has it, which is the whole point of the pack that
+                // promised it.
+                // ```c
+                // if (obj->flags & REACHABLE)
+                //         return 0;
+                // obj->flags |= REACHABLE;
+                // ```
+                //
+                // (`mark_object()`, builtin/fsck.c:151-153.) The guard precedes both
+                // the promisor stop and the `HAS_OBJ` test, so however many parents
+                // name one object it is judged — and reported — exactly once.
+                if !state.reachable.insert(child) {
+                    continue;
                 }
-                continue;
+                if promisor.contains(&child) {
+                    continue;
+                }
+                // A corrupt object never got `HAS_OBJ`, so `check_reachable_object()`
+                // prints `missing` for it with the type the reference site expected.
+                if !has_obj.contains(&child) {
+                    // ```c
+                    // if (!(obj->flags & HAS_OBJ)) {
+                    //         if (parent && !odb_has_object(options->repo->objects, &obj->oid,
+                    //                                       ODB_HAS_OBJECT_RECHECK_PACKED)) {
+                    //                 printf_ln(_("broken link from %7s %s\n"
+                    //                             "              to %7s %s"), …);
+                    //                 errors_found |= ERROR_REACHABLE;
+                    //         }
+                    //         return 1;
+                    // }
+                    // ```
+                    //
+                    // (`mark_object()`, builtin/fsck.c:163-175.) `HAS_OBJ` and
+                    // `odb_has_object()` part company for exactly one shape: an
+                    // object whose file is there but which the scan could not read
+                    // or parse. git then prints `missing` without the pair of
+                    // `broken link` lines, which is why the odb is asked again here
+                    // rather than the `corrupt` set being taken as the answer.
+                    if !repo.has_object(child) {
+                        // `%7s` on both type names — `gix`'s `Kind` writes itself
+                        // through `write_str`, which ignores a width, so the padding
+                        // is applied to the rendered name instead.
+                        broken_links.push(format!(
+                            "broken link from {:>7} {}\n              to {:>7} {}",
+                            kind.to_string(),
+                            names.describe(&id),
+                            child_kind.to_string(),
+                            names.describe(&child)
+                        ));
+                        errors |= ERROR_REACHABLE;
+                    }
+                    // ```c
+                    // if (!(obj->flags & HAS_OBJ)) {
+                    //         if (is_promisor_object(repo, &obj->oid)) return;
+                    //         if (has_object_pack(repo, &obj->oid))
+                    //                 return; /* it is in pack - forget about it */
+                    //         printf_ln(_("missing %s %s"), …);
+                    // ```
+                    //
+                    // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
+                    // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
+                    // there, so the pack is consulted before anything is reported.
+                    if !in_pack(&repo, child, &pack_check.bad) {
+                        state.missing.insert(child, child_kind);
+                    }
+                    continue;
+                }
+                queue.push((child, Some(child_kind)));
             }
-            queue.push((child, Some(child_kind)));
         }
+        connectivity.tick();
     }
+    connectivity.stop("done");
 
     // ---- 6a. `mark_unreachable_referents()` ---------------------------------
     //
@@ -1492,7 +1504,64 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
     print!("{out}");
 
+    // ```c
+    // if (repo->settings.core_commit_graph) {
+    //         …
+    //         for (source = repo->objects->sources; source; source = source->next) {
+    //                 …
+    //                 strvec_pushl(&commit_graph_verify.args, "commit-graph",
+    //                              "verify", "--object-dir", source->path, NULL);
+    //                 if (show_progress)
+    //                         strvec_push(&commit_graph_verify.args, "--progress");
+    //                 else
+    //                         strvec_push(&commit_graph_verify.args, "--no-progress");
+    //                 if (run_command(&commit_graph_verify))
+    //                         errors_found |= ERROR_COMMIT_GRAPH;
+    //         }
+    // }
+    // ```
+    //
+    // (builtin/fsck.c:985-999, the last step of `cmd_fsck()`.) The child runs for
+    // every source, alternates included, whether or not `--full` scanned them,
+    // and draws its own `Verifying commits in commit graph` meter.
+    if repo.config_snapshot().boolean("core.commitGraph") != Some(false) {
+        for source in odb_sources(&repo) {
+            let source = source.canonicalize().unwrap_or(source);
+            let progress = if show_progress { "--progress" } else { "--no-progress" };
+            let args = [
+                OsStr::new("commit-graph"),
+                OsStr::new("verify"),
+                OsStr::new("--object-dir"),
+                source.as_os_str(),
+                OsStr::new(progress),
+            ];
+            if run_git_cmd(&args) != 0 {
+                errors |= ERROR_COMMIT_GRAPH;
+            }
+        }
+    }
+
     Ok(ExitCode::from(errors))
+}
+
+/// `run_command()` on a `git_cmd = 1` child with every stream inherited, after
+/// `start_command()`'s `fflush(NULL)` (run-command.c:743). The answer is
+/// `wait_or_whine()`'s: the exit status, `-1` when the child could not be
+/// started, and `128 + signo` for one killed by a signal (run-command.c:574-585).
+fn run_git_cmd(args: &[&OsStr]) -> i32 {
+    use std::io::Write;
+    use std::os::unix::process::ExitStatusExt;
+    let Ok(exe) = crate::hosted::git_exe() else {
+        return -1;
+    };
+    let _ = std::io::stdout().flush();
+    crate::cstdio::before_spawn();
+    match std::process::Command::new(exe).args(args).status() {
+        Ok(status) => status
+            .code()
+            .unwrap_or_else(|| status.signal().map_or(-1, |sig| sig + 128)),
+        Err(_) => -1,
+    }
 }
 
 /// The full usage block `parse-options.c` prints for `-h` and after a usage
@@ -3102,9 +3171,11 @@ fn odb_sources(repo: &gix::Repository) -> Vec<PathBuf> {
 /// (:902-911), and `verify_packfile()` draws at each multiple of 1024 of the
 /// running count and once after the pack's last object (pack-check.c:170-178).
 /// Packs are walked in list order, so the intermediate counts depend on it.
-/// `verify_reverse_indices()`' meter is a delayed one (:937-938) that closes
-/// long before its first update tick, so it never draws, and a source with a
-/// multi-pack-index was refused before anything was printed.
+/// `verify_reverse_indices()` follows with or without `--full` (:993-994): a
+/// delayed meter over the source's packs (:933-938), advanced once per pack
+/// (:953). Under the default `GIT_PROGRESS_DELAY` it closes long before its
+/// first update tick and never draws; with `GIT_PROGRESS_DELAY=0` it does. A
+/// source with a multi-pack-index was refused before anything was printed.
 fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, pack_lists: Option<&PackLists>) -> Result<()> {
     use crate::progress::Meter;
 
@@ -3125,41 +3196,65 @@ fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, pack_lists: Optio
         meter.set(256);
         meter.stop("done");
 
-        if !check_full {
-            continue;
+        if check_full {
+            check_objects_progress(repo, &objdir, pack_lists)?;
         }
-        let sizes = match pack_lists {
+
+        // `verify_reverse_indices()`: `packfile_store_get_packs()` counted
+        // for the total, then `display_progress(progress, ++pack_count)` per
+        // pack.
+        let packs = match pack_lists {
             Some(lists) => lists
                 .sources
                 .iter()
                 .find(|(dir, _)| *dir == objdir)
-                .map(|(_, packs)| packs.iter().map(|p| p.index.num_objects() as usize).collect())
-                .unwrap_or_default(),
-            None => {
-                // The list order could not be reconstructed. It only shows in
-                // the counts when the packs differ in size.
-                let sizes = pack_sizes(repo, &objdir);
-                if sizes.windows(2).any(|pair| pair[0] != pair[1]) {
-                    bail!("--progress --full is not ported here: git's \"Checking objects\" meter counts packs in its pack-list order, which could not be reconstructed for this repository");
-                }
-                sizes
-            }
+                .map_or(0, |(_, packs)| packs.len()),
+            None => pack_sizes(repo, &objdir).len(),
         };
-        let mut meter = Meter::counted("Checking objects", sizes.iter().sum(), true);
-        let mut base = 0usize;
-        for n in sizes {
-            // `if (((base_count + i) & 1023) == 0) display_progress(…)` for every
-            // `i` in `0..n`, then `display_progress(progress, base_count + i)`.
-            let mut at = base.next_multiple_of(1024);
-            while at < base + n {
-                meter.set(at);
-                at += 1024;
-            }
-            meter.set(base + n);
-            base += n;
+        let mut meter = Meter::delayed("Verifying reverse pack-indexes", packs, true)?;
+        for nr in 0..packs {
+            meter.set(nr + 1);
         }
         meter.stop("done");
     }
+    Ok(())
+}
+
+/// `verify_packs()`' "Checking objects" meter for one source, under `--full`.
+fn check_objects_progress(repo: &gix::Repository, objdir: &Path, pack_lists: Option<&PackLists>) -> Result<()> {
+    use crate::progress::Meter;
+
+    let sizes = match pack_lists {
+        Some(lists) => lists
+            .sources
+            .iter()
+            .find(|(dir, _)| dir == objdir)
+            .map(|(_, packs)| packs.iter().map(|p| p.index.num_objects() as usize).collect())
+            .unwrap_or_default(),
+        None => {
+            // The list order could not be reconstructed. It only shows in
+            // the counts when the packs differ in size.
+            let sizes = pack_sizes(repo, objdir);
+            if sizes.windows(2).any(|pair| pair[0] != pair[1]) {
+                bail!("--progress --full is not ported here: git's \"Checking objects\" meter counts packs in its pack-list order, which could not be reconstructed for this repository");
+            }
+            sizes
+        }
+    };
+    let mut meter = Meter::counted("Checking objects", sizes.iter().sum(), true);
+    let mut base = 0usize;
+    for n in sizes {
+        // `if (((base_count + i) & 1023) == 0) display_progress(…)` for every
+        // `i` in `0..n`, then `display_progress(progress, base_count + i)`.
+        let mut at = base.next_multiple_of(1024);
+        while at < base + n {
+            meter.set(at);
+            at += 1024;
+        }
+        meter.set(base + n);
+        base += n;
+    }
+    meter.stop("done");
     Ok(())
 }
 

@@ -2344,7 +2344,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             true => super::status::Reference::AmendParent,
             false => super::status::Reference::Commit,
         };
-        match super::status::commit_template_block(
+        if let Err(e) = super::status::commit_template_block(
             reference,
             untracked_arg.as_deref(),
             &comment,
@@ -2352,12 +2352,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // `s->added_cut_line`: the scissors line above this block, which
             // `--cleanup=scissors` already wrote (builtin/commit.c:963, :986).
             cleanup == Cleanup::Scissors,
+            &mut buf,
         ) {
-            Ok(block) => buf.push_str(&block),
-            Err(e) => {
-                std::fs::write(&msg_path, crate::rawarg::to_bytes(&buf))?;
-                return Err(e);
-            }
+            std::fs::write(&msg_path, crate::rawarg::to_bytes(&buf))?;
+            return Err(e);
         }
     }
     std::fs::write(&msg_path, crate::rawarg::to_bytes(&buf))?;

@@ -347,6 +347,12 @@ fn parse_scaled_int(name: &str, raw: &str) -> std::result::Result<i64, ExitCode>
 fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitCode> {
     let mut object_dir = inherited_object_dir;
     let mut shallow = false;
+    // `opts.progress = isatty(2)` ahead of `parse_options()`
+    // (builtin/commit-graph.c:91), so `--[no-]progress` overrides it.
+    let mut progress = {
+        use std::io::IsTerminal;
+        std::io::stderr().is_terminal()
+    };
     let mut end_of_opts = false;
 
     let mut i = 0;
@@ -373,9 +379,8 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
             "--no-object-dir" => object_dir = None,
             "--shallow" => shallow = true,
             "--no-shallow" => shallow = false,
-            // Progress is written to stderr by git and only when forced or on a
-            // tty; nothing is emitted here either way.
-            "--progress" | "--no-progress" => {}
+            "--progress" => progress = true,
+            "--no-progress" => progress = false,
             s if s.starts_with("--object-dir=") => {
                 object_dir = Some(s["--object-dir=".len()..].to_string());
             }
@@ -410,10 +415,21 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
             return Ok(ExitCode::from(1));
         };
         return Ok(match gix::commitgraph::File::at(&tip) {
-            Ok(f) => match f.traverse(|_| Ok(())) {
-                Ok(_) => ExitCode::SUCCESS,
-                Err(e) => error_exit(&e.to_string()),
-            },
+            Ok(f) => {
+                // `COMMIT_GRAPH_VERIFY_SHALLOW` leaves `num_commits_in_base` out of
+                // the meter's total (commit-graph.c:2927-2929).
+                let mut meter = verify_meter(f.num_commits(), progress);
+                let verified = f.traverse(|_| {
+                    meter.tick();
+                    Ok(())
+                });
+                let code = match verified {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(e) => error_exit(&e.to_string()),
+                };
+                meter.stop("done");
+                code
+            }
             Err(e) => error_exit(&e.to_string()),
         });
     }
@@ -423,13 +439,37 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
         Err(e) => return Ok(error_exit(&e.to_string())),
     };
 
-    match graph.verify_integrity(|_| -> Result<(), std::convert::Infallible> { Ok(()) }) {
-        Ok(_) => Ok(ExitCode::SUCCESS),
+    // `g->num_commits + g->num_commits_in_base`: every file of the chain.
+    let mut meter = verify_meter(graph.num_commits(), progress);
+    let verified = graph.verify_integrity(|_| -> Result<(), std::convert::Infallible> {
+        meter.tick();
+        Ok(())
+    });
+    let code = match verified {
+        Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
-            Ok(ExitCode::from(1))
+            ExitCode::from(1)
         }
-    }
+    };
+    // `stop_progress(&progress)` after the per-file loop (commit-graph.c:2945),
+    // so the `, done.` line follows any report the loop printed.
+    meter.stop("done");
+    Ok(code)
+}
+
+/// `verify_commit_graph()`'s meter (commit-graph.c:2924-2935): under
+/// `COMMIT_GRAPH_WRITE_PROGRESS` a `start_progress()` — not a delayed one, so
+/// `GIT_PROGRESS_DELAY` does not hold it back — over `total` commits, advanced
+/// by `display_progress(progress, ++(*seen))` once per commit
+/// `verify_one_commit_graph()` checks against the object database (:2828).
+///
+/// The checks themselves are `gix_commitgraph`'s integrity walk, not
+/// `verify_one_commit_graph()`'s comparison with the object database; it calls
+/// back once per commit of every file it reaches, so a graph that verifies draws
+/// the same `1..=total` counts whichever file the walk visits first.
+fn verify_meter(total: u32, progress: bool) -> crate::progress::Meter {
+    crate::progress::Meter::counted("Verifying commits in commit graph", total as usize, progress)
 }
 
 /// The last entry of a `commit-graph-chain` file, resolved to its `.graph` path.

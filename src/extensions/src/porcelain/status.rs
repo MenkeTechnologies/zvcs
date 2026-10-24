@@ -180,13 +180,18 @@ pub fn status(args: &[String]) -> Result<ExitCode> {
 /// `status_format` is `STATUS_FORMAT_NONE` for the whole of `cmd_commit`
 /// (builtin/commit.c:1810, "Ignore status.short"), which is what `--long` pins
 /// here.
+///
+/// The block is appended to `out` even when the report dies part-way: git's
+/// `s->fp` is a stdio stream, so whatever `wt_status_print()` wrote before the
+/// `die()` reaches `COMMIT_EDITMSG` when `exit()` flushes it.
 pub(crate) fn commit_template_block(
     reference: Reference,
     untracked: Option<&str>,
     comment: &str,
     verbose: u32,
     added_cut_line: bool,
-) -> Result<String> {
+    out: &mut String,
+) -> Result<()> {
     let mut args = vec!["--long".to_string()];
     // `handle_untracked_files_arg()` ran before `prepare_to_commit()`, so the
     // block honors `-u<mode>` exactly as the report on stdout does.
@@ -200,12 +205,13 @@ pub(crate) fn commit_template_block(
         args.push("--verbose".to_string());
     }
     let mut body = String::new();
-    status_report(
+    let report = status_report(
         &args,
         reference,
         Some(Template { comment, out: &mut body, added_cut_line }),
-    )?;
-    Ok(body)
+    );
+    out.push_str(&body);
+    report.map(|_| ())
 }
 
 /// `cut_line` plus `wt_status_append_cut_line()`'s two-line explanation
@@ -299,7 +305,7 @@ pub(crate) fn status_with(args: &[String], reference: Reference) -> Result<ExitC
 fn status_report(
     args: &[String],
     reference: Reference,
-    template: Option<Template<'_>>,
+    mut template: Option<Template<'_>>,
 ) -> Result<ExitCode> {
     let mut short = false;
     let mut porcelain_v2 = false;
@@ -1453,6 +1459,57 @@ fn status_report(
     untracked_paths.sort();
     ignored_paths.sort();
 
+    // git colors the human formats (long and short display) when `color.status`
+    // (or `color.ui`) is on and stdout is a terminal; the porcelain machine format
+    // is never colored.
+    // The editor block joins them: `s->use_color = GIT_COLOR_NEVER` around the
+    // `run_status` that renders it (builtin/commit.c:1023-1026).
+    let colors = super::color::StatusColors::resolve(&repo, porcelain || template.is_some());
+
+    // Neither format asks about tracking without a `s->branch` (wt-status.c:1998,
+    // wt-status.c:2209).
+    let no_branch = matches!(head_state, HeadState::Unknown);
+    // Both printers call `branch_get()` before they ask about the upstream, so a
+    // bad `remote.*` / `branch.*` key dies with the header already in stdio's
+    // buffer, which `die()`'s `exit()` flushes:
+    //   * `wt_shortstatus_print_tracking()` (wt-status.c:2206-2226) after
+    //     `## ` and, for an unborn branch, `No commits yet on `; a detached
+    //     `HEAD` jumps to `conclude` first.
+    //   * `wt_longstatus_print_tracking()` (wt-status.c:1226-1229), reached only
+    //     `if (!s->is_initial)` (wt-status.c:2025) and only for a `refs/heads/`
+    //     branch, after the `On branch <name>` line. The editor block's `s->fp`
+    //     is the stream on `COMMIT_EDITMSG` (builtin/commit.c:911), so there the
+    //     line is left in the block, which the caller writes out as it dies.
+    if short && branch_header && !no_branch && !matches!(head_state, HeadState::Detached { .. }) {
+        let initial = matches!(head_state, HeadState::Unborn(_));
+        let printed: Vec<u8> = if null_term {
+            let mut b = b"## ".to_vec();
+            if initial {
+                b.extend_from_slice(b"No commits yet on ");
+            }
+            b
+        } else {
+            let mut s = colors.paint(Slot::Header, "## ");
+            if initial {
+                s.push_str(&colors.paint(Slot::Header, "No commits yet on "));
+            }
+            s.into_bytes()
+        };
+        branch_get(&repo, &printed)?;
+    } else if !short && !unborn && head_on_local_branch(&repo) {
+        let mut header = long_branch_header(&head_state, &progress, &colors);
+        if let Some(cs) = comment_prefix.as_deref() {
+            header = comment_prefix_body(&header, cs);
+        }
+        match &mut template {
+            Some(t) => {
+                *t.out = header;
+                branch_get(&repo, b"")?;
+            }
+            None => branch_get(&repo, header.as_bytes())?,
+        }
+    }
+
     // `wt_longstatus_print_tracking` times `format_tracking_info`, whose cost is
     // the ahead/behind revision walk — [`tracking_info`] here.
     //
@@ -1462,9 +1519,6 @@ fn status_report(
     // `status.compareBranches` names. Only the format about to be printed is
     // computed, so neither pays for the other's revision walks.
     let ab_t0 = std::time::Instant::now();
-    // Neither format asks about tracking without a `s->branch` (wt-status.c:1998,
-    // wt-status.c:2209).
-    let no_branch = matches!(head_state, HeadState::Unknown);
     let tracking = if unborn || no_branch || !short {
         None
     } else {
@@ -1476,13 +1530,6 @@ fn status_report(
         tracking_comparisons(&repo)?
     };
     let ab_elapsed_ms = ab_t0.elapsed().as_millis() as u64;
-
-    // git colors the human formats (long and short display) when `color.status`
-    // (or `color.ui`) is on and stdout is a terminal; the porcelain machine format
-    // is never colored.
-    // The editor block joins them: `s->use_color = GIT_COLOR_NEVER` around the
-    // `run_status` that renders it (builtin/commit.c:1023-1026).
-    let colors = super::color::StatusColors::resolve(&repo, porcelain || template.is_some());
 
     if short {
         if null_term {
@@ -3649,11 +3696,6 @@ fn uf_was_slow(t0: Option<std::time::Instant>) -> Option<f64> {
     (ms > UF_DELAY_WARNING_IN_MS).then(|| ms as f64 / 1000.0)
 }
 
-/// `branch = branch_get(branch_name)` in `wt_porcelain_v2_print_tracking()`
-/// (wt-status.c:2368): remote.c's `read_config()` parses every `remote.*` and
-/// `branch.*` key, so `-c remote.origin.prune==` dies there. The
-/// `# branch.oid` / `# branch.head` lines are already in stdio's buffer and
-/// `die()`'s `exit()` flushes them, so `printed` goes out before the error.
 /// The `# branch.head` value of `wt_porcelain_v2_print_tracking`: the short
 /// branch name, `(detached)`, or `None` for a NULL `s->branch` — an
 /// unresolvable `HEAD` (wt-status.c:153) — which prints `(unknown)` and skips
@@ -3670,6 +3712,22 @@ fn v2_branch_head(repo: &gix::Repository) -> Option<String> {
     })
 }
 
+/// `skip_prefix(s->branch, "refs/heads/", &branch_name)` in
+/// `wt_longstatus_print_tracking()` (wt-status.c:1226-1228): a `HEAD` that is
+/// detached, or a symref outside `refs/heads/`, returns before `branch_get()`.
+fn head_on_local_branch(repo: &gix::Repository) -> bool {
+    repo.head_name()
+        .ok()
+        .flatten()
+        .is_some_and(|n| n.as_bstr().starts_with(b"refs/heads/"))
+}
+
+/// `branch = branch_get(branch_name)`, which every format's tracking printer
+/// calls (wt-status.c:1229, :2226, :2368): remote.c's `read_config()` parses
+/// every `remote.*` and `branch.*` key, so `-c remote.origin.prune==` dies
+/// there. Whatever the printer wrote before the call is already in stdio's
+/// buffer and `die()`'s `exit()` flushes it, so `printed` goes out before the
+/// error.
 fn branch_get(repo: &gix::Repository, printed: &[u8]) -> Result<()> {
     if let Err(r) = crate::cmd_config::read_remote_config(repo) {
         use std::io::Write;
@@ -4626,6 +4684,53 @@ fn sparse_checkout_state(repo: &gix::Repository) -> Option<Option<u32>> {
     Some(Some((100 - (100 * skipped) / total) as u32))
 }
 
+/// git's long-format branch header (wt_longstatus_print): a leading empty
+/// `header`-slot write, then the prefix — `header` for a real branch, `nobranch`
+/// for detached HEAD — and finally the branch name / detached object name in the
+/// `branch` slot (`WT_STATUS_ONBRANCH`, config `color.status.branch`).
+fn long_branch_header(head_state: &HeadState, progress: &ProgressState, colors: &StatusColors) -> String {
+    let mut out = String::new();
+    match head_state {
+        HeadState::Branch(name) | HeadState::Unborn(name) => {
+            out.push_str(&colors.paint(Slot::Header, ""));
+            out.push_str(&colors.paint(Slot::Header, "On branch "));
+            out.push_str(&colors.paint(Slot::Branch, name));
+            out.push('\n');
+        }
+        HeadState::Detached { from, at } => {
+            out.push_str(&colors.paint(Slot::Header, ""));
+            // A rebase names what it is rebasing onto instead of the detached id:
+            // `wt_longstatus_print` prefers `state.onto` whenever a rebase is in
+            // progress (wt-status.c:1902).
+            let (prefix, name) = if progress.rebase || progress.rebase_interactive {
+                let prefix = if progress.rebase_interactive {
+                    "interactive rebase in progress; onto "
+                } else {
+                    "rebase in progress; onto "
+                };
+                (prefix, progress.onto.as_deref().unwrap_or(""))
+            } else {
+                match from.as_deref() {
+                    // `HEAD detached at ` while `HEAD` still holds what the switch
+                    // put there, `HEAD detached from ` once it has moved on
+                    // (wt-status.c:1908-1913).
+                    Some(name) if *at => ("HEAD detached at ", name),
+                    Some(name) => ("HEAD detached from ", name),
+                    // git prints the whole sentence as the prefix and an empty
+                    // branch name after it (wt-status.c:1914-1917).
+                    None => ("Not currently on any branch.", ""),
+                }
+            };
+            out.push_str(&colors.paint(Slot::Nobranch, prefix));
+            out.push_str(&colors.paint(Slot::Branch, name));
+            out.push('\n');
+        }
+        // `if (s->branch)` (wt-status.c:1998) guards the whole branch line.
+        HeadState::Unknown => {}
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_long(
     head_state: &HeadState,
@@ -4712,48 +4817,7 @@ fn render_long(
     // line is a header write of its own, closed before the per-file slot opens.
     let tab = || colors.paint(Slot::Header, "\t");
 
-    // git's long-format branch header (wt_longstatus_print): a leading empty
-    // `header`-slot write, then the prefix — `header` for a real branch, `nobranch`
-    // for detached HEAD — and finally the branch name / detached object name in the
-    // `branch` slot (`WT_STATUS_ONBRANCH`, config `color.status.branch`).
-    match head_state {
-        HeadState::Branch(name) | HeadState::Unborn(name) => {
-            out.push_str(&colors.paint(Slot::Header, ""));
-            out.push_str(&colors.paint(Slot::Header, "On branch "));
-            out.push_str(&colors.paint(Slot::Branch, name));
-            out.push('\n');
-        }
-        HeadState::Detached { from, at } => {
-            out.push_str(&colors.paint(Slot::Header, ""));
-            // A rebase names what it is rebasing onto instead of the detached id:
-            // `wt_longstatus_print` prefers `state.onto` whenever a rebase is in
-            // progress (wt-status.c:1902).
-            let (prefix, name) = if progress.rebase || progress.rebase_interactive {
-                let prefix = if progress.rebase_interactive {
-                    "interactive rebase in progress; onto "
-                } else {
-                    "rebase in progress; onto "
-                };
-                (prefix, progress.onto.as_deref().unwrap_or(""))
-            } else {
-                match from.as_deref() {
-                    // `HEAD detached at ` while `HEAD` still holds what the switch
-                    // put there, `HEAD detached from ` once it has moved on
-                    // (wt-status.c:1908-1913).
-                    Some(name) if *at => ("HEAD detached at ", name),
-                    Some(name) => ("HEAD detached from ", name),
-                    // git prints the whole sentence as the prefix and an empty
-                    // branch name after it (wt-status.c:1914-1917).
-                    None => ("Not currently on any branch.", ""),
-                }
-            };
-            out.push_str(&colors.paint(Slot::Nobranch, prefix));
-            out.push_str(&colors.paint(Slot::Branch, name));
-            out.push('\n');
-        }
-        // `if (s->branch)` (wt-status.c:1998) guards the whole branch line.
-        HeadState::Unknown => {}
-    }
+    out.push_str(&long_branch_header(head_state, progress, colors));
 
     // git prints a blank line after the tracking block and after each
     // in-progress-operation block; a plain branch/detached header runs straight

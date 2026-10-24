@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Read as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -43,6 +44,9 @@ pub fn stock_subcommands() -> Result<Vec<String>> {
     Ok(cmds)
 }
 
+/// Ceiling for one dispatch probe; a verb that serves instead of exiting is killed at it.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Probe which subcommands zvcs dispatches, by invoking each and reading the
 /// refusal. Empirical by design — the alternative is trusting a list that
 /// nothing verifies.
@@ -51,9 +55,38 @@ pub fn dispatched(zvcs_bin: &Path, home: &Path, cmds: &[String], probe_dir: &Pat
     for cmd in cmds {
         let mut c = Command::new(zvcs_bin);
         env::harden(&mut c, home);
-        c.current_dir(probe_dir).arg(cmd);
-        let Ok(res) = c.output() else { continue };
-        let stderr = String::from_utf8_lossy(&res.stderr);
+        c.current_dir(probe_dir)
+            .arg(cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let Ok(mut child) = c.spawn() else { continue };
+        let start = Instant::now();
+        let exited = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if start.elapsed() < PROBE_TIMEOUT => std::thread::sleep(Duration::from_millis(5)),
+                _ => break false,
+            }
+        };
+        if !exited {
+            // A verb that serves (`daemon`) never exits on its own. It was running,
+            // so its dispatch arm exists; kill the group so no server outlives the probe.
+            // SAFETY: `kill` takes no memory from this process; the pid is the
+            // unreaped child's own group.
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            out.push(cmd.clone());
+            continue;
+        }
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
         // Only the dispatch-table miss means "absent". Any other outcome —
         // success, a usage error, an unsupported *flag* — means the arm exists.
         if !stderr.contains("not yet ported") {

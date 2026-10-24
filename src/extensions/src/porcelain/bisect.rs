@@ -2850,6 +2850,14 @@ fn get_oid(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
             return Some(id);
         }
     }
+    // `get_oid_1()` has a case for `~<n>`, `^<n>`, `^{...}` and the basic name
+    // and nothing else (object-name.c:1093-1131): the `^!`, `^@` and `^-<n>`
+    // marks belong to `handle_revision_arg_1()` and never resolve here, so
+    // `git bisect good HEAD^!` is `Bad rev input: HEAD^!` in stock 2.56.0,
+    // where gitoxide's wider grammar would hand back `HEAD`.
+    if crate::objname::has_walk_mark(spec) {
+        return None;
+    }
     repo.rev_parse_single(spec).ok().map(|id| id.detach())
 }
 

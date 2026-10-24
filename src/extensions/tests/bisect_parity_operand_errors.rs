@@ -80,3 +80,29 @@ fn operands_that_are_not_commits_die_and_unknown_ones_fail() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `get_oid_1()` has no case for the revision-walk marks `^!`, `^@` and
+/// `^-<n>` (object-name.c:1093-1131), so `repo_get_oid()` refuses them and
+/// `bisect_state()` answers `Bad rev input` without writing a ref; gitoxide's
+/// wider grammar resolved `HEAD^!` to `HEAD` and marked it good.
+#[test]
+fn walk_marks_are_not_object_names() {
+    let root = std::env::temp_dir().join(format!("zvcs-bisect-walk-marks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    for n in ["1", "2"] {
+        std::fs::write(root.join("f"), n).unwrap();
+        git(&root, &["add", "f"]);
+        git(&root, &["commit", "-q", "-m", n]);
+    }
+    assert_eq!(git(&root, &["bisect", "start"]).2, 0);
+    for spec in ["HEAD^!", "HEAD^@", "HEAD^-1"] {
+        assert_eq!(
+            git(&root, &["bisect", "good", spec]),
+            (String::new(), format!("error: Bad rev input: {spec}\n"), 1)
+        );
+    }
+    assert_eq!(git(&root, &["for-each-ref", "refs/bisect"]).0, "");
+    let _ = std::fs::remove_dir_all(&root);
+}

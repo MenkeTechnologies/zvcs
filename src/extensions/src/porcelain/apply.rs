@@ -1338,8 +1338,13 @@ pub fn apply(args: &[String]) -> Result<ExitCode> {
         // then the machine-readable --numstat records, then the --summary lines — and
         // it prints them *last* (apply.c:4993-5000), after the check and the write.
         // Every earlier failure reaches them through a `goto end` that skips them, so
-        // a patch that does not apply produces no report at all.
+        // a patch that does not apply produces no report at all. Each of the three is
+        // also gated on `state->apply_verbosity > verbosity_silent` (apply.c:5007-5014),
+        // so `-q` silences the reports along with the diagnostics.
         let reports = |patches: &[Patch]| {
+            if o.quiet() {
+                return;
+            }
             if o.stat {
                 print!("{}", render_stat(patches));
             }

@@ -742,8 +742,23 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
     // and after `--negotiate-only`'s, and a `.gitmodules` the config parser refuses ends the
     // command there, before FETCH_HEAD is touched.
     if !opts.negotiate_only && from_config != Some(Recurse::No) {
-        if let Some(message) = repo.workdir().and_then(crate::config::gitmodules_bad_line) {
-            return Err(crate::fatal::die(message));
+        if let Some(work_tree) = repo.workdir() {
+            if let Some(message) = crate::config::gitmodules_bad_line(work_tree) {
+                return Err(crate::fatal::die(message));
+            }
+            // ```c
+            // if (file_exists(file)) {
+            //         config_source.file = file;
+            // } else if (repo_get_oid(repo, GITMODULES_INDEX, &oid) >= 0 ||
+            // ```
+            //
+            // (submodule-config.c:800-802.) Without a worktree `.gitmodules`, `:.gitmodules`
+            // is looked up in the index, so the index is read here, ahead of every ref and
+            // the network, and an index git cannot decode ends the fetch in
+            // `do_read_index()`'s `die()`. A missing index reads as empty.
+            if std::fs::symlink_metadata(work_tree.join(".gitmodules")).is_err() {
+                repo.index_or_empty()?;
+            }
         }
     }
     let resolved_recurse = if opts.negotiate_only || opts.porcelain { Some(Recurse::No) } else { from_config };

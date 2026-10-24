@@ -181,10 +181,11 @@ const ERROR_REFS: u8 = 8;
 ///    write wins, so the order the head sites run in is what decides the name.
 ///    Only `fsck_resolve_undo()`'s `:(<stage>):<path>` is missing, because the
 ///    index's resolve-undo extension is not a head source here at all.
-/// 7. **`--cache` does not verify the index itself.** git also turns on
-///    `verify_index_checksum` and `verify_ce_order`; `gix-index` does not expose
-///    either. The head-node half of the flag — index entries and cache-tree ids
-///    become heads — is what is implemented.
+/// 7. **The index's entry order is not verified.** git turns on
+///    `verify_index_checksum` and `verify_ce_order` before reading each index;
+///    the header and checksum half is ported (`verify_index_hdr()`), the
+///    entry-order half is not, as `gix-index` does not expose it. Index entries
+///    and cache-tree ids become heads as in git.
 /// 8. **`broken link from`/`to` is ported; its NULL-object form is not.**
 ///    `mark_object()` has two ways of reporting a link it cannot follow
 ///    (builtin/fsck.c:135-175). The one this port reproduces is the pair
@@ -2112,6 +2113,18 @@ fn collect_default_heads(
     // References, taking each ref's direct target rather than its fully peeled
     // one, so an annotated tag object counts as reachable in its own right.
     for reference in repo.references()?.all()? {
+        // `snapshot_refs()` ignores what `refs_for_each_ref_ext()` returns
+        // (builtin/fsck.c:613-614), so a reftable iterator that fails — every read of a
+        // stack that would not open reports `refs->err` (refs/reftable-backend.c:824-842)
+        // — just ends the walk with no refs taken.
+        if let Err(err) = &reference {
+            if matches!(
+                err.downcast_ref::<gix::refs::file::iter::loose_then_packed::Error>(),
+                Some(gix::refs::file::iter::loose_then_packed::Error::Reftable(_))
+            ) {
+                break;
+            }
+        }
         // The iterator yields a boxed error, which anyhow cannot convert via `?`.
         let reference = reference.map_err(|e| anyhow::anyhow!(e))?;
         // Bind the direct target first so the borrow of `reference` ends before
@@ -2181,7 +2194,20 @@ fn collect_reflog_heads(
         .map_or(0, |d| d.as_secs());
     let mut errors = 0u8;
     for wt in super::prune::get_worktrees(repo) {
-        for log_name in wt.reflog_names(repo)? {
+        // What `refs_for_each_reflog()` returns is ignored as well (:672-673): a
+        // reftable stack that would not open lists no reflogs, and nothing is said.
+        let log_names = match wt.reflog_names(repo) {
+            Err(err)
+                if matches!(
+                    err.downcast_ref::<gix::repository::reftable::Error>(),
+                    Some(gix::repository::reftable::Error::Backend(_))
+                ) =>
+            {
+                Vec::new()
+            }
+            other => other?,
+        };
+        for log_name in log_names {
             let name = wt.ref_name(log_name.as_ref()).to_string();
             crate::refstore::for_each_reflog_entry(repo, &name, false, |entry| {
                 if now != 0 && entry.timestamp > now {
@@ -2243,6 +2269,7 @@ fn collect_index_heads(
     label: Option<&str>,
     verbose: bool,
 ) -> anyhow::Result<u8> {
+    verify_index_hdr(repo, &label.map_or_else(|| index_path_label(repo), str::to_owned))?;
     let Ok(index) = repo.index_or_empty() else {
         return Ok(0);
     };
@@ -2276,6 +2303,62 @@ fn collect_index_heads(
         return collect_cache_tree(repo, tree, state, heads, names, &path, verbose);
     }
     Ok(0)
+}
+
+/// The header checks `read_index_from()` makes before it decodes a single entry,
+/// with `verify_index_checksum` on, as `cmd_fsck()` sets it (builtin/fsck.c:955)
+/// before reading each worktree's index.
+///
+/// ```c
+/// if (mmap_size < sizeof(struct cache_header) + the_hash_algo->rawsz)
+///         die(_("%s: index file smaller than expected"), path);
+/// ...
+/// if (verify_hdr(hdr, mmap_size) < 0)
+///         goto unmap;
+/// ...
+/// unmap:
+///         munmap((void *)mmap, mmap_size);
+///         die(_("index file corrupt"));
+/// ```
+///
+/// (`do_read_index()`, read-cache.c:2244-2255 and :2345-2347; `verify_hdr()` at
+/// :1715-1743.) The trailer is checked with the repository's hash over everything
+/// before it, and a null trailer — `index.skipHash` — is accepted unchecked. A
+/// missing index is no index (`must_exist` is 0); any other failure to read it is
+/// left to the decode that follows.
+fn verify_index_hdr(repo: &gix::Repository, path: &str) -> anyhow::Result<()> {
+    let Ok(data) = std::fs::read(repo.index_path()) else {
+        return Ok(());
+    };
+    let hash = repo.object_hash();
+    let rawsz = hash.len_in_bytes();
+    if data.len() < 12 + rawsz {
+        return Err(crate::fatal::die(format!("{path}: index file smaller than expected")));
+    }
+    let corrupt = |message: String| {
+        eprintln!("error: {message}");
+        Err(crate::fatal::die("index file corrupt"))
+    };
+    // `hdr->hdr_signature` is printed as read, without `ntohl()`.
+    let signature: [u8; 4] = data[..4].try_into().expect("length checked above");
+    if &signature != b"DIRC" {
+        return corrupt(format!("bad signature 0x{:08x}", u32::from_ne_bytes(signature)));
+    }
+    // `INDEX_FORMAT_LB` and `INDEX_FORMAT_UB` (read-cache-ll.h).
+    let version = i32::from_be_bytes(data[4..8].try_into().expect("length checked above"));
+    if !(2..=4).contains(&version) {
+        return corrupt(format!("bad index version {version}"));
+    }
+    let (body, trailer) = data.split_at(data.len() - rawsz);
+    if trailer.iter().all(|b| *b == 0) {
+        return Ok(());
+    }
+    let mut hasher = gix::hash::hasher(hash);
+    hasher.update(body);
+    if hasher.try_finalize()?.as_slice() != trailer {
+        return corrupt("bad index file sha1 signature".into());
+    }
+    Ok(())
 }
 
 /// The index path as `fsck_index()` names it — git runs from the top of the

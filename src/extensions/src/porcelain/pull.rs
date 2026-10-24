@@ -895,7 +895,13 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
     // `receive-pack` already do here.
     crate::ensure_reflog_identity(&mut repo);
     let repo = repo;
-    let head_name = repo.head_name()?;
+    // `current_branch` comes from `refs_resolve_ref_unsafe("HEAD", 0, NULL, &flag)`
+    // (remote.c:645-654), which leaves it NULL when `HEAD` does not resolve at all — as
+    // under a reftable stack that failed to open — and the pull goes on without a branch.
+    let head_name = match repo.head_name() {
+        Err(gix::reference::find::existing::Error::NotFound { .. }) => None,
+        other => other?,
+    };
     let branch_short = head_name.as_ref().map(|h| h.shorten().to_string());
 
     // `config_get_ff()` (builtin/pull.c:171-190) runs before the integration
@@ -1568,10 +1574,11 @@ pub fn pull(args: &[String]) -> Result<ExitCode> {
 /// unfinished merge. Both exit 128.
 fn refuse_unfinished_merge(repo: &gix::Repository) -> Result<Option<ExitCode>> {
     let snap = repo.config_snapshot();
-    let unmerged = repo.open_index().map(|index| {
-        index.entries().iter().any(|e| e.stage_raw() != 0)
-    });
-    if unmerged.unwrap_or(false) {
+    // `repo_read_index_unmerged()` reads through `do_read_index()`, which takes a missing
+    // index as empty and `die()`s on one it cannot read (read-cache.c:2245, :2347), ahead
+    // of both refusals — so the failure is let out, and `run_command` words it as git does.
+    let unmerged = repo.index_or_empty()?.entries().iter().any(|e| e.stage_raw() != 0);
+    if unmerged {
         eprintln!("error: Pulling is not possible because you have unmerged files.");
         if snap.boolean("advice.resolveConflict") != Some(false) {
             eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");

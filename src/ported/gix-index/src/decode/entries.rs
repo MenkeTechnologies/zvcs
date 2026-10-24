@@ -111,7 +111,10 @@ pub fn chunk<'a>(
             has_delta_paths,
             prev_path,
         )
-        .ok_or(decode::Error::Entry { index: idx })?;
+        .ok_or_else(|| match unknown_extended_flags(data, object_hash.len_in_bytes()) {
+            Some(extended_flags) => decode::Error::UnknownEntryFormat { extended_flags },
+            None => decode::Error::Entry { index: idx },
+        })?;
 
         data = remaining;
         is_sparse |= entry.mode.is_sparse();
@@ -204,6 +207,35 @@ pub fn chunk_over_mmap_tail(
         }
     }
     Ok((outcome, padded.len() - remaining.len()))
+}
+
+/// The second flags word of the entry at the start of `data`, already shifted into the
+/// upper half, if the entry declares `CE_EXTENDED` and that word carries a bit outside
+/// `CE_EXTENDED_FLAGS` — the one entry `create_from_disk()` dies on:
+///
+/// ```c
+/// if (flags & CE_EXTENDED) {
+///     int extended_flags;
+///     extended_flags = get_be16(flagsp + sizeof(uint16_t)) << 16;
+///     /* We do not yet understand any bit out of CE_EXTENDED_FLAGS */
+///     if (extended_flags & ~CE_EXTENDED_FLAGS)
+///         die(_("unknown index entry format 0x%08x"), extended_flags);
+/// ```
+///
+/// (read-cache.c:1821-1826). `flagsp` is the stat data plus the object id of the
+/// repository's width (:1805), which is how a SHA-1 index read as SHA-256 lands its
+/// flags twelve bytes late, in the next entry's stat data or a path. [`load_one()`] rejects
+/// the same word, so this only tells its `None` apart.
+fn unknown_extended_flags(data: &[u8], hash_len: usize) -> Option<u32> {
+    let flagsp = data.get(40 + hash_len..)?;
+    let (flags, flagsp) = read_u16(flagsp)?;
+    if !entry::at_rest::Flags::from_bits_retain(flags).contains(entry::at_rest::Flags::EXTENDED) {
+        return None;
+    }
+    let (extended_flags, _) = read_u16(flagsp)?;
+    entry::at_rest::FlagsExtended::from_bits(extended_flags)
+        .is_none()
+        .then_some(u32::from(extended_flags) << 16)
 }
 
 /// Note that `prev_path` is only useful if the version is V4

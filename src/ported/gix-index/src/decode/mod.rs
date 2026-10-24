@@ -22,6 +22,10 @@ mod error {
         OutOfMemory,
         #[error("Could not parse entry at index {index}")]
         Entry { index: u32 },
+        /// `create_from_disk()`'s `die()` on an extended flag it does not know
+        /// (read-cache.c:1826), worded as git words it.
+        #[error("unknown index entry format 0x{extended_flags:08x}")]
+        UnknownEntryFormat { extended_flags: u32 },
         #[error("Mandatory extension wasn't implemented or malformed.")]
         Extension(#[from] extension::decode::Error),
         #[error("Index trailer should have been {expected} bytes long, but was {actual}")]
@@ -228,7 +232,7 @@ impl State {
                 let entries = match entries_res {
                     Ok((entries, _)) => entries,
                     Err(strict @ Error::Entry { .. }) => {
-                        entries_over_mmap_tail(post_header_data, data_len, num_entries, object_hash, version)
+                        entries_over_mmap_tail(post_header_data, data_len, num_entries, object_hash, version)?
                             .ok_or(strict)?
                             .0
                     }
@@ -253,11 +257,12 @@ impl State {
                 // final page (read-cache.c:1877). Only try that once the strict pass
                 // has already said the entries do not fit, so a well-formed index
                 // never pays for the copy, and keep the strict error when the second
-                // pass fails for a reason the zero fill cannot explain — an unknown
-                // extended flag, say, which git dies on too (read-cache.c:1812).
+                // pass fails for a reason the zero fill cannot explain. An unknown
+                // extended flag the second pass reaches is git's own `die()`
+                // (read-cache.c:1826), so that error wins over the strict one.
                 Err(strict @ Error::Entry { .. }) => {
                     let Some((outcome, consumed)) =
-                        entries_over_mmap_tail(post_header_data, data_len, num_entries, object_hash, version)
+                        entries_over_mmap_tail(post_header_data, data_len, num_entries, object_hash, version)?
                     else {
                         return Err(strict);
                     };
@@ -350,19 +355,20 @@ fn vec_with_capacity<T>(capacity: usize) -> Result<Vec<T>, Error> {
 /// this normally does not. Also returns how many bytes of `post_header_data` were consumed,
 /// which is where git would look for the extensions.
 ///
-/// `None` when the second pass fails as well, which means the failure was never about
-/// running out of file: an unknown extended flag, say, which git dies on too
-/// (read-cache.c:1812). The caller reports the error the strict pass produced.
+/// `Ok(None)` when the second pass fails as well for a reason the zero fill cannot explain;
+/// the caller then reports the error the strict pass produced. An unknown extended flag
+/// met on the way is the exception: git reads that far too and dies on it
+/// (read-cache.c:1826), so that error is the one returned.
 fn entries_over_mmap_tail(
     post_header_data: &[u8],
     file_len: usize,
     num_entries: u32,
     object_hash: gix_hash::Kind,
     version: Version,
-) -> Option<(EntriesOutcome, usize)> {
+) -> Result<Option<(EntriesOutcome, usize)>, Error> {
     let mut entries = Vec::new();
     let mut path_backing = Vec::new();
-    let (entries::Outcome { is_sparse }, consumed) = entries::chunk_over_mmap_tail(
+    let (entries::Outcome { is_sparse }, consumed) = match entries::chunk_over_mmap_tail(
         post_header_data,
         file_len,
         &mut entries,
@@ -370,16 +376,19 @@ fn entries_over_mmap_tail(
         num_entries,
         object_hash,
         version,
-    )
-    .ok()?;
-    Some((
+    ) {
+        Ok(outcome) => outcome,
+        Err(err @ Error::UnknownEntryFormat { .. }) => return Err(err),
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((
         EntriesOutcome {
             entries,
             path_backing,
             is_sparse,
         },
         consumed,
-    ))
+    )))
 }
 
 fn entries(

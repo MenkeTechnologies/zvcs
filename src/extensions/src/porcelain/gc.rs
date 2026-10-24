@@ -649,6 +649,18 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // worktree prune, then rerere gc, then commit-graph write. The first two are
     // `gc_foreground_tasks()`, skipped under `--skip-foreground-tasks`
     // (`if (opts.detach <= 0 && !skip_foreground_tasks)`, builtin/gc.c:1012).
+    //
+    // ```c
+    // if (cfg->pack_refs && maintenance_task_pack_refs(opts, cfg))
+    //         return error(FAILED_RUN, "pack-refs");
+    // if (cfg->prune_reflogs && maintenance_task_reflog_expire(opts, cfg))
+    // ```
+    //
+    // (`gc_foreground_tasks()`, builtin/gc.c:535-543.) A failed `pack-refs` child — one
+    // whose reftable stack will not open exits with the bare error code and says
+    // nothing — is one `error:` line, and the early return skips `reflog expire`;
+    // `cmd_gc()` ignores the result and goes on (:715-716).
+    let mut pack_refs_failed = false;
     if !skip_foreground_tasks && pack_refs_enabled(&repo) {
         // `maintenance_task_pack_refs()` (builtin/gc.c:168-175) runs
         // `pack-refs --all --prune`, and an *automatic* run adds `--auto` on top
@@ -672,7 +684,10 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
         if auto {
             argv.push("--auto".to_string());
         }
-        super::pack_refs::pack_refs(&argv)?;
+        if super::pack_refs::pack_refs(&argv)? != ExitCode::SUCCESS {
+            eprintln!("error: failed to run pack-refs");
+            pack_refs_failed = true;
+        }
     }
 
     // Re-discovered because `pack-refs` rewrote the ref store underneath the
@@ -683,7 +698,7 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // expired entry no longer keeps its object alive. Skipped only when both
     // `gc.reflogExpire` and `gc.reflogExpireUnreachable` are `never`, exactly as
     // git's `cfg->prune_reflogs` gate.
-    if !skip_foreground_tasks && reflog_expire_enabled(&repo) {
+    if !skip_foreground_tasks && !pack_refs_failed && reflog_expire_enabled(&repo) {
         // `gc_foreground_tasks()` (builtin/gc.c): a `reflog expire` child that fails is reported
         // as `error: failed to run reflog` and the run carries on with the other tasks; it
         // does not end `gc`. The child's own diagnostics come first — a configured expiry it
@@ -796,7 +811,11 @@ pub fn gc(args: &[String]) -> Result<ExitCode> {
     // `gc`'s own. An error that is neither of git's two shapes is this port
     // speaking for itself and is left to the caller to render as such.
     if let Err(err) = super::repack::repack(&argv) {
+        // An index the `pack-objects` grandchild cannot decode for `--indexed-objects`
+        // is `do_read_index()`'s `die()` in that child (read-cache.c:1826).
+        let index_fatal = crate::fatal::index_entry_format_fatal(&err);
         match err.downcast_ref::<crate::fatal::Fatal>() {
+            _ if index_fatal.is_some() => eprintln!("fatal: {}", index_fatal.expect("checked")),
             Some(fatal) => eprintln!("fatal: {fatal}"),
             None if err.downcast_ref::<crate::fatal::Silent>().is_none() => return Err(err),
             None => {}

@@ -231,13 +231,11 @@ pub fn discovery_fatal(err: &anyhow::Error) -> Option<String> {
 /// — the exit codes are the same in both, so this is the general condition and
 /// not a property of the mislabelled-hash fixture.
 ///
-/// **Only the exit code is borrowed, never the sentence.** git's index message
-/// carries four bytes of stat data read back as a format word
-/// (`0xb17b0000` on one run of this fixture, a different value on the next) and
-/// the port's carries a rolling hash, so neither side has a reproducible string
-/// and this port must not invent one in git's voice. The caller therefore keeps
-/// the port's own `zvcs: <verb>: …` diagnostic and changes only the status,
-/// which is the part a caller branches on.
+/// **Only the exit code is borrowed here, never the sentence.** The caller keeps
+/// the port's own `zvcs: <verb>: …` diagnostic and changes only the status, which
+/// is the part a caller branches on. The one index sentence this port can say in
+/// git's words — because it computes the same word from the same bytes — is
+/// [`index_entry_format_fatal`], which `run_command` tries first.
 pub fn unreadable_repository_data(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         // The index. `gix::worktree::open_index::Error` is the wrapper every
@@ -274,6 +272,47 @@ pub fn unreadable_repository_data(err: &anyhow::Error) -> bool {
             return matches!(err, gix::refs::file::loose::reference::decode::Error::Parse { .. });
         }
         false
+    })
+}
+
+/// git's `unknown index entry format 0x%08x` if `err` carries the index entry
+/// `create_from_disk()` dies on (read-cache.c:1821-1826): one declaring
+/// `CE_EXTENDED` whose second flags word has a bit outside `CE_EXTENDED_FLAGS`.
+///
+/// The word is whatever two bytes sit where the entry's flags are expected. In a
+/// SHA-1 index read as SHA-256 (`extensions.objectFormat = sha256` over a SHA-1
+/// store) that is twelve bytes late, inside the next entry's stat data, so the
+/// value changes whenever the index is rewritten — but it is a function of the
+/// file's bytes, and `gix_index` reads the same two bytes git does, so the
+/// sentence is git's for the same index.
+///
+/// Like every arm of `do_read_index()` this is a `die()`, below every command, so
+/// it is wired in `run_command` rather than in the verbs that met it first. The
+/// decode error is the leaf of a chain of `#[error(transparent)]` wrappers, whose
+/// `source()` skips straight past it, so each wrapper that can carry it is opened.
+pub fn index_entry_format_fatal(err: &anyhow::Error) -> Option<String> {
+    use gix::index::{decode::Error as Decode, file::init::Error as Init};
+    use gix::worktree::open_index::Error as OpenIndex;
+    fn unknown(err: &Decode) -> Option<String> {
+        matches!(err, Decode::UnknownEntryFormat { .. }).then(|| err.to_string())
+    }
+    fn from_init(err: &Init) -> Option<String> {
+        match err {
+            Init::Decode(err) => unknown(err),
+            _ => None,
+        }
+    }
+    err.chain().find_map(|cause| {
+        if let Some(err) = cause.downcast_ref::<OpenIndex>() {
+            return match err {
+                OpenIndex::IndexFile(err) => from_init(err),
+                _ => None,
+            };
+        }
+        if let Some(err) = cause.downcast_ref::<Init>() {
+            return from_init(err);
+        }
+        cause.downcast_ref::<Decode>().and_then(unknown)
     })
 }
 

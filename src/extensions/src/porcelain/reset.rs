@@ -1483,7 +1483,7 @@ pub(super) fn carry_skip_worktree(old: &gix::index::File, new_index: &mut gix::i
 /// the entry from the tree instead leaves a zeroed stat, which matches no file, so every
 /// tracked path gets re-materialised — normally invisible, and very visible when
 /// `refs/replace/` maps the entry's blob elsewhere.
-fn carry_stat_of_unchanged(old: &gix::index::File, new_index: &mut gix::index::File) {
+pub(super) fn carry_stat_of_unchanged(old: &gix::index::File, new_index: &mut gix::index::File) {
     use gix::index::entry::Stage;
 
     let carried: HashMap<BString, (ObjectId, gix::index::entry::Mode, gix::index::entry::Stat)> = {

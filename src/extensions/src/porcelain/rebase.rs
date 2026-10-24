@@ -1535,6 +1535,11 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
         Some(s) if s == "-" => "@{-1}".to_string(),
         Some(s) => s.clone(),
         None => {
+            // `branch = branch_get(NULL)` (builtin/rebase.c:1654) runs remote.c's
+            // `read_config()`, whose `handle_config()` parses every `remote.*`
+            // and `branch.*` key: `remote.origin.prune==` dies with
+            // `bad boolean config value` before any upstream is looked up.
+            crate::cmd_config::read_remote_config(&repo).map_err(|r| r.into_error())?;
             let tracking = branch.as_ref().and_then(|b| {
                 repo.branch_remote_tracking_ref_name(b.as_ref(), gix::remote::Direction::Fetch)
             });
@@ -3904,6 +3909,12 @@ fn restore_worktree_to_tree(
         .ok_or_else(|| anyhow!("bare repository has no worktree to restore"))?
         .to_owned();
     let mut new_index = repo.index_from_tree(&tree)?;
+    // `reset_head()` with `RESET_HEAD_HARD` (reset.c) unpacks with `oneway_merge`
+    // and `o.reset`, whose `same(old, a)` arm (unpack-trees.c:3036-3048) re-adds
+    // the old entry, stat and all: a file whose stat still matches is not
+    // rewritten, so a `core.autocrlf` flipped since it was checked out leaves
+    // its LF bytes alone.
+    super::reset::carry_stat_of_unchanged(old, &mut new_index);
     let mut opts =
         repo.checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)?;
     opts.destination_is_initially_empty = false;

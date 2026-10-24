@@ -10,9 +10,12 @@
 //! Covered:
 //!   * `-r`/`--recursive` (and `--no-recursive`), `-t`/`--show-trees`
 //!     (and `--no-show-trees`), `--max-depth=<n>` / `--max-depth <n>`, `-z`
-//!   * an optional `<revision-range>` of `A..B` and `^X` operands (defaults to
-//!     `HEAD`): the excluded side seeds the `--not` queue and paths that reach it
-//!     are emitted against the `^`-prefixed boundary commit
+//!   * an optional `<revision-range>` (defaults to `HEAD`) of `A..B`, `A...B` (the merge
+//!     bases excluded), `^X`, `X^@`, `X^!` and `X^-[<n>]` operands, with `--not` and
+//!     `--all` among them: the excluded side seeds the `--not` queue and paths that
+//!     reach it are emitted against the `^`-prefixed boundary commit
+//!   * `-n`/`--max-count` and the rest of `handle_revision_opt()`'s count-and-age arm:
+//!     each commit popped past the limit is a boundary as well
 //!   * literal `[--] <pathspec>...`, prefixed with the repo-relative cwd like
 //!     git does, with git's exact depth rule (`tree-diff.c:check_recursion_depth`)
 //!   * C-style path quoting (`core.quotePath`) for the newline-terminated form
@@ -22,7 +25,6 @@
 //!     and `last-modified can only operate on one commit at a time`
 //!
 //! Not covered — these `bail!` rather than emit output that would diverge:
-//!   * `A...B`, `X^@`, `X^!`, `X^-`, `--not`, `--all` and `-n`
 //!   * pathspec magic (`:(...)`)
 
 use anyhow::Result;
@@ -153,20 +155,21 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     let mut max_depth: i32 = 0;
     let mut show_trees = false;
     let mut nul = false;
-    // `(argument, appeared after `--`)`. `PARSE_OPT_KEEP_DASHDASH` makes
-    // `parse_options` stop at `--`, so nothing past it is read as an option.
-    let mut positionals: Vec<(&str, bool)> = Vec::new();
-    let mut only_paths = false;
-    // `PARSE_OPT_KEEP_UNKNOWN_OPT`: unrecognised options survive option parsing
-    // and are reported by `last_modified_init()` *after* `setup_revisions()` has
-    // had its chance to die on a bad revision.
-    let mut unknown: Option<&str> = None;
+    // What `parse_options()` hands `setup_revisions()`: every word ahead of `--` that is
+    // not one of this command's options, in order. `PARSE_OPT_KEEP_UNKNOWN_OPT` keeps an
+    // unrecognised option where it stood, so `-n 3`, `--not` and `--all` reach the revision
+    // walk's own option table between the revisions they apply to.
+    let mut words: Vec<&str> = Vec::new();
+    // `PARSE_OPT_KEEP_DASHDASH` makes `parse_options` stop at `--`, so nothing past it is
+    // read as an option, and `setup_revisions()` takes all of it as pathspecs.
+    let mut after_dashdash: Vec<&str> = Vec::new();
+    let mut seen_dashdash = false;
 
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if only_paths {
-            positionals.push((a, true));
+        if seen_dashdash {
+            after_dashdash.push(a);
             i += 1;
             continue;
         }
@@ -181,7 +184,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
                 // `-h` and exits 0 with nothing on stderr.
                 return Ok(super::show_usage(USAGE));
             }
-            "--" => only_paths = true,
+            "--" => seen_dashdash = true,
             "-r" | "--recursive" => max_depth = -1,
             "--no-recursive" => max_depth = 0,
             "-t" | "--show-trees" => show_trees = true,
@@ -204,12 +207,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
                     Err(code) => return Ok(code),
                 }
             }
-            _ if a.len() > 1 && a.starts_with('-') => {
-                if unknown.is_none() {
-                    unknown = Some(a);
-                }
-            }
-            _ => positionals.push((a, false)),
+            _ => words.push(a),
         }
         i += 1;
     }
@@ -219,80 +217,133 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     // lazy: `prepare_repo_settings()` first runs when the first revision resolves, so a bad
     // `core.packedGitLimit` loses to every error `setup_revisions()` raises before then.
     crate::default_config::validate(&repo).map_err(crate::default_config::Rejection::into_error)?;
-    let mut settings_loaded = false;
-    let mut load_settings = || -> Result<()> {
-        if !settings_loaded {
-            settings_loaded = true;
-            crate::repo_settings::RepoSettings::load(&repo).map_err(crate::fatal::die)?;
-        }
-        Ok(())
-    };
 
-    // Split positionals into `rev.pending` and pathspecs the way `setup_revisions`
-    // does: leading arguments that `handle_revision_arg()` takes are revisions, and
-    // from the first one it refuses on, every argument is a pathspec
-    // (revision.c:3117-3132).
-    let mut tips: Vec<Tip> = Vec::new();
+    // `struct prio_queue queue = { compare_commits_by_gen_then_commit_date }`
+    // (builtin/last-modified.c:347). That comparator (commit.c:909) sorts by
+    // `commit_graph_generation()` first and only falls back to the commit date when the
+    // two generations are equal — and with no commit-graph *every* generation is
+    // `GENERATION_NUMBER_INFINITY` (commit-graph.c:134), so the fallback is the whole
+    // comparator. With one, the numbers are real and the order can differ; the walk
+    // below detects that case rather than refusing outright. See [`PrioQueue`].
+    // `commit_graph_generation()` (commit-graph.c:126) answers `GENERATION_NUMBER_INFINITY`
+    // for a commit that is not in the graph, the corrected commit date for one that is when
+    // the whole chain carries `GDA2`, and the topological level otherwise
+    // (commit-graph.c:902-917). Holding the graph open from `setup_revisions()` on gives all
+    // three, and `A...B`'s merge-base walk reads the same numbers.
+    let commit_graph = repo.commit_graph_if_enabled()?;
+
+    // `setup_revisions()` (revision.c:3045-3132): every word is offered to the revision
+    // walk's option table first, then to `handle_revision_arg()`; from the first word that
+    // is neither, every word is a pathspec.
+    let mut setup = Pending {
+        repo: &repo,
+        parsed: Parsed {
+            graph: commit_graph.as_ref(),
+            info: HashMap::new(),
+        },
+        tips: Vec::new(),
+        settings_loaded: false,
+    };
+    // `revs->max_count` and the rest of `handle_revision_opt()`'s count-and-age arm
+    // (revision.c:2373-2425). Only `max_count` is read by `last_modified_run()`.
+    let mut counts = crate::revopt::Counts::default();
+    // `flags` as `--not` toggles it (revision.c:2944-2945): whether a revision is pended
+    // `UNINTERESTING | BOTTOM`.
+    let mut not = false;
+    // `revs->rev_input_given`: a revision or a ref-selecting option was seen, even one that
+    // pended nothing, so `rev.def` stays out (revision.c:1651, 2262-2263, 3163).
+    let mut rev_input_given = false;
+    // `revs->pending` names the first unrecognised option `left` kept in argv;
+    // `last_modified_init()` reports it after `setup_revisions()` returns.
+    let mut unknown: Option<&str> = None;
     let mut specs: Vec<&str> = Vec::new();
-    let mut seen_path = false;
-    for &(p, after_dashdash) in &positionals {
-        if after_dashdash {
-            specs.push(p);
+    let mut i = 0;
+    while i < words.len() {
+        let p = words[i];
+        // `if (!seen_end_of_options && *arg == '-')` (revision.c:3080): a lone `-` is an
+        // option word here too, and nothing claims it.
+        if p.starts_with('-') {
+            match p {
+                // handle_revision_pseudo_opt() (revision.c:2944-2945).
+                "--not" => not = !not,
+                // handle_revision_pseudo_opt() (revision.c:2846-2855): every ref, then HEAD,
+                // then the other worktrees' HEADs, each pended under `flags`.
+                "--all" => {
+                    rev_input_given = true;
+                    match all_refs(&repo)? {
+                        Ok(refs) => {
+                            if !refs.is_empty() {
+                                setup.load_settings()?;
+                            }
+                            for (name, id) in refs {
+                                setup.tips.push(Tip { name, id, exclude: not });
+                            }
+                        }
+                        Err(name) => {
+                            // get_reference()'s `die("bad object %s", name)` (revision.c:396).
+                            eprintln!("fatal: bad object {name}");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
+                }
+                _ => match counts.parse(&words, i) {
+                    Some(Ok(hit)) => {
+                        i += hit.consumed;
+                        continue;
+                    }
+                    // `-n` with nothing after it is `error()` (revision.c:2403-2404), which
+                    // `setup_revisions()` turns into `exit(128)`; every other refusal there is
+                    // a `die()`.
+                    Some(Err(message)) if message.starts_with('-') => {
+                        eprintln!("error: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    Some(Err(message)) => {
+                        eprintln!("fatal: {message}");
+                        return Ok(ExitCode::from(128));
+                    }
+                    None => {
+                        unknown.get_or_insert(p);
+                    }
+                },
+            }
+            i += 1;
             continue;
         }
-        if !seen_path {
-            if p.contains("...") || ["^@", "^!", "^-"].iter().any(|m| p.contains(m)) {
-                anyhow::bail!("unsupported <revision-range> {p:?} (symmetric and parent-shorthand ranges are not ported)");
-            }
-            // `handle_dotdot()` (revision.c:2131-2157) is tried first; a bare `..` is the
-            // parent-directory pathspec (revision.c:2176-2183).
-            if let Some((a, b)) = p.split_once("..").filter(|_| p != "..") {
-                let a_name = if a.is_empty() { "HEAD" } else { a };
-                let b_name = if b.is_empty() { "HEAD" } else { b };
-                if let (Ok(a_id), Ok(b_id)) = (repo.rev_parse_single(a_name), repo.rev_parse_single(b_name)) {
-                    load_settings()?;
-                    // `handle_dotdot_1()`'s `verify_non_filename(full_name)` (revision.c:2086-2088).
-                    if check_filename(&repo, p) {
-                        return Ok(die_both(p));
-                    }
-                    // `A..B`: A carries `flags ^ (UNINTERESTING | BOTTOM)`, B the plain flags,
-                    // and both are queued A first (revision.c:2095-2127).
-                    tips.push(Tip { name: a_name.to_owned(), id: a_id.detach(), exclude: true });
-                    tips.push(Tip { name: b_name.to_owned(), id: b_id.detach(), exclude: false });
-                    continue;
-                }
-            }
-            // `*arg == '^'` sets `UNINTERESTING | BOTTOM` and is stripped before the lookup
-            // (revision.c:2221-2225); `verify_non_filename()` sees the stripped name.
-            let (name, exclude) = match p.strip_prefix('^') {
-                Some(rest) => (rest, true),
-                None => (p, false),
-            };
-            if let Ok(id) = repo.rev_parse_single(name) {
-                load_settings()?;
-                if check_filename(&repo, name) {
-                    return Ok(die_both(name));
-                }
-                tips.push(Tip { name: name.to_owned(), id: id.detach(), exclude });
+        match setup.handle_revision_arg(p, not, seen_dashdash)? {
+            Ok(true) => {
+                rev_input_given = true;
+                i += 1;
                 continue;
             }
-            if exclude {
-                // revision.c:3119-3120.
-                eprintln!("fatal: bad revision '{p}'");
+            Ok(false) => {}
+            Err(code) => return Ok(code),
+        }
+        // revision.c:3119-3132.
+        if seen_dashdash || p.starts_with('^') {
+            eprintln!("fatal: bad revision '{p}'");
+            return Ok(ExitCode::from(128));
+        }
+        // `verify_filename()` (setup.c:280-290) for this word and every one after it: an
+        // option there is refused outright, and a wildcard or `:(` item passes unstatted.
+        for (j, &rest) in words[i..].iter().enumerate() {
+            if rest.starts_with('-') {
+                eprintln!("fatal: option '{rest}' must come before non-option arguments");
                 return Ok(ExitCode::from(128));
             }
+            if !(crate::setup::looks_like_pathspec(rest) || check_filename(&repo, rest)) {
+                return Ok(if j > 0 {
+                    die_no_such_path(rest)
+                } else {
+                    die_ambiguous(rest)
+                });
+            }
+            specs.push(rest);
         }
-        // `verify_filename()` (setup.c:280-290): a wildcard or `:(` item passes unstatted.
-        if !(crate::setup::looks_like_pathspec(p) || check_filename(&repo, p)) {
-            return Ok(if seen_path {
-                die_no_such_path(p)
-            } else {
-                die_ambiguous(p)
-            });
-        }
-        seen_path = true;
-        specs.push(p);
+        break;
     }
+    specs.extend(after_dashdash);
+    let max_count = counts.max_count;
 
     if let Some(msg) = crate::pathspec::first_outside_repository_fatal(&repo, &specs, gix::pathspec::Defaults::default()) {
         eprintln!("fatal: {msg}");
@@ -321,7 +372,7 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         }
     }
     // The implicit `HEAD` resolves after the pathspecs are parsed.
-    load_settings()?;
+    setup.load_settings()?;
     // `parse_pathspec()`: when every item is an exclude, one positive item matching everything
     // is added.
     if pathspecs.is_empty() && !excludes.is_empty() {
@@ -340,9 +391,10 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
+    let Pending { mut parsed, mut tips, .. } = setup;
     // `rev.def = "HEAD"` (builtin/last-modified.c:481) stands in only when no
     // revision was given at all, so `^X` alone leaves nothing interesting.
-    if tips.is_empty() {
+    if tips.is_empty() && !rev_input_given {
         match repo.rev_parse_single("HEAD") {
             Ok(id) => tips.push(Tip {
                 name: "HEAD".into(),
@@ -375,19 +427,6 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-
-    // `struct prio_queue queue = { compare_commits_by_gen_then_commit_date }`
-    // (builtin/last-modified.c:347). That comparator (commit.c:909) sorts by
-    // `commit_graph_generation()` first and only falls back to the commit date when the
-    // two generations are equal — and with no commit-graph *every* generation is
-    // `GENERATION_NUMBER_INFINITY` (commit-graph.c:134), so the fallback is the whole
-    // comparator. With one, the numbers are real and the order can differ; the walk
-    // below detects that case rather than refusing outright. See [`PrioQueue`].
-    // `commit_graph_generation()` (commit-graph.c:126) answers `GENERATION_NUMBER_INFINITY`
-    // for a commit that is not in the graph, the corrected commit date for one that is when
-    // the whole chain carries `GDA2`, and the topological level otherwise
-    // (commit-graph.c:902-917). Holding the graph open for the walk gives all three.
-    let commit_graph = repo.commit_graph_if_enabled()?;
 
     // git reads `core.quotePath` once, in its config callback, into the global
     // every `quote_c_style()` caller shares.
@@ -448,11 +487,8 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
     // `commit->date` read for them. Both queues compare live: a commit nobody parsed yet
     // reads as `GENERATION_NUMBER_INFINITY` and date 0, and it changes once something
     // parses it, even while it sits in a queue. `setup_revisions()` parsed every tip and
-    // every commit its revision syntax stepped through.
-    let mut parsed = Parsed {
-        graph: commit_graph.as_ref(),
-        info: HashMap::new(),
-    };
+    // every commit its revision syntax stepped through, which for `A...B` includes the whole
+    // merge-base walk, already recorded in `parsed`.
     for t in &tips {
         for id in commits_parsed_by_name(&repo, &t.name, t.id) {
             parsed.parse(&repo, id)?;
@@ -484,14 +520,24 @@ pub fn last_modified(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    let mut queue_popped: usize = 0;
     while let Some(c) = queue.get(&parsed) {
         let mut active_c = active.remove(&c).unwrap_or_else(|| vec![false; n]);
         let commit = repo.find_commit(c)?;
         let c_tree = commit.tree_id()?.detach();
 
-        if parent2.contains(&c) {
-            // A boundary commit (builtin/last-modified.c:394-407): every path whose entry
-            // here is the version of interest is emitted `^`-prefixed, in tree-diff order.
+        // `(0 <= max_count && max_count < ++queue_popped) || (c->object.flags & PARENT2)`
+        // (builtin/last-modified.c:394-395): `-n` makes every commit popped past the limit
+        // a boundary too, `++queue_popped` counting only while a limit is set.
+        let over_limit = max_count.is_some_and(|max| {
+            queue_popped += 1;
+            max < queue_popped
+        });
+        if over_limit || parent2.contains(&c) {
+            // A boundary commit (builtin/last-modified.c:396-407): it is marked
+            // `PARENT2 | BOUNDARY`, and every path whose entry here is the version of interest
+            // is emitted `^`-prefixed, in tree-diff order.
+            parent2.insert(c);
             let mut entries: Vec<(BString, Option<ObjectId>)> = Vec::new();
             diff_trees(&repo, None, Some(c_tree), b"", &opts, &mut entries)?;
             for (path, oid) in &entries {
@@ -705,6 +751,535 @@ impl PrioQueue {
         self.get_pending = true;
         Some(self.array[0].1)
     }
+}
+
+/// `rev.pending` as `setup_revisions()` fills it, with the commits its revision syntax
+/// parsed along the way.
+struct Pending<'r, 'g> {
+    repo: &'r gix::Repository,
+    parsed: Parsed<'g>,
+    tips: Vec<Tip>,
+    settings_loaded: bool,
+}
+
+impl Pending<'_, '_> {
+    /// `prepare_repo_settings()`, which the first revision lookup runs.
+    fn load_settings(&mut self) -> Result<()> {
+        if !self.settings_loaded {
+            self.settings_loaded = true;
+            crate::repo_settings::RepoSettings::load(self.repo).map_err(crate::fatal::die)?;
+        }
+        Ok(())
+    }
+
+    /// `handle_revision_arg_1()` (revision.c:2159-2259) under `flags` as `--not` left them:
+    /// `Ok(true)` when the word pended something (or named a commit with nothing to pend),
+    /// `Ok(false)` when it is no revision, `Err` for the `die()`s on the way.
+    fn handle_revision_arg(
+        &mut self,
+        arg_: &str,
+        not: bool,
+        cant_be_filename: bool,
+    ) -> Result<std::result::Result<bool, ExitCode>> {
+        let repo = self.repo;
+        // revision.c:2176-2183: a bare `..` is the parent-directory pathspec.
+        if !cant_be_filename && arg_ == ".." {
+            return Ok(Ok(false));
+        }
+        // handle_dotdot() (revision.c:2131-2157), tried first.
+        if let Some(at) = arg_.find("..") {
+            let a_name = &arg_[..at];
+            let mut b_name = &arg_[at + 2..];
+            let symmetric = b_name.starts_with('.');
+            if symmetric {
+                b_name = &b_name[1..];
+            }
+            let a_name = if a_name.is_empty() { "HEAD" } else { a_name };
+            let b_name = if b_name.is_empty() { "HEAD" } else { b_name };
+            if let (Ok(a_id), Ok(b_id)) = (repo.rev_parse_single(a_name), repo.rev_parse_single(b_name)) {
+                let (a_id, b_id) = (a_id.detach(), b_id.detach());
+                self.load_settings()?;
+                // `handle_dotdot_1()`'s `verify_non_filename(full_name)` (revision.c:2086-2088).
+                if !cant_be_filename && check_filename(repo, arg_) {
+                    return Ok(Err(die_both(arg_)));
+                }
+                if symmetric {
+                    // `A...B` (revision.c:2100-2120): both sides must be commits, their merge
+                    // bases are pended first under `flags ^ (UNINTERESTING | BOTTOM)`, and A
+                    // and B themselves under the plain flags.
+                    let a = self.lookup_commit_reference(a_id)?;
+                    let b = self.lookup_commit_reference(b_id)?;
+                    let (Some(a), Some(b)) = (a, b) else {
+                        // dotdot_missing() (revision.c:2054-2061).
+                        eprintln!("fatal: Invalid symmetric difference expression {arg_}");
+                        return Ok(Err(ExitCode::from(128)));
+                    };
+                    for base in self.get_merge_bases(a, b)? {
+                        // add_pending_commit_list() names each by its hex id (revision.c:1987).
+                        self.tips.push(Tip { name: base.to_string(), id: base, exclude: !not });
+                    }
+                    self.tips.push(Tip { name: a_name.to_owned(), id: a_id, exclude: not });
+                } else {
+                    // `A..B`: A carries `flags ^ (UNINTERESTING | BOTTOM)`, B the plain flags,
+                    // and both are queued A first (revision.c:2095-2127).
+                    self.tips.push(Tip { name: a_name.to_owned(), id: a_id, exclude: !not });
+                }
+                self.tips.push(Tip { name: b_name.to_owned(), id: b_id, exclude: not });
+                return Ok(Ok(true));
+            }
+        }
+
+        let mut arg = arg_;
+        // `<rev>^@` (revision.c:2190-2197): the parents alone, under the plain flags.
+        if let Some(mark) = arg.find("^@") {
+            if mark + 2 == arg.len() && self.add_parents_only(&arg[..mark], not, 0)? {
+                return Ok(Ok(true));
+            }
+        }
+        // `<rev>^!` (revision.c:2198-2203): the parents excluded, then `<rev>` itself.
+        if let Some(mark) = arg.find("^!") {
+            if mark + 2 == arg.len() && self.add_parents_only(&arg[..mark], !not, 0)? {
+                arg = &arg[..mark];
+            }
+        }
+        // `<rev>^-[<n>]` (revision.c:2204-2219): parent `<n>` (default 1) excluded, then
+        // `<rev>` itself. A count `strtol_i()` refuses, or one below 1, is no revision.
+        if let Some(mark) = arg.find("^-") {
+            let mut exclude_parent = 1;
+            let count = &arg[mark + 2..];
+            if !count.is_empty() {
+                match crate::revopt::strtol_i(count) {
+                    Some(n) if n >= 1 => exclude_parent = n,
+                    _ => return Ok(Ok(false)),
+                }
+            }
+            if self.add_parents_only(&arg[..mark], !not, exclude_parent)? {
+                arg = &arg[..mark];
+            }
+        }
+        // `*arg == '^'` sets `UNINTERESTING | BOTTOM` and is stripped before the lookup
+        // (revision.c:2221-2225); `verify_non_filename()` sees the stripped name.
+        let (name, exclude) = match arg.strip_prefix('^') {
+            Some(rest) => (rest, !not),
+            None => (arg, not),
+        };
+        let Ok(id) = repo.rev_parse_single(name) else {
+            return Ok(Ok(false));
+        };
+        self.load_settings()?;
+        if !cant_be_filename && check_filename(repo, name) {
+            return Ok(Err(die_both(name)));
+        }
+        self.tips.push(Tip { name: name.to_owned(), id: id.detach(), exclude });
+        Ok(Ok(true))
+    }
+
+    /// `add_parents_only()` (revision.c:1895-1934): pend the parents of the commit `arg_`
+    /// names — only parent `exclude_parent` when that is non-zero — each under `arg` (its
+    /// `^` taken off) and `exclude` (flipped by that `^`). `false` when `arg_` is not a
+    /// commit-ish or has no such parent; the caller then tries the rest of the syntax.
+    fn add_parents_only(&mut self, arg_: &str, mut exclude: bool, exclude_parent: i32) -> Result<bool> {
+        let repo = self.repo;
+        let mut arg = arg_;
+        if let Some(rest) = arg.strip_prefix('^') {
+            exclude = !exclude;
+            arg = rest;
+        }
+        // repo_get_oid_committish().
+        let Ok(id) = repo.rev_parse_single(arg) else {
+            return Ok(false);
+        };
+        let id = id.detach();
+        self.load_settings()?;
+        // get_reference()'s `parse_object()`, once per tag peeled.
+        let Ok(object) = repo.find_object(id).and_then(|o| Ok(o.peel_tags_to_end()?)) else {
+            return Ok(false);
+        };
+        if object.kind != gix::object::Kind::Commit {
+            return Ok(false);
+        }
+        for c in commits_parsed_by_name(repo, arg, id) {
+            self.parsed.parse(repo, c)?;
+        }
+        let parents: Vec<ObjectId> = repo.find_commit(object.id)?.parent_ids().map(|p| p.detach()).collect();
+        let wanted = usize::try_from(exclude_parent).unwrap_or(0);
+        if wanted > parents.len() {
+            return Ok(false);
+        }
+        for (k, parent) in parents.into_iter().enumerate() {
+            if wanted != 0 && k + 1 != wanted {
+                continue;
+            }
+            self.tips.push(Tip { name: arg.to_owned(), id: parent, exclude });
+        }
+        Ok(true)
+    }
+
+    /// `lookup_commit_reference()`: the commit `id` peels to, or its `error()` naming what
+    /// the peel stopped at (object.c:object_as_type()).
+    fn lookup_commit_reference(&mut self, id: ObjectId) -> Result<Option<ObjectId>> {
+        let object = self.repo.find_object(id)?.peel_tags_to_end()?;
+        if object.kind != gix::object::Kind::Commit {
+            eprintln!("error: object {} is a {}, not a commit", object.id, object.kind);
+            return Ok(None);
+        }
+        self.parsed.parse(self.repo, object.id)?;
+        Ok(Some(object.id))
+    }
+
+    fn generation(&self, id: &ObjectId) -> u64 {
+        self.parsed.key(id).0
+    }
+
+    fn parents(&self, id: ObjectId) -> Result<Vec<ObjectId>> {
+        Ok(self.repo.find_commit(id)?.parent_ids().map(|p| p.detach()).collect())
+    }
+
+    /// `commit_list_sort_by_date()`: newest first, stable.
+    fn sort_by_date(&self, list: &mut [ObjectId]) {
+        list.sort_by(|a, b| self.parsed.key(b).1.cmp(&self.parsed.key(a).1));
+    }
+
+    /// `repo_get_merge_bases(one, two)`, i.e. `get_merge_bases_many_0()` with one "two",
+    /// cleanup and `MERGE_BASE_FIND_ALL` (commit-reach.c:564-606). Every commit the walk
+    /// parses is recorded, because the last-modified queues read those commits' dates.
+    fn get_merge_bases(&mut self, one: ObjectId, two: ObjectId) -> Result<Vec<ObjectId>> {
+        // merge_bases_many() (commit-reach.c:265-307).
+        if one == two {
+            return Ok(vec![one]);
+        }
+        self.parsed.parse(self.repo, one)?;
+        self.parsed.parse(self.repo, two)?;
+        let mut marks: HashMap<ObjectId, u8> = HashMap::new();
+        let list = self.paint_down_to_common(one, &[two], 0, &mut marks)?;
+        let mut result: Vec<ObjectId> =
+            list.into_iter().filter(|c| marks.get(c).copied().unwrap_or(0) & MB_STALE == 0).collect();
+        self.sort_by_date(&mut result);
+        if result.len() <= 1 {
+            return Ok(result);
+        }
+        let mut result = self.remove_redundant(result)?;
+        self.sort_by_date(&mut result);
+        Ok(result)
+    }
+
+    /// `paint_down_to_common()` under `MERGE_BASE_FIND_ALL` (commit-reach.c:186-263), with
+    /// the counted queue of `struct paint_state` (commit-reach.c:84-184). `marks` holds the
+    /// object flags it paints, which every caller clears afterwards.
+    fn paint_down_to_common(
+        &mut self,
+        one: ObjectId,
+        twos: &[ObjectId],
+        min_generation: u64,
+        marks: &mut HashMap<ObjectId, u8>,
+    ) -> Result<Vec<ObjectId>> {
+        let mut state = PaintState {
+            queue: PrioQueue::default(),
+            counts: [0; 3],
+            min_generation,
+            last_gen: u64::from(gix::commitgraph::GENERATION_NUMBER_INFINITY),
+            topo_ceiling: if corrected_commit_dates_enabled(self.parsed.graph) {
+                u64::from(gix::commitgraph::GENERATION_NUMBER_INFINITY)
+            } else {
+                GENERATION_NUMBER_V1_MAX
+            },
+        };
+        *marks.entry(one).or_default() |= MB_PARENT1;
+        if twos.is_empty() {
+            return Ok(vec![one]);
+        }
+        self.paint_queue_put(&mut state, marks, one, 0);
+        for &two in twos {
+            self.paint_queue_put(&mut state, marks, two, MB_PARENT2);
+        }
+        let mut result = Vec::new();
+        while let Some(c) = self.paint_queue_get(&mut state, marks) {
+            let mut flags = marks[&c] & (MB_PARENT1 | MB_PARENT2 | MB_STALE);
+            if flags == MB_PARENT1 | MB_PARENT2 {
+                if marks[&c] & MB_RESULT == 0 {
+                    *marks.get_mut(&c).expect("painted") |= MB_RESULT;
+                    result.push(c);
+                }
+                // Mark parents of a found merge stale.
+                flags |= MB_STALE;
+            }
+            for p in self.parents(c)? {
+                if marks.get(&p).copied().unwrap_or(0) & flags == flags {
+                    continue;
+                }
+                self.parsed.parse(self.repo, p)?;
+                self.paint_queue_put(&mut state, marks, p, flags);
+            }
+        }
+        self.sort_by_date(&mut result);
+        Ok(result)
+    }
+
+    /// `paint_queue_put()` (commit-reach.c:109-123).
+    fn paint_queue_put(&self, state: &mut PaintState, marks: &mut HashMap<ObjectId, u8>, c: ObjectId, add: u8) {
+        let flags = marks.entry(c).or_default();
+        let old = *flags;
+        *flags |= add;
+        let new = *flags;
+        if old & MB_ENQUEUED != 0 {
+            state.update(old, -1);
+            state.update(new, 1);
+        } else {
+            *flags |= MB_ENQUEUED;
+            state.queue.put(c, &self.parsed);
+            state.update(new, 1);
+        }
+    }
+
+    /// `paint_queue_get()` (commit-reach.c:129-170).
+    fn paint_queue_get(&self, state: &mut PaintState, marks: &mut HashMap<ObjectId, u8>) -> Option<ObjectId> {
+        let c = state.queue.get(&self.parsed)?;
+        let flags = marks.get_mut(&c).expect("queued commits are painted");
+        *flags &= !MB_ENQUEUED;
+        let generation = self.generation(&c);
+        state.last_gen = generation;
+        if generation < state.min_generation {
+            return None;
+        }
+        let [parent1, parent2, candidates] = state.counts;
+        if candidates == 0 {
+            if parent1 == 0 && parent2 == 0 {
+                return None;
+            }
+            if (parent1 == 0 || parent2 == 0) && generation < state.topo_ceiling {
+                return None;
+            }
+        }
+        state.update(*flags, -1);
+        Some(c)
+    }
+
+    /// `remove_redundant()` (commit-reach.c:545-562).
+    fn remove_redundant(&mut self, array: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
+        if generation_numbers_enabled(self.parsed.graph)
+            && array
+                .iter()
+                .any(|c| self.generation(c) < u64::from(gix::commitgraph::GENERATION_NUMBER_INFINITY))
+        {
+            return self.remove_redundant_with_gen(array);
+        }
+        self.remove_redundant_no_gen(array)
+    }
+
+    /// `remove_redundant_no_gen()` (commit-reach.c:368-427).
+    fn remove_redundant_no_gen(&mut self, array: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
+        for &c in &array {
+            self.parsed.parse(self.repo, c)?;
+        }
+        let mut redundant = vec![false; array.len()];
+        for i in 0..array.len() {
+            if redundant[i] {
+                continue;
+            }
+            let mut min_generation = self.generation(&array[i]);
+            let mut work = Vec::new();
+            let mut filled_index = Vec::new();
+            for j in 0..array.len() {
+                if i == j || redundant[j] {
+                    continue;
+                }
+                filled_index.push(j);
+                work.push(array[j]);
+                min_generation = min_generation.min(self.generation(&array[j]));
+            }
+            let mut marks: HashMap<ObjectId, u8> = HashMap::new();
+            self.paint_down_to_common(array[i], &work, min_generation, &mut marks)?;
+            let flag = |c: &ObjectId| marks.get(c).copied().unwrap_or(0);
+            if flag(&array[i]) & MB_PARENT2 != 0 {
+                redundant[i] = true;
+            }
+            for (k, w) in work.iter().enumerate() {
+                if flag(w) & MB_PARENT1 != 0 {
+                    redundant[filled_index[k]] = true;
+                }
+            }
+        }
+        Ok(array.into_iter().zip(redundant).filter(|(_, r)| !r).map(|(c, _)| c).collect())
+    }
+
+    /// `remove_redundant_with_gen()` (commit-reach.c:429-543).
+    fn remove_redundant_with_gen(&mut self, array: Vec<ObjectId>) -> Result<Vec<ObjectId>> {
+        let repo = self.repo;
+        let mut marks: HashMap<ObjectId, u8> = HashMap::new();
+        let flag = |marks: &HashMap<ObjectId, u8>, c: &ObjectId| marks.get(c).copied().unwrap_or(0);
+        // Sort the input by generation number, ascending (`QSORT(compare_commits_by_gen)`).
+        let mut sorted = array.clone();
+        sorted.sort_by_key(|c| self.generation(c));
+        let mut min_generation = self.generation(&sorted[0]);
+        let mut min_gen_pos = 0;
+
+        // Mark all parents of the input as STALE.
+        let mut walk_start = Vec::new();
+        for &c in &array {
+            self.parsed.parse(repo, c)?;
+            *marks.entry(c).or_default() |= MB_RESULT;
+            for p in self.parents(c)? {
+                self.parsed.parse(repo, p)?;
+                if flag(&marks, &p) & MB_STALE == 0 {
+                    *marks.entry(p).or_default() |= MB_STALE;
+                    walk_start.push(p);
+                }
+            }
+        }
+        walk_start.sort_by_key(|c| self.generation(c));
+        // Remove the STALE bit for now to allow walking through parents.
+        for c in &walk_start {
+            *marks.entry(*c).or_default() &= !MB_STALE;
+        }
+
+        // Start walking from the highest generation.
+        let mut count_still_independent = array.len();
+        for start in walk_start.iter().rev() {
+            if count_still_independent <= 1 {
+                break;
+            }
+            // Push the STALE bits up to min generation; the stack's head is its last element.
+            let mut stack = vec![*start];
+            *marks.entry(*start).or_default() |= MB_STALE;
+            while let Some(&c) = stack.last() {
+                self.parsed.parse(repo, c)?;
+                if flag(&marks, &c) & MB_RESULT != 0 {
+                    *marks.entry(c).or_default() &= !MB_RESULT;
+                    count_still_independent -= 1;
+                    if count_still_independent <= 1 {
+                        break;
+                    }
+                    if c == sorted[min_gen_pos] {
+                        while min_gen_pos < sorted.len() - 1 && flag(&marks, &sorted[min_gen_pos]) & MB_STALE != 0 {
+                            min_gen_pos += 1;
+                        }
+                        min_generation = self.generation(&sorted[min_gen_pos]);
+                    }
+                }
+                if self.generation(&c) < min_generation {
+                    stack.pop();
+                    continue;
+                }
+                let next = self.parents(c)?.into_iter().find(|p| flag(&marks, p) & MB_STALE == 0);
+                match next {
+                    Some(p) => {
+                        *marks.entry(p).or_default() |= MB_STALE;
+                        stack.push(p);
+                    }
+                    // Pop if all parents have been visited already.
+                    None => {
+                        stack.pop();
+                    }
+                }
+            }
+        }
+        Ok(array.into_iter().filter(|c| flag(&marks, c) & MB_STALE == 0).collect())
+    }
+}
+
+/// commit-reach.c's object flags (object.h: PARENT1, PARENT2, STALE, RESULT and the
+/// paint queue's ENQUEUED), kept apart from the last-modified walk's own PARENT1/PARENT2
+/// because every merge-base caller clears them before that walk starts.
+const MB_PARENT1: u8 = 1 << 0;
+const MB_PARENT2: u8 = 1 << 1;
+const MB_STALE: u8 = 1 << 2;
+const MB_RESULT: u8 = 1 << 3;
+const MB_ENQUEUED: u8 = 1 << 4;
+
+/// `GENERATION_NUMBER_V1_MAX` (commit.h:13).
+const GENERATION_NUMBER_V1_MAX: u64 = 0x3FFF_FFFF;
+
+/// `struct paint_state` (commit-reach.c:84-92): the queue and its per-side counters.
+struct PaintState {
+    queue: PrioQueue,
+    /// `parent1_count`, `parent2_count`, `mb_candidate_count`.
+    counts: [isize; 3],
+    min_generation: u64,
+    last_gen: u64,
+    topo_ceiling: u64,
+}
+
+impl PaintState {
+    /// `paint_count_update()` (commit-reach.c:94-107).
+    fn update(&mut self, flags: u8, delta: isize) {
+        match flags & (MB_PARENT1 | MB_PARENT2 | MB_STALE) {
+            MB_PARENT1 => self.counts[0] += delta,
+            MB_PARENT2 => self.counts[1] += delta,
+            f if f == MB_PARENT1 | MB_PARENT2 => self.counts[2] += delta,
+            _ => {}
+        }
+    }
+}
+
+/// `corrected_commit_dates_enabled()` (commit-graph.c:793-802).
+fn corrected_commit_dates_enabled(graph: Option<&gix::commitgraph::Graph>) -> bool {
+    graph.is_some_and(|g| g.num_commits() > 0 && g.has_generation_data())
+}
+
+/// `generation_numbers_enabled()` (commit-graph.c:778-791): the first commit's topological
+/// level is non-zero. git reads it from the newest layer of a split chain; every layer is
+/// written by the same `CDAT` code, so the base layer's first commit answers the same.
+fn generation_numbers_enabled(graph: Option<&gix::commitgraph::Graph>) -> bool {
+    graph.is_some_and(|g| g.num_commits() > 0 && g.commit_at(gix::commitgraph::Position(0)).generation() != 0)
+}
+
+/// `--all`'s pending entries in `handle_refs()` order (revision.c:2846-2855): every ref
+/// under `refs/` by name (`refs_for_each_ref()`), then `HEAD` (`refs_head_ref()`), then each
+/// other worktree's `HEAD` (`other_head_refs()`, worktree.c:602-637). Each names the object
+/// the ref holds, a tag left a tag. `Err` names a ref whose object cannot be read, which is
+/// get_reference()'s `die("bad object %s")`.
+fn all_refs(repo: &gix::Repository) -> Result<std::result::Result<Vec<(String, ObjectId)>, String>> {
+    let mut named: Vec<(Vec<u8>, Option<ObjectId>)> = Vec::new();
+    for r in repo.references()?.all()? {
+        match crate::fatal::ref_walk_entry(r)? {
+            crate::fatal::RefWalkEntry::Ref(mut r) => {
+                let name = r.name().as_bstr().to_vec();
+                // A dangling symbolic ref is dropped before `handle_one_ref()` sees it.
+                if let Ok(id) = r.follow_to_object() {
+                    named.push((name, Some(id.detach())));
+                }
+            }
+            crate::fatal::RefWalkEntry::Broken(name) => named.push((name.into_bytes(), None)),
+            crate::fatal::RefWalkEntry::Omitted => {}
+        }
+    }
+    named.sort();
+    let mut out = Vec::new();
+    for (name, id) in named {
+        let name = String::from_utf8_lossy(&name).into_owned();
+        match id {
+            Some(id) if repo.find_header(id).is_ok() => out.push((name, id)),
+            _ => return Ok(Err(name)),
+        }
+    }
+    // refs_head_ref(): an unborn HEAD pends nothing.
+    if let Ok(head) = repo.head() {
+        if let Some(id) = head.id() {
+            out.push(("HEAD".to_owned(), id.detach()));
+        }
+    }
+    // other_head_refs(): the main worktree's HEAD when this is a linked one, then every
+    // linked worktree but this one.
+    if repo.git_dir() != repo.common_dir() {
+        if let Ok(mut r) = repo.find_reference("main-worktree/HEAD") {
+            if let Ok(id) = r.follow_to_object() {
+                out.push(("main-worktree/HEAD".to_owned(), id.detach()));
+            }
+        }
+    }
+    for proxy in repo.worktrees().unwrap_or_default() {
+        let name = format!("worktrees/{}/HEAD", proxy.id());
+        let Ok(wt) = proxy.into_repo_with_possibly_inaccessible_worktree() else {
+            continue;
+        };
+        if wt.git_dir() == repo.git_dir() {
+            continue;
+        }
+        if let Some(id) = wt.head().ok().and_then(|h| h.id()) {
+            out.push((name, id.detach()));
+        }
+    }
+    Ok(Ok(out))
 }
 
 /// The commits `get_oid_with_context()` parses while it resolves `name` to `id`: the

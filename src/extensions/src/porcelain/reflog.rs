@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1426,14 +1426,6 @@ fn write_reflog(repo: &mut gix::Repository, args: &[String]) -> Result<ExitCode>
     let old = parse_write_oid(repo, old_spec, "old")?;
     let new = parse_write_oid(repo, new_spec, "new")?;
 
-    // `ref_transaction_update_reflog()` queues a `REF_LOG_ONLY` update that
-    // records the two ids as given (`REF_LOG_USE_PROVIDED_OIDS`, refs.c:1464-1494);
-    // the reftable transaction this port drives always logs the reference's
-    // current value as the old one, so it cannot write this entry.
-    if crate::refstore::is_reftable(repo) {
-        bail!("reflog write is not supported in a reftable repository: the ref store cannot log provided object ids");
-    }
-
     // `git_committer_info(0)`: `<name> <<email>> <seconds> <tz>`, the same string the
     // reflog writer would have filled in on its own. The non-strict form, so a machine
     // with no `user.*` gets the synthesized identity rather than a refusal.
@@ -1442,6 +1434,10 @@ fn write_reflog(repo: &mut gix::Repository, args: &[String]) -> Result<ExitCode>
         .committer()
         .transpose()?
         .ok_or_else(|| anyhow!("no committer identity available for the reflog entry"))?;
+
+    if crate::refstore::is_reftable(repo) {
+        return write_reftable_reflog(repo, name, old, new, committer, message);
+    }
     let mut line = format!(
         "{old} {new} {} <{}> {}",
         committer.name.to_str_lossy(),
@@ -1483,6 +1479,54 @@ fn write_reflog(repo: &mut gix::Repository, args: &[String]) -> Result<ExitCode>
     use std::io::Write as _;
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
     file.write_all(&line)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The reftable half of `cmd_reflog_write` (builtin/reflog.c:445-457): one
+/// transaction holding the single `ref_transaction_update_reflog()` update
+/// (`REF_LOG_ONLY | REF_LOG_USE_PROVIDED_OIDS`, refs.c:1463-1496) at index 0,
+/// which `prepare_single_update()` queues with its provided old id and nothing
+/// else (refs/reftable-backend.c:1090-1100) and `write_transaction_table()`
+/// (:1463) writes as the one log record of a new table.
+fn write_reftable_reflog(
+    repo: &gix::Repository,
+    name: &str,
+    old: ObjectId,
+    new: ObjectId,
+    committer: gix::actor::SignatureRef<'_>,
+    message: &str,
+) -> Result<ExitCode> {
+    use gix::refs::file::transaction::{prepare, ReflogUpdate};
+
+    let mut committer_info = Vec::new();
+    committer.trim().write_to(&mut committer_info)?;
+    let entry = ReflogUpdate {
+        name: gix::refs::FullName::try_from(name)?,
+        old_oid: old,
+        new_oid: new,
+        committer_info: committer_info.into(),
+        message: message.into(),
+        index: 0,
+    };
+    let fail = gix::lock::acquire::Fail::Immediately;
+    let prepared = match repo
+        .refs
+        .transaction()
+        .update_reflogs([entry])
+        .prepare(Vec::new(), fail, fail)
+    {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            let message = match &err {
+                prepare::Error::Reftable { message, .. } => message.to_string(),
+                other => other.to_string(),
+            };
+            crate::git_fatal!("cannot commit reflog update: {message}");
+        }
+    };
+    if let Err(err) = prepared.commit(Some(committer)) {
+        crate::git_fatal!("cannot commit reflog update: {err}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 

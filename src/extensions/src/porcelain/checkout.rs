@@ -3213,6 +3213,30 @@ fn restore_from_tree(
     // to read the index drops the bit for it in `clear_skip_worktree_from_present_files()`
     // (repository.c:458, sparse-index.c:673-686), because the path it says is absent is
     // now there.
+    let norm = Specs::new(repo, paths)?;
+
+    // The bit is read *after* `read_tree_some()` has laid the tree over the index
+    // (builtin/checkout.c:635-636). `update_some()` keeps the old entry, flags and all,
+    // only when the tree names the same blob in the same mode and the entry is not
+    // intent-to-add (:214-229); any other pathspec-matched tree entry replaces it with a
+    // fresh `create_ce_flags(0) | CE_UPDATE` one (:210, :231-232) that has no
+    // `CE_SKIP_WORKTREE`. So a sparse path the tree *changes* is matched and checked out
+    // even without the flag, while one the tree leaves as it is stays out of reach.
+    let tree_blobs: HashMap<BString, (gix::ObjectId, gix::index::entry::Mode)> = {
+        let (tree_matched, _) = matches_in(&src, &norm);
+        let tree_matched: HashSet<BString> = tree_matched.into_iter().collect();
+        let backing = src.path_backing();
+        src.entries()
+            .iter()
+            .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
+            .filter(|(p, _)| tree_matched.contains(p))
+            .collect()
+    };
+    let replaced_by_tree = |path: &BString, e: &gix::index::Entry| {
+        tree_blobs.get(path).is_some_and(|(id, mode)| {
+            *id != e.id || *mode != e.mode || e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD)
+        })
+    };
     let sparse: HashSet<BString> = if ignore_skipworktree {
         HashSet::new()
     } else {
@@ -3222,14 +3246,14 @@ fn restore_from_tree(
             .entries()
             .iter()
             .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
-            .map(|e| e.path_in(backing).to_owned())
+            .map(|e| (e.path_in(backing).to_owned(), e))
+            .filter(|(p, e)| !replaced_by_tree(p, e))
+            .map(|(p, _)| p)
             .collect()
     };
     if !sparse.is_empty() {
         src.remove_entries(|_, path, _| sparse.contains(&path.to_owned()));
     }
-
-    let norm = Specs::new(repo, paths)?;
 
     // Paths to write from the tree, and (no-overlay only) paths to delete.
     let (matched, to_remove) = if overlay {
@@ -3338,39 +3362,28 @@ fn restore_from_tree(
         };
         match positions.get(path).copied().ok_or(()) {
             Ok(idx) => {
+                let replaced = replaced_by_tree(path, &index.entries()[idx]);
                 let e = &mut index.entries_mut()[idx];
-                if e.id != *id || e.mode != *mode {
+                if replaced {
                     stale.push(path.clone());
+                    // `update_some()` (builtin/checkout.c:210, :231-232): the replacement is a
+                    // fresh `create_ce_flags(0)` entry, so the old one's `CE_SKIP_WORKTREE`,
+                    // `CE_INTENT_TO_ADD` and `CE_VALID` go with it. `CE_EXTENDED` is derived
+                    // from `CE_EXTENDED_FLAGS` on every write (`do_write_index()`,
+                    // read-cache.c:2851-2856), so it goes too.
+                    e.flags = crate::default_config::stat_cache_flags();
+                } else {
+                    // The entry `update_some()` left in place keeps its flags, `CE_SKIP_WORKTREE`
+                    // included: `checkout_entry()` refreshes stat data without touching
+                    // `ce_flags` (builtin/checkout.c:465-470) and `write_locked_index()` (:701)
+                    // stores the bit. The `H` a later `ls-files -t` shows is the reader's
+                    // `clear_skip_worktree_from_present_files()` (sparse-index.c:680-691), in
+                    // memory only.
+                    e.flags.insert(crate::default_config::stat_cache_flags());
                 }
                 e.id = *id;
                 e.mode = *mode;
                 e.stat = *stat;
-                e.flags.insert(crate::default_config::stat_cache_flags());
-                // `clear_skip_worktree_from_present_files()` (sparse-index.c:643-671): a
-                // `SKIP_WORKTREE` entry whose file is on disk stops being one, and
-                // `--ignore-skip-worktree-bits` has just put this one there. git clears it on
-                // the next read of the index rather than here; recording it now is the same
-                // index either way, and it is the index every later reader sees.
-                if ignore_skipworktree {
-                    e.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
-                    // ```c
-                    // /* reduce extended entries if possible */
-                    // cache[i]->ce_flags &= ~CE_EXTENDED;
-                    // if (cache[i]->ce_flags & CE_EXTENDED_FLAGS) {
-                    //         extended++;
-                    //         cache[i]->ce_flags |= CE_EXTENDED;
-                    // }
-                    // ```
-                    //
-                    // (`do_write_index()`, read-cache.c:2884-2891.) `CE_EXTENDED` is derived
-                    // from `CE_EXTENDED_FLAGS` — `CE_INTENT_TO_ADD | CE_SKIP_WORKTREE` — and
-                    // git recomputes it on every write; the entry that just lost its last
-                    // extended flag stops needing the extended word, and an index with no such
-                    // entry is written at version 2 rather than 3.
-                    if !e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD) {
-                        e.flags.remove(gix::index::entry::Flags::EXTENDED);
-                    }
-                }
             }
             Err(_) => {
                 index.dangerously_push_entry(

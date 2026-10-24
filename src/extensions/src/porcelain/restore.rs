@@ -1385,11 +1385,14 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 if let Some(stat) = fresh_stats.get(&p.to_owned()) {
                     e.stat = *stat;
                     e.flags.insert(crate::default_config::stat_cache_flags());
-                    // The file is in the worktree now, so the bit that said it was not
-                    // there no longer describes it.
-                    if ignore_skip_worktree {
-                        e.flags.remove(Flags::SKIP_WORKTREE);
-                    }
+                    // `CE_SKIP_WORKTREE` stays on an entry `--ignore-skip-worktree-bits` wrote
+                    // out: `checkout_worktree()` hands it to `checkout_entry()`
+                    // (builtin/checkout.c:465-470), which refreshes stat data without touching
+                    // `ce_flags`, and `write_locked_index()` (:701) stores the bit. Only an entry
+                    // `update_some()` replaced (:210-232) arrives without it, and that one was
+                    // built fresh above. The `H` a later `ls-files -t` shows is the reader's
+                    // `clear_skip_worktree_from_present_files()` (sparse-index.c:680-691), in
+                    // memory only.
                 }
             }
         }

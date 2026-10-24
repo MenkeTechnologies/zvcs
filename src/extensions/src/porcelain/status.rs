@@ -2776,6 +2776,7 @@ fn porcelain_v2_output(
         };
         drop(head);
         out.push_str(&format!("# branch.head {head_name}\n"));
+        branch_get(repo, out.as_bytes())?;
         if let Some(t) = tracking_info(repo)? {
             out.push_str(&format!("# branch.upstream {}\n", t.upstream));
             if !t.gone {
@@ -3194,6 +3195,7 @@ fn porcelain_v2_output(
             drop(head);
             b.extend_from_slice(format!("# branch.head {head_name}").as_bytes());
             b.push(0);
+            branch_get(repo, &b)?;
             if let Some(t) = tracking_info(repo)? {
                 b.extend_from_slice(format!("# branch.upstream {}", t.upstream).as_bytes());
                 b.push(0);
@@ -3637,6 +3639,22 @@ fn uf_was_slow(t0: Option<std::time::Instant>) -> Option<f64> {
         t0.elapsed().as_millis() as u64
     };
     (ms > UF_DELAY_WARNING_IN_MS).then(|| ms as f64 / 1000.0)
+}
+
+/// `branch = branch_get(branch_name)` in `wt_porcelain_v2_print_tracking()`
+/// (wt-status.c:2368): remote.c's `read_config()` parses every `remote.*` and
+/// `branch.*` key, so `-c remote.origin.prune==` dies there. The
+/// `# branch.oid` / `# branch.head` lines are already in stdio's buffer and
+/// `die()`'s `exit()` flushes them, so `printed` goes out before the error.
+fn branch_get(repo: &gix::Repository, printed: &[u8]) -> Result<()> {
+    if let Err(r) = crate::cmd_config::read_remote_config(repo) {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(printed);
+        let _ = stdout.flush();
+        return Err(r.into_error());
+    }
+    Ok(())
 }
 
 fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {

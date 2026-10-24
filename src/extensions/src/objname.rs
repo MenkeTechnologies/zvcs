@@ -2720,7 +2720,7 @@ pub fn upstream_mark_fatal_allowed(
 
     let full = format!("refs/heads/{name}");
     // `branch->merge[0]->dst`, which is the whole condition when it is present.
-    if crate::porcelain::branch::upstream_ref(repo, full.as_str().into()).is_some() {
+    if crate::porcelain::branch::upstream_name(repo, full.as_str().into()).is_some() {
         return None;
     }
     if repo.try_find_reference(full.as_str()).ok().flatten().is_none() {
@@ -2918,8 +2918,8 @@ fn push_dest(repo: &gix::Repository, named: &str) -> Result<String, String> {
     // answer with the upstream itself. Its `die()` has already been taken above
     // each call, so the `None` here is the state that arm cannot be in.
     let upstream_value = || -> Result<String, String> {
-        crate::porcelain::branch::upstream_ref(repo, refname.as_str().into())
-            .map(|up| up.as_bstr().to_string())
+        crate::porcelain::branch::upstream_name(repo, refname.as_str().into())
+            .map(|up| up.to_string())
             .ok_or_else(|| format!("no upstream configured for branch '{name}'"))
     };
 
@@ -3426,8 +3426,8 @@ fn resolve_ref_oid(repo: &gix::Repository, full: &str) -> Option<ObjectId> {
 ///
 ///   * `interpret_empty_at()`: a bare `@` is `HEAD`;
 ///   * `interpret_branch_mark()` with `branch_get_upstream()`: `<branch>@{u}` and
-///     `<branch>@{upstream}` become the full name of that branch's
-///     remote-tracking ref, with anything after the mark carried over.
+///     `<branch>@{upstream}` become that branch's upstream as
+///     `set_shortened_ref()` spells it, with anything after the mark carried over.
 ///
 /// `Some(Err(_))` is the `die()` [`upstream_mark_fatal`] words. `None` means git
 /// leaves the operand exactly as typed — including `@{push}`, whose `push.default`
@@ -3476,7 +3476,7 @@ pub fn interpret_branch_name(
     } else {
         format!("refs/heads/{branch}")
     };
-    let Some(upstream) = crate::porcelain::branch::upstream_ref(repo, full.as_str().into()) else {
+    let Some(upstream) = crate::porcelain::branch::upstream_name(repo, full.as_str().into()) else {
         return Some(Err(upstream_mark_fatal(repo, name)?));
     };
     // `upstream_mark()` returns the length it matched, and `interpret_branch_name`
@@ -3486,7 +3486,13 @@ pub fn interpret_branch_name(
         .iter()
         .find(|m| rest.len() >= m.len() && rest[..m.len()].eq_ignore_ascii_case(m))
         .map(|m| m.len())?;
-    Some(Ok(format!("{}{}", upstream.as_bstr(), &rest[mark_len..])))
+    // `set_shortened_ref(r, buf, value)` (object-name.c:1467, :1403-1409) stores
+    // `refs_shorten_unambiguous_ref(…, value, 0)`, not the full name, and that
+    // short form is what `repo_dwim_ref()` then expands: an upstream of
+    // `refs/tags/dup` comes back as `dup`, which a `refs/heads/dup` makes
+    // ambiguous, so `work@{u}` warns as stock does.
+    let short = crate::refname::shorten_unambiguous(repo, &upstream, false);
+    Some(Ok(format!("{}{}", String::from_utf8_lossy(&short), &rest[mark_len..])))
 }
 
 /// `interpret_branch_mark()` with `push_mark`/`branch_get_push()`

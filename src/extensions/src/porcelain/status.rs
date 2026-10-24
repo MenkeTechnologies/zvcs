@@ -3754,14 +3754,21 @@ fn tracking_info(repo: &gix::Repository) -> Result<Option<Tracking>> {
     // `...<upstream> [ahead N, behind M]` half missing, while `git status`'s long
     // format reported the divergence from the same configuration.
     let full = branch_ref.name().as_bstr().to_owned();
-    let Some(upstream_name) = super::branch::upstream_ref(repo, full.as_bstr()) else {
+    // `branch_get_upstream()`'s value as it stands, which for the local remote `.`
+    // can be the unqualified `branch.<name>.merge` (remote.c:1802-1807).
+    let Some(upstream_name) = super::branch::upstream_name(repo, full.as_bstr()) else {
         return Ok(None);
     };
-    // `refs_shorten_unambiguous_ref(…, base, 0)` (wt-status.c:2138-2139).
-    let upstream = upstream_name.shorten().to_str_lossy().into_owned();
+    // `refs_shorten_unambiguous_ref(…, base, 0)` (wt-status.c:2239-2240): not a
+    // category strip, so a branch whose name a tag shares stays `heads/<name>`.
+    let upstream = crate::refname::shorten_unambiguous_str(repo, &upstream_name.to_str_lossy(), false);
     // `sti < 0` with a `base` is the gone upstream; the counts are `num_ours` /
-    // `num_theirs`, which are zero for an identical tip.
-    match super::branch::stat_tracking_info(repo, repo.head_id().ok(), &upstream_name) {
+    // `num_theirs`, which are zero for an identical tip. An unqualified name is
+    // one `stat_branch_pair()`'s `refs_read_ref()` never finds.
+    let counted = gix::refs::FullName::try_from(upstream_name)
+        .ok()
+        .and_then(|name| super::branch::stat_tracking_info(repo, repo.head_id().ok(), &name));
+    match counted {
         Some((ahead, behind)) => Ok(Some(Tracking {
             upstream,
             gone: false,
@@ -3882,13 +3889,12 @@ fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
     // `upstream_ref` / `push_ref` are this crate's `branch_get_upstream()` and
     // `branch_get_push()`; git reads both once, outside the loop
     // (`remote.c:2397-2398`), because the loop compares against them.
-    let upstream = super::branch::upstream_ref(repo, full.as_bstr());
-    let push = super::branch::push_ref(repo, full.as_bstr());
+    let upstream = super::branch::upstream_name(repo, full.as_bstr());
+    let push = super::branch::push_ref(repo, full.as_bstr()).map(|n| n.as_bstr().to_owned());
     let local = repo.head_id().ok();
     let local_short = full.strip_prefix(b"refs/heads/".as_slice()).map(|s| s.to_str_lossy().into_owned());
 
-    let mut seen: std::collections::HashSet<gix::refs::FullName> =
-        std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<gix::bstr::BString> = std::collections::HashSet::new();
     let mut out = Vec::new();
     for name in compare_branch_names(repo) {
         let resolved = if name.eq_ignore_ascii_case("@{upstream}") {
@@ -3924,7 +3930,7 @@ fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
         if is_push {
             if upstream.as_ref() != Some(&full_ref) {
                 let remote = super::branch::pushremote_for_branch(repo, local_short.as_deref());
-                let full_str = full_ref.as_bstr().to_str_lossy();
+                let full_str = full_ref.to_str_lossy();
                 if let Some(branch) = full_str
                     .strip_prefix("refs/remotes/")
                     .and_then(|rest| rest.strip_prefix(remote.as_str()))
@@ -3937,9 +3943,14 @@ fn tracking_comparisons(repo: &gix::Repository) -> Result<Vec<Comparison>> {
                 pull_advice = true;
             }
         }
-        let counts = super::branch::stat_tracking_info(repo, local, &full_ref);
+        // `stat_branch_pair()` reads `base` exactly, which an unqualified
+        // upstream never names.
+        let counts = gix::refs::FullName::try_from(full_ref.clone())
+            .ok()
+            .and_then(|name| super::branch::stat_tracking_info(repo, local, &name));
         out.push(Comparison {
-            name: full_ref.shorten().to_str_lossy().into_owned(),
+            // `refs_shorten_unambiguous_ref(…, full_ref, 0)` (remote.c:2492-2493).
+            name: crate::refname::shorten_unambiguous_str(repo, &full_ref.to_str_lossy(), false),
             gone: counts.is_none(),
             ahead: counts.map_or(0, |c| c.0),
             behind: counts.map_or(0, |c| c.1),

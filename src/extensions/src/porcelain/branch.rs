@@ -516,11 +516,11 @@ fn branch_mark(
         b => format!("refs/heads/{b}"),
     };
     // `value = get_data(branch, &err); if (!value) die("%s", err.buf);`
-    let Some(upstream) = upstream_ref(repo, full.as_str().into()) else {
+    let Some(upstream) = upstream_name(repo, full.as_str().into()) else {
         return Err(crate::objname::upstream_mark_fatal_allowed(repo, name, false)
             .unwrap_or_else(|| format!("no upstream configured for branch '{name}'")));
     };
-    let value = upstream.as_bstr().to_str_lossy().into_owned();
+    let value = upstream.to_str_lossy().into_owned();
     // `if (!branch_interpret_allowed(value, options->allowed)) return -1;`
     let ok = match allowed {
         Interpret::Local => value.starts_with("refs/heads/"),
@@ -1465,21 +1465,96 @@ pub(crate) fn worktree_map(repo: &gix::Repository) -> std::collections::HashMap<
 }
 
 /// git's `branch_get_upstream`: the remote-tracking ref `full` is configured to
-/// build on, or `None` when it tracks nothing.
+/// build on, or `None` when it tracks nothing — or when it tracks a name
+/// [`upstream_name`] could only leave unqualified, which no `FullName` can hold.
 pub(crate) fn upstream_ref(repo: &gix::Repository, full: &BStr) -> Option<FullName> {
+    FullName::try_from(upstream_name(repo, full)?).ok()
+}
+
+/// `branch->merge[0]->dst` as `branch_get_upstream()` returns it, byte for byte.
+///
+/// For the local remote `.`, `set_merge()` takes `branch.<name>.merge` through
+/// `repo_dwim_ref()` once `remote_find_tracking()` has found no refspec for it
+/// (remote.c:1798-1808):
+///
+/// ```c
+/// if (repo_dwim_ref(repo, ret->merge[i]->src,
+///                   strlen(ret->merge[i]->src), &oid, &ref,
+///                   0) == 1)
+///         ret->merge[i]->dst = ref;
+/// else
+///         ret->merge[i]->dst = xstrdup(ret->merge[i]->src);
+/// ```
+///
+/// so a name that resolves under exactly one `ref_rev_parse_rules` spelling
+/// becomes that ref (with symrefs followed: `HEAD` names the checked-out branch),
+/// while one that resolves under none, or under several (`refs_found > 1`, a
+/// branch and a tag both called `dup`), stays exactly as configured. That raw
+/// `dup` is the upstream every reader then reports: `%(upstream)` prints it, and
+/// `stat_tracking_info()`'s exact read of it fails, so the branch is `[gone]`.
+pub(crate) fn upstream_name(repo: &gix::Repository, full: &BStr) -> Option<BString> {
+    thread_local! {
+        /// `set_merge()`'s result per `(branch, branch.<name>.merge)`: `None`
+        /// while the dwim is still running, the `dst` once it has.
+        static SET_MERGE: std::cell::RefCell<std::collections::HashMap<(BString, String), Option<BString>>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
     let name = FullName::try_from(full.to_owned()).ok()?;
-    // git's `set_merge`: a `branch.<name>.remote` of `.` means the upstream lives
-    // in this very repository, so `branch.<name>.merge` *is* the upstream ref and
-    // no fetch refspec is consulted.
-    let local_remote = repo
-        .config_snapshot()
-        .string(&format!("branch.{}.remote", name.shorten()))
+    let snap = repo.config_snapshot();
+    let short = name.shorten();
+    let local_remote = snap
+        .string(&format!("branch.{short}.remote"))
         .is_some_and(|v| v.as_bstr() == ".");
     if local_remote {
-        return repo
-            .branch_remote_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
-            .ok();
+        let merge = snap
+            .strings(&format!("branch.{short}.merge"))
+            .and_then(|v| v.into_iter().next())?;
+        let merge = merge.to_str_lossy().into_owned();
+        // `remote_find_tracking(remote, ret->merge[i])` for the remote named `.`,
+        // whose fetch refspecs are `remote...fetch`.
+        let fetch: Vec<String> = snap
+            .strings("remote...fetch")
+            .into_iter()
+            .flatten()
+            .map(|v| v.to_str_lossy().into_owned())
+            .collect();
+        if let Some(dst) = remote_find_tracking_src(&fetch, &merge) {
+            return Some(dst.into());
+        }
+        // `if (ret->set_merge) return;` (remote.c:1784-1785): the branch is set up
+        // once per process, so `repo_dwim_ref()`'s `ignoring dangling symref`
+        // warning comes out once however many readers ask for the upstream.
+        let key = (full.to_owned(), merge.clone());
+        match SET_MERGE.with(|done| done.borrow().get(&key).cloned()) {
+            Some(Some(dst)) => return Some(dst),
+            // `ret->set_merge = 1` is raised before the loop (remote.c:1794), so a
+            // `branch.<name>.merge` of `<name>@{u}` that leads `repo_dwim_ref()`
+            // back here finds the branch set up with no `dst`, and
+            // `interpret_branch_mark()` — `nonfatal_dangling_mark` is 0 here — dies
+            // on `branch_get_upstream()`'s error (object-name.c:1455-1461,
+            // remote.c:1908-1911).
+            Some(None) => {
+                crate::cstdio::flush();
+                eprintln!("fatal: upstream branch '{merge}' not stored as a remote-tracking branch");
+                std::process::exit(128);
+            }
+            None => {}
+        }
+        SET_MERGE.with(|done| done.borrow_mut().insert(key.clone(), None));
+        let found = super::rev_parse::dwim_ref_matches(repo, &merge);
+        let dst: BString = match found.as_slice() {
+            [only] => only.as_str().into(),
+            _ => merge.into(),
+        };
+        SET_MERGE.with(|done| done.borrow_mut().insert(key, Some(dst.clone())));
+        return Some(dst);
     }
+    upstream_remote_ref(repo, name).map(|n| n.as_bstr().to_owned())
+}
+
+/// [`upstream_name`] for a remote other than `.`: the tracking ref the remote's
+/// fetch refspecs map `branch.<name>.merge` to.
+fn upstream_remote_ref(repo: &gix::Repository, name: FullName) -> Option<FullName> {
     // `set_merge()` (remote.c:1798-1801) hands `branch.<name>.merge` to
     // `remote_find_tracking()` exactly as configured. gitoxide qualifies a bare
     // `main` to `refs/heads/main` first, so a `refs/heads/*` fetch refspec

@@ -2562,8 +2562,7 @@ fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
         // `git rev-parse --symbolic-full-name main@{u}` with `refs/heads/side`
         // there; `branch_remote_tracking_ref_name()` has nothing to return.
         if direction == gix::remote::Direction::Fetch {
-            return super::branch::upstream_ref(repo, branch.as_bstr())
-                .map(|r| r.as_bstr().to_owned());
+            return super::branch::upstream_name(repo, branch.as_bstr());
         }
         return repo
             .branch_remote_tracking_ref_name(branch.as_ref(), direction)

@@ -3403,10 +3403,12 @@ fn render_upstream(
     let tracking = if rr.push_remote {
         None
     } else {
+        // `branch_get_upstream()`'s value as it stands: for the local remote `.`
+        // that can be the unqualified `branch.<name>.merge` itself (remote.c:1802-1807).
         let t = if for_push {
-            branch::push_ref(repo, full)
+            branch::push_ref(repo, full).map(|n| n.as_bstr().to_owned())
         } else {
-            branch::upstream_ref(repo, full)
+            branch::upstream_name(repo, full)
         };
         match t {
             Some(t) => Some(t),
@@ -3423,6 +3425,8 @@ fn render_upstream(
             .ok()
             .flatten()
             .and_then(|r| r.into_fully_peeled_id().ok());
+        // An unqualified upstream names no ref `stat_tracking_info()` can read, so
+        // it measures as gone.
         let measured = if for_push {
             branch::push_ref(repo, full)
         } else {
@@ -3436,7 +3440,7 @@ fn render_upstream(
     let value = match &rr.option {
         RrOption::Ref(m) => {
             let name = tracking.expect("a non-push_remote option resolved one");
-            let name = name.as_bstr().to_vec();
+            let name = name.to_vec();
             return Ok(match m {
                 NameMod::Full => name,
                 // `shorten_unambiguous_ref` against the live ref set, exactly as
@@ -3495,11 +3499,15 @@ fn render_upstream(
                 // branch would still push somewhere under `push.default`.
                 name.and_then(|n| push_refspec_dest(repo, &n))
             } else {
-                // A fetch reports `branch.<name>.merge` verbatim.
-                name.and_then(|n| {
-                    repo.branch_remote_ref_name(n.as_ref(), gix::remote::Direction::Fetch)
-                })
-                .and_then(|r| r.ok())
+                // A fetch reports `branch.<name>.merge` verbatim:
+                // `return xstrdup(branch->merge[0]->src);` (remote.c:734-735),
+                // the configured value before any qualification, so a bare `dup`
+                // stays `dup` where gitoxide's lookup answered `refs/heads/dup`.
+                let first = repo
+                    .config_snapshot()
+                    .strings(&format!("branch.{}.merge", short.to_str_lossy()))
+                    .and_then(|v| v.into_iter().next());
+                return Ok(first.map(|v| v.to_vec()).unwrap_or_default());
             };
             resolved.map(|n| n.as_bstr().to_string()).unwrap_or_default()
         }

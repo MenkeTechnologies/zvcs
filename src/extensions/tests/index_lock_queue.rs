@@ -154,3 +154,41 @@ fn zero_wait_disables_the_budget() {
         "a 0ms budget must not sleep through the default wait (took {elapsed:?})"
     );
 }
+
+/// With no daemon the queued job runs inline, fails on the same stuck lock, and
+/// that failure is printed by the command that hit it. It must not be printed a
+/// second time by the next command in the repo: `surface_pending_failures` is for
+/// a daemon job nobody has seen yet, and an inline row left unnotified made an
+/// unrelated, successful `update-ref` open with
+/// `zvcs: exec: … failed: fatal: Unable to create '…/index.lock': File exists.`
+#[test]
+fn an_inline_job_failure_is_not_reported_again_by_the_next_command() {
+    let (repo, home) = fixture("nosurface");
+    let lock = take_index_lock(&repo); // held through the add only
+
+    let add = zvcs(&repo, &home, &[("ZVCS_INDEX_LOCK_WAIT_MS", "50")], &["add", "a.txt"]);
+    assert!(!add.status.success(), "the inline re-run meets the same lock");
+    std::fs::remove_file(&lock).expect("release index.lock");
+
+    assert!(
+        zvcs(
+            &repo,
+            &home,
+            &[
+                ("GIT_AUTHOR_NAME", "A"),
+                ("GIT_AUTHOR_EMAIL", "a@example.com"),
+                ("GIT_COMMITTER_NAME", "A"),
+                ("GIT_COMMITTER_EMAIL", "a@example.com"),
+                ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+                ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+            ],
+            &["commit", "-q", "--allow-empty", "-m", "c"],
+        )
+        .status
+        .success(),
+        "commit"
+    );
+    let next = zvcs(&repo, &home, &[], &["update-ref", "refs/heads/other", "HEAD"]);
+    assert!(next.status.success(), "update-ref: {}", stderr_of(&next));
+    assert_eq!(stderr_of(&next), "", "the add's failure was already reported once");
+}

@@ -391,5 +391,13 @@ fn finalize(id: Option<i64>, result: &crate::jobrun::JobResult, _spec: &Value) {
         let state = if result.ok { "done" } else { "failed" };
         let exit = if result.ok { 0 } else { 1 };
         let _ = crate::db::job_finished(&conn, id, state, exit, &result.output, result.sha_after.as_deref());
+        // An inline run's failure has already been printed by `run_inline` and
+        // returned as this process's status. Left unnotified, the NEXT command in
+        // the repo would print it a second time through
+        // `surface_pending_failures` as `zvcs: exec: … failed: fatal: …`, in front
+        // of that command's own (possibly successful) output.
+        if !result.ok {
+            let _ = crate::db::mark_notified(&conn, &[id]);
+        }
     }
 }

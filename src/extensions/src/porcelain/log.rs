@@ -2062,10 +2062,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         } else if a == "--do-walk" {
             no_walk = None;
         } else if a == "-g" || a == "--walk-reflogs" {
-            // `init_reflog_walk(&revs->reflog_info)`: the walk stops being a
-            // traversal of ancestry and becomes one of each named ref's reflog.
+            // `init_reflog_walk(&revs->reflog_info)` (revision.c:2459-2460): the walk
+            // stops being a traversal of ancestry and becomes one of each named
+            // ref's reflog. `init_reflog_walk()` is a bare `CALLOC_ARRAY(*info, 1)`
+            // (reflog-walk.c:132-136), so every `-g` — including a repeat, or the
+            // one `cmd_log_reflog()` already ran — throws away the reflogs queued so
+            // far: only what follows the last one is walked, and `git reflog --all
+            // -g` prints nothing.
             walk_reflogs = true;
-            reflog_walk_from.get_or_insert([
+            reflog_walk_from = Some([
                 revs.len(),
                 ref_selections.len(),
                 reflog_selections.len(),

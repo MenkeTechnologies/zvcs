@@ -1188,8 +1188,18 @@ fn pick_one(
     // `--ff`: HEAD is exactly the picked commit's parent, so replaying the
     // change is a fast-forward. git prints nothing in this case.
     if opts.allow_ff && base_id == Some(head_id) {
-        advance_head(&repo, head_id, pick_id, "cherry-pick: fast-forward".into())?;
+        // `fast_forward_to()` (sequencer.c:657-676) checks the picked tree out with
+        // `checkout_fast_forward()` before it opens the `HEAD` transaction, and a
+        // transaction that fails is `error("%s", err.buf)` and `return -1` — which
+        // `do_pick_commit()` hands on as `PICK_RESULT_ERROR`, so the command ends on
+        // `die(_("cherry-pick failed"))` with the index and work tree already moved.
         state.index = update_clean_worktree(&repo, &state.index, pick_tree, &should_interrupt)?;
+        if let Some(message) =
+            held_ref_lock(advance_head(&repo, head_id, pick_id, "cherry-pick: fast-forward".into()))?
+        {
+            eprintln!("error: {message}");
+            return Ok(PickOutcome::Stopped(sequencer_failed_tail()));
+        }
         state.head_id = pick_id;
         return Ok(PickOutcome::Done);
     }
@@ -1663,8 +1673,11 @@ fn pick_one(
             opts.gpg_sign,
             allow_empty_flag,
         )?;
+        // `res = !!res` (sequencer.c:2570): whatever status the child `git commit`
+        // exited with — its 128 on a `HEAD` it could not lock included — the pick
+        // stops at 1.
         if code != ExitCode::SUCCESS {
-            return Ok(PickOutcome::Stopped(code));
+            return Ok(PickOutcome::Stopped(ExitCode::FAILURE));
         }
         state.head_id = repo.head_id()?.detach();
         state.index = repo.open_index()?;
@@ -1704,13 +1717,28 @@ fn pick_one(
         super::commit::sequencer_signer(&repo, opts.gpg_sign).as_ref(),
     )?;
 
+    // `do_recursive_merge()` has written the merged index and work tree before
+    // `do_commit()` runs, so they are in place ahead of the `HEAD` update — and
+    // ahead of the `post-commit` hook, which reads that index.
+    state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
     let reflog = gix::reference::log::message("cherry-pick", message.as_bstr(), 1);
-    advance_head(&repo, head_id, new_id, reflog)?;
+    // `try_to_commit()`: a failed `update_head_with_reflog()` is
+    // `res = error("%s", err.buf)` (sequencer.c:1693-1696), which `do_pick_commit()`
+    // folds to `res = !!res` (sequencer.c:2570) — `PICK_RESULT_CONFLICTS`, status 1
+    // with no `cherry-pick failed` die. The merged index, `MERGE_MSG` (which
+    // `do_commit()` only unlinks on success) and the `CHERRY_PICK_HEAD` that
+    // sequencer.c:2474-2479 wrote before the commit all stay behind. Reported here
+    // rather than returned, so a held branch lock is the command's own stop and not
+    // lock contention for the dispatcher to re-run against that now-merged index.
+    if let Some(message) = held_ref_lock(advance_head(&repo, head_id, new_id, reflog))? {
+        crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
+        eprintln!("error: {message}");
+        return Ok(PickOutcome::Stopped(ExitCode::FAILURE));
+    }
     // `run_commit_hook(0, r->index_file, NULL, "post-commit", NULL)`
     // (sequencer.c:1697), the last thing `try_to_commit()` does. Its exit status
     // is dropped: git ignores a failing `post-commit`.
     let _ = crate::hooks::run(&repo, "post-commit", &[], None);
-    state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
     // The commit consumes `MERGE_MSG` — `do_commit()` passes it as the message
     // file and `remove_branch_state()` unlinks it — so a landed pick leaves
     // neither it nor `CHERRY_PICK_HEAD` behind, whichever arm wrote them.
@@ -2199,7 +2227,14 @@ fn continue_single_pick(
     // [`super::replay_commit::continue_reflog_action`].
     let action = super::replay_commit::continue_reflog_action(repo);
     let reflog = gix::reference::log::message(&action, message.as_bstr(), 1);
-    advance_head(repo, head_id, new_id, reflog)?;
+    // That child's `HEAD` transaction failing is `die("%s", err.buf)` after
+    // `rollback_index_files()` (builtin/commit.c:1945-1948), and `continue_single_pick()`
+    // returns its 128 as the command's status (sequencer.c:5354-5379). Raised as a
+    // `fatal:` rather than returned as the lock error, which the dispatcher would
+    // take for contention and re-run.
+    if let Some(message) = held_ref_lock(advance_head(repo, head_id, new_id, reflog))? {
+        return Err(crate::fatal::die(message));
+    }
     // `sequencer_post_commit_cleanup()`, which is what the child `git commit`
     // runs on its way out: the pseudo-refs always go, the sequencer directory
     // only once the todo is down to the instruction just finished.
@@ -2408,6 +2443,21 @@ fn index_differs_from(
         }
     }
     Ok(staged != flatten(repo, head_tree)?)
+}
+
+/// `Ok(Some(message))` when `moved` failed because another process holds the ref's
+/// lock — the `cannot lock ref 'HEAD': Unable to create …` text `lock_raw_ref()`
+/// leaves in `err` — so the caller can report it the way its C path does instead of
+/// handing the dispatcher an error it reads as lock contention. Any other failure
+/// is passed through.
+fn held_ref_lock(moved: Result<()>) -> Result<Option<String>> {
+    match moved {
+        Ok(()) => Ok(None),
+        Err(e) => match crate::fatal::lock_held_fatal(&e) {
+            Some(message) => Ok(Some(message)),
+            None => Err(e),
+        },
+    }
 }
 
 /// Point `HEAD` (writing through to its branch when attached) at `new`, with

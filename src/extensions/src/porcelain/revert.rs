@@ -948,7 +948,7 @@ fn continue_single_pick(
         super::commit::commit_config_signer(repo).as_ref(),
     )?;
     let subject = message.lines().next().unwrap_or("").to_string();
-    repo.edit_reference(RefEdit {
+    let moved = repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
@@ -971,7 +971,18 @@ fn continue_single_pick(
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
         deref: true,
-    })?;
+    });
+    // The child `git commit` dies on a failed `HEAD` transaction —
+    // `die("%s", err.buf)` after `rollback_index_files()` (builtin/commit.c:1945-1948) — and
+    // `continue_single_pick()` returns its 128 as the command's status
+    // (sequencer.c:5354-5379). Raised as that `fatal:` rather than returned as the
+    // lock error, which the dispatcher would take for contention and re-run.
+    if let Err(e) = moved.map_err(anyhow::Error::from) {
+        return Err(match crate::fatal::lock_held_fatal(&e) {
+            Some(message) => crate::fatal::die(message),
+            None => e,
+        });
+    }
 
     let _ = std::fs::remove_file(git_dir.join("MERGE_MSG"));
     crate::sequencer::post_commit_cleanup(repo, false)?;
@@ -1409,10 +1420,13 @@ fn revert_one(
             o.gpg_sign.as_deref(),
             false,
         )?;
+        // `res = !!res` (sequencer.c:2570): whatever status the child `git commit`
+        // exited with — its 128 on a `HEAD` it could not lock included — the revert
+        // stops at 1.
         return Ok(if code == ExitCode::SUCCESS {
             Step::Done
         } else {
-            Step::Failed(code)
+            Step::Failed(ExitCode::FAILURE)
         });
     }
 

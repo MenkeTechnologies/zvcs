@@ -123,7 +123,21 @@ pub(crate) fn run_git_commit(
         enter_toplevel(&repo);
     }
     std::env::set_var("GIT_REFLOG_ACTION", reflog_action(action));
-    super::commit::commit(&args)
+    // A real child that cannot lock `HEAD` dies with `die("%s", err.buf)`
+    // (builtin/commit.c:1945-1948) and exits 128, which `run_command()` hands the
+    // sequencer as a status. In process the same failure is an error the
+    // dispatcher would read as lock contention and re-run the whole pick for, so
+    // it is ended here the way the child would end it.
+    match super::commit::commit(&args) {
+        Err(e) => match crate::fatal::lock_held_fatal(&e) {
+            Some(message) => {
+                eprintln!("fatal: {message}");
+                Ok(ExitCode::from(crate::fatal::EXIT_FATAL))
+            }
+            None => Err(e),
+        },
+        done => done,
+    }
 }
 
 /// The directory a `git commit` child of a sequencer verb starts in.

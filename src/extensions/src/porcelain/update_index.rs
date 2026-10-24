@@ -571,6 +571,15 @@ pub fn update_index(args: &[String]) -> Result<ExitCode> {
             // untracked cache, here or in `tweak_untracked_cache()` on the read, is a
             // reason to write on its own.
             if ctx.dirty || ctx.force_write || ctx.index.untracked_changed() {
+                // `do_write_index()` smudges racily clean entries (read-cache.c:2916-2917), and
+                // comparing a regular file there is an `index_fd()` attribute lookup that dies on
+                // a bad `--attr-source` / `GIT_ATTR_SOURCE` while the lock is still held, so the
+                // index is left as it was.
+                if let Some(message) = super::pack_objects::bad_default_attr_source(&ctx.repo) {
+                    if crate::index_racy::smudge_reads_attributes(&ctx.repo, &ctx.index) {
+                        crate::git_fatal!("{message}");
+                    }
+                }
                 // `do_write_index()` refuses to serialise an entry whose object id
                 // is null, so the write fails and `cmd_update_index` dies. Without
                 // this, `--cacheinfo <mode>,<null oid>,<path>` writes an index
@@ -1010,8 +1019,13 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
             let requested = crate::config::index_version(preferred_index_format.into());
             // The guard and the report both read the *old* version, and both
             // see the zero of an index that was never on disk.
+            // That guard is also the only thing that makes the index worth writing:
+            // `cmd_update_index()` writes on `cache_changed || force_write`
+            // (builtin/update-index.c:1309), so naming the version already on disk
+            // leaves the file untouched — and never runs the write's racy smudge.
             if i32::from(ctx.index_disk_version) != preferred_index_format {
                 ctx.something_changed = true;
+                ctx.dirty = true;
             }
             report(
                 ctx,
@@ -1021,7 +1035,6 @@ fn run(ctx: &mut Ctx, args: &[String]) -> Result<Outcome> {
                 ),
             );
             ctx.index_version = Some(requested);
-            ctx.dirty = true;
         }
     }
 
@@ -1859,6 +1872,11 @@ fn add_one_path(
         Some(a) => a,
         None => return Err(crate::fatal::need_work_tree()),
     };
+    // `add_one_path()` hashes through `index_path()`, whose `S_IFREG` arm is
+    // `index_fd()`: its first step, `would_convert_to_git_filter_fd()`
+    // (object-file.c:952), is an attribute lookup, so a bad `--attr-source` /
+    // `GIT_ATTR_SOURCE` dies here before anything is written.
+    die_on_bad_attr_source(ctx, meta)?;
     let content = read_worktree_content(&abs, meta)?;
     // A symlink's target is stored verbatim: `index_path()` (read-cache.c:2372)
     // takes the `S_IFLNK` arm, which never reaches `index_fd()` and so never

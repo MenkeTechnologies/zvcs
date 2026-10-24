@@ -140,12 +140,50 @@ fn match_stat_basic_differs(
 /// A no-op for an index with no timestamp (never read from disk), for a bare repository, and for
 /// entries whose `mtime` is older than the index's own — the overwhelming majority.
 pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File) {
+    let object_hash = index.object_hash();
+    let smudge: Vec<usize> = racy_comparisons(repo, index)
+        .into_iter()
+        // `ce_modified_check_fs()`: the stat agrees, so the content has to answer.
+        .filter(|(idx, full, meta)| modified_check_fs(object_hash, full, meta, &index.entries()[*idx].id))
+        .map(|(idx, _, _)| idx)
+        .collect();
+
+    for idx in smudge {
+        // `ce->ce_stat_data.sd_size = 0` — the one field git touches, so nothing else about the
+        // entry is disturbed.
+        index.entries_mut()[idx].stat.size = 0;
+    }
+}
+
+/// Does the smudge loop of `do_write_index()` hash a regular file through `index_fd()`?
+///
+/// `ce_modified_check_fs()`'s `S_IFREG` arm is `ce_compare_data()` (read-cache.c:231-245), which
+/// opens the file and hands it to `index_fd()`; that function's first step,
+/// `would_convert_to_git_filter_fd()` (object-file.c:952), is an attribute lookup. So a write
+/// that has a racily clean regular file to compare is where a bad `--attr-source` /
+/// `GIT_ATTR_SOURCE` dies (attr.c:1221-1226), even in a command that never asked for an
+/// attribute itself. A file `git_open_cloexec()` cannot open never reaches `index_fd()`.
+pub(crate) fn smudge_reads_attributes(repo: &gix::Repository, index: &gix::index::File) -> bool {
+    racy_comparisons(repo, index)
+        .iter()
+        .any(|(_, full, meta)| meta.file_type().is_file() && std::fs::File::open(full).is_ok())
+}
+
+/// The entries `do_write_index()` (read-cache.c:2912-2917) takes as far as
+/// `ce_modified_check_fs()` inside `ce_smudge_racily_clean_entry()` (read-cache.c:2574-2594),
+/// each with its worktree path and `lstat`: not `CE_REMOVE`, not `ce_uptodate()`, racy, and with
+/// a stat `ce_match_stat_basic()` cannot already tell apart.
+fn racy_comparisons(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+) -> Vec<(usize, std::path::PathBuf, std::fs::Metadata)> {
+    let mut out = Vec::new();
     if repo.workdir().is_none() {
-        return;
+        return out;
     }
     let timestamp = index.timestamp();
     if timestamp.unix_seconds() == 0 {
-        return;
+        return out;
     }
 
     // `is_racy_stat()` (read-cache.c:355): the entry is racy when the index is not strictly newer
@@ -164,10 +202,8 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
     let snapshot = repo.config_snapshot();
     let trust_executable_bit = snapshot.boolean("core.fileMode").unwrap_or(true);
     let has_symlinks = snapshot.boolean("core.symlinks").unwrap_or(true);
-    let object_hash = index.object_hash();
-    let empty_blob = object_hash.empty_blob();
+    let empty_blob = index.object_hash().empty_blob();
 
-    let mut smudge: Vec<usize> = Vec::new();
     {
         let backing = index.path_backing();
         for (idx, entry) in index.entries().iter().enumerate() {
@@ -206,19 +242,10 @@ pub fn smudge_racily_clean(repo: &gix::Repository, index: &mut gix::index::File)
             ) {
                 continue;
             }
-            // `ce_modified_check_fs()`: the stat agrees, so the content has to answer.
-            if !modified_check_fs(object_hash, &full, &meta, &entry.id) {
-                continue;
-            }
-            smudge.push(idx);
+            out.push((idx, full, meta));
         }
     }
-
-    for idx in smudge {
-        // `ce->ce_stat_data.sd_size = 0` — the one field git touches, so nothing else about the
-        // entry is disturbed.
-        index.entries_mut()[idx].stat.size = 0;
-    }
+    out
 }
 
 /// Write `index` the way every command in this port writes it: git's racy-clean smudge first, then

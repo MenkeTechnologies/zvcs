@@ -1424,6 +1424,19 @@ fn merge_with_strategies(
     // bracket the whole loop, not each attempt: one snapshot is what every
     // `restore_state()` below rewinds to.
     let stash = begin_autostash(repo, opts)?;
+    // A clean `--autostash` reaches `has_uncommitted_changes()`, whose
+    // `run_diff_index()` dies in `unpack_trees()` (sequencer.c:4742-4743).
+    // Without one, `save_state()`'s `stash create` child dies the same way in
+    // `check_changes_tracked_files()` (builtin/stash.c:1264), and the parent
+    // follows with `die(_("stash failed"))` (builtin/merge.c:365-366).
+    if stash.is_none() {
+        if let Some(code) = unpack_trees_excludes_die(repo) {
+            if !opts.autostash {
+                eprintln!("fatal: stash failed");
+            }
+            return Ok(code);
+        }
+    }
     // Same `fflush(NULL)` as above: git reaches `stash create` through
     // `run_command()` too.
     //
@@ -1643,6 +1656,29 @@ fn quit() -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `unpack_trees()` (unpack-trees.c:1922-1926) leaves `preserve_ignored` at 0 for
+/// every caller `cmd_merge` reaches, so each one runs `setup_standard_excludes()`
+/// and dies on an unusable `core.excludesFile` before it reads a tree:
+///
+/// ```c
+/// if (!o->preserve_ignored) {
+///         o->internal.dir = &dir;
+///         o->internal.dir->flags |= DIR_SHOW_IGNORED;
+///         setup_standard_excludes(o->internal.dir);
+/// }
+/// ```
+///
+/// That covers `reset --merge` under `--abort` (builtin/reset.c:83),
+/// `checkout_fast_forward()`, and the `do_diff_cache()` behind
+/// `repo_index_has_changes()`. Prints the `fatal:` line and answers 128, or
+/// `None` when the exclude file is usable — see
+/// [`crate::config::excludes_file_fatal`].
+fn unpack_trees_excludes_die(repo: &gix::Repository) -> Option<ExitCode> {
+    let msg = crate::config::excludes_file_fatal(repo)?;
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(128))
+}
+
 /// `git merge --abort`: `git reset --merge` plus dropping the merge state.
 ///
 /// The reset is confined to the paths the merge touched — every path that has a
@@ -1675,6 +1711,13 @@ fn abort() -> Result<ExitCode> {
         .and_then(|r| r.target().try_id().map(ToOwned::to_owned));
     if stash.is_some() {
         crate::sequencer::delete_state_ref(&repo, MERGE_AUTOSTASH)?;
+    }
+
+    // `cmd_reset()` takes the index lock and reaches `reset_index()`, whose
+    // `unpack_trees()` dies here — after `MERGE_AUTOSTASH` is gone, before
+    // `reset_refs()` writes `ORIG_HEAD` (builtin/reset.c:491-522).
+    if let Some(code) = unpack_trees_excludes_die(&repo) {
+        return Ok(code);
     }
 
     let head = repo.head()?;
@@ -2438,6 +2481,15 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         // `the_repository->index` in place and `read_tree_trivial()` unpacks over
         // that same in-memory index; this port re-runs `read-tree` as a command
         // against the file, so the repaired stat data has to reach the file.
+        //
+        // `repo_index_has_changes()` diffs through `do_diff_cache()`, an
+        // `unpack_trees()` caller (diff-lib.c), so an unusable
+        // `core.excludesFile` dies before the check reports anything. git's
+        // refresh stays in memory, so the port checks before writing it and
+        // leaves the index file as the death leaves it.
+        if let Some(code) = unpack_trees_excludes_die(&repo) {
+            return Ok(code);
+        }
         refresh_and_write_index(&repo)?;
         // "Must first ensure that index matches HEAD before attempting a trivial
         // merge." — `repo_index_has_changes()` (builtin/merge.c:1712-1719). Its
@@ -2490,6 +2542,13 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             );
         }
         let stash = begin_autostash(&repo, opts)?;
+        // `checkout_fast_forward()`'s `unpack_trees()` (merge.c) — or, under a
+        // clean `--autostash`, `create_autostash_ref()` before it.
+        if stash.is_none() {
+            if let Some(code) = unpack_trees_excludes_die(&repo) {
+                return Ok(code);
+            }
+        }
         if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, None)? {
             // `checkout_fast_forward()` refused: `apply_autostash_ref()`, builtin/merge.c:1682.
             end_autostash(&repo, stash, true)?;
@@ -2536,6 +2595,13 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         );
     }
     let stash = begin_autostash(&repo, opts)?;
+    // `checkout_fast_forward()`'s `unpack_trees()` (merge.c) — or, under a
+    // clean `--autostash`, `create_autostash_ref()` before it.
+    if stash.is_none() {
+        if let Some(code) = unpack_trees_excludes_die(&repo) {
+            return Ok(code);
+        }
+    }
     if let Some(code) = guard_checkout(&repo, head_tree, target_tree, &old_index, None)? {
         // `apply_autostash_ref()`, builtin/merge.c:1682.
         end_autostash(&repo, stash, true)?;

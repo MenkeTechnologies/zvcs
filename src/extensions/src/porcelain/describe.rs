@@ -62,10 +62,9 @@ const LONG_OPTS: &[LongOpt] = &[
 ///                                         (git's `name-rev` reverse-ancestry walk)
 ///   * `git describe <blob>`             — name the commit that introduced the blob,
 ///                                         suffixed with `:<path>`
-///   * `--broken[=<mark>]`               — like `--dirty` (git runs the same `diff-index`
-///                                         and appends the *dirty* mark for a dirty tree);
-///                                         `<mark>` itself is for a `diff-index` that could
-///                                         not finish, which cannot happen here
+///   * `--broken[=<mark>]`               — forks `update-index --refresh` and
+///                                         `diff-index --quiet HEAD --`: the *dirty* mark
+///                                         for a dirty tree, `<mark>` for a child that dies
 /// ```
 ///
 /// `--match`/`--exclude` are ports of `builtin/describe.c:get_name()`: the candidate
@@ -238,43 +237,6 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     let mut repo = crate::setup::discover()?;
     repo.object_cache_size_if_unset(4 * 1024 * 1024);
 
-    // ```c
-    // if (!dirty)
-    //         dirty = "-dirty";
-    //
-    // switch (run_command(&cp)) {
-    // case 0:  suffix = NULL;   break;
-    // case 1:  suffix = dirty;  break;
-    // default: suffix = broken;         /* diff-index aborted abnormally */
-    // }
-    // ```
-    //
-    // (builtin/describe.c:780-793.) `--broken` runs the same `diff-index` the plain
-    // `--dirty` path runs, so a dirty work tree earns the *dirty* mark either way —
-    // `--broken`'s own mark is only for a `diff-index` that could not finish, which is
-    // not a failure mode this port has. The check is over tracked changes only:
-    // untracked files never make describe report dirty.
-    //
-    // The in-process `--dirty` arm (builtin/describe.c:756-766) starts with
-    // `refresh_index(REFRESH_QUIET|REFRESH_UNMERGED)`, whose first `ce_compare_data()`
-    // asks attributes and so dies on an `--attr-source` / `GIT_ATTR_SOURCE` naming no
-    // tree-ish — see [`super::read_tree::StatCtx::refresh_dies_on_attr_source`].
-    // `REFRESH_UNMERGED` skips conflicted paths silently. `--broken` runs its
-    // refresh in a child instead and is not covered by this.
-    if dirty.is_some() && broken.is_none() {
-        let index = repo.index_or_empty()?;
-        if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)? {
-            return death.die();
-        }
-    }
-    let dirty_mark = match (&dirty, &broken) {
-        (None, None) => None,
-        (mark, _) => {
-            let mark = mark.clone().unwrap_or_else(|| "-dirty".to_string());
-            repo.is_dirty()?.then_some(mark)
-        }
-    };
-
     // git's first bail: with nothing to name from and no hash fallback, stop before
     // walking. The selector decides what counts as a name — under the default only
     // tags are collected, but unannotated ones still count towards "some name exists".
@@ -284,6 +246,60 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
     if !always && !has_any_name(&repo, select, &filter)? {
         return fatal("No names found, cannot describe anything.");
     }
+
+    // ```c
+    // if (argc == 0) {
+    //         if (broken) {
+    //                 strvec_pushv(&cp.args, update_index_args);
+    //                 cp.git_cmd = 1; cp.no_stdin = 1; cp.no_stdout = 1;
+    //                 run_command(&cp);
+    //                 …
+    //                 strvec_pushv(&cp.args, diff_index_args);
+    //                 …
+    //                 if (!dirty)
+    //                         dirty = "-dirty";
+    //
+    //                 switch (run_command(&cp)) {
+    //                 case 0:  suffix = NULL;   break;
+    //                 case 1:  suffix = dirty;  break;
+    //                 default: suffix = broken;         /* diff-index aborted abnormally */
+    //                 }
+    //         } else if (dirty) {
+    // ```
+    //
+    // (builtin/describe.c:726-756.) The suffix is settled after the "No names
+    // found" gate above (:722-724). `--broken` forks `git update-index --unmerged
+    // -q --refresh` and `git diff-index --quiet HEAD --`, stdout closed and stderr
+    // inherited, and reads only the second child's status: a child that dies — from
+    // a cwd inside `.git`, where neither has a work tree, both print `fatal: this
+    // operation must be run in a work tree` — earns the broken mark, not a fatal.
+    // The check is over tracked changes only: untracked files never make describe
+    // report dirty.
+    //
+    // The in-process `--dirty` arm (builtin/describe.c:756-766) starts with
+    // `refresh_index(REFRESH_QUIET|REFRESH_UNMERGED)`, whose first `ce_compare_data()`
+    // asks attributes and so dies on an `--attr-source` / `GIT_ATTR_SOURCE` naming no
+    // tree-ish — see [`super::read_tree::StatCtx::refresh_dies_on_attr_source`].
+    // `REFRESH_UNMERGED` skips conflicted paths silently.
+    let dirty_mark = match (&dirty, &broken) {
+        (None, None) => None,
+        (mark, Some(broken_mark)) => {
+            let mark = mark.clone().unwrap_or_else(|| "-dirty".to_string());
+            run_git_child(&["update-index", "--unmerged", "-q", "--refresh"]);
+            match run_git_child(&["diff-index", "--quiet", "HEAD", "--"]) {
+                0 => None,
+                1 => Some(mark),
+                _ => Some(broken_mark.clone()),
+            }
+        }
+        (Some(mark), None) => {
+            let index = repo.index_or_empty()?;
+            if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)? {
+                return death.die();
+            }
+            repo.is_dirty()?.then_some(mark.clone())
+        }
+    };
 
     let opts = Options {
         select,
@@ -1361,3 +1377,28 @@ usage: git describe [--all] [--tags] [--contains] [--abbrev=<n>] [<commit-ish>..
                           append <mark> on broken working tree (default: \"-broken\")
 
 ";
+
+/// `run_command()` on a `cp.git_cmd = 1; cp.no_stdin = 1; cp.no_stdout = 1;` child
+/// (builtin/describe.c:729-741): stdin and stdout on `/dev/null`, stderr inherited,
+/// after `start_command()`'s `fflush(NULL)` (run-command.c:743). The answer is
+/// `wait_or_whine()`'s: the exit status, `-1` when the child could not be started,
+/// and `128 + signo` for a child killed by a signal (run-command.c:574-585).
+fn run_git_child(args: &[&str]) -> i32 {
+    use std::process::{Command, Stdio};
+    let Ok(exe) = crate::hosted::git_exe() else {
+        return -1;
+    };
+    crate::cstdio::before_spawn();
+    let status = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status();
+    match status {
+        Ok(status) => status.code().unwrap_or_else(|| {
+            use std::os::unix::process::ExitStatusExt;
+            status.signal().map_or(-1, |sig| sig + 128)
+        }),
+        Err(_) => -1,
+    }
+}

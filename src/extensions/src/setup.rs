@@ -2565,8 +2565,13 @@ pub fn command_line_config_gate(
 ) -> Option<ExitCode> {
     // Verified against git 2.55.0: `version`, a bare `help` and `stripspace` exit 0
     // under a bogus count and under a malformed `-c` alike; everything else
-    // measured reports it and exits 128.
-    let reads_no_config = sub == "version" || sub == "stripspace" || (sub == "help" && args.is_empty());
+    // measured reports it and exits 128. `help` reads configuration only where
+    // `cmd_help()` does (git 2.56.0: `help --developer-interfaces` and `help -a
+    // --no-aliases` exit 0 under both as well), see
+    // [`crate::porcelain::help::reads_config`].
+    let reads_no_config = sub == "version"
+        || sub == "stripspace"
+        || (sub == "help" && !crate::porcelain::help::reads_config(args));
     if reads_no_config {
         return None;
     }

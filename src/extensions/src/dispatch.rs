@@ -1203,13 +1203,14 @@ const CONFIG_GATE_EXEMPT_VERBS: &[&str] = &[
     "version",
 ];
 
-/// `git help` reads configuration only for the forms that consult the command
-/// tables or a manual page. Measured against git 2.55.0 under the same malformed
-/// `.git/config`: bare `git help` and `git help -g` exit 0, while `git help -a`,
-/// `git help --all` and `git help <verb>` exit 128 — and `git <verb> --help` is
-/// rewritten to the last of those, so it dies too.
+/// `git help` reads configuration only where `cmd_help()` does, see
+/// [`crate::porcelain::help::reads_config`]. Measured against git 2.56.0 under a
+/// malformed `.git/config`: bare `help`, `-g`, `--developer-interfaces`, `-c`,
+/// `-a --no-aliases` and every usage refusal answer as if the file were sound, while
+/// `-a`, `--aliases-for-completion` and `help <verb>` exit 128 — and `git <verb>
+/// --help` is rewritten to the last of those, so it dies too.
 fn help_reads_config(args: &[String]) -> bool {
-    !(args.is_empty() || args == ["-g"] || args == ["--guides"])
+    crate::porcelain::help::reads_config(args)
 }
 
 /// Whether the dispatcher's `read_early_config()` reads the repository's config

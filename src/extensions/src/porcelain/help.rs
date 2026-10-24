@@ -1536,8 +1536,88 @@ impl Mode {
     }
 }
 
-/// `git help` — display help information about Git.
-pub fn help(args: &[String]) -> Result<ExitCode> {
+/// `cmd_help()`'s command line once `parse_options()` (builtin/help.c:672-673) and the
+/// post-parse checks at builtin/help.c:676-680 and `opt_mode_usage()` have accepted it.
+struct Parsed<'a> {
+    mode: Option<Mode>,
+    /// The last of `--man`/`--web`/`--info`; `--no-*` clears it.
+    viewer: Option<&'static str>,
+    verbose: bool,
+    externals: bool,
+    aliases: bool,
+    rest: Vec<&'a str>,
+}
+
+/// A command line `cmd_help()` ends before it reaches any configuration read:
+/// every one of these exits from `parse_options()` or the usage checks that
+/// follow it, ahead of `setup_git_directory_gently()` (builtin/help.c:743).
+enum Refusal {
+    /// `--<opt>=<value>` for an option that takes none.
+    NoValue(crate::parseopt::OptName<'static>),
+    Ambiguous { tok: String, first: String, second: String },
+    /// `-h`, `--help` or `--help-all`: the usage block on stdout.
+    Usage(&'static str),
+    /// A second, different `OPT_CMDMODE` mode: `(new, previous)`.
+    ModeConflict(Mode, Mode),
+    /// An unknown option: its name and whether it was a short switch.
+    Unknown(String, bool),
+    /// `usage_msg_opt()`'s `fatal:` line.
+    Fatal(String),
+}
+
+impl Refusal {
+    fn render(self) -> ExitCode {
+        match self {
+            Refusal::NoValue(name) => crate::parseopt::takes_no_value(name),
+            Refusal::Ambiguous { tok, first, second } => {
+                super::ambiguous_option(&tok, &first, &second, USAGE)
+            }
+            Refusal::Usage(usage) => super::show_usage(usage),
+            // git's `OPT_CMDMODE` conflict: one `error:` line on stderr, exit 129,
+            // no usage block.
+            Refusal::ModeConflict(new, prev) => {
+                eprintln!(
+                    "error: options '{}' and '{}' cannot be used together",
+                    new.short_spelling(),
+                    prev.short_spelling()
+                );
+                ExitCode::from(129)
+            }
+            Refusal::Unknown(name, short) => unknown_option(&name, short),
+            Refusal::Fatal(msg) => fatal(&msg),
+        }
+    }
+}
+
+/// Whether `cmd_help()` reads configuration for this command line, which decides
+/// whether the dispatcher's config gates apply to it at all. git.c's `commands[]`
+/// gives `help` no setup flag, so `run_builtin()` reads nothing; the only reads are
+/// `cmd_help()`'s own:
+///
+/// * `--all` in verbose mode with aliases shown: `list_all_cmds_help_aliases()`
+///   calls `list_aliases()` (help.c:486-492, reached from builtin/help.c:687);
+/// * `--aliases-for-completion`: `list_aliases()` (builtin/help.c:721);
+/// * a topic: `setup_git_directory_gently()` and `repo_config()`
+///   (builtin/help.c:743-744).
+///
+/// Every refusal of the parse, every other mode, and a bare `help` return before
+/// any of those. Non-verbose `--all` `break`s into the `!argv[0]` tail
+/// (builtin/help.c:736-741), which reads nothing either.
+pub(crate) fn reads_config(args: &[String]) -> bool {
+    let Ok(parsed) = parse(args) else {
+        return false;
+    };
+    match parsed.mode {
+        Some(Mode::All) => parsed.verbose && parsed.aliases,
+        Some(Mode::AliasesForCompletion) => true,
+        Some(_) => false,
+        None => !parsed.rest.is_empty(),
+    }
+}
+
+/// `parse_options(argc, argv, prefix, builtin_help_options, builtin_help_usage, 0)`
+/// (builtin/help.c:672-673), then the post-parse checks in git's own order.
+fn parse(args: &[String]) -> std::result::Result<Parsed<'_>, Refusal> {
     let mut mode: Option<Mode> = None;
     let mut viewer: Option<&'static str> = None; // last of --man/--web/--info wins
     let mut verbose = true;
@@ -1560,8 +1640,8 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
         // Respell a unique abbreviation as the name it resolves to, so `--user-i`
         // reaches the same arm as `--user-interfaces`.
         let canonical;
-        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
-            return Ok(code);
+        if let Some(name) = super::long_no_value_name(a, LONG_OPTS, &[]) {
+            return Err(Refusal::NoValue(name));
         }
         let a = match super::canonical_long(a, LONG_OPTS) {
             super::Long::Name(name) => {
@@ -1569,7 +1649,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 canonical.as_ref()
             }
             super::Long::Ambiguous(first, second) => {
-                return Ok(super::ambiguous_option(a, &first, &second, USAGE))
+                return Err(Refusal::Ambiguous { tok: a.clone(), first, second });
             }
         };
         if let Some(long) = a.strip_prefix("--") {
@@ -1578,12 +1658,8 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 // (parse-options.c:1122), one line ahead of the `"help"` test
                 // below and rendering `USAGE_FULL` rather than `USAGE_NORMAL`.
                 // Both are exact matches, so neither abbreviates.
-                "help-all" => {
-                    return Ok(super::show_usage(USAGE_ALL));
-                }
-                "help" => {
-                    return Ok(super::show_usage(USAGE));
-                }
+                "help-all" => return Err(Refusal::Usage(USAGE_ALL)),
+                "help" => return Err(Refusal::Usage(USAGE)),
                 "all"
                 | "guides"
                 | "config"
@@ -1602,9 +1678,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                         "user-interfaces" => Mode::UserInterfaces,
                         _ => Mode::DeveloperInterfaces,
                     };
-                    if let Some(code) = set_mode(&mut mode, m) {
-                        return Ok(code);
-                    }
+                    set_mode(&mut mode, m)?;
                 }
                 "verbose" => verbose = true,
                 "no-verbose" => verbose = false,
@@ -1624,7 +1698,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                 // an `OPT_HIDDEN_BOOL` (builtin/help.c:72), so its unset writes 0 —
                 // the state this command already runs in — and resolves too.
                 "exclude-guides" | "no-exclude-guides" => {}
-                _ => return Ok(unknown_option(long, false)),
+                _ => return Err(Refusal::Unknown(long.to_string(), false)),
             }
             continue;
         }
@@ -1632,9 +1706,7 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             // parse-options splits a short-option cluster like `-av`.
             for c in a[1..].chars() {
                 let m = match c {
-                    'h' => {
-                        return Ok(super::show_usage(USAGE));
-                    }
+                    'h' => return Err(Refusal::Usage(USAGE)),
                     'a' => Some(Mode::All),
                     'g' => Some(Mode::Guides),
                     'c' => Some(Mode::Config),
@@ -1654,12 +1726,10 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
                         viewer = Some("--info");
                         None
                     }
-                    _ => return Ok(unknown_option(&c.to_string(), true)),
+                    _ => return Err(Refusal::Unknown(c.to_string(), true)),
                 };
                 if let Some(m) = m {
-                    if let Some(code) = set_mode(&mut mode, m) {
-                        return Ok(code);
-                    }
+                    set_mode(&mut mode, m)?;
                 }
             }
             continue;
@@ -1672,23 +1742,32 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
     // git's post-parse validation, in git's own order.
     if let Some(m) = mode {
         if !rest.is_empty() {
-            return Ok(fatal(&format!(
+            return Err(Refusal::Fatal(format!(
                 "the '{}' option doesn't take any non-option arguments",
                 m.long_spelling()
             )));
         }
         if let Some(v) = viewer {
-            return Ok(fatal(&format!(
+            return Err(Refusal::Fatal(format!(
                 "options '{}' and '{v}' cannot be used together",
                 m.long_spelling()
             )));
         }
     }
     if list_toggle_seen && mode != Some(Mode::All) {
-        return Ok(fatal(
-            "the '--no-[external-commands|aliases]' options can only be used with '--all'",
+        return Err(Refusal::Fatal(
+            "the '--no-[external-commands|aliases]' options can only be used with '--all'".to_string(),
         ));
     }
+    Ok(Parsed { mode, viewer, verbose, externals, aliases, rest })
+}
+
+/// `git help` — display help information about Git.
+pub fn help(args: &[String]) -> Result<ExitCode> {
+    let Parsed { mode, viewer, verbose, externals, aliases, rest } = match parse(args) {
+        Ok(parsed) => parsed,
+        Err(refusal) => return Ok(refusal.render()),
+    };
 
     match mode {
         Some(Mode::All) => {
@@ -1817,21 +1896,16 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// Record a listing mode. A second, different one is rejected exactly as git's
-/// `OPT_CMDMODE` does: one `error:` line on stderr, exit 129, no usage block.
-fn set_mode(slot: &mut Option<Mode>, new: Mode) -> Option<ExitCode> {
+/// Record a listing mode. A second, different one is refused as git's
+/// `OPT_CMDMODE` does, see [`Refusal::ModeConflict`].
+fn set_mode(slot: &mut Option<Mode>, new: Mode) -> std::result::Result<(), Refusal> {
     if let Some(prev) = *slot {
         if prev != new {
-            eprintln!(
-                "error: options '{}' and '{}' cannot be used together",
-                new.short_spelling(),
-                prev.short_spelling()
-            );
-            return Some(ExitCode::from(129));
+            return Err(Refusal::ModeConflict(new, prev));
         }
     }
     *slot = Some(new);
-    None
+    Ok(())
 }
 
 /// git's parse-options response to an unrecognised option: one `error:` line,

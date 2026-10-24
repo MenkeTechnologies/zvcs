@@ -65,12 +65,15 @@
 //! byte-identical to a full `write` restricted to that pack set (and an empty
 //! resulting set reproduces `error: no pack files to index.` / exit 255).
 //!
-//! `write --refs-snapshot=<path>` (and its separate-argument form) is accepted
-//! and discarded: git only consults the snapshot when generating a multi-pack
-//! bitmap, so without `--bitmap` it never influences a single output byte — git
-//! does not even open the file. With `--bitmap` the snapshot would replace the
-//! ref walk that chooses which commits get an entry, which is not ported: the
-//! commit set is always the one `refs_for_each_ref()` produces.
+//! `write --refs-snapshot=<path>` (and its separate-argument form) is an
+//! `OPT_FILENAME`, `:(optional)` and all. git only consults the snapshot when it
+//! writes a multi-pack bitmap, so without `--bitmap` — or when an up-to-date MIDX
+//! already has its bitmap — the file is never opened. With it, the snapshot's
+//! `[+]<oid>` lines replace the ref walk that chooses which commits get an entry,
+//! the `+` marking the ones the selection prefers (see [`read_refs_snapshot`]),
+//! and a file that cannot be opened or holds a bad line dies as git's does,
+//! leaving no MIDX behind. The snapshot does not touch the preferred pack:
+//! `find_commits_for_midx_bitmap()` is its only reader (midx-write.c:1706).
 //!
 //! `write --preferred-pack=<name>` is honoured where it is observable:
 //! duplicate-object resolution, and — with `--bitmap` — the pseudo-pack order
@@ -289,11 +292,11 @@ pub(super) const REPACK_OPTS: &[LongOpt] = &[
 ///     own progress goes to stderr and never to stdout)
 ///   * `-h` at the top level and on every sub-command
 ///
-/// `write` also honours `--stdin-packs`, `--preferred-pack=` and
+/// `write` also honours `--bitmap`, `--stdin-packs`, `--preferred-pack=` and
 /// `--refs-snapshot=` (see the module docs), and reproduces git's two cross-flag
-/// usage errors. `write --bitmap` / `--incremental` and a `--preferred-pack`
-/// that would break a cross-pack duplicate tie `bail!` — see the module docs for
-/// the specific missing substrate.
+/// usage errors. `write --incremental`, and a `--preferred-pack` or `--bitmap`
+/// that would break a cross-pack duplicate tie, `bail!` — see the module docs
+/// for the specific missing substrate.
 pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     // Dispatch includes the verb at index 0.
     let args = match args.first().map(String::as_str) {
@@ -388,6 +391,7 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     let mut base = false;
     let mut stdin_packs = false;
     let mut preferred: Option<String> = None;
+    let mut refs_snapshot: Option<String> = None;
     let mut it = rest.iter().copied();
     while let Some(orig) = it.next() {
         if after_dd {
@@ -433,6 +437,8 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             "--no-write-chain-file" => no_chain = true,
             "--stdin-packs" => stdin_packs = true,
             "--no-stdin-packs" => stdin_packs = false,
+            // `OPTION_FILENAME` returns before touching the value on its negated
+            // form (parse-options.c:214-224), so a preceding snapshot survives.
             "--no-refs-snapshot" => {}
             "--no-base" => base = false,
             "--no-preferred-pack" => preferred = None,
@@ -447,12 +453,23 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
                 }
             },
             _ if a.starts_with("--base=") => base = true,
-            "--refs-snapshot" => {
-                if it.next().is_none() {
+            // `OPT_FILENAME(0, "refs-snapshot", ...)` (builtin/multi-pack-index.c:168-169):
+            // `:(optional)` and the empty name are `get_value()`'s.
+            "--refs-snapshot" => match it.next() {
+                Some(v) => {
+                    crate::parseopt::opt_filename(&mut refs_snapshot, v, crate::parseopt::discovered_prefix)?;
+                }
+                None => {
                     return Ok(value_error("option `refs-snapshot' requires a value"));
                 }
+            },
+            _ if a.starts_with("--refs-snapshot=") => {
+                crate::parseopt::opt_filename(
+                    &mut refs_snapshot,
+                    &a["--refs-snapshot=".len()..],
+                    crate::parseopt::discovered_prefix,
+                )?;
             }
-            _ if a.starts_with("--refs-snapshot=") => {}
             "--preferred-pack" => match it.next() {
                 Some(v) => preferred = Some(v.to_string()),
                 None => {
@@ -662,7 +679,22 @@ fn write(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
     // stock 2.55.0, whose `--stdin-packs` write of one pack of a two-pack
     // repository reports `Packfile doesn't have full closure` and leaves the
     // pack directory exactly as it found it.
-    if bitmap && !write_midx_bitmap(&repo, &pack_dir, &staged.checksum, &staged.written)? {
+    //
+    // A `die()` on the way — `read_refs_snapshot()`'s among them — runs the
+    // lock file's atexit cleanup, which likewise leaves no MIDX behind.
+    let built = if bitmap {
+        write_midx_bitmap(&repo, &pack_dir, &staged.checksum, &staged.written, refs_snapshot.as_deref())
+    } else {
+        Ok(true)
+    };
+    let built = match built {
+        Ok(built) => built,
+        Err(e) => {
+            staged.roll_back();
+            return Err(e);
+        }
+    };
+    if !built {
         staged.roll_back();
         // `error(_("could not write multi-pack bitmap"))` and the `goto cleanup`
         // that leaves `result` at its initial `-1` (midx-write.c:1270, 1717-1722).
@@ -879,6 +911,7 @@ fn write_midx_bitmap(
     pack_dir: &Path,
     checksum: &gix::hash::oid,
     written: &multi_index::write::Outcome,
+    refs_snapshot: Option<&str>,
 ) -> Result<bool> {
     // `pdata->objects`, which `prepare_midx_packing_data()` fills by walking
     // `ctx->pack_order` — so position `i` in it is MIDX pack order.
@@ -894,44 +927,51 @@ fn write_midx_bitmap(
         .map(|(at, entry)| (entry.id, at as u32))
         .collect();
 
-    // `bitmap_writer_build_type_index()` reads each object's type out of the
-    // `object_entry`, which for a MIDX carries none — `packlist_alloc()` leaves
-    // it `OBJ_NONE`, so git falls through to `odb_read_object_info()` for every
-    // one of them. The same lookup, once per object, in the same order.
-    let mut kinds: Vec<gix::object::Kind> = Vec::with_capacity(pack_order.len());
-    for id in &pack_order {
-        let Ok(header) = repo.find_header(*id) else {
-            return Ok(false);
-        };
-        kinds.push(header.kind());
-    }
-    let name_hashes = vec![0u32; written.entries.len()];
-
-    // `find_commits_for_midx_bitmap()`: every commit reachable from a ref that
-    // the MIDX also holds, which is `traverse_commit_list()` over the pending
-    // set `add_ref_to_pending()` built, filtered by `oid_pos()` against the MIDX
-    // entries (midx-write.c:790-800, 838-878).
+    // `find_commits_for_midx_bitmap()`: every commit reachable from the pending
+    // set that the MIDX also holds, which is `traverse_commit_list()` filtered by
+    // `oid_pos()` against the MIDX entries (midx-write.c:790-800, 838-878). The
+    // pending set is the `--refs-snapshot` file's when one was given, and
+    // otherwise the one `add_ref_to_pending()` builds over every ref. It runs
+    // before `write_midx_bitmap()` reads a single object type
+    // (midx-write.c:1706-1716), so a snapshot that dies does so first.
     let mut options = super::pack_objects::BitmapOptions::from_repo(repo);
     options.write = true;
-    let preferred_tips = super::pack_objects::preferred_tip_commits(repo, &options.preferred_tips);
     let mut tips: Vec<gix::ObjectId> = Vec::new();
-    if let Ok(platform) = repo.references() {
-        if let Ok(all) = platform.all() {
-            for reference in all.flatten() {
-                let mut reference = reference;
-                // `reference_get_peeled_oid()` then `object->type != OBJ_COMMIT`:
-                // a tag is followed to the commit, and anything that is not one
-                // is dropped.
-                let Ok(id) = reference.peel_to_id_in_place() else {
-                    continue;
-                };
-                let id = id.detach();
-                if repo.find_commit(id).is_ok() {
-                    tips.push(id);
+    let preferred_tips = match refs_snapshot {
+        Some(path) => {
+            // `NEEDS_BITMAP` comes from the snapshot's `+` marks alone:
+            // `bitmap_is_preferred_refname()` is only asked by
+            // `add_ref_to_pending()`, which this branch never calls.
+            let mut preferred = std::collections::HashSet::new();
+            for (id, plus) in read_refs_snapshot(repo, path)? {
+                tips.push(id);
+                if plus {
+                    preferred.insert(id);
                 }
             }
+            preferred
         }
-    }
+        None => {
+            if let Ok(platform) = repo.references() {
+                if let Ok(all) = platform.all() {
+                    for reference in all.flatten() {
+                        let mut reference = reference;
+                        // `reference_get_peeled_oid()` then `object->type !=
+                        // OBJ_COMMIT`: a tag is followed to the commit, and
+                        // anything that is not one is dropped.
+                        let Ok(id) = reference.peel_to_id_in_place() else {
+                            continue;
+                        };
+                        let id = id.detach();
+                        if repo.find_commit(id).is_ok() {
+                            tips.push(id);
+                        }
+                    }
+                }
+            }
+            super::pack_objects::preferred_tip_commits(repo, &options.preferred_tips)
+        }
+    };
     tips.sort_unstable();
     tips.dedup();
     let mut commits: Vec<(gix::ObjectId, i64, bool, bool)> = Vec::new();
@@ -952,6 +992,19 @@ fn write_midx_bitmap(
     // `prepare_revision_walk()` hands the traversal a date-ordered queue, so the
     // list `bitmap_writer_select_commits()` walks is newest first.
     commits.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // `bitmap_writer_build_type_index()` reads each object's type out of the
+    // `object_entry`, which for a MIDX carries none — `packlist_alloc()` leaves
+    // it `OBJ_NONE`, so git falls through to `odb_read_object_info()` for every
+    // one of them. The same lookup, once per object, in the same order.
+    let mut kinds: Vec<gix::object::Kind> = Vec::with_capacity(pack_order.len());
+    for id in &pack_order {
+        let Ok(header) = repo.find_header(*id) else {
+            return Ok(false);
+        };
+        kinds.push(header.kind());
+    }
+    let name_hashes = vec![0u32; written.entries.len()];
 
     let Some(bytes) = super::pack_objects::build_bitmap(
         repo,
@@ -991,6 +1044,108 @@ fn write_midx_bitmap(
         return Err(e.into());
     }
     Ok(true)
+}
+
+/// `read_refs_snapshot()` (midx-write.c:803-833) followed by the tag peeling
+/// `prepare_revision_walk()` gives each pending object in `handle_commit()`
+/// (revision.c:382-445): the commits the bitmap walk starts from, each paired
+/// with whether its line carried the `+` that sets `NEEDS_BITMAP`.
+///
+/// ```c
+/// if (buf.len && *buf.buf == '+') {
+///         preferred = 1;
+///         hex = &buf.buf[1];
+/// }
+/// if (parse_oid_hex_algop(hex, &oid, &end, revs->repo->hash_algo) < 0)
+///         die(_("could not parse line: %s"), buf.buf);
+/// if (*end)
+///         die(_("malformed line: %s"), buf.buf);
+/// object = parse_object_or_die(revs->repo, &oid, NULL);
+/// ```
+///
+/// Lines come from `strbuf_getline()`, which drops the `\n` and a `\r` before
+/// it, and the whole line — `+` included — is what the two `die()`s quote. A
+/// tag is followed to what it tags with its flags (`object->flags |= flags`),
+/// so `+<tag>` marks the commit; a tree or blob, directly or behind a tag, is
+/// pending but never a commit and so starts no walk.
+///
+/// `path` is the stored `OPT_FILENAME` value. git opens `fix_filename()`'s
+/// spelling from the top of the work tree; zvcs has not `chdir`ed there, so the
+/// typed name opens the same file, and the prefixed spelling is only what
+/// `xfopen()`'s `die_errno()` (wrapper.c:435-451) names.
+fn read_refs_snapshot(repo: &gix::Repository, path: &str) -> Result<Vec<(gix::ObjectId, bool)>> {
+    let prefix = crate::setup::startup_prefix(repo);
+    let depth = prefix
+        .as_deref()
+        .map_or(0, |p| p.split('/').filter(|c| !c.is_empty()).count());
+    // `prefix_filename_except_for_dash()` (abspath.c:286-291) leaves `-` as the
+    // file of that name at the top, not standard input.
+    let (open_path, shown) = if path == "-" {
+        (format!("{}-", "../".repeat(depth)), path.to_owned())
+    } else {
+        (path.to_owned(), crate::setup::prefix_filename(prefix.as_deref(), path))
+    };
+    // git's `fopen()` refuses a directory with EISDIR (`FREAD_READS_DIRECTORIES`).
+    let bytes = match fs::metadata(&open_path) {
+        Ok(meta) if meta.is_dir() => Err(io::Error::from_raw_os_error(libc::EISDIR)),
+        _ => fs::read(&open_path),
+    }
+    .map_err(|e| {
+        crate::fatal::die(format!(
+            "could not open '{shown}' for reading: {}",
+            crate::external::strerror(&e)
+        ))
+    })?;
+
+    let hex_len = repo.object_hash().len_in_hex();
+    let mut tips = Vec::new();
+    let mut rest: &[u8] = &bytes;
+    while !rest.is_empty() {
+        let (line, tail) = match rest.iter().position(|&b| b == b'\n') {
+            Some(at) => (&rest[..at], &rest[at + 1..]),
+            None => (rest, &[][..]),
+        };
+        rest = tail;
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let shown = String::from_utf8_lossy(line);
+        let (plus, hex) = match line.strip_prefix(b"+") {
+            Some(hex) => (true, hex),
+            None => (false, line),
+        };
+        // `parse_oid_hex_algop()`: exactly one object name's worth of hex
+        // digits, either case, and then nothing but the end of the line.
+        let Some(digits) = hex.get(..hex_len).filter(|d| d.iter().all(u8::is_ascii_hexdigit)) else {
+            return Err(crate::fatal::die(format!("could not parse line: {shown}")));
+        };
+        if hex.len() != hex_len {
+            return Err(crate::fatal::die(format!("malformed line: {shown}")));
+        }
+        let id = gix::ObjectId::from_hex(&digits.to_ascii_lowercase())
+            .map_err(|_| crate::fatal::die(format!("could not parse line: {shown}")))?;
+        // `parse_object_or_die(repo, &oid, NULL)` names the object by its hex.
+        let Ok(mut object) = repo.find_object(id) else {
+            return Err(crate::fatal::die(format!("unable to parse object: {id}")));
+        };
+        loop {
+            match object.kind {
+                gix::object::Kind::Commit => {
+                    tips.push((object.id, plus));
+                    break;
+                }
+                gix::object::Kind::Tag => {
+                    let Ok(target) = object.to_tag_ref_iter().target_id() else {
+                        return Err(crate::fatal::die(format!("unable to parse object: {}", object.id)));
+                    };
+                    let Ok(next) = repo.find_object(target) else {
+                        return Err(crate::fatal::die(format!("bad object {target}")));
+                    };
+                    object = next;
+                }
+                gix::object::Kind::Tree | gix::object::Kind::Blob => break,
+            }
+        }
+    }
+    Ok(tips)
 }
 
 /// Read the `--stdin-packs` name set from stdin: one `.idx` basename per line,

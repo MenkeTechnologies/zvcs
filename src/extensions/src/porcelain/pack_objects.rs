@@ -3958,6 +3958,9 @@ pub(crate) fn bitmap_file(
         commits.push((entry.id, date, merge, preferred.contains(&entry.id)));
     }
     commits.sort_by(|a, b| b.1.cmp(&a.1));
+    if commits.is_empty() {
+        return None;
+    }
 
     build_bitmap(
         repo,
@@ -3999,7 +4002,11 @@ pub(crate) fn build_bitmap(
 ) -> Option<Vec<u8>> {
     use pack::data::output::bitmap;
 
-    if pack_order.is_empty() || commits.is_empty() {
+    // No candidate commits is not a failure: `bitmap_writer_select_commits()`
+    // selects none and `bitmap_writer_finish()` still writes the type bitmaps
+    // (pack-bitmap-write.c:1045-1060), which is what a MIDX bitmap over an empty
+    // `--refs-snapshot` is on stock. [`bitmap_file`] keeps its own refusal.
+    if pack_order.is_empty() {
         return None;
     }
     let pack_position: std::collections::HashMap<ObjectId, u32> = pack_order

@@ -5317,14 +5317,22 @@ fn collect_index_worktree(
             let side = |(id, kind): (ObjectId, EntryKind)| -> Result<CombinedSide> {
                 Ok(CombinedSide { kind: Some(kind), id, bytes: blob_bytes(repo, id)?, status: b'M' })
             };
+            // `dpath->mode` is `wt_mode`, which `show_raw_diff()` prints; the patch
+            // reads the file again and takes the mode its own `lstat()` gives
+            // (combine-diff.c:1079), a directory `check_removed()` called removed
+            // reading as an empty result rather than a deleted one.
+            let parents = vec![side(s.ours)?, side(s.theirs)?];
+            let id = repo.object_hash().null();
+            let (patch_kind, bytes, result_deleted) =
+                combined_worktree_result(repo, workdir, &path, unmerged_kind, id, &parents)?;
             combined.push(CombinedPath {
                 path: path.clone(),
-                // A removed result is `deleted_file` in `show_patch_diff()`; one that
-                // is there takes the mode of its own `lstat()` (combine-diff.c:1079).
-                kind: unmerged_kind.and_then(|_| worktree_kind(workdir, &path)),
-                id: repo.object_hash().null(),
-                bytes: read_worktree_bytes(Some(workdir), &path).unwrap_or_default(),
-                parents: vec![side(s.ours)?, side(s.theirs)?],
+                kind: unmerged_kind,
+                patch_kind,
+                result_deleted,
+                id,
+                bytes,
+                parents,
             });
             continue;
         }
@@ -9618,9 +9626,18 @@ fn tree_blob(
 /// (combine-diff.h) as `diff_tree_paths()` fills it in.
 struct CombinedPath {
     path: BString,
-    /// `None` when the result tree does not hold the path, which git records as
-    /// mode `000000` and the null object id.
+    /// `elem->mode` as the path was built, which `show_raw_diff()` prints
+    /// (combine-diff.c:1253). `None` when the result tree does not hold the path,
+    /// which git records as mode `000000` and the null object id.
     kind: Option<EntryKind>,
+    /// `elem->mode` once `show_patch_diff()` has read the result (combine-diff.c:
+    /// 1041-1117), which its header and `mode_differs` test use. A worktree result
+    /// takes its `lstat()` mode there rather than `ce_mode_from_stat()`'s, so under
+    /// `core.fileMode=false` the two differ. Equal to `kind` for a tree result.
+    patch_kind: Option<EntryKind>,
+    /// `result_deleted` (combine-diff.c:1111-1116): the worktree result
+    /// `lstat()` could not find. Never set for a tree result.
+    result_deleted: bool,
     id: ObjectId,
     bytes: Vec<u8>,
     parents: Vec<CombinedSide>,
@@ -9689,7 +9706,7 @@ fn combined_path_set(
         if shared_with_a_parent {
             continue;
         }
-        out.push(CombinedPath { path, kind, id, bytes, parents });
+        out.push(CombinedPath { path, kind, patch_kind: kind, result_deleted: false, id, bytes, parents });
     }
     Ok(out)
 }
@@ -9848,6 +9865,7 @@ fn reverse_combined(set: &mut [CombinedPath]) {
     for cp in set {
         let (kind, id, bytes) = (cp.kind, cp.id, std::mem::take(&mut cp.bytes));
         cp.kind = cp.parents[0].kind;
+        cp.patch_kind = cp.kind;
         cp.id = cp.parents[0].id;
         cp.bytes = cp.parents[0].bytes.clone();
         for p in &mut cp.parents {
@@ -9866,6 +9884,70 @@ fn reverse_combined(set: &mut [CombinedPath]) {
             p.bytes = bytes.clone();
         }
     }
+}
+
+/// What `show_patch_diff()` reads for a worktree result (combine-diff.c:1041-1117):
+/// the result's bytes, `elem->mode` as the read leaves it, and `result_deleted`.
+///
+/// - no `lstat()`, or a file `open()` refuses, is `deleted_file:` — no content,
+///   mode `0`, `result_deleted`;
+/// - a symlink is its target at `canon_mode(S_IFLNK)`;
+/// - a directory keeps `elem->mode` and reads `grab_blob()` of the gitlink's
+///   `HEAD`, or of `elem->oid` when `repo_resolve_gitlink_ref()` finds none — the
+///   null id here, which is an empty result, not a deleted one;
+/// - a file is read at `canon_mode(st.st_mode)`, or at `S_IFLNK` when
+///   `core.symlinks` is off and every parent is a symlink.
+///
+/// `kind` and `id` are the path's `elem->mode` and `elem->oid` as built.
+fn combined_worktree_result(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+    path: &BString,
+    kind: Option<EntryKind>,
+    id: ObjectId,
+    parents: &[CombinedSide],
+) -> Result<(Option<EntryKind>, Vec<u8>, bool)> {
+    let full = workdir.join(gix::path::from_bstr(path.as_bstr()));
+    let deleted = (None, Vec::new(), true);
+    let Ok(meta) = std::fs::symlink_metadata(&full) else {
+        return Ok(deleted);
+    };
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&full)?;
+        return Ok((Some(EntryKind::Link), gix::path::into_bstr(target).into_owned().into(), false));
+    }
+    if meta.is_dir() {
+        let head = gix::open(&full).ok().and_then(|sub| sub.head_id().ok().map(|h| h.detach()));
+        let oid = head.unwrap_or(id);
+        // `grab_blob()` (combine-diff.c:313-321): a gitlink mode reads as its
+        // `Subproject commit` line, a null id as an empty blob.
+        let bytes = match kind {
+            Some(EntryKind::Commit) => format!("Subproject commit {oid}\n").into_bytes(),
+            _ if oid.is_null() => Vec::new(),
+            _ => blob_bytes(repo, oid)?,
+        };
+        return Ok((kind, bytes, false));
+    }
+    let Ok(bytes) = std::fs::read(&full) else {
+        return Ok(deleted);
+    };
+    // `canon_mode()` (object.h:145-148): a regular file is `0755` when the owner may
+    // execute it and `0644` otherwise.
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o100 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    let has_symlinks = super::update_index::ModeRules::from_repo(repo).has_symlinks;
+    let is_file = has_symlinks || parents.iter().any(|p| p.kind != Some(EntryKind::Link));
+    let mode = match (is_file, executable) {
+        (false, _) => EntryKind::Link,
+        (true, true) => EntryKind::BlobExecutable,
+        (true, false) => EntryKind::Blob,
+    };
+    Ok((Some(mode), bytes, false))
 }
 
 /// `show_modified()`'s combined arm (diff-lib.c:408-424) for one queued pair of
@@ -9894,8 +9976,11 @@ fn reverse_combined(set: &mut [CombinedPath]) {
 /// `oneway_diff()` its lowest stage as `idx`, whose zeroed stat never matches the
 /// file, so it is that stage against the tree.
 ///
-/// A gitlink also stays a pair here: `show_patch_diff()` reads its result through
-/// `repo_resolve_gitlink_ref()`, which this renderer does not do.
+/// A gitlink in the tree or the index, or a submodule the stage-0 entry names,
+/// still stays a pair here: `get_stat_data()`'s `match_stat_with_submodule()`
+/// dirty test is not carried into this arm. A repository standing at an unmerged
+/// file's path does combine, its result read through `repo_resolve_gitlink_ref()`
+/// by [`combined_worktree_result`].
 fn oneway_combined_path(
     repo: &gix::Repository,
     index: &gix::index::State,
@@ -9907,15 +9992,10 @@ fn oneway_combined_path(
     let Some((tree_id, tree_kind)) = d.old else {
         return Ok(None);
     };
-    let result_kind = match (&d.new, repo.workdir()) {
-        (_, Some(workdir)) if d.unmerged => match worktree_kind(workdir, &d.path) {
-            Some(k) => k,
-            None => return Ok(None),
-        },
-        (NewSide::Worktree(k) | NewSide::Blob(_, k), _) => *k,
-        _ => return Ok(None),
+    let Some(workdir) = repo.workdir() else {
+        return Ok(None);
     };
-    if tree_kind == EntryKind::Commit || result_kind == EntryKind::Commit {
+    if tree_kind == EntryKind::Commit {
         return Ok(None);
     }
     // The stage-0 entry, or for a conflicted path the lowest stage it has.
@@ -9935,18 +10015,42 @@ fn oneway_combined_path(
     let Some(index_kind) = index_mode_kind(entry.mode) else {
         return Ok(None);
     };
-    let Some(result) = read_worktree_bytes(repo.workdir(), &d.path) else {
-        return Ok(None);
+    // `get_stat_data()` (diff-lib.c:324-343): an unmerged stage's zeroed stat never
+    // matches, so its mode is always `ce_mode_from_stat()` of the lowest stage after
+    // `check_removed()`, and a path that check calls removed stays the pair. That is
+    // a gitlink for a repository standing where the file was, whose result
+    // `show_patch_diff()` reads through `repo_resolve_gitlink_ref()`.
+    let rules = super::update_index::ModeRules::from_repo(repo);
+    let result_kind = match &d.new {
+        _ if d.unmerged || entry.stage_raw() != 0 => match conflict_worktree_kind(workdir, rules, index_kind, &d.path) {
+            Some(k) => k,
+            None => return Ok(None),
+        },
+        NewSide::Worktree(EntryKind::Commit) | NewSide::Blob(_, EntryKind::Commit) => return Ok(None),
+        NewSide::Worktree(k) | NewSide::Blob(_, k) => *k,
+        _ => return Ok(None),
     };
+    if index_kind == EntryKind::Commit {
+        return Ok(None);
+    }
     let side = |kind: EntryKind, id: ObjectId| -> Result<CombinedSide> {
         Ok(CombinedSide { kind: Some(kind), id, bytes: blob_bytes(repo, id)?, status: b'M' })
     };
+    let parents = vec![side(index_kind, entry.id)?, side(tree_kind, tree_id)?];
+    let id = repo.object_hash().null();
+    // `p->mode` is `get_stat_data()`'s `ce_mode_from_stat()` answer, which
+    // `show_raw_diff()` prints; the patch takes the mode the file's own `lstat()`
+    // gives when it reads the result (combine-diff.c:1079).
+    let (patch_kind, bytes, result_deleted) =
+        combined_worktree_result(repo, workdir, &d.path, Some(result_kind), id, &parents)?;
     Ok(Some(CombinedPath {
         path: d.path.clone(),
         kind: Some(result_kind),
-        id: repo.object_hash().null(),
-        bytes: result,
-        parents: vec![side(index_kind, entry.id)?, side(tree_kind, tree_id)?],
+        patch_kind,
+        result_deleted,
+        id,
+        bytes,
+        parents,
     }))
 }
 
@@ -10249,7 +10353,7 @@ fn combined_patch(
         // cannot find is `result_deleted`, which `combine_diff()` and `dump_sline()`
         // both return on at once (combine-diff.c:436-437, 767-768) — the header is
         // all such a path prints.
-        let result_deleted = working_tree_file && cp.kind.is_none();
+        let result_deleted = cp.result_deleted;
         let (sline, cnt) = match binary || result_deleted {
             true => (Vec::new(), 0),
             false => {
@@ -10260,7 +10364,7 @@ fn combined_patch(
         let show_hunks = !binary && !result_deleted && sline_has_marks(&sline, cnt);
         // `for (i = 0; i < num_parent; i++) if (elem->parent[i].mode != elem->mode)`
         // (combine-diff.c:1123-1128).
-        let mode_differs = cp.parents.iter().any(|p| p.kind != cp.kind);
+        let mode_differs = cp.parents.iter().any(|p| p.kind != cp.patch_kind);
         // `if (show_hunks || mode_differs || working_tree_file)` (combine-diff.c:1206):
         // a path whose content matches a parent but whose mode does not still gets a
         // header, with no hunks under it.
@@ -10290,12 +10394,12 @@ fn combined_patch(
         let mut added = false;
         let mut deleted = false;
         if mode_differs {
-            deleted = cp.kind.is_none();
+            deleted = cp.patch_kind.is_none();
             added = !deleted && cp.parents.iter().all(|p| p.status == b'A');
             if added {
                 out.extend_from_slice(line_prefix);
                 push_str(&mut out, "new file mode ");
-                push_str(&mut out, &mode_octal(cp.kind));
+                push_str(&mut out, &mode_octal(cp.patch_kind));
             } else {
                 if deleted {
                     out.extend_from_slice(line_prefix);
@@ -10308,9 +10412,9 @@ fn combined_patch(
                     }
                     push_str(&mut out, &mode_octal(p.kind));
                 }
-                if cp.kind.is_some() {
+                if cp.patch_kind.is_some() {
                     push_str(&mut out, "..");
-                    push_str(&mut out, &mode_octal(cp.kind));
+                    push_str(&mut out, &mode_octal(cp.patch_kind));
                 }
             }
             out.push(b'\n');

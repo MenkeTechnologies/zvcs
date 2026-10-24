@@ -951,6 +951,32 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             )));
         }
     }
+    // builtin/clone.c:1091-1097, still before the banner:
+    //
+    // ```c
+    // if (option_bare)
+    //         work_tree = NULL;
+    // else {
+    //         work_tree = getenv("GIT_WORK_TREE");
+    //         if (work_tree && path_exists(work_tree))
+    //                 die(_("working tree '%s' already exists."), work_tree);
+    // }
+    // ```
+    //
+    // `--work-tree=.` reaches here as `GIT_WORK_TREE=.` (git.c's handle_options), so
+    // `git --work-tree=. clone src dst` dies naming `.` exactly as written.
+    // `path_exists()` (builtin/clone.c:863-867) is a `stat()`, so a dangling symlink
+    // does not count and falls through to the `mkdir()` below.
+    if !bare {
+        if let Some(work_tree) = std::env::var_os("GIT_WORK_TREE") {
+            if std::fs::metadata(&work_tree).is_ok() {
+                return Ok(fatal(&format!(
+                    "working tree '{}' already exists.",
+                    work_tree.to_string_lossy()
+                )));
+            }
+        }
+    }
     // `junk_work_tree` in `cmd_clone()`: git remembers the directory it made so `remove_junk()`
     // can take it down again on any death below, and leaves a directory it found alone.
     let created_destination = !dst.exists();

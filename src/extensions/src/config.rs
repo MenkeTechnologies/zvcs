@@ -722,8 +722,10 @@ pub fn index_version(version: i64) -> gix::index::Version {
 /// `--ignored` needed to provoke it.
 ///
 /// Returns the `fatal:` line to print, or `None` when the exclude file is usable
-/// (or absent). The path is named as configured, which is what git's `fname`
-/// holds after `expand_user_path()` leaves a relative path alone.
+/// (or absent). The path is named as `git_config_pathname()` leaves it in
+/// `fname`: a relative path as configured, and a `~/` path expanded against
+/// `$HOME` (and `~user/`, `%(prefix)/`) by `interpolate_path()` (path.c:698-737),
+/// which is what stock prints.
 pub fn excludes_file_fatal(repo: &gix::Repository) -> Option<String> {
     use gix::bstr::ByteSlice;
     let snapshot = repo.config_snapshot();
@@ -732,14 +734,9 @@ pub fn excludes_file_fatal(repo: &gix::Repository) -> Option<String> {
     if shown.is_empty() {
         return None;
     }
-    let path = gix::path::from_bstr(gix::bstr::BStr::new(&raw)).into_owned();
-    let path = match path.strip_prefix("~") {
-        Ok(rest) => match std::env::var_os("HOME") {
-            Some(home) => std::path::PathBuf::from(home).join(rest),
-            None => path,
-        },
-        Err(_) => path,
-    };
+    let path = crate::setup::interpolate_path(&shown)
+        .unwrap_or_else(|| gix::path::from_bstr(gix::bstr::BStr::new(&raw)).into_owned());
+    let shown = path.to_string_lossy().into_owned();
     match std::fs::read(&path) {
         Ok(_) => None,
         // `ENOENT` is git's silent case: no exclude file, no diagnostic.
@@ -2932,34 +2929,38 @@ fn repository_directories() -> Option<RepositoryDirs> {
             (git_dir, work_tree, false)
         }
     };
-    // `get_common_dir()`: `$GIT_COMMON_DIR`, else a `commondir` file inside
-    // `$GIT_DIR` redirecting the shared half of the repository elsewhere, which is
-    // how a linked worktree is wired up. The file's content is a path, relative to
-    // `$GIT_DIR` unless absolute; git's message shows it resolved, so a
-    // `worktrees/<name>/../..` round trip is normalised away rather than printed.
-    let common_dir = match std::env::var_os("GIT_COMMON_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => match std::fs::read_to_string(git_dir.join("commondir")) {
-            Ok(text) => {
-                let trimmed = text.trim_end_matches(['\n', '\r']);
-                let candidate = PathBuf::from(trimmed);
-                if trimmed.is_empty() {
-                    git_dir.clone()
-                } else if candidate.is_absolute() {
-                    candidate
-                } else {
-                    normalize_lexically(&git_dir.join(candidate))
-                }
-            }
-            Err(_) => git_dir.clone(),
-        },
-    };
+    let common_dir = common_dir_of(&git_dir);
     Some(RepositoryDirs {
         git_dir,
         common_dir,
         work_tree,
         explicit,
     })
+}
+
+/// `get_common_dir()`: `$GIT_COMMON_DIR`, else a `commondir` file inside
+/// `$GIT_DIR` redirecting the shared half of the repository elsewhere, which is
+/// how a linked worktree is wired up. The file's content is a path, relative to
+/// `$GIT_DIR` unless absolute; git's message shows it resolved, so a
+/// `worktrees/<name>/../..` round trip is normalised away rather than printed.
+fn common_dir_of(git_dir: &std::path::Path) -> PathBuf {
+    match std::env::var_os("GIT_COMMON_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::fs::read_to_string(git_dir.join("commondir")) {
+            Ok(text) => {
+                let trimmed = text.trim_end_matches(['\n', '\r']);
+                let candidate = PathBuf::from(trimmed);
+                if trimmed.is_empty() {
+                    git_dir.to_path_buf()
+                } else if candidate.is_absolute() {
+                    candidate
+                } else {
+                    normalize_lexically(&git_dir.join(candidate))
+                }
+            }
+            Err(_) => git_dir.to_path_buf(),
+        },
+    }
 }
 
 /// Collapse `.` and `x/..` in a path without touching the filesystem, the way
@@ -3322,6 +3323,17 @@ pub fn repository_format_refusal() -> Option<String> {
     verify_repository_format(&format)
 }
 
+/// `read_and_verify_repository_format(&fmt, ".", NULL)` from `enter_repo()`
+/// (setup.c:1898), run in the git directory the suffix scan settled on: the
+/// `err` text `die("%s", err.buf)` reports (setup.c:779), or `None` to carry on.
+pub fn repository_format_refusal_in(git_dir: &std::path::Path) -> Option<String> {
+    let format = read_repository_format(&common_dir_of(git_dir).join("config"));
+    if format.version < 0 {
+        return None;
+    }
+    verify_repository_format(&format)
+}
+
 /// What a gently set-up command needs to carry on outside a repository whose
 /// format `verify_repository_format()` refuses: the walk found a work tree,
 /// `repo_discover_implicit_gitdir()` (setup.c:1238-1244) reached
@@ -3437,9 +3449,6 @@ pub fn worktree_config_is_bogus() -> bool {
 /// `die_errno(_("cannot chdir to '%s'"), git_work_tree_cfg)` for every verb that
 /// runs setup, before the builtin says a word. The error is that `die()`.
 pub fn check_bare_and_worktree() -> anyhow::Result<()> {
-    if std::env::var_os("GIT_WORK_TREE").is_some() {
-        return Ok(());
-    }
     let Some(dirs) = repository_directories() else {
         return Ok(());
     };
@@ -3460,6 +3469,12 @@ pub fn check_bare_and_worktree() -> anyhow::Result<()> {
         is_bare = bare.or(is_bare);
         work_tree = tree.or(work_tree);
         has_common = false;
+    }
+    // `$GIT_WORK_TREE` overrides `core.worktree` only after `read_and_verify_repository_format()`
+    // has read both files (setup.c:1175-1190), so an unparsable `core.bare` above still dies
+    // with the variable set.
+    if std::env::var_os("GIT_WORK_TREE").is_some() {
+        return Ok(());
     }
     // `git --bare` starts `is_bare_repository_cfg` at 1 (git.c:258); a
     // `core.bare` in the files replaces it.

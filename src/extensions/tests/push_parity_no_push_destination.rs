@@ -114,3 +114,21 @@ fn a_spelled_out_name_is_a_url_alias() {
     let (_, err, code) = f.run(&["-c", "remote.pushDefault=../r.git", "push", "--all"]);
     assert_eq!((err.as_str(), code), ("To ../r.git\n * [new branch]      main -> main\n", 0));
 }
+
+#[test]
+fn an_empty_name_is_no_remote() {
+    // `remotes_remote_get_1()` aliases the empty name to the empty url, which
+    // `add_url()` takes as a reset (remote.c:75-81, 822-826): the remote has no
+    // url, so `pushremote_get()` is NULL even with `origin` configured. Measured
+    // from stock git 2.56.0.
+    let f = Fixture::new("empty");
+    f.run(&["remote", "add", "origin", "../r.git"]);
+    for key in ["branch.main.pushRemote=", "remote.pushDefault=", "branch.main.remote="] {
+        let (out, err, code) = f.run(&["-c", key, "push"]);
+        assert_eq!((out.as_str(), err.as_str(), code), ("", NO_DESTINATION, 128), "{key}");
+    }
+    for args in [&["push", ""][..], &["push", "--repo="][..]] {
+        let (out, err, code) = f.run(args);
+        assert_eq!((out.as_str(), err.as_str(), code), ("", "fatal: bad repository ''\n", 128));
+    }
+}

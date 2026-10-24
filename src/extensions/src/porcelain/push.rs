@@ -414,10 +414,20 @@ pub fn push(args: &[String]) -> Result<ExitCode> {
     // `origin`, never a refspec named `origin`.
     let explicit_repo = !positionals.is_empty() || f.repo.is_some();
     let remote_name: String = match positionals.first().cloned().or_else(|| f.repo.clone()) {
+        // builtin/push.c:795-797: `pushremote_get(repo)` came back NULL. Only an
+        // empty name does: `remotes_remote_get_1()` (remote.c:822-826) aliases a
+        // given name with no url to itself, and `add_url()` (remote.c:75-81)
+        // takes the empty url as a reset, so the remote stays invalid.
+        Some(r) if !push_remote_valid(&repo, &r) => {
+            crate::git_fatal!("bad repository '{r}'");
+        }
         Some(r) => r,
         None => match default_push_remote(&repo) {
-            Some(name) => name,
-            None => {
+            // builtin/push.c:801-803: a `branch.<name>.pushRemote`,
+            // `remote.pushDefault` or `branch.<name>.remote` set to the empty
+            // string fails the same test, so `pushremote_get(NULL)` is NULL.
+            Some(name) if push_remote_valid(&repo, &name) => name,
+            _ => {
                 // builtin/push.c:761-777: `pushremote_get(NULL)` came back NULL.
                 eprintln!(
                     "fatal: No configured push destination.\n\
@@ -2960,6 +2970,14 @@ fn die_if_repo_looks_like_ref(repo: &gix::Repository, arg: &str) -> Option<Strin
 /// of those keys spelled out — the sole remote, or `origin` — is not taken as a
 /// URL alias, so without a `remote.<name>.url` it is no remote at all
 /// (`valid_remote()`, remote.c:44-47).
+/// `valid_remote()` (remote.c:44-47) on the remote `remotes_remote_get_1()`
+/// (remote.c:805-833) builds from a given name: a name with no configured url
+/// becomes its own url, which `add_url()` (remote.c:75-81) drops when empty.
+/// So only the empty name without a `remote..url` is invalid.
+fn push_remote_valid(repo: &gix::Repository, name: &str) -> bool {
+    !name.is_empty() || !crate::config::multi_values(repo, "remote..url").is_empty()
+}
+
 fn default_push_remote(repo: &gix::Repository) -> Option<String> {
     let snap = repo.config_snapshot();
     let branch = repo

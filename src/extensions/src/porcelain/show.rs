@@ -4175,8 +4175,11 @@ fn show_commit_record(
                 // `printf("%s%c", diff_line_prefix(opt), opt->line_termination)`
                 // (combine-diff.c:1610): the separator is the record terminator, so
                 // `-z` makes it a NUL. It is written on `needsep` alone, whether or
-                // not the combined patch turns out to have sections.
-                if wrote {
+                // not the sections have output of their own — but the whole raw/patch
+                // block sits under `if (num_paths)`, so a merge whose combined path
+                // set is empty (a clean merge, or a pickaxe nothing survived) writes
+                // no separator at all.
+                if wrote && !cc.is_empty() {
                     out.push(if disp.z { b'\0' } else { b'\n' });
                 }
                 out.extend_from_slice(&cc);

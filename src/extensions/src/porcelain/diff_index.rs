@@ -2019,6 +2019,14 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         return Err(crate::fatal::need_work_tree());
     }
 
+    // `diff_cache()` hands the tree to `unpack_trees()` with `preserve_ignored`
+    // at 0 (diff-lib.c:572-588), so `setup_standard_excludes()` dies on an
+    // unusable `core.excludesFile` before a pair is queued, `--cached` or not
+    // (unpack-trees.c:1922-1926).
+    if let Some(code) = super::merge::unpack_trees_excludes_die(&repo) {
+        return Ok(code);
+    }
+
     // Magic (`:(…)`) and glob (`* ? [`) pathspecs go through gitoxide's pathspec engine,
     // git's own algorithm, which applies the cwd prefix, `:(top)`, `:(icase)`, `:(glob)`
     // and `:(exclude)` exactly as git does. Purely literal paths and directory prefixes

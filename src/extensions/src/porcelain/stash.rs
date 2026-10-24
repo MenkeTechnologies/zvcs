@@ -848,6 +848,17 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         return Ok(code);
     }
 
+    // `check_changes()` opens with `check_changes_tracked_files()`, whose
+    // `run_diff_index()` dies in `unpack_trees()` on an unusable
+    // `core.excludesFile` once `HEAD` resolves (builtin/stash.c:1248, 1264,
+    // unpack-trees.c:1922-1926) — after the refresh above has written the index.
+    if repo.head_id().is_ok() {
+        if let Some(msg) = crate::config::excludes_file_fatal(repo) {
+            refresh_and_write_index(repo)?;
+            return Err(crate::fatal::die(msg));
+        }
+    }
+
     // An unborn HEAD has no base to stash against. `do_create_stash()` says so on
     // stderr — unprefixed, and not at all under `-q` — and returns -1; it gets
     // there only after the pathspec check and the refresh above
@@ -2234,7 +2245,15 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // whose first act is `repo_get_oid(the_repository, "HEAD", &dummy)` (:1248): the
     // lookup that dies on an unreadable `core.warnAmbiguousRefs` (refs.c:827) ahead of
     // the index read and its racy hashing. Its answer is re-asked below.
-    let _ = crate::objname::resolve(repo, "HEAD");
+    let head = crate::objname::resolve(repo, "HEAD");
+    // With `HEAD` resolved, the same function's `run_diff_index()` dies in
+    // `unpack_trees()` on an unusable `core.excludesFile` (builtin/stash.c:1264,
+    // unpack-trees.c:1922-1926), before `run_diff_files()` hashes anything.
+    if head.is_some() {
+        if let Some(code) = super::merge::unpack_trees_excludes_die(repo) {
+            return Ok(code);
+        }
+    }
     // `check_changes_tracked_files()` hashes a racily clean entry in
     // `run_diff_files()`, and whatever it lets through reaches
     // `do_create_stash()`'s refresh (builtin/stash.c:1521) — which, unborn HEAD

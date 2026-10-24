@@ -904,6 +904,12 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
 
     // ---- 3. Path form: reset the named index entries only; no HEAD move. ----
     if with_paths {
+        // `read_from_tree()`'s `do_diff_cache()` runs `unpack_trees()`, whose
+        // `setup_standard_excludes()` dies on an unusable `core.excludesFile`
+        // (builtin/reset.c:216, diff-lib.c:572-588, unpack-trees.c:1922-1926).
+        if let Some(code) = super::merge::unpack_trees_excludes_die(&repo) {
+            return Ok(code);
+        }
         // `if (pathspec->nr && pathspec_needs_expanded_index(...)) ensure_full_index(...)`
         // (builtin/reset.c:214-215), before the diff stages anything.
         let expand_first = crate::sparse_index::pathspec_needs_expanded_index(&repo, &old_index, &paths);
@@ -939,6 +945,13 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             }
             Err(_) => gix::ObjectId::empty_tree(repo.object_hash()),
         };
+        // `reset_index()`'s `unpack_trees()` (builtin/reset.c:117) leaves
+        // `preserve_ignored` at 0 for both modes, so `setup_standard_excludes()`
+        // dies on an unusable `core.excludesFile` (unpack-trees.c:1922-1926)
+        // after the KEEP arm's HEAD lookup and before any ref moves.
+        if let Some(code) = super::merge::unpack_trees_excludes_die(&repo) {
+            return Ok(code);
+        }
         let should_interrupt = AtomicBool::new(false);
         let applied = reset_two_tree(
             &repo,
@@ -1004,6 +1017,16 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     // merge/cherry-pick/revert state. `reset_refs()` is gated on `!unborn`, so an
     // unborn branch keeps both HEAD and ORIG_HEAD as they were; `remove_branch_state()`
     // is not gated and runs for every whole-tree reset.
+    //
+    // `--mixed` (`read_from_tree()`'s `do_diff_cache()`) and `--hard`
+    // (`reset_index()`) both reach `unpack_trees()`, and its
+    // `setup_standard_excludes()` dies on an unusable `core.excludesFile` before
+    // `reset_refs()` (builtin/reset.c:496-530, unpack-trees.c:1922-1926).
+    if mode != ResetMode::Soft {
+        if let Some(code) = super::merge::unpack_trees_excludes_die(&repo) {
+            return Ok(code);
+        }
+    }
     let mut head_moved = true;
     if let Some(commit) = &head_commit {
         if let Ok(prev) = repo.head_id() {

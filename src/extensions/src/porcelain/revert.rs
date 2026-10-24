@@ -1482,7 +1482,7 @@ fn revert_one(
         vec![head_id],
         signer.as_ref(),
     )?;
-    repo.edit_reference(RefEdit {
+    let moved = repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
@@ -1496,7 +1496,22 @@ fn revert_one(
             .try_into()
             .map_err(|e| anyhow::anyhow!("invalid ref name HEAD: {e}"))?,
         deref: true,
-    })?;
+    });
+    // `try_to_commit()`: a failed `update_head_with_reflog()` is
+    // `res = error("%s", err.buf)` (sequencer.c:1693-1696), which `do_pick_commit()`
+    // folds to `res = !!res` (sequencer.c:2570) — status 1, no `revert failed` die,
+    // and the index the merge already wrote stays behind. Reported here rather than
+    // returned, so a held branch lock is the command's own refusal and not lock
+    // contention for the dispatcher to re-run against that now-dirty index.
+    if let Err(e) = moved.map_err(anyhow::Error::from) {
+        match crate::fatal::lock_held_fatal(&e) {
+            Some(message) => {
+                eprintln!("error: {message}");
+                return Ok(Step::Failed(ExitCode::FAILURE));
+            }
+            None => return Err(e),
+        }
+    }
 
     // `run_commit_hook(0, r->index_file, NULL, "post-commit", NULL)`
     // (sequencer.c:1697), the last thing `try_to_commit()` does. Its exit status

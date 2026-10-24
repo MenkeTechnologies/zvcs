@@ -1483,6 +1483,129 @@ pub fn ensure_object_identity(repo: &mut gix::Repository, role: &str) -> Option<
     None
 }
 
+/// The refusals of `fmt_ident()` under `IDENT_STRICT` (ident.c:456-542), for a
+/// caller that asks only whether the identity is usable — `cmd_merge`'s bare
+/// `git_committer_info(IDENT_STRICT)` (builtin/merge.c:1722, 1764), whose result
+/// is thrown away.
+///
+/// `role` is `Author` or `Committer`, the word `ident_env_hint()` heads its
+/// block with; it also picks `GIT_<ROLE>_NAME`/`_EMAIL`/`_DATE` and the
+/// `<role>.name`/`<role>.email` config. Each check stands where `fmt_ident()`
+/// makes it:
+///
+/// * the email: the environment variable (set, even empty, is given), then
+///   `<role>.email`, then — unless `user.useConfigOnly` refuses an identity no
+///   `*.email` key gave — `ident_default_email()`, refused when the address it
+///   built from the account and host is bogus;
+/// * the name, the same way through `ident_default_name()`, then an empty name
+///   and a name made only of `crud()` characters;
+/// * `GIT_<ROLE>_DATE`, which `parse_date()` must accept.
+///
+/// `default_name_is_bogus` — a uid with no passwd entry — is not modelled:
+/// [`passwd_self`] substitutes `unknown`/`Unknown` without saying it did.
+///
+/// The verdict depends only on the environment and the config, so a caller that
+/// goes on to inject a reflog identity ([`ensure_reflog_identity`]) takes it
+/// first and reports it, through [`IdentRefusal::die`], where git calls
+/// `fmt_ident()`. `None` means the identity would be formatted.
+pub fn fmt_ident_strict(repo: &gix::Repository, role: &str) -> Option<IdentRefusal> {
+    let upper = role.to_uppercase();
+    let lower = role.to_lowercase();
+    let env = |key: &str| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned());
+    let cfg = repo.config_snapshot();
+    let cfg_str = |key: &str| cfg.string(key).map(|v| v.to_string());
+    // `set_ident()` (ident.c:610-675): any of the three `*.email` keys, or of the
+    // three `*.name` keys, marks `ident_config_given`, even with an empty value.
+    let given = |field: &str| ["user", "author", "committer"].iter().any(|s| cfg.string(&format!("{s}.{field}")).is_some());
+    let mail_given = given("email");
+    let name_given = given("name");
+    let use_config_only = cfg.boolean("user.useConfigOnly").unwrap_or(false);
+    let die = |hint: bool, msg: String| {
+        Some(IdentRefusal {
+            role: hint.then(|| role.to_string()),
+            msg,
+        })
+    };
+
+    // `if (!email) { … git_<role>_email.len … }`: an empty `<role>.email` is no
+    // email at all, where an empty environment variable is one.
+    let email = match env(&format!("GIT_{upper}_EMAIL")).or_else(|| cfg_str(&format!("{lower}.email")).filter(|s| !s.is_empty())) {
+        Some(email) => email,
+        None => {
+            if use_config_only && !mail_given {
+                return die(true, "no email was given and auto-detection is disabled".into());
+            }
+            // `ident_default_email()` (ident.c:171-189) computes only when no
+            // `*.email` key was read and `user.email` is empty; otherwise it
+            // answers `git_default_email`, which is `user.email` or empty.
+            let user_email = cfg_str("user.email").unwrap_or_default();
+            if mail_given || !user_email.is_empty() {
+                user_email
+            } else if let Some(email) = env("EMAIL").filter(|s| !s.is_empty()) {
+                email.trim().to_string()
+            } else {
+                let (addr, bogus) = auto_email(&auto_name().login);
+                let addr = addr.trim().to_string();
+                if bogus {
+                    return die(true, format!("unable to auto-detect email address (got '{addr}')"));
+                }
+                addr
+            }
+        }
+    };
+
+    let (name, using_default) =
+        match env(&format!("GIT_{upper}_NAME")).or_else(|| cfg_str(&format!("{lower}.name")).filter(|s| !s.is_empty())) {
+            Some(name) => (name, false),
+            None => {
+                if use_config_only && !name_given {
+                    return die(true, "no name was given and auto-detection is disabled".into());
+                }
+                // `ident_default_name()` (ident.c:162-169): `copy_gecos()` of the
+                // passwd entry, trimmed, unless a `*.name` key was read.
+                let user_name = cfg_str("user.name").unwrap_or_default();
+                if name_given || !user_name.is_empty() {
+                    (user_name, true)
+                } else {
+                    let (login, gecos) = passwd_self();
+                    (copy_gecos(&gecos, &login), true)
+                }
+            }
+        };
+    if name.is_empty() {
+        return die(using_default, format!("empty ident name (for <{email}>) not allowed"));
+    }
+    // `has_non_crud()` over `crud()` (ident.c:203-223).
+    let crud = |c: u8| c <= 32 || b",:;<>\"\\'".contains(&c);
+    if name.bytes().all(crud) {
+        return die(false, format!("name consists only of disallowed characters: {name}"));
+    }
+    if let Some(date) = env(&format!("GIT_{upper}_DATE")).filter(|s| !s.is_empty()) {
+        if crate::date::parse_date_basic(&date).is_none() {
+            return die(false, format!("invalid date format: {date}"));
+        }
+    }
+    None
+}
+
+/// How [`fmt_ident_strict`] found the identity unusable: the `die()` message, and
+/// the role `ident_env_hint()` heads its advice with when the death prints one.
+pub struct IdentRefusal {
+    role: Option<String>,
+    msg: String,
+}
+
+impl IdentRefusal {
+    /// Print what `fmt_ident()` prints on its way out and answer `die()`'s 128.
+    pub fn die(&self) -> std::process::ExitCode {
+        if let Some(role) = &self.role {
+            identity_advice(role);
+        }
+        eprintln!("fatal: {}", self.msg);
+        std::process::ExitCode::from(128)
+    }
+}
+
 /// The block `fmt_ident()` prints before it gives up, verbatim.
 fn identity_advice(role: &str) {
     eprintln!(

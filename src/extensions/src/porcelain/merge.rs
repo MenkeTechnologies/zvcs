@@ -1357,6 +1357,9 @@ struct MergeCtx<'a> {
     /// The composed merge message. git builds it in `collect_parents()` before
     /// any strategy runs, so every attempt commits the same text.
     message: String,
+    /// What `git_committer_info(IDENT_STRICT)` refuses, if anything — see
+    /// [`crate::fmt_ident_strict`].
+    committer_refusal: Option<&'a crate::IdentRefusal>,
 }
 
 /// What one `try_merge_strategy()` call reported (builtin/merge.c:789-851).
@@ -1426,14 +1429,23 @@ fn merge_with_strategies(
     let stash = begin_autostash(repo, opts)?;
     // A clean `--autostash` reaches `has_uncommitted_changes()`, whose
     // `run_diff_index()` dies in `unpack_trees()` (sequencer.c:4742-4743).
-    // Without one, `save_state()`'s `stash create` child dies the same way in
+    if stash.is_none() && opts.autostash {
+        if let Some(code) = unpack_trees_excludes_die(repo) {
+            return Ok(code);
+        }
+    }
+    // "We are going to make a new commit." — `git_committer_info(IDENT_STRICT)`
+    // (builtin/merge.c:1763-1764), after `create_autostash_ref()` and before
+    // `save_state()`, so an autostash it follows stays in `MERGE_AUTOSTASH`.
+    if let Some(refusal) = ctx.committer_refusal {
+        return Ok(refusal.die());
+    }
+    // Without `--autostash`, `save_state()`'s `stash create` child dies in
     // `check_changes_tracked_files()` (builtin/stash.c:1264), and the parent
     // follows with `die(_("stash failed"))` (builtin/merge.c:365-366).
-    if stash.is_none() {
+    if stash.is_none() && !opts.autostash {
         if let Some(code) = unpack_trees_excludes_die(repo) {
-            if !opts.autostash {
-                eprintln!("fatal: stash failed");
-            }
+            eprintln!("fatal: stash failed");
             return Ok(code);
         }
     }
@@ -1673,7 +1685,7 @@ fn quit() -> Result<ExitCode> {
 /// `repo_index_has_changes()`. Prints the `fatal:` line and answers 128, or
 /// `None` when the exclude file is usable — see
 /// [`crate::config::excludes_file_fatal`].
-fn unpack_trees_excludes_die(repo: &gix::Repository) -> Option<ExitCode> {
+pub(crate) fn unpack_trees_excludes_die(repo: &gix::Repository) -> Option<ExitCode> {
     let msg = crate::config::excludes_file_fatal(repo)?;
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(128))
@@ -2011,6 +2023,10 @@ fn merge_into_unborn(repo: &gix::Repository, refs: &[String], opts: &Opts) -> Re
 
 fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     let mut repo = crate::setup::discover()?;
+    // `git_committer_info(IDENT_STRICT)` (builtin/merge.c:1722, 1764) judges the
+    // configured identity, so the verdict is taken before the reflog identity
+    // below is injected into the in-memory config, and reported where git asks.
+    let committer_refusal = crate::fmt_ident_strict(&repo, "Committer");
     // Moving `HEAD` writes a reflog, and a fast-forward has already touched the
     // worktree by then — a failure there would leave the merge half-applied. git
     // synthesizes an identity for reflog purposes rather than failing.
@@ -2381,6 +2397,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             spec: "",
             diverged: true,
             message: compose_message(&repo, &msg_specs, &targets, branch.as_ref(), local_id, opts)?,
+            committer_refusal: committer_refusal.as_ref(),
         };
         return merge_with_strategies(&repo, &ctx, opts, &picks);
     }
@@ -2501,6 +2518,11 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             crate::merge_guard::report_index_changes(&staged);
             return Ok(ExitCode::from(2));
         }
+        // "See if it is really trivial." — `git_committer_info(IDENT_STRICT)`
+        // (builtin/merge.c:1722) stands ahead of the first line.
+        if let Some(refusal) = &committer_refusal {
+            return Ok(refusal.die());
+        }
         // Both lines are bare `printf`s with no verbosity check, so `-q` keeps
         // them (builtin/merge.c:1723, 1730).
         println!("Trying really trivial in-index merge...");
@@ -2526,6 +2548,7 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             spec,
             diverged,
             message,
+            committer_refusal: committer_refusal.as_ref(),
         };
         return merge_with_strategies(&repo, &ctx, opts, &picks);
     }

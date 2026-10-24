@@ -861,24 +861,27 @@ fn status_report(
 
     // Resolve the head into an owned description so the borrow ends before we
     // re-open references for the tracking computation.
-    let head = repo.head()?;
     // `s->branch` is always read off `HEAD`, whatever `s->reference` is: the
     // "On branch …" line names where the commit will land, not what it is measured
-    // against.
-    let head_unborn = head.is_unborn();
-    let head_state = if head_unborn {
-        HeadState::Unborn(referent_short(head.referent_name(), "main"))
-    } else if head.is_detached() {
-        // `wt_status_get_state(..., s->branch && !strcmp(s->branch, "HEAD"))`
-        // (wt-status.c:883): the reflog lookup runs only for a detached `HEAD`.
-        match detached_from(&repo) {
-            Some((from, at)) => HeadState::Detached { from: Some(from), at },
-            None => HeadState::Detached { from: None, at: false },
+    // against. `s->branch = refs_resolve_refdup(…, "HEAD", 0, NULL, NULL)`
+    // (wt-status.c:153) is NULL rather than fatal when `HEAD` cannot be read —
+    // a symref to a malformed name such as the `refs/heads/.invalid` stub a
+    // reftable repository leaves for the files backend.
+    let head_state = match repo.head() {
+        Err(_) => HeadState::Unknown,
+        Ok(head) if head.is_unborn() => {
+            HeadState::Unborn(referent_short(head.referent_name(), "main"))
         }
-    } else {
-        HeadState::Branch(referent_short(head.referent_name(), "HEAD"))
+        Ok(head) if head.is_detached() => {
+            // `wt_status_get_state(..., s->branch && !strcmp(s->branch, "HEAD"))`
+            // (wt-status.c:885): the reflog lookup runs only for a detached `HEAD`.
+            match detached_from(&repo) {
+                Some((from, at)) => HeadState::Detached { from: Some(from), at },
+                None => HeadState::Detached { from: None, at: false },
+            }
+        }
+        Ok(head) => HeadState::Branch(referent_short(head.referent_name(), "HEAD")),
     };
-    drop(head);
 
     // `s->is_initial = repo_get_oid(s->reference, &oid) ? 1 : 0` (builtin/commit.c:580):
     // whether the *reference* resolves, which for `--amend` is `HEAD^1` and so is
@@ -1459,12 +1462,15 @@ fn status_report(
     // `status.compareBranches` names. Only the format about to be printed is
     // computed, so neither pays for the other's revision walks.
     let ab_t0 = std::time::Instant::now();
-    let tracking = if unborn || !short {
+    // Neither format asks about tracking without a `s->branch` (wt-status.c:1998,
+    // wt-status.c:2209).
+    let no_branch = matches!(head_state, HeadState::Unknown);
+    let tracking = if unborn || no_branch || !short {
         None
     } else {
         tracking_info(&repo)?
     };
-    let comparisons = if unborn || short {
+    let comparisons = if unborn || no_branch || short {
         Vec::new()
     } else {
         tracking_comparisons(&repo)?
@@ -2314,6 +2320,11 @@ enum HeadState {
     /// `Not currently on any branch.`
     Detached { from: Option<String>, at: bool },
     Unborn(String),
+    /// `s->branch` is NULL: `HEAD` itself did not resolve (wt-status.c:153).
+    /// The long format prints no branch line, the short header stops right
+    /// after its `## ` with no terminator (wt-status.c:2207-2210), and
+    /// porcelain v2 says `# branch.head (unknown)` (wt-status.c:2347-2348).
+    Unknown,
 }
 
 /// Upstream relationship of the current branch, as git's `stat_tracking_info`
@@ -2766,18 +2777,16 @@ fn porcelain_v2_output(
             Ok(id) => out.push_str(&format!("# branch.oid {}\n", id.detach())),
             Err(_) => out.push_str("# branch.oid (initial)\n"),
         }
-        let head = repo.head()?;
-        let head_name = if head.is_detached() {
-            "(detached)".to_string()
-        } else {
-            head.referent_name()
-                .map(|n| n.shorten().to_str_lossy().into_owned())
-                .unwrap_or_else(|| "(detached)".to_string())
+        let head_name = v2_branch_head(repo);
+        out.push_str(&format!("# branch.head {}\n", head_name.as_deref().unwrap_or("(unknown)")));
+        let tracking = match head_name {
+            Some(_) => {
+                branch_get(repo, out.as_bytes())?;
+                tracking_info(repo)?
+            }
+            None => None,
         };
-        drop(head);
-        out.push_str(&format!("# branch.head {head_name}\n"));
-        branch_get(repo, out.as_bytes())?;
-        if let Some(t) = tracking_info(repo)? {
+        if let Some(t) = tracking {
             out.push_str(&format!("# branch.upstream {}\n", t.upstream));
             if !t.gone {
                 // FULL prints the exact counts (`+0 -0` when identical); QUICK knows
@@ -3184,19 +3193,18 @@ fn porcelain_v2_output(
                 Err(_) => b.extend_from_slice(b"# branch.oid (initial)"),
             }
             b.push(0);
-            let head = repo.head()?;
-            let head_name = if head.is_detached() {
-                "(detached)".to_string()
-            } else {
-                head.referent_name()
-                    .map(|n| n.shorten().to_str_lossy().into_owned())
-                    .unwrap_or_else(|| "(detached)".to_string())
-            };
-            drop(head);
-            b.extend_from_slice(format!("# branch.head {head_name}").as_bytes());
+            let head_name = v2_branch_head(repo);
+            b.extend_from_slice(b"# branch.head ");
+            b.extend_from_slice(head_name.as_deref().unwrap_or("(unknown)").as_bytes());
             b.push(0);
-            branch_get(repo, &b)?;
-            if let Some(t) = tracking_info(repo)? {
+            let tracking = match head_name {
+                Some(_) => {
+                    branch_get(repo, &b)?;
+                    tracking_info(repo)?
+                }
+                None => None,
+            };
+            if let Some(t) = tracking {
                 b.extend_from_slice(format!("# branch.upstream {}", t.upstream).as_bytes());
                 b.push(0);
                 if !t.gone {
@@ -3646,6 +3654,22 @@ fn uf_was_slow(t0: Option<std::time::Instant>) -> Option<f64> {
 /// `branch.*` key, so `-c remote.origin.prune==` dies there. The
 /// `# branch.oid` / `# branch.head` lines are already in stdio's buffer and
 /// `die()`'s `exit()` flushes them, so `printed` goes out before the error.
+/// The `# branch.head` value of `wt_porcelain_v2_print_tracking`: the short
+/// branch name, `(detached)`, or `None` for a NULL `s->branch` — an
+/// unresolvable `HEAD` (wt-status.c:153) — which prints `(unknown)` and skips
+/// the upstream lookup entirely (wt-status.c:2347-2348).
+fn v2_branch_head(repo: &gix::Repository) -> Option<String> {
+    use gix::bstr::ByteSlice;
+    let head = repo.head().ok()?;
+    Some(if head.is_detached() {
+        "(detached)".to_string()
+    } else {
+        head.referent_name()
+            .map(|n| n.shorten().to_str_lossy().into_owned())
+            .unwrap_or_else(|| "(detached)".to_string())
+    })
+}
+
 fn branch_get(repo: &gix::Repository, printed: &[u8]) -> Result<()> {
     if let Err(r) = crate::cmd_config::read_remote_config(repo) {
         use std::io::Write;
@@ -4002,6 +4026,8 @@ fn short_branch_header(
     let h = |s: &str| colors.paint(Slot::Header, s);
     let mut out = h("## ");
     match head_state {
+        // `if (!s->branch) return;` (wt-status.c:2209): not even the newline.
+        HeadState::Unknown => return out,
         HeadState::Detached { .. } => {
             out.push_str(&colors.paint(Slot::Nobranch, "HEAD (no branch)"));
             out.push('\n');
@@ -4725,6 +4751,8 @@ fn render_long(
             out.push_str(&colors.paint(Slot::Branch, name));
             out.push('\n');
         }
+        // `if (s->branch)` (wt-status.c:1998) guards the whole branch line.
+        HeadState::Unknown => {}
     }
 
     // git prints a blank line after the tracking block and after each
@@ -5601,6 +5629,8 @@ fn short_branch_header_z(
 ) {
     out.extend_from_slice(b"## ");
     match head_state {
+        // `if (!s->branch) return;` (wt-status.c:2209): not even the NUL.
+        HeadState::Unknown => return,
         HeadState::Detached { .. } => {
             out.extend_from_slice(b"HEAD (no branch)");
             out.push(0);

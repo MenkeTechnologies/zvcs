@@ -67,7 +67,14 @@ const ERROR_REFS: u8 = 8;
 ///                                       as in git.
 ///   * `--progress` / `--no-progress` — progress on stderr, defaulting to
 ///                                       `isatty(2)`, and forced off by
-///                                       `--verbose` as `cmd_fsck` does.
+///                                       `--verbose` as `cmd_fsck` does. The
+///                                       ref-database, object-directory and
+///                                       `--full` "Checking objects" meters are
+///                                       drawn per odb source; a source with a
+///                                       multi-pack-index, a scan finding that
+///                                       git would print between redraws, or a
+///                                       pack list whose order cannot be
+///                                       reconstructed is refused.
 ///   * `--verbose` / `-v` / `--no-verbose` — the `Checking ...` trace on stderr;
 ///                                       see divergence 9.
 ///   * `--name-objects`               — decorate each reported id with the path
@@ -296,13 +303,22 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             Some(explicit) => explicit,
             None => std::io::stderr().is_terminal(),
         };
-    if show_progress {
-        // Each odb source gets its own "Checking object directories" block
-        // (handled at the object-directory progress point below), and `--full`
-        // adds a "Checking objects" / commit-graph block per pack that this port
-        // cannot reproduce (no pack verification in the vendored crates).
-        if opt.check_full && !opt.connectivity_only && has_packs(&repo) {
-            bail!("--progress --full is not ported for a repository with packs: git's pack verification emits its own \"Checking objects\" progress block this port cannot reproduce (the verification itself is done below)");
+    if show_progress && !opt.connectivity_only {
+        // `verify_midx()` (odb/source-packed.c:961-982) runs
+        // `git multi-pack-index verify --progress` as a child for every packed
+        // source it reaches, and that child draws its own meters. Those are not
+        // reproduced here, so a reached source holding a midx is refused.
+        let midx_on = repo.config_snapshot().boolean("core.multiPackIndex") != Some(false);
+        let has_midx = odb_sources(&repo)
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| opt.check_full || i == 0)
+            .any(|(_, objdir)| {
+                let pack = objdir.join("pack");
+                pack.join("multi-pack-index").exists() || pack.join("multi-pack-index.d").exists()
+            });
+        if midx_on && has_midx {
+            bail!("--progress is not ported for a repository with a multi-pack-index: git's `multi-pack-index verify --progress` child draws its own meters");
         }
     }
 
@@ -524,8 +540,20 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         all.retain(scanned);
         in_odb.retain(scanned);
     }
-    let snapshot_reads = (!explicit_heads && !snapshot_missed).then_some(heads.as_slice());
-    let pack_lists = PackLists::load(&repo, snapshot_reads);
+    // Every packed read `snapshot_refs()` made, in order (see [`PackLists`]).
+    // A ref's head is read by `snapshot_ref()`'s `parse_object()`, which returns
+    // early for an object already parsed (object.c:335-337), so only a head's
+    // first appearance reads; an explicit argument also reads whatever
+    // `repo_get_oid()` had to read to resolve it (see [`explicit_arg_reads`]).
+    let snapshot_reads: Option<Vec<ObjectId>> = match (snapshot_missed, explicit_heads) {
+        (true, _) => None,
+        (false, true) => explicit_arg_reads(&repo, &opt.objects),
+        (false, false) => {
+            let mut parsed: HashSet<ObjectId> = HashSet::new();
+            Some(heads.iter().copied().filter(|id| parsed.insert(*id)).collect())
+        }
+    };
+    let pack_lists = PackLists::load(&repo, snapshot_reads.as_deref());
     let scan_ordered = match loose_scan_order(&repo, opt.check_full, pack_lists.as_ref()) {
         Some(order) if order.len() == all.len() && order.iter().all(|id| in_odb.contains(id)) => {
             all = order;
@@ -903,6 +931,19 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             msg_lines.len()
         );
     }
+    // Under `--progress` git prints every one of these lines *between* meter
+    // redraws: a loose object's findings and cruft come out while its
+    // subdirectory is walked, before `fsck_subdir()` draws (odb/source-loose.c:
+    // 1101-1106), a pack's lines while `verify_packfile()` runs between its own
+    // draws (pack-check.c:108-178), and `fsck_finish()`'s after both meters have
+    // closed (builtin/fsck.c:934-938). The lines are gathered here rather than
+    // emitted in that walk, so their position among the redraws is not known.
+    if show_progress
+        && !opt.connectivity_only
+        && (!msg_lines.is_empty() || !cruft_lines.is_empty() || !pack_check.lines.is_empty())
+    {
+        bail!("--progress is not ported when the object scan reports a finding: git prints it between its progress redraws");
+    }
     let mut cruft = cruft_lines.into_iter().peekable();
     for (slot, id, line) in &msg_lines {
         if let (Some(index), Slot::Scan(_)) = (&scan_index, slot) {
@@ -917,12 +958,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         eprintln!("{line}");
     }
     if show_progress && !opt.connectivity_only {
-        // `fsck_object_dir()` runs once per odb source (the main object directory
-        // plus every alternate, followed transitively), each emitting its own
-        // 256-subdirectory progress block.
-        for _ in 0..odb_source_count(&repo) {
-            progress_block("Checking object directories", 256);
-        }
+        odb_fsck_progress(&repo, opt.check_full, pack_lists.as_ref())?;
     }
 
     // ---- 3b. `--full`: verify every pack ------------------------------------
@@ -2967,10 +3003,211 @@ fn odb_sources(repo: &gix::Repository) -> Vec<PathBuf> {
     out
 }
 
-/// How many object directories `fsck_object_dir()` runs over, which is how
-/// many progress blocks `--progress` prints.
-fn odb_source_count(repo: &gix::Repository) -> usize {
-    odb_sources(repo).len()
+/// The meters `odb_fsck()` (odb.c:1161-1167) draws under `ODB_FSCK_PROGRESS`,
+/// source by source: `odb_source_files_fsck()` skips a non-local source unless
+/// `--full` (odb/source-files.c:918-919), then runs the loose half and the
+/// packed half (:921-922).
+///
+/// The loose half is `odb_source_loose_fsck()` (odb/source-loose.c:1108-1130):
+/// a 256-step meter that `fsck_subdir()` advances to `nr + 1` after each
+/// `.git/objects/??` directory `opendir()` could open (object-file.c:1062-1104)
+/// — a missing one is skipped silently and any other failure ends the walk —
+/// and that is then set to 256 and closed.
+///
+/// The packed half draws `verify_packs()`' "Checking objects" meter only under
+/// `--full` (odb/source-packed.c:990): its total is every pack's object count
+/// (:902-911), and `verify_packfile()` draws at each multiple of 1024 of the
+/// running count and once after the pack's last object (pack-check.c:170-178).
+/// Packs are walked in list order, so the intermediate counts depend on it.
+/// `verify_reverse_indices()`' meter is a delayed one (:937-938) that closes
+/// long before its first update tick, so it never draws, and a source with a
+/// multi-pack-index was refused before anything was printed.
+fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, pack_lists: Option<&PackLists>) -> Result<()> {
+    use crate::progress::Meter;
+
+    for (nth, objdir) in odb_sources(repo).into_iter().enumerate() {
+        // Only the repository's own object directory is `local`.
+        if !check_full && nth > 0 {
+            continue;
+        }
+
+        let mut meter = Meter::counted("Checking object directories", 256, true);
+        for nr in 0..256usize {
+            match std::fs::read_dir(objdir.join(format!("{nr:02x}"))) {
+                Ok(_) => meter.set(nr + 1),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => break,
+            }
+        }
+        meter.set(256);
+        meter.stop("done");
+
+        if !check_full {
+            continue;
+        }
+        let sizes = match pack_lists {
+            Some(lists) => lists
+                .sources
+                .iter()
+                .find(|(dir, _)| *dir == objdir)
+                .map(|(_, packs)| packs.iter().map(|p| p.index.num_objects() as usize).collect())
+                .unwrap_or_default(),
+            None => {
+                // The list order could not be reconstructed. It only shows in
+                // the counts when the packs differ in size.
+                let sizes = pack_sizes(repo, &objdir);
+                if sizes.windows(2).any(|pair| pair[0] != pair[1]) {
+                    bail!("--progress --full is not ported here: git's \"Checking objects\" meter counts packs in its pack-list order, which could not be reconstructed for this repository");
+                }
+                sizes
+            }
+        };
+        let mut meter = Meter::counted("Checking objects", sizes.iter().sum(), true);
+        let mut base = 0usize;
+        for n in sizes {
+            // `if (((base_count + i) & 1023) == 0) display_progress(…)` for every
+            // `i` in `0..n`, then `display_progress(progress, base_count + i)`.
+            let mut at = base.next_multiple_of(1024);
+            while at < base + n {
+                meter.set(at);
+                at += 1024;
+            }
+            meter.set(base + n);
+            base += n;
+        }
+        meter.stop("done");
+    }
+    Ok(())
+}
+
+/// The objects `snapshot_refs()` reads, in order, for explicit `<object>`
+/// arguments (builtin/fsck.c:592-603): `repo_get_oid()` on each argument, then
+/// `snapshot_ref()`'s `parse_object()` on what it resolved to.
+///
+/// Only the argument shapes whose resolution reads a known sequence are
+/// modelled, and `None` is returned for any other, which leaves a pack-list tie
+/// unplaced:
+///
+///  * a full-length hex id or an existing ref name resolves without reading an
+///    object (`get_oid_basic()`);
+///  * `<rev>:<path>` resolves `<rev>` that way, then `get_tree_entry()`
+///    (tree-walk.c:605-635) reads `<rev>` peeled to a tree with
+///    `odb_read_object_peeled()` — the commit or tag, then what it points at,
+///    down to the tree — and `find_tree_entry()` (tree-walk.c:568-603) reads
+///    each subtree it descends into, but not the entry it lands on.
+///
+/// `parse_object()` reads the resolved object unless an earlier call already
+/// parsed it (object.c:335-337); `odb_read_object_peeled()` reads raw buffers
+/// and parses nothing.
+fn explicit_arg_reads(repo: &gix::Repository, args: &[String]) -> Option<Vec<ObjectId>> {
+    let mut reads: Vec<ObjectId> = Vec::new();
+    let mut parsed: HashSet<ObjectId> = HashSet::new();
+    for arg in args {
+        let (base, path) = match arg.split_once(':') {
+            Some((base, path)) => (base, Some(path)),
+            None => (arg.as_str(), None),
+        };
+        let base_id = resolve_without_reads(repo, base)?;
+        let id = match path {
+            None => base_id,
+            Some(path) => tree_entry_reads(repo, base_id, path, &mut reads)?,
+        };
+        if !repo.has_object(id) {
+            return None;
+        }
+        if parsed.insert(id) {
+            reads.push(id);
+        }
+    }
+    Some(reads)
+}
+
+/// `get_oid_basic()` for the two forms that read no object: a full-length hex
+/// id, and a name `repo_dwim_ref()` finds. A string of hex digits shorter than
+/// an id may instead be an abbreviation, whose disambiguation reads objects, so
+/// it is refused, as is every name carrying revision syntax.
+fn resolve_without_reads(repo: &gix::Repository, base: &str) -> Option<ObjectId> {
+    let hexsz = repo.object_hash().len_in_hex();
+    if base.len() == hexsz {
+        if let Ok(id) = ObjectId::from_hex(base.as_bytes()) {
+            return Some(id);
+        }
+    }
+    if base.is_empty()
+        || base.bytes().all(|b| b.is_ascii_hexdigit())
+        || base.contains(['^', '~', '@', '{', '}', ':', '*', '?', '[', '\\', ' '])
+    {
+        return None;
+    }
+    repo.find_reference(base).ok()?;
+    repo.rev_parse_single(base).ok().map(|id| id.detach())
+}
+
+/// `get_tree_entry(repo, start, path)`'s reads, appended to `reads`, and the
+/// entry it finds. `None` when the lookup fails or takes a shape not modelled.
+fn tree_entry_reads(repo: &gix::Repository, start: ObjectId, path: &str, reads: &mut Vec<ObjectId>) -> Option<ObjectId> {
+    // `odb_read_object_peeled(…, OBJ_TREE, …)`: read, and follow a commit's
+    // tree or a tag's target until a tree is read.
+    let peel = |mut id: ObjectId, reads: &mut Vec<ObjectId>| -> Option<ObjectId> {
+        loop {
+            reads.push(id);
+            let object = repo.find_object(id).ok()?;
+            id = match object.kind {
+                Kind::Tree => return Some(id),
+                Kind::Commit => object.into_commit().tree_id().ok()?.detach(),
+                Kind::Tag => object.into_tag().target_id().ok()?.detach(),
+                Kind::Blob => return None,
+            };
+        }
+    };
+    let mut tree = peel(start, reads)?;
+    if path.is_empty() {
+        return Some(tree);
+    }
+    if path.starts_with('/') || path.contains("//") {
+        return None;
+    }
+    let mut components = path.split('/').peekable();
+    while let Some(name) = components.next() {
+        let entry = repo
+            .find_object(tree)
+            .ok()?
+            .into_tree()
+            .decode()
+            .ok()?
+            .entries
+            .iter()
+            .find(|e| e.filename == name.as_bytes())
+            .map(|e| (e.oid.to_owned(), e.mode.is_tree()))?;
+        match components.peek() {
+            None => return Some(entry.0),
+            // `dir/`: the directory itself, before any recursion reads it.
+            Some(&"") if entry.1 => return Some(entry.0),
+            Some(_) if entry.1 => tree = peel(entry.0, reads)?,
+            Some(_) => return None,
+        }
+    }
+    None
+}
+
+/// Every pack's object count in `objdir`, for a source whose list order is not
+/// known; `add_packed_git()` lists only a pack whose `.pack` is a regular file.
+fn pack_sizes(repo: &gix::Repository, objdir: &Path) -> Vec<usize> {
+    let dir = objdir.join("pack");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let base = name.strip_suffix(".idx")?;
+            std::fs::metadata(dir.join(format!("{base}.pack"))).ok().filter(|m| m.is_file())?;
+            pack::index::File::at(dir.join(&name), repo.object_hash())
+                .ok()
+                .map(|index| index.num_objects() as usize)
+        })
+        .collect()
 }
 
 /// Every linked worktree's HEAD and index as heads, matching git's
@@ -3395,13 +3632,8 @@ impl PackLists {
         // With pairwise distinct mtimes the re-sort alone decides the order, so
         // the reads only matter for a tie.
         if tie {
-            // `parse_object()` returns early for an object already parsed, so
-            // only a head's first appearance reads.
-            let mut parsed: HashSet<ObjectId> = HashSet::new();
             for &id in reads? {
-                if parsed.insert(id) {
-                    move_to_front(&mut lists.sources, id);
-                }
+                move_to_front(&mut lists.sources, id);
             }
             for (_, packs) in &mut lists.sources {
                 sort_packs(packs);

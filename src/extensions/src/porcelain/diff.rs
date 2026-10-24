@@ -1820,7 +1820,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // `fix_filename()` answers NULL for an empty name
                 // (parse-options.c:64-70), so `-O ''` also drops a
                 // `diff.orderFile` seeded above.
-                order_file = (!a.is_empty()).then(|| a.clone());
+                // A missing `:(optional)<file>` keeps it (parse-options.c:226-229).
+                crate::parseopt::opt_filename(&mut order_file, a, crate::parseopt::discovered_prefix)?;
             } else if flag == "-l" {
                 match parse_rename_limit(a) {
                     Ok(n) => ro.rename_limit = n,
@@ -2238,7 +2239,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             // `-O<file>` (`OPT_FILENAME('O', ...)`): the value may be glued on or be
             // the next argument, and the last one on the line wins.
             "-O" => pending_value = Some(a.to_string()),
-            s if s.starts_with("-O") => order_file = Some(s["-O".len()..].to_owned()),
+            s if s.starts_with("-O") => {
+                crate::parseopt::opt_filename(&mut order_file, &s["-O".len()..], crate::parseopt::discovered_prefix)?;
+            }
             // `--color[=<when>]` / `--no-color` (`OPT_COLOR_FLAG`).
             "--color" => color_when = Some(diff_color::ColorWhen::Always),
             "--no-color" => color_when = Some(diff_color::ColorWhen::Never),

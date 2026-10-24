@@ -215,7 +215,8 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                         None => return Ok(super::missing_option_value("--pathspec-from-file")),
                     },
                 };
-                opts.pathspec_from_file = Some(val);
+                // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
+                crate::parseopt::opt_filename(&mut opts.pathspec_from_file, &val, crate::parseopt::discovered_prefix)?;
                 i += 1;
                 continue;
             }

@@ -290,15 +290,16 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME`: `fix_filename()` turns an
             // empty value into NULL (parse-options.c:64-70), and that NULL replaces
             // any earlier value (parse-options.c:227-232), so `--pathspec-from-file=`
-            // leaves no file to read and no clash with `-p` to die over.
+            // leaves no file to read and no clash with `-p` to die over; a missing
+            // `:(optional)<file>` keeps the earlier value (parse-options.c:226-229).
             "--pathspec-from-file" => {
                 i += 1;
                 let v = super::value_at(args, i, a)?;
-                from_file = (!v.is_empty()).then(|| v.to_string());
+                crate::parseopt::opt_filename(&mut from_file, v, || crate::setup::startup_prefix(&repo))?;
             }
             s if s.starts_with("--pathspec-from-file=") => {
                 let v = &s["--pathspec-from-file=".len()..];
-                from_file = (!v.is_empty()).then(|| v.to_string());
+                crate::parseopt::opt_filename(&mut from_file, v, || crate::setup::startup_prefix(&repo))?;
             }
             // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
             "--no-pathspec-from-file" => {}

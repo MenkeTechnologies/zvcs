@@ -871,6 +871,9 @@ struct Opts {
     /// `-O<file>` (`OPT_FILENAME('O', …, &options->orderfile)`), over the
     /// `diff.orderFile` default.
     orderfile: Option<String>,
+    /// Whether a `-O` assigned `orderfile`: `-O ''` stores NULL over the
+    /// configured file, a missing `:(optional)<file>` leaves it (parse-options.c:223-233).
+    orderfile_assigned: bool,
     /// The order file's patterns once `prepare_order()` has read them.
     order_patterns: Option<std::sync::Arc<Vec<Vec<u8>>>>,
     /// An order file `prepare_order()` could not read, raised by the first
@@ -1236,6 +1239,7 @@ pub fn format_patch(args: &[String]) -> Result<ExitCode> {
     // letter's diffstat, when there is one.
     let order_read = match &opts.orderfile {
         Some(path) => Some(super::diff_files::read_order_file(path)),
+        None if opts.orderfile_assigned => None,
         None => super::status::configured_orderfile(&repo)?
             .map(|path| super::status::read_orderfile(&repo, &path)),
     };
@@ -2161,6 +2165,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
         irreversible_delete: false,
         skip_or_rotate: None,
         orderfile: None,
+        orderfile_assigned: false,
         order_patterns: None,
         order_failure: std::cell::RefCell::new(None),
         detect_rename: None,
@@ -2446,10 +2451,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--signature-file" => {
                 i += 1;
-                o.sig_file_arg = Some(value_at(args, i, a)?);
+                let v = value_at(args, i, a)?;
+                crate::parseopt::opt_filename(&mut o.sig_file_arg, &v, crate::parseopt::discovered_prefix)?;
             }
             s if s.starts_with("--signature-file=") => {
-                o.sig_file_arg = Some(s["--signature-file=".len()..].to_owned());
+                let v = &s["--signature-file=".len()..];
+                crate::parseopt::opt_filename(&mut o.sig_file_arg, v, crate::parseopt::discovered_prefix)?;
             }
             "--rfc" => rfc = Some("RFC".to_owned()),
             "--no-rfc" => rfc = None,
@@ -2501,10 +2508,12 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
             }
             "--description-file" => {
                 i += 1;
-                o.description_file = Some(value_at(args, i, a)?);
+                let v = value_at(args, i, a)?;
+                crate::parseopt::opt_filename(&mut o.description_file, &v, crate::parseopt::discovered_prefix)?;
             }
             s if s.starts_with("--description-file=") => {
-                o.description_file = Some(s["--description-file=".len()..].to_owned());
+                let v = &s["--description-file=".len()..];
+                crate::parseopt::opt_filename(&mut o.description_file, v, crate::parseopt::discovered_prefix)?;
             }
             "--commit-list-format" => {
                 i += 1;
@@ -3284,9 +3293,11 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed> {
                     eprintln!("error: switch `O' requires a value");
                     return Ok(Parsed::Exit(ExitCode::from(129)));
                 };
-                o.orderfile = Some(v.clone());
+                o.orderfile_assigned |= crate::parseopt::opt_filename(&mut o.orderfile, v, crate::parseopt::discovered_prefix)?;
             }
-            s if s.starts_with("-O") => o.orderfile = Some(s[2..].to_owned()),
+            s if s.starts_with("-O") => {
+                o.orderfile_assigned |= crate::parseopt::opt_filename(&mut o.orderfile, &s[2..], crate::parseopt::discovered_prefix)?;
+            }
             s if DEFERRED_SHORT_VALUE.contains(&s) => {
                 i += 1;
                 if args.get(i).is_none() {

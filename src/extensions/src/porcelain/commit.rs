@@ -708,7 +708,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `if (edit_message) use_message = edit_message;` (builtin/commit.c:1351-1352).
     let mut use_message_arg: Option<String> = None;
     let mut edit_message_arg: Option<String> = None;
-    let mut file_args: Vec<String> = Vec::new();
+    // `logfile`: `-F`/`--file`, an `OPT_FILENAME`, so the last value wins and an
+    // empty one or a missing `:(optional)<file>` behaves as `opt_filename()` says.
+    let mut logfile_arg: Option<String> = None;
     // `-s`/`--signoff` adds a `Signed-off-by:` trailer with the committer ident;
     // `--squash`/`--fixup` build an autosquash-formatted message from a commit.
     let mut signoff = false;
@@ -736,6 +738,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     let mut cleanup_arg: Option<String> = None;
     let mut trailer_args: Vec<String> = Vec::new();
     let mut template_arg: Option<String> = None;
+    // Whether a `-t` assigned `template_file`, which `git_commit_config()` seeded
+    // from `commit.template` before `parse_and_validate_options()` ran
+    // (builtin/commit.c:1808, :1821): `-t ''` clears the configured template,
+    // while `--no-template` and a missing `:(optional)<file>` leave it standing.
+    let mut template_assigned = false;
     let mut status_flag: Option<bool> = None;
     // `verbose = -1; /* unspecified */` (builtin/commit.c:1820) before
     // `OPT__VERBOSE`, which is `OPT_COUNTUP`: each `-v` adds one from a floor of
@@ -822,7 +829,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         }
         match a {
             "-m" | "--message" => messages.push(super::take_value(args, &mut i, a)?.to_string()),
-            "-F" | "--file" => file_args.push(super::take_value(args, &mut i, a)?.to_string()),
+            "-F" | "--file" => {
+                let v = super::take_value(args, &mut i, a)?;
+                crate::parseopt::opt_filename(&mut logfile_arg, v, crate::parseopt::discovered_prefix)?;
+            }
             "-C" | "--reuse-message" => {
                 use_message_arg = Some(super::take_value(args, &mut i, a)?.to_string())
             }
@@ -830,7 +840,9 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 edit_message_arg = Some(super::take_value(args, &mut i, a)?.to_string());
             }
             "--date" => date_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
-            s if s.starts_with("--file=") => file_args.push(s["--file=".len()..].to_string()),
+            s if s.starts_with("--file=") => {
+                crate::parseopt::opt_filename(&mut logfile_arg, &s["--file=".len()..], crate::parseopt::discovered_prefix)?;
+            }
             s if s.starts_with("--reuse-message=") => {
                 use_message_arg = Some(s["--reuse-message=".len()..].to_string())
             }
@@ -843,18 +855,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "-q" | "--quiet" => quiet = true,
             // The unset halves of the message-source options. Each is exactly what
             // parse-options writes for that entry's type, so a later `--no-<x>`
-            // discards an earlier value rather than being an unknown option:
+            // is never an unknown option:
             //
             //   `-m` is an `OPT_CALLBACK` over `opt_parse_m()`, whose unset arm
             //     clears the accumulated buffer (builtin/commit.c:172-174);
-            //   `-F`/`--file` is an `OPT_FILENAME` and `--author`, `--date`,
-            //     `-c`, `-C`, `--fixup`, `--squash` are `OPT_STRING`s, whose unset
-            //     writes NULL over the slot (parse-options.c:200-202, 214-215);
+            //   `--author`, `--date`, `-c`, `-C`, `--fixup`, `--squash` are
+            //     `OPT_STRING`s, whose unset writes NULL over the slot
+            //     (parse-options.c:200-202);
+            //   `-F`/`--file` is an `OPT_FILENAME`, whose unset value is NULL and
+            //     `if (!value) return 0;` leaves the earlier file in place
+            //     (parse-options.c:214-224);
             //   `--reset-author` and the two hidden `--allow-empty*` are
             //     `OPT_BOOL`/`OPT_HIDDEN_BOOL`, whose unset writes 0;
             //   `-q` is an `OPT__QUIET` (`OPT_COUNTUP`), whose unset resets to 0.
             "--no-message" => messages.clear(),
-            "--no-file" => file_args.clear(),
+            "--no-file" => {}
             "--no-reuse-message" => use_message_arg = None,
             "--no-reedit-message" => edit_message_arg = None,
             "--no-date" => date_arg = None,
@@ -941,11 +956,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             "--no-patch" => patch_interactive = false,
             "--interactive" => interactive = true,
             "--no-interactive" => interactive = false,
+            // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
             "--pathspec-from-file" => {
-                pathspec_from_file = Some(super::take_value(args, &mut i, a)?.to_string())
+                let v = super::take_value(args, &mut i, a)?;
+                crate::parseopt::opt_filename(&mut pathspec_from_file, v, crate::parseopt::discovered_prefix)?;
             }
             s if s.starts_with("--pathspec-from-file=") => {
-                pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string())
+                let v = &s["--pathspec-from-file=".len()..];
+                crate::parseopt::opt_filename(&mut pathspec_from_file, v, crate::parseopt::discovered_prefix)?;
             }
             // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
             "--no-pathspec-from-file" => {}
@@ -962,11 +980,18 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 trailer_args.push(s["--trailer=".len()..].to_string())
             }
             "--no-trailer" => trailer_args.clear(),
-            "-t" | "--template" => template_arg = Some(super::take_value(args, &mut i, a)?.to_string()),
-            s if s.starts_with("--template=") => {
-                template_arg = Some(s["--template=".len()..].to_string())
+            // `-t`/`--template` is an `OPT_FILENAME` (parse-options.c:209-235): an
+            // empty or missing `:(optional)` name is `opt_filename()`'s to settle,
+            // and the unset form leaves the earlier template in place.
+            "-t" | "--template" => {
+                let v = super::take_value(args, &mut i, a)?;
+                template_assigned |= crate::parseopt::opt_filename(&mut template_arg, v, crate::parseopt::discovered_prefix)?;
             }
-            "--no-template" => template_arg = None,
+            s if s.starts_with("--template=") => {
+                let v = &s["--template=".len()..];
+                template_assigned |= crate::parseopt::opt_filename(&mut template_arg, v, crate::parseopt::discovered_prefix)?;
+            }
+            "--no-template" => {}
             "--status" => status_flag = Some(true),
             "--no-status" => status_flag = Some(false),
             // --- hooks and signing ---------------------------------------------
@@ -1051,7 +1076,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     {
         let use_message = use_message_arg.is_some();
         let edit_message = edit_message_arg.is_some();
-        let logfile = !file_args.is_empty();
+        let logfile = logfile_arg.is_some();
         let have_option_m = !messages.is_empty();
         let first_two = |set: &[(bool, &str)]| -> Option<(String, String)> {
             let mut given = set.iter().filter(|(on, _)| *on).map(|(_, name)| *name);
@@ -1455,7 +1480,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // leaves those behind, and dying at this point would not. [`deferred_fatal`]
     // is released once the tree is built.
     let mut deferred_fatal: Option<String> = None;
-    for f in &file_args {
+    if let Some(f) = &logfile_arg {
         let content = if f == "-" {
             // `if (strbuf_read(&sb, 0, 0) < 0) die_errno(_("could not read log
             // from standard input"));` (builtin/commit.c:810-811) — a raw byte
@@ -1504,7 +1529,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         // is `strbuf_read_file()`'s bytes verbatim, and git adds nothing to them;
         // under `--cleanup=verbatim` that missing byte is the whole difference
         // between two commit ids. (`-m` and `-F` cannot both be given.)
-        if file_args.is_empty() && !message.ends_with('\n') {
+        if logfile_arg.is_none() && !message.ends_with('\n') {
             message.push('\n');
         }
     }
@@ -1595,7 +1620,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if let Some(raw) = &fixup_arg {
         'fixup: {
         // `-c`/`-C`/`-F` are rejected with `--fixup` in every form.
-        if reuse_arg.is_some() || !file_args.is_empty() {
+        if reuse_arg.is_some() || logfile_arg.is_some() {
             crate::git_fatal!("options '-c/-C/-F' and '--fixup' cannot be used together");
         }
         // Parse `[(amend|reword):]<commit>`: only a leading run of alpha
@@ -2010,10 +2035,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
 
     let snap = repo.config_snapshot();
     // `-t`/`--template <file>` beats `commit.template`; both seed the buffer and
-    // both arm git's `template_untouched()` abort. `--no-template` only clears the
-    // option: a configured `commit.template` still applies.
+    // both arm git's `template_untouched()` abort. `--no-template` changes nothing,
+    // so a configured `commit.template` still applies; `-t ''` assigned NULL over it.
     let template_file: Option<std::path::PathBuf> = match &template_arg {
         Some(t) => Some(expand_tilde(t)),
+        None if template_assigned => None,
         None => snap.string("commit.template").map(|v| expand_tilde(&v.to_string())),
     };
 
@@ -2094,6 +2120,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // both arm git's `template_untouched()` abort.
     let template_file: Option<std::path::PathBuf> = match &template_arg {
         Some(t) => Some(expand_tilde(t)),
+        None if template_assigned => None,
         None => snap.string("commit.template").map(|v| expand_tilde(&v.to_string())),
     };
 
@@ -2406,7 +2433,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             && fixup_arg.is_none()
         {
             (Some("message"), None)
-        } else if !file_args.is_empty() {
+        } else if logfile_arg.is_some() {
             (Some("message"), None)
         } else if let Some(m) = &use_message {
             (Some("commit"), Some(m.clone()))
@@ -2985,10 +3012,15 @@ pub(super) fn read_pathspec_file(src: &str, nul: bool) -> Result<Vec<String>> {
         // (wrapper.c) — git's `fatal:` at 128, not this port's own `zvcs: <cmd>:`
         // line at 1, which is what a caller testing `$?` for 128 would miss.
         // `strerror()` has no Rust `(os error <n>)` tail, so the tail is trimmed.
+        //
+        // The name is the one `fix_filename()` stored (parse-options.c:64-70):
+        // behind the startup prefix, as C opens it from the top of the work tree,
+        // so `git -C sub add --pathspec-from-file=nope` names `sub/nope`.
         std::fs::read(src).map_err(|e| {
             let text = e.to_string();
             let reason = text.split(" (os error ").next().unwrap_or(&text);
-            crate::fatal::die(format!("could not open '{src}' for reading: {reason}"))
+            let shown = crate::setup::prefix_filename(crate::parseopt::discovered_prefix().as_deref(), src);
+            crate::fatal::die(format!("could not open '{shown}' for reading: {reason}"))
         })?
     };
     let sep = if nul { b'\0' } else { b'\n' };

@@ -534,7 +534,11 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             "--no-format" => opts.format = None,
             "--prefix" => opts.prefix = Some(value_of(args, &mut i, a)?),
             "--no-prefix" => opts.prefix = None,
-            "-o" | "--output" => opts.output = Some(value_of(args, &mut i, a)?),
+            // `cmd_archive()`'s `OPT_FILENAME` (builtin/archive.c:87), see [`set_output`].
+            "-o" | "--output" => {
+                let v = value_of(args, &mut i, a)?;
+                crate::parseopt::opt_filename(&mut opts.output, &v, crate::parseopt::discovered_prefix)?;
+            }
             // git accepts `--no-output` but it is a no-op: `-o FILE --no-output`
             // (either order) still writes to FILE. Verified against git 2.55.0.
             "--no-output" => {}
@@ -566,7 +570,9 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             "--no-add-file" | "--no-add-virtual-file" => opts.added.clear(),
             _ if a.starts_with("--format=") => opts.format = Some(a[9..].to_string()),
             _ if a.starts_with("--prefix=") => opts.prefix = Some(a[9..].to_string()),
-            _ if a.starts_with("--output=") => opts.output = Some(a[9..].to_string()),
+            _ if a.starts_with("--output=") => {
+                crate::parseopt::opt_filename(&mut opts.output, &a[9..], crate::parseopt::discovered_prefix)?;
+            }
             _ if a.starts_with("--mtime=") => opts.mtime = Some(a[8..].to_string()),
             _ if a.starts_with("--add-file=") => match resolve_add_file(&a[11..], opts.prefix.as_deref()) {
                 Ok(item) => opts.added.push(item),
@@ -1174,6 +1180,19 @@ const SHORT_OPTS: crate::parseopt::Shorts<'static> =
 const OUTER_SHORT_OPTS: crate::parseopt::Shorts<'static> =
     crate::parseopt::Shorts { flags: "", values: "o", optargs: "", number: false };
 
+/// `-o`/`--output` is `cmd_archive()`'s `OPT_FILENAME` (builtin/archive.c:87), so
+/// `-o ''` writes to stdout and a missing `:(optional)<file>` keeps the earlier
+/// value (parse-options.c:223-233); its `die_errno()` is `fatal:` at 128.
+fn set_output(slot: &mut Option<String>, value: &str) -> std::result::Result<(), ExitCode> {
+    match crate::parseopt::opt_filename(slot, value, crate::parseopt::discovered_prefix) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            Err(ExitCode::from(128))
+        }
+    }
+}
+
 /// `parse_options(argc, argv, prefix, local_opts, NULL, PARSE_OPT_KEEP_ALL)`
 /// (builtin/archive.c:97-98).
 ///
@@ -1211,7 +1230,7 @@ fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
                     None => return Err(super::missing_option_value("-o")),
                 },
             };
-            out.output = Some(value);
+            set_output(&mut out.output, &value)?;
             i += 1;
             continue;
         }
@@ -1251,7 +1270,7 @@ fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
             },
         };
         match slot {
-            "output" => out.output = Some(value),
+            "output" => set_output(&mut out.output, &value)?,
             "remote" => out.remote = Some(value),
             _ => out.exec = value,
         }

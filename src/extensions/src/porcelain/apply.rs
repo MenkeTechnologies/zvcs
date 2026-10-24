@@ -847,12 +847,13 @@ fn parse_opts(
                 // Both spellings run `apply_option_parse_space_change()`
                 // (apply.c:5048), which is a plain on/off for `ws_ignore_action`.
                 "ignore-space-change" | "ignore-whitespace" => o.ignore_ws = !neg,
-                // `OPT_FILENAME` (apply.c:5246); the `--no-` form clears it.
+                // `OPT_FILENAME` (apply.c:5260): the `--no-` form changes nothing and
+                // the value goes through `opt_filename()` (parse-options.c:209-235).
                 "build-fake-ancestor" => {
-                    o.fake_ancestor = if neg {
-                        None
-                    } else {
-                        Some(long_value(args, &mut i, name, inline)?)
+                    if !neg {
+                        let v = long_value(args, &mut i, name, inline)?;
+                        crate::parseopt::opt_filename(&mut o.fake_ancestor, &v, crate::parseopt::discovered_prefix)
+                            .map_err(|e| die(&e.to_string()))?;
                     }
                 }
 

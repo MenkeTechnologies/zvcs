@@ -258,15 +258,21 @@ pub fn fmt_merge_msg(args: &[String]) -> Result<ExitCode> {
             _ if a.starts_with("--into-name=") => {
                 into_name = Some(a["--into-name=".len()..].into());
             }
+            // `-F`/`--file` is an `OPT_FILENAME` (parse-options.c:223-233).
             "-F" | "--file" => {
                 i += 1;
-                inpath = Some(super::value_at(args, i, a)?.to_string());
+                let v = super::value_at(args, i, a)?;
+                crate::parseopt::opt_filename(&mut inpath, v, crate::parseopt::discovered_prefix)?;
             }
             // Accepted, and deliberately inert: `OPTION_FILENAME` does not clear
             // the value on the negated form, so a preceding `--file` survives.
             "--no-file" => {}
-            _ if a.starts_with("--file=") => inpath = Some(a["--file=".len()..].into()),
-            _ if a.starts_with("-F") && a.len() > 2 => inpath = Some(a[2..].into()),
+            _ if a.starts_with("--file=") => {
+                crate::parseopt::opt_filename(&mut inpath, &a["--file=".len()..], crate::parseopt::discovered_prefix)?;
+            }
+            _ if a.starts_with("-F") && a.len() > 2 => {
+                crate::parseopt::opt_filename(&mut inpath, &a[2..], crate::parseopt::discovered_prefix)?;
+            }
             "--" => {
                 // parse_options stops here; everything left is a positional.
                 positional |= i + 1 < args.len();

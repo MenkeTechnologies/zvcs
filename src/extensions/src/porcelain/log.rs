@@ -1289,6 +1289,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `-O<file>` (`OPT_FILENAME('O', …, &options->orderfile)`), over the
     // `diff.orderFile` default `repo_diff_setup()` seeded.
     let mut order_cli: Option<String> = None;
+    // Whether a `-O` assigned the slot: `-O ''` stores NULL over the configured
+    // file, while a missing `:(optional)<file>` leaves it (parse-options.c:223-233).
+    let mut order_assigned = false;
     // `save_parents()`: under `--full-diff`, `simplify_commit()` keeps each
     // commit's parent list as `try_to_simplify_commit()` left it, before
     // `rewrite_parents()` replaces it (revision.c:4325-4326), and
@@ -2346,9 +2349,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 eprintln!("error: switch `O' requires a value");
                 return Ok(ExitCode::from(129));
             };
-            order_cli = Some(v.clone());
+            order_assigned |= crate::parseopt::opt_filename(&mut order_cli, v, crate::parseopt::discovered_prefix)?;
         } else if let Some(v) = a.strip_prefix("-O") {
-            order_cli = Some(v.to_string());
+            order_assigned |= crate::parseopt::opt_filename(&mut order_cli, v, crate::parseopt::discovered_prefix)?;
         } else if a == "-S" {
             i += 1;
             let v = args.get(i).cloned().unwrap_or_default();
@@ -5717,6 +5720,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut order_failure: Option<anyhow::Error> = None;
     let order_read = match &order_cli {
         Some(path) => Some(super::diff_files::read_order_file(path)),
+        None if order_assigned => None,
         None => super::status::configured_orderfile(&repo)?
             .map(|path| super::status::read_orderfile(&repo, &path)),
     };

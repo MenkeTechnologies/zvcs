@@ -453,10 +453,10 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
             "--no-column" => {
                 let _ = super::column::parseopt_column(&mut colopts, None, true);
             }
-            // Clear an accumulated message/file/format/cleanup the way git's
-            // OPT_FILENAME / OPT_STRING negations do (each sets its target back to
-            // NULL when unset).
-            "--no-file" => message_file = None,
+            // `-F`/`--file` is an `OPT_FILENAME`, whose unset value is NULL and
+            // `if (!value) return 0;` leaves the earlier file in place
+            // (parse-options.c:214-224).
+            "--no-file" => {}
             // git's `OPT_STRVEC` unset empties the accumulated trailer list.
             "--no-trailer" => trailers.clear(),
             "--no-format" => format = None,
@@ -588,11 +588,12 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                 } else if let Some(rest) = a.strip_prefix("-m") {
                     messages.push(crate::rawarg::to_bytes(rest).into_owned());
                 } else if let Some(rest) = a.strip_prefix("--file=") {
-                    message_file = Some(rest.to_string());
+                    crate::parseopt::opt_filename(&mut message_file, rest, crate::parseopt::discovered_prefix)?;
                 } else if a == "--file" || a == "-F" {
-                    message_file = Some(super::take_value(args, &mut i, a)?.to_string());
+                    let v = super::take_value(args, &mut i, a)?;
+                    crate::parseopt::opt_filename(&mut message_file, v, crate::parseopt::discovered_prefix)?;
                 } else if let Some(rest) = a.strip_prefix("-F") {
-                    message_file = Some(rest.to_string());
+                    crate::parseopt::opt_filename(&mut message_file, rest, crate::parseopt::discovered_prefix)?;
                 // `-u<key-id>` and `--local-user=<key-id>`: an `OPT_STRING` takes
                 // its value stuck to the short name or after the `=`, and an empty
                 // one is a key git passes to gpg unchanged (which answers
@@ -685,7 +686,9 @@ pub fn tag(args: &[String]) -> Result<ExitCode> {
                                 };
                                 match c {
                                     'm' => messages.push(crate::rawarg::to_bytes(&val).into_owned()),
-                                    'F' => message_file = Some(val),
+                                    'F' => {
+                                        crate::parseopt::opt_filename(&mut message_file, &val, crate::parseopt::discovered_prefix)?;
+                                    }
                                     _ => keyid = Some(val),
                                 }
                                 break; // the value flag consumed the rest of the cluster

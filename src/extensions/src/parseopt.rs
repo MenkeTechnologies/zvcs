@@ -1119,3 +1119,76 @@ pub fn incompatible_options(opts: &[(bool, &str)]) -> Option<String> {
         _ => None,
     }
 }
+
+/// `get_value()`'s `OPTION_FILENAME` arm (parse-options.c:223-233), run on the
+/// value `get_arg()` produced for an `OPT_FILENAME` option:
+///
+/// ```c
+/// is_optional = skip_prefix(value, ":(optional)", &value);
+/// value = fix_filename(p->prefix, value);
+/// if (is_optional && is_missing_file(value)) {
+///         free((char *)value);
+/// } else {
+///         FREE_AND_NULL(*(char **)opt->value);
+///         *(const char **)opt->value = value;
+/// }
+/// ```
+///
+/// `slot` is the option's variable; the result says whether it was assigned,
+/// for a caller whose slot was seeded from config before parsing. A name behind one leading `:(optional)` that
+/// `is_missing_file()` reports absent leaves `slot` as an earlier occurrence (or
+/// the command's config) set it, so `--pathspec-from-file=:(optional)list` reads
+/// `list` when it is there and is not given at all when it is not. An empty name
+/// is `fix_filename()`'s NULL (parse-options.c:64-70): it clears `slot`, and
+/// behind `:(optional)` it reaches `is_missing_file(NULL)`, whose `stat(NULL)`
+/// fails with EFAULT and dies `could not stat (null): Bad address`
+/// (wrapper.c:802-813). Any `stat()` failure other than ENOENT is that same
+/// `die_errno()`, at parse time, ahead of every later option.
+///
+/// `prefix` yields `p->prefix`, the slash-terminated startup prefix; it is only
+/// asked for behind `:(optional)`, so the common spelling costs no lookup. The name kept
+/// in `slot` is the one typed, not `fix_filename()`'s prefixed spelling: zvcs
+/// never `chdir`s to the top of the work tree, so the typed name already names
+/// the file C opens from there. The prefix shows only where C's spelling does:
+/// in the `could not stat` message, and for `-`, which
+/// `prefix_filename_except_for_dash()` (abspath.c:286-291) leaves unprefixed, so
+/// C stats a file called `-` at the top rather than in the current directory.
+pub fn opt_filename(
+    slot: &mut Option<String>,
+    value: &str,
+    prefix: impl FnOnce() -> Option<String>,
+) -> Result<bool, anyhow::Error> {
+    let (optional, value) = match value.strip_prefix(":(optional)") {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    if !optional {
+        *slot = (!value.is_empty()).then(|| value.to_owned());
+        return Ok(true);
+    }
+    if value.is_empty() {
+        return Err(crate::fatal::die("could not stat (null): Bad address"));
+    }
+    let prefix = prefix();
+    let prefix = prefix.as_deref();
+    let depth = prefix.map_or(0, |p| p.split('/').filter(|c| !c.is_empty()).count());
+    let stat_path = if value == "-" { format!("{}-", "../".repeat(depth)) } else { value.to_owned() };
+    match std::fs::metadata(&stat_path) {
+        Ok(_) => {
+            *slot = Some(value.to_owned());
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => {
+            let shown = if value == "-" { value.to_owned() } else { crate::setup::prefix_filename(prefix, value) };
+            Err(crate::fatal::die(format!("could not stat {shown}: {}", crate::external::strerror(&e))))
+        }
+    }
+}
+
+/// `p->prefix` for an [`opt_filename`] caller that parses before it has a
+/// repository in hand: the startup prefix of the repository discovery finds, or
+/// NULL outside one.
+pub fn discovered_prefix() -> Option<String> {
+    crate::setup::discover().ok().and_then(|repo| crate::setup::startup_prefix(&repo))
+}

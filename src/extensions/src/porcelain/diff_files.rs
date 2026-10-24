@@ -1895,10 +1895,12 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("-O") {
-        // `OPT_FILENAME` (diff.c:6291) stores `fix_filename()`, which answers NULL
+        // `OPT_FILENAME` (diff.c:6270) stores `fix_filename()`, which answers NULL
         // for an empty name (parse-options.c:64-70): `-O ''` clears the order file
-        // rather than naming one.
-        opts.order_file = (!v.is_empty()).then(|| v.to_owned());
+        // rather than naming one, and a missing `:(optional)<file>` keeps the
+        // earlier one (parse-options.c:226-229). Its `die_errno()` is a plain `fatal:`.
+        crate::parseopt::opt_filename(&mut opts.order_file, v, crate::parseopt::discovered_prefix)
+            .map_err(|e| Fatal::RevOptDie(e.to_string()))?;
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--output=") {

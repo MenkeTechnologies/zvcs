@@ -287,6 +287,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     // `-O<file>` (`OPT_FILENAME('O', …, &options->orderfile)`), over the
     // `diff.orderFile` default; `pending_order` is the separate value form.
     let mut order_cli: Option<String> = None;
+    // Whether a `-O` assigned the slot: `-O ''` stores NULL over the configured
+    // file, while a missing `:(optional)<file>` leaves it (parse-options.c:223-233).
+    let mut order_assigned = false;
     let mut pending_order = false;
     // `--pickaxe-all` (`o->pickaxe_opts & DIFF_PICKAXE_ALL`) and `--pickaxe-regex`
     // (`DIFF_PICKAXE_REGEX`), the two knobs `diffcore_pickaxe()` reads beside the
@@ -491,7 +494,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             continue;
         }
         if std::mem::take(&mut pending_order) {
-            order_cli = Some(a.clone());
+            order_assigned |= crate::parseopt::opt_filename(&mut order_cli, a, crate::parseopt::discovered_prefix)?;
             continue;
         }
         // The value checks `diff_opt_parse`'s callbacks run as each option is seen.
@@ -590,7 +593,9 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
             "-S" => pending_pickaxe = Some('S'),
             "-G" => pending_pickaxe = Some('G'),
             "-O" => pending_order = true,
-            s if s.starts_with("-O") => order_cli = Some(s[2..].to_string()),
+            s if s.starts_with("-O") => {
+                order_assigned |= crate::parseopt::opt_filename(&mut order_cli, &s[2..], crate::parseopt::discovered_prefix)?;
+            }
             "-L" => pending_line_range = true,
             "--" => after_dashdash = true,
             "-p" | "-u" | "--patch" => formats.patch = true,
@@ -2178,6 +2183,7 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
     let mut order_failure: Option<anyhow::Error> = None;
     let order_read = match &order_cli {
         Some(path) => Some(super::diff_files::read_order_file(path)),
+        None if order_assigned => None,
         None => super::status::configured_orderfile(&repo)?
             .map(|path| super::status::read_orderfile(&repo, &path)),
     };

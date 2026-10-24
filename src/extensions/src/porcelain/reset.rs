@@ -485,8 +485,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
         let a = typed;
         // `--pathspec-from-file <file>` (separate-argument form): parse-options
         // consumes the very next token as the value regardless of what it looks like.
+        // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
         if take_pff_value {
-            pathspec_from_file = Some(a.clone());
+            crate::parseopt::opt_filename(&mut pathspec_from_file, a, crate::parseopt::discovered_prefix)?;
             take_pff_value = false;
             continue;
         }
@@ -584,7 +585,8 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             s if s.starts_with("--pathspec-from-file=") => {
-                pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
+                let v = &s["--pathspec-from-file=".len()..];
+                crate::parseopt::opt_filename(&mut pathspec_from_file, v, crate::parseopt::discovered_prefix)?;
             }
             // `--recurse-submodules[=<bool>]`: git's
             // `option_parse_recurse_submodules_worktree_updater()`, whose value is a

@@ -591,7 +591,10 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             "--pathspec-from-file" => {
                 i += 1;
                 match args.get(i) {
-                    Some(v) => pathspec_from_file = Some(v.clone()),
+                    // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
+                    Some(v) => {
+                        crate::parseopt::opt_filename(&mut pathspec_from_file, v, crate::parseopt::discovered_prefix)?;
+                    }
                     None => {
                         eprintln!("error: option `pathspec-from-file' requires a value");
                         return Ok(ExitCode::from(129));
@@ -644,7 +647,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 }
             }
             s if s.starts_with("--pathspec-from-file=") => {
-                pathspec_from_file = Some(s["--pathspec-from-file=".len()..].to_string());
+                let v = &s["--pathspec-from-file=".len()..];
+                crate::parseopt::opt_filename(&mut pathspec_from_file, v, crate::parseopt::discovered_prefix)?;
             }
             s if s.starts_with("-s") && s.len() > 2 => source = Some(s[2..].to_string()),
             // `PARSE_OPT_UNKNOWN` (parse-options.c:1210-1224): the `error:` line and

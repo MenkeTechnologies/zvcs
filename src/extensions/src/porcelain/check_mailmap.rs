@@ -130,8 +130,14 @@ pub fn check_mailmap(args: &[String]) -> Result<ExitCode> {
                             }
                         }
                     };
+                    // `--mailmap-file` is an `OPT_FILENAME` (builtin/check-mailmap.c:22):
+                    // its unset form changes nothing and its value goes through
+                    // `opt_filename()` (parse-options.c:209-235). `--mailmap-blob` is
+                    // an `OPT_STRING`, whose unset writes NULL (parse-options.c:200-202).
                     if slot == "mailmap-file" {
-                        opts.mailmap_file = value;
+                        if let Some(v) = &value {
+                            crate::parseopt::opt_filename(&mut opts.mailmap_file, v, crate::parseopt::discovered_prefix)?;
+                        }
                     } else {
                         opts.mailmap_blob = value;
                     }

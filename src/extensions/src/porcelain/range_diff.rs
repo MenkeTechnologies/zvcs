@@ -1517,14 +1517,21 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             // `OPT_FILENAME('O', …, &options->orderfile)`: attached or the next
             // argv element, the last one winning. Read only when `patch_diff()`
             // first runs, like `prepare_order()`.
+            // A missing `:(optional)<file>` keeps the earlier one (parse-options.c:226-229).
             _ if name.starts_with("-O") => {
-                opts.orderfile = match name.len() {
+                let value = match name.len() {
                     2 => {
                         i += 1;
-                        args.get(i).cloned()
+                        args.get(i).map(String::as_str)
                     }
-                    _ => Some(name[2..].to_string()),
+                    _ => Some(&name[2..]),
                 };
+                match value {
+                    Some(v) => {
+                        crate::parseopt::opt_filename(&mut opts.orderfile, v, crate::parseopt::discovered_prefix)?;
+                    }
+                    None => opts.orderfile = None,
+                }
             }
             _ if name.starts_with("-S") || name.starts_with("-G") => {
                 pickaxe_mask |= match name.as_bytes()[1] {

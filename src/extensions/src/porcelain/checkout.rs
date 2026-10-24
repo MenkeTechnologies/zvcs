@@ -441,7 +441,8 @@ fn checkout_main(args: &[String]) -> Result<ExitCode> {
                     super::value_at(args, i, a)?.to_string()
                 }
             };
-            pathspec_from_file = Some(val);
+            // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
+            crate::parseopt::opt_filename(&mut pathspec_from_file, &val, crate::parseopt::discovered_prefix)?;
             i += 1;
             continue;
         }

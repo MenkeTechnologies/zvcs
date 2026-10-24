@@ -462,7 +462,10 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
     // `check_rules_opts.cone_mode = -1` (builtin/sparse-checkout.c:1155): unset,
     // not "cone".
     let mut cone: Option<bool> = None;
-    let mut rules_file: Option<PathBuf> = None;
+    // `--rules-file` is an `OPT_FILENAME` (builtin/sparse-checkout.c:1144): its
+    // unset form changes nothing and its value goes through `opt_filename()`
+    // (parse-options.c:209-235).
+    let mut rules_file_arg: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -475,9 +478,11 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
             // `skip-checks'` and 129. The usage line is quoted verbatim below, so
             // the refusal and the block that follows it disagree exactly as git's
             // do.
-            "--no-rules-file" => rules_file = None,
+            "--no-rules-file" => {}
             "--rules-file" => match it.next() {
-                Some(v) => rules_file = Some(PathBuf::from(v)),
+                Some(v) => {
+                    crate::parseopt::opt_filename(&mut rules_file_arg, v, crate::parseopt::discovered_prefix)?;
+                }
                 None => {
                     // git reports a missing value without the usage block.
                     eprintln!("error: option `rules-file' requires a value");
@@ -485,12 +490,14 @@ fn cmd_check_rules(args: &[String]) -> Result<ExitCode> {
                 }
             },
             _ if a.starts_with("--rules-file=") => {
-                rules_file = Some(PathBuf::from(&a["--rules-file=".len()..]));
+                let v = &a["--rules-file=".len()..];
+                crate::parseopt::opt_filename(&mut rules_file_arg, v, crate::parseopt::discovered_prefix)?;
             }
             _ if a.starts_with('-') => return Ok(opt_error(a, USAGE_CHECK_RULES)),
             _ => {}
         }
     }
+    let rules_file = rules_file_arg.map(PathBuf::from);
 
     let sparsity = match &rules_file {
         // `--rules-file` holds a directory list in cone mode, patterns otherwise.

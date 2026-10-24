@@ -4444,12 +4444,13 @@ fn parse_push_options(
             "--pathspec-from-file" => {
                 i += 1;
                 let f = args.get(i).ok_or_else(|| anyhow!("option '{a}' requires a value"))?;
-                from_file = Some(f.clone());
+                // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME` (parse-options.c:223-233).
+                crate::parseopt::opt_filename(&mut from_file, f, crate::parseopt::discovered_prefix)?;
             }
             "--" => rest_are_paths = true,
             other => {
                 if let Some(f) = other.strip_prefix("--pathspec-from-file=") {
-                    from_file = Some(f.to_string());
+                    crate::parseopt::opt_filename(&mut from_file, f, crate::parseopt::discovered_prefix)?;
                 } else if let Some(m) = other.strip_prefix("--message=") {
                     o.message = Some(m.to_string());
                 } else if let Some(m) = other.strip_prefix("-m") {

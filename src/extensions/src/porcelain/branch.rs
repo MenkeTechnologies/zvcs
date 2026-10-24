@@ -1476,12 +1476,109 @@ pub(crate) fn upstream_ref(repo: &gix::Repository, full: &BStr) -> Option<FullNa
         .string(&format!("branch.{}.remote", name.shorten()))
         .is_some_and(|v| v.as_bstr() == ".");
     if local_remote {
-        repo.branch_remote_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
-            .ok()
-    } else {
-        repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
-            .ok()
+        return repo
+            .branch_remote_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
+            .ok();
     }
+    // `set_merge()` (remote.c:1798-1801) hands `branch.<name>.merge` to
+    // `remote_find_tracking()` exactly as configured. gitoxide qualifies a bare
+    // `main` to `refs/heads/main` first, so a `refs/heads/*` fetch refspec
+    // matched where git's does not, and `%(upstream)` named a tracking ref git
+    // leaves unset ("not stored as a remote-tracking branch").
+    let snap = repo.config_snapshot();
+    let short = name.shorten();
+    let merge = snap
+        .strings(&format!("branch.{short}.merge"))
+        .and_then(|v| v.into_iter().next())?;
+    if !merge.starts_with(b"refs/") {
+        let remote = snap.string(&format!("branch.{short}.remote"))?;
+        let fetch: Vec<String> = snap
+            .strings(&format!("remote.{}.fetch", remote.to_str_lossy()))
+            .into_iter()
+            .flatten()
+            .map(|v| v.to_str_lossy().into_owned())
+            .collect();
+        let dst = remote_find_tracking_src(&fetch, &merge.to_str_lossy())?;
+        return FullName::try_from(dst).ok();
+    }
+    repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Fetch)?
+        .ok()
+}
+
+/// `refspec_find_match()` (`refspec.c:437-469`) for a query that names its
+/// `src`: the destination the first positive fetch refspec maps `needle` to,
+/// unless `refspec_find_negative_match()` (`refspec.c:349-403`) rules it out.
+fn remote_find_tracking_src(specs: &[String], needle: &str) -> Option<String> {
+    // `match_refname_with_pattern()` (`refspec.c:301-326`) with `needle` as the refname.
+    let pattern_match = |key: &str, value: &str| -> Option<String> {
+        let (kprefix, ksuffix) = key.split_once('*')?;
+        if needle.len() < kprefix.len() + ksuffix.len()
+            || !needle.starts_with(kprefix)
+            || !needle.ends_with(ksuffix)
+        {
+            return None;
+        }
+        let middle = &needle[kprefix.len()..needle.len() - ksuffix.len()];
+        let (vprefix, vsuffix) = value.split_once('*').unwrap_or((value, ""));
+        Some(format!("{vprefix}{middle}{vsuffix}"))
+    };
+    // `(negative, src, dst)` as `parse_refspec()` splits each fetch refspec.
+    let items: Vec<(bool, &str, Option<&str>)> = specs
+        .iter()
+        .map(|s| {
+            let s = s.strip_prefix('+').unwrap_or(s);
+            if let Some(neg) = s.strip_prefix('^') {
+                return (true, neg, None);
+            }
+            match s.split_once(':') {
+                Some((src, dst)) if !dst.is_empty() => (false, src, Some(dst)),
+                Some((src, _)) => (false, src, None),
+                None => (false, s, None),
+            }
+        })
+        .collect();
+
+    // `refspec_find_negative_match()`: expand the positive refspecs `needle`
+    // matches in reverse, then test each expansion against the negative ones
+    // (`refname_matches_negative_refspec_item()`, `refspec.c:338-347`).
+    let mut reversed = Vec::new();
+    for &(negative, src, dst) in &items {
+        if negative {
+            continue;
+        }
+        if src.contains('*') {
+            if let Some(e) = pattern_match(dst.unwrap_or(src), src) {
+                reversed.push(e);
+            }
+        } else if src == needle {
+            reversed.push(src.to_string());
+        }
+    }
+    let negative_match = |refname: &str| {
+        items.iter().any(|&(negative, src, _)| {
+            negative
+                && match src.split_once('*') {
+                    Some((p, s)) => {
+                        refname.len() >= p.len() + s.len()
+                            && refname.starts_with(p)
+                            && refname.ends_with(s)
+                    }
+                    None => refname == src,
+                }
+        })
+    };
+    if reversed.iter().any(|r| negative_match(r)) {
+        return None;
+    }
+
+    items.iter().find_map(|&(negative, src, dst)| {
+        let dst = dst.filter(|_| !negative)?;
+        if src.contains('*') {
+            pattern_match(src, dst)
+        } else {
+            (src == needle).then(|| dst.to_string())
+        }
+    })
 }
 
 /// git's `branch_get_push`: the remote-tracking ref that would mirror a push of

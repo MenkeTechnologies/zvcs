@@ -2841,9 +2841,13 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // symref's own log-only entry is still appended. A detached `HEAD` updates itself to the value
     // it already holds and logs nothing.
     match &wt_repo {
-        Some(wt_repo) => {
+        Some(_) => {
             if checkout {
-                reset_ref_updates(wt_repo, start.oid())?;
+                // The reset is a child process (builtin/worktree.c:400), so it reads the
+                // `config.worktree` `copy_filtered_worktree_config()` just wrote; the repository
+                // opened for the `HEAD` write predates that copy.
+                let wt_repo = gix::open_opts(&admin, repo.open_options().clone())?;
+                reset_ref_updates(&wt_repo, start.oid())?;
             }
         }
         None => {
@@ -2851,7 +2855,7 @@ fn add(args: &[String]) -> Result<ExitCode> {
                 std::fs::write(admin.join("ORIG_HEAD"), format!("{}\n", start.oid().to_hex()))?;
             }
             let reset_line = checkout && !matches!(start, Start::Detached(_));
-            write_worktree_reflog(&repo, &admin, start.oid(), reset_line)?;
+            write_worktree_reflog(&repo, &admin, start.oid(), checkout, reset_line)?;
         }
     }
 
@@ -3556,13 +3560,18 @@ fn create_branch(
 /// behind a symbolic `HEAD` is left alone, is the backend's `prepare_single_update()`.
 fn reset_ref_updates(wt_repo: &gix::Repository, oid: ObjectId) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
-    crate::refstore::state_ref_write(wt_repo, "ORIG_HEAD", &StateRef::Object(oid), "updating ORIG_HEAD")?;
+    crate::refstore::state_ref_write(
+        wt_repo,
+        "ORIG_HEAD",
+        &StateRef::Object(oid),
+        &reset_reflog_message("updating ORIG_HEAD", None),
+    )?;
     wt_repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: false,
-                message: "reset: moving to HEAD".into(),
+                message: reset_reflog_message("updating HEAD", Some("HEAD")).into(),
             },
             expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(oid)),
             new: gix::refs::Target::Object(oid),
@@ -3573,9 +3582,27 @@ fn reset_ref_updates(wt_repo: &gix::Repository, oid: ObjectId) -> Result<()> {
     Ok(())
 }
 
-/// The `logs/HEAD` lines `add_worktree()` leaves behind: the creation of the new `HEAD`, and —
-/// when `reset_line` — the `reset --hard` that checks the worktree out.
-fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId, reset_line: bool) -> Result<()> {
+/// The reflog message `set_reflog_message()` (builtin/reset.c:225-237) builds for the `reset --hard`
+/// child: `$GIT_REFLOG_ACTION: <action>` when the environment names one, else `reset: moving to
+/// <rev>` for the `HEAD` update and `reset: <action>` for the `ORIG_HEAD` one.
+fn reset_reflog_message(action: &str, rev: Option<&str>) -> String {
+    match (std::env::var_os("GIT_REFLOG_ACTION"), rev) {
+        (Some(rla), _) => format!("{}: {action}", rla.to_string_lossy()),
+        (None, Some(rev)) => format!("reset: moving to {rev}"),
+        (None, None) => format!("reset: {action}"),
+    }
+}
+
+/// The reflogs `add_worktree()` leaves behind: in `logs/HEAD` the creation of the new `HEAD`, and —
+/// when `reset_line` — the `reset --hard` that checks the worktree out; in `logs/ORIG_HEAD`, when
+/// `checkout` ran that reset and `core.logAllRefUpdates` is `always`, its `ORIG_HEAD` update.
+fn write_worktree_reflog(
+    repo: &gix::Repository,
+    admin: &Path,
+    oid: ObjectId,
+    checkout: bool,
+    reset_line: bool,
+) -> Result<()> {
     let now = gix::date::Time::now_local_or_utc().format_or_unix(gix::date::time::Format::Raw);
     let sig = match repo.committer() {
         Some(Ok(sig)) => sig,
@@ -3593,12 +3620,34 @@ fn write_worktree_reflog(repo: &gix::Repository, admin: &Path, oid: ObjectId, re
     let mut text = format!("{} {} {sig}\n", zero.to_hex(), oid.to_hex());
     if reset_line {
         text.push_str(&format!(
-            "{} {} {sig}\treset: moving to HEAD\n",
+            "{} {} {sig}\t{}\n",
             oid.to_hex(),
-            oid.to_hex()
+            oid.to_hex(),
+            reset_reflog_message("updating HEAD", Some("HEAD"))
         ));
     }
     std::fs::write(admin.join("logs").join("HEAD"), text)?;
+    // `reset_refs()` (builtin/reset.c:309-315) points the fresh worktree's `ORIG_HEAD` at the `HEAD`
+    // it just resolved. The files backend logs a ref outside `HEAD`, `refs/heads/`, `refs/remotes/`
+    // and `refs/notes/` only when `should_autocreate_reflog()` (refs.c) sees
+    // `core.logAllRefUpdates=always`; the new worktree has no `logs/ORIG_HEAD` to append to yet.
+    // The child reads the common config plus the `config.worktree` that
+    // `copy_filtered_worktree_config()` copied from this worktree, so this snapshot answers alike.
+    let always = repo
+        .config_snapshot()
+        .string("core.logAllRefUpdates")
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"always"));
+    if checkout && always {
+        std::fs::write(
+            admin.join("logs").join("ORIG_HEAD"),
+            format!(
+                "{} {} {sig}\t{}\n",
+                zero.to_hex(),
+                oid.to_hex(),
+                reset_reflog_message("updating ORIG_HEAD", None)
+            ),
+        )?;
+    }
     Ok(())
 }
 

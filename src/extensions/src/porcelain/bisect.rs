@@ -1847,10 +1847,19 @@ fn clean_state(ctx: &Ctx) -> Result<()> {
 /// `run_builtin()` like any other invocation — so from a cwd inside `.git`, where
 /// setup finds no work tree, the child dies with `this operation must be run in
 /// a work tree` before checking anything out.
+///
+/// The child also parses the configuration bisect itself never does:
+/// `repo_config(the_repository, git_checkout_config, opts)` (builtin/checkout.c:1901)
+/// ends in `git_xmerge_config()` and so `git_default_config()`, where
+/// `core.safecrlf=abc` dies in `git_config_bool()` (environment.c:430-438). The
+/// child's `fatal: bad boolean config value` is followed by `could not check out
+/// original HEAD` and 1. Going through [`crate::dispatch::run`] gives the
+/// in-process child every gate a fresh `git checkout` process passes, the work-tree
+/// one included.
 fn run_checkout(args: &[&str]) -> Result<bool> {
     let _child = crate::cstdio::run_command();
     let argv: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    match crate::dispatch::setup_work_tree().and_then(|()| super::checkout::checkout(&argv)) {
+    match crate::dispatch::run("checkout", &argv) {
         Ok(code) => Ok(code == ExitCode::SUCCESS),
         Err(err) => {
             if let Some(f) = err.downcast_ref::<crate::fatal::Fatal>() {

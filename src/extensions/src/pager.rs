@@ -177,6 +177,16 @@ fn atoi(s: &[u8]) -> Option<i64> {
     Some(if negative { -n } else { n })
 }
 
+/// Whether the command line already chose (`-p`/`-P`), i.e. git's `use_pager != -1`:
+/// `run_builtin()` (git.c:493-495) then skips `check_pager_config()` and with it
+/// the `read_early_config()` walk. Set by [`maybe_setup`].
+static PAGER_CHOICE_MADE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `use_pager == -1` as `run_builtin()` tests it before `check_pager_config()`.
+pub(crate) fn pager_choice_open() -> bool {
+    !PAGER_CHOICE_MADE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Decide whether to page `cmd` and, if so, install the pager over stdout.
 ///
 /// `forced` carries the command-line choice: `Some(true)` for `-p`/`--paginate`,
@@ -184,6 +194,7 @@ fn atoi(s: &[u8]) -> Option<i64> {
 /// command line wins over config, which wins over the default set — matching
 /// git's precedence, where the config check only runs while `use_pager == -1`.
 pub fn maybe_setup(cmd: &str, forced: Option<bool>) {
+    PAGER_CHOICE_MADE.store(forced.is_some(), std::sync::atomic::Ordering::Relaxed);
     // `-P`/`--no-pager`, or output is not a terminal: never page.
     if forced == Some(false) || !std::io::stdout().is_terminal() {
         return;

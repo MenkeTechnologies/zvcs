@@ -125,6 +125,19 @@ pub fn hash_object(args: &[String]) -> Result<ExitCode> {
     // (builtin/hash-object.c), both ahead of the option combinations: with `-w`
     // and no repository git dies here, whatever else the command line holds and
     // even when it names nothing to hash.
+    //
+    // A format `verify_repository_format()` refuses is `die("%s", err.buf)` for the
+    // first and a warning plus `*nongit_ok = -1` for the second (setup.c:771-779),
+    // after which the command hashes from the top of the work tree it chdir()ed to.
+    if opts.write {
+        if let Some(msg) = crate::config::repository_format_refusal() {
+            crate::trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            return Ok(ExitCode::from(128));
+        }
+    } else if let Some(code) = crate::setup::refuse_repository_format_gently() {
+        return Ok(code);
+    }
     let repo = match crate::setup::discover() {
         Ok(repo) => Some(repo),
         Err(err) if opts.write => {

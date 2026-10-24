@@ -116,7 +116,14 @@ const DEFAULT_GIT_DIR: &str = ".git";
 /// reached the top — of the filesystem, or of a `GIT_CEILING_DIRECTORIES` entry
 /// — without finding a repository. Both endings print this same line; git does
 /// not say which one stopped it, nor how far it walked.
+///
+/// After the command's gentle setup refused the repository's format, the walk is
+/// not empty: it re-finds that repository and dies with the refusal instead, see
+/// [`crate::setup::ignored_format_refusal`].
 pub fn no_repository_walked() -> String {
+    if let Some(refusal) = crate::setup::ignored_format_refusal() {
+        return refusal.to_owned();
+    }
     format!("not a git repository (or any of the parent directories): {DEFAULT_GIT_DIR}")
 }
 

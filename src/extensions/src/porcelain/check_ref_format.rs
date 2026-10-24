@@ -197,7 +197,12 @@ fn usage_error() -> ExitCode {
 /// Acceptance prints the expanded shorthand.
 fn check_ref_format_branch(arg: &str) -> Result<ExitCode> {
     // `setup_git_directory_gently()` (builtin/check-ref-format.c:47) — the only
-    // mode of this command that looks for a repository at all.
+    // mode of this command that looks for a repository at all. A format
+    // `verify_repository_format()` refuses is its warning and `*nongit_ok = -1`
+    // (setup.c:771-777), so the name is then taken as outside a repository.
+    if let Some(code) = crate::setup::refuse_repository_format_gently() {
+        return Ok(code);
+    }
     crate::config::check_bare_and_worktree()?;
     let expanded = match crate::setup::discover() {
         Ok(repo) => match copy_branchname(&repo, arg) {

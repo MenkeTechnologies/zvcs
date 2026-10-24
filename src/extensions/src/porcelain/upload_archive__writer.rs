@@ -101,6 +101,20 @@ pub fn upload_archive__writer(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(129));
     }
 
+    // `enter_repo(the_repository, argv[1], 0)` (builtin/upload-archive.c:34) dies on
+    // the gitfile or the repository format of the candidate its suffix scan settles on.
+    let base = std::path::Path::new(&args[0]).as_os_str().to_owned();
+    let candidates: Vec<std::path::PathBuf> = ["/.git", "", ".git/.git", ".git"]
+        .iter()
+        .map(|suffix| {
+            let mut p = base.clone();
+            p.push(suffix);
+            std::path::PathBuf::from(p)
+        })
+        .collect();
+    if let Some(msg) = crate::setup::enter_repo_refusal(&candidates) {
+        return fatal(&msg);
+    }
     let Some(repo) = enter_repo(&args[0]) else {
         return fatal(&format!(
             "'{}' does not appear to be a git repository",

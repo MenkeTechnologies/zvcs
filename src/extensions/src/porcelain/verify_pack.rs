@@ -185,7 +185,15 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
     //   $ git verify-pack -v --object-format=bogus nope1 nope2
     //   stdout: "nope1.pack: bad" / "nope2.pack: bad"
     //   stderr: "fatal: unknown hash algorithm 'bogus'" (twice), exit 1
+    // Each pack is an `index-pack --verify` child (builtin/verify-pack.c:20-44), a
+    // `RUN_SETUP_GENTLY` entry (git.c:596). Under a format `verify_repository_format()`
+    // refuses, every child warns from its own `setup_git_directory_gently()` and again
+    // from `check_pager_config()`'s early-config walk (setup.c:771-777, git.c:493-495),
+    // then runs from the top of the work tree it chdir()ed to, outside the repository:
+    // a relative `<pack>` names a file there, and the hash is `GIT_HASH_DEFAULT`.
+    let refusal = crate::config::gentle_repository_format_refusal();
     let choice = match object_format.as_deref() {
+        None if refusal.is_some() => HashChoice::Kind(gix::hash::Kind::Sha1),
         None => {
             // git falls back to the repository's algorithm; verify-pack also runs
             // outside a repository, where SHA-1 is the only thing it can assume.
@@ -201,9 +209,18 @@ pub fn verify_pack(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut err = false;
+    let cwd = std::env::current_dir()?;
     for path in packs {
+        if let Some(refusal) = &refusal {
+            eprintln!("warning: {}", refusal.message);
+            eprintln!("warning: ignoring git dir '{}': {}", refusal.git_dir_shown, refusal.message);
+            std::env::set_current_dir(&refusal.top)?;
+        }
         if !verify_one(path, verbose, stat_only, &choice) {
             err = true;
+        }
+        if refusal.is_some() {
+            std::env::set_current_dir(&cwd)?;
         }
     }
     Ok(if err {

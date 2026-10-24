@@ -1853,7 +1853,12 @@ pub fn help(args: &[String]) -> Result<ExitCode> {
             //
             // `setup_git_directory_gently()` runs here and nowhere earlier in
             // `cmd_help()` (builtin/help.c:743), so `-a`, `-g`, `--config` and a
-            // bare `help` never meet a repository's setup warnings.
+            // bare `help` never meet a repository's setup warnings. A format
+            // `verify_repository_format()` refuses is its warning, `*nongit_ok = -1`
+            // and a chdir to the top of the work tree (setup.c:771-777, 1957-1959).
+            if let Some(code) = crate::setup::refuse_repository_format_gently() {
+                return Ok(code);
+            }
             crate::config::check_bare_and_worktree()?;
             // `repo_config(the_repository, git_help_config, NULL)` (builtin/help.c:744), value by
             // value in parse order: `help.format` is judged where it stands (`parse_help_format()`
@@ -2245,6 +2250,8 @@ fn is_executable_file(path: &Path) -> bool {
 /// `read_early_config()` dies with the reader's own second line, so `Err` is the
 /// exit status once both lines are on stderr.
 pub(crate) fn alias_entries() -> Result<Vec<(String, String)>, ExitCode> {
+    // `read_early_config()` (alias.c:97), whose walk warns on a refused format.
+    crate::setup::read_early_config_ignored_format();
     let repo = crate::setup::discover().ok();
     let mut out = Vec::new();
     for entry in crate::config::walk_config_gently(repo.as_ref()) {
@@ -2321,6 +2328,9 @@ pub(crate) fn common_group(section: &str) -> Option<Vec<String>> {
 fn alias_list() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
 
+    // `list_aliases()` and `alias_lookup()` both read through `read_early_config()`
+    // (alias.c:88, 97), whose walk warns on a refused format.
+    crate::setup::read_early_config_ignored_format();
     let repo = crate::setup::discover().ok();
     let snapshot = repo.as_ref().map(|r| r.config_snapshot());
     let globals;

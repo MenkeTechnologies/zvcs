@@ -1901,6 +1901,18 @@ pub(crate) fn repository_ignored() -> bool {
 /// already refused, set by [`refuse_repository_format_gently`].
 static IGNORED_FORMAT_WARNING: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The `err` text of a format [`refuse_repository_format_gently`] turned into a warning.
+/// A later `setup_git_directory()` from the same command (grep's index fallback,
+/// archive, `hash-object -w`, `enter_repo()`) re-walks from the top it chdir()ed to,
+/// finds the same repository, and this time has no `nongit_ok`: `die("%s", err.buf)`
+/// (setup.c:779).
+static IGNORED_FORMAT_REFUSAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// See [`IGNORED_FORMAT_REFUSAL`].
+pub(crate) fn ignored_format_refusal() -> Option<&'static str> {
+    IGNORED_FORMAT_REFUSAL.get().map(String::as_str)
+}
+
 /// `read_and_verify_repository_format()` with a non-`NULL` `nongit_ok`
 /// (setup.c:771-777) for a command that sets up gently:
 ///
@@ -1931,6 +1943,7 @@ pub(crate) fn refuse_repository_format_gently() -> Option<ExitCode> {
         "warning: ignoring git dir '{}': {}",
         refusal.git_dir_shown, refusal.message
     ));
+    let _ = IGNORED_FORMAT_REFUSAL.set(refusal.message);
     None
 }
 
@@ -1938,10 +1951,29 @@ pub(crate) fn refuse_repository_format_gently() -> Option<ExitCode> {
 /// [`refuse_repository_format_gently`]: the walk finds the same repository, the
 /// format check fails again and warns again, and the early config carries on
 /// without the repository's files.
+///
+/// A command that never set up (`help -a`, whose `list_aliases()` is the first
+/// read) walks from its own cwd, so `discover_git_directory_reason()` names the git
+/// directory relative to it when the walk stayed put and absolutely when it climbed
+/// (setup.c:1745-1754).
 pub(crate) fn read_early_config_ignored_format() {
     if let Some(warning) = IGNORED_FORMAT_WARNING.get() {
         eprintln!("{warning}");
+        return;
     }
+    if repository_ignored() {
+        return;
+    }
+    let Some(refusal) = crate::config::gentle_repository_format_refusal() else {
+        return;
+    };
+    let cwd = std::env::current_dir().ok().map(|cwd| realpath(&cwd));
+    let shown = if refusal.git_dir_shown == ".git" && cwd.as_ref() != Some(&refusal.top) {
+        refusal.top.join(".git").to_string_lossy().into_owned()
+    } else {
+        refusal.git_dir_shown
+    };
+    eprintln!("warning: ignoring git dir '{shown}': {}", refusal.message);
 }
 
 /// Returns the exit code to leave with, or `None` to continue.
@@ -3151,10 +3183,25 @@ pub fn check_url_allowed(url: &gix::Url) -> Option<ExitCode> {
 /// the "does not appear to be a git repository" line the callers fall back to
 /// when the scan finds nothing at all.
 ///
+/// Having chdir()ed into the git directory it settled on, `enter_repo()` reads its
+/// format with `read_and_verify_repository_format(&fmt, ".", NULL)` (setup.c:1898).
+/// There is no `nongit_ok`, so a format `verify_repository_format()` refuses is
+/// `die("%s", err.buf)` (setup.c:779) before the caller says anything.
+///
 /// `candidates` are the paths the caller would try in order, already
 /// tilde-expanded. Returns the exit code to leave with, or `None` when the caller
 /// should carry on opening the repository itself.
 pub fn enter_repo_gitfile_gate(candidates: &[PathBuf]) -> Option<ExitCode> {
+    let msg = enter_repo_refusal(candidates)?;
+    crate::trace2::error(&msg);
+    eprintln!("fatal: {msg}");
+    Some(ExitCode::from(crate::fatal::EXIT_FATAL))
+}
+
+/// The `die()` text of [`enter_repo_gitfile_gate`], for a caller that writes its
+/// own `fatal:` line (`upload-archive--writer`, whose stderr is one sideband
+/// packet per write).
+pub fn enter_repo_refusal(candidates: &[PathBuf]) -> Option<String> {
     use crate::porcelain::rev_parse::{gitfile_error_message, is_git_directory, read_gitfile_gently};
     for candidate in candidates {
         let Ok(meta) = std::fs::metadata(candidate) else { continue };
@@ -3164,13 +3211,11 @@ pub fn enter_repo_gitfile_gate(candidates: &[PathBuf]) -> Option<ExitCode> {
         // This is the candidate `enter_repo()` settled on; its `read_gitfile()`
         // is fatal for the six outcomes that mean "this looked like a gitfile
         // and was not one".
-        return match read_gitfile_gently(candidate) {
-            Ok(_) => None,
-            Err(err) => {
-                eprintln!("fatal: {}", gitfile_error_message(candidate, err));
-                Some(ExitCode::from(crate::fatal::EXIT_FATAL))
-            }
+        let git_dir = match read_gitfile_gently(candidate) {
+            Ok(target) => target.unwrap_or_else(|| candidate.clone()),
+            Err(err) => return Some(gitfile_error_message(candidate, err)),
         };
+        return crate::config::repository_format_refusal_in(&git_dir);
     }
     None
 }

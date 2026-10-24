@@ -2152,6 +2152,35 @@ pub fn config(args: &[String]) -> Result<ExitCode> {
     };
 
     // ```c
+    // if (actions & (ACTION_LIST | ACTION_GET_ALL | ACTION_GET_REGEXP | ACTION_GET_URLMATCH))
+    //         setup_auto_pager("config", 1);
+    // ```
+    //
+    // (builtin/config.c:1494-1495; `cmd_config_list()` and `cmd_config_get()` call it
+    // unconditionally at :1058 and, unless `--type=color`, :1117-1118.) `config` is
+    // `DELAY_PAGER_CONFIG`, so this is where its `check_pager_config()` runs
+    // (git.c:140-147): after `location_options_init()`, ahead of
+    // `config_with_options()`, and only while neither `-p`/`-P` nor `pager_in_use()`
+    // has decided. Its `read_early_config()` is what re-finds a repository whose
+    // format setup refused and warns `ignoring git dir`.
+    let auto_pager = if from_subcommand {
+        matches!(
+            mode,
+            Mode::List
+                | Mode::Get
+                | Mode::GetAll
+                | Mode::GetKeyRegexp
+                | Mode::GetKeyRegexpAll
+                | Mode::GetUrlMatch
+        ) && !(mode != Mode::List && d.ty == Some(ValueType::Color))
+    } else {
+        matches!(mode, Mode::List | Mode::GetAll | Mode::GetRegexp | Mode::GetUrlMatch)
+    };
+    if auto_pager && crate::pager::pager_choice_open() && !crate::pager::in_use() {
+        crate::setup::read_early_config_ignored_format();
+    }
+
+    // ```c
     // if (inc->depth > MAX_INCLUDE_DEPTH)
     //         die(_(include_depth_advice), MAX_INCLUDE_DEPTH, path,
     //             !cf ? "<unknown>" : cf->name ? cf->name : "the command line");

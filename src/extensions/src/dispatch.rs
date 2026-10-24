@@ -1267,13 +1267,18 @@ const REPO_FORMAT_GATE_VERBS: &[&str] = &["init", "init-db", "rev-parse"];
 /// [`crate::NO_SETUP_VERBS`] excludes, because the question that list answers
 /// ("what still works with no repository at all") is not this one.
 ///
-/// The warning half is ported for `diff` alone ([`gentle_format_gate`]). For the
-/// rest it means running each verb with the repository suppressed — every
-/// `read_early_config()` then has `discover_git_directory_reason()`
-/// (setup.c:1765-1767) emit a second `warning: ignoring git dir '<dir>': …`, at
-/// whatever point that verb reads early config — and each verb's own `nongit`
-/// arm. Listing them here keeps this gate from inventing a `fatal:` git does not
-/// raise; they carry on as before.
+/// The warning half runs each verb with the repository suppressed from the top of
+/// the work tree ([`crate::setup::refuse_repository_format_gently`]): in
+/// [`gentle_format_gate`] for `diff` and the `RUN_SETUP_GENTLY` entries, and where
+/// the verb calls `setup_git_directory_gently()` itself for the rest (`help <topic>`,
+/// `check-ref-format --branch`, `hash-object`, `stripspace -s`/`-c` through
+/// [`gentle_setup_gates`]). Every `read_early_config()` then has
+/// `discover_git_directory_reason()` (setup.c:1765-1767) emit a second
+/// `warning: ignoring git dir '<dir>': …` ([`crate::setup::read_early_config_ignored_format`]),
+/// and a later `setup_git_directory()` dies with the refusal ([`crate::fatal::no_repository_walked`]).
+/// The verbs that never set up (`version`, `url-parse`, `mailsplit`, `remote-ext`, …)
+/// never meet the format; `upload-pack`, `receive-pack` and `upload-archive--writer`
+/// meet it in `enter_repo()`, which dies ([`crate::setup::enter_repo_gitfile_gate`]).
 const FORMAT_GENTLE_VERBS: &[&str] = &[
     "apply",
     "archive",
@@ -1412,18 +1417,64 @@ fn format_refusal(sub: &str, args: &[String]) -> Option<String> {
     crate::config::repository_format_refusal()
 }
 
+/// The `commands[]` entries flagged `RUN_SETUP_GENTLY` (git.c:537-679): `run_builtin()`
+/// calls `setup_git_directory_gently(the_repository, &no_repo)` for each before the
+/// builtin's own `fn` (git.c:486-487), so a refused format warns there, ahead of any
+/// option parse, `-h` included.
+const RUN_SETUP_GENTLY_VERBS: &[&str] = &[
+    "apply",
+    "archive",
+    "bugreport",
+    "bundle",
+    "column",
+    "config",
+    "credential",
+    "diagnose",
+    "difftool",
+    "for-each-repo",
+    "grep",
+    "hook",
+    "index-pack",
+    "interpret-trailers",
+    "ls-remote",
+    "mailinfo",
+    "merge-file",
+    "patch-id",
+    "shortlog",
+    "show-index",
+    "var",
+];
+
 /// The warning half of `check_repository_format_gently()` for the gentle verbs
 /// this port carries on outside the repository for, see
-/// [`crate::setup::refuse_repository_format_gently`]. Only `diff` so far: its
-/// `nongit` arm is `DIFF_NO_INDEX_IMPLICIT` (builtin/diff.c:458-477), which
-/// [`crate::porcelain::diff`] already reaches whenever discovery finds nothing.
-/// `--help` first is `handle_builtin()`'s rewrite to `git help diff`, which never
-/// reaches `cmd_diff()`'s `setup_git_directory_gently()`.
+/// [`crate::setup::refuse_repository_format_gently`].
+///
+/// * `diff`: its `nongit` arm is `DIFF_NO_INDEX_IMPLICIT` (builtin/diff.c:458-477),
+///   which [`crate::porcelain::diff`] already reaches whenever discovery finds nothing.
+/// * [`RUN_SETUP_GENTLY_VERBS`]: `run_builtin()`'s own setup, then — unless the entry
+///   carries `DELAY_PAGER_CONFIG` (`config` alone) or the command line already chose
+///   a pager — `check_pager_config()` (git.c:493-495), whose `read_early_config()`
+///   re-walks to the refused repository and warns `ignoring git dir`.
+///
+/// `--help` first is `handle_builtin()`'s rewrite to `git help <cmd>`, which never
+/// reaches the verb's setup.
 fn gentle_format_gate(sub: &str, args: &[String]) -> Option<ExitCode> {
-    if sub != "diff" || args.first().is_some_and(|a| a == "--help") {
+    if args.first().is_some_and(|a| a == "--help") {
         return None;
     }
-    crate::setup::refuse_repository_format_gently()
+    if sub == "diff" {
+        return crate::setup::refuse_repository_format_gently();
+    }
+    if !RUN_SETUP_GENTLY_VERBS.contains(&sub) {
+        return None;
+    }
+    if let Some(code) = crate::setup::refuse_repository_format_gently() {
+        return Some(code);
+    }
+    if sub != "config" && crate::pager::pager_choice_open() {
+        crate::setup::read_early_config_ignored_format();
+    }
+    None
 }
 
 /// `check_repo_format()` refusing an `extensions.<key>` value of the repository's config: prints
@@ -1447,12 +1498,16 @@ fn extension_value_refusal(sub: &str) -> Option<String> {
 /// for a verb which only reaches it in some modes, after the verb has parsed its own options:
 /// a line the parser rejects, an `extensions.<key>` value `check_repo_format()` rejects, and a
 /// repository version it cannot parse. [`reads_repository_config`] exempts such a verb from the
-/// dispatcher's own pass, so the verb calls this at the point git does. Returns the exit code to
-/// leave with.
+/// dispatcher's own pass, so the verb calls this at the point git does. Then the format check
+/// itself, whose refusal is only a warning here (setup.c:771-777), see
+/// [`crate::setup::refuse_repository_format_gently`]. Returns the exit code to leave with.
 pub(crate) fn gentle_setup_gates(sub: &str) -> Option<ExitCode> {
-    let msg = crate::config::bad_config_line(crate::config::ConfigScopes::Repository, crate::config::GitDirNaming::AsDiscovered)
+    let refused = crate::config::bad_config_line(crate::config::ConfigScopes::Repository, crate::config::GitDirNaming::AsDiscovered)
         .or_else(|| extension_value_refusal(sub))
-        .or_else(crate::config::repository_version_refusal)?;
+        .or_else(crate::config::repository_version_refusal);
+    let Some(msg) = refused else {
+        return crate::setup::refuse_repository_format_gently();
+    };
     crate::trace2::error(&msg);
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(crate::fatal::EXIT_FATAL))

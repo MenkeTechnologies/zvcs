@@ -287,12 +287,18 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
             s if s.starts_with("--chmod=") => {
                 chmod_arg = Some(s["--chmod=".len()..].to_string());
             }
+            // `OPT_PATHSPEC_FROM_FILE` is an `OPT_FILENAME`: `fix_filename()` turns an
+            // empty value into NULL (parse-options.c:64-70), and that NULL replaces
+            // any earlier value (parse-options.c:227-232), so `--pathspec-from-file=`
+            // leaves no file to read and no clash with `-p` to die over.
             "--pathspec-from-file" => {
                 i += 1;
-                from_file = Some(super::value_at(args, i, a)?.to_string());
+                let v = super::value_at(args, i, a)?;
+                from_file = (!v.is_empty()).then(|| v.to_string());
             }
             s if s.starts_with("--pathspec-from-file=") => {
-                from_file = Some(s["--pathspec-from-file=".len()..].to_string());
+                let v = &s["--pathspec-from-file=".len()..];
+                from_file = (!v.is_empty()).then(|| v.to_string());
             }
             // accepted and ignored: measured against stock, an earlier --pathspec-from-file survives it.
             "--no-pathspec-from-file" => {}

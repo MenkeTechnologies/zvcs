@@ -3093,9 +3093,15 @@ fn restore_from_index(
         if let Ok(idx) = index.entry_index_by_path(BStr::new(path)) {
             if let Some((id, mode, stat)) = fresh.get(path) {
                 let e = &mut index.entries_mut()[idx];
-                if ignore_skipworktree {
-                    e.flags.remove(Flags::SKIP_WORKTREE);
-                }
+                // The real index keeps `CE_SKIP_WORKTREE` on a path `--ignore-skip-worktree-bits`
+                // wrote out: `checkout_worktree()` (builtin/checkout.c:447-450) hands the entry to
+                // `checkout_entry()`, which writes the file and refreshes its stat data without
+                // touching `ce_flags`, and `write_locked_index()` (:701) stores the bit. The `H`
+                // that `ls-files -v` shows afterwards is the next reader's
+                // `clear_skip_worktree_from_present_files()` (repository.c:467), which drops it in
+                // memory only. Clearing it here wrote a different index: an `H` entry still
+                // carrying `CE_EXTENDED`, which a later `status` rewrote or left depending on
+                // whether the write landed in the file's mtime second.
                 if e.id != *id || e.mode != *mode {
                     stale.push(path.clone());
                 }

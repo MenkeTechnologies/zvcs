@@ -3125,33 +3125,16 @@ fn emit_blob_finding(
     }
 }
 
-/// Every object directory git would search: the repository's own, plus each
-/// alternate reached transitively.
+/// Every object directory git would search, `repo->objects->sources`: the
+/// repository's own, then each alternate in the order `prepare_alt_odb()` links
+/// them (odb.c). That walk is depth-first pre-order — an entry is linked before
+/// its own `info/alternates` is read — and `gix-odb`'s alternate resolution is
+/// its port, so the loose-object scan and the `commit-graph verify` child per
+/// source (builtin/fsck.c:985-999) visit them in git's order, transitive
+/// alternates included.
 fn odb_sources(repo: &gix::Repository) -> Vec<PathBuf> {
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut out: Vec<PathBuf> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![repo.common_dir().join("objects")];
-    while let Some(objdir) = stack.pop() {
-        let canon = objdir.canonicalize().unwrap_or_else(|_| objdir.clone());
-        if !seen.insert(canon) {
-            continue;
-        }
-        out.push(objdir.clone());
-        let Ok(content) = std::fs::read(objdir.join("info").join("alternates")) else {
-            continue;
-        };
-        for line in content.split(|&b| b == b'\n') {
-            if line.is_empty() || line[0] == b'#' {
-                continue;
-            }
-            let p = Path::new(std::ffi::OsStr::from_bytes(line));
-            stack.push(if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                objdir.join(p)
-            });
-        }
-    }
+    let mut out = vec![repo.common_dir().join("objects")];
+    out.extend(repo.objects.store_ref().alternate_db_paths().unwrap_or_default());
     out
 }
 

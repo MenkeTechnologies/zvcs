@@ -3,12 +3,14 @@
 //! Both subcommands are implemented, including the file format writer.
 //!
 //! * `git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress]`
-//!   Opens `<object-dir>/info/commit-graph` (or the split chain under
-//!   `<object-dir>/info/commit-graphs/`) through `gix_commitgraph` and runs
-//!   `Graph::verify_integrity`. `--shallow` verifies only the tip file of a
-//!   split chain, via `gix_commitgraph::File::traverse`. On success stdout is
-//!   empty and the exit code is 0. When no commit-graph file exists at all git
-//!   treats that as success too, and so does this.
+//!   A port of `graph_verify()` and `verify_commit_graph()`, in
+//!   `commit_graph_verify.rs`: opens `<object-dir>/info/commit-graph` (or the
+//!   split chain under `<object-dir>/info/commit-graphs/`, whose layers may live in
+//!   any source of the object database), loads it with git's own checks and
+//!   messages, and compares every commit with the object database. `--shallow`
+//!   verifies only the tip file of a split chain. On success stdout is empty and
+//!   the exit code is 0. When no commit-graph file exists at all git treats that
+//!   as success too, and so does this.
 //! * `git commit-graph write [--object-dir <dir>] [--append] [--reachable |
 //!   --stdin-packs | --stdin-commits] [--[no-]progress] <split-options>`
 //!   Collects the commit set the way git does — from every pack in the object
@@ -88,10 +90,11 @@
 //! ignores all three for a non-split write, and so does this, after validating
 //! their values so the exit codes still agree.
 //!
-//! Progress goes to stderr in git and is not emitted here. Verification
-//! *failure* text is gix's diagnostic, not git's wording; only the success path
-//! is byte-identical. Exit codes follow git: 1 when the file fails to parse or
-//! verify, 128 for `fatal:`, 129 for usage errors.
+//! `write` emits no progress. `verify` draws git's `Verifying commits in commit
+//! graph` meter and reports with git's wording; its exit code is
+//! `verify_commit_graph()`'s error bits (1 for a mismatch, 2 for a bad checksum
+//! alone, 3 for both), 1 when the file fails to load, 128 for `fatal:` and 129
+//! for usage errors.
 
 use anyhow::{bail, Result};
 use gix::hash::ObjectId;
@@ -100,6 +103,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+#[path = "commit_graph_verify.rs"]
+mod verify_port;
 
 /// Top-level usage, byte-for-byte as git 2.55 emits it.
 /// `cmd_commit_graph()`'s top-level option table (builtin/commit-graph.c:347),
@@ -393,94 +399,35 @@ fn verify(args: &[String], inherited_object_dir: Option<String>) -> Result<ExitC
         i += 1;
     }
 
-    let repo = crate::setup::discover()?;
-    let objects = match object_directory(&repo, object_dir.as_deref()) {
-        Ok(p) => p,
+    // `disable_replace_refs()` in `cmd_commit_graph()` (builtin/commit-graph.c:356): the object
+    // database is compared as stored, not through `refs/replace/*`.
+    let repo = {
+        let mut repo = crate::setup::discover()?;
+        repo.objects.ignore_replacements = true;
+        repo
+    };
+    let source = match verify_source(&repo, object_dir.as_deref()) {
+        Ok(s) => s,
         Err(code) => return Ok(code),
     };
-
-    let info = objects.join("info");
-    let single = info.join("commit-graph");
-    let chain = info.join("commit-graphs").join("commit-graph-chain");
-    // No commit-graph at all is not an error for git: it verifies nothing and succeeds.
-    if !single.is_file() && !chain.is_file() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    // `--shallow` on a split chain checks the tip file only. The chain file
-    // lists base graphs first and the tip last.
-    if shallow && !single.is_file() {
-        let Some(tip) = chain_tip(&chain) else {
-            eprintln!("error: could not read commit-graph chain file");
-            return Ok(ExitCode::from(1));
-        };
-        return Ok(match gix::commitgraph::File::at(&tip) {
-            Ok(f) => {
-                // `COMMIT_GRAPH_VERIFY_SHALLOW` leaves `num_commits_in_base` out of
-                // the meter's total (commit-graph.c:2927-2929).
-                let mut meter = verify_meter(f.num_commits(), progress);
-                let verified = f.traverse(|_| {
-                    meter.tick();
-                    Ok(())
-                });
-                let code = match verified {
-                    Ok(_) => ExitCode::SUCCESS,
-                    Err(e) => error_exit(&e.to_string()),
-                };
-                meter.stop("done");
-                code
-            }
-            Err(e) => error_exit(&e.to_string()),
-        });
-    }
-
-    let graph = match gix::commitgraph::at(&info) {
-        Ok(g) => g,
-        Err(e) => return Ok(error_exit(&e.to_string())),
-    };
-
-    // `g->num_commits + g->num_commits_in_base`: every file of the chain.
-    let mut meter = verify_meter(graph.num_commits(), progress);
-    let verified = graph.verify_integrity(|_| -> Result<(), std::convert::Infallible> {
-        meter.tick();
-        Ok(())
-    });
-    let code = match verified {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::from(1)
-        }
-    };
-    // `stop_progress(&progress)` after the per-file loop (commit-graph.c:2945),
-    // so the `, done.` line follows any report the loop printed.
-    meter.stop("done");
-    Ok(code)
+    let sources = verify_port::odb_sources(&repo);
+    Ok(verify_port::graph_verify(&repo, &sources, &source, shallow, progress))
 }
 
-/// `verify_commit_graph()`'s meter (commit-graph.c:2924-2935): under
-/// `COMMIT_GRAPH_WRITE_PROGRESS` a `start_progress()` — not a delayed one, so
-/// `GIT_PROGRESS_DELAY` does not hold it back — over `total` commits, advanced
-/// by `display_progress(progress, ++(*seen))` once per commit
-/// `verify_one_commit_graph()` checks against the object database (:2828).
-///
-/// The checks themselves are `gix_commitgraph`'s integrity walk, not
-/// `verify_one_commit_graph()`'s comparison with the object database; it calls
-/// back once per commit of every file it reaches, so a graph that verifies draws
-/// the same `1..=total` counts whichever file the walk visits first.
-fn verify_meter(total: u32, progress: bool) -> crate::progress::Meter {
-    crate::progress::Meter::counted("Verifying commits in commit graph", total as usize, progress)
-}
-
-/// The last entry of a `commit-graph-chain` file, resolved to its `.graph` path.
-fn chain_tip(chain: &Path) -> Option<PathBuf> {
-    let body = std::fs::read_to_string(chain).ok()?;
-    let last = body.lines().map(str::trim).rfind(|l| !l.is_empty())?;
-    Some(
-        chain
-            .parent()?
-            .join(format!("graph-{last}.graph")),
-    )
+/// `odb_find_source_or_die()` for `verify` (builtin/commit-graph.c:102-108): no `--object-dir`
+/// is `repo_get_object_directory()`, the first source; otherwise the source the value resolves to,
+/// as [`object_directory`] finds it, kept with the spelling git prints it by.
+fn verify_source(
+    repo: &gix::Repository,
+    dir: Option<&str>,
+) -> std::result::Result<verify_port::Source, ExitCode> {
+    let sources = verify_port::odb_sources(repo);
+    let Some(dir) = dir else {
+        return Ok(sources.into_iter().next().expect("the primary source"));
+    };
+    let want = object_dir_realpath(repo, dir)?;
+    verify_port::find_source(sources, &want)
+        .ok_or_else(|| fatal(&format!("could not find object directory matching {dir}")))
 }
 
 // --- write -----------------------------------------------------------------
@@ -1903,7 +1850,7 @@ fn display_path(path: &Path) -> String {
 
 // --- object directory ------------------------------------------------------
 
-/// Resolve `--object-dir` against the repository, as git's `odb_find_alternate`
+/// Resolve `--object-dir` against the repository, as git's `odb_find_source_or_die()`
 /// does: the value must name the repository's own object database or one of its
 /// alternates, otherwise git refuses with exit 128.
 fn object_directory(
@@ -1914,6 +1861,17 @@ fn object_directory(
     let Some(dir) = dir else {
         return Ok(repo_objects);
     };
+    let want = object_dir_realpath(repo, dir)?;
+    match verify_port::find_source(verify_port::odb_sources(repo), &want) {
+        Some(_) => Ok(want),
+        None => Err(fatal(&format!(
+            "could not find object directory matching {dir}"
+        ))),
+    }
+}
+
+/// `real_pathdup(obj_dir, 1)` at the head of `odb_find_source()` (odb.c:362).
+fn object_dir_realpath(repo: &gix::Repository, dir: &str) -> std::result::Result<PathBuf, ExitCode> {
     if dir.is_empty() {
         return Err(fatal("The empty string is not a valid path"));
     }
@@ -1924,41 +1882,6 @@ fn object_directory(
         (true, Some(top)) => top.join(dir),
         _ => PathBuf::from(dir),
     };
-    // `odb_find_source_or_die()` resolves it with `real_pathdup(path, 1)`, which dies on a missing
-    // intermediate component.
-    let want = match crate::setup::realpath_or_die(&at_setup) {
-        Ok(p) => p,
-        Err(message) => return Err(fatal(&message)),
-    };
-    match resolve_object_dir(want, &repo_objects) {
-        Some(p) => Ok(p),
-        None => Err(fatal(&format!(
-            "could not find object directory matching {dir}"
-        ))),
-    }
-}
-
-/// Map a user-supplied `--object-dir` onto a known object directory.
-///
-/// git rejects a directory that is neither the repository's own object database
-/// nor one of its alternates; mirror that by comparing canonicalised paths
-/// against the main objects dir and every entry of `info/alternates`.
-fn resolve_object_dir(want: PathBuf, repo_objects: &Path) -> Option<PathBuf> {
-    let mut candidates = vec![repo_objects.to_path_buf()];
-
-    if let Ok(alternates) = std::fs::read_to_string(repo_objects.join("info").join("alternates")) {
-        for line in alternates.lines().filter(|l| !l.trim().is_empty()) {
-            let p = PathBuf::from(line);
-            candidates.push(if p.is_absolute() {
-                p
-            } else {
-                repo_objects.join(p)
-            });
-        }
-    }
-
-    candidates
-        .into_iter()
-        .find(|c| std::fs::canonicalize(c).is_ok_and(|c| c == want))
-        .map(|_| want)
+    // `real_pathdup(path, 1)` dies on a missing intermediate component.
+    crate::setup::realpath_or_die(&at_setup).map_err(|message| fatal(&message))
 }

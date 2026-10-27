@@ -162,6 +162,38 @@ fn a_directory_already_in_the_environment_is_emitted_commented_out() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The shim directory on `PATH` *behind* a stock git is not an active shadow:
+/// every `git` another program execs (hub, an editor, a script) is the stock
+/// one, so its commands never reach the `zcommands` log. The `PATH` line has to
+/// be emitted live so the `eval` moves the shim to the front.
+#[test]
+fn a_shim_directory_behind_a_stock_git_is_emitted_live() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = scratch("shadowed");
+    assert!(zshadow(&home, &[], &[]).status.success(), "install failed");
+    let bin = home.join("bin");
+    let stock = home.join("stock");
+    std::fs::create_dir_all(&stock).unwrap();
+    std::fs::write(stock.join("git"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(stock.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let behind = zshadow(&home, &["-n"], &[("PATH", format!("{}:{}:/usr/bin", stock.display(), bin.display()))]);
+    let stdout = String::from_utf8(behind.stdout).expect("utf-8 stdout");
+    assert!(
+        stdout.lines().any(|l| l.starts_with("export PATH=")),
+        "a shim behind a stock git must be re-prepended:\n{stdout}"
+    );
+
+    let ahead = zshadow(&home, &["-n"], &[("PATH", format!("{}:{}:/usr/bin", bin.display(), stock.display()))]);
+    let stdout = String::from_utf8(ahead.stdout).expect("utf-8 stdout");
+    assert!(
+        stdout.lines().any(|l| l.starts_with("# export PATH=") && l.ends_with("already on PATH")),
+        "a shim already first stays commented out:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn print_only_installs_nothing() {
     let home = scratch("print");

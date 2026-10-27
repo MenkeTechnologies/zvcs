@@ -111,10 +111,22 @@ fn install_completion(dir: &Path) -> Result<&'static str> {
     Ok("_git written")
 }
 
-/// Print one shell line, commented out when `var` already lists `dir` (and
-/// `--all` was not given) so an `eval` cannot duplicate the entry.
+/// Print one shell line, commented out when the environment already satisfies
+/// it (and `--all` was not given) so an `eval` cannot duplicate the entry.
+///
+/// For `PATH`, listing `dir` is not enough: the shadow is active only when the
+/// first `git` on `PATH` is the one in `dir`. With `dir` behind a stock git —
+/// `/usr/local/bin` ahead of `~/.zvcs/bin` — every `git` a program execs (hub,
+/// an editor, a script) is stock git, and its commands never reach the
+/// `zcommands` log. The line is emitted live so `eval` moves `dir` to the front.
 fn emit(var: &str, code: &str, dir: &Path, all: bool) {
-    if !all && doctor::path_list_contains(var, dir) {
+    let satisfied = if var == "PATH" {
+        let shim = dir.join("git");
+        doctor::first_git_on_path().is_some_and(|found| doctor::canon(&found) == doctor::canon(&shim))
+    } else {
+        doctor::path_list_contains(var, dir)
+    };
+    if !all && satisfied {
         println!("# {code}  # already on {var}");
     } else {
         println!("{code}");

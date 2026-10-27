@@ -168,7 +168,7 @@ fn marker(level: &Level, colored: bool) -> String {
 }
 
 /// The first `git` executable on `PATH`, or `None`.
-fn first_git_on_path() -> Option<PathBuf> {
+pub(crate) fn first_git_on_path() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join("git"))
@@ -176,7 +176,7 @@ fn first_git_on_path() -> Option<PathBuf> {
 }
 
 /// Canonicalize, falling back to the path as-is so a comparison still works.
-fn canon(p: &Path) -> PathBuf {
+pub(crate) fn canon(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
 }
 

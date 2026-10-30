@@ -60,6 +60,26 @@ impl WorktreeFilter {
         })
     }
 
+    /// The pipeline `diff_populate_filespec()` reads a worktree side through
+    /// (diff.c:4483-4489):
+    ///
+    /// ```c
+    /// int conv_flags = global_conv_flags_eol;
+    /// /*
+    ///  * demote FAIL to WARN to allow inspecting the situation
+    ///  * instead of refusing.
+    ///  */
+    /// if (conv_flags & CONV_EOL_RNDTRP_DIE)
+    ///         conv_flags = CONV_EOL_RNDTRP_WARN;
+    /// ```
+    ///
+    /// so `core.safecrlf=true` warns where `git add` would die.
+    pub(super) fn for_diff(repo: &gix::Repository) -> Result<Self> {
+        let mut filter = Self::new(repo, true, false)?;
+        demote_roundtrip_die(filter.pipeline.options_mut());
+        Ok(filter)
+    }
+
     /// The pipeline `git apply` reads a worktree pre-image through — `read_old_data()`,
     /// apply.c:2401-2427.
     ///
@@ -130,6 +150,15 @@ impl WorktreeFilter {
         let mut converted = Vec::with_capacity(bytes.len());
         outcome.read_to_end(&mut converted).map_err(|e| ConvertError(e.to_string()))?;
         Ok(converted)
+    }
+}
+
+/// `diff_populate_filespec()`'s `CONV_EOL_RNDTRP_DIE` → `CONV_EOL_RNDTRP_WARN`
+/// (diff.c:4483-4489) on a pipeline's options. See [`WorktreeFilter::for_diff`].
+pub(super) fn demote_roundtrip_die(options: &mut gix::filter::plumbing::pipeline::Options) {
+    use gix::filter::plumbing::pipeline::CrlfRoundTripCheck;
+    if options.crlf_roundtrip_check == CrlfRoundTripCheck::Fail {
+        options.crlf_roundtrip_check = CrlfRoundTripCheck::Warn;
     }
 }
 

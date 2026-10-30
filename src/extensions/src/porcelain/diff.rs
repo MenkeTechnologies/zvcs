@@ -518,6 +518,11 @@ struct Delta {
     /// the names the formats that never call `strip_prefix()` print. `None` when
     /// nothing was stripped.
     unstripped: Option<(BString, Option<BString>)>,
+    /// `p->two->data` already filled for a worktree post-image: [`skip_stat_unmatch`]
+    /// read the file through `convert_to_git()`, so its round-trip warning has been
+    /// printed, and `diff_populate_filespec()` returns early for a filespec that
+    /// holds data (diff.c:4498-4499) — no later read of the pair warns again.
+    populated: bool,
 }
 
 /// `userdiff_find_by_path()` for a pair's two filespecs. git looks the two sides up
@@ -698,6 +703,7 @@ impl Delta {
             drivers: PairDrivers::default(),
             textconv: None,
             unstripped: None,
+            populated: false,
         }
     }
 
@@ -1260,6 +1266,7 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         // `fill_textconv()` renders as nothing at all.
         textconv: d.textconv.as_ref().map(|(o, _)| (o.clone(), Vec::new())),
         unstripped: d.unstripped.clone(),
+        populated: d.populated,
     };
     let creation = Delta {
         path: d.path.clone(),
@@ -1282,6 +1289,7 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         drivers: d.drivers.clone(),
         textconv: d.textconv.as_ref().map(|(_, n)| (Vec::new(), n.clone())),
         unstripped: d.unstripped.clone(),
+        populated: d.populated,
     };
     Some((deletion, creation))
 }
@@ -1343,7 +1351,145 @@ const SHORT_OPTS: crate::parseopt::Shorts<'static> =
 // entry point
 // ---------------------------------------------------------------------------
 
+/// `cmd_diff()`, whose last act before it returns the result code is
+///
+/// ```c
+/// result = diff_result_code(&rev);
+/// if (1 < rev.diffopt.skip_stat_unmatch)
+///         refresh_index_quietly();
+/// ```
+///
+/// (builtin/diff.c:648-650): a diff that dropped at least one pair as dirty only in
+/// its stat data writes the refreshed stat data back, so the next command need not
+/// read those files again. A `die()` on the way exits before it.
 pub fn diff(args: &[String]) -> Result<ExitCode> {
+    let mut refresh = None;
+    let code = cmd_diff(args, &mut refresh)?;
+    if let Some(repo) = refresh {
+        refresh_index_quietly(&repo)?;
+    }
+    Ok(code)
+}
+
+/// `refresh_index_quietly()` (builtin/diff.c:237-250):
+///
+/// ```c
+/// fd = repo_hold_locked_index(the_repository, &lock_file, 0);
+/// if (fd < 0)
+///         return;
+/// discard_index(the_repository->index);
+/// repo_read_index(the_repository);
+/// refresh_index(the_repository->index, REFRESH_QUIET|REFRESH_UNMERGED, NULL, NULL, NULL);
+/// repo_update_index_if_able(the_repository, &lock_file);
+/// ```
+///
+/// The lock is taken without `LOCK_DIE_ON_ERROR`, so an index another process holds
+/// costs the refresh and nothing else. The re-read, the whole-index refresh and the
+/// conditional write are `git status`'s own [`super::status::update_index_if_able`]
+/// with no pathspec and no untracked walk: it writes when the refresh moved stat
+/// data, when `tweak_split_index()` / `tweak_untracked_cache()` changed the shape on
+/// the read, or when an entry is racily clean, and only if the index on disk is
+/// still the one it read.
+fn refresh_index_quietly(repo: &gix::Repository) -> Result<()> {
+    let Some(lock) = crate::index_racy::hold_locked_index(repo) else {
+        return Ok(());
+    };
+    super::status::update_index_if_able(repo, lock, &[], None)
+}
+
+/// `diffcore_skip_stat_unmatch()` (diff.c:7376-7399) over
+/// `diff_filespec_check_stat_unmatch()` (diff.c:7337-7374): drop every pair that
+/// reached the queue only because its worktree side's stat data moved, and return
+/// how many were dropped.
+///
+/// ```c
+/// if (!DIFF_FILE_VALID(p->one) ||                 /* (1) */
+///     !DIFF_FILE_VALID(p->two) ||
+///     (p->one->oid_valid && p->two->oid_valid) ||
+///     (p->one->mode != p->two->mode) ||
+///     diff_populate_filespec(r, p->one, &dpf_options) ||
+///     diff_populate_filespec(r, p->two, &dpf_options) ||
+///     (p->one->size != p->two->size) ||
+///     !diff_filespec_is_identical(r, p->one, p->two)) /* (2) */
+///         p->skip_stat_unmatch_result = 1;
+/// ```
+///
+/// A pair that gets as far as `diff_populate_filespec()` of its worktree side reads
+/// the file through `convert_to_git()` — `would_convert_to_git()` defeats the size-only
+/// shortcut (diff.c:4536-4543) — under `global_conv_flags_eol` demoted from `DIE` to
+/// `WARN` (diff.c:4483-4489), so `core.safecrlf` warns here, once per file, and never
+/// dies; the pair keeps that data ([`Delta::populated`]). Comparing the converted
+/// content's blob id is `diff_filespec_is_identical()`'s byte comparison. A file the
+/// read cannot open keeps its pair (`err_empty`). A gitlink's image is `Subproject
+/// commit <oid>[-dirty]` (`diff_populate_gitlink()`), equal only when the checked-out
+/// commit is the recorded one and nothing is dirty.
+///
+/// The queue is walked in path order, which is the order `run_diff_files()` and
+/// `unpack_trees()` queue in. `quick_quit` is `diff_can_quit_early()` stopping the walk
+/// at the first pair that sets `has_changes` (diff-lib.c:135-136, :550-553): every
+/// pair behind it was never queued, so it is neither read nor counted.
+fn skip_stat_unmatch(repo: &gix::Repository, deltas: &mut Vec<Delta>, quick_quit: bool) -> Result<usize> {
+    deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
+    let Some(workdir) = repo.workdir().map(|p| p.to_owned()) else {
+        return Ok(0);
+    };
+    let hash_kind = repo.object_hash();
+    let mut filter: Option<super::convert_to_git::WorktreeFilter> = None;
+    let mut skipped = 0;
+    let mut kept: Vec<Delta> = Vec::with_capacity(deltas.len());
+    for mut d in std::mem::take(deltas) {
+        let identical = match (&d.old, &d.new) {
+            _ if d.unmerged || d.old_worktree => false,
+            (Some((old_id, old_kind)), NewSide::Worktree(new_kind)) if old_kind == new_kind => match new_kind {
+                EntryKind::Commit => d.new_commit == Some(*old_id) && d.dirty_submodule == 0,
+                EntryKind::Tree => false,
+                _ => {
+                    let path = workdir.join(gix::path::from_bstr(d.path.as_bstr()));
+                    let bytes = match std::fs::symlink_metadata(&path) {
+                        Ok(md) if md.is_symlink() => {
+                            std::fs::read_link(&path).ok().map(|t| gix::path::into_bstr(t).into_owned().into())
+                        }
+                        Ok(md) if md.len() == 0 => Some(Vec::new()),
+                        Ok(_) => match std::fs::read(&path) {
+                            Ok(raw) => {
+                                let f = match &mut filter {
+                                    Some(f) => f,
+                                    none => none.insert(super::convert_to_git::WorktreeFilter::for_diff(repo)?),
+                                };
+                                d.populated = true;
+                                f.convert(repo, &gix::path::from_bstr(d.path.as_bstr()), &raw)
+                                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+                                    .map(Some)?
+                            }
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    };
+                    match bytes {
+                        Some(bytes) => gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &bytes)? == *old_id,
+                        None => false,
+                    }
+                }
+            },
+            _ => false,
+        };
+        if identical {
+            skipped += 1;
+            continue;
+        }
+        // `diff_unmerge()` (diff.c:7722-7736) queues the `U` pair without touching
+        // `has_changes`; `diff_change()` and `diff_addremove()` set it.
+        let sets_has_changes = !d.unmerged;
+        kept.push(d);
+        if quick_quit && sets_has_changes {
+            break;
+        }
+    }
+    *deltas = kept;
+    Ok(skipped)
+}
+
+fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<ExitCode> {
     // `builtin_diff()` splits before anything else: `--no-index` compares two paths
     // on disk and needs no repository, so it cannot wait for discovery below.
     //
@@ -1415,6 +1561,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // (diff.c:406-409) — the *ui* callback, which is why the plumbing verbs
     // (`diff-files`, `diff-index`, `diff-tree`) ignore the key entirely.
     let mnemonic_prefix;
+    // `int diff_auto_refresh_index = 1` (diff.c:68), which `git_diff_ui_config()` sets from
+    // `diff.autoRefreshIndex` (diff.c:402-405) and `cmd_diff()` turns into
+    // `skip_stat_unmatch` (builtin/diff.c:525).
+    let mut auto_refresh_index = true;
     // `--line-prefix=<s>`: prepended to every emitted line (`diff_line_prefix()`).
     let mut line_prefix: Vec<u8> = Vec::new();
     // `--compact-summary`: annotate `--stat` names with create/delete/mode info.
@@ -1639,6 +1789,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         //   * without `diff.mnemonicPrefix` nothing changes — the configured
         //     prefixes, or `a/` and `b/`, are installed up front as before.
         mnemonic_prefix = snap.boolean("diff.mnemonicPrefix") == Some(true);
+        if let Some(b) = snap.boolean("diff.autoRefreshIndex") {
+            auto_refresh_index = b;
+        }
         if snap.boolean("diff.noPrefix") == Some(true) {
             src_prefix = Some(Vec::new());
             dst_prefix = Some(Vec::new());
@@ -3206,9 +3359,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let files_combine =
         diff_files_shape && (combine_merges || (!quiet && unmerged_stage.is_none() && fmt & F_PATCH != 0));
     let mut files_combined: Vec<CombinedPath> = Vec::new();
-    // Paths [`collect_tree_worktree`] found stat-dirty with unchanged content, for
-    // `show_modified()`'s combined arm.
-    let mut stat_dirty: Vec<BString> = Vec::new();
 
     // `builtin_diff_tree()` (builtin/diff.c:196):
     //
@@ -3455,7 +3605,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 &paths,
                 &mut deltas,
                 ignore_submodules.status_mode(),
-                &mut stat_dirty,
             )?;
         } else {
             collect_index_worktree(
@@ -3500,6 +3649,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 }
             },
         )?;
+        // Every worktree side reaches `convert_to_git()` through `diff_populate_filespec()`,
+        // which demotes `core.safecrlf=true` to a warning (diff.c:4483-4489).
+        super::convert_to_git::demote_roundtrip_die(cache.filter.worktree_filter.options_mut());
         worktree_mode = true;
     }
 
@@ -3556,26 +3708,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         }
         deltas = kept;
         // An entry the tree and the index agree on, whose file only moved its stat
-        // data, queues no pair, yet `get_stat_data()` hands `show_modified()` the
-        // null id for it, so it combines as well, its result the unchanged file.
-        if let Some(tree_id) = old_tree_id {
-            let tree = repo.find_object(tree_id)?.peel_to_tree()?;
-            stat_dirty.retain(|p| relative.as_ref().is_none_or(|prefix| p.starts_with(prefix.as_bytes())));
-            for path in stat_dirty {
-                if walk_combined.iter().any(|cp| cp.path == path) || deltas.iter().any(|d| d.path == path) {
-                    continue;
-                }
-                let Some((tree_oid, tree_kind)) = tree_entry(&tree, &path)? else {
-                    continue;
-                };
-                let d = Delta::plain(path, Some((tree_oid, tree_kind)), NewSide::Worktree(tree_kind));
-                if let Some(cp) = oneway_combined_path(&repo, &index, &d)? {
-                    walk_combined.push(cp);
-                }
-            }
-            // `unpack_trees()` reaches `show_modified()` in index order.
-            walk_combined.sort_by(|a, b| a.path.cmp(&b.path));
-        }
+        // data, is in the queue too ([`collect_tree_worktree`]): `get_stat_data()`
+        // hands `show_modified()` the null id for it, so it combines as well, its
+        // result the unchanged file. `unpack_trees()` reaches `show_modified()` in
+        // index order.
+        walk_combined.sort_by(|a, b| a.path.cmp(&b.path));
     }
     // `show_patch_diff()` reads each worktree result as the walk reaches it, ahead
     // of the queue's own reads, and only when the combined patch is what it prints
@@ -3584,6 +3721,42 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         true => convert_combined_results(&repo, &mut walk_combined)?,
         false => None,
     };
+
+    // `diff_setup_done()` (diff.c:4899): the four whitespace-ignoring options and
+    // `-I<re>` make "is there a change?" a question only the rendered content can
+    // answer, so they raise `flags.diff_from_contents`. `--ignore-blank-lines` is
+    // deliberately *not* on that list, and the difference is visible: measured
+    // against 2.55.0, `git diff -w --raw` and `git diff -I<re> --raw` print a real
+    // post-image object name for a worktree side while `git diff
+    // --ignore-blank-lines --raw` prints all-zero.
+    // `diff_setup_done()` (diff.c:5360): "External diffs could declare non-identical
+    // contents equal", so `--exit-code`/`--quiet` beside an allowed external driver
+    // also has to look at what the rendering pass found.
+    let from_contents = ws != Whitespace::Keep
+        || !ignore.lines.is_empty()
+        || (allow_external && want_exit_code);
+
+    // `diffcore_skip_stat_unmatch()` (diff.c:7376-7399), the first pass of
+    // `diffcore_std()` (diff.c:7485-7486), which `cmd_diff()` arms through
+    // `skip_stat_unmatch = !!diff_auto_refresh_index` (builtin/diff.c:525) for every
+    // form but `--no-index`. Only a worktree side lacks an object name, so the tree,
+    // index and blob forms never drop anything here. A combined section that died on
+    // its conversion ended the walk before `diffcore_std()` was reached.
+    //
+    // `diff_can_quit_early()` (diff.c:7539-7544) stops the walk at the first pair that
+    // sets `has_changes` under `--quiet`, but only when neither `--diff-filter` nor
+    // `diff_from_contents` is in play; the pairs behind it are never queued.
+    if combined_die.is_some() {
+        // The walk died inside `show_patch_diff()`: nothing after the dying path was
+        // queued, and the queue is never flushed, so none of its files are read.
+        deltas.clear();
+    } else if worktree_mode && auto_refresh_index {
+        let quick_quit = quiet && diff_filter.is_none() && !from_contents;
+        // `rev.diffopt.skip_stat_unmatch - 1`, which decides `refresh_index_quietly()`.
+        if skip_stat_unmatch(&repo, &mut deltas, quick_quit)? > 0 {
+            *refresh = Some(repo.clone());
+        }
+    }
 
     // `-R`: swap the two sides of every pair, before diffcore and every format sees
     // them, the way `diff_change()` does. `diff_unmerge()` (diff.c:7722-7736) never
@@ -3755,6 +3928,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     msg.extend_from_slice(target.as_slice());
                     msg.extend_from_slice(b"' in the diff\n");
                     std::io::stderr().lock().write_all(&msg)?;
+                    // `die()`: `refresh_index_quietly()` is never reached.
+                    refresh.take();
                     return Ok(ExitCode::from(128));
                 }
             }
@@ -3771,19 +3946,6 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     // ---- analyze every delta once -----------------------------------------
     // `--quiet`/`-s` produce no output, so the patch bodies are never needed.
     let workdir = repo.workdir().map(|p| p.to_owned());
-    // `diff_setup_done()` (diff.c:4899): the four whitespace-ignoring options and
-    // `-I<re>` make "is there a change?" a question only the rendered content can
-    // answer, so they raise `flags.diff_from_contents`. `--ignore-blank-lines` is
-    // deliberately *not* on that list, and the difference is visible: measured
-    // against 2.55.0, `git diff -w --raw` and `git diff -I<re> --raw` print a real
-    // post-image object name for a worktree side while `git diff
-    // --ignore-blank-lines --raw` prints all-zero.
-    // `diff_setup_done()` (diff.c:5360): "External diffs could declare non-identical
-    // contents equal", so `--exit-code`/`--quiet` beside an allowed external driver
-    // also has to look at what the rendering pass found.
-    let from_contents = ws != Whitespace::Keep
-        || !ignore.lines.is_empty()
-        || (allow_external && want_exit_code);
     // `diff_flush()` (diff.c:6828): `--quiet`/`-s` produce no output, but with
     // `diff_from_contents` and `--exit-code` git still runs the patch machinery with
     // its output redirected to `/dev/null` purely to learn the exit status.
@@ -4027,6 +4189,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         Ok(e) => e,
         Err(msg) => {
             eprintln!("{msg}");
+            // `die()`: `refresh_index_quietly()` is never reached.
+            refresh.take();
             return Ok(ExitCode::from(128));
         }
     };
@@ -4823,6 +4987,8 @@ fn run_diffcore_rename(
     let mut old_raw_ids: BTreeMap<usize, ObjectId> = BTreeMap::new();
     let mut submodule_state: BTreeMap<usize, (u8, Option<ObjectId>, Option<ObjectId>)> =
         BTreeMap::new();
+    // The worktree specs [`skip_stat_unmatch`] already read ([`Delta::populated`]).
+    let mut populated_specs: BTreeSet<usize> = BTreeSet::new();
 
     for d in deltas.drain(..) {
         // `p->one->path`, which is `p->two->path` for every pair a tree, index or
@@ -4885,6 +5051,9 @@ fn run_diffcore_rename(
             )),
         };
         new_sides.insert(two, clone_new_side(&d.new));
+        if d.populated {
+            populated_specs.insert(if d.old_worktree { one } else { two });
+        }
         if d.dirty_submodule != 0 || d.new_commit.is_some() {
             submodule_state.insert(two, (d.dirty_submodule, d.new_commit, d.new_id));
         }
@@ -4951,6 +5120,7 @@ fn run_diffcore_rename(
             drivers: PairDrivers::default(),
             textconv: None,
             unstripped: None,
+            populated: populated_specs.contains(&p.one) || populated_specs.contains(&p.two),
         });
     }
     Ok(warnings)
@@ -5070,6 +5240,7 @@ fn collect_tree_index(
             drivers: PairDrivers::default(),
             textconv: None,
             unstripped: None,
+            populated: false,
         });
     }
     Ok(())
@@ -5078,20 +5249,20 @@ fn collect_tree_index(
 /// `<tree>` vs. the worktree. Reproduces `diff-index`: start from the tree-to-index
 /// difference, then let the index-to-worktree difference override the "new" side.
 ///
-/// `stat_dirty` collects every entry whose stat data no longer matches the file
-/// while its content still does. `get_stat_data()` (diff-lib.c:315-347) asks
-/// `match_stat_with_submodule()` with no `CE_MATCH_*` option, so such an entry is
-/// changed, its `oid` is the null id, and `show_modified()`'s combined arm
-/// (diff-lib.c:408-424) prints it even though no pair is queued for it here. An
-/// entry whose stat matches and whose content was only checked because it was racy
-/// is not: `ie_match_stat()` settles it through `ce_modified_check_fs()`.
+/// An entry whose stat data no longer matches the file while its content still does
+/// is changed to `get_stat_data()` (diff-lib.c:315-347), which asks
+/// `match_stat_with_submodule()` with no `CE_MATCH_*` option: its `oid` is the null
+/// id, so `show_modified()` queues it against the tree (diff-lib.c:426-431) for
+/// [`skip_stat_unmatch`] to drop when the file matches the tree, and its combined arm
+/// (diff-lib.c:408-424) prints it under `-c`. An entry whose stat matches and whose
+/// content was only checked because it was racy is not: `ie_match_stat()` settles it
+/// through `ce_modified_check_fs()`.
 fn collect_tree_worktree(
     repo: &gix::Repository,
     spec: &str,
     paths: &[String],
     deltas: &mut Vec<Delta>,
     submodules: gix::status::Submodule,
-    stat_dirty: &mut Vec<BString>,
 ) -> Result<()> {
     let stat_opts = repo.stat_options()?;
     let tree_id = rev_object(repo, spec)?.peel_to_tree()?.id;
@@ -5142,13 +5313,18 @@ fn collect_tree_worktree(
     }
     // gix proved these entries' content equal and keeps them for an index write
     // instead of yielding them; the stat comparison on the new stat tells the
-    // touched file from the racily clean one, as `diff-files` does.
+    // touched file from the racily clean one, as `diff-files` does. The touched one
+    // is `get_stat_data()`'s changed entry: its post-image is the file, under the
+    // null id, whether or not the index moved off the tree.
     if let Some(outcome) = iter.outcome_mut() {
         let index = &outcome.worktree_index;
         for (at, new_stat) in outcome.needs_update() {
             let entry = &index.entries()[at];
-            if !new_stat.matches(&entry.stat, stat_opts) {
-                stat_dirty.push(entry.path(index).to_owned());
+            if new_stat.matches(&entry.stat, stat_opts) {
+                continue;
+            }
+            if let Some(kind) = index_mode_kind(entry.mode) {
+                new_sides.insert(entry.path(index).to_owned(), (NewSide::Worktree(kind), 0, None));
             }
         }
     }
@@ -5410,7 +5586,8 @@ fn collect_index_worktree(
     let stage_table = conflict_stage_table(&index);
     let conflicts = conflict_stages(&index);
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
-    let iter = repo
+    let stat_opts = repo.stat_options()?;
+    let mut iter = repo
         .status(gix::progress::Discard)?
         .index_worktree_submodules(submodules)
         .index_worktree_options_mut(|o| {
@@ -5421,7 +5598,7 @@ fn collect_index_worktree(
 
     let mut seen_conflicts: Vec<BString> = Vec::new();
     let mode_rules = super::update_index::ModeRules::from_repo(repo);
-    for item in iter {
+    for item in iter.by_ref() {
         let item = item?;
         if let gix::status::index_worktree::Item::Modification {
             rela_path, status, ..
@@ -5464,6 +5641,26 @@ fn collect_index_worktree(
             // the id, since the gitlink itself did not move.
             delta.new_id = head.filter(|h| *h == entry.id);
             deltas.push(delta);
+        }
+    }
+    // An entry whose stat data `ie_match_stat()` rejects is queued by `diff_change()`
+    // with the null post-image id whatever its content (diff-lib.c:278-285); gix
+    // proved these entries' content equal and keeps them for an index write instead
+    // of yielding them, so they are queued here for [`skip_stat_unmatch`] to drop and
+    // count. A racily clean entry whose stat still matches is `ie_match_stat()`'s own
+    // content check (read-cache.c:418-420) and never reaches the queue.
+    if let Some(outcome) = iter.outcome_mut() {
+        let wt_index = &outcome.worktree_index;
+        for (at, new_stat) in outcome.needs_update() {
+            let entry = &wt_index.entries()[at];
+            if new_stat.matches(&entry.stat, stat_opts) {
+                continue;
+            }
+            let Some(kind) = index_mode_kind(entry.mode) else {
+                continue;
+            };
+            let path = entry.path(wt_index).to_owned();
+            deltas.push(Delta::plain(path, Some((entry.id, kind)), NewSide::Worktree(kind)));
         }
     }
 
@@ -5535,6 +5732,7 @@ fn collect_index_worktree(
             drivers: PairDrivers::default(),
             textconv: None,
             unstripped: None,
+            populated: false,
         });
         // ```c
         // pair = diff_unmerge(&revs->diffopt, ce->name);
@@ -5560,20 +5758,10 @@ fn collect_index_worktree(
         if let (Some(side), None) = (wanted, stage_kind) {
             deltas.push(Delta::plain(path, Some(side), NewSide::Absent));
         } else if let (Some(side), Some(k)) = (wanted, stage_kind) {
-            // `git diff` arms `skip_stat_unmatch` (builtin/diff.c:525), which drops a pair whose
-            // worktree side carries no object name when both sides have the same mode and
-            // identical content: the stage-2 pair of a conflicted path whose file still holds
-            // the stage-2 blob is no change at all, though the `U` pair stays.
-            let identical = side.1 == k
-                && repo.filter_pipeline(None).ok().is_some_and(|(mut pipeline, wt_index)| {
-                    matches!(
-                        pipeline.worktree_file_to_object(path.as_bstr(), &wt_index),
-                        Ok(Some((id, kind, _))) if id == side.0 && kind == side.1
-                    )
-                });
-            if !identical {
-                deltas.push(Delta::plain(path, Some(side), NewSide::Worktree(k)));
-            }
+            // The stage's zeroed stat never matches, so the pair is queued with the null
+            // post-image id; a file that still holds the stage blob is dropped (and
+            // counted) by [`skip_stat_unmatch`], though the `U` pair stays.
+            deltas.push(Delta::plain(path, Some(side), NewSide::Worktree(k)));
         }
     }
     Ok(())
@@ -7510,6 +7698,22 @@ fn first_unhashable(workdir: Option<&std::path::Path>, deltas: &[Delta]) -> Opti
     })
 }
 
+/// A pair [`skip_stat_unmatch`] already read ([`Delta::populated`]) holds its data, so
+/// `diff_populate_filespec()` returns before `convert_to_git()` (diff.c:4498-4499) and
+/// the analysis must not print its round-trip warning a second time. Returns the
+/// setting to put back once the pair is analyzed.
+fn hold_populated(
+    cache: &mut gix::diff::blob::Platform,
+    d: &Delta,
+) -> gix::filter::plumbing::pipeline::CrlfRoundTripCheck {
+    let options = cache.filter.worktree_filter.options_mut();
+    let check = options.crlf_roundtrip_check;
+    if d.populated {
+        options.crlf_roundtrip_check = gix::filter::plumbing::pipeline::CrlfRoundTripCheck::Skip;
+    }
+    check
+}
+
 fn analyze_all(
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
@@ -7543,7 +7747,8 @@ fn analyze_all(
         return deltas
             .iter()
             .map(|d| {
-                analyze(
+                let check = hold_populated(cache, d);
+                let an = analyze(
                     cache,
                     &repo.objects,
                     d,
@@ -7559,7 +7764,9 @@ fn analyze_all(
                     want_binary,
                     func_context,
                     ignore,
-                )
+                );
+                cache.filter.worktree_filter.options_mut().crlf_roundtrip_check = check;
+                an
             })
             .collect();
     }
@@ -7588,10 +7795,12 @@ fn analyze_all(
                     )?,
                     _ => repo.diff_resource_cache_for_tree_diff()?,
                 };
+                super::convert_to_git::demote_roundtrip_die(cache.filter.worktree_filter.options_mut());
                 let mut mine = Vec::new();
                 loop {
                     let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(delta) = deltas.get(i) else { break };
+                    let check = hold_populated(&mut cache, delta);
                     let an = analyze(
                         &mut cache,
                         &repo.objects,
@@ -7608,7 +7817,9 @@ fn analyze_all(
                         want_binary,
                         func_context,
                         ignore,
-                    )?;
+                    );
+                    cache.filter.worktree_filter.options_mut().crlf_roundtrip_check = check;
+                    let an = an?;
                     mine.push((i, an));
                 }
                 Ok(mine)
@@ -9017,10 +9228,15 @@ fn diffstat_pairs<'a>(deltas: &'a [Delta], analyses: &'a [Analysis]) -> Vec<(&'a
             let (Some((_, old_kind)), Some(new_kind)) = (d.old, d.new_kind()) else {
                 return true;
             };
-            // `!DIFF_FILE_VALID(p->one) || !oid_eq(...)`: a side with no id of its
-            // own (worktree content) can always differ, which is what
-            // [`Analysis::old_id`] carries once it has been hashed.
-            let may_differ = an.old_id != an.new_id;
+            // `!(one->oid_valid && two->oid_valid && oideq(&one->oid, &two->oid))`
+            // (diff.c:4189-4190): a side with no id of its own (worktree content) can
+            // always differ, even when hashing it would give the other side's id —
+            // the stat-dirty pair `diff.autoRefreshIndex=false` keeps in the queue.
+            // [`Delta::new_id`] / [`Delta::old_raw_id`] are the ids such a side does
+            // carry: a gitlink still at its recorded commit, a hashed rename candidate.
+            let worktree_side = (d.old_worktree && d.old_raw_id.is_none())
+                || (matches!(d.new, NewSide::Worktree(_)) && d.new_id.is_none());
+            let may_differ = worktree_side || an.old_id != an.new_id;
             let dropped = may_differ
                 && status_char(d) == b'M'
                 && an.added == 0

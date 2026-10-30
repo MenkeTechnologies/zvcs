@@ -1699,7 +1699,7 @@ fn status_report(
 ///
 /// `lock` is the `<index>.lock` `cmd_status` has held since before the collection
 /// (`fd >= 0`); every early return drops it, which is `rollback_lock_file()`.
-fn update_index_if_able(
+pub(super) fn update_index_if_able(
     repo: &gix::Repository,
     lock: gix::lock::File,
     pathspecs: &[BString],

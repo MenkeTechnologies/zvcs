@@ -1212,6 +1212,40 @@ impl<'r> ProcessGraph<'r> {
         }
     }
 
+    /// `lookup_commit_in_graph()` (commit-graph.c:1020-1048), which `parse_object_with_flags()`
+    /// asks first under `PARSE_OBJECT_SKIP_HASH_CHECK` (object.c:339-343), followed by the
+    /// `get_commit_tree_oid()` its caller makes: the tree and the parents of a commit the graph
+    /// holds, `None` when there is no graph, the graph does not hold `oid`, the
+    /// `GIT_COMMIT_GRAPH_PARANOIA` check finds no object, or `fill_commit_in_graph()` fails — in
+    /// each of which the caller reads the object database instead.
+    pub(in crate::porcelain) fn lookup_commit_in_graph(
+        &mut self,
+        oid: ObjectId,
+        out: &mut Vec<String>,
+    ) -> Result<Option<(ObjectId, Vec<ObjectId>)>, Die> {
+        if !self.prepare(out)? {
+            return Ok(None);
+        }
+        let repo = self.repo;
+        let v = self.graph.as_mut().expect("prepared");
+        let tip = v.graphs.len() - 1;
+        let Some(pos) = v.search_commit_pos_in_graph(&oid, tip) else {
+            return Ok(None);
+        };
+        if crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false) && !repo.has_object(oid) {
+            return Ok(None);
+        }
+        let Some(c) = v.lookup_commit(oid) else {
+            return Ok(None);
+        };
+        if !v.commits[c].parsed && !v.fill_commit_in_graph(c, tip, pos)? {
+            return Ok(None);
+        }
+        let tree = v.commit_tree_in_graph(tip, c);
+        let parents = v.commits[c].parents.iter().map(|&p| v.commits[p].oid).collect();
+        Ok(Some((tree, parents)))
+    }
+
     /// `repo_parse_commit_internal(r, item, 0, 1)` up to its object-database read
     /// (commit.c:621-640) for a commit not parsed yet: `parse_commit_in_graph()`
     /// (commit-graph.c:1064-1079), then the `GIT_COMMIT_GRAPH_PARANOIA` re-check.

@@ -1047,7 +1047,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         promisor_pass_done = true;
         match &pack_lists {
             Some(lists) if lists.pack_count() < 2 => {
-                for promised in lists.promisor_pass(None) {
+                for (promised, _) in lists.promisor_pass(None) {
                     state.note(promised);
                 }
             }
@@ -1093,20 +1093,26 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     && !unparseable.contains_key(&id)
                     && (!finish_read || lists.pack_count() < 2) =>
             {
-                for promised in lists.promisor_pass(first_is_tree.then_some(id)) {
+                // A blob `snapshot_ref()` parsed stays parsed, so the pass reads it no more
+                // than it reads a parsed commit, tag or held tree.
+                let mut parsed_blobs: HashSet<ObjectId> = match opt.connectivity_only {
+                    true => heads
+                        .iter()
+                        .copied()
+                        .filter(|head| matches!(repo.find_header(*head).map(|h| h.kind()), Ok(Kind::Blob)))
+                        .collect(),
+                    false => HashSet::new(),
+                };
+                for (promised, source) in lists.promisor_pass(first_is_tree.then_some(id)) {
                     state.note(promised);
                     if opt.connectivity_only {
-                        promisor_parse(&repo, &mut state, &mut pre_parsed, promised);
+                        let parse = PromisorParse {
+                            parsed: &mut pre_parsed,
+                            parsed_blobs: &mut parsed_blobs,
+                            source,
+                        };
+                        promisor_parse(&repo, &mut state, &mut graph, parse, promised)?;
                     }
-                }
-                // `parse_object_with_flags(…, PARSE_OBJECT_SKIP_HASH_CHECK)` answers a commit
-                // from the commit-graph first (object.c:339-343), whose parse order is not
-                // replayed for this pass. Its reads skip the MRU update only in the store
-                // being listed (odb/source-packed.c:456), so a pack of another source that
-                // answers one moves, which is not replayed either.
-                let sources_with_packs = lists.sources.iter().filter(|(_, packs)| !packs.is_empty()).count();
-                if opt.connectivity_only && (commit_graph_on_disk(&repo) || sources_with_packs > 1) {
-                    creation_modeled = false;
                 }
             }
             _ => creation_modeled = false,
@@ -1278,7 +1284,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     Kind::Blob => false,
                 };
                 if reads {
-                    state.pack_reads.push(Some(id));
+                    state.pack_reads.push((Some(id), None));
                 }
             }
             // Under `--connectivity-only` nothing but a head was parsed before the walk, so a
@@ -1435,7 +1441,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // rather than the `corrupt` set being taken as the answer.
                     // The ask is a read, and a miss re-prepares the odb.
                     let present = repo.has_object(child);
-                    state.pack_reads.push(present.then_some(child));
+                    state.pack_reads.push((present.then_some(child), None));
                     if !present {
                         // `%7s` on both type names — `gix`'s `Kind` writes itself
                         // through `write_str`, which ignores a width, so the padding
@@ -1515,8 +1521,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         let mut parsed_here: HashSet<ObjectId> = HashSet::new();
         let mut packs_now = pack_lists.as_ref().filter(|_| listing.is_some()).map(ReferentsPacks::new);
         if let Some(packs) = &mut packs_now {
-            for read in &state.pack_reads {
-                packs.read(*read, None);
+            for &(read, frozen) in &state.pack_reads {
+                packs.read(read, frozen);
             }
         }
         let halves = packs_now.as_ref().map_or(1, |packs| packs.sources.len() * 2);
@@ -2059,10 +2065,12 @@ struct State {
     /// Every odb read after `odb_reprepare()` that `find_pack_entry()` may answer, in order:
     /// `Some(id)` moves the pack holding `id` to the front of its source's list
     /// (odb/source-packed.c:38-45), `None` is a read that missed and so re-prepared every
-    /// source, which re-sorts its list (odb.c:576-588, odb/source-packed.c:94-95). Under
-    /// `--connectivity-only` this decides the pack order `mark_unreachable_referents()`'s
-    /// listing walks; see [`ReferentsPacks`].
-    pack_reads: Vec<Option<ObjectId>>,
+    /// source, which re-sorts its list (odb.c:576-588, odb/source-packed.c:94-95). The second
+    /// half is the source being listed when the read was made, whose packs do not move
+    /// (`skip_mru_updates`, odb/source-packed.c:456-485): `add_promisor_object()` reads inside
+    /// the promisor pass's listing. Under `--connectivity-only` this decides the pack order
+    /// `mark_unreachable_referents()`'s listing walks; see [`ReferentsPacks`].
+    pack_reads: Vec<(Option<ObjectId>, Option<usize>)>,
     /// Trees whose buffer is held, so `repo_parse_tree()` / `parse_object()` read nothing:
     /// a tree head `snapshot_ref()` parsed, or a cache-tree node, until the reachability
     /// walk frees it (builtin/fsck.c:174-183). Only consulted under `--connectivity-only`.
@@ -2805,7 +2813,7 @@ fn collect_cache_tree(
         state.note(tree.id);
         // `parse_object()` reads a tree whose buffer is not held, and keeps it.
         if state.parsed_trees.insert(tree.id) {
-            state.pack_reads.push(Some(tree.id));
+            state.pack_reads.push((Some(tree.id), None));
         }
         heads.push(tree.id);
     }
@@ -4022,6 +4030,10 @@ struct ListedPack {
     index: pack::index::File,
     /// `p->pack_promisor`: a `.promisor` file sits beside the pack.
     promisor: bool,
+    /// `p->multi_pack_index`: `prepare_midx_pack()` loaded the pack (midx.c:477), so
+    /// `find_pack_entry()` never answers from it, and never moves it, through the list
+    /// (odb/source-packed.c:38-45).
+    midx: bool,
 }
 
 impl ListedPack {
@@ -4063,68 +4075,224 @@ impl ListedPack {
 /// returns the `packs_by_path` entry it already has (packfile.c:872-894) — and
 /// a tie is left in that moved order.
 ///
-/// A source with a `multi-pack-index` and more than one pack is refused:
-/// `prepare_pack()` skips the packs the midx covers (packfile.c:998-1000) and
-/// `packfile_store_get_packs()` loads them afterwards through
-/// `prepare_midx_pack()` (packfile.c:1093-1104), an ordering this does not
-/// replay.
+/// A source with a `multi-pack-index` builds its list in three steps instead.
+/// `odb_source_packed_prepare()` loads the midx before it reads the directory
+/// (odb/source-packed.c:832-853), and `prepare_pack()` then skips every `.idx`
+/// the midx names (:759-761). A covered pack joins the list only when
+/// `prepare_midx_pack()` loads it (midx.c:456-485), through
+/// `packfile_store_load_pack()`'s append to the tail (packfile.c:778-811): a
+/// read the midx answers loads the pack that owns the object (`midx_fill_entry()`,
+/// midx.c:592-631), and `packfile_store_get_packs()` loads every pack still
+/// missing, in pack-int-id order (packfile.c:856-866). Once loaded, such a pack
+/// is never moved: `find_pack_entry()` asks the midx first and skips
+/// `multi_pack_index` packs in its list scan (odb/source-packed.c:31-45).
+/// `odb_reprepare()` keeps the midx it has (midx.c:749-750), so its re-sort
+/// places only the covered packs the snapshot's reads loaded, and `cmd_fsck`'s
+/// first listing or `odb_fsck()` appends the rest unsorted.
 struct PackLists {
     /// Each source's object directory and its packs, in list order.
     sources: Vec<(PathBuf, Vec<ListedPack>)>,
+    /// Each source's `multi-pack-index`, as `prepare_multi_pack_index_one()` loaded it.
+    midx: Vec<Option<SourceMidx>>,
+}
+
+/// A source's `struct multi_pack_index`, with which of its packs `prepare_midx_pack()`
+/// has loaded (`m->packs[]`).
+struct SourceMidx {
+    /// The midx, or each layer of an incremental chain, base first. A layer's packs
+    /// follow those of every layer below it in pack-int-id order (`num_packs_in_base`,
+    /// midx.c:280-306).
+    layers: Vec<pack::multi_index::File>,
+    loaded: Vec<bool>,
+}
+
+impl SourceMidx {
+    /// `prepare_multi_pack_index_one()` for `<objdir>/pack` (midx.c:741-755), which is
+    /// `load_multi_pack_index()`: the single file, else the chain
+    /// `load_multi_pack_index_chain()` reads from `multi-pack-index.d` (midx.c:308-397).
+    /// `Some(None)` where there is neither. `None` for one this does not replay: a file
+    /// or a layer that will not load, or a chain file git warns about, whose fallbacks
+    /// and warning lines are not ported.
+    fn open(dir: &Path, hash: gix::hash::Kind) -> Option<Option<Self>> {
+        let path = dir.join("multi-pack-index");
+        let layers = if path.exists() {
+            vec![pack::multi_index::File::at(&path, None).ok()?]
+        } else {
+            let chain_dir = dir.join("multi-pack-index.d");
+            let Ok(chain) = std::fs::read(chain_dir.join("multi-pack-index-chain")) else {
+                return Some(None);
+            };
+            // `open_multi_pack_index_chain()` takes an empty file for a missing one and
+            // warns about one shorter than a hash (midx.c:255-278).
+            if chain.is_empty() {
+                return Some(None);
+            }
+            let hexsz = hash.len_in_hex();
+            if chain.len() < hexsz {
+                return None;
+            }
+            // `count = st_size / (hexsz + 1)` lines, each a layer's hash
+            // (midx.c:316-341).
+            let mut layers = Vec::new();
+            for line in chain.split(|&b| b == b'\n').take(chain.len() / (hexsz + 1)) {
+                let layer = ObjectId::from_hex(line).ok()?;
+                let file = chain_dir.join(format!("multi-pack-index-{layer}.midx"));
+                layers.push(pack::multi_index::File::at(file, None).ok()?);
+            }
+            if layers.is_empty() {
+                return Some(None);
+            }
+            layers
+        };
+        let loaded = vec![false; layers.iter().map(|m| m.num_indices() as usize).sum()];
+        Some(Some(SourceMidx { layers, loaded }))
+    }
+
+    /// `midx_contains_pack()` for a `readdir()` name, over every layer (midx.c:713-719).
+    fn contains(&self, idx_name: &str) -> bool {
+        self.layers
+            .iter()
+            .any(|m| m.index_names().iter().any(|name| name.as_os_str() == idx_name))
+    }
+
+    /// The `.idx` name of pack `pack_int_id`, `m->pack_names[]` of the layer
+    /// `midx_for_pack()` finds it in (midx.c:436-454).
+    fn pack_name(&self, mut pack_int_id: usize) -> String {
+        for m in &self.layers {
+            let names = m.index_names();
+            if pack_int_id < names.len() {
+                return names[pack_int_id].to_string_lossy().into_owned();
+            }
+            pack_int_id -= names.len();
+        }
+        unreachable!("pack-int-id beyond the midx's packs")
+    }
+
+    /// The pack-int-id `midx_fill_entry()` answers `id` from (midx.c:592-605):
+    /// `bsearch_midx()` asks the tip layer first and then each base (midx.c:533-540).
+    fn owner(&self, id: ObjectId) -> Option<usize> {
+        let mut in_base: usize = self.layers.iter().map(|m| m.num_indices() as usize).sum();
+        for m in self.layers.iter().rev() {
+            in_base -= m.num_indices() as usize;
+            if let Some(entry) = m.lookup(id) {
+                return Some(in_base + m.pack_id_and_pack_offset_at_index(entry).0 as usize);
+            }
+        }
+        None
+    }
+}
+
+/// `add_packed_git()` for `<dir>/<idx_name>` (packfile.c:710-776): `Some(None)` when the
+/// `.pack` is not a regular file, which drops the pack, and `None` for an index this
+/// cannot open.
+fn listed_pack(dir: &Path, idx_name: &str, hash: gix::hash::Kind, midx: bool) -> Option<Option<ListedPack>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let base = idx_name.strip_suffix(".idx")?;
+    let Ok(meta) = std::fs::metadata(dir.join(format!("{base}.pack"))) else {
+        return Some(None);
+    };
+    if !meta.is_file() {
+        return Some(None);
+    }
+    Some(Some(ListedPack {
+        mtime: meta.mtime(),
+        index: pack::index::File::at(dir.join(idx_name), hash).ok()?,
+        promisor: dir.join(format!("{base}.promisor")).exists(),
+        midx,
+    }))
 }
 
 impl PackLists {
     /// `reads` is the snapshot's read sequence when it is known. Without it a
-    /// tie cannot be placed, and `None` is returned.
+    /// tie cannot be placed, nor which covered packs the reads loaded, and
+    /// `None` is returned. A covered pack `prepare_midx_pack()` cannot load
+    /// (`MIDX_PACK_ERROR`, whose reads fall back to the list scan) is refused too.
     fn load(repo: &gix::Repository, reads: Option<&[ObjectId]>) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-
         let hash = repo.object_hash();
-        let mut sources = Vec::new();
+        // `prepare_multi_pack_index_one()` loads nothing under `core.multiPackIndex=false`
+        // (midx.c:745-747).
+        let midx_on = repo.config_snapshot().boolean("core.multiPackIndex") != Some(false);
+        let mut lists = Self { sources: Vec::new(), midx: Vec::new() };
         let mut tie = false;
         for objdir in odb_sources(repo) {
             let dir = objdir.join("pack");
+            let midx = match midx_on {
+                true => SourceMidx::open(&dir, hash)?,
+                false => None,
+            };
             let mut packs: Vec<ListedPack> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    let Some(base) = name.strip_suffix(".idx") else {
-                        continue;
-                    };
-                    // `add_packed_git()` drops a pack whose `.pack` is not a
-                    // regular file.
-                    let Ok(meta) = std::fs::metadata(dir.join(format!("{base}.pack"))) else {
-                        continue;
-                    };
-                    if !meta.is_file() {
+                    if !name.ends_with(".idx") || midx.as_ref().is_some_and(|m| m.contains(&name)) {
                         continue;
                     }
-                    packs.push(ListedPack {
-                        mtime: meta.mtime(),
-                        index: pack::index::File::at(dir.join(&name), hash).ok()?,
-                        promisor: dir.join(format!("{base}.promisor")).exists(),
-                    });
+                    packs.extend(listed_pack(&dir, &name, hash, false)?);
                 }
-            }
-            if packs.len() > 1 && dir.join("multi-pack-index").exists() {
-                return None;
             }
             sort_packs(&mut packs);
             tie |= packs.windows(2).any(|pair| pair[0].mtime == pair[1].mtime);
-            sources.push((objdir, packs));
+            lists.sources.push((objdir, packs));
+            lists.midx.push(midx);
         }
-        let mut lists = Self { sources };
-        // With pairwise distinct mtimes the re-sort alone decides the order, so
-        // the reads only matter for a tie.
-        if tie {
+        // With pairwise distinct mtimes and no midx the re-sort alone decides the
+        // order. Otherwise the reads place a tie, and decide which covered packs are
+        // in the list for the re-sort to place.
+        let midx_order_open = lists
+            .midx
+            .iter()
+            .zip(&lists.sources)
+            .any(|(m, (_, packs))| m.as_ref().is_some_and(|m| m.loaded.len() + packs.len() > 1));
+        if tie || midx_order_open {
             for &id in reads? {
-                move_to_front(&mut lists.sources, id);
+                lists.snapshot_read(id, hash)?;
             }
             for (_, packs) in &mut lists.sources {
                 sort_packs(packs);
             }
         }
+        // `packfile_store_get_packs()`, which `cmd_fsck`'s listing or `odb_fsck()`
+        // reaches for every source before anything else reads.
+        for ((objdir, packs), midx) in lists.sources.iter_mut().zip(&mut lists.midx) {
+            let Some(m) = midx else { continue };
+            for pack_int_id in 0..m.loaded.len() {
+                if !m.loaded[pack_int_id] {
+                    let name = m.pack_name(pack_int_id);
+                    packs.push(listed_pack(&objdir.join("pack"), &name, hash, true)??);
+                    m.loaded[pack_int_id] = true;
+                }
+            }
+        }
         Some(lists)
+    }
+
+    /// One read `snapshot_refs()` made, before `packfile_store_get_packs()` loaded
+    /// the covered packs: a midx that holds `id` loads its owner pack onto the tail
+    /// of the list. `None` where that pack will not load.
+    fn snapshot_read(&mut self, id: ObjectId, hash: gix::hash::Kind) -> Option<()> {
+        let hex = id.to_hex().to_string();
+        for ((objdir, packs), midx) in self.sources.iter_mut().zip(&mut self.midx) {
+            if let Some(m) = midx {
+                if let Some(pack_int_id) = m.owner(id) {
+                    if !m.loaded[pack_int_id] {
+                        let name = m.pack_name(pack_int_id);
+                        packs.push(listed_pack(&objdir.join("pack"), &name, hash, true)??);
+                        m.loaded[pack_int_id] = true;
+                    }
+                    return Some(());
+                }
+            }
+            if let Some(at) = packs.iter().position(|p| !p.midx && p.index.lookup(id).is_some()) {
+                let pack = packs.remove(at);
+                packs.insert(0, pack);
+                return Some(());
+            }
+            if objdir.join(&hex[..2]).join(&hex[2..]).is_file() {
+                return Some(());
+            }
+        }
+        Some(())
     }
 
     fn packs(&self) -> impl Iterator<Item = &ListedPack> {
@@ -4135,25 +4303,35 @@ impl PackLists {
         self.packs().count()
     }
 
-    /// The ids `add_promisor_object()` is called with, in call order:
+    /// The ids `add_promisor_object()` is called with, in call order, each with
+    /// the index of the source whose listing hands it over:
     /// `odb_for_each_object(… PROMISOR_ONLY | PACK_ORDER)` skips loose objects
     /// (odb/source-files.c:85) and non-promisor packs (packfile.c:2580-2582) and
     /// walks the rest in list order, each in pack order. `read` is one packed
     /// read made since `odb_reprepare()`, which moves its pack first.
-    fn promisor_pass(&self, read: Option<ObjectId>) -> Vec<ObjectId> {
+    ///
+    /// The pass's own reads cannot reorder a list before it is walked: a source
+    /// being listed sets `skip_mru_updates` (odb/source-packed.c:456-485), and an
+    /// id it lists is found there or in an earlier source, whose listing is over,
+    /// so a later source is never asked.
+    fn promisor_pass(&self, read: Option<ObjectId>) -> Vec<(ObjectId, usize)> {
         let mut sources: Vec<(PathBuf, Vec<&ListedPack>)> = self
             .sources
             .iter()
             .map(|(objdir, packs)| (objdir.clone(), packs.iter().collect()))
             .collect();
         if let Some(id) = read {
-            move_to_front(&mut sources, id);
+            move_to_front(&mut sources, &self.midx, id);
         }
         sources
             .iter()
-            .flat_map(|(_, packs)| packs.iter())
-            .filter(|pack| pack.promisor)
-            .flat_map(|pack| pack.ids_by_offset())
+            .enumerate()
+            .flat_map(|(index, (_, packs))| {
+                packs
+                    .iter()
+                    .filter(|pack| pack.promisor)
+                    .flat_map(move |pack| pack.ids_by_offset().into_iter().map(move |id| (id, index)))
+            })
             .collect()
     }
 }
@@ -4164,10 +4342,14 @@ fn sort_packs<P: std::borrow::Borrow<ListedPack>>(packs: &mut [P]) {
 }
 
 /// One read of `id` through the odb: the first source whose pack list holds it
-/// moves that pack to the front (`find_pack_entry()`); a source holding it
-/// loose answers without touching any list.
-fn move_to_front<P: std::borrow::Borrow<ListedPack>>(sources: &mut [(PathBuf, Vec<P>)], id: ObjectId) {
-    move_to_front_unless(sources, id, None);
+/// moves that pack to the front (`find_pack_entry()`); a source whose midx holds
+/// it, or that holds it loose, answers without touching any list.
+fn move_to_front<P: std::borrow::Borrow<ListedPack>>(
+    sources: &mut [(PathBuf, Vec<P>)],
+    midx: &[Option<SourceMidx>],
+    id: ObjectId,
+) {
+    move_to_front_unless(sources, midx, id, None);
 }
 
 /// [`move_to_front`] while the store of source `frozen` is being listed, which sets its
@@ -4175,12 +4357,18 @@ fn move_to_front<P: std::borrow::Borrow<ListedPack>>(sources: &mut [(PathBuf, Ve
 /// without moving.
 fn move_to_front_unless<P: std::borrow::Borrow<ListedPack>>(
     sources: &mut [(PathBuf, Vec<P>)],
+    midx: &[Option<SourceMidx>],
     id: ObjectId,
     frozen: Option<usize>,
 ) {
     let hex = id.to_hex().to_string();
     for (index, (objdir, packs)) in sources.iter_mut().enumerate() {
-        if let Some(at) = packs.iter().position(|p| p.borrow().index.lookup(id).is_some()) {
+        // `midx_fill_entry()` answers first, from a pack that never moves
+        // (odb/source-packed.c:31-36).
+        if midx[index].as_ref().is_some_and(|m| m.owner(id).is_some()) {
+            return;
+        }
+        if let Some(at) = packs.iter().position(|p| !p.borrow().midx && p.borrow().index.lookup(id).is_some()) {
             if frozen != Some(index) {
                 let pack = packs.remove(at);
                 packs.insert(0, pack);
@@ -4297,6 +4485,7 @@ fn loose_listing(objdir: &Path, hexsz: usize) -> Option<Vec<ObjectId>> {
 /// while it runs move only packs of other sources.
 struct ReferentsPacks<'a> {
     sources: Vec<(PathBuf, Vec<&'a ListedPack>)>,
+    midx: &'a [Option<SourceMidx>],
 }
 
 impl<'a> ReferentsPacks<'a> {
@@ -4306,13 +4495,13 @@ impl<'a> ReferentsPacks<'a> {
             .iter()
             .map(|(objdir, packs)| (objdir.clone(), packs.iter().collect()))
             .collect();
-        Self { sources }
+        Self { sources, midx: &lists.midx }
     }
 
     /// One read, made while the packed half of source `frozen` is being listed.
     fn read(&mut self, read: Option<ObjectId>, frozen: Option<usize>) {
         match read {
-            Some(id) => move_to_front_unless(&mut self.sources, id, frozen),
+            Some(id) => move_to_front_unless(&mut self.sources, self.midx, id, frozen),
             None => {
                 for (_, packs) in &mut self.sources {
                     sort_packs(packs);
@@ -4327,44 +4516,79 @@ impl<'a> ReferentsPacks<'a> {
     }
 }
 
+/// What [`promisor_parse`] knows to be parsed, and where the pass is listing.
+struct PromisorParse<'a> {
+    /// Commits and tags parsed so far, `pre_parsed`.
+    parsed: &'a mut HashSet<ObjectId>,
+    /// Blobs parsed so far: a blob head, or one this pass read.
+    parsed_blobs: &'a mut HashSet<ObjectId>,
+    /// The source whose packed half lists the id, whose packs do not move.
+    source: usize,
+}
+
 /// `add_promisor_object()`'s parse of one promised id under `--connectivity-only`
-/// (packfile.c:2006-2059): nothing but a head was parsed before the pass, so
-/// `parse_object_with_flags()` reads the object and `parse_object_buffer()` looks up
-/// what a commit or tag names — the tree and then each parent (commit.c:545-586), or
-/// the tagged object (tag.c:166-176). A tree's entries are only read, and a blob names
-/// nothing. The object stays parsed, so neither the reachability walk nor
+/// (packfile.c:2006-2059). `lookup_object()` finds the object the listing created; one
+/// already parsed — a commit, tag or blob a head or this pass parsed, a tree whose
+/// buffer is held — is used as it is and nothing is read. Otherwise
+/// `parse_object_with_flags(…, PARSE_OBJECT_SKIP_HASH_CHECK)` asks the commit-graph
+/// first (object.c:339-343): `lookup_commit_in_graph()` fills a commit it holds in
+/// without reading, its parents through `insert_parent_or_die()`'s `lookup_commit()`
+/// (commit-graph.c:925-979, 1020-1048), and `get_commit_tree_oid()` then looks up the
+/// tree (commit-graph.c:1091-1120). Anything else is read (object.c:345-394), and
+/// `parse_object_buffer()` looks up what a commit or tag names — the tree and then each
+/// parent (commit.c:545-586), or the tagged object (tag.c:166-176). A tree's entries are
+/// only read, and its buffer is freed again (packfile.c:2040-2041); a blob names
+/// nothing. A commit or tag stays parsed, so neither the reachability walk nor
 /// `mark_unreachable_referents()` looks its links up again.
 fn promisor_parse(
     repo: &gix::Repository,
     state: &mut State,
-    parsed: &mut HashSet<ObjectId>,
+    graph: &mut ProcessGraph<'_>,
+    parse: PromisorParse<'_>,
     id: ObjectId,
-) {
+) -> Result<()> {
     state.typed.insert(id);
-    if parsed.contains(&id) {
-        return;
+    if parse.parsed.contains(&id) || parse.parsed_blobs.contains(&id) || state.parsed_trees.contains(&id) {
+        return Ok(());
     }
-    if !matches!(repo.find_header(id).map(|h| h.kind()), Ok(Kind::Commit | Kind::Tag)) {
-        return;
-    }
-    if let Ok(Ok(decoded)) = decode(repo, id) {
-        for (child, _) in &decoded.children {
-            state.note(*child);
-            state.typed.insert(*child);
+    let kind = repo.find_header(id).map(|h| h.kind()).ok();
+    if kind == Some(Kind::Commit) {
+        let mut out = Vec::new();
+        let filled = graph.lookup_commit_in_graph(id, &mut out);
+        for line in out {
+            eprintln!("{line}");
         }
-        parsed.insert(id);
+        if let Some((tree, parents)) = filled.map_err(crate::fatal::die)? {
+            // `GIT_COMMIT_GRAPH_PARANOIA` first checks the commit with
+            // `odb_has_object()` (commit-graph.c:1033-1034), a read.
+            if crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false) {
+                state.pack_reads.push((Some(id), Some(parse.source)));
+            }
+            for child in parents.into_iter().chain(std::iter::once(tree)) {
+                state.note(child);
+                state.typed.insert(child);
+            }
+            parse.parsed.insert(id);
+            return Ok(());
+        }
     }
-}
-
-/// Whether `prepare_commit_graph()` would find a graph to open: `core.commitGraph` is not
-/// off and some odb source holds `info/commit-graph` or a `info/commit-graphs/` chain
-/// (commit-graph.c:736-773).
-fn commit_graph_on_disk(repo: &gix::Repository) -> bool {
-    repo.config_snapshot().boolean("core.commitGraph") != Some(false)
-        && odb_sources(repo).iter().any(|objdir| {
-            objdir.join("info/commit-graph").is_file()
-                || objdir.join("info/commit-graphs/commit-graph-chain").is_file()
-        })
+    state.pack_reads.push((Some(id), Some(parse.source)));
+    match kind {
+        Some(Kind::Blob) => {
+            parse.parsed_blobs.insert(id);
+        }
+        Some(Kind::Commit | Kind::Tag) => {
+            if let Ok(Ok(decoded)) = decode(repo, id) {
+                for (child, _) in &decoded.children {
+                    state.note(*child);
+                    state.typed.insert(*child);
+                }
+                parse.parsed.insert(id);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The loose id `<sub>/<name>` spells, when the name is one.

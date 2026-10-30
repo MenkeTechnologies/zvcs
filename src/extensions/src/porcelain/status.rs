@@ -1435,6 +1435,14 @@ fn status_report(
         if ignored_matching {
             collapse_to_matching_ignore(&repo, &index, &mut ignored_paths)?;
         }
+        // The long and short formats print no `u` line, but `run_diff_files()` compares an
+        // unmerged path's stage 2 for them all the same, so a gitlink there whose
+        // `<path>/.git` is unusable dies in `is_submodule_modified()` as it does for
+        // `--porcelain=v2`; see [`unmerged_change`]. Only that refusal matters here.
+        let submodules = submodule_mode(&repo, ignore_submodules, untracked);
+        for (_, path) in &unmerged {
+            unmerged_change(&repo, submodules, &index, gix::bstr::BStr::new(path), 0)?;
+        }
     }
 
     // `wt_status_collect()` (wt-status.c:863-876) runs `run_diff_files()`, then —
@@ -2757,12 +2765,10 @@ fn removed_gitlink(repo: &gix::Repository, rela_path: &gix::bstr::BStr) -> Optio
 /// } else { "N..." }
 /// ```
 ///
-/// `modes` are the mode columns of the record being printed. For a `1`/`2` line those
-/// are git's own three; for a `u` line git tests the same three accumulated fields
-/// while the line itself prints the stage modes, so the stage modes plus the worktree
-/// mode stand in — measured equal against git 2.55.0 for an `AA` gitlink conflict both
-/// with the submodule checked out (`u AA S... 000000 160000 160000 160000 …`) and with
-/// its directory removed (`… 160000 160000 000000 …`, still `S...`).
+/// `modes` are the accumulated mode fields of the record being printed: git's own three
+/// for a `1`/`2` line; for a `u` line the line itself prints the stage modes while the
+/// token tests [`UnmergedChange`]'s `mode_index` and `mode_worktree`, `mode_head` being
+/// `0` there.
 fn v2_submodule_token(modes: &[u32], sub: SubmoduleState) -> String {
     if !modes.iter().any(|m| *m == 0o160000) {
         return "N...".to_owned();
@@ -2774,6 +2780,140 @@ fn v2_submodule_token(modes: &[u32], sub: SubmoduleState) -> String {
         flag(sub.modified, 'M'),
         flag(sub.untracked, 'U'),
     )
+}
+
+/// The `wt_status_change_data` fields an unmerged path accumulates from
+/// `run_diff_files()`, which a `u` line reads through
+/// [`v2_submodule_token`] and its `<mW>` column (wt-status.c:2564, :2612).
+/// `mode_head` stays `0`: `wt_status_collect_updated_cb()` sets nothing for a
+/// `DIFF_STATUS_UNMERGED` pair (wt-status.c:598-605).
+#[derive(Clone, Copy)]
+struct UnmergedChange {
+    mode_index: u32,
+    mode_worktree: u32,
+    sub: SubmoduleState,
+}
+
+/// `run_diff_files()` over one unmerged path (diff-lib.c:154-226, 234-310), as
+/// `wt_status_collect_changed_cb()` (wt-status.c:470-525) folds its pairs.
+///
+/// The first pair is `diff_unmerge()`'s, both sides empty but for `two->mode =
+/// wt_mode`, so it contributes `mode_index = 0`, `mode_worktree = wt_mode` and no
+/// submodule bits (`!oideq()` of two null ids). The loop then keeps the stage-2
+/// entry as `ce` (`diff_unmerged_stage` is 2 when `max_count` is unset) and falls
+/// through to the ordinary comparison, so ours may queue a second pair:
+///
+/// * `check_removed()` (diff-lib.c:42-77) says gone: `diff_addremove('-')`, a
+///   `DIFF_STATUS_DELETED` pair, `mode_index = ce_mode`; for a gitlink
+///   `diff_queue_addremove()` drops it under `ignore=all` (diff.c:7588-7589).
+/// * otherwise `match_stat_with_submodule()` (diff-lib.c:88-107): a gitlink over a
+///   directory is changed when its `HEAD` resolves to another commit
+///   (`ce_compare_gitlink()`, read-cache.c:268-284), never under `ignore=all`, and
+///   `is_submodule_modified()` fills `dirty_submodule` unless `ignore=dirty` —
+///   `status` sets `dirty_submodules` (wt-status.c:646), so it asks even when
+///   changed. A gitlink over anything else is `TYPE_CHANGED`. A blob over a
+///   directory survived `check_removed()` only because that directory resolves a
+///   `HEAD`, and is `TYPE_CHANGED` to `S_IFGITLINK`.
+/// * changed or dirty: `diff_change()`, so `mode_index = ce_mode`, `mode_worktree =
+///   ce_mode_from_stat()`, and over a gitlink worktree side
+///   `new_submodule_commits = !oideq(&one->oid, &two->oid)` — two's id is null when
+///   changed — and `dirty_submodule`. `diff_queue_change()` drops a gitlink-to-gitlink
+///   pair under `ignore=all` (diff.c:7642-7644), which `changed = 0` already covers.
+///
+/// A blob stage 2 over a file or symlink queues at most a pair whose modes carry no
+/// `S_IFGITLINK`, and whose `ce_mode_from_stat()` is `create_ce_mode(st_mode)` just
+/// as `wt_mode`'s was (read-cache.h:16-29), so it changes nothing a `u` line shows.
+///
+/// The `die()` of `is_submodule_modified()` over an unusable `<path>/.git`
+/// (submodule.c:1892-1899) comes back as the error it is.
+fn unmerged_change(
+    repo: &gix::Repository,
+    submodules: gix::status::Submodule,
+    index: &gix::index::State,
+    path: &gix::bstr::BStr,
+    wt_mode: u32,
+) -> Result<UnmergedChange> {
+    let mut d = UnmergedChange {
+        mode_index: 0,
+        mode_worktree: wt_mode,
+        sub: SubmoduleState::default(),
+    };
+    let ours = index.entry_range(path).and_then(|range| {
+        index.entries()[range]
+            .iter()
+            .find(|e| e.stage_raw() == 2)
+            .map(|e| (e.mode.bits(), e.id))
+    });
+    let (Some((ce_mode, ce_id)), Some(wd)) = (ours, repo.workdir()) else {
+        return Ok(d);
+    };
+    let is_gitlink = ce_mode == 0o160000;
+    let md = std::fs::symlink_metadata(wd.join(gix::path::from_bstr(path)));
+    let removed = match &md {
+        Err(_) => true,
+        Ok(_) if super::check_ignore::has_symlink_leading_path(wd, path) => true,
+        Ok(md) => {
+            md.is_dir() && !is_gitlink && super::worktree_filespec::gitlink_head(wd, path).is_none()
+        }
+    };
+    if removed {
+        if !(is_gitlink && gitlink_ignore(repo, submodules, path)? == gix::submodule::config::Ignore::All) {
+            d.mode_index = ce_mode;
+        }
+        return Ok(d);
+    }
+    let over_dir = md.as_ref().is_ok_and(std::fs::Metadata::is_dir);
+    match (is_gitlink, over_dir) {
+        (true, true) => {
+            let ignore = gitlink_ignore(repo, submodules, path)?;
+            if ignore == gix::submodule::config::Ignore::All {
+                return Ok(d);
+            }
+            let status = gix::submodule::status::gitlink_status(repo, path, ce_id, ignore, false)?;
+            let sub = SubmoduleState::from_gix(&status);
+            if sub.new_commits || sub.dirty() {
+                d.mode_index = ce_mode;
+                d.mode_worktree = 0o160000;
+                d.sub = sub;
+            }
+        }
+        (true, false) => {
+            d.mode_index = ce_mode;
+            d.mode_worktree = worktree_mode(repo, path, ce_mode);
+        }
+        (false, true) => {
+            d.mode_index = ce_mode;
+            d.mode_worktree = 0o160000;
+            d.sub.new_commits = true;
+        }
+        (false, false) => {}
+    }
+    Ok(d)
+}
+
+/// The ignore level `is_submodule_ignored()` and `match_stat_with_submodule()` apply
+/// to the gitlink at `path`, resolved as [`submodule_mode`]'s value is by
+/// `BuiltinSubmoduleStatus`: an explicit `--ignore-submodules` overrides everything
+/// (`override_submodule_config`), else `submodule.<name>.ignore` from
+/// `set_diffopt_flags_from_submodule_config()` (submodule.c:180-199) over the
+/// diff-level default.
+fn gitlink_ignore(
+    repo: &gix::Repository,
+    submodules: gix::status::Submodule,
+    path: &gix::bstr::BStr,
+) -> Result<gix::submodule::config::Ignore> {
+    let fallback = match submodules {
+        gix::status::Submodule::Given { ignore, .. } => return Ok(ignore),
+        gix::status::Submodule::PerSubmoduleOr { fallback, .. } => fallback,
+        gix::status::Submodule::AsConfigured { .. } => gix::submodule::config::Ignore::default(),
+    };
+    let named = repo
+        .submodules()?
+        .and_then(|mut subs| subs.find(|sm| sm.path().is_ok_and(|p| p == path)));
+    Ok(match named {
+        Some(sm) => sm.ignore()?.unwrap_or(fallback),
+        None => fallback,
+    })
 }
 
 /// `index_name_is_other()` (read-cache.c:3442): whether a dirwalk entry is really
@@ -3206,6 +3346,8 @@ fn porcelain_v2_output(
 
     // --------------------------------------- fill from index & worktree stat
     let index = repo.index_or_empty()?;
+    // The `u` lines' own `run_diff_files()` comparison, see [`unmerged_change`].
+    let submodules = submodule_mode(repo, ignore_submodules, untracked);
     // `wt_status_collect_untracked()` (wt-status.c:834, :840): a dirwalk entry whose
     // name the index already holds is not untracked content.
     untracked_paths.retain(|p| index_name_is_other(&index, gix::bstr::BStr::new(p)));
@@ -3348,11 +3490,10 @@ fn porcelain_v2_output(
                     }
                 }
             }
-            let m_w = worktree_mode(repo, path.as_bstr(), first_stage_mode(&sm));
-            // An unmerged path has no `wt_status_change_data` here, so the stage modes
-            // stand in for git's accumulated `mode_head`/`mode_index`, and it never
-            // carries dirty-submodule bits. See [`v2_submodule_token`].
-            let sub = v2_submodule_token(&[sm[0], sm[1], sm[2], m_w], SubmoduleState::default());
+            let wt_mode = worktree_mode(repo, path.as_bstr(), first_stage_mode(&sm));
+            let d = unmerged_change(repo, submodules, &index, path.as_bstr(), wt_mode)?;
+            let m_w = d.mode_worktree;
+            let sub = v2_submodule_token(&[d.mode_index, d.mode_worktree], d.sub);
             let mut line: Vec<u8> = Vec::new();
             line.extend_from_slice(
                 format!(
@@ -3452,11 +3593,13 @@ fn porcelain_v2_output(
                 }
             }
         }
-        let m_w = worktree_mode(repo, path.as_bstr(), first_stage_mode(&sm));
-        // An unmerged path has no `wt_status_change_data` here, so the stage modes stand
-        // in for git's accumulated `mode_head`/`mode_index`, and it never carries
-        // dirty-submodule bits. See [`v2_submodule_token`].
-        let sub = v2_submodule_token(&[sm[0], sm[1], sm[2], m_w], SubmoduleState::default());
+        // `wt_porcelain_v2_print_unmerged_entry()` (wt-status.c:2564-2612): the token
+        // and `<mW>` are the accumulated `wt_status_change_data`, the stage columns
+        // the index entries themselves.
+        let wt_mode = worktree_mode(repo, path.as_bstr(), first_stage_mode(&sm));
+        let d = unmerged_change(repo, submodules, &index, path.as_bstr(), wt_mode)?;
+        let m_w = d.mode_worktree;
+        let sub = v2_submodule_token(&[d.mode_index, d.mode_worktree], d.sub);
         let line = format!(
             "u {xy} {sub} {:06o} {:06o} {:06o} {:06o} {} {} {} {}",
             sm[0],

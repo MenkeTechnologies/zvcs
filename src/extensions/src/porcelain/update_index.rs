@@ -2514,9 +2514,14 @@ fn refresh(
             }
         };
 
-        // Gitlinks ignore stat data entirely: only the nested HEAD matters.
+        // Gitlinks ignore stat data entirely: `ce_match_stat_basic()` calls anything but
+        // a directory `TYPE_CHANGED`, and over one asks `ce_compare_gitlink()`, which
+        // calls a `HEAD` that does not resolve (no `.git`, an unusable gitfile, an
+        // unborn branch) unchanged (read-cache.c:268-284, :331-337). An unchanged
+        // gitlink is neither marked up to date nor restatted (read-cache.c:1425-1434),
+        // and `refresh_cache_ent()` never asks `is_submodule_modified()`.
         if mode == Mode::COMMIT {
-            let ok = meta.is_dir() && gitlink_head(&abs) == Some(id);
+            let ok = meta.is_dir() && gitlink_head(&abs).is_none_or(|head| head == id);
             if !ok && !flags.quiet {
                 show_refresh_file(
                     RefreshReport::Modified,

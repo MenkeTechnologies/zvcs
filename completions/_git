@@ -1,7 +1,9 @@
-#compdef git git-cvsserver git-receive-pack git-upload-archive git-upload-pack git-shell gitk tig
+#compdef git git-cvsserver git-receive-pack git-upload-archive git-upload-pack git-shell gitk tig -P git-*
 # zvcs-forked _git: the stock zsh `_git` with the zvcs `z*` superset verbs added
 # (a `zvcs_commands` group in `_git_commands`, and `_git-z*` arg completers at the
 # end). Put this dir first on `fpath` so it shadows the system `_git`.
+# The -P git-* pattern also completes the dashed git-<verb> links `git zshadow`
+# installs in ~/.zvcs/bin: _git dispatches a git-<verb> service to _git-<verb>.
 
 # Some parts of this completion's behaviour are configurable:
 #
@@ -9216,7 +9218,11 @@ _git() {
         ;;
     esac
   else
-    _call_function ret _$service
+    # A dashed git-<verb> with no _git-<verb> completer falls back the way
+    # `git <verb>` does above.
+    if ! _call_function ret _$service && zstyle -T :completion:$curcontext: use-fallback; then
+      _default && ret=0
+    fi
   fi
 
   return ret

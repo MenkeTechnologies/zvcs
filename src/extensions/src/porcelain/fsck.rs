@@ -75,11 +75,12 @@ const ERROR_COMMIT_GRAPH: u8 = 16;
 ///                                       `--verbose` as `cmd_fsck` does. The
 ///                                       ref-database, object-directory and
 ///                                       `--full` "Checking objects" meters are
-///                                       drawn per odb source; a source with a
-///                                       multi-pack-index, a scan finding that
-///                                       git would print between redraws, or a
-///                                       pack list whose order cannot be
-///                                       reconstructed is refused.
+///                                       drawn per odb source, each source ending
+///                                       in the `multi-pack-index verify
+///                                       --progress` child's own meters; a scan
+///                                       finding that git would print between
+///                                       redraws, or a pack list whose order
+///                                       cannot be reconstructed, is refused.
 ///   * `--verbose` / `-v` / `--no-verbose` — the `Checking ...` trace on stderr;
 ///                                       see divergence 9.
 ///   * `--name-objects`               — decorate each reported id with the path
@@ -250,7 +251,7 @@ const ERROR_COMMIT_GRAPH: u8 = 16;
 /// object exactly (see [`SlotOrder`] and [`replay_obj_hash`]). The replay needs
 /// the scan's own order, which comes from the raw `readdir()` sequence of
 /// `.git/objects/??` plus, when the odb holds one, the pack's offset order
-/// ([`loose_scan_order`]). Where that is unavailable — `--connectivity-only`,
+/// ([`ObjectScan`]). Where that is unavailable — `--connectivity-only`,
 /// `--no-full` with a pack, more than one pack, a linked worktree — a weaker
 /// argument applies instead: under linear probing the *set* of occupied slots is
 /// independent of insertion order, so slots partition into clusters (maximal
@@ -309,25 +310,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             Some(explicit) => explicit,
             None => std::io::stderr().is_terminal(),
         };
-    if show_progress && !opt.connectivity_only {
-        // `verify_midx()` (odb/source-packed.c:961-982) runs
-        // `git multi-pack-index verify --progress` as a child for every packed
-        // source it reaches, and that child draws its own meters. Those are not
-        // reproduced here, so a reached source holding a midx is refused.
-        let midx_on = repo.config_snapshot().boolean("core.multiPackIndex") != Some(false);
-        let has_midx = odb_sources(&repo)
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| opt.check_full || i == 0)
-            .any(|(_, objdir)| {
-                let pack = objdir.join("pack");
-                pack.join("multi-pack-index").exists() || pack.join("multi-pack-index.d").exists()
-            });
-        if midx_on && has_midx {
-            bail!("--progress is not ported for a repository with a multi-pack-index: git's `multi-pack-index verify --progress` child draws its own meters");
-        }
-    }
-
     // `git_fsck_config()` runs before any checking, so a bad `fsck.<msg-id>`
     // value or an unreadable `fsck.skipList` dies before a line is printed.
     let msg_config = match MsgConfig::new(&repo, MsgSource::Fsck { strict: opt.strict }) {
@@ -356,6 +338,34 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
         if show_progress {
             progress_block("Checking ref database", 1);
+        }
+    }
+
+    // The first odb read prepares every source, and `odb_source_packed_prepare()` loads
+    // its multi-pack-index first (odb/source-packed.c:832-853): a file
+    // `load_multi_pack_index_one()` dies on (midx.c:146-217) ends the command there,
+    // ahead of every object line. One it gives up on with an `error()` is tried again on
+    // every later prepare, which prints the line each time; how many prepares this run
+    // makes is not modelled, so that case is refused.
+    let midx_on = repo.config_snapshot().boolean("core.multiPackIndex") != Some(false);
+    if midx_on {
+        for objdir in odb_sources(&repo) {
+            let pack_dir = objdir.join("pack");
+            let label = format!("{}/pack/multi-pack-index", super::multi_pack_index::source_label(&repo, &pack_dir));
+            let mut log = super::multi_pack_index::MidxLog::default();
+            super::multi_pack_index::load_multi_pack_index(&pack_dir, &label, repo.object_hash(), &mut log)?;
+            if let Some(msg) = log.died {
+                for line in &log.lines {
+                    eprintln!("{line}");
+                }
+                return Err(crate::fatal::die(msg));
+            }
+            if !log.lines.is_empty() {
+                bail!(
+                    "refusing to guess the output: git prints `{}` on every odb prepare that retries this multi-pack-index",
+                    log.lines[0]
+                );
+            }
         }
     }
 
@@ -497,7 +507,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // The gix iterator's order is its own; git's is `fsck_source()`'s, and that
     // is what decides where two colliding ids land in `obj_hash`. Take only
     // membership from the iterator and re-lay `all` in git's order whenever that
-    // order is reconstructible — see [`loose_scan_order`].
+    // order is reconstructible — see [`ObjectScan`].
     // `snapshot_refs()` read every head it parsed, and each read a pack answered
     // moved that pack to the front of its source's list (see [`PackLists`]).
     // Those reads are the snapshot's heads, in order, only when the snapshot
@@ -527,7 +537,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // rather than `parse_object()` can find it. `--connectivity-only` replaces
     // the whole block with `odb_for_each_object()`, which is unaffected.
     if !opt.check_full && !opt.connectivity_only {
-        let loose: HashSet<ObjectId> = loose_only_scan_order(&repo).into_iter().collect();
+        let loose: HashSet<ObjectId> = local_loose_objects(&repo);
         all.retain(|id| loose.contains(id));
         in_odb.retain(|id| loose.contains(id));
     }
@@ -535,7 +545,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // the objects past it are never scanned — unless `verify_pack()` meets them
     // in a pack. `odb_for_each_object()` under `--connectivity-only` walks the
     // same way, stops in the same place, and lists the packs as well.
-    let unvisited: HashSet<ObjectId> = loose_unvisited(&repo);
+    let unvisited: HashSet<ObjectId> = loose_unvisited(&repo, opt.check_full || opt.connectivity_only);
     if !unvisited.is_empty() {
         let packed: HashSet<ObjectId> = if opt.check_full || opt.connectivity_only {
             unvisited.iter().copied().filter(|id| in_pack_index(&repo, *id)).collect()
@@ -560,17 +570,45 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
     };
     let pack_lists = PackLists::load(&repo, snapshot_reads.as_deref());
-    let scan_ordered = match loose_scan_order(&repo, opt.check_full, pack_lists.as_ref()) {
-        Some(order) if order.len() == all.len() && order.iter().all(|id| in_odb.contains(id)) => {
-            all = order;
-            true
-        }
-        _ => false,
+    // `--full`'s `verify_pack()` pass, run ahead of the scan so the objects it
+    // could not produce are treated as absent; its lines are printed at 3b.
+    let pack_check = match opt.check_full && !opt.connectivity_only {
+        true => verify_packs(&repo),
+        false => super::pack_check::PackCheck::default(),
     };
-    // Where each object sits in that order, which is the order every line the
-    // scan itself emits comes out in.
-    let scan_index: Option<HashMap<ObjectId, usize>> = scan_ordered
-        .then(|| all.iter().enumerate().map(|(i, id)| (*id, i)).collect());
+    let packed_half = PackedHalf::load(&repo);
+    let object_scan = ObjectScan::new(&repo, opt.check_full, opt.verbose, pack_lists.as_ref());
+    // The scan's visits, once per copy, when their order is known and accounts
+    // for exactly the objects listed above. A copy `verify_pack()` could not
+    // produce never reaches `fsck_obj_buffer()` while another copy of the same
+    // id does, which the per-id [`PackCheck`] sets cannot tell apart, so an id
+    // visited twice with an unverified copy leaves the order unknown.
+    let visits: Option<Vec<ScanVisit>> = object_scan.visits.filter(|visits| {
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut repeated = false;
+        for visit in visits {
+            repeated |= !seen.insert(visit.id) && pack_check.unverified.contains(&visit.id);
+        }
+        !repeated && seen.len() == in_odb.len() && seen.iter().all(|id| in_odb.contains(id))
+    });
+    let scan_ordered = visits.is_some();
+    let visits: Vec<ScanVisit> = match visits {
+        Some(visits) => {
+            let mut seen: HashSet<ObjectId> = HashSet::new();
+            all = visits.iter().map(|v| v.id).filter(|id| seen.insert(*id)).collect();
+            visits
+        }
+        None => all.iter().map(|&id| ScanVisit { id, loose: is_loose(&repo, id) }).collect(),
+    };
+    // Where each object is first visited in that order, for the lines that are
+    // keyed by id rather than by visit (see `lint_special_blobs()`).
+    let scan_index: Option<HashMap<ObjectId, usize>> = scan_ordered.then(|| {
+        let mut index: HashMap<ObjectId, usize> = HashMap::new();
+        for (at, visit) in visits.iter().enumerate() {
+            index.entry(visit.id).or_insert(at);
+        }
+        index
+    });
     // `--connectivity-only` replaces the scan with `odb_for_each_object()`, whose
     // call sequence — repeats included — both `mark_object_for_connectivity()`
     // and `mark_unreachable_referents()` replay (see [`connectivity_listing`]).
@@ -628,22 +666,33 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // Stray files in `.git/objects/??`, which `fsck_cruft()` reports as part of
     // the same walk. `--connectivity-only` replaces that walk with
     // `odb_for_each_object()`, which reports only a subdirectory it cannot open.
-    let cruft_lines: Vec<(usize, String)> = if opt.connectivity_only {
-        loose_unopenable(&repo).into_iter().map(|line| (0, line)).collect()
+    // `odb_source_loose_fsck()` also announces each source it walks with the
+    // verbose header (odb/source-loose.c:1114-1115), which this port places with
+    // the cruft whenever the scan order is known; `--connectivity-only` skips the
+    // scan, header included.
+    let mut cruft_lines: Vec<(usize, String)> = Vec::new();
+    if opt.connectivity_only {
+        cruft_lines = loose_unopenable(&repo).into_iter().map(|line| (0, line)).collect();
+    } else if scan_ordered {
+        cruft_lines = object_scan.walk_lines.into_iter().map(|(at, line, _)| (at, line)).collect();
     } else {
-        loose_cruft(&repo)
-    };
-    // `fsck_source()` announces the directory once per odb source before walking
-    // it; `--connectivity-only` skips `fsck_source()` altogether.
-    if opt.verbose && !opt.connectivity_only {
-        eprintln!("Checking object directory");
+        // Without the scan order a header's place among the scan's own lines is
+        // unknown, and these lines are printed as the scan runs: the one header
+        // goes first, ahead of everything a lone source's scan prints.
+        if opt.verbose && object_scan.sources > 1 {
+            bail!(
+                "refusing to guess the output order: git prints a `Checking object directory` header \
+                 ahead of each of these {} sources' scans",
+                object_scan.sources
+            );
+        }
+        for (at, line, header) in object_scan.walk_lines {
+            match header {
+                true => eprintln!("{line}"),
+                false => cruft_lines.push((at, line)),
+            }
+        }
     }
-    // `--full`'s `verify_pack()` pass, run ahead of the scan so the objects it
-    // could not produce are treated as absent; its lines are printed at 3b.
-    let pack_check = match opt.check_full && !opt.connectivity_only {
-        true => verify_packs(&repo),
-        false => super::pack_check::PackCheck::default(),
-    };
     // `--connectivity-only` replaces `fsck_source()` with
     // `mark_object_for_connectivity()`, which creates the object straight from
     // the odb's listing with `lookup_unknown_object()` and sets `HAS_OBJ` without
@@ -659,9 +708,24 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             state.note(id);
         }
     }
-    for &id in &all {
+    // Where each visit's lines start in `msg_lines`, which is what orders the
+    // lines pushed after the scan among those the scan pushed.
+    let mut visit_start: Vec<usize> = Vec::with_capacity(visits.len());
+    // Commits and tags a visit parsed. A later copy of one finds `object.parsed`
+    // set, so `parse_commit_buffer()`/`parse_tag_buffer()` return at once and
+    // create nothing (commit.c:527-528, tag.c:146-147).
+    let mut scan_parsed: HashSet<ObjectId> = HashSet::new();
+    let mut scanned: HashSet<ObjectId> = HashSet::new();
+    for &ScanVisit { id, loose } in &visits {
         if opt.connectivity_only {
             continue;
+        }
+        visit_start.push(msg_lines.len());
+        // A copy of an object an earlier copy failed to read or parse goes
+        // through `parse_object_buffer()` again, against an object whose
+        // `parsed` flag the failed parse already set.
+        if !scanned.insert(id) && (corrupt.contains(&id) || unparseable.contains_key(&id)) {
+            bail!("refusing to guess the output order: {id} is stored more than once and one copy could not be read or parsed");
         }
         // A packed object `verify_pack()` could not produce never reaches
         // `fsck_obj_buffer()`: its lines are the pack's, and it stays without
@@ -718,7 +782,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // the commit was parsed already, when it returns at once (:527-528). So the first commit
         // the scan parses loads the graph when no head did, and its loader lines land in this
         // object's place in the scan.
-        if kind == Kind::Commit && !pre_parsed.contains(&id) {
+        if kind == Kind::Commit && !pre_parsed.contains(&id) && !scan_parsed.contains(&id) {
             let mut out = Vec::new();
             let result = graph.load_commit_graph_info(id, &mut out);
             let slot = Slot::Scan(id.as_bytes()[0]);
@@ -726,8 +790,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             if let Err(msg) = result {
                 // die() in the middle of the scan: what the scan printed up to here, then the
                 // fatal line.
-                for (_, _, line) in &msg_lines {
+                let mut walk = cruft_lines.iter().peekable();
+                for (i, (_, _, line)) in msg_lines.iter().enumerate() {
+                    while scan_ordered && walk.peek().is_some_and(|(k, _)| *k <= visit_of(&visit_start, i)) {
+                        eprintln!("{}", walk.next().expect("peeked").1);
+                    }
                     eprintln!("{line}");
+                }
+                while scan_ordered && walk.peek().is_some_and(|(k, _)| *k < visit_start.len()) {
+                    eprintln!("{}", walk.next().expect("peeked").1);
                 }
                 return Err(crate::fatal::die(msg));
             }
@@ -758,7 +829,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // never. A tree is the other way round: `parse_tree_buffer()` creates
         // nothing and `fsck_walk_tree()` decodes the entries and looks every one
         // of them up, on every run.
-        let creates_children = kind == Kind::Tree || !pre_parsed.contains(&id);
+        let creates_children = kind == Kind::Tree || !(pre_parsed.contains(&id) || scan_parsed.contains(&id));
+        if matches!(kind, Kind::Commit | Kind::Tag) {
+            scan_parsed.insert(id);
+        }
         // A grafted commit's true parents are already gone: `apply_commit_graft()`
         // dropped them as `parse_commit_buffer()` does (commit.c:569), so they are
         // neither created nor marked used here, and the graft's parents are both.
@@ -820,7 +894,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // failures are `ERROR_OBJECT`; a packed one is checked by
                     // `verify_pack()`'s `fsck_obj_buffer` callback, and git
                     // reports the whole pack instead with `ERROR_PACK`.
-                    errors |= if is_loose(&repo, id) {
+                    errors |= if loose {
                         ERROR_OBJECT
                     } else {
                         ERROR_PACK
@@ -879,6 +953,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // (fsck.c:1336-1340), and the first such call builds the promisor set — see
     // step 3c.
     let mut finish_asked_promisor = false;
+    let scan_end = msg_lines.len();
     if !opt.connectivity_only {
         errors |= lint_special_blobs(
             &repo,
@@ -891,37 +966,38 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         );
     }
     // These lines come out in the order the scan visited their objects, which is
-    // `scan_index` whenever this port could reconstruct it.
+    // the order they were pushed in whenever this port could reconstruct it.
     //
     // Without it the weaker argument applies: `for_each_loose_file_in_source()`
     // walks the 256 subdirectories in numeric order and only the entries *within*
     // one of them in raw `readdir()` order (`object-file.c`), so the lines are
     // ordered by the first byte of the id and only a pair sharing a first byte is
     // unresolvable.
-    if scan_lines.len() > 1 {
-        match &scan_index {
-            Some(index) => scan_lines.sort_by_key(|(id, _)| index.get(id).copied()),
-            None => {
-                let mut by_subdir: HashSet<u8> = HashSet::new();
-                let collides = scan_lines
-                    .iter()
-                    .any(|(id, _)| !by_subdir.insert(id.as_bytes()[0]));
-                if collides || has_packs(&repo) {
-                    anyhow::bail!(
-                        "refusing to guess the output order: git emits these {} lines during its \
-                         object-directory scan, and two of them share the raw readdir() sequence \
-                         of one .git/objects/?? subdirectory",
-                        scan_lines.len()
-                    );
-                }
-                scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
-            }
+    if scan_lines.len() > 1 && scan_index.is_none() {
+        let mut by_subdir: HashSet<u8> = HashSet::new();
+        let collides = scan_lines
+            .iter()
+            .any(|(id, _)| !by_subdir.insert(id.as_bytes()[0]));
+        if collides || has_packs(&repo) {
+            anyhow::bail!(
+                "refusing to guess the output order: git emits these {} lines during its \
+                 object-directory scan, and two of them share the raw readdir() sequence \
+                 of one .git/objects/?? subdirectory",
+                scan_lines.len()
+            );
         }
+        scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
     }
 
     // The message layer's lines come from the same scan plus `fsck_finish()`,
     // so they are ordered — and refused when ambiguous — by the same rule, with
     // the two finish sweeps landing after every scan line. See [`Slot`].
+    //
+    // With the scan order known, a line the scan pushed belongs to the visit that
+    // pushed it, and one `lint_special_blobs()` added afterwards to its blob's
+    // first visit, after that visit's own lines. `msg_at` keeps each line's
+    // visit for the walk lines to interleave with.
+    let mut msg_at: Vec<Option<usize>> = vec![None; msg_lines.len()];
     if msg_lines.len() > 1 {
         let mut by_slot: HashMap<Slot, HashSet<ObjectId>> = HashMap::new();
         for &(slot, id, _) in &msg_lines {
@@ -937,11 +1013,25 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             .any(|(slot, ids)| !matches!(slot, Slot::Scan(_)) && ids.len() > 1);
         match &scan_index {
             Some(index) if !finish_collides => {
-                msg_lines.sort_by_key(|&(slot, id, _)| match slot {
-                    Slot::Scan(_) => (0usize, index.get(&id).copied()),
-                    Slot::FinishGitmodules => (1, None),
-                    Slot::FinishGitattributes => (2, None),
-                });
+                let mut keyed: Vec<((usize, Option<usize>), (Slot, ObjectId, String))> = msg_lines
+                    .drain(..)
+                    .enumerate()
+                    .map(|(i, (slot, id, line))| {
+                        let key = match slot {
+                            Slot::Scan(_) if i < scan_end => (0usize, Some(visit_of(&visit_start, i))),
+                            Slot::Scan(_) => (0, index.get(&id).copied()),
+                            Slot::FinishGitmodules => (1, None),
+                            Slot::FinishGitattributes => (2, None),
+                        };
+                        (key, (slot, id, line))
+                    })
+                    .collect();
+                keyed.sort_by_key(|(key, _)| *key);
+                msg_at.clear();
+                for ((_, at), line) in keyed {
+                    msg_at.push(at);
+                    msg_lines.push(line);
+                }
             }
             _ => {
                 let collides = by_slot.values().any(|ids| ids.len() > 1);
@@ -956,11 +1046,21 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 msg_lines.sort_by_key(|&(slot, _, _)| slot);
             }
         }
+    } else if scan_index.is_some() {
+        msg_at = msg_lines
+            .iter()
+            .enumerate()
+            .map(|(i, &(slot, id, _))| match slot {
+                Slot::Scan(_) if i < scan_end => Some(visit_of(&visit_start, i)),
+                Slot::Scan(_) => scan_index.as_ref().and_then(|index| index.get(&id).copied()),
+                _ => None,
+            })
+            .collect();
     }
-    // `fsck_cruft()`'s lines come out of the same `readdir()` walk as the scan's
-    // own, so they interleave with them: a cruft entry keyed `k` was met after
-    // `k` loose objects had been handed to `fsck_loose()`, which places it ahead
-    // of the line the `k`-th object would print.
+    // The walk lines — `fsck_cruft()`'s and, under `--verbose`, each source's
+    // header — come out of the same `readdir()` walk as the scan's own, so they
+    // interleave with them: one keyed `k` was met after `k` visits, which places
+    // it ahead of the lines of visit `k`. All of them precede `fsck_finish()`.
     if !cruft_lines.is_empty() && !msg_lines.is_empty() && scan_index.is_none() {
         anyhow::bail!(
             "refusing to guess the output order: git emits {} `bad sha1 file` line(s) interleaved \
@@ -984,9 +1084,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         bail!("--progress is not ported when the object scan reports a finding: git prints it between its progress redraws");
     }
     let mut cruft = cruft_lines.into_iter().peekable();
-    for (slot, id, line) in &msg_lines {
-        if let (Some(index), Slot::Scan(_)) = (&scan_index, slot) {
-            let at = index.get(id).copied().unwrap_or(usize::MAX);
+    for (n, (slot, _, line)) in msg_lines.iter().enumerate() {
+        if scan_index.is_some() {
+            let at = match slot {
+                Slot::Scan(_) => msg_at.get(n).copied().flatten().unwrap_or(usize::MAX),
+                _ => usize::MAX,
+            };
             while cruft.peek().is_some_and(|&(k, _)| k <= at) {
                 eprintln!("{}", cruft.next().expect("peeked").1);
             }
@@ -997,7 +1100,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         eprintln!("{line}");
     }
     if show_progress && !opt.connectivity_only {
-        odb_fsck_progress(&repo, opt.check_full, pack_lists.as_ref())?;
+        if !odb_fsck_progress(&repo, opt.check_full, midx_on, pack_lists.as_ref())? {
+            errors |= ERROR_OBJECT;
+        }
     }
 
     // ---- 3b. `--full`: verify every pack ------------------------------------
@@ -1011,6 +1116,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
     if pack_check.failed {
         errors |= ERROR_PACK;
+    }
+    // `verify_midx()` (odb/source-packed.c:961-982) ends each scanned source's packed half
+    // with a `git multi-pack-index verify --object-dir <source> --no-progress` child, run
+    // whether or not the source has a midx, whose failure makes `odb_fsck()` fail and so
+    // sets `ERROR_OBJECT` (builtin/fsck.c:934-935). Under `--progress` the child runs among
+    // the meters, in [`odb_fsck_progress`].
+    if midx_on && !opt.connectivity_only && !show_progress {
+        for objdir in odb_sources(&repo).into_iter().take(if opt.check_full { usize::MAX } else { 1 }) {
+            if !verify_midx_child(&objdir, false) {
+                errors |= ERROR_OBJECT;
+            }
+        }
     }
 
     // ---- 3c. `process_refs()`: the snapshot, handled ------------------------
@@ -1199,7 +1316,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // A head the loose walk never reached is a readable object of its
             // own type, which `parse_object()`/`lookup_tree()` gave it.
             if !has_obj.contains(&id) {
-                if !in_pack(&repo, id, &pack_check.bad) {
+                if !packed_half.has(id, &pack_check.bad) {
                     if index_blobs.contains(&id) {
                         state.missing.insert(id, Kind::Blob);
                     } else if unvisited.contains(&id) {
@@ -1466,7 +1583,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
                     // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
                     // there, so the pack is consulted before anything is reported.
-                    if !in_pack(&repo, child, &pack_check.bad) {
+                    if !packed_half.has(child, &pack_check.bad) {
                         state.missing.insert(child, child_kind);
                     }
                     continue;
@@ -1752,6 +1869,20 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
 
     Ok(ExitCode::from(errors))
+}
+
+/// `verify_midx()`'s child for the source at `objdir` (odb/source-packed.c:961-982):
+/// whether it exited 0.
+fn verify_midx_child(objdir: &Path, progress: bool) -> bool {
+    let objdir = objdir.canonicalize().unwrap_or_else(|_| objdir.to_path_buf());
+    let args = [
+        OsStr::new("multi-pack-index"),
+        OsStr::new("verify"),
+        OsStr::new("--object-dir"),
+        objdir.as_os_str(),
+        OsStr::new(if progress { "--progress" } else { "--no-progress" }),
+    ];
+    run_git_cmd(&args) == 0
 }
 
 /// `run_command()` on a `git_cmd = 1` child with every stream inherited, after
@@ -2899,22 +3030,41 @@ fn has_packs(repo: &gix::Repository) -> bool {
         .unwrap_or(false)
 }
 
-/// The number of odb sources git iterates: the main object directory plus every
-/// alternate, followed transitively (`objects/info/alternates`). git prints one
-/// "Checking object directories" progress block per source. Sources are deduped
-/// by canonical path, matching git's device/inode dedup closely enough for the
-/// count, which is all the identical progress blocks need.
-/// Whether `id` exists as a loose object in any odb source — which decides
-/// whether git found it through `fsck_object_dir()` or through `verify_pack()`,
-/// and so which error bit its messages set.
-/// `has_object_pack()` — the odb holds `id`, and not as a loose file. It is the
-/// guard `check_reachable_object()` puts in front of its `missing` line
+/// `has_object_pack()` (packfile.c:1922-1933): whether the packed half of any
+/// source holds `id`, whatever its loose copies. It is the guard
+/// `check_reachable_object()` puts in front of its `missing` line
 /// (builtin/fsck.c:268-269), which only matters once something in the odb can
-/// lack `HAS_OBJ`: a pack under `--no-full`.
-/// `bad` is `mark_bad_packed_object()`'s set, which `find_pack_entry()` skips.
-fn in_pack(repo: &gix::Repository, id: ObjectId, bad: &HashSet<ObjectId>) -> bool {
-    repo.has_object(id) && !is_loose(repo, id) && !bad.contains(&id)
+/// lack `HAS_OBJ`: a pack, or an alternate's loose object, under `--no-full`.
+/// Every source's packs are those `add_packed_git()` lists — an `.idx` beside a
+/// `.pack` that is a regular file (packfile.c:710-776) — and `bad` is
+/// `mark_bad_packed_object()`'s set, which `find_pack_entry()` skips.
+struct PackedHalf {
+    indexes: Vec<pack::index::File>,
 }
+
+impl PackedHalf {
+    fn load(repo: &gix::Repository) -> Self {
+        let mut indexes = Vec::new();
+        for objdir in odb_sources(repo) {
+            let dir = objdir.join("pack");
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".idx") {
+                    if let Some(Some(pack)) = listed_pack(&dir, &name, repo.object_hash(), false) {
+                        indexes.push(pack.index);
+                    }
+                }
+            }
+        }
+        Self { indexes }
+    }
+
+    fn has(&self, id: ObjectId, bad: &HashSet<ObjectId>) -> bool {
+        !bad.contains(&id) && self.indexes.iter().any(|index| index.lookup(id).is_some())
+    }
+}
+
 
 /// Whether any odb source's pack index lists `id`, loose copies aside.
 fn in_pack_index(repo: &gix::Repository, id: ObjectId) -> bool {
@@ -2929,6 +3079,9 @@ fn in_pack_index(repo: &gix::Repository, id: ObjectId) -> bool {
     })
 }
 
+/// Whether `id` exists as a loose object in any odb source — which decides
+/// whether git found it through `fsck_object_dir()` or through `verify_pack()`,
+/// and so which error bit its messages set.
 fn is_loose(repo: &gix::Repository, id: ObjectId) -> bool {
     let hex = id.to_hex().to_string();
     odb_sources(repo)
@@ -3482,10 +3635,12 @@ fn odb_sources(repo: &gix::Repository) -> Vec<PathBuf> {
 /// `verify_reverse_indices()` follows with or without `--full` (:993-994): a
 /// delayed meter over the source's packs (:933-938), advanced once per pack
 /// (:953). Under the default `GIT_PROGRESS_DELAY` it closes long before its
-/// first update tick and never draws; with `GIT_PROGRESS_DELAY=0` it does. A
-/// source with a multi-pack-index was refused before anything was printed.
-fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, pack_lists: Option<&PackLists>) -> Result<()> {
+/// first update tick and never draws; with `GIT_PROGRESS_DELAY=0` it does.
+/// `verify_midx()` closes the packed half (:996-997) with its child, which
+/// draws its own meters under `--progress`; `false` when one failed.
+fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, midx_on: bool, pack_lists: Option<&PackLists>) -> Result<bool> {
     use crate::progress::Meter;
+    let mut ok = true;
 
     for (nth, objdir) in odb_sources(repo).into_iter().enumerate() {
         // Only the repository's own object directory is `local`.
@@ -3524,8 +3679,11 @@ fn odb_fsck_progress(repo: &gix::Repository, check_full: bool, pack_lists: Optio
             meter.set(nr + 1);
         }
         meter.stop("done");
+        if midx_on {
+            ok &= verify_midx_child(&objdir, true);
+        }
     }
-    Ok(())
+    Ok(ok)
 }
 
 /// `verify_packs()`' "Checking objects" meter for one source, under `--full`.
@@ -3989,39 +4147,106 @@ fn probe_insert(table: &mut [Option<ObjectId>], id: ObjectId) {
     table[j] = Some(id);
 }
 
-/// The order `fsck_source()` visits the odb in: every source (the main object
-/// directory then each alternate), each walked by
-/// `for_each_loose_file_in_source()` — the 256 `.git/objects/??` subdirectories
-/// in numeric order, and the entries within one of them in raw `readdir()`
-/// order, which `std::fs::read_dir` is the same system call for.
+/// One `fsck_obj()` call of the object scan: the id, and whether
+/// `fsck_loose()` (a loose file) or `verify_pack()`'s `fsck_obj_buffer()` (a
+/// packed copy) made it — which decides the error bit a failed check sets.
+#[derive(Clone, Copy)]
+struct ScanVisit {
+    id: ObjectId,
+    loose: bool,
+}
+
+/// The visit that pushed `msg_lines[line]`, given where each visit's lines
+/// start: the last visit to start at or before it.
+fn visit_of(visit_start: &[usize], line: usize) -> usize {
+    visit_start.partition_point(|&start| start <= line).saturating_sub(1)
+}
+
+/// The object scan `odb_fsck()` runs (odb.c:1161-1167), in git's order.
 ///
-/// After every source's loose walk, `check_full` re-runs `fsck_obj()` over the
-/// packed objects through `verify_pack()`: `verify_packfile()` (pack-check.c)
-/// sorts each pack's index entries by **pack offset** before calling
-/// `fsck_obj_buffer()`, and `repo_for_each_pack` visits the packs source by
-/// source in [`PackLists`] order.
-///
-/// `None` when the tail is not reconstructible — `--no-full` (which skips the
-/// packs entirely, leaving the odb listing this port takes `all` from wider than
-/// what git created) or pack lists [`PackLists::load`] cannot replay.
-fn loose_scan_order(
-    repo: &gix::Repository,
-    check_full: bool,
-    pack_lists: Option<&PackLists>,
-) -> Option<Vec<ObjectId>> {
-    let mut out = loose_only_scan_order(repo);
-    if has_packs(repo) {
-        if !check_full {
-            // `fsck_source()` never reaches a pack, so the loose walk *is* the
-            // whole scan and its order is known exactly (builtin/fsck.c:1072-1076).
-            return Some(out);
+/// `odb_fsck()` asks every source in turn; `odb_source_files_fsck()` skips a
+/// non-local source unless `--full`, then runs the source's loose half and its
+/// packed half (odb/source-files.c:912-925). The loose half is
+/// `odb_source_loose_fsck()` (odb/source-loose.c:1108-1130): the verbose
+/// `Checking object directory` header, then `for_each_loose_file_in_source()`
+/// — the 256 `.git/objects/??` subdirectories in numeric order, the entries
+/// within one of them in raw `readdir()` order, which `std::fs::read_dir` is
+/// the same system call for — handing every object to `fsck_loose()` and every
+/// other entry to `fsck_cruft()`. The packed half runs `verify_packs()` only
+/// under `--full` (odb/source-packed.c:990): `packfile_store_get_packs()` in
+/// [`PackLists`] order, and `verify_packfile()` (pack-check.c) sorts each pack's
+/// index entries by **pack offset** before calling `fsck_obj_buffer()`. An id
+/// held twice — loose and packed, in two packs, in two sources — is visited
+/// once per copy.
+struct ObjectScan {
+    /// Every visit in order; `None` when a pack list the scan walks could not be
+    /// replayed (see [`PackLists::load`]).
+    visits: Option<Vec<ScanVisit>>,
+    /// The lines the loose walks print themselves, in walk order, each keyed by
+    /// the number of visits made before it, which places it ahead of that
+    /// visit's own lines: each scanned source's verbose header (the `true`
+    /// ones), `fsck_cruft()`'s `bad sha1 file: <path>` for every `readdir()`
+    /// entry that is not `hexsz - 2` hex digits and not a `tmp_obj_` temporary
+    /// (builtin/fsck.c:776-782, object-file.c:1490-1514) — plain
+    /// `fprintf_ln()`, so no error bit — and the `unable to open` `error()` of a
+    /// subdirectory that ends a walk, whose return `odb_source_loose_fsck()`
+    /// discards.
+    walk_lines: Vec<(usize, String, bool)>,
+    /// The number of sources `odb_fsck()` scans.
+    sources: usize,
+}
+
+impl ObjectScan {
+    fn new(repo: &gix::Repository, check_full: bool, verbose: bool, pack_lists: Option<&PackLists>) -> Self {
+        let hexsz = repo.object_hash().len_in_hex();
+        let mut visits: Vec<ScanVisit> = Vec::new();
+        let mut walk_lines: Vec<(usize, String, bool)> = Vec::new();
+        let mut ordered = true;
+        let mut sources = 0usize;
+        for (nth, objdir) in odb_sources(repo).into_iter().enumerate() {
+            // `if (!(opts->flags & ODB_FSCK_FULL) && !source->local) return 0;`
+            // (odb/source-files.c:918-919). Only the first source is local.
+            if !check_full && nth > 0 {
+                continue;
+            }
+            sources += 1;
+            if verbose {
+                walk_lines.push((visits.len(), "Checking object directory".to_owned(), true));
+            }
+            for_each_loose_file_in_source(&objdir, &mut |step| match step {
+                LooseWalk::Entry { sub, name, path } => {
+                    // `hex_to_bytes()` reads through `hexval_table`, which maps
+                    // `A`-`F` as well as `a`-`f` (hex-ll.c), so an upper-case
+                    // name is an object to git and never reaches the cruft callback.
+                    if name.len() == hexsz - 2 && name.iter().all(|b| b.is_ascii_hexdigit()) {
+                        visits.extend(loose_id(sub, name, hexsz).map(|id| ScanVisit { id, loose: true }));
+                    } else if !name.starts_with(b"tmp_obj_") {
+                        walk_lines.push((visits.len(), format!("bad sha1 file: {}", loose_label_of(repo, &path)), false));
+                    }
+                }
+                LooseWalk::Unopenable { dir, err } => walk_lines.push((visits.len(), unopenable_line(repo, &dir, &err), false)),
+                LooseWalk::Unvisited { .. } => {}
+            });
+            if !check_full {
+                continue;
+            }
+            match pack_lists.and_then(|lists| lists.sources.iter().find(|(dir, _)| *dir == objdir)) {
+                Some((_, packs)) => {
+                    for pack in packs {
+                        visits.extend(pack.ids_by_offset().into_iter().map(|id| ScanVisit { id, loose: false }));
+                    }
+                }
+                None => ordered &= pack_sizes(repo, &objdir).is_empty(),
+            }
         }
-        for pack in pack_lists?.packs() {
-            out.extend(pack.ids_by_offset());
+        Self {
+            visits: ordered.then_some(visits),
+            walk_lines,
+            sources,
         }
     }
-    Some(out)
 }
+
 
 /// One `struct packed_git` in a source's `packfile_store` list.
 struct ListedPack {
@@ -4601,16 +4826,15 @@ fn loose_id(sub: u16, name: &[u8], hexsz: usize) -> Option<ObjectId> {
     ObjectId::from_hex(&hex).ok()
 }
 
-/// The loose half of [`loose_scan_order`].
-fn loose_only_scan_order(repo: &gix::Repository) -> Vec<ObjectId> {
+/// The loose objects `--no-full`'s scan hands to `fsck_loose()`: those of the
+/// local source alone, as `odb_source_files_fsck()` skips every other one
+/// without `ODB_FSCK_FULL` (odb/source-files.c:918-919).
+fn local_loose_objects(repo: &gix::Repository) -> HashSet<ObjectId> {
     let hexsz = repo.object_hash().len_in_hex();
-    let mut seen: HashSet<ObjectId> = HashSet::new();
-    let mut out: Vec<ObjectId> = Vec::new();
-    for_each_loose_file(repo, |step| {
+    let mut out: HashSet<ObjectId> = HashSet::new();
+    for_each_loose_file_in_source(&odb_sources(repo)[0], &mut |step| {
         if let LooseWalk::Entry { sub, name, .. } = step {
-            if let Some(id) = loose_id(sub, name, hexsz).filter(|id| seen.insert(*id)) {
-                out.push(id);
-            }
+            out.extend(loose_id(sub, name, hexsz));
         }
     });
     out
@@ -4619,59 +4843,24 @@ fn loose_only_scan_order(repo: &gix::Repository) -> Vec<ObjectId> {
 /// The loose objects an unopenable subdirectory kept the walk from reaching.
 /// They are in the odb, so gitoxide lists them, but git never scans them: a
 /// reachable one is `missing`, a reflog entry naming one is invalid.
-fn loose_unvisited(repo: &gix::Repository) -> HashSet<ObjectId> {
+///
+/// Without `scan_all` — the `--no-full` scan, which never reaches a non-local
+/// source (odb/source-files.c:918-919) — every loose object of an alternate is
+/// one of them too. A copy some scanned walk did reach makes the id scanned.
+fn loose_unvisited(repo: &gix::Repository, scan_all: bool) -> HashSet<ObjectId> {
     let hexsz = repo.object_hash().len_in_hex();
     let mut out = HashSet::new();
-    for_each_loose_file(repo, |step| {
-        if let LooseWalk::Unvisited { sub, name } = step {
-            out.extend(loose_id(sub, name, hexsz));
-        }
-    });
-    out
-}
-
-/// Every file in a `.git/objects/??` directory that is not a loose object, with
-/// the number of loose objects the same walk had already yielded when it was
-/// met — the key that puts `fsck_cruft()`'s line back where git emits it.
-///
-/// ```c
-/// static int fsck_cruft(const char *basename, const char *path, void *data UNUSED)
-/// {
-///         if (!starts_with(basename, "tmp_obj_"))
-///                 fprintf_ln(stderr, _("bad sha1 file: %s"), path);
-///         return 0;
-/// }
-/// ```
-///
-/// (builtin/fsck.c:776-782.) `for_each_file_in_obj_subdir()` calls the cruft
-/// callback for every `readdir()` entry whose name is not exactly `hexsz - 2`
-/// hex digits (object-file.c:1490-1514), so a subdirectory with a stray file is
-/// the only way to reach it. The line is plain `fprintf_ln()`, not `error()`:
-/// `errors_found` is untouched and `git fsck` still exits 0.
-///
-/// The `unable to open` line of a subdirectory that ends the walk comes out of
-/// the same walk, so it is keyed the same way. It is an `error()` whose return
-/// `odb_source_loose_fsck()` discards: it sets no error bit either.
-fn loose_cruft(repo: &gix::Repository) -> Vec<(usize, String)> {
-    let hexsz = repo.object_hash().len_in_hex();
-    let mut objects = 0usize;
-    let mut out: Vec<(usize, String)> = Vec::new();
-    for_each_loose_file(repo, |step| match step {
-        LooseWalk::Entry { name, path, .. } => {
-            // `hex_to_bytes()` reads through `hexval_table`, which maps
-            // `A`-`F` as well as `a`-`f` (hex-ll.c), so an upper-case name
-            // is an object to git and never reaches the cruft callback.
-            if name.len() == hexsz - 2 && name.iter().all(|b| b.is_ascii_hexdigit()) {
-                objects += 1;
-            } else if !name.starts_with(b"tmp_obj_") {
-                // `basename` is the dirent name; git keeps the temporary files
-                // `write_loose_object()` leaves behind out of the report.
-                out.push((objects, format!("bad sha1 file: {}", loose_label_of(repo, &path))));
-            }
-        }
-        LooseWalk::Unopenable { dir, err } => out.push((objects, unopenable_line(repo, &dir, &err))),
-        LooseWalk::Unvisited { .. } => {}
-    });
+    let mut visited = HashSet::new();
+    for (nth, objdir) in odb_sources(repo).into_iter().enumerate() {
+        let skipped = !scan_all && nth > 0;
+        for_each_loose_file_in_source(&objdir, &mut |step| match step {
+            LooseWalk::Unvisited { sub, name } => out.extend(loose_id(sub, name, hexsz)),
+            LooseWalk::Entry { sub, name, .. } if skipped => out.extend(loose_id(sub, name, hexsz)),
+            LooseWalk::Entry { sub, name, .. } => visited.extend(loose_id(sub, name, hexsz)),
+            LooseWalk::Unopenable { .. } => {}
+        });
+    }
+    out.retain(|id| !visited.contains(id));
     out
 }
 

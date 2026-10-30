@@ -977,7 +977,7 @@ pub(super) fn open_idx_and_pack(
 /// The bounds depend on the *hash* the reader was told to use, which is why
 /// `--object-format=sha256` over a sha1 index reports a wrong size and then
 /// refuses to open it. Nothing is printed for a file that passes every check.
-fn report_bad_idx_size(index_path: &Path, hash: Kind) {
+pub(super) fn report_bad_idx_size(index_path: &Path, hash: Kind) {
     let Ok(data) = fs::read(index_path) else { return };
     let path = index_path.display();
     let hashsz = hash.len_in_bytes();

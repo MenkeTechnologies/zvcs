@@ -111,12 +111,14 @@
 //!     files once it's clear what this does`), so a layer cannot even be read
 //!     back correctly, let alone merged.
 //!
-//! `verify` uses `verify_integrity_fast`, which is the exact scope of git's
-//! `verify_midx_file`: trailing checksum, fan-out monotonicity, OID ordering,
-//! and every recorded pack offset checked against the referenced `.idx` —
-//! without traversing pack data. Failure exits 1 like git; the diagnostic text
-//! on stderr is gitoxide's, not git's `incorrect checksum` / `incorrect object
-//! offset for oid[N] = ...` wording.
+//! `verify` is a port of `midx.c`'s `verify_midx_file()` over its own port of
+//! `load_multi_pack_index()` — the single file or the incremental chain, with
+//! the loader's `error()`, `warning()` and `die()` lines: the trailing
+//! checksum, every pack the midx names, the OID order and every object's
+//! offset against its pack's `.idx`, each problem a `midx_report()` line in
+//! the order libc's `qsort()` groups the objects by pack, with git's four
+//! meters under `--progress` (on by default when stderr is a terminal).
+//! `git fsck` runs it as a child for every source it scans.
 
 use anyhow::{bail, Result};
 use std::fs;
@@ -279,7 +281,8 @@ pub(super) const REPACK_OPTS: &[LongOpt] = &[
 ///
 /// Supported forms (stdout, exit code and resulting MIDX file matching stock git):
 ///   * `git multi-pack-index write`      → `<objdir>/pack/multi-pack-index`
-///   * `git multi-pack-index verify`     → silent, exit 0 (exit 1 on damage)
+///   * `git multi-pack-index verify`     → silent, exit 0 (exit 1 on damage, with
+///     `verify_midx_file()`'s reports and meters)
 ///   * `git multi-pack-index expire`     → silent, exit 0; drops packs the MIDX
 ///     no longer resolves any object to and rewrites the MIDX if it dropped any
 ///   * `git multi-pack-index compact <from> <to>` → endpoint resolution and its
@@ -288,8 +291,8 @@ pub(super) const REPACK_OPTS: &[LongOpt] = &[
 ///     the packs the fill step picks into one new pack and rewrites the MIDX,
 ///     leaving the old packs for `expire`
 ///   * `--object-dir=<dir>` / `--object-dir <dir>` / `--no-object-dir` on any
-///   * `--progress` / `--no-progress` (accepted; progress is discarded, git's
-///     own progress goes to stderr and never to stdout)
+///   * `--progress` / `--no-progress` (`verify` draws git's meters; every other
+///     sub-command accepts and discards them)
 ///   * `-h` at the top level and on every sub-command
 ///
 /// `write` also honours `--bitmap`, `--stdin-packs`, `--preferred-pack=` and
@@ -305,6 +308,9 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     };
 
     let mut object_dir: Option<PathBuf> = None;
+    // `opts.flags`' `MIDX_PROGRESS`, which the top level and every sub-command parse into
+    // the same bit (builtin/multi-pack-index.c).
+    let mut progress: Option<bool> = None;
     let mut subcommand: Option<&str> = None;
     let mut rest: Vec<&str> = Vec::new();
 
@@ -336,6 +342,11 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
             }
         };
         let a = resolved.as_ref();
+        match a {
+            "--progress" => progress = Some(true),
+            "--no-progress" => progress = Some(false),
+            _ => {}
+        }
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -368,7 +379,7 @@ pub fn multi_pack_index(args: &[String]) -> Result<ExitCode> {
     match subcommand {
         None => Ok(usage_error(Some("need a subcommand"), USAGE)),
         Some("write") => write(&rest, object_dir),
-        Some("verify") => verify(&rest, object_dir),
+        Some("verify") => verify(&rest, object_dir, progress),
         Some("expire") => expire(&rest, object_dir),
         Some("compact") => compact(&rest, object_dir),
         Some("repack") => repack(&rest, object_dir),
@@ -1342,7 +1353,7 @@ impl StagedMidx {
 }
 
 /// `verify`: check the MIDX against the pack indices it references.
-fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
+fn verify(rest: &[&str], mut object_dir: Option<PathBuf>, mut progress: Option<bool>) -> Result<ExitCode> {
     let mut after_dd = false;
     let mut it = rest.iter().copied();
     while let Some(orig) = it.next() {
@@ -1370,6 +1381,11 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
             }
         };
         let a = resolved.as_ref();
+        match a {
+            "--progress" => progress = Some(true),
+            "--no-progress" => progress = Some(false),
+            _ => {}
+        }
         match take_common(a, &mut it, &mut object_dir)? {
             Common::Consumed => continue,
             Common::MissingValue(name) => {
@@ -1393,23 +1409,27 @@ fn verify(rest: &[&str], mut object_dir: Option<PathBuf>) -> Result<ExitCode> {
         }
     }
 
-    let (_repo, pack_dir) = object_store(object_dir)?;
-    let midx = pack_dir.join("multi-pack-index");
+    let (repo, pack_dir) = object_store(object_dir)?;
+    // `cmd_multi_pack_index()` sets `MIDX_PROGRESS` when stderr is a terminal, before either
+    // parser runs.
+    let progress = progress.unwrap_or_else(|| std::io::IsTerminal::is_terminal(&std::io::stderr()));
+    let label = source_label(&repo, &pack_dir);
+    verify_midx_file(&pack_dir, &format!("{label}/pack"), repo.object_hash(), progress)
+}
 
-    // No MIDX is not an error for git: `verify_midx_file()` returns 0 silently.
-    if !midx.exists() {
-        return Ok(ExitCode::SUCCESS);
-    }
-
-    let file = multi_index::File::at(&midx, None)?;
-    match file.verify_integrity_fast(&mut gix::progress::Discard, &AtomicBool::new(false)) {
-        Ok(_) => Ok(ExitCode::SUCCESS),
-        Err(e) => {
-            // git reports each problem via `error()` and exits 1.
-            eprintln!("error: {e}");
-            Ok(ExitCode::from(1))
-        }
-    }
+/// How git spells the object directory `<pack_dir>/..` in a message: the path
+/// `odb_find_source()` matched, which for a repository with a worktree is the
+/// `.git/objects` setup reaches from the top of it.
+pub(crate) fn source_label(repo: &gix::Repository, pack_dir: &Path) -> String {
+    let objdir = pack_dir.parent().unwrap_or(pack_dir);
+    let real = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let objdir = real(objdir);
+    repo.workdir()
+        .map(real)
+        .and_then(|work| objdir.strip_prefix(work).ok().map(Path::to_path_buf))
+        .unwrap_or(objdir)
+        .display()
+        .to_string()
 }
 
 /// `expire`: drop every pack the MIDX no longer names an object in.
@@ -2291,6 +2311,729 @@ fn usage_error(msg: Option<&str>, usage: &str) -> ExitCode {
 fn value_error(msg: &str) -> ExitCode {
     eprintln!("error: {msg}");
     ExitCode::from(129)
+}
+
+// ===========================================================================
+// `midx.c`: loading a multi-pack-index, and `verify_midx_file()`
+// ===========================================================================
+
+const MIDX_SIGNATURE: u32 = 0x4d49_4458;
+const MIDX_VERSION_V1: u8 = 1;
+const MIDX_VERSION_V2: u8 = 2;
+const MIDX_HEADER_SIZE: usize = 12;
+const MIDX_CHUNK_ALIGNMENT: u64 = 4;
+const CHUNK_TOC_ENTRY_SIZE: usize = 12;
+const MIDX_CHUNK_OFFSET_WIDTH: usize = 8;
+const MIDX_LARGE_OFFSET_NEEDED: u32 = 0x8000_0000;
+const MIDX_CHUNKID_PACKNAMES: u32 = 0x504e_414d;
+const MIDX_CHUNKID_OIDFANOUT: u32 = 0x4f49_4446;
+const MIDX_CHUNKID_OIDLOOKUP: u32 = 0x4f49_444c;
+const MIDX_CHUNKID_OBJECTOFFSETS: u32 = 0x4f4f_4646;
+const MIDX_CHUNKID_LARGEOFFSETS: u32 = 0x4c4f_4646;
+/// `SPARSE_PROGRESS_INTERVAL` (midx.c:915-920).
+const SPARSE_PROGRESS_INTERVAL: usize = 1 << 12;
+
+/// What loading a multi-pack-index printed, in order — `error()` and `warning()` lines with
+/// their prefixes — and the `die()` message that ended it, if one did.
+#[derive(Default)]
+pub(crate) struct MidxLog {
+    pub(crate) lines: Vec<String>,
+    pub(crate) died: Option<String>,
+}
+
+/// One loaded `struct multi_pack_index` layer: the file and where its chunks sit in it.
+struct MidxLayer {
+    data: Vec<u8>,
+    hash_len: usize,
+    num_objects: u32,
+    num_packs: u32,
+    pack_names: Vec<String>,
+    fanout: usize,
+    lookup: usize,
+    offsets: usize,
+    /// `chunk_large_offsets` and its length.
+    large: Option<(usize, usize)>,
+    num_objects_in_base: u32,
+    num_packs_in_base: u32,
+}
+
+fn be32(data: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(data[at..at + 4].try_into().expect("four bytes"))
+}
+
+fn be64(data: &[u8], at: usize) -> u64 {
+    u64::from_be_bytes(data[at..at + 8].try_into().expect("eight bytes"))
+}
+
+/// `oid_version()` (chunk-format.c:205-215).
+fn oid_version(hash: gix::hash::Kind) -> u8 {
+    match hash {
+        gix::hash::Kind::Sha256 => 2,
+        _ => 1,
+    }
+}
+
+/// `read_table_of_contents()` (chunk-format.c:104-164): each chunk's id, start and size, or
+/// `None` after the `error()` it printed. `Err` for a table that runs past the end of the
+/// file, which git reads out of its mapping without a check.
+fn read_table_of_contents(
+    data: &[u8],
+    toc_offset: usize,
+    toc_length: usize,
+    rawsz: usize,
+    log: &mut MidxLog,
+) -> Result<Option<Vec<(u32, usize, usize)>>> {
+    if toc_offset + (toc_length + 1) * CHUNK_TOC_ENTRY_SIZE > data.len() {
+        bail!("a multi-pack-index chunk table past the end of its file is not ported");
+    }
+    let mut chunks: Vec<(u32, usize, usize)> = Vec::new();
+    let mut at = toc_offset;
+    for _ in 0..toc_length {
+        let chunk_id = be32(data, at);
+        let chunk_offset = be64(data, at + 4);
+        if chunk_id == 0 {
+            log.lines.push("error: terminating chunk id appears earlier than expected".into());
+            return Ok(None);
+        }
+        if chunk_offset % MIDX_CHUNK_ALIGNMENT != 0 {
+            log.lines.push(format!("error: chunk id {chunk_id:x} not {MIDX_CHUNK_ALIGNMENT}-byte aligned"));
+            return Ok(None);
+        }
+        at += CHUNK_TOC_ENTRY_SIZE;
+        let next_chunk_offset = be64(data, at + 4);
+        if next_chunk_offset < chunk_offset || next_chunk_offset > (data.len() - rawsz) as u64 {
+            log.lines.push(format!("error: improper chunk offset(s) {chunk_offset:x} and {next_chunk_offset:x}"));
+            return Ok(None);
+        }
+        if chunks.iter().any(|&(id, _, _)| id == chunk_id) {
+            log.lines.push(format!("error: duplicate chunk ID {chunk_id:x} found"));
+            return Ok(None);
+        }
+        chunks.push((chunk_id, chunk_offset as usize, (next_chunk_offset - chunk_offset) as usize));
+    }
+    let chunk_id = be32(data, at);
+    if chunk_id != 0 {
+        log.lines.push(format!("error: final chunk has non-zero id {chunk_id:x}"));
+        return Ok(None);
+    }
+    Ok(Some(chunks))
+}
+
+/// `load_multi_pack_index_one()` (midx.c:108-230) for the file at `path`, which `label`
+/// spells as git names it. `None` when it is absent or failed to load; a `die()` is left in
+/// `log.died`, and nothing past it is attempted.
+fn load_multi_pack_index_one(path: &Path, label: &str, hash: gix::hash::Kind, log: &mut MidxLog) -> Result<Option<MidxLayer>> {
+    let Ok(data) = fs::read(path) else {
+        return Ok(None);
+    };
+    let rawsz = hash.len_in_bytes();
+    if data.len() < MIDX_HEADER_SIZE + rawsz {
+        log.lines.push(format!("error: multi-pack-index file {label} is too small"));
+        return Ok(None);
+    }
+    let signature = be32(&data, 0);
+    if signature != MIDX_SIGNATURE {
+        log.died = Some(format!(
+            "multi-pack-index signature 0x{signature:08x} does not match signature 0x{MIDX_SIGNATURE:08x}"
+        ));
+        return Ok(None);
+    }
+    let version = data[4];
+    if version != MIDX_VERSION_V1 && version != MIDX_VERSION_V2 {
+        log.died = Some(format!("multi-pack-index version {version} not recognized"));
+        return Ok(None);
+    }
+    let hash_version = data[5];
+    if hash_version != oid_version(hash) {
+        log.lines.push(format!(
+            "error: multi-pack-index hash version {hash_version} does not match version {}",
+            oid_version(hash)
+        ));
+        return Ok(None);
+    }
+    let num_chunks = data[6] as usize;
+    let num_packs = be32(&data, 8);
+    let Some(chunks) = read_table_of_contents(&data, MIDX_HEADER_SIZE, num_chunks, rawsz, log)? else {
+        return Ok(None);
+    };
+    let chunk = |id: u32| chunks.iter().find(|&&(c, _, _)| c == id).map(|&(_, start, size)| (start, size));
+    let die = |log: &mut MidxLog, msg: &str| {
+        log.died = Some(msg.to_owned());
+        Ok(None)
+    };
+
+    let Some((names_at, names_len)) = chunk(MIDX_CHUNKID_PACKNAMES) else {
+        return die(log, "multi-pack-index required pack-name chunk missing or corrupted");
+    };
+    // `midx_read_oid_fanout()` (midx.c:51-73).
+    let fanout_ok = match chunk(MIDX_CHUNKID_OIDFANOUT) {
+        None => None,
+        Some((_, size)) if size != 4 * 256 => {
+            log.lines.push("error: multi-pack-index OID fanout is of the wrong size".into());
+            None
+        }
+        Some((at, _)) => {
+            let mut ok = Some(at);
+            for i in 0..255 {
+                let (a, b) = (be32(&data, at + 4 * i), be32(&data, at + 4 * (i + 1)));
+                if a > b {
+                    log.lines.push(format!(
+                        "error: oid fanout out of order: fanout[{i}] = {a:x} > {b:x} = fanout[{}]",
+                        i + 1
+                    ));
+                    ok = None;
+                    break;
+                }
+            }
+            ok
+        }
+    };
+    let Some(fanout) = fanout_ok else {
+        return die(log, "multi-pack-index required OID fanout chunk missing or corrupted");
+    };
+    let num_objects = be32(&data, fanout + 4 * 255);
+    // `midx_read_oid_lookup()` (midx.c:75-87).
+    let lookup = match chunk(MIDX_CHUNKID_OIDLOOKUP) {
+        Some((at, size)) if size == rawsz * num_objects as usize => Some(at),
+        Some(_) => {
+            log.lines.push("error: multi-pack-index OID lookup chunk is the wrong size".into());
+            None
+        }
+        None => None,
+    };
+    let Some(lookup) = lookup else {
+        return die(log, "multi-pack-index required OID lookup chunk missing or corrupted");
+    };
+    // `midx_read_object_offsets()` (midx.c:89-100).
+    let offsets = match chunk(MIDX_CHUNKID_OBJECTOFFSETS) {
+        Some((at, size)) if size == num_objects as usize * MIDX_CHUNK_OFFSET_WIDTH => Some(at),
+        Some(_) => {
+            log.lines.push("error: multi-pack-index object offset chunk is the wrong size".into());
+            None
+        }
+        None => None,
+    };
+    let Some(offsets) = offsets else {
+        return die(log, "multi-pack-index required object offsets chunk missing or corrupted");
+    };
+    let large = chunk(MIDX_CHUNKID_LARGEOFFSETS);
+
+    let names = &data[names_at..names_at + names_len];
+    let mut pack_names: Vec<String> = Vec::with_capacity(num_packs as usize);
+    let mut cur = 0usize;
+    for i in 0..num_packs as usize {
+        let Some(end) = names[cur..].iter().position(|&b| b == 0) else {
+            return die(log, "multi-pack-index pack-name chunk is too short");
+        };
+        let name = String::from_utf8_lossy(&names[cur..cur + end]).into_owned();
+        cur += end + 1;
+        if version == MIDX_VERSION_V1 && i > 0 && name.as_bytes() <= pack_names[i - 1].as_bytes() {
+            return die(
+                log,
+                &format!("multi-pack-index pack names out of order: '{}' before '{name}'", pack_names[i - 1]),
+            );
+        }
+        pack_names.push(name);
+    }
+    Ok(Some(MidxLayer {
+        data,
+        hash_len: rawsz,
+        num_objects,
+        num_packs,
+        pack_names,
+        fanout,
+        lookup,
+        offsets,
+        large,
+        num_objects_in_base: 0,
+        num_packs_in_base: 0,
+    }))
+}
+
+/// `load_multi_pack_index_chain()` (midx.c:255-397) under `<pack>/multi-pack-index.d`: the
+/// layers it loaded, base first, which stop short of the chain file where a line is not a
+/// hash or a layer will not load.
+fn load_multi_pack_index_chain(pack_dir: &Path, label: &str, hash: gix::hash::Kind, log: &mut MidxLog) -> Result<Vec<MidxLayer>> {
+    let mut chain: Vec<MidxLayer> = Vec::new();
+    let Ok(file) = fs::read(pack_dir.join("multi-pack-index.d/multi-pack-index-chain")) else {
+        return Ok(chain);
+    };
+    let hexsz = hash.len_in_hex();
+    // `open_multi_pack_index_chain()`: an empty file is a missing one.
+    if file.len() < hexsz {
+        if !file.is_empty() {
+            log.lines.push("warning: multi-pack-index chain file too small".into());
+        }
+        return Ok(chain);
+    }
+    let count = file.len() / (hexsz + 1);
+    let mut lines = file.split_inclusive(|&b| b == b'\n');
+    for _ in 0..count {
+        let Some(line) = lines.next() else { break };
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        // `get_oid_hex_algop()` reads the first `hexsz` digits and ignores the rest.
+        let Some(layer) = line.get(..hexsz).and_then(|hex| gix::ObjectId::from_hex(hex).ok()) else {
+            log.lines.push(format!(
+                "warning: invalid multi-pack-index chain: line '{}' not a hash",
+                String::from_utf8_lossy(line)
+            ));
+            break;
+        };
+        let name = format!("multi-pack-index-{layer}.midx");
+        let path = pack_dir.join("multi-pack-index.d").join(&name);
+        let layer_label = format!("{label}.d/{name}");
+        let loaded = load_multi_pack_index_one(&path, &layer_label, hash, log)?;
+        if log.died.is_some() {
+            return Ok(chain);
+        }
+        let mut valid = false;
+        if let Some(mut m) = loaded {
+            // `add_midx_to_chain()` (midx.c:280-306).
+            match chain.last() {
+                Some(base) if base.num_packs.checked_add(base.num_packs_in_base).is_none() => log
+                    .lines
+                    .push(format!("warning: pack count in base MIDX too high: {}", base.num_packs_in_base)),
+                Some(base) if base.num_objects.checked_add(base.num_objects_in_base).is_none() => log
+                    .lines
+                    .push(format!("warning: object count in base MIDX too high: {}", base.num_objects_in_base)),
+                base => {
+                    if let Some(base) = base {
+                        m.num_packs_in_base = base.num_packs + base.num_packs_in_base;
+                        m.num_objects_in_base = base.num_objects + base.num_objects_in_base;
+                    }
+                    chain.push(m);
+                    valid = true;
+                }
+            }
+        }
+        if !valid {
+            log.lines.push("warning: unable to find all multi-pack index files".into());
+            break;
+        }
+    }
+    Ok(chain)
+}
+
+/// `load_multi_pack_index()` (midx.c:399-413): `<pack>/multi-pack-index`, else the chain.
+/// `label` spells `<pack>/multi-pack-index` as git names it. Empty when there is none.
+pub(crate) fn load_multi_pack_index(pack_dir: &Path, label: &str, hash: gix::hash::Kind, log: &mut MidxLog) -> Result<usize> {
+    Ok(load_midx_layers(pack_dir, label, hash, log)?.len())
+}
+
+fn load_midx_layers(pack_dir: &Path, label: &str, hash: gix::hash::Kind, log: &mut MidxLog) -> Result<Vec<MidxLayer>> {
+    if let Some(m) = load_multi_pack_index_one(&pack_dir.join("multi-pack-index"), label, hash, log)? {
+        return Ok(vec![m]);
+    }
+    if log.died.is_some() {
+        return Ok(Vec::new());
+    }
+    load_multi_pack_index_chain(pack_dir, label, hash, log)
+}
+
+/// A `struct multi_pack_index` with its chain, tip last, and the pack each pack-int-id
+/// `prepare_midx_pack()` loaded.
+struct MidxChain<'a> {
+    layers: Vec<MidxLayer>,
+    pack_dir: &'a Path,
+    /// `<objdir>/pack` as git spells it in a pack's name.
+    pack_label: &'a str,
+    /// `m->packs[]` over every layer: `None` not tried yet, `Some(None)` `MIDX_PACK_ERROR`.
+    packs: Vec<Option<Option<LoadedPack>>>,
+}
+
+/// One `struct packed_git` a midx loaded.
+struct LoadedPack {
+    /// `p->pack_name`, `<objdir>/pack/pack-<hash>.pack` as git spells it.
+    name: String,
+    path: PathBuf,
+    idx_path: PathBuf,
+    /// `p->pack_size`, from `add_packed_git()`'s `stat()`.
+    size: u64,
+    /// `p->index_data`, once `open_pack_index()` loaded it.
+    idx: Option<gix::odb::pack::index::File>,
+    /// `p->pack_fd != -1`.
+    open: bool,
+}
+
+impl MidxChain<'_> {
+    fn tip(&self) -> &MidxLayer {
+        self.layers.last().expect("a loaded midx")
+    }
+
+    /// `midx_for_object()` (midx.c:420-434): the layer holding position `pos`, and the
+    /// position within it.
+    fn for_object(&self, pos: u32) -> Result<(&MidxLayer, usize)> {
+        let m = self
+            .layers
+            .iter()
+            .rev()
+            .find(|m| pos >= m.num_objects_in_base)
+            .expect("the base layer starts at 0");
+        if pos >= m.num_objects + m.num_objects_in_base {
+            return Err(crate::fatal::die("invalid MIDX object position, MIDX is likely corrupt"));
+        }
+        Ok((m, (pos - m.num_objects_in_base) as usize))
+    }
+
+    /// `nth_midxed_object_oid()` (midx.c:542-555).
+    fn oid(&self, pos: u32) -> Result<gix::ObjectId> {
+        let (m, n) = self.for_object(pos)?;
+        let at = m.lookup + m.hash_len * n;
+        Ok(gix::ObjectId::from_bytes_or_panic(&m.data[at..at + m.hash_len]))
+    }
+
+    /// `nth_midxed_pack_int_id()` (midx.c:578-584).
+    fn pack_int_id(&self, pos: u32) -> Result<u32> {
+        let (m, n) = self.for_object(pos)?;
+        Ok(m.num_packs_in_base + be32(&m.data, m.offsets + n * MIDX_CHUNK_OFFSET_WIDTH))
+    }
+
+    /// `nth_midxed_offset()` (midx.c:557-576).
+    fn offset(&self, pos: u32) -> Result<u64> {
+        let (m, n) = self.for_object(pos)?;
+        let offset32 = be32(&m.data, m.offsets + n * MIDX_CHUNK_OFFSET_WIDTH + 4);
+        match m.large {
+            Some((at, len)) if offset32 & MIDX_LARGE_OFFSET_NEEDED != 0 => {
+                let index = (offset32 ^ MIDX_LARGE_OFFSET_NEEDED) as usize;
+                if index >= len / 8 {
+                    return Err(crate::fatal::die("multi-pack-index large offset out of bounds"));
+                }
+                Ok(be64(&m.data, at + 8 * index))
+            }
+            _ => Ok(u64::from(offset32)),
+        }
+    }
+
+    /// `bsearch_midx()` (midx.c:531-540): every layer from the tip down, each through
+    /// `bsearch_hash()` (hash-lookup.c:107-134).
+    fn bsearch(&self, oid: &gix::oid) -> Option<u32> {
+        let hash = oid.as_bytes();
+        for m in self.layers.iter().rev() {
+            let fan = |i: usize| be32(&m.data, m.fanout + 4 * i);
+            let mut hi = fan(hash[0] as usize);
+            let mut lo = if hash[0] == 0 { 0 } else { fan(hash[0] as usize - 1) };
+            while lo < hi {
+                let mi = lo + (hi - lo) / 2;
+                let at = m.lookup + mi as usize * m.hash_len;
+                match m.data[at..at + m.hash_len].cmp(hash) {
+                    std::cmp::Ordering::Equal => return Some(mi + m.num_objects_in_base),
+                    std::cmp::Ordering::Greater => hi = mi,
+                    std::cmp::Ordering::Less => lo = mi + 1,
+                }
+            }
+        }
+        None
+    }
+
+    /// `prepare_midx_pack()` (midx.c:456-485) through `add_packed_git()` (packfile.c:710-776):
+    /// the pack loads when its name is an `.idx` and its `.pack` is a regular file.
+    /// Returns whether it failed.
+    fn prepare_pack(&mut self, pack_int_id: u32) -> Result<bool> {
+        let total = self.tip().num_packs + self.tip().num_packs_in_base;
+        let m = self
+            .layers
+            .iter()
+            .rev()
+            .find(|m| pack_int_id >= m.num_packs_in_base)
+            .expect("the base layer starts at 0");
+        if pack_int_id >= m.num_packs + m.num_packs_in_base {
+            return Err(crate::fatal::die(format!("bad pack-int-id: {pack_int_id} ({total} total packs)")));
+        }
+        if let Some(state) = &self.packs[pack_int_id as usize] {
+            return Ok(state.is_none());
+        }
+        let name = &m.pack_names[(pack_int_id - m.num_packs_in_base) as usize];
+        let loaded = name.strip_suffix(".idx").and_then(|base| {
+            let path = self.pack_dir.join(format!("{base}.pack"));
+            let meta = fs::metadata(&path).ok().filter(|meta| meta.is_file())?;
+            Some(LoadedPack {
+                name: format!("{}/{base}.pack", self.pack_label),
+                idx_path: self.pack_dir.join(name),
+                path,
+                size: meta.len(),
+                idx: None,
+                open: false,
+            })
+        });
+        let failed = loaded.is_none();
+        self.packs[pack_int_id as usize] = Some(loaded);
+        Ok(failed)
+    }
+
+    fn pack(&mut self, pack_int_id: u32) -> Option<&mut LoadedPack> {
+        self.packs.get_mut(pack_int_id as usize)?.as_mut()?.as_mut()
+    }
+}
+
+impl LoadedPack {
+    /// `open_pack_index()` (packfile.c:265-283): load the `.idx` once, after
+    /// `check_packed_git_idx()`'s `error()` when it will not load.
+    fn open_index(&mut self, hash: gix::hash::Kind) -> bool {
+        if self.idx.is_some() {
+            return true;
+        }
+        match gix::odb::pack::index::File::at(&self.idx_path, hash) {
+            Ok(idx) => {
+                self.idx = Some(idx);
+                true
+            }
+            Err(_) => {
+                super::index_pack::report_bad_idx_size(&self.idx_path, hash);
+                false
+            }
+        }
+    }
+
+    /// `is_pack_valid()` (packfile.c:1785-1794), which is `open_packed_git_1()`
+    /// (packfile.c:529-596) on a pack whose descriptor is closed.
+    fn is_valid(&mut self, hash: gix::hash::Kind) -> bool {
+        if self.open {
+            return true;
+        }
+        if !self.open_index(hash) {
+            eprintln!("error: packfile {} index unavailable", self.name);
+            return false;
+        }
+        let Ok(data) = fs::read(&self.path) else {
+            return false;
+        };
+        let name = &self.name;
+        if data.len() as u64 != self.size {
+            eprintln!("error: packfile {name} size changed");
+            return false;
+        }
+        if data.len() < 12 {
+            eprintln!("error: file {name} is far too short to be a packfile");
+            return false;
+        }
+        if &data[..4] != b"PACK" {
+            eprintln!("error: file {name} is not a GIT packfile");
+            return false;
+        }
+        let version = be32(&data, 4);
+        if version != 2 && version != 3 {
+            eprintln!("error: packfile {name} is version {version} and not supported (try upgrading GIT to a newer version)");
+            return false;
+        }
+        let idx = self.idx.as_ref().expect("opened above");
+        let entries = be32(&data, 8);
+        if entries != idx.num_objects() {
+            eprintln!(
+                "error: packfile {name} claims to have {entries} objects while index indicates {} objects",
+                idx.num_objects()
+            );
+            return false;
+        }
+        let hashsz = hash.len_in_bytes();
+        if data.len() < hashsz {
+            eprintln!("error: packfile {name} signature is unavailable");
+            return false;
+        }
+        if data[data.len() - hashsz..] != *idx.pack_checksum().as_bytes() {
+            eprintln!("error: packfile {name} does not match index");
+            return false;
+        }
+        self.open = true;
+        true
+    }
+}
+
+/// A `start_sparse_progress()` meter: `stop_progress()` first displays the total when the
+/// last value displayed was not it (`finish_if_sparse()`, progress.c:325-330).
+struct SparseMeter {
+    meter: crate::progress::Meter,
+    total: usize,
+    last: Option<usize>,
+}
+
+impl SparseMeter {
+    fn new(title: &'static str, total: usize, on: bool) -> Self {
+        Self { meter: crate::progress::Meter::counted(title, total, on), total, last: None }
+    }
+
+    fn display(&mut self, n: usize) {
+        self.last = Some(n);
+        self.meter.set(n);
+    }
+
+    /// `midx_display_sparse_progress()` (midx.c:917-922).
+    fn display_sparse(&mut self, n: usize) {
+        if n & (SPARSE_PROGRESS_INTERVAL - 1) == 0 {
+            self.display(n);
+        }
+    }
+
+    fn stop(mut self) {
+        if self.last != Some(self.total) {
+            self.display(self.total);
+        }
+        self.meter.stop("done");
+    }
+}
+
+/// `verify_midx_file()` (midx.c:925-1080) for the source whose pack directory is
+/// `pack_dir`, `pack_label` spelling it as git does. Every report goes to stderr through
+/// `midx_report()`, without a prefix; the answer is the exit code.
+fn verify_midx_file(pack_dir: &Path, pack_label: &str, hash: gix::hash::Kind, progress: bool) -> Result<ExitCode> {
+    let midx_label = format!("{pack_label}/multi-pack-index");
+    let mut log = MidxLog::default();
+    let layers = load_midx_layers(pack_dir, &midx_label, hash, &mut log)?;
+    for line in &log.lines {
+        eprintln!("{line}");
+    }
+    if let Some(msg) = log.died {
+        return Err(crate::fatal::die(msg));
+    }
+    if layers.is_empty() {
+        if fs::metadata(pack_dir.join("multi-pack-index")).is_ok() {
+            eprintln!("error: multi-pack-index file exists, but failed to parse");
+            return Ok(ExitCode::from(1));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let total_packs = {
+        let tip = layers.last().expect("non-empty");
+        (tip.num_packs + tip.num_packs_in_base) as usize
+    };
+    let mut m = MidxChain {
+        layers,
+        pack_dir,
+        pack_label,
+        packs: (0..total_packs).map(|_| None).collect(),
+    };
+    let mut error = false;
+    let mut report = |line: String| {
+        error = true;
+        eprintln!("{line}");
+    };
+
+    // `midx_checksum_valid()`: `hashfile_checksum_valid()` over the tip's file.
+    {
+        let data = &m.tip().data;
+        let rawsz = hash.len_in_bytes();
+        let mut hasher = gix::hash::hasher(hash);
+        hasher.update(&data[..data.len() - rawsz]);
+        let valid = hasher.try_finalize().is_ok_and(|sum| sum.as_bytes() == &data[data.len() - rawsz..]);
+        if !valid {
+            report("incorrect checksum".into());
+        }
+    }
+
+    let mut meter = crate::progress::Meter::delayed("Looking for referenced packfiles", total_packs, progress)?;
+    for i in 0..total_packs {
+        if m.prepare_pack(i as u32)? {
+            report(format!("failed to load pack in position {i}"));
+        }
+        meter.set(i + 1);
+    }
+    meter.stop("done");
+
+    let num_objects = m.tip().num_objects as usize;
+    let in_base = m.tip().num_objects_in_base as usize;
+    if num_objects == 0 {
+        report("the midx contains no oid".into());
+        return Ok(ExitCode::from(1));
+    }
+
+    let mut meter = SparseMeter::new("Verifying OID order in multi-pack-index", num_objects - 1, progress);
+    // `for (curr = m; curr; curr = curr->base_midx)` re-checks the tip once per layer: the
+    // body never reads `curr`.
+    for _ in 0..m.layers.len() {
+        for i in 0..num_objects - 1 {
+            let oid1 = m.oid((in_base + i) as u32)?;
+            let oid2 = m.oid((in_base + i + 1) as u32)?;
+            if oid1 >= oid2 {
+                report(format!("oid lookup out of order: oid[{i}] = {oid1} >= {oid2} = oid[{}]", i + 1));
+            }
+            meter.display_sparse(i + 1);
+        }
+    }
+    meter.stop();
+
+    // Every object's pack-int-id, the tip's grouped by pack with libc's `qsort()` and
+    // `compare_pair_pos_vs_id()` (midx.c:899-912), whose `b - a` on two `uint32_t` is
+    // returned as an `int`.
+    #[repr(C)]
+    struct Pair {
+        pos: u32,
+        pack_int_id: u32,
+    }
+    extern "C" fn compare_pair_pos_vs_id(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+        // SAFETY: `qsort()` hands two elements of the `Pair` slice it was given.
+        let (a, b) = unsafe { (&*a.cast::<Pair>(), &*b.cast::<Pair>()) };
+        b.pack_int_id.wrapping_sub(a.pack_int_id) as libc::c_int
+    }
+    let mut pairs: Vec<Pair> = Vec::with_capacity(num_objects + in_base);
+    for i in 0..num_objects + in_base {
+        pairs.push(Pair { pos: i as u32, pack_int_id: m.pack_int_id(i as u32)? });
+    }
+    let mut meter = SparseMeter::new("Sorting objects by packfile", num_objects, progress);
+    meter.display(0);
+    if num_objects > 1 {
+        // SAFETY: the first `num_objects` elements of `pairs` are live, initialised `Pair`s,
+        // and the comparator only reads two of them.
+        unsafe {
+            libc::qsort(
+                pairs.as_mut_ptr().cast::<libc::c_void>(),
+                num_objects,
+                std::mem::size_of::<Pair>(),
+                Some(compare_pair_pos_vs_id),
+            );
+        }
+    }
+    meter.stop();
+
+    let mut meter = SparseMeter::new("Verifying object offsets", num_objects, progress);
+    for i in 0..num_objects + in_base {
+        // Leaving a pack closes its descriptor and its index, so a later object of the
+        // same pack opens and checks both again.
+        if i > 0 && pairs[i - 1].pack_int_id != pairs[i].pack_int_id {
+            if let Some(p) = m.pack(pairs[i - 1].pack_int_id) {
+                p.open = false;
+                p.idx = None;
+            }
+        }
+        let oid = m.oid(pairs[i].pos)?;
+        // `midx_fill_entry()` (midx.c:592-631).
+        let hit = match m.bsearch(&oid) {
+            None => None,
+            Some(pos) => {
+                let pack_int_id = m.pack_int_id(pos)?;
+                if m.prepare_pack(pack_int_id)? {
+                    None
+                } else {
+                    let valid = m.pack(pack_int_id).expect("prepared").is_valid(hash);
+                    match valid {
+                        true => Some((pack_int_id, m.offset(pos)?)),
+                        false => None,
+                    }
+                }
+            }
+        };
+        let Some((pack_int_id, m_offset)) = hit else {
+            report(format!("failed to load pack entry for oid[{}] = {oid}", pairs[i].pos));
+            continue;
+        };
+        let p = m.pack(pack_int_id).expect("prepared");
+        if !p.open_index(hash) {
+            let name = p.name.clone();
+            report(format!("failed to load pack-index for packfile {name}"));
+            break;
+        }
+        // `find_pack_entry_one()`: 0 when the index does not hold the object.
+        let idx = p.idx.as_ref().expect("opened above");
+        let p_offset = idx.lookup(oid).map_or(0, |entry| idx.pack_offset_at_index(entry));
+        if m_offset != p_offset {
+            report(format!(
+                "incorrect object offset for oid[{}] = {oid}: {m_offset:x} != {p_offset:x}",
+                pairs[i].pos
+            ));
+        }
+        meter.display_sparse(i + 1);
+    }
+    meter.stop();
+
+    Ok(ExitCode::from(u8::from(error)))
 }
 
 #[cfg(test)]

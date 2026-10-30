@@ -10223,7 +10223,9 @@ mod tests {
 
         assert!(is_empty_line(b"\n"));
         assert!(is_empty_line(b"   \t\n"));
-        assert!(is_empty_line(b"\x0b\x0c"));
+        // Vertical tab and form feed are control bytes to `sane_ctype`, not space
+        // (ctype.c:21), so `is_empty_rec()` does not call them empty.
+        assert!(!is_empty_line(b"\x0b\x0c"));
         assert!(!is_empty_line(b"}\n"));
     }
 

@@ -344,12 +344,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // The first odb read prepares every source, and `odb_source_packed_prepare()` loads
     // its multi-pack-index first (odb/source-packed.c:832-853): a file
     // `load_multi_pack_index_one()` dies on (midx.c:146-217) ends the command there,
-    // ahead of every object line. One it gives up on with an `error()` is tried again on
-    // every later prepare, which prints the line each time; how many prepares this run
-    // makes is not modelled, so that case is refused.
+    // ahead of every object line. One it gives up on with an `error()` is never stored,
+    // so every later prepare tries it again and prints the line again; see [`MidxRetry`].
     let midx_on = repo.config_snapshot().boolean("core.multiPackIndex") != Some(false);
+    let mut midx_retry = MidxRetry::default();
     if midx_on {
-        for objdir in odb_sources(&repo) {
+        let sources = odb_sources(&repo);
+        for objdir in &sources {
             let pack_dir = objdir.join("pack");
             let label = format!("{}/pack/multi-pack-index", super::multi_pack_index::source_label(&repo, &pack_dir));
             let mut log = super::multi_pack_index::MidxLog::default();
@@ -360,12 +361,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 }
                 return Err(crate::fatal::die(msg));
             }
-            if !log.lines.is_empty() {
+            if log.lines.is_empty() {
+                continue;
+            }
+            if let Some(why) = midx_retry_unmodelled(&repo, &opt, sources.len()) {
                 bail!(
-                    "refusing to guess the output: git prints `{}` on every odb prepare that retries this multi-pack-index",
+                    "refusing to guess the output: git prints `{}` on every odb prepare that retries this multi-pack-index, and {why}",
                     log.lines[0]
                 );
             }
+            midx_retry.lines = log.lines;
         }
     }
 
@@ -402,11 +407,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // error bit, and `default_refs` is left alone so the head set stays
             // empty.
             Some(id) if !repo.has_object(id) => {
+                midx_retry.parse_object_miss();
                 die_if_unreadable_loose(&repo, id)?;
                 eprintln!("error: {arg}: invalid sha1 pointer {id}");
                 errors |= ERROR_REACHABLE;
             }
             Some(id) => {
+                midx_retry.read();
                 // `parse_object()` on a loose file that exists but will not inflate dies
                 // (`loose object … is corrupt`) while the arguments are still being read,
                 // ahead of every object check below.
@@ -482,8 +489,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             &promisor,
             &mut errors,
             &mut snapshot_missed,
+            &mut midx_retry,
         )?;
     }
+    // `cmd_fsck()`'s `odb_reprepare()` after the snapshot (builtin/fsck.c:927-928).
+    midx_retry.reprepare();
 
     // ---- 3. every object in the odb ----------------------------------------
     //
@@ -1335,8 +1345,29 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `object_array_pop()` hands `traverse_one_object()`, whatever that walk
     // made of it.
     let mut connectivity = crate::progress::Meter::delayed("Checking connectivity", 0, show_progress)?;
+    let walk_midx: Vec<(PathBuf, Option<SourceMidx>)> = match midx_on {
+        true => odb_sources(&repo)
+            .into_iter()
+            .map(|objdir| {
+                let midx = SourceMidx::open(&objdir.join("pack"), repo.object_hash()).flatten();
+                (objdir, midx)
+            })
+            .collect(),
+        false => Vec::new(),
+    };
     while let Some((id, expected)) = queue.pop() {
         'traverse: {
+            // A tree entry's blob, and an index entry's, is `lookup_blob()`'s object, typed
+            // `OBJ_BLOB` without a read (fsck.c:383, builtin/fsck.c:778-788), and
+            // `traverse_one_object()` hands it to `fsck_walk()`, whose `OBJ_BLOB` case returns
+            // at once (builtin/fsck.c:174-183, fsck.c:491-492), so nothing asks the odb for it.
+            if expected == Some(Kind::Blob) || (expected.is_none() && index_blobs.contains(&id)) {
+                break 'traverse;
+            }
+            // The read below `die()`s on a bad pack-int-id, which flushes what stdout holds.
+            if midx_read_dies(&walk_midx, id) {
+                print_held_stdout(&scan_lines, &broken_links);
+            }
             let kind = match repo.find_header(id) {
                 Ok(h) => h.kind(),
                 // The odb cannot read it. Under a full scan the object is in
@@ -1558,6 +1589,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // rather than the `corrupt` set being taken as the answer.
                     // The ask is a read, and a miss re-prepares the odb.
                     let present = repo.has_object(child);
+                    if !present {
+                        midx_retry.miss();
+                    }
                     state.pack_reads.push((present.then_some(child), None));
                     if !present {
                         // `%7s` on both type names — `gix`'s `Kind` writes itself
@@ -2329,15 +2363,39 @@ fn walk_parse_commit(
             Ok(None)
         }
         Err(msg) => {
-            let mut printed = String::new();
-            for line in scan_lines.iter().map(|(_, l)| l).chain(broken_links) {
-                printed.push_str(line);
-                printed.push('\n');
-            }
-            print!("{printed}");
+            print_held_stdout(scan_lines, broken_links);
             Err(crate::fatal::die(msg))
         }
     }
+}
+
+/// What `die()` flushes when it ends the walk: the stdout lines `fsck_obj()` and
+/// `mark_object()` wrote so far, which this port still holds.
+fn print_held_stdout(scan_lines: &[(ObjectId, String)], broken_links: &[String]) {
+    let mut printed = String::new();
+    for line in scan_lines.iter().map(|(_, l)| l).chain(broken_links) {
+        printed.push_str(line);
+        printed.push('\n');
+    }
+    print!("{printed}");
+}
+
+/// Whether an odb read of `id` dies in `midx_for_pack()` on a pack-int-id past the
+/// midx's packs (midx.c:438-454). `find_pack_entry()` asks a source's midx before
+/// anything else (odb/source-packed.c:31-36), so the first source whose midx holds `id`
+/// decides, unless an earlier source answered from a loose copy. Only a single-file midx:
+/// the object database this port reads through does not load an incremental chain.
+fn midx_read_dies(sources: &[(PathBuf, Option<SourceMidx>)], id: ObjectId) -> bool {
+    let hex = id.to_hex().to_string();
+    for (objdir, midx) in sources {
+        if let Some(dies) = midx.as_ref().filter(|m| m.layers.len() == 1).and_then(|m| m.owner_dies(id)) {
+            return dies;
+        }
+        if objdir.join(&hex[..2]).join(&hex[2..]).is_file() {
+            return false;
+        }
+    }
+    false
 }
 
 /// `object.c::parse_object_buffer` for the four types, reduced to what
@@ -2574,6 +2632,7 @@ fn collect_default_heads(
     promisor: &HashSet<ObjectId>,
     errors: &mut u8,
     missed: &mut bool,
+    midx_retry: &mut MidxRetry,
 ) -> Result<usize> {
     let mut count = 0usize;
     // One `snapshot_ref()` call: `parse_object()` first, which creates the object
@@ -2590,7 +2649,15 @@ fn collect_default_heads(
                             name: &str,
                             id: ObjectId|
      -> Result<usize> {
+        // `parse_object()` of the null id that stands for an unresolvable ref returns
+        // before any source is asked (odb.c:554-555).
+        if !id.is_null() {
+            midx_retry.read();
+        }
         if !repo.has_object(id) {
+            if !id.is_null() {
+                midx_retry.parse_object_miss();
+            }
             die_if_unreadable_loose(repo, id)?;
             *missed = true;
             if promisor.contains(&id) {
@@ -4321,6 +4388,102 @@ struct PackLists {
     midx: Vec<Option<SourceMidx>>,
 }
 
+/// The `error()` lines `load_multi_pack_index()` gives up on a source's midx with
+/// (midx.c:108-217). A midx that failed to load is never stored, so every
+/// `odb_source_packed_prepare()` that runs again tries the file again and prints them
+/// again (midx.c:741-755, odb/source-packed.c:832-853). Empty when the midx loaded or
+/// there is none, and then every call is a no-op.
+///
+/// The prepares `cmd_fsck()` makes in-process are the first odb read's, which prepares
+/// the source (odb/source-packed.c:31), `odb_reprepare()` after the snapshot
+/// (builtin/fsck.c:927-928), and one per read that finds nothing, whose second read
+/// re-prepares with `ODB_PREPARE_FLUSH_CACHES` (odb.c:575-586, odb/source-packed.c:94-95).
+/// [`midx_retry_unmodelled`] refuses the runs whose reads this does not place.
+#[derive(Default)]
+struct MidxRetry {
+    lines: Vec<String>,
+    prepared: bool,
+}
+
+impl MidxRetry {
+    fn prepare(&self) {
+        for line in &self.lines {
+            eprintln!("{line}");
+        }
+    }
+
+    /// An odb read: the first one prepares the source.
+    fn read(&mut self) {
+        if !self.prepared {
+            self.prepared = true;
+            self.prepare();
+        }
+    }
+
+    /// A read the first pass over the sources did not answer.
+    fn miss(&mut self) {
+        self.read();
+        self.prepare();
+    }
+
+    /// `parse_object()` of an id no source holds (object.c:345-378): its
+    /// `odb_read_object_info()` and then its `odb_read_object()` each miss.
+    fn parse_object_miss(&mut self) {
+        self.miss();
+        self.miss();
+    }
+
+    fn reprepare(&mut self) {
+        self.prepared = true;
+        self.prepare();
+    }
+}
+
+/// Why [`MidxRetry`] cannot place this run's prepares, if it cannot: a second source,
+/// whose first read prepares it alone (odb.c:561-568); a linked worktree, whose HEAD
+/// and index this port takes outside the snapshot; promised objects, whose
+/// `is_promisor_object()` pass reads on its own; a commit-graph, whose verify child
+/// prepares in its own process; an argument `repo_get_oid()` may read for (a
+/// revision expression or an abbreviated id, object-name.c:501); and a loose object
+/// that will not open or inflate, whose failed reads interleave their own lines.
+fn midx_retry_unmodelled(repo: &gix::Repository, opt: &Options, sources: usize) -> Option<&'static str> {
+    if sources > 1 {
+        return Some("this port does not order the prepares of several sources");
+    }
+    if repo.worktrees().map(|w| !w.is_empty()).unwrap_or(false) {
+        return Some("this port does not place a linked worktree's reads");
+    }
+    if !super::rev_list::promisor_objects(repo).is_empty() {
+        return Some("this port does not place the promisor pass's reads");
+    }
+    let info = odb_sources(repo)[0].join("info");
+    if repo.config_snapshot().boolean("core.commitGraph") != Some(false)
+        && (info.join("commit-graph").exists() || info.join("commit-graphs").exists())
+    {
+        return Some("the commit-graph verify child's own prepares are not modelled");
+    }
+    let hexsz = repo.object_hash().len_in_hex();
+    for arg in &opt.objects {
+        let full_hex = arg.len() == hexsz && ObjectId::from_hex(arg.as_bytes()).is_ok();
+        let hex_like = arg.len() >= 4 && arg.bytes().all(|b| b.is_ascii_hexdigit());
+        let resolves = repo.rev_parse_single(arg.as_str()).is_ok();
+        let plain_ref = arg == "HEAD" || repo.find_reference(arg.as_str()).is_ok();
+        if !(full_hex || plain_ref || (!resolves && !hex_like)) {
+            return Some("this port does not replay the reads `repo_get_oid()` makes for this argument");
+        }
+    }
+    let mut unreadable = false;
+    for_each_loose_file_in_source(&odb_sources(repo)[0], &mut |step| match step {
+        LooseWalk::Entry { sub, name, path } => {
+            if let Some(id) = loose_id(sub, name, hexsz) {
+                unreadable |= read_loose_object(&path, "", id).is_err();
+            }
+        }
+        LooseWalk::Unopenable { .. } | LooseWalk::Unvisited { .. } => unreadable = true,
+    });
+    unreadable.then_some("this port does not interleave the failed reads of an unreadable loose object")
+}
+
 /// A source's `struct multi_pack_index`, with which of its packs `prepare_midx_pack()`
 /// has loaded (`m->packs[]`).
 struct SourceMidx {
@@ -4339,6 +4502,12 @@ impl SourceMidx {
     /// or a layer that will not load, or a chain file git warns about, whose fallbacks
     /// and warning lines are not ported.
     fn open(dir: &Path, hash: gix::hash::Kind) -> Option<Option<Self>> {
+        // A file and chain the loader gives up on leave `source->midx` NULL, so the source
+        // lists every pack itself, as one without a midx does (odb/source-packed.c:759-761).
+        let mut log = super::multi_pack_index::MidxLog::default();
+        if super::multi_pack_index::load_multi_pack_index(dir, "", hash, &mut log).ok()? == 0 && log.died.is_none() {
+            return Some(None);
+        }
         let path = dir.join("multi-pack-index");
         let layers = if path.exists() {
             vec![pack::multi_index::File::at(&path, None).ok()?]
@@ -4391,6 +4560,15 @@ impl SourceMidx {
             pack_int_id -= names.len();
         }
         unreachable!("pack-int-id beyond the midx's packs")
+    }
+
+    /// `midx_fill_entry()` on `id` (midx.c:592-610): `None` when no layer holds it, else
+    /// whether `midx_for_pack()` dies on the owner's pack-int-id, which counts the layers
+    /// below the one holding `id` (midx.c:438-454, 584-590).
+    fn owner_dies(&self, id: ObjectId) -> Option<bool> {
+        let m = self.layers.iter().rev().find(|m| m.lookup(id).is_some())?;
+        let entry = m.lookup(id)?;
+        Some(m.pack_id_and_pack_offset_at_index(entry).0 >= m.num_indices())
     }
 
     /// The pack-int-id `midx_fill_entry()` answers `id` from (midx.c:592-605):

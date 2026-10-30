@@ -69,6 +69,16 @@ pub(crate) mod index_lookup {
 
     use crate::store::{handle, handle::IntraPackLookup, types};
 
+    /// `midx_for_pack()` (midx.c:438-454), which `midx_fill_entry()` reaches through
+    /// `prepare_midx_pack()` before it trusts an object's owner: a pack-int-id past the
+    /// `num_packs` packs the midx names is `die()`, from whichever read asked.
+    fn bad_pack_int_id(pack_int_id: gix_pack::multi_index::PackIndex, num_packs: usize) {
+        if pack_int_id as usize >= num_packs {
+            eprintln!("fatal: bad pack-int-id: {pack_int_id} ({num_packs} total packs)");
+            std::process::exit(128);
+        }
+    }
+
     pub(crate) struct Outcome<'a> {
         pub object_index: handle::IndexForObjectInPack,
         pub index_file: IntraPackLookup<'a>,
@@ -115,7 +125,12 @@ pub(crate) mod index_lookup {
         pub(crate) fn contains(&self, object_id: &oid) -> bool {
             match &self.file {
                 handle::SingleOrMultiIndex::Single { index, .. } => index.lookup(object_id).is_some(),
-                handle::SingleOrMultiIndex::Multi { index, .. } => index.lookup(object_id).is_some(),
+                // `odb_has_object()` asks `find_pack_entry()` too, whose `midx_fill_entry()`
+                // checks the owner's pack-int-id before it answers (midx.c:592-610).
+                handle::SingleOrMultiIndex::Multi { index, data } => index.lookup(object_id).is_some_and(|idx| {
+                    bad_pack_int_id(index.pack_id_and_pack_offset_at_index(idx).0, data.len());
+                    true
+                }),
             }
         }
 
@@ -178,6 +193,7 @@ pub(crate) mod index_lookup {
                 }),
                 handle::SingleOrMultiIndex::Multi { index, data } => index.lookup(object_id).map(move |idx| {
                     let (pack_index, pack_offset) = index.pack_id_and_pack_offset_at_index(idx);
+                    bad_pack_int_id(pack_index, data.len());
                     Outcome {
                         object_index: handle::IndexForObjectInPack {
                             pack_id: types::PackId {

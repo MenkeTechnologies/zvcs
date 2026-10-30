@@ -912,6 +912,11 @@ fn continue_single_pick(
         Err(_) => index_tree(repo, &index)?,
     };
     let head_id = repo.head_id()?.detach();
+    // The child's author and committer lookups, which a stopped revert (no
+    // `CHERRY_PICK_HEAD` to name the author) meets in that order.
+    if let Some(code) = super::cherry_pick::continue_commit_identity(repo, git_dir, true) {
+        return Ok(Err(code));
+    }
 
     // The child is `git commit`, which refuses a commit with nothing in it: the status
     // report on stdout, the cherry-pick advice on stderr when the stop was a cherry-pick
@@ -1437,6 +1442,17 @@ fn revert_one(
     // A revert that changes nothing produces no commit; git reports this via the
     // commit machinery and exits 1.
     if merged_tree == ours_tree {
+        // `try_to_commit()` returns 1 and `do_commit()` hands the revert to
+        // `run_git_commit(MERGE_MSG, …)` (sequencer.c:1752-1756), a `git commit`
+        // child that looks the identity up before it finds nothing to commit —
+        // with `--cleanup=verbatim` unless `--cleanup` or `-s` was given
+        // (sequencer.c:1171-1174). Its death is folded to `res = !!res`
+        // (sequencer.c:2566-2571).
+        let verbatim = (cleanup.is_none() && !o.signoff)
+            || repo.config_snapshot().string("commit.cleanup").is_some_and(|v| v.to_str_lossy() == "verbatim");
+        if super::cherry_pick::continue_commit_identity(repo, repo.git_dir(), !verbatim).is_some() {
+            return Ok(Step::Failed(ExitCode::from(1)));
+        }
         if !wt.modified.is_empty() || !wt.untracked.is_empty() {
             // git finishes a no-op pick by running `git commit`, which finds
             // nothing to commit and prints the working-tree status — byte-identical

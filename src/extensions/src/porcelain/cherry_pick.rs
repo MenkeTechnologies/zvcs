@@ -1643,8 +1643,14 @@ fn pick_one(
                 );
                 return Ok(PickOutcome::Done);
             }
+            // `run_git_commit()` adds `--cleanup=verbatim` unless `--cleanup`, `-s`
+            // or `-x` was given (sequencer.c:1171-1174); the child then falls back
+            // to `commit.cleanup`, whose default without an editor strips
+            // whitespace.
+            let verbatim = (cleanup.is_none() && !opts.signoff && !opts.record_origin)
+                || repo.config_snapshot().string("commit.cleanup").is_some_and(|v| v.to_str_lossy() == "verbatim");
             return Ok(PickOutcome::Stopped(stop_empty(
-                repo, pick_id, head_id, &message,
+                repo, pick_id, head_id, &message, !verbatim,
             )?));
         }
     }
@@ -1879,7 +1885,11 @@ fn handle_verb(verb: Verb, opts: &Opts<'_>) -> Result<ExitCode> {
         return Ok(usage());
     }
 
-    let repo = crate::setup::discover()?;
+    let mut repo = crate::setup::discover()?;
+    // `--continue` commits through a `git commit` child, whose strict identity
+    // lookups are judged before the defaults it writes with are injected.
+    crate::settle_commit_identity(&mut repo);
+    let repo = repo;
     let git_dir = repo.git_dir().to_owned();
 
     match verb {
@@ -2133,6 +2143,43 @@ fn tree_from_index(repo: &gix::Repository, index: &gix::index::File) -> Result<O
     Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
 }
 
+/// The identity lookups of a `git commit` child that concludes a pick from
+/// `MERGE_MSG` — `continue_single_pick()`'s `--no-edit --cleanup=strip`
+/// (sequencer.c:5362-5378), or `run_git_commit()`'s `-F MERGE_MSG` for a pick that
+/// went empty — at the points that child makes them, all ahead of its
+/// nothing-to-commit refusal: `determine_author_info()` opens `prepare_to_commit()`
+/// (builtin/commit.c:777-778) and asks for the default author unless
+/// `CHERRY_PICK_HEAD` names one (builtin/commit.c:1365-1368) — a stopped revert has
+/// none — then the template, `MERGE_MSG` with its whitespace cleaned when the
+/// cleanup is not `verbatim` (`clean_message_contents`, builtin/commit.c:924-925),
+/// goes into `COMMIT_EDITMSG` (:911, :931) ahead of
+/// `git_committer_info(IDENT_STRICT)` (:941). The verdicts are the ones
+/// [`crate::settle_commit_identity`] took for the command. `Some` is the death's
+/// exit status; `None` leaves `COMMIT_EDITMSG` holding the template a commit that
+/// goes on keeps.
+pub(super) fn continue_commit_identity(
+    repo: &gix::Repository,
+    git_dir: &std::path::Path,
+    clean: bool,
+) -> Option<ExitCode> {
+    let (author, committer) = crate::commit_ident_verdicts();
+    let whence = super::commit::determine_whence(repo);
+    let author_given = matches!(
+        whence,
+        super::commit::Whence::CherryPick | super::commit::Whence::RebasePick
+    );
+    if let (false, Some(refusal)) = (author_given, author) {
+        return Some(refusal.die());
+    }
+    let template = std::fs::read(git_dir.join("MERGE_MSG")).unwrap_or_default();
+    let template = match clean {
+        true => super::stripspace::strip_space(&template, None),
+        false => template,
+    };
+    let _ = std::fs::write(git_dir.join("COMMIT_EDITMSG"), template);
+    committer.map(|refusal| refusal.die())
+}
+
 /// `continue_single_pick()`: finish the pick that stopped.
 ///
 /// git spawns `git commit --no-edit --cleanup=strip`, which recovers the message
@@ -2193,6 +2240,10 @@ fn continue_single_pick(
         .head_id()
         .map_err(|_| anyhow::anyhow!("HEAD does not point to a commit"))?
         .detach();
+
+    if let Some(code) = continue_commit_identity(repo, git_dir, true) {
+        return Ok(Err(code));
+    }
 
     // The child is `git commit`, and that command refuses a commit with nothing
     // in it: `!committable && !allow_empty` prints the status and the
@@ -2317,10 +2368,17 @@ fn stop_empty(
     pick_id: ObjectId,
     head_id: ObjectId,
     message: &BString,
+    clean: bool,
 ) -> Result<ExitCode> {
     let git_dir = repo.git_dir();
     crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", pick_id, "")?;
     std::fs::write(git_dir.join("MERGE_MSG"), &message[..])?;
+    // The refusal below is the `git commit` child's, which looks the identity up
+    // first. Its death is a 128 that `do_pick_commit()` folds to `res = !!res`
+    // (sequencer.c:2566-2571), so the command exits 1.
+    if continue_commit_identity(repo, git_dir, clean).is_some() {
+        return Ok(ExitCode::from(1));
+    }
 
     // ```c
     // s->hints = advice_enabled(ADVICE_STATUS_HINTS);

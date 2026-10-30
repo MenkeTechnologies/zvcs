@@ -1620,6 +1620,7 @@ pub fn fmt_ident_strict(repo: &gix::Repository, role: &str) -> Option<IdentRefus
         Some(IdentRefusal {
             role: hint.then(|| role.to_string()),
             msg,
+            date: false,
         })
     };
 
@@ -1676,12 +1677,25 @@ pub fn fmt_ident_strict(repo: &gix::Repository, role: &str) -> Option<IdentRefus
     if name.bytes().all(crud) {
         return die(false, format!("name consists only of disallowed characters: {name}"));
     }
-    if let Some(date) = env(&format!("GIT_{upper}_DATE")).filter(|s| !s.is_empty()) {
-        if crate::date::parse_date_basic(&date).is_none() {
-            return die(false, format!("invalid date format: {date}"));
-        }
+    ident_date_strict(role)
+}
+
+/// The date half of [`fmt_ident_strict`]: `fmt_ident()`'s `want_date` arm, which
+/// `die()`s when `parse_date()` refuses the `date_str` it was handed
+/// (ident.c:531-536). A caller that hands `fmt_ident()` a date of its own instead
+/// of `GIT_<ROLE>_DATE` — `git commit --date`, or the date of the commit an
+/// `--amend`/`-C` reuses — never meets it.
+pub fn ident_date_strict(role: &str) -> Option<IdentRefusal> {
+    let date = std::env::var_os(format!("GIT_{}_DATE", role.to_uppercase()))?;
+    let date = date.to_string_lossy();
+    if date.is_empty() || crate::date::parse_date_basic(&date).is_some() {
+        return None;
     }
-    None
+    Some(IdentRefusal {
+        role: None,
+        msg: format!("invalid date format: {date}"),
+        date: true,
+    })
 }
 
 /// The verdicts of `write_commit_tree()`'s `git_author_info(IDENT_STRICT)` and
@@ -1731,9 +1745,17 @@ pub fn commit_ident_verdicts() -> (Option<&'static IdentRefusal>, Option<&'stati
 pub struct IdentRefusal {
     role: Option<String>,
     msg: String,
+    /// The refusal is [`ident_date_strict`]'s: the name and the email passed.
+    date: bool,
 }
 
 impl IdentRefusal {
+    /// Whether only the date was refused, which a caller supplying its own date
+    /// never reaches.
+    pub fn is_date(&self) -> bool {
+        self.date
+    }
+
     /// Print what `fmt_ident()` prints on its way out and answer `die()`'s 128.
     pub fn die(&self) -> std::process::ExitCode {
         if let Some(role) = &self.role {

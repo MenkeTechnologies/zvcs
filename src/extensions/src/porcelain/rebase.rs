@@ -2210,7 +2210,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // short-cutting it here would diverge on everything `git am` does along the
     // way — the `Applying:` lines, the session directory, and `Patch is empty.`
     // on a commit that changes no tree.
-    let exact_replay = plan.is_some() && !apply_backend;
+    //
+    // git has no such shortcut: every pick goes through `do_pick_commit()`, whose
+    // `commit_tree_extended()` asks `git_committer_info(IDENT_STRICT)`
+    // (commit.c:1713-1714) and dies with the first pick applied and the state
+    // directory, `CHERRY_PICK_HEAD` and `MERGE_MSG` written. A committer that
+    // refusal awaits is therefore replayed through the sequencer, which stops there.
+    let exact_replay = plan.is_some() && !apply_backend && crate::commit_tree_refusal(true).is_none();
     let plan = if exact_replay { plan.unwrap_or_default() } else { Vec::new() };
 
     if exact_replay {
@@ -2642,6 +2648,14 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
 /// while the tip is still this commit becomes a new root commit rather than its
 /// child.
 fn write_synth_root(repo: &gix::Repository) -> Result<ObjectId> {
+    // `commit_tree("", 0, the_hash_algo->empty_tree, NULL, &squash_onto, NULL,
+    // NULL)` (builtin/rebase.c:1696-1697) hands over no author, so
+    // `write_commit_tree()` asks `git_author_info(IDENT_STRICT)` and then
+    // `git_committer_info(IDENT_STRICT)` (commit.c:1709-1714) before anything is
+    // written.
+    if let Some(refusal) = crate::commit_tree_refusal(false) {
+        return Err(refusal.clone().into_fatal());
+    }
     let author = repo
         .author()
         .ok_or_else(|| anyhow!("author identity is not configured"))??
@@ -5448,14 +5462,14 @@ impl<'r> Sequencer<'r> {
                     //         record_in_rewritten(&item->commit->object.oid,
                     //                             peek_command(todo_list, 1));
                     // ```
-                    // (sequencer.c:5088-5090): a recreated merge maps its original
-                    // onto the new one, exactly as a pick does.
-                    if matches!(step, Step::Next) {
-                        if let Some(oid) = item.commit {
-                            let next_is_fixup =
-                                peek_command(&list, i + 1).is_some_and(|c| c.is_fixup());
-                            rewritten::record(self.repo, &dir, oid, next_is_fixup);
-                        }
+                    // (sequencer.c:5207-5212): a recreated merge maps its original
+                    // onto the new one, exactly as a pick does. Only a reschedule
+                    // (`res < 0`) skips it; a merge that stopped (`res > 0`) is
+                    // recorded against the `HEAD` it stopped on.
+                    if let Some(oid) = item.commit {
+                        let next_is_fixup =
+                            peek_command(&list, i + 1).is_some_and(|c| c.is_fixup());
+                        rewritten::record(self.repo, &dir, oid, next_is_fixup);
                     }
                     step
                 }
@@ -5867,10 +5881,10 @@ impl<'r> Sequencer<'r> {
             write_author_script(repo, &commit)?;
             set_head(repo, Target::Object(oid), "rebase: fast-forward")?;
             if item.cmd == todo::Cmd::Reword {
-                return self.reword();
+                return self.reword(item, &commit, &short, None);
             }
             if item.cmd == todo::Cmd::Edit {
-                return self.stop_for_edit(oid, &short, item);
+                return self.stop_for_edit(oid, &short, item, None);
             }
             return Ok(Step::Next);
         }
@@ -6040,7 +6054,7 @@ impl<'r> Sequencer<'r> {
         run_commit_hooks(repo, None, new);
 
         match item.cmd {
-            todo::Cmd::Reword => self.reword(),
+            todo::Cmd::Reword => self.reword(item, &commit, &short, Some(&merge_msg)),
             // `error_with_patch(r, commit, …)` (sequencer.c:4965) is handed
             // `item->commit` — the commit being *replayed*, not the one the pick
             // just wrote. `make_patch()` puts that id in `stopped-sha` and
@@ -6048,7 +6062,7 @@ impl<'r> Sequencer<'r> {
             // of the `post-rewrite` pair and what `git show REBASE_HEAD` resolves.
             // Passing `new` here made both name the replacement, so the pair came
             // out as `<new> <new>` and `REBASE_HEAD` pointed at the wrong commit.
-            todo::Cmd::Edit => self.stop_for_edit(oid, &short, item),
+            todo::Cmd::Edit => self.stop_for_edit(oid, &short, item, Some(&merge_msg)),
             _ => Ok(Step::Next),
         }
     }
@@ -6401,6 +6415,54 @@ impl<'r> Sequencer<'r> {
         }
 
         write_author_script(repo, &commit)?;
+        // `do_merge()` concludes through `run_git_commit(git_path_merge_msg(r), …)`
+        // (sequencer.c:4452-4453), a `git commit` child handed the original's author
+        // through `read_env_script()`, whose `git_committer_info(IDENT_STRICT)`
+        // (builtin/commit.c:941) is the one lookup that can refuse. The commit is
+        // written in process below; a refusal it would meet is reproduced by running
+        // the child git runs, over the state `do_merge()` left for it: `MERGE_MSG`
+        // (sequencer.c:4320-4322), `MERGE_HEAD` and `MERGE_MODE` (:4406-4408) and
+        // merge-ort's `AUTO_MERGE`. The child's `res = !!…` is 1, which
+        // `pick_commits()` reports through `error_with_patch(…, exit_code = 1,
+        // to_amend = 0)` (sequencer.c:5213-5217).
+        if crate::commit_tree_refusal(true).is_some() {
+            let git_dir = repo.git_dir();
+            let body = super::format_patch::skip_blank_lines(&message).to_vec();
+            std::fs::write(git_dir.join("MERGE_MSG"), &body)?;
+            std::fs::write(git_dir.join("MERGE_HEAD"), format!("{merge_head}"))?;
+            std::fs::write(git_dir.join("MERGE_MODE"), "no-ff")?;
+            crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
+            self.term_clear_line();
+            // `run_git_commit()` with no flags: `-n`, `--no-gpg-sign`, `-F`,
+            // `--cleanup=verbatim` and `--allow-empty-message`, run through
+            // `run_command_silent_on_success()` (sequencer.c:1153-1188).
+            let msg_path = git_dir.join("MERGE_MSG");
+            let args: Vec<String> = vec![
+                "-n".into(),
+                "--no-gpg-sign".into(),
+                "-F".into(),
+                msg_path.display().to_string(),
+                "--cleanup=verbatim".into(),
+                "--allow-empty-message".into(),
+            ];
+            let (ok, out) = self.run_commit_capture(&args, self.author_env())?;
+            if !ok {
+                use std::io::Write;
+                let _ = std::io::stderr().write_all(&out);
+                let dir = self.dir();
+                if !dir.join("message").exists() {
+                    std::fs::write(dir.join("message"), &body)?;
+                }
+                make_patch(repo, &dir, &commit)?;
+                let short = todo::short_name(repo, original);
+                eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
+                return Ok(Step::Stop(1));
+            }
+            // The verdict is the parent's; a child that commits anyway concluded the
+            // merge itself and moved `HEAD`.
+            self.refresh_index()?;
+            return Ok(Step::Next);
+        }
         let mut author = commit.author()?.to_owned()?;
         let mut committer = self.committer.clone();
         apply_date_options(
@@ -6432,6 +6494,12 @@ impl<'r> Sequencer<'r> {
             )
             .to_string(),
         )?;
+        // That `git commit` writes the `-F MERGE_MSG` text, taken verbatim, into
+        // `COMMIT_EDITMSG` (builtin/commit.c:911-932) and leaves it there.
+        std::fs::write(
+            repo.git_dir().join("COMMIT_EDITMSG"),
+            super::format_patch::skip_blank_lines(&message),
+        )?;
         // `do_merge()` concludes through `run_git_commit()` (sequencer.c:4394),
         // i.e. a real `git commit`, which runs `post-commit`. It carries no
         // `--amend`, so there is no `post-rewrite amend` half.
@@ -6442,7 +6510,16 @@ impl<'r> Sequencer<'r> {
     /// `reword`: amend the commit just made, with the editor open on its
     /// message. git reaches this through `run_git_commit(NULL, …, EDIT_MSG |
     /// VERIFY_MSG | AMEND_MSG | ALLOW_EMPTY)`, i.e. a real `git commit --amend`.
-    fn reword(&mut self) -> Result<Step> {
+    ///
+    /// `message` is `ctx->message`, the buffer the pick committed with; a reword that
+    /// fast-forwarded never built one (`have_message` stays 0).
+    fn reword(
+        &mut self,
+        item: &todo::Item,
+        commit: &gix::Commit<'_>,
+        short: &str,
+        message: Option<&BString>,
+    ) -> Result<Step> {
         self.term_clear_line();
         let args: Vec<String> = vec![
             "--amend".into(),
@@ -6453,10 +6530,31 @@ impl<'r> Sequencer<'r> {
         let env = self.author_env();
         let code = self.run_commit(&args, env)?;
         self.refresh_index()?;
-        if code != 0 {
-            return Ok(Step::Stop(code as u8));
+        if code == 0 {
+            return Ok(Step::Next);
         }
-        Ok(Step::Next)
+        // A `git commit` that failed is `res = !!res`, i.e. `PICK_RESULT_CONFLICTS`
+        // (sequencer.c:2566-2571, 2589-2590), which `pick_one_commit()` hands to
+        // `error_with_patch(…, exit_code = 1, to_amend)`; `to_amend` holds when `HEAD`
+        // is the reworded commit itself — it fast-forwarded — or the `--root`
+        // stand-in (sequencer.c:5098-5116).
+        let head = self.repo.head_id()?.detach();
+        let to_amend = head == commit.id || Some(head) == self.st.squash_onto;
+        // `error_with_patch()` (sequencer.c:3874-3880): the `message` from
+        // `ctx->message` when the pick built one, then `make_patch()`.
+        let dir = self.dir();
+        if let Some(message) = message {
+            if !dir.join("message").exists() {
+                std::fs::write(dir.join("message"), message)?;
+            }
+        }
+        make_patch(self.repo, &dir, commit)?;
+        if to_amend {
+            self.intend_to_amend()?;
+        } else {
+            eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
+        }
+        Ok(Step::Stop(1))
     }
 
     /// `edit`: the pick landed, now hand control back to the user.
@@ -6465,10 +6563,26 @@ impl<'r> Sequencer<'r> {
     /// `error_with_patch(…, exit_code = 0, to_amend = 1)`, which records the
     /// `amend` marker `--continue` needs and returns 0 — an `edit` stop is a
     /// success, not a failure.
-    fn stop_for_edit(&mut self, at: ObjectId, short: &str, item: &todo::Item) -> Result<Step> {
+    ///
+    /// `message` is `ctx->message`, which an `edit` that fast-forwarded never built.
+    fn stop_for_edit(
+        &mut self,
+        at: ObjectId,
+        short: &str,
+        item: &todo::Item,
+        message: Option<&BString>,
+    ) -> Result<Step> {
         self.term_clear_line();
         eprintln!("Stopped at {short}...  {}", item.arg.to_str_lossy());
         let dir = self.dir();
+        // `if (ctx->have_message && !file_exists(rebase_path_message()))`
+        // (sequencer.c:3874-3877): the buffer the pick committed, sign-off and
+        // trailers included.
+        if let Some(message) = message {
+            if !dir.join("message").exists() {
+                std::fs::write(dir.join("message"), message)?;
+            }
+        }
         // `error_with_patch(…, to_amend = 1)` runs `make_patch()` first
         // (sequencer.c:3505-3507), so an `edit` stop records the same
         // `REBASE_HEAD`/`patch`/`message` a conflict stop does — that is what
@@ -6506,6 +6620,20 @@ impl<'r> Sequencer<'r> {
             self.st.ignore_date,
             self.st.committer_date_is_author_date,
         );
+
+        // `do_commit()` without `EDIT_MSG` is `try_to_commit()` in process, whose
+        // `commit_tree_extended()` is handed `HEAD`'s author (`AMEND_MSG`), so only
+        // its `git_committer_info(IDENT_STRICT)` can die (commit.c:1713-1714) — with
+        // the fixup applied and staged, and `MERGE_MSG` holding `ctx->message`, the
+        // fixup's own message (sequencer.c:2470-2471).
+        let in_process = !final_fixup || dir.join("message-fixup").exists();
+        if in_process {
+            if let Some(refusal) = crate::commit_tree_refusal(true) {
+                std::fs::write(repo.git_dir().join("MERGE_MSG"), commit.message_raw()?)?;
+                let _ = refusal.die();
+                return Ok(Step::Stop(128));
+            }
+        }
 
         if !final_fixup {
             // Mid-chain: no editor, the message is the running combination.
@@ -6557,7 +6685,17 @@ impl<'r> Sequencer<'r> {
         } else {
             let squash_msg = repo.git_dir().join("SQUASH_MSG");
             std::fs::copy(dir.join("message-squash"), &squash_msg)?;
-            let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
+            // `unlink(git_path_merge_msg(r))` (sequencer.c:2448) runs before the
+            // merge, and the merge writes `ctx->message` — the squashed commit's own
+            // message — back to `MERGE_MSG` (sequencer.c:2470-2471), so the
+            // `git commit` below finds one, which is what its status block reads as a
+            // rebase in progress (wt-status.c:1617-1619).
+            std::fs::write(repo.git_dir().join("MERGE_MSG"), commit.message_raw()?)?;
+            // `do_commit()` with `EDIT_MSG` skips `try_to_commit()` and records the
+            // squashed commit as `REBASE_HEAD` before it runs `git commit`
+            // (sequencer.c:1752-1756); nothing takes it off again.
+            let oid = commit.id;
+            crate::sequencer::write_state_oid(repo, "REBASE_HEAD", oid, "rebase")?;
             self.term_clear_line();
             let args: Vec<String> = vec![
                 "-n".into(),
@@ -6572,7 +6710,18 @@ impl<'r> Sequencer<'r> {
             let code = self.run_commit(&args, env)?;
             self.refresh_index()?;
             if code != 0 {
-                return Ok(Step::Stop(code as u8));
+                // `res = !!res` makes a failed `git commit` `PICK_RESULT_CONFLICTS`
+                // (sequencer.c:2566-2571), which a fixup/squash reports through
+                // `error_failed_squash()` (sequencer.c:5094-5097, 3911-3926):
+                // `message-squash` becomes `message` and replaces `MERGE_MSG`, then
+                // `error_with_patch(…, exit_code = 1, to_amend = 1)`.
+                let merge_msg = repo.git_dir().join("MERGE_MSG");
+                std::fs::copy(dir.join("message-squash"), dir.join("message"))?;
+                let _ = std::fs::remove_file(&merge_msg);
+                std::fs::copy(dir.join("message"), &merge_msg)?;
+                make_patch(repo, &dir, commit)?;
+                self.intend_to_amend()?;
+                return Ok(Step::Stop(1));
             }
         }
         for f in ["message-fixup", "message-squash", "current-fixups"] {
@@ -7002,8 +7151,13 @@ impl<'r> Sequencer<'r> {
             use std::io::Write;
             let _ = err.write_all(&out.1);
         }
-        // `error_with_patch(r, commit, arg, arg_len, opts, res = 1, to_amend = 0)`.
-        make_patch(repo, &self.dir(), commit)?;
+        // `error_with_patch(r, commit, arg, arg_len, opts, res = 1, to_amend = 0)`,
+        // whose `ctx->message` is written ahead of `make_patch()` (sequencer.c:3874-3880).
+        let dir = self.dir();
+        if !dir.join("message").exists() {
+            std::fs::write(dir.join("message"), message)?;
+        }
+        make_patch(repo, &dir, commit)?;
         eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
         Ok(Step::Stop(1))
     }
@@ -7225,16 +7379,15 @@ fn make_patch(repo: &gix::Repository, dir: &std::path::Path, commit: &gix::Commi
     std::fs::write(dir.join("patch"), stopped_patch(repo, commit, parent)?)?;
     let message = dir.join("message");
     if !message.exists() {
-        // The file holds the commit message from its subject onward, ending in a
-        // single newline — measured against stock 2.55.0, whose `message` after a
-        // stop on `subj\n\nbody\n` is those bytes exactly, with no blank line
-        // appended. Leading blank lines are dropped the way
-        // `find_commit_subject()` drops them.
+        // Only a stop with no `ctx->message` gets here (`error_with_patch()` wrote
+        // that buffer first, sequencer.c:3874-3877): an `edit` or `reword` that
+        // fast-forwarded. The file is the commit message from its subject onward,
+        // `find_commit_subject()` dropping the leading blank lines, and
+        // `write_message(…, append_eol = 1)` adds a newline of its own
+        // (sequencer.c:3830-3836, 580) — so `subj\n` is written as `subj\n\n`.
         let raw = commit.message_raw()?;
         let mut body = super::format_patch::skip_blank_lines(&raw).to_vec();
-        if !body.ends_with(b"\n") {
-            body.push(b'\n');
-        }
+        body.push(b'\n');
         std::fs::write(message, body)?;
     }
     Ok(())
@@ -7273,7 +7426,14 @@ fn stopped_patch(
     if parent.is_none() {
         return Ok(Vec::new());
     }
-    let root_entries = |tree: ObjectId| -> Result<HashMap<BString, (u16, ObjectId)>> {
+    // A merge takes the `is_merge` arm, where neither `remerge_diff`,
+    // `combine_merges` nor `separate_merges` is set on a `rev_info` that
+    // `setup_revisions()` never saw, so it `return 0`s with nothing written
+    // (log-tree.c:1221-1242): a `merge` command's stop leaves a zero-byte patch.
+    if commit.parent_ids().nth(1).is_some() {
+        return Ok(Vec::new());
+    }
+    let root_entries =|tree: ObjectId| -> Result<HashMap<BString, (u16, ObjectId)>> {
         Ok(repo
             .find_tree(tree)?
             .decode()?
@@ -7447,6 +7607,13 @@ fn sign_off(
 ) -> Result<BString> {
     if !signoff {
         return Ok(message.clone());
+    }
+    // `append_signoff()` names the committer through `fmt_name(WANT_COMMITTER_IDENT)`
+    // (sequencer.c:5814), an `fmt_ident(…, IDENT_STRICT | IDENT_NO_DATE)`
+    // (ident.c:560-561) that dies over the committer `commit_tree()` would refuse —
+    // ahead of the merge, so the pick leaves nothing applied.
+    if let (_, Some(refusal)) = crate::commit_ident_verdicts() {
+        return Err(refusal.clone().into_fatal());
     }
     let Ok(mut text) = String::from_utf8(message.to_vec()) else {
         bail!("--signoff on a non-UTF-8 commit message is not ported");

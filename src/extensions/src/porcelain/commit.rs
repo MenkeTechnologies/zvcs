@@ -1365,12 +1365,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `author_message` — the `-C`/`-c`/`--amend` commit, or `CHERRY_PICK_HEAD` for a
     // pick being concluded, unless `--reset-author` (builtin/commit.c:1353-1368) — nor
     // `--author` named one (builtin/commit.c:643-674).
-    let author_given = author_arg.is_some()
-        || (!reset_author
-            && (reuse_arg.is_some()
-                || (amend && fixup_arg.is_none())
-                || whence.is_cherry_pick()
-                || whence.is_rebase()));
+    let author_message = !reset_author
+        && (reuse_arg.is_some()
+            || (amend && fixup_arg.is_none())
+            || whence.is_cherry_pick()
+            || whence.is_rebase());
 
     // `check_fixup_reword_options()` (builtin/commit.c:1295-1307), called while
     // `--fixup=reword:` is parsed (:1399-1401): a reword records no content, so
@@ -1708,6 +1707,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // `determine_author_info()` runs it from inside `prepare_to_commit()`, after
     // the index has been refreshed and the tree written, so an unparsable date is
     // deferred with the same mechanism an unreadable `-F` file is.
+    // `determine_author_info()` dies over an unparsable `--date` itself
+    // (builtin/commit.c:676-679), ahead of the `-F` read and the lookups the rest of
+    // `prepare_to_commit()` makes, so it is kept apart from them as well.
+    let mut date_fatal: Option<String> = None;
     let date_override: Option<gix::date::Time> = match &date_arg {
         Some(d) => match crate::date::parse_date_basic(d) {
             Some(time) => Some(time),
@@ -1715,6 +1718,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 (seconds, false) => Some(gix::date::Time::new(seconds, 0)),
                 (_, true) => {
                     deferred_fatal.get_or_insert_with(|| format!("invalid date format: {d}"));
+                    date_fatal = Some(format!("invalid date format: {d}"));
                     None
                 }
             },
@@ -1896,10 +1900,26 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // "This checks and barfs if author is badly specified": `determine_author_info()`
     // opens `prepare_to_commit()` (builtin/commit.c:777-778), after `prepare_index()`
     // and ahead of the `pre-commit` hook; its `die()` rolls the staging back.
-    if !author_given {
-        if let Some(refusal) = author_refusal {
-            return Ok(refusal.die());
+    // Inside it the `--date` parse comes first, then `fmt_ident(name, email,
+    // WANT_AUTHOR_IDENT, date, IDENT_STRICT)` (builtin/commit.c:676-684), whose name
+    // and email are the reused commit's or `--author`'s when either named one, and
+    // whose date is the reused commit's, else `--date`'s, else `GIT_AUTHOR_DATE` —
+    // the only one `fmt_ident()` can refuse (ident.c:531-536).
+    if let Some(msg) = date_fatal {
+        crate::git_fatal!("{msg}");
+    }
+    let author_refusal = if author_message {
+        None
+    } else if author_arg.is_some() {
+        match date_override {
+            Some(_) => None,
+            None => crate::ident_date_strict("Author"),
         }
+    } else {
+        author_refusal.filter(|refusal| !(refusal.is_date() && date_override.is_some())).cloned()
+    };
+    if let Some(refusal) = author_refusal {
+        return Ok(refusal.die());
     }
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
@@ -2247,6 +2267,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // the editor and the `--trailer` pass both see it — `append_signoff()`
     // (sequencer.c) called from `prepare_to_commit()`.
     if signoff {
+        // `append_signoff()` names the committer through `fmt_name(WANT_COMMITTER_IDENT)`,
+        // an `fmt_ident(…, IDENT_STRICT)` (sequencer.c:5814, ident.c:560-561): it
+        // dies over the committer `:941` would refuse, with `COMMIT_EDITMSG` opened
+        // (`fopen_for_writing()`, builtin/commit.c:911) and nothing written to it yet.
+        if let Some(refusal) = committer_refusal {
+            std::fs::write(repo.git_dir().join("COMMIT_EDITMSG"), b"")?;
+            return Ok(refusal.die());
+        }
         let committer = repo
             .committer()
             .transpose()?
@@ -2272,8 +2300,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
     // "This checks if committer ident is explicitly given" —
     // `git_committer_info(IDENT_STRICT)` (builtin/commit.c:940-941), right after the
-    // template is written and before any hook sees the message.
+    // template is written and before any hook sees the message. The template went
+    // into `COMMIT_EDITMSG` at :931, and `die()`'s `exit()` flushes it there.
     if let Some(refusal) = committer_refusal {
+        std::fs::write(repo.git_dir().join("COMMIT_EDITMSG"), crate::rawarg::to_bytes(&buf))?;
         return Ok(refusal.die());
     }
 

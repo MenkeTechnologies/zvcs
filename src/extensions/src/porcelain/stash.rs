@@ -546,6 +546,14 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
     // it saves fine with `user.useConfigOnly` set and nothing configured.
     let mut repo = crate::setup::discover()?;
     crate::ensure_reflog_identity(&mut repo);
+    // `do_push_stash()` gets its commits from `do_create_stash()`, whose
+    // `prepare_fallback_ident("git stash", "git@stash")` (builtin/stash.c:1521) sets the
+    // environment for the rest of the process: the `refs/stash` entry
+    // `do_store_stash()` logs and the reset that follows it are written under the
+    // fallback too.
+    if matches!(args.first().map(String::as_str), None | Some("push" | "save")) {
+        crate::prepare_fallback_ident(&mut repo, "git stash", "git@stash");
+    }
 
     match args.first().map(String::as_str) {
         None => {
@@ -1562,6 +1570,13 @@ fn build_stash_commit(
     message: Option<&str>,
     opts: &PushOpts,
 ) -> Result<StashBuild> {
+    // `prepare_fallback_ident("git stash", "git@stash")` (builtin/stash.c:1521) opens
+    // `do_create_stash()`. A merge, rebase or `checkout -m` reaches this through a
+    // `git stash create` child (sequencer.c:4751-4757, builtin/merge.c:356-361), so the
+    // fallback names these commits and nothing the caller writes afterwards.
+    let mut fallback = repo.clone();
+    crate::prepare_fallback_ident(&mut fallback, "git stash", "git@stash");
+    let repo = &fallback;
     // `do_create_stash()` obtains the index tree `I` with
     // `write_index_as_tree(&info->i_tree, the_repository->index,
     // repo_get_index_file(), 0, NULL)` (builtin/stash.c), and that call is not a read.
@@ -1724,6 +1739,15 @@ fn build_stash_commit(
     // Appending one here changes the commit id and diverges `refs/stash` plus
     // every object-listing probe from stock git. Verified byte-for-byte against
     // git 2.55.0 for the `push`, `push -m`, and `save` message forms.
+    //
+    // `commit_tree()` formats both idents under `IDENT_STRICT` (commit.c:1710-1714),
+    // so what the fallback could not fill — a configured but empty `user.name`, a
+    // `GIT_AUTHOR_NAME=` — dies here, at the first commit.
+    for role in ["Author", "Committer"] {
+        if let Some(refusal) = crate::fmt_ident_strict(repo, role) {
+            return Err(refusal.into_fatal());
+        }
+    }
     let index_commit = repo.new_commit(format!("{index_msg}\n"), i_tree_id, [head_id])?.id().detach();
 
     // `-u`/`-a` capture the untracked files into a THIRD parent: a parentless
@@ -2231,9 +2255,27 @@ pub(crate) fn create_snapshot(repo: &gix::Repository) -> Result<Option<ObjectId>
     if repo.head_id().is_err() || !repo.is_dirty()? {
         return Ok(None);
     }
-    let built = build_stash_commit(repo, repo, None, &PushOpts::with_message(None))?;
+    // The `stash create` child's own `die()` reaches stderr, and the parent follows it with
+    // `die(_("stash failed"))` (builtin/merge.c:365-366).
+    let built = child_stash_create(build_stash_commit(repo, repo, None, &PushOpts::with_message(None)), "stash failed")?;
     // Not `--patch`, so `do_create_stash()` always reached its `commit_tree()` for `W`.
     Ok(built.w_commit)
+}
+
+/// What a caller that runs `git stash create` as a child sees when the child `die()`s:
+/// the child's `fatal:` line on the shared stderr, then the caller's own `die(parent)`.
+/// Any other error is not a death the child would have reported, and passes through.
+fn child_stash_create(built: Result<StashBuild>, parent: &str) -> Result<StashBuild> {
+    match built {
+        Err(err) => match err.downcast_ref::<crate::fatal::Fatal>() {
+            Some(fatal) => {
+                eprintln!("fatal: {}", crate::fatal::report_text(&fatal.0));
+                crate::git_fatal!("{parent}")
+            }
+            None => Err(err),
+        },
+        ok => ok,
+    }
 }
 
 /// `git stash create [<message>…]` — build the stash commit graph and print the
@@ -3353,8 +3395,15 @@ pub fn create_autostash(repo: &gix::Repository) -> Result<ObjectId> {
 /// `refs/stash` reflog line the entry gets when a conflicting re-apply forces the
 /// snapshot to be kept.
 pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<ObjectId> {
-    let StashBuild { w_commit, head_tree_id, affected, .. } =
-        build_stash_commit(repo, repo, Some(message), &PushOpts::with_message(None))?;
+    // `create_autostash_internal()` runs `git stash create` through `capture_command()`
+    // (sequencer.c:4751-4758), whose `start_command()` flushes stdio first
+    // (run-command.c:743); a child that dies leaves its `fatal:` line and the parent
+    // dies with `Cannot autostash`.
+    crate::cstdio::before_spawn();
+    let StashBuild { w_commit, head_tree_id, affected, .. } = child_stash_create(
+        build_stash_commit(repo, repo, Some(message), &PushOpts::with_message(None)),
+        "Cannot autostash",
+    )?;
 
     // Reset the tracked worktree + index back to HEAD (untracked files untouched),
     // exactly as `push` does after storing the stash.

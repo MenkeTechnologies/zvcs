@@ -1313,18 +1313,103 @@ pub fn ensure_reflog_identity(repo: &mut gix::Repository) {
     if repo.committer().is_some() {
         return;
     }
+    // `fmt_ident()` defaults each field on its own (ident.c:468-503): a configured
+    // `user.name` keeps its name and only the address is synthesized, and the other
+    // way round. The default stands in for whichever role lacks its own value — a
+    // `committer.email` alone leaves the author on `ident_default_email()` — so it is
+    // injected as `user.<field>`, below every `<role>.<field>` and `GIT_<ROLE>_<FIELD>`,
+    // whenever `user.<field>` itself is not configured.
+    let resolved = |field: &str| repo.config_snapshot().string(format!("user.{field}").as_str()).is_some();
+    let (name_missing, email_missing) = (!resolved("name"), !resolved("email"));
+    // `ident_default_name()`/`ident_default_email()` (ident.c:162-189) compute nothing once
+    // `set_ident()` read any `*.name`/`*.email` key (ident.c:610-671) — an `author.name`
+    // alone leaves the committer's default name empty, which `fmt_ident()` replaces by the
+    // login name (ident.c:507-516), and an `author.email` alone leaves its address empty.
+    let config_given = |field: &str| {
+        let cfg = repo.config_snapshot();
+        ["author", "committer"].iter().any(|role| cfg.string(format!("{role}.{field}").as_str()).is_some())
+    };
     let name = auto_name();
-    // `git_default_email()`: the `EMAIL` environment variable outranks the
-    // address built from the account and host, and is what most machines that
-    // have no `user.email` actually go by.
-    let email = std::env::var("EMAIL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| auto_email(&name.login).0);
+    let mut injected = gix::config::File::new(gix::config::file::Metadata::api());
+    if name_missing {
+        let display = if config_given("name") { &name.login } else { &name.display };
+        let _ = injected.set_raw_value(&gix::config::tree::User::NAME, display.as_str());
+    }
+    if email_missing {
+        // `git_default_email()`: the `EMAIL` environment variable outranks the
+        // address built from the account and host, and is what most machines that
+        // have no `user.email` actually go by.
+        let email = if config_given("email") {
+            String::new()
+        } else {
+            std::env::var("EMAIL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| auto_email(&name.login).0)
+        };
+        let _ = injected.set_raw_value(&gix::config::tree::User::EMAIL, email.as_str());
+    }
+    // Appended as its own `Source::Api` file, so [`prepare_fallback_ident`] can still
+    // tell a synthesized field from a configured one. Committing the snapshot
+    // rebuilds the cached personas so the injected identity takes effect.
     let mut cfg = repo.config_snapshot_mut();
-    let _ = cfg.set_value(&gix::config::tree::User::NAME, name.display.as_str());
-    let _ = cfg.set_value(&gix::config::tree::User::EMAIL, email.as_str());
-    // Rebuilds the cached personas so the injected identity takes effect.
+    let _ = cfg.append(injected);
+    let _ = cfg.commit();
+}
+
+/// `prepare_fallback_ident()` (ident.c:697-707), which `do_create_stash()` calls before
+/// it writes a commit (builtin/stash.c:1521): every author and committer field that
+/// neither the configuration nor the environment gives takes `name`/`email`, so a
+/// stash made with no identity is `git stash <git@stash>` rather than the account's
+/// synthesized default.
+///
+/// ```c
+/// static void set_env_if(const char *key, const char *value, int *given, int bit)
+/// {
+///         if ((*given & bit) || getenv(key))
+///                 return; /* nothing to do */
+///         setenv(key, value, 0);
+///         *given |= bit;
+/// }
+/// ```
+///
+/// `*given` holds what `set_ident()` recorded while the configuration was read: a
+/// `user.<field>` sets the bit for both roles, an `<role>.<field>` for its own role
+/// (ident.c:610-671). `EMAIL` does not count — only `ident_default_email()` sets the
+/// bit for it, and nothing has asked for the default address yet. A field
+/// [`ensure_reflog_identity`] synthesized is not configured either, so values from
+/// `Source::Api` are not looked at. git sets the environment; the fallback goes into
+/// the in-memory configuration instead, where the commits and reflog entries this
+/// repository handle writes pick it up, and where a process that runs further
+/// commands does not keep it.
+pub fn prepare_fallback_ident(repo: &mut gix::Repository, name: &str, email: &str) {
+    let given = |role: &str, field: &str, env: &str| {
+        let cfg = repo.config_snapshot();
+        let configured = |key: String| {
+            cfg.plumbing()
+                .string_filter(key.as_str(), |meta| meta.source != gix::config::Source::Api)
+                .is_some()
+        };
+        configured(format!("{role}.{field}"))
+            || configured(format!("user.{field}"))
+            || std::env::var_os(env).is_some()
+    };
+    let mut fallback = gix::config::File::new(gix::config::file::Metadata::api());
+    for (role, field, env, value) in [
+        ("author", "name", "GIT_AUTHOR_NAME", name),
+        ("author", "email", "GIT_AUTHOR_EMAIL", email),
+        ("committer", "name", "GIT_COMMITTER_NAME", name),
+        ("committer", "email", "GIT_COMMITTER_EMAIL", email),
+    ] {
+        if !given(role, field, env) {
+            let _ = fallback.set_raw_value_by(role, None, field, value);
+        }
+    }
+    if fallback.sections().next().is_none() {
+        return;
+    }
+    let mut cfg = repo.config_snapshot_mut();
+    let _ = cfg.append(fallback);
     let _ = cfg.commit();
 }
 
@@ -1603,6 +1688,15 @@ impl IdentRefusal {
         }
         eprintln!("fatal: {}", self.msg);
         std::process::ExitCode::from(128)
+    }
+
+    /// [`die`](Self::die) for a caller that unwinds through `Result`: the advice is
+    /// printed now and the `fatal:` line by whoever reports the error.
+    pub fn into_fatal(self) -> anyhow::Error {
+        if let Some(role) = &self.role {
+            identity_advice(role);
+        }
+        crate::fatal::die(self.msg)
     }
 }
 

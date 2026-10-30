@@ -1161,30 +1161,97 @@ pub(crate) fn merge_diff_algorithm(repo: &gix::Repository, ui: bool) -> Algorith
         .unwrap_or(Algorithm::Histogram)
 }
 
-/// `init_merge_options()` → `merge_recursive_config()`: the numeric keys it reads are
-/// dies-on-bad-value lookups, so an unreadable one ends every merge that builds its options.
-/// Returns the message git's `fatal:` carries.
-pub(crate) fn merge_recursive_config_error(repo: &gix::Repository) -> Option<String> {
-    ["merge.verbosity", "diff.renameLimit", "merge.renameLimit"]
-        .into_iter()
-        .find_map(|key| crate::config::config_int(repo, key).err())
+/// `init_merge_options()` → `merge_recursive_config()` (merge-ort.c:5453-5493): the
+/// targeted lookups it makes before the `git_xmerge_config` walk, each of which dies on
+/// a value it cannot read, so an unreadable one ends every merge that builds its options.
+///
+/// ```c
+/// repo_config_get_int(opt->repo, "merge.verbosity", &opt->verbosity);
+/// repo_config_get_int(opt->repo, "diff.renamelimit", &opt->rename_limit);
+/// repo_config_get_int(opt->repo, "merge.renamelimit", &opt->rename_limit);
+/// repo_config_get_bool(opt->repo, "merge.renormalize", &renormalize);
+/// if (!repo_config_get_string(opt->repo, "diff.renames", &value))
+///         opt->detect_renames = git_config_rename("diff.renames", value);
+/// if (!repo_config_get_string(opt->repo, "merge.renames", &value))
+///         opt->detect_renames = git_config_rename("merge.renames", value);
+/// if (!repo_config_get_string(opt->repo, "merge.directoryrenames", &value)) { … }
+/// ```
+///
+/// Each reads the last value only. The ints go through `git_config_int()` and
+/// `die_bad_number()` (config.c:1191-1236), whose message names the file. The rename
+/// keys are `git_config_rename()` (diff.c:211-218): `copies`/`copy`, then
+/// `git_config_bool()` (config.c:1304-1310), whose `bad boolean config value` names no
+/// origin; its integer half is `git_parse_int()`, so a value past `int` range, an
+/// overflowing `k`/`m`/`g` suffix or a word like `always` is not a boolean. The string
+/// reads refuse a valueless key through `config_error_nonbool()` and
+/// `git_die_config()` (config.c:2383-2392). `merge.directoryrenames` accepts any value
+/// it is given ("avoid erroring on values from future versions of git"). The `ui` read of
+/// `diff.algorithm` that follows is [`ui_diff_algorithm_check`].
+pub(crate) fn merge_recursive_config_error(repo: &gix::Repository) -> Option<crate::default_config::Rejection> {
+    use crate::default_config::Rejection;
+
+    for key in ["merge.verbosity", "diff.renameLimit", "merge.renameLimit"] {
+        if let Err(msg) = crate::config::config_int(repo, key) {
+            return Some(Rejection::Die(msg));
+        }
+    }
+    let bad_bool = |raw: &str, key: &str| Rejection::Die(format!("bad boolean config value '{raw}' for '{key}'"));
+    // `git_config_bool(var, NULL)` is true, so only a valued spelling can fail.
+    if let Some(Some(raw)) = crate::config::last_value_implicit(repo, "merge.renormalize") {
+        if crate::optint::maybe_bool(&raw).is_none() {
+            return Some(bad_bool(&raw, "merge.renormalize"));
+        }
+    }
+    for key in ["diff.renames", "merge.renames", "merge.directoryrenames"] {
+        match crate::config::last_value_implicit(repo, key) {
+            None => {}
+            Some(None) => {
+                return Some(Rejection::Reported {
+                    errors: vec![format!("missing value for '{key}'")],
+                    fatal: crate::config::die_config_linenr(Some(repo), key),
+                });
+            }
+            Some(Some(raw)) => {
+                let copies = raw.eq_ignore_ascii_case("copies") || raw.eq_ignore_ascii_case("copy");
+                if key != "merge.directoryrenames" && !copies && crate::optint::maybe_bool(&raw).is_none() {
+                    return Some(bad_bool(&raw, key));
+                }
+            }
+        }
+    }
+    None
 }
+
 
 /// `init_ui_merge_options()` reads `diff.algorithm` and dies on a name
 /// `parse_algorithm_value()` rejects (merge-ort.c:5472-5480), whatever `-X` says later:
 /// `fatal: unknown value for config 'diff.algorithm': <value>` at 128, with no
 /// config-source suffix. `merge` never gets here with one, its configuration layer refuses
 /// it first; `cherry-pick` and `revert` reach it on every pick, clean or not.
+/// The read is `repo_config_get_string()`, so a valueless `diff.algorithm` is refused
+/// before any name is parsed: `error: missing value for 'diff.algorithm'` and
+/// `git_die_config()`'s origin line (config.c:2383-2392).
 pub(crate) fn ui_diff_algorithm_check(repo: &gix::Repository) -> Result<()> {
-    if let Some(raw) = repo.config_snapshot().string("diff.algorithm") {
-        if parse_algorithm_value(&raw.to_str_lossy()).is_none() {
-            return Err(crate::fatal::die(format!(
-                "unknown value for config 'diff.algorithm': {}",
-                raw.to_str_lossy()
-            )));
-        }
+    match ui_diff_algorithm_refusal(repo) {
+        Some(rejection) => Err(rejection.into_error()),
+        None => Ok(()),
     }
-    Ok(())
+}
+
+/// [`ui_diff_algorithm_check`]'s refusal, unprinted.
+pub(crate) fn ui_diff_algorithm_refusal(repo: &gix::Repository) -> Option<crate::default_config::Rejection> {
+    use crate::default_config::Rejection;
+
+    match crate::config::last_value_implicit(repo, "diff.algorithm")? {
+        None => Some(Rejection::Reported {
+            errors: vec!["missing value for 'diff.algorithm'".to_string()],
+            fatal: crate::config::die_config_linenr(Some(repo), "diff.algorithm"),
+        }),
+        Some(raw) if parse_algorithm_value(&raw).is_none() => {
+            Some(Rejection::Die(format!("unknown value for config 'diff.algorithm': {raw}")))
+        }
+        Some(_) => None,
+    }
 }
 
 /// `Repository::tree_merge_options()` with the `-X` knobs folded in.
@@ -1203,8 +1270,13 @@ pub(crate) fn tree_merge_options(
 ) -> Result<gix::merge::tree::Options> {
     use gix::merge::plumbing::blob::builtin_driver::{binary, text};
 
-    if let Some(msg) = merge_recursive_config_error(repo) {
-        return Err(crate::fatal::die(msg));
+    if let Some(rejection) = merge_recursive_config_error(repo) {
+        return Err(rejection.into_error());
+    }
+    // `merge_recursive_config()` reads `diff.algorithm` under `ui` before its
+    // `repo_config(git_xmerge_config)` walk (merge-ort.c:5481-5492).
+    if ui {
+        ui_diff_algorithm_check(repo)?;
     }
 
     // `merge.conflictStyle` is read *here*, where the merge engine's options are
@@ -1215,10 +1287,6 @@ pub(crate) fn tree_merge_options(
     // `git status` and `git diff` all succeed — none of them reaches a real
     // three-way merge. `git merge-tree` and `git cherry-pick` die like `merge`.
     validate_conflict_style(repo).map_err(|r| r.into_error())?;
-
-    if ui {
-        ui_diff_algorithm_check(repo)?;
-    }
 
     let mut opts: gix::merge::plumbing::tree::Options = repo.tree_merge_options()?.into();
 

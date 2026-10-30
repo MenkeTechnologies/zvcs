@@ -3762,6 +3762,12 @@ pub(super) fn apply_switch_autostash(
     opt: MergeOpt<'_>,
     base_label: Option<&str>,
 ) -> Result<bool> {
+    // A `git stash apply` child that dies on its configuration is `STASH_APPLY_ERROR`:
+    // the snapshot is stored, and the switch goes on (builtin/checkout.c:1240-1252).
+    if super::stash::autostash_apply_child_dies(repo) {
+        super::stash::autostash_apply_failed(repo, stash, &format!("autostash while switching to '{}'", opt.name))?;
+        return Ok(false);
+    }
     let commit = repo.find_commit(stash)?;
     let Some(parent) = commit.parent_ids().next() else {
         return Err(crate::fatal::die("autostash commit has no base"));

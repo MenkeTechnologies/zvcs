@@ -1460,6 +1460,45 @@ pub fn walk_config_after_enter_repo(repo: &gix::Repository) -> Vec<ConfigValue> 
     values
 }
 
+/// [`walk_config`] as a git child sees it when its parent exported
+/// `GIT_DIR=absolute_path(repo_get_git_dir())` — the `git status` that
+/// `do_apply_stash()` runs (builtin/stash.c:762-768). The child's git directory is
+/// that absolute spelling (`strbuf_add_absolute_path()`, abspath.c:293-316), so
+/// the files under it are named through it: `… in file
+/// /abs/repo/.git/config.worktree: invalid unit`. A linked worktree's common
+/// directory is `get_common_dir_noenv()`'s `strbuf_add_real_path()` of
+/// `<gitdir>/<commondir>` (setup.c), symlink-free. Files outside both keep the
+/// names they had.
+pub fn walk_config_under_exported_git_dir(repo: &gix::Repository) -> Vec<ConfigValue> {
+    let spelled = match crate::setup::after_setup(repo) {
+        Some(s) => s.git_dir,
+        None => crate::hooks::absolutize(repo.git_dir()),
+    };
+    let abs_git_dir = crate::setup::absolute_path_spelled(repo, &spelled);
+    let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    let (real_git_dir, real_common_dir) = (real(repo.git_dir()), real(repo.common_dir()));
+    let mut values = walk_config(repo);
+    for v in &mut values {
+        let ValueOrigin::File { path, .. } = &mut v.origin else {
+            continue;
+        };
+        let Some(file) = real(std::path::Path::new(path.as_str())) else {
+            continue;
+        };
+        let renamed = if let Some(rest) = real_git_dir.as_deref().and_then(|d| file.strip_prefix(d).ok()) {
+            abs_git_dir.join(rest)
+        } else if let Some((dir, rest)) =
+            real_common_dir.as_deref().and_then(|d| file.strip_prefix(d).ok().map(|r| (d, r)))
+        {
+            dir.join(rest)
+        } else {
+            continue;
+        };
+        *path = renamed.to_string_lossy().into_owned();
+    }
+    values
+}
+
 /// [`walk_config`] for a `RUN_SETUP_GENTLY` verb: the repository's merged read
 /// when there is one, otherwise the system/global cascade plus the command line
 /// that `repo_config(the_repository, fn, data)` walks before setup has found a

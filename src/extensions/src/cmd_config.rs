@@ -1559,22 +1559,9 @@ fn fmt_merge_msg_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), 
 /// `merge.directoryRenames` is read too but never refuses (the C ignores values
 /// it does not know, "from future versions of git").
 pub fn validate_merge_recursive(repo: &gix::Repository) -> Result<(), Rejection> {
-    // `git_config_get_int()`: `die_bad_number`, with its ` in file` clause.
-    for key in ["merge.verbosity", "diff.renamelimit", "merge.renamelimit"] {
-        crate::config::config_int(repo, key).map_err(Rejection::Die)?;
-    }
-    // `git_config_get_bool("merge.renormalize")`, and `git_config_rename()`
-    // (diff.c:191-198) for the two rename keys: `copies`/`copy` first, then
-    // `git_config_bool`, whose refusal carries no origin.
-    for key in ["merge.renormalize", "diff.renames", "merge.renames"] {
-        let Some((raw, _)) = crate::config::last_value_with_origin(repo, key) else {
-            continue;
-        };
-        let copies = key != "merge.renormalize"
-            && (raw.eq_ignore_ascii_case("copies") || raw.eq_ignore_ascii_case("copy"));
-        if !copies && crate::optint::maybe_bool(&raw).is_none() {
-            return Err(Rejection::Die(format!("bad boolean config value '{raw}' for '{key}'")));
-        }
+    // The targeted reads, ints then the rename keys (merge-ort.c:5456-5480).
+    if let Some(rejection) = crate::merge_apply::merge_recursive_config_error(repo) {
+        return Err(rejection);
     }
     let mut out = defaults();
     for v in walk_config(repo) {

@@ -83,8 +83,15 @@ impl Status {
 /// `repo_config(r, git_status_config, &s)` — what `cmd_status` installs through
 /// `status_init_config()` (builtin/commit.c:1608).
 pub fn validate_status(repo: &gix::Repository) -> Result<(), Rejection> {
+    validate_status_values(walk_config(repo))
+}
+
+/// [`validate_status`] over an already-built walk, for the `git status` child whose
+/// config files are named through the git directory its parent exported
+/// ([`crate::config::walk_config_under_exported_git_dir`]).
+pub fn validate_status_values(values: Vec<ConfigValue>) -> Result<(), Rejection> {
     let mut st = Status::new();
-    for v in walk_config(repo) {
+    for v in values {
         git_status_config(&v, &mut st)?;
     }
     Ok(())

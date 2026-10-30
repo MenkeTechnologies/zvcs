@@ -3370,7 +3370,10 @@ fn list(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// ignored, so a config value its `git_status_config` callback refuses ends only that
 /// child: the `fatal:` goes to stderr and the apply carries on to the drop and exit 0.
 fn run_status_child(repo: &gix::Repository) -> Result<()> {
-    if let Err(rejection) = crate::status_config::validate_status(repo) {
+    // The child runs under `GIT_DIR=absolute_path(...)` (builtin/stash.c:762-768),
+    // so a refusal names the repository's config files by that absolute path.
+    let values = crate::config::walk_config_under_exported_git_dir(repo);
+    if let Err(rejection) = crate::status_config::validate_status_values(values) {
         let fatal = rejection.into_fatal();
         if !fatal.is_empty() {
             eprintln!("fatal: {fatal}");
@@ -3682,10 +3685,13 @@ fn restore_stash_commit(
     // `--index` arm and before the merge: its `merge_recursive_config()` reads
     // `merge.verbosity`, `diff.renamelimit` and `merge.renamelimit` with
     // `git_config_get_int()`, which dies on a value it cannot read — so the
-    // refusal comes out alone, with no `The stash entry is kept` after it.
+    // refusal comes out alone, with no `The stash entry is kept` after it. The
+    // rename keys `git_config_rename()` reads next die the same way, and so does
+    // the `ui` read of `diff.algorithm` (merge-ort.c:5460-5490).
     if super::merge::merge_recursive_config_check(repo).is_some() {
         return Err(crate::parseopt::silent(crate::fatal::EXIT_FATAL));
     }
+    crate::merge_apply::ui_diff_algorithm_check(repo)?;
 
     let should_interrupt = AtomicBool::new(false);
     // A merge that did not come out clean — an unresolved conflict, or a checkout
@@ -3899,6 +3905,15 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
     // (run-command.c:743); a child that dies leaves its `fatal:` line and the parent
     // dies with `Cannot autostash`.
     crate::cstdio::before_spawn();
+    // The child's `repo_config(git_stash_config)` (builtin/stash.c:2484) runs first and
+    // ends in `git_diff_basic_config`, so an unreadable `diff.renameLimit` kills it there.
+    if let Err(rejection) = crate::diff_config::validate_basic(repo) {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        crate::git_fatal!("Cannot autostash");
+    }
     let StashBuild { w_commit, head_tree_id, affected, .. } = child_stash_create(
         build_stash_commit(repo, repo, Some(message), &PushOpts::with_message(None)),
         "Cannot autostash",
@@ -3929,8 +3944,15 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
 /// *ours* (the current index's tree, e.g. the just-rebased tip), and *theirs*
 /// (the stashed worktree tree `W`). Prints git's `Applied autostash.` on a clean
 /// apply, or the conflict notice (leaving the changes recoverable) otherwise.
-/// Returns the conflicted paths (empty on a clean apply).
-pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool) -> Result<Vec<BString>> {
+/// Returns whether the apply was clean or conflicted, or
+/// [`AutostashApply::Failed`] when the `git stash apply` child would have died on its
+/// configuration — reported here, whatever `quiet` says, as
+/// [`autostash_apply_failed`] describes.
+pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool) -> Result<AutostashApply> {
+    if autostash_apply_child_dies(repo) {
+        autostash_apply_failed(repo, commit_id, "autostash")?;
+        return Ok(AutostashApply::Failed);
+    }
     let commit = repo.find_commit(commit_id)?;
     let parents: Vec<ObjectId> = commit.parent_ids().map(|id| id.detach()).collect();
     if parents.len() < 2 {
@@ -4054,7 +4076,55 @@ pub fn apply_autostash(repo: &gix::Repository, commit_id: ObjectId, quiet: bool)
             eprintln!("apply the local changes later by running \"git stash pop\".");
         }
     }
-    Ok(applied.conflicts)
+    Ok(if applied.conflicts.is_empty() {
+        AutostashApply::Clean
+    } else {
+        AutostashApply::Conflicted
+    })
+}
+
+/// What [`apply_autostash`]'s `git stash apply` child came back with:
+/// `do_stash_apply()`'s `STASH_APPLY_CLEAN`, `STASH_APPLY_CONFLICT` and
+/// `STASH_APPLY_ERROR` (sequencer.c:4818-4825).
+pub enum AutostashApply {
+    Clean,
+    Conflicted,
+    Failed,
+}
+
+/// Whether the `git stash apply <oid>` child `do_stash_apply()` runs
+/// (sequencer.c:4798-4826) dies on the configuration before it merges anything:
+/// `cmd_stash`'s `repo_config(git_stash_config)` ends in `git_diff_basic_config`
+/// (builtin/stash.c:997, 2484), and `do_apply_stash()`'s `init_ui_merge_options()`
+/// (builtin/stash.c:698) runs `merge_recursive_config()` — its targeted reads, the
+/// `ui` read of `diff.algorithm`, and the `git_xmerge_config` walk (merge-ort.c:5453-5493).
+/// The child runs with `no_stderr`, so its `fatal:` is never seen.
+pub(crate) fn autostash_apply_child_dies(repo: &gix::Repository) -> bool {
+    // `validate_merge_recursive()` is the targeted reads plus the walk; the
+    // answer is all that matters here, not which read refused first.
+    crate::diff_config::validate_basic(repo).is_err()
+        || crate::merge_apply::ui_diff_algorithm_refusal(repo).is_some()
+        || crate::cmd_config::validate_merge_recursive(repo).is_err()
+}
+
+/// `apply_save_autostash_oid()`'s tail for a `STASH_APPLY_ERROR` (sequencer.c:4843-4865):
+/// the snapshot goes to `git stash store -m <message> -q <oid>`, and then
+/// `error: could not apply autostash; your changes are safe in the stash`. The store
+/// child keeps its stderr and dies on the same `git_diff_basic_config` the apply child
+/// does, in which case its `fatal:` is followed by `error: cannot store <oid>`.
+pub(crate) fn autostash_apply_failed(repo: &gix::Repository, oid: ObjectId, message: &str) -> Result<()> {
+    crate::cstdio::before_spawn();
+    if let Err(rejection) = crate::diff_config::validate_basic(repo) {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        eprintln!("error: cannot store {oid}");
+        return Ok(());
+    }
+    store_commit(repo, oid, message)?;
+    eprintln!("error: could not apply autostash; your changes are safe in the stash");
+    Ok(())
 }
 
 /// `git stash clear` — remove every entry (ref + reflog), silently if none.

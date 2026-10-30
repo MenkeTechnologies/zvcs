@@ -4878,8 +4878,12 @@ fn end_autostash(repo: &gix::Repository, stash: Option<ObjectId>, applied: bool)
     // `start_command()`'s `fflush(NULL)` (run-command.c:743) puts the buffered
     // merge summary and diffstat out ahead of `Applied autostash.`.
     crate::cstdio::before_spawn();
-    let conflicts = crate::porcelain::stash::apply_autostash(repo, id, true)?;
-    if conflicts.is_empty() {
+    let applied = crate::porcelain::stash::apply_autostash(repo, id, true)?;
+    if let crate::porcelain::stash::AutostashApply::Failed = applied {
+        // Stored and reported by the apply; `apply_autostash_ref()` still deletes
+        // the ref (sequencer.c:4939-4940).
+        crate::sequencer::delete_state_ref(repo, MERGE_AUTOSTASH)?;
+    } else if let crate::porcelain::stash::AutostashApply::Clean = applied {
         repo.edit_reference(RefEdit {
             change: Change::Delete {
                 expected: PreviousValue::Any,
@@ -5023,9 +5027,13 @@ fn append_message(buf: &mut Option<String>, arg: &str) {
 /// merge that dies here still leaves the new `ORIG_HEAD` behind. Reading the
 /// keys in `cmd_merge`'s config pass instead left the old one.
 ///
+/// The `merge.renormalize`, `diff.renames`, `merge.renames` and
+/// `merge.directoryrenames` reads after them (merge-ort.c:5460-5480) die the same
+/// way; see [`crate::merge_apply::merge_recursive_config_error`].
+///
 /// Returns the exit code to hand back, having already printed git's `fatal:`.
 pub(super) fn merge_recursive_config_check(repo: &gix::Repository) -> Option<ExitCode> {
-    let msg = crate::merge_apply::merge_recursive_config_error(repo)?;
+    let msg = crate::merge_apply::merge_recursive_config_error(repo)?.into_fatal();
     eprintln!("fatal: {msg}");
     Some(ExitCode::from(128))
 }

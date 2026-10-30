@@ -496,8 +496,10 @@ pub(crate) fn apply_merge_autostash(repo: &gix::Repository) -> Result<()> {
     // `start_command()`'s `fflush(NULL)` (run-command.c:743) puts the buffered
     // `[<branch> <oid>] <subject>` summary out ahead of `Applied autostash.`.
     crate::cstdio::before_spawn();
-    let conflicts = super::stash::apply_autostash(repo, stash, true)?;
-    if conflicts.is_empty() {
+    let applied = super::stash::apply_autostash(repo, stash, true)?;
+    if let super::stash::AutostashApply::Failed = applied {
+        // Stored and reported by the apply itself (sequencer.c:4843-4865).
+    } else if let super::stash::AutostashApply::Clean = applied {
         eprintln!("Applied autostash.");
     } else {
         let args = ["store", "-m", "autostash", "-q", &stash.to_string()]

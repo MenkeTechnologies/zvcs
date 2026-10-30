@@ -3140,8 +3140,14 @@ type StatOnly = gix::status::plumbing::index_as_worktree::traits::FastEq;
 struct Collector<'a> {
     /// `core.trustCTime`/`core.checkStat`, for re-testing a `NeedsUpdate` payload.
     stat_opts: gix::index::entry::stat::Options,
-    workdir: &'a Path,
-    executable_bit: bool,
+    /// The index the walk visits, for the stat data of an unmerged path's stages,
+    /// which gix's conflict report does not carry.
+    index: &'a gix::index::State,
+    /// `check_removed()`, `ce_mode_from_stat()` and the ordinary comparison an
+    /// unmerged path's selected stage falls through to.
+    compare: EntryCompare<'a>,
+    /// The first `die()` an entry comparison raised; the walk cannot return it.
+    error: Option<anyhow::Error>,
     null: ObjectId,
     /// `-0`/`-1`/`-2`/`-3`: which conflict stage the second record compares.
     unmerged_stage: u8,
@@ -3157,38 +3163,195 @@ struct Collector<'a> {
     combined: Vec<CombinedPath>,
 }
 
-impl Collector<'_> {
-    /// The mode git would record for the worktree file at `rela_path`, or `0`
-    /// when it is gone. Mirrors `check_removed()` followed by `ce_mode_from_stat()`,
-    /// including the fact that a filesystem without a usable executable bit always
-    /// yields `100644`.
-    fn worktree_mode(&self, rela_path: &gix::bstr::BStr) -> u32 {
-        let rela = gix::path::from_bstr(rela_path);
-        let path = self.workdir.join(&*rela);
-        let Ok(md) = std::fs::symlink_metadata(&path) else {
-            return 0;
-        };
+/// One pair the ordinary `run_diff_files()` comparison queues for an index entry
+/// (diff-lib.c:234-310): `diff_addremove('-')` for a removal, else `diff_change()`.
+pub(super) struct EntryPair {
+    pub(super) src_mode: u32,
+    pub(super) dst_mode: u32,
+    pub(super) src_id: ObjectId,
+    pub(super) dst_id: ObjectId,
+    /// `D`, or `T`/`M` as `diff_resolve_rename_copy()` names a change by whether
+    /// `S_IFMT` differs (`DIFF_PAIR_TYPE_CHANGED`).
+    pub(super) status: u8,
+    pub(super) dirty_submodule: u8,
+    /// A gitlink over a directory: the commit its checkout has, as
+    /// [`Delta::new_commit`] keeps it.
+    pub(super) new_commit: Option<ObjectId>,
+}
+
+/// The per-entry half of `run_diff_files()` that runs outside gix's status walk:
+/// an unmerged path's selected stage, which the C loop leaves in `ce` and hands to
+/// the ordinary comparison (diff-lib.c:213-216), and the `wt_mode` of its
+/// `diff_unmerge()` pair (diff-lib.c:161-170).
+pub(super) struct EntryCompare<'r> {
+    repo: &'r gix::Repository,
+    workdir: &'r Path,
+    stat: super::read_tree::StatCtx,
+    /// How `match_stat_with_submodule()` and `is_submodule_ignored()` resolve a
+    /// gitlink's ignore level; see [`super::status::gitlink_ignore`].
+    submodules: gix::status::Submodule,
+    /// `trust_executable_bit` (`core.fileMode`).
+    executable_bit: bool,
+    /// `has_symlinks` (`core.symlinks`).
+    symlinks: bool,
+    /// `flags.dirty_submodules` (diff-lib.c:101).
+    dirty_submodules: bool,
+    null: ObjectId,
+}
+
+impl<'r> EntryCompare<'r> {
+    pub(super) fn new(
+        repo: &'r gix::Repository,
+        index: &gix::index::File,
+        submodules: gix::status::Submodule,
+        dirty_submodules: bool,
+    ) -> Result<Self> {
+        let caps = repo.filesystem_options()?;
+        Ok(Self {
+            repo,
+            workdir: repo.workdir().ok_or_else(crate::fatal::need_work_tree)?,
+            stat: super::read_tree::StatCtx::new(repo, index)?,
+            submodules,
+            executable_bit: caps.executable_bit,
+            symlinks: caps.symlink,
+            dirty_submodules,
+            null: ObjectId::null(repo.object_hash()),
+        })
+    }
+
+    /// `check_removed()` (diff-lib.c:42-77): the `lstat()` of a work tree entity
+    /// still to be compared with `ce`, or `None` when it was removed. A directory
+    /// stands for a gitlink whether or not it is checked out, and for anything
+    /// else only when it is a repository whose `HEAD` resolves.
+    fn check_removed(&self, ce_mode: u32, rela_path: &gix::bstr::BStr) -> Option<std::fs::Metadata> {
+        let md = std::fs::symlink_metadata(self.workdir.join(gix::path::from_bstr(rela_path))).ok()?;
+        if super::check_ignore::has_symlink_leading_path(self.workdir, rela_path) {
+            return None;
+        }
+        if md.is_dir()
+            && ce_mode != 0o160000
+            && super::worktree_filespec::gitlink_head(self.workdir, rela_path).is_none()
+        {
+            return None;
+        }
+        Some(md)
+    }
+
+    /// `ce_mode_from_stat()` (read-cache.h:16-29) over `create_ce_mode()`
+    /// (object.h:133-143): only the owner `x` bit counts, and without
+    /// `core.symlinks`/`core.fileMode` a regular file keeps the entry's mode.
+    fn ce_mode_from_stat(&self, ce_mode: u32, md: &std::fs::Metadata) -> u32 {
         let ft = md.file_type();
+        let ce_is_reg = ce_mode & 0o170000 == 0o100000;
+        if ft.is_file() && !self.symlinks && ce_mode == 0o120000 {
+            return ce_mode;
+        }
+        if ft.is_file() && !self.executable_bit {
+            return if ce_is_reg { ce_mode } else { 0o100644 };
+        }
         if ft.is_symlink() {
             return 0o120000;
         }
         if ft.is_dir() {
-            // `run_diff_files()`'s unmerged branch (diff-lib.c:161) calls
-            // `check_removed()` before `ce_mode_from_stat()`, so a directory that is
-            // a repository is `S_IFGITLINK` rather than "gone".
-            return match super::worktree_filespec::removed_became_gitlink(self.workdir, rela_path) {
-                Some(_) => 0o160000,
-                None => 0,
-            };
+            return 0o160000;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if self.executable_bit && md.permissions().mode() & 0o111 != 0 {
+            if md.permissions().mode() & 0o100 != 0 {
                 return 0o100755;
             }
         }
         0o100644
+    }
+
+    /// `check_removed()` then `ce_mode_from_stat()` for an entry of mode `ce_mode`,
+    /// or `0` when it was removed: the `wt_mode` of an unmerged path's
+    /// `diff_unmerge()` pair, taken from its first stage (diff-lib.c:161-170).
+    pub(super) fn wt_mode(&self, ce_mode: u32, rela_path: &gix::bstr::BStr) -> u32 {
+        self.check_removed(ce_mode, rela_path)
+            .map_or(0, |md| self.ce_mode_from_stat(ce_mode, &md))
+    }
+
+    /// The ordinary comparison of `ce` (diff-lib.c:234-310), for an entry gix's walk
+    /// did not compare. `None` when nothing is queued.
+    ///
+    /// A removal is `diff_addremove('-')`, which `diff_queue_addremove()` drops for an
+    /// ignored gitlink (diff.c:7588-7589). Otherwise `match_stat_with_submodule()`
+    /// (diff-lib.c:88-107): `ie_match_stat()` finds a gitlink changed when it is no
+    /// directory or `ce_compare_gitlink()` sees its `HEAD` resolve to another commit
+    /// (read-cache.c:268-284, :327-333), never under `ignore=all`, and
+    /// `is_submodule_modified()` is asked for its dirt unless `ignore=dirty`, when it
+    /// is unchanged or `dirty_submodules` is set. The `die()` of the latter over an
+    /// unusable `<path>/.git` comes back as the error it is.
+    pub(super) fn compare(&self, ce: &gix::index::Entry, rela_path: &gix::bstr::BStr) -> Result<Option<EntryPair>> {
+        use gix::index::entry::Flags;
+        let ce_mode = ce.mode.bits();
+        let is_gitlink = ce_mode == 0o160000;
+        // `ce_skip_worktree()`, then `CE_VALID`: `changed = 0` with no submodule asked.
+        if ce.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID) {
+            return Ok(None);
+        }
+        let ignore = || super::status::gitlink_ignore(self.repo, self.submodules, rela_path);
+        let Some(md) = self.check_removed(ce_mode, rela_path) else {
+            if is_gitlink && ignore()? == gix::submodule::config::Ignore::All {
+                return Ok(None);
+            }
+            return Ok(Some(EntryPair {
+                src_mode: ce_mode,
+                dst_mode: 0,
+                src_id: ce.id,
+                dst_id: self.null,
+                status: b'D',
+                dirty_submodule: 0,
+                new_commit: None,
+            }));
+        };
+        let mut dirty_submodule = 0;
+        let mut new_commit = None;
+        let changed = if is_gitlink {
+            let head = md
+                .is_dir()
+                .then(|| super::worktree_filespec::gitlink_head(self.workdir, rela_path))
+                .flatten();
+            let changed = !md.is_dir() || head.is_some_and(|head| head != ce.id);
+            let ignore = ignore()?;
+            if md.is_dir() {
+                new_commit = Some(head.unwrap_or(ce.id));
+            }
+            if ignore == gix::submodule::config::Ignore::All {
+                false
+            } else {
+                if ignore != gix::submodule::config::Ignore::Dirty
+                    && (!changed || self.dirty_submodules)
+                    && md.is_dir()
+                {
+                    let status = gix::submodule::status::gitlink_status(self.repo, rela_path, ce.id, ignore, false)?;
+                    if status.changes.as_ref().is_some_and(|c| !c.is_empty()) {
+                        dirty_submodule = super::diff_pairs::DIRTY_SUBMODULE_MODIFIED;
+                    }
+                }
+                changed
+            }
+        } else {
+            matches!(
+                self.stat.probe(self.repo, ce, rela_path),
+                super::read_tree::Probe::Changed | super::read_tree::Probe::Absent
+            )
+        };
+        if !changed && dirty_submodule == 0 {
+            return Ok(None);
+        }
+        let dst_mode = self.ce_mode_from_stat(ce_mode, &md);
+        Ok(Some(EntryPair {
+            src_mode: ce_mode,
+            dst_mode,
+            src_id: ce.id,
+            dst_id: if changed { self.null } else { ce.id },
+            status: if ce_mode & 0o170000 != dst_mode & 0o170000 { b'T' } else { b'M' },
+            dirty_submodule,
+            new_commit,
+        }))
     }
 }
 
@@ -3228,7 +3391,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 // git prints an unmerged marker, then repeats the comparison
                 // against whichever stage `diff_unmerged_stage` selects (2 by
                 // default). When that stage is absent, only the marker is shown.
-                let wt_mode = self.worktree_mode(rela_path);
+                // `wt_mode` is `check_removed()` and `ce_mode_from_stat()` for the
+                // path's first stage, before the loop moves `ce` (diff-lib.c:161-170).
+                let first_mode = entries.iter().flatten().next().map_or(src_mode, |e| e.mode.bits());
+                let wt_mode = self.compare.wt_mode(first_mode, rela_path);
 
                 // `run_diff_files()`: when `combine_merges` is on and both stage #2
                 // and stage #3 survive (`num_compare_stages == 2`), the whole path
@@ -3263,20 +3429,34 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 if self.unmerged_stage == 0 {
                     return;
                 }
-                let Some(stage) = entries[usize::from(self.unmerged_stage) - 1].as_ref() else {
+                // The stage `diff_unmerged_stage` selects stays in `ce` and falls
+                // through to the ordinary comparison (diff-lib.c:213-216); absent, only
+                // the marker is shown.
+                let stage = u32::from(self.unmerged_stage);
+                let Some(ce) = self.index.entry_range(rela_path).and_then(|range| {
+                    self.index.entries()[range].iter().find(|e| e.stage_raw() == stage)
+                }) else {
                     return;
                 };
+                let pair = match self.compare.compare(ce, rela_path) {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => return,
+                    Err(err) => {
+                        self.error.get_or_insert(err);
+                        return;
+                    }
+                };
                 Delta {
-                    src_mode: stage.mode.bits(),
-                    dst_mode: wt_mode,
-                    src_id: stage.id,
-                    dst_id: self.null,
-                    status: if wt_mode == 0 { b'D' } else { b'M' },
+                    src_mode: pair.src_mode,
+                    dst_mode: pair.dst_mode,
+                    src_id: pair.src_id,
+                    dst_id: pair.dst_id,
+                    status: pair.status,
                     path: path.clone(),
                     disk: path,
                     unmerged: false,
-                    dirty_submodule: 0,
-                    new_commit: None,
+                    dirty_submodule: pair.dirty_submodule,
+                    new_commit: pair.new_commit,
                     src: None,
                     score: 0,
                     same: false,
@@ -3320,7 +3500,7 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
             // the creation carries the worktree file's mode, not the staged one.
             EntryStatus::IntentToAdd => Delta {
                 src_mode: 0,
-                dst_mode: match self.worktree_mode(rela_path) {
+                dst_mode: match self.compare.wt_mode(src_mode, rela_path) {
                     0 => src_mode,
                     m => m,
                 },
@@ -3347,7 +3527,7 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
             // `SubmoduleModification` before this arm can see it.
             EntryStatus::Change(Change::Removed) => {
                 let became_gitlink = src_mode != 0o160000
-                    && super::worktree_filespec::removed_became_gitlink(self.workdir, rela_path)
+                    && super::worktree_filespec::removed_became_gitlink(self.compare.workdir, rela_path)
                         .is_some();
                 Delta {
                     src_mode,
@@ -3487,11 +3667,7 @@ fn collect(
     opts: &Opts,
 ) -> Result<(Vec<Delta>, Vec<CombinedPath>)> {
     let index = repo.index_or_empty()?;
-    let workdir = repo
-        .workdir()
-        .ok_or_else(|| crate::fatal::need_work_tree())?
-        .to_owned();
-    let caps = repo.filesystem_options()?;
+    repo.workdir().ok_or_else(crate::fatal::need_work_tree)?;
 
     die_on_worktree_hash_refusal_by_stat(repo, &index, &patterns)?;
 
@@ -3529,8 +3705,9 @@ fn collect(
 
     let mut collector = Collector {
         stat_opts: repo.stat_options()?,
-        workdir: workdir.as_path(),
-        executable_bit: caps.executable_bit,
+        index: &index,
+        compare: EntryCompare::new(repo, &index, submodules, opts.fmt & F_PATCH != 0)?,
+        error: None,
         null: ObjectId::null(repo.object_hash()),
         unmerged_stage: opts.unmerged_stage,
         combine: opts.combine_merges,
@@ -3564,6 +3741,9 @@ fn collect(
         },
     )?;
 
+    if let Some(err) = collector.error.take() {
+        return Err(err);
+    }
     if let Some(patterns) = same_patterns {
         queue_same(repo, &index, &patterns, opts, &mut collector.deltas)?;
     }

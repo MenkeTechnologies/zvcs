@@ -953,7 +953,7 @@ fn resolve_commit(repo: &gix::Repository, spec: &str) -> Option<ObjectId> {
 /// that merely has local edits is not a row.
 fn summary_changes(
     repo: &gix::Repository,
-    index: &gix::index::State,
+    index: &gix::index::File,
     rev: Option<&ObjectId>,
     files: bool,
     cached: bool,
@@ -990,9 +990,7 @@ fn summary_changes(
         // commands special-case it before they ever look at the work tree.
         let stages = unmerged_stages(index, &path);
         if let Some(lowest) = stages.first() {
-            if let Some(change) = unmerged_change(repo, &path, lowest, rev, files, cached, &null) {
-                changes.push(change);
-            }
+            changes.extend(unmerged_changes(repo, index, &path, lowest, rev, files, cached, &null)?);
             continue;
         }
         // `--files` diffs the index against the work tree; otherwise the left
@@ -1048,12 +1046,17 @@ fn summary_changes(
     Ok(changes)
 }
 
-/// The one filepair a conflicted `path` contributes to `submodule summary`'s
-/// diff, or `None` when it contributes none.
+/// The filepairs a conflicted `path` contributes to `submodule summary`'s diff
+/// that `submodule_summary_callback()` keeps, those with a gitlink on either side
+/// (builtin/submodule--helper.c:1204-1205).
 ///
 /// `git diff-files` (diff-lib.c:154-227) queues `diff_unmerge()` — an empty
-/// source — and sets only `pair->two->mode` from `lstat()`, so the pair reads
-/// `:000000 160000 <null> <null> U`.
+/// source — and sets only `pair->two->mode`, `check_removed()` and
+/// `ce_mode_from_stat()` of the first stage, so over a checkout the pair reads
+/// `:000000 160000 <null> <null> U`. Stage 2 then falls through to the ordinary
+/// comparison under `--ignore-submodules=dirty` (diff-lib.c:213-310), which may
+/// queue a second pair: a deletion, a type change, or a gitlink whose `HEAD`
+/// moved.
 ///
 /// `git diff-index --cached` (diff-lib.c:467-474) queues the same empty pair
 /// and fills `pair->one` from the *tree*, so it reads
@@ -1068,12 +1071,83 @@ fn summary_changes(
 /// null destination with the submodule's own `HEAD`
 /// (builtin/submodule--helper.c:1025-1031), which is what [`worktree_entry`]
 /// does for the merged case.
+#[allow(clippy::too_many_arguments)]
+fn unmerged_changes(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    path: &BString,
+    lowest: &gix::index::Entry,
+    rev: Option<&ObjectId>,
+    files: bool,
+    cached: bool,
+    null: &ObjectId,
+) -> Result<Vec<Change>> {
+    if files {
+        if repo.workdir().is_none() {
+            return Ok(Vec::new());
+        }
+        let compare = super::diff_files::EntryCompare::new(
+            repo,
+            index,
+            gix::status::Submodule::Given {
+                ignore: gix::submodule::config::Ignore::Dirty,
+                check_dirty: false,
+            },
+            false,
+        )?;
+        let mut pairs = vec![Change {
+            path: path.clone(),
+            mod_src: 0,
+            oid_src: *null,
+            mod_dst: compare.wt_mode(lowest.mode.bits(), path.as_bstr()),
+            oid_dst: *null,
+            status: 'U',
+        }];
+        let ours = index.entry_range(path.as_bstr()).and_then(|range| {
+            index.entries()[range].iter().find(|e| e.stage_raw() == 2)
+        });
+        if let Some(ours) = ours {
+            if let Some(pair) = compare.compare(ours, path.as_bstr())? {
+                pairs.push(Change {
+                    path: path.clone(),
+                    mod_src: pair.src_mode,
+                    oid_src: pair.src_id,
+                    mod_dst: pair.dst_mode,
+                    oid_dst: pair.dst_id,
+                    status: char::from(pair.status),
+                });
+            }
+        }
+        pairs.retain(|c| c.src_is_gitlink() || c.dst_is_gitlink());
+        for change in &mut pairs {
+            if change.oid_dst == *null {
+                change.oid_dst = worktree_oid(repo, path, change.mod_dst).unwrap_or(*null);
+            }
+        }
+        return Ok(pairs);
+    }
+    Ok(unmerged_change(repo, path, lowest, rev, cached, null).into_iter().collect())
+}
+
+/// `generate_submodule_summary()`'s fill-in for a null destination id when the
+/// diff was against the work tree (builtin/submodule--helper.c:1030-1050): a
+/// gitlink is the submodule's `HEAD` when it resolves, a file or symlink what
+/// [`worktree_entry`] hashes for it, a removal stays null.
+fn worktree_oid(repo: &gix::Repository, path: &BString, mode: u32) -> Option<ObjectId> {
+    let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
+    match mode & S_IFMT {
+        GITLINK => gix::open(full).ok()?.head_id().ok().map(|id| id.detach()),
+        0o100000 | 0o120000 => worktree_blob(repo, &full, &std::fs::symlink_metadata(&full).ok()?).map(|(_, id)| id),
+        _ => None,
+    }
+}
+
+/// The `diff-index` half of [`unmerged_changes`].
 fn unmerged_change(
     repo: &gix::Repository,
     path: &BString,
     lowest: &gix::index::Entry,
     rev: Option<&ObjectId>,
-    files: bool,
     cached: bool,
     null: &ObjectId,
 ) -> Option<Change> {
@@ -1081,24 +1155,6 @@ fn unmerged_change(
         let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
         gix::open(full).ok()?.head_id().ok().map(|id| id.detach())
     };
-    if files {
-        // `wt_mode = ce_mode_from_stat(ce, st.st_mode)`, and `canon_mode()` maps
-        // a directory to `S_IFGITLINK`. A path that is gone leaves `wt_mode` 0.
-        let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
-        let mod_dst = match std::fs::symlink_metadata(&full) {
-            Ok(meta) if meta.is_dir() => GITLINK,
-            Ok(_) => return None,
-            Err(_) => 0,
-        };
-        return Some(Change {
-            path: path.clone(),
-            mod_src: 0,
-            oid_src: *null,
-            mod_dst,
-            oid_dst: head_of_submodule().unwrap_or(*null),
-            status: 'U',
-        });
-    }
     let (mod_src, oid_src) = match rev {
         Some(rev) => entry_of_tree(repo, rev, path)?,
         None => return None,
@@ -1206,14 +1262,20 @@ fn worktree_entry(
         let oid = head.or_else(|| entry_of_index(index, path).map(|(_, id)| id))?;
         return Some((GITLINK, oid));
     }
+    worktree_blob(repo, &full, &meta)
+}
+
+/// The mode and blob id of the file or symlink at `full`, as [`worktree_entry`]
+/// records it.
+fn worktree_blob(repo: &gix::Repository, full: &std::path::Path, meta: &std::fs::Metadata) -> Option<(u32, ObjectId)> {
     let (mode, data) = if meta.is_symlink() {
-        (0o120000, std::fs::read_link(&full).ok()?.into_os_string().into_encoded_bytes())
+        (0o120000, std::fs::read_link(full).ok()?.into_os_string().into_encoded_bytes())
     } else {
         use std::os::unix::fs::PermissionsExt;
         let exec = meta.permissions().mode() & 0o111 != 0;
         (
             if exec { 0o100755 } else { 0o100644 },
-            std::fs::read(&full).ok()?,
+            std::fs::read(full).ok()?,
         )
     };
     let oid = gix::objs::compute_hash(repo.object_hash(), gix::object::Kind::Blob, &data).ok()?;

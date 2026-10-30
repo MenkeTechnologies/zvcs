@@ -2897,7 +2897,7 @@ fn unmerged_change(
 /// (`override_submodule_config`), else `submodule.<name>.ignore` from
 /// `set_diffopt_flags_from_submodule_config()` (submodule.c:180-199) over the
 /// diff-level default.
-fn gitlink_ignore(
+pub(super) fn gitlink_ignore(
     repo: &gix::Repository,
     submodules: gix::status::Submodule,
     path: &gix::bstr::BStr,

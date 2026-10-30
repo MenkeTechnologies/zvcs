@@ -407,10 +407,15 @@ fn resolve_file_type_with_index(
                 } else {
                     let icase_dir =
                         index.entry_closest_to_directory_or_directory_icase(rela_path.as_bstr(), true, accelerate);
+                    // index_dir_exists() only knows the parent components of indexed names
+                    // (name-hash.c:61-78), so a gitlink or sparse directory recorded at another
+                    // stage of this same conflicted path has no slash and is no directory with
+                    // entries below it; directory_exists_in_index_icase() (dir.c:1888-1901)
+                    // then falls back to the entry itself.
                     let directory_matches_exactly = icase_dir.is_some_and(|dir| {
                         let path = dir.path(index);
-                        let slash_idx = path.rfind_byte(b'/').expect("dir");
-                        path[..slash_idx].as_bstr() == rela_path
+                        path.rfind_byte(b'/')
+                            .is_some_and(|slash_idx| path[..slash_idx].as_bstr() == rela_path)
                     });
                     if directory_matches_exactly {
                         icase_directory_to_kinds(icase_dir)

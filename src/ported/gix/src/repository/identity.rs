@@ -17,8 +17,8 @@ use crate::{
 impl crate::Repository {
     /// Return the committer as configured by this repository, which is determined by…
     ///
-    /// * …the git configuration `committer.name|email`…
     /// * …the `GIT_COMMITTER_(NAME|EMAIL|DATE)` environment variables…
+    /// * …the git configuration `committer.name|email`…
     /// * …the configuration for `user.name|email` as fallback…
     ///
     /// …and in that order, or `None` if no committer name or email was configured, or `Some(Err(…))`
@@ -65,8 +65,8 @@ impl crate::Repository {
 
     /// Return the author as configured by this repository, which is determined by…
     ///
-    /// * …the git configuration `author.name|email`…
     /// * …the `GIT_AUTHOR_(NAME|EMAIL|DATE)` environment variables…
+    /// * …the git configuration `author.name|email`…
     /// * …the configuration for `user.name|email` as fallback…
     ///
     /// …and in that order, or `None` if there was nothing configured.
@@ -108,6 +108,17 @@ impl Personas {
             email_key: &keys::Any,
             fallback: Option<(&keys::Any, &keys::Any)>,
         ) -> (Option<BString>, Option<BString>) {
+            // `git_author_info()`/`git_committer_info()` hand `fmt_ident()`
+            // `getenv("GIT_<ROLE>_NAME")` and `getenv("GIT_<ROLE>_EMAIL")`, and only a
+            // field the environment leaves unset falls back to `<role>.name`/`.email`
+            // (ident.c:565-589, 468-493). The environment arrives as the
+            // `EnvOverride` copy of the fallback keys, so that copy outranks the
+            // configuration; a fallback set any other way stays below it.
+            let from_env = |key: Option<&keys::Any>| {
+                key.and_then(|key| config.string_filter(key, |meta| meta.source == gix_config::Source::EnvOverride))
+            };
+            let env_name = from_env(fallback.map(|(name_key, _)| name_key));
+            let env_email = from_env(fallback.map(|(_, email_key)| email_key));
             let fallback = fallback.and_then(|(name_key, email_key)| {
                 debug_assert_eq!(name_key.section.name(), email_key.section.name());
                 config
@@ -116,12 +127,16 @@ impl Personas {
                     .map(|section| (section, name_key, email_key))
             });
             (
-                config
-                    .string(name_key)
-                    .or_else(|| fallback.as_ref().and_then(|(s, name_key, _)| s.value(name_key.name))),
-                config
-                    .string(email_key)
-                    .or_else(|| fallback.as_ref().and_then(|(s, _, email_key)| s.value(email_key.name))),
+                env_name.or_else(|| {
+                    config
+                        .string(name_key)
+                        .or_else(|| fallback.as_ref().and_then(|(s, name_key, _)| s.value(name_key.name)))
+                }),
+                env_email.or_else(|| {
+                    config
+                        .string(email_key)
+                        .or_else(|| fallback.as_ref().and_then(|(s, _, email_key)| s.value(email_key.name)))
+                }),
             )
         }
         let parse_date = |key: &str, date: &keys::Any| -> Option<String> {

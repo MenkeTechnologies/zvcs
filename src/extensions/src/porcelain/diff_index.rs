@@ -93,7 +93,7 @@
 //! `ws.c` whitespace-error markup.
 //!
 //! Options that only steer patch/stat *shaping* (`--anchored=`, `--color-moved[=]`,
-//! `--word-diff` bare, `--ignore-submodules` bare, `-B`, `-l<n>`, `-a`/`--text`, `-W`,
+//! `--word-diff` bare, `-B`, `-l<n>`, `-a`/`--text`, `-W`,
 //! …) are accepted and ignored for the raw, `--name-only` and `--name-status`
 //! listings — stock git's bytes there are identical with and without them. The full
 //! list is `render_only_option`. Because this module does not *port* those shapers, a
@@ -140,6 +140,9 @@
 //!     `error: bad --word-diff argument: <mode>`.
 //!   * `--ignore-submodules=<v>` — only `none|untracked|dirty|all`; else exit 128
 //!     `fatal: bad --ignore-submodules argument: <v>`.
+//!     The value, or `all` for the bare flag, decides how a worktree gitlink is
+//!     judged (`match_stat_with_submodule()`, diff-lib.c:88-107) and whether a
+//!     gitlink pair is queued at all (`is_submodule_ignored()`, diff.c:7552).
 //!   * `--diff-algorithm[=]<v>` (both the `=<v>` and separated `--diff-algorithm <v>`
 //!     forms, matched case-insensitively) and the `--minimal`/`--patience`/`--histogram`
 //!     `OPT_BIT` aliases — all four of `parse_algorithm_value()`'s names select a real
@@ -239,8 +242,6 @@
 //!   and exit 128, and the tail is macOS `regerror()`'s wording for the unbalanced
 //!   bracket/parenthesis/brace and trailing-backslash errors
 //!   ([`super::diff_pickaxe::compile_regex`]) and the `regex` crate's message otherwise.
-//! * A locally modified but committed-clean submodule is reported as unchanged; git also
-//!   inspects the submodule worktree and would report it.
 //! * With a bare `--abbrev` and no `core.abbrev` set, the length comes from gitoxide's
 //!   unique-prefix computation for the first real id (falling back to 7); git derives it
 //!   from the packed object count, so the two can differ on large packed repositories.
@@ -370,6 +371,10 @@ struct Opts {
     rename: diffcore_rename::Options,
     /// `-p`/`-u`/`--patch`: render the unified patch body.
     patch: bool,
+    /// `--ignore-submodules[=<when>]` (`diff_opt_ignore_submodules()`, diff.c:5773-5787):
+    /// the bare form is `all`, and either spelling raises
+    /// `override_submodule_config`, so `submodule.<name>.ignore` is never consulted.
+    ignore_submodules: Option<gix::submodule::config::Ignore>,
     /// `-U<n>`/`--unified=<n>`: unified-diff context, git's default of 3.
     ctx: u32,
     /// `--inter-hunk-context=<n>`: `xecfg.interhunkctxlen`, the extra gap two change
@@ -464,6 +469,11 @@ struct Delta {
     /// keys the `%03d` suffix off the score rather than off the status letter.
     /// [`diffcore_rename::similarity_index`] turns it into the printed percentage.
     score: u32,
+    /// `p->one->dirty_submodule` and `p->two->dirty_submodule`: whether
+    /// `is_submodule_modified()` found the worktree gitlink on that side dirty, which
+    /// `diff_populate_gitlink()` (diff.c:4449-4459) shows as `-dirty`. Only the
+    /// worktree side is ever set; `-R` moves it with the rest of the pair.
+    dirty: [bool; 2],
 }
 
 /// The `p->one` side of a pair `diffcore_rename()` matched across paths.
@@ -648,7 +658,6 @@ fn render_only_option(a: &str) -> bool {
         "--ext-diff",
         "--full-index",
         "--function-context",
-        "--ignore-submodules",
         "--irreversible-delete",
         "--no-diff-merges",
         "--no-ext-diff",
@@ -1505,6 +1514,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     }
                 }
             }
+            "--ignore-submodules" => opts.ignore_submodules = Some(gix::submodule::config::Ignore::All),
             s if s.starts_with("--ignore-submodules=") => {
                 // `parse_ignore_submodules_arg`: `--ignore-submodules=<value>` accepts only
                 // `none`, `untracked`, `dirty` or `all` (case-sensitively); anything else,
@@ -1517,6 +1527,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                         128,
                         format!("fatal: bad --ignore-submodules argument: {val}\n").into_bytes(),
                     ));
+                } else {
+                    opts.ignore_submodules = gix::submodule::config::Ignore::try_from(val.as_bytes().as_bstr()).ok();
                 }
             }
             s if s.starts_with("--skip-to=") => {
@@ -2117,6 +2129,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
             std::mem::swap(&mut d.src_mode, &mut d.dst_mode);
             std::mem::swap(&mut d.src_id, &mut d.dst_id);
+            d.dirty.swap(0, 1);
         }
     }
 
@@ -2548,6 +2561,7 @@ fn plumbing_opts() -> Opts {
         pickaxe_all: false,
         rename: diffcore_rename::Options::default(),
         patch: false,
+        ignore_submodules: None,
         ctx: 3,
         inter_hunk_ctx: 0,
         check: false,
@@ -2647,6 +2661,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
 
     let all: BTreeSet<&BString> = tree.keys().chain(idx.keys()).collect();
     let mut racy_paths: Vec<BString> = Vec::new();
+    let mut gitlink_ignore = GitlinkIgnore::new(repo, opts);
     let mut deltas = Vec::new();
     for path in all {
         let src = tree.get(path).copied();
@@ -2662,6 +2677,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                 path: path.clone(),
                 rename: None,
                 score: 0,
+                dirty: [false, false],
             });
             continue;
         };
@@ -2683,6 +2699,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                     path: path.clone(),
                     rename: None,
                     score: 0,
+                    dirty: [false, false],
                 });
             }
             continue;
@@ -2701,6 +2718,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                 path: path.clone(),
                 rename: None,
                 score: 0,
+                dirty: [false, false],
             });
             continue;
         }
@@ -2708,6 +2726,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
         // git's `get_stat_data`.
         let mut dst_mode = info.mode;
         let mut dst_id = info.id;
+        let mut dirty_submodule = false;
         if !opts.cached && !info.cached_entry {
             let workdir = workdir.as_deref().expect("checked above");
             let full = worktree_path(workdir, path);
@@ -2722,9 +2741,30 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                         dst_id = null;
                     }
                 }
+                Ok(md) if md.is_dir() && (info.mode & S_IFMT) == 0o160000 => {
+                    // `match_stat_with_submodule()` (diff-lib.c:88-107): `ie_match_stat()`
+                    // on a gitlink is `ce_compare_gitlink()` (read-cache.c:268-284), the
+                    // submodule `HEAD` against the recorded id, and unless the pair is
+                    // ignored or only its dirtiness is, `is_submodule_modified()` asks the
+                    // submodule itself — when the gitlink did not move, or always under
+                    // `DIFF_FORMAT_PATCH`, which raises `flags.dirty_submodules`
+                    // (diff.c:5314-5315). Neither looks at `.gitmodules`.
+                    use gix::submodule::config::Ignore;
+                    let ignore = gitlink_ignore.get(path);
+                    if ignore != Ignore::All {
+                        let status =
+                            gix::submodule::status::gitlink_status(repo, path.as_bstr(), info.id, ignore, false)?;
+                        let changed = status.checked_out_head_id.is_some_and(|head| head != info.id);
+                        if changed {
+                            dst_mode = 0o160000;
+                            dst_id = null;
+                        }
+                        if ignore != Ignore::Dirty && (!changed || opts.patch) {
+                            dirty_submodule = status.changes.as_ref().is_some_and(|c| !c.is_empty());
+                        }
+                    }
+                }
                 Ok(md) => {
-                    // Submodules are left alone: deciding whether a checked-out
-                    // submodule is dirty needs a full status of its own worktree.
                     if (info.mode & S_IFMT) != 0o160000
                         && (info.intent_to_add
                             || entry_is_dirty(repo, info, &md, index_timestamp, stat_opts, &full, &mut racy_paths, path))
@@ -2748,7 +2788,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
         }
 
         let (src_mode, src_id) = src.unwrap_or((0, null));
-        if src_mode == dst_mode && src_id == dst_id {
+        if src_mode == dst_mode && src_id == dst_id && !dirty_submodule {
             // `oneway_diff()` (diff-lib.c:431): `--find-copies-harder` queues the
             // *unchanged* paths too, as `diff_same()` pairs, so `diffcore_rename()`
             // can use them as copy sources. Its own queue rebuild drops whichever of
@@ -2766,10 +2806,86 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
             path: path.clone(),
             rename: None,
             score: 0,
+            dirty: [false, dirty_submodule],
         });
     }
 
+    deltas.retain(|d| !gitlink_ignore.drops(d));
     Ok((deltas, racy_paths))
+}
+
+/// The submodule flag word `match_stat_with_submodule()` (diff-lib.c:93-104) and
+/// `is_submodule_ignored()` (diff.c:7552-7566) see for one gitlink.
+///
+/// `cmd_diff_index()` reads only `git_diff_basic_config()` (builtin/diff-index.c:31),
+/// and `diff.ignoreSubmodules` belongs to `git_diff_ui_config()` (diff.c:447-451), so
+/// with no `--ignore-submodules` no `handle_ignore_submodules_arg()` call happens and
+/// `repo_diff_setup()` raises `ignore_untracked_in_submodules` (diff.c:5148-5149).
+/// Unless the command line set
+/// `override_submodule_config`, `set_diffopt_flags_from_submodule_config()`
+/// (submodule.c:180-200) then replaces the whole word with the submodule's own
+/// `submodule.<name>.ignore`, from the configuration first and `.gitmodules`
+/// second. A gitlink `.gitmodules` does not name keeps the diff-level word.
+struct GitlinkIgnore<'a> {
+    repo: &'a gix::Repository,
+    command_line: Option<gix::submodule::config::Ignore>,
+    /// `.gitmodules`' `ignore` per submodule path, read at the first gitlink, as
+    /// `repo_read_gitmodules()` is.
+    per_path: Option<BTreeMap<BString, gix::submodule::config::Ignore>>,
+}
+
+impl<'a> GitlinkIgnore<'a> {
+    fn new(repo: &'a gix::Repository, opts: &Opts) -> Self {
+        GitlinkIgnore {
+            repo,
+            command_line: opts.ignore_submodules,
+            per_path: None,
+        }
+    }
+
+    fn get(&mut self, path: &BString) -> gix::submodule::config::Ignore {
+        if let Some(ignore) = self.command_line {
+            return ignore;
+        }
+        let repo = self.repo;
+        let per_path = self.per_path.get_or_insert_with(|| {
+            let mut map = BTreeMap::new();
+            let Ok(Some(subs)) = repo.submodules() else {
+                return map;
+            };
+            let snap = repo.config_snapshot();
+            for sub in subs {
+                let Ok(sub_path) = sub.path() else { continue };
+                let key = format!("submodule.{}.ignore", sub.name());
+                let ignore = match snap.string(key.as_str()) {
+                    Some(v) => gix::submodule::config::Ignore::try_from(v.as_ref()).ok(),
+                    None => sub.ignore().ok().flatten(),
+                };
+                if let Some(ignore) = ignore {
+                    map.insert(sub_path, ignore);
+                }
+            }
+            map
+        });
+        per_path
+            .get(path)
+            .copied()
+            .unwrap_or(gix::submodule::config::Ignore::Untracked)
+    }
+
+    /// `is_submodule_ignored()` as `diff_queue_addremove()` (diff.c:7590) and
+    /// `diff_queue_change()` (diff.c:7643-7645) apply it: a pair whose surviving
+    /// side, or both of whose sides, are gitlinks is not queued under `all`.
+    fn drops(&mut self, d: &Delta) -> bool {
+        let gitlink = |mode: u32| (mode & S_IFMT) == 0o160000;
+        let queued_as_gitlink = match (d.src_mode, d.dst_mode) {
+            (0, 0) => false,
+            (0, dst) => gitlink(dst),
+            (src, 0) => gitlink(src),
+            (src, dst) => gitlink(src) && gitlink(dst),
+        };
+        !d.unmerged && queued_as_gitlink && self.get(&d.path) == gix::submodule::config::Ignore::All
+    }
 }
 
 /// Flatten `tree_id` into `out`, keyed by repository-root relative path.
@@ -2999,18 +3115,22 @@ fn apply_rename_detection(
             unmerged.push((i, d));
             continue;
         }
-        let one = q.add_spec(diffcore_rename::FileSpec::new(
+        let mut one = diffcore_rename::FileSpec::new(
             d.src_path().clone(),
             d.src_mode,
             d.src_id,
             d.src_id != ObjectId::null(repo.object_hash()),
-        ));
-        let two = q.add_spec(diffcore_rename::FileSpec::new(
+        );
+        one.dirty_submodule = u8::from(d.dirty[0]);
+        let mut two = diffcore_rename::FileSpec::new(
             d.path.clone(),
             d.dst_mode,
             d.dst_id,
             d.dst_id != ObjectId::null(repo.object_hash()),
-        ));
+        );
+        two.dirty_submodule = u8::from(d.dirty[1]);
+        let one = q.add_spec(one);
+        let two = q.add_spec(two);
         q.add_pair(one, two);
     }
 
@@ -3042,6 +3162,7 @@ fn apply_rename_detection(
                 copy: p.status == b'C',
             }),
             score: p.score,
+            dirty: [one.dirty_submodule != 0, two.dirty_submodule != 0],
         });
     }
     // `diff_unmerge()`'s pairs kept their queue slots throughout, so splice them back
@@ -3126,8 +3247,8 @@ fn side_content(
         return Ok(None);
     }
     if (mode & S_IFMT) == 0o160000 {
-        // A submodule has no blob to compare; git uses its recorded commit id.
-        return Ok(Some(id.to_string().into_bytes()));
+        let dirty = d.dirty[usize::from(!source)];
+        return Ok(Some(gitlink_text(repo, workdir, id, &d.path, dirty)));
     }
     if id != null {
         return Ok(Some(repo.find_object(id)?.data.clone()));
@@ -3141,9 +3262,11 @@ fn side_content(
 /// `true` when the two sides of `d` hold the same content under the requested folding.
 fn sides_match(repo: &gix::Repository, workdir: Option<&Path>, d: &Delta, opts: &Opts) -> Result<bool> {
     let null = ObjectId::null(repo.object_hash());
-    // Identical recorded ids settle it without reading anything.
+    // Identical recorded ids settle it without reading anything, unless a gitlink
+    // side is dirty: `diff_unmodified_pair()` (diff.c:6484-6511) also requires both
+    // `dirty_submodule`s clear, as `-dirty` makes the `Subproject commit` texts differ.
     if d.src_id != null && d.dst_id != null {
-        if d.src_id == d.dst_id {
+        if d.src_id == d.dst_id && d.dirty == [false, false] {
             return Ok(true);
         }
         if !opts.ws.any() && opts.ignore_lines.is_none() {
@@ -3425,14 +3548,14 @@ fn content_of(
     mode: u32,
     id: ObjectId,
     path: &BString,
+    dirty: bool,
 ) -> Result<Option<Vec<u8>>> {
     let null = ObjectId::null(repo.object_hash());
     if mode == 0 {
         return Ok(None);
     }
     if (mode & S_IFMT) == 0o160000 {
-        // A submodule has no blob; git uses its recorded commit id as the "content".
-        return Ok(Some(id.to_string().into_bytes()));
+        return Ok(Some(gitlink_text(repo, workdir, id, path, dirty)));
     }
     if id != null {
         if let Ok(obj) = repo.find_object(id) {
@@ -3549,8 +3672,8 @@ fn analyze_index_delta(
     let src_id = fill_oid_info(repo, workdir, d.src_mode, d.src_id, &d.path)?;
     let dst_id = fill_oid_info(repo, workdir, d.dst_mode, d.dst_id, &d.path)?;
 
-    let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path)?.unwrap_or_default();
-    let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path)?.unwrap_or_default();
+    let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path, d.dirty[0])?.unwrap_or_default();
+    let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path, d.dirty[1])?.unwrap_or_default();
 
     // `diff_filespec_is_binary()` per side (diff.c:3712): the path's `diff` attribute is
     // consulted first — when it is `-diff`/`diff` or its driver sets `diff.<name>.binary`,
@@ -3779,10 +3902,32 @@ fn fill_oid_info(
     path: &BString,
 ) -> Result<ObjectId> {
     let null = ObjectId::null(repo.object_hash());
-    if id != null || mode == 0 || (mode & S_IFMT) == 0o160000 {
+    if id != null || mode == 0 {
         return Ok(id);
     }
+    if (mode & S_IFMT) == 0o160000 {
+        // `index_path()` on a directory is `repo_resolve_gitlink_ref(path, "HEAD")`
+        // (object-file.c), the submodule's checked-out commit.
+        return Ok(gitlink_head(workdir, path).unwrap_or(null));
+    }
     Ok(hash_worktree(repo, workdir, path)?.unwrap_or(null))
+}
+
+/// The submodule `HEAD` at the worktree gitlink `path`, as
+/// `repo_resolve_gitlink_ref(path, "HEAD")` reads it.
+fn gitlink_head(workdir: Option<&Path>, path: &BString) -> Option<ObjectId> {
+    let repo = gix::open(worktree_path(workdir?, path)).ok()?;
+    repo.head_id().ok().map(gix::Id::detach)
+}
+
+/// `diff_populate_gitlink()` (diff.c:4449-4459): a gitlink's text is
+/// `Subproject commit <id>`, `-dirty` glued on when `is_submodule_modified()`
+/// found its worktree dirty. A worktree side with no valid id names the commit
+/// `diff_fill_oid_info()` resolves for it.
+fn gitlink_text(repo: &gix::Repository, workdir: Option<&Path>, id: ObjectId, path: &BString, dirty: bool) -> Vec<u8> {
+    let null = ObjectId::null(repo.object_hash());
+    let id = if id == null { gitlink_head(workdir, path).unwrap_or(null) } else { id };
+    format!("Subproject commit {id}{}\n", if dirty { "-dirty" } else { "" }).into_bytes()
 }
 
 /// `strip_prefix()` (diff.c:4988-5001): drop `prefix_length` bytes, then one `/` if
@@ -3842,13 +3987,21 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[IdxAnalysis], opts: &Opts) -> 
             });
             continue;
         }
-        let (added, deleted) = if an.binary {
+        // A gitlink queued only for its `-dirty` worktree keeps one id on both sides:
+        // `builtin_diffstat()`'s `may_differ` (diff.c:4189-4190) is then false, so it
+        // counts nothing and the row stands at `0`.
+        let gitlink = |mode: u32| (mode & S_IFMT) == 0o160000;
+        let dirty_only =
+            gitlink(d.src_mode) && gitlink(d.dst_mode) && !d.src_id.is_null() && d.src_id == d.dst_id;
+        let (added, deleted) = if dirty_only {
+            (0, 0)
+        } else if an.binary {
             // Binary counts are byte sizes, not lines.
             (an.new_data.len() as u32, an.old_data.len() as u32)
         } else {
             (an.added, an.deleted)
         };
-        if d.status() == b'M' && added == 0 && deleted == 0 && d.src_mode == d.dst_mode && !an.binary {
+        if !dirty_only && d.status() == b'M' && added == 0 && deleted == 0 && d.src_mode == d.dst_mode && !an.binary {
             continue;
         }
         out.push(StatFile {

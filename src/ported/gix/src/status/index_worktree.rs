@@ -281,7 +281,7 @@ pub mod submodule_status {
         type Output = crate::submodule::Status;
         type Error = Error;
 
-        fn status(&mut self, _entry: &gix_index::Entry, rela_path: &BStr) -> Result<Option<Self::Output>, Self::Error> {
+        fn status(&mut self, entry: &gix_index::Entry, rela_path: &BStr) -> Result<Option<Self::Output>, Self::Error> {
             use bstr::ByteSlice;
             #[cfg(feature = "parallel")]
             let repo = self.repo.to_thread_local();
@@ -303,14 +303,25 @@ pub mod submodule_status {
                     None => Vec::new(),
                 }),
             };
-            if known.binary_search_by(|path| path.as_bstr().cmp(rela_path)).is_err() {
-                return Ok(None);
-            }
-            let Ok(Some(mut submodules)) = repo.submodules() else {
-                return Ok(None);
+            // A gitlink `.gitmodules` does not name is still compared:
+            // `submodule_from_path()` returns NULL, so no per-submodule `ignore`
+            // applies and the diff-level setting stands (submodule.c:180-200),
+            // and the comparison itself needs only `<path>/.git`.
+            let registered = known.binary_search_by(|path| path.as_bstr().cmp(rela_path)).is_ok();
+            let sm = if registered {
+                let Ok(Some(mut submodules)) = repo.submodules() else {
+                    return Ok(None);
+                };
+                let Some(sm) = submodules.find(|sm| sm.path().is_ok_and(|path| path == rela_path)) else {
+                    return Ok(None);
+                };
+                Some(sm)
+            } else {
+                None
             };
-            let Some(sm) = submodules.find(|sm| sm.path().is_ok_and(|path| path == rela_path)) else {
-                return Ok(None);
+            let sm_ignore = match &sm {
+                Some(sm) => sm.ignore()?,
+                None => None,
             };
             let (ignore, check_dirty) = match self.mode {
                 Submodule::AsConfigured { check_dirty } => {
@@ -325,18 +336,20 @@ pub mod submodule_status {
                         (ignore, check_dirty)
                     } else {
                         // If no global ignore is set, use the submodule's ignore setting.
-                        let ignore = sm.ignore()?.unwrap_or_default();
-                        (ignore, check_dirty)
+                        (sm_ignore.unwrap_or_default(), check_dirty)
                     }
                 }
                 Submodule::PerSubmoduleOr { fallback, check_dirty } => {
                     // submodule.c:190-196: `submodule.<name>.ignore` wins over the
                     // diff-level default the caller folded into `fallback`.
-                    (sm.ignore()?.unwrap_or(fallback), check_dirty)
+                    (sm_ignore.unwrap_or(fallback), check_dirty)
                 }
                 Submodule::Given { ignore, check_dirty } => (ignore, check_dirty),
             };
-            let status = sm.status(ignore, check_dirty)?;
+            let status = match &sm {
+                Some(sm) => sm.status(ignore, check_dirty)?,
+                None => crate::submodule::status::gitlink_status(&repo, rela_path, entry.id, ignore, check_dirty)?,
+            };
             Ok(status.is_dirty().and_then(|dirty| dirty.then_some(status)))
         }
     }

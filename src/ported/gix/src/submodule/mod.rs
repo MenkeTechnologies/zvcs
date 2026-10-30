@@ -474,38 +474,126 @@ pub mod status {
                 }
                 Some(repo) => repo,
             };
+            ladder(sm_repo, state, index_id, ignore, check_dirty, adjust_options)
+        }
+    }
 
-            let checked_out_head_id = sm_repo.head_id().ok().map(crate::Id::detach);
-            let mut status = Status {
+    /// The status of the gitlink at `rela_path` judged from `<path>/.git` alone,
+    /// which is all git consults; used for a gitlink `.gitmodules` does not name.
+    ///
+    /// git never needs a `.gitmodules` entry to judge a gitlink. The index walk's
+    /// `ce_compare_gitlink()` (read-cache.c:268-284) resolves `<path>/.git`'s
+    /// `HEAD` through `repo_resolve_gitlink_ref()` and compares it with the
+    /// entry's id, and `is_submodule_modified()` (submodule.c:1880-1902) reads
+    /// `<path>/.git` as a gitfile, falling back to the path itself, and calls the
+    /// submodule unpopulated — so unmodified — when that is no git directory.
+    /// `.gitmodules` only feeds `set_diffopt_flags_from_submodule_config()`,
+    /// where `submodule_from_path()` returning NULL simply leaves the diff-level
+    /// ignore setting in force (submodule.c:180-200). There is no
+    /// `.git/modules/<name>` fallback here: neither C function looks there.
+    pub fn gitlink_status(
+        repo: &crate::Repository,
+        rela_path: &crate::bstr::BStr,
+        index_id: gix_hash::ObjectId,
+        ignore: config::Ignore,
+        check_dirty: bool,
+    ) -> Result<Status, Error> {
+        let rela = gix_path::from_bstr(rela_path);
+        let work_dir = match repo.workdir() {
+            None => rela.into_owned(),
+            Some(prefix) => prefix.join(rela),
+        };
+        let worktree_gitdir = work_dir.join(gix_discover::DOT_GIT_DIR);
+        // submodule.c:1892-1895: `read_gitfile()`, else the `.git` path itself.
+        let git_dir = if worktree_gitdir.is_file() {
+            gix_discover::path::from_gitdir_file(&worktree_gitdir).unwrap_or_else(|_| worktree_gitdir.clone())
+        } else {
+            worktree_gitdir.clone()
+        };
+        let mut state = super::State {
+            repository_exists: git_dir.is_dir(),
+            is_old_form: worktree_gitdir.is_dir(),
+            worktree_checkout: worktree_gitdir.exists(),
+            superproject_configuration: false,
+        };
+        if ignore == config::Ignore::All {
+            return Ok(Status {
+                state,
+                ..Default::default()
+            });
+        }
+        let index_id = Some(index_id);
+        if !state.repository_exists {
+            return Ok(Status {
                 state,
                 index_id,
-                checked_out_head_id,
                 ..Default::default()
-            };
-            if ignore == config::Ignore::Dirty || check_dirty && status.is_dirty() == Some(true) {
-                return Ok(status);
-            }
-
-            if !state.worktree_checkout {
-                return Ok(status);
-            }
-            let statuses = adjust_options(sm_repo.status(gix_features::progress::Discard)?)
-                .index_worktree_options_mut(|opts| {
-                    if ignore == config::Ignore::Untracked {
-                        opts.dirwalk_options = None;
-                    }
-                })
-                .into_iter(None)?;
-            let mut changes = Vec::new();
-            for change in statuses {
-                changes.push(change?);
-                if check_dirty {
-                    break;
-                }
-            }
-            status.changes = Some(changes);
-            Ok(status)
+            });
         }
+        let mut options = repo.options.clone();
+        options.git_dir_trust = None;
+        let sm_repo = match crate::open_opts(&git_dir, options) {
+            Ok(mut sm_repo) => {
+                if sm_repo.workdir().is_none() {
+                    sm_repo.set_workdir(Some(work_dir)).map_err(open::Error::from)?;
+                }
+                sm_repo
+            }
+            Err(crate::open::Error::NotARepository { .. }) => {
+                state.repository_exists = false;
+                return Ok(Status {
+                    state,
+                    index_id,
+                    ..Default::default()
+                });
+            }
+            Err(err) => return Err(open::Error::from(err).into()),
+        };
+        ladder(sm_repo, state, index_id, ignore, check_dirty, &mut |s| s)
+    }
+
+    /// The part of the status computation that runs once the submodule
+    /// repository is open: its `HEAD`, then its own worktree status.
+    fn ladder(
+        sm_repo: crate::Repository,
+        state: super::State,
+        index_id: Option<gix_hash::ObjectId>,
+        ignore: config::Ignore,
+        check_dirty: bool,
+        adjust_options: &mut dyn for<'a> FnMut(
+            crate::status::Platform<'a, gix_features::progress::Discard>,
+        ) -> crate::status::Platform<'a, gix_features::progress::Discard>,
+    ) -> Result<Status, Error> {
+        let checked_out_head_id = sm_repo.head_id().ok().map(crate::Id::detach);
+        let mut status = Status {
+            state,
+            index_id,
+            checked_out_head_id,
+            ..Default::default()
+        };
+        if ignore == config::Ignore::Dirty || check_dirty && status.is_dirty() == Some(true) {
+            return Ok(status);
+        }
+
+        if !state.worktree_checkout {
+            return Ok(status);
+        }
+        let statuses = adjust_options(sm_repo.status(gix_features::progress::Discard)?)
+            .index_worktree_options_mut(|opts| {
+                if ignore == config::Ignore::Untracked {
+                    opts.dirwalk_options = None;
+                }
+            })
+            .into_iter(None)?;
+        let mut changes = Vec::new();
+        for change in statuses {
+            changes.push(change?);
+            if check_dirty {
+                break;
+            }
+        }
+        status.changes = Some(changes);
+        Ok(status)
     }
 
     impl Status {

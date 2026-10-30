@@ -763,11 +763,20 @@ struct SubmoduleIgnore {
     /// sets — and which makes the whole `.gitmodules` lookup below never happen.
     overridden: bool,
     /// `options->flags.ignore_dirty_submodules`, which only `dirty` raises
-    /// (`handle_ignore_submodules_arg()`, submodule.c:441-442). It changes no pair
-    /// this port queues — the gitlink itself is still diffed — but it does cancel
-    /// the worktree dirtiness probe, which is the one thing about it that is
-    /// observable here. See [`submodule_probe_warnings`].
+    /// (`handle_ignore_submodules_arg()`, submodule.c:441-442). It keeps
+    /// `match_stat_with_submodule()` (diff-lib.c:101-104) from asking
+    /// `is_submodule_modified()` at all, so a gitlink whose `HEAD` did not move is
+    /// no change and one that moved carries no `-dirty`; and it cancels the
+    /// worktree dirtiness probe of [`submodule_probe_warnings`].
     ignore_dirty: bool,
+    /// `options->flags.ignore_submodule_set`: some `handle_ignore_submodules_arg()`
+    /// call, from `diff.ignoreSubmodules` or the command line, has run. Until one
+    /// does, `repo_diff_setup()` (diff.c:5148-5149) raises
+    /// `ignore_untracked_in_submodules`.
+    ignore_set: bool,
+    /// `options->flags.ignore_untracked_in_submodules` as an explicit `untracked`
+    /// left it (submodule.c:439-440).
+    ignore_untracked: bool,
     /// Each `.gitmodules` path whose submodule names an `ignore` value, and whether
     /// that value is `all`. A path absent here is a submodule that names none.
     per_path: std::collections::HashMap<BString, bool>,
@@ -842,6 +851,31 @@ impl SubmoduleIgnore {
             return self.default_all;
         }
         self.per_path.get(path).copied().unwrap_or(self.default_all)
+    }
+
+    /// How the index↔worktree walk judges a gitlink: the flag word
+    /// `match_stat_with_submodule()` (diff-lib.c:93-104) sees, with
+    /// `set_diffopt_flags_from_submodule_config()` (submodule.c:180-200) applying
+    /// `submodule.<name>.ignore` per path unless the command line overrode it.
+    fn status_mode(&self) -> gix::status::Submodule {
+        use gix::submodule::config::Ignore;
+        let ignore = if self.default_all {
+            Ignore::All
+        } else if self.ignore_dirty {
+            Ignore::Dirty
+        } else if self.ignore_untracked || !self.ignore_set {
+            Ignore::Untracked
+        } else {
+            Ignore::None
+        };
+        if self.overridden {
+            gix::status::Submodule::Given { ignore, check_dirty: false }
+        } else {
+            gix::status::Submodule::PerSubmoduleOr {
+                fallback: ignore,
+                check_dirty: false,
+            }
+        }
     }
 
     /// Whether `is_submodule_ignored()` is consulted for this pair at all: the two
@@ -1666,6 +1700,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         if let Some(v) = snap.string("diff.ignoreSubmodules") {
             ignore_submodules.default_all = v.as_bstr() == "all";
             ignore_submodules.ignore_dirty = v.as_bstr() == "dirty";
+            ignore_submodules.ignore_untracked = v.as_bstr() == "untracked";
+            ignore_submodules.ignore_set = true;
         }
         // `diff.dirstat` (diff.c:521-532, inside `git_diff_basic_config()`): the
         // parsed parameters land in `default_diff_options`/`diff_dirstat_permille_
@@ -2327,6 +2363,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 ignore_submodules.overridden = true;
                 ignore_submodules.default_all = true;
                 ignore_submodules.ignore_dirty = false;
+                ignore_submodules.ignore_untracked = false;
+                ignore_submodules.ignore_set = true;
             }
             s if s.starts_with("--ignore-submodules=") => {
                 ignore_submodules.overridden = true;
@@ -2334,6 +2372,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // names (submodule.c:432-435), so each spelling is an assignment
                 // rather than an accumulation.
                 ignore_submodules.ignore_dirty = false;
+                ignore_submodules.ignore_untracked = false;
+                ignore_submodules.ignore_set = true;
                 match &s["--ignore-submodules=".len()..] {
                     "all" => ignore_submodules.default_all = true,
                     "dirty" => {
@@ -2343,7 +2383,11 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                     // `untracked` only relaxes what counts as a *modification* of a
                     // checked-out submodule; the gitlink pair itself stays in the
                     // queue, as does `none`'s.
-                    "none" | "untracked" => ignore_submodules.default_all = false,
+                    "none" => ignore_submodules.default_all = false,
+                    "untracked" => {
+                        ignore_submodules.default_all = false;
+                        ignore_submodules.ignore_untracked = true;
+                    }
                     v => {
                         eprintln!("fatal: bad --ignore-submodules argument: {v}");
                         return Ok(ExitCode::from(128));
@@ -3402,13 +3446,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             .to_owned();
         if revs.len() == 1 {
             old_tree_id = Some(tree_id_for(&repo, revs.first())?);
-            collect_tree_worktree(&repo, &revs[0], &paths, &mut deltas)?;
+            collect_tree_worktree(&repo, &revs[0], &paths, &mut deltas, ignore_submodules.status_mode())?;
         } else {
             collect_index_worktree(
                 &repo,
                 &workdir,
                 &paths,
                 &mut deltas,
+                ignore_submodules.status_mode(),
                 ita_invisible,
                 unmerged_stage,
                 files_combine,
@@ -4925,6 +4970,7 @@ fn collect_tree_worktree(
     spec: &str,
     paths: &[String],
     deltas: &mut Vec<Delta>,
+    submodules: gix::status::Submodule,
 ) -> Result<()> {
     let tree_id = rev_object(repo, spec)?.peel_to_tree()?.id;
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
@@ -4939,7 +4985,7 @@ fn collect_tree_worktree(
         .status(gix::progress::Discard)?
         .head_tree(tree_id)
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
-        .index_worktree_submodules(submodule_status())
+        .index_worktree_submodules(submodules)
         .index_worktree_options_mut(|o| {
             o.dirwalk_options = None; // exclude untracked files, matching `git diff`
             o.rewrites = None; // no rename detection
@@ -5068,17 +5114,6 @@ fn blob_operand(repo: &gix::Repository, name: &str, id: ObjectId) -> BlobOperand
             }
         }
         _ => fallback,
-    }
-}
-
-/// git's `ignore_untracked_in_submodules` default (`diff_setup_done()`, diff.c:5169):
-/// a diff never counts untracked files inside a submodule as damage, so the status
-/// walk is told the same thing rather than paying for a dirwalk whose result would
-/// be dropped.
-fn submodule_status() -> gix::status::Submodule {
-    gix::status::Submodule::Given {
-        ignore: gix::submodule::config::Ignore::Untracked,
-        check_dirty: false,
     }
 }
 
@@ -5225,6 +5260,8 @@ fn collect_index_worktree(
     workdir: &std::path::Path,
     paths: &[String],
     deltas: &mut Vec<Delta>,
+    // `match_stat_with_submodule()`'s view of a gitlink: [`SubmoduleIgnore::status_mode`].
+    submodules: gix::status::Submodule,
     ita_invisible: bool,
     // `revs->max_count` → `diff_unmerged_stage` (diff-lib.c:107): which conflict
     // stage the ordinary pair of an unmerged path compares. `None` is git's `-1`,
@@ -5241,7 +5278,7 @@ fn collect_index_worktree(
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
     let iter = repo
         .status(gix::progress::Discard)?
-        .index_worktree_submodules(submodule_status())
+        .index_worktree_submodules(submodules)
         .index_worktree_options_mut(|o| {
             o.dirwalk_options = None; // exclude untracked files, matching `git diff`
             o.rewrites = None; // no rename detection

@@ -40,6 +40,13 @@ gix = { path = "../ported/gix", features = [
     "merge",
     "sha256",
 ] }
+# `init_curl_http_auth()` hands the filled credential to curl for every URL
+# scheme (http.c:638-667); nothing in http.c withholds it over plain `http://`.
+# gix-transport refuses that unless this feature is on, which made every
+# authenticated push or fetch against an `http://` remote die before its retry.
+gix-transport = { path = "../ported/gix-transport", features = [
+    "http-client-insecure-credentials",
+] }
 # git's `reftable/` library, ported: `git refs migrate --ref-format=reftable`
 # writes the new store through it.
 gix-reftable = { path = "../ported/gix-reftable" }

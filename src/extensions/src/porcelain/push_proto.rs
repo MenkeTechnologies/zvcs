@@ -583,7 +583,10 @@ pub fn send_pack(
             ..Default::default()
         },
     )?;
-    let mut authenticate = connection.configured_credentials_for_current_url();
+    // remote-curl authenticates through `credential_fill()` and its helpers
+    // (http.c:638-667); see [`super::credential::transport_authenticate`].
+    let mut authenticate =
+        super::credential::transport_authenticate(repo.config_snapshot().plumbing().clone());
     let transport = connection.transport_mut();
     // Apply the repository's transport configuration (user agent, http.* options)
     // the same way gix's ref_map does before a handshake.
@@ -600,6 +603,10 @@ pub fn send_pack(
     ) {
         Ok(h) => h,
         Err(e) => {
+            // A 401 to the retry that carried credentials: `discover_refs()` dies.
+            if crate::transport_err::http_auth_fatal(url.as_str(), Some(repo), &e).is_some() {
+                crate::hosted::exit(128);
+            }
             let err = anyhow::Error::from(e).context("receive-pack handshake failed");
             // An ssh transport that never connected exits the way git's does.
             // `ssh_fatal` has already written git's block; this layer returns a

@@ -307,7 +307,11 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         }
     }
     let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
-        Ok(c) => c.with_server_options(server_options),
+        Ok(c) => c
+            .with_server_options(server_options)
+            .with_credentials(super::credential::transport_authenticate(
+                repo.config_snapshot().plumbing().clone(),
+            )),
         // A local path that is not a repository is `enter_repo()` coming back
         // NULL in `git_connect()`, which names the path and then adds the same
         // block an unreachable host produces.
@@ -336,6 +340,12 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             eprintln!("hint: see protocol.version in 'git help config' for more details");
             eprintln!("fatal: {e}");
             eprintln!("fatal: the remote end hung up unexpectedly");
+            return Ok(ExitCode::from(128));
+        }
+        // A 401 to the retry that carried credentials: `discover_refs()` dies.
+        Err(gix::remote::ref_map::Error::Handshake(e))
+            if crate::transport_err::http_auth_fatal(&url.to_string(), Some(&repo), &e).is_some() =>
+        {
             return Ok(ExitCode::from(128));
         }
         Err(e) => {
@@ -1005,9 +1015,15 @@ fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) 
         opts.upload_pack.as_deref().map(Into::into),
         "upload-pack",
     );
-    let refs = match advertised_refs(url.clone(), version, upload_pack, &opts.server_options) {
+    let refs = match advertised_refs(url.clone(), version, upload_pack, &opts.server_options, config) {
         Ok(refs) => refs,
         Err(err) => {
+            // A 401 to the retry that carried credentials: `discover_refs()` dies.
+            if let Some(e) = err.downcast_ref::<gix::protocol::handshake::Error>() {
+                if let Some(code) = crate::transport_err::http_auth_fatal(&raw.to_string(), None, e) {
+                    return code;
+                }
+            }
             if let Some(code) = crate::transport_err::ssh_fatal(&url.to_bstring().to_string(), &err)
                 .or_else(|| crate::transport_err::hang_up_fatal(&err))
             {
@@ -1027,6 +1043,7 @@ fn advertised_refs(
     version: gix::protocol::transport::Protocol,
     upload_pack: Option<gix::bstr::BString>,
     server_options: &[gix::bstr::BString],
+    config: gix::config::File,
 ) -> anyhow::Result<Vec<Ref>> {
     use gix::protocol::transport::client::blocking_io::connect;
     let mut transport = connect::connect(
@@ -1040,7 +1057,7 @@ fn advertised_refs(
     let mut handshake = gix::protocol::handshake(
         &mut transport,
         gix::protocol::transport::Service::UploadPack,
-        gix::credentials::builtin,
+        super::credential::transport_authenticate(config),
         Vec::new(),
         &mut gix::progress::Discard,
     )?;

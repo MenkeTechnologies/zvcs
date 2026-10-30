@@ -22,7 +22,8 @@ use std::process::ExitCode;
 ///     add-only and silently kept the old secret on a re-store — the daily-driver
 ///     bug where every later `get` re-prompts; modern git updates, and so do we.)
 ///   * `erase` → `SecKeychainFindInternetPassword` then `SecKeychainItemDelete`,
-///     gated on at least a protocol and host, exactly as upstream requires.
+///     gated on at least a protocol and host, exactly as upstream requires, and
+///     when a password is given only for an item that stores that password.
 ///
 /// Two write-suppression rules keep `store` from touching the keychain on every
 /// authenticated operation. A keychain *write* is a separate authorization from a
@@ -142,7 +143,7 @@ fn lock_self() -> Result<Option<std::fs::File>, String> {
 /// A credential description as read off stdin. Fields are kept even though the
 /// keychain calls that would consume them are unimplemented, so the parse stays
 /// a faithful mirror of upstream's `read_credential` rather than a line-counter.
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[allow(dead_code)] // consumed only by the unimplemented keychain operations
 struct Credential {
     protocol: Option<String>,
@@ -437,8 +438,10 @@ mod keychain {
     }
 
     /// Port of `find_username_in_item`: read the stored account attribute off a
-    /// located item and emit it as `username=`.
-    unsafe fn find_username_in_item(item_ref: SecKeychainItemRef) {
+    /// located item and emit it as `username=`. The name is also returned, because
+    /// upstream keeps it in the `username` global that `encode_state_seen()` reads
+    /// next (git-credential-osxkeychain.c:169).
+    unsafe fn find_username_in_item(item_ref: SecKeychainItemRef) -> Option<String> {
         let mut attr = SecKeychainAttribute {
             tag: K_SEC_ACCOUNT_ITEM_ATTR,
             length: 0,
@@ -456,11 +459,13 @@ mod keychain {
             ptr::null_mut(),
         ) != 0
         {
-            return;
+            return None;
         }
         let name = std::slice::from_raw_parts(attr.data as *const u8, attr.length as usize);
         write_item("username", name);
+        let name = String::from_utf8_lossy(name).into_owned();
         SecKeychainItemFreeContent(&mut list, ptr::null_mut());
+        Some(name)
     }
 
     /// `get` — port of `find_internet_password`.
@@ -470,14 +475,22 @@ mod keychain {
                 return;
             };
             write_item("password", &password);
-            if cred.username.is_none() {
-                find_username_in_item(item_ref);
-            }
+            // `if (!username) find_username_in_item(item);` fills the global the
+            // state token is encoded from, so the account found here is part of
+            // the token exactly as a caller-supplied one would be.
+            let found_username = match &cred.username {
+                Some(_) => None,
+                None => find_username_in_item(item_ref),
+            };
+            let seen = Credential {
+                username: cred.username.clone().or(found_username),
+                ..cred.clone()
+            };
             // Report what was handed out, so a `store` that merely echoes it back
             // can be recognized as redundant and skipped. Upstream emits both
             // lines unconditionally on a hit.
             write_item("capability[]", b"state");
-            write_item("state[]", &super::encode_state_seen(cred, &password));
+            write_item("state[]", &super::encode_state_seen(&seen, &password));
             // `item_ref` is a CoreFoundation object; the helper runs once per
             // process invocation and exits, so it is not released here — the same
             // as upstream's C, which also leaves it to process teardown.
@@ -573,9 +586,25 @@ mod keychain {
         if cred.protocol.is_none() || cred.host.is_none() {
             return;
         }
+        // `delete_ref()` (git-credential-osxkeychain.c:239-300): when the caller
+        // names a password, an item is only deleted if its stored secret, up to the
+        // metadata lines `add_internet_password()` appends after a newline, is that
+        // password — so rejecting a credential that was never the stored one, or
+        // has since been replaced, leaves the keychain alone. Upstream walks every
+        // match of the query (`kSecMatchLimitAll`); the legacy lookup used here
+        // yields one match at a time, so the walk stops at the first item whose
+        // secret differs.
         unsafe {
-            if let Some((_, item_ref)) = find(cred, false) {
-                SecKeychainItemDelete(item_ref);
+            while let Some((stored, item_ref)) = find(cred, cred.password.is_some()) {
+                if let Some(password) = &cred.password {
+                    let end = stored.iter().position(|&b| b == b'\n').unwrap_or(stored.len());
+                    if &stored[..end] != password.as_bytes() {
+                        break;
+                    }
+                }
+                if SecKeychainItemDelete(item_ref) != 0 {
+                    break;
+                }
             }
         }
     }

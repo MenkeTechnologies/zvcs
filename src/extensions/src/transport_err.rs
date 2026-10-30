@@ -269,3 +269,167 @@ pub fn hang_up_fatal(err: &anyhow::Error) -> Option<ExitCode> {
     eprintln!("fatal: {hang_up}");
     Some(ExitCode::from(128))
 }
+
+/// `discover_refs()`'s `HTTP_NOAUTH` case (remote-curl.c:524-527), or `None` when
+/// `err` is not a refusal of the credentials the handshake retried with:
+///
+/// ```c
+/// case HTTP_NOAUTH:
+///         show_http_message(&type, &charset, &buffer);
+///         die(_("Authentication failed for '%s'"),
+///             transport_anonymize_url(url.buf));
+/// ```
+///
+/// `handle_curl_result()` only returns `HTTP_NOAUTH` for a `401` to a request that
+/// carried a username and password, after `credential_reject()` has erased them
+/// (http.c:1945-1955); the vendored handshake has done the same erase by the time
+/// it reports `InvalidCredentials`. `url` is the remote's URL as configured, which
+/// remote-curl ends with a slash (`end_url_with_slash()`, remote-curl.c:1587-1589).
+/// Exit 128.
+pub fn http_auth_fatal(
+    url: &str,
+    repo: Option<&gix::Repository>,
+    err: &gix::protocol::handshake::Error,
+) -> Option<ExitCode> {
+    let gix::protocol::handshake::Error::InvalidCredentials { source, .. } = err else {
+        return None;
+    };
+    if let Some(response) = source
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<gix::protocol::transport::client::blocking_io::http::ErrorResponse>())
+    {
+        show_http_message(response, repo);
+    }
+    let mut url = url.to_owned();
+    if !url.is_empty() && !url.ends_with('/') {
+        url.push('/');
+    }
+    eprintln!("fatal: Authentication failed for '{}'", transport_anonymize_url(&url));
+    Some(ExitCode::from(128))
+}
+
+/// `show_http_message()` (remote-curl.c:370-395): a `text/plain` body is reencoded
+/// from its charset to the log output encoding, trimmed, and printed one
+/// `remote: ` line per line; any other type, or an empty body, prints nothing.
+fn show_http_message(
+    response: &gix::protocol::transport::client::blocking_io::http::ErrorResponse,
+    repo: Option<&gix::Repository>,
+) {
+    let (kind, charset) = extract_content_type(response.content_type.as_deref().unwrap_or(""));
+    if kind != "text/plain" {
+        return;
+    }
+    let mut msg = response.body.clone();
+    if !charset.is_empty() {
+        let to = match repo {
+            Some(repo) => crate::revfilter::log_output_encoding(repo, None),
+            None => "UTF-8".to_owned(),
+        };
+        // `strbuf_reencode()` leaves the buffer alone when the conversion fails.
+        if let Some(converted) = crate::porcelain::mailinfo::reencode(&msg, &charset, &to) {
+            msg = converted;
+        }
+    }
+    let msg = msg.trim_ascii();
+    if msg.is_empty() {
+        return;
+    }
+    for line in msg.split(|&b| b == b'\n') {
+        let mut out = b"remote: ".to_vec();
+        out.extend_from_slice(line);
+        out.push(b'\n');
+        use std::io::Write;
+        std::io::stderr().write_all(&out).ok();
+    }
+}
+
+/// `extract_content_type()` (http.c:2071-2101): the media type with whitespace
+/// dropped and lower-cased up to the first `;`, then the `charset` parameter,
+/// which defaults to `ISO-8859-1` for a `text/` type that names none.
+fn extract_content_type(raw: &str) -> (String, String) {
+    let raw = raw.as_bytes();
+    let mut kind = String::new();
+    let mut p = 0;
+    while p < raw.len() {
+        let c = raw[p];
+        p += 1;
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b';' {
+            break;
+        }
+        kind.push(c.to_ascii_lowercase() as char);
+    }
+    let mut charset = String::new();
+    while p < raw.len() {
+        while p < raw.len() && (raw[p].is_ascii_whitespace() || raw[p] == b';') {
+            p += 1;
+        }
+        // `extract_param(p, "charset", charset)`
+        let rest = &raw[p..];
+        if rest.len() > 7 && rest[..7].eq_ignore_ascii_case(b"charset") && rest[7] == b'=' {
+            charset = rest[8..]
+                .iter()
+                .take_while(|&&b| !b.is_ascii_whitespace() && b != b';')
+                .map(|&b| b as char)
+                .collect();
+            return (kind, charset);
+        }
+        while p < raw.len() && !raw[p].is_ascii_whitespace() {
+            p += 1;
+        }
+    }
+    if charset.is_empty() && kind.starts_with("text/") {
+        charset.push_str("ISO-8859-1");
+    }
+    (kind, charset)
+}
+
+/// `transport_anonymize_url()` (transport.c:1744-1784): drop the userinfo of a
+/// `<scheme>://<userinfo>@<host>…` or `<userinfo>@<host>:<path>` URL; anything
+/// else, a local path included, is returned unchanged.
+pub fn transport_anonymize_url(url: &str) -> String {
+    let Some(at) = url.find('@') else {
+        return url.to_owned();
+    };
+    if url_is_local_not_ssh(url) {
+        return url.to_owned();
+    }
+    let anon_part = &url[at + 1..];
+    let prefix_len = match url.find("://") {
+        None => {
+            // cannot be "me@there:/path/name"
+            if !anon_part.contains(':') {
+                return url.to_owned();
+            }
+            0
+        }
+        Some(scheme_end) => {
+            // make sure scheme is reasonable (RFC 1738 2.1)
+            if !url[..scheme_end]
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'.' | b'-'))
+            {
+                return url.to_owned();
+            }
+            // @ past the first slash does not count
+            if url[scheme_end + 3..].find('/').is_some_and(|slash| scheme_end + 3 + slash < at) {
+                return url.to_owned();
+            }
+            scheme_end + 3
+        }
+    };
+    format!("{}{}", &url[..prefix_len], anon_part)
+}
+
+/// `url_is_local_not_ssh()` (url.c:136-142) off Windows, where
+/// `has_dos_drive_prefix()` is always false.
+fn url_is_local_not_ssh(url: &str) -> bool {
+    let colon = url.find(':');
+    let slash = url.find('/');
+    match colon {
+        None => true,
+        Some(colon) => slash.is_some_and(|slash| slash < colon),
+    }
+}

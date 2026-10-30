@@ -268,6 +268,99 @@ fn run(op: Op) -> Result<ExitCode> {
     }
 }
 
+/// The credential callback zvcs's own transports authenticate through: remote-curl's
+/// `http_auth`, filled by `credential_fill()` after a `401` and settled by
+/// `credential_approve()` or `credential_reject()` once the retry is answered
+/// (http.c:1925-1955).
+///
+/// Every action re-reads `[credential]` the way `credential_apply_config()` does
+/// (credential.c:172-207), through [`standalone_credential_helpers`]'s port of
+/// `urlmatch_config_entry()` — so a `credential.<url>.helper` matches on the same
+/// prefix rule `git credential fill` uses, and a `-c credential.helper=…` runs once.
+///
+/// A `get` runs the helpers with the cascade's own prompt switched off and then,
+/// as `credential_fill()` does, falls back to `credential_getpass()` for what they
+/// left out. Its failures are `credential_fill()`'s `die()`s: `could not read
+/// Username for '<url>': terminal prompts disabled` under `GIT_TERMINAL_PROMPT=0`,
+/// `unable to get password from user` under `credential.interactive=never`, exit
+/// 128 — not an error handed back up the transport.
+pub(crate) fn transport_authenticate(
+    cfg: gix::config::File,
+) -> impl FnMut(Action) -> gix::credentials::protocol::Result {
+    move |action| {
+        use gix::credentials::protocol::Error;
+
+        let url = match &action {
+            Action::Get(ctx) => ctx.url.clone().or_else(|| ctx.to_url()),
+            Action::Store(payload) | Action::Erase(payload) => {
+                Context::from_bytes(payload.as_slice(), Default::default())
+                    .ok()
+                    .and_then(|ctx| ctx.to_url())
+            }
+        }
+        .ok_or(Error::UrlMissing)?;
+        let url = gix::url::parse(url.as_bstr()).map_err(|e| Error::UrlParse(e))?;
+        let (mut cascade, get, prompt) = match standalone_credential_helpers(&cfg, url) {
+            Ok(parts) => parts,
+            Err(msg) => {
+                fatal(&msg);
+                crate::hosted::exit(128);
+            }
+        };
+        discount_echoed_helpers(&mut cascade);
+
+        if !matches!(action, Action::Get(_)) {
+            return cascade.invoke(action, prompt);
+        }
+        let helpers_only = gix::prompt::Options {
+            mode: gix::prompt::Mode::Disable,
+            askpass: prompt.askpass.clone(),
+        };
+        let context = match cascade.invoke(get, helpers_only) {
+            Err(Error::IdentityMissing { context }) => context,
+            other => return other,
+        };
+
+        // What the helpers did produce comes back redacted; a secret that reads
+        // `<redacted>` is unusable and is asked for again.
+        let unredacted = |v: Option<String>| v.filter(|v| v != "<redacted>");
+        let mut cred = Cred {
+            protocol: context.protocol.clone().map(Into::into),
+            host: context.host.clone().map(Into::into),
+            path: context.path.clone(),
+            username: context.username.clone().map(Into::into),
+            password: unredacted(context.password.clone()).map(Into::into),
+            ..Default::default()
+        };
+        if let Err(msg) = credential_getpass(&cfg, &mut cred, &prompt) {
+            fatal(&msg);
+            crate::hosted::exit(128);
+        }
+        let (Some(username), Some(password)) = (cred.username, cred.password) else {
+            fatal("unable to get password from user");
+            crate::hosted::exit(128);
+        };
+        let username = username.to_string();
+        let password = password.to_string();
+        let oauth_refresh_token = unredacted(context.oauth_refresh_token.clone());
+        let next = Context {
+            username: Some(username.clone()),
+            password: Some(password.clone()),
+            oauth_refresh_token: oauth_refresh_token.clone(),
+            url: None,
+            ..context
+        };
+        Ok(Some(gix::credentials::protocol::Outcome {
+            identity: gix::sec::identity::Account {
+                username,
+                password,
+                oauth_refresh_token,
+            },
+            next: next.into(),
+        }))
+    }
+}
+
 /// The helper cascade for a `git credential` run that found no repository —
 /// [`gix::config::Snapshot::credential_helpers`] needs one, but git's
 /// `credential_apply_config` only ever reads configuration, so system and
@@ -538,17 +631,94 @@ fn ask_one(
     } else {
         format!("{what} for '{desc}': ")
     };
-    // `PROMPT_ECHO` for the username, hidden for the password; either way an
-    // askpass program takes precedence, which is what `PROMPT_ASKPASS` means.
-    let opts = gix::prompt::Options {
-        mode: if what == "Password" {
-            gix::prompt::Mode::Hidden
-        } else {
-            gix::prompt::Mode::Visible
-        },
-        askpass: prompt.askpass.clone(),
+    // `PROMPT_ASKPASS | PROMPT_ECHO` for the username, `PROMPT_ASKPASS` alone for
+    // the password (credential.c:241-266).
+    git_prompt(&message, what != "Password", prompt.askpass.as_deref())
+}
+
+/// Port of `git_prompt()` (prompt.c:47-77) with `PROMPT_ASKPASS`: the askpass
+/// program, then the terminal, and `die("could not read %s%s", prompt, err)`
+/// when neither answered — `err` being `strerror(errno)` of the failed terminal
+/// prompt, or `terminal prompts disabled` under `GIT_TERMINAL_PROMPT=0`.
+///
+/// `askpass` is already `GIT_ASKPASS`, else `core.askPass`, else `SSH_ASKPASS`
+/// ([`gix::prompt::Options::apply_environment`]); an empty one is set but not
+/// run, as `askpass && *askpass` has it. Returns the `die()` text on failure.
+fn git_prompt(
+    prompt: &str,
+    echo: bool,
+    askpass: Option<&std::path::Path>,
+) -> std::result::Result<String, String> {
+    if let Some(cmd) = askpass.filter(|cmd| !cmd.as_os_str().is_empty()) {
+        if let Some(answer) = do_askpass(cmd, prompt) {
+            return Ok(answer);
+        }
+    }
+    let err = if crate::setup::git_env_bool("GIT_TERMINAL_PROMPT", true) {
+        let opts = gix::prompt::Options {
+            mode: if echo {
+                gix::prompt::Mode::Visible
+            } else {
+                gix::prompt::Mode::Hidden
+            },
+            askpass: None,
+        };
+        match gix::prompt::ask(prompt, &opts) {
+            Ok(answer) => return Ok(answer),
+            Err(gix::prompt::Error::TtyIo(e)) => crate::external::strerror(&e),
+            Err(e) => e.to_string(),
+        }
+    } else {
+        "terminal prompts disabled".to_owned()
     };
-    gix::prompt::ask(&message, &opts).map_err(|e| format!("could not prompt for {what}: {e}"))
+    // prompts already contain ": " at the end
+    Err(format!("could not read {prompt}{err}"))
+}
+
+/// Port of `do_askpass()` (prompt.c:12-45): run `<cmd> <prompt>` without a
+/// shell and keep its stdout up to the first CR or LF. A program that cannot be
+/// started is `start_command()`'s own `error: cannot run …`; one that ran but
+/// failed is `unable to read askpass response from '<cmd>'`. Either way the
+/// terminal is asked next.
+fn do_askpass(cmd: &std::path::Path, prompt: &str) -> Option<String> {
+    let child = std::process::Command::new(cmd)
+        .arg(prompt)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        // A name with no `/` that `locate_in_PATH()` cannot find fails in the
+        // parent as `error: cannot run <cmd>` (run-command.c:434-443, :757-762);
+        // any other failure is the forked child's `exec`, reported up the notify
+        // pipe through the die routine as `fatal: cannot exec '<cmd>'`
+        // (run-command.c:403-405).
+        Err(e) => {
+            let shown = cmd.display();
+            let err = crate::external::strerror(&e);
+            let searched = !cmd.as_os_str().as_encoded_bytes().contains(&b'/');
+            if searched && e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!("error: cannot run {shown}: {err}");
+            } else {
+                eprintln!("fatal: cannot exec '{shown}': {err}");
+            }
+            return None;
+        }
+    };
+    match child.wait_with_output() {
+        Ok(out) if out.status.success() => {
+            let end = out
+                .stdout
+                .iter()
+                .position(|&b| b == b'\r' || b == b'\n')
+                .unwrap_or(out.stdout.len());
+            Some(String::from_utf8_lossy(&out.stdout[..end]).into_owned())
+        }
+        _ => {
+            eprintln!("error: unable to read askpass response from '{}'", cmd.display());
+            None
+        }
+    }
 }
 
 /// `credential_describe()`: the credential as a url, verbatim.

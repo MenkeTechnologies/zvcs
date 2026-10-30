@@ -4340,6 +4340,7 @@ dependencies = [
  "fancy-regex",
  "gix",
  "gix-reftable",
+ "gix-transport",
  "ignore",
  "libc",
  "libloading",

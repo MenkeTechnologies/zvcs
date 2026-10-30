@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 
 use crate::client::blocking_io::http::{
     self,
+    ErrorResponse,
     options::{FollowRedirects, HttpVersion, ProxyAuthMethod, SslVersion, SslVersionRangeInclusive},
     redirect::{self, Action as RedirectAction},
     reqwest::Remote,
@@ -627,6 +628,26 @@ impl Default for Remote {
                     pending = Some(replay);
                 };
 
+                // remote-curl's `discover_refs()` keeps the body and `Content-Type` of a refused
+                // request and hands them to `show_http_message()` before it dies (remote-curl.c:516-545),
+                // so they are read off an error response here, ahead of `error_for_status()`
+                // consuming it.
+                let (executed, content_type, body) = match executed {
+                    Ok(res) if res.status().is_client_error() || res.status().is_server_error() => {
+                        let content_type = res
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+                        match res.error_for_status_ref().err() {
+                            Some(err) => {
+                                let body = res.bytes().map(|b| b.to_vec()).unwrap_or_default();
+                                (Err(err), content_type, body)
+                            }
+                            None => (Ok(res), None, Vec::new()),
+                        }
+                    }
+                    other => (other, None, Vec::new()),
+                };
                 let mut res = match executed.and_then(reqwest::blocking::Response::error_for_status) {
                     Ok(res) => res,
                     Err(err) => {
@@ -647,7 +668,14 @@ impl Default for Remote {
                                 } else {
                                     std::io::ErrorKind::Other
                                 };
-                                std::io::Error::new(kind, format!("Received HTTP status {}", status.as_str()))
+                                std::io::Error::new(
+                                    kind,
+                                    ErrorResponse {
+                                        status: status.as_u16(),
+                                        content_type,
+                                        body,
+                                    },
+                                )
                             }
                             // Preserve the `reqwest::Error` as the source so the underlying cause -- e.g. a
                             // connection or TLS failure -- isn't lost. It was previously stringified, which

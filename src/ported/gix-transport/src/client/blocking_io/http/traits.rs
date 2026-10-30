@@ -83,6 +83,29 @@ impl<A, B, C> From<PostResponse<A, B, C>> for GetResponse<A, B> {
     }
 }
 
+/// An HTTP response with an error status, carried as the inner error of the `std::io::Error` a backend reports it
+/// with, so a caller can still show what the server said.
+///
+/// remote-curl's `discover_refs()` keeps the body of a refused ref request together with its `Content-Type` and
+/// passes both to `show_http_message()` ahead of its `die()` (remote-curl.c:516-545); this is that pair.
+#[derive(Debug, Clone)]
+pub struct ErrorResponse {
+    /// The HTTP status code.
+    pub status: u16,
+    /// The raw `Content-Type` header value, if the response had one.
+    pub content_type: Option<String>,
+    /// The response body.
+    pub body: Vec<u8>,
+}
+
+impl std::fmt::Display for ErrorResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Received HTTP status {}", self.status)
+    }
+}
+
+impl std::error::Error for ErrorResponse {}
+
 /// A trait to abstract the HTTP operations needed to power all git interactions: read via GET and write via POST.
 /// Note that 401 must be turned into `std::io::Error(PermissionDenied)`, and other non-success http statuses must be transformed
 /// into `std::io::Error(Other)`

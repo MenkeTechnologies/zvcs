@@ -8,7 +8,7 @@ use std::{
 
 use base64::Engine;
 use bstr::BStr;
-pub use traits::{Error, GetResponse, Http, PostBodyDataKind, PostResponse};
+pub use traits::{Error, ErrorResponse, GetResponse, Http, PostBodyDataKind, PostResponse};
 
 use crate::{
     Protocol, Service,

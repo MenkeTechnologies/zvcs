@@ -3326,6 +3326,11 @@ fn fetch_one(
     let transport_progress = super::fetch_progress::transport_progress(opts.quiet, opts.progress);
     let remote_output = super::fetch_progress::RemoteOutput::new(repo);
     connection.set_transfer_progress(!transport_progress, Some(remote_output.handler()));
+    // remote-curl authenticates through `credential_fill()` and its helpers
+    // (http.c:638-667); see [`super::credential::transport_authenticate`].
+    connection.set_credentials(super::credential::transport_authenticate(
+        repo.config_snapshot().plumbing().clone(),
+    ));
 
     // `--negotiate-only` never lists refs and never asks for a pack: it runs the negotiation on its
     // own and prints the commits the remote acknowledged as common, one per line.
@@ -3361,6 +3366,12 @@ fn fetch_one(
         .prepare_fetch(&mut *progress, map_options)
     {
         Ok(p) => p,
+        // A 401 to the retry that carried credentials: `discover_refs()` dies.
+        Err(gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Handshake(e)))
+            if crate::transport_err::http_auth_fatal(&raw_url, Some(repo), &e).is_some() =>
+        {
+            return Ok(Verdict::Fatal);
+        }
         // git's `die_if_server_options()` also prints the advice line, and both it and the
         // "server doesn't support" case are `fatal:` exits rather than per-remote failures.
         Err(gix::remote::fetch::prepare::Error::RefMap(

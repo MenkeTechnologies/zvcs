@@ -259,6 +259,41 @@ fn picks_ask_for_the_committer_and_reverts_for_both() {
     }
 }
 
+/// `print_commit_summary()` adds ` Committer:` and the implicit-identity advice when
+/// the committer's address was not given (sequencer.c:1453-1460). An `author.email`
+/// alone is a `*.email` key, so `ident_default_email()` computes nothing and the
+/// committer commits on an empty address the summary names — on any machine,
+/// whatever its host or gecos field. The advice reads `~/.gitconfig` existing as
+/// the `config` wording (sequencer.c:1399-1413) and `advice.implicitIdentity` turns
+/// it off; `GIT_COMMITTER_EMAIL`, even empty, or `user.email` makes it sufficient.
+#[test]
+fn the_summary_names_a_committer_whose_address_was_not_given() {
+    let Some(f) = Fixture::new("summary") else { return };
+    let config: &[(&str, &str)] = &[("author.email", "ae@example.com")];
+    let quiet: &[(&str, &str)] = &[("author.email", "ae@example.com"), ("advice.implicitIdentity", "false")];
+    let user: &[(&str, &str)] = &[("user.email", "ue@example.com")];
+    let envs: &[&[(&str, &str)]] = &[
+        &[("GIT_COMMITTER_NAME", "Env C")],
+        &[("GIT_COMMITTER_NAME", "Env C"), ("GIT_COMMITTER_EMAIL", "")],
+        &[("GIT_COMMITTER_NAME", "Env C"), ("EMAIL", "e@example.com")],
+    ];
+    for home_config in [false, true] {
+        if home_config {
+            std::fs::write(f.root.join(".gitconfig"), "").unwrap();
+        }
+        for config in [config, quiet, user] {
+            for env in envs {
+                f.same(false, config, env, &["commit", "--allow-empty", "-m", "e"]);
+                f.same(false, config, env, &["commit", "--amend", "--no-edit"]);
+                f.same(false, config, env, &["cherry-pick", "side"]);
+                f.same(false, config, env, &["revert", "--no-edit", "HEAD"]);
+            }
+        }
+    }
+    let got = f.same(false, config, envs[0], &["commit", "--allow-empty", "-m", "e"]);
+    assert!(got.stdout.contains("\n Committer: Env C <>\n"), "{}", got.stdout);
+}
+
 /// A merge-backend rebase replays each pick with its own author, so only the
 /// committer is looked up, and the death keeps the state directory resumable.
 #[test]

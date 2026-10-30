@@ -138,6 +138,9 @@ pub enum Advice {
     /// `repo_default_branch_name()` fell back to the built-in initial branch name
     /// because `init.defaultBranch` is unset (refs.c:709-711).
     DefaultBranchName,
+    /// `print_commit_summary()`'s note after ` Committer:` that the identity was
+    /// worked out from the account and host (sequencer.c:1456-1459).
+    ImplicitIdentity,
 }
 
 impl Advice {
@@ -188,6 +191,7 @@ impl Advice {
             Advice::AddIgnoredFile => "advice.addIgnoredFile",
             Advice::SparseIndexExpanded => "advice.sparseIndexExpanded",
             Advice::DefaultBranchName => "advice.defaultBranchName",
+            Advice::ImplicitIdentity => "advice.implicitIdentity",
         }
     }
 

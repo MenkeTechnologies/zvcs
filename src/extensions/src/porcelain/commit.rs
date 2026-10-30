@@ -3006,6 +3006,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         println!(" Date: {dt}");
     }
+    // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
+    print!(
+        "{}",
+        crate::summary_committer_block(&repo, &format!("{} <{}>", committer.name, committer.email))
+    );
 
     // --- short-stat + summary --------------------------------------------
     // `log_tree_diff()` bails out on a commit with more than one parent unless a
@@ -3973,7 +3978,7 @@ fn editor_status_block(
             ),
         );
     }
-    if !committer_ident_sufficiently_given(&repo.config_snapshot()) {
+    if !crate::committer_ident_sufficiently_given(&repo) {
         ident_line(
             &mut buf,
             format!("Committer: {} <{}>", committer.name, committer.email),
@@ -3983,21 +3988,6 @@ fn editor_status_block(
     // clarity" (builtin/commit.c:1021).
     buf.push_str(&format!("{comment}\n"));
     Ok(buf)
-}
-
-/// git's `committer_ident_sufficiently_given()` (ident.c:600-603): whether the
-/// committer's *address* was given rather than worked out from the machine. The
-/// editor block names the committer only when it was not (builtin/commit.c:1013),
-/// which is how a first-time user is told what is about to be recorded.
-///
-/// `IDENT_MAIL_GIVEN` comes from `GIT_COMMITTER_EMAIL` (ident.c:582-583), from
-/// `committer.email` / `user.email` in the config (ident.c:645-648, :663-666),
-/// and from `EMAIL` when `ident_default_email()` fell back to it (ident.c:176-179).
-/// A hostname, `/etc/mailname` or passwd guess is none of those.
-fn committer_ident_sufficiently_given(snap: &gix::config::Snapshot<'_>) -> bool {
-    let env = |key: &str| std::env::var_os(key).is_some_and(|v| !v.is_empty());
-    let cfg = |key: &str| snap.string(key).is_some_and(|v| !v.is_empty());
-    env("GIT_COMMITTER_EMAIL") || cfg("committer.email") || cfg("user.email") || env("EMAIL")
 }
 
 /// git's `wt_status_add_cut_line()`: the `>8` scissors line plus the two-line

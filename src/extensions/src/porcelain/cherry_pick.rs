@@ -1785,6 +1785,8 @@ fn pick_one(
         use gix::date::time::format;
         println!(" Date: {}", author_time.format_or_unix(format::DEFAULT));
     }
+    // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
+    print!("{}", crate::summary_committer_block(&repo, &committer_ident));
     print_diffstat(head_tree, tree_id)?;
 
     state.head_id = new_id;
@@ -2328,6 +2330,8 @@ fn continue_single_pick(
         use gix::date::time::format;
         println!(" Date: {}", author.time()?.format_or_unix(format::DEFAULT));
     }
+    // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
+    print!("{}", crate::summary_committer_block(repo, &committer_ident));
     let head_tree = repo.find_commit(head_id)?.tree_id()?.detach();
     print_diffstat(head_tree, tree_id)?;
     Ok(Ok(()))

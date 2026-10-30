@@ -1739,6 +1739,90 @@ pub fn commit_ident_verdicts() -> (Option<&'static IdentRefusal>, Option<&'stati
     }
 }
 
+/// git's `committer_ident_sufficiently_given()` (ident.c:591-603): whether
+/// `IDENT_MAIL_GIVEN` is in `committer_ident_explicitly_given`, i.e. the committer's
+/// address was given rather than worked out from the account and host.
+///
+/// The bit comes from `GIT_COMMITTER_EMAIL` being set at all, even empty
+/// (`getenv()`, ident.c:582-583), from a `committer.email` or `user.email` key
+/// (`set_ident()`, ident.c:642-650, :663-671), and from `EMAIL` when
+/// `ident_default_email()` took it (ident.c:173-179) — which it computes only
+/// while no `*.email` key was read. The fields [`ensure_reflog_identity`] and
+/// [`prepare_fallback_ident`] inject live in `Source::Api` files and were given by
+/// nobody, so they do not count.
+pub fn committer_ident_sufficiently_given(repo: &gix::Repository) -> bool {
+    let cfg = repo.config_snapshot();
+    let configured = |key: &str| {
+        cfg.plumbing()
+            .string_filter(key, |meta| meta.source != gix::config::Source::Api)
+            .is_some()
+    };
+    if std::env::var_os("GIT_COMMITTER_EMAIL").is_some()
+        || configured("committer.email")
+        || configured("user.email")
+    {
+        return true;
+    }
+    !configured("author.email") && std::env::var_os("EMAIL").is_some_and(|v| !v.is_empty())
+}
+
+/// The ` Committer:` part of `print_commit_summary()` (sequencer.c:1453-1460),
+/// as the text that follows the ` Date:` line: nothing when
+/// [`committer_ident_sufficiently_given`], otherwise ` Committer: <ident>` and,
+/// under `advice.implicitIdentity`, `implicit_ident_advice()` on its own lines. The
+/// format's terminator closes the advice with the blank line before the stat.
+pub fn summary_committer_block(repo: &gix::Repository, committer_ident: &str) -> String {
+    if committer_ident_sufficiently_given(repo) {
+        return String::new();
+    }
+    let mut out = format!(" Committer: {committer_ident}\n");
+    if crate::advice::Advice::ImplicitIdentity.enabled_in(repo) {
+        out.push_str(implicit_ident_advice());
+        out.push('\n');
+    }
+    out
+}
+
+/// `implicit_ident_advice()` (sequencer.c:1374-1413): the `config` wording when
+/// `~/.gitconfig` or `$XDG_CONFIG_HOME/git/config` (else `~/.config/git/config`)
+/// exists, the `--edit` wording otherwise.
+fn implicit_ident_advice() -> &'static str {
+    const NOCONFIG: &str = "Your name and email address were configured automatically based\n\
+on your username and hostname. Please check that they are accurate.\n\
+You can suppress this message by setting them explicitly. Run the\n\
+following command and follow the instructions in your editor to edit\n\
+your configuration file:\n\
+\n\
+\x20   git config --global --edit\n\
+\n\
+After doing this, you may fix the identity used for this commit with:\n\
+\n\
+\x20   git commit --amend --reset-author\n";
+    const CONFIG: &str = "Your name and email address were configured automatically based\n\
+on your username and hostname. Please check that they are accurate.\n\
+You can suppress this message by setting them explicitly:\n\
+\n\
+\x20   git config --global user.name \"Your Name\"\n\
+\x20   git config --global user.email you@example.com\n\
+\n\
+After doing this, you may fix the identity used for this commit with:\n\
+\n\
+\x20   git commit --amend --reset-author\n";
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let user_config = home.as_ref().map(|h| h.join(".gitconfig"));
+    // `xdg_config_home_for()` (path.c:1545-1560).
+    let xdg_config = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(std::path::PathBuf::from(dir).join("git/config")),
+        None => home.as_ref().map(|h| h.join(".config/git/config")),
+    };
+    let exists = |p: &Option<std::path::PathBuf>| p.as_ref().is_some_and(|p| p.exists());
+    if exists(&user_config) || exists(&xdg_config) {
+        CONFIG
+    } else {
+        NOCONFIG
+    }
+}
+
 /// How [`fmt_ident_strict`] found the identity unusable: the `die()` message, and
 /// the role `ident_env_hint()` heads its advice with when the death prints one.
 #[derive(Clone)]

@@ -1990,6 +1990,8 @@ fn print_summary(
             author_time.format_or_unix(gix::date::time::format::DEFAULT)
         );
     }
+    // ` Committer:` and the implicit-identity advice (sequencer.c:1453-1460).
+    print!("{}", crate::summary_committer_block(repo, committer_ident));
 
     // ```c
     // rev.diff = 1;

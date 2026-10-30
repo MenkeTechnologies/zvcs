@@ -92,6 +92,10 @@
 //!   `-u`/`--only-untracked` (and `stash.showIncludeUntracked`, which seeds them
 //!   before the options are read) bring the untracked `^3` tree into the diff.
 //! * `branch` — create+check out a branch at the stash base, apply there, drop.
+//! * `export` / `import` — `do_export_stash()` chains a copy of every entry (or of
+//!   the ones named) onto a fixed-ident base commit over the empty tree and prints
+//!   the tip or writes it to `--to-ref`; `do_import_stash()` walks such a chain back
+//!   to its base, checking each link, and stores the entries oldest first.
 //! * `create_autostash` / `apply_autostash` — the rebase/pull `--autostash`
 //!   helpers. Unlike `apply`/`pop`, the re-apply here IS a real three-way merge
 //!   (`merge_apply::three_way_merge`) of the stash onto the moved `HEAD`, since
@@ -169,9 +173,6 @@ const PUSH_USAGE: &str = r#"usage: git stash [push] [-p | --patch] [-S | --stage
 
 /// The command's own usage, which `git stash -h` writes to **stdout** before
 /// exiting 129 — every subcommand form, not just `push`'s.
-///
-/// `export`/`import` are listed because git lists them; asking for either still
-/// gets this port's "is not a stash command", as it does for any other word.
 const STASH_USAGE: &str = r#"usage: git stash list [<log-options>]
    or: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]
    or: git stash drop [-q | --quiet] [<stash>]
@@ -700,10 +701,10 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
             let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             explicit_status(store_stash(&repo, &args[1..]))
         }
-        // Neither body is ported, but `parse_options()` runs before either one,
-        // so the option surface is still git's: `-h` and `--help-all` print the
-        // sub-command's block on stdout and an unclaimed flag is refused with it
-        // on stderr, both at 129. Only a well-formed invocation reaches the bail.
+        // `export_stash()` and `import_stash()` (builtin/stash.c:2427-2454, 2276-2291):
+        // `parse_options()` runs first, so `-h` and `--help-all` print the
+        // sub-command's block on stdout and an unclaimed flag is refused with it on
+        // stderr, both at 129, before either body is reached.
         Some(sub @ ("export" | "import")) => {
             let (usage, table) = match sub {
                 "export" => (EXPORT_USAGE, EXPORT_OPTS),
@@ -711,20 +712,22 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
             };
             let rest = &args[1..];
             let mut i = 0;
-            let mut operands = 0;
+            let mut operands: Vec<String> = Vec::new();
+            let mut print = false;
+            let mut to_ref: Option<String> = None;
             while let Some(a) = rest.get(i).map(String::as_str) {
                 i += 1;
                 // `PARSE_OPT_KEEP_DASHDASH` leaves the `--` in argv but still
                 // ends the option scan, so nothing past it is an option.
                 if a == "--" {
-                    operands += 1;
+                    operands.push(a.to_string());
                     break;
                 }
                 if super::asks_for_help(a, "") {
                     return Ok(super::show_usage(usage));
                 }
                 if !a.starts_with('-') || a == "-" {
-                    operands += 1;
+                    operands.push(a.to_string());
                     continue;
                 }
                 let resolved = match canonical(a, table, usage) {
@@ -732,29 +735,55 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
                     Err(code) => return Ok(code),
                 };
                 match resolved.as_ref() {
-                    "--print" | "--no-to-ref" => {}
+                    "--print" => print = true,
+                    "--no-to-ref" => to_ref = None,
                     // `OPT_STRING` takes the next argument when no `=<value>` is
                     // attached, and `get_arg()` refuses at 129 when there is
                     // none — which is also what keeps a following `-h` from
                     // being read as a request for help.
                     "--to-ref" => match rest.get(i) {
-                        Some(_) => i += 1,
+                        Some(value) => {
+                            to_ref = Some(value.clone());
+                            i += 1;
+                        }
                         None => return Ok(super::missing_option_value("--to-ref")),
                     },
-                    other if other.starts_with("--to-ref=") => {}
+                    other if other.starts_with("--to-ref=") => {
+                        to_ref = Some(other["--to-ref=".len()..].to_string());
+                    }
                     _ => return Ok(usage_error(a, usage)),
                 }
             }
-            // `import_stash()`: `if (argc != 1) usage_msg_opt(_("a revision is required"), ...)`,
-            // judged once `parse_options()` has consumed the options; the `--` it keeps is an operand.
+            operands.extend(rest[i..].iter().cloned());
+            let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
             if sub == "import" {
-                operands += rest[i..].len();
-                if operands != 1 {
+                // ```c
+                // if (argc != 1)
+                //         usage_msg_opt("a revision is required", git_stash_import_usage, options);
+                // ```
+                //
+                // (builtin/stash.c:2287-2288), judged once `parse_options()` has
+                // consumed the options; the `--` it keeps is an operand.
+                if operands.len() != 1 {
                     eprint!("fatal: a revision is required\n\n{usage}");
                     return Ok(ExitCode::from(129));
                 }
+                return do_import_stash(&repo, &operands[0]);
             }
-            crate::git_fatal!("`stash {sub}` is not ported")
+            // ```c
+            // if (ref && action == ACTION_NONE)
+            //         action = ACTION_TO_REF;
+            //
+            // if (action == ACTION_NONE || (ref && action == ACTION_PRINT))
+            //         return error(_("exactly one of --print and --to-ref is required"));
+            // ```
+            //
+            // (builtin/stash.c:2448-2452.)
+            if print == to_ref.is_some() {
+                eprintln!("error: exactly one of --print and --to-ref is required");
+                return Ok(failed());
+            }
+            do_export_stash(&mut repo, to_ref.as_deref(), &operands)
         }
         // ```c
         // if (fn) {
@@ -2363,13 +2392,13 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
 /// `git stash store -m <msg> -q <commit>`, which `apply_save_autostash_oid()` runs when
 /// an autostash could not be re-applied: the snapshot becomes a real `stash` so the
 /// "Your changes are safe in the stash" line is true.
-pub(crate) fn store_commit(repo: &gix::Repository, oid: ObjectId, message: &str) -> Result<()> {
+pub(crate) fn store_commit(repo: &gix::Repository, oid: ObjectId, message: impl AsRef<[u8]>) -> Result<()> {
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
                 mode: RefLog::AndReference,
                 force_create_reflog: true,
-                message: message.into(),
+                message: message.as_ref().into(),
             },
             expected: PreviousValue::Any,
             new: Target::Object(oid),
@@ -2476,6 +2505,476 @@ fn store_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         name: "refs/stash".try_into().map_err(|e| anyhow!("invalid ref name refs/stash: {e}"))?,
         deref: false,
     })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `ident` both `export` idents format to: `fmt_ident("git stash", "git@stash",
+/// WANT_BLANK_IDENT, "2001-09-17T00:00:00Z", 0)` (builtin/stash.c:2338-2341), the
+/// fixed date `format-patch` uses, so the base commit is the same in every repository.
+/// `do_import_stash()` compares the root's idents against the same spelling
+/// (builtin/stash.c:2156).
+const EXPORT_BASE_IDENT: &[u8] = b"git stash <git@stash> 1000684800 +0000";
+
+/// A commit as `parse_commit_buffer()` leaves it (commit.c:516-577): the tree, the
+/// parents, and the buffer `repo_get_commit_buffer()` hands back afterwards.
+#[derive(Clone)]
+struct ParsedCommit {
+    id: ObjectId,
+    tree: ObjectId,
+    parents: Vec<ObjectId>,
+    buffer: Vec<u8>,
+}
+
+/// The parsed-object table `export` and `import` consult: a commit parses once,
+/// after which `repo_parse_commit()` answers from `object.parsed` without a word
+/// (commit.c:622-623). A parse that failed is not remembered, so asking again
+/// reports again.
+#[derive(Default)]
+struct Commits(HashMap<ObjectId, ParsedCommit>);
+
+impl Commits {
+    /// `repo_parse_commit()` (commit.c:603-652): a missing object is `Could not
+    /// read`, another type is `Object %s not a commit`.
+    fn parse(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<ParsedCommit> {
+        if let Some(parsed) = self.0.get(&id) {
+            return Some(parsed.clone());
+        }
+        let Ok(object) = repo.find_object(id) else {
+            eprintln!("error: Could not read {id}");
+            return None;
+        };
+        if object.kind != gix::object::Kind::Commit {
+            eprintln!("error: Object {id} not a commit");
+            return None;
+        }
+        let parsed = parse_commit_buffer(id, object.data.to_vec())?;
+        self.0.insert(id, parsed.clone());
+        Some(parsed)
+    }
+
+    /// `lookup_commit_reference()`: tags are peeled, a present object of another
+    /// type is reported before the caller's own message, and an absent one is not.
+    fn lookup_reference(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<ParsedCommit> {
+        let reference = crate::objname::lookup_commit_reference(repo, id);
+        match reference {
+            crate::objname::CommitRef::Commit(peeled) => self.parse(repo, peeled),
+            crate::objname::CommitRef::NotCommit { .. } => {
+                if let Some(message) = reference.type_error() {
+                    eprintln!("error: {message}");
+                }
+                None
+            }
+            crate::objname::CommitRef::Absent => None,
+        }
+    }
+}
+
+/// `parse_commit_buffer()` (commit.c:539-577) without grafts: a `tree` line, then
+/// every `parent` line that follows it.
+fn parse_commit_buffer(id: ObjectId, buffer: Vec<u8>) -> Option<ParsedCommit> {
+    let hexsz = id.kind().len_in_hex();
+    let (tree_entry_len, parent_entry_len) = (hexsz + 5, hexsz + 7);
+    let tail = buffer.len();
+    if tail <= tree_entry_len + 1 || !buffer.starts_with(b"tree ") || buffer[tree_entry_len] != b'\n' {
+        eprintln!("error: bogus commit object {id}");
+        return None;
+    }
+    let Ok(tree) = ObjectId::from_hex(&buffer[5..tree_entry_len]) else {
+        eprintln!("error: bad tree pointer in commit {id}");
+        return None;
+    };
+    let mut at = tree_entry_len + 1;
+    let mut parents = Vec::new();
+    while at + parent_entry_len < tail && buffer[at..].starts_with(b"parent ") {
+        let parent = ObjectId::from_hex(&buffer[at + 7..at + parent_entry_len]);
+        match parent {
+            Ok(parent) if tail > at + parent_entry_len + 1 && buffer[at + parent_entry_len] == b'\n' => {
+                parents.push(parent);
+            }
+            _ => {
+                eprintln!("error: bad parents in commit {id}");
+                return None;
+            }
+        }
+        at += parent_entry_len + 1;
+    }
+    Some(ParsedCommit { id, tree, parents, buffer })
+}
+
+/// `check_stash_topology()` (builtin/stash.c:189-214): two or three parents, the
+/// second with exactly one parent that is the first, the third with none.
+fn check_stash_topology(repo: &gix::Repository, commits: &mut Commits, stash: &ParsedCommit) -> bool {
+    let parents = &stash.parents;
+    if !(2..=3).contains(&parents.len()) {
+        return false;
+    }
+    let Some(_) = commits.parse(repo, parents[0]) else {
+        return false;
+    };
+    let Some(p2) = commits.parse(repo, parents[1]) else {
+        return false;
+    };
+    let p3 = match parents.get(2) {
+        Some(&id) => match commits.parse(repo, id) {
+            Some(p3) => Some(p3),
+            None => return false,
+        },
+        None => None,
+    };
+    if p2.parents.len() != 1 || p3.is_some_and(|p3| !p3.parents.is_empty()) {
+        return false;
+    }
+    if commits.parse(repo, p2.parents[0]).is_none() {
+        return false;
+    }
+    parents[0] == p2.parents[0]
+}
+
+/// `find_commit_header()` (commit.c:1918-1938): the value of the first `key`
+/// header line, the scan ending at the blank line (or the buffer's NUL).
+fn find_commit_header<'a>(buffer: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let buffer = buffer.split(|&b| b == 0).next().unwrap_or_default();
+    for line in buffer.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            return None;
+        }
+        if line.len() > key.len() && line.starts_with(key) && line[key.len()] == b' ' {
+            return Some(&line[key.len() + 1..]);
+        }
+    }
+    None
+}
+
+/// `strstr(buffer, "\n\n")` over the NUL-terminated commit buffer: the offset of
+/// the message.
+fn message_offset(buffer: &[u8]) -> Option<usize> {
+    let text = buffer.split(|&b| b == 0).next().unwrap_or_default();
+    text.find(b"\n\n").map(|at| at + 2)
+}
+
+/// `split_ident_line()`'s refusals (ident.c:275-305): an ident needs a `<` and a
+/// `>` after it; everything past that is optional.
+fn ident_splits(line: &[u8]) -> bool {
+    let line = line.split(|&b| b == 0).next().unwrap_or_default();
+    line.find_byte(b'<').is_some_and(|lt| line[lt + 1..].contains(&b'>'))
+}
+
+/// `commit_tree_extended()` with no signature and no extra headers
+/// (commit.c:1686-1726, 1729-1830): the buffer `write_commit_tree()` lays out, the
+/// UTF-8 check over it, and the write. `None` is its `-1`, already reported.
+fn write_stash_commit(
+    repo: &gix::Repository,
+    msg: &[u8],
+    tree: ObjectId,
+    parents: &[ObjectId],
+    author: &[u8],
+    committer: &[u8],
+) -> Result<Option<ObjectId>> {
+    if msg.contains(&0) {
+        eprintln!("error: a NUL byte in commit log message not allowed.");
+        return Ok(None);
+    }
+    // `encoding_is_utf8 = is_encoding_utf8(git_commit_encoding)`: no
+    // `i18n.commitEncoding` is UTF-8.
+    let snapshot = repo.config_snapshot();
+    let encoding = snapshot.string("i18n.commitEncoding").filter(|v| {
+        let name = v.to_str_lossy();
+        !(name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8"))
+    });
+    let mut buffer = Vec::new();
+    buffer.extend_from_slice(format!("tree {tree}\n").as_bytes());
+    for parent in parents {
+        buffer.extend_from_slice(format!("parent {parent}\n").as_bytes());
+    }
+    for (header, ident) in [(&b"author "[..], author), (&b"committer "[..], committer)] {
+        buffer.extend_from_slice(header);
+        buffer.extend_from_slice(ident);
+        buffer.push(b'\n');
+    }
+    if let Some(encoding) = &encoding {
+        buffer.extend_from_slice(b"encoding ");
+        buffer.extend_from_slice(encoding);
+        buffer.push(b'\n');
+    }
+    buffer.push(b'\n');
+    buffer.extend_from_slice(msg);
+    if encoding.is_none() && !super::commit_tree::verify_utf8(&mut buffer) {
+        eprintln!(
+            "Warning: commit message did not conform to UTF-8.\n\
+             You may want to amend it after fixing the message, or set the config\n\
+             variable i18n.commitEncoding to the encoding your project uses."
+        );
+    }
+    let id = gix::objs::Write::write_buf(&repo.objects, gix::object::Kind::Commit, &buffer)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(Some(id))
+}
+
+/// `write_commit_with_parents()` (builtin/stash.c:2075-2134): a copy of the stash
+/// commit `oid` over the empty tree with `parents`, keeping its author and
+/// committer lines byte for byte and prefixing its message with `git stash: `.
+fn write_commit_with_parents(
+    repo: &gix::Repository,
+    commits: &mut Commits,
+    oid: ObjectId,
+    parents: &[ObjectId],
+) -> Result<Option<ObjectId>> {
+    let Some(this) = commits.lookup_reference(repo, oid) else {
+        // `repo_get_commit_buffer()` on a commit nothing parsed has no buffer, so
+        // neither header is found.
+        eprintln!("error: cannot parse commit {oid}");
+        return Ok(None);
+    };
+    let buffer = &this.buffer;
+    let (Some(author), Some(committer)) =
+        (find_commit_header(buffer, b"author"), find_commit_header(buffer, b"committer"))
+    else {
+        eprintln!("error: cannot parse commit {oid}");
+        return Ok(None);
+    };
+    if !ident_splits(author) || !ident_splits(committer) {
+        eprintln!("error: invalid author or committer for {oid}");
+        return Ok(None);
+    }
+    // ```c
+    // p = strstr(buffer, "\n\n");
+    // strbuf_addstr(&msg, "git stash: ");
+    //
+    // if (p)
+    //         strbuf_add(&msg, p + 2, bufsize - (p + 2 - buffer));
+    // strbuf_complete_line(&msg);
+    // ```
+    let mut msg = b"git stash: ".to_vec();
+    if let Some(at) = message_offset(buffer) {
+        msg.extend_from_slice(&buffer[at..]);
+    }
+    if msg.last() != Some(&b'\n') {
+        msg.push(b'\n');
+    }
+    let empty = repo.object_hash().empty_tree();
+    match write_stash_commit(repo, &msg, empty, parents, author, committer)? {
+        Some(out) => Ok(Some(out)),
+        None => {
+            eprintln!("error: could not write commit");
+            Ok(None)
+        }
+    }
+}
+
+/// `repo_get_oid_with_flags(r, revision, &oid, GET_OID_QUIETLY | GET_OID_GENTLY)`
+/// (builtin/stash.c:2366-2368): no warning, and an `@{<n>}` the log does not reach
+/// is a failure rather than `get_oid_basic()`'s `die()` — including the `@{<n>}`
+/// one past the end, whose old value `GET_OID_GENTLY` does not hand back, and an
+/// `@{<date>}` older than the log, whose oldest entry it does not hand back either
+/// (object-name.c:794-818).
+fn get_oid_gently(repo: &gix::Repository, revision: &str) -> Option<ObjectId> {
+    if crate::objname::reflog_reach(repo, revision).is_some() {
+        return None;
+    }
+    if let Some(Some(n)) = reflog_recno(revision) {
+        let named = revision.split('@').next().unwrap_or(revision);
+        if let Ok(Some(count)) = reflog_len(repo, named) {
+            if n >= count {
+                return None;
+            }
+        }
+    }
+    crate::objname::resolve_quiet(repo, revision)
+}
+
+/// `git stash export (--print | --to-ref <ref>) [<stash>...]` — `do_export_stash()`
+/// (builtin/stash.c:2320-2419): a parentless base commit over the empty tree, then
+/// one copy of each stash commit whose first parent chains to the previous copy and
+/// whose second parent is the stash itself, oldest entry nearest the base. The tip is
+/// printed or written to `ref`.
+fn do_export_stash(repo: &mut gix::Repository, ref_: Option<&str>, argv: &[String]) -> Result<ExitCode> {
+    // `prepare_fallback_ident("git stash", "git@stash")` (builtin/stash.c:2337). The
+    // commits below name their idents outright, so what the fallback reaches is the
+    // reflog entry `refs_update_ref()` writes for `--to-ref`.
+    crate::prepare_fallback_ident(repo, "git stash", "git@stash");
+    let repo = &*repo;
+    let empty = repo.object_hash().empty_tree();
+
+    // ```c
+    // /* First, we create a single empty commit. */
+    // if (commit_tree_extended("", 0, r->hash_algo->empty_tree, NULL,
+    //                          &base, author, committer, NULL, NULL))
+    //         return error(_("unable to write base commit"));
+    // ```
+    let Some(base) = write_stash_commit(repo, b"", empty, &[], EXPORT_BASE_IDENT, EXPORT_BASE_IDENT)? else {
+        eprintln!("error: unable to write base commit");
+        return Ok(failed());
+    };
+    let mut commits = Commits::default();
+    let mut items: Vec<ObjectId> = Vec::new();
+    if !argv.is_empty() {
+        // Each argument through `parse_stash_revision(&revision, argv[i], 1)` —
+        // a run of digits is `refs/stash@{<n>}` — in the order given.
+        for arg in argv {
+            let revision = if arg.bytes().all(|b| b.is_ascii_digit()) {
+                format!("refs/stash@{{{arg}}}")
+            } else {
+                arg.clone()
+            };
+            let Some(oid) = get_oid_gently(repo, &revision) else {
+                eprintln!("error: unable to find stash entry {arg}");
+                return Ok(failed());
+            };
+            match commits.lookup_reference(repo, oid) {
+                Some(stash) if check_stash_topology(repo, &mut commits, &stash) => items.push(stash.id),
+                _ => {
+                    eprintln!("error: {revision} does not look like a stash commit");
+                    return Ok(failed());
+                }
+            }
+        }
+    } else {
+        // `refs_for_each_reflog_ent_reverse(..., "refs/stash", collect_stash_entries, ...)`,
+        // newest entry first (builtin/stash.c:2296-2318, 2385-2394). An entry that is
+        // not a stash ends the walk with `collect_stash_entries()`'s `error()`, and
+        // `&& cb_data.count` then leaves through `out` with `res` still 0: the
+        // command prints nothing and exits 0.
+        let mut entries = Vec::new();
+        crate::refstore::for_each_reflog_entry(repo, "refs/stash", true, |entry| {
+            entries.push(entry.new_oid);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        for new_oid in entries {
+            match commits.lookup_reference(repo, new_oid) {
+                Some(stash) if check_stash_topology(repo, &mut commits, &stash) => items.push(stash.id),
+                _ => {
+                    eprintln!("error: {new_oid} does not look like a stash commit");
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+        }
+    }
+
+    // `items = commit_list_reverse(items)`: the last one named, or the oldest entry,
+    // is the first copy over the base.
+    let mut prev = base;
+    for stash in items.into_iter().rev() {
+        match write_commit_with_parents(repo, &mut commits, stash, &[prev, stash])? {
+            Some(out) => prev = out,
+            None => return Ok(failed()),
+        }
+    }
+    match ref_ {
+        // `refs_update_ref(..., NULL, ref, &prev->object.oid, NULL, 0,
+        // UPDATE_REFS_DIE_ON_ERR)`: no message, no `REF_NO_DEREF`.
+        Some(name) => {
+            let write = super::update_ref::CmdlineWrite {
+                name,
+                new: &super::update_ref::Val::Oid(prev),
+                old: &super::update_ref::Val::Missing,
+                delete: false,
+                deref: true,
+                create_reflog: false,
+                msg: None,
+            };
+            let code = super::update_ref::write_cmdline(repo, &write, super::update_ref::OnErr::Die)?;
+            if code != ExitCode::SUCCESS {
+                return Ok(code);
+            }
+        }
+        None => println!("{prev}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `git stash import <commit>` — `do_import_stash()` (builtin/stash.c:2136-2274):
+/// walk the first-parent chain an `export` wrote down to its base, checking every
+/// link, then store each second parent in `refs/stash` oldest first, with the stash
+/// commit's own message as the reflog line.
+fn do_import_stash(repo: &gix::Repository, rev: &str) -> Result<ExitCode> {
+    let Some(chain) = crate::objname::resolve(repo, rev) else {
+        eprintln!("error: not a valid revision: {rev}");
+        return Ok(failed());
+    };
+    let mut commits = Commits::default();
+    let Some(mut this) = commits.lookup_reference(repo, chain) else {
+        eprintln!("error: not a commit: {rev}");
+        return Ok(failed());
+    };
+    let empty = repo.object_hash().empty_tree();
+    // `commit_list_insert()` at the head while walking towards the base, so the
+    // list ends oldest first.
+    let mut items: Vec<ObjectId> = Vec::new();
+    loop {
+        if this.tree != empty || (!this.parents.is_empty() && this.parents.len() != 2) {
+            eprintln!("error: {} is not a valid exported stash commit", this.id);
+            return Ok(failed());
+        }
+        let buffer = &this.buffer;
+        if this.parents.is_empty() {
+            // ```c
+            // if (!author || !committer) {
+            //         error(_("cannot parse commit %s"), oid_to_hex(&this->object.oid));
+            //         goto out;
+            // }
+            // ```
+            //
+            // (builtin/stash.c:2186-2189.) `res` is left at 0 there.
+            let (Some(author), Some(committer)) =
+                (find_commit_header(buffer, b"author"), find_commit_header(buffer, b"committer"))
+            else {
+                eprintln!("error: cannot parse commit {}", this.id);
+                return Ok(ExitCode::SUCCESS);
+            };
+            if author != EXPORT_BASE_IDENT || committer != EXPORT_BASE_IDENT {
+                eprintln!("error: found root commit {} with invalid data", this.id);
+                return Ok(failed());
+            }
+            break;
+        }
+        let Some(at) = message_offset(buffer) else {
+            eprintln!("error: cannot parse commit {}", this.id);
+            return Ok(failed());
+        };
+        if !buffer[at..].starts_with(b"git stash: ") {
+            eprintln!("error: found stash commit {} without expected prefix", this.id);
+            return Ok(failed());
+        }
+        let stash_id = this.parents[1];
+        let first = commits.parse(repo, this.parents[0]);
+        let stash = match first {
+            Some(_) => commits.parse(repo, stash_id),
+            None => None,
+        };
+        let (Some(first), Some(stash)) = (first, stash) else {
+            eprintln!("error: cannot parse parents of commit: {}", this.id);
+            return Ok(failed());
+        };
+        if !check_stash_topology(repo, &mut commits, &stash) {
+            eprintln!("error: {stash_id} does not look like a stash commit");
+            return Ok(failed());
+        }
+        items.insert(0, stash_id);
+        this = first;
+    }
+
+    for oid in items {
+        let Some(stash) = commits.parse(repo, oid) else {
+            eprintln!("error: cannot read commit buffer for {oid}");
+            return Ok(failed());
+        };
+        let Some(at) = message_offset(&stash.buffer) else {
+            eprintln!("error: cannot parse commit {oid}");
+            return Ok(failed());
+        };
+        // `do_store_stash(oid, msg, 1)` (builtin/stash.c:1130-1154): the
+        // `assert_stash_like()` `die()`, then the update with
+        // `UPDATE_REFS_QUIET_ON_ERR`, whose failure is only this caller's line.
+        if let Some(message) = store_assert_stash_like(repo, oid) {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+        let msg = stash.buffer[at..].split(|&b| b == 0).next().unwrap_or_default();
+        if store_commit(repo, oid, msg).is_err() {
+            eprintln!("error: cannot save the stash for {oid}");
+            return Ok(failed());
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 

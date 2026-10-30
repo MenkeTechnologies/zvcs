@@ -88,6 +88,14 @@ fn fixture(stock: &str, tag: &str) -> PathBuf {
         let f = std::fs::File::options().write(true).open(dir.join(name)).unwrap();
         f.set_modified(old).unwrap();
     }
+    // `b3` is written in the second `b2` was staged in more often than not, and
+    // whether a stock write of the index then lands in that second decides what
+    // stock reports: racily clean, `ce_modified_check_fs()` opens it and `diff HEAD`
+    // hashes the file; otherwise the stat matches and the index id stands
+    // (read-cache.c:353-375, :434-438). An mtime a second away from the entry's
+    // takes the timing out: the stat no longer matches, in every fixture.
+    let f = std::fs::File::options().write(true).open(dir.join("b")).unwrap();
+    f.set_modified(old + std::time::Duration::from_secs(1)).unwrap();
     dir
 }
 

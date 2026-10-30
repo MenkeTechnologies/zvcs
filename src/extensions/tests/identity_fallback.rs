@@ -52,10 +52,13 @@ impl Fixture {
     /// Write (or empty) the global config the commands will read. The fixture's
     /// own commits need an identity; the commands under test must not.
     fn identity(&self, on: bool) {
+        // `maintenance.auto = false`: a commit otherwise detaches `git maintenance run
+        // --auto`, whose `objects/maintenance.lock` can vanish under the `cp -Rp` of
+        // [`Fixture::stock_outcome`].
         let body = if on {
-            "[user]\n\tname = t\n\temail = t@e.co\n[protocol \"file\"]\n\tallow = always\n"
+            "[user]\n\tname = t\n\temail = t@e.co\n[protocol \"file\"]\n\tallow = always\n[maintenance]\n\tauto = false\n"
         } else {
-            "[protocol \"file\"]\n\tallow = always\n"
+            "[protocol \"file\"]\n\tallow = always\n[maintenance]\n\tauto = false\n"
         };
         std::fs::write(self.root.join("gitconfig"), body).unwrap();
     }

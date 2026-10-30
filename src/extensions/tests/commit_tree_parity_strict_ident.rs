@@ -278,9 +278,13 @@ fn picks_ask_for_the_committer_and_reverts_for_both() {
 #[test]
 fn the_summary_names_a_committer_whose_address_was_not_given() {
     let Some(f) = Fixture::new("summary") else { return };
-    let config: &[(&str, &str)] = &[("author.email", "ae@example.com")];
-    let quiet: &[(&str, &str)] = &[("author.email", "ae@example.com"), ("advice.implicitIdentity", "false")];
-    let user: &[(&str, &str)] = &[("user.email", "ue@example.com")];
+    // `user.name` gives the author a name: an account whose gecos field is empty — a
+    // CI runner's — has none to default to, and the commit dies (ident.c:509-514)
+    // before any summary. It sets no address bit (ident.c:652-661).
+    let config: &[(&str, &str)] = &[("author.email", "ae@example.com"), ("user.name", "U Ser")];
+    let quiet: &[(&str, &str)] =
+        &[("author.email", "ae@example.com"), ("user.name", "U Ser"), ("advice.implicitIdentity", "false")];
+    let user: &[(&str, &str)] = &[("user.email", "ue@example.com"), ("user.name", "U Ser")];
     let envs: &[&[(&str, &str)]] = &[
         &[("GIT_COMMITTER_NAME", "Env C")],
         &[("GIT_COMMITTER_NAME", "Env C"), ("GIT_COMMITTER_EMAIL", "")],

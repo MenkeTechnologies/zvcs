@@ -202,9 +202,21 @@ fn an_unreadable_worktree_file_is_listed_and_unhashable() {
         std::fs::write(dir.join("z.txt"), "z\n").unwrap();
         run(stock, dir, &["add", "."]);
         run(stock, dir, &["commit", "-qm", "base"]);
+        // Writing within the second is a race the fixture can lose: with the index
+        // written a second later than `two` and `owt` landing in `two`'s second, the
+        // stat matches, the entry is not racy, and stock itself reports the index id
+        // (read-cache.c:353-375, :434-438). Both files take one mtime a minute ahead,
+        // so every index stock writes is older than the entry and it stays racy.
+        let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        let stamp = |path: &Path| {
+            let f = std::fs::File::options().write(true).open(path).unwrap();
+            f.set_modified(ahead).unwrap();
+        };
         std::fs::write(dir.join("f.txt"), "two\n").unwrap();
+        stamp(&dir.join("f.txt"));
         run(stock, dir, &["add", "f.txt"]);
         std::fs::write(dir.join("f.txt"), "owt\n").unwrap();
+        stamp(&dir.join("f.txt"));
         std::fs::write(dir.join("a.txt"), "aa\n").unwrap();
         std::fs::write(dir.join("z.txt"), "zz\n").unwrap();
         chmod(&dir.join("f.txt"), 0);

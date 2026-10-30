@@ -417,6 +417,28 @@ pub fn verify_filename_diagnosis(repo: &gix::Repository, arg: &str) -> Option<St
     misspelt_object_name(repo, arg)
 }
 
+/// [`verify_filename_diagnosis`] for a caller that has already replayed the
+/// second pass's `get_oid_basic()` itself, ambiguity and `expand_ref()`
+/// warnings included: the message alone, with no second dwim of the operand.
+///
+/// `rev-parse` is that caller. It replays the pass through
+/// [`crate::objname::warn_ambiguous_operand`] over the *reduced* name, which is
+/// what `get_oid_1()` hands `get_oid_basic()` (`object-name.c:1107-1132`), so
+/// `dang:f`, `dang^{commit}` and `dang~1` are each dwim'd as `dang` once —
+/// stock 2.56.0 prints `ignoring dangling symref refs/heads/dang` twice for
+/// all three, once per pass. Dwimming the whole operand here as well printed a
+/// third line for a plain `dang`.
+pub fn verify_filename_message(repo: &gix::Repository, arg: &str) -> Option<String> {
+    let b = arg.as_bytes();
+    if b.first() == Some(&b':') && !b.get(1).is_some_and(u8::is_ascii_alphanumeric) {
+        return None;
+    }
+    if matches!(split(arg), Split::Rev) {
+        return None;
+    }
+    misspelt_object_name(repo, arg)
+}
+
 /// `verify_filename()` followed by `die_verify_filename()` (`setup.c:198-226`) as
 /// one call: the text of the `die()` for an operand that is neither a revision
 /// nor a path, or `None` when `verify_filename()` let it through.

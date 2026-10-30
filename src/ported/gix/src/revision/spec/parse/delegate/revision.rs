@@ -20,7 +20,24 @@ impl delegate::Revision for Delegate<'_> {
         if self.has_delayed_err() && self.refs[self.idx].is_some() {
             return Err(message("Refusing call as there are delayed errors and a ref is available").raise_erased());
         }
-        match self.repo.refs.find(name) {
+        let found = match self.repo.refs.find(name) {
+            Ok(r) if resolves_for_reading(&self.repo.refs, &r) => Ok(r),
+            // `expand_ref()` resolves every rule with `RESOLVE_REF_READING`
+            // (refs.c:820-834), so a symref whose chain ends nowhere and a loose
+            // file that will not parse are both NULL there, and the loop goes on
+            // to the next rule. gix's DWIM stops at the first file it finds, which
+            // made a dangling `refs/tags/x` hide a real `refs/heads/x`.
+            Ok(_)
+            | Err(gix_ref::file::find::existing::Error::Find(
+                gix_ref::file::find::Error::ReferenceCreation { .. },
+            )) => first_readable_rule(&self.repo.refs, name).ok_or_else(|| {
+                gix_ref::file::find::existing::Error::NotFound {
+                    name: gix_path::from_bstr(name).into_owned(),
+                }
+            }),
+            Err(err) => Err(err),
+        };
+        match found {
             Ok(r) => {
                 assert!(self.refs[self.idx].is_none(), "BUG: cannot set the same ref twice");
                 self.refs[self.idx] = Some(r);
@@ -325,4 +342,46 @@ fn to_sorted_vec(objs: HashSet<ObjectId>) -> Vec<ObjectId> {
     let mut v: Vec<_> = objs.into_iter().collect();
     v.sort();
     v
+}
+
+/// `refs_resolve_ref_unsafe(..., RESOLVE_REF_READING, ...)` answering non-NULL
+/// for `r`: a direct ref, or a symref whose chain reaches one within
+/// `SYMREF_MAXDEPTH` (5) hops, each hop an exact lookup (refs.c:2147-2196).
+fn resolves_for_reading(refs: &gix_ref::file::Store, r: &gix_ref::Reference) -> bool {
+    let mut target = match &r.target {
+        gix_ref::Target::Object(_) => return true,
+        gix_ref::Target::Symbolic(name) => name.clone(),
+    };
+    for _ in 0..5 {
+        let Ok(Some(next)) = refs.try_find(target.as_ref()) else {
+            return false;
+        };
+        if next.name != target {
+            return false;
+        }
+        match next.target {
+            gix_ref::Target::Object(_) => return true,
+            gix_ref::Target::Symbolic(name) => target = name,
+        }
+    }
+    false
+}
+
+/// `expand_ref()`'s walk over `ref_rev_parse_rules` (refs.c:808-834) for the
+/// first rule whose exact refname resolves for reading. A rule that names a
+/// dangling symref or a broken loose ref is passed over, as the C's NULL is.
+fn first_readable_rule(refs: &gix_ref::file::Store, name: &BStr) -> Option<gix_ref::Reference> {
+    [
+        name.to_owned(),
+        format!("refs/{name}").into(),
+        format!("refs/tags/{name}").into(),
+        format!("refs/heads/{name}").into(),
+        format!("refs/remotes/{name}").into(),
+        format!("refs/remotes/{name}/HEAD").into(),
+    ]
+    .into_iter()
+    .find_map(|rule: BString| {
+        let r = refs.try_find(rule.as_bstr()).ok()??;
+        (r.name.as_bstr() == rule && resolves_for_reading(refs, &r)).then_some(r)
+    })
 }

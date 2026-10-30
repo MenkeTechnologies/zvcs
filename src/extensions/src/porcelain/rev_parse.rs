@@ -975,7 +975,7 @@ pub fn rev_parse(args: &[String]) -> Result<ExitCode> {
                     if let Some(message) = crate::objname::peel_type_error(&repo, arg) {
                         eprintln!("error: {message}");
                     }
-                    match crate::objpath::verify_filename_diagnosis(&repo, arg) {
+                    match crate::objpath::verify_filename_message(&repo, arg) {
                         Some(diagnosis) => eprintln!("fatal: {diagnosis}"),
                         None => eprintln!(
                             "fatal: ambiguous argument '{arg}': unknown revision or path not in the working tree.\n\
@@ -1058,8 +1058,34 @@ pub(crate) fn dwim_ref_matches(repo: &gix::Repository, name: &str) -> Vec<String
         format!("refs/remotes/{name}"),
         format!("refs/remotes/{name}/HEAD"),
     ] {
-        let Ok(Some(r)) = repo.try_find_reference(rule.as_str()) else {
-            continue;
+        let r = match repo.try_find_reference(rule.as_str()) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue,
+            // ```c
+            // } else if ((flag & REF_ISBROKEN) && strchr(fullref.buf, '/')) {
+            //         warning(_("ignoring broken ref %s"), fullref.buf);
+            // }
+            // ```
+            //
+            // (`refs.c:831-833`.) A loose file that `parse_loose_ref_contents()`
+            // cannot read is `REF_ISBROKEN` (`refs/files-backend.c:686-689`), and
+            // `refs_resolve_ref_unsafe()` hands the flag back with its NULL under
+            // `RESOLVE_REF_READING`. Like the dangling-symref arm it is asked of the
+            // expansion only, and nothing in `get_oid_basic()`'s flags gates it, so
+            // stock `rev-parse --verify -q <broken>` prints it once.
+            Err(gix::reference::find::Error::Find(
+                gix::refs::file::find::Error::ReferenceCreation { relative_path, .. },
+            )) => {
+                if gix::path::to_unix_separators_on_windows(gix::path::into_bstr(relative_path))
+                    .as_ref()
+                    == rule.as_bytes()
+                    && rule.contains('/')
+                {
+                    eprintln!("warning: ignoring broken ref {rule}");
+                }
+                continue;
+            }
+            Err(_) => continue,
         };
         // git resolves each rule with `refs_resolve_ref_unsafe()`, an *exact*
         // lookup, so `refs_found` counts distinct existing refnames. gitoxide's
@@ -1347,6 +1373,9 @@ fn warn_reflog_reach_again(repo: &gix::Repository, arg: &str) {
     // the full-hex one answers to `GET_OID_SKIP_AMBIGUITY_CHECK` instead and so
     // comes out on both passes regardless — stock 2.55.0 prints
     // `refname '<40-hex>' is ambiguous.` twice for `<40-hex-ref>:nosuch`.
+    // `repo_dwim_ref()` runs under the flag all the same, so this is also the
+    // pass's one `ignoring dangling symref` line (`refs.c:829-830`), and the
+    // diagnosis the caller asks for next must not dwim the operand again.
     warn_ambiguous_refname(repo, arg, true);
     if let Some(message) = crate::objname::read_ref_at_warning(repo, arg) {
         eprintln!("warning: {message}");
@@ -2202,12 +2231,17 @@ fn show_rev(
         // spelling exists, so there is no single full name to report: git prints
         // an `error:` and *nothing* on stdout, at exit 0. It is not the ambiguity
         // *warning* — `-q` silences that one and leaves this.
+        //
+        // The call is unconditional, so `expand_ref()`'s `ignoring dangling
+        // symref` line comes out here too, once, whether or not a rule matched:
+        // stock `rev-parse --symbolic-full-name tdang`, with `refs/tags/tdang`
+        // dangling, prints it twice — `get_oid()`'s dwim and this one.
+        let refs_found = match (name, known_full) {
+            (Some(n), None) => n.to_str().map_or(0, |n| dwim_ref_matches(repo, n).len()),
+            _ => 0,
+        };
         let full = match (&full, name, known_full) {
-            (Some(_), Some(n), None)
-                if n.to_str()
-                    .ok()
-                    .is_some_and(|n| dwim_ref_matches(repo, n).len() > 1) =>
-            {
+            (Some(_), Some(n), None) if refs_found > 1 => {
                 out.flush()?;
                 eprintln!("error: refname '{}' is ambiguous", n);
                 None
@@ -2577,13 +2611,32 @@ fn dwim_full_name(repo: &gix::Repository, name: &BStr) -> Option<BString> {
         });
     }
 
-    let mut current = repo.find_reference(name).ok()?;
-    for _ in 0..16 {
-        let next = match current.target() {
-            TargetRef::Object(_) => return Some(current.name().as_bstr().to_owned()),
-            TargetRef::Symbolic(target) => target.as_bstr().to_owned(),
+    // `expand_ref()`'s `*ref` (refs.c:822-826): what the first rule that
+    // resolves under `RESOLVE_REF_READING` resolved *to*. A dangling symref or a
+    // broken loose file is NULL there and the walk goes on, so a dangling
+    // `refs/tags/x` leaves `--symbolic-full-name x` naming `refs/heads/x`; gix's
+    // own DWIM stopped at the tag and printed nothing.
+    for rule in [
+        name.to_owned(),
+        format!("refs/{name}"),
+        format!("refs/tags/{name}"),
+        format!("refs/heads/{name}"),
+        format!("refs/remotes/{name}"),
+        format!("refs/remotes/{name}/HEAD"),
+    ] {
+        let Ok(Some(r)) = repo.try_find_reference(rule.as_str()) else {
+            continue;
         };
-        current = repo.find_reference(next.as_bstr()).ok()?;
+        if r.name().as_bstr() != rule.as_bytes() {
+            continue;
+        }
+        let resolved = match r.target() {
+            TargetRef::Object(_) => Some(rule),
+            TargetRef::Symbolic(full) => resolve_symref_chain(repo, full.as_bstr()),
+        };
+        if let Some(resolved) = resolved {
+            return Some(resolved.into());
+        }
     }
     None
 }

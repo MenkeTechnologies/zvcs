@@ -283,13 +283,13 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         }
         return true;
     }
-    // A quiet caller is re-examining an operand it has already resolved, and the
-    // count below would repeat `repo_dwim_ref()`'s own `ignoring dangling symref`
-    // warning a second time for one lookup — stock `rev-parse
-    // refs/heads/<dangling>` prints it twice, not three times.
-    if flags.quiet {
-        return false;
-    }
+    // `GET_OID_QUIETLY` is not a gate on the count. `repo_dwim_ref()` runs
+    // whatever the flags (`object-name.c:744-748`), and `expand_ref()`'s
+    // `ignoring dangling symref`/`ignoring broken ref` warnings (`refs.c:829-833`)
+    // test nothing but the ref's own flags — so stock `rev-parse --verify -q
+    // <dangling>` still prints the line once. The flag is tested only in the
+    // ambiguity warning's own condition, after the setting (`object-name.c:752`).
+    //
     // The setting is not read up front: `repo_dwim_ref()`/`repo_dwim_log()` ask
     // for it the moment a rule matches (`refs.c:828`, `refs.c:873`), and a name
     // no rule matches never asks at all — so `-c core.warnAmbiguousRefs==` kills
@@ -324,6 +324,9 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         if !crate::refname::warn_ambiguous_refs(repo) {
             return false;
         }
+        if flags.quiet {
+            return false;
+        }
         if logs_found > 1 || short_oid_unambiguous(repo, reflog_base) {
             eprintln!("warning: refname '{reflog_base}' is ambiguous.");
         }
@@ -339,6 +342,9 @@ pub fn warn_ambiguous_operand(repo: &gix::Repository, name: &str, flags: OidFlag
         return false;
     }
     if !crate::refname::warn_ambiguous_refs(repo) {
+        return false;
+    }
+    if flags.quiet {
         return false;
     }
     if refs_found > 1 || short_oid_unambiguous(repo, base) {
@@ -2723,7 +2729,10 @@ pub fn upstream_mark_fatal_allowed(
     if crate::porcelain::branch::upstream_name(repo, full.as_str().into()).is_some() {
         return None;
     }
-    if repo.try_find_reference(full.as_str()).ok().flatten().is_none() {
+    // `refs_ref_exists()` (remote.c:1900) reads with `RESOLVE_REF_READING`, so a
+    // dangling symref branch is no branch at all here: stock `rev-parse dang@{u}`
+    // dies `no such branch: 'dang'`, not `no upstream configured`.
+    if !crate::refname::ref_exists(repo, full.as_bytes()) {
         return Some(format!("no such branch: '{name}'"));
     }
     match repo.config_snapshot().string(&format!("branch.{name}.merge")) {

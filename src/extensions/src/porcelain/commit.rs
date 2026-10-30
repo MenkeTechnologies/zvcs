@@ -1258,9 +1258,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     }
 
     // --- repository + serialized read-modify-write -----------------------
-    // The object this writes carries an identity, and git fills the halves
-    // the user did not give rather than refusing — except under
-    // `user.useConfigOnly`, which is the one case it says so.
     let mut repo = crate::setup::discover()?;
     // `get_cleanup_mode()` reads `commit.cleanup` as well when no `--cleanup` was given, still inside
     // `parse_and_validate_options()`, so a bad configured mode dies before any hook or staging.
@@ -1271,9 +1268,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
         }
     }
-    if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
-        return Ok(code);
-    }
+    // `fmt_ident(…, IDENT_STRICT)` for the author in `determine_author_info()`
+    // (builtin/commit.c:683-684) and `git_committer_info(IDENT_STRICT)` in
+    // `prepare_to_commit()` (builtin/commit.c:941) judge the configured identity, so
+    // both verdicts are taken before the identity the commit is written with is
+    // injected, and each is reported where git asks — a `git commit` a pick runs
+    // in-process keeps the verdict its parent took.
+    crate::settle_commit_identity(&mut repo);
+    let (author_refusal, committer_refusal) = crate::commit_ident_verdicts();
     // `prepare_index()` opens with `parse_pathspec(&pathspec, 0, PATHSPEC_PREFER_FULL,
     // prefix, argv)` (builtin/commit.c:367-369), so every element is read before the
     // index is touched and a malformed one is `fatal:` at 128. Reaching the matcher
@@ -1357,6 +1359,16 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     {
         crate::git_fatal!("--reset-author can be used only with -C, -c or --amend.");
     }
+    // `determine_author_info()` asks for the default author only when neither
+    // `author_message` — the `-C`/`-c`/`--amend` commit, or `CHERRY_PICK_HEAD` for a
+    // pick being concluded, unless `--reset-author` (builtin/commit.c:1353-1368) — nor
+    // `--author` named one (builtin/commit.c:643-674).
+    let author_given = author_arg.is_some()
+        || (!reset_author
+            && (reuse_arg.is_some()
+                || (amend && fixup_arg.is_none())
+                || whence.is_cherry_pick()
+                || whence.is_rebase()));
 
     // `check_fixup_reword_options()` (builtin/commit.c:1295-1307), called while
     // `--fixup=reword:` is parsed (:1399-1401): a reword records no content, so
@@ -1879,6 +1891,14 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
         Some(v) => v,
         None => !from_flags,
     };
+    // "This checks and barfs if author is badly specified": `determine_author_info()`
+    // opens `prepare_to_commit()` (builtin/commit.c:777-778), after `prepare_index()`
+    // and ahead of the `pre-commit` hook; its `die()` rolls the staging back.
+    if !author_given {
+        if let Some(refusal) = author_refusal {
+            return Ok(refusal.die());
+        }
+    }
     // `pre-commit` runs before the commit is built; a non-zero exit aborts it
     // (the hook prints its own diagnostics, so we exit quietly). `--no-verify`
     // skips it, as it does `commit-msg`.
@@ -2071,6 +2091,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
+        // `git_committer_info(IDENT_STRICT)` (builtin/commit.c:941) stands between the
+        // template read and the `!committable` guard (builtin/commit.c:1081).
+        if let Some(refusal) = committer_refusal {
+            return Ok(refusal.die());
+        }
         // `run_status(stdout, index_file, prefix, 0, s)` (builtin/commit.c:1085).
         // The refusal *is* a status report: git runs the engine `git status` runs,
         // over the index this commit would have used, on stdout — and only then
@@ -2242,6 +2267,12 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // the cleanup that follows uses the same character.
     if comment_char_is_auto {
         comment = adjust_comment_line_char(&buf)?;
+    }
+    // "This checks if committer ident is explicitly given" —
+    // `git_committer_info(IDENT_STRICT)` (builtin/commit.c:940-941), right after the
+    // template is written and before any hook sees the message.
+    if let Some(refusal) = committer_refusal {
+        return Ok(refusal.die());
     }
 
     // `--author="Name <email>"` overrides the author identity. The author *date*

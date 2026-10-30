@@ -805,7 +805,11 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         return Ok(usage());
     }
 
-    let repo = crate::setup::discover()?;
+    let mut repo = crate::setup::discover()?;
+    // Every pick writes its commit through `commit_tree()`, whose strict identity
+    // lookups (commit.c:1709-1714) are judged before the defaults are injected.
+    crate::settle_commit_identity(&mut repo);
+    let repo = repo;
     // ```c
     // if (!strcmp(k, "commit.gpgsign")) {
     //         free(opts->gpg_sign);
@@ -1706,6 +1710,16 @@ fn pick_one(
         .to_str_lossy()
         .into_owned();
 
+    // `commit_tree_extended()` is handed the picked author, so only its
+    // `git_committer_info(IDENT_STRICT)` can die (commit.c:1713-1714) — after
+    // `do_recursive_merge()` wrote the index and the work tree and
+    // sequencer.c:2506-2511 wrote `CHERRY_PICK_HEAD`, all of which stay behind with
+    // `MERGE_MSG` and `AUTO_MERGE`.
+    if let Some(refusal) = crate::commit_tree_refusal(true) {
+        state.index = update_clean_worktree(&repo, &state.index, tree_id, &should_interrupt)?;
+        crate::sequencer::write_state_oid(&repo, "CHERRY_PICK_HEAD", pick_id, "")?;
+        return Ok(PickOutcome::Stopped(refusal.die()));
+    }
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685).
     let new_id = super::commit::write_commit_object(
         &repo,

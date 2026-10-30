@@ -672,7 +672,9 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // a container or a `sudo` shell cannot switch branches at all, and a
     // recursive submodule walk aborts on the first one it reaches.
     let mut repo = crate::setup::discover()?;
-    crate::ensure_reflog_identity(&mut repo);
+    // The picks write their commits through `commit_tree()`, whose strict identity
+    // lookups (commit.c:1709-1714) are judged before the defaults are injected.
+    crate::settle_commit_identity(&mut repo);
     // `merge_dir()` / `apply_dir()` are `GIT_PATH_FUNC`s (`builtin/rebase.c:53-54`),
     // so they resolve against `$GIT_DIR`, and neither `rebase-merge` nor
     // `rebase-apply` appears in `path.c`'s `common_list` (`path.c:98-124`) that
@@ -5970,6 +5972,7 @@ impl<'r> Sequencer<'r> {
         // a hook that rewrites `$1` cannot change the replayed message. Measured
         // against stock 2.55.0, which runs it once per pick with
         // `.git/COMMIT_EDITMSG message`.
+        let merge_msg = final_message.clone();
         let final_message: BString =
             match crate::sequencer::prepare_commit_msg(repo, &final_message, false)? {
                 crate::sequencer::Prepared::NoHook => final_message,
@@ -5982,6 +5985,17 @@ impl<'r> Sequencer<'r> {
                 // `--continue` retries from the same instruction.
                 crate::sequencer::Prepared::Failed => return Ok(Step::Stop(1)),
             };
+        // `commit_tree_extended()` is handed the replayed author, so only its
+        // `git_committer_info(IDENT_STRICT)` can die (commit.c:1713-1714) — with the
+        // pick applied, `MERGE_MSG` written (sequencer.c:2471-2472) and
+        // `CHERRY_PICK_HEAD` recorded (sequencer.c:2506-2511), all of which stay
+        // behind with the state directory.
+        if let Some(refusal) = crate::commit_tree_refusal(true) {
+            std::fs::write(repo.git_dir().join("MERGE_MSG"), &merge_msg)?;
+            crate::sequencer::write_state_oid(repo, "CHERRY_PICK_HEAD", oid, "")?;
+            let _ = refusal.die();
+            return Ok(Step::Stop(128));
+        }
         // The sign-off and the `--trailer` arguments went on above, before the
         // merge, so that a conflict stop records them too. The reflog entry below
         // still names the original subject, which neither touches.

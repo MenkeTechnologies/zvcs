@@ -1360,6 +1360,10 @@ struct MergeCtx<'a> {
     /// What `git_committer_info(IDENT_STRICT)` refuses, if anything — see
     /// [`crate::fmt_ident_strict`].
     committer_refusal: Option<&'a crate::IdentRefusal>,
+    /// What `commit_tree()`'s `git_author_info(IDENT_STRICT)` refuses, if
+    /// anything (commit.c:1710-1711) — judged with the committer, before the reflog
+    /// identity is injected, and reported where the merge commit is written.
+    author_refusal: Option<&'a crate::IdentRefusal>,
 }
 
 /// What one `try_merge_strategy()` call reported (builtin/merge.c:789-851).
@@ -1517,6 +1521,7 @@ fn merge_with_strategies(
             &format!("Merge made by the '{}' strategy.", picks[best.unwrap_or(wt)].name),
             spec_label,
             stash,
+            ctx.author_refusal,
         );
     }
 
@@ -2026,11 +2031,15 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
     // `git_committer_info(IDENT_STRICT)` (builtin/merge.c:1722, 1764) judges the
     // configured identity, so the verdict is taken before the reflog identity
     // below is injected into the in-memory config, and reported where git asks.
-    let committer_refusal = crate::fmt_ident_strict(&repo, "Committer");
+    // `commit_tree_extended()` asks `git_author_info(IDENT_STRICT)` for the author of
+    // every merge commit it writes (commit.c:1710-1711), after `prepare_to_commit()`
+    // has written `MERGE_HEAD`/`MERGE_MSG` — the same configured identity, judged now.
+    //
     // Moving `HEAD` writes a reflog, and a fast-forward has already touched the
     // worktree by then — a failure there would leave the merge half-applied. git
     // synthesizes an identity for reflog purposes rather than failing.
-    crate::ensure_reflog_identity(&mut repo);
+    crate::settle_commit_identity(&mut repo);
+    let (author_refusal, committer_refusal) = crate::commit_ident_verdicts();
     let repo = repo;
 
     // `if (repo_read_index_unmerged(...)) die_resolve_conflict("merge")`
@@ -2397,7 +2406,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             spec: "",
             diverged: true,
             message: compose_message(&repo, &msg_specs, &targets, branch.as_ref(), local_id, opts)?,
-            committer_refusal: committer_refusal.as_ref(),
+            committer_refusal,
+            author_refusal,
         };
         return merge_with_strategies(&repo, &ctx, opts, &picks);
     }
@@ -2520,14 +2530,23 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
         }
         // "See if it is really trivial." — `git_committer_info(IDENT_STRICT)`
         // (builtin/merge.c:1722) stands ahead of the first line.
-        if let Some(refusal) = &committer_refusal {
+        if let Some(refusal) = committer_refusal {
             return Ok(refusal.die());
         }
         // Both lines are bare `printf`s with no verbosity check, so `-q` keeps
         // them (builtin/merge.c:1723, 1730).
         println!("Trying really trivial in-index merge...");
         if read_tree_trivial(bases[0].detach(), local_id, target_id)? {
-            return merge_trivial(&repo, local_id, target_id, head_tree, message, opts, &reflog_spec);
+            return merge_trivial(
+                &repo,
+                local_id,
+                target_id,
+                head_tree,
+                message,
+                opts,
+                &reflog_spec,
+                author_refusal,
+            );
         }
         println!("Nope.");
     }
@@ -2548,7 +2567,8 @@ fn do_merge(refs: &[String], opts: &Opts) -> Result<ExitCode> {
             spec,
             diverged,
             message,
-            committer_refusal: committer_refusal.as_ref(),
+            committer_refusal,
+            author_refusal,
         };
         return merge_with_strategies(&repo, &ctx, opts, &picks);
     }
@@ -2810,6 +2830,7 @@ fn merge_trivial(
     message: String,
     opts: &Opts,
     reflog_spec: &str,
+    author_refusal: Option<&crate::IdentRefusal>,
 ) -> Result<ExitCode> {
     // `repo_refresh_and_write_index(…)` (builtin/merge.c:994-997) before
     // `write_tree_trivial()` turns the index into the merge commit's tree.
@@ -2830,6 +2851,7 @@ fn merge_trivial(
         "In-index merge",
         reflog_spec,
         None,
+        author_refusal,
     )
 }
 
@@ -3437,6 +3459,7 @@ fn finalize_clean(
     finish_msg: &str,
     spec_label: &str,
     stash: Option<ObjectId>,
+    author_refusal: Option<&crate::IdentRefusal>,
 ) -> Result<ExitCode> {
     let do_commit = opts.commit.unwrap_or(!opts.squash);
 
@@ -3482,6 +3505,10 @@ fn finalize_clean(
         Ok(crate::hooks::run_commit_hook(repo, edit, &index_file, event, args)?.ok)
     };
 
+    // `write_tree_trivial()` (builtin/merge.c:1025, 1000) writes the index as the
+    // result tree ahead of `prepare_to_commit()`, so its cache-tree is on disk for the
+    // hooks and stays there when the hook vetoes or `commit_tree()` dies.
+    settle_index_for_commit(repo, merged_tree, true)?;
     // `pre-merge-commit` runs before the commit; a non-zero exit vetoes it. The
     // hook's own output (inherited on stderr) is the whole diagnostic, as in git.
     if !opts.no_verify && !commit_hook("pre-merge-commit", &[])? {
@@ -3554,6 +3581,14 @@ fn finalize_clean(
         return Ok(ExitCode::from(1));
     }
 
+    // `commit_tree()` → `commit_tree_extended()`: `git_author_info(IDENT_STRICT)`
+    // (commit.c:1710-1711) dies before the commit is formatted, so the merge state
+    // `prepare_to_commit()` wrote and an autostash in `MERGE_AUTOSTASH` stay behind.
+    // The committer half (commit.c:1713-1714) was refused earlier, at
+    // builtin/merge.c:1763-1764.
+    if let Some(refusal) = author_refusal {
+        return Ok(refusal.die());
+    }
     let author = repo
         .author()
         .ok_or_else(|| anyhow::anyhow!("author identity is not configured"))??;
@@ -3586,7 +3621,6 @@ fn finalize_clean(
         }
     }
     let new_id = repo.write_object(&commit)?.detach();
-    settle_index_for_commit(repo, merged_tree, true)?;
     advance(
         repo,
         local_id,

@@ -553,7 +553,10 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
     // malformed `am.*` boolean is a config-time fatal (exit 128) that precedes
     // any CLI usage error (exit 129), and the config values become the option
     // defaults the command line then overrides.
-    let repo = crate::setup::discover()?;
+    let mut repo = crate::setup::discover()?;
+    // Judged before anything injects a default identity; the check stands below.
+    crate::settle_commit_identity(&mut repo);
+    let repo = repo;
     let defaults = match am_config(&repo) {
         Ok(d) => d,
         Err(msg) => {
@@ -592,6 +595,13 @@ pub fn am(args: &[String]) -> Result<ExitCode> {
             "The -b/--binary option has been a no-op for long time, and\n\
              it will be removed. Please do not use it anymore."
         );
+    }
+
+    // "Ensure a valid committer ident can be constructed" —
+    // `git_committer_info(IDENT_STRICT)` (builtin/am.c:2464-2465), right after the
+    // option parse and before the index is read or any session is touched.
+    if let Some(refusal) = crate::commit_tree_refusal(true) {
+        return Ok(refusal.die());
     }
 
     let state_dir = repo.git_dir().join("rebase-apply");

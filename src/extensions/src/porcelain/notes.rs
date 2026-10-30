@@ -154,13 +154,14 @@ pub fn notes(args: &[String]) -> Result<ExitCode> {
     };
     let sub_args: &[String] = if i < args.len() { &args[i + 1..] } else { &[] };
 
-    // The object this writes carries an identity, and git fills the halves
-    // the user did not give rather than refusing — except under
-    // `user.useConfigOnly`, which is the one case it says so.
+    // `create_notes_commit()` hands `commit_tree()` no author and no committer
+    // (notes-utils.c:39-41), so each notes commit takes both from
+    // `git_*_info(IDENT_STRICT)` (commit.c:1709-1714): the verdict is taken here,
+    // before the identity the objects are written with is injected, and reported
+    // by [`notes_commit`] once the notes tree is written — a subcommand that commits
+    // nothing never asks.
     let mut repo = crate::setup::discover()?;
-    if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
-        return Ok(code);
-    }
+    crate::settle_commit_identity(&mut repo);
     let notes_ref = resolve_notes_ref(&repo, override_ref.as_deref());
 
     match sub {
@@ -785,6 +786,22 @@ fn write_tree(repo: &gix::Repository, notes: &Notes) -> Result<ObjectId> {
     Ok(editor.write(|tree| repo.write_object(tree).map(|id| id.detach()))?)
 }
 
+/// `create_notes_commit()`'s `commit_tree()` (notes-utils.c:39-41): the commit is
+/// written only once `git_author_info(IDENT_STRICT)` and
+/// `git_committer_info(IDENT_STRICT)` accept the identity, and their `die()` comes
+/// after the notes tree it would have pointed at is already in the object store.
+fn notes_commit(
+    repo: &gix::Repository,
+    message: String,
+    tree: ObjectId,
+    parents: impl IntoIterator<Item = impl Into<ObjectId>>,
+) -> Result<ObjectId> {
+    if let Some(refusal) = crate::commit_tree_refusal(false) {
+        return Err(refusal.clone().into_fatal());
+    }
+    Ok(repo.new_commit(message, tree, parents)?.id().detach())
+}
+
 /// `notes-utils.c:commit_notes()` — write the tree, commit it on top of the
 /// current notes ref (a root commit when the ref is unborn), and move the ref
 /// with git's `notes: `-prefixed reflog message.
@@ -796,10 +813,7 @@ fn commit_notes(
     msg: &str,
 ) -> Result<()> {
     let tree_id = write_tree(repo, notes)?;
-    let commit = repo
-        .new_commit(format!("{msg}\n"), tree_id, parent)?
-        .id()
-        .detach();
+    let commit = notes_commit(repo, format!("{msg}\n"), tree_id, parent)?;
     repo.edit_reference(RefEdit {
         change: Change::Update {
             log: LogChange {
@@ -2842,7 +2856,7 @@ fn do_merge(
         // `\n` that `commit_notes()` completes ordinary note commits with is
         // *not* added here.
         let tree_id = write_tree(repo, &out_notes)?;
-        let commit = repo.new_commit(reflog.clone(), tree_id, vec![l, r])?.id().detach();
+        let commit = notes_commit(repo, reflog.clone(), tree_id, vec![l, r])?;
         move_notes_ref(repo, local_ref, Some(l), commit, &reflog)?;
         Ok(ExitCode::SUCCESS)
     } else {
@@ -2854,7 +2868,7 @@ fn do_merge(
             msg.push('\n');
         }
         let tree_id = write_tree(repo, &out_notes)?;
-        let partial = repo.new_commit(msg, tree_id, vec![l, r])?.id().detach();
+        let partial = notes_commit(repo, msg, tree_id, vec![l, r])?;
 
         // `refs_update_ref(…, msg.buf, "NOTES_MERGE_PARTIAL", …)` and
         // `refs_update_symref(…, "NOTES_MERGE_REF", notes_ref, NULL)`
@@ -3013,7 +3027,7 @@ fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
     }
 
     let tree_id = write_tree(repo, &notes)?;
-    let commit = repo.new_commit(full_msg.clone(), tree_id, parents)?.id().detach();
+    let commit = notes_commit(repo, full_msg.clone(), tree_id, parents)?;
     // `notes-merge.c:746-748`.
     if verbosity >= 2 {
         println!("Finalized notes merge commit: {commit}");

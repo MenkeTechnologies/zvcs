@@ -108,13 +108,12 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(code);
     }
 
-    // The object this writes carries an identity, and git fills the halves
-    // the user did not give rather than refusing — except under
-    // `user.useConfigOnly`, which is the one case it says so.
+    // `commit_tree()` hands `commit_tree_extended()` no author and no committer, so
+    // both come from `git_*_info(IDENT_STRICT)` (commit.c:1709-1714) once the command
+    // line, the tree and the message are settled: judged now, before the identity
+    // the object is written with is injected, and reported there.
     let mut repo = crate::setup::discover()?;
-    if let Some(code) = crate::ensure_object_identity(&mut repo, "Author") {
-        return Ok(code);
-    }
+    crate::settle_commit_identity(&mut repo);
 
     let mut message: Vec<u8> = Vec::new();
     let mut have_message = false;
@@ -289,6 +288,9 @@ pub fn commit_tree(args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::FAILURE);
     }
 
+    if let Some(refusal) = crate::commit_tree_refusal(false) {
+        return Ok(refusal.die());
+    }
     let author = identity(repo.author(), "author")?;
     let committer = identity(repo.committer(), "committer")?;
 

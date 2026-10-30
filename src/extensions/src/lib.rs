@@ -1309,8 +1309,11 @@ fn is_implicit_bare_repo(path: &std::path::Path) -> bool {
 /// falls back to — when nothing is configured. Nothing is written to disk, and a real
 /// identity is left untouched, so `commit`'s own "who are you" behaviour is unchanged.
 pub fn ensure_reflog_identity(repo: &mut gix::Repository) {
-    // A configured identity (env or `user.*`, valid or not) is left as-is.
-    if repo.committer().is_some() {
+    // A configured identity (env or `user.*`, valid or not) is left as-is. The
+    // author is looked at as well: a commit whose committer the environment gives in
+    // full still defaults its author per field — `--author` keeps the default date —
+    // the way `git_author_info()` does (ident.c:565-576).
+    if repo.committer().is_some() && repo.author().is_some() {
         return;
     }
     // `fmt_ident()` defaults each field on its own (ident.c:468-503): a configured
@@ -1673,8 +1676,50 @@ pub fn fmt_ident_strict(repo: &gix::Repository, role: &str) -> Option<IdentRefus
     None
 }
 
+/// The verdicts of `write_commit_tree()`'s `git_author_info(IDENT_STRICT)` and
+/// `git_committer_info(IDENT_STRICT)` (commit.c:1709-1714), judged once per process.
+static COMMIT_IDENTS: std::sync::OnceLock<(Option<IdentRefusal>, Option<IdentRefusal>)> =
+    std::sync::OnceLock::new();
+
+/// Judge the identity every `commit_tree()` of this process is written with, then
+/// inject the defaults the objects and reflogs carry ([`ensure_reflog_identity`]).
+///
+/// Like [`fmt_ident_strict`] the verdict reads only the environment and the
+/// configuration, so it has to be taken before anything is injected — the first call
+/// of the process takes it, and a command run in-process by another (a pick under a
+/// rebase, a stash under a merge) keeps that verdict. [`commit_tree_refusal`] reports
+/// it where git calls `commit_tree()`.
+pub fn settle_commit_identity(repo: &mut gix::Repository) {
+    COMMIT_IDENTS.get_or_init(|| (fmt_ident_strict(repo, "Author"), fmt_ident_strict(repo, "Committer")));
+    ensure_reflog_identity(repo);
+}
+
+/// What `commit_tree_extended()` dies over, if anything: an unusable author is
+/// reported ahead of an unusable committer, the order `write_commit_tree()` asks in
+/// (commit.c:1709-1714). `author_given` is a caller that hands `commit_tree()` an
+/// author of its own — an `--amend`, or a pick reusing the original commit's — which
+/// skips the first lookup. `None` before [`settle_commit_identity`] ran.
+pub fn commit_tree_refusal(author_given: bool) -> Option<&'static IdentRefusal> {
+    let (author, committer) = commit_ident_verdicts();
+    match author {
+        Some(refusal) if !author_given => Some(refusal),
+        _ => committer,
+    }
+}
+
+/// The author and the committer verdict of [`settle_commit_identity`] apart, for a
+/// command that asks for each at its own point (`git commit`). Both `None` before it
+/// ran.
+pub fn commit_ident_verdicts() -> (Option<&'static IdentRefusal>, Option<&'static IdentRefusal>) {
+    match COMMIT_IDENTS.get() {
+        Some((author, committer)) => (author.as_ref(), committer.as_ref()),
+        None => (None, None),
+    }
+}
+
 /// How [`fmt_ident_strict`] found the identity unusable: the `die()` message, and
 /// the role `ident_env_hint()` heads its advice with when the death prints one.
+#[derive(Clone)]
 pub struct IdentRefusal {
     role: Option<String>,
     msg: String,

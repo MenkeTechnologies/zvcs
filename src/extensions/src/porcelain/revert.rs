@@ -469,7 +469,11 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         },
     };
 
-    let repo = crate::setup::discover()?;
+    let mut repo = crate::setup::discover()?;
+    // Every revert writes its commit through `commit_tree()`, whose strict identity
+    // lookups (commit.c:1709-1714) are judged before the defaults are injected.
+    crate::settle_commit_identity(&mut repo);
+    let repo = repo;
     if repo.workdir().is_none() {
         eprintln!("fatal: this operation must be run in a work tree");
         return Ok(ExitCode::from(128));
@@ -1485,6 +1489,14 @@ fn revert_one(
             return Ok(Step::Failed(ExitCode::from(128)));
         }
     };
+    // A revert is committed with no author of its own (`do_pick_commit()` leaves
+    // `author` NULL for `TODO_REVERT`, sequencer.c:2422-2423, 2545), so
+    // `commit_tree_extended()` asks `git_author_info(IDENT_STRICT)` and then
+    // `git_committer_info(IDENT_STRICT)` (commit.c:1709-1714); either `die()` leaves
+    // the applied index, the work tree, `MERGE_MSG` and `AUTO_MERGE` behind.
+    if let Some(refusal) = crate::commit_tree_refusal(false) {
+        return Ok(Step::Failed(refusal.die()));
+    }
     // `commit_tree_extended(msg, ..., opts->gpg_sign, extra)` (sequencer.c:1685):
     // the in-process commit signs with exactly the key the sequencer carries.
     let new_id = super::commit::write_commit_object(

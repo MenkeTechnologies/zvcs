@@ -66,6 +66,27 @@
 //!     compile with `regex::bytes` (Unicode off, byte semantics) to mirror git's
 //!     `regcomp`; `--find-object` is `pickaxe_match()`'s objfind branch and, because
 //!     git never hashes the worktree side for objfind, matches on the staged blob id.
+//!   * `-M[<n>]`/`--find-renames[=<n>]`, `-C[<n>]`/`--find-copies[=<n>]` (twice for
+//!     `--find-copies-harder`), `-B[<n>[/<m>]]`/`--break-rewrites[=…]`, `-l<n>`,
+//!     `--no-renames`, `--[no-]rename-empty`: `diffcore_std()`'s break, rename and
+//!     merge-broken passes, run through the shared `diffcore-rename.c` /
+//!     `diffcore-break.c` port in [`super::diffcore_rename`] over the queue
+//!     `run_diff_files()` builds, after `-R` and the `--relative` narrowing and
+//!     before the pickaxe, `-O`, the rotation and `--diff-filter` (whose `B` names a
+//!     scored modification). A destination is a worktree file, a source an index
+//!     entry; `--find-copies-harder` also queues every unchanged entry as
+//!     `diff_same()` does. An unmerged pair is a destination too: given a deleted
+//!     file as its source it prints as `U100 <source>` with the hashed worktree id,
+//!     and the source drops out. Every format carries the second name:
+//!     `R<nnn>`/`C<nnn>` with both paths in `--raw`/`--name-status`,
+//!     `pprint_rename()`'s `{old => new}` in `--stat`/`--numstat`, ` rename`/` copy`/
+//!     ` rewrite` in `--summary`, and `similarity index`/`dissimilarity index` with a
+//!     whole-file `emit_rewrite_diff()` body in the patch. `diff.renameLimit` sets the
+//!     `-l` default and a cut-short matrix gets `diff_warn_rename_limit()`'s warning.
+//!     One simplification: the patch's funcname and textconv driver is looked up
+//!     by `p->one->path` for both sides, where `builtin_diff()` looks `two` up by its
+//!     own name; the two differ only for a rename across paths whose attributes
+//!     name different drivers.
 //!   * `-O<orderfile>` reorders the queued pairs by the order file's glob patterns
 //!     (`diffcore_order`); `--output=<file>` writes every rendered byte to `<file>`.
 //!   * `-c`/`--cc` and the free combined diff `git diff-files -p` produces for a
@@ -110,17 +131,6 @@
 //!     reproduces `xdl_get_hunk()`'s handling of it.
 //!   * `--binary` for content that is actually binary (the `GIT binary patch`
 //!     literal/delta encoding is not produced).
-//!   * `-M`/`-C`/`-B` rename, copy and rewrite *pairing*. Accepted and not applied, so
-//!     a pair git collapses is still reported as a separate `D`+`A`. This is a real
-//!     divergence, not a shape `diff-files` cannot reach: with an intent-to-add
-//!     destination (`git add -N <new>` after `git rm --cached <old>`) stock 2.55.0
-//!     answers `-M` with `R097 <old> <new>`, measured. The shared
-//!     `diffcore-rename.c`/`diffcore-break.c` port in [`super::diffcore_rename`] is
-//!     what `diff-index` now runs over its own walk; this module's `Delta` still
-//!     carries one path per record and its renderers still assume it, so wiring the
-//!     same pass here is the outstanding work rather than a missing algorithm.
-//!     `-C` alone has one observable effect that *is* reproduced: `diffcore_rename()`
-//!     hashes every copy destination, so an added path shows its real object id.
 //!
 //! `--submodule[=<format>]` is honored in full: `short` renders the gitlink pair as the
 //! synthetic `Subproject commit <oid>` blobs, and `log`/`diff` take `builtin_diff()`'s
@@ -150,6 +160,7 @@ use gix::prelude::ObjectIdExt;
 use regex::bytes::Regex;
 
 use super::diff_color;
+use super::diffcore_rename;
 use super::diff_pickaxe;
 use super::diffstat::{self, StatWidths};
 use super::worktree_filespec::{set_absent_resource, subproject_image};
@@ -455,9 +466,9 @@ struct Opts {
     dirstat: DirStat,
     /// `-0`/`-1`/`-2`/`-3`, `--base`/`--ours`/`--theirs`. git's default is 2.
     unmerged_stage: u8,
-    /// `-C`/`--find-copies[-harder]`: rename detection registers every "added"
-    /// pair as a copy destination, which hashes its worktree side on the way.
-    find_copies: bool,
+    /// `-M`/`-C`/`-B`/`-l<n>` and their long spellings: the `diff_options` fields
+    /// `diffcore_std()` hands to the break, rename and merge-broken passes.
+    rename: diffcore_rename::Options,
     /// `run_diff_files()` shows a combined diff (`show_combined_diff()`) for an
     /// unmerged path that still has both stage #2 and stage #3, instead of the
     /// `* Unmerged path` marker plus a two-way diff against one stage. This is on
@@ -526,9 +537,60 @@ struct Delta {
     /// this is the only place the real post-image id survives — and
     /// `--submodule=log`/`=diff` need it to name the range they report.
     new_commit: Option<ObjectId>,
+    /// git's `p->one->path` when `diffcore_rename()` gave this pair a source at
+    /// another path: a rename or copy, or an unmerged pair that took a deleted file
+    /// as its source (diffcore-rename.c:1420-1433). `None` means `p->one->path` is
+    /// `p->two->path`.
+    src: Option<SrcPath>,
+    /// git's `p->score`, in `MAX_SCORE` units: the similarity of a rename or copy,
+    /// or the dissimilarity `diffcore_break()` left on a pair it broke. Non-zero is
+    /// what makes `diff_flush_raw()` print the `%03d` suffix (diff.c:6457).
+    score: u32,
+    /// A `diff_same()` pair (diff-lib.c:278-281): an up-to-date entry queued only
+    /// because `--find-copies-harder` lets it be a copy source. `diffcore_rename()`
+    /// drops it again as `diff_unmodified_pair()`.
+    same: bool,
+    /// `[one, two]`: the side's id was filled in by `hash_filespec()`
+    /// (diffcore-rename.c:264-274), which writes `oid` but leaves `oid_valid` clear.
+    /// `--raw` prints that id, while every `oid_valid` test downstream still sees
+    /// an unknown id.
+    hashed: [bool; 2],
+}
+
+/// The `p->one->path` of a pair whose two sides name different paths.
+#[derive(Clone)]
+struct SrcPath {
+    /// As rendered, after `--relative` stripping.
+    path: BString,
+    /// The repository-root relative path.
+    disk: BString,
 }
 
 impl Delta {
+    /// `p->one->path` as rendered.
+    fn src_path(&self) -> &BString {
+        self.src.as_ref().map_or(&self.path, |s| &s.path)
+    }
+
+    /// `p->one->path`, repository-root relative.
+    fn src_disk(&self) -> &BString {
+        self.src.as_ref().map_or(&self.disk, |s| &s.disk)
+    }
+
+    /// `p->one->oid_valid && p->two->oid_valid && oideq(...)`: both ids known and
+    /// equal, so the content cannot differ.
+    fn ids_known_equal(&self) -> bool {
+        !self.src_id.is_null()
+            && !self.dst_id.is_null()
+            && self.hashed == [false, false]
+            && self.src_id == self.dst_id
+    }
+
+    /// `R` or `C`: `diff_flush_raw()` prints both names (diff.c:6470).
+    fn renamed(&self) -> bool {
+        matches!(self.status, b'R' | b'C')
+    }
+
     fn old_valid(&self) -> bool {
         self.src_mode != 0
     }
@@ -555,8 +617,9 @@ const S_IFMT: u32 = 0o170000;
 
 /// The two halves `run_diff()` renders for a type change (diff.c:5052): the pre-image
 /// against an invalid post-image, then an invalid pre-image against the post-image. git
-/// allocates each null filespec with the *other* side's path, but `diff-files` never
-/// renames, so both halves carry the pair's single name.
+/// allocates each null filespec with the *other* side's path, and `run_diff_cmd()` names
+/// both halves `one->path`/`two->path`, so a pair `diffcore_rename()` matched across
+/// paths keeps its source name on both.
 fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
     if !d.type_changed() {
         return None;
@@ -573,6 +636,10 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         unmerged: false,
         dirty_submodule: 0,
         new_commit: None,
+        src: d.src.clone(),
+        score: 0,
+        same: false,
+        hashed: [false, false],
     };
     let creation = Delta {
         src_mode: 0,
@@ -585,6 +652,10 @@ fn split_type_change(d: &Delta) -> Option<(Delta, Delta)> {
         unmerged: false,
         dirty_submodule: 0,
         new_commit: None,
+        src: d.src.clone(),
+        score: 0,
+        same: false,
+        hashed: [false, false],
     };
     Some((deletion, creation))
 }
@@ -991,7 +1062,7 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
             ds
         },
         unmerged_stage: 2,
-        find_copies: false,
+        rename: diffcore_rename::Options::default(),
         combine_merges: false,
         dense_combined: false,
         explicit_stage: false,
@@ -1294,11 +1365,29 @@ fn parse(repo: &gix::Repository, args: &[String]) -> Result<Parsed, Fatal> {
         opts.unmerged_stage = u8::try_from(n).ok().filter(|&n| n <= 3).ok_or(Fatal::Usage)?;
         opts.explicit_stage = true;
     }
+    // `diff_setup_done()` (diff.c:5267-5268): `--find-copies-harder` turns copy
+    // detection on by itself.
+    if opts.rename.find_copies_harder {
+        opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+    }
     if quiet {
         // `--quiet` wins over every other format and turns on the exit status.
         opts.fmt = F_NO_OUTPUT;
         opts.exit_code = true;
+        // `flags.quick` (diff.c:5327-5332) drops rename detection rather than pay
+        // for it; `-B` stays.
+        opts.rename.detect_rename = 0;
+        opts.rename.find_copies_harder = false;
     }
+    // diff.c:5317-5318: `diff_rename_limit_default` is `diff.renameLimit`, which
+    // `git_diff_basic_config()` reads (diff.c:483-486), or 1000.
+    if opts.rename.detect_rename != 0 && opts.rename.rename_limit < 0 {
+        opts.rename.rename_limit = repo
+            .config_snapshot()
+            .integer("diff.renameLimit")
+            .unwrap_or(diffcore_rename::DEFAULT_RENAME_LIMIT);
+    }
+    opts.rename.hash_kind = repo.object_hash();
     if opts.fmt == 0 {
         opts.fmt = F_RAW;
     }
@@ -1402,17 +1491,6 @@ const ACCEPTED_NOOP: &[&str] = &[
     "--no-notes",
     "--ita-invisible-in-index",
     "--ita-visible-in-index",
-    // `--no-renames` is inert because detection is off to begin with. The three below
-    // it are *not* inert in stock git — an intent-to-add destination lets `diff-files
-    // -M` report an `R` — and are listed here only because this module's renderers
-    // cannot carry a second path yet; see the module header.
-    "--no-renames",
-    "--rename-empty",
-    "--no-rename-empty",
-    "-B",
-    "--break-rewrites",
-    "-M",
-    "--find-renames",
     // diff-files' "stay quiet about removed files"; zvcs never warns about them.
     "-q",
     // `--expand-tabs`/`--no-expand-tabs` (revision.c:2575-2578) set only
@@ -1425,9 +1503,7 @@ const ACCEPTED_NOOP: &[&str] = &[
     // this command starts with both clear, so neither can change any output.
     "--no-text",
     "--no-follow",
-    // `--no-find-copies-harder` lowers a flag that is never raised here, and
     // `--no-function-context` turns off a hunk shaping this command already omits.
-    "--no-find-copies-harder",
     "--no-function-context",
 ];
 
@@ -1442,8 +1518,6 @@ const PICKAXE_KIND_OBJFIND: u8 = 4;
 const ACCEPTED_NOOP_VALUED: &[&str] = &[
     "--anchored=",
     "--submodule=",
-    "--break-rewrites=",
-    "--find-renames=",
 ];
 
 /// Long options declared with a *required* argument (`OPT_CALLBACK_F` without
@@ -1590,7 +1664,18 @@ fn classify(
         "--ignore-space-at-eol" => opts.ws = Whitespace::IgnoreAtEol,
         "--ignore-cr-at-eol" => opts.ws = Whitespace::IgnoreCrAtEol,
         "--ignore-blank-lines" => opts.ignore_blank_lines = true,
-        "-C" | "--find-copies" | "--find-copies-harder" => opts.find_copies = true,
+        // `diff_opt_find_renames()`/`diff_opt_find_copies()`/`diff_opt_break_rewrites()`
+        // (diff.c:5470-5545) with no value: the default score. A second `-C` is
+        // `flags.find_copies_harder`, as `--find-copies-harder` is.
+        "-M" | "--find-renames" => set_find_renames(opts, ""),
+        "-C" | "--find-copies" => set_find_copies(opts, ""),
+        "-B" | "--break-rewrites" => opts.rename.break_opt = 0,
+        "--find-copies-harder" => opts.rename.find_copies_harder = true,
+        "--no-find-copies-harder" => opts.rename.find_copies_harder = false,
+        // `OPT_SET_INT_F(0, "no-renames", &options->detect_rename, …, 0, …)`.
+        "--no-renames" => opts.rename.detect_rename = 0,
+        "--rename-empty" => opts.rename.rename_empty = true,
+        "--no-rename-empty" => opts.rename.rename_empty = false,
         // `-c`/`--cc`: request a combined diff and, per `common_setup()`, imply the
         // patch format when nothing else is asked for. `--cc` also densifies.
         "-c" => {
@@ -1772,12 +1857,13 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
     if let Some(v) = s.strip_prefix("--find-copies=") {
         crate::diffopt::check_rename_score("find-copies", v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
-        opts.find_copies = true;
+        set_find_copies(opts, v);
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--find-renames=") {
         crate::diffopt::check_rename_score("find-renames", v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        set_find_renames(opts, v);
         return Ok(Flag::Handled);
     }
     // `--expand-tabs=<n>`: the value is inert here (see `ACCEPTED_NOOP`) but
@@ -1792,6 +1878,8 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
     if let Some(v) = s.strip_prefix("--break-rewrites=") {
         crate::diffopt::check_break_rewrites(v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        // `opt1 | (opt2 << 16)` (diff.c:5514); the form was checked just above.
+        opts.rename.break_opt = diffcore_rename::parse_break_opt(v).unwrap_or(0);
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("--diff-algorithm=") {
@@ -1907,30 +1995,31 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         opts.output_file = Some(v.to_owned());
         return Ok(Flag::Handled);
     }
-    // `-B<n>`, `-M<n>`, `-C<n>`: the score itself is irrelevant without renames,
-    // but `parse_rename_score()` must still consume the whole value or the
-    // callback reports it — with the *long* name, since that is `opt->long_name`.
+    // `-B<n>`, `-M<n>`, `-C<n>`: `parse_rename_score()` must consume the whole value
+    // or the callback reports it — with the *long* name, since that is
+    // `opt->long_name`.
     if let Some(v) = s.strip_prefix("-C") {
         crate::diffopt::check_rename_score("find-copies", v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
-        opts.find_copies = true;
+        set_find_copies(opts, v);
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("-M") {
         crate::diffopt::check_rename_score("find-renames", v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        set_find_renames(opts, v);
         return Ok(Flag::Handled);
     }
     if let Some(v) = s.strip_prefix("-B") {
         crate::diffopt::check_break_rewrites(v)
             .map_err(|msg| Fatal::OptionError(format!("error: {msg}")))?;
+        // `opt1 | (opt2 << 16)` (diff.c:5514); the form was checked just above.
+        opts.rename.break_opt = diffcore_rename::parse_break_opt(v).unwrap_or(0);
         return Ok(Flag::Handled);
     }
     // `-l<n>`: `OPT_INTEGER('l', NULL, &options->rename_limit, …)` (diff.c:6188).
-    // diff-files never pairs a deletion with an addition, so the limit is inert,
-    // but parse-options still rejects a value that is not an integer.
     if let Some(v) = s.strip_prefix("-l") {
-        crate::optint::integer(&crate::optint::short_opt('l'), v)
+        opts.rename.rename_limit = crate::optint::integer(&crate::optint::short_opt('l'), v)
             .map_err(|e| Fatal::OptionError(format!("error: {e}")))?;
         return Ok(Flag::Handled);
     }
@@ -1970,6 +2059,23 @@ fn classify_valued(repo: &gix::Repository, s: &str, opts: &mut Opts) -> Result<F
         return Ok(Flag::Unsupported);
     }
     Ok(Flag::Unknown)
+}
+
+/// `diff_opt_find_renames()` (diff.c:5721) once the value has been checked.
+fn set_find_renames(opts: &mut Opts, v: &str) {
+    opts.rename.rename_score = diffcore_rename::parse_rename_score(v).0;
+    opts.rename.detect_rename = diffcore_rename::DETECT_RENAME;
+}
+
+/// `diff_opt_find_copies()` (diff.c:5701) once the value has been checked: a second
+/// copy request is `flags.find_copies_harder`.
+fn set_find_copies(opts: &mut Opts, v: &str) {
+    opts.rename.rename_score = diffcore_rename::parse_rename_score(v).0;
+    if opts.rename.detect_rename == diffcore_rename::DETECT_COPY {
+        opts.rename.find_copies_harder = true;
+    } else {
+        opts.rename.detect_rename = diffcore_rename::DETECT_COPY;
+    }
 }
 
 /// Record one `-I<re>` / `--ignore-matching-lines=<re>`.
@@ -2112,27 +2218,44 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
     combined.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // `-O<file>` (`diffcore_order`): stably reorder the queue so pairs whose path
-    // matches an earlier pattern in the order file come first. This runs on the
-    // repository-root relative path, before `--relative` strips anything and before
-    // `--rotate-to`/`--skip-to` re-anchor, matching git's `diff_flush` order.
-    // `diffcore_order()` opens with `if (!q->nr) return;`, so an order file that
-    // cannot be read is only fatal when there is a queue to reorder.
-    if let (Some(of), false) = (&opts.order_file, deltas.is_empty() && combined.is_empty()) {
-        let order = read_order_file(of)?;
-        deltas.sort_by_cached_key(|d| match_order(&order, d.path.as_slice()));
-        combined.sort_by_cached_key(|c| match_order(&order, c.path.as_slice()));
-    }
-
+    // `diff_change()` swaps the sides as it queues the pair (diff.c:7667), so `-R`
+    // happens before every `diffcore_std()` pass, rename detection included.
     if opts.reverse {
         for d in &mut deltas {
             reverse_delta(d);
         }
     }
 
-    // Rotation runs before `--relative` strips anything: `git diff-files
-    // --relative=src --rotate-to=src/lib.rs` succeeds while `--rotate-to=lib.rs`
-    // fails, so the anchor always names the repository-root relative path.
+    // `--relative` is a queue-time filter too: `run_diff_files()`, `diff_unmerge()`
+    // and `diff_same()` all skip a path outside the prefix (diff-lib.c:150-152,
+    // diff.c:7712-7714, 7727-7729), so a rename source outside it never exists.
+    let prefix = relative_prefix(repo, &opts.relative)?;
+    apply_relative(&mut deltas, prefix.as_ref());
+    apply_relative_combined(&mut combined, prefix.as_ref());
+
+    // `diffcore_std()` (diff.c:7489-7495): break, rename, then merge-broken, ahead of
+    // the pickaxe, the order file, the rotation and the filter. The warning
+    // `diff_result_code()` prints for a matrix `-l` cut short waits for the exit.
+    let rename_warnings = if opts.rename.detect_rename != 0 || opts.rename.break_opt != -1 {
+        apply_rename_detection(repo, &workdir, &mut deltas, &opts, prefix.as_ref())?
+    } else {
+        diffcore_rename::Warnings::default()
+    };
+
+    // `-O<file>` (`diffcore_order`): stably reorder the queue so pairs whose
+    // `p->two->path` (diffcore-order.c:105-110) matches an earlier pattern in the
+    // order file come first — the repository-root relative path, whatever
+    // `--relative` strips. `diffcore_order()` opens with `if (!q->nr) return;`, so an
+    // order file that cannot be read is only fatal when there is a queue to reorder.
+    if let (Some(of), false) = (&opts.order_file, deltas.is_empty() && combined.is_empty()) {
+        let order = read_order_file(of)?;
+        deltas.sort_by_cached_key(|d| match_order(&order, d.disk.as_slice()));
+        combined.sort_by_cached_key(|c| match_order(&order, c.path.as_slice()));
+    }
+
+    // `diffcore_rotate()` compares `q->queue[i]->two->path` (diffcore-rotate.c:21),
+    // the unstripped name: `git diff-files --relative=src --rotate-to=src/lib.rs`
+    // succeeds while `--rotate-to=lib.rs` fails.
     //
     // `diffcore_rotate()` opens with `if (!q->nr) return;`, so an empty diff is not
     // a missing path: `git diff-files --skip-to=src/lib.rs` on a clean worktree
@@ -2141,21 +2264,17 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     match &opts.anchor {
         _ if deltas.is_empty() && combined.is_empty() => {}
         None => {}
-        Some(Anchor::Rotate(p)) => match deltas.iter().position(|d| &d.path == p) {
+        Some(Anchor::Rotate(p)) => match deltas.iter().position(|d| &d.disk == p) {
             Some(i) => deltas.rotate_left(i),
             None => return Ok(Fatal::NoSuchPath(p.to_string()).report()),
         },
-        Some(Anchor::Skip(p)) => match deltas.iter().position(|d| &d.path == p) {
+        Some(Anchor::Skip(p)) => match deltas.iter().position(|d| &d.disk == p) {
             Some(i) => {
                 deltas.drain(..i);
             }
             None => return Ok(Fatal::NoSuchPath(p.to_string()).report()),
         },
     }
-
-    let prefix = relative_prefix(repo, &opts.relative)?;
-    apply_relative(&mut deltas, prefix.as_ref());
-    apply_relative_combined(&mut combined, prefix.as_ref());
 
     // Content is needed by every non-raw format, by the whitespace family's
     // pruning, and by the `-S`/`-G` pickaxe. `--find-object` reads only the recorded
@@ -2166,8 +2285,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     );
     let want_content = opts.fmt & (F_CONTENT | F_CHECKDIFF) != 0
         || opts.diff_from_contents()
-        || pickaxe_needs_content
-        || opts.find_copies;
+        || pickaxe_needs_content;
     // `-G` inspects the added/removed lines, so it needs the rendered hunks even
     // when the requested output format is raw.
     let want_patch = opts.fmt & (F_PATCH | F_CHECKDIFF) != 0
@@ -2198,8 +2316,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     let reads_attributes = want_content
         && (opts.fmt & ((F_CONTENT | F_CHECKDIFF) & !F_SUMMARY) != 0
             || opts.diff_from_contents()
-            || pickaxe_needs_content
-            || opts.find_copies);
+            || pickaxe_needs_content);
     if !reads_attributes {
         // A raw or name-only listing never reads an attribute, so a bad `--attr-source`
         // is not diagnosed (attr.c:1201-1228 runs on the first lookup).
@@ -2232,22 +2349,20 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         }
     }
 
+    // `run_diff_cmd()` (diff.c:4959-4961) sets `found_changes` for every rename and
+    // copy, whatever its hunks, so `diff_flush()`'s quiet run keeps an exact `C100`.
+    for (d, an) in deltas.iter().zip(analyses.iter_mut()) {
+        if d.renamed() {
+            an.changed = true;
+        }
+    }
+
     // `diffcore_pickaxe()` runs before the filter and before any output.
     if let Some(px) = &opts.pickaxe {
         apply_pickaxe(px, &mut deltas, &mut analyses);
     }
     if let Some(f) = &opts.filter {
         apply_filter(f, &mut deltas, &mut analyses);
-    }
-
-    // `diffcore_rename()` hashes every rename/copy destination on the way, which
-    // is the only reason `-C` fills in the id of a record whose source is absent.
-    if opts.find_copies {
-        for (d, an) in deltas.iter_mut().zip(&analyses) {
-            if !d.old_valid() && d.new_valid() {
-                d.dst_id = an.dst_id;
-            }
-        }
     }
 
     // `diff_flush()`: with diff_from_contents each pair is run through the patch
@@ -2563,7 +2678,9 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         }
     }
 
-    // `diff_result_code()`: bit 0 is `--exit-code`, bit 1 is `--check`.
+    // `diff_result_code()`: `diff_warn_rename_limit()` first (diff.c:7526-7528), then
+    // bit 0 is `--exit-code`, bit 1 is `--check`.
+    rename_warnings.emit("diff.renameLimit");
     let mut code = 0u8;
     let has_changes = !combined.is_empty()
         || if opts.diff_from_contents() {
@@ -2629,10 +2746,19 @@ fn apply_relative(deltas: &mut Vec<Delta>, prefix: Option<&BString>) {
         if !d.disk.starts_with(prefix) {
             return false;
         }
-        let rest = &d.disk[prefix.len()..];
-        d.path = rest.strip_prefix(b"/").unwrap_or(rest).into();
+        d.path = strip_relative(&d.disk, Some(prefix));
         true
     });
+}
+
+/// `strip_prefix()` (diff.c:4988-5001) on one repository-root relative name:
+/// `prefix_length` bytes, then one `/` if that is what follows.
+fn strip_relative(disk: &BString, prefix: Option<&BString>) -> BString {
+    let Some(prefix) = prefix else {
+        return disk.clone();
+    };
+    let rest = disk.get(prefix.len()..).unwrap_or_default();
+    rest.strip_prefix(b"/").unwrap_or(rest).into()
 }
 
 /// `--relative[=<p>]` for the combined-diff paths: the same `strncmp()` narrowing,
@@ -2642,6 +2768,97 @@ fn apply_relative_combined(combined: &mut Vec<CombinedPath>, prefix: Option<&BSt
     if let Some(prefix) = prefix {
         combined.retain(|c| c.path.starts_with(prefix));
     }
+}
+
+/// The `diffcore_std()` break/rename/merge-broken slice (diff.c:7489-7495) over this
+/// command's queue, through the shared [`diffcore_rename`] port: build git's
+/// filespec/filepair queue from the deltas, run the passes, let
+/// `diff_resolve_rename_copy()` assign every status letter, then rebuild the deltas
+/// from the pairs that survive.
+///
+/// The queue is the one `run_diff_files()` builds. A source side is the index entry
+/// (`oid_valid`) and a destination side the worktree file, whose id stays unset
+/// until `hash_filespec()` fills it mid-pass — that filled-in id is what `--raw`
+/// then prints. `-R` has already swapped the two. `diff_unmerge()`'s pair carries
+/// no source and the worktree file's mode (diff-lib.c:221-224), so it is a
+/// destination (diffcore-rename.c:1420-1433) and may take a deleted path as its
+/// `p->one`. A `diff_same()` pair shares one filespec between its sides
+/// (diff.c:7716-7719), exactly as the arena index does here.
+fn apply_rename_detection(
+    repo: &gix::Repository,
+    workdir: &Path,
+    deltas: &mut Vec<Delta>,
+    opts: &Opts,
+    prefix: Option<&BString>,
+) -> Result<diffcore_rename::Warnings> {
+    let null = repo.object_hash().null();
+    let spec = |path: &BString, mode: u32, id: ObjectId| match mode {
+        0 => diffcore_rename::FileSpec::absent(path.clone()),
+        _ => diffcore_rename::FileSpec::new(path.clone(), mode, id, id != null),
+    };
+    let mut q = diffcore_rename::Queue::default();
+    // What a gitlink side carries that no filespec has room for, keyed by its spec.
+    let mut submodule_state: BTreeMap<usize, (u8, Option<ObjectId>)> = BTreeMap::new();
+    for d in deltas.drain(..) {
+        let one = q.add_spec(spec(d.src_disk(), d.src_mode, d.src_id));
+        let two = match d.same {
+            true => one,
+            false => q.add_spec(spec(&d.disk, d.dst_mode, d.dst_id)),
+        };
+        if d.dirty_submodule != 0 || d.new_commit.is_some() {
+            // `-R` moved the worktree side, and its `dirty_submodule`, into `p->one`.
+            let side = if opts.reverse { one } else { two };
+            q.specs[side].dirty_submodule = d.dirty_submodule;
+            submodule_state.insert(side, (d.dirty_submodule, d.new_commit));
+        }
+        let pair = q.add_pair(one, two);
+        q.pairs[pair].unmerged = d.unmerged;
+    }
+
+    let mut cache = repo.diff_resource_cache(
+        Mode::ToGit,
+        WorktreeRoots {
+            old_root: None,
+            new_root: Some(workdir.to_owned()),
+        },
+    )?;
+    // The port marks a hashed spec `oid_valid`; git does not (see [`Delta::hashed`]).
+    let valid_before: Vec<bool> = q.specs.iter().map(|s| s.oid_valid).collect();
+    let mut content = super::diff::DeltaContent {
+        repo,
+        cache: &mut cache,
+        workdir: Some(workdir.to_owned()),
+    };
+    let warnings = diffcore_rename::run(&mut q, &opts.rename, &mut content);
+    diffcore_rename::resolve_rename_copy(&mut q);
+
+    for p in &q.pairs {
+        let (one, two) = (&q.specs[p.one], &q.specs[p.two]);
+        let sub = submodule_state
+            .get(&p.two)
+            .or_else(|| submodule_state.get(&p.one))
+            .copied();
+        deltas.push(Delta {
+            src_mode: one.mode,
+            dst_mode: two.mode,
+            src_id: if one.valid() { one.oid } else { null },
+            dst_id: if two.valid() { two.oid } else { null },
+            status: p.status,
+            path: strip_relative(&two.path, prefix),
+            disk: two.path.clone(),
+            unmerged: p.unmerged,
+            dirty_submodule: sub.map_or(0, |s| s.0),
+            new_commit: sub.and_then(|s| s.1),
+            src: (one.path != two.path).then(|| SrcPath {
+                path: strip_relative(&one.path, prefix),
+                disk: one.path.clone(),
+            }),
+            score: p.score,
+            same: false,
+            hashed: [one.oid_valid && !valid_before[p.one], two.oid_valid && !valid_before[p.two]],
+        });
+    }
+    Ok(warnings)
 }
 
 /// Drop every delta whose `keep` flag is false, in lock step with its analysis.
@@ -2662,7 +2879,13 @@ fn retain_by(deltas: &mut Vec<Delta>, analyses: &mut Vec<Analysis>, keep: &[bool
 
 /// `diffcore_apply_filter()` / `match_filter()`.
 fn apply_filter(f: &Filter, deltas: &mut Vec<Delta>, analyses: &mut Vec<Analysis>) {
-    let keep: Vec<bool> = deltas.iter().map(|d| f.keep.contains(&d.status)).collect();
+    // `match_filter()` (diff.c:7272-7281): a modification `diffcore_break()` left a
+    // score on answers to `B`, not `M`.
+    let letter = |d: &Delta| match (d.status, d.score) {
+        (b'M', s) if s != 0 => b'B',
+        (st, _) => st,
+    };
+    let keep: Vec<bool> = deltas.iter().map(|d| f.keep.contains(&letter(d))).collect();
     if f.all_or_none {
         if keep.iter().any(|k| *k) {
             return;
@@ -2846,6 +3069,10 @@ struct Collector<'a> {
     /// diverted to [`Collector::combined`] instead of producing a `U` marker plus a
     /// two-way record.
     combine: bool,
+    /// `flags.dirty_submodules`, which `diff_setup_done()` raises for a patch
+    /// (diff.c:5314-5315): `match_stat_with_submodule()` only asks a submodule whose
+    /// `HEAD` moved whether it is dirty when it is set (diff-lib.c:100-103).
+    dirty_submodules: bool,
     deltas: Vec<Delta>,
     combined: Vec<CombinedPath>,
 }
@@ -2948,6 +3175,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                     unmerged: true,
                     dirty_submodule: 0,
                     new_commit: None,
+                    src: None,
+                    score: 0,
+                    same: false,
+                    hashed: [false, false],
                 });
                 if self.unmerged_stage == 0 {
                     return;
@@ -2966,6 +3197,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                     unmerged: false,
                     dirty_submodule: 0,
                     new_commit: None,
+                    src: None,
+                    score: 0,
+                    same: false,
+                    hashed: [false, false],
                 }
             }
             // gix emits this when the content comparison proved the entry clean even
@@ -2995,11 +3230,20 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                     unmerged: false,
                     dirty_submodule: 0,
                     new_commit: None,
+                    src: None,
+                    score: 0,
+                    same: false,
+                    hashed: [false, false],
                 }
             }
+            // `diff_addremove('+', ce_mode_from_stat(ce, st.st_mode), …)` (diff-lib.c:263-268):
+            // the creation carries the worktree file's mode, not the staged one.
             EntryStatus::IntentToAdd => Delta {
                 src_mode: 0,
-                dst_mode: src_mode,
+                dst_mode: match self.worktree_mode(rela_path) {
+                    0 => src_mode,
+                    m => m,
+                },
                 src_id: self.null,
                 dst_id: self.null,
                 status: b'A',
@@ -3008,6 +3252,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 unmerged: false,
                 dirty_submodule: 0,
                 new_commit: None,
+                src: None,
+                score: 0,
+                same: false,
+                hashed: [false, false],
             },
             // gix reports every non-submodule entry whose path `lstat`s as a directory
             // as a removal; `check_removed()` (diff-lib.c:58) only agrees when that
@@ -3032,6 +3280,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                     unmerged: false,
                     dirty_submodule: 0,
                     new_commit: None,
+                    src: None,
+                    score: 0,
+                    same: false,
+                    hashed: [false, false],
                 }
             }
             EntryStatus::Change(Change::Type { worktree_mode }) => Delta {
@@ -3045,6 +3297,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 unmerged: false,
                 dirty_submodule: 0,
                 new_commit: None,
+                src: None,
+                score: 0,
+                same: false,
+                hashed: [false, false],
             },
             EntryStatus::Change(Change::Modification {
                 executable_bit_changed,
@@ -3064,6 +3320,10 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 unmerged: false,
                 dirty_submodule: 0,
                 new_commit: None,
+                src: None,
+                score: 0,
+                same: false,
+                hashed: [false, false],
             },
             EntryStatus::Change(Change::SubmoduleModification(sm)) => {
                 // A submodule whose checked-out `HEAD` still matches the index is
@@ -3082,12 +3342,17 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                     // `two->dirty_submodule`: local damage inside the submodule's
                     // worktree, which `--submodule=log`/`=diff` report as `-dirty`
                     // on the affected side of the header.
-                    dirty_submodule: if sm.changes.as_ref().is_some_and(|c| !c.is_empty()) {
+                    dirty_submodule: if (!moved || self.dirty_submodules)
+                        && sm.changes.as_ref().is_some_and(|c| !c.is_empty()) {
                         super::diff_pairs::DIRTY_SUBMODULE_MODIFIED
                     } else {
                         0
                     },
                     new_commit: Some(sm.checked_out_head_id.unwrap_or(entry.id)),
+                    src: None,
+                    score: 0,
+                    same: false,
+                    hashed: [false, false],
                 }
             }
         };
@@ -3184,6 +3449,7 @@ fn collect(
         null: ObjectId::null(repo.object_hash()),
         unmerged_stage: opts.unmerged_stage,
         combine: opts.combine_merges,
+        dirty_submodules: opts.fmt & F_PATCH != 0,
         deltas: Vec::new(),
         combined: Vec::new(),
     };
@@ -3191,6 +3457,8 @@ fn collect(
     let should_interrupt = AtomicBool::new(false);
     let comparator: StatOnly = gix::status::plumbing::index_as_worktree::traits::FastEq;
 
+    // `diff_same()` needs the pathspec again once the status walk has consumed it.
+    let same_patterns = opts.rename.find_copies_harder.then(|| patterns.clone());
     repo.index_worktree_status(
         &index,
         patterns,
@@ -3211,7 +3479,65 @@ fn collect(
         },
     )?;
 
+    if let Some(patterns) = same_patterns {
+        queue_same(repo, &index, &patterns, opts, &mut collector.deltas)?;
+    }
     Ok((collector.deltas, collector.combined))
+}
+
+/// `diff_same()` for every stage-0 entry `run_diff_files()` found unchanged
+/// (diff-lib.c:244-248, 276-281), queued only under `--find-copies-harder` so the
+/// untouched file can be a copy source. A gitlink is skipped when
+/// `is_submodule_ignored()` says so (diff.c:7709-7710), which for this command is
+/// `--ignore-submodules=all`.
+fn queue_same(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    patterns: &[BString],
+    opts: &Opts,
+    deltas: &mut Vec<Delta>,
+) -> Result<()> {
+    let queued: std::collections::HashSet<BString> = deltas.iter().map(|d| d.disk.clone()).collect();
+    let mut pathspec = match patterns.is_empty() {
+        true => None,
+        false => Some(repo.pathspec(
+            false,
+            patterns,
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?),
+    };
+    let skip_gitlinks = opts.ignore_submodules == Some(gix::submodule::config::Ignore::All);
+    let state: &gix::index::State = index;
+    for e in state.entries() {
+        let path = e.path(state);
+        let mode = e.mode.bits();
+        if e.stage_raw() != 0
+            || queued.contains(path)
+            || (skip_gitlinks && mode == 0o160000)
+            || !pathspec.as_mut().map_or(true, |ps| ps.is_included(path, Some(false)))
+        {
+            continue;
+        }
+        deltas.push(Delta {
+            src_mode: mode,
+            dst_mode: mode,
+            src_id: e.id,
+            dst_id: e.id,
+            status: b'M',
+            path: path.to_owned(),
+            disk: path.to_owned(),
+            unmerged: false,
+            dirty_submodule: 0,
+            new_commit: None,
+            src: None,
+            score: 0,
+            same: true,
+            hashed: [false, false],
+        });
+    }
+    Ok(())
 }
 
 /// Flip the executable bit of a regular-file mode, leaving anything else alone.
@@ -3257,7 +3583,8 @@ fn resolve_drivers(
 ) -> Result<Vec<Option<std::sync::Arc<crate::userdiff::Driver>>>> {
     let mut out = Vec::with_capacity(deltas.len());
     for d in deltas {
-        out.push(lookup.for_path(d.disk.as_ref()).map_err(crate::fatal::die)?);
+        // `attr_path = one->path` in `run_diff()` (diff.c:5014).
+        out.push(lookup.for_path(d.src_disk().as_ref()).map_err(crate::fatal::die)?);
     }
     Ok(out)
 }
@@ -3319,13 +3646,22 @@ fn analyze(
 ) -> Result<Analysis> {
     let null = hash_kind.null();
     if d.unmerged {
-        // The unmerged pair has no source, so git only ever reads its worktree
-        // side — for `--dirstat`'s damage score and for the pickaxe.
+        // `run_diff()` never patches an unmerged pair, so git only ever reads its
+        // sides for `--dirstat`'s damage score and for the pickaxe: the worktree
+        // file, and the deleted entry `diffcore_rename()` may have given it as its
+        // source.
         let mut a = Analysis::unmerged(null);
         if d.new_valid() {
             let full = workdir.join(gix::path::from_bstr(d.disk.as_bstr()));
             a.new_data = std::fs::read(&full).unwrap_or_default();
             a.dst_id = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &a.new_data)?;
+        }
+        if d.old_valid() && !d.src_id.is_null() && d.src_mode & S_IFMT != 0o160000 {
+            use gix::prelude::FindExt;
+            let mut buf = Vec::new();
+            objects.find_blob(&d.src_id, &mut buf)?;
+            a.old_data = buf;
+            a.src_id = d.src_id;
         }
         return Ok(a);
     }
@@ -3340,7 +3676,20 @@ fn analyze(
     };
     let (old_id, old_mode, new_mode) = (blob_id, blob_mode, wt_mode);
 
-    let path = d.disk.as_bstr();
+    // `p->one->path` and `p->two->path`, which differ for a pair
+    // `diffcore_rename()` matched across paths: the index side is read at its own
+    // name and the worktree side at its own, each with its own attributes.
+    let (blob_path, wt_path) = if swapped {
+        (d.disk.as_bstr(), d.src_disk().as_bstr())
+    } else {
+        (d.src_disk().as_bstr(), d.disk.as_bstr())
+    };
+    // `attr_path` in `run_diff()` (diff.c:5014) is `one->path`.
+    let path = d.src_disk().as_bstr();
+    // `builtin_diff()`'s `complete_rewrite` (diff.c:4927): a modification
+    // `diffcore_break()` left a score on is shown as a whole-file rewrite, and
+    // `builtin_diffstat()` counts it with `count_lines()` (diff.c:4204-4208).
+    let rewrite = d.status == b'M' && d.score != 0;
     let old_kind = if old_mode != 0 {
         kind_of(old_mode)
     } else {
@@ -3363,7 +3712,7 @@ fn analyze(
     let new_gitlink = new_mode == 0o160000;
     if old_gitlink || new_gitlink {
         let new_commit = if new_gitlink {
-            super::worktree_filespec::gitlink_head(workdir, path).unwrap_or(null)
+            super::worktree_filespec::gitlink_head(workdir, wt_path).unwrap_or(null)
         } else {
             null
         };
@@ -3380,25 +3729,25 @@ fn analyze(
         let new_is_blob = !new_gitlink && new_mode != 0;
         let prep = if old_is_blob || new_is_blob {
             if old_is_blob {
-                cache.set_resource(old_id, old_kind, path, ResourceKind::OldOrSource, objects)?;
+                cache.set_resource(old_id, old_kind, blob_path, ResourceKind::OldOrSource, objects)?;
             } else {
                 set_absent_resource(
                     cache,
                     ResourceKind::OldOrSource,
                     EntryKind::Blob,
-                    path,
+                    blob_path,
                     objects,
                     null,
                 )?;
             }
             if new_is_blob {
-                cache.set_resource(null, new_kind, path, ResourceKind::NewOrDestination, objects)?;
+                cache.set_resource(null, new_kind, wt_path, ResourceKind::NewOrDestination, objects)?;
             } else {
                 set_absent_resource(
                     cache,
                     ResourceKind::NewOrDestination,
                     EntryKind::Blob,
-                    path,
+                    wt_path,
                     objects,
                     null,
                 )?;
@@ -3466,19 +3815,19 @@ fn analyze(
     // still be reachable through a symlinked leading path (the read wrongly succeeds).
     // See [`set_absent_resource`].
     if old_mode != 0 {
-        cache.set_resource(old_id, old_kind, path, ResourceKind::OldOrSource, objects)?;
+        cache.set_resource(old_id, old_kind, blob_path, ResourceKind::OldOrSource, objects)?;
     } else {
-        set_absent_resource(cache, ResourceKind::OldOrSource, old_kind, path, objects, null)?;
+        set_absent_resource(cache, ResourceKind::OldOrSource, old_kind, blob_path, objects, null)?;
     }
     if new_mode != 0 {
         // With `new_root` set on the cache, a null id reads from the worktree by path.
-        cache.set_resource(null, new_kind, path, ResourceKind::NewOrDestination, objects)?;
+        cache.set_resource(null, new_kind, wt_path, ResourceKind::NewOrDestination, objects)?;
     } else {
         set_absent_resource(
             cache,
             ResourceKind::NewOrDestination,
             new_kind,
-            path,
+            wt_path,
             objects,
             null,
         )?;
@@ -3495,7 +3844,7 @@ fn analyze(
         gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, buf)?
     } else {
         // Binary worktree content: hash the raw file (filters not applied).
-        let full = workdir.join(gix::path::from_bstr(path));
+        let full = workdir.join(gix::path::from_bstr(wt_path));
         let bytes = std::fs::read(&full).unwrap_or_default();
         gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &bytes)?
     };
@@ -3541,7 +3890,7 @@ fn analyze(
                 let worktree = if wt_mode == 0 {
                     Vec::new()
                 } else {
-                    std::fs::read(workdir.join(gix::path::from_bstr(path))).unwrap_or_default()
+                    std::fs::read(workdir.join(gix::path::from_bstr(wt_path))).unwrap_or_default()
                 };
                 if swapped {
                     (worktree, staged)
@@ -3566,6 +3915,7 @@ fn analyze(
                 d.old_valid(),
                 d.new_valid(),
             )? {
+                Some((o, n)) if rewrite => want_patch.then(|| rewrite_body(o, n, opts)),
                 Some((o, n)) => internal_diff(o, n, opts, want_patch, funcname).2,
                 None => None,
             };
@@ -3594,6 +3944,35 @@ fn analyze(
             new_data,
             changed: true,
         }),
+        Operation::InternalDiff { algorithm: _ } if rewrite => {
+            // `emit_rewrite_diff()` (diff.c:1874) over the converted text when a
+            // textconv driver applies (diff.c:3925-3927), the raw images otherwise.
+            let hunks = match &convert(
+                lookup,
+                textconv,
+                path,
+                &old_data,
+                &new_data,
+                d.old_valid(),
+                d.new_valid(),
+            )? {
+                Some((o, n)) => rewrite_body(o, n, opts),
+                None => rewrite_body(&old_data, &new_data, opts),
+            };
+            Ok(Analysis {
+                src_id,
+                dst_id,
+                added: super::diff_pairs::count_lines(&new_data),
+                deleted: super::diff_pairs::count_lines(&old_data),
+                binary: false,
+                binary_sizes: (0, 0),
+                hunks: want_patch.then_some(hunks),
+                old_data,
+                new_data,
+                // `emit_rewrite_diff()`'s caller sets `o->found_changes = 1`.
+                changed: true,
+            })
+        }
         Operation::InternalDiff { algorithm: _ } => {
             let (added, deleted, hunks) =
                 internal_diff(&old_data, &new_data, opts, want_patch, funcname);
@@ -3629,6 +4008,13 @@ fn analyze(
             })
         }
     }
+}
+
+/// `emit_rewrite_diff()`'s body (diff.c:1939-1960): one hunk spanning both whole
+/// images. The markers are git's canonical `-`/`+`; [`render_patch`] maps them onto
+/// `--output-indicator-*` with every other hunk's.
+fn rewrite_body(old_data: &[u8], new_data: &[u8], opts: &Opts) -> Vec<u8> {
+    super::diff_pairs::emit_rewrite_body(old_data, new_data, opts.irreversible_delete, b'-', b'+')
 }
 
 /// `xdl_diff()` over two in-core images, with every knob the command line set: the
@@ -3827,34 +4213,47 @@ fn render_raw(repo: &gix::Repository, deltas: &[Delta], opts: &Opts) -> Vec<u8> 
     // Field separator (between status and path) and record terminator.
     let (sep, term): (u8, u8) = if opts.nul { (0, 0) } else { (b'\t', b'\n') };
 
+    let name = |out: &mut Vec<u8>, path: &BString| match opts.nul {
+        true => out.extend_from_slice(path.as_ref()),
+        false => out.extend_from_slice(&quoted_name(path)),
+    };
     let mut out = Vec::new();
     for d in deltas {
         out.extend_from_slice(&opts.line_prefix);
-        match opts.format {
-            Format::NameOnly => {}
-            Format::NameStatus => {
-                out.push(d.status);
-                out.push(sep);
-            }
-            Format::Raw => {
-                out.extend_from_slice(
-                    format!(
-                        ":{:06o} {:06o} {} {} ",
-                        d.src_mode,
-                        d.dst_mode,
-                        hex(repo, &d.src_id, len),
-                        hex(repo, &d.dst_id, len),
-                    )
-                    .as_bytes(),
-                );
-                out.push(d.status);
-                out.push(sep);
-            }
+        // `flush_one_pair()` (diff.c:6713-6729): `--name-only` prints `p->two->path`.
+        if opts.format == Format::NameOnly {
+            name(&mut out, &d.path);
+            out.push(term);
+            continue;
         }
-        if opts.nul {
-            out.extend_from_slice(d.path.as_ref());
+        // `diff_flush_raw()` (diff.c:6448-6492).
+        if opts.format == Format::Raw {
+            out.extend_from_slice(
+                format!(
+                    ":{:06o} {:06o} {} {} ",
+                    d.src_mode,
+                    d.dst_mode,
+                    hex(repo, &d.src_id, len),
+                    hex(repo, &d.dst_id, len),
+                )
+                .as_bytes(),
+            );
+        }
+        out.push(d.status);
+        if d.score != 0 {
+            out.extend_from_slice(
+                format!("{:03}", diffcore_rename::similarity_index(d.score)).as_bytes(),
+            );
+        }
+        out.push(sep);
+        if d.renamed() {
+            name(&mut out, d.src_path());
+            out.push(sep);
+            name(&mut out, &d.path);
         } else {
-            out.extend_from_slice(&quoted_name(&d.path));
+            // `name_a = p->one->mode ? p->one->path : p->two->path`, which is how an
+            // unmerged pair that took a source prints that source's name.
+            name(&mut out, if d.src_mode != 0 { d.src_path() } else { &d.path });
         }
         out.push(term);
     }
@@ -3913,6 +4312,9 @@ fn abbrev_len(
 /// One `struct diffstat_file`.
 struct StatFile {
     path: BString,
+    /// `from_name`: `p->one->path` when it differs from `p->two->path`, which is
+    /// what makes the row `is_renamed` (diff.c:2919-2927).
+    from_name: Option<BString>,
     /// The name as printed, quoted and possibly annotated by `--compact-summary`.
     print_name: Vec<u8>,
     added: u32,
@@ -3928,12 +4330,13 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec
     for (d, an) in deltas.iter().zip(analyses) {
         if d.unmerged {
             // `run_diffstat()` hands an unmerged pair to `builtin_diffstat()` before
-            // `strip_prefix()` runs (diff.c:5071-5075): the row keeps the full path
-            // under `--relative`, and `get_compact_summary()` finds no status or mode
-            // change on its two empty filespecs.
+            // `strip_prefix()` runs (diff.c:5071-5075): the row is `p->one->path` in
+            // full under `--relative`, and `get_compact_summary()` finds no status or
+            // mode change on its two empty filespecs.
             out.push(StatFile {
-                path: d.disk.clone(),
-                print_name: quoted_name(&d.disk),
+                path: d.src_disk().clone(),
+                from_name: None,
+                print_name: quoted_name(d.src_disk()),
                 added: 0,
                 deleted: 0,
                 binary: false,
@@ -3947,7 +4350,13 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec
         } else {
             (an.added, an.deleted)
         };
+        // `builtin_diffstat()` (diff.c:4229-4250) drops an empty modification only on
+        // its xdiff branch: not for a binary pair, not for a `complete_rewrite`, and
+        // not when both ids are known and equal (`may_differ` is clear).
+        let may_differ = !d.ids_known_equal();
         if d.status == b'M'
+            && d.score == 0
+            && may_differ
             && added == 0
             && deleted == 0
             && d.src_mode == d.dst_mode
@@ -3957,6 +4366,7 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec
         }
         out.push(StatFile {
             path: d.path.clone(),
+            from_name: d.src.as_ref().map(|s| s.path.clone()),
             print_name: stat_print_name(d, an, opts),
             added,
             deleted,
@@ -3969,17 +4379,24 @@ fn compute_diffstat(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec
 
 /// `fill_print_name()` plus `get_compact_summary()`.
 fn stat_print_name(d: &Delta, _an: &Analysis, opts: &Opts) -> Vec<u8> {
-    let mut name = quoted_name(&d.path);
+    // `fill_print_name()` (diff.c:2730): a renamed row is the `pprint_rename()`d pair.
+    let renamed = d.src.is_some();
+    let mut name = match renamed {
+        true => super::diff_pairs::pprint_rename(d.src_path(), &d.path),
+        false => quoted_name(&d.path),
+    };
     if !opts.compact_summary {
         return name;
     }
-    let comment: Option<&str> = if d.status == b'A' {
+    // `get_compact_summary()` (diff.c:4134-4159) tests creation and deletion only
+    // for a row that is not renamed.
+    let comment: Option<&str> = if !renamed && d.status == b'A' {
         Some(match d.dst_mode {
             0o120000 => "new +l",
             0o100755 => "new +x",
             _ => "new",
         })
-    } else if d.status == b'D' {
+    } else if !renamed && d.status == b'D' {
         Some("gone")
     } else if d.src_mode == 0o120000 && d.dst_mode != 0o120000 {
         Some("mode -l")
@@ -4009,10 +4426,21 @@ fn render_numstat(out: &mut Vec<u8>, files: &[StatFile], opts: &Opts) {
             out.extend_from_slice(format!("{}\t{}\t", f.added, f.deleted).as_bytes());
         }
         if opts.nul {
+            // `show_numstat()` (diff.c:3266-3274): under `-z` a renamed row is three
+            // NUL-terminated fields, an empty one, the source, then the destination,
+            // written raw rather than `pprint_rename()`d.
+            if let Some(from) = &f.from_name {
+                out.push(0);
+                out.extend_from_slice(from.as_ref());
+                out.push(0);
+            }
             out.extend_from_slice(f.path.as_ref());
             out.push(0);
         } else {
-            out.extend_from_slice(&quoted_name(&f.path));
+            match &f.from_name {
+                Some(from) => out.extend_from_slice(&super::diff_pairs::pprint_rename(from, &f.path)),
+                None => out.extend_from_slice(&quoted_name(&f.path)),
+            }
             out.push(b'\n');
         }
     }
@@ -4044,9 +4472,7 @@ fn dirstat_damage(deltas: &[Delta], analyses: &[Analysis], opts: &Opts) -> Vec<(
     let mut out = Vec::new();
     for (d, an) in deltas.iter().zip(analyses) {
         // Both ids known and equal means the content cannot have changed.
-        if d.old_valid() && d.new_valid() && !d.src_id.is_null() && !d.dst_id.is_null()
-            && d.src_id == d.dst_id
-        {
+        if d.old_valid() && d.new_valid() && d.ids_known_equal() {
             out.push((d.disk.clone(), 0));
             continue;
         }
@@ -4232,6 +4658,10 @@ fn summary_is_empty(deltas: &[Delta]) -> bool {
         match d.status {
             b'A' | b'D' | b'C' | b'R' => return false,
             _ => {
+                // A pair `diffcore_break()` scored prints a ` rewrite ` line.
+                if d.score != 0 {
+                    return false;
+                }
                 if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
                     return false;
                 }
@@ -4245,23 +4675,46 @@ fn summary_is_empty(deltas: &[Delta]) -> bool {
 /// `--relative` its names are still the full paths.
 fn render_summary(out: &mut Vec<u8>, d: &Delta) {
     match d.status {
-        b'D' => summary_mode_name(out, "delete", d.src_mode, &d.disk),
+        b'D' => summary_mode_name(out, "delete", d.src_mode, d.src_disk()),
         b'A' => summary_mode_name(out, "create", d.dst_mode, &d.disk),
+        // `show_rename_copy()` (diff.c:6766-6780): the `pprint_rename()`d pair, the
+        // similarity, then a mode change without a name of its own.
+        st @ (b'R' | b'C') => {
+            out.extend_from_slice(if st == b'C' { b" copy " } else { b" rename " });
+            out.extend_from_slice(&super::diff_pairs::pprint_rename(d.src_disk(), &d.disk));
+            out.extend_from_slice(
+                format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)).as_bytes(),
+            );
+            show_mode_change(out, d, false);
+        }
         _ => {
-            if d.src_mode != 0 && d.dst_mode != 0 && d.src_mode != d.dst_mode {
-                out.extend_from_slice(
-                    format!(
-                        " mode change {} => {} ",
-                        mode_str(d.src_mode),
-                        mode_str(d.dst_mode)
-                    )
-                    .as_bytes(),
-                );
+            // Every other letter, `U` included: a score announces a rewrite of
+            // `p->two->path`, and then `show_mode_change(opt, p, !p->score)`.
+            if d.score != 0 {
+                out.extend_from_slice(b" rewrite ");
                 out.extend_from_slice(&quoted_name(&d.disk));
-                out.push(b'\n');
+                out.extend_from_slice(
+                    format!(" ({}%)\n", diffcore_rename::similarity_index(d.score)).as_bytes(),
+                );
             }
+            show_mode_change(out, d, d.score == 0);
         }
     }
+}
+
+/// `show_mode_change()` (diff.c:6748-6764), naming `p->two->path` when asked to.
+fn show_mode_change(out: &mut Vec<u8>, d: &Delta, show_name: bool) {
+    if d.src_mode == 0 || d.dst_mode == 0 || d.src_mode == d.dst_mode {
+        return;
+    }
+    out.extend_from_slice(
+        format!(" mode change {} => {}", mode_str(d.src_mode), mode_str(d.dst_mode)).as_bytes(),
+    );
+    if show_name {
+        out.push(b' ');
+        out.extend_from_slice(&quoted_name(&d.disk));
+    }
+    out.push(b'\n');
 }
 
 /// `show_file_mode_name()`.
@@ -4597,9 +5050,11 @@ fn render_patch(
     hlen: usize,
     zlib_level: i32,
 ) {
+    // `run_diff()` (diff.c:5021-5025) names an unmerged pair by its stripped
+    // `one->path`, which is a source `diffcore_rename()` gave it when it has one.
     if d.unmerged {
         out.extend_from_slice(b"* Unmerged path ");
-        out.extend_from_slice(d.path.as_ref());
+        out.extend_from_slice(d.src_path().as_ref());
         out.push(b'\n');
         return;
     }
@@ -4647,13 +5102,19 @@ fn render_patch(
         || d.src_mode != d.dst_mode
         || an.binary
         || an.hunks.is_some()
+        // `fill_metainfo()` (diff.c:4875-4912) hands a rename, a copy and a scored
+        // modification a header of their own, so an exact `R100` with no hunks
+        // still shows.
+        || d.renamed()
+        || d.score != 0
         || (an.changed && content_differs);
     if !must_show {
         return;
     }
+    let src_path = d.src_path();
 
     out.extend_from_slice(b"diff --git ");
-    out.extend_from_slice(&quote_two(pa, &d.path, pb, &d.path));
+    out.extend_from_slice(&quote_two(pa, src_path, pb, &d.path));
     out.push(b'\n');
 
     // File-creation / deletion / mode-change lines.
@@ -4678,6 +5139,32 @@ fn render_patch(
         _ => {}
     }
 
+    // `fill_metainfo()`'s `xfrm_msg`, which `builtin_diff()` appends after the mode
+    // lines (diff.c:3913-3915): the similarity block first, then the index line.
+    match d.status {
+        st @ (b'R' | b'C') => {
+            let verb = if st == b'C' { "copy" } else { "rename" };
+            out.extend_from_slice(
+                format!(
+                    "similarity index {}%\n{verb} from ",
+                    diffcore_rename::similarity_index(d.score)
+                )
+                .as_bytes(),
+            );
+            out.extend_from_slice(&quoted_name(src_path));
+            out.extend_from_slice(format!("\n{verb} to ").as_bytes());
+            out.extend_from_slice(&quoted_name(&d.path));
+            out.push(b'\n');
+        }
+        b'M' if d.score != 0 => {
+            out.extend_from_slice(
+                format!("dissimilarity index {}%\n", diffcore_rename::similarity_index(d.score))
+                    .as_bytes(),
+            );
+        }
+        _ => {}
+    }
+
     // The `index <old>..<new>[ <mode>]` line only appears when content differs.
     if content_differs {
         out.extend_from_slice(b"index ");
@@ -4698,7 +5185,7 @@ fn render_patch(
     }
 
     let old_label = if d.old_valid() {
-        quote_one(pa, &d.path)
+        quote_one(pa, src_path)
     } else {
         b"/dev/null".to_vec()
     };
@@ -4714,6 +5201,17 @@ fn render_patch(
     // calling it `Bin` while the patch shows hunks. [`analyze`] records that by
     // handing back a hunk body beside `binary: true`.
     if an.binary && an.hunks.is_none() {
+        // diff.c:3949-3976: identical images, by id when `--binary` is off and both
+        // sides are regular files, by bytes otherwise, show the header alone. Only a
+        // pair `diffcore_rename()` matched exactly reaches this with a header.
+        let same = if !opts.binary && d.src_mode & S_IFMT == 0o100000 && d.dst_mode & S_IFMT == 0o100000 {
+            an.src_id == an.dst_id
+        } else {
+            an.old_data == an.new_data
+        };
+        if same {
+            return;
+        }
         if opts.binary {
             // `emit_binary_diff()`: the payload replaces the whole `Binary files …`
             // line, and there is no `---`/`+++` pair in front of it.
@@ -4726,8 +5224,15 @@ fn render_patch(
             out.extend_from_slice(b" differ\n");
         }
     } else if let Some(hunks) = &an.hunks {
-        emit_file_line(out, b"--- ", &old_label);
-        emit_file_line(out, b"+++ ", &new_label);
+        if d.status == b'M' && d.score != 0 {
+            // `emit_rewrite_diff()` (diff.c:1891-1905) swaps the prefixes for `-R` only
+            // under `diff.mnemonicPrefix`, which `git_diff_basic_config()` never reads.
+            emit_file_line(out, b"--- ", &quote_one(&opts.src_prefix, src_path));
+            emit_file_line(out, b"+++ ", &quote_one(&opts.dst_prefix, &d.path));
+        } else {
+            emit_file_line(out, b"--- ", &old_label);
+            emit_file_line(out, b"+++ ", &new_label);
+        }
         for line in byte_lines(hunks) {
             let mut line = line.to_vec();
             match line.first().copied() {

@@ -4597,14 +4597,21 @@ fn walk_tree_blobs(
 /// uses, so any checkout filter is applied exactly once and identically; when that
 /// platform declines to expose the bytes (its binary/oversized path) the raw file is
 /// read instead, which is what git's own populate does for such a blob.
-struct DeltaContent<'a> {
-    repo: &'a gix::Repository,
-    cache: &'a mut gix::diff::blob::Platform,
-    workdir: Option<std::path::PathBuf>,
+pub(super) struct DeltaContent<'a> {
+    pub(super) repo: &'a gix::Repository,
+    pub(super) cache: &'a mut gix::diff::blob::Platform,
+    pub(super) workdir: Option<std::path::PathBuf>,
 }
 
 impl DeltaContent<'_> {
     fn read(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        // `diff_populate_gitlink()` (diff.c:4449-4469), which `diff_populate_filespec()`
+        // takes for a gitlink before looking at `oid_valid` (diff.c:4502-4503): the
+        // spec's own id, null for a worktree side, plus `-dirty` for local damage.
+        if spec.mode & 0o170000 == 0o160000 {
+            let dirty = if spec.dirty_submodule != 0 { "-dirty" } else { "" };
+            return Some(format!("Subproject commit {}{dirty}\n", spec.oid.to_hex()).into_bytes());
+        }
         if spec.oid_valid && !spec.oid.is_null() {
             return self.repo.find_object(spec.oid).ok().map(|o| o.detach().data);
         }

@@ -4776,7 +4776,7 @@ fn read_blob(
 }
 
 /// `count_lines()`: lines in a buffer, counting an unterminated final line.
-fn count_lines(data: &[u8]) -> u32 {
+pub(crate) fn count_lines(data: &[u8]) -> u32 {
     if data.is_empty() {
         return 0;
     }
@@ -4800,11 +4800,23 @@ fn rewrite_line_count(count: u32) -> String {
 /// every old line removed and every new line added, with no context. `-D` prints the
 /// pre-image range as `?,?` and drops the removed lines entirely.
 fn emit_rewrite_diff(old_data: &[u8], new_data: &[u8], opts: &Opts) -> Vec<u8> {
+    emit_rewrite_body(old_data, new_data, opts.irreversible_delete, opts.ind_old, opts.ind_new)
+}
+
+/// [`emit_rewrite_diff`] with its three `diff_options` inputs spelled out, for the
+/// commands that keep their own option struct (`diff-files`).
+pub(crate) fn emit_rewrite_body(
+    old_data: &[u8],
+    new_data: &[u8],
+    irreversible_delete: bool,
+    ind_old: u8,
+    ind_new: u8,
+) -> Vec<u8> {
     let lc_a = count_lines(old_data);
     let lc_b = count_lines(new_data);
     let mut out = Vec::new();
     out.extend_from_slice(b"@@ -");
-    if opts.irreversible_delete {
+    if irreversible_delete {
         out.extend_from_slice(b"?,?");
     } else {
         out.extend_from_slice(rewrite_line_count(lc_a).as_bytes());
@@ -4812,11 +4824,11 @@ fn emit_rewrite_diff(old_data: &[u8], new_data: &[u8], opts: &Opts) -> Vec<u8> {
     out.extend_from_slice(b" +");
     out.extend_from_slice(rewrite_line_count(lc_b).as_bytes());
     out.extend_from_slice(b" @@\n");
-    if lc_a != 0 && !opts.irreversible_delete {
-        emit_rewrite_lines(&mut out, opts.ind_old, old_data);
+    if lc_a != 0 && !irreversible_delete {
+        emit_rewrite_lines(&mut out, ind_old, old_data);
     }
     if lc_b != 0 {
-        emit_rewrite_lines(&mut out, opts.ind_new, new_data);
+        emit_rewrite_lines(&mut out, ind_new, new_data);
     }
     out
 }

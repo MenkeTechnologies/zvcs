@@ -520,11 +520,10 @@ index daf31e1,594dc4f..0000000
     assert_eq!(err(&bogus), "fatal: invalid value for '--diff-merges': 'bogus'\n");
 }
 
-/// `diff-index`' own merge-diff arithmetic. The combined renderer is *not* ported for
-/// this command, so the assertions here are about the two things that are: the modes
-/// that only turn the patch on, and `--cached`, under which `oneway_diff()`
-/// (diff-lib.c:408) never takes the combined branch at all, so a combined mode
-/// degrades to a plain patch rather than being refused.
+/// `diff-index`' own merge-diff arithmetic: the modes that only turn the patch on,
+/// `--cached`, under which `oneway_diff()` (diff-lib.c:408) never takes the combined
+/// branch at all, so a combined mode degrades to a plain patch, and the combined
+/// section the same modes print when the worktree is read.
 #[test]
 fn diff_index_merge_diff_selector() {
     let (repo, home) = tree_fixture("idxmerge");
@@ -538,12 +537,27 @@ fn diff_index_merge_diff_selector() {
         assert_eq!(out(&o), patch, "{flag} under --cached is a plain patch");
     }
 
-    // Without `--cached` the same modes would render `diff --combined`, which this
-    // command cannot produce; they must fail loudly rather than print a two-way patch.
-    for flag in ["--diff-merges=combined", "-c", "--cc"] {
+    // Without `--cached`, `show_modified()` (diff-lib.c:408-424) turns `doc/bin.dat`
+    // into a two-parent path, printed during the walk as `diff --combined` (or
+    // `diff --cc` for the dense mode) ahead of the other pairs' ordinary patch.
+    // Measured from stock git 2.56.0 on this fixture.
+    let rest = patch
+        .split_once("diff --git a/doc/keep.txt")
+        .map(|(_, tail)| format!("diff --git a/doc/keep.txt{tail}"))
+        .expect("the patch has a doc/keep.txt section");
+    for (flag, header) in [
+        ("--diff-merges=combined", "combined"),
+        ("-c", "combined"),
+        ("--cc", "cc"),
+    ] {
         let o = cmd(&repo, &home, &["diff-index", "HEAD~1", flag]);
-        assert!(!o.status.success(), "{flag} silently produced: {}", out(&o));
-        assert_eq!(out(&o), "", "{flag} wrote bytes it cannot get right");
+        assert!(o.status.success(), "{flag}: {}", err(&o));
+        let combined = "index c9d4736,5cba280..0000000\nBinary files differ\n";
+        assert_eq!(
+            out(&o),
+            format!("diff --{header} doc/bin.dat\n{combined}{rest}"),
+            "{flag}"
+        );
     }
 
     // The non-combined modes only fill an *empty* output format, so pairing one with

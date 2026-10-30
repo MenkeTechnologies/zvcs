@@ -571,16 +571,35 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // scan itself emits comes out in.
     let scan_index: Option<HashMap<ObjectId, usize>> = scan_ordered
         .then(|| all.iter().enumerate().map(|(i, id)| (*id, i)).collect());
+    // `--connectivity-only` replaces the scan with `odb_for_each_object()`, whose
+    // call sequence — repeats included — both `mark_object_for_connectivity()`
+    // and `mark_unreachable_referents()` replay (see [`connectivity_listing`]).
+    // `all` takes its first-appearance order, the order the listing creates in.
+    let listing: Option<Vec<ObjectId>> = match opt.connectivity_only {
+        true => pack_lists
+            .as_ref()
+            .and_then(|lists| connectivity_listing(lists, repo.object_hash().len_in_hex()))
+            .filter(|ops| {
+                let listed: HashSet<ObjectId> = ops.iter().copied().collect();
+                listed.len() == in_odb.len() && listed.iter().all(|id| in_odb.contains(id))
+            }),
+        false => None,
+    };
+    if let Some(ops) = &listing {
+        let mut listed: HashSet<ObjectId> = HashSet::new();
+        all = ops.iter().copied().filter(|id| listed.insert(*id)).collect();
+    }
     // `lookup_<type>()` is called in one long sequence over the whole command,
     // and [`SlotOrder`] can only replay it when every caller is accounted for.
-    // That holds when the scan itself is in git's order, when the scan runs at
-    // all (`--connectivity-only` replaces it with a listing walk whose object
-    // creation this port does not model), and when there is no linked worktree —
-    // whose HEAD git snapshots with the main one but which this port handles in
-    // one later block together with that worktree's index and reflogs.
-    let mut creation_modeled = scan_ordered
-        && !opt.connectivity_only
-        && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
+    // That holds when the scan itself is in git's order — or, under
+    // `--connectivity-only`, the listing that replaces it — and when there is no
+    // linked worktree, whose HEAD git snapshots with the main one but which this
+    // port handles in one later block together with that worktree's index and
+    // reflogs.
+    let mut creation_modeled = match opt.connectivity_only {
+        true => listing.is_some(),
+        false => scan_ordered,
+    } && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
     let has_promisor_remote = super::rev_list::has_promisor_remote(&repo);
 
     // Children of every object, for `used` and `missing`. git checks every
@@ -625,17 +644,23 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         true => verify_packs(&repo),
         false => super::pack_check::PackCheck::default(),
     };
-    for &id in &all {
-        // `--connectivity-only` replaces `fsck_source()` with
-        // `mark_object_for_connectivity()`, which creates the object straight
-        // from the odb's listing and sets `HAS_OBJ` without reading a byte. So
-        // nothing is parsed here, nothing is reported here, and — the part that
-        // shows on stdout — no object is marked `USED` here. `check_connectivity()`
-        // makes up for that with `mark_unreachable_referents()` below; the
-        // reachability walk is where a corrupt object is finally noticed, and
-        // only if it is a non-blob something reaches.
-        if opt.connectivity_only {
+    // `--connectivity-only` replaces `fsck_source()` with
+    // `mark_object_for_connectivity()`, which creates the object straight from
+    // the odb's listing with `lookup_unknown_object()` and sets `HAS_OBJ` without
+    // reading a byte (builtin/fsck.c:795-803). So nothing is parsed here, nothing
+    // is reported here, and — the part that shows on stdout — no object is
+    // marked `USED` here. `check_connectivity()` makes up for that with
+    // `mark_unreachable_referents()` below; the reachability walk is where a
+    // corrupt object is finally noticed, and only if it is a non-blob something
+    // reaches. A repeated listing is `lookup_unknown_object()`'s
+    // `lookup_object()` hit, which moves the object back to its home slot.
+    if opt.connectivity_only {
+        for &id in listing.as_deref().unwrap_or(&all) {
             state.note(id);
+        }
+    }
+    for &id in &all {
+        if opt.connectivity_only {
             continue;
         }
         // A packed object `verify_pack()` could not produce never reaches
@@ -1034,6 +1059,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         creation_modeled = false;
         promisor_pass_done = true;
     }
+    // A tree `snapshot_ref()` parsed keeps its buffer: under `--connectivity-only` no
+    // `fsck_obj()` frees it (builtin/fsck.c:446-448).
+    if opt.connectivity_only {
+        for id in &heads {
+            if matches!(repo.find_header(*id).map(|h| h.kind()), Ok(Kind::Tree)) {
+                state.parsed_trees.insert(*id);
+            }
+        }
+    }
     for id in heads.clone() {
         state.note(id);
         if promisor_pass_done {
@@ -1047,7 +1081,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // tree.c:208-213) while commits, tags and blobs stay parsed. The pass
         // itself sets `skip_mru_updates` (packfile.c:2573), so it leaves the
         // list alone.
-        let first_is_tree = matches!(repo.find_header(id).map(|h| h.kind()), Ok(Kind::Tree));
+        // Under `--connectivity-only` no `fsck_obj()` ran, so the tree `snapshot_ref()` parsed
+        // keeps its buffer and the head's second `parse_object()` returns at once
+        // (object.c:335-337), reading nothing.
+        let first_is_tree = !opt.connectivity_only
+            && matches!(repo.find_header(id).map(|h| h.kind()), Ok(Kind::Tree));
         let finish_read = !gitmodules_found.is_empty() || !gitattributes_found.is_empty();
         match &pack_lists {
             Some(lists)
@@ -1057,6 +1095,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             {
                 for promised in lists.promisor_pass(first_is_tree.then_some(id)) {
                     state.note(promised);
+                    if opt.connectivity_only {
+                        promisor_parse(&repo, &mut state, &mut pre_parsed, promised);
+                    }
+                }
+                // `parse_object_with_flags(…, PARSE_OBJECT_SKIP_HASH_CHECK)` answers a commit
+                // from the commit-graph first (object.c:339-343), whose parse order is not
+                // replayed for this pass. Its reads skip the MRU update only in the store
+                // being listed (odb/source-packed.c:456), so a pack of another source that
+                // answers one moves, which is not replayed either.
+                let sources_with_packs = lists.sources.iter().filter(|(_, packs)| !packs.is_empty()).count();
+                if opt.connectivity_only && (commit_graph_on_disk(&repo) || sources_with_packs > 1) {
+                    creation_modeled = false;
                 }
             }
             _ => creation_modeled = false,
@@ -1211,6 +1261,36 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     state.note(*child);
                 }
             }
+            // The walk's own odb reads, which move packs (see `State::pack_reads`):
+            // `repo_parse_tree()` reads a tree whose buffer is not held and
+            // `traverse_one_object()` frees it after (builtin/fsck.c:174-183), a commit is
+            // read unless parsed or answered by the graph — whose answer
+            // `GIT_COMMIT_GRAPH_PARANOIA` checks with `odb_has_object()` (commit.c:625-636)
+            // — and `parse_tag()` reads a tag not parsed yet. Under a full scan nothing
+            // after it lists the packs again, so only `--connectivity-only` keeps these.
+            if opt.connectivity_only {
+                let reads = match kind {
+                    Kind::Tree => !state.parsed_trees.remove(&id),
+                    Kind::Commit if from_graph.is_some() => {
+                        crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false)
+                    }
+                    Kind::Commit | Kind::Tag => !parsed_already,
+                    Kind::Blob => false,
+                };
+                if reads {
+                    state.pack_reads.push(Some(id));
+                }
+            }
+            // Under `--connectivity-only` nothing but a head was parsed before the walk, so a
+            // commit the graph did not answer is parsed here from its buffer:
+            // `parse_commit_buffer()` looks up the tree, then each parent the graft leaves
+            // (commit.c:545-586), and `fsck_walk_tag()`'s `parse_tag()` the tagged object
+            // (tag.c:166-176). A full scan parsed every one of them already, so it looks
+            // nothing up here.
+            let parses_here = opt.connectivity_only
+                && from_graph.is_none()
+                && !parsed_already
+                && matches!(kind, Kind::Commit | Kind::Tag);
             // An object `parse_object_buffer()` rejected has no links to follow:
             // `fsck_walk_commit()`/`fsck_walk_tag()` read fields the failed parse
             // never filled in. The scan above already reported it.
@@ -1228,6 +1308,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
             };
+            if parses_here {
+                // `decode()` has already applied the graft, which is what
+                // `parse_commit_buffer()` looks parents up from.
+                for (child, _) in &decoded.children {
+                    state.note(*child);
+                }
+            }
             // `traverse_one_object()` is another `fsck_walk()`, so a tree whose
             // entries will not decode complains a second time — once for the scan's
             // `fsck_obj()` call and once here (builtin/fsck.c:186-195). Only the
@@ -1346,7 +1433,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // or parse. git then prints `missing` without the pair of
                     // `broken link` lines, which is why the odb is asked again here
                     // rather than the `corrupt` set being taken as the answer.
-                    if !repo.has_object(child) {
+                    // The ask is a read, and a miss re-prepares the odb.
+                    let present = repo.has_object(child);
+                    state.pack_reads.push(present.then_some(child));
+                    if !present {
                         // `%7s` on both type names — `gix`'s `Kind` writes itself
                         // through `write_str`, which ignores a width, so the padding
                         // is applied to the rendered name instead.
@@ -1403,41 +1493,119 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         for line in loose_unopenable(&repo) {
             eprintln!("{line}");
         }
-        for &id in &all {
-            if state.reachable.contains(&id) {
-                continue;
+        // ```c
+        // struct object *obj = lookup_object(data, oid);
+        //
+        // if (!obj || !(obj->flags & HAS_OBJ))
+        //         return 0; /* not part of our original set */
+        // if (obj->flags & REACHABLE)
+        //         return 0; /* reachable objects already traversed */
+        // ```
+        //
+        // (`mark_unreachable_referents()`, builtin/fsck.c:210-221.) The callback
+        // runs once per listing, repeats included, and its `lookup_object()`
+        // comes first — so every listed object, reachable or not, moves back to
+        // its home slot here. A repeat of an unreachable tree is walked again,
+        // since the first walk freed its buffer (:237-238); a commit or tag the
+        // first walk parsed stays parsed and looks nothing up again.
+        //
+        // The listing is walked source by source, each loose half then packed half,
+        // and the packed half's order is the pack lists' at that moment (see
+        // [`ReferentsPacks`]). Unreplayed, it is `all` in one piece.
+        let mut parsed_here: HashSet<ObjectId> = HashSet::new();
+        let mut packs_now = pack_lists.as_ref().filter(|_| listing.is_some()).map(ReferentsPacks::new);
+        if let Some(packs) = &mut packs_now {
+            for read in &state.pack_reads {
+                packs.read(*read, None);
             }
-            // `fsck_walk_blob()` reads nothing and names nothing; an object the
-            // odb cannot type at all is read three times over and the third read
-            // is fatal — see [`unreadable_unreachable_object`].
-            let header = match repo.find_header(id) {
-                Ok(header) => header,
-                Err(_) => {
-                    if let Some(code) = unreadable_unreachable_object(&repo, id, 3) {
-                        return Ok(code);
-                    }
+        }
+        let halves = packs_now.as_ref().map_or(1, |packs| packs.sources.len() * 2);
+        let hexsz = repo.object_hash().len_in_hex();
+        for half in 0..halves {
+            let (source, packed) = (half / 2, half % 2 == 1);
+            let ids: Vec<ObjectId> = match &packs_now {
+                None => all.clone(),
+                Some(packs) if packed => packs.packed_listing(source),
+                Some(packs) => loose_listing(&packs.sources[source].0, hexsz).unwrap_or_default(),
+            };
+            let frozen = packed.then_some(source);
+            for id in ids {
+                state.note(id);
+                if state.reachable.contains(&id) {
                     continue;
                 }
-            };
-            if header.kind() == Kind::Blob {
-                continue;
-            }
-            // `fsck_walk_commit()`'s `repo_parse_commit()` asks the commit-graph first, as in
-            // the reachability walk above; only a head was parsed before.
-            let from_graph = match header.kind() == Kind::Commit && !pre_parsed.contains(&id) {
-                true => match walk_parse_commit(&mut graph, id, &scan_lines, &broken_links)? {
-                    Some(parsed) => parsed,
-                    None => continue,
-                },
-                false => None,
-            };
-            let Ok(Ok(decoded)) = from_graph.map_or_else(|| decode(&repo, id), |d| Ok(Ok(d))) else { continue };
-            for (child, _) in &decoded.children {
-                // Unlike the scan, nothing here was parsed beforehand, so both
-                // `fsck_walk_tree()`'s `lookup_tree()`/`lookup_blob()` and
-                // `repo_parse_commit()`'s `lookup_commit()` create.
-                state.note(*child);
-                state.used.insert(*child);
+                // `fsck_walk_blob()` reads nothing and names nothing; an object the
+                // odb cannot type at all is read three times over and the third read
+                // is fatal — see [`unreadable_unreachable_object`]. Its failed reads
+                // re-prepared the odb.
+                let header = match repo.find_header(id) {
+                    Ok(header) => header,
+                    Err(_) => {
+                        if let Some(code) = unreadable_unreachable_object(&repo, id, 3) {
+                            return Ok(code);
+                        }
+                        if let Some(packs) = &mut packs_now {
+                            packs.read(None, frozen);
+                        }
+                        continue;
+                    }
+                };
+                let kind = header.kind();
+                // `odb_read_object_info()` for an object nothing has typed yet.
+                if state.typed.insert(id) {
+                    if let Some(packs) = &mut packs_now {
+                        packs.read(Some(id), frozen);
+                    }
+                }
+                if kind == Kind::Blob {
+                    continue;
+                }
+                // `repo_parse_commit()` and `parse_tag()` return at once for an object
+                // already parsed, leaving only the pointers the first parse stored.
+                let parsed_before = kind != Kind::Tree && (pre_parsed.contains(&id) || !parsed_here.insert(id));
+                // `fsck_walk_commit()`'s `repo_parse_commit()` asks the commit-graph first, as in
+                // the reachability walk above; only a head was parsed before.
+                let from_graph = match kind == Kind::Commit && !parsed_before {
+                    true => match walk_parse_commit(&mut graph, id, &scan_lines, &broken_links)? {
+                        Some(parsed) => parsed,
+                        None => continue,
+                    },
+                    false => None,
+                };
+                // The walk's parse reads, as in the reachability walk: a tree every time,
+                // since each walk frees its buffer (builtin/fsck.c:237-238), a commit or tag
+                // the first time unless the graph answered.
+                let parse_reads = match kind {
+                    Kind::Tree => true,
+                    Kind::Commit if from_graph.is_some() => {
+                        crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false)
+                    }
+                    _ => !parsed_before,
+                };
+                if parse_reads {
+                    if let Some(packs) = &mut packs_now {
+                        packs.read(Some(id), frozen);
+                    }
+                }
+                // The graph parse looks up the parents and then, through
+                // `repo_get_commit_tree()`, the tree (commit-graph.c:858-874, 1091-1120);
+                // a buffer parse the tree first (commit.c:545-586).
+                let graph_order = from_graph.is_some();
+                let Ok(Ok(decoded)) = from_graph.map_or_else(|| decode(&repo, id), |d| Ok(Ok(d))) else { continue };
+                let children: Vec<ObjectId> = decoded.children.iter().map(|(child, _)| *child).collect();
+                if !parsed_before {
+                    let looked_up = match graph_order {
+                        true => children.iter().skip(1).chain(children.first()).copied().collect(),
+                        false => children.clone(),
+                    };
+                    for child in looked_up {
+                        state.note(child);
+                        state.typed.insert(child);
+                    }
+                }
+                for child in children {
+                    state.used.insert(child);
+                }
             }
         }
     }
@@ -1888,6 +2056,22 @@ struct State {
     /// Only the reachable walk fills this: `check_reachable_object()` is the
     /// only place git prints a `missing` line.
     missing: HashMap<ObjectId, Kind>,
+    /// Every odb read after `odb_reprepare()` that `find_pack_entry()` may answer, in order:
+    /// `Some(id)` moves the pack holding `id` to the front of its source's list
+    /// (odb/source-packed.c:38-45), `None` is a read that missed and so re-prepared every
+    /// source, which re-sorts its list (odb.c:576-588, odb/source-packed.c:94-95). Under
+    /// `--connectivity-only` this decides the pack order `mark_unreachable_referents()`'s
+    /// listing walks; see [`ReferentsPacks`].
+    pack_reads: Vec<Option<ObjectId>>,
+    /// Trees whose buffer is held, so `repo_parse_tree()` / `parse_object()` read nothing:
+    /// a tree head `snapshot_ref()` parsed, or a cache-tree node, until the reachability
+    /// walk frees it (builtin/fsck.c:174-183). Only consulted under `--connectivity-only`.
+    parsed_trees: HashSet<ObjectId>,
+    /// Ids whose `struct object` has a type, so `mark_unreachable_referents()` reads nothing
+    /// to learn it (builtin/fsck.c:227-232). An unreachable object is typed only by
+    /// `add_promisor_object()` or by an earlier walk of the same pass: every other typed
+    /// lookup names a head or something a head reaches.
+    typed: HashSet<ObjectId>,
 }
 
 impl State {
@@ -2619,6 +2803,10 @@ fn collect_cache_tree(
         // named with a bare colon.
         names.put(tree.id, || ":".to_string());
         state.note(tree.id);
+        // `parse_object()` reads a tree whose buffer is not held, and keeps it.
+        if state.parsed_trees.insert(tree.id) {
+            state.pack_reads.push(Some(tree.id));
+        }
         heads.push(tree.id);
     }
     let mut errors = 0u8;
@@ -3846,6 +4034,13 @@ impl ListedPack {
         by_offset.sort();
         by_offset.into_iter().map(|(_, id)| id).collect()
     }
+
+    /// The pack's ids in index position order, which is object-name order:
+    /// `for_each_object_in_pack()` without `ODB_FOR_EACH_OBJECT_PACK_ORDER`
+    /// (packfile.c:1957-1999).
+    fn ids_by_name(&self) -> Vec<ObjectId> {
+        (0..self.index.num_objects()).map(|i| self.index.oid_at_index(i).to_owned()).collect()
+    }
 }
 
 /// Every odb source's pack list as it stands after `cmd_fsck`'s
@@ -3964,19 +4159,32 @@ impl PackLists {
 }
 
 /// `sort_packs(…, sort_pack)` within one source: younger first, stable on a tie.
-fn sort_packs(packs: &mut [ListedPack]) {
-    packs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+fn sort_packs<P: std::borrow::Borrow<ListedPack>>(packs: &mut [P]) {
+    packs.sort_by(|a, b| b.borrow().mtime.cmp(&a.borrow().mtime));
 }
 
 /// One read of `id` through the odb: the first source whose pack list holds it
 /// moves that pack to the front (`find_pack_entry()`); a source holding it
 /// loose answers without touching any list.
 fn move_to_front<P: std::borrow::Borrow<ListedPack>>(sources: &mut [(PathBuf, Vec<P>)], id: ObjectId) {
+    move_to_front_unless(sources, id, None);
+}
+
+/// [`move_to_front`] while the store of source `frozen` is being listed, which sets its
+/// `skip_mru_updates` (odb/source-packed.c:456-485): a pack of that source answers
+/// without moving.
+fn move_to_front_unless<P: std::borrow::Borrow<ListedPack>>(
+    sources: &mut [(PathBuf, Vec<P>)],
+    id: ObjectId,
+    frozen: Option<usize>,
+) {
     let hex = id.to_hex().to_string();
-    for (objdir, packs) in sources.iter_mut() {
+    for (index, (objdir, packs)) in sources.iter_mut().enumerate() {
         if let Some(at) = packs.iter().position(|p| p.borrow().index.lookup(id).is_some()) {
-            let pack = packs.remove(at);
-            packs.insert(0, pack);
+            if frozen != Some(index) {
+                let pack = packs.remove(at);
+                packs.insert(0, pack);
+            }
             return;
         }
         if objdir.join(&hex[..2]).join(&hex[2..]).is_file() {
@@ -4004,30 +4212,159 @@ enum LooseWalk<'a> {
 /// does.
 fn for_each_loose_file(repo: &gix::Repository, mut visit: impl FnMut(LooseWalk<'_>)) {
     for objdir in odb_sources(repo) {
-        let mut stopped = false;
-        for sub in 0u16..=0xff {
-            let dir = objdir.join(format!("{sub:02x}"));
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(_) if stopped => continue,
-                Err(err) => {
-                    visit(LooseWalk::Unopenable { dir, err });
-                    stopped = true;
-                    continue;
-                }
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name = name.as_bytes();
-                if stopped {
-                    visit(LooseWalk::Unvisited { sub, name });
-                } else {
-                    visit(LooseWalk::Entry { sub, name, path: entry.path() });
+        for_each_loose_file_in_source(&objdir, &mut visit);
+    }
+}
+
+/// [`for_each_loose_file`] over one odb source, `for_each_loose_file_in_source()`
+/// itself (object-file.c:1111-1130).
+fn for_each_loose_file_in_source(objdir: &Path, visit: &mut impl FnMut(LooseWalk<'_>)) {
+    let mut stopped = false;
+    for sub in 0u16..=0xff {
+        let dir = objdir.join(format!("{sub:02x}"));
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) if stopped => continue,
+            Err(err) => {
+                visit(LooseWalk::Unopenable { dir, err });
+                stopped = true;
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.as_bytes();
+            if stopped {
+                visit(LooseWalk::Unvisited { sub, name });
+            } else {
+                visit(LooseWalk::Entry { sub, name, path: entry.path() });
+            }
+        }
+    }
+}
+
+/// Every id `odb_for_each_object(repo->objects, NULL, cb, repo, 0)` hands its
+/// callback, in call order and with repeats — the sequence
+/// `mark_object_for_connectivity()` and `mark_unreachable_referents()` each run
+/// `lookup_object()` over under `--connectivity-only` (builtin/fsck.c:375-376,
+/// :931-932).
+///
+/// `odb_for_each_object_ext()` visits the sources in order (odb.c:834-852), and
+/// `odb_source_files_for_each_object()` lists a source's loose objects before
+/// its packed ones (odb/source-files.c:121-140): the loose half is
+/// `for_each_loose_file_in_source()`, the packed half
+/// `odb_source_packed_for_each_object()`, which walks `packfile_store_get_packs()`
+/// in list order and each pack through `for_each_object_in_pack()` without
+/// `ODB_FOR_EACH_OBJECT_PACK_ORDER` — index position, so object-name order
+/// (odb/source-packed.c:416-490, packfile.c:1957-1999). An id both loose and
+/// packed, or in two packs, is listed once per copy.
+///
+/// `None` when a loose subdirectory cannot be opened: the loose walk's error
+/// return ends the whole listing there (odb/source-files.c:131-133), packs and
+/// later sources included, which [`fsck`]'s `HAS_OBJ` set does not replay.
+fn connectivity_listing(lists: &PackLists, hexsz: usize) -> Option<Vec<ObjectId>> {
+    let mut out: Vec<ObjectId> = Vec::new();
+    for (objdir, packs) in &lists.sources {
+        out.extend(loose_listing(objdir, hexsz)?);
+        for pack in packs {
+            out.extend(pack.ids_by_name());
+        }
+    }
+    Some(out)
+}
+
+/// The loose half of [`connectivity_listing`] for one source, `None` where a
+/// subdirectory cannot be opened.
+fn loose_listing(objdir: &Path, hexsz: usize) -> Option<Vec<ObjectId>> {
+    let mut out: Vec<ObjectId> = Vec::new();
+    let mut unopenable = false;
+    for_each_loose_file_in_source(objdir, &mut |step| match step {
+        LooseWalk::Entry { sub, name, .. } => out.extend(loose_id(sub, name, hexsz)),
+        LooseWalk::Unopenable { .. } => unopenable = true,
+        LooseWalk::Unvisited { .. } => {}
+    });
+    (!unopenable).then_some(out)
+}
+
+/// The pack lists `mark_unreachable_referents()`'s listing walks (builtin/fsck.c:375-376).
+///
+/// It starts from the lists `odb_reprepare()` sorted, and every read since — the
+/// cache-tree's, the reachability walk's (`State::pack_reads`), then this pass's own —
+/// moves the pack that answered to the front, or re-sorts every list on a miss. The
+/// packed half of each source's listing takes its list as it stands when it starts and
+/// sets `skip_mru_updates` until it ends (odb/source-packed.c:456-485), so reads made
+/// while it runs move only packs of other sources.
+struct ReferentsPacks<'a> {
+    sources: Vec<(PathBuf, Vec<&'a ListedPack>)>,
+}
+
+impl<'a> ReferentsPacks<'a> {
+    fn new(lists: &'a PackLists) -> Self {
+        let sources = lists
+            .sources
+            .iter()
+            .map(|(objdir, packs)| (objdir.clone(), packs.iter().collect()))
+            .collect();
+        Self { sources }
+    }
+
+    /// One read, made while the packed half of source `frozen` is being listed.
+    fn read(&mut self, read: Option<ObjectId>, frozen: Option<usize>) {
+        match read {
+            Some(id) => move_to_front_unless(&mut self.sources, id, frozen),
+            None => {
+                for (_, packs) in &mut self.sources {
+                    sort_packs(packs);
                 }
             }
         }
     }
+
+    /// The packed half of source `index`'s listing, in its list's current order.
+    fn packed_listing(&self, index: usize) -> Vec<ObjectId> {
+        self.sources[index].1.iter().flat_map(|pack| pack.ids_by_name()).collect()
+    }
+}
+
+/// `add_promisor_object()`'s parse of one promised id under `--connectivity-only`
+/// (packfile.c:2006-2059): nothing but a head was parsed before the pass, so
+/// `parse_object_with_flags()` reads the object and `parse_object_buffer()` looks up
+/// what a commit or tag names — the tree and then each parent (commit.c:545-586), or
+/// the tagged object (tag.c:166-176). A tree's entries are only read, and a blob names
+/// nothing. The object stays parsed, so neither the reachability walk nor
+/// `mark_unreachable_referents()` looks its links up again.
+fn promisor_parse(
+    repo: &gix::Repository,
+    state: &mut State,
+    parsed: &mut HashSet<ObjectId>,
+    id: ObjectId,
+) {
+    state.typed.insert(id);
+    if parsed.contains(&id) {
+        return;
+    }
+    if !matches!(repo.find_header(id).map(|h| h.kind()), Ok(Kind::Commit | Kind::Tag)) {
+        return;
+    }
+    if let Ok(Ok(decoded)) = decode(repo, id) {
+        for (child, _) in &decoded.children {
+            state.note(*child);
+            state.typed.insert(*child);
+        }
+        parsed.insert(id);
+    }
+}
+
+/// Whether `prepare_commit_graph()` would find a graph to open: `core.commitGraph` is not
+/// off and some odb source holds `info/commit-graph` or a `info/commit-graphs/` chain
+/// (commit-graph.c:736-773).
+fn commit_graph_on_disk(repo: &gix::Repository) -> bool {
+    repo.config_snapshot().boolean("core.commitGraph") != Some(false)
+        && odb_sources(repo).iter().any(|objdir| {
+            objdir.join("info/commit-graph").is_file()
+                || objdir.join("info/commit-graphs/commit-graph-chain").is_file()
+        })
 }
 
 /// The loose id `<sub>/<name>` spells, when the name is one.

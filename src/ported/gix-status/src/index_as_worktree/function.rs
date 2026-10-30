@@ -532,7 +532,23 @@ impl<'index> State<'_, 'index> {
             odb_reads: self.odb_reads,
             odb_bytes: self.odb_bytes,
         };
-        let content_change = diff.compare_blobs(entry, file_size_bytes, fetch_data, &mut self.buf2)?;
+        let content_change = match diff.compare_blobs(entry, file_size_bytes, fetch_data, &mut self.buf2) {
+            Ok(change) => change,
+            // `ce_compare_data()` (read-cache.c:231-245) starts from `match = -1` and only an `open()`
+            // that succeeds replaces it, so a file it cannot open is `DATA_CHANGED` rather than an error;
+            // `ce_compare_link()` (read-cache.c:247-256) does the same for a failed `readlink()`.
+            Err(Error::WorktreeUnreadable(_)) => {
+                return Ok(Some(
+                    Change::Modification {
+                        executable_bit_changed,
+                        content_change: None,
+                        set_entry_stat_size_zero: false,
+                    }
+                    .into(),
+                ));
+            }
+            Err(err) => return Err(err),
+        };
         // This file is racy clean! Set the size to 0 so we keep detecting this as the file is updated.
         if content_change.is_some() || executable_bit_changed {
             let set_entry_stat_size_zero = content_change.is_some() && racy_clean;
@@ -622,7 +638,7 @@ where
         // TODO: what to do about precompose unicode and ignore_case for symlinks
         let out = if is_symlink && self.core_symlinks {
             let symlink_path = gix_path::to_unix_separators_on_windows(gix_path::into_bstr(
-                std::fs::read_link(self.path).map_err(gix_hash::io::Error::from)?,
+                std::fs::read_link(self.path).map_err(|err| Error::WorktreeUnreadable(err.into()))?,
             ));
             self.buf.extend_from_slice(&symlink_path);
             self.worktree_bytes.fetch_add(self.buf.len() as u64, Ordering::Relaxed);
@@ -637,7 +653,7 @@ where
                 .attr_stack
                 .at_entry(self.rela_path, Some(self.entry.mode), &self.objects)
                 .map_err(gix_hash::io::Error::from)?;
-            let file = std::fs::File::open(self.path).map_err(gix_hash::io::Error::from)?;
+            let file = std::fs::File::open(self.path).map_err(|err| Error::WorktreeUnreadable(err.into()))?;
             let out = self
                 .filter
                 .convert_to_git(

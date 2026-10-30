@@ -3548,11 +3548,13 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     }
 
     // `-R`: swap the two sides of every pair, before diffcore and every format sees
-    // them, the way `diff_change()` does.
+    // them, the way `diff_change()` does. `diff_unmerge()` (diff.c:7722-7736) never
+    // looks at `reverse_diff`, so a `U` pair keeps its sides: the worktree file stays
+    // `p->two`, still a rename destination, and `--cached`'s tree entry `p->one`.
     if reverse {
         std::mem::swap(&mut src_prefix, &mut dst_prefix);
         let null = repo.object_hash().null();
-        for d in &mut deltas {
+        for d in deltas.iter_mut().filter(|d| !d.unmerged) {
             reverse_delta(d, null);
         }
     }
@@ -3591,7 +3593,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
     let mut rename_warnings = diffcore_rename::Warnings::default();
     if ro.detect_rename != 0 || ro.break_opt != -1 {
-        rename_warnings = run_diffcore_rename(&repo, &mut cache, &mut deltas, &ro, worktree_mode)?;
+        rename_warnings =
+            run_diffcore_rename(&repo, &mut cache, &mut deltas, &ro, worktree_mode, fmt & F_PATCH != 0)?;
     }
 
     // `diffcore_pickaxe()` (diff.c:7517), which `diffcore_std()` runs immediately
@@ -3779,12 +3782,26 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         apply_textconv(&repo, &mut drivers, &mut deltas, repo.workdir())?;
     }
 
+    // `run_diff()`, `run_diffstat()` and `run_checkdiff()` each begin a pair with
+    // `diff_fill_oid_info()` on both sides, so the first pair whose worktree file
+    // cannot be hashed ends the command there: what the formats printed for the
+    // pairs ahead of it stays, nothing after it is reached. See [`first_unhashable`].
+    // `show_dirstat()` reads the filespecs without filling them and is left alone.
+    let fills_oids = check
+        || exit_needs_patch
+        || names_need_patch
+        || fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH) != 0;
+    let unhashable = match (!quiet || exit_needs_patch) && fills_oids {
+        true => first_unhashable(workdir.as_deref(), &deltas),
+        false => None,
+    };
+    let analyzed = unhashable.as_ref().map_or(deltas.len(), |u| u.index);
     let mut analyses: Vec<Analysis> = Vec::new();
     if (!quiet || exit_needs_patch) && want_analysis {
         analyses = analyze_all(
             &repo,
             &mut cache,
-            &deltas,
+            &deltas[..analyzed],
             ctx,
             ws,
             indent_heuristic,
@@ -3832,7 +3849,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // `-R` swaps which half owns the worktree: the deletion half's *pre*-image is
         // then the file, and the creation half's pre-image is the invalid filespec.
         let reversed_worktree = reverse && worktree_mode;
-        for delta in &deltas {
+        for delta in &deltas[..analyzed] {
             splits.push(match split_type_change(delta) {
                 Some((del, add)) => {
                     let (del_an, add_an) = if reversed_worktree {
@@ -4052,6 +4069,10 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         let buf = apply_line_prefix(buf, &line_prefix);
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&buf);
+        if let Some(u) = unhashable {
+            let _ = stdout.flush();
+            return Err(u.die());
+        }
         // `diff_result_code()` (diff.c:7536-7556) ORs two independent bits: `01` for
         // `--exit-code` with changes, `02` for a checkdiff that found a whitespace
         // error. `git diff --exit-code --check` on a dirty tree exits 3, not 2.
@@ -4093,7 +4114,8 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 // rendered quietly first and dropped when it reports nothing, so a
                 // whitespace-only change is absent from these formats as well.
                 if names_need_patch {
-                    let an = &analyses[i];
+                    // The quiet render of the pair [`first_unhashable`] found dies.
+                    let Some(an) = analyses.get(i) else { break };
                     if !pair_reports_change(&mut scratch, &repo, delta, an, &r, submodule_format)? {
                         continue;
                     }
@@ -4120,7 +4142,12 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             separator = true;
         }
 
-        if fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0 {
+        // `compute_diffstat()` fills every pair before `diff_flush()` prints any
+        // count, so the unhashable pair ends the command ahead of the whole block
+        // and of everything after it.
+        let halted = unhashable.is_some()
+            && (names_need_patch || fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0);
+        if !halted && fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0 {
             let stat_pairs = diffstat_pairs(&deltas, &analyses);
             // `compute_diffstat()` (diff.c:7168) *assigns* `found_changes` from the
             // number of surviving entries, so a stat format that dropped every pair
@@ -4142,7 +4169,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
         // Its `lines` mode reuses the diffstat counts (a binary pair is charged one
         // unit per 64 bytes), `--dirstat-by-file` charges one unit per changed file,
         // and the default mode uses the content damage computed with the pair.
-        if fmt & F_DIRSTAT != 0 {
+        if !halted && fmt & F_DIRSTAT != 0 {
             let files: Vec<(BString, u64)> = deltas
                 .iter()
                 .zip(analyses.iter())
@@ -4194,7 +4221,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             separator = true;
         }
 
-        if fmt & F_SUMMARY != 0 {
+        if !halted && fmt & F_SUMMARY != 0 {
             // `diff_flush()` (diff.c:7243): `if (output_format & DIFF_FORMAT_SUMMARY
             // && !is_summary_empty(q))` — an empty summary writes nothing and does
             // not raise `separator`, so `-p --summary` over a plain content change
@@ -4204,7 +4231,7 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             separator |= out.len() != before;
         }
 
-        if fmt & F_PATCH != 0 {
+        if !halted && fmt & F_PATCH != 0 {
             if separator {
                 // `DIFF_SYMBOL_SEPARATOR` is `o->line_termination` (diff.c:1436-1440),
                 // so `-z` separates the earlier block from the patch with a NUL
@@ -4473,6 +4500,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             stdout.flush()?;
         }
     }
+    if let Some(u) = unhashable {
+        return Err(u.die());
+    }
     // `diff_result_code()` calls `diff_warn_rename_limit()` after stdout is flushed,
     // so the `-l` / `diff.renameLimit` warnings land after the diff itself.
     // A combined diff runs every diffcore pass on `diff_tree_combined()`'s *copy* of
@@ -4563,11 +4593,11 @@ fn add_unmodified_pairs(
     worktree_mode: bool,
     deltas: &mut Vec<Delta>,
 ) -> Result<()> {
-    let seen: BTreeSet<BString> = deltas
-        .iter()
-        .filter(|d| d.old.is_some())
-        .map(|d| d.path.clone())
-        .collect();
+    // `diff_same()` (diff-lib.c:276-281, :431) queues only an entry the walk found
+    // unchanged, so every path already in the queue is excluded whichever side it
+    // has: a deletion `-R` turned into a creation has no pre-image left here, yet its
+    // index entry is not unchanged.
+    let seen: BTreeSet<BString> = deltas.iter().map(|d| d.path.clone()).collect();
     // The same pathspec filtering the change list went through. Worktree sources
     // were already limited by the dirwalk, which matches pathspecs itself.
     let mut specs = if worktree_mode || paths.is_empty() {
@@ -4716,8 +4746,16 @@ fn run_diffcore_rename(
     deltas: &mut Vec<Delta>,
     opts: &diffcore_rename::Options,
     worktree_mode: bool,
+    // `flags.dirty_submodules`, which `diff_setup_done()` raises for a patch
+    // (diff.c:5314-5315): without it `match_stat_with_submodule()` (diff-lib.c:100-103)
+    // never asks a moved submodule whether it is dirty.
+    dirty_submodules: bool,
 ) -> Result<diffcore_rename::Warnings> {
     let mut q = diffcore_rename::Queue::default();
+    // The commit a worktree gitlink pre-image has checked out, which `-R` moved onto
+    // `d.old` and which no filespec has room for: `run_diff_files()` queued that side
+    // with the null id (diff-lib.c:290) and only `diff_fill_oid_info()` resolves it.
+    let mut old_commits: BTreeMap<usize, ObjectId> = BTreeMap::new();
     // spec index -> the "new" side it came from, so a surviving pair can be turned
     // back into a delta that still knows whether to read the worktree. A gitlink
     // pair also has to keep the submodule state it arrived with, which no filespec
@@ -4739,6 +4777,26 @@ fn run_diffcore_rename(
         // spec has to carry that name or the rename pass hands it back renamed to the
         // post-image's.
         let one = match d.old {
+            // A worktree gitlink pre-image is `diff_change()`'s swapped `p->two`: the
+            // gitlink's own id when the submodule did not move, the null id when it
+            // did, which `hash_filespec()` turns into the blob of
+            // `Subproject commit <null>` (diff.c:4449-4469).
+            Some((commit, EntryKind::Commit)) if d.old_worktree => {
+                let raw = d.old_raw_id.filter(|id| !id.is_null());
+                let mut spec = diffcore_rename::FileSpec::new(
+                    d.old_path().clone(),
+                    kind_mode(EntryKind::Commit),
+                    raw.unwrap_or(repo.object_hash().null()),
+                    raw.is_some(),
+                );
+                spec.dirty_submodule = match raw.is_some() || dirty_submodules {
+                    true => d.old_dirty_submodule,
+                    false => 0,
+                };
+                let one = q.add_spec(spec);
+                old_commits.insert(one, commit);
+                one
+            }
             Some((id, k)) => {
                 let mut spec = diffcore_rename::FileSpec::new(
                     d.old_path().clone(),
@@ -4799,7 +4857,7 @@ fn run_diffcore_rename(
             None
         };
         let old = if one.valid() {
-            mode_kind(one.mode).map(|k| (one.oid, k))
+            mode_kind(one.mode).map(|k| (old_commits.get(&p.one).copied().unwrap_or(one.oid), k))
         } else {
             None
         };
@@ -6809,7 +6867,7 @@ fn commit_deltas(
     }
     // `-B` runs through the same pass even with no rename detection behind it.
     if ro.detect_rename != 0 || ro.break_opt != -1 {
-        run_diffcore_rename(repo, cache, &mut deltas, &ro, false)?;
+        run_diffcore_rename(repo, cache, &mut deltas, &ro, false, false)?;
         deltas.sort_by(|a, b| a.path.cmp(&b.path).then(b.unmerged.cmp(&a.unmerged)));
     }
     // The `--follow` limit, applied once the rename it is following exists as a
@@ -7317,6 +7375,64 @@ pub(crate) fn cwd_prefix(repo: &gix::Repository) -> String {
 /// state that must not be shared. The caller's `cache` is used as-is on the
 /// sequential path so a small diff allocates nothing extra.
 #[allow(clippy::too_many_arguments)]
+/// The pair `diff_fill_oid_info()` (diff.c:4969-4985) cannot fill: a worktree side,
+/// which has no valid id, goes through `index_path()`, and a regular file it cannot
+/// `open()` is `error_errno("open(\"%s\")")` (object-file.c:996-999) followed by the
+/// caller's `die("cannot hash %s")`.
+pub(crate) struct Unhashable {
+    /// The pair's position in the queue `diff_flush()` walks.
+    pub(crate) index: usize,
+    /// `one->path`, the repository-relative name `index_path()` opened.
+    path: BString,
+    err: std::io::Error,
+}
+
+impl Unhashable {
+    /// The `error:` line, then the fatal error that ends the command with 128.
+    pub(crate) fn die(self) -> anyhow::Error {
+        eprintln!("error: open(\"{}\"): {}", self.path, crate::external::strerror(&self.err));
+        crate::fatal::die(format!("cannot hash {}", self.path))
+    }
+}
+
+/// `index_path()`'s `S_IFREG` arm for the worktree side at `path`: `None` when the
+/// file is not a regular file `lstat()` finds (the symlink and gitlink arms are not
+/// reached through here) or when it opens.
+pub(crate) fn unhashable_worktree_file(
+    workdir: &std::path::Path,
+    index: usize,
+    path: &BString,
+) -> Option<Unhashable> {
+    let full = workdir.join(gix::path::from_bstr(path.as_bstr()));
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let err = std::fs::File::open(&full).err()?;
+    Some(Unhashable { index, path: path.clone(), err })
+}
+
+/// The first queued pair whose worktree side [`unhashable_worktree_file`] rejects.
+/// `run_diff()` and `run_diffstat()` return for an unmerged pair before they fill
+/// anything (diff.c:5022-5026, :5071-5077).
+fn first_unhashable(workdir: Option<&std::path::Path>, deltas: &[Delta]) -> Option<Unhashable> {
+    let workdir = workdir?;
+    deltas.iter().enumerate().find_map(|(i, d)| {
+        if d.unmerged {
+            return None;
+        }
+        let blob = |k: EntryKind| matches!(k, EntryKind::Blob | EntryKind::BlobExecutable);
+        let old = match d.old {
+            Some((_, k)) if d.old_worktree && blob(k) => unhashable_worktree_file(workdir, i, d.old_path()),
+            _ => None,
+        };
+        old.or_else(|| match d.new {
+            NewSide::Worktree(k) if blob(k) => unhashable_worktree_file(workdir, i, &d.path),
+            _ => None,
+        })
+    })
+}
+
 fn analyze_all(
     repo: &gix::Repository,
     cache: &mut gix::diff::blob::Platform,
@@ -10020,11 +10136,16 @@ fn combined_worktree_result(
 /// `oneway_diff()` its lowest stage as `idx`, whose zeroed stat never matches the
 /// file, so it is that stage against the tree.
 ///
-/// A gitlink in the tree or the index, or a submodule the stage-0 entry names,
-/// still stays a pair here: `get_stat_data()`'s `match_stat_with_submodule()`
-/// dirty test is not carried into this arm. A repository standing at an unmerged
-/// file's path does combine, its result read through `repo_resolve_gitlink_ref()`
-/// by [`combined_worktree_result`].
+/// A stage-0 gitlink the tree also records as a gitlink is the same test over
+/// `get_stat_data()`'s `oid`: `match_stat_with_submodule()` (diff-lib.c:88-107)
+/// calls the entry changed when the submodule's `HEAD` moved off it
+/// (`ce_compare_gitlink()`, read-cache.c:268-284), and a changed entry's `oid` is the
+/// null id (diff-lib.c:341-343), so it combines; one whose `HEAD` still sits on the
+/// entry keeps `ce->oid` and combines only when the tree disagrees with the index —
+/// a submodule that is merely dirty is the ordinary pair `diff_change()` queues with
+/// its `dirty_submodule`. A gitlink on one side and a blob on the other stays a pair
+/// here. A repository standing at an unmerged file's path does combine, its result
+/// read through `repo_resolve_gitlink_ref()` by [`combined_worktree_result`].
 fn oneway_combined_path(
     repo: &gix::Repository,
     index: &gix::index::State,
@@ -10039,9 +10160,6 @@ fn oneway_combined_path(
     let Some(workdir) = repo.workdir() else {
         return Ok(None);
     };
-    if tree_kind == EntryKind::Commit {
-        return Ok(None);
-    }
     // The stage-0 entry, or for a conflicted path the lowest stage it has.
     let entry = index
         .entry_by_path_and_stage(d.path.as_bstr(), gix::index::entry::Stage::Unconflicted)
@@ -10070,15 +10188,34 @@ fn oneway_combined_path(
             Some(k) => k,
             None => return Ok(None),
         },
-        NewSide::Worktree(EntryKind::Commit) | NewSide::Blob(_, EntryKind::Commit) => return Ok(None),
         NewSide::Worktree(k) | NewSide::Blob(_, k) => *k,
         _ => return Ok(None),
     };
-    if index_kind == EntryKind::Commit {
-        return Ok(None);
+    match (tree_kind, index_kind, result_kind) {
+        (EntryKind::Commit, EntryKind::Commit, EntryKind::Commit) if entry.stage_raw() == 0 => {
+            // The walk's worktree side names the commit the submodule has checked
+            // out; a gitlink it left as the index's blob side did not move, or was
+            // never asked (`flags.ignore_submodules` zeroes `changed`).
+            let changed = match &d.new {
+                NewSide::Worktree(_) => d.new_commit.is_some_and(|head| head != entry.id),
+                _ => false,
+            };
+            let oid = if changed { repo.object_hash().null() } else { entry.id };
+            if oid == tree_id && tree_id == entry.id {
+                return Ok(None);
+            }
+        }
+        (EntryKind::Commit, _, _) | (_, EntryKind::Commit, _) => return Ok(None),
+        _ => {}
     }
+    // `grab_blob()` (combine-diff.c:313-321) reads a gitlink parent as its
+    // `Subproject commit` line.
     let side = |kind: EntryKind, id: ObjectId| -> Result<CombinedSide> {
-        Ok(CombinedSide { kind: Some(kind), id, bytes: blob_bytes(repo, id)?, status: b'M' })
+        let bytes = match kind {
+            EntryKind::Commit => format!("Subproject commit {id}\n").into_bytes(),
+            _ => blob_bytes(repo, id)?,
+        };
+        Ok(CombinedSide { kind: Some(kind), id, bytes, status: b'M' })
     };
     let parents = vec![side(index_kind, entry.id)?, side(tree_kind, tree_id)?];
     let id = repo.object_hash().null();

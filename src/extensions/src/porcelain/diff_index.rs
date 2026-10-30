@@ -474,6 +474,11 @@ struct Delta {
     /// `diff_populate_gitlink()` (diff.c:4449-4459) shows as `-dirty`. Only the
     /// worktree side is ever set; `-R` moves it with the rest of the pair.
     dirty: [bool; 2],
+    /// `[one, two]`: the side's id was filled in by `hash_filespec()`
+    /// (diffcore-rename.c:264-274), which writes `oid` but leaves `oid_valid` clear,
+    /// so `--raw` prints that id while `diff_fill_oid_info()` still fills the side
+    /// afresh — for a gitlink, with the commit its submodule has checked out.
+    hashed: [bool; 2],
 }
 
 /// The `p->one` side of a pair `diffcore_rename()` matched across paths.
@@ -2210,6 +2215,17 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // (and with it the rendered hunks) exactly as `-p` does.
         let want_hunks = opts.patch || opts.format == Format::Check;
         let need_analyses = want_hunks || opts.numstat || opts.diffstat || opts.shortstat;
+        // `run_diff()`, `run_diffstat()` and `run_checkdiff()` start every pair with
+        // `diff_fill_oid_info()` (diff.c:5028-5029, :5084-5085, :5109-5110), so the first
+        // pair whose worktree file cannot be hashed ends the command there: `--check`
+        // and the patch keep what they printed for the pairs ahead of it, the stat
+        // family dies before it prints a count.
+        let unhashable = match (need_analyses, workdir.as_deref()) {
+            (true, Some(root)) => deltas.iter().enumerate().find_map(|(i, d)| unhashable_side(root, i, d)),
+            _ => None,
+        };
+        let analyzed = unhashable.as_ref().map_or(deltas.len(), |u| u.index);
+        let halted = unhashable.is_some() && (opts.numstat || opts.diffstat || opts.shortstat);
         let analyses: Vec<IdxAnalysis> = if need_analyses {
             // `diff_filespec_load_driver()`: the `diff` attribute — `-diff` is
             // `driver_false`, `diff` is `driver_true`, a value names a driver whose
@@ -2226,7 +2242,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             let mut lookup = crate::userdiff::Lookup::new(&repo)?;
             let drivers = resolve_drivers(&mut lookup, &deltas)?;
             let mut analyses: Vec<IdxAnalysis> = Vec::with_capacity(deltas.len());
-            for ((d, db), drv) in deltas.iter().zip(&driver_binary).zip(&drivers) {
+            for ((d, db), drv) in deltas[..analyzed].iter().zip(&driver_binary).zip(&drivers) {
                 analyses.push(analyze_index_delta(
                     &repo,
                     workdir.as_deref(),
@@ -2291,7 +2307,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 check_failed =
                     super::diff_files::render_check(&mut rest, &pairs, &colors);
             }
-            if opts.numstat || opts.diffstat || opts.shortstat {
+            if !halted && (opts.numstat || opts.diffstat || opts.shortstat) {
                 let stats = compute_diffstat(&deltas, &analyses, &opts);
                 if opts.numstat {
                     render_numstat(&mut rest, &stats, &opts);
@@ -2304,11 +2320,11 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 }
                 separator = true;
             }
-            if let Some(ds) = &opts.dirstat {
+            if let (Some(ds), false) = (&opts.dirstat, halted) {
                 let files = dirstat_damage(&repo, &deltas, &opts, ds)?;
                 render_dirstat(&mut rest, files, ds);
             }
-            if opts.summary && !summary_is_empty(&deltas) {
+            if !halted && opts.summary && !summary_is_empty(&deltas) {
                 for d in &deltas {
                     render_summary(&mut rest, d);
                 }
@@ -2316,7 +2332,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             }
         }
 
-        if opts.patch && !deltas.is_empty() {
+        if !halted && opts.patch && !deltas.is_empty() {
             if separator {
                 rest.push(b'\n');
             }
@@ -2393,6 +2409,9 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         // `git diff-index` nothing arms the buffer and this is an unbuffered write
         // as before, `EPIPE` and all.
         crate::cstdio::write_bytes_io(&out)?;
+        if let Some(u) = unhashable {
+            return Err(u.die());
+        }
     }
 
     // `diff_result_code()`: bit 0 is `--exit-code` with something to report, bit 1 is
@@ -2678,6 +2697,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                 rename: None,
                 score: 0,
                 dirty: [false, false],
+                hashed: [false, false],
             });
             continue;
         };
@@ -2700,6 +2720,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                     rename: None,
                     score: 0,
                     dirty: [false, false],
+                    hashed: [false, false],
                 });
             }
             continue;
@@ -2719,6 +2740,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
                 rename: None,
                 score: 0,
                 dirty: [false, false],
+                hashed: [false, false],
             });
             continue;
         }
@@ -2807,6 +2829,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
             rename: None,
             score: 0,
             dirty: [false, dirty_submodule],
+            hashed: [false, false],
         });
     }
 
@@ -2886,6 +2909,25 @@ impl<'a> GitlinkIgnore<'a> {
         };
         !d.unmerged && queued_as_gitlink && self.get(&d.path) == gix::submodule::config::Ignore::All
     }
+}
+
+/// The pair's side `diff_fill_oid_info()` (diff.c:4969-4985) would hash and cannot:
+/// a regular file with no valid id — `get_stat_data()`'s worktree side, wherever `-R`
+/// put it — that will not open. `one` is filled first, and `run_diff()` returns for an
+/// unmerged pair before either (diff.c:5022-5026).
+fn unhashable_side(workdir: &Path, i: usize, d: &Delta) -> Option<super::diff::Unhashable> {
+    if d.unmerged {
+        return None;
+    }
+    let worktree = |mode: u32, id: &ObjectId, hashed: bool| mode & S_IFMT == 0o100000 && (id.is_null() || hashed);
+    let one = worktree(d.src_mode, &d.src_id, d.hashed[0])
+        .then(|| super::diff::unhashable_worktree_file(workdir, i, d.src_path()))
+        .flatten();
+    one.or_else(|| {
+        worktree(d.dst_mode, &d.dst_id, d.hashed[1])
+            .then(|| super::diff::unhashable_worktree_file(workdir, i, &d.path))
+            .flatten()
+    })
 }
 
 /// Flatten `tree_id` into `out`, keyed by repository-root relative path.
@@ -3142,6 +3184,8 @@ fn apply_rename_detection(
     };
     // `diff_warn_rename_limit()` (diff.c:7028): `-l<n>`/`diff.renameLimit` cutting the
     // matrix short is reported on stderr, naming the config key the caller could raise.
+    // The port marks a hashed spec `oid_valid`; git does not (see [`Delta::hashed`]).
+    let valid_before: Vec<bool> = q.specs.iter().map(|s| s.oid_valid).collect();
     diffcore_rename::run(&mut q, &ropts, &mut content).emit("diff.renameLimit");
     diffcore_rename::resolve_rename_copy(&mut q);
 
@@ -3149,6 +3193,7 @@ fn apply_rename_detection(
     for p in &q.pairs {
         let one = &q.specs[p.one];
         let two = &q.specs[p.two];
+        let hashed = |i: usize| !valid_before[i] && q.specs[i].oid_valid;
         let renamed = matches!(p.status, b'R' | b'C');
         rebuilt.push(Delta {
             src_mode: one.mode,
@@ -3163,6 +3208,7 @@ fn apply_rename_detection(
             }),
             score: p.score,
             dirty: [one.dirty_submodule != 0, two.dirty_submodule != 0],
+            hashed: [hashed(p.one), hashed(p.two)],
         });
     }
     // `diff_unmerge()`'s pairs kept their queue slots throughout, so splice them back
@@ -3184,6 +3230,9 @@ struct IdxContent<'a> {
 
 impl diffcore_rename::Content for IdxContent<'_> {
     fn size(&mut self, spec: &diffcore_rename::FileSpec) -> Option<u64> {
+        if let Some(line) = gitlink_image(spec) {
+            return Some(line.len() as u64);
+        }
         if spec.oid_valid {
             // `check_size_only = 1`: the odb header answers without inflating the blob.
             let header = self.repo.find_header(spec.oid).ok()?;
@@ -3193,6 +3242,9 @@ impl diffcore_rename::Content for IdxContent<'_> {
     }
 
     fn data(&mut self, spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+        if let Some(line) = gitlink_image(spec) {
+            return Some(line);
+        }
         if spec.oid_valid {
             if let Ok(obj) = self.repo.find_object(spec.oid) {
                 return Some(obj.detach().data);
@@ -3200,6 +3252,17 @@ impl diffcore_rename::Content for IdxContent<'_> {
         }
         read_worktree(self.workdir?, &spec.path)
     }
+}
+
+/// `diff_populate_gitlink()` (diff.c:4449-4469), which `diff_populate_filespec()` takes
+/// for a gitlink before it looks at `oid_valid` (diff.c:4502-4503): the spec's own id —
+/// null for a worktree side `get_stat_data()` found moved — plus `-dirty` for local
+/// damage, so `hash_filespec()` names `Subproject commit <oid>`, never a blob.
+fn gitlink_image(spec: &diffcore_rename::FileSpec) -> Option<Vec<u8>> {
+    (spec.mode & S_IFMT == 0o160000).then(|| {
+        let dirty = if spec.dirty_submodule != 0 { "-dirty" } else { "" };
+        format!("Subproject commit {}{dirty}\n", spec.oid.to_hex()).into_bytes()
+    })
 }
 
 /// The pickaxe (`-S` counts occurrences, `-G` greps the changed lines).
@@ -3669,11 +3732,17 @@ fn analyze_index_delta(
     // `diff_fill_oid_info()`: a side that exists but carries no valid id is the worktree
     // side, and git hashes the file right here so the `index` line can name it. Both
     // sides are tested because `-R` has already swapped them by now.
-    let src_id = fill_oid_info(repo, workdir, d.src_mode, d.src_id, &d.path)?;
-    let dst_id = fill_oid_info(repo, workdir, d.dst_mode, d.dst_id, &d.path)?;
+    // A side `hash_filespec()` named is still `!oid_valid` there.
+    let null = ObjectId::null(repo.object_hash());
+    let (one_id, two_id) = (
+        if d.hashed[0] { null } else { d.src_id },
+        if d.hashed[1] { null } else { d.dst_id },
+    );
+    let src_id = fill_oid_info(repo, workdir, d.src_mode, one_id, d.src_path())?;
+    let dst_id = fill_oid_info(repo, workdir, d.dst_mode, two_id, &d.path)?;
 
-    let old_data = content_of(repo, workdir, d.src_mode, d.src_id, &d.path, d.dirty[0])?.unwrap_or_default();
-    let new_data = content_of(repo, workdir, d.dst_mode, d.dst_id, &d.path, d.dirty[1])?.unwrap_or_default();
+    let old_data = content_of(repo, workdir, d.src_mode, one_id, d.src_path(), d.dirty[0])?.unwrap_or_default();
+    let new_data = content_of(repo, workdir, d.dst_mode, two_id, &d.path, d.dirty[1])?.unwrap_or_default();
 
     // `diff_filespec_is_binary()` per side (diff.c:3712): the path's `diff` attribute is
     // consulted first — when it is `-diff`/`diff` or its driver sets `diff.<name>.binary`,

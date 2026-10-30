@@ -2325,7 +2325,12 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     let funcnames = resolve_drivers(&mut lookup, &deltas)?;
     let mut analyses: Vec<Analysis> = Vec::with_capacity(deltas.len());
     if let Some(cache) = cache.as_mut() {
-        for (d, drv) in deltas.iter().zip(&funcnames) {
+        for (i, (d, drv)) in deltas.iter().zip(&funcnames).enumerate() {
+            // A pair `diff_fill_oid_info()` dies on is never rendered; see below.
+            if unhashable_side(&workdir, i, d).is_some() {
+                analyses.push(Analysis::unmerged(hash_kind.null()));
+                continue;
+            }
             let tc = opts
                 .allow_textconv
                 .then(|| drv.as_ref().and_then(|x| x.settings.textconv.as_deref()))
@@ -2363,6 +2368,26 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     }
     if let Some(f) = &opts.filter {
         apply_filter(f, &mut deltas, &mut analyses);
+    }
+
+    // `run_diff()`, `run_diffstat()` and `run_checkdiff()` start every pair with
+    // `diff_fill_oid_info()` (diff.c:5028-5029, :5084-5085, :5109-5110), so the first
+    // pair whose worktree file cannot be hashed ends the command there. The quiet
+    // patch run of `diff_from_contents` meets it inside the raw/name loop, the stat
+    // family before it prints a count, `--check` in its own loop, and the patch after
+    // the pairs ahead of it.
+    let fills_oids = opts.fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT | F_PATCH | F_CHECKDIFF) != 0
+        || opts.diff_from_contents();
+    let unhashable = match fills_oids && cache.is_some() {
+        true => deltas.iter().enumerate().find_map(|(i, d)| unhashable_side(&workdir, i, d)),
+        false => None,
+    };
+    let halted = unhashable.is_some()
+        && (opts.diff_from_contents() || opts.fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0);
+    let fillable = unhashable.as_ref().map_or(usize::MAX, |u| u.index);
+    if let (Some(u), true) = (&unhashable, opts.diff_from_contents()) {
+        deltas.truncate(u.index);
+        analyses.truncate(u.index);
     }
 
     // `diff_flush()`: with diff_from_contents each pair is run through the patch
@@ -2417,12 +2442,13 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             out.extend_from_slice(&render_raw(repo, &deltas, &opts));
             separator = true;
         }
-        if opts.fmt & F_CHECKDIFF != 0 {
+        if opts.fmt & F_CHECKDIFF != 0 && !halted {
             // `builtin_checkdiff()` asks both attributes per pair (diff.c:4276-4277).
             let mut check_rules = super::diff::WsRules::new(repo);
             let pairs: Vec<CheckPair<'_>> = deltas
                 .iter()
                 .zip(&analyses)
+                .take(fillable)
                 .map(|(d, an)| CheckPair {
                     checkable: !d.unmerged && d.new_valid() && !an.binary,
                     path: &d.path,
@@ -2443,7 +2469,7 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         }
 
         let dirstat_by_line = opts.fmt & F_DIRSTAT != 0 && opts.dirstat.by_line;
-        if opts.fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0 || dirstat_by_line {
+        if !halted && (opts.fmt & (F_NUMSTAT | F_DIFFSTAT | F_SHORTSTAT) != 0 || dirstat_by_line) {
             let stats = compute_diffstat(&deltas, &analyses, &opts);
             if opts.fmt & F_NUMSTAT != 0 {
                 render_numstat(&mut rest, &stats, &opts);
@@ -2467,12 +2493,12 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             }
             separator = true;
         }
-        if opts.fmt & F_DIRSTAT != 0 && !dirstat_by_line {
+        if !halted && opts.fmt & F_DIRSTAT != 0 && !dirstat_by_line {
             let files = dirstat_damage(&deltas, &analyses, &opts);
             render_dirstat(&mut rest, files, &opts.dirstat);
         }
 
-        if opts.fmt & F_SUMMARY != 0 && !summary_is_empty(&deltas) {
+        if !halted && opts.fmt & F_SUMMARY != 0 && !summary_is_empty(&deltas) {
             for d in &deltas {
                 render_summary(&mut rest, d);
             }
@@ -2480,7 +2506,11 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         }
     }
 
-    if opts.fmt & F_PATCH != 0 && (!combined_patch.is_empty() || !deltas.is_empty()) {
+    if let Some(u) = &unhashable {
+        deltas.truncate(u.index);
+        analyses.truncate(u.index);
+    }
+    if !halted && opts.fmt & F_PATCH != 0 && (!combined_patch.is_empty() || !deltas.is_empty()) {
         if separator {
             rest.push(b'\n');
         }
@@ -2677,6 +2707,9 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             stdout.flush()?;
         }
     }
+    if let Some(u) = unhashable {
+        return Err(u.die());
+    }
 
     // `diff_result_code()`: `diff_warn_rename_limit()` first (diff.c:7526-7528), then
     // bit 0 is `--exit-code`, bit 1 is `--check`.
@@ -2695,6 +2728,25 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         code |= 2;
     }
     Ok(ExitCode::from(code))
+}
+
+/// The pair's side `diff_fill_oid_info()` (diff.c:4969-4985) would hash and cannot:
+/// a regular file with no valid id — the worktree side, wherever `-R` put it, or a
+/// side `hash_filespec()` filled without setting `oid_valid` — that will not open.
+/// `one` is filled first. `run_diff()` returns for an unmerged pair before either.
+fn unhashable_side(workdir: &Path, i: usize, d: &Delta) -> Option<super::diff::Unhashable> {
+    if d.unmerged {
+        return None;
+    }
+    let worktree = |mode: u32, id: &ObjectId, hashed: bool| mode & S_IFMT == 0o100000 && (id.is_null() || hashed);
+    let one = worktree(d.src_mode, &d.src_id, d.hashed[0])
+        .then(|| super::diff::unhashable_worktree_file(workdir, i, d.src_disk()))
+        .flatten();
+    one.or_else(|| {
+        worktree(d.dst_mode, &d.dst_id, d.hashed[1])
+            .then(|| super::diff::unhashable_worktree_file(workdir, i, &d.disk))
+            .flatten()
+    })
 }
 
 /// `diff_change()` under `--reverse-diff`: the two sides swap wholesale, and the

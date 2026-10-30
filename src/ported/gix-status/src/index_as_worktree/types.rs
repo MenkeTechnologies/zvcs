@@ -13,6 +13,12 @@ pub enum Error {
     Time(#[from] std::time::SystemTimeError),
     #[error("IO error while writing blob or reading file metadata or changing filetype")]
     Io(#[from] gix_hash::io::Error),
+    /// The worktree file could not be opened (or its link target read) to compare it with the entry.
+    /// [`index_as_worktree()`](crate::index_as_worktree()) never returns this: like `ce_compare_data()`
+    /// and `ce_compare_link()` (read-cache.c:231-266), whose `match = -1` survives a failed `open()` or
+    /// `readlink()`, it reports the entry as modified instead.
+    #[error("Could not open the worktree file for comparison")]
+    WorktreeUnreadable(#[source] gix_hash::io::Error),
     #[error("Failed to obtain blob from object database")]
     Find(#[from] gix_object::find::existing_object::Error),
     #[error("Could not determine status for submodule at '{rela_path}'")]
@@ -131,7 +137,9 @@ pub enum Change<T = (), U = ()> {
         executable_bit_changed: bool,
         /// The output of the [`CompareBlobs`](crate::index_as_worktree::traits::CompareBlobs) run on this entry.
         /// If there is no content change and only the executable bit
-        /// changed then this is `None`.
+        /// changed then this is `None`. It is also `None`, with `executable_bit_changed` unset, when the
+        /// worktree file could not be read to compare it: `ce_compare_data()` (read-cache.c:231-245) calls
+        /// such a file modified without knowing its content.
         content_change: Option<T>,
         /// If true, the caller is expected to set [entry.stat.size = 0](gix_index::entry::Stat::size) to assure this
         /// otherwise racily clean entry can still be detected as dirty next time this is called, but this time without

@@ -693,7 +693,11 @@ fn stash_main(args: &[String]) -> Result<ExitCode> {
         }
         // `create` has no option table at all — every argument is message text,
         // `-h` included, which is why it prints a stash id rather than usage.
-        Some("create") => explicit_status(create_stash(&repo, &args[1..])),
+        Some("create") => match create_stash(&repo, &args[1..]) {
+            Ok(None) => Ok(ExitCode::from(1)),
+            Ok(Some(code)) => explicit_status(Ok(code)),
+            Err(err) => explicit_status(Err(err)),
+        },
         Some("store") => {
             if let Some(code) = usage_requested(&args[1..], STORE_USAGE) {
                 return Ok(code);
@@ -1507,6 +1511,47 @@ fn tracked_changes_match(repo: &gix::Repository, specs: &[String]) -> Result<boo
     Ok(!select_matching(repo, specs, &changed)?.is_empty())
 }
 
+/// `check_changes_tracked_files()` (builtin/stash.c:1241-1280) as `create_stash()` reaches it,
+/// over an index nothing has refreshed: `run_diff_index(&rev, DIFF_INDEX_CACHED)` against
+/// `HEAD`, then `run_diff_files(&rev, 0)` under `quick` and `ignore_submodules`. The second
+/// compares stat data, so a file whose mtime moved is a change even when its bytes are
+/// what the index records — `diff_change()` sets `has_changes` without reading content
+/// (diff.c). The caller has already resolved `HEAD`.
+fn tracked_files_changed_unrefreshed(repo: &gix::Repository) -> Result<bool> {
+    let index = repo.index_or_empty()?;
+    // `run_diff_index(DIFF_INDEX_CACHED)`: any entry whose path, mode or blob differs
+    // from the tree's, or any unmerged stage, is a difference.
+    let head = repo.index_from_tree(&repo.head_tree_id()?.detach())?;
+    let key = |idx: &gix::index::File| -> Vec<(BString, Mode, ObjectId, u32)> {
+        let backing = idx.path_backing();
+        idx.entries().iter().map(|e| (e.path_in(backing).to_owned(), e.mode, e.id, e.stage_raw())).collect()
+    };
+    if key(&index) != key(&head) {
+        return Ok(true);
+    }
+    // `run_diff_files()` (diff-lib.c): skip-worktree entries are not looked at; a
+    // missing file is a deletion (`check_removed()`); an assume-unchanged entry that
+    // is present matches (`ie_match_stat()`'s `ce_valid()` arm); a gitlink never
+    // differs under `ignore_submodules` (`match_stat_with_submodule()`).
+    let ctx = super::read_tree::StatCtx::new(repo, &index)?;
+    let backing = index.path_backing();
+    for entry in index.entries() {
+        if entry.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE) {
+            continue;
+        }
+        match ctx.probe(repo, entry, entry.path_in(backing)) {
+            super::read_tree::Probe::Absent => return Ok(true),
+            super::read_tree::Probe::Changed
+                if !entry.flags.contains(gix::index::entry::Flags::ASSUME_VALID) =>
+            {
+                return Ok(true)
+            }
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
 /// Untracked files a `-u`/`-a` push takes, restricted by any pathspec.
 ///
 /// `-a` additionally takes ignored files. Directories are walked into rather
@@ -2288,6 +2333,16 @@ fn refuse_unmerged_create(repo: &gix::Repository) -> Result<Option<ExitCode>> {
 /// if the strategy fails. `None` when there is nothing to snapshot, which is git's
 /// empty output from `stash create`.
 pub(crate) fn create_snapshot(repo: &gix::Repository) -> Result<Option<ObjectId>> {
+    // The child runs whether or not there is anything to save, and its
+    // `repo_config(git_stash_config)` (builtin/stash.c:2484) comes first: a value that
+    // callback refuses is the child's `fatal:`, then `stash failed` (builtin/merge.c:365-366).
+    if let Err(rejection) = crate::cmd_config::validate_stash(repo) {
+        let fatal = rejection.into_fatal();
+        if !fatal.is_empty() {
+            eprintln!("fatal: {fatal}");
+        }
+        crate::git_fatal!("stash failed");
+    }
     if repo.head_id().is_err() || !repo.is_dirty()? {
         return Ok(None);
     }
@@ -2318,7 +2373,11 @@ fn child_stash_create(built: Result<StashBuild>, parent: &str) -> Result<StashBu
 /// `W` commit id without storing it or touching the worktree. Port of
 /// `create_stash` (builtin/stash.c): the message is every remaining arg joined
 /// by a space (no option parsing), and a clean tree prints nothing (exit 0).
-fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
+///
+/// `None` is `do_create_stash()`'s `ret = 1` (builtin/stash.c:1540-1543), the one
+/// positive return, which `cmd_stash()` passes through as exit 1 (builtin/stash.c:2498-2510);
+/// every other failure here is C's `-1`, which [`explicit_status`] turns into 128.
+fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<Option<ExitCode>> {
     // `create_stash()` opens with `check_changes_tracked_files()` (builtin/stash.c:1658),
     // whose first act is `repo_get_oid(the_repository, "HEAD", &dummy)` (:1248): the
     // lookup that dies on an unreadable `core.warnAmbiguousRefs` (refs.c:827) ahead of
@@ -2329,7 +2388,7 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // unpack-trees.c:1922-1926), before `run_diff_files()` hashes anything.
     if head.is_some() {
         if let Some(code) = super::merge::unpack_trees_excludes_die(repo) {
-            return Ok(code);
+            return Ok(Some(code));
         }
     }
     // `check_changes_tracked_files()` hashes a racily clean entry in
@@ -2343,15 +2402,35 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         for path in &death.unmerged {
             println!("{path}: needs merge");
         }
-        return death.die();
+        return death.die().map(Some);
+    }
+    // ```c
+    // memset(&ps, 0, sizeof(ps));
+    // if (!check_changes_tracked_files(&ps))
+    //         return 0;
+    // ```
+    //
+    // (builtin/stash.c:1657-1659.) Nothing has refreshed the index yet, so an entry
+    // whose stat moved while its content did not is a change here. An unborn `HEAD`
+    // is `-1`, which goes on to `do_create_stash()` as well.
+    if repo.head_id().is_ok() && !tracked_files_changed_unrefreshed(repo)? {
+        return Ok(Some(ExitCode::SUCCESS));
+    }
+    // `do_create_stash()` opens with `repo_refresh_and_write_index()` (builtin/stash.c:1523-1528),
+    // which writes the index whatever the refresh found. A conflicted index is left to
+    // [`refuse_unmerged_create`], which names its paths the way the refresh does.
+    let unmerged = repo.index_or_empty()?.entries().iter().any(|e| e.stage_raw() != 0);
+    if !unmerged {
+        refresh_and_write_index(repo)?;
     }
     if repo.head_id().is_err() {
         eprintln!("You do not have the initial commit yet");
-        return Ok(ExitCode::FAILURE);
+        return Ok(Some(ExitCode::FAILURE));
     }
-    // `check_changes_tracked_files`: no tracked changes → nothing to create.
-    // A missing index file reads as an empty one, which differs from a non-empty `HEAD` tree by
-    // every one of its entries.
+    // `do_create_stash()`'s own `check_changes()` (builtin/stash.c:1540-1543), after the
+    // refresh: a stat-only change is gone now, and nothing to stash is `ret = 1`, exit 1
+    // with nothing printed. A missing index file reads as an empty one, which differs from
+    // a non-empty `HEAD` tree by every one of its entries.
     let dirty = match repo.is_dirty() {
         Ok(dirty) => dirty,
         Err(_) if !repo.index_path().exists() => {
@@ -2360,11 +2439,11 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
         Err(e) => return Err(e.into()),
     };
     if !dirty {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(None);
     }
-    // `create_stash()` has no `repo_refresh_and_write_index()` gate of its own —
-    // it goes straight into `do_create_stash()`, where a conflicted index is
-    // reported twice over and the whole thing gives up:
+    // `do_create_stash()` checks its refresh for `< 0` only, so a conflicted index gets
+    // past it, and is reported twice over when the tree is written and the whole thing
+    // gives up:
     //
     // ```c
     // if (write_index_as_tree(&info->i_tree, the_repository->index,
@@ -2383,7 +2462,12 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // reaches this: its `refresh_and_write_cache()` fails first, with the shorter
     // `error: could not write index`.
     if let Some(code) = refuse_unmerged_create(repo)? {
-        return Ok(code);
+        return Ok(Some(code));
+    }
+    // `i_tree` comes from `write_index_as_tree()` (builtin/stash.c:1561), which writes the
+    // refreshed index back once more when its cache-tree was not fully valid.
+    if let Some(mut index) = crate::held_index::take() {
+        let _ = super::write_tree::refresh_cache_tree(repo, &mut index, false)?;
     }
     // `strbuf_join_argv()` over the remaining words; an empty result is the
     // no-message case, so `git stash create ''` prints the same `WIP on …` commit
@@ -2391,7 +2475,7 @@ fn create_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     let message = Some(args.join(" ")).filter(|m| !m.is_empty());
     let built = build_stash_commit(repo, repo, message.as_deref(), &PushOpts::with_message(None))?;
     println!("{}", built.w_commit.expect("`create` never takes the --patch branch"));
-    Ok(ExitCode::SUCCESS)
+    Ok(Some(ExitCode::SUCCESS))
 }
 
 /// `git stash store [-m <msg>] [-q] <commit>` — point `refs/stash` at an existing
@@ -3999,9 +4083,10 @@ pub fn create_autostash_msg(repo: &gix::Repository, message: &str) -> Result<Obj
     // (run-command.c:743); a child that dies leaves its `fatal:` line and the parent
     // dies with `Cannot autostash`.
     crate::cstdio::before_spawn();
-    // The child's `repo_config(git_stash_config)` (builtin/stash.c:2484) runs first and
-    // ends in `git_diff_basic_config`, so an unreadable `diff.renameLimit` kills it there.
-    if let Err(rejection) = crate::diff_config::validate_basic(repo) {
+    // The child's `repo_config(git_stash_config)` (builtin/stash.c:2484) runs first: its
+    // four `stash.*` booleans, then `git_diff_basic_config` (builtin/stash.c:978-998), so a
+    // `stash.showStat=bogus` or an unreadable `diff.renameLimit` kills it there.
+    if let Err(rejection) = crate::cmd_config::validate_stash(repo) {
         let fatal = rejection.into_fatal();
         if !fatal.is_empty() {
             eprintln!("fatal: {fatal}");
@@ -4188,15 +4273,15 @@ pub enum AutostashApply {
 
 /// Whether the `git stash apply <oid>` child `do_stash_apply()` runs
 /// (sequencer.c:4798-4826) dies on the configuration before it merges anything:
-/// `cmd_stash`'s `repo_config(git_stash_config)` ends in `git_diff_basic_config`
-/// (builtin/stash.c:997, 2484), and `do_apply_stash()`'s `init_ui_merge_options()`
-/// (builtin/stash.c:698) runs `merge_recursive_config()` — its targeted reads, the
+/// `cmd_stash`'s `repo_config(git_stash_config)` reads the four `stash.*` booleans and
+/// ends in `git_diff_basic_config` (builtin/stash.c:978-998, 2484), and
+/// `do_apply_stash()`'s `init_ui_merge_options()` (builtin/stash.c:698) runs `merge_recursive_config()` — its targeted reads, the
 /// `ui` read of `diff.algorithm`, and the `git_xmerge_config` walk (merge-ort.c:5453-5493).
 /// The child runs with `no_stderr`, so its `fatal:` is never seen.
 pub(crate) fn autostash_apply_child_dies(repo: &gix::Repository) -> bool {
     // `validate_merge_recursive()` is the targeted reads plus the walk; the
     // answer is all that matters here, not which read refused first.
-    crate::diff_config::validate_basic(repo).is_err()
+    crate::cmd_config::validate_stash(repo).is_err()
         || crate::merge_apply::ui_diff_algorithm_refusal(repo).is_some()
         || crate::cmd_config::validate_merge_recursive(repo).is_err()
 }
@@ -4204,11 +4289,11 @@ pub(crate) fn autostash_apply_child_dies(repo: &gix::Repository) -> bool {
 /// `apply_save_autostash_oid()`'s tail for a `STASH_APPLY_ERROR` (sequencer.c:4843-4865):
 /// the snapshot goes to `git stash store -m <message> -q <oid>`, and then
 /// `error: could not apply autostash; your changes are safe in the stash`. The store
-/// child keeps its stderr and dies on the same `git_diff_basic_config` the apply child
+/// child keeps its stderr and dies on the same `git_stash_config` the apply child
 /// does, in which case its `fatal:` is followed by `error: cannot store <oid>`.
 pub(crate) fn autostash_apply_failed(repo: &gix::Repository, oid: ObjectId, message: &str) -> Result<()> {
     crate::cstdio::before_spawn();
-    if let Err(rejection) = crate::diff_config::validate_basic(repo) {
+    if let Err(rejection) = crate::cmd_config::validate_stash(repo) {
         let fatal = rejection.into_fatal();
         if !fatal.is_empty() {
             eprintln!("fatal: {fatal}");

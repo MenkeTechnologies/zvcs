@@ -1571,6 +1571,41 @@ pub fn validate_merge_recursive(repo: &gix::Repository) -> Result<(), Rejection>
 }
 
 // ---------------------------------------------------------------------------
+// stash
+// ---------------------------------------------------------------------------
+
+/// `repo_config(the_repository, git_stash_config, NULL)`, the first thing
+/// `cmd_stash()` does for every subcommand, `-h` included (builtin/stash.c:2484) —
+/// and so the first thing each `git stash create`, `store` and `apply` child the
+/// autostash callers spawn does.
+pub fn validate_stash(repo: &gix::Repository) -> Result<(), Rejection> {
+    validate_stash_values(walk_config(repo))
+}
+
+/// [`validate_stash`] over an explicit value list.
+pub fn validate_stash_values(values: Vec<ConfigValue>) -> Result<(), Rejection> {
+    let mut out = defaults();
+    for v in values {
+        git_stash_config(&v, &mut out)?;
+    }
+    Ok(())
+}
+
+/// `git_stash_config()` (builtin/stash.c:978-998): its four booleans through
+/// `git_config_bool()`, everything else through `git_diff_basic_config`. Every
+/// entry is read in turn, so an overridden `stash.index=bogus` dies as surely as
+/// the last one.
+fn git_stash_config(v: &ConfigValue, out: &mut DefaultConfig) -> Result<(), Rejection> {
+    let key = v.key.as_str();
+    match key {
+        "stash.showstat" | "stash.showpatch" | "stash.showincludeuntracked" | "stash.index" => {
+            bool_value(v, key).map(|_| ())
+        }
+        _ => crate::diff_config::git_diff_basic_config(v, out),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // reflog expire
 // ---------------------------------------------------------------------------
 

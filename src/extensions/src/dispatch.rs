@@ -567,6 +567,10 @@ fn runs_config_without_repository(sub: &str, args: &[String]) -> bool {
         "hash-object" => !has("-w"),
         "hook" => args.first().map(String::as_str) == Some("run"),
         "var" => args.len() == 1 && args[0] != "-l",
+        // `run_builtin()` skips `RUN_SETUP` for a lone `-h` or `--help-all` (git.c:478), and
+        // `cmd_stash()` reads `git_stash_config` before it parses anything
+        // (builtin/stash.c:2484).
+        "stash" => args.len() == 1 && (args[0] == "-h" || args[0] == "--help-all"),
         _ => false,
     }
 }
@@ -680,6 +684,13 @@ enum ConfigCallback {
     DiffBasic,
     /// `git_diff_ui_config`: the porcelain diff callback.
     DiffUi,
+    /// `git_stash_config` (builtin/stash.c:978-998), which `cmd_stash()` installs
+    /// ahead of every subcommand (builtin/stash.c:2484): the four `stash.*` booleans,
+    /// then `git_diff_basic_config`.
+    Stash,
+    /// `git stash show`: `git_stash_config` in `cmd_stash()`, then `show_stash()`'s own
+    /// `repo_config(the_repository, git_diff_ui_config, NULL)` (builtin/stash.c:1053).
+    StashShow,
     /// `git_log_config` (builtin/log.c:462).
     Log,
     /// The same `git_log_config`, reached through the `git log` child
@@ -743,10 +754,6 @@ enum ConfigCallback {
 
 /// Which callback `sub` installs.
 ///
-/// `stash` is `DiffBasic` even though `git stash show` reaches the UI layer
-/// through the diff it runs: the choice here is per verb, and taking the
-/// narrower layer under-matches on that one subcommand rather than refusing
-/// `stash list` for a key git lets through.
 /// The first token of a `reflog` command line that is not the verb itself: the subcommand, or
 /// whatever `cmd_reflog()` treats as the implied `show`'s first argument.
 fn reflog_subcommand(args: &[String]) -> Option<&str> {
@@ -778,10 +785,11 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
         "log" | "show" | "whatchanged" => ConfigCallback::Log,
         "format-patch" => ConfigCallback::Format,
         "diff" | "range-diff" => ConfigCallback::DiffUi,
-        // `list_stash()` and `show_stash()` are not the rest of `git stash`:
+        // `cmd_stash()` reads `git_stash_config` for every subcommand
+        // (builtin/stash.c:2484), which ends in `git_diff_basic_config`
+        // (builtin/stash.c:997). `list_stash()` and `show_stash()` read more after it:
         // the first runs a `git log` child (builtin/stash.c:969-975), the second
-        // a diff through `cmd_diff`'s UI layer, while every other subcommand
-        // stops at `git_diff_basic_config` (builtin/stash.c:997). Measured on
+        // `git_diff_ui_config` (builtin/stash.c:1053). Measured on
         // 2.56.0 with `-c <key>=bogus`: `stash list` dies for `color.ui`,
         // `color.diff`, `diff.context`, `log.date` and `format.pretty` at the
         // child's 128, which `cmd_stash` passes through (builtin/stash.c:2498-2510);
@@ -791,8 +799,8 @@ fn config_callback(sub: &str, args: &[String]) -> ConfigCallback {
             let first = args.iter().map(String::as_str).find(|a| *a != "stash");
             match first {
                 Some("list") => ConfigCallback::StashList,
-                Some("show") => ConfigCallback::DiffUi,
-                _ => ConfigCallback::DiffBasic,
+                Some("show") => ConfigCallback::StashShow,
+                _ => ConfigCallback::Stash,
             }
         }
         "diff-files" | "diff-index" | "diff-pairs" | "diff-tree" | "merge-tree" | "cherry-pick" | "revert" => {
@@ -1928,9 +1936,13 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     ConfigCallback::Color => crate::diff_config::validate_color(&repo),
                     ConfigCallback::DiffBasic => crate::diff_config::validate_basic(&repo),
                     ConfigCallback::DiffUi => crate::diff_config::validate_ui(&repo),
+                    ConfigCallback::Stash => crate::cmd_config::validate_stash(&repo),
+                    ConfigCallback::StashShow => crate::cmd_config::validate_stash(&repo)
+                        .and_then(|()| crate::diff_config::validate_ui(&repo)),
                     ConfigCallback::Log => crate::log_config::validate_log(&repo),
-                    // Two callbacks. `cmd_stash` installs `git_diff_basic_config`
-                    // in the parent (builtin/stash.c:2484 -> :997), so a key *that*
+                    // Two callbacks. `cmd_stash` installs `git_stash_config`, which
+                    // ends in `git_diff_basic_config`, in the parent
+                    // (builtin/stash.c:2484 -> :997), so a key *that*
                     // callback reads dies there like any other fatal. Everything
                     // else `git_log_config` reads is refused by the `git log` child
                     // `list_stash()` spawns (builtin/stash.c:969-975), and since 2.56
@@ -1948,9 +1960,8 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
                     //
                     // (builtin/stash.c:963-964), so `git -c color.ui=bogus stash
                     // list` is silent at 0 with an empty stash and the fatal at 128
-                    // with an entry. The parent's `git_diff_basic_config` runs
-                    // either way.
-                    ConfigCallback::StashList => match crate::diff_config::validate_basic(&repo) {
+                    // with an entry. The parent's `git_stash_config` runs either way.
+                    ConfigCallback::StashList => match crate::cmd_config::validate_stash(&repo) {
                         Err(rejection) => Err(rejection),
                         Ok(()) if !stash_ref_exists(&repo) => Ok(()),
                         Ok(()) => match crate::log_config::validate_log(&repo) {
@@ -2024,6 +2035,7 @@ pub fn run(sub: &str, args: &[String]) -> Result<ExitCode> {
             let values = crate::config::walk_config_gently(None);
             let outcome = match config_callback(sub, args) {
                 ConfigCallback::DiffUi => crate::diff_config::validate_ui_values(values),
+                ConfigCallback::Stash => crate::cmd_config::validate_stash_values(values),
                 ConfigCallback::Grep => crate::cmd_config::validate_grep_values(values),
                 _ => crate::default_config::validate_values(values).map(|_| ()),
             };

@@ -306,7 +306,7 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     }
-    let connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
+    let mut connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
         Ok(c) => c
             .with_server_options(server_options)
             .with_credentials(super::credential::transport_authenticate(
@@ -325,6 +325,20 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
             return Ok(ExitCode::from(128));
         }
     };
+    // The refill of a refused `POST` happens inside the transport; see
+    // [`super::credential::with_post_authentication`].
+    {
+        use gix::protocol::transport::client::TransportWithoutIO;
+        let transport_url = connection.transport_mut().to_url().into_owned();
+        let remote_name = connection.remote().name().map(gix::remote::Name::as_bstr).map(ToOwned::to_owned);
+        if let Ok(Some(options)) = repo.transport_options(gix::bstr::ByteSlice::as_bstr(transport_url.as_slice()), remote_name.as_ref().map(|n| gix::bstr::ByteSlice::as_bstr(n.as_slice()))) {
+            connection.set_transport_options(super::credential::with_post_authentication(
+                options,
+                repo.config_snapshot().plumbing().clone(),
+                gix::bstr::ByteSlice::as_bstr(transport_url.as_slice()),
+            ));
+        }
+    }
     let ref_map = match connection.ref_map(
         gix::progress::Discard,
         gix::remote::ref_map::Options {
@@ -345,6 +359,12 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         // A 401 to the retry that carried credentials: `discover_refs()` dies.
         Err(gix::remote::ref_map::Error::Handshake(e))
             if crate::transport_err::http_auth_fatal(&url.to_string(), Some(&repo), &e).is_some() =>
+        {
+            return Ok(ExitCode::from(128));
+        }
+        // The `ls-refs` `POST` was refused: `get_remote_refs()` dies.
+        Err(gix::remote::ref_map::Error::InitRefMap(gix::protocol::fetch::refmap::init::Error::ListRefs(e)))
+            if crate::transport_err::ls_refs_rejected_fatal(&e).is_some() =>
         {
             return Ok(ExitCode::from(128));
         }
@@ -1046,6 +1066,8 @@ fn advertised_refs(
     config: gix::config::File,
 ) -> anyhow::Result<Vec<Ref>> {
     use gix::protocol::transport::client::blocking_io::connect;
+    let is_http = matches!(url.scheme, gix::url::Scheme::Http | gix::url::Scheme::Https);
+    let url_string = url.to_bstring();
     let mut transport = connect::connect(
         url,
         connect::Options {
@@ -1054,6 +1076,16 @@ fn advertised_refs(
             ..Default::default()
         },
     )?;
+    // The refill of a refused `POST` happens inside the transport; see
+    // [`super::credential::with_post_authentication`].
+    if is_http {
+        let options = super::credential::with_post_authentication(
+            Box::new(gix::protocol::transport::client::blocking_io::http::Options::default()),
+            config.clone(),
+            url_string.as_ref(),
+        );
+        transport.configure(&*options).ok();
+    }
     let mut handshake = gix::protocol::handshake(
         &mut transport,
         gix::protocol::transport::Service::UploadPack,

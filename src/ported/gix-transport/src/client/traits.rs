@@ -21,6 +21,17 @@ pub trait TransportWithoutIO {
         Err(Error::AuthenticationUnsupported)
     }
 
+    /// After an authenticated handshake succeeded with the identity passed to [`set_identity()`][Self::set_identity()],
+    /// hand over `next`, the way to `erase` that credential, so a later request it is refused for can reject it as
+    /// http.c's `handle_curl_result()` does (:1945-1955). Transports without authentication ignore it.
+    #[cfg(feature = "gix-credentials")]
+    fn set_credential_next(&mut self, _next: gix_credentials::helper::NextAction) {}
+
+    /// Sign requests with the `Authorization` value `authorization` instead of one built from the identity passed to
+    /// [`set_identity()`][Self::set_identity()]: `<authtype> <credential>` from a helper that answered with both
+    /// (http.c's `http_append_auth_header()`, :625-636). Transports without authentication ignore it.
+    fn set_authorization(&mut self, _authorization: Option<String>) {}
+
     /// Returns the canonical URL pointing to the destination of this transport.
     fn to_url(&self) -> Cow<'_, BStr>;
 
@@ -57,6 +68,15 @@ impl<T: TransportWithoutIO + ?Sized> TransportWithoutIO for Box<T> {
         self.deref_mut().set_identity(identity)
     }
 
+    #[cfg(feature = "gix-credentials")]
+    fn set_credential_next(&mut self, next: gix_credentials::helper::NextAction) {
+        self.deref_mut().set_credential_next(next)
+    }
+
+    fn set_authorization(&mut self, authorization: Option<String>) {
+        self.deref_mut().set_authorization(authorization)
+    }
+
     fn to_url(&self) -> Cow<'_, BStr> {
         self.deref().to_url()
     }
@@ -77,6 +97,15 @@ impl<T: TransportWithoutIO + ?Sized> TransportWithoutIO for Box<T> {
 impl<T: TransportWithoutIO + ?Sized> TransportWithoutIO for &mut T {
     fn set_identity(&mut self, identity: gix_sec::identity::Account) -> Result<(), Error> {
         self.deref_mut().set_identity(identity)
+    }
+
+    #[cfg(feature = "gix-credentials")]
+    fn set_credential_next(&mut self, next: gix_credentials::helper::NextAction) {
+        self.deref_mut().set_credential_next(next)
+    }
+
+    fn set_authorization(&mut self, authorization: Option<String>) {
+        self.deref_mut().set_authorization(authorization)
     }
 
     fn to_url(&self) -> Cow<'_, BStr> {

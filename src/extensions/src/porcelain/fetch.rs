@@ -3331,6 +3331,21 @@ fn fetch_one(
     connection.set_credentials(super::credential::transport_authenticate(
         repo.config_snapshot().plumbing().clone(),
     ));
+    // ... and for the refill of a refused `POST`, which happens inside the transport; see
+    // [`super::credential::with_post_authentication`]. A configuration error is left to the
+    // connection's own read of these options, which reports it.
+    {
+        use gix::protocol::transport::client::TransportWithoutIO;
+        let transport_url = connection.transport_mut().to_url().into_owned();
+        let remote_name = connection.remote().name().map(|n| n.as_bstr().to_owned());
+        if let Ok(Some(options)) = repo.transport_options(gix::bstr::ByteSlice::as_bstr(transport_url.as_slice()), remote_name.as_ref().map(|n| gix::bstr::ByteSlice::as_bstr(n.as_slice()))) {
+            connection.set_transport_options(super::credential::with_post_authentication(
+                options,
+                repo.config_snapshot().plumbing().clone(),
+                gix::bstr::ByteSlice::as_bstr(transport_url.as_slice()),
+            ));
+        }
+    }
 
     // `--negotiate-only` never lists refs and never asks for a pack: it runs the negotiation on its
     // own and prints the commits the remote acknowledged as common, one per line.
@@ -3370,6 +3385,12 @@ fn fetch_one(
         Err(gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Handshake(e)))
             if crate::transport_err::http_auth_fatal(&raw_url, Some(repo), &e).is_some() =>
         {
+            return Ok(Verdict::Fatal);
+        }
+        // The `ls-refs` `POST` was refused: `get_remote_refs()` dies.
+        Err(gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::InitRefMap(
+            gix::protocol::fetch::refmap::init::Error::ListRefs(e),
+        ))) if crate::transport_err::ls_refs_rejected_fatal(&e).is_some() => {
             return Ok(Verdict::Fatal);
         }
         // git's `die_if_server_options()` also prints the advice line, and both it and the

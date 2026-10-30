@@ -348,6 +348,9 @@ pub struct Transport<H: Http> {
     service: Option<Service>,
     line_provider: Option<StreamingPeekableIter<H::ResponseBody>>,
     identity: Option<gix_sec::identity::Account>,
+    /// `<authtype> <credential>` from the helper that produced [`identity`][Self::identity], sent as the
+    /// `Authorization` header in place of `Basic` (http.c's `http_append_auth_header()`, :625-636).
+    authorization: Option<String>,
     trace: bool,
     /// `http.proactiveAuth`, captured from the options passed to [`configure()`][client::TransportWithoutIO::configure()].
     /// It lives here rather than in the backend because the identity the request is signed with does.
@@ -385,6 +388,7 @@ impl<H: Http> Transport<H> {
             http,
             line_provider: None,
             identity,
+            authorization: None,
             trace,
             proactive_auth: Default::default(),
             empty_auth: Default::default(),
@@ -468,12 +472,68 @@ impl<H: Http> Transport<H> {
                     "Will not send credentials in clear text over http",
                 ));
             }
-            headers.push(Cow::Owned(format!(
-                "Authorization: Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
-            )));
+            headers.push(Cow::Owned(match &self.authorization {
+                Some(authorization) => format!("Authorization: {authorization}"),
+                None => format!("Authorization: {}", basic_authorization(username, password)),
+            }));
         }
         Ok(())
+    }
+}
+
+/// The value of the `Authorization` header that signs a request as `username` with `password`.
+pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+    )
+}
+
+/// A panic raised by the credential callback on a backend's worker thread, carried to the thread that reads
+/// the response and resumed there, so an `exit()` that unwinds still reaches whoever catches it.
+pub(crate) struct CallbackPanic(std::sync::Mutex<Option<Box<dyn Any + Send>>>);
+
+impl CallbackPanic {
+    pub(crate) fn new(payload: Box<dyn Any + Send>) -> Self {
+        CallbackPanic(std::sync::Mutex::new(Some(payload)))
+    }
+
+    /// Resume the panic `err` carries, if it carries one.
+    fn resume_if_carried_by(err: &std::io::Error) {
+        let payload = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<CallbackPanic>())
+            .and_then(|panic| panic.0.lock().ok()?.take());
+        if let Some(payload) = payload {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+
+impl std::fmt::Debug for CallbackPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallbackPanic")
+    }
+}
+
+impl std::fmt::Display for CallbackPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the credential callback panicked")
+    }
+}
+
+impl std::error::Error for CallbackPanic {}
+
+/// Pick up the identity the backend obtained when it retried a refused `POST`, so the requests that follow
+/// are signed with it, as every request after `credential_fill()` is with http.c's one `http_auth`.
+fn sync_obtained_identity<H: Http>(
+    http: &mut H,
+    identity: &mut Option<gix_sec::identity::Account>,
+    authorization: &mut Option<String>,
+) {
+    if let Some((obtained, obtained_authorization)) = http.take_obtained_identity() {
+        *identity = Some(obtained);
+        *authorization = obtained_authorization;
     }
 }
 
@@ -489,7 +549,16 @@ fn append_url(base: &str, suffix: &str) -> String {
 impl<H: Http> client::TransportWithoutIO for Transport<H> {
     fn set_identity(&mut self, identity: gix_sec::identity::Account) -> Result<(), client::Error> {
         self.identity = Some(identity);
+        self.authorization = None;
         Ok(())
+    }
+
+    fn set_credential_next(&mut self, next: gix_credentials::helper::NextAction) {
+        self.http.set_credential_next(next);
+    }
+
+    fn set_authorization(&mut self, authorization: Option<String>) {
+        self.authorization = authorization;
     }
 
     fn to_url(&self) -> Cow<'_, BStr> {
@@ -557,6 +626,7 @@ impl<H: Http> Transport<H> {
             }))?;
         if let Some(outcome) = outcome {
             self.identity = Some(outcome.identity);
+            self.authorization = outcome.authorization;
         }
         Ok(())
     }
@@ -569,6 +639,7 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
         extra_parameters: &'a [(&'a str, Option<&'a str>)],
     ) -> Result<SetServiceResponse<'_>, client::Error> {
         self.authenticate_proactively()?;
+        sync_obtained_identity(&mut self.http, &mut self.identity, &mut self.authorization);
         let url = append_url(self.url.as_ref(), &format!("info/refs?service={}", service.as_str()));
         let static_headers = [Cow::Borrowed(self.user_agent_header)];
         let mut dynamic_headers = Vec::<Cow<'_, str>>::new();
@@ -660,6 +731,7 @@ impl<H: Http> blocking_io::Transport for Transport<H> {
         on_into_read: MessageKind,
         trace: bool,
     ) -> Result<RequestWriter<'_>, client::Error> {
+        sync_obtained_identity(&mut self.http, &mut self.identity, &mut self.authorization);
         let service = self.service.ok_or(client::Error::MissingHandshake)?;
         let url = append_url(&self.url, service.as_str());
         let static_headers = &[
@@ -717,6 +789,11 @@ struct HeadersThenBody<H: Http, B: Unpin> {
 impl<H: Http, B: Unpin> HeadersThenBody<H, B> {
     fn handle_headers(&mut self) -> std::io::Result<()> {
         if let Some(headers) = self.headers.take() {
+            let mut headers = headers;
+            if let Err(err) = headers.fill_buf() {
+                CallbackPanic::resume_if_carried_by(&err);
+                return Err(std::io::Error::other(client::Error::from(err)));
+            }
             <Transport<H>>::check_content_type(self.service, "result", headers).map_err(std::io::Error::other)?;
         }
         Ok(())
@@ -856,6 +933,7 @@ mod tests {
                         oauth_refresh_token: None,
                     },
                     next: gix_credentials::helper::NextAction::from(ctx),
+                    authorization: None,
                 })),
                 _ => Ok(None),
             }

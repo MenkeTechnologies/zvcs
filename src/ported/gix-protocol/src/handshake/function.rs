@@ -47,13 +47,27 @@ where
         } = match result {
             Ok(v) => Ok(v),
             Err(client::Error::Io(ref err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let www_authenticate = client::www_authenticate(err);
                 drop(result); // needed to workaround this: https://github.com/rust-lang/rust/issues/76149
                 let url = transport.to_url().into_owned();
                 progress.set_name("authentication".into());
-                let credentials::protocol::Outcome { identity, next } =
-                    authenticate(credentials::helper::Action::get_for_url(url.clone()))?
-                        .ok_or(Error::EmptyCredentials)?;
+                // `http_request_reauth()` refills through `http_reauth_prepare(1)` (http.c:2475-2476), which is
+                // `credential_fill(..., all_capabilities=1)`: the helper is told the caller understands
+                // `authtype` and `state`, and sees the challenge of the refused request as `wwwauth[]`.
+                let mut get = credentials::helper::Action::get_for_url(url.clone());
+                if let Some(ctx) = get.context_mut() {
+                    ctx.set_all_capabilities(credentials::protocol::CredentialOp::Initial);
+                    ctx.wwwauth = www_authenticate.into_iter().map(Into::into).collect();
+                }
+                let credentials::protocol::Outcome {
+                    identity,
+                    next,
+                    authorization,
+                } =
+                    authenticate(get)?.ok_or(Error::EmptyCredentials)?;
                 transport.set_identity(identity)?;
+                transport.set_authorization(authorization);
+                transport.set_credential_next(next.clone());
                 progress.step();
                 progress.set_name("handshake (authenticated)".into());
                 match transport.handshake(service, &extra_parameters).await {
@@ -63,7 +77,7 @@ where
                     }
                     // Still no permission? Reject the credentials.
                     Err(client::Error::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-                        authenticate(next.erase())?;
+                        authenticate(next.with_wwwauth(client::www_authenticate(&err)).erase())?;
                         return Err(Error::InvalidCredentials { url, source: err });
                     }
                     // Otherwise, do nothing, as we don't know if it actually got to try the credentials.

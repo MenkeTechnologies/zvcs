@@ -433,3 +433,37 @@ fn url_is_local_not_ssh(url: &str) -> bool {
         Some(colon) => slash.is_some_and(|slash| slash < colon),
     }
 }
+
+/// `get_remote_refs()`'s `die()` (connect.c:614-615) for a v2 `ls-refs` whose `POST` the server refused, or
+/// `None` when `err` is not that: remote-curl's `post_rpc()` ends a failed stateless-connect request with
+/// `packet_response_end()` (remote-curl.c:1086-1087) after `run_slot()` reported it, so the reader finds a
+/// response-end where the flush after the listing belongs. Exit 128.
+pub fn ls_refs_rejected_fatal(err: &gix::protocol::ls_refs::Error) -> Option<ExitCode> {
+    http_error_response(err)?;
+    eprintln!("fatal: expected flush after ref listing");
+    Some(ExitCode::from(128))
+}
+
+/// The HTTP error response somewhere below `err`, looking through the `std::io::Error`s and transport errors
+/// the response is wrapped in on its way up.
+fn http_error_response<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a gix::protocol::transport::client::blocking_io::http::ErrorResponse> {
+    use gix::protocol::transport::client::{self, blocking_io::http::ErrorResponse};
+    if let Some(response) = err.downcast_ref::<ErrorResponse>() {
+        return Some(response);
+    }
+    let inner: Option<&(dyn std::error::Error + 'static)> = if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        io.get_ref().map(|e| e as &(dyn std::error::Error + 'static))
+    } else if let Some(client::Error::Io(io)) = err.downcast_ref::<client::Error>() {
+        Some(io)
+    } else if let Some(gix::protocol::ls_refs::Error::Io(io)) = err.downcast_ref::<gix::protocol::ls_refs::Error>() {
+        Some(io)
+    } else if let Some(gix::protocol::ls_refs::Error::Transport(t)) = err.downcast_ref::<gix::protocol::ls_refs::Error>()
+    {
+        Some(t)
+    } else {
+        err.source()
+    };
+    http_error_response(inner?)
+}

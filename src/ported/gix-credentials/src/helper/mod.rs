@@ -1,6 +1,9 @@
 use bstr::{BStr, BString};
 
-use crate::{Program, protocol, protocol::Context};
+use crate::{
+    Program, protocol,
+    protocol::{Context, CredentialOp},
+};
 
 /// A list of helper programs to run in order to obtain credentials.
 #[derive(Debug)]
@@ -155,10 +158,15 @@ impl TryFrom<&NextAction> for Context {
 }
 
 impl From<Context> for NextAction {
-    fn from(ctx: Context) -> Self {
+    /// `credential_approve()` and `credential_reject()` (credential.c:547-583) both run
+    /// `credential_next_state()` and then write the credential as a [`CredentialOp::Response`], so the `state[]`
+    /// a helper answered with goes back to it, and a `capability[]` only when the caller and a helper both
+    /// announced it.
+    fn from(mut ctx: Context) -> Self {
         let options = ctx.options;
+        ctx.next_state();
         let mut buf = Vec::<u8>::new();
-        ctx.write_to(&mut buf).expect("cannot fail");
+        ctx.write_to_op(&mut buf, CredentialOp::Response).expect("cannot fail");
         NextAction {
             previous_output: buf.into(),
             options,
@@ -174,6 +182,32 @@ impl NextAction {
     /// Reject the result of the previous [Action] and erase it as to not be returned when being looked up.
     pub fn erase(self) -> Action {
         Action::Erase(self.previous_output)
+    }
+
+    /// Replace the `wwwauth[]` lines of what will be stored or erased with `headers`, the `WWW-Authenticate`
+    /// values of the response that decided it.
+    ///
+    /// git keeps one credential per transport (http.c's `http_auth`), and every response rewrites its
+    /// `wwwauth_headers` through `fwrite_wwwauth()` (http.c:220-317) — so the `erase` after a refused retry
+    /// carries the challenge of that refusal, not of the response that led to the `get`.
+    ///
+    /// The payload is read back as the [`CredentialOp::Response`] it was written as: a `capability[]` in it was
+    /// announced by both sides, and its `state[]` lines are the ones to send.
+    pub fn with_wwwauth(self, headers: impl IntoIterator<Item = impl Into<BString>>) -> Self {
+        let Ok(mut ctx) = Context::from_bytes(self.previous_output.as_ref(), self.options) else {
+            return self;
+        };
+        for capa in [&mut ctx.capa_authtype, &mut ctx.capa_state] {
+            capa.request_initial = capa.request_helper;
+        }
+        ctx.state_to_send = std::mem::take(&mut ctx.state);
+        ctx.wwwauth = headers.into_iter().map(Into::into).collect();
+        let mut buf = Vec::<u8>::new();
+        ctx.write_to_op(&mut buf, CredentialOp::Response).expect("cannot fail");
+        NextAction {
+            previous_output: buf.into(),
+            options: self.options,
+        }
     }
 }
 

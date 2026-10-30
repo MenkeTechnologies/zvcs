@@ -591,6 +591,11 @@ pub fn send_pack(
     // Apply the repository's transport configuration (user agent, http.* options)
     // the same way gix's ref_map does before a handshake.
     if let Ok(Some(config)) = repo.transport_options(url.as_str(), None) {
+        let config = super::credential::with_post_authentication(
+            config,
+            repo.config_snapshot().plumbing().clone(),
+            url.as_str().into(),
+        );
         transport.configure(&*config).ok();
     }
 
@@ -1889,6 +1894,7 @@ impl Sideband {
     /// `case 3:` — a remote error. git prints the whole packet as one `remote: `
     /// line; there is no line splitting on this band.
     pub(super) fn remote_error(&mut self, text: &[u8]) {
+        let text = up_to_nul(text);
         if !self.scratch.is_empty() {
             self.scratch.push('\n');
         }
@@ -1904,6 +1910,7 @@ impl Sideband {
     /// soon as it is complete so a hook's output appears while it is still running.
     /// A trailing partial line stays in `scratch` for the next packet.
     pub(super) fn progress(&mut self, text: &[u8]) {
+        let text = up_to_nul(text);
         let text = String::from_utf8_lossy(text);
         let mut rest = text.as_ref();
         while let Some(at) = rest.find(['\n', '\r']) {
@@ -1991,6 +1998,13 @@ impl Sideband {
         out.push_str(&sanitize_control_characters(rest));
         out
     }
+}
+
+/// The packet as the C string `demultiplex_sideband()` reads it: `buf[len] = '\0'` and then `strpbrk()`,
+/// `strlen()` and `strbuf_add_sanitized()`'s `for (; n && *src; ...)` all stop at the first NUL
+/// (sideband.c:234, :350, :373-416), so nothing after one is shown.
+fn up_to_nul(text: &[u8]) -> &[u8] {
+    text.split(|b| *b == 0).next().unwrap_or_default()
 }
 
 /// `strbuf_add_sanitized()` (sideband.c:220) at its default

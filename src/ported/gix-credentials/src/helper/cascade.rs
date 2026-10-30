@@ -81,6 +81,9 @@ impl Cascade {
     pub fn invoke(&mut self, mut action: helper::Action, mut prompt: gix_prompt::Options) -> protocol::Result {
         if let Some(ctx) = action.context_mut() {
             ctx.options = self.context_options;
+            // `credential_fill()` (credential.c:511-512): `credential_next_state(c); c->multistage = 0;`
+            ctx.next_state();
+            ctx.multistage = false;
         }
         let mut url = action
             .context_mut()
@@ -115,6 +118,15 @@ impl Cascade {
                         password_expiry_utc,
                         url: ctx_url,
                         quit,
+                        capa_authtype,
+                        capa_state,
+                        authtype,
+                        credential,
+                        ephemeral,
+                        wwwauth,
+                        state,
+                        state_to_send: _,
+                        multistage,
                     } = {
                         // `credential_read()` warns about a line without `=` and stops
                         // there; `credential_fill()` (credential.c:517) discards the
@@ -136,6 +148,26 @@ impl Cascade {
                         }
                         if let Some(src) = password_expiry_utc {
                             dst_ctx.password_expiry_utc = Some(src);
+                        }
+                        // `credential_read()` reads the answer into the very struct the request was
+                        // written from (credential.c:313-389): a `capability[]` is the helper's
+                        // announcement, `wwwauth[]` and `state[]` lines are appended, and the flags
+                        // are set rather than merged.
+                        for (src, dst) in [(capa_authtype, &mut dst_ctx.capa_authtype), (capa_state, &mut dst_ctx.capa_state)] {
+                            dst.request_helper |= src.request_helper;
+                        }
+                        dst_ctx.wwwauth.extend(wwwauth);
+                        dst_ctx.state.extend(state);
+                        if ephemeral {
+                            dst_ctx.ephemeral = true;
+                        }
+                        if multistage {
+                            dst_ctx.multistage = true;
+                        }
+                        for (src, dst) in [(authtype, &mut dst_ctx.authtype), (credential, &mut dst_ctx.credential)] {
+                            if let Some(src) = src {
+                                *dst = Some(src);
+                            }
                         }
                         for (src, dst) in [
                             (protocol, &mut dst_ctx.protocol),
@@ -159,7 +191,14 @@ impl Cascade {
                             dst_ctx.password_expiry_utc = None;
                             dst_ctx.clear_secrets();
                         }
-                        if dst_ctx.username.is_some() && dst_ctx.password.is_some() {
+                        // ```c
+                        // if ((c->username && c->password) || c->credential) {
+                        //         strvec_clear(&c->wwwauth_headers);
+                        //         return;
+                        // }
+                        // ```
+                        if (dst_ctx.username.is_some() && dst_ctx.password.is_some()) || dst_ctx.credential.is_some() {
+                            dst_ctx.wwwauth.clear();
                             break;
                         }
                         if quit.unwrap_or_default() {

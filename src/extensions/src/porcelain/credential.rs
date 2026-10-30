@@ -300,7 +300,7 @@ pub(crate) fn transport_authenticate(
         }
         .ok_or(Error::UrlMissing)?;
         let url = gix::url::parse(url.as_bstr()).map_err(|e| Error::UrlParse(e))?;
-        let (mut cascade, get, prompt) = match standalone_credential_helpers(&cfg, url) {
+        let (mut cascade, mut get, prompt) = match standalone_credential_helpers(&cfg, url) {
             Ok(parts) => parts,
             Err(msg) => {
                 fatal(&msg);
@@ -308,6 +308,13 @@ pub(crate) fn transport_authenticate(
             }
         };
         discount_echoed_helpers(&mut cascade);
+        // The transport's `http_auth` carries the capabilities it announces and the server's challenge into
+        // the `get` (credential.c:409-442); the request rebuilt for the cascade has to keep them.
+        if let (Action::Get(from), Some(to)) = (&action, get.context_mut()) {
+            to.capa_authtype = from.capa_authtype;
+            to.capa_state = from.capa_state;
+            to.wwwauth = from.wwwauth.clone();
+        }
 
         if !matches!(action, Action::Get(_)) {
             return cascade.invoke(action, prompt);
@@ -343,11 +350,14 @@ pub(crate) fn transport_authenticate(
         let username = username.to_string();
         let password = password.to_string();
         let oauth_refresh_token = unredacted(context.oauth_refresh_token.clone());
+        // The challenge belonged to the refused request; the `store` that follows a successful one carries
+        // that response's, which `fwrite_wwwauth()` reset at its status line (http.c:303-312).
         let next = Context {
             username: Some(username.clone()),
             password: Some(password.clone()),
             oauth_refresh_token: oauth_refresh_token.clone(),
             url: None,
+            wwwauth: Vec::new(),
             ..context
         };
         Ok(Some(gix::credentials::protocol::Outcome {
@@ -357,8 +367,39 @@ pub(crate) fn transport_authenticate(
                 oauth_refresh_token,
             },
             next: next.into(),
+            authorization: None,
         }))
     }
+}
+
+/// Hand [`transport_authenticate`] to the http transport itself, for the `credential_fill()` remote-curl's
+/// `post_rpc()` runs when a `POST` is answered with a `401` (`http_reauth_prepare(0)`, remote-curl.c:1070-1074,
+/// :943-950). The handshake's refill goes through the callback given to the handshake; the `POST`s happen deep
+/// inside the transport, where only its options reach.
+///
+/// `options` is what [`gix::Repository::transport_options`] produced for `url`; any other transport's options
+/// pass through untouched. An `http.proactiveAuth` cascade gix already put there keeps its request and has its
+/// callback replaced, so both refills go through the same `credential_fill()`.
+pub(crate) fn with_post_authentication(
+    mut options: Box<dyn std::any::Any>,
+    cfg: gix::config::File,
+    url: &gix::bstr::BStr,
+) -> Box<dyn std::any::Any> {
+    use gix::protocol::transport::client::blocking_io::http;
+    if let Some(opts) = options.downcast_mut::<http::Options>() {
+        let action = opts
+            .authenticate
+            .take()
+            .map(|(action, _)| action)
+            .unwrap_or_else(|| gix::credentials::helper::Action::get_for_url(url));
+        let authenticate = transport_authenticate(cfg);
+        opts.authenticate = Some((
+            action,
+            std::sync::Arc::new(std::sync::Mutex::new(authenticate))
+                as std::sync::Arc<std::sync::Mutex<http::options::AuthenticateFn>>,
+        ));
+    }
+    options
 }
 
 /// The helper cascade for a `git credential` run that found no repository —

@@ -41,7 +41,7 @@ async-client = [
 ]
 
 ## Add implementations for performing a `handshake` along with the dependencies needed for it.
-handshake = ["dep:gix-credentials"]
+handshake = ["dep:gix-credentials", "gix-transport/gix-credentials"]
 
 ## Add implementations for performing a `fetch` (for packs) along with the dependencies needed for it.
 fetch = [

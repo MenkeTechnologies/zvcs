@@ -264,6 +264,10 @@ fn build_client(
         .connect_timeout(config.connect_timeout.unwrap_or(Duration::from_secs(20)))
         .connection_verbose(config.verbose)
         .http1_title_case_headers()
+        // libcurl hands a folded header line to `fwrite_wwwauth()` as it came, and http.c joins the
+        // continuation to its `WWW-Authenticate` value (http.c:268-300); hyper refuses the response instead
+        // unless told to unfold it.
+        .http1_allow_obsolete_multiline_headers_in_responses(true)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             match *redirect_action.lock() {
                 RedirectAction::Follow => {
@@ -442,6 +446,147 @@ impl<R: Read> Read for LowSpeedGuard<R> {
     }
 }
 
+/// `http.maxRetries`, `http.retryAfter` and `http.maxRetryTime`: repeat a request that was answered with
+/// `429 Too Many Requests`, waiting for what the server asks for via `Retry-After` or, failing that, for
+/// `http.retryAfter` seconds. A body that is being streamed cannot be replayed, so such a request is never retried.
+fn execute_retrying_rate_limits(
+    client: &reqwest::blocking::Client,
+    req: reqwest::blocking::Request,
+    config: &http::Options,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    let mut retries_left = config.max_retries;
+    let mut pending = Some(req);
+    loop {
+        let req = pending.take().expect("a request to send in every iteration");
+        let replay = (retries_left > 0).then(|| req.try_clone()).flatten();
+        let res = client.execute(req);
+        let Some(replay) = replay else { break res };
+        let Ok(ref ok) = res else { break res };
+        if ok.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            break res;
+        }
+        // Only the delta-seconds form of `Retry-After` is understood; the HTTP-date form
+        // falls back to `http.retryAfter`, as it does with libcurl before 7.66.0.
+        let delay = ok
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(config.retry_after_seconds);
+        if delay > config.max_retry_time_seconds {
+            break res;
+        }
+        std::thread::sleep(Duration::from_secs(delay));
+        retries_left -= 1;
+        pending = Some(replay);
+    }
+}
+
+/// The `WWW-Authenticate` values of a response, in order: http.c's `fwrite_wwwauth()` (http.c:220-317), which
+/// pushes one entry per header with its value trimmed, and clears the list at every status line so only the last
+/// response counts.
+///
+/// A folded continuation line is joined to its header with one space; hyper does that unfolding when
+/// `http1_allow_obsolete_multiline_headers_in_responses` is on (see [`build_client()`]). The one shape it cannot
+/// reproduce is a continuation line that is empty after trimming in the middle of a value, which git skips and
+/// hyper turns into a second space.
+fn www_authenticate(headers: &reqwest::header::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).trim().to_owned())
+        .collect()
+}
+
+/// `run_slot()`'s `error(_("RPC failed; %s"), msg.buf)` (remote-curl.c:859-873) for a request that ended with `status`.
+fn report_rpc_failure(status: reqwest::StatusCode) {
+    let code = status.as_u16();
+    eprintln!("error: RPC failed; HTTP {code} curl 22 The requested URL returned error: {code}");
+}
+
+/// The error a `POST` refused with a `401` is reported with, as the transport expects it.
+fn unauthorized(www_authenticate: Vec<String>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        ErrorResponse {
+            status: 401,
+            content_type: None,
+            body: Vec::new(),
+            www_authenticate,
+        },
+    )
+}
+
+/// Run the credential callback here, on the worker thread, and hand a panic in it to the thread that reads the
+/// response instead of losing it with this one.
+fn call_authenticate(
+    authenticate: &std::sync::Mutex<http::options::AuthenticateFn>,
+    action: gix_credentials::helper::Action,
+) -> std::io::Result<gix_credentials::protocol::Result> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        authenticate.lock().expect("no panics in other threads")(action)
+    }))
+    .map_err(|payload| std::io::Error::other(http::CallbackPanic::new(payload)))
+}
+
+/// `handle_curl_result()`'s answer to a `401` (http.c:1945-1975) for a `POST`, then `http_reauth_prepare(0)`
+/// (http.c:669-683): a request that carried a credential has it rejected, which is `erase` with the challenge of
+/// this refusal, and fails; any other is filled in by `credential_fill(..., all_capabilities=0)`, so the helper is
+/// told of `wwwauth[]` but of no capability.
+///
+/// Returns the `Authorization` value to send the request again with, or `None` if it fails as it is.
+fn unauthorized_post(
+    config: &http::Options,
+    post_auth: &Mutex<PostAuth>,
+    url: &str,
+    had_authorization: bool,
+    www_authenticate: Vec<String>,
+) -> std::io::Result<Option<reqwest::header::HeaderValue>> {
+    let Some((_, authenticate)) = config.authenticate.as_ref() else {
+        return Ok(None);
+    };
+    if had_authorization {
+        let next = post_auth.lock().next.take();
+        if let Some(next) = next {
+            call_authenticate(authenticate, next.with_wwwauth(www_authenticate).erase())?.ok();
+        }
+        return Ok(None);
+    }
+    #[cfg(not(feature = "http-client-insecure-credentials"))]
+    if url.starts_with("http://") {
+        return Ok(None);
+    }
+    let mut get = gix_credentials::helper::Action::get_for_url(url);
+    if let Some(ctx) = get.context_mut() {
+        ctx.wwwauth = www_authenticate.into_iter().map(Into::into).collect();
+    }
+    let outcome = match call_authenticate(authenticate, get)? {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return Ok(None),
+        Err(err) => return Err(std::io::Error::other(err)),
+    };
+    let value = reqwest::header::HeaderValue::try_from(match &outcome.authorization {
+        Some(authorization) => authorization.clone(),
+        None => http::basic_authorization(&outcome.identity.username, &outcome.identity.password),
+    })
+    .map_err(std::io::Error::other)?;
+    let mut auth = post_auth.lock();
+    auth.next = Some(outcome.next);
+    auth.obtained = Some((outcome.identity, outcome.authorization));
+    Ok(Some(value))
+}
+
+/// `credential_approve()` for a credential filled in after a refused `POST`, once the retry went through.
+fn approve_post_credential(config: &http::Options, post_auth: &Mutex<PostAuth>) {
+    let Some((_, authenticate)) = config.authenticate.as_ref() else {
+        return;
+    };
+    let next = post_auth.lock().next.clone();
+    if let Some(next) = next {
+        call_authenticate(authenticate, next.store()).ok();
+    }
+}
+
 fn authority_changed(curr_url: &reqwest::Url, prev_url: &reqwest::Url) -> bool {
     curr_url.scheme() != prev_url.scheme()
         || curr_url.host_str() != prev_url.host_str()
@@ -454,6 +599,8 @@ impl Default for Remote {
         let (res_send, res_recv) = std::sync::mpsc::sync_channel(0);
         let redirected_base_url_shared = Arc::new(Mutex::new(None));
         let redirected_base_url_shared_for_field = redirected_base_url_shared.clone();
+        let post_auth_shared = Arc::new(Mutex::new(PostAuth::default()));
+        let post_auth_shared_for_field = post_auth_shared.clone();
         let handle = std::thread::spawn(move || -> Result<(), Error> {
             let mut follow = None;
             let redirect_action = Arc::new(Mutex::new(RedirectAction::Stop));
@@ -471,7 +618,7 @@ impl Default for Remote {
             // `http.cookieFile` is read once, as curl's cookie engine does, and kept for the session.
             let mut cookies: Option<(PathBuf, http::cookies::Jar)> = None;
 
-            for Request {
+            'requests: for Request {
                 url,
                 base_url,
                 headers,
@@ -512,7 +659,10 @@ impl Default for Remote {
                 } else {
                     client.get(&effective_url)
                 }
-                .headers(headers);
+                .headers(headers.clone());
+                // remote-curl's `rpc->large_request`: the body did not fit into `http.postBuffer` and goes out
+                // chunked, which cannot be sent twice.
+                let mut large_request = false;
                 let (post_body_tx, mut post_body_rx) = pipe::unidirectional(0);
                 let (mut response_body_tx, response_body_rx) = pipe::unidirectional(0);
                 let (mut headers_tx, headers_rx) = pipe::unidirectional(0);
@@ -546,6 +696,7 @@ impl Default for Remote {
                             match post_body_rx.read(&mut probe)? {
                                 0 => req_builder.body(buf),
                                 _ => {
+                                    large_request = true;
                                     buf.extend_from_slice(&probe);
                                     req_builder.body(reqwest::blocking::Body::new(
                                         std::io::Cursor::new(buf).chain(post_body_rx),
@@ -553,7 +704,10 @@ impl Default for Remote {
                                 }
                             }
                         }
-                        None => req_builder.body(reqwest::blocking::Body::new(post_body_rx)),
+                        None => {
+                            large_request = true;
+                            req_builder.body(reqwest::blocking::Body::new(post_body_rx))
+                        }
                     },
                     None => req_builder,
                 };
@@ -597,43 +751,138 @@ impl Default for Remote {
                     *follow = FollowRedirects::None;
                 }
 
-                // `http.maxRetries`, `http.retryAfter` and `http.maxRetryTime`: repeat a request that was
-                // answered with `429 Too Many Requests`, waiting for what the server asks for via
-                // `Retry-After` or, failing that, for `http.retryAfter` seconds. A body that is being
-                // streamed cannot be replayed, so such a request is never retried.
-                let mut retries_left = config.max_retries;
-                let mut pending = Some(req);
+                // The `base_url` the transport authenticates against, which follows an accepted redirect.
+                let auth_url = redirected_base_url.clone().unwrap_or_else(|| base_url.clone());
+
+                // remote-curl.c:943-953, before a request that does not fit into `http.postBuffer`:
+                //
+                // ```c
+                // if (large_request) {
+                //         struct slot_results results;
+                //
+                //         do {
+                //                 err = probe_rpc(rpc, &results);
+                //                 if (err == HTTP_REAUTH)
+                //                         http_reauth_prepare(0);
+                //         } while (err == HTTP_REAUTH);
+                //         if (err != HTTP_OK)
+                //                 return -1;
+                // ```
+                //
+                // A chunked body cannot be rewound for a second attempt, so the `401` is drawn out by a
+                // `0000` request first, and the real one goes out with the credential it led to.
+                if upload_body_kind.is_some() && large_request {
+                    let mut probe_headers = headers.clone();
+                    probe_headers.remove("git-protocol");
+                    let mut filled = false;
+                    let probed = loop {
+                        let probe = match client
+                            .post(&effective_url)
+                            .headers(probe_headers.clone())
+                            .body("0000")
+                            .build()
+                        {
+                            Ok(probe) => probe,
+                            Err(err) => break Err(std::io::Error::other(err)),
+                        };
+                        let res = match client.execute(probe) {
+                            Ok(res) => res,
+                            Err(err) => break Err(std::io::Error::other(err)),
+                        };
+                        if res.status() != reqwest::StatusCode::UNAUTHORIZED {
+                            if res.status().as_u16() >= 300 {
+                                report_rpc_failure(res.status());
+                            }
+                            break match res.error_for_status() {
+                                Ok(_) => {
+                                    // `probe_rpc()` goes through `handle_curl_result()` like any slot, so the
+                                    // credential it went through with is approved right here.
+                                    if filled {
+                                        approve_post_credential(&config, &post_auth_shared);
+                                    }
+                                    Ok(())
+                                }
+                                Err(err) => Err(std::io::Error::other(err)),
+                            };
+                        }
+                        let www_authenticate = www_authenticate(res.headers());
+                        let had_authorization = probe_headers.contains_key(reqwest::header::AUTHORIZATION);
+                        match unauthorized_post(&config, &post_auth_shared, &auth_url, had_authorization, www_authenticate.clone()) {
+                            Ok(Some(authorization)) => {
+                                filled = true;
+                                probe_headers.insert(reqwest::header::AUTHORIZATION, authorization.clone());
+                                req.headers_mut().insert(reqwest::header::AUTHORIZATION, authorization);
+                            }
+                            Ok(None) => {
+                                if had_authorization {
+                                    report_rpc_failure(reqwest::StatusCode::UNAUTHORIZED);
+                                }
+                                break Err(unauthorized(www_authenticate));
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    };
+                    if let Err(err) = probed {
+                        headers_tx.channel.send(Err(err)).ok();
+                        continue;
+                    }
+                }
+
+                // A `401` to a `POST` whose body is in memory is filled in and sent again, remote-curl.c:1070-1074:
+                //
+                // ```c
+                // err = run_slot(slot, NULL);
+                // if (err == HTTP_REAUTH && !large_request) {
+                //         http_reauth_prepare(0);
+                //         curl_slist_free_all(headers);
+                //         goto retry;
+                // }
+                // ```
+                //
+                // and the credential that made it through is approved (`credential_approve()` in
+                // `handle_curl_result()`, http.c:1927-1931).
+                let mut approve_after_success = false;
+                let mut sent_authorization = false;
                 let executed = loop {
-                    let req = pending.take().expect("a request to send in every iteration");
-                    let replay = (retries_left > 0).then(|| req.try_clone()).flatten();
-                    let res = client.execute(req);
-                    let Some(replay) = replay else { break res };
+                    let replay = (upload_body_kind.is_some() && !large_request)
+                        .then(|| req.try_clone())
+                        .flatten();
+                    let had_authorization = req.headers().contains_key(reqwest::header::AUTHORIZATION);
+                    sent_authorization = had_authorization;
+                    let res = execute_retrying_rate_limits(&client, req, &config);
                     let Ok(ref ok) = res else { break res };
-                    if ok.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if ok.status() != reqwest::StatusCode::UNAUTHORIZED || upload_body_kind.is_none() {
                         break res;
                     }
-                    // Only the delta-seconds form of `Retry-After` is understood; the HTTP-date form
-                    // falls back to `http.retryAfter`, as it does with libcurl before 7.66.0.
-                    let delay = ok
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.trim().parse::<u64>().ok())
-                        .unwrap_or(config.retry_after_seconds);
-                    if delay > config.max_retry_time_seconds {
+                    if !had_authorization && replay.is_none() {
                         break res;
                     }
-                    std::thread::sleep(Duration::from_secs(delay));
-                    retries_left -= 1;
-                    pending = Some(replay);
+                    let www_authenticate = www_authenticate(ok.headers());
+                    match unauthorized_post(&config, &post_auth_shared, &auth_url, had_authorization, www_authenticate) {
+                        Ok(Some(authorization)) => {
+                            let mut retry = replay.expect("only a request in memory is filled in and sent again");
+                            retry.headers_mut().insert(reqwest::header::AUTHORIZATION, authorization);
+                            approve_after_success = true;
+                            req = retry;
+                        }
+                        Ok(None) => break res,
+                        Err(err) => {
+                            headers_tx.channel.send(Err(err)).ok();
+                            continue 'requests;
+                        }
+                    }
                 };
+                if approve_after_success && executed.as_ref().is_ok_and(|res| res.status().is_success()) {
+                    approve_post_credential(&config, &post_auth_shared);
+                }
 
                 // remote-curl's `discover_refs()` keeps the body and `Content-Type` of a refused
                 // request and hands them to `show_http_message()` before it dies (remote-curl.c:516-545),
                 // so they are read off an error response here, ahead of `error_for_status()`
                 // consuming it.
-                let (executed, content_type, body) = match executed {
+                let (executed, content_type, body, www) = match executed {
                     Ok(res) if res.status().is_client_error() || res.status().is_server_error() => {
+                        let www = www_authenticate(res.headers());
                         let content_type = res
                             .headers()
                             .get(reqwest::header::CONTENT_TYPE)
@@ -641,12 +890,12 @@ impl Default for Remote {
                         match res.error_for_status_ref().err() {
                             Some(err) => {
                                 let body = res.bytes().map(|b| b.to_vec()).unwrap_or_default();
-                                (Err(err), content_type, body)
+                                (Err(err), content_type, body, www)
                             }
-                            None => (Ok(res), None, Vec::new()),
+                            None => (Ok(res), None, Vec::new(), Vec::new()),
                         }
                     }
-                    other => (other, None, Vec::new()),
+                    other => (other, None, Vec::new(), Vec::new()),
                 };
                 let mut res = match executed.and_then(reqwest::blocking::Response::error_for_status) {
                     Ok(res) => res,
@@ -661,6 +910,15 @@ impl Default for Remote {
                         }
                         let err = match err.status() {
                             Some(status) => {
+                                // `run_slot()` (remote-curl.c:848-876) reports every `POST` that ends neither
+                                // `HTTP_OK` nor `HTTP_REAUTH`, the `401` to a request without a credential; with
+                                // `CURLOPT_FAILONERROR` off, `normalize_curl_result()` makes any status from 300
+                                // up `CURLE_HTTP_RETURNED_ERROR` (http.c:1897-1920).
+                                if upload_body_kind.is_some()
+                                    && (status != reqwest::StatusCode::UNAUTHORIZED || sent_authorization)
+                                {
+                                    report_rpc_failure(status);
+                                }
                                 let kind = if status == reqwest::StatusCode::UNAUTHORIZED {
                                     std::io::ErrorKind::PermissionDenied
                                 } else if status.is_server_error() {
@@ -674,6 +932,7 @@ impl Default for Remote {
                                         status: status.as_u16(),
                                         content_type,
                                         body,
+                                        www_authenticate: www,
                                     },
                                 )
                             }
@@ -765,6 +1024,7 @@ impl Default for Remote {
             response: res_recv,
             config: http::Options::default(),
             redirected_base_url: redirected_base_url_shared_for_field,
+            post_auth: post_auth_shared_for_field,
         }
     }
 }
@@ -896,6 +1156,24 @@ impl http::Http for Remote {
     fn redirected_base_url(&self) -> Option<String> {
         self.redirected_base_url.lock().clone()
     }
+
+    fn set_credential_next(&mut self, next: gix_credentials::helper::NextAction) {
+        self.post_auth.lock().next = Some(next);
+    }
+
+    fn take_obtained_identity(&mut self) -> Option<(gix_sec::identity::Account, Option<String>)> {
+        self.post_auth.lock().obtained.take()
+    }
+}
+
+/// The part of http.c's `http_auth` a `POST` refused with a `401` needs, shared between the transport and
+/// the worker thread, which is where the refusal is seen.
+#[derive(Default)]
+pub(crate) struct PostAuth {
+    /// How to `erase` the credential the requests are signed with (`credential_reject()`).
+    pub next: Option<gix_credentials::helper::NextAction>,
+    /// An identity the worker filled in itself after a `401`, for the transport to sign later requests with.
+    pub obtained: Option<(gix_sec::identity::Account, Option<String>)>,
 }
 
 pub(crate) struct Request {

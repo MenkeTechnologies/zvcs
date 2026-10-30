@@ -39,3 +39,19 @@ pub(crate) fn capabilities_v2_line<T>(read: std::io::Result<T>) -> Result<T, Err
         _ => Error::Io(err),
     })
 }
+
+/// The `WWW-Authenticate` values of the HTTP response `err` reports, in order, or nothing when `err` is not an
+/// HTTP error response.
+///
+/// http.c's `fwrite_wwwauth()` (http.c:220-317) keeps them for the credential helper's `wwwauth[]` lines.
+pub fn www_authenticate(err: &std::io::Error) -> Vec<String> {
+    #[cfg(feature = "http-client")]
+    if let Some(response) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<blocking_io::http::ErrorResponse>())
+    {
+        return response.www_authenticate.clone();
+    }
+    let _ = err;
+    Vec::new()
+}

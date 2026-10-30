@@ -5,11 +5,19 @@ use crate::protocol::context::Error;
 mod write {
     use bstr::{BStr, BString};
 
-    use crate::protocol::{Context, ContextOptions, context::serde::validate};
+    use crate::protocol::{Context, ContextOptions, CredentialOp, context::serde::validate};
 
     impl Context {
         /// Write ourselves to `out` such that [`from_bytes()`][Self::from_bytes()] can decode it losslessly.
-        pub fn write_to(&self, mut out: impl std::io::Write) -> std::io::Result<()> {
+        ///
+        /// This is the form a `get` is handed to a helper in, [`CredentialOp::Helper`].
+        pub fn write_to(&self, out: impl std::io::Write) -> std::io::Result<()> {
+            self.write_to_op(out, CredentialOp::Helper)
+        }
+
+        /// `credential_write()` (credential.c:409-442): write ourselves to `out` as the `op` side of the
+        /// exchange, which decides whether the `capability[]` announcements and the fields they govern go along.
+        pub fn write_to_op(&self, mut out: impl std::io::Write, op: CredentialOp) -> std::io::Result<()> {
             use bstr::ByteSlice;
             fn write_key(out: &mut impl std::io::Write, key: &str, value: &BStr) -> std::io::Result<()> {
                 out.write_all(key.as_bytes())?;
@@ -30,7 +38,53 @@ mod write {
                 // We only decode quit and interpret it, but won't get to pass it on as it means to stop the
                 // credential helper invocation chain.
                 quit: _,
+                capa_authtype,
+                capa_state,
+                authtype,
+                credential,
+                ephemeral,
+                wwwauth,
+                state: _,
+                state_to_send,
+                multistage,
             } = self;
+            let protect_protocol = *protect_protocol;
+            let item = |out: &mut dyn std::io::Write, key: &str, value: &BStr| -> std::io::Result<()> {
+                validate(key, value, protect_protocol).map_err(std::io::Error::other)?;
+                out.write_all(key.as_bytes())?;
+                out.write_all(b"=")?;
+                out.write_all(value)?;
+                out.write_all(b"\n")
+            };
+            // ```c
+            // if (credential_has_capability(&c->capa_authtype, op_type))
+            //         credential_write_item(c, fp, "capability[]", "authtype", 0);
+            // if (credential_has_capability(&c->capa_state, op_type))
+            //         credential_write_item(c, fp, "capability[]", "state", 0);
+            //
+            // if (credential_has_capability(&c->capa_authtype, op_type)) {
+            //         credential_write_item(c, fp, "authtype", c->authtype, 0);
+            //         credential_write_item(c, fp, "credential", c->credential, 0);
+            //         if (c->ephemeral)
+            //                 credential_write_item(c, fp, "ephemeral", "1", 0);
+            // }
+            // ```
+            if capa_authtype.has(op) {
+                item(&mut out, "capability[]", "authtype".into())?;
+            }
+            if capa_state.has(op) {
+                item(&mut out, "capability[]", "state".into())?;
+            }
+            if capa_authtype.has(op) {
+                for (key, value) in [("authtype", authtype), ("credential", credential)] {
+                    if let Some(value) = value {
+                        item(&mut out, key, value.as_bytes().as_bstr())?;
+                    }
+                }
+                if *ephemeral {
+                    item(&mut out, "ephemeral", "1".into())?;
+                }
+            }
             // `url` has no counterpart in `credential_write()` — git splits a `url=`
             // it *reads* into the fields below and never writes one back — so it
             // stays first, where a helper reading it the way `credential_read()`
@@ -38,7 +92,7 @@ mod write {
             // overwritten by the explicit fields that follow.
             for (key, value) in [("url", url)] {
                 if let Some(value) = value {
-                    validate(key, value.as_slice().into(), *protect_protocol).map_err(std::io::Error::other)?;
+                    validate(key, value.as_slice().into(), protect_protocol).map_err(std::io::Error::other)?;
                     write_key(&mut out, key, value.as_ref()).ok();
                 }
             }
@@ -56,12 +110,12 @@ mod write {
             // scripts take — reports the difference, so the order is observable.
             for (key, value) in [("protocol", protocol), ("host", host)] {
                 if let Some(value) = value {
-                    validate(key, value.as_str().into(), *protect_protocol).map_err(std::io::Error::other)?;
+                    validate(key, value.as_str().into(), protect_protocol).map_err(std::io::Error::other)?;
                     write_key(&mut out, key, value.as_bytes().as_bstr()).ok();
                 }
             }
             if let Some(value) = path {
-                validate("path", value.as_slice().into(), *protect_protocol).map_err(std::io::Error::other)?;
+                validate("path", value.as_slice().into(), protect_protocol).map_err(std::io::Error::other)?;
                 write_key(&mut out, "path", value.as_ref()).ok();
             }
             for (key, value) in [
@@ -70,15 +124,36 @@ mod write {
                 ("oauth_refresh_token", oauth_refresh_token),
             ] {
                 if let Some(value) = value {
-                    validate(key, value.as_str().into(), *protect_protocol).map_err(std::io::Error::other)?;
+                    validate(key, value.as_str().into(), protect_protocol).map_err(std::io::Error::other)?;
                     write_key(&mut out, key, value.as_bytes().as_bstr()).ok();
                 }
             }
             if let Some(value) = password_expiry_utc {
                 let key = "password_expiry_utc";
                 let value = value.to_string();
-                validate(key, value.as_str().into(), *protect_protocol).map_err(std::io::Error::other)?;
+                validate(key, value.as_str().into(), protect_protocol).map_err(std::io::Error::other)?;
                 write_key(&mut out, key, value.as_bytes().as_bstr()).ok();
+            }
+            // ```c
+            // for (size_t i = 0; i < c->wwwauth_headers.nr; i++)
+            //         credential_write_item(c, fp, "wwwauth[]", c->wwwauth_headers.v[i], 0);
+            // if (credential_has_capability(&c->capa_state, op_type)) {
+            //         if (c->multistage)
+            //                 credential_write_item(c, fp, "continue", "1", 0);
+            //         for (size_t i = 0; i < c->state_headers_to_send.nr; i++)
+            //                 credential_write_item(c, fp, "state[]", c->state_headers_to_send.v[i], 0);
+            // }
+            // ```
+            for value in wwwauth {
+                item(&mut out, "wwwauth[]", value.as_ref())?;
+            }
+            if capa_state.has(op) {
+                if *multistage {
+                    item(&mut out, "continue", "1".into())?;
+                }
+                for value in state_to_send {
+                    item(&mut out, "state[]", value.as_ref())?;
+                }
             }
             Ok(())
         }
@@ -96,7 +171,7 @@ mod write {
 pub mod decode {
     use bstr::{BString, ByteSlice};
 
-    use crate::protocol::{Context, ContextOptions, context, context::serde::validate};
+    use crate::protocol::{Context, ContextOptions, CredentialOp, context, context::serde::validate};
 
     /// The error returned by [`from_bytes()`][Context::from_bytes()].
     #[derive(Debug, thiserror::Error)]
@@ -144,6 +219,17 @@ pub mod decode {
             input: &[u8],
             options: ContextOptions,
         ) -> Result<(Self, Option<BString>), Error> {
+            Self::from_bytes_until_invalid_op(input, options, CredentialOp::Helper)
+        }
+
+        /// Like [`from_bytes_until_invalid()`][Self::from_bytes_until_invalid()], reading `input` as the `op` side
+        /// of the exchange: a `capability[]` line is recorded as announced by that side (`credential_read()`'s
+        /// `credential_set_capability(..., op_type)`, credential.c:368-372).
+        pub fn from_bytes_until_invalid_op(
+            input: &[u8],
+            options: ContextOptions,
+            op: CredentialOp,
+        ) -> Result<(Self, Option<BString>), Error> {
             let mut ctx = Context {
                 options,
                 ..Context::default()
@@ -159,6 +245,15 @@ pub mod decode {
                 password_expiry_utc,
                 url,
                 quit,
+                capa_authtype,
+                capa_state,
+                authtype,
+                credential,
+                ephemeral,
+                wwwauth,
+                state,
+                state_to_send: _,
+                multistage,
             } = &mut ctx;
             let mut invalid: Option<BString> = None;
             for line in input.lines().take_while(|line| !line.is_empty()) {
@@ -202,6 +297,27 @@ pub mod decode {
                             .ok()
                             .map(Into::into);
                     }
+                    "authtype" | "credential" => {
+                        if !value.is_utf8() {
+                            return Err(Error::IllformedUtf8InValue { key: key.into(), value });
+                        }
+                        *if key == "authtype" { &mut *authtype } else { &mut *credential } = Some(value.to_string());
+                    }
+                    // `c->ephemeral = !!git_config_bool("ephemeral", value);` and the same for `continue`
+                    // (credential.c:362-385).
+                    "ephemeral" | "continue" => {
+                        let on = gix_config_value::Boolean::try_from(value.as_bstr())
+                            .ok()
+                            .is_some_and(|b| b.0);
+                        *if key == "ephemeral" { &mut *ephemeral } else { &mut *multistage } = on;
+                    }
+                    "wwwauth[]" => wwwauth.push(value),
+                    "state[]" => state.push(value),
+                    "capability[]" => match value.as_bytes() {
+                        b"authtype" => capa_authtype.set(op),
+                        b"state" => capa_state.set(op),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }

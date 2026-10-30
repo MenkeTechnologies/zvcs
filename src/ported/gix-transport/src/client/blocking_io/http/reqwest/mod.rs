@@ -10,6 +10,8 @@ pub struct Remote {
     config: crate::client::blocking_io::http::Options,
     /// The effective base URL after an accepted redirect.
     redirected_base_url: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+    /// What the worker thread knows of the credential in use, to retry a `POST` refused with a `401`.
+    post_auth: std::sync::Arc<parking_lot::Mutex<remote::PostAuth>>,
 }
 
 /// A function to configure a single request prior to sending it, support most complex configuration beyond what's possible with

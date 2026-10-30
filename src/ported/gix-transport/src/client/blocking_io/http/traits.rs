@@ -96,6 +96,9 @@ pub struct ErrorResponse {
     pub content_type: Option<String>,
     /// The response body.
     pub body: Vec<u8>,
+    /// The value of every `WWW-Authenticate` header of the response, in order, which is what http.c's
+    /// `fwrite_wwwauth()` (http.c:220-317) collects into `http_auth.wwwauth_headers` for the credential helper.
+    pub www_authenticate: Vec<String>,
 }
 
 impl std::fmt::Display for ErrorResponse {
@@ -156,6 +159,19 @@ pub trait Http {
 
     /// Return the effective base URL after a backend accepted a redirect, if available.
     fn redirected_base_url(&self) -> Option<String> {
+        None
+    }
+
+    /// Tell the backend how to `erase` the credential the transport signs its requests with, should a `POST`
+    /// carrying it be refused with a `401` (http.c's `credential_reject()` in `handle_curl_result()`, :1945-1955).
+    /// That credential has been stored already.
+    fn set_credential_next(&mut self, _next: gix_credentials::helper::NextAction) {}
+
+    /// The identity the backend obtained by itself, because a `POST` was answered with a `401` and retried
+    /// (remote-curl.c's `post_rpc()`, :1070-1074), for the transport to sign the requests that follow with.
+    /// It comes with the `Authorization` value to send in its place when the helper answered with an `authtype` and
+    /// a `credential`.
+    fn take_obtained_identity(&mut self) -> Option<(gix_sec::identity::Account, Option<String>)> {
         None
     }
 }

@@ -40,10 +40,33 @@ mod access {
                 password_expiry_utc: _,
                 url: _,
                 quit: _,
+                capa_authtype: _,
+                capa_state: _,
+                authtype: _,
+                credential,
+                ephemeral: _,
+                wwwauth: _,
+                state: _,
+                state_to_send: _,
+                multistage: _,
             } = self;
 
             *password = None;
             *oauth_refresh_token = None;
+            // `credential_clear_secrets()` (credential.c:48-52) forgets the pre-encoded credential too.
+            *credential = None;
+        }
+
+        /// `credential_next_state()` (credential.c:42-46): what the last helper answered with in `state[]` becomes
+        /// what the next invocation sends, and nothing is left to answer with yet.
+        pub fn next_state(&mut self) {
+            self.state_to_send = std::mem::take(&mut self.state);
+        }
+
+        /// `credential_set_all_capabilities()` (credential.c:72-77).
+        pub fn set_all_capabilities(&mut self, op: crate::protocol::CredentialOp) {
+            self.capa_authtype.set(op);
+            self.capa_state.set(op);
         }
         /// Replace existing secrets with the word `<redacted>`.
         pub fn redacted(mut self) -> Self {
@@ -58,8 +81,17 @@ mod access {
                 password_expiry_utc: _,
                 url: _,
                 quit: _,
+                capa_authtype: _,
+                capa_state: _,
+                authtype: _,
+                credential,
+                ephemeral: _,
+                wwwauth: _,
+                state: _,
+                state_to_send: _,
+                multistage: _,
             } = &mut self;
-            for secret in [password, oauth_refresh_token].into_iter().flatten() {
+            for secret in [password, oauth_refresh_token, credential].into_iter().flatten() {
                 *secret = "<redacted>".into();
             }
             self

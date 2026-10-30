@@ -9,6 +9,9 @@ pub struct Outcome {
     pub identity: gix_sec::identity::Account,
     /// A handle to the action to perform next in another call to [`helper::invoke()`][crate::helper::invoke()].
     pub next: helper::NextAction,
+    /// `<authtype> <credential>`, the value of the `Authorization` header to send instead of one built from the
+    /// identity, when the helper answered with both (http.c's `http_append_auth_header()`, :625-636).
+    pub authorization: Option<String>,
 }
 
 /// The Result type used in credentials top-level functions to obtain a complete identity.
@@ -65,6 +68,72 @@ pub struct Context {
     pub url: Option<BString>,
     /// If true, the caller should stop asking for credentials immediately without calling more credential helpers in the chain.
     pub quit: Option<bool>,
+    /// `capability[]=authtype`, credential.h's `capa_authtype`: whether the caller and the helper said they
+    /// understand `authtype` and `credential`.
+    pub capa_authtype: Capability,
+    /// `capability[]=state`, credential.h's `capa_state`: whether the caller and the helper said they
+    /// understand `state[]` and `continue`.
+    pub capa_state: Capability,
+    /// The authentication scheme `credential` is for, such as `Bearer` (credential.h's `authtype`).
+    pub authtype: Option<String>,
+    /// A pre-encoded credential sent as `Authorization: <authtype> <credential>`. It is as secret as a password.
+    pub credential: Option<String>,
+    /// `ephemeral=1`: the credential is not to be stored.
+    pub ephemeral: bool,
+    /// One `WWW-Authenticate` header value of the server's last response per entry, in order
+    /// (credential.h's `wwwauth_headers`, written as `wwwauth[]`).
+    pub wwwauth: Vec<BString>,
+    /// The `state[]` lines the last helper answered with (credential.h's `state_headers`).
+    pub state: Vec<BString>,
+    /// The `state[]` lines to hand to the next helper invocation (credential.h's `state_headers_to_send`),
+    /// filled from [`state`][Self::state] by [`next_state()`][Self::next_state()].
+    pub state_to_send: Vec<BString>,
+    /// `continue=1`: the helper takes part in a multi-stage exchange (credential.h's `multistage`).
+    pub multistage: bool,
+}
+
+/// Which side of the credential protocol a [`Context`] is read from or written to, credential.h's
+/// `enum credential_op_type`. It decides which `capability[]` announcements apply.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CredentialOp {
+    /// `CREDENTIAL_OP_INITIAL`: what the caller of `git credential` (or the transport) asked for.
+    Initial,
+    /// `CREDENTIAL_OP_HELPER`: a `get` written to a helper, or a helper's answer read back.
+    Helper,
+    /// `CREDENTIAL_OP_RESPONSE`: a `store`/`erase` written to a helper, or the answer written to the caller.
+    Response,
+}
+
+/// One capability's state along the chain, credential.h's `struct credential_capability`.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct Capability {
+    /// The caller announced it.
+    pub request_initial: bool,
+    /// A helper announced it in its answer.
+    pub request_helper: bool,
+    /// The answer to the caller announced it.
+    pub response: bool,
+}
+
+impl Capability {
+    /// `credential_set_capability()` (credential.c:56-69).
+    pub fn set(&mut self, op: CredentialOp) {
+        match op {
+            CredentialOp::Initial => self.request_initial = true,
+            CredentialOp::Helper => self.request_helper = true,
+            CredentialOp::Response => self.response = true,
+        }
+    }
+
+    /// `credential_has_capability()` (credential.c:296-310): pass a capability along only if every step before
+    /// `op` had it.
+    pub fn has(&self, op: CredentialOp) -> bool {
+        match op {
+            CredentialOp::Helper => self.request_initial,
+            CredentialOp::Response => self.request_initial && self.request_helper,
+            CredentialOp::Initial => false,
+        }
+    }
 }
 
 /// Options for encoding and decoding a [`Context`].
@@ -92,19 +161,38 @@ pub fn helper_outcome_to_result(outcome: Option<helper::Outcome>, action: helper
         (helper::Action::Get(ctx), None) => Err(Error::IdentityMissing {
             context: ctx.redacted(),
         }),
-        (helper::Action::Get(ctx), Some(mut outcome)) => match outcome.consume_identity() {
-            Some(identity) => Ok(Some(Outcome {
-                identity,
-                next: outcome.next,
-            })),
-            None => Err(if outcome.quit {
-                Error::Quit
-            } else {
-                Error::IdentityMissing {
-                    context: ctx.redacted(),
-                }
-            }),
-        },
+        (helper::Action::Get(ctx), Some(mut outcome)) => {
+            let authorization = ctx
+                .authtype
+                .as_ref()
+                .zip(ctx.credential.as_ref())
+                .map(|(authtype, credential)| format!("{authtype} {credential}"));
+            match outcome.consume_identity() {
+                Some(identity) => Ok(Some(Outcome {
+                    identity,
+                    next: outcome.next,
+                    authorization,
+                })),
+                // `credential_fill()` is done once a helper produced a `credential` (credential.c:533-536); the
+                // request is then signed with it alone.
+                None if authorization.is_some() && !outcome.quit => Ok(Some(Outcome {
+                    identity: gix_sec::identity::Account {
+                        username: ctx.username.clone().unwrap_or_default(),
+                        password: String::new(),
+                        oauth_refresh_token: None,
+                    },
+                    next: outcome.next,
+                    authorization,
+                })),
+                None => Err(if outcome.quit {
+                    Error::Quit
+                } else {
+                    Error::IdentityMissing {
+                        context: ctx.redacted(),
+                    }
+                }),
+            }
+        }
         (helper::Action::Store(_) | helper::Action::Erase(_), _ignore) => Ok(None),
     }
 }

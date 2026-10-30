@@ -3988,7 +3988,8 @@ pub(crate) fn bitmap_file(
 ///
 /// `pack_order` is the object ids in bit order, `kinds` is indexed the same way,
 /// `name_hashes` and `index_position` address the entry-header order, and
-/// `commits` is the candidate list newest-first.
+/// `commits` is the candidate list in the order git's `indexed_commits` holds it,
+/// which is sorted here the way `bitmap_writer_select_commits()` sorts it.
 #[expect(clippy::too_many_arguments)]
 pub(crate) fn build_bitmap(
     repo: &gix::Repository,
@@ -4015,14 +4016,32 @@ pub(crate) fn build_bitmap(
         .map(|(at, id)| (*id, at as u32))
         .collect();
 
-    let selected_ids = select_commits(commits);
+    // `QSORT(indexed_commits, indexed_commits_nr, date_compare)` opens
+    // `bitmap_writer_select_commits()` (pack-bitmap-write.c:1045-1051).
+    let commit_dates: Vec<i64> = commits.iter().map(|(_, date, _, _)| *date).collect();
+    let indexed: Vec<(ObjectId, i64, bool, bool)> = qsort_by_date(&commit_dates, DateOrder::NewestFirst)
+        .into_iter()
+        .map(|at| commits[at])
+        .collect();
+    let selected_ids = select_commits(&indexed);
 
-    // Ascending date, so that walking a commit is most likely to run into an
-    // ancestor whose bitmap has already been computed.
-    let mut order: Vec<ObjectId> = selected_ids.clone();
+    // `compute_xor_offsets()` puts the selected commits in ascending date order
+    // with `QSORT(writer->selected, nr, bitmapped_commit_date_cmp)`
+    // (pack-bitmap-write.c:344-353), the order the entries are written in; and
+    // walking oldest first is also most likely to run into an ancestor whose
+    // bitmap has already been computed. `bitmap::write` sorts by date again,
+    // stably, which leaves this order as it is.
     let dates: std::collections::HashMap<ObjectId, i64> =
         commits.iter().map(|(id, date, _, _)| (*id, *date)).collect();
-    order.sort_by_key(|id| dates.get(id).copied().unwrap_or(0));
+    let selected_dates: Vec<i64> = selected_ids.iter().map(|id| dates.get(id).copied().unwrap_or(0)).collect();
+    let order: Vec<ObjectId> = if selected_ids.len() > 1 {
+        qsort_by_date(&selected_dates, DateOrder::OldestFirst)
+            .into_iter()
+            .map(|at| selected_ids[at])
+            .collect()
+    } else {
+        selected_ids.clone()
+    };
 
     let words = pack_order.len().div_ceil(64);
     let mut computed: std::collections::HashMap<ObjectId, Vec<u64>> = std::collections::HashMap::new();
@@ -4327,6 +4346,74 @@ pub(crate) fn preferred_tip_commits(repo: &gix::Repository, prefixes: &[String])
         }
     }
     out
+}
+
+/// Which of the two date comparators [`qsort_by_date`] runs.
+#[derive(Clone, Copy)]
+enum DateOrder {
+    /// `date_compare()` (pack-bitmap-write.c:1038-1043).
+    NewestFirst,
+    /// `bitmapped_commit_date_cmp()` (pack-bitmap-write.c:332-342).
+    OldestFirst,
+}
+
+/// `QSORT(..., date_compare)` or `QSORT(..., bitmapped_commit_date_cmp)` over
+/// commits with these dates, run through the `qsort` git runs it through; the
+/// answer is the permutation, as indices into `dates`.
+///
+/// `QSORT` is `sane_qsort()` -> libc `qsort` (git-compat-util.h), which is not
+/// stable, and commits sharing a committer date tie under both comparators, so
+/// the order libc leaves them in is the order the bitmap entries are written
+/// in. Only the date travels into the C, as it is the only field either
+/// comparator reads.
+fn qsort_by_date(dates: &[i64], order: DateOrder) -> Vec<usize> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Key {
+        date: i64,
+        ix: usize,
+    }
+
+    /// ```c
+    /// return (long)b->date - (long)a->date;
+    /// ```
+    ///
+    /// The difference is truncated to the comparator's `int`.
+    unsafe extern "C" fn newest_first(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+        // SAFETY: `qsort` only hands back pointers into the `Key` array below.
+        let (a, b) = unsafe { (&*a.cast::<Key>(), &*b.cast::<Key>()) };
+        b.date.wrapping_sub(a.date) as libc::c_int
+    }
+
+    unsafe extern "C" fn oldest_first(a: *const libc::c_void, b: *const libc::c_void) -> libc::c_int {
+        // SAFETY: as above.
+        let (a, b) = unsafe { (&*a.cast::<Key>(), &*b.cast::<Key>()) };
+        match a.date.cmp(&b.date) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Greater => 1,
+            std::cmp::Ordering::Equal => 0,
+        }
+    }
+
+    let mut keys: Vec<Key> = dates.iter().enumerate().map(|(ix, &date)| Key { date, ix }).collect();
+    // `sane_qsort()` skips the call for fewer than two elements.
+    if keys.len() > 1 {
+        let cmp = match order {
+            DateOrder::NewestFirst => newest_first,
+            DateOrder::OldestFirst => oldest_first,
+        };
+        // SAFETY: `keys` is a live, initialised slice of `Key`; the length and
+        // element size describe it exactly, and `cmp` only reads two `Key`s.
+        unsafe {
+            libc::qsort(
+                keys.as_mut_ptr().cast::<libc::c_void>(),
+                keys.len(),
+                std::mem::size_of::<Key>(),
+                Some(cmp),
+            );
+        }
+    }
+    keys.into_iter().map(|k| k.ix).collect()
 }
 
 /// git's `bitmap_writer_select_commits()`: take every commit when there are few
@@ -4984,6 +5071,41 @@ fn rev_list_objects(
 /// names commits that have since been pruned, and git's `parse_object()` gives it
 /// a NULL it skips.
 pub(crate) fn traverse_commit_list(repo: &gix::Repository, pending: Vec<ObjectId>) -> Vec<ObjectId> {
+    let CommitWalk {
+        commits: mut out,
+        objects,
+        mut seen,
+    } = walk_commits(repo, pending);
+    // Phase 2: `traverse_trees_and_blobs()`. `objects` grows only in phase 1, so
+    // the index walk is over a fixed list; subtrees are expanded in place.
+    for id in objects {
+        expand_tree(repo, id, &mut seen, &mut out);
+    }
+    out
+}
+
+/// The commits [`traverse_commit_list`] shows, in the order it shows them, from
+/// `pending` taken in the order given: its phase 1 without the trees and blobs.
+/// `find_commits_for_midx_bitmap()` (midx-write.c:836-878) runs this walk with a
+/// callback that only looks at commits.
+pub(crate) fn traversal_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> Vec<ObjectId> {
+    walk_commits(repo, pending).commits
+}
+
+/// What phase 1 of [`traverse_commit_list`] leaves behind.
+struct CommitWalk {
+    /// The commits, in the order `show_commit()` sees them.
+    commits: Vec<ObjectId>,
+    /// `pending` after `prepare_revision_walk()` and the commit loop: the tags,
+    /// trees and blobs named directly, then each shown commit's tree.
+    objects: Vec<ObjectId>,
+    /// Every id listed so far, which phase 2 keeps adding to.
+    seen: HashSet<ObjectId>,
+}
+
+/// Phase 1 of [`traverse_commit_list`]: `prepare_revision_walk()` and the commit
+/// loop of `do_traverse()`.
+fn walk_commits(repo: &gix::Repository, pending: Vec<ObjectId>) -> CommitWalk {
     use gix::object::Kind;
 
     let mut seen: HashSet<ObjectId> = HashSet::new();
@@ -5063,13 +5185,11 @@ pub(crate) fn traverse_commit_list(repo: &gix::Repository, pending: Vec<ObjectId
             queue.insert(pos, (parent, date));
         }
     }
-
-    // Phase 2: `traverse_trees_and_blobs()`. `objects` grows only in phase 1, so
-    // the index walk is over a fixed list; subtrees are expanded in place.
-    for id in objects {
-        expand_tree(repo, id, &mut seen, &mut out);
+    CommitWalk {
+        commits: out,
+        objects,
+        seen,
     }
-    out
 }
 
 /// `process_tree()`/`process_blob()`: show `id`, and when it is a tree descend

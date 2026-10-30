@@ -9,9 +9,9 @@
 //! so `:(optional)` naming no file and an empty value both mean no snapshot.
 //!
 //! Both binaries run on byte-identical copies of one stock-built repository, and the
-//! `multi-pack-index*` files they leave are compared byte for byte. The fixture stays
-//! under 64 objects: above that the two bitmap writers' EWAH XOR encodings differ, which
-//! is independent of the snapshot.
+//! `multi-pack-index*` files they leave are compared byte for byte. Histories with tied
+//! dates and bitmaps longer than one EWAH word are covered by
+//! `multi_pack_index_parity_bitmap_order.rs`.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};

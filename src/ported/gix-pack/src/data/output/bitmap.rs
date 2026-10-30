@@ -150,15 +150,21 @@ pub fn write(
     if selected.len() > 1 {
         selected.sort_by_key(|commit| commit.date);
     }
+    // `stored->bitmap` is `bitmap_to_ewah()` of each reachability bitmap, and
+    // each candidate is `ewah_xor(writer->selected[curr].bitmap, stored->bitmap,
+    // test_xor)` on those compressed streams (pack-bitmap-write.c:368-395).
+    let stored: Vec<ewah::Builder> = selected
+        .iter()
+        .map(|commit| ewah::Builder::from_bitmap_words(&commit.reachable))
+        .collect();
     let mut write_as: Vec<ewah::Builder> = Vec::with_capacity(selected.len());
     let mut xor_offsets: Vec<u8> = Vec::with_capacity(selected.len());
     for at in 0..selected.len() {
-        let mut best = ewah::Builder::from_bitmap_words(&selected[at].reachable);
+        let mut best = stored[at].clone();
         let mut best_offset = 0usize;
         for back in 1..=MAX_XOR_OFFSET_SEARCH {
             let Some(base) = at.checked_sub(back) else { break };
-            let candidate =
-                ewah::write::xor_of_bitmap_words(&selected[base].reachable, &selected[at].reachable);
+            let candidate = ewah::write::xor(&stored[base], &stored[at]);
             if candidate.word_count() < best.word_count() {
                 best = candidate;
                 best_offset = back;

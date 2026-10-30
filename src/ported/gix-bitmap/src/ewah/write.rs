@@ -382,12 +382,14 @@ fn bits_for(words: &[u64]) -> usize {
     }
 }
 
-/// git's `ewah_xor()`, computed on the plain word form the two bitmaps were
-/// built from rather than on their compressed streams.
+/// The XOR of two plain bitmaps, re-encoded with
+/// [`Builder::from_bitmap_words`] rather than run on the compressed streams as
+/// git's `ewah_xor()` is (that is [`xor`]).
 ///
 /// Word for word the result is the same, since XOR distributes over the
 /// encoding; what differs is that git's version can leave trailing all-zero
-/// words in the output where this drops them. Both decode to the same set of
+/// words in the output where this drops them, so a writer that has to match
+/// git's bytes uses [`xor`]. Both decode to the same set of
 /// bits, and the bit count is git's `max(bit_size)` either way, so a reader
 /// XOR-ing this back against `a` recovers `b` exactly.
 pub fn xor_of_bitmap_words(a: &[u64], b: &[u64]) -> Builder {

@@ -972,26 +972,25 @@ fn write_midx_bitmap(
             super::pack_objects::preferred_tip_commits(repo, &options.preferred_tips)
         }
     };
-    tips.sort_unstable();
-    tips.dedup();
+    // `traverse_commit_list(&revs, bitmap_show_commit, NULL, &cb)`: the pending
+    // set in the order it was added — the snapshot's line order, or the ref
+    // order — through `prepare_revision_walk()`'s date queue, whose ties keep
+    // that order (midx-write.c:848-874). `bitmap_show_commit()` pushes each
+    // commit the MIDX holds, in the order shown, and that order is what the
+    // `QSORT`s in `bitmap_writer_select_commits()` and `compute_xor_offsets()`
+    // start from, so it decides where commits sharing a date are written.
     let mut commits: Vec<(gix::ObjectId, i64, bool, bool)> = Vec::new();
-    if let Ok(walk) = repo.rev_walk(tips).all() {
-        for info in walk.flatten() {
-            let id = info.id;
-            if !index_position.contains_key(&id) {
-                continue;
-            }
-            let Ok(commit) = repo.find_commit(id) else {
-                continue;
-            };
-            let date = commit.time().map(|time| time.seconds).unwrap_or(0);
-            let merge = commit.parent_ids().count() > 1;
-            commits.push((id, date, merge, preferred_tips.contains(&id)));
+    for id in super::pack_objects::traversal_commits(repo, tips) {
+        if !index_position.contains_key(&id) {
+            continue;
         }
+        let Ok(commit) = repo.find_commit(id) else {
+            continue;
+        };
+        let date = commit.time().map(|time| time.seconds).unwrap_or(0);
+        let merge = commit.parent_ids().count() > 1;
+        commits.push((id, date, merge, preferred_tips.contains(&id)));
     }
-    // `prepare_revision_walk()` hands the traversal a date-ordered queue, so the
-    // list `bitmap_writer_select_commits()` walks is newest first.
-    commits.sort_by(|a, b| b.1.cmp(&a.1));
 
     // `bitmap_writer_build_type_index()` reads each object's type out of the
     // `object_entry`, which for a MIDX carries none — `packlist_alloc()` leaves

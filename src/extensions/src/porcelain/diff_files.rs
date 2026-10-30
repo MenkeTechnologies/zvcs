@@ -668,7 +668,9 @@ struct CombinedPath {
     path: BString,
     /// `parent[0]` = stage #2, `parent[1]` = stage #3: their staged blob and mode.
     parents: [(ObjectId, u32); 2],
-    /// The result mode, i.e. the worktree file's mode (`0` when it is gone).
+    /// `dpath->mode`: `ce_mode_from_stat()` of the worktree file (`0` when it is
+    /// gone), which `show_raw_diff()` prints. The patch header takes the mode
+    /// `show_patch_diff()`'s own read gives instead (combine-diff.c:1041-1117).
     wt_mode: u32,
 }
 
@@ -2430,9 +2432,30 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             }
             separator = true;
         } else if opts.fmt & F_PATCH != 0 {
+            // `show_patch_diff()` reads each result from the worktree
+            // (combine-diff.c:1041-1117) through the reader `git diff` shares: a
+            // symlink is its target, a directory its gitlink's `HEAD`, a file its
+            // `convert_to_git()` image.
+            let items: Vec<_> = combined
+                .iter()
+                .map(|c| {
+                    let wt = (c.wt_mode != 0).then(|| kind_of(c.wt_mode));
+                    let stages = c.parents.map(|(id, m)| (id, kind_of(m)));
+                    (c.path.clone(), wt, stages)
+                })
+                .collect();
+            let (results, died) = super::diff::worktree_combined_results(repo, &workdir, &items, opts.allow_textconv)?;
+            let shown = died.as_ref().map_or(combined.len(), |(at, _)| *at);
             let mut combined_patch: Vec<u8> = Vec::new();
-            for c in &combined {
-                render_combined_patch(&mut combined_patch, repo, c, &opts, &workdir)?;
+            for (c, result) in combined.iter().zip(&results).take(shown) {
+                render_combined_patch(&mut combined_patch, repo, c, result, &opts)?;
+            }
+            // `convert_to_git()` died inside the index scan: the sections ahead of
+            // that path were already printed, and the queue is never flushed.
+            if let Some((_, die)) = died {
+                let painted = super::diff::colorize_combined(combined_patch, &colors, &opts.line_prefix, 2);
+                std::io::stdout().lock().write_all(&painted)?;
+                return Err(die);
             }
             // `show_combined_diff()` prints the sections itself, in `dump_sline()`'s
             // own palette (combine-diff.c:752-873), and never through the emitter, so
@@ -5369,18 +5392,6 @@ fn append_lost(sline: &mut Sline, line: &[u8], mask: u64) {
     });
 }
 
-/// Read one parent's blob for the combined diff, mirroring `grab_blob()`: a
-/// gitlink becomes a `Subproject commit` stub and a null id an empty buffer.
-fn read_parent_blob(repo: &gix::Repository, id: &ObjectId, mode: u32) -> Result<Vec<u8>> {
-    if mode == 0o160000 {
-        return Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes());
-    }
-    if id.is_null() {
-        return Ok(Vec::new());
-    }
-    Ok(repo.find_object(*id)?.data.clone())
-}
-
 /// `buffer_is_binary()`: a NUL byte within the first 8000 bytes.
 fn buffer_is_binary(buf: &[u8]) -> bool {
     let n = buf.len().min(8000);
@@ -5824,8 +5835,10 @@ fn dump_sline(
     }
 }
 
-/// `repo_find_unique_abbrev()` for a combined header id: the shortest unique
-/// prefix, but at least `min` characters, and exactly `min` zeros for the null id.
+/// `repo_find_unique_abbrev()` for a combined header id (combine-diff.c:944-953):
+/// the shortest unique prefix, but at least `min` characters, and exactly `min`
+/// zeros for the null id. A gitlink's commit, which this object database does not
+/// hold, stays at `min` (object-name.c:889-935).
 fn header_hex(repo: &gix::Repository, id: &ObjectId, min: Option<usize>) -> String {
     let Some(min) = min else {
         return id.to_hex().to_string(); // --full-index
@@ -5833,8 +5846,7 @@ fn header_hex(repo: &gix::Repository, id: &ObjectId, min: Option<usize>) -> Stri
     if id.is_null() {
         return "0".repeat(min);
     }
-    let uniq = id.attach(repo).shorten_or_id().hex_len();
-    id.to_hex_with_len(uniq.max(min)).to_string()
+    crate::abbrev::unique_abbrev(repo, id, min)
 }
 
 /// The combined header's abbreviation floor: `--full-index` → full, otherwise
@@ -5857,6 +5869,9 @@ fn show_combined_header(
     out: &mut Vec<u8>,
     repo: &gix::Repository,
     c: &CombinedPath,
+    // `elem->mode` once `show_patch_diff()` has read the result (combine-diff.c:
+    // 1041-1117): the file's own `lstat()` mode, `0` for a deleted result.
+    result_mode: u32,
     opts: &Opts,
     line_prefix: &[u8],
     show_file_header: bool,
@@ -5883,8 +5898,8 @@ fn show_combined_header(
     out.extend_from_slice(header_hex(repo, &repo.object_hash().null(), abbrev).as_bytes());
     out.push(b'\n');
 
-    let mode_differs = c.parents.iter().any(|(_, m)| *m != c.wt_mode);
-    let deleted = c.wt_mode == 0;
+    let mode_differs = c.parents.iter().any(|(_, m)| *m != result_mode);
+    let deleted = result_mode == 0;
     // diff-files always records DIFF_STATUS_MODIFIED for both parents, so the
     // "added if nobody had it" branch never fires here.
     if mode_differs {
@@ -5902,8 +5917,8 @@ fn show_combined_header(
             }
             out.extend_from_slice(format!("{m:06o}").as_bytes());
         }
-        if c.wt_mode != 0 {
-            out.extend_from_slice(format!("..{:06o}", c.wt_mode).as_bytes());
+        if result_mode != 0 {
+            out.extend_from_slice(format!("..{result_mode:06o}").as_bytes());
         }
         out.push(b'\n');
     }
@@ -5930,31 +5945,28 @@ fn show_combined_header(
     out.push(b'\n');
 }
 
-/// The full `diff --cc` section for one combined path.
+/// The full `diff --cc` section for one combined path, over the result
+/// [`super::diff::worktree_combined_results`] read for it.
 fn render_combined_patch(
     out: &mut Vec<u8>,
     repo: &gix::Repository,
     c: &CombinedPath,
+    read: &super::diff::WorktreeCombinedResult,
     opts: &Opts,
-    workdir: &Path,
 ) -> Result<()> {
     const NUM_PARENT: usize = 2;
 
-    let full = workdir.join(gix::path::from_bstr(c.path.as_bstr()));
-    let (result, result_deleted) = match std::fs::read(&full) {
-        Ok(b) => (b, false),
-        Err(_) => (Vec::new(), true),
-    };
+    let result = &read.bytes;
+    let result_deleted = read.deleted;
+    let result_mode = read.mode.map_or(0, |k| u32::from(k as u16));
 
-    let parents: Vec<Vec<u8>> = c
-        .parents
-        .iter()
-        .map(|(id, m)| read_parent_blob(repo, id, *m))
-        .collect::<Result<_>>()?;
+    let parents = &read.parents;
 
-    let is_binary = buffer_is_binary(&result) || parents.iter().any(|p| buffer_is_binary(p));
+    // `if (textconv) is_binary = 0;` (combine-diff.c:1130-1131).
+    let is_binary =
+        !read.textconv && (buffer_is_binary(result) || parents.iter().any(|p| buffer_is_binary(p)));
     if is_binary {
-        show_combined_header(out, repo, c, opts, &opts.line_prefix, false);
+        show_combined_header(out, repo, c, result_mode, opts, &opts.line_prefix, false);
         out.extend_from_slice(b"Binary files differ\n");
         return Ok(());
     }
@@ -6002,7 +6014,7 @@ fn render_combined_patch(
         if !reused {
             combine_diff_parent(
                 &parents[n],
-                &result,
+                result,
                 &mut sline,
                 cnt,
                 n,
@@ -6015,13 +6027,13 @@ fn render_combined_patch(
     // working_tree_file is always true for diff-files, so the header and body are
     // shown regardless of make_hunks()'s verdict.
     let _ = make_hunks(&mut sline, cnt, NUM_PARENT, opts.dense_combined, opts.ctx as usize);
-    show_combined_header(out, repo, c, opts, &opts.line_prefix, true);
+    show_combined_header(out, repo, c, result_mode, opts, &opts.line_prefix, true);
     dump_sline(
         out,
         &sline,
         cnt,
         NUM_PARENT,
-        &result,
+        result,
         result_deleted,
         opts.ctx as usize,
         &opts.line_prefix,

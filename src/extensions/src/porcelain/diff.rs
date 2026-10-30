@@ -5689,8 +5689,10 @@ fn collect_index_worktree(
             .unwrap_or(EntryKind::Blob);
         let unmerged_kind = conflict_worktree_kind(workdir, mode_rules, first_stage_kind, &path);
         if let (true, Some(s)) = (combine, conflicts.get(&path)) {
+            // `grab_blob()` (combine-diff.c:313-321): a gitlink stage reads as its
+            // `Subproject commit` line, never as an object.
             let side = |(id, kind): (ObjectId, EntryKind)| -> Result<CombinedSide> {
-                Ok(CombinedSide { kind: Some(kind), id, bytes: blob_bytes(repo, id)?, status: b'M' })
+                Ok(CombinedSide { kind: Some(kind), id, bytes: grab_blob(repo, kind, id)?, status: b'M' })
             };
             // `dpath->mode` is `wt_mode`, which `show_raw_diff()` prints; the patch
             // reads the file again and takes the mode its own `lstat()` gives
@@ -10383,13 +10385,7 @@ fn combined_worktree_result(
     if meta.is_dir() {
         let head = gix::open(&full).ok().and_then(|sub| sub.head_id().ok().map(|h| h.detach()));
         let oid = head.unwrap_or(id);
-        // `grab_blob()` (combine-diff.c:313-321): a gitlink mode reads as its
-        // `Subproject commit` line, a null id as an empty blob.
-        let bytes = match kind {
-            Some(EntryKind::Commit) => format!("Subproject commit {oid}\n").into_bytes(),
-            _ if oid.is_null() => Vec::new(),
-            _ => blob_bytes(repo, oid)?,
-        };
+        let bytes = grab_blob(repo, kind.unwrap_or(EntryKind::Blob), oid)?;
         return Ok((kind, bytes, false, false));
     }
     let Ok(bytes) = std::fs::read(&full) else {
@@ -10506,6 +10502,72 @@ fn combined_textconv(
     Ok(())
 }
 
+/// One `diff-files -c|--cc` path as `show_patch_diff()` read it (combine-diff.c:
+/// 1029-1131): `elem->mode` after the worktree read (`None` for `deleted_file:`),
+/// the result bytes `convert_to_git()` or the textconv program left,
+/// `result_deleted`, each parent as `grab_blob()` read it, and whether textconv
+/// ran, which makes the path never binary.
+pub(crate) struct WorktreeCombinedResult {
+    pub(crate) mode: Option<EntryKind>,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) deleted: bool,
+    pub(crate) parents: Vec<Vec<u8>>,
+    pub(crate) textconv: bool,
+}
+
+/// The reads `show_patch_diff()` makes for `run_diff_files()`'s two-stage paths
+/// (diff-lib.c:211-215), through the same [`combined_worktree_result`] and
+/// [`convert_combined_results`] `git diff` reads its unmerged results with, so the
+/// readlink, gitlink, fake-symlink, `convert_to_git()` and textconv rules live in
+/// one place.
+///
+/// Each item is the path, `dpath->mode` (`wt_mode`, `None` for a removed file) and
+/// stage #2 and #3 as the two parents. `allow_textconv` is
+/// `opt->flags.allow_textconv`. Returns one result per item, in order, and, when a
+/// read died, the position of that path and the fatal error: the results ahead of
+/// it are the sections already printed.
+#[allow(clippy::type_complexity)]
+pub(crate) fn worktree_combined_results(
+    repo: &gix::Repository,
+    workdir: &std::path::Path,
+    items: &[(BString, Option<EntryKind>, [(ObjectId, EntryKind); NUM_PARENT])],
+    allow_textconv: bool,
+) -> Result<(Vec<WorktreeCombinedResult>, Option<(usize, anyhow::Error)>)> {
+    let null = repo.object_hash().null();
+    let mut set: Vec<CombinedPath> = Vec::with_capacity(items.len());
+    for (path, kind, stages) in items {
+        let parents: Vec<CombinedSide> = stages
+            .iter()
+            .map(|&(id, k)| Ok(CombinedSide { kind: Some(k), id, bytes: grab_blob(repo, k, id)?, status: b'M' }))
+            .collect::<Result<_>>()?;
+        let (patch_kind, bytes, result_deleted, convert_result) =
+            combined_worktree_result(repo, workdir, path, *kind, null, &parents)?;
+        set.push(CombinedPath {
+            path: path.clone(),
+            kind: *kind,
+            patch_kind,
+            result_deleted,
+            convert_result,
+            textconv: false,
+            id: null,
+            bytes,
+            parents,
+        });
+    }
+    let died = convert_combined_results(repo, &mut set, allow_textconv)?;
+    let results = set
+        .into_iter()
+        .map(|cp| WorktreeCombinedResult {
+            mode: cp.patch_kind,
+            bytes: cp.bytes,
+            deleted: cp.result_deleted,
+            parents: cp.parents.into_iter().map(|p| p.bytes).collect(),
+            textconv: cp.textconv,
+        })
+        .collect();
+    Ok((results, died))
+}
+
 /// `show_modified()`'s combined arm (diff-lib.c:408-424) for one queued pair of
 /// `git diff -c|--cc <rev>`: a path the tree (`old_entry`) and the index's stage-0
 /// entry (`new_entry`) both hold, whose file `get_stat_data()` could read, becomes
@@ -10604,14 +10666,8 @@ fn oneway_combined_path(
         (EntryKind::Commit, _, _) | (_, EntryKind::Commit, _) => return Ok(None),
         _ => {}
     }
-    // `grab_blob()` (combine-diff.c:313-321) reads a gitlink parent as its
-    // `Subproject commit` line.
     let side = |kind: EntryKind, id: ObjectId| -> Result<CombinedSide> {
-        let bytes = match kind {
-            EntryKind::Commit => format!("Subproject commit {id}\n").into_bytes(),
-            _ => blob_bytes(repo, id)?,
-        };
-        Ok(CombinedSide { kind: Some(kind), id, bytes, status: b'M' })
+        Ok(CombinedSide { kind: Some(kind), id, bytes: grab_blob(repo, kind, id)?, status: b'M' })
     };
     let parents = vec![side(index_kind, entry.id)?, side(tree_kind, tree_id)?];
     let id = repo.object_hash().null();
@@ -11275,6 +11331,17 @@ fn render_unmerged(out: &mut Vec<u8>, delta: &Delta) {
 
 fn blob_bytes(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>> {
     Ok(repo.find_object(id)?.detach().data)
+}
+
+/// `grab_blob()` (combine-diff.c:304-335) without its textconv arm: a gitlink parent
+/// reads as its `Subproject commit` line, a null id as an empty (deleted) blob, and
+/// anything else as the object itself.
+fn grab_blob(repo: &gix::Repository, kind: EntryKind, id: ObjectId) -> Result<Vec<u8>> {
+    match kind {
+        EntryKind::Commit => Ok(format!("Subproject commit {id}\n").into_bytes()),
+        _ if id.is_null() => Ok(Vec::new()),
+        _ => blob_bytes(repo, id),
+    }
 }
 
 /// `coalesce_lines()`: LCS-merge `fresh` (the lines parent `parent` lost) into the

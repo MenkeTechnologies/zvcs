@@ -2494,13 +2494,22 @@ fn combined_commit(
         // `opt->flags.full_index`, `opt->a_prefix`/`opt->b_prefix` and
         // `rev->combined_all_paths` alongside the path set; they are the last four
         // arguments the shared engine takes.
-        let patch = super::diff::merge_combined_patch(
+        // `show_patch_diff()` hands `dump_sline()` `opt->use_color` (combine-diff.c:1210),
+        // which `--color[=<when>]`/`--no-color` set and nothing else can: `diff-tree`
+        // loads `git_diff_basic_config` (builtin/diff-tree.c:127), which reads the
+        // `color.diff.<slot>` palette but never `color.diff`/`color.ui`.
+        let colors = super::diff_color::DiffColors::resolve(
+            repo,
+            super::diff_color::resolve_color_plumbing(color_when(&opts.diff_args)),
+        );
+        let patch = super::diff::merge_combined_patch_painted(
             repo,
             commit_id,
             parents,
             &paths,
             unified_context(&opts.diff_args),
             opts.dense_combined,
+            &colors,
             &combined_header_opts(&opts.diff_args, opts.combined_all_paths),
         )?;
         if needsep {
@@ -2547,6 +2556,24 @@ fn combined_header_opts(diff_args: &[String], all_paths: bool) -> super::diff::C
         }
     }
     hdr
+}
+
+/// The `--color[=<when>]` / `--no-color` the command line left in force, the last
+/// spelling winning as `diff_opt_parse()` assigns `options->use_color`; `None` when
+/// neither was given.
+fn color_when(diff_args: &[String]) -> Option<super::diff_color::ColorWhen> {
+    let mut when = None;
+    for a in diff_args {
+        if a == "--color" {
+            when = Some(super::diff_color::ColorWhen::Always);
+        } else if a == "--no-color" {
+            when = Some(super::diff_color::ColorWhen::Never);
+        } else if let Some(v) = a.strip_prefix("--color=") {
+            // Already validated while parsing (see the `--color=` arm above).
+            when = super::diff_color::parse_color_when(v).or(when);
+        }
+    }
+    when
 }
 
 /// `-U<n>`/`--unified=<n>`, or git's default of 3 when neither was given.

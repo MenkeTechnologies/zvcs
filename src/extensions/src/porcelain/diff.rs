@@ -3718,7 +3718,7 @@ fn cmd_diff(args: &[String], refresh: &mut Option<gix::Repository>) -> Result<Ex
     // of the queue's own reads, and only when the combined patch is what it prints
     // (`show_combined_diff()`, combine-diff.c:1284-1296).
     let combined_die = match !quiet && fmt & (F_RAW | F_NAME | F_NAME_STATUS) == 0 && fmt & F_PATCH != 0 {
-        true => convert_combined_results(&repo, &mut walk_combined)?,
+        true => convert_combined_results(&repo, &mut walk_combined, allow_textconv)?,
         false => None,
     };
 
@@ -5706,6 +5706,7 @@ fn collect_index_worktree(
                 patch_kind,
                 result_deleted,
                 convert_result,
+                textconv: false,
                 id,
                 bytes,
                 parents,
@@ -10077,7 +10078,7 @@ fn tree_blob(
 /// One entry of a combined diff's path set: the result side plus, for each parent,
 /// the side that parent contributes. Mirrors `struct combine_diff_path`
 /// (combine-diff.h) as `diff_tree_paths()` fills it in.
-struct CombinedPath {
+pub(crate) struct CombinedPath {
     path: BString,
     /// `elem->mode` as the path was built, which `show_raw_diff()` prints
     /// (combine-diff.c:1253). `None` when the result tree does not hold the path,
@@ -10095,6 +10096,9 @@ struct CombinedPath {
     /// symlink, so `show_patch_diff()` runs it through `convert_to_git()` before
     /// diffing (combine-diff.c:1097-1107). Never set for a tree result.
     convert_result: bool,
+    /// The result and every parent were read through the path's textconv program
+    /// ([`convert_combined_results`]), which makes `is_binary` 0 (combine-diff.c:1130-1131).
+    textconv: bool,
     id: ObjectId,
     bytes: Vec<u8>,
     parents: Vec<CombinedSide>,
@@ -10163,7 +10167,7 @@ fn combined_path_set(
         if shared_with_a_parent {
             continue;
         }
-        out.push(CombinedPath { path, kind, patch_kind: kind, result_deleted: false, convert_result: false, id, bytes, parents });
+        out.push(CombinedPath { path, kind, patch_kind: kind, result_deleted: false, convert_result: false, textconv: false, id, bytes, parents });
     }
     Ok(out)
 }
@@ -10412,18 +10416,49 @@ fn combined_worktree_result(
     Ok((Some(mode), bytes, false, is_file))
 }
 
-/// `convert_to_git()` over every worktree result that owes it, in walk order
-/// (combine-diff.c:1097-1107), with `global_conv_flags_eol`: its default
+/// The reads `show_patch_diff()` makes of a worktree-result path set, in walk order.
+///
+/// With `opt->flags.allow_textconv` and a `diff.<driver>.textconv` for the path
+/// (`userdiff_get_textconv()`, combine-diff.c:1031-1035), a regular worktree file is
+/// the program's output over the file itself (combine-diff.c:1069-1073) — no
+/// `convert_to_git()`, no fake-symlink test, `elem->mode` left as the walk set it —
+/// and every parent goes through `grab_blob()`'s `fill_textconv()` arm
+/// (combine-diff.c:321-325), a gitlink and a null id keeping their own forms. Such a
+/// path is never binary (combine-diff.c:1130-1131).
+///
+/// Every other worktree result that owes it goes through `convert_to_git()`
+/// (combine-diff.c:1097-1107) with `global_conv_flags_eol`: its default
 /// `CONV_EOL_RNDTRP_WARN` prints the `in the working copy of` warning as each path
-/// is reached, and `core.safecrlf=true` dies there. Returns the position of the
-/// path that died, every combined section ahead of it already printed, and the
-/// fatal error.
+/// is reached, and `core.safecrlf=true` dies there.
+///
+/// Returns the position of the path that died — `convert_to_git()`'s refusal or
+/// `fill_textconv()`'s `unable to read files to diff` — every combined section ahead
+/// of it already printed, and the fatal error.
 fn convert_combined_results(
     repo: &gix::Repository,
     set: &mut [CombinedPath],
+    allow_textconv: bool,
 ) -> Result<Option<(usize, anyhow::Error)>> {
     let mut filter: Option<super::convert_to_git::WorktreeFilter> = None;
-    for (at, cp) in set.iter_mut().enumerate().filter(|(_, cp)| cp.convert_result) {
+    let mut drivers: Option<DriverCache<'_>> = None;
+    let mut caches: std::collections::HashMap<String, super::notes::Cache> = std::collections::HashMap::new();
+    for (at, cp) in set.iter_mut().enumerate() {
+        if allow_textconv {
+            let lookup = match &mut drivers {
+                Some(l) => l,
+                none => none.insert(DriverCache::new(repo)?),
+            };
+            let driver = lookup.for_path(cp.path.as_bstr()).map_err(crate::fatal::die)?;
+            if let Some(program) = driver.as_ref().and_then(|d| d.settings.textconv.clone()) {
+                match combined_textconv(repo, lookup, &mut caches, driver.as_deref(), &program, cp) {
+                    Ok(()) => continue,
+                    Err(e) => return Ok(Some((at, e))),
+                }
+            }
+        }
+        if !cp.convert_result {
+            continue;
+        }
         let f = match &mut filter {
             Some(f) => f,
             none => none.insert(super::convert_to_git::WorktreeFilter::new(repo, true, false)?),
@@ -10435,6 +10470,40 @@ fn convert_combined_results(
         cp.convert_result = false;
     }
     Ok(None)
+}
+
+/// [`convert_combined_results`]'s textconv arm for one worktree-result path: the
+/// result first, as `show_patch_diff()` reads it, then each parent as
+/// `combine_diff()` does.
+fn combined_textconv(
+    repo: &gix::Repository,
+    drivers: &mut DriverCache<'_>,
+    caches: &mut std::collections::HashMap<String, super::notes::Cache>,
+    driver: Option<&crate::userdiff::Driver>,
+    program: &str,
+    cp: &mut CombinedPath,
+) -> Result<()> {
+    // `else if (textconv)` sits below the `lstat()`, symlink and directory arms
+    // (combine-diff.c:1046-1068), so only a regular file reaches it, and a missing
+    // one is still `deleted_file:`.
+    let regular = repo.workdir().is_some_and(|w| {
+        std::fs::symlink_metadata(w.join(gix::path::from_bstr(cp.path.as_bstr()))).is_ok_and(|m| m.is_file())
+    });
+    if cp.result_deleted || !regular {
+        return Ok(());
+    }
+    // `fill_filespec(df, null_oid(), 0, st.st_mode)`: not oid-valid, so never cached.
+    cp.bytes = cached_textconv(repo, drivers, caches, driver, program, cp.path.as_bstr(), None, &cp.bytes)?;
+    cp.patch_kind = cp.kind;
+    cp.convert_result = false;
+    for p in cp.parents.iter_mut() {
+        if p.kind == Some(EntryKind::Commit) || p.id.is_null() {
+            continue;
+        }
+        p.bytes = cached_textconv(repo, drivers, caches, driver, program, cp.path.as_bstr(), Some(p.id), &p.bytes)?;
+    }
+    cp.textconv = true;
+    Ok(())
 }
 
 /// `show_modified()`'s combined arm (diff-lib.c:408-424) for one queued pair of
@@ -10557,10 +10626,112 @@ fn oneway_combined_path(
         patch_kind,
         result_deleted,
         convert_result,
+        textconv: false,
         id,
         bytes,
         parents,
     }))
+}
+
+/// [`oneway_combined_path`] for one pair `git diff-index -c|--cc <tree-ish>` queued.
+/// `cmd_diff_index()` reaches the same `run_diff_index()` (builtin/diff-index.c:68)
+/// that `git diff <rev>` does, so `show_modified()`'s combined arm (diff-lib.c:408-424)
+/// decides the same way for both verbs.
+///
+/// `tree` is `old_entry`'s mode and id; `stat` is what `get_stat_data()` handed
+/// back — the index entry's id, or the null id with `ce_mode_from_stat()`'s mode
+/// when the file's stat no longer matches it (diff-lib.c:337-343). `unmerged` is a
+/// conflicted index path, which `unpack_trees()` hands over as its lowest stage.
+pub(crate) fn diff_index_combined_path(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    path: &BString,
+    tree: (u32, ObjectId),
+    stat: (u32, ObjectId),
+    unmerged: bool,
+) -> Result<Option<CombinedPath>> {
+    let (Some(tree_kind), Some(stat_kind)) = (mode_kind(tree.0), mode_kind(stat.0)) else {
+        return Ok(None);
+    };
+    let new = match stat.1.is_null() {
+        true => NewSide::Worktree(stat_kind),
+        false => NewSide::Blob(stat.1, stat_kind),
+    };
+    let mut d = Delta::plain(path.clone(), Some((tree.1, tree_kind)), new);
+    d.unmerged = unmerged;
+    // `match_stat_with_submodule()` called a gitlink changed because its submodule's
+    // `HEAD` moved off the recorded commit (read-cache.c:268-284); the walk's
+    // worktree side names that `HEAD`.
+    if stat_kind == EntryKind::Commit && stat.1.is_null() {
+        d.new_commit = repo
+            .workdir()
+            .and_then(|w| gix::open(w.join(gix::path::from_bstr(path.as_bstr()))).ok())
+            .and_then(|sub| sub.head_id().ok().map(|h| h.detach()));
+    }
+    oneway_combined_path(repo, index, &d)
+}
+
+/// What `show_combined_diff()` (combine-diff.c:1284-1296) printed for the paths
+/// [`diff_index_combined_path`] took out of `git diff-index`'s queue, while the walk
+/// was still running and so ahead of everything `diff_flush()` prints: a
+/// `show_raw_diff()` record each under `--raw`/`--name-only`/`--name-status`,
+/// otherwise `show_patch_diff()` under `-p`, and nothing for any other format.
+///
+/// The patch reads each path first ([`convert_combined_results`]: the textconv
+/// program under `--textconv`, `convert_to_git()` otherwise); a path that dies
+/// there leaves the sections ahead of it in the returned bytes and its fatal beside
+/// them, and the queue is never flushed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn diff_index_combined_output(
+    repo: &gix::Repository,
+    set: &mut [CombinedPath],
+    (raw, name_only, name_status, patch): (bool, bool, bool, bool),
+    raw_abbrev: usize,
+    z: bool,
+    full_index: bool,
+    combined_all_paths: bool,
+    ctx: u32,
+    dense: bool,
+    (a_prefix, b_prefix): (&[u8], &[u8]),
+    line_prefix: &[u8],
+    colors: &diff_color::DiffColors,
+    allow_textconv: bool,
+) -> Result<(Vec<u8>, Option<anyhow::Error>)> {
+    let mut out: Vec<u8> = Vec::new();
+    if raw || name_only || name_status {
+        let fmt = match (raw, name_status) {
+            (true, _) => F_RAW,
+            (false, true) => F_NAME_STATUS,
+            (false, false) => F_NAME,
+        };
+        for cp in set.iter() {
+            render_combined_raw_at(&mut out, cp, fmt, raw_abbrev, z, line_prefix, combined_all_paths);
+        }
+        return Ok((out, None));
+    }
+    if !patch {
+        return Ok((out, None));
+    }
+    let died = convert_combined_results(repo, set, allow_textconv)?;
+    let shown = died.as_ref().map_or(set.len(), |(at, _)| *at);
+    let hash_len = repo.object_hash().len_in_hex();
+    let abbrev = match full_index {
+        true => hash_len,
+        false => crate::abbrev::configured_abbrev(repo, hash_len),
+    };
+    out = combined_patch(
+        &set[..shown],
+        ctx,
+        dense,
+        abbrev,
+        a_prefix,
+        b_prefix,
+        line_prefix,
+        colors,
+        combined_all_paths,
+        true,
+    )?;
+    Ok((out, died.map(|(_, e)| e)))
 }
 
 /// The combined half of `diff_tree_combined()` (combine-diff.c:1606-1626) for
@@ -10857,7 +11028,9 @@ fn combined_patch(
         // `buffer_is_binary()` over the result and every parent (combine-diff.c:
         // 1132-1147): a binary path gets the header without its `---`/`+++` pair and
         // `Binary files differ`, and no line diff is run for it.
-        let binary = looks_binary(&cp.bytes) || cp.parents.iter().any(|p| looks_binary(&p.bytes));
+        // `if (textconv) is_binary = 0;` comes first (combine-diff.c:1130-1131).
+        let binary =
+            !cp.textconv && (looks_binary(&cp.bytes) || cp.parents.iter().any(|p| looks_binary(&p.bytes)));
         // `deleted_file:` (combine-diff.c:1111-1116): a worktree result that `lstat()`
         // cannot find is `result_deleted`, which `combine_diff()` and `dump_sline()`
         // both return on at once (combine-diff.c:436-437, 767-768) — the header is
@@ -11480,7 +11653,7 @@ struct PatchSink<'a> {
     before: &'a [&'a [u8]],
     after: &'a [&'a [u8]],
     /// `xecfg->find_func`: the path's userdiff driver funcname pattern, when it has
-    /// one. `None` leaves git's built-in [`super::diff_pairs::def_ff`] in charge.
+    /// one. `None` leaves git's built-in [`def_ff`] in charge.
     funcname: Option<&'a crate::userdiff::FuncName>,
     /// git's `funclineprev`: the line the previous hunk's search started from, and
     /// the limit for the next one, so a heading is never scanned for twice.
@@ -11492,30 +11665,31 @@ struct PatchSink<'a> {
     func_text: Vec<u8>,
 }
 
-/// git's `def_ff` (xdiff/xemit.c): the default answer to "does this line begin a
-/// section?" when no `diff=<driver>` attribute supplies a `funcname` pattern.
+/// git's `def_ff` (xdiff/xemit.c:102-116): the default answer to "does this line
+/// begin a section?" when no `diff=<driver>` attribute supplies a `funcname`
+/// pattern. Every porcelain's hunk-header and function-context code goes through
+/// this one copy.
 ///
 /// A line qualifies when its first byte is an ASCII letter, `_`, or `$` — the
 /// column-zero convention that C, shell, Rust and most other languages follow for
-/// top-level definitions. The text is clipped to `sz` FIRST and only then stripped
-/// of trailing whitespace, which is the order git uses; doing it the other way
-/// around would keep a different byte count for a long line.
+/// top-level definitions. The heading is [`crate::userdiff::clip_heading`]'s, so
+/// `sz` = 1 answers only whether the line qualifies, the way `is_func_rec()` asks.
 pub(crate) fn def_ff(rec: &[u8], sz: usize) -> Option<&[u8]> {
     let first = *rec.first()?;
     if !(first.is_ascii_alphabetic() || first == b'_' || first == b'$') {
         return None;
     }
-    let mut len = rec.len().min(sz);
-    // C's `isspace` in the default locale, which includes the vertical tab that
-    // Rust's `is_ascii_whitespace` leaves out.
-    while len > 0 && matches!(rec[len - 1], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
-        len -= 1;
-    }
-    Some(&rec[..len])
+    Some(crate::userdiff::clip_heading(rec, sz))
+}
+
+/// git's `is_empty_rec()` (xdiff/xemit.c:159-167): a record, newline included, of
+/// nothing but [`crate::userdiff::xdl_isspace`] bytes.
+pub(crate) fn is_empty_rec(rec: &[u8]) -> bool {
+    rec.iter().all(|&b| crate::userdiff::xdl_isspace(b))
 }
 
 /// The longest section heading git will keep: `struct func_line { char buf[80]; }`.
-const FUNC_LINE_MAX: usize = 80;
+pub(crate) const FUNC_LINE_MAX: usize = 80;
 /// git formats a hunk header into a 128-byte buffer and clips the heading to
 /// whatever is left in it, so a long line number range shortens the heading.
 pub(crate) const HUNK_HDR_MAX: usize = 128;

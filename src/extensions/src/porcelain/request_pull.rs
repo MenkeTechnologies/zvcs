@@ -1047,11 +1047,9 @@ impl<'a> HunkWriter<'a> {
         let ctx_start = before_hunk_start.saturating_sub(1);
         let mut idx = ctx_start as i64 - 1;
         while idx >= 0 {
-            let line = trim_end_ws(self.before_lines[idx as usize]);
-            if let Some(&first) = line.first() {
-                if first.is_ascii_alphabetic() || first == b'_' || first == b'$' {
-                    return Some(line);
-                }
+            // xdiff/xemit.c:124: the shared `def_ff()`, clipped to `struct func_line`.
+            if let Some(line) = super::diff::def_ff(self.before_lines[idx as usize], super::diff::FUNC_LINE_MAX) {
+                return Some(line);
             }
             idx -= 1;
         }
@@ -1112,17 +1110,6 @@ fn write_range(out: &mut Vec<u8>, start: u32, len: u32) {
     } else {
         let _ = write!(out, "{start},{len}");
     }
-}
-
-fn trim_end_ws(mut s: &[u8]) -> &[u8] {
-    while let Some(&last) = s.last() {
-        if last == b' ' || last == b'\t' || last == b'\n' || last == b'\r' {
-            s = &s[..s.len() - 1];
-        } else {
-            break;
-        }
-    }
-    s
 }
 
 /// The bytes to diff for an entry: a blob comes from the object database; a

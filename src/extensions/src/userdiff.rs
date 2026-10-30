@@ -291,7 +291,7 @@ impl FuncName {
     /// to match wins, and the heading is that match's extent — capture group 1 when
     /// the pattern has one that participated, the whole match otherwise. The result
     /// is clipped to `sz` and only then stripped of trailing whitespace, the same
-    /// order [`super::porcelain::diff_pairs::def_ff`] uses.
+    /// order xdiff's `def_ff()` uses ([`clip_heading`]).
     pub fn find<'a>(&self, rec: &'a [u8], sz: usize) -> Option<&'a [u8]> {
         // "Exclude terminating newline (and cr) from matching".
         let mut len = rec.len();
@@ -318,15 +318,32 @@ impl FuncName {
             Some(g) => g,
             None => caps.get(0)?,
         };
-        let mut result = (m.end() - m.start()).min(sz);
-        let text = &line[m.start()..];
-        // C's `isspace` in the default locale, which includes the vertical tab that
-        // Rust's `is_ascii_whitespace` leaves out.
-        while result > 0 && matches!(text[result - 1], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
-            result -= 1;
-        }
-        Some(&text[..result])
+        // xdiff-interface.c:240-245: clipped to the buffer, then right-trimmed with
+        // git's own `isspace`.
+        Some(clip_heading(&line[m.start()..m.end()], sz))
     }
+}
+
+/// git's `isspace()` as xdiff sees it: `sane_istest(x, GIT_SPACE)`
+/// (sane-ctype.h:40), which the `sane_ctype` table (ctype.c:20-28) grants only to
+/// tab, newline, carriage return and space. xdiff includes git-compat-util.h
+/// (xdiff/xinclude.h:26), so `XDL_ISSPACE()` (xdiff/xmacros.h:33) is this same
+/// test: a vertical tab or form feed is *not* space, in either the locale's sense
+/// or Rust's `is_ascii_whitespace`, which counts the form feed.
+pub(crate) fn xdl_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// The tail both heading finders share — `def_ff()` (xdiff/xemit.c:108-111) and
+/// `ff_regexp()` (xdiff-interface.c:242-245): clip `text` to the `sz`-byte buffer
+/// FIRST and only then strip trailing [`xdl_isspace`] bytes. Doing it the other
+/// way round keeps a different byte count for a long line.
+pub(crate) fn clip_heading(text: &[u8], sz: usize) -> &[u8] {
+    let mut len = text.len().min(sz);
+    while len > 0 && xdl_isspace(text[len - 1]) {
+        len -= 1;
+    }
+    &text[..len]
 }
 
 /// `regcomp()` over one element, translated into what the `regex` crate accepts.

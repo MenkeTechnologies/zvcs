@@ -9304,17 +9304,17 @@ fn emit_hunks_with_ignorable(
     Ok(writer.finish())
 }
 
-/// Port of `def_ff()` (xdiff/xemit.c), the funcname heuristic git uses when no
-/// `xfuncname` driver applies: a line whose first byte starts an identifier.
+/// `is_func_rec()` (xdiff/xemit.c:128-132) with no `xfuncname` driver: the shared
+/// [`super::diff::def_ff`] asked through a one-byte buffer, a line whose first byte
+/// starts an identifier.
 fn is_func_line(line: &[u8]) -> bool {
-    matches!(line.first(), Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+    super::diff::def_ff(line, 1).is_some()
 }
 
-/// Port of `is_empty_rec()` (xdiff/xemit.c): a record of nothing but whitespace.
+/// `is_empty_rec()` (xdiff/xemit.c:159-167), the shared [`super::diff::is_empty_rec`].
 /// Records carry their newline, so a blank line is empty by this test.
 fn is_empty_line(line: &[u8]) -> bool {
-    line.iter()
-        .all(|&c| matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+    super::diff::is_empty_rec(line)
 }
 
 /// Port of `get_func_line()` (xdiff/xemit.c): scan the *pre-image* from `start`
@@ -9410,11 +9410,9 @@ impl<'a> HunkWriter<'a> {
         let ctx_start = before_hunk_start.saturating_sub(1);
         let mut idx = ctx_start as i64 - 1;
         while idx >= 0 {
-            let line = trim_end_ws(self.before_lines[idx as usize]);
-            if let Some(&first) = line.first() {
-                if first.is_ascii_alphabetic() || first == b'_' || first == b'$' {
-                    return Some(line);
-                }
+            // xdiff/xemit.c:124: the shared `def_ff()`, clipped to `struct func_line`.
+            if let Some(line) = super::diff::def_ff(self.before_lines[idx as usize], super::diff::FUNC_LINE_MAX) {
+                return Some(line);
             }
             idx -= 1;
         }

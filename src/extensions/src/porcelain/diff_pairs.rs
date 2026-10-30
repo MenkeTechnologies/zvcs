@@ -5068,18 +5068,14 @@ fn is_blank_rec(line: &[u8], ws: Whitespace) -> bool {
     line.iter().all(|b| b.is_ascii_whitespace())
 }
 
-/// `is_empty_rec`: the record is nothing but leading whitespace.
-fn is_empty_rec(line: &[u8]) -> bool {
-    line.iter().all(|b| b.is_ascii_whitespace())
-}
-
 /// `xecfg->find_func`: the driver's compiled `funcname`/`xfuncname` pattern when the
-/// path has one, and git's built-in [`def_ff`] heuristic when it does not — which is
-/// exactly what `xdl_emit_diff()` does with a NULL `find_func`.
+/// path has one, and git's built-in [`super::diff::def_ff`] heuristic when it does
+/// not — which is exactly what `match_func_rec()` (xdiff/xemit.c:118-126) does with a
+/// NULL `find_func`.
 fn find_func<'a>(ff: Option<&crate::userdiff::FuncName>, rec: &'a [u8]) -> Option<&'a [u8]> {
     match ff {
         Some(f) => f.find(rec, FUNCNAME_MAX),
-        None => def_ff(rec),
+        None => super::diff::def_ff(rec, FUNCNAME_MAX),
     }
 }
 
@@ -5166,7 +5162,7 @@ pub(crate) struct EmitGeometry<'a> {
     /// `-W` / `--function-context`, i.e. `XDL_EMIT_FUNCCONTEXT`.
     pub(crate) func_context: bool,
     /// `xecfg->find_func`: the path's userdiff driver funcname pattern, when it has
-    /// one. `None` leaves git's built-in [`def_ff`] in charge.
+    /// one. `None` leaves git's built-in [`super::diff::def_ff`] in charge.
     pub(crate) funcname: Option<&'a crate::userdiff::FuncName>,
 }
 
@@ -5286,7 +5282,7 @@ pub(crate) fn emit_hunks(
             }
             let mut fs1 = get_func_line(geom.funcname, before, i1, -1);
             while fs1 > 0
-                && !is_empty_rec(before[(fs1 - 1) as usize])
+                && !super::diff::is_empty_rec(before[(fs1 - 1) as usize])
                 && find_func(geom.funcname, before[(fs1 - 1) as usize]).is_none()
             {
                 fs1 -= 1;
@@ -5318,7 +5314,7 @@ pub(crate) fn emit_hunks(
 
             if geom.func_context {
                 let mut fe1 = get_func_line(geom.funcname, before, end1 as isize, nrec1 as isize);
-                while fe1 > 0 && is_empty_rec(before[(fe1 - 1) as usize]) {
+                while fe1 > 0 && super::diff::is_empty_rec(before[(fe1 - 1) as usize]) {
                     fe1 -= 1;
                 }
                 let fe1 = if fe1 < 0 { nrec1 } else { fe1 as usize };
@@ -6244,19 +6240,6 @@ fn fmt_range(start: u32, len: u32) -> String {
     }
 }
 
-/// git's built-in `def_ff` heuristic: a record qualifies as a function line when it
-/// starts with a letter, `_` or `$`; the text is capped at 80 bytes and right-trimmed.
-fn def_ff(rec: &[u8]) -> Option<&[u8]> {
-    let first = *rec.first()?;
-    if !(first.is_ascii_alphabetic() || first == b'_' || first == b'$') {
-        return None;
-    }
-    let mut len = rec.len().min(FUNCNAME_MAX);
-    while len > 0 && rec[len - 1].is_ascii_whitespace() {
-        len -= 1;
-    }
-    Some(&rec[..len])
-}
 
 /// git's `diff_options.anchors` — the repeatable `--anchored=<text>` list.
 ///

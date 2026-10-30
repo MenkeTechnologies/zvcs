@@ -3715,21 +3715,14 @@ impl InnerHunks<'_> {
     /// git's `def_ff()`, the default hunk-header function finder used when no
     /// `diff` attribute selects a userdiff driver: the nearest line above the
     /// hunk whose first byte is a letter, `_` or `$`, capped at 80 bytes and
-    /// then right-trimmed.
+    /// then right-trimmed — the shared [`super::diff::def_ff`].
     fn func(&self, hunk_start_0based: i64) -> Option<Vec<u8>> {
         let mut idx = hunk_start_0based - 1;
         while idx >= 0 {
-            let line = self.before[idx as usize];
-            match line.first() {
-                Some(&first) if first.is_ascii_alphabetic() || first == b'_' || first == b'$' => {
-                    let mut n = line.len().min(FUNC_BUF_SIZE);
-                    while n > 0 && line[n - 1].is_ascii_whitespace() {
-                        n -= 1;
-                    }
-                    return (n > 0).then(|| line[..n].to_vec());
-                }
-                _ => idx -= 1,
+            if let Some(text) = super::diff::def_ff(self.before[idx as usize], FUNC_BUF_SIZE) {
+                return (!text.is_empty()).then(|| text.to_vec());
             }
+            idx -= 1;
         }
         None
     }

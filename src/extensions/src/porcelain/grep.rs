@@ -2924,10 +2924,8 @@ fn is_funcname_line(line: &[u8], func: Option<&crate::userdiff::FuncName>) -> bo
         // sign of the return value here.
         return f.find(line, 1).is_some();
     }
-    match line.first() {
-        Some(&b) => b.is_ascii_alphabetic() || b == b'_' || b == b'$',
-        None => false,
-    }
+    // grep.c:1349-1352, the same first-byte test as xdiff's `def_ff()`.
+    super::diff::def_ff(line, 1).is_some()
 }
 
 /// git's `is_empty_line`: a line that is only whitespace.

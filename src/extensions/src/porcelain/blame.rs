@@ -6004,7 +6004,7 @@ fn whole_number(s: &str) -> Option<u32> {
 /// `_`, or `$`. Used whenever the path has no userdiff driver with a `funcname`
 /// pattern.
 fn is_funcname_line(line: &[u8]) -> bool {
-    matches!(line.first(), Some(&c) if c.is_ascii_alphabetic() || c == b'_' || c == b'$')
+    super::diff::def_ff(line, 1).is_some()
 }
 
 /// `line-range.c:match_funcname()`: the driver's pattern when the path has one —

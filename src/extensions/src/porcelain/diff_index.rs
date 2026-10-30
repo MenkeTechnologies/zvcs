@@ -49,8 +49,14 @@
 //!   * `--compact-summary` / `--no-compact-summary`.
 //!   * `--diff-merges=<mode>`, `--no-diff-merges`, `--dd`, `--remerge-diff` — the
 //!     merge-diff knob. Every mode but `off`/`none` fills an *empty* output format
-//!     with the patch (`diff_merges_setup_revs()`, diff-merges.c:188); the combined
-//!     modes are listed under the limitations below.
+//!     with the patch (`diff_merges_setup_revs()`, diff-merges.c:188).
+//!   * `-c`, `--cc`, `--diff-merges=combined`/`=dense-combined`, `--combined-all-paths`
+//!     — without `--cached`, `show_modified()` (diff-lib.c:408-424) turns a path whose
+//!     tree, index and worktree sides disagree into a two-parent `combine_diff_path`
+//!     (parent 0 the index entry, parent 1 the tree entry, result the worktree file),
+//!     printed during the walk ahead of the queue: a `::` record under `--raw`, the
+//!     `diff --combined`/`diff --cc` section under `-p`. The rest stay ordinary pairs.
+//!     Under `--cached` the mode only turns the patch format on.
 //!   * `--diff-filter=<letters>`        — include upper-case, exclude lower-case statuses.
 //!   * `--line-prefix=<s>`              — prefix every emitted record.
 //!   * `--relative[=<path>]`, `--no-relative` — limit to a path prefix (the cwd by default) and strip it.
@@ -223,13 +229,6 @@
 //!      not the after side.
 //!
 //!   Nothing is faked: the algorithm the user asked for is the one that runs.
-//! * `--diff-merges=combined` / `=dense-combined` / `-c` / `--cc` *without* `--cached`.
-//!   `oneway_diff()` (diff-lib.c:408) then builds a two-parent `combine_diff_path` —
-//!   parent 0 the index entry, parent 1 the tree entry, result the worktree file — and
-//!   renders `diff --combined`/`diff --cc` for it. That renderer is not reached from
-//!   here, so those invocations are declined rather than answered with a two-way patch.
-//!   Under `--cached` the same guard means the mode only turns the patch format on,
-//!   which *is* reproduced.
 //! * `--anchored=<text>`: the anchored patience variant *is* implemented — see
 //!   [`super::diff_pairs::set_anchor_texts`] and `gix-imara-diff`'s `patience.rs` — but
 //!   this verb does not parse the flag onto it, so it is recorded and refused for any
@@ -1055,8 +1054,8 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             // of the effect — measured against stock 2.55.0, where
             // `diff-index --diff-merges=<m|on|1|first-parent|separate|r|remerge> <tree>`,
             // `--remerge-diff` and `--dd` are each byte-identical to `diff-index -p`.
-            // The two combined modes are not: they render `diff --combined`, which this
-            // port has not got, so they turn the patch format on and are then declined.
+            // The two combined modes are not: they render `diff --combined` for the paths
+            // `show_modified()` combines.
             "--remerge-diff" | "--dd" => {
                 combine_merges = None;
                 merges_need_diff = true;
@@ -1627,17 +1626,17 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     if combined_all_paths && combine_merges.is_none() {
         combined_all_paths_error = true;
     }
-    // `oneway_diff()` (diff-lib.c:408) takes the combined path only when the worktree
-    // is being read: `revs->combine_merges && !cached`. Under `--cached` a combined
-    // mode therefore does nothing but turn the patch format on, which the arms above
-    // already did. Without it, git renders a two-parent `diff --combined`/`diff --cc`
-    // whose parents are the index entry and the tree entry — a shape this module does
-    // not build, so the run is declined rather than approximated.
-    if let Some(flag) = combine_merges {
-        if !opts.cached {
-            content_altering.get_or_insert(flag);
-        }
-    }
+    // `show_modified()` (diff-lib.c:408) takes the combined path only when the
+    // worktree is being read: `revs->combine_merges && !cached`. Under `--cached` a
+    // combined mode therefore does nothing but turn the patch format on, which the
+    // arms above already did. Without it, a pair whose three sides disagree becomes
+    // a two-parent `diff --combined`/`diff --cc` — parent 0 the index entry, parent 1
+    // the tree entry, result the worktree file — printed while the walk runs. The
+    // value is `rev->dense_combined_merges`.
+    let walk_combine: Option<bool> = combine_merges
+        .as_deref()
+        .filter(|_| !opts.cached)
+        .map(|flag| matches!(flag, "--cc" | "--diff-merges=cc" | "--diff-merges=dense-combined"));
     // `diff_setup_done()` (diff.c:5288): `--find-copies-harder` turns copy detection on
     // by itself, so a lone `--find-copies-harder` still runs the rename pass.
     if opts.rename.find_copies_harder {
@@ -2121,6 +2120,38 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         || opts.pickaxe.is_some()
         || content_output
         || bad_format.is_some();
+    // `show_modified()`'s combined arm (diff-lib.c:408-424): inside the tree walk —
+    // after the pathspec and the `--relative` prefix test, ahead of `-R`, diffcore and
+    // every format — a path the tree and the index both hold, whose file
+    // `get_stat_data()` could read, and whose `get_stat_data()` id or index id differs
+    // from the tree's, is taken out of the queue and printed on the spot. A deletion,
+    // an addition and a pair whose ids all agree (a mode or dirty-submodule change)
+    // stay `diff_change()` pairs.
+    let mut walk_combined: Vec<super::diff::CombinedPath> = Vec::new();
+    if walk_combine.is_some() {
+        let index = repo.index_or_empty()?;
+        let mut kept: Vec<Delta> = Vec::with_capacity(deltas.len());
+        for d in deltas.drain(..) {
+            let candidate = d.src_mode != 0 && d.dst_mode != 0 && d.src_id != d.dst_id;
+            let cp = match candidate {
+                true => super::diff::diff_index_combined_path(
+                    &repo,
+                    &index,
+                    &d.path,
+                    (d.src_mode, d.src_id),
+                    (d.dst_mode, d.dst_id),
+                    d.unmerged,
+                )?,
+                false => None,
+            };
+            match cp {
+                Some(cp) => walk_combined.push(cp),
+                None => kept.push(d),
+            }
+        }
+        deltas = kept;
+    }
+
     // `diff_queue_change()` (diff.c:7667) swaps the two sides as it queues the pair, so
     // `-R` happens before every `diffcore_std()` pass — rename detection included. That
     // is why `diff-index -R -C` finds no copy where `diff-index -C` does: reversed, the
@@ -2287,6 +2318,40 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     deltas.iter().map(|d| display_path(&d.path, &opts)).collect();
                 let pairs: Vec<super::diff_files::CheckPair<'_>> = deltas
                     .iter()
+        // `show_combined_diff()` (combine-diff.c:1284-1296) printed each combined path
+        // during the walk, so all of them come ahead of what `diff_flush()` makes of
+        // the queue, and none of them sets the separator the patch below waits for.
+        if let Some(dense) = walk_combine.filter(|_| !walk_combined.is_empty()) {
+            let hexsz = repo.object_hash().len_in_hex();
+            let (head, died) = super::diff::diff_index_combined_output(
+                &repo,
+                &mut walk_combined,
+                (
+                    opts.format == Format::Raw && opts.emit_pairs,
+                    opts.format == Format::NameOnly,
+                    opts.format == Format::NameStatus,
+                    opts.patch,
+                ),
+                abbrev_len(&repo, &deltas, &opts, hexsz).unwrap_or(hexsz),
+                opts.nul,
+                opts.full_index,
+                combined_all_paths,
+                opts.ctx,
+                dense,
+                (opts.src_prefix.as_bytes(), opts.dst_prefix.as_bytes()),
+                &opts.line_prefix,
+                &colors,
+                opts.allow_textconv,
+            )?;
+            // `convert_to_git()` died inside the walk: the sections ahead of that
+            // path are out, and the queue is never flushed.
+            if let Some(die) = died {
+                crate::cstdio::write_bytes_io(&head)?;
+                return Err(die);
+            }
+            out.extend_from_slice(&head);
+        }
+
                     .zip(&analyses)
                     .zip(&names)
                     .map(|((d, an), name)| super::diff_files::CheckPair {

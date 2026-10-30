@@ -266,9 +266,10 @@ pub fn file(
             // `assign_blame()`'s `!(commit->object.flags & UNINTERESTING)` and its
             // `!(revs->max_age != -1 && commit->date < revs->max_age)`, which are one condition in
             // git and so are one block here: either way `pass_blame()` is skipped and the commit
-            // keeps what is still suspected of it. See [`Options::bottom`].
+            // keeps what is still suspected of it. See [`Options::bottom`]. Both dates are
+            // `timestamp_t`, which is unsigned, so a bound before the epoch is above them all.
             if options.bottom.contains(&commit_id)
-                || options.since.is_some_and(|since| commit_time < since.seconds)
+                || options.since.is_some_and(|since| (commit_time as u64) < (since.seconds as u64))
             {
                 if unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, &paths) {
                     break 'outer;

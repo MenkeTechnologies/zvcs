@@ -1248,9 +1248,19 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // `--reverse`, and it carries the name the file had there, so no lookup in the object database
     // reconstructs it.
     let mut previous_origins: PreviousOrigins = std::collections::BTreeMap::new();
+    let fake_cut =
+        worktree_content.is_some() && fake_commit_cut(&opts, gix::date::Time::now_local_or_utc().seconds);
     // `(lines, blob content)` — the overlay path needs the blamed blob's bytes,
     // which come from the outcome on a miss and from the object on a hit.
     let (mut lines, blamed_bytes) = match cached {
+        // `--since` stops the dig at the working-tree commit itself (see
+        // [`fake_commit_cut`]): its `pass_blame()` never runs, so no walk does, and
+        // every line of the final image stays with it. The one blob read is
+        // `setup_scoreboard()`'s own `sb->num_read_blob++` (blame.c:2889).
+        _ if fake_cut => {
+            stats.num_read_blob = 1;
+            (Vec::new(), Vec::new())
+        }
         // Nothing to blame against: the file exists only in the index, so the empty
         // `HEAD` image below leaves every line with the synthetic commit. No walk runs, but
         // git's does not either — `setup_scoreboard()` reads the final image, and the fake
@@ -1296,7 +1306,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // a line present in both sides of the merge is credited to `HEAD`'s side,
         // exactly as here.
         let mut sources: Vec<(Vec<Line>, Vec<u8>)> = vec![(lines, blamed_bytes.clone())];
-        for parent in &merge_parents {
+        for parent in merge_parents.iter().filter(|_| !fake_cut) {
             let Some(blob) = blob_at(&repo, parent, &rel_path) else {
                 // `verify_working_tree_path` tolerates a parent without the path;
                 // it simply has nothing to hand back.
@@ -1916,9 +1926,7 @@ fn collect_commit_info(
             // branch (`blame.c:2601`). The date compared is `commit->date`, the
             // *committer* date, and the bound is ignored under `--reverse`.
             let date_cut = opts.reverse_from.is_none()
-                && opts.max_age.is_some_and(|bound| {
-                    committer_time.map(|t| t.seconds).unwrap_or(0) < bound
-                });
+                && opts.ages().below_max_age(committer_time.map(|t| t.seconds).unwrap_or(0));
             let boundary = (!opts.show_root && commit.parent_ids().next().is_none())
                 || opts.reverse_from.is_some_and(|from| from == line.commit_id)
                 || opts.bottom.contains(&line.commit_id)
@@ -1951,6 +1959,14 @@ fn collect_commit_info(
     Ok(info)
 }
 
+/// Whether `assign_blame()` (blame.c:2614-2621) refuses to pass blame from the
+/// synthetic working-tree commit, whose `commit->date` is `now` (blame.c:209):
+/// `--since` after the current time, or before the epoch, keeps every line on it
+/// and paints it `UNINTERESTING`. `sb->reverse` skips the test.
+fn fake_commit_cut(opts: &Options, now: i64) -> bool {
+    opts.reverse_from.is_none() && opts.ages().below_max_age(now)
+}
+
 /// The synthetic commit git invents for the final image (working tree, or the
 /// `--contents` file). git's `fake_working_tree_commit` uses a different author
 /// identity and message `from` field when `--contents` supplies the image.
@@ -1973,7 +1989,9 @@ fn not_committed_info(id: ObjectId, opts: &Options, rel_path: &str) -> CommitInf
     CommitInfo {
         display_author: display_author(name.as_bstr(), mail.as_bstr(), opts.show_email),
         display_date: opts.date_mode.format_time(now.seconds, now.offset),
-        boundary: false,
+        // `commit->date = now` (blame.c:209), so `assign_blame()`'s `max_age` test
+        // can stop the dig at the working tree itself and mark it the boundary.
+        boundary: fake_commit_cut(opts, now.seconds),
         hex: id.to_hex().to_string(),
         author_name: name.to_vec(),
         author_mail: mail.to_vec(),
@@ -5053,6 +5071,11 @@ fn rev_opt_value_checked(arg: &str) -> bool {
 }
 
 impl Options {
+    /// `revs->max_age`, the one age bound blame reads; see [`crate::revopt::Ages`].
+    fn ages(&self) -> crate::revopt::Ages {
+        crate::revopt::Ages { max_age: self.max_age, ..Default::default() }
+    }
+
     fn parse(
         repo: &gix::Repository,
         args: &[String],
@@ -5449,7 +5472,7 @@ impl Options {
                 }
                 // `--since=<date>` / `--after=<date>` / `--max-age=<epoch>`, which
                 // are one field: `revs->max_age`. `handle_revision_opt()` reads the
-                // first two through `approxidate()` and the third through `atoi()`,
+                // first two through `approxidate()` and the third through `parse_age()`,
                 // and `assign_blame()` (`blame.c:2596-2604`) is the only place blame
                 // looks at it:
                 //
@@ -5478,12 +5501,23 @@ impl Options {
                             (a, super::value_at(args, i, a)?.to_string())
                         }
                     };
-                    max_age = Some(if name == "--max-age" {
-                        // `revs->max_age = atoi(optarg)` — a raw epoch, not a date.
-                        value.trim().parse::<i64>().unwrap_or(0)
+                    // `revs->max_age = parse_age(optarg)` — a raw epoch, not a
+                    // date — or `approxidate(optarg)` (revision.c:2411-2422);
+                    // see [`crate::revopt::parse_age`] and
+                    // [`crate::revopt::approxidate_age`].
+                    max_age = if name == "--max-age" {
+                        match crate::revopt::parse_age(&value) {
+                            Ok(age) => age,
+                            Err(message) => {
+                                let mut err = std::io::stderr().lock();
+                                writeln!(err, "fatal: {message}")?;
+                                err.flush()?;
+                                return Ok(ParseOutcome::Reported(ExitCode::from(128)));
+                            }
+                        }
                     } else {
-                        crate::date::approxidate(&value)
-                    });
+                        crate::revopt::approxidate_age(&value)
+                    };
                 }
                 // `if (revs.diffopt.flags.find_copies_harder) opt |=
                 // (PICKAXE_BLAME_COPY | PICKAXE_BLAME_MOVE | PICKAXE_BLAME_COPY_HARDER);`

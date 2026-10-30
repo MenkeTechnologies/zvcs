@@ -1166,12 +1166,9 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     let mut grep_ignore_case = false;
     let mut grep_all_match = false;
     let mut grep_invert = false;
-    // `--since`/`--after` and `--until`/`--before` commit-date range (committer
-    // time), parsed with git's approxidate.
-    let mut since: Option<i64> = None;
-    // `revs->max_age_as_filter`, the display-time twin of `--since`.
-    let mut since_as_filter: Option<i64> = None;
-    let mut until: Option<i64> = None;
+    // `revs->max_age`, `revs->min_age` and `revs->max_age_as_filter`: the
+    // `--since`/`--until`/`--since-as-filter` spellings, read off `counts`.
+    let mut ages = crate::revopt::Ages::default();
     // Pickaxe: `-S<string>` (net occurrence count changed) / `-G<regex>` (a
     // changed line matches). Both diff each commit against its first parent.
     let mut pickaxe_s: Option<String> = None;
@@ -1466,9 +1463,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
             Some(Ok(hit)) => {
                 max_count = counts.max_count;
                 skip = counts.skip;
-                since = counts.max_age;
-                until = counts.min_age;
-                since_as_filter = counts.max_age_as_filter;
+                ages = counts.ages();
                 i += hit.consumed;
                 continue;
             }
@@ -3885,9 +3880,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         && !no_merges
         && min_parents.is_none()
         && max_parents.is_none()
-        && since.is_none()
-        && since_as_filter.is_none()
-        && until.is_none()
+        && !ages.any()
         && author_pats.is_empty()
         && reflog_pats.is_empty()
         && committer_pats.is_empty()
@@ -3936,6 +3929,65 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     } else {
         walk_reporting(&repo, &tips, &tip_sources, first_parent, &hidden, budget, no_walk)?
     };
+    // `revs->max_age` outside a reflog walk (that one is tested entry by entry
+    // below). The walk is limited by an UNINTERESTING pending commit
+    // (revision.c:431-436), by `topo_order` without generation numbers
+    // (revision.c:3195-3196) — `--topo-order`, `--date-order`,
+    // `--author-date-order`, `--graph` and `-L` set it — and by the options that
+    // set `revs->limited` where they are parsed (revision.c:2049, 2438-2547,
+    // 2750). See [`crate::revopt::Ages::cut_max_age`]. `--no-walk` pops the
+    // pending list and drops what the test fails, with no parents to follow.
+    if ages.max_age.is_some() && !walk_reflogs {
+        let limited = !hidden.is_empty()
+            || order != Order::Default
+            || graph
+            || line_level
+            || ancestry_path
+            || cherry_mark
+            || cherry_pick
+            || left_only
+            || right_only
+            || show_children
+            || simplify_merges_opt
+            || simplify_by_decoration
+            || show_merge;
+        let mut dates: HashMap<ObjectId, i64> = HashMap::with_capacity(nodes.len());
+        for node in &nodes {
+            dates.insert(node.id, commit_date(&repo.find_commit(node.id)?));
+        }
+        let date = |id: &ObjectId| dates.get(id).copied().unwrap_or(0);
+        if no_walk.is_some() && !limited {
+            nodes.retain(|n| !ages.below_max_age(date(&n.id)));
+        } else {
+            let shallow: HashSet<ObjectId> = repo
+                .shallow_commits()
+                .ok()
+                .flatten()
+                .map(|c| c.iter().copied().collect())
+                .unwrap_or_default();
+            let parents_of: HashMap<ObjectId, Vec<ObjectId>> = nodes
+                .iter()
+                .map(|n| {
+                    let followed = match (shallow.contains(&n.id), first_parent) {
+                        (true, _) => &n.parents[..0],
+                        (false, true) => &n.parents[..n.parents.len().min(1)],
+                        (false, false) => &n.parents[..],
+                    };
+                    (n.id, followed.to_vec())
+                })
+                .collect();
+            let walked: Vec<ObjectId> = nodes.iter().map(|n| n.id).collect();
+            let kept = ages.cut_max_age(
+                &walked,
+                &tips,
+                limited,
+                |id| parents_of.get(id).cloned().unwrap_or_default(),
+                date,
+            );
+            let mut by_id: HashMap<ObjectId, Node> = nodes.into_iter().map(|n| (n.id, n)).collect();
+            nodes = kept.iter().filter_map(|id| by_id.remove(id)).collect();
+        }
+    }
     // `--maximal-only`: every commit the walk handed to `process_parents()`, in
     // that order, with the parents it went on to — captured before any later
     // filter drops a commit, since the marks are made either way. `--no-walk`
@@ -5144,11 +5196,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     }
     let notes_trees = super::notes::load_display(&repo, &notes_opt)?;
 
-    if !commit_filter.is_empty()
-        || since.is_some()
-        || since_as_filter.is_some()
-        || until.is_some()
-        || has_pickaxe
+    if !commit_filter.is_empty() || ages.any() || has_pickaxe
     {
         let mut kept = Vec::with_capacity(nodes.len());
         for node in nodes.into_iter() {
@@ -5162,10 +5210,10 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 Some(rl) => rl.time.seconds,
                 None => commit_date(&commit),
             };
-            if since.is_some_and(|s| seconds < s)
-                || since_as_filter.is_some_and(|s| seconds < s)
-                || until.is_some_and(|u| seconds > u)
-            {
+            // `revs->max_age` was a walk cut for every walk but this one: the
+            // reflog arm of `get_revision_1()` (revision.c:4472-4476) tests each
+            // entry as it is handed out. The other two are `get_commit_action()`'s.
+            if (node.reflog.is_some() && ages.below_max_age(seconds)) || ages.ignores(seconds) {
                 continue;
             }
             // `get_reflog_message()` strips the entry's trailing newline, which is
@@ -8182,6 +8230,12 @@ fn split_reflog_name(name: &str) -> (&str, ReflogStart) {
 }
 
 impl ReflogEntry {
+    /// `get_reflog_timestamp()` (reflog-walk.c:302-312): the entry's own clock, which
+    /// `comparison_date()` (revision.c:4211-4217) measures `--since`/`--until` against.
+    pub(crate) fn seconds(&self) -> i64 {
+        self.time.seconds
+    }
+
     /// `get_reflog_selector()`: `<ref>@{<n>}`, or `<ref>@{<date>}` when `--date=`
     /// was given on the command line (git's `force_date`, i.e.
     /// `revs->date_mode_explicit`). `shorten` is `%gd`'s short ref; the `Reflog:`

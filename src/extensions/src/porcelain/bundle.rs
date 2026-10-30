@@ -834,7 +834,7 @@ fn create(args: &[String]) -> Result<ExitCode> {
         eprintln!("fatal: Need a repository to create a bundle.");
         return Ok(ExitCode::from(128));
     };
-    let Setup { pending, pathspecs, walk_args, unrecognized, diff, max_age, min_age } =
+    let Setup { pending, pathspecs, walk_args, unrecognized, diff, ages } =
         match resolve_revisions(&repo, &rev_args)? {
             Ok(setup) => setup,
             Err(code) => return Ok(code),
@@ -1004,12 +1004,12 @@ fn create(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
             // A tag is never warned about, but `--since` and `--until` still drop one whose
-            // own date is outside the window (its tagger line, 0 without one). Measured on
+            // own date is outside the window (bundle.c:416-421). Measured on
             // git 2.56.0: `bundle create <file> v1 --since=<after the tag was made>` and
             // `--until=<before it>` both refuse an empty bundle, while a cut that falls
             // between the tagged commit and the tag keeps the ref.
             if entry_kind == Some(Kind::Tag)
-                && !tag_in_age_window(&repo, entry.id, max_age, min_age)
+                && !tag_in_age_window(&repo, entry.id, ages)
             {
                 continue;
             }
@@ -1377,25 +1377,36 @@ struct Setup {
     /// `revs->diffopt`, for the `diff_setup_done()` checks.
     diff: super::diff_opt_parse::DiffOpts,
     /// `revs->max_age` and `revs->min_age`: `--since` / `--until` and their spellings.
-    max_age: Option<i64>,
-    min_age: Option<i64>,
+    ages: crate::revopt::Ages,
 }
 
-/// Whether a tag's own date, its tagger line or 0, lies inside the `--since` /
-/// `--until` window.
-fn tag_in_age_window(
-    repo: &gix::Repository,
-    id: ObjectId,
-    max_age: Option<i64>,
-    min_age: Option<i64>,
-) -> bool {
-    let date = repo
-        .find_object(id)
-        .ok()
-        .and_then(|o| o.try_into_tag().ok())
-        .and_then(|tag| tag.tagger().ok().flatten().map(|t| t.seconds()))
-        .unwrap_or(0);
-    max_age.is_none_or(|min| date >= min) && min_age.is_none_or(|max| date <= max)
+/// `is_tag_in_date_range()` (bundle.c:303-331): whether a tag's own date lies
+/// strictly inside the `--since` / `--until` window.
+///
+/// The date is whatever `parse_timestamp()` reads after the first `>` of the
+/// line that follows the first `"\ntagger "` anywhere in the object, and the
+/// comparisons are the unsigned `timestamp_t` ones. An object that cannot be
+/// read, or has no such line or no `>` on it, is in range.
+fn tag_in_age_window(repo: &gix::Repository, id: ObjectId, ages: crate::revopt::Ages) -> bool {
+    use crate::revopt::timestamp_t;
+    if ages.max_age.is_none() && ages.min_age.is_none() {
+        return true;
+    }
+    let Ok(object) = repo.find_object(id) else {
+        return true;
+    };
+    let buf: &[u8] = &object.data;
+    let Some(at) = buf.windows(8).position(|w| w == b"\ntagger ") else {
+        return true;
+    };
+    let line = &buf[at + 1..];
+    let line = &line[..line.iter().position(|&b| b == b'\n').unwrap_or(line.len())];
+    let Some(gt) = line.iter().position(|&b| b == b'>') else {
+        return true;
+    };
+    let (date, _) = crate::refstore::strtoumax(&buf[at + 1 + gt + 1..]);
+    ages.max_age.is_none_or(|bound| timestamp_t(bound) < date)
+        && ages.min_age.is_none_or(|bound| timestamp_t(bound) > date)
 }
 
 /// What the limited revision walk showed.
@@ -2008,7 +2019,7 @@ fn resolve_revisions(
         }
         walk
     });
-    Ok(Ok(Setup { pending, pathspecs, walk_args, unrecognized, diff, max_age: counts.max_age, min_age: counts.min_age }))
+    Ok(Ok(Setup { pending, pathspecs, walk_args, unrecognized, diff, ages: counts.ages() }))
 }
 
 /// git's `read_revisions_from_stdin()` (revision.c), the whole of it:

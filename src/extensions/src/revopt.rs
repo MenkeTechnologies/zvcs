@@ -150,9 +150,148 @@ pub fn parse_age(arg: &str) -> Result<Option<i64>, String> {
     if num == u64::MAX {
         return Ok(None);
     }
-    // A bound past `i64::MAX` can only exclude every commit there is, which is
-    // what the saturating conversion leaves it doing.
-    Ok(Some(i64::try_from(num).unwrap_or(i64::MAX)))
+    // Kept bit for bit: [`Ages`] compares it as the `timestamp_t` it is, so a
+    // bound past `i64::MAX` round-trips through the cast unchanged.
+    Ok(Some(num as i64))
+}
+
+/// `revs->max_age = approxidate(optarg)` and its `min_age` /
+/// `max_age_as_filter` twins (revision.c:2414-2431). `approxidate()` hands back
+/// a `timestamp_t`, and a date one second before the epoch is `(timestamp_t)-1`
+/// — the very value `REV_INFO_INIT` (revision.h:434-436) uses for "not given",
+/// so that date leaves the bound off, as it does in git.
+pub fn approxidate_age(arg: &str) -> Option<i64> {
+    let when = crate::date::approxidate(arg);
+    (timestamp_t(when) != u64::MAX).then_some(when)
+}
+
+/// A date as `struct rev_info` and `struct commit` hold it: `timestamp_t` is
+/// `uintmax_t` (git-compat-util.h), so a date before the epoch — the
+/// `approxidate()` of `100.years.ago` — compares above every real one.
+pub fn timestamp_t(seconds: i64) -> u64 {
+    seconds as u64
+}
+
+/// `revs->max_age`, `revs->min_age` and `revs->max_age_as_filter`, with the
+/// three tests revision.c makes of them. `None` is the `-1` sentinel each test
+/// starts with; every comparison is unsigned, as in the C.
+///
+/// The date a test is handed is `comparison_date()` (revision.c:4211-4217): the
+/// reflog entry's timestamp under `--walk-reflogs`, otherwise `commit->date`.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Ages {
+    pub max_age: Option<i64>,
+    pub min_age: Option<i64>,
+    pub max_age_as_filter: Option<i64>,
+}
+
+impl Ages {
+    /// Whether any of the three bounds is in force.
+    pub fn any(&self) -> bool {
+        self.max_age.is_some() || self.min_age.is_some() || self.max_age_as_filter.is_some()
+    }
+
+    /// `revs->max_age != -1 && date < revs->max_age`: the walk cut of
+    /// `limit_list()` (revision.c:1474), `explore_walk_step()` (3794) and
+    /// `get_revision_1()` (4472-4476), and `assign_blame()`'s (blame.c:2614-2616).
+    pub fn below_max_age(&self, date: i64) -> bool {
+        self.max_age.is_some_and(|bound| timestamp_t(date) < timestamp_t(bound))
+    }
+
+    /// `revs->min_age != -1 && date > revs->min_age` (revision.c:1487, 4252-4254).
+    pub fn above_min_age(&self, date: i64) -> bool {
+        self.min_age.is_some_and(|bound| timestamp_t(date) > timestamp_t(bound))
+    }
+
+    /// `revs->max_age_as_filter != -1 && date < revs->max_age_as_filter`
+    /// (revision.c:1490-1491, 4255-4257).
+    pub fn below_max_age_as_filter(&self, date: i64) -> bool {
+        self.max_age_as_filter.is_some_and(|bound| timestamp_t(date) < timestamp_t(bound))
+    }
+
+    /// The two tests `get_commit_action()` makes (revision.c:4252-4257): a
+    /// commit they fail is ignored, but the walk goes on through its parents.
+    pub fn ignores(&self, date: i64) -> bool {
+        self.above_min_age(date) || self.below_max_age_as_filter(date)
+    }
+
+    /// `revs->max_age` applied to a walk that was run without it, so that every
+    /// walker of history shares one cut.
+    ///
+    /// `walked` is that walk in its order, `tips` the commits it started from in
+    /// the order its queue received them, `parents` the parents
+    /// `process_parents()` went on to (after `--first-parent` and the shallow
+    /// grafts), and `date` the committer date.
+    ///
+    /// A *limited* walk (`revs->limited`) runs `limit_list()`, which paints a
+    /// commit below the bound `UNINTERESTING` and `mark_parents_uninteresting()`
+    /// paints its whole ancestry (revision.c:1474-1483), so nothing reachable from
+    /// it is listed even when a newer path leads there too.
+    ///
+    /// Otherwise the cut is `get_revision_1()`'s (revision.c:4472-4476): a commit
+    /// below the bound is popped and dropped *before* `process_parents()`, so its
+    /// parents enter the date queue only if some other commit hands them on, and
+    /// the order is that of the queue the shorter walk drains — newest committer
+    /// date first, a tie going to the commit queued first.
+    pub fn cut_max_age<P, D>(
+        &self,
+        walked: &[gix::ObjectId],
+        tips: &[gix::ObjectId],
+        limited: bool,
+        parents: P,
+        date: D,
+    ) -> Vec<gix::ObjectId>
+    where
+        P: Fn(&gix::ObjectId) -> Vec<gix::ObjectId>,
+        D: Fn(&gix::ObjectId) -> i64,
+    {
+        use std::collections::HashSet;
+        if self.max_age.is_none() {
+            return walked.to_vec();
+        }
+        if limited {
+            let mut uninteresting: HashSet<gix::ObjectId> = HashSet::new();
+            let mut stack: Vec<gix::ObjectId> =
+                walked.iter().copied().filter(|id| self.below_max_age(date(id))).collect();
+            while let Some(id) = stack.pop() {
+                if uninteresting.insert(id) {
+                    stack.extend(parents(&id));
+                }
+            }
+            return walked.iter().copied().filter(|id| !uninteresting.contains(id)).collect();
+        }
+        // `prio_queue` over `compare_commits_by_commit_date`, whose ties fall to
+        // the insertion counter: the key is (date, Reverse(seq)), largest first.
+        let mut queue: std::collections::BinaryHeap<(u64, std::cmp::Reverse<u64>, gix::ObjectId)> =
+            std::collections::BinaryHeap::new();
+        let mut seen: HashSet<gix::ObjectId> = HashSet::new();
+        let mut seq = 0u64;
+        for tip in tips {
+            if seen.insert(*tip) {
+                queue.push((timestamp_t(date(tip)), std::cmp::Reverse(seq), *tip));
+                seq += 1;
+            }
+        }
+        let in_walk: HashSet<gix::ObjectId> = walked.iter().copied().collect();
+        let mut out = Vec::new();
+        while let Some((_, _, id)) = queue.pop() {
+            if self.below_max_age(date(&id)) {
+                continue;
+            }
+            for parent in parents(&id) {
+                if seen.insert(parent) {
+                    queue.push((timestamp_t(date(&parent)), std::cmp::Reverse(seq), parent));
+                    seq += 1;
+                }
+            }
+            // A commit the uncut walk did not list (a tip it never reached
+            // because a read failed first) is not listed by the cut one either.
+            if in_walk.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
 }
 
 /// `parse_long_opt()` (diff.c:5380-5399): `--name=<value>` stuck, or `--name`
@@ -209,7 +348,7 @@ pub enum Count {
     /// `revs->min_age` — the `--until`/`--before`/`--min-age` side.
     MinAge(Option<i64>),
     /// `revs->max_age_as_filter`, the display-time twin of `--since`.
-    MaxAgeAsFilter(i64),
+    MaxAgeAsFilter(Option<i64>),
 }
 
 /// The `rev_info` fields this arm writes, plus the bookkeeping the two
@@ -241,6 +380,15 @@ pub struct Counts {
 }
 
 impl Counts {
+    /// The three age bounds, with the tests revision.c makes of them.
+    pub fn ages(&self) -> Ages {
+        Ages {
+            max_age: self.max_age,
+            min_age: self.min_age,
+            max_age_as_filter: self.max_age_as_filter,
+        }
+    }
+
     /// Fold one [`Count`] in, raising the `die()` text when it collides with what
     /// is already set.
     ///
@@ -295,7 +443,7 @@ impl Counts {
             }
             Count::MaxAge(v) => self.max_age = v,
             Count::MinAge(v) => self.min_age = v,
-            Count::MaxAgeAsFilter(v) => self.max_age_as_filter = Some(v),
+            Count::MaxAgeAsFilter(v) => self.max_age_as_filter = v,
         }
         Ok(())
     }
@@ -428,14 +576,12 @@ pub fn parse<S: AsRef<str>>(args: &[S], i: usize) -> Option<Result<Hit, String>>
     }
 
     long!("max-age", |v| parse_age(v).map(Count::MaxAge));
-    long!("since", |v| Ok(Count::MaxAge(Some(crate::date::approxidate(v)))));
-    long!("since-as-filter", |v| Ok(Count::MaxAgeAsFilter(
-        crate::date::approxidate(v)
-    )));
-    long!("after", |v| Ok(Count::MaxAge(Some(crate::date::approxidate(v)))));
+    long!("since", |v| Ok(Count::MaxAge(approxidate_age(v))));
+    long!("since-as-filter", |v| Ok(Count::MaxAgeAsFilter(approxidate_age(v))));
+    long!("after", |v| Ok(Count::MaxAge(approxidate_age(v))));
     long!("min-age", |v| parse_age(v).map(Count::MinAge));
-    long!("before", |v| Ok(Count::MinAge(Some(crate::date::approxidate(v)))));
-    long!("until", |v| Ok(Count::MinAge(Some(crate::date::approxidate(v)))));
+    long!("before", |v| Ok(Count::MinAge(approxidate_age(v))));
+    long!("until", |v| Ok(Count::MinAge(approxidate_age(v))));
 
     None
 }

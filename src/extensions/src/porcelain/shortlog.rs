@@ -1187,9 +1187,48 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             Some(_) => walk(repo, &tips, &[], &filters)?,
             None => walk(repo, &tips, &hidden, &filters)?,
         };
-        let items = match &fp_excluded {
+        let items: Vec<WalkItem> = match &fp_excluded {
             Some(excluded) => items.into_iter().filter(|it| !excluded.contains(&it.id)).collect(),
             None => items,
+        };
+        // `revs->max_age`, cut as [`crate::revopt::Ages::cut_max_age`] describes.
+        // The walk is limited by an UNINTERESTING pending commit
+        // (revision.c:431-436), by `topo_order` (revision.c:3195-3196) and by
+        // `--ancestry-path` and `--simplify-by-decoration` (revision.c:2438-2483).
+        let ages = filters.counts.ages();
+        let items = match ages.max_age {
+            None => items,
+            Some(_) => {
+                let limited = !hidden.is_empty()
+                    || filters.order != Order::Default
+                    || filters.ancestry_path
+                    || simplify_by_decoration;
+                let parents_of: std::collections::HashMap<ObjectId, Vec<ObjectId>> = items
+                    .iter()
+                    .map(|it| {
+                        let followed = match filters.first_parent {
+                            true => &it.parents[..it.parents.len().min(1)],
+                            false => &it.parents[..],
+                        };
+                        (it.id, followed.to_vec())
+                    })
+                    .collect();
+                let dates: std::collections::HashMap<ObjectId, i64> = items
+                    .iter()
+                    .map(|it| (it.id, super::rev_list::commit_date(repo, it.id)))
+                    .collect();
+                let walked: Vec<ObjectId> = items.iter().map(|it| it.id).collect();
+                let kept = ages.cut_max_age(
+                    &walked,
+                    &tips,
+                    limited,
+                    |id| parents_of.get(id).cloned().unwrap_or_default(),
+                    |id| dates.get(id).copied().unwrap_or(0),
+                );
+                let mut by_id: std::collections::HashMap<ObjectId, WalkItem> =
+                    items.into_iter().map(|it| (it.id, it)).collect();
+                kept.iter().filter_map(|id| by_id.remove(id)).collect()
+            }
         };
         if let Some(abort) = abort {
             // A pathspec puts `try_to_simplify_commit()` (revision.c:1182) ahead of
@@ -1851,27 +1890,14 @@ fn parent_count_matches(parents: usize, filters: &Filters) -> bool {
     }
 }
 
-/// git's `--since`/`--until` gate, applied to the commit timestamp.
+/// `get_commit_action()`'s `--until` and `--since-as-filter` tests
+/// (revision.c:4252-4257). `--since` itself cut the walk before this ran.
 fn time_matches(commit: &gix::Commit<'_>, filters: &Filters) -> Result<bool> {
-    let c = &filters.counts;
-    if c.max_age.is_none() && c.min_age.is_none() && c.max_age_as_filter.is_none() {
+    let ages = filters.counts.ages();
+    if ages.min_age.is_none() && ages.max_age_as_filter.is_none() {
         return Ok(true);
     }
-    let seconds = commit.time()?.seconds;
-    if c.max_age.is_some_and(|since| seconds < since) {
-        return Ok(false);
-    }
-    // `revs->max_age_as_filter` is applied by `get_commit_action()` rather than
-    // `limit_list()`, so it hides a commit without hiding its ancestors. This
-    // walk already never prunes on `--since`, so here the two cutoffs differ
-    // only in that both can be in force at once.
-    if c.max_age_as_filter.is_some_and(|since| seconds < since) {
-        return Ok(false);
-    }
-    if c.min_age.is_some_and(|until| seconds > until) {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(!ages.ignores(commit.time()?.seconds))
 }
 
 

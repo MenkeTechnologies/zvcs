@@ -2308,25 +2308,53 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
         // counter runs out, and `--reverse` reverses what survived that limit rather
         // than limiting the reversed stream (revision.c:4683-4692).
         let mut nodes = walked;
-        // `--since`/`--until`/`--max-age`/`--min-age`/`--since-as-filter` gate on
-        // the committer date. This walk never prunes, so all four cutoffs are
-        // applied to what it produced rather than to what it explores — the
-        // difference `--since-as-filter` exists to draw does not arise here.
-        if counts.max_age.is_some() || counts.min_age.is_some() || counts.max_age_as_filter.is_some()
-        {
-            let mut kept = Vec::with_capacity(nodes.len());
-            for node in nodes {
-                let seconds = repo.find_commit(node.id)?.time()?.seconds;
-                let too_old = counts.max_age.is_some_and(|since| seconds < since)
-                    || counts
-                        .max_age_as_filter
-                        .is_some_and(|since| seconds < since);
-                let too_new = counts.min_age.is_some_and(|until| seconds > until);
-                if !too_old && !too_new {
-                    kept.push(node);
+        // `--since`/`--until`/`--max-age`/`--min-age`/`--since-as-filter`,
+        // measured against `comparison_date()` (revision.c:4211-4217): the reflog
+        // entry's date under `-g`, the committer date otherwise. A reflog walk
+        // drops the entries the `max_age` test fails as it hands them out
+        // (revision.c:4472-4476); any other walk is cut as
+        // [`crate::revopt::Ages::cut_max_age`] describes, limited by a range's
+        // UNINTERESTING bottom (revision.c:431-436) or by `topo_order`
+        // (revision.c:3195-3196). `get_commit_action()`'s two tests follow.
+        let ages = counts.ages();
+        if ages.any() {
+            let mut dates: std::collections::HashMap<ObjectId, i64> = std::collections::HashMap::new();
+            for node in &nodes {
+                if node.reflog.is_none() {
+                    dates.insert(node.id, repo.find_commit(node.id)?.time()?.seconds);
                 }
             }
-            nodes = kept;
+            let date = |node: &super::log::Node| match &node.reflog {
+                Some(entry) => entry.seconds(),
+                None => dates.get(&node.id).copied().unwrap_or(0),
+            };
+            if reflog_from.is_some() {
+                nodes.retain(|n| !ages.below_max_age(date(n)));
+            } else if ages.max_age.is_some() {
+                let limited = !walk_hidden.is_empty() || order != super::log::Order::Default;
+                let parents_of: std::collections::HashMap<ObjectId, Vec<ObjectId>> = nodes
+                    .iter()
+                    .map(|n| {
+                        let followed = match first_parent {
+                            true => &n.parents[..n.parents.len().min(1)],
+                            false => &n.parents[..],
+                        };
+                        (n.id, followed.to_vec())
+                    })
+                    .collect();
+                let walked: Vec<ObjectId> = nodes.iter().map(|n| n.id).collect();
+                let kept = ages.cut_max_age(
+                    &walked,
+                    &walk_tips,
+                    limited,
+                    |id| parents_of.get(id).cloned().unwrap_or_default(),
+                    |id| dates.get(id).copied().unwrap_or(0),
+                );
+                let mut by_id: std::collections::HashMap<ObjectId, super::log::Node> =
+                    nodes.into_iter().map(|n| (n.id, n)).collect();
+                nodes = kept.iter().filter_map(|id| by_id.remove(id)).collect();
+            }
+            nodes.retain(|n| !ages.ignores(date(n)));
         }
         // `--max-count-oldest` keeps the *last* `max_count` commits of the walk,
         // still in walk order (`retrieve_oldest_commits()`, revision.c:4596-4657),
@@ -2416,12 +2444,11 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
                 reverse_stage = reverse;
+                // `get_revision_1()`'s `max_age` test on the `REV_WALK_NO_WALK` pop
+                // (revision.c:4472-4476), then `get_commit_action()`'s two.
+                let ages = counts.ages();
                 let seconds = repo.find_commit(*id)?.time()?.seconds;
-                let too_old = counts.max_age.is_some_and(|since| seconds < since)
-                    || counts
-                        .max_age_as_filter
-                        .is_some_and(|since| seconds < since);
-                if too_old || counts.min_age.is_some_and(|until| seconds > until) {
+                if ages.below_max_age(seconds) || ages.ignores(seconds) {
                     continue;
                 }
                 if let Some(specs) = no_walk_specs.as_mut() {

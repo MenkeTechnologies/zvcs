@@ -300,7 +300,7 @@ pub fn parse_reflog_line(line: &[u8], kind: gix::hash::Kind) -> Option<ReflogEnt
 /// `strtoumax(s, &end, 10)`: leading white space, an optional sign, then the
 /// digits; the value saturates on overflow and a `-` negates it as unsigned.
 /// Without digits the value is 0 and nothing is consumed.
-fn strtoumax(s: &[u8]) -> (u64, &[u8]) {
+pub(crate) fn strtoumax(s: &[u8]) -> (u64, &[u8]) {
     // The C library's `isspace()`: space and \t \n \v \f \r.
     let start = s.iter().position(|c| !matches!(c, b' ' | b'\t'..=b'\r')).unwrap_or(s.len());
     let (negative, digits_at) = match s.get(start) {

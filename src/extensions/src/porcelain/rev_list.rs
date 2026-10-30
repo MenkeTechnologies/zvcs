@@ -1126,12 +1126,9 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `handle_revision_opt()`'s count-and-age state; the locals around it are
     // refreshed from it as each option lands. See [`crate::revopt`].
     let mut counts = crate::revopt::Counts::default();
-    // `--since`/`--until` are git's `max_age`/`min_age`, both committer-date.
-    let mut max_age: Option<i64> = None;
-    let mut min_age: Option<i64> = None;
-    // `revs->max_age_as_filter` (`--since-as-filter`): the same bound as
-    // `max_age`, applied as an output filter rather than as a walk cut.
-    let mut max_age_as_filter: Option<i64> = None;
+    // `revs->max_age`, `revs->min_age` and `revs->max_age_as_filter`, read off
+    // `counts`; see [`crate::revopt::Ages`].
+    let mut ages = crate::revopt::Ages::default();
     // `revs->dense` (revision.c:2462-2465), which `repo_init_revisions()` starts
     // at 1. `--sparse` clears it and `--dense` puts it back.
     let mut dense = true;
@@ -1351,9 +1348,7 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             Some(Ok(hit)) => {
                 max_count = counts.max_count;
                 skip_count = counts.skip;
-                max_age = counts.max_age;
-                min_age = counts.min_age;
-                max_age_as_filter = counts.max_age_as_filter;
+                ages = counts.ages();
                 if counts.no_walk_cleared {
                     no_walk = false;
                 }
@@ -2751,6 +2746,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // What `limit_list()` painted UNINTERESTING under `-g`: the ancestry of a
     // commit pended before `-g` was read.
     let mut reflog_uninteresting: HashSet<ObjectId> = HashSet::new();
+    // Under `-g`, `comparison_date()` of each entry in `commits` (revision.c:4211-4217).
+    let mut reflog_dates: Option<Vec<i64>> = None;
     // The reflog walk replaces the list wholesale: each entry is one "commit" in
     // the order `git log -g` reports them, and every filter below then applies to
     // that list exactly as it would to an ancestry walk.
@@ -2766,6 +2763,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             super::log::reflog_walk(&repo, &reflog_names)?
         };
         commits = nodes.iter().map(|n| n.id).collect();
+        let mut dates: Vec<i64> =
+            nodes.iter().map(|n| n.reflog.as_ref().map_or(0, |r| r.seconds())).collect();
         // `get_revision_1()` takes each commit from `next_reflog_entry()` and only
         // runs `try_to_simplify_commit()` on it (revision.c:4385-4420), never
         // following a parent: every entry is walked. The reachability passes below
@@ -2780,24 +2779,63 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         // reflog entries come out.
         if !hidden.is_empty() {
             reflog_uninteresting = super::log::ancestor_closure(&repo, &hidden)?;
-            commits.retain(|id| !reflog_uninteresting.contains(id));
+            (commits, dates) = commits
+                .iter()
+                .copied()
+                .zip(dates)
+                .filter(|(id, _)| !reflog_uninteresting.contains(id))
+                .unzip();
         }
+        reflog_dates = Some(dates);
         parents_of = nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
         abort = None;
     }
 
-    // `--since` is git's `max_age`: a commit older than the bound is marked
-    // UNINTERESTING, which prunes everything it reaches as well. `--until`
-    // (`min_age`) only skips the commit itself and keeps walking.
-    if let Some(bound) = max_age {
-        let stale: Vec<ObjectId> = commits
-            .iter()
-            .copied()
-            .filter(|id| commit_date(&repo, *id) < bound)
-            .collect();
-        if !stale.is_empty() {
-            let pruned = reachable_from(&stale, &parents_of);
-            commits.retain(|id| !pruned.contains(id));
+    // `revs->limited` (revision.c:431-436, 2438-2547, 2750, 3195-3196): an
+    // UNINTERESTING pending commit, `topo_order` without generation numbers, or
+    // one of the options that set it where they are parsed. `--bisect` sets it
+    // in `cmd_rev_list()` (builtin/rev-list.c:916-917).
+    let limited = seeds.iter().any(|s| s.uninteresting)
+        || order != Order::Date
+        || ancestry_path
+        || cherry_mark
+        || cherry_pick
+        || left_only
+        || right_only
+        || show_children
+        || simplify_merges_opt
+        || simplify_by_decoration
+        || bisect;
+    // `revs->max_age`: under `-g` the reflog arm of `get_revision_1()` drops each
+    // entry whose own date fails the test (revision.c:4472-4476); `--no-walk`
+    // pops the pending list the same way; any other walk is cut as
+    // [`crate::revopt::Ages::cut_max_age`] describes.
+    if ages.max_age.is_some() {
+        if let Some(dates) = reflog_dates.as_mut() {
+            (commits, *dates) = commits
+                .iter()
+                .copied()
+                .zip(dates.iter().copied())
+                .filter(|(_, date)| !ages.below_max_age(*date))
+                .unzip();
+        } else if no_walk && !limited {
+            commits.retain(|id| !ages.below_max_age(commit_date(&repo, *id)));
+        } else {
+            let dates: HashMap<ObjectId, i64> =
+                parents_of.keys().chain(commits.iter()).map(|id| (*id, commit_date(&repo, *id))).collect();
+            commits = ages.cut_max_age(
+                &commits,
+                &tips,
+                limited,
+                |id| {
+                    let parents = parents_of.get(id).map_or(&[][..], Vec::as_slice);
+                    match first_parent {
+                        true => parents[..parents.len().min(1)].to_vec(),
+                        false => parents.to_vec(),
+                    }
+                },
+                |id| dates.get(id).copied().unwrap_or(0),
+            );
         }
     }
     // Every commit `process_parents()` handles from here on sets `CHILD_VISITED` on
@@ -2809,11 +2847,20 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         true => commits.clone(),
         false => Vec::new(),
     };
-    if let Some(bound) = min_age {
-        commits.retain(|id| commit_date(&repo, *id) <= bound);
-    }
-    if let Some(bound) = max_age_as_filter {
-        commits.retain(|id| commit_date(&repo, *id) >= bound);
+    // `--until` and `--since-as-filter`: `get_commit_action()`'s two tests
+    // (revision.c:4252-4257), against the same `comparison_date()`.
+    if ages.min_age.is_some() || ages.max_age_as_filter.is_some() {
+        match reflog_dates.as_ref() {
+            Some(dates) => {
+                commits = commits
+                    .iter()
+                    .zip(dates)
+                    .filter(|(_, date)| !ages.ignores(**date))
+                    .map(|(id, _)| *id)
+                    .collect();
+            }
+            None => commits.retain(|id| !ages.ignores(commit_date(&repo, *id))),
+        }
     }
 
     // `SYMMETRIC_LEFT` reaches every ancestor of the left tip: `process_parents`
@@ -3122,8 +3169,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             && !reverse
             && max_count.is_none()
             && skip_count == 0
-            && min_age.is_none()
-            && max_age.is_none()
+            && ages.min_age.is_none()
+            && ages.max_age.is_none()
             && min_parents <= 0
             && max_parents.is_none()
             && pathspecs.is_empty()
@@ -3176,17 +3223,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
             let reachable = reachable_from(&tips, &parents_of);
             maximal_processed.retain(|id| reachable.contains(id));
         }
-        let limited = seeds.iter().any(|s| s.uninteresting)
-            || order != Order::Date
-            || ancestry_path
-            || cherry_mark
-            || cherry_pick
-            || left_only
-            || right_only
-            || show_children
-            || simplify_merges_opt
-            || simplify_by_decoration
-            || bisect;
         let passes = maximal_passes(
             &maximal_processed,
             |id| parents_of.get(id).cloned().unwrap_or_default(),

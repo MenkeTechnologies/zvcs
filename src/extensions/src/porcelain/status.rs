@@ -5000,9 +5000,14 @@ fn render_long(
     if progress.merge {
         if progress.rebase_interactive {
             // A conflicted `rebase -i` shows what the todo list is doing before the
-            // merge banner, with a plain newline between them.
+            // merge banner, with a plain newline between them: a raw
+            // `fputs("\n", s->fp)` (wt-status.c:1972-1975) rather than a
+            // `status_printf`, so no comment prefix lands on it in a
+            // `COMMIT_EDITMSG` template or under `status.displayCommentPrefix`.
+            // It rides as a block for that reason.
             out.push_str(rebase_info);
-            out.push('\n');
+            out.push_str(&format!("\u{1}{}\u{1}\n", blocks.len()));
+            blocks.push("\n".to_string());
         }
         if unmerged.is_empty() {
             out.push_str(&h("All conflicts fixed but you are still merging.\n"));
@@ -5283,9 +5288,9 @@ fn render_long(
     // report. This renderer accumulates, so the flush has to be explicit; see
     // [`flush_rendered`].
     if let Some(limit) = submodule_summary_limit {
-        flush_rendered(&mut out, comment_prefix, sink);
+        flush_rendered(&mut out, comment_prefix, &blocks, sink);
         out.push_str(&submodule_summary(workdir, false, limit, reference));
-        flush_rendered(&mut out, comment_prefix, sink);
+        flush_rendered(&mut out, comment_prefix, &blocks, sink);
         out.push_str(&submodule_summary(workdir, true, limit, reference));
     }
 
@@ -5529,20 +5534,7 @@ fn render_long(
 
     // `status.displayCommentPrefix`: prefix each body line with the comment string
     // (git's `status_vprintf`). The trailer keeps its raw, unprefixed form.
-    let mut body = match comment_prefix {
-        Some(cs) => comment_prefix_body(&out, cs),
-        None => out,
-    };
-    // Splice the pre-laid-out column blocks over their sentinels. A sentinel line
-    // does not start with a tab, so `comment_prefix_body` renders it as `<cs> <s>`;
-    // the block itself already carries the correct (possibly `#`/colored) indent.
-    for (idx, block) in blocks.iter().enumerate() {
-        let key = match comment_prefix {
-            Some(cs) => format!("{cs} \u{1}{idx}\u{1}\n"),
-            None => format!("\u{1}{idx}\u{1}\n"),
-        };
-        body = body.replace(&key, block);
-    }
+    let mut body = prefix_and_splice(out, comment_prefix, &blocks);
     body.push_str(&trailer);
     body
 }
@@ -5574,17 +5566,34 @@ enum LongSink {
 /// `comment_prefix_body` is line-wise and every flush point sits on a line
 /// boundary, so prefixing the halves separately is the same as prefixing the
 /// whole — which is also how git does it, one `status_printf` at a time.
-fn flush_rendered(out: &mut String, comment_prefix: Option<&str>, sink: LongSink) {
+fn flush_rendered(out: &mut String, comment_prefix: Option<&str>, blocks: &[String], sink: LongSink) {
     if sink == LongSink::Retain || out.is_empty() {
         return;
     }
-    let text = std::mem::take(out);
-    let text = match comment_prefix {
+    let text = prefix_and_splice(std::mem::take(out), comment_prefix, blocks);
+    crate::cstdio::write_bytes(text.as_bytes());
+    crate::cstdio::before_spawn();
+}
+
+/// Comment-prefix a rendered stretch of the long-format body, then splice the
+/// blocks [`render_long`] set aside over their sentinels: the pre-laid-out
+/// column listings, the verbose patches, and the raw lines git writes past
+/// `status_printf`. A sentinel line does not start with a tab, so
+/// `comment_prefix_body` renders it as `<cs> <s>`; the block itself already
+/// carries the correct (possibly `#`/colored) indent, or none.
+fn prefix_and_splice(text: String, comment_prefix: Option<&str>, blocks: &[String]) -> String {
+    let mut body = match comment_prefix {
         Some(cs) => comment_prefix_body(&text, cs),
         None => text,
     };
-    crate::cstdio::write_bytes(text.as_bytes());
-    crate::cstdio::before_spawn();
+    for (idx, block) in blocks.iter().enumerate() {
+        let key = match comment_prefix {
+            Some(cs) => format!("{cs} \u{1}{idx}\u{1}\n"),
+            None => format!("\u{1}{idx}\u{1}\n"),
+        };
+        body = body.replace(&key, block);
+    }
+    body
 }
 
 /// The leading SGR sequence git's `color()` would emit for `slot`, recovered from

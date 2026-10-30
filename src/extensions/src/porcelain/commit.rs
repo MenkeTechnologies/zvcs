@@ -1818,7 +1818,7 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // where this port used to leave `<root>=-1/1`, because it only rebuilt the
     // cache-tree past the hook, on the way to the commit it never made.
     if !all && !include_flag && !only_mode {
-        super::write_tree::update_cache_tree_if_stale(&repo, &mut index)?;
+        prepare_index_cache_tree(&repo, &mut index)?;
         // `SKIP_IF_UNCHANGED` skips only an index whose `cache_changed` is zero, and the
         // `UNTRACKED_CHANGED` bit `tweak_untracked_cache()` sets on the read counts: a
         // cache `core.untrackedCache` just created or dropped is written here.
@@ -2002,26 +2002,23 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // the listed paths swapped for their worktree content instead — see
     // [`PartialIndex`], which also stages those paths into the real index — but
     // only once the commit has actually been recorded, so it stays borrowed here.
-    let tree_id: ObjectId = if let Some(partial) = &partial {
-        partial.tree(&repo)?
-    } else {
-        match super::write_tree::refresh_cache_tree(&repo, &mut index, false)? {
-            Ok(id) => id,
-            Err(err) => {
-                // `if (cache_tree_update(the_repository->index, 0)) { error(_("Error
-                // building trees")); return 0; }` (builtin/commit.c:1111-1114), and a
-                // `prepare_to_commit()` that returns 0 makes `cmd_commit` exit 1.
-                super::write_tree::report_tree_build_failure(&err);
-                eprintln!("error: Error building trees");
-                return Ok(ExitCode::from(1));
-            }
-        }
-    };
+    //
+    // A tree that cannot be built is not reported here: `prepare_index()`'s
+    // `cache_tree_update(..., WRITE_TREE_SILENT)` (builtin/commit.c:488) fails
+    // quietly, and the loud `cache_tree_update(the_repository->index, 0)` that says
+    // so comes at :1111, after the message is on disk and the `!committable` guard
+    // has passed. The failure is held in `tree_build` until that point.
+    let tree_build: std::result::Result<ObjectId, gix::index::extension::tree::update::Error> =
+        if let Some(partial) = &partial {
+            Ok(partial.tree(&repo)?)
+        } else {
+            super::write_tree::refresh_cache_tree(&repo, &mut index, false)?
+        };
 
-    // The point `prepare_to_commit()` starts at: the index is refreshed and the
-    // tree is written, and everything it dies over dies from here on. An
-    // unreadable `-F` file or an unparsable `--date` is one of those, and the
-    // objects and index above stay behind exactly as stock leaves them.
+    // The point `prepare_to_commit()` starts at: the index is refreshed, and
+    // everything it dies over dies from here on. An unreadable `-F` file or an
+    // unparsable `--date` is one of those, and the objects and index above stay
+    // behind exactly as stock leaves them.
     if let Some(msg) = deferred_fatal {
         crate::git_fatal!("{msg}");
     }
@@ -2076,82 +2073,21 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     };
 
     let snap = repo.config_snapshot();
-    // `-t`/`--template <file>` beats `commit.template`; both seed the buffer and
-    // both arm git's `template_untouched()` abort. `--no-template` changes nothing,
-    // so a configured `commit.template` still applies; `-t ''` assigned NULL over it.
-    let template_file: Option<std::path::PathBuf> = match &template_arg {
-        Some(t) => Some(expand_tilde(t)),
-        None if template_assigned => None,
-        None => snap.string("commit.template").map(|v| expand_tilde(&v.to_string())),
+    // git's `committable`: whether the index records something the parent does
+    // not. `prepare_to_commit()` learns it while writing the message — from
+    // `run_status()` into `COMMIT_EDITMSG` when an editor gets the status block
+    // (builtin/commit.c:1025), from `index_differs_from()` otherwise (:1062) — and
+    // tests it only once the message is on disk (:1081), so the guard sits below.
+    // A tree that could not be built names an index entry whose object is gone,
+    // which no intact parent tree holds: that index differs, and the commit goes
+    // on to the :1111 failure as stock's does.
+    let unchanged = match &tree_build {
+        Ok(tree_id) => match parent_tree_id {
+            Some(pt) => pt == *tree_id,
+            None => *tree_id == ObjectId::empty_tree(hash),
+        },
+        Err(_) => false,
     };
-
-    // --- nothing-to-commit guard -----------------------------------------
-    let unchanged = match parent_tree_id {
-        Some(pt) => pt == tree_id,
-        None => tree_id == ObjectId::empty_tree(hash),
-    };
-    // git's guard is `!committable && whence != FROM_MERGE && !allow_empty &&
-    // !(amend && is_a_merge(current_head))` (builtin/commit.c:1081-1082).
-    // Concluding a merge is exempt because resolving every conflict back to
-    // `HEAD`'s content still has to record the merge, and *amending* a merge is
-    // exempt for the same reason — the commit being rewritten is a merge, so it
-    // stays one whatever its tree says.
-    let amending_a_merge = amend && parents.len() > 1;
-    if unchanged && !allow_empty && whence != Whence::Merge && !amending_a_merge {
-        // `prepare_to_commit()` reads the template into the message buffer before it
-        // reaches the `!committable` guard, so an unreadable one dies first.
-        if let Some(path) = &template_file {
-            let seeded_elsewhere = from_flags
-                || squash_fixup_seed.is_some()
-                || reuse_commit.is_some()
-                || amend
-                || repo.git_dir().join("MERGE_MSG").exists()
-                || repo.git_dir().join("SQUASH_MSG").exists();
-            if !seeded_elsewhere {
-                if let Err(e) = std::fs::read_to_string(path) {
-                    crate::git_fatal!("could not read '{}': {}", path.display(), crate::external::strerror(&e));
-                }
-            }
-        }
-        // `git_committer_info(IDENT_STRICT)` (builtin/commit.c:941) stands between the
-        // template read and the `!committable` guard (builtin/commit.c:1081).
-        if let Some(refusal) = committer_refusal {
-            return Ok(refusal.die());
-        }
-        // `run_status(stdout, index_file, prefix, 0, s)` (builtin/commit.c:1085).
-        // The refusal *is* a status report: git runs the engine `git status` runs,
-        // over the index this commit would have used, on stdout — and only then
-        // adds whatever advice the situation calls for on stderr. Nothing else is
-        // printed for a plain empty commit, so this report is the whole message.
-        //
-        // An `--amend` refusal takes the same route: `s->amend`/`s->reference` were
-        // set by `run_status()` long before the guard ran, so the report is the
-        // `HEAD^1` one and only the advice underneath it differs. What git does
-        // *not* do here is `die()` — the advice goes to stderr with no `fatal:` in
-        // front of it and the exit code is 1, not 128.
-        //
-        // The long format is the only one reachable: a `--short`/`--porcelain`/
-        // `-z` request has already turned the command into a dry run
-        // (builtin/commit.c:1422-1423) and returned far above.
-        //
-        // `index_file` here is `prepare_index()`'s return value, so under `--only`
-        // the report is taken over the *false* index — HEAD's tree with just the
-        // named paths swapped in — and not over the repository's. That is what
-        // makes `git commit -m x -- untouched.txt` in a repository with other
-        // staged work say "Changes not staged for commit" about that work: the
-        // false index holds HEAD's version of it, so it reads as a worktree-only
-        // difference. The real index is never even written on this path, since git
-        // reaches `rollback_index_files()` (builtin/commit.c:1845) instead of
-        // `commit_index_files()`.
-        let code = {
-            let _swap = match &partial {
-                Some(p) => Some(IndexSwap::install(&repo, &p.index)?),
-                None => None,
-            };
-            refuse_nothing_to_commit(untracked_arg.as_deref(), amend, whence)?
-        };
-        return Ok(code);
-    }
 
     // --- message: `prepare_to_commit()` -----------------------------------
     // `use_editor` and `no_edit` are settled above, before `pre-commit` runs.
@@ -2434,16 +2370,26 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             true => super::status::Reference::AmendParent,
             false => super::status::Reference::Commit,
         };
-        if let Err(e) = super::status::commit_template_block(
-            reference,
-            untracked_arg.as_deref(),
-            &comment,
-            verbose,
-            // `s->added_cut_line`: the scissors line above this block, which
-            // `--cleanup=scissors` already wrote (builtin/commit.c:963, :986).
-            cleanup == Cleanup::Scissors,
-            &mut buf,
-        ) {
+        //
+        // The status is `index_file`'s, so under `--only` it is taken over the
+        // false index, as the refusal's `run_status()` below is.
+        let block = {
+            let _swap = match &partial {
+                Some(p) => Some(IndexSwap::install(&repo, &p.index)?),
+                None => None,
+            };
+            super::status::commit_template_block(
+                reference,
+                untracked_arg.as_deref(),
+                &comment,
+                verbose,
+                // `s->added_cut_line`: the scissors line above this block, which
+                // `--cleanup=scissors` already wrote (builtin/commit.c:963, :986).
+                cleanup == Cleanup::Scissors,
+                &mut buf,
+            )
+        };
+        if let Err(e) = block {
             std::fs::write(&msg_path, crate::rawarg::to_bytes(&buf))?;
             return Err(e);
         }
@@ -2467,6 +2413,67 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     if !trailer_args.is_empty() {
         apply_trailers(&repo, &msg_path, &trailer_args)?;
     }
+
+    // --- nothing-to-commit guard -----------------------------------------
+    // git's guard is `!committable && whence != FROM_MERGE && !allow_empty &&
+    // !(amend && is_a_merge(current_head))` (builtin/commit.c:1081-1082), reached
+    // after `pre-commit` (:780), the template write (:931), the committer check
+    // (:941), the status block or `index_differs_from()` and `--trailer` (:1069),
+    // and before `prepare-commit-msg` (:1116). So `commit -m x` with nothing
+    // staged leaves `x` in `COMMIT_EDITMSG` and runs `pre-commit` but not
+    // `prepare-commit-msg` or `commit-msg`.
+    // Concluding a merge is exempt because resolving every conflict back to
+    // `HEAD`'s content still has to record the merge, and *amending* a merge is
+    // exempt for the same reason — the commit being rewritten is a merge, so it
+    // stays one whatever its tree says.
+    let amending_a_merge = amend && parents.len() > 1;
+    if unchanged && !allow_empty && whence != Whence::Merge && !amending_a_merge {
+        // `run_status(stdout, index_file, prefix, 0, s)` (builtin/commit.c:1085).
+        // The refusal *is* a status report: git runs the engine `git status` runs,
+        // over the index this commit would have used, on stdout — and only then
+        // adds whatever advice the situation calls for on stderr. Nothing else is
+        // printed for a plain empty commit, so this report is the whole message.
+        //
+        // An `--amend` refusal takes the same route: `s->amend`/`s->reference` were
+        // set by `run_status()` long before the guard ran, so the report is the
+        // `HEAD^1` one and only the advice underneath it differs. What git does
+        // *not* do here is `die()` — the advice goes to stderr with no `fatal:` in
+        // front of it and the exit code is 1, not 128.
+        //
+        // The long format is the only one reachable: a `--short`/`--porcelain`/
+        // `-z` request has already turned the command into a dry run
+        // (builtin/commit.c:1422-1423) and returned far above.
+        //
+        // `index_file` here is `prepare_index()`'s return value, so under `--only`
+        // the report is taken over the *false* index — HEAD's tree with just the
+        // named paths swapped in — and not over the repository's. That is what
+        // makes `git commit -m x -- untouched.txt` in a repository with other
+        // staged work say "Changes not staged for commit" about that work: the
+        // false index holds HEAD's version of it, so it reads as a worktree-only
+        // difference. The real index is never even written on this path, since git
+        // reaches `rollback_index_files()` (builtin/commit.c:1845) instead of
+        // `commit_index_files()`.
+        let code = {
+            let _swap = match &partial {
+                Some(p) => Some(IndexSwap::install(&repo, &p.index)?),
+                None => None,
+            };
+            refuse_nothing_to_commit(untracked_arg.as_deref(), amend, whence)?
+        };
+        return Ok(code);
+    }
+
+    // `if (cache_tree_update(the_repository->index, 0)) { error(_("Error building
+    // trees")); return 0; }` (builtin/commit.c:1111-1114), and a
+    // `prepare_to_commit()` that returns 0 makes `cmd_commit` exit 1.
+    let tree_id: ObjectId = match tree_build {
+        Ok(id) => id,
+        Err(err) => {
+            super::write_tree::report_tree_build_failure(&err);
+            eprintln!("error: Error building trees");
+            return Ok(ExitCode::from(1));
+        }
+    };
 
     // ```c
     // if (run_commit_hook(use_editor, index_file, NULL, "prepare-commit-msg",
@@ -3227,7 +3234,7 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
         if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(repo, &real, |_| true)? {
             return death.die();
         }
-        super::write_tree::update_cache_tree_if_stale(repo, &mut real)?;
+        prepare_index_cache_tree(repo, &mut real)?;
         None
     };
 
@@ -3282,6 +3289,23 @@ fn dry_run_commit(repo: &gix::Repository, o: &DryRun) -> Result<ExitCode> {
     } else {
         ExitCode::from(1)
     })
+}
+
+/// `prepare_index()`'s as-is `cache_tree_update(the_repository->index,
+/// WRITE_TREE_SILENT)` (builtin/commit.c:487-488): rebuild a stale cache-tree and
+/// record it, before any hook runs.
+///
+/// `WRITE_TREE_SILENT` quiets only `verify_cache()`'s unmerged report
+/// (cache-tree.c:222-223); its directory/file report (:247-252) and
+/// `update_one()`'s `invalid object` line (:459-460) print all the same. So an
+/// index naming a missing blob says `invalid object` here and again at the loud
+/// update past the `!committable` guard (builtin/commit.c:1111).
+fn prepare_index_cache_tree(repo: &gix::Repository, index: &mut gix::index::File) -> Result<()> {
+    match super::write_tree::refresh_cache_tree(repo, index, false)? {
+        Err(gix::index::extension::tree::update::Error::Unmerged(_)) | Ok(_) => {}
+        Err(err) => super::write_tree::report_tree_build_failure(&err),
+    }
+    Ok(())
 }
 
 /// The report the empty-commit refusal is made of: `run_status(stdout,

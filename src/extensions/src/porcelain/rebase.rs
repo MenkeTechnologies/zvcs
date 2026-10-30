@@ -2265,7 +2265,13 @@ pub fn rebase(args: &[String]) -> Result<ExitCode> {
     // given rather than taking a different path, so the todo list is built,
     // (not) edited and executed either way. Only the exact-replay shape above
     // and the apply backend bypass it.
-    if !apply_backend && !exact_replay && !replay_range.is_empty() {
+    //
+    // An empty range bypasses it only while `allow_preemptive_ff` holds. `-i`,
+    // `--exec` and `--autosquash` clear it (builtin/rebase.c:1476-1481), so
+    // `can_fast_forward()` is never asked (:1804) and `is_merge()` goes straight
+    // to `run_specific_rebase()` (:1872-1873), where `complete_action()` hands the
+    // editor a `noop` sheet even when `<onto>` already descends from `HEAD`.
+    if !apply_backend && !exact_replay && (!replay_range.is_empty() || !allow_preemptive_ff) {
         if gpg_sign_on {
             return Err(refuse_gpg_sign());
         }

@@ -1783,9 +1783,16 @@ fn is_head_log(full_name: &str) -> bool {
 
 /// `lookup_commit_reference_gently(the_repository, oid, 1)`: the commit `oid`
 /// names, through any chain of annotated tags, or `None` for anything else.
+///
+/// The lookup parses the commit, and the first `parse_commit_buffer()` asks
+/// `lookup_commit_graft()` (commit.c:554), whose `prepare_commit_graft()` reads
+/// `info/grafts` and prints its deprecation advice — so the advice appears even
+/// when no entry needs the reachability walk.
 fn peel_to_commit(repo: &gix::Repository, oid: ObjectId) -> Option<ObjectId> {
     let object = repo.find_object(oid).ok()?;
-    object.peel_tags_to_end().ok().filter(|o| o.kind == gix::object::Kind::Commit).map(|o| o.id)
+    let commit = object.peel_tags_to_end().ok().filter(|o| o.kind == gix::object::Kind::Commit).map(|o| o.id)?;
+    repo.commit_grafts();
+    Some(commit)
 }
 
 /// The value `files_reflog_expire()` hands to the prepare callback:

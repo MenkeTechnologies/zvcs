@@ -555,8 +555,8 @@ struct Verifier<'r> {
     /// The shallow file's commits, which `prepare_commit_graft()` registers as grafts the first
     /// time `lookup_commit_graft()` is asked; `None` once they are registered.
     shallow_pending: Option<Vec<ObjectId>>,
-    /// The commits registered so far, `r->parsed_objects->grafts`.
-    grafts: Vec<ObjectId>,
+    /// `r->parsed_objects->grafts` once `prepare_commit_graft()` has run; `None` before.
+    grafts: Option<std::sync::Arc<gix::revwalk::graft::Table>>,
     /// `verify_commit_graph_error` (commit-graph.c:2746).
     error: i32,
 }
@@ -851,10 +851,12 @@ impl Verifier<'_> {
         }
         let mut at = tree_entry_len + 1;
 
-        // lookup_commit_graft(): a shallow commit is registered as a graft with
-        // `nr_parent = -1` (shallow.c:32-45), so its parents are skipped.
+        // lookup_commit_graft() (commit.c:554-556): a grafted commit skips its own
+        // parents, `grafts_keep_true_parents` being unset here, and a shallow one is
+        // registered with `nr_parent = -1` (shallow.c:32-45).
         self.prepare_commit_graft();
-        let grafted = self.grafts.contains(&oid);
+        let graft = self.grafts.as_ref().and_then(|t| t.get(&oid)).cloned();
+        let grafted = graft.is_some();
         let mut parents = Vec::new();
         while at + parent_entry_len < tail && buf[at..].starts_with(b"parent ") {
             let parent = get_oid_hex(&buf[at + 7..], kind);
@@ -873,6 +875,14 @@ impl Verifier<'_> {
             }
             parents.push(parent);
         }
+        // commit.c:578-590: then the graft's own parents, none for a shallow commit.
+        for parent in graft.as_ref().map(|g| g.parents()).unwrap_or_default() {
+            if self.lookup_commit(*parent).is_none() {
+                eprintln!("error: bad graft parent {parent} in commit {oid}");
+                return None;
+            }
+            parents.push(*parent);
+        }
         Some((parents, tree, parse_commit_date(&buf[at..])))
     }
 
@@ -883,19 +893,35 @@ impl Verifier<'_> {
     /// (shallow.c:32-45). Every commit the graph has parsed by then therefore reaches the
     /// comparison with no parents on either side.
     ///
-    /// `read_graft_file()` for `info/grafts` is not ported.
+    /// `read_graft_file()` runs first: it prints the deprecation advice and the `bad graft data`
+    /// errors (commit.c:287-314), and each line's `register_commit_graft()` ends in
+    /// `unparse_commit()` (commit.c:244, :209-218), so a commit the graph parsed already is parsed
+    /// again — from the object database, with the graft's parents — when the loop reaches it.
     fn prepare_commit_graft(&mut self) {
-        let Some(shallow) = self.shallow_pending.take() else {
+        if self.grafts.is_some() {
             return;
-        };
-        for oid in shallow {
+        }
+        let table = self.repo.commit_grafts().clone();
+        // The file's own lines, without the reporting `commit_grafts()` has just done; the merged
+        // table cannot tell a graft-file line from the shallow entry that replaced it.
+        let mut from_file = gix::revwalk::graft::Table::default();
+        let _ = gix::revwalk::graft::read(&self.repo.graft_file(), self.repo.object_hash(), &mut from_file);
+        for (oid, _) in from_file.iter() {
+            if let Some(c) = self.lookup_commit(*oid) {
+                if self.commits[c].parsed {
+                    self.commits[c].parents.clear();
+                    self.commits[c].parsed = false;
+                }
+            }
+        }
+        for oid in self.shallow_pending.take().unwrap_or_default() {
             if let Some(c) = self.lookup_commit(oid) {
                 if self.commits[c].parsed {
                     self.commits[c].parents.clear();
                 }
             }
-            self.grafts.push(oid);
         }
+        self.grafts = Some(table);
     }
 
     /// `verify_one_commit_graph()` (commit-graph.c:2766-2916).
@@ -1152,7 +1178,7 @@ impl<'r> ProcessGraph<'r> {
                     objects: HashMap::new(),
                     commits: Vec::new(),
                     shallow_pending: None,
-                    grafts: Vec::new(),
+                    grafts: Some(repo.commit_grafts().clone()),
                     error: 0,
                 });
                 break;
@@ -1387,7 +1413,7 @@ fn verify_inner(repo: &gix::Repository, sources: &[Source], source: &Source, sha
         objects: HashMap::new(),
         commits: Vec::new(),
         shallow_pending: Some(crate::porcelain::fetch_progress::shallow_grafts(repo)),
-        grafts: Vec::new(),
+        grafts: None,
         error: 0,
     };
 

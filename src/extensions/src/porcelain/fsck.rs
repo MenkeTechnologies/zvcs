@@ -438,14 +438,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
     // The two shapes in which an object this repository does not have is not an
     // error: a shallow boundary, whose parents were never sent, and a promisor
-    // pack's promise, which the remote still holds. Both are read here because
-    // `snapshot_refs()` below already needs the promisor set.
-    let shallow: HashSet<ObjectId> = repo
-        .shallow_commits()
-        .ok()
-        .flatten()
-        .map(|commits| commits.iter().copied().collect())
-        .unwrap_or_default();
+    // pack's promise, which the remote still holds. A shallow boundary is a graft
+    // without parents, which `apply_commit_graft()` takes from the graft table; the
+    // promisor set is read here because `snapshot_refs()` below already needs it.
     let promisor = super::rev_list::promisor_objects(&repo);
 
     // ---- 2b. `snapshot_refs()`: the reference half of the head set ----------
@@ -675,7 +670,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // `fsck_loose()` parses before it does anything else, and skips
         // `fsck_obj()` — the verbose line included — when the parse fails.
         let decoded = match parse_object_buffer(id, kind, &data, repo.object_hash().len_in_hex()) {
-            Ok(d) => d,
+            Ok(d) => apply_commit_graft(&repo, id, kind, d),
             Err(failed) => {
                 let slot = Slot::Scan(id.as_bytes()[0]);
                 if let Some(line) = failed.diagnostic {
@@ -739,20 +734,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         // nothing and `fsck_walk_tree()` decodes the entries and looks every one
         // of them up, on every run.
         let creates_children = kind == Kind::Tree || !pre_parsed.contains(&id);
-        let grafted = kind == Kind::Commit && shallow.contains(&id);
-        for (child, child_kind) in &decoded.children {
-            // ```c
-            // if (graft && (graft->nr_parent < 0 || grafts_replace_parents))
-            //         continue;
-            // ```
-            //
-            // (`parse_commit_buffer()`, commit.c.) A shallow boundary carries a
-            // graft with no parents, so its `parent` lines are stepped over
-            // before `lookup_commit()` is reached: the parents are neither
-            // created nor marked used. Its tree is read as usual.
-            if grafted && *child_kind == Kind::Commit {
-                continue;
-            }
+        // A grafted commit's true parents are already gone: `apply_commit_graft()`
+        // dropped them as `parse_commit_buffer()` does (commit.c:569), so they are
+        // neither created nor marked used here, and the graft's parents are both.
+        for (child, _) in &decoded.children {
             // Absent children are `note`d all the same: `fsck_walk()` creates
             // them, so they occupy an `obj_hash` slot. They are not *reported*
             // here — `check_unreachable_object()` never prints `missing`, so an
@@ -823,10 +808,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             continue;
         }
 
-        // `fsck_commit()` reports a root as `!commit->parents`, which is what the
-        // graft above leaves a shallow boundary commit with — so `--root` names
-        // every boundary of a shallow clone as well as the history's own root.
-        if opt.show_root && (decoded.is_root_commit || grafted) {
+        // `fsck_commit()` reports a root as `!commit->parents`, which is what a
+        // graft leaves a shallow boundary or a parentless `info/grafts` line with —
+        // so `--root` names those as well as the history's own roots.
+        if opt.show_root && decoded.is_root_commit {
             scan_lines.push((id, format!("root {id}")));
         }
         if opt.show_tags {
@@ -1310,13 +1295,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // only a tree's children are recorded.
                 if kind == Kind::Tree {
                     state.note(child);
-                }
-                // A shallow boundary commit has no parents at all as far as the
-                // object graph is concerned: `parse_commit()` applies the graft, so
-                // `fsck_walk_commit()` never sees them and their absence is not a
-                // break in the chain. Its tree is still walked.
-                if child_kind == Kind::Commit && shallow.contains(&id) {
-                    continue;
                 }
                 // ```c
                 // if (is_promisor_object(options->repo, &obj->oid))
@@ -2049,12 +2027,44 @@ fn walk_parse_commit(
 /// repository, which is also what git's `fsck_walk_tree()` does.
 fn decode(repo: &gix::Repository, id: ObjectId) -> Result<Result<Decoded, ParseFailed>> {
     let object = repo.find_object(id)?;
-    Ok(parse_object_buffer(
-        id,
-        object.kind,
-        &object.data,
-        repo.object_hash().len_in_hex(),
-    ))
+    let kind = object.kind;
+    Ok(parse_object_buffer(id, kind, &object.data, repo.object_hash().len_in_hex())
+        .map(|decoded| apply_commit_graft(repo, id, kind, decoded)))
+}
+
+/// The graft half of `parse_commit_buffer()` (commit.c:554-590), applied to what
+/// [`parse_object_buffer`] decoded from the bytes alone.
+///
+/// ```c
+/// graft = lookup_commit_graft(r, &item->object.oid);
+/// while (... !memcmp(bufptr, "parent ", 7)) {
+///         ...
+///         if (graft && (graft->nr_parent < 0 || !grafts_keep_true_parents))
+///                 continue;
+///         ...
+/// }
+/// if (graft)
+///         for (i = 0; i < graft->nr_parent; i++)
+///                 pptr = &commit_list_insert(lookup_commit(r, &graft->parent[i]), pptr)->next;
+/// ```
+///
+/// A commit `<GIT_DIR>/info/grafts` or `<GIT_DIR>/shallow` names keeps its tree and has the
+/// table's parents in place of its own `parent` lines, which were still validated by the
+/// decode. `fsck` never sets `grafts_keep_true_parents` (only `pack-objects
+/// --keep-true-parents` does), so the true parents are always dropped: they are neither
+/// created nor marked used, a graft parent is both, and `--root` (`!commit->parents`,
+/// builtin/fsck.c) names a commit grafted to no parents.
+fn apply_commit_graft(repo: &gix::Repository, id: ObjectId, kind: Kind, mut decoded: Decoded) -> Decoded {
+    if kind != Kind::Commit {
+        return decoded;
+    }
+    if let Some(graft) = repo.commit_grafts().get(&id) {
+        // `children[0]` is the tree `set_commit_tree()` stored before the parents.
+        decoded.children.truncate(1);
+        decoded.children.extend(graft.parents().iter().map(|p| (*p, Kind::Commit)));
+        decoded.is_root_commit = graft.parents().is_empty();
+    }
+    decoded
 }
 
 /// The buffer half of [`decode`], so `receive-pack` can reuse it.

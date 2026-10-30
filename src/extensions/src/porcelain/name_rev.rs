@@ -202,13 +202,14 @@ struct Pool {
     /// The commit-graph, when one exists and `core.commitGraph` allows it.
     /// `repo_parse_commit` served from it never allocates the commit's tree.
     graph: Option<gix::commitgraph::Graph>,
-    /// `.git/shallow`: the commits git grafts to no parents.
+    /// The graft table, `.git/info/grafts` (or `$GIT_GRAFT_FILE`) plus `.git/shallow`.
     ///
-    /// `parse_commit_buffer` consults `lookup_commit_graft` (commit.c) and stops
-    /// at a grafted commit, so in a shallow clone the walk never reaches — and
-    /// `--all` therefore never *lists* — anything past the boundary, even when
-    /// the objects are still on disk from before the clone was reshaped.
-    shallow: HashSet<ObjectId>,
+    /// `parse_commit_buffer` consults `lookup_commit_graft` (commit.c:554-590) and
+    /// walks a grafted commit with the table's parents instead of its own, so in a
+    /// shallow clone the walk never reaches — and `--all` therefore never *lists* —
+    /// anything past the boundary, even when the objects are still on disk from
+    /// before the clone was reshaped.
+    grafts: std::sync::Arc<gix::revwalk::graft::Table>,
 }
 
 /// git's `hash_obj`: the first `sizeof(unsigned int)` bytes of the object id,
@@ -226,12 +227,7 @@ impl Pool {
             nr: 0,
             index: HashMap::new(),
             graph: repo.commit_graph_if_enabled().ok().flatten(),
-            shallow: repo
-                .shallow_commits()
-                .ok()
-                .flatten()
-                .map(|c| c.iter().copied().collect())
-                .unwrap_or_default(),
+            grafts: repo.commit_grafts().clone(),
         }
     }
 
@@ -372,12 +368,11 @@ impl Pool {
             return;
         };
         let tree = commit.tree();
-        // A grafted commit is parsed with an empty parent list, which is how
-        // `lookup_commit_graft` prunes a shallow clone's boundary.
-        let parents: Vec<ObjectId> = if self.shallow.contains(&self.objs[ix].oid) {
-            Vec::new()
-        } else {
-            commit.parents().collect()
+        // `lookup_commit_graft()` (commit.c:554-590): a grafted commit drops its own
+        // `parent` lines and takes the table's, which for a shallow boundary is none.
+        let parents: Vec<ObjectId> = match self.grafts.parents_of(&self.objs[ix].oid) {
+            Some(grafted) => grafted.to_vec(),
+            None => commit.parents().collect(),
         };
         let date = commit.committer().ok().map_or(0, |s| s.seconds());
 

@@ -1130,12 +1130,19 @@ impl<'a> Base<'a> {
 /// between them: `git commit-graph write` disables replacement first and so
 /// always passes it, while `gc` does not and so must ask
 /// [`replacements_in_use`] itself.
+///
+/// `prepare_commit_graft()` is the read that prints the `info/grafts`
+/// deprecation advice and the `bad graft data` errors, so a write in a grafted
+/// repository prints them and then writes nothing. `grafts_nr` counts what
+/// parsed, not the file's size: a graft file of comments and blank lines leaves
+/// the table empty and the graph is written. `is_repository_shallow()`
+/// (shallow.c:62-90) is a successful `fopen()` of `shallow`, so an empty file
+/// still makes the repository shallow.
 pub(crate) fn commit_graph_incompatible(repo: &gix::Repository) -> bool {
-    let git_dir = repo.common_dir();
-    let nonempty = |p: std::path::PathBuf| {
-        std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
-    };
-    nonempty(git_dir.join("info").join("grafts")) || nonempty(git_dir.join("shallow"))
+    // An empty `--shallow-file ""` names no file (shallow.c:76), which joined onto
+    // the common directory would otherwise open the directory itself.
+    let shallow = repo.shallow_file();
+    !repo.commit_grafts().is_empty() || (shallow != repo.common_dir() && std::fs::File::open(&shallow).is_ok())
 }
 
 /// Whether `refs/replace/*` is both enabled and non-empty, which is git's

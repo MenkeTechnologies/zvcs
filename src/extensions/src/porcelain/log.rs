@@ -11461,11 +11461,11 @@ pub(crate) fn build_decorations(repo: &gix::Repository, filter: &DecorationFilte
 
     // `for_each_commit_graft(add_graft_decoration, NULL)` (log-tree.c:242): every
     // commit the graft table names gets the literal `grafted` decoration, and it
-    // is added last so it renders first. The table is `.git/shallow` plus
-    // `.git/info/grafts`; this port carries the shallow half, which is the one a
-    // `clone --depth`/`fetch --depth` leaves behind. No `ref_filter_match()` runs
-    // over these — they are not refs, so `--decorate-refs` cannot exclude them.
-    for id in repo.shallow_commits().ok().flatten().iter().flat_map(|c| c.iter()) {
+    // is added last so it renders first. The table is `.git/info/grafts` (or
+    // `$GIT_GRAFT_FILE`) plus `.git/shallow`, walked in its sorted order
+    // (commit.c:342-350). No `ref_filter_match()` runs over these — they are not
+    // refs, so `--decorate-refs` cannot exclude them.
+    for (id, _) in repo.commit_grafts().iter() {
         map.entry(*id).or_default().push(Deco {
             kind: DecoKind::Grafted,
             full: "grafted".to_string(),

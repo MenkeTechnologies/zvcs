@@ -510,7 +510,7 @@ fn reachability<'a>(
         if collect_hook_roots(repo, expire, &mut roots).is_err() {
             return Err(anyhow::Error::new(crate::fatal::Silent(128)));
         }
-        *cache = Some(close_over(repo, roots));
+        *cache = Some(close_over(repo, roots, TrueParents::Drop));
     }
     Ok(cache.as_ref().expect("just filled"))
 }
@@ -1084,8 +1084,28 @@ pub(super) fn push_cache_tree(tree: &gix::index::extension::Tree, roots: &mut Ve
 /// parents, tags their target, trees their non-gitlink entries. Objects that
 /// cannot be found or decoded are dropped from the walk but stay in the set, so
 /// a corrupt object is never mistaken for an unreachable one.
-pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>) -> HashSet<ObjectId> {
-    close_over_excluding(repo, roots, &HashSet::new())
+pub(super) fn close_over(repo: &gix::Repository, roots: Vec<ObjectId>, true_parents: TrueParents) -> HashSet<ObjectId> {
+    close_over_excluding(repo, roots, &HashSet::new(), true_parents)
+}
+
+/// What a walk does with the parents a grafted commit records itself — git's
+/// `grafts_keep_true_parents` (environment.c:59), read by `parse_commit_buffer()`:
+///
+/// ```c
+/// if (graft && (graft->nr_parent < 0 || !grafts_keep_true_parents))
+///         continue;                                   /* commit.c:569 */
+/// ```
+///
+/// Only `pack-objects --keep-true-parents` sets it, and `repack` always passes that
+/// flag (builtin/repack.c:475), so a repack keeps both the true parents and the
+/// graft's while `prune`'s `mark_reachable_objects()` follows the graft alone. A
+/// shallow boundary (`nr_parent < 0`) drops its true parents either way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrueParents {
+    /// `grafts_keep_true_parents == 0`: a graft replaces the parent list.
+    Drop,
+    /// `grafts_keep_true_parents == 1`: a graft's parents follow the true ones.
+    Keep,
 }
 
 /// [`close_over`] with a set of objects marked UNINTERESTING before the walk
@@ -1097,8 +1117,9 @@ pub(super) fn close_over_excluding(
     repo: &gix::Repository,
     roots: Vec<ObjectId>,
     uninteresting: &HashSet<ObjectId>,
+    true_parents: TrueParents,
 ) -> HashSet<ObjectId> {
-    close_over_unpacked(repo, roots, uninteresting, &|_| false)
+    close_over_unpacked(repo, roots, uninteresting, &|_| false, true_parents)
 }
 
 /// [`close_over_excluding`] for a walk run with `--unpacked`: a commit that `packed` names is
@@ -1109,18 +1130,14 @@ pub(super) fn close_over_unpacked(
     roots: Vec<ObjectId>,
     uninteresting: &HashSet<ObjectId>,
     packed: &dyn Fn(&ObjectId) -> bool,
+    true_parents: TrueParents,
 ) -> HashSet<ObjectId> {
-    // `register_shallow()` (shallow.c:34-47) installs a graft with
-    // `nr_parent = -1` for every commit named in `.git/shallow` and clears the
-    // parents of one already parsed, so a shallow boundary commit contributes no
-    // parents to any traversal. Without the graft the walk names the parents the
-    // commit object still records, which a shallow clone does not have.
-    let shallow: HashSet<ObjectId> = repo
-        .shallow_commits()
-        .ok()
-        .flatten()
-        .map(|c| c.iter().copied().collect())
-        .unwrap_or_default();
+    // The graft table: the `info/grafts` (or `$GIT_GRAFT_FILE`) lines, and the
+    // `nr_parent = -1` entry `register_shallow()` (shallow.c:32-45) installs for
+    // every commit named in `.git/shallow`, so a shallow boundary contributes no
+    // parents to any traversal. Without it the walk names the parents the commit
+    // object still records, which a shallow clone does not have.
+    let grafts = repo.commit_grafts();
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut stack: Vec<ObjectId> = Vec::new();
     for id in roots {
@@ -1149,8 +1166,18 @@ pub(super) fn close_over_unpacked(
                     if !packed(&id) {
                         next.push(tree);
                     }
-                    if !shallow.contains(&id) {
-                        next.extend(parents);
+                    // `parse_commit_buffer()` (commit.c:554-590): the true parents
+                    // unless a graft drops them, then the graft's own.
+                    match grafts.get(&id) {
+                        None => next.extend(parents),
+                        Some(graft) => {
+                            let keep = true_parents == TrueParents::Keep
+                                && matches!(graft, gix::revwalk::graft::Graft::Parents(_));
+                            if keep {
+                                next.extend(parents);
+                            }
+                            next.extend(graft.parents().iter().copied());
+                        }
                     }
                 }
             }

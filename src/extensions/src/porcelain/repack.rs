@@ -786,10 +786,10 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
     // An incremental run passes `--unpacked`: a commit some pack already holds is ignored by the
     // walk, so its tree is not reached from it.
     let reachable = match st.all_into_one {
-        true => super::prune::close_over_excluding(&repo, roots, &promisor_held),
+        true => super::prune::close_over_excluding(&repo, roots, &promisor_held, super::prune::TrueParents::Keep),
         false => super::prune::close_over_unpacked(&repo, roots, &promisor_held, &|id| {
             existing.iter().any(|pack| pack.lookup(*id).is_some())
-        }),
+        }, super::prune::TrueParents::Keep),
     };
 
     // `--filter=tree:<depth>` is decided by pack-objects' traversal as a whole, not object by
@@ -1353,7 +1353,7 @@ fn execute(st: &State, midx: &MidxConfig, pack_size_limit_cfg: Option<u64>) -> R
             // run wrote.
             let mut delivered: HashSet<ObjectId> = in_new_pack.clone();
             delivered.extend(cruft_kept.iter().copied());
-            let reached = super::prune::close_over_excluding(&repo, tips, &delivered);
+            let reached = super::prune::close_over_excluding(&repo, tips, &delivered, super::prune::TrueParents::Keep);
             stamps = reached
                 .into_iter()
                 .map(|id| {
@@ -2728,7 +2728,7 @@ fn loosen_unreachable(
                     }
                 }
             }
-            super::prune::close_over(repo, tips)
+            super::prune::close_over(repo, tips, super::prune::TrueParents::Keep)
         }
     };
 

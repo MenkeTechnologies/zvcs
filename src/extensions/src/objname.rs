@@ -2373,6 +2373,19 @@ pub enum ReflogReach {
     Warning(String),
 }
 
+/// A date as git's `timestamp_t` holds it: `uintmax_t` (git-compat-util.h), so
+/// the comparisons `read_ref_at_ent()` makes are unsigned.
+///
+/// `approxidate_careful()` returns `update_tm()`'s `time_t` cast to that type
+/// (date.c:1410), and a date before the epoch — `100.years.ago`, `1900-01-01`,
+/// or the `-1` a failed `mktime()` hands back — wraps to a value no reflog entry
+/// is newer than. `timestamp <= cb->at_time` (refs.c:1126) then holds for the
+/// newest entry, so `stash@{100.years.ago}` is `stash@{0}`'s commit, without the
+/// `only goes back to` warning an older-than-the-log date raises.
+fn timestamp_t(seconds: i64) -> u64 {
+    seconds as u64
+}
+
 /// The `@{…}` selector of a reflog operand, as `get_oid_basic()` splits it
 /// (`object-name.c:704-724`):
 ///
@@ -2517,15 +2530,15 @@ pub fn reflog_reach_of(repo: &gix::Repository, name: &str) -> Option<ReflogReach
         // saturating parse below lands on the same side of that test.
         let n: i64 = if digits { sel.parse().unwrap_or(i64::MAX) } else { -1 };
         if n >= 100_000_000 {
-            (-1i64, n)
+            (-1i64, n as u64)
         } else if n >= 0 {
-            (n, 0i64)
+            (n, 0u64)
         } else {
             let (t, errors) = crate::date::approxidate_careful(sel);
             if errors {
                 return None;
             }
-            (-1, t)
+            (-1, timestamp_t(t))
         }
     };
 
@@ -2574,7 +2587,7 @@ pub fn reflog_reach_of(repo: &gix::Repository, name: &str) -> Option<ReflogReach
     // `read_ref_at_ent()`: `if (timestamp <= cb->at_time || cb->cnt == 0)`. With a
     // date selector `cnt` is 0 from the start only for `@{0}`, so what decides the
     // walk is whether any entry is old enough.
-    if entries.iter().any(|e| e.1.seconds <= at_time) {
+    if entries.iter().any(|e| timestamp_t(e.1.seconds) <= at_time) {
         return None;
     }
     let oldest = entries.last()?;
@@ -3093,7 +3106,7 @@ pub fn read_ref_at_warning_of(repo: &gix::Repository, name: &str) -> Option<Stri
 /// `get_oid_basic()`'s reflog branch up to and including the `read_ref_at()` call
 /// (`object-name.c:742-789`), returning the walk's result together with the two
 /// selector values `object-name.c:790-820` still needs to interpret it.
-fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, i64)> {
+fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, u64)> {
     let (base, sel) = split_reflog_selector(spec)?;
     // `repo_dwim_ref("HEAD")` reports HEAD's *target*; `repo_dwim_log` reports the
     // ref whose log was found. Either way an unborn HEAD resolves to nothing and
@@ -3123,15 +3136,15 @@ fn reflog_read(repo: &gix::Repository, spec: &str) -> Option<(ReadRefAt, i64, i6
     let digits = !sel.is_empty() && sel.bytes().all(|c| c.is_ascii_digit());
     let n: i64 = if digits { sel.parse().unwrap_or(i64::MAX) } else { -1 };
     let (nth, at_time) = if n >= 100_000_000 {
-        (-1i64, n)
+        (-1i64, n as u64)
     } else if n >= 0 {
-        (n, 0i64)
+        (n, 0u64)
     } else {
         let (t, errors) = crate::date::approxidate_careful(sel);
         if errors {
             return None;
         }
-        (-1, t)
+        (-1, timestamp_t(t))
     };
 
     // `repo_dwim_log()` does not merely *find* the log — it resolves the ref and
@@ -3215,7 +3228,7 @@ struct ReadRefAt {
 fn read_ref_at(
     refname: &str,
     entries: &[(ObjectId, ObjectId, gix::date::Time)],
-    at_time: i64,
+    at_time: u64,
     cnt: i64,
     current: ObjectId,
 ) -> Option<ReadRefAt> {
@@ -3232,7 +3245,7 @@ fn read_ref_at(
         // `cb->tz = tz; cb->date = timestamp;` happen for every record, matched or
         // not, so the warnings below date the record they stopped on.
         let (date, tz) = (time.seconds, time.offset);
-        if date <= at_time || cnt == 0 {
+        if timestamp_t(date) <= at_time || cnt == 0 {
             if !prev_ooid.is_null() {
                 oid = *noid;
                 if prev_ooid != *noid {
@@ -3241,7 +3254,7 @@ fn read_ref_at(
                         crate::porcelain::log::show_date_rfc2822(date, tz)
                     ));
                 }
-            } else if date == at_time {
+            } else if timestamp_t(date) == at_time {
                 oid = *noid;
             } else if *noid != oid {
                 warning = Some(format!(

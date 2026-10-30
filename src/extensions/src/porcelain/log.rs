@@ -8397,9 +8397,12 @@ pub(super) fn reflog_walk(repo: &gix::Repository, names: &[String]) -> Result<Ve
             // past the end simply leaves the cursor below zero and walks nothing.
             ReflogStart::Index(n) => nr - n as i64 - 1,
             // `get_reflog_recno_by_time()`: the newest entry already current then,
-            // or nothing at all when the log does not go back that far.
+            // or nothing at all when the log does not go back that far. The test
+            // `timestamp >= array->items[i].timestamp` (reflog-walk.c:110) is over
+            // `timestamp_t`, which is unsigned, so a date before the epoch
+            // (`100.years.ago`) wraps past every entry and starts at the newest.
             ReflogStart::Date(when) => {
-                match (0..items.len()).rev().find(|&i| when >= items[i].time.seconds) {
+                match (0..items.len()).rev().find(|&i| when as u64 >= items[i].time.seconds as u64) {
                     Some(i) => i as i64,
                     None => continue,
                 }

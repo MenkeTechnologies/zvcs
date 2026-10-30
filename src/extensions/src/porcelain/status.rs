@@ -2527,7 +2527,7 @@ impl SubmoduleState {
         use gix::status::Item;
 
         let mut state = SubmoduleState {
-            new_commits: sm.checked_out_head_id != sm.index_id,
+            new_commits: sm.head_moved(),
             ..SubmoduleState::default()
         };
         for item in sm.changes.iter().flatten() {

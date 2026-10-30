@@ -355,6 +355,30 @@ pub fn packed_refs_fatal(err: &anyhow::Error) -> Option<String> {
     err.chain().find_map(gix::refs::packed::InvalidLine::in_error).map(|line| line.to_string())
 }
 
+/// The `die()` `is_submodule_modified()` raises over a gitlink's `<path>/.git`
+/// (submodule.c:1892-1899, and `read_gitfile()`'s setup.c:927-952), from inside
+/// `match_stat_with_submodule()` — so below `diff-files`, `diff`, `diff-index`
+/// and `status` alike.
+///
+/// It arrives in one of two shapes: straight from
+/// [`gix::submodule::status::gitlink_status`], or boxed by the index-versus-worktree
+/// walk inside the `submodule_status::Error` whose transparent variant hides the
+/// inner error from the chain.
+pub fn submodule_git_dir_fatal(err: &anyhow::Error) -> Option<String> {
+    use gix::status::index_worktree::submodule_status::Error as Walk;
+    use gix::submodule::status::Error as Probe;
+    err.chain().find_map(|cause| {
+        let probe = match cause.downcast_ref::<Walk>() {
+            Some(Walk::SubmoduleStatus(inner)) => Some(inner),
+            _ => cause.downcast_ref::<Probe>(),
+        };
+        match probe {
+            Some(Probe::NotAGitRepository(message)) => Some(message.clone()),
+            _ => None,
+        }
+    })
+}
+
 /// Turn an error that carries an unparsable `packed-refs` record into git's own
 /// `die()` for it, leaving anything else untouched.
 ///

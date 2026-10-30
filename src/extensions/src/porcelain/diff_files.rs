@@ -3386,7 +3386,7 @@ impl<'index> gix::status::plumbing::index_as_worktree_with_renames::VisitEntry<'
                 // A submodule whose checked-out `HEAD` still matches the index is
                 // only "dirty" inside; git leaves the destination id filled in
                 // rather than nulling it, since the gitlink itself is unchanged.
-                let moved = sm.checked_out_head_id != sm.index_id;
+                let moved = sm.head_moved();
                 Delta {
                     src_mode,
                     dst_mode: src_mode,
@@ -3489,8 +3489,13 @@ fn collect(
         // manufacture a whole gitlink section stock does not print. `git diff` already
         // pins this via [`super::diff::submodule_status`]; `diff-files` is the same
         // index-to-worktree comparison and takes the same default.
-        None => gix::status::Submodule::Given {
-            ignore: gix::submodule::config::Ignore::Untracked,
+        //
+        // That default is only the starting point: without `--ignore-submodules`
+        // `override_submodule_config` stays clear, so `match_stat_with_submodule()`
+        // lets `set_diffopt_flags_from_submodule_config()` apply each gitlink's
+        // `submodule.<name>.ignore` over it (diff-lib.c:94-95, submodule.c:180-200).
+        None => gix::status::Submodule::PerSubmoduleOr {
+            fallback: gix::submodule::config::Ignore::Untracked,
             check_dirty: false,
         },
     };

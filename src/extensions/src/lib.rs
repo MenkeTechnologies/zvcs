@@ -1089,6 +1089,14 @@ fn run_command(argv: &[String]) -> ExitCode {
             eprintln!("fatal: {msg}");
             ExitCode::from(fatal::EXIT_FATAL)
         }
+        // A gitlink whose `<path>/.git` is no git directory is
+        // `is_submodule_modified()`'s `die()`; see [`fatal::submodule_git_dir_fatal`].
+        Err(e) if fatal::submodule_git_dir_fatal(&e).is_some() => {
+            let msg = fatal::submodule_git_dir_fatal(&e).expect("checked");
+            trace2::error(&msg);
+            eprintln!("fatal: {msg}");
+            ExitCode::from(fatal::EXIT_FATAL)
+        }
         // An index entry with an extended flag git does not know is
         // `create_from_disk()`'s `die()` (read-cache.c:1826), and its sentence is
         // computed from the same bytes; see [`fatal::index_entry_format_fatal`].

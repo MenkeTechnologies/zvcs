@@ -752,7 +752,10 @@ pub(super) fn reflog_delete(
         None => -tail[..digits].parse::<i64>().unwrap_or(0),
         Some(_) => 0,
     };
-    let count = |time: i64| older_than.map_or(true, |target| time < target);
+    // `if (!cb->expire_total || timestamp < cb->expire_total)` (reflog.c:515), over
+    // `timestamp_t`, which is unsigned: a date before the epoch (`100.years.ago`)
+    // wraps past every entry, so all of them count and the newest is dropped.
+    let count = |time: i64| older_than.map_or(true, |target| target == 0 || (time as u64) < target as u64);
 
     // `refs_reflog_expire()` walks the log oldest entry first, and
     // `should_expire_reflog_ent()` reduces — with everything but `recno` unset —

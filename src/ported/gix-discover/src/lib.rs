@@ -37,6 +37,8 @@ pub const MODULES: &str = "modules";
 ///
 pub mod repository;
 
+pub mod setup;
+
 ///
 pub mod is_git {
     use std::path::PathBuf;

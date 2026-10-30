@@ -1455,6 +1455,13 @@ fn tracked_changes_match(repo: &gix::Repository, specs: &[String]) -> Result<boo
         .status(gix::progress::Discard)?
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
         .index_worktree_rewrites(None)
+        // `rev.diffopt.flags.ignore_submodules = 1` (builtin/stash.c:1256): no
+        // gitlink is compared with its worktree, so `match_stat_with_submodule()`
+        // never reaches `is_submodule_modified()` or its `die()`.
+        .index_worktree_submodules(gix::status::Submodule::Given {
+            ignore: gix::submodule::config::Ignore::All,
+            check_dirty: false,
+        })
         .untracked_files(gix::status::UntrackedFiles::None)
         .index_worktree_options_mut(|o| o.dirwalk_options = None)
         .into_iter(Vec::new())?;
@@ -2530,13 +2537,35 @@ struct ParsedCommit {
 /// (commit.c:622-623). A parse that failed is not remembered, so asking again
 /// reports again.
 #[derive(Default)]
-struct Commits(HashMap<ObjectId, ParsedCommit>);
+struct Commits {
+    parsed: HashMap<ObjectId, ParsedCommit>,
+    /// `prepare_commit_graph()`'s answer, asked once: `None` until then.
+    graph: Option<Option<gix::commitgraph::Graph>>,
+}
 
 impl Commits {
-    /// `repo_parse_commit()` (commit.c:603-652): a missing object is `Could not
-    /// read`, another type is `Object %s not a commit`.
+    /// `repo_parse_commit()` (commit.c:603-652), which asks the commit-graph first
+    /// (`use_commit_graph` is 1 there) and reads the object only when the graph has
+    /// no answer: a missing object is `Could not read`, another type is `Object %s
+    /// not a commit`.
     fn parse(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<ParsedCommit> {
-        if let Some(parsed) = self.0.get(&id) {
+        if let Some(parsed) = self.parsed.get(&id) {
+            return Some(parsed.clone());
+        }
+        if let Some(parsed) = self.parse_commit_in_graph(repo, id) {
+            self.parsed.insert(id, parsed.clone());
+            return Some(parsed);
+        }
+        self.parse_object(repo, id)
+    }
+
+    /// `parse_object()`'s commit arm (object.c:315-329, 268-279): the object read
+    /// and handed to `parse_commit_buffer()`. Unlike [`Self::parse`] this never asks
+    /// the commit-graph for the parents — `check_graph` only loads the graph
+    /// position and generation (commit.c:592-593) — so a commit reached through
+    /// `lookup_commit_reference()` takes them from its buffer and the graft table.
+    fn parse_object(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<ParsedCommit> {
+        if let Some(parsed) = self.parsed.get(&id) {
             return Some(parsed.clone());
         }
         let Ok(object) = repo.find_object(id) else {
@@ -2547,9 +2576,44 @@ impl Commits {
             eprintln!("error: Object {id} not a commit");
             return None;
         }
-        let parsed = parse_commit_buffer(id, object.data.to_vec())?;
-        self.0.insert(id, parsed.clone());
+        let parsed = parse_commit_buffer(repo, id, object.data.to_vec())?;
+        self.parsed.insert(id, parsed.clone());
         Some(parsed)
+    }
+
+    /// `parse_commit_in_graph()` (commit-graph.c:1012-1026) and
+    /// `fill_commit_in_graph()` (commit-graph.c:933-985): the tree and parents the
+    /// graph records, or `None` when there is no usable graph or `id` is not in it.
+    ///
+    /// `prepare_commit_graph()` refuses the graph unless `core.commitGraph` allows
+    /// it and `commit_graph_compatible()` (commit-graph.c:223-242) holds: no
+    /// replace refs, no grafts, not shallow. The buffer is what a later
+    /// `repo_get_commit_buffer()` reads from the object store.
+    fn parse_commit_in_graph(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<ParsedCommit> {
+        let graph = self
+            .graph
+            .get_or_insert_with(|| {
+                let replaced = repo.objects.store_ref().replacements().next().is_some();
+                if replaced {
+                    return None;
+                }
+                repo.commit_graph_if_enabled().ok().flatten()
+            })
+            .as_ref()?;
+        let commit = graph.commit_by_id(id)?;
+        let tree = commit.root_tree_id().to_owned();
+        let mut parents = Vec::new();
+        for pos in commit.iter_parents() {
+            // `insert_parent_or_die()` (commit-graph.c:917-931).
+            let pos = pos.ok()?;
+            if pos.0 >= graph.num_commits() {
+                eprintln!("fatal: invalid parent position {}", pos.0);
+                std::process::exit(128);
+            }
+            parents.push(graph.id_at(pos).to_owned());
+        }
+        let buffer = repo.find_object(id).map(|o| o.data.to_vec()).unwrap_or_default();
+        Some(ParsedCommit { id, tree, parents, buffer })
     }
 
     /// `lookup_commit_reference()`: tags are peeled, a present object of another
@@ -2557,7 +2621,7 @@ impl Commits {
     fn lookup_reference(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<ParsedCommit> {
         let reference = crate::objname::lookup_commit_reference(repo, id);
         match reference {
-            crate::objname::CommitRef::Commit(peeled) => self.parse(repo, peeled),
+            crate::objname::CommitRef::Commit(peeled) => self.parse_object(repo, peeled),
             crate::objname::CommitRef::NotCommit { .. } => {
                 if let Some(message) = reference.type_error() {
                     eprintln!("error: {message}");
@@ -2569,9 +2633,26 @@ impl Commits {
     }
 }
 
-/// `parse_commit_buffer()` (commit.c:539-577) without grafts: a `tree` line, then
-/// every `parent` line that follows it.
-fn parse_commit_buffer(id: ObjectId, buffer: Vec<u8>) -> Option<ParsedCommit> {
+/// `parse_commit_buffer()` (commit.c:516-596): a `tree` line, then every `parent`
+/// line that follows it — each one still checked when a graft discards it — and
+/// then the graft's own parents:
+///
+/// ```c
+/// graft = lookup_commit_graft(r, &item->object.oid);
+/// …
+/// if (graft && (graft->nr_parent < 0 || !grafts_keep_true_parents))
+///         continue;
+/// …
+/// if (graft) {
+///         for (i = 0; i < graft->nr_parent; i++) { … commit_list_insert(new_parent, pptr) … }
+/// }
+/// ```
+///
+/// `stash` never sets `grafts_keep_true_parents`, so a graft-file entry replaces
+/// the recorded parents and a shallow entry (`nr_parent < 0`) leaves none. The
+/// first lookup reads `info/grafts`, which is where its deprecation advice is
+/// printed.
+fn parse_commit_buffer(repo: &gix::Repository, id: ObjectId, buffer: Vec<u8>) -> Option<ParsedCommit> {
     let hexsz = id.kind().len_in_hex();
     let (tree_entry_len, parent_entry_len) = (hexsz + 5, hexsz + 7);
     let tail = buffer.len();
@@ -2584,12 +2665,15 @@ fn parse_commit_buffer(id: ObjectId, buffer: Vec<u8>) -> Option<ParsedCommit> {
         return None;
     };
     let mut at = tree_entry_len + 1;
+    let graft = repo.commit_grafts().get(&id).cloned();
     let mut parents = Vec::new();
     while at + parent_entry_len < tail && buffer[at..].starts_with(b"parent ") {
         let parent = ObjectId::from_hex(&buffer[at + 7..at + parent_entry_len]);
         match parent {
             Ok(parent) if tail > at + parent_entry_len + 1 && buffer[at + parent_entry_len] == b'\n' => {
-                parents.push(parent);
+                if graft.is_none() {
+                    parents.push(parent);
+                }
             }
             _ => {
                 eprintln!("error: bad parents in commit {id}");
@@ -2597,6 +2681,9 @@ fn parse_commit_buffer(id: ObjectId, buffer: Vec<u8>) -> Option<ParsedCommit> {
             }
         }
         at += parent_entry_len + 1;
+    }
+    if let Some(graft) = &graft {
+        parents.extend(graft.parents().iter().copied());
     }
     Some(ParsedCommit { id, tree, parents, buffer })
 }
@@ -2771,7 +2858,10 @@ fn get_oid_gently(repo: &gix::Repository, revision: &str) -> Option<ObjectId> {
     if crate::objname::reflog_reach(repo, revision).is_some() {
         return None;
     }
-    if let Some(Some(n)) = reflog_recno(revision) {
+    // A run of nine digits or more is a timestamp, not an entry: `if (100000000 <=
+    // nth) { at_time = nth; nth = -1; }` (object-name.c:771-773), which
+    // `reflog_reach()` has already judged.
+    if let Some(Some(n)) = reflog_recno(revision).filter(|n| n.is_none_or(|n| n < 100_000_000)) {
         let named = revision.split('@').next().unwrap_or(revision);
         if let Ok(Some(count)) = reflog_len(repo, named) {
             if n >= count {
@@ -3022,6 +3112,7 @@ fn show_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // through the reflog; anything else is resolved as an arbitrary stash-like
     // commit, matching git's `get_stash_info`.
     let commit_id = match resolve_stash(repo, &stash_specs)? {
+        Ok(spec) if spec.ambiguous => return Ok(failed()),
         Ok(spec) => spec.id,
         Err(code) => return Ok(code),
     };
@@ -3229,6 +3320,7 @@ fn branch_stash(repo: &gix::Repository, args: &[String]) -> Result<ExitCode> {
     // is dropped afterwards (`is_stash_ref`).
     let specs: Vec<String> = positionals[1..].iter().map(|s| (*s).to_string()).collect();
     let stash = match resolve_stash(repo, &specs)? {
+        Ok(spec) if spec.ambiguous => return Ok(failed()),
         Ok(spec) => spec,
         Err(code) => return Ok(code),
     };
@@ -3411,6 +3503,8 @@ fn apply_or_pop(repo: &gix::Repository, opts: &ApplyOptions, pop: bool) -> Resul
         if let Some(code) = require_stash_ref(&stash) {
             return Ok(code);
         }
+    } else if stash.ambiguous {
+        return Ok(failed());
     }
     let commit_id = stash.id;
 
@@ -4721,6 +4815,13 @@ pub(crate) struct StashSpec {
     /// `refs/stash` and even `stash@{0}~0` all pass, while the same commit named
     /// by its id does not.
     is_stash_ref: bool,
+    /// `repo_dwim_ref()` found more than one ref under that spelling — a branch
+    /// named `stash` beside `refs/stash` — which makes `get_stash_info()` return
+    /// 1 without a word (builtin/stash.c:285-304). `apply`, `show` and `branch`
+    /// stop there; `drop` and `pop` go through `get_stash_info_assert()`, which
+    /// stops only on a negative return and then refuses the revision as no stash
+    /// reference (builtin/stash.c:845-857).
+    ambiguous: bool,
 }
 
 /// `parse_stash_revision()`: an absent argument is the newest entry, a run of
@@ -4826,24 +4927,45 @@ fn resolve_stash(
         }
     };
 
-    // `assert_stash_like()`: `<rev>^1` and `<rev>^2` both have to exist.
-    let stash_like = repo
-        .find_commit(id)
-        .map(|c| c.parent_ids().count() >= 2)
-        .unwrap_or(false);
+    // `assert_stash_like()` (builtin/stash.c:217-224), then `has_u`
+    // (builtin/stash.c:281): each `get_oidf()` is a `repo_get_oid()` of its own
+    // over the revision as a string, so every one goes back through
+    // `get_oid_basic()` and repeats its warnings — `stash@{3.years.ago}` says
+    // `log for 'stash' only goes back to …` six times, once per lookup:
+    //
+    // ```c
+    // if (get_oidf(&info->b_commit, "%s^1", revision) ||
+    //     get_oidf(&info->w_tree, "%s:", revision) ||
+    //     get_oidf(&info->b_tree, "%s^1:", revision) ||
+    //     get_oidf(&info->i_tree, "%s^2:", revision))
+    //         die(_("'%s' is not a stash-like commit"), revision);
+    // ```
+    let stash_like = ["^1", ":", "^1:", "^2:"]
+        .iter()
+        .all(|suffix| crate::objname::resolve(repo, &format!("{revision}{suffix}")).is_some());
     if !stash_like {
         eprintln!("fatal: '{revision}' is not a stash-like commit");
         return Ok(Err(ExitCode::from(128)));
     }
+    // `info->has_u = !get_oidf(&info->u_tree, "%s^3:", revision);` — the answer is
+    // read from the commit's parents where it is needed; the lookup is kept for
+    // what it prints.
+    let _ = crate::objname::resolve(repo, &format!("{revision}^3:"));
 
-    // `repo_dwim_ref()` over everything up to the first `@`.
+    // `repo_dwim_ref()` over everything up to the first `@`:
+    //
+    // ```c
+    // case 0: /* Not found, but valid ref */
+    //         info->is_stash_ref = 0;
+    // case 1:
+    //         info->is_stash_ref = !strcmp(expanded_ref, ref_stash);
+    // default: /* Invalid or ambiguous */
+    // ```
     let named = revision.split('@').next().unwrap_or(&revision);
-    let is_stash_ref = repo
-        .try_find_reference(named)
-        .ok()
-        .flatten()
-        .is_some_and(|r| r.name().as_bstr() == "refs/stash");
-    Ok(Ok(StashSpec { revision, id, is_stash_ref }))
+    let found = super::rev_parse::dwim_ref_matches(repo, named);
+    let is_stash_ref = found.len() == 1 && found[0] == "refs/stash";
+    let ambiguous = found.len() > 1;
+    Ok(Ok(StashSpec { revision, id, is_stash_ref, ambiguous }))
 }
 
 /// `assert_stash_ref()`: `drop` and `pop` rewrite the reflog, so they refuse a

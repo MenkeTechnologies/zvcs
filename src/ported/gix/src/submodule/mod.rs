@@ -407,6 +407,12 @@ pub mod status {
         StatusIter(#[from] crate::status::into_iter::Error),
         #[error(transparent)]
         NextStatusItem(#[from] crate::status::iter::Error),
+        /// The `die()` of `is_submodule_modified()` (submodule.c:1892-1899) or of
+        /// the `read_gitfile()` it calls (setup.c:927-952): `<path>/.git` is a
+        /// directory that is no git directory, or a gitfile that cannot be used.
+        /// The message is git's, without the `fatal: ` prefix.
+        #[error("{0}")]
+        NotAGitRepository(String),
     }
 
     impl Submodule<'_> {
@@ -478,6 +484,63 @@ pub mod status {
         }
     }
 
+    /// `is_submodule_modified()`'s look at `<path>/.git` (submodule.c:1888-1902),
+    /// up to the point where it would run `git status --porcelain=2` in it:
+    ///
+    /// ```c
+    /// strbuf_addf(&buf, "%s/.git", path);
+    /// git_dir = read_gitfile(buf.buf);
+    /// if (!git_dir)
+    ///         git_dir = buf.buf;
+    /// if (!is_git_directory(git_dir)) {
+    ///         if (is_directory(git_dir))
+    ///                 die(_("'%s' not recognized as a git repository"), git_dir);
+    ///         strbuf_release(&buf);
+    ///         /* The submodule is not checked out, so it is not modified */
+    ///         return 0;
+    /// }
+    /// ```
+    ///
+    /// `read_gitfile()` is `read_gitfile_gently(path, NULL)`, which dies on a gitfile
+    /// it cannot use. git has moved to the top of the worktree by then, so both
+    /// messages name the path relative to it. `Ok(false)` is the unpopulated
+    /// submodule, `Ok(true)` one there is a git directory to ask.
+    ///
+    /// Callers ask only where git calls `is_submodule_modified()` —
+    /// `match_stat_with_submodule()` (diff-lib.c:88-107) skips it under
+    /// `ignore=all` and `ignore=dirty` — and a gitlink whose `<path>/.git` this
+    /// refuses never resolves a `HEAD`, so `ce_compare_gitlink()` has always
+    /// called it unchanged by then.
+    pub fn is_submodule_populated_for_status(
+        repo: &crate::Repository,
+        rela_path: &crate::bstr::BStr,
+    ) -> Result<bool, Error> {
+        let dot_git = gix_path::from_bstr(rela_path).join(gix_discover::DOT_GIT_DIR);
+        let on_disk = match repo.workdir() {
+            None => dot_git.clone(),
+            Some(prefix) => prefix.join(&dot_git),
+        };
+        let git_dir = match gix_discover::setup::read_gitfile_gently(&on_disk) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => on_disk,
+            Err(err) => {
+                return Err(Error::NotAGitRepository(gix_discover::setup::gitfile_error_message(
+                    &dot_git, err,
+                )));
+            }
+        };
+        if !gix_discover::setup::is_git_directory(&git_dir) {
+            if git_dir.is_dir() {
+                return Err(Error::NotAGitRepository(format!(
+                    "'{}' not recognized as a git repository",
+                    dot_git.display()
+                )));
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// The status of the gitlink at `rela_path` judged from `<path>/.git` alone,
     /// which is all git consults; used for a gitlink `.gitmodules` does not name.
     ///
@@ -521,6 +584,9 @@ pub mod status {
                 state,
                 ..Default::default()
             });
+        }
+        if ignore != config::Ignore::Dirty {
+            is_submodule_populated_for_status(repo, rela_path)?;
         }
         let index_id = Some(index_id);
         if !state.repository_exists {
@@ -609,9 +675,21 @@ pub mod status {
             if !self.state.worktree_checkout || !self.state.repository_exists {
                 return None;
             }
-            let is_dirty =
-                self.checked_out_head_id != self.index_id || self.changes.as_ref().is_some_and(|c| !c.is_empty());
+            let is_dirty = self.head_moved() || self.changes.as_ref().is_some_and(|c| !c.is_empty());
             Some(is_dirty)
+        }
+
+        /// `ce_compare_gitlink()` (read-cache.c:268-284): the checked-out `HEAD`
+        /// differs from the recorded commit. A `HEAD` that does not resolve — an
+        /// unborn branch — is no change at all:
+        ///
+        /// ```c
+        /// if (repo_resolve_gitlink_ref(the_repository, ce->name, "HEAD", &oid) < 0)
+        ///         return 0;
+        /// return !oideq(&oid, &ce->oid);
+        /// ```
+        pub fn head_moved(&self) -> bool {
+            self.checked_out_head_id.is_some_and(|head| Some(head) != self.index_id)
         }
     }
 

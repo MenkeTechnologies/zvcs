@@ -346,10 +346,14 @@ pub mod submodule_status {
                 }
                 Submodule::Given { ignore, check_dirty } => (ignore, check_dirty),
             };
-            let status = match &sm {
-                Some(sm) => sm.status(ignore, check_dirty)?,
-                None => crate::submodule::status::gitlink_status(&repo, rela_path, entry.id, ignore, check_dirty)?,
-            };
+            // `.gitmodules` has done its part once `ignore` is known: the
+            // comparison itself is `ce_compare_gitlink()` and
+            // `is_submodule_modified()` (read-cache.c:268-284,
+            // submodule.c:1880-1902), which read `<path>/.git` and nothing else
+            // for a named and an unnamed gitlink alike — so a gitfile they cannot
+            // use is no change under `ignore=dirty`, and a `.git` that is no git
+            // directory is `is_submodule_modified()`'s `die()` otherwise.
+            let status = crate::submodule::status::gitlink_status(&repo, rela_path, entry.id, ignore, check_dirty)?;
             Ok(status.is_dirty().and_then(|dirty| dirty.then_some(status)))
         }
     }

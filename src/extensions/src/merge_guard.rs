@@ -231,22 +231,39 @@ pub fn verify_two_way(
     new_tree: ObjectId,
     index: &gix::index::State,
 ) -> Result<Clobber> {
+    verify_two_way_initial(repo, old_tree, new_tree, index, false)
+}
+
+/// [`verify_two_way`] with `o->initial_checkout`, which `checkout` sets to
+/// `is_index_unborn()` (builtin/checkout.c:829). `twoway_merge()` then sends every
+/// new-tree path the index lacks to `merged_entry()` instead of taking it for a
+/// staged deletion (unpack-trees.c:2977-2987), so `verify_absent()` refuses each
+/// one an untracked file stands in — the two trees agreeing on it or not.
+pub fn verify_two_way_initial(
+    repo: &gix::Repository,
+    old_tree: ObjectId,
+    new_tree: ObjectId,
+    index: &gix::index::State,
+    initial_checkout: bool,
+) -> Result<Clobber> {
     let old = flatten(repo, old_tree)?;
     let new = flatten(repo, new_tree)?;
     let mut clobber = Clobber::default();
+    let (cur, conflicted) = index_map(index);
 
     // The merge's footprint: every path the two trees disagree on, in path
     // order so the reported lists come out sorted like git's.
     let touched: BTreeSet<&BString> = old
         .keys()
         .chain(new.keys())
-        .filter(|p| old.get(*p) != new.get(*p))
+        .filter(|p| {
+            old.get(*p) != new.get(*p) || (initial_checkout && !cur.contains_key(*p) && new.contains_key(*p))
+        })
         .collect();
     if touched.is_empty() {
         return Ok(clobber);
     }
 
-    let (cur, conflicted) = index_map(index);
     // What each path in the footprint asks of the disk, in traversal order.
     let mut checks: Vec<(&BString, Check)> = Vec::new();
     for path in touched {
@@ -265,7 +282,7 @@ pub fn verify_two_way(
             Some(_) => Check::Reject,
             // Staged deletion of a path the merge changes: `twoway_merge()`
             // rejects rather than resurrect it.
-            None if o.is_some() && n.is_some() => Check::Reject,
+            None if o.is_some() && n.is_some() && !initial_checkout => Check::Reject,
             None => match n {
                 Some(entry) => Check::Absent(entry.1, AbsentError::Overwritten),
                 None => Check::Absent(o.expect("in the footprint").1, AbsentError::Removed),

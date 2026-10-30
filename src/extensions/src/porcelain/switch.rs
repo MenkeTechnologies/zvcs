@@ -1456,7 +1456,9 @@ fn move_worktree(
         return Ok(Ok(None));
     }
     let mut autostashed = None;
-    if cur_tree != target_tree {
+    // An unborn index moves even onto the same tree: `initial_checkout` sends every path to
+    // `merged_entry()` (builtin/checkout.c:829, unpack-trees.c:2977-2987).
+    if cur_tree != target_tree || super::checkout::index_unborn(repo)? {
         match super::checkout::move_worktree(repo, cur_tree, target_tree, merge)? {
             super::checkout::Moved::Refused(code) => return Ok(Err(code)),
             super::checkout::Moved::Autostashed { conflicted } => autostashed = Some(conflicted),

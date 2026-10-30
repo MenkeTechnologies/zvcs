@@ -863,7 +863,10 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // index has never heard of — which is the whole point of taking untracked
     // files — so `git stash push -u -- never-added.txt` is not an error.
     if !opts.pathspecs.is_empty() && opts.untracked == Untracked::No {
-        let index = repo.open_index()?;
+        // `repo_read_index_preload()` (builtin/stash.c:1704) reads a missing index file as an
+        // empty index (`do_read_index()` with `must_exist == 0`, read-cache.c:2232), so every pathspec
+        // reports unmatched there.
+        let index = crate::index_open::or_empty(repo)?;
         let backing = index.path_backing();
         let tracked: Vec<BString> =
             index.entries().iter().map(|e| e.path_in(backing).to_owned()).collect();
@@ -1039,6 +1042,12 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // builtin/stash.c) — including under `-k`, which only skips the index reset
     // that follows. Reverting the whole path to `HEAD` here would delete work the
     // stash does not hold.
+    //
+    // `do_push_stash()` skips that `checkout --no-overlay <i_tree>` when `i_tree` is the empty
+    // tree (builtin/stash.c:1851-1866), so a `--keep-index` push over an empty index ends at the
+    // `reset --hard` and leaves `HEAD` in the index and the worktree. `-S` keeps the flag for
+    // its own `reset -q --refresh` (builtin/stash.c:1882-1893).
+    let keep_index = keep_index && (opts.staged_only || !i_tree_id.is_empty_tree());
     let worktree_target = match (opts.staged_only, keep_index) {
         (true, _) => match revert_staged_in_worktree(
             &scratch,
@@ -1081,6 +1090,12 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // `-S`'s target tree lives in the scratch odb, so both readers go through it; for
     // every other mode it is a real tree and the proxy just reads through.
     let target_map = tree_map(&scratch, worktree_target)?;
+    // Without a pathspec, `git clean --force --quiet -d :/` runs ahead of the
+    // `reset --hard` (builtin/stash.c:1762-1780, 1819-1829): an untracked file that
+    // `HEAD` tracks — one the index had dropped — is removed and then checked out again.
+    if opts.pathspecs.is_empty() {
+        remove_stashed_untracked(repo, &untracked_paths);
+    }
     let should_interrupt = AtomicBool::new(false);
     let fresh = sync_worktree(&scratch, worktree_target, &affected, &target_map, &should_interrupt)?;
     let old_index = repo.open_index()?;
@@ -1122,16 +1137,10 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     };
     write_target_index(repo, index_target, &old_index, &fresh, cache_tree)?;
 
-    // The untracked files now live in the stash's third parent, so git removes
-    // them from the worktree — with `git clean --force --quiet -d`, whose `-d`
-    // also takes the directories they leave empty.
-    let workdir = repo.workdir().map(std::path::Path::to_path_buf);
-    if let Some(root) = workdir {
-        for path in &untracked_paths {
-            let abs = root.join(gix::path::from_bstr(path.as_bstr()).as_ref());
-            let _ = std::fs::remove_file(&abs);
-        }
-        remove_emptied_dirs(repo, &untracked_paths);
+    // With a pathspec the untracked matches leave through the `add` and
+    // `apply --index -R` children, after the tracked paths are reset.
+    if !opts.pathspecs.is_empty() {
+        remove_stashed_untracked(repo, &untracked_paths);
     }
 
     // `do_push_stash()` clears the worktree with `reset --hard`, which logs
@@ -1184,6 +1193,18 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The untracked files now live in the stash's third parent, so git removes
+/// them from the worktree — with `git clean --force --quiet -d`, whose `-d`
+/// also takes the directories they leave empty.
+fn remove_stashed_untracked(repo: &gix::Repository, untracked_paths: &[BString]) {
+    let Some(root) = repo.workdir() else { return };
+    for path in untracked_paths {
+        let abs = root.join(gix::path::from_bstr(path.as_bstr()).as_ref());
+        let _ = std::fs::remove_file(&abs);
+    }
+    remove_emptied_dirs(repo, untracked_paths);
+}
+
 /// Pathspec matching for a push, over the same `repo.pathspec()` engine `rm`,
 /// `grep` and `jump` use — so `:(glob)`, `:(icase)` and `:!` behave identically
 /// here and a bare `*` keeps crossing `/` the way git's pathspecs do.
@@ -1197,7 +1218,9 @@ fn select_matching(
     specs: &[String],
     candidates: &[BString],
 ) -> Result<HashSet<BString>> {
-    let index = repo.open_index()?;
+    // The index only backs `:(attr)` lookups; a missing file is an empty index
+    // (read-cache.c:2232), as everywhere `do_push_stash()` reads it.
+    let index = crate::index_open::or_empty(repo)?;
     let patterns: Vec<BString> = specs.iter().map(|s| BString::from(s.as_str())).collect();
     let mut ps = repo.pathspec(
         true,
@@ -2037,7 +2060,9 @@ fn revert_staged_in_worktree(
         .collect();
     if !in_the_way.is_empty() {
         in_the_way.sort();
-        for path in &in_the_way {
+        // `git apply -R` prepends every patch after the first to its list
+        // (apply.c:4918-4928), so `check_patch_list()` reports them last path first.
+        for path in in_the_way.iter().rev() {
             eprintln!("error: {path}: already exists in working directory");
         }
         // Reported with its own wording, so the caller's per-path
@@ -2213,7 +2238,10 @@ fn merge_trees_cleanly(
 /// `stash push`, `apply` or `pop` in the middle of a conflicted merge ends: every unmerged path on
 /// stdout, then `error: could not write index` and a `-1` (see [`failed`]).
 fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
-    let index = repo.open_index()?;
+    // `repo_refresh_and_write_index()` refreshes the index `repo_read_index_preload()` read just
+    // before it (builtin/stash.c:659, 1704), an empty one when the file is missing
+    // (read-cache.c:2232), and its `write_locked_index()` creates the file (read-cache.c:1490).
+    let index = crate::index_open::or_empty(repo)?;
     let backing = index.path_backing();
     let mut unmerged: Vec<&BStr> = index
         .entries()

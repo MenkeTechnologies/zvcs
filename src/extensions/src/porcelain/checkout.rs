@@ -1530,6 +1530,15 @@ fn checkout_head_in_place(repo: &gix::Repository, quiet: bool, force: bool) -> R
             .detach();
         reset_worktree_to_tree(repo, tree)?;
     } else {
+        // The two-way merge onto `HEAD`'s own tree has nothing to move unless the index is
+        // unborn, when `initial_checkout` sends every path to `merged_entry()`
+        // (builtin/checkout.c:829, unpack-trees.c:2977-2987).
+        if let (Ok(tree), true) = (repo.head_tree_id(), index_unborn(repo)?) {
+            let tree = tree.detach();
+            if let Moved::Refused(code) = move_worktree(repo, tree, tree, None)? {
+                return Ok(code);
+            }
+        }
         show_local_changes("HEAD", quiet)?;
     }
     // `update_refs_for_switch()`'s "Nothing to do" arm still ends in
@@ -2093,7 +2102,9 @@ fn create_and_switch(
         // two trees are (builtin/checkout.c:871-876) — a same-tree `checkout -f -B`
         // still rewrites the index through `unpack_trees()`, cache-tree included.
         reset_worktree_to_tree(repo, target_tree)?;
-    } else if target_tree != cur_tree || index_unborn(repo)? {
+    } else if merge_worktree && (target_tree != cur_tree || index_unborn(repo)?) {
+        // `do_merge = 0` (builtin/checkout.c:1206-1207) skips `merge_working_tree()` whole,
+        // so a bare `git checkout -b <branch>` over a missing index file writes none.
         match move_worktree(repo, cur_tree, target_tree, merge)? {
             Moved::Refused(code) => return Ok(code),
             Moved::Autostashed { conflicted } => (autostashed, autostash_conflicted) = (true, conflicted),
@@ -2523,7 +2534,9 @@ fn restore_conflict_stage(
 ) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
-    let index = repo.open_index()?;
+    // `repo_read_index_preload()` (builtin/checkout.c:631) takes a missing index file for an
+    // empty index (read-cache.c:2232), where no pathspec matches.
+    let index = crate::index_open::or_empty(repo)?;
     let norm = Specs::new(repo, paths)?;
     let matched = match match_paths(&index, paths, &norm) {
         Ok(m) => m,
@@ -3234,7 +3247,8 @@ fn restore_from_tree(
     // the collapsed index `checkout_main()` asks for (:1904). What the walk does to each sparse
     // directory is [`super::checkout_sparse::SparseDirs`]'s; the blobs it never reaches as
     // entries of their own leave the source.
-    let mut index = repo.open_index()?;
+    // A missing index file is an empty index there (read-cache.c:2232).
+    let mut index = crate::index_open::or_empty(repo)?;
     let sparse_dirs = super::checkout_sparse::SparseDirs::prepare(
         repo,
         &mut index,
@@ -3563,7 +3577,10 @@ pub(super) enum Gate {
 /// back lost what the refresh had learnt (`ce_mark_uptodate()`), so the switch's own write
 /// re-examined those entries as racy and left stand-ins in a split index that stock does not.
 pub(super) fn refuse_unmerged_index(repo: &gix::Repository) -> Result<Option<ExitCode>> {
-    let mut index = repo.index_or_load_from_head_or_empty()?.into_owned();
+    // `merge_working_tree()`'s `repo_read_index_preload()` (builtin/checkout.c:849) takes a
+    // missing index file for an empty index (read-cache.c:2232), so the two-way merge below
+    // finds every file of the new tree in the worktree untracked.
+    let mut index = crate::index_open::or_empty(repo)?;
     let refreshed = if repo.workdir().is_some() {
         super::update_index::refresh_index(
             repo,
@@ -3613,7 +3630,9 @@ pub(super) fn switch_gate(
         None => {}
     }
     let index = crate::held_index::peek_or_read(repo)?;
-    let clobber = crate::merge_guard::verify_two_way(repo, cur_tree, target_tree, &index)?;
+    // `topts->initial_checkout = is_index_unborn(the_repository->index)` (builtin/checkout.c:829).
+    let initial_checkout = index.entries().is_empty() && index.timestamp().unix_seconds() == 0;
+    let clobber = crate::merge_guard::verify_two_way_initial(repo, cur_tree, target_tree, &index, initial_checkout)?;
     if clobber.is_empty() {
         return Ok(Gate::Clean);
     }
@@ -3947,7 +3966,7 @@ pub(super) fn update_worktree_to_tree(
         // from that in-memory index, not from a copy read back off disk.
         match crate::held_index::take() {
             Some(index) => index,
-            None => repo.index_or_load_from_head_or_empty()?.into_owned(),
+            None => crate::index_open::or_empty(repo)?,
         }
     };
     let old_stats: HashMap<BString, (ObjectId, Mode, Stat)> = {
@@ -4108,7 +4127,8 @@ fn flatten_tree(
 pub(super) fn reset_worktree_to_tree(repo: &gix::Repository, new_tree: ObjectId) -> Result<()> {
     let should_interrupt = AtomicBool::new(false);
 
-    let old = repo.index_or_load_from_head_or_empty()?.into_owned();
+    // A missing index file is an empty index (read-cache.c:2232).
+    let old = crate::index_open::or_empty(repo)?;
     let stat_ctx = super::read_tree::StatCtx::new(repo, &old)?;
     // Stage-0 entries only: a conflicted path has no stage-0 entry, so it never
     // matches `same(old, a)` and always ends up rewritten, which is what

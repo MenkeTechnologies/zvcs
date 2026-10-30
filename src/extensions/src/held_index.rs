@@ -22,12 +22,13 @@ pub fn hold(repo: &gix::Repository, index: gix::index::File) {
     HELD.with(|held| *held.borrow_mut() = Some((repo.clone(), index)));
 }
 
-/// A copy of the held index, or else the index on disk (`HEAD`'s tree when there is none).
+/// A copy of the held index, or else the index on disk — an empty one when there is no file,
+/// as `do_read_index()` reads it with `must_exist == 0` (read-cache.c:2232).
 pub fn peek_or_read(repo: &gix::Repository) -> anyhow::Result<gix::index::File> {
     if let Some(index) = HELD.with(|held| held.borrow().as_ref().map(|(_, i)| i.clone())) {
         return Ok(index);
     }
-    Ok(repo.index_or_load_from_head_or_empty()?.into_owned())
+    Ok(crate::index_open::or_empty(repo)?)
 }
 
 /// Take the held index, if any; whoever takes it writes it.

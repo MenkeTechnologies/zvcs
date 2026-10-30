@@ -884,7 +884,12 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
 
     // --- Resolve the restore source ----------------------------------------
     // `source_tree_id == None` means "the current index" (default worktree src).
-    let source_tree_id: Option<ObjectId> = match &source {
+    //
+    // `--staged` without `--source` is `from_treeish = "HEAD"` (builtin/checkout.c:1972-1973),
+    // resolved like any other source, so an unborn branch dies `could not resolve 'HEAD'`
+    // (builtin/checkout.c:2026-2027).
+    let source_or_head = source.clone().or_else(|| staged.then(|| "HEAD".to_string()));
+    let source_tree_id: Option<ObjectId> = match &source_or_head {
         // A `--source` that names nothing is git's own fatal, with the name
         // quoted. Propagating the revision parser's error instead put a Rust type
         // name and a path inside `src/ported/` in front of the user, and exited 1
@@ -905,14 +910,15 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             let id = super::checkout::branch_ref_id(&repo, rev.as_str()).unwrap_or(id);
             Some(super::checkout::classify_tree_ish(&repo, id)?.source_tree()?)
         }
-        None if staged => Some(repo.head_tree_id_or_empty()?.detach()),
         None => None,
     };
     let source_is_index = source_tree_id.is_none();
 
     // The real worktree index — the write target for `--staged`, and the read
     // source in the default worktree case.
-    let mut cur = repo.open_index()?;
+    // `repo_read_index_preload()` (builtin/checkout.c:631) takes a missing file for an empty
+    // index (read-cache.c:2232).
+    let mut cur = crate::index_open::or_empty(&repo)?;
 
     // `read_tree_some()` over the collapsed index `checkout_main()` asks for
     // (builtin/checkout.c:636, :1904): what it and the marking pass do to each sparse

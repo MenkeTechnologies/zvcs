@@ -885,7 +885,9 @@ pub fn reset(args: &[String]) -> Result<ExitCode> {
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
 
     // Capture the pre-reset index (worktree stats + tracked set) before mutating.
-    let old_index = repo.index_or_load_from_head_or_empty()?.into_owned();
+    // `repo_read_index()` (builtin/reset.c:480) takes a missing index file for an empty index
+    // (read-cache.c:2232), so a path reset over one stages the named paths alone.
+    let old_index = crate::index_open::or_empty(&repo)?;
 
     // ```c
     // if (reset_type == SOFT || reset_type == KEEP)
@@ -1865,6 +1867,9 @@ enum Refusal {
     /// path is new to the index, so whatever occupies it in the work tree is
     /// untracked.
     WouldLoseUntracked,
+    /// `ERROR_WOULD_LOSE_UNTRACKED_REMOVED` — `deleted_entry()` with no index entry
+    /// runs `verify_absent()` on the path the merge removes (unpack-trees.c:2683-2686).
+    WouldLoseUntrackedRemoved,
 }
 
 impl Refusal {
@@ -1876,6 +1881,9 @@ impl Refusal {
             }
             Refusal::WouldLoseUntracked => {
                 format!("Untracked working tree file '{path}' would be overwritten by merge.")
+            }
+            Refusal::WouldLoseUntrackedRemoved => {
+                format!("Untracked working tree file '{path}' would be removed by merge.")
             }
         }
     }
@@ -1891,6 +1899,9 @@ enum Act {
     Update,
     /// Local changes would be lost — abort the whole reset.
     Conflict,
+    /// Nothing to write, but the path must not be in the work tree untracked:
+    /// `deleted_entry(oldtree, NULL)`'s `verify_absent()` (unpack-trees.c:2683-2686).
+    VerifyAbsent,
 }
 
 /// `oneway_merge` (`--merge`): compare the index entry `i` to the target `t`.
@@ -1925,7 +1936,10 @@ fn classify_keep(
             }
         }
         None => match (h, t) {
-            (_, None) => Act::Keep,
+            // `twoway_merge()`'s closing `return deleted_entry(oldtree, current, o)`
+            // (unpack-trees.c:2988) for a path `HEAD` has and the target drops.
+            (Some(_), None) => Act::VerifyAbsent,
+            (None, None) => Act::Keep,
             (Some(hv), Some(_)) if Some(hv) == t => Act::Keep, // staged deletion kept
             (Some(_), Some(_)) => Act::Conflict,
             (None, Some(_)) => Act::Update,
@@ -2051,16 +2065,20 @@ fn reset_two_tree(
             Act::Conflict => {
                 conflicts.insert((path.clone(), Refusal::WouldOverwrite));
             }
+            Act::VerifyAbsent => {
+                if !conflicted && !worktree_absent_or_ignored(repo, old, &mut excludes, BStr::new(path)) {
+                    conflicts.insert((path.clone(), Refusal::WouldLoseUntrackedRemoved));
+                }
+            }
         }
     }
 
-    // git's `unpack_trees` prints one `error:` line per conflicting entry, then the
-    // caller (`reset_index`) prints the `fatal:` line and exits 128. Nothing is
-    // written and HEAD is not moved.
-    if !conflicts.is_empty() {
-        for (path, refusal) in &conflicts {
-            eprintln!("error: {}", refusal.message(BStr::new(path)));
-        }
+    // `reset_index()` sets no `show_all_errors`, so `add_rejected_path()` reports the
+    // first refused entry with `error()` and the traversal stops there
+    // (unpack-trees.c:249-251); the caller (`reset_index`) prints the `fatal:` line and
+    // exits 128. Nothing is written and HEAD is not moved.
+    if let Some((path, refusal)) = conflicts.iter().next() {
+        eprintln!("error: {}", refusal.message(BStr::new(path)));
         return Ok(None);
     }
 

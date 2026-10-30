@@ -2318,25 +2318,6 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         let mut painted: Option<(usize, usize)> = None;
         let mut separator = false;
 
-        if opts.emit_pairs {
-            out.extend_from_slice(&render(&repo, &deltas, &opts)?);
-            if !deltas.is_empty() {
-                separator = true;
-            }
-        }
-
-        if !deltas.is_empty() {
-            // `builtin_checkdiff()`, in `diff_flush()`'s raw/name/checkdiff block —
-            // the same walk `diff-files --check` does, over this command's pair list.
-            if opts.format == Format::Check {
-                // `builtin_checkdiff()` asks both attributes per pair (diff.c:4276-4277).
-                let mut check_rules = super::diff::WsRules::new(&repo);
-                // `run_checkdiff()` reports the `strip_prefix()`ed name and looks the
-                // attributes up by the full one (diff.c:5102-5107).
-                let names: Vec<BString> =
-                    deltas.iter().map(|d| display_path(&d.path, &opts)).collect();
-                let pairs: Vec<super::diff_files::CheckPair<'_>> = deltas
-                    .iter()
         // `show_combined_diff()` (combine-diff.c:1284-1296) printed each combined path
         // during the walk, so all of them come ahead of what `diff_flush()` makes of
         // the queue, and none of them sets the separator the patch below waits for.
@@ -2371,6 +2352,25 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
             out.extend_from_slice(&head);
         }
 
+        if opts.emit_pairs {
+            out.extend_from_slice(&render(&repo, &deltas, &opts)?);
+            if !deltas.is_empty() {
+                separator = true;
+            }
+        }
+
+        if !deltas.is_empty() {
+            // `builtin_checkdiff()`, in `diff_flush()`'s raw/name/checkdiff block —
+            // the same walk `diff-files --check` does, over this command's pair list.
+            if opts.format == Format::Check {
+                // `builtin_checkdiff()` asks both attributes per pair (diff.c:4276-4277).
+                let mut check_rules = super::diff::WsRules::new(&repo);
+                // `run_checkdiff()` reports the `strip_prefix()`ed name and looks the
+                // attributes up by the full one (diff.c:5102-5107).
+                let names: Vec<BString> =
+                    deltas.iter().map(|d| display_path(&d.path, &opts)).collect();
+                let pairs: Vec<super::diff_files::CheckPair<'_>> = deltas
+                    .iter()
                     .zip(&analyses)
                     .zip(&names)
                     .map(|((d, an), name)| super::diff_files::CheckPair {

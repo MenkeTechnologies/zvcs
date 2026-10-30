@@ -4786,7 +4786,65 @@ fn edit_todo_list(
         return Ok(EditOutcome::Rejected);
     }
     let _ = std::fs::remove_file(dir.join("dropped"));
+    // "See if branches need to be added or removed from the update-refs file
+    // based on the new todo list." (rebase-interactive.c:160-164)
+    filter_update_refs(repo, &new)?;
     Ok(EditOutcome::Ok(new))
+}
+
+/// `todo_list_filter_update_refs()` (sequencer.c:4537-4621): a record whose ref
+/// has not been updated yet and that no `update-ref` line names any more is
+/// dropped, and an `update-ref` line with no record gains one, its `before` read
+/// from the ref as it stands (`init_update_ref_record()`, sequencer.c:259-272).
+/// The file is rewritten only when something changed.
+fn filter_update_refs(repo: &gix::Repository, list: &todo::List) -> Result<()> {
+    let mut refs = read_update_refs_state(repo)?;
+    let named = |r: &str| {
+        list.items
+            .iter()
+            .any(|item| item.cmd == todo::Cmd::UpdateRef && item.arg.as_slice() == r.as_bytes())
+    };
+    let before = refs.len();
+    refs.retain(|(name, _, after)| !after.is_null() || named(name));
+    let mut updated = refs.len() != before;
+    let null = ObjectId::null(repo.object_hash());
+    for item in &list.items {
+        if item.cmd != todo::Cmd::UpdateRef {
+            continue;
+        }
+        let name = item.arg.to_str_lossy().into_owned();
+        if refs.iter().any(|(r, _, _)| *r == name) {
+            continue;
+        }
+        // `string_list_insert()`: `get_entry_index()`'s binary search over a list
+        // read back in file order (string-list.c:15-38), so the new record lands
+        // where a sorted list would put it.
+        let (mut left, mut right) = (0, refs.len());
+        while left < right {
+            let middle = left + (right - left) / 2;
+            match name.as_bytes().cmp(refs[middle].0.as_bytes()) {
+                std::cmp::Ordering::Less => right = middle,
+                std::cmp::Ordering::Greater => left = middle + 1,
+                std::cmp::Ordering::Equal => break,
+            }
+        }
+        // "This may fail, but that's fine, we will keep the null OID."
+        let before = if name.starts_with("refs/") {
+            repo.try_find_reference(name.as_str())
+                .ok()
+                .flatten()
+                .and_then(|mut r| r.follow_to_object().ok().map(|id| id.detach()))
+                .unwrap_or(null)
+        } else {
+            null
+        };
+        refs.insert(right, (name, before, null));
+        updated = true;
+    }
+    if updated {
+        write_update_refs_state(repo, &refs)?;
+    }
+    Ok(())
 }
 
 /// `apply_autostash(); sequencer_remove_state();` — the teardown git runs when
@@ -4968,12 +5026,14 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
         let tip = repo.head_id()?.detach();
         let tip_tree = repo.find_commit(tip)?.tree_id()?.detach();
         restore_worktree_to_tree(repo, &old, tip_tree, &seq.should_interrupt)?;
-        // The per-instruction reset the pick loop runs before every instruction
-        // (sequencer.c:4624-4629) — the merge state the stop recorded belongs to
-        // the instruction being thrown away. `REBASE_HEAD` is *not* dropped here:
-        // stock leaves it naming the skipped commit, and this measured the same.
-        let _ = std::fs::remove_file(repo.git_dir().join("MERGE_MSG"));
-        let _ = crate::refstore::state_ref_delete(repo, "AUTO_MERGE", "");
+        // `remove_branch_state(the_repository, 0)` (builtin/rebase.c:1394,
+        // branch.c:863-879) — the merge state the stop recorded belongs to the
+        // instruction being thrown away: `CHERRY_PICK_HEAD`, `AUTO_MERGE`,
+        // `SQUASH_MSG` and every `MERGE_*` file, which includes the `MERGE_HEAD`
+        // and `MERGE_MODE` a stopped `merge` instruction left. `REBASE_HEAD` is
+        // *not* dropped here: stock leaves it naming the skipped commit, and this
+        // measured the same.
+        super::reset::remove_branch_state(repo, false)?;
     }
     // `ACTION_SKIP` falls through to `sequencer_continue()` (builtin/rebase.c:
     // 1385-1397), so a skip reaches `commit_staged_changes()` too — with a clean
@@ -6207,141 +6267,215 @@ impl<'r> Sequencer<'r> {
             })
     }
 
-    /// `do_merge()`: recreate a merge commit whose sides the sheet named by label.
+    /// [`lookup_label`](Self::lookup_label) as `do_merge()` calls it, also handing
+    /// back `buf`: `refs/rewritten/<label>` when that ref exists, else the label
+    /// itself, whose `lookup_commit_reference_by_name()` peels a tag to its commit
+    /// (sequencer.c:4050-4070).
+    fn lookup_label_named(&self, label: &str) -> Result<(ObjectId, String)> {
+        let full = format!("refs/rewritten/{label}");
+        if let Ok(Some(mut r)) = self.repo.try_find_reference(full.as_str()) {
+            if let Ok(id) = r.peel_to_id() {
+                return Ok((id.detach(), full));
+            }
+        }
+        self.repo
+            .rev_parse_single(label)
+            .ok()
+            .and_then(|id| id.object().ok()?.peel_to_commit().ok())
+            .map(|c| (c.id, label.to_string()))
+            .ok_or_else(|| {
+                eprintln!("error: could not resolve '{label}'");
+                anyhow!(Reschedule)
+            })
+    }
+
+    /// `do_merge()` (sequencer.c:4167-4477): recreate a merge from the heads the
+    /// sheet names by label.
     ///
-    /// Covered: the fast-forward shortcut (`HEAD` and every merge head are still
-    /// the original merge's parents, so its commit id survives the rebase) and a
-    /// genuine two-parent `ort` merge, including a conflict stop.
+    /// Covered: the fast-forward shortcut, the `[new root]` fast-forward, the
+    /// `git merge -s <strategy>` child for an octopus or an explicit strategy, and a
+    /// two-parent merge-ort merge concluded by the `git commit` child, with
+    /// `merge -c` and a bare `merge` amending the result in the editor.
     ///
-    /// Not ported, and refused rather than approximated: octopus merges (git
-    /// shells out to `git merge -s octopus`), an explicit `-s <strategy>`, the
-    /// `merge -c` editor variant, `merge` with no `-C`/`-c` original, and
-    /// merging onto the `--root` stand-in commit.
+    /// Not ported, and refused rather than approximated: a two-parent merge whose
+    /// heads have more than one merge base.
     fn do_merge(&mut self, item: &todo::Item) -> Result<Step> {
         let repo = self.repo;
-        let Some(original) = item.commit else {
-            self.term_clear_line();
-            bail!(
-                "`merge` without `-C <commit>` is not ported (git synthesizes a \
-                 `Merge branch '…'` message for it); the rebase is still resumable with \
-                 `git rebase --abort`"
-            );
-        };
-        if item.flags & todo::EDIT_MERGE_MSG != 0 {
-            self.term_clear_line();
-            bail!("`merge -c` (reword the merge message) is not ported");
-        }
+        let edit = item.flags & todo::EDIT_MERGE_MSG != 0;
+        let arg: &[u8] = item.arg.as_slice();
+        let head = repo.head_id()?.detach();
 
-        // The argument is the merge heads, optionally followed by `# <oneline>`.
-        let arg = item.arg.to_str_lossy().into_owned();
-        let heads: Vec<&str> = arg
-            .split_whitespace()
-            .take_while(|w| *w != "#")
-            .collect();
-        if heads.is_empty() {
-            self.term_clear_line();
-            crate::git_fatal!("nothing to merge: '{arg}'");
-        }
         // ```c
-        // merge_commit = lookup_label(r, p, k, &ref_name);
-        // if (!merge_commit) {
-        //         ret = error(_("unable to parse '%.*s'"), k, p);
-        //         goto leave_merge;
-        // }
+        // merge_arg_len = oneline_offset = arg_len;
+        // for (p = arg; p - arg < arg_len; p += strspn(p, " \t\n")) {
+        //         if (!*p)
+        //                 break;
+        //         if (*p == '#' && (!p[1] || isspace(p[1]))) {
+        //                 p += 1 + strspn(p + 1, " \t\n");
+        //                 oneline_offset = p - arg;
+        //                 break;
+        //         }
+        //         k = strcspn(p, " \t\n");
+        //         …
+        //         merge_commit = lookup_label(r, p, k, &ref_name);
         // ```
-        //
-        // (sequencer.c:4151-4155.) A label `do_merge()` cannot resolve costs two
-        // `error:` lines, not one: `lookup_label()` has already said it could not
-        // resolve the name, and `do_merge()` adds that it could not parse the
-        // merge-head list because of it.
-        let mut merge_heads: Vec<ObjectId> = Vec::with_capacity(heads.len());
-        for h in &heads {
-            match self.lookup_label(h) {
-                Ok(id) => merge_heads.push(id),
+        // (sequencer.c:4204-4224.) `ref_name` keeps the name the last head resolved
+        // through, `refs/rewritten/<label>` or the label itself, and becomes the
+        // `theirs` conflict-marker label.
+        let sep = |b: u8| matches!(b, b' ' | b'\t' | b'\n');
+        let mut merge_arg_len = arg.len();
+        let mut oneline_offset = arg.len();
+        let mut to_merge: Vec<ObjectId> = Vec::new();
+        let mut ref_name = String::new();
+        let mut p = 0;
+        while p < arg.len() {
+            if arg[p] == b'#' && arg.get(p + 1).is_none_or(|&b| b.is_ascii_whitespace()) {
+                p += 1;
+                p += arg[p..].iter().take_while(|&&b| sep(b)).count();
+                oneline_offset = p;
+                break;
+            }
+            let k = arg[p..].iter().take_while(|&&b| !sep(b)).count();
+            let name = arg[p..p + k].to_str_lossy().into_owned();
+            match self.lookup_label_named(&name) {
+                Ok((id, resolved)) => {
+                    to_merge.push(id);
+                    ref_name = resolved;
+                }
                 Err(e) => {
                     if e.is::<Reschedule>() {
-                        eprintln!("error: unable to parse '{h}'");
+                        eprintln!("error: unable to parse '{name}'");
                     }
                     return Err(e);
                 }
             }
+            p += k;
+            merge_arg_len = p;
+            p += arg[p..].iter().take_while(|&&b| sep(b)).count();
         }
-        let head = repo.head_id()?.detach();
+        if to_merge.is_empty() {
+            self.term_clear_line();
+            eprintln!("error: nothing to merge: '{}'", item.arg.to_str_lossy());
+            return Err(anyhow!(Reschedule));
+        }
+
+        // ```c
+        // if (opts->have_squash_onto &&
+        //     oideq(&head_commit->object.oid, &opts->squash_onto)) {
+        //         …
+        //         if (to_merge->next)
+        //                 ret = error(_("octopus merge cannot be executed on "
+        //                               "top of a [new root]"));
+        //         else
+        //                 ret = fast_forward_to(r, &to_merge->item->object.oid,
+        //                                       &head_commit->object.oid, 0, opts);
+        //         goto leave_merge;
+        // }
+        // ```
+        // (sequencer.c:4231-4246): no message, no editor, no author-script.
+        if self.st.squash_onto == Some(head) {
+            if to_merge.len() > 1 {
+                self.term_clear_line();
+                eprintln!("error: octopus merge cannot be executed on top of a [new root]");
+                return Err(anyhow!(Reschedule));
+            }
+            update_clean_worktree(repo, &self.index, to_merge[0], &self.should_interrupt)?;
+            self.refresh_index()?;
+            set_head(repo, Target::Object(to_merge[0]), "rebase: fast-forward")?;
+            return Ok(Step::Next);
+        }
 
         // `can_fast_forward`: HEAD is still the original merge's first parent and
         // the merge heads are still its remaining parents — in the same order and
         // the same number of them, which is `if (j || p) can_fast_forward = 0`
-        // (sequencer.c:4270-4292) — so the original merge commit already *is* the
+        // (sequencer.c:4248-4274) — so the original merge commit already *is* the
         // answer. An octopus reaches this too, which is what makes
         // `rebase --rebase-merges` over a four-parent merge reproduce it byte for
-        // byte instead of rebuilding it.
-        let original_parents: Vec<ObjectId> = repo
-            .find_commit(original)?
-            .parent_ids()
-            .map(|p| p.detach())
-            .collect();
-        let can_fast_forward = self.st.allow_ff
-            && original_parents.first() == Some(&head)
-            && original_parents.len() == merge_heads.len() + 1
-            && original_parents[1..] == merge_heads[..];
-        if can_fast_forward {
-            update_clean_worktree(repo, &self.index, original, &self.should_interrupt)?;
-            self.refresh_index()?;
-            set_head(repo, Target::Object(original), "rebase: fast-forward")?;
-            return Ok(Step::Next);
+        // byte instead of rebuilding it. `merge -c` still goes on to the editor
+        // (`goto fast_forward_edit`, sequencer.c:4276-4283).
+        let original = item.commit.map(|id| repo.find_commit(id)).transpose()?;
+        if let Some(commit) = &original {
+            let parents: Vec<ObjectId> = commit.parent_ids().map(|p| p.detach()).collect();
+            let can_fast_forward = self.st.allow_ff
+                && parents.first() == Some(&head)
+                && parents.len() == to_merge.len() + 1
+                && parents[1..] == to_merge[..];
+            if can_fast_forward {
+                let id = commit.id;
+                update_clean_worktree(repo, &self.index, id, &self.should_interrupt)?;
+                self.refresh_index()?;
+                set_head(repo, Target::Object(id), "rebase: fast-forward")?;
+                if edit {
+                    return self.merge_amend_in_editor(item, None);
+                }
+                return Ok(Step::Next);
+            }
         }
 
         // ```c
-        // if (strategy || to_merge->next) {
-        //         /* Octopus merge */
+        // if (commit) {
         //         …
-        //         strvec_pushl(&cmd.args, "merge", "-s", "octopus", "--no-edit",
-        //                      "--no-ff", "--no-log", "--no-stat", "-F",
-        //                      git_path_merge_msg(r), NULL);
-        //         …
-        //         for (j = to_merge; j; j = j->next)
-        //                 strvec_push(&cmd.args, oid_to_hex(&j->item->object.oid));
+        //         write_author_script(message);
+        //         find_commit_subject(message, &body);
+        //         strbuf_add(&ctx->message, body, len);
+        // } else {
+        //         strbuf_addf(&buf, "author %s", git_author_info(0));
+        //         write_author_script(buf.buf);
+        //         if (oneline_offset < arg_len) {
+        //                 strbuf_add(&ctx->message, arg + oneline_offset,
+        //                            arg_len - oneline_offset);
+        //         } else {
+        //                 strbuf_addf(&ctx->message, "Merge %s '%.*s'",
+        //                             to_merge->next ? "branches" : "branch",
+        //                             merge_arg_len, arg);
+        //         }
+        // }
+        // ctx->have_message = 1;
+        // if (write_message(ctx->message.buf, ctx->message.len,
+        //                   git_path_merge_msg(r), 0)) {
         // ```
-        // (sequencer.c:4310-4348). More than one merge head is not merged in
-        // process at all: git hands the whole instruction to a
-        // `git merge -s octopus` child, which commits it, moves `HEAD` and writes
-        // its own `merge <oid> <oid> …: Merge made by the 'octopus' strategy.`
-        // reflog line — measured against stock 2.55.0 replaying a four-parent
-        // merge with `rebase --rebase-merges=rebase-cousins`.
-        if merge_heads.len() > 1 {
-            // `write_message(body, len, git_path_merge_msg(r), 0)`: the original
-            // merge's message from its subject onward, which is what `-F` reads.
-            let commit = repo.find_commit(original)?;
-            let raw = commit.message_raw()?.to_owned();
-            let msg_path = repo.git_dir().join("MERGE_MSG");
-            std::fs::write(&msg_path, super::format_patch::skip_blank_lines(&raw))?;
-            // `refs_delete_ref(…, "CHERRY_PICK_HEAD", …)` right before the child,
-            // so the `git commit` inside it does not conclude a pick instead.
-            let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
-            self.term_clear_line();
-            let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
-            cmd.current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()))
-                .args(["merge", "-s", "octopus", "--no-edit", "--no-ff", "--no-log", "--no-stat"])
-                .arg("-F")
-                .arg(&msg_path)
-                .arg("--no-gpg-sign");
-            for id in &merge_heads {
-                cmd.arg(id.to_string());
+        // (sequencer.c:4287-4326.) `MERGE_MSG` is the message as it stands, with
+        // no newline added.
+        let message: BString = match &original {
+            Some(commit) => {
+                write_author_script(repo, commit)?;
+                super::format_patch::skip_blank_lines(commit.message_raw()?).into()
             }
-            crate::cstdio::before_spawn();
-            let status = cmd.status()?;
-            if !status.success() {
-                return Ok(Step::Stop(status.code().unwrap_or(1).clamp(0, 255) as u8));
+            None => {
+                let author = match repo.author() {
+                    Some(sig) => sig?.to_owned()?,
+                    None => self.committer.clone(),
+                };
+                write_author_script_ident(repo, author.name.as_ref(), author.email.as_ref(), author.time)?;
+                if oneline_offset < arg.len() {
+                    arg[oneline_offset..].into()
+                } else {
+                    let mut m = BString::from(format!(
+                        "Merge {} '",
+                        if to_merge.len() > 1 { "branches" } else { "branch" }
+                    ));
+                    m.extend_from_slice(&arg[..merge_arg_len]);
+                    m.push(b'\'');
+                    m
+                }
             }
-            // "force re-reading of the cache": the child rewrote the index.
-            self.refresh_index()?;
-            return Ok(Step::Next);
-        }
-        let merge_head = merge_heads[0];
+        };
+        let git_dir = repo.git_dir().to_owned();
+        let merge_msg = git_dir.join("MERGE_MSG");
+        std::fs::write(&merge_msg, &message)?;
 
-        // `merge_ort_recursive()` over the one merge base. Several bases would
-        // need the virtual common ancestor git builds by merging them, which is
-        // not reachable from here.
+        // `strategy` is `NULL` unless `-X` was given or `-s` named something other
+        // than `recursive`/`ort` (sequencer.c:4177-4182).
+        let strategy = match self.st.strategy.as_deref() {
+            _ if !self.st.strategy_opts.is_empty() => self.st.strategy.clone(),
+            None | Some("recursive") | Some("ort") => None,
+            Some(s) => Some(s.to_string()),
+        };
+        if strategy.is_some() || to_merge.len() > 1 {
+            return self.merge_with_strategy_child(item, strategy.as_deref(), &to_merge, &merge_msg, &message, edit);
+        }
+        let merge_head = to_merge[0];
+
         let bases = repo.merge_bases_many(head, &[merge_head])?;
         // ```c
         // if (bases && oideq(&merge_commit->object.oid,
@@ -6351,12 +6485,11 @@ impl<'r> Sequencer<'r> {
         //         goto leave_merge;
         // }
         // ```
-        // (sequencer.c:4334-4339). A merge head that is already an ancestor of
+        // (sequencer.c:4399-4404). A merge head that is already an ancestor of
         // `HEAD` contributes nothing, so git writes no `MERGE_HEAD`, builds no
         // commit and leaves `HEAD` where it is -- while still recording the
         // original merge in `rewritten`, which is why this returns `Next` rather
-        // than stopping. Without it a `merge` whose side had already been
-        // replayed onto `HEAD` produced a two-parent commit git never writes.
+        // than stopping.
         if bases.first().map(|b| b.detach()) == Some(merge_head) {
             return Ok(Step::Next);
         }
@@ -6368,13 +6501,19 @@ impl<'r> Sequencer<'r> {
                 bases.len()
             );
         }
+        // `write_message(…, git_path_merge_head(r), 0)` and
+        // `write_message("no-ff", 5, git_path_merge_mode(r), 0)` (sequencer.c:4406-4408):
+        // neither file ends in a newline.
+        std::fs::write(git_dir.join("MERGE_HEAD"), merge_head.to_string())?;
+        std::fs::write(git_dir.join("MERGE_MODE"), "no-ff")?;
+
         let base_tree = match bases.first() {
             Some(id) => repo.find_object(id.detach())?.peel_to_tree()?.id,
             None => ObjectId::empty_tree(repo.object_hash()),
         };
         let head_tree = repo.find_commit(head)?.tree_id()?.detach();
         let other_tree = repo.find_commit(merge_head)?.tree_id()?.detach();
-        let other_label = format!("refs/rewritten/{}", heads[0]);
+        // `o.branch1 = "HEAD"; o.branch2 = ref_name.buf;` (sequencer.c:4414-4415).
         let applied = crate::merge_apply::three_way_merge_with_options(
             repo,
             base_tree,
@@ -6384,127 +6523,209 @@ impl<'r> Sequencer<'r> {
             gix::merge::blob::builtin_driver::text::Labels {
                 ancestor: None,
                 current: Some(BStr::new(b"HEAD")),
-                other: Some(BStr::new(other_label.as_bytes())),
+                other: Some(BStr::new(ref_name.as_bytes())),
             },
             &self.should_interrupt,
             false,
             &self.xopts,
         )?;
-        // `if (ret <= 0) fputs(o.obuf.buf, stdout)` (sequencer.c:4360-4361) —
-        // `do_merge()` buffers merge-ort's output (`o.buffer_output = 2`) and
-        // flushes it only when the merge did not come out clean.
-        if !applied.conflicts.is_empty() {
-            for line in &applied.messages {
-                println!("{line}");
-            }
+        // `merge_switch_to_result()` records the merged tree as `AUTO_MERGE`,
+        // clean or not (merge-ort.c:4959-4962).
+        crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
+        let clean = applied.conflicts.is_empty();
+        // `merge_ort_recursive()` hands `merge_switch_to_result()` `show_msgs =
+        // !!opt->verbosity` (merge-ort-wrappers.c:67-70), whose
+        // `merge_display_update_messages()` writes straight to stdout
+        // (merge-ort.c:4833, 4973-4974), clean merge or not. `o.obuf`, which
+        // `do_merge()` flushes only when `ret <= 0` (sequencer.c:4425-4426), is
+        // merge-recursive's buffer and stays empty under merge-ort.
+        if !applied.messages.is_empty() {
+            self.term_clear_line();
+        }
+        for line in &applied.messages {
+            println!("{line}");
         }
         self.index = applied.index;
         crate::index_racy::write(repo, &mut self.index)?;
 
-        let commit = repo.find_commit(original)?;
-        let message: BString = commit.message_raw()?.to_owned();
-        if !applied.conflicts.is_empty() {
-            // `MERGE_HEAD`/`MERGE_MODE` are what let `git commit` conclude the
-            // stopped merge.
-            std::fs::write(repo.git_dir().join("MERGE_HEAD"), format!("{merge_head}\n"))?;
-            std::fs::write(repo.git_dir().join("MERGE_MODE"), "no-ff\n")?;
-            std::fs::write(repo.git_dir().join("MERGE_MSG"), &message)?;
-            let short = todo::short_name(repo, original);
-            let subject = first_line(message.as_bstr());
-            return self.stop_for_conflict(item, original, &short, &subject, &message, None, false, false);
+        if !clean {
+            // `repo_rerere(r, opts->allow_rerere_auto)` (sequencer.c:4451-4452),
+            // then `pick_commits()` reports the conflict through
+            // `error_with_patch(…, res = 1, to_amend = 0)` (sequencer.c:5213-5217).
+            super::rerere::repo_rerere(repo, self.st.rerere_autoupdate)?;
+            return self.merge_error_with_patch(item, Some(&message), 1);
         }
 
-        write_author_script(repo, &commit)?;
-        // `do_merge()` concludes through `run_git_commit(git_path_merge_msg(r), …)`
-        // (sequencer.c:4452-4453), a `git commit` child handed the original's author
-        // through `read_env_script()`, whose `git_committer_info(IDENT_STRICT)`
-        // (builtin/commit.c:941) is the one lookup that can refuse. The commit is
-        // written in process below; a refusal it would meet is reproduced by running
-        // the child git runs, over the state `do_merge()` left for it: `MERGE_MSG`
-        // (sequencer.c:4320-4322), `MERGE_HEAD` and `MERGE_MODE` (:4406-4408) and
-        // merge-ort's `AUTO_MERGE`. The child's `res = !!…` is 1, which
-        // `pick_commits()` reports through `error_with_patch(…, exit_code = 1,
-        // to_amend = 0)` (sequencer.c:5213-5217).
-        if crate::commit_tree_refusal(true).is_some() {
-            let git_dir = repo.git_dir();
-            let body = super::format_patch::skip_blank_lines(&message).to_vec();
-            std::fs::write(git_dir.join("MERGE_MSG"), &body)?;
-            std::fs::write(git_dir.join("MERGE_HEAD"), format!("{merge_head}"))?;
-            std::fs::write(git_dir.join("MERGE_MODE"), "no-ff")?;
-            crate::merge_apply::write_auto_merge(repo, applied.tree_id)?;
-            self.term_clear_line();
-            // `run_git_commit()` with no flags: `-n`, `--no-gpg-sign`, `-F`,
-            // `--cleanup=verbatim` and `--allow-empty-message`, run through
-            // `run_command_silent_on_success()` (sequencer.c:1153-1188).
-            let msg_path = git_dir.join("MERGE_MSG");
-            let args: Vec<String> = vec![
-                "-n".into(),
-                "--no-gpg-sign".into(),
-                "-F".into(),
-                msg_path.display().to_string(),
-                "--cleanup=verbatim".into(),
-                "--allow-empty-message".into(),
-            ];
-            let (ok, out) = self.run_commit_capture(&args, self.author_env())?;
-            if !ok {
-                use std::io::Write;
-                let _ = std::io::stderr().write_all(&out);
-                let dir = self.dir();
-                if !dir.join("message").exists() {
-                    std::fs::write(dir.join("message"), &body)?;
-                }
-                make_patch(repo, &dir, &commit)?;
-                let short = todo::short_name(repo, original);
-                eprintln!("Could not apply {short}... {}", item.arg.to_str_lossy());
-                return Ok(Step::Stop(1));
-            }
-            // The verdict is the parent's; a child that commits anyway concluded the
-            // merge itself and moved `HEAD`.
-            self.refresh_index()?;
+        // `run_git_commit(git_path_merge_msg(r), reflog_action, opts,
+        // run_commit_flags)` with no flags (sequencer.c:4453-4460): a real
+        // `git commit` over `MERGE_HEAD`/`MERGE_MODE`/`MERGE_MSG`, handed the
+        // author-script's author, run through `run_command_silent_on_success()`.
+        // Under `--signoff` it carries no `-s`, only the loss of
+        // `--cleanup=verbatim` (sequencer.c:1170-1174): the merge is not signed off.
+        self.term_clear_line();
+        let mut args: Vec<String> = vec![
+            "-n".into(),
+            "--no-gpg-sign".into(),
+            "-F".into(),
+            merge_msg.display().to_string(),
+        ];
+        if !self.st.signoff && !commit_cleanup_is_explicit(repo) {
+            args.push("--cleanup=verbatim".into());
+        }
+        args.push("--allow-empty-message".into());
+        let mut env = self.run_git_commit_env(true);
+        env.push(("GIT_REFLOG_ACTION".into(), format!("{} (merge)", reflog_action())));
+        let (ok, out) = self.run_commit_capture(&args, env)?;
+        self.refresh_index()?;
+        if !ok {
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(&out);
+            return self.merge_error_with_patch(item, Some(&message), 1);
+        }
+        if edit {
+            return self.merge_amend_in_editor(item, Some(&message));
+        }
+        Ok(Step::Next)
+    }
+
+    /// `do_merge()`'s `fast_forward_edit:` arm (sequencer.c:4462-4468): amend the
+    /// merge just made with the editor open, `run_git_commit(NULL, …, AMEND_MSG |
+    /// EDIT_MSG | VERIFY_MSG)` — `git commit --amend --no-gpg-sign -e`, hooks
+    /// enabled, its output shown. `message` is `ctx->message`, which a merge that
+    /// fast-forwarded never built.
+    fn merge_amend_in_editor(&mut self, item: &todo::Item, message: Option<&BString>) -> Result<Step> {
+        self.term_clear_line();
+        let args: Vec<String> = vec!["--amend".into(), "--no-gpg-sign".into(), "-e".into()];
+        // `read_env_script()` is skipped for an amend without a message file unless
+        // `--committer-date-is-author-date` needs the author date
+        // (sequencer.c:1133-1136).
+        let read_env = self.st.committer_date_is_author_date && !self.st.ignore_date;
+        let mut env = self.run_git_commit_env(read_env);
+        env.push(("GIT_REFLOG_ACTION".into(), format!("{} (merge)", reflog_action())));
+        let code = self.run_commit(&args, env)?;
+        self.refresh_index()?;
+        if code == 0 {
             return Ok(Step::Next);
         }
-        let mut author = commit.author()?.to_owned()?;
-        let mut committer = self.committer.clone();
-        apply_date_options(
-            &mut author,
-            &mut committer,
-            self.now,
-            self.st.ignore_date,
-            self.st.committer_date_is_author_date,
-        );
-        let signed = sign_off(&self.committer, self.st.signoff, &message)?;
-        let new = repo
-            .write_object(&gix::objs::Commit {
-                message: signed,
-                tree: applied.tree_id,
-                author,
-                committer,
-                encoding: None,
-                parents: [head, merge_head].into_iter().collect(),
-                extra_headers: Default::default(),
-            })?
-            .detach();
-        set_head(
-            repo,
-            Target::Object(new),
-            &gix::reference::log::message(
-                &format!("{} (merge)", reflog_action()),
-                message.as_bstr(),
-                1,
-            )
-            .to_string(),
-        )?;
-        // That `git commit` writes the `-F MERGE_MSG` text, taken verbatim, into
-        // `COMMIT_EDITMSG` (builtin/commit.c:911-932) and leaves it there.
-        std::fs::write(
-            repo.git_dir().join("COMMIT_EDITMSG"),
-            super::format_patch::skip_blank_lines(&message),
-        )?;
-        // `do_merge()` concludes through `run_git_commit()` (sequencer.c:4394),
-        // i.e. a real `git commit`, which runs `post-commit`. It carries no
-        // `--amend`, so there is no `post-rewrite amend` half.
-        run_commit_hooks(repo, None, new);
+        // `ret = !!run_git_commit(…)` is a conflict-shaped 1; with no
+        // `ctx->message`, `make_patch()` writes `message` itself.
+        self.merge_error_with_patch(item, message, 1)
+    }
+
+    /// `do_merge()`'s octopus arm (sequencer.c:4328-4392): hand the merge to a
+    /// `git merge -s <strategy>` child, which commits it, moves `HEAD` and logs
+    /// its own `Merge made by …` reflog line.
+    fn merge_with_strategy_child(
+        &mut self,
+        item: &todo::Item,
+        strategy: Option<&str>,
+        to_merge: &[ObjectId],
+        merge_msg: &std::path::Path,
+        message: &BString,
+        edit: bool,
+    ) -> Result<Step> {
+        let repo = self.repo;
+        // `read_env_script(&cmd.env)` plus the two date options; no
+        // `GIT_REFLOG_ACTION` of its own.
+        let env = self.run_git_commit_env(true);
+        let mut cmd = std::process::Command::new(crate::hosted::git_exe()?);
+        cmd.current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.args(["merge", "-s", strategy.unwrap_or("octopus")]);
+        if strategy.is_some() {
+            for x in &self.st.strategy_opts {
+                cmd.arg(format!("-X{x}"));
+            }
+        }
+        cmd.arg(if edit { "--edit" } else { "--no-edit" })
+            .args(["--no-ff", "--no-log", "--no-stat", "-F"])
+            .arg(merge_msg)
+            .arg("--no-gpg-sign");
+        for id in to_merge {
+            cmd.arg(id.to_string());
+        }
+        // `refs_delete_ref(…, "CHERRY_PICK_HEAD", …)` right before the child, so
+        // the `git commit` inside it does not conclude a pick instead.
+        let _ = crate::refstore::state_ref_delete(repo, "CHERRY_PICK_HEAD", "");
+        self.term_clear_line();
+        crate::cstdio::before_spawn();
+        let status = cmd.status()?;
+        // "force re-reading of the cache": the child rewrote the index.
+        self.refresh_index()?;
+        // `ret = run_command(&cmd)`: the child's exit code is what
+        // `error_with_patch()` returns (sequencer.c:5213-5217).
+        let code = status.code().unwrap_or(1).clamp(0, 255) as u8;
+        if code != 0 {
+            return self.merge_error_with_patch(item, Some(message), code);
+        }
         Ok(Step::Next)
+    }
+
+    /// `error_with_patch(r, item->commit, arg, arg_len, opts, res, 0)` for a
+    /// `merge` (sequencer.c:3857-3903). `have_message` is `ctx->message` when
+    /// `do_merge()` built one.
+    fn merge_error_with_patch(
+        &mut self,
+        item: &todo::Item,
+        have_message: Option<&BString>,
+        code: u8,
+    ) -> Result<Step> {
+        let repo = self.repo;
+        let dir = self.dir();
+        // `if (ctx->have_message && !file_exists(rebase_path_message()))`:
+        // `write_message(…, 0)`, no newline added.
+        if let Some(m) = have_message {
+            if !dir.join("message").exists() {
+                std::fs::write(dir.join("message"), m)?;
+            }
+        }
+        if let Some(id) = item.commit {
+            make_patch(repo, &dir, &repo.find_commit(id)?)?;
+        }
+        if let Some(oid) = self.autostash {
+            let _ = std::fs::write(dir.join("autostash"), format!("{oid}\n"));
+        }
+        self.term_clear_line();
+        match item.commit {
+            Some(id) => eprintln!(
+                "Could not apply {}... {}",
+                todo::short_name(repo, id),
+                item.arg.to_str_lossy()
+            ),
+            // "We don't have the hash of the parent so just print the line from
+            // the todo file."
+            None => eprintln!("Could not merge {}", item.arg.to_str_lossy()),
+        }
+        // `cmd_rebase()` ends in `return !!ret` (builtin/rebase.c:1917-1926), so an
+        // octopus child's exit code 2 still leaves the rebase with 1.
+        Ok(Step::Stop(u8::from(code != 0)))
+    }
+
+    /// The environment `run_git_commit()` (sequencer.c:1133-1151) and the octopus
+    /// child (sequencer.c:4332-4343) build: the author-script's `GIT_AUTHOR_*`
+    /// when `read_env` holds, then the two date options. `GIT_*_DATE=` (empty) is
+    /// git's `ident_default_date()`, the clock; it is spelled out here as this run's
+    /// one `now`. Callers add `GIT_REFLOG_ACTION` where git sets one.
+    fn run_git_commit_env(&self, read_env: bool) -> Vec<(String, String)> {
+        let mut env = if read_env { self.author_env() } else { Vec::new() };
+        let now = self.now.format_or_unix(gix::date::time::Format::Raw);
+        if self.st.committer_date_is_author_date {
+            let date = if self.st.ignore_date {
+                now.clone()
+            } else {
+                env.iter()
+                    .find(|(k, _)| k == "GIT_AUTHOR_DATE")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            env.push(("GIT_COMMITTER_DATE".into(), date));
+        }
+        if self.st.ignore_date {
+            env.push(("GIT_AUTHOR_DATE".into(), now));
+        }
+        env
     }
 
     /// `reword`: amend the commit just made, with the editor open on its
@@ -7479,15 +7700,26 @@ fn stopped_patch(
 /// instruction can be concluded by `git commit` without losing the author.
 fn write_author_script(repo: &gix::Repository, commit: &gix::Commit<'_>) -> Result<()> {
     let author = commit.author()?;
+    write_author_script_ident(repo, author.name, author.email, author.time().unwrap_or_default())
+}
+
+/// [`write_author_script`] over an ident of its own: `do_merge()`'s
+/// `"author %s", git_author_info(0)` for a `merge` with no original commit
+/// (sequencer.c:4305-4309).
+fn write_author_script_ident(
+    repo: &gix::Repository,
+    name: &BStr,
+    email: &BStr,
+    time: gix::date::Time,
+) -> Result<()> {
     let sq = |v: &BStr| format!("'{}'", v.to_str_lossy().replace('\'', "'\\''"));
-    let time = author.time().unwrap_or_default();
     // `GIT_AUTHOR_DATE='@<seconds> <+-HHMM>'` — git's "raw" date spelling, the
     // one form `parse_date()` round-trips without a timezone database.
     let (sign, off) = if time.offset < 0 { ('-', -time.offset) } else { ('+', time.offset) };
     let body = format!(
         "GIT_AUTHOR_NAME={}\nGIT_AUTHOR_EMAIL={}\nGIT_AUTHOR_DATE='@{} {sign}{:02}{:02}'\n",
-        sq(author.name),
-        sq(author.email),
+        sq(name),
+        sq(email),
         time.seconds,
         off / 3600,
         (off % 3600) / 60,
@@ -7621,6 +7853,16 @@ fn sign_off(
     let ident = format!("{} <{}>", committer.name, committer.email);
     super::commit::append_signoff(&mut text, &ident, 0, false);
     Ok(BString::from(text))
+}
+
+/// `opts->explicit_cleanup`: `git_sequencer_config()` sets it for a
+/// `commit.cleanup` of `verbatim`, `whitespace`, `strip` or `scissors` and warns
+/// over anything else (sequencer.c:279-298). It is what keeps `run_git_commit()`
+/// from forcing `--cleanup=verbatim` on the `git commit` child.
+fn commit_cleanup_is_explicit(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .string("commit.cleanup")
+        .is_some_and(|v| matches!(v.as_slice(), b"verbatim" | b"whitespace" | b"strip" | b"scissors"))
 }
 
 /// `command == TODO_PICK || command == TODO_REWORD || command == TODO_EDIT`

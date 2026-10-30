@@ -14,6 +14,9 @@
 //! unpopulated, which reads as "`--init` did nothing".
 #![cfg(unix)]
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,7 +61,13 @@ impl Fixture {
     }
 
     fn cmd(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut c = Command::new(BIN);
+        self.cmd_with(BIN, dir, args)
+    }
+
+    /// [`Fixture::cmd`] under another binary — stock git, for the outcomes that
+    /// depend on what the machine's account and host let `fmt_ident()` work out.
+    fn cmd_with(&self, bin: &str, dir: &Path, args: &[&str]) -> Command {
+        let mut c = Command::new(bin);
         c.args(args)
             .current_dir(dir)
             .env("HOME", &self.root)
@@ -85,6 +94,31 @@ impl Fixture {
     fn git(&self, dir: &Path, args: &[&str]) {
         let out = self.cmd(dir, args).output().unwrap();
         assert!(out.status.success(), "setup `git {args:?}` failed: {out:?}");
+    }
+
+    /// `(exit code, stderr)` of `args` under stock git, run in a copy of the repo
+    /// so the zvcs run sees the state it would have seen, or `None` when this
+    /// machine has no stock git. The repo path is replaced by `<repo>` in both.
+    ///
+    /// Whether a commit made with no configured identity goes through depends on
+    /// the machine: `fmt_ident()` under `IDENT_STRICT` refuses a defaulted address
+    /// the host gives no domain for (ident.c:480-484) and a defaulted name the
+    /// passwd gecos field leaves empty (ident.c:509-514) — a CI runner account has
+    /// a domain and no gecos, a workstation often the other way round.
+    fn stock_outcome(&self, args: &[&str], env: &[(&str, &str)]) -> Option<(i32, String)> {
+        let stock = stock_git::stock_git()?;
+        let copy = self.root.join(format!("stock-{}", args.join("-")));
+        let _ = std::fs::remove_dir_all(&copy);
+        let cp = Command::new("/bin/cp").arg("-Rp").arg(&self.repo).arg(&copy).status().unwrap();
+        assert!(cp.success());
+        let mut c = self.cmd_with(stock, &copy, args);
+        c.env_remove("EMAIL");
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr).replace(copy.to_str().unwrap(), "<repo>");
+        Some((out.status.code().unwrap_or(-1), err))
     }
 
     /// `(exit code, stdout, stderr)` of a command run in the repo.
@@ -210,12 +244,20 @@ fn the_email_environment_variable_is_used_when_config_has_none() {
     // A tracked file, so `-a` has something to stage.
     std::fs::write(f.repo.join("a.txt"), "a\nmore\n").unwrap();
 
-    let out = f
-        .cmd(&f.repo, &["commit", "-q", "-a", "-m", "x"])
-        .env("EMAIL", "someone@example.org")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "commit failed: {}", String::from_utf8_lossy(&out.stderr));
+    let args = ["commit", "-q", "-a", "-m", "x"];
+    let stock = f.stock_outcome(&args, &[("EMAIL", "someone@example.org")]);
+    let out = f.cmd(&f.repo, &args).env("EMAIL", "someone@example.org").output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr).replace(f.repo.to_str().unwrap(), "<repo>");
+    // An account whose gecos field is empty has no name to go with the address:
+    // stock git refuses the commit there, and zvcs must refuse it the same way.
+    if let Some(stock) = &stock {
+        assert_eq!(&(out.status.code().unwrap_or(-1), err.clone()), stock, "left is zvcs, right is stock");
+        if stock.0 != 0 {
+            assert!(err.contains("fatal: empty ident name (for <someone@example.org>) not allowed"), "{err}");
+            return;
+        }
+    }
+    assert!(out.status.success(), "commit failed: {err}");
 
     let (_, who, _) = f.run(&["log", "-1", "--format=%ae|%ce"]);
     assert_eq!(who.trim(), "someone@example.org|someone@example.org", "identity: {who}");
@@ -233,8 +275,12 @@ fn an_undetectable_address_refuses_object_writes_but_not_ref_moves() {
     let add = f.cmd_no_email(&f.repo, &["add", "b.txt"]).output().unwrap();
     assert!(add.status.success(), "add failed: {}", String::from_utf8_lossy(&add.stderr));
 
+    let stock = f.stock_outcome(&["commit", "-m", "x"], &[]);
     let out = f.cmd_no_email(&f.repo, &["commit", "-m", "x"]).output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = String::from_utf8_lossy(&out.stderr).replace(f.repo.to_str().unwrap(), "<repo>");
+    if let Some(stock) = &stock {
+        assert_eq!(&(out.status.code().unwrap_or(-1), err.clone()), stock, "left is zvcs, right is stock");
+    }
     // A host with a domain *can* auto-detect, and there the commit is allowed —
     // assert the contract, not the machine.
     if out.status.success() {
@@ -242,10 +288,14 @@ fn an_undetectable_address_refuses_object_writes_but_not_ref_moves() {
     }
     assert_eq!(out.status.code(), Some(128), "wrong exit: {err}");
     assert!(err.starts_with("Author identity unknown\n"), "stderr: {err}");
-    assert!(
-        err.contains("fatal: unable to auto-detect email address (got '"),
-        "the refusal must name the address it rejected: {err}"
-    );
+    // A detected address with an empty gecos name is refused over the name
+    // (ident.c:509-514), which the comparison with stock above has checked.
+    if !err.contains("fatal: empty ident name (for <") {
+        assert!(
+            err.contains("fatal: unable to auto-detect email address (got '"),
+            "the refusal must name the address it rejected: {err}"
+        );
+    }
 
     // The ref move is unaffected: its reflog takes the same address.
     let out = f.cmd_no_email(&f.repo, &["branch", "reflogged"]).output().unwrap();

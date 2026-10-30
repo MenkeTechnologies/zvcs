@@ -23,6 +23,9 @@ fn run(bin: &str, dir: &Path, action: Option<&str>, args: &[&str]) -> (String, S
         .env("GIT_AUTHOR_EMAIL", "a@example.com")
         .env("GIT_COMMITTER_NAME", "a")
         .env("GIT_COMMITTER_EMAIL", "a@example.com")
+        // Both sides' fixtures are built by stock, in different seconds; a clock
+        // author date would give the two `one` commits different ids.
+        .env("GIT_AUTHOR_DATE", "1700000000 +0000")
         .env("GIT_COMMITTER_DATE", "1700000000 +0000")
         .env("HOME", dir)
         .env("LC_ALL", "C");

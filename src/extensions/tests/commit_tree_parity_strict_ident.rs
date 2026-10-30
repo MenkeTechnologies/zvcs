@@ -208,7 +208,16 @@ fn merge_dies_at_the_merge_commits_author() {
     }
     let got = f.same(true, &[], ENVS[0], &["merge", "--autostash", "--no-edit", "side"]);
     if got.code == 128 {
-        assert!(got.stderr.starts_with("Author identity unknown\n"), "{}", got.stderr);
+        // `cmd_merge()` asks for the committer strictly right after the autostash
+        // (builtin/merge.c:1761-1766), so an account whose gecos field is empty —
+        // a CI runner's — is refused there over the committer's defaulted name
+        // (ident.c:509-514) before the merge commit's author is looked up.
+        let role = if got.stderr.contains("fatal: empty ident name (for <ce@example.com>)") {
+            "Committer"
+        } else {
+            "Author"
+        };
+        assert!(got.stderr.starts_with(&format!("{role} identity unknown\n")), "{}", got.stderr);
         assert!(got.state_files.iter().any(|s| s == "MERGE_AUTOSTASH"), "{:?}", got.state_files);
     }
 }

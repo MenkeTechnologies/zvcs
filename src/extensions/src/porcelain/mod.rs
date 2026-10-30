@@ -648,6 +648,7 @@ mod checkout;
 #[allow(non_snake_case)] // maps to git's `checkout--worker` subcommand
 mod checkout__worker;
 mod checkout_index;
+mod checkout_sparse;
 mod cherry;
 mod cherry_pick;
 mod clean;

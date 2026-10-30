@@ -14,8 +14,9 @@
 //! `convert_to_sparse()` collapses a full index whenever the repository allows a sparse one, and
 //! leaves an index that is already collapsed exactly as it is — entries *and* cache-tree.
 //!
-//! This port has no command that can work over a sparse-directory entry, so every index is
-//! expanded as it is read. One git would keep collapsed is expanded only *virtually*
+//! Every index is expanded as it is read; only the path forms of `checkout` and `restore`
+//! turn it back into the collapsed index and work over its sparse-directory entries
+//! (`porcelain::checkout_sparse`). One git would keep collapsed is expanded only *virtually*
 //! ([`gix::index::State::virtual_sparse_dirs()`]): it stays marked `INDEX_COLLAPSED`, and the
 //! write puts its directories back as they were read instead of rebuilding the index from
 //! scratch, which is what makes the cache-tree a sparse-aware command leaves behind match
@@ -184,8 +185,10 @@ fn clear_skip_worktree_from_present_files(repo: &gix::Repository, index: &mut gi
         return;
     };
     let present = |path: &[u8]| std::fs::symlink_metadata(workdir.join(gix::path::from_bstr(path.as_bstr()))).is_ok();
+    // `if (clear_skip_worktree_from_present_files_sparse(istate)) ensure_full_index(istate);`
+    // (sparse-index.c:689-692): a plain `ensure_full_index()`, so the advice is given.
     if index.virtual_sparse_dirs().iter().any(|dir| present(&dir.path)) {
-        ensure_full_index_with_advice(repo, index, false);
+        ensure_full_index(repo, index);
     }
     let collapsed: Vec<BString> = index.virtual_sparse_dirs().iter().map(|dir| dir.path.clone()).collect();
     let skip = gix::index::entry::Flags::SKIP_WORKTREE;

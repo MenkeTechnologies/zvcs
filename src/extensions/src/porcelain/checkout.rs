@@ -2964,6 +2964,17 @@ fn restore_from_index(
 
     let mut index = crate::index_open::or_empty(repo)?;
     let norm = Specs::new(repo, paths)?;
+    // The collapsed index `checkout_main()` reads with `command_requires_full_index = 0`
+    // (builtin/checkout.c:1904): a sparse directory is one entry, matched only as a whole.
+    let sparse_dirs = super::checkout_sparse::SparseDirs::prepare(
+        repo,
+        &mut index,
+        paths,
+        None,
+        true,
+        ignore_skipworktree,
+        &|p| norm.matches(p),
+    )?;
     // `if (opts->merge) unmerge_index(…)` (builtin/checkout.c:637-638) — ahead of the
     // pathspec match, so a conflict that was already resolved comes back first.
     if merge.is_some() {
@@ -2973,26 +2984,25 @@ fn restore_from_index(
     }
     // `mark_ce_for_checkout_*()` (builtin/checkout.c:392, :426) skips a skip-worktree entry
     // before it ever consults the pathspec, so naming one is `did not match any file(s) known to
-    // git` — unless `--ignore-skip-worktree-bits` says otherwise.
-    let sparse: HashSet<BString> = match ignore_skipworktree {
-        true => HashSet::new(),
-        false => {
-            let backing = index.path_backing();
-            index
-                .entries()
-                .iter()
-                .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
-                .map(|e| e.path_in(backing).to_owned())
-                .collect()
-        }
+    // git` — unless `--ignore-skip-worktree-bits` says otherwise. A sparse-directory entry is
+    // matched by [`super::checkout_sparse::SparseDirs`], never as a file.
+    let sparse: HashSet<BString> = {
+        let backing = index.path_backing();
+        index
+            .entries()
+            .iter()
+            .filter(|e| {
+                e.mode.is_sparse()
+                    || (!ignore_skipworktree && e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
+            })
+            .map(|e| e.path_in(backing).to_owned())
+            .collect()
     };
-    let matched = match match_paths_excluding(&index, paths, &norm, &sparse) {
-        Ok(m) => m,
-        Err(spec) => {
-            eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
-            return Ok(ExitCode::from(1));
-        }
-    };
+    let (matched, hit) = matches_in_excluding(&index, &norm, &sparse);
+    if let Some(si) = (0..paths.len()).find(|&si| !hit[si] && !sparse_dirs.hit(si)) {
+        eprintln!("error: pathspec '{}' did not match any file(s) known to git", paths[si]);
+        return Ok(ExitCode::from(1));
+    }
 
     // `checkout_paths()`'s unmerged pass, which runs over the whole matched set
     // before anything is written — so a refusal leaves the worktree untouched.
@@ -3077,7 +3087,9 @@ fn restore_from_index(
     }
     let should_interrupt = AtomicBool::new(false);
     // `state.istate = the_repository->index` (builtin/checkout.c:412).
+    sparse_dirs.truncate_at_abort(repo, &mut subset, &mut Vec::new());
     checkout_subset(repo, &mut subset, &index, &should_interrupt, &crate::worktree::UpdatingFiles::off())?;
+    let sparse_errs = sparse_dirs.checkout_worktree(repo)?;
 
     // Refresh stat info in the real index for the restored paths so a later
     // status stays cheap; content ids are unchanged. An unmerged path has no
@@ -3113,6 +3125,7 @@ fn restore_from_index(
             }
         }
     }
+    sparse_dirs.update_index(&mut index);
     for path in &stale {
         index.invalidate_path_in_tree(path.as_bstr());
     }
@@ -3150,7 +3163,9 @@ fn restore_from_index(
     }
     // `checkout_paths()`'s tail: `errs |= post_checkout_hook(head, head, 0)`.
     let head = head_commit_id(repo);
-    Ok(run_post_checkout(repo, head, head, false))
+    let code = run_post_checkout(repo, head, head, false);
+    // `errs` is -1 once `checkout_entry()` failed, whatever the hook returned.
+    Ok(if sparse_errs { ExitCode::from(255) } else { code })
 }
 
 /// Restore `paths` from `tree_ish` into both the index and the worktree
@@ -3215,6 +3230,22 @@ fn restore_from_tree(
     // now there.
     let norm = Specs::new(repo, paths)?;
 
+    // `repo_read_index_preload()` then `read_tree_some()` (builtin/checkout.c:627-636), over
+    // the collapsed index `checkout_main()` asks for (:1904). What the walk does to each sparse
+    // directory is [`super::checkout_sparse::SparseDirs`]'s; the blobs it never reaches as
+    // entries of their own leave the source.
+    let mut index = repo.open_index()?;
+    let sparse_dirs = super::checkout_sparse::SparseDirs::prepare(
+        repo,
+        &mut index,
+        paths,
+        Some(tree_id),
+        overlay,
+        ignore_skipworktree,
+        &|p| norm.matches(p),
+    )?;
+    src.remove_entries(|_, path, _| sparse_dirs.hides_tree_path(path));
+
     // The bit is read *after* `read_tree_some()` has laid the tree over the index
     // (builtin/checkout.c:635-636). `update_some()` keeps the old entry, flags and all,
     // only when the tree names the same blob in the same mode and the entry is not
@@ -3232,22 +3263,29 @@ fn restore_from_tree(
             .filter(|(p, _)| tree_matched.contains(p))
             .collect()
     };
+    // The blob whose `add_index_entry()` expanded a sparse index was looked up before the
+    // expansion, so it replaces the entry the expansion made whatever that holds.
     let replaced_by_tree = |path: &BString, e: &gix::index::Entry| {
         tree_blobs.get(path).is_some_and(|(id, mode)| {
-            *id != e.id || *mode != e.mode || e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD)
+            *id != e.id
+                || *mode != e.mode
+                || e.flags.contains(gix::index::entry::Flags::INTENT_TO_ADD)
+                || sparse_dirs.is_fresh(path)
         })
     };
-    let sparse: HashSet<BString> = if ignore_skipworktree {
-        HashSet::new()
-    } else {
-        let index = repo.open_index()?;
+    // A sparse-directory entry is matched by `sparse_dirs`, never as a file.
+    let sparse: HashSet<BString> = {
         let backing = index.path_backing();
         index
             .entries()
             .iter()
-            .filter(|e| e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE))
             .map(|e| (e.path_in(backing).to_owned(), e))
-            .filter(|(p, e)| !replaced_by_tree(p, e))
+            .filter(|(p, e)| {
+                e.mode.is_sparse()
+                    || (!ignore_skipworktree
+                        && e.flags.contains(gix::index::entry::Flags::SKIP_WORKTREE)
+                        && !replaced_by_tree(p, e))
+            })
             .map(|(p, _)| p)
             .collect()
     };
@@ -3256,22 +3294,16 @@ fn restore_from_tree(
     }
 
     // Paths to write from the tree, and (no-overlay only) paths to delete.
-    let (matched, to_remove) = if overlay {
-        (
-            match match_paths(&src, paths, &norm) {
-                Ok(m) => m,
-                Err(spec) => {
-                    eprintln!(
-                        "error: pathspec '{spec}' did not match any file(s) known to git"
-                    );
-                    return Ok(ExitCode::from(1));
-                }
-            },
-            Vec::new(),
-        )
+    let (matched, mut to_remove) = if overlay {
+        let (tree_matched, tree_hit) = matches_in(&src, &norm);
+        if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !sparse_dirs.hit(si)) {
+            eprintln!("error: pathspec '{}' did not match any file(s) known to git", paths[si]);
+            return Ok(ExitCode::from(1));
+        }
+        (tree_matched, Vec::new())
     } else {
         let (tree_matched, tree_hit) = matches_in(&src, &norm);
-        let cur = repo.open_index()?;
+        let cur = &index;
         // ```c
         // if (!opts->ignore_skip_worktree_bits && ce_skip_worktree(ce))
         //         continue;
@@ -3281,9 +3313,9 @@ fn restore_from_tree(
         // of the union is filtered the same way the tree side is: a path the
         // sparse-checkout definition keeps out of the work tree is not a path
         // `--no-overlay` may delete.
-        let (idx_matched, idx_hit) = matches_in_excluding(&cur, &norm, &sparse);
+        let (idx_matched, idx_hit) = matches_in_excluding(cur, &norm, &sparse);
         // A pathspec must match in the tree or the index; else git's "did not match".
-        if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si]) {
+        if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si] && !sparse_dirs.hit(si)) {
             // `report_path_error()` (pathspec.c) writes
             // `error: pathspec '%s' did not match any file(s) known to git` and
             // `checkout_paths()` returns 1 on it (builtin/checkout.c:642-643) —
@@ -3303,9 +3335,8 @@ fn restore_from_tree(
 
     // Counted before anything is written: afterwards every file matches its entry.
     let count = if bare && !quiet {
-        let cur = repo.open_index()?;
-        let ctx = super::read_tree::StatCtx::new(repo, &cur)?;
-        let effective = tree_effective_entries(&src, &cur, &matched);
+        let ctx = super::read_tree::StatCtx::new(repo, &index)?;
+        let effective = tree_effective_entries(&src, &index, &matched);
         nr_checkouts(repo, &ctx, effective.iter().map(|(p, e)| (p, e)))
     } else {
         0
@@ -3314,7 +3345,6 @@ fn restore_from_tree(
     let mut subset = repo.index_from_tree(&tree_id)?;
     keep_only(&mut subset, &matched);
     let should_interrupt = AtomicBool::new(false);
-    let mut index = repo.open_index()?;
     // `checkout_paths()` runs `read_tree()`/`update_some()` over `the_repository->index`
     // *before* it writes anything (builtin/checkout.c:400-412), so the attributes a
     // matched path sees are the tree's and every other path's are the index's — which is
@@ -3327,7 +3357,9 @@ fn restore_from_tree(
     // what `restore -SW .` after `mv a A` leaves behind: `A` sorts first, goes, and `a`
     // is then written.
     die_on_bad_attr_source_for_writes(repo, &index, &subset)?;
+    sparse_dirs.truncate_at_abort(repo, &mut subset, &mut to_remove);
     let fresh = checkout_interleaved(repo, &mut subset, &to_remove, &index, &should_interrupt)?;
+    let sparse_errs = sparse_dirs.checkout_worktree(repo)?;
 
     // Fold the tree's blobs (with fresh checkout stats) into the real index.
     let mut pushed = false;
@@ -3416,6 +3448,7 @@ fn restore_from_tree(
     for path in &stale {
         index.invalidate_path_in_tree(path.as_bstr());
     }
+    sparse_dirs.update_index(&mut index);
     crate::index_racy::write(repo, &mut index)?;
 
     if bare && !quiet {
@@ -3426,7 +3459,9 @@ fn restore_from_tree(
         );
     }
     let head = head_commit_id(repo);
-    Ok(run_post_checkout(repo, head, head, false))
+    let code = run_post_checkout(repo, head, head, false);
+    // `errs` is -1 once `checkout_entry()` failed, whatever the hook returned.
+    Ok(if sparse_errs { ExitCode::from(255) } else { code })
 }
 
 // --- Worktree / ref helpers ------------------------------------------------

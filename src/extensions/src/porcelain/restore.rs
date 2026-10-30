@@ -842,8 +842,8 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // `git restore . :!<path>` exclude something: short-circuiting on the `.` skipped the
     // exclusion entirely and restored the path it names.
     let match_all = pathspecs.is_empty();
-    let mut specs: Vec<String> = Vec::new();
-    for p in &pathspecs {
+    let mut specs: Vec<(usize, String)> = Vec::new();
+    for (si, p) in pathspecs.iter().enumerate() {
         // A magic pathspec (`:!x`, `:(exclude)x`, `:/`, …) is not a path to resolve against
         // the prefix — but it still has to *match* something. `report_path_error()`
         // (dir.c:640-673) walks every element of the parsed set and names each one whose
@@ -856,7 +856,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // `--pathspec-from-file` corpus case (whose only spec is `:(glob)**/*.txt`) exit 0.
         if p.starts_with(':') {
             if !super::ls_files::is_exclude_pathspec(p) {
-                specs.push(p.clone());
+                specs.push((si, p.clone()));
             }
             continue;
         }
@@ -865,7 +865,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
             // The resolved form is only wanted for the two rejections above; the check
             // below matches each element through the pathspec engine from its raw text,
             // which is what applies the repository prefix.
-            Ok(Some(_)) => specs.push(p.clone()),
+            Ok(Some(_)) => specs.push((si, p.clone())),
             Err(()) => {
                 eprintln!("fatal: {p}: '{p}' is outside repository at '{}'", wd_c.display());
                 return Ok(ExitCode::from(128));
@@ -914,6 +914,20 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // source in the default worktree case.
     let mut cur = repo.open_index()?;
 
+    // `read_tree_some()` over the collapsed index `checkout_main()` asks for
+    // (builtin/checkout.c:636, :1904): what it and the marking pass do to each sparse
+    // directory is [`super::checkout_sparse::SparseDirs`]'s, and the blobs below one that the
+    // walk never reaches as entries of their own leave the source.
+    let sparse_dirs = super::checkout_sparse::SparseDirs::prepare(
+        &repo,
+        &mut cur,
+        &pathspecs.iter().map(String::as_str).collect::<Vec<_>>(),
+        source_tree_id,
+        overlay,
+        ignore_skip_worktree,
+        &|p| path_matches(BStr::new(p), match_all, &spec_set),
+    )?;
+
     // ```c
     // if (opts->merge)
     //         unmerge_index(the_repository->index, &opts->pathspec, CE_MATCHED);
@@ -930,10 +944,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     }
 
     // The source, materialized as an index (a tree is unpacked into one).
-    let source_index: gix::index::File = match &source_tree_id {
+    let mut source_index: gix::index::File = match &source_tree_id {
         Some(tid) => repo.index_from_tree(tid)?,
         None => cur.clone(),
     };
+    source_index.remove_entries(|_, p, _| sparse_dirs.hides_tree_path(p));
 
     // path -> (id, mode, flags, stat) for the source; used for staged writes.
     let mut source_map: HashMap<BString, (ObjectId, Mode, Flags, Stat)> = HashMap::new();
@@ -950,6 +965,9 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     {
         let b = cur.path_backing();
         for e in cur.entries() {
+            if e.mode.is_sparse() {
+                continue;
+            }
             let p = e.path_in(b).to_owned();
             let s = e.stage_raw() as usize;
             stage_blobs.entry(p.clone()).or_insert([None, None, None, None])[s] = Some((e.id, e.mode));
@@ -1025,7 +1043,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 let replaced = !source_is_index
                     && path_matches(BStr::new(p), match_all, &spec_set)
                     && source_map.get(p).is_some_and(|(id, mode, _, _)| {
-                        *id != e.id || *mode != e.mode || e.flags.contains(Flags::INTENT_TO_ADD)
+                        *id != e.id || *mode != e.mode || e.flags.contains(Flags::INTENT_TO_ADD) || sparse_dirs.is_fresh(p)
                     });
                 !replaced
             })
@@ -1046,7 +1064,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // every entry first (builtin/checkout.c:428), and without a source tree the index
         // itself is the source.
         let index_only_counts = !(overlay && !source_is_index);
-        for raw in &specs {
+        for (si, raw) in &specs {
             // Each spec is checked on its own: git names the one that matched nothing.
             let single = super::log::PathspecMatcher::new(&repo, std::slice::from_ref(raw))?;
             let hit = source_map
@@ -1054,7 +1072,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                 .chain(cur_paths.iter().filter(|_| index_only_counts))
                 .filter(|p| !sparse_kept.contains(*p))
                 .any(|p| path_matches(BStr::new(p), false, &single));
-            if !hit {
+            if !hit && !sparse_dirs.hit(*si) {
                 eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
                 return Ok(ExitCode::from(1));
             }
@@ -1249,7 +1267,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
                     // skip-worktree, intent-to-add and assume-unchanged do not survive it.
                     // The kept entry keeps its stat data too: zeroing it made the next
                     // `status` re-hash a file nothing had touched.
-                    if e.id != *id || e.mode != *mode || e.flags.contains(Flags::INTENT_TO_ADD) {
+                    if e.id != *id || e.mode != *mode || e.flags.contains(Flags::INTENT_TO_ADD) || sparse_dirs.is_fresh(path) {
                         invalidated.push(path.clone());
                         e.flags = Flags::empty();
                         e.id = *id;
@@ -1296,6 +1314,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
 
     // --- Apply worktree checkout -------------------------------------------
     let mut fresh_stats: HashMap<BString, Stat> = HashMap::new();
+    let mut sparse_errs = false;
     if worktree {
         let should_interrupt = AtomicBool::new(false);
 
@@ -1329,9 +1348,11 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // the_repository->index`, builtin/checkout.c:412) — `cur` supplies the
         // `.gitattributes` files the subset dropped.
         super::checkout::die_on_bad_attr_source_for_writes(&repo, &cur, &subset)?;
+        sparse_dirs.truncate_at_abort(&repo, &mut subset, &mut remove);
         let written =
             super::checkout::checkout_interleaved(&repo, &mut subset, &remove, &cur, &should_interrupt)?;
         fresh_stats.extend(written.into_iter().map(|(path, (_, _, stat))| (path, stat)));
+        sparse_errs = sparse_dirs.checkout_worktree(&repo)?;
 
         // --- Recurse into matched submodules --------------------------------
         // git-restore(1): when the restore location includes the working tree
@@ -1421,6 +1442,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         for path in &invalidated {
             cur.invalidate_path_in_tree(path.as_ref());
         }
+        sparse_dirs.update_index(&mut cur);
         super::write_tree::prepare_offset_table(&repo, &mut cur);
         // `do_write_index()` takes `skip_hash` from the settings block for every
         // index it writes (read-cache.c:2830-2831), so a `--staged` restore leaves
@@ -1432,5 +1454,7 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
     // post_checkout_hook(head, head, 0)` — a path restore never moves `HEAD`, so
     // the hook sees the same id twice and the file-checkout flag.
     let head = super::checkout::head_commit_id(&repo);
-    Ok(super::checkout::run_post_checkout(&repo, head, head, false))
+    let code = super::checkout::run_post_checkout(&repo, head, head, false);
+    // `errs` is -1 once `checkout_entry()` failed, whatever the hook returned.
+    Ok(if sparse_errs { ExitCode::from(255) } else { code })
 }

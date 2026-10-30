@@ -2587,7 +2587,8 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
     // exactly like a missing one, before the file is ever opened. `/dev/null` is
     // the reachable case: it reads as an empty log rather than as an error
     // without the size test. A `stat()` that fails for any reason other than
-    // `ENOENT` is `die_errno("could not stat '%s'")` instead.
+    // `ENOENT` is `die_errno(_("could not stat %s"), filename)` instead — no quotes
+    // around the name (wrapper.c:819-822).
     //
     // The name is taken as typed, but `RUN_SETUP` has already moved git to the
     // top of the worktree, so a relative log path resolves from there and not
@@ -2607,7 +2608,7 @@ fn replay_cmd(args: &[String]) -> Result<ExitCode> {
             eprintln!("error: cannot read file '{file}' for replaying");
             return Ok(ExitCode::from(1));
         }
-        Err(e) => crate::git_fatal!("could not stat '{file}': {}", crate::errno_text(&e)),
+        Err(e) => crate::git_fatal!("could not stat {file}: {}", crate::errno_text(&e)),
     }
 
     // ```c

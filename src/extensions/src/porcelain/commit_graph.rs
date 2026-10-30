@@ -105,7 +105,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[path = "commit_graph_verify.rs"]
-mod verify_port;
+pub(super) mod verify_port;
 
 /// Top-level usage, byte-for-byte as git 2.55 emits it.
 /// `cmd_commit_graph()`'s top-level option table (builtin/commit-graph.c:347),

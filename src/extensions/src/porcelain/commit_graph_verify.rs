@@ -16,7 +16,10 @@
 //!   an error found in the tip layer makes every base layer stop after its first loop.
 //!
 //! Messages go to stderr the way the C writes them: `graph_report()` with no prefix, `error()`,
-//! `warning()` and `die()` with theirs, interleaved with the progress meter's redraws.
+//! `warning()` and `die()` with theirs, interleaved with the progress meter's redraws. The
+//! loaders queue their `error()` / `warning()` lines for the caller to print, because the other
+//! reader of the graph, [`ProcessGraph`] (`prepare_commit_graph()` and the graph-side commit parse
+//! `git fsck`'s own process does), has to place them among output it is still collecting.
 
 use gix::hash::ObjectId;
 use gix::objs::Find as _;
@@ -167,31 +170,31 @@ type Chunks = Vec<(u32, usize, usize)>;
 
 /// `read_table_of_contents()` (chunk-format.c:104-161) with `expected_alignment` 1, so the
 /// alignment check never fires.
-fn read_table_of_contents(data: &[u8], toc_offset: usize, toc_length: usize, rawsz: usize) -> Option<Chunks> {
+fn read_table_of_contents(data: &[u8], toc_offset: usize, toc_length: usize, rawsz: usize, out: &mut Vec<String>) -> Option<Chunks> {
     let mut chunks: Chunks = Vec::new();
     let mut toc = toc_offset;
     for _ in 0..toc_length {
         let chunk_id = be32(data, toc);
         let chunk_offset = be64(data, toc + 4);
         if chunk_id == 0 {
-            eprintln!("error: terminating chunk id appears earlier than expected");
+            out.push("error: terminating chunk id appears earlier than expected".into());
             return None;
         }
         toc += CHUNK_TOC_ENTRY_SIZE;
         let next_chunk_offset = be64(data, toc + 4);
         if next_chunk_offset < chunk_offset || next_chunk_offset > (data.len() - rawsz) as u64 {
-            eprintln!("error: improper chunk offset(s) {chunk_offset:x} and {next_chunk_offset:x}");
+            out.push(format!("error: improper chunk offset(s) {chunk_offset:x} and {next_chunk_offset:x}"));
             return None;
         }
         if chunks.iter().any(|&(id, _, _)| id == chunk_id) {
-            eprintln!("error: duplicate chunk ID {chunk_id:x} found");
+            out.push(format!("error: duplicate chunk ID {chunk_id:x} found"));
             return None;
         }
         chunks.push((chunk_id, chunk_offset as usize, (next_chunk_offset - chunk_offset) as usize));
     }
     let chunk_id = be32(data, toc);
     if chunk_id != 0 {
-        eprintln!("error: final chunk has non-zero id {chunk_id:x}");
+        out.push(format!("error: final chunk has non-zero id {chunk_id:x}"));
         return None;
     }
     Some(chunks)
@@ -205,17 +208,17 @@ fn chunk(chunks: &Chunks, id: u32) -> Option<(usize, usize)> {
 
 /// `load_commit_graph_one_fd_st()` (commit-graph.c:256-280): the size from `fstat()` is checked
 /// before the file is mapped, so a short file, or a directory, is only "too small".
-fn load_commit_graph_one_fd_st(repo: &gix::Repository, f: std::fs::File, size: u64) -> Result<Option<Graph>, Die> {
+fn load_commit_graph_one_fd_st(repo: &gix::Repository, f: std::fs::File, size: u64, out: &mut Vec<String>) -> Result<Option<Graph>, Die> {
     if size < graph_min_size(repo.object_hash().len_in_bytes()) as u64 {
-        eprintln!("error: commit-graph file is too small");
+        out.push("error: commit-graph file is too small".into());
         return Ok(None);
     }
-    parse_commit_graph(repo, map_file(f)?)
+    parse_commit_graph(repo, map_file(f)?, out)
 }
 
 /// `parse_commit_graph()` (commit-graph.c:373-491) over the bytes of one file. `None` after the
 /// `error()` that explains why.
-fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Graph>, Die> {
+fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>, out: &mut Vec<String>) -> Result<Option<Graph>, Die> {
     let hash = repo.object_hash();
     let rawsz = hash.len_in_bytes();
     // The silent re-check of the minimum size (:384-385).
@@ -225,37 +228,37 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
 
     let graph_signature = be32(&data, 0);
     if graph_signature != GRAPH_SIGNATURE {
-        eprintln!("error: commit-graph signature {graph_signature:X} does not match signature {GRAPH_SIGNATURE:X}");
+        out.push(format!("error: commit-graph signature {graph_signature:X} does not match signature {GRAPH_SIGNATURE:X}"));
         return Ok(None);
     }
     let graph_version = data[4];
     if graph_version != GRAPH_VERSION {
-        eprintln!("error: commit-graph version {graph_version:X} does not match version {GRAPH_VERSION:X}");
+        out.push(format!("error: commit-graph version {graph_version:X} does not match version {GRAPH_VERSION:X}"));
         return Ok(None);
     }
     let hash_version = data[5];
     if hash_version != oid_version(hash) {
-        eprintln!(
+        out.push(format!(
             "error: commit-graph hash version {hash_version:X} does not match version {:X}",
             oid_version(hash)
-        );
+        ));
         return Ok(None);
     }
 
     let num_chunks = data[6] as usize;
     if data.len() < GRAPH_HEADER_SIZE + (num_chunks + 1) * CHUNK_TOC_ENTRY_SIZE + GRAPH_FANOUT_SIZE + rawsz {
-        eprintln!("error: commit-graph file is too small to hold {num_chunks} chunks");
+        out.push(format!("error: commit-graph file is too small to hold {num_chunks} chunks"));
         return Ok(None);
     }
 
-    let Some(chunks) = read_table_of_contents(&data, GRAPH_HEADER_SIZE, num_chunks, rawsz) else {
+    let Some(chunks) = read_table_of_contents(&data, GRAPH_HEADER_SIZE, num_chunks, rawsz, out) else {
         return Ok(None);
     };
 
     // graph_read_oid_fanout() (commit-graph.c:282-304).
     let fanout = match chunk(&chunks, GRAPH_CHUNKID_OIDFANOUT) {
         Some((_, size)) if size != 256 * 4 => {
-            eprintln!("error: commit-graph oid fanout chunk is wrong size");
+            out.push("error: commit-graph oid fanout chunk is wrong size".into());
             None
         }
         Some((start, _)) => {
@@ -263,14 +266,14 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
             if ordered {
                 Some(start)
             } else {
-                eprintln!("error: commit-graph fanout values out of order");
+                out.push("error: commit-graph fanout values out of order".into());
                 None
             }
         }
         None => None,
     };
     let Some(fanout) = fanout else {
-        eprintln!("error: commit-graph required OID fanout chunk missing or corrupted");
+        out.push("error: commit-graph required OID fanout chunk missing or corrupted".into());
         return Ok(None);
     };
     let num_commits = be32(&data, fanout + 4 * 255);
@@ -279,13 +282,13 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
     let oid_lookup = match chunk(&chunks, GRAPH_CHUNKID_OIDLOOKUP) {
         Some((start, size)) if (size / rawsz) as u64 == num_commits as u64 => Some(start),
         Some(_) => {
-            eprintln!("error: commit-graph OID lookup chunk is the wrong size");
+            out.push("error: commit-graph OID lookup chunk is the wrong size".into());
             None
         }
         None => None,
     };
     let Some(oid_lookup) = oid_lookup else {
-        eprintln!("error: commit-graph required OID lookup chunk missing or corrupted");
+        out.push("error: commit-graph required OID lookup chunk missing or corrupted".into());
         return Ok(None);
     };
 
@@ -293,13 +296,13 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
     let commit_data = match chunk(&chunks, GRAPH_CHUNKID_DATA) {
         Some((start, size)) if (size / (rawsz + 16)) as u64 == num_commits as u64 => Some(start),
         Some(_) => {
-            eprintln!("error: commit-graph commit data chunk is wrong size");
+            out.push("error: commit-graph commit data chunk is wrong size".into());
             None
         }
         None => None,
     };
     let Some(commit_data) = commit_data else {
-        eprintln!("error: commit-graph required commit data chunk missing or corrupted");
+        out.push("error: commit-graph required commit data chunk missing or corrupted".into());
         return Ok(None);
     };
 
@@ -314,7 +317,7 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
         // graph_read_generation_data() (commit-graph.c:326-334); its failure is not fatal.
         if let Some((start, size)) = chunk(&chunks, GRAPH_CHUNKID_GENERATION_DATA) {
             if (size / 4) as u64 != num_commits as u64 {
-                eprintln!("error: commit-graph generations chunk is wrong size");
+                out.push("error: commit-graph generations chunk is wrong size".into());
             } else {
                 generation_data = Some(start);
             }
@@ -328,7 +331,7 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
         // graph_read_bloom_index() (commit-graph.c:336-346).
         if let Some((_, size)) = chunk(&chunks, GRAPH_CHUNKID_BLOOMINDEXES) {
             if (size / 4) as u64 != num_commits as u64 {
-                eprintln!("warning: commit-graph changed-path index chunk is too small");
+                out.push("warning: commit-graph changed-path index chunk is too small".into());
             } else {
                 bloom_indexes = true;
             }
@@ -336,9 +339,9 @@ fn parse_commit_graph(repo: &gix::Repository, data: Vec<u8>) -> Result<Option<Gr
         // graph_read_bloom_data() (commit-graph.c:348-371).
         if let Some((start, size)) = chunk(&chunks, GRAPH_CHUNKID_BLOOMDATA) {
             if size < BLOOMDATA_CHUNK_HEADER_SIZE {
-                eprintln!(
+                out.push(format!(
                     "warning: ignoring too-small changed-path chunk ({size} < {BLOOMDATA_CHUNK_HEADER_SIZE}) in commit-graph file"
-                );
+                ));
             } else {
                 bloom = Some((be32(&data, start), be32(&data, start + 4), be32(&data, start + 8)));
             }
@@ -397,24 +400,24 @@ fn map_file(mut f: std::fs::File) -> Result<Vec<u8>, Die> {
 
 /// `load_commit_graph_one()` (commit-graph.c:493-509): a file that cannot be opened is skipped
 /// silently.
-fn load_commit_graph_one(repo: &gix::Repository, path: &Path) -> Result<Option<Graph>, Die> {
+fn load_commit_graph_one(repo: &gix::Repository, path: &Path, out: &mut Vec<String>) -> Result<Option<Graph>, Die> {
     match open_commit_graph(path) {
-        Opened::File(f, size) => load_commit_graph_one_fd_st(repo, f, size),
+        Opened::File(f, size) => load_commit_graph_one_fd_st(repo, f, size, out),
         Opened::Missing | Opened::Failed(_) => Ok(None),
     }
 }
 
 /// `add_graph_to_chain()` (commit-graph.c:570-614): whether `g` may sit on `chain` (tip last),
 /// given the ids the chain file named below it.
-fn add_graph_to_chain(g: &mut Graph, chain: &[Graph], oids: &[ObjectId], rawsz: usize) -> bool {
+fn add_graph_to_chain(g: &mut Graph, chain: &[Graph], oids: &[ObjectId], rawsz: usize, out: &mut Vec<String>) -> bool {
     let mut n = oids.len();
     if n != 0 && g.base_graphs.is_none() {
-        eprintln!("warning: commit-graph has no base graphs chunk");
+        out.push("warning: commit-graph has no base graphs chunk".into());
         return false;
     }
     let (base_start, base_size) = g.base_graphs.unwrap_or((0, 0));
     if base_size / rawsz < n {
-        eprintln!("warning: commit-graph base graphs chunk is too small");
+        out.push("warning: commit-graph base graphs chunk is too small".into());
         return false;
     }
     let mut cur = chain.len();
@@ -424,14 +427,14 @@ fn add_graph_to_chain(g: &mut Graph, chain: &[Graph], oids: &[ObjectId], rawsz: 
             && oids[n] == chain[cur - 1].oid
             && oids[n].as_bytes() == &g.data[base_start + rawsz * n..base_start + rawsz * (n + 1)];
         if !matches {
-            eprintln!("warning: commit-graph chain does not match");
+            out.push("warning: commit-graph chain does not match".into());
             return false;
         }
         cur -= 1;
     }
     if let Some(tip) = chain.last() {
         let Some(total) = tip.num_commits.checked_add(tip.num_commits_in_base) else {
-            eprintln!("warning: commit count in base graph too high: {}", tip.num_commits_in_base);
+            out.push(format!("warning: commit count in base graph too high: {}", tip.num_commits_in_base));
             return false;
         };
         g.num_commits_in_base = total;
@@ -441,7 +444,7 @@ fn add_graph_to_chain(g: &mut Graph, chain: &[Graph], oids: &[ObjectId], rawsz: 
 
 /// `load_commit_graph_chain_fd_st()` (commit-graph.c:641-701): the layers that loaded, base first,
 /// and whether the chain is incomplete.
-fn load_commit_graph_chain(repo: &gix::Repository, sources: &[Source], body: &[u8], size: u64) -> Result<(Vec<Graph>, bool), Die> {
+fn load_commit_graph_chain(repo: &gix::Repository, sources: &[Source], body: &[u8], size: u64, out: &mut Vec<String>) -> Result<(Vec<Graph>, bool), Die> {
     let kind = repo.object_hash();
     let rawsz = kind.len_in_bytes();
     let count = size / (kind.len_in_hex() as u64 + 1);
@@ -454,10 +457,10 @@ fn load_commit_graph_chain(repo: &gix::Repository, sources: &[Source], body: &[u
         let Some(line) = lines.next() else { break };
         let line = line.strip_suffix(b"\n").unwrap_or(line);
         let Some(oid) = get_oid_hex(line, kind) else {
-            eprintln!(
+            out.push(format!(
                 "warning: invalid commit-graph chain: line '{}' not a hash",
                 String::from_utf8_lossy(line)
-            );
+            ));
             valid = false;
             break;
         };
@@ -467,8 +470,8 @@ fn load_commit_graph_chain(repo: &gix::Repository, sources: &[Source], body: &[u
             // get_split_graph_filename() (commit-graph.c:204-209) names the file by the whole line.
             let name = format!("graph-{}.graph", String::from_utf8_lossy(line));
             let path = source.real.join("info").join("commit-graphs").join(name);
-            if let Some(mut g) = load_commit_graph_one(repo, &path)? {
-                if add_graph_to_chain(&mut g, &chain, &oids, rawsz) {
+            if let Some(mut g) = load_commit_graph_one(repo, &path, out)? {
+                if add_graph_to_chain(&mut g, &chain, &oids, rawsz, out) {
                     chain.push(g);
                     valid = true;
                 }
@@ -478,7 +481,7 @@ fn load_commit_graph_chain(repo: &gix::Repository, sources: &[Source], body: &[u
         oids.push(oid);
 
         if !valid {
-            eprintln!("warning: unable to find all commit-graph files");
+            out.push("warning: unable to find all commit-graph files".into());
             break;
         }
     }
@@ -499,10 +502,10 @@ fn load_commit_graph_chain(repo: &gix::Repository, sources: &[Source], body: &[u
         };
         if mine != first {
             g.bloom = None;
-            eprintln!(
+            out.push(format!(
                 "warning: disabling Bloom filters for commit-graph layer '{}' due to incompatible settings",
                 g.oid
-            );
+            ));
         }
     }
     Ok((chain, !valid))
@@ -1052,6 +1055,174 @@ impl Verifier<'_> {
     }
 }
 
+/// `read_commit_graph_one()` (commit-graph.c:720-728): `load_commit_graph_v1()`, a file that
+/// cannot be opened skipped silently, then `load_commit_graph_chain()` (:704-718), whose
+/// `open_commit_graph_chain()` (:616-639) treats an empty chain file as a missing one and warns
+/// about a short one. The layers that loaded, base first; empty when there is no graph.
+fn read_commit_graph_one(
+    repo: &gix::Repository,
+    sources: &[Source],
+    source: &Source,
+    out: &mut Vec<String>,
+) -> Result<Vec<Graph>, Die> {
+    let info = source.real.join("info");
+    if let Some(g) = load_commit_graph_one(repo, &info.join("commit-graph"), out)? {
+        return Ok(vec![g]);
+    }
+    match open_commit_graph(&info.join("commit-graphs").join("commit-graph-chain")) {
+        Opened::File(_, 0) | Opened::Missing | Opened::Failed(_) => Ok(Vec::new()),
+        Opened::File(_, size) if size < repo.object_hash().len_in_hex() as u64 => {
+            out.push("warning: commit-graph chain file too small".into());
+            Ok(Vec::new())
+        }
+        Opened::File(f, size) => {
+            let body = map_file(f).unwrap_or_default();
+            Ok(load_commit_graph_chain(repo, sources, &body, size, out)?.0)
+        }
+    }
+}
+
+/// How the graph half of `repo_parse_commit_internal()` (commit.c:625-640) answered.
+pub(in crate::porcelain) enum GraphParse {
+    /// `parse_commit_in_graph()` filled the commit in: the tree `get_commit_tree()` reads from the
+    /// graph (`get_commit_tree_in_graph()`, commit-graph.c:1122-1125) and the parents
+    /// `fill_commit_in_graph()` inserted, in order.
+    Parsed { tree: ObjectId, parents: Vec<ObjectId> },
+    /// No graph, or the commit is not in it: the caller reads the object database.
+    NotInGraph,
+    /// `GIT_COMMIT_GRAPH_PARANOIA` found the commit in the graph but not in the object database,
+    /// so it was unparsed again after this `error()`, and the parse failed.
+    Paranoid(String),
+}
+
+/// `r->objects->commit_graph` for a command that reads the graph instead of verifying it, with
+/// the parsed-object table its graph-side parses share: `prepare_commit_graph()`
+/// (commit-graph.c:736-773), `load_commit_graph_info()` (:1081-1089) and the graph half of
+/// `repo_parse_commit_internal()` (commit.c:625-640).
+///
+/// `commit_graph_compatible()` (commit-graph.c:223-242) is ported for a process that ran
+/// `disable_replace_refs()` first, as `cmd_fsck()` does (builtin/fsck.c:879), so `refs/replace/`
+/// never makes the graph incompatible here.
+pub(in crate::porcelain) struct ProcessGraph<'r> {
+    repo: &'r gix::Repository,
+    /// `r->objects->commit_graph_attempted`.
+    attempted: bool,
+    /// `r->objects->commit_graph`, with the objects its parses created.
+    graph: Option<Verifier<'r>>,
+    /// `parse_commit_in_graph()`'s `checked_env` (commit-graph.c:1066).
+    checked_env: bool,
+}
+
+impl<'r> ProcessGraph<'r> {
+    pub(in crate::porcelain) fn new(repo: &'r gix::Repository) -> Self {
+        ProcessGraph {
+            repo,
+            attempted: false,
+            graph: None,
+            checked_env: false,
+        }
+    }
+
+    /// `prepare_commit_graph()` (commit-graph.c:736-773): the first call loads the graph of the
+    /// first source that has one, queueing the loader's `error()` / `warning()` lines on `out`;
+    /// every later call answers from that attempt.
+    pub(in crate::porcelain) fn prepare(&mut self, out: &mut Vec<String>) -> Result<bool, Die> {
+        if self.attempted {
+            return Ok(self.graph.is_some());
+        }
+        self.attempted = true;
+        let repo = self.repo;
+        let enabled = crate::repo_settings::config_bool_strict(repo, "core.commitgraph")?.unwrap_or(true);
+        if !crate::setup::git_env_bool("GIT_TEST_COMMIT_GRAPH", false) && !enabled {
+            return Ok(false);
+        }
+        // commit_graph_compatible(): prepare_commit_graft() reads info/grafts and registers the
+        // shallow file, and either leaves the graph unused.
+        if !repo.commit_grafts().is_empty() {
+            return Ok(false);
+        }
+        let sources = odb_sources(repo);
+        for source in &sources {
+            let graphs = read_commit_graph_one(repo, &sources, source, out)?;
+            if !graphs.is_empty() {
+                self.graph = Some(Verifier {
+                    repo,
+                    rawsz: repo.object_hash().len_in_bytes(),
+                    graphs,
+                    objects: HashMap::new(),
+                    commits: Vec::new(),
+                    shallow_pending: None,
+                    grafts: Vec::new(),
+                    error: 0,
+                });
+                break;
+            }
+        }
+        Ok(self.graph.is_some())
+    }
+
+    /// `load_commit_graph_info()` (commit-graph.c:1081-1089), which `parse_commit_buffer()` runs
+    /// with `check_graph` set (commit.c:593-594) for a commit parsed from the object database:
+    /// the commit's graph position and generation are filled in, which can die on a corrupt
+    /// generation chunk. The commit is parsed from then on, so no graph parse revisits it.
+    pub(in crate::porcelain) fn load_commit_graph_info(&mut self, oid: ObjectId, out: &mut Vec<String>) -> Result<(), Die> {
+        if !self.prepare(out)? {
+            return Ok(());
+        }
+        let v = self.graph.as_mut().expect("prepared");
+        let tip = v.graphs.len() - 1;
+        let Some(c) = v.lookup_commit(oid) else {
+            return Ok(());
+        };
+        v.commits[c].parsed = true;
+        // find_commit_pos_in_graph() (commit-graph.c:997-1006).
+        let pos = match v.commits[c].graph_pos {
+            COMMIT_NOT_FROM_GRAPH => v.search_commit_pos_in_graph(&oid, tip),
+            pos => Some(pos),
+        };
+        match pos {
+            Some(pos) => v.fill_commit_graph_info(c, tip, pos),
+            None => Ok(()),
+        }
+    }
+
+    /// `repo_parse_commit_internal(r, item, 0, 1)` up to its object-database read
+    /// (commit.c:621-640) for a commit not parsed yet: `parse_commit_in_graph()`
+    /// (commit-graph.c:1064-1079), then the `GIT_COMMIT_GRAPH_PARANOIA` re-check.
+    pub(in crate::porcelain) fn parse_commit(&mut self, oid: ObjectId, out: &mut Vec<String>) -> Result<GraphParse, Die> {
+        if !self.checked_env && crate::setup::git_env_bool("GIT_TEST_COMMIT_GRAPH_DIE_ON_PARSE", false) {
+            return Err(
+                "dying as requested by the 'GIT_TEST_COMMIT_GRAPH_DIE_ON_PARSE' variable on commit-graph parse!".into(),
+            );
+        }
+        self.checked_env = true;
+        if !self.prepare(out)? {
+            return Ok(GraphParse::NotInGraph);
+        }
+        let repo = self.repo;
+        let v = self.graph.as_mut().expect("prepared");
+        let tip = v.graphs.len() - 1;
+        let Some(c) = v.lookup_commit(oid) else {
+            return Ok(GraphParse::NotInGraph);
+        };
+        if !v.parse_commit_in_graph_one(tip, c)? {
+            return Ok(GraphParse::NotInGraph);
+        }
+        if crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false) && !repo.has_object(oid) {
+            // unparse_commit() (commit.c:209-218).
+            let item = &mut v.commits[c];
+            item.parsed = false;
+            item.parents.clear();
+            return Ok(GraphParse::Paranoid(format!(
+                "error: commit {oid} exists in commit-graph but not in the object database"
+            )));
+        }
+        let tree = v.commit_tree_in_graph(tip, c);
+        let parents = v.commits[c].parents.iter().map(|&p| v.commits[p].oid).collect();
+        Ok(GraphParse::Parsed { tree, parents })
+    }
+}
+
 /// `get_oid_hex()` / `get_oid_hex_algop()`: the first `hexsz` characters of `s` as hex digits of
 /// either case, whatever follows them.
 fn get_oid_hex(s: &[u8], kind: gix::hash::Kind) -> Option<ObjectId> {
@@ -1147,13 +1318,24 @@ pub(super) fn graph_verify(
     }
 }
 
+/// Run one loader and print what it queued, in order, before its result is acted on: `verify`
+/// writes each `error()` / `warning()` the loader meets straight to stderr, ahead of any meter.
+fn emit<T>(load: impl FnOnce(&mut Vec<String>) -> T) -> T {
+    let mut out = Vec::new();
+    let result = load(&mut out);
+    for line in out {
+        eprintln!("{line}");
+    }
+    result
+}
+
 fn verify_inner(repo: &gix::Repository, sources: &[Source], source: &Source, shallow: bool, progress: bool) -> Result<u8, Die> {
     let graph_name = |base: &Path| base.join("info").join("commit-graph");
     let chain_name = |base: &Path| base.join("info").join("commit-graphs").join("commit-graph-chain");
 
     let mut incomplete_chain = false;
     let graphs = match open_commit_graph(&graph_name(&source.real)) {
-        Opened::File(f, size) => match load_commit_graph_one_fd_st(repo, f, size)? {
+        Opened::File(f, size) => match emit(|out| load_commit_graph_one_fd_st(repo, f, size, out))? {
             Some(g) => vec![g],
             None => return Ok(1),
         },
@@ -1187,7 +1369,7 @@ fn verify_inner(repo: &gix::Repository, sources: &[Source], source: &Source, sha
                 Opened::File(f, size) => {
                     // xfdopen() + strbuf_getline_lf(): a read error is an early EOF.
                     let body = map_file(f).unwrap_or_default();
-                    let (chain, incomplete) = load_commit_graph_chain(repo, sources, &body, size)?;
+                    let (chain, incomplete) = emit(|out| load_commit_graph_chain(repo, sources, &body, size, out))?;
                     incomplete_chain = incomplete;
                     if chain.is_empty() {
                         return Ok(1);

@@ -10,6 +10,8 @@ use gix::hash::ObjectId;
 use gix::objs::Kind;
 use gix::odb::pack;
 
+use super::commit_graph::verify_port::{GraphParse, ProcessGraph};
+
 /// `builtin/fsck.c`'s `ERROR_OBJECT` — a bad `<object>` argument, or an object
 /// that would not parse.
 const ERROR_OBJECT: u8 = 1;
@@ -372,6 +374,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // parse of one of them is a no-op, which the object scan below has to know:
     // see `creates_children` there.
     let mut pre_parsed: HashSet<ObjectId> = HashSet::new();
+    // `the_repository->objects->commit_graph`, which the first commit this process parses
+    // loads (`prepare_commit_graph()`, commit-graph.c:736-773).
+    let mut graph = ProcessGraph::new(&repo);
     for arg in &opt.objects {
         // `repo_get_oid()` turns a full-length hex id into an object id without
         // consulting the odb, so an id that names nothing still reaches
@@ -406,15 +411,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // *not* created here; `parse_tree_buffer()` only keeps the
                 // buffer, and the entries are decoded later by the walk.
                 state.note(id);
-                if matches!(
-                    repo.find_header(id).map(|h| h.kind()),
-                    Ok(Kind::Commit) | Ok(Kind::Tag)
-                ) {
+                let kind = repo.find_header(id).map(|h| h.kind()).ok();
+                if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
                     if let Ok(Ok(parsed)) = decode(&repo, id) {
                         for (child, _) in &parsed.children {
                             state.note(*child);
                         }
                         pre_parsed.insert(id);
+                        if kind == Some(Kind::Commit) {
+                            commit_graph_info_now(&mut graph, id)?;
+                        }
                     }
                 }
                 heads.push(id);
@@ -467,6 +473,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             &mut heads,
             &mut names,
             &mut pre_parsed,
+            &mut graph,
             &promisor,
             &mut errors,
             &mut snapshot_missed,
@@ -687,6 +694,24 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
         };
+        // `parse_commit_buffer()` ends with `load_commit_graph_info()` (commit.c:593-594), unless
+        // the commit was parsed already, when it returns at once (:527-528). So the first commit
+        // the scan parses loads the graph when no head did, and its loader lines land in this
+        // object's place in the scan.
+        if kind == Kind::Commit && !pre_parsed.contains(&id) {
+            let mut out = Vec::new();
+            let result = graph.load_commit_graph_info(id, &mut out);
+            let slot = Slot::Scan(id.as_bytes()[0]);
+            msg_lines.extend(out.into_iter().map(|line| (slot, id, line)));
+            if let Err(msg) = result {
+                // die() in the middle of the scan: what the scan printed up to here, then the
+                // fatal line.
+                for (_, _, line) in &msg_lines {
+                    eprintln!("{line}");
+                }
+                return Err(crate::fatal::die(msg));
+            }
+        }
         // `fsck_obj()`'s own line, which covers blobs too. It is part of the
         // scan's stderr stream, so it belongs in `msg_lines` alongside the
         // findings it interleaves with (builtin/fsck.c:413-416 sits between
@@ -1177,10 +1202,34 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             if kind == Kind::Blob {
                 break 'traverse;
             }
+            // `fsck_walk_commit()` opens with `repo_parse_commit()` (fsck.c:410), which
+            // returns at once for a commit `parse_object()` already parsed — a head, or
+            // anything the scan read — and otherwise asks the commit-graph first
+            // (commit.c:625-640). The graph's tree and parents are then what the walk
+            // follows, whatever the object database says, and a corrupt edge dies.
+            let parsed_already = pre_parsed.contains(&id) || (!opt.connectivity_only && has_obj.contains(&id));
+            let from_graph = match kind == Kind::Commit && !parsed_already {
+                true => match walk_parse_commit(&mut graph, id, &scan_lines, &broken_links)? {
+                    Some(parsed) => parsed,
+                    // `repo_parse_commit()` failed, so `fsck_walk_commit()` returns -1 and
+                    // nothing behind the commit is walked.
+                    None => break 'traverse,
+                },
+                false => None,
+            };
+            // The graph parse created what it names: `fill_commit_in_graph()` each parent
+            // through `insert_parent_or_die()`'s `lookup_commit()`, then `fsck_walk_commit()`
+            // the tree through `get_commit_tree_in_graph()`'s `lookup_tree()`
+            // (commit-graph.c:858-874, 1091-1120), ids the object database may not have.
+            if let Some(parsed) = &from_graph {
+                for (child, _) in parsed.children.iter().skip(1).chain(parsed.children.first()) {
+                    state.note(*child);
+                }
+            }
             // An object `parse_object_buffer()` rejected has no links to follow:
             // `fsck_walk_commit()`/`fsck_walk_tag()` read fields the failed parse
             // never filled in. The scan above already reported it.
-            let decoded = match decode(&repo, id) {
+            let decoded = match from_graph.map_or_else(|| decode(&repo, id), |d| Ok(Ok(d))) {
                 Ok(Ok(d)) => d,
                 // Rejected by `parse_object_buffer()`; the scan above reported it.
                 Ok(Err(_)) => break 'traverse,
@@ -1395,7 +1444,16 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             if header.kind() == Kind::Blob {
                 continue;
             }
-            let Ok(Ok(decoded)) = decode(&repo, id) else { continue };
+            // `fsck_walk_commit()`'s `repo_parse_commit()` asks the commit-graph first, as in
+            // the reachability walk above; only a head was parsed before.
+            let from_graph = match header.kind() == Kind::Commit && !pre_parsed.contains(&id) {
+                true => match walk_parse_commit(&mut graph, id, &scan_lines, &broken_links)? {
+                    Some(parsed) => parsed,
+                    None => continue,
+                },
+                false => None,
+            };
+            let Ok(Ok(decoded)) = from_graph.map_or_else(|| decode(&repo, id), |d| Ok(Ok(d))) else { continue };
             for (child, _) in &decoded.children {
                 // Unlike the scan, nothing here was parsed beforehand, so both
                 // `fsck_walk_tree()`'s `lookup_tree()`/`lookup_blob()` and
@@ -1924,6 +1982,63 @@ struct ParseFailed {
     diagnostic: Option<String>,
 }
 
+/// `load_commit_graph_info()` for a commit `parse_object()` just parsed from the object database
+/// (`parse_commit_buffer()` with `check_graph` set, commit.c:593-594). The first one loads the
+/// graph, so the loader's `error()` / `warning()` lines are printed here, where git prints them;
+/// a corrupt generation chunk dies.
+fn commit_graph_info_now(graph: &mut ProcessGraph<'_>, id: ObjectId) -> Result<()> {
+    let mut out = Vec::new();
+    let result = graph.load_commit_graph_info(id, &mut out);
+    for line in out {
+        eprintln!("{line}");
+    }
+    result.map_err(crate::fatal::die)
+}
+
+/// `repo_parse_commit()` from `fsck_walk_commit()` (fsck.c:410) on a commit nothing has parsed
+/// yet, as far as the commit-graph answers it (commit.c:625-640): `Some(Some(_))` is the tree
+/// and parents the graph holds, `Some(None)` sends the caller to the object database, and `None`
+/// is a failed parse, after its `error()`. A corrupt edge dies; `die()` then flushes the stdout
+/// `fsck_obj()` and `mark_object()` wrote so far, which this port still holds in `scan_lines`
+/// and `broken_links`.
+fn walk_parse_commit(
+    graph: &mut ProcessGraph<'_>,
+    id: ObjectId,
+    scan_lines: &[(ObjectId, String)],
+    broken_links: &[String],
+) -> Result<Option<Option<Decoded>>> {
+    let mut out = Vec::new();
+    let result = graph.parse_commit(id, &mut out);
+    for line in out {
+        eprintln!("{line}");
+    }
+    match result {
+        Ok(GraphParse::Parsed { tree, parents }) => Ok(Some(Some(Decoded {
+            children: std::iter::once((tree, Kind::Tree))
+                .chain(parents.into_iter().map(|p| (p, Kind::Commit)))
+                .collect(),
+            child_paths: Vec::new(),
+            is_root_commit: false,
+            tag: None,
+            walk_error: None,
+        }))),
+        Ok(GraphParse::NotInGraph) => Ok(Some(None)),
+        Ok(GraphParse::Paranoid(line)) => {
+            eprintln!("{line}");
+            Ok(None)
+        }
+        Err(msg) => {
+            let mut printed = String::new();
+            for line in scan_lines.iter().map(|(_, l)| l).chain(broken_links) {
+                printed.push_str(line);
+                printed.push('\n');
+            }
+            print!("{printed}");
+            Err(crate::fatal::die(msg))
+        }
+    }
+}
+
 /// `object.c::parse_object_buffer` for the four types, reduced to what
 /// `builtin/fsck.c` uses of the result: the links `fsck_walk()` follows and the
 /// two fields `--root`/`--tags` print. Blobs and trees always parse — a tree's
@@ -2122,6 +2237,7 @@ fn collect_default_heads(
     heads: &mut Vec<ObjectId>,
     names: &mut ObjectNames,
     pre_parsed: &mut HashSet<ObjectId>,
+    graph: &mut ProcessGraph<'_>,
     promisor: &HashSet<ObjectId>,
     errors: &mut u8,
     missed: &mut bool,
@@ -2173,6 +2289,9 @@ fn collect_default_heads(
                     state.note(*child);
                 }
                 pre_parsed.insert(id);
+                if kind == Some(Kind::Commit) {
+                    commit_graph_info_now(graph, id)?;
+                }
             }
         }
         heads.push(id);

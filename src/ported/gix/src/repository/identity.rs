@@ -179,7 +179,15 @@ impl Personas {
         let committer_date = parse_date("gitoxide.commit.committerDate", &gitoxide::Commit::COMMITTER_DATE);
         let author_date = parse_date("gitoxide.commit.authorDate", &gitoxide::Commit::AUTHOR_DATE);
 
-        user_email = user_email.or_else(|| config.string(gitoxide::User::EMAIL_FALLBACK));
+        // `ident_default_email()` reads `EMAIL` only while `set_ident()` has seen no
+        // `*.email` key (ident.c:173-179, :622-671): an `author.email` or
+        // `committer.email` alone leaves the other role on an empty default address.
+        let email_key_read = [&Author::EMAIL, &Committer::EMAIL, &User::EMAIL]
+            .into_iter()
+            .any(|key| config.string(key).is_some());
+        if !email_key_read {
+            user_email = user_email.or_else(|| config.string(gitoxide::User::EMAIL_FALLBACK));
+        }
         Personas {
             user: Entity {
                 name: user_name,

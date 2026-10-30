@@ -1352,11 +1352,25 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         sparse_skipped.insert(BString::from(typed[*i].as_bytes()));
     }
 
+    // `add_files_to_cache()` sets `override_submodule_config` and no ignore flag
+    // (read-cache.c:4053), so its `run_diff_files()` asks `is_submodule_modified()`
+    // about every unchanged gitlink the pathspec selects, and dies on one whose
+    // `<path>/.git` is no git directory. `--refresh`, `--renormalize` and
+    // `--resolved` never call it (builtin/add.c:599-601, 670-677).
+    let files_to_cache_die = if refresh || renormalize || add_resolved {
+        None
+    } else {
+        super::worktree_filespec::unusable_gitlinks(&repo, &index, |p| pathspec.is_included(p, Some(false)))
+            .into_iter()
+            .next()
+            .map(|(_, message)| message)
+    };
     let check = super::add_support::SpecCheck {
         original: &typed,
         resolved: &resolved,
         ignore_missing,
         ignore_errors,
+        files_to_cache_die,
         mode: match (refresh, renormalize, update_only) {
             (true, _, _) => super::add_support::SpecMode::Refresh,
             (_, true, _) => super::add_support::SpecMode::Renormalize,

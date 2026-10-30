@@ -341,6 +341,9 @@ struct Opts {
     nul: bool,                     // -z: NUL field/record terminators, no path quoting
     abbrev: Option<Option<usize>>, // --abbrev[=N]: None=full, Some(None)=auto, Some(Some(n))=N
     exit_code: bool,               // --exit-code/--quiet: exit 1 when anything differs
+    /// `--quiet`'s `flags.quick`, which lets `oneway_diff()` stop the walk at the first
+    /// path that queued a change (`diff_can_quit_early()`, diff-lib.c:550-553).
+    quick: bool,
     reverse: bool,                 // -R: swap the two sides
     line_prefix: Vec<u8>,          // --line-prefix=<s>
     /// `diffopt.prefix` once `diff_setup_done()` has run (diff.c:5270-5275): `Some` only
@@ -1645,6 +1648,7 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
     opts.exit_code = exit_code_given;
     if quiet {
         opts.exit_code = true;
+        opts.quick = true;
         check_mask = M_NO_OUTPUT;
         // `diff_setup_done()` (diff.c:5348-5353): `flags.quick` reports only the exit
         // status, so git drops rename detection rather than paying for it. This runs
@@ -2053,35 +2057,50 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
 
     // `o->flags.check_failed`, set by the `--check` walk below.
     let mut check_failed = false;
-    let (mut deltas, mut racy_paths) = collect(&repo, &tree_id, &opts)?;
-    if !paths.is_empty() {
-        if needs_gix {
-            let index = repo.index_or_empty()?;
-            let mut ps = repo.pathspec(
-                false,
-                &paths,
-                false,
-                &index,
-                gix::worktree::stack::state::attributes::Source::IdMapping,
-            )?;
-            deltas.retain(|d| ps.is_included(d.path.as_bstr(), Some(false)));
-            racy_paths.retain(|p| ps.is_included(p.as_bstr(), Some(false)));
-        } else {
-            // Pathspecs are cwd-relative in git while output paths are root-relative, so
-            // lift every pattern into repository-root space before matching.
+    // `oneway_diff()` tests the `--relative` prefix and `ce_path_match()` before
+    // `do_oneway_diff()` looks at a path (diff-lib.c:540-547), so a path either one
+    // turns away is never stat'ed, never hands a gitlink to `is_submodule_modified()`
+    // and never stops a `--quiet` walk.
+    let ps_index = match needs_gix && !paths.is_empty() {
+        true => Some(repo.index_or_empty()?),
+        false => None,
+    };
+    let mut ps = match &ps_index {
+        Some(index) => Some(repo.pathspec(
+            false,
+            &paths,
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::IdMapping,
+        )?),
+        None => None,
+    };
+    // Pathspecs are cwd-relative in git while output paths are root-relative, so
+    // lift every pattern into repository-root space before matching.
+    let lifted: Vec<BString> = match paths.is_empty() || needs_gix {
+        true => Vec::new(),
+        false => {
             let prefix = repo_prefix(&repo)?;
-            let lifted: Vec<BString> = paths
+            paths
                 .iter()
                 .map(|p| {
                     let mut full = prefix.clone();
                     full.extend_from_slice(p);
                     full
                 })
-                .collect();
-            deltas.retain(|d| lifted.iter().any(|p| path_matches(&d.path, p)));
-            racy_paths.retain(|r| lifted.iter().any(|p| path_matches(r, p)));
+                .collect()
         }
-    }
+    };
+    let relative = opts.relative.clone();
+    let mut selected = |path: &BString| {
+        let in_pathspec = match &mut ps {
+            _ if paths.is_empty() => true,
+            Some(ps) => ps.is_included(path.as_bstr(), Some(false)),
+            None => lifted.iter().any(|p| path_matches(path, p)),
+        };
+        in_pathspec && relative.as_ref().is_none_or(|rel| path.starts_with(rel))
+    };
+    let (mut deltas, racy_paths) = collect(&repo, &tree_id, &opts, &mut selected)?;
     // A racily clean entry inside the pathspec was read back by `ce_modified_check_fs()` while
     // the queue was built, and the first attribute lookup of that read is
     // `compute_default_attr_source()`'s `die(_("bad --attr-source or GIT_ATTR_SOURCE"))`.
@@ -2631,6 +2650,7 @@ fn plumbing_opts() -> Opts {
         nul: false,
         abbrev: None,
         exit_code: false,
+        quick: false,
         reverse: false,
         line_prefix: Vec::new(),
         relative: None,
@@ -2688,12 +2708,17 @@ pub(crate) fn cached_name_only(repo: &gix::Repository, tree_id: &ObjectId) -> Re
         cached: true,
         ..plumbing_opts()
     };
-    Ok(collect(repo, tree_id, &opts)?.0.into_iter().map(|d| d.path).collect())
+    Ok(collect(repo, tree_id, &opts, &mut |_| true)?.0.into_iter().map(|d| d.path).collect())
 }
 
 /// The deltas, plus the paths whose racy stat data made `ie_match_stat()` read the file back
 /// (`ce_modified_check_fs()`), which is where an attribute lookup can die.
-fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(Vec<Delta>, Vec<BString>)> {
+fn collect(
+    repo: &gix::Repository,
+    tree_id: &ObjectId,
+    opts: &Opts,
+    selected: &mut dyn FnMut(&BString) -> bool,
+) -> Result<(Vec<Delta>, Vec<BString>)> {
     let null = ObjectId::null(repo.object_hash());
     let mut tree: BTreeMap<BString, (u32, ObjectId)> = BTreeMap::new();
     flatten_tree(repo, tree_id, &BString::default(), &mut tree)?;
@@ -2746,8 +2771,26 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
     let all: BTreeSet<&BString> = tree.keys().chain(idx.keys()).collect();
     let mut racy_paths: Vec<BString> = Vec::new();
     let mut gitlink_ignore = GitlinkIgnore::new(repo, opts);
-    let mut deltas = Vec::new();
+    // `diff_can_quit_early()` (diff.c:7539-7544): `--quiet` without `--diff-filter`.
+    // `diff_queue_addremove()` and `diff_queue_change()` raise `has_changes` for a
+    // pair they queue unless `diff_from_contents` defers it to the content pass
+    // (diff.c:7623-7625, 7664-7676); `diff_unmerge()` never does (diff.c:7722-7736).
+    let quit_early = opts.quick
+        && opts.filter_include.is_empty()
+        && opts.filter_exclude.is_empty()
+        && !diff_from_contents(opts);
+    let mut deltas: Vec<Delta> = Vec::new();
     for path in all {
+        if quit_early
+            && deltas
+                .last()
+                .is_some_and(|d: &Delta| !d.unmerged && !gitlink_ignore.drops(d))
+        {
+            break;
+        }
+        if !selected(path) {
+            continue;
+        }
         let src = tree.get(path).copied();
         let Some(info) = idx.get(path) else {
             // In the tree but gone from the index: a plain deletion.
@@ -2914,7 +2957,7 @@ fn collect(repo: &gix::Repository, tree_id: &ObjectId, opts: &Opts) -> Result<(V
 /// (submodule.c:180-200) then replaces the whole word with the submodule's own
 /// `submodule.<name>.ignore`, from the configuration first and `.gitmodules`
 /// second. A gitlink `.gitmodules` does not name keeps the diff-level word.
-struct GitlinkIgnore<'a> {
+pub(super) struct GitlinkIgnore<'a> {
     repo: &'a gix::Repository,
     command_line: Option<gix::submodule::config::Ignore>,
     /// `.gitmodules`' `ignore` per submodule path, read at the first gitlink, as
@@ -2923,6 +2966,17 @@ struct GitlinkIgnore<'a> {
 }
 
 impl<'a> GitlinkIgnore<'a> {
+    /// The word no `--ignore-submodules` overrides: what `describe --dirty`'s in-process
+    /// `run_diff_index()` sees, since `cmd_describe()` reads only `git_default_config`
+    /// (builtin/describe.c:650) and passes no such option (builtin/describe.c:56-59).
+    pub(super) fn from_submodule_config(repo: &'a gix::Repository) -> Self {
+        GitlinkIgnore {
+            repo,
+            command_line: None,
+            per_path: None,
+        }
+    }
+
     fn new(repo: &'a gix::Repository, opts: &Opts) -> Self {
         GitlinkIgnore {
             repo,
@@ -2931,7 +2985,7 @@ impl<'a> GitlinkIgnore<'a> {
         }
     }
 
-    fn get(&mut self, path: &BString) -> gix::submodule::config::Ignore {
+    pub(super) fn get(&mut self, path: &BString) -> gix::submodule::config::Ignore {
         if let Some(ignore) = self.command_line {
             return ignore;
         }

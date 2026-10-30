@@ -1298,7 +1298,7 @@ fn status_report(
                                 RenameSide::absent(rela_path.clone(), hash),
                                 RenameSide {
                                     path: rela_path.clone(),
-                                    mode: worktree_mode(&repo, gix::bstr::BStr::new(&rela_path)),
+                                    mode: worktree_mode(&repo, gix::bstr::BStr::new(&rela_path), entry.mode.bits()),
                                     id: ObjectId::null(hash),
                                     id_valid: false,
                                 },
@@ -1354,7 +1354,7 @@ fn status_report(
                             // at all, which is what makes it a rename *source*.
                             let wt_mode = match kind {
                                 WorkKind::Deleted => 0,
-                                _ => worktree_mode(&repo, gix::bstr::BStr::new(&rela_path)),
+                                _ => worktree_mode(&repo, gix::bstr::BStr::new(&rela_path), entry.mode.bits()),
                             };
                             work_pairs.push((
                                 RenameSide {
@@ -2669,15 +2669,6 @@ struct V2Rec {
     rename: Option<(u8, u32, BString)>,
 }
 
-/// `d->mode_worktree`: `check_removed()` (diff-lib.c:42) followed by
-/// `ce_mode_from_stat()` (read-cache.h:8) for one path.
-///
-/// A vanished path is `0`, which is what `run_diff_files()`'s unmerged branch writes
-/// (`wt_mode = 0`, diff-lib.c:169) and what `git status --porcelain=v2` prints as the
-/// `<mW>` column of a `u` line for a conflict whose file was deleted from the worktree.
-/// A directory is `S_IFGITLINK` when it is a repository (`create_ce_mode()`,
-/// object.h:140) and `0` when it is not, since `check_removed()` then calls the entry
-/// removed.
 /// Whether `path` is a gitlink in the index with a directory in the work tree —
 /// the case `ce_mode_from_stat()` answers `S_IFGITLINK` for without looking
 /// inside the directory (read-cache.h `ce_mode_from_stat()`).
@@ -2691,7 +2682,18 @@ fn ita_gitlink_over_dir(repo: &gix::Repository, index: &gix::index::File, path: 
             .is_some_and(|wd| wd.join(gix::path::from_bstr(path)).is_dir())
 }
 
-fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
+/// `d->mode_worktree`: `check_removed()` (diff-lib.c:42) followed by
+/// `ce_mode_from_stat()` (read-cache.h:16) for one path, `ce_mode` being the mode of
+/// the index entry `check_removed()` is handed.
+///
+/// A vanished path is `0`, which is what `run_diff_files()`'s unmerged branch writes
+/// (`wt_mode = 0`, diff-lib.c:169) and what `git status --porcelain=v2` prints as the
+/// `<mW>` column of a `u` line for a conflict whose file was deleted from the worktree.
+/// A directory survives `check_removed()` when the entry is already a gitlink, whether
+/// or not the directory is a repository with a commit, or when it resolves a
+/// `HEAD` (diff-lib.c:58-74); `create_ce_mode(S_IFDIR)` then makes it `S_IFGITLINK`
+/// (object.h:140-141). Any other directory is a removed entry, `0`.
+fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr, ce_mode: u32) -> u32 {
     let Some(wd) = repo.workdir() else {
         return 0;
     };
@@ -2699,6 +2701,9 @@ fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
     match std::fs::symlink_metadata(&full) {
         Ok(m) if m.file_type().is_symlink() => 0o120000,
         Ok(m) if m.file_type().is_dir() => {
+            if ce_mode == 0o160000 {
+                return 0o160000;
+            }
             match super::worktree_filespec::removed_became_gitlink(wd, path) {
                 Some(_) => 0o160000,
                 None => 0,
@@ -2721,6 +2726,14 @@ fn worktree_mode(repo: &gix::Repository, path: &gix::bstr::BStr) -> u32 {
         }
         Err(_) => 0,
     }
+}
+
+/// The mode of the entry `run_diff_files()`'s unmerged branch hands `check_removed()` and
+/// `ce_mode_from_stat()` for a conflicted path: the first of its stages in index order
+/// (diff-lib.c:150-163), so the lowest stage present. `stages` holds stages 1-3, `0`
+/// where a stage is absent.
+fn first_stage_mode(stages: &[u32; 3]) -> u32 {
+    stages.iter().copied().find(|m| *m != 0).unwrap_or(0)
 }
 
 /// `check_removed()`'s directory arm (diff-lib.c:58) for a path gix reported as
@@ -3059,7 +3072,7 @@ fn porcelain_v2_output(
                                 RenameSide::absent(rela_path.clone(), hash),
                                 RenameSide {
                                     path: rela_path.clone(),
-                                    mode: worktree_mode(repo, gix::bstr::BStr::new(&rela_path)),
+                                    mode: worktree_mode(repo, gix::bstr::BStr::new(&rela_path), entry.mode.bits()),
                                     id: ObjectId::null(hash),
                                     id_valid: false,
                                 },
@@ -3107,7 +3120,7 @@ fn porcelain_v2_output(
                             let wt_mode = if y == b'D' {
                                 0
                             } else {
-                                worktree_mode(repo, gix::bstr::BStr::new(&rela_path))
+                                worktree_mode(repo, gix::bstr::BStr::new(&rela_path), entry.mode.bits())
                             };
                             work_pairs.push((
                                 RenameSide {
@@ -3220,7 +3233,7 @@ fn porcelain_v2_output(
             // entry (diff-lib.c:265): a gitlink entry over a directory stays
             // `160000` whether or not that repository has a commit.
             b'A' if r.ita && ita_gitlink_over_dir(repo, &index, path.as_bstr()) => 0o160000,
-            _ => worktree_mode(repo, path.as_bstr()),
+            _ => worktree_mode(repo, path.as_bstr(), r.m_i),
         };
     }
 
@@ -3335,7 +3348,7 @@ fn porcelain_v2_output(
                     }
                 }
             }
-            let m_w = worktree_mode(repo, path.as_bstr());
+            let m_w = worktree_mode(repo, path.as_bstr(), first_stage_mode(&sm));
             // An unmerged path has no `wt_status_change_data` here, so the stage modes
             // stand in for git's accumulated `mode_head`/`mode_index`, and it never
             // carries dirty-submodule bits. See [`v2_submodule_token`].
@@ -3439,7 +3452,7 @@ fn porcelain_v2_output(
                 }
             }
         }
-        let m_w = worktree_mode(repo, path.as_bstr());
+        let m_w = worktree_mode(repo, path.as_bstr(), first_stage_mode(&sm));
         // An unmerged path has no `wt_status_change_data` here, so the stage modes stand
         // in for git's accumulated `mode_head`/`mode_index`, and it never carries
         // dirty-submodule bits. See [`v2_submodule_token`].

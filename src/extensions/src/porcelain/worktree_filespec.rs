@@ -71,6 +71,69 @@ pub(crate) fn removed_became_gitlink(workdir: &Path, rela_path: &BStr) -> Option
     gitlink_head(workdir, rela_path)
 }
 
+/// Every stage-0 gitlink, in index order, whose `<path>/.git` makes
+/// `is_submodule_modified()` die (submodule.c:1892-1899) when `run_diff_files()` or
+/// `get_stat_data()` reaches it, as `(path, message)`; the message has no `fatal: `.
+/// The first is the one git dies on.
+///
+/// The walk is the one both of those take to the call:
+///
+/// ```c
+/// if (ce->ce_flags & (CE_VALID | CE_FSMONITOR_VALID)) { changed = 0; … }  /* diff-lib.c:246 */
+/// changed = check_removed(ce, &st);                    /* lstat; leading symlink */
+/// changed = match_stat_with_submodule(…);              /* diff-lib.c:88-107 */
+///         changed = ie_match_stat(…);   /* skip-worktree, CE_VALID, i-t-a: read-cache.c:401-414 */
+///         …
+///         else if (!ignore_dirty_submodules && (!changed || dirty_submodules))
+///                 *dirty_submodule = is_submodule_modified(ce->name, …);
+/// ```
+///
+/// A gitlink's `ie_match_stat()` is `TYPE_CHANGED` over anything but a directory and
+/// `ce_compare_gitlink()` over one (read-cache.c:331-337), which calls a `HEAD` that
+/// does not resolve unchanged (read-cache.c:268-284); gitlinks are never racy
+/// (`is_racy_timestamp()`, read-cache.c:368-373). Neither caller raises
+/// `dirty_submodules`, so only an unchanged gitlink is asked. `consider` is the
+/// caller's own gate: its pathspec, and the `ignore=dirty`/`ignore=all` that sets
+/// `ignore_dirty_submodules` or `ignore_submodules` for the path.
+pub(crate) fn unusable_gitlinks(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    mut consider: impl FnMut(&BStr) -> bool,
+) -> Vec<(gix::bstr::BString, String)> {
+    use gix::index::entry::{Flags, Mode, Stage};
+    let mut out = Vec::new();
+    let Some(workdir) = repo.workdir() else {
+        return out;
+    };
+    for e in index.entries() {
+        if e.stage() != Stage::Unconflicted || e.mode != Mode::COMMIT {
+            continue;
+        }
+        if e.flags.intersects(Flags::SKIP_WORKTREE | Flags::ASSUME_VALID | Flags::INTENT_TO_ADD) {
+            continue;
+        }
+        let path = e.path(index);
+        if !consider(path) {
+            continue;
+        }
+        let abs = workdir.join(gix::path::from_bstr(path).as_ref());
+        if !std::fs::symlink_metadata(&abs).is_ok_and(|md| md.is_dir())
+            || super::check_ignore::has_symlink_leading_path(workdir, path)
+        {
+            continue;
+        }
+        if gitlink_head(workdir, path).is_some_and(|head| head != e.id) {
+            continue;
+        }
+        if let Err(gix::submodule::status::Error::NotAGitRepository(message)) =
+            gix::submodule::status::is_submodule_populated_for_status(repo, path)
+        {
+            out.push((path.to_owned(), message));
+        }
+    }
+    out
+}
+
 /// `diff_populate_gitlink()` (diff.c:4475): the one-line image git gives a gitlink
 /// filespec, with `-dirty` glued on whenever any `dirty_submodule` bit is set.
 pub(crate) fn subproject_image(id: ObjectId, dirty: bool) -> Vec<u8> {

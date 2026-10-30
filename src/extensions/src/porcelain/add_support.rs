@@ -137,6 +137,11 @@ pub(super) struct SpecCheck<'a> {
     /// (builtin/add.c:596), so `-u` says nothing about its unmatched elements.
     pub ignore_errors: bool,
     pub mode: SpecMode,
+    /// The `die()` `add_files_to_cache()` reaches before it stages anything; see
+    /// [`super::worktree_filespec::unusable_gitlinks`]. It comes after the
+    /// "did not match any files" loop and before `report_path_error()` and
+    /// `add_files()` (builtin/add.c:651-684).
+    pub files_to_cache_die: Option<String>,
 }
 
 /// Report the pathspecs that matched nothing, in the wording and with the severity
@@ -303,6 +308,11 @@ pub(super) fn unmatched_pathspec_check(
             }
             SpecMode::Renormalize | SpecMode::Refresh => {}
         }
+    }
+
+    if let Some(message) = &c.files_to_cache_die {
+        eprintln!("fatal: {message}");
+        return Ok(SpecVerdict::Fatal(ExitCode::from(FATAL)));
     }
 
     // `take_worktree_changes && !add_renormalize && !ignore_add_errors`

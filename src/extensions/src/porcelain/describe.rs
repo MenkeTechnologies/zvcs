@@ -297,7 +297,7 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)? {
                 return death.die();
             }
-            repo.is_dirty()?.then_some(mark.clone())
+            dirty_or_die_at_unusable_gitlink(&repo, &index)?.then_some(mark.clone())
         }
     };
 
@@ -1092,6 +1092,73 @@ fn hex_len(id: &gix::Id<'_>, abbrev: Option<i64>) -> Result<usize> {
         }
         None => id.shorten()?.hex_len(),
     })
+}
+
+/// `--dirty`'s `run_diff_index(&revs, 0)` over `diff-index --quiet HEAD --`
+/// (builtin/describe.c:768-779): whether the work tree differs from `HEAD`.
+///
+/// The walk goes in path order and `oneway_diff()` stops at the first path that
+/// queued a change (`diff_can_quit_early()`, diff-lib.c:550-553, diff.c:7539-7544).
+/// Every path it reaches first passes through `get_stat_data()` (diff-lib.c:320-345),
+/// whose `match_stat_with_submodule()` dies in `is_submodule_modified()` on a gitlink
+/// whose `<path>/.git` is no git directory — so that gitlink is fatal unless a change
+/// sorts ahead of it. `submodule.<name>.ignore=dirty|all` keeps the call from
+/// happening (diff-lib.c:93-104).
+fn dirty_or_die_at_unusable_gitlink(repo: &gix::Repository, index: &gix::index::File) -> Result<bool> {
+    use gix::submodule::config::Ignore;
+    let mut ignore = super::diff_index::GitlinkIgnore::from_submodule_config(repo);
+    let unusable = super::worktree_filespec::unusable_gitlinks(repo, index, |p| {
+        !matches!(ignore.get(&p.to_owned()), Ignore::Dirty | Ignore::All)
+    });
+    let Some((first, message)) = unusable.first() else {
+        return Ok(repo.is_dirty()?);
+    };
+    let ahead = |p: &BStr| p < first.as_bstr();
+
+    let head_tree_id = repo.head_tree_id_or_empty()?;
+    let mut staged_ahead = false;
+    repo.tree_index_status(
+        &head_tree_id,
+        index,
+        None,
+        gix::status::tree_index::TrackRenames::Disabled,
+        |change, _, _| {
+            if ahead(change.location()) {
+                staged_ahead = true;
+                return Ok::<_, std::convert::Infallible>(std::ops::ControlFlow::Break(()));
+            }
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )?;
+    if staged_ahead {
+        return Ok(true);
+    }
+
+    // The worktree side, with the gitlinks git would die on left out so that the
+    // comparison of every other path can finish; only a change ahead of the first
+    // one decides anything.
+    let excluded: Vec<BString> = unusable
+        .iter()
+        .map(|(path, _)| {
+            let mut spec = BString::from(":(exclude,literal)");
+            spec.extend_from_slice(path);
+            spec
+        })
+        .collect();
+    let iter = repo
+        .status(gix::features::progress::Discard)?
+        .index_worktree_rewrites(None)
+        .index_worktree_submodules(gix::status::Submodule::AsConfigured { check_dirty: true })
+        .index_worktree_options_mut(|opts| {
+            opts.dirwalk_options = None;
+        })
+        .into_index_worktree_iter(excluded)?;
+    for item in iter {
+        if ahead(item?.rela_path()) {
+            return Ok(true);
+        }
+    }
+    crate::git_fatal!("{message}")
 }
 
 /// Does any ref the selector would collect (after glob filtering) exist at all?

@@ -4923,6 +4923,12 @@ fn collect_tracked_changes(
     if repo.workdir().is_none() {
         crate::git_fatal!("this operation must be run in a work tree");
     }
+    // `add_files_to_cache()`'s `run_diff_files()` (read-cache.c:4053-4064) asks
+    // `is_submodule_modified()` about every unchanged gitlink and dies, before
+    // anything is staged, on one whose `<path>/.git` is no git directory.
+    if let Some((_, message)) = super::worktree_filespec::unusable_gitlinks(repo, index, |_| true).into_iter().next() {
+        crate::git_fatal!("{message}");
+    }
     let mut staged: Vec<StagedFile> = Vec::new();
     let mut deletions: Vec<BString> = Vec::new();
     let mut order = QueuedOrder::default();

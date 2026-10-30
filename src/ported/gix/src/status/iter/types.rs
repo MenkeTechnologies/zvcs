@@ -82,6 +82,17 @@ impl Outcome {
         self.changes.as_ref().is_some_and(|changes| !changes.is_empty())
     }
 
+    /// The entries whose content matched the worktree although the cheap stat check did not settle
+    /// them, as `(entry_index, new_stat)`: the `EntryStatus::NeedsUpdate` items the iterator keeps
+    /// for [`write_changes()`](Self::write_changes()) instead of yielding them. `entry_index` indexes
+    /// the entries of [`worktree_index`](Self::worktree_index).
+    pub fn needs_update(&self) -> impl Iterator<Item = (usize, &crate::index::entry::Stat)> + '_ {
+        self.changes.iter().flatten().filter_map(|(entry_index, change)| match change {
+            ApplyChange::NewStat(stat) => Some((*entry_index, stat)),
+            ApplyChange::SetSizeToZero => None,
+        })
+    }
+
     /// Write the changes if there are any back to the index file.
     /// This can only be done once as the changes are consumed in the process, if there were any.
     pub fn write_changes(&mut self) -> Option<Result<(), gix_index::file::write::Error>> {

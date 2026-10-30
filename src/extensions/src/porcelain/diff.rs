@@ -3206,6 +3206,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
     let files_combine =
         diff_files_shape && (combine_merges || (!quiet && unmerged_stage.is_none() && fmt & F_PATCH != 0));
     let mut files_combined: Vec<CombinedPath> = Vec::new();
+    // Paths [`collect_tree_worktree`] found stat-dirty with unchanged content, for
+    // `show_modified()`'s combined arm.
+    let mut stat_dirty: Vec<BString> = Vec::new();
 
     // `builtin_diff_tree()` (builtin/diff.c:196):
     //
@@ -3446,7 +3449,14 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             .to_owned();
         if revs.len() == 1 {
             old_tree_id = Some(tree_id_for(&repo, revs.first())?);
-            collect_tree_worktree(&repo, &revs[0], &paths, &mut deltas, ignore_submodules.status_mode())?;
+            collect_tree_worktree(
+                &repo,
+                &revs[0],
+                &paths,
+                &mut deltas,
+                ignore_submodules.status_mode(),
+                &mut stat_dirty,
+            )?;
         } else {
             collect_index_worktree(
                 &repo,
@@ -3545,7 +3555,35 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
             }
         }
         deltas = kept;
+        // An entry the tree and the index agree on, whose file only moved its stat
+        // data, queues no pair, yet `get_stat_data()` hands `show_modified()` the
+        // null id for it, so it combines as well, its result the unchanged file.
+        if let Some(tree_id) = old_tree_id {
+            let tree = repo.find_object(tree_id)?.peel_to_tree()?;
+            stat_dirty.retain(|p| relative.as_ref().is_none_or(|prefix| p.starts_with(prefix.as_bytes())));
+            for path in stat_dirty {
+                if walk_combined.iter().any(|cp| cp.path == path) || deltas.iter().any(|d| d.path == path) {
+                    continue;
+                }
+                let Some((tree_oid, tree_kind)) = tree_entry(&tree, &path)? else {
+                    continue;
+                };
+                let d = Delta::plain(path, Some((tree_oid, tree_kind)), NewSide::Worktree(tree_kind));
+                if let Some(cp) = oneway_combined_path(&repo, &index, &d)? {
+                    walk_combined.push(cp);
+                }
+            }
+            // `unpack_trees()` reaches `show_modified()` in index order.
+            walk_combined.sort_by(|a, b| a.path.cmp(&b.path));
+        }
     }
+    // `show_patch_diff()` reads each worktree result as the walk reaches it, ahead
+    // of the queue's own reads, and only when the combined patch is what it prints
+    // (`show_combined_diff()`, combine-diff.c:1284-1296).
+    let combined_die = match !quiet && fmt & (F_RAW | F_NAME | F_NAME_STATUS) == 0 && fmt & F_PATCH != 0 {
+        true => convert_combined_results(&repo, &mut walk_combined)?,
+        false => None,
+    };
 
     // `-R`: swap the two sides of every pair, before diffcore and every format sees
     // them, the way `diff_change()` does. `diff_unmerge()` (diff.c:7722-7736) never
@@ -4456,8 +4494,9 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 true => r.hash_kind.len_in_hex(),
                 false => crate::abbrev::configured_abbrev(&repo, r.hash_kind.len_in_hex()),
             };
-            head = combined_patch(
-                &walk_combined,
+            let shown = combined_die.as_ref().map_or(walk_combined.len(), |(at, _)| *at);
+            let patch = combined_patch(
+                &walk_combined[..shown],
                 ctx,
                 // `rev->dense_combined_merges`, which `builtin_diff_files()` raises
                 // along with `combine_merges` when nothing set either.
@@ -4470,9 +4509,24 @@ pub fn diff(args: &[String]) -> Result<ExitCode> {
                 combined_all_paths,
                 true,
             )?;
+            // `convert_to_git()` died inside the walk: the combined sections ahead of
+            // that path were already printed, and the queue is never flushed.
+            if let Some((_, die)) = combined_die {
+                std::io::stdout().lock().write_all(&patch)?;
+                return Err(die);
+            }
+            head = patch;
         }
-        head.extend_from_slice(&out);
-        out = head;
+        // `show_raw_diff()`, `show_combined_header()` and `dump_sline()` write with
+        // `printf()`/`putchar()`, not to `opt->file` (combine-diff.c:740-873, 922-1011,
+        // 1228-1276), so `--output=<file>` leaves them on stdout.
+        match output_file {
+            Some(_) => std::io::stdout().lock().write_all(&head)?,
+            None => {
+                head.extend_from_slice(&out);
+                out = head;
+            }
+        }
     }
 
     // The combined half of `diff_tree_combined()` (combine-diff.c:1611-1631): the
@@ -5023,13 +5077,23 @@ fn collect_tree_index(
 
 /// `<tree>` vs. the worktree. Reproduces `diff-index`: start from the tree-to-index
 /// difference, then let the index-to-worktree difference override the "new" side.
+///
+/// `stat_dirty` collects every entry whose stat data no longer matches the file
+/// while its content still does. `get_stat_data()` (diff-lib.c:315-347) asks
+/// `match_stat_with_submodule()` with no `CE_MATCH_*` option, so such an entry is
+/// changed, its `oid` is the null id, and `show_modified()`'s combined arm
+/// (diff-lib.c:408-424) prints it even though no pair is queued for it here. An
+/// entry whose stat matches and whose content was only checked because it was racy
+/// is not: `ie_match_stat()` settles it through `ce_modified_check_fs()`.
 fn collect_tree_worktree(
     repo: &gix::Repository,
     spec: &str,
     paths: &[String],
     deltas: &mut Vec<Delta>,
     submodules: gix::status::Submodule,
+    stat_dirty: &mut Vec<BString>,
 ) -> Result<()> {
+    let stat_opts = repo.stat_options()?;
     let tree_id = rev_object(repo, spec)?.peel_to_tree()?.id;
     let patterns: Vec<BString> = paths.iter().map(|p| BString::from(p.as_str())).collect();
 
@@ -5039,7 +5103,7 @@ fn collect_tree_worktree(
     // `trust_executable_bit` / `has_symlinks` for `ce_mode_from_stat()`.
     let mode_rules = super::update_index::ModeRules::from_repo(repo);
 
-    let iter = repo
+    let mut iter = repo
         .status(gix::progress::Discard)?
         .head_tree(tree_id)
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
@@ -5050,7 +5114,7 @@ fn collect_tree_worktree(
         })
         .into_iter(patterns)?;
 
-    for item in iter {
+    for item in iter.by_ref() {
         match item? {
             gix::status::Item::TreeIndex(change) => {
                 use gix::diff::index::ChangeRef;
@@ -5073,6 +5137,18 @@ fn collect_tree_worktree(
                 if let Some((path, new, dirty, head)) = worktree_new_side(repo.workdir(), mode_rules, item)? {
                     new_sides.insert(path, (new, dirty, head));
                 }
+            }
+        }
+    }
+    // gix proved these entries' content equal and keeps them for an index write
+    // instead of yielding them; the stat comparison on the new stat tells the
+    // touched file from the racily clean one, as `diff-files` does.
+    if let Some(outcome) = iter.outcome_mut() {
+        let index = &outcome.worktree_index;
+        for (at, new_stat) in outcome.needs_update() {
+            let entry = &index.entries()[at];
+            if !new_stat.matches(&entry.stat, stat_opts) {
+                stat_dirty.push(entry.path(index).to_owned());
             }
         }
     }
@@ -5425,13 +5501,14 @@ fn collect_index_worktree(
             // reading as an empty result rather than a deleted one.
             let parents = vec![side(s.ours)?, side(s.theirs)?];
             let id = repo.object_hash().null();
-            let (patch_kind, bytes, result_deleted) =
+            let (patch_kind, bytes, result_deleted, convert_result) =
                 combined_worktree_result(repo, workdir, &path, unmerged_kind, id, &parents)?;
             combined.push(CombinedPath {
                 path: path.clone(),
                 kind: unmerged_kind,
                 patch_kind,
                 result_deleted,
+                convert_result,
                 id,
                 bytes,
                 parents,
@@ -9798,6 +9875,10 @@ struct CombinedPath {
     /// `result_deleted` (combine-diff.c:1111-1116): the worktree result
     /// `lstat()` could not find. Never set for a tree result.
     result_deleted: bool,
+    /// The result was read from a regular worktree file that is not a fake
+    /// symlink, so `show_patch_diff()` runs it through `convert_to_git()` before
+    /// diffing (combine-diff.c:1097-1107). Never set for a tree result.
+    convert_result: bool,
     id: ObjectId,
     bytes: Vec<u8>,
     parents: Vec<CombinedSide>,
@@ -9866,7 +9947,7 @@ fn combined_path_set(
         if shared_with_a_parent {
             continue;
         }
-        out.push(CombinedPath { path, kind, patch_kind: kind, result_deleted: false, id, bytes, parents });
+        out.push(CombinedPath { path, kind, patch_kind: kind, result_deleted: false, convert_result: false, id, bytes, parents });
     }
     Ok(out)
 }
@@ -10058,6 +10139,9 @@ fn reverse_combined(set: &mut [CombinedPath]) {
 /// - a file is read at `canon_mode(st.st_mode)`, or at `S_IFLNK` when
 ///   `core.symlinks` is off and every parent is a symlink.
 ///
+/// The last element says whether the bytes still owe `convert_to_git()`: see
+/// [`CombinedPath::convert_result`].
+///
 /// `kind` and `id` are the path's `elem->mode` and `elem->oid` as built.
 fn combined_worktree_result(
     repo: &gix::Repository,
@@ -10066,15 +10150,15 @@ fn combined_worktree_result(
     kind: Option<EntryKind>,
     id: ObjectId,
     parents: &[CombinedSide],
-) -> Result<(Option<EntryKind>, Vec<u8>, bool)> {
+) -> Result<(Option<EntryKind>, Vec<u8>, bool, bool)> {
     let full = workdir.join(gix::path::from_bstr(path.as_bstr()));
-    let deleted = (None, Vec::new(), true);
+    let deleted = (None, Vec::new(), true, false);
     let Ok(meta) = std::fs::symlink_metadata(&full) else {
         return Ok(deleted);
     };
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(&full)?;
-        return Ok((Some(EntryKind::Link), gix::path::into_bstr(target).into_owned().into(), false));
+        return Ok((Some(EntryKind::Link), gix::path::into_bstr(target).into_owned().into(), false, false));
     }
     if meta.is_dir() {
         let head = gix::open(&full).ok().and_then(|sub| sub.head_id().ok().map(|h| h.detach()));
@@ -10086,7 +10170,7 @@ fn combined_worktree_result(
             _ if oid.is_null() => Vec::new(),
             _ => blob_bytes(repo, oid)?,
         };
-        return Ok((kind, bytes, false));
+        return Ok((kind, bytes, false, false));
     }
     let Ok(bytes) = std::fs::read(&full) else {
         return Ok(deleted);
@@ -10107,7 +10191,34 @@ fn combined_worktree_result(
         (true, true) => EntryKind::BlobExecutable,
         (true, false) => EntryKind::Blob,
     };
-    Ok((Some(mode), bytes, false))
+    // "If not a fake symlink, apply filters, e.g. autocrlf" (combine-diff.c:1097-1107),
+    // which [`convert_combined_results`] runs once the patch is known to be printed.
+    Ok((Some(mode), bytes, false, is_file))
+}
+
+/// `convert_to_git()` over every worktree result that owes it, in walk order
+/// (combine-diff.c:1097-1107), with `global_conv_flags_eol`: its default
+/// `CONV_EOL_RNDTRP_WARN` prints the `in the working copy of` warning as each path
+/// is reached, and `core.safecrlf=true` dies there. Returns the position of the
+/// path that died, every combined section ahead of it already printed, and the
+/// fatal error.
+fn convert_combined_results(
+    repo: &gix::Repository,
+    set: &mut [CombinedPath],
+) -> Result<Option<(usize, anyhow::Error)>> {
+    let mut filter: Option<super::convert_to_git::WorktreeFilter> = None;
+    for (at, cp) in set.iter_mut().enumerate().filter(|(_, cp)| cp.convert_result) {
+        let f = match &mut filter {
+            Some(f) => f,
+            none => none.insert(super::convert_to_git::WorktreeFilter::new(repo, true, false)?),
+        };
+        match f.convert(repo, &gix::path::from_bstr(cp.path.as_bstr()), &cp.bytes) {
+            Ok(bytes) => cp.bytes = bytes,
+            Err(e) => return Ok(Some((at, crate::fatal::die(e.to_string())))),
+        }
+        cp.convert_result = false;
+    }
+    Ok(None)
 }
 
 /// `show_modified()`'s combined arm (diff-lib.c:408-424) for one queued pair of
@@ -10222,13 +10333,14 @@ fn oneway_combined_path(
     // `p->mode` is `get_stat_data()`'s `ce_mode_from_stat()` answer, which
     // `show_raw_diff()` prints; the patch takes the mode the file's own `lstat()`
     // gives when it reads the result (combine-diff.c:1079).
-    let (patch_kind, bytes, result_deleted) =
+    let (patch_kind, bytes, result_deleted, convert_result) =
         combined_worktree_result(repo, workdir, &d.path, Some(result_kind), id, &parents)?;
     Ok(Some(CombinedPath {
         path: d.path.clone(),
         kind: Some(result_kind),
         patch_kind,
         result_deleted,
+        convert_result,
         id,
         bytes,
         parents,
@@ -10657,7 +10769,7 @@ fn combined_patch(
 /// `diff_line_prefix(opt)` and before the text; the prefix is already in place
 /// here, so it is stepped over rather than re-emitted. With a disabled table every
 /// lookup is the empty string and the pass copies the bytes through unchanged.
-fn colorize_combined(
+pub(crate) fn colorize_combined(
     out: Vec<u8>,
     colors: &diff_color::DiffColors,
     line_prefix: &[u8],
@@ -10699,7 +10811,31 @@ fn colorize_combined(
             res.extend_from_slice(line);
             continue;
         } else if rest.starts_with(b"@") {
-            diff_color::DiffSlot::Frag
+            // `c_frag` on the `@@@ ... @@@` range alone; a hunk comment after it is
+            // `c_reset c_context " " c_reset c_func <comment>` (combine-diff.c:
+            // 809-833), and the line closes with one `c_reset` either way.
+            let close = [b" ".as_slice(), &b"@".repeat(num_parent + 1)].concat();
+            let header_end = rest
+                .windows(close.len())
+                .position(|w| w == close.as_slice())
+                .map_or(rest.len(), |at| at + close.len());
+            let split = body.len() - rest.len();
+            res.extend_from_slice(&body[..split]);
+            push_str(&mut res, colors.get(diff_color::DiffSlot::Frag));
+            res.extend_from_slice(&rest[..header_end]);
+            if let Some(comment) = rest[header_end..].strip_prefix(b" ") {
+                push_str(&mut res, reset);
+                push_str(&mut res, colors.get(diff_color::DiffSlot::Context));
+                res.push(b' ');
+                push_str(&mut res, reset);
+                push_str(&mut res, colors.get(diff_color::DiffSlot::Func));
+                res.extend_from_slice(comment);
+            }
+            push_str(&mut res, reset);
+            if nl {
+                res.push(b'\n');
+            }
+            continue;
         } else {
             let signs = &rest[..num_parent.min(rest.len())];
             if signs.contains(&b'-') {
@@ -10713,8 +10849,23 @@ fn colorize_combined(
         let split = body.len() - rest.len();
         res.extend_from_slice(&body[..split]);
         push_str(&mut res, colors.get(slot));
-        res.extend_from_slice(rest);
-        push_str(&mut res, reset);
+        // `show_line_to_eol()` (combine-diff.c:740-750) prints a body line's trailing
+        // CR after `c_reset`, not before it.
+        let is_body = matches!(
+            slot,
+            diff_color::DiffSlot::Old | diff_color::DiffSlot::New | diff_color::DiffSlot::Context
+        );
+        match rest.strip_suffix(b"\r").filter(|_| is_body) {
+            Some(text) => {
+                res.extend_from_slice(text);
+                push_str(&mut res, reset);
+                res.push(b'\r');
+            }
+            None => {
+                res.extend_from_slice(rest);
+                push_str(&mut res, reset);
+            }
+        }
         if nl {
             res.push(b'\n');
         }
@@ -10981,11 +11132,43 @@ fn make_hunks(sline: &mut [SLine], cnt: usize, context: u32, dense: bool) {
     give_context(sline, cnt, context);
 }
 
+/// `hunk_comment_line()` (combine-diff.c:730-738): a result line opening with an
+/// ASCII letter, `_` or `$` can name the combined hunks after it. The diff driver's
+/// `funcname`/`xfuncname` plays no part: `show_patch_diff()` looks the driver up
+/// for `binary` and `textconv` alone (combine-diff.c:1031-1035).
+pub(crate) fn is_hunk_comment_line(bol: &[u8]) -> bool {
+    matches!(bol.first(), Some(&ch) if ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$')
+}
+
+/// The part of a hunk comment line the `@@@` header carries (combine-diff.c:
+/// 816-830): its bytes up to, but not including, the last non-space byte among
+/// the first 40, since `putchar(hunk_comment[i])` runs only while
+/// `i < comment_end`. Empty when `comment_end` stays 0, which prints nothing,
+/// not even the separating space.
+pub(crate) fn combined_hunk_comment(bol: &[u8]) -> &[u8] {
+    let mut comment_end = 0usize;
+    for (i, &ch) in bol.iter().take(40).enumerate() {
+        if ch == 0 || ch == b'\n' {
+            break;
+        }
+        if !super::remote_fd::is_git_space(ch) {
+            comment_end = i;
+        }
+    }
+    &bol[..comment_end]
+}
+
 /// `dump_sline()`.
 fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
     let mut lno = 0usize;
     loop {
+        // `hunk_comment` starts over for every hunk and follows the unmarked lines
+        // scanned on the way to it (combine-diff.c:772-778).
+        let mut hunk_comment: Option<&[u8]> = None;
         while lno <= cnt && sline[lno].flag & MARK == 0 {
+            if is_hunk_comment_line(&sline[lno].bol) {
+                hunk_comment = Some(&sline[lno].bol);
+            }
             lno += 1;
         }
         if cnt < lno {
@@ -11020,6 +11203,13 @@ fn dump_sline(out: &mut Vec<u8>, sline: &[SLine], cnt: usize, context: u32) {
         }
         push_str(out, &format!(" +{},{rlines} ", lno + 1));
         out.extend_from_slice(&b"@".repeat(NUM_PARENT + 1));
+        // `printf("%s%s %s%s", c_reset, c_context, c_reset, c_func)` ahead of the
+        // comment (combine-diff.c:825-827); [`colorize_combined`] paints it.
+        let comment = hunk_comment.map(combined_hunk_comment).unwrap_or_default();
+        if !comment.is_empty() {
+            out.push(b' ');
+            out.extend_from_slice(comment);
+        }
         out.push(b'\n');
 
         while lno < hunk_end {

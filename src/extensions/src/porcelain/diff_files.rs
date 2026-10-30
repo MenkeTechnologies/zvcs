@@ -2423,7 +2423,6 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
     // form per path: a `::`-prefixed raw/name record when a raw-ish format is on,
     // otherwise a `diff --cc` patch.
     let combine_raw = opts.fmt & (F_RAW | F_NAME | F_NAME_STATUS) != 0;
-    let mut combined_patch: Vec<u8> = Vec::new();
     if !combined.is_empty() {
         if combine_raw {
             for c in &combined {
@@ -2431,9 +2430,23 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             }
             separator = true;
         } else if opts.fmt & F_PATCH != 0 {
+            let mut combined_patch: Vec<u8> = Vec::new();
             for c in &combined {
                 render_combined_patch(&mut combined_patch, repo, c, &opts, &workdir)?;
             }
+            // `show_combined_diff()` prints the sections itself, in `dump_sline()`'s
+            // own palette (combine-diff.c:752-873), and never through the emitter, so
+            // `--word-diff`, `--color-moved` and the whitespace highlighting do not
+            // reach them, and they lead whatever `diff_flush()` prints for the queue.
+            // They carry `--line-prefix` already, on every line but the bare `mode`
+            // one. `run_diff_files()` combines a path only at `num_compare_stages == 2`
+            // (diff-lib.c:211), so every section has two sign columns.
+            out.extend_from_slice(&super::diff::colorize_combined(
+                combined_patch,
+                &colors,
+                &opts.line_prefix,
+                2,
+            ));
         }
     }
 
@@ -2510,17 +2523,14 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
         deltas.truncate(u.index);
         analyses.truncate(u.index);
     }
-    if !halted && opts.fmt & F_PATCH != 0 && (!combined_patch.is_empty() || !deltas.is_empty()) {
+    if !halted && opts.fmt & F_PATCH != 0 && !deltas.is_empty() {
         if separator {
             rest.push(b'\n');
         }
         // The whole patch is assembled uncolored first, then re-emitted in one pass
         // through git's `fn_out_consume()` chain with each file pair's whitespace
         // state — `diff_flush_patch_all_file_pairs()`'s ordering, which is what lets
-        // `--color-moved` and `--word-diff` see every pair at once. The combined
-        // (`--cc`) sections carry no per-pair pre/post images, so they go through the
-        // default state, exactly as `check_blank_at_eof()` leaves it when the two
-        // sides were never compared.
+        // `--color-moved` and `--word-diff` see every pair at once.
         let paint_opts = diff_color::PaintOptions {
             ws_error_highlight: opts.ws_error_highlight,
             indicators: (opts.ind_new, opts.ind_old, opts.ind_ctx),
@@ -2532,13 +2542,8 @@ fn run(repo: &gix::Repository, opts: Opts, paths: Vec<BString>) -> Result<ExitCo
             line_prefix: opts.line_prefix.clone(),
             ..Default::default()
         };
-        let mut plain = combined_patch.clone();
-        // Every `diff --cc` section ahead of the first ordinary pair consumes a slot,
-        // so the per-file states line up with the headers the re-emitter counts.
-        let combined_sections =
-            diff_pickaxe::count_occurrences(&combined_patch, b"\ndiff --cc ") + usize::from(combined_patch.starts_with(b"diff --cc "));
-        let mut files: Vec<diff_color::FilePaint> =
-            vec![diff_color::FilePaint::new(ws_rule); combined_sections];
+        let mut plain: Vec<u8> = Vec::new();
+        let mut files: Vec<diff_color::FilePaint> = Vec::new();
         // `fill_metainfo()`'s abbreviation length (diff.c:4915):
         //     int abbrev = o->abbrev ? o->abbrev : DEFAULT_ABBREV;
         //     if (o->flags.full_index) abbrev = hexsz;
@@ -5697,13 +5702,9 @@ fn show_parent_lno(out: &mut Vec<u8>, sline: &[Sline], l0: usize, l1: usize, n: 
     out.extend_from_slice(format!(" -{},{}", a, b - a - null_context).as_bytes());
 }
 
-/// `hunk_comment_line()`.
-fn hunk_comment_line(sl: &Sline, result: &[u8]) -> bool {
-    if sl.len == 0 {
-        return false;
-    }
-    let ch = result[sl.bol];
-    ch.is_ascii_alphabetic() || ch == b'_' || ch == b'$'
+/// The bytes of result line `sl`, without its terminator.
+fn sline_text<'a>(sl: &Sline, result: &'a [u8]) -> &'a [u8] {
+    &result[sl.bol..sl.bol + sl.len]
 }
 
 /// `dump_sline()`: render every combined hunk. `ind_*` carry the
@@ -5729,7 +5730,7 @@ fn dump_sline(
     loop {
         let mut hunk_comment: Option<usize> = None;
         while lno <= cnt && sline[lno].flag & mark == 0 {
-            if hunk_comment_line(&sline[lno], result) {
+            if super::diff::is_hunk_comment_line(sline_text(&sline[lno], result)) {
                 hunk_comment = Some(lno);
             }
             lno += 1;
@@ -5771,23 +5772,12 @@ fn dump_sline(
             out.push(b'@');
         }
 
-        if let Some(hc) = hunk_comment {
-            let bol = sline[hc].bol;
-            let hcbytes = &result[bol..];
-            let mut comment_end = 0usize;
-            for i in 0..40 {
-                let Some(&ch) = hcbytes.get(i) else { break };
-                if ch == b'\n' {
-                    break;
-                }
-                if !ch.is_ascii_whitespace() {
-                    comment_end = i;
-                }
-            }
-            if comment_end != 0 {
-                out.extend_from_slice(b" ");
-                out.extend_from_slice(&hcbytes[..comment_end]);
-            }
+        // `printf("%s%s %s%s", c_reset, c_context, c_reset, c_func)` ahead of the
+        // comment (combine-diff.c:825-827); [`super::diff::colorize_combined`] paints it.
+        let comment = hunk_comment.map_or(&[][..], |hc| super::diff::combined_hunk_comment(sline_text(&sline[hc], result)));
+        if !comment.is_empty() {
+            out.push(b' ');
+            out.extend_from_slice(comment);
         }
         out.push(b'\n');
 
@@ -5857,8 +5847,7 @@ fn header_abbrev(repo: &gix::Repository, opts: &Opts) -> Option<usize> {
 }
 
 /// `show_combined_header()` for a working-tree combined diff (`show_file_header`
-/// is always set for diff-files). `line_prefix` is empty here because the caller
-/// hands this output to the painter, which stamps `--line-prefix` once.
+/// is always set for diff-files).
 fn show_combined_header(
     out: &mut Vec<u8>,
     repo: &gix::Repository,
@@ -5894,8 +5883,11 @@ fn show_combined_header(
     // diff-files always records DIFF_STATUS_MODIFIED for both parents, so the
     // "added if nobody had it" branch never fires here.
     if mode_differs {
-        out.extend_from_slice(line_prefix);
+        // `printf("%s%sdeleted file ", line_prefix, c_meta)` and then a bare
+        // `printf("mode ")` (combine-diff.c:968-971): only a deletion's mode line
+        // carries the line prefix.
         if deleted {
+            out.extend_from_slice(line_prefix);
             out.extend_from_slice(b"deleted file ");
         }
         out.extend_from_slice(b"mode ");
@@ -5957,7 +5949,7 @@ fn render_combined_patch(
 
     let is_binary = buffer_is_binary(&result) || parents.iter().any(|p| buffer_is_binary(p));
     if is_binary {
-        show_combined_header(out, repo, c, opts, b"", false);
+        show_combined_header(out, repo, c, opts, &opts.line_prefix, false);
         out.extend_from_slice(b"Binary files differ\n");
         return Ok(());
     }
@@ -6018,7 +6010,7 @@ fn render_combined_patch(
     // working_tree_file is always true for diff-files, so the header and body are
     // shown regardless of make_hunks()'s verdict.
     let _ = make_hunks(&mut sline, cnt, NUM_PARENT, opts.dense_combined, opts.ctx as usize);
-    show_combined_header(out, repo, c, opts, b"", true);
+    show_combined_header(out, repo, c, opts, &opts.line_prefix, true);
     dump_sline(
         out,
         &sline,
@@ -6027,7 +6019,7 @@ fn render_combined_patch(
         &result,
         result_deleted,
         opts.ctx as usize,
-        b"",
+        &opts.line_prefix,
     );
     Ok(())
 }

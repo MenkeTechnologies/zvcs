@@ -139,9 +139,13 @@ impl Response {
                     line.clear();
                     // `process_section_header()` dies when the reader is not at a data line (fetch-pack.c:1469-1479),
                     // which is where a refused `POST` leaves it: at the `0002` remote-curl writes in place of the
-                    // response (remote-curl.c:1086-1087). The end of the stream is the reader's own `die()`.
-                    if reader.peek_data_line().is_none() {
-                        return Err(response::Error::ExpectedSection { section: expected });
+                    // response (remote-curl.c:1086-1087). The end of the stream is the reader's own `die()`, and so
+                    // is an `ERR` line: the peek runs under `PACKET_READ_DIE_ON_ERR_PACKET` (fetch-pack.c:1729-1731,
+                    // pkt-line.c:508-510), so "remote error: ..." comes ahead of any section check.
+                    match reader.peek_data_line() {
+                        None => return Err(response::Error::ExpectedSection { section: expected }),
+                        Some(Err(err)) => return Err(err.into()),
+                        Some(Ok(_)) => {}
                     }
                     expected = "packfile";
                     if reader.readline_str(&mut line)? == 0 {

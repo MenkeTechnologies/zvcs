@@ -4696,6 +4696,11 @@ fn sequencer_rebase(start: SequencerStart<'_>) -> Result<ExitCode> {
     update_clean_worktree(repo, start.old_index, base, &should_interrupt)?;
     run_post_checkout(repo, start.state.orig_head, base);
 
+    // "Expand the commit IDs": `complete_action()` renders the edited sheet with
+    // `todo_list_to_strbuf()` and parses that before `pick_commits()` runs it
+    // (sequencer.c:6751-6758), so the lines the sequencer keeps are the
+    // rendering, not the editor's spelling of them.
+    new_list.forget_raw();
     let mut seq = Sequencer::new(repo, start.state)?;
     seq.autostash = start.autostash;
     seq.run(new_list, 0)
@@ -4997,11 +5002,22 @@ fn rebase_continue(repo: &gix::Repository, skip: bool) -> Result<ExitCode> {
     crate::diff_config::validate_basic(repo).map_err(|r| r.into_error())?;
     let st = read_basic_state(repo)?;
     let dir = rebase_merge_dir(repo);
-    let (list, parsed_ok) = todo::List::parse(
-        repo,
-        &std::fs::read(dir.join("git-rebase-todo")).unwrap_or_default(),
-        dir.join("done").exists(),
-    );
+    // `read_populate_todo()` opens the sheet with `strbuf_read_file_or_whine()`
+    // (sequencer.c:3078-3079), so a sheet an `exec` removed stops the rebase
+    // rather than reading as an empty one that concludes it.
+    let todo_path = dir.join("git-rebase-todo");
+    let buf = match std::fs::read(&todo_path) {
+        Ok(buf) => buf,
+        Err(e) => {
+            eprintln!(
+                "error: could not open '{}': {}",
+                crate::setup::git_path_display(repo, &todo_path),
+                crate::external::strerror(&e)
+            );
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let (list, parsed_ok) = todo::List::parse(repo, &buf, dir.join("done").exists());
     if !parsed_ok {
         eprintln!("error: please fix this using 'git rebase --edit-todo'.");
         return Ok(ExitCode::from(1));
@@ -5282,6 +5298,15 @@ struct Sequencer<'r> {
     /// merge-ort. Parsed once per run, because git parses once per
     /// `try_merge_strategy()` and every pick in a run shares the options.
     xopts: crate::merge_apply::StrategyOptions,
+    /// `check_todo` (sequencer.c:5145): the instruction just run handed control to
+    /// something that may have rewritten `git-rebase-todo` — an `exec`, or a
+    /// `git commit` with the editor open — so `pick_commits()` compares the file
+    /// with what it wrote before moving on.
+    check_todo: bool,
+    /// What the last `save_todo()` wrote to `git-rebase-todo`: the in-memory sheet
+    /// after the running instruction, which a reschedule puts that instruction
+    /// back in front of.
+    saved_rest: Vec<u8>,
 }
 
 /// What one instruction did.
@@ -5351,6 +5376,8 @@ impl<'r> Sequencer<'r> {
             fixup_count: 0,
             fixups: Vec::new(),
             xopts,
+            check_todo: false,
+            saved_rest: Vec::new(),
         })
     }
 
@@ -5390,23 +5417,68 @@ impl<'r> Sequencer<'r> {
     /// about to run, which is appended to `done` instead. That split is what
     /// makes a stop resumable — `--continue` concludes the instruction in `done`
     /// and then runs the file from the top.
-    fn save_todo(&self, list: &todo::List, next: usize) -> Result<()> {
+    fn save_todo(&mut self, list: &todo::List, next: usize) -> Result<()> {
         let dir = self.dir();
-        let rest = todo::List { items: list.items[next.min(list.items.len())..].to_vec() };
-        std::fs::write(dir.join("git-rebase-todo"), rest.to_bytes(self.repo, None, 0))?;
+        self.saved_rest = self.todo_rest(list, next);
+        std::fs::write(dir.join("git-rebase-todo"), &self.saved_rest)?;
         if next > 0 {
             let one = todo::List { items: vec![list.items[next - 1].clone()] };
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(dir.join("done"))?;
-            std::io::Write::write_all(&mut f, &one.to_bytes(self.repo, None, 0))?;
+            std::io::Write::write_all(&mut f, &one.raw_bytes(self.repo))?;
         }
         Ok(())
     }
 
+    /// `todo_list->buf.buf + get_item_line_offset(todo_list, next)`: the sheet
+    /// from instruction `next` on, as `save_todo()` writes it.
+    fn todo_rest(&self, list: &todo::List, next: usize) -> Vec<u8> {
+        todo::List { items: list.items[next.min(list.items.len())..].to_vec() }.raw_bytes(self.repo)
+    }
+
+    /// `reread_todo_if_changed()` (sequencer.c:5006-5027): `git-rebase-todo` no
+    /// longer holds what `save_todo()` wrote before instruction `current` ran, so
+    /// it is parsed again and run from its top. `read_populate_todo()`
+    /// (sequencer.c:3071-3122) recounts `done_nr` from `done` and `total_nr` from
+    /// both, and writes the new `end`. `Ok(None)` leaves `list` as it was; an
+    /// unreadable or unparsable sheet is `Err` with git's message already printed.
+    fn reread_todo_if_changed(&mut self, list: &todo::List, current: usize) -> Result<Option<todo::List>, ()> {
+        let dir = self.dir();
+        let path = dir.join("git-rebase-todo");
+        // `strbuf_read_file_or_whine()` (path.c): `error_errno(_("could not open '%s'"), path)`.
+        let buf = match std::fs::read(&path) {
+            Ok(buf) => buf,
+            Err(e) => {
+                eprintln!(
+                    "error: could not open '{}': {}",
+                    crate::setup::git_path_display(self.repo, &path),
+                    crate::external::strerror(&e)
+                );
+                return Err(());
+            }
+        };
+        if buf == self.todo_rest(list, current + 1) {
+            return Ok(None);
+        }
+        let (new, ok) = todo::List::parse(self.repo, &buf, dir.join("done").exists());
+        if !ok {
+            eprintln!("error: please fix this using 'git rebase --edit-todo'.");
+            return Err(());
+        }
+        if new.items.is_empty() && !dir.join("done").exists() {
+            eprintln!("error: no commits parsed.");
+            return Err(());
+        }
+        if self.count_progress(&new).is_err() {
+            return Err(());
+        }
+        Ok(Some(new))
+    }
+
     /// `pick_commits()` — run the instruction stream from `start`.
-    fn run(&mut self, list: todo::List, start: usize) -> Result<ExitCode> {
+    fn run(&mut self, mut list: todo::List, start: usize) -> Result<ExitCode> {
         self.count_progress(&list)?;
         let dir = self.dir();
         for f in ["message", "stopped-sha", "amend", "patch"] {
@@ -5416,6 +5488,7 @@ impl<'r> Sequencer<'r> {
         let mut i = start;
         while i < list.items.len() {
             let item = list.items[i].clone();
+            self.check_todo = false;
             self.save_todo(&list, i + 1)?;
             // `pick_commits()` clears the previous instruction's per-step records
             // before running this one (sequencer.c:5043-5048):
@@ -5560,7 +5633,29 @@ impl<'r> Sequencer<'r> {
                 }
             };
             match step {
-                Step::Next | Step::Dropped => i += 1,
+                Step::Next | Step::Dropped => {
+                    // ```c
+                    // } else if (is_rebase_i(opts) && check_todo && !res &&
+                    //            reread_todo_if_changed(r, todo_list, opts)) {
+                    //         return -1;
+                    // }
+                    // ```
+                    // (sequencer.c:5236-5239.) A sheet that changed under the
+                    // instruction replaces the one in memory and runs from its
+                    // top (`todo_list->current = -1`, then `current++`).
+                    if self.check_todo {
+                        match self.reread_todo_if_changed(&list, i) {
+                            Ok(Some(new)) => {
+                                list = new;
+                                i = 0;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(()) => return Ok(ExitCode::from(1)),
+                        }
+                    }
+                    i += 1;
+                }
                 Step::Stop(code) => {
                     return Ok(if code == 0 {
                         ExitCode::SUCCESS
@@ -5613,6 +5708,8 @@ impl<'r> Sequencer<'r> {
 
     /// `do_exec()` — run the rest of the line through the shell.
     fn do_exec(&mut self, item: &todo::Item) -> Result<Step> {
+        // `check_todo = 1` (sequencer.c:5199), whatever the command did.
+        self.check_todo = true;
         let command = item.arg.to_str_lossy().into_owned();
         self.term_clear_line();
         if !self.st.quiet {
@@ -5706,11 +5803,15 @@ impl<'r> Sequencer<'r> {
     /// Put `item` back at the head of `git-rebase-todo` — git's `reschedule`
     /// path, which re-runs `save_todo()` with the current index rather than the
     /// next one.
+    ///
+    /// The rest of the sheet comes from memory, not from the file: `save_todo(…,
+    /// reschedule = 1)` writes `todo_list->buf` from the current instruction on
+    /// (sequencer.c:3692-3710), so a line a failed `exec` appended to
+    /// `git-rebase-todo` is overwritten, never read back.
     fn reschedule(&self, item: &todo::Item) -> Result<()> {
         let path = self.dir().join("git-rebase-todo");
-        let rest = std::fs::read(&path).unwrap_or_default();
-        let mut out = todo::List { items: vec![item.clone()] }.to_bytes(self.repo, None, 0);
-        out.extend_from_slice(&rest);
+        let mut out = todo::List { items: vec![item.clone()] }.raw_bytes(self.repo);
+        out.extend_from_slice(&self.saved_rest);
         std::fs::write(path, out)?;
         Ok(())
     }
@@ -6303,8 +6404,8 @@ impl<'r> Sequencer<'r> {
     /// two-parent merge-ort merge concluded by the `git commit` child, with
     /// `merge -c` and a bare `merge` amending the result in the editor.
     ///
-    /// Not ported, and refused rather than approximated: a two-parent merge whose
-    /// heads have more than one merge base.
+    /// A two-parent merge whose heads have more than one merge base merges against
+    /// the virtual base `merge_ort_recursive()` builds from them.
     fn do_merge(&mut self, item: &todo::Item) -> Result<Step> {
         let repo = self.repo;
         let edit = item.flags & todo::EDIT_MERGE_MSG != 0;
@@ -6499,41 +6600,56 @@ impl<'r> Sequencer<'r> {
         if bases.first().map(|b| b.detach()) == Some(merge_head) {
             return Ok(Step::Next);
         }
-        if bases.len() > 1 {
-            self.term_clear_line();
-            bail!(
-                "`merge` across {} merge bases is not ported (git folds them into one virtual \
-                 ancestor); the rebase is still resumable with `git rebase --abort`",
-                bases.len()
-            );
-        }
         // `write_message(…, git_path_merge_head(r), 0)` and
         // `write_message("no-ff", 5, git_path_merge_mode(r), 0)` (sequencer.c:4406-4408):
         // neither file ends in a newline.
         std::fs::write(git_dir.join("MERGE_HEAD"), merge_head.to_string())?;
         std::fs::write(git_dir.join("MERGE_MODE"), "no-ff")?;
 
-        let base_tree = match bases.first() {
-            Some(id) => repo.find_object(id.detach())?.peel_to_tree()?.id,
-            None => ObjectId::empty_tree(repo.object_hash()),
+        // `merge_ort_recursive(&o, head_commit, merge_commit, bases, &i)`
+        // (sequencer.c:4409-4424) is `merge_ort_internal()`, which names the base
+        // it merges against (merge-ort.c:5327-5346): no base is the empty tree,
+        // several bases are merged into each other first — the virtual
+        // `merged common ancestors`, whose inner merges report only from
+        // `merge.verbosity >= 5` (merge-ort.c:815) — and a single base is its own
+        // abbreviated id. The name is what a `diff3`/`zdiff3` conflict prints on
+        // its `|||||||` line.
+        let base_ids: Vec<ObjectId> = bases.iter().map(|b| b.detach()).collect();
+        let (base_tree, ancestor, inner_messages) = match base_ids.as_slice() {
+            [] => (ObjectId::empty_tree(repo.object_hash()), "empty tree".to_string(), Vec::new()),
+            [base] => (
+                repo.find_object(*base)?.peel_to_tree()?.id,
+                bases[0].shorten_or_id().to_string(),
+                Vec::new(),
+            ),
+            _ => {
+                let (tree, messages) = super::merge::virtual_base_tree_reporting(
+                    repo,
+                    &base_ids,
+                    None,
+                    super::merge::merge_verbosity(repo) >= 5,
+                )?;
+                (tree, "merged common ancestors".to_string(), messages)
+            }
         };
         let head_tree = repo.find_commit(head)?.tree_id()?.detach();
         let other_tree = repo.find_commit(merge_head)?.tree_id()?.detach();
         // `o.branch1 = "HEAD"; o.branch2 = ref_name.buf;` (sequencer.c:4414-4415).
-        let applied = crate::merge_apply::three_way_merge_with_options(
+        let applied = crate::merge_apply::three_way_merge_with_options_recursive(
             repo,
             base_tree,
             head_tree,
             other_tree,
             &self.index,
             gix::merge::blob::builtin_driver::text::Labels {
-                ancestor: None,
+                ancestor: Some(BStr::new(ancestor.as_bytes())),
                 current: Some(BStr::new(b"HEAD")),
                 other: Some(BStr::new(ref_name.as_bytes())),
             },
             &self.should_interrupt,
             false,
             &self.xopts,
+            &inner_messages,
         )?;
         // `merge_switch_to_result()` records the merged tree as `AUTO_MERGE`,
         // clean or not (merge-ort.c:4959-4962).
@@ -6600,6 +6716,8 @@ impl<'r> Sequencer<'r> {
     /// enabled, its output shown. `message` is `ctx->message`, which a merge that
     /// fast-forwarded never built.
     fn merge_amend_in_editor(&mut self, item: &todo::Item, message: Option<&BString>) -> Result<Step> {
+        // `fast_forward_edit: *check_todo = 1;` (sequencer.c:4463-4464).
+        self.check_todo = true;
         self.term_clear_line();
         let args: Vec<String> = vec!["--amend".into(), "--no-gpg-sign".into(), "-e".into()];
         // `read_env_script()` is skipped for an amend without a message file unless
@@ -6747,6 +6865,8 @@ impl<'r> Sequencer<'r> {
         short: &str,
         message: Option<&BString>,
     ) -> Result<Step> {
+        // `fast_forward_edit:` … `*check_todo = 1;` (sequencer.c:2552-2563).
+        self.check_todo = true;
         self.term_clear_line();
         let args: Vec<String> = vec![
             "--amend".into(),
@@ -6933,6 +7053,9 @@ impl<'r> Sequencer<'r> {
                 "-e".into(),
                 "--allow-empty".into(),
             ];
+            // `*check_todo = !!(flags & EDIT_MSG);` (sequencer.c:2551): the editor
+            // ran, so the sheet may have changed under it.
+            self.check_todo = true;
             let env = self.author_env();
             let code = self.run_commit(&args, env)?;
             self.refresh_index()?;

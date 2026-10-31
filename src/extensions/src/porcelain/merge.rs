@@ -1834,7 +1834,7 @@ pub(super) fn verify_merge_signature(
 /// into `show_msgs = !!verbosity`, which is the only part of the scale this
 /// build's output surface can express: levels 1–5 all print the same
 /// `Auto-merging` / `CONFLICT (…)` block, level 0 prints none of it.
-fn merge_verbosity(repo: &gix::Repository) -> i64 {
+pub(super) fn merge_verbosity(repo: &gix::Repository) -> i64 {
     if let Ok(env) = std::env::var("GIT_MERGE_VERBOSITY") {
         let digits = env.trim_start();
         let end = digits
@@ -3095,7 +3095,7 @@ pub(super) fn virtual_base_tree_with(
 /// merge-base recursion, so a base whose own bases disagree prints at depth 2 and wider; here
 /// that level runs inside `gix_merge::commit()`, which has no way to pass its conflicts back
 /// out, so those lines have no counterpart.
-fn virtual_base_tree_reporting(
+pub(super) fn virtual_base_tree_reporting(
     repo: &gix::Repository,
     bases: &[ObjectId],
     options: Option<gix::merge::tree::Options>,

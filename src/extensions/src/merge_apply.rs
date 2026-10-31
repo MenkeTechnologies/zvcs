@@ -319,6 +319,36 @@ pub fn three_way_merge_with_options(
     show_msgs: bool,
     xopts: &StrategyOptions,
 ) -> Result<Applied> {
+    three_way_merge_with_options_recursive(
+        repo,
+        base_tree,
+        ours_tree,
+        theirs_tree,
+        old_index,
+        labels,
+        should_interrupt,
+        show_msgs,
+        xopts,
+        &[],
+    )
+}
+
+/// [`three_way_merge_with_options`] carrying what the merge-base recursion already had to
+/// say, in the same message list as this merge's own — see
+/// [`three_way_merge_guarded_recursive`], which is this with the checkout guard armed.
+#[allow(clippy::too_many_arguments)]
+pub fn three_way_merge_with_options_recursive(
+    repo: &gix::Repository,
+    base_tree: ObjectId,
+    ours_tree: ObjectId,
+    theirs_tree: ObjectId,
+    old_index: &gix::index::File,
+    labels: gix::merge::blob::builtin_driver::text::Labels<'_>,
+    should_interrupt: &AtomicBool,
+    show_msgs: bool,
+    xopts: &StrategyOptions,
+    inner: &[crate::merge_msg::Message],
+) -> Result<Applied> {
     let merged = merge_and_apply(
         repo,
         base_tree,
@@ -331,7 +361,7 @@ pub fn three_way_merge_with_options(
         xopts,
         None,
         None,
-        &[],
+        inner,
     )?;
     let Merged::Applied(applied) = merged else {
         unreachable!("no worktree tree was handed over, so no checkout guard ran")

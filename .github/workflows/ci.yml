@@ -36,22 +36,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/stock-git
-          key: stock-git-${{ runner.os }}-${{ runner.arch }}-${{ env.STOCK_GIT_VERSION }}-${{ env.STOCK_GIT_SHA256 }}-brewcurl
+          key: stock-git-${{ runner.os }}-${{ runner.arch }}-${{ env.STOCK_GIT_VERSION }}-${{ env.STOCK_GIT_SHA256 }}
       - name: Build stock git
         if: steps.stock-git.outputs.cache-hit != 'true'
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update
             sudo apt-get install -y libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
-            curl_config=curl-config
-          else
-            # Link Homebrew libcurl, as Homebrew's git does, not the system one:
-            # libcurl's error text (e.g. CURLE_PARTIAL_FILE's "curl 18 ...")
-            # differs between the two, and the parity tests compare it.
-            brew list curl >/dev/null 2>&1 || brew install curl
-            curl_config="$(brew --prefix curl)/bin/curl-config"
           fi
-          "$curl_config" --version
           tarball="git-$STOCK_GIT_VERSION.tar.xz"
           curl -sSfL -o "$RUNNER_TEMP/$tarball" \
             "https://mirrors.edge.kernel.org/pub/software/scm/git/$tarball"
@@ -59,7 +51,6 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP"
           make -C "$RUNNER_TEMP/git-$STOCK_GIT_VERSION" -j"$(getconf _NPROCESSORS_ONLN)" \
             prefix="$HOME/.local/stock-git" \
-            CURL_CONFIG="$curl_config" \
             NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PYTHON=YesPlease \
             all install
       # First on PATH, and named explicitly for the parity harness

@@ -150,6 +150,8 @@ impl Store {
             num_handles_unstable: Default::default(),
             num_disk_state_consolidation: Default::default(),
             promisor: Default::default(),
+            bad_objects: Default::default(),
+            pack_name_root: Default::default(),
         })
     }
 }

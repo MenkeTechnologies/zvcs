@@ -174,6 +174,39 @@ impl Store {
         .ok();
         true
     }
+
+    /// Spell `p->pack_name` relative to `root`, the working tree git chdir()s to before it reads an
+    /// object, as `setup_git_directory()` leaves the object directory `.git/objects` there. The first
+    /// call wins; without one a pack is named by its full path.
+    pub fn set_pack_name_root(&self, root: std::path::PathBuf) {
+        let _keep_the_first_root = self.pack_name_root.set(root);
+    }
+
+    /// `p->pack_name` for the pack at `path`.
+    pub(crate) fn pack_name(&self, path: &std::path::Path) -> String {
+        self.pack_name_root
+            .get()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
+    /// Whether `mark_bad_packed_object()` gave up on `id` in the pack at `pack`.
+    pub(crate) fn is_bad_packed_object(&self, pack: &std::path::Path, id: &gix_hash::oid) -> bool {
+        let bad = self.bad_objects.lock();
+        !bad.is_empty() && bad.get(pack).is_some_and(|set| set.contains(id))
+    }
+
+    /// `mark_bad_packed_object()` (packfile.c:981-984): every later read through this store passes over
+    /// `id` in the pack at `pack`.
+    pub fn mark_bad_packed_object(&self, pack: &std::path::Path, id: &gix_hash::oid) {
+        self.bad_objects
+            .lock()
+            .entry(pack.to_owned())
+            .or_default()
+            .insert(id.to_owned());
+    }
 }
 
 /// Clears [`PROMISOR_FETCH_IN_PROGRESS`] even if the hook unwinds, so one failed fetch doesn't leave every
@@ -193,6 +226,9 @@ pub mod find;
 pub mod prefix;
 
 mod header;
+
+mod packed_read;
+pub use packed_read::{patch_delta, patch_delta_quiet};
 
 ///
 pub mod iter;

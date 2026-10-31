@@ -44,6 +44,15 @@ pub(crate) mod error {
             /// The original object to lookup
             id: gix_hash::ObjectId,
         },
+        /// The object is only in packs that gave up on it: `odb_source_packed_read_object_info()`'s
+        /// message, naming the first such pack (odb/source-packed.c:128-130, odb.c:548-607).
+        #[error("packed object {id} (stored in {pack}) is corrupt")]
+        PackedObjectCorrupt {
+            /// The object that was asked for.
+            id: gix_hash::ObjectId,
+            /// `p->pack_name` of the first pack that failed to produce it.
+            pack: String,
+        },
     }
 
     #[derive(Copy, Clone)]
@@ -78,6 +87,21 @@ pub(crate) mod error {
 }
 pub use error::Error;
 
+thread_local! {
+    /// Set by [`with_corrupt_reads_as_errors()`].
+    static CORRUPT_READS_AS_ERRORS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with whole-object reads handing [`Error::PackedObjectCorrupt`] back rather than dying with
+/// it as `odb_read_object()` does (odb.c:597-603), for a caller that still holds output git would have
+/// written by then and must flush it before it dies with the same message.
+pub fn with_corrupt_reads_as_errors<T>(f: impl FnOnce() -> T) -> T {
+    let before = CORRUPT_READS_AS_ERRORS.replace(true);
+    let out = f();
+    CORRUPT_READS_AS_ERRORS.set(before);
+    out
+}
+
 use crate::store::types::PackId;
 
 impl<S> super::Handle<S>
@@ -104,7 +128,12 @@ where
             id = super::access::follow_replacements(&self.store.replacements, id);
         }
 
+        // `do_oid_object_info_extended()` (odb.c:541-616): the pack the first corrupt read names, and
+        // whether the second read, which every miss gets, has run.
+        let mut bad_pack: Option<String> = None;
+        let mut second_read = false;
         loop {
+            let mut failed: Option<(std::sync::Arc<gix_pack::data::File>, u64)> = None;
             {
                 let marker = snapshot.marker;
                 'indices: for (idx, index) in snapshot.indices.iter_mut().enumerate() {
@@ -119,7 +148,7 @@ where
                             None => match self.store.load_pack(pack_id, marker)? {
                                 Some(pack) => {
                                     *possibly_pack = Some(pack);
-                                    possibly_pack.as_deref().expect("just put it in")
+                                    possibly_pack.as_ref().expect("just put it in")
                                 }
                                 // The pack this index points at is gone. That happens transiently
                                 // while another process repacks, and permanently when a stale
@@ -131,146 +160,204 @@ where
                                 None => continue 'indices,
                             },
                         };
-                        let entry = pack.entry(pack_offset)?;
-                        let header_size = entry.header_size();
-                        let res = pack.decode_entry(
-                            entry,
-                            buffer,
-                            inflate,
-                            &|id, _out| {
-                                let pack_offset = index_file.pack_offset_by_id(id)?;
-                                pack.entry(pack_offset)
-                                    .ok()
-                                    .map(gix_pack::data::decode::entry::ResolvedBase::InPack)
-                            },
-                            pack_cache,
-                        );
-                        let res = match res {
-                            Ok(r) => Ok((
-                                gix_object::Data {
-                                    kind: r.kind,
-                                    object_hash: pack.object_hash(),
-                                    data: buffer.as_slice(),
+                        // `packfile_fill_entry()` and `midx_fill_entry()` pass over an object marked
+                        // bad in this pack, which then names a corrupt answer (packfile.c:1846-1853,
+                        // midx.c:621-626).
+                        if self.store.is_bad_packed_object(pack.path(), id) {
+                            bad_pack.get_or_insert_with(|| self.store.pack_name(pack.path()));
+                            continue 'indices;
+                        }
+                        let pack_arc = std::sync::Arc::clone(pack);
+                        let pack = &*pack_arc;
+                        let res = 'decode: {
+                            let entry = match pack.entry(pack_offset) {
+                                Ok(entry) => entry,
+                                Err(err) => break 'decode Err(err.into()),
+                            };
+                            let header_size = entry.header_size();
+                            let res = pack.decode_entry(
+                                entry,
+                                buffer,
+                                inflate,
+                                &|id, _out| {
+                                    let pack_offset = index_file.pack_offset_by_id(id)?;
+                                    pack.entry(pack_offset)
+                                        .ok()
+                                        .map(gix_pack::data::decode::entry::ResolvedBase::InPack)
                                 },
-                                Some(gix_pack::data::entry::Location {
-                                    pack_id: pack.id,
-                                    pack_offset,
-                                    entry_size: r.compressed_size + header_size,
-                                }),
-                            )),
-                            Err(gix_pack::data::decode::Error::DeltaBaseUnresolved(base_id)) => {
-                                // Only with multi-pack indices it's allowed to jump to refer to other packs within this
-                                // multi-pack. Otherwise this would constitute a thin pack which is only allowed in transit.
-                                // However, if we somehow end up with that, we will resolve it safely, even though we could
-                                // avoid handling this case and error instead.
+                                pack_cache,
+                            );
+                            let res = match res {
+                                Ok(r) => Ok((
+                                    (r.kind, pack.object_hash()),
+                                    Some(gix_pack::data::entry::Location {
+                                        pack_id: pack.id,
+                                        pack_offset,
+                                        entry_size: r.compressed_size + header_size,
+                                    }),
+                                )),
+                                Err(gix_pack::data::decode::Error::DeltaBaseUnresolved(base_id)) => {
+                                    // Only with multi-pack indices it's allowed to jump to refer to other packs within this
+                                    // multi-pack. Otherwise this would constitute a thin pack which is only allowed in transit.
+                                    // However, if we somehow end up with that, we will resolve it safely, even though we could
+                                    // avoid handling this case and error instead.
 
-                                // Since this is a special case, we just allocate here to make it work. It's an actual delta-ref object
-                                // which is sent by some servers that points to an object outside of the pack we are looking
-                                // at right now. With the complexities of loading packs, we go into recursion here. Git itself
-                                // doesn't do a cycle check, and we won't either but limit the recursive depth.
-                                // The whole ordeal isn't as efficient as it could be due to memory allocation and
-                                // later mem-copying when trying again.
-                                let mut buf = Vec::new();
-                                let obj_kind = self
-                                    .try_find_cached_inner(
-                                        &base_id,
-                                        &mut buf,
-                                        inflate,
-                                        pack_cache,
-                                        snapshot,
-                                        recursion
-                                            .map(error::DeltaBaseRecursion::inc_depth)
-                                            .or_else(|| error::DeltaBaseRecursion::new(id).into()),
-                                    )
-                                    .map_err(|err| Error::DeltaBaseLookup {
-                                        err: Box::new(err),
-                                        base_id,
-                                        id: id.to_owned(),
-                                    })?
-                                    .ok_or_else(|| Error::DeltaBaseMissing {
-                                        base_id,
-                                        id: id.to_owned(),
-                                    })?
-                                    .0
-                                    .kind;
-                                let handle::index_lookup::Outcome {
-                                    object_index:
-                                        handle::IndexForObjectInPack {
-                                            pack_id: _,
-                                            pack_offset,
-                                        },
-                                    index_file,
-                                    pack: possibly_pack,
-                                } = match snapshot.indices[idx].lookup(id) {
-                                    Some(res) => res,
-                                    None => {
-                                        let mut out = None;
-                                        for index in &mut snapshot.indices {
-                                            out = index.lookup(id);
-                                            if out.is_some() {
-                                                break;
+                                    // Since this is a special case, we just allocate here to make it work. It's an actual delta-ref object
+                                    // which is sent by some servers that points to an object outside of the pack we are looking
+                                    // at right now. With the complexities of loading packs, we go into recursion here. Git itself
+                                    // doesn't do a cycle check, and we won't either but limit the recursive depth.
+                                    // The whole ordeal isn't as efficient as it could be due to memory allocation and
+                                    // later mem-copying when trying again.
+                                    let mut buf = Vec::new();
+                                    let obj_kind = self
+                                        .try_find_cached_inner(
+                                            &base_id,
+                                            &mut buf,
+                                            inflate,
+                                            pack_cache,
+                                            snapshot,
+                                            recursion
+                                                .map(error::DeltaBaseRecursion::inc_depth)
+                                                .or_else(|| error::DeltaBaseRecursion::new(id).into()),
+                                        )
+                                        .map_err(|err| Error::DeltaBaseLookup {
+                                            err: Box::new(err),
+                                            base_id,
+                                            id: id.to_owned(),
+                                        })
+                                        .and_then(|found| {
+                                            found.ok_or_else(|| Error::DeltaBaseMissing {
+                                                base_id,
+                                                id: id.to_owned(),
+                                            })
+                                        });
+                                    let obj_kind = match obj_kind {
+                                        Ok(found) => found.0.kind,
+                                        Err(err) => break 'decode Err(err),
+                                    };
+                                    let handle::index_lookup::Outcome {
+                                        object_index:
+                                            handle::IndexForObjectInPack {
+                                                pack_id: _,
+                                                pack_offset,
+                                            },
+                                        index_file,
+                                        pack: possibly_pack,
+                                    } = match snapshot.indices[idx].lookup(id) {
+                                        Some(res) => res,
+                                        None => {
+                                            let mut out = None;
+                                            for index in &mut snapshot.indices {
+                                                out = index.lookup(id);
+                                                if out.is_some() {
+                                                    break;
+                                                }
                                             }
-                                        }
 
-                                        out.unwrap_or_else(|| {
+                                            out.unwrap_or_else(|| {
                                            panic!("could not find object {id} in any index after looking up one of its base objects {base_id}" )
                                        })
-                                    }
-                                };
-                                let pack = possibly_pack
-                                    .as_ref()
-                                    .expect("pack to still be available like just now");
-                                let entry = pack.entry(pack_offset)?;
-                                let header_size = entry.header_size();
-                                pack.decode_entry(
-                                    entry,
-                                    buffer,
-                                    inflate,
-                                    &|id, out| {
-                                        index_file
-                                            .pack_offset_by_id(id)
-                                            .and_then(|pack_offset| {
-                                                pack.entry(pack_offset)
-                                                    .ok()
-                                                    .map(gix_pack::data::decode::entry::ResolvedBase::InPack)
-                                            })
-                                            .or_else(|| {
-                                                (id == base_id).then(|| {
-                                                    out.resize(buf.len(), 0);
-                                                    out.copy_from_slice(buf.as_slice());
-                                                    gix_pack::data::decode::entry::ResolvedBase::OutOfPack {
-                                                        kind: obj_kind,
-                                                        end: out.len(),
-                                                    }
+                                        }
+                                    };
+                                    let pack = possibly_pack
+                                        .as_ref()
+                                        .expect("pack to still be available like just now");
+                                    let entry = match pack.entry(pack_offset) {
+                                        Ok(entry) => entry,
+                                        Err(err) => break 'decode Err(err.into()),
+                                    };
+                                    let header_size = entry.header_size();
+                                    pack.decode_entry(
+                                        entry,
+                                        buffer,
+                                        inflate,
+                                        &|id, out| {
+                                            index_file
+                                                .pack_offset_by_id(id)
+                                                .and_then(|pack_offset| {
+                                                    pack.entry(pack_offset)
+                                                        .ok()
+                                                        .map(gix_pack::data::decode::entry::ResolvedBase::InPack)
                                                 })
-                                            })
-                                    },
-                                    pack_cache,
-                                )
-                                .map(move |r| {
-                                    (
-                                        gix_object::Data {
-                                            kind: r.kind,
-                                            object_hash: pack.object_hash(),
-                                            data: buffer.as_slice(),
+                                                .or_else(|| {
+                                                    (id == base_id).then(|| {
+                                                        out.resize(buf.len(), 0);
+                                                        out.copy_from_slice(buf.as_slice());
+                                                        gix_pack::data::decode::entry::ResolvedBase::OutOfPack {
+                                                            kind: obj_kind,
+                                                            end: out.len(),
+                                                        }
+                                                    })
+                                                })
                                         },
-                                        Some(gix_pack::data::entry::Location {
-                                            pack_id: pack.id,
-                                            pack_offset,
-                                            entry_size: r.compressed_size + header_size,
-                                        }),
+                                        pack_cache,
                                     )
-                                })
+                                    .map(move |r| {
+                                        (
+                                            (r.kind, pack.object_hash()),
+                                            Some(gix_pack::data::entry::Location {
+                                                pack_id: pack.id,
+                                                pack_offset,
+                                                entry_size: r.compressed_size + header_size,
+                                            }),
+                                        )
+                                    })
+                                }
+                                Err(err) => Err(err),
+                            };
+                            res.map_err(Error::from)
+                        };
+                        match res {
+                            Ok(((kind, object_hash), location)) => {
+                                if idx != 0 {
+                                    snapshot.indices.swap(0, idx);
+                                }
+                                let data = gix_object::Data {
+                                    kind,
+                                    object_hash,
+                                    data: buffer.as_slice(),
+                                };
+                                return Ok(Some((data, location)));
                             }
-                            Err(err) => Err(err),
-                        }?;
-
-                        if idx != 0 {
-                            snapshot.indices.swap(0, idx);
+                            // `packed_object_info()` failed: read the entry again as git does, which
+                            // prints what git prints, and stop asking this source's packs
+                            // (odb/source-packed.c:117-127).
+                            Err(_) => {
+                                failed = Some((pack_arc, pack_offset));
+                                break 'indices;
+                            }
                         }
-                        return Ok(Some(res));
                     }
                 }
+            }
+            if let Some((pack, pack_offset)) = failed {
+                let mut odb = Recover {
+                    handle: self,
+                    snapshot: &mut *snapshot,
+                    inflate: &mut *inflate,
+                    pack: pack.path(),
+                };
+                if let Some((kind, data)) =
+                    self.read_bad_entry(&pack, &mut odb, |p, odb| p.read_object(pack_offset, odb))
+                {
+                    *buffer = data;
+                    return Ok(Some((
+                        gix_object::Data {
+                            kind,
+                            object_hash: pack.object_hash(),
+                            data: buffer.as_slice(),
+                        },
+                        None,
+                    )));
+                }
+                self.store.mark_bad_packed_object(pack.path(), id);
+                bad_pack.get_or_insert_with(|| self.store.pack_name(pack.path()));
+            } else if let Some(new_snapshot) = self.store.load_one_index(self.known_index_ctx(snapshot.marker))? {
+                // `find_pack_entry()` asks every pack a source knows before its loose half is read
+                // (odb/source-files.c:79-96): the indices not loaded yet come first.
+                *snapshot = new_snapshot;
+                self.clear_cache();
+                continue;
             }
 
             for lodb in snapshot.loose_dbs.iter() {
@@ -288,9 +375,155 @@ where
                     *snapshot = new_snapshot;
                     self.clear_cache();
                 }
-                None => return Ok(None),
+                None => match self.second_read(&mut second_read, bad_pack.take(), id)? {
+                    Some(pack) => bad_pack = Some(pack),
+                    None => return Ok(None),
+                },
             }
         }
+    }
+
+    /// The end of `do_oid_object_info_extended()`'s first pass over the sources (odb.c:575-607) for
+    /// an object nothing produced. Without a pack that gave up on it, a second read finds no more
+    /// than the refresh just did, so it is a plain miss. With one, the second read runs once, now
+    /// passing over the object in that pack, and hands `bad_pack` back to keep it; after that the
+    /// answer is that the object is corrupt.
+    pub(super) fn second_read(
+        &self,
+        second_read: &mut bool,
+        bad_pack: Option<String>,
+        id: &gix_hash::oid,
+    ) -> Result<Option<String>, Error> {
+        match bad_pack {
+            None => Ok(None),
+            Some(pack) if !*second_read => {
+                *second_read = true;
+                Ok(Some(pack))
+            }
+            Some(pack) => Err(Error::PackedObjectCorrupt {
+                id: id.to_owned(),
+                pack,
+            }),
+        }
+    }
+
+    /// Read the entry `pack` failed to decode through [`packed_read`](super::packed_read) as git
+    /// reads it, with `odb` answering the reads it makes of the rest of the object database.
+    pub(super) fn read_bad_entry<T>(
+        &self,
+        pack: &gix_pack::data::File,
+        odb: &mut dyn super::packed_read::Odb,
+        read: impl FnOnce(&super::packed_read::Pack<'_>, &mut dyn super::packed_read::Odb) -> Option<T>,
+    ) -> Option<T> {
+        let data = pack.entry_slice(0..pack.data_len() as u64)?;
+        let name = self.store.pack_name(pack.path());
+        let index = gix_pack::index::File::at(pack.path().with_extension("idx"), pack.object_hash()).ok();
+        let p = super::packed_read::Pack {
+            data,
+            name: &name,
+            index,
+            hash: pack.object_hash(),
+        };
+        read(&p, odb)
+    }
+
+    /// The size of `id` as `packed_object_info()` with `sizep` alone computes it (packfile.c:1308-1350),
+    /// which never checks the type: `cat-file -s`'s read (builtin/cat-file.c:154-169). Loose objects and
+    /// entries `gix-pack` decodes answer through [`gix_object::FindHeader`].
+    pub fn try_size(&self, id: &gix_hash::oid) -> Result<Option<u64>, Error> {
+        self.fetch_from_promisor(id);
+        let mut snapshot = self.snapshot.borrow_mut();
+        let id = match self.ignore_replacements {
+            true => id,
+            false => super::access::follow_replacements(&self.store.replacements, id),
+        };
+        let mut bad_pack: Option<String> = None;
+        let mut second_read = false;
+        loop {
+            let mut found: Option<(std::sync::Arc<gix_pack::data::File>, u64)> = None;
+            {
+                let marker = snapshot.marker;
+                for index in snapshot.indices.iter_mut() {
+                    if let Some(handle::index_lookup::Outcome {
+                        object_index: handle::IndexForObjectInPack { pack_id, pack_offset },
+                        pack: possibly_pack,
+                        ..
+                    }) = index.lookup(id)
+                    {
+                        let pack = match possibly_pack {
+                            Some(pack) => &*pack,
+                            None => match self.store.load_pack(pack_id, marker)? {
+                                Some(pack) => {
+                                    *possibly_pack = Some(pack);
+                                    possibly_pack.as_ref().expect("just put it in")
+                                }
+                                None => continue,
+                            },
+                        };
+                        if self.store.is_bad_packed_object(pack.path(), id) {
+                            bad_pack.get_or_insert_with(|| self.store.pack_name(pack.path()));
+                            continue;
+                        }
+                        found = Some((std::sync::Arc::clone(pack), pack_offset));
+                        break;
+                    }
+                }
+            }
+            if let Some((pack, pack_offset)) = found {
+                let mut inflate = self.inflate.borrow_mut();
+                let mut odb = Recover {
+                    handle: self,
+                    snapshot: &mut snapshot,
+                    inflate: &mut inflate,
+                    pack: pack.path(),
+                };
+                if let Some(size) = self.read_bad_entry(&pack, &mut odb, |p, _| p.read_size(pack_offset)) {
+                    return Ok(Some(size));
+                }
+                self.store.mark_bad_packed_object(pack.path(), id);
+                bad_pack.get_or_insert_with(|| self.store.pack_name(pack.path()));
+            } else if let Some(new_snapshot) = self.store.load_one_index(self.known_index_ctx(snapshot.marker))? {
+                // The indices of the packs already known come before the loose objects, as above.
+                *snapshot = new_snapshot;
+                self.clear_cache();
+                continue;
+            }
+            for lodb in snapshot.loose_dbs.iter() {
+                if lodb.contains(id) {
+                    return lodb
+                        .try_header(id)
+                        .map(|hdr| hdr.map(|(size, _kind)| size))
+                        .map_err(Into::into);
+                }
+            }
+            match self.store.load_one_index(self.index_ctx(snapshot.marker))? {
+                Some(new_snapshot) => {
+                    *snapshot = new_snapshot;
+                    self.clear_cache();
+                }
+                None => match self.second_read(&mut second_read, bad_pack.take(), id)? {
+                    Some(pack) => bad_pack = Some(pack),
+                    None => return Ok(None),
+                },
+            }
+        }
+    }
+
+    /// Whether the copy of `id` that `index` names is one `mark_bad_packed_object()` gave up on, which
+    /// `packfile_fill_entry()` and `midx_fill_entry()` then pass over (packfile.c:1846-1853, midx.c:621-626).
+    fn names_bad_copy(&self, index: &mut handle::IndexLookup, id: &gix_hash::oid) -> bool {
+        if self.store.bad_objects.lock().is_empty() {
+            return false;
+        }
+        index
+            .lookup(id)
+            .and_then(|found| {
+                found
+                    .pack
+                    .as_ref()
+                    .map(|pack| self.store.is_bad_packed_object(pack.path(), id))
+            })
+            .unwrap_or(false)
     }
 
     pub(crate) fn clear_cache(&self) {
@@ -329,8 +562,8 @@ where
     fn contains(&self, id: &gix_hash::oid) -> bool {
         let mut snapshot = self.snapshot.borrow_mut();
         loop {
-            for (idx, index) in snapshot.indices.iter().enumerate() {
-                if index.contains(id) {
+            for (idx, index) in snapshot.indices.iter_mut().enumerate() {
+                if index.contains(id) && !self.names_bad_copy(index, id) {
                     if idx != 0 {
                         snapshot.indices.swap(0, idx);
                     }
@@ -364,8 +597,14 @@ where
         self.fetch_from_promisor(id);
         let mut snapshot = self.snapshot.borrow_mut();
         let mut inflate = self.inflate.borrow_mut();
-        self.try_find_cached_inner(id, buffer, &mut inflate, pack_cache, &mut snapshot, None)
-            .map_err(|err| Box::new(err) as _)
+        match self.try_find_cached_inner(id, buffer, &mut inflate, pack_cache, &mut snapshot, None) {
+            // A whole-object read is `odb_read_object()`'s, which asks with `OBJECT_INFO_DIE_IF_CORRUPT`
+            // and dies with the corrupt read's message (odb.c:597-603, 744-758).
+            Err(err @ Error::PackedObjectCorrupt { .. }) if !CORRUPT_READS_AS_ERRORS.get() => {
+                super::packed_read::die(&err.to_string())
+            }
+            res => res.map_err(|err| Box::new(err) as _),
+        }
     }
 
     fn location_by_oid(&self, id: &gix_hash::oid, buf: &mut Vec<u8>) -> Option<gix_pack::data::entry::Location> {
@@ -552,5 +791,52 @@ where
         // uses.
         self.fetch_from_promisor(id);
         gix_pack::Find::contains(self, id)
+    }
+}
+
+/// What [`packed_read`](super::packed_read) asks of the rest of the object database while it reads a bad
+/// entry of `pack`: the reads go through the same handle, and see the objects already marked bad.
+pub(super) struct Recover<'a, S>
+where
+    S: Deref<Target = super::Store> + Clone,
+{
+    pub handle: &'a super::Handle<S>,
+    pub snapshot: &'a mut load_index::Snapshot,
+    pub inflate: &'a mut gix_zlib::Inflate,
+    pub pack: &'a std::path::Path,
+}
+
+impl<S> super::packed_read::Odb for Recover<'_, S>
+where
+    S: Deref<Target = super::Store> + Clone,
+{
+    fn read_type(&mut self, id: &gix_hash::oid) -> Option<gix_object::Kind> {
+        // `odb_read_object_info()` follows replacements (odb.c:722-735).
+        self.handle
+            .try_header_inner(id, self.inflate, self.snapshot, None)
+            .ok()
+            .flatten()
+            .map(|hdr| hdr.kind())
+    }
+
+    fn read_object(&mut self, id: &gix_hash::oid) -> Option<(gix_object::Kind, Vec<u8>)> {
+        // `unpack_entry()` asks with no flags, so no replacement is followed (packfile.c:1617-1628).
+        let mut buf = Vec::new();
+        self.handle
+            .try_find_cached_inner(
+                id,
+                &mut buf,
+                self.inflate,
+                &mut gix_pack::cache::Never,
+                self.snapshot,
+                Some(error::DeltaBaseRecursion::new(id)),
+            )
+            .ok()
+            .flatten()
+            .map(|(obj, _)| (obj.kind, obj.data.to_vec()))
+    }
+
+    fn mark_bad(&mut self, id: &gix_hash::oid) {
+        self.handle.store.mark_bad_packed_object(self.pack, id);
     }
 }

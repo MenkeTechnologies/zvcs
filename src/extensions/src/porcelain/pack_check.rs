@@ -56,6 +56,7 @@ pub(super) fn verify_pack(
     idx_bytes: &[u8],
     pack_bytes: &[u8],
     pack_name: &str,
+    pack_path: &std::path::Path,
     out: &mut PackCheck,
 ) {
     let hash = repo.object_hash();
@@ -103,7 +104,7 @@ pub(super) fn verify_pack(
         .chain(std::iter::once(pack_sig_ofs as u64))
         .collect();
 
-    let reader = Reader { repo, index, pack: pack_bytes, pack_name, hash };
+    let reader = Reader { repo, index, pack: pack_bytes, pack_name, pack_path, hash };
     for (&(offset, nr), &end) in entries.iter().zip(&ends) {
         let oid = index.oid_at_index(nr).to_owned();
         // `check_pack_crc()` for a v2 index (pack-check.c:108-117).
@@ -148,6 +149,8 @@ struct Reader<'a> {
     index: &'a pack::index::File,
     pack: &'a [u8],
     pack_name: &'a str,
+    /// The `.pack` file, which names this pack to the object database's `bad_objects`.
+    pack_path: &'a std::path::Path,
     hash: gix::hash::Kind,
 }
 
@@ -299,6 +302,7 @@ impl Reader<'_> {
                         self.pack_name
                     ));
                     out.bad.insert(base_oid);
+                    self.repo.objects.store_ref().mark_bad_packed_object(self.pack_path, &base_oid);
                     base = self.elsewhere(base_oid).map(|(k, d)| {
                         final_kind = Some(k);
                         d
@@ -335,7 +339,9 @@ impl Reader<'_> {
     /// other copy the odb has, which for a base marked bad here means a loose
     /// object or another pack.
     fn elsewhere(&self, id: ObjectId) -> Option<(Kind, Vec<u8>)> {
-        let object = self.repo.find_object(id).ok()?;
+        // `odb_read_object_info_extended()` with no flags, which does not die on a corrupt answer
+        // (packfile.c:1617-1628).
+        let object = gix::odb::store::find::with_corrupt_reads_as_errors(|| self.repo.find_object(id)).ok()?;
         Some((object.kind, object.data.clone()))
     }
 }
@@ -351,83 +357,9 @@ fn base_kind(kind: i32) -> Option<Kind> {
     }
 }
 
-/// `get_delta_hdr_size()` (delta.h:89-102).
-fn delta_hdr_size(data: &[u8], at: &mut usize) -> usize {
-    let mut size = 0usize;
-    let mut shift = 0u32;
-    loop {
-        let cmd = data[*at];
-        *at += 1;
-        if shift < usize::BITS {
-            size |= usize::from(cmd & 0x7f) << shift;
-        }
-        shift += 7;
-        if cmd & 0x80 == 0 || *at >= data.len() {
-            return size;
-        }
-    }
-}
-
 /// `patch_delta()` (patch-delta.c:15-96): the delta applied to `base`, or
 /// `Err` for a delta that does not fit it, carrying the one `error()` git
 /// prints for it, if any. Shared with `unpack-objects`.
 pub(super) fn patch_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, Option<&'static str>> {
-    const DELTA_SIZE_MIN: usize = 4;
-    if delta.len() < DELTA_SIZE_MIN {
-        return Err(None);
-    }
-    let mut at = 0usize;
-    if delta_hdr_size(delta, &mut at) != base.len() {
-        return Err(None);
-    }
-    let mut size = delta_hdr_size(delta, &mut at);
-    let mut dst = Vec::with_capacity(size);
-    const GONE_WILD: Result<Vec<u8>, Option<&str>> = Err(Some("delta replay has gone wild"));
-    while at < delta.len() {
-        let cmd = delta[at];
-        at += 1;
-        if cmd & 0x80 != 0 {
-            let (mut cp_off, mut cp_size) = (0usize, 0usize);
-            for (bit, shift, is_off) in [
-                (0x01, 0, true),
-                (0x02, 8, true),
-                (0x04, 16, true),
-                (0x08, 24, true),
-                (0x10, 0, false),
-                (0x20, 8, false),
-                (0x40, 16, false),
-            ] {
-                if cmd & bit != 0 {
-                    let Some(&b) = delta.get(at) else { return GONE_WILD };
-                    at += 1;
-                    let v = usize::from(b) << shift;
-                    if is_off { cp_off |= v } else { cp_size |= v }
-                }
-            }
-            if cp_size == 0 {
-                cp_size = 0x10000;
-            }
-            match cp_off.checked_add(cp_size) {
-                Some(end) if end <= base.len() && cp_size <= size => {
-                    dst.extend_from_slice(&base[cp_off..end]);
-                    size -= cp_size;
-                }
-                _ => return GONE_WILD,
-            }
-        } else if cmd != 0 {
-            let n = usize::from(cmd);
-            if n > size || n > delta.len() - at {
-                return GONE_WILD;
-            }
-            dst.extend_from_slice(&delta[at..at + n]);
-            at += n;
-            size -= n;
-        } else {
-            return Err(Some("unexpected delta opcode 0"));
-        }
-    }
-    if size != 0 {
-        return GONE_WILD;
-    }
-    Ok(dst)
+    gix::odb::store::patch_delta_quiet(base, delta)
 }

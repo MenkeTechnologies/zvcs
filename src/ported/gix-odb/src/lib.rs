@@ -177,6 +177,15 @@ pub struct Store {
     /// The hook that fetches objects which are missing locally from a *promisor remote*, installed by
     /// the caller that knows how to talk to one. See [`Store::set_promisor()`].
     promisor: std::sync::OnceLock<store::PromisorFetchFn>,
+
+    /// `struct packed_git`'s `bad_objects` (packfile.h:24) for every pack read through this store, by the
+    /// pack's path: the objects `mark_bad_packed_object()` gave up on in that pack, which every later
+    /// lookup there passes over (packfile.c:1846-1853, midx.c:621-626).
+    pub(crate) bad_objects:
+        parking_lot::Mutex<std::collections::HashMap<PathBuf, std::collections::HashSet<gix_hash::ObjectId>>>,
+    /// The working tree git chdir()s to, against which `p->pack_name` is spelled. See
+    /// [`Store::set_pack_name_root()`].
+    pack_name_root: std::sync::OnceLock<PathBuf>,
 }
 
 /// Create a new cached handle to the object store with support for additional options.

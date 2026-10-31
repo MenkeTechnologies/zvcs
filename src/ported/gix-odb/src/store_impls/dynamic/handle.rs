@@ -323,6 +323,17 @@ where
         }
     }
 
+    /// [`Self::index_ctx()`] without the disk refresh: it loads the indices of the packs already known,
+    /// which `find_pack_entry()` asks before the loose half of a source is read
+    /// (odb/source-files.c:79-96, odb/source-packed.c:31-46).
+    pub(crate) fn known_index_ctx(&self, marker: types::SlotIndexMarker) -> super::IndexCtx {
+        super::IndexCtx {
+            refresh_mode: super::RefreshMode::Never,
+            marker,
+            loose_compression: self.loose_compression,
+        }
+    }
+
     /// Call once if pack ids are stored and later used for lookup, meaning they should always remain mapped and not be unloaded
     /// even if they disappear from disk.
     /// This must be called if there is a chance that git maintenance is happening while a pack is created.

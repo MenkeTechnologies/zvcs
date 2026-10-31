@@ -30,10 +30,15 @@ where
             id = super::access::follow_replacements(&self.store.replacements, id);
         }
 
+        // `do_oid_object_info_extended()` (odb.c:541-616): the pack the first corrupt read names, and
+        // whether the second read, which every miss gets, has run.
+        let mut bad_pack: Option<String> = None;
+        let mut second_read = false;
         'outer: loop {
+            let mut failed: Option<(std::sync::Arc<gix_pack::data::File>, u64)> = None;
             {
                 let marker = snapshot.marker;
-                for (idx, index) in snapshot.indices.iter_mut().enumerate() {
+                'indices: for (idx, index) in snapshot.indices.iter_mut().enumerate() {
                     if let Some(handle::index_lookup::Outcome {
                         object_index: handle::IndexForObjectInPack { pack_id, pack_offset },
                         index_file,
@@ -41,11 +46,11 @@ where
                     }) = index.lookup(id)
                     {
                         let pack = match possibly_pack {
-                            Some(pack) => pack,
+                            Some(pack) => &*pack,
                             None => match self.store.load_pack(pack_id, marker)? {
                                 Some(pack) => {
                                     *possibly_pack = Some(pack);
-                                    possibly_pack.as_deref().expect("just put it in")
+                                    possibly_pack.as_ref().expect("just put it in")
                                 }
                                 None => {
                                     // The pack wasn't available anymore so we are supposed to try another round with a fresh index
@@ -65,94 +70,153 @@ where
                                 }
                             },
                         };
-                        let entry = pack.entry(pack_offset)?;
-                        let res = match pack.decode_header(entry, inflate, &|id| {
-                            index_file.pack_offset_by_id(id).and_then(|pack_offset| {
-                                pack.entry(pack_offset)
-                                    .ok()
-                                    .map(gix_pack::data::decode::header::ResolvedBase::InPack)
-                            })
-                        }) {
-                            Ok(header) => Ok(header.into()),
-                            Err(gix_pack::data::decode::Error::DeltaBaseUnresolved(base_id)) => {
-                                // Only with multi-pack indices it's allowed to jump to refer to other packs within this
-                                // multi-pack. Otherwise this would constitute a thin pack which is only allowed in transit.
-                                // However, if we somehow end up with that, we will resolve it safely, even though we could
-                                // avoid handling this case and error instead.
-                                let hdr = self
-                                    .try_header_inner(
-                                        &base_id,
-                                        inflate,
-                                        snapshot,
-                                        recursion
-                                            .map(DeltaBaseRecursion::inc_depth)
-                                            .or_else(|| DeltaBaseRecursion::new(id).into()),
-                                    )
-                                    .map_err(|err| Error::DeltaBaseLookup {
-                                        err: Box::new(err),
-                                        base_id,
-                                        id: id.to_owned(),
-                                    })?
-                                    .ok_or_else(|| Error::DeltaBaseMissing {
-                                        base_id,
-                                        id: id.to_owned(),
-                                    })?;
-                                let handle::index_lookup::Outcome {
-                                    object_index:
-                                        handle::IndexForObjectInPack {
-                                            pack_id: _,
-                                            pack_offset,
-                                        },
-                                    index_file,
-                                    pack: possibly_pack,
-                                } = match snapshot.indices[idx].lookup(id) {
-                                    Some(res) => res,
-                                    None => {
-                                        let mut out = None;
-                                        for index in &mut snapshot.indices {
-                                            out = index.lookup(id);
-                                            if out.is_some() {
-                                                break;
+                        // `packfile_fill_entry()` and `midx_fill_entry()` pass over an object marked
+                        // bad in this pack, which then names a corrupt answer (packfile.c:1846-1853,
+                        // midx.c:621-626).
+                        if self.store.is_bad_packed_object(pack.path(), id) {
+                            bad_pack.get_or_insert_with(|| self.store.pack_name(pack.path()));
+                            continue 'indices;
+                        }
+                        let pack_arc = std::sync::Arc::clone(pack);
+                        let pack = &*pack_arc;
+                        let res = 'decode: {
+                            let entry = match pack.entry(pack_offset) {
+                                Ok(entry) => entry,
+                                Err(err) => break 'decode Err(err.into()),
+                            };
+                            let res = match pack.decode_header(entry, inflate, &|id| {
+                                index_file.pack_offset_by_id(id).and_then(|pack_offset| {
+                                    pack.entry(pack_offset)
+                                        .ok()
+                                        .map(gix_pack::data::decode::header::ResolvedBase::InPack)
+                                })
+                            }) {
+                                Ok(header) => Ok(header.into()),
+                                Err(gix_pack::data::decode::Error::DeltaBaseUnresolved(base_id)) => {
+                                    // Only with multi-pack indices it's allowed to jump to refer to other packs within this
+                                    // multi-pack. Otherwise this would constitute a thin pack which is only allowed in transit.
+                                    // However, if we somehow end up with that, we will resolve it safely, even though we could
+                                    // avoid handling this case and error instead.
+                                    let hdr = self
+                                        .try_header_inner(
+                                            &base_id,
+                                            inflate,
+                                            snapshot,
+                                            recursion
+                                                .map(DeltaBaseRecursion::inc_depth)
+                                                .or_else(|| DeltaBaseRecursion::new(id).into()),
+                                        )
+                                        .map_err(|err| Error::DeltaBaseLookup {
+                                            err: Box::new(err),
+                                            base_id,
+                                            id: id.to_owned(),
+                                        })
+                                        .and_then(|found| {
+                                            found.ok_or_else(|| Error::DeltaBaseMissing {
+                                                base_id,
+                                                id: id.to_owned(),
+                                            })
+                                        });
+                                    let hdr = match hdr {
+                                        Ok(hdr) => hdr,
+                                        Err(err) => break 'decode Err(err),
+                                    };
+                                    let handle::index_lookup::Outcome {
+                                        object_index:
+                                            handle::IndexForObjectInPack {
+                                                pack_id: _,
+                                                pack_offset,
+                                            },
+                                        index_file,
+                                        pack: possibly_pack,
+                                    } = match snapshot.indices[idx].lookup(id) {
+                                        Some(res) => res,
+                                        None => {
+                                            let mut out = None;
+                                            for index in &mut snapshot.indices {
+                                                out = index.lookup(id);
+                                                if out.is_some() {
+                                                    break;
+                                                }
                                             }
-                                        }
 
-                                        out.unwrap_or_else(|| {
+                                            out.unwrap_or_else(|| {
                                             panic!("could not find object {id} in any index after looking up one of its base objects {base_id}")
                                         })
-                                    }
-                                };
-                                let pack = possibly_pack
-                                    .as_ref()
-                                    .expect("pack to still be available like just now");
-                                let entry = pack.entry(pack_offset)?;
-                                pack.decode_header(entry, inflate, &|id| {
-                                    index_file
-                                        .pack_offset_by_id(id)
-                                        .and_then(|pack_offset| {
-                                            pack.entry(pack_offset)
-                                                .ok()
-                                                .map(gix_pack::data::decode::header::ResolvedBase::InPack)
-                                        })
-                                        .or_else(|| {
-                                            (id == base_id).then(|| {
-                                                gix_pack::data::decode::header::ResolvedBase::OutOfPack {
-                                                    kind: hdr.kind(),
-                                                    num_deltas: hdr.num_deltas(),
-                                                }
+                                        }
+                                    };
+                                    let pack = possibly_pack
+                                        .as_ref()
+                                        .expect("pack to still be available like just now");
+                                    let entry = match pack.entry(pack_offset) {
+                                        Ok(entry) => entry,
+                                        Err(err) => break 'decode Err(err.into()),
+                                    };
+                                    pack.decode_header(entry, inflate, &|id| {
+                                        index_file
+                                            .pack_offset_by_id(id)
+                                            .and_then(|pack_offset| {
+                                                pack.entry(pack_offset)
+                                                    .ok()
+                                                    .map(gix_pack::data::decode::header::ResolvedBase::InPack)
                                             })
-                                        })
-                                })
-                                .map(Into::into)
+                                            .or_else(|| {
+                                                (id == base_id).then(|| {
+                                                    gix_pack::data::decode::header::ResolvedBase::OutOfPack {
+                                                        kind: hdr.kind(),
+                                                        num_deltas: hdr.num_deltas(),
+                                                    }
+                                                })
+                                            })
+                                    })
+                                    .map(Into::into)
+                                }
+                                Err(err) => Err(err),
+                            };
+                            res.map_err(Error::from)
+                        };
+                        match res {
+                            Ok(res) => {
+                                if idx != 0 {
+                                    snapshot.indices.swap(0, idx);
+                                }
+                                return Ok(Some(res));
                             }
-                            Err(err) => Err(err),
-                        }?;
-
-                        if idx != 0 {
-                            snapshot.indices.swap(0, idx);
+                            // `packed_object_info()` failed: read the entry again as git does, which
+                            // prints what git prints, and stop asking this source's packs
+                            // (odb/source-packed.c:117-127).
+                            Err(_) => {
+                                failed = Some((pack_arc, pack_offset));
+                                break 'indices;
+                            }
                         }
-                        return Ok(Some(res));
                     }
                 }
+            }
+            if let Some((pack, pack_offset)) = failed {
+                let mut odb = super::find::Recover {
+                    handle: self,
+                    snapshot: &mut *snapshot,
+                    inflate: &mut *inflate,
+                    pack: pack.path(),
+                };
+                if let Some((kind, size)) =
+                    self.read_bad_entry(&pack, &mut odb, |p, odb| p.read_header(pack_offset, odb))
+                {
+                    return Ok(Some(Header::Packed(gix_pack::data::decode::header::Outcome {
+                        kind,
+                        object_size: size,
+                        num_deltas: 0,
+                    })));
+                }
+                self.store.mark_bad_packed_object(pack.path(), id);
+                bad_pack.get_or_insert_with(|| self.store.pack_name(pack.path()));
+            } else if let Some(new_snapshot) = self.store.load_one_index(self.known_index_ctx(snapshot.marker))? {
+                // `find_pack_entry()` asks every pack a source knows before its loose half is read
+                // (odb/source-files.c:79-96): the indices not loaded yet come first.
+                *snapshot = new_snapshot;
+                self.clear_cache();
+                continue 'outer;
             }
 
             for lodb in snapshot.loose_dbs.iter() {
@@ -167,7 +231,10 @@ where
                     *snapshot = new_snapshot;
                     self.clear_cache();
                 }
-                None => return Ok(None),
+                None => match self.second_read(&mut second_read, bad_pack.take(), id)? {
+                    Some(pack) => bad_pack = Some(pack),
+                    None => return Ok(None),
+                },
             }
         }
     }

@@ -698,6 +698,23 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
                 Ok(ExitCode::from(1))
             }
         }
+        // `case 's'` without `--use-mailmap` asks for `sizep` alone (builtin/cat-file.c:170-187),
+        // which `packed_object_info()` answers from the entry's header without ever checking its type
+        // (packfile.c:1330-1350).
+        Mode::Size if !use_mailmap => {
+            // The empty tree is the in-memory source's, asked ahead of every other one
+            // (odb/source-inmemory.c:15-34, odb.c:557-558).
+            let size = match oid == gix::hash::ObjectId::empty_tree(oid.kind()) {
+                true => Ok(Some(0)),
+                false => repo.objects.try_size(&oid),
+            };
+            let Ok(Some(size)) = size else {
+                eprintln!("fatal: git cat-file: could not get object info");
+                return Ok(ExitCode::from(128));
+            };
+            println!("{size}");
+            Ok(ExitCode::SUCCESS)
+        }
         Mode::Type | Mode::Size => {
             let Ok(header) = repo.find_header(oid) else {
                 eprintln!("fatal: git cat-file: could not get object info");
@@ -716,6 +733,12 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Mode::Print => {
+            // `case 'p'` asks `odb_read_object_info()` for the type first, and only then reads the
+            // object, through `odb_read_object()`, which dies on a corrupt one (builtin/cat-file.c:214-236).
+            if repo.find_header(oid).is_err() {
+                eprintln!("fatal: Not a valid object name {spec}");
+                return Ok(ExitCode::from(128));
+            }
             let Ok(object) = repo.find_object(oid) else {
                 eprintln!("fatal: Not a valid object name {spec}");
                 return Ok(ExitCode::from(128));

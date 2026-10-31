@@ -604,19 +604,26 @@ impl ThreadSafeRepository {
         // Repositories spawned off this one (other worktrees) are `repo_init()`'s, not setup's.
         options.honor_object_directory_env = false;
 
+        let objects = gix_odb::Store::at_opts(
+            objects_dir,
+            &mut replacements.into_iter(),
+            gix_odb::store::init::Options {
+                slots: object_store_slots,
+                object_hash: config.object_hash,
+                use_multi_pack_index: config.use_multi_pack_index,
+                alloc_limit_bytes: config.alloc_limit_bytes,
+                loose_compression: config.loose_compression,
+                current_dir: current_dir.to_owned().into(),
+            },
+        )?;
+        // `setup_git_directory()` chdir()s to the top of the working tree, so `p->pack_name` is spelled
+        // from there (setup.c:1221-1227).
+        if let Some(worktree_dir) = worktree_dir.as_deref() {
+            objects.set_pack_name_root(worktree_dir.to_owned());
+        }
+
         Ok(ThreadSafeRepository {
-            objects: OwnShared::new(gix_odb::Store::at_opts(
-                objects_dir,
-                &mut replacements.into_iter(),
-                gix_odb::store::init::Options {
-                    slots: object_store_slots,
-                    object_hash: config.object_hash,
-                    use_multi_pack_index: config.use_multi_pack_index,
-                    alloc_limit_bytes: config.alloc_limit_bytes,
-                    loose_compression: config.loose_compression,
-                    current_dir: current_dir.to_owned().into(),
-                },
-            )?),
+            objects: OwnShared::new(objects),
             common_dir,
             refs,
             work_tree: worktree_dir,

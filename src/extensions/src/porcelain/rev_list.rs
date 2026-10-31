@@ -5911,7 +5911,9 @@ fn process_blob(
     }
     let shown = match r & LOFR_DO_SHOW != 0 {
         true => {
-            let exists = trav.repo.find_header(id).is_ok();
+            // `finish_object()` asks `odb_read_object_info_extended()` with no `object_info`, which
+            // finds the object without reading it (builtin/rev-list.c:384-395).
+            let exists = trav.repo.has_object(id);
             show_object(trav, id, path, gix::object::Kind::Blob, exists)
         }
         false => Ok(()),
@@ -5937,6 +5939,14 @@ fn process_tree(
 ) -> Result<(), ExitCode> {
     if trav.seen.contains(&id) {
         return Ok(());
+    }
+    // `parse_tree_gently()`'s `odb_read_object()` dies on a tree only a pack that gave up on it
+    // holds (odb.c:597-603), and the listing written so far is flushed on the way out, which the
+    // walk's caller does for this port.
+    if let Err(err) = gix::odb::store::find::with_corrupt_reads_as_errors(|| trav.repo.find_object(id)) {
+        if let Some(msg) = super::fsck::corrupt_packed_message(&err) {
+            return Err(fatal(&msg));
+        }
     }
     // The entries are collected first so the tree borrow ends before recursing.
     let entries: Option<Vec<(ObjectId, Vec<u8>, gix::object::tree::EntryMode)>> =

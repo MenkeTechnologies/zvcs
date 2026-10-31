@@ -725,6 +725,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // set, so `parse_commit_buffer()`/`parse_tag_buffer()` return at once and
     // create nothing (commit.c:527-528, tag.c:146-147).
     let mut scan_parsed: HashSet<ObjectId> = HashSet::new();
+    let mut scan_packs = ScanPacks::default();
     let mut scanned: HashSet<ObjectId> = HashSet::new();
     for &ScanVisit { id, loose } in &visits {
         if opt.connectivity_only {
@@ -749,7 +750,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
         // `fsck_loose()` reads the object out of the odb first of all. Every
         // failure of that read is reported and stepped over.
-        let (kind, data) = match read_for_fsck(&repo, id) {
+        let (kind, data) = match read_for_fsck(&repo, &mut scan_packs, id) {
             Ok(read) => read,
             Err(lines) => {
                 let slot = Slot::Scan(id.as_bytes()[0]);
@@ -1377,7 +1378,17 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // `parse_commit()` failing, which is where git gives up. Its own
                 // diagnostic ahead of this line names the specific odb failure and
                 // is not reproduced.
-                Err(_) => match expected {
+                Err(err) => match expected {
+                    // `parse_object()` follows its failed `odb_read_object_info()` with `odb_read_object()`,
+                    // which dies on an object only a pack that gave up on it holds (object.c:345-378,
+                    // odb.c:597-603), flushing what stdout holds.
+                    _ if expected != Some(Kind::Blob) && corrupt_packed_message(&err).is_some() => {
+                        print_held_stdout(&scan_lines, &broken_links);
+                        match repo.find_object(id) {
+                            Ok(object) => object.kind,
+                            Err(_) => break 'traverse,
+                        }
+                    }
                     Some(Kind::Blob) | None => break 'traverse,
                     Some(_) => {
                         let path = loose_object_label(&repo, id)
@@ -2369,6 +2380,18 @@ fn walk_parse_commit(
     }
 }
 
+/// The message of a read that failed because the object is only in packs that gave up on it, the
+/// answer `odb_read_object()` dies on (odb.c:597-603).
+pub(crate) fn corrupt_packed_message(err: &gix::object::find::existing::Error) -> Option<String> {
+    match err {
+        gix::object::find::existing::Error::Find(inner) => match inner.downcast_ref::<gix::odb::store::find::Error>() {
+            Some(e @ gix::odb::store::find::Error::PackedObjectCorrupt { .. }) => Some(e.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// What `die()` flushes when it ends the walk: the stdout lines `fsck_obj()` and
 /// `mark_object()` wrote so far, which this port still holds.
 fn print_held_stdout(scan_lines: &[(ObjectId, String)], broken_links: &[String]) {
@@ -3080,7 +3103,7 @@ fn verify_packs(repo: &gix::Repository) -> super::pack_check::PackCheck {
                 continue;
             };
             let pack_name = loose_label_of(repo, &data_path);
-            super::pack_check::verify_pack(repo, &index, &idx_bytes, &pack_bytes, &pack_name, &mut check);
+            super::pack_check::verify_pack(repo, &index, &idx_bytes, &pack_bytes, &pack_name, &data_path, &mut check);
         }
     }
     check
@@ -3508,16 +3531,58 @@ fn strerror(e: &std::io::Error) -> String {
 /// `error:` lines git prints before setting `ERROR_OBJECT` and moving on to the
 /// next object — neither path aborts the walk, which is the whole point of
 /// `git fsck` on a damaged repository.
-fn read_for_fsck(repo: &gix::Repository, id: ObjectId) -> Result<(Kind, Vec<u8>), Vec<String>> {
+fn read_for_fsck(repo: &gix::Repository, scan_packs: &mut ScanPacks, id: ObjectId) -> Result<(Kind, Vec<u8>), Vec<String>> {
     if let Some(path) = loose_object_path(repo, id) {
         let label = loose_label_of(repo, &path);
         return read_loose_object(&path, &label, id);
     }
     // A packed object git reads through `verify_packfile()`, whose per-object
     // failures surface as `fsck_obj_buffer()`'s pathless line.
+    if let Some(read) = scan_packs.read(repo, id) {
+        return read.ok_or_else(|| vec![format!("error: {id}: object corrupt or missing")]);
+    }
     match repo.find_object(id) {
         Ok(o) => Ok((o.kind, o.data.clone())),
         Err(_) => Err(vec![format!("error: {id}: object corrupt or missing")]),
+    }
+}
+
+/// The packs `verify_pack()` hands the scan its packed objects from: each pack is read through its own
+/// `.idx` (pack-check.c:52-70, 183-196), so a multi-pack-index plays no part in what the scan reads, and
+/// an offset a damaged one gets wrong is only met by the reads of the walk after it.
+#[derive(Default)]
+struct ScanPacks {
+    bundles: Option<Vec<gix::odb::pack::Bundle>>,
+    inflate: gix::zlib::Inflate,
+}
+
+impl ScanPacks {
+    /// The first pack copy of `id`, `Some(None)` when that copy will not decode, `None` when no pack
+    /// holds it.
+    fn read(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<Option<(Kind, Vec<u8>)>> {
+        let bundles = self.bundles.get_or_insert_with(|| {
+            let hash = repo.object_hash();
+            let mut out = Vec::new();
+            for objdir in odb_sources(repo) {
+                let Ok(rd) = std::fs::read_dir(objdir.join("pack")) else { continue };
+                let mut idx: Vec<PathBuf> = rd
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "idx") && p.with_extension("pack").is_file())
+                    .collect();
+                idx.sort();
+                out.extend(idx.iter().filter_map(|p| gix::odb::pack::Bundle::at(p, hash).ok()));
+            }
+            out
+        });
+        let bundle = bundles.iter().find(|b| b.index.lookup(id).is_some())?;
+        let mut buf = Vec::new();
+        Some(
+            bundle
+                .find(&id, &mut buf, &mut self.inflate, &mut gix::odb::pack::cache::Never)
+                .ok()
+                .flatten()
+                .map(|(obj, _)| (obj.kind, obj.data.to_vec())),
+        )
     }
 }
 

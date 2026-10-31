@@ -5292,17 +5292,21 @@ fn collect_tree_worktree(
                 let deleted = matches!(change, ChangeRef::Deletion { .. });
                 let (loc, _, entry_mode, oid) = change.fields();
                 let (location, id) = (loc.to_owned(), oid.to_owned());
-                match if deleted { None } else { index_mode_kind(entry_mode) } {
-                    // A gitlink the index already moved: the worktree pass below
+                // `show_modified()` takes the post-image from `get_stat_data()` of the
+                // index entry (diff-lib.c:315-347, :399), so a worktree side for the
+                // path always wins over the index side. gix runs the tree↔index and
+                // index↔worktree passes on two threads whose items arrive in either
+                // order, so the index side only fills a path the worktree pass has
+                // not already claimed; inserting it unconditionally let a late
+                // tree↔index item overwrite the file and print the index id.
+                let side = match if deleted { None } else { index_mode_kind(entry_mode) } {
+                    // A gitlink the index already moved: the worktree pass
                     // overrides this with the submodule's checked-out `HEAD` when
                     // the two disagree.
-                    Some(k) => {
-                        new_sides.insert(location, (NewSide::Blob(id, k), 0, None));
-                    }
-                    None => {
-                        new_sides.insert(location, (NewSide::Absent, 0, None));
-                    }
-                }
+                    Some(k) => NewSide::Blob(id, k),
+                    None => NewSide::Absent,
+                };
+                new_sides.entry(location).or_insert((side, 0, None));
             }
             gix::status::Item::IndexWorktree(item) => {
                 if let Some((path, new, dirty, head)) = worktree_new_side(repo.workdir(), mode_rules, item)? {

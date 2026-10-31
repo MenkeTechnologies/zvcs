@@ -39,7 +39,8 @@ impl Response {
     /// and more localized without having to support all the cruft that there is.
     ///
     /// `wants_to_negotiate` should be `false` for clones which is when we don't have sent any haves. The reason for this flag to exist
-    /// is to predict how to parse V1 output only, and neither `client_expects_pack` nor `wants_to_negotiate` are relevant for V2.
+    /// is to predict how to parse V1 output only. For V2, `client_expects_pack` only names the section a response that stops
+    /// short was expected to begin with.
     /// This ugliness is in place to avoid having to resort to an [an even more complex ugliness](https://github.com/git/git/blob/9e49351c3060e1fa6e0d2de64505b7becf157f28/fetch-pack.c#L583-L594)
     /// that `git` has to use to predict how many acks are supposed to be read. We also genuinely hope that this covers it all….
     pub fn from_line_reader<'a>(
@@ -64,7 +65,14 @@ impl Response {
                         // [a lot](https://github.com/git/git/blob/9e49351c3060e1fa6e0d2de64505b7becf157f28/fetch-pack.c#L583-L594)
                         // to deal with this correctly.
                         // For now this is acceptable, as V2 can be used as a workaround, which also is the default.
-                        Some(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => break 'lines false,
+                        // Not where a refused `POST` left the response, though: fetch-pack reads it without
+                        // `PACKET_READ_GENTLE_ON_EOF` and dies at that end (fetch-pack.c:372-374, pkt-line.c:364-372).
+                        Some(Err(err))
+                            if err.kind() == io::ErrorKind::UnexpectedEof
+                                && gix_transport::client::RpcEnded::find(&err).is_none() =>
+                        {
+                            break 'lines false;
+                        }
                         Some(Err(err)) => return Err(err.into()),
                         Some(Ok(Err(err))) => return Err(err.into()),
                         None => {
@@ -119,8 +127,23 @@ impl Response {
                 let mut acks = Vec::<Acknowledgement>::new();
                 let mut shallows = Vec::<ShallowUpdate>::new();
                 let mut wanted_refs = Vec::<WantedRef>::new();
+                // The section `do_fetch_pack_v2()` insists on next (fetch-pack.c:1791, :1833): `acknowledgments`
+                // answers a round without `done`, and everything after it, like the answer to `done`, leads up
+                // to `packfile`.
+                let mut expected = if client_expects_pack {
+                    "packfile"
+                } else {
+                    "acknowledgments"
+                };
                 let has_pack = 'section: loop {
                     line.clear();
+                    // `process_section_header()` dies when the reader is not at a data line (fetch-pack.c:1469-1479),
+                    // which is where a refused `POST` leaves it: at the `0002` remote-curl writes in place of the
+                    // response (remote-curl.c:1086-1087). The end of the stream is the reader's own `die()`.
+                    if reader.peek_data_line().is_none() {
+                        return Err(response::Error::ExpectedSection { section: expected });
+                    }
+                    expected = "packfile";
                     if reader.readline_str(&mut line)? == 0 {
                         return Err(response::Error::Io(io::Error::new(
                             io::ErrorKind::UnexpectedEof,

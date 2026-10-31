@@ -211,3 +211,45 @@ mod error {
 }
 
 pub use error::{Error, HangUp};
+
+/// What the process reading a `POST`'s response finds once that `POST` failed: the end of its pipe.
+///
+/// git runs remote-curl as a child of the command, and runs `send-pack` or `fetch-pack` as remote-curl's child
+/// for protocol v0/v1 (`rpc_service()`, remote-curl.c:1094-1167). A failed `POST` never reaches that reader as an
+/// error. remote-curl has already said what went wrong (`run_slot()`'s `RPC failed`, remote-curl.c:848-876, or the
+/// `die()` of a `credential_fill()` that got no answer). For v0/v1 it closes the reader's input and drains its
+/// output (remote-curl.c:1143-1151). For v2 `stateless_connect()` writes one `packet_response_end()` and stops
+/// (remote-curl.c:1086-1087, :1534-1536). So the reader sees end of file, after a `0002` for a v2 request where
+/// remote-curl lived to write one. Whatever the reader says next comes from its own `PACKET_READ_EOF` handling.
+///
+/// This is the inner error of the `std::io::Error` of kind [`UnexpectedEof`][std::io::ErrorKind::UnexpectedEof]
+/// that ends such a response. The kind is what every packet-line reader takes for end of file, and this payload
+/// says whether remote-curl survived. The parent of a dead remote-curl finds no answer to its command
+/// (`recvline()` reads EOF, transport-helper.c:71-85), while one that survived answers with an empty status
+/// list and exits 128 (`parse_push()`, remote-curl.c:1430-1456).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcEnded {
+    /// remote-curl itself died while handling the request, as `credential_fill()` does when no helper answers
+    /// and the terminal prompt is disabled.
+    pub helper_died: bool,
+}
+
+impl RpcEnded {
+    /// The `std::io::Error` a reader of the response gets in place of more data.
+    pub fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, self)
+    }
+
+    /// The `RpcEnded` that ended a response, if `err` is that end.
+    pub fn find(err: &std::io::Error) -> Option<RpcEnded> {
+        err.get_ref()?.downcast_ref::<RpcEnded>().copied()
+    }
+}
+
+impl std::fmt::Display for RpcEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the remote end hung up unexpectedly")
+    }
+}
+
+impl std::error::Error for RpcEnded {}

@@ -19,6 +19,10 @@ pub enum Error {
     UnknownLineType { line: String },
     #[error("Unknown or unsupported header: {header:?}")]
     UnknownSectionHeader { header: String },
+    /// `process_section_header()`'s `die(_("expected '%s'"), section)` (fetch-pack.c:1464-1485): the response
+    /// stopped at a flush, delimiter or response-end where the section `do_fetch_pack_v2()` reads next belongs.
+    #[error("expected '{section}'")]
+    ExpectedSection { section: &'static str },
 }
 
 impl From<std::io::Error> for Error {

@@ -430,6 +430,11 @@ pub struct Outcome {
     /// hook nor the upload ran. [`statuses`][Self::statuses] holds only the
     /// `error()`s the match raised, in the order it raised them.
     pub match_failed: bool,
+    /// send-pack died under remote-curl without a status for any ref it sent (see [`HelperEnded`]): `Some(true)`
+    /// when remote-curl died first and never answers its `push` command, `Some(false)` when it answered with an
+    /// empty status list and exits 128 (`parse_push()`, remote-curl.c:1430-1456). Those refs are not in
+    /// [`statuses`][Self::statuses].
+    pub helper_ended: Option<bool>,
 }
 
 /// One line of the `pre-push` hook's stdin, `<local ref> <local oid> <remote
@@ -610,6 +615,10 @@ pub fn send_pack(
         Err(e) => {
             // A 401 to the retry that carried credentials: `discover_refs()` dies.
             if crate::transport_err::http_auth_fatal(url.as_str(), Some(repo), &e).is_some() {
+                crate::hosted::exit(128);
+            }
+            // Any other refusal of the ref advertisement: `discover_refs()` dies.
+            if crate::transport_err::http_get_fatal(url.as_str(), Some(repo), &e).is_some() {
                 crate::hosted::exit(128);
             }
             let err = anyhow::Error::from(e).context("receive-pack handshake failed");
@@ -1047,6 +1056,7 @@ pub fn send_pack(
             no_refs: false,
             aborted: None,
             match_failed: true,
+            helper_ended: None,
         });
     }
 
@@ -1065,6 +1075,7 @@ pub fn send_pack(
                 no_refs: false,
                 aborted: Some(code),
                 match_failed: false,
+                helper_ended: None,
             });
         }
     }
@@ -1095,6 +1106,7 @@ pub fn send_pack(
             no_refs: true,
             aborted: None,
             match_failed: false,
+            helper_ended: None,
         });
     }
 
@@ -1320,6 +1332,7 @@ pub fn send_pack(
                 no_refs: false,
                 aborted: None,
                 match_failed: false,
+                helper_ended: None,
             });
         }
     }
@@ -1352,6 +1365,7 @@ pub fn send_pack(
             no_refs: false,
             aborted: None,
             match_failed: false,
+            helper_ended: None,
         });
     }
 
@@ -1366,6 +1380,7 @@ pub fn send_pack(
             no_refs: false,
             aborted: None,
             match_failed: false,
+            helper_ended: None,
         });
     }
 
@@ -1469,12 +1484,20 @@ pub fn send_pack(
         .transport_mut()
         .request(WriteMode::Binary, MessageKind::Flush, false)?
         .into_parts();
-    writer.write_all(&req_buf)?;
-    if need_pack {
-        writer.write_all(&pack_bytes)?;
-    }
-    writer.flush()?;
+    let wrote = writer
+        .write_all(&req_buf)
+        .and_then(|()| if need_pack { writer.write_all(&pack_bytes) } else { Ok(()) })
+        .and_then(|()| writer.flush());
     drop(writer);
+    // Once a request failed remote-curl reads on to the end of what send-pack writes and drops it
+    // (remote-curl.c:1143-1151), so over http a write that found the request gone is no failure of send-pack's:
+    // the response it reads next says what happened.
+    if let Err(e) = wrote {
+        let is_http = url.starts_with("http://") || url.starts_with("https://");
+        if !(is_http && e.kind() == std::io::ErrorKind::BrokenPipe) {
+            return Err(e.into());
+        }
+    }
 
     // Read the response. With `side-band-64k` the whole stream is multiplexed:
     // band 1 carries the report-status pkt-lines, bands 2 and 3 carry everything
@@ -1485,10 +1508,30 @@ pub fn send_pack(
     // and parsing the primary band afterwards is the same sequence, because the
     // server writes the entire report before those hooks start and the client has
     // nothing to say in between.
-    let report_lines: Vec<String> = if use_sideband {
-        pkt_lines(&demultiplex_sideband(repo, &mut reader)?)
+    let report_lines = if use_sideband {
+        demultiplex_sideband(repo, &mut reader).map(|primary| pkt_lines(&primary))
     } else {
-        read_pkt_lines(&mut reader)?
+        read_pkt_lines(&mut reader)
+    };
+    let report_lines: Vec<String> = match report_lines {
+        Ok(lines) => lines,
+        // send-pack died under remote-curl before any ref got a status: every command it sent stays
+        // `REF_STATUS_NONE`, which nothing after this prints or acts on (transport.c:589-616, :894-934).
+        Err(e) => match e.downcast::<HelperEnded>() {
+            Ok(HelperEnded(ended)) => {
+                return Ok(Outcome {
+                    url,
+                    statuses,
+                    advertised: advertised_order,
+                    unpack: Ok(()),
+                    no_refs: false,
+                    aborted: None,
+                    match_failed: false,
+                    helper_ended: Some(ended.helper_died),
+                });
+            }
+            Err(e) => return Err(e),
+        },
     };
 
     // Parse report-status (send-pack.c `receive_status`). The first line is the
@@ -1631,6 +1674,7 @@ pub fn send_pack(
         no_refs: false,
         aborted: None,
         match_failed: false,
+        helper_ended: None,
     })
 }
 
@@ -1678,11 +1722,43 @@ fn read_pkt_lines(reader: &mut Box<dyn ExtendedBufRead<'_> + Unpin + '_>) -> Res
             // Flush / delimiter / response-end all terminate the report.
             Some(Ok(Ok(_))) => break,
             Some(Ok(Err(e))) => crate::git_fatal!("malformed packet line from remote: {e}"),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Err(hung_up(&e)),
             Some(Err(e)) => bail!("error reading from remote: {e}"),
         }
     }
     Ok(lines)
 }
+
+/// `get_packet_data()`'s `die(_("the remote end hung up unexpectedly"))` (pkt-line.c:364-372): `receive_status()`
+/// reads without `PACKET_READ_GENTLE_ON_EOF` (send-pack.c:708-710), so a response that ends early kills send-pack.
+///
+/// Over http that send-pack is remote-curl's child (`rpc_service()`, remote-curl.c:1094-1167). Its death is its
+/// own, and the push goes on in the parent: the error that comes back is [`HelperEnded`]. Anywhere else send-pack
+/// runs in the pushing process, and the `die()` ends it.
+fn hung_up(err: &std::io::Error) -> anyhow::Error {
+    use gix::protocol::transport::client::blocking_io::http::RpcEnded;
+    match RpcEnded::find(err) {
+        Some(ended) => {
+            eprintln!("fatal: the remote end hung up unexpectedly");
+            anyhow::Error::new(HelperEnded(ended))
+        }
+        None => crate::fatal::die("the remote end hung up unexpectedly"),
+    }
+}
+
+/// send-pack died under remote-curl, which carries on as [`http::RpcEnded`] says.
+///
+/// [`http::RpcEnded`]: gix::protocol::transport::client::blocking_io::http::RpcEnded
+#[derive(Debug)]
+struct HelperEnded(gix::protocol::transport::client::blocking_io::http::RpcEnded);
+
+impl std::fmt::Display for HelperEnded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("send-pack died")
+    }
+}
+
+impl std::error::Error for HelperEnded {}
 
 /// Split a buffer of pkt-lines into their payloads as text, stopping at the first
 /// flush/delim. This is what the demultiplexed band-1 stream is: the server
@@ -1747,6 +1823,12 @@ fn demultiplex_sideband(
             Some(Ok(Err(e))) => {
                 sideband.finish();
                 crate::git_fatal!("malformed packet line from remote: {e}");
+            }
+            // `PACKET_READ_EOF`: `demultiplex_sideband()` says so in its own name (sideband.c:325-331), and
+            // `receive_status()`, reading what the demultiplexer passed on, dies at the end of it.
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                sideband.disconnected("send-pack");
+                return Err(hung_up(&e));
             }
             Some(Err(e)) => {
                 sideband.finish();
@@ -1944,6 +2026,17 @@ impl Sideband {
             let colored = self.colorize(rest);
             self.scratch.push_str(&colored);
         }
+    }
+
+    /// `PACKET_READ_EOF` in `demultiplex_sideband()` (sideband.c:325-331), which names the reader `me`, as
+    /// `recv_sideband("send-pack", ...)` does (send-pack.c:251-259), then the `cleanup:` tail.
+    pub(super) fn disconnected(&mut self, me: &str) {
+        if !self.scratch.is_empty() {
+            self.scratch.push('\n');
+        }
+        self.scratch.push_str(me);
+        self.scratch.push_str(": unexpected disconnect while reading sideband packet");
+        self.finish();
     }
 
     /// The `cleanup:` tail of `demultiplex_sideband()`: whatever is still buffered

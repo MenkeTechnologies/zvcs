@@ -504,6 +504,177 @@ fn report_rpc_failure(status: reqwest::StatusCode) {
     eprintln!("error: RPC failed; HTTP {code} curl 22 The requested URL returned error: {code}");
 }
 
+/// Whether `headers` are those of a protocol v2 request, which git sends from `stateless_connect()` rather than
+/// from `rpc_service()` (remote-curl.c:1460-1554, :1094-1167).
+fn is_stateless_connect(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("git-protocol")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(':').any(|p| p == "version=2"))
+}
+
+/// The end of a `POST` that failed, as the reader of its response finds it (see [`http::RpcEnded`]).
+///
+/// remote-curl.c:1086-1087 for a request that remote-curl survived:
+///
+/// ```c
+/// if (stateless_connect)
+///         packet_response_end(rpc->in);
+/// ```
+///
+/// and then `stateless_connect()` stops sending (remote-curl.c:1534-1536), while `rpc_service()` closes the
+/// reader's input (remote-curl.c:1143-1144). A dead remote-curl writes nothing more at all.
+fn end_rpc(
+    headers_tx: pipe::Writer,
+    response_body_tx: pipe::Writer,
+    stateless_connect: bool,
+    helper_died: bool,
+) {
+    headers_tx
+        .channel
+        .send(Err(http::RpcEnded { helper_died }.into_io_error()))
+        .ok();
+    end_rpc_body(response_body_tx, stateless_connect, helper_died);
+}
+
+/// Whether `err`, the failure of a `POST`, is one remote-curl reports and ends the request on, and if so whether
+/// remote-curl died of it: an HTTP status `run_slot()` already reported (remote-curl.c:859-873), a `401` it gave up
+/// on, or the `die()` of the fill for one. `None` for a failure to talk to the server at all, which is left to the
+/// caller as it is.
+fn rpc_failure(err: &std::io::Error) -> Option<bool> {
+    if let Some(ended) = http::RpcEnded::find(err) {
+        return Some(ended.helper_died);
+    }
+    let inner = err.get_ref()?;
+    let has_status = inner.downcast_ref::<ErrorResponse>().is_some()
+        || inner
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|err| err.status().is_some());
+    has_status.then_some(false)
+}
+
+/// The part of [`end_rpc()`] that follows a response whose headers already went to the reader, as when the body
+/// stopped arriving.
+fn end_rpc_body(mut response_body_tx: pipe::Writer, stateless_connect: bool, helper_died: bool) {
+    let ended = http::RpcEnded { helper_died };
+    if stateless_connect && !helper_died {
+        response_body_tx.write_all(b"0002").ok();
+    }
+    response_body_tx.channel.send(Err(ended.into_io_error())).ok();
+}
+
+/// `struct check_pktline_state` (remote-curl.c:772-776): how far into a pkt-line the response of a v2 `POST` has
+/// got, which `post_rpc()` reports when the response stopped short (remote-curl.c:1081-1084).
+#[derive(Default)]
+struct PktlineState {
+    len_buf: [u8; 4],
+    len_filled: usize,
+    remaining: usize,
+}
+
+impl PktlineState {
+    /// `check_pktline()` (remote-curl.c:778-815) over the next `data` of the response. A length remote-curl dies
+    /// on comes back as the message of its `die()`.
+    fn check(&mut self, mut data: &[u8]) -> Result<(), String> {
+        while !data.is_empty() {
+            if self.remaining == 0 {
+                let digits = (4 - self.len_filled).min(data.len());
+                self.len_buf[self.len_filled..self.len_filled + digits].copy_from_slice(&data[..digits]);
+                self.len_filled += digits;
+                data = &data[digits..];
+                if self.len_filled == 4 {
+                    // `packet_length()`: four hex digits, or -1.
+                    let len = std::str::from_utf8(&self.len_buf)
+                        .ok()
+                        .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .and_then(|hex| usize::from_str_radix(hex, 16).ok());
+                    self.remaining = match len {
+                        None => {
+                            return Err(format!(
+                                "remote-curl: bad line length character: {}",
+                                String::from_utf8_lossy(&self.len_buf)
+                            ));
+                        }
+                        Some(2) => return Err("remote-curl: unexpected response end packet".into()),
+                        Some(len) if len < 4 => 0,
+                        Some(len) => len - 4,
+                    };
+                    self.len_filled = 0;
+                }
+            }
+            if self.remaining > 0 {
+                let take = self.remaining.min(data.len());
+                data = &data[take..];
+                self.remaining -= take;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `rpc_in()` (remote-curl.c:828-846): the response of a `POST` on its way to the reader, with what `post_rpc()`
+/// checks once the request is over.
+struct RpcIn<'a> {
+    out: &'a mut pipe::Writer,
+    /// `rpc->any_written`.
+    any_written: bool,
+    /// `rpc_in_data.pktline_state`, kept for a v2 request only (`check_pktline = stateless_connect`).
+    pktline: Option<PktlineState>,
+    /// The `die()` `check_pktline()` reached, which ends remote-curl.
+    died: Option<String>,
+    /// The reader went away, so the response goes nowhere.
+    write_failed: bool,
+    /// The bytes of the body that arrived.
+    received: u64,
+}
+
+impl Write for RpcIn<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.died.is_some() {
+            return Err(std::io::Error::other("remote-curl died"));
+        }
+        if !buf.is_empty() {
+            self.any_written = true;
+        }
+        if let Some(state) = self.pktline.as_mut() {
+            if let Err(msg) = state.check(buf) {
+                self.died = Some(msg);
+                return Err(std::io::Error::other("remote-curl died"));
+            }
+        }
+        if let Err(err) = self.out.write_all(buf) {
+            self.write_failed = true;
+            return Err(err);
+        }
+        self.received += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// `run_slot()`'s report of a response body that stopped arriving (remote-curl.c:859-873), with the text curl
+/// gives the two ways this transport sees that happen: `CURLE_PARTIAL_FILE` for a body shorter than its
+/// `Content-Length`, and `CURLE_OPERATION_TIMEDOUT` for `http.lowSpeedLimit`. Returns whether it said anything.
+fn report_body_failure(err: &std::io::Error, content_length: Option<u64>, received: u64) -> bool {
+    if err.kind() == std::io::ErrorKind::TimedOut {
+        eprintln!("error: RPC failed; curl 28 {err}");
+        return true;
+    }
+    match content_length {
+        Some(len) if received < len => {
+            eprintln!(
+                "error: RPC failed; curl 18 end of response with {} bytes missing",
+                len - received
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The error a `POST` refused with a `401` is reported with, as the transport expects it.
 fn unauthorized(www_authenticate: Vec<String>) -> std::io::Error {
     std::io::Error::new(
@@ -560,9 +731,13 @@ fn unauthorized_post(
     if let Some(ctx) = get.context_mut() {
         ctx.wwwauth = www_authenticate.into_iter().map(Into::into).collect();
     }
-    let outcome = match call_authenticate(authenticate, get)? {
+    let outcome = match http::as_post_rpc_fill(|| call_authenticate(authenticate, get))? {
         Ok(Some(outcome)) => outcome,
         Ok(None) => return Ok(None),
+        // `credential_fill()` died, and with it remote-curl.
+        Err(gix_credentials::protocol::Error::Exited { .. }) => {
+            return Err(http::RpcEnded { helper_died: true }.into_io_error());
+        }
         Err(err) => return Err(std::io::Error::other(err)),
     };
     let value = reqwest::header::HeaderValue::try_from(match &outcome.authorization {
@@ -663,6 +838,8 @@ impl Default for Remote {
                 // remote-curl's `rpc->large_request`: the body did not fit into `http.postBuffer` and goes out
                 // chunked, which cannot be sent twice.
                 let mut large_request = false;
+                // A v2 request, whose failure ends with `packet_response_end()`.
+                let stateless_connect = upload_body_kind.is_some() && is_stateless_connect(&headers);
                 let (post_body_tx, mut post_body_rx) = pipe::unidirectional(0);
                 let (mut response_body_tx, response_body_rx) = pipe::unidirectional(0);
                 let (mut headers_tx, headers_rx) = pipe::unidirectional(0);
@@ -823,7 +1000,14 @@ impl Default for Remote {
                         }
                     };
                     if let Err(err) = probed {
-                        headers_tx.channel.send(Err(err)).ok();
+                        // The rest of the body the caller still writes goes nowhere, and must not hold it up.
+                        drop(req);
+                        match rpc_failure(&err) {
+                            Some(helper_died) => end_rpc(headers_tx, response_body_tx, stateless_connect, helper_died),
+                            None => {
+                                headers_tx.channel.send(Err(err)).ok();
+                            }
+                        }
                         continue;
                     }
                 }
@@ -867,7 +1051,14 @@ impl Default for Remote {
                         }
                         Ok(None) => break res,
                         Err(err) => {
-                            headers_tx.channel.send(Err(err)).ok();
+                            match rpc_failure(&err) {
+                                Some(helper_died) => {
+                                    end_rpc(headers_tx, response_body_tx, stateless_connect, helper_died);
+                                }
+                                None => {
+                                    headers_tx.channel.send(Err(err)).ok();
+                                }
+                            }
                             continue 'requests;
                         }
                     }
@@ -949,7 +1140,12 @@ impl Default for Remote {
                                 std::io::Error::other(err)
                             }
                         };
-                        headers_tx.channel.send(Err(err)).ok();
+                        match upload_body_kind.is_some().then(|| rpc_failure(&err)).flatten() {
+                            Some(helper_died) => end_rpc(headers_tx, response_body_tx, stateless_connect, helper_died),
+                            None => {
+                                headers_tx.channel.send(Err(err)).ok();
+                            }
+                        }
                         continue;
                     }
                 };
@@ -997,6 +1193,15 @@ impl Default for Remote {
                 // body channel and that's all we can do.
                 // `http.lowSpeedLimit` together with `http.lowSpeedTime` abort a transfer that stalls,
                 // which curl does with `CURLOPT_LOW_SPEED_LIMIT`/`CURLOPT_LOW_SPEED_TIME`.
+                let content_length = res.content_length();
+                let mut rpc_in = RpcIn {
+                    out: &mut response_body_tx,
+                    any_written: false,
+                    pktline: stateless_connect.then(PktlineState::default),
+                    died: None,
+                    write_failed: false,
+                    received: 0,
+                };
                 let copied = if config.low_speed_limit_bytes_per_second > 0 && config.low_speed_time_seconds > 0 {
                     std::io::copy(
                         &mut LowSpeedGuard {
@@ -1006,13 +1211,58 @@ impl Default for Remote {
                             window_start: Instant::now(),
                             window_bytes: 0,
                         },
-                        &mut response_body_tx,
+                        &mut rpc_in,
                     )
                 } else {
-                    std::io::copy(&mut res, &mut response_body_tx)
+                    std::io::copy(&mut res, &mut rpc_in)
                 };
-                if let Err(err) = copied {
-                    response_body_tx.channel.send(Err(err)).ok();
+                let RpcIn {
+                    any_written,
+                    pktline,
+                    died,
+                    write_failed,
+                    received,
+                    ..
+                } = rpc_in;
+                if upload_body_kind.is_none() {
+                    if let Err(err) = copied {
+                        response_body_tx.channel.send(Err(err)).ok();
+                    }
+                    continue;
+                }
+                // What `post_rpc()` makes of the response once `run_slot()` is done with it
+                // (remote-curl.c:1076-1087): a `die()` in `check_pktline()` ended remote-curl midway, a
+                // transfer curl failed is reported, and a request that failed, wrote nothing or stopped inside
+                // a pkt-line is the end of the conversation.
+                if let Some(msg) = died {
+                    eprintln!("fatal: {msg}");
+                    end_rpc_body(response_body_tx, stateless_connect, true);
+                    continue;
+                }
+                if write_failed {
+                    // Nobody reads the response any more.
+                    continue;
+                }
+                let mut failed = match &copied {
+                    Ok(_) => false,
+                    Err(err) => {
+                        report_body_failure(err, content_length, received);
+                        true
+                    }
+                };
+                failed |= !any_written;
+                if let Some(state) = pktline {
+                    if state.len_filled > 0 {
+                        eprintln!("error: {} bytes of length header were received", state.len_filled);
+                        failed = true;
+                    }
+                    if state.remaining > 0 {
+                        eprintln!("error: {} bytes of body are still expected", state.remaining);
+                        failed = true;
+                    }
+                }
+                if failed {
+                    end_rpc_body(response_body_tx, stateless_connect, false);
                 }
             }
             Ok(())

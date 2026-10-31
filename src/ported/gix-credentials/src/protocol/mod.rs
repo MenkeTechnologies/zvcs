@@ -40,6 +40,11 @@ pub enum Error {
     Quit,
     #[error("Couldn't obtain {prompt}")]
     Prompt { prompt: String, source: gix_prompt::Error },
+    /// The fill ended the process it ran in with `code`, as `credential_fill()` does with its `die()`s
+    /// (credential.c:504-547, prompt.c:73). Only a caller that runs the fill in-process where git runs it in a child, as git
+    /// does in remote-curl, can see this rather than its own exit.
+    #[error("The credential fill exited with status {code}")]
+    Exited { code: i32 },
 }
 
 /// Additional context to be passed to the credentials helper.

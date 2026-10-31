@@ -203,6 +203,17 @@ pub fn remote_error_fatal(err: &anyhow::Error) -> Option<ExitCode> {
     Some(ExitCode::from(128))
 }
 
+/// `process_section_header()`'s `die(_("expected '%s'"), section)` (fetch-pack.c:1464-1485) for a v2 fetch response
+/// that stopped where its next section belongs, or `None` when `err` is something else. Exit 128.
+pub fn expected_section_fatal(err: &anyhow::Error) -> Option<ExitCode> {
+    let section = err.chain().find_map(|cause| match cause.downcast_ref::<gix::protocol::fetch::response::Error>() {
+        Some(e @ gix::protocol::fetch::response::Error::ExpectedSection { .. }) => Some(e),
+        _ => None,
+    })?;
+    eprintln!("fatal: {section}");
+    Some(ExitCode::from(128))
+}
+
 /// The server's message from an `ERR` line anywhere in `err`'s source chain.
 ///
 /// Both spellings the vendored protocol produces are checked: the packetline
@@ -306,6 +317,70 @@ pub fn http_auth_fatal(
     }
     eprintln!("fatal: Authentication failed for '{}'", transport_anonymize_url(&url));
     Some(ExitCode::from(128))
+}
+
+/// The rest of `discover_refs()`'s refusals (remote-curl.c:516-545), or `None` when the ref advertisement did not
+/// fail with an HTTP status, or failed with one handled elsewhere: a `401` (`HTTP_REAUTH`/`HTTP_NOAUTH`, see
+/// [`http_auth_fatal`]) or a `429` (`HTTP_RATE_LIMITED`).
+///
+/// ```c
+/// case HTTP_MISSING_TARGET:
+///         show_http_message(&type, &charset, &buffer);
+///         die(_("repository '%s' not found"),
+///             transport_anonymize_url(url.buf));
+/// ...
+/// default:
+///         show_http_message(&type, &charset, &buffer);
+///         die(_("unable to access '%s': %s"),
+///             transport_anonymize_url(url.buf), curl_errorstr);
+/// ```
+///
+/// `missing_target()` is a `404` (http.h:94-103), and `curl_errorstr` for any status from 300 up is what
+/// `normalize_curl_result()` writes (http.c:1897-1920). remote-curl dies; the transport-helper parent finds no
+/// answer to `list` and exits 128 without a word of its own. Exit 128.
+pub fn http_get_fatal(
+    url: &str,
+    repo: Option<&gix::Repository>,
+    err: &(dyn std::error::Error + 'static),
+) -> Option<ExitCode> {
+    let response = find_error_response(err)?;
+    if response.status < 300 || response.status == 401 || response.status == 429 {
+        return None;
+    }
+    show_http_message(response, repo);
+    let mut url = url.to_owned();
+    if !url.is_empty() && !url.ends_with('/') {
+        url.push('/');
+    }
+    let url = transport_anonymize_url(&url);
+    if response.status == 404 {
+        eprintln!("fatal: repository '{url}' not found");
+    } else {
+        eprintln!(
+            "fatal: unable to access '{url}': The requested URL returned error: {}",
+            response.status
+        );
+    }
+    Some(ExitCode::from(128))
+}
+
+/// The HTTP error response anywhere below `err`, looking inside every `std::io::Error` on the way, whose
+/// `source()` skips the error it wraps.
+fn find_error_response<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a gix::protocol::transport::client::blocking_io::http::ErrorResponse> {
+    use gix::protocol::transport::client::blocking_io::http::ErrorResponse;
+    let mut next = Some(err);
+    while let Some(cur) = next {
+        if let Some(response) = cur.downcast_ref::<ErrorResponse>() {
+            return Some(response);
+        }
+        next = match cur.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|e| e as &(dyn std::error::Error + 'static)),
+            None => cur.source(),
+        };
+    }
+    None
 }
 
 /// `show_http_message()` (remote-curl.c:370-395): a `text/plain` body is reencoded
@@ -432,38 +507,4 @@ fn url_is_local_not_ssh(url: &str) -> bool {
         None => true,
         Some(colon) => slash.is_some_and(|slash| slash < colon),
     }
-}
-
-/// `get_remote_refs()`'s `die()` (connect.c:614-615) for a v2 `ls-refs` whose `POST` the server refused, or
-/// `None` when `err` is not that: remote-curl's `post_rpc()` ends a failed stateless-connect request with
-/// `packet_response_end()` (remote-curl.c:1086-1087) after `run_slot()` reported it, so the reader finds a
-/// response-end where the flush after the listing belongs. Exit 128.
-pub fn ls_refs_rejected_fatal(err: &gix::protocol::ls_refs::Error) -> Option<ExitCode> {
-    http_error_response(err)?;
-    eprintln!("fatal: expected flush after ref listing");
-    Some(ExitCode::from(128))
-}
-
-/// The HTTP error response somewhere below `err`, looking through the `std::io::Error`s and transport errors
-/// the response is wrapped in on its way up.
-fn http_error_response<'a>(
-    err: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a gix::protocol::transport::client::blocking_io::http::ErrorResponse> {
-    use gix::protocol::transport::client::{self, blocking_io::http::ErrorResponse};
-    if let Some(response) = err.downcast_ref::<ErrorResponse>() {
-        return Some(response);
-    }
-    let inner: Option<&(dyn std::error::Error + 'static)> = if let Some(io) = err.downcast_ref::<std::io::Error>() {
-        io.get_ref().map(|e| e as &(dyn std::error::Error + 'static))
-    } else if let Some(client::Error::Io(io)) = err.downcast_ref::<client::Error>() {
-        Some(io)
-    } else if let Some(gix::protocol::ls_refs::Error::Io(io)) = err.downcast_ref::<gix::protocol::ls_refs::Error>() {
-        Some(io)
-    } else if let Some(gix::protocol::ls_refs::Error::Transport(t)) = err.downcast_ref::<gix::protocol::ls_refs::Error>()
-    {
-        Some(t)
-    } else {
-        err.source()
-    };
-    http_error_response(inner?)
 }

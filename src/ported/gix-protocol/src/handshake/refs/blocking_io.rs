@@ -12,8 +12,13 @@ pub fn from_v2_refs(in_refs: &mut dyn ReadlineBufRead) -> Result<Vec<Ref>, Error
         .transpose()
         .map_err(refs::parse::eof_as(gix_transport::client::HangUp::RefListingFlush))?
         .transpose()?
-        .and_then(|l| l.as_bstr())
     {
+        // `get_remote_refs()` (connect.c:609-615) reads refs while the reader returns `PACKET_READ_NORMAL` and
+        // dies unless it stopped at a flush, so a response-end in place of the flush, which remote-curl writes
+        // after a refused `POST` (remote-curl.c:1086-1087), is `expected flush after ref listing`.
+        let Some(line) = line.as_bstr() else {
+            return Err(Error::HungUp(gix_transport::client::HangUp::RefListingFlush));
+        };
         out_refs.push(refs::shared::parse_v2(line)?);
     }
     Ok(out_refs)

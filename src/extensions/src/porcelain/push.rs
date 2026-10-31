@@ -1076,6 +1076,21 @@ git push <groupname>\n"
     } else {
         report(&outcome, f.verbose, f.quiet)?
     };
+    // send-pack died under remote-curl ([`push_proto::Outcome::helper_ended`]). A dead remote-curl never answers
+    // the `push` command, so `push_update_refs_status()` returns 1 (transport-helper.c:946-958), and with
+    // `push_ret` set there is neither `Done` nor `Everything up-to-date` (transport.c:1560-1564) and
+    // `push_with_options()` reports the failure (builtin/push.c:392-397). One that answered with its empty status
+    // list leaves `push_ret` alone, but `transport_disconnect()` finds it exited 128 (transport-helper.c:246-268),
+    // which fails the push without another word (builtin/push.c:400-403).
+    let (code, trailer, failure) = match outcome.helper_ended {
+        Some(true) => (
+            ExitCode::from(1),
+            false,
+            Some(failure.unwrap_or_else(|| PushFailure::without_rejections(f.porcelain))),
+        ),
+        Some(false) => (ExitCode::from(1), trailer, failure),
+        None => (code, trailer, failure),
+    };
     if f.set_upstream {
         record_upstreams(&repo, &remote_name, &outcome, &upstreams, f.dry_run, f.quiet);
     }
@@ -2731,6 +2746,15 @@ struct PushFailure<'a> {
 }
 
 impl PushFailure<'_> {
+    /// The failure of a push no ref was rejected in, colored as [`report`]'s and [`report_porcelain`]'s are.
+    fn without_rejections(porcelain: bool) -> Self {
+        let color = match porcelain {
+            true => String::new(),
+            false => super::color::PushColors::resolve(crate::setup::discover().ok().as_ref()).error,
+        };
+        PushFailure { rejected: Vec::new(), color }
+    }
+
     fn report(&self, url: &str) {
         // `color.push` / `color.push.error`. git closes the span *after* the
         // newline, so the reset lands at the start of the following line.
@@ -2858,7 +2882,9 @@ fn report_porcelain<'a>(
         true => outcome.statuses.as_slice(),
         false => &[][..],
     };
-    if status_block {
+    // `print_one_push_report()` writes the `To <url>` line ahead of the first ref it prints (transport.c:774-778), so
+    // a push that has no ref to report, as when send-pack died under remote-curl, prints none.
+    if status_block && !listed.is_empty() {
         println!("To {}", outcome.url);
     }
     // The same three walks over `remote_refs` as the human block

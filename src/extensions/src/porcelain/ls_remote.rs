@@ -362,17 +362,20 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         {
             return Ok(ExitCode::from(128));
         }
-        // The `ls-refs` `POST` was refused: `get_remote_refs()` dies.
-        Err(gix::remote::ref_map::Error::InitRefMap(gix::protocol::fetch::refmap::init::Error::ListRefs(e)))
-            if crate::transport_err::ls_refs_rejected_fatal(&e).is_some() =>
+        // Any other refusal of the ref advertisement: `discover_refs()` dies.
+        Err(gix::remote::ref_map::Error::Handshake(e))
+            if crate::transport_err::http_get_fatal(&url.to_string(), Some(&repo), &e).is_some() =>
         {
             return Ok(ExitCode::from(128));
         }
         Err(e) => {
             // An ssh transport that never connected is git's own `die()`: the
-            // child's stderr, then the fixed block.
+            // child's stderr, then the fixed block. An `ls-refs` answer that
+            // stopped short of its flush is `get_remote_refs()`'s `die()`.
             let err = anyhow::Error::from(e);
-            if let Some(code) = crate::transport_err::ssh_fatal(&url.to_string(), &err) {
+            if let Some(code) = crate::transport_err::ssh_fatal(&url.to_string(), &err)
+                .or_else(|| crate::transport_err::hang_up_fatal(&err))
+            {
                 return Ok(code);
             }
             eprintln!("fatal: {err}");
@@ -1040,7 +1043,9 @@ fn outside_repository(repository: Option<&str>, patterns: &[&str], opts: &Opts) 
         Err(err) => {
             // A 401 to the retry that carried credentials: `discover_refs()` dies.
             if let Some(e) = err.downcast_ref::<gix::protocol::handshake::Error>() {
-                if let Some(code) = crate::transport_err::http_auth_fatal(&raw.to_string(), None, e) {
+                if let Some(code) = crate::transport_err::http_auth_fatal(&raw.to_string(), None, e)
+                    .or_else(|| crate::transport_err::http_get_fatal(&raw.to_string(), None, e))
+                {
                     return code;
                 }
             }

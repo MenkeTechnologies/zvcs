@@ -392,7 +392,17 @@ pub(crate) fn with_post_authentication(
             .take()
             .map(|(action, _)| action)
             .unwrap_or_else(|| gix::credentials::helper::Action::get_for_url(url));
-        let authenticate = transport_authenticate(cfg);
+        let mut fill = transport_authenticate(cfg);
+        // A `die()` in the fill for a `POST` ends remote-curl, not the command, and the transport ends the
+        // response the way the dead child leaves it (`http::RpcEnded`). The fill `http.proactiveAuth` runs ahead
+        // of the handshake is the command's own and still exits.
+        let authenticate = move |action: Action| {
+            if !http::credential_fill_is_post_rpc() {
+                return fill(action);
+            }
+            crate::hosted::catch_exit(|| fill(action))
+                .unwrap_or_else(|code| Err(gix::credentials::protocol::Error::Exited { code }))
+        };
         opts.authenticate = Some((
             action,
             std::sync::Arc::new(std::sync::Mutex::new(authenticate))

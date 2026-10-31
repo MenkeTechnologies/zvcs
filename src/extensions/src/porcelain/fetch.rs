@@ -3387,10 +3387,10 @@ fn fetch_one(
         {
             return Ok(Verdict::Fatal);
         }
-        // The `ls-refs` `POST` was refused: `get_remote_refs()` dies.
-        Err(gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::InitRefMap(
-            gix::protocol::fetch::refmap::init::Error::ListRefs(e),
-        ))) if crate::transport_err::ls_refs_rejected_fatal(&e).is_some() => {
+        // Any other refusal of the ref advertisement: `discover_refs()` dies.
+        Err(gix::remote::fetch::prepare::Error::RefMap(gix::remote::ref_map::Error::Handshake(e)))
+            if crate::transport_err::http_get_fatal(&raw_url, Some(repo), &e).is_some() =>
+        {
             return Ok(Verdict::Fatal);
         }
         // git's `die_if_server_options()` also prints the advice line, and both it and the
@@ -3710,6 +3710,10 @@ fn fetch_one(
             // unreachable want, a hidden ref), which git reports verbatim.
             let err = anyhow::Error::from(e);
             if crate::transport_err::remote_error_fatal(&err).is_some() {
+                return Ok(Verdict::Fatal);
+            }
+            // A response cut off where a section belongs, which is how a refused `POST` ends.
+            if crate::transport_err::expected_section_fatal(&err).is_some() {
                 return Ok(Verdict::Fatal);
             }
             // ```c

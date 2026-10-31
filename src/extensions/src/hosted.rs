@@ -139,6 +139,19 @@ pub fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// Run `f` as git runs code in a child process: an [`exit`] inside it ends `f` with `Err(code)` and leaves this
+/// process running. Any other panic carries on unwinding.
+pub fn catch_exit<T>(f: impl FnOnce() -> T) -> Result<T, i32> {
+    install_quiet_hook();
+    let previously = HOSTED.replace(true);
+    let outcome = panic::catch_unwind(AssertUnwindSafe(f));
+    HOSTED.set(previously);
+    outcome.or_else(|payload| match payload.downcast::<HostedExit>() {
+        Ok(exit) => Err(exit.0),
+        Err(payload) => panic::resume_unwind(payload),
+    })
+}
+
 /// Teach the panic hook to stay quiet about [`HostedExit`].
 ///
 /// An ordinary `panic_any` prints "thread panicked at …" before unwinding,

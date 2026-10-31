@@ -9,6 +9,7 @@ use std::{
 use base64::Engine;
 use bstr::BStr;
 pub use traits::{Error, ErrorResponse, GetResponse, Http, PostBodyDataKind, PostResponse};
+pub use crate::client::RpcEnded;
 
 use crate::{
     Protocol, Service,
@@ -489,6 +490,31 @@ pub(crate) fn basic_authorization(username: &str, password: &str) -> String {
     )
 }
 
+thread_local! {
+    /// Set while a backend runs the credential callback for a refused `POST`; see [`credential_fill_is_post_rpc()`].
+    static POST_RPC_FILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the credential callback running on this thread is `http_reauth_prepare(0)`'s fill for a `POST`
+/// (remote-curl.c:1070-1074, :943-950), which git runs inside remote-curl.
+///
+/// A `die()` there ends remote-curl and not the command. A callback that can end the process may then
+/// return [`gix_credentials::protocol::Error::Exited`] instead, and the backend ends the response the way
+/// a dead remote-curl leaves it ([`RpcEnded`]). Every other fill, the handshake's included, is the
+/// command's own business.
+pub fn credential_fill_is_post_rpc() -> bool {
+    POST_RPC_FILL.with(std::cell::Cell::get)
+}
+
+/// Run `f`, the credential callback for a refused `POST`, with [`credential_fill_is_post_rpc()`] answering `true`.
+#[cfg(feature = "http-client-reqwest")]
+pub(crate) fn as_post_rpc_fill<T>(f: impl FnOnce() -> T) -> T {
+    let previous = POST_RPC_FILL.replace(true);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    POST_RPC_FILL.set(previous);
+    out.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
+
 /// A panic raised by the credential callback on a backend's worker thread, carried to the thread that reads
 /// the response and resumed there, so an `exit()` that unwinds still reaches whoever catches it.
 pub(crate) struct CallbackPanic(std::sync::Mutex<Option<Box<dyn Any + Send>>>);
@@ -792,6 +818,11 @@ impl<H: Http, B: Unpin> HeadersThenBody<H, B> {
             let mut headers = headers;
             if let Err(err) = headers.fill_buf() {
                 CallbackPanic::resume_if_carried_by(&err);
+                // A failed `POST` has no response to check: the body is whatever remote-curl left on the pipe,
+                // which the body reader hands over as it is (see [`RpcEnded`]).
+                if RpcEnded::find(&err).is_some() {
+                    return Ok(());
+                }
                 return Err(std::io::Error::other(client::Error::from(err)));
             }
             <Transport<H>>::check_content_type(self.service, "result", headers).map_err(std::io::Error::other)?;

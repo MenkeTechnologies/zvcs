@@ -392,6 +392,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `the_repository->objects->commit_graph`, which the first commit this process parses
     // loads (`prepare_commit_graph()`, commit-graph.c:736-773).
     let mut graph = ProcessGraph::new(&repo);
+    // Every object the arguments' `parse_object()` calls have parsed, of any type.
+    let mut arg_parsed: HashSet<ObjectId> = HashSet::new();
     for arg in &opt.objects {
         // `repo_get_oid()` turns a full-length hex id into an object id without
         // consulting the odb, so an id that names nothing still reaches
@@ -421,25 +423,21 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     return Ok(code);
                 }
                 default_refs += 1;
-                // `snapshot_ref()` calls `parse_object()`, which creates the
-                // object and then parses it — and the parse creates the links it
-                // stores: `parse_commit_buffer()` its tree and every parent,
-                // `parse_tag_buffer()` the tagged object. A tree's entries are
-                // *not* created here; `parse_tree_buffer()` only keeps the
-                // buffer, and the entries are decoded later by the walk.
-                state.note(id);
-                let kind = repo.find_header(id).map(|h| h.kind()).ok();
-                if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
-                    if let Ok(Ok(parsed)) = decode(&repo, id) {
-                        for (child, _) in &parsed.children {
-                            state.note(*child);
-                        }
-                        pre_parsed.insert(id);
-                        if kind == Some(Kind::Commit) {
-                            commit_graph_info_now(&mut graph, id)?;
-                        }
+                // `repo_get_oid()` parses first when the argument peels: `peel_onion()`
+                // parses `<rev>` and each object on the way down to the type it asks for
+                // (see [`get_oid_peeled`]).
+                let base = arg.split_once(':').map_or(arg.as_str(), |(base, _)| base);
+                let mut peeled = arg_parsed.clone();
+                let mut calls: Vec<(ObjectId, bool)> = Vec::new();
+                if get_oid_peeled(&repo, base, &mut peeled, &mut calls).is_some() {
+                    arg_parsed = peeled;
+                    for (call, parses) in calls {
+                        parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, call, parses)?;
                     }
                 }
+                // Then `snapshot_ref()` calls `parse_object()` on what it resolved to.
+                let parses = arg_parsed.insert(id);
+                parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, id, parses)?;
                 heads.push(id);
             }
             None => {
@@ -2341,6 +2339,41 @@ fn commit_graph_info_now(graph: &mut ProcessGraph<'_>, id: ObjectId) -> Result<(
     result.map_err(crate::fatal::die)
 }
 
+/// The `obj_hash` side of one `parse_object()` call made while the arguments are
+/// read. Its `lookup_object()` finds or creates the object; a call that finds it
+/// parsed returns there (object.c:335-337). A parse creates the links it stores —
+/// `parse_commit_buffer()` the tree and then every parent, `parse_tag_buffer()` the
+/// tagged object — each with its type. A tree's entries are *not* created:
+/// `parse_tree_buffer()` only keeps the buffer, and the walk decodes it later.
+fn parse_object_ops(
+    repo: &gix::Repository,
+    state: &mut State,
+    pre_parsed: &mut HashSet<ObjectId>,
+    graph: &mut ProcessGraph<'_>,
+    id: ObjectId,
+    parses: bool,
+) -> Result<()> {
+    state.note(id);
+    if !parses {
+        return Ok(());
+    }
+    let kind = repo.find_header(id).map(|h| h.kind()).ok();
+    if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
+        if let Ok(Ok(parsed)) = decode(repo, id) {
+            state.typed.insert(id);
+            for (child, _) in &parsed.children {
+                state.note(*child);
+                state.typed.insert(*child);
+            }
+            pre_parsed.insert(id);
+            if kind == Some(Kind::Commit) {
+                commit_graph_info_now(graph, id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `repo_parse_commit()` from `fsck_walk_commit()` (fsck.c:410) on a commit nothing has parsed
 /// yet, as far as the commit-graph answers it (commit.c:625-640): `Some(Some(_))` is the tree
 /// and parents the graph holds, `Some(None)` sends the caller to the object database, and `None`
@@ -3866,7 +3899,9 @@ fn check_objects_progress(repo: &gix::Repository, objdir: &Path, pack_lists: Opt
 ///
 ///  * a full-length hex id or an existing ref name resolves without reading an
 ///    object (`get_oid_basic()`);
-///  * `<rev>:<path>` resolves `<rev>` that way, then `get_tree_entry()`
+///  * `<rev>^{<type>}` resolves `<rev>` either way and then parses its way down
+///    to the type (see [`get_oid_peeled`]);
+///  * `<rev>:<path>` resolves `<rev>` either way, then `get_tree_entry()`
 ///    (tree-walk.c:605-635) reads `<rev>` peeled to a tree with
 ///    `odb_read_object_peeled()` — the commit or tag, then what it points at,
 ///    down to the tree — and `find_tree_entry()` (tree-walk.c:568-603) reads
@@ -3883,7 +3918,9 @@ fn explicit_arg_reads(repo: &gix::Repository, args: &[String]) -> Option<Vec<Obj
             Some((base, path)) => (base, Some(path)),
             None => (arg.as_str(), None),
         };
-        let base_id = resolve_without_reads(repo, base)?;
+        let mut calls: Vec<(ObjectId, bool)> = Vec::new();
+        let base_id = get_oid_peeled(repo, base, &mut parsed, &mut calls)?;
+        reads.extend(calls.into_iter().filter(|&(_, parses)| parses).map(|(id, _)| id));
         let id = match path {
             None => base_id,
             Some(path) => tree_entry_reads(repo, base_id, path, &mut reads)?,
@@ -3917,6 +3954,80 @@ fn resolve_without_reads(repo: &gix::Repository, base: &str) -> Option<ObjectId>
     }
     repo.find_reference(base).ok()?;
     repo.rev_parse_single(base).ok().map(|id| id.detach())
+}
+
+/// `get_oid_1()` (object-name.c:1083-1140) for a name that is either a
+/// [`resolve_without_reads`] form or `<name>^{<type>}` over one, appending every
+/// `parse_object()` call it makes to `calls`, each with whether it parses the
+/// object (`true`) or finds it in `parsed` already and returns at once
+/// (object.c:335-337). Either way the call's `lookup_object()` looks the id up.
+///
+/// `peel_onion()` (object-name.c:907-1000) resolves `<name>`, then
+/// `parse_object()`s it. `^{}` follows a tag chain with `deref_tag()`, which
+/// `parse_object()`s each tagged object (tag.c:76-95); every other type goes
+/// through `repo_peel_to_type()` (object-name.c:882-905), which parses only an
+/// object not parsed yet and steps from a tag to what it tags and from a commit
+/// to its tree. `None` for a shape not modelled: a `~`/`^<n>` suffix, `^{/<regex>}`,
+/// an unknown type, or a peel git fails.
+fn get_oid_peeled(
+    repo: &gix::Repository,
+    name: &str,
+    parsed: &mut HashSet<ObjectId>,
+    calls: &mut Vec<(ObjectId, bool)>,
+) -> Option<ObjectId> {
+    let open = match name.len() >= 4 && name.ends_with('}') {
+        true => name.rfind("^{").filter(|&caret| caret > 0),
+        false => None,
+    };
+    let Some(caret) = open else {
+        return resolve_without_reads(repo, name);
+    };
+    // `None` asks `deref_tag()`'s peel to a non-tag, `Some(None)` takes any type.
+    let expected: Option<Option<Kind>> = match &name[caret + 2..] {
+        "commit}" => Some(Some(Kind::Commit)),
+        "tag}" => Some(Some(Kind::Tag)),
+        "tree}" => Some(Some(Kind::Tree)),
+        "blob}" => Some(Some(Kind::Blob)),
+        "object}" => Some(None),
+        "}" => None,
+        _ => return None,
+    };
+    // One `parse_object()` call; a commit or tag it cannot parse fails the peel.
+    let parse = |id: ObjectId, parsed: &mut HashSet<ObjectId>, calls: &mut Vec<(ObjectId, bool)>| -> Option<Kind> {
+        let kind = repo.find_header(id).ok()?.kind();
+        let parses = parsed.insert(id);
+        if parses && matches!(kind, Kind::Commit | Kind::Tag) && !matches!(decode(repo, id), Ok(Ok(_))) {
+            return None;
+        }
+        calls.push((id, parses));
+        Some(kind)
+    };
+    // The tag's target, or the commit's tree `parse_commit_buffer()` stored.
+    let deref = |id: ObjectId| -> Option<ObjectId> { decode(repo, id).ok()?.ok()?.children.first().map(|(c, _)| *c) };
+
+    let outer = get_oid_peeled(repo, &name[..caret], parsed, calls)?;
+    let mut o = outer;
+    let mut kind = parse(o, parsed, calls)?;
+    let Some(expected) = expected else {
+        while kind == Kind::Tag {
+            o = deref(o)?;
+            kind = parse(o, parsed, calls)?;
+        }
+        return Some(o);
+    };
+    loop {
+        if expected.is_none_or(|want| want == kind) {
+            return Some(o);
+        }
+        o = match kind {
+            Kind::Tag | Kind::Commit => deref(o)?,
+            Kind::Tree | Kind::Blob => return None,
+        };
+        kind = match parsed.contains(&o) {
+            true => repo.find_header(o).ok()?.kind(),
+            false => parse(o, parsed, calls)?,
+        };
+    }
 }
 
 /// `get_tree_entry(repo, start, path)`'s reads, appended to `reads`, and the

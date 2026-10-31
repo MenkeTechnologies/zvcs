@@ -163,6 +163,51 @@ fn dangling_order_over_loose_and_duplicated_objects() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Two packs with one `st_mtime`, as two repacks within the same second leave them:
+/// `sort_pack()` ties (packfile.c:1044-1069), so the reads `snapshot_refs()` made decide
+/// the list order the listing walks. A `<rev>^{<type>}` argument reads through
+/// `peel_onion()`'s `parse_object()` calls (object-name.c:907-1000), which also create
+/// what each parse links to ahead of everything else in `obj_hash`.
+#[test]
+fn dangling_order_over_packs_of_one_mtime() {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let root = scratch("tie");
+    let repo = history(stock, &root, 80, 40);
+    setup(stock, &repo, &["repack", "-q", "-a"]);
+    let tag = setup(stock, &repo, &["rev-parse", "HEAD~7"]);
+    let tag = setup_in(
+        stock,
+        &repo,
+        &["hash-object", "-t", "tag", "-w", "--stdin"],
+        &format!("object {tag}\ntype commit\ntag t\ntagger C O Mitter <committer@example.com> 1112911993 -0700\n\nt\n"),
+    );
+    setup(stock, &repo, &["update-ref", "refs/tags/t", &tag]);
+    // The owner may set a file's times through a read-only descriptor (utimensat(2)),
+    // and a pack is read-only.
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let mut packs = 0;
+    for entry in std::fs::read_dir(repo.join(".git/objects/pack")).unwrap().flatten() {
+        if entry.path().extension().is_some_and(|ext| ext == "pack") {
+            std::fs::File::open(entry.path()).unwrap().set_modified(when).unwrap();
+            packs += 1;
+        }
+    }
+    assert_eq!(packs, 2);
+    for rev in ["HEAD^{tree}", "HEAD^{commit}", "HEAD^{}", "t^{tree}", "t^{}", "HEAD^{tree}:d0"] {
+        for args in [
+            &["fsck", "--connectivity-only", rev][..],
+            &["fsck", "--connectivity-only", "--unreachable", rev],
+            &["fsck", "--connectivity-only", "--verbose", rev],
+            &["fsck", rev],
+        ] {
+            let (code, out, _) = same(stock, &repo, args);
+            assert_eq!(code, 0, "{args:?}");
+            assert!(out.contains("dangling") || out.contains("unreachable"), "{args:?}: {out}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Two packs and loose objects, a deleted branch whose history only the reflog keeps, and
 /// `--lost-found`, whose files must be the ones stock writes.
 #[test]

@@ -46,6 +46,8 @@ enum Fault {
     PostAuth,
     /// The first `POST` sends its headers and half its body, then closes.
     PostTruncated,
+    /// The first `POST` sends its headers and half its body, then resets the connection.
+    PostReset,
 }
 
 /// One HTTP request off `stream`: method, target, lower-cased headers, body.
@@ -154,6 +156,22 @@ fn serve(stream: TcpStream, root: &Path, fault: Fault, posts: &AtomicUsize) {
         out.write_all(head.as_bytes()).ok();
         if matches!(fault, Fault::PostTruncated) && nth_post == Some(1) {
             out.write_all(&rest[..rest.len() / 2]).ok();
+            return;
+        }
+        if matches!(fault, Fault::PostReset) && nth_post == Some(1) {
+            out.write_all(&rest[..rest.len() / 2]).ok();
+            // SO_LINGER with a zero timeout makes the close send a RST instead of a FIN.
+            let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+            // SAFETY: a valid socket and a `linger` that outlives the call.
+            unsafe {
+                libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&stream),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&raw const linger).cast(),
+                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                );
+            }
             return;
         }
         out.write_all(rest).ok();
@@ -306,6 +324,21 @@ fn push_parity_truncated_response_is_curl_partial_file() {
     let got = run(BIN, "trunc-z", Fault::PostTruncated, false, &["push", "origin", "main"]);
     assert_eq!(got, want);
     assert!(want.stderr.starts_with("error: RPC failed; curl 18 end of response with "));
+}
+
+#[test]
+fn push_parity_reset_response_is_curl_recv_error() {
+    // A reset is a failed recv(), CURLE_RECV_ERROR, whatever the body's length (cf-socket.c:1663-1680).
+    check(
+        "reset",
+        Fault::PostReset,
+        false,
+        &["push", "origin", "main"],
+        "error: RPC failed; curl 56 Recv failure: Connection reset by peer\n\
+         send-pack: unexpected disconnect while reading sideband packet\n\
+         fatal: the remote end hung up unexpectedly\n\
+         Everything up-to-date\n",
+    );
 }
 
 #[test]

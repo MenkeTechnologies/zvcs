@@ -655,12 +655,40 @@ impl Write for RpcIn<'_> {
     }
 }
 
+/// The OS error a socket call under `err` failed with: reqwest and hyper wrap it, and `io::Error::source()` skips
+/// the error a custom `io::Error` carries, so each one's `get_ref()` is looked into as well.
+fn socket_errno(err: &std::io::Error) -> Option<i32> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        cur = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => match io.raw_os_error() {
+                Some(code) => return Some(code),
+                None => io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static)),
+            },
+            None => e.source(),
+        };
+    }
+    None
+}
+
 /// `run_slot()`'s report of a response body that stopped arriving (remote-curl.c:859-873), with the text curl
-/// gives the two ways this transport sees that happen: `CURLE_PARTIAL_FILE` for a body shorter than its
-/// `Content-Length`, and `CURLE_OPERATION_TIMEDOUT` for `http.lowSpeedLimit`. Returns whether it said anything.
+/// gives the three ways this transport sees that happen: `CURLE_OPERATION_TIMEDOUT` for `http.lowSpeedLimit`;
+/// `CURLE_RECV_ERROR` for a `recv()` that failed, such as a connection reset, which `cf_socket_recv()` words
+/// "Recv failure: <strerror>" (cf-socket.c:1663-1680); and `CURLE_PARTIAL_FILE` for a clean end of the stream
+/// short of the `Content-Length`, the 0-byte `recv()` that `sendrecv_dl()` writes as the end of the body
+/// (transfer.c:286-297) and `cw_download_write()` refuses (sendf.c:243-247). Returns whether it said anything.
+///
+/// libcurl before 8.9.0 has no `cw_download_write()` check and says "transfer closed with N bytes remaining to
+/// read" for the same short body (transfer.c:526-527 in 8.7.1); this follows the current wording.
 fn report_body_failure(err: &std::io::Error, content_length: Option<u64>, received: u64) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         eprintln!("error: RPC failed; curl 28 {err}");
+        return true;
+    }
+    if let Some(code) = socket_errno(err) {
+        let text = std::io::Error::from_raw_os_error(code).to_string();
+        let text = text.strip_suffix(&format!(" (os error {code})")).unwrap_or(&text);
+        eprintln!("error: RPC failed; curl 56 Recv failure: {text}");
         return true;
     }
     match content_length {

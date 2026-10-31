@@ -1033,6 +1033,16 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
+    // With a pathspec the reset is three children (builtin/stash.c:1781-1815): `git add`
+    // stages what the pathspec names, `git diff-index --cached HEAD` takes what that staged
+    // against `HEAD`, and `git apply --index -R` reverses it. `run_command()` failing for any
+    // of them ends the push with -1, the stash already stored and announced.
+    if !opts.pathspecs.is_empty() && !opts.staged_only {
+        if let Some(code) = pathspec_reset_refusal(repo, opts, head_tree_id)? {
+            return Ok(code);
+        }
+    }
+
     // Reset the tracked worktree + index (untracked files handled separately
     // below). `--keep-index` resets to the index tree rather than HEAD, which is
     // precisely what leaves the staged changes staged and their content on disk.
@@ -1082,10 +1092,16 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // index holds right now) and reverting only the affected paths is what keeps
     // a staged change to an unmatched path staged, which is what git does under
     // a pathspec. Reverting nothing is `--keep-index`.
+    //
+    // With a pathspec that tree is only ever an index: `add` and `apply --index -R` stage
+    // entry by entry and write no tree object (builtin/stash.c:1784-1815), so it is built in
+    // the scratch odb, as is the index read from it. Written to the repository, an `I` with
+    // an unmatched path staged left a dangling tree stock never has.
+    let index_odb = if opts.pathspecs.is_empty() { repo } else { &scratch };
     let index_target = if keep_index {
         i_tree_id
     } else {
-        revert_paths_in_tree(repo, i_tree_id, head_tree_id, &affected)?
+        revert_paths_in_tree(index_odb, i_tree_id, head_tree_id, &affected)?
     };
     // `-S`'s target tree lives in the scratch odb, so both readers go through it; for
     // every other mode it is a real tree and the proxy just reads through.
@@ -1135,12 +1151,19 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     } else {
         CacheTree::LikeUnpackTrees
     };
-    write_target_index(repo, index_target, &old_index, &fresh, cache_tree)?;
+    write_target_index(index_odb, index_target, &old_index, &fresh, cache_tree)?;
 
     // With a pathspec the untracked matches leave through the `add` and
-    // `apply --index -R` children, after the tracked paths are reset.
+    // `apply --index -R` children, after the tracked paths are reset. The reversed patch
+    // deletes only what `HEAD` lacks: an untracked path `HEAD` tracks (one the index had
+    // dropped, or a missing index) is a modification or no change at all in
+    // `diff-index --cached HEAD`, so `apply -R` leaves it at `HEAD`'s content, which the
+    // reset above already wrote (builtin/stash.c:1784-1815).
     if !opts.pathspecs.is_empty() {
-        remove_stashed_untracked(repo, &untracked_paths);
+        let head = tree_map(repo, head_tree_id)?;
+        let created: Vec<BString> =
+            untracked_paths.iter().filter(|path| !head.contains_key(*path)).cloned().collect();
+        remove_stashed_untracked(repo, &created);
     }
 
     // `do_push_stash()` clears the worktree with `reset --hard`, which logs
@@ -1183,8 +1206,14 @@ fn push(repo: &gix::Repository, opts: &PushOpts) -> Result<ExitCode> {
     // -- <an ignored file>` stores and announces the stash, then reports
     // `error: pathspec '…' did not match any file(s) known to git` and fails (`-1`).
     // The check at the top of the push could not have caught it: `-a` skips it.
+    //
+    // `--no-overlay` matches the pathspec against the index as well as the tree
+    // (`mark_ce_for_checkout_no_overlay()`, builtin/checkout.c:421-436), and after
+    // `apply --index -R` the matched part of the index is exactly `HEAD`'s, so a path
+    // `HEAD` tracks matches even where `I` dropped it — the checkout then removes it.
     if keep_index && !opts.pathspecs.is_empty() && !opts.staged_only {
-        let staged: Vec<BString> = tree_map(repo, i_tree_id)?.into_keys().collect();
+        let mut staged: Vec<BString> = tree_map(repo, i_tree_id)?.into_keys().collect();
+        staged.extend(tree_map(repo, head_tree_id)?.into_keys());
         if let Some(code) = report_path_error(repo, &opts.pathspecs, &staged, false)? {
             return Ok(code);
         }
@@ -1203,6 +1232,99 @@ fn remove_stashed_untracked(repo: &gix::Repository, untracked_paths: &[BString])
         let _ = std::fs::remove_file(&abs);
     }
     remove_emptied_dirs(repo, untracked_paths);
+}
+
+/// The first two children of `do_push_stash()`'s pathspec reset and the refusals of the
+/// third (builtin/stash.c:1784-1815). `None` when the reversed patch applies, which the
+/// caller's reset then carries out.
+///
+/// `git add -- <ps>` runs as the child git runs — `-u` unless untracked files were taken,
+/// `--force` under `-a` — at the top level with each spec's `original` form, so its refusals
+/// (a spec matching no file, an ignored path named outright) are its own. What it leaves
+/// staged is compared with `HEAD` over the pathspec, as `diff-index --cached HEAD -- <ps>`
+/// does, and `apply --index -R` refuses that patch before touching anything in two ways:
+///
+/// * no patch at all, `error: No valid patches in input (allow with "--allow-empty")`
+///   (apply.c:4945-4950) — an untracked file `HEAD` tracks with the same content, staged by
+///   `add` straight back to `HEAD`'s entry;
+/// * a path the reversed patch would create while the worktree has a file there
+///   (`check_to_create()`, apply.c:3941-3985, reported at :4120-4123) — a path the index
+///   dropped that `add -u` does not stage back. Every such path is reported, in patch order.
+fn pathspec_reset_refusal(
+    repo: &gix::Repository,
+    opts: &PushOpts,
+    head_tree_id: ObjectId,
+) -> Result<Option<ExitCode>> {
+    let mut args = vec!["add".to_string()];
+    if opts.untracked == Untracked::No {
+        args.push("-u".to_string());
+    }
+    if opts.untracked == Untracked::All {
+        args.push("--force".to_string());
+    }
+    args.push("--".to_string());
+    args.extend(opts.pathspecs.iter().map(|spec| original(spec)));
+    let (ok, _) = super::add_patch::run_git(&args, None, false, repo.workdir())?;
+    if !ok {
+        return Ok(Some(ExitCode::FAILURE));
+    }
+
+    let head = tree_map(repo, head_tree_id)?;
+    let index = crate::index_open::or_empty(repo)?;
+    let backing = index.path_backing();
+    let staged: HashMap<BString, (ObjectId, Mode)> = index
+        .entries()
+        .iter()
+        .filter(|e| e.stage() == gix::index::entry::Stage::Unconflicted)
+        .map(|e| (e.path_in(backing).to_owned(), (e.id, e.mode)))
+        .collect();
+    let mut candidates: Vec<BString> = head.keys().chain(staged.keys()).cloned().collect();
+    candidates.sort();
+    candidates.dedup();
+    let matched = select_matching(repo, &opts.pathspecs, &candidates)?;
+    // `diff-index` walks the index and the tree in path order, which is the order
+    // `apply` checks the patches in.
+    let mut reversed: Vec<&BString> =
+        candidates.iter().filter(|p| matched.contains(*p) && staged.get(*p) != head.get(*p)).collect();
+    reversed.sort();
+    if reversed.is_empty() {
+        eprintln!("error: No valid patches in input (allow with \"--allow-empty\")");
+        return Ok(Some(ExitCode::FAILURE));
+    }
+    let mut refused = false;
+    for path in reversed {
+        // Only a deletion from `HEAD` reverses into a creation.
+        if !head.contains_key(path) || staged.contains_key(path) {
+            continue;
+        }
+        let Some(full) = repo.workdir_path(path.as_bstr()) else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(&full) else { continue };
+        if meta.is_dir() || has_symlink_leading_path(repo, path.as_bstr()) {
+            continue;
+        }
+        eprintln!("error: {path}: already exists in working directory");
+        refused = true;
+    }
+    Ok(refused.then_some(ExitCode::FAILURE))
+}
+
+/// `has_symlink_leading_path()` (symlinks.c): whether a directory above `path` is a symlink.
+fn has_symlink_leading_path(repo: &gix::Repository, path: &BStr) -> bool {
+    let Some(root) = repo.workdir() else { return false };
+    let mut dir = root.to_path_buf();
+    let mut components = path.split_str("/").peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            return false;
+        }
+        dir.push(gix::path::from_bstr(component.as_bstr()).as_ref());
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(meta) if meta.is_dir() => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Pathspec matching for a push, over the same `repo.pathspec()` engine `rm`,
@@ -1344,18 +1466,25 @@ fn is_exclude_spec(spec: &str) -> bool {
 /// prefix joins it there, rather than a second `:(prefix:0)` being stacked in
 /// front of it. The prefix length is always 0 here: this port resolves a pathspec
 /// against the repository root, so the cwd contributes no prefix magic.
+///
+/// What follows the magic is the element's `match`, not the word as typed
+/// (pathspec.c:513-521): `prefix_path_gently()` has folded `./`, `..` and doubled
+/// slashes out of it (pathspec.c:489-490), unless `top` magic copied it verbatim
+/// (:485-487). So `./notes.txt` is `:(prefix:0)notes.txt` and `.` is `:(prefix:0)`,
+/// which is also what the `add` child of a pathspec push is handed.
 fn original(spec: &str) -> String {
     let Some(rest) = spec.strip_prefix(':') else {
-        return format!(":(prefix:0){spec}");
+        return format!(":(prefix:0){}", pathspec_match(spec, false));
     };
     // Long form `:(magic,magic)<pattern>`: the magic list is kept and the prefix
     // is appended inside the same parentheses.
     if let Some(body) = rest.strip_prefix('(') {
         return match body.split_once(')') {
             Some((magic, pattern)) if !magic.is_empty() => {
-                format!(":({magic},prefix:0){pattern}")
+                let top = magic.split(',').any(|m| m.trim() == "top");
+                format!(":({magic},prefix:0){}", pathspec_match(pattern, top))
             }
-            Some((_, pattern)) => format!(":(prefix:0){pattern}"),
+            Some((_, pattern)) => format!(":(prefix:0){}", pathspec_match(pattern, false)),
             // An unterminated `:(` is not valid magic; git would have died on it
             // already, so there is nothing to fold and the spec stands as typed.
             None => format!(":(prefix:0){spec}"),
@@ -1382,7 +1511,21 @@ fn original(spec: &str) -> String {
         _ => 2,
     });
     names.dedup();
-    format!(":({},prefix:0){pattern}", names.join(","))
+    let top = names.contains(&"top");
+    format!(":({},prefix:0){}", names.join(","), pathspec_match(pattern, top))
+}
+
+/// The `match` `init_pathspec_item()` builds from a pattern at the top level
+/// (pathspec.c:481-501): copied as is under `top` magic, otherwise normalized by
+/// `prefix_path_gently()` with an empty prefix. A pattern that climbs out of the
+/// worktree was already a `die()` in `parse_pathspec_fatal()`, and an absolute one
+/// is left as typed.
+fn pathspec_match(pattern: &str, top: bool) -> String {
+    if top || pattern.starts_with('/') {
+        return pattern.to_string();
+    }
+    crate::pathspec::normalize_path(pattern.into())
+        .map_or_else(|| pattern.to_string(), |m| m.to_str_lossy().into_owned())
 }
 
 /// The first index entry `stash_working_tree()`'s one-way merge would refuse, or

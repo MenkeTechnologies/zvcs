@@ -525,6 +525,37 @@ impl Delta {
         }
     }
 
+    /// `DIFF_FILE_VALID()` on both sides and differing `S_IFMT` bits: the pair
+    /// `run_diff()` splits (diff.c:5031-5033). An unmerged pair returned before.
+    fn is_type_change(&self) -> bool {
+        !self.unmerged
+            && self.old_valid()
+            && self.new_valid()
+            && (self.src_mode & S_IFMT) != (self.dst_mode & S_IFMT)
+    }
+
+    /// The two halves `run_diff()` hands `run_diff_cmd()`: `one` against an empty
+    /// filespec, then an empty filespec against `two` (diff.c:5038-5048). `p`
+    /// itself, its rename source and score included, stays the same for both.
+    fn split_type_change(&self, null: ObjectId) -> [Delta; 2] {
+        let half = |src: bool| Delta {
+            src_mode: if src { self.src_mode } else { 0 },
+            dst_mode: if src { 0 } else { self.dst_mode },
+            src_id: if src { self.src_id } else { null },
+            dst_id: if src { null } else { self.dst_id },
+            unmerged: false,
+            path: self.path.clone(),
+            rename: self.rename.as_ref().map(|r| RenameSrc {
+                path: r.path.clone(),
+                copy: r.copy,
+            }),
+            score: self.score,
+            dirty: [src && self.dirty[0], !src && self.dirty[1]],
+            hashed: [src && self.hashed[0], !src && self.hashed[1]],
+        };
+        [half(true), half(false)]
+    }
+
     fn old_valid(&self) -> bool {
         self.src_mode != 0
     }
@@ -535,7 +566,7 @@ impl Delta {
 }
 
 /// What the index knows about one path, with the stages collapsed the way git's
-/// `oneway_diff` sees them: stage 2 wins when a path is unmerged, and the stat data of
+/// `oneway_diff` sees them: the first stage stands for an unmerged path, and the stat data of
 /// an unmerged entry is all zeroes, which is what makes it always compare dirty.
 struct IdxInfo {
     mode: u32,
@@ -2276,6 +2307,10 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
         };
         let analyzed = unhashable.as_ref().map_or(deltas.len(), |u| u.index);
         let halted = unhashable.is_some() && (opts.numstat || opts.diffstat || opts.shortstat);
+        // `run_diff()`'s split of a type change (diff.c:5031-5049): the patch shows
+        // the pair as a deletion of `one` followed by a creation of `two`, each
+        // analysed on its own, while every other format keeps the whole pair.
+        let mut halves: Vec<Option<[(Delta, IdxAnalysis); 2]>> = Vec::new();
         let analyses: Vec<IdxAnalysis> = if need_analyses {
             // `diff_filespec_load_driver()`: the `diff` attribute — `-diff` is
             // `driver_false`, `diff` is `driver_true`, a value names a driver whose
@@ -2303,6 +2338,25 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                     opts.allow_textconv.then(|| drv.textconv()).unwrap_or((None, None)),
                     &mut lookup,
                 )?);
+                if opts.patch && d.is_type_change() {
+                    let [one, two] = d.split_type_change(ObjectId::null(repo.object_hash()));
+                    let mut half = |h: Delta| -> Result<(Delta, IdxAnalysis)> {
+                        let an = analyze_index_delta(
+                            &repo,
+                            workdir.as_deref(),
+                            &h,
+                            &opts,
+                            *db,
+                            drv.funcname(),
+                            opts.allow_textconv.then(|| drv.textconv()).unwrap_or((None, None)),
+                            &mut lookup,
+                        )?;
+                        Ok((h, an))
+                    };
+                    halves.push(Some([half(one)?, half(two)?]));
+                } else {
+                    halves.push(None);
+                }
             }
             analyses
         } else {
@@ -2450,18 +2504,25 @@ pub fn diff_index(args: &[String]) -> Result<ExitCode> {
                 (false, Some(Some(n))) => n.clamp(crate::abbrev::MINIMUM_ABBREV, hexsz),
                 (false, _) => crate::abbrev::configured_abbrev(&repo, hexsz),
             };
-            for (d, an) in deltas.iter().zip(&analyses) {
-                let before = plain.len();
-                render_patch(&mut plain, d, an, &opts, patch_abbrev, zlib_level);
-                if plain.len() != before {
-                    files.push(diff_color::FilePaint {
-                        ws_rule,
-                        blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
+            for (i, (d, an)) in deltas.iter().zip(&analyses).enumerate() {
+                let whole = [(d, an)];
+                let split: Vec<(&Delta, &IdxAnalysis)> = match halves.get(i) {
+                    Some(Some(h)) => h.iter().map(|(d, an)| (d, an)).collect(),
+                    _ => whole.to_vec(),
+                };
+                for (d, an) in split {
+                    let before = plain.len();
+                    render_patch(&mut plain, d, an, &opts, patch_abbrev, zlib_level);
+                    if plain.len() != before {
+                        files.push(diff_color::FilePaint {
+                            ws_rule,
+                            blank_at_eof: diff_color::check_blank_at_eof(&an.old_data, &an.new_data),
                         // This command does not resolve a path's userdiff driver, so no driver word
                         // regex is available; `diff.wordRegex` still reaches the emitter through
                         // [`diff_color::ExtraPaint`].
                         word_regex: None,
-                    });
+                        });
+                    }
                 }
             }
             let at = rest.len();
@@ -2732,13 +2793,10 @@ fn collect(
         let stage = e.stage_raw();
         match idx.get_mut(&path) {
             Some(slot) => {
+                // The first stage is the entry `unpack_index_entry()` and
+                // `unpack_callback()` hand to `oneway_diff()`; the rest are only
+                // marked used (unpack-trees.c:703-721, :1537-1561).
                 slot.unmerged = true;
-                // Stage 2 ("ours") is the entry git's one-way merge keeps.
-                if stage == 2 {
-                    slot.mode = e.mode.bits();
-                    slot.id = e.id;
-                    slot.stat = e.stat;
-                }
             }
             None => {
                 idx.insert(
@@ -2861,6 +2919,18 @@ fn collect(
             let workdir = workdir.as_deref().expect("checked above");
             let full = worktree_path(workdir, path);
             match std::fs::symlink_metadata(&full) {
+                Ok(md)
+                    if md.is_dir()
+                        && (info.mode & S_IFMT) != 0o160000
+                        && super::worktree_filespec::gitlink_head(workdir, path.as_bstr()).is_some() =>
+                {
+                    // `check_removed()` keeps a directory that is a repository whose
+                    // `HEAD` resolves (diff-lib.c:58-63), and `ie_match_stat()` finds
+                    // the file's type changed, so `ce_mode_from_stat()` names the
+                    // directory a gitlink with a null id (diff-lib.c:338-342).
+                    dst_mode = 0o160000;
+                    dst_id = null;
+                }
                 Ok(md) if md.is_dir() && (info.mode & S_IFMT) != 0o160000 => {
                     // A tracked file replaced by a directory counts as removed.
                     if !opts.match_missing {
@@ -2892,6 +2962,15 @@ fn collect(
                         if ignore != Ignore::Dirty && (!changed || opts.patch) {
                             dirty_submodule = status.changes.as_ref().is_some_and(|c| !c.is_empty());
                         }
+                    }
+                }
+                Ok(md) if (info.mode & S_IFMT) == 0o160000 => {
+                    // A gitlink over anything but a directory: `ce_match_stat_basic()`
+                    // reports `TYPE_CHANGED` (read-cache.c:331-334), which only an
+                    // ignored submodule cancels (diff-lib.c:98-99).
+                    if gitlink_ignore.get(path) != gix::submodule::config::Ignore::All {
+                        dst_mode = mode_from_stat(&md);
+                        dst_id = null;
                     }
                 }
                 Ok(md) => {

@@ -1060,15 +1060,16 @@ fn summary_changes(
 ///
 /// `git diff-index --cached` (diff-lib.c:467-474) queues the same empty pair
 /// and fills `pair->one` from the *tree*, so it reads
-/// `:160000 000000 <tree oid> <null> U`.
+/// `:160000 000000 <tree oid> <null> U`, and nothing that is a gitlink on
+/// neither side when the tree lacks the path.
 ///
 /// `git diff-index` without `--cached` takes neither branch — `cached` is false
-/// there — and falls through to `show_modified()`, which compares the tree
-/// against the index entry and reports a null destination because an unmerged
-/// entry carries no stat data to match: `:160000 160000 <tree oid> <null> M`.
+/// there — and compares the first stage, the entry `unpack_index_entry()` and
+/// `unpack_callback()` hand over (unpack-trees.c:703-721, :1537-1561), as if it
+/// were merged: `show_new_file()` or `show_modified()` (diff-lib.c:351-433).
 ///
-/// In the two `!cached` shapes `generate_submodule_summary()` then replaces the
-/// null destination with the submodule's own `HEAD`
+/// In the `!cached` shapes `generate_submodule_summary()` then replaces a null
+/// destination with the submodule's own `HEAD` or the file's hash
 /// (builtin/submodule--helper.c:1025-1031), which is what [`worktree_entry`]
 /// does for the merged case.
 #[allow(clippy::too_many_arguments)]
@@ -1126,7 +1127,16 @@ fn unmerged_changes(
         }
         return Ok(pairs);
     }
-    Ok(unmerged_change(repo, path, lowest, rev, cached, null).into_iter().collect())
+    let mut pairs: Vec<Change> = unmerged_change(repo, index, path, lowest, rev, cached, null)?.into_iter().collect();
+    pairs.retain(|c| c.src_is_gitlink() || c.dst_is_gitlink());
+    if !cached {
+        for change in &mut pairs {
+            if change.oid_dst == *null {
+                change.oid_dst = worktree_oid(repo, path, change.mod_dst).unwrap_or(*null);
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 /// `generate_submodule_summary()`'s fill-in for a null destination id when the
@@ -1142,52 +1152,106 @@ fn worktree_oid(repo: &gix::Repository, path: &BString, mode: u32) -> Option<Obj
     }
 }
 
-/// The `diff-index` half of [`unmerged_changes`].
+/// The `diff-index` half of [`unmerged_changes`]: `do_oneway_diff()`
+/// (diff-lib.c:443-499) for the first stage `lowest` against the tree entry.
+#[allow(clippy::too_many_arguments)]
 fn unmerged_change(
     repo: &gix::Repository,
+    index: &gix::index::File,
     path: &BString,
     lowest: &gix::index::Entry,
     rev: Option<&ObjectId>,
     cached: bool,
     null: &ObjectId,
-) -> Option<Change> {
-    let head_of_submodule = || {
-        let full = repo.workdir()?.join(&*gix::path::from_bstr(path.as_bstr()));
-        gix::open(full).ok()?.head_id().ok().map(|id| id.detach())
-    };
-    let (mod_src, oid_src) = match rev {
-        Some(rev) => entry_of_tree(repo, rev, path)?,
-        None => return None,
-    };
-    if cached {
-        return Some(Change {
+) -> Result<Option<Change>> {
+    use gix::index::entry::Flags;
+    let tree = rev.and_then(|rev| entry_of_tree(repo, rev, path));
+    // `cached = o->index_only || CE_VALID || ce_skip_worktree()`, and a staged
+    // entry under it is `diff_unmerge()` with `pair->one` filled from the tree
+    // (diff-lib.c:462-474).
+    if cached || lowest.flags.intersects(Flags::ASSUME_VALID | Flags::SKIP_WORKTREE) {
+        let (mod_src, oid_src) = tree.unwrap_or((0, *null));
+        return Ok(Some(Change {
             path: path.clone(),
             mod_src,
             oid_src,
             mod_dst: 0,
             oid_dst: *null,
             status: 'U',
-        });
+        }));
     }
-    Some(Change {
+    if repo.workdir().is_none() {
+        return Ok(None);
+    }
+    // `get_stat_data()` (diff-lib.c:313-349): `check_removed()`, then
+    // `match_stat_with_submodule()` under `--ignore-submodules=dirty`, which is
+    // what [`super::diff_files::EntryCompare::compare`] runs. A removal makes it
+    // return -1; otherwise a change is the stat mode with a null id, and no
+    // change keeps the stage's own mode and id.
+    let compare = super::diff_files::EntryCompare::new(
+        repo,
+        index,
+        gix::status::Submodule::Given {
+            ignore: gix::submodule::config::Ignore::Dirty,
+            check_dirty: false,
+        },
+        false,
+    )?;
+    let (mod_dst, oid_dst) = match compare.compare(lowest, path.as_bstr())? {
+        // `show_new_file()` returns on -1; `show_modified()` reports the tree
+        // entry as removed (diff-lib.c:369-371, :397-403).
+        Some(pair) if pair.status == b'D' => {
+            return Ok(tree.map(|(mod_src, oid_src)| Change {
+                path: path.clone(),
+                mod_src,
+                oid_src,
+                mod_dst: 0,
+                oid_dst: *null,
+                status: 'D',
+            }));
+        }
+        Some(pair) => (pair.dst_mode, pair.dst_id),
+        None => (lowest.mode.bits(), lowest.id),
+    };
+    let Some((mod_src, oid_src)) = tree else {
+        // `diff_index_show_file(revs, "+", ...)` (diff-lib.c:372).
+        return Ok(Some(Change {
+            path: path.clone(),
+            mod_src: 0,
+            oid_src: *null,
+            mod_dst,
+            oid_dst,
+            status: 'A',
+        }));
+    };
+    // `show_modified()` queues `diff_change()` only when mode or id moved
+    // (diff-lib.c:426-430); the dirty flag cannot be raised under `dirty`.
+    if mod_src == mod_dst && oid_src == oid_dst {
+        return Ok(None);
+    }
+    let status = if mod_src & S_IFMT != mod_dst & S_IFMT { 'T' } else { 'M' };
+    Ok(Some(Change {
         path: path.clone(),
         mod_src,
         oid_src,
-        mod_dst: lowest.mode.bits(),
-        oid_dst: head_of_submodule().unwrap_or(*null),
-        status: 'M',
-    })
+        mod_dst,
+        oid_dst,
+        status,
+    }))
 }
 
 /// Every gitlink of the index, keyed by path. Both diff commands walk the whole
 /// index, unmerged stages included — `run_diff_files` has an explicit
 /// `if (ce_stage(ce))` branch (diff-lib.c:154) and `do_oneway_diff` another
 /// (diff-lib.c:467) — so a conflicted submodule is a candidate path like any
-/// other.
+/// other. Every unmerged path is one as well, whatever its stages hold: the
+/// first stage is compared with the work tree, and a blob stage over a
+/// submodule checkout reads as `160000` through `ce_mode_from_stat()`
+/// (diff-lib.c:161-170, :339-342).
 fn gitlinks_of_index(index: &gix::index::State) -> HashMap<BString, ObjectId> {
     let mut out = HashMap::new();
     for entry in index.entries() {
-        if entry.mode == gix::index::entry::Mode::COMMIT {
+        if entry.mode == gix::index::entry::Mode::COMMIT || entry.stage_raw() != 0 {
             out.entry(entry.path(index).to_owned()).or_insert(entry.id);
         }
     }

@@ -1387,7 +1387,10 @@ fn select_matching(
 /// `cmd_stash` still exits 128 for it from `git stash push` and 1 from the
 /// assumed push (see [`failed`]).
 ///
-/// Exclusions select by removing, so they are never reported as unmatched.
+/// An exclusion is named only when no spec matched positively, since
+/// `do_match_pathspec()` marks it seen on the `DO_MATCH_EXCLUDE` pass that follows a
+/// positive match (dir.c:557-563); with every spec an exclusion, `parse_pathspec()`'s
+/// appended `.` item (pathspec.c:671-678) stands in for the positive ones.
 fn report_path_error(
     repo: &gix::Repository,
     specs: &[String],
@@ -1397,24 +1400,21 @@ fn report_path_error(
     let mut matched: Vec<bool> = Vec::with_capacity(specs.len());
     for raw in specs {
         if is_exclude_spec(raw) {
-            matched.push(true);
+            matched.push(false);
             continue;
         }
         let one = [raw.clone()];
         matched.push(!select_matching(repo, &one, candidates)?.is_empty());
     }
-    let mut errors = false;
-    for (i, raw) in specs.iter().enumerate() {
-        if matched[i] {
-            continue;
-        }
-        // The duplicate-of-a-match exemption, verbatim from `report_path_error()`.
-        if specs.iter().enumerate().any(|(j, other)| j != i && matched[j] && other == raw) {
-            continue;
-        }
-        eprintln!("error: pathspec '{}' did not match any file(s) known to git", original(raw));
-        errors = true;
+    // The exclusions, the appended `.` item and the duplicate-of-a-match exemption
+    // are `report_path_error()`'s, decided in one place.
+    let originals: Vec<String> = specs.iter().map(|raw| original(raw)).collect();
+    let unmatched = crate::pathspec::report_path_error_items(&originals, |i| matched[i], !candidates.is_empty());
+    for item in &unmatched {
+        let spec = item.map_or(".", |i| originals[i].as_str());
+        eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
     }
+    let errors = !unmatched.is_empty();
     if errors {
         if hint {
             eprintln!("Did you forget to 'git add'?");
@@ -1842,9 +1842,13 @@ fn build_stash_commit(
         Err(_) if !repo.index_path().exists() => Some(gix::index::File::clone(&*repo.index_or_empty()?)),
         Err(_) => None,
     };
-    if let Some(mut index) = index {
-        super::write_tree::update_cache_tree_if_stale(repo, &mut index)?;
-    }
+    // The root it records is `info->i_tree`. `cache_tree_update()` writes only the nodes
+    // it had to rebuild (cache-tree.c:497-503), so a root the cache-tree already held —
+    // the empty tree `read-tree --empty` records — is named without ever being written.
+    let cache_tree_root = match index {
+        Some(mut index) => super::write_tree::refresh_cache_tree(repo, &mut index, false)?.ok(),
+        None => None,
+    };
     let head_id = repo.head_id()?.detach();
     let head_tree_id = repo.head_tree_id()?.detach();
     let branch = match repo.head_name()? {
@@ -1940,7 +1944,12 @@ fn build_stash_commit(
             }
         }
     }
-    let i_tree_id = i_editor.write()?.detach();
+    // Writing the edited tree instead stored every tree it touched, the empty one
+    // included, where stock's `fsck` then reports `missing tree 4b825dc…`.
+    let i_tree_id = match cache_tree_root {
+        Some(id) => id,
+        None => i_editor.write()?.detach(),
+    };
 
     // `stash_working_tree()` builds `W` from `diff-index HEAD` against the worktree, not from the
     // index: a path `HEAD` has and the index lost (`git rm --cached`, or an index that is

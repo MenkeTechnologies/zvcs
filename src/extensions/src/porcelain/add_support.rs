@@ -10,7 +10,7 @@
 //! and which reach `add_to_index()` under `-N` and pull the empty blob into the object database.
 
 use anyhow::{anyhow, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::process::ExitCode;
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -137,6 +137,11 @@ pub(super) struct SpecCheck<'a> {
     /// (builtin/add.c:596), so `-u` says nothing about its unmatched elements.
     pub ignore_errors: bool,
     pub mode: SpecMode,
+    /// `-f` (`ignored_too`): no exclude list is set up and `DIR_COLLECT_IGNORED`
+    /// is not set (builtin/add.c:504-508), so nothing is ever reported ignored.
+    pub ignored_too: bool,
+    /// The patterns the walk matched with, 1:1 with `original`.
+    pub patterns: &'a [BString],
     /// The `die()` `add_files_to_cache()` reaches before it stages anything; see
     /// [`super::worktree_filespec::unusable_gitlinks`]. It comes after the
     /// "did not match any files" loop and before `report_path_error()` and
@@ -159,19 +164,17 @@ pub(super) fn unmatched_pathspec_check(
     c: &SpecCheck<'_>,
     seen: &HashSet<usize>,
 ) -> Result<SpecVerdict> {
-    // Literal pathspecs that exist on disk yet matched nothing: under `Add` a
-    // .gitignore exclusion, reported as one block listing every such path — but
-    // only once the loop below has had its chance to die, since the fatal outranks
-    // it in either argv order.
-    let mut ignored: BTreeSet<&str> = BTreeSet::new();
-    // `report_path_error()` collects rather than dying, so `-u` names every
-    // unmatched element before it exits.
-    let mut unknown: Vec<&str> = Vec::new();
+    // `dir.ignored`: what `fill_directory()` collected under `DIR_COLLECT_IGNORED`
+    // (builtin/add.c:504-511), already sorted (dir.c:3164), to which the
+    // `--ignore-missing` arm below appends. It is printed as one block, but only
+    // once the loop below has had its chance to die, since the fatal outranks it
+    // in either argv order.
+    let mut ignored: Vec<BString> = match c.mode {
+        SpecMode::Add if !c.ignored_too => collect_ignored(repo, index, c.patterns)?,
+        _ => Vec::new(),
+    };
     // `is_excluded()`, built only if the `--ignore-missing` arm actually asks.
     let mut excludes = None;
-    // The walk's ignored entries, collapsed as `fill_directory()` records them,
-    // built only if an existing element is not excluded on its own account.
-    let mut walked: Option<Vec<String>> = None;
 
     for (i, spec) in c.original.iter().enumerate() {
         if seen.contains(&i) || is_exclude_spec(spec) || spec.is_empty() {
@@ -181,6 +184,16 @@ pub(super) fn unmatched_pathspec_check(
         // the element *after* the prefix pass, which is the only form a worktree path
         // can be built from. The message still quotes `original`, i.e. `spec`.
         let relative = c.resolved.get(i).map(String::as_str).unwrap_or(spec.as_str());
+        // `pathspec.items[i].match` is `copyfrom` — the element with its magic taken
+        // off (pathspec.c:451-470) — and it is what `is_excluded()` and
+        // `dir_add_ignored()` are handed (builtin/add.c:562-564) and what the walk
+        // matched an ignored entry against. Asking the exclude stack about
+        // `:(prefix:0)ign` itself named no file, so the ignored `ign` that
+        // `stash push -u -- ign` hands to `add` was dropped in silence.
+        let matched: &str = crate::pathspec::parse_element_magic(relative.into())
+            .ok()
+            .and_then(|element| element.path(relative.into()).to_str().ok())
+            .unwrap_or(relative);
         // `path` is `pathspec.items[i].match`: the element with its magic parsed
         // off. `:(attr:-text)` has the empty match and `:(attr:text)f` the match
         // `f`, so testing the typed text instead made both die where git — which
@@ -232,81 +245,34 @@ pub(super) fn unmatched_pathspec_check(
             // `get_dtype()` leaves an absent path `DT_UNKNOWN`, which
             // `last_matching_pattern()` treats as a non-directory.
             let mode = match std::fs::symlink_metadata(
-                repo.workdir_path(BStr::new(relative.as_bytes())).unwrap_or_default(),
+                repo.workdir_path(BStr::new(matched.as_bytes())).unwrap_or_default(),
             ) {
                 Ok(md) if md.is_dir() => gix::index::entry::Mode::DIR,
                 _ => gix::index::entry::Mode::FILE,
             };
-            if stack.at_entry(BStr::new(relative.as_bytes()), Some(mode))?.is_excluded() {
-                ignored.insert(relative);
+            // Under `-f` no exclude list was set up (builtin/add.c:504-507), so
+            // `is_excluded()` has nothing to match; `dir_add_ignored()` keeps only a
+            // name the index does not hold (dir.c:1866-1875).
+            if !c.ignored_too
+                && stack.at_entry(BStr::new(matched.as_bytes()), Some(mode))?.is_excluded()
+                && index.entry_index_by_path(BStr::new(matched.as_bytes())).is_err()
+            {
+                ignored.push(BString::from(matched));
             }
             // `--ignore-missing` only silences this loop. `report_path_error()` reads
             // `ps_matched`, which `add_files_to_cache()` fills and the flag never
             // touches, so under `-u` the element is still named and still exits 128.
-            if c.mode == SpecMode::Update {
-                unknown.push(spec);
-            }
             continue;
         }
         match c.mode {
-            SpecMode::Update => unknown.push(spec),
-            // `dir_add_ignored()` records `pathspec.items[i].match`, so the block
-            // below lists the repo-relative form, not the element as typed.
-            SpecMode::Add => {
-                // `dir.ignored` only holds what `fill_directory()` kept, and the walk
-                // keeps a path only once `match_pathspec()` — attribute filter
-                // included (dir.c:365-367) — accepts it. An `:(attr:…)` element
-                // whose file exists but carries other attributes was never matched,
-                // so it is neither seen nor ignored: git exits 0 without a word.
-                let has_attrs = parsed.as_ref().is_some_and(|p| !p.attributes.is_empty());
-                if has_attrs {
-                    let mut single = repo.pathspec(
-                        true,
-                        std::slice::from_ref(&relative),
-                        false,
-                        index,
-                        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-                    )?;
-                    if !single.is_included(BStr::new(path.as_bytes()), Some(false)) {
-                        continue;
-                    }
-                }
-                // Same rule, stated generally: `dir.ignored` is filled by
-                // `fill_directory()` from paths the *exclude* machinery
-                // classified, so a path that exists and was simply not matched
-                // belongs in no block at all — git exits 0 saying nothing. The
-                // element that shows it is a rooted one, whose path is verbatim:
-                // `git add ':(top)./a.txt'` names a file that exists, matches no
-                // entry (`./a.txt` is not `a.txt`) and is not ignored, and
-                // listing it under the gitignore banner claimed an exclude rule
-                // that does not exist.
-                let stack = match &mut excludes {
-                    Some(stack) => stack,
-                    none => none.insert(repo.excludes(
-                        index,
-                        None,
-                        gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-                    )?),
-                };
-                let mode = match std::fs::symlink_metadata(
-                    repo.workdir_path(BStr::new(relative.as_bytes())).unwrap_or_default(),
-                ) {
-                    Ok(md) if md.is_dir() => gix::index::entry::Mode::DIR,
-                    _ => gix::index::entry::Mode::FILE,
-                };
-                // A directory no rule names but whose every entry is ignored is
-                // still in `dir.ignored`: `treat_directory()` collapses it into one
-                // ignored entry (dir.c), so `git add logs/` under `*.log` lands in
-                // the block although `logs` itself is not excluded.
-                let excluded = stack.at_entry(BStr::new(relative.as_bytes()), Some(mode))?.is_excluded()
-                    || covering_ignored_name(walked.get_or_insert_with(|| walk_ignored_names(repo, index)), relative)
-                        .is_some();
-                if !excluded {
-                    continue;
-                }
-                ignored.insert(relative);
-            }
-            SpecMode::Renormalize | SpecMode::Refresh => {}
+            // An element that names a file on disk yet matched nothing is not this
+            // loop's concern (builtin/add.c:653-667): whether it is reported as
+            // ignored was settled by the walk, which [`collect_ignored`] ports. A
+            // path that exists and was simply not matched — `:(top)./a.txt`, or an
+            // `:(attr:…)` element whose file carries other attributes — is in no
+            // block at all, and git exits 0 saying nothing.
+            // Under `-u` the element waits for `report_path_error()` below.
+            SpecMode::Add | SpecMode::Update | SpecMode::Renormalize | SpecMode::Refresh => {}
         }
     }
 
@@ -318,6 +284,18 @@ pub(super) fn unmatched_pathspec_check(
     // `take_worktree_changes && !add_renormalize && !ignore_add_errors`
     // (builtin/add.c:596): with `--ignore-errors` git never calls
     // `report_path_error()` at all, so `-u --ignore-errors <untracked>` is silent.
+    // It collects rather than dying, so `-u` names every unmatched element, the
+    // exclusions and the appended `.` item included, before it exits. Every index
+    // entry reaches `ce_path_match()` with `ps_matched` in `run_diff_files()`
+    // (diff-lib.c), so that item meets a name whenever the index holds one.
+    let unknown: Vec<&str> = if c.mode == SpecMode::Update {
+        crate::pathspec::report_path_error_items(c.original, |i| seen.contains(&i), !index.entries().is_empty())
+            .into_iter()
+            .map(|item| item.map_or(".", |i| c.original[i].as_str()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     if !unknown.is_empty() && !c.ignore_errors {
         for spec in unknown {
             eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
@@ -326,7 +304,7 @@ pub(super) fn unmatched_pathspec_check(
     }
     if !ignored.is_empty() {
         eprintln!("The following paths are ignored by one of your .gitignore files:");
-        for p in collapsed_ignored_names(repo, index, &ignored) {
+        for p in &ignored {
             eprintln!("{p}");
         }
         // `advise_if_enabled(ADVICE_ADD_IGNORED_FILE, …)` (builtin/add.c:351-352):
@@ -340,72 +318,66 @@ pub(super) fn unmatched_pathspec_check(
     Ok(SpecVerdict::Ok)
 }
 
-/// The names git's walk recorded for an ignored `relative`, which are not the
-/// path itself.
+/// `dir->ignored` as `fill_directory()` leaves it for `cmd_add()`
+/// (builtin/add.c:504-511): the walk runs with `DIR_COLLECT_IGNORED` over the
+/// standard excludes, and `add_path_to_appropriate_result_list()` keeps an
+/// excluded path only when `exclude_matches_pathspec()` names it, i.e. an item's
+/// literal part spelled out, or a leading directory of one (dir.c:2269-2299,
+/// :2660-2669). That test reads `item->match` alone: an `:(exclude)` or
+/// `:(attr:…)` item names its path as much as a plain one does, so
+/// `add g ':!ign'` reports `ign`. An excluded directory is listed as itself and
+/// never descended into (dir.c:2483-2490), so `add logs/l` under a `logs/` rule
+/// names `logs`, while `add sub` under `*.log` names nothing.
 ///
-/// `add_files()` prints `dir->ignored[i]->name` (builtin/add.c:349-350), and what
-/// the walk put there is what `treat_directory()` decided: a directory an ignore
-/// rule names, *or* one whose every entry is ignored, is collapsed into a single
-/// ignored entry and its contents are never visited. So `git add logs/debug.log`
-/// in a tree where `*.log` covers all of `logs/` reports `logs`, not the file —
-/// and the recorded name carries no trailing slash.
-///
-/// The collapse is the walk's, so it is asked of the walk rather than
-/// re-derived: the same dirwalk in `CollapseDirectory` mode over this one path.
-/// An element that names nothing on disk — the `--ignore-missing` arm, where git
-/// calls `dir_add_ignored()` with the pathspec's own path — walks to nothing and
-/// keeps its name.
-fn collapsed_ignored_names(
+/// `exclude_matches_pathspec()` can name no path for an item whose literal part
+/// (`nowildcard_len`) is empty, so when every element is such an item (`.` at the
+/// root, `:/`, a leading wildcard) the walk would collect nothing and is skipped.
+/// Below the root each item's literal part starts with the prefix, so it is not.
+fn collect_ignored(
     repo: &gix::Repository,
     index: &gix::index::File,
-    relative: &BTreeSet<&str>,
-) -> BTreeSet<String> {
-    let collapsed = walk_ignored_names(repo, index);
-    relative
-        .iter()
-        .map(|spec| {
-            covering_ignored_name(&collapsed, spec)
-                .unwrap_or_else(|| spec.trim_end_matches('/'))
-                .to_string()
-        })
-        .collect()
-}
-
-/// Every ignored entry of a whole-worktree dirwalk in `CollapseDirectory` mode.
-///
-/// The collapse is a property of the walk, not of the element that reached it,
-/// so the walk has to run over the whole worktree — restricting it to the
-/// element would hand back the element again, which is the very thing the
-/// collapse replaces.
-fn walk_ignored_names(repo: &gix::Repository, index: &gix::index::File) -> Vec<String> {
-    let collapsed = || -> Result<Vec<String>> {
-        let options = repo
-            .dirwalk_options()?
-            .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory))
-            .emit_untracked(gix::dir::walk::EmissionMode::CollapseDirectory);
-        let patterns = vec![BString::from(":/")];
-        let mut names = Vec::new();
-        for item in repo.dirwalk_iter(index.clone(), patterns, Default::default(), options)? {
-            let item = item?;
-            if !matches!(item.entry.status, gix::dir::entry::Status::Ignored(_)) {
-                continue;
+    patterns: &[BString],
+) -> Result<Vec<BString>> {
+    let names_a_path = patterns.iter().any(|p| {
+        gix::pathspec::parse(p.as_ref(), Default::default()).is_ok_and(|parsed| {
+            let path = parsed.path();
+            match parsed.search_mode {
+                gix::pathspec::SearchMode::Literal => !path.is_empty(),
+                _ => path.first().is_some_and(|b| !matches!(b, b'*' | b'?' | b'[' | b'\\')),
             }
-            names.push(item.entry.rela_path.to_string());
-        }
-        Ok(names)
+        })
+    });
+    let at_root = repo.prefix().ok().flatten().is_none_or(|p| p.as_os_str().is_empty());
+    if at_root && !names_a_path {
+        return Ok(Vec::new());
+    }
+    // `:(attr:…)` items are matched in attr.c's default `GIT_ATTR_CHECKIN`
+    // direction, as [`mark_seen_per_spec`] reads them.
+    let mut ps = repo.pathspec(
+        true,
+        patterns,
+        false,
+        index,
+        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+    )?;
+    // `setup_standard_excludes()` (builtin/add.c:507).
+    let mut excludes = repo.excludes(
+        index,
+        None,
+        gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+    )?;
+    let mut is_excluded = |path: &BStr, is_dir: bool| {
+        let mode = if is_dir { Mode::DIR } else { Mode::FILE };
+        excludes.at_entry(path, Some(mode)).is_ok_and(|p| p.is_excluded())
     };
-    collapsed().unwrap_or_default()
-}
-
-/// The walked ignored entry that covers `spec` — the entry that *is* it, or a
-/// directory it sits under — without its trailing slash.
-fn covering_ignored_name<'a>(collapsed: &'a [String], spec: &str) -> Option<&'a str> {
-    let spec = spec.trim_end_matches('/');
-    collapsed.iter().find_map(|name| {
-        let name = name.trim_end_matches('/');
-        let covers = spec == name || spec.strip_prefix(name).is_some_and(|r| r.starts_with('/'));
-        covers.then_some(name)
-    })
+    let outcome = repo.fill_directory(
+        index,
+        &mut ps,
+        gix::dir::read_directory::DIR_COLLECT_IGNORED,
+        &mut is_excluded,
+        None,
+    )?;
+    Ok(outcome.ignored)
 }
 
 /// The conflicted paths `refresh()`'s `refresh_index()` names (read-cache.c:1518,

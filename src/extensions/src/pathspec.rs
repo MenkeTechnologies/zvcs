@@ -1055,6 +1055,57 @@ pub fn magic_mask_fatal<S: AsRef<[u8]>>(specs: &[S], magic_mask: u32) -> Option<
     })
 }
 
+/// Whether an element carries `:(exclude)` magic (`:!`, `:^`, or the long
+/// form), as `init_pathspec_item()` records it in `item->magic`.
+pub fn is_exclude_element(elt: &str) -> bool {
+    parse_element_magic(elt.into()).is_ok_and(|element| element.magic & MAGIC_EXCLUDE != 0)
+}
+
+/// The items `report_path_error()` (dir.c:642-680) names, in `pathspec->items`
+/// order: `Some(i)` for `originals[i]`, `None` for the `.` item `parse_pathspec()`
+/// appends when every element is an exclusion (pathspec.c:671-678), whose
+/// `original` is `"."`.
+///
+/// `seen(i)` answers for each positive element. An exclusion is never matched
+/// on its own account: `do_match_pathspec()` sets `seen[i] = MATCHED_FNMATCH` for
+/// every exclude item only on its `DO_MATCH_EXCLUDE` pass (dir.c:557-563), which
+/// `match_pathspec_with_flags()` runs once a name has matched positively
+/// (dir.c:578-593). So the exclusions are matched exactly when some positive
+/// element is, or, with none given, when `any_name` says the appended `.` item
+/// met a name at all (it matches every name the caller examined).
+///
+/// An unmatched item spelled exactly like one that matched is not named ("The
+/// caller might have fed identical pathspec twice").
+pub fn report_path_error_items<S: AsRef<str>>(
+    originals: &[S],
+    seen: impl Fn(usize) -> bool,
+    any_name: bool,
+) -> Vec<Option<usize>> {
+    let exclude: Vec<bool> = originals.iter().map(|o| is_exclude_element(o.as_ref())).collect();
+    let all_exclude = !originals.is_empty() && exclude.iter().all(|&e| e);
+    let positive_hit = if all_exclude {
+        any_name
+    } else {
+        (0..originals.len()).any(|i| !exclude[i] && seen(i))
+    };
+    let matched: Vec<bool> = (0..originals.len())
+        .map(|i| if exclude[i] { positive_hit } else { seen(i) })
+        .collect();
+    let mut out: Vec<Option<usize>> = (0..originals.len())
+        .filter(|&i| !matched[i])
+        .filter(|&i| {
+            !(0..originals.len())
+                .any(|j| j != i && matched[j] && originals[j].as_ref() == originals[i].as_ref())
+        })
+        .map(Some)
+        .collect();
+    // The appended item's `original` is `"."`, which no exclusion is spelled as.
+    if all_exclude && !any_name {
+        out.push(None);
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // `prefix_path()` (setup.c:149-160), the *other* way a verb turns an argument
 // into a repository-relative path.

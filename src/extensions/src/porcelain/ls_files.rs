@@ -1235,21 +1235,23 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
     // stdout when the diagnostic is written. It reports every unmatched element,
     // one `error:` line each, and prints the hint once afterwards.
     //
-    // An `:(exclude)` element is never among them: `parse_pathspec()` appends an
-    // implicit empty positive item when every element is an exclude, and
-    // `do_match_pathspec()` marks an exclude item seen as soon as it excludes
-    // something — verified against git 2.55.0, where `ls-files --error-unmatch --
-    // :!nosuch.txt` exits 0 and says nothing.
+    // An `:(exclude)` element is among them only when no name matched positively:
+    // `do_match_pathspec()` marks an exclude item seen on the `DO_MATCH_EXCLUDE`
+    // pass that follows a positive match (dir.c:557-563), and `parse_pathspec()`
+    // appends a `.` item to an all-exclusion pathspec (pathspec.c:671-678), so
+    // `ls-files --error-unmatch -- :!nosuch.txt` is silent over a non-empty index
+    // and names both `:!nosuch.txt` and `.` over an empty one.
     if opts.error_unmatch {
-        let mut bad = 0usize;
-        for (i, raw) in raw_patterns.iter().enumerate() {
-            if matched.contains(&i) || is_exclude_pathspec(raw) {
-                continue;
-            }
+        let unmatched = crate::pathspec::report_path_error_items(
+            &raw_patterns,
+            |i| matched.contains(&i),
+            seen_items.offered,
+        );
+        for item in &unmatched {
+            let raw = item.map_or(".", |i| raw_patterns[i].as_str());
             eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
-            bad += 1;
         }
-        if bad > 0 {
+        if !unmatched.is_empty() {
             eprintln!("Did you forget to 'git add'?");
             return Ok(ExitCode::from(1));
         }
@@ -1351,6 +1353,13 @@ fn keep_trailing_spaces(pattern: &str) -> String {
 /// only answers "included or not", so each positive item gets an engine of its own.
 struct SeenItems<'r> {
     items: Vec<Option<gix::Pathspec<'r>>>,
+    /// Whether any name reached `match_pathspec()` that the `.` item
+    /// `parse_pathspec()` appends to an all-exclusion pathspec matches. Under
+    /// `PATHSPEC_PREFER_CWD` (builtin/ls-files.c) that item is the current
+    /// directory (pathspec.c:674-676), so only a name below `cwd` counts.
+    offered: bool,
+    /// The current directory's prefix, slash-terminated, empty at the top.
+    cwd: Vec<u8>,
 }
 
 impl<'r> SeenItems<'r> {
@@ -1374,11 +1383,12 @@ impl<'r> SeenItems<'r> {
                 )?)
             });
         }
-        Ok(Self { items })
+        Ok(Self { items, offered: false, cwd: crate::setup::prefix_bytes(repo) })
     }
 
     /// Record every positive item that `path` hits.
     fn mark(&mut self, path: &BStr, is_dir: bool, matched: &mut HashSet<usize>) {
+        self.offered |= path.starts_with(&self.cwd);
         for (i, item) in self.items.iter_mut().enumerate() {
             let Some(item) = item else { continue };
             if let Some(m) = item.pattern_matching_relative_path(path, Some(is_dir)) {

@@ -434,6 +434,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // The synthetic "matched because nothing excludes it" case (all specs are
     // exclusions) reports sequence_number == pathspecs.len(); track it apart.
     let mut synthetic_seen: u8 = 0;
+    let cwd = crate::setup::prefix_bytes(&repo);
     let mut selected: Vec<Target> = Vec::new();
     let mut selected_paths: HashSet<BString> = HashSet::new();
     // Which pathspec items have already matched a path letter for letter — git's
@@ -441,8 +442,14 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let mut matched_verbatim: HashSet<usize> = HashSet::new();
 
     for t in &targets_all {
+        // With nothing but exclusions the implicit item is the current directory under
+        // `PATHSPEC_PREFER_CWD` (builtin/rm.c, pathspec.c:674-676): a path outside it matches
+        // no item, so it records no `seen[]` and is not removed.
+        if all_exclude && !t.path.starts_with(&cwd) {
+            continue;
+        }
         // The items this path hits, strongest rank each; with nothing but exclusions the implicit
-        // whole-tree item hits everything.
+        // item hits everything left.
         let mut hits: Vec<(usize, u8)> = Vec::new();
         for (idx, item) in item_ps.iter_mut().enumerate() {
             if let Some(item) = item {
@@ -487,7 +494,15 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        let Some(m) = ps.pattern_matching_relative_path(t.path.as_bstr(), Some(false)) else {
+        let m = ps.pattern_matching_relative_path(t.path.as_bstr(), Some(false));
+        // The `.` item `parse_pathspec()` appends to an all-exclusion pathspec
+        // (pathspec.c:671-678) is a positive one: it records `seen[]` on the first pass,
+        // before the exclusion pass drops the path (dir.c:578-593), so `git rm -- ':!t'`
+        // over an index of `t` alone still matched `.` recursively.
+        if all_exclude && m.is_some() {
+            synthetic_seen = synthetic_seen.max(RECURSIVELY);
+        }
+        let Some(m) = m else {
             continue;
         };
         if m.is_excluded() {
@@ -554,10 +569,9 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     for (idx, raw) in pathspecs.iter().enumerate() {
         let shown = prefix_shown.as_deref().unwrap_or(raw);
         // Exclusions are judged like every other item: `seen[]` holds them as matched once
-        // anything hit a positive item (dir.c:564-565), which is what makes them optional.
-        if is_exclude[idx] && all_exclude {
-            continue;
-        }
+        // anything hit a positive item (dir.c:557-563), which is what makes them optional —
+        // and, with no name to match at all, leaves them unmatched, so `git rm -- ':!x'` over
+        // an empty index dies naming `:!x`.
         let how = seen[idx];
         if how != 0 {
             seen_any = true;
@@ -574,9 +588,17 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             return Ok(fatal(format!("not removing '{shown}' recursively without -r")));
         }
     }
-    // The all-exclusions case: git treats the implicit whole-tree match as `.`.
-    if is_exclude.iter().all(|&e| e) && synthetic_seen == RECURSIVELY && !opts.recursive {
-        return Ok(fatal("not removing '.' recursively without -r"));
+    // The all-exclusions case: git treats the implicit whole-tree match as `.`, the last
+    // item its loop visits. Unmatched, it is reached only past `--ignore-unmatch` or as
+    // part of the sparse-path report, since the exclusions before it died otherwise.
+    if all_exclude {
+        if synthetic_seen == 0 {
+            if !opts.ignore_unmatch && sparse_seen.first().copied().unwrap_or(false) {
+                only_match_skip_worktree.push(".".to_owned());
+            }
+        } else if synthetic_seen == RECURSIVELY && !opts.recursive {
+            return Ok(fatal("not removing '.' recursively without -r"));
+        }
     }
     // That implicit whole-tree match is still a match, so it counts toward
     // git's `seen_any` even though no numbered pathspec recorded it.

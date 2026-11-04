@@ -2538,13 +2538,10 @@ fn restore_conflict_stage(
     // empty index (read-cache.c:2232), where no pathspec matches.
     let index = crate::index_open::or_empty(repo)?;
     let norm = Specs::new(repo, paths)?;
-    let matched = match match_paths(&index, paths, &norm) {
-        Ok(m) => m,
-        Err(spec) => {
-            eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
-            return Ok(ExitCode::from(1));
-        }
-    };
+    let (matched, hit) = matches_in(&index, &norm);
+    if let Some(code) = report_unmatched(paths, |si| hit[si], !index.entries().is_empty()) {
+        return Ok(code);
+    }
     let mset: HashSet<BString> = matched.iter().cloned().collect();
 
     // Which stages each matched path carries (index 0..=3).
@@ -3012,9 +3009,9 @@ fn restore_from_index(
             .collect()
     };
     let (matched, hit) = matches_in_excluding(&index, &norm, &sparse);
-    if let Some(si) = (0..paths.len()).find(|&si| !hit[si] && !sparse_dirs.hit(si)) {
-        eprintln!("error: pathspec '{}' did not match any file(s) known to git", paths[si]);
-        return Ok(ExitCode::from(1));
+    let any_name = index.entries().iter().any(|e| !sparse.contains(e.path(&index)));
+    if let Some(code) = report_unmatched(paths, |si| hit[si] || sparse_dirs.hit(si), any_name) {
+        return Ok(code);
     }
 
     // `checkout_paths()`'s unmerged pass, which runs over the whole matched set
@@ -3310,9 +3307,9 @@ fn restore_from_tree(
     // Paths to write from the tree, and (no-overlay only) paths to delete.
     let (matched, mut to_remove) = if overlay {
         let (tree_matched, tree_hit) = matches_in(&src, &norm);
-        if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !sparse_dirs.hit(si)) {
-            eprintln!("error: pathspec '{}' did not match any file(s) known to git", paths[si]);
-            return Ok(ExitCode::from(1));
+        let any_name = !src.entries().is_empty();
+        if let Some(code) = report_unmatched(paths, |si| tree_hit[si] || sparse_dirs.hit(si), any_name) {
+            return Ok(code);
         }
         (tree_matched, Vec::new())
     } else {
@@ -3329,18 +3326,17 @@ fn restore_from_tree(
         // `--no-overlay` may delete.
         let (idx_matched, idx_hit) = matches_in_excluding(cur, &norm, &sparse);
         // A pathspec must match in the tree or the index; else git's "did not match".
-        if let Some(si) = (0..paths.len()).find(|&si| !tree_hit[si] && !idx_hit[si] && !sparse_dirs.hit(si)) {
-            // `report_path_error()` (pathspec.c) writes
-            // `error: pathspec '%s' did not match any file(s) known to git` and
-            // `checkout_paths()` returns 1 on it (builtin/checkout.c:642-643) —
-            // an `error:`, not a `fatal:`. Bailing here instead put the port's
-            // own `zvcs: checkout: ` prefix in front of the same sentence, which
-            // the overlay arm a few lines above already avoids.
-            eprintln!(
-                "error: pathspec '{}' did not match any file(s) known to git",
-                paths[si]
-            );
-            return Ok(ExitCode::from(1));
+        // `report_path_error()` (pathspec.c) writes
+        // `error: pathspec '%s' did not match any file(s) known to git` and
+        // `checkout_paths()` returns 1 on it (builtin/checkout.c:642-643) —
+        // an `error:`, not a `fatal:`. Bailing here instead put the port's
+        // own `zvcs: checkout: ` prefix in front of the same sentence, which
+        // the overlay arm a few lines above already avoids.
+        let any_name = !src.entries().is_empty()
+            || cur.entries().iter().any(|e| !sparse.contains(e.path(cur)));
+        let hit = |si: usize| tree_hit[si] || idx_hit[si] || sparse_dirs.hit(si);
+        if let Some(code) = report_unmatched(paths, hit, any_name) {
+            return Ok(code);
         }
         let tset: HashSet<BString> = tree_matched.iter().cloned().collect();
         let rm: Vec<BString> = idx_matched.into_iter().filter(|p| !tset.contains(p)).collect();
@@ -4695,17 +4691,18 @@ fn describe(repo: &gix::Repository, id: ObjectId) -> Result<(String, String)> {
 
 // --- Pathspec / index helpers ----------------------------------------------
 
-/// Collect the index entries (by path) matching every pathspec in `specs`.
-/// Each spec must match at least one entry, else git's "did not match" error.
-/// The matched paths, or `Err(spec)` naming the first pathspec that matched nothing —
-/// git reports that on stderr as `error: …` and exits 1, so it is not an error value
-/// the dispatcher would re-prefix.
-fn match_paths<'a>(
-    index: &gix::index::File,
-    specs: &[&'a str],
-    norm: &Specs,
-) -> std::result::Result<Vec<BString>, &'a str> {
-    match_paths_excluding(index, specs, norm, &HashSet::new())
+/// `report_path_error()` (dir.c:642-680) as `checkout_paths()` reaches it, which then
+/// returns 1 (builtin/checkout.c:642-643): every element that matched nothing is named,
+/// not just the first, and an exclusion is among them when no name matched positively.
+/// `hit(si)` answers for each positive element, `any_name` whether `ce_path_match()` was
+/// offered any entry at all (what the `.` item an all-exclusion pathspec gains matches).
+fn report_unmatched(paths: &[&str], hit: impl Fn(usize) -> bool, any_name: bool) -> Option<ExitCode> {
+    let unmatched = crate::pathspec::report_path_error_items(paths, hit, any_name);
+    for item in &unmatched {
+        let spec = item.map_or(".", |si| paths[si]);
+        eprintln!("error: pathspec '{spec}' did not match any file(s) known to git");
+    }
+    (!unmatched.is_empty()).then(|| ExitCode::from(1))
 }
 
 /// The `-- <pathspec>…` list, parsed by `parse_pathspec()`'s gate and then by the
@@ -4725,8 +4722,8 @@ struct Specs {
     set: super::log::PathspecMatcher,
     /// One matcher per element, for `report_path_error()`'s per-element "did
     /// this one match anything" bookkeeping (dir.c:640-673). `None` for an
-    /// exclusion, which `do_match_pathspec()` marks seen as soon as it subtracts
-    /// anything and which is therefore never the element git names.
+    /// exclusion, which `do_match_pathspec()` marks seen once any name matched
+    /// positively (dir.c:557-563); [`report_unmatched`] decides that.
     per_element: Vec<Option<super::log::PathspecMatcher>>,
 }
 
@@ -4759,23 +4756,8 @@ impl Specs {
     }
 }
 
-/// [`match_paths`] with the entries in `exclude` taken out of the index first — the sparse
-/// entries `PS_IGNORE_SKIP_WORKTREE` hides from a pathspec.
-fn match_paths_excluding<'a>(
-    index: &gix::index::File,
-    specs: &[&'a str],
-    norm: &Specs,
-    exclude: &HashSet<BString>,
-) -> std::result::Result<Vec<BString>, &'a str> {
-    let (matched, hit) = matches_in_excluding(index, norm, exclude);
-    match hit.iter().position(|h| !h) {
-        Some(si) => Err(specs[si]),
-        None => Ok(matched),
-    }
-}
-
 /// The entries of `index` matching any pathspec, plus a per-spec "did it match
-/// anything" flag. Unlike [`match_paths`] this never fails, so callers that must
+/// anything" flag. This never fails, so callers that must
 /// consider several indexes (e.g. no-overlay's tree ∪ index) can decide the
 /// "did not match" error against their own union.
 fn matches_in(index: &gix::index::File, norm: &Specs) -> (Vec<BString>, Vec<bool>) {
@@ -4792,8 +4774,8 @@ fn matches_in_excluding(
 ) -> (Vec<BString>, Vec<bool>) {
     let mut matched: Vec<BString> = Vec::new();
     let mut seen: HashSet<BString> = HashSet::new();
-    // An exclusion is never the element `report_path_error()` names, so it
-    // starts out satisfied.
+    // An exclusion has no matcher of its own: [`report_unmatched`] judges it
+    // from the positive elements, so its flag is never read.
     let mut hit: Vec<bool> = norm.per_element.iter().map(Option::is_none).collect();
 
     let backing = index.path_backing();

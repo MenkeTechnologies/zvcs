@@ -1070,18 +1070,33 @@ pub fn restore(args: &[String]) -> Result<ExitCode> {
         // every entry first (builtin/checkout.c:428), and without a source tree the index
         // itself is the source.
         let index_only_counts = !(overlay && !source_is_index);
+        let offered: Vec<_> = source_map
+            .keys()
+            .chain(cur_paths.iter().filter(|_| index_only_counts))
+            .filter(|p| !sparse_kept.contains(*p))
+            .collect();
+        // An element that resolved to the top of the tree names every entry offered.
+        let mut seen: Vec<bool> = vec![!offered.is_empty(); pathspecs.len()];
         for (si, raw) in &specs {
-            // Each spec is checked on its own: git names the one that matched nothing.
+            // Each spec is checked on its own, as `do_match_pathspec()` records a
+            // positive item's `seen[i]` before any exclusion applies (dir.c:548-575).
             let single = super::log::PathspecMatcher::new(&repo, std::slice::from_ref(raw))?;
-            let hit = source_map
-                .keys()
-                .chain(cur_paths.iter().filter(|_| index_only_counts))
-                .filter(|p| !sparse_kept.contains(*p))
-                .any(|p| path_matches(BStr::new(p), false, &single));
-            if !hit && !sparse_dirs.hit(*si) {
-                eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
-                return Ok(ExitCode::from(1));
-            }
+            seen[*si] = offered.iter().any(|p| path_matches(BStr::new(p), false, &single));
+        }
+        // `report_path_error()` (dir.c:642-680) names every element that matched
+        // nothing, and an exclusion too when no name matched positively; then
+        // `checkout_paths()` returns 1 (builtin/checkout.c:642-643).
+        let unmatched = crate::pathspec::report_path_error_items(
+            &pathspecs,
+            |si| seen[si] || sparse_dirs.hit(si),
+            !offered.is_empty(),
+        );
+        for item in &unmatched {
+            let raw = item.map_or(".", |si| pathspecs[si].as_str());
+            eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
+        }
+        if !unmatched.is_empty() {
+            return Ok(ExitCode::from(1));
         }
     }
 

@@ -1371,6 +1371,8 @@ pub fn add(args: &[String]) -> Result<ExitCode> {
         ignore_missing,
         ignore_errors,
         files_to_cache_die,
+        ignored_too: force,
+        patterns: &patterns,
         mode: match (refresh, renormalize, update_only) {
             (true, _, _) => super::add_support::SpecMode::Refresh,
             (_, true, _) => super::add_support::SpecMode::Renormalize,

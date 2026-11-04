@@ -152,6 +152,7 @@ impl Store {
             promisor: Default::default(),
             bad_objects: Default::default(),
             pack_name_root: Default::default(),
+            invalid_pack_opens: Default::default(),
         })
     }
 }

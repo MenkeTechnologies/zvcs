@@ -2724,7 +2724,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                 // the walk one commit *earlier* than this iterator notices it — the
                 // iterator queues parent ids unread and only trips when one is
                 // popped. `locate` puts the abort back where git has it.
-                Err(err) => match super::log::WalkAbort::locate(&repo, &commits, &parents_of) {
+                Err(err) => match super::log::WalkAbort::locate(
+                    &repo,
+                    &commits,
+                    &parents_of,
+                    super::log::WalkAbort::failed_on(&err),
+                ) {
                     Some((at, found)) => {
                         commits.truncate(at);
                         abort = Some(found);
@@ -3903,7 +3908,26 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // with these.
     let mut graph_blocks: Vec<Option<super::log::GraphBlock>> = Vec::new();
 
+    // `show_commit()` and `show_object()` print each record as the walk reaches it
+    // (builtin/rev-list.c:250-416), into stdio's buffer, which `exit()` flushes
+    // when a read further on dies; the listing printed whole only once the walk
+    // ends is the one that is not staged: a summary, a graph, a `--reverse`d walk
+    // that already failed, the bisect variables without `--bisect-all`.
+    let streams = !graph
+        && !count_only
+        && !quiet
+        && !disk_usage
+        && !(reverse && abort.is_some())
+        && (bisect_vars_text.is_none() || bisect_all);
+    let stage = |out: &mut Vec<u8>| -> Result<()> {
+        if streams {
+            crate::cstdio::block().write_all(out)?;
+            out.clear();
+        }
+        Ok(())
+    };
     for ((id, is_boundary), own_parents) in emitted.iter().zip(&emitted_parents) {
+        stage(&mut out)?;
         let record_start = out.len();
         let record_parents: &[ObjectId] = match own_parents {
             Some(parents) => parents,
@@ -4086,6 +4110,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         if objects && in_commit_order && !is_boundary {
             // The objects shown ahead of a missing one stand: see
             // [`print_before_die`].
+            // The commit's own line stands too when a read of its trees dies.
+            stage(&mut out)?;
             let failed = collect_commit_objects(&mut trav, *id).err();
             for (oid, name) in trav.lines.drain(..) {
                 // `show_object()` (list-objects.c:38-48) returns *before* the
@@ -4171,28 +4197,35 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // commit's objects inside the loop, alongside the commit, and those stand.
     if objects && !in_commit_order && abort.is_none() {
         let mut failed: Option<ExitCode> = None;
-        for id in &commits {
-            if let Err(code) = collect_commit_objects(&mut trav, *id) {
+        // Each commit's objects are listed before the next commit's trees are read,
+        // so a tree read that dies leaves the lines ahead of it printed.
+        let mut listed = 0;
+        for commit in &commits {
+            stage(&mut out)?;
+            if let Err(code) = collect_commit_objects(&mut trav, *commit) {
                 failed = Some(code);
-                break;
             }
-        }
-        for (id, name) in &trav.lines {
-            // `show_object()` (list-objects.c:38-48), as above.
-            if unpacked && packed_objects.contains(id) {
-                continue;
-            }
-            if disk_usage {
-                match object_disk_size(&repo, *id) {
-                    Some(n) => disk_total += n,
-                    None => return Ok(fatal(&format!("unable to get disk usage of {id}"))),
+            for (id, name) in &trav.lines[listed..] {
+                // `show_object()` (list-objects.c:38-48), as above.
+                if unpacked && packed_objects.contains(id) {
+                    continue;
+                }
+                if disk_usage {
+                    match object_disk_size(&repo, *id) {
+                        Some(n) => disk_total += n,
+                        None => return Ok(fatal(&format!("unable to get disk usage of {id}"))),
+                    }
+                }
+                // Objects are always counted on the right, because a marked count and
+                // `--objects` are mutually exclusive.
+                count_right += 1;
+                if !quiet && !count_only {
+                    object_line(id, name, &mut out);
                 }
             }
-            // Objects are always counted on the right, because a marked count and
-            // `--objects` are mutually exclusive.
-            count_right += 1;
-            if !quiet && !count_only {
-                object_line(id, name, &mut out);
+            listed = trav.lines.len();
+            if failed.is_some() {
+                break;
             }
         }
         if let Some(code) = failed {
@@ -4201,8 +4234,8 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let stdout = std::io::stdout();
-    let mut sink = stdout.lock();
+    // The staged listing's buffer: see `stage` above.
+    let mut sink = crate::cstdio::block();
     // Everything below the walk is a *summary* rather than a stream: a count, a
     // disk-usage total, a `--reverse`d listing. git computes those inside the
     // `while ((commit = get_revision(revs)))` loop and prints them once it ends,
@@ -5912,8 +5945,9 @@ fn process_blob(
     let shown = match r & LOFR_DO_SHOW != 0 {
         true => {
             // `finish_object()` asks `odb_read_object_info_extended()` with no `object_info`, which
-            // finds the object without reading it (builtin/rev-list.c:384-395).
-            let exists = trav.repo.has_object(id);
+            // finds the object without reading it, and with no flags, so a miss gets the second read
+            // (builtin/rev-list.c:385-396, odb.c:571-584).
+            let exists = trav.repo.objects.contains_recheck(&id);
             show_object(trav, id, path, gix::object::Kind::Blob, exists)
         }
         false => Ok(()),
@@ -5940,22 +5974,30 @@ fn process_tree(
     if trav.seen.contains(&id) {
         return Ok(());
     }
-    // `parse_tree_gently()`'s `odb_read_object()` dies on a tree only a pack that gave up on it
-    // holds (odb.c:597-603), and the listing written so far is flushed on the way out, which the
-    // walk's caller does for this port.
-    if let Err(err) = gix::odb::store::find::with_corrupt_reads_as_errors(|| trav.repo.find_object(id)) {
-        if let Some(msg) = super::fsck::corrupt_packed_message(&err) {
-            return Err(fatal(&msg));
-        }
-    }
+    // `repo_parse_tree_gently(tree, 1)` reads the tree once (tree.c:185-204): its
+    // `odb_read_object()` dies on a tree only a pack that gave up on it holds (odb.c:597-603), and
+    // the listing written so far is flushed on the way out, which the walk's caller does for this
+    // port; a tree that is missing is a quiet failure, an object of another type an error.
     // The entries are collected first so the tree borrow ends before recursing.
     let entries: Option<Vec<(ObjectId, Vec<u8>, gix::object::tree::EntryMode)>> =
-        tree_object(trav.repo, id).map(|tree| {
-            tree.iter()
-                .filter_map(|e| e.ok())
-                .map(|e| (e.object_id(), e.filename().to_vec(), e.mode()))
-                .collect()
-        });
+        match gix::odb::store::find::with_corrupt_reads_as_errors(|| trav.repo.find_object(id)) {
+            Err(err) => match super::fsck::corrupt_packed_message(&err) {
+                Some(msg) => return Err(fatal(&msg)),
+                None => None,
+            },
+            Ok(object) if object.kind != gix::object::Kind::Tree => {
+                eprintln!("error: Object {id} not a tree");
+                None
+            }
+            Ok(object) => Some(
+                object
+                    .into_tree()
+                    .iter()
+                    .filter_map(|e| e.ok())
+                    .map(|e| (e.object_id(), e.filename().to_vec(), e.mode()))
+                    .collect(),
+            ),
+        };
     let failed_parse = entries.is_none();
     let baselen = base.len();
     base.extend_from_slice(name);
@@ -6405,7 +6447,7 @@ fn print_before_die(out: &[u8], summary: bool) -> Result<()> {
     if summary {
         return Ok(());
     }
-    let mut sink = std::io::stdout().lock();
+    let mut sink = crate::cstdio::block();
     sink.write_all(out)?;
     sink.flush()?;
     Ok(())

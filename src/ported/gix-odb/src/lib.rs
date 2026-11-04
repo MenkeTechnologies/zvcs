@@ -186,6 +186,9 @@ pub struct Store {
     /// The working tree git chdir()s to, against which `p->pack_name` is spelled. See
     /// [`Store::set_pack_name_root()`].
     pack_name_root: std::sync::OnceLock<PathBuf>,
+    /// How many times `is_pack_valid()` has refused a pack: a lookup that met one during its first
+    /// pass gets the second read, which opens the pack, and reports it, once more (odb.c:571-584).
+    pub(crate) invalid_pack_opens: AtomicUsize,
 }
 
 /// Create a new cached handle to the object store with support for additional options.

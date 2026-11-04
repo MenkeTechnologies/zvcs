@@ -1822,7 +1822,7 @@ fn locate_abort(
         .iter()
         .map(|item| (item.id, item.parents.clone()))
         .collect();
-    super::log::WalkAbort::locate(repo, &walked, &parents_of)
+    super::log::WalkAbort::locate(repo, &walked, &parents_of, None)
 }
 
 /// The author timestamp `--author-date-order` ranks a commit by, which is git's

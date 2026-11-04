@@ -14,12 +14,16 @@ use gix::diff::blob::{diff_with_slider_heuristics, Algorithm, InternedInput, Uni
 use gix::hash::ObjectId;
 
 /// The bytes to diff for an entry: a real blob is read from the object database; a
-/// submodule (commit entry) is rendered as its `Subproject commit <oid>` line.
+/// submodule (commit entry) is rendered as its `Subproject commit <oid>` line. A blob
+/// the object database does not produce is `die("unable to read %s")`
+/// (diff.c:4596-4598).
 pub(crate) fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Result<Vec<u8>> {
     if is_submodule {
-        Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes())
-    } else {
-        Ok(repo.find_object(id)?.detach().data)
+        return Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes());
+    }
+    match repo.find_object(id) {
+        Ok(object) => Ok(object.detach().data),
+        Err(_) => Err(crate::fatal::die(format!("unable to read {id}"))),
     }
 }
 

@@ -5747,8 +5747,11 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // one terminated record per commit meant one write(2) per commit — 6375
     // syscalls for a full `log` on a deep history, which showed up as ~400ms of
     // system time against git's 8ms. git buffers and so does this now; the tail
-    // is flushed below, and a closed pipe still surfaces as BrokenPipe.
-    let mut stdout = std::io::BufWriter::with_capacity(64 * 1024, std::io::stdout().lock());
+    // is flushed below, and a closed pipe still surfaces as BrokenPipe. The
+    // buffer is stdio's, so a read that dies further on (`die()` exits through
+    // `std::process::exit`) still writes out the records printed before it, as
+    // `exit()` flushes them in git.
+    let mut stdout = crate::cstdio::block();
     let mut first = true;
     // Formats that need only what the walk produced skip the object read
     // entirely — the dominant cost of `--pretty=format:%H` on a deep history.
@@ -5950,7 +5953,7 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
     // `log_tree_commit()` prints `"\n%s\n"` with the break bar ahead of a commit
     // that is not linear — or, in `--reverse`'s output stage, behind it
     // (log-tree.c:1188-1197) — straight to the file, outside any line prefix.
-    let write_break = |stdout: &mut std::io::BufWriter<std::io::StdoutLock<'_>>, bar: &str| -> Result<()> {
+    let write_break = |stdout: &mut crate::cstdio::Block, bar: &str| -> Result<()> {
         write!(stdout, "\n{bar}\n")?;
         Ok(())
     };
@@ -9369,19 +9372,43 @@ impl WalkAbort {
     ///
     /// `None` means the walk failed for some other reason, which the caller should
     /// keep reporting the way it did before.
+    ///
+    /// git reads each parent once, in `process_parents()` (revision.c:1189-1194),
+    /// and every read of an object the odb cannot produce prints what the odb
+    /// prints for it again. So no parent is read twice here: one the walk returned
+    /// was read by it, and `failed`, the id the walk's error names, is the one its
+    /// read just failed on.
     pub(super) fn locate(
         repo: &gix::Repository,
         walked: &[ObjectId],
         parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+        failed: Option<ObjectId>,
     ) -> Option<(usize, WalkAbort)> {
         for (at, id) in walked.iter().enumerate() {
             for parent in parents_of.get(id).into_iter().flatten() {
-                if repo.find_object(*parent).is_err() {
+                let unreadable = match failed {
+                    Some(failed) if failed == *parent => true,
+                    _ if parents_of.contains_key(parent) => false,
+                    _ => repo.find_object(*parent).is_err(),
+                };
+                if unreadable {
                     return Some((at, WalkAbort { missing: *parent, child: *id }));
                 }
             }
         }
         None
+    }
+
+    /// The commit a `gix` walk's error says its read failed on, for [`Self::locate`].
+    pub(super) fn failed_on(err: &gix::revision::walk::iter::Error) -> Option<ObjectId> {
+        use gix::objs::find::existing_iter::Error as Read;
+        use gix::traverse::commit::simple::Error as Walk;
+        match err {
+            gix::revision::walk::iter::Error::SimpleTraversal(Walk::Find(
+                Read::NotFound { oid } | Read::ObjectKind { oid, .. },
+            )) => Some(*oid),
+            _ => None,
+        }
     }
 
     /// `error("Could not read %s", oid_to_hex(&item->object.oid))` (commit.c:641-645).
@@ -13462,6 +13489,22 @@ pub(super) fn prefetch_diff_pairs(
     Ok(())
 }
 
+/// The tree `diff_tree_oid()` is handed for `id`: a commit's tree, which
+/// `log_tree_diff()` passes as `get_commit_tree_oid()` (log-tree.c:1171-1172, :1251), or
+/// `id` itself when it is a tree. `fill_tree_descriptor()` reads it peeled to a
+/// tree and dies naming it when it is not one (tree-walk.c:85-99).
+fn diff_tree_side(repo: &gix::Repository, id: ObjectId) -> Result<gix::Tree<'_>> {
+    let object = repo.find_object(id)?;
+    let tree_id = match object.kind {
+        gix::object::Kind::Commit => object.into_commit().tree_id()?.detach(),
+        _ => id,
+    };
+    repo.find_object(tree_id)
+        .ok()
+        .and_then(|object| object.peel_to_tree().ok())
+        .ok_or_else(|| crate::fatal::die(format!("unable to read tree ({tree_id})")))
+}
+
 fn collect_changes(
     repo: &gix::Repository,
     commit: &gix::Commit<'_>,
@@ -13486,13 +13529,13 @@ fn collect_changes(
     warn: Option<&mut super::diffcore_rename::Warnings>,
 ) -> Result<Vec<FileChange>> {
     let mut warn = warn;
-    let new_tree = commit.tree()?;
+    let new_tree = diff_tree_side(repo, commit.id)?;
     let old_tree = match parent {
         // A commit id in every caller but one: `--diff-merges=remerge` hands the
         // re-merged *tree* here, which is what `diff_tree_oid()` is given in
         // `do_remerge_diff()` (log-tree.c:1076). Peeling accepts both and is the same
         // step for a commit.
-        Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
+        Some(pid) => Some(diff_tree_side(repo, pid)?),
         None => None,
     };
     // `-R` swaps every pair as the queue is built (`diff_change()`,

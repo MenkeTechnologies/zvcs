@@ -153,6 +153,42 @@ pub(super) struct State {
     parents_buf: Vec<u8>,
     /// Reusable parent id/time storage populated from the commit-graph cache.
     parent_ids: SmallVec<[(ObjectId, SecondsSinceUnixEpoch); 2]>,
+    /// Queued parents whose commit could not be read for its time, with why.
+    unreadable: gix_hashtable::HashMap<ObjectId, Unreadable>,
+}
+
+/// Why a parent's commit could not be read when it was queued. Popping the parent reports the same
+/// failure without asking the object database again: git reads each parent once, in
+/// `process_parents()`'s `repo_parse_commit_gently()` (revision.c:1189-1194), and a second read is a
+/// second round of whatever the object database prints for it.
+#[derive(Clone, Copy)]
+enum Unreadable {
+    Missing,
+    Kind { actual: gix_object::Kind },
+}
+
+impl Unreadable {
+    /// What the failed read said, if it can be said again; any other failure is read again.
+    fn of(err: &gix_object::find::existing_iter::Error) -> Option<Self> {
+        use gix_object::find::existing_iter::Error as E;
+        match err {
+            E::NotFound { .. } => Some(Self::Missing),
+            E::ObjectKind { actual, .. } => Some(Self::Kind { actual: *actual }),
+            E::Find(_) => None,
+        }
+    }
+
+    fn error(self, oid: ObjectId) -> gix_object::find::existing_iter::Error {
+        use gix_object::find::existing_iter::Error as E;
+        match self {
+            Self::Missing => E::NotFound { oid },
+            Self::Kind { actual } => E::ObjectKind {
+                oid,
+                actual,
+                expected: gix_object::Kind::Commit,
+            },
+        }
+    }
 }
 
 fn to_queue_key(i: i64, order: CommitTimeOrder) -> QueueKey<i64> {
@@ -295,7 +331,8 @@ fn mark_ancestors_hidden(
 ///
 mod init {
     use super::{
-        CommitDateQueue, CommitTimeOrder, Error, Sorting, State, collect_parents, compute_hidden_frontier, to_queue_key,
+        CommitDateQueue, CommitTimeOrder, Error, Sorting, State, collect_parents, compute_hidden_frontier,
+        parent_commit_time, to_queue_key,
     };
     use crate::commit::{Either, Info, ParentIds, Parents, Simple};
     use gix_date::SecondsSinceUnixEpoch;
@@ -315,6 +352,7 @@ mod init {
                 hidden_tips: Vec::new(),
                 parents_buf: vec![],
                 parent_ids: Default::default(),
+                unreadable: Default::default(),
             }
         }
     }
@@ -331,6 +369,7 @@ mod init {
                 hidden_tips,
                 parents_buf: _,
                 parent_ids: _,
+                unreadable,
             } = self;
             next.clear();
             queue.clear();
@@ -339,6 +378,7 @@ mod init {
             seen.clear();
             hidden.clear();
             hidden_tips.clear();
+            unreadable.clear();
         }
     }
 
@@ -616,6 +656,12 @@ mod init {
                     continue;
                 }
                 let mut parents: ParentIds = Default::default();
+                // A parent whose read already failed when it was queued fails again here, unread.
+                if let Some(why) = state.unreadable.remove(&oid) {
+                    if self.cache.as_ref().is_none_or(|cache| cache.commit_by_id(oid).is_none()) {
+                        return Some(Err(why.error(oid).into()));
+                    }
+                }
 
                 // `parse_commit_buffer()` still reads the commit — only its parent list
                 // is replaced (commit.c:554-590) — so the graft is applied after the
@@ -637,13 +683,7 @@ mod init {
                             next,
                             order,
                             cutoff,
-                            || {
-                                self.objects
-                                    .find_commit_iter(id.as_ref(), &mut state.parents_buf)
-                                    .ok()
-                                    .and_then(|parent| parent.committer().ok().map(|committer| committer.seconds()))
-                                    .unwrap_or_default()
-                            },
+                            || parent_commit_time(&self.objects, id, &mut state.parents_buf, &mut state.unreadable),
                         );
                     }
                     return Some(Ok(Info {
@@ -701,13 +741,8 @@ mod init {
                                         order,
                                         cutoff,
                                         || {
-                                            let parent =
-                                                self.objects.find_commit_iter(id.as_ref(), &mut state.parents_buf).ok();
-                                            parent
-                                                .and_then(|parent| {
-                                                    parent.committer().ok().map(|committer| committer.seconds())
-                                                })
-                                                .unwrap_or_default()
+                                            let (buf, unreadable) = (&mut state.parents_buf, &mut state.unreadable);
+                                            parent_commit_time(&self.objects, id, buf, unreadable)
                                         },
                                     );
                                 }
@@ -852,6 +887,26 @@ mod init {
                 Some(cutoff_older_than) if parent_commit_time < cutoff_older_than => {}
                 Some(_) | None => queue.insert(key, parent_id),
             }
+        }
+    }
+}
+
+/// The committer time of the parent `id` that is being queued, `0` when its commit cannot be read,
+/// which is then remembered in `unreadable` for when it is popped.
+fn parent_commit_time(
+    objects: &impl gix_object::Find,
+    id: ObjectId,
+    buf: &mut Vec<u8>,
+    unreadable: &mut gix_hashtable::HashMap<ObjectId, Unreadable>,
+) -> SecondsSinceUnixEpoch {
+    use gix_object::FindExt;
+    match objects.find_commit_iter(&id, buf) {
+        Ok(parent) => parent.committer().ok().map(|committer| committer.seconds()).unwrap_or_default(),
+        Err(err) => {
+            if let Some(why) = Unreadable::of(&err) {
+                unreadable.insert(id, why);
+            }
+            0
         }
     }
 }

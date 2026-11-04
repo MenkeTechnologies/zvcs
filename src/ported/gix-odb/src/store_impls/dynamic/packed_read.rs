@@ -22,7 +22,7 @@ const OBJ_REF_DELTA: i32 = 7;
 
 /// The reads of the rest of the object database `packfile.c` makes while it recovers from a bad
 /// entry, and `mark_bad_packed_object()` for the pack being read.
-pub(crate) trait Odb {
+pub trait Odb {
     /// `odb_read_object_info(r, oid, NULL)`: the object's type, `None` for a negative answer.
     fn read_type(&mut self, id: &oid) -> Option<Kind>;
     /// `odb_read_object_info_extended()` with `typep`, `sizep` and `contentp` and no flags.
@@ -39,7 +39,7 @@ pub(crate) struct Pack<'a> {
     pub name: &'a str,
     /// The pack's own `.idx` (`p->index_data`), which `find_pack_entry_one()` and the reverse index
     /// read whether or not a multi-pack-index named the entry.
-    pub index: Option<gix_pack::index::File>,
+    pub index: Option<&'a gix_pack::index::File>,
     /// `p->repo->hash_algo`.
     pub hash: gix_hash::Kind,
 }
@@ -52,8 +52,28 @@ pub(crate) fn die(msg: &str) -> ! {
     std::process::exit(128)
 }
 
-fn error(msg: &str) {
-    eprintln!("error: {msg}");
+thread_local! {
+    /// Set by [`capture_errors()`]: the `error()` lines collected rather than printed.
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `error()`: `error: <msg>` on stderr, or into what [`capture_errors()`] collects.
+pub(crate) fn error(msg: &str) {
+    let line = format!("error: {msg}");
+    CAPTURED.with_borrow_mut(|captured| match captured {
+        Some(lines) => lines.push(line),
+        None => eprintln!("{line}"),
+    });
+}
+
+/// Run `f` with every `error()` line the object database prints collected rather than printed, for
+/// a caller that orders them among lines of its own; the lines come back in the order git prints
+/// them.
+pub fn capture_errors<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let before = CAPTURED.replace(Some(Vec::new()));
+    let out = f();
+    let lines = CAPTURED.replace(before).unwrap_or_default();
+    (out, lines)
 }
 
 /// The object type of a non-delta `enum object_type` value.
@@ -535,4 +555,28 @@ impl Pack<'_> {
             size => Some(size as u64),
         }
     }
+}
+
+/// `verify_packfile()`'s read of one entry (pack-check.c:126-147): `unpack_object_header()`, then
+/// `unpack_entry()`, of the object at `obj_offset` in the pack `data`, named `name` and indexed by
+/// `index`, with `odb` answering the reads of the rest of the object database. `None` is the `NULL`
+/// git reports as `cannot unpack`. Not taken: the streaming read git makes instead for a blob at or
+/// above `core.bigFileThreshold` (pack-check.c:133-141).
+pub fn verify_unpack_entry(
+    data: &[u8],
+    name: &str,
+    index: &gix_pack::index::File,
+    hash: gix_hash::Kind,
+    obj_offset: u64,
+    odb: &mut dyn Odb,
+) -> Option<(Kind, Vec<u8>)> {
+    let pack = Pack {
+        data,
+        name,
+        index: Some(index),
+        hash,
+    };
+    let mut curpos = obj_offset;
+    pack.unpack_object_header(&mut curpos);
+    pack.unpack_entry(obj_offset, odb)
 }

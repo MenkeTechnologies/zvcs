@@ -1380,6 +1380,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     }
                 },
             };
+            // `fsck_walk_tree()` opens with `repo_parse_tree()` (fsck.c:361-362), which reads a tree
+            // whose buffer is not held and refuses an object of another type with
+            // `error("Object %s not a tree")` (tree.c:185-204); the walk then stops there.
+            if expected == Some(Kind::Tree) && kind != Kind::Tree && !state.parsed_trees.contains(&id) {
+                eprintln!("error: Object {id} not a tree");
+                break 'traverse;
+            }
             if kind == Kind::Blob {
                 break 'traverse;
             }

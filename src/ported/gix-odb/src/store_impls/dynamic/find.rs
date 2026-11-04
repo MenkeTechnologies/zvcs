@@ -132,6 +132,8 @@ where
         // whether the second read, which every miss gets, has run.
         let mut bad_pack: Option<String> = None;
         let mut second_read = false;
+        let refused = self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed);
+        let mut refused_packs = Vec::new();
         loop {
             let mut failed: Option<(std::sync::Arc<gix_pack::data::File>, u64)> = None;
             {
@@ -145,7 +147,7 @@ where
                     {
                         let pack = match possibly_pack {
                             Some(pack) => pack,
-                            None => match self.store.load_pack(pack_id, marker)? {
+                            None => match self.load_pack_once(pack_id, marker, &mut refused_packs)? {
                                 Some(pack) => {
                                     *possibly_pack = Some(pack);
                                     possibly_pack.as_ref().expect("just put it in")
@@ -330,6 +332,9 @@ where
                     }
                 }
             }
+            if failed.is_none() && second_read {
+                failed = self.midx_survivor(snapshot, id, &refused_packs, &mut bad_pack);
+            }
             if let Some((pack, pack_offset)) = failed {
                 let mut odb = Recover {
                     handle: self,
@@ -375,31 +380,38 @@ where
                     *snapshot = new_snapshot;
                     self.clear_cache();
                 }
-                None => match self.second_read(&mut second_read, bad_pack.take(), id)? {
-                    Some(pack) => bad_pack = Some(pack),
-                    None => return Ok(None),
-                },
+                None => {
+                    if !self.second_read(&mut second_read, refused, &mut refused_packs, &mut bad_pack, id)? {
+                        return Ok(None);
+                    }
+                }
             }
         }
     }
 
     /// The end of `do_oid_object_info_extended()`'s first pass over the sources (odb.c:575-607) for
-    /// an object nothing produced. Without a pack that gave up on it, a second read finds no more
-    /// than the refresh just did, so it is a plain miss. With one, the second read runs once, now
-    /// passing over the object in that pack, and hands `bad_pack` back to keep it; after that the
-    /// answer is that the object is corrupt.
+    /// an object nothing produced: whether to read once more. The second read runs once, and only matters
+    /// when the first met a pack it could not use, as otherwise it finds no more than the refresh just
+    /// did: a pack that gave up on the object, which the second read passes over and keeps in
+    /// `bad_pack`, or a pack `is_pack_valid()` refused since `refused`, which the second read opens and
+    /// reports again. After it, a pack that gave up on the object makes the answer that it is corrupt.
     pub(super) fn second_read(
         &self,
         second_read: &mut bool,
-        bad_pack: Option<String>,
+        refused: usize,
+        refused_packs: &mut Vec<PackId>,
+        bad_pack: &mut Option<String>,
         id: &gix_hash::oid,
-    ) -> Result<Option<String>, Error> {
-        match bad_pack {
-            None => Ok(None),
-            Some(pack) if !*second_read => {
-                *second_read = true;
-                Ok(Some(pack))
-            }
+    ) -> Result<bool, Error> {
+        let met_unusable_pack = bad_pack.is_some()
+            || self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed) != refused;
+        if !*second_read && met_unusable_pack {
+            *second_read = true;
+            refused_packs.clear();
+            return Ok(true);
+        }
+        match bad_pack.take() {
+            None => Ok(false),
             Some(pack) => Err(Error::PackedObjectCorrupt {
                 id: id.to_owned(),
                 pack,
@@ -421,7 +433,7 @@ where
         let p = super::packed_read::Pack {
             data,
             name: &name,
-            index,
+            index: index.as_ref(),
             hash: pack.object_hash(),
         };
         read(&p, odb)
@@ -439,6 +451,8 @@ where
         };
         let mut bad_pack: Option<String> = None;
         let mut second_read = false;
+        let refused = self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed);
+        let mut refused_packs = Vec::new();
         loop {
             let mut found: Option<(std::sync::Arc<gix_pack::data::File>, u64)> = None;
             {
@@ -452,7 +466,7 @@ where
                     {
                         let pack = match possibly_pack {
                             Some(pack) => &*pack,
-                            None => match self.store.load_pack(pack_id, marker)? {
+                            None => match self.load_pack_once(pack_id, marker, &mut refused_packs)? {
                                 Some(pack) => {
                                     *possibly_pack = Some(pack);
                                     possibly_pack.as_ref().expect("just put it in")
@@ -468,6 +482,9 @@ where
                         break;
                     }
                 }
+            }
+            if found.is_none() && second_read {
+                found = self.midx_survivor(&snapshot, id, &refused_packs, &mut bad_pack);
             }
             if let Some((pack, pack_offset)) = found {
                 let mut inflate = self.inflate.borrow_mut();
@@ -501,10 +518,11 @@ where
                     *snapshot = new_snapshot;
                     self.clear_cache();
                 }
-                None => match self.second_read(&mut second_read, bad_pack.take(), id)? {
-                    Some(pack) => bad_pack = Some(pack),
-                    None => return Ok(None),
-                },
+                None => {
+                    if !self.second_read(&mut second_read, refused, &mut refused_packs, &mut bad_pack, id)? {
+                        return Ok(None);
+                    }
+                }
             }
         }
     }
@@ -524,6 +542,159 @@ where
                     .map(|pack| self.store.is_bad_packed_object(pack.path(), id))
             })
             .unwrap_or(false)
+    }
+
+    /// [`Store::load_pack()`](super::Store::load_pack) for one pass of a lookup. git asks each pack once
+    /// per pass (odb/source-packed.c:22-46), while this handle runs the pass again whenever it loads
+    /// another index; a pack `is_pack_valid()` refused earlier in the pass, kept in `refused_packs`, is
+    /// therefore not opened, and reported, again until the second read clears the list.
+    pub(super) fn load_pack_once(
+        &self,
+        pack_id: PackId,
+        marker: crate::store::types::SlotIndexMarker,
+        refused_packs: &mut Vec<PackId>,
+    ) -> std::io::Result<Option<std::sync::Arc<gix_pack::data::File>>> {
+        if refused_packs.contains(&pack_id) {
+            return Ok(None);
+        }
+        let before = self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed);
+        let pack = self.store.load_pack(pack_id, marker)?;
+        if pack.is_none() && self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed) != before {
+            refused_packs.push(pack_id);
+        }
+        Ok(pack)
+    }
+
+    /// The second read's recovery for a multi-pack-index whose owning pack of `id` `is_pack_valid()`
+    /// refused, `MIDX_FILL_OWNER_UNAVAILABLE` (odb/source-packed.c:48-73): every pack the multi-pack-index
+    /// covers is asked through its own `.idx`, as `packfile_fill_entry()` asks it, so the refused owner
+    /// is opened, and reported, once more, and a copy of `id` in another covered pack is found. That
+    /// pack and the offset of `id` in it come back.
+    pub(super) fn midx_survivor(
+        &self,
+        snapshot: &load_index::Snapshot,
+        id: &gix_hash::oid,
+        refused_packs: &[PackId],
+        bad_pack: &mut Option<String>,
+    ) -> Option<(std::sync::Arc<gix_pack::data::File>, u64)> {
+        for owner in refused_packs.iter().filter(|pack| pack.multipack_index.is_some()) {
+            let Some(handle::SingleOrMultiIndex::Multi { index: midx, .. }) = snapshot
+                .indices
+                .iter()
+                .find(|index| index.id == owner.index)
+                .map(|index| &index.file)
+            else {
+                continue;
+            };
+            let dir = midx.path().parent()?;
+            for (n, name) in midx.index_names().iter().enumerate() {
+                // `prepare_midx_pack()` failing passes the pack over.
+                let Ok(index) = gix_pack::index::File::at(dir.join(name), self.store.object_hash) else {
+                    continue;
+                };
+                // `packfile_fill_entry()` (packfile.c:1840-1866): the object marked bad there, then the
+                // pack's own index, then `is_pack_valid()`.
+                let pack_path = dir.join(name).with_extension("pack");
+                if self.store.is_bad_packed_object(&pack_path, id) {
+                    bad_pack.get_or_insert_with(|| self.store.pack_name(&pack_path));
+                    continue;
+                }
+                let Some(offset) = index.lookup(id).map(|nr| index.pack_offset_at_index(nr)) else {
+                    continue;
+                };
+                let pack_id = PackId {
+                    index: owner.index,
+                    multipack_index: Some(n as gix_pack::multi_index::PackIndex),
+                };
+                if let Ok(Some(pack)) = self.store.load_pack(pack_id, snapshot.marker) {
+                    return Some((pack, offset));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the pack `index` names for `id` passes `is_pack_valid()`, which `packfile_fill_entry()`
+    /// and `midx_fill_entry()` ask before they answer that the pack has it (packfile.c:1855-1866,
+    /// midx.c:618-619): a pack not mapped yet is opened, and kept when it is valid.
+    fn pack_is_valid(
+        &self,
+        index: &mut handle::IndexLookup,
+        id: &gix_hash::oid,
+        marker: crate::store::types::SlotIndexMarker,
+        refused_packs: &mut Vec<PackId>,
+    ) -> bool {
+        let Some(handle::index_lookup::Outcome {
+            object_index: handle::IndexForObjectInPack { pack_id, .. },
+            pack: possibly_pack,
+            ..
+        }) = index.lookup(id)
+        else {
+            return false;
+        };
+        if possibly_pack.is_some() {
+            return true;
+        }
+        match self.load_pack_once(pack_id, marker, refused_packs) {
+            Ok(Some(pack)) => {
+                *possibly_pack = Some(pack);
+                true
+            }
+            Ok(None) => false,
+            // The index still names the object; what failed is the map, which a read reports.
+            Err(_) => true,
+        }
+    }
+
+    /// `odb_has_object()` with `ODB_HAS_OBJECT_RECHECK_PACKED` (odb.c:809-822): a lookup that misses
+    /// gets the second read of `do_oid_object_info_extended()` (odb.c:571-584), which matters, as in
+    /// [`Self::second_read()`], only when the first opened a pack `is_pack_valid()` refused.
+    pub fn contains_recheck(&self, id: &gix_hash::oid) -> bool {
+        let refused = self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed);
+        gix_object::Exists::exists(self, id)
+            || (self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed) != refused
+                && self.contains_pass(id, true))
+    }
+
+    /// Whether `id` is here, as `find_pack_entry()` and the loose source answer with no object info
+    /// asked for: the index lookup, the packs passed over that hold it only as a bad copy or that
+    /// `is_pack_valid()` refuses, and, on the `second_read`, the multi-pack-index recovery of
+    /// [`Self::midx_survivor()`].
+    fn contains_pass(&self, id: &gix_hash::oid, second_read: bool) -> bool {
+        let mut snapshot = self.snapshot.borrow_mut();
+        let mut refused_packs = Vec::new();
+        loop {
+            let marker = snapshot.marker;
+            for (idx, index) in snapshot.indices.iter_mut().enumerate() {
+                if index.contains(id)
+                    && !self.names_bad_copy(index, id)
+                    && self.pack_is_valid(index, id, marker, &mut refused_packs)
+                {
+                    if idx != 0 {
+                        snapshot.indices.swap(0, idx);
+                    }
+                    return true;
+                }
+            }
+            if second_read && self.midx_survivor(&snapshot, id, &refused_packs, &mut None).is_some() {
+                return true;
+            }
+
+            for lodb in snapshot.loose_dbs.iter() {
+                if lodb.contains(id) {
+                    return true;
+                }
+            }
+
+            match self.store.load_one_index(self.index_ctx(snapshot.marker)) {
+                Ok(Some(new_snapshot)) => {
+                    *snapshot = new_snapshot;
+                    self.clear_cache();
+                }
+                Ok(None) => return false, // nothing more to load, or our refresh mode doesn't allow disk refreshes
+                Err(_) => return false, // something went wrong, nothing we can communicate here with this trait. TODO: Maybe that should change?
+            }
+        }
     }
 
     pub(crate) fn clear_cache(&self) {
@@ -560,32 +731,7 @@ where
 {
     // TODO: probably make this method fallible, but that would mean its own error type.
     fn contains(&self, id: &gix_hash::oid) -> bool {
-        let mut snapshot = self.snapshot.borrow_mut();
-        loop {
-            for (idx, index) in snapshot.indices.iter_mut().enumerate() {
-                if index.contains(id) && !self.names_bad_copy(index, id) {
-                    if idx != 0 {
-                        snapshot.indices.swap(0, idx);
-                    }
-                    return true;
-                }
-            }
-
-            for lodb in snapshot.loose_dbs.iter() {
-                if lodb.contains(id) {
-                    return true;
-                }
-            }
-
-            match self.store.load_one_index(self.index_ctx(snapshot.marker)) {
-                Ok(Some(new_snapshot)) => {
-                    *snapshot = new_snapshot;
-                    self.clear_cache();
-                }
-                Ok(None) => return false, // nothing more to load, or our refresh mode doesn't allow disk refreshes
-                Err(_) => return false, // something went wrong, nothing we can communicate here with this trait. TODO: Maybe that should change?
-            }
-        }
+        self.contains_pass(id, false)
     }
 
     fn try_find_cached<'a>(

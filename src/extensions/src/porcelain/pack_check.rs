@@ -1,6 +1,8 @@
-//! `pack-check.c`'s `verify_pack()`, with the `unpack_entry()` (packfile.c) and
-//! `patch_delta()` (patch-delta.c) it drives, reduced to what `fsck --full`
-//! observes: the `error:` lines, in git's order, and which objects came back.
+//! `pack-check.c`'s `verify_pack()`, reduced to what `fsck --full` observes: the
+//! `error:` lines, in git's order, and which objects came back. The
+//! `unpack_entry()` (packfile.c) and `patch_delta()` (patch-delta.c) it drives
+//! are the object database's own ([`gix::odb::store::verify_unpack_entry`]),
+//! whose lines are collected here so they print where git prints them.
 //!
 //! For each pack git checks the `.idx` trailer, then the `.pack` trailer
 //! against the pack's own bytes and against the copy the `.idx` records, then
@@ -39,6 +41,8 @@ pub(super) struct PackCheck {
 }
 
 impl PackCheck {
+    /// One of `verify_packfile()`'s own `err = error(...)` lines, which make it fail; the lines
+    /// `unpack_entry()` prints on the way are not (pack-check.c:52-181).
     fn error(&mut self, line: String) {
         self.lines.push(format!("error: {line}"));
         self.failed = true;
@@ -70,11 +74,17 @@ pub(super) fn verify_pack(
         }
     }
 
-    // `verify_packfile()`'s trailer checks (pack-check.c:73-94).
-    if pack_bytes.len() < rawsz {
+    // `verify_packfile()` opens the pack through `is_pack_valid()` before it reads a byte of it
+    // (pack-check.c:69-70), whose own line comes first.
+    let (valid, lines) =
+        gix::odb::store::capture_errors(|| repo.objects.store_ref().is_pack_valid(pack_path, Some(index)));
+    out.lines.extend(lines);
+    if !valid || pack_bytes.len() < rawsz {
         out.error(format!("packfile {pack_name} cannot be accessed"));
         return;
     }
+
+    // `verify_packfile()`'s trailer checks (pack-check.c:73-94).
     let pack_sig_ofs = pack_bytes.len() - rawsz;
     let pack_sig = &pack_bytes[pack_sig_ofs..];
     if digest(hash, &pack_bytes[..pack_sig_ofs]).as_deref() != Some(pack_sig) {
@@ -104,7 +114,6 @@ pub(super) fn verify_pack(
         .chain(std::iter::once(pack_sig_ofs as u64))
         .collect();
 
-    let reader = Reader { repo, index, pack: pack_bytes, pack_name, pack_path, hash };
     for (&(offset, nr), &end) in entries.iter().zip(&ends) {
         let oid = index.oid_at_index(nr).to_owned();
         // `check_pack_crc()` for a v2 index (pack-check.c:108-117).
@@ -116,7 +125,16 @@ pub(super) fn verify_pack(
                 ));
             }
         }
-        match reader.unpack_entry(offset, out) {
+        let mut recovery = Recovery {
+            repo,
+            pack_path,
+            bad: &mut out.bad,
+        };
+        let (data, lines) = gix::odb::store::capture_errors(|| {
+            gix::odb::store::verify_unpack_entry(pack_bytes, pack_name, index, hash, offset, &mut recovery)
+        });
+        out.lines.extend(lines);
+        match data {
             None => {
                 out.error(format!("cannot unpack {oid} from {pack_name} at offset {offset}"));
                 out.unverified.insert(oid);
@@ -140,220 +158,31 @@ fn digest(hash: gix::hash::Kind, bytes: &[u8]) -> Option<Vec<u8>> {
     hasher.try_finalize().ok().map(|id| id.as_bytes().to_vec())
 }
 
-/// `OBJ_OFS_DELTA` / `OBJ_REF_DELTA`.
-const OBJ_OFS_DELTA: i32 = 6;
-const OBJ_REF_DELTA: i32 = 7;
-
-struct Reader<'a> {
+/// What `unpack_entry()` asks of the rest of the object database while it reads a pack under
+/// check: the delta bases it marks bad are kept in [`PackCheck::bad`] as well as in the object
+/// database's own `bad_objects`, and a base it could not read is read from any other copy.
+struct Recovery<'a> {
     repo: &'a gix::Repository,
-    index: &'a pack::index::File,
-    pack: &'a [u8],
-    pack_name: &'a str,
     /// The `.pack` file, which names this pack to the object database's `bad_objects`.
     pack_path: &'a std::path::Path,
-    hash: gix::hash::Kind,
+    bad: &'a mut HashSet<ObjectId>,
 }
 
-impl Reader<'_> {
-    /// `unpack_object_header()` (packfile.c:1137-1164, :1225-1249): the type and
-    /// size at `*curpos`, advancing past the header; `-1` is `OBJ_BAD`.
-    fn object_header(&self, curpos: &mut u64, out: &mut PackCheck) -> (i32, usize) {
-        let buf = self.pack.get(*curpos as usize..).unwrap_or_default();
-        let Some(&first) = buf.first() else {
-            return (-1, 0);
-        };
-        let mut c = first as usize;
-        let kind = ((c >> 4) & 7) as i32;
-        let mut size = c & 15;
-        let mut shift = 4u32;
-        let mut used = 1usize;
-        while c & 0x80 != 0 {
-            if buf.len() <= used || usize::BITS - 7 < shift {
-                out.error("bad object header".to_string());
-                return (-1, 0);
-            }
-            c = buf[used] as usize;
-            used += 1;
-            size = size.saturating_add((c & 0x7f) << shift);
-            shift += 7;
-        }
-        *curpos += used as u64;
-        (kind, size)
+impl gix::odb::store::PackedReadOdb for Recovery<'_> {
+    fn read_type(&mut self, id: &gix::hash::oid) -> Option<Kind> {
+        self.repo.find_header(id).ok().map(|hdr| hdr.kind())
     }
 
-    /// `get_delta_base()` (packfile.c:1273-1312): the base's offset, `0` when
-    /// the reference is out of bounds or names an object not in this pack.
-    fn delta_base(&self, curpos: &mut u64, kind: i32, delta_obj_offset: u64) -> u64 {
-        let info = self.pack.get(*curpos as usize..).unwrap_or_default();
-        if kind == OBJ_OFS_DELTA {
-            let mut used = 0usize;
-            let Some(&c0) = info.first() else { return 0 };
-            used += 1;
-            let mut c = c0;
-            let mut base_offset = u64::from(c & 127);
-            while c & 128 != 0 {
-                base_offset += 1;
-                if base_offset == 0 || base_offset >> (64 - 7) != 0 {
-                    return 0; // overflow
-                }
-                let Some(&next) = info.get(used) else { return 0 };
-                used += 1;
-                c = next;
-                base_offset = (base_offset << 7) + u64::from(c & 127);
-            }
-            if base_offset == 0 || base_offset >= delta_obj_offset {
-                return 0; // out of bound
-            }
-            *curpos += used as u64;
-            delta_obj_offset - base_offset
-        } else {
-            let rawsz = self.hash.len_in_bytes();
-            let Some(raw) = info.get(..rawsz) else { return 0 };
-            *curpos += rawsz as u64;
-            let oid = ObjectId::from_bytes_or_panic(raw);
-            self.index
-                .lookup(oid)
-                .map_or(0, |nr| self.index.pack_offset_at_index(nr))
-        }
-    }
-
-    /// `unpack_compressed_entry()` (packfile.c:1723-1766): inflate exactly
-    /// `size` bytes at `curpos`, printing `git_inflate()`'s complaint when zlib
-    /// refuses the stream.
-    fn compressed_entry(&self, curpos: u64, size: usize, out: &mut PackCheck) -> Option<Vec<u8>> {
-        let input = self.pack.get(curpos as usize..).unwrap_or_default();
-        // `stream.avail_out = size + 1`: one spare byte catches a payload that
-        // is longer than its header says.
-        let mut buffer = vec![0u8; size + 1];
-        let mut z = gix::zlib::Decompress::new();
-        let status = match z.decompress(input, &mut buffer, gix::zlib::FlushDecompress::Finish) {
-            Ok(status) => status,
-            Err(e) => {
-                out.lines.push(super::fsck::inflate_error_line(&z, &e));
-                return None;
-            }
-        };
-        if !matches!(status, gix::zlib::Status::StreamEnd) || z.total_out() != size as u64 {
-            return None;
-        }
-        buffer.truncate(size);
-        Some(buffer)
-    }
-
-    /// The type of the object at `offset` for a delta-base diagnostic: the id
-    /// the `.idx` lists there, if any (`offset_to_pack_pos()`).
-    fn oid_at_offset(&self, offset: u64) -> Option<ObjectId> {
-        (0..self.index.num_objects())
-            .find(|&nr| self.index.pack_offset_at_index(nr) == offset)
-            .map(|nr| self.index.oid_at_index(nr).to_owned())
-    }
-
-    /// `unpack_entry()` (packfile.c:1784-2000).
-    fn unpack_entry(&self, obj_offset: u64, out: &mut PackCheck) -> Option<(Kind, Vec<u8>)> {
-        let mut obj_offset = obj_offset;
-        let mut curpos = obj_offset;
-        // (obj_offset, curpos past the base reference, delta size)
-        let mut delta_stack: Vec<(u64, u64, usize)> = Vec::new();
-
-        // PHASE 1: drill down to the innermost base object.
-        let (mut kind, mut size);
-        let mut data: Option<Vec<u8>> = None;
-        let mut failed_reference = false;
-        loop {
-            (kind, size) = self.object_header(&mut curpos, out);
-            if kind != OBJ_OFS_DELTA && kind != OBJ_REF_DELTA {
-                break;
-            }
-            let base_offset = self.delta_base(&mut curpos, kind, obj_offset);
-            if base_offset == 0 {
-                out.error(format!(
-                    "failed to validate delta base reference at offset {curpos} from {}",
-                    self.pack_name
-                ));
-                // Bail to phase 2, in hopes of recovery.
-                failed_reference = true;
-                break;
-            }
-            delta_stack.push((obj_offset, curpos, size));
-            curpos = base_offset;
-            obj_offset = base_offset;
-        }
-
-        // PHASE 2: handle the base.
-        match kind {
-            OBJ_OFS_DELTA | OBJ_REF_DELTA if failed_reference => {}
-            1..=4 => data = self.compressed_entry(curpos, size, out),
-            _ => out.error(format!(
-                "unknown object type {kind} at offset {obj_offset} in {}",
-                self.pack_name
-            )),
-        }
-        let mut final_kind = base_kind(kind);
-
-        // PHASE 3: apply deltas in order.
-        while let Some((delta_offset, delta_curpos, delta_size)) = delta_stack.pop() {
-            let mut base = data.take();
-            if base.is_none() {
-                // "We're probably in deep shit, but let's try to fetch the
-                // required base anyway from another pack or loose."
-                if let Some(base_oid) = self.oid_at_offset(obj_offset) {
-                    out.error(format!(
-                        "failed to read delta base object {base_oid} at offset {obj_offset} from {}",
-                        self.pack_name
-                    ));
-                    out.bad.insert(base_oid);
-                    self.repo.objects.store_ref().mark_bad_packed_object(self.pack_path, &base_oid);
-                    base = self.elsewhere(base_oid).map(|(k, d)| {
-                        final_kind = Some(k);
-                        d
-                    });
-                }
-            }
-            obj_offset = delta_offset;
-            let Some(base) = base else { continue };
-            match self.compressed_entry(delta_curpos, delta_size, out) {
-                None => {
-                    out.error(format!(
-                        "failed to unpack compressed delta at offset {delta_curpos} from {}",
-                        self.pack_name
-                    ));
-                }
-                Some(delta) => {
-                    data = match patch_delta(&base, &delta) {
-                        Ok(result) => Some(result),
-                        Err(line) => {
-                            if let Some(line) = line {
-                                out.lines.push(format!("error: {line}"));
-                            }
-                            out.error("failed to apply delta".to_string());
-                            None
-                        }
-                    };
-                }
-            }
-        }
-        Some((final_kind?, data?))
-    }
-
-    /// The fallback read of a delta base this pack could not produce: every
-    /// other copy the odb has, which for a base marked bad here means a loose
-    /// object or another pack.
-    fn elsewhere(&self, id: ObjectId) -> Option<(Kind, Vec<u8>)> {
+    fn read_object(&mut self, id: &gix::hash::oid) -> Option<(Kind, Vec<u8>)> {
         // `odb_read_object_info_extended()` with no flags, which does not die on a corrupt answer
         // (packfile.c:1617-1628).
         let object = gix::odb::store::find::with_corrupt_reads_as_errors(|| self.repo.find_object(id)).ok()?;
         Some((object.kind, object.data.clone()))
     }
-}
 
-/// The object type of a non-delta pack entry.
-fn base_kind(kind: i32) -> Option<Kind> {
-    match kind {
-        1 => Some(Kind::Commit),
-        2 => Some(Kind::Tree),
-        3 => Some(Kind::Blob),
-        4 => Some(Kind::Tag),
-        _ => None,
+    fn mark_bad(&mut self, id: &gix::hash::oid) {
+        self.bad.insert(id.to_owned());
+        self.repo.objects.store_ref().mark_bad_packed_object(self.pack_path, id);
     }
 }
 

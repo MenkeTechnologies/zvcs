@@ -228,7 +228,7 @@ pub mod prefix;
 mod header;
 
 mod packed_read;
-pub use packed_read::{patch_delta, patch_delta_quiet};
+pub use packed_read::{Odb as PackedReadOdb, capture_errors, patch_delta, patch_delta_quiet, verify_unpack_entry};
 
 ///
 pub mod iter;

@@ -55,12 +55,18 @@
 //! * A write that fails at flush time is dropped rather than reported. That is
 //!   what `exit()` does with a stdio buffer it cannot write out, and it is what
 //!   git looks like when its stdout is a closed pipe.
+//!
+//! A command that streams more than a screenful (`log`, `rev-list`) writes
+//! through [`Block`] instead: the same buffer, written out whenever it fills, as
+//! a fully buffered stdio stream is, and so still flushed by `exit()` when a read
+//! further on dies.
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// Bytes written while [`DEFERRED`] is set and no newline has released them.
+/// Bytes written while [`DEFERRED`] is set and no newline has released them, or
+/// through a [`Block`] writer and not yet written out.
 static BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 /// Whether some command asked for git's buffering. Set by [`defer`].
@@ -85,6 +91,11 @@ pub fn defer() {
     // paths leave through `std::process::exit`, which skips it — and `exit()` is
     // exactly where C would flush the stdio buffer. Registering once, on arming,
     // keeps the handler off processes that never buffer anything.
+    register_at_exit();
+}
+
+/// Install the `atexit` flush, once.
+fn register_at_exit() {
     static REGISTERED: OnceLock<()> = OnceLock::new();
     REGISTERED.get_or_init(|| {
         // SAFETY: `at_exit` takes no arguments, returns nothing, and only locks a
@@ -113,6 +124,8 @@ pub fn write_bytes(bytes: &[u8]) {
 /// any, belongs to [`flush`], which discards it.
 pub fn write_bytes_io(bytes: &[u8]) -> std::io::Result<()> {
     if !DEFERRED.load(Ordering::Relaxed) {
+        // What a [`Block`] writer holds was written first.
+        flush();
         let mut out = std::io::stdout().lock();
         out.write_all(bytes)?;
         return out.flush();
@@ -137,14 +150,52 @@ pub fn write_bytes_io(bytes: &[u8]) -> std::io::Result<()> {
 /// The `exit()`-time flush of the stdio buffer. Idempotent, so the dispatcher and
 /// the `atexit` handler can both call it.
 pub fn flush() {
-    let mut buf = BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = write_out(&mut BUFFER.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// How much [`Block`] holds before it writes out: a block, not a line, so a
+/// long listing costs one `write(2)` per 64 KiB rather than one per record.
+const BLOCK: usize = 64 * 1024;
+
+/// stdout fully buffered, as stdio buffers it for a pipe or a file: writes
+/// collect in this module's buffer, go out when it fills or at [`flush`], and
+/// whatever is held when a `die()` calls `std::process::exit` is written by the
+/// `atexit` handler, which is what `exit()` does with stdio's buffer. Unlike
+/// [`write_bytes`], a failed write is reported, so a closed pipe still surfaces
+/// as `BrokenPipe`.
+pub struct Block(());
+
+/// A [`Block`] writer onto stdout.
+pub fn block() -> Block {
+    register_at_exit();
+    Block(())
+}
+
+impl Write for Block {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut buf = BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        buf.extend_from_slice(bytes);
+        if buf.len() >= BLOCK {
+            write_out(&mut buf)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        write_out(&mut BUFFER.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// Write `buf` to fd 1 and empty it, as stdio's buffer is emptied whether or
+/// not the write succeeded.
+fn write_out(buf: &mut Vec<u8>) -> std::io::Result<()> {
     if buf.is_empty() {
-        return;
+        return Ok(());
     }
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(&buf);
-    let _ = out.flush();
+    let res = out.write_all(buf).and_then(|()| out.flush());
     buf.clear();
+    res
 }
 
 /// `start_command()`'s `fflush(NULL)` (run-command.c:743), which git runs

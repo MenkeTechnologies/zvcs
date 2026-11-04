@@ -691,8 +691,11 @@ pub fn cat_file(args: &[String]) -> Result<ExitCode> {
 
     match mode {
         // `-e` is silent on both paths: 0 when present, 1 when absent.
+        // `odb_has_object()` with `ODB_HAS_OBJECT_RECHECK_PACKED | ODB_HAS_OBJECT_FETCH_PROMISOR`
+        // (builtin/cat-file.c:189-192): a miss gets the second read.
         Mode::Exists => {
-            if repo.has_object(oid) {
+            let empty_tree = oid == gix::hash::ObjectId::empty_tree(oid.kind());
+            if empty_tree || repo.objects.contains_recheck(&oid) {
                 Ok(ExitCode::SUCCESS)
             } else {
                 Ok(ExitCode::from(1))

@@ -34,6 +34,8 @@ where
         // whether the second read, which every miss gets, has run.
         let mut bad_pack: Option<String> = None;
         let mut second_read = false;
+        let refused = self.store.invalid_pack_opens.load(std::sync::atomic::Ordering::Relaxed);
+        let mut refused_packs = Vec::new();
         'outer: loop {
             let mut failed: Option<(std::sync::Arc<gix_pack::data::File>, u64)> = None;
             {
@@ -47,27 +49,16 @@ where
                     {
                         let pack = match possibly_pack {
                             Some(pack) => &*pack,
-                            None => match self.store.load_pack(pack_id, marker)? {
+                            None => match self.load_pack_once(pack_id, marker, &mut refused_packs)? {
                                 Some(pack) => {
                                     *possibly_pack = Some(pack);
                                     possibly_pack.as_ref().expect("just put it in")
                                 }
-                                None => {
-                                    // The pack wasn't available anymore so we are supposed to try another round with a fresh index
-                                    match self.store.load_one_index(self.index_ctx(snapshot.marker))? {
-                                        Some(new_snapshot) => {
-                                            *snapshot = new_snapshot;
-                                            self.clear_cache();
-                                            continue 'outer;
-                                        }
-                                        None => {
-                                            // nothing new in the index, kind of unexpected to not have a pack but to also
-                                            // to have no new index yet. We set the new index before removing any slots, so
-                                            // this should be observable.
-                                            return Ok(None);
-                                        }
-                                    }
-                                }
+                                // Gone, or refused by `is_pack_valid()`: `packfile_fill_entry()` and
+                                // `midx_fill_entry()` answer that the pack does not have it, and the next
+                                // index is asked (packfile.c:1855-1866, midx.c:618-619), as in
+                                // `try_find_cached_inner()`. The refresh below still runs afterwards.
+                                None => continue 'indices,
                             },
                         };
                         // `packfile_fill_entry()` and `midx_fill_entry()` pass over an object marked
@@ -193,6 +184,9 @@ where
                     }
                 }
             }
+            if failed.is_none() && second_read {
+                failed = self.midx_survivor(snapshot, id, &refused_packs, &mut bad_pack);
+            }
             if let Some((pack, pack_offset)) = failed {
                 let mut odb = super::find::Recover {
                     handle: self,
@@ -231,10 +225,11 @@ where
                     *snapshot = new_snapshot;
                     self.clear_cache();
                 }
-                None => match self.second_read(&mut second_read, bad_pack.take(), id)? {
-                    Some(pack) => bad_pack = Some(pack),
-                    None => return Ok(None),
-                },
+                None => {
+                    if !self.second_read(&mut second_read, refused, &mut refused_packs, &mut bad_pack, id)? {
+                        return Ok(None);
+                    }
+                }
             }
         }
     }

@@ -9,7 +9,7 @@ use std::{
 use base64::Engine;
 use bstr::BStr;
 pub use traits::{Error, ErrorResponse, GetResponse, Http, PostBodyDataKind, PostResponse};
-pub use crate::client::RpcEnded;
+pub use crate::client::{CurlFailure, RpcEnded};
 
 use crate::{
     Protocol, Service,
@@ -218,6 +218,10 @@ pub struct Options {
     pub connect_timeout: Option<std::time::Duration>,
     /// If enabled, emit additional information about connections and possibly the data received or written.
     pub verbose: bool,
+    /// remote-curl's `options.verbosity`, which the transport helper sets to the command's verbosity plus one
+    /// (`standard_options()`, transport-helper.c:371-379): `0` under `--quiet`, `1` by default, `2` for `-v`.
+    /// Above `1` every `POST` is announced on stderr with the size of its body (`post_rpc()`, remote-curl.c:994-1056).
+    pub verbosity: i32,
     /// If set, use this path to point to a file with CA certificates to verify peers.
     pub ssl_ca_info: Option<PathBuf>,
     /// If set, use this path to point to a *directory* whose files each contain CA certificates to verify peers.
@@ -313,6 +317,8 @@ impl Default for Options {
             user_agent: None,
             connect_timeout: None,
             verbose: false,
+            // `options.verbosity = 1` (remote-curl.c:1571).
+            verbosity: 1,
             ssl_ca_info: None,
             ssl_ca_path: None,
             ssl_cert: None,

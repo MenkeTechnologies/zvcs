@@ -30,6 +30,18 @@ pub(crate) fn transport_progress(quiet: bool, force_progress: Option<bool>) -> b
     force_progress.unwrap_or_else(|| !quiet && std::io::stderr().is_terminal())
 }
 
+/// Hand remote-curl the `verbosity` option for a command whose `OPT__VERBOSITY()` count is `verbosity`:
+/// `transport_set_verbosity()` caps `transport->verbose` at 3 and makes any quiet count `-1`
+/// (transport.c:1338-1344), and `standard_options()` sends one more than that (transport-helper.c:371-379).
+/// Only an http transport has a remote-curl; any other transport's options pass through untouched.
+pub(crate) fn with_helper_verbosity(mut options: Box<dyn std::any::Any>, verbosity: i32) -> Box<dyn std::any::Any> {
+    use gix::protocol::transport::client::blocking_io::http;
+    if let Some(opts) = options.downcast_mut::<http::Options>() {
+        opts.verbosity = verbosity.clamp(-1, 3) + 1;
+    }
+    options
+}
+
 /// `check_objects()` (builtin/index-pack.c:278-294): the `Checking objects` meter
 /// a `--strict` `index-pack -v` draws after the pack is resolved.
 ///

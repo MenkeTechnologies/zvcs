@@ -287,7 +287,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     }
     let mut bare = false;
     let mut mirror = false;
-    let mut quiet = false;
+    // `option_verbosity` (builtin/clone.c:75), which `OPT__VERBOSITY()` counts.
+    let mut verbosity: i32 = 0;
     // `Some(true)` = `--progress` forced, `Some(false)` = `--no-progress`,
     // `None` = default (progress iff stderr is a terminal), matching git.
     let mut force_progress: Option<bool> = None;
@@ -456,11 +457,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             // after parsing so a later `--no-mirror` can still take it back.
             "--mirror" => mirror = true,
             "--no-mirror" => mirror = false,
-            "-q" | "--quiet" => quiet = true,
-            "--no-quiet" => quiet = false,
-            // `-v`/`--verbose` only adds output detail in git; the clone result
-            // is identical, so it is accepted without changing behavior.
-            "-v" | "--verbose" | "--no-verbose" => {}
+            // `OPT__VERBOSITY(&option_verbosity)` (builtin/clone.c:923), whose
+            // `parse_opt_verbosity_cb()` (parse-options-cb.c:65-87) counts `-v` up and
+            // `-q` down, each starting over from the other's side of zero, and resets on
+            // either negation.
+            "-q" | "--quiet" => verbosity = if verbosity <= 0 { verbosity - 1 } else { -1 },
+            "-v" | "--verbose" => verbosity = if verbosity >= 0 { verbosity + 1 } else { 1 },
+            "--no-quiet" | "--no-verbose" => verbosity = 0,
             "--progress" => force_progress = Some(true),
             "--no-progress" => force_progress = Some(false),
             // `clone_local()`: a local source has its object store copied (hardlinked
@@ -638,8 +641,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 for (off, c) in other.char_indices().skip(1) {
                     let rest = &other[off + c.len_utf8()..];
                     match c {
-                        'q' => quiet = true,
-                        'v' => {}
+                        'q' => verbosity = if verbosity <= 0 { verbosity - 1 } else { -1 },
+                        'v' => verbosity = if verbosity >= 0 { verbosity + 1 } else { 1 },
                         'l' => {
                             no_local = false;
                             local_explicit = true;
@@ -688,6 +691,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             _ => positionals.push(typed),
         }
     }
+
+    // Every `0 <= option_verbosity` test of `cmd_clone()` is `!quiet` here.
+    let quiet = verbosity < 0;
 
     // `--mirror` implies `--bare` (git-clone(1): "This implies --bare").
     if mirror {
@@ -1875,6 +1881,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         let sideband = (!is_local).then(|| remote_output.handler());
         prepare = prepare.configure_connection(move |connection| {
             connection.set_transfer_progress(!transport_progress, sideband.clone());
+            // `transport_set_verbosity(transport, option_verbosity, option_progress)` (builtin/clone.c:1346)
+            // reaches remote-curl as its `verbosity` option. A configuration error is left to the
+            // connection's own read of these options, which reports it.
+            use gix::protocol::transport::client::TransportWithoutIO;
+            let url = connection.transport_mut().to_url().into_owned();
+            let repo = connection.remote().repo();
+            let name = connection.remote().name().map(|n| n.as_bstr().to_owned());
+            if let Ok(Some(options)) = repo.transport_options(
+                gix::bstr::ByteSlice::as_bstr(url.as_slice()),
+                name.as_ref().map(|n| gix::bstr::ByteSlice::as_bstr(n.as_slice())),
+            ) {
+                connection.set_transport_options(super::fetch_progress::with_helper_verbosity(options, verbosity));
+            }
             Ok(())
         });
     }

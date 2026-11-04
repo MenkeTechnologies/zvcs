@@ -1616,9 +1616,12 @@ dependencies = [
  "gix-quote",
  "gix-sec",
  "gix-url",
+ "hyper",
  "parking_lot",
  "reqwest",
  "thiserror",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]

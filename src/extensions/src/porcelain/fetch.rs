@@ -699,6 +699,8 @@ pub fn fetch(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    opts.verbosity = verbosity;
+
     // ```c
     // if (recurse_submodules_cli != RECURSE_SUBMODULES_DEFAULT)
     //         config.recurse_submodules = recurse_submodules_cli;
@@ -2083,6 +2085,9 @@ struct FetchOpts {
     dry_run: bool,
     verbose: bool,
     quiet: bool,
+    /// `verbosity` as `OPT__VERBOSITY()` counted it, which `transport_set_verbosity()` hands the transport
+    /// (builtin/fetch.c:1599).
+    verbosity: i32,
     force: bool,
     // `None` = neither the flag nor the config set it (git's "unspecified");
     // resolved to a concrete value from `fetch.prune`/`fetch.pruneTags` before
@@ -2170,6 +2175,7 @@ impl Default for FetchOpts {
             dry_run: false,
             verbose: false,
             quiet: false,
+            verbosity: 0,
             force: false,
             prune: None,
             prune_tags: None,
@@ -3339,11 +3345,12 @@ fn fetch_one(
         let transport_url = connection.transport_mut().to_url().into_owned();
         let remote_name = connection.remote().name().map(|n| n.as_bstr().to_owned());
         if let Ok(Some(options)) = repo.transport_options(gix::bstr::ByteSlice::as_bstr(transport_url.as_slice()), remote_name.as_ref().map(|n| gix::bstr::ByteSlice::as_bstr(n.as_slice()))) {
-            connection.set_transport_options(super::credential::with_post_authentication(
+            let options = super::credential::with_post_authentication(
                 options,
                 repo.config_snapshot().plumbing().clone(),
                 gix::bstr::ByteSlice::as_bstr(transport_url.as_slice()),
-            ));
+            );
+            connection.set_transport_options(super::fetch_progress::with_helper_verbosity(options, opts.verbosity));
         }
     }
 

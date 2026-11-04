@@ -253,3 +253,49 @@ impl std::fmt::Display for RpcEnded {
 }
 
 impl std::error::Error for RpcEnded {}
+
+/// A transfer that failed below HTTP, as libcurl reports it: the `CURLcode` `curl_easy_perform()` returned and
+/// the text `failf()` left in the `CURLOPT_ERRORBUFFER` git hands every slot as `curl_errorstr` (http.c:1636).
+///
+/// git words the failure from these two alone. `discover_refs()` dies with `unable to access '<url>': <message>`
+/// (remote-curl.c:541-545), and `run_slot()` reports a `POST` as `RPC failed; curl <code> <message>`
+/// (remote-curl.c:859-873).
+#[derive(Debug)]
+pub struct CurlFailure {
+    /// The `CURLcode`, such as `7` for `CURLE_COULDNT_CONNECT`.
+    pub code: u32,
+    /// What `failf()` wrote for it.
+    pub message: String,
+    /// The failure of the transport this was derived from.
+    pub source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
+}
+
+impl CurlFailure {
+    /// The `CurlFailure` anywhere below `err`, looking inside every `std::io::Error` on the way, whose `source()`
+    /// skips the error it wraps.
+    pub fn find<'a>(err: &'a (dyn std::error::Error + 'static)) -> Option<&'a CurlFailure> {
+        let mut next = Some(err);
+        while let Some(cur) = next {
+            if let Some(failure) = cur.downcast_ref::<CurlFailure>() {
+                return Some(failure);
+            }
+            next = match cur.downcast_ref::<std::io::Error>() {
+                Some(io) => io.get_ref().map(|e| e as &(dyn std::error::Error + 'static)),
+                None => cur.source(),
+            };
+        }
+        None
+    }
+}
+
+impl std::fmt::Display for CurlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CurlFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}

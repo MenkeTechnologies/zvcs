@@ -20,11 +20,11 @@
 //! printed — a Rust `io::Error` for a stream that ended is not a diagnostic git
 //! has, and must never reach the terminal. See [`ssh_fatal`].
 //!
-//! This is deliberately limited to `ssh`. git's HTTP diagnostics are different
-//! text (`fatal: unable to access '<url>': <curl message>` and
-//! `fatal: could not read Username for '<url>': terminal prompts disabled`), and
-//! the curl wording is not something this transport can reproduce, so those are
-//! left alone rather than half-matched.
+//! [`ssh_fatal`] is limited to `ssh`. git's HTTP diagnostics are different text
+//! (`fatal: unable to access '<url>': <curl message>`, `fatal: repository '<url>'
+//! not found`), which [`http_get_fatal`] and [`http_auth_fatal`] print from what the
+//! http transport reports: the refusing response, or the `CURLcode` and text curl
+//! would have failed the transfer with.
 
 use std::process::ExitCode;
 
@@ -319,9 +319,9 @@ pub fn http_auth_fatal(
     Some(ExitCode::from(128))
 }
 
-/// The rest of `discover_refs()`'s refusals (remote-curl.c:516-545), or `None` when the ref advertisement did not
-/// fail with an HTTP status, or failed with one handled elsewhere: a `401` (`HTTP_REAUTH`/`HTTP_NOAUTH`, see
-/// [`http_auth_fatal`]) or a `429` (`HTTP_RATE_LIMITED`).
+/// The rest of `discover_refs()`'s refusals (remote-curl.c:516-545), or `None` when the ref advertisement failed
+/// neither with an HTTP status nor with a transfer curl gave up on (`http::CurlFailure`), or with a status handled
+/// elsewhere: a `401` (`HTTP_REAUTH`/`HTTP_NOAUTH`, see [`http_auth_fatal`]) or a `429` (`HTTP_RATE_LIMITED`).
 ///
 /// ```c
 /// case HTTP_MISSING_TARGET:
@@ -343,16 +343,26 @@ pub fn http_get_fatal(
     repo: Option<&gix::Repository>,
     err: &(dyn std::error::Error + 'static),
 ) -> Option<ExitCode> {
-    let response = find_error_response(err)?;
+    let with_slash = |url: &str| {
+        let mut url = url.to_owned();
+        if !url.is_empty() && !url.ends_with('/') {
+            url.push('/');
+        }
+        transport_anonymize_url(&url)
+    };
+    let Some(response) = find_error_response(err) else {
+        // The `default:` case for a request curl failed below HTTP, a refused connection or an empty reply:
+        // `show_http_message()` has no response to show, and `curl_errorstr` is the text curl failed with.
+        use gix::protocol::transport::client::blocking_io::http::CurlFailure;
+        let failure = CurlFailure::find(err)?;
+        eprintln!("fatal: unable to access '{}': {failure}", with_slash(url));
+        return Some(ExitCode::from(128));
+    };
     if response.status < 300 || response.status == 401 || response.status == 429 {
         return None;
     }
     show_http_message(response, repo);
-    let mut url = url.to_owned();
-    if !url.is_empty() && !url.ends_with('/') {
-        url.push('/');
-    }
-    let url = transport_anonymize_url(&url);
+    let url = with_slash(url);
     if response.status == 404 {
         eprintln!("fatal: repository '{url}' not found");
     } else {

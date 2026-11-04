@@ -252,16 +252,29 @@ impl reqwest::dns::Resolve for FamilyRestrictedResolver {
     }
 }
 
-/// Build a `reqwest` client that honors `config`, with `redirect_action`/`redirect_tail` driving the
-/// redirect policy that `http.followRedirects` selects per request.
+#[cfg(test)]
 fn build_client(
     config: &ClientConfig,
     proxy_credentials: Option<(String, String)>,
     redirect_action: Arc<Mutex<RedirectAction>>,
     redirect_tail: Arc<Mutex<String>>,
 ) -> Result<reqwest::blocking::Client, Error> {
+    build_counting_client(config, proxy_credentials, redirect_action, redirect_tail, ConnectionCount::default())
+}
+
+/// Build a `reqwest` client that honors `config`, with `redirect_action`/`redirect_tail` driving the
+/// redirect policy that `http.followRedirects` selects per request, and `connections` counting the
+/// connections it sets out to open.
+fn build_counting_client(
+    config: &ClientConfig,
+    proxy_credentials: Option<(String, String)>,
+    redirect_action: Arc<Mutex<RedirectAction>>,
+    redirect_tail: Arc<Mutex<String>>,
+    connections: ConnectionCount,
+) -> Result<reqwest::blocking::Client, Error> {
     let mut builder = reqwest::blocking::ClientBuilder::new()
         .connect_timeout(config.connect_timeout.unwrap_or(Duration::from_secs(20)))
+        .connector_layer(connections)
         .connection_verbose(config.verbose)
         .http1_title_case_headers()
         // libcurl hands a folded header line to `fwrite_wwwauth()` as it came, and http.c joins the
@@ -453,13 +466,15 @@ fn execute_retrying_rate_limits(
     client: &reqwest::blocking::Client,
     req: reqwest::blocking::Request,
     config: &http::Options,
+    connections: &ConnectionCount,
+    attempt: &mut Attempt,
 ) -> reqwest::Result<reqwest::blocking::Response> {
     let mut retries_left = config.max_retries;
     let mut pending = Some(req);
     loop {
         let req = pending.take().expect("a request to send in every iteration");
         let replay = (retries_left > 0).then(|| req.try_clone()).flatten();
-        let res = client.execute(req);
+        let res = curl_perform(client, req, connections, attempt);
         let Some(replay) = replay else { break res };
         let Ok(ref ok) = res else { break res };
         if ok.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -504,6 +519,282 @@ fn report_rpc_failure(status: reqwest::StatusCode) {
     eprintln!("error: RPC failed; HTTP {code} curl 22 The requested URL returned error: {code}");
 }
 
+/// The connections a client has set out to open, so that a request which failed can tell whether it went out on
+/// one that had already carried an earlier request — curl's `conn->bits.reuse`, which decides whether
+/// [`curl_perform()`] sends the request again. reqwest's pool does not say which connection a request took, so the
+/// count is kept by a layer around its connector: a request during which no connection was attempted went out on a
+/// pooled one.
+#[derive(Clone, Default)]
+struct ConnectionCount(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ConnectionCount {
+    fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl<S> tower_layer::Layer<S> for ConnectionCount {
+    type Service = CountedConnector<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        CountedConnector {
+            inner,
+            count: self.clone(),
+        }
+    }
+}
+
+/// The connector [`ConnectionCount`] wraps.
+#[derive(Clone)]
+struct CountedConnector<S> {
+    inner: S,
+    count: ConnectionCount,
+}
+
+impl<S, R> tower_service::Service<R> for CountedConnector<S>
+where
+    S: tower_service::Service<R>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        self.count.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.call(req)
+    }
+}
+
+/// What one request went through in [`curl_perform()`]: when its last attempt began, which is curl's
+/// `TIMER_STARTSINGLE`, and the failure curl reported in place of the transport's own when it gave up sending it
+/// again.
+struct Attempt {
+    started: Instant,
+    gave_up: Option<http::CurlFailure>,
+}
+
+impl Attempt {
+    fn new() -> Self {
+        Attempt {
+            started: Instant::now(),
+            gave_up: None,
+        }
+    }
+}
+
+/// `curl_easy_perform()` for `req`, with what `Curl_retry_request()` does for a connection that died
+/// (transfer.c:595-657 in curl 8.22.0):
+///
+/// ```c
+/// if(conn->bits.reuse &&
+///    (data->req.bytecount + data->req.headerbytecount == 0) &&
+///    ((!data->req.no_body && !data->req.done) ||
+///     (conn->scheme->protocol & PROTO_FAMILY_HTTP))
+///   ...)
+///   retry = TRUE;
+/// ...
+/// if(retry) {
+///   if(data->state.retrycount++ >= CONN_MAX_RETRIES) {
+///     failf(data, "Connection died, tried %d times before giving up",
+///           CONN_MAX_RETRIES);
+///     ...
+///     return CURLE_SEND_ERROR;
+///   }
+///   ...
+///   Curl_creader_set_rewind(data, TRUE);
+/// ```
+///
+/// A request that went out on a connection an earlier one had used, and failed before a byte of the response came
+/// back, is sent again on a fresh one. A body in memory is sent again as it is. A body remote-curl streams
+/// (`large_request`) is rewound through `rpc_seek()`, which only rewinds within the first buffer; that buffer was
+/// all handed over by the time the server could have answered, so the rewind fails with remote-curl's error and
+/// `CURLE_SEND_FAIL_REWIND` (remote-curl.c:753-770, sendf.c:849-860 in curl 8.22.0).
+fn curl_perform(
+    client: &reqwest::blocking::Client,
+    mut req: reqwest::blocking::Request,
+    connections: &ConnectionCount,
+    attempt: &mut Attempt,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    const CONN_MAX_RETRIES: u32 = 5;
+    let mut retrycount = 0;
+    loop {
+        let replay = req.try_clone();
+        let opened = connections.get();
+        attempt.started = Instant::now();
+        let res = client.execute(req);
+        let Err(err) = &res else { return res };
+        let reused = connections.get() == opened;
+        if !reused || err.is_connect() || err.is_timeout() || hyper_error(err).is_none() {
+            return res;
+        }
+        let Some(replay) = replay else {
+            eprintln!("error: unable to rewind rpc post data - try increasing http.postBuffer");
+            attempt.gave_up = Some(http::CurlFailure {
+                code: 65,
+                message: "seek callback returned error 1".into(),
+                source: None,
+            });
+            return res;
+        };
+        if retrycount >= CONN_MAX_RETRIES {
+            attempt.gave_up = Some(http::CurlFailure {
+                code: 55,
+                message: format!("Connection died, tried {CONN_MAX_RETRIES} times before giving up"),
+                source: None,
+            });
+            return res;
+        }
+        retrycount += 1;
+        req = replay;
+    }
+}
+
+/// The hyper error below `err`, which is what a request that reached the connection fails with.
+fn hyper_error(err: &reqwest::Error) -> Option<&hyper::Error> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(hyper) = e.downcast_ref::<hyper::Error>() {
+            return Some(hyper);
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// The `CURLcode` and `failf()` text curl ends a transfer with that failed before any response arrived, for the
+/// ways this transport sees that happen, or `None` for a failure curl has no counterpart for here.
+///
+/// * A host that does not resolve: `CURLE_COULDNT_RESOLVE_HOST`, "Could not resolve host: <host>" (url.c).
+/// * A connection that could not be made: `CURLE_COULDNT_CONNECT`, or `CURLE_OPERATION_TIMEDOUT` when the
+///   attempt timed out, with the text `cf_ip_happy_connect()` writes before it changes the code
+///   (cf-ip-happy.c:717-729 in curl 8.22.0). The time is `Curl_pgrs_since_ms(data, NULL, TIMER_STARTSINGLE)`,
+///   counted from when this attempt began.
+/// * A `send()` or `recv()` that failed: "Send failure: <strerror>" for `EPIPE`, `CURLE_SEND_ERROR`, and
+///   "Recv failure: <strerror>", `CURLE_RECV_ERROR`, for the rest, as `cf_socket_send()` and `cf_socket_recv()`
+///   word them (cf-socket.c:1663-1680).
+/// * A connection that ended before the response did: `Curl_http_done()`'s "Empty reply from server",
+///   `CURLE_GOT_NOTHING` (http.c:1703-1715). hyper reports a connection that closed part-way into the response
+///   headers the same way, which curl would not count as empty.
+fn curl_failure(err: &reqwest::Error, url: &str, attempt: &Attempt) -> Option<http::CurlFailure> {
+    let (code, message) = if let Some(failure) = &attempt.gave_up {
+        (failure.code, failure.message.clone())
+    } else if err.is_connect() {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        // `conn->origin->hostname`, which holds an IPv6 address without its brackets.
+        let host = parsed.host_str()?.trim_start_matches('[').trim_end_matches(']').to_owned();
+        if is_dns_failure(err) {
+            (6, format!("Could not resolve host: {host}"))
+        } else {
+            let errno = socket_errno_of(err)?;
+            let port = parsed.port_or_known_default()?;
+            let ms = attempt.started.elapsed().as_millis();
+            // `SOCKETIMEDOUT`, `ETIMEDOUT`.
+            let timed_out = std::io::Error::from_raw_os_error(errno).kind() == std::io::ErrorKind::TimedOut;
+            let code = if timed_out { 28 } else { 7 };
+            (
+                code,
+                format!("Failed to connect to {host}:{port} after {ms} ms: Could not connect to server"),
+            )
+        }
+    } else if let Some(errno) = socket_errno_of(err) {
+        let text = std::io::Error::from_raw_os_error(errno).to_string();
+        let text = text
+            .strip_suffix(&format!(" (os error {errno})"))
+            .unwrap_or(&text)
+            .to_owned();
+        if std::io::Error::from_raw_os_error(errno).kind() == std::io::ErrorKind::BrokenPipe {
+            (55, format!("Send failure: {text}"))
+        } else {
+            (56, format!("Recv failure: {text}"))
+        }
+    } else if hyper_error(err).is_some_and(hyper::Error::is_incomplete_message) {
+        (52, "Empty reply from server".to_owned())
+    } else {
+        return None;
+    };
+    Some(http::CurlFailure {
+        code,
+        message,
+        source: None,
+    })
+}
+
+/// Whether the connect that failed under `err` failed to resolve the host. hyper-util's connector does not export
+/// its error type; it names a failed lookup "dns error".
+fn is_dns_failure(err: &reqwest::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if e.to_string() == "dns error" {
+            return true;
+        }
+        cur = e.source();
+    }
+    false
+}
+
+/// [`socket_errno()`] for a `reqwest::Error`.
+fn socket_errno_of(err: &reqwest::Error) -> Option<i32> {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return socket_errno(io);
+        }
+        cur = e.source();
+    }
+    None
+}
+
+/// `run_slot()`'s `RPC failed` line for a `POST` curl failed below HTTP (remote-curl.c:859-873): with no status to
+/// report, `curl <code>` and `curl_errorstr`.
+fn report_rpc_curl_failure(failure: &http::CurlFailure) {
+    eprintln!("error: RPC failed; curl {} {}", failure.code, failure.message);
+}
+
+/// `post_rpc()`'s announcement of each `POST` when remote-curl's `options.verbosity` is above `1`
+/// (remote-curl.c:994-997, :1051-1055):
+///
+/// ```c
+/// if (options.verbosity > 1) {
+///         fprintf(stderr, "POST %s (chunked)\n", rpc->service_name);
+/// ...
+/// if (options.verbosity > 1) {
+///         fprintf(stderr, "POST %s (%lu bytes)\n",
+///                 rpc->service_name, (unsigned long)rpc->len);
+/// ```
+///
+/// `rpc->service_name` is the last component of the URL the request goes to. remote-curl gzips an upload-pack
+/// request over 1024 bytes and says `(gzip <len> to <size> bytes)` for it (remote-curl.c:1006-1043); this transport
+/// sends such a request as it is, and announces it as such.
+fn announce_post(url: &str, large_request: bool, req: &reqwest::blocking::Request) {
+    let service = url.rsplit('/').next().unwrap_or_default();
+    if large_request {
+        eprintln!("POST {service} (chunked)");
+    } else {
+        let len = req.body().and_then(reqwest::blocking::Body::as_bytes).map_or(0, <[u8]>::len);
+        eprintln!("POST {service} ({len} bytes)");
+    }
+}
+
+/// The error a request that failed before any response arrived is handed on with: the [`http::CurlFailure`] curl
+/// would have ended it with, which a `POST` reports right away as `run_slot()` does, or the transport's own error
+/// where curl has no counterpart.
+fn transfer_error(err: reqwest::Error, url: &str, attempt: &Attempt, post: bool) -> std::io::Error {
+    match curl_failure(&err, url, attempt) {
+        Some(mut failure) => {
+            if post {
+                report_rpc_curl_failure(&failure);
+            }
+            failure.source = Some(Box::new(err));
+            std::io::Error::other(failure)
+        }
+        None => std::io::Error::other(err),
+    }
+}
+
 /// Whether `headers` are those of a protocol v2 request, which git sends from `stateless_connect()` rather than
 /// from `rpc_service()` (remote-curl.c:1460-1554, :1094-1167).
 fn is_stateless_connect(headers: &reqwest::header::HeaderMap) -> bool {
@@ -538,15 +829,16 @@ fn end_rpc(
 }
 
 /// Whether `err`, the failure of a `POST`, is one remote-curl reports and ends the request on, and if so whether
-/// remote-curl died of it: an HTTP status `run_slot()` already reported (remote-curl.c:859-873), a `401` it gave up
-/// on, or the `die()` of the fill for one. `None` for a failure to talk to the server at all, which is left to the
-/// caller as it is.
+/// remote-curl died of it: an HTTP status or a [`http::CurlFailure`] `run_slot()` already reported
+/// (remote-curl.c:859-873), a `401` it gave up on, or the `die()` of the fill for one. `None` for a failure curl
+/// has no counterpart for, which is left to the caller as it is.
 fn rpc_failure(err: &std::io::Error) -> Option<bool> {
     if let Some(ended) = http::RpcEnded::find(err) {
         return Some(ended.helper_died);
     }
     let inner = err.get_ref()?;
     let has_status = inner.downcast_ref::<ErrorResponse>().is_some()
+        || inner.downcast_ref::<http::CurlFailure>().is_some()
         || inner
             .downcast_ref::<reqwest::Error>()
             .is_some_and(|err| err.status().is_some());
@@ -820,6 +1112,8 @@ impl Default for Remote {
             )> = None;
             // `http.cookieFile` is read once, as curl's cookie engine does, and kept for the session.
             let mut cookies: Option<(PathBuf, http::cookies::Jar)> = None;
+            // Shared by every client this thread builds, so a rebuilt one still counts into it.
+            let connections = ConnectionCount::default();
 
             'requests: for Request {
                 url,
@@ -844,11 +1138,12 @@ impl Default for Remote {
                             }
                             None => None,
                         };
-                        let client = build_client(
+                        let client = build_counting_client(
                             &client_config,
                             credentials,
                             redirect_action.clone(),
                             redirect_tail.clone(),
+                            connections.clone(),
                         )?;
                         cached_client = Some((client_config, client.clone()));
                         client
@@ -990,9 +1285,10 @@ impl Default for Remote {
                             Ok(probe) => probe,
                             Err(err) => break Err(std::io::Error::other(err)),
                         };
-                        let res = match client.execute(probe) {
+                        let mut attempt = Attempt::new();
+                        let res = match curl_perform(&client, probe, &connections, &mut attempt) {
                             Ok(res) => res,
-                            Err(err) => break Err(std::io::Error::other(err)),
+                            Err(err) => break Err(transfer_error(err, &effective_url, &attempt, true)),
                         };
                         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
                             if res.status().as_u16() >= 300 {
@@ -1055,13 +1351,17 @@ impl Default for Remote {
                 // `handle_curl_result()`, http.c:1927-1931).
                 let mut approve_after_success = false;
                 let mut sent_authorization = false;
+                let mut attempt = Attempt::new();
                 let executed = loop {
                     let replay = (upload_body_kind.is_some() && !large_request)
                         .then(|| req.try_clone())
                         .flatten();
                     let had_authorization = req.headers().contains_key(reqwest::header::AUTHORIZATION);
                     sent_authorization = had_authorization;
-                    let res = execute_retrying_rate_limits(&client, req, &config);
+                    if upload_body_kind.is_some() && config.verbosity > 1 {
+                        announce_post(&effective_url, large_request, &req);
+                    }
+                    let res = execute_retrying_rate_limits(&client, req, &config, &connections, &mut attempt);
                     let Ok(ref ok) = res else { break res };
                     if ok.status() != reqwest::StatusCode::UNAUTHORIZED || upload_body_kind.is_none() {
                         break res;
@@ -1165,7 +1465,7 @@ impl Default for Remote {
                                     authenticate.lock().expect("no panics in other threads")(action.erase()).ok();
                                     cached_client = None;
                                 }
-                                std::io::Error::other(err)
+                                transfer_error(err, &effective_url, &attempt, upload_body_kind.is_some())
                             }
                         };
                         match upload_body_kind.is_some().then(|| rpc_failure(&err)).flatten() {

@@ -942,6 +942,7 @@ git push <groupname>\n"
             use std::io::IsTerminal;
             std::io::stderr().is_terminal()
         }) && !f.quiet,
+        verbosity: f.verbosity,
     };
     // `transport_push()`'s steps between the match and `push_refs()`
     // (transport.c:1479-1531), which `push_proto::send_pack` calls back into once

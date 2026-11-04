@@ -384,6 +384,8 @@ fn push(st: &State) -> Result<ExitCode> {
             use std::io::IsTerminal;
             std::io::stderr().is_terminal()
         }),
+        // `git send-pack` talks to `git_connect()` itself, so no transport helper is handed a verbosity.
+        verbosity: 0,
     };
 
     // `git_connect()` for a local destination runs `git-receive-pack '<dest>'`,

@@ -305,6 +305,8 @@ pub struct SendOptions {
     /// `pack-objects` child as `--progress` and which is what makes that child
     /// print its `Total …` summary.
     pub progress: bool,
+    /// The `-v`/`-q` count, which `transport_set_verbosity()` hands the transport (builtin/push.c:374).
+    pub verbosity: i32,
 }
 
 /// `TRANSPORT_PUSH_MATCHING`: push every local branch the remote already carries.
@@ -601,6 +603,7 @@ pub fn send_pack(
             repo.config_snapshot().plumbing().clone(),
             url.as_str().into(),
         );
+        let config = super::fetch_progress::with_helper_verbosity(config, opts.verbosity);
         transport.configure(&*config).ok();
     }
 

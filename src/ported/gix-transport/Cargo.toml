@@ -40,7 +40,7 @@ http-client-curl-openssl = ["http-client-curl", "curl/ssl"]
 ## Implies `http-client` and adds support for http transports using the blocking version of `reqwest`.
 ## NOTE: `https://` is NOT supported by default. You must enable one of the `http-client-reqwest-rust-tls`
 ## or `http-client-reqwest-native-tls` features to enable HTTPS support.
-http-client-reqwest = ["reqwest", "http-client"]
+http-client-reqwest = ["reqwest", "http-client", "dep:hyper", "dep:tower-layer", "dep:tower-service"]
 ## Stacks with `http-client-reqwest` and enables `https://` via the `rustls` crate.
 http-client-reqwest-rust-tls = ["http-client-reqwest", "reqwest/rustls"]
 ## Stacks with `http-client-reqwest` and enables `https://` via the `rustls` crate.
@@ -126,6 +126,10 @@ curl = { version = "0.4", optional = true, default-features = false }
 # for http-client-reqwest
 # all but the 'default-tls' feature
 reqwest = { version = "0.13.4", optional = true, default-features = false, features = ["blocking", "charset", "http2"] }
+# The connection-level failures curl tells apart, which reqwest reports through hyper's error and its connector stack.
+hyper = { version = "1.10.1", optional = true, default-features = false }
+tower-layer = { version = "0.3.3", optional = true }
+tower-service = { version = "0.3.3", optional = true }
 
 ## If used in conjunction with `async-client`, the `connect()` method will become available along with supporting the git protocol over TCP,
 ## where the TCP stream is created using this crate.

@@ -202,13 +202,50 @@ fn mkdtemp(objects: &Path, prefix: &str) -> Result<PathBuf> {
     })
 }
 
-/// `mkdtemp(3)` as git calls it (`git_mkdstemps_mode()`, wrapper.c:434-495): the
-/// trailing `XXXXXX` of `template` becomes six characters of
-/// `[a-zA-Z0-9]`, retried on `EEXIST` up to `TMP_MAX` times, and the directory is
-/// created mode 0700. Any other error ends the search at once.
+/// `mkdtemp(3)` as git calls it (`git_mkdtemp()`, wrapper.c:574-577): the
+/// trailing `XXXXXX` of `template` becomes six characters of `[a-zA-Z0-9]`,
+/// retried on `EEXIST` up to `TMP_MAX` times, and the directory is created mode
+/// 0700. Any other error ends the search at once.
 pub(crate) fn git_mkdtemp(template: &std::ffi::OsStr) -> std::io::Result<PathBuf> {
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::DirBuilderExt;
+    git_mkdstemps_mode(template, |path| std::fs::DirBuilder::new().mode(0o700).create(path))
+        .map(|(path, ())| path)
+}
+
+/// `git_mkstemp_mode()` (wrapper.c:584-588): the same name search as
+/// [`git_mkdtemp`], creating a regular file with
+/// `open(pattern, O_CREAT | O_EXCL | O_RDWR, mode)` (wrapper.c:558) and handing
+/// back the descriptor that open returned.
+///
+/// The descriptor is the point. `mode` is commonly 0444 (`odb_mkstemp()`,
+/// odb.c:80), so the file can be written only through the descriptor that
+/// created it; reopening the path for writing is `EACCES`. And `O_EXCL` is what
+/// keeps two temporaries from being one file: a name already taken, by this
+/// process or another, is `EEXIST`, and the search moves on rather than
+/// truncating it.
+pub(crate) fn git_mkstemp_mode(
+    template: &std::ffi::OsStr,
+    mode: u32,
+) -> std::io::Result<(PathBuf, std::fs::File)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    git_mkdstemps_mode(template, |path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)
+    })
+}
+
+/// `git_mkdstemps_mode()` (wrapper.c:514-572) with no suffix: fill the trailing
+/// `XXXXXX` of `template` from `[a-zA-Z0-9]` and hand the name to `create`, up
+/// to `TMP_MAX` times while it answers `EEXIST`.
+fn git_mkdstemps_mode<T>(
+    template: &std::ffi::OsStr,
+    mut create: impl FnMut(&std::path::Path) -> std::io::Result<T>,
+) -> std::io::Result<(PathBuf, T)> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     const LETTERS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     const TMP_MAX: u32 = 16384;
     let pattern = template.as_bytes();
@@ -234,8 +271,8 @@ pub(crate) fn git_mkdtemp(template: &std::ffi::OsStr) -> std::io::Result<PathBuf
             v /= LETTERS.len() as u64;
         }
         let path = PathBuf::from(std::ffi::OsString::from_vec(name));
-        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => return Ok(path),
+        match create(&path) {
+            Ok(created) => return Ok((path, created)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }

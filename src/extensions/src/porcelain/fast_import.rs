@@ -111,7 +111,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, Read, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
 use std::process::ExitCode;
 
 use gix::hash::ObjectId;
@@ -327,12 +326,11 @@ impl TempPack {
     fn start(repo: &gix::Repository) -> Result<TempPack> {
         let dir = repo.objects.store_ref().path().join("pack");
         std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!(
-            "tmp_pack_{}",
-            crate::porcelain::index_pack::mkstemp_suffix()
-        ));
-        std::fs::File::create(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))?;
+        // `odb_mkstemp()` is `git_mkstemp_mode(…, 0444)` (odb.c:72-91), an
+        // `O_CREAT | O_EXCL` open retried on `EEXIST` (wrapper.c:543-567), so
+        // this name is one no other temporary in the directory can share.
+        let (path, _fd) =
+            crate::tmp_objdir::git_mkstemp_mode(dir.join("tmp_pack_XXXXXX").as_os_str(), 0o444)?;
         Ok(TempPack { path })
     }
 
@@ -599,8 +597,8 @@ impl PackLog {
             &by_oid,
         )?;
         let pack = base.with_extension("pack");
-        install_pack_file(&dir, &pack, &packed.bytes)?;
-        install_pack_file(&dir, &base.with_extension("idx"), &index)?;
+        install_pack_file(&dir, "tmp_pack_XXXXXX", &pack, &packed.bytes)?;
+        install_pack_file(&dir, "tmp_idx_XXXXXX", &base.with_extension("idx"), &index)?;
 
         for id in &created {
             let loose = self.loose_path(id);
@@ -673,10 +671,25 @@ impl PackLog {
 /// The mode is why the rename matters — a pack whose object set has not changed
 /// hashes to the name it already carries, and writing straight at that path
 /// would land on the 0444 file the last run left.
-fn install_pack_file(dir: &std::path::Path, to: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    let tmp = dir.join(format!("tmp_pack_{}", crate::porcelain::index_pack::mkstemp_suffix()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444))?;
+///
+/// `pattern` is the `odb_mkstemp()` template git writes the artifact under:
+/// `tmp_pack_XXXXXX` for the pack (`start_packfile()`, fast-import.c:790-791)
+/// and `tmp_idx_XXXXXX` for its index (`write_idx_file()`, pack-write.c:86-87).
+/// The bytes go through the descriptor `git_mkstemp_mode()` opened, since the
+/// file is 0444 from the moment it exists. A name picked without `O_EXCL` could
+/// be the run's own `TempPack`, already 0444, and opening that for writing is
+/// `EACCES`.
+fn install_pack_file(
+    dir: &std::path::Path,
+    pattern: &str,
+    to: &std::path::Path,
+    bytes: &[u8],
+) -> Result<()> {
+    let (tmp, mut fd) = crate::tmp_objdir::git_mkstemp_mode(dir.join(pattern).as_os_str(), 0o444)?;
+    fd.write_all(bytes).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    drop(fd);
     std::fs::rename(&tmp, to).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;

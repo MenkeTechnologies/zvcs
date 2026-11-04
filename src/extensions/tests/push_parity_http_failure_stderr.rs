@@ -310,16 +310,32 @@ fn push_parity_post_refused_ends_send_pack_and_remote_curl_answers_nothing() {
 
 #[test]
 fn push_parity_post_fill_that_dies_kills_remote_curl() {
-    check(
-        "post401",
-        Fault::PostAuth,
-        false,
-        &["push", "origin", "main"],
-        "fatal: could not read Username for 'http://HOST': terminal prompts disabled\n\
+    if !stock_available() {
+        return;
+    }
+    let expected_stderr = "fatal: could not read Username for 'http://HOST': terminal prompts disabled\n\
          send-pack: unexpected disconnect while reading sideband packet\n\
          fatal: the remote end hung up unexpectedly\n\
-         error: failed to push some refs to 'http://HOST/r.git'\n",
+         error: failed to push some refs to 'http://HOST/r.git'\n";
+    let args = ["push", "origin", "main"];
+    let want = run(stock_bin(), "post401-s", Fault::PostAuth, false, &args);
+    let got = run(BIN, "post401-z", Fault::PostAuth, false, &args);
+    // Stock's lines come from git-remote-http, send-pack and push writing to
+    // one stderr at once, so their order varies from run to run (3 of 30 on
+    // Linux); only the lines themselves are compared with stock. zvcs prints
+    // them in one order, which is held to the expected text exactly.
+    let lines = |s: &str| {
+        let mut v: Vec<String> = s.lines().map(str::to_owned).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        (got.code, &got.stdout, lines(&got.stderr), &got.refs, &got.tracking),
+        (want.code, &want.stdout, lines(&want.stderr), &want.refs, &want.tracking),
+        "post401: zvcs and stock git differ"
     );
+    assert_eq!(lines(&want.stderr), lines(expected_stderr), "post401: the fixture produces the failure it is about");
+    assert_eq!(got.stderr, expected_stderr, "post401: zvcs's stderr order");
 }
 
 #[test]

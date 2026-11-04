@@ -253,21 +253,23 @@ where
     };
 
     gix_trace::detail!("mark known_common").into_scope(|| -> Result<_, Error> {
-        // mark all complete advertised refs as common refs.
-        for mapping in ref_map
-            .mappings
-            .iter()
-            .zip(remote_ref_target_known.iter().copied())
-            // We need this filter as the graph wouldn't contain annotated tags.
-            .filter_map(|(mapping, known)| (!known).then_some(mapping))
-        {
-            let want_id = mapping.remote.as_id();
-            if let Some(common_id) = want_id
-                .and_then(|id| graph.get(id).map(|c| (c, id)))
-                .filter(|(c, _)| c.data.flags.contains(Flags::COMPLETE))
-                .map(|(_, id)| id)
+        // "Mark all complete remote refs as common refs" (fetch-pack.c:851-863): every ref the
+        // server advertised, not only the ones a refspec maps, in the name order `sort_ref_list()`
+        // left them in (fetch-pack.c:1155, :1747). `deref_without_lazy_fetch(oid, 0)` peels an
+        // annotated tag we hold down to its commit (fetch-pack.c:136-178), so a tag such as
+        // `refs/tags/v1` makes its commit a COMMON_REF, whose ancestors then never go out as `have`.
+        let mut remote_refs: Vec<_> = ref_map.remote_refs.iter().map(|r| r.unpack()).collect();
+        remote_refs.sort_by(|a, b| a.0.cmp(b.0));
+        let mut buf = Vec::new();
+        for (_name, old_oid, _peeled) in remote_refs {
+            let Some(commit_id) = old_oid.and_then(|id| deref_tags(objects, id.to_owned(), &mut buf)) else {
+                continue;
+            };
+            if graph
+                .get(&commit_id)
+                .is_some_and(|c| c.data.flags.contains(Flags::COMPLETE))
             {
-                negotiator.known_common(common_id.into(), graph)?;
+                negotiator.known_common(commit_id, graph)?;
             }
         }
         Ok(())
@@ -454,6 +456,23 @@ pub fn add_wants(
         }
     }
     has_want
+}
+
+/// Follow `id` through annotated tags held in `objects`, as `deref_without_lazy_fetch()` does
+/// (fetch-pack.c:153-172): `None` when an object on the way is missing locally, otherwise the first
+/// object that is not a tag. Whether that is a commit is left to the caller's graph lookup.
+fn deref_tags(
+    objects: &impl gix_object::Find,
+    mut id: gix_hash::ObjectId,
+    buf: &mut Vec<u8>,
+) -> Option<gix_hash::ObjectId> {
+    loop {
+        let data = objects.try_find(&id, buf).ok()??;
+        match data.try_into_tag_iter() {
+            Some(tag) => id = tag.target_id().ok()?,
+            None => return Some(id),
+        }
+    }
 }
 
 /// Remove all commits that are more recent than the cut-off, which is the commit time of the oldest common commit we have with the server.

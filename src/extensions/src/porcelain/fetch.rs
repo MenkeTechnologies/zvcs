@@ -3638,6 +3638,7 @@ fn fetch_one(
         })
         .with_negotiation_restrictions(restrictions)
         .with_refetch(opts.refetch)
+        .with_keep_pack(opts.keep)
         .with_filter(fetch_filter.clone())
         .with_atomic(opts.atomic)
         .with_show_forced_updates(opts.show_forced_updates)

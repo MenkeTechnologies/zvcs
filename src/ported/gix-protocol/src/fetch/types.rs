@@ -29,6 +29,9 @@ pub struct Options<'a> {
     /// Where the remote's sideband messages go instead of the parsed [`RemoteProgress`](crate::RemoteProgress)
     /// reporting, if anywhere.
     pub sideband: Option<Sideband>,
+    /// git's `args->keep_pack` (transport.c:490): when unset, a protocol v0/v1 negotiation that never saw
+    /// an ACK warns "no common commits" (fetch-pack.c:1247-1252).
+    pub keep_pack: bool,
 }
 
 /// A receiver for the remote's sideband messages as they arrived: band 2 (progress) with `is_error == false`
@@ -113,6 +116,20 @@ mod with_fetch {
             arguments: &mut fetch::Arguments,
             previous_response: Option<&fetch::Response>,
         ) -> Result<(negotiate::Round, bool), negotiate::Error>;
+        /// `negotiator->next()` (fetch-negotiator.h): the next commit to offer as `have`, or `None` once
+        /// there is nothing left to offer.
+        fn next_have(&mut self) -> Option<Result<gix_hash::ObjectId, negotiate::Error>> {
+            None
+        }
+        /// `negotiator->ack()` (fetch-negotiator.h): the server acknowledged `id`; return whether it was
+        /// already known to be common.
+        fn ack(&mut self, _id: gix_hash::ObjectId) -> Result<bool, negotiate::Error> {
+            Ok(false)
+        }
+        /// The `--negotiation-include` commits, written as `have` ahead of the negotiator's own.
+        fn always_have(&self) -> Vec<gix_hash::ObjectId> {
+            Vec::new()
+        }
     }
 
     /// The outcome of [`fetch()`](crate::fetch()).

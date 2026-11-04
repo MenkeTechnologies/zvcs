@@ -978,6 +978,7 @@ fn receive(
         // Deepen exactly as `--depth`/`--shallow-*` asked; `Shallow::NoChange`
         // (the common case) leaves negotiation untouched.
         .with_shallow(shallow)
+        .with_keep_pack(keep)
         .receive(super::fetch_progress::Meters::new(plan), &should_interrupt);
     remote_output.finish();
     let outcome = outcome?;

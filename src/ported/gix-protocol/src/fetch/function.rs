@@ -14,6 +14,11 @@ use crate::transport::client::async_io::{ExtendedBufRead, HandleProgress, Transp
 #[cfg(feature = "blocking-client")]
 use crate::transport::client::blocking_io::{ExtendedBufRead, HandleProgress, Transport};
 
+/// `INITIAL_FLUSH` (fetch-pack.c:272): the haves in the first window of a negotiation.
+const INITIAL_FLUSH: usize = 16;
+/// `MAX_IN_VAIN` (fetch-pack.c:67): haves sent without an ACK after which a negotiation gives up.
+const MAX_IN_VAIN: usize = 256;
+
 /// Perform one fetch operation, relying on a `transport`.
 /// `negotiate` is used to run the negotiation of objects that should be contained in the pack, *if* one is to be received.
 /// `progress` and `should_interrupt` is passed to all potentially long-running parts of the operation.
@@ -55,6 +60,7 @@ pub async fn fetch<P, T, E>(
         tags,
         reject_shallow_remote,
         filter,
+        keep_pack,
         no_progress,
         sideband,
     }: Options<'_>,
@@ -116,7 +122,7 @@ where
         protocol_version = handshake.server_protocol_version as usize
     );
     let action = negotiate.mark_complete_and_common_ref()?;
-    let mut previous_response = None::<crate::fetch::Response>;
+    let mut previous_response: Option<crate::fetch::Response>;
     match &action {
         negotiate::Action::NoChange | negotiate::Action::SkipToRefUpdate => Ok(None),
         negotiate::Action::MustNegotiate {
@@ -127,43 +133,230 @@ where
             }
             let mut rounds = Vec::new();
             let is_stateless = arguments.is_stateless(!transport.connection_persists_across_multiple_requests());
-            let mut state = negotiate::one_round::State::new(is_stateless);
-            let mut reader = 'negotiation: loop {
-                let _round = gix_trace::detail!("negotiate round", round = rounds.len() + 1);
-                progress.step();
-                progress.set_name(format!("negotiate (round {})", rounds.len() + 1));
-                if should_interrupt.load(Ordering::Relaxed) {
-                    return Err(Error::Negotiate(negotiate::Error::NegotiationFailed {
-                        rounds: rounds.len(),
-                    }));
+            let always_have = negotiate.always_have();
+            let mut reader = match protocol_version {
+                gix_transport::Protocol::V2 => {
+                    // The FETCH_SEND_REQUEST / FETCH_PROCESS_ACKS states of `do_fetch_pack_v2()`
+                    // (fetch-pack.c:1764-1811). Every request repeats what was found in common so far
+                    // (`add_common()`, fetch-pack.c:1332-1341), then the `--negotiation-include`
+                    // commits and up to `haves_to_send` new haves (`add_haves()`, fetch-pack.c:1343-1376).
+                    // `done` goes out only once the negotiator has nothing left, or after MAX_IN_VAIN
+                    // haves without an ACK once one was seen (fetch-pack.c:1443-1447); otherwise the
+                    // server answers with `acknowledgments`, and its `ready` is what brings the pack.
+                    // `common` is an oidset in git, iterated in hash order; here it keeps the order the
+                    // acknowledgements arrived in.
+                    let mut common = Vec::<gix_hash::ObjectId>::new();
+                    let mut haves_to_send = INITIAL_FLUSH;
+                    let mut in_vain = 0;
+                    let mut seen_ack = false;
+                    'negotiation: loop {
+                        let _round = gix_trace::detail!("negotiate round", round = rounds.len() + 1);
+                        progress.step();
+                        progress.set_name(format!("negotiate (round {})", rounds.len() + 1));
+                        if should_interrupt.load(Ordering::Relaxed) {
+                            return Err(Error::Negotiate(negotiate::Error::NegotiationFailed {
+                                rounds: rounds.len(),
+                            }));
+                        }
+                        for id in &common {
+                            arguments.have(id);
+                        }
+                        for id in &always_have {
+                            arguments.have(id);
+                        }
+                        let mut haves_added = 0;
+                        while haves_added < haves_to_send {
+                            match negotiate.next_have() {
+                                Some(id) => arguments.have(id?),
+                                None => break,
+                            }
+                            haves_added += 1;
+                        }
+                        let window = haves_to_send;
+                        haves_to_send = gix_negotiate::window_size(true, Some(haves_to_send));
+                        in_vain += haves_added;
+                        let is_done = haves_added == 0 || (seen_ack && in_vain >= MAX_IN_VAIN);
+                        let mut reader = arguments.send(transport, is_done).await?;
+                        if sideband_all {
+                            setup_remote_progress(&mut progress, &mut reader, sideband.as_ref(), should_interrupt);
+                        }
+                        let response =
+                            crate::fetch::Response::from_line_reader(protocol_version, &mut reader, is_done, !is_done)
+                                .await?;
+                        let mut acked = false;
+                        for ack in response.acknowledgements() {
+                            if let crate::fetch::response::Acknowledgement::Common(id) = ack {
+                                negotiate.ack(*id)?;
+                                in_vain = 0;
+                                seen_ack = true;
+                                acked = true;
+                                if !common.contains(id) {
+                                    common.push(*id);
+                                }
+                            }
+                        }
+                        rounds.push(negotiate::Round {
+                            haves_sent: haves_added,
+                            in_vain,
+                            haves_to_send: window,
+                            previous_response_had_at_least_one_in_common: acked,
+                        });
+                        let has_pack = response.has_pack();
+                        previous_response = Some(response);
+                        if has_pack {
+                            break 'negotiation reader;
+                        }
+                    }
                 }
-
-                let is_done = match negotiate.one_round(&mut state, &mut arguments, previous_response.as_ref()) {
-                    Ok((round, is_done)) => {
-                        rounds.push(round);
-                        is_done
+                gix_transport::Protocol::V0 | gix_transport::Protocol::V1 => {
+                    // `find_common()` (fetch-pack.c:349-644). Haves are flushed at INITIAL_FLUSH and
+                    // then wherever `next_flush()` puts the next boundary, counted over all haves sent
+                    // (fetch-pack.c:276-290, :521-537). A connection that persists keeps one window
+                    // ahead: the first flush is not waited for, and each later one reads the answer to
+                    // the flush before it (fetch-pack.c:539-544). A stateless one reads each answer at
+                    // once, and replays a newly found common commit in every later request, since the
+                    // server forgets it between requests (fetch-pack.c:572-591). The
+                    // `--negotiation-include` commits go out once, ahead of the rest, and count towards
+                    // the first window (fetch-pack.c:496-514).
+                    let no_done = is_stateless && handshake.capabilities.contains("no-done");
+                    let mut count = 0;
+                    let mut flush_at = INITIAL_FLUSH;
+                    let mut window_start = 0;
+                    let mut in_vain = 0;
+                    let mut got_continue = false;
+                    let mut got_ready = false;
+                    let mut replay = Vec::<gix_hash::ObjectId>::new();
+                    let mut first_shallows = None::<Vec<ShallowUpdate>>;
+                    for id in &always_have {
+                        arguments.have(id);
+                        count += 1;
                     }
-                    Err(err) => {
-                        return Err(err.into());
+                    'negotiation: loop {
+                        let finished = match negotiate.next_have() {
+                            None => true,
+                            Some(id) => {
+                                arguments.have(id?);
+                                in_vain += 1;
+                                count += 1;
+                                if flush_at > count {
+                                    continue 'negotiation;
+                                }
+                                let _round = gix_trace::detail!("negotiate round", round = rounds.len() + 1);
+                                progress.step();
+                                progress.set_name(format!("negotiate (round {})", rounds.len() + 1));
+                                if should_interrupt.load(Ordering::Relaxed) {
+                                    return Err(Error::Negotiate(negotiate::Error::NegotiationFailed {
+                                        rounds: rounds.len(),
+                                    }));
+                                }
+                                let mut rd = arguments.send(transport, false).await?;
+                                let window = count - window_start;
+                                window_start = count;
+                                flush_at = gix_negotiate::window_size(is_stateless, Some(count));
+                                if !is_stateless && count == INITIAL_FLUSH {
+                                    rounds.push(negotiate::Round {
+                                        haves_sent: window,
+                                        in_vain,
+                                        haves_to_send: window,
+                                        previous_response_had_at_least_one_in_common: false,
+                                    });
+                                    continue 'negotiation;
+                                }
+                                let response =
+                                    crate::fetch::Response::from_line_reader(protocol_version, &mut rd, false, true)
+                                        .await?;
+                                let mut acked = false;
+                                for ack in response.acknowledgements() {
+                                    match ack {
+                                        crate::fetch::response::Acknowledgement::Common(id) => {
+                                            let was_common = negotiate.ack(*id)?;
+                                            if is_stateless && !was_common {
+                                                replay.push(*id);
+                                                in_vain = 0;
+                                            } else if !is_stateless {
+                                                in_vain = 0;
+                                            }
+                                            got_continue = true;
+                                            acked = true;
+                                        }
+                                        crate::fetch::response::Acknowledgement::Ready => {
+                                            in_vain = 0;
+                                            got_continue = true;
+                                            got_ready = true;
+                                            acked = true;
+                                        }
+                                        crate::fetch::response::Acknowledgement::Nak => {}
+                                    }
+                                }
+                                if first_shallows.is_none() && !response.shallow_updates().is_empty() {
+                                    first_shallows = Some(response.shallow_updates().to_vec());
+                                }
+                                rounds.push(negotiate::Round {
+                                    haves_sent: window,
+                                    in_vain,
+                                    haves_to_send: window,
+                                    previous_response_had_at_least_one_in_common: acked,
+                                });
+                                if got_ready && no_done {
+                                    // No `done` is owed: the pack follows this very answer
+                                    // (fetch-pack.c:616-619).
+                                    let mut response =
+                                        crate::fetch::Response::from_line_reader(protocol_version, &mut rd, true, false)
+                                            .await?;
+                                    // The shallow list answers the first flush, not the last one (fetch-pack.c:455-481).
+                                    if response.shallow_updates().is_empty() {
+                                        response.append_v1_shallow_updates(first_shallows.take());
+                                    }
+                                    previous_response = Some(response);
+                                    break 'negotiation rd;
+                                }
+                                if is_stateless {
+                                    for id in &replay {
+                                        arguments.have(id);
+                                    }
+                                }
+                                (got_continue && MAX_IN_VAIN < in_vain) || got_ready
+                            }
+                        };
+                        if finished {
+                            // `done` closes the negotiation, sent with the haves of the window still
+                            // open; the answers still outstanding, the last ACK or NAK and then the pack
+                            // follow on the same stream (fetch-pack.c:612-641).
+                            rounds.push(negotiate::Round {
+                                haves_sent: count - window_start,
+                                in_vain,
+                                haves_to_send: count - window_start,
+                                previous_response_had_at_least_one_in_common: false,
+                            });
+                            let mut rd = arguments.send(transport, true).await?;
+                            let mut response =
+                                crate::fetch::Response::from_line_reader(protocol_version, &mut rd, true, false)
+                                    .await?;
+                            // The shallow list answers the first flush, not the last one (fetch-pack.c:455-481).
+                            if response.shallow_updates().is_empty() {
+                                response.append_v1_shallow_updates(first_shallows.take());
+                            }
+                            // `find_common()` returns -1 unless some ACK was read, the one after `done`
+                            // included, and only for a negotiation that sent anything (fetch-pack.c:621-643);
+                            // `do_fetch_pack()` then warns unless the pack is kept (fetch-pack.c:1247-1252).
+                            let final_ack = response
+                                .acknowledgements()
+                                .iter()
+                                .any(|ack| !matches!(ack, crate::fetch::response::Acknowledgement::Nak));
+                            if count > 0 && !got_continue && !final_ack && !keep_pack {
+                                eprintln!("warning: no common commits");
+                            }
+                            previous_response = Some(response);
+                            break 'negotiation rd;
+                        }
                     }
-                };
-                let mut reader = arguments.send(transport, is_done).await?;
-                if sideband_all {
-                    setup_remote_progress(&mut progress, &mut reader, sideband.as_ref(), should_interrupt);
-                }
-                let response =
-                    crate::fetch::Response::from_line_reader(protocol_version, &mut reader, is_done, !is_done).await?;
-                let has_pack = response.has_pack();
-                previous_response = Some(response);
-                if has_pack {
-                    progress.step();
-                    progress.set_name("receiving pack".into());
-                    if !sideband_all {
-                        setup_remote_progress(&mut progress, &mut reader, sideband.as_ref(), should_interrupt);
-                    }
-                    break 'negotiation reader;
                 }
             };
+            progress.step();
+            progress.set_name("receiving pack".into());
+            if !sideband_all {
+                setup_remote_progress(&mut progress, &mut reader, sideband.as_ref(), should_interrupt);
+            }
             // This needs drop if tracing is compiled in. We just don't know it.
             drop(negotiate_span);
 

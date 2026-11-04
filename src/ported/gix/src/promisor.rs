@@ -320,6 +320,7 @@ pub fn fetch(repo: &crate::Repository, promisor: &Remote, ids: &[gix_hash::Objec
             filter: promisor.filter.as_deref(),
             no_progress: false,
             sideband: None,
+            keep_pack: false,
         },
     )?;
 

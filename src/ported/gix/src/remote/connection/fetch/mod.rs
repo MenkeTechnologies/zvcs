@@ -185,6 +185,7 @@ where
             shallow: Default::default(),
             negotiation: Default::default(),
             refetch: false,
+            keep_pack: false,
             atomic: false,
             show_forced_updates: true,
             filter: None,
@@ -242,6 +243,7 @@ where
     shallow: remote::fetch::Shallow,
     negotiation: gix_protocol::fetch::negotiate::Restrictions,
     refetch: bool,
+    keep_pack: bool,
     atomic: bool,
     show_forced_updates: bool,
     filter: Option<gix_protocol::fetch::filter::Filter>,
@@ -318,6 +320,14 @@ where
         self
     }
 
+    /// git's `args->keep_pack` (transport.c:490), set by `fetch --keep` (builtin/fetch.c:1604) and by
+    /// every clone (builtin/clone.c:1362). Besides keeping the pack, it silences the protocol v0/v1
+    /// "no common commits" warning (fetch-pack.c:1247-1252).
+    pub fn with_keep_pack(mut self, enabled: bool) -> Self {
+        self.inner.keep_pack = enabled;
+        self
+    }
+
     /// If enabled, apply the ref updates in a single all-or-nothing transaction.
     ///
     /// This is git's `--atomic`: should any mapping be rejected, no ref is updated at all, and
@@ -380,6 +390,11 @@ where
 
     pub(crate) fn with_filter(mut self, filter: Option<gix_protocol::fetch::filter::Filter>) -> Self {
         self.filter = filter;
+        self
+    }
+
+    pub(crate) fn with_keep_pack(mut self, enabled: bool) -> Self {
+        self.keep_pack = enabled;
         self
     }
 }

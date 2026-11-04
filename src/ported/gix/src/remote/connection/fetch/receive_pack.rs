@@ -133,6 +133,7 @@ where
             filter: self.filter.as_ref().map(gix_protocol::fetch::filter::Filter::as_str),
             no_progress: con.no_progress,
             sideband: con.sideband.clone(),
+            keep_pack: self.keep_pack,
         };
         let context = gix_protocol::fetch::Context {
             handshake: &mut handshake,
@@ -232,7 +233,12 @@ where
             rounds: v.negotiate.rounds,
         });
 
-        if matches!(handshake.server_protocol_version, gix_protocol::transport::Protocol::V2) {
+        if negotiate.is_some() {
+            // `fetch_refs_via_pack()` clears `finished_handshake` once `fetch_pack()` has run
+            // (transport.c:564), so `disconnect_git()` writes no closing flush after a fetch
+            // (transport.c:1024-1025): the server just sees the connection close.
+            con.transport.skip_end_of_interaction();
+        } else if matches!(handshake.server_protocol_version, gix_protocol::transport::Protocol::V2) {
             gix_protocol::indicate_end_of_interaction(&mut con.transport.inner, con.trace)
                 .await
                 .ok();
@@ -547,5 +553,30 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
             previous_response,
             &self.restrictions.always_have,
         )
+    }
+
+    fn next_have(&mut self) -> Option<Result<gix_hash::ObjectId, negotiate::Error>> {
+        // `--refetch` runs the noop negotiator (fetch-pack.c:1724-1725, :1149-1150), which never
+        // offers anything.
+        if self.refetch {
+            return None;
+        }
+        self.negotiator
+            .next_have(&mut *self.graph)
+            .map(|res| res.map_err(Into::into))
+    }
+
+    fn ack(&mut self, id: gix_hash::ObjectId) -> Result<bool, negotiate::Error> {
+        if self.refetch {
+            return Ok(false);
+        }
+        Ok(self.negotiator.in_common_with_remote(id, &mut *self.graph)?)
+    }
+
+    fn always_have(&self) -> Vec<gix_hash::ObjectId> {
+        if self.refetch {
+            return Vec::new();
+        }
+        self.restrictions.always_have.clone()
     }
 }

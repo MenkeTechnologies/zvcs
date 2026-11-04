@@ -443,6 +443,8 @@ impl PrepareFetch {
             // history a new shallow root could invalidate, so every root the pack brought along is
             // accepted rather than rejected.
             .with_shallow_update(remote::fetch::ShallowUpdate::Cloning)
+            // `transport_set_option(transport, TRANS_OPT_KEEP, "yes")` (builtin/clone.c:1362).
+            .with_keep_pack(true)
             .receive(&repo, &mut progress, should_interrupt)
             .await?;
 

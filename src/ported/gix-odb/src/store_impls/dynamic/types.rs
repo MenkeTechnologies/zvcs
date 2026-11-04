@@ -396,6 +396,94 @@ pub(crate) struct MutableIndexAndPack {
     pub(crate) generation: AtomicGeneration,
 }
 
+/// The slots of a [`Store`](crate::Store), a list that only ever grows and whose
+/// slots never move, so a `&MutableIndexAndPack` stays valid for the store's life.
+///
+/// git keeps no fixed table of packs: `packfile_store_add_pack()` appends each
+/// pack it learns of to the store's list (packfile.c:778-786), whether
+/// `reprepare_packed_git()` found it on disk or a writer such as fast-import's
+/// `end_packfile()` registered it through `packfile_store_load_pack()`
+/// (builtin/fast-import.c:923-926, packfile.c:788-811). A process that opened
+/// the store with 32 slots and then writes 40 packs must still find all 40, so
+/// once every slot is taken the list gains another chunk instead of failing.
+///
+/// Chunk 0 holds the slots the store was opened with; chunk `k` (`k >= 1`) holds
+/// `first << (k - 1)` more, so the capacity doubles with each chunk and the
+/// chunk of any slot index is found arithmetically.
+pub(crate) struct SlotList {
+    chunks: [std::sync::OnceLock<Box<[MutableIndexAndPack]>>; Self::MAX_CHUNKS],
+    /// The number of slots in chunk 0, at least 1.
+    first: usize,
+    /// The number of slots in all initialized chunks.
+    len: AtomicUsize,
+}
+
+impl SlotList {
+    /// Doubling from a single slot reaches [`PackId::max_indices()`] within this many chunks.
+    const MAX_CHUNKS: usize = 16;
+
+    fn chunk(len: usize) -> Box<[MutableIndexAndPack]> {
+        std::iter::repeat_with(MutableIndexAndPack::default).take(len).collect()
+    }
+
+    pub(crate) fn new(slot_count: usize) -> Self {
+        let first = slot_count.max(1);
+        let chunks = std::array::from_fn(|k| match k {
+            0 => std::sync::OnceLock::from(Self::chunk(first)),
+            _ => std::sync::OnceLock::new(),
+        });
+        SlotList {
+            chunks,
+            first,
+            len: AtomicUsize::new(first),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<&MutableIndexAndPack> {
+        if index < self.first {
+            return self.chunks[0].get()?.get(index);
+        }
+        let chunk = (usize::BITS - (index / self.first).leading_zeros()) as usize;
+        let start = self.first << (chunk - 1);
+        self.chunks.get(chunk)?.get()?.get(index - start)
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &MutableIndexAndPack> {
+        self.chunks.iter().map_while(|c| c.get()).flat_map(|c| c.iter())
+    }
+
+    /// Add the next chunk of empty slots, returning `false` if no more slots can be
+    /// represented by a [`PackId`]. Must only be called with the store's write lock held.
+    pub(crate) fn grow(&self) -> bool {
+        let len = self.len();
+        if len >= PackId::max_indices() {
+            return false;
+        }
+        let chunk = (usize::BITS - (len / self.first).leading_zeros()) as usize;
+        let Some(slot) = self.chunks.get(chunk) else {
+            return false;
+        };
+        let added = (self.first << (chunk - 1)).min(PackId::max_indices() - len);
+        if slot.set(Self::chunk(added)).is_err() {
+            return false;
+        }
+        self.len.store(len + added, Ordering::Release);
+        true
+    }
+}
+
+impl std::ops::Index<usize> for SlotList {
+    type Output = MutableIndexAndPack;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("slot indices are always within the slot list")
+    }
+}
+
 /// A snapshot about resource usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

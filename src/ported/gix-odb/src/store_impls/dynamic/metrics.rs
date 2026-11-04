@@ -44,7 +44,7 @@ impl super::Store {
             }
         }
 
-        for slot in &self.files {
+        for slot in self.files.iter() {
             match slot.files.load().as_ref() {
                 None => {
                     unused_slots += 1;

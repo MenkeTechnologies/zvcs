@@ -4,7 +4,7 @@ use arc_swap::ArcSwap;
 
 use crate::{
     Store,
-    store::types::{MutableIndexAndPack, SlotMapIndex},
+    store::types::{SlotList, SlotMapIndex},
 };
 
 /// Options for use in [`Store::at_opts()`].
@@ -140,7 +140,7 @@ impl Store {
             write: Default::default(),
             replacements,
             path: objects_dir,
-            files: Vec::from_iter(std::iter::repeat_with(MutableIndexAndPack::default).take(slot_count)),
+            files: SlotList::new(slot_count),
             index: ArcSwap::new(Arc::new(SlotMapIndex::default())),
             use_multi_pack_index,
             object_hash,

@@ -328,6 +328,12 @@ impl super::Store {
         while let Some((mut index_info, mtime, move_from_slot_idx)) = index_paths_to_add.pop_front() {
             'increment_slot_index: loop {
                 if num_indices_checked == self.files.len() {
+                    // Every slot is taken: grow the list as git appends to its pack list
+                    // (packfile.c:778-786) and continue with the first new slot.
+                    if self.files.grow() {
+                        next_possibly_free_index = num_indices_checked;
+                        continue 'increment_slot_index;
+                    }
                     return Err(Error::InsufficientSlots {
                         current: self.files.len(),
                         needed: index_paths_to_add.len() + 1, /*the one currently popped off*/

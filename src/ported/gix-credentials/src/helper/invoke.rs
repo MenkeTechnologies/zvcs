@@ -56,7 +56,18 @@ pub(crate) fn raw(helper: &mut crate::Program, action: &Action) -> std::result::
     if let (Action::Get(_), None) = (&action, &stdout) {
         panic!("BUG: `Helper` impls must return an output handle to read output from if Action::Get is provided")
     }
-    action.send(&mut stdin)?;
+    // `run_credential_helper()` writes the request with `SIGPIPE` ignored and checks neither the writes nor the
+    // `fclose()` (credential.c:462-466), so a helper that exits without reading its input, `!true` say, is read
+    // from like any other rather than failing the fill on `EPIPE`:
+    //
+    // ```c
+    // fp = xfdopen(helper.in, "w");
+    // sigchain_push(SIGPIPE, SIG_IGN);
+    // credential_write(c, fp, want_output ? CREDENTIAL_OP_HELPER : CREDENTIAL_OP_RESPONSE);
+    // fclose(fp);
+    // sigchain_pop(SIGPIPE);
+    // ```
+    action.send(&mut stdin).ok();
     drop(stdin);
     let stdout = stdout
         .map(|mut stdout| {

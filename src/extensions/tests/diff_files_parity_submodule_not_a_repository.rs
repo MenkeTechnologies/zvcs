@@ -23,10 +23,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> (String, String, i32) {
@@ -130,7 +138,7 @@ impl Fixture {
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {
-        let (out, err, code) = run(STOCK, dir, &self.root, args);
+        let (out, err, code) = run(stock_bin(), dir, &self.root, args);
         assert_eq!(code, 0, "fixture step {args:?} failed: {err}");
         out
     }
@@ -192,7 +200,7 @@ fn check(registered: bool, ignore: Option<&str>, dot_git: DotGit) {
     let tag = format!("{registered}-{}-{dot_git:?}", ignore.unwrap_or("unset"));
     let f = Fixture::new(&tag, registered, ignore, dot_git);
     for args in COMMANDS {
-        let stock = run(STOCK, &f.root.join("stock"), &f.root, args);
+        let stock = run(stock_bin(), &f.root.join("stock"), &f.root, args);
         let zvcs = run(ZVCS, &f.root.join("zvcs"), &f.root, args);
         assert_eq!(zvcs, stock, "{tag}: git {args:?}: (stdout, stderr, status) differ");
     }

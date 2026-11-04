@@ -20,10 +20,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, work_tree: Option<&str>, args: &[&str]) -> (String, String, i32) {
@@ -96,7 +104,7 @@ fn snapshot(dir: &Path) -> String {
 fn source(root: &Path) -> PathBuf {
     let src = root.join("src");
     std::fs::create_dir_all(&src).expect("src");
-    let git = |args: &[&str]| run(STOCK, &src, root, None, args);
+    let git = |args: &[&str]| run(stock_bin(), &src, root, None, args);
     git(&["init", "-q", "-b", "main", "."]);
     std::fs::write(src.join("a"), "one\n").expect("write a");
     git(&["add", "a"]);
@@ -110,7 +118,7 @@ fn source(root: &Path) -> PathBuf {
 fn compare(root: &Path, name: &str, prepare: &dyn Fn(&Path), work_tree: &str, args: &[&str]) {
     let src = root.join("src");
     let mut seen = Vec::new();
-    for (label, bin) in [("stock", STOCK), ("zvcs", ZVCS)] {
+    for (label, bin) in [("stock", stock_bin()), ("zvcs", ZVCS)] {
         let case = root.join(label).join(name);
         std::fs::create_dir_all(&case).expect("case dir");
         prepare(&case);
@@ -193,7 +201,7 @@ fn a_work_tree_stat_does_not_find_is_made_and_the_destination_holds_the_git_dir(
             &["--git-dir=dst", "fsck"],
             &["--git-dir=dst", "rev-parse", "--show-toplevel"],
         ] {
-            let (stdout, stderr, code) = run(STOCK, &case, &root, None, args);
+            let (stdout, stderr, code) = run(stock_bin(), &case, &root, None, args);
             out.push_str(&format!("{args:?} {code}\n{stdout}{stderr}"));
         }
         reads.push(out.replace(&*case.to_string_lossy(), "<C>"));

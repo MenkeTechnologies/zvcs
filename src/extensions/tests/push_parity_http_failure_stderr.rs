@@ -29,10 +29,18 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 /// What the server does to which request.
@@ -117,7 +125,7 @@ fn serve(stream: TcpStream, root: &Path, fault: Fault, posts: &AtomicUsize) {
             continue;
         }
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-        let mut child = Command::new(STOCK)
+        let mut child = Command::new(stock_bin())
             .arg("http-backend")
             .env("GIT_PROJECT_ROOT", root)
             .env("GIT_HTTP_EXPORT_ALL", "1")
@@ -196,7 +204,7 @@ fn run(bin: &str, tag: &str, fault: Fault, behind: bool, args: &[&str]) -> Run {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("srv")).unwrap();
     let stock = |cwd: &Path, args: &[&str]| {
-        let out = Command::new(STOCK)
+        let out = Command::new(stock_bin())
             .args(args)
             .current_dir(cwd)
             .env("HOME", &root)
@@ -280,7 +288,7 @@ fn check(tag: &str, fault: Fault, behind: bool, args: &[&str], expected_stderr: 
     if !stock_available() {
         return;
     }
-    let want = run(STOCK, &format!("{tag}-s"), fault, behind, args);
+    let want = run(stock_bin(), &format!("{tag}-s"), fault, behind, args);
     let got = run(BIN, &format!("{tag}-z"), fault, behind, args);
     assert_eq!(got, want, "{tag}: zvcs and stock git differ");
     assert_eq!(want.stderr, expected_stderr, "{tag}: the fixture produces the failure it is about");
@@ -320,7 +328,7 @@ fn push_parity_truncated_response_is_curl_partial_file() {
         return;
     }
     // The number of missing bytes depends on the response, so only the shape is fixed here.
-    let want = run(STOCK, "trunc-s", Fault::PostTruncated, false, &["push", "origin", "main"]);
+    let want = run(stock_bin(), "trunc-s", Fault::PostTruncated, false, &["push", "origin", "main"]);
     let got = run(BIN, "trunc-z", Fault::PostTruncated, false, &["push", "origin", "main"]);
     assert_eq!(got, want);
     assert!(want.stderr.starts_with("error: RPC failed; curl 18 end of response with "));
@@ -441,7 +449,7 @@ fn push_parity_porcelain_without_a_ref_to_report_prints_no_to_line() {
         return;
     }
     let args = &["push", "--porcelain", "origin", "main"];
-    let want = run(STOCK, "porc-s", Fault::Post(500, 1), false, args);
+    let want = run(stock_bin(), "porc-s", Fault::Post(500, 1), false, args);
     let got = run(BIN, "porc-z", Fault::Post(500, 1), false, args);
     assert_eq!(got, want);
     assert_eq!(want.stdout, "Done\n", "remote-curl answered, so push_ret is 0 and nothing is listed");

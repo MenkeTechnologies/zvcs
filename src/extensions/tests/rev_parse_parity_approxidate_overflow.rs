@@ -26,10 +26,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, args: &[&str], date: &str) -> (String, String, i32) {
@@ -99,15 +107,15 @@ impl Fixture {
     }
 
     fn git(&self, dir: &Path, args: &[&str], date: &str) {
-        let (_, err, code) = run(STOCK, dir, &self.root, args, date);
+        let (_, err, code) = run(stock_bin(), dir, &self.root, args, date);
         assert_eq!(code, 0, "fixture step {args:?} failed: {err}");
     }
 
     /// The stash reflog and every ref, read by stock git.
     fn post_state(&self, side: &str) -> String {
         let dir = self.root.join(side);
-        let (log, _, _) = run(STOCK, &dir, &self.root, &["reflog", "show", "--format=%H %gs", "refs/stash"], "1700000000 +0000");
-        let (refs, _, _) = run(STOCK, &dir, &self.root, &["for-each-ref"], "1700000000 +0000");
+        let (log, _, _) = run(stock_bin(), &dir, &self.root, &["reflog", "show", "--format=%H %gs", "refs/stash"], "1700000000 +0000");
+        let (refs, _, _) = run(stock_bin(), &dir, &self.root, &["for-each-ref"], "1700000000 +0000");
         format!("{log}--\n{refs}")
     }
 }
@@ -116,7 +124,7 @@ impl Fixture {
 fn check(tag: &str, stash_branch: bool, args: &[&str]) {
     let f = Fixture::new(tag, stash_branch);
     let date = "1700100000 +0000";
-    let stock = run(STOCK, &f.root.join("stock"), &f.root, args, date);
+    let stock = run(stock_bin(), &f.root.join("stock"), &f.root, args, date);
     let zvcs = run(ZVCS, &f.root.join("zvcs"), &f.root, args, date);
     assert_eq!(zvcs, stock, "git {args:?}: (stdout, stderr, status) differ");
     assert_eq!(f.post_state("zvcs"), f.post_state("stock"), "git {args:?}: post-state differs");

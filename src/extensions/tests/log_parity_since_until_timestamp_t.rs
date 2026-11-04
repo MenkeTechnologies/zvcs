@@ -23,10 +23,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, args: &[&str], date: &str) -> (String, String, i32) {
@@ -81,7 +89,7 @@ impl Fixture {
     }
 
     fn git(&self, args: &[&str], date: i64) {
-        let (_, err, code) = run(STOCK, &self.work, &self.root, args, &format!("{date} +0000"));
+        let (_, err, code) = run(stock_bin(), &self.work, &self.root, args, &format!("{date} +0000"));
         assert_eq!(code, 0, "fixture step {args:?} failed: {err}");
     }
 
@@ -132,7 +140,7 @@ impl Fixture {
 
     fn check(&self, args: &[&str]) {
         let date = "1000900000 +0000";
-        let stock = run(STOCK, &self.work, &self.root, args, date);
+        let stock = run(stock_bin(), &self.work, &self.root, args, date);
         let zvcs = run(ZVCS, &self.work, &self.root, args, date);
         assert_eq!(zvcs, stock, "git {args:?}: (stdout, stderr, status) differ");
     }
@@ -267,11 +275,11 @@ fn bundle_keeps_a_tag_strictly_inside_the_window() {
         let stock_out = f.root.join(format!("stock-{i}.bundle"));
         let zvcs_out = f.root.join(format!("zvcs-{i}.bundle"));
         let date = "1000900000 +0000";
-        let stock = run(STOCK, &f.work, &f.root, &["bundle", "create", stock_out.to_str().unwrap(), "main", "v1", bound], date);
+        let stock = run(stock_bin(), &f.work, &f.root, &["bundle", "create", stock_out.to_str().unwrap(), "main", "v1", bound], date);
         let zvcs = run(ZVCS, &f.work, &f.root, &["bundle", "create", zvcs_out.to_str().unwrap(), "main", "v1", bound], date);
         assert_eq!(zvcs, stock, "bundle create {bound}: (stdout, stderr, status) differ");
         if stock.2 == 0 {
-            let heads = |path: &Path| run(STOCK, &f.work, &f.root, &["bundle", "list-heads", path.to_str().unwrap()], date);
+            let heads = |path: &Path| run(stock_bin(), &f.work, &f.root, &["bundle", "list-heads", path.to_str().unwrap()], date);
             assert_eq!(heads(&zvcs_out), heads(&stock_out), "bundle create {bound}: heads differ");
         }
     }

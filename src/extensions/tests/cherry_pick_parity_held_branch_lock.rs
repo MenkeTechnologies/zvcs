@@ -22,10 +22,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> (String, String, i32) {
@@ -61,7 +69,7 @@ fn fixture(root: &Path, setup: &[&[&str]]) -> PathBuf {
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
     let git = |args: &[&str]| {
-        let (_, err, code) = run(STOCK, &work, root, args);
+        let (_, err, code) = run(stock_bin(), &work, root, args);
         (err, code)
     };
     git(&["init", "-q", "-b", "main", "."]);
@@ -99,7 +107,7 @@ fn state(work: &Path, home: &Path) -> String {
         &["log", "--format=%H %s", "-3", "main"],
         &["fsck"],
     ] {
-        let (out, err, code) = run(STOCK, work, home, args);
+        let (out, err, code) = run(stock_bin(), work, home, args);
         s += &format!("$ git {}\n{out}{err}[{code}]\n", args.join(" "));
     }
     let git_dir = work.join(".git");
@@ -124,7 +132,7 @@ fn state(work: &Path, home: &Path) -> String {
 /// and exit status so a case can also pin what stock does.
 fn compare(tag: &str, lock: &str, setup: &[&[&str]], args: &[&str]) -> (String, i32) {
     let mut seen = Vec::new();
-    for (who, bin) in [("stock", STOCK), ("zvcs", ZVCS)] {
+    for (who, bin) in [("stock", stock_bin()), ("zvcs", ZVCS)] {
         let root = std::env::temp_dir().join(format!(
             "zvcs-cherry-pick-held-lock-{tag}-{who}-{}",
             std::process::id()

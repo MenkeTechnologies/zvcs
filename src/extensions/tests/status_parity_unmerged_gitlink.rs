@@ -19,10 +19,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> (String, String, i32) {
@@ -136,14 +144,14 @@ impl Fixture {
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> String {
-        let (out, err, code) = run(STOCK, dir, &self.home(), args);
+        let (out, err, code) = run(stock_bin(), dir, &self.home(), args);
         assert_eq!(code, 0, "stock git {args:?} failed: {err}");
         out
     }
 
     fn git_stdin(&self, dir: &Path, args: &[&str], input: &str) {
         use std::io::Write;
-        let mut child = Command::new(STOCK)
+        let mut child = Command::new(stock_bin())
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -157,7 +165,7 @@ impl Fixture {
 
     fn compare(&self, args: &[&str]) -> (String, String, i32) {
         let home = self.home();
-        let stock = run(STOCK, &self.root.join("stock"), &home, args);
+        let stock = run(stock_bin(), &self.root.join("stock"), &home, args);
         let zvcs = run(ZVCS, &self.root.join("zvcs"), &home, args);
         assert_eq!(stock, zvcs, "git {args:?} differs (left stock, right zvcs)");
         stock

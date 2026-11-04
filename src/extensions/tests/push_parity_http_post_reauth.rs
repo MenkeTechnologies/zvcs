@@ -32,10 +32,18 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn base64(input: &[u8]) -> String {
@@ -140,7 +148,7 @@ fn serve(stream: TcpStream, root: &Path, auth: &str, guard: Guard, challenge: &s
             continue;
         }
         let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-        let mut child = Command::new(STOCK)
+        let mut child = Command::new(stock_bin())
             .arg("http-backend")
             .env("GIT_PROJECT_ROOT", root)
             .env("GIT_HTTP_EXPORT_ALL", "1")
@@ -227,7 +235,7 @@ fn run(bin: &str, tag: &str, case: &Case<'_>) -> Run {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("srv")).unwrap();
     let stock = |cwd: &Path, args: &[&str]| {
-        let out = Command::new(STOCK)
+        let out = Command::new(stock_bin())
             .args(args)
             .current_dir(cwd)
             .env("HOME", &root)
@@ -329,7 +337,7 @@ fn run(bin: &str, tag: &str, case: &Case<'_>) -> Run {
 }
 
 fn compare(tag: &str, case: &Case<'_>) -> Run {
-    let want = run(STOCK, &format!("{tag}-stock"), case);
+    let want = run(stock_bin(), &format!("{tag}-stock"), case);
     let got = run(BIN, &format!("{tag}-zvcs"), case);
     assert_eq!(got.stderr, want.stderr, "{tag}: stderr");
     assert_eq!(got.stdout, want.stdout, "{tag}: stdout");

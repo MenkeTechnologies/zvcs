@@ -10,7 +10,15 @@ use std::path::Path;
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 /// Push `main` into a bare repository whose `post-receive` prints `payload` (a
 /// perl string literal) on stderr, which `receive-pack` muxes onto band 2.
@@ -19,7 +27,7 @@ fn push(bin: &str, tag: &str, payload: &str) -> (Option<i32>, Vec<u8>, Vec<u8>) 
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let git = |cwd: &Path, args: &[&str]| {
-        let out = Command::new(STOCK)
+        let out = Command::new(stock_bin())
             .args(args)
             .current_dir(cwd)
             .env("HOME", &root)
@@ -62,7 +70,7 @@ fn push(bin: &str, tag: &str, payload: &str) -> (Option<i32>, Vec<u8>, Vec<u8>) 
 
 #[test]
 fn band_two_stops_at_a_nul() {
-    if !Path::new(STOCK).exists() {
+    if !Path::new(stock_bin()).exists() {
         return;
     }
     for (tag, payload) in [
@@ -72,7 +80,7 @@ fn band_two_stops_at_a_nul() {
         ("trailing", r"p\0"),
         ("after-cr", r"q\r\0r\n"),
     ] {
-        let want = push(STOCK, &format!("{tag}-stock"), payload);
+        let want = push(stock_bin(), &format!("{tag}-stock"), payload);
         let got = push(BIN, &format!("{tag}-zvcs"), payload);
         assert_eq!(
             String::from_utf8_lossy(&got.2),

@@ -16,10 +16,18 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, args: &[&str], stdin: Option<&Path>) -> (String, String, i32) {
@@ -57,13 +65,13 @@ fn run(bin: &str, dir: &Path, args: &[&str], stdin: Option<&Path>) -> (String, S
 fn fixture(root: &Path, name: &str) -> std::path::PathBuf {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
-    run(STOCK, &dir, &["init", "-q", "-b", "main"], None);
+    run(stock_bin(), &dir, &["init", "-q", "-b", "main"], None);
     for n in 1..=5 {
         std::fs::write(dir.join(format!("f{n}")), format!("{n}\n")).unwrap();
-        run(STOCK, &dir, &["add", "."], None);
-        run(STOCK, &dir, &["commit", "-q", "-m", &format!("c{n}")], None);
+        run(stock_bin(), &dir, &["add", "."], None);
+        run(stock_bin(), &dir, &["commit", "-q", "-m", &format!("c{n}")], None);
         if n == 2 {
-            run(STOCK, &dir, &["branch", "side"], None);
+            run(stock_bin(), &dir, &["branch", "side"], None);
         }
     }
     dir
@@ -72,11 +80,11 @@ fn fixture(root: &Path, name: &str) -> std::path::PathBuf {
 /// Run `args` through both binaries on fresh copies of the fixture and return
 /// each side's answer plus its `refs/bisect/*` listing.
 fn both(root: &Path, tag: &str, args: &[&str], stdin: Option<&Path>) -> [(String, String, i32, String); 2] {
-    [STOCK, ZVCS].map(|bin| {
-        let side = if bin == STOCK { "stock" } else { "zvcs" };
+    [stock_bin(), ZVCS].map(|bin| {
+        let side = if bin == stock_bin() { "stock" } else { "zvcs" };
         let dir = fixture(root, &format!("{tag}-{side}"));
         let got = run(bin, &dir, args, stdin);
-        let refs = run(STOCK, &dir, &["for-each-ref", "refs/bisect"], None).0;
+        let refs = run(stock_bin(), &dir, &["for-each-ref", "refs/bisect"], None).0;
         (got.0, got.1, got.2, refs)
     })
 }

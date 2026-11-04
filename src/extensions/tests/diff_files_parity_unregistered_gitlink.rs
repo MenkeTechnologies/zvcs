@@ -25,10 +25,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZVCS: &str = env!("CARGO_BIN_EXE_git");
-const STOCK: &str = "/opt/homebrew/bin/git";
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
+/// The oracle, chosen by the shared policy in `support/stock_git.rs`
+/// (`ZVCS_STOCK_GIT`, else the newest stock install). With none, the Homebrew
+/// path stands in so the availability check below skips as it always has.
+fn stock_bin() -> &'static str {
+    stock_git::stock_git().unwrap_or("/opt/homebrew/bin/git")
+}
 
 fn stock_available() -> bool {
-    Path::new(STOCK).exists()
+    Path::new(stock_bin()).exists()
 }
 
 fn run(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> (String, String, i32) {
@@ -109,7 +117,7 @@ impl Fixture {
     }
 
     fn git(&self, dir: &Path, args: &[&str]) {
-        let (_, err, code) = run(STOCK, dir, &self.root, args);
+        let (_, err, code) = run(stock_bin(), dir, &self.root, args);
         assert_eq!(code, 0, "fixture step {args:?} failed: {err}");
     }
 
@@ -161,7 +169,7 @@ impl Fixture {
     /// own paths only appear in a gitfile's target, which no compared command
     /// prints, so the outputs are compared as they are.
     fn same(&self, args: &[&str]) {
-        let stock = run(STOCK, &self.work("stock"), &self.root, args);
+        let stock = run(stock_bin(), &self.work("stock"), &self.root, args);
         let zvcs = run(ZVCS, &self.work("zvcs"), &self.root, args);
         assert_eq!(zvcs, stock, "zvcs vs stock for {args:?}");
     }
@@ -267,12 +275,12 @@ fn add_update_restages_the_moved_gitlink() {
     }
     for shape in [Shape::Moved, Shape::GitfileMoved, Shape::Modified] {
         let f = Fixture::new(&format!("add-u-{shape:?}"), shape);
-        let stock = run(STOCK, &f.work("stock"), &f.root, &["add", "-u"]);
+        let stock = run(stock_bin(), &f.work("stock"), &f.root, &["add", "-u"]);
         let zvcs = run(ZVCS, &f.work("zvcs"), &f.root, &["add", "-u"]);
         assert_eq!(zvcs, stock, "add -u for {shape:?}");
         for args in [&["ls-files", "-s"][..], &["diff-index", "--cached", "HEAD"][..]] {
-            let s = run(STOCK, &f.work("stock"), &f.root, args);
-            let z = run(STOCK, &f.work("zvcs"), &f.root, args);
+            let s = run(stock_bin(), &f.work("stock"), &f.root, args);
+            let z = run(stock_bin(), &f.work("zvcs"), &f.root, args);
             assert_eq!(z, s, "index after add -u for {shape:?}: {args:?}");
         }
     }

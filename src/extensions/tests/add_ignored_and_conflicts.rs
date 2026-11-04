@@ -13,6 +13,9 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "support/stock_git.rs"]
+mod stock_git;
+
 const BIN: &str = env!("CARGO_BIN_EXE_git");
 
 fn run(dir: &Path, args: &[&str]) -> Output {
@@ -48,10 +51,8 @@ fn scratch(tag: &str) -> PathBuf {
     root
 }
 
-/// A worktree whose ignore rules cover a whole directory (`build/`), a directory
-/// only by way of its contents (`logs/`, all `*.log`), and single files.
-fn ignored_fixture(tag: &str) -> PathBuf {
-    let dir = scratch(tag);
+/// The files and ignore rules of [`ignored_fixture`], written into `dir`.
+fn write_ignored_tree(dir: &Path) {
     for sub in ["build", "logs"] {
         std::fs::create_dir_all(dir.join(sub)).expect("mkdir");
     }
@@ -66,6 +67,13 @@ fn ignored_fixture(tag: &str) -> PathBuf {
     ] {
         std::fs::write(dir.join(path), body).expect("write fixture file");
     }
+}
+
+/// A worktree whose ignore rules cover a whole directory (`build/`), a directory
+/// only by way of its contents (`logs/`, all `*.log`), and single files.
+fn ignored_fixture(tag: &str) -> PathBuf {
+    let dir = scratch(tag);
+    write_ignored_tree(&dir);
     ok(&dir, &["init", "-q", "-b", "main"]);
     dir
 }
@@ -95,33 +103,54 @@ fn force_descends_into_a_directory_the_ignore_rules_cover() {
     );
 }
 
+/// `bin` with no configuration but the repository's own: an empty `HOME` and
+/// no `XDG_CONFIG_HOME` leave no global `core.excludesFile`, and
+/// `GIT_CONFIG_NOSYSTEM` drops the system file, so only the fixture's
+/// `.gitignore` decides what is ignored.
+fn isolated(bin: &str, dir: &Path, home: &Path, args: &[&str]) -> Output {
+    Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@e.x")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@e.x")
+        .output()
+        .expect("run binary")
+}
+
+/// The ignored-paths block names the collapsed directory the walk stopped at
+/// when a rule names the directory (`build/`); `logs/` is ignored only by way
+/// of `*.log`, so the walk goes inside it. What each pathspec prints, and its
+/// exit status, is taken from stock git on the same fixture.
 #[test]
 fn the_ignored_paths_block_names_the_directory_the_walk_stopped_at() {
-    let dir = ignored_fixture("report");
-    ok(&dir, &["add", "-A"]);
-    ok(&dir, &["commit", "-qm", "x"]);
-
-    let block = |args: &[&str]| -> Vec<String> {
-        let out = run(&dir, args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        stderr_of(&out)
-            .lines()
-            .skip(1)
-            .take_while(|l| !l.starts_with("hint: "))
-            .map(str::to_string)
-            .collect()
+    let Some(stock) = stock_git::stock_git() else {
+        return;
+    };
+    let home = scratch("report-home");
+    let outcome = |bin: &str, tag: &str, args: &[&str]| {
+        let dir = scratch(tag);
+        write_ignored_tree(&dir);
+        for setup in [&["init", "-q", "-b", "main"][..], &["add", "-A"], &["commit", "-qm", "x"]] {
+            let out = isolated(bin, &dir, &home, setup);
+            assert!(out.status.success(), "{bin} {setup:?}: {}", stderr_of(&out));
+        }
+        let out = isolated(bin, &dir, &home, args);
+        let _ = std::fs::remove_dir_all(&dir);
+        (out.status.code(), stdout_of(&out), stderr_of(&out))
     };
 
-    // A file inside a collapsed directory is reported as that directory: the walk
-    // never looked inside it, so its name is the only one recorded.
-    assert_eq!(block(&["add", "build/output.o"]), ["build"]);
-    assert_eq!(block(&["add", "logs/debug.log"]), ["logs"]);
-    // And the directory itself is named without the trailing slash it was typed
-    // with, because the name comes from the walk rather than from the pathspec.
-    assert_eq!(block(&["add", "build/"]), ["build"]);
-    assert_eq!(block(&["add", "logs/"]), ["logs"]);
-    // A file that is ignored on its own account keeps its own name.
-    assert_eq!(block(&["add", "notes.tmp"]), ["notes.tmp"]);
+    for (n, path) in ["build/output.o", "logs/debug.log", "build/", "logs/", "notes.tmp"].into_iter().enumerate() {
+        let args = ["add", path];
+        let want = outcome(stock, &format!("report-s{n}"), &args);
+        let got = outcome(BIN, &format!("report-z{n}"), &args);
+        assert_eq!(got, want, "git add {path}: zvcs and stock git differ");
+    }
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]

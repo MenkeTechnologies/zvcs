@@ -17,6 +17,10 @@ env:
   # (96E0 7AF2 5771 9559 80DA D100 20D0 4E5A 7136 60A7).
   STOCK_GIT_VERSION: 2.56.0
   STOCK_GIT_SHA256: 26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3
+  # libcurl the ubuntu stock git links: the release Homebrew ships (and its sha256),
+  # since Ubuntu 24.04's libcurl 8.5.0 predates the wording the parity tests compare.
+  STOCK_CURL_VERSION: 8.23.0
+  STOCK_CURL_SHA256: 95b22eb32bf6d1fa6e3e9463bdb61cece3efc56d86576a9b3cbd428246a6d854
 
 jobs:
   build-test:
@@ -36,19 +40,33 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.local/stock-git
-          key: stock-git-${{ runner.os }}-${{ runner.arch }}-${{ env.STOCK_GIT_VERSION }}-${{ env.STOCK_GIT_SHA256 }}-brewcurl
+          key: stock-git-${{ runner.os }}-${{ runner.arch }}-${{ env.STOCK_GIT_VERSION }}-${{ env.STOCK_GIT_SHA256 }}-curl-${{ env.STOCK_CURL_VERSION }}
       - name: Build stock git
         if: steps.stock-git.outputs.cache-hit != 'true'
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update
-            sudo apt-get install -y libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
-            curl_config=curl-config
+            sudo apt-get install -y libexpat1-dev libssl-dev zlib1g-dev
+            # The parity tests compare libcurl's error text, and Ubuntu's libcurl
+            # (8.5.0) predates 8.9.0's CURLE_PARTIAL_FILE wording "end of response
+            # with N bytes missing", so libcurl is built into the stock-git prefix.
+            curl_tarball="curl-$STOCK_CURL_VERSION.tar.bz2"
+            curl -sSfL -o "$RUNNER_TEMP/$curl_tarball" "https://curl.se/download/$curl_tarball"
+            echo "$STOCK_CURL_SHA256  $RUNNER_TEMP/$curl_tarball" | shasum -a 256 -c -
+            tar -xjf "$RUNNER_TEMP/$curl_tarball" -C "$RUNNER_TEMP"
+            (cd "$RUNNER_TEMP/curl-$STOCK_CURL_VERSION" \
+              && ./configure --prefix="$HOME/.local/stock-git" --with-openssl \
+                   --without-libpsl --disable-ldap --disable-manual \
+              && make -j"$(getconf _NPROCESSORS_ONLN)" && make install)
+            curl_config="$HOME/.local/stock-git/bin/curl-config"
+            # CURLDIR also gives git-remote-http an rpath to that libcurl.
+            curl_dir="$HOME/.local/stock-git"
           else
             # Link Homebrew libcurl, as Homebrew's git does, not the system one: the
             # parity tests compare libcurl's error text, and the system libcurl
             # (8.7.1) predates 8.9.0's CURLE_PARTIAL_FILE wording "end of response
             # with N bytes missing".
+            curl_dir=
             brew list curl >/dev/null 2>&1 || brew install curl
             curl_config="$(brew --prefix curl)/bin/curl-config"
           fi
@@ -61,6 +79,7 @@ jobs:
           make -C "$RUNNER_TEMP/git-$STOCK_GIT_VERSION" -j"$(getconf _NPROCESSORS_ONLN)" \
             prefix="$HOME/.local/stock-git" \
             CURL_CONFIG="$curl_config" \
+            ${curl_dir:+CURLDIR="$curl_dir"} \
             NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PYTHON=YesPlease \
             all install
       # First on PATH, and named explicitly for the parity harness

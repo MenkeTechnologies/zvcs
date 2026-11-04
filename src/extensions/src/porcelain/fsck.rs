@@ -348,6 +348,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // so every later prepare tries it again and prints the line again; see [`MidxRetry`].
     let midx_on = repo.config_snapshot().boolean("core.multiPackIndex") != Some(false);
     let mut midx_retry = MidxRetry::default();
+    // The arguments' traces, when [`midx_retry_unmodelled`] needed them first.
+    let mut arg_traces: Option<Vec<ArgTrace>> = None;
     if midx_on {
         let sources = odb_sources(&repo);
         for objdir in &sources {
@@ -364,7 +366,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             if log.lines.is_empty() {
                 continue;
             }
-            if let Some(why) = midx_retry_unmodelled(&repo, &opt, sources.len()) {
+            if let Some(why) = midx_retry_unmodelled(&repo, &opt, sources.len(), &mut arg_traces) {
                 bail!(
                     "refusing to guess the output: git prints `{}` on every odb prepare that retries this multi-pack-index, and {why}",
                     log.lines[0]
@@ -392,18 +394,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `the_repository->objects->commit_graph`, which the first commit this process parses
     // loads (`prepare_commit_graph()`, commit-graph.c:736-773).
     let mut graph = ProcessGraph::new(&repo);
-    // Every object the arguments' `parse_object()` calls have parsed, of any type.
-    let mut arg_parsed: HashSet<ObjectId> = HashSet::new();
-    for arg in &opt.objects {
-        // `repo_get_oid()` turns a full-length hex id into an object id without
-        // consulting the odb, so an id that names nothing still reaches
-        // `snapshot_ref()`; every shorter or symbolic form has to resolve.
-        let resolved = repo
-            .rev_parse_single(arg.as_str())
-            .map(|id| id.detach())
-            .ok()
-            .or_else(|| ObjectId::from_hex(arg.as_bytes()).ok());
-        match resolved {
+    // `repo_get_oid()` on each argument, with the reads, parses, lookups and `error()`
+    // lines it makes on the way (see [`GetOid`]).
+    let traces: Vec<ArgTrace> = arg_traces.take().unwrap_or_else(|| GetOid::trace_args(&repo, &opt.objects));
+    for (arg, trace) in opt.objects.iter().zip(&traces) {
+        replay_arg_ops(&repo, &mut state, &mut pre_parsed, &mut graph, &mut midx_retry, trace)?;
+        match trace.resolved {
             // `snapshot_ref()`: `parse_object()` returning NULL is the id's
             // problem, not the argument's — a different message and a different
             // error bit, and `default_refs` is left alone so the head set stays
@@ -423,21 +419,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     return Ok(code);
                 }
                 default_refs += 1;
-                // `repo_get_oid()` parses first when the argument peels: `peel_onion()`
-                // parses `<rev>` and each object on the way down to the type it asks for
-                // (see [`get_oid_peeled`]).
-                let base = arg.split_once(':').map_or(arg.as_str(), |(base, _)| base);
-                let mut peeled = arg_parsed.clone();
-                let mut calls: Vec<(ObjectId, bool)> = Vec::new();
-                if get_oid_peeled(&repo, base, &mut peeled, &mut calls).is_some() {
-                    arg_parsed = peeled;
-                    for (call, parses) in calls {
-                        parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, call, parses)?;
-                    }
-                }
                 // Then `snapshot_ref()` calls `parse_object()` on what it resolved to.
-                let parses = arg_parsed.insert(id);
-                parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, id, parses)?;
+                parse_object_ops(&repo, &mut state, &mut pre_parsed, &mut graph, id, trace.snapshot_parses)?;
                 heads.push(id);
             }
             None => {
@@ -571,7 +554,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `repo_get_oid()` had to read to resolve it (see [`explicit_arg_reads`]).
     let snapshot_reads: Option<Vec<ObjectId>> = match (snapshot_missed, explicit_heads) {
         (true, _) => None,
-        (false, true) => explicit_arg_reads(&repo, &opt.objects),
+        (false, true) => explicit_arg_reads(&repo, &traces),
         (false, false) => {
             let mut parsed: HashSet<ObjectId> = HashSet::new();
             Some(heads.iter().copied().filter(|id| parsed.insert(*id)).collect())
@@ -3890,191 +3873,637 @@ fn check_objects_progress(repo: &gix::Repository, objdir: &Path, pack_lists: Opt
 }
 
 /// The objects `snapshot_refs()` reads, in order, for explicit `<object>`
-/// arguments (builtin/fsck.c:592-603): `repo_get_oid()` on each argument, then
-/// `snapshot_ref()`'s `parse_object()` on what it resolved to.
-///
-/// Only the argument shapes whose resolution reads a known sequence are
-/// modelled, and `None` is returned for any other, which leaves a pack-list tie
-/// unplaced:
-///
-///  * a full-length hex id or an existing ref name resolves without reading an
-///    object (`get_oid_basic()`);
-///  * `<rev>^{<type>}` resolves `<rev>` either way and then parses its way down
-///    to the type (see [`get_oid_peeled`]);
-///  * `<rev>:<path>` resolves `<rev>` either way, then `get_tree_entry()`
-///    (tree-walk.c:605-635) reads `<rev>` peeled to a tree with
-///    `odb_read_object_peeled()` — the commit or tag, then what it points at,
-///    down to the tree — and `find_tree_entry()` (tree-walk.c:568-603) reads
-///    each subtree it descends into, but not the entry it lands on.
-///
-/// `parse_object()` reads the resolved object unless an earlier call already
-/// parsed it (object.c:335-337); `odb_read_object_peeled()` reads raw buffers
-/// and parses nothing.
-fn explicit_arg_reads(repo: &gix::Repository, args: &[String]) -> Option<Vec<ObjectId>> {
+/// arguments (builtin/fsck.c:592-603): `repo_get_oid()` on each argument (see
+/// [`GetOid`]), then `snapshot_ref()`'s `parse_object()` on what it resolved
+/// to, which reads only an object no earlier call parsed (object.c:335-337).
+/// `None` when an argument takes a step [`GetOid`] does not model, or resolves
+/// to an id no source holds, whose reads miss and re-prepare every source.
+fn explicit_arg_reads(repo: &gix::Repository, traces: &[ArgTrace]) -> Option<Vec<ObjectId>> {
     let mut reads: Vec<ObjectId> = Vec::new();
-    let mut parsed: HashSet<ObjectId> = HashSet::new();
-    for arg in args {
-        let (base, path) = match arg.split_once(':') {
-            Some((base, path)) => (base, Some(path)),
-            None => (arg.as_str(), None),
-        };
-        let mut calls: Vec<(ObjectId, bool)> = Vec::new();
-        let base_id = get_oid_peeled(repo, base, &mut parsed, &mut calls)?;
-        reads.extend(calls.into_iter().filter(|&(_, parses)| parses).map(|(id, _)| id));
-        let id = match path {
-            None => base_id,
-            Some(path) => tree_entry_reads(repo, base_id, path, &mut reads)?,
-        };
-        if !repo.has_object(id) {
+    for trace in traces {
+        if !trace.complete {
             return None;
         }
-        if parsed.insert(id) {
-            reads.push(id);
+        reads.extend(trace.ops.iter().filter_map(|op| match op {
+            ArgOp::Read(id) => Some(*id),
+            _ => None,
+        }));
+        if let Some(id) = trace.resolved {
+            if !repo.has_object(id) {
+                return None;
+            }
+            if trace.snapshot_parses {
+                reads.push(id);
+            }
         }
     }
     Some(reads)
 }
 
-/// `get_oid_basic()` for the two forms that read no object: a full-length hex
-/// id, and a name `repo_dwim_ref()` finds. A string of hex digits shorter than
-/// an id may instead be an abbreviation, whose disambiguation reads objects, so
-/// it is refused, as is every name carrying revision syntax.
-fn resolve_without_reads(repo: &gix::Repository, base: &str) -> Option<ObjectId> {
-    let hexsz = repo.object_hash().len_in_hex();
-    if base.len() == hexsz {
-        if let Ok(id) = ObjectId::from_hex(base.as_bytes()) {
-            return Some(id);
-        }
-    }
-    if base.is_empty()
-        || base.bytes().all(|b| b.is_ascii_hexdigit())
-        || base.contains(['^', '~', '@', '{', '}', ':', '*', '?', '[', '\\', ' '])
-    {
-        return None;
-    }
-    repo.find_reference(base).ok()?;
-    repo.rev_parse_single(base).ok().map(|id| id.detach())
+/// One step `repo_get_oid()` takes on an `<object>` argument, which [`fsck`]
+/// replays in order.
+enum ArgOp {
+    /// An odb read that finds the object, through `find_pack_entry()` for a
+    /// packed one (packfile.c:2149-2168).
+    Read(ObjectId),
+    /// `parse_object()`, and whether it parses the object (see [`parse_object_ops`]).
+    Parse(ObjectId, bool),
+    /// `repo_parse_commit()` of a commit nothing parsed yet, answered from the
+    /// object database: `parse_commit_buffer()` with `check_graph` clear
+    /// (commit.c:600-660, :593-594), which creates the tree and every parent.
+    ParseCommit(ObjectId),
+    /// `lookup_unknown_object()` or `lookup_commit()`, which find or create.
+    Lookup(ObjectId),
+    /// `object_as_type()` typing an object `lookup_unknown_object()` created.
+    Typed(ObjectId),
+    /// An `error()` line, without its `error: ` prefix.
+    Error(String),
 }
 
-/// `get_oid_1()` (object-name.c:1083-1140) for a name that is either a
-/// [`resolve_without_reads`] form or `<name>^{<type>}` over one, appending every
-/// `parse_object()` call it makes to `calls`, each with whether it parses the
-/// object (`true`) or finds it in `parsed` already and returns at once
-/// (object.c:335-337). Either way the call's `lookup_object()` looks the id up.
+/// What `repo_get_oid()` did for one argument.
+struct ArgTrace {
+    /// Its steps, in order: every one when `complete`, else those up to the
+    /// first step not modelled.
+    ops: Vec<ArgOp>,
+    /// Whether `ops` is every step the C takes.
+    complete: bool,
+    /// What the argument resolved to.
+    resolved: Option<ObjectId>,
+    /// Whether `snapshot_ref()`'s `parse_object()` of `resolved` parses it.
+    snapshot_parses: bool,
+}
+
+/// A step [`GetOid`] does not model: a read that misses (which re-prepares every
+/// source, odb.c:575-586), a commit-graph parse, an abbreviated id or reflog
+/// selector, a corrupt object, or a name shape not ported.
+struct Unmodelled;
+
+/// A step's result: `Ok(None)` is the C's own failure, `Err` a step not modelled.
+type Step<T> = std::result::Result<T, Unmodelled>;
+
+/// `repo_get_oid()` (object-name.c:1729-1860) over the `<object>` arguments, with
+/// the parsed-object table its reads, parses and lookups share across them.
 ///
-/// `peel_onion()` (object-name.c:907-1000) resolves `<name>`, then
-/// `parse_object()`s it. `^{}` follows a tag chain with `deref_tag()`, which
-/// `parse_object()`s each tagged object (tag.c:76-95); every other type goes
-/// through `repo_peel_to_type()` (object-name.c:882-905), which parses only an
-/// object not parsed yet and steps from a tag to what it tags and from a commit
-/// to its tree. `None` for a shape not modelled: a `~`/`^<n>` suffix, `^{/<regex>}`,
-/// an unknown type, or a peel git fails.
-fn get_oid_peeled(
-    repo: &gix::Repository,
-    name: &str,
-    parsed: &mut HashSet<ObjectId>,
-    calls: &mut Vec<(ObjectId, bool)>,
-) -> Option<ObjectId> {
-    let open = match name.len() >= 4 && name.ends_with('}') {
-        true => name.rfind("^{").filter(|&caret| caret > 0),
-        false => None,
-    };
-    let Some(caret) = open else {
-        return resolve_without_reads(repo, name);
-    };
-    // `None` asks `deref_tag()`'s peel to a non-tag, `Some(None)` takes any type.
-    let expected: Option<Option<Kind>> = match &name[caret + 2..] {
-        "commit}" => Some(Some(Kind::Commit)),
-        "tag}" => Some(Some(Kind::Tag)),
-        "tree}" => Some(Some(Kind::Tree)),
-        "blob}" => Some(Some(Kind::Blob)),
-        "object}" => Some(None),
-        "}" => None,
-        _ => return None,
-    };
-    // One `parse_object()` call; a commit or tag it cannot parse fails the peel.
-    let parse = |id: ObjectId, parsed: &mut HashSet<ObjectId>, calls: &mut Vec<(ObjectId, bool)>| -> Option<Kind> {
-        let kind = repo.find_header(id).ok()?.kind();
-        let parses = parsed.insert(id);
-        if parses && matches!(kind, Kind::Commit | Kind::Tag) && !matches!(decode(repo, id), Ok(Ok(_))) {
-            return None;
-        }
-        calls.push((id, parses));
-        Some(kind)
-    };
-    // The tag's target, or the commit's tree `parse_commit_buffer()` stored.
-    let deref = |id: ObjectId| -> Option<ObjectId> { decode(repo, id).ok()?.ok()?.children.first().map(|(c, _)| *c) };
-
-    let outer = get_oid_peeled(repo, &name[..caret], parsed, calls)?;
-    let mut o = outer;
-    let mut kind = parse(o, parsed, calls)?;
-    let Some(expected) = expected else {
-        while kind == Kind::Tag {
-            o = deref(o)?;
-            kind = parse(o, parsed, calls)?;
-        }
-        return Some(o);
-    };
-    loop {
-        if expected.is_none_or(|want| want == kind) {
-            return Some(o);
-        }
-        o = match kind {
-            Kind::Tag | Kind::Commit => deref(o)?,
-            Kind::Tree | Kind::Blob => return None,
-        };
-        kind = match parsed.contains(&o) {
-            true => repo.find_header(o).ok()?.kind(),
-            false => parse(o, parsed, calls)?,
-        };
-    }
+/// Modelled: a full-length hex id or a name `repo_dwim_ref()` finds
+/// (`get_oid_basic()`, which reads nothing), and over those `~<n>` / `^<n>`
+/// (`get_nth_ancestor()` / `get_parent()`, object-name.c:827-880),
+/// `^{<type>}` and `^{/<regex>}` (`peel_onion()`, :907-1000), `<rev>:<path>`
+/// (`get_tree_entry()`, tree-walk.c:568-635) and `:[<n>:]<path>` (the index).
+struct GetOid<'r> {
+    repo: &'r gix::Repository,
+    /// Whether a commit-graph may answer `repo_parse_commit()`
+    /// (commit.c:625-640), whose parse this does not replay.
+    graph: bool,
+    /// `obj->parsed`.
+    parsed: HashSet<ObjectId>,
+    /// An object whose `obj->type` is set.
+    typed: HashSet<ObjectId>,
+    ops: Vec<ArgOp>,
 }
 
-/// `get_tree_entry(repo, start, path)`'s reads, appended to `reads`, and the
-/// entry it finds. `None` when the lookup fails or takes a shape not modelled.
-fn tree_entry_reads(repo: &gix::Repository, start: ObjectId, path: &str, reads: &mut Vec<ObjectId>) -> Option<ObjectId> {
-    // `odb_read_object_peeled(…, OBJ_TREE, …)`: read, and follow a commit's
-    // tree or a tag's target until a tree is read.
-    let peel = |mut id: ObjectId, reads: &mut Vec<ObjectId>| -> Option<ObjectId> {
-        loop {
-            reads.push(id);
-            let object = repo.find_object(id).ok()?;
-            id = match object.kind {
-                Kind::Tree => return Some(id),
-                Kind::Commit => object.into_commit().tree_id().ok()?.detach(),
-                Kind::Tag => object.into_tag().target_id().ok()?.detach(),
-                Kind::Blob => return None,
+impl<'r> GetOid<'r> {
+    /// Every argument's trace, in argument order.
+    fn trace_args(repo: &'r gix::Repository, args: &[String]) -> Vec<ArgTrace> {
+        let enabled = crate::repo_settings::config_bool_strict(repo, "core.commitgraph").ok().flatten() != Some(false);
+        let graph = (enabled || crate::setup::git_env_bool("GIT_TEST_COMMIT_GRAPH", false))
+            && odb_sources(repo).iter().any(|objdir| {
+                let info = objdir.join("info");
+                info.join("commit-graph").exists() || info.join("commit-graphs").exists()
+            });
+        let mut sim = GetOid { repo, graph, parsed: HashSet::new(), typed: HashSet::new(), ops: Vec::new() };
+        args.iter().map(|arg| sim.trace(arg)).collect()
+    }
+
+    fn trace(&mut self, arg: &str) -> ArgTrace {
+        // `repo_get_oid()` turns a full-length hex id into an object id without
+        // consulting the odb, so an id that names nothing still reaches
+        // `snapshot_ref()`; every shorter or symbolic form has to resolve.
+        let resolved = self
+            .repo
+            .rev_parse_single(arg)
+            .map(|id| id.detach())
+            .ok()
+            .or_else(|| ObjectId::from_hex(arg.as_bytes()).ok());
+        let (parsed, typed) = (self.parsed.clone(), self.typed.clone());
+        let complete = matches!(self.repo_get_oid(arg), Ok(id) if id == resolved);
+        let ops = std::mem::take(&mut self.ops);
+        if !complete {
+            // What an unmodelled step would have parsed is unknown, so the later
+            // arguments are traced as if this one had parsed nothing.
+            (self.parsed, self.typed) = (parsed, typed);
+        }
+        let snapshot_parses = match resolved {
+            Some(id) if self.repo.has_object(id) => {
+                let parses = self.parsed.insert(id);
+                if parses {
+                    self.typed.insert(id);
+                    if let Ok(Ok(decoded)) = decode(self.repo, id) {
+                        self.typed.extend(decoded.children.iter().map(|(child, _)| *child));
+                    }
+                }
+                parses
+            }
+            _ => false,
+        };
+        ArgTrace { ops, complete, resolved, snapshot_parses }
+    }
+
+    /// `get_oid_with_context_1(repo, name, 0, NULL, …)` (object-name.c:1729-1860).
+    fn repo_get_oid(&mut self, name: &str) -> Step<Option<ObjectId>> {
+        if let Some(id) = self.get_oid_1(name)? {
+            return Ok(Some(id));
+        }
+        let bytes = name.as_bytes();
+        if let Some(rest) = name.strip_prefix(':') {
+            // `:/<text>` searches every ref's history, which is not modelled.
+            if bytes.len() > 2 && bytes[1] == b'/' {
+                return Err(Unmodelled);
+            }
+            let (stage, path) = match bytes.len() >= 3 && bytes[2] == b':' && (b'0'..=b'3').contains(&bytes[1]) {
+                true => (u32::from(bytes[1] - b'0'), &name[3..]),
+                false => (0, rest),
+            };
+            // `resolve_relative_path()` rewrites `./` and `../` against the prefix.
+            if path.starts_with("./") || path.starts_with("../") {
+                return Err(Unmodelled);
+            }
+            let index = self.repo.index_or_empty().map_err(|_| Unmodelled)?;
+            for entry in index.entries() {
+                if entry.path(&index) == path.as_bytes() && entry.stage_raw() == stage {
+                    // `reject_tree_in_index()` refuses a sparse directory entry.
+                    if entry.mode.is_sparse() {
+                        return Err(Unmodelled);
+                    }
+                    return Ok(Some(entry.id));
+                }
+            }
+            return Ok(None);
+        }
+        // The first `:` outside a `^{…}` or `@{…}` ends the revision.
+        let mut depth = 0usize;
+        let mut at = 0usize;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'@' | b'^' if bytes.get(at + 1) == Some(&b'{') => {
+                    at += 1;
+                    depth += 1;
+                }
+                b'}' if depth > 0 => depth -= 1,
+                b':' if depth == 0 => break,
+                _ => {}
+            }
+            at += 1;
+        }
+        if at == bytes.len() {
+            return Ok(None);
+        }
+        let Some(tree) = self.get_oid_1(&name[..at])? else {
+            return Ok(None);
+        };
+        let path = &name[at + 1..];
+        if path.starts_with("./") || path.starts_with("../") {
+            return Err(Unmodelled);
+        }
+        self.get_tree_entry(tree, path.as_bytes())
+    }
+
+    /// `get_oid_1()` (object-name.c:1083-1140).
+    fn get_oid_1(&mut self, name: &str) -> Step<Option<ObjectId>> {
+        // "name~3" is "name^^^", "name~" is "name~1", and "name^" is "name^1".
+        let bytes = name.as_bytes();
+        let mut cp = bytes.len();
+        while cp > 0 && bytes[cp - 1].is_ascii_digit() {
+            cp -= 1;
+        }
+        if cp > 0 && matches!(bytes[cp - 1], b'~' | b'^') {
+            let len1 = cp - 1;
+            let mut num: u32 = 0;
+            for &digit in &bytes[cp..] {
+                match num.checked_mul(10).and_then(|n| n.checked_add(u32::from(digit - b'0'))) {
+                    Some(n) => num = n,
+                    None => return Ok(None),
+                }
+            }
+            if num == 0 && cp == bytes.len() {
+                num = 1;
+            } else if num > i32::MAX as u32 {
+                return Ok(None);
+            }
+            return match bytes[len1] {
+                b'^' => self.get_parent(&name[..len1], num),
+                _ => self.get_nth_ancestor(&name[..len1], num),
             };
         }
-    };
-    let mut tree = peel(start, reads)?;
-    if path.is_empty() {
-        return Some(tree);
+        if let Some(id) = self.peel_onion(name)? {
+            return Ok(Some(id));
+        }
+        if let Some(id) = self.get_oid_basic(name)? {
+            return Ok(Some(id));
+        }
+        // `get_describe_name()`: a `<ref>-<n>-g<hex>` hands the hex to `get_short_oid()`.
+        let describe = (2..bytes.len()).rev().any(|cp| {
+            bytes[cp] == b'g'
+                && bytes[cp - 1] == b'-'
+                && bytes[cp + 1..].iter().all(u8::is_ascii_hexdigit)
+                && bytes[..cp - 1].last().is_some_and(u8::is_ascii_hexdigit)
+        });
+        if describe || self.short_oid_reads(name) {
+            return Err(Unmodelled);
+        }
+        Ok(None)
     }
-    if path.starts_with('/') || path.contains("//") {
-        return None;
+
+    /// Whether `get_short_oid()` would look `name` up as an abbreviation, which
+    /// reads every candidate (object-name.c:273, :501-560).
+    fn short_oid_reads(&self, name: &str) -> bool {
+        (4..=self.repo.object_hash().len_in_hex()).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit())
     }
-    let mut components = path.split('/').peekable();
-    while let Some(name) = components.next() {
-        let entry = repo
-            .find_object(tree)
-            .ok()?
-            .into_tree()
-            .decode()
-            .ok()?
-            .entries
-            .iter()
-            .find(|e| e.filename == name.as_bytes())
-            .map(|e| (e.oid.to_owned(), e.mode.is_tree()))?;
-        match components.peek() {
-            None => return Some(entry.0),
-            // `dir/`: the directory itself, before any recursion reads it.
-            Some(&"") if entry.1 => return Some(entry.0),
-            Some(_) if entry.1 => tree = peel(entry.0, reads)?,
-            Some(_) => return None,
+
+    /// `get_oid_basic()` (object-name.c:667-825) for the names it resolves
+    /// without reading an object: a full-length hex id, and a name
+    /// `repo_dwim_ref()` finds, whose `warn_ambiguous_refs` check asks
+    /// `get_short_oid()` about the name, which reads for a hex one. Reflog and
+    /// `@{…}` selectors are not modelled.
+    fn get_oid_basic(&mut self, name: &str) -> Step<Option<ObjectId>> {
+        let hexsz = self.repo.object_hash().len_in_hex();
+        if name.len() == hexsz {
+            if let Ok(id) = ObjectId::from_hex(name.as_bytes()) {
+                return Ok(Some(id));
+            }
+        }
+        if name.is_empty() || name == "@" || name.contains("@{") || self.short_oid_reads(name) {
+            return Err(Unmodelled);
+        }
+        if self.repo.find_reference(name).is_err() {
+            return Ok(None);
+        }
+        match self.repo.rev_parse_single(name) {
+            Ok(id) => Ok(Some(id.detach())),
+            Err(_) => Err(Unmodelled),
         }
     }
-    None
+
+    /// `peel_onion()` (object-name.c:907-1000).
+    fn peel_onion(&mut self, name: &str) -> Step<Option<ObjectId>> {
+        let bytes = name.as_bytes();
+        if bytes.len() < 4 || bytes[bytes.len() - 1] != b'}' {
+            return Ok(None);
+        }
+        let Some(open) = (1..bytes.len()).rev().find(|&at| bytes[at] == b'{' && bytes[at - 1] == b'^') else {
+            return Ok(None);
+        };
+        let sp = &name[open + 1..];
+        // `None` peels tags only (`OBJ_NONE`), `Some(None)` takes any type.
+        let expected: Option<Option<Kind>> = if sp.starts_with("commit}") || sp.starts_with('/') {
+            Some(Some(Kind::Commit))
+        } else if sp.starts_with("tag}") {
+            Some(Some(Kind::Tag))
+        } else if sp.starts_with("tree}") {
+            Some(Some(Kind::Tree))
+        } else if sp.starts_with("blob}") {
+            Some(Some(Kind::Blob))
+        } else if sp.starts_with("object}") {
+            Some(None)
+        } else if sp.starts_with('}') {
+            None
+        } else {
+            return Ok(None);
+        };
+        let Some(outer) = self.get_oid_1(&name[..open - 1])? else {
+            return Ok(None);
+        };
+        let mut kind = self.parse_object(outer)?;
+        let mut o = outer;
+        let Some(expected) = expected else {
+            // `deref_tag()` (tag.c:76-95) parses each tagged object in turn.
+            while kind == Kind::Tag {
+                o = self.tag_target(o)?.0;
+                kind = self.parse_object(o)?;
+            }
+            return Ok(Some(o));
+        };
+        // `repo_peel_to_type()` (object-name.c:882-905).
+        loop {
+            if !self.parsed.contains(&o) {
+                kind = self.parse_object(o)?;
+            }
+            if expected.is_none_or(|want| want == kind) {
+                break;
+            }
+            o = match kind {
+                Kind::Tag => self.tag_target(o)?.0,
+                Kind::Commit => self.commit_links(o)?.0,
+                Kind::Tree | Kind::Blob => {
+                    let want = expected.map_or("any", type_name);
+                    let have = type_name(kind);
+                    self.ops.push(ArgOp::Error(format!(
+                        "{name}: expected {want} type, but the object dereferences to {have} type"
+                    )));
+                    return Ok(None);
+                }
+            };
+            kind = self.kind_of(o)?;
+        }
+        match sp.strip_prefix('/') {
+            None | Some("}") => Ok(Some(o)),
+            Some(text) => self.get_oid_oneline(&text[..text.len() - 1], o),
+        }
+    }
+
+    /// `get_oid_oneline()` (object-name.c:1183-1236) from one commit: the
+    /// queue pops the newest commit first, a date tie in insertion order
+    /// (prio-queue.c), and `pop_most_recent_commit()` (commit.c:782-797)
+    /// parses each parent before the popped commit's buffer is read, which
+    /// `save_commit_buffer = 0` (builtin/fsck.c:880) leaves to
+    /// `repo_get_commit_buffer()`'s `odb_read_object()` (commit.c:380-399).
+    fn get_oid_oneline(&mut self, text: &str, start: ObjectId) -> Step<Option<ObjectId>> {
+        let (pattern, negative) = match text.strip_prefix('!') {
+            None => (text, false),
+            Some(rest) if rest.starts_with('-') => (&rest[1..], true),
+            Some(rest) if rest.starts_with('!') => (rest, false),
+            Some(_) => return Ok(None),
+        };
+        // A pattern the `regex` crate refuses may still be one `regcomp()` accepts.
+        let regex = crate::revfilter::build_regex(
+            pattern,
+            crate::revfilter::Dialect::Extended,
+            false,
+            crate::revfilter::Origin::CommandLine,
+        )
+        .map_err(|_| Unmodelled)?;
+        let mut queue: Vec<(i64, usize, ObjectId)> = Vec::new();
+        let mut seen: HashSet<ObjectId> = HashSet::new();
+        let mut ctr = 0usize;
+        seen.insert(start);
+        queue.push((self.commit_date(start)?, ctr, start));
+        ctr += 1;
+        while !queue.is_empty() {
+            let newest = (0..queue.len())
+                .max_by(|&a, &b| queue[a].0.cmp(&queue[b].0).then(queue[b].1.cmp(&queue[a].1)))
+                .expect("non-empty");
+            let (_, _, commit) = queue.swap_remove(newest);
+            for parent in self.commit_links(commit)?.1 {
+                if self.repo_parse_commit(parent)? && seen.insert(parent) {
+                    queue.push((self.commit_date(parent)?, ctr, parent));
+                    ctr += 1;
+                }
+            }
+            self.parse_object(commit)?;
+            self.ops.push(ArgOp::Read(commit));
+            let data = self.repo.find_object(commit).map_err(|_| Unmodelled)?.data.clone();
+            let matches = match data.windows(2).position(|w| w == b"\n\n") {
+                Some(at) => regex.is_match(&data[at + 2..]),
+                None => false,
+            };
+            if matches != negative {
+                return Ok(Some(commit));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `get_parent()` (object-name.c:827-855).
+    fn get_parent(&mut self, name: &str, idx: u32) -> Step<Option<ObjectId>> {
+        let Some(id) = self.get_oid_1(name)? else {
+            return Ok(None);
+        };
+        let Some(commit) = self.lookup_commit_reference(id)? else {
+            return Ok(None);
+        };
+        if idx == 0 {
+            return Ok(Some(commit));
+        }
+        Ok(self.commit_links(commit)?.1.get(idx as usize - 1).copied())
+    }
+
+    /// `get_nth_ancestor()` (object-name.c:857-880).
+    fn get_nth_ancestor(&mut self, name: &str, generation: u32) -> Step<Option<ObjectId>> {
+        let Some(id) = self.get_oid_1(name)? else {
+            return Ok(None);
+        };
+        let Some(mut commit) = self.lookup_commit_reference(id)? else {
+            return Ok(None);
+        };
+        for _ in 0..generation {
+            if !self.repo_parse_commit(commit)? {
+                return Ok(None);
+            }
+            match self.commit_links(commit)?.1.first() {
+                Some(&parent) => commit = parent,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(commit))
+    }
+
+    /// `lookup_commit_reference()` (commit.c:42-79): `peel_object_ext()`
+    /// (object.c:211-253) looks the id up, reads its type if it has none, and
+    /// parses its way down a tag chain; then `lookup_commit()` and
+    /// `repo_parse_commit_gently()`.
+    fn lookup_commit_reference(&mut self, id: ObjectId) -> Step<Option<ObjectId>> {
+        self.ops.push(ArgOp::Lookup(id));
+        let mut kind = self.kind_of(id)?;
+        if self.typed.insert(id) {
+            self.ops.push(ArgOp::Read(id));
+            self.ops.push(ArgOp::Typed(id));
+        }
+        let mut peeled = id;
+        while kind == Kind::Tag {
+            self.parse_object(peeled)?;
+            let (target, declared) = self.tag_target(peeled)?;
+            if self.kind_of(target)? != declared {
+                return Err(Unmodelled);
+            }
+            (peeled, kind) = (target, declared);
+        }
+        if kind != Kind::Commit {
+            self.ops.push(ArgOp::Error(format!("object {id} is a {}, not a commit", type_name(kind))));
+            return Ok(None);
+        }
+        self.ops.push(ArgOp::Lookup(peeled));
+        Ok(self.repo_parse_commit(peeled)?.then_some(peeled))
+    }
+
+    /// `repo_parse_commit()` (commit.c:600-660): nothing for a parsed commit,
+    /// else a read and `parse_commit_buffer()`.
+    fn repo_parse_commit(&mut self, id: ObjectId) -> Step<bool> {
+        if self.parsed.contains(&id) {
+            return Ok(true);
+        }
+        if self.graph || self.kind_of(id)? != Kind::Commit {
+            return Err(Unmodelled);
+        }
+        self.ops.push(ArgOp::Read(id));
+        self.parse_links(id)?;
+        self.ops.push(ArgOp::ParseCommit(id));
+        Ok(true)
+    }
+
+    /// `parse_object()` (object.c:322-378): returns at once for a parsed
+    /// object, else reads it and parses it, a commit's or tag's links created
+    /// with their types. Returns the object's type.
+    fn parse_object(&mut self, id: ObjectId) -> Step<Kind> {
+        let kind = self.kind_of(id)?;
+        if self.parsed.contains(&id) {
+            self.ops.push(ArgOp::Parse(id, false));
+            return Ok(kind);
+        }
+        self.ops.push(ArgOp::Read(id));
+        match kind {
+            Kind::Commit | Kind::Tag => self.parse_links(id)?,
+            Kind::Tree | Kind::Blob => {
+                self.parsed.insert(id);
+                self.typed.insert(id);
+            }
+        }
+        self.ops.push(ArgOp::Parse(id, true));
+        Ok(kind)
+    }
+
+    /// The parse of a commit or tag: it and every link it stores become typed.
+    /// A buffer the parse would reject is not modelled.
+    fn parse_links(&mut self, id: ObjectId) -> Step<()> {
+        let Ok(Ok(decoded)) = decode(self.repo, id) else {
+            return Err(Unmodelled);
+        };
+        self.parsed.insert(id);
+        self.typed.insert(id);
+        self.typed.extend(decoded.children.iter().map(|(child, _)| *child));
+        Ok(())
+    }
+
+    /// The object's type; an object no source holds is a read that misses.
+    fn kind_of(&self, id: ObjectId) -> Step<Kind> {
+        self.repo.find_header(id).map(|h| h.kind()).map_err(|_| Unmodelled)
+    }
+
+    /// A parsed tag's `tagged` object and the type the tag declares for it.
+    fn tag_target(&self, id: ObjectId) -> Step<(ObjectId, Kind)> {
+        match decode(self.repo, id) {
+            Ok(Ok(decoded)) => decoded.children.first().copied().ok_or(Unmodelled),
+            _ => Err(Unmodelled),
+        }
+    }
+
+    /// A parsed commit's tree and parents, as `parse_commit_buffer()` stored
+    /// them, grafts applied.
+    fn commit_links(&self, id: ObjectId) -> Step<(ObjectId, Vec<ObjectId>)> {
+        let Ok(Ok(decoded)) = decode(self.repo, id) else {
+            return Err(Unmodelled);
+        };
+        let mut links = decoded.children.iter().map(|(child, _)| *child);
+        let tree = links.next().ok_or(Unmodelled)?;
+        Ok((tree, links.collect()))
+    }
+
+    /// `commit->date`, the committer timestamp `parse_commit_date()` reads.
+    fn commit_date(&self, id: ObjectId) -> Step<i64> {
+        let commit = self.repo.find_commit(id).map_err(|_| Unmodelled)?;
+        commit.time().map(|t| t.seconds).map_err(|_| Unmodelled)
+    }
+
+    /// `get_tree_entry()` (tree-walk.c:605-635): `odb_read_object_peeled()`
+    /// (odb.c:760-808) reads `start` and follows a commit's tree or a tag's
+    /// target until it reads a tree, and `find_tree_entry()` (tree-walk.c:568-603)
+    /// walks its entries, recursing into the subtree a `<dir>/<rest>` names.
+    /// Raw buffers only: nothing is parsed or looked up.
+    fn get_tree_entry(&mut self, start: ObjectId, name: &[u8]) -> Step<Option<ObjectId>> {
+        let mut id = start;
+        let tree = loop {
+            let object = self.repo.find_object(id).map_err(|_| Unmodelled)?;
+            self.ops.push(ArgOp::Read(id));
+            id = match object.kind {
+                Kind::Tree => break object.into_tree(),
+                Kind::Commit => object.into_commit().tree_id().map_err(|_| Unmodelled)?.detach(),
+                Kind::Tag => object.into_tag().target_id().map_err(|_| Unmodelled)?.detach(),
+                Kind::Blob => return Ok(None),
+            };
+        };
+        if name.is_empty() {
+            return Ok(Some(id));
+        }
+        let entries: Vec<(Vec<u8>, ObjectId, bool)> = tree
+            .decode()
+            .map_err(|_| Unmodelled)?
+            .entries
+            .iter()
+            .map(|e| (e.filename.to_vec(), e.oid.to_owned(), e.mode.is_tree()))
+            .collect();
+        for (entry, oid, is_dir) in entries {
+            let len = entry.len();
+            if len > name.len() {
+                continue;
+            }
+            match name[..len].cmp(&entry[..]) {
+                std::cmp::Ordering::Greater => continue,
+                std::cmp::Ordering::Less => break,
+                std::cmp::Ordering::Equal => {}
+            }
+            if len == name.len() {
+                return Ok(Some(oid));
+            }
+            if name[len] != b'/' {
+                continue;
+            }
+            if !is_dir {
+                break;
+            }
+            if len + 1 == name.len() {
+                return Ok(Some(oid));
+            }
+            return self.get_tree_entry(oid, &name[len + 1..]);
+        }
+        Ok(None)
+    }
+}
+
+/// `type_name()`.
+fn type_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Commit => "commit",
+        Kind::Tree => "tree",
+        Kind::Blob => "blob",
+        Kind::Tag => "tag",
+    }
+}
+
+/// The `obj_hash` side of one argument's [`ArgTrace`], and its `error()` lines;
+/// the first odb read also prepares the source (see [`MidxRetry`]). An
+/// incomplete trace replays only its `error()` lines, which the steps before the
+/// first one not modelled printed.
+fn replay_arg_ops(
+    repo: &gix::Repository,
+    state: &mut State,
+    pre_parsed: &mut HashSet<ObjectId>,
+    graph: &mut ProcessGraph<'_>,
+    midx_retry: &mut MidxRetry,
+    trace: &ArgTrace,
+) -> Result<()> {
+    for op in &trace.ops {
+        match op {
+            ArgOp::Error(line) => eprintln!("error: {line}"),
+            _ if !trace.complete => {}
+            ArgOp::Read(_) => midx_retry.read(),
+            ArgOp::Parse(id, parses) => parse_object_ops(repo, state, pre_parsed, graph, *id, *parses)?,
+            ArgOp::ParseCommit(id) => {
+                if let Ok(Ok(decoded)) = decode(repo, *id) {
+                    state.typed.insert(*id);
+                    for (child, _) in &decoded.children {
+                        state.note(*child);
+                        state.typed.insert(*child);
+                    }
+                    pre_parsed.insert(*id);
+                }
+            }
+            ArgOp::Lookup(id) => {
+                state.note(*id);
+            }
+            ArgOp::Typed(id) => {
+                state.typed.insert(*id);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every pack's object count in `objdir`, for a source whose list order is not
@@ -4619,10 +5048,15 @@ impl MidxRetry {
 /// whose first read prepares it alone (odb.c:561-568); a linked worktree, whose HEAD
 /// and index this port takes outside the snapshot; promised objects, whose
 /// `is_promisor_object()` pass reads on its own; a commit-graph, whose verify child
-/// prepares in its own process; an argument `repo_get_oid()` may read for (a
-/// revision expression or an abbreviated id, object-name.c:501); and a loose object
+/// prepares in its own process; an argument whose `repo_get_oid()` reads [`GetOid`] does not
+/// trace in full (an abbreviated id, object-name.c:501, among others); and a loose object
 /// that will not open or inflate, whose failed reads interleave their own lines.
-fn midx_retry_unmodelled(repo: &gix::Repository, opt: &Options, sources: usize) -> Option<&'static str> {
+fn midx_retry_unmodelled(
+    repo: &gix::Repository,
+    opt: &Options,
+    sources: usize,
+    arg_traces: &mut Option<Vec<ArgTrace>>,
+) -> Option<&'static str> {
     if sources > 1 {
         return Some("this port does not order the prepares of several sources");
     }
@@ -4639,14 +5073,24 @@ fn midx_retry_unmodelled(repo: &gix::Repository, opt: &Options, sources: usize) 
         return Some("the commit-graph verify child's own prepares are not modelled");
     }
     let hexsz = repo.object_hash().len_in_hex();
-    for arg in &opt.objects {
-        let full_hex = arg.len() == hexsz && ObjectId::from_hex(arg.as_bytes()).is_ok();
-        let hex_like = arg.len() >= 4 && arg.bytes().all(|b| b.is_ascii_hexdigit());
-        let resolves = repo.rev_parse_single(arg.as_str()).is_ok();
-        let plain_ref = arg == "HEAD" || repo.find_reference(arg.as_str()).is_ok();
-        if !(full_hex || plain_ref || (!resolves && !hex_like)) {
-            return Some("this port does not replay the reads `repo_get_oid()` makes for this argument");
+    let unreplayed = "this port does not replay the reads `repo_get_oid()` makes for this argument";
+    // The first read an argument's resolution makes prepares the source, and the replay
+    // places it for a trace [`GetOid`] models in full, which makes no read that misses.
+    // Tracing parses commits, and the first parse reads `info/grafts`, whose advice would
+    // then print ahead of this prepare's line; with a graft file only the names that
+    // read nothing are taken.
+    if repo.graft_file().exists() {
+        for arg in &opt.objects {
+            let full_hex = arg.len() == hexsz && ObjectId::from_hex(arg.as_bytes()).is_ok();
+            let hex_like = arg.len() >= 4 && arg.bytes().all(|b| b.is_ascii_hexdigit());
+            let resolves = repo.rev_parse_single(arg.as_str()).is_ok();
+            let plain_ref = arg == "HEAD" || repo.find_reference(arg.as_str()).is_ok();
+            if !(full_hex || plain_ref || (!resolves && !hex_like)) {
+                return Some(unreplayed);
+            }
         }
+    } else if arg_traces.get_or_insert_with(|| GetOid::trace_args(repo, &opt.objects)).iter().any(|t| !t.complete) {
+        return Some(unreplayed);
     }
     let mut unreadable = false;
     for_each_loose_file_in_source(&odb_sources(repo)[0], &mut |step| match step {

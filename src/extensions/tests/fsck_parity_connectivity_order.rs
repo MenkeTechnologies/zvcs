@@ -172,7 +172,61 @@ fn dangling_order_over_loose_and_duplicated_objects() {
 fn dangling_order_over_packs_of_one_mtime() {
     let Some(stock) = stock_git::stock_git() else { return };
     let root = scratch("tie");
-    let repo = history(stock, &root, 80, 40);
+    let repo = packs_of_one_mtime(stock, &root);
+    for rev in ["HEAD^{tree}", "HEAD^{commit}", "HEAD^{}", "t^{tree}", "t^{}", "HEAD^{tree}:d0"] {
+        for args in [
+            &["fsck", "--connectivity-only", rev][..],
+            &["fsck", "--connectivity-only", "--unreachable", rev],
+            &["fsck", "--connectivity-only", "--verbose", rev],
+            &["fsck", rev],
+        ] {
+            let (code, out, _) = same(stock, &repo, args);
+            assert_eq!(code, 0, "{args:?}");
+            assert!(out.contains("dangling") || out.contains("unreachable"), "{args:?}: {out}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same tie under the other revision shapes `repo_get_oid()` reads for:
+/// `get_nth_ancestor()` / `get_parent()` (object-name.c:827-880) look the commit up,
+/// read its type and parse it and each ancestor down to the one asked for; `<rev>:<path>`
+/// reads the trees down to the entry (tree-walk.c:568-635); `^{/<regex>}` parses each
+/// commit it queues and reads each one it pops (object-name.c:1183-1236). An argument that
+/// fails has read just the same, and a peel that ends on the wrong type says so first
+/// (object-name.c:882-905), as does a parent step from a non-commit (commit.c:42-79).
+#[test]
+fn dangling_order_over_packs_of_one_mtime_for_revision_arguments() {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let root = scratch("tie-revs");
+    let repo = packs_of_one_mtime(stock, &root);
+    let resolving = ["HEAD~3", "HEAD^", "t~2", "HEAD~1:d0", ":d0/f0", "HEAD^{/c7}", "HEAD~2^{/c5}", "HEAD~3 HEAD~1"];
+    let failing = ["HEAD^2", "HEAD~100", "HEAD^{blob}", "HEAD^{tree}~1", "HEAD:nosuch", "HEAD^{/nomatch}"];
+    for rev in resolving.iter().chain(&failing) {
+        let revs: Vec<&str> = rev.split(' ').collect();
+        for form in [
+            &["fsck", "--connectivity-only"][..],
+            &["fsck", "--connectivity-only", "--unreachable"],
+            &["fsck", "--connectivity-only", "--verbose"],
+            &["fsck"],
+        ] {
+            let args: Vec<&str> = form.iter().copied().chain(revs.iter().copied()).collect();
+            let (code, out, _) = same(stock, &repo, &args);
+            assert_eq!(code, i32::from(failing.contains(rev)), "{args:?}");
+            assert!(out.contains("dangling") || out.contains("unreachable"), "{args:?}: {out}");
+        }
+    }
+    let (_, _, err) = same(stock, &repo, &["fsck", "HEAD^{blob}"]);
+    assert!(err.starts_with("error: HEAD^{blob}: expected blob type, but the object dereferences to tree type\n"), "{err}");
+    let (_, _, err) = same(stock, &repo, &["fsck", "HEAD^{tree}~1"]);
+    assert!(err.contains(", not a commit\nerror: invalid parameter: expected sha1, got 'HEAD^{tree}~1'\n"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [`history`] repacked into two packs whose `.pack` files share one mtime, with a tag
+/// `t` of `HEAD~7`.
+fn packs_of_one_mtime(stock: &str, root: &Path) -> PathBuf {
+    let repo = history(stock, root, 80, 40);
     setup(stock, &repo, &["repack", "-q", "-a"]);
     let tag = setup(stock, &repo, &["rev-parse", "HEAD~7"]);
     let tag = setup_in(
@@ -193,19 +247,7 @@ fn dangling_order_over_packs_of_one_mtime() {
         }
     }
     assert_eq!(packs, 2);
-    for rev in ["HEAD^{tree}", "HEAD^{commit}", "HEAD^{}", "t^{tree}", "t^{}", "HEAD^{tree}:d0"] {
-        for args in [
-            &["fsck", "--connectivity-only", rev][..],
-            &["fsck", "--connectivity-only", "--unreachable", rev],
-            &["fsck", "--connectivity-only", "--verbose", rev],
-            &["fsck", rev],
-        ] {
-            let (code, out, _) = same(stock, &repo, args);
-            assert_eq!(code, 0, "{args:?}");
-            assert!(out.contains("dangling") || out.contains("unreachable"), "{args:?}: {out}");
-        }
-    }
-    let _ = std::fs::remove_dir_all(&root);
+    repo
 }
 
 /// Two packs and loose objects, a deleted branch whose history only the reflog keeps, and

@@ -252,3 +252,25 @@ fn a_midx_that_fails_to_load_is_reported_on_every_prepare() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Revision arguments under a midx that fails to load: the first read an argument's
+/// `repo_get_oid()` makes prepares the source, so the retried midx's line lands ahead of
+/// an argument's own `error()` lines, and an argument that fails after reading (`HEAD~5`
+/// walks off the root) still prepares it (object-name.c:827-880, :907-1000, tree-walk.c:605-635).
+#[test]
+fn a_midx_that_fails_to_load_is_reported_from_a_revision_arguments_first_read() {
+    let Some(stock) = stock_git::stock_git() else { return };
+    let root = scratch("revargs");
+    let repo = damaged(stock, &root, "small");
+    for rev in ["HEAD~1:f1", "HEAD~1", "HEAD^", "HEAD:f1", ":f1", "HEAD^{/c1}", "HEAD^{blob}", "HEAD~5", "HEAD~2 HEAD~1:f1"] {
+        let revs: Vec<&str> = rev.split(' ').collect();
+        for form in FSCK.iter().copied().chain([&["fsck", "--name-objects", "--unreachable"][..]]) {
+            let args: Vec<&str> = form.iter().copied().chain(revs.iter().copied()).collect();
+            let (_, _, err) = same(stock, &repo, &args);
+            assert!(err.contains("error: multi-pack-index file"), "{args:?}: {err}");
+        }
+    }
+    let (_, _, err) = same(stock, &repo, &["fsck", "HEAD^{blob}"]);
+    assert!(err.contains("error: HEAD^{blob}: expected blob type, but the object dereferences to tree type\n"), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}

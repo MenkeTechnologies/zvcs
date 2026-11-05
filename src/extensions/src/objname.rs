@@ -3320,7 +3320,7 @@ fn read_ref_at(
 /// `repo_dwim_log()`'s `logs_found`: how many `ref_rev_parse_rules` spellings of
 /// `name` both resolve and have a reflog. It is the count `get_oid_basic()` tests
 /// for the ambiguity warning.
-fn dwim_log_matches(repo: &gix::Repository, name: &str) -> usize {
+pub(crate) fn dwim_log_matches(repo: &gix::Repository, name: &str) -> usize {
     dwim_log(repo, name).0
 }
 

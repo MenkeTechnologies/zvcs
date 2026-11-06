@@ -446,6 +446,12 @@ fn status_repo(
             continue;
         }
 
+        if let Some(msg) = workdir.as_deref().and_then(|wd| broken_gitfile_fatal(wd, entry.path.as_bstr())) {
+            out.flush()?;
+            eprintln!("fatal: {msg}");
+            return Ok(128);
+        }
+
         // git prints `-` when the submodule is not active, or when `<path>/.git`
         // does not resolve to a git directory.
         let sub_repo = match workdir.as_ref() {
@@ -1649,6 +1655,11 @@ fn foreach_repo(
             continue;
         };
         let sm_dir = workdir.join(&*gix::path::from_bstr(entry.path.as_bstr()));
+        if let Some(msg) = broken_gitfile_fatal(&workdir, entry.path.as_bstr()) {
+            std::io::stdout().flush()?;
+            eprintln!("fatal: {msg}");
+            return Ok(128);
+        }
         let Ok(sub_repo) = gix::open(&sm_dir) else {
             continue;
         };
@@ -1988,6 +1999,11 @@ fn sync_one(
     // Superproject `submodule.<name>.url` — git's `git_config_set_gently`.
     config.set_raw_value_by("submodule", Some(sub_name), "url", url_bytes.as_bstr())?;
 
+    if let Some(msg) = repo.workdir().and_then(|wd| broken_gitfile_fatal(wd, path.as_bstr())) {
+        std::io::stdout().flush()?;
+        eprintln!("fatal: {msg}");
+        return Ok(SyncOne::Failed(128));
+    }
     // `is_submodule_populated_gently`: no repository on disk means git stops
     // here (the remote-url rewrite and any recursion are skipped).
     let sub_repo = repo
@@ -2587,11 +2603,16 @@ fn deinit_one(
         // `git rm -qn <path>`: a dry run whose only job is to refuse when the
         // worktree carries changes that removing it would throw away.
         if !force {
-            let dry = crate::dispatch::run(
-                "rm",
-                &["-qn".to_string(), path.to_str_lossy().into_owned()],
-            )?;
-            if dry != ExitCode::SUCCESS {
+            // A child, as `cp_rm.git_cmd = 1` makes it (submodule--helper.c:1617-1625), run
+            // from the top of the work tree: whatever it dies with is its own stderr line,
+            // and only its exit status reaches this test.
+            let exe = crate::hosted::git_exe()?;
+            let dry = std::process::Command::new(exe)
+                .args(["rm", "-qn"])
+                .arg(gix::path::from_bstr(path.as_bstr()).as_ref())
+                .current_dir(workdir)
+                .status()?;
+            if !dry.success() {
                 crate::git_fatal!(
                     "Submodule work tree '{display}' contains local modifications; use '-f' to discard them"
                 );
@@ -2607,7 +2628,9 @@ fn deinit_one(
             }
             std::io::stdout().flush()?;
         }
-        unset_core_worktree(repo, sub_name.as_bstr(), display);
+        // submodule_unset_core_worktree() warns with `sub->path`, not the display path
+        // (submodule.c:2069-2071).
+        unset_core_worktree(repo, sub_name.as_bstr(), &path.to_str_lossy());
     }
 
     // git recreates the (now empty) directory so the gitlink keeps a mount
@@ -2655,20 +2678,41 @@ fn deinit_one(
 /// `repo_config_set_in_file_gently(..., NULL)`, which answers `CONFIG_NOTHING_SET`
 /// for an absent key, so a second `deinit` of the same submodule warns even
 /// though the first one already left the config in the wanted state.
+///
+/// A submodule that was never cloned has no `modules/<name>/config`, and the
+/// lock git takes on it first fails, so `error_errno()` reports that ahead of the
+/// warning (config.c:3066-3072), naming the file as `git_path()` spells it.
 pub(crate) fn unset_core_worktree(repo: &gix::Repository, name: &BStr, display: &str) {
     let unset = || -> Result<bool> {
         let path = submodule_name_to_gitdir(repo, name)?.join("config");
         let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-        let mut config = ConfigFile::from_path_no_includes(path.clone(), Source::Local)?;
-        let removed = config
-            .section_mut("core", None)
-            .ok()
-            .and_then(|mut section| section.remove("worktree"))
-            .is_some();
-        if removed {
-            persist(&path, &config)?;
+        let result = crate::config_store::set_multivar_in_file(
+            &path,
+            "core.worktree",
+            "core.worktree",
+            "core".len(),
+            None,
+            crate::config_store::ValuePattern::Any,
+            None,
+            false,
+        );
+        match result {
+            Ok(()) => Ok(true),
+            Err(crate::config_store::StoreError::Io(err)) => {
+                let shown = repo.git_dir().join("modules").join(gix::path::from_bstr(name).as_ref());
+                eprintln!(
+                    "error: could not lock config file {}: {}",
+                    crate::setup::git_path_display(repo, &shown.join("config")),
+                    super::config::errno_text(&err)
+                );
+                Ok(false)
+            }
+            Err(crate::config_store::StoreError::InvalidFile) => {
+                eprintln!("error: invalid config file {}", path.display());
+                Ok(false)
+            }
+            Err(_) => Ok(false),
         }
-        Ok(removed)
     };
     if !matches!(unset(), Ok(true)) {
         eprintln!("warning: Could not unset core.worktree setting in submodule '{display}'");
@@ -2807,6 +2851,18 @@ fn absorb_one(
     // `absorb_git_dir_into_superproject_recurse`: the same pass inside the
     // submodule, with the display prefix extended by this path.
     let Ok(sub_repo) = gix::open(&sm_dir) else {
+        // The recursion is a `git submodule--helper absorbgitdirs` child run in <path>
+        // (submodule.c:2538-2548), whose setup dies first on a `.git` that still leads
+        // to no repository, setup_git_directory_gently_1() reading it through read_gitfile_gently() (setup.c:1634-1670).
+        let dot_git = sm_dir.join(".git");
+        if !crate::porcelain::rev_parse::is_git_directory(&dot_git) {
+            if let Err(err) = crate::porcelain::rev_parse::read_gitfile_gently(&dot_git) {
+                eprintln!(
+                    "fatal: {}",
+                    crate::porcelain::rev_parse::gitfile_error_message(std::path::Path::new(".git"), err)
+                );
+            }
+        }
         crate::git_fatal!("could not recurse into submodule '{path}'");
     };
     let nested = format!("{}{path}/", super_prefix.unwrap_or(""));
@@ -2886,16 +2942,16 @@ fn real_path(path: &std::path::Path) -> std::path::PathBuf {
 
 // ---------------------------------------------------------------- update ----
 
-/// The integration strategy a `git submodule update` may run per submodule,
-/// restricted to the three that reduce to a re-exec of a ported zvcs command
-/// (`checkout`/`merge`/`rebase`). git's `SM_UPDATE_NONE` is a skip and
-/// `SM_UPDATE_COMMAND` (`update = !<cmd>`) runs an arbitrary shell command, so
-/// neither is represented here.
-#[derive(Clone, Copy, PartialEq)]
+/// The integration strategy a `git submodule update` runs per submodule: the
+/// three that re-exec a ported zvcs command (`checkout`/`merge`/`rebase`), and
+/// `SM_UPDATE_COMMAND`, the `update = !<cmd>` of `.git/config` run through the
+/// shell. git's `SM_UPDATE_NONE` is a skip and never reaches this type.
+#[derive(Clone, PartialEq)]
 enum UpdateStrategy {
     Checkout,
     Merge,
     Rebase,
+    Command(String),
 }
 
 /// The flags of `git submodule update` this port honors.
@@ -3154,9 +3210,13 @@ fn update_repo(
         Err(code) => return Ok(code),
     };
     let submodules = submodules(&repo)?;
-    let Some(workdir) = repo.workdir().map(ToOwned::to_owned) else {
+    if repo.workdir().is_none() {
         return Ok(0);
-    };
+    }
+    // `clone_data_path` is `repo_get_work_tree()` + "/" + path (submodule--helper.c:1918-1920),
+    // the resolved top `setup_git_directory()` chdir'd to, so run from `super/d` the
+    // "Cloning into" line names `/…/super/s2`, never the discovered `/…/super/d/../s2`.
+    let workdir = git_directory_cwd(&repo)?;
 
     // git's `update_submodules` runs in two phases: `run_processes_parallel` clones every
     // submodule that needs one, up to `max_jobs` at a time, and only then does a serial pass
@@ -3261,24 +3321,29 @@ fn update_repo(
         let (display, sm_dir, cfg_strategy) = (display.as_str(), sm_dir.as_path(), cfg_strategy.clone());
         let just_cloned = clone_url.is_some();
 
+        // `ensure_core_worktree()` opens the checkout before anything else, and a
+        // `.git` that leads to no repository (a removed `modules/<name>`) is its
+        // die_message() with the bare path (submodule--helper.c:2727-2729, :2962).
         let Ok(sub_repo) = gix::open(sm_dir) else {
-            crate::git_fatal!("submodule path '{display}' could not be opened after cloning");
+            crate::git_fatal!("could not get a repository handle for submodule '{}'", entry.path);
         };
 
         // git's `determine_submodule_update_strategy`: the command-line override,
         // else the config/.gitmodules value, else checkout; a just-cloned submodule
         // then downgrades merge/rebase (and none) to checkout.
-        let strategy = match opts.update_default {
+        let strategy = match opts.update_default.clone() {
             Some(s) => s,
             None => match cfg_strategy {
                 gix::submodule::config::Update::Checkout
                 | gix::submodule::config::Update::None => UpdateStrategy::Checkout,
                 gix::submodule::config::Update::Merge => UpdateStrategy::Merge,
                 gix::submodule::config::Update::Rebase => UpdateStrategy::Rebase,
-                gix::submodule::config::Update::Command(_) => bail!(
-                    "submodule '{}' configures `update = !<command>`; running an arbitrary command strategy is not ported",
-                    entry.path
-                ),
+                // `parse_submodule_update_strategy()` keeps what follows the `!`
+                // (submodule-config.c:183-185); `.gitmodules` never gets this far, as
+                // `submodule init` registers its command as `none`.
+                gix::submodule::config::Update::Command(command) => {
+                    UpdateStrategy::Command(command.to_str_lossy().into_owned())
+                }
             },
         };
         let strategy = if just_cloned {
@@ -3656,8 +3721,16 @@ fn run_update_command(
 ) -> Result<u8> {
     let hex = oid.to_hex().to_string();
     let exe = crate::hosted::git_exe()?;
-    let mut cmd = std::process::Command::new(exe);
-    match strategy {
+    // `cp.use_shell = 1` with the command and the id as two arguments: run_command()'s
+    // prepare_shell_cmd() appends `"$@"` when the command holds shell metacharacters and
+    // runs `sh -c '<command> "$@"' '<command>' <oid>`, and execs it directly otherwise
+    // (run-command.c:275-309).
+    let mut cmd = match &strategy {
+        UpdateStrategy::Command(command) => crate::external::prepare_shell_cmd(std::ffi::OsStr::new(command.as_str()), [hex.as_str()]),
+        _ => std::process::Command::new(exe),
+    };
+    match &strategy {
+        UpdateStrategy::Command(_) => {}
         UpdateStrategy::Checkout => {
             cmd.arg("checkout").arg("-q");
             if subforce {
@@ -3677,14 +3750,28 @@ fn run_update_command(
             }
         }
     }
-    cmd.arg(&hex);
+    if !matches!(strategy, UpdateStrategy::Command(_)) {
+        cmd.arg(&hex);
+    }
     submodule_child_env(&mut cmd, sm_dir);
-    let status = cmd.status()?;
-    let code = child_code(status);
+    let code = match (cmd.status(), &strategy) {
+        (Ok(status), _) => child_code(status),
+        // start_command()'s error_errno("cannot run %s") for a program that cannot be
+        // exec'd (run-command.c:761); run_command() then answers -1, still a failure.
+        (Err(err), UpdateStrategy::Command(command)) => {
+            eprintln!("error: cannot run {command}: {}", crate::external::strerror(&err));
+            1
+        }
+        (Err(err), _) => return Err(err.into()),
+    };
     if code != 0 {
         // git's checkout branch keeps `git checkout`'s exit code; merge/rebase
         // replace it with `die_message`'s 128.
-        return Ok(match strategy {
+        return Ok(match &strategy {
+            UpdateStrategy::Command(command) => {
+                eprintln!("fatal: Execution of '{command} {hex}' failed in submodule path '{display}'");
+                128
+            }
             UpdateStrategy::Checkout => {
                 eprintln!("fatal: Unable to checkout '{hex}' in submodule path '{display}'");
                 code
@@ -3700,7 +3787,8 @@ fn run_update_command(
         });
     }
     if !quiet {
-        match strategy {
+        match &strategy {
+            UpdateStrategy::Command(command) => println!("Submodule path '{display}': '{command} {hex}'"),
             UpdateStrategy::Checkout => {
                 println!("Submodule path '{display}': checked out '{hex}'")
             }
@@ -4053,6 +4141,56 @@ fn compute_alternate_path(path: &std::path::Path) -> std::result::Result<(), Str
         return Err(format!("reference repository '{}' is grafted", path.display()));
     }
     Ok(())
+}
+
+/// The `die()` that `read_gitfile(<path>/.git)` in status_submodule() and
+/// `is_submodule_populated_gently(path, NULL)` in the foreach and sync callbacks reach
+/// (submodule--helper.c:774-776, :350, :1481): `resolve_gitdir_gently()` takes a git
+/// directory as it is (setup.c:2169-2174), and otherwise `read_gitfile_gently()` with
+/// no error-code pointer dies on everything but a missing or non-regular `.git`
+/// (setup.c:925-951), naming the `<path>/.git` it was handed, relative to the top.
+fn broken_gitfile_fatal(workdir: &std::path::Path, path: &BStr) -> Option<String> {
+    use crate::porcelain::rev_parse::{gitfile_error_message, is_git_directory, read_gitfile_gently};
+    let shown = format!("{path}/.git");
+    let dot_git = workdir.join(&shown);
+    if is_git_directory(&dot_git) {
+        return None;
+    }
+    read_gitfile_gently(&dot_git)
+        .err()
+        .map(|err| gitfile_error_message(std::path::Path::new(&shown), err))
+}
+
+/// `append_fetch_remotes()` (submodule--helper.c:3383-3407): `git remote -v` run
+/// with `GIT_DIR=<gitdir>` and `GIT_WORK_TREE=.`, keeping each ` (fetch)` line, suffix
+/// stripped, as `  <name>\t<url>\n`. A child that fails contributes nothing.
+fn fetch_remotes(git_dir: &std::path::Path) -> String {
+    let mut msg = String::new();
+    let Ok(exe) = crate::hosted::git_exe() else {
+        return msg;
+    };
+    let out = std::process::Command::new(exe)
+        .args(["remote", "-v"])
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", ".")
+        .stderr(std::process::Stdio::inherit())
+        .output();
+    let Ok(out) = out else {
+        return msg;
+    };
+    if !out.status.success() {
+        return msg;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Only lines that end in `\n` are looked at, as the `strchr(line, '\n')` loop does.
+    let mut rest = text.as_ref();
+    while let Some(end) = rest.find('\n') {
+        if let Some(line) = rest[..end].strip_suffix(" (fetch)") {
+            msg.push_str(&format!("  {line}\n"));
+        }
+        rest = &rest[end + 1..];
+    }
+    msg
 }
 
 /// `read_gitfile()`: the path a `gitdir: <path>` file points at, resolved against
@@ -4986,10 +5124,11 @@ fn pathdiff_relative(from: &std::path::Path, to: &std::path::Path) -> String {
 /// worktree being deleted, and the absolute path is why git's `Cloning into
 /// '/…/other'…` line is absolute where a plain `git clone other` is not.
 ///
-/// Deliberate scope: `--reference`/`--dissociate`/`--ref-format` are not
-/// accepted.
+/// Deliberate scope: `--ref-format` is not accepted.
 fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     let mut force = false;
+    let mut reference: Option<String> = None;
+    let mut dissociate = false;
     let mut progress = false;
     let mut name: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -5031,6 +5170,10 @@ fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
             "--name" => name = Some(value(inline)?),
             "-b" | "--branch" => branch = Some(value(inline)?),
             "--depth" => depth = Some(value(inline)?),
+            // `--reference) reference="--reference=$2"` and `--dissociate) dissociate=$1`
+            // (git-submodule.sh:90-107): one reference, the last one given.
+            "--reference" => reference = Some(value(inline)?),
+            "--dissociate" => dissociate = true,
             other => bail!("`submodule add {other}` is not ported"),
         }
         i += 1;
@@ -5241,9 +5384,10 @@ fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     } else {
         if sm_gitdir.is_dir() {
             if !force {
+                let remotes = fetch_remotes(&sm_gitdir);
                 crate::git_fatal!(
                     "A git directory for '{name}' is found locally with remote(s):\n\
-                     If you want to reuse this local git directory instead of cloning again from\n  \
+                     {remotes}If you want to reuse this local git directory instead of cloning again from\n  \
                      {realrepo}\nuse the '--force' option. If the local git directory is not the \
                      correct repo\nor you are unsure what this means choose another name with the \
                      '--name' option."
@@ -5255,34 +5399,75 @@ fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
             std::fs::create_dir_all(parent)?;
         }
 
-        let exe = crate::hosted::git_exe()?;
-        let mut cmd = std::process::Command::new(exe);
-        // git passes `--no-checkout` here and leaves the worktree to the `checkout -f -q`
-        // below. This port does not, for the reason [`clone_submodule`] documents: its
-        // `checkout` cannot populate a worktree from the absent index a `--no-checkout`
-        // clone leaves behind. Same end state, one extra worktree write.
-        cmd.arg("clone");
-        if quiet {
-            cmd.arg("--quiet");
-        }
-        if progress {
-            cmd.arg("--progress");
-        }
-        if let Some(depth) = &depth {
-            cmd.arg(format!("--depth={depth}"));
-        }
-        cmd.arg("--separate-git-dir").arg(&sm_gitdir);
-        cmd.arg("--").arg(&realrepo).arg(&abs);
-        cmd.current_dir(&workdir)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_PREFIX");
-        if child_code(cmd.status()?) != 0 {
-            crate::git_fatal!(
-                "clone of '{realrepo}' into submodule path '{}' failed",
-                abs.display()
+        // clone_submodule() clones only when `modules/<name>` is absent; a reactivated
+        // git directory keeps its objects, gets its work tree directory and loses its
+        // stale index, so the `checkout -f -q` below rebuilds both (submodule--helper.c:
+        // 1921-1992).
+        if !sm_gitdir.exists() {
+            let exe = crate::hosted::git_exe()?;
+            let mut cmd = std::process::Command::new(exe);
+            // git passes `--no-checkout` here and leaves the worktree to the `checkout -f -q`
+            // below. This port does not, for the reason [`clone_submodule`] documents: its
+            // `checkout` cannot populate a worktree from the absent index a `--no-checkout`
+            // clone leaves behind. Same end state, one extra worktree write.
+            cmd.arg("clone");
+            if quiet {
+                cmd.arg("--quiet");
+            }
+            if progress {
+                cmd.arg("--progress");
+            }
+            if let Some(depth) = &depth {
+                cmd.arg(format!("--depth={depth}"));
+            }
+            // clone_submodule() hands the clone `--reference` for the given repository and
+            // for each one prepare_possible_alternates() finds through
+            // `submodule.alternateLocation`, then `--dissociate` (submodule--helper.c:1929-1951).
+            let mut references: Vec<String> = reference.iter().cloned().collect();
+            let mut notes = CloneOutput { code: 0, stdout: Vec::new(), stderr: Vec::new() };
+            let alternates = prepare_possible_alternates(
+                &AlternateSetup::from_repo(&repo),
+                name.as_str().into(),
+                &mut references,
+                &mut notes,
             );
+            std::io::stderr().write_all(&notes.stderr)?;
+            if let Err(fatal) = alternates {
+                std::io::stderr().write_all(fatal.as_bytes())?;
+                return Ok(ExitCode::from(128));
+            }
+            for reference in &references {
+                cmd.arg("--reference").arg(reference);
+            }
+            if dissociate {
+                cmd.arg("--dissociate");
+            }
+            cmd.arg("--separate-git-dir").arg(&sm_gitdir);
+            cmd.arg("--").arg(&realrepo).arg(&abs);
+            cmd.current_dir(&workdir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_PREFIX");
+            if child_code(cmd.status()?) != 0 {
+                crate::git_fatal!(
+                    "clone of '{realrepo}' into submodule path '{}' failed",
+                    abs.display()
+                );
+            }
+        } else {
+            std::fs::create_dir_all(&abs)?;
+            if let Err(err) = std::fs::remove_file(sm_gitdir.join("index")) {
+                // unlink_or_warn() (wrapper.c:679-707).
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: unable to unlink '{}': {}",
+                        sm_gitdir.join("index").display(),
+                        crate::external::strerror(&err)
+                    );
+                }
+            }
+            connect_work_tree_and_git_dir(&abs, &sm_gitdir)?;
         }
 
         // `strvec_pushl(&cp.args, "checkout", "-f", "-q", NULL)` with `cp.dir =
@@ -5319,16 +5504,16 @@ fn add(args: &[String], mut quiet: bool) -> Result<ExitCode> {
     }
     std::fs::write(&local_config, cfg.to_bstring())?;
 
-    // git stages the gitlink with `git add --no-warn-embedded-repo [-f] -- <path>`
-    // before it writes `.gitmodules`; the entry it produces is the submodule's HEAD.
-    let head = gix::open(&abs)?
-        .head_id()
-        .map_err(|_| anyhow::anyhow!("the cloned submodule has an unborn HEAD"))?
-        .detach();
-    let cacheinfo = format!("160000,{},{}", head.to_hex(), path);
-    let staged = run_at_toplevel(&workdir, &["update-index", "--add", "--cacheinfo", &cacheinfo])?;
-    if staged != 0 {
-        return Ok(ExitCode::from(staged));
+    // git stages the gitlink with an `add --no-warn-embedded-repo [--force] -- <path>`
+    // child before it writes `.gitmodules` (submodule--helper.c:3535-3543), so a path
+    // `add` quietly declines, one inside `.git`, is left unstaged and the run goes on.
+    let mut add_args = vec!["add", "--no-warn-embedded-repo"];
+    if force {
+        add_args.push("--force");
+    }
+    add_args.extend(["--", path.as_str()]);
+    if run_at_toplevel(&workdir, &add_args)? != 0 {
+        crate::git_fatal!("Failed to add submodule '{path}'");
     }
 
     // `config_submodule_in_gitmodules(name, "url", add_data->repo)`: the *argument*,

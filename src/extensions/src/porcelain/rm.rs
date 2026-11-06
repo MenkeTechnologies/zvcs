@@ -678,6 +678,9 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
             let staged = head_id.map(|h| h != t.id).unwrap_or(true);
 
             let local = if t.mode == Mode::COMMIT {
+                if let Some(wd) = &workdir {
+                    die_on_broken_submodule_gitfile(wd, &path_str)?;
+                }
                 submodule_is_dirty(&repo, &t.path)
             } else {
                 match worktree_blob(&repo, &t.path, t.mode, hash_kind)? {
@@ -938,6 +941,25 @@ fn worktree_blob(
 
     let id = gix::objs::compute_hash(hash_kind, gix::objs::Kind::Blob, &content)?;
     Ok(Some(id))
+}
+
+/// The `read_gitfile("<path>/.git")` that bad_to_remove_submodule() reaches through
+/// submodule_uses_gitfile() for a submodule directory that exists and is not empty
+/// (submodule.c:2013-2017, :1971-1972): with no error-code pointer it dies on a `.git`
+/// file that is malformed or leads to no repository (setup.c:925-951), before any
+/// `git status` child is asked about the work tree.
+fn die_on_broken_submodule_gitfile(workdir: &std::path::Path, path: &str) -> Result<()> {
+    use crate::porcelain::rev_parse::{gitfile_error_message, read_gitfile_gently};
+    let dir = workdir.join(path);
+    let populated = std::fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_some());
+    if !populated {
+        return Ok(());
+    }
+    let shown = format!("{path}/.git");
+    match read_gitfile_gently(&dir.join(".git")) {
+        Err(err) => crate::git_fatal!("{}", gitfile_error_message(std::path::Path::new(&shown), err)),
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Whether the submodule rooted at `path` has changes that make it "modified" for

@@ -2708,7 +2708,14 @@ fn add(args: &[String]) -> Result<ExitCode> {
     if let Some(code) = check_candidate_path(&common, &worktrees, &path, path_arg, force_count, "add") {
         return Ok(code);
     }
-    if let Start::Branch(name, _) = &start {
+    // `is_branch` (worktree.c:482-487) holds for `--orphan` too when the branch it names
+    // already exists: the checked-out test runs before `make_worktree_orphan()` refuses it.
+    let existing = match &start {
+        Start::Branch(name, _) => Some(name),
+        Start::Orphan(name) if crate::refname::ref_exists(&repo, name.as_bstr()) => Some(name),
+        _ => None,
+    };
+    if let Some(name) = existing {
         if !force {
             if let Some(other) = checked_out_in(&repo, name)? {
                 eprintln!(
@@ -2808,7 +2815,17 @@ fn add(args: &[String]) -> Result<ExitCode> {
     // `make_worktree_orphan()` only points `HEAD` at the unborn branch, and the `reset --hard`
     // that follows leaves an empty index and an empty worktree — no `ORIG_HEAD`, no
     // `HEAD is now at` line, and no ref: the branch is born with the first commit.
-    if let Start::Orphan(_) = start {
+    if let Start::Orphan(name) = &start {
+        // `make_worktree_orphan()` calls validate_new_branchname(ref, &symref, 0) in this
+        // process (worktree.c:409-416), which dies when the branch exists, `-f` or not
+        // (branch.c:505-514); the atexit remove_junk() then deletes the administrative
+        // directory and the new work tree (worktree.c:273-288, :512-514).
+        if crate::refname::ref_exists(&repo, name.as_bstr()) {
+            std::fs::remove_dir_all(&admin).ok();
+            std::fs::remove_dir_all(&path).ok();
+            eprintln!("fatal: a branch named '{}' already exists", name.shorten());
+            return Ok(ExitCode::from(128));
+        }
         // `make_worktree_orphan()` (builtin/worktree.c:411-423) runs `symbolic-ref HEAD
         // refs/heads/<branch>` in the new worktree, `refs_update_symref(…, NULL)` once more.
         if let Some(wt_repo) = &wt_repo {

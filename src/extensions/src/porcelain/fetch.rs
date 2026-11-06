@@ -3996,10 +3996,20 @@ fn fetch_one(
         .map(|r| (r.0, r.1, r.2, r.3, false))
         .chain(second_pass.into_iter().map(|r| (r.0, r.1, r.2, r.3, true)))
     {
+        // An exact object id on the command line becomes a ref named after the refspec
+        // source as typed, `alloc_ref(name)` with `name = refspec->src` (remote.c:2141-2152), and that `rm->name`
+        // is what the summary row and the FETCH_HEAD note quote (builtin/fetch.c:1324-1365).
+        let exact_oid_source = mapping.remote.as_id().and_then(|_| {
+            mapping
+                .spec_index
+                .get(&ref_map.refspecs, &ref_map.extra_refspecs)
+                .and_then(|spec| spec.to_ref().source().map(|src| src.to_string()))
+        });
         let remote_full = mapping
             .remote
             .as_name()
             .map(|n| n.to_string())
+            .or_else(|| exact_oid_source.clone())
             .unwrap_or_default();
         let remote_id = mapping.remote.as_id().map(ToOwned::to_owned);
 
@@ -4086,6 +4096,7 @@ fn fetch_one(
             .as_name()
             .and_then(|n| FullName::try_from(n).ok())
             .map(|f| f.shorten().to_string())
+            .or_else(|| exact_oid_source.clone())
             .or_else(|| mapping.remote.as_id().map(|id| id.to_hex_with_len(abbrev).to_string()))
             .unwrap_or_default();
 

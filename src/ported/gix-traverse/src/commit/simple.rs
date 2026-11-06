@@ -198,6 +198,10 @@ fn to_queue_key(i: i64, order: CommitTimeOrder) -> QueueKey<i64> {
     }
 }
 
+/// `SLOP` (revision.c:1304): how many uninteresting commits `limit_list()` keeps popping once
+/// everything still queued is uninteresting and older than the last interesting commit.
+const SLOP: u32 = 5;
+
 /// Compute the boundary at which the visible walk must stop because commits become reachable from
 /// both the visible tips and the hidden tips.
 ///
@@ -238,6 +242,12 @@ fn compute_hidden_frontier(
     // only ever means popping a few entries more than strictly needed, never stopping too early.
     let mut queue = gix_revwalk::PriorityQueue::<GenThenTime, (ObjectId, bool)>::new();
     let mut visible_pending = 0usize;
+    // limit_list()'s `slop` and `date` (revision.c:1448-1449): the date of the last
+    // visible commit popped, and how many more hidden pops the loop allows itself once
+    // nothing visible is queued, so a hidden path through a commit dated earlier than
+    // its descendant (clock skew) still reaches what the visible side already passed.
+    let mut slop = SLOP;
+    let mut date = SecondsSinceUnixEpoch::MAX;
 
     for &visible in visible_tips {
         graph.get_or_insert_full_commit(visible, |commit| {
@@ -284,10 +294,22 @@ fn compute_hidden_frontier(
             }
         }
 
-        // git's `still_interesting()`, consulted only after an uninteresting commit: everything
-        // left is hidden, so nothing the visible walk can reach is left to discover.
-        if flags.contains(PaintFlags::HIDDEN) && visible_pending == 0 {
-            break;
+        // git's `still_interesting()` (revision.c:1306-1327), consulted only after an
+        // uninteresting commit (revision.c:1480-1485): an empty queue ends the walk; a queued
+        // commit no older than the last visible one, or a visible one still pending, renews
+        // the slop; otherwise each hidden pop spends one, and none left ends the walk.
+        if flags.contains(PaintFlags::HIDDEN) {
+            slop = match queue.peek() {
+                None => 0,
+                Some((next, _)) if date <= next.time => SLOP,
+                Some(_) if visible_pending != 0 => SLOP,
+                Some(_) => slop - 1,
+            };
+            if slop == 0 {
+                break;
+            }
+        } else {
+            date = graph.get(&commit_id).expect("queued commits are in the graph").commit_time;
         }
     }
 

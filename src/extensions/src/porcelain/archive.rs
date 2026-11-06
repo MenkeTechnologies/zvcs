@@ -1348,11 +1348,17 @@ fn run_remote_archiver(outer: &Outer, here: Option<&gix::Repository>) -> Result<
         pkt_line(&mut request, format!("argument {arg}\n").as_bytes());
     }
     request.extend_from_slice(b"0000");
-    // A server that died before reading the whole request leaves this write to
-    // fail on a closed pipe; the handshake below reports that as the disconnect
-    // it is, so the error here is not the one to print.
-    let _ = to_server.write_all(&request);
-    let _ = to_server.flush();
+    // `packet_write_fmt()` and `packet_flush()` go through `write_or_die()`, whose
+    // `check_pipe()` makes a server that exited before the request was written
+    // (an `--exec` the shell cannot find) a death by `SIGPIPE`, with nothing on
+    // stderr (write-or-die.c:91-103). A server that exits after taking the
+    // request is the handshake's "remote end hung up" below.
+    if let Err(err) = to_server.write_all(&request).and_then(|()| to_server.flush()) {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            let _ = child.wait();
+            crate::sigpipe::exit_broken_pipe();
+        }
+    }
     drop(to_server);
 
     let mut from_server = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));

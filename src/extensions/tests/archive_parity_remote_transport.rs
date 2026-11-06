@@ -7,7 +7,9 @@
 //!   git repository".
 //! * `git_connect()` refuses a path that looks like an option ("strange pathname
 //!   '-x' blocked", connect.c:1483-1484) and runs `--exec` as `<exec> '<path>'`
-//!   through `/bin/sh -c`, whose `$0` is that whole command line.
+//!   through `/bin/sh -c`, whose `$0` is that whole command line. A request
+//!   written after that shell has exited is `write_or_die()`'s death by
+//!   `SIGPIPE`, as in git.
 //! * The serving side stats `--add-file` in the git directory `enter_repo()`
 //!   chdir'd into, so `--add-file=HEAD` passes the stat and reaches "options
 //!   '--add-file' and '--remote' cannot be used together" while `--add-file=a`
@@ -51,13 +53,33 @@ fn a_remote_name_and_an_insteadof_url_resolve_as_remote_get_does() {
     same_unordered(&t, &["archive", "--remote=origin", "nosuchref"]);
 }
 
+/// A server that is gone before the request is written: whether the client's
+/// `write_or_die()` meets the closed pipe (death by `SIGPIPE`, 141, nothing
+/// more said) or the request fits in the pipe first and the handshake reads
+/// EOF (128, "the remote end hung up unexpectedly") is a race in stock git too.
+/// Both outcomes collapse to the second one before comparing.
+fn hung_up(o: Outcome) -> Outcome {
+    const HUNG_UP: &str = "fatal: the remote end hung up unexpectedly\n";
+    match o.code {
+        141 => Outcome { code: 128, stderr: format!("{}{HUNG_UP}", o.stderr), ..o },
+        _ => o,
+    }
+}
+
 #[test]
 fn git_connect_blocks_an_option_like_path_and_runs_exec_through_the_shell() {
     let Some(t) = Twin::new("archive-remote-connect") else { return };
     t.same(&["archive", "--remote=-x", "HEAD"]);
     t.same(&["archive", "--remote=file://-x", "HEAD"]);
-    t.same(&["archive", "--remote=.", "--exec=nosuchcmd", "HEAD"]);
-    t.same(&["archive", "--remote=../up", "--exec=nosuchcmd;", "--list"]);
+    for args in [
+        &["archive", "--remote=.", "--exec=nosuchcmd", "HEAD"][..],
+        &["archive", "--remote=../up", "--exec=nosuchcmd;", "--list"],
+    ] {
+        let (stock, zvcs) = t.run_in("work", args);
+        let (stock, zvcs) = (hung_up(stock), hung_up(zvcs));
+        assert_eq!(stock.code, 128, "{stock:?}");
+        assert_eq!(zvcs, stock, "git {args:?}: left is zvcs, right is stock");
+    }
 }
 
 #[test]

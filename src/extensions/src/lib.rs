@@ -1462,6 +1462,33 @@ fn copy_gecos(gecos: &str, login: &str) -> String {
     name.trim().to_string()
 }
 
+/// `ident_default_name()` (ident.c:162-169): `user.name` as configured, computed
+/// from the passwd gecos through `copy_gecos()` only when it is empty and none of
+/// `user.name`, `author.name` or `committer.name` was read at all
+/// (`IDENT_NAME_GIVEN`, ident.c:610-660). No login-name fallback; that is
+/// `fmt_ident()`'s.
+pub(crate) fn ident_default_name(user_name: String, name_given: bool) -> String {
+    if name_given || !user_name.is_empty() {
+        return user_name;
+    }
+    let (login, gecos) = passwd_self();
+    copy_gecos(&gecos, &login)
+}
+
+/// `ident_default_email()` (ident.c:171-189): `user.email` as configured, or,
+/// when it is empty and no `*.email` key was read (`IDENT_MAIL_GIVEN`), a
+/// non-empty `EMAIL`, else the address built from the login and host name,
+/// trimmed.
+pub(crate) fn ident_default_email(user_email: String, mail_given: bool) -> String {
+    if mail_given || !user_email.is_empty() {
+        return user_email;
+    }
+    match std::env::var("EMAIL").ok().filter(|e| !e.is_empty()) {
+        Some(email) => email.trim().to_string(),
+        None => auto_email(&auto_name().login).0.trim().to_string(),
+    }
+}
+
 /// `xgetpwuid_self()` (ident.c:41-58): this uid's `(pw_name, pw_gecos)`, or the
 /// `("unknown", "Unknown")` stand-in git substitutes when there is no passwd
 /// entry. git reads the account from the passwd database only — `USER` and

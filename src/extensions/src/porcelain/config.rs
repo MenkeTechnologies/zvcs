@@ -4048,17 +4048,49 @@ fn match_urls(url: &UrlInfo, pattern: &UrlInfo) -> Option<UrlMatch> {
 /// side effect only — an editor that fails has said so with `error:`, and the
 /// command still returns 0.
 fn edit_config(target: &WriteTarget) -> Result<ExitCode> {
-    if target.create_parent {
-        if let Some(parent) = target.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+    let repo = crate::setup::discover().ok();
+    // `show_editor()` (builtin/config.c:1305-1315): only `--global` creates its
+    // file, `O_CREAT | O_EXCL`, seeded with `default_user_config()`
+    // (builtin/config.c:915-927). Any other target is handed to the editor as it
+    // is, and a path whose directory is missing dies in `launch_editor()`.
+    if matches!(target.source, Source::User | Source::Git) {
+        let created = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target.path);
+        match created {
+            Ok(mut file) => {
+                // `repo_config(the_repository, git_default_config, NULL)` ran
+                // first, so `git_ident_config()` has read the ident keys.
+                let snap = repo.as_ref().map(|r| r.config_snapshot());
+                let value = |key: &str| snap.as_ref().and_then(|s| s.string(key)).map(|v| v.to_string());
+                let given = |kind: &str| {
+                    ["user", "author", "committer"]
+                        .iter()
+                        .any(|section| value(&format!("{section}.{kind}")).is_some())
+                };
+                let content = format!(
+                    "# This is Git's per-user configuration file.\n\
+                     [user]\n\
+                     # Please adapt and uncomment the following lines:\n\
+                     #\tname = {}\n\
+                     #\temail = {}\n",
+                    crate::ident_default_name(value("user.name").unwrap_or_default(), given("name")),
+                    crate::ident_default_email(value("user.email").unwrap_or_default(), given("email")),
+                );
+                let _ = file.write_all(content.as_bytes());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Ok(fatal(&format!(
+                    "cannot create configuration file {}: {}",
+                    target.path.display(),
+                    errno_text(&e)
+                )))
+            }
         }
     }
-    // git creates the file first so the editor always opens something.
-    if !target.path.exists() {
-        std::fs::File::create(&target.path)?;
-    }
 
-    let repo = crate::setup::discover().ok();
     let _ = crate::editor::launch_editor(repo.as_ref(), &target.path, &[]);
     Ok(ExitCode::SUCCESS)
 }

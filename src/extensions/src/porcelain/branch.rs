@@ -1656,12 +1656,15 @@ fn remote_find_tracking_src(specs: &[String], needle: &str) -> Option<String> {
     })
 }
 
-/// git's `branch_get_push`: the remote-tracking ref that would mirror a push of
-/// `full`, or `None` when the branch has no push destination.
+/// git's `branch_get_push()` (remote.c:2030-2042): the remote-tracking ref that
+/// would mirror a push of `full`, or `None` where `branch_get_push_1()` reports an
+/// error. That is [`crate::objname::push_dest`], the `push.default` switch
+/// `<branch>@{push}` resolves through, so a branch with no `branch.<name>.remote`
+/// still pushes to `origin` under `push.default=current` or `matching`.
 pub(crate) fn push_ref(repo: &gix::Repository, full: &BStr) -> Option<FullName> {
-    let name = FullName::try_from(full.to_owned()).ok()?;
-    repo.branch_remote_tracking_ref_name(name.as_ref(), gix::remote::Direction::Push)?
-        .ok()
+    let short = full.strip_prefix(b"refs/heads/".as_slice())?;
+    let dest = crate::objname::push_dest(repo, short.to_str().ok()?).ok()?;
+    FullName::try_from(dest).ok()
 }
 
 /// `pushremote_for_branch()` (`remote.c:698-722`): `branch.<name>.pushRemote`,
@@ -3025,7 +3028,9 @@ fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     if o.names.len() > 1 {
         return fatal("too many arguments to unset upstream");
     }
-    let branch_name = match o.names.first() {
+    // `branch_get(NULL)` and `branch_get("HEAD")` both answer the current
+    // branch (remote.c:1828-1829), so a detached HEAD fails either way.
+    let branch_name = match o.names.first().filter(|n| n.as_str() != "HEAD") {
         Some(n) => n.clone(),
         None => match repo.head_name()? {
             Some(h) => h.shorten().to_string(),
@@ -3035,24 +3040,66 @@ fn unset_upstream(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
         },
     };
 
+    // `branch_has_merge_config()` is `branch->set_merge`, which `set_merge()`
+    // only sets for a branch with both a remote and a merge entry
+    // (remote.c:1786-1794).
     let snap = repo.config_snapshot();
     let has_upstream = snap
         .string(&format!("branch.{branch_name}.remote"))
         .is_some()
-        || snap
+        && snap
             .string(&format!("branch.{branch_name}.merge"))
             .is_some();
     if !has_upstream {
         return fatal(format!("branch '{branch_name}' has no upstream information"));
     }
 
+    // ```c
+    // strbuf_addf(&buf, "branch.%s.remote", branch->name);
+    // repo_config_set_multivar(the_repository, buf.buf, NULL, NULL, CONFIG_FLAGS_MULTI_REPLACE);
+    // strbuf_reset(&buf);
+    // strbuf_addf(&buf, "branch.%s.merge", branch->name);
+    // repo_config_set_multivar(the_repository, buf.buf, NULL, NULL, CONFIG_FLAGS_MULTI_REPLACE);
+    // ```
+    // (builtin/branch.c:1283-1288), through the store `git config --unset-all`
+    // writes with, so a section the two keys leave empty goes with them
+    // (`maybe_remove_section()`, config.c:2811). Both are the non-gently form,
+    // which dies "could not unset '%s'" (config.c:3290-3302).
+    let path = repo.common_dir().join("config");
     let _lock = crate::lock::RepoLock::acquire(repo.git_dir());
-    let (path, mut file) = local_config(repo)?;
-    if let Ok(mut section) = file.section_mut("branch", Some(BStr::new(branch_name.as_bytes()))) {
-        while section.remove("remote").is_some() {}
-        while section.remove("merge").is_some() {}
+    for key in ["remote", "merge"] {
+        let name = format!("branch.{branch_name}.{key}");
+        let canonical = match crate::config::parse_config_key(&name) {
+            Ok(canonical) => canonical,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return fatal(format!("could not unset '{name}'"));
+            }
+        };
+        let stored = crate::config_store::set_multivar_in_file(
+            &path,
+            &name,
+            &canonical,
+            name.len() - key.len() - 1,
+            None,
+            crate::config_store::ValuePattern::Any,
+            None,
+            true,
+        );
+        if let Err(err) = stored {
+            use crate::config_store::StoreError;
+            match err {
+                StoreError::InvalidFile => eprintln!("error: invalid config file {}", path.display()),
+                StoreError::Io(io) => eprintln!(
+                    "error: could not lock config file {}: {}",
+                    path.display(),
+                    super::config::errno_text(&io)
+                ),
+                StoreError::InvalidPattern(_) | StoreError::NothingSet => {}
+            }
+            return fatal(format!("could not unset '{name}'"));
+        }
     }
-    write_config(&path, &file)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4162,95 +4209,61 @@ fn copy_branch(repo: &gix::Repository, o: &Opts) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Drop the whole `branch.<name>` subsection from the local config, which is
-/// `repo_config_rename_section(the_repository, "branch.<name>", NULL)` — git's
-/// spelling of "remove this section". A branch that never had a section of its
-/// own leaves nothing to remove, and that is not an error.
+/// Drop the whole `branch.<name>` subsection from the local config:
+/// `delete_branch_config()` (builtin/branch.c:229-236), whose
+/// `repo_config_rename_section(the_repository, "branch.<name>", NULL)` is git's
+/// spelling of "remove this section" and only warns when it fails. A branch
+/// that never had a section of its own leaves nothing to remove.
 fn remove_branch_config(repo: &gix::Repository, name: &str) -> Result<()> {
-    let Ok((path, mut file)) = local_config(repo) else {
-        return Ok(());
-    };
-    let sub = gix::bstr::BString::from(name.as_bytes());
-    let mut removed = false;
-    while file
-        .remove_section("branch", Some(BStr::new(sub.as_slice())))
-        .is_some()
-    {
-        removed = true;
-    }
-    if removed {
-        write_config(&path, &file)?;
+    let path = repo.common_dir().join("config");
+    let section = format!("branch.{name}");
+    if let Err(err) = crate::config_store::copy_or_rename_section_in_file(&path, &section, None, false) {
+        report_rename_error(&path, &err);
+        eprintln!("warning: update of config-file failed");
     }
     Ok(())
 }
 
-/// Copy every `branch.<old>.*` value into `branch.<new>.*` in the local config.
-/// When `remove_old`, the old subsection is deleted afterward (a rename); a copy
-/// leaves it in place. Mirrors git's `git_config_copy_section` /
-/// `git_config_rename_section` for the `branch.<name>` section.
+/// Carry the `branch.<old>` section over to `branch.<new>` in the local config:
+/// `repo_config_rename_section()` when `remove_old` (a rename, which rewrites the
+/// header where the section stands) and `repo_config_copy_section()` otherwise
+/// (a copy, written right after the section it copies), as `copy_or_rename_branch()`
+/// does (builtin/branch.c:697-703), through the store `git config
+/// --rename-section` writes with (`repo_config_copy_or_rename_section_in_file()`,
+/// config.c:3353).
 fn move_branch_config(
     repo: &gix::Repository,
     old: &str,
     new: &str,
     remove_old: bool,
 ) -> Result<()> {
-    let (path, mut file) = local_config(repo)?;
-
-    // Gather the old subsection's key/value pairs in order, as owned data so the
-    // immutable borrow ends before the mutation below.
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    if let Some(iter) = file.sections_by_name("branch") {
-        for section in iter {
-            if section.header().subsection_name() == Some(BStr::new(old.as_bytes())) {
-                for name in section.value_names() {
-                    for value in section.values(&name) {
-                        pairs.push((name.clone(), value.to_str_lossy().into_owned()));
-                    }
-                }
-            }
-        }
+    let path = repo.common_dir().join("config");
+    let (old_section, new_section) = (format!("branch.{old}"), format!("branch.{new}"));
+    let moved = crate::config_store::copy_or_rename_section_in_file(&path, &old_section, Some(&new_section), !remove_old);
+    if let Err(err) = moved {
+        report_rename_error(&path, &err);
+        let what = if remove_old { "renamed" } else { "copied" };
+        crate::git_fatal!("branch is {what}, but update of config-file failed");
     }
-
-    if pairs.is_empty() && !remove_old {
-        return Ok(());
-    }
-
-    if remove_old {
-        // `git_config_rename_section()` rewrites the *header* and leaves the section where it is,
-        // so `branch -m` keeps the file's section order. Appending a new section and deleting the
-        // old one moves it to the end instead, which shows up in `git config --list` order and in
-        // any diff of `.git/config`.
-        let renamed = file.rename_section(
-            "branch",
-            Some(BStr::new(old.as_bytes())),
-            "branch",
-            Some(gix::bstr::BString::from(new.as_bytes())),
-        );
-        // A branch with no config section of its own has nothing to rename, which is not an error.
-        if let Err(err) = renamed {
-            if !matches!(
-                err,
-                gix::config::file::rename_section::Error::Lookup(
-                    gix::config::lookup::existing::Error::SectionMissing
-                        | gix::config::lookup::existing::Error::SubSectionMissing
-                        | gix::config::lookup::existing::Error::KeyMissing
-                )
-            ) {
-                return Err(err.into());
-            }
-        }
-    } else if !pairs.is_empty() {
-        // `-c`/`-C` copies the section rather than moving it, so the copy is appended — which is
-        // where `git config --list` shows it after `git branch -c`.
-        let sub = BStr::new(new.as_bytes());
-        let mut section = file.section_mut_or_create_new("branch", Some(sub))?;
-        for (key, value) in &pairs {
-            section.push(key.as_str(), value.as_str())?;
-        }
-    }
-
-    write_config(&path, &file)?;
     Ok(())
+}
+
+/// The `error:` line `repo_config_copy_or_rename_section_in_file()` prints for
+/// a failure before its caller's own message (config.c:3405-3505).
+fn report_rename_error(path: &std::path::Path, err: &crate::config_store::RenameError) {
+    use crate::config_store::RenameError;
+    match err {
+        RenameError::LongLine(line) => eprintln!(
+            "error: refusing to work with overly long line in '{}' on line {line}",
+            path.display()
+        ),
+        RenameError::NoLock => eprintln!("error: could not lock config file {}", path.display()),
+        RenameError::Io(io) => eprintln!(
+            "error: could not lock config file {}: {}",
+            path.display(),
+            super::config::errno_text(io)
+        ),
+    }
 }
 
 /// Serialize `file` to `path` atomically: write a sibling temp file, then rename

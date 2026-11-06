@@ -188,7 +188,16 @@ fn launch_specified_editor(
 
         // `strbuf_realpath(&realpath, path, 1)` and `p.use_shell = 1`; the
         // child runs where setup left git, with what setup exported.
-        let realpath = crate::setup::realpath(path);
+        // `REALPATH_DIE_ON_ERROR`: a path whose directory is missing dies
+        // `Invalid path '<prefix>': <strerror>` before any child is started.
+        let realpath = match crate::pathspec::real_path_strict(&path.to_string_lossy()) {
+            Ok(resolved) => resolved,
+            Err(message) => {
+                crate::cstdio::flush();
+                eprintln!("fatal: {message}");
+                std::process::exit(128);
+            }
+        };
         let mut cmd = crate::external::prepare_shell_cmd_str(&editor, [&realpath]);
         match repo {
             Some(repo) => crate::setup::export_to_child(repo, crate::setup::after_setup(repo).as_ref(), &mut cmd),

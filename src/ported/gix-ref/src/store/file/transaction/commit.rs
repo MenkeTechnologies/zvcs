@@ -246,7 +246,45 @@ impl Transaction<'_, '_> {
                 drop(lock);
             }
         }
-        Ok(updates.into_iter().map(|edit| edit.update).collect())
+        // `files_transaction_finish()` marks every `REF_DELETING && !REF_LOG_ONLY`
+        // update `REF_DELETED_RMDIR`, packed or loose, and once the locks are gone
+        // runs `try_remove_empty_parents(refs, refname, REMOVE_EMPTY_PARENTS_REF)`
+        // for each (refs/files-backend.c:3430-3471): the directories between
+        // `refs/<kind>/` and the ref are removed bottom-up until one is not empty.
+        // Each deleted ref's path, and how many of its parent directories lie below
+        // `refs/<kind>/`.
+        let deleted: Vec<(std::path::PathBuf, usize)> = updates
+            .iter()
+            .filter(|c| {
+                !c.log_only_split
+                    && matches!(
+                        c.update.change,
+                        Change::Delete {
+                            log: RefLog::AndReference,
+                            ..
+                        }
+                    )
+            })
+            .map(|c| {
+                let components = c.update.name.as_bstr().split(|&b| b == b'/').count();
+                (
+                    self.store.reference_path(c.update.name.as_ref()),
+                    components.saturating_sub(3),
+                )
+            })
+            .collect();
+        let edits = updates.into_iter().map(|edit| edit.update).collect();
+        for (path, parents) in deleted {
+            let mut dir = path.parent();
+            for _ in 0..parents {
+                let Some(d) = dir else { break };
+                if std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+        Ok(edits)
     }
 }
 mod error {

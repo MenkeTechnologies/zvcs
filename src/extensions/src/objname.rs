@@ -2872,7 +2872,7 @@ pub fn push_mark_fatal_allowed(
 ///
 /// `named` is the text before the mark's `@`, i.e. `interpret_branch_mark()`'s
 /// `xmemdupz(name, at)`; empty means `branch_get(NULL)`.
-fn push_dest(repo: &gix::Repository, named: &str) -> Result<String, String> {
+pub(crate) fn push_dest(repo: &gix::Repository, named: &str) -> Result<String, String> {
     // `branch_get(NULL)` / `branch_get("HEAD")`.
     let name = if named.is_empty() || named == "HEAD" {
         match repo.head_name() {

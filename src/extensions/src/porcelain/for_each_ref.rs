@@ -1391,7 +1391,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // `cmd_for_each_ref()`: a `HEAD` that does not resolve yields NULL and the
     // listing runs without the `%(HEAD)` marker, so a *broken* referent is the
     // same as an unborn one here and is not an error.
-    let head_name = broken_ref_is_absent(repo.head_name())?.flatten().map(|n| n.as_bstr().to_vec());
+    // A detached `HEAD` resolves to the name `HEAD` itself, so under
+    // `--include-root-refs` the `HEAD` row is the one marked (`head_atom_parser()`
+    // and `populate_value()`, ref-filter.c).
+    let head_name = match broken_ref_is_absent(repo.head_name())?.flatten() {
+        Some(n) => Some(n.as_bstr().to_vec()),
+        None => repo.head_id().is_ok().then(|| b"HEAD".to_vec()),
+    };
 
     // Materialise every ref name first: the iterator holds the packed-refs
     // buffer, which would block the per-ref object lookups below.
@@ -1472,13 +1478,13 @@ pub fn for_each_ref(args: &[String]) -> Result<ExitCode> {
     // A `die()` `apply_ref_filter()` raised mid-walk in an iterative listing:
     // the refs before it are formatted and written first, as git does.
     let mut pending_die: Option<String> = None;
+    let start_after = match &start_after {
+        Some(marker) => Some(StartAfter::seek(&repo, marker.as_bytes(), &names)?),
+        None => None,
+    };
     for refname in names {
-        // `--start-after` seeks inside the `refs/` iteration, so a marker that
-        // does not name a ref under `refs/` has no effect at all.
-        if let Some(marker) = &start_after {
-            if marker.starts_with("refs/") && refname.as_slice() <= marker.as_bytes() {
-                continue;
-            }
+        if start_after.as_ref().is_some_and(|s| !s.yields(&refname)) {
+            continue;
         }
         if !patterns.is_empty()
             && !patterns
@@ -3515,6 +3521,198 @@ fn render_upstream(
     Ok(value.into_bytes())
 }
 
+/// `--start-after=<marker>`: which refs the iterator still yields once
+/// `start_ref_iterator_after()` (ref-filter.c:2817-2829) has seeked it to
+/// `<marker>` followed by a `\001` byte, the first name sorting after the marker.
+///
+/// The reftable backend and the packed-refs half of the files backend seek
+/// exactly there. The files backend's loose half seeks its `ref_cache` with
+/// `cache_ref_iterator_seek()` (refs/ref-cache.c:471-551), which walks the seek
+/// path one directory level at a time and, at a level where every entry sorts
+/// before the path, clamps to the last entry: when that entry is a directory it
+/// descends into it and yields the whole subtree. So with loose refs a marker
+/// such as `zzz` lists every loose ref (the root level holds only `refs/`),
+/// `refs/zzz` lists nothing (`refs/worktree/`, always present and empty, is
+/// last), and `refs/heads/n/zzz` lists all of `refs/heads/n/<last-subdir>/`.
+/// `overlay_ref_iterator_begin()` then merges the two halves by name
+/// (refs/files-backend.c:1097-1112).
+enum StartAfter {
+    /// Every ref whose name sorts after the marker.
+    Exact(Vec<u8>),
+    /// The files backend: what the loose cache yields, plus each packed ref that
+    /// sorts after the marker.
+    Files {
+        marker: Vec<u8>,
+        loose: HashSet<Vec<u8>>,
+        packed: HashSet<Vec<u8>>,
+    },
+}
+
+/// One `struct ref_dir` of the loose cache: entry names (a directory's ending
+/// in `/`) in `sort_ref_dir()` order, and whether each is a directory.
+type CacheDir = Vec<(Vec<u8>, bool)>;
+
+impl StartAfter {
+    /// `names` is everything the listing iterates, so the names outside `refs/`
+    /// are the root refs `add_root_refs()` put at the cache's top level
+    /// (refs/files-backend.c:502-503), present under `--include-root-refs` only.
+    fn seek(repo: &gix::Repository, marker: &[u8], names: &[Vec<u8>]) -> Result<StartAfter> {
+        if crate::refstore::is_reftable(repo) {
+            return Ok(StartAfter::Exact(marker.to_vec()));
+        }
+        let mut target = marker.to_vec();
+        target.push(1);
+        let roots: Vec<Vec<u8>> = names.iter().filter(|n| !n.starts_with(b"refs/")).cloned().collect();
+        let loose = cache_seek_yield(repo, &target, &roots);
+        let mut packed = HashSet::new();
+        if let Ok(buf) = std::fs::read(repo.common_dir().join("packed-refs")) {
+            for line in buf.lines() {
+                if line.starts_with(b"#") || line.starts_with(b"^") {
+                    continue;
+                }
+                if let Some(sp) = line.find_byte(b' ') {
+                    packed.insert(line[sp + 1..].to_vec());
+                }
+            }
+        }
+        Ok(StartAfter::Files {
+            marker: marker.to_vec(),
+            loose,
+            packed,
+        })
+    }
+
+    fn yields(&self, name: &[u8]) -> bool {
+        match self {
+            StartAfter::Exact(marker) => name > marker.as_slice(),
+            StartAfter::Files { marker, loose, packed } => {
+                loose.contains(name) || (packed.contains(name) && name > marker.as_slice())
+            }
+        }
+    }
+}
+
+/// `loose_fill_ref_dir()` (refs/files-backend.c:363-410) for the directory
+/// `dirname` (`""` is the top level `get_loose_ref_cache()` fills itself, with the
+/// root refs and an entry for `refs/`, refs/files-backend.c:484-512), sorted as
+/// `sort_ref_dir()` sorts it, by name.
+fn loose_cache_dir(repo: &gix::Repository, dirname: &[u8], roots: &[Vec<u8>]) -> CacheDir {
+    let mut entries: CacheDir = Vec::new();
+    if dirname.is_empty() {
+        entries.extend(roots.iter().map(|r| (r.clone(), false)));
+        entries.push((b"refs/".to_vec(), true));
+    } else {
+        // `files_ref_path()`: the per-worktree prefixes live in the worktree's
+        // own git directory, everything else under the common one.
+        let per_worktree = [b"refs/bisect/".as_slice(), b"refs/worktree/", b"refs/rewritten/"];
+        let base = if per_worktree.iter().any(|p| dirname.starts_with(p)) {
+            repo.git_dir()
+        } else {
+            repo.common_dir()
+        };
+        if let Ok(read) = std::fs::read_dir(base.join(gix::path::from_bstr(dirname.as_bstr()))) {
+            for de in read.flatten() {
+                let file_name = gix::path::os_str_into_bstr(&de.file_name()).map(|n| n.to_vec());
+                let Ok(file_name) = file_name else { continue };
+                if file_name.starts_with(b".") || file_name.ends_with(b".lock") {
+                    continue;
+                }
+                let mut name = dirname.to_vec();
+                name.extend_from_slice(&file_name);
+                // `get_dtype(de, &path, 1)` follows a symlink.
+                match std::fs::metadata(de.path()) {
+                    Ok(m) if m.is_dir() => {
+                        name.push(b'/');
+                        entries.push((name, true));
+                    }
+                    Ok(m) if m.is_file() => entries.push((name, false)),
+                    _ => {}
+                }
+            }
+        }
+        // `add_per_worktree_entries_to_dir()` (refs/files-backend.c:297-317).
+        if dirname == b"refs/" {
+            for prefix in per_worktree {
+                if !entries.iter().any(|(n, _)| n == prefix) {
+                    entries.push((prefix.to_vec(), true));
+                }
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// `strncmp(a, b, len)` over byte strings that end at their length.
+fn strncmp(a: &[u8], b: &[u8], len: usize) -> std::cmp::Ordering {
+    for k in 0..len {
+        let (x, y) = (a.get(k).copied().unwrap_or(0), b.get(k).copied().unwrap_or(0));
+        if x != y || x == 0 {
+            return x.cmp(&y);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// The loose refs `cache_ref_iterator_seek(iter, target, 0)` followed by
+/// `cache_ref_iterator_advance()` yields (refs/ref-cache.c:380-551).
+fn cache_seek_yield(repo: &gix::Repository, target: &[u8], roots: &[Vec<u8>]) -> HashSet<Vec<u8>> {
+    use std::cmp::Ordering;
+    // `struct cache_ref_iterator_level`: the directory and its `index`.
+    let mut levels: Vec<(CacheDir, isize)> = vec![(loose_cache_dir(repo, b"", roots), -1)];
+    let mut slash = Some(0usize);
+    loop {
+        let level = levels.len() - 1;
+        let dir = &levels[level].0;
+        let found = slash.and_then(|s| target[s..].find_byte(b'/').map(|p| s + p));
+        let len = found.unwrap_or(target.len());
+        let mut cmp = Ordering::Equal;
+        let mut idx = dir.len();
+        for (i, (name, _)) in dir.iter().enumerate() {
+            cmp = strncmp(target, name, len);
+            if cmp != Ordering::Greater {
+                idx = i;
+                break;
+            }
+        }
+        // `/* don't overflow the index */`
+        let idx = idx.min(dir.len() - 1);
+        slash = found.map(|p| p + 1);
+        levels[level].1 = idx as isize;
+        let (name, is_dir) = levels[level].0[idx].clone();
+        if is_dir {
+            let sub = loose_cache_dir(repo, &name, roots);
+            let empty = sub.is_empty();
+            levels.push((sub, -1));
+            if slash.is_none() || empty {
+                break;
+            }
+        } else {
+            // `/* reduce the index so the leaf node is iterated over */`
+            if cmp != Ordering::Greater && slash.is_none() {
+                levels[level].1 = idx as isize - 1;
+            }
+            break;
+        }
+    }
+
+    let mut out = HashSet::new();
+    while let Some((dir, index)) = levels.last_mut() {
+        *index += 1;
+        let Some((name, is_dir)) = dir.get(*index as usize).cloned() else {
+            levels.pop();
+            continue;
+        };
+        if is_dir {
+            let sub = loose_cache_dir(repo, &name, roots);
+            levels.push((sub, -1));
+        } else {
+            out.insert(name);
+        }
+    }
+    out
+}
+
 /// Whether the ref that ultimately holds `name`'s object id came out of
 /// `packed-refs` rather than a loose file, following symrefs to the leaf.
 pub(super) fn is_packed(repo: &gix::Repository, name: &str) -> bool {
@@ -3539,15 +3737,18 @@ pub(super) fn is_packed(repo: &gix::Repository, name: &str) -> bool {
     false
 }
 
-/// git's `remote_ref_for_branch(branch, for_push=1)`: run `branch` through the
-/// push remote's *configured* push refspecs. `None` when the branch has no push
-/// remote, that remote declares no push refspec, or none of them match.
+/// git's `remote_ref_for_branch(branch, for_push=1)` (remote.c:737-749): run
+/// `branch` through the push remote's *configured* push refspecs. `None` when
+/// that remote declares no push refspec or none of them match. The remote is
+/// `remotes_pushremote_for_branch()`'s, which falls back to the sole configured
+/// remote or `origin` for a branch with no `branch.<name>.remote`.
 fn push_refspec_dest(
     repo: &gix::Repository,
     branch: &gix::refs::FullName,
 ) -> Option<gix::refs::FullName> {
-    let name = repo.branch_remote_name(branch.shorten(), gix::remote::Direction::Push)?;
-    let remote = repo.try_find_remote(name.as_bstr())?.ok()?;
+    let short = branch.shorten().to_str().ok()?;
+    let name = super::branch::pushremote_for_branch(repo, Some(short));
+    let remote = repo.try_find_remote(name.as_str())?.ok()?;
     let specs = remote.refspecs(gix::remote::Direction::Push);
     if specs.is_empty() {
         return None;

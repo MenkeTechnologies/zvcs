@@ -1826,7 +1826,7 @@ pub(super) fn run_git_cmd(args: &[String]) -> i32 {
 /// `wait_or_whine()` (run-command.c:558-596): the exit code, or `128 + signal` with an
 /// `error:` line unless the signal is SIGINT, SIGQUIT or SIGPIPE. `argv0` is
 /// `cmd->args.v[0]`, the first word the caller pushed.
-fn wait_status_code(argv0: &str, status: std::process::ExitStatus) -> i32 {
+pub(super) fn wait_status_code(argv0: &str, status: std::process::ExitStatus) -> i32 {
     if let Some(code) = status.code() {
         return code;
     }

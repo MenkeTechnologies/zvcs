@@ -1,9 +1,9 @@
 //! `push.negotiate` and `push.useBitmaps`, the two keys `send_pack()` reads for
 //! itself (`send-pack.c:549-560`).
 //!
-//! Neither acceleration exists here — there are no negotiation rounds before a
-//! push and `gix-pack` has no bitmap reader — so what is portable is *when* and
-//! *how* git refuses a value it cannot read, and that is what these assert.
+//! What these assert is *when* and *how* git refuses a value it cannot read.
+//! The negotiation `push.negotiate=true` runs is `push_parity_negotiate.rs`'s
+//! business; `gix-pack` has no bitmap reader, so `push.useBitmaps` steers nothing.
 //!
 //! The "when" is the interesting half. Both reads sit inside `send_pack()`,
 //! after the `if (!remote_refs)` early return and therefore after the transport

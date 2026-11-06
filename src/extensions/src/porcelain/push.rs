@@ -914,6 +914,31 @@ git push <groupname>\n"
             .string_by("remote", Some(remote_name.as_str().into()), "receivepack")
             .map(|v| v.to_string())
     });
+    // `args.negotiation_include` / `args.negotiation_restrict` are the remote's own
+    // `parse_transport_option()` lists (remote.c:577-582), which `git_transport_push()`
+    // hands `send_pack()` (transport.c:969-970). A push through a remote helper runs
+    // `git send-pack` as the helper's child instead, and that leaves both unset.
+    let (negotiation_include, negotiation_restrict) = if push_proto::through_remote_helper(&transport_url) {
+        (Vec::new(), Vec::new())
+    } else {
+        let list = |key: &str| -> Vec<String> {
+            repo.config_snapshot()
+                .strings(&format!("remote.{remote_name}.{key}"))
+                .unwrap_or_default()
+                .iter()
+                .map(|v| v.to_str_lossy().into_owned())
+                .fold(Vec::new(), |mut acc, value| {
+                    // An empty value clears what the earlier ones accumulated.
+                    if value.is_empty() {
+                        acc.clear();
+                    } else {
+                        acc.push(value);
+                    }
+                    acc
+                })
+        };
+        (list("negotiationInclude"), list("negotiationRestrict"))
+    };
     let send_opts = push_proto::SendOptions {
         atomic: f.atomic,
         signed: f.signed,
@@ -943,6 +968,8 @@ git push <groupname>\n"
             std::io::stderr().is_terminal()
         }) && !f.quiet,
         verbosity: f.verbosity,
+        negotiation_include,
+        negotiation_restrict,
     };
     // `transport_push()`'s steps between the match and `push_refs()`
     // (transport.c:1479-1531), which `push_proto::send_pack` calls back into once

@@ -35,22 +35,23 @@
 //!
 //! # Configuration
 //!
-//! `send_pack()` reads two keys of its own (`send-pack.c:549-560`), both after
-//! the transport is open. Neither acceleration exists here — there are no
-//! negotiation rounds before a push, and `gix-pack` has no bitmap reader — so
-//! both are read and validated exactly where git reads them, and the values then
-//! steer nothing:
+//! `send_pack()` reads two keys of its own (`send-pack.c:516-527`), both after
+//! the transport is open:
 //!
-//!   * `push.negotiate` runs `git fetch --negotiate-only` first so the pack can
-//!     leave out what the rounds proved common. Its documented `false` behaviour
-//!     — "rely solely on the server's ref advertisement" — is what this port does
-//!     either way.
+//!   * `push.negotiate` runs `git fetch --negotiate-only` against the push URL
+//!     first, with the tips being pushed as `--negotiation-restrict`, and the
+//!     commits it prints join the pack's haves so the pack leaves out what the
+//!     rounds proved common (`get_commons_through_negotiation()`,
+//!     send-pack.c:402-475). A child that fails — a protocol v0 server, one
+//!     without `wait-for-done` — earns a warning and the push goes on.
 //!   * `push.useBitmaps` becomes `--no-use-bitmap-index` on the `pack-objects`
-//!     child, and the count here is already the un-accelerated one.
+//!     child. `gix-pack` has no bitmap reader, so the value is read and
+//!     validated where git reads it and then steers nothing; the count here is
+//!     already the un-accelerated one.
 //!
-//! The *position* of the read is the observable part and is reproduced: a bad
-//! value is fatal for an already-up-to-date push and for `--dry-run`, and is not
-//! reached at all when the remote could not be contacted.
+//! The *position* of the read is observable and is reproduced: a bad value is
+//! fatal for an already-up-to-date push and for `--dry-run`, and is not reached
+//! at all when the remote could not be contacted.
 
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -307,6 +308,14 @@ pub struct SendOptions {
     pub progress: bool,
     /// The `-v`/`-q` count, which `transport_set_verbosity()` hands the transport (builtin/push.c:374).
     pub verbosity: i32,
+    /// `args->negotiation_include`: `remote.<name>.negotiationInclude`, which
+    /// `git_transport_push()` hands `send_pack()` (transport.c:969). Empty for
+    /// `git send-pack` and for a push through a remote helper, whose `send-pack`
+    /// child leaves its static `args` zeroed (builtin/send-pack.c:27).
+    pub negotiation_include: Vec<String>,
+    /// `args->negotiation_restrict`: `remote.<name>.negotiationRestrict`
+    /// (transport.c:970), empty in the same two cases.
+    pub negotiation_restrict: Vec<String>,
 }
 
 /// `TRANSPORT_PUSH_MATCHING`: push every local branch the remote already carries.
@@ -1115,28 +1124,39 @@ pub fn send_pack(
 
     // `send_pack()` reads its own two keys here, right after the `if
     // (!remote_refs)` early return and before the capability selection below
-    // (send-pack.c:542-560). Both go through `repo_config_get_bool`, so an
+    // (send-pack.c:516-527). Both go through `repo_config_get_bool`, so an
     // unreadable value dies — and it dies *late*, after the transport is open:
-    // git 2.55.0 reports it for an already-up-to-date push and for `--dry-run`,
-    // and does not report it when the remote could not be reached at all.
+    // git reports it for an already-up-to-date push and for `--dry-run`, and
+    // does not report it when the remote could not be reached at all.
     //
     //   * `push.negotiate` runs `git fetch --negotiate-only` against the same
-    //     URL first, so the pack can leave out what the rounds proved common.
-    //     This port's pack is built from the advertised tips alone, which is
-    //     what git falls back to when the key is false — its documented "rely
-    //     solely on the server's ref advertisement" behaviour.
+    //     URL first ([`get_commons_through_negotiation`]), and the commits it
+    //     prints join the pack's haves, so the pack leaves out what the rounds
+    //     proved common.
     //   * `push.useBitmaps` becomes `args->disable_bitmaps`, i.e.
     //     `--no-use-bitmap-index` on the `pack-objects` child. `gix-pack` has no
     //     bitmap reader, so the count is already the un-accelerated one.
-    //
-    // Both are therefore validated and reported exactly as git does while the
-    // acceleration each names stays unimplemented; see the module docs.
-    if !requests.is_empty() {
-        for key in ["push.negotiate", "push.usebitmaps"] {
-            if let Err(message) = crate::repo_settings::config_bool_strict(repo, key) {
-                crate::git_fatal!("{message}");
-            }
+    let mut commons: Vec<ObjectId> = Vec::new();
+    match crate::repo_settings::config_bool_strict(repo, "push.negotiate") {
+        Err(message) => crate::git_fatal!("{message}"),
+        Ok(Some(true)) => {
+            // `remote_refs` in its own order — the advertisement, then the refs
+            // `match_push_refs()` created — each with the `new_oid` that
+            // `set_ref_status_for_push()` copied from its peer (remote.c:1691-1692),
+            // which up-to-date and rejected refs carry as well.
+            let mut tips: Vec<(&str, ObjectId)> = statuses
+                .iter()
+                .map(|s| (s.name.as_str(), s.new))
+                .chain(wire.iter().map(|w| (w.name.as_str(), w.new)))
+                .collect();
+            tips.sort_by_cached_key(|(name, _)| remote_refs_position(&advertised_order, &created, name));
+            let tips: Vec<ObjectId> = tips.into_iter().map(|(_, id)| id).collect();
+            commons = get_commons_through_negotiation(repo, &url, opts, &tips)?;
         }
+        Ok(_) => {}
+    }
+    if let Err(message) = crate::repo_settings::config_bool_strict(repo, "push.usebitmaps") {
+        crate::git_fatal!("{message}");
     }
 
     // `if (server_supports("side-band-64k")) use_sideband = 1;` (send-pack.c:573).
@@ -1444,6 +1464,9 @@ pub fn send_pack(
         // to objects we actually hold locally (git's `feed_object(negative)` skips
         // objects the local odb lacks).
         let mut haves: Vec<ObjectId> = advertised.values().copied().collect();
+        // The commits `push.negotiate` proved common, after the advertisement and
+        // before the old tips (`pack_objects()`, send-pack.c:86-96).
+        haves.extend(commons.iter().copied());
         haves.extend(wire.iter().map(|w| w.old).filter(|o| *o != null));
         let objects = objects_to_send(repo, &wants, &haves);
         let bytes = super::pack_objects::pack_bytes_for(repo, &objects)?;
@@ -1709,6 +1732,132 @@ impl Default for RemoteVerdict {
             reports: Vec::new(),
         }
     }
+}
+
+/// Whether `transport_get()` hands `url` to a remote helper rather than to the
+/// native transport (transport.c:1209-1290): a `<helper>::<address>` URL, or a
+/// `<scheme>://` URL whose scheme is not `file`, `git`, `ssh`, `git+ssh` or
+/// `ssh+git`. A push through a helper — smart HTTP is `git-remote-curl` — runs
+/// `git send-pack` as that helper's child instead of `git_transport_push()`.
+pub(super) fn through_remote_helper(url: &str) -> bool {
+    // `is_urlschemechar(first, ch)`: alphanumerics, and `+`, `-`, `.` after the first.
+    let scheme_len = url
+        .char_indices()
+        .take_while(|&(i, c)| c.is_ascii_alphabetic() || (i > 0 && (c.is_ascii_digit() || "+-.".contains(c))))
+        .count();
+    if url[scheme_len..].starts_with("::") {
+        return true;
+    }
+    // `is_url()` (url.c:20-38): a scheme followed by "://".
+    if scheme_len == 0 || !url[scheme_len..].starts_with("://") {
+        return false;
+    }
+    !["file", "git", "ssh", "git+ssh", "ssh+git"].contains(&&url[..scheme_len])
+}
+
+/// Ports `get_commons_through_negotiation()` (send-pack.c:402-475): run
+/// `git fetch --negotiate-only` against the push URL with one
+/// `--negotiation-restrict` per tip being pushed, and read back the commits it
+/// prints, one hex id and a newline each. They join the pack's haves.
+///
+/// `tips` is every `new_oid` of `remote_refs` in its order; the null ones —
+/// deletions, and the refs nothing was matched to — name no tip. A configured
+/// `remote.<name>.negotiationRestrict` replaces them; `negotiationInclude` adds
+/// `--negotiation-include` haves. With neither a tip nor an include, no child runs.
+///
+/// The information is useful but not mandatory: a child that fails — a protocol
+/// v0 server, one without `wait-for-done` — leaves its own messages on stderr,
+/// and the push goes on with the advertisement alone after a warning.
+fn get_commons_through_negotiation(
+    repo: &gix::Repository,
+    url: &str,
+    opts: &SendOptions,
+    tips: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    use std::io::Read;
+
+    let mut args: Vec<String> = vec!["fetch".into(), "--negotiate-only".into()];
+    let mut nr_negotiation = 0;
+    if !opts.negotiation_restrict.is_empty() {
+        args.extend(opts.negotiation_restrict.iter().map(|r| format!("--negotiation-restrict={r}")));
+        nr_negotiation = opts.negotiation_restrict.len();
+    } else {
+        for tip in tips.iter().filter(|id| !id.is_null()) {
+            args.push(format!("--negotiation-restrict={tip}"));
+            nr_negotiation += 1;
+        }
+    }
+    args.extend(opts.negotiation_include.iter().map(|r| format!("--negotiation-include={r}")));
+    nr_negotiation += opts.negotiation_include.len();
+    // `args->url`. Through a helper it is the `send-pack` child's destination,
+    // which `git-remote-curl` passes as its own `url` after `end_url_with_slash()`
+    // (remote-curl.c:1587-1589, :1394) — the address without its `<helper>::`
+    // prefix, ending in '/'.
+    let mut url = url.to_owned();
+    if through_remote_helper(&url) {
+        if let Some((_, address)) = url.split_once("::").filter(|(scheme, _)| !scheme.contains('/')) {
+            url = address.to_owned();
+        }
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+    }
+    args.push(url);
+    if nr_negotiation == 0 {
+        return Ok(Vec::new());
+    }
+
+    // `child.git_cmd = 1; child.no_stdin = 1; child.out = -1;`: stderr stays the
+    // caller's.
+    crate::cstdio::before_spawn();
+    let child = crate::hosted::git_exe().and_then(|exe| {
+        super::maintenance::git_child(repo, exe)
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+    });
+    let Ok(mut child) = child else {
+        crate::git_fatal!("send-pack: unable to fork off fetch subprocess");
+    };
+    let mut out = child.stdout.take().expect("piped stdout");
+    let len = repo.object_hash().len_in_hex() + 1;
+    let mut commons = Vec::new();
+    loop {
+        // `read_in_full(child.out, hex_hash, len)`: as many bytes as arrive, up to `len`.
+        let mut hex_hash = vec![0u8; len];
+        let mut read_len = 0;
+        while read_len < len {
+            match out.read(&mut hex_hash[read_len..]) {
+                Ok(0) => break,
+                Ok(n) => read_len += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        if read_len == 0 {
+            break;
+        }
+        if read_len != len {
+            crate::git_fatal!("invalid length read {read_len}");
+        }
+        let oid = match (ObjectId::from_hex(&hex_hash[..len - 1]), hex_hash[len - 1]) {
+            (Ok(oid), b'\n') => oid,
+            _ => crate::git_fatal!("invalid hash"),
+        };
+        commons.push(oid);
+    }
+    drop(out);
+    // `finish_command()`: the child's exit, through `wait_or_whine()`.
+    let code = match child.wait() {
+        Ok(status) => super::fetch::wait_status_code("fetch", status),
+        Err(_) => -1,
+    };
+    if code != 0 {
+        // "The information that push negotiation provides is useful but not mandatory."
+        eprintln!("warning: push negotiation failed; proceeding anyway with push");
+    }
+    Ok(commons)
 }
 
 /// Read every pkt-line of the response up to the first flush, as text. Ports the

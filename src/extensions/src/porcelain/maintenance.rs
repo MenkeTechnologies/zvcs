@@ -2345,7 +2345,7 @@ mod task_option_tests {
 /// Outside that model the child starts at the top of the work tree, and a relative
 /// `GIT_DIR` this process was handed is made absolute so it still names the
 /// repository from there.
-fn git_child(repo: &gix::Repository, exe: PathBuf) -> std::process::Command {
+pub(super) fn git_child(repo: &gix::Repository, exe: PathBuf) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.current_dir(repo.workdir().unwrap_or_else(|| repo.git_dir()));
     let setup = crate::setup::after_setup(repo);

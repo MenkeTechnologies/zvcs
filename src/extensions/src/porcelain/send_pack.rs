@@ -386,6 +386,10 @@ fn push(st: &State) -> Result<ExitCode> {
         }),
         // `git send-pack` talks to `git_connect()` itself, so no transport helper is handed a verbosity.
         verbosity: 0,
+        // `cmd_send_pack()` never sets `args.negotiation_include` or `args.negotiation_restrict`
+        // (builtin/send-pack.c:27), so `push.negotiate` restricts to the pushed tips alone.
+        negotiation_include: Vec::new(),
+        negotiation_restrict: Vec::new(),
     };
 
     // `git_connect()` for a local destination runs `git-receive-pack '<dest>'`,
@@ -511,6 +515,13 @@ pub(crate) fn local_dest_that_is_not_a_repository<'a>(
     if url.scheme != gix::url::Scheme::File {
         return None;
     }
+    // `parse_connect_url()` hands `git-receive-pack` the path of a `file:///<path>`
+    // URL, from the '/' that ends its empty host (connect.c:1110-1140), and that
+    // path is what `enter_repo()` opens and its message quotes.
+    let dest = match dest.strip_prefix("file://") {
+        Some(path) if path.starts_with('/') => path,
+        _ => dest,
+    };
     // `enter_repo(..., strict = 0)`: a worktree, a `.git` directory, or a bare
     // repository, with `.git` appended if that is what makes it one.
     let found = [

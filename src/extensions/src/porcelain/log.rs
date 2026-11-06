@@ -3511,6 +3511,13 @@ fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<
                     .or_else(|_| committish_short_oid(&repo, spec).ok_or(()))
                     .map_err(|_| ())
             };
+            // A bare prefix that names more than one object and that the
+            // `GET_OID_COMMITTISH` hint leaves ambiguous is reported by
+            // `get_short_oid()` itself, ahead of whatever `setup_revisions()` then
+            // makes of the operand (object-name.c:507-543).
+            if resolved.is_err() && spec.bytes().all(|b| b.is_ascii_hexdigit()) {
+                crate::objname::short_oid_ambiguous_as(&repo, spec, Some("committish"), false);
+            }
             match resolved {
                 Ok(id) => {
                     // `prepare_revision_walk()`'s `handle_commit()` peels a tag

@@ -285,6 +285,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         ParseControl::Proceed => {}
         ParseControl::Exit(code) => return Ok(ExitCode::from(code)),
     }
+    // `fsck_obj()`'s `root`/`tagged` lines and `mark_object()`'s `broken link` lines are
+    // `printf()`s into stdio's buffer as the scan and the walk reach them, and a read that
+    // `die()`s afterwards leaves through `exit()`, which flushes what the buffer holds.
+    crate::cstdio::defer();
 
     // `cmd_fsck`: `--lost-found` forces a full check and turns reflogs off.
     if opt.write_lost_and_found {
@@ -322,6 +326,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
 
     let mut errors: u8 = 0;
     let mut state = State::default();
+    state.untyped_listing = opt.connectivity_only;
 
     // ---- 1. reference-database check ---------------------------------------
     //
@@ -555,15 +560,18 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // early for an object already parsed (object.c:335-337), so only a head's
     // first appearance reads; an explicit argument also reads whatever
     // `repo_get_oid()` had to read to resolve it (see [`explicit_arg_reads`]).
-    let snapshot_reads: Option<Vec<ObjectId>> = match (snapshot_missed, explicit_heads) {
-        (true, _) => None,
-        (false, true) => explicit_arg_reads(&repo, &traces),
-        (false, false) => {
+    // A head no source produced was read too, but `find_pack_entry()` answered it from
+    // no pack and so moved none (packfile.c:2149-2168), and the `odb_reprepare()` of its
+    // second pass re-sorts each list, which keeps a tie in the order it has (see
+    // [`PackLists::load`] for the multi-pack-index case it does not place).
+    let snapshot_reads: Option<Vec<ObjectId>> = match explicit_heads {
+        true => explicit_arg_reads(&repo, &traces),
+        false => {
             let mut parsed: HashSet<ObjectId> = HashSet::new();
             Some(heads.iter().copied().filter(|id| parsed.insert(*id)).collect())
         }
     };
-    let pack_lists = PackLists::load(&repo, snapshot_reads.as_deref());
+    let pack_lists = PackLists::load(&repo, snapshot_reads.as_deref(), snapshot_missed);
     // `--full`'s `verify_pack()` pass, run ahead of the scan so the objects it
     // could not produce are treated as absent; its lines are printed at 3b.
     let mut pack_check = match opt.check_full && !opt.connectivity_only {
@@ -571,7 +579,8 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         false => super::pack_check::PackCheck::default(),
     };
     let packed_half = PackedHalf::load(&repo, midx_on);
-    let object_scan = ObjectScan::new(&repo, opt.check_full, opt.verbose, pack_lists.as_ref());
+    let refused_packs: Vec<PathBuf> = pack_check.refused.iter().map(|(path, _)| path.clone()).collect();
+    let object_scan = ObjectScan::new(&repo, opt.check_full, opt.verbose, pack_lists.as_ref(), &refused_packs);
     // The scan's visits, once per copy, when their order is known and accounts
     // for exactly the objects listed above. A copy `verify_pack()` could not
     // produce never reaches `fsck_obj_buffer()` while another copy of the same
@@ -580,25 +589,46 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let visits: Option<Vec<ScanVisit>> = object_scan.visits.filter(|visits| {
         let mut seen: HashSet<ObjectId> = HashSet::new();
         let mut repeated = false;
+        // A refused pack's copies are known not to be walked, so only the
+        // copies its walk did reach can be repeats.
+        let mut walked: HashSet<ObjectId> = HashSet::new();
         for visit in visits {
-            repeated |= !seen.insert(visit.id) && pack_check.unverified.contains(&visit.id);
+            seen.insert(visit.id);
+            if !visit.refused {
+                repeated |= !walked.insert(visit.id) && pack_check.unverified.contains(&visit.id);
+            }
         }
         !repeated && seen.len() == in_odb.len() && seen.iter().all(|id| in_odb.contains(id))
     });
     let scan_ordered = visits.is_some();
     let visits: Vec<ScanVisit> = match visits {
         Some(visits) => {
+            // The walked copies first: a refused pack's copy is never visited, so
+            // an object it alone holds is only listed, after them.
             let mut seen: HashSet<ObjectId> = HashSet::new();
-            all = visits.iter().map(|v| v.id).filter(|id| seen.insert(*id)).collect();
+            all = visits
+                .iter()
+                .filter(|v| !v.refused)
+                .chain(visits.iter().filter(|v| v.refused))
+                .map(|v| v.id)
+                .filter(|id| seen.insert(*id))
+                .collect();
             visits
         }
-        None => all.iter().map(|&id| ScanVisit { id, loose: is_loose(&repo, id) }).collect(),
+        None => all.iter().map(|&id| ScanVisit {
+            id,
+            loose: is_loose(&repo, id),
+            refused: false,
+        }).collect(),
     };
     // Where each object is first visited in that order, for the lines that are
     // keyed by id rather than by visit (see `lint_special_blobs()`).
     let scan_index: Option<HashMap<ObjectId, usize>> = scan_ordered.then(|| {
         let mut index: HashMap<ObjectId, usize> = HashMap::new();
         for (at, visit) in visits.iter().enumerate() {
+            if visit.refused {
+                continue;
+            }
             index.entry(visit.id).or_insert(at);
         }
         index
@@ -627,11 +657,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `--connectivity-only`, the listing that replaces it — and when there is no
     // linked worktree, whose HEAD git snapshots with the main one but which this
     // port handles in one later block together with that worktree's index and
-    // reflogs.
+    // reflogs; and when every `<object>` argument's `repo_get_oid()` was traced
+    // in full, since a step [`GetOid`] does not model may create objects.
     let mut creation_modeled = match opt.connectivity_only {
         true => listing.is_some(),
         false => scan_ordered,
-    } && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true);
+    } && repo.worktrees().map(|w| w.is_empty()).unwrap_or(true)
+        && traces.iter().all(|trace| trace.complete);
     let has_promisor_remote = super::rev_list::has_promisor_remote(&repo);
 
     // Children of every object, for `used` and `missing`. git checks every
@@ -732,11 +764,19 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let mut scan_parsed: HashSet<ObjectId> = HashSet::new();
     let mut scan_packs = ScanPacks::default();
     let mut scanned: HashSet<ObjectId> = HashSet::new();
-    for &ScanVisit { id, loose } in &visits {
+    for &ScanVisit { id, loose, refused } in &visits {
         if opt.connectivity_only {
             continue;
         }
         visit_start.push(msg_lines.len());
+        // A refused pack's copy is not visited at all (pack-check.c:69-70); an
+        // object no walked copy produced stays without `HAS_OBJ`.
+        if refused {
+            if !pack_check.verified.contains(&id) && loose_object_path(&repo, id).is_none() {
+                corrupt.insert(id);
+            }
+            continue;
+        }
         // A copy of an object an earlier copy failed to read or parse goes
         // through `parse_object_buffer()` again, against an object whose
         // `parsed` flag the failed parse already set.
@@ -1010,6 +1050,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             );
         }
         scan_lines.sort_by_key(|(id, _)| id.as_bytes()[0]);
+    }
+    // The scan has printed these by now, in this order.
+    for (_, line) in &scan_lines {
+        crate::cstdio::println!("{line}");
     }
 
     // The message layer's lines come from the same scan plus `fsck_finish()`,
@@ -1318,10 +1362,12 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // what decides whether an unreadable object is even opened here. A head has
     // no such site.
     let mut queue: Vec<(ObjectId, Option<Kind>)> = Vec::new();
-    // `mark_object()`'s stdout lines, emitted by `traverse_reachable()` — after
-    // every line `fsck_obj()` printed during the scan and before the
-    // connectivity report.
-    let mut broken_links: Vec<String> = Vec::new();
+    // Each reachable object without `HAS_OBJ`, with the type its `missing` line names it
+    // by (`None` for none). `check_reachable_object()` asks `has_object_pack()` about it
+    // when `check_connectivity()`'s slot loop reaches it (builtin/fsck.c:246-262,
+    // :341-349), after the walk's reads, and each answer from a pack moves that pack to
+    // the head of its list for the next.
+    let mut pack_probes: Vec<(ObjectId, Option<Kind>)> = Vec::new();
     for id in heads {
         if state.reachable.insert(id) {
             // A head reaches `mark_object()` through `mark_object_reachable()`
@@ -1340,19 +1386,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // A head the loose walk never reached is a readable object of its
             // own type, which `parse_object()`/`lookup_tree()` gave it.
             if !has_obj.contains(&id) {
-                let (in_pack, lines) = packed_half.has(&repo, id, &pack_check.bad)?;
-                if !lines.is_empty() {
-                    state.pack_probe_lines.insert(id, lines);
-                }
-                if !in_pack {
-                    if index_blobs.contains(&id) {
-                        state.missing.insert(id, Kind::Blob);
-                    } else if unvisited.contains(&id) {
-                        if let Ok(header) = repo.find_header(id) {
-                            state.missing.insert(id, header.kind());
-                        }
-                    }
-                }
+                let missing_as = if index_blobs.contains(&id) {
+                    Some(Kind::Blob)
+                } else if unvisited.contains(&id) {
+                    repo.find_header(id).ok().map(|header| header.kind())
+                } else {
+                    None
+                };
+                pack_probes.push((id, missing_as));
                 continue;
             }
             queue.push((id, None));
@@ -1363,16 +1404,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     // `object_array_pop()` hands `traverse_one_object()`, whatever that walk
     // made of it.
     let mut connectivity = crate::progress::Meter::delayed("Checking connectivity", 0, show_progress)?;
-    let walk_midx: Vec<(PathBuf, Option<SourceMidx>)> = match midx_on {
-        true => odb_sources(&repo)
-            .into_iter()
-            .map(|objdir| {
-                let midx = SourceMidx::open(&objdir.join("pack"), repo.object_hash()).flatten();
-                (objdir, midx)
-            })
-            .collect(),
-        false => Vec::new(),
-    };
     while let Some((id, expected)) = queue.pop() {
         'traverse: {
             // A tree entry's blob, and an index entry's, is `lookup_blob()`'s object, typed
@@ -1384,10 +1415,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             let typed = expected.or_else(|| state.kinds.get(&id).copied());
             if typed == Some(Kind::Blob) || (expected.is_none() && index_blobs.contains(&id)) {
                 break 'traverse;
-            }
-            // The read below `die()`s on a bad pack-int-id, which flushes what stdout holds.
-            if midx_read_dies(&walk_midx, id) {
-                print_held_stdout(&scan_lines, &broken_links);
             }
             let kind = match repo.find_header(id) {
                 Ok(h) => h.kind(),
@@ -1403,7 +1430,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // which dies on an object only a pack that gave up on it holds (object.c:345-378,
                     // odb.c:597-603), flushing what stdout holds.
                     _ if expected != Some(Kind::Blob) && corrupt_packed_message(&err).is_some() => {
-                        print_held_stdout(&scan_lines, &broken_links);
                         match repo.find_object(id) {
                             Ok(object) => object.kind,
                             Err(_) => break 'traverse,
@@ -1417,6 +1443,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // give up with `Could not read` (commit.c:638-645, tree.c:194-199,
                     // tag.c:214-217). `traverse_reachable()` ignores the walk's failure.
                     _ if matches!(err, gix::object::find::existing::Error::NotFound { .. }) => {
+                        // Each read that misses re-prepares the odb on its second pass, which
+                        // re-sorts every pack list (odb.c:571-584).
+                        state.pack_reads.push((None, None));
                         match typed {
                             None => {
                                 // `parse_object()` opens with `lookup_object()` (object.c:335).
@@ -1455,7 +1484,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // follows, whatever the object database says, and a corrupt edge dies.
             let parsed_already = pre_parsed.contains(&id) || (!opt.connectivity_only && has_obj.contains(&id));
             let from_graph = match kind == Kind::Commit && !parsed_already {
-                true => match walk_parse_commit(&mut graph, id, &scan_lines, &broken_links)? {
+                true => match walk_parse_commit(&mut graph, id)? {
                     Some(parsed) => parsed,
                     // `repo_parse_commit()` failed, so `fsck_walk_commit()` returns -1 and
                     // nothing behind the commit is walked.
@@ -1483,11 +1512,14 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // `traverse_one_object()` frees it after (builtin/fsck.c:174-183), a commit is
             // read unless parsed or answered by the graph — whose answer
             // `GIT_COMMIT_GRAPH_PARANOIA` checks with `odb_has_object()` (commit.c:625-636)
-            // — and `parse_tag()` reads a tag not parsed yet. Under a full scan nothing
-            // after it lists the packs again, so only `--connectivity-only` keeps these.
-            if opt.connectivity_only {
+            // — and `parse_tag()` reads a tag not parsed yet. A scan's `fsck_obj()` freed
+            // every tree it checked, which clears `parsed` (builtin/fsck.c:446-448,
+            // tree.c:208-213), so the walk reads each tree again. `--connectivity-only`'s
+            // listing and `check_connectivity()`'s `has_object_pack()` both meet the
+            // lists these reads left.
+            {
                 let reads = match kind {
-                    Kind::Tree => !state.parsed_trees.remove(&id),
+                    Kind::Tree => !opt.connectivity_only || !state.parsed_trees.remove(&id),
                     Kind::Commit if from_graph.is_some() => {
                         crate::setup::git_env_bool("GIT_COMMIT_GRAPH_PARANOIA", false)
                     }
@@ -1661,13 +1693,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                         // `%7s` on both type names — `gix`'s `Kind` writes itself
                         // through `write_str`, which ignores a width, so the padding
                         // is applied to the rendered name instead.
-                        broken_links.push(format!(
+                        crate::cstdio::println!(
                             "broken link from {:>7} {}\n              to {:>7} {}",
                             kind.to_string(),
                             names.describe(&id),
                             child_kind.to_string(),
                             names.describe(&child)
-                        ));
+                        );
                         errors |= ERROR_REACHABLE;
                     }
                     // ```c
@@ -1680,14 +1712,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     //
                     // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
                     // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
-                    // there, so the pack is consulted before anything is reported.
-                    let (in_pack, lines) = packed_half.has(&repo, child, &pack_check.bad)?;
-                    if !lines.is_empty() {
-                        state.pack_probe_lines.insert(child, lines);
-                    }
-                    if !in_pack {
-                        state.missing.insert(child, child_kind);
-                    }
+                    // there, so the pack is consulted before anything is reported. That ask
+                    // is `check_connectivity()`'s, in slot order after the walk (see
+                    // `pack_probes`).
+                    pack_probes.push((child, Some(child_kind)));
                     continue;
                 }
                 queue.push((child, Some(child_kind)));
@@ -1830,7 +1858,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // `fsck_walk_commit()`'s `repo_parse_commit()` asks the commit-graph first, as in
                 // the reachability walk above; only a head was parsed before.
                 let from_graph = match kind == Kind::Commit && !parsed_before {
-                    true => match walk_parse_commit(&mut graph, id, &scan_lines, &broken_links)? {
+                    true => match walk_parse_commit(&mut graph, id)? {
                         Some(parsed) => parsed,
                         None => continue,
                     },
@@ -1884,7 +1912,46 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     }
 
     // ---- 7. the connectivity report ----------------------------------------
-    //
+    let order = SlotOrder::new(
+        &state.known,
+        creation_modeled.then_some(state.ops.as_slice()),
+    );
+    // `check_reachable_object()`'s `has_object_pack()` (packfile.c:1922-1933) runs as
+    // `check_connectivity()` reaches each object in slot order (builtin/fsck.c:341-349).
+    // It asks each source's `find_pack_entry()`, which walks the pack list from its head,
+    // steps over a pack `is_pack_valid()` refuses, and moves the pack that answers to the
+    // head (odb/source-packed.c:22-46). So which of two packs holding an object answers,
+    // and whether the refused one is opened and reported first, is the list's order at
+    // that moment: [`PackLists`] after `odb_reprepare()`, then every read since
+    // (`State::pack_reads`), then the earlier answers here. A miss here re-prepares
+    // nothing: `has_object_pack()` asks the packed source alone, with no second read.
+    // `--connectivity-only`'s `printable_type()` and `--lost-found`'s writes read too, in
+    // the same loop, and are not replayed; nor is an order the slots leave open.
+    let probe_ids: Vec<ObjectId> = pack_probes.iter().map(|(id, _)| *id).collect();
+    let mut mru = pack_lists
+        .as_ref()
+        .filter(|_| !opt.connectivity_only && !opt.write_lost_and_found && !order.is_ambiguous_for(&probe_ids))
+        .map(ReferentsPacks::new);
+    if let Some(mru) = &mut mru {
+        for &(read, frozen) in &state.pack_reads {
+            mru.read(read, frozen);
+        }
+    }
+    pack_probes.sort_by_key(|(id, _)| (order.slot_of(id), *id));
+    for (id, missing_as) in pack_probes {
+        let (in_pack, lines) = packed_half.has(&repo, id, &pack_check.bad, mru.as_ref())?;
+        if !lines.is_empty() {
+            state.pack_probe_lines.insert(id, lines);
+        }
+        match (in_pack, missing_as, &mut mru) {
+            (true, _, Some(mru)) => mru.read(Some(id), None),
+            (false, Some(kind), _) => {
+                state.missing.insert(id, kind);
+            }
+            _ => {}
+        }
+    }
+
     // `check_reachable_object()` prints `missing` for anything reachable that
     // lacks `HAS_OBJ`, which an object the scan failed to parse does.
     for (&id, &kind) in &unparseable {
@@ -1949,10 +2016,6 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let order = SlotOrder::new(
-        &state.known,
-        creation_modeled.then_some(state.ops.as_slice()),
-    );
     let mut reported: Vec<ObjectId> = lines.iter().map(|(id, _)| *id).collect();
     // `check_object()` prints its `Checking` line ahead of `check_reachable_object()`'s
     // `has_object_pack()` (builtin/fsck.c:341-349), so under `--verbose` the pack lines
@@ -1994,20 +2057,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         }
     }
 
-    let mut out = String::new();
-    for (_, line) in &scan_lines {
-        out.push_str(line);
-        out.push('\n');
-    }
-    for line in &broken_links {
-        out.push_str(line);
-        out.push('\n');
-    }
     for (_, line) in &lines {
-        out.push_str(line);
-        out.push('\n');
+        crate::cstdio::println!("{line}");
     }
-    print!("{out}");
 
     // ```c
     // if (repo->settings.core_commit_graph) {
@@ -2352,6 +2404,10 @@ fn resolve_long(arg: &str) -> LongOutcome {
 /// Everything accumulated across the passes.
 #[derive(Default)]
 struct State {
+    /// `--connectivity-only`, whose listing creates every object it lists untyped through
+    /// `lookup_unknown_object()` (builtin/fsck.c:795-803): only `typed` then says an object
+    /// has a type.
+    untyped_listing: bool,
     /// Every object id git's `obj_hash` would hold: present objects plus every
     /// id merely referenced by one. Drives the output ordering.
     known: HashSet<ObjectId>,
@@ -2524,14 +2580,8 @@ fn parse_object_ops(
 /// yet, as far as the commit-graph answers it (commit.c:625-640): `Some(Some(_))` is the tree
 /// and parents the graph holds, `Some(None)` sends the caller to the object database, and `None`
 /// is a failed parse, after its `error()`. A corrupt edge dies; `die()` then flushes the stdout
-/// `fsck_obj()` and `mark_object()` wrote so far, which this port still holds in `scan_lines`
-/// and `broken_links`.
-fn walk_parse_commit(
-    graph: &mut ProcessGraph<'_>,
-    id: ObjectId,
-    scan_lines: &[(ObjectId, String)],
-    broken_links: &[String],
-) -> Result<Option<Option<Decoded>>> {
+/// `fsck_obj()` and `mark_object()` wrote so far, which [`crate::cstdio`] holds.
+fn walk_parse_commit(graph: &mut ProcessGraph<'_>, id: ObjectId) -> Result<Option<Option<Decoded>>> {
     let mut out = Vec::new();
     let result = graph.parse_commit(id, &mut out);
     for line in out {
@@ -2552,10 +2602,7 @@ fn walk_parse_commit(
             eprintln!("{line}");
             Ok(None)
         }
-        Err(msg) => {
-            print_held_stdout(scan_lines, broken_links);
-            Err(crate::fatal::die(msg))
-        }
+        Err(msg) => Err(crate::fatal::die(msg)),
     }
 }
 
@@ -2569,35 +2616,6 @@ pub(crate) fn corrupt_packed_message(err: &gix::object::find::existing::Error) -
         },
         _ => None,
     }
-}
-
-/// What `die()` flushes when it ends the walk: the stdout lines `fsck_obj()` and
-/// `mark_object()` wrote so far, which this port still holds.
-fn print_held_stdout(scan_lines: &[(ObjectId, String)], broken_links: &[String]) {
-    let mut printed = String::new();
-    for line in scan_lines.iter().map(|(_, l)| l).chain(broken_links) {
-        printed.push_str(line);
-        printed.push('\n');
-    }
-    print!("{printed}");
-}
-
-/// Whether an odb read of `id` dies in `midx_for_pack()` on a pack-int-id past the
-/// midx's packs (midx.c:438-454). `find_pack_entry()` asks a source's midx before
-/// anything else (odb/source-packed.c:31-36), so the first source whose midx holds `id`
-/// decides, unless an earlier source answered from a loose copy. Only a single-file midx:
-/// the object database this port reads through does not load an incremental chain.
-fn midx_read_dies(sources: &[(PathBuf, Option<SourceMidx>)], id: ObjectId) -> bool {
-    let hex = id.to_hex().to_string();
-    for (objdir, midx) in sources {
-        if let Some(dies) = midx.as_ref().filter(|m| m.layers.len() == 1).and_then(|m| m.owner_dies(id)) {
-            return dies;
-        }
-        if objdir.join(&hex[..2]).join(&hex[2..]).is_file() {
-            return false;
-        }
-    }
-    false
 }
 
 /// `object.c::parse_object_buffer` for the four types, reduced to what
@@ -3051,7 +3069,14 @@ fn collect_reflog_heads(
                         }
                         state.note(id);
                         heads.push(id);
-                    } else if !promisor.contains(&id) {
+                        continue;
+                    }
+                    // The `lookup_object()` finds an object created without `HAS_OBJ` all the
+                    // same, and moves it back to its home slot (object.c:92-118).
+                    if state.known.contains(&id) {
+                        state.note(id);
+                    }
+                    if !promisor.contains(&id) {
                         eprintln!("error: {name}: invalid reflog entry {id}");
                         errors |= ERROR_REACHABLE;
                     }
@@ -3213,7 +3238,23 @@ fn collect_cache_tree(
         eprintln!("Checking cache tree of {index_path}");
     }
     if tree.num_entries.is_some() {
-        if !repo.has_object(tree.id) {
+        // `parse_object()` (builtin/fsck.c:705-710) asks `odb_read_object_info()` for an object
+        // with no type other than blob and then `odb_read_object()` (object.c:335-378), each a
+        // read with its second pass (odb.c:571-584): a pack `is_pack_valid()` refuses is
+        // reported on every pass, and the miss re-prepares the odb, which re-sorts each pack
+        // list. An object a scanned tree named is a typed tree already, and is read once.
+        let typed = state.known.contains(&tree.id)
+            && (!state.untyped_listing || state.typed.contains(&tree.id))
+            && state.kinds.get(&tree.id) != Some(&Kind::Blob);
+        let (mut present, refused) = gix::odb::store::capture_errors(|| repo.has_object(tree.id));
+        if !present && !refused.is_empty() {
+            let info = typed || repo.find_header(tree.id).is_ok();
+            present = repo.find_object(tree.id).is_ok() && info;
+        } else {
+            refused.iter().for_each(|line| eprintln!("{line}"));
+        }
+        if !present {
+            state.pack_reads.push((None, None));
             die_if_unreadable_loose(repo, tree.id)?;
             eprintln!(
                 "error: {}: invalid sha1 pointer in cache-tree of {index_path}",
@@ -3365,7 +3406,7 @@ impl PackedHalf {
                     if !name.ends_with(".idx") || matches!(&midx, Some(Some(m)) if m.contains(&name)) {
                         continue;
                     }
-                    if let Some(Some(pack)) = listed_pack(&pack_dir, &name, repo.object_hash(), false) {
+                    if let Some(Some(pack)) = listed_pack(repo, &pack_dir, &name, false) {
                         packs.push((pack_dir.join(name).with_extension("pack"), pack.index));
                     }
                 }
@@ -3379,11 +3420,17 @@ impl PackedHalf {
     }
 
     /// Whether some source's packed half answers `id`, and the `error:` lines the
-    /// `is_pack_valid()` calls on the way printed. `Err` when the answer, or how many
-    /// packs are opened on the way, depends on the order of a source's pack list,
-    /// which is not replayed here: `id` in more than one pack outside a
-    /// multi-pack-index, one of which `is_pack_valid()` refuses.
-    fn has(&self, repo: &gix::Repository, id: ObjectId, bad: &HashSet<ObjectId>) -> Result<(bool, Vec<String>)> {
+    /// `is_pack_valid()` calls on the way printed. When `id` is in more than one pack
+    /// outside a multi-pack-index and `is_pack_valid()` refuses one of them, the answer
+    /// and the packs opened on the way are the order of the source's list: `mru` is
+    /// that list as it stands, and `Err` is returned without it.
+    fn has(
+        &self,
+        repo: &gix::Repository,
+        id: ObjectId,
+        bad: &HashSet<ObjectId>,
+        mru: Option<&ReferentsPacks<'_>>,
+    ) -> Result<(bool, Vec<String>)> {
         let mut lines = Vec::new();
         if bad.contains(&id) {
             return Ok((false, lines));
@@ -3400,7 +3447,7 @@ impl PackedHalf {
             }
             valid
         };
-        for source in &self.sources {
+        for (nth, source) in self.sources.iter().enumerate() {
             let Some(midx) = &source.midx else {
                 if source.packs.iter().any(|(_, index)| index.lookup(id).is_some()) {
                     return Ok((true, lines));
@@ -3413,7 +3460,7 @@ impl PackedHalf {
                     return Ok((true, lines));
                 }
             }
-            let holders: Vec<&(PathBuf, pack::index::File)> =
+            let mut holders: Vec<&(PathBuf, pack::index::File)> =
                 source.packs.iter().filter(|(_, index)| index.lookup(id).is_some()).collect();
             if holders.len() > 1 {
                 let valid: Vec<bool> = holders
@@ -3423,7 +3470,15 @@ impl PackedHalf {
                         valid
                     })
                     .collect();
-                if valid.contains(&true) && valid.contains(&false) {
+                let listed = mru.and_then(|mru| mru.sources.get(nth)).map(|(_, packs)| {
+                    let at = |path: &Path| packs.iter().position(|pack| pack.index.path().with_extension("pack") == path);
+                    holders.iter().map(|(path, _)| at(path)).collect::<Option<Vec<usize>>>()
+                });
+                if let Some(Some(at)) = listed {
+                    let mut by_list: Vec<(usize, &(PathBuf, pack::index::File))> = at.into_iter().zip(holders).collect();
+                    by_list.sort_by_key(|(at, _)| *at);
+                    holders = by_list.into_iter().map(|(_, holder)| holder).collect();
+                } else if valid.contains(&true) && valid.contains(&false) {
                     bail!(
                         "refusing to guess the output: {id} is in {} packs of {}, and which of them \
                          has_object_pack() opens first is the order of git's most-recently-used pack list",
@@ -4201,6 +4256,11 @@ enum ArgOp {
     Error(String),
     /// A `warning()` line, without its `warning: ` prefix.
     Warning(String),
+    /// An `advise()` line, without its `hint: ` prefix.
+    Advice(String),
+    /// `parse_tag()`'s `parse_tag_buffer()` on a tag `lookup_tag()` created: the tagged object
+    /// is looked up as the type the tag names (tag.c:130-204).
+    ParseTag(ObjectId),
     /// A `die()`, which ends the command there.
     Fatal(String),
     /// `odb_reprepare()`, which re-sorts every source's pack list (stable, so the
@@ -4224,7 +4284,7 @@ struct ArgTrace {
 }
 
 /// A step [`GetOid`] does not model: a read of an object no source holds, a
-/// disambiguation that reads its candidates or reports them, a ref store other
+/// disambiguation whose type hint reads its candidates, a ref store other
 /// than the files backend, a corrupt object, or a name shape not ported.
 struct Unmodelled;
 
@@ -4238,8 +4298,46 @@ enum Hint {
     Treeish,
 }
 
+/// `struct disambiguate_state`'s candidate bookkeeping (object-name.c:36-49).
+#[derive(Default)]
+struct Disambiguation {
+    candidate: Option<ObjectId>,
+    checked: bool,
+    ok: bool,
+    fn_used: bool,
+    ambiguous: bool,
+}
+
 /// A step's result: `Ok(None)` is the C's own failure, `Err` a step not modelled.
 type Step<T> = std::result::Result<T, Unmodelled>;
+
+/// `git_qsort_s()` (compat/qsort_s.c:9-63), the merge sort `QSORT_S()` is on every platform
+/// git is built for without `HAVE_ISO_QSORT_S` (compat/posix.h:492-501): each half sorted, then
+/// merged taking from the left half while `cmp` says `<= 0`. Its calls to `cmp` are the order a
+/// comparator that reads sees its reads in.
+fn git_qsort_s<T: Copy>(b: &mut [T], cmp: &mut impl FnMut(&T, &T) -> std::cmp::Ordering) {
+    let n = b.len();
+    if n <= 1 {
+        return;
+    }
+    let n1 = n / 2;
+    git_qsort_s(&mut b[..n1], cmp);
+    git_qsort_s(&mut b[n1..], cmp);
+    let mut tmp: Vec<T> = Vec::with_capacity(n);
+    let (mut i, mut j) = (0, n1);
+    while i < n1 && j < n {
+        if cmp(&b[i], &b[j]) != std::cmp::Ordering::Greater {
+            tmp.push(b[i]);
+            i += 1;
+        } else {
+            tmp.push(b[j]);
+            j += 1;
+        }
+    }
+    // What is left of the right half is in place already.
+    tmp.extend_from_slice(&b[i..n1]);
+    b[..tmp.len()].copy_from_slice(&tmp);
+}
 
 /// `repo_get_oid()` (object-name.c:1729-1860) over the `<object>` arguments, with
 /// the parsed-object table its reads, parses and lookups share across them.
@@ -4247,8 +4345,8 @@ type Step<T> = std::result::Result<T, Unmodelled>;
 /// Modelled: a full-length hex id, a name `repo_dwim_ref()` or `repo_dwim_log()`
 /// finds with its reflog selector, `@{-<n>}` and `@{u}` marks (`get_oid_basic()`,
 /// object-name.c:667-825, which reads nothing), an abbreviated id or describe name
-/// one object answers (`get_short_oid()` / `get_describe_name()`, :501-560,
-/// :1056-1081), and over those `~<n>` / `^<n>` (`get_nth_ancestor()` /
+/// one object answers or, with no hint, reports ambiguous (`get_short_oid()` /
+/// `get_describe_name()`, :455-545, :1056-1081), and over those `~<n>` / `^<n>` (`get_nth_ancestor()` /
 /// `get_parent()`, :827-880), `^{<type>}` and `^{/<regex>}` (`peel_onion()`,
 /// :907-1000), `<rev>:<path>` (`get_tree_entry()`, tree-walk.c:568-635),
 /// `:[<n>:]<path>` (the index) and `:/<text>` (every ref, :1758-1775), with `./`
@@ -4450,8 +4548,9 @@ impl<'r> GetOid<'r> {
     /// `get_short_oid()` (object-name.c:501-610). The candidates are listed from
     /// the indexes and loose directories alone, which reads nothing; a lone
     /// candidate is the answer without the hint being asked (:121-138), and none
-    /// at all is listed again after `odb_reprepare()`. Two or more that the hint
-    /// would have to read, or that a non-quiet call reports, are not modelled.
+    /// at all is listed again after `odb_reprepare()`. Two or more with no hint are
+    /// reported (see [`Self::show_ambiguous`]); two or more a hint has to read are not
+    /// modelled past the lines they print.
     fn get_short_oid(&mut self, name: &str, hint: Hint, quietly: bool) -> Step<Option<ObjectId>> {
         // `init_object_disambiguation()`: `MINIMUM_ABBREV` to `GIT_MAX_HEXSZ` hex digits.
         if name.len() < 4 || name.len() > 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -4469,16 +4568,221 @@ impl<'r> GetOid<'r> {
             }
             1 => Ok(candidates.into_iter().next()),
             _ => {
-                let default_hint = self
-                    .repo
-                    .config_snapshot()
-                    .string("core.disambiguate")
-                    .is_some_and(|v| !v.to_string().eq_ignore_ascii_case("none"));
-                match hint == Hint::None && !default_hint && quietly {
-                    true => Ok(None),
-                    false => Err(Unmodelled),
+                let want = match hint {
+                    Hint::None => crate::objname::disambiguate_filter(self.repo),
+                    Hint::Commit => Some("commit"),
+                    Hint::Committish => Some("committish"),
+                    Hint::Treeish => Some("treeish"),
+                };
+                let Some(want) = want else {
+                    if quietly {
+                        return Ok(None);
+                    }
+                    self.show_ambiguous(name, candidates, None)?;
+                    return Ok(None);
+                };
+                // `odb_for_each_object_ext()` hands `update_disambiguate_state()` each source's
+                // loose candidates and then its packed ones (odb/source-files.c:121-136), and
+                // `ds.fn` reads the ones it is asked about. Only the order one source with at
+                // most one pack and no multi-pack-index gives is replayed here; what the others
+                // print is still known.
+                let Some(order) = self.enumeration_order(&candidates) else {
+                    if !quietly {
+                        if let Some(mut listed) = crate::objname::short_oid_candidates(self.repo, name, Some(want)) {
+                            crate::objname::sort_ambiguous(self.repo, &mut listed);
+                            for line in crate::objname::ambiguity_lines(self.repo, name, &listed) {
+                                self.push_line(&line);
+                            }
+                        }
+                    }
+                    return Err(Unmodelled);
+                };
+                let mut ds = Disambiguation::default();
+                for current in order {
+                    if self.update_disambiguate_state(&mut ds, current, want)? {
+                        break;
+                    }
+                }
+                if let Some(id) = self.finish_object_disambiguation(&mut ds, want)? {
+                    return Ok(Some(id));
+                }
+                if !quietly {
+                    // `if (!ds.ambiguous) ds.fn = NULL;` (object-name.c:523-524)
+                    self.show_ambiguous(name, candidates, ds.ambiguous.then_some(want))?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// The order `odb_for_each_object_ext()` lists `candidates` in for one source with at most
+    /// one pack and no multi-pack-index: the loose cache's, an `oidtree` walked in object-name
+    /// order (odb/source-loose.c:480-483), then the pack's index from `bsearch_pack()`'s first
+    /// match on (odb/source-packed.c:288-336). An object stored both ways is listed twice.
+    fn enumeration_order(&self, candidates: &HashSet<ObjectId>) -> Option<Vec<ObjectId>> {
+        let sources = odb_sources(self.repo);
+        let [objdir] = sources.as_slice() else {
+            return None;
+        };
+        if !matches!(SourceMidx::open(&objdir.join("pack"), self.repo.object_hash()), Some(None))
+            || pack_sizes(self.repo, objdir).len() > 1
+        {
+            return None;
+        }
+        let mut sorted: Vec<ObjectId> = candidates.iter().copied().collect();
+        sorted.sort();
+        let loose = sorted.iter().copied().filter(|id| is_loose(self.repo, *id));
+        let packed = sorted.iter().copied().filter(|id| in_pack_index(self.repo, *id));
+        Some(loose.chain(packed).collect())
+    }
+
+    /// `update_disambiguate_state()` (object-name.c:52-102) with `ds.fn` set: whether the
+    /// listing stops here.
+    fn update_disambiguate_state(&mut self, ds: &mut Disambiguation, current: ObjectId, want: &str) -> Step<bool> {
+        let Some(candidate) = ds.candidate else {
+            ds.candidate = Some(current);
+            return Ok(false);
+        };
+        if candidate == current {
+            return Ok(false);
+        }
+        if !ds.checked {
+            ds.ok = self.disambiguate_fn(candidate, want)?;
+            ds.fn_used = true;
+            ds.checked = true;
+        }
+        if !ds.ok {
+            ds.candidate = Some(current);
+            ds.checked = false;
+            return Ok(false);
+        }
+        if self.disambiguate_fn(current, want)? {
+            ds.ok = false;
+            ds.ambiguous = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// `finish_object_disambiguation()` (object-name.c:104-136) over two or more candidates:
+    /// the one it settles on, `None` for `SHORT_NAME_AMBIGUOUS`.
+    fn finish_object_disambiguation(&mut self, ds: &mut Disambiguation, want: &str) -> Step<Option<ObjectId>> {
+        if ds.ambiguous {
+            return Ok(None);
+        }
+        let candidate = ds.candidate.ok_or(Unmodelled)?;
+        if !ds.checked {
+            ds.ok = !ds.fn_used || self.disambiguate_fn(candidate, want)?;
+        }
+        Ok(ds.ok.then_some(candidate))
+    }
+
+    /// `disambiguate_<want>_only()` (object-name.c:138-200): `odb_read_object_info()`, and for a
+    /// tag under `committish` / `treeish` the `deref_tag(parse_object())` that follows it
+    /// (tag.c:76-95).
+    fn disambiguate_fn(&mut self, id: ObjectId, want: &str) -> Step<bool> {
+        let kind = self.kind_of(id)?;
+        self.ops.push(ArgOp::Read(id));
+        let passes = |kind: Kind| match want {
+            "commit" | "committish" => kind == Kind::Commit,
+            "tree" => kind == Kind::Tree,
+            "treeish" => matches!(kind, Kind::Tree | Kind::Commit),
+            "blob" => kind == Kind::Blob,
+            _ => true,
+        };
+        if passes(kind) || kind != Kind::Tag || !matches!(want, "committish" | "treeish") {
+            return Ok(passes(kind));
+        }
+        let mut o = id;
+        let mut kind = self.parse_object(o)?;
+        while kind == Kind::Tag {
+            o = self.tag_target(o)?.0;
+            kind = self.parse_object(o)?;
+        }
+        Ok(passes(kind))
+    }
+
+    /// `get_short_oid()`'s report (object-name.c:507-543): the `error()`, then
+    /// `repo_for_each_abbrev()`'s candidates in object-name order (`oid_array_for_each_unique()`,
+    /// object-name.c:547-568), `sort_ambiguous_oid_array()`'s merge sort, whose comparator reads
+    /// both objects' types each time it is called (object-name.c:416-453, compat/qsort_s.c), and
+    /// `show_ambiguous_object()` on each in that order (object-name.c:292-401): it skips one
+    /// `ds.fn`, when `filter` names it, turns down, reads the type, `lookup_commit()`s a commit
+    /// and reads its buffer once for `%ad` and once for `%s`, since `cmd_fsck()` keeps no commit
+    /// buffer (builtin/fsck.c:880, commit.c:391-410), and `lookup_tag()`s a tag and
+    /// `parse_tag()`s it, a read unless it is parsed already (tag.c:206-227). `advise()` prints
+    /// the block last.
+    fn show_ambiguous(&mut self, name: &str, candidates: HashSet<ObjectId>, filter: Option<&str>) -> Step<()> {
+        let mut listed: Vec<ObjectId> = candidates.into_iter().collect();
+        listed.sort();
+        let error_at = self.ops.len();
+        let kind_of = |repo: &gix::Repository, id: ObjectId| repo.find_header(id).ok().map(|h| h.kind());
+        let (repo, ops) = (self.repo, &mut self.ops);
+        git_qsort_s(&mut listed, &mut |a: &ObjectId, b: &ObjectId| {
+            let (a_type, b_type) = (kind_of(repo, *a), kind_of(repo, *b));
+            ops.push(if a_type.is_some() { ArgOp::Read(*a) } else { ArgOp::Miss });
+            ops.push(if b_type.is_some() { ArgOp::Read(*b) } else { ArgOp::Miss });
+            if a_type == b_type {
+                return a.cmp(b);
+            }
+            match crate::objname::type_sort_order(a_type) > crate::objname::type_sort_order(b_type) {
+                true => std::cmp::Ordering::Greater,
+                false => std::cmp::Ordering::Less,
+            }
+        });
+        let mut shown: Vec<ObjectId> = Vec::new();
+        for id in listed {
+            if let Some(want) = filter {
+                if !self.disambiguate_fn(id, want)? {
+                    continue;
                 }
             }
+            shown.push(id);
+            let Some(kind) = kind_of(self.repo, id) else {
+                self.ops.push(ArgOp::Miss);
+                continue;
+            };
+            self.ops.push(ArgOp::Read(id));
+            match kind {
+                Kind::Commit => {
+                    self.ops.push(ArgOp::Lookup(id));
+                    self.ops.push(ArgOp::Typed(id));
+                    self.typed.insert(id);
+                    self.ops.push(ArgOp::Read(id));
+                    self.ops.push(ArgOp::Read(id));
+                }
+                Kind::Tag => {
+                    self.ops.push(ArgOp::Lookup(id));
+                    self.ops.push(ArgOp::Typed(id));
+                    self.typed.insert(id);
+                    if !self.parsed.contains(&id) {
+                        self.ops.push(ArgOp::Read(id));
+                        self.parse_links(id)?;
+                        self.ops.push(ArgOp::ParseTag(id));
+                    }
+                }
+                Kind::Tree | Kind::Blob => {}
+            }
+        }
+        let mut lines = crate::objname::ambiguity_lines(self.repo, name, &shown).into_iter();
+        // The `error()` comes before the sort's reads, the block after the listing.
+        if let Some(line) = lines.next() {
+            let at = self.ops.len();
+            self.push_line(&line);
+            let error = self.ops.remove(at);
+            self.ops.insert(error_at, error);
+        }
+        for line in lines {
+            self.push_line(&line);
+        }
+        Ok(())
+    }
+
+    /// One whole `error()` or `advise()` line, as an op.
+    fn push_line(&mut self, line: &str) {
+        match line.strip_prefix("error: ") {
+            Some(text) => self.ops.push(ArgOp::Error(text.to_owned())),
+            None => self.ops.push(ArgOp::Advice(line.strip_prefix("hint: ").unwrap_or(line).to_owned())),
         }
     }
 
@@ -5083,6 +5387,7 @@ fn replay_arg_ops(
         match op {
             ArgOp::Error(line) => eprintln!("error: {line}"),
             ArgOp::Warning(line) => eprintln!("warning: {line}"),
+            ArgOp::Advice(line) => eprintln!("hint: {line}"),
             ArgOp::Fatal(msg) => return Err(crate::fatal::die(msg.clone())),
             _ if !trace.complete => {}
             ArgOp::Read(_) => midx_retry.read(),
@@ -5103,6 +5408,16 @@ fn replay_arg_ops(
             }
             ArgOp::Typed(id) => {
                 state.typed.insert(*id);
+            }
+            ArgOp::ParseTag(id) => {
+                if let Ok(Ok(decoded)) = decode(repo, *id) {
+                    for (child, kind) in &decoded.children {
+                        state.note(*child);
+                        state.typed.insert(*child);
+                        state.kinds.entry(*child).or_insert(*kind);
+                    }
+                    pre_parsed.insert(*id);
+                }
             }
             ArgOp::GraphParse(id) => {
                 let mut out = Vec::new();
@@ -5455,6 +5770,9 @@ fn probe_insert(table: &mut [Option<ObjectId>], id: ObjectId) {
 struct ScanVisit {
     id: ObjectId,
     loose: bool,
+    /// A copy in a pack `is_pack_valid()` refused, which `verify_packfile()` never walks
+    /// (pack-check.c:69-70): it is listed only so the pack keeps its place in the order.
+    refused: bool,
 }
 
 /// The visit that pushed `msg_lines[line]`, given where each visit's lines
@@ -5501,7 +5819,18 @@ struct ObjectScan {
 }
 
 impl ObjectScan {
-    fn new(repo: &gix::Repository, check_full: bool, verbose: bool, pack_lists: Option<&PackLists>) -> Self {
+    /// `refused` names the packs `verify_pack()` saw `is_pack_valid()` refuse:
+    /// `verify_packfile()` returns before its walk (pack-check.c:69-70), so their
+    /// copies are listed as [`ScanVisit::refused`] and none reaches `fsck_obj_buffer()`.
+    fn new(
+        repo: &gix::Repository,
+        check_full: bool,
+        verbose: bool,
+        pack_lists: Option<&PackLists>,
+        refused: &[PathBuf],
+    ) -> Self {
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let refused: Vec<PathBuf> = refused.iter().map(|path| canonical(path)).collect();
         let hexsz = repo.object_hash().len_in_hex();
         let mut visits: Vec<ScanVisit> = Vec::new();
         let mut walk_lines: Vec<(usize, String, bool)> = Vec::new();
@@ -5524,7 +5853,7 @@ impl ObjectScan {
                     // `A`-`F` as well as `a`-`f` (hex-ll.c), so an upper-case
                     // name is an object to git and never reaches the cruft callback.
                     if name.len() == hexsz - 2 && name.iter().all(|b| b.is_ascii_hexdigit()) {
-                        visits.extend(loose_id(sub, name, hexsz).map(|id| ScanVisit { id, loose: true }));
+                        visits.extend(loose_id(sub, name, hexsz).map(|id| ScanVisit { id, loose: true, refused: false }));
                     } else if !name.starts_with(b"tmp_obj_") {
                         walk_lines.push((visits.len(), format!("bad sha1 file: {}", loose_label_of(repo, &path)), false));
                     }
@@ -5538,8 +5867,14 @@ impl ObjectScan {
             match pack_lists.and_then(|lists| lists.sources.iter().find(|(dir, _)| *dir == objdir)) {
                 Some((_, packs)) => {
                     for pack in packs {
-                        pack_starts.push((pack.index.path().with_extension("pack"), visits.len()));
-                        visits.extend(pack.ids_by_offset().into_iter().map(|id| ScanVisit { id, loose: false }));
+                        let pack_path = pack.index.path().with_extension("pack");
+                        let refused = refused.contains(&canonical(&pack_path));
+                        pack_starts.push((pack_path, visits.len()));
+                        visits.extend(pack.ids_by_offset().into_iter().map(|id| ScanVisit {
+                            id,
+                            loose: false,
+                            refused,
+                        }));
                     }
                 }
                 None => ordered &= pack_sizes(repo, &objdir).is_empty(),
@@ -5566,6 +5901,9 @@ struct ListedPack {
     /// `find_pack_entry()` never answers from it, and never moves it, through the list
     /// (odb/source-packed.c:38-45).
     midx: bool,
+    /// Whether `is_pack_valid()` passes the pack. `packfile_fill_entry()` steps over one it
+    /// refuses, so a read neither answers from it nor moves it (packfile.c:1840-1866).
+    valid: bool,
 }
 
 impl ListedPack {
@@ -5684,7 +6022,7 @@ impl MidxRetry {
 /// and index this port takes outside the snapshot; promised objects, whose
 /// `is_promisor_object()` pass reads on its own; a commit-graph, whose verify child
 /// prepares in its own process; an argument whose `repo_get_oid()` reads [`GetOid`] does not
-/// trace in full (an ambiguous abbreviated id, object-name.c:501, among others); and a loose object
+/// trace in full (an abbreviated id a type hint disambiguates, object-name.c:52-102, among others); and a loose object
 /// that will not open or inflate, whose failed reads interleave their own lines.
 fn midx_retry_unmodelled(
     repo: &gix::Repository,
@@ -5817,15 +6155,6 @@ impl SourceMidx {
         unreachable!("pack-int-id beyond the midx's packs")
     }
 
-    /// `midx_fill_entry()` on `id` (midx.c:592-610): `None` when no layer holds it, else
-    /// whether `midx_for_pack()` dies on the owner's pack-int-id, which counts the layers
-    /// below the one holding `id` (midx.c:438-454, 584-590).
-    fn owner_dies(&self, id: ObjectId) -> Option<bool> {
-        let m = self.layers.iter().rev().find(|m| m.lookup(id).is_some())?;
-        let entry = m.lookup(id)?;
-        Some(m.pack_id_and_pack_offset_at_index(entry).0 >= m.num_indices())
-    }
-
     /// The pack-int-id `midx_fill_entry()` answers `id` from (midx.c:592-605):
     /// `bsearch_midx()` asks the tip layer first and then each base (midx.c:533-540).
     fn owner(&self, id: ObjectId) -> Option<usize> {
@@ -5842,8 +6171,9 @@ impl SourceMidx {
 
 /// `add_packed_git()` for `<dir>/<idx_name>` (packfile.c:710-776): `Some(None)` when the
 /// `.pack` is not a regular file, which drops the pack, and `None` for an index this
-/// cannot open.
-fn listed_pack(dir: &Path, idx_name: &str, hash: gix::hash::Kind, midx: bool) -> Option<Option<ListedPack>> {
+/// cannot open. Its `valid` is `is_pack_valid()` asked once, quietly: a pack that fails
+/// keeps failing, and each read that reaches it prints its own lines.
+fn listed_pack(repo: &gix::Repository, dir: &Path, idx_name: &str, midx: bool) -> Option<Option<ListedPack>> {
     use std::os::unix::fs::MetadataExt;
 
     let base = idx_name.strip_suffix(".idx")?;
@@ -5853,11 +6183,16 @@ fn listed_pack(dir: &Path, idx_name: &str, hash: gix::hash::Kind, midx: bool) ->
     if !meta.is_file() {
         return Some(None);
     }
+    let index = pack::index::File::at(dir.join(idx_name), repo.object_hash()).ok()?;
+    let pack_path = dir.join(format!("{base}.pack"));
+    let (valid, _) =
+        gix::odb::store::capture_errors(|| repo.objects.store_ref().is_pack_valid(&pack_path, Some(&index)));
     Some(Some(ListedPack {
         mtime: meta.mtime(),
-        index: pack::index::File::at(dir.join(idx_name), hash).ok()?,
+        index,
         promisor: dir.join(format!("{base}.promisor")).exists(),
         midx,
+        valid,
     }))
 }
 
@@ -5866,7 +6201,12 @@ impl PackLists {
     /// tie cannot be placed, nor which covered packs the reads loaded, and
     /// `None` is returned. A covered pack `prepare_midx_pack()` cannot load
     /// (`MIDX_PACK_ERROR`, whose reads fall back to the list scan) is refused too.
-    fn load(repo: &gix::Repository, reads: Option<&[ObjectId]>) -> Option<Self> {
+    ///
+    /// `missed` says a snapshot read found its object nowhere. That moves no pack, but
+    /// a multi-pack-index that names the object loads its owner pack through
+    /// `prepare_midx_pack()` before `is_pack_valid()` refuses it (midx.c:456-485, :592-631),
+    /// which `reads` does not record, so a source with a midx is not placed then.
+    fn load(repo: &gix::Repository, reads: Option<&[ObjectId]>, missed: bool) -> Option<Self> {
         let hash = repo.object_hash();
         // `prepare_multi_pack_index_one()` loads nothing under `core.multiPackIndex=false`
         // (midx.c:745-747).
@@ -5879,6 +6219,9 @@ impl PackLists {
                 true => SourceMidx::open(&dir, hash)?,
                 false => None,
             };
+            if missed && midx.is_some() {
+                return None;
+            }
             let mut packs: Vec<ListedPack> = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -5886,7 +6229,7 @@ impl PackLists {
                     if !name.ends_with(".idx") || midx.as_ref().is_some_and(|m| m.contains(&name)) {
                         continue;
                     }
-                    packs.extend(listed_pack(&dir, &name, hash, false)?);
+                    packs.extend(listed_pack(repo, &dir, &name, false)?);
                 }
             }
             sort_packs(&mut packs);
@@ -5904,7 +6247,7 @@ impl PackLists {
             .any(|(m, (_, packs))| m.as_ref().is_some_and(|m| m.loaded.len() + packs.len() > 1));
         if tie || midx_order_open {
             for &id in reads? {
-                lists.snapshot_read(id, hash)?;
+                lists.snapshot_read(repo, id)?;
             }
             for (_, packs) in &mut lists.sources {
                 sort_packs(packs);
@@ -5917,7 +6260,7 @@ impl PackLists {
             for pack_int_id in 0..m.loaded.len() {
                 if !m.loaded[pack_int_id] {
                     let name = m.pack_name(pack_int_id);
-                    packs.push(listed_pack(&objdir.join("pack"), &name, hash, true)??);
+                    packs.push(listed_pack(repo, &objdir.join("pack"), &name, true)??);
                     m.loaded[pack_int_id] = true;
                 }
             }
@@ -5928,20 +6271,20 @@ impl PackLists {
     /// One read `snapshot_refs()` made, before `packfile_store_get_packs()` loaded
     /// the covered packs: a midx that holds `id` loads its owner pack onto the tail
     /// of the list. `None` where that pack will not load.
-    fn snapshot_read(&mut self, id: ObjectId, hash: gix::hash::Kind) -> Option<()> {
+    fn snapshot_read(&mut self, repo: &gix::Repository, id: ObjectId) -> Option<()> {
         let hex = id.to_hex().to_string();
         for ((objdir, packs), midx) in self.sources.iter_mut().zip(&mut self.midx) {
             if let Some(m) = midx {
                 if let Some(pack_int_id) = m.owner(id) {
                     if !m.loaded[pack_int_id] {
                         let name = m.pack_name(pack_int_id);
-                        packs.push(listed_pack(&objdir.join("pack"), &name, hash, true)??);
+                        packs.push(listed_pack(repo, &objdir.join("pack"), &name, true)??);
                         m.loaded[pack_int_id] = true;
                     }
                     return Some(());
                 }
             }
-            if let Some(at) = packs.iter().position(|p| !p.midx && p.index.lookup(id).is_some()) {
+            if let Some(at) = packs.iter().position(|p| !p.midx && p.valid && p.index.lookup(id).is_some()) {
                 let pack = packs.remove(at);
                 packs.insert(0, pack);
                 return Some(());
@@ -6026,7 +6369,10 @@ fn move_to_front_unless<P: std::borrow::Borrow<ListedPack>>(
         if midx[index].as_ref().is_some_and(|m| m.owner(id).is_some()) {
             return;
         }
-        if let Some(at) = packs.iter().position(|p| !p.borrow().midx && p.borrow().index.lookup(id).is_some()) {
+        if let Some(at) = packs.iter().position(|p| {
+            let p = p.borrow();
+            !p.midx && p.valid && p.index.lookup(id).is_some()
+        }) {
             if frozen != Some(index) {
                 let pack = packs.remove(at);
                 packs.insert(0, pack);

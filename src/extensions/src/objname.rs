@@ -3797,23 +3797,44 @@ fn reflog_entries(
 ///
 /// Returns whether anything was printed.
 pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) -> bool {
-    let Some(mut listed) = short_oid_candidates(repo, name, disambiguate_filter(repo)) else {
+    short_oid_ambiguous_as(repo, name, disambiguate_filter(repo), quietly)
+}
+
+/// [`short_oid_ambiguous`] under the hint a caller's `GET_OID_<type>` flag installs as
+/// `ds.fn` in place of `core.disambiguate` (object-name.c:475-486): `"committish"` for
+/// `log`'s `REVARG_COMMITTISH` (revision.c:2151-2152), say.
+pub fn short_oid_ambiguous_as(repo: &gix::Repository, name: &str, want: Option<&str>, quietly: bool) -> bool {
+    let Some(mut listed) = short_oid_candidates(repo, name, want) else {
         return false;
     };
     if quietly {
         return true;
     }
-    let kind_of = |id: &ObjectId| repo.find_header(*id).ok().map(|h| h.kind());
-    // `sort_ambiguous()` (`object-name.c:453-484`): tags, then commits, then trees
-    // and blobs; inside one type, `oidcmp()`.
-    listed.sort_by_key(|id| (type_sort_order(kind_of(id)), *id));
+    sort_ambiguous(repo, &mut listed);
+    for line in ambiguity_lines(repo, name, &listed) {
+        eprintln!("{line}");
+    }
+    true
+}
 
+/// `sort_ambiguous()` (object-name.c:416-448) as `QSORT_S` orders with it: tags, then
+/// commits, then trees and blobs; inside one type, `oidcmp()`.
+pub fn sort_ambiguous(repo: &gix::Repository, listed: &mut [ObjectId]) {
+    let kind_of = |id: &ObjectId| repo.find_header(*id).ok().map(|h| h.kind());
+    listed.sort_by_key(|id| (type_sort_order(kind_of(id)), *id));
+}
+
+/// The lines `get_short_oid()` prints for `name` (object-name.c:507-543): its `error()`, then
+/// `advise()`'s block with one `show_ambiguous_object()` line per candidate of `listed`, which
+/// is in [`sort_ambiguous`] order (object-name.c:292-401).
+pub fn ambiguity_lines(repo: &gix::Repository, name: &str, listed: &[ObjectId]) -> Vec<String> {
     let abbrev = crate::abbrev::configured_abbrev(repo, repo.object_hash().len_in_hex());
     // `ds.hex_pfx`, which `parse_oid_prefix()` lowercases (`object-name.c:244-246`).
-    eprintln!("error: short object ID {} is ambiguous", name.to_ascii_lowercase());
-    eprintln!("hint: The candidates are:");
-    for id in &listed {
-        let kind = kind_of(id);
+    let mut lines = vec![
+        format!("error: short object ID {} is ambiguous", name.to_ascii_lowercase()),
+        "hint: The candidates are:".to_owned(),
+    ];
+    for id in listed {
         // `repo_find_unique_abbrev(oid, DEFAULT_ABBREV)`, which widens past a
         // collision rather than cutting at the requested width. `DEFAULT_ABBREV`
         // is `default_abbrev` (cache.h:1417), the resolved `core.abbrev` — not
@@ -3821,16 +3842,17 @@ pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) ->
         // object database gives nothing to size against, so a repository whose
         // config sets `core.abbrev = 10` lists ten-hex candidates.
         let hex = crate::abbrev::unique_abbrev(repo, id, abbrev);
-        let type_name = match kind {
-            Some(gix::object::Kind::Tag) => "tag",
-            Some(gix::object::Kind::Commit) => "commit",
-            Some(gix::object::Kind::Tree) => "tree",
-            Some(gix::object::Kind::Blob) => "blob",
-            None => "unknown type",
+        let line = match repo.find_header(*id).ok().map(|h| h.kind()) {
+            // `odb_read_object_info()` failing: `"%s [bad object]"`.
+            None => format!("{hex} [bad object]"),
+            Some(gix::object::Kind::Commit) => format!("{hex} commit{}", ambiguous_commit_desc(repo, id)),
+            Some(gix::object::Kind::Tag) => ambiguous_tag_line(repo, id, &hex),
+            Some(gix::object::Kind::Tree) => format!("{hex} tree"),
+            Some(gix::object::Kind::Blob) => format!("{hex} blob"),
         };
-        eprintln!("hint:   {hex} {type_name}{}", ambiguous_object_desc(repo, id, kind));
+        lines.push(format!("hint:   {line}"));
     }
-    true
+    lines
 }
 
 /// Whether `get_short_oid()` answers `SHORT_NAME_AMBIGUOUS` for `name` under the
@@ -3842,7 +3864,7 @@ pub fn short_oid_ambiguous(repo: &gix::Repository, name: &str, quietly: bool) ->
 /// one passing the hint is found, and any other count is ambiguous. `ds.fn =
 /// NULL` for the listing when none passed (`object-name.c:517-518`), so every
 /// candidate is listed then.
-fn short_oid_candidates(
+pub fn short_oid_candidates(
     repo: &gix::Repository,
     name: &str,
     want: Option<&str>,
@@ -3919,56 +3941,52 @@ pub fn get_oid_ambiguous(repo: &gix::Repository, name: &str) -> bool {
     short_oid_candidates(repo, &name[..len], want).is_some()
 }
 
-/// `show_ambiguous_object()`'s `desc` (`object-name.c:412-451`): a commit gets
-/// `" %ad - %s"` rendered with `DATE_SHORT`, a tag gets `" %s"` of its tag name,
-/// and everything else gets nothing.
-fn ambiguous_object_desc(
-    repo: &gix::Repository,
-    id: &ObjectId,
-    kind: Option<gix::object::Kind>,
-) -> String {
-    match kind {
-        Some(gix::object::Kind::Commit) => {
-            let Ok(commit) = repo.find_object(*id).ok().and_then(|o| o.try_into_commit().ok()).ok_or(()) else {
-                return String::new();
-            };
-            let Ok(decoded) = commit.decode() else { return String::new() };
-            let Ok(author) = decoded.author() else { return String::new() };
-            let time = author.time().unwrap_or_default();
-            // git's `tz` is the `[-+]HHMM` integer off the object header;
-            // `gix_actor` carries the offset in seconds.
-            let tz = (time.offset / 3600) * 100 + (time.offset % 3600) / 60;
-            let date = crate::showdate::show_date(
-                time.seconds,
-                tz,
-                &crate::showdate::DateMode::new(crate::showdate::DateType::Short),
-                0,
-            );
-            let subject = decoded.message().summary().to_string();
-            format!(" {date} - {subject}")
-        }
-        Some(gix::object::Kind::Tag) => {
-            let Ok(tag) = repo.find_object(*id).ok().and_then(|o| o.try_into_tag().ok()).ok_or(()) else {
-                return String::new();
-            };
-            match tag.decode() {
-                Ok(decoded) => format!(" {}", decoded.name),
-                Err(_) => String::new(),
-            }
-        }
-        _ => String::new(),
-    }
+/// `show_ambiguous_object()`'s commit line after its type (object-name.c:320-344): `" %ad - %s"`
+/// rendered with `DATE_SHORT`.
+fn ambiguous_commit_desc(repo: &gix::Repository, id: &ObjectId) -> String {
+    let Ok(commit) = repo.find_object(*id).ok().and_then(|o| o.try_into_commit().ok()).ok_or(()) else {
+        return String::new();
+    };
+    let Ok(decoded) = commit.decode() else { return String::new() };
+    let Ok(author) = decoded.author() else { return String::new() };
+    let time = author.time().unwrap_or_default();
+    // git's `tz` is the `[-+]HHMM` integer off the object header;
+    // `gix_actor` carries the offset in seconds.
+    let tz = (time.offset / 3600) * 100 + (time.offset % 3600) / 60;
+    let date = crate::showdate::show_date(
+        time.seconds,
+        tz,
+        &crate::showdate::DateMode::new(crate::showdate::DateType::Short),
+        0,
+    );
+    let subject = decoded.message().summary().to_string();
+    format!(" {date} - {subject}")
 }
 
-/// `type_sort_order()` (`object-name.c:453-470`): tags first, then commits, then
-/// trees and blobs together, then anything unreadable.
-fn type_sort_order(kind: Option<gix::object::Kind>) -> u8 {
+/// `show_ambiguous_object()`'s tag line (object-name.c:345-374): `parse_tag()` succeeding with a
+/// `tag` name gives `"%s tag %s - %s"`, the date `parse_tag_buffer()` took from the `tagger`
+/// line, 0 without one (tag.c:105-120, :197-200), shown `DATE_SHORT` at offset 0; anything else
+/// is `"%s [bad tag, could not parse it]"`.
+fn ambiguous_tag_line(repo: &gix::Repository, id: &ObjectId, hex: &str) -> String {
+    let tag = repo.find_object(*id).ok().and_then(|o| o.try_into_tag().ok());
+    let Some(decoded) = tag.as_ref().and_then(|tag| tag.decode().ok()) else {
+        return format!("{hex} [bad tag, could not parse it]");
+    };
+    let date = decoded.tagger().ok().flatten().and_then(|tagger| tagger.time().ok()).map_or(0, |time| time.seconds);
+    let date = crate::showdate::show_date(date, 0, &crate::showdate::DateMode::new(crate::showdate::DateType::Short), 0);
+    format!("{hex} tag {date} - {}", decoded.name)
+}
+
+/// `sort_ambiguous()`'s `type % 4` (object-name.c:438-447): tags, then commits, then trees, then
+/// blobs. An object `odb_read_object_info()` cannot type is `-1`, and C's `%` keeps the sign,
+/// so it sorts ahead of all of them.
+pub fn type_sort_order(kind: Option<gix::object::Kind>) -> i8 {
     match kind {
+        None => -1,
         Some(gix::object::Kind::Tag) => 0,
         Some(gix::object::Kind::Commit) => 1,
         Some(gix::object::Kind::Tree) => 2,
         Some(gix::object::Kind::Blob) => 3,
-        None => 4,
     }
 }
 
@@ -3977,7 +3995,7 @@ fn type_sort_order(kind: Option<gix::object::Kind>) -> u8 {
 ///
 /// `committish` and `treeish` peel, so they are not a kind test on their own;
 /// [`kind_passes`] is what applies them.
-fn disambiguate_filter(repo: &gix::Repository) -> Option<&'static str> {
+pub fn disambiguate_filter(repo: &gix::Repository) -> Option<&'static str> {
     let value = repo.config_snapshot().string("core.disambiguate")?;
     let value = value.to_string();
     match value.as_str() {

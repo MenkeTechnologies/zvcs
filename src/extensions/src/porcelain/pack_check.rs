@@ -38,6 +38,10 @@ pub(super) struct PackCheck {
     pub unverified: HashSet<ObjectId>,
     /// Objects the walk did hand to `fsck_obj_buffer()`, from any pack.
     pub verified: HashSet<ObjectId>,
+    /// Each pack `is_pack_valid()` refused, by its `.pack` path, with the range of
+    /// [`Self::lines`] its `verify_pack()` printed: all of them ahead of the first object
+    /// of the pack, since the walk never starts (pack-check.c:69-70).
+    pub refused: Vec<(std::path::PathBuf, std::ops::Range<usize>)>,
 }
 
 impl PackCheck {
@@ -65,6 +69,7 @@ pub(super) fn verify_pack(
 ) {
     let hash = repo.object_hash();
     let rawsz = hash.len_in_bytes();
+    let first_line = out.lines.len();
 
     // `verify_pack_index()`: `hashfile_checksum_valid()` over the `.idx`.
     if idx_bytes.len() >= rawsz {
@@ -81,6 +86,10 @@ pub(super) fn verify_pack(
     out.lines.extend(lines);
     if !valid || pack_bytes.len() < rawsz {
         out.error(format!("packfile {pack_name} cannot be accessed"));
+        // `verify_packfile()` returns before its walk (pack-check.c:69-70), so not one of the
+        // pack's objects reaches `fsck_obj_buffer()` and none of them gets `HAS_OBJ`.
+        out.unverified.extend((0..index.num_objects()).map(|nr| index.oid_at_index(nr).to_owned()));
+        out.refused.push((pack_path.to_owned(), first_line..out.lines.len()));
         return;
     }
 

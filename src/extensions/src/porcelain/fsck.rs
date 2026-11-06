@@ -566,11 +566,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
     let pack_lists = PackLists::load(&repo, snapshot_reads.as_deref());
     // `--full`'s `verify_pack()` pass, run ahead of the scan so the objects it
     // could not produce are treated as absent; its lines are printed at 3b.
-    let pack_check = match opt.check_full && !opt.connectivity_only {
+    let mut pack_check = match opt.check_full && !opt.connectivity_only {
         true => verify_packs(&repo),
         false => super::pack_check::PackCheck::default(),
     };
-    let packed_half = PackedHalf::load(&repo);
+    let packed_half = PackedHalf::load(&repo, midx_on);
     let object_scan = ObjectScan::new(&repo, opt.check_full, opt.verbose, pack_lists.as_ref());
     // The scan's visits, once per copy, when their order is known and accounts
     // for exactly the objects listed above. A copy `verify_pack()` could not
@@ -669,6 +669,27 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         cruft_lines = loose_unopenable(&repo).into_iter().map(|line| (0, line)).collect();
     } else if scan_ordered {
         cruft_lines = object_scan.walk_lines.into_iter().map(|(at, line, _)| (at, line)).collect();
+        // `verify_packs()` walks the packs in list order (odb/source-packed.c:986-992), and a
+        // pack `is_pack_valid()` refuses prints all it prints before the next pack's objects
+        // are checked (pack-check.c:69-70): its lines go where its own objects would have.
+        let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());
+        let starts: Vec<(PathBuf, usize)> =
+            object_scan.pack_starts.iter().map(|(path, at)| (canonical(path), *at)).collect();
+        let mut moved: Vec<std::ops::Range<usize>> = Vec::new();
+        for (path, range) in &pack_check.refused {
+            let path = canonical(path);
+            if let Some((_, at)) = starts.iter().find(|(start, _)| *start == path) {
+                cruft_lines.extend(pack_check.lines[range.clone()].iter().map(|line| (*at, line.clone())));
+                moved.push(range.clone());
+            }
+        }
+        cruft_lines.sort_by_key(|(at, _)| *at);
+        pack_check.lines = std::mem::take(&mut pack_check.lines)
+            .into_iter()
+            .enumerate()
+            .filter(|(n, _)| !moved.iter().any(|range| range.contains(n)))
+            .map(|(_, line)| line)
+            .collect();
     } else {
         // Without the scan order a header's place among the scan's own lines is
         // unknown, and these lines are printed as the scan runs: the one header
@@ -1319,7 +1340,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // A head the loose walk never reached is a readable object of its
             // own type, which `parse_object()`/`lookup_tree()` gave it.
             if !has_obj.contains(&id) {
-                if !packed_half.has(id, &pack_check.bad) {
+                let (in_pack, lines) = packed_half.has(&repo, id, &pack_check.bad)?;
+                if !lines.is_empty() {
+                    state.pack_probe_lines.insert(id, lines);
+                }
+                if !in_pack {
                     if index_blobs.contains(&id) {
                         state.missing.insert(id, Kind::Blob);
                     } else if unvisited.contains(&id) {
@@ -1354,7 +1379,10 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // `OBJ_BLOB` without a read (fsck.c:383, builtin/fsck.c:778-788), and
             // `traverse_one_object()` hands it to `fsck_walk()`, whose `OBJ_BLOB` case returns
             // at once (builtin/fsck.c:174-183, fsck.c:491-492), so nothing asks the odb for it.
-            if expected == Some(Kind::Blob) || (expected.is_none() && index_blobs.contains(&id)) {
+            // The type the object's `struct object` holds when it is popped: the reference site's,
+            // or, for a head, whatever lookup typed it since (see `State::kinds`).
+            let typed = expected.or_else(|| state.kinds.get(&id).copied());
+            if typed == Some(Kind::Blob) || (expected.is_none() && index_blobs.contains(&id)) {
                 break 'traverse;
             }
             // The read below `die()`s on a bad pack-int-id, which flushes what stdout holds.
@@ -1380,6 +1408,25 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                             Ok(object) => object.kind,
                             Err(_) => break 'traverse,
                         }
+                    }
+                    // An object the odb lists but no read finds, as in a pack `is_pack_valid()`
+                    // refuses. `fsck_walk()` hands an untyped one to `parse_object()`, whose
+                    // `odb_read_object_info()` and `odb_read_object()` both miss, and then has no
+                    // type to walk it as (fsck.c:487-502, object.c:345-378); a typed one is read
+                    // once by `repo_parse_commit()`, `repo_parse_tree()` or `parse_tag()`, which
+                    // give up with `Could not read` (commit.c:638-645, tree.c:194-199,
+                    // tag.c:214-217). `traverse_reachable()` ignores the walk's failure.
+                    _ if matches!(err, gix::object::find::existing::Error::NotFound { .. }) => {
+                        match typed {
+                            None => {
+                                // `parse_object()` opens with `lookup_object()` (object.c:335).
+                                state.note(id);
+                                let _ = repo.find_object(id);
+                                eprintln!("error: Unknown object type for {}", names.describe(&id));
+                            }
+                            Some(_) => eprintln!("error: Could not read {id}"),
+                        }
+                        break 'traverse;
                     }
                     Some(Kind::Blob) | None => break 'traverse,
                     Some(_) => {
@@ -1544,6 +1591,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 }
             }
             for (child, child_kind) in decoded.children {
+                state.kinds.entry(child).or_insert(child_kind);
                 // `fsck_walk_tree()` resolves every entry through `lookup_tree()` /
                 // `lookup_blob()`, and a lookup moves a displaced object back to its
                 // home slot, so the call has to be replayed here as well as in the
@@ -1604,7 +1652,7 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // `broken link` lines, which is why the odb is asked again here
                     // rather than the `corrupt` set being taken as the answer.
                     // The ask is a read, and a miss re-prepares the odb.
-                    let present = repo.has_object(child);
+                    let present = repo.objects.contains_recheck(&child);
                     if !present {
                         midx_retry.miss();
                     }
@@ -1633,7 +1681,11 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                     // (`check_reachable_object()`, builtin/fsck.c:265-275.) Under
                     // `--no-full` a packed object has no `HAS_OBJ` and yet is plainly
                     // there, so the pack is consulted before anything is reported.
-                    if !packed_half.has(child, &pack_check.bad) {
+                    let (in_pack, lines) = packed_half.has(&repo, child, &pack_check.bad)?;
+                    if !lines.is_empty() {
+                        state.pack_probe_lines.insert(child, lines);
+                    }
+                    if !in_pack {
                         state.missing.insert(child, child_kind);
                     }
                     continue;
@@ -1711,9 +1763,48 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                 // odb cannot type at all is read three times over and the third read
                 // is fatal — see [`unreadable_unreachable_object`]. Its failed reads
                 // re-prepared the odb.
-                let header = match repo.find_header(id) {
-                    Ok(header) => header,
+                let (header, read_lines) = gix::odb::store::capture_errors(|| repo.find_header(id));
+                let header = match header {
+                    Ok(header) => {
+                        read_lines.iter().for_each(|line| eprintln!("{line}"));
+                        header
+                    }
+                    // An object the listing names but no read finds, as in a pack `is_pack_valid()`
+                    // refuses. An untyped one is asked `odb_read_object_info()` here, and
+                    // `fsck_walk()` hands it on untyped to `parse_object()`, whose two reads miss as
+                    // well, and then has no type to walk it as (builtin/fsck.c:227-235,
+                    // fsck.c:487-502, object.c:345-378). A typed one skips the first read, and its
+                    // `repo_parse_tree()`, `repo_parse_commit()` or `parse_tag()` read gives up with
+                    // `Could not read` (tree.c:194-199, commit.c:638-645, tag.c:214-217); a blob is
+                    // not read at all.
+                    Err(gix::object::find::existing::Error::NotFound { .. }) => {
+                        if state.typed.contains(&id) {
+                            match state.kinds.get(&id) {
+                                Some(Kind::Blob) => {}
+                                Some(_) => {
+                                    let _ = repo.find_object(id);
+                                    eprintln!("error: Could not read {id}");
+                                }
+                                None => bail!(
+                                    "refusing to guess the output: {id} is listed, typed by a lookup this \
+                                     port does not record the type of, and unreadable"
+                                ),
+                            }
+                        } else {
+                            read_lines.iter().for_each(|line| eprintln!("{line}"));
+                            // `parse_object()` opens with `lookup_object()` (object.c:335).
+                            state.note(id);
+                            let _ = repo.find_header(id);
+                            let _ = repo.find_object(id);
+                            eprintln!("error: Unknown object type for {}", names.describe(&id));
+                        }
+                        if let Some(packs) = &mut packs_now {
+                            packs.read(None, frozen);
+                        }
+                        continue;
+                    }
                     Err(_) => {
+                        read_lines.iter().for_each(|line| eprintln!("{line}"));
                         if let Some(code) = unreadable_unreachable_object(&repo, id, 3) {
                             return Ok(code);
                         }
@@ -1781,6 +1872,9 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
                         state.note(child);
                         state.typed.insert(child);
                     }
+                    for (child, kind) in &decoded.children {
+                        state.kinds.entry(*child).or_insert(*kind);
+                    }
                 }
                 for child in children {
                     state.used.insert(child);
@@ -1820,20 +1914,33 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
             // before the dangling/lost-found block, so `--unreachable` never
             // writes lost-found.
             // Under `--connectivity-only` nothing has read this object, so it
-            // can still turn out to be unreadable here. git's `printable_type()`
-            // answers `unknown` for one and prints the line anyway; this port
-            // has no `unknown` object kind, so it stays silent instead.
-            let Ok(header) = repo.find_header(id) else { continue };
+            // can still turn out to be unreadable here. `printable_type()` asks
+            // `odb_read_object_info()` for an object no lookup typed, and names the
+            // type it cannot learn `unknown` (builtin/fsck.c:56-70); lost-found files
+            // it under `other` (:298-301). Its read's lines come out as
+            // `check_object()` reaches the object.
+            let (header, read_lines) = gix::odb::store::capture_errors(|| repo.find_header(id));
+            let kind: Option<Kind> = match header {
+                Ok(header) => Some(header.kind()),
+                Err(gix::object::find::existing::Error::NotFound { .. }) => match state.kinds.get(&id) {
+                    Some(&kind) if state.typed.contains(&id) => Some(kind),
+                    _ => None,
+                },
+                Err(_) => continue,
+            };
+            let printable = |kind: Option<Kind>| kind.map_or_else(|| "unknown".to_owned(), |kind| kind.to_string());
+            let prints = opt.show_unreachable || (!state.used.contains(&id) && opt.show_dangling);
+            if prints && !state.typed.contains(&id) && !read_lines.is_empty() {
+                state.pack_probe_lines.entry(id).or_default().extend(read_lines);
+            }
             if opt.show_unreachable {
-                let kind = header.kind();
-                lines.push((id, format!("unreachable {kind} {}", names.describe(&id))));
+                lines.push((id, format!("unreachable {} {}", printable(kind), names.describe(&id))));
             } else if !state.used.contains(&id) {
                 // `!USED` — the tip of an unreachable set. `dangling` printing and
                 // lost-found writing are independent: `--no-dangling --lost-found`
                 // still writes the files.
-                let kind = header.kind();
                 if opt.show_dangling {
-                    lines.push((id, format!("dangling {kind} {}", names.describe(&id))));
+                    lines.push((id, format!("dangling {} {}", printable(kind), names.describe(&id))));
                 }
                 if opt.write_lost_and_found {
                     write_lost_found(&repo, id, kind)?;
@@ -1846,7 +1953,13 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         &state.known,
         creation_modeled.then_some(state.ops.as_slice()),
     );
-    let reported: Vec<ObjectId> = lines.iter().map(|(id, _)| *id).collect();
+    let mut reported: Vec<ObjectId> = lines.iter().map(|(id, _)| *id).collect();
+    // `check_object()` prints its `Checking` line ahead of `check_reachable_object()`'s
+    // `has_object_pack()` (builtin/fsck.c:341-349), so under `--verbose` the pack lines
+    // place their objects among the walk.
+    if opt.verbose {
+        reported.extend(state.pack_probe_lines.keys().copied());
+    }
     if order.is_ambiguous_for(&reported) {
         anyhow::bail!(
             "refusing to guess the output order: git emits these {} lines in obj_hash slot order, \
@@ -1869,6 +1982,15 @@ pub fn fsck(args: &[String]) -> Result<ExitCode> {
         walked.sort_by_key(|id| (order.slot_of(id), *id));
         for id in walked {
             eprintln!("Checking {}", names.describe(&id));
+            for line in state.pack_probe_lines.get(&id).into_iter().flatten() {
+                eprintln!("{line}");
+            }
+        }
+    } else {
+        let mut probed: Vec<(&ObjectId, &Vec<String>)> = state.pack_probe_lines.iter().collect();
+        probed.sort_by_key(|(id, _)| (order.slot_of(id), **id));
+        for line in probed.into_iter().flat_map(|(_, lines)| lines) {
+            eprintln!("{line}");
         }
     }
 
@@ -2249,6 +2371,16 @@ struct State {
     /// Only the reachable walk fills this: `check_reachable_object()` is the
     /// only place git prints a `missing` line.
     missing: HashMap<ObjectId, Kind>,
+    /// The `error:` lines `check_reachable_object()`'s `has_object_pack()` prints for a
+    /// reachable object without `HAS_OBJ` (builtin/fsck.c:265-269), when an `is_pack_valid()`
+    /// on the way refused a pack: printed as the report reaches the object.
+    pack_probe_lines: HashMap<ObjectId, Vec<String>>,
+    /// The type each walk's `lookup_tree()` / `lookup_blob()` / `lookup_commit()` /
+    /// `lookup_tag()` gave an object it named (fsck.c:364-478, commit.c:545-586, tag.c:166-176),
+    /// the first one winning as `object_as_type()` keeps it. A head or listed object popped
+    /// after such a lookup is walked as that type rather than parsed from scratch
+    /// (fsck.c:487-498), which matters only for one no read finds.
+    kinds: HashMap<ObjectId, Kind>,
     /// Every odb read after `odb_reprepare()` that `find_pack_entry()` may answer, in order:
     /// `Some(id)` moves the pack holding `id` to the front of its source's list
     /// (odb/source-packed.c:38-45), `None` is a read that missed and so re-prepared every
@@ -2374,9 +2506,10 @@ fn parse_object_ops(
     if matches!(kind, Some(Kind::Commit) | Some(Kind::Tag)) {
         if let Ok(Ok(parsed)) = decode(repo, id) {
             state.typed.insert(id);
-            for (child, _) in &parsed.children {
+            for (child, kind) in &parsed.children {
                 state.note(*child);
                 state.typed.insert(*child);
+                state.kinds.entry(*child).or_insert(*kind);
             }
             pre_parsed.insert(id);
             if kind == Some(Kind::Commit) {
@@ -2723,7 +2856,22 @@ fn collect_default_heads(
         if !id.is_null() {
             midx_retry.read();
         }
-        if !repo.has_object(id) {
+        // `parse_object()` asks `odb_read_object_info()` and, when that misses, `odb_read_object()`
+        // (object.c:345-378), each a read with its second pass (odb.c:571-584): a pack
+        // `is_pack_valid()` refuses is reported on every pass of both.
+        let (mut present, refused) = gix::odb::store::capture_errors(|| repo.has_object(id));
+        if !present && !refused.is_empty() {
+            let info = repo.find_header(id).is_ok();
+            present = repo.find_object(id).is_ok() && info;
+        } else {
+            refused.iter().for_each(|line| eprintln!("{line}"));
+        }
+        if !present {
+            // Its `lookup_object()` (object.c:335) finds an object created already and creates
+            // nothing.
+            if state.known.contains(&id) {
+                state.note(id);
+            }
             if !id.is_null() {
                 midx_retry.parse_object_miss();
             }
@@ -3174,30 +3322,123 @@ fn has_packs(repo: &gix::Repository) -> bool {
 /// Every source's packs are those `add_packed_git()` lists — an `.idx` beside a
 /// `.pack` that is a regular file (packfile.c:710-776) — and `bad` is
 /// `mark_bad_packed_object()`'s set, which `find_pack_entry()` skips.
+///
+/// Each source is asked through `find_pack_entry()` with no object info
+/// (odb/source-packed.c:22-46, :76-104): the multi-pack-index first, whose
+/// `midx_fill_entry()` answers only once `is_pack_valid()` passes the owning pack
+/// (midx.c:592-631), then every pack the multi-pack-index does not cover, through
+/// `packfile_fill_entry()`'s own `is_pack_valid()` (packfile.c:1840-1866). A pack
+/// that fails it is opened, and reported, again on every ask, since
+/// `open_packed_git()` keeps nothing of a pack it refused; one that passes stays
+/// open (packfile.c:1820-1838).
 struct PackedHalf {
-    indexes: Vec<pack::index::File>,
+    sources: Vec<HalfSource>,
+    /// Packs `is_pack_valid()` passed, which it answers from the open descriptor from
+    /// then on.
+    valid: std::cell::RefCell<HashSet<PathBuf>>,
+}
+
+struct HalfSource {
+    pack_dir: PathBuf,
+    /// The source's multi-pack-index: `Some(None)` for none, `None` for one
+    /// [`SourceMidx::open`] does not replay, whose source is then asked only through
+    /// the `.idx` files, with no `is_pack_valid()`.
+    midx: Option<Option<SourceMidx>>,
+    /// The packs `prepare_pack()` lists itself, each `.pack` path and its index: every
+    /// pack when the multi-pack-index is not replayed.
+    packs: Vec<(PathBuf, pack::index::File)>,
 }
 
 impl PackedHalf {
-    fn load(repo: &gix::Repository) -> Self {
-        let mut indexes = Vec::new();
+    fn load(repo: &gix::Repository, midx_on: bool) -> Self {
+        let mut sources = Vec::new();
         for objdir in odb_sources(repo) {
-            let dir = objdir.join("pack");
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".idx") {
-                    if let Some(Some(pack)) = listed_pack(&dir, &name, repo.object_hash(), false) {
-                        indexes.push(pack.index);
+            let pack_dir = objdir.join("pack");
+            let midx = match midx_on {
+                true => SourceMidx::open(&pack_dir, repo.object_hash()),
+                false => Some(None),
+            };
+            let mut packs = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&pack_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !name.ends_with(".idx") || matches!(&midx, Some(Some(m)) if m.contains(&name)) {
+                        continue;
+                    }
+                    if let Some(Some(pack)) = listed_pack(&pack_dir, &name, repo.object_hash(), false) {
+                        packs.push((pack_dir.join(name).with_extension("pack"), pack.index));
                     }
                 }
             }
+            sources.push(HalfSource { pack_dir, midx, packs });
         }
-        Self { indexes }
+        Self {
+            sources,
+            valid: Default::default(),
+        }
     }
 
-    fn has(&self, id: ObjectId, bad: &HashSet<ObjectId>) -> bool {
-        !bad.contains(&id) && self.indexes.iter().any(|index| index.lookup(id).is_some())
+    /// Whether some source's packed half answers `id`, and the `error:` lines the
+    /// `is_pack_valid()` calls on the way printed. `Err` when the answer, or how many
+    /// packs are opened on the way, depends on the order of a source's pack list,
+    /// which is not replayed here: `id` in more than one pack outside a
+    /// multi-pack-index, one of which `is_pack_valid()` refuses.
+    fn has(&self, repo: &gix::Repository, id: ObjectId, bad: &HashSet<ObjectId>) -> Result<(bool, Vec<String>)> {
+        let mut lines = Vec::new();
+        if bad.contains(&id) {
+            return Ok((false, lines));
+        }
+        let store = repo.objects.store_ref();
+        let mut pack_is_valid = |path: &Path, index: Option<&pack::index::File>, lines: &mut Vec<String>| {
+            if self.valid.borrow().contains(path) {
+                return true;
+            }
+            let (valid, printed) = gix::odb::store::capture_errors(|| store.is_pack_valid(path, index));
+            lines.extend(printed);
+            if valid {
+                self.valid.borrow_mut().insert(path.to_owned());
+            }
+            valid
+        };
+        for source in &self.sources {
+            let Some(midx) = &source.midx else {
+                if source.packs.iter().any(|(_, index)| index.lookup(id).is_some()) {
+                    return Ok((true, lines));
+                }
+                continue;
+            };
+            if let Some(owner) = midx.as_ref().and_then(|m| m.owner(id).map(|n| m.pack_name(n))) {
+                let path = source.pack_dir.join(owner).with_extension("pack");
+                if pack_is_valid(&path, None, &mut lines) {
+                    return Ok((true, lines));
+                }
+            }
+            let holders: Vec<&(PathBuf, pack::index::File)> =
+                source.packs.iter().filter(|(_, index)| index.lookup(id).is_some()).collect();
+            if holders.len() > 1 {
+                let valid: Vec<bool> = holders
+                    .iter()
+                    .map(|(path, index)| {
+                        let (valid, _) = gix::odb::store::capture_errors(|| store.is_pack_valid(path, Some(index)));
+                        valid
+                    })
+                    .collect();
+                if valid.contains(&true) && valid.contains(&false) {
+                    bail!(
+                        "refusing to guess the output: {id} is in {} packs of {}, and which of them \
+                         has_object_pack() opens first is the order of git's most-recently-used pack list",
+                        holders.len(),
+                        source.pack_dir.display()
+                    );
+                }
+            }
+            for (path, index) in holders {
+                if pack_is_valid(path, Some(index), &mut lines) {
+                    return Ok((true, lines));
+                }
+            }
+        }
+        Ok((false, lines))
     }
 }
 
@@ -4849,9 +5090,10 @@ fn replay_arg_ops(
             ArgOp::ParseCommit(id) => {
                 if let Ok(Ok(decoded)) = decode(repo, *id) {
                     state.typed.insert(*id);
-                    for (child, _) in &decoded.children {
+                    for (child, kind) in &decoded.children {
                         state.note(*child);
                         state.typed.insert(*child);
+                        state.kinds.entry(*child).or_insert(*kind);
                     }
                     pre_parsed.insert(*id);
                 }
@@ -4970,12 +5212,14 @@ fn collect_linked_worktree_heads(
 /// go under `commit/`, everything else under `other/`. A blob's file holds its
 /// content; every other type's file holds its id followed by a newline. Mirrors
 /// `check_unreachable_object()`'s write branch.
-fn write_lost_found(repo: &gix::Repository, id: ObjectId, kind: Kind) -> Result<()> {
-    let subdir = if kind == Kind::Commit { "commit" } else { "other" };
+/// `kind` is `None` for an object whose type is still `OBJ_NONE`, which is neither a commit
+/// nor a blob (builtin/fsck.c:298-310).
+fn write_lost_found(repo: &gix::Repository, id: ObjectId, kind: Option<Kind>) -> Result<()> {
+    let subdir = if kind == Some(Kind::Commit) { "commit" } else { "other" };
     let dir = repo.git_dir().join("lost-found").join(subdir);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(id.to_string());
-    if kind == Kind::Blob {
+    if kind == Some(Kind::Blob) {
         let object = repo.find_object(id)?;
         std::fs::write(&path, &object.data)?;
     } else {
@@ -5251,6 +5495,9 @@ struct ObjectScan {
     walk_lines: Vec<(usize, String, bool)>,
     /// The number of sources `odb_fsck()` scans.
     sources: usize,
+    /// Each pack `verify_packs()` walks, by its `.pack` path, with the number of visits made
+    /// before its first object.
+    pack_starts: Vec<(PathBuf, usize)>,
 }
 
 impl ObjectScan {
@@ -5260,6 +5507,7 @@ impl ObjectScan {
         let mut walk_lines: Vec<(usize, String, bool)> = Vec::new();
         let mut ordered = true;
         let mut sources = 0usize;
+        let mut pack_starts: Vec<(PathBuf, usize)> = Vec::new();
         for (nth, objdir) in odb_sources(repo).into_iter().enumerate() {
             // `if (!(opts->flags & ODB_FSCK_FULL) && !source->local) return 0;`
             // (odb/source-files.c:918-919). Only the first source is local.
@@ -5290,6 +5538,7 @@ impl ObjectScan {
             match pack_lists.and_then(|lists| lists.sources.iter().find(|(dir, _)| *dir == objdir)) {
                 Some((_, packs)) => {
                     for pack in packs {
+                        pack_starts.push((pack.index.path().with_extension("pack"), visits.len()));
                         visits.extend(pack.ids_by_offset().into_iter().map(|id| ScanVisit { id, loose: false }));
                     }
                 }
@@ -5300,6 +5549,7 @@ impl ObjectScan {
             visits: ordered.then_some(visits),
             walk_lines,
             sources,
+            pack_starts,
         }
     }
 }

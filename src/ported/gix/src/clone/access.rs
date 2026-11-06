@@ -55,6 +55,15 @@ impl PrepareFetch {
         self
     }
 
+    /// Set the `branch` name `HEAD` takes when the remote advertises no `HEAD` at all, as protocol v0/v1 does for
+    /// a `HEAD` that names a missing branch: `cmd_clone()` falls back to `repo_default_branch_name()`, checking
+    /// out the remote's branch of that name if it has one and leaving `HEAD` unborn on it otherwise
+    /// (builtin/clone.c:1554-1586). If `None`, `HEAD` is left as it was initialized.
+    pub fn with_default_branch(mut self, branch: Option<impl Into<BString>>) -> Self {
+        self.default_branch = branch.map(Into::into);
+        self
+    }
+
     /// Apply the given configuration `values` right before readying the actual fetch from the remote.
     /// The configuration is marked with [source API](gix_config::Source::Api), and will not be written back, it's
     /// retained only in memory.

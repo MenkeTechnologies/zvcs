@@ -56,6 +56,9 @@ pub struct PrepareFetch {
     /// The single revision to fetch and detach `HEAD` at (git's `clone --revision`), if any.
     #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
     revision: Option<gix_refspec::RefSpec>,
+    /// The branch `HEAD` is set to when the remote advertised no `HEAD` (git's `repo_default_branch_name()`), if any.
+    #[cfg_attr(not(feature = "blocking-network-client"), allow(dead_code))]
+    default_branch: Option<BString>,
 }
 
 /// The error returned by [`PrepareFetch::new()`].
@@ -204,6 +207,7 @@ impl PrepareFetch {
             remove_worktree_on_drop,
             filter: None,
             revision: None,
+            default_branch: None,
         })
     }
 }

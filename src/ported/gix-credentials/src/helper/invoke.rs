@@ -52,7 +52,25 @@ pub fn invoke(helper: &mut crate::Program, action: &Action) -> Result {
 }
 
 pub(crate) fn raw(helper: &mut crate::Program, action: &Action) -> std::result::Result<Option<Vec<u8>>, Error> {
-    let (mut stdin, stdout) = helper.start(action)?;
+    // `if (start_command(&helper) < 0) return -1;` (credential.c:459-460): a helper that cannot be started fails
+    // on its own, and `credential_fill()` goes on to the next one (credential.c:519-520). A shell that will not
+    // execute is `child_err_spew()`'s report, through the die-message routine (run-command.c:378-406).
+    let (mut stdin, stdout) = match helper.start(action) {
+        Ok(streams) => streams,
+        Err(err) => {
+            let cmd = helper.shell_command_text(action);
+            let text = err.to_string();
+            let text = match err.raw_os_error() {
+                Some(code) => text
+                    .strip_suffix(&format!(" (os error {code})"))
+                    .unwrap_or(&text)
+                    .to_owned(),
+                None => text,
+            };
+            eprintln!("fatal: cannot exec '{cmd}': {text}");
+            return Err(Error::CredentialsHelperFailed { source: err });
+        }
+    };
     if let (Action::Get(_), None) = (&action, &stdout) {
         panic!("BUG: `Helper` impls must return an output handle to read output from if Action::Get is provided")
     }

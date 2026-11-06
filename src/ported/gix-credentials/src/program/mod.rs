@@ -67,9 +67,12 @@ impl Program {
     }
 
     /// Convert the program into the respective command, suitable to invoke `action`.
+    ///
+    /// A helper given as an absolute path or as a `!` script is not spawned from this command: invoking it runs it
+    /// the way `run_credential_helper()` does, as `sh -c "<helper> <operation>"`.
     pub fn to_command(&self, action: &helper::Action) -> std::process::Command {
         let git_program = gix_path::env::exe_invocation();
-        let mut cmd = match &self.kind {
+        let cmd = match &self.kind {
             Kind::Builtin => {
                 let mut cmd = Command::from(gix_command::prepare(git_program));
                 cmd.arg("credential").arg(action.as_arg(false));
@@ -93,6 +96,11 @@ impl Program {
                 .arg(action.as_arg(true))
                 .into(),
         };
+        self.with_stdio(cmd, action)
+    }
+
+    /// `cmd` with the standard streams a helper invoked for `action` is given.
+    fn with_stdio(&self, mut cmd: Command, action: &helper::Action) -> Command {
         cmd.stdin(Stdio::piped())
             .stdout(if action.expects_output() {
                 Stdio::piped()
@@ -119,7 +127,26 @@ impl Program {
         action: &helper::Action,
     ) -> std::io::Result<(std::process::ChildStdin, Option<std::process::ChildStdout>)> {
         assert!(self.child.is_none(), "BUG: must not call `start()` twice");
-        let mut cmd = self.to_command(action);
+        let mut cmd = match &self.kind {
+            // `credential_do()` appends the operation to the helper's text and `run_credential_helper()` runs
+            // the result with `use_shell` (credential.c:446-459, :487-500):
+            //
+            // ```c
+            // strbuf_addf(&cmd, " %s", operation);
+            // ```
+            //
+            // That space is one of `prepare_shell_cmd()`'s metacharacters and there are no further arguments,
+            // so the helper always runs as `SHELL_PATH -c <cmd> <cmd>` (run-command.c:288-309), the text
+            // standing in as `$0`. A helper that is missing or cannot be executed is the shell's to report,
+            // `<cmd>: <path>: No such file or directory`, and its exit status fails only this helper.
+            Kind::ExternalShellScript(_) | Kind::ExternalPath { .. } => {
+                let script = gix_path::from_bstring(self.shell_command_text(action));
+                let mut cmd = Command::new(gix_path::env::shell());
+                cmd.arg("-c").arg(&script).arg(&script);
+                self.with_stdio(cmd, action)
+            }
+            Kind::Builtin | Kind::ExternalName { .. } => self.to_command(action),
+        };
         gix_trace::debug!(cmd = ?cmd, "launching credential helper");
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("stdin to be configured");
@@ -127,6 +154,23 @@ impl Program {
 
         self.child = child.into();
         Ok((stdin, stdout))
+    }
+
+    /// The command `credential_do()` builds for `action` (credential.c:487-500): the helper's text without its
+    /// `!`, an absolute path as it is, a name as `git credential-<name>`, each followed by the operation.
+    pub(crate) fn shell_command_text(&self, action: &helper::Action) -> BString {
+        let mut cmd = match &self.kind {
+            Kind::Builtin => BString::from("git credential"),
+            Kind::ExternalName { name_and_args } => {
+                let mut cmd = BString::from("git credential-");
+                cmd.push_str(name_and_args);
+                cmd
+            }
+            Kind::ExternalShellScript(text) | Kind::ExternalPath { path_and_args: text } => text.clone(),
+        };
+        cmd.push(b' ');
+        cmd.push_str(action.as_arg(!matches!(self.kind, Kind::Builtin)));
+        cmd
     }
 
     pub(crate) fn finish(&mut self) -> std::io::Result<()> {

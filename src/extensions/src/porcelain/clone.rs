@@ -1613,6 +1613,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             .map_err(|_| anyhow::anyhow!("--branch expects a valid branch name, got {name:?}"))?;
     }
     prepare = prepare.with_shallow(shallow);
+    // `repo_default_branch_name()` is what `HEAD` becomes for a remote that advertised none
+    // (builtin/clone.c:1554-1586); its advice is given once the refs are in, see
+    // [`advise_default_branch`].
+    if branch.is_none() && revision_spec.is_none() {
+        let default_branch = clone_default_branch_name(&git_dir, &config_pairs, true);
+        prepare = prepare.with_default_branch(default_branch);
+    }
     prepare = prepare.with_revision(revision_spec);
     // "ignored in local clones" is literal: git never puts the filter on the wire
     // for a local source, because there is no wire — `clone_local()` copies the
@@ -2086,6 +2093,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 cloned_empty = true;
                 unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty();
+            } else if branch.is_none() && revision.is_none() {
+                advise_default_branch(&git_dir, &config_pairs, &outcome.ref_map);
             }
             say_done();
             note_remote_head(&outcome.ref_map);
@@ -2128,6 +2137,8 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                 cloned_empty = true;
                 unborn_head = unborn_head_target(&outcome.ref_map);
                 warn_empty();
+            } else if branch.is_none() && revision.is_none() {
+                advise_default_branch(&git_dir, &config_pairs, &outcome.ref_map);
             }
             say_done();
             note_remote_head(&outcome.ref_map);
@@ -2354,9 +2365,7 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     .and_then(|probe| probe.head_target.clone())
             })
             .or_else(|| {
-                gix::open(&git_dir)
-                    .ok()
-                    .map(|repo| format!("refs/heads/{}", default_branch_name(&repo)))
+                clone_default_branch_name(&git_dir, &config_pairs, false).map(|branch| format!("refs/heads/{branch}"))
             });
         if let Some(target) = unborn_head.as_deref().filter(|t| t.starts_with("refs/heads/")) {
             std::fs::write(git_dir.join("HEAD"), format!("ref: {target}\n"))?;
@@ -4435,6 +4444,31 @@ fn mapped_refs_empty(ref_map: &gix::remote::fetch::RefMap) -> bool {
         .mappings
         .iter()
         .any(|m| matches!(m.spec_index, gix::protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)))
+}
+
+/// The advice `repo_default_branch_name(the_repository, 0)` gives when `cmd_clone()` falls back to it for a
+/// remote that advertised no `HEAD` (builtin/clone.c:1554-1572, refs.c:701-710): protocol v0/v1 leaves out a
+/// `HEAD` that names a missing branch, where v2's `ls-refs` reports it as `unborn`. The branch itself was
+/// handed to the fetch through `with_default_branch()`.
+fn advise_default_branch(git_dir: &Path, config_pairs: &[(String, String)], ref_map: &gix::remote::fetch::RefMap) {
+    if ref_map.remote_refs.iter().any(|r| r.unpack().0 == "HEAD") {
+        return;
+    }
+    clone_default_branch_name(git_dir, config_pairs, false);
+}
+
+/// `repo_default_branch_name(the_repository, quiet)` (refs.c:691-716) as `cmd_clone()` asks it: after
+/// `write_config()` has put every `-c <key>=<value>` into the new repository's config (builtin/clone.c:764-791),
+/// so a `-c init.defaultBranch=<name>` answers it, ahead of the global config. This clone writes those pairs
+/// only once the fetch is done, so they are consulted here first.
+fn clone_default_branch_name(git_dir: &Path, config_pairs: &[(String, String)], quiet: bool) -> Option<String> {
+    if let Some(name) = crate::refname::default_branch_name_override() {
+        return Some(name);
+    }
+    if let Some((_, name)) = config_pairs.iter().rev().find(|(key, _)| key.eq_ignore_ascii_case("init.defaultBranch")) {
+        return Some(name.clone());
+    }
+    gix::open(git_dir).ok().map(|repo| crate::refname::repo_default_branch_name(&repo, quiet))
 }
 
 /// Whether `transport_get_remote_refs()` returned a non-NULL list: an `unborn` line is

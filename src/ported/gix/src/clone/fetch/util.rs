@@ -142,11 +142,38 @@ pub fn update_head(
     reflog_message: &BStr,
     remote_name: &BStr,
     ref_name: Option<&PartialName>,
+    default_branch: Option<&BStr>,
 ) -> Result<(), Error> {
     use gix_ref::{
         Target,
         transaction::{PreviousValue, RefEdit},
     };
+    // `cmd_clone()` for a remote that advertised no `HEAD` (builtin/clone.c:1554-1586):
+    //
+    // ```c
+    // branch = to_free = repo_default_branch_name(the_repository, 0);
+    // unborn_head = xstrfmt("refs/heads/%s", branch);
+    // ...
+    // our_head_points_at = find_remote_branch(mapped_refs, branch);
+    // ```
+    //
+    // `update_head()` then makes `HEAD` that branch, created at the remote's branch of the same name if the clone
+    // fetched one, or left unborn on it (builtin/clone.c:583-611). A clone that mapped no ref is an empty clone,
+    // whose `HEAD` the caller sets along with the rest of what `option_no_checkout` changes.
+    let mapped_any = ref_map
+        .mappings
+        .iter()
+        .any(|m| matches!(m.spec_index, gix_protocol::fetch::refmap::SpecIndex::ExplicitInRemote(_)));
+    let default_head = default_branch.filter(|_| mapped_any).map(|branch| {
+        let mut full_name = BString::from("refs/heads/");
+        full_name.extend_from_slice(branch);
+        let object = ref_map.mappings.iter().find_map(|m| {
+            (m.remote.as_name() == Some(full_name.as_bstr()))
+                .then(|| m.remote.as_id())
+                .flatten()
+        });
+        (object, full_name)
+    });
     let head_info = match ref_name {
         Some(ref_name) => {
             let (target, full_ref_name) = find_custom_refname(ref_map, ref_name)?;
@@ -169,7 +196,12 @@ pub fn update_head(
                 _ => return None,
             })
         }),
-    };
+    }
+    .or_else(|| {
+        default_head
+            .as_ref()
+            .map(|(object, full_name)| (*object, Some(full_name.as_bstr())))
+    });
     let Some((head_peeled_id, head_ref)) = head_info else {
         return Ok(());
     };

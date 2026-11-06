@@ -476,6 +476,7 @@ impl PrepareFetch {
                 reflog_message.as_ref(),
                 remote_name.as_ref(),
                 self.ref_name.as_ref(),
+                self.default_branch.as_ref().map(AsRef::as_ref),
             )?;
         }
 

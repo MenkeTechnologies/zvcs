@@ -42,7 +42,6 @@ impl Algorithm {
         &mut self,
         id: ObjectId,
         mode: Mark,
-        ancestors: Ancestors,
         graph: &mut crate::Graph<'_, '_>,
     ) -> Result<(), Error> {
         let mut is_common = false;
@@ -50,20 +49,22 @@ impl Algorithm {
             .get_or_insert_commit(id, |data| is_common = data.flags.contains(Flags::COMMON))?
             .filter(|_| !is_common)
         {
-            let mut queue = gix_revwalk::PriorityQueue::from_iter(Some((commit.commit_time, (id, 0_usize))));
+            let mut queue = gix_revwalk::PriorityQueue::from_iter(Some((commit.commit_time, id)));
             if let Mark::ThisCommitAndAncestors = mode {
                 commit.data.flags |= Flags::COMMON;
                 if commit.data.flags.contains(Flags::SEEN) && !commit.data.flags.contains(Flags::POPPED) {
                     self.non_common_revs -= 1;
                 }
             }
-            while let Some((id, generation)) = queue.pop_value() {
+            // `mark_common()` (negotiator/default.c:57-103) walks on through every SEEN commit, however deep: a SEEN
+            // commit went through `rev_list_push()`, which parsed it, so `dont_parse` never stops the walk early.
+            while let Some(id) = queue.pop_value() {
                 if graph
                     .get(&id)
                     .is_none_or(|commit| !commit.data.flags.contains(Flags::SEEN))
                 {
                     self.add_to_queue(id, Flags::SEEN, graph)?;
-                } else if matches!(ancestors, Ancestors::AllUnseen) || generation < 2 {
+                } else {
                     if let Some(commit) = graph.get_or_insert_commit(id, |_| {})? {
                         for parent_id in commit.parents.clone() {
                             let mut prev_flags = Flags::default();
@@ -77,7 +78,7 @@ impl Algorithm {
                                 if prev_flags.contains(Flags::SEEN) && !prev_flags.contains(Flags::POPPED) {
                                     self.non_common_revs -= 1;
                                 }
-                                queue.insert(parent.commit_time, (parent_id, generation + 1));
+                                queue.insert(parent.commit_time, parent_id);
                             }
                         }
                     }
@@ -95,7 +96,7 @@ impl Negotiator for Algorithm {
             .is_none_or(|commit| !commit.data.flags.contains(Flags::SEEN))
         {
             self.add_to_queue(id, Flags::COMMON_REF | Flags::SEEN, graph)?;
-            self.mark_common(id, Mark::AncestorsOnly, Ancestors::DirectUnseen, graph)?;
+            self.mark_common(id, Mark::AncestorsOnly, graph)?;
         }
         Ok(())
     }
@@ -133,7 +134,7 @@ impl Negotiator for Algorithm {
                     }
                 }
                 if mark.contains(Flags::COMMON) {
-                    if let Err(err) = self.mark_common(parent_id, Mark::AncestorsOnly, Ancestors::AllUnseen, graph) {
+                    if let Err(err) = self.mark_common(parent_id, Mark::AncestorsOnly, graph) {
                         return Some(Err(err));
                     }
                 }
@@ -149,7 +150,7 @@ impl Negotiator for Algorithm {
         let known_to_be_common = graph
             .get(&id)
             .is_some_and(|commit| commit.data.flags.contains(Flags::COMMON));
-        self.mark_common(id, Mark::ThisCommitAndAncestors, Ancestors::DirectUnseen, graph)?;
+        self.mark_common(id, Mark::ThisCommitAndAncestors, graph)?;
         Ok(known_to_be_common)
     }
 }
@@ -157,11 +158,4 @@ impl Negotiator for Algorithm {
 enum Mark {
     AncestorsOnly,
     ThisCommitAndAncestors,
-}
-
-enum Ancestors {
-    /// Traverse only the parents of a commit.
-    DirectUnseen,
-    /// Traverse all ancestors that weren't yet seen.
-    AllUnseen,
 }

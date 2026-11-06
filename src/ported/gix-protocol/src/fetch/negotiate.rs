@@ -425,13 +425,25 @@ pub fn add_wants(
     // verbatim and feeds it to `pack-objects`, so the difference is visible in the pack it writes back.
     wants.sort_by_key(|m| advertised_position(ref_map, m));
     // The same remote ref can be reached by more than one mapping — an explicit refspec and the opportunistic
-    // one that derives its tracking ref both point at it — and asking for it twice would have the server emit
-    // a duplicate `wanted-refs` entry.
+    // one that derives its tracking ref both point at it. `fetch_pack()` drops the repeats by ref name with
+    // `remove_duplicates_in_refs()` (fetch-pack.c:2009-2028, :2163), an exact object id being sought under its
+    // hex as the name, and nothing else: two refs at the same commit, a clone's `HEAD` and the branch it
+    // points at, are each wanted (fetch-pack.c:380-428, `add_wants()` at :1302-1330).
     let mut sent = std::collections::HashSet::new();
     for want in wants {
         let id_on_remote = want.remote.as_id();
+        let name = match want.remote.as_name() {
+            Some(name) => name.to_owned(),
+            None => match id_on_remote {
+                Some(id) => bstr::BString::from(id.to_hex().to_string()),
+                None => continue,
+            },
+        };
+        if !sent.insert(name) {
+            continue;
+        }
         if !arguments.can_use_ref_in_want() || matches!(want.remote, refmap::Source::ObjectId(_)) {
-            if let Some(id) = id_on_remote.filter(|id| sent.insert(bstr::BString::from(id.to_hex().to_string()))) {
+            if let Some(id) = id_on_remote {
                 arguments.want(id);
                 has_want = true;
             }
@@ -440,10 +452,8 @@ pub fn add_wants(
                 .remote
                 .as_name()
                 .expect("name available if this isn't an object id");
-            if sent.insert(name.to_owned()) {
-                arguments.want_ref(name);
-                has_want = true;
-            }
+            arguments.want_ref(name);
+            has_want = true;
         }
         let id_is_annotated_tag_we_have = id_on_remote
             .and_then(|id| objects.try_header(id).ok().flatten().map(|h| (id, h)))

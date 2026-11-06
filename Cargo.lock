@@ -1616,6 +1616,7 @@ dependencies = [
  "gix-quote",
  "gix-sec",
  "gix-url",
+ "gix-zlib",
  "hyper",
  "parking_lot",
  "reqwest",

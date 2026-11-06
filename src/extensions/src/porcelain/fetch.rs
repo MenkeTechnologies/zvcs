@@ -2792,6 +2792,10 @@ fn negotiation_restrictions(
             return Ok(Err(verdict));
         }
     }
+    // `add_oids_to_set()` puts them in an oidset that starts as `OIDSET_INIT`, and
+    // every request writes them in its iteration order, each once (fetch-pack.c:497-514,
+    // :1351-1364, :2248-2249).
+    out.always_have = crate::oidhash::oidset_init_order(&out.always_have);
     Ok(Ok(out))
 }
 
@@ -3371,10 +3375,19 @@ fn fetch_one(
                 gix::remote::negotiate_only::Error::RequiresV2
                 | gix::remote::negotiate_only::Error::WaitForDoneUnsupported,
             ) => return Ok(Verdict::Refused),
+            // A `die()` of the response reader in `negotiate_using_fetch()`
+            // (fetch-pack.c:2292-2313): nothing is printed, the acknowledged
+            // commits included.
+            Err(gix::remote::negotiate_only::Error::Protocol(message)) => {
+                eprintln!("fatal: {message}");
+                return Ok(Verdict::Fatal);
+            }
             Err(e) => return Err(e.into()),
         };
+        // `acked_commits` is an oidset that starts as `OIDSET_INIT`, printed in
+        // its iteration order (builtin/fetch.c:2812-2814).
         let mut out = String::new();
-        for id in common {
+        for id in crate::oidhash::oidset_init_order(&common) {
             out.push_str(&id.to_hex().to_string());
             out.push('\n');
         }

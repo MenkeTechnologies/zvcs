@@ -766,17 +766,56 @@ fn report_rpc_curl_failure(failure: &http::CurlFailure) {
 ///                 rpc->service_name, (unsigned long)rpc->len);
 /// ```
 ///
-/// `rpc->service_name` is the last component of the URL the request goes to. remote-curl gzips an upload-pack
-/// request over 1024 bytes and says `(gzip <len> to <size> bytes)` for it (remote-curl.c:1006-1043); this transport
-/// sends such a request as it is, and announces it as such.
-fn announce_post(url: &str, large_request: bool, req: &reqwest::blocking::Request) {
+/// `rpc->service_name` is the last component of the URL the request goes to. A request [`in_memory_body()`]
+/// deflated is announced with both sizes (remote-curl.c:1039-1044):
+///
+/// ```c
+/// fprintf(stderr, "POST %s (gzip %lu to %lu bytes)\n",
+///         rpc->service_name,
+///         (unsigned long)rpc->len, (unsigned long)gzip_size);
+/// ```
+fn announce_post(url: &str, large_request: bool, gzipped: Option<(usize, usize)>, req: &reqwest::blocking::Request) {
     let service = url.rsplit('/').next().unwrap_or_default();
     if large_request {
         eprintln!("POST {service} (chunked)");
+    } else if let Some((len, gzip_size)) = gzipped {
+        eprintln!("POST {service} (gzip {len} to {gzip_size} bytes)");
     } else {
         let len = req.body().and_then(reqwest::blocking::Body::as_bytes).map_or(0, <[u8]>::len);
         eprintln!("POST {service} ({len} bytes)");
     }
+}
+
+/// The body of a `POST` that fits into `http.postBuffer`, as `post_rpc()` sends it (remote-curl.c:1008-1056).
+///
+/// remote-curl deflates an upload-pack request over 1024 bytes itself, `rpc->gzip_request` being set by
+/// `fetch_git()` and `stateless_connect()` alone (remote-curl.c:1247, :1511), so a `git-receive-pack` body goes
+/// as it is:
+///
+/// ```c
+/// } else if (use_gzip && 1024 < rpc->len) {
+///         git_deflate_init_gzip(&stream, Z_BEST_COMPRESSION);
+///         ...
+///         headers = curl_slist_append(headers, "Content-Encoding: gzip");
+/// ```
+///
+/// `gzipped` receives `(rpc->len, gzip_size)` for [`announce_post()`].
+fn in_memory_body(
+    req_builder: reqwest::blocking::RequestBuilder,
+    url: &str,
+    buf: Vec<u8>,
+    gzipped: &mut Option<(usize, usize)>,
+) -> reqwest::blocking::RequestBuilder {
+    let service = url.rsplit('/').next().unwrap_or_default();
+    if service != "git-upload-pack" || buf.len() <= 1024 {
+        return req_builder.body(buf);
+    }
+    // `Z_BEST_COMPRESSION` is zlib's level 9.
+    let body = gix_zlib::deflate::compress(&buf, 9, gix_zlib::deflate::Wrap::Gzip);
+    *gzipped = Some((buf.len(), body.len()));
+    req_builder
+        .header(reqwest::header::CONTENT_ENCODING, "gzip")
+        .body(body)
 }
 
 /// The error a request that failed before any response arrived is handed on with: the [`http::CurlFailure`] curl
@@ -1161,6 +1200,8 @@ impl Default for Remote {
                 // remote-curl's `rpc->large_request`: the body did not fit into `http.postBuffer` and goes out
                 // chunked, which cannot be sent twice.
                 let mut large_request = false;
+                // remote-curl's `gzip_body`: `(rpc->len, gzip_size)` of a request it deflated.
+                let mut gzipped = None;
                 // A v2 request, whose failure ends with `packet_response_end()`.
                 let stateless_connect = upload_body_kind.is_some() && is_stateless_connect(&headers);
                 let (post_body_tx, mut post_body_rx) = pipe::unidirectional(0);
@@ -1182,7 +1223,7 @@ impl Default for Remote {
                     Some(PostBodyDataKind::BoundedAndFitsIntoMemory) => {
                         let mut buf = Vec::<u8>::with_capacity(512);
                         post_body_rx.read_to_end(&mut buf)?;
-                        req_builder.body(buf)
+                        in_memory_body(req_builder, &effective_url, buf, &mut gzipped)
                     }
                     // `http.postBuffer`: buffer up to that many bytes and, if the body ended within the
                     // budget, send it with `Content-Length`; only a larger body is streamed with
@@ -1194,7 +1235,7 @@ impl Default for Remote {
                             (&mut post_body_rx).take(limit).read_to_end(&mut buf)?;
                             let mut probe = [0u8; 1];
                             match post_body_rx.read(&mut probe)? {
-                                0 => req_builder.body(buf),
+                                0 => in_memory_body(req_builder, &effective_url, buf, &mut gzipped),
                                 _ => {
                                     large_request = true;
                                     buf.extend_from_slice(&probe);
@@ -1352,14 +1393,17 @@ impl Default for Remote {
                 let mut approve_after_success = false;
                 let mut sent_authorization = false;
                 let mut attempt = Attempt::new();
+                // A retry sends the deflated body again without announcing it: `else if (gzip_body)` (remote-curl.c:999-1006).
+                let mut gzip_announced = false;
                 let executed = loop {
                     let replay = (upload_body_kind.is_some() && !large_request)
                         .then(|| req.try_clone())
                         .flatten();
                     let had_authorization = req.headers().contains_key(reqwest::header::AUTHORIZATION);
                     sent_authorization = had_authorization;
-                    if upload_body_kind.is_some() && config.verbosity > 1 {
-                        announce_post(&effective_url, large_request, &req);
+                    if upload_body_kind.is_some() && config.verbosity > 1 && !gzip_announced {
+                        announce_post(&effective_url, large_request, gzipped, &req);
+                        gzip_announced = gzipped.is_some();
                     }
                     let res = execute_retrying_rate_limits(&client, req, &config, &connections, &mut attempt);
                     let Ok(ref ok) = res else { break res };

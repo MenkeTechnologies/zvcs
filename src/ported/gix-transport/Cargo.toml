@@ -40,7 +40,7 @@ http-client-curl-openssl = ["http-client-curl", "curl/ssl"]
 ## Implies `http-client` and adds support for http transports using the blocking version of `reqwest`.
 ## NOTE: `https://` is NOT supported by default. You must enable one of the `http-client-reqwest-rust-tls`
 ## or `http-client-reqwest-native-tls` features to enable HTTPS support.
-http-client-reqwest = ["reqwest", "http-client", "dep:hyper", "dep:tower-layer", "dep:tower-service"]
+http-client-reqwest = ["reqwest", "http-client", "dep:hyper", "dep:tower-layer", "dep:tower-service", "dep:gix-zlib"]
 ## Stacks with `http-client-reqwest` and enables `https://` via the `rustls` crate.
 http-client-reqwest-rust-tls = ["http-client-reqwest", "reqwest/rustls"]
 ## Stacks with `http-client-reqwest` and enables `https://` via the `rustls` crate.
@@ -99,6 +99,8 @@ gix-sec = { version = "^0.14.1", path = "../gix-sec" }
 gix-packetline = { version = "^0.21.5", path = "../gix-packetline" }
 gix-credentials = { version = "^0.38.2", path = "../gix-credentials", optional = true }
 gix-quote = { version = "^0.7.2", path = "../gix-quote" }
+# for http-client-reqwest: remote-curl gzips an upload-pack request over 1024 bytes (remote-curl.c:1008-1044)
+gix-zlib = { version = "^0.1.0", path = "../gix-zlib", optional = true }
 
 serde = { version = "1.0.114", optional = true, default-features = false, features = [
     "std",

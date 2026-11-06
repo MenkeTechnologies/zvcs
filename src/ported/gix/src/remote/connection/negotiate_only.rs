@@ -1,29 +1,26 @@
 //! git's `git fetch --negotiate-only`: find out which commits the remote has in common with us,
 //! without asking it for a single object.
 //!
-//! This is a fetch request that carries no `want` at all. `wait-for-done` keeps the server in the
-//! acknowledgement phase instead of letting it decide it is `ready` and start a pack, so the exchange
-//! ends when we run out of `have`s to offer rather than when the server has heard enough.
+//! This is `negotiate_using_fetch()` (fetch-pack.c:2226-2331): `fetch` requests that carry no
+//! `want` at all, only `wait-for-done` and the `have`s. `wait-for-done` keeps the server in the
+//! acknowledgement phase instead of letting it decide it is `ready` and start a pack.
 //!
 //! There is no `ls-refs` beforehand: with nothing to want, there is nothing to map, which is why the
 //! `have`s are the plain ancestry of the requested tips rather than the pruned set a normal fetch
 //! would send.
 //!
-//! ### Deviation
-//!
-//! Stock git 2.55.0 sends one more request than it has `have`s for whenever a requested tip is left
-//! unacknowledged, and that empty request is what makes `upload-pack` start a `packfile` section.
-//! Its reader is still looking for `acknowledgments`, so the command dies with
-//! `fatal: expected 'acknowledgments', received 'packfile'` and exit code 128 — for example under
-//! `--negotiation-restrict='refs/heads/*'` against a remote that only shares one of those branches.
-//! That is a defect rather than a contract: the documented job of the option is to print the common
-//! ancestors, so this implementation stops once the negotiator is exhausted, prints them, and exits
-//! zero.
+//! The rounds end when a request went out with no new `have` (or after MAX_IN_VAIN unacknowledged
+//! ones once something was acknowledged), or when every tip reaches an acknowledged commit. The
+//! request with no new `have` is still sent, and `upload-pack` answers a request that has neither
+//! `have`s nor `done` with a `packfile` section, so a tip the remote shares nothing with ends the run
+//! in `fatal: expected 'acknowledgments', received 'packfile'`, as it does in git.
+use std::collections::HashSet;
+
 use gix_protocol::fetch::negotiate;
 #[cfg(feature = "async-network-client")]
-use gix_transport::client::async_io::Transport;
+use gix_transport::client::async_io::{ExtendedBufRead, Transport, TransportV2Ext};
 #[cfg(feature = "blocking-network-client")]
-use gix_transport::client::blocking_io::Transport;
+use gix_transport::client::blocking_io::{ExtendedBufRead, Transport, TransportV2Ext};
 
 use crate::{
     Progress,
@@ -31,6 +28,11 @@ use crate::{
     config::tree::Fetch,
     remote::{Connection, connection::ConnectionDetached},
 };
+
+/// `INITIAL_FLUSH` (fetch-pack.c:272): the haves in the first round.
+const INITIAL_FLUSH: usize = 16;
+/// `MAX_IN_VAIN` (fetch-pack.c:67): haves sent without an ACK after which the rounds stop.
+const MAX_IN_VAIN: usize = 256;
 
 /// The error returned by [`Connection::negotiate_only()`].
 #[derive(Debug, thiserror::Error)]
@@ -51,11 +53,14 @@ pub enum Error {
     #[error("Could not walk the commit graph to find what we have")]
     Graph(#[from] gix_negotiate::Error),
     #[error(transparent)]
-    Response(#[from] gix_protocol::fetch::response::Error),
+    Io(#[from] std::io::Error),
     #[error("--negotiate-only requires protocol v2")]
     RequiresV2,
     #[error("server does not support wait-for-done")]
     WaitForDoneUnsupported,
+    /// A `die()` of the response reader, its message exactly as git words it.
+    #[error("{0}")]
+    Protocol(String),
 }
 
 impl gix_protocol::transport::IsSpuriousError for Error {
@@ -73,7 +78,7 @@ where
     T: Transport,
 {
     /// Ask the remote which of the commits reachable from `restrictions` it already has, and return
-    /// them in the order it acknowledged them.
+    /// them in the order it acknowledged them, repeats included.
     ///
     /// Nothing is fetched and no ref is touched.
     #[gix_protocol::maybe_async::maybe_async]
@@ -131,9 +136,9 @@ where
         let fetch = gix_protocol::Command::Fetch;
         // Only a v2 server that advertises `wait-for-done` will stay in the acknowledgement phase for
         // a request without wants; anything else would answer with a pack we never asked for.
-        // `fetch_refs_via_pack()` (transport.c:487-495) refuses the two cases separately,
+        // `fetch_refs_via_pack()` (transport.c:532-548) refuses the two cases separately,
         // then closes the connection at `cleanup:` without the flush `disconnect_git()`
-        // would send (transport.c:530-535): the service reads EOF where it expected wants.
+        // would send (transport.c:574-580): the service reads EOF where it expected wants.
         let refusal = if handshake.server_protocol_version != gix_transport::Protocol::V2 {
             Some(Error::RequiresV2)
         } else if !handshake
@@ -154,15 +159,15 @@ where
             return Err(refusal);
         }
 
+        // `write_command_and_capabilities()` (connect.c) writes the same capability lines as any
+        // other `fetch`; of the arguments, `negotiate_using_fetch()` writes only `wait-for-done`
+        // and the haves (fetch-pack.c:2270-2276) — no `thin-pack`, `ofs-delta` or `done`.
         let mut features = fetch.default_features(handshake.server_protocol_version, &handshake.capabilities);
         features.push(repo.config.user_agent_tuple());
         features.extend(gix_protocol::command::server_options(
             &handshake.capabilities,
             &self.server_options,
         ));
-        let mut arguments =
-            gix_protocol::fetch::Arguments::new(handshake.server_protocol_version, features, self.trace);
-        arguments.add_feature("wait-for-done");
 
         let mut negotiator = repo
             .config
@@ -176,60 +181,195 @@ where
             .into_negotiator();
         let cache = repo.commit_graph_if_enabled().ok().flatten();
         let mut graph = repo.revision_graph(cache.as_ref());
-        // Without a ref-map there is nothing to mark complete, so the tips are all the negotiator ever
-        // learns about — which is why a `--negotiate-only` run walks further back than a fetch would.
-        for id in restrictions.tips.iter().flatten() {
+        // `mark_tips()` (fetch-pack.c:2246): without a ref-map there is nothing to mark complete, so
+        // the tips are all the negotiator ever learns about.
+        let tips: &[gix_hash::ObjectId] = restrictions.tips.as_deref().unwrap_or_default();
+        for id in tips {
             negotiator.add_tip(*id, &mut graph)?;
         }
+        // `add_haves()` calls `have_sent()` on each `--negotiation-include` commit as it writes it
+        // (fetch-pack.c:1351-1364), which marks it common for the walk; the first round does so
+        // before its first `next()`, so marking them here is the same thing.
         for id in &restrictions.always_have {
             negotiator.in_common_with_remote(*id, &mut graph)?;
         }
 
-        let is_stateless =
-            arguments.is_stateless(!self.transport.inner.connection_persists_across_multiple_requests());
-        let mut state = negotiate::one_round::State::new(is_stateless);
-        let mut previous_response = None::<gix_protocol::fetch::Response>;
-        let mut common = Vec::new();
-        loop {
-            let (round, is_done) = negotiate::one_round(
-                negotiator.as_mut(),
-                &mut graph,
-                &mut state,
-                &mut arguments,
-                previous_response.as_ref(),
-                &restrictions.always_have,
-            )?;
-            // Nothing left to offer. Sending an empty request would only ask the server to build a
-            // pack, which is the one thing this operation must not do.
-            if round.haves_sent == 0 && restrictions.always_have.is_empty() {
-                break;
+        let mut haves_to_send = INITIAL_FLUSH;
+        let mut in_vain = 0;
+        let mut seen_ack = false;
+        let mut last_iteration = false;
+        // `acked_commits`, in the order the ACKs arrived; the caller prints them as git's oidset
+        // iterates them.
+        let mut acked = Vec::new();
+        // The commits that carry fetch-pack's COMMON flag (fetch-pack.c:2295-2305).
+        let mut common = HashSet::new();
+        while !last_iteration {
+            let mut args = vec![crate::bstr::BString::from("wait-for-done")];
+            // `add_haves()` (fetch-pack.c:1343-1376): the `--negotiation-include` commits lead every
+            // request, then up to `haves_to_send` from the negotiator.
+            for id in &restrictions.always_have {
+                args.push(format!("have {id}").into());
             }
-            let mut reader = arguments.send(&mut self.transport.inner, false).await?;
-            let response = gix_protocol::fetch::Response::from_line_reader(
-                handshake.server_protocol_version,
-                &mut reader,
-                false,
-                true,
-            )
-            .await?;
-            drop(reader);
-            for ack in response.acknowledgements() {
-                if let gix_protocol::fetch::response::Acknowledgement::Common(id) = ack {
-                    common.push(*id);
+            let mut haves_added = 0;
+            while let Some(id) = negotiator.next_have(&mut graph) {
+                args.push(format!("have {}", id?).into());
+                haves_added += 1;
+                if haves_added >= haves_to_send {
+                    break;
                 }
             }
-            previous_response = Some(response);
-            if is_done {
-                break;
+            haves_to_send = gix_negotiate::window_size(true, Some(haves_to_send));
+            in_vain += haves_added;
+            if haves_added == 0 || (seen_ack && in_vain >= MAX_IN_VAIN) {
+                last_iteration = true;
+            }
+
+            let mut reader = self.transport.inner.invoke(
+                fetch.as_str(),
+                features.iter().filter(|(_, v)| v.is_some()).cloned(),
+                Some(args.into_iter()),
+                self.trace,
+            )?;
+            reader.reset(gix_transport::Protocol::V2);
+            // `process_section_header(&reader, "acknowledgments", 0)` (fetch-pack.c:1464-1485).
+            let header = match reader.peek_data_line().await {
+                Some(Ok(Ok(line))) => Some(String::from_utf8_lossy(line).trim_end_matches('\n').to_owned()),
+                Some(Ok(Err(err))) => return Err(Error::Protocol(err.to_string())),
+                Some(Err(err)) => return Err(err.into()),
+                None => None,
+            };
+            match header.as_deref() {
+                Some("acknowledgments") => {
+                    let mut line = String::new();
+                    reader.readline_str(&mut line).await?;
+                }
+                Some(other) => {
+                    return Err(Error::Protocol(format!(
+                        "expected 'acknowledgments', received '{other}'"
+                    )));
+                }
+                None => return Err(Error::Protocol("expected 'acknowledgments'".into())),
+            }
+            // `process_ack()` (fetch-pack.c:1487-1541), called until it reports no further ACK.
+            let mut received_ready = false;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.readline_str(&mut line).await? == 0 {
+                    break;
+                }
+                let line = line.trim_end_matches('\n');
+                if line == "NAK" {
+                    continue;
+                }
+                if let Some(arg) = line.strip_prefix("ACK ") {
+                    let hex_len = repo.object_hash().len_in_hex();
+                    if let Some(id) = arg
+                        .get(..hex_len)
+                        .and_then(|hex| gix_hash::ObjectId::from_hex(hex.as_bytes()).ok())
+                    {
+                        negotiator.in_common_with_remote(id, &mut graph)?;
+                        if repo.find_commit(id).is_ok() {
+                            common.insert(id);
+                        }
+                        in_vain = 0;
+                        seen_ack = true;
+                        acked.push(id);
+                    }
+                    continue;
+                }
+                if line == "ready" {
+                    received_ready = true;
+                    continue;
+                }
+                return Err(Error::Protocol(format!("unexpected acknowledgment line: '{line}'")));
+            }
+            let at_delimiter = reader.stopped_at() == Some(gix_transport::client::MessageKind::Delimiter);
+            if received_ready && !at_delimiter {
+                return Err(Error::Protocol("expected packfile to be sent after 'ready'".into()));
+            }
+            if !received_ready && at_delimiter {
+                return Err(Error::Protocol(
+                    "expected no other sections to be sent after no 'ready'".into(),
+                ));
+            }
+            if received_ready {
+                return Err(Error::Protocol("unexpected 'ready' from remote".into()));
+            }
+            drop(reader);
+            if can_all_from_reach_with_flag(repo, tips, &common) {
+                last_iteration = true;
             }
         }
-        gix_protocol::indicate_end_of_interaction(&mut self.transport.inner, self.trace)
-            .await
-            .ok();
-        // git prints them in `oidset` iteration order, which is a hash order it never promises; a
-        // stable one is the closest thing to it that can be relied on.
-        common.sort();
-        common.dedup();
-        Ok(common)
+        // `fetch_refs_via_pack()` closes the connection at `cleanup:` without a flush
+        // (transport.c:574-580).
+        self.transport.skip_end_of_interaction();
+        Ok(acked)
     }
+}
+
+/// `can_all_from_reach_with_flag(&nt_object_array, COMMON, REACH_SCRATCH, 0, min_generation)`
+/// (commit-reach.c:955-1055): whether every tip, peeled, reaches a commit in `common`.
+///
+/// The DFS from each tip in turn shares one visited set, and RESULT spreads one level up the stack
+/// as the walk unwinds. A tip that is not a commit is passed over; one that cannot be read fails
+/// the check. git also stops below `min_generation`, the lowest generation among the acknowledged
+/// commits; generations only fall along ancestry, so no commit below it can reach one of them and
+/// leaving the cut-off out changes nothing but the time spent.
+fn can_all_from_reach_with_flag(
+    repo: &crate::Repository,
+    tips: &[gix_hash::ObjectId],
+    common: &HashSet<gix_hash::ObjectId>,
+) -> bool {
+    let mut visited = HashSet::<gix_hash::ObjectId>::new();
+    let mut result = HashSet::<gix_hash::ObjectId>::new();
+    let mut list = Vec::new();
+    for tip in tips {
+        let Ok(object) = repo.find_object(*tip).and_then(|o| o.peel_tags_to_end().map_err(Into::into)) else {
+            return false;
+        };
+        if object.kind != crate::object::Kind::Commit {
+            continue;
+        }
+        list.push(object.id);
+    }
+    let parents_of = |id: gix_hash::ObjectId| -> Option<Vec<gix_hash::ObjectId>> {
+        let commit = repo.find_commit(id).ok()?;
+        Some(commit.parent_ids().map(crate::Id::detach).collect())
+    };
+    let reaches = |id: &gix_hash::ObjectId, result: &HashSet<gix_hash::ObjectId>| common.contains(id) || result.contains(id);
+    for tip in list {
+        visited.insert(tip);
+        let mut stack = vec![tip];
+        while let Some(&top) = stack.last() {
+            if reaches(&top, &result) {
+                stack.pop();
+                if let Some(&below) = stack.last() {
+                    result.insert(below);
+                }
+                continue;
+            }
+            let mut descended = false;
+            for parent in parents_of(top).unwrap_or_default() {
+                if reaches(&parent, &result) {
+                    result.insert(top);
+                }
+                if visited.insert(parent) {
+                    if repo.find_commit(parent).is_err() {
+                        continue;
+                    }
+                    stack.push(parent);
+                    descended = true;
+                    break;
+                }
+            }
+            if !descended {
+                stack.pop();
+            }
+        }
+        if !reaches(&tip, &result) {
+            return false;
+        }
+    }
+    true
 }

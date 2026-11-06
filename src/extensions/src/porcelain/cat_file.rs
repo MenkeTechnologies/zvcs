@@ -1254,6 +1254,25 @@ struct Format {
 
 const DEFAULT_FORMAT: &str = "%(objectname) %(objecttype) %(objectsize)";
 
+/// `batch_object_write()`'s info read (builtin/cat-file.c:536-551). It asks `sizep` when the
+/// format shows `%(objectsize)`, as the default format does, or a `blob:limit` filter needs it
+/// (builtin/cat-file.c:379-386, 540-545), and a packed delta whose size cannot be read is then
+/// `missing` (packfile.c:1330-1350) where a read of the type alone still finds it.
+fn batch_info(
+    repo: &gix::Repository,
+    oid: gix::hash::ObjectId,
+    fmt: &Format,
+    filter: Option<&ObjFilter>,
+) -> std::result::Result<gix::odb::find::Header, gix::object::find::existing::Error> {
+    let asks_size = fmt.is_default
+        || fmt.tokens.iter().any(|t| matches!(t, Token::ObjectSize))
+        || matches!(filter, Some(ObjFilter::BlobLimit(_)));
+    match asks_size {
+        true => gix::odb::store::find::read_info_with_size(|| repo.find_header(oid)),
+        false => repo.find_header(oid),
+    }
+}
+
 /// Compile a cat-file format string, matching git's `expand_format` validation
 /// and its `strbuf_expand_bad_format` diagnostics. `Err` carries the exact
 /// `fatal:` line git would print.
@@ -1703,7 +1722,7 @@ fn run_batch(
             // (`batch_object_write()`, builtin/cat-file.c.) An object the enumeration found
             // but the odb cannot read — a corrupt loose file, whose name is still a name —
             // is reported as `missing` rather than dropped from the listing.
-            let Ok(header) = repo.find_header(oid) else {
+            let Ok(header) = batch_info(&repo, oid, &fmt, objfilter.as_ref()) else {
                 out.write_all(oid.to_hex().to_string().as_bytes())?;
                 out.write_all(b" missing")?;
                 out.write_all(&[output_delim])?;
@@ -2421,7 +2440,7 @@ fn process_request(
     // operand's path arm resolved through, which `%(objectmode)` renders.
     let mode = path_entry.map(|(_, m)| m);
 
-    let Ok(header) = repo.find_header(oid) else {
+    let Ok(header) = batch_info(repo, oid, fmt, filter) else {
         // ```c
         // if (ret < 0) {
         //         if (data->mode == S_IFGITLINK)
@@ -2601,7 +2620,7 @@ fn emit_follow(
             Ok(EmitOutcome::Ok)
         }
         FollowResult::Found(oid, mode) => {
-            let Ok(header) = repo.find_header(oid) else {
+            let Ok(header) = batch_info(repo, oid, fmt, filter) else {
                 out.write_all(name)?;
                 out.write_all(b" missing\n")?;
                 return Ok(EmitOutcome::Ok);

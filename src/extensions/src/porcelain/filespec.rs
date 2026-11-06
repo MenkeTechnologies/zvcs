@@ -17,14 +17,68 @@ use gix::hash::ObjectId;
 /// submodule (commit entry) is rendered as its `Subproject commit <oid>` line. A blob
 /// the object database does not produce is `die("unable to read %s")`
 /// (diff.c:4596-4598).
+///
+/// A side that came back with no content is diffed as git diffs a `NULL` `s->data`: xdiff reads a
+/// `NULL` buffer as no lines, and `diff_filespec_is_binary()` leaves it text (diff.c:3703-3709).
 pub(crate) fn content_of(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Result<Vec<u8>> {
+    Ok(populate(repo, id, is_submodule)?.unwrap_or_default())
+}
+
+/// [`content_of`] with git's `NULL` kept apart: `diff_populate_filespec()` as
+/// `diff_filespec_is_binary()` calls it, with `check_binary` set (diff.c:3703-3704), which reads
+/// the size alone first and dies when that fails, then the content (diff.c:4580-4617); see
+/// [`read_content`] for the `None` it can hand back.
+pub(crate) fn populate(repo: &gix::Repository, id: ObjectId, is_submodule: bool) -> Result<Option<Vec<u8>>> {
     if is_submodule {
-        return Ok(format!("Subproject commit {}\n", id.to_hex()).into_bytes());
+        return Ok(Some(format!("Subproject commit {}\n", id.to_hex()).into_bytes()));
     }
-    match repo.find_object(id) {
-        Ok(object) => Ok(object.detach().data),
-        Err(_) => Err(crate::fatal::die(format!("unable to read {id}"))),
+    populate_blob(&repo.objects, id)
+}
+
+/// [`populate`] of a blob side through the object database handle alone.
+pub(crate) fn populate_blob(objects: &gix::OdbHandle, id: ObjectId) -> Result<Option<Vec<u8>>> {
+    read_size(objects, id)?;
+    read_content(objects, id)
+}
+
+/// The read `diff_populate_filespec()` makes for `check_binary` or `size_only`: `sizep` alone
+/// (diff.c:4580-4598), which `packed_object_info()` answers from the entry's header, or from the
+/// delta's own header for a delta (packfile.c:1330-1350), and whose failure is the die.
+pub(crate) fn read_size(objects: &gix::OdbHandle, id: ObjectId) -> Result<u64> {
+    match objects.try_size(&id) {
+        Ok(Some(size)) => Ok(size),
+        _ => Err(crate::fatal::die(format!("unable to read {id}"))),
     }
+}
+
+/// The read `diff_populate_filespec()` makes for content: `contentp` and `sizep` and no `typep`
+/// (diff.c:4580-4617). A packed entry that does not unpack then succeeds with `s->data` `NULL`
+/// rather than failing (packfile.c:1323-1327), after the `error()` lines the unpack printed. `None`
+/// is that `NULL`; since `diff_populate_filespec()` returns early only for data it holds
+/// (diff.c:4496-4497), every later populate of the side reads the object, and prints those lines,
+/// again.
+pub(crate) fn read_content(objects: &gix::OdbHandle, id: ObjectId) -> Result<Option<Vec<u8>>> {
+    use gix::prelude::Find;
+    let mut buf = Vec::new();
+    let (found, null) = gix::odb::store::find::read_content_without_type(|| {
+        objects.try_find(&id, &mut buf).map(|object| object.is_some())
+    });
+    match (found, null) {
+        (_, Some(_size)) => Ok(None),
+        (Ok(true), None) => Ok(Some(buf)),
+        _ => Err(crate::fatal::die(format!("unable to read {id}"))),
+    }
+}
+
+/// `builtin_diffstat()`'s `fill_mmfile()` of each side after `diff_filespec_is_binary()` populated
+/// it (diff.c:681-695, 4190-4235): a side whose data is still `NULL` is populated once more, without
+/// `check_binary`, which reads its content again. `null_sides` are the ids of the sides that came
+/// back `NULL`, old before new.
+pub(crate) fn fill_mmfile_again(repo: &gix::Repository, null_sides: impl IntoIterator<Item = ObjectId>) -> Result<()> {
+    for id in null_sides {
+        read_content(&repo.objects, id)?;
+    }
+    Ok(())
 }
 
 /// git's binary heuristic: a NUL byte within the first 8000 bytes.

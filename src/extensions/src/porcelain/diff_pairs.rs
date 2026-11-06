@@ -4569,25 +4569,63 @@ fn analyze(
     } else {
         p.old_mode
     });
-    let set = |cache: &mut gix::diff::blob::Platform| -> Result<()> {
-        cache.set_resource(
-            p.old_id,
-            old_kind,
-            p.old_path.as_bstr(),
-            ResourceKind::OldOrSource,
-            &repo.objects,
-        )?;
-        cache.set_resource(
-            p.new_id,
-            new_kind,
-            p.new_path.as_bstr(),
-            ResourceKind::NewOrDestination,
-            &repo.objects,
-        )?;
+    // `diff_populate_filespec()` reads with `contentp` and no `typep`, so a packed entry that does not
+    // unpack leaves `s->data` `NULL` rather than failing (packfile.c:1323-1327): that side is
+    // handed to the platform as the empty filespec, which is how xdiff reads a `NULL` buffer.
+    // A blob that cannot be read at all is `die("unable to read %s")` (diff.c:4596-4598).
+    let set = |cache: &mut gix::diff::blob::Platform, id: ObjectId, mode, path: &BString, kind| {
+        use gix::diff::blob::{pipeline::convert_to_diffable, platform::set_resource};
+        // `diff_filespec_is_binary()` populates with `check_binary`: the size alone first.
+        if !id.is_null() && super::filespec::read_size(&repo.objects, id).is_err() {
+            return Err(fatal(&format!("unable to read {}", id.to_hex())));
+        }
+        let (res, null_content) = gix::odb::store::find::read_content_without_type(|| {
+            cache.set_resource(id, mode, path.as_bstr(), kind, &repo.objects)
+        });
+        let res = match null_content {
+            Some(_) => {
+                let null = ObjectId::null(repo.object_hash());
+                super::worktree_filespec::set_absent_resource(cache, kind, mode, path.as_bstr(), &repo.objects, null)
+                    .map(|()| true)
+            }
+            None => match res {
+                Err(set_resource::Error::ConvertToDiffable(convert_to_diffable::Error::FindObject(_))) => {
+                    return Err(fatal(&format!("unable to read {}", id.to_hex())));
+                }
+                res => res.map(|()| false).map_err(Into::into),
+            },
+        };
+        res.map_err(|_| fatal("unable to diff blob pair"))
+    };
+    let old_null = set(cache, p.old_id, old_kind, &p.old_path, ResourceKind::OldOrSource)?;
+    let new_null = set(cache, p.new_id, new_kind, &p.new_path, ResourceKind::NewOrDestination)?;
+    // `builtin_diffstat()`'s `fill_mmfile()` populates a `NULL` side once more when the ids may
+    // differ (diff.c:4190-4235), which reads it again; `diff_filespec_is_binary()` leaves a `NULL`
+    // side text (diff.c:3703-3709).
+    let reread_null_sides = |old_binary: bool, new_binary: bool| -> std::result::Result<(), Status> {
+        if old_binary || new_binary || p.old_id == p.new_id {
+            return Ok(());
+        }
+        for (_, id) in [(old_null, p.old_id), (new_null, p.new_id)].into_iter().filter(|(null, _)| *null) {
+            super::filespec::read_content(&repo.objects, id).map_err(|_| fatal(&format!("unable to read {id}")))?;
+        }
         Ok(())
     };
-    if set(cache).is_err() {
-        return Err(fatal("unable to diff blob pair"));
+    // A `NULL` side facing another `NULL` side or an invalid one is two empty buffers, which the
+    // platform cannot be handed as two absent resources.
+    if (old_null || new_null) && (old_null || !p.old_valid()) && (new_null || !p.new_valid()) {
+        reread_null_sides(false, false)?;
+        let algorithm = opts.algo.unwrap_or(gix::diff::blob::Algorithm::Myers);
+        let (add, del, hunks) = text_analysis(&[], &[], opts, algorithm, ff)?;
+        return Ok(Analysis {
+            add,
+            del,
+            binary: false,
+            old_data: Vec::new(),
+            new_data: Vec::new(),
+            converted: None,
+            hunks,
+        });
     }
     let prep = match cache.prepare_diff() {
         Ok(p) => p,
@@ -4601,18 +4639,22 @@ fn analyze(
     // score the damage, and `-a` has nothing to diff.
     let old_data = match prep.old.data.as_slice() {
         Some(d) => d.to_vec(),
+        None if old_null => Vec::new(),
         None => read_blob(repo, p.old_id, p.old_valid())?,
     };
     let new_data = match prep.new.data.as_slice() {
         Some(d) => d.to_vec(),
+        None if new_null => Vec::new(),
         None => read_blob(repo, p.new_id, p.new_valid())?,
     };
     // Whether gitoxide classified each side on its own as binary. `as_slice()` is `None`
     // exactly for the content it refused to hand back, so this is `diff_filespec_is_binary()`
     // per side — which is what the `--textconv` binary test needs, since a converted side
-    // is never binary no matter what the raw blob looked like.
-    let old_is_binary = p.old_valid() && prep.old.data.as_slice().is_none();
-    let new_is_binary = p.new_valid() && prep.new.data.as_slice().is_none();
+    // is never binary no matter what the raw blob looked like. A `NULL` side is text
+    // (diff.c:3703-3709).
+    let old_is_binary = p.old_valid() && prep.old.data.as_slice().is_none() && !old_null;
+    let new_is_binary = p.new_valid() && prep.new.data.as_slice().is_none() && !new_null;
+    reread_null_sides(old_is_binary, new_is_binary)?;
 
     // `builtin_diff()`'s `--textconv` path: resolve each side's `diff.<driver>.textconv`
     // program and diff its stdout instead of the blob. A side that converted is never

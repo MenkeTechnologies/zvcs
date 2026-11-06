@@ -469,6 +469,15 @@ impl Pack<'_> {
     /// `unpack_entry()` (packfile.c:1503-1720): the object at `obj_offset` with its type, or `None`
     /// once every recovery failed.
     fn unpack_entry(&self, obj_offset: u64, odb: &mut dyn Odb) -> Option<(Kind, Vec<u8>)> {
+        let (kind, data, _) = self.unpack_entry_sized(obj_offset, odb);
+        Some((kind?, data?))
+    }
+
+    /// `unpack_entry()` with its `final_type` and `final_size`: the type and the data, each `None`
+    /// where git leaves `OBJ_BAD` or `NULL`, and the `size` git stores in `*final_size` whether or not
+    /// the data came out (packfile.c:1703-1706): the header size of the innermost entry read, or the
+    /// result of the last delta that applied.
+    fn unpack_entry_sized(&self, obj_offset: u64, odb: &mut dyn Odb) -> (Option<Kind>, Option<Vec<u8>>, usize) {
         let mut obj_offset = obj_offset;
         let mut curpos = obj_offset;
         // (obj_offset, curpos past the base reference, delta size)
@@ -539,14 +548,17 @@ impl Pack<'_> {
                 )),
                 Some(delta) => {
                     data = patch_delta(&base, &delta);
-                    // We could not apply the delta; warn the user, but keep going.
-                    if data.is_none() {
-                        error("failed to apply delta");
+                    match &data {
+                        // `patch_delta()` sets `*dst_size` only for a delta that applied
+                        // (patch-delta.c:94).
+                        Some(out) => size = out.len(),
+                        // We could not apply the delta; warn the user, but keep going.
+                        None => error("failed to apply delta"),
                     }
                 }
             }
         }
-        Some((final_kind?, data?))
+        (final_kind, data, size)
     }
 
     /// `packed_object_info()` with `typep`, `sizep` and `contentp` (packfile.c:1308-1441), the read
@@ -555,6 +567,16 @@ impl Pack<'_> {
         // `cache_or_unpack_entry()`; a `NULL` there is `OBJ_BAD`, which `packed_to_object_type()`
         // hands back without a line of its own.
         self.unpack_entry(obj_offset, odb)
+    }
+
+    /// `packed_object_info()` with `sizep` and `contentp` and no `typep` (packfile.c:1323-1327), the
+    /// read `diff_populate_filespec()` makes (diff.c:4580-4617): `cache_or_unpack_entry()` sets
+    /// `type = OBJ_BAD` for a `NULL`, but only `typep` would turn that into `-1`, so the read
+    /// succeeds whatever came out. The data with its type, `None` for git's `NULL`, and the size
+    /// `unpack_entry()` left in `*sizep`.
+    pub(crate) fn read_content(&self, obj_offset: u64, odb: &mut dyn Odb) -> (Option<(Kind, Vec<u8>)>, u64) {
+        let (kind, data, size) = self.unpack_entry_sized(obj_offset, odb);
+        (kind.zip(data), size as u64)
     }
 
     /// `packed_object_info()` with `typep` alone (packfile.c:1308-1441), the read
@@ -570,6 +592,17 @@ impl Pack<'_> {
             kind_out,
             self.size_of(obj_offset, kind, size, curpos, false).unwrap_or(0),
         ))
+    }
+
+    /// `packed_object_info()` with `typep` and `sizep` (packfile.c:1308-1393), as `cat-file
+    /// --batch-check` asks: the size comes first, so a delta whose size cannot be read is `-1`,
+    /// after `get_size_from_delta()`'s lines, before the type is ever looked at.
+    pub(crate) fn read_type_and_size(&self, obj_offset: u64, odb: &mut dyn Odb) -> Option<(Kind, u64)> {
+        let mut curpos = obj_offset;
+        let (kind, size) = self.unpack_object_header(&mut curpos);
+        let size = self.size_of(obj_offset, kind, size, curpos, true)?;
+        let kind_out = kind_of(self.packed_to_object_type(obj_offset, kind, curpos, odb))?;
+        Some((kind_out, size))
     }
 
     /// `packed_object_info()` with `sizep` alone (packfile.c:1308-1350), as `cat-file -s` asks: the

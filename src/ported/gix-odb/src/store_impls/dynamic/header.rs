@@ -194,9 +194,11 @@ where
                     inflate: &mut *inflate,
                     pack: pack.path(),
                 };
-                if let Some((kind, size)) =
-                    self.read_bad_entry(&pack, &mut odb, |p, odb| p.read_header(pack_offset, odb))
-                {
+                let with_size = recursion.is_none() && super::find::INFO_WITH_SIZE.get();
+                if let Some((kind, size)) = self.read_bad_entry(&pack, &mut odb, |p, odb| match with_size {
+                    true => p.read_type_and_size(pack_offset, odb),
+                    false => p.read_header(pack_offset, odb),
+                }) {
                     return Ok(Some(Header::Packed(gix_pack::data::decode::header::Outcome {
                         kind,
                         object_size: size,

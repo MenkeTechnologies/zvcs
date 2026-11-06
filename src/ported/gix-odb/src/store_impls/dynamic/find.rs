@@ -53,6 +53,14 @@ pub(crate) mod error {
             /// `p->pack_name` of the first pack that failed to produce it.
             pack: String,
         },
+        /// A read under [`read_content_without_type()`](super::read_content_without_type) that
+        /// succeeded with `NULL` content, which a `gix_object::Data` cannot carry: the size git
+        /// stored is handed to the caller of that function instead.
+        #[error("packed object {id} read with no content")]
+        NullContent {
+            /// The object that was asked for.
+            id: gix_hash::ObjectId,
+        },
     }
 
     #[derive(Copy, Clone)]
@@ -99,6 +107,46 @@ pub fn with_corrupt_reads_as_errors<T>(f: impl FnOnce() -> T) -> T {
     let before = CORRUPT_READS_AS_ERRORS.replace(true);
     let out = f();
     CORRUPT_READS_AS_ERRORS.set(before);
+    out
+}
+
+thread_local! {
+    /// Set by [`read_content_without_type()`].
+    static CONTENT_WITHOUT_TYPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The `*sizep` of the last read [`read_content_without_type()`] saw come back with `NULL` content.
+    static NULL_CONTENT_SIZE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f`, a whole-object read, as `odb_read_object_info_extended()` with `contentp` and `sizep`
+/// and no `typep` and no `OBJECT_INFO_DIE_IF_CORRUPT`, the read `diff_populate_filespec()` makes
+/// (diff.c:4580-4617). A packed entry that does not unpack is then no failure:
+/// `packed_object_info()` turns `cache_or_unpack_entry()`'s `NULL` into `-1` only for a caller that
+/// asked for the type (packfile.c:1323-1327, 1383-1393), so the entry is not marked bad, no other
+/// copy is tried, and the read succeeds with no content. `f` then comes back with
+/// [`Error::NullContent`] and the second value is the size `unpack_entry()` stored
+/// (packfile.c:1703-1706). An object no source produced stays a plain failure, not a `die()`.
+pub fn read_content_without_type<T>(f: impl FnOnce() -> T) -> (T, Option<u64>) {
+    let before = CONTENT_WITHOUT_TYPE.replace(true);
+    NULL_CONTENT_SIZE.set(None);
+    let out = f();
+    CONTENT_WITHOUT_TYPE.set(before);
+    (out, NULL_CONTENT_SIZE.take())
+}
+
+thread_local! {
+    /// Set by [`read_info_with_size()`].
+    pub(super) static INFO_WITH_SIZE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, a header read, as `odb_read_object_info_extended()` with `typep` and `sizep`, which
+/// `cat-file --batch-check` makes for `%(objectsize)` (builtin/cat-file.c:379-386, 540-545): a header
+/// read otherwise answers `typep` alone (`odb_read_object_info(r, oid, NULL)`), where a delta whose
+/// size cannot be read still has a type. With the size asked for, `packed_object_info()` reads it
+/// first and fails on it (packfile.c:1330-1350).
+pub fn read_info_with_size<T>(f: impl FnOnce() -> T) -> T {
+    let before = INFO_WITH_SIZE.replace(true);
+    let out = f();
+    INFO_WITH_SIZE.set(before);
     out
 }
 
@@ -342,6 +390,31 @@ where
                     inflate: &mut *inflate,
                     pack: pack.path(),
                 };
+                // `packed_object_info()` with `contentp` and no `typep` succeeds whatever
+                // `cache_or_unpack_entry()` produced (packfile.c:1323-1327). The reads it makes of
+                // other objects while it recovers ask for the type, so the mode ends here.
+                if recursion.is_none() && CONTENT_WITHOUT_TYPE.replace(false) {
+                    let read = self.read_bad_entry(&pack, &mut odb, |p, odb| Some(p.read_content(pack_offset, odb)));
+                    CONTENT_WITHOUT_TYPE.set(true);
+                    match read {
+                        Some((Some((kind, data)), _)) => {
+                            *buffer = data;
+                            return Ok(Some((
+                                gix_object::Data {
+                                    kind,
+                                    object_hash: pack.object_hash(),
+                                    data: buffer.as_slice(),
+                                },
+                                None,
+                            )));
+                        }
+                        Some((None, size)) => {
+                            NULL_CONTENT_SIZE.set(Some(size));
+                            return Err(Error::NullContent { id: id.to_owned() });
+                        }
+                        None => {}
+                    }
+                }
                 if let Some((kind, data)) =
                     self.read_bad_entry(&pack, &mut odb, |p, odb| p.read_object(pack_offset, odb))
                 {
@@ -746,7 +819,10 @@ where
         match self.try_find_cached_inner(id, buffer, &mut inflate, pack_cache, &mut snapshot, None) {
             // A whole-object read is `odb_read_object()`'s, which asks with `OBJECT_INFO_DIE_IF_CORRUPT`
             // and dies with the corrupt read's message (odb.c:597-603, 744-758).
-            Err(err @ Error::PackedObjectCorrupt { .. }) if !CORRUPT_READS_AS_ERRORS.get() => {
+            // `diff_populate_filespec()`'s read asks without that flag and dies with its own message.
+            Err(err @ Error::PackedObjectCorrupt { .. })
+                if !CORRUPT_READS_AS_ERRORS.get() && !CONTENT_WITHOUT_TYPE.get() =>
+            {
                 super::packed_read::die(&err.to_string())
             }
             res => res.map_err(|err| Box::new(err) as _),

@@ -3019,11 +3019,13 @@ fn raw_pair_stream(changes: &[Change]) -> Vec<u8> {
     out
 }
 
-/// The raw blob bytes on one side of a change; an absent side is the empty content.
-fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Vec<u8>> {
+/// The raw blob bytes on one side of a change; an absent side is the empty content. `None` is
+/// a side `diff_populate_filespec()` left `NULL` (see [`super::filespec::populate`]), which is
+/// diffed as no lines.
+fn side_bytes(repo: &gix::Repository, side: Option<Side>) -> Result<Option<Vec<u8>>> {
     match side {
-        Some(s) => Ok(repo.find_object(s.id)?.detach().data),
-        None => Ok(Vec::new()),
+        Some(s) => super::filespec::populate_blob(&repo.objects, s.id),
+        None => Ok(Some(Vec::new())),
     }
 }
 
@@ -3040,11 +3042,19 @@ fn numstat_counts(
     drivers: &mut super::cat_file::Textconv<'_>,
     c: &Change,
 ) -> Result<Option<(u32, u32)>> {
-    let old = side_bytes(repo, c.old)?;
-    let new = side_bytes(repo, c.new)?;
+    let old_data = side_bytes(repo, c.old)?;
+    let new_data = side_bytes(repo, c.new)?;
+    let (old_null, new_null) = (old_data.is_none(), new_data.is_none());
+    let (old, new) = (old_data.unwrap_or_default(), new_data.unwrap_or_default());
     let driver = drivers.binary_attr(c.path.as_bstr())?;
     if filespec_is_binary(driver, &old) || filespec_is_binary(driver, &new) {
         return Ok(None);
+    }
+    // `fill_mmfile()` populates a `NULL` side once more when the ids may differ (diff.c:4190-4235).
+    if c.old.map(|s| s.id) != c.new.map(|s| s.id) {
+        let null_sides = [(c.old, old_null), (c.new, new_null)];
+        let null_sides = null_sides.into_iter().filter_map(|(side, null)| side.filter(|_| null).map(|s| s.id));
+        super::filespec::fill_mmfile_again(repo, null_sides)?;
     }
     let input = InternedInput::new(sources::byte_lines(&old), sources::byte_lines(&new));
     let diff = Diff::compute(Algorithm::Myers, &input);

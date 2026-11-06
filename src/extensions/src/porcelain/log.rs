@@ -9,7 +9,7 @@ use gix::hash::ObjectId;
 use gix::object::tree::diff::ChangeDetached;
 use gix::objs::tree::EntryKind;
 
-use super::filespec::{content_of, count_changed_lines_ws, filespec_is_binary, is_binary};
+use super::filespec::{content_of, count_changed_lines_ws, fill_mmfile_again, filespec_is_binary, is_binary, populate};
 use super::diff_color;
 // `--color=<when>` (and `--color`/`--no-color`): whether `%C`/`%d` emit ANSI.
 // One tri-state for the whole port, so the value grammar cannot drift.
@@ -13662,8 +13662,9 @@ fn collect_changes(
             || o.renames == Some(super::diffcore_rename::DETECT_COPY)
     });
     let mut out = Vec::with_capacity(changes.len());
+    let mut null_read = false;
     for change in &changes {
-        let f = prepare_change(repo, change, with_counts, ws).map_err(|e| match with_counts && !renames_read {
+        let f = prepare_change(repo, change, with_counts, ws, &mut null_read).map_err(|e| match with_counts && !renames_read {
             true => super::diff::died_in_flush(e, Vec::new()),
             false => e,
         })?;
@@ -13672,8 +13673,9 @@ fn collect_changes(
         }
     }
     // Off-thread: the answer is already in `out`, so the row is bookkeeping and
-    // the caller must not wait for a transaction to reach the disk.
-    if cacheable {
+    // the caller must not wait for a transaction to reach the disk. A list with a side read that
+    // came back with no content is not kept: git reads that side, and prints its errors, each run.
+    if cacheable && !null_read {
         crate::rcache::cache_write(crate::rcache::CacheWrite::TreeDiff {
             old_tree: old_key,
             new_tree: new_key,
@@ -14600,12 +14602,14 @@ fn class_matches(name: &[u8], c: u8) -> Option<bool> {
 }
 
 /// Turn one gix change into a [`FileChange`], or `None` for the directory entries
-/// git does not report (gix emits those *and* recurses into them).
+/// git does not report (gix emits those *and* recurses into them). `null_read` is set when a side
+/// read came back with no content, whose `error()` lines a later run must print again.
 fn prepare_change(
     repo: &gix::Repository,
     change: &ChangeDetached,
     with_counts: bool,
     ws: super::diff::Whitespace,
+    null_read: &mut bool,
 ) -> Result<Option<FileChange>> {
     let (path, status, old, new) = match change {
         ChangeDetached::Addition {
@@ -14684,19 +14688,21 @@ fn prepare_change(
 
     if with_counts {
         let is_sub = |mode: u32| mode & 0o170000 == 0o160000;
-        let old_content = match old {
-            Some((id, mode)) => content_of(repo, id, is_sub(mode))?,
-            None => Vec::new(),
-        };
-        let new_content = match new {
-            Some((id, mode)) => content_of(repo, id, is_sub(mode))?,
-            None => Vec::new(),
-        };
+        // `None` inside is a side `diff_populate_filespec()` left `NULL`.
+        let old_data = old.map(|(id, mode)| populate(repo, id, is_sub(mode))).transpose()?;
+        let new_data = new.map(|(id, mode)| populate(repo, id, is_sub(mode))).transpose()?;
+        let old_null = matches!(old_data, Some(None));
+        let new_null = matches!(new_data, Some(None));
+        *null_read |= old_null || new_null;
+        let old_content = old_data.flatten().unwrap_or_default();
+        let new_content = new_data.flatten().unwrap_or_default();
         f.old_size = old_content.len();
         f.new_size = new_content.len();
         f.is_binary = is_binary(&old_content) || is_binary(&new_content);
         let mode_only = matches!((old, new), (Some((a, _)), Some((b, _))) if a == b);
         if !f.is_binary && !mode_only {
+            let null_sides = [old.filter(|_| old_null), new.filter(|_| new_null)];
+            fill_mmfile_again(repo, null_sides.into_iter().flatten().map(|(id, _)| id))?;
             let (added, deleted) = count_changed_lines_ws(&old_content, &new_content, ws)?;
             f.added = added;
             f.deleted = deleted;
@@ -14747,12 +14753,26 @@ pub(crate) fn change_path(change: &ChangeDetached) -> &[u8] {
 // --stat
 // ---------------------------------------------------------------------------
 
+/// Whether `builtin_diffstat()` keeps `f`: it drops a modification of two valid sides whose
+/// mode is unchanged and in which xdiff found no line to count (diff.c:4245-4265), which a
+/// side read with no content (see [`super::filespec::populate`]) can leave. A `-B` rewrite, which
+/// carries a score, and a binary pair are counted elsewhere and always kept.
+fn in_diffstat(f: &&FileChange) -> bool {
+    !(f.status == b'M'
+        && f.score == 0
+        && !f.is_binary
+        && f.added == 0
+        && f.deleted == 0
+        && matches!((f.old_side, f.new_side), (Some((a, x)), Some((b, y))) if a == b && x != y))
+}
+
 /// The rows [`super::diffstat::show_stats`] renders. A binary file's "counts" are
 /// the two byte sizes, which is what `builtin_diffstat()` puts in `added`/`deleted`
 /// for one.
 fn stat_rows(files: &[FileChange], compact: bool, rel: &str) -> Vec<diffstat::StatFile> {
     files
         .iter()
+        .filter(in_diffstat)
         .map(|f| diffstat::StatFile {
             print_name: stat_name(f, compact, rel),
             added: if f.is_binary { f.new_size as u64 } else { f.added as u64 },
@@ -14918,7 +14938,7 @@ fn name_field(path: &[u8], z: bool) -> Vec<u8> {
 /// binary file whose line counts are undefined. Under `-z` the record is
 /// `<added>\t<deleted>\t\0<path>\0`, with a rename naming both sides.
 fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], z: bool, rel: &str) {
-    for f in files {
+    for f in files.iter().filter(in_diffstat) {
         if f.is_binary {
             out.extend_from_slice(b"-\t-\t");
         } else {

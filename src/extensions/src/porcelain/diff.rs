@@ -7984,13 +7984,40 @@ fn analyze_all(
 /// worktree entry for that path.
 /// A blob side handed to the platform, which reads it: one the object database does not produce
 /// is `diff_populate_filespec()`'s `die("unable to read %s")` (diff.c:4596-4598).
-fn read_side(res: Result<(), gix::diff::blob::platform::set_resource::Error>, id: ObjectId) -> Result<()> {
+///
+/// That read asks with `contentp` and no `typep`, so a packed entry that does not unpack succeeds
+/// with `s->data` `NULL` (packfile.c:1323-1327), which xdiff reads as no lines: the side is handed
+/// to the platform as the empty filespec, and the answer is whether it came back `NULL`.
+///
+/// `diff_filespec_is_binary()` populates with `check_binary`, so the size alone is read first, and
+/// its failure is the die (diff.c:4580-4598).
+fn read_side(
+    cache: &mut gix::diff::blob::Platform,
+    (id, mode): (ObjectId, EntryKind),
+    rela_path: &gix::bstr::BStr,
+    kind: ResourceKind,
+    objects: &gix::OdbHandle,
+    null: ObjectId,
+) -> Result<bool> {
     use gix::diff::blob::{pipeline::convert_to_diffable, platform::set_resource};
+    // A worktree side (only `-R` puts one first) has no id and is read by path.
+    if id.is_null() {
+        cache.set_resource(id, mode, rela_path, kind, objects)?;
+        return Ok(false);
+    }
+    super::filespec::read_size(objects, id)?;
+    let (res, null_content) = gix::odb::store::find::read_content_without_type(|| {
+        cache.set_resource(id, mode, rela_path, kind, objects)
+    });
+    if null_content.is_some() {
+        set_absent_resource(cache, kind, mode, rela_path, objects, null)?;
+        return Ok(true);
+    }
     match res {
         Err(set_resource::Error::ConvertToDiffable(convert_to_diffable::Error::FindObject(_))) => {
             Err(crate::fatal::die(format!("unable to read {id}")))
         }
-        res => Ok(res?),
+        res => Ok(res.map(|()| false)?),
     }
 }
 
@@ -8148,15 +8175,17 @@ fn analyze(
             algo_override,
         );
     }
+    // Whether each side's read came back `NULL`.
+    let (mut old_null, mut new_null) = (false, false);
     match delta.old {
-        Some((id, k)) => read_side(cache.set_resource(id, k, old_side_path, ResourceKind::OldOrSource, objects), id)?,
+        Some((id, k)) => old_null = read_side(cache, (id, k), old_side_path, ResourceKind::OldOrSource, objects, null)?,
         // An addition's pre-image is git's invalid filespec — `diff_populate_filespec()`
         // returns an empty one without touching the worktree. See [`set_absent_resource`].
         None => set_absent_resource(cache, ResourceKind::OldOrSource, old_kind, old_side_path, objects, null)?,
     };
     match &delta.new {
         NewSide::Blob(id, k) => {
-            read_side(cache.set_resource(*id, *k, path, ResourceKind::NewOrDestination, objects), *id)?;
+            new_null = read_side(cache, (*id, *k), path, ResourceKind::NewOrDestination, objects, null)?;
         }
         NewSide::Worktree(k) => {
             // With `new_root` set on the cache, a null id reads from the worktree by path.
@@ -8168,6 +8197,28 @@ fn analyze(
             set_absent_resource(cache, ResourceKind::NewOrDestination, old_kind, path, objects, null)?;
         }
     };
+    // A `NULL` side facing another `NULL` side or an invalid one is two empty buffers to xdiff,
+    // which the platform cannot be handed as two absent resources; `fill_mmfile()` populates each
+    // `NULL` side once more first, the two ids differing (diff.c:681-695, 4190-4235).
+    let old_id = delta.old.map_or(null, |(id, _)| id);
+    let new_id = match &delta.new {
+        NewSide::Blob(id, _) => *id,
+        _ => null,
+    };
+    let null_sides: Vec<ObjectId> = [(old_null, old_id), (new_null, new_id)]
+        .into_iter()
+        .filter_map(|(is_null, id)| is_null.then_some(id))
+        .collect();
+    let old_empty = old_null || delta.old.is_none();
+    let new_empty = new_null || matches!(delta.new, NewSide::Absent);
+    if !null_sides.is_empty() && old_empty && new_empty {
+        if old_id != new_id {
+            for id in &null_sides {
+                super::filespec::read_content(objects, *id)?;
+            }
+        }
+        return analyze_images(Some(Vec::new()), Some(Vec::new()), old_id, new_id, false, ctx, want_patch, algo_override);
+    }
 
     // The platform's configured `diff.algorithm`, read before `prepare_diff()` takes
     // its borrow. Only the textconv path below needs it: everywhere else the
@@ -8297,6 +8348,13 @@ fn analyze(
             bail!("external diff drivers are not supported for {path:?}")
         }
         Operation::InternalDiff { algorithm } => {
+            // `builtin_diffstat()`'s `fill_mmfile()` populates a `NULL` side once more when the
+            // two ids may differ (diff.c:4190-4235); `diff_filespec_is_binary()` read it first.
+            if old_id != new_id {
+                for id in &null_sides {
+                    super::filespec::read_content(objects, *id)?;
+                }
+            }
             // `--minimal`/`--histogram`/`--diff-algorithm=` override the default.
             let algorithm = algo_override.unwrap_or(algorithm);
             let raw_old = prep.old.data.as_slice().unwrap_or_default();

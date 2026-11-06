@@ -12,7 +12,7 @@ use gix::objs::{Kind, TreeRefIter};
 use gix::prelude::ObjectIdExt;
 use gix::revision::plumbing::Spec as RevSpec;
 
-use super::filespec::{content_of, count_changed_lines_ws, filespec_is_binary, is_binary};
+use super::filespec::{content_of, count_changed_lines_ws, fill_mmfile_again, filespec_is_binary, is_binary, populate};
 use super::diff_color;
 use super::diffstat::{self, StatWidths};
 use super::line_log;
@@ -4864,9 +4864,16 @@ fn prepare_change(
     read: bool,
 ) -> Result<Option<FileChange>> {
     let null = ObjectId::null(repo.object_hash());
-    let blob_of = |repo: &gix::Repository, id: ObjectId, is_sub: bool| match read {
-        true => content_of(repo, id, is_sub),
-        false => Ok(Vec::new()),
+    // The sides `diff_populate_filespec()` left `NULL`, in the order they were read.
+    let null_sides = std::cell::RefCell::new(Vec::new());
+    let blob_of = |repo: &gix::Repository, id: ObjectId, is_sub: bool| -> Result<Vec<u8>> {
+        if !read {
+            return Ok(Vec::new());
+        }
+        Ok(populate(repo, id, is_sub)?.unwrap_or_else(|| {
+            null_sides.borrow_mut().push(id);
+            Vec::new()
+        }))
     };
     let mut f = match change {
         ChangeDetached::Addition {
@@ -4970,6 +4977,10 @@ fn prepare_change(
     };
 
     fill_counts(&mut f, ws)?;
+    // The tallies are `builtin_diffstat()`'s, whose `fill_mmfile()` reads a `NULL` side again.
+    if !f.is_binary && !f.mode_only {
+        fill_mmfile_again(repo, null_sides.into_inner())?;
+    }
     Ok(Some(f))
 }
 
@@ -5061,11 +5072,26 @@ fn emit_raw(
 // --stat
 // ---------------------------------------------------------------------------
 
+/// Whether `builtin_diffstat()` keeps `f`: it drops a modification of two valid sides whose
+/// mode is unchanged and in which xdiff found no line to count (diff.c:4245-4265), which a
+/// side read with no content (see [`super::filespec::populate`]) can leave. A `-B` rewrite, which
+/// carries a score, and a binary pair are counted elsewhere and always kept.
+fn in_diffstat(f: &&FileChange) -> bool {
+    !(f.status == b'M'
+        && f.score == 0
+        && !f.is_binary
+        && f.added == 0
+        && f.deleted == 0
+        && f.old_mode == f.new_mode
+        && f.old_id != f.new_id)
+}
+
 /// The rows [`super::diffstat::show_stats`] renders. For a binary file the two
 /// "counts" are the byte sizes, which is what `builtin_diffstat()` stores.
 fn stat_rows(files: &[FileChange], compact: bool, rel: &str) -> Vec<diffstat::StatFile> {
     files
         .iter()
+        .filter(in_diffstat)
         .map(|f| diffstat::StatFile {
             print_name: stat_name(f, compact, rel),
             added: if f.is_binary { f.new_content.len() as u64 } else { f.added as u64 },
@@ -5124,7 +5150,7 @@ fn set_indicator(
 /// quoted, since `write_name_quoted()` writes the name raw when its terminator
 /// is NUL.
 fn emit_numstat(out: &mut Vec<u8>, files: &[FileChange], rel: &str, z: bool) {
-    for f in files {
+    for f in files.iter().filter(in_diffstat) {
         if f.is_binary {
             out.extend_from_slice(b"-\t-\t");
         } else {

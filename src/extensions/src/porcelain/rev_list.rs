@@ -4199,10 +4199,15 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         let mut failed: Option<ExitCode> = None;
         // Each commit's objects are listed before the next commit's trees are read,
         // so a tree read that dies leaves the lines ahead of it printed.
+        // The objects named on the command line are in `trav.lines` ahead of any
+        // commit's; with no commit to list them alongside, the closing
+        // `traverse_non_commits()` still lists them (list-objects.c:344-422), so
+        // they get a pass of their own.
         let mut listed = 0;
-        for commit in &commits {
+        let passes = commits.iter().map(Some).chain(commits.is_empty().then_some(None));
+        for commit in passes {
             stage(&mut out)?;
-            if let Err(code) = collect_commit_objects(&mut trav, *commit) {
+            if let Some(Err(code)) = commit.map(|commit| collect_commit_objects(&mut trav, *commit)) {
                 failed = Some(code);
             }
             for (id, name) in &trav.lines[listed..] {

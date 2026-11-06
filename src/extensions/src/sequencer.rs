@@ -153,6 +153,10 @@ pub enum Revs {
     /// `run_sequencer()` reports it as the usage block with status 129 once the
     /// whole list is scanned, so a bad revision anywhere outranks it.
     UnknownOption,
+    /// A `die()` inside the argument walk other than the three above: a count
+    /// `parse_count()` refuses, a second `--stdin`, an option line in `--stdin`
+    /// mode. The text is the message without its `fatal: ` prefix.
+    Fatal(String),
 }
 
 impl Revs {
@@ -167,6 +171,7 @@ impl Revs {
         match self {
             Revs::BadRevision(spec) => Some(format!("fatal: bad revision '{spec}'\n")),
             Revs::BadObject(name) => Some(format!("fatal: bad object {name}\n")),
+            Revs::Fatal(message) => Some(format!("fatal: {message}\n")),
             Revs::InvalidRange { spec, symmetric, notes } => {
                 let mut out = String::new();
                 for note in notes {
@@ -220,10 +225,11 @@ impl Revs {
 ///
 /// A dash-prefixed operand is offered to [`pseudo_opt`] first, as
 /// `setup_revisions()` offers it to `handle_revision_pseudo_opt()`; whatever
-/// that does not claim stays an unrecognized option for `run_sequencer()`. The
-/// *other* half of the dash arguments git accepts here — `handle_revision_opt`'s
-/// `--reverse`, `--max-count`, the grep and date filters — is still unserved, so
-/// those reach this port as unknown options where stock walks them.
+/// that does not claim goes on to `--stdin`, `--end-of-options` and the part of
+/// `handle_revision_opt()` served here — `--reverse`, `--max-count`, `-<n>`,
+/// `-n<n>` and `--skip`. The rest of that function — `--max-count-oldest`, the
+/// grep, date and ordering options — is still unserved, so those stay
+/// unrecognized options for `run_sequencer()` where stock walks them.
 pub fn prepare_revs<S: AsRef<str>>(
     repo: &gix::Repository,
     specs: &[S],
@@ -232,6 +238,12 @@ pub fn prepare_revs<S: AsRef<str>>(
     let mut pending = Pending::default();
     let mut state = RevState::default();
     let mut unknown_option = false;
+    let mut seen_end_of_options = false;
+    let mut read_from_stdin = false;
+    let mut walk = WalkOpts {
+        reverse: false,
+        counts: crate::revopt::Counts::default(),
+    };
 
     let mut n = 0usize;
     while n < specs.len() {
@@ -242,207 +254,67 @@ pub fn prepare_revs<S: AsRef<str>>(
         // revision. What `handle_revision_pseudo_opt()` claims is consumed here;
         // the rest git keeps and only reports once the whole list is scanned, so
         // a later bad revision still wins.
-        if spec.starts_with('-') {
+        if !seen_end_of_options && spec.starts_with('-') {
             match pseudo_opt(repo, spec, specs.get(n).map(AsRef::as_ref), &mut state, &mut pending)? {
-                Pseudo::Handled(extra) => n += extra,
-                Pseudo::Unknown => unknown_option = true,
+                Pseudo::Handled(extra) => {
+                    n += extra;
+                    continue;
+                }
                 Pseudo::NotACommit { name, kind } => return Ok(Revs::NotACommit { name, kind }),
+                Pseudo::Unknown => {}
             }
+            // `setup_revisions()`'s own two words, between the pseudo options
+            // and `handle_revision_opt()` (revision.c:3088-3102).
+            if spec == "--stdin" {
+                if read_from_stdin {
+                    return Ok(Revs::Fatal("--stdin given twice?".into()));
+                }
+                read_from_stdin = true;
+                if let Some(stop) = read_revisions_from_stdin(repo, &mut state, &mut pending)? {
+                    return Ok(stop);
+                }
+                continue;
+            }
+            if spec == "--end-of-options" {
+                seen_end_of_options = true;
+                continue;
+            }
+            // `handle_revision_opt()`'s `--reverse` (revision.c:2746-2747) and its
+            // count arm (revision.c:2373-2410). `--max-count`, `-<n>` and `-n<n>`
+            // clear `revs->no_walk`; `--skip` does not. The rest of the arm — the
+            // `--max-count-oldest` limit and the date bounds — and the rest of
+            // the function stay unknown options here.
+            if spec == "--reverse" {
+                walk.reverse = !walk.reverse;
+                continue;
+            }
+            if let Some(Ok(crate::revopt::Hit {
+                what: crate::revopt::Count::MaxCount(_) | crate::revopt::Count::Skip(_),
+                ..
+            })) = crate::revopt::parse(specs, n - 1)
+            {
+                match walk.counts.parse(specs, n - 1) {
+                    Some(Ok(hit)) => {
+                        n += hit.consumed - 1;
+                        if matches!(hit.what, crate::revopt::Count::MaxCount(_)) {
+                            pending.walked = true;
+                        }
+                    }
+                    Some(Err(message)) => return Ok(Revs::Fatal(message)),
+                    None => {}
+                }
+                continue;
+            }
+            // A count spelling `parse_count()` refuses dies on the spot.
+            if let Some(Err(message)) = crate::revopt::parse(specs, n - 1) {
+                return Ok(Revs::Fatal(message));
+            }
+            unknown_option = true;
             continue;
         }
 
-        // `handle_dotdot()`, which `handle_revision_arg_1()` reaches before any
-        // other reading of the operand: a token holding `..` is a range, both of
-        // whose endpoints resolve through `get_oid_with_context()` — and so
-        // through the full-hex rule — before either object is looked up.
-        // [`crate::objname::dotdot`] is that function; what is left here is only
-        // what the sequencer does with each of its three answers.
-        if let Some(range) = crate::objname::split_range(spec) {
-            // The two `get_oid_with_context()` calls at the top of
-            // `handle_dotdot_1()` are the range's only resolution in this pass,
-            // and the `||` between them short-circuits — which is why
-            // `<nosuch>..<40-hex-ref>` is silent while `<40-hex-ref>..<nosuch>`
-            // warns once. [`crate::objname::dotdot`] is deliberately quiet (it is
-            // asked twice per operand here), so the warning is taken separately.
-            crate::objname::warn_dotdot_endpoints(repo, spec);
-            match crate::objname::dotdot(repo, spec) {
-                // `<a>...<b>`: both tips, with their merge bases excluded. The
-                // merge bases take `flags_exclude`, both tips take `flags`.
-                crate::objname::Dotdot::Ok { a, b } if range.symmetric => {
-                    for base in repo.merge_bases_many(a, &[b])? {
-                        // `add_pending_commit_list()` names a merge base by its
-                        // own `oid_to_hex()`, so it is always a full-length hex
-                        // and always earns the second-pass warning in a
-                        // repository that has a ref by that name.
-                        let base = base.detach();
-                        pending.add(base, &base.to_string(), !state.uninteresting);
-                    }
-                    pending.add(a, range.a, state.uninteresting);
-                    pending.add(b, range.b, state.uninteresting);
-                }
-                // `<a>..<b>`: everything `<b>` reaches that `<a>` does not. This
-                // form only `parse_object()`s its endpoints, so a non-commit one
-                // is queued here and refused later by
-                // `sequencer_pick_revisions()`, naming the endpoint as written.
-                crate::objname::Dotdot::Ok { a, b } => {
-                    match (peel_id(repo, a), peel_id(repo, b)) {
-                        (Side::Commit(from), Side::Commit(to)) => {
-                            pending.add(from, range.a, !state.uninteresting);
-                            pending.add(to, range.b, state.uninteresting);
-                        }
-                        (Side::NotACommit(kind), _) => {
-                            return Ok(Revs::NotACommit { name: range.a.to_owned(), kind })
-                        }
-                        (_, Side::NotACommit(kind)) => {
-                            return Ok(Revs::NotACommit { name: range.b.to_owned(), kind })
-                        }
-                        _ => return Ok(Revs::BadRevision(spec.to_owned())),
-                    }
-                }
-                crate::objname::Dotdot::Missing { notes } => {
-                    return Ok(Revs::InvalidRange {
-                        spec: spec.to_owned(),
-                        symmetric: range.symmetric,
-                        notes,
-                    })
-                }
-                // `handle_dotdot_1()` returned -1. git then retries the whole
-                // token as a single name, which cannot succeed for one holding
-                // `..`, and `assume_dashdash` turns that into `bad revision`.
-                crate::objname::Dotdot::NotARange => {
-                    return Ok(Revs::BadRevision(spec.to_owned()))
-                }
-            }
-            continue;
-        }
-
-        // `handle_revision_arg_1`'s `local_flags`, applied *after* the `^!`,
-        // `^@` and `^-` marks are handled: a leading `^` inverts the sense of
-        // this one operand and is then stripped. Doing it here rather than
-        // leaning on `gix`'s `Spec::Exclude` is what serves `^<a>^-<n>`, which
-        // git's own `rev-parse` rejects but `setup_revisions()` accepts —
-        // `add_parents_only()` strips the same `^` a second time, so the parent
-        // stays interesting while `<a>` does not.
-        //
-        // The stripped word is what resolves; every diagnostic still quotes the
-        // operand as it was typed, which is what `die("bad revision '%s'", arg)`
-        // does with its untouched `arg`.
-        let (word, uninteresting) = match spec.strip_prefix('^') {
-            Some(rest) if !rest.is_empty() => (rest, !state.uninteresting),
-            _ => (spec, state.uninteresting),
-        };
-
-        // The name every resolution of this operand is actually handed, and the
-        // name each pending entry it queues is recorded under: the operand minus
-        // its `^@`/`^!`/`^-<n>` mark and minus the leading `^`, since
-        // `add_parents_only()` strips one of its own from what it was given.
-        let base = crate::objname::uninteresting_mark(crate::objname::parents_only_base(spec)).0;
-        let marked = base.len() != word.len();
-
-        // A full-length hex the repository does not have resolves anyway, so git
-        // gets as far as `get_reference()` and dies there naming the object
-        // rather than the operand. `gix`'s parser consults the odb, so without
-        // this the same operand would come back as a bad revision — the
-        // divergence this whole module exists to close.
-        if let Some(name) = crate::objname::bad_object_name(repo, spec) {
-            // `get_oid_with_context()` decoded it and warned before
-            // `get_reference()` died on it, so the warning still comes out.
-            crate::objname::warn_ambiguous_refname(repo, name);
-            return Ok(Revs::BadObject(name.to_owned()));
-        }
-
-        let Ok(parsed) = repo.rev_parse(word) else {
-            return Ok(Revs::BadRevision(spec.to_owned()));
-        };
-        // `handle_revision_arg_1()` resolves one operand once or twice, and the
-        // parse above is what says which. A mark hands its base to
-        // `add_parents_only()`, whose first act is `repo_get_oid_committish(arg)`;
-        // `^@` then makes the function return outright, while `^!` and `^-<n>`
-        // put the base back into `arg` and fall through to the function's own
-        // `get_oid_with_context(arg)`. Every one of those calls is handed the
-        // same string, so only the *count* is observable — which is why it is
-        // taken from the outcome here rather than from a second guess at whether
-        // `add_parents_only()` would have succeeded (an `^-<n>` past the parent
-        // count, for one, resolves once and not twice).
-        let warn_resolutions = |n: usize| {
-            for _ in 0..n {
-                crate::objname::warn_ambiguous_refname(repo, base);
-            }
-        };
-        match *parsed {
-            gix::revision::plumbing::Spec::Include(id) => {
-                warn_resolutions(1);
-                match peel_id(repo, id) {
-                    Side::Commit(id) => pending.add_rev(id, word, uninteresting),
-                    Side::NotACommit(kind) => {
-                        return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
-                    }
-                    Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
-                }
-            }
-            // `gix` reports a leading `^` itself when the word survived the strip
-            // above — an operand that is nothing but `^`.
-            gix::revision::plumbing::Spec::Exclude(id) => {
-                warn_resolutions(1);
-                match peel_id(repo, id) {
-                    Side::Commit(id) => pending.add_rev(id, word, !uninteresting),
-                    Side::NotACommit(kind) => {
-                        return Ok(Revs::NotACommit { name: spec.to_owned(), kind })
-                    }
-                    Side::Unresolved => return Ok(Revs::BadRevision(spec.to_owned())),
-                }
-            }
-            // `<a>^!`: `<a>` itself, with everything its parents reach excluded.
-            // `add_parents_only()` queues the parents first and `<a>` is added
-            // afterwards from the trimmed argument, which is the order git's
-            // `pending` ends up in.
-            gix::revision::plumbing::Spec::ExcludeParents(id) => {
-                warn_resolutions(2);
-                let Side::Commit(id) = peel_id(repo, id) else {
-                    return Ok(Revs::BadRevision(spec.to_owned()));
-                };
-                for parent in repo.find_commit(id)?.parent_ids() {
-                    pending.add(parent.detach(), base, !uninteresting);
-                }
-                pending.add_rev(id, base, uninteresting);
-            }
-            // `<a>^@`: every parent of `<a>`, but not `<a>`. `add_parents_only()`
-            // succeeded, so `handle_revision_arg_1` returns before `<a>` is ever
-            // added and every entry is a `REV_CMD_PARENTS_ONLY` one.
-            gix::revision::plumbing::Spec::IncludeOnlyParents(id) => {
-                warn_resolutions(1);
-                let Side::Commit(id) = peel_id(repo, id) else {
-                    return Ok(Revs::BadRevision(spec.to_owned()));
-                };
-                for parent in repo.find_commit(id)?.parent_ids() {
-                    pending.add(parent.detach(), base, uninteresting);
-                }
-            }
-            // `<a>^-<n>`: parent `<n>` of `<a>` excluded, `<a>` itself included —
-            // `add_parents_only(…, flags ^ (UNINTERESTING | BOTTOM), n)` followed
-            // by `<a>` at the plain flags. `gix` reports that pair as the range
-            // `<a>^<n>..<a>`, and rejects the spellings git rejects: `^-0`, a
-            // non-numeric suffix, and an `<n>` past the parent count all come
-            // back as a bad revision.
-            //
-            // `marked` separates it from a `<a>..<b>` this branch can never see —
-            // the textual split above already claimed those — so the mark is what
-            // the two resolutions are counted for.
-            gix::revision::plumbing::Spec::Range { from, to } => {
-                warn_resolutions(if marked { 2 } else { 1 });
-                let (Side::Commit(from), Side::Commit(to)) =
-                    (peel_id(repo, from), peel_id(repo, to))
-                else {
-                    return Ok(Revs::BadRevision(spec.to_owned()));
-                };
-                pending.add(from, base, !uninteresting);
-                pending.add_rev(to, base, uninteresting);
-            }
-            // `<a>...<b>` is split textually above, so `gix` can only produce
-            // this for an operand that reached neither branch, which it cannot.
-            gix::revision::plumbing::Spec::Merge { .. } => {
-                return Ok(Revs::BadRevision(spec.to_owned()))
-            }
+        if let Some(stop) = handle_operand(repo, spec, &mut state, &mut pending)? {
+            return Ok(stop);
         }
     }
 
@@ -465,7 +337,15 @@ pub fn prepare_revs<S: AsRef<str>>(
         let sequencer = !(cmdline == 1 && plain == 1);
         let mut seen = std::collections::HashSet::new();
         include.retain(|id| seen.insert(*id));
-        return Ok(Revs::Picks { commits: include, sequencer });
+        // `if (!revs->unsorted_input) commit_list_sort_by_date(&revs->commits);`
+        // (revision.c, `prepare_revision_walk()`): `--no-walk=sorted` lists the
+        // commits newest first, a stable merge sort over the command-line order.
+        if state.sorted_input {
+            let date = |id: &ObjectId| repo.find_commit(*id).ok().and_then(|c| c.time().ok()).map_or(0, |t| t.seconds);
+            include.sort_by_key(|id| std::cmp::Reverse(date(id)));
+        }
+        let commits = walk.limit(include);
+        return Ok(Revs::Picks { commits, sequencer });
     }
 
     // `revs->unsorted_input` governs the *no-walk* list only; a real walk comes
@@ -474,18 +354,301 @@ pub fn prepare_revs<S: AsRef<str>>(
     // `gix`'s graph-order default in place put `git cherry-pick <a>..<b> <side>`
     // in an order stock never produces.
     let mut commits = Vec::new();
-    let walk = repo
+    let rev_walk = repo
         .rev_walk(include)
         .with_hidden(exclude)
         .sorting(Sorting::ByCommitTime(CommitTimeOrder::NewestFirst));
-    for info in walk.all()? {
+    for info in rev_walk.all()? {
         commits.push(info?.id);
     }
+    // `prepare_revs()`'s `if (opts->action == REPLAY_PICK && !opts->revs->no_walk)
+    // opts->revs->reverse ^= 1;` (sequencer.c:5479-5484), taken on top of any
+    // `--reverse` of the user's.
     if action == Action::Pick {
-        commits.reverse();
+        walk.reverse = !walk.reverse;
     }
+    let commits = walk.limit(commits);
     // A walked selection always runs through the sequencer, even at length 1.
     Ok(Revs::Picks { commits, sequencer: true })
+}
+
+/// The `rev_info` fields `handle_revision_opt()` and the `--no-walk` pseudo
+/// option set for the sequencer, beyond the pending list itself.
+struct WalkOpts {
+    /// `revs->reverse`.
+    reverse: bool,
+    /// `revs->max_count` and `revs->skip_count`.
+    counts: crate::revopt::Counts,
+}
+
+impl WalkOpts {
+    /// `get_revision()` over the selection: `get_revision_internal()` drops the
+    /// first `skip_count` commits and stops after `max_count`, and `reverse`
+    /// then hands the survivors back in the opposite order (revision.c:4528-4590).
+    fn limit(&self, commits: Vec<ObjectId>) -> Vec<ObjectId> {
+        let take = self.counts.max_count.unwrap_or(usize::MAX);
+        let mut out: Vec<ObjectId> = commits.into_iter().skip(self.counts.skip).take(take).collect();
+        if self.reverse {
+            out.reverse();
+        }
+        out
+    }
+}
+
+/// `read_revisions_from_stdin()` (revision.c:2975-3023): one revision per line
+/// until an empty line or `--`, each taken as `handle_revision_arg()` takes an
+/// argv operand but with its own `flags`, so a `--not` inside stdin does not
+/// reach the command line. A dash line other than a pseudo option or
+/// `--end-of-options` dies, and so does a revision that does not resolve.
+///
+/// The pathspecs `read_pathspec_from_stdin()` takes after a `--` line are not
+/// read: a cherry-pick or revert walk limited by paths is not served.
+fn read_revisions_from_stdin(
+    repo: &gix::Repository,
+    state: &mut RevState,
+    pending: &mut Pending,
+) -> Result<Option<Revs>> {
+    let outer = std::mem::replace(&mut state.uninteresting, false);
+    let mut seen_end_of_options = false;
+    let mut input = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut input)?;
+    let mut stop = None;
+    for line in input.split_inclusive(|&b| b == b'\n') {
+        // `strbuf_getline()`: the newline and a carriage return before it go.
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = String::from_utf8_lossy(line);
+        if line.is_empty() || line == "--" {
+            break;
+        }
+        if !seen_end_of_options && line.starts_with('-') {
+            if line == "--end-of-options" {
+                seen_end_of_options = true;
+                continue;
+            }
+            match pseudo_opt(repo, &line, None, state, pending)? {
+                Pseudo::Handled(_) => continue,
+                Pseudo::NotACommit { name, kind } => {
+                    stop = Some(Revs::NotACommit { name, kind });
+                    break;
+                }
+                Pseudo::Unknown => {
+                    stop = Some(Revs::Fatal(format!("invalid option '{line}' in --stdin mode")));
+                    break;
+                }
+            }
+        }
+        if let Some(found) = handle_operand(repo, &line, state, pending)? {
+            stop = Some(found);
+            break;
+        }
+    }
+    state.uninteresting = outer;
+    Ok(stop)
+}
+
+/// `handle_revision_arg()` for one operand that is not an option: queue what it
+/// names on `pending`, or return the `die()` / refusal `setup_revisions()` meets.
+fn handle_operand(
+    repo: &gix::Repository,
+    spec: &str,
+    state: &mut RevState,
+    pending: &mut Pending,
+) -> Result<Option<Revs>> {
+    // `handle_dotdot()`, which `handle_revision_arg_1()` reaches before any
+    // other reading of the operand: a token holding `..` is a range, both of
+    // whose endpoints resolve through `get_oid_with_context()` — and so
+    // through the full-hex rule — before either object is looked up.
+    // [`crate::objname::dotdot`] is that function; what is left here is only
+    // what the sequencer does with each of its three answers.
+    if let Some(range) = crate::objname::split_range(spec) {
+        // The two `get_oid_with_context()` calls at the top of
+        // `handle_dotdot_1()` are the range's only resolution in this pass,
+        // and the `||` between them short-circuits — which is why
+        // `<nosuch>..<40-hex-ref>` is silent while `<40-hex-ref>..<nosuch>`
+        // warns once. [`crate::objname::dotdot`] is deliberately quiet (it is
+        // asked twice per operand here), so the warning is taken separately.
+        crate::objname::warn_dotdot_endpoints(repo, spec);
+        match crate::objname::dotdot(repo, spec) {
+            // `<a>...<b>`: both tips, with their merge bases excluded. The
+            // merge bases take `flags_exclude`, both tips take `flags`.
+            crate::objname::Dotdot::Ok { a, b } if range.symmetric => {
+                for base in repo.merge_bases_many(a, &[b])? {
+                    // `add_pending_commit_list()` names a merge base by its
+                    // own `oid_to_hex()`, so it is always a full-length hex
+                    // and always earns the second-pass warning in a
+                    // repository that has a ref by that name.
+                    let base = base.detach();
+                    pending.add(base, &base.to_string(), !state.uninteresting);
+                }
+                pending.add(a, range.a, state.uninteresting);
+                pending.add(b, range.b, state.uninteresting);
+            }
+            // `<a>..<b>`: everything `<b>` reaches that `<a>` does not. This
+            // form only `parse_object()`s its endpoints, so a non-commit one
+            // is queued here and refused later by
+            // `sequencer_pick_revisions()`, naming the endpoint as written.
+            crate::objname::Dotdot::Ok { a, b } => {
+                match (peel_id(repo, a), peel_id(repo, b)) {
+                    (Side::Commit(from), Side::Commit(to)) => {
+                        pending.add(from, range.a, !state.uninteresting);
+                        pending.add(to, range.b, state.uninteresting);
+                    }
+                    (Side::NotACommit(kind), _) => {
+                        return Ok(Some(Revs::NotACommit { name: range.a.to_owned(), kind }))
+                    }
+                    (_, Side::NotACommit(kind)) => {
+                        return Ok(Some(Revs::NotACommit { name: range.b.to_owned(), kind }))
+                    }
+                    _ => return Ok(Some(Revs::BadRevision(spec.to_owned()))),
+                }
+            }
+            crate::objname::Dotdot::Missing { notes } => {
+                return Ok(Some(Revs::InvalidRange {
+                    spec: spec.to_owned(),
+                    symmetric: range.symmetric,
+                    notes,
+                }))
+            }
+            // `handle_dotdot_1()` returned -1. git then retries the whole
+            // token as a single name, which cannot succeed for one holding
+            // `..`, and `assume_dashdash` turns that into `bad revision`.
+            crate::objname::Dotdot::NotARange => {
+                return Ok(Some(Revs::BadRevision(spec.to_owned())))
+            }
+        }
+        return Ok(None);
+    }
+
+    // `handle_revision_arg_1`'s `local_flags`, applied *after* the `^!`,
+    // `^@` and `^-` marks are handled: a leading `^` inverts the sense of
+    // this one operand and is then stripped. Doing it here rather than
+    // leaning on `gix`'s `Spec::Exclude` is what serves `^<a>^-<n>`, which
+    // git's own `rev-parse` rejects but `setup_revisions()` accepts —
+    // `add_parents_only()` strips the same `^` a second time, so the parent
+    // stays interesting while `<a>` does not.
+    //
+    // The stripped word is what resolves; every diagnostic still quotes the
+    // operand as it was typed, which is what `die("bad revision '%s'", arg)`
+    // does with its untouched `arg`.
+    let (word, uninteresting) = match spec.strip_prefix('^') {
+        Some(rest) if !rest.is_empty() => (rest, !state.uninteresting),
+        _ => (spec, state.uninteresting),
+    };
+
+    // The name every resolution of this operand is actually handed, and the
+    // name each pending entry it queues is recorded under: the operand minus
+    // its `^@`/`^!`/`^-<n>` mark and minus the leading `^`, since
+    // `add_parents_only()` strips one of its own from what it was given.
+    let base = crate::objname::uninteresting_mark(crate::objname::parents_only_base(spec)).0;
+    let marked = base.len() != word.len();
+
+    // A full-length hex the repository does not have resolves anyway, so git
+    // gets as far as `get_reference()` and dies there naming the object
+    // rather than the operand. `gix`'s parser consults the odb, so without
+    // this the same operand would come back as a bad revision — the
+    // divergence this whole module exists to close.
+    if let Some(name) = crate::objname::bad_object_name(repo, spec) {
+        // `get_oid_with_context()` decoded it and warned before
+        // `get_reference()` died on it, so the warning still comes out.
+        crate::objname::warn_ambiguous_refname(repo, name);
+        return Ok(Some(Revs::BadObject(name.to_owned())));
+    }
+
+    let Ok(parsed) = repo.rev_parse(word) else {
+        return Ok(Some(Revs::BadRevision(spec.to_owned())));
+    };
+    // `handle_revision_arg_1()` resolves one operand once or twice, and the
+    // parse above is what says which. A mark hands its base to
+    // `add_parents_only()`, whose first act is `repo_get_oid_committish(arg)`;
+    // `^@` then makes the function return outright, while `^!` and `^-<n>`
+    // put the base back into `arg` and fall through to the function's own
+    // `get_oid_with_context(arg)`. Every one of those calls is handed the
+    // same string, so only the *count* is observable — which is why it is
+    // taken from the outcome here rather than from a second guess at whether
+    // `add_parents_only()` would have succeeded (an `^-<n>` past the parent
+    // count, for one, resolves once and not twice).
+    let warn_resolutions = |n: usize| {
+        for _ in 0..n {
+            crate::objname::warn_ambiguous_refname(repo, base);
+        }
+    };
+    match *parsed {
+        gix::revision::plumbing::Spec::Include(id) => {
+            warn_resolutions(1);
+            match peel_id(repo, id) {
+                Side::Commit(id) => pending.add_rev(id, word, uninteresting),
+                Side::NotACommit(kind) => {
+                    return Ok(Some(Revs::NotACommit { name: spec.to_owned(), kind }))
+                }
+                Side::Unresolved => return Ok(Some(Revs::BadRevision(spec.to_owned()))),
+            }
+        }
+        // `gix` reports a leading `^` itself when the word survived the strip
+        // above — an operand that is nothing but `^`.
+        gix::revision::plumbing::Spec::Exclude(id) => {
+            warn_resolutions(1);
+            match peel_id(repo, id) {
+                Side::Commit(id) => pending.add_rev(id, word, !uninteresting),
+                Side::NotACommit(kind) => {
+                    return Ok(Some(Revs::NotACommit { name: spec.to_owned(), kind }))
+                }
+                Side::Unresolved => return Ok(Some(Revs::BadRevision(spec.to_owned()))),
+            }
+        }
+        // `<a>^!`: `<a>` itself, with everything its parents reach excluded.
+        // `add_parents_only()` queues the parents first and `<a>` is added
+        // afterwards from the trimmed argument, which is the order git's
+        // `pending` ends up in.
+        gix::revision::plumbing::Spec::ExcludeParents(id) => {
+            warn_resolutions(2);
+            let Side::Commit(id) = peel_id(repo, id) else {
+                return Ok(Some(Revs::BadRevision(spec.to_owned())));
+            };
+            for parent in repo.find_commit(id)?.parent_ids() {
+                pending.add(parent.detach(), base, !uninteresting);
+            }
+            pending.add_rev(id, base, uninteresting);
+        }
+        // `<a>^@`: every parent of `<a>`, but not `<a>`. `add_parents_only()`
+        // succeeded, so `handle_revision_arg_1` returns before `<a>` is ever
+        // added and every entry is a `REV_CMD_PARENTS_ONLY` one.
+        gix::revision::plumbing::Spec::IncludeOnlyParents(id) => {
+            warn_resolutions(1);
+            let Side::Commit(id) = peel_id(repo, id) else {
+                return Ok(Some(Revs::BadRevision(spec.to_owned())));
+            };
+            for parent in repo.find_commit(id)?.parent_ids() {
+                pending.add(parent.detach(), base, uninteresting);
+            }
+        }
+        // `<a>^-<n>`: parent `<n>` of `<a>` excluded, `<a>` itself included —
+        // `add_parents_only(…, flags ^ (UNINTERESTING | BOTTOM), n)` followed
+        // by `<a>` at the plain flags. `gix` reports that pair as the range
+        // `<a>^<n>..<a>`, and rejects the spellings git rejects: `^-0`, a
+        // non-numeric suffix, and an `<n>` past the parent count all come
+        // back as a bad revision.
+        //
+        // `marked` separates it from a `<a>..<b>` this branch can never see —
+        // the textual split above already claimed those — so the mark is what
+        // the two resolutions are counted for.
+        gix::revision::plumbing::Spec::Range { from, to } => {
+            warn_resolutions(if marked { 2 } else { 1 });
+            let (Side::Commit(from), Side::Commit(to)) =
+                (peel_id(repo, from), peel_id(repo, to))
+            else {
+                return Ok(Some(Revs::BadRevision(spec.to_owned())));
+            };
+            pending.add(from, base, !uninteresting);
+            pending.add_rev(to, base, uninteresting);
+        }
+        // `<a>...<b>` is split textually above, so `gix` can only produce
+        // this for an operand that reached neither branch, which it cannot.
+        gix::revision::plumbing::Spec::Merge { .. } => {
+            return Ok(Some(Revs::BadRevision(spec.to_owned())))
+        }
+    }
+    Ok(None)
 }
 
 /// `revs->pending` as this port needs it: the tips to walk from, the ones to
@@ -598,6 +761,9 @@ struct RevState {
     /// `revs->single_worktree`, which keeps `--all` from reaching the other
     /// worktrees' `HEAD`s.
     single_worktree: bool,
+    /// `!revs->unsorted_input`. `run_sequencer()` starts the sequencer's walk
+    /// unsorted (builtin/revert.c:133-134); `--no-walk=sorted` sorts it.
+    sorted_input: bool,
 }
 
 /// What [`pseudo_opt`] made of a dash operand.
@@ -613,12 +779,12 @@ enum Pseudo {
     NotACommit { name: String, kind: gix::object::Kind },
 }
 
-/// `handle_revision_pseudo_opt()`, restricted to the ref-selecting arguments and
-/// `--not`.
+/// `handle_revision_pseudo_opt()`, restricted to the ref-selecting arguments,
+/// `--not`, `--no-walk[=<mode>]` and `--do-walk`.
 ///
 /// `--bisect`, `--reflog`, `--indexed-objects`, `--alternate-refs`,
-/// `--no-walk[=<mode>]`, `--do-walk`, `--exclude-hidden=<section>`, `--stdin`
-/// and `--filter=<spec>` are not served and stay unknown options here.
+/// `--exclude-hidden=<section>` and `--filter=<spec>` are not served and stay
+/// unknown options here.
 fn pseudo_opt(
     repo: &gix::Repository,
     arg: &str,
@@ -703,6 +869,10 @@ fn pseudo_opt(
             }
         }
         "--not" => state.uninteresting = !state.uninteresting,
+        // `--no-walk` and `--do-walk` (revision.c:2946-2961). A later
+        // uninteresting operand clears `no_walk` again.
+        "--no-walk" => pending.walked = false,
+        "--do-walk" => pending.walked = true,
         "--single-worktree" => state.single_worktree = true,
         _ => {
             // `--branches=`/`--tags=`/`--remotes=` are `skip_prefix()` tests, so
@@ -726,6 +896,22 @@ fn pseudo_opt(
             if let Some((pattern, extra)) = long_opt("exclude") {
                 state.excludes.push(pattern);
                 return Ok(Pseudo::Handled(extra));
+            }
+            // `--no-walk=<mode>`: the detached form is not allowed, and a mode
+            // other than the two is `error()` with `no_walk` already set, the
+            // -1 that leaves the word to `handle_revision_opt()`, which keeps it
+            // as unknown.
+            if let Some(mode) = arg.strip_prefix("--no-walk=") {
+                pending.walked = false;
+                match mode {
+                    "sorted" => state.sorted_input = true,
+                    "unsorted" => state.sorted_input = false,
+                    _ => {
+                        eprintln!("error: invalid argument to --no-walk");
+                        return Ok(Pseudo::Unknown);
+                    }
+                }
+                return Ok(Pseudo::Handled(0));
             }
             return Ok(Pseudo::Unknown);
         }

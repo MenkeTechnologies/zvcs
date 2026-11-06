@@ -1177,7 +1177,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // further down. The message itself is shaped further down, where the
     // `amend` prefix it shares is handled.
     let fixup_reword = fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("reword:"));
-    if fixup_reword {
+    // `amend:` sets the same `allow_empty = 1` while it is parsed
+    // (builtin/commit.c:1395-1398), ahead of the `--only` check below.
+    let fixup_amend = fixup_reword || fixup_arg.as_deref().is_some_and(|raw| raw.starts_with("amend:"));
+    if fixup_amend {
         allow_empty = true;
     }
     // `parse_and_validate_options()` rejects a malformed `-u<mode>` and
@@ -1404,7 +1407,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     //
     // Rejecting the amend form broke `commit --amend -F <file> --only`, which is
     // how the JetBrains client rewords a commit message.
-    if pathspecs.is_empty() && (include_flag || (only_flag && !amend && !allow_empty)) {
+    if pathspecs.is_empty()
+        && (include_flag
+            || (only_flag && !allow_empty && (!amend || (fixup_arg.is_some() && !fixup_amend))))
+    {
         crate::git_fatal!("No paths with --include/--only does not make sense.");
     }
 
@@ -1614,19 +1620,47 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             }
         };
         let subject = folded_subject(&crate::rawarg::from_bytes(c.message_raw()?));
+        // `use_message` as `parse_and_validate_options()` left it: `-c`/`-C`, or
+        // the `HEAD` an `--amend` without `--fixup` implies (builtin/commit.c:1351-1354).
+        let use_message: Option<&str> = match (&reuse_arg, amend && fixup_arg.is_none()) {
+            (Some(r), _) => Some(r.as_str()),
+            (None, true) => Some("HEAD"),
+            (None, false) => None,
+        };
+        // ```c
+        // if (use_message && !strcmp(use_message, squash_message))
+        //         strbuf_addstr(&sb, "squash! ");
+        // else
+        //         repo_format_commit_message(…, c, "squash! %s\n\n", &sb, &ctx);
+        // ```
+        // (builtin/commit.c:784-799.) The subject is inserted first and every
+        // other message option appends to it.
+        let prefix = match use_message == Some(spec.as_str()) {
+            true => "squash! ".to_string(),
+            false => format!("squash! {subject}\n\n"),
+        };
         if from_flags {
-            // A `-m`/`-F` body follows the `squash!` subject line. A `-C`/`-c`
-            // message contributes only its *body* — git's `use_message` arm is
-            // `buffer = strstr(use_message_buffer, "\n\n"); if (buffer)
-            // strbuf_addstr(&sb, skip_blank_lines(buffer + 2));` — so reusing a
-            // commit whose message is a bare subject adds nothing at all.
-            let body = match reuse_commit.is_some() {
-                true => message_body(&message),
-                false => std::mem::take(&mut message),
-            };
-            message = format!("squash! {subject}\n\n{body}");
+            // A `-m`/`-F` body, or the `-C` message whole: git's `use_message` arm
+            // is `buffer = strstr(use_message_buffer, "\n\n"); if (buffer)
+            // strbuf_addstr(&sb, skip_blank_lines(buffer + 2));`, and
+            // `use_message_buffer` is the raw commit, so that `"\n\n"` ends the
+            // headers and the whole message follows.
+            let body = std::mem::take(&mut message);
+            message = format!("{prefix}{body}");
         } else {
-            squash_fixup_seed = Some(format!("squash! {subject}\n\n"));
+            // `-c` and `--amend` reach the same `use_message` arm with the editor
+            // still open.
+            let reused = match use_message {
+                Some(name) => match lookup_commit_reference_by_name(&repo, name) {
+                    Some(rc) => {
+                        let raw = rc.message_raw()?.to_owned();
+                        crate::rawarg::from_bytes(super::rebase_todo::skip_blank_lines(&raw)).into_owned()
+                    }
+                    None => String::new(),
+                },
+                None => String::new(),
+            };
+            squash_fixup_seed = Some(format!("{prefix}{reused}"));
         }
         }
     }
@@ -1685,9 +1719,15 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             // "--fixup", fixup_message)` (builtin/commit.c:851-853), where
             // `fixup_message` has been cut at the colon (:1392-1393), so it names
             // the suboption as typed: `--fixup:amend` or `--fixup:reword`.
+            // `prepare_to_commit()` is where it dies, after `prepare_index()` has
+            // reported an unmatched pathspec, so the death is deferred like the
+            // lookups above.
             if from_flags {
                 let sub = &raw[..alpha];
-                crate::git_fatal!("options '-m' and '--fixup:{sub}' cannot be used together");
+                deferred_fatal.get_or_insert_with(|| {
+                    format!("options '-m' and '--fixup:{sub}' cannot be used together")
+                });
+                break 'fixup;
             }
             allow_empty = true;
             let orig = crate::rawarg::from_bytes(c.message_raw()?).into_owned();
@@ -2125,6 +2165,11 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
     // The buffer git hands the editor (and, without one, the message itself).
     let mut buf = if from_flags {
         message.clone()
+    // `--squash` and `--fixup=amend:` shape `sb` ahead of the `use_message`
+    // arm an `--amend` reaches (builtin/commit.c:784-799, :825-856), so their
+    // buffer wins over the amended commit's message even under `--no-edit`.
+    } else if let Some(s) = &squash_fixup_seed {
+        s.clone()
     } else if amend && no_edit {
         let mut m = crate::rawarg::from_bytes(amend_head
             .as_ref()
@@ -2134,8 +2179,6 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             m.push('\n');
         }
         m
-    } else if let Some(s) = &squash_fixup_seed {
-        s.clone()
     } else if let Some(rc) = &reuse_commit {
         crate::rawarg::from_bytes(rc.message_raw()?).into_owned()
     } else if amend {
@@ -2293,7 +2336,10 @@ pub fn commit(args: &[String]) -> Result<ExitCode> {
             a.clone()
         } else if let Some(rc) = &reuse_commit {
             rc.author()?.to_owned()?
-        } else if let Some(hc) = &amend_head {
+        // `--amend` names `HEAD` as `author_message` only through the
+        // `use_message = "HEAD"` it implies without `--fixup`
+        // (builtin/commit.c:1353-1363); `--amend --fixup=<c>` composes a new author.
+        } else if let (Some(hc), None) = (&amend_head, &fixup_arg) {
             hc.author()?.to_owned()?
         } else {
             cfg_author()?

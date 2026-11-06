@@ -331,6 +331,9 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        if let Some(code) = super::cherry_pick::attached_value_refused(a, false) {
+            return Ok(code);
+        }
         match a {
             "--" => no_more_opts = true,
             // parse_options_step() answers `-h` where it meets it, on stdout at
@@ -561,7 +564,8 @@ pub fn revert(args: &[String]) -> Result<ExitCode> {
         crate::sequencer::Revs::UnknownOption => return Ok(usage_error()),
         crate::sequencer::Revs::BadRevision(_)
         | crate::sequencer::Revs::BadObject(_)
-        | crate::sequencer::Revs::InvalidRange { .. } => {
+        | crate::sequencer::Revs::InvalidRange { .. }
+        | crate::sequencer::Revs::Fatal(_) => {
             unreachable!("reported by setup_revisions_fatal above")
         }
     };

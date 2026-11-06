@@ -3364,6 +3364,7 @@ enum CheckoutKind {
     Checkout,
     Rebase,
     Bisect,
+    UpdateRef,
 }
 
 /// `struct checked_out_branch` (branch.c:395-399).
@@ -3420,8 +3421,45 @@ fn checked_out_branches(repo: &gix::Repository) -> Result<Vec<CheckedOut>> {
                 register(format!("refs/heads/{branch}"), CheckoutKind::Bisect);
             }
         }
+        // `sequencer_get_update_refs_state(wt_gitdir, &update_refs)`
+        // (branch.c:463-472): every ref a running `rebase --update-refs` will
+        // move is held like a checked-out branch, so `branch -f` refuses it.
+        for refname in update_refs_state(&wt_gitdir, repo.object_hash().len_in_hex()) {
+            register(refname, CheckoutKind::UpdateRef);
+        }
     }
     Ok(out)
+}
+
+/// `sequencer_get_update_refs_state()` (sequencer.c:7000-7049): the refnames of
+/// `<wt_gitdir>/rebase-merge/update-refs`, each followed by a `before` and an
+/// `after` object id line, in `string_list_insert()`'s sorted, de-duplicated
+/// order. A missing file is an empty list; a record cut short, or holding a line
+/// `get_oid_hex()` refuses, warns and yields nothing, since the caller registers
+/// only on success.
+fn update_refs_state(wt_gitdir: &Path, hexsz: usize) -> Vec<String> {
+    let path = wt_gitdir.join("rebase-merge").join("update-refs");
+    let Ok(raw) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    // `strbuf_getline()`: one line per call, its `\n` and a `\r` before it gone.
+    let mut lines = raw.split_inclusive(|&b| b == b'\n').map(|l| {
+        let l = l.strip_suffix(b"\n").unwrap_or(l);
+        l.strip_suffix(b"\r").unwrap_or(l)
+    });
+    // `get_oid_hex()` reads exactly `hexsz` hex digits and ignores what follows.
+    let oid_hex = |l: Option<&[u8]>| {
+        l.is_some_and(|l| l.len() >= hexsz && l[..hexsz].iter().all(u8::is_ascii_hexdigit))
+    };
+    let mut refs = std::collections::BTreeSet::new();
+    while let Some(name) = lines.next() {
+        if !oid_hex(lines.next()) || !oid_hex(lines.next()) {
+            eprintln!("warning: update-refs file at '{}' is invalid", path.display());
+            return Vec::new();
+        }
+        refs.insert(String::from_utf8_lossy(name).into_owned());
+    }
+    refs.into_iter().collect()
 }
 
 /// `get_branch()` (wt-status.c): read a state file naming a branch, trim its

@@ -685,7 +685,7 @@ pub(super) fn resolve_slot(repo: &gix::Repository, spec: &str) -> Option<Val> {
 /// gitoxide reports the precondition that failed; git reports it as a failure to
 /// take the lock. The three preconditions `update-ref` can violate map one to
 /// one, and anything else is passed through unchanged.
-fn lock_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String {
+pub(super) fn lock_error(repo: &gix::Repository, e: &gix::reference::edit::Error) -> String {
     use gix::refs::file::transaction::prepare::Error as P;
     let p = match e {
         gix::reference::edit::Error::FileTransactionPrepare(p) => p,

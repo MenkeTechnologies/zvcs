@@ -185,10 +185,12 @@
 //! The pseudo-revisions `handle_revision_pseudo_opt()` claims out of the same
 //! list are served too: `--not`, `--all`, `--branches[=<pattern>]`,
 //! `--tags[=<pattern>]`, `--remotes[=<pattern>]`, `--glob=<pattern>`,
-//! `--exclude=<pattern>` and `--single-worktree`. The rest of that function —
-//! `--bisect`, `--reflog`, `--indexed-objects`, `--alternate-refs`,
-//! `--no-walk[=<mode>]`, `--do-walk`, `--exclude-hidden=<section>`, `--stdin`,
-//! `--filter=<spec>` — and all of `handle_revision_opt()`'s walk options are
+//! `--exclude=<pattern>`, `--single-worktree`, `--no-walk[=<mode>]` and
+//! `--do-walk`, and `setup_revisions()`'s own `--stdin`. So is
+//! the part of `handle_revision_opt()` that shapes the selection — `--reverse`,
+//! `--max-count`, `-<n>`, `-n<n>` and `--skip`. `--bisect`, `--reflog`,
+//! `--indexed-objects`, `--alternate-refs`, `--exclude-hidden=<section>`,
+//! `--filter=<spec>` and the rest of `handle_revision_opt()`'s walk options are
 //! not, so those reach stage 5 as unknown options where stock walks them.
 //!
 //! The `-X` values `gix-merge` cannot express — the whitespace family,
@@ -526,6 +528,43 @@ fn verb_conflict(new: Verb, prev: Verb) -> String {
     )
 }
 
+/// `do_get_value()`'s `takes no value` refusals (parse-options.c:138-143) over
+/// `builtin/revert.c`'s option table: `--<name>=<value>` on an entry carrying
+/// `PARSE_OPT_NOARG`, or on the `--no-` spelling of any negatable entry, is an
+/// `error:` at 129 with no usage block. `pick` selects the cherry-pick half of
+/// the table over the revert half. `--commit` is the negation of the table's
+/// `no-commit`, so `optname()` names it `no-no-commit`.
+pub(super) fn attached_value_refused(arg: &str, pick: bool) -> Option<ExitCode> {
+    use crate::parseopt::{takes_no_value, OptName};
+    let (name, _) = arg.strip_prefix("--")?.split_once('=')?;
+    // `OPT_CMDMODE`s and `OPT_BOOL`s (builtin/revert.c:121-167).
+    const NOARG: &[&str] = &[
+        "quit",
+        "continue",
+        "abort",
+        "skip",
+        "no-commit",
+        "edit",
+        "signoff",
+        "rerere-autoupdate",
+    ];
+    const PICK_NOARG: &[&str] = &["ff", "allow-empty", "allow-empty-message", "keep-redundant-commits"];
+    const REVERT_NOARG: &[&str] = &["reference"];
+    // The negatable entries that take a value; `--empty` is `PARSE_OPT_NONEG`.
+    const NEG_VALUED: &[&str] = &["cleanup", "mainline", "strategy", "strategy-option", "gpg-sign"];
+    const NEG_BOOL: &[&str] = &["edit", "signoff", "rerere-autoupdate"];
+    let own = if pick { PICK_NOARG } else { REVERT_NOARG };
+    if NOARG.contains(&name) || own.contains(&name) {
+        return Some(takes_no_value(OptName::Long(name)));
+    }
+    if name == "commit" {
+        return Some(takes_no_value(OptName::Unset("no-commit")));
+    }
+    let stem = name.strip_prefix("no-")?;
+    let negatable = NEG_VALUED.contains(&stem) || NEG_BOOL.contains(&stem) || own.contains(&stem);
+    negatable.then(|| takes_no_value(OptName::Unset(stem)))
+}
+
 /// `optname()` for a long option, spelled as `builtin/revert.c`'s table spells
 /// it — the two shorthands keep the call sites below on one line each.
 fn long(name: &str) -> crate::parseopt::OptName<'_> {
@@ -591,6 +630,9 @@ fn parse<'a>(args: &'a [String]) -> Result<Opts<'a>, ExitCode> {
             return Err(super::show_usage(USAGE_ALL));
         }
 
+        if let Some(code) = attached_value_refused(arg, true) {
+            return Err(code);
+        }
         // Split `--name=value` once so both spellings share a match arm.
         let (name, inline) = match arg.split_once('=') {
             Some((n, v)) if n.starts_with("--") => (n, Some(v)),
@@ -872,6 +914,7 @@ pub fn cherry_pick(args: &[String]) -> Result<ExitCode> {
         crate::sequencer::Revs::BadRevision(_)
         | crate::sequencer::Revs::BadObject(_)
         | crate::sequencer::Revs::InvalidRange { .. }
+        | crate::sequencer::Revs::Fatal(_)
         | crate::sequencer::Revs::UnknownOption => {
             unreachable!("stage 4 and stage 5 return on these")
         }
@@ -1649,9 +1692,15 @@ fn pick_one(
             // whitespace.
             let verbatim = (cleanup.is_none() && !opts.signoff && !opts.record_origin)
                 || repo.config_snapshot().string("commit.cleanup").is_some_and(|v| v.to_str_lossy() == "verbatim");
-            return Ok(PickOutcome::Stopped(stop_empty(
-                repo, pick_id, head_id, &message, !verbatim,
-            )?));
+            // With `-e` the empty pick still goes to `do_commit()` with `EDIT_MSG`
+            // (sequencer.c:2544-2548), so the `git commit -e` child writes its whole
+            // template, status block included, to `COMMIT_EDITMSG` before it refuses
+            // the empty commit (builtin/commit.c:911-1097); that is the editor arm below.
+            if !super::replay_commit::should_edit(opts.edit_given, super::replay_commit::Action::Pick) {
+                return Ok(PickOutcome::Stopped(stop_empty(
+                    repo, pick_id, head_id, &message, !verbatim,
+                )?));
+            }
         }
     }
 

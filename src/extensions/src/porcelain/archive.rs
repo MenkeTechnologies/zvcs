@@ -443,7 +443,14 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     };
     // `init_archivers()` → `init_tar_archiver()`: the tar configuration is
     // walked here, after the outer option pass and before `-o` is created.
-    let tar = TarConfig::load(crate::setup::discover().ok().as_ref())?;
+    let here = crate::setup::discover().ok();
+    let tar = TarConfig::load(here.as_ref())?;
+    // The serving side runs from the directory `enter_repo()` chdir'd into, the
+    // git directory (setup.c:1879, :1889), and `add_file_cb()` stats an
+    // `--add-file` there: `prefix_filename(NULL, arg)` leaves it relative to
+    // that cwd (archive.c:584-588). `upload-archive--writer` opens the repository
+    // from its work tree instead, so the stat is anchored on the git directory.
+    let add_file_root = here.as_ref().filter(|_| is_remote).map(|r| r.git_dir().to_path_buf());
     // ```c
     // if (output)
     //         create_output_file(output);
@@ -475,7 +482,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         }
     }
     if outer.remote.is_some() {
-        return run_remote_archiver(&outer);
+        return run_remote_archiver(&outer, here.as_ref());
     }
 
     let mut opts = Opts::default();
@@ -545,22 +552,16 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
             "--mtime" => opts.mtime = Some(value_of(args, &mut i, a)?),
             "--add-file" => {
                 let value = value_of(args, &mut i, a)?;
-                match resolve_add_file(&value, opts.prefix.as_deref()) {
+                match resolve_add_file(&value, opts.prefix.as_deref(), add_file_root.as_deref()) {
                     Ok(item) => opts.added.push(item),
-                    Err(msg) => {
-                        eprintln!("fatal: {msg}");
-                        return Ok(ExitCode::from(128));
-                    }
+                    Err(msg) => return Ok(die_line(&msg)),
                 }
             }
             "--add-virtual-file" => {
                 let value = value_of(args, &mut i, a)?;
                 match resolve_virtual_file(&value) {
                     Ok(item) => opts.added.push(item),
-                    Err(msg) => {
-                        eprintln!("fatal: {msg}");
-                        return Ok(ExitCode::from(128));
-                    }
+                    Err(msg) => return Ok(die_line(&msg)),
                 }
             }
             // `add_file_cb()`'s unset arm clears the whole extra-file list
@@ -574,19 +575,13 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
                 crate::parseopt::opt_filename(&mut opts.output, &a[9..], crate::parseopt::discovered_prefix)?;
             }
             _ if a.starts_with("--mtime=") => opts.mtime = Some(a[8..].to_string()),
-            _ if a.starts_with("--add-file=") => match resolve_add_file(&a[11..], opts.prefix.as_deref()) {
+            _ if a.starts_with("--add-file=") => match resolve_add_file(&a[11..], opts.prefix.as_deref(), add_file_root.as_deref()) {
                 Ok(item) => opts.added.push(item),
-                Err(msg) => {
-                    eprintln!("fatal: {msg}");
-                    return Ok(ExitCode::from(128));
-                }
+                Err(msg) => return Ok(die_line(&msg)),
             },
             _ if a.starts_with("--add-virtual-file=") => match resolve_virtual_file(&a[19..]) {
                 Ok(item) => opts.added.push(item),
-                Err(msg) => {
-                    eprintln!("fatal: {msg}");
-                    return Ok(ExitCode::from(128));
-                }
+                Err(msg) => return Ok(die_line(&msg)),
             },
             // `cmd_archive()` took `--remote` for itself before this parse ran, so
             // reaching one here means the outer pass did not (an abbreviation this
@@ -628,8 +623,7 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
     // the tree-ish check, and named for `--add-file` whichever of the two
     // spellings put the file there.
     if is_remote && !opts.added.is_empty() {
-        eprintln!("fatal: options '--add-file' and '--remote' cannot be used together");
-        return Ok(ExitCode::from(128));
+        return Ok(die_line("options '--add-file' and '--remote' cannot be used together"));
     }
 
     // `--list` short-circuits everything else, but git rejects any leftover
@@ -1300,8 +1294,22 @@ fn parse_outer(args: &[String]) -> std::result::Result<Outer, ExitCode> {
 /// The `--format` inferred from `-o`'s filename goes first *so that an explicit
 /// `--format` later on the command line overrides it* — the server keeps the last
 /// one it is given. Then `ACK`, a flush, and the archive itself on sideband 1.
-fn run_remote_archiver(outer: &Outer) -> Result<ExitCode> {
-    let remote = outer.remote.as_deref().unwrap_or_default();
+fn run_remote_archiver(outer: &Outer, here: Option<&gix::Repository>) -> Result<ExitCode> {
+    // `_remote = remote_get(remote); transport_get(_remote, _remote->url.v[0])`
+    // (builtin/archive.c:32-33): a configured remote's name stands for its first
+    // URL, and `url.<base>.insteadOf` rewrites either.
+    let resolved = remote_get_url(here, outer.remote.as_deref().unwrap_or_default());
+    // The `remote: ` prefixing and the keyword colours `demultiplex_sideband()`
+    // applies are the ones `push` uses, read from configuration git has loaded
+    // long before the first packet; reading them here rather than once the
+    // archive is flowing keeps the client as quick to relay the server's
+    // `remote: ` lines as git is. `--remote` runs outside a repository too, and
+    // there is then nothing to read `color.remote` from.
+    let mut sideband = match here {
+        Some(repo) => super::push_proto::Sideband::new(repo),
+        None => super::push_proto::Sideband::plain(),
+    };
+    let remote = resolved.as_str();
     // Every transport carries the same stream; only the way it is opened differs,
     // and the only opener here is a local child process. Refuse the others rather
     // than hand a URL to `upload-archive` as though it were a path, which would
@@ -1309,12 +1317,27 @@ fn run_remote_archiver(outer: &Outer) -> Result<ExitCode> {
     if let Some(kind) = non_local_transport(remote) {
         bail!("archive --remote over {kind} is not supported here: only a local repository is served");
     }
-    let mut child = match spawn_upload_archive(&outer.exec, remote) {
+    // `git_connect()` → `parse_connect_url()` (connect.c:1467): a `file://` URL
+    // is decoded and its path taken from the first '/' after the host, so
+    // `file://-x` has none.
+    let path = match super::fetch_pack::parse_connect_url(remote) {
+        Ok((_, _, path)) => path,
+        Err(msg) => return Ok(die_line(&msg)),
+    };
+    let path = path.as_str();
+    // `if (looks_like_command_line_option(path)) die(_("strange pathname '%s'
+    // blocked"), path);` (connect.c:1483-1484), before any child is started.
+    if path.starts_with('-') {
+        return Ok(die_line(&format!("strange pathname '{path}' blocked")));
+    }
+    // `transport_check_allowed("file")` (connect.c:1523).
+    if let Some(code) = crate::setup::transport_check_allowed("file") {
+        return Ok(code);
+    }
+    let mut child = match spawn_upload_archive(&outer.exec, path) {
         Ok(child) => child,
-        Err(err) => {
-            eprintln!("fatal: cannot run {}: {err}", outer.exec);
-            return Ok(ExitCode::from(128));
-        }
+        // `if (start_command(conn)) die(_("unable to fork"));` (connect.c:1533-1534).
+        Err(_) => return Ok(die_line("unable to fork")),
     };
     let mut to_server = child.stdin.take().expect("piped stdin");
     let mut request: Vec<u8> = Vec::new();
@@ -1338,30 +1361,26 @@ fn run_remote_archiver(outer: &Outer) -> Result<ExitCode> {
         // server that never spoke.
         Err(_) => {
             let _ = child.wait();
-            eprintln!("fatal: the remote end hung up unexpectedly");
-            return Ok(ExitCode::from(128));
+            return Ok(die_line("the remote end hung up unexpectedly"));
         }
         Ok(None) => {
             let _ = child.wait();
-            eprintln!("fatal: git archive: expected ACK/NAK, got a flush packet");
-            return Ok(ExitCode::from(128));
+            return Ok(die_line("git archive: expected ACK/NAK, got a flush packet"));
         }
         Ok(Some(line)) => {
             let line = String::from_utf8_lossy(&line).trim_end_matches('\n').to_string();
             if line != "ACK" {
                 let _ = child.wait();
-                match line.strip_prefix("NACK ") {
-                    Some(reason) => eprintln!("fatal: git archive: NACK {reason}"),
-                    None => eprintln!("fatal: git archive: protocol error"),
-                }
-                return Ok(ExitCode::from(128));
+                return Ok(match line.strip_prefix("NACK ") {
+                    Some(reason) => die_line(&format!("git archive: NACK {reason}")),
+                    None => die_line("git archive: protocol error"),
+                });
             }
         }
     }
     if !matches!(read_pkt_line(&mut from_server), Ok(None)) {
         let _ = child.wait();
-        eprintln!("fatal: git archive: expected a flush");
-        return Ok(ExitCode::from(128));
+        return Ok(die_line("git archive: expected a flush"));
     }
 
     // `create_output_file()` (builtin/archive.c:12-21) has already put `-o`'s file
@@ -1370,7 +1389,7 @@ fn run_remote_archiver(outer: &Outer) -> Result<ExitCode> {
         Some(path) => Box::new(std::fs::File::create(path)?),
         None => Box::new(std::io::stdout().lock()),
     };
-    let failed = recv_sideband(&mut from_server, &mut sink)?;
+    let failed = recv_sideband(&mut from_server, &mut sink, &mut sideband)?;
     sink.flush()?;
     // `rv |= transport_disconnect(transport)`: a server that exited non-zero makes
     // the whole thing a failure even when the sideband ended cleanly.
@@ -1388,11 +1407,12 @@ fn run_remote_archiver(outer: &Outer) -> Result<ExitCode> {
 /// The default `git-upload-archive` is git's own helper, found through the exec
 /// path it prepends to `PATH` for its children; the same repository served by
 /// this port has to be served by *this* binary, so the default runs it directly
-/// as `upload-archive`. A `--exec` the caller chose is run through the shell the
-/// way `git_connect()` does, which is why `--exec=nosuch` reports
-/// `nosuch: command not found` and not an `execvp` failure.
+/// as `upload-archive`. A `--exec` the caller chose is run the way `git_connect()`
+/// runs it: the command line `<exec> <sq-quoted path>` (connect.c:1486-1488) with
+/// `use_shell` set (connect.c:1495), which `prepare_shell_cmd()` turns into
+/// `/bin/sh -c <cmd> <cmd>`, so the shell's `$0` is the whole command line and
+/// `--exec=nosuch` reports `nosuch '.': nosuch: command not found`.
 fn spawn_upload_archive(exec: &str, path: &str) -> std::io::Result<std::process::Child> {
-    let path = path.strip_prefix("file://").unwrap_or(path);
     let mut command = match exec == "git-upload-archive" {
         true => {
             let mut c = std::process::Command::new(std::env::current_exe()?);
@@ -1400,9 +1420,10 @@ fn spawn_upload_archive(exec: &str, path: &str) -> std::io::Result<std::process:
             c
         }
         false => {
-            let mut c = std::process::Command::new("sh");
-            c.arg("-c").arg(format!("{exec} '{path}'"));
-            c
+            let mut cmd = format!("{exec} ").into_bytes();
+            super::rev_parse::sq_quote_buf(&mut cmd, path.as_bytes());
+            use std::os::unix::ffi::OsStrExt;
+            crate::external::prepare_shell_cmd(std::ffi::OsStr::from_bytes(&cmd), std::iter::empty::<&str>())
         }
     };
     // `git_connect()` clears `local_repo_env` from the child's environment
@@ -1445,19 +1466,17 @@ const LOCAL_REPO_ENV: &[&str] = &[
 /// (sideband.c:301-433): band 1 is the archive, band 2 progress, band 3 an error,
 /// and the stream ends at a flush. Returns whether it ended as anything but that
 /// clean flush, which is `!!rv` in the caller.
-fn recv_sideband(from: &mut impl std::io::BufRead, out: &mut impl Write) -> Result<bool> {
-    // The `remote: ` prefixing and the keyword colours are the same ones `push`
-    // uses. `--remote` runs outside a repository too, and there is then nothing
-    // to read `color.remote` from.
-    let mut sideband = match crate::setup::discover() {
-        Ok(repo) => super::push_proto::Sideband::new(&repo),
-        Err(_) => super::push_proto::Sideband::plain(),
-    };
+fn recv_sideband(
+    from: &mut impl std::io::BufRead,
+    out: &mut impl Write,
+    sideband: &mut super::push_proto::Sideband,
+) -> Result<bool> {
     loop {
         match read_pkt_line(from) {
+            // `PACKET_READ_EOF` (sideband.c:325-331): `recv_sideband()` passes
+            // `die_on_error = 0`, so this is a plain line, not a `fatal:`.
             Err(_) => {
-                sideband.finish();
-                eprintln!("fatal: archive: unexpected disconnect while reading sideband packet");
+                sideband.disconnected("archive");
                 return Ok(true);
             }
             Ok(None) => {
@@ -1472,9 +1491,16 @@ fn recv_sideband(from: &mut impl std::io::BufRead, out: &mut impl Write) -> Resu
                     sideband.finish();
                     return Ok(true);
                 }
-                _ => {
+                // `default:` (sideband.c:421-425), again without `die()`.
+                Some((band, _)) => {
                     sideband.finish();
-                    eprintln!("fatal: archive: protocol error: bad band");
+                    let _ = std::io::stderr().write_all(format!("archive: protocol error: bad band #{band}\n").as_bytes());
+                    return Ok(true);
+                }
+                // A zero-length packet carries no band at all (sideband.c:338-342).
+                None => {
+                    sideband.finish();
+                    let _ = std::io::stderr().write_all(b"archive: protocol error: missing sideband designator\n");
                     return Ok(true);
                 }
             },
@@ -1500,20 +1526,56 @@ fn non_local_transport(remote: &str) -> Option<&'static str> {
     }
 }
 
+/// The URL `remote_get(name)->url.v[0]` gives `run_remote_archiver()`: the
+/// first URL of a configured remote of that name, otherwise the name itself,
+/// with `url.<base>.insteadOf` applied either way (remote.c). Outside a
+/// repository only the system, global and command-line configuration exist.
+fn remote_get_url(here: Option<&gix::Repository>, name: &str) -> String {
+    match here {
+        Some(repo) => {
+            if crate::cmd_config::read_remote_config(repo).is_err() {
+                return name.to_string();
+            }
+            repo.find_fetch_remote(Some(gix::bstr::BStr::new(name)))
+                .ok()
+                .and_then(|remote| remote.url(gix::remote::Direction::Fetch).map(gix::url::Url::to_bstring))
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| name.to_string())
+        }
+        None => {
+            let mut raw = gix::bstr::BString::from(name);
+            gix::remote::url::Rewrite::from_config(&crate::config::global_config(), |_| true)
+                .rewrite_url_in_place(&mut raw, gix::remote::Direction::Fetch);
+            raw.to_string()
+        }
+    }
+}
+
+/// `die()` on the client side: `fatal: <msg>` in a single `write()`, as
+/// `vreportf()` (usage.c) issues it. The serving `upload-archive` shares this
+/// stderr and writes its own `fatal: sent error to the client: ...` while the
+/// client demultiplexes; a line split across several writes tears in between.
+fn die_line(msg: &str) -> ExitCode {
+    let _ = std::io::stderr().write_all(format!("fatal: {msg}\n").as_bytes());
+    ExitCode::from(128)
+}
+
 /// A pkt-line carrying `payload`.
 fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
     out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
     out.extend_from_slice(payload);
 }
 
-/// One pkt-line, or `None` for the flush that ends a stream. `Err` is a
+/// One pkt-line, or `None` for the flush (or delim) that ends a stream. `Err` is a
 /// disconnect or a malformed length.
 fn read_pkt_line(r: &mut impl std::io::Read) -> Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
     r.read_exact(&mut header)?;
     let len = usize::from_str_radix(std::str::from_utf8(&header)?, 16)?;
     match len {
-        0..=4 => Ok(None),
+        // `0004` is a normal packet with an empty payload, not a flush
+        // (pkt-line.c `packet_read_with_status()`).
+        0..=3 => Ok(None),
         _ => {
             let mut payload = vec![0u8; len - 4];
             r.read_exact(&mut payload)?;
@@ -1575,8 +1637,14 @@ fn resolve_virtual_file(value: &str) -> std::result::Result<Added, String> {
 /// diagnostics. The path is resolved against the process cwd exactly as git's
 /// `prefix_filename()` does when run from a subdirectory; the archive name is
 /// the basename, with `--prefix` prepended later at writing time.
-fn resolve_add_file(path: &str, base: Option<&str>) -> std::result::Result<Added, String> {
-    let Ok(meta) = std::fs::metadata(path) else {
+/// On the serving side `root` is the git directory the stat is anchored on.
+fn resolve_add_file(
+    path: &str,
+    base: Option<&str>,
+    root: Option<&std::path::Path>,
+) -> std::result::Result<Added, String> {
+    let on_disk = root.map_or_else(|| std::path::PathBuf::from(path), |root| root.join(path));
+    let Ok(meta) = std::fs::metadata(&on_disk) else {
         return Err(format!("File not found: {path}"));
     };
     if !meta.is_file() {

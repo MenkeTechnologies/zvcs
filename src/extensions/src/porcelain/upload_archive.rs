@@ -94,7 +94,8 @@ pub fn upload_archive(args: &[String]) -> Result<ExitCode> {
             let line = "NACK unable to spawn subprocess\n";
             write!(out, "{:04x}{line}", line.len() + 4)?;
             out.flush()?;
-            eprintln!("fatal: upload-archive: {err}");
+            let line = format!("fatal: upload-archive: {}\n", crate::external::strerror(&err));
+            let _ = std::io::stderr().write_all(line.as_bytes());
             return Ok(ExitCode::from(128));
         }
     };
@@ -120,8 +121,12 @@ pub fn upload_archive(args: &[String]) -> Result<ExitCode> {
     if !child.wait()?.success() {
         sideband(&mut out, 3, DEADCHILD.as_bytes())?;
         out.flush()?;
-        // No trailing flush packet on this path: git's `die` runs first.
-        eprintln!("fatal: sent error to the client: {DEADCHILD}");
+        // No trailing flush packet on this path: git's `die` runs first
+        // (builtin/upload-archive.c:72-82). `vreportf()` writes the line in one
+        // `write()`; the client shares this stderr and demultiplexes its own
+        // `remote: ` lines meanwhile, so a split line tears between them.
+        let line = format!("fatal: sent error to the client: {DEADCHILD}\n");
+        let _ = std::io::stderr().write_all(line.as_bytes());
         return Ok(ExitCode::from(128));
     }
 

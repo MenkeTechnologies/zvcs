@@ -468,7 +468,7 @@ pub fn fetch_pack(args: &[String]) -> Result<ExitCode> {
 /// git's `enum url_scheme` (url.h:26). `Unknown` is the value
 /// `parse_connect_url()` dies on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum UrlScheme {
+pub(super) enum UrlScheme {
     Local,
     File,
     Ssh,
@@ -655,7 +655,7 @@ fn split_host_and_port(mut host: String) -> (String, Option<String>) {
 /// POSIX's `offset_1st_component()` returns at most 1 (`is_dir_sep(s[0])`), so a
 /// `file://` URL takes the same `strchr(end, separator)` path every other
 /// non-local scheme takes.
-fn parse_connect_url(url_orig: &str) -> std::result::Result<(UrlScheme, String, String), String> {
+pub(super) fn parse_connect_url(url_orig: &str) -> std::result::Result<(UrlScheme, String, String), String> {
     let url = if is_url(url_orig) {
         url_decode(url_orig)
     } else {

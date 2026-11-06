@@ -814,7 +814,11 @@ fn archive_impl(args: &[String], is_remote: bool) -> Result<ExitCode> {
         None
     } else {
         match Search::from_specs(parsed.clone(), cwd_prefix.as_deref(), &root) {
-            Ok(s) => Some(s),
+            Ok(mut s) => {
+                // `PATHSPEC_PREFER_CWD` (archive.c:473-474).
+                s.prefer_cwd();
+                Some(s)
+            }
             Err(e) => {
                 eprintln!("fatal: {e}");
                 return Ok(ExitCode::from(128));

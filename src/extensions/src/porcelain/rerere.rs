@@ -529,7 +529,9 @@ fn cmd_forget(repo: &gix::Repository, paths: &[&str]) -> Result<ExitCode> {
         false,
         &index,
         gix::worktree::stack::state::attributes::Source::IdMapping,
-    )?;
+    )?
+    // `PATHSPEC_PREFER_CWD` (builtin/rerere.c:85-86).
+    .prefer_cwd();
     for path in find_conflict(&index) {
         if !spec.is_included(path.as_bstr(), Some(false)) {
             continue;

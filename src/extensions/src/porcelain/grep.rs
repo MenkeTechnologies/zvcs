@@ -1452,7 +1452,8 @@ pub fn grep(args: &[String]) -> Result<ExitCode> {
                 false,
                 &index,
                 gix::worktree::stack::state::attributes::Source::IdMapping,
-            )?;
+            )?
+            .prefer_cwd();
             // `grep_cache()` hands every gitlink it walks past to
             // `grep_submodule()`. The filtered iterator below cannot serve this:
             // it tests `sub` as a file, so a pathspec of `sub/mod.txt` drops the
@@ -1973,7 +1974,8 @@ fn collect_trees(
             false,
             index,
             gix::worktree::stack::state::attributes::Source::IdMapping,
-        )?;
+        )?
+        .prefer_cwd();
         let rev_prefix = format!("{rev}:").into_bytes();
         // Files contributed by a submodule, appended after the superproject's
         // and merged back into path order below — the same shape the index walk
@@ -2391,7 +2393,8 @@ fn collect_directory_no_worktree(
             false,
             index,
             gix::worktree::stack::state::attributes::Source::IdMapping,
-        )?),
+        )?
+        .prefer_cwd()),
         None => DirSpecs::Bare(bare_pathspec(specs, &cwd)?),
     };
     let mut excludes = match (opts.exclude_standard, repo) {

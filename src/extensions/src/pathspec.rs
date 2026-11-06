@@ -1128,6 +1128,13 @@ fn is_dir_sep(c: u8) -> bool {
 /// return `NULL` and so what raises the die. A port that normalised with
 /// `Path::components()` instead silently clamps at the root and never fails.
 pub fn normalize_path(src: &BStr) -> Option<BString> {
+    normalize_path_copy_len(src, &mut 0)
+}
+
+/// [`normalize_path`] with `prefix_len` (path.c:1102-1106): `src[..prefix_len]` is an
+/// already normalized prefix, and each `..` that eats into it lowers `prefix_len` to
+/// what remains (path.c:1199-1200), as `prefix_path_gently()` reports it.
+pub fn normalize_path_copy_len(src: &BStr, prefix_len: &mut usize) -> Option<BString> {
     // `offset_1st_component()`: just the leading `/` outside Windows.
     let mut i = 0usize;
     let mut dst: Vec<u8> = Vec::with_capacity(src.len());
@@ -1168,6 +1175,7 @@ pub fn normalize_path(src: &BStr) -> Option<BString> {
                     while dst.len() > dst0 && dst[dst.len() - 1] != b'/' {
                         dst.pop();
                     }
+                    *prefix_len = (*prefix_len).min(dst.len() - dst0);
                     continue;
                 }
                 _ => {}

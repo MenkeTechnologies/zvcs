@@ -86,8 +86,13 @@ impl Pattern {
             // prefixlen` (pathspec.c:484, :487, :507). git's sanity check
             // BUG()s on a prefix past the end of the match (pathspec.c:547-551);
             // with no `BUG()` to raise, an over-long one is clamped so the
-            // prefix stays a prefix.
-            self.prefix_len = self.prefix_magic.unwrap_or(0).min(self.path.len());
+            // prefix stays a prefix. git's prefix ends in the directory's `/`
+            // (`:(prefix:4)sub/a`, as `prefix_magic()` writes it), which
+            // `prefix_len` leaves out, as `normalize()` counts it below: the
+            // `strncmp()` of `item->prefix` bytes under `:(icase)` (dir.c:429-431)
+            // is the directory and the `/` after it.
+            let len = self.prefix_magic.unwrap_or(0).min(self.path.len());
+            self.prefix_len = if len > 0 && self.path[len - 1] == b'/' { len - 1 } else { len };
             return Ok(self);
         }
 

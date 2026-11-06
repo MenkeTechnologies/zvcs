@@ -77,6 +77,12 @@ impl<'repo> Pathspec<'repo> {
             stack: cache,
         })
     }
+    /// `PATHSPEC_PREFER_CWD`: see [`Search::prefer_cwd()`].
+    pub fn prefer_cwd(mut self) -> Self {
+        self.search.prefer_cwd();
+        self
+    }
+
     /// Turn ourselves into the functional parts for direct usage.
     /// Note that the [`cache`](AttributeStack) is only set if one of the [`search` patterns](Search)
     /// is specifying attributes to match for.

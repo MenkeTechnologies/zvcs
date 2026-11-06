@@ -146,6 +146,14 @@ impl Search {
                 },
                 source: None,
                 common_prefix_len,
+                prefix: {
+                    let mut prefix = gix_path::to_unix_separators_on_windows(gix_path::into_bstr(prefix)).into_owned();
+                    if !prefix.is_empty() && !prefix.ends_with(b"/") {
+                        prefix.push(b'/');
+                    }
+                    prefix
+                },
+                implicit_match: Default::default(),
             })
         }
         inner(&mut pathspecs.into_iter(), prefix, root)

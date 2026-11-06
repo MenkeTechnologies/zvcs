@@ -113,6 +113,13 @@ pub struct Search {
     all_patterns_are_excluded: bool,
     /// The amount of bytes that are in common among all `patterns` and that aren't matched case-insensitively
     common_prefix_len: usize,
+    /// The prefix the patterns were normalized with, repository-relative and `/`-terminated,
+    /// or empty at the root.
+    prefix: BString,
+    /// `item->match` of the `.` item `parse_pathspec()` appends when every pattern is an
+    /// exclusion (pathspec.c:671-678): empty, matching everything, unless
+    /// [`Search::prefer_cwd()`] made it the prefix.
+    implicit_match: BString,
 }
 
 /// The output of a pathspec [parsing][parse()] operation. It can be used to match against a one or more paths.

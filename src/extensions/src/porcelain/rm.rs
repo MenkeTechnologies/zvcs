@@ -389,7 +389,8 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         false,
         &index,
         gix::worktree::stack::state::attributes::Source::IdMapping,
-    )?;
+    )?
+    .prefer_cwd();
 
     // `refresh_index(…, REFRESH_QUIET | REFRESH_UNMERGED, &pathspec, …)` (builtin/rm.c) hashes the first
     // matching entry whose stat data cannot vouch for it, which dies on an unreadable
@@ -434,7 +435,6 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     // The synthetic "matched because nothing excludes it" case (all specs are
     // exclusions) reports sequence_number == pathspecs.len(); track it apart.
     let mut synthetic_seen: u8 = 0;
-    let cwd = crate::setup::prefix_bytes(&repo);
     let mut selected: Vec<Target> = Vec::new();
     let mut selected_paths: HashSet<BString> = HashSet::new();
     // Which pathspec items have already matched a path letter for letter — git's
@@ -442,14 +442,11 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
     let mut matched_verbatim: HashSet<usize> = HashSet::new();
 
     for t in &targets_all {
-        // With nothing but exclusions the implicit item is the current directory under
-        // `PATHSPEC_PREFER_CWD` (builtin/rm.c, pathspec.c:674-676): a path outside it matches
-        // no item, so it records no `seen[]` and is not removed.
-        if all_exclude && !t.path.starts_with(&cwd) {
-            continue;
-        }
-        // The items this path hits, strongest rank each; with nothing but exclusions the implicit
-        // item hits everything left.
+        // The items this path hits, strongest rank each. With nothing but exclusions the item
+        // `parse_pathspec()` appends stands in, the current directory under `PATHSPEC_PREFER_CWD`
+        // (builtin/rm.c:280-282, pathspec.c:671-678): a path outside it hits no item, so it
+        // records no `seen[]` and is not removed.
+        let implicit_hit = all_exclude && ps.search().implicit_item_matches(t.path.as_bstr(), false);
         let mut hits: Vec<(usize, u8)> = Vec::new();
         for (idx, item) in item_ps.iter_mut().enumerate() {
             if let Some(item) = item {
@@ -460,7 +457,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
                 }
             }
         }
-        let positive = !hits.is_empty() || all_exclude;
+        let positive = !hits.is_empty() || implicit_hit;
         // An entry outside the sparse-checkout definition is invisible to the removal (and to
         // `seen[]`) unless `--sparse` was given; it only feeds the separate skip-worktree tally
         // that turns "did not match any files" into the sparse-path report. That tally is
@@ -499,7 +496,7 @@ pub fn rm(args: &[String]) -> Result<ExitCode> {
         // (pathspec.c:671-678) is a positive one: it records `seen[]` on the first pass,
         // before the exclusion pass drops the path (dir.c:578-593), so `git rm -- ':!t'`
         // over an index of `t` alone still matched `.` recursively.
-        if all_exclude && m.is_some() {
+        if implicit_hit {
             synthetic_seen = synthetic_seen.max(RECURSIVELY);
         }
         let Some(m) = m else {

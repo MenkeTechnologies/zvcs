@@ -47,6 +47,10 @@ impl Search {
 
         let is_dir = is_dir.unwrap_or(false);
         let patterns_len = self.patterns.len();
+        // Nothing excluding the path, it stands on the item `parse_pathspec()` appends with
+        // no positive pattern given (pathspec.c:671-678), which under `PATHSPEC_PREFER_CWD`
+        // is the prefix alone.
+        let implicit_hit = self.all_patterns_are_excluded && self.implicit_item_matches(relative_path, is_dir);
         let res = self.patterns.iter_mut().find_map(|mapping| {
             let ignore_case = mapping.value.pattern.signature.contains(MagicSignature::ICASE);
             let prefix = mapping.value.pattern.prefix_directory();
@@ -117,7 +121,7 @@ impl Search {
             })
         });
 
-        if res.is_none() && self.all_patterns_are_excluded {
+        if res.is_none() && implicit_hit {
             Some(Match {
                 pattern: &self.match_all,
                 sequence_number: patterns_len,
@@ -190,7 +194,7 @@ impl Search {
             }
         }
 
-        self.all_patterns_are_excluded
+        self.all_patterns_are_excluded && self.implicit_item_can_match_directory(relative_path)
     }
 
     /// Returns `true` if `relative_path` matches the prefix of this pathspec.
@@ -244,7 +248,7 @@ impl Search {
             }
         }
 
-        self.all_patterns_are_excluded
+        self.all_patterns_are_excluded && self.implicit_item_can_match_directory(relative_path)
     }
 }
 

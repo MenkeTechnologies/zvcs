@@ -1263,7 +1263,8 @@ fn pathspec_reset_refusal(
         args.push("--force".to_string());
     }
     args.push("--".to_string());
-    args.extend(opts.pathspecs.iter().map(|spec| original(spec)));
+    let prefix = crate::setup::prefix_bytes(repo);
+    args.extend(opts.pathspecs.iter().map(|spec| original(spec, &prefix)));
     let (ok, _) = super::add_patch::run_git(&args, None, false, repo.workdir())?;
     if !ok {
         return Ok(Some(ExitCode::FAILURE));
@@ -1408,7 +1409,8 @@ fn report_path_error(
     }
     // The exclusions, the appended `.` item and the duplicate-of-a-match exemption
     // are `report_path_error()`'s, decided in one place.
-    let originals: Vec<String> = specs.iter().map(|raw| original(raw)).collect();
+    let prefix = crate::setup::prefix_bytes(repo);
+    let originals: Vec<String> = specs.iter().map(|raw| original(raw, &prefix)).collect();
     let unmatched = crate::pathspec::report_path_error_items(&originals, |i| matched[i], !candidates.is_empty());
     for item in &unmatched {
         let spec = item.map_or(".", |i| originals[i].as_str());
@@ -1464,17 +1466,21 @@ fn is_exclude_spec(spec: &str) -> bool {
 /// So `notes.txt` is reported as `:(prefix:0)notes.txt` and `:(literal)*.txt` as
 /// `:(literal,prefix:0)*.txt` — the magic keeps its own parentheses and the
 /// prefix joins it there, rather than a second `:(prefix:0)` being stacked in
-/// front of it. The prefix length is always 0 here: this port resolves a pathspec
-/// against the repository root, so the cwd contributes no prefix magic.
+/// front of it. The number is the `prefixlen` `prefix_path_gently()` leaves: the
+/// length of the cwd prefix still leading the `match` (pathspec.c:488-492), so
+/// `deep` run in `sub/` is `:(prefix:4)sub/deep` and `../t` is `:(prefix:0)t`,
+/// while a `top` element is copied with `0` (:485-487).
 ///
 /// What follows the magic is the element's `match`, not the word as typed
 /// (pathspec.c:513-521): `prefix_path_gently()` has folded `./`, `..` and doubled
 /// slashes out of it (pathspec.c:489-490), unless `top` magic copied it verbatim
-/// (:485-487). So `./notes.txt` is `:(prefix:0)notes.txt` and `.` is `:(prefix:0)`,
-/// which is also what the `add` child of a pathspec push is handed.
-fn original(spec: &str) -> String {
+/// (:485-487). So `./notes.txt` is `:(prefix:0)notes.txt` and `.` is `:(prefix:0)`
+/// at the top, which is also what the `add` child of a pathspec push is handed;
+/// that child runs at the top, where the prefix magic alone places the element.
+fn original(spec: &str, prefix: &[u8]) -> String {
     let Some(rest) = spec.strip_prefix(':') else {
-        return format!(":(prefix:0){}", pathspec_match(spec, false));
+        let (m, len) = pathspec_match(spec, false, prefix);
+        return format!(":(prefix:{len}){m}");
     };
     // Long form `:(magic,magic)<pattern>`: the magic list is kept and the prefix
     // is appended inside the same parentheses.
@@ -1482,9 +1488,13 @@ fn original(spec: &str) -> String {
         return match body.split_once(')') {
             Some((magic, pattern)) if !magic.is_empty() => {
                 let top = magic.split(',').any(|m| m.trim() == "top");
-                format!(":({magic},prefix:0){}", pathspec_match(pattern, top))
+                let (m, len) = pathspec_match(pattern, top, prefix);
+                format!(":({magic},prefix:{len}){m}")
             }
-            Some((_, pattern)) => format!(":(prefix:0){}", pathspec_match(pattern, false)),
+            Some((_, pattern)) => {
+                let (m, len) = pathspec_match(pattern, false, prefix);
+                format!(":(prefix:{len}){m}")
+            }
             // An unterminated `:(` is not valid magic; git would have died on it
             // already, so there is nothing to fold and the spec stands as typed.
             None => format!(":(prefix:0){spec}"),
@@ -1503,7 +1513,8 @@ fn original(spec: &str) -> String {
         pattern = &pattern[c.len_utf8()..];
     }
     if names.is_empty() {
-        return format!(":(prefix:0){spec}");
+        let (m, len) = pathspec_match(pattern, false, prefix);
+        return format!(":(prefix:{len}){m}");
     }
     names.sort_by_key(|n| match *n {
         "top" => 0,
@@ -1512,20 +1523,27 @@ fn original(spec: &str) -> String {
     });
     names.dedup();
     let top = names.contains(&"top");
-    format!(":({},prefix:0){}", names.join(","), pathspec_match(pattern, top))
+    let (m, len) = pathspec_match(pattern, top, prefix);
+    format!(":({},prefix:{len}){m}", names.join(","))
 }
 
-/// The `match` `init_pathspec_item()` builds from a pattern at the top level
-/// (pathspec.c:481-501): copied as is under `top` magic, otherwise normalized by
-/// `prefix_path_gently()` with an empty prefix. A pattern that climbs out of the
-/// worktree was already a `die()` in `parse_pathspec_fatal()`, and an absolute one
-/// is left as typed.
-fn pathspec_match(pattern: &str, top: bool) -> String {
+/// The `match` `init_pathspec_item()` builds (pathspec.c:481-501) and the `prefixlen`
+/// it is left with: copied as is under `top` magic with `0`, otherwise `prefix` and the
+/// pattern joined and normalized by `prefix_path_gently()`, where each `..` lowers the
+/// prefix length to what survives of it (setup.c:135-142, path.c:1199-1200). A pattern
+/// that climbs out of the worktree was already a `die()` in `parse_pathspec_fatal()`,
+/// and an absolute one is left as typed.
+fn pathspec_match(pattern: &str, top: bool, prefix: &[u8]) -> (String, usize) {
     if top || pattern.starts_with('/') {
-        return pattern.to_string();
+        return (pattern.to_string(), 0);
     }
-    crate::pathspec::normalize_path(pattern.into())
-        .map_or_else(|| pattern.to_string(), |m| m.to_str_lossy().into_owned())
+    let mut joined = BString::from(prefix);
+    joined.extend_from_slice(pattern.as_bytes());
+    let mut len = prefix.len();
+    match crate::pathspec::normalize_path_copy_len(joined.as_bstr(), &mut len) {
+        Some(m) => (m.to_str_lossy().into_owned(), len),
+        None => (pattern.to_string(), 0),
+    }
 }
 
 /// The first index entry `stash_working_tree()`'s one-way merge would refuse, or

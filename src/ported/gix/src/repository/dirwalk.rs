@@ -53,6 +53,11 @@ impl Repository {
             index,
             crate::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
         )?;
+        // Matching only inside the prefix with no pattern is `PATHSPEC_PREFER_CWD`, which also
+        // makes the prefix the item an all-exclusion pathspec gains (pathspec.c:671-678).
+        if options.empty_patterns_match_prefix {
+            pathspec = pathspec.prefer_cwd();
+        }
 
         let git_dir_realpath =
             crate::path::realpath_opts(self.git_dir(), self.current_dir(), crate::path::realpath::MAX_SYMLINKS)?;

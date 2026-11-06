@@ -856,7 +856,8 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         false,
         &index,
         gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-    )?;
+    )?
+    .prefer_cwd();
     let mut seen_items = SeenItems::new(&repo, &patterns, &raw_patterns, &index)?;
 
     // ```c
@@ -990,10 +991,10 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
         // (dir.h:585-594.) `show_dir_entry()` runs this for every line it prints,
         // and that is the *only* thing that sets `ps_matched` for a `-o`/`-k`
         // listing: the trailing `/` is dropped and re-offered as the `is_dir` flag.
-        let mut mark = |_ps: &mut gix::Pathspec<'_>, name: &BStr| {
+        let mut mark = |ps: &mut gix::Pathspec<'_>, name: &BStr| {
             let is_dir = name.last() == Some(&b'/');
             let bare = if is_dir { &name[..name.len() - 1] } else { &name[..] };
-            seen_items.mark(bare.as_bstr(), is_dir, &mut matched);
+            seen_items.mark(ps, bare.as_bstr(), is_dir, &mut matched);
         };
 
         if opts.others {
@@ -1079,7 +1080,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             }
             continue;
         }
-        seen_items.mark(path, false, &mut matched);
+        seen_items.mark(&ps, path, false, &mut matched);
         let Some(m) = ps.pattern_matching_relative_path(path, Some(false)) else {
             continue;
         };
@@ -1176,7 +1177,7 @@ pub fn ls_files(args: &[String]) -> Result<ExitCode> {
             };
             for rec in records {
                 let name = rec.name();
-                seen_items.mark(name, false, &mut matched);
+                seen_items.mark(&ps, name, false, &mut matched);
                 let Some(m) = ps.pattern_matching_relative_path(name, Some(false)) else {
                     continue;
                 };
@@ -1355,11 +1356,9 @@ struct SeenItems<'r> {
     items: Vec<Option<gix::Pathspec<'r>>>,
     /// Whether any name reached `match_pathspec()` that the `.` item
     /// `parse_pathspec()` appends to an all-exclusion pathspec matches. Under
-    /// `PATHSPEC_PREFER_CWD` (builtin/ls-files.c) that item is the current
-    /// directory (pathspec.c:674-676), so only a name below `cwd` counts.
+    /// `PATHSPEC_PREFER_CWD` (builtin/ls-files.c:732-734) that item is the current
+    /// directory (pathspec.c:674-676), so only a name below it counts.
     offered: bool,
-    /// The current directory's prefix, slash-terminated, empty at the top.
-    cwd: Vec<u8>,
 }
 
 impl<'r> SeenItems<'r> {
@@ -1383,12 +1382,13 @@ impl<'r> SeenItems<'r> {
                 )?)
             });
         }
-        Ok(Self { items, offered: false, cwd: crate::setup::prefix_bytes(repo) })
+        Ok(Self { items, offered: false })
     }
 
-    /// Record every positive item that `path` hits.
-    fn mark(&mut self, path: &BStr, is_dir: bool, matched: &mut HashSet<usize>) {
-        self.offered |= path.starts_with(&self.cwd);
+    /// Record every positive item that `path` hits, and whether `ps`'s appended
+    /// `.` item does.
+    fn mark(&mut self, ps: &gix::Pathspec<'_>, path: &BStr, is_dir: bool, matched: &mut HashSet<usize>) {
+        self.offered |= ps.search().implicit_item_matches(path, is_dir);
         for (i, item) in self.items.iter_mut().enumerate() {
             let Some(item) = item else { continue };
             if let Some(m) = item.pattern_matching_relative_path(path, Some(is_dir)) {

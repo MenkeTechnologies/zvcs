@@ -71,11 +71,15 @@ fn ps_strneq(icase: bool, a: &[u8], b: &[u8], n: usize) -> bool {
 impl Search {
     /// The items in the order they were given — gix keeps its patterns sorted
     /// exclusions first, git keeps `pathspec->items` in argument order, and
-    /// `common_prefix_len()` measures against `items[0]`.
-    fn git_items(&self) -> Vec<(usize, Item)> {
+    /// `common_prefix_len()` measures against the first positive one. Each carries
+    /// the index of its gix pattern, or `None` for the `.` item `parse_pathspec()`
+    /// appends when every element is an exclusion (pathspec.c:671-678): its `match`
+    /// is empty, or the prefix under `PATHSPEC_PREFER_CWD`, and `init_pathspec_item()`
+    /// sets `prefix` and `nowildcard_len` to its whole length.
+    fn git_items(&self) -> Vec<(Option<usize>, Item)> {
         let mut order: Vec<usize> = (0..self.patterns.len()).collect();
         order.sort_by_key(|&idx| self.patterns[idx].sequence_number);
-        order
+        let mut items: Vec<(Option<usize>, Item)> = order
             .into_iter()
             .map(|idx| (idx, &self.patterns[idx]))
             .map(|(idx, mapping)| {
@@ -100,7 +104,7 @@ impl Search {
                     simple_length(&matcher).max(prefix)
                 };
                 (
-                    idx,
+                    Some(idx),
                     Item {
                         nowildcard_len,
                         prefix,
@@ -111,7 +115,22 @@ impl Search {
                     },
                 )
             })
-            .collect()
+            .collect();
+        if !items.is_empty() && items.iter().all(|(_, item)| item.exclude) {
+            let len = self.implicit_match.len();
+            items.push((
+                None,
+                Item {
+                    matcher: self.implicit_match.clone(),
+                    prefix: len,
+                    nowildcard_len: len,
+                    icase: false,
+                    exclude: false,
+                    glob: false,
+                },
+            ));
+        }
+        items
     }
 
     /// `match_pathspec_with_flags()` (dir.c:578-593) with a zero `prefix` and no
@@ -157,14 +176,9 @@ impl Search {
     }
 
     /// `do_match_pathspec()` (dir.c:513-576).
-    ///
-    /// `parse_pathspec()` appends a match-everything item when every element is
-    /// an exclusion (pathspec.c:630-640); gix keeps no such item, so a search
-    /// with no positive item answers for it — `MATCHED_RECURSIVELY`, what
-    /// `match_pathspec_item()` returns for an empty `match`.
     fn do_match_pathspec(
         &mut self,
-        items: &[(usize, Item)],
+        items: &[(Option<usize>, Item)],
         name: &BStr,
         flags: u32,
         attributes: &mut dyn FnMut(
@@ -178,9 +192,6 @@ impl Search {
             return MATCHED_RECURSIVELY;
         }
         let exclude = flags & DO_MATCH_EXCLUDE != 0;
-        if !exclude && items.iter().all(|(_, item)| item.exclude) {
-            return MATCHED_RECURSIVELY;
-        }
         let mut retval = 0;
         for (idx, item) in items.iter().rev() {
             if item.exclude != exclude {
@@ -195,7 +206,7 @@ impl Search {
     /// `match_pathspec_item()` (dir.c:387-492) with a zero `prefix`.
     fn match_pathspec_item(
         &mut self,
-        idx: usize,
+        idx: Option<usize>,
         item: &Item,
         name: &BStr,
         flags: u32,
@@ -216,8 +227,9 @@ impl Search {
 
         // `match_pathspec_attrs()` (pathspec.c:725-761) checks the name without
         // any trailing slash a directory was handed in with.
-        let mapping = &mut self.patterns[idx];
-        if let Some(attrs) = mapping.value.attrs_match.as_mut() {
+        if let Some(mapping) = idx.map(|idx| &mut self.patterns[idx])
+            && let Some(attrs) = mapping.value.attrs_match.as_mut()
+        {
             let is_dir = name.last() == Some(&b'/');
             let path = if is_dir { name[..namelen - 1].as_bstr() } else { name };
             if !attributes(path, gix_glob::pattern::Case::Sensitive, is_dir, attrs) {
@@ -271,12 +283,14 @@ impl Search {
 
     /// `common_prefix_len()` (dir.c:204-247): the longest leading *directory*
     /// every positive item shares, up to its first wildcard — or, under
-    /// `:(icase)`, up to the command's prefix only.
+    /// `:(icase)`, up to the command's prefix only. Each is measured against the
+    /// first positive item, `items[first]`.
     pub fn git_common_prefix_len(&self) -> usize {
         let items = self.git_items();
-        let Some((_, first)) = items.first() else {
+        let Some(first) = items.iter().position(|(_, item)| !item.exclude) else {
             return 0;
         };
+        let first_match = &items[first].1.matcher;
         let mut max = 0;
         for (n, (_, item)) in items.iter().enumerate() {
             if item.exclude {
@@ -285,9 +299,9 @@ impl Search {
             let item_len = if item.icase { item.prefix } else { item.nowildcard_len };
             let mut len = 0;
             let mut i = 0;
-            while i < item_len && (n == 0 || i < max) {
+            while i < item_len && (n == first || i < max) {
                 let c = item.matcher[i];
-                if first.matcher.get(i) != Some(&c) {
+                if first_match.get(i) != Some(&c) {
                     break;
                 }
                 if c == b'/' {
@@ -295,7 +309,7 @@ impl Search {
                 }
                 i += 1;
             }
-            if n == 0 || len < max {
+            if n == first || len < max {
                 max = len;
                 if max == 0 {
                     break;
@@ -306,11 +320,13 @@ impl Search {
     }
 
     /// The directory [`Search::git_common_prefix_len()`] measures, as
-    /// `fill_directory()` passes it on: `pathspec->items[0].match` cut to that length.
+    /// `fill_directory()` passes it on: `pathspec->items[first].match` cut to that
+    /// length (dir.c:261).
     pub fn git_common_prefix(&self) -> BString {
         let len = self.git_common_prefix_len();
         self.git_items()
-            .first()
+            .iter()
+            .find(|(_, item)| !item.exclude)
             .map(|(_, item)| BString::from(&item.matcher[..len]))
             .unwrap_or_default()
     }
@@ -319,7 +335,7 @@ impl Search {
     /// at or below `path`, judged on the literal part of each item alone.
     pub fn simplify_away(&self, path: &BStr) -> bool {
         let items = self.git_items();
-        if items.is_empty() || items.iter().all(|(_, item)| item.exclude) {
+        if items.is_empty() {
             return false;
         }
         !items.iter().any(|(_, item)| {

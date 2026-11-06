@@ -423,6 +423,7 @@ pub fn clean(args: &[String]) -> Result<ExitCode> {
                 &repo.index_or_load_from_head_or_empty()?.into_owned(),
                 gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
             )?
+            .prefer_cwd()
             .detach()?,
         ),
     };
@@ -998,6 +999,7 @@ fn walk(
             state,
             gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
         )?
+        .prefer_cwd()
         .detach()?;
 
     let workdir = repo

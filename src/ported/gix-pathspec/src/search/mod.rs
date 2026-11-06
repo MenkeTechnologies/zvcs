@@ -38,6 +38,39 @@ impl Match<'_> {
     }
 }
 
+/// `PATHSPEC_PREFER_CWD`
+impl Search {
+    /// `PATHSPEC_PREFER_CWD` (pathspec.h:65): when every pattern is an exclusion, the
+    /// `.` item `parse_pathspec()` appends is the command's prefix rather than the whole
+    /// tree (pathspec.c:671-678), so `git ls-files -- ':!x'` run in `sub/` lists `sub/`
+    /// alone. Callers that pass `PATHSPEC_PREFER_FULL` or neither flag keep the default.
+    pub fn prefer_cwd(&mut self) {
+        self.implicit_match = self.prefix.clone();
+    }
+
+    /// `match_pathspec_item()` (dir.c:387-492) for that appended item: its `match` is
+    /// empty or the prefix, every byte of it literal, so it matches a name at or below
+    /// that directory, or, with `is_dir`, the directory itself (`DO_MATCH_DIRECTORY`).
+    /// Callers keeping `seen[]` read the appended item's entry from this.
+    pub fn implicit_item_matches(&self, relative_path: &BStr, is_dir: bool) -> bool {
+        let matcher = self.implicit_match.as_bstr();
+        if matcher.is_empty() {
+            return true;
+        }
+        relative_path.starts_with(matcher)
+            || (is_dir && relative_path.len() + 1 == matcher.len() && matcher.starts_with(relative_path))
+    }
+
+    /// Whether the directory `relative_path` (no trailing `/`) can hold a name the appended
+    /// item matches: it is at or below the prefix, or leads up to it.
+    pub(crate) fn implicit_item_can_match_directory(&self, relative_path: &BStr) -> bool {
+        let matcher = self.implicit_match.as_bstr();
+        matcher.is_empty()
+            || self.implicit_item_matches(relative_path, true)
+            || (matcher.starts_with(relative_path) && matcher.get(relative_path.len()) == Some(&b'/'))
+    }
+}
+
 /// Access
 impl Search {
     /// Return an iterator over the patterns that participate in the search.

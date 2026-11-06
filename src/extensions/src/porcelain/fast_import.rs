@@ -72,8 +72,14 @@
 //!   * `--rewrite-submodules-from/-to=<name>:<file>` — the marks file is read
 //!     where git reads it, so a missing or corrupt one fails identically, but a
 //!     stream that actually carries a gitlink to rewrite is refused.
-//!   * `N` once a notes ref would exceed 255 notes, where git re-fans-out the
-//!     whole notes tree.
+//!
+//! The in-memory trees are git's (`struct tree_entry` and `struct
+//! tree_content`, see "git's in-memory trees" below): two versions per entry,
+//! subtrees read only when a path walks into them, only dirty trees stored, a
+//! tree deltified against its old version when that sits in the pack being
+//! built, the notes tree re-fanned-out as its note count crosses a power of
+//! 256, and branches loaded and evicted through the `--active-branches` LRU.
+//! That shape is what the statistics block and the crash report describe.
 //!
 //! Storage follows git's own rule rather than a fixed choice. `end_packfile()`
 //! keeps the pack it wrote and explodes it with `git unpack-objects` only when
@@ -93,23 +99,26 @@
 //! `--max-pack-size`/`pack.packSizeLimit` would be crossed
 //! (`store_object()` at `fast-import.c:1024-1030`); this port hands the object
 //! set to the same writer `pack-objects` uses, in one pack, with its own delta
-//! window. `--depth`, `--big-file-threshold`, `--active-branches` and
-//! `--max-pack-size` are therefore still validated the way git validates them
-//! and then left to steer nothing. The object set, the index and the refs are a
+//! window. git's delta *decisions* are still made — `store_object()` tries the
+//! same base under the same `--depth`/`pack.depth` and `--big-file-threshold`,
+//! with the port of `diff-delta.c`, and keeps the depth it would have given the
+//! object — because the statistics block counts them and a tree read back
+//! carries its depth. `--max-pack-size` is validated the way git validates it
+//! and then steers nothing. The object set, the index and the refs are a
 //! function of the stream and are identical; the compression and the grouping
 //! are not.
 //!
-//! Two deliberate differences remain, neither of which changes the objects or
-//! refs a caller can observe: the `--stats` block — stderr only, and full of
-//! allocator and pack-window counters that have no equivalent here — is never
-//! printed, and no crash report is dumped on a fatal error, because the
-//! `fast_import_crash_<pid>` file could never match anyway and lives inside
-//! `.git` where nothing observes it. The `warning:` lines
-//! `parse_one_option()` prints are *not* part of that: they are ordinary
-//! stderr a caller reads, and they are reproduced.
+//! Without `--quiet` the run ends in git's statistics block on stderr, and a
+//! fatal error writes git's crash report to `$GIT_DIR/fast_import_crash_<pid>`
+//! and names it after the `fatal:` line. The block's last four `pack_report`
+//! counters count the mmap windows `packfile.c` opens to read objects back out
+//! of packs; this port reads through gitoxide's object store, opens no such
+//! window, and reports zeros, which is what git reports for a run that never
+//! reads a packed object. The `warning:` lines `parse_one_option()` prints are
+//! ordinary stderr a caller reads, and they are reproduced.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write as _};
 use std::process::ExitCode;
 
@@ -380,9 +389,27 @@ impl TempPack {
 /// [`PackLog::flush`] is then `end_packfile()`: it decides which of the two
 /// shapes git would have left behind and makes the store match it.
 struct PackLog {
-    /// git's `insert_object()` table, reduced to the one bit `store_object()`
-    /// reads out of it — whether `e->idx.offset` is already set.
-    seen: HashSet<ObjectId>,
+    /// git's `object_table` (`insert_object()`, builtin/fast-import.c:523-536):
+    /// one entry per object id the run has hashed, looked up, or loaded from a
+    /// marks file, whether or not it was stored.
+    table: HashMap<ObjectId, ObjectEntry>,
+    /// `pack_id`: the number of the pack now being built. It moves on only when
+    /// `end_packfile()` keeps a pack.
+    pack_id: u32,
+    /// `object_count_by_type`, `duplicate_count_by_type`, `delta_count_by_type`
+    /// and `delta_count_attempts_by_type`, indexed by [`type_slot`].
+    stored_by_type: [u64; 4],
+    duplicates_by_type: [u64; 4],
+    deltas_by_type: [u64; 4],
+    delta_attempts_by_type: [u64; 4],
+    /// `last_blob`: the blob a following blob is deltified against.
+    last_blob: LastObject,
+    /// `max_depth`: `pack.depth`, `--depth`, or git's 50.
+    max_depth: u64,
+    /// `repo_settings_get_big_file_threshold()`: `core.bigFileThreshold`,
+    /// `--big-file-threshold`, or git's 512 MiB. A `data <n>` above it is
+    /// streamed by `stream_blob()`, which never deltifies.
+    big_file_threshold: u64,
     /// The objects of the pack now being built, in the order they were stored.
     /// `object_count` is its length.
     ids: Vec<ObjectId>,
@@ -392,7 +419,7 @@ struct PackLog {
     created: Vec<ObjectId>,
     /// The pack indices the object store held when the run opened, standing in
     /// for `packfile_list_find_oid` above. Loaded once: a pack this run writes
-    /// can only hold objects already in [`PackLog::seen`], which short-circuits
+    /// can only hold objects already in [`PackLog::table`], which short-circuits
     /// ahead of this check exactly as git's table does.
     packed: Vec<gix::odb::pack::index::File>,
     /// The primary object directory, which is where the loose files are.
@@ -425,7 +452,15 @@ impl PackLog {
             }
         }
         PackLog {
-            seen: HashSet::new(),
+            table: HashMap::new(),
+            pack_id: 0,
+            stored_by_type: [0; 4],
+            duplicates_by_type: [0; 4],
+            deltas_by_type: [0; 4],
+            delta_attempts_by_type: [0; 4],
+            last_blob: LastObject::default(),
+            max_depth: 50,
+            big_file_threshold: 512 * 1024 * 1024,
             ids: Vec::new(),
             created: Vec::new(),
             packed,
@@ -458,7 +493,11 @@ impl PackLog {
     /// `core.*`, `push.*` and similar value the default callback refuses.
     fn configure(&mut self, repo: &gix::Repository) -> Result<()> {
         let die = crate::fatal::die;
-        crate::config::config_ulong(repo, "pack.depth").map_err(die)?;
+        // `if (max_depth > MAX_DEPTH) max_depth = MAX_DEPTH;` — clamped here,
+        // where `--depth` is refused instead.
+        if let Some(depth) = crate::config::config_ulong(repo, "pack.depth").map_err(die)? {
+            self.max_depth = depth.min(MAX_DEPTH);
+        }
         let index_version = crate::config::config_int(repo, "pack.indexversion").map_err(die)?;
         if let Some(version) = index_version.map(|v| v as i32 as u32).filter(|v| *v > 2) {
             // `git_die_config()`: the `error:` text, then the origin-naming `fatal:`.
@@ -474,6 +513,11 @@ impl PackLog {
             None => crate::config::config_int(repo, "transfer.unpacklimit").map_err(die)?,
         };
         crate::default_config::validate(repo).map_err(crate::default_config::Rejection::into_error)?;
+        // `git_default_core_config()` reads `core.bigfilethreshold` with
+        // `git_config_ulong()` into the repository settings the blob parser asks.
+        if let Some(threshold) = crate::config::config_ulong(repo, "core.bigfilethreshold").map_err(die)? {
+            self.big_file_threshold = threshold;
+        }
 
         self.unpack_limit = unpack_limit.unwrap_or(100);
         // 1 and 2 are the two versions `write_idx_file()` can write and [`index_file`] emits.
@@ -490,19 +534,45 @@ impl PackLog {
         self.objdir.join(&hex[..2]).join(&hex[2..])
     }
 
-    /// `store_object()`: hash the object, decide whether git would have counted
-    /// it into the pack, and write it.
+    /// `store_object()` (builtin/fast-import.c:968-1110): hash the object,
+    /// decide whether git would have counted it into the pack, try the delta
+    /// git would have tried, and write it.
     ///
+    /// ```c
+    /// e = insert_object(&oid);
+    /// if (mark) insert_mark(&marks, mark, e);
+    /// if (e->idx.offset) { duplicate_count_by_type[type]++; return 1; }
+    /// … packfile_list_find_oid() … { …; duplicate_count_by_type[type]++; return 1; }
+    /// if (last && last->data.len && last->data.buf && last->depth < max_depth
+    ///         && dat->len > the_hash_algo->rawsz) {
+    ///         delta_count_attempts_by_type[type]++;
+    ///         delta = diff_delta(last->data.buf, last->data.len,
+    ///                 dat->buf, dat->len,
+    ///                 &deltalen_st, dat->len - the_hash_algo->rawsz);
+    /// } else
+    ///         delta = NULL;
+    /// ```
+    ///
+    /// The mark is the caller's to insert, through [`Importer::insert_mark`].
     /// The write happens either way — a duplicate is already in the store, so
-    /// `write_buf` is a no-op for it — and only the bookkeeping differs.
+    /// `write_buf` is a no-op for it — and only the bookkeeping differs. The
+    /// delta is computed with the port of `diff-delta.c` for the one thing
+    /// fast-import keeps of it: whether one at most `len - rawsz` bytes long
+    /// exists, which decides `delta_count_by_type` and the stored object's depth.
+    /// The pack bytes themselves are written by [`PackLog::flush`].
     ///
     /// The second half of the return is git's `!store_object()`: whether this
     /// object was *newly stored into the current pack*, which is what
     /// `parse_new_commit` and `parse_new_tag` set `b->pack_id` / `t->pack_id`
     /// from (3101, 3272-3274) and therefore what `--export-pack-edges` names.
-    fn store(&mut self, repo: &gix::Repository, kind: Kind, data: &[u8]) -> Result<(ObjectId, bool)> {
+    fn store(
+        &mut self,
+        repo: &gix::Repository,
+        kind: Kind,
+        data: &[u8],
+        last: Last<'_>,
+    ) -> Result<(ObjectId, bool)> {
         let id = gix::objs::compute_hash(repo.object_hash(), kind, data)?;
-        let fresh = self.seen.insert(id);
         // Probed before the write, because that is the only moment the answer is
         // still "was it there before this run put it there".
         let loose = self.loose_path(&id);
@@ -514,11 +584,45 @@ impl PackLog {
         if !existed && loose.exists() {
             self.created.push(id);
         }
-        let stored = fresh && !self.packed.iter().any(|idx| idx.lookup(id).is_some());
-        if stored {
-            self.ids.push(id);
+
+        let slot = type_slot(kind);
+        if self.table.contains_key(&id) {
+            self.duplicates_by_type[slot] += 1;
+            return Ok((id, false));
         }
-        Ok((id, stored))
+        if self.packed.iter().any(|idx| idx.lookup(id).is_some()) {
+            self.table.insert(id, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0 });
+            self.duplicates_by_type[slot] += 1;
+            return Ok((id, false));
+        }
+
+        let rawsz = repo.object_hash().len_in_bytes();
+        let max_depth = self.max_depth;
+        let last = match last {
+            Last::None => None,
+            Last::Blob => Some(&mut self.last_blob),
+            Last::Tree(lo) => Some(lo),
+        };
+        let mut depth = 0;
+        if let Some(last) = &last {
+            if !last.data.is_empty() && u64::from(last.depth) < max_depth && data.len() > rawsz {
+                self.delta_attempts_by_type[slot] += 1;
+                let delta = gix::odb::pack::data::output::delta::encode::Index::new(last.data.as_slice())
+                    .and_then(|index| index.create(data, (data.len() - rawsz) as u64));
+                if delta.is_some() {
+                    self.deltas_by_type[slot] += 1;
+                    depth = last.depth + 1;
+                }
+            }
+        }
+        self.table.insert(id, ObjectEntry { kind, pack_id: self.pack_id, depth });
+        self.stored_by_type[slot] += 1;
+        self.ids.push(id);
+        if let Some(last) = last {
+            last.data = data.to_vec();
+            last.depth = depth;
+        }
+        Ok((id, true))
     }
 
     /// `end_packfile()` (`builtin/fast-import.c:870-945`) for the pack the log
@@ -757,6 +861,10 @@ struct Opts {
     /// the option or feature named it, so `--relative-marks` applies to the
     /// names that follow it and not to the ones before.
     export_marks: Option<std::path::PathBuf>,
+    /// The same name as git spells it: `prefix_filename()` against the
+    /// directory the command started in, or `git_path()` under
+    /// `--relative-marks`. The crash report quotes it.
+    export_marks_shown: String,
     relative_marks: bool,
     /// `state->allow_unsafe_features`. Set by the early argv scan before the
     /// stream is read, which is the only setting a `feature` line ever sees.
@@ -789,6 +897,7 @@ impl Opts {
             date_format: DateFormat::Raw,
             require_done: false,
             export_marks: None,
+            export_marks_shown: String::new(),
             relative_marks: false,
             allow_unsafe: false,
             cat_blob_fd: None,
@@ -800,36 +909,85 @@ impl Opts {
     }
 }
 
-/// A ref being built in memory, exactly one per name the stream has named.
+/// `struct branch`: a ref being built in memory, exactly one per name the
+/// stream has named.
 struct Branch {
     /// Full ref name, e.g. `refs/heads/main`.
     name: String,
-    /// The tip this branch will be written at, or `None` while it has none.
+    /// `oid`: the tip this branch will be written at, or `None` for the null id.
     head: Option<ObjectId>,
-    /// The tree the next commit on this branch starts from.
-    tree: Dir,
-    /// Set by `from <null oid>`: the ref is to be deleted rather than updated.
-    delete: bool,
-    /// Notes counted in `tree`, used to pick the notes fanout.
+    /// `branch_tree`: the tree the next commit on this branch starts from.
+    tree: TreeEntry,
+    /// `last_commit`: `object_count_by_type[OBJ_COMMIT]` when its last commit
+    /// was stored — the clock the active-branch LRU evicts by.
+    last_commit: u64,
+    /// `num_notes`: notes counted in `tree`, which pick the notes fanout.
     notes: u64,
-    /// git's `b->pack_id == pack_id`: whether the commit object this branch now
-    /// points at was newly stored into the pack currently being built. Only such
-    /// a tip is named on a `--export-pack-edges` line, and it is never cleared by
-    /// a later duplicate commit — git only ever assigns it (3101).
-    packed: bool,
+    /// `active`: on the `active_branches` list.
+    active: bool,
+    /// `delete`: set by `from <null oid>`; the ref is to be deleted rather than
+    /// updated.
+    delete: bool,
+    /// `pack_id`: the pack the commit it points at was newly stored into, or
+    /// [`MAX_PACK_ID`]. Only a tip of the pack being closed is named on an
+    /// `--export-pack-edges` line, and a later duplicate commit does not clear
+    /// it — git only ever assigns it (3135).
+    pack_id: u32,
 }
 
-/// One entry in an in-memory tree: a blob/symlink/gitlink, or a sub-directory.
-#[derive(Clone)]
-enum Node {
-    Leaf { mode: u32, oid: ObjectId },
-    Dir(Dir),
+/// `struct tag`: one `tag` command, kept for the whole run.
+struct Tag {
+    name: String,
+    /// `oid`: null until the tag object is stored, which is what the crash
+    /// report shows for a tag whose command died part way.
+    oid: ObjectId,
+    /// `pack_id`, as for [`Branch::pack_id`].
+    pack_id: u32,
 }
 
-/// An in-memory tree. Keyed by raw file name; git's ordering is applied on write.
-#[derive(Clone, Default)]
-struct Dir {
-    entries: BTreeMap<Vec<u8>, Node>,
+/// `struct mark_set`'s shape (builtin/fast-import.c:575-596): the levels of
+/// 1024 slots `insert_mark()` allocates, which the statistics block counts as
+/// `marks:` and as pool memory.
+struct MarkSet {
+    /// `shift` of the top level.
+    shift: u32,
+    /// `(shift, first mark)` of every level below the top allocated so far.
+    levels: HashSet<(u32, u64)>,
+    /// The slots set so far.
+    marked: HashSet<u64>,
+}
+
+impl MarkSet {
+    fn new() -> MarkSet {
+        MarkSet {
+            shift: 0,
+            levels: HashSet::new(),
+            marked: HashSet::new(),
+        }
+    }
+
+    /// `insert_mark()`'s walk: grow the top until `idnum` fits, then allocate
+    /// the missing levels down to its slot. Returns whether the slot was new,
+    /// which is what `marks_set_count` counts.
+    fn insert(&mut self, pools: &mut Pools, idnum: u64) -> bool {
+        while idnum.checked_shr(self.shift).unwrap_or(0) >= 1024 {
+            pools.alloc(SIZEOF_MARK_SET);
+            // The old top becomes `sets[0]` of the new one.
+            self.levels.insert((self.shift, 0));
+            self.shift += 10;
+        }
+        let (mut shift, mut base, mut rest) = (self.shift, 0u64, idnum);
+        while shift > 0 {
+            let i = rest >> shift;
+            rest -= i << shift;
+            base += i << shift;
+            shift -= 10;
+            if self.levels.insert((shift, base)) {
+                pools.alloc(SIZEOF_MARK_SET);
+            }
+        }
+        self.marked.insert(idnum)
+    }
 }
 
 /// `git fast-import` — import a stream of objects and ref updates from stdin.
@@ -895,14 +1053,29 @@ fn run(args: &[String]) -> Result<ExitCode> {
     let mut pack = PackLog::new(&repo);
     pack.configure(&repo)?;
 
+    // `marks = mem_pool_calloc(&fi_mem_pool, 1, sizeof(struct mark_set));` and
+    // `rc_free = mem_pool_alloc(&fi_mem_pool, cmd_save * sizeof(*rc_free));`
+    // (builtin/fast-import.c:4211, 4239), the pool's first two allocations.
+    let mut pools = Pools::new();
+    pools.alloc(SIZEOF_MARK_SET);
+    pools.alloc(CMD_SAVE as u64 * SIZEOF_RECENT_COMMAND);
+    pools.ignore_case = repo.config_snapshot().boolean("core.ignorecase").unwrap_or(false);
+
     let mut imp = Importer {
         pack,
         repo,
         opts: Opts::new(),
         marks: HashMap::new(),
+        mark_set: MarkSet::new(),
+        marks_set_count: 0,
         branches: Vec::new(),
         by_name: HashMap::new(),
+        active_branches: Vec::new(),
+        max_active_branches: 5,
+        branch_load_count: 0,
         tags: Vec::new(),
+        pools,
+        show_stats: true,
         failed: false,
         seen_data_command: false,
         submodule_rewrites: Vec::new(),
@@ -941,16 +1114,27 @@ fn run(args: &[String]) -> Result<ExitCode> {
         }
         Err(e) => {
             pack.end();
-            // `die_nicely`: `end_packfile(); unkeep_all_packs(); dump_marks();`
-            // (builtin/fast-import.c:441-443), in that order — so a run that
-            // stored more than `fastimport.unpackLimit` objects and *then* died
-            // still leaves them packed rather than loose. A failure to write the
-            // pack here is dropped: git is already on its way out with the
-            // caller's error, and `unlink_or_warn`/`die_errno` inside
-            // `end_packfile` cannot replace it.
+            // `die_nicely()` (builtin/fast-import.c:444-463): the `fatal:` line,
+            // then `write_crash_report(message); end_packfile();
+            // unkeep_all_packs(); dump_marks();`, in that order — so the report
+            // shows the branches and marks as the failing command left them, and
+            // a run that stored more than `fastimport.unpackLimit` objects and
+            // *then* died still leaves them packed rather than loose. A failure
+            // to write the pack here is dropped: git is already on its way out
+            // with the caller's error, and `unlink_or_warn`/`die_errno` inside
+            // `end_packfile` cannot replace it. A refusal from the default config
+            // callback has printed its own lines and carries no message to report.
+            let silent = e.is::<crate::fatal::Silent>();
+            if !silent {
+                eprintln!("fatal: {e}");
+                imp.write_crash_report(&e.to_string());
+            }
             let _ = imp.end_packfile();
             imp.dump_marks_on_fatal();
-            Err(e)
+            match silent {
+                true => Err(e),
+                false => Ok(ExitCode::from(128)),
+            }
         }
     }
 }
@@ -1025,11 +1209,12 @@ fn strtoumax10(spec: &[u8]) -> usize {
 
 /// `option_depth()` (builtin/fast-import.c:3746-3751): parsed, then held to
 /// the bitfield's ceiling.
-fn option_depth(value: &str) -> Result<()> {
-    if ulong_arg("--depth", value)? > MAX_DEPTH {
+fn option_depth(value: &str) -> Result<u64> {
+    let depth = ulong_arg("--depth", value)?;
+    if depth > MAX_DEPTH {
         crate::git_fatal!("--depth cannot exceed {MAX_DEPTH}");
     }
-    Ok(())
+    Ok(depth)
 }
 
 /// `option_max_pack_size()` (builtin/fast-import.c:3815-3829), shared by the
@@ -1062,13 +1247,13 @@ fn option_max_pack_size(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// `option_big_file_threshold()` (builtin/fast-import.c:3831-3838): validated,
-/// then left to steer the deltification this port does not reproduce.
-fn option_big_file_threshold(value: &str) -> Result<()> {
-    if super::list_objects_filter::git_parse_ulong(value.as_bytes()).is_none() {
+/// `option_big_file_threshold()` (builtin/fast-import.c:3827-3834): the size
+/// above which a counted `data` blob is streamed rather than deltified.
+fn option_big_file_threshold(value: &str) -> Result<u64> {
+    let Some(v) = super::list_objects_filter::git_parse_ulong(value.as_bytes()) else {
         crate::git_fatal!("--big-file-threshold: argument must be a non-negative integer");
-    }
-    Ok(())
+    };
+    Ok(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,6 +1268,24 @@ thread_local! {
     /// call.
     static COMMAND_BUF: std::cell::RefCell<Vec<u8>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// `cmd_hist` (builtin/fast-import.c:252-258): the last `cmd_save` lines
+    /// `read_next_command()` read, oldest first, for the crash report.
+    static CMD_HIST: std::cell::RefCell<std::collections::VecDeque<Vec<u8>>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Append a line `read_next_command()` read to [`CMD_HIST`]
+/// (builtin/fast-import.c:1889-1904), dropping the oldest once `cmd_save` are
+/// held.
+fn record_command(line: &[u8]) {
+    CMD_HIST.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.len() == CMD_SAVE {
+            h.pop_front();
+        }
+        h.push_back(line.to_vec());
+    });
 }
 
 /// The current [`COMMAND_BUF`], for the diagnostics that quote it.
@@ -1106,11 +1309,25 @@ impl Input {
         }
     }
 
-    /// One raw line without its LF, or `None` at EOF.
+    /// One line as `read_next_command()` reads it: without its LF, or `None`
+    /// at EOF. A fresh line is also appended to the command history
+    /// (builtin/fast-import.c:1889-1904), the oldest dropped once `cmd_save`
+    /// are held; a line handed back with [`Input::unread`] is not recorded
+    /// twice.
     fn line(&mut self) -> Result<Option<Vec<u8>>> {
         if let Some(line) = self.pending.take() {
             return Ok(Some(line));
         }
+        let Some(buf) = self.raw_line()? else {
+            return Ok(None);
+        };
+        record_command(&buf);
+        Ok(Some(buf))
+    }
+
+    /// One line off the stream into `command_buf`, not recorded — the read
+    /// `parse_data()` makes for each line of a `data <<delim` body (1953).
+    fn raw_line(&mut self) -> Result<Option<Vec<u8>>> {
         let mut buf = Vec::new();
         if self.stdin.read_until(b'\n', &mut buf)? == 0 {
             return Ok(None);
@@ -1185,7 +1402,7 @@ impl Input {
             let delim = delim.to_vec();
             let mut out = Vec::new();
             loop {
-                let Some(line) = self.line()? else {
+                let Some(line) = self.raw_line()? else {
                     crate::git_fatal!(
                         "EOF in data (terminator '{}' not found)",
                         String::from_utf8_lossy(&delim)
@@ -1219,16 +1436,30 @@ struct Importer {
     repo: gix::Repository,
     opts: Opts,
     marks: HashMap<u64, ObjectId>,
+    /// The shape of `marks`, for the statistics block.
+    mark_set: MarkSet,
+    /// `marks_set_count`: slots set in any mark set, the submodule ones
+    /// included.
+    marks_set_count: u64,
     /// Branches in the order the stream first named them.
     branches: Vec<Branch>,
     by_name: HashMap<String, usize>,
-    /// `(<tag name>, <object id>, <newly stored into the current pack>)`, in
-    /// stream order; written under `refs/tags/`. The third field is git's
-    /// `t->pack_id == pack_id` and only decides `--export-pack-edges`.
-    tags: Vec<(String, ObjectId, bool)>,
+    /// `active_branches`, the list's head first, and `max_active_branches`.
+    active_branches: Vec<usize>,
+    max_active_branches: u64,
+    /// `branch_load_count`.
+    branch_load_count: u64,
+    /// `first_tag` .. `last_tag`, in stream order; written under `refs/tags/`
+    /// at every checkpoint and at the end.
+    tags: Vec<Tag>,
     /// git's pack: what `store_object()` counted, and what `end_packfile()` then
     /// does with it.
     pack: PackLog,
+    /// `fi_mem_pool`, the tree-entry pool and the atom table.
+    pools: Pools,
+    /// `show_stats`: print the statistics block at the end. On by default;
+    /// `--quiet` turns it off and `--stats` back on.
+    show_stats: bool,
     /// Set when a ref update was declined; makes the process exit 1.
     failed: bool,
     /// Whether a command other than `feature`/`option` has been seen, which is
@@ -1268,6 +1499,9 @@ impl Importer {
         }
 
         self.checkpoint()?;
+        if self.show_stats {
+            self.print_stats();
+        }
         Ok(if self.failed {
             ExitCode::FAILURE
         } else {
@@ -1283,7 +1517,11 @@ impl Importer {
     fn next_command(&mut self, input: &mut Input) -> Result<Option<Vec<u8>>> {
         loop {
             let unread = input.pending.is_some();
-            let Some(line) = input.line()? else {
+            let line = match input.pending.take() {
+                Some(line) => Some(line),
+                None => input.raw_line()?,
+            };
+            let Some(line) = line else {
                 return Ok(None);
             };
             if !unread
@@ -1292,6 +1530,11 @@ impl Importer {
                 && !line.starts_with(b"option ")
             {
                 self.parse_argv()?;
+            }
+            // Recorded only once `parse_argv()` is through: a command line that
+            // dies leaves the line that triggered it out of the crash report.
+            if !unread {
+                record_command(&line);
             }
             if line.first() == Some(&b'#') {
                 continue;
@@ -1405,19 +1648,18 @@ impl Importer {
     fn apply_option(&mut self, name: &str, unset: bool, value: &str) -> Result<()> {
         match name {
             "date-format" => self.opts.date_format = date_format(value)?,
-            // Both only steer the stderr statistics block, which is not printed.
-            "stats" | "quiet" => {}
+            "stats" => self.show_stats = true,
+            // `option_quiet()`: `show_stats = 0; quiet = 1;`
+            "quiet" => self.show_stats = false,
             "force" => self.opts.force = true,
             "done" => self.opts.require_done = true,
             "max-pack-size" => option_max_pack_size(value)?,
-            "big-file-threshold" => option_big_file_threshold(value)?,
-            "depth" => option_depth(value)?,
-            "active-branches" => {
-                ulong_arg("--active-branches", value)?;
-            }
+            "big-file-threshold" => self.pack.big_file_threshold = option_big_file_threshold(value)?,
+            "depth" => self.pack.max_depth = option_depth(value)?,
+            "active-branches" => self.max_active_branches = ulong_arg("--active-branches", value)?,
             "import-marks" => self.option_import_marks(value, false, false)?,
             "import-marks-if-exists" => self.option_import_marks(value, false, true)?,
-            "export-marks" => self.opts.export_marks = Some(self.marks_path(value)),
+            "export-marks" => self.option_export_marks(value),
             "relative-marks" => self.opts.relative_marks = !unset,
             "rewrite-submodules-from" | "rewrite-submodules-to" => self.submodule_rewrite(value)?,
             "signed-commits" => self.opts.signed_commits = signed_mode("--signed-commits", value)?,
@@ -1467,7 +1709,23 @@ impl Importer {
         };
         let display = pending.path.display().to_string();
         for (mark, id) in read_mark_file(&pending.path, &display, pending.ignore_missing)? {
-            self.marks.insert(mark, id);
+            // `insert_object_entry()` (builtin/fast-import.c:1806-1820): an
+            // object the table does not hold yet must exist, and enters it as
+            // one no pack of this run holds.
+            if !self.pack.table.contains_key(&id) {
+                let Some(header) = self.repo.try_find_header(id)? else {
+                    crate::git_fatal!("object not found: {id}");
+                };
+                self.pack.table.insert(
+                    id,
+                    ObjectEntry {
+                        kind: header.kind(),
+                        pack_id: MAX_PACK_ID,
+                        depth: 0,
+                    },
+                );
+            }
+            self.insert_mark(mark, id);
         }
         self.opts.import_marks_done = true;
         Ok(())
@@ -1494,9 +1752,217 @@ impl Importer {
             .ok_or_else(|| anyhow!("expected format name:filename for submodule rewrite option"))?;
         // Parsed for its errors: a missing or corrupt marks file is the only
         // observable effect of this option until a gitlink actually appears.
-        read_mark_file(std::path::Path::new(file), file, false)?;
+        // `read_mark_file(&ms, fp, insert_oid_entry)` into a mark set of its own
+        // (builtin/fast-import.c:3796-3802): `insert_mark()` allocates its levels
+        // from the same pool and counts its slots in the same `marks_set_count`.
+        let mut ms = MarkSet::new();
+        for (mark, _) in read_mark_file(std::path::Path::new(file), file, false)? {
+            if ms.insert(&mut self.pools, mark) {
+                self.marks_set_count += 1;
+            }
+        }
         self.submodule_rewrites.push(name.to_string());
         Ok(())
+    }
+
+    /// The statistics block `cmd_fast_import()` prints on stderr unless
+    /// `--quiet` asked it not to (builtin/fast-import.c:4301-4326), and the
+    /// `pack_report()` it ends in (packfile.c:50-69).
+    ///
+    /// Every counter fast-import keeps is reproduced, the memory figures
+    /// included: they are sums of the LP64 `sizeof`s of what it allocated,
+    /// which the allocators above replay. The `pack_report` window counters
+    /// count the mmap windows `packfile.c` opened to read objects back out of
+    /// packs. This port reads objects through gitoxide's store and opens no
+    /// such window, so it reports its own zeros there.
+    fn print_stats(&self) {
+        let p = &self.pack;
+        let total: u64 = p.stored_by_type.iter().sum();
+        let duplicates: u64 = p.duplicates_by_type.iter().sum();
+        // `alloc_objects(object_entry_alloc)` at startup, and again whenever
+        // `new_object()` finds the newest block full.
+        let blocks = (p.table.len() as u64).div_ceil(OBJECT_ENTRY_ALLOC).max(1);
+        let alloc_count = blocks * OBJECT_ENTRY_ALLOC;
+        let objects_bytes = alloc_count * SIZEOF_OBJECT_ENTRY;
+        let pools_bytes = self.pools.tree_entry_allocd + self.pools.pool_alloc;
+        let rule = "---------------------------------------------------------------------";
+
+        let mut out = String::new();
+        out.push_str("fast-import statistics:\n");
+        out.push_str(rule);
+        out.push('\n');
+        out.push_str(&format!("Alloc'd objects: {alloc_count:>10}\n"));
+        out.push_str(&format!("Total objects:   {total:>10} ({duplicates:>10} duplicates                  )\n"));
+        for (label, slot) in [("blobs  ", 0), ("trees  ", 1), ("commits", 2), ("tags   ", 3)] {
+            out.push_str(&format!(
+                "      {label}:   {:>10} ({:>10} duplicates {:>10} deltas of {:>10} attempts)\n",
+                p.stored_by_type[slot],
+                p.duplicates_by_type[slot],
+                p.deltas_by_type[slot],
+                p.delta_attempts_by_type[slot],
+            ));
+        }
+        out.push_str(&format!(
+            "Total branches:  {:>10} ({:>10} loads     )\n",
+            self.branches.len(),
+            self.branch_load_count
+        ));
+        let marks = 1024u64.checked_shl(self.mark_set.shift).unwrap_or(0);
+        out.push_str(&format!("      marks:     {marks:>10} ({:>10} unique    )\n", self.marks_set_count));
+        out.push_str(&format!("      atoms:     {:>10}\n", self.pools.atoms.len()));
+        out.push_str(&format!("Memory total:    {:>10} KiB\n", (pools_bytes + objects_bytes) / 1024));
+        out.push_str(&format!("       pools:    {:>10} KiB\n", pools_bytes / 1024));
+        out.push_str(&format!("     objects:    {:>10} KiB\n", objects_bytes / 1024));
+        out.push_str(rule);
+        out.push('\n');
+
+        // `pack_report()`: the page size, then the two window settings as
+        // `prepare_repo_settings()` left them.
+        // SAFETY: `sysconf` takes an int and returns a long; no pointers involved.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let (window_size, limit) = match crate::repo_settings::RepoSettings::load(&self.repo) {
+            Ok(s) => (s.packed_git_window_size, s.packed_git_limit),
+            Err(_) => (
+                crate::repo_settings::DEFAULT_PACKED_GIT_WINDOW_SIZE,
+                crate::repo_settings::DEFAULT_PACKED_GIT_LIMIT,
+            ),
+        };
+        out.push_str(&format!("pack_report: getpagesize()            = {page_size:>10}\n"));
+        out.push_str(&format!("pack_report: core.packedGitWindowSize = {window_size:>10}\n"));
+        out.push_str(&format!("pack_report: core.packedGitLimit      = {limit:>10}\n"));
+        out.push_str(&format!("pack_report: pack_used_ctr            = {:>10}\n", 0));
+        out.push_str(&format!("pack_report: pack_mmap_calls          = {:>10}\n", 0));
+        out.push_str(&format!("pack_report: pack_open_windows        = {:>10} / {:>10}\n", 0, 0));
+        out.push_str(&format!("pack_report: pack_mapped              = {:>10} / {:>10}\n", 0, 0));
+        out.push_str(rule);
+        out.push('\n');
+        out.push('\n');
+        eprint!("{out}");
+    }
+
+    /// `write_crash_report()` (builtin/fast-import.c:353-438): the state the
+    /// failing command left behind, written to `$GIT_DIR/fast_import_crash_<pid>`
+    /// and named on stderr. The branches are listed in `branch_table` order,
+    /// all of them, under the heading git gives them.
+    fn write_crash_report(&self, err: &str) {
+        let pid = std::process::id();
+        let loc = self.repo.git_dir().join(format!("fast_import_crash_{pid}"));
+        let shown = crate::setup::git_path_display(&self.repo, &loc);
+        let mut rpt = match std::fs::File::create(&loc) {
+            Ok(f) => std::io::BufWriter::new(f),
+            Err(e) => {
+                eprintln!("error: can't write crash report {shown}: {}", strerror(&e));
+                return;
+            }
+        };
+        eprintln!("fast-import: dumping crash report to {shown}");
+
+        let null = ObjectId::null(self.repo.object_hash());
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"fast-import crash report:\n");
+        out.extend_from_slice(format!("    fast-import process: {pid}\n").as_bytes());
+        // SAFETY: `getppid` takes no arguments and cannot fail.
+        let ppid = unsafe { libc::getppid() };
+        out.extend_from_slice(format!("    parent process     : {ppid}\n").as_bytes());
+        let now = crate::date::now_seconds();
+        let iso = crate::showdate::DateMode::new(crate::showdate::DateType::Iso8601);
+        out.extend_from_slice(format!("    at {}\n", crate::showdate::show_date(now, 0, &iso, now)).as_bytes());
+        out.push(b'\n');
+
+        out.extend_from_slice(b"fatal: ");
+        out.extend_from_slice(err.as_bytes());
+        out.push(b'\n');
+
+        out.push(b'\n');
+        out.extend_from_slice(b"Most Recent Commands Before Crash\n");
+        out.extend_from_slice(b"---------------------------------\n");
+        CMD_HIST.with(|h| {
+            let h = h.borrow();
+            for (i, cmd) in h.iter().enumerate() {
+                out.extend_from_slice(if i + 1 == h.len() { b"* " } else { b"  " });
+                out.extend_from_slice(cmd);
+                out.push(b'\n');
+            }
+        });
+
+        out.push(b'\n');
+        out.extend_from_slice(b"Active Branch LRU\n");
+        out.extend_from_slice(b"-----------------\n");
+        out.extend_from_slice(
+            format!(
+                "    active_branches = {} cur, {} max\n",
+                self.active_branches.len(),
+                self.max_active_branches
+            )
+            .as_bytes(),
+        );
+        out.push(b'\n');
+        out.extend_from_slice(b"  pos  clock name\n");
+        out.extend_from_slice(b"  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+        for (lu, &idx) in self.active_branches.iter().enumerate() {
+            let b = &self.branches[idx];
+            out.extend_from_slice(format!("  {:>2}) {:>6} {}\n", lu + 1, b.last_commit, b.name).as_bytes());
+        }
+
+        out.push(b'\n');
+        out.extend_from_slice(b"Inactive Branches\n");
+        out.extend_from_slice(b"-----------------\n");
+        for idx in self.branch_table_order() {
+            // `write_branch_report()` (builtin/fast-import.c:325-351).
+            let b = &self.branches[idx];
+            out.extend_from_slice(format!("{}:\n", b.name).as_bytes());
+            out.extend_from_slice(b"  status      :");
+            if b.active {
+                out.extend_from_slice(b" active");
+            }
+            if b.tree.tree.is_some() {
+                out.extend_from_slice(b" loaded");
+            }
+            if b.tree.versions[1].oid.is_null() {
+                out.extend_from_slice(b" dirty");
+            }
+            out.push(b'\n');
+            out.extend_from_slice(format!("  tip commit  : {}\n", b.head.unwrap_or(null)).as_bytes());
+            out.extend_from_slice(format!("  old tree    : {}\n", b.tree.versions[0].oid).as_bytes());
+            out.extend_from_slice(format!("  cur tree    : {}\n", b.tree.versions[1].oid).as_bytes());
+            out.extend_from_slice(format!("  commit clock: {}\n", b.last_commit).as_bytes());
+            out.extend_from_slice(b"  last pack   : ");
+            if b.pack_id < MAX_PACK_ID {
+                out.extend_from_slice(b.pack_id.to_string().as_bytes());
+            }
+            out.push(b'\n');
+            out.push(b'\n');
+        }
+
+        if !self.tags.is_empty() {
+            out.push(b'\n');
+            out.extend_from_slice(b"Annotated Tags\n");
+            out.extend_from_slice(b"--------------\n");
+            for t in &self.tags {
+                out.extend_from_slice(format!("{} {}\n", t.oid, t.name).as_bytes());
+            }
+        }
+
+        out.push(b'\n');
+        out.extend_from_slice(b"Marks\n");
+        out.extend_from_slice(b"-----\n");
+        match &self.opts.export_marks {
+            Some(_) => {
+                out.extend_from_slice(format!("  exported to {}\n", self.opts.export_marks_shown).as_bytes());
+            }
+            None => {
+                let mut marks: Vec<_> = self.marks.iter().collect();
+                marks.sort_by_key(|(m, _)| **m);
+                for (mark, id) in marks {
+                    out.extend_from_slice(format!(":{mark} {id}\n").as_bytes());
+                }
+            }
+        }
+
+        out.push(b'\n');
+        out.extend_from_slice(b"-------------------\n");
+        out.extend_from_slice(b"END OF CRASH REPORT\n");
+        let _ = rpt.write_all(&out).and_then(|()| rpt.flush());
     }
 
     /// git's `die_nicely` path: a fatal error still writes the `--export-marks`
@@ -1512,23 +1978,41 @@ impl Importer {
     /// branch and tag state: git reads `b->pack_id`/`t->pack_id` out of the
     /// branch table and the tag list at exactly this point (`913-927`).
     fn end_packfile(&mut self) -> Result<()> {
-        let Some(pack) = self.pack.flush(&self.repo)? else {
-            // Nothing kept — `discard_pack`, or a pack `loosen_small_pack()`
-            // exploded. Either way there is no boundary to name.
+        let object_count = self.pack.ids.len();
+        let pack_id = self.pack.pack_id;
+        let kept = self.pack.flush(&self.repo)?;
+        // `/* We can't carry a delta across packfiles. */` (955-962)
+        self.pack.last_blob = LastObject::default();
+        if object_count == 0 {
+            return Ok(());
+        }
+        let Some(pack) = kept else {
+            // `loosen_small_pack()` exploded it: `invalidate_pack_id(pack_id)`
+            // (540-563) — nothing points into a pack any more.
+            for e in self.pack.table.values_mut().filter(|e| e.pack_id == pack_id) {
+                e.pack_id = MAX_PACK_ID;
+            }
+            for b in self.branches.iter_mut().filter(|b| b.pack_id == pack_id) {
+                b.pack_id = MAX_PACK_ID;
+            }
+            for t in self.tags.iter_mut().filter(|t| t.pack_id == pack_id) {
+                t.pack_id = MAX_PACK_ID;
+            }
             return Ok(());
         };
         let mut tips: Vec<ObjectId> = Vec::new();
-        for branch in &mut self.branches {
-            if std::mem::take(&mut branch.packed) {
-                tips.extend(branch.head);
+        for idx in self.branch_table_order() {
+            let b = &self.branches[idx];
+            if b.pack_id == pack_id {
+                tips.push(b.head.unwrap_or_else(|| ObjectId::null(self.repo.object_hash())));
             }
         }
-        for (_, id, packed) in &mut self.tags {
-            if std::mem::take(packed) {
-                tips.push(*id);
-            }
+        for t in self.tags.iter().filter(|t| t.pack_id == pack_id) {
+            tips.push(t.oid);
         }
-        self.pack.write_edges(&pack, &tips)
+        self.pack.write_edges(&pack, &tips)?;
+        self.pack.pack_id += 1;
+        Ok(())
     }
 
     /// Read commands until `done` or EOF. Returns whether `done` ended the stream.
@@ -1598,15 +2082,42 @@ impl Importer {
         if field(&line, b"original-oid ").is_some() {
             line = input.command()?;
         }
-        let Some(spec) = field(&line, b"data ") else {
-            crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
-        };
-        let payload = input.data(&spec)?;
-        let id = self.pack.store(&self.repo, Kind::Blob, &payload)?.0;
+        let id = self.parse_and_store_blob(input, &line)?;
         if let Some(m) = mark {
-            self.marks.insert(m, id);
+            self.insert_mark(m, id);
         }
         Ok(())
+    }
+
+    /// `parse_and_store_blob(&last_blob, …)` (builtin/fast-import.c:2071-2090)
+    /// for the `data` command in `line`: a payload above the big-file threshold
+    /// goes through `stream_blob()`, which forgets the last blob and never
+    /// deltifies; anything else is stored against `last_blob`.
+    fn parse_and_store_blob(&mut self, input: &mut Input, line: &Option<Vec<u8>>) -> Result<ObjectId> {
+        let Some(spec) = field(line, b"data ") else {
+            crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
+        };
+        // `parse_data()` returns 0 — "stream it" — only for the counted form:
+        // `if (limit && limit < len)`.
+        let limit = self.pack.big_file_threshold;
+        let streamed = !spec.starts_with(b"<<") && limit != 0 && (limit as u128) < strtoumax10(&spec) as u128;
+        let payload = input.data(&spec)?;
+        let last = match streamed {
+            true => {
+                self.pack.last_blob = LastObject::default();
+                Last::None
+            }
+            false => Last::Blob,
+        };
+        Ok(self.pack.store(&self.repo, Kind::Blob, &payload, last)?.0)
+    }
+
+    /// `insert_mark(&marks, mark, e)` (builtin/fast-import.c:571-596).
+    fn insert_mark(&mut self, mark: u64, id: ObjectId) {
+        if self.mark_set.insert(&mut self.pools, mark) {
+            self.marks_set_count += 1;
+        }
+        self.marks.insert(mark, id);
     }
 
     /// `commit <ref>` with its header block, ancestry and file changes.
@@ -1692,9 +2203,16 @@ impl Importer {
         }
         let mut parents: Vec<ObjectId> = self.branches[idx].head.into_iter().collect();
         while let Some(spec) = field(&line, b"merge ") {
-            parents.push(self.commitish(&spec)?);
+            parents.push(self.parse_merge(&spec)?);
             line = input.command()?;
         }
+
+        // `/* ensure the branch is active/loaded */`
+        if self.branches[idx].tree.tree.is_none() || self.max_active_branches == 0 {
+            self.unload_one_branch();
+            self.load_branch(idx)?;
+        }
+        let mut prev_fanout = convert_num_notes_to_fanout(self.branches[idx].notes);
 
         // File changes run until a blank line, EOF, or a line we do not own.
         while let Some(cmd) = line.clone() {
@@ -1704,8 +2222,10 @@ impl Importer {
             if after(&cmd, b"M ").is_some() {
                 self.file_modify(input, idx, &cmd)?;
             } else if let Some(v) = after(&cmd, b"D ") {
+                // `file_change_d()` (builtin/fast-import.c:2494-2501).
                 let path = unquote(v)?;
-                dir_remove(&mut self.branches[idx].tree, &path);
+                let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+                tree_content_remove(&mut g, &mut self.branches[idx].tree, &path, None, true)?;
             } else if let Some(v) = after(&cmd, b"C ") {
                 let v = v.to_vec();
                 self.file_copy(idx, &v, false)?;
@@ -1714,10 +2234,9 @@ impl Importer {
                 self.file_copy(idx, &v, true)?;
             } else if let Some(v) = after(&cmd, b"N ") {
                 let v = v.to_vec();
-                self.note_change(input, idx, &v)?;
+                self.note_change(input, idx, &v, &mut prev_fanout)?;
             } else if cmd == b"deleteall" {
-                self.branches[idx].tree = Dir::default();
-                self.branches[idx].notes = 0;
+                self.file_change_deleteall(idx)?;
             } else if let Some(v) = after(&cmd, b"ls ") {
                 let v = v.to_vec();
                 self.parse_ls(&v, Some(idx))?;
@@ -1731,7 +2250,18 @@ impl Importer {
             line = input.command()?;
         }
 
-        let tree = write_dir(&self.repo, &mut self.pack, &self.branches[idx].tree)?;
+        let new_fanout = convert_num_notes_to_fanout(self.branches[idx].notes);
+        if new_fanout != prev_fanout {
+            let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+            self.branches[idx].notes = change_note_fanout(&mut g, &mut self.branches[idx].tree, new_fanout)?;
+        }
+
+        // `/* build the tree and the commit */`
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        store_tree(&mut g, &mut self.branches[idx].tree)?;
+        let branch_tree = &mut self.branches[idx].tree;
+        branch_tree.versions[0].oid = branch_tree.versions[1].oid;
+        let tree = branch_tree.versions[1].oid;
         let mut buf = Vec::new();
         buf.extend_from_slice(format!("tree {tree}\n").as_bytes());
         for p in &parents {
@@ -1769,20 +2299,37 @@ impl Importer {
 
         // `if (!store_object(OBJ_COMMIT, &new_data, NULL, &b->oid, next_mark))
         //          b->pack_id = pack_id;` (builtin/fast-import.c:3100-3101).
-        let (id, stored) = self.pack.store(&self.repo, Kind::Commit, &buf)?;
-        self.branches[idx].head = Some(id);
-        self.branches[idx].delete = false;
-        if stored {
-            self.branches[idx].packed = true;
-        }
+        let (id, stored) = self.pack.store(&self.repo, Kind::Commit, &buf, Last::None)?;
         if let Some(m) = mark {
-            self.marks.insert(m, id);
+            self.insert_mark(m, id);
         }
+        let pack_id = self.pack.pack_id;
+        let branch = &mut self.branches[idx];
+        branch.head = Some(id);
+        branch.delete = false;
+        if stored {
+            branch.pack_id = pack_id;
+        }
+        // `b->last_commit = object_count_by_type[OBJ_COMMIT];`
+        branch.last_commit = self.pack.stored_by_type[type_slot(Kind::Commit)];
         Ok(())
     }
 
     /// `tag <name> LF mark? from original-oid? tagger? data`.
     fn parse_tag(&mut self, input: &mut Input, name: &str) -> Result<()> {
+        // `t = mem_pool_calloc(&fi_mem_pool, 1, sizeof(struct tag));` and its
+        // name, appended to the tag list before anything is read
+        // (builtin/fast-import.c:3236-3242): a tag whose command dies is still
+        // listed, with a null id, in the crash report.
+        self.pools.alloc(SIZEOF_TAG);
+        self.pools.strdup(name);
+        let slot = self.tags.len();
+        self.tags.push(Tag {
+            name: name.to_string(),
+            oid: ObjectId::null(self.repo.object_hash()),
+            pack_id: 0,
+        });
+
         let mut mark = None;
         let mut line = input.command()?;
         if let Some(v) = field(&line, b"mark :") {
@@ -1851,32 +2398,68 @@ impl Importer {
 
         // `if (store_object(OBJ_TAG, …)) t->pack_id = MAX_PACK_ID; else
         //  t->pack_id = pack_id;` (builtin/fast-import.c:3272-3275).
-        let (id, stored) = self.pack.store(&self.repo, Kind::Tag, &buf)?;
-        self.tags.push((name.to_string(), id, stored));
+        let (id, stored) = self.pack.store(&self.repo, Kind::Tag, &buf, Last::None)?;
         if let Some(m) = mark {
-            self.marks.insert(m, id);
+            self.insert_mark(m, id);
         }
+        self.tags[slot].oid = id;
+        self.tags[slot].pack_id = match stored {
+            true => self.pack.pack_id,
+            false => MAX_PACK_ID,
+        };
         Ok(())
     }
 
     /// `reset <ref> LF from? LF?`.
+    ///
+    /// `parse_reset_branch()` (builtin/fast-import.c:3317-3360): an existing
+    /// branch loses its tip and both tree versions and lets go of its loaded
+    /// tree, but stays on the active list and keeps its note count.
     fn parse_reset(&mut self, input: &mut Input, name: &str) -> Result<()> {
-        let idx = self.branch(name)?;
-        self.branches[idx].head = None;
-        self.branches[idx].tree = Dir::default();
-        self.branches[idx].notes = 0;
+        let idx = match self.by_name.get(name) {
+            Some(&idx) => {
+                let null = ObjectId::null(self.repo.object_hash());
+                let b = &mut self.branches[idx];
+                b.head = None;
+                b.tree.versions[0].oid = null;
+                b.tree.versions[1].oid = null;
+                if let Some(t) = b.tree.tree.take() {
+                    release_tree_content_recursive(&mut self.pools, t);
+                }
+                idx
+            }
+            None => self.branch(name)?,
+        };
 
         if let Some(line) = input.command()? {
             // Take an owned copy so the pushback below is not holding a borrow.
             match after(&line, b"from ").map(<[u8]>::to_vec) {
+                // `parse_objectish()` ends in `read_next_command()`, and
+                // `if (command_buf.len > 0) unread_command_buf = 1;` hands a
+                // line that is not the blank terminator back.
                 Some(from) => {
                     self.parse_from(idx, &from)?;
-                    input.skip_optional_lf()?;
+                    if let Some(next) = input.command()? {
+                        if !next.is_empty() {
+                            input.unread(next);
+                        }
+                    }
                 }
                 // The optional blank line that ends the command, or something
                 // that belongs to whoever reads next.
                 None if line.is_empty() => {}
                 None => input.unread(line),
+            }
+        }
+
+        // A `reset refs/tags/<name>` to the null id deletes the ref, and
+        // `dump_branches()` runs before `dump_tags()`, so the first tag of that
+        // name comes off the tag list or it would write the ref straight back.
+        if self.branches[idx].delete {
+            if let Some(tag_name) = self.branches[idx].name.strip_prefix("refs/tags/") {
+                if let Some(at) = self.tags.iter().position(|t| t.name == tag_name) {
+                    self.tags.remove(at);
+                }
             }
         }
         Ok(())
@@ -1931,7 +2514,7 @@ impl Importer {
             crate::git_fatal!("expected 'to' command, got {}", command_buf());
         };
         let id = self.commitish(&spec)?;
-        self.marks.insert(mark, id);
+        self.insert_mark(mark, id);
         input.command()?;
         Ok(())
     }
@@ -1955,7 +2538,7 @@ impl Importer {
         } else if let Some(arg) = feature.strip_prefix("export-marks=") {
             // git names the whole feature here, argument and all.
             self.check_unsafe_feature(feature)?;
-            self.opts.export_marks = Some(self.marks_path(arg));
+            self.option_export_marks(arg);
         } else if let Some(arg) = feature
             .strip_prefix("rewrite-submodules-to=")
             .or_else(|| feature.strip_prefix("rewrite-submodules-from="))
@@ -1993,18 +2576,22 @@ impl Importer {
         if let Some(v) = option.strip_prefix("max-pack-size=") {
             option_max_pack_size(v)?;
         } else if let Some(v) = option.strip_prefix("big-file-threshold=") {
-            option_big_file_threshold(v)?;
+            self.pack.big_file_threshold = option_big_file_threshold(v)?;
         } else if let Some(v) = option.strip_prefix("depth=") {
-            option_depth(v)?;
+            self.pack.max_depth = option_depth(v)?;
         } else if let Some(v) = option.strip_prefix("active-branches=") {
-            ulong_arg("--active-branches", v)?;
+            self.max_active_branches = ulong_arg("--active-branches", v)?;
         } else if let Some(v) = option.strip_prefix("export-pack-edges=") {
             self.option_export_pack_edges(v)?;
         } else if let Some(v) = option.strip_prefix("signed-commits=") {
             self.opts.signed_commits = signed_mode("--signed-commits", v)?;
         } else if let Some(v) = option.strip_prefix("signed-tags=") {
             self.opts.signed_tags = signed_mode("--signed-tags", v)?;
-        } else if !matches!(option, "quiet" | "stats" | "allow-unsafe-features") {
+        } else if option == "quiet" {
+            self.show_stats = false;
+        } else if option == "stats" {
+            self.show_stats = true;
+        } else if option != "allow-unsafe-features" {
             crate::git_fatal!("this version of fast-import does not support option: {option}");
         }
         Ok(())
@@ -2068,7 +2655,8 @@ impl Importer {
             && oid == ObjectId::empty_tree(self.repo.object_hash())
             && !path.is_empty()
         {
-            dir_remove(&mut self.branches[idx].tree, &path);
+            let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+            tree_content_remove(&mut g, &mut self.branches[idx].tree, &path, None, false)?;
             return Ok(());
         }
 
@@ -2080,12 +2668,16 @@ impl Importer {
         }
 
         let oid = if inline_data {
-            let dline = input.command()?;
-            let Some(spec) = field(&dline, b"data ") else {
-                crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
-            };
-            let payload = input.data(&spec)?;
-            self.pack.store(&self.repo, Kind::Blob, &payload)?.0
+            // `while (read_next_command() != EOF)`: a `cat-blob` may come
+            // between the `M` and its `data` (builtin/fast-import.c:2460-2468).
+            loop {
+                let dline = input.command()?;
+                if let Some(v) = field(&dline, b"cat-blob ") {
+                    self.cat_blob(&v)?;
+                    continue;
+                }
+                break self.parse_and_store_blob(input, &dline)?;
+            }
         } else {
             oid
         };
@@ -2136,80 +2728,153 @@ impl Importer {
             }
         }
 
-        if mode == 0o40000 {
-            let sub = load_dir(&self.repo, oid)?;
-            if path.is_empty() {
-                self.branches[idx].tree = sub;
-            } else {
-                dir_set(&mut self.branches[idx].tree, &path, Node::Dir(sub));
-            }
-        } else {
-            dir_set(&mut self.branches[idx].tree, &path, Node::Leaf { mode, oid });
+        // ```c
+        // if (!*path.buf) {
+        //         tree_content_replace(&b->branch_tree, &oid, mode, NULL);
+        //         return;
+        // }
+        // …
+        // tree_content_set(&b->branch_tree, path.buf, &oid, mode, NULL);
+        // ```
+        //
+        // A directory is set by id alone; its entries are read when something
+        // walks into it.
+        let root = &mut self.branches[idx].tree;
+        if path.is_empty() {
+            return tree_content_replace(&mut self.pools, root, oid, mode, None);
         }
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        tree_content_set(&mut g, root, &path, oid, mode, None)?;
+        Ok(())
+    }
+
+    /// `file_change_deleteall()` (builtin/fast-import.c:2622-2630).
+    fn file_change_deleteall(&mut self, idx: usize) -> Result<()> {
+        let null = ObjectId::null(self.repo.object_hash());
+        let b = &mut self.branches[idx];
+        if let Some(t) = b.tree.tree.take() {
+            release_tree_content_recursive(&mut self.pools, t);
+        }
+        b.tree.versions[0].oid = null;
+        b.tree.versions[1].oid = null;
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        load_tree(&mut g, &mut b.tree)?;
+        b.notes = 0;
         Ok(())
     }
 
     /// `C SP <src> SP <dst>` and `R SP <src> SP <dst>` (`remove_source` for `R`).
+    ///
+    /// `file_change_cr()` (builtin/fast-import.c:2503-2535): the source entry
+    /// is taken out (`R`) or copied (`C`) into a leaf, with a dirty subtree
+    /// carried along, and set at the destination — or made the root when the
+    /// destination is empty.
     fn file_copy(&mut self, idx: usize, rest: &[u8], remove_source: bool) -> Result<()> {
         let (src, dst) = split_two_paths(rest)?;
-        let node = dir_get(&self.branches[idx].tree, &src)
-            .cloned()
-            .ok_or_else(|| anyhow!("Path {} not in branch", String::from_utf8_lossy(&src)))?;
-        if remove_source {
-            dir_remove(&mut self.branches[idx].tree, &src);
+        let mut leaf = TreeEntry::detached(self.repo.object_hash(), 0);
+        let root = &mut self.branches[idx].tree;
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        match remove_source {
+            true => tree_content_remove(&mut g, root, &src, Some(&mut leaf), true)?,
+            false => tree_content_get(&mut g, root, &src, &mut leaf, true)?,
+        };
+        if leaf.versions[1].mode == 0 {
+            crate::git_fatal!("path {} not in branch", String::from_utf8_lossy(&src));
         }
+        let subtree = leaf.tree.take();
         if dst.is_empty() {
-            match node {
-                Node::Dir(d) => self.branches[idx].tree = d,
-                Node::Leaf { .. } => crate::git_fatal!("Path {} is not a tree", String::from_utf8_lossy(&src)),
-            }
-        } else {
-            dir_set(&mut self.branches[idx].tree, &dst, node);
+            return tree_content_replace(g.pools, root, leaf.versions[1].oid, leaf.versions[1].mode, subtree);
         }
+        tree_content_set(&mut g, root, &dst, leaf.versions[1].oid, leaf.versions[1].mode, subtree)?;
         Ok(())
     }
 
     /// `N SP <dataref> SP <commit-ish>` or `N SP inline SP <commit-ish>` + data.
-    fn note_change(&mut self, input: &mut Input, idx: usize, rest: &[u8]) -> Result<()> {
-        let (oid, target) = if let Some(after_inline) = after(rest, b"inline ") {
-            let target = after_inline.to_vec();
-            let line = input.command()?;
-            let Some(spec) = field(&line, b"data ") else {
-                crate::git_fatal!("expected 'data n' command, found: {}", command_buf());
-            };
-            let payload = input.data(&spec)?;
-            (self.pack.store(&self.repo, Kind::Blob, &payload)?.0, target)
+    ///
+    /// `note_change_n()` (builtin/fast-import.c:2537-2620). A branch whose note
+    /// count is still unknown has its notes counted first, in
+    /// `change_note_fanout()`'s counting mode; the note is then removed from
+    /// the path the old fanout gives it and set at the one the new count gives.
+    /// The fanout of the notes already there is fixed up once the commit's
+    /// changes are all read.
+    fn note_change(&mut self, input: &mut Input, idx: usize, rest: &[u8], old_fanout: &mut u8) -> Result<()> {
+        if self.branches[idx].notes == 0 && *old_fanout == 0 {
+            let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+            let notes = change_note_fanout(&mut g, &mut self.branches[idx].tree, 0xff)?;
+            self.branches[idx].notes = notes;
+            *old_fanout = convert_num_notes_to_fanout(notes);
+        }
+
+        // `<dataref>` or `inline`.
+        let (inline_data, oid, oe, target) = if let Some(after_inline) = after(rest, b"inline ") {
+            (true, ObjectId::null(self.repo.object_hash()), None, after_inline.to_vec())
         } else {
             let (oid, target) = self.dataref_space(rest, "SHA1")?;
-            (oid, target.to_vec())
+            (false, oid, self.pack.table.get(&oid).copied(), target.to_vec())
         };
-        let commit = self.commitish(&target)?;
-        let hex = commit.to_string().into_bytes();
 
-        // Drop any existing note for this commit, wherever its fanout put it.
-        for fanout in 0..=19usize {
-            let path = note_path(&hex, fanout);
-            if dir_get(&self.branches[idx].tree, &path).is_some() {
-                let branch = &mut self.branches[idx];
-                dir_remove(&mut branch.tree, &path);
-                branch.notes = branch.notes.saturating_sub(1);
-                break;
+        // `<commit-ish>`.
+        let text = utf8(&target, "commit-ish")?;
+        let commit = if let Some(&s) = self.by_name.get(&text) {
+            match self.branches[s].head {
+                Some(id) => id,
+                None => crate::git_fatal!("can't add a note on empty branch."),
             }
-        }
+        } else if let Some(v) = target.strip_prefix(b":") {
+            let mark = parse_mark_ref_eol(v)?;
+            let id = self.find_mark(mark)?;
+            if self.pack.table.get(&id).map(|e| e.kind) != Some(Kind::Commit) {
+                crate::git_fatal!("mark :{mark} not a commit");
+            }
+            id
+        } else {
+            let Some(id) = self.get_oid(&text) else {
+                crate::git_fatal!("invalid ref name or SHA1 expression: {text}");
+            };
+            // `odb_read_object_peeled(…, OBJ_COMMIT, …)`.
+            match self.repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
+                Some(commit) => commit.id,
+                None => crate::git_fatal!("not a valid commit: {text}"),
+            }
+        };
 
-        let notes = self.branches[idx].notes + 1;
-        if notes > 255 {
-            bail!(
-                "notes ref would hold {notes} notes, which makes git re-fan-out the whole \
-                 notes tree; that rebalancing is not ported"
-            );
+        let oid = if inline_data {
+            let line = input.command()?;
+            self.parse_and_store_blob(input, &line)?
+        } else {
+            match oe {
+                Some(oe) if oe.kind != Kind::Blob => {
+                    crate::git_fatal!("not a blob (actually a {}): {}", oe.kind, command_buf())
+                }
+                Some(_) => {}
+                None if oid.is_null() => {}
+                None => match self.repo.try_find_header(oid)? {
+                    None => crate::git_fatal!("blob not found: {}", command_buf()),
+                    Some(h) if h.kind() != Kind::Blob => {
+                        crate::git_fatal!("not a blob (actually a {}): {}", h.kind(), command_buf())
+                    }
+                    Some(_) => {}
+                },
+            }
+            oid
+        };
+
+        let rawsz = self.repo.object_hash().len_in_bytes();
+        let hex = commit.to_string().into_bytes();
+        let path = construct_path_with_fanout(&hex, *old_fanout, rawsz)?;
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        let b = &mut self.branches[idx];
+        if tree_content_remove(&mut g, &mut b.tree, &path, None, false)? {
+            b.notes = b.notes.wrapping_sub(1);
         }
-        self.branches[idx].notes = notes;
-        dir_set(
-            &mut self.branches[idx].tree,
-            &note_path(&hex, 0),
-            Node::Leaf { mode: 0o100644, oid },
-        );
+        if oid.is_null() {
+            // Nothing to insert: the note is deleted.
+            return Ok(());
+        }
+        b.notes += 1;
+        let new_fanout = convert_num_notes_to_fanout(b.notes);
+        let path = construct_path_with_fanout(&hex, new_fanout, rawsz)?;
+        tree_content_set(&mut g, &mut b.tree, &path, oid, S_IFREG | 0o644, None)?;
         Ok(())
     }
 
@@ -2242,59 +2907,127 @@ impl Importer {
         if header.kind() != Kind::Blob {
             crate::git_fatal!("object {oid} is a {} but a blob was expected.", header.kind());
         }
-        let object = self.repo.find_object(oid)?;
-        let mut out = format!("{oid} blob {}\n", object.data.len()).into_bytes();
-        out.extend_from_slice(&object.data);
+        let data = self.repo.find_object(oid)?.data.clone();
+        let mut out = format!("{oid} blob {}\n", data.len()).into_bytes();
+        out.extend_from_slice(&data);
         out.push(b'\n');
-        // `object` borrows `self.repo`; release it before taking `&mut self`.
-        drop(object);
-        self.respond(&out)
+        self.respond(&out)?;
+        // A blob of the pack being written becomes the next blob's delta base
+        // (builtin/fast-import.c:3416-3421).
+        if let Some(oe) = self.pack.table.get(&oid).copied().filter(|oe| oe.pack_id == self.pack.pack_id) {
+            self.pack.last_blob = LastObject { data, depth: oe.depth };
+        }
+        Ok(())
     }
 
     /// `ls [<dataref> SP] <path>` → an `ls-tree` line, or `missing <path>`.
+    ///
+    /// `parse_ls()` (builtin/fast-import.c:3609-3644): a quoted path reads the
+    /// commit's own tree; a tree-ish is peeled into a root entry of its own. A
+    /// directory still being built is stored first, so its id can be printed.
     fn parse_ls(&mut self, rest: &[u8], branch: Option<usize>) -> Result<()> {
-        let (root, path) = if rest.first() == Some(&b'"') {
-            let idx = branch.ok_or_else(|| anyhow!("Not in a commit: ls"))?;
-            (self.branches[idx].tree.clone(), unquote(rest)?)
+        let hash = self.repo.object_hash();
+        let (mut own_root, path) = if rest.first() == Some(&b'"') {
+            if branch.is_none() {
+                crate::git_fatal!("not in a commit: {}", command_buf());
+            }
+            (None, unquote(rest)?)
         } else {
             // `parse_ls()` takes the tree-ish through `parse_mark_ref_space()`
             // for a mark (builtin/fast-import.c:3518), so a mark with trailing
             // junk is `missing space after mark`, not `garbage after mark`.
             let (oid, rest) = self.dataref_space(rest, "tree-ish")?;
-            let tree = self.repo.find_object(oid)?.peel_to_tree()?.id;
-            (load_dir(&self.repo, tree)?, unquote(rest)?)
+            let tree = self.parse_treeish(oid)?;
+            // `root = new_tree_entry(); …; load_tree(root);`
+            self.pools.new_tree_entry();
+            let mut root = TreeEntry::detached(hash, 0);
+            root.versions[1].oid = tree;
+            if !tree.is_null() {
+                root.versions[1].mode = S_IFDIR;
+            }
+            let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+            load_tree(&mut g, &mut root)?;
+            (Some(root), unquote(rest)?)
         };
 
-        let line = if path.is_empty() {
-            let oid = write_dir(&self.repo, &mut self.pack, &root)?;
-            let mut l = format!("040000 tree {oid}\t").into_bytes();
-            l.push(b'\n');
-            l
-        } else {
-            match dir_get(&root, &path) {
-                None => {
-                    let mut l = b"missing ".to_vec();
-                    l.extend_from_slice(&path);
-                    l.push(b'\n');
-                    l
-                }
-                Some(Node::Leaf { mode, oid }) => {
-                    let kind = if *mode == 0o160000 { "commit" } else { "blob" };
-                    let mut l = format!("{mode:06o} {kind} {oid}\t").into_bytes();
-                    l.extend_from_slice(&path);
-                    l.push(b'\n');
-                    l
-                }
-                Some(Node::Dir(d)) => {
-                    let oid = write_dir(&self.repo, &mut self.pack, d)?;
-                    let mut l = format!("040000 tree {oid}\t").into_bytes();
-                    l.extend_from_slice(&path);
-                    l.push(b'\n');
-                    l
-                }
+        let mut leaf = TreeEntry::detached(hash, 0);
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        let root = match (&mut own_root, branch) {
+            (Some(root), _) => root,
+            (None, Some(idx)) => &mut self.branches[idx].tree,
+            (None, None) => unreachable!("refused above"),
+        };
+        tree_content_get(&mut g, root, &path, &mut leaf, true)?;
+        // `A directory in preparation would have a sha1 of zero until it is
+        // saved.  Save, for simplicity.`
+        if s_isdir(leaf.versions[1].mode) {
+            store_tree(&mut g, &mut leaf)?;
+        }
+
+        // `print_ls()` (builtin/fast-import.c:3584-3607).
+        let mode = leaf.versions[1].mode;
+        let mut line = match mode {
+            0 => b"missing ".to_vec(),
+            _ => {
+                let kind = match mode & S_IFMT {
+                    0o160000 => "commit",
+                    S_IFDIR => "tree",
+                    _ => "blob",
+                };
+                format!("{:06o} {kind} {}\t", mode & !NO_DELTA, leaf.versions[1].oid).into_bytes()
             }
         };
+        line.extend_from_slice(&crate::quote::quoted_name_bytes(&path));
+        line.push(b'\n');
+
+        if let Some(t) = leaf.tree.take() {
+            release_tree_content_recursive(&mut self.pools, t);
+        }
+        if let Some(root) = own_root {
+            release_tree_entry(&mut self.pools, root);
+        }
         self.respond(&line)
+    }
+
+    /// `parse_treeish_dataref()`'s peel (builtin/fast-import.c:3440-3502,
+    /// 3558-3582): commits and tags are dereferenced one layer at a time until
+    /// a tree is reached, and an object the table did not know is entered into
+    /// it on the way.
+    fn parse_treeish(&mut self, mut oid: ObjectId) -> Result<ObjectId> {
+        loop {
+            let kind = match self.pack.table.get(&oid) {
+                Some(e) => e.kind,
+                None => {
+                    // `dereference()`: `/* cache it! */`
+                    let Some(header) = self.repo.try_find_header(oid)? else {
+                        crate::git_fatal!("object not found: {oid}");
+                    };
+                    let kind = header.kind();
+                    self.pack.table.insert(oid, ObjectEntry { kind, pack_id: MAX_PACK_ID, depth: 0 });
+                    kind
+                }
+            };
+            let hexsz = oid.kind().len_in_hex();
+            let (prefix, what) = match kind {
+                Kind::Tree => return Ok(oid),
+                Kind::Commit => (&b"tree "[..], "commit"),
+                Kind::Tag => (&b"object "[..], "tag"),
+                Kind::Blob => crate::git_fatal!("not a tree-ish: {}", command_buf()),
+            };
+            let Ok(object) = self.repo.find_object(oid) else {
+                crate::git_fatal!("can't load object {oid}");
+            };
+            // The id is read at a fixed offset, past `tree ` or `object `, as
+            // `get_oid_hex(buf + strlen("tree "), oid)` reads it.
+            let peeled = object
+                .data
+                .get(prefix.len()..prefix.len() + hexsz)
+                .and_then(|hex| ObjectId::from_hex(hex).ok());
+            match peeled {
+                Some(next) => oid = next,
+                None => crate::git_fatal!("invalid SHA1 in {what}: {}", command_buf()),
+            }
+        }
     }
 
     /// Write a query response to `--cat-blob-fd`, or stdout when unset.
@@ -2328,57 +3061,175 @@ impl Importer {
         if !refname_ok_onelevel(name) {
             crate::git_fatal!("branch name doesn't conform to Git standards: {name}");
         }
+        // `new_branch()` (builtin/fast-import.c:647-667).
+        self.pools.alloc(SIZEOF_BRANCH);
+        self.pools.strdup(name);
         let idx = self.branches.len();
         self.branches.push(Branch {
             name: name.to_string(),
             head: None,
-            tree: Dir::default(),
-            delete: false,
+            tree: TreeEntry::detached(self.repo.object_hash(), S_IFDIR),
+            last_commit: 0,
             notes: 0,
-            packed: false,
+            active: false,
+            delete: false,
+            pack_id: MAX_PACK_ID,
         });
         self.by_name.insert(name.to_string(), idx);
         Ok(idx)
     }
 
+    /// The branches in `branch_table` order: by `hc_str(name) % branch_table_sz`
+    /// bucket, the most recently created first within a bucket
+    /// (builtin/fast-import.c:565-570, 647-667). `dump_branches()`, the pack
+    /// edges and the crash report all walk the table this way.
+    fn branch_table_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.branches.len()).collect();
+        order.sort_by_key(|&idx| (hc_str(self.branches[idx].name.as_bytes()) % BRANCH_TABLE_SZ, std::cmp::Reverse(idx)));
+        order
+    }
+
+    /// `unload_one_branch()` (builtin/fast-import.c:2097-2130): while the
+    /// active list is full, drop the branch with the oldest commit clock — the
+    /// first such on the list — and let go of its tree.
+    fn unload_one_branch(&mut self) {
+        while !self.active_branches.is_empty() && self.active_branches.len() as u64 >= self.max_active_branches {
+            let mut min_commit = u64::MAX;
+            let mut at = 0;
+            for (pos, &idx) in self.active_branches.iter().enumerate() {
+                if self.branches[idx].last_commit < min_commit {
+                    at = pos;
+                    min_commit = self.branches[idx].last_commit;
+                }
+            }
+            let idx = self.active_branches.remove(at);
+            let e = &mut self.branches[idx];
+            e.active = false;
+            if let Some(t) = e.tree.tree.take() {
+                release_tree_content_recursive(&mut self.pools, t);
+            }
+        }
+    }
+
+    /// `load_branch()` (builtin/fast-import.c:2132-2142).
+    fn load_branch(&mut self, idx: usize) -> Result<()> {
+        let mut g = Ctx { repo: &self.repo, pack: &mut self.pack, pools: &mut self.pools };
+        load_tree(&mut g, &mut self.branches[idx].tree)?;
+        if !self.branches[idx].active {
+            self.branches[idx].active = true;
+            self.active_branches.insert(0, idx);
+            self.branch_load_count += 1;
+        }
+        Ok(())
+    }
+
     /// Apply a `from <commit-ish>` to branch `idx`: adopt its tip and its tree.
+    ///
+    /// `parse_objectish()` (builtin/fast-import.c:2654-2697): another branch
+    /// lends its tip and its stored tree id; a mark, its commit; anything else
+    /// `get_oid()` resolves, the commit it peels to. Only the tree's id is
+    /// taken — a loaded tree that no longer matches it is let go and read again
+    /// when the commit needs it.
     fn parse_from(&mut self, idx: usize, spec: &[u8]) -> Result<()> {
         let text = utf8(spec, "commit-ish")?;
+        let saved = self.branches[idx].tree.versions[1].oid;
 
-        // A branch already in the table contributes its in-memory tree directly.
-        if let Some(&other) = self.by_name.get(&text) {
-            if other == idx {
-                crate::git_fatal!("Can't create a branch from itself: {}", self.branches[idx].name);
+        if let Some(&s) = self.by_name.get(&text) {
+            if s == idx {
+                crate::git_fatal!("can't create a branch from itself: {}", self.branches[idx].name);
             }
-            let (head, tree, notes) = {
-                let src = &self.branches[other];
-                (src.head, src.tree.clone(), src.notes)
-            };
-            let dst = &mut self.branches[idx];
-            dst.head = head;
-            dst.tree = tree;
-            dst.notes = notes;
-            dst.delete = false;
-            return Ok(());
+            let (head, t) = (self.branches[s].head, self.branches[s].tree.versions[1].oid);
+            let b = &mut self.branches[idx];
+            b.head = head;
+            b.tree.versions[0].oid = t;
+            b.tree.versions[1].oid = t;
+        } else if let Some(v) = spec.strip_prefix(b":") {
+            let mark = parse_mark_ref_eol(v)?;
+            let id = self.find_mark(mark)?;
+            if self.pack.table.get(&id).map(|e| e.kind) != Some(Kind::Commit) {
+                crate::git_fatal!("mark :{mark} not a commit");
+            }
+            if self.branches[idx].head != Some(id) {
+                self.branches[idx].head = Some(id);
+                self.parse_from_existing(idx)?;
+            }
+        } else if let Some(id) = self.get_oid(&text) {
+            self.branches[idx].head = (!id.is_null()).then_some(id);
+            self.parse_from_existing(idx)?;
+            if id.is_null() {
+                self.branches[idx].delete = true;
+            }
+        } else {
+            crate::git_fatal!("invalid ref name or SHA1 expression: {text}");
         }
 
-        let id = self.commitish_allow_null(spec)?;
-        if id.is_null() {
-            self.branches[idx].head = None;
-            self.branches[idx].tree = Dir::default();
-            self.branches[idx].notes = 0;
-            self.branches[idx].delete = true;
-            return Ok(());
+        let b = &mut self.branches[idx];
+        if b.tree.tree.is_some() && saved != b.tree.versions[1].oid {
+            if let Some(t) = b.tree.tree.take() {
+                release_tree_content_recursive(&mut self.pools, t);
+            }
         }
-        let tree = self.repo.find_object(id)?.peel_to_commit()?.tree_id()?.detach();
-        let tree = load_dir(&self.repo, tree)?;
-        let notes = count_notes(&tree, &mut Vec::new());
-        let dst = &mut self.branches[idx];
-        dst.head = Some(id);
-        dst.tree = tree;
-        dst.notes = notes;
-        dst.delete = false;
         Ok(())
+    }
+
+    /// `parse_from_existing()` and `parse_from_commit()`
+    /// (builtin/fast-import.c:2632-2652): both tree versions become the tree of
+    /// the commit the tip peels to, and the tip becomes that commit.
+    fn parse_from_existing(&mut self, idx: usize) -> Result<()> {
+        let null = ObjectId::null(self.repo.object_hash());
+        let Some(id) = self.branches[idx].head else {
+            self.branches[idx].tree.versions[0].oid = null;
+            self.branches[idx].tree.versions[1].oid = null;
+            return Ok(());
+        };
+        let peeled = self.repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok());
+        let Some(commit) = peeled else {
+            crate::git_fatal!("not a valid commit: {id}");
+        };
+        let Ok(tree) = commit.tree_id() else {
+            crate::git_fatal!("the commit {} is corrupt", commit.id);
+        };
+        let b = &mut self.branches[idx];
+        b.head = Some(commit.id);
+        b.tree.versions[0].oid = tree.detach();
+        b.tree.versions[1].oid = b.tree.versions[0].oid;
+        Ok(())
+    }
+
+    /// `parse_merge()` (builtin/fast-import.c:2717-2749) for one `merge` line:
+    /// a branch's tip as it stands, a mark's commit, or the commit anything
+    /// else peels to.
+    fn parse_merge(&mut self, spec: &[u8]) -> Result<ObjectId> {
+        let text = utf8(spec, "commit-ish")?;
+        if let Some(&s) = self.by_name.get(&text) {
+            return Ok(self.branches[s].head.unwrap_or_else(|| ObjectId::null(self.repo.object_hash())));
+        }
+        if let Some(v) = spec.strip_prefix(b":") {
+            let mark = parse_mark_ref_eol(v)?;
+            let id = self.find_mark(mark)?;
+            if self.pack.table.get(&id).map(|e| e.kind) != Some(Kind::Commit) {
+                crate::git_fatal!("mark :{mark} not a commit");
+            }
+            return Ok(id);
+        }
+        let Some(id) = self.get_oid(&text) else {
+            crate::git_fatal!("invalid ref name or SHA1 expression: {text}");
+        };
+        match self.repo.find_object(id).ok().and_then(|o| o.peel_to_commit().ok()) {
+            Some(commit) => Ok(commit.id),
+            None => crate::git_fatal!("not a valid commit: {text}"),
+        }
+    }
+
+    /// `repo_get_oid()` for a commit-ish that is neither a branch of the
+    /// stream nor a mark: a full hex id as it is, or any revision expression.
+    fn get_oid(&self, text: &str) -> Option<ObjectId> {
+        if text.len() == self.repo.object_hash().len_in_hex() {
+            if let Ok(id) = ObjectId::from_hex(text.as_bytes()) {
+                return Some(id);
+            }
+        }
+        self.repo.rev_parse_single(text).ok().map(|id| id.detach())
     }
 
     /// Resolve a `<commit-ish>`: a mark, a branch, or any revision expression.
@@ -2606,6 +3457,18 @@ impl Importer {
         }
     }
 
+    /// `option_export_marks()` (builtin/fast-import.c:3758-3763).
+    fn option_export_marks(&mut self, marks: &str) {
+        self.opts.export_marks = Some(self.marks_path(marks));
+        self.opts.export_marks_shown = match self.opts.relative_marks && !std::path::Path::new(marks).is_absolute() {
+            true => {
+                let path = self.repo.git_dir().join("info").join("fast-import").join(marks);
+                crate::setup::git_path_display(&self.repo, &path)
+            }
+            false => crate::setup::prefix_filename(crate::setup::startup_prefix(&self.repo).as_deref(), marks),
+        };
+    }
+
     /// `dump_marks()`: write out the mark table, ascending by mark number.
     ///
     /// It declines while an import file is named but no marks file has been
@@ -2649,11 +3512,12 @@ impl Importer {
     /// that just closed rather than of the one the next command opens.
     fn checkpoint(&mut self) -> Result<()> {
         self.end_packfile()?;
-        for i in 0..self.branches.len() {
-            self.update_branch(i)?;
+        for idx in self.branch_table_order() {
+            self.update_branch(idx)?;
         }
-        for (name, id, _) in std::mem::take(&mut self.tags) {
-            let full = format!("refs/tags/{name}");
+        // `dump_tags()` writes every tag of the run, at every checkpoint.
+        for i in 0..self.tags.len() {
+            let (full, id) = (format!("refs/tags/{}", self.tags[i].name), self.tags[i].oid);
             let old = self.current(&full)?;
             self.write_ref(&full, id, old)?;
         }
@@ -3003,165 +3867,825 @@ fn read_mark_file(
 }
 
 // ---------------------------------------------------------------------------
-// Tree model
+// git's in-memory trees
 // ---------------------------------------------------------------------------
+//
+// A port of the tree half of builtin/fast-import.c: `struct tree_entry` with its
+// two versions, `struct tree_content`, and the functions that load, edit and
+// store them (657-1615). Version 0 is the tree as it was last stored or
+// loaded, version 1 the tree as the stream has made it; a null version-1 id is
+// "dirty", a version-1 mode of 0 is "deleted, still needed for the old tree".
+// Subtrees are read lazily, the first time a path walks into them. The shape
+// matters beyond the ids it produces: which trees are stored, which of them git
+// tried to deltify against their old version, which names it interned, and how
+// many entries and contents it allocated are all printed by the statistics
+// block, and the loaded/dirty state of each branch by the crash report.
 
-/// Read an existing tree object into the in-memory model, recursively.
-fn load_dir(repo: &gix::Repository, oid: ObjectId) -> Result<Dir> {
-    let tree = repo.find_object(oid)?.peel_to_tree()?;
-    let entries: Vec<(u32, Vec<u8>, ObjectId)> = tree
-        .decode()?
-        .entries
-        .iter()
-        .map(|e| (mode_of(e.mode.kind()), e.filename.to_vec(), e.oid.to_owned()))
-        .collect();
+/// `S_IFMT`, `S_IFDIR` and `S_IFREG` as git's `cache.h` spells them.
+const S_IFMT: u32 = 0o170000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFREG: u32 = 0o100000;
+/// `#define NO_DELTA S_ISUID` (builtin/fast-import.c:40-43): set on a
+/// version-0 directory mode whose old tree can no longer be a delta base.
+const NO_DELTA: u32 = 0o4000;
+/// `MAX_PACK_ID` (builtin/fast-import.c:35-36): "in no pack this run wrote".
+const MAX_PACK_ID: u32 = (1 << 16) - 1;
 
-    let mut dir = Dir::default();
-    for (mode, name, oid) in entries {
-        let node = if mode == 0o40000 {
-            Node::Dir(load_dir(repo, oid)?)
+fn s_isdir(mode: u32) -> bool {
+    mode & S_IFMT == S_IFDIR
+}
+
+/// `struct atom_str`: an interned path component.
+type Atom = std::rc::Rc<[u8]>;
+
+/// One `struct object_entry` of git's object table, reduced to what is read
+/// back out of it.
+#[derive(Clone, Copy)]
+struct ObjectEntry {
+    kind: Kind,
+    /// `pack_id`: the pack it was stored into, or [`MAX_PACK_ID`].
+    pack_id: u32,
+    /// `depth`: its delta chain length in that pack.
+    depth: u32,
+}
+
+/// `struct last_object`: the object the next one of its kind is deltified
+/// against.
+#[derive(Default)]
+struct LastObject {
+    data: Vec<u8>,
+    depth: u32,
+}
+
+/// Which `struct last_object` a [`PackLog::store`] call passes.
+enum Last<'a> {
+    None,
+    /// `&last_blob`.
+    Blob,
+    /// A tree's old version, built by `store_tree()`.
+    Tree(&'a mut LastObject),
+}
+
+/// The index of an object type in git's `*_count_by_type[]` arrays, in the
+/// order the statistics block prints them.
+fn type_slot(kind: Kind) -> usize {
+    match kind {
+        Kind::Blob => 0,
+        Kind::Tree => 1,
+        Kind::Commit => 2,
+        Kind::Tag => 3,
+    }
+}
+
+/// `struct tree_entry_ms`.
+#[derive(Clone, Copy)]
+struct Version {
+    mode: u32,
+    oid: ObjectId,
+}
+
+/// `struct tree_entry`.
+struct TreeEntry {
+    /// `tree`: the loaded content, or `None` until something walks into it.
+    tree: Option<Box<TreeContent>>,
+    name: Atom,
+    versions: [Version; 2],
+}
+
+impl TreeEntry {
+    /// A `struct tree_entry` git keeps outside the entry pool: a branch's
+    /// `branch_tree`, or the `leaf` a caller zeroes on its stack.
+    fn detached(hash: gix::hash::Kind, mode: u32) -> TreeEntry {
+        let null = ObjectId::null(hash);
+        TreeEntry {
+            tree: None,
+            name: Atom::from(&[][..]),
+            versions: [Version { mode, oid: null }, Version { mode, oid: null }],
+        }
+    }
+}
+
+/// `struct tree_content`.
+struct TreeContent {
+    entry_capacity: u32,
+    delta_depth: u32,
+    /// `entries[0 .. entry_count]`.
+    entries: Vec<TreeEntry>,
+}
+
+/// `GIT_MAX_ALIGNMENT` on the LP64 platforms git and this port build for.
+const MAX_ALIGNMENT: u64 = 8;
+/// `sizeof(struct mp_block)`: three pointers ahead of the flexible array.
+const MP_BLOCK: u64 = 24;
+/// `fi_mem_pool.block_alloc` (builtin/fast-import.c:194-196).
+const POOL_BLOCK_ALLOC: u64 = 2 * 1024 * 1024 - MP_BLOCK;
+/// `tree_entry_alloc` (builtin/fast-import.c:230).
+const TREE_ENTRY_ALLOC: u64 = 1000;
+/// `avail_tree_table_sz` (builtin/fast-import.c:232).
+const AVAIL_TREE_TABLE_SZ: u32 = 100;
+/// `sizeof` of the structures fast-import allocates, on LP64: a 36-byte
+/// `struct object_id` (`GIT_MAX_RAWSZ` + the `algo` int) aligned to 4, and
+/// pointers and `uintmax_t` aligned to 8.
+const SIZEOF_TREE_ENTRY: u64 = 96;
+const SIZEOF_TREE_CONTENT: u64 = 16;
+const SIZEOF_ATOM_STR: u64 = 16;
+const SIZEOF_BRANCH: u64 = 176;
+const SIZEOF_TAG: u64 = 56;
+const SIZEOF_MARK_SET: u64 = 8200;
+const SIZEOF_RECENT_COMMAND: u64 = 24;
+const SIZEOF_OBJECT_ENTRY: u64 = 72;
+/// `object_entry_alloc` (builtin/fast-import.c:213).
+const OBJECT_ENTRY_ALLOC: u64 = 5000;
+/// `cmd_save` (builtin/fast-import.c:258).
+const CMD_SAVE: usize = 100;
+
+/// fast-import's allocators, as the statistics block measures them:
+/// `fi_mem_pool` (mem-pool.c:83-104), the tree-entry free list
+/// (builtin/fast-import.c:728-752), the `avail_tree_table` that recycles tree
+/// contents by capacity (677-726), and the atom table (617-632).
+struct Pools {
+    /// `fi_mem_pool.pool_alloc`.
+    pool_alloc: u64,
+    /// `end - next_free` of the pool's head block; `None` before the first
+    /// block.
+    head_free: Option<u64>,
+    /// `tree_entry_allocd`.
+    tree_entry_allocd: u64,
+    /// Entries handed out by `new_tree_entry()` and not yet released.
+    entries_live: u64,
+    /// Entries allocated in all, live or on the free list.
+    entries_capacity: u64,
+    /// `avail_tree_table[]`: per bucket, the released capacities, the list's
+    /// head last.
+    avail_tree_table: Vec<Vec<u32>>,
+    /// `atom_table`; its length is `atom_cnt`.
+    atoms: HashMap<Vec<u8>, Atom>,
+    /// `fspathncmp()` is `strncasecmp()` under `core.ignorecase`.
+    ignore_case: bool,
+}
+
+impl Pools {
+    fn new() -> Pools {
+        Pools {
+            pool_alloc: 0,
+            head_free: None,
+            tree_entry_allocd: 0,
+            entries_live: 0,
+            entries_capacity: 0,
+            avail_tree_table: vec![Vec::new(); AVAIL_TREE_TABLE_SZ as usize],
+            atoms: HashMap::new(),
+            ignore_case: false,
+        }
+    }
+
+    /// `mem_pool_alloc(&fi_mem_pool, len)` (mem-pool.c:83-104): carve `len`,
+    /// rounded up to the alignment, out of the head block, or start a new block
+    /// — a block of its own, linked behind the head, for a request of half a
+    /// block or more.
+    fn alloc(&mut self, len: u64) {
+        let len = len.div_ceil(MAX_ALIGNMENT) * MAX_ALIGNMENT;
+        if let Some(free) = self.head_free.filter(|free| *free >= len) {
+            self.head_free = Some(free - len);
+            return;
+        }
+        if len >= POOL_BLOCK_ALLOC / 2 {
+            self.pool_alloc += MP_BLOCK + len;
+            self.head_free.get_or_insert(0);
         } else {
-            Node::Leaf { mode, oid }
-        };
-        dir.entries.insert(name, node);
+            self.pool_alloc += MP_BLOCK + POOL_BLOCK_ALLOC;
+            self.head_free = Some(POOL_BLOCK_ALLOC - len);
+        }
     }
-    Ok(dir)
-}
 
-/// Serialize the model back into tree objects, skipping directories that ended
-/// up empty — git never records an empty tree as an entry, which is what makes a
-/// delete cascade up through its now-empty parents.
-fn write_dir(repo: &gix::Repository, pack: &mut PackLog, dir: &Dir) -> Result<ObjectId> {
-    let mut items: Vec<(&[u8], u32, ObjectId)> = Vec::new();
-    for (name, node) in &dir.entries {
-        match node {
-            Node::Leaf { mode, oid } => items.push((name.as_slice(), *mode, *oid)),
-            Node::Dir(sub) => {
-                let oid = write_dir(repo, pack, sub)?;
-                if oid == ObjectId::empty_tree(repo.object_hash()) {
-                    continue;
-                }
-                items.push((name.as_slice(), 0o40000, oid));
+    /// `mem_pool_strdup()`: the string and its NUL.
+    fn strdup(&mut self, s: &str) {
+        self.alloc(s.len() as u64 + 1);
+    }
+
+    /// `new_tree_entry()` (builtin/fast-import.c:728-746): the free list grows
+    /// by `tree_entry_alloc` entries only when it is empty.
+    fn new_tree_entry(&mut self) {
+        if self.entries_live == self.entries_capacity {
+            self.entries_capacity += TREE_ENTRY_ALLOC;
+            self.tree_entry_allocd += TREE_ENTRY_ALLOC * SIZEOF_TREE_ENTRY;
+        }
+        self.entries_live += 1;
+    }
+
+    /// `new_tree_content()` (builtin/fast-import.c:677-704): the first released
+    /// content of at least `cnt` entries in its bucket, or a pool allocation
+    /// rounded up to a multiple of 8 entries.
+    fn new_tree_content(&mut self, cnt: u32) -> Box<TreeContent> {
+        let list = &mut self.avail_tree_table[hc_entries(cnt) as usize];
+        let entry_capacity = match list.iter().rposition(|capacity| *capacity >= cnt) {
+            Some(at) => list.remove(at),
+            None => {
+                let cnt = if cnt & 7 != 0 { (cnt / 8 + 1) * 8 } else { cnt };
+                self.alloc(SIZEOF_TREE_CONTENT + 8 * u64::from(cnt));
+                cnt
             }
+        };
+        Box::new(TreeContent {
+            entry_capacity,
+            delta_depth: 0,
+            entries: Vec::new(),
+        })
+    }
+
+    /// `release_tree_content()` (builtin/fast-import.c:706-712): the content
+    /// goes back on the list for its capacity; its entries are the caller's.
+    fn release_tree_content(&mut self, entry_capacity: u32) {
+        self.avail_tree_table[hc_entries(entry_capacity) as usize].push(entry_capacity);
+    }
+
+    /// `to_atom()` (builtin/fast-import.c:617-632).
+    fn to_atom(&mut self, s: &[u8]) -> Atom {
+        if let Some(atom) = self.atoms.get(s) {
+            return atom.clone();
+        }
+        self.alloc(SIZEOF_ATOM_STR + s.len() as u64 + 1);
+        let atom = Atom::from(s);
+        self.atoms.insert(s.to_vec(), atom.clone());
+        atom
+    }
+
+    /// `fspathncmp(p, e->name->str_dat, n) == 0`.
+    fn name_eq(&self, a: &[u8], b: &[u8]) -> bool {
+        match self.ignore_case {
+            true => a.eq_ignore_ascii_case(b),
+            false => a == b,
         }
     }
-    items.sort_by(|a, b| base_name_compare(a.0, a.1, b.0, b.1));
-
-    let mut buf = Vec::new();
-    for (name, mode, oid) in items {
-        buf.extend_from_slice(format!("{mode:o} ").as_bytes());
-        buf.extend_from_slice(name);
-        buf.push(0);
-        buf.extend_from_slice(oid.as_slice());
-    }
-    // `store_tree()` ends in `store_object(OBJ_TREE, …)` like every other object
-    // the stream produces, so a tree counts toward `object_count` too.
-    Ok(pack.store(repo, Kind::Tree, &buf)?.0)
 }
 
-/// Find the node at `path`, or `None` when nothing lives there.
-fn dir_get<'a>(dir: &'a Dir, path: &[u8]) -> Option<&'a Node> {
-    let mut cur = dir;
-    let mut parts = path.split(|&b| b == b'/').peekable();
-    while let Some(part) = parts.next() {
-        let node = cur.entries.get(part)?;
-        if parts.peek().is_none() {
-            return Some(node);
+/// `hc_entries()` (builtin/fast-import.c:671-675).
+fn hc_entries(cnt: u32) -> u32 {
+    let cnt = if cnt & 7 != 0 { cnt / 8 + 1 } else { cnt / 8 };
+    cnt.min(AVAIL_TREE_TABLE_SZ - 1)
+}
+
+/// `branch_table_sz` (builtin/fast-import.c:240).
+const BRANCH_TABLE_SZ: u32 = 1039;
+
+/// `hc_str()` (builtin/fast-import.c:565-570): `r = r * 31 + *s++` over the
+/// platform's `char`, which is signed on x86-64 and Apple arm64 and unsigned
+/// on Linux arm64 — so a name with a byte above 0x7f lands in a different
+/// bucket there, in git as here.
+fn hc_str(s: &[u8]) -> u32 {
+    s.iter()
+        .fold(0u32, |r, &c| r.wrapping_mul(31).wrapping_add(c as std::ffi::c_char as i32 as u32))
+}
+
+/// What the tree functions need of the importer: the repository to read
+/// objects from, the pack bookkeeping `store_object()` updates, and the
+/// allocators.
+struct Ctx<'a> {
+    repo: &'a gix::Repository,
+    pack: &'a mut PackLog,
+    pools: &'a mut Pools,
+}
+
+/// `release_tree_content_recursive()` (builtin/fast-import.c:714-720).
+fn release_tree_content_recursive(pools: &mut Pools, t: Box<TreeContent>) {
+    let TreeContent { entry_capacity, entries, .. } = *t;
+    for e in entries {
+        release_tree_entry(pools, e);
+    }
+    pools.release_tree_content(entry_capacity);
+}
+
+/// `release_tree_entry()` (builtin/fast-import.c:748-754).
+fn release_tree_entry(pools: &mut Pools, e: TreeEntry) {
+    if let Some(t) = e.tree {
+        release_tree_content_recursive(pools, t);
+    }
+    pools.entries_live -= 1;
+}
+
+/// `grow_tree_content()` (builtin/fast-import.c:722-732).
+fn grow_tree_content(pools: &mut Pools, t: Box<TreeContent>, amt: u32) -> Box<TreeContent> {
+    let mut r = pools.new_tree_content(t.entries.len() as u32 + amt);
+    r.delta_depth = t.delta_depth;
+    let TreeContent { entry_capacity, entries, .. } = *t;
+    r.entries = entries;
+    pools.release_tree_content(entry_capacity);
+    r
+}
+
+/// `if (t->entry_count == t->entry_capacity) root->tree = t = grow_tree_content(t, t->entry_count);`,
+/// which every caller runs before it appends an entry.
+fn grow_if_full(pools: &mut Pools, slot: &mut Option<Box<TreeContent>>) {
+    let t = slot.take().expect("a loaded tree");
+    *slot = Some(match t.entries.len() as u32 == t.entry_capacity {
+        true => {
+            let count = t.entries.len() as u32;
+            grow_tree_content(pools, t, count)
         }
-        match node {
-            Node::Dir(sub) => cur = sub,
-            Node::Leaf { .. } => return None,
+        false => t,
+    });
+}
+
+/// `dup_tree_content()` (builtin/fast-import.c:756-779): a loaded subtree is
+/// copied only while it is dirty; a clean one is read again when needed.
+fn dup_tree_content(pools: &mut Pools, s: &TreeContent) -> Box<TreeContent> {
+    let mut d = pools.new_tree_content(s.entries.len() as u32);
+    for a in &s.entries {
+        pools.new_tree_entry();
+        let tree = match &a.tree {
+            Some(t) if a.versions[1].oid.is_null() => Some(dup_tree_content(pools, t)),
+            _ => None,
+        };
+        d.entries.push(TreeEntry {
+            tree,
+            name: a.name.clone(),
+            versions: a.versions,
+        });
+    }
+    d.delta_depth = s.delta_depth;
+    d
+}
+
+/// `parse_mode()` (object.h:200-215): octal digits up to a space, into a
+/// `uint16_t`.
+fn parse_mode(s: &[u8]) -> Option<(u32, usize)> {
+    if s.first() == Some(&b' ') {
+        return None;
+    }
+    let mut mode: u32 = 0;
+    for (i, &c) in s.iter().enumerate() {
+        if c == b' ' {
+            return Some((mode & 0xffff, i + 1));
         }
+        if !(b'0'..=b'7').contains(&c) {
+            return None;
+        }
+        mode = (mode << 3).wrapping_add(u32::from(c - b'0'));
     }
     None
 }
 
-/// Place `node` at `path`, creating intermediate directories. A file standing
-/// where a directory is needed is replaced by that directory, as git's
-/// `tree_content_set` replaces it.
-fn dir_set(dir: &mut Dir, path: &[u8], node: Node) {
-    match path.iter().position(|&b| b == b'/') {
-        None => {
-            dir.entries.insert(path.to_vec(), node);
-        }
-        Some(i) => {
-            let slot = dir
-                .entries
-                .entry(path[..i].to_vec())
-                .or_insert_with(|| Node::Dir(Dir::default()));
-            if matches!(slot, Node::Leaf { .. }) {
-                *slot = Node::Dir(Dir::default());
-            }
-            if let Node::Dir(sub) = slot {
-                dir_set(sub, &path[i + 1..], node);
-            }
-        }
+/// `load_tree()` (builtin/fast-import.c:1293-1351): read `root`'s version-1
+/// tree into a fresh content, one entry per tree entry. A tree this run stored
+/// into a pack carries that object's delta depth.
+fn load_tree(g: &mut Ctx<'_>, root: &mut TreeEntry) -> Result<()> {
+    let oid = root.versions[1].oid;
+    // `root->tree = t = new_tree_content(8);` — a content already there is
+    // overwritten, not released, exactly as the C overwrites the pointer.
+    root.tree = Some(g.pools.new_tree_content(8));
+    if oid.is_null() {
+        return Ok(());
     }
-}
 
-/// Remove whatever is at `path`, then drop parents the removal left empty.
-fn dir_remove(dir: &mut Dir, path: &[u8]) -> bool {
-    let parts: Vec<&[u8]> = path.split(|&b| b == b'/').collect();
-    remove_parts(dir, &parts)
-}
-
-/// The recursive half of [`dir_remove`], pruning empty directories on the way out.
-fn remove_parts(dir: &mut Dir, parts: &[&[u8]]) -> bool {
-    let (first, rest) = parts.split_first().expect("a path always has one component");
-    if rest.is_empty() {
-        return dir.entries.remove(*first).is_some();
-    }
-    let removed = match dir.entries.get_mut(*first) {
-        Some(Node::Dir(sub)) => {
-            let removed = remove_parts(sub, rest);
-            (removed, sub.entries.is_empty())
+    let buf = match g.pack.table.get(&oid).copied() {
+        Some(myoe) if myoe.pack_id != MAX_PACK_ID => {
+            if myoe.kind != Kind::Tree {
+                crate::git_fatal!("not a tree: {oid}");
+            }
+            root.tree.as_mut().expect("just set").delta_depth = myoe.depth;
+            match g.repo.try_find_object(oid) {
+                Ok(Some(object)) => object.data.clone(),
+                _ => crate::git_fatal!("can't load tree {oid}"),
+            }
         }
-        _ => return false,
+        _ => match g.repo.try_find_object(oid) {
+            Ok(Some(object)) if object.kind == Kind::Tree => object.data.clone(),
+            _ => crate::git_fatal!("can't load tree {oid}"),
+        },
     };
-    if removed.1 {
-        dir.entries.remove(*first);
+
+    let rawsz = g.repo.object_hash().len_in_bytes();
+    let mut c = 0;
+    while c != buf.len() {
+        // `e = new_tree_entry();`, the grow, and only then the parse.
+        g.pools.new_tree_entry();
+        grow_if_full(g.pools, &mut root.tree);
+        let Some((mode, used)) = parse_mode(&buf[c..]) else {
+            crate::git_fatal!("corrupt mode in {oid}");
+        };
+        c += used;
+        let name_len = buf[c..].iter().position(|&b| b == 0).unwrap_or(buf.len() - c);
+        let name = g.pools.to_atom(&buf[c..c + name_len]);
+        c += name_len + 1;
+        let Some(raw) = buf.get(c..c + rawsz) else {
+            crate::git_fatal!("can't load tree {oid}");
+        };
+        let entry_oid = ObjectId::from_bytes_or_panic(raw);
+        c += rawsz;
+        let version = Version { mode, oid: entry_oid };
+        root.tree.as_mut().expect("loaded above").entries.push(TreeEntry {
+            tree: None,
+            name,
+            versions: [version, version],
+        });
     }
-    removed.0
+    Ok(())
 }
 
-/// Count the note blobs already in a notes tree, so the fanout stays consistent
-/// with what an earlier import wrote. A note is a leaf whose path components
-/// concatenate to one full object id in hex.
-fn count_notes(dir: &Dir, prefix: &mut Vec<u8>) -> u64 {
-    let mut total = 0;
-    for (name, node) in &dir.entries {
-        let before = prefix.len();
-        prefix.extend_from_slice(name);
-        match node {
-            Node::Leaf { .. } => {
-                // A note is named after the object it annotates, so its path
-                // spells out one full object id (40 hex for SHA-1, 64 for SHA-256).
-                if matches!(prefix.len(), 40 | 64) && prefix.iter().all(u8::is_ascii_hexdigit) {
-                    total += 1;
-                }
+/// `mktree()` (builtin/fast-import.c:1371-1401): sort the entries by version
+/// `v` — the order is kept, as the C sorts in place — and write that version.
+fn mktree(t: &mut TreeContent, v: usize, rawsz: usize) -> Vec<u8> {
+    t.entries.sort_by(|a, b| {
+        base_name_compare(&a.name, a.versions[v].mode, &b.name, b.versions[v].mode)
+    });
+    let mut buf = Vec::new();
+    for e in &t.entries {
+        if e.versions[v].mode == 0 {
+            continue;
+        }
+        buf.extend_from_slice(format!("{:o} ", e.versions[v].mode & !NO_DELTA).as_bytes());
+        buf.extend_from_slice(&e.name);
+        buf.push(0);
+        buf.extend_from_slice(&e.versions[v].oid.as_slice()[..rawsz]);
+    }
+    buf
+}
+
+/// `store_tree()` (builtin/fast-import.c:1403-1446): store every dirty tree
+/// below `root` and then `root` itself, deltified against its old version
+/// when that version sits in the pack now being built, and let go of the
+/// entries deleted since the last store.
+fn store_tree(g: &mut Ctx<'_>, root: &mut TreeEntry) -> Result<()> {
+    if !root.versions[1].oid.is_null() {
+        return Ok(());
+    }
+    if root.tree.is_none() {
+        load_tree(g, root)?;
+    }
+    let rawsz = g.repo.object_hash().len_in_bytes();
+    let pack_id = g.pack.pack_id;
+    let t = root.tree.as_mut().expect("loaded above");
+    for e in t.entries.iter_mut() {
+        if e.tree.is_some() {
+            store_tree(g, e)?;
+        }
+    }
+
+    // Looked up after the subtrees are stored, as the C does: one of them may
+    // be the object the old version names.
+    let le = match root.versions[0].mode & NO_DELTA {
+        0 => g.pack.table.get(&root.versions[0].oid).copied(),
+        _ => None,
+    };
+    let mut lo = LastObject::default();
+    if s_isdir(root.versions[0].mode) && le.is_some_and(|le| le.pack_id == pack_id) {
+        lo.data = mktree(t, 0, rawsz);
+        lo.depth = t.delta_depth;
+    }
+    let new_tree = mktree(t, 1, rawsz);
+    let (oid, _) = g.pack.store(g.repo, Kind::Tree, &new_tree, Last::Tree(&mut lo))?;
+    root.versions[1].oid = oid;
+
+    let t = root.tree.as_mut().expect("loaded above");
+    t.delta_depth = lo.depth;
+    for mut e in std::mem::take(&mut t.entries) {
+        if e.versions[1].mode != 0 {
+            e.versions[0] = e.versions[1];
+            t.entries.push(e);
+        } else {
+            release_tree_entry(g.pools, e);
+        }
+    }
+    Ok(())
+}
+
+/// `tree_content_replace()` (builtin/fast-import.c:1448-1461).
+fn tree_content_replace(
+    pools: &mut Pools,
+    root: &mut TreeEntry,
+    oid: ObjectId,
+    mode: u32,
+    newtree: Option<Box<TreeContent>>,
+) -> Result<()> {
+    if !s_isdir(mode) {
+        crate::git_fatal!("root cannot be a non-directory");
+    }
+    root.versions[0].oid = ObjectId::null(oid.kind());
+    root.versions[1].oid = oid;
+    if let Some(t) = root.tree.take() {
+        release_tree_content_recursive(pools, t);
+    }
+    root.tree = newtree;
+    Ok(())
+}
+
+/// The first component of `p` and whether more follow: `strchrnul(p, '/')`.
+fn first_component(p: &[u8]) -> (usize, bool) {
+    match p.iter().position(|&b| b == b'/') {
+        Some(n) => (n, true),
+        None => (p.len(), false),
+    }
+}
+
+/// The index of the entry of `root`'s loaded content named `name`.
+fn find_entry(pools: &Pools, t: &TreeContent, name: &[u8]) -> Option<usize> {
+    t.entries.iter().position(|e| e.name.len() == name.len() && pools.name_eq(name, &e.name))
+}
+
+/// `tree_content_set()` (builtin/fast-import.c:1463-1543). Returns whether
+/// anything changed, which is what marks the parents dirty.
+fn tree_content_set(
+    g: &mut Ctx<'_>,
+    root: &mut TreeEntry,
+    p: &[u8],
+    oid: ObjectId,
+    mode: u32,
+    subtree: Option<Box<TreeContent>>,
+) -> Result<bool> {
+    let (n, more) = first_component(p);
+    if n == 0 {
+        crate::git_fatal!("empty path component found in input");
+    }
+    if !more && !s_isdir(mode) && subtree.is_some() {
+        crate::git_fatal!("non-directories cannot have subtrees");
+    }
+    if root.tree.is_none() {
+        load_tree(g, root)?;
+    }
+    let null = ObjectId::null(oid.kind());
+    let t = root.tree.as_mut().expect("loaded above");
+    if let Some(i) = find_entry(g.pools, t, &p[..n]) {
+        let e = &mut t.entries[i];
+        if !more {
+            if !s_isdir(mode) && e.versions[1].mode == mode && e.versions[1].oid == oid {
+                return Ok(false);
             }
-            Node::Dir(sub) => total += count_notes(sub, prefix),
+            e.versions[1] = Version { mode, oid };
+            if let Some(old) = e.tree.take() {
+                release_tree_content_recursive(g.pools, old);
+            }
+            e.tree = subtree;
+            // The old subtree is no delta base any more: its entries are gone.
+            if s_isdir(e.versions[0].mode) {
+                e.versions[0].mode |= NO_DELTA;
+            }
+            root.versions[1].oid = null;
+            return Ok(true);
         }
-        prefix.truncate(before);
+        if !s_isdir(e.versions[1].mode) {
+            // A content the C overwrites rather than releases.
+            e.tree = Some(g.pools.new_tree_content(8));
+            e.versions[1].mode = S_IFDIR;
+        }
+        if e.tree.is_none() {
+            load_tree(g, e)?;
+        }
+        if tree_content_set(g, e, &p[n + 1..], oid, mode, subtree)? {
+            root.versions[1].oid = null;
+            return Ok(true);
+        }
+        return Ok(false);
     }
-    total
+
+    grow_if_full(g.pools, &mut root.tree);
+    g.pools.new_tree_entry();
+    let name = g.pools.to_atom(&p[..n]);
+    let mut e = TreeEntry {
+        tree: None,
+        name,
+        versions: [Version { mode: 0, oid: null }, Version { mode: 0, oid: null }],
+    };
+    if more {
+        e.tree = Some(g.pools.new_tree_content(8));
+        e.versions[1].mode = S_IFDIR;
+        tree_content_set(g, &mut e, &p[n + 1..], oid, mode, subtree)?;
+    } else {
+        e.tree = subtree;
+        e.versions[1] = Version { mode, oid };
+    }
+    root.tree.as_mut().expect("loaded above").entries.push(e);
+    root.versions[1].oid = null;
+    Ok(true)
 }
 
-/// The path a note takes at a given fanout: `fanout` two-character directories
-/// followed by the rest of the id.
-fn note_path(hex: &[u8], fanout: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hex.len() + fanout);
-    let mut i = 0;
-    for _ in 0..fanout {
-        if i + 2 >= hex.len() {
-            break;
+/// The `del_entry:` tail of `tree_content_remove()`: hand the entry to
+/// `backup_leaf` or release its subtree, and mark it deleted.
+fn del_entry(pools: &mut Pools, e: &mut TreeEntry, backup_leaf: Option<&mut TreeEntry>) {
+    match backup_leaf {
+        Some(leaf) => {
+            leaf.tree = e.tree.take();
+            leaf.name = e.name.clone();
+            leaf.versions = e.versions;
         }
-        out.extend_from_slice(&hex[i..i + 2]);
-        out.push(b'/');
-        i += 2;
+        None => {
+            if let Some(t) = e.tree.take() {
+                release_tree_content_recursive(pools, t);
+            }
+        }
     }
-    out.extend_from_slice(&hex[i..]);
-    out
+    e.versions[1] = Version {
+        mode: 0,
+        oid: ObjectId::null(e.versions[1].oid.kind()),
+    };
+}
+
+/// `tree_content_remove()` (builtin/fast-import.c:1545-1601). A directory the
+/// removal leaves with no live entry is removed with it.
+fn tree_content_remove(
+    g: &mut Ctx<'_>,
+    root: &mut TreeEntry,
+    p: &[u8],
+    backup_leaf: Option<&mut TreeEntry>,
+    allow_root: bool,
+) -> Result<bool> {
+    let (n, more) = first_component(p);
+    if root.tree.is_none() {
+        load_tree(g, root)?;
+    }
+    let null = ObjectId::null(root.versions[1].oid.kind());
+    if p.is_empty() && allow_root {
+        del_entry(g.pools, root, backup_leaf);
+        root.versions[1].oid = null;
+        return Ok(true);
+    }
+
+    let t = root.tree.as_mut().expect("loaded above");
+    let Some(i) = find_entry(g.pools, t, &p[..n]) else {
+        return Ok(false);
+    };
+    let e = &mut t.entries[i];
+    if more && !s_isdir(e.versions[1].mode) {
+        // A file stands where the path's parent directory would be, so the
+        // path cannot exist and needs no deleting.
+        return Ok(true);
+    }
+    if !more {
+        del_entry(g.pools, e, backup_leaf);
+        root.versions[1].oid = null;
+        return Ok(true);
+    }
+    if e.tree.is_none() {
+        load_tree(g, e)?;
+    }
+    if !tree_content_remove(g, e, &p[n + 1..], backup_leaf, false)? {
+        return Ok(false);
+    }
+    let live = e
+        .tree
+        .as_ref()
+        .is_some_and(|t| t.entries.iter().any(|child| child.versions[1].mode != 0));
+    if !live {
+        del_entry(g.pools, e, None);
+    }
+    root.versions[1].oid = null;
+    Ok(true)
+}
+
+/// `tree_content_get()` (builtin/fast-import.c:1603-1646): copy the entry at
+/// `p` into `leaf`, with a private copy of its subtree while that is dirty.
+fn tree_content_get(
+    g: &mut Ctx<'_>,
+    root: &mut TreeEntry,
+    p: &[u8],
+    leaf: &mut TreeEntry,
+    allow_root: bool,
+) -> Result<bool> {
+    let (n, more) = first_component(p);
+    if n == 0 && !allow_root {
+        crate::git_fatal!("empty path component found in input");
+    }
+    if root.tree.is_none() {
+        load_tree(g, root)?;
+    }
+    let found = |pools: &mut Pools, e: &TreeEntry, leaf: &mut TreeEntry| {
+        leaf.name = e.name.clone();
+        leaf.versions = e.versions;
+        leaf.tree = match &e.tree {
+            Some(t) if e.versions[1].oid.is_null() => Some(dup_tree_content(pools, t)),
+            _ => None,
+        };
+    };
+    if n == 0 {
+        found(g.pools, root, leaf);
+        return Ok(true);
+    }
+    let t = root.tree.as_mut().expect("loaded above");
+    let Some(i) = find_entry(g.pools, t, &p[..n]) else {
+        return Ok(false);
+    };
+    let e = &mut t.entries[i];
+    if !more {
+        found(g.pools, e, leaf);
+        return Ok(true);
+    }
+    if !s_isdir(e.versions[1].mode) {
+        return Ok(false);
+    }
+    if e.tree.is_none() {
+        load_tree(g, e)?;
+    }
+    tree_content_get(g, e, &p[n + 1..], leaf, false)
+}
+
+/// `convert_num_notes_to_fanout()` (builtin/fast-import.c:2144-2150).
+fn convert_num_notes_to_fanout(mut num_notes: u64) -> u8 {
+    let mut fanout = 0;
+    loop {
+        num_notes >>= 8;
+        if num_notes == 0 {
+            return fanout;
+        }
+        fanout += 1;
+    }
+}
+
+/// `construct_path_with_fanout()` (builtin/fast-import.c:2152-2167).
+fn construct_path_with_fanout(hex: &[u8], fanout: u8, rawsz: usize) -> Result<Vec<u8>> {
+    if usize::from(fanout) >= rawsz {
+        crate::git_fatal!("too large fanout ({fanout})");
+    }
+    let mut path = Vec::with_capacity(hex.len() + usize::from(fanout));
+    let mut j = 0;
+    for _ in 0..fanout {
+        path.extend_from_slice(&hex[j..j + 2]);
+        path.push(b'/');
+        j += 2;
+    }
+    path.extend_from_slice(&hex[j..]);
+    Ok(path)
+}
+
+/// The entry `path` names below `root`, walking loaded contents only — the
+/// pointer `do_change_note_fanout()` holds for the directory it is in.
+fn entry_at<'a>(pools: &Pools, root: &'a mut TreeEntry, path: &[Atom]) -> Option<&'a mut TreeEntry> {
+    let mut cur = root;
+    for name in path {
+        let t = cur.tree.as_mut()?;
+        let i = find_entry(pools, t, name)?;
+        cur = &mut t.entries[i];
+    }
+    Some(cur)
+}
+
+/// `do_change_note_fanout()` (builtin/fast-import.c:2169-2246): count the
+/// notes below the directory at `dir` and, unless `fanout` is the counting
+/// mode `0xff`, move each one to the path that fanout gives it.
+fn do_change_note_fanout(
+    g: &mut Ctx<'_>,
+    orig_root: &mut TreeEntry,
+    dir: &[Atom],
+    hex_oid: &[u8],
+    fullpath: &[u8],
+    fanout: u8,
+) -> Result<u64> {
+    let hexsz = g.repo.object_hash().len_in_hex();
+    let rawsz = g.repo.object_hash().len_in_bytes();
+    let mut num_notes = 0;
+    if let Some(root) = entry_at(g.pools, orig_root, dir) {
+        if root.tree.is_none() {
+            load_tree(g, root)?;
+        }
+    }
+
+    // `for (i = 0; t && i < t->entry_count; i++)`, with `t = root->tree`
+    // re-read after every entry: a rename may have grown it.
+    let mut i = 0;
+    loop {
+        let Some(root) = entry_at(g.pools, orig_root, dir) else { break };
+        let Some(t) = root.tree.as_ref() else { break };
+        let Some(e) = t.entries.get(i) else { break };
+        i += 1;
+        let (name, mode) = (e.name.clone(), e.versions[1].mode);
+
+        let tmp_hex_oid_len = hex_oid.len() + name.len();
+        if mode == 0 || tmp_hex_oid_len > hexsz || name.len() % 2 != 0 {
+            continue;
+        }
+        let hex = [hex_oid, &name[..]].concat();
+        let mut path = fullpath.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&name);
+
+        if tmp_hex_oid_len == hexsz && hex.iter().all(u8::is_ascii_hexdigit) {
+            // A note entry.
+            if fanout == 0xff {
+                num_notes += 1;
+                continue;
+            }
+            let realpath = construct_path_with_fanout(&hex, fanout, rawsz)?;
+            if path == realpath {
+                num_notes += 1;
+                continue;
+            }
+            let mut leaf = TreeEntry::detached(g.repo.object_hash(), 0);
+            if !tree_content_remove(g, orig_root, &path, Some(&mut leaf), false)? {
+                crate::git_fatal!("failed to remove path {}", String::from_utf8_lossy(&path));
+            }
+            let subtree = leaf.tree.take();
+            tree_content_set(g, orig_root, &realpath, leaf.versions[1].oid, leaf.versions[1].mode, subtree)?;
+        } else if s_isdir(mode) {
+            let mut sub = dir.to_vec();
+            sub.push(name);
+            num_notes += do_change_note_fanout(g, orig_root, &sub, &hex, &path, fanout)?;
+        }
+    }
+    Ok(num_notes)
+}
+
+/// `change_note_fanout()` (builtin/fast-import.c:2248-2259).
+fn change_note_fanout(g: &mut Ctx<'_>, root: &mut TreeEntry, fanout: u8) -> Result<u64> {
+    do_change_note_fanout(g, root, &[], &[], &[], fanout)
 }
 
 /// git's `base_name_compare`: unsigned byte order, except that a directory's
@@ -3180,20 +4704,8 @@ fn base_name_compare(n1: &[u8], m1: u32, n2: &[u8], m2: u32) -> std::cmp::Orderi
 fn trailing_byte(name: &[u8], common: usize, mode: u32) -> u8 {
     match name.get(common) {
         Some(&byte) => byte,
-        None if mode == 0o40000 => b'/',
+        None if s_isdir(mode) => b'/',
         None => 0,
-    }
-}
-
-/// The canonical mode git stores for each entry kind.
-fn mode_of(kind: gix::object::tree::EntryKind) -> u32 {
-    use gix::object::tree::EntryKind::*;
-    match kind {
-        Tree => 0o40000,
-        Blob => 0o100644,
-        BlobExecutable => 0o100755,
-        Link => 0o120000,
-        Commit => 0o160000,
     }
 }
 

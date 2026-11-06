@@ -55,10 +55,17 @@ impl Response {
                 let mut acks = Vec::<Acknowledgement>::new();
                 let mut shallows = Vec::<ShallowUpdate>::new();
                 let mut saw_ready = false;
+                // After `done`, `find_common()` reads acknowledgements only until its count of outstanding flushes
+                // is used up by a `NAK` or a final `ACK <oid>` arrives (fetch-pack.c:628-643), and `get_pack()`
+                // takes the stream from there, so an end of stream after that is the sideband demultiplexer's.
+                let mut nak_after_done = false;
                 let has_pack = 'lines: loop {
                     line.clear();
                     let peeked_line = match reader.peek_data_line() {
                         Some(Ok(Ok(line))) => String::from_utf8_lossy(line),
+                        Some(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof && nak_after_done => {
+                            break 'lines true;
+                        }
                         // This special case (hang/block forever) deals with a single NAK being a legitimate EOF sometimes
                         // Note that this might block forever in stateful connections as there it's not really clear
                         // if something will be following or not by just looking at the response. Instead you have to know
@@ -104,6 +111,15 @@ impl Response {
                         break 'lines true;
                     }
                     assert_ne!(reader.readline_str(&mut line)?, 0, "consuming a peeked line works");
+                    if client_expects_pack {
+                        // `get_ack()` returns `ACK` for an `ACK <oid>` with nothing after it, and `find_common()`
+                        // returns on it (fetch-pack.c:631-636): the pack is next.
+                        let mut tokens = line.trim_end().split(' ');
+                        if tokens.next() == Some("ACK") && tokens.next().is_some() && tokens.next().is_none() {
+                            break 'lines true;
+                        }
+                        nak_after_done |= line.trim_end() == "NAK";
+                    }
                     // When the server sends ready, we know there is going to be a pack so no need to stop early.
                     saw_ready |= matches!(acks.last(), Some(Acknowledgement::Ready));
                     if let Some(Acknowledgement::Nak) = acks.last().filter(|_| !client_expects_pack || !saw_ready) {

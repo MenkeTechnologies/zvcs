@@ -212,9 +212,11 @@ impl Plan {
     }
 
     /// Whether a pack of `nr_objects` goes to `unpack-objects` rather than
-    /// `index-pack` (fetch-pack.c:994-997, 1007, 1040-1041).
+    /// `index-pack` (fetch-pack.c:994-997, 1007, 1040-1041). `do_keep` starts as `args->keep_pack` and only the
+    /// header read changes it, so with no header read (`fetch.unpackLimit=0`) every pack not kept is unpacked.
     fn unpacks(&self, nr_objects: usize) -> bool {
-        self.passes_header() && (nr_objects as u64) < self.unpack_limit && !self.index_pack_required
+        let do_keep = self.keep_pack || (self.passes_header() && (nr_objects as u64) >= self.unpack_limit);
+        !do_keep && !self.index_pack_required
     }
 
     /// `index-pack -v` (fetch-pack.c:1013-1014).
@@ -226,6 +228,124 @@ impl Plan {
     /// is `quiet = !isatty(2)` (builtin/unpack-objects.c:626).
     fn unpack_objects_verbose(&self) -> bool {
         self.index_pack_verbose() && std::io::stderr().is_terminal()
+    }
+}
+
+/// `get_pack()` for a pack whose sideband stream ended before it was taken whole (fetch-pack.c:960-1100), after
+/// the demultiplexer said so (see [`gix::remote::fetch::PackStream`]). It prints what git prints on its way to
+/// the `die()` the caller exits 128 with, and leaves the repository as the child left it.
+///
+/// `smart_http` is a transport that runs through remote-curl, whose protocol v0/v1 `fetch-pack` child is not told
+/// to keep the pack: `TRANS_OPT_KEEP` is among the helper's `unsupported_options` (transport-helper.c:275-280)
+/// and `fetch_git()` passes no `--keep` (remote-curl.c:1203-1234). A v2 fetch runs `fetch_pack()` in this process
+/// with the option as it was set (transport.c:490).
+///
+/// ```c
+/// if (!args->keep_pack && unpack_limit && !index_pack_args) {
+///         if (read_pack_header(demux.out, &header))
+///                 die(_("protocol error: bad pack header"));
+///         pass_header = 1;
+///         if (ntohl(header.hdr_entries) < unpack_limit)
+///                 do_keep = 0;
+///         else
+///                 do_keep = 1;
+/// }
+/// ...
+/// if (do_keep && (pack_lockfiles || fsck_objects)) {
+///         ...
+///         if (!is_well_formed)
+///                 die(_("fetch-pack: invalid index-pack output"));
+/// ...
+/// ret = finish_command(&cmd);
+/// if (!ret || (args->check_self_contained_and_connected && ret == 1))
+///         ...
+/// else
+///         die(_("%s failed"), cmd_name);
+/// if (use_sideband && finish_async(&demux))
+///         die(_("error in sideband demultiplexer"));
+/// ```
+///
+/// `pack_lockfiles` is never NULL here: the fetch's own `transport->pack_lockfiles` or remote-curl's
+/// `--lock-pack`. A child that read everything leaves its objects: `unpack-objects` writes each as it goes, and
+/// `index-pack`'s pack stays with its `.keep`, which a fetch that dies in this process removes on exit
+/// (`unlock_pack_atexit()`, builtin/fetch.c:2639) and a `fetch-pack` child cannot report.
+pub(crate) fn pack_stream_died(
+    repo: &gix::Repository,
+    plan: Plan,
+    smart_http: bool,
+    stream: &gix::remote::fetch::PackStream,
+) {
+    use gix::protocol::transport::Protocol;
+    let in_process = !smart_http || stream.protocol == Protocol::V2;
+    let keep_pack = plan.keep_pack && in_process;
+    let pass_header = !keep_pack && plan.unpack_limit != 0;
+    // `read_pack_header()` (packfile.c): twelve bytes, the signature and a version `pack_version_ok()` accepts.
+    let header = &stream.header;
+    let nr_objects = (header.len() == 12 && header.starts_with(b"PACK") && matches!(header[7], 2 | 3) && header[4..7] == [0, 0, 0])
+        .then(|| u64::from(u32::from_be_bytes(header[8..12].try_into().expect("four bytes"))));
+    if pass_header && nr_objects.is_none() {
+        eprintln!("fatal: protocol error: bad pack header");
+        return;
+    }
+    let nr_objects = nr_objects.unwrap_or(0);
+    let do_keep = keep_pack || (pass_header && nr_objects >= plan.unpack_limit);
+    let unpacks = !do_keep && !plan.index_pack_required;
+    if unpacks {
+        // The pack the vendored writer made goes first: `unpack-objects` writes each object through
+        // `odb_write_object()`, which skips one the repository already has (odb.c:993-999), and these are
+        // only in that pack. A fresh handle answers "already has" without it.
+        if let Some(bundle) = &stream.bundle {
+            let rev = bundle.data_path.as_ref().map(|data| data.with_extension("rev"));
+            for path in [bundle.data_path.clone(), bundle.index_path.clone(), bundle.keep_path.clone(), rev]
+                .into_iter()
+                .flatten()
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let fresh = gix::open(repo.git_dir()).ok();
+        let retained = stream.retained.as_deref().unwrap_or_default();
+        match super::unpack_objects::unpack_received(fresh.as_ref().unwrap_or(repo), retained) {
+            Ok(()) => {}
+            Err(message) => {
+                if let Some(message) = message {
+                    eprintln!("fatal: {message}");
+                }
+                eprintln!("fatal: unpack-objects failed");
+                return;
+            }
+        }
+    } else if stream.consumer_failed {
+        // `index-pack --stdin` opened `objects/pack/tmp_pack_XXXXXX` before it read the header
+        // (`open_pack_file()`, builtin/index-pack.c:359-367, `odb_mkstemp()` mode 0444, odb.c:72-91) and its `die()`
+        // leaves it there. What it had flushed into it is not kept: the vendored writer's own temporary holds a
+        // rewritten pack, so the file is left empty, as the `index-pack` port leaves it.
+        let dir = repo.objects.store_ref().path().join("pack");
+        let _ = crate::tmp_objdir::git_mkstemp_mode(dir.join("tmp_pack_XXXXXX").as_os_str(), 0o444);
+        // `index-pack`'s `fill()` (builtin/index-pack.c:270-289).
+        eprintln!("fatal: early EOF");
+        if do_keep {
+            eprintln!("fatal: fetch-pack: invalid index-pack output");
+        } else {
+            eprintln!("fatal: index-pack failed");
+        }
+        return;
+    } else if let Some(bundle) = &stream.bundle {
+        super::fetch::finish_kept_pack(repo, bundle);
+        // `index-pack` writes a `.keep` only when told `--keep`, for a pack `get_pack()` keeps
+        // (fetch-pack.c:1019-1020); an `index-pack` chosen by `fsck_objects` or a promisor fetch alone writes none.
+        if in_process || !do_keep {
+            if let Some(keep) = &bundle.keep_path {
+                let _ = std::fs::remove_file(keep);
+            }
+        }
+    }
+    if stream.disconnected {
+        eprintln!("fatal: error in sideband demultiplexer");
+    } else if stream.response_end_consumed {
+        // `do_check_stateless_delimiter()` reads past the response-end packet the demultiplexer took
+        // (fetch-pack.c:1847, pkt-line.c:364-372).
+        eprintln!("fatal: the remote end hung up unexpectedly");
     }
 }
 

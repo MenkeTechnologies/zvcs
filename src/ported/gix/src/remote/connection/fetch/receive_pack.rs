@@ -119,6 +119,22 @@ where
             });
         }
 
+        // A band-3 message ends `recv_sideband()` with `SIDEBAND_REMOTE_ERROR` once it has been shown
+        // (sideband.c:369-377), so the end of the stream after it is not reported as a disconnect.
+        let remote_error = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sideband = con.sideband.clone().map(|inner| {
+            let remote_error = remote_error.clone();
+            gix_protocol::fetch::Sideband(std::sync::Arc::new(std::sync::Mutex::new(
+                move |is_error: bool, data: &[u8]| {
+                    if is_error {
+                        remote_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Ok(mut handler) = inner.0.lock() {
+                        (&mut *handler)(is_error, data);
+                    }
+                },
+            )))
+        });
         let fetch_options = gix_protocol::fetch::Options {
             shallow_file: repo.shallow_file(),
             shallow: &self.shallow,
@@ -132,9 +148,14 @@ where
                 .unwrap_or(false),
             filter: self.filter.as_ref().map(gix_protocol::fetch::filter::Filter::as_str),
             no_progress: con.no_progress,
-            sideband: con.sideband.clone(),
+            sideband,
             keep_pack: self.keep_pack,
         };
+        let protocol = handshake.server_protocol_version;
+        // `stateless_rpc`: remote-curl ends every response with a response-end packet (remote-curl.c:1086-1087).
+        let stateless = !con.transport.inner.connection_persists_across_multiple_requests();
+        let stateless_v2 = stateless && matches!(protocol, gix_protocol::transport::Protocol::V2);
+        let mut demux = DemuxState::new(config::unpack_limit(repo), remote_error, stateless_v2);
         let context = gix_protocol::fetch::Context {
             handshake: &mut handshake,
             transport: &mut con.transport.inner,
@@ -193,8 +214,12 @@ where
                 // `--dry-run` receives the pack too: git's dry run stops short of the
                 // ref updates and `FETCH_HEAD`, not of the transfer, which is why its
                 // forced-update test has both commits to compare.
+                let mut pack = Demux {
+                    inner: reader,
+                    state: &mut demux,
+                };
                 write_pack_bundle = Some(gix_pack::Bundle::write_to_directory(
-                    reader,
+                    &mut pack,
                     Some(&repo.objects.store_ref().path().join("pack")),
                     progress,
                     should_interrupt,
@@ -204,14 +229,44 @@ where
                     })),
                     write_pack_options,
                 )?);
-                Ok(true)
+                // The demultiplexer reads on to the packet that ends the stream after the child is done with it
+                // (`recv_sideband()`, pkt-line.c:585-603), so whatever follows the pack is consumed here.
+                std::io::copy(&mut pack, &mut std::io::sink())?;
+                Ok(false)
             },
             progress,
             should_interrupt,
             context,
             fetch_options,
         )
-        .await?;
+        .await;
+        // `get_pack()`'s ways of dying of a stream that ended early, and `do_check_stateless_delimiter()`'s
+        // (fetch-pack.c:1068-1100, :1846-1847).
+        let end = demux.end;
+        // `finish_async()` fails for a demultiplexer that hit the end of the stream or a band-3 message.
+        let demux_failed =
+            end == Some(DemuxEnd::Disconnect) || demux.remote_error.load(std::sync::atomic::Ordering::Relaxed);
+        let response_end_consumed = end == Some(DemuxEnd::Special) && stateless_v2;
+        let mut pack_stream = |consumer_failed: bool, bundle: Option<gix_pack::bundle::write::Outcome>| {
+            Error::PackStream(Box::new(fetch::PackStream {
+                protocol,
+                header: std::mem::take(&mut demux.header),
+                retained: demux.retained.take(),
+                disconnected: demux_failed,
+                consumer_failed,
+                response_end_consumed: !consumer_failed && response_end_consumed,
+                bundle,
+            }))
+        };
+        let res = match res {
+            Err(gix_protocol::fetch::Error::ConsumePack(_)) if end.is_some() => {
+                return Err(pack_stream(true, None));
+            }
+            Ok(Some(_)) if demux_failed || response_end_consumed => {
+                return Err(pack_stream(false, write_pack_bundle.take()));
+            }
+            res => res?,
+        };
         // The `shallow <oid>` lines the remote sent without us having asked for a depth change. They
         // are what git's `receive_shallow_info()` collects into `shallow_info`, and the input to the
         // `update_shallow()` decision below.
@@ -578,5 +633,152 @@ impl gix_protocol::fetch::Negotiate for Negotiate<'_, '_, '_> {
             return Vec::new();
         }
         self.restrictions.always_have.clone()
+    }
+}
+
+/// Where `recv_sideband()` stopped reading the pack's sideband stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DemuxEnd {
+    /// The flush that ends the pack, or a delimiter the reader stops at.
+    Flush,
+    /// A delimiter or response-end packet in a reader that does not stop at it, which `demultiplex_sideband()`
+    /// treats as a flush (sideband.c:333-346).
+    Special,
+    /// The end of the stream, or a packet cut short by it: `PACKET_READ_EOF` under `PACKET_READ_GENTLE_ON_EOF`
+    /// (pkt-line.c:364-372, :585-589), or a band-3 message before it. Either fails `finish_async()`.
+    Disconnect,
+}
+
+/// What [`Demux`] learned of the pack as it went by.
+struct DemuxState {
+    end: Option<DemuxEnd>,
+    /// The first bytes of the pack, up to the 12 of its header.
+    header: Vec<u8>,
+    /// Every byte of the pack, while its header announces fewer objects than `retain_below`, or for every pack when
+    /// that is `0`: `get_pack()` then reads no header and gives any pack it does not keep to `unpack-objects`
+    /// (fetch-pack.c:991-998, :1007).
+    retained: Option<Vec<u8>>,
+    retain_below: u64,
+    /// A protocol v2 response over remote-curl, which ends every response it took whole with a response-end
+    /// packet (remote-curl.c:1086-1087). The vendored transport ends such a response with the end of its body.
+    stateless_v2: bool,
+    /// Set once the remote sent a band-3 message.
+    remote_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DemuxState {
+    fn new(
+        retain_below: u64,
+        remote_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stateless_v2: bool,
+    ) -> Self {
+        DemuxState {
+            end: None,
+            header: Vec::with_capacity(12),
+            retained: None,
+            retain_below,
+            stateless_v2,
+            remote_error,
+        }
+    }
+
+    fn record(&mut self, bytes: &[u8]) {
+        if self.header.len() < 12 {
+            let missing = 12 - self.header.len();
+            self.header.extend_from_slice(&bytes[..missing.min(bytes.len())]);
+            if self.header.len() == 12 {
+                let nr_objects = u32::from_be_bytes(self.header[8..12].try_into().expect("four bytes"));
+                if self.retain_below == 0 || u64::from(nr_objects) < self.retain_below {
+                    self.retained = Some(Vec::new());
+                }
+            }
+        }
+        if let Some(retained) = self.retained.as_mut() {
+            retained.extend_from_slice(bytes);
+        }
+    }
+}
+
+/// `sideband_demux()` (fetch-pack.c:897-905): the pack's sideband stream as the child that takes the pack reads
+/// it. `recv_sideband()` stops at any of the packets that end a stream (sideband.c:333-346) and at the end of the
+/// stream itself, which it reports before closing its output:
+///
+/// ```c
+/// if (status == PACKET_READ_EOF) {
+///         strbuf_addf(scratch,
+///                     "%s%s: unexpected disconnect while reading sideband packet",
+///                     scratch->len ? "\n" : "", me);
+///         *sideband_type = SIDEBAND_PROTOCOL_ERROR;
+///         goto cleanup;
+/// }
+/// ```
+///
+/// Either way the child sees the end of its input there.
+struct Demux<'a, 'r> {
+    inner: &'r mut dyn std::io::BufRead,
+    state: &'a mut DemuxState,
+}
+
+impl std::io::BufRead for Demux<'_, '_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.state.end.is_none() {
+            let available = match self.inner.fill_buf() {
+                Ok(buf) => buf.len(),
+                Err(err) => {
+                    let non_data_line = err.get_ref().is_some_and(|inner| {
+                        matches!(
+                            inner.downcast_ref::<gix_protocol::transport::packetline::decode::band::Error>(),
+                            Some(gix_protocol::transport::packetline::decode::band::Error::NonDataLine)
+                        )
+                    });
+                    if non_data_line {
+                        self.state.end = Some(DemuxEnd::Special);
+                    } else if err.kind() == std::io::ErrorKind::UnexpectedEof
+                        && self.state.stateless_v2
+                        && gix_protocol::transport::client::RpcEnded::find(&err).is_none()
+                    {
+                        // A v2 response whose body ended between packets without a failure is followed by
+                        // the response-end packet remote-curl writes after every response, which stops
+                        // `recv_sideband()` as a flush does. A failed one carries its own `0002`.
+                        self.state.end = Some(DemuxEnd::Special);
+                    } else if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        if !self.state.remote_error.load(std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!("fetch-pack: unexpected disconnect while reading sideband packet");
+                        }
+                        self.state.end = Some(DemuxEnd::Disconnect);
+                    } else {
+                        return Err(err);
+                    }
+                    0
+                }
+            };
+            if available == 0 {
+                self.state.end.get_or_insert(DemuxEnd::Flush);
+            }
+        }
+        if self.state.end.is_some() {
+            return Ok(&[]);
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if amt == 0 {
+            return;
+        }
+        if let Ok(buf) = self.inner.fill_buf() {
+            self.state.record(&buf[..amt.min(buf.len())]);
+        }
+        self.inner.consume(amt);
+    }
+}
+
+impl std::io::Read for Demux<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = std::io::BufRead::fill_buf(self)?;
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        std::io::BufRead::consume(self, n);
+        Ok(n)
     }
 }

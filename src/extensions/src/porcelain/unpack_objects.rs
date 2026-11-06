@@ -231,6 +231,21 @@ pub fn unpack_objects(args: &[String]) -> Result<ExitCode> {
     })
 }
 
+/// The `unpack-objects` child `get_pack()` hands a small pack to (fetch-pack.c:1040-1051), run over the bytes
+/// of `pack` that arrived: each complete object is written as it is read, and a stream that ends early dies
+/// `early EOF` with the objects before it written. A failure is the message of the `die()` it ended with, or
+/// `None` for an `exit()` after its own `error()` lines.
+/// The child is `-q` or not a terminal's, so it draws no meter.
+pub(crate) fn unpack_received(repo: &gix::Repository, pack: &[u8]) -> std::result::Result<(), Option<String>> {
+    let mut unpack = Unpack::new(repo, false, true, false, false, 0);
+    unpack.input = Some(pack);
+    match unpack.run() {
+        Ok(_) => Ok(()),
+        Err(Stop::Die(message)) => Err(Some(message)),
+        Err(Stop::Exit(_)) => Err(None),
+    }
+}
+
 /// How a run ends early: `die()` (`fatal: <message>`, 128) or a plain
 /// `exit(<code>)` after an `error()` line already printed.
 enum Stop {
@@ -296,6 +311,8 @@ struct Unpack<'r> {
     /// `.gitmodules` / `.gitattributes` blobs `fsck_object()` queued for
     /// `fsck_finish()`.
     finish_blobs: Vec<(gix::ObjectId, bool, bool)>,
+    /// The pack bytes still to be read when they come from memory rather than from fd 0.
+    input: Option<&'r [u8]>,
 }
 
 impl<'r> Unpack<'r> {
@@ -330,6 +347,7 @@ impl<'r> Unpack<'r> {
             written: Default::default(),
             known: Default::default(),
             finish_blobs: Vec::new(),
+            input: None,
         }
     }
 
@@ -347,7 +365,12 @@ impl<'r> Unpack<'r> {
             self.offset = 0;
         }
         loop {
-            let got = {
+            let got = if let Some(input) = self.input.as_mut() {
+                let n = input.len().min(self.buffer.len() - self.len);
+                self.buffer[self.len..self.len + n].copy_from_slice(&input[..n]);
+                *input = &input[n..];
+                Ok(n)
+            } else {
                 // fd 0 itself: the standard library's `Stdin` would buffer ahead.
                 let mut stdin = std::mem::ManuallyDrop::new(unsafe {
                     <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(0)

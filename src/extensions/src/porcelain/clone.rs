@@ -2078,6 +2078,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     prepare.persist();
                     return Ok(());
                 }
+                Err(gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::PackStream(stream))) => {
+                    return Err(pack_stream_died(&git_dir, url_str, filter.is_some(), &stream));
+                }
                 Err(e) => {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
                 }
@@ -2127,6 +2130,9 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
                     junk.leave();
                     prepare.persist();
                     return Ok(());
+                }
+                Err(gix::clone::fetch::Error::Fetch(gix::remote::fetch::Error::PackStream(stream))) => {
+                    return Err(pack_stream_died(&git_dir, url_str, filter.is_some(), &stream));
                 }
                 Err(e) => {
                     return Err(short_pack(e, branch.as_deref(), &effective_remote_name));
@@ -3515,6 +3521,30 @@ fn remove_remote_tracking_head(git_dir: &Path) -> Result<()> {
     // them at all, so prune the empty ones back to (and excluding) `refs/`.
     prune_empty_dirs(&git_dir.join("refs").join("remotes"));
     Ok(())
+}
+
+/// `get_pack()`'s death of a pack stream that ended early, for a clone: `transport_set_option(transport,
+/// TRANS_OPT_KEEP, "yes")` (builtin/clone.c:1362) with the `unpack_limit` `fetch_pack_setup()` read
+/// (fetch-pack.c:2015-2026), and `index-pack` required by a filter's `--from-promisor` or by
+/// `fetch_pack_fsck_objects()`. The clone is removed on the way out, as for any `die()` before `junk_mode` moves on.
+fn pack_stream_died(
+    git_dir: &Path,
+    url: &str,
+    filtered: bool,
+    stream: &gix::remote::fetch::PackStream,
+) -> anyhow::Error {
+    if let Ok(repo) = gix::open(git_dir) {
+        let plan = super::fetch_progress::Plan {
+            progress: false,
+            quiet: true,
+            keep_pack: true,
+            unpack_limit: super::fetch_progress::unpack_limit(&repo),
+            index_pack_required: filtered || super::fetch::fetch_pack_fsck_objects(&repo),
+        };
+        let smart_http = url.starts_with("http://") || url.starts_with("https://");
+        super::fetch_progress::pack_stream_died(&repo, plan, smart_http, stream);
+    }
+    anyhow::Error::new(crate::fatal::Silent(128))
 }
 
 /// Give the post-fetch connectivity check the wording `update_remote_refs()` uses on the clone side,

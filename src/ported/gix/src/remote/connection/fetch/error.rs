@@ -54,6 +54,10 @@ pub enum Error {
     /// objects` and abandons the fetch before its ref transaction.
     #[error("did not send all necessary objects")]
     NotConnected,
+    /// The pack stream ended before `get_pack()` could take all of it, which git dies of (fetch-pack.c:960-1100).
+    /// What it dies with depends on which child `get_pack()` chose, so the details are handed to the caller.
+    #[error("the pack stream ended early")]
+    PackStream(Box<PackStream>),
 }
 
 impl gix_protocol::transport::IsSpuriousError for Error {
@@ -64,4 +68,32 @@ impl gix_protocol::transport::IsSpuriousError for Error {
             _ => false,
         }
     }
+}
+
+/// How the sideband stream of a pack ended short of what `get_pack()` needed (fetch-pack.c:960-1100).
+///
+/// `sideband_demux()` runs `recv_sideband()` over the response, which stops at a flush, a delimiter or a
+/// response-end packet alike (sideband.c:333-346), and at the end of the stream with
+/// `fetch-pack: unexpected disconnect while reading sideband packet` (sideband.c:325-331), already printed by the time
+/// this is returned. Its output is the pack's child's input, which then sees the end of its input.
+#[derive(Debug)]
+pub struct PackStream {
+    /// The protocol version the pack was received with.
+    pub protocol: gix_protocol::transport::Protocol,
+    /// The first pack bytes, up to the 12 of the header `read_pack_header()` reads.
+    pub header: Vec<u8>,
+    /// Every pack byte that arrived, kept for a pack whose header announces fewer objects than the
+    /// `fetch.unpackLimit` in effect, which `get_pack()` gives to `unpack-objects`.
+    pub retained: Option<Vec<u8>>,
+    /// The demultiplexer reached the end of the stream rather than one of the packets that end it, or the remote
+    /// sent a band-3 message, which `finish_async()` reports as `error in sideband demultiplexer`
+    /// (fetch-pack.c:1098-1099).
+    pub disconnected: bool,
+    /// The pack could not be read to its end, the child's failure.
+    pub consumer_failed: bool,
+    /// A protocol v2 response over a stateless connection whose pack ended at the response-end packet, so
+    /// `do_check_stateless_delimiter()` reads the end of the stream in its place (fetch-pack.c:1847).
+    pub response_end_consumed: bool,
+    /// The pack that was written when the child succeeded.
+    pub bundle: Option<gix_pack::bundle::write::Outcome>,
 }

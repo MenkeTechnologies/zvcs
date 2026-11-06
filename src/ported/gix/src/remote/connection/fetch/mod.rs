@@ -16,7 +16,7 @@ use crate::{
 };
 
 mod error;
-pub use error::Error;
+pub use error::{Error, PackStream};
 
 ///
 pub mod shallow;

@@ -3641,6 +3641,13 @@ fn fetch_one(
         tips.snapshot_before(repo);
     }
 
+    let plan = super::fetch_progress::Plan {
+        progress: transport_progress,
+        quiet: opts.quiet,
+        keep_pack: opts.keep,
+        unpack_limit: super::fetch_progress::unpack_limit(repo),
+        index_pack_required: fsck_objects || from_promisor,
+    };
     let outcome = prepared
         .with_dry_run(opts.dry_run)
         .with_shallow(opts.shallow.clone().unwrap_or_default())
@@ -3658,16 +3665,7 @@ fn fetch_one(
         .with_reflog_message(RefLogMessage::Prefixed {
             action: opts.reflog_action.clone().into(),
         })
-        .receive(
-            super::fetch_progress::Meters::new(super::fetch_progress::Plan {
-                progress: transport_progress,
-                quiet: opts.quiet,
-                keep_pack: opts.keep,
-                unpack_limit: super::fetch_progress::unpack_limit(repo),
-                index_pack_required: fsck_objects || from_promisor,
-            }),
-            &should_interrupt,
-        );
+        .receive(super::fetch_progress::Meters::new(plan), &should_interrupt);
     remote_output.finish();
     let outcome = match outcome {
         Ok(outcome) => outcome,
@@ -3678,6 +3676,12 @@ fn fetch_one(
         Err(gix::remote::fetch::Error::NotConnected) => {
             eprintln!("error: {url} did not send all necessary objects");
             return Ok(Verdict::Rejected);
+        }
+        // The pack's sideband stream ended before `get_pack()` had all of it, which it dies of.
+        Err(gix::remote::fetch::Error::PackStream(stream)) => {
+            let smart_http = raw_url.starts_with("http://") || raw_url.starts_with("https://");
+            super::fetch_progress::pack_stream_died(repo, plan, smart_http, &stream);
+            return Ok(Verdict::Fatal);
         }
         // gitoxide's "no explicit refspec produced a mapping" guard, which git
         // does not have. git asks the question once per refspec, against the
@@ -5815,7 +5819,7 @@ pub(super) fn fetch_pack_fsck_objects(repo: &gix::Repository) -> bool {
 /// index with the creating process's umask and no `.rev`, so a pack that survives the fetch (a
 /// `--keep`, or one at or over `fetch.unpackLimit`) is brought to git's state here. A pack that
 /// [`explode_small_pack`] took apart is gone and skipped.
-fn finish_kept_pack(repo: &gix::Repository, bundle: &gix::odb::pack::bundle::write::Outcome) {
+pub(crate) fn finish_kept_pack(repo: &gix::Repository, bundle: &gix::odb::pack::bundle::write::Outcome) {
     use std::os::unix::fs::PermissionsExt;
     let (Some(index_path), Some(data_path)) = (&bundle.index_path, &bundle.data_path) else {
         return;
@@ -5844,9 +5848,10 @@ fn explode_small_pack(
     repo: &gix::Repository,
     bundle: &gix::odb::pack::bundle::write::Outcome,
 ) -> Result<()> {
-    // `0` disables the shortcut: no header is read, and `index-pack` takes every pack.
+    // `0` reads no header, which leaves `do_keep` at `args->keep_pack`, so `unpack-objects` takes every
+    // pack (fetch-pack.c:991-998, :1007).
     let limit = super::fetch_progress::unpack_limit(repo);
-    if limit == 0 || u64::from(bundle.index.num_objects) >= limit {
+    if limit != 0 && u64::from(bundle.index.num_objects) >= limit {
         return Ok(());
     }
     let (Some(index_path), Some(data_path)) = (&bundle.index_path, &bundle.data_path) else {

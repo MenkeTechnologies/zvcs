@@ -204,9 +204,19 @@ pub(super) fn unmatched_pathspec_check(
             .pathspec_defaults_inherit_ignore_case(false)
             .ok()
             .and_then(|defaults| gix::pathspec::parse(relative.as_bytes(), defaults).ok());
+        // `item->match` keeps the trailing '/' the element was written with
+        // (pathspec.c:481-506), which gix's parse moved into `MUST_BE_DIR`, so
+        // `file_exists("x/")` fails with ENOTDIR on a file named `x` and
+        // `add x/` dies where `add x` would not.
         let (path, glob_or_icase) = match &parsed {
             Some(p) => (
-                p.path().to_str_lossy().into_owned(),
+                {
+                    let mut path = p.path().to_str_lossy().into_owned();
+                    if p.signature.contains(gix::pathspec::MagicSignature::MUST_BE_DIR) && !path.ends_with('/') {
+                        path.push('/');
+                    }
+                    path
+                },
                 p.signature.contains(gix::pathspec::MagicSignature::ICASE)
                     || p.search_mode == gix::pathspec::SearchMode::PathAwareGlob,
             ),

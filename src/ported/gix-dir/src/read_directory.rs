@@ -229,7 +229,8 @@ impl Dir<'_, '_, '_, '_> {
     }
 
     fn disk_path(&self, rela: &BStr) -> PathBuf {
-        let rela = rela.strip_suffix(b"/").unwrap_or(rela);
+        // A rooted base of "/" alone is the filesystem root `opendir()` gets.
+        let rela = rela.strip_suffix(b"/").filter(|r| !r.is_empty()).unwrap_or(rela);
         self.root.join(gix_path::from_bstr(rela.as_bstr()))
     }
 
@@ -390,7 +391,10 @@ impl Dir<'_, '_, '_, '_> {
             baselen = path[prevlen..].find_byte(b'/').map_or(len, |at| prevlen + at);
             sb.clear();
             sb.extend_from_slice(&path[..baselen]);
-            if !self.disk_path(sb.as_bstr()).is_dir() {
+            // `is_directory(sb.buf)` stats the bytes as given: a leading '/' (a
+            // rooted `:(top)/abs` item) leaves the first component empty and
+            // `stat("")` fails, so the walk stops before it starts (dir.c:2862-2865).
+            if sb.is_empty() || !self.disk_path(sb.as_bstr()).is_dir() {
                 break;
             }
             sb.truncate(prevlen);
@@ -600,12 +604,11 @@ impl Dir<'_, '_, '_, '_> {
     ///
     /// The patterns themselves are matched by [`Context::is_excluded`]; only the stack
     /// that decides *when* each ignore file is consulted is kept here, since that is
-    /// what decides which directories are invalidated. Without a cache there is nothing
-    /// to do.
+    /// what decides which directories are invalidated. git runs it from
+    /// `last_matching_pattern()` for every path `is_excluded()` asks about, cache or
+    /// not (dir.c:1822), so a base it cannot split into directories, the "/" a
+    /// rooted `:(top)/` walks from, dies here with or without a cache.
     fn prep_exclude(&mut self, base: &BStr) {
-        if self.untracked.is_none() {
-            return;
-        }
         let baselen = base.len();
         // Pop the directories that are not a prefix of `base`.
         while let Some(&(len, _)) = self.exclude_stack.last() {
@@ -630,8 +633,8 @@ impl Dir<'_, '_, '_, '_> {
             let (start, end) = match current {
                 None => (0, 0),
                 Some(c) => {
-                    let Some(slash) = base[c + 1..].find_byte(b'/') else {
-                        panic!("oops in prep_exclude");
+                    let Some(slash) = base.get(c + 1..).and_then(|rest| rest.find_byte(b'/')) else {
+                        die("oops in prep_exclude");
                     };
                     let end = c + 1 + slash + 1;
                     untracked = self.lookup_untracked(untracked, &base[c..end]);
@@ -888,6 +891,18 @@ impl Dir<'_, '_, '_, '_> {
             self.out.entries.push(path.to_owned());
         }
     }
+}
+
+/// `die()` (usage.c): stdout flushed as `exit()` flushes stdio, then
+/// `fatal: <msg>` and exit 128. The tempfile `atexit` handler removes the
+/// locks taken so far, such as `add`'s `index.lock`; `std::process::exit`
+/// runs no destructors, so the registry is cleaned here first.
+fn die(msg: &str) -> ! {
+    use std::io::Write;
+    gix_tempfile::registry::cleanup_tempfiles();
+    let _ = std::io::stdout().flush();
+    eprintln!("fatal: {msg}");
+    std::process::exit(128)
 }
 
 /// The `READ_GITFILE_ERR_*` codes `is_nonbare_repository_dir()` tells apart.

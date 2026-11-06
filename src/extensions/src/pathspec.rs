@@ -251,7 +251,13 @@ pub fn first_outside_repository_fatal<S: AsRef<[u8]>>(
         let elt: &BStr = spec.as_ref().as_bstr();
         let mut pattern = gix::pathspec::parse(spec.as_ref(), defaults).ok()?;
         // `copyfrom`: the path with the magic already taken off.
-        let copyfrom = pattern.path().to_owned();
+        let copyfrom = element_copyfrom(elt, &pattern);
+        // `:(top)` and `:(prefix:<n>)` copy `copyfrom` verbatim and never reach
+        // `prefix_path_gently()` (pathspec.c:482-487), so `:(top)/nope/x` matches
+        // nothing rather than dying in `real_path()`.
+        if parse_element_magic(elt).is_ok_and(|element| element.rooted()) {
+            return None;
+        }
         // `prefix_path_gently()` resolves an absolute element with `real_path()` first, which
         // dies on a missing parent before the inside/outside question is asked.
         if gix::path::is_absolute(gix::path::from_bstr(copyfrom.as_bstr())) {
@@ -313,6 +319,15 @@ pub fn real_path_strict(arg: &str) -> Result<std::path::PathBuf, String> {
     Ok(resolved)
 }
 
+/// `copyfrom` as `parse_element_magic()` leaves it (pathspec.c:463-468): the
+/// element after its magic, byte for byte. gix's parse drops a trailing '/'
+/// into `MUST_BE_DIR`, so its path would quote `//` as '/' and `../x/` as '../x'.
+pub(crate) fn element_copyfrom(elt: &BStr, pattern: &gix::pathspec::Pattern) -> BString {
+    parse_element_magic(elt)
+        .map(|element| element.path(elt).to_owned())
+        .unwrap_or_else(|_| pattern.path().to_owned())
+}
+
 /// [`first_outside_repository_fatal`] in a repository without a working tree.
 ///
 /// `prefix_path_gently()` still runs there (setup.c:120-147) with a `NULL`
@@ -329,7 +344,10 @@ fn bare_outside_repository_fatal<S: AsRef<[u8]>>(
 ) -> Option<String> {
     let bad = specs.iter().find_map(|spec| {
         let mut pattern = gix::pathspec::parse(spec.as_ref(), defaults).ok()?;
-        let copyfrom = pattern.path().to_owned();
+        let copyfrom = element_copyfrom(spec.as_ref().as_bstr(), &pattern);
+        if parse_element_magic(spec.as_ref().as_bstr()).is_ok_and(|element| element.rooted()) {
+            return None;
+        }
         let outside = gix::path::is_absolute(gix::path::from_bstr(copyfrom.as_bstr()))
             || pattern.normalize(std::path::Path::new(""), std::path::Path::new("")).is_err();
         outside.then(|| (spec.as_ref().as_bstr().to_owned(), copyfrom))

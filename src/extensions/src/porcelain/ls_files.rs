@@ -291,10 +291,15 @@ fn check_pathspecs(
         // (b) Path normalization — a spec escaping the worktree is fatal. git
         // quotes the path portion (magic stripped), captured before normalize
         // consumes it, and prefixes the whole line with the raw spelling.
-        let path = parsed.path().to_str_lossy().into_owned();
+        // The path portion keeps a trailing '/' that gix moved into `MUST_BE_DIR`.
+        let path = crate::pathspec::element_copyfrom(raw.as_str().into(), &parsed)
+            .to_str_lossy()
+            .into_owned();
         // `prefix_path_gently()` resolves an absolute element with `real_path()` first, which
         // dies on a missing parent before the inside/outside question is asked.
-        if path.starts_with('/') {
+        // `:(top)` and `:(prefix:<n>)` never reach it (pathspec.c:482-487).
+        let rooted = crate::pathspec::parse_element_magic(raw.as_str().into()).is_ok_and(|e| e.rooted());
+        if path.starts_with('/') && !rooted {
             if let Err(message) = crate::pathspec::real_path_strict(&path) {
                 eprintln!("fatal: {message}");
                 return Ok(Some(ExitCode::from(128)));

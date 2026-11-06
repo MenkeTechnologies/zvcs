@@ -77,7 +77,12 @@ impl Pattern {
             p.search_mode = search_mode;
         }
         let mut path = &input[cursor..];
-        if path.last() == Some(&b'/') {
+        // git keeps the trailing '/' in `item->match` (pathspec.c:481-506), so a
+        // path that is the '/' alone stays the one-byte match "/": under
+        // `:(top)` it is copied verbatim and no index entry starts with '/', and
+        // without it `prefix_path_gently()` sees an absolute path outside the
+        // worktree. Stripping it left the empty path, which matches everything.
+        if path.last() == Some(&b'/') && path.len() > 1 {
             p.signature |= MagicSignature::MUST_BE_DIR;
             path = &path[..path.len() - 1];
         }

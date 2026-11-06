@@ -1107,6 +1107,7 @@ dependencies = [
  "gix-object",
  "gix-path",
  "gix-pathspec",
+ "gix-tempfile",
  "gix-trace",
  "gix-utils",
  "gix-worktree",

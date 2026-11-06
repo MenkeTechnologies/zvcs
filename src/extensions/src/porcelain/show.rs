@@ -2468,7 +2468,12 @@ pub fn show(args: &[String]) -> Result<ExitCode> {
                     continue;
                 }
             }
-            if let Err(e) = show_one(&repo, &mut out, spec, *id, &pretty, selection, &diff_pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None) {
+            // `out` holds what git has written already, so a `die()` of the object database
+            // (`use_pack()`'s, say) is raised here, after it, rather than where it happens.
+            let shown_this = gix::odb::store::defer_die(|| {
+                show_one(&repo, &mut out, spec, *id, &pretty, selection, &diff_pathspecs, &disp, &pickaxe, &mut shown, source_mode.then_some(spec.as_str()), &mut shown_one, None)
+            });
+            if let Err(e) = shown_this.unwrap_or_else(|message| Err(crate::fatal::die(message))) {
                 // git writes each object as `cmd_show()` reaches it, so a `die()`
                 // partway through the list — `regcomp_or_die()` on the first commit
                 // diffed, say — leaves the objects before it already printed.
@@ -3192,7 +3197,7 @@ fn show_commit<'a>(
         };
         let mut warn = super::diffcore_rename::Warnings::default();
         let mut paths_against = |parent: Option<ObjectId>| -> Result<Vec<Vec<u8>>> {
-            let queue = collect_changes(repo, commit, parent, &disp.patch, &mut warn, specs.as_ref())?;
+            let queue = collect_changes(repo, commit, parent, &disp.patch, &mut warn, specs.as_ref(), false)?;
             Ok(queue.into_iter().map(|f| f.path).collect())
         };
         use super::log::DiffMerges;
@@ -3713,12 +3718,10 @@ fn show_commit_record(
     // 2.55.0), so `log_tree_diff()` is past its `all_need_diff` gate for every
     // commit, and `log_tree_diff_flush()` then tests the queue it built — which is
     // what decides whether the record prints at all (see the suppression below).
-    // So `git show -s --diff-merges=separate` still walks each parent's diff.
-    let diff_shown = (selection != Selection::Disabled
-        || disp.exit_code
-        || pickaxe.active()
-        || from.is_some())
-        && !(parents.is_empty() && !disp.show_root)
+    // So `git show -s --diff-merges=separate` still walks each parent's diff, and so does
+    // every `-s` record: `diff_tree_oid()` reads both trees, and a tree it cannot read
+    // ends the command before the header (log-tree.c:1176-1180).
+    let diff_shown = !(parents.is_empty() && !disp.show_root)
         && !merge_off;
     // `diffcore_pickaxe()` runs inside `diffcore_std()`, which
     // `find_paths_generic()` (combine-diff.c:1378-1420) calls once per parent — so
@@ -3726,6 +3729,9 @@ fn show_commit_record(
     // 0` pass filters (the queue the count formats are measured on).
     let pickaxe_path = pickaxe.active();
     let mut queue_nonempty = false;
+    // A blob `diff_flush()` could not read: git dies there, with `show_log()` and the
+    // separator written and the formats that read nothing ahead of it (diff.c:7166-7300).
+    let mut flush_death: Option<anyhow::Error> = None;
     let files: Vec<FileChange> = if line_log_pairs.is_some() {
         // `-L` renders `line_log_queue_pairs()`' pairs, not the commit's own change
         // set, so none of the collection below runs.
@@ -3750,7 +3756,23 @@ fn show_commit_record(
         if reads_content && remerge.is_none() && !combined && super::rev_list::has_promisor_remote(repo) {
             super::log::prefetch_diff_pairs(repo, commit.id, against, specs.as_mut())?;
         }
-        let mut f = collect_changes(repo, commit, against, &disp.patch, &mut warn, specs.as_ref())?;
+        // The blobs this queue reads: the pickaxe's (in `diffcore_std()`), the diffstat's, and
+        // `--check`'s or a whitespace rule's re-test. The patch reads its own pairs as it
+        // writes them, one by one, in `diff_flush()`.
+        let content = pickaxe_path
+            || selection == Selection::Check
+            || disp.patch.ws != super::diff::Whitespace::Keep
+            || matches!(
+                selection,
+                Selection::Blocks { numstat, stat, shortstat, dirstat, .. } if numstat || stat || shortstat || dirstat
+            );
+        let mut f = match collect_changes(repo, commit, against, &disp.patch, &mut warn, specs.as_ref(), content) {
+            Err(e) if !pickaxe_path && e.downcast_ref::<super::diff::DiedInFlush>().is_some() => {
+                flush_death = Some(e);
+                collect_changes(repo, commit, against, &disp.patch, &mut warn, specs.as_ref(), false)?
+            }
+            res => res?,
+        };
         // Only a pass that reached `too_many_rename_candidates()` writes the
         // `diff_options` fields (see `git log`'s `record_rename_warnings`); an
         // empty report leaves the previous commit's in place.
@@ -4055,6 +4077,11 @@ fn show_commit_record(
         if !header_empty {
             out.push(if disp.z { b'\0' } else { b'\n' });
         }
+        // The combined record's count formats read the first parent's pairs right after this
+        // separator (combine-diff.c:1600-1620).
+        if let Some(e) = flush_death.take() {
+            return Err(e);
+        }
         // A merge's name list is the *combined* one: one status letter per parent,
         // and only the paths that differ from every parent (`diff_tree_combined()`'s
         // dense filter). `--name-only` prints the paths alone.
@@ -4282,6 +4309,19 @@ fn show_commit_record(
             _ => out.push(b'\n'),
         }
     }
+    // `diff_flush()` writes the raw, name and summary formats from the queue alone; the
+    // diffstat reads every pair before it prints (diff.c:7210-7240), as `--check` does,
+    // so only the patch gets as far as the pairs ahead of the unreadable one.
+    if let Some(e) = flush_death.take() {
+        let reads_first = match selection {
+            Selection::Blocks { numstat, stat, shortstat, dirstat, .. } => numstat || stat || shortstat || dirstat,
+            _ => true,
+        };
+        if reads_first {
+            return Err(e);
+        }
+        flush_death = Some(e);
+    }
 
     match selection {
         Selection::Disabled => {}
@@ -4425,7 +4465,16 @@ fn show_commit_record(
                     },
                     &specs,
                     false,
-                )?
+                )
+                .map_err(|e| {
+                    // The pairs ahead of the one `diff_flush()` died on are out.
+                    if let Some(died) = e.downcast_ref::<super::diff::DiedInFlush>() {
+                        let start = out.len();
+                        out.extend_from_slice(&died.written);
+                        disp.no_prefix.borrow_mut().push((start, out.len()));
+                    }
+                    e
+                })?
                 .pop()
                 .unwrap_or_default();
                 // `additional_headers()` (diff.c:3772-3777) and the synthetic pairs
@@ -4447,7 +4496,11 @@ fn show_commit_record(
         }
     }
 
-    Ok(())
+    // The patch read the pairs again and came through; the first read's death stands.
+    match flush_death {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// git limits a commit's diff to paths matching the pathspecs after `--`. Without
@@ -4536,15 +4589,19 @@ fn collect_changes(
     // `-- <pathspec>`: git limits the *tree walk* to it, so the unmodified entries
     // `--find-copies-harder` adds as copy sources are limited by it too.
     specs: Option<&super::log::PathspecMatcher>,
+    // Whether a format reads the blobs in `diff_flush()`: the count formats, the patch,
+    // `--check`, or a whitespace rule the queue is re-tested under.
+    content: bool,
 ) -> Result<Vec<FileChange>> {
     let ws = opts.ws;
-    let new_tree = commit.tree()?;
+    // `diff_tree_oid()`'s two trees, read as `fill_tree_descriptor()` reads them (tree-walk.c:85-99).
+    let new_tree = super::log::diff_tree_side(repo, commit.id)?;
     let old_tree = match parent {
         // A commit id in every caller but one: `--diff-merges=remerge` hands the
         // re-merged *tree* here, which is what `diff_tree_oid()` is given in
         // `do_remerge_diff()` (log-tree.c:1076). Peeling accepts both and is the same
         // step for a commit.
-        Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
+        Some(pid) => Some(super::log::diff_tree_side(repo, pid)?),
         None => None,
     };
     // `-R` (`flags.reverse_diff`): `diff_change()` and `diff_addremove()` swap
@@ -4563,9 +4620,27 @@ fn collect_changes(
     )?;
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
 
+    // `diffcore_rename()` reads a blob only with a source and a destination to pair, or
+    // with copies or `-B` making every modification a source (diffcore-rename.c:1416-1462),
+    // ahead of `show_log()`. Every other read is `diff_flush()`'s, after it, and so is
+    // marked as one.
+    let copies_or_break = opts.find_copies_harder
+        || opts.break_opt != -1
+        || opts.renames == Some(super::diffcore_rename::DETECT_COPY);
+    let paired = changes.iter().any(|c| matches!(c, ChangeDetached::Addition { .. }))
+        && changes.iter().any(|c| matches!(c, ChangeDetached::Deletion { .. }));
     let mut out = Vec::with_capacity(changes.len());
     for change in &changes {
-        if let Some(f) = prepare_change(repo, change, ws)? {
+        let renames_read = opts.renames != Some(0)
+            && match change {
+                ChangeDetached::Addition { .. } | ChangeDetached::Deletion { .. } => paired || copies_or_break,
+                _ => copies_or_break,
+            };
+        let f = prepare_change(repo, change, ws, content || renames_read).map_err(|e| match renames_read {
+            false => super::diff::died_in_flush(e, Vec::new()),
+            true => e,
+        })?;
+        if let Some(f) = f {
             out.push(f);
         }
     }
@@ -4784,8 +4859,15 @@ fn prepare_change(
     repo: &gix::Repository,
     change: &ChangeDetached,
     ws: super::diff::Whitespace,
+    // Whether the blobs are read: only a format that shows content, the pickaxe or
+    // `diffcore_rename()` reads them (diff.c:4596-4598 is the read).
+    read: bool,
 ) -> Result<Option<FileChange>> {
     let null = ObjectId::null(repo.object_hash());
+    let blob_of = |repo: &gix::Repository, id: ObjectId, is_sub: bool| match read {
+        true => content_of(repo, id, is_sub),
+        false => Ok(Vec::new()),
+    };
     let mut f = match change {
         ChangeDetached::Addition {
             location,
@@ -4807,7 +4889,7 @@ fn prepare_change(
                 old_id: null,
                 new_id: *id,
                 old_content: Vec::new(),
-                new_content: content_of(repo, *id, is_sub)?,
+                new_content: blob_of(repo, *id, is_sub)?,
                 old_is_sub: false,
                 new_is_sub: is_sub,
                 is_binary: false,
@@ -4835,7 +4917,7 @@ fn prepare_change(
                 new_mode: None,
                 old_id: *id,
                 new_id: null,
-                old_content: content_of(repo, *id, is_sub)?,
+                old_content: blob_of(repo, *id, is_sub)?,
                 new_content: Vec::new(),
                 old_is_sub: is_sub,
                 new_is_sub: false,
@@ -4873,8 +4955,8 @@ fn prepare_change(
                 new_mode: Some(entry_mode.value().into()),
                 old_id: *previous_id,
                 new_id: *id,
-                old_content: content_of(repo, *previous_id, old_is_sub)?,
-                new_content: content_of(repo, *id, new_is_sub)?,
+                old_content: blob_of(repo, *previous_id, old_is_sub)?,
+                new_content: blob_of(repo, *id, new_is_sub)?,
                 old_is_sub,
                 new_is_sub,
                 is_binary: false,
@@ -5416,7 +5498,7 @@ fn combined_pickaxe_survivors(
     let mut survivors: Option<Vec<Vec<u8>>> = None;
     for parent in parents {
         let mut warn = super::diffcore_rename::Warnings::default();
-        let mut f = collect_changes(repo, commit, Some(parent.detach()), &disp.patch, &mut warn, specs.as_ref())?;
+        let mut f = collect_changes(repo, commit, Some(parent.detach()), &disp.patch, &mut warn, specs.as_ref(), true)?;
         if let Some(specs) = &specs {
             f.retain(|c| specs.matches(&c.path));
         }

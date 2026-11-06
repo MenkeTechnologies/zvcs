@@ -45,11 +45,50 @@ pub(crate) struct Pack<'a> {
 }
 
 /// `die()`: what stdout holds is flushed as `exit()` flushes stdio, then `fatal: <msg>` and 128.
-pub(crate) fn die(msg: &str) -> ! {
+///
+/// On a thread inside [`defer_die()`] the `die()` is not this thread's to raise: the read was made
+/// ahead of the point git makes it, so the message unwinds to the nearest [`catch_die()`] and the
+/// caller raises it once git's sequential order reaches that read.
+pub fn die(msg: &str) -> ! {
     use std::io::Write;
+    if DEFER_DIE.get() {
+        std::panic::resume_unwind(Box::new(Died(msg.to_owned())));
+    }
     let _ = std::io::stdout().flush();
     eprintln!("fatal: {msg}");
     std::process::exit(128)
+}
+
+/// The payload a deferred [`die()`] unwinds with.
+struct Died(String);
+
+thread_local! {
+    /// Set by [`defer_die()`]: a [`die()`] on this thread unwinds instead of exiting.
+    static DEFER_DIE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` where a [`die()`] is the caller's to raise: work computed ahead of the order git does it
+/// in, such as the next commits' patches of `log -p`, or output this port holds where git has
+/// already written it. A `die()` inside comes back as `Err(<message>)`; [`capture_errors()`] around
+/// it holds the `error()` lines too.
+pub fn defer_die<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    let before = DEFER_DIE.replace(true);
+    let out = catch_die(f);
+    DEFER_DIE.set(before);
+    out
+}
+
+/// Run `f`, handing back a [`die()`] that [`defer_die()`] made unwind as `Err(<message>)`, for a
+/// caller that knows what git had written by then. Outside [`defer_die()`] a `die()` exits, so this
+/// only ever returns `Ok`.
+pub fn catch_die<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(out) => Ok(out),
+        Err(payload) => match payload.downcast::<Died>() {
+            Ok(died) => Err(died.0),
+            Err(other) => std::panic::resume_unwind(other),
+        },
+    }
 }
 
 thread_local! {

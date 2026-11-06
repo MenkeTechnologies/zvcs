@@ -2667,6 +2667,32 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     }
     dedup_in_place(&mut tips);
 
+    // `revs->limited` (revision.c:431-436, 2438-2547, 2750, 3195-3196): an
+    // UNINTERESTING pending commit, `topo_order` without generation numbers, or
+    // one of the options that set it where they are parsed. `--bisect` sets it
+    // in `cmd_rev_list()` (builtin/rev-list.c:916-917).
+    let limited = seeds.iter().any(|s| s.uninteresting)
+        || order != Order::Date
+        || ancestry_path
+        || cherry_mark
+        || cherry_pick
+        || left_only
+        || right_only
+        || show_children
+        || simplify_merges_opt
+        || simplify_by_decoration
+        || bisect;
+
+    // `--in-commit-order` lists each commit's objects as `get_revision()` hands the commit
+    // out, so the walk's reads and the listing's interleave (list-objects.c:432-447); a
+    // limited walk, `--reverse` and the reflog and `--no-walk` lists are drained first.
+    let streams_objects =
+        objects && in_commit_order && !reverse && !limited && !no_walk && !walk_reflogs && !graph;
+    // What the walk's reads printed, by the commit they were read for, and in walk order;
+    // and what the reads for the commits after an abort printed. See the walk below.
+    let mut walk_lines: HashMap<ObjectId, Vec<String>> = HashMap::new();
+    let mut abort_lines: Vec<String> = Vec::new();
+
     // 1. Full commit list in date order — the input every later stage refines.
     let mut commits: Vec<ObjectId> = Vec::new();
     let mut parents_of: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
@@ -2716,9 +2742,26 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         if !hidden.is_empty() && !exclude_first_parent_only {
             platform = platform.with_hidden(hidden.clone());
         }
-        for info in platform.all()? {
+        let mut walk = platform.all()?;
+        loop {
+            // `get_revision()` reads a commit's parents as it hands the commit out
+            // (revision.c:1189-1194), and under `--in-commit-order` the commit's objects
+            // are listed before the next one is asked for (list-objects.c:432-447). The
+            // walk here runs ahead of that listing, so what its reads print is held
+            // with the commit they were read for, and printed when the listing gets
+            // there; a listing that dies first never prints it, as git never read it.
+            let (info, lines) = match streams_objects {
+                true => gix::odb::store::capture_errors(|| walk.next()),
+                false => (walk.next(), Vec::new()),
+            };
+            let Some(info) = info else { break };
             let info = match info {
-                Ok(info) => info,
+                Ok(info) => {
+                    if !lines.is_empty() {
+                        walk_lines.insert(info.id, lines);
+                    }
+                    info
+                }
                 // `process_parents()` (revision.c:1189-1194) parses every parent of
                 // the commit it just popped, so a parent the odb cannot produce ends
                 // the walk one commit *earlier* than this iterator notices it — the
@@ -2731,17 +2774,32 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
                     super::log::WalkAbort::failed_on(&err),
                 ) {
                     Some((at, found)) => {
-                        commits.truncate(at);
+                        // The commits from `at` on are never handed out, so what was read
+                        // for them is printed where the walk dies.
+                        for id in commits.drain(at..) {
+                            abort_lines.extend(walk_lines.remove(&id).unwrap_or_default());
+                        }
+                        abort_lines.extend(lines);
                         abort = Some(found);
                         break;
                     }
-                    None => return Err(err.into()),
+                    None => {
+                        print_lines(lines);
+                        return Err(err.into());
+                    }
                 },
             };
             parents_of.insert(info.id, info.parent_ids.to_vec());
             commits.push(info.id);
         }
     }
+
+    // The order the walk handed the commits out in, for printing what it read for each.
+    let walk_order: Vec<ObjectId> = match streams_objects {
+        true => commits.clone(),
+        false => Vec::new(),
+    };
+    let mut walk_pos = 0;
 
     if exclude_first_parent_only && !hidden.is_empty() {
         let excluded = super::log::ancestor_closure_opt(&repo, &hidden, true)?;
@@ -2795,22 +2853,6 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         parents_of = nodes.iter().map(|n| (n.id, n.parents.clone())).collect();
         abort = None;
     }
-
-    // `revs->limited` (revision.c:431-436, 2438-2547, 2750, 3195-3196): an
-    // UNINTERESTING pending commit, `topo_order` without generation numbers, or
-    // one of the options that set it where they are parsed. `--bisect` sets it
-    // in `cmd_rev_list()` (builtin/rev-list.c:916-917).
-    let limited = seeds.iter().any(|s| s.uninteresting)
-        || order != Order::Date
-        || ancestry_path
-        || cherry_mark
-        || cherry_pick
-        || left_only
-        || right_only
-        || show_children
-        || simplify_merges_opt
-        || simplify_by_decoration
-        || bisect;
     // `revs->max_age`: under `-g` the reflog arm of `get_revision_1()` drops each
     // entry whose own date fails the test (revision.c:4472-4476); `--no-walk`
     // pops the pending list the same way; any other walk is cut as
@@ -3927,6 +3969,13 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
         Ok(())
     };
     for ((id, is_boundary), own_parents) in emitted.iter().zip(&emitted_parents) {
+        // What the walk read to hand this commit out, and the commits it skipped before it.
+        if let Some(at) = walk_order[walk_pos..].iter().position(|c| c == id) {
+            for c in &walk_order[walk_pos..=walk_pos + at] {
+                print_lines(walk_lines.remove(c).unwrap_or_default());
+            }
+            walk_pos += at + 1;
+        }
         stage(&mut out)?;
         let record_start = out.len();
         let record_parents: &[ObjectId] = match own_parents {
@@ -4246,6 +4295,12 @@ pub fn rev_list(args: &[String]) -> Result<ExitCode> {
     // `while ((commit = get_revision(revs)))` loop and prints them once it ends,
     // so a walk that died never reaches the print — only the plain listing, which
     // git emits commit by commit, keeps the prefix it managed to produce.
+    // The rest of what the walk read, then what it read for the commits an abort left
+    // unlisted, which `die()` follows.
+    for c in &walk_order[walk_pos..] {
+        print_lines(walk_lines.remove(c).unwrap_or_default());
+    }
+    print_lines(std::mem::take(&mut abort_lines));
     if let Some(abort) = abort {
         // A pathspec puts `try_to_simplify_commit()` (revision.c:1182) ahead of
         // `process_parents()`'s parent loop, and its tree diff hits the unreadable
@@ -6712,4 +6767,11 @@ fn packed_entry_size(pack_dir: &std::path::Path, id: ObjectId) -> Option<u64> {
         return Some(end - offset);
     }
     None
+}
+
+/// Print the `error()` lines an object read printed while they were held.
+fn print_lines(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("{line}");
+    }
 }

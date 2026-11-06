@@ -7021,6 +7021,93 @@ pub(crate) fn commit_patches(
     Ok(out)
 }
 
+/// One commit's patch computed ahead of its record: what git would have printed to stderr while it
+/// read the commit's objects, and the patch, or how `log_tree_diff()` ended for it.
+pub(crate) struct Ahead {
+    pub(crate) errors: Vec<String>,
+    pub(crate) patch: Result<Vec<u8>>,
+}
+
+impl Ahead {
+    /// Work `f` that runs ahead of git's order, its `die()` and `error()` lines held for the record.
+    pub(crate) fn run(f: impl FnOnce() -> Result<Vec<u8>>) -> Ahead {
+        let (patch, errors) = gix::odb::store::capture_errors(|| gix::odb::store::defer_die(f));
+        Ahead { errors, patch: patch.unwrap_or_else(|message| Err(crate::fatal::die(message))) }
+    }
+}
+
+/// [`commit_patches`] for commits whose records have not been written yet. git reads a commit's
+/// trees and blobs only once `log_tree_commit()` reaches it, so a read that dies leaves every
+/// earlier record printed and nothing after it (log-tree.c:1176-1222). Each job's `die()` and
+/// `error()` lines are therefore held in its [`Ahead`], for the caller to raise when the record is
+/// due; and once a job has failed, nothing after it is computed, since git never gets there.
+pub(crate) fn commit_patches_ahead(
+    repo: &gix::Repository,
+    jobs: &[(ObjectId, Option<ObjectId>)],
+    opts: &PatchOpts,
+    paths: &[String],
+) -> Result<Vec<Ahead>> {
+    let workers = crate::threads::count(jobs.len(), 4).max(1);
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    // The first job that failed: the record git dies at.
+    let failed_at = std::sync::atomic::AtomicUsize::new(usize::MAX);
+    let mut done: Vec<(usize, Ahead)> = Vec::with_capacity(jobs.len());
+    let mut failure: Option<anyhow::Error> = None;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let proto = repo.clone();
+            let (cursor, failed_at) = (&cursor, &failed_at);
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, Ahead)>> {
+                use std::sync::atomic::Ordering::Relaxed;
+                let repo = proto;
+                let mut cache = repo.diff_resource_cache_for_tree_diff()?;
+                let r = patch_render(&repo, opts);
+                let mut specs = match paths.is_empty() {
+                    true => None,
+                    false => Some(super::log::PathspecMatcher::new(&repo, paths)?),
+                };
+                let mut drivers = DriverCache::new(&repo)?;
+                let mut mine = Vec::new();
+                loop {
+                    let i = cursor.fetch_add(1, Relaxed);
+                    let Some((id, parent)) = jobs.get(i) else { break };
+                    if i > failed_at.load(Relaxed) {
+                        break;
+                    }
+                    let ahead = Ahead::run(|| {
+                        commit_patch_with(&repo, &mut cache, &mut drivers, &r, *id, *parent, opts, specs.as_mut(), false)
+                    });
+                    if ahead.patch.is_err() {
+                        failed_at.fetch_min(i, Relaxed);
+                    }
+                    mine.push((i, ahead));
+                }
+                Ok(mine)
+            }));
+        }
+        for h in handles {
+            match h.join() {
+                Ok(Ok(mine)) => done.extend(mine),
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(_) => {
+                    failure.get_or_insert_with(|| anyhow::anyhow!("diff worker panicked"));
+                }
+            }
+        }
+    });
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    let mut out: Vec<Ahead> = (0..jobs.len()).map(|_| Ahead { errors: Vec::new(), patch: Ok(Vec::new()) }).collect();
+    for (i, ahead) in done {
+        out[i] = ahead;
+    }
+    Ok(out)
+}
+
 /// The file pairs one commit's diff resolves to: the tree-to-tree change list with
 /// the pathspec limit and `diffcore_rename()` already applied. Shared by the patch
 /// renderer and by `--dirstat`, which needs the same queue but different per-pair
@@ -7043,14 +7130,14 @@ fn commit_deltas(
     // used to narrow the queue. See the block at the end of this function.
     strip: bool,
 ) -> Result<Vec<Delta>> {
-    let commit = repo.find_object(commit_id)?.try_into_commit()?;
-    let new_tree = commit.tree()?;
+    // `diff_tree_oid()`'s two trees, read as `fill_tree_descriptor()` reads them (tree-walk.c:85-99).
+    let new_tree = super::log::diff_tree_side(repo, commit_id)?;
     let old_tree = match parent {
         // A commit id in every caller but one: `--diff-merges=remerge` hands the
         // re-merged *tree* here, which is what `diff_tree_oid()` is given in
         // `do_remerge_diff()` (log-tree.c:1076). Peeling accepts both and is the same
         // step for a commit.
-        Some(pid) => Some(repo.find_object(pid)?.peel_to_tree()?),
+        Some(pid) => Some(super::log::diff_tree_side(repo, pid)?),
         None => None,
     };
     // `-R` swaps every pair as the queue is built (`diff_change()`,
@@ -7443,8 +7530,10 @@ fn commit_patch_with(
                 out.extend_from_slice(&apply_line_prefix(lines, &opts.line_prefix));
                 continue;
             }
-            // A worktree side never arises for a tree diff, so `workdir` is `None`.
-            let an = analyze(
+            // A worktree side never arises for a tree diff, so `workdir` is `None`. The pair is
+            // read inside `diff_flush()`, so a read that dies here dies with the header and the
+            // pairs before this one already written (diff.c:6980-6990, :4596-4598).
+            let an = gix::odb::store::catch_die(|| analyze(
                 cache,
                 &repo.objects,
                 delta,
@@ -7466,7 +7555,30 @@ fn commit_patch_with(
                     inter_hunk_ctx: opts.inter_hunk_ctx,
                     irreversible_delete: opts.irreversible_delete,
                 },
-            )?;
+            ))
+            .unwrap_or_else(|message| Err(crate::fatal::die(message)));
+            let an = match an {
+                Ok(an) => an,
+                Err(e) => {
+                    // Under `--color-moved` the pairs are held in `o->emitted_symbols` until
+                    // the last one is done (diff.c:7088-7120), so nothing of the patch is out.
+                    let held = opts.colors.enabled()
+                        && opts.extra.color_moved.is_some_and(|m| m != diff_color::ColorMoved::No);
+                    if !held {
+                        out.extend_from_slice(&diff_color::colorize_patch_ex(
+                            &plain,
+                            &opts.colors,
+                            &paint_opts,
+                            &files,
+                            diff_color::FilePaint::new(ws_rule),
+                            &opts.extra,
+                        ));
+                    } else {
+                        out.clear();
+                    }
+                    return Err(died_in_flush(e, out));
+                }
+            };
             let before = plain.len();
             render_patch(&mut plain, repo, delta, &an, r)?;
             if plain.len() != before {
@@ -7870,6 +7982,43 @@ fn analyze_all(
 /// exactly the empty filespec. The lift also moves the platform's cache key from the
 /// path to the (null) id, so an absent side shares one entry instead of shadowing the
 /// worktree entry for that path.
+/// A blob side handed to the platform, which reads it: one the object database does not produce
+/// is `diff_populate_filespec()`'s `die("unable to read %s")` (diff.c:4596-4598).
+fn read_side(res: Result<(), gix::diff::blob::platform::set_resource::Error>, id: ObjectId) -> Result<()> {
+    use gix::diff::blob::{pipeline::convert_to_diffable, platform::set_resource};
+    match res {
+        Err(set_resource::Error::ConvertToDiffable(convert_to_diffable::Error::FindObject(_))) => {
+            Err(crate::fatal::die(format!("unable to read {id}")))
+        }
+        res => Ok(res?),
+    }
+}
+
+/// A read that died inside `diff_flush()`, after `log_tree_diff_flush()` had run `show_log()` and
+/// written the separator (log-tree.c:939-967): the record's header is out, and so is what the flush
+/// wrote for the pairs ahead of the one it died on, which is `written`. Attached as context to the
+/// error, which stays the `die()` it was.
+#[derive(Debug)]
+pub(crate) struct DiedInFlush {
+    message: String,
+    pub(crate) written: Vec<u8>,
+}
+
+impl std::fmt::Display for DiedInFlush {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Mark `e` as raised inside `diff_flush()`, after `written`.
+pub(crate) fn died_in_flush(e: anyhow::Error, written: Vec<u8>) -> anyhow::Error {
+    if e.downcast_ref::<DiedInFlush>().is_some() {
+        return e;
+    }
+    let message = e.to_string();
+    e.context(DiedInFlush { message, written })
+}
+
 fn set_absent_resource(
     cache: &mut gix::diff::blob::Platform,
     kind: ResourceKind,
@@ -8000,14 +8149,14 @@ fn analyze(
         );
     }
     match delta.old {
-        Some((id, k)) => cache.set_resource(id, k, old_side_path, ResourceKind::OldOrSource, objects)?,
+        Some((id, k)) => read_side(cache.set_resource(id, k, old_side_path, ResourceKind::OldOrSource, objects), id)?,
         // An addition's pre-image is git's invalid filespec — `diff_populate_filespec()`
         // returns an empty one without touching the worktree. See [`set_absent_resource`].
         None => set_absent_resource(cache, ResourceKind::OldOrSource, old_kind, old_side_path, objects, null)?,
     };
     match &delta.new {
         NewSide::Blob(id, k) => {
-            cache.set_resource(*id, *k, path, ResourceKind::NewOrDestination, objects)?;
+            read_side(cache.set_resource(*id, *k, path, ResourceKind::NewOrDestination, objects), *id)?;
         }
         NewSide::Worktree(k) => {
             // With `new_root` set on the cache, a null id reads from the worktree by path.

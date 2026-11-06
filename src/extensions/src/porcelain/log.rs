@@ -696,7 +696,24 @@ pub fn log(args: &[String]) -> Result<ExitCode> {
     log_flavored(args, Flavor::Log)
 }
 
+/// [`log_flavored_records`], and the record a read inside `diff_flush()` died in: by then
+/// `log_tree_diff_flush()` has run `show_log()` and written the separator after it
+/// (log-tree.c:939-967), and `diff_flush()` the pairs ahead of the one it died on, all of which
+/// `exit()` flushes from stdio. This port renders a record only once its diff is done, so what git
+/// had written is held for the record until then, and written here when it does not get there.
 fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
+    let mut shown = None;
+    let res = log_flavored_records(args, flavor, &mut shown);
+    if let (Err(e), Some(head)) = (&res, shown) {
+        if let Some(died) = e.downcast_ref::<super::diff::DiedInFlush>() {
+            let mut stdout = crate::cstdio::block();
+            let _ = stdout.write_all(&head).and_then(|()| stdout.write_all(&died.written));
+        }
+    }
+    res
+}
+
+fn log_flavored_records(args: &[String], flavor: Flavor, shown: &mut Option<Vec<u8>>) -> Result<ExitCode> {
     // Repeated object reads (one per rendered commit) re-inflate from the pack
     // without a cache; gix ships one and simply does not enable it by default.
     // A few MB turns `log` on a deep history from thousands of decompressions
@@ -6077,6 +6094,27 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
         // (`graph_show_commit_msg`), so the split has to survive into
         // [`render_graph`]; everything appended below is diff output.
         let mut msg_len = block.len();
+        // What git has written of this record when `diff_flush()` reads its first blob, for
+        // [`log_flavored`]: `show_log()`, and the separator `log_tree_diff_flush()` writes after
+        // it for a format that is not `oneline` (log-tree.c:939-967). Under `--no-commit-id`
+        // there is neither. Only the stat formats and the patch read blobs there.
+        *shown = None;
+        let reads_blobs = emit_patch || ((stat || numstat || shortstat) && !name_only && !name_status);
+        if reads_blobs && !graph && !line_level && !probe_queue {
+            let mut head: Vec<u8> = Vec::new();
+            if !no_commit_id {
+                if !terminator && !first {
+                    head.push(rec_term);
+                }
+                head.extend_from_slice(&block);
+                if !matches!(pretty, Pretty::Oneline) && !empty_user_format {
+                    let dashes =
+                        stat && emit_patch && !mail_notes_shown_dashes(&repo, &notes_trees, &pretty, node.id)?;
+                    head.extend_from_slice(if dashes { b"---\n" } else { b"\n" });
+                }
+            }
+            *shown = Some(super::diff::apply_line_prefix(head, &line_prefix));
+        }
 
         // `log_tree_diff` short-circuits under `-L`: it flushes the pairs
         // `line_log_queue_pairs()` produced and returns, so neither the merge rule
@@ -6686,6 +6724,15 @@ fn log_flavored(args: &[String], flavor: Flavor) -> Result<ExitCode> {
                 }
             }
             if emit_patch {
+                // `diff_flush()` has written the formats ahead of the patch, and its
+                // separator, by the time the patch reads a blob (diff.c:7210-7262).
+                if let Some(head) = shown.as_mut() {
+                    let mut ahead = diff.clone();
+                    if separator {
+                        ahead.push(rec_term);
+                    }
+                    head.extend_from_slice(&super::diff::apply_line_prefix(ahead, &line_prefix));
+                }
                 // The full patch, rendered by the same pipeline as `git diff` so
                 // the two agree byte-for-byte. git separates a preceding count
                 // format from the patch with a blank line.
@@ -7977,7 +8024,8 @@ struct PatchWindow {
     patch_opts: super::diff::PatchOpts,
     /// Index of `slots[0]` within the caller's node list.
     start: usize,
-    slots: Vec<Vec<u8>>,
+    /// Each commit's patch, or how its diff ended, with the `error()` lines its reads printed.
+    slots: Vec<super::diff::Ahead>,
 }
 
 impl PatchWindow {
@@ -8033,7 +8081,7 @@ impl PatchWindow {
             let mut at: Vec<usize> = Vec::with_capacity(span.len());
             // A merge under `combined`/`dense-combined` needs every parent tree at
             // once, so it is rendered on its own rather than as a two-way job.
-            let mut merged: Vec<(usize, Vec<u8>)> = Vec::new();
+            let mut merged: Vec<(usize, super::diff::Ahead)> = Vec::new();
             for (k, n) in span.iter().enumerate() {
                 if !self.diffable(n) {
                     continue;
@@ -8043,20 +8091,22 @@ impl PatchWindow {
                         DiffMerges::Combined | DiffMerges::DenseCombined => {
                             merged.push((
                                 k,
-                                super::diff::merge_combined_patch_painted(
-                                    repo,
-                                    n.id,
-                                    &n.parents,
-                                    paths,
-                                    ctx,
-                                    self.merges == DiffMerges::DenseCombined,
-                                    &self.patch_opts.colors,
-                                    // `show_combined_header()` (combine-diff.c:931-933).
-                                    &super::diff::CombinedHeaderOpts::from_patch_opts(
-                                        &self.patch_opts,
-                                        false,
-                                    ),
-                                )?,
+                                super::diff::Ahead::run(|| {
+                                    super::diff::merge_combined_patch_painted(
+                                        repo,
+                                        n.id,
+                                        &n.parents,
+                                        paths,
+                                        ctx,
+                                        self.merges == DiffMerges::DenseCombined,
+                                        &self.patch_opts.colors,
+                                        // `show_combined_header()` (combine-diff.c:931-933).
+                                        &super::diff::CombinedHeaderOpts::from_patch_opts(
+                                            &self.patch_opts,
+                                            false,
+                                        ),
+                                    )
+                                }),
                             ));
                             continue;
                         }
@@ -8071,8 +8121,10 @@ impl PatchWindow {
                 jobs.push((n.id, n.parents.first().copied()));
                 at.push(k);
             }
-            let computed = super::diff::commit_patches(repo, &jobs, &self.patch_opts, paths, false)?;
-            self.slots = vec![Vec::new(); span.len()];
+            let computed = super::diff::commit_patches_ahead(repo, &jobs, &self.patch_opts, paths)?;
+            self.slots = (0..span.len())
+                .map(|_| super::diff::Ahead { errors: Vec::new(), patch: Ok(Vec::new()) })
+                .collect();
             for (slot, patch) in at.into_iter().zip(computed) {
                 self.slots[slot] = patch;
             }
@@ -8081,7 +8133,16 @@ impl PatchWindow {
             }
             self.start = i;
         }
-        Ok(&self.slots[i - self.start])
+        // The record is due: what its reads printed goes out now, and a read that died dies
+        // here, with every earlier record written (log-tree.c:1176-1222).
+        let slot = &mut self.slots[i - self.start];
+        for line in slot.errors.drain(..) {
+            eprintln!("{line}");
+        }
+        if slot.patch.is_err() {
+            return std::mem::replace(&mut slot.patch, Ok(Vec::new())).map(|_| &[][..]);
+        }
+        Ok(slot.patch.as_deref().unwrap_or_default())
     }
 }
 
@@ -13493,7 +13554,7 @@ pub(super) fn prefetch_diff_pairs(
 /// `log_tree_diff()` passes as `get_commit_tree_oid()` (log-tree.c:1171-1172, :1251), or
 /// `id` itself when it is a tree. `fill_tree_descriptor()` reads it peeled to a
 /// tree and dies naming it when it is not one (tree-walk.c:85-99).
-fn diff_tree_side(repo: &gix::Repository, id: ObjectId) -> Result<gix::Tree<'_>> {
+pub(crate) fn diff_tree_side(repo: &gix::Repository, id: ObjectId) -> Result<gix::Tree<'_>> {
     let object = repo.find_object(id)?;
     let tree_id = match object.kind {
         gix::object::Kind::Commit => object.into_commit().tree_id()?.detach(),
@@ -13590,9 +13651,23 @@ fn collect_changes(
     )?;
     changes.sort_by(|a, b| change_path(a).cmp(change_path(b)));
 
+    // The tallies are `diff_flush()`'s diffstat, read after `show_log()` (log-tree.c:939-967),
+    // unless `diffcore_rename()` reads the blob first, which it does only with a source and a
+    // destination to pair, or with copies or `-B` making every modification a source
+    // (diffcore-rename.c:1416-1462).
+    let renames_read = detect.is_some_and(|o| {
+        let paired = changes.iter().any(|c| matches!(c, ChangeDetached::Addition { .. }))
+            && changes.iter().any(|c| matches!(c, ChangeDetached::Deletion { .. }));
+        o.renames != Some(0) && (paired || o.find_copies_harder || o.break_opt != -1)
+            || o.renames == Some(super::diffcore_rename::DETECT_COPY)
+    });
     let mut out = Vec::with_capacity(changes.len());
     for change in &changes {
-        if let Some(f) = prepare_change(repo, change, with_counts, ws)? {
+        let f = prepare_change(repo, change, with_counts, ws).map_err(|e| match with_counts && !renames_read {
+            true => super::diff::died_in_flush(e, Vec::new()),
+            false => e,
+        })?;
+        if let Some(f) = f {
             out.push(f);
         }
     }

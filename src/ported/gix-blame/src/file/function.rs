@@ -1377,9 +1377,18 @@ pub(crate) fn tokens_for_diffing(data: &[u8]) -> impl TokenSource<Token = &[u8]>
 /// `\n`, so `git blame -w` (`XDF_IGNORE_WHITESPACE`) treats a whitespace-only line change as no
 /// change. Keeping every `\n` preserves the line count, so a diff of the stripped data yields
 /// hunk line-indices that still map one-to-one onto the original lines.
+///
+/// The `\n` ending a record is whitespace to `xdl_recmatch()` too (`XDL_ISSPACE()`,
+/// xdiff/xutils.c), so under `-w` a last line without one matches the same text with
+/// one; a missing final `\n` is supplied so the two compare equal.
 pub fn strip_whitespace_per_line(data: &[u8]) -> Vec<u8> {
-    data.iter()
+    let mut out: Vec<u8> = data
+        .iter()
         .copied()
         .filter(|&b| b == b'\n' || !matches!(b, b' ' | b'\t' | b'\r' | 0x0c | 0x0b))
-        .collect()
+        .collect();
+    if data.last().is_some_and(|&b| b != b'\n') {
+        out.push(b'\n');
+    }
+    out
 }

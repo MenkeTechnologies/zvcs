@@ -293,6 +293,11 @@ pub fn describe(args: &[String]) -> Result<ExitCode> {
             }
         }
         (Some(mark), None) => {
+            // `setup_work_tree(the_repository)` opens the arm (builtin/describe.c:760),
+            // so from a cwd inside `.git` `--dirty` dies where `--broken` only marks.
+            if !repo.workdir().is_some_and(|wt| wt.is_dir()) {
+                return Err(crate::fatal::need_work_tree());
+            }
             let index = repo.index_or_empty()?;
             if let Some(death) = super::read_tree::StatCtx::refresh_dies_on_attr_source(&repo, &index, |_| true)? {
                 return death.die();
@@ -1022,13 +1027,25 @@ fn format_outcome(
     // annotated tag object whose own name is `inner` describes as `inner`, with a
     // warning naming both. gitoxide carries the ref name through instead, which
     // printed `light-to-tag-2-g725c7d5` where stock prints `inner-2-g725c7d5`.
+    //
+    // `misnamed` and `tagged` are `n->misnamed` and `get_tagged_oid(n->tag)`, which
+    // decide `append_suffix()` below. The warning names `n->path`, the ref less
+    // `refs/tags/`, or under --all less `refs/` only (`get_name()`, :155-160).
+    let mut misnamed = false;
+    let mut tagged: Option<gix::ObjectId> = None;
     if let Some(name) = outcome.name.as_deref() {
-        if let Some(embedded) = annotated_tag_name(repo, name) {
+        if let Some((embedded, target)) = annotated_tag_name(repo, name) {
+            tagged = Some(target);
             if embedded != name {
+                let path = match opts.prefix_names {
+                    true => format!("tags/{name}"),
+                    false => name.to_string(),
+                };
                 eprintln!(
                     "warning: tag '{}' is externally known as '{}'",
-                    name, embedded
+                    path, embedded
                 );
+                misnamed = true;
             }
             let shown: BString = match opts.prefix_names {
                 true => {
@@ -1053,18 +1070,50 @@ fn format_outcome(
         }
     }
 
-    // `--abbrev=0` is git's request to drop the `-<depth>-g<hash>` tail entirely.
-    let mut out = if opts.abbrev == Some(0) {
-        match &outcome.name {
+    // ```c
+    // /* exact match */
+    // append_name(n, dst);
+    // if (n->misnamed || longformat)
+    //         append_suffix(0, n->tag ? get_tagged_oid(n->tag) : &cmit->object.oid, dst);
+    // …
+    // append_name(all_matches[0].name, dst);
+    // if (all_matches[0].name->misnamed || abbrev)
+    //         append_suffix(all_matches[0].depth, &cmit->object.oid, dst);
+    // ```
+    //
+    // (builtin/describe.c:343-346, :493-495.) Only the exact match reaches depth
+    // 0, and its tail names the object the tag points at: the commit, or for a tag
+    // of a tag the inner tag. A misnamed tag keeps its tail even under --abbrev=0,
+    // where `repo_find_unique_abbrev(oid, 0)` is the whole hex.
+    let mut out = match &outcome.name {
+        Some(name) if misnamed || (outcome.depth == 0 && tagged.is_some() && opts.long) => {
+            let exact = outcome.depth == 0;
+            let oid = match exact {
+                true => tagged.unwrap_or(outcome.id),
+                false => outcome.id,
+            };
+            let hex = match opts.abbrev {
+                Some(0) => oid.to_string(),
+                _ => {
+                    use gix::prelude::ObjectIdExt as _;
+                    let attached = oid.attach(repo);
+                    let len = hex_len(&attached, opts.abbrev)?;
+                    oid.to_hex_with_len(len).to_string()
+                }
+            };
+            format!("{name}-{}-g{hex}", outcome.depth)
+        }
+        _ if opts.abbrev == Some(0) => match &outcome.name {
             Some(name) => name.to_string(),
             // Only reachable via --always, where git prints the id in full.
             None => outcome.id.to_string(),
+        },
+        _ => {
+            let hex = hex_len(id, opts.abbrev)?;
+            let mut format = outcome.into_format(hex);
+            format.long(opts.long);
+            format.to_string()
         }
-    } else {
-        let hex = hex_len(id, opts.abbrev)?;
-        let mut format = outcome.into_format(hex);
-        format.long(opts.long);
-        format.to_string()
     };
 
     if let Some(mark) = &opts.dirty_mark {
@@ -1284,11 +1333,12 @@ fn run_contains(
 /// `tag ` header of the object, which a tag can be *created* with and then have
 /// the ref renamed out from under, and which `git describe` prefers over the ref
 /// name in every case where the two disagree.
-fn annotated_tag_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {
+fn annotated_tag_name(repo: &gix::Repository, short: &BStr) -> Option<(BString, gix::ObjectId)> {
     let reference = repo.find_reference(format!("refs/tags/{short}").as_str()).ok()?;
     let target = reference.target().try_id()?.to_owned();
     let tag = repo.find_object(target).ok()?.try_into_tag().ok()?;
-    Some(BString::from(tag.decode().ok()?.name.to_vec()))
+    let decoded = tag.decode().ok()?;
+    Some((BString::from(decoded.name.to_vec()), decoded.target()))
 }
 
 fn prefixed_name(repo: &gix::Repository, short: &BStr) -> Option<BString> {

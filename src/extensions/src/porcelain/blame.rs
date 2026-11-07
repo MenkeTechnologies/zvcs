@@ -850,6 +850,17 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // every line belongs to the synthetic commit holding the final image.
         index_only = true;
     }
+    // The path the suspect, `HEAD`, holds the final image under. `pass_blame()` of
+    // the fake commit asks `find_origin()` and then `find_rename()` (blame.c:1422-1456),
+    // whose `do_diff_cache()` of `HEAD` against the index follows a `git mv`: the
+    // index's new path is the rename's destination and `HEAD`'s old one its source.
+    let mut head_path = rel_path.clone();
+    if index_only {
+        if let Some(from) = index_rename_source(&repo, suspect, &rel_path)? {
+            head_path = from;
+            index_only = false;
+        }
+    }
 
     // `fake_working_tree_commit()`'s stat block (`blame.c:237-268`), the statements
     // after `verify_working_tree_path()` above:
@@ -1069,7 +1080,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
     // comparison that decides `passes_whole_blame` is between two converted
     // images just as git's is.
     let scapegoat_image = |id: &ObjectId| -> Result<Option<Vec<u8>>> {
-        let Some(raw) = blob_at(&repo, id, &rel_path)
+        let Some(raw) = blob_at(&repo, id, &head_path)
             .and_then(|blob| repo.find_object(blob).ok())
             .map(|o| o.detach().data)
         else {
@@ -1222,10 +1233,10 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // for the same reason `--ignore-rev` is.
         && textconv.is_none()
         && opts.bottom.is_empty())
-        .then(|| (suspect.to_string(), rel_path.clone(), algo_key));
+        .then(|| (suspect.to_string(), head_path.clone(), algo_key));
     // The blamed blob identifies the file content the attribution belongs to.
     let blamed_blob = repo
-        .rev_parse_single(format!("{suspect}:{rel_path}").as_str())
+        .rev_parse_single(format!("{suspect}:{head_path}").as_str())
         .ok()
         .map(|id| id.detach());
     let cached = cache_key.as_ref().zip(blamed_blob).and_then(|((c, p, a), blob)| {
@@ -1276,7 +1287,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             let outcome = run_blame(
                 &repo,
                 textconv.as_ref(),
-                rel_path.as_bytes().as_bstr(),
+                head_path.as_bytes().as_bstr(),
                 suspect,
                 blame_options.clone(),
             )?;
@@ -1299,6 +1310,21 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         }
     };
 
+    // A line the suspect blamed under the path it renamed away from keeps that
+    // origin's path, which differs from the one blamed and so is shown.
+    if head_path != rel_path {
+        let renamed = |name: Option<Vec<u8>>| name.or_else(|| Some(head_path.as_bytes().to_vec()));
+        for line in lines.iter_mut() {
+            line.source_name = renamed(line.source_name.take());
+        }
+        for entry in uncoalesced.iter_mut().filter(|e| e.source_file_name.is_none()) {
+            entry.source_file_name = Some(head_path.as_str().into());
+        }
+        previous_origins = std::mem::take(&mut previous_origins)
+            .into_iter()
+            .map(|((c, name), (p, pname))| ((c, renamed(name)), (p, renamed(pname))))
+            .collect();
+    }
     if let Some(content) = &worktree_content {
         // The scapegoats of the synthetic commit, in git's order: the suspect
         // first, then each `MERGE_HEAD`. `pass_blame()` diffs against them in
@@ -1385,6 +1411,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
             &info,
             &rel_path,
             head_id,
+            &head_path,
             &null_id,
             &previous_origins,
         );
@@ -1426,7 +1453,7 @@ pub(super) fn blame_with(args: &[String], cmd: &str) -> Result<ExitCode> {
         // The synthetic commit only records a `previous` origin when it actually
         // handed lines to one, which never happens when the path is index-only.
         let head_id = if index_only { None } else { head_id };
-        emit_porcelain(&lines, &info, &rel_path, head_id, &null_id, &opts, &previous_origins)?
+        emit_porcelain(&lines, &info, &rel_path, head_id, &head_path, &null_id, &opts, &previous_origins)?
     } else {
         emit_human(&repo, &lines, &info, &rel_path, &opts, &colors, &refcounts)?
     };
@@ -2309,6 +2336,7 @@ fn emit_porcelain(
     info: &HashMap<ObjectId, CommitInfo>,
     rel_path: &str,
     head_id: Option<ObjectId>,
+    head_path: &str,
     null_id: &ObjectId,
     opts: &Options,
     previous_origins: &PreviousOrigins,
@@ -2331,7 +2359,7 @@ fn emit_porcelain(
         let key = (first.commit_id, path.to_vec());
         if !previous_cache.contains_key(&key) {
             let previous = if &first.commit_id == null_id {
-                head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
+                head_id.map(|h| (h.to_hex().to_string(), head_path.as_bytes().to_vec()))
             } else {
                 // `origin->previous` as `pass_blame()` recorded it — the first
                 // scapegoat origin the commit handed entries to, a parent going
@@ -2552,6 +2580,7 @@ fn emit_incremental(
     info: &HashMap<ObjectId, CommitInfo>,
     rel_path: &str,
     head_id: Option<ObjectId>,
+    head_path: &str,
     null_id: &ObjectId,
     previous_origins: &PreviousOrigins,
 ) -> Result<ExitCode> {
@@ -2577,7 +2606,7 @@ fn emit_incremental(
         let key = (entry.commit_id, path.to_vec());
         if !previous_cache.contains_key(&key) {
             let previous = if &entry.commit_id == null_id {
-                head_id.map(|h| (h.to_hex().to_string(), current_path.to_vec()))
+                head_id.map(|h| (h.to_hex().to_string(), head_path.as_bytes().to_vec()))
             } else {
                 // Same `blame_origin::previous` the coalesced porcelain reports,
                 // and *only* that: `write_filename_info()`
@@ -2804,6 +2833,59 @@ enum Targets {
 fn errno_text(e: &std::io::Error) -> String {
     let text = e.to_string();
     text.split(" (os error ").next().unwrap_or(&text).to_string()
+}
+
+/// `find_rename()` (blame.c:1422-1456) for the fake working-tree commit, whose
+/// `do_diff_cache()` diffs `parent`'s tree against the index with
+/// `DIFF_DETECT_RENAME` and `single_follow = path`: the old path of the `R` pair
+/// whose new path is `path`, if any.
+///
+/// `single_follow` keeps every other creation out of the destinations
+/// (diffcore-rename.c `register_rename_src()`'s caller loop), and plain rename
+/// detection takes its sources from the deletions only, so the queue built here is
+/// the index's entry for `path` plus every path the index no longer has.
+fn index_rename_source(repo: &gix::Repository, parent: ObjectId, path: &str) -> Result<Option<String>> {
+    use super::diffcore_rename::{self, FileSpec, Queue};
+    let index = repo.index_or_empty()?;
+    let Some(new) = index
+        .entries()
+        .iter()
+        .find(|e| e.stage_raw() == 0 && &**e.path(&index) == path.as_bytes())
+    else {
+        return Ok(None);
+    };
+    let tree = repo.find_object(parent)?.try_into_commit()?.tree()?;
+    let mut recorder = gix::traverse::tree::Recorder::default();
+    tree.traverse().breadthfirst(&mut recorder)?;
+    // `(path, old side, new side)` in the path order the diff queues them.
+    let mut sides: Vec<(gix::bstr::BString, Option<(u32, ObjectId)>, Option<(u32, ObjectId)>)> = recorder
+        .records
+        .iter()
+        .filter(|e| !e.mode.is_tree() && index.entry_by_path(e.filepath.as_bstr()).is_none())
+        .map(|e| (e.filepath.clone(), Some((u32::from(e.mode.value()), e.oid)), None))
+        .collect();
+    sides.push((path.into(), None, Some((new.mode.bits(), new.id))));
+    sides.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut q = Queue::default();
+    for (p, old, new) in sides {
+        let side = |s: Option<(u32, ObjectId)>| match s {
+            Some((mode, id)) => FileSpec::new(p.clone(), mode, id, true),
+            None => FileSpec::absent(p.clone()),
+        };
+        let (one, two) = (q.add_spec(side(old)), q.add_spec(side(new)));
+        q.add_pair(one, two);
+    }
+    let opts = diffcore_rename::Options {
+        detect_rename: diffcore_rename::DETECT_RENAME,
+        hash_kind: repo.object_hash(),
+        ..Default::default()
+    };
+    diffcore_rename::run(&mut q, &opts, &mut diffcore_rename::OdbContent { repo });
+    diffcore_rename::resolve_rename_copy(&mut q);
+    Ok(q.pairs.iter().find_map(|p| {
+        let (one, two) = (&q.specs[p.one], &q.specs[p.two]);
+        (matches!(p.status, b'R' | b'C') && two.path == path.as_bytes()).then(|| one.path.to_string())
+    }))
 }
 
 /// git's `verify_working_tree_path` fallback: the path is tracked in the index even

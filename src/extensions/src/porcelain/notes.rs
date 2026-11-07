@@ -636,7 +636,14 @@ pub(crate) fn format_display_encoded(
                 write!(out, "\nNotes ({short}):\n")?;
             }
         }
-        for line in msg.split(|&b| b == b'\n') {
+        // `for (msg_p = msg; msg_p < msg + msglen; msg_p += linelen + 1)`
+        // (notes.c:1328): each line ends at a newline or at `msglen`, so an empty
+        // note prints no line and a newline left at the end opens none.
+        let mut lines: Vec<&[u8]> = msg.split(|&b| b == b'\n').collect();
+        if lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        for line in lines {
             if !raw {
                 out.extend_from_slice(b"    ");
             }
@@ -2155,33 +2162,63 @@ fn combine_into(
     src: ObjectId,
     combine: Combine,
 ) -> Result<()> {
-    let existing = notes.map.get(&to).copied();
-    match combine {
-        Combine::Overwrite => {
-            notes.map.insert(to, src);
+    add_note(repo, notes, to, Some(src), combine)
+}
+
+/// `notes.c:add_note()` through `note_tree_insert()` (notes.c:253-286): an empty
+/// slot takes the new note unless it is null; a slot already holding the same
+/// blob is left alone; otherwise the combine function decides, and a null result
+/// removes the note.
+fn add_note(
+    repo: &gix::Repository,
+    notes: &mut Notes,
+    to: ObjectId,
+    new: Option<ObjectId>,
+    combine: Combine,
+) -> Result<()> {
+    let Some(cur) = notes.map.get(&to).copied() else {
+        if let Some(new) = new {
+            notes.map.insert(to, new);
         }
-        Combine::Ignore => {
-            if existing.is_none() {
-                notes.map.insert(to, src);
-            }
-        }
-        Combine::Concatenate | Combine::CatSortUniq => {
-            let new = repo.find_object(src)?.data.clone();
-            let body = match existing {
-                None => new,
-                Some(cur_id) => {
-                    let cur = repo.find_object(cur_id)?.data.clone();
-                    if combine == Combine::CatSortUniq {
-                        combine_cat_sort_uniq(&cur, &new)
-                    } else {
-                        combine_concatenate(&cur, &new)
-                    }
-                }
-            };
-            let blob = repo.write_blob(&body)?.detach();
-            notes.map.insert(to, blob);
-        }
+        return Ok(());
+    };
+    if Some(cur) == new {
+        return Ok(());
     }
+    // A note blob that cannot be read, or is no blob: `odb_read_object()` failing
+    // or `type != OBJ_BLOB` in the combine functions.
+    let read = |id: Option<ObjectId>| -> Option<Vec<u8>> {
+        let obj = repo.find_object(id?).ok()?;
+        (obj.kind == gix::object::Kind::Blob).then(|| obj.data.clone())
+    };
+    let result = match combine {
+        Combine::Overwrite => new,
+        Combine::Ignore => Some(cur),
+        // combine_notes_concatenate() (notes.c:810-856): an empty or unreadable
+        // new note keeps the current one, an empty or unreadable current one
+        // takes the new one, and only two non-empty blobs are joined.
+        Combine::Concatenate => match read(new).filter(|n| !n.is_empty()) {
+            None => Some(cur),
+            Some(new_msg) => match read(Some(cur)).filter(|c| !c.is_empty()) {
+                None => new,
+                Some(cur_msg) => Some(repo.write_blob(combine_concatenate(&cur_msg, &new_msg))?.detach()),
+            },
+        },
+        // combine_notes_cat_sort_uniq() (notes.c:912-939): a null side adds no
+        // lines, and the sorted result is always written back as a new blob.
+        Combine::CatSortUniq => {
+            let cur_msg = read(Some(cur)).unwrap_or_default();
+            let new_msg = match new {
+                Some(_) => read(new).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            Some(repo.write_blob(combine_cat_sort_uniq(&cur_msg, &new_msg))?.detach())
+        }
+    };
+    match result {
+        Some(id) => notes.map.insert(to, id),
+        None => notes.map.remove(&to),
+    };
     Ok(())
 }
 
@@ -2782,19 +2819,30 @@ fn do_merge(
                     }
                     re
                 }
-                Strategy::Union => {
-                    if verbosity >= 0 {
-                        println!("Concatenating local and remote notes for {obj}");
-                    }
-                    let body = combine_concatenate(&blob(lo)?, &blob(re)?);
-                    Some(repo.write_blob(&body)?.detach())
-                }
-                Strategy::CatSortUniq => {
-                    if verbosity >= 0 {
-                        println!("Concatenating unique lines in local and remote notes for {obj}");
-                    }
-                    let body = combine_cat_sort_uniq(&blob(lo)?, &blob(re)?);
-                    Some(repo.write_blob(&body)?.detach())
+                // `add_note(t, &p->obj, &p->remote, combine_notes_…)` into the
+                // local tree (notes-merge.c:466-484): a side that deleted the
+                // note is a null oid, which the combine functions skip over.
+                Strategy::Union | Strategy::CatSortUniq => {
+                    let combine = match strat {
+                        Strategy::Union => {
+                            if verbosity >= 0 {
+                                println!("Concatenating local and remote notes for {obj}");
+                            }
+                            Combine::Concatenate
+                        }
+                        _ => {
+                            if verbosity >= 0 {
+                                println!("Concatenating unique lines in local and remote notes for {obj}");
+                            }
+                            Combine::CatSortUniq
+                        }
+                    };
+                    let mut t = Notes {
+                        map: lo.map(|lo| BTreeMap::from([(*obj, lo)])).unwrap_or_default(),
+                        non_notes: Vec::new(),
+                    };
+                    add_note(repo, &mut t, *obj, re, combine)?;
+                    t.map.get(obj).copied()
                 }
                 Strategy::Manual => {
                     if verbosity >= 0 {
@@ -2810,16 +2858,33 @@ fn do_merge(
                             return Ok(code);
                         }
                     }
-                    if verbosity >= -1 {
-                        // `notes-merge.c:merge_one_change_manual()` calls the
-                        // conflict `add/add` when the merge base carries no
-                        // note for the object and `content` when it does.
-                        let reason = if b.is_none() { "add/add" } else { "content" };
-                        println!(
-                            "CONFLICT ({reason}): Merge conflict in notes for object {obj}"
-                        );
-                    }
-                    let content = conflict_content(local_ref, &remote_ref, &blob(lo)?, &blob(re)?);
+                    // `merge_one_change_manual()` (notes-merge.c:408-439): a side
+                    // that deleted the note leaves the other side's note in the
+                    // tree as it is; otherwise ll_merge() writes the conflict,
+                    // `add/add` when the merge base carries no note for the object.
+                    let content = match (lo, re) {
+                        (None, _) | (_, None) => {
+                            let (deleted_in, modified_in) = match lo {
+                                None => (local_ref, &remote_ref[..]),
+                                Some(_) => (&remote_ref[..], local_ref),
+                            };
+                            if verbosity >= -1 {
+                                println!(
+                                    "CONFLICT (delete/modify): Notes for object {obj} deleted in {deleted_in} and modified in {modified_in}. Version from {modified_in} left in tree."
+                                );
+                            }
+                            blob(lo.or(re))?
+                        }
+                        (Some(_), Some(_)) => {
+                            if verbosity >= -1 {
+                                let reason = if b.is_none() { "add/add" } else { "content" };
+                                println!(
+                                    "CONFLICT ({reason}): Merge conflict in notes for object {obj}"
+                                );
+                            }
+                            ll_merge_note(local_ref, &remote_ref, &blob(b)?, &blob(lo)?, &blob(re)?)
+                        }
+                    };
                     conflicts.push((*obj, content));
                     // Conflicted notes stay out of the partial tree.
                     None
@@ -2945,21 +3010,28 @@ fn git_path_shown(repo: &gix::Repository, name: &str) -> String {
     }
 }
 
-/// The `<<<<<<< / ======= / >>>>>>>` blob git's `ll_merge` writes for a note
-/// whose whole content conflicts (the case for single-block notes).
-fn conflict_content(local_ref: &str, remote_ref: &str, l: &[u8], r: &[u8]) -> Vec<u8> {
+/// `ll_merge_in_worktree()` (notes-merge.c:355-384): `ll_merge()` of the three
+/// note blobs under the object's hex name, labelled with the two notes refs and
+/// no ancestor label. `builtin/notes.c` reads `git_default_config` only, never
+/// `git_xmerge_config()`, so the style is always plain `merge` with 7-wide
+/// markers, at `merge-ll.c`'s `XDL_MERGE_ZEALOUS`.
+fn ll_merge_note(local_ref: &str, remote_ref: &str, base: &[u8], local: &[u8], remote: &[u8]) -> Vec<u8> {
+    use gix::merge::blob::builtin_driver::text::{Labels, Options};
     let mut out = Vec::new();
-    out.extend_from_slice(format!("<<<<<<< {local_ref}\n").as_bytes());
-    out.extend_from_slice(l);
-    if l.last() != Some(&b'\n') {
-        out.push(b'\n');
-    }
-    out.extend_from_slice(b"=======\n");
-    out.extend_from_slice(r);
-    if r.last() != Some(&b'\n') {
-        out.push(b'\n');
-    }
-    out.extend_from_slice(format!(">>>>>>> {remote_ref}\n").as_bytes());
+    let mut input = gix::diff::blob::InternedInput::default();
+    gix::merge::blob::builtin_driver::text(
+        &mut out,
+        &mut input,
+        Labels {
+            ancestor: None,
+            current: Some(local_ref.as_bytes().as_bstr()),
+            other: Some(remote_ref.as_bytes().as_bstr()),
+        },
+        local,
+        base,
+        remote,
+        Options::default(),
+    );
     out
 }
 
@@ -3027,7 +3099,7 @@ fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
     }
 
     let tree_id = write_tree(repo, &notes)?;
-    let commit = notes_commit(repo, full_msg.clone(), tree_id, parents)?;
+    let commit = notes_commit(repo, full_msg.clone(), tree_id, parents.clone())?;
     // `notes-merge.c:746-748`.
     if verbosity >= 2 {
         println!("Finalized notes merge commit: {commit}");
@@ -3037,6 +3109,22 @@ fn merge_commit(repo: &gix::Repository, verbosity: i32) -> Result<ExitCode> {
         .map(|r| r.into_fully_peeled_id())
         .transpose()?
         .map(|id| id.detach());
+    // `refs_update_ref(…, o->local_ref, &oid, is_null_oid(&parent_oid) ? NULL :
+    // &parent_oid, 0, UPDATE_REFS_DIE_ON_ERR)` (builtin/notes.c:875-878): the ref
+    // must still be where the merge started, the partial commit's first parent,
+    // and a ref that moved or went away meanwhile dies before the merge state is
+    // cleaned up.
+    if let Some(&expected) = parents.first() {
+        let reason = match local_tip {
+            Some(cur) if cur == expected => None,
+            Some(cur) => Some(format!("is at {cur} but expected {expected}")),
+            None => Some(format!("unable to resolve reference '{local_ref}'")),
+        };
+        if let Some(reason) = reason {
+            eprintln!("fatal: update_ref failed for ref '{local_ref}': cannot lock ref '{local_ref}': {reason}");
+            return Ok(ExitCode::from(128));
+        }
+    }
     move_notes_ref(repo, &local_ref, local_tip, commit, &reflog)?;
 
     // Clear the staged merge.

@@ -1292,7 +1292,7 @@ const REVISION_OPTS: &[(&str, Take, bool)] = &[
 ];
 
 /// What `setup_revisions()` made of one `-`-prefixed word.
-enum Claimed {
+pub(super) enum Claimed {
     /// Left in `argv` for the caller; `bundle create` reports it unrecognized.
     No,
     /// Consumed, this many argv words; `walk` says whether it limits the walk.
@@ -1302,7 +1302,7 @@ enum Claimed {
 /// The `handle_revision_opt()` chain for one word: the count-and-age arm, then the
 /// table above, then `diff_opt_parse()` (revision.c:2758-2762). `Err` is the exit
 /// status of a `die()` / parse-options refusal whose message is already out.
-fn claim_revision_opt(
+pub(super) fn claim_revision_opt(
     repo: &gix::Repository,
     args: &[String],
     i: usize,

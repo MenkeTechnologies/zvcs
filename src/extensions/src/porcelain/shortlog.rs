@@ -53,7 +53,18 @@
 //!     match, `--first-parent` limiting a merge to its first parent. When no
 //!     revision is pending the pathspecs are inert and shortlog reads stdin,
 //!     exactly as git does.
-//!   * message/ident filtering: `--grep`, `--author`, `--all-match`,
+//!   * the diff options `setup_revisions()` hands `diff_opt_parse()`
+//!     (`-p`, `--stat`, `-M`, `-S <string>`, `--output=<file>`, …), with
+//!     `diff_merges_parse_opts()`, `-r`, `-t` and `-v` ahead of them: accepted
+//!     and checked as `diff_setup_done()` checks them, with the three effects a
+//!     tally can see — `--output` takes the output, `--follow` turns path
+//!     limiting off, and `--find-object` and the separate and remerge
+//!     `--diff-merges` styles walk full history. A cluster a diff option
+//!     stops part-way through is left over, or reported unknown, as the rest
+//!     of the cluster.
+//!   * message/ident filtering: `--grep`, `--author`, `--committer` (past
+//!     `--end-of-options`), each stuck or with its value in the next word,
+//!     `--all-match`,
 //!     `--invert-grep`, `-i`/`--regexp-ignore-case`, and the dialect selectors
 //!     `-F`/`--fixed-strings`, `-E`/`--extended-regexp`, `-P`/`--perl-regexp`,
 //!     `--basic-regexp` (see the regex note below).
@@ -96,8 +107,9 @@
 //! forms and vice versa; `-E`/`--extended-regexp` and `-P`/`--perl-regexp` pass
 //! the pattern through unchanged; `-F`/`--fixed-strings` escapes it to a
 //! literal. The last dialect flag on the line wins, as in git's `grep_config`.
-//! (`--committer=<pattern>` needs no handling: `committer` is one of shortlog's
-//! own boolean options, so git rejects the `=<value>` spelling outright.)
+//! (`--committer=<pattern>` reaches the revision layer only past
+//! `--end-of-options`: before it `committer` is one of shortlog's own boolean
+//! options, so git rejects the `=<value>` spelling outright.)
 //! Because the crate's regex engine is not glibc/BSD `regcomp` nor PCRE2, an
 //! exotic pattern can diverge from git; the common BRE/ERE/literal cases match.
 //!
@@ -261,6 +273,9 @@ struct Filters {
     counts: crate::revopt::Counts,
     grep: Vec<String>,
     author: Vec<String>,
+    /// `--committer=<pattern>`, which only reaches `handle_revision_opt()` past
+    /// `--end-of-options`.
+    committer: Vec<String>,
     all_match: bool,
     invert_grep: bool,
     ignore_case: bool,
@@ -311,6 +326,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         counts: crate::revopt::Counts::default(),
         grep: Vec::new(),
         author: Vec::new(),
+        committer: Vec::new(),
         all_match: false,
         invert_grep: false,
         ignore_case: false,
@@ -365,6 +381,15 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     // then leave unparsed; see the loop below.
     let mut options_done = false;
     let mut leftover: Option<String> = None;
+    // What `handle_revision_opt()`'s `diff_merges_parse_opts()` and
+    // `diff_opt_parse()` arms made of the words they claimed; see
+    // [`revision_fallback`].
+    let mut diff_merges = DiffMerges::default();
+    let mut diffopt = super::diff_opt_parse::DiffOpts::default();
+    let mut full_diff = false;
+    // `--find-object` resolves its value while the option is parsed (diff.c:5510),
+    // so the repository is looked up ahead of the loop.
+    let mut repo = crate::setup::discover().ok();
 
     // `setup_revisions()`'s `seen_dashdash`, found in a scan of the whole
     // argument vector before anything is resolved.
@@ -420,8 +445,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         // abbreviating — so a name outside [`LONG_OPTS`] must come back untouched,
         // which is exactly what the resolver does.
         let canonical;
-        if let Some(code) = super::long_takes_no_value(a, LONG_OPTS).filter(|_| !options_done) {
-            return Ok(code);
+        // Asked only before `--end-of-options`: the check prints its refusal as it
+        // finds it, and past that point shortlog's table is out of reach.
+        if !options_done {
+            if let Some(code) = super::long_takes_no_value(a, LONG_OPTS) {
+                return Ok(code);
+            }
         }
         let a = match super::canonical_long(a, LONG_OPTS) {
             _ if options_done => a,
@@ -441,7 +470,10 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
             };
 
             // shortlog's own option table. A boolean of git's rejects `=value`.
-            let native_bool = matches!(
+            // Past `--end-of-options` the table is out of reach: the word goes to
+            // `setup_revisions()`, where `--summary` is a diff option and the rest
+            // are left over.
+            let native_bool = !options_done && matches!(
                 name,
                 "committer"
                     | "no-committer"
@@ -452,10 +484,6 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     | "email"
                     | "no-email"
             );
-            if options_done && (native_bool || name == "group" || name == "no-group") {
-                leftover.get_or_insert_with(|| a.to_string());
-                continue;
-            }
             if native_bool {
                 if value.is_some() {
                     eprintln!("error: option `{name}' takes no value");
@@ -475,7 +503,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 continue;
             }
 
-            if name == "group" {
+            if !options_done && name == "group" {
                 let field = match value {
                     Some(v) => v.to_string(),
                     None => match argv.get(i) {
@@ -511,7 +539,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 argv_consumed = true;
                 continue;
             }
-            if name == "no-group" {
+            if !options_done && name == "no-group" {
                 group_author = false;
                 group_committer = false;
                 group_special.clear();
@@ -581,6 +609,26 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 None => {}
             }
 
+            // `--date`, `--author`, `--committer` and `--grep` take their value
+            // through `parse_long_opt()` as well (revision.c:2702-2724), so a bare
+            // spelling takes the next word. `--committer` gets here only past
+            // `--end-of-options`; before it, shortlog's own table claims it.
+            let (name, value) = match (name, value) {
+                ("date" | "author" | "committer" | "grep", None) => {
+                    match argv[..revision_args_end(argv, i - 1, options_done)].get(i) {
+                        Some(next) => {
+                            i += 1;
+                            (name, Some(next.as_str()))
+                        }
+                        None => {
+                            eprintln!("fatal: Option '--{name}' requires a value");
+                            return Ok(ExitCode::from(128));
+                        }
+                    }
+                }
+                given => given,
+            };
+
             // Everything else is a revision-walk option.
             match (name, value) {
                 ("min-parents", Some(v)) => match int_arg(v) {
@@ -645,6 +693,7 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     return Ok(ExitCode::from(128));
                 }
                 ("author", Some(v)) => filters.author.push(v.to_string()),
+                ("committer", Some(v)) => filters.committer.push(v.to_string()),
                 ("grep", Some(v)) => filters.grep.push(v.to_string()),
                 ("all-match", None) => filters.all_match = true,
                 ("invert-grep", None) => filters.invert_grep = true,
@@ -701,10 +750,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                     | "no-show-signature" | "expand-tabs" | "no-expand-tabs" | "show-notes"
                     | "notes" | "no-notes" | "standard-notes" | "no-standard-notes"
                     | "show-notes-by-default" | "show-linear-break" | "encode-email-headers"
-                    | "no-encode-email-headers" | "root" | "no-commit-id" | "always"
-                    | "full-diff",
+                    | "no-encode-email-headers" | "root" | "no-commit-id" | "always",
                     None,
                 ) => {}
+                // `revs->full_diff` (revision.c:2692-2694) keeps the pathspec out of
+                // `revs->diffopt`, which `diff_setup_done()` reads for `--follow`.
+                ("full-diff", None) => full_diff = true,
                 ("show-linear-break" | "show-notes" | "notes", Some(_)) => {}
                 ("expand-tabs", Some(v)) => {
                     if !crate::revopt::strtol_i(v).is_some_and(|n| n >= 0) {
@@ -743,10 +794,19 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 ("abbrev", None) => abbrev_arg = None,
                 ("no-abbrev", None) => abbrev_arg = Some(AbbrevArg::Full),
                 ("abbrev", Some(v)) => abbrev_arg = Some(AbbrevArg::Len(v.to_string())),
-                _ if options_done => {
-                    leftover.get_or_insert_with(|| a.to_string());
-                }
-                _ => return Ok(unknown_option(a, argv_consumed)),
+                _ => match revision_fallback(
+                    repo.as_ref(),
+                    &argv[i - 1..revision_args_end(argv, i - 1, options_done)],
+                    &mut diff_merges,
+                    &mut diffopt,
+                ) {
+                    Fallback::Took(words) => i += words - 1,
+                    Fallback::Exit(code) => return Ok(code),
+                    Fallback::Unknown(word) if options_done => {
+                        leftover.get_or_insert(word);
+                    }
+                    Fallback::Unknown(word) => return Ok(unknown_option(&word, argv_consumed)),
+                },
             }
             argv_consumed = true;
             continue;
@@ -768,40 +828,30 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         }
 
         // Single-letter revision-walk options, which shortlog does not own.
-        match body {
-            "i" => {
-                filters.ignore_case = true;
-                argv_consumed = true;
-                continue;
-            }
-            "F" => {
-                filters.dialect = Dialect::Fixed;
-                argv_consumed = true;
-                continue;
-            }
-            // `-E`/`-P`: extended/perl regex dialect selectors (last-wins).
-            "E" => {
-                filters.dialect = Dialect::Extended;
-                argv_consumed = true;
-                continue;
-            }
-            "P" => {
-                filters.dialect = Dialect::Perl;
-                argv_consumed = true;
-                continue;
-            }
-            _ => {}
+        if single_letter_opt(a, &mut filters) {
+            argv_consumed = true;
+            continue;
         }
 
         // Past `--end-of-options` no cluster is split: handle_revision_opt() takes
-        // the word whole (`-n <n>`) or leaves it over.
+        // the word whole (`-n <n>`), hands it to `diff_opt_parse()`, or leaves it
+        // over as that parser left it in argv.
         if options_done {
             match apply_count_opt(argv, i - 1, &mut filters) {
                 Some(Ok(consumed)) => i += consumed - 1,
                 Some(Err(code)) => return Ok(code),
-                None => {
-                    leftover.get_or_insert_with(|| a.to_string());
-                }
+                None => match revision_fallback(
+                    repo.as_ref(),
+                    &argv[i - 1..revision_args_end(argv, i - 1, options_done)],
+                    &mut diff_merges,
+                    &mut diffopt,
+                ) {
+                    Fallback::Took(words) => i += words - 1,
+                    Fallback::Exit(code) => return Ok(code),
+                    Fallback::Unknown(word) => {
+                        leftover.get_or_insert(word);
+                    }
+                },
             }
             continue;
         }
@@ -829,14 +879,23 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
                 // the cluster>` before returning PARSE_OPT_UNKNOWN, so what
                 // `parse_revision_opt()` sees for `-n2` is `-2`
                 // (builtin/shortlog.c:430-445). That is how `-n2` is both
-                // `--numbered` and `--max-count=2`.
+                // `--numbered` and `--max-count=2`, and `-sp` both `--summary`
+                // and `--patch`. The rest of argv follows the rewritten word, so
+                // an option that takes a separate value takes the next one.
                 _ => {
-                    let rest = format!("-{}", &body[off..]);
-                    match apply_count_opt(std::slice::from_ref(&rest), 0, &mut filters) {
-                        Some(Ok(_)) => break,
+                    let mut rest = vec![format!("-{}", &body[off..])];
+                    rest.extend_from_slice(&argv[i..]);
+                    match apply_count_opt(&rest, 0, &mut filters) {
+                        Some(Ok(consumed)) => i += consumed - 1,
                         Some(Err(code)) => return Ok(code),
-                        None => return Ok(unknown_option(a, argv_consumed)),
+                        None if single_letter_opt(&rest[0], &mut filters) => {}
+                        None => match revision_fallback(repo.as_ref(), &rest, &mut diff_merges, &mut diffopt) {
+                            Fallback::Took(words) => i += words - 1,
+                            Fallback::Exit(code) => return Ok(code),
+                            Fallback::Unknown(word) => return Ok(unknown_option(&word, argv_consumed)),
+                        },
                     }
+                    break;
                 }
             }
         }
@@ -869,7 +928,6 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         filters.order = Order::Topo;
     }
 
-    let mut repo = crate::setup::discover().ok();
     // `revision.c` clamps `--abbrev=<n>` against the repository's hash width, so
     // the value can only be resolved once the repository is open. Outside one,
     // `cmd_shortlog()` pins SHA-1 (builtin/shortlog.c:421-422).
@@ -1123,6 +1181,30 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
         }
     }
 
+    // The tail of `setup_revisions()` once every operand is resolved
+    // (revision.c:3192-3212): `--find-object` clears `revs->simplify_history`,
+    // `--follow` keeps `revs->prune` off so the pathspec limits nothing, then
+    // `diff_merges_setup_revs()` and `diff_setup_done()` refuse what they refuse.
+    // Outside a repository `cmd_shortlog()` never calls `setup_revisions()`
+    // (builtin/shortlog.c:457).
+    if repo.is_some() {
+        if diffopt.objfind() || diff_merges.no_simplify_history {
+            full_history = true;
+        }
+        if let Err(message) = diff_merges.setup_revs() {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+        let diff_pathspec: &[Vec<u8>] = if full_diff { &[] } else { &pathspecs };
+        if let Err(message) = diffopt.setup_done(diff_pathspec) {
+            eprintln!("fatal: {message}");
+            return Ok(ExitCode::from(128));
+        }
+        if diffopt.follow_renames() {
+            pathspecs.clear();
+        }
+    }
+
     // Compile the message/ident patterns to byte regexes once the dialect and `-i` are
     // final, as `setup_revisions()` does after it has resolved every revision operand
     // (`compile_grep_patterns()`), so an unknown revision is reported ahead of a bad
@@ -1136,6 +1218,12 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
     )?;
     filters.commit_filter.author_res = compile_patterns(
         &filters.author,
+        filters.dialect,
+        filters.ignore_case,
+        crate::revfilter::Origin::Header,
+    )?;
+    filters.commit_filter.committer_res = compile_patterns(
+        &filters.committer,
         filters.dialect,
         filters.ignore_case,
         crate::revfilter::Origin::Header,
@@ -1376,12 +1464,158 @@ pub fn shortlog(args: &[String]) -> Result<ExitCode> {
 
     let mut out: Vec<u8> = Vec::new();
     render(&groups, &opts, &mut out);
-    std::io::stdout().write_all(&out)?;
+    // `log.file = rev.diffopt.file` (builtin/shortlog.c:462): `--output` sends
+    // the tally to the file it opened.
+    match diffopt.output_file.as_mut() {
+        Some(file) => file.write_all(&out)?,
+        None => std::io::stdout().write_all(&out)?,
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 /// git's `error: unknown option ...` path: the message, then the usage block,
 /// both on stderr, exit 129.
+/// `handle_revision_opt()`'s single-letter grep switches (revision.c:2728-2736):
+/// `-i`, and the `-F`/`-E`/`-P` dialect selectors, last one winning. Whole words
+/// only — `strcmp()`, never a cluster.
+fn single_letter_opt(word: &str, filters: &mut Filters) -> bool {
+    match word {
+        "-i" => filters.ignore_case = true,
+        "-F" => filters.dialect = Dialect::Fixed,
+        "-E" => filters.dialect = Dialect::Extended,
+        "-P" => filters.dialect = Dialect::Perl,
+        _ => return false,
+    }
+    true
+}
+
+/// Where the words a revision option may take a value from end. Before
+/// `--end-of-options` `parse_revision_opt()` hands `handle_revision_opt()` the
+/// rest of parse-options' argv, `--` included; past it `setup_revisions()` has
+/// already cut its argv at the first `--` (revision.c:3015-3033).
+fn revision_args_end(argv: &[String], at: usize, options_done: bool) -> usize {
+    match options_done {
+        false => argv.len(),
+        true => (at..argv.len()).find(|&j| argv[j] == "--").unwrap_or(argv.len()),
+    }
+}
+
+/// What [`revision_fallback`] made of a word.
+enum Fallback {
+    /// Claimed, taking this many words.
+    Took(usize),
+    /// Refused, with the diagnostic already on stderr.
+    Exit(ExitCode),
+    /// Not a revision option: the word as it was left in argv, which
+    /// `parse_options_step()` may have rewritten to the unparsed rest of a cluster.
+    Unknown(String),
+}
+
+/// The tail of `handle_revision_opt()` (revision.c:2583-2593, :2758-2762) for a
+/// word nothing above claimed: `-r` and `-t`, `diff_merges_parse_opts()`, `-v`,
+/// and last `diff_opt_parse()`, which takes the whole diff option table. None of
+/// these change what shortlog prints except where [`DiffMerges`] and
+/// [`DiffOpts`](super::diff_opt_parse::DiffOpts) say so.
+fn revision_fallback(
+    repo: Option<&gix::Repository>,
+    args: &[String],
+    diff_merges: &mut DiffMerges,
+    diffopt: &mut super::diff_opt_parse::DiffOpts,
+) -> Fallback {
+    use super::diff_opt_parse::Step;
+
+    let word = args[0].as_str();
+    match word {
+        "-r" | "-t" | "-v" => return Fallback::Took(1),
+        "-m" => diff_merges.set_separate(),
+        "-c" | "--cc" => diff_merges.set_combined(),
+        "--dd" => diff_merges.set_separate(),
+        "--remerge-diff" => diff_merges.set_remerge_diff(),
+        "--no-diff-merges" => diff_merges.suppress(),
+        "--combined-all-paths" => diff_merges.combined_all_paths = true,
+        _ => match crate::revopt::long_opt("diff-merges", args, 0) {
+            Some(Err(message)) => {
+                eprintln!("fatal: {message}");
+                return Fallback::Exit(ExitCode::from(128));
+            }
+            Some(Ok((style, words))) => {
+                if !diff_merges.set(style) {
+                    eprintln!("fatal: invalid value for '--diff-merges': '{style}'");
+                    return Fallback::Exit(ExitCode::from(128));
+                }
+                return Fallback::Took(words);
+            }
+            None => {
+                return match super::diff_opt_parse::diff_opt_parse_in(repo, args, diffopt) {
+                    Step::Took(words) => Fallback::Took(words),
+                    Step::Exit(code) => Fallback::Exit(code),
+                    Step::Unknown => Fallback::Unknown(diffopt.rewritten_arg.take().unwrap_or_else(|| word.to_string())),
+                }
+            }
+        },
+    }
+    Fallback::Took(1)
+}
+
+/// The `struct rev_info` fields `diff_merges_parse_opts()` (diff-merges.c:119-151)
+/// sets that a commit tally can observe: `revs->simplify_history`, which the
+/// separate and remerge styles clear and nothing sets back, and the pair
+/// `diff_merges_setup_revs()` checks (diff-merges.c:178-185).
+#[derive(Default)]
+struct DiffMerges {
+    combine_merges: bool,
+    combined_all_paths: bool,
+    no_simplify_history: bool,
+}
+
+impl DiffMerges {
+    /// `suppress()`: every style flag off, `--combined-all-paths` included.
+    fn suppress(&mut self) {
+        self.combine_merges = false;
+        self.combined_all_paths = false;
+    }
+
+    /// `set_separate()`, which `-m` reaches through `set_to_default` — shortlog
+    /// reads no `log.diffMerges` — and `set_first_parent()` through it.
+    fn set_separate(&mut self) {
+        self.suppress();
+        self.no_simplify_history = true;
+    }
+
+    /// `set_combined()` / `set_dense_combined()`.
+    fn set_combined(&mut self) {
+        self.suppress();
+        self.combine_merges = true;
+    }
+
+    /// `set_remerge_diff()`.
+    fn set_remerge_diff(&mut self) {
+        self.suppress();
+        self.no_simplify_history = true;
+    }
+
+    /// `set_diff_merges()` through `func_by_opt()`; false for a style it does not
+    /// know.
+    fn set(&mut self, style: &str) -> bool {
+        match style {
+            "off" | "none" => self.suppress(),
+            "1" | "first-parent" | "separate" | "m" | "on" => self.set_separate(),
+            "c" | "combined" | "cc" | "dense-combined" => self.set_combined(),
+            "r" | "remerge" => self.set_remerge_diff(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// `diff_merges_setup_revs()`'s refusal.
+    fn setup_revs(&self) -> Result<(), String> {
+        match self.combined_all_paths && !self.combine_merges {
+            true => Err("--combined-all-paths makes no sense without -c or --cc".to_string()),
+            false => Ok(()),
+        }
+    }
+}
+
 fn unknown_option(arg: &str, argv_consumed: bool) -> ExitCode {
     let shown = if argv_consumed { "(null)" } else { arg };
     eprint!("error: unknown option `{shown}'\n{USAGE}");

@@ -107,6 +107,13 @@ pub(super) struct DiffOpts {
     /// `options->use_color` as an option left it — `None` while no option touched
     /// it, which is the plain output this walker draws.
     use_color: Option<ColorBool>,
+    /// The word the last call left in `argv[0]` when it returned unknown part-way
+    /// through a short-option cluster: `-<rest>`, as parse_options_step() rewrites
+    /// it. `None` when the word was left as written.
+    pub(super) rewritten_arg: Option<String>,
+    /// `options->file` as `--output` left it, for a caller that writes its own
+    /// output there (`log.file = rev.diffopt.file`, builtin/shortlog.c:462).
+    pub(super) output_file: Option<std::fs::File>,
 }
 
 impl DiffOpts {
@@ -127,6 +134,19 @@ impl DiffOpts {
             Some(ColorBool::Auto) => std::io::IsTerminal::is_terminal(&std::io::stdout()),
             Some(ColorBool::Never) | None => false,
         }
+    }
+
+    /// `options->flags.follow_renames`: `setup_revisions()` then leaves
+    /// `revs->prune` off, so a pathspec no longer limits the walk
+    /// (revision.c:3198-3202).
+    pub(super) fn follow_renames(&self) -> bool {
+        self.follow_renames
+    }
+
+    /// `options->objfind` is set: `setup_revisions()` clears
+    /// `revs->simplify_history` for it (revision.c:3192-3193).
+    pub(super) fn objfind(&self) -> bool {
+        self.pickaxe_opts & PICKAXE_KIND_OBJFIND != 0
     }
 
     /// `revs->diff` as `setup_revisions()` derives it (revision.c:3182-3190):
@@ -198,6 +218,13 @@ pub(super) enum Step {
 /// before its option loop (revision.c:3015-3033) — so a detached value is never
 /// taken from behind it.
 pub(super) fn diff_opt_parse(repo: &gix::Repository, args: &[String], st: &mut DiffOpts) -> Step {
+    diff_opt_parse_in(Some(repo), args, st)
+}
+
+/// [`diff_opt_parse`] for a command that may run outside a repository, where
+/// `startup_info->have_repository` is 0: `shortlog` reading a log from stdin.
+pub(super) fn diff_opt_parse_in(repo: Option<&gix::Repository>, args: &[String], st: &mut DiffOpts) -> Step {
+    st.rewritten_arg = None;
     let arg = args[0].as_str();
     let Some(body) = arg.strip_prefix('-') else {
         return Step::Unknown;
@@ -222,7 +249,7 @@ pub(super) fn diff_opt_parse(repo: &gix::Repository, args: &[String], st: &mut D
 /// letter is unknown, and after the first letter when the cluster goes on — so
 /// `-raw` and `-stat` are refused as long options typed with one dash, while
 /// `-Sedited` (whose `S` took the rest as its value) never reaches it.
-fn parse_short(repo: &gix::Repository, cluster: &str, next: Option<&str>, st: &mut DiffOpts) -> Step {
+fn parse_short(repo: Option<&gix::Repository>, cluster: &str, next: Option<&str>, st: &mut DiffOpts) -> Step {
     let typos = || crate::parseopt::check_typos(cluster, super::diff_pairs::LONG_OPTS).map_err(ExitCode::from);
     let mut rest = cluster;
     let mut first = true;
@@ -232,6 +259,12 @@ fn parse_short(repo: &gix::Repository, cluster: &str, next: Option<&str>, st: &m
                 if let Err(code) = typos() {
                     return Step::Exit(code);
                 }
+            }
+            // parse_options_step() fakes `-<rest of the cluster>` into `ctx->argv[0]`
+            // for a letter it meets after the first (parse-options.c:1088-1097), and
+            // that rewritten word is what `setup_revisions()` keeps over.
+            if !first {
+                st.rewritten_arg = Some(format!("-{rest}"));
             }
             return Step::Unknown;
         };
@@ -265,7 +298,7 @@ fn parse_short(repo: &gix::Repository, cluster: &str, next: Option<&str>, st: &m
 
 /// `parse_long_opt()` (parse-options.c:519-594) without its abbreviation half,
 /// which `PARSE_OPT_KEEP_UNKNOWN_OPT` turns off.
-fn parse_long(repo: &gix::Repository, arg: &str, next: Option<&str>, st: &mut DiffOpts) -> Step {
+fn parse_long(repo: Option<&gix::Repository>, arg: &str, next: Option<&str>, st: &mut DiffOpts) -> Step {
     let mut arg_start = arg;
     let mut flags_unset = false;
     let mut no_no = false;
@@ -305,7 +338,7 @@ fn parse_long(repo: &gix::Repository, arg: &str, next: Option<&str>, st: &mut Di
 /// `do_get_value()`'s checks (parse-options.c:130-143) and `get_arg()`
 /// (parse-options.c:47-62) for one resolved long option, then its effect.
 fn get_value(
-    repo: &gix::Repository,
+    repo: Option<&gix::Repository>,
     opt: &LongOpt,
     unset: bool,
     attached: Option<&str>,
@@ -355,7 +388,7 @@ fn set_format(st: &mut DiffOpts, bits: u32) {
 /// spelled `no-<x>` in the table keeps that spelling here, `unset` being its
 /// `OPT_UNSET` sense.
 fn apply(
-    repo: &gix::Repository,
+    repo: Option<&gix::Repository>,
     name: &str,
     unset: bool,
     value: Option<&str>,
@@ -443,7 +476,7 @@ fn apply(
         // truncated — while the option is parsed, and colour is forced off unless
         // it was already `always`.
         "output" => {
-            super::diff::open_output_file(value.unwrap_or_default())?;
+            st.output_file = Some(super::diff::open_output_file(value.unwrap_or_default())?);
             st.output = true;
             if st.use_color != Some(ColorBool::Always) {
                 st.use_color = Some(ColorBool::Never);
@@ -515,10 +548,17 @@ fn apply(
         }
         "pickaxe-all" => st.pickaxe_opts |= PICKAXE_ALL,
         "pickaxe-regex" => st.pickaxe_opts |= PICKAXE_REGEX,
-        "find-object" => match crate::objname::find_object(repo, value.unwrap_or_default()) {
-            Ok(_) => st.pickaxe_opts |= PICKAXE_KIND_OBJFIND,
-            Err(e) => return Err(e.report()),
-        },
+        // `diff_opt_find_object()` (diff.c:5501-5520) refuses outside a repository
+        // before it resolves anything.
+        "find-object" => {
+            let Some(repo) = repo else {
+                return Err(error("--find-object requires a git repository"));
+            };
+            match crate::objname::find_object(repo, value.unwrap_or_default()) {
+                Ok(_) => st.pickaxe_opts |= PICKAXE_KIND_OBJFIND,
+                Err(e) => return Err(e.report()),
+            }
+        }
         "diff-filter" => {
             let v = value.unwrap_or_default();
             if let Err(bad) = st.filter.accumulate(v) {

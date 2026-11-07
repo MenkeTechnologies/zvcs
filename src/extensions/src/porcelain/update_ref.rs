@@ -60,13 +60,18 @@
 //! Not covered: `--create-reflog` on a one-level name, which would have to write
 //! `$GIT_DIR/logs/<name>` by hand; it keeps the bad-name refusal instead.
 //!
-//! Also not covered: the `HEAD` reflog line a `verify` of the checked-out branch
-//! leaves behind. `ref_transaction_verify()` (refs.c) passes `new_oid = NULL`, so
+//! A `verify` of the checked-out branch leaves a `HEAD` reflog line behind too.
+//! `ref_transaction_verify()` (refs.c) passes `new_oid = NULL`, so
 //! `split_head_update()` mirrors a *null* new value onto `HEAD` and
 //! `.git/logs/HEAD` gains `<old> <null>` — while `update <ref> <X> <X>` on the
-//! same ref, which is otherwise indistinguishable once staged, gains `<X> <X>`.
-//! `gix_ref`'s `Change::Update` has no way to say "no new value", so the two
-//! cannot be told apart at the point the mirror is built.
+//! same ref gains `<X> <X>`. `gix_ref`'s `Change::Update` has no way to say "no
+//! new value", so the `verify` stages that mirror itself (see
+//! `stage_verify_head_mirror`).
+//!
+//! Under `--batch-updates` a rejected update still leaves the log-only lines
+//! split off it: the `HEAD` line for the checked-out branch and one per symref
+//! it came through, written as `files_transaction_finish()` writes them (see
+//! `RejectedSplit`), and its `rejected` line names the end of the symref chain.
 
 use anyhow::{anyhow, Result};
 use std::process::ExitCode;
@@ -1848,6 +1853,13 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
     crate::cstdio::defer();
     let mut rejected: Vec<(String, String)> = Vec::new();
     let mut last: Vec<(String, String)> = Vec::new();
+    // The log-only updates a rejected update leaves behind; see
+    // [`RejectedSplit`]. `files_transaction_finish()` writes them with the rest.
+    let mut split_logs: Vec<RejectedSplit> = Vec::new();
+    let head_ref = head_referent(repo);
+    // The `HEAD` mirror [`stage_verify_head_mirror`] staged after a `verify`,
+    // which that verify's own turn has already dealt with.
+    let mut mirror_done: Option<usize> = None;
     for index in 0..=batch.edits.len() {
         // A `create` over a reference that is already there is
         // `REF_TRANSACTION_ERROR_CREATE_EXISTS`, not a generic failure, so
@@ -1863,14 +1875,59 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
             let new = entry.new.map_or_else(|| "(null)".to_string(), |id| id.to_string());
             rejected.push((
                 format!("cannot lock ref '{}': reference already exists", entry.name),
-                format!("rejected {} {new} {zero} reference already exists", entry.name),
+                format!(
+                    "rejected {} {new} {zero} reference already exists",
+                    deref_chain(repo, &entry.name, entry.deref)
+                ),
+            ));
+            // `create` and a zero-valued `verify` both carry `REF_HAVE_OLD` with the
+            // null id; only `create` has a new value.
+            let message = batch
+                .edits
+                .get(index)
+                .filter(|_| entry.guards_edit)
+                .map(edit_message)
+                .unwrap_or_default();
+            split_logs.extend(RejectedSplit::plan(
+                repo,
+                head_ref.as_ref(),
+                &entry.name,
+                entry.deref,
+                entry.new,
+                Some(zero),
+                &message,
             ));
             dropped |= entry.guards_edit;
         }
         let Some(edit) = batch.edits.get(index).cloned() else { break };
-        if dropped {
+        if dropped || mirror_done == Some(index) {
             continue;
         }
+        let verify = batch.verify_edits.contains(&index);
+        // The `HEAD` mirror of this `verify`, when one was staged right behind it.
+        let mirror = batch
+            .edits
+            .get(index + 1)
+            .filter(|next| verify && log_only(next) && next.name.as_bstr() == "HEAD")
+            .cloned();
+        if mirror.is_some() {
+            mirror_done = Some(index + 1);
+        }
+        // What `split_head_update()` and `split_symref_update()` copy off the update
+        // before `lock_ref_for_update()` checks its old value: `&update->new_oid`
+        // (null for a `verify`, which passes no new value), `&update->old_oid` when
+        // `REF_HAVE_OLD` is set, and `update->msg`. A symbolic target is not
+        // covered.
+        let pending_split = match (&edit.change, have_old(&edit, zero)) {
+            (Change::Update { new: Target::Symbolic(_), .. }, _) | (_, Err(())) => None,
+            (change, Ok(old_oid)) => {
+                let new_oid = match change {
+                    Change::Update { new: Target::Object(id), .. } if !verify => Some(*id),
+                    _ => None,
+                };
+                Some((new_oid, old_oid, edit_message(&edit)))
+            }
+        };
         let mut edit = edit;
         let name = edit.name.to_string();
         let (new, old) = edit_oids(&edit, &zero, batch.verify_edits.contains(&index));
@@ -1892,7 +1949,21 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
             let Some(kind) = refused.kind else {
                 crate::git_fatal!("{}", refused.message);
             };
-            rejected.push((refused.message, format!("rejected {name} {new} {old} {kind}")));
+            // The line names `update->refname`, the update the check ran on: the
+            // end of the symref chain (builtin/update-ref.c:258-262).
+            let written = written_refname(repo, &edit);
+            rejected.push((refused.message, format!("rejected {written} {new} {old} {kind}")));
+            if let Some((new_oid, old_oid, message)) = &pending_split {
+                split_logs.extend(RejectedSplit::plan(
+                    repo,
+                    head_ref.as_ref(),
+                    &name,
+                    edit.deref,
+                    *new_oid,
+                    *old_oid,
+                    message,
+                ));
+            }
             continue;
         }
         // `ref_transaction_maybe_set_rejected()` with
@@ -1904,7 +1975,13 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
             rejected.push((reason.clone(), format!("rejected {name} {new} {old} refname conflict")));
             continue;
         }
-        if let Err(e) = repo.edit_reference(edit) {
+        // A `verify` lands together with its `HEAD` mirror, which then stands in
+        // for the split gitoxide would otherwise add for it on its own.
+        let landed = match mirror {
+            Some(mirror) => repo.edit_references([edit, mirror]).map(drop),
+            None => repo.edit_reference(edit).map(drop),
+        };
+        if let Err(e) = landed {
             let msg = lock_error(repo, &e);
             // A generic failure still dies; only the categorised ones are
             // reportable (builtin/update-ref.c:285-291).
@@ -1920,11 +1997,134 @@ fn apply(repo: &gix::Repository, mut batch: Batch, batch_updates: bool) -> Resul
             write_symref_log(repo, plan)?;
         }
     }
+    for split in &split_logs {
+        split.write(repo)?;
+    }
     for (message, line) in rejected.into_iter().chain(last) {
         eprintln!("error: {message}");
         crate::cstdio::println!("{line}");
     }
     Ok(())
+}
+
+/// The reflog lines a `--batch-updates` update leaves behind when it is rejected
+/// at its old-value check.
+///
+/// `lock_ref_for_update()` runs `split_head_update()` and `split_symref_update()`
+/// before it checks the old value (refs/files-backend.c:2709-2713, :2772-2814),
+/// and `ref_transaction_maybe_set_rejected()` marks only the update that failed
+/// (refs.c:1276-1310). The log-only updates split off it stay in the transaction,
+/// and `files_transaction_finish()` writes their reflog with
+/// `parse_and_write_reflog()` (:3352-3360):
+///
+/// * each symref the update came through was demoted to `REF_LOG_ONLY` and keeps
+///   the lock `lock_raw_ref()` took on it, whose `old_oid` is null — the referent's
+///   value is copied up only once its own check passed (:2826-2836);
+/// * the extra `HEAD` update for the branch `HEAD` points at copies
+///   `&update->new_oid`, `&update->old_oid` and `update->msg` (:2530-2533), and its
+///   lock takes `update->old_oid` under `REF_HAVE_OLD`, the branch lock's value
+///   otherwise (:2760-2764).
+///
+/// So `create refs/heads/main <A>` on the checked-out branch is rejected and still
+/// leaves `<null> <A>` in `.git/logs/HEAD`. The reftable backend gets the same from
+/// its own transaction.
+struct RejectedSplit {
+    name: FullName,
+    old: ObjectId,
+    new: ObjectId,
+    message: String,
+}
+
+impl RejectedSplit {
+    /// The lines for an update of `name` with `new_oid` (`None` without
+    /// `REF_HAVE_NEW`) and `old_oid` (`None` without `REF_HAVE_OLD`).
+    fn plan(
+        repo: &gix::Repository,
+        head_ref: Option<&FullName>,
+        name: &str,
+        deref: bool,
+        new_oid: Option<ObjectId>,
+        old_oid: Option<ObjectId>,
+        message: &str,
+    ) -> Vec<RejectedSplit> {
+        let zero = ObjectId::null(repo.object_hash());
+        let new = new_oid.unwrap_or(zero);
+        // The chain `split_symref_update()` walks, bounded by `SYMREF_MAXDEPTH`.
+        let mut chain = vec![name.to_string()];
+        while deref && chain.len() <= 5 {
+            let Ok(Some(reference)) = repo.try_find_reference(chain[chain.len() - 1].as_str()) else {
+                break;
+            };
+            match reference.target() {
+                gix::refs::TargetRef::Symbolic(target) => chain.push(target.as_bstr().to_string()),
+                gix::refs::TargetRef::Object(_) => break,
+            }
+        }
+        let (leaf, symrefs) = chain.split_last().expect("the chain starts with the name");
+        let mut lines: Vec<RejectedSplit> = symrefs
+            .iter()
+            .filter_map(|symref| FullName::try_from(symref.as_str()).ok())
+            .map(|name| RejectedSplit {
+                name,
+                old: zero,
+                new,
+                message: message.to_string(),
+            })
+            .collect();
+        // `REF_UPDATE_VIA_HEAD` (:2577-2586): an update that came through `HEAD`
+        // already logged there, and gets no second `HEAD` line.
+        let via_head = symrefs.iter().any(|symref| symref == "HEAD");
+        if !via_head && head_ref.is_some_and(|head_ref| head_ref.as_bstr() == leaf.as_str()) {
+            let old = old_oid.unwrap_or_else(|| {
+                repo.try_find_reference(leaf.as_str())
+                    .ok()
+                    .flatten()
+                    .and_then(|r| match r.target() {
+                        gix::refs::TargetRef::Object(id) => Some(id.to_owned()),
+                        gix::refs::TargetRef::Symbolic(_) => None,
+                    })
+                    .unwrap_or(zero)
+            });
+            lines.push(RejectedSplit {
+                name: FullName::try_from("HEAD").expect("HEAD is a valid ref name"),
+                old,
+                new,
+                message: message.to_string(),
+            });
+        }
+        lines
+    }
+
+    fn write(&self, repo: &gix::Repository) -> Result<()> {
+        super::symbolic_ref::append_reflog(repo, self.name.as_bstr(), Some(self.old), &self.new, &self.message)
+    }
+}
+
+/// `REF_HAVE_OLD` and `update->old_oid` for a staged edit: `create` and a zero
+/// old value pass the null id, no old value leaves the flag unset. `Err` for an
+/// old symref target, which carries no object id.
+fn have_old(edit: &RefEdit, zero: ObjectId) -> std::result::Result<Option<ObjectId>, ()> {
+    let expected = match &edit.change {
+        Change::Update { expected, .. } | Change::Delete { expected, .. } => expected,
+    };
+    match expected {
+        PreviousValue::MustExistAndMatch(Target::Object(id)) | PreviousValue::ExistingMustMatch(Target::Object(id)) => {
+            Ok(Some(*id))
+        }
+        PreviousValue::MustExistAndMatch(Target::Symbolic(_)) | PreviousValue::ExistingMustMatch(Target::Symbolic(_)) => {
+            Err(())
+        }
+        PreviousValue::MustNotExist => Ok(Some(zero)),
+        PreviousValue::Any | PreviousValue::MustExist => Ok(None),
+    }
+}
+
+/// `update->msg` of a staged edit: the `-m <reason>` it was given.
+fn edit_message(edit: &RefEdit) -> String {
+    match &edit.change {
+        Change::Update { log, .. } => log.message.to_string(),
+        Change::Delete { message, .. } => message.to_string(),
+    }
 }
 
 /// A name conflict `files_transaction_prepare()` raises while it splits updates:

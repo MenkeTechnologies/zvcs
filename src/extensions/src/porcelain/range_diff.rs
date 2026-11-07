@@ -334,6 +334,12 @@
 //! * An unrecognised option reaches the usage error as "need two commit ranges"
 //!   rather than upstream's "unknown option", because unrecognised options are
 //!   deferred (see above). The exit status, 129, is the same.
+//! * Past `--end-of-options` an operand may start with `-` (a branch named
+//!   `-x`). The inner `git log` reads such a range or forwarded operand as an
+//!   option: one it leaves over is reproduced (`fatal: unrecognized argument`,
+//!   then `could not parse log`, 255), while one it claims — `-p`, `--stat`, a
+//!   `git log` option — stops the run as an unsupported flag instead of drawing
+//!   output the claimed option would have changed.
 //! * Any `--diff-merges` spelling — `--remerge-diff` and `--no-diff-merges`
 //!   included, since both push onto `diff_merges_arg` — makes upstream set
 //!   `range_diff_opts.include_merges` (builtin/range-diff.c:94-97), so a merge
@@ -1100,6 +1106,7 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // because the classifier below reads its position (see [`classify`]).
     let mut pos: Vec<String> = Vec::new();
     let mut after_dash_dash = false;
+    let mut options_done = false;
 
     // `diffopt.output_format` (see [`FMT_NAME`]) and `diffopt.flags.
     // dirstat_by_line`, accumulated by [`format_bits`] as each argument is read.
@@ -1143,8 +1150,17 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
             i += 1;
             continue;
         }
+        // `--end-of-options` ends parse_options_step() and is consumed there
+        // (parse-options.c:1119-1124, no PARSE_OPT_KEEP_UNKNOWN_OPT): every word
+        // after it is an operand, while a later `--` is still the one
+        // `cmd_range_diff()` looks for (builtin/range-diff.c:97-101).
+        if a == "--end-of-options" && !options_done {
+            options_done = true;
+            i += 1;
+            continue;
+        }
         // A bare `-` is a revision-ish operand, not an option.
-        if a.len() < 2 || !a.starts_with('-') {
+        if options_done || a.len() < 2 || !a.starts_with('-') {
             pos.push(a.to_string());
             i += 1;
             continue;
@@ -2068,6 +2084,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
     // Upstream resolves each range by running `git log` over it, oldest range
     // first; a range naming an unknown revision is fatal before any patch is
     // read, and `git log`'s -1 return becomes exit status 255.
+    if let Some(code) = inner_log_options(&repo, &range1, &extra, true)? {
+        return Ok(code);
+    }
     let mut ends1 = match endpoints(&repo, &range1) {
         Ok(e) => walkable(&repo, e),
         Err(_) => return Ok(could_not_parse_log(&repo, &range1)),
@@ -2090,6 +2109,9 @@ pub fn range_diff(args: &[String]) -> Result<ExitCode> {
         Ok(e) => e,
         Err(code) => return Ok(code),
     };
+    if let Some(code) = inner_log_options(&repo, &range2, &extra, false)? {
+        return Ok(code);
+    }
     let mut ends2 = match endpoints(&repo, &range2) {
         Ok(e) => walkable(&repo, e),
         Err(_) => return Ok(could_not_parse_log(&repo, &range2)),
@@ -2395,6 +2417,91 @@ fn inner_log_config_refusal(repo: &gix::Repository, range: &str) -> Option<ExitC
 /// `builtin/range-diff.c`'s own `error()` for a failed inner log, on its own:
 /// the caller has already printed whatever that log died with. Upstream's -1
 /// return is exit status 255.
+/// The words `--end-of-options` lets through to the inner `git log` as options:
+/// a range or a forwarded operand that starts with `-` (a branch named `-x`).
+///
+/// `read_patches()` hands the log `<range> <log_arg>...` (range-diff.c:71-73),
+/// and there such a word is an option again. `cmd_log_init_finish()` runs its own
+/// table and then `setup_revisions()` (builtin/log.c:309-320), and the first word
+/// neither claims is `die(_("unrecognized argument: %s"), argv[1])` — after every
+/// revision on the line has resolved — which range-diff reports as
+/// `could not parse log` at 255. A word either does claim would change what the
+/// log produces, which this port does not reproduce, so it stops on it instead.
+///
+/// `forwarded` says whether this log is the first to meet the forwarded operands:
+/// a word among them that is left over fails range1's log, before range2's runs.
+/// `None` when nothing is left over.
+fn inner_log_options(
+    repo: &gix::Repository,
+    range: &str,
+    extra: &[String],
+    forwarded: bool,
+) -> Result<Option<ExitCode>> {
+    let is_option = |word: &str| word.len() > 1 && word.starts_with('-');
+    let mut words: Vec<String> = vec![range.to_string()];
+    if forwarded {
+        // `setup_revisions()` reads options only up to the `--` it cut off.
+        words.extend(extra.iter().take_while(|w| w.as_str() != "--").cloned());
+    }
+    // `cmd_log_init_finish()`'s own options (builtin/log.c:280-302).
+    const LOG_OWN: [&str; 9] = [
+        "quiet",
+        "source",
+        "use-mailmap",
+        "mailmap",
+        "i-still-use-this",
+        "clear-decorations",
+        "decorate-refs",
+        "decorate-refs-exclude",
+        "decorate",
+    ];
+    let mut counts = crate::revopt::Counts::default();
+    let mut diff = super::diff_opt_parse::DiffOpts::default();
+    let mut leftover: Option<String> = None;
+    for at in 0..words.len() {
+        let word = words[at].as_str();
+        if !is_option(word) {
+            continue;
+        }
+        let long = word.strip_prefix("--").map(|l| l.split_once('=').map_or(l, |(n, _)| n));
+        let log_own = match long {
+            Some(name) => LOG_OWN.contains(&name.strip_prefix("no-").unwrap_or(name)),
+            None => matches!(word.as_bytes()[1], b'q' | b'L'),
+        };
+        if log_own || word == "--end-of-options" {
+            bail!(unsupported_flag(word));
+        }
+        match super::bundle::claim_revision_opt(repo, &words, at, &mut counts, &mut diff) {
+            Ok(super::bundle::Claimed::Yes { .. }) => bail!(unsupported_flag(word)),
+            // Left over as `diff_opt_parse()` left it in argv: a cluster it stopped
+            // part-way through is the rest of the cluster (`-p..x` is `-..x`).
+            Ok(super::bundle::Claimed::No) => {
+                let left = diff.rewritten_arg.take();
+                leftover.get_or_insert_with(|| left.unwrap_or_else(|| word.to_string()));
+            }
+            Err(_) => return Ok(Some(log_parse_failed(range))),
+        }
+    }
+    let Some(leftover) = leftover else {
+        return Ok(None);
+    };
+    // The revisions on the line still resolve first.
+    if !is_option(range) && endpoints(repo, range).is_err() {
+        return Ok(Some(could_not_parse_log(repo, range)));
+    }
+    if forwarded {
+        let operands: Vec<String> = extra.iter().enumerate()
+            .filter(|(n, w)| !is_option(w) || extra[..*n].iter().any(|s| s == "--"))
+            .map(|(_, w)| w.clone())
+            .collect();
+        if let Err(code) = extra_operands(repo, range, &operands) {
+            return Ok(Some(code));
+        }
+    }
+    eprintln!("fatal: unrecognized argument: {leftover}");
+    Ok(Some(log_parse_failed(range)))
+}
+
 fn log_parse_failed(range: &str) -> ExitCode {
     eprintln!("error: could not parse log for '{range}'");
     ExitCode::from(255)
@@ -2865,6 +2972,12 @@ fn committish(repo: &gix::Repository, spec: &str) -> bool {
 /// Modelled here by treating an id that appears on both sides as the single
 /// object it is: the tips that are also hidden count as negative.
 fn is_range_diff_range(repo: &gix::Repository, spec: &str) -> RangeKind {
+    // A word only `--end-of-options` lets through: `setup_revisions()` reads it
+    // as an option, so it pends nothing whether `handle_revision_opt()` claims it
+    // or leaves it over.
+    if spec.len() > 1 && spec.starts_with('-') {
+        return RangeKind::NotRange;
+    }
     match endpoints(repo, spec) {
         Ok((tips, hidden)) => {
             let positive = tips.iter().filter(|id| !hidden.contains(id)).count();

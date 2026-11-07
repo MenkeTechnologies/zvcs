@@ -399,13 +399,7 @@ fn push(st: &State) -> Result<ExitCode> {
     // reproduced here because the vendored transport reports a single Rust-level
     // metadata error instead.
     if let Some(bad) = local_dest_that_is_not_a_repository(dest, crate::setup::setup_cwd(&repo).as_deref()) {
-        eprintln!("fatal: '{bad}' does not appear to be a git repository");
-        eprintln!(
-            "fatal: Could not read from remote repository.\n\n\
-             Please make sure you have the correct access rights\n\
-             and the repository exists."
-        );
-        return Ok(ExitCode::from(128));
+        return Ok(crate::transport_err::enter_repo_fatal(&bad));
     }
 
     // Everything `send_pack()` can fail on is a `die()` in git — a refused
@@ -499,43 +493,28 @@ fn read_pkt_line(r: &mut impl std::io::Read) -> Result<Pkt> {
     Ok(Pkt::Line(payload))
 }
 
-/// The destination as `enter_repo()` sees it, when it names a local path that is
-/// not a repository — the case `git-receive-pack` would have refused on the far
-/// end. `None` for anything reachable, and for any destination that is not a
-/// local path, whose failures belong to the transport that owns them.
+/// The `die()` text of the `upload-pack`/`receive-pack` child `git_connect()`
+/// starts for `dest`, when `dest` is a local path its `enter_repo()` refuses —
+/// `'<path>' does not appear to be a git repository`, or the `read_gitfile()`
+/// refusal of a plain file the suffix scan settled on. `None` for anything it
+/// enters, and for any destination that is not a local path, whose failures
+/// belong to the transport that owns them.
 ///
-/// The service is started in git's current directory, `cwd` — the top of the work
+/// The child is started in git's current directory, `cwd` — the top of the work
 /// tree once setup has moved there — so a relative `dest` is looked for from it.
-/// `None` is this process's current directory.
-pub(crate) fn local_dest_that_is_not_a_repository<'a>(
-    dest: &'a str,
+/// `None` is this process's current directory. See
+/// [`crate::transport_err::enter_repo_refusal`] and
+/// [`crate::transport_err::connect_path`].
+pub(crate) fn local_dest_that_is_not_a_repository(
+    dest: &str,
     cwd: Option<&std::path::Path>,
-) -> Option<&'a str> {
+) -> Option<String> {
     let url = gix::url::parse(dest.into()).ok()?;
     if url.scheme != gix::url::Scheme::File {
         return None;
     }
-    // `parse_connect_url()` hands `git-receive-pack` the path of a `file:///<path>`
-    // URL, from the '/' that ends its empty host (connect.c:1110-1140), and that
-    // path is what `enter_repo()` opens and its message quotes.
-    let dest = match dest.strip_prefix("file://") {
-        Some(path) if path.starts_with('/') => path,
-        _ => dest,
-    };
-    // `enter_repo(..., strict = 0)`: a worktree, a `.git` directory, or a bare
-    // repository, with `.git` appended if that is what makes it one.
-    let found = [
-        dest.to_string(),
-        format!("{dest}/.git"),
-        format!("{dest}.git"),
-        format!("{dest}.git/.git"),
-    ]
-    .iter()
-    .any(|c| match cwd {
-        Some(cwd) => gix::open(cwd.join(c)).is_ok(),
-        None => gix::open(c).is_ok(),
-    });
-    (!found).then_some(dest)
+    let path = crate::transport_err::connect_path(&url);
+    crate::transport_err::enter_repo_refusal(&path, cwd)
 }
 
 /// `match_push_refs()` reduced to what `send-pack` can ask of it: `--all` and

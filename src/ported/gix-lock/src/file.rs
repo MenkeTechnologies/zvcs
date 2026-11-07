@@ -60,6 +60,15 @@ impl File {
     pub fn resource_path(&self) -> PathBuf {
         strip_lock_suffix(&self.lock_path)
     }
+
+    /// Release the lock without committing it, removing the lock file and none of
+    /// the directories the acquisition created. See [`Marker::release_keeping_directories()`].
+    pub fn release_keeping_directories(self) {
+        drop(self.inner.take());
+        if let Some(pid_file) = self.pid_file {
+            drop(pid_file.take());
+        }
+    }
 }
 
 mod io_impls {
@@ -99,5 +108,20 @@ impl Marker {
     /// Return the path at which the locked resource resides
     pub fn resource_path(&self) -> PathBuf {
         strip_lock_suffix(&self.lock_path)
+    }
+
+    /// Release the lock without committing it, removing the lock file and none of
+    /// the directories the acquisition created, whatever the lock's cleanup mode.
+    ///
+    /// `rollback_lock_file()` deletes the lock file alone (lockfile.h, tempfile.c
+    /// `delete_tempfile()`); a ref lock's leading directories are pruned only where
+    /// the ref store asks for it, so a caller that gives up on a lock before the
+    /// store would have — `lock_raw_ref()`'s `error_return:` (refs/files-backend.c:
+    /// 993-995) — releases it this way.
+    pub fn release_keeping_directories(self) {
+        drop(self.inner.take());
+        if let Some(pid_file) = self.pid_file {
+            drop(pid_file.take());
+        }
     }
 }

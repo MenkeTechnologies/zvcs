@@ -755,8 +755,13 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
     // (`cmd_clone()`, builtin/clone.c.) Before anything is created or announced, a
     // source that is neither a repository, a gitfile nor a bundle on disk, and has
     // no colon to be a URL, is refused — an existing directory that holds no
-    // repository included.
-    if !url_str.contains(':') && matches!(classify_local_source(url_str), LocalSource::Neither) {
+    // repository included. `get_repo_path()` runs whether or not the name has a
+    // colon, and a gitfile it reads dies there, ahead of everything else.
+    let classified = classify_local_source(url_str);
+    if let LocalSource::Refused(msg) = &classified {
+        return Ok(fatal(msg));
+    }
+    if !url_str.contains(':') && matches!(classified, LocalSource::Neither) {
         return Ok(fatal(&format!("repository '{url_str}' does not exist")));
     }
 
@@ -1278,6 +1283,25 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
         crate::git_fatal!("could not set 'core.repositoryformatversion' to '{}'", u8::from(reftable));
     }
 
+    // `transport_get(remote, path ? path : remote->url.v[0])` (builtin/clone.c:1345)
+    // tries a local regular-file source as a bundle before it picks a transport:
+    //
+    // ```c
+    // } else if (url_is_local_not_ssh(url) && is_file(url) && is_bundle(url, 1)) {
+    // ```
+    //
+    // (transport.c:1258.) `is_bundle()` reports a file without a bundle header right
+    // there, so that `error:` precedes everything the transport does later — the
+    // depth option, `transport_check_allowed("file")` in `git_connect()`, and the
+    // `upload-pack` child that file falls through to.
+    let not_a_bundle = bundle_source
+        .as_ref()
+        .filter(|path| !looks_like_bundle(path))
+        .map(|path| absolute_pathdup(path));
+    if let Some(shown) = &not_a_bundle {
+        eprintln!("error: '{shown}' does not look like a v2 or v3 bundle file");
+    }
+
     // `transport_check_allowed()`, here rather than at the top of the command
     // because git reaches it inside `transport_get()`/`git_connect()` — after the
     // banner. `git clone <path>` under `$GIT_PROTOCOL_FROM_USER=0` therefore
@@ -1334,22 +1358,19 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
 
     // `get_repo_path_1()` reads a local source as a repository first and as a bundle second, so a
     // path that is neither — a plain file, a loose pack — reaches the transport as a bundle
-    // candidate. git then prints three things: the bundle check that rejected it, the `die()` of
-    // the `upload-pack` child it fell back to (a file that is not a gitfile is
-    // `invalid gitfile format`), and the block `git_connect()` ends with. Exit 128.
+    // candidate. After the bundle check that rejected it (above), git prints the `die()` of the
+    // `upload-pack` child it fell back to — `enter_repo()` settles on the plain file and its
+    // `read_gitfile()` refuses it, `invalid gitfile format` for a file that is not a gitfile —
+    // and the block `git_connect()` ends with. Exit 128.
     let bundle_transport = match bundle_source {
         None => None,
         Some(path) => {
             let shown = absolute_pathdup(&path);
-            if !looks_like_bundle(&path) {
+            if not_a_bundle.is_some() {
                 junk.remove_now();
-                eprintln!("error: '{shown}' does not look like a v2 or v3 bundle file");
-                eprintln!("fatal: invalid gitfile format: {shown}");
-                eprintln!("fatal: Could not read from remote repository.");
-                eprintln!();
-                eprintln!("Please make sure you have the correct access rights");
-                eprintln!("and the repository exists.");
-                return Ok(ExitCode::from(128));
+                let refusal = crate::transport_err::enter_repo_refusal(&shown, None)
+                    .unwrap_or_else(|| format!("'{shown}' does not appear to be a git repository"));
+                return Ok(crate::transport_err::enter_repo_fatal(&refusal));
             }
             // ```c
             // if (is_bundle) {
@@ -2272,6 +2293,12 @@ pub fn clone(args: &[String]) -> Result<ExitCode> {
             return Ok(code);
         }
         if let Some(code) = crate::transport_err::hang_up_fatal(e) {
+            return Ok(code);
+        }
+        // A `file://` source `get_repo_path()` did not claim reaches `git_connect()`,
+        // whose `upload-pack` child dies in `enter_repo()`; the clone then dies in
+        // `die_initial_contact()` and `remove_junk()` takes the new directory down.
+        if let Some(code) = crate::transport_err::file_url_fatal_in(e) {
             return Ok(code);
         }
         // `discover_refs()` refused, or a fetch response cut off where its next section belongs.
@@ -3755,6 +3782,9 @@ enum LocalSource {
     Bundle(PathBuf),
     /// Neither — git leaves `path` NULL and hands the raw URL to the transport.
     Neither,
+    /// A candidate that starts `gitdir: ` and that `read_gitfile()` refuses: its `die()`
+    /// text (`read_gitfile_error_die()`, setup.c:927-952).
+    Refused(String),
 }
 
 /// Classify a local source the way `get_repo_path_1()` does, in its order: the four repository
@@ -3781,6 +3811,11 @@ fn classify_local_source(repo_name: &str) -> LocalSource {
                 .map(|bytes| bytes.starts_with(b"gitdir: "))
                 .unwrap_or(false);
             if is_gitfile {
+                // `dst = read_gitfile(path->buf);` (builtin/clone.c:122) is the dying
+                // spelling, so a gitfile that names no repository ends the clone here.
+                if let Err(err) = gix::discover::setup::read_gitfile_gently(&candidate) {
+                    return LocalSource::Refused(gix::discover::setup::gitfile_error_message(&candidate, err));
+                }
                 return LocalSource::Repository(source_path(suffix));
             }
         }

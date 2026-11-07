@@ -788,7 +788,7 @@ git push <groupname>\n"
         &transport_url,
         crate::setup::setup_cwd(&repo).as_deref(),
     ) {
-        return Ok(crate::transport_err::not_a_repository_fatal(bad));
+        return Ok(crate::transport_err::enter_repo_fatal(&bad));
     }
 
     let (mut requests, upstreams) = match build_requests(&repo, &f, &specs) {

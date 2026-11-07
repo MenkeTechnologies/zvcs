@@ -119,6 +119,137 @@ pub fn not_a_repository_fatal(path: &str) -> ExitCode {
     ExitCode::from(128)
 }
 
+/// The path `git_connect()` hands the `upload-pack`/`receive-pack` child of a local
+/// `url`, which is the string `enter_repo()` opens and its messages quote.
+///
+/// `parse_connect_url()` (connect.c:1067-1106) keeps a plain path as it is and, for
+/// a `file://` URL, starts the path at the `/` that ends the empty host:
+///
+/// ```c
+/// if (scheme == URL_SCHEME_LOCAL)
+///         path = end;
+/// else if (scheme == URL_SCHEME_FILE && *host != '/' &&
+///          !has_dos_drive_prefix(host) &&
+///          offset_1st_component(host - 2) > 1)
+///         path = host - 2; /* include the leading "//" */
+/// [...]
+/// else
+///         path = strchr(end, separator);
+/// ```
+///
+/// so `file:///srv/r` is `/srv/r`, and `file://host/r`, whose host is not empty,
+/// keeps the leading `//` as `//host/r`.
+pub fn connect_path(url: &gix::Url) -> String {
+    let path = url.path.to_string();
+    if url.serialize_alternative_form {
+        return path;
+    }
+    match url.host() {
+        Some(host) if !host.is_empty() => format!("//{host}{path}"),
+        _ => path,
+    }
+}
+
+/// `enter_repo(path, 0)` (setup.c:1821-1906) as the `upload-pack`/`receive-pack`
+/// child `git_connect()` starts in `cwd` runs it: `None` when it enters a
+/// repository, otherwise the text the child's `die()` writes.
+///
+/// ```c
+/// static const char *suffix[] = {
+///         "/.git", "", ".git/.git", ".git", NULL,
+/// };
+/// [...]
+/// while ((1 < len) && (path[len-1] == '/'))
+///         len--;
+/// [...]
+/// if (used_path.buf[0] == '~') {
+///         char *newpath = interpolate_path(used_path.buf, 0);
+///         if (!newpath)
+///                 return NULL;
+///         [...]
+/// }
+/// for (i = 0; suffix[i]; i++) {
+///         [...]
+///         if (!stat(used_path.buf, &st) &&
+///             (S_ISREG(st.st_mode) ||
+///             (S_ISDIR(st.st_mode) && is_git_directory(used_path.buf)))) {
+///                 strbuf_addstr(&validated_path, suffix[i]);
+///                 break;
+///         }
+///         [...]
+/// }
+/// if (!suffix[i])
+///         return NULL;
+/// gitfile = read_gitfile(used_path.buf);
+/// ```
+///
+/// The scan settles on the first candidate that is a regular file or a git
+/// directory, and only then reads it with the dying `read_gitfile()`, so a plain
+/// file ends at `invalid gitfile format: <candidate>` — the candidate as the child
+/// spelled it, relative when `path` is. Anything the scan cannot settle on is
+/// `upload-pack`'s own refusal (builtin/upload-pack.c:62-63):
+///
+/// ```c
+/// if (!enter_repo(the_repository, dir, enter_repo_flags))
+///         die("'%s' does not appear to be a git repository", dir);
+/// ```
+///
+/// with `dir` as it arrived, trailing slashes and `~` included. Having entered the
+/// git directory, the child reads its format without `nongit_ok`, so a format
+/// `verify_repository_format()` refuses is that `die()` instead (setup.c:1893-1896).
+pub fn enter_repo_refusal(path: &str, cwd: Option<&std::path::Path>) -> Option<String> {
+    use gix::discover::setup::{gitfile_error_message, is_git_directory, read_gitfile_gently};
+    let not_a_repository = || Some(format!("'{path}' does not appear to be a git repository"));
+    let bytes = path.as_bytes();
+    let mut len = path.len();
+    while len > 1 && bytes[len - 1] == b'/' {
+        len -= 1;
+    }
+    let used = &path[..len];
+    let used = if used.starts_with('~') {
+        match crate::setup::interpolate_path(used) {
+            Some(expanded) => expanded.to_string_lossy().into_owned(),
+            None => return not_a_repository(),
+        }
+    } else {
+        used.to_string()
+    };
+    // The child runs in `cwd`; this process may not, so a relative candidate is
+    // looked at from there and still named as the child names it.
+    let on_disk = |candidate: &str| match cwd {
+        Some(cwd) => cwd.join(candidate),
+        None => std::path::PathBuf::from(candidate),
+    };
+    for suffix in ["/.git", "", ".git/.git", ".git"] {
+        let candidate = format!("{used}{suffix}");
+        let disk = on_disk(&candidate);
+        let Ok(meta) = std::fs::metadata(&disk) else { continue };
+        if !meta.is_file() && !(meta.is_dir() && is_git_directory(&disk)) {
+            continue;
+        }
+        let git_dir = match read_gitfile_gently(&disk) {
+            Ok(target) => target.unwrap_or(disk),
+            Err(err) => return Some(gitfile_error_message(std::path::Path::new(&candidate), err)),
+        };
+        // The candidate passed `is_git_directory()`, or `read_gitfile()` checked its
+        // target with it, so the `chdir()` and the `is_git_directory(".")` that follow
+        // (setup.c:1876-1891) find the same directory.
+        return crate::config::repository_format_refusal_in(&git_dir);
+    }
+    not_a_repository()
+}
+
+/// The child's `enter_repo()` refusal ([`enter_repo_refusal`]), then the block
+/// `die_initial_contact()` adds once the parent reads nothing back. Exit 128.
+pub fn enter_repo_fatal(refusal: &str) -> ExitCode {
+    eprintln!("fatal: {refusal}");
+    eprintln!("fatal: Could not read from remote repository.");
+    eprintln!();
+    eprintln!("Please make sure you have the correct access rights");
+    eprintln!("and the repository exists.");
+    ExitCode::from(128)
+}
+
 /// [`not_a_repository_fatal`] for the vendored transport's own spelling of the
 /// same failure, or `None` when `err` is something else.
 ///
@@ -126,12 +257,16 @@ pub fn not_a_repository_fatal(path: &str) -> ExitCode {
 /// git directory and fails with `connect::Error::FileUrl` — "Could not verify
 /// that "<url>" url is a valid git directory before attempting to use it" —
 /// where git's `git_connect()` would have spawned `upload-pack`/`receive-pack`
-/// and died in `enter_repo()`. The URL carried in the error is the path as it
-/// was configured or typed, which is the string git's message quotes.
+/// and died in `enter_repo()`. What git prints is that child's refusal of the
+/// path `parse_connect_url()` gave it ([`connect_path`], [`enter_repo_refusal`]):
+/// `/srv/r` for `file:///srv/r`, not the URL.
 pub fn file_url_fatal(err: &gix::remote::connect::Error) -> Option<ExitCode> {
     match err {
-        gix::remote::connect::Error::FileUrl { url, .. } => {
-            Some(not_a_repository_fatal(&url.to_bstring().to_string()))
+        gix::remote::connect::Error::FileUrl { url, cwd, .. } => {
+            let path = connect_path(url);
+            let refusal = enter_repo_refusal(&path, Some(cwd))
+                .unwrap_or_else(|| format!("'{path}' does not appear to be a git repository"));
+            Some(enter_repo_fatal(&refusal))
         }
         _ => None,
     }
@@ -139,9 +274,20 @@ pub fn file_url_fatal(err: &gix::remote::connect::Error) -> Option<ExitCode> {
 
 /// [`file_url_fatal`] for an error that carries the connect failure somewhere
 /// in its source chain, as one propagated through `?` does.
+///
+/// `gix::clone::fetch::Error::Connect` is `#[error(transparent)]`, whose `source()`
+/// skips the connect error it wraps, so a clone's chain is asked for that variant
+/// directly.
 pub fn file_url_fatal_in(err: &anyhow::Error) -> Option<ExitCode> {
     err.chain()
-        .find_map(|cause| cause.downcast_ref::<gix::remote::connect::Error>())
+        .find_map(|cause| {
+            cause.downcast_ref::<gix::remote::connect::Error>().or_else(|| {
+                match cause.downcast_ref::<gix::clone::fetch::Error>() {
+                    Some(gix::clone::fetch::Error::Connect(inner)) => Some(inner),
+                    _ => None,
+                }
+            })
+        })
         .and_then(file_url_fatal)
 }
 

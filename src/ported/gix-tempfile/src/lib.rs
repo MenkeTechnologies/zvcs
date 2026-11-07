@@ -181,7 +181,21 @@ impl AutoRemove {
         match self {
             AutoRemove::Tempfile => None,
             AutoRemove::TempfileAndEmptyParentDirectoriesUntil { boundary_directory } => {
-                remove_dir::empty_upward_until_boundary(directory_to_potentially_delete, &boundary_directory).ok();
+                // A named tempfile's path is made absolute when it is created, while the
+                // boundary is kept as the caller spelled it; compared as they are, a relative
+                // boundary such as `.git/refs/heads` never contains the file's directory and
+                // nothing is removed. Both are read from the current directory instead.
+                let absolute = |path: &Path| -> std::path::PathBuf {
+                    match path.is_relative() {
+                        true => std::env::current_dir().map_or_else(|_| path.to_owned(), |cwd| cwd.join(path)),
+                        false => path.to_owned(),
+                    }
+                };
+                remove_dir::empty_upward_until_boundary(
+                    &absolute(directory_to_potentially_delete),
+                    &absolute(&boundary_directory),
+                )
+                .ok();
                 Some(boundary_directory)
             }
         }

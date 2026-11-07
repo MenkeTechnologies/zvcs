@@ -315,10 +315,8 @@ pub fn ls_remote(args: &[String]) -> Result<ExitCode> {
         // A local path that is not a repository is `enter_repo()` coming back
         // NULL in `git_connect()`, which names the path and then adds the same
         // block an unreachable host produces.
-        Err(gix::remote::connect::Error::FileUrl { url, .. }) => {
-            return Ok(crate::transport_err::not_a_repository_fatal(
-                &url.to_bstring().to_string(),
-            ));
+        Err(e @ gix::remote::connect::Error::FileUrl { .. }) => {
+            return Ok(crate::transport_err::file_url_fatal(&e).expect("a FileUrl error"));
         }
         Err(e) => {
             eprintln!("fatal: {e}");

@@ -2912,12 +2912,7 @@ fn fetch_one(
         if repo.try_find_remote(spec.as_str()).is_none() {
             if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(&spec, crate::setup::setup_cwd(repo).as_deref()) {
                 fetch_head.truncate_now()?;
-                eprintln!("fatal: '{bad}' does not appear to be a git repository");
-                eprintln!(
-                    "fatal: Could not read from remote repository.\n\n\
-                     Please make sure you have the correct access rights\n\
-                     and the repository exists."
-                );
+                crate::transport_err::enter_repo_fatal(&bad);
                 return Ok(Verdict::Fatal);
             }
         }

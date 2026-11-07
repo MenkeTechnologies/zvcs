@@ -206,11 +206,18 @@ impl Transaction<'_, '_> {
                             });
                         }
                     } else {
-                        gix_tempfile::remove_dir::empty_upward_until_boundary(
-                            reflog_path.parent().expect("never without parent"),
-                            &reflog_root,
-                        )
-                        .ok();
+                        // `try_remove_empty_parents(refs, refname, REMOVE_EMPTY_PARENTS_REFLOG)`
+                        // (refs/files-backend.c:3402-3410, 1330-1371) spares `logs/refs/` and the
+                        // `logs/refs/<kind>/` below it, as the loose-ref pruning further down does.
+                        let components = change.update.name.as_bstr().split(|&b| b == b'/').count();
+                        let mut dir = reflog_path.parent();
+                        for _ in 0..components.saturating_sub(3) {
+                            let Some(d) = dir else { break };
+                            if std::fs::remove_dir(d).is_err() {
+                                break;
+                            }
+                            dir = d.parent();
+                        }
                     }
                 }
             }

@@ -2166,12 +2166,12 @@ fn fetch_object_info(
     };
     let mut connection = match remote.connect_with_options(gix::remote::Direction::Fetch, connect_options) {
         Ok(connection) => connection,
-        Err(gix::remote::connect::Error::FileUrl { url, .. }) => {
-            return Ok(Err(crate::transport_err::not_a_repository_fatal(
-                &url.to_bstring().to_string(),
-            )));
+        Err(e) => {
+            if let Some(code) = crate::transport_err::file_url_fatal(&e) {
+                return Ok(Err(code));
+            }
+            return die(&e.to_string());
         }
-        Err(e) => return die(&e.to_string()),
     };
     let url_text = url.as_ref().map(|u| u.to_bstring().to_string()).unwrap_or_default();
     let mut authenticate = match url.clone().map(|u| connection.configured_credentials(u)) {

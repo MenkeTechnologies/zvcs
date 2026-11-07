@@ -37,6 +37,9 @@ mod error {
         FileUrl {
             source: Box<gix_discover::is_git::Error>,
             url: gix_url::Url,
+            /// The directory a relative path in `url` was looked for from, where git's
+            /// `upload-pack`/`receive-pack` child would have been started.
+            cwd: std::path::PathBuf,
         },
     }
 
@@ -216,6 +219,7 @@ impl<'repo> Remote<'repo> {
                         return Err(Error::FileUrl {
                             source: first_err.expect("at least one candidate was tried").into(),
                             url: url.clone(),
+                            cwd: cwd.clone(),
                         })
                     }
                 };

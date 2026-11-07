@@ -125,7 +125,7 @@ impl Transaction<'_, '_> {
                 let lock = gix_lock::Marker::acquire_to_hold_resource(
                     base.join(relative_path.as_ref()),
                     lock_fail_mode,
-                    Some(base.clone().into_owned()),
+                    Some(kind_directory(&base, &relative_path)),
                 )
                 .map_err(|err| Self::lock_acquire_error(err, "borrowcheck won't allow change.name()"))?;
 
@@ -138,6 +138,11 @@ impl Transaction<'_, '_> {
                     (PreviousValue::ExistingMustMatch(_) | PreviousValue::Any, None)
                     | (PreviousValue::MustExist | PreviousValue::Any, Some(_)) => {}
                     (PreviousValue::MustExist | PreviousValue::MustExistAndMatch(_), None) => {
+                        // `lock_raw_ref()` fails a `mustexist` lock on a missing ref inside
+                        // itself and `error_return:` unlocks without pruning, since the lock
+                        // never reaches `files_transaction_cleanup()` (refs/files-backend.c:
+                        // 885-893, 993-995): the directories it created stay.
+                        lock.release_keeping_directories();
                         return Err(Error::DeleteReferenceMustExist {
                             full_name: change.name(),
                         });
@@ -171,7 +176,7 @@ impl Transaction<'_, '_> {
                     gix_lock::File::acquire_to_update_resource(
                         base.join(relative_path.as_ref()),
                         lock_fail_mode,
-                        Some(base.clone().into_owned()),
+                        Some(kind_directory(&base, &relative_path)),
                     )
                     .map_err(|err| {
                         Self::lock_acquire_error(
@@ -200,6 +205,8 @@ impl Transaction<'_, '_> {
                     (PreviousValue::MustExist, None) => {
                         let expected = Target::Object(store.object_hash.null());
                         let full_name = change.name();
+                        // See the deletion's `MustExist` arm above.
+                        lock.release_keeping_directories();
                         return Err(Error::MustExist { full_name, expected });
                     }
                     (PreviousValue::MustNotExist, Some(existing)) => {
@@ -231,6 +238,8 @@ impl Transaction<'_, '_> {
                     (PreviousValue::MustExistAndMatch(previous), None) => {
                         let expected = previous.to_owned();
                         let full_name = change.name();
+                        // See the deletion's `MustExist` arm above.
+                        lock.release_keeping_directories();
                         return Err(Error::MustExist { full_name, expected });
                     }
                 }
@@ -866,3 +875,34 @@ mod error {
 }
 
 pub use error::Error;
+
+/// The directory a released ref lock may prune up to, exclusively: `refs/<kind>/`
+/// for a ref below it, and for any other name the directory the lock is in, so that
+/// nothing is removed.
+///
+/// `lock_raw_ref()` creates the lock's leading directories
+/// (refs/files-backend.c:791-792), and the lock is released either by the commit
+/// or, still held, by `files_transaction_cleanup()`, which follows `unlock_ref()`
+/// with `try_remove_empty_parents(refs, update->refname, REMOVE_EMPTY_PARENTS_REF)`
+/// (:2919-2929). That function skips the first two components of the name and
+/// removes the empty directories below them, bottom-up (:1330-1371):
+///
+/// ```c
+/// for (i = 0; i < 2; i++) { /* refs/{heads,tags,...}/ */
+///         while (*p && *p != '/')
+///                 p++;
+///         /* tolerate duplicate slashes; see check_refname_format() */
+///         while (*p == '/')
+///                 p++;
+/// }
+/// ```
+///
+/// so `refs/tags/` itself is never removed, nor any directory above it — however
+/// the git directory is spelled, and whether or not it lies inside a work tree.
+fn kind_directory(base: &std::path::Path, relative_path: &std::path::Path) -> std::path::PathBuf {
+    let mut components = relative_path.components();
+    match (components.next(), components.next(), components.next()) {
+        (Some(first), Some(second), Some(_)) => base.join(first).join(second),
+        _ => base.join(relative_path).parent().unwrap_or(base).to_owned(),
+    }
+}

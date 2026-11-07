@@ -2156,13 +2156,7 @@ fn show(repo: &gix::Repository, args: &[String], verbose: bool) -> Result<ExitCo
         // transport does.
         if !no_query && repo.find_remote(*name).is_err() {
             if let Some(bad) = super::send_pack::local_dest_that_is_not_a_repository(name, crate::setup::setup_cwd(repo).as_deref()) {
-                eprintln!("fatal: '{bad}' does not appear to be a git repository");
-                eprintln!(
-                    "fatal: Could not read from remote repository.\n\n\
-                     Please make sure you have the correct access rights\n\
-                     and the repository exists."
-                );
-                return Ok(ExitCode::from(128));
+                return Ok(crate::transport_err::enter_repo_fatal(&bad));
             }
         }
         let map = if no_query {

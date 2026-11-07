@@ -138,18 +138,14 @@
 //!
 //! ### Not ported (bailed on with a precise message, never silently ignored)
 //!
-//!   1. **Thin-pack completion.** `gix_pack::Bundle::write_to_directory` takes
-//!      a `thin_pack_base_object_lookup` used to *resolve* external deltas for
-//!      index computation (`gix-pack/src/bundle/write/mod.rs:53`), but it does
-//!      not append the base objects to the pack the way `index-pack --fix-thin`
-//!      does, and it writes no `.rev` reverse index. A kept pack therefore
-//!      differs on disk from the one git would have stored.
-//!   2. **The quarantine.** git ingests a push into a temporary object
+//!   1. **The quarantine.** git ingests a push into a temporary object
 //!      directory, exports it to the hooks as `GIT_QUARANTINE_PATH`, and
 //!      migrates it only once `pre-receive` has passed; this port writes
-//!      straight into the object store, so a declined push leaves its objects
-//!      behind for the next `gc` rather than discarding them at once.
-//!   3. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
+//!      straight into the object store, so a push a hook declines leaves its
+//!      objects behind for the next `gc` rather than discarding them at once.
+//!      A pack the unpack step itself rejects (`--strict`) is removed again,
+//!      which is all a failed child leaves in git either.
+//!   2. **Shallow pushes.** The `shallow <oid>` lines a shallow client sends are
 //!      consumed and dropped, and the shallow-update switch that governs them is
 //!      deliberately left unread rather than named here: grafting
 //!      the pushed history onto the receiving repository's shallow boundary is
@@ -1771,9 +1767,9 @@ fn cap_present(caps: &[u8], want: &[u8]) -> bool {
 /// Index the packfile streaming off `input`, then either explode it into loose
 /// objects or keep it — `receive-pack.c::unpack()`'s `unpack-objects` versus
 /// `index-pack` choice, decided by the object count in the pack header against
-/// `receive.unpackLimit`. A thin pack's external delta bases are resolved from
-/// the odb (git's `index-pack --fix-thin`), so a `send-pack` thin pack lands
-/// complete.
+/// `receive.unpackLimit`. The delta bases a thin pack lacks, and only those the
+/// pack cannot supply itself, are appended to it from the odb (git's
+/// `index-pack --fix-thin`), so a `send-pack` thin pack lands complete.
 ///
 /// On failure the diagnostics have already gone back to the pusher and what is
 /// returned is the `unpack <status>` line the client reports: either one of
@@ -1856,12 +1852,25 @@ fn ingest_pack(
         }
     };
     // `write_to_directory` always drops a `.keep`; a received push keeps none.
+    // It only drops one when it moved a pack of its own into place, rather than
+    // finding the very same pack there already.
+    let created = outcome.keep_path.is_some();
     if let Some(kp) = &outcome.keep_path {
         let _ = std::fs::remove_file(kp);
     }
     let (index_path, data_path) = match (&outcome.index_path, &outcome.data_path) {
         (Some(index), Some(data)) => (index.clone(), data.clone()),
         _ => return Ok(()),
+    };
+    // A child that dies leaves no object behind: `index-pack --strict` checks
+    // every object before `write_idx_file()` runs, and both children write into
+    // the transaction's quarantine, which is discarded when they fail
+    // (object-file.c:1366-1445, tmp-objdir.c:54-77).
+    let discard = || {
+        if created {
+            let _ = std::fs::remove_file(&index_path);
+            let _ = std::fs::remove_file(&data_path);
+        }
     };
 
     // `--strict`: every object the push brought in is linted before any ref
@@ -1870,12 +1879,14 @@ fn ingest_pack(
         Ok(ids) => ids,
         Err(e) => {
             band.fatal(&e.to_string());
+            discard();
             return Err(child);
         }
     };
     if config.fsck_objects {
         if let Err(message) = fsck_received(repo, &received, config, band, to_loose) {
             band.fatal(&message);
+            discard();
             return Err(child);
         }
     }
@@ -1884,10 +1895,23 @@ fn ingest_pack(
     if to_loose {
         if let Err(e) = explode_pack(repo, &received) {
             band.fatal(&e.to_string());
+            discard();
             return Err(child);
         }
         let _ = std::fs::remove_file(&index_path);
         let _ = std::fs::remove_file(&data_path);
+        return Ok(());
+    }
+    // `index-pack` writes the reverse index unless `pack.writeReverseIndex` is
+    // false (builtin/index-pack.c:1687-1692, 1922-1930, 2104-2108) and leaves
+    // the files it renames into place read-only (`rename_tmp_packfile()`, :1590-1606).
+    if created {
+        let snapshot = repo.config_snapshot();
+        if snapshot.boolean("pack.writeReverseIndex").unwrap_or(true) {
+            let _ = super::index_pack::write_rev_index(&index_path, &outcome.index.data_hash, repo.object_hash());
+        }
+        let _ = super::index_pack::set_read_only(&index_path);
+        let _ = super::index_pack::set_read_only(&data_path);
     }
     Ok(())
 }

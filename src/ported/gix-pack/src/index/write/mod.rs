@@ -2,7 +2,7 @@ pub use error::Error;
 
 mod error;
 
-mod ref_delta;
+pub(crate) mod ref_delta;
 
 pub mod reverse;
 

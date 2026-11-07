@@ -15,8 +15,11 @@ mod error;
 pub use error::Error;
 use gix_features::progress::prodash::DynNestedProgress;
 
+mod fix_thin;
+use fix_thin::FixThinIter;
+
 mod types;
-use types::{LockWriter, PassThrough};
+use types::PassThrough;
 pub use types::{Options, Outcome};
 
 use crate::bundle::write::types::SharedTempFile;
@@ -89,30 +92,30 @@ impl crate::Bundle {
             _,
         ) = match thin_pack_base_object_lookup {
             Some(thin_pack_lookup) => {
-                let pack = interrupt::Read {
-                    inner: pack,
-                    should_interrupt,
+                // `index-pack --fix-thin`: the pack is stored as it arrives and completed at its end.
+                let pack = PassThrough {
+                    reader: interrupt::Read {
+                        inner: pack,
+                        should_interrupt,
+                    },
+                    writer: Some(data_file.clone()),
                 };
                 let buffered_pack = io::BufReader::new(pack);
-                let pack_entries_iter = data::input::LookupRefDeltaObjectsIter::new(
-                    data::input::BytesToEntriesIter::new_from_header(
-                        buffered_pack,
-                        options.iteration_mode,
-                        data::input::EntryDataMode::KeepAndCrc32,
-                        object_hash,
-                    )?,
+                let pack_entries_iter = data::input::BytesToEntriesIter::new_from_header(
+                    buffered_pack,
+                    options.iteration_mode,
+                    data::input::EntryDataMode::Crc32,
+                    object_hash,
+                )?;
+                let pack_version = pack_entries_iter.version();
+                let pack_entries_iter = FixThinIter::new(
+                    pack_entries_iter,
                     thin_pack_lookup,
                     options.compression,
-                )
-                .with_base_sink(Arc::clone(&thin_pack_bases));
-                let pack_version = pack_entries_iter.inner.version();
-                let pack_entries_iter = data::input::EntriesToBytesIter::new(
-                    pack_entries_iter,
-                    LockWriter {
-                        writer: data_file.clone(),
-                    },
-                    pack_version,
                     object_hash,
+                    pack_version,
+                    data_file.clone(),
+                    Arc::clone(&thin_pack_bases),
                 );
                 (Box::new(pack_entries_iter), pack_version)
             }
@@ -201,23 +204,31 @@ impl crate::Bundle {
             _,
         ) = match thin_pack_base_object_lookup {
             Some(thin_pack_lookup) => {
-                let pack = interrupt::Read {
-                    inner: pack,
-                    should_interrupt,
+                // `index-pack --fix-thin`: the pack is stored as it arrives and completed at its end.
+                let pack = PassThrough {
+                    reader: interrupt::Read {
+                        inner: pack,
+                        should_interrupt,
+                    },
+                    writer: Some(data_file.clone()),
                 };
                 let buffered_pack = io::BufReader::with_capacity(eight_pages, pack);
-                let pack_entries_iter = data::input::LookupRefDeltaObjectsIter::new(
-                    data::input::BytesToEntriesIter::new_from_header(
-                        buffered_pack,
-                        options.iteration_mode,
-                        data::input::EntryDataMode::KeepAndCrc32,
-                        object_hash,
-                    )?,
+                let pack_entries_iter = data::input::BytesToEntriesIter::new_from_header(
+                    buffered_pack,
+                    options.iteration_mode,
+                    data::input::EntryDataMode::Crc32,
+                    object_hash,
+                )?;
+                let pack_kind = pack_entries_iter.version();
+                let pack_entries_iter = FixThinIter::new(
+                    pack_entries_iter,
                     thin_pack_lookup,
                     options.compression,
-                )
-                .with_base_sink(Arc::clone(&thin_pack_bases));
-                let pack_kind = pack_entries_iter.inner.version();
+                    object_hash,
+                    pack_kind,
+                    data_file.clone(),
+                    Arc::clone(&thin_pack_bases),
+                );
                 (Box::new(pack_entries_iter), pack_kind)
             }
             None => {

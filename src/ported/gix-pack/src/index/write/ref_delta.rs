@@ -25,15 +25,160 @@ use crate::{
 pub(super) type BasesByChildOffset = HashMap<data::Offset, data::Offset>;
 
 /// A reconstructed object waiting for its children to be resolved against it.
-struct Base {
-    /// Index into `ranges` of the entry this object was decoded from.
-    index: usize,
+pub(crate) struct Base {
+    /// Index into `ranges` of the entry this object was decoded from, or `None` for an object that is not (yet) part
+    /// of the pack, like a thin pack's base taken from the object database.
+    pub(crate) index: Option<usize>,
     /// The object type, which every delta built on top of this object inherits.
-    kind: gix_object::Kind,
+    pub(crate) kind: gix_object::Kind,
     /// The id of the object, which ref-deltas name their base by.
-    id: ObjectId,
+    pub(crate) id: ObjectId,
     /// The fully reconstructed object data a delta is applied to.
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
+}
+
+/// The delta graph of a pack — which entries are undeltified, and which deltas hang off which base — along with what
+/// it takes to reconstruct objects by walking it, the way `resolve_deltas()` walks `ofs_deltas` and `ref_deltas` from
+/// every base object outwards (`builtin/index-pack.c:1329-1362`, `find_ofs_delta_children()`/`find_ref_delta_children()`
+/// at `:713-761`).
+pub(crate) struct Walker<'a, F, R> {
+    resolve: F,
+    pack: &'a R,
+    ranges: &'a [EntryRange],
+    object_hash: gix_hash::Kind,
+    alloc_limit_bytes: Option<usize>,
+    should_interrupt: &'a AtomicBool,
+    /// The entries that are not deltas, in pack order.
+    pub(crate) roots: Vec<usize>,
+    ofs_children: HashMap<usize, Vec<usize>>,
+    ref_children: HashMap<ObjectId, Vec<usize>>,
+    inflate: gix_zlib::Inflate,
+    delta_bytes: Vec<u8>,
+}
+
+impl<'a, F, R> Walker<'a, F, R>
+where
+    R: Send + Sync,
+    F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
+{
+    /// Read the header of every entry in `ranges`, sorted by pack offset, to learn the pack's delta graph.
+    ///
+    /// * `resolve` and `pack` provide the raw bytes of an entry, exactly as they do for [`crate::cache::delta::Tree::traverse()`].
+    pub(crate) fn new(
+        resolve: F,
+        pack: &'a R,
+        ranges: &'a [EntryRange],
+        object_hash: gix_hash::Kind,
+        alloc_limit_bytes: Option<usize>,
+        should_interrupt: &'a AtomicBool,
+    ) -> Result<Self, Error> {
+        let index_by_offset: HashMap<data::Offset, usize> =
+            ranges.iter().enumerate().map(|(i, r)| (r.start, i)).collect();
+
+        let mut roots = Vec::new();
+        let mut ofs_children: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut ref_children: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+        for (index, range) in ranges.iter().enumerate() {
+            let bytes = resolve(range.clone(), pack).ok_or(Error::ResolveFailed { pack_offset: range.start })?;
+            match data::Entry::from_bytes(bytes, range.start, object_hash)?.header {
+                data::entry::Header::OfsDelta { base_distance } => {
+                    let base_offset = data::entry::Header::verified_base_pack_offset(range.start, base_distance)
+                        .ok_or(Error::ResolveFailed { pack_offset: range.start })?;
+                    let base_index = *index_by_offset
+                        .get(&base_offset)
+                        .ok_or(Error::OutOfPackRefDelta { base_pack_offset: base_offset })?;
+                    ofs_children.entry(base_index).or_default().push(index);
+                }
+                data::entry::Header::RefDelta { base_id } => ref_children.entry(base_id).or_default().push(index),
+                _ => roots.push(index),
+            }
+        }
+        Ok(Walker {
+            resolve,
+            pack,
+            ranges,
+            object_hash,
+            alloc_limit_bytes,
+            should_interrupt,
+            roots,
+            ofs_children,
+            ref_children,
+            inflate: gix_zlib::Inflate::default(),
+            delta_bytes: Vec::new(),
+        })
+    }
+
+    /// Decode the undeltified entry at `index` into a base to walk from.
+    pub(crate) fn root(&mut self, index: usize) -> Result<Base, Error> {
+        let (entry, data) = decompress(
+            &self.resolve,
+            self.pack,
+            &self.ranges[index],
+            self.object_hash,
+            self.alloc_limit_bytes,
+            &mut self.inflate,
+        )?;
+        let kind = entry.header.as_kind().expect("a root is never a delta");
+        Ok(Base {
+            index: Some(index),
+            kind,
+            id: hash(self.object_hash, kind, &data)?,
+            data,
+        })
+    }
+
+    /// Reconstruct every delta that depends on `base`, directly or through other deltas, and call
+    /// `on_ref_delta(child, base)` with the `ranges` index of every ref-delta just before it is resolved, along with
+    /// the index of the entry its base came from.
+    pub(crate) fn walk(
+        &mut self,
+        base: Base,
+        on_ref_delta: &mut dyn FnMut(usize, Option<usize>),
+    ) -> Result<(), Error> {
+        let mut stack = vec![base];
+        while let Some(base) = stack.pop() {
+            if self.should_interrupt.load(Ordering::Relaxed) {
+                return Err(Error::Interrupted);
+            }
+            let ofs = base
+                .index
+                .and_then(|index| self.ofs_children.get(&index))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let refs = self.ref_children.get(&base.id).map(Vec::as_slice).unwrap_or_default();
+            for (child, is_ref_delta) in ofs
+                .iter()
+                .map(|c| (*c, false))
+                .chain(refs.iter().map(|c| (*c, true)))
+            {
+                if is_ref_delta {
+                    on_ref_delta(child, base.index);
+                }
+                let data = apply_delta(
+                    &self.resolve,
+                    self.pack,
+                    &self.ranges[child],
+                    &base.data,
+                    self.object_hash,
+                    self.alloc_limit_bytes,
+                    &mut self.inflate,
+                    &mut self.delta_bytes,
+                )?;
+                let id = hash(self.object_hash, base.kind, &data)?;
+                // Leaves are dropped right away so only the current path through the delta tree is held in memory,
+                // just like `resolve_deltas()` frees a `base_data` that no unresolved delta refers to anymore.
+                if self.ofs_children.contains_key(&child) || self.ref_children.contains_key(&id) {
+                    stack.push(Base {
+                        index: Some(child),
+                        kind: base.kind,
+                        id,
+                        data,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Reconstruct every object in the pack described by `ranges` and return, for each `OBJ_REF_DELTA` entry, the pack
@@ -57,82 +202,19 @@ where
     R: Send + Sync,
     F: for<'r> Fn(EntryRange, &'r R) -> Option<&'r [u8]> + Send + Clone,
 {
-    let index_by_offset: HashMap<data::Offset, usize> =
-        ranges.iter().enumerate().map(|(i, r)| (r.start, i)).collect();
-
-    let mut roots = Vec::new();
-    let mut ofs_children: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut ref_children: HashMap<ObjectId, Vec<usize>> = HashMap::new();
-    for (index, range) in ranges.iter().enumerate() {
-        let bytes = resolve(range.clone(), pack).ok_or(Error::ResolveFailed { pack_offset: range.start })?;
-        match data::Entry::from_bytes(bytes, range.start, object_hash)?.header {
-            data::entry::Header::OfsDelta { base_distance } => {
-                let base_offset = data::entry::Header::verified_base_pack_offset(range.start, base_distance)
-                    .ok_or(Error::ResolveFailed { pack_offset: range.start })?;
-                let base_index = *index_by_offset
-                    .get(&base_offset)
-                    .ok_or(Error::OutOfPackRefDelta { base_pack_offset: base_offset })?;
-                ofs_children.entry(base_index).or_default().push(index);
-            }
-            data::entry::Header::RefDelta { base_id } => ref_children.entry(base_id).or_default().push(index),
-            _ => roots.push(index),
-        }
-    }
-
+    let mut walker = Walker::new(resolve, pack, ranges, object_hash, alloc_limit_bytes, should_interrupt)?;
     let mut bases = BasesByChildOffset::with_capacity(num_ref_deltas);
-    let mut inflate = gix_zlib::Inflate::default();
-    let mut delta_bytes = Vec::new();
-    let mut stack: Vec<Base> = Vec::new();
-    for root in roots {
+    for root in walker.roots.clone() {
         if bases.len() == num_ref_deltas {
             break;
         }
-        let (entry, data) = decompress(&resolve, pack, &ranges[root], object_hash, alloc_limit_bytes, &mut inflate)?;
-        let kind = entry.header.as_kind().expect("a root is never a delta");
-        stack.push(Base {
-            index: root,
-            kind,
-            id: hash(object_hash, kind, &data)?,
-            data,
-        });
-
-        while let Some(base) = stack.pop() {
-            if should_interrupt.load(Ordering::Relaxed) {
-                return Err(Error::Interrupted);
-            }
-            let ofs = ofs_children.get(&base.index).map(Vec::as_slice).unwrap_or_default();
-            let refs = ref_children.get(&base.id).map(Vec::as_slice).unwrap_or_default();
-            for (child, is_ref_delta) in ofs
-                .iter()
-                .map(|c| (*c, false))
-                .chain(refs.iter().map(|c| (*c, true)))
-            {
-                if is_ref_delta {
-                    bases.insert(ranges[child].start, ranges[base.index].start);
-                }
-                let data = apply_delta(
-                    &resolve,
-                    pack,
-                    &ranges[child],
-                    &base.data,
-                    object_hash,
-                    alloc_limit_bytes,
-                    &mut inflate,
-                    &mut delta_bytes,
-                )?;
-                let id = hash(object_hash, base.kind, &data)?;
-                // Leaves are dropped right away so only the current path through the delta tree is held in memory,
-                // just like `resolve_deltas()` frees a `base_data` that no unresolved delta refers to anymore.
-                if ofs_children.contains_key(&child) || ref_children.contains_key(&id) {
-                    stack.push(Base {
-                        index: child,
-                        kind: base.kind,
-                        id,
-                        data,
-                    });
-                }
-            }
-        }
+        let base = walker.root(root)?;
+        walker.walk(base, &mut |child, base| {
+            bases.insert(
+                ranges[child].start,
+                ranges[base.expect("every base in the pack has an index")].start,
+            );
+        })?;
     }
     Ok(bases)
 }

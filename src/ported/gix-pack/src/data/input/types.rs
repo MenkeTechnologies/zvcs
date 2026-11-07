@@ -13,6 +13,10 @@ pub enum Error {
     IncompletePack { actual: u64, expected: u64 },
     #[error("The object {object_id} could not be decoded or wasn't found")]
     NotFound { object_id: gix_hash::ObjectId },
+    /// `fix_unresolved_deltas()` read a thin pack's base from the object database and it did not hash to its id
+    /// (`builtin/index-pack.c:1526-1528`).
+    #[error("local object {id} is corrupt")]
+    CorruptLocalObject { id: gix_hash::ObjectId },
 }
 
 /// Iteration Mode

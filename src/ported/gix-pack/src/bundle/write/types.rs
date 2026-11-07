@@ -1,4 +1,4 @@
-use std::{hash::Hash, io, io::SeekFrom, path::PathBuf, sync::Arc};
+use std::{hash::Hash, io, path::PathBuf, sync::Arc};
 
 use gix_tempfile::handle::Writable;
 
@@ -107,31 +107,5 @@ where
 
     fn consume(&mut self, amt: usize) {
         self.reader.consume(amt);
-    }
-}
-
-pub(crate) struct LockWriter {
-    pub writer: SharedTempFile,
-}
-
-impl io::Write for LockWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.lock().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.lock().flush()
-    }
-}
-
-impl io::Read for LockWriter {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.writer.lock().get_mut().read(buf)
-    }
-}
-
-impl io::Seek for LockWriter {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.writer.lock().seek(pos)
     }
 }

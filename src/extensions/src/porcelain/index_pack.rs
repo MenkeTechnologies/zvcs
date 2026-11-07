@@ -79,15 +79,14 @@
 //! of all of the above in that same algorithm — because the vendored `gix-pack`
 //! has no reverse-index writer.
 //!
-//! Thin-pack completion (`--fix-thin`) is honoured through the object database:
-//! `gix_pack::data::input::LookupRefDeltaObjectsIter` resolves each REF_DELTA
-//! base from the odb and injects it, so a thin pack is completed and indexed.
-//! One caveat is documented rather than hidden: git appends the borrowed bases
-//! at the end of the pack while `gix` injects each one just before its first
-//! referencing delta, so a pack that actually needed completion is a valid,
-//! self-contained pack but its hash need not equal the one stock git would
-//! print. A self-contained stream (the common case) is copied through
-//! byte-for-byte, so its hash matches git exactly.
+//! Thin-pack completion (`--fix-thin`) follows `conclude_pack()` and
+//! `fix_unresolved_deltas()` (builtin/index-pack.c:1370-1541): the pack is
+//! stored as it arrives, its REF_DELTAs are resolved against the pack itself
+//! first, and only the bases still missing are read from the object database
+//! and appended at the end, in the position order of the deltas that need
+//! them, before the header count and trailer are rewritten. A base the pack
+//! already carries, even as a delta, is never stored twice, and the completed
+//! pack is the one stock git writes.
 //!
 //! `--strict`, `--fsck-objects` and `--check-self-contained-and-connected` are
 //! covered: see [`fsck_pack`]. git splits them across two flags
@@ -1995,7 +1994,7 @@ pub(super) fn write_missing_rev_indexes(pack_dir: &Path, hash: Kind) {
 /// ordered by pack offset, the pack checksum, and a trailer over everything
 /// preceding it in that same algorithm. The file lands beside the index with the
 /// `.idx` suffix swapped for `.rev`, matching git even under `-o`.
-fn write_rev_index(index_path: &Path, pack_hash: &ObjectId, hash: Kind) -> Result<()> {
+pub(super) fn write_rev_index(index_path: &Path, pack_hash: &ObjectId, hash: Kind) -> Result<()> {
     let index = pack::index::File::at(index_path, hash)?;
 
     let mut by_offset: Vec<(u64, u32)> = (0..index.num_objects())
@@ -2050,7 +2049,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 /// git leaves `.pack`, `.idx` and `.rev` world-readable but immutable (0444).
-fn set_read_only(path: &Path) -> Result<()> {
+pub(super) fn set_read_only(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o444))?;
     Ok(())
 }
